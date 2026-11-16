@@ -1657,17 +1657,27 @@ Stages:
     - **The answers are the host's arms'.** `decs` lists one decoder for
       each codec the caps decode, `dcap` its profiles and level from the
       caps' entry; a codec the host lacks is not listed, so VideoToolbox
-      decodes it in software as on a Mac without it. `encs` lists no
-      encoder and `meps` no processor, and every create is answered with a
-      refusal in its reply's `,err`, as for a codec the host lacks
-      (`reims_vgpu_video::paravirt`). A host with no arm offers no caps and
-      the kext publishes no service: the guest's VideoToolbox is then not a
-      guest's.
-    - **No host offers `VT_MESSAGES` yet.** A guest's VideoToolbox would
-      list our decoders as hardware while no session of one can run, so
-      the host offers the bit once its decode sessions do; until then the
-      arm64e kext publishes no service, and the guest answers no hardware
-      decoder for any codec, as before the bit.
+      decodes it in software as on a Mac without it. A create of a listed
+      decoder starts a decoder session (`reims_vgpu_video::paravirt`'s
+      `decoder`), whose pictures the host's video arm decodes and lands in
+      the surface the guest lent for each (`crates/reims-vgpu/src/graphics/vt.rs`;
+      on VA-API, written there by the driver's video processing where it
+      takes the surface's layout, else copied by the CPU). `encs` lists no
+      encoder and `meps` no processor, and an encoder's create is answered
+      with a refusal in its reply's `,err`, as for a codec the host lacks.
+      A host with no arm offers no caps and the kext publishes no service:
+      the guest's VideoToolbox is then not a guest's.
+    - **The host offers `VT_MESSAGES` where its arm lands decodes in the
+      guest's surfaces**: on VA-API. An NVIDIA host offers it not yet, and
+      lists no decoder. The arm64e kext publishes the service on macOS 26
+      and later alone (`rgfxVtServesRelease`); macOS 14 and 15 decode in
+      software, as before the bit.
+    - **A lend locks the surface first.** Before it lends a surface, the
+      kext takes a read-write CPU lock of it and lets it go, as a process
+      would: what the GPU wrote of it is in its pages, its seed moves, and
+      a device cache of it is filled from its pages at its next use, after
+      the host's picture is there. Nothing uses the surface on the GPU while
+      VideoToolbox holds it lent.
 
 ## What metal2vulkan adds in stage 3
 
@@ -2206,7 +2216,8 @@ only where no negotiation can carry it.
   `VT_MESSAGE` of a guest that did not take it as one it could not read
   (`RGFX_VT_STATUS_MALFORMED`). The arm64e kext takes it, and publishes the
   service only where the caps list a decoder; the x86-64 kext and the firmware
-  drivers do not. No host offers it yet (item 17).
+  drivers do not. The host offers it where its video arm lands VideoToolbox's
+  decodes in the guest's surfaces (item 17).
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed

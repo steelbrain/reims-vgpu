@@ -2072,6 +2072,61 @@ impl<P: Platform> SurfaceViews<P> {
         crate::device_writes::page_runs(&pages, GUEST_PAGE)
     }
 
+    /// A view of the guest RAM runs `runs`, `(address, length)` in order, that hold a surface of
+    /// `length` bytes from the first run's first byte: a surface the guest's kext lent with a
+    /// `VT_MESSAGE`, which a VideoToolbox decoder of the host's writes its picture into
+    /// ([`super::super::vt`]). Each run starts on a page, and every run but the last is whole
+    /// pages; the last is mapped to its page's end, a page the surface's allocation holds whole.
+    /// The view is made apart from the blocks' views and their cache, with no buffer over it, and
+    /// its mapping is let go of on the surface worker as theirs is.
+    pub(crate) fn lent_view(
+        views: &Mutex<SurfaceViews<P>>,
+        platform: &P,
+        runs: &[(u64, u64)],
+        length: u64,
+    ) -> Result<Arc<SurfaceView<P>>, PagesRefusal> {
+        let (memory, lease, teardown) = {
+            let v = views.lock();
+            let Some((memory, lease)) = v.memory.as_ref() else {
+                return Err(PagesRefusal::NoMemoryMap);
+            };
+            (Arc::clone(memory), Arc::clone(lease), v.teardown.clone())
+        };
+        let page = platform.vm().page_size().max(MAPPING_PAGE).max(GUEST_PAGE);
+        if !page.is_power_of_two() {
+            return Err(PagesRefusal::PageSize);
+        }
+        let Some((last, whole)) = runs.split_last() else {
+            return Err(PagesRefusal::Unaligned);
+        };
+        if runs
+            .iter()
+            .any(|&(address, n)| n == 0 || !address.is_multiple_of(page))
+            || whole.iter().any(|&(_, n)| !n.is_multiple_of(page))
+        {
+            return Err(PagesRefusal::Unaligned);
+        }
+        let held = runs
+            .iter()
+            .try_fold(0u64, |sum, &(_, n)| sum.checked_add(n));
+        if held.is_none_or(|held| held < length) {
+            return Err(PagesRefusal::Length);
+        }
+        let mut key = runs.to_vec();
+        let end = last
+            .1
+            .checked_next_multiple_of(page)
+            .ok_or(PagesRefusal::Length)?;
+        if let Some(run) = key.last_mut() {
+            run.1 = end;
+        }
+        let mapped = key
+            .iter()
+            .try_fold(0u64, |sum, &(_, n)| sum.checked_add(n))
+            .ok_or(PagesRefusal::Length)?;
+        map_view(&memory, lease, teardown, &key, mapped)
+    }
+
     /// Each guest page of `runs`, in their order, as its host address in the guest's RAM mapping
     /// and its bytes (a run's last may be short): what a cache the host's CPU copies reads and
     /// writes ([`super::surface_cache`]'s copied pages). `None` where the host has no mapping of

@@ -83,17 +83,17 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
     RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
     RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA,
-    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-    RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
-    RGFX_VIDEO_CAPS_VERSION, RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE,
-    RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN,
-    RGFX_VIDEO_HEVC_MAIN_10, RGFX_VT_STATUS_MALFORMED, RgfxBlockGrant, RgfxBlockRelease,
-    RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry,
-    RgfxDisplayColor, RgfxEventSignalled, RgfxFunctionPointerState, RgfxHeapOverPages,
-    RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineAnswersQuery,
-    RgfxRateMapAnswer, RgfxRateMapState, RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName,
-    RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_FEATURE_VT_MESSAGES, RGFX_RESOURCE_ID_CHUNK,
+    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK,
+    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
+    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RGFX_VIDEO_CODEC_H264,
+    RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH,
+    RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RGFX_VT_STATUS_MALFORMED,
+    RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled,
+    RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
+    RgfxFunctionPointerState, RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader,
+    RgfxPageRun, RgfxPipelineAnswersQuery, RgfxRateMapAnswer, RgfxRateMapState, RgfxSamplerState,
+    RgfxScheduledAsk, RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PresentAnswer,
@@ -158,6 +158,7 @@ mod sink;
 mod vaapi;
 mod video_choice;
 mod video_host;
+mod vt;
 mod vulkan;
 
 pub(crate) use video_choice::graphics_video as vulkan_graphics_video;
@@ -654,7 +655,16 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 let cached = caps.flags & RGFX_VIDEO_CAPS_OUTPUT_CACHED != 0;
                 debug_assert!(caps.codec_count as usize <= RGFX_VIDEO_CAPS_CODECS);
                 region.write(RGFX_VIDEO_CAPS_OFFSET, caps.as_bytes());
-                vt = paravirt::Host::new(vt_decoders(&caps));
+                // VideoToolbox's decoders are listed where the arm lands their pictures in the
+                // surfaces the guest lends: each session decodes on the arm.
+                if video.guest_decodes() {
+                    let backend = vt::VtBackend::new(Arc::clone(&video), decoder.lent_views());
+                    vt = paravirt::Host::with_backend(
+                        vt_decoders(&caps),
+                        Arc::new(backend),
+                        crate::video::runtime::PlatformRuntime::of(&platform),
+                    );
+                }
                 if cached && video.imports_device_caches() {
                     decoder.set_exportable_caches();
                 } else if cached && video.decodes_into_device_caches() {
@@ -703,7 +713,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 .collect();
             let host = Box::new(CallbackHost {
                 callbacks: config.callbacks,
-                features,
+                features: features | vt_features(&vt),
                 features_16k,
                 deferred_budget,
                 control: Arc::clone(&control),
@@ -3310,6 +3320,17 @@ struct GuestLink(VtLink);
 impl paravirt::Link for GuestLink {
     fn send(&self, message: &[u8]) -> bool {
         self.0.send(message)
+    }
+}
+
+/// The features VideoToolbox's paravirtual path adds: `VT_MESSAGES` where `vt` lists a decoder,
+/// whose sessions decode on the host's video arm; an arm64 guest's kext then serves the guest's
+/// VideoToolbox. None where it lists none.
+fn vt_features(vt: &paravirt::Host) -> u64 {
+    if vt.decoders().is_empty() {
+        0
+    } else {
+        RGFX_FEATURE_VT_MESSAGES
     }
 }
 

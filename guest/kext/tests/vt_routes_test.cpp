@@ -183,6 +183,10 @@ int main()
 		check(rgfxVtServesDecoders(caps), "an HEVC decoder is served");
 	}
 
+	// The service serves macOS 26 and later alone.
+	check(!rgfxVtServesRelease(23) && !rgfxVtServesRelease(24), "none on macOS 14 or 15");
+	check(rgfxVtServesRelease(25) && rgfxVtServesRelease(26), "macOS 26 and 27 are served");
+
 	std::printf("vt_routes_test: %d checks passed\n", checks);
 	return 0;
 }

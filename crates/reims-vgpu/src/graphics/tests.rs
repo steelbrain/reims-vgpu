@@ -13581,6 +13581,19 @@ fn a_group_closes_at_its_limits() {
     }
 }
 
+/// The host offers `VT_MESSAGES` where VideoToolbox's paravirtual path lists a decoder, and not
+/// where it lists none: a host whose video arm lands no picture in the guest's surfaces.
+#[test]
+fn vt_messages_are_offered_where_a_decoder_is_listed() {
+    assert_eq!(vt_features(&paravirt::Host::default()), 0);
+    let listed = paravirt::Host::new(vec![paravirt::Decoder {
+        codec: paravirt::Codec::H264,
+        profiles: vec![66],
+        max_level: 52,
+    }]);
+    assert_eq!(vt_features(&listed), RGFX_FEATURE_VT_MESSAGES);
+}
+
 /// VideoToolbox's paravirtual path lists a decoder for each decode entry of the caps of H.264 or
 /// HEVC with a profile, its profiles as VideoToolbox numbers them and its level the caps': no
 /// encode entry, no entry with no profile, and no codec past the caps' count.

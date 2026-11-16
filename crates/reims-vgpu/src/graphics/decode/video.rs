@@ -36,7 +36,7 @@ use reims_vgpu_graphics::wire::{
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity};
 #[cfg(target_os = "linux")]
 use reims_vgpu_video::core::device_memory::{DmaBufError, SurfaceDmaBuf};
-use reims_vgpu_video::core::surfaces::SurfaceError;
+use reims_vgpu_video::core::surfaces::{SurfaceError, SurfaceLayout};
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
 use reims_vgpu_vulkan::core::platform::event::EventRef;
@@ -81,6 +81,16 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     /// A session of `codec` (`RGFX_VIDEO_CODEC_*`) in `direction` (`RGFX_VIDEO_DECODE` or
     /// `RGFX_VIDEO_ENCODE`); `None` where the hardware has no such codec.
     fn session(&self, codec: u32, direction: u32) -> Option<Arc<dyn GraphicsVideoSession<P>>>;
+    /// A decoder of `codec` (`RGFX_VIDEO_CODEC_*`, one of [`Self::caps`] in the decode
+    /// direction) whose pictures land in surfaces the guest lends with VideoToolbox's paravirtual
+    /// messages ([`GuestDecoder`]); `None` where the arm has none.
+    fn guest_decoder(&self, _codec: u32) -> Option<Box<dyn GuestDecoder>> {
+        None
+    }
+    /// Whether [`Self::guest_decoder`] answers a decoder of each codec [`Self::caps`] decodes.
+    fn guest_decodes(&self) -> bool {
+        false
+    }
     /// Whether a decode lands its picture in an output surface's device cache, where the
     /// surface's block has one, as well as in its pages
     /// ([`RGFX_VIDEO_CAPS_OUTPUT_CACHED`](reims_vgpu_graphics::wire::RGFX_VIDEO_CAPS_OUTPUT_CACHED)).
@@ -100,6 +110,29 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     fn decodes_into_device_caches(&self) -> bool {
         false
     }
+}
+
+/// A decoder of one codec's Annex-B access units, in decode order, whose pictures land in
+/// surfaces the guest lent: VideoToolbox's paravirtual decoders' (`super::super::vt`), one call
+/// at a time.
+pub trait GuestDecoder: Send {
+    /// Decodes `au`, NAL units in Annex-B form, after `parameter_sets` (Annex-B, where they
+    /// changed; else empty), into `output`, and returns once the picture is there: `Ok(true)`, or
+    /// `Ok(false)` for an access unit the stream's random access skips, `output` left as it was.
+    fn decode(
+        &mut self,
+        parameter_sets: &[u8],
+        au: &[u8],
+        output: &GuestOutput<'_>,
+    ) -> Result<bool, reims_vgpu_video::core::backend::BackendError>;
+}
+
+/// A surface the guest lent, as a [`GuestDecoder`] lands a picture in it.
+pub struct GuestOutput<'a> {
+    /// Its layout: its CoreVideo format, its size and its two planes.
+    pub layout: SurfaceLayout,
+    /// Its memory, the surface's first byte its first.
+    pub memory: &'a dyn DeviceMemory,
 }
 
 /// What the video crate's codec decoders refuse of `codec` beyond its entry

@@ -12,6 +12,7 @@
 #include "RgfxTrace.hpp"
 
 #include <IOKit/IOLib.h>
+#include <libkern/version.h>
 
 namespace {
 // How long a send waits for its VT_STATUS: the host answers once its side took the message.
@@ -341,6 +342,13 @@ IOReturn AppleVideoToolboxParavirtualizationDriver::lend(task_t task, uint32_t s
 	IOMemoryDescriptor *memory =
 	    isSurface(surface) ? OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface))
 	                       : nullptr;
+	// The host writes the surface's pages (a decoder's output) or reads them: a read-write CPU
+	// lock of it first, as a process's, puts what the GPU wrote of it in its pages, moves its
+	// seed, and has a device cache of it filled from its pages again at its next use
+	// (RgfxAcceleratorLocks.cpp). Nothing uses the surface on the GPU while it is lent.
+	uint32_t seed = 0;
+	if (memory && rgfxIOSurfaceLock(surface, 0, &seed) == kIOReturnSuccess)
+		rgfxIOSurfaceUnlock(surface, 0, &seed);
 	const uint64_t base = memory ? rgfxIOSurfaceBaseOffset(surface) : 0;
 	const uint64_t length = memory ? rgfxIOSurfaceAllocSize(surface) : 0;
 	if (!memory || !length || base + length > memory->getLength()) {
@@ -759,6 +767,11 @@ void ReimsGraphics::startVtService()
 		to[i] = at[i];
 	if (!rgfxVtServesDecoders(caps)) {
 		IOLog("ReimsGraphics: the host decodes no video: no VideoToolbox service\n");
+		return;
+	}
+	if (!rgfxVtServesRelease(version_major)) {
+		IOLog("ReimsGraphics: no VideoToolbox service on kernel %d: macOS 26 and later only\n",
+		      version_major);
 		return;
 	}
 	AppleVideoToolboxParavirtualizationDriver *made =

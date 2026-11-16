@@ -134,7 +134,7 @@ use reims_vgpu_graphics::wire::{
     RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureDidModifyData, RgfxTextureFromBuffer,
     RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout, RgfxVideoSessionCreate,
 };
-use reims_vgpu_video::core::device_memory::MemoryLife;
+use reims_vgpu_video::core::device_memory::{DeviceMemory, MemoryLife};
 use reims_vgpu_vulkan::core::host::HostPtr;
 use reims_vgpu_vulkan::core::memory::map::MemoryMap;
 use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
@@ -209,8 +209,8 @@ mod work;
 pub(crate) mod worker;
 
 pub use video::{
-    Decoded, GraphicsVideo, GraphicsVideoSession, Landed, PlanePages, VideoDecode, VideoEncode,
-    VideoPlane,
+    Decoded, GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestOutput, Landed, PlanePages,
+    VideoDecode, VideoEncode, VideoPlane,
 };
 
 pub(crate) use cmdbuf::Begun;
@@ -901,6 +901,56 @@ struct SurfaceNames {
     /// Where in the region each of those textures' copy keeps its
     /// [`RgfxSurfaceWriters`], by the texture's id, where its message gave one.
     writers: HashMap<u64, u64>,
+}
+
+/// The views of guest RAM a decoder's shared state makes, as VideoToolbox's paravirtual decoders
+/// take them ([`GraphicsDecoder::lent_views`]): a surface the guest lent, mapped whole.
+pub(crate) struct LentViews<P: Platform> {
+    shared: Arc<Shared<P>>,
+    platform: Arc<P>,
+}
+
+impl<P: Platform> Clone for LentViews<P> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            platform: Arc::clone(&self.platform),
+        }
+    }
+}
+
+impl<P: Platform> LentViews<P> {
+    /// A view of the surface of `length` bytes in the guest RAM runs `runs`
+    /// ([`surface_pages::SurfaceViews::lent_view`]); `Err` says why not.
+    pub(crate) fn view(&self, runs: &[(u64, u64)], length: u64) -> Result<LentView, String> {
+        let view = surface_pages::SurfaceViews::lent_view(
+            &self.shared.surface_views,
+            &*self.platform,
+            runs,
+            length,
+        )
+        .map_err(|why| format!("no view of its pages: {why:?}"))?;
+        let memory = view.memory().ok_or("a view of no bytes")?;
+        Ok(LentView {
+            memory,
+            _view: Box::new(view),
+        })
+    }
+}
+
+/// A view of a surface the guest lent ([`LentViews::view`]): its memory, whose identity lives as
+/// long as this does, so what a device of the host's video makes of it (an import) is kept until
+/// this goes.
+pub(crate) struct LentView {
+    memory: Arc<dyn DeviceMemory>,
+    _view: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl LentView {
+    /// The view's memory, the surface's first byte its first.
+    pub(crate) fn memory(&self) -> &Arc<dyn DeviceMemory> {
+        &self.memory
+    }
 }
 
 /// The stage-3 decoder: a handle on the device's [`Shared`] state through which one message is
@@ -2773,6 +2823,15 @@ impl<P: Platform> GraphicsDecoder<P> {
             bytes.extend_from_slice(unsafe { std::slice::from_raw_parts(host.as_ptr::<u8>(), n) });
         }
         (bytes.len().to_u64() == length).then_some(bytes)
+    }
+
+    /// The decoder's views of guest RAM, as VideoToolbox's paravirtual decoders make them of the
+    /// surfaces the guest lends ([`LentViews`]), from any thread.
+    pub(crate) fn lent_views(&self) -> LentViews<P> {
+        LentViews {
+            shared: Arc::clone(&self.shared),
+            platform: Arc::clone(&self.platform),
+        }
     }
 
     /// The textures IOSurface `iosurface_id` is named by, oldest first: those over its plane 0,
