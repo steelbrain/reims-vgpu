@@ -445,11 +445,11 @@ pub const RGFX_FEATURE_PIPELINE_ANSWERS: u64 = 0x8000_0000_0000;
 /// [`RGFX_REG_DRIVER_FEATURES_HI`]: the device has two displays or more, up to
 /// [`RGFX_DISPLAYS_MAX`], each with its own scanout, modes, `VBLANK`s, cursor, presents, colour and
 /// panel, which each display message names by the display's id (docs/graphics-kext/design.md,
-/// "Multiple displays"). A host offers it only where the device has two displays or more. A guest
-/// that took it is answered `DISPLAYS` with every display, ids 0 up, and is sent the events of
-/// each; a guest that did not sees display 0 alone, as from a device of one display, and is sent
-/// no event of another. Each display's scanout lies in a room of its own
-/// ([`RGFX_SCANOUT_ROOM_ALIGN`]). No host offers it yet.
+/// "Multiple displays"). The device offers it only where its host made it with two displays or
+/// more (`RvgGraphicsDeviceConfig`'s `display_count`, QEMU's `displays` property). A guest that
+/// took it is answered `DISPLAYS` with every display, ids 0 up, and is sent the events of each; a
+/// guest that did not sees display 0 alone, as from a device of one display, and is sent no event
+/// of another. Each display's scanout lies in a room of its own ([`RGFX_SCANOUT_ROOM_ALIGN`]).
 pub const RGFX_FEATURE_MULTI_DISPLAY: u64 = 0x1_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -736,7 +736,8 @@ pub const RGFX_STATUS_CACHE: u32 = 7;
 pub const RGFX_SCANOUT_BYTES_PER_PIXEL: u32 = 4;
 /// The largest cursor image, in pixels each way.
 pub const RGFX_CURSOR_MAX_SIZE: u32 = 256;
-/// The displays the device has: display 0.
+/// The displays a device has where its host names no other count (`RvgGraphicsDeviceConfig`'s
+/// `display_count` of 0 or 1): display 0 alone. A host gives it up to [`RGFX_DISPLAYS_MAX`].
 pub const RGFX_DISPLAY_COUNT: u32 = 1;
 /// The most displays a device has. A device of two or more offers [`RGFX_FEATURE_MULTI_DISPLAY`],
 /// and has them from its start to its end: none is added or removed while it runs.
