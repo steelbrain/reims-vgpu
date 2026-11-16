@@ -5568,7 +5568,13 @@ commit. Each outcome the new design allows is one of those two:
   video buffer, and its queue holds room for another command buffer. A buffer
   whose walk faults after a part has its failure at its stand-in's
   completion, as one whose walk faults whole; the parts committed before the
-  fault ran, as the encoders before a fault of Metal's GPU run. The Vulkan
+  fault ran, as the encoders before a fault of Metal's GPU run. Each part but
+  the last that waits for and signals no event is marked to join the next
+  one's completion (`CommandBuffer::set_completion_joins_next`), so the
+  platform may send several to its driver in one submission: nothing observes
+  a marked part's completion but the note of its outcome for the last part's
+  record, so the guest sees the buffer complete at its last part's own end, as
+  before (`decode/split.rs`, "Its parts' completions"). The Vulkan
   platform keeps a buffer whole where a part would answer otherwise than the
   whole (`gpu/command.rs`, "A command buffer in parts"); a buffer of compute
   encoders alone is cut too, its unit of command predication going on in the
@@ -5579,8 +5585,10 @@ commit. Each outcome the new design allows is one of those two:
   `a_buffer_is_committed_whole_where_its_parts_would_wait`,
   `another_queue_s_commit_waits_for_a_buffer_s_last_part` and
   `a_walk_that_faults_after_a_part_fails_at_its_stand_in`,
-  `a_split_after_a_mid_buffer_signal_keeps_the_signal_before_the_cut` and
-  `a_split_after_a_skipped_encoder_answers_as_the_whole` (the decoder's
+  `a_split_after_a_mid_buffer_signal_keeps_the_signal_before_the_cut`,
+  `a_split_after_a_skipped_encoder_answers_as_the_whole`,
+  `a_buffer_s_parts_but_its_last_join_the_next_completion_unless_they_signal`
+  and `a_first_part_that_waits_from_its_begin_is_not_marked` (the decoder's
   `cmdbuf` tests), and the gate's own (`decode/split.rs`).
 - **What still waits on ring 0's thread:** a block named again, for that
   block's writers; a present's fill, for that block's users begun and not

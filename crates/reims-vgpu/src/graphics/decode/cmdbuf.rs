@@ -655,6 +655,16 @@ fn leaving(handler: CompletedHandler, in_flight: InFlight) -> CompletedHandler {
     })
 }
 
+/// Marks `part`, a command buffer's part before its last about to be committed, to join the next
+/// one's completion where its walk's `s` holds no event's wait or signal in it
+/// ([`Splitting::events`]): its completion is then observed by nothing but its handler from
+/// [`Parts::part_handler`], which notes its outcome for the last part's and lets its place among
+/// its queue's command buffers go (the module docs of [`super::split`], "Its parts'
+/// completions"). Whether it marked it: `false` where the platform took no mark.
+fn joins_next<P: Platform>(part: &P::CommandBuffer, s: &Splitting) -> bool {
+    !s.events && part.set_completion_joins_next(true)
+}
+
 /// A command buffer's walk where it may be committed in parts ([`super::split`]).
 struct Splitting {
     /// Its context.
@@ -669,6 +679,10 @@ struct Splitting {
     parts: Option<Arc<Parts>>,
     /// The platform keeps it whole from now on.
     whole: bool,
+    /// The part being walked into its current command buffer waits for or signals an event: at
+    /// its begin, for a cache's fill or another queue's buffer ([`Begun`]'s `waits_at_begin`),
+    /// or by an op, so its completion is observed: committed unmarked ([`joins_next`]).
+    events: bool,
 }
 
 /// A chunk of a command buffer dealt to two threads, walked ([`GraphicsDecoder::walk_dealt`]).
@@ -804,6 +818,9 @@ pub(crate) struct Begun<P: Platform> {
     marks: Arc<Marks>,
     /// It waits on the GPU for a buffer of another queue that has not finished.
     waits_for_order: bool,
+    /// Its command buffer waits on the GPU for an event from its begin: a fill of a device cache
+    /// it uses, or a buffer of another queue ([`Self::waits_for_order`]).
+    waits_at_begin: bool,
     /// Its queue's records the host may post at their commit.
     line: Arc<Line>,
     /// Its `CB_SUBMITTED`, where it asks for one.
@@ -1776,7 +1793,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
         };
         let answer = early.then_some(&mut answer as &mut dyn FnMut());
-        let (_, follows, uses) =
+        let (fill_waits, follows, uses) =
             (self.surface_caches).before_answering(device, &cb, &take.uses, &reach, answer)?;
         // The buffers of other queues it runs after, on the GPU, kept for the work the host starts
         // off it (`surface_order`).
@@ -1809,6 +1826,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             order: take.order.is_some(),
             marks: Arc::clone(&counts.order),
             waits_for_order,
+            waits_at_begin: fill_waits || waits_for_order,
             line: Arc::clone(&counts.line),
             submitted,
             scheduled,
@@ -1857,6 +1875,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             order,
             marks,
             waits_for_order,
+            waits_at_begin,
             line,
             submitted,
             scheduled,
@@ -1906,6 +1925,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 hold: None,
                 parts: None,
                 whole: false,
+                events: waits_at_begin,
             });
         let mut cb = cb;
         // Dealt to two threads at once, where it may be cut and its queue holds room for a command
@@ -2404,17 +2424,22 @@ impl<P: Platform> GraphicsDecoder<P> {
         // buffer's goes on to its last part.
         let part = parts.part_handler(InFlight::new(&s.in_flight));
         cb.add_completion_seen_handler(ON, part)?;
+        let joins = joins_next(cb, s);
         match cb.split(ON)? {
             Some(next) => {
                 *cb = next;
                 s.hold = Some(hold);
                 s.since = clock.now_mono();
+                s.events = false;
                 self.note_part_cut();
             }
             None => {
                 // Kept whole: the handler just added sees the buffer's own completion, which
                 // its outcome then is ([`Parts::merged`]); the gate stays held only where parts
-                // are out.
+                // are out. Its last part, unmarked.
+                if joins {
+                    cb.set_completion_joins_next(false);
+                }
                 s.whole = true;
                 if !first {
                     s.hold = Some(hold);
@@ -2877,15 +2902,21 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let parts = Arc::clone(s.parts.get_or_insert_with(Arc::default));
                     let committing = part.as_ref().unwrap_or(&*cb);
                     committing.add_completion_seen_handler(ON, parts.part_handler(place))?;
+                    let joins = joins_next(committing, s);
                     match committing.commit_part(ON)? {
                         PartCut::Cut => {
                             deal.parts_out = true;
+                            s.events = false;
                             self.note_part_cut();
                         }
                         PartCut::Fails => {
                             // Kept whole, as a cut the platform refuses keeps it
                             // ([`Self::split_here`]): the handler just added sees its completion,
-                            // and the gate stays held only where parts are out.
+                            // and the gate stays held only where parts are out. Its commit is
+                            // the whole's, the last part's, unmarked.
+                            if joins {
+                                committing.set_completion_joins_next(false);
+                            }
                             s.whole = true;
                             if !deal.parts_out {
                                 s.hold = None;
@@ -3017,6 +3048,12 @@ impl<P: Platform> GraphicsDecoder<P> {
             };
             match op_group(tag) {
                 RGFX_OP_GROUP_FRAMING => {
+                    // An event's wait or signal: the part it goes into is observed.
+                    if matches!(tag, RGFX_OP_SIGNAL_EVENT | RGFX_OP_WAIT_EVENT)
+                        && let Some(s) = split.as_mut()
+                    {
+                        s.events = true;
+                    }
                     self.framing_op((tag, body, &ops[len..]), cb, encoder, events)?;
                     if tag == RGFX_OP_ENCODER_END {
                         self.reconcile_laid(cb)?;
@@ -9246,10 +9283,12 @@ mod tests {
         let message = command_buffer_message(310, 40, &ops);
         assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
         assert!(p.call_log().calls_to("split").is_empty());
+        let committed = p.world().committed();
+        assert_eq!(committed.len(), 1, "a platform that keeps it whole");
         assert_eq!(
-            p.world().committed().len(),
-            1,
-            "a platform that keeps it whole"
+            p.world().joins_next(committed[0]),
+            Some(false),
+            "its commit the whole's, unmarked"
         );
 
         let Split { p, mut dec, .. } = splitting();
@@ -9515,6 +9554,148 @@ mod tests {
         assert_eq!(*posted.lock(), [(RGFX_EVT_CB_COMPLETE, 350, RGFX_CB_OK)]);
     }
 
+    /// Whether each of `parts` is marked to join the next one's completion
+    /// (`CommandBuffer::set_completion_joins_next`).
+    fn marks(p: &FakePlatform, parts: &[ObjId]) -> Vec<bool> {
+        (parts.iter())
+            .map(|part| p.world().joins_next(*part).expect("a live command buffer"))
+            .collect()
+    }
+
+    /// A command buffer's parts but its last are marked to join the next one's completion, each
+    /// where it waits for and signals no event ([`super::super::split`], "Its parts'
+    /// completions"): a part that signals an event, plain or shared, goes unmarked, and so does
+    /// the last, which carries the buffer's records. A marked part's completion posts nothing the
+    /// guest sees, however late it comes, and a fault in one fails the buffer as before.
+    #[test]
+    fn a_buffer_s_parts_but_its_last_join_the_next_completion_unless_they_signal() {
+        use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, NsErrorText};
+        let Split {
+            p, mut dec, posted, ..
+        } = splitting();
+        let device = p.device();
+        create_events(&p, &mut dec, 0);
+        let signals = Arc::clone(&posted);
+        dec.set_signal_sink(Arc::new(move |m| {
+            let value = u32::try_from(m.value).unwrap();
+            signals.lock().push((m.header.r#type, m.obj_id, value));
+        }));
+        let ok = CommandBufferStatus::COMPLETED;
+
+        let message = command_buffer_message(390, 120, &passes(4));
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let parts = p.world().committed();
+        assert_eq!(marks(&p, &parts), [true, true, true, false]);
+        posted.lock().clear();
+        for part in &parts[..3] {
+            assert!(p.world().complete(*part, ok, None, CompleteOn::Caller));
+            assert!(
+                posted.lock().is_empty(),
+                "a marked part's completion posts nothing"
+            );
+        }
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(*posted.lock(), [(RGFX_EVT_CB_COMPLETE, 390, RGFX_CB_OK)]);
+
+        // A part that signals the plain event 6, and one that signals the shared event 7, which
+        // the guest has as the event reaches it: neither is marked.
+        let ops = [
+            blit_ops(),
+            event_op(RGFX_OP_SIGNAL_EVENT, 6, 1),
+            blit_ops(),
+            event_op(RGFX_OP_SIGNAL_EVENT, 7, 2),
+            blit_ops(),
+            blit_ops(),
+        ]
+        .concat();
+        let mark = p.call_log().mark();
+        let message = command_buffer_message(391, 121, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let parts = p.world().committed();
+        let signalled: Vec<_> = (p.call_log().since(mark).into_iter())
+            .filter(|c| c.sel == "encodeSignalEvent:value:")
+            .map(|c| c.obj)
+            .collect();
+        assert_eq!(signalled, parts[1..3], "each signal in a part of its own");
+        assert_eq!(marks(&p, &parts), [true, false, false, false]);
+        posted.lock().clear();
+        assert!(p.world().complete(parts[0], ok, None, CompleteOn::Caller));
+        assert!(posted.lock().is_empty());
+        for part in &parts[1..3] {
+            assert!(p.world().complete(*part, ok, None, CompleteOn::Caller));
+        }
+        assert_eq!(*posted.lock(), [(RGFX_EVT_EVENT_SIGNALLED, 7, 2)]);
+        p.world().complete_all(CompleteOn::Caller);
+        posted.lock().clear();
+
+        // A marked part fails: the buffer's error, as before.
+        let message = command_buffer_message(392, 122, &passes(3));
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let parts = p.world().committed();
+        assert_eq!(marks(&p, &parts), [true, true, false]);
+        posted.lock().clear();
+        let error = NsErrorText {
+            domain: "MTLCommandBufferErrorDomain".to_owned(),
+            code: 3,
+            description: "Page Fault".to_owned(),
+        };
+        let failed = CommandBufferStatus::ERROR;
+        assert!(
+            p.world()
+                .complete(parts[1], failed, Some(error), CompleteOn::Caller)
+        );
+        assert!(posted.lock().is_empty());
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            *posted.lock(),
+            [(
+                RGFX_EVT_CB_COMPLETE,
+                392,
+                reims_vgpu_graphics::wire::RGFX_CB_PAGE_FAULT
+            )]
+        );
+    }
+
+    /// The first part of a command buffer that waits on the GPU from its begin, for a buffer of
+    /// another queue it runs after (its `SURFACE_ORDER`), is not marked to join the next one's
+    /// completion; its later parts but the last are.
+    #[test]
+    fn a_first_part_that_waits_from_its_begin_is_not_marked() {
+        use reims_vgpu_graphics::ops::{RGFX_OP_SURFACE_ORDER, RgfxSurfaceOrderWait};
+        let Split { p, mut dec, .. } = splitting();
+        let device = p.device();
+        let queue = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 6,
+            ..RgfxQueueCreate::default()
+        };
+        assert_eq!(dec.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
+        let order = |waits: &[RgfxSurfaceOrderWait]| op(RGFX_OP_SURFACE_ORDER, waits.as_bytes());
+        // Queue 6's buffer, committed and not finished.
+        let read = command_buffer_on(6, 200, &order(&[]));
+        assert_eq!(dec.decode(&device, &read).unwrap(), Ok(()));
+        let mut ops = order(&[RgfxSurfaceOrderWait {
+            queue_obj_id: 6,
+            seqno: 200,
+        }]);
+        ops.extend(passes(3));
+        let mark = p.call_log().mark();
+        let message = command_buffer_message(393, 123, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let committed = p.world().committed();
+        let parts = &committed[1..];
+        let waited: Vec<_> = (p.call_log().since(mark).into_iter())
+            .filter(|c| c.sel == "encodeWaitForEvent:value:")
+            .map(|c| c.obj)
+            .collect();
+        assert_eq!(waited, parts[..1], "the wait in its first part");
+        assert_eq!(marks(&p, parts), [false, true, false]);
+    }
+
     /// `n` passes of [`render_ops`].
     fn passes(n: usize) -> Vec<u8> {
         (0..n).map(|_| render_ops()).collect::<Vec<_>>().concat()
@@ -9537,13 +9718,14 @@ mod tests {
     /// call of the platform's but the command buffers' makes, commits, parts and handlers, which a
     /// dealt walk makes otherwise than a whole one.
     fn walk_calls(p: &FakePlatform, mark: u64) -> Vec<(bool, Shape, Option<ObjId>)> {
-        const NOT_THE_WALK: [&str; 6] = [
+        const NOT_THE_WALK: [&str; 7] = [
             "commandBuffer",
             "commit",
             "split",
             "part",
             "commitPart",
             "fold",
+            "setCompletionJoinsNext",
         ];
         (p.call_log().since(mark).into_iter())
             .filter(|c| !NOT_THE_WALK.contains(&c.sel) && !c.sel.contains("Handler"))
@@ -10041,6 +10223,11 @@ mod tests {
             let parts = p.world().committed();
             assert_eq!(parts, cbs_of(&dealt), "each chunk a part, in their order");
             assert_eq!(
+                marks(&p, &parts),
+                [true, true, true, true, true, true, true, false],
+                "every part but the last joins the next one's completion"
+            );
+            assert_eq!(
                 answered(&posted),
                 [(RGFX_EVT_CB_SCHEDULED, RGFX_CB_OK)],
                 "at its take"
@@ -10324,6 +10511,13 @@ mod tests {
                 parts,
                 cbs[..=failing as usize],
                 "{seqno}: the parts before it, then the whole"
+            );
+            let mut marked = vec![true; failing as usize];
+            marked.push(false);
+            assert_eq!(
+                marks(&p, &parts),
+                marked,
+                "{seqno}: the parts before it marked, the whole not"
             );
             records.lock().clear();
             let error = NsErrorText {

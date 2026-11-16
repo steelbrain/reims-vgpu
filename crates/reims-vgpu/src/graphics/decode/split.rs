@@ -107,6 +107,30 @@
 //! (QuartzCore's `CA::OGL::MetalContext` completed handlers, SkyLight's hitch telemetry and debug
 //! HUD, RenderBox's frame statistics), none paces frames from them (read from their code).
 //!
+//! **Its parts' completions.** Each part before the last is marked to join the next one's
+//! completion as it is committed (`CommandBuffer::set_completion_joins_next`), so the platform may
+//! send several of a queue's parts found ready together, and the part behind them, to its driver
+//! in one submission, rather than each in a submission of its own: each costs the driver's
+//! submission, which grows with the memory the part's work lists. A marked part's work, its order
+//! on the queue and its GPU times are unchanged, but it is seen complete, and its handlers run,
+//! only once the last of its submission completed, late by the GPU time of at most three
+//! batches of work after it (the runtime's bound of a submission). Nothing
+//! observes that but its own handler ([`Parts::part_handler`]), which notes its outcome for the
+//! last part's and lets its place among its queue's command buffers go, a hold the guest never
+//! sees. So a part is marked only where its completion carries nothing else: never the last part,
+//! which carries the buffer's handlers, records, tickets and its queue's surface signal; never a
+//! part that waits for or signals an event, at its begin (a device cache's fill, a buffer of
+//! another queue in the surface order) or by an op, whose value another queue's GPU, the guest
+//! or the device's listener waits for; and a part the platform keeps whole is unmarked again, as
+//! its commit is then the whole's. A fence a marked part updates is reached as late as its
+//! completion: the GPU's order of its work is unchanged, and a wait of another queue's for it is
+//! met at the end of the part's submission, never early. A fault in a marked part fails the
+//! buffer as before: its error reaches the last part's record, whose handler runs after every
+//! earlier part's in the queue's commit order. The guest sees its command buffer complete at its
+//! last part's own end, as before: the platform sends the first unmarked command buffer behind
+//! marked ones last in their submission, seen complete at its own end, and never holds it for
+//! later work.
+//!
 //! **What another message sees** ([`SplitGate`]). While a buffer of a context has parts out, from
 //! its first part's commit to its last, no other command buffer of the context is committed, and
 //! the context's range messages that come are carried out after its last commit: each other

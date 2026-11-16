@@ -38,6 +38,11 @@ way) and saved 0.15-1 a present at its first opening, and in Geekbench 7's Metal
 against 136.1 on the XTX), seeing command buffers complete up to 60 and 17.5 ms after their own GPU
 end (2.9 and 3.6 ms exact). Nor did it buy frame rate in a guest's drag on the Iris Xe (15.7-17.3
 frames a second grouped, 16.4-17.6 exact), for 0.4-1.7 ms of the runtime's scheduler CPU a frame.
+The exact form groups only what its caller marks to join the next: the device marks a guest
+command buffer's parts before its last that signal and wait for no event, whose completions the
+guest never sees, so the runtime may send up to four of them found ready together in one kernel
+submission, the part behind them last in it, and the guest still sees its command buffer complete
+at its last part's own end.
 
 Every device also takes `YCbCrInPlacePolicy::Exact`: a function that reads a `YCBCR8_420_2P`
 (500) or `YCBCR10_420_2P` (505) texture's planes in place, on a device whose memory is the host's
