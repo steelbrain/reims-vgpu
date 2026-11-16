@@ -206,6 +206,11 @@ public:
 	/// then the `size` bytes of parameter sets at `parameterSets`, padded to whole words.
 	void videoDecodeH265(const RgfxVideoOpDecodeH265 &body, const uint8_t *parameterSets,
 	                     uint32_t size);
+	/// Encodes a frame (RGFX_OP_VIDEO_ENCODE_H264 or RGFX_OP_VIDEO_ENCODE_H265, `tag`): `body`,
+	/// then the session's settings at `settings` where they changed since its last encode (null
+	/// for none); the op's settings_size says which.
+	void videoEncode(uint16_t tag, const RgfxVideoOpEncode &body,
+	                 const RgfxVideoEncodeSettings *settings);
 
 	// --- render ops (RGFX_OP_RENDER_*, group 1) --------------------------------
 
@@ -779,8 +784,9 @@ private:
 	void grow(size_t n);
 	// Gives back the block the builder holds, if any.
 	void giveBackBlock();
-	// A video decode op of `tag`: its header, the `n` bytes of its body at `body`, then the
-	// `size` bytes of parameter sets at `parameterSets`, padded with zeros to whole words.
+	// A video op of `tag`: its header, the `n` bytes of its body at `body`, then the `size` bytes
+	// at `parameterSets` (a decode's parameter sets, an encode's settings), padded with zeros to
+	// whole words.
 	void appendVideoDecode(uint16_t tag, const void *body, size_t n, const uint8_t *parameterSets,
 	                       uint32_t size);
 

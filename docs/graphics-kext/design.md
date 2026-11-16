@@ -1388,14 +1388,24 @@ Stages:
       and sessions requiring hardware fail as on a Mac without it (−12906,
       −12908) (**measured**, macOS 26.7.2 guest, Windows host with a UHD
       630, 2026-11-16). The arm64e kext names none on any host, nor HEVC
-      decode: the route is x86-64's, and with the keys an arm64 guest
-      answered hardware HEVC decode true while a session requiring it failed
-      −17692 and none reached the host (**measured**, arm64 macOS 14.6.1
-      guest, VA-API host, 2026-11-16). AppleGVA drives an AMD driver
+      decode or H.264 encode: the route is x86-64's, and with the keys an
+      arm64 guest answered hardware HEVC decode true while a session
+      requiring it failed −17692 and none reached the host (**measured**,
+      arm64 macOS 14.6.1 guest, VA-API host, 2026-11-16). AppleGVA drives an
+      AMD driver
       through high-level commands (picture parameters and slice data;
       rate-control settings), which map onto Vulkan Video. The driver decodes
       H.264 and HEVC, each where the host's caps list it; HEVC in the profiles
-      they list (Main into NV12, Main 10 into P010).
+      they list (Main into NV12, Main 10 into P010). It encodes H.264 where
+      the caps list an H.264 encoder with a rate control, and the
+      accelerator then publishes `IOGVAH264EncodeCapabilities`, the ratings
+      VideoToolbox ranks the encoder by, as an AMD Mac's (`VTRating` 350,
+      `VTQualityRating` 50 on a Radeon Pro 5300M's, macOS 26.7.1): AppleGVA's
+      `h264.gva` is listed as hardware, and a session requiring hardware is
+      made and encodes on the host's encoder. It lists no HEVC encode, on a
+      host that encodes HEVC too, so VideoToolbox lists no `hevc.gva` and a
+      session requiring hardware fails −12908, as on a Mac without an HEVC
+      encoder (**measured**, macOS 26.7.2 guest, Iris Xe host, 2026-11-16).
     - **Routing:** AppleGVA hands a session to the AMD driver only on the
       Macs without an Intel GPU, or where `com.apple.AppleGVA`'s
       `gvaForceAMDKE` is set; elsewhere, an iMac20,1 among them, it looks for
@@ -1473,7 +1483,23 @@ Stages:
       holds a set the SPS predicts from another by its pictures as well,
       derived, so the driver writes every set by its pictures, a predicted
       one too (measured on the guest with a stream of 25 sets in its SPS, 22
-      of them predicted). Encode is to take the same path.
+      of them predicted).
+    - **An encode takes the same path.** AppleGVA's H.264 encoder sends one
+      encode command a frame (function 0x20, sub-ID 0x800), naming the source
+      IOSurface, its own SPS and PPS records (laid out as the decoder's
+      parsed ones), the picture's NAL header, its rate control (mode 0, a QP
+      of AppleGVA's own a frame) and a bitstream buffer of the driver's,
+      which it uses as a ring. The driver sends a command buffer of the
+      session's queue holding one video encoder, whose op
+      (`RGFX_OP_VIDEO_ENCODE_H264`) names textures over the source's two
+      planes and a Shared buffer the host writes the access unit and its
+      result into, with the session's settings where they changed. When
+      AppleGVA asks the command's status and it is done, the driver copies
+      the access unit into the ring at AppleGVA's start cursor, wrapping at
+      its capacity, then writes the end cursor and the access unit's length
+      in bits, which AppleGVA reads to take it out
+      (`guest/bundle/src/RgfxVideoDriver.cpp`). AppleGVA schedules a frame
+      only once it has the last one's status, so one frame is in flight.
     - **The HEVC output surface is named in the parameters, not on the
       command.** An H.264 decode arrives as a pipeline whose transfer command
       carries the output surface; an HEVC decode is a bare decode command with

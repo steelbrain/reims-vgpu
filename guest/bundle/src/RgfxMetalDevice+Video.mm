@@ -8,8 +8,10 @@
 #import "RgfxMetalDevice.h"
 
 #include <algorithm>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #include "RgfxSerializer.hpp"
 #include "RgfxVideoChannel.hpp"
@@ -46,7 +48,54 @@ constexpr size_t kBitstreams = 8;
 // access unit.
 constexpr size_t kBitstreamMin = 256 * 1024;
 
+// The source surfaces an encode session keeps textures over, past which the least recently used
+// goes: an encoder's pool of frames, which VideoToolbox hands it again and again. Each texture
+// holds its surface, so the few kept hold little.
+constexpr size_t kSourcesKept = 8;
+
+// An encode session's buffers its encodes' access units and results land in, free for the next
+// encode: each goes back here once the driver lets go of the encode's token (RgfxVideoEncodeWork).
+struct EncodeOutputs {
+	std::mutex lock;
+	std::vector<id<MTLBuffer>> free;
+};
+
 } // namespace
+
+// One encode's work, the token rgfx::video::encode answers: its command buffer, whose status and
+// wait it answers as the command buffer's (rgfx::video::tokenStatus, waitToken), and the buffer
+// its access unit and result land in, which goes back to its session's free ones as the work
+// goes.
+@interface RgfxVideoEncodeWork : NSObject {
+@public
+	id<MTLCommandBuffer> _commandBuffer;
+	id<MTLBuffer> _output;
+	uint64_t _resultOffset;
+	std::shared_ptr<EncodeOutputs> _outputs;
+}
+- (MTLCommandBufferStatus)status;
+- (void)waitUntilCompleted;
+@end
+
+@implementation RgfxVideoEncodeWork
+- (MTLCommandBufferStatus)status
+{
+	return _commandBuffer.status;
+}
+
+- (void)waitUntilCompleted
+{
+	[_commandBuffer waitUntilCompleted];
+}
+
+- (void)dealloc
+{
+	if (_outputs && _output != nil) {
+		std::lock_guard<std::mutex> hold(_outputs->lock);
+		_outputs->free.push_back(_output);
+	}
+}
+@end
 
 struct rgfx::video::Session {
 	RgfxMetalDevice *device;
@@ -80,6 +129,13 @@ struct rgfx::video::Session {
 	};
 	Bitstream bitstreams[kBitstreams];
 	size_t nextBitstream = 0;
+	// An encode session's: the textures over each source surface's two planes, by IOSurfaceID,
+	// the settings it last sent the host (none before its first encode), and its free output
+	// buffers.
+	std::unordered_map<uint64_t, Output> sources;
+	bool settingsSent = false;
+	RgfxVideoEncodeSettings sentSettings = {};
+	std::shared_ptr<EncodeOutputs> encodeOutputs = std::make_shared<EncodeOutputs>();
 };
 
 const RgfxVideoCodecCaps *rgfx::video::hostCodec(uint32_t codec, uint32_t direction)
@@ -104,6 +160,18 @@ RgfxVideoDecodeCaps rgfx::video::decodeCaps(uint32_t codec)
 	for (uint32_t i = 0; i < caps->codec_count && i < RGFX_VIDEO_CAPS_CODECS; i++)
 		if (caps->codecs[i].codec == codec && caps->codecs[i].direction == RGFX_VIDEO_DECODE)
 			return caps->decode[i];
+	return {};
+}
+
+RgfxVideoEncodeCaps rgfx::video::encodeCaps(uint32_t codec)
+{
+	RgfxMetalDevice *device = processDevice();
+	if (device == nil)
+		return {};
+	const RgfxVideoCaps *caps = [device videoCaps];
+	for (uint32_t i = 0; i < caps->codec_count && i < RGFX_VIDEO_CAPS_CODECS; i++)
+		if (caps->codecs[i].codec == codec && caps->codecs[i].direction == RGFX_VIDEO_ENCODE)
+			return caps->encode[i];
 	return {};
 }
 
@@ -176,6 +244,7 @@ void rgfx::video::closeSession(Session *session)
 		std::lock_guard<std::mutex> hold(session->lock);
 		last = session->last;
 		session->outputs.clear();
+		session->sources.clear();
 	}
 	[last waitUntilCompleted];
 	if (RgfxSerializer *serializer = [session->device serializer])
@@ -388,6 +457,143 @@ void *rgfx::video::decode(Session *session, const Decode &decode)
 		session->last = cb;
 	}
 	return (void *)CFBridgingRetain(cb);
+}
+
+namespace {
+
+// The textures over `source`'s two planes an encode of `session`'s reads, made once per surface;
+// false where the surface is of no format the host reads or a texture is not made. Over the
+// surface's pages where its block is made here: the host reads a source's bytes on the CPU, so a
+// device cache would only be one more copy. The caller holds the session's lock.
+bool sourceTextures(rgfx::video::Session *session, IOSurfaceRef source, id<MTLTexture> *luma,
+                    id<MTLTexture> *chroma)
+{
+	const OSType format = IOSurfaceGetPixelFormat(source);
+	if ((format != '420v' && format != '420f') || IOSurfaceGetPlaneCount(source) != 2)
+		return false;
+	const uint64_t key = IOSurfaceGetID(source);
+	auto it = session->sources.find(key);
+	if (it == session->sources.end()) {
+		if (session->sources.size() >= kSourcesKept) {
+			auto oldest = session->sources.begin();
+			for (auto o = session->sources.begin(); o != session->sources.end(); ++o)
+				if (o->second.lastUse < oldest->second.lastUse)
+					oldest = o;
+			session->sources.erase(oldest);
+		}
+		rgfx::video::Session::Output textures;
+		{
+			RgfxAskUncachedScope ask;
+			for (size_t plane = 0; plane < 2; plane++) {
+				const MTLPixelFormat format =
+				    plane == 0 ? MTLPixelFormatR8Unorm : MTLPixelFormatRG8Unorm;
+				MTLTextureDescriptor *desc = [MTLTextureDescriptor
+				    texture2DDescriptorWithPixelFormat:format
+				                                 width:IOSurfaceGetWidthOfPlane(source, plane)
+				                                height:IOSurfaceGetHeightOfPlane(source, plane)
+				                             mipmapped:NO];
+				desc.usage = MTLTextureUsageShaderRead;
+				id<MTLTexture> t = [session->device newTextureWithDescriptor:desc
+				                                                   iosurface:source
+				                                                       plane:plane];
+				if (t == nil)
+					return false;
+				(plane == 0 ? textures.luma : textures.chroma) = t;
+			}
+		}
+		it = session->sources.emplace(key, textures).first;
+	}
+	it->second.lastUse = ++session->uses;
+	*luma = it->second.luma;
+	*chroma = it->second.chroma;
+	return true;
+}
+
+// A free output buffer of `session`'s that holds `bytes`, or a new one; nil where the device
+// makes none.
+id<MTLBuffer> encodeOutput(rgfx::video::Session *session, size_t bytes)
+{
+	{
+		std::lock_guard<std::mutex> hold(session->encodeOutputs->lock);
+		auto &free = session->encodeOutputs->free;
+		for (auto it = free.begin(); it != free.end(); ++it)
+			if ((*it).length >= bytes) {
+				id<MTLBuffer> b = *it;
+				free.erase(it);
+				return b;
+			}
+		// The smaller ones go: the frames grew.
+		free.clear();
+	}
+	id<MTLBuffer> b = [session->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+	return b != nil && b.contents != nullptr ? b : nil;
+}
+
+} // namespace
+
+void *rgfx::video::encode(Session *session, const Encode &encode)
+{
+	if (session == nullptr || encode.source == nullptr || encode.capacity == 0 ||
+	    encode.capacity > UINT32_MAX)
+		return nullptr;
+	id<MTLTexture> luma, chroma;
+	bool send;
+	{
+		std::lock_guard<std::mutex> hold(session->lock);
+		if (!sourceTextures(session, encode.source, &luma, &chroma))
+			return nullptr;
+		send = !session->settingsSent ||
+		       memcmp(&session->sentSettings, &encode.settings, sizeof encode.settings) != 0;
+	}
+	// The access unit from the buffer's first byte, its result after it, at a multiple of 8.
+	const uint64_t resultOffset = (encode.capacity + 7) & ~7ull;
+	id<MTLBuffer> output = encodeOutput(session, resultOffset + sizeof(RgfxVideoEncodeResult));
+	if (output == nil)
+		return nullptr;
+	std::lock_guard<std::mutex> submit(session->submit);
+	id<MTLCommandBuffer> cb = [session->queue commandBuffer];
+	if (![cb isKindOfClass:[RgfxCmdBuffer class]])
+		return nullptr;
+	RgfxVideoOpEncode body = {};
+	body.bitstream_offset = 0;
+	body.bitstream_capacity = encode.capacity;
+	body.result_offset = resultOffset;
+	body.frame_index = encode.frameIndex;
+	body.flags = encode.forceKeyframe ? RGFX_VIDEO_ENCODE_FORCE_KEYFRAME : 0;
+	[(RgfxCmdBuffer *)cb rgfxEncodeVideoSession:session->objId
+	                                      codec:session->codec
+	                                     encode:body
+	                                   settings:send ? &encode.settings : nullptr
+	                                       luma:luma
+	                                     chroma:chroma
+	                                     output:output];
+	[cb commit];
+	RgfxVideoEncodeWork *work = [RgfxVideoEncodeWork new];
+	work->_commandBuffer = cb;
+	work->_output = output;
+	work->_resultOffset = resultOffset;
+	work->_outputs = session->encodeOutputs;
+	{
+		std::lock_guard<std::mutex> hold(session->lock);
+		session->last = cb;
+		session->settingsSent = true;
+		session->sentSettings = encode.settings;
+	}
+	return (void *)CFBridgingRetain(work);
+}
+
+bool rgfx::video::encodeResult(void *token, RgfxVideoEncodeResult *result, const uint8_t **bytes)
+{
+	id object = (__bridge id)token;
+	if (![object isKindOfClass:[RgfxVideoEncodeWork class]])
+		return false;
+	RgfxVideoEncodeWork *work = (RgfxVideoEncodeWork *)object;
+	if (work->_commandBuffer.status != MTLCommandBufferStatusCompleted)
+		return false;
+	const uint8_t *base = (const uint8_t *)work->_output.contents;
+	memcpy(result, base + work->_resultOffset, sizeof *result);
+	*bytes = base;
+	return true;
 }
 
 int rgfx::video::tokenStatus(void *token)

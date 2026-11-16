@@ -22,6 +22,11 @@
  * Picture where Main is, whose decoder takes its streams. Elsewhere it publishes none, and HEVC
  * decodes in software, as on a GPU without it.
  *
+ * AppleGVA's H.264 encoder ranks a GPU by its accelerator's IOGVAH264EncodeCapabilities: the
+ * ratings VideoToolbox weighs encoders by (VTRating, VTQualityRating). The accelerator publishes
+ * them where the host encodes H.264, as an AMD Mac's accelerator does (350 and 50 on a Radeon Pro
+ * 5300M's, macOS 26.7.1), and none elsewhere.
+ *
  * AppleGVA's vendor-driver route, which our bundle's video driver serves, is x86-64's. On an arm64
  * guest the keys bring no session to it: with them, on a host that decodes H.264 and HEVC,
  * VideoToolbox answered VTIsHardwareDecodeSupported true for HEVC, yet a session requiring a
@@ -103,6 +108,28 @@ static inline bool rgfxHevcDecode(const RgfxVideoCaps &caps, RgfxHevcDecode *out
 		d.maxLevel = c.max_level;
 		*out = d;
 		return true;
+	}
+	return false;
+}
+
+// The ratings the accelerator publishes for H.264 encode: an AMD Mac's (IOGVAH264EncodeCapabilities).
+constexpr uint32_t kRgfxH264EncodeRating = 350;
+constexpr uint32_t kRgfxH264EncodeQualityRating = 50;
+
+// Whether `caps` lists an H.264 encoder, for its accelerator to publish its ratings: an encode
+// entry with a profile and a rate control (RgfxVideoEncodeCaps, whose rate controls 0 say none).
+// False for an older host's caps, for a host with no video arm or no encoder, and on an arm64
+// guest.
+static inline bool rgfxH264Encode(const RgfxVideoCaps &caps)
+{
+	if (!kRgfxGuestVideoDriver || caps.version < RGFX_VIDEO_CAPS_VERSION)
+		return false;
+	const uint32_t n = caps.codec_count < RGFX_VIDEO_CAPS_CODECS ? caps.codec_count
+	                                                             : RGFX_VIDEO_CAPS_CODECS;
+	for (uint32_t i = 0; i < n; i++) {
+		const RgfxVideoCodecCaps &c = caps.codecs[i];
+		if (c.codec == RGFX_VIDEO_CODEC_H264 && c.direction == RGFX_VIDEO_ENCODE)
+			return c.profiles != 0 && caps.encode[i].rate_controls != 0;
 	}
 	return false;
 }

@@ -1,7 +1,7 @@
-// video_codecs_test: what the accelerator publishes of the host's video: its video driver, and
-// HEVC decode (RgfxVideoCodecs.hpp). Built with each architecture's rules (the Makefile's
-// video_codecs_test, and video_codecs_arm64_test with RGFX_GUEST_ARM64=1): the x86-64 kext
-// publishes what the host's caps list, the arm64e kext nothing.
+// video_codecs_test: what the accelerator publishes of the host's video: its video driver, HEVC
+// decode and H.264 encode (RgfxVideoCodecs.hpp). Built with each architecture's rules (the
+// Makefile's video_codecs_test, and video_codecs_arm64_test with RGFX_GUEST_ARM64=1): the x86-64
+// kext publishes what the host's caps list, the arm64e kext nothing.
 #include <cstdio>
 #include <cstdlib>
 
@@ -88,9 +88,43 @@ static void x86Rules()
 	RgfxVideoCaps counted = caps(RGFX_VIDEO_HEVC_MAIN, 153);
 	counted.codec_count = 0;
 	CHECK(!rgfxDecodesVideo(counted));
+	// H.264 encode's ratings are published where the caps list an H.264 encoder with a profile
+	// and a rate control: after the decoders, or alone.
+	RgfxVideoCaps encoder = caps(RGFX_VIDEO_HEVC_MAIN, 153);
+	encoder.codec_count = 3;
+	encoder.codecs[2] = encoder.codecs[0];
+	encoder.codecs[2].direction = RGFX_VIDEO_ENCODE;
+	encoder.encode[2].rate_controls = 1u << RGFX_VIDEO_RATE_CQP;
+	CHECK(rgfxH264Encode(encoder));
+	RgfxVideoCaps alone = {};
+	alone.version = RGFX_VIDEO_CAPS_VERSION;
+	alone.codec_count = 1;
+	alone.codecs[0] = encoder.codecs[2];
+	alone.encode[0] = encoder.encode[2];
+	CHECK(rgfxH264Encode(alone));
+	// Not where they list none: decoders alone, an encoder of no rate control (the host lists the
+	// codec but encodes nothing) or of no profile, an HEVC encoder, an older host's caps, an entry
+	// past the count.
+	CHECK(!rgfxH264Encode(caps(RGFX_VIDEO_HEVC_MAIN, 153)));
+	RgfxVideoCaps noRate = alone;
+	noRate.encode[0].rate_controls = 0;
+	CHECK(!rgfxH264Encode(noRate));
+	RgfxVideoCaps noEncodeProfile = alone;
+	noEncodeProfile.codecs[0].profiles = 0;
+	CHECK(!rgfxH264Encode(noEncodeProfile));
+	RgfxVideoCaps hevcEncoder = alone;
+	hevcEncoder.codecs[0].codec = RGFX_VIDEO_CODEC_HEVC;
+	CHECK(!rgfxH264Encode(hevcEncoder));
+	RgfxVideoCaps oldEncoder = alone;
+	oldEncoder.version = 0;
+	CHECK(!rgfxH264Encode(oldEncoder));
+	RgfxVideoCaps uncounted = alone;
+	uncounted.codec_count = 0;
+	CHECK(!rgfxH264Encode(uncounted));
 }
 
-// The arm64e kext's rules: no video driver and no HEVC decode, whatever the caps list.
+// The arm64e kext's rules: no video driver, no HEVC decode and no H.264 encode, whatever the caps
+// list.
 static void arm64Rules()
 {
 	CHECK(!kRgfxGuestVideoDriver);
@@ -108,6 +142,19 @@ static void arm64Rules()
 	hevcOnly.codec_count = 1;
 	CHECK(!rgfxDecodesVideo(hevcOnly));
 	CHECK(!rgfxHevcDecode(hevcOnly, &d));
+	// An H.264 encoder with a profile and a rate control, after the decoders or alone: no ratings.
+	RgfxVideoCaps encoder = both;
+	encoder.codec_count = 3;
+	encoder.codecs[2] = encoder.codecs[0];
+	encoder.codecs[2].direction = RGFX_VIDEO_ENCODE;
+	encoder.encode[2].rate_controls = 1u << RGFX_VIDEO_RATE_CQP;
+	CHECK(!rgfxH264Encode(encoder));
+	RgfxVideoCaps alone = {};
+	alone.version = RGFX_VIDEO_CAPS_VERSION;
+	alone.codec_count = 1;
+	alone.codecs[0] = encoder.codecs[2];
+	alone.encode[0] = encoder.encode[2];
+	CHECK(!rgfxH264Encode(alone));
 	// Nothing written to the answer.
 	CHECK(d.count == 0 && d.maxLevel == 0);
 }

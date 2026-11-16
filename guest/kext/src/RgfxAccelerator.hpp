@@ -691,7 +691,8 @@ private:
 	// (its definition says what breaks without it); a no-op where another device is named GFX0.
 	void nameProviderForVideo();
 	// Publishes the host's hardware video that AppleGVA reads from the accelerator, from the
-	// video caps the host wrote (RgfxVideoCodecs.hpp): HEVC decode, where the host has it.
+	// video caps the host wrote (RgfxVideoCodecs.hpp): its video driver, H.264 encode and HEVC
+	// decode, each where the host has it.
 	void publishVideoCodecs();
 	// Has IOSurface align the bytes per row it works out for a surface as the host's GPU takes
 	// such rows in place (RgfxSurfaceRows.hpp; IOSurface's own where the host asks no more), and

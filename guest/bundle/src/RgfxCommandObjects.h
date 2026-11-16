@@ -236,6 +236,20 @@ NS_ASSUME_NONNULL_BEGIN
                         chroma:(id<MTLTexture>)chroma
                     outputRows:(uint32_t)outputRows;
 
+/// Encodes the buffer's one encoder, a video encoder on the encode session `session`, of `codec`
+/// (RGFX_VIDEO_CODEC_*), holding one encode (RGFX_OP_VIDEO_ENCODE_H264 or _H265, `body`, its
+/// texture and buffer ids filled here): of the source surface `luma` and `chroma` lie over, which
+/// the buffer reads, into `output`, which it writes, the access unit at `body`'s bitstream_offset
+/// and the result at its result_offset; after the settings at `settings` where they changed (null
+/// for none). The video driver's (RgfxVideoChannel.hpp).
+- (void)rgfxEncodeVideoSession:(uint64_t)session
+                         codec:(uint32_t)codec
+                        encode:(RgfxVideoOpEncode)body
+                      settings:(nullable const RgfxVideoEncodeSettings *)settings
+                          luma:(id<MTLTexture>)luma
+                        chroma:(id<MTLTexture>)chroma
+                        output:(id<MTLBuffer>)output;
+
 @end
 
 // --- the encoders ------------------------------------------------------------

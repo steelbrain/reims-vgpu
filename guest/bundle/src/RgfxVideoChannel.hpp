@@ -12,6 +12,11 @@
  * reads it. The output surfaces are reached through textures over their planes, made once per
  * surface and place a picture lands at in it.
  *
+ * An encode is a command buffer of the session's queue too: the host reads the source surface
+ * through textures over its planes, in place, and writes the access unit and its result into a
+ * Shared buffer of the session's, which goes back to the session once the driver lets go of the
+ * encode's token.
+ *
  * Plain C++, so the driver's AppleGVA side stays C++; every handle is opaque.
  */
 
@@ -49,6 +54,11 @@ uint32_t outputPlaneAlignment(uint32_t sampleBytes);
 /// copy of their crop alone, the layout is past what a surface takes, or the process has no device
 /// of ours.
 RgfxVideoOutputLayout outputLayout(uint32_t codec);
+
+/// What the host's encoder of `codec` takes beyond its caps (RgfxVideoCaps::encode): its rate
+/// controls and B pictures. All zero where the process has no device of ours or the host has no
+/// such encoder.
+RgfxVideoEncodeCaps encodeCaps(uint32_t codec);
 
 /// A session on the host, its queue, and the textures it made over output surfaces.
 struct Session;
@@ -89,6 +99,30 @@ struct Decode {
 /// encoded (a surface of no format the codec lands in, a surface no texture lies over, or no
 /// command buffer).
 void *decode(Session *session, const Decode &decode);
+
+/// One frame to encode on its session, of its codec: the two-plane surface `source`, NV12's
+/// ('420v', '420f'), its whole planes, the settings' size; the `settings` in force from it on,
+/// which the call sends the host where they differ from the last it sent the session (the
+/// first's always); its place in display order, `frameIndex`; and whether it must be a keyframe.
+/// The access unit takes at most `capacity` bytes.
+struct Encode {
+	IOSurfaceRef source;
+	RgfxVideoEncodeSettings settings;
+	uint64_t frameIndex;
+	bool forceKeyframe;
+	uint64_t capacity;
+};
+
+/// Commits the encode on `session`'s queue: a token for its completion, null where it was not
+/// encoded (a source of no format the host reads, no texture over it, no buffer for its access
+/// unit, or no command buffer).
+void *encode(Session *session, const Encode &encode);
+
+/// What came of the encode `token` names, once it is done (tokenStatus 1): the host's result in
+/// `result`, and its access unit's bytes, `result->bitstream_size` of them where it says
+/// RGFX_VIDEO_ENCODE_OK, at `*bytes`, which stay until the token is let go. False where the
+/// token is no encode's or is not done.
+bool encodeResult(void *token, RgfxVideoEncodeResult *result, const uint8_t **bytes);
 
 /// Where the work `token` names is: 0 running, 1 done, -1 failed.
 int tokenStatus(void *token);

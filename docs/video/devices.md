@@ -3,8 +3,8 @@
 The reims-graphics device (PCI 1234:5247) decodes and encodes the guest's H.264 and HEVC on the
 host's hardware. The guest's video driver, in our Metal bundle, is AppleGVA's vendor driver
 ([docs/graphics-kext/design.md](../graphics-kext/design.md), "Decided", 16); it decodes, and
-sends no encode op yet. This file is the host's side: what it answers the guest, and what a
-decode and an encode do. The wire's records and their
+encodes H.264 (`ENCODE_H264`), sending no `ENCODE_H265` yet. This file is the host's side: what
+it answers the guest, and what a decode and an encode do. The wire's records and their
 fields are documented where they are defined: `crates/reims-vgpu-graphics/src/wire.rs` (the caps and
 the session) and `crates/reims-vgpu-graphics/src/ops/video.rs` (the ops).
 
@@ -27,11 +27,11 @@ hardware (`kVTCouldNotFindVideoDecoderErr`, `kVTCouldNotFindVideoEncoderErr`), a
 encodes every other session in software, as on a Mac without hardware video.
 
 An arm64 guest is offered no codec on any host: the arm64e kext names AppleGVA no video driver
-and publishes no HEVC decode, whatever the caps list, and VideoToolbox answers as above. The
-route our video driver serves, AppleGVA's vendor driver, is x86-64's: with the keys an arm64
-macOS 14.6.1 guest on a VA-API host answered `VTIsHardwareDecodeSupported` true for HEVC, while
-a session requiring a hardware HEVC decoder failed −17692, one requiring H.264 −12906, and no
-session reached the host (measured 2026-11-16).
+and publishes no HEVC decode or H.264 encode, whatever the caps list, and VideoToolbox answers
+as above. The route our video driver serves, AppleGVA's vendor driver, is x86-64's: with the
+keys an arm64 macOS 14.6.1 guest on a VA-API host answered `VTIsHardwareDecodeSupported` true
+for HEVC, while a session requiring a hardware HEVC decoder failed −17692, one requiring H.264
+−12906, and no session reached the host (measured 2026-11-16).
 
 ## The caps
 

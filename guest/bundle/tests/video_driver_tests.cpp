@@ -9,7 +9,10 @@
  * alignment, a plane's size or pitch, a budget, a limit, a decoder's tile parameter), that a tile
  * parameter it cannot write whole is refused rather than answered unwritten, that each driver
  * AppleGVA makes keeps bitstream pools of its own, and that a context's schedule waits only for
- * its own context's, not for another's held in its work.
+ * its own context's, not for another's held in its work. Of the encoder: that H.264 encode is
+ * listed and its contexts made only where the host encodes it, that its pixel pools are given and
+ * freed by kind, and that a frame is sent with the settings AppleGVA's records give and its access
+ * unit published in AppleGVA's ring as it is queried done, a failed one failing the next schedule.
  *
  * Exits 0 and prints a one-line summary when every check passes; aborts on the first failure.
  */
@@ -22,12 +25,15 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include <sys/mman.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "RgfxVideoBits.hpp"
@@ -36,6 +42,7 @@
 #include "RgfxVideoH265.hpp"
 
 extern "C" int AVD_CreateAVDAccelerator(void **out, const void *params, void *identity);
+extern "C" char **environ;
 
 namespace {
 
@@ -243,6 +250,30 @@ std::condition_variable g_sentChanged;
 FakeSession *g_holdOn = nullptr;
 bool g_held = false;
 std::vector<FakeSession *> g_sentOn;
+// Whether the stand-in host has its encoders, H.264's and HEVC's, as the hosts' arms have (the
+// run's host has; a check may take them away), and the rate controls they take (none: an encoder
+// the host lists without one, which the driver reads as none).
+bool g_hostEncodes = true;
+uint32_t g_encodeRates = 1u << RGFX_VIDEO_RATE_CQP | 1u << RGFX_VIDEO_RATE_VBR;
+// Each encode the driver sends, as it sent it.
+struct SentEncode {
+	FakeSession *session;
+	uint32_t surface;
+	RgfxVideoEncodeSettings settings;
+	uint64_t frameIndex;
+	bool forceKeyframe;
+	uint64_t capacity;
+};
+std::vector<SentEncode> g_encodes;
+// Each encode's work, done at once: what the host answers of it, the status and access unit the
+// stand-in answers the next encodes.
+struct EncodeWork {
+	RgfxVideoEncodeResult result;
+	std::vector<uint8_t> bytes;
+};
+std::deque<EncodeWork> g_encodeWork;
+uint32_t g_encodeStatus = RGFX_VIDEO_ENCODE_OK;
+std::vector<uint8_t> g_accessUnit;
 
 } // namespace
 
@@ -269,6 +300,26 @@ const RgfxVideoCodecCaps *hostCodec(uint32_t codec, uint32_t direction)
 	h264.formats = RGFX_VIDEO_FORMAT_NV12;
 	hevc.formats = RGFX_VIDEO_FORMAT_NV12 | RGFX_VIDEO_FORMAT_P010;
 	hevc.max_references = g_hevcMaxReferences;
+	// And, where a check has them, H.264 encode of every profile and HEVC encode of Main, of
+	// 144x144 to 4096x4096.
+	static RgfxVideoCodecCaps h264Encode = {}, hevcEncode = {};
+	h264Encode.codec = RGFX_VIDEO_CODEC_H264;
+	h264Encode.profiles = RGFX_VIDEO_H264_BASELINE | RGFX_VIDEO_H264_MAIN | RGFX_VIDEO_H264_HIGH;
+	h264Encode.max_level = 52;
+	hevcEncode.codec = RGFX_VIDEO_CODEC_HEVC;
+	hevcEncode.profiles = RGFX_VIDEO_HEVC_MAIN;
+	hevcEncode.max_level = 186;
+	for (RgfxVideoCodecCaps *c : {&h264Encode, &hevcEncode}) {
+		c->direction = RGFX_VIDEO_ENCODE;
+		c->formats = RGFX_VIDEO_FORMAT_NV12;
+		c->min_size[0] = c->min_size[1] = 144;
+		c->max_size[0] = c->max_size[1] = 4096;
+	}
+	if (direction == RGFX_VIDEO_ENCODE)
+		return !g_hostEncodes                 ? nullptr
+		       : codec == RGFX_VIDEO_CODEC_H264 ? &h264Encode
+		       : codec == RGFX_VIDEO_CODEC_HEVC ? &hevcEncode
+		                                        : nullptr;
 	if (direction != RGFX_VIDEO_DECODE || !g_hostDecodes)
 		return nullptr;
 	return codec == RGFX_VIDEO_CODEC_H264 ? &h264 : codec == RGFX_VIDEO_CODEC_HEVC ? &hevc : nullptr;
@@ -277,6 +328,14 @@ const RgfxVideoCodecCaps *hostCodec(uint32_t codec, uint32_t direction)
 RgfxVideoDecodeCaps decodeCaps(uint32_t codec)
 {
 	return codec == RGFX_VIDEO_CODEC_HEVC && g_hostDecodes ? g_decodeCaps : RgfxVideoDecodeCaps{};
+}
+
+RgfxVideoEncodeCaps encodeCaps(uint32_t codec)
+{
+	RgfxVideoEncodeCaps c = {};
+	if (g_hostEncodes && (codec == RGFX_VIDEO_CODEC_H264 || codec == RGFX_VIDEO_CODEC_HEVC))
+		c.rate_controls = g_encodeRates;
+	return c;
 }
 
 // A device whose linear textures of the planes' formats take 64 bytes.
@@ -332,6 +391,31 @@ void *decode(Session *session, const Decode &d)
 	g_sentChanged.notify_all();
 	return &g_work;
 }
+// Each encode is sent, as work that is done at once with the status and access unit the stand-in
+// answers.
+void *encode(Session *session, const Encode &e)
+{
+	g_encodes.push_back({session, e.source ? IOSurfaceGetID(e.source) : 0, e.settings, e.frameIndex,
+	                     e.forceKeyframe, e.capacity});
+	EncodeWork &work = g_encodeWork.emplace_back();
+	work.result.status = g_encodeStatus;
+	work.result.bitstream_size = g_accessUnit.size();
+	work.result.frame_index = e.frameIndex;
+	work.bytes = g_accessUnit;
+	return &work;
+}
+
+bool encodeResult(void *token, RgfxVideoEncodeResult *result, const uint8_t **bytes)
+{
+	for (EncodeWork &w : g_encodeWork)
+		if (&w == token) {
+			*result = w.result;
+			*bytes = w.bytes.data();
+			return true;
+		}
+	return false;
+}
+
 int tokenStatus(void *) { return 1; }
 int waitToken(void *)
 {
@@ -388,14 +472,15 @@ uint64_t allocate(void *driver, uint32_t pool, uint32_t bytes)
 	return callOn(driver, kAllocateBitstreamBufferPool, &p) == kOk ? address : 0;
 }
 
-// Whether the `bytes` at `address` are mapped and hold what was written there.
+// Whether the `bytes` at `address` are mapped and hold what was written there. Whether they are
+// mapped is msync's answer (ENOMEM for pages not mapped): macOS's mincore answers success for
+// pages not mapped, and reading them would fault.
 bool holds(uint64_t address, uint32_t bytes, uint8_t value)
 {
-	unsigned char present = 0;
 	const size_t page = (size_t)getpagesize();
-	for (uint64_t at = address & ~(uint64_t)(page - 1); at < address + bytes; at += page)
-		if (mincore((void *)at, page, (char *)&present) != 0)
-			return false;
+	const uint64_t first = address & ~(uint64_t)(page - 1);
+	if (msync((void *)first, (size_t)(address + bytes - first), MS_ASYNC) != 0)
+		return false;
 	const uint8_t *b = (const uint8_t *)address;
 	for (uint32_t i = 0; i < bytes; i++)
 		if (b[i] != value)
@@ -1493,29 +1578,459 @@ void checkH264SpsLayouts()
 	CFRelease(narrower);
 }
 
-int main()
+
+// --- encode ----------------------------------------------------------------------------------
+
+constexpr uint32_t kFunctionEncode = 0x20;
+constexpr uint64_t kEncodeH264 = 0x800, kEncodeHevc = 0x1000;
+constexpr uint64_t kBadArgument = 5;
+enum { kAllocatePixelBufferPool = 8, kQueryCommandStatus = 11 };
+constexpr uint32_t kQueryDone = 1;
+
+struct Query {
+	void *token;
+	uint32_t field_08;
+	uint32_t detail;
+	uint32_t status;
+	uint32_t field_14;
+};
+struct QueryList {
+	uint32_t count;
+	uint32_t field_04;
+	Query *queries;
+};
+struct PixelPoolRecord {
+	Format format;
+	uint64_t field_08, field_10, field_18, field_20, field_28;
+	uint64_t *address;
+};
+static_assert(sizeof(PixelPoolRecord) == 0x38, "pixel pool record layout");
+struct PixelPool {
+	uint32_t pool;
+	uint32_t field_04;
+	uint32_t size_factors[2];
+	uint32_t count;
+	uint32_t field_14;
+	PixelPoolRecord *records;
+};
+
+// The functions of the capability block of `id` and `sub`.
+int listed(uint32_t id, uint64_t sub)
 {
+	const CapabilityBlock *b = capabilities();
+	int n = 0;
+	for (uint32_t f = 0; f < b->function_count; f++)
+		n += b->functions[f]->function_id == id && b->functions[f]->sub_id == sub;
+	return n;
+}
+
+// The test binary's path, which checkListedOn runs again.
+const char *g_self;
+
+// In a process of its own, as the driver fills its capability block once a process (the test
+// binary run again, `listed ENCODES RATES`, which exits 0 where the block lists H.264 encode
+// `want` times): a host that `encodes` H.264 with rate controls `rates`.
+void checkListedOn(bool encodes, uint32_t rates, int want, const char *what)
+{
+	char encodesArg[4], ratesArg[16], wantArg[4];
+	std::snprintf(encodesArg, sizeof encodesArg, "%d", encodes ? 1 : 0);
+	std::snprintf(ratesArg, sizeof ratesArg, "%u", rates);
+	std::snprintf(wantArg, sizeof wantArg, "%d", want);
+	char *const argv[] = {const_cast<char *>(g_self), const_cast<char *>("listed"), encodesArg,
+	                      ratesArg, wantArg, nullptr};
+	pid_t pid = 0;
+	CHECK(posix_spawn(&pid, g_self, nullptr, nullptr, argv, environ) == 0, "%s: no child", what);
+	int status = 0;
+	CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	      "%s (the child's status %#x)", what, status);
+}
+
+// The child of checkListedOn: whether the block of its host lists H.264 encode `want` times, and
+// HEVC encode never.
+int listedChild(char **argv)
+{
+	g_hostEncodes = std::atoi(argv[2]) != 0;
+	g_encodeRates = (uint32_t)std::strtoul(argv[3], nullptr, 10);
+	void *table = nullptr;
+	uint8_t params[64] = {}, identity[64] = {};
+	if (AVD_CreateAVDAccelerator(&table, params, identity) != 0 || !table)
+		return 2;
+	g_table = (DriverTable *)table;
+	g_driver = createDriver();
+	if (listed(kFunctionEncode, kEncodeHevc) != 0)
+		return 3;
+	return listed(kFunctionEncode, kEncodeH264) == std::atoi(argv[4]) ? 0 : 1;
+}
+
+// The capability block lists H.264 encode (function 0x20, sub-ID 0x800, NV12 in and a bitstream
+// out) where the host has an H.264 encoder with a rate control, and no HEVC encode, though the host
+// has an HEVC encoder: the driver encodes no HEVC, so it answers as a Mac without an HEVC encoder
+// does (VideoToolbox lists no hevc.gva, and a create that requires hardware fails -12908, measured
+// on macOS 26.7.2); a host with no encoder, or one it lists with no rate control, lists none. The rest of the checks run on a host
+// that encodes, so every answer of the block with the encoder listed is one AppleGVA may divide by
+// (checkNoZeroAnswers).
+void checkEncodeListedApart()
+{
+	checkListedOn(false, 1u << RGFX_VIDEO_RATE_CQP, 0, "H.264 encode listed with no host encoder");
+	checkListedOn(true, 0, 0, "H.264 encode listed with no rate control");
+	checkListedOn(true, 1u << RGFX_VIDEO_RATE_CQP, 1, "H.264 encode not listed once");
+}
+
+void checkEncodeListed()
+{
+	CHECK(listed(kFunctionEncode, kEncodeH264) == 1, "H.264 encode not listed once");
+	CHECK(listed(kFunctionEncode, kEncodeHevc) == 0, "HEVC encode listed");
+	const CapabilityBlock *b = capabilities();
+	for (uint32_t f = 0; f < b->function_count; f++) {
+		const Function &fn = *b->functions[f];
+		if (fn.function_id != kFunctionEncode)
+			continue;
+		CHECK(fn.input_count == 1 && fn.inputs[0].fourcc == 'NV12' && fn.output_count == 1 &&
+		          fn.outputs[0].fourcc == 'rawb',
+		      "the encode's formats");
+	}
+}
+
+// Makes one encode context of `sub` of `width` x `height`: CreateContexts' answer, the context in
+// `context`.
+uint64_t makeEncode(void **context, uint32_t width, uint32_t height, uint64_t sub = kEncodeH264)
+{
+	static FunctionInfo f;
+	f = {};
+	f.function_id = kFunctionEncode;
+	f.sub_id = sub;
+	f.width = width;
+	f.height = height;
+	static const FunctionInfo *list[1];
+	list[0] = &f;
+	*context = nullptr;
+	ContextInfo info = {1, 0, list, context};
+	ContextInit init = {&info, nullptr};
+	return call(kCreateContexts, &init);
+}
+
+// An H.264 encode context opens an encode session on the host where the host encodes its size;
+// one of a size past the host's, one on a host with no encoder, and an HEVC encode on a host that
+// encodes HEVC are refused at their create, with no session left open.
+void checkEncodeCreate()
+{
+	g_hostEncodes = true;
+	const struct {
+		uint32_t width, height;
+		uint64_t sub;
+		bool encodes;
+		uint64_t want;
+	} cases[] = {
+	    {640, 480, kEncodeH264, true, kOk},           {4096, 4096, kEncodeH264, true, kOk},
+	    {4097, 480, kEncodeH264, true, kUnsupported}, {128, 480, kEncodeH264, true, kUnsupported},
+	    {640, 480, kEncodeH264, false, kUnsupported}, {640, 480, kEncodeHevc, true, kUnsupported},
+	};
+	for (const auto &c : cases) {
+		g_hostEncodes = c.encodes;
+		g_opened.clear();
+		void *context = nullptr;
+		CHECK(makeEncode(&context, c.width, c.height, c.sub) == c.want,
+		      "an encode of sub 0x%llx of %ux%u", (unsigned long long)c.sub, c.width, c.height);
+		CHECK(g_opened.size() == (c.want == kOk ? 1u : 0u), "%zu sessions for %ux%u",
+		      g_opened.size(), c.width, c.height);
+		CHECK((context != nullptr) == (c.want == kOk), "the context of %ux%u", c.width, c.height);
+		if (context) {
+			ContextDelete del = {1, 0, &context};
+			CHECK(call(kDeleteContexts, &del) == kOk, "DeleteContexts");
+			CHECK(g_opened[0]->closed, "a deleted encode's session left open");
+		}
+	}
+	g_hostEncodes = true;
+}
+
+// AllocatePixelBufferPool gives an encoder's pools of kinds 0xe and 0x1b: a buffer of the product
+// of the size factors' bytes for each record, its address written where the record points, each
+// its own. A pool of another kind, of no buffer or more than 32, or of no size, is refused, and so
+// is a record with nowhere to write. FreePixelBufferPool of a kind frees that kind's buffers alone,
+// a pool allocated again replaces the kind's, and DeleteDriver frees the rest.
+void checkPixelPools()
+{
+	void *driver = createDriver();
+	auto pool = [&](uint32_t kind, uint32_t count, uint32_t a, uint32_t b,
+	                std::vector<uint64_t> &addresses) {
+		addresses.assign(count, 0);
+		std::vector<PixelPoolRecord> records(count);
+		for (uint32_t i = 0; i < count; i++)
+			records[i].address = &addresses[i];
+		PixelPool p = {kind, 0, {a, b}, count, 0, records.data()};
+		return callOn(driver, kAllocatePixelBufferPool, &p);
+	};
+	std::vector<uint64_t> qp, other;
+	CHECK(pool(0xe, 3, 128, 64, qp) == kOk, "a pool of kind 0xe");
+	CHECK(qp[0] && qp[1] && qp[2] && qp[0] != qp[1] && qp[1] != qp[2] && qp[0] != qp[2],
+	      "the pool's addresses");
+	for (int i = 0; i < 3; i++)
+		std::memset((void *)qp[i], 0x40 + i, 128 * 64);
+	CHECK(pool(0x1b, 2, 4096, 3, other) == kOk, "a pool of kind 0x1b");
+	for (int i = 0; i < 2; i++)
+		std::memset((void *)other[i], 0x50 + i, 4096 * 3);
+	std::vector<uint64_t> none;
+	CHECK(pool(0x7, 1, 64, 64, none) == kBadArgument, "a pool of kind 7");
+	CHECK(pool(0xe, 0, 64, 64, none) == kBadArgument, "a pool of no buffer");
+	CHECK(pool(0xe, 33, 64, 64, none) == kBadArgument, "a pool of 33 buffers");
+	CHECK(pool(0xe, 1, 0, 64, none) == kBadArgument, "a pool of no size");
+	PixelPoolRecord nowhere = {};
+	PixelPool p = {0xe, 0, {64, 64}, 1, 0, &nowhere};
+	CHECK(callOn(driver, kAllocatePixelBufferPool, &p) == kBadArgument, "a record with no slot");
+	CHECK(holds(qp[2], 128 * 64, 0x42) && holds(other[1], 4096 * 3, 0x51),
+	      "a refused pool freed or wrote the buffers given");
+	CHECK(callOn(driver, kFreePixelBufferPool, (const void *)0xe) == kOk, "FreePixelBufferPool");
+	CHECK(!holds(qp[0], 128 * 64, 0x40), "kind 0xe's buffers kept after its free");
+	CHECK(holds(other[0], 4096 * 3, 0x50), "kind 0x1b's buffers freed with kind 0xe's");
+	std::vector<uint64_t> again;
+	CHECK(pool(0x1b, 1, 64, 64, again) == kOk && again[0], "a pool of kind 0x1b allocated again");
+	CHECK(!holds(other[0], 4096 * 3, 0x50), "the replaced pool's buffers kept");
+	CHECK(callOn(driver, kDeleteDriver, nullptr) == kOk, "DeleteDriver");
+	CHECK(!holds(again[0], 64, 0), "a deleted driver's pixel pool kept");
+}
+
+// An H.264 encode command's parameters as AppleGVA fills them, as far as the driver reads them:
+// the bitstream ring (buffer 0 of pool 0, its capacity, the access unit's start, and the end the
+// driver writes, P+0x0 to P+0x10), the source surface (P+0x20), its SPS and PPS records (P+0x2f0,
+// P+0x2f8), its NAL header (P+0x310, nal_unit_type at +0xc), its rate control (P+0x328: the mode,
+// the QP at +0x10 and the frame rate at +0x24) and the record the driver writes the access unit's
+// length in bits in (P+0x330, at +0x6c).
+struct H264Encode {
+	std::vector<uint8_t> sps;
+	rgfx::video::h264::Pps pps;
+	uint8_t nal[0x20] = {};
+	uint8_t rate[0x40] = {};
+	uint8_t length[0x80] = {};
+	uint8_t parameters[0x340] = {};
+
+	H264Encode(std::vector<uint8_t> record, const rgfx::video::h264::Pps &p, IOSurfaceRef source,
+	           uint32_t capacity, uint32_t start, uint32_t nalType, uint32_t mode, uint32_t qp)
+	    : sps(std::move(record)), pps(p)
+	{
+		const uint32_t ring[4] = {0, 0, capacity, start};
+		std::memcpy(parameters, ring, sizeof ring);
+		std::memcpy(parameters + 0x20, &source, 8);
+		const void *records[2] = {sps.data(), &pps};
+		std::memcpy(parameters + 0x2f0, records, sizeof records);
+		const void *at[] = {nal, rate, length};
+		std::memcpy(parameters + 0x310, &at[0], 8);
+		std::memcpy(parameters + 0x328, &at[1], 8);
+		std::memcpy(parameters + 0x330, &at[2], 8);
+		std::memcpy(nal + 0xc, &nalType, 4);
+		const uint32_t fps[2] = {30, 1};
+		std::memcpy(rate, &mode, 4);
+		std::memcpy(rate + 0x10, &qp, 4);
+		std::memcpy(rate + 0x24, fps, sizeof fps);
+	}
+	uint32_t end() const { return u32(parameters + 0x10); }
+	uint32_t bits() const { return u32(length + 0x6c); }
+	static uint32_t u32(const uint8_t *at)
+	{
+		uint32_t v;
+		std::memcpy(&v, at, 4);
+		return v;
+	}
+};
+
+// Schedules `e` on `context`: Schedule's answer, its token in `token`.
+uint64_t scheduleEncode(void *context, const H264Encode &e, void **token)
+{
+	Command c = {};
+	c.function_id = kFunctionEncode;
+	c.sub_id = kEncodeH264;
+	c.context = context;
+	c.parameters = e.parameters;
+	const Command *list[1] = {&c};
+	void *tokens[1] = {};
+	CommandList cl = {1, 0, list};
+	TokenList tl = {1, 0, tokens};
+	const uint64_t answer = call(kSchedule, &cl, &tl);
+	*token = tokens[0];
+	return answer;
+}
+
+// QueryCommandStatus of `token`, its detail set as AppleGVA's encoder sets it: the status.
+uint32_t queryEncode(void *token)
+{
+	Query q = {token, 0, 1, 0, 0};
+	QueryList ql = {1, 0, &q};
+	CHECK(call(kQueryCommandStatus, &ql) == kOk, "QueryCommandStatus");
+	return q.status;
+}
+
+// An encode is sent with the settings AppleGVA's records give, and published to AppleGVA as it is
+// queried done:
+// - the settings: the SPS's profile and level, the PPS's entropy coder, the source's size, the
+//   rate control's QP as a constant QP and its frame rate, no keyframes of the host's own; an IDR
+//   NAL header forces a keyframe, another does not; the frames count up in display order; the
+//   access unit takes the ring's capacity but a byte;
+// - the access unit lands in the ring at its start, wrapping at the ring's end, with the end
+//   cursor past it and its length in bits; a second query publishes nothing again;
+// - a frame the host failed, or whose access unit fills the ring, publishes none (the end at the
+//   start, a length of 0) and fails the context's next schedule, sending nothing; the schedule
+//   after it goes on;
+// - a rate control of a mode the driver does not read is not sent.
+void checkEncodeFrames()
+{
+	using namespace rgfx::video::h264;
+	g_hostEncodes = true;
+	g_encodeRates = 1u << RGFX_VIDEO_RATE_CQP;
+	g_encodes.clear();
+	g_encodeWork.clear();
+	constexpr uint32_t kRing = 0x1000;
+	const uint64_t ringAt = allocate(g_driver, 0, kRing);
+	CHECK(ringAt != 0, "the bitstream ring refused");
+	uint8_t *ring = (uint8_t *)ringAt;
+	IOSurfaceRef source = canvas(640, 480);
+	Sps sps = {};
+	sps.field_000 = 1;
+	sps.profile_idc = 100;
+	sps.level_idc = 30;
+	sps.chroma_format_idc = 1;
+	sps.log2_max_pic_order_cnt_lsb_minus4 = 2;
+	sps.max_num_ref_frames = 1;
+	sps.pic_width_in_mbs_minus1 = 39;
+	sps.pic_height_in_map_units_minus1 = 29;
+	sps.frame_mbs_only_flag = 1;
+	sps.direct_8x8_inference_flag = 1;
+	Pps pps = {};
+	pps.field_000 = 1;
+	pps.entropy_coding_mode_flag = 1;
+	void *context = nullptr;
+	CHECK(makeEncode(&context, 640, 480) == kOk, "a create of one H.264 encode");
+	g_accessUnit.assign(300, 0);
+	for (size_t i = 0; i < g_accessUnit.size(); i++)
+		g_accessUnit[i] = (uint8_t)(i * 7 + 1);
+	auto published = [&](uint32_t start) {
+		for (size_t i = 0; i < g_accessUnit.size(); i++)
+			if (ring[(start + i) % kRing] != g_accessUnit[i])
+				return false;
+		return true;
+	};
+	void *token = nullptr;
+	// An IDR frame at the ring's start.
+	std::memset(ring, 0, kRing);
+	H264Encode idr(spsRecordOn12(sps), pps, source, kRing, 0, 5, 0, 26);
+	CHECK(scheduleEncode(context, idr, &token) == kOk && token, "an IDR frame not scheduled");
+	CHECK(g_encodes.size() == 1, "%zu encodes sent", g_encodes.size());
+	const SentEncode &first = g_encodes[0];
+	const RgfxVideoEncodeSettings &st = first.settings;
+	CHECK(first.surface == IOSurfaceGetID(source) && first.frameIndex == 0 && first.forceKeyframe &&
+	          first.capacity == kRing - 1,
+	      "the IDR frame's encode: surface %u, frame %llu, keyframe %d, capacity %llu", first.surface,
+	      (unsigned long long)first.frameIndex, first.forceKeyframe,
+	      (unsigned long long)first.capacity);
+	CHECK(st.width == 640 && st.height == 480 && st.format == RGFX_VIDEO_FORMAT_NV12 &&
+	          st.profile == RGFX_VIDEO_H264_HIGH && st.level == 30 &&
+	          st.entropy == RGFX_VIDEO_ENTROPY_CABAC && st.rate_control == RGFX_VIDEO_RATE_CQP &&
+	          st.qp_i == 26 && st.qp_p == 26 && st.qp_b == 26 &&
+	          st.key_frame_interval == UINT32_MAX && st.frame_rate_num == 30 &&
+	          st.frame_rate_den == 1 && st.full_range == 0,
+	      "the IDR frame's settings: profile %#x level %u entropy %u rate %u qp %u keys %u fps %u/%u",
+	      st.profile, st.level, st.entropy, st.rate_control, st.qp_i, st.key_frame_interval,
+	      st.frame_rate_num, st.frame_rate_den);
+	CHECK(queryEncode(token) == kQueryDone, "the IDR frame not done");
+	CHECK(published(0) && idr.end() == 300 && idr.bits() == 2400,
+	      "the IDR frame's access unit: end %u, %u bits", idr.end(), idr.bits());
+	std::memset(ring, 0, kRing);
+	CHECK(queryEncode(token) == kQueryDone && ring[0] == 0, "a second query published again");
+	// A P frame near the ring's end: its access unit wraps.
+	H264Encode p(spsRecordOn12(sps), pps, source, kRing, 0xf00, 1, 0, 30);
+	CHECK(scheduleEncode(context, p, &token) == kOk, "a P frame not scheduled");
+	CHECK(g_encodes.size() == 2 && g_encodes[1].frameIndex == 1 && !g_encodes[1].forceKeyframe &&
+	          g_encodes[1].settings.qp_p == 30,
+	      "the P frame's encode");
+	CHECK(queryEncode(token) == kQueryDone, "the P frame not done");
+	CHECK(published(0xf00) && p.end() == (0xf00 + 300) % kRing && p.bits() == 2400,
+	      "the wrapped access unit: end %#x, %u bits", p.end(), p.bits());
+	// A frame the host failed.
+	g_encodeStatus = RGFX_VIDEO_ENCODE_FAILED;
+	H264Encode failed(spsRecordOn12(sps), pps, source, kRing, 0x100, 1, 0, 30);
+	CHECK(scheduleEncode(context, failed, &token) == kOk, "the failing frame not scheduled");
+	g_encodeStatus = RGFX_VIDEO_ENCODE_OK;
+	CHECK(queryEncode(token) == kQueryDone, "the failed frame not done");
+	CHECK(failed.end() == 0x100 && failed.bits() == 0, "the failed frame published: end %#x, %u bits",
+	      failed.end(), failed.bits());
+	const size_t before = g_encodes.size();
+	H264Encode after(spsRecordOn12(sps), pps, source, kRing, 0x100, 1, 0, 30);
+	CHECK(scheduleEncode(context, after, &token) == kNotSent, "the frame after a failed one scheduled");
+	CHECK(g_encodes.size() == before, "the frame after a failed one sent");
+	CHECK(scheduleEncode(context, after, &token) == kOk, "the next frame not scheduled");
+	CHECK(queryEncode(token) == kQueryDone && after.end() == 0x100 + 300, "the next frame not published");
+	// An access unit that fills the ring is not published.
+	g_accessUnit.assign(kRing, 0x77);
+	H264Encode full(spsRecordOn12(sps), pps, source, kRing, 0, 1, 0, 30);
+	CHECK(scheduleEncode(context, full, &token) == kOk, "the full frame not scheduled");
+	CHECK(queryEncode(token) == kQueryDone && full.end() == 0 && full.bits() == 0,
+	      "an access unit that fills the ring published");
+	CHECK(scheduleEncode(context, after, &token) == kNotSent, "the frame after a full one scheduled");
+	g_accessUnit.assign(16, 0x11);
+	// A rate control of mode 1.
+	const size_t sent = g_encodes.size();
+	H264Encode bitrate(spsRecordOn12(sps), pps, source, kRing, 0, 1, 1, 0);
+	CHECK(scheduleEncode(context, bitrate, &token) == kNotSent, "a frame of rate mode 1 scheduled");
+	CHECK(g_encodes.size() == sent, "a frame of rate mode 1 sent");
+	// Constrained Baseline with CAVLC.
+	sps.profile_idc = 66;
+	pps.entropy_coding_mode_flag = 0;
+	void *baseline = nullptr;
+	CHECK(makeEncode(&baseline, 640, 480) == kOk, "a create of a Baseline encode");
+	H264Encode cavlc(spsRecordOn12(sps), pps, source, kRing, 0, 5, 0, 26);
+	CHECK(scheduleEncode(baseline, cavlc, &token) == kOk, "a Baseline frame not scheduled");
+	CHECK(g_encodes.back().settings.profile == RGFX_VIDEO_H264_BASELINE &&
+	          g_encodes.back().settings.entropy == RGFX_VIDEO_ENTROPY_CAVLC &&
+	          g_encodes.back().frameIndex == 0,
+	      "the Baseline frame's settings");
+	CHECK(queryEncode(token) == kQueryDone, "the Baseline frame not done");
+	for (void *c : {context, baseline}) {
+		ContextDelete del = {1, 0, &c};
+		CHECK(call(kDeleteContexts, &del) == kOk, "DeleteContexts");
+	}
+	CHECK(callOn(g_driver, kFreeBitstreamBufferPool, (const void *)0) == kOk,
+	      "FreeBitstreamBufferPool");
+	CFRelease(source);
+	g_encodeRates = 1u << RGFX_VIDEO_RATE_CQP | 1u << RGFX_VIDEO_RATE_VBR;
+}
+
+// Runs a check, naming it first where VIDEO_TESTS_TRACE is set, so a crash names its check.
+#define RUN(check)                                       \
+	do {                                             \
+		if (std::getenv("VIDEO_TESTS_TRACE"))    \
+			std::fprintf(stderr, "%s\n", #check); \
+		check();                                 \
+	} while (0)
+
+int main(int argc, char **argv)
+{
+	if (argc == 5 && std::strcmp(argv[1], "listed") == 0)
+		return listedChild(argv);
+	g_self = argv[0];
+	RUN(checkEncodeListedApart);
 	void *table = nullptr;
 	uint8_t params[64] = {}, identity[64] = {};
 	CHECK(AVD_CreateAVDAccelerator(&table, params, identity) == 0 && table, "the driver's table");
 	g_table = (DriverTable *)table;
 	g_driver = createDriver();
-	checkPoolsPerDriver();
-	checkFailedCreate();
-	checkH264SizeAtCreate();
-	checkDelete();
-	checkUnsentDecode();
-	checkTileLanding();
-	checkHostBounds();
-	checkHostVerdict();
-	checkContextsScheduleApart();
-	checkFrameDescriptions();
-	checkH264SpsLayouts();
-	checkNoZeroAnswers();
-	checkTileInfo();
-	checkTileInfoRefused();
-	checkLayoutFromHost();
-	checkLayoutInPlace();
+	RUN(checkPoolsPerDriver);
+	RUN(checkFailedCreate);
+	RUN(checkH264SizeAtCreate);
+	RUN(checkDelete);
+	RUN(checkUnsentDecode);
+	RUN(checkTileLanding);
+	RUN(checkHostBounds);
+	RUN(checkHostVerdict);
+	RUN(checkContextsScheduleApart);
+	RUN(checkFrameDescriptions);
+	RUN(checkH264SpsLayouts);
+	RUN(checkNoZeroAnswers);
+	RUN(checkTileInfo);
+	RUN(checkTileInfoRefused);
+	RUN(checkLayoutFromHost);
+	RUN(checkLayoutInPlace);
+	RUN(checkEncodeListed);
+	RUN(checkEncodeCreate);
+	RUN(checkPixelPools);
+	RUN(checkEncodeFrames);
 	std::printf("video_driver_tests: %d checks passed\n", g_checks);
 	return 0;
 }

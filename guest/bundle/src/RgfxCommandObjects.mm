@@ -2083,6 +2083,25 @@ enum RgfxStage : unsigned {
 	_encoder->endEncoder();
 }
 
+- (void)rgfxEncodeVideoSession:(uint64_t)session
+                         codec:(uint32_t)codec
+                        encode:(RgfxVideoOpEncode)body
+                      settings:(const RgfxVideoEncodeSettings *)settings
+                          luma:(id<MTLTexture>)luma
+                        chroma:(id<MTLTexture>)chroma
+                        output:(id<MTLBuffer>)output
+{
+	_encoder->beginVideoPass(session);
+	body.source_luma_texture_obj_id = rgfxReads(_encoder, luma);
+	body.source_chroma_texture_obj_id = rgfxReads(_encoder, chroma);
+	body.bitstream_buffer_obj_id = rgfxWrites(_encoder, output);
+	body.result_buffer_obj_id = body.bitstream_buffer_obj_id;
+	_encoder->videoEncode(codec == RGFX_VIDEO_CODEC_HEVC ? RGFX_OP_VIDEO_ENCODE_H265
+	                                                     : RGFX_OP_VIDEO_ENCODE_H264,
+	                      body, settings);
+	_encoder->endEncoder();
+}
+
 - (nullable id<MTLBlitCommandEncoder>)blitCommandEncoder
 {
 	_encoder->beginBlitPass();

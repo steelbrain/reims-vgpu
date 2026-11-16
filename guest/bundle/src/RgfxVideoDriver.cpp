@@ -135,10 +135,15 @@ enum : uint32_t {
 	kFunctionDecode = 1,
 	kFunctionProcess = 2,
 	kFunctionTransfer = 0x10,
+	kFunctionEncode = 0x20,
 	kFunctionPipeline = 0x80,
 };
 constexpr uint64_t kCodecH264 = 0x8;
 constexpr uint64_t kCodecHevc = 0x800;
+// An encode's sub-ID for H.264, NV12 frames in and a bitstream out, as AMD's driver lists it: under
+// the encode function, 0x800 is H.264 (an HEVC encode is 0x1000), where under the decode function
+// it is HEVC.
+constexpr uint64_t kEncodeH264 = 0x800;
 
 Function &addFunction(CapabilityBlock &b, uint32_t function_id, uint64_t sub_id, uint32_t in,
 		      std::initializer_list<uint32_t> outs, uint32_t engine = kVideoEngine)
@@ -197,6 +202,12 @@ void fillCapabilities(CapabilityBlock &b)
 		else if (main10)
 			addDecoder(b, kCodecHevc, {'x420', 'xf20'});
 	}
+	// H.264 encode, where the host's hardware takes it (an encoder with a rate control,
+	// RgfxVideoEncodeCaps), from NV12 frames: one function, as AMD's driver lists it, with no
+	// pipeline.
+	if (rgfx::video::hostCodec(RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_ENCODE) &&
+	    rgfx::video::encodeCaps(RGFX_VIDEO_CODEC_H264).rate_controls != 0)
+		addFunction(b, kFunctionEncode, kEncodeH264, 'NV12', {'rawb'});
 	// Frame processing on the graphics engine.
 	addFunction(b, kFunctionProcess, 0x10, 'NV12', {'NV12'}, kGraphicsEngine);
 	b.functions = b.function_list;
@@ -299,6 +310,33 @@ struct PixelRequirement {
 };
 static_assert(offsetof(PixelRequirement, alignments) == 0x40, "pixel requirement layout");
 
+// AllocatePixelBufferPool: buffers of the driver's for an encode, one for each record, whose
+// address the driver writes where the record's `address` points. AMD's driver takes pools of
+// kinds 0xe and 0x1b, one to 32 buffers of the product of the two size factors' bytes each.
+struct PixelPoolRecord {
+	Format format;
+	uint64_t field_08;
+	uint64_t field_10;
+	uint64_t field_18;
+	uint64_t field_20;
+	uint64_t field_28;
+	uint64_t *address; // out: where the buffer's address goes
+};
+static_assert(sizeof(PixelPoolRecord) == 0x38, "pixel pool record layout");
+
+struct PixelPool {
+	uint32_t pool;
+	uint32_t field_04;
+	uint32_t size_factors[2]; // a buffer's bytes are their product
+	uint32_t count;
+	uint32_t field_14;
+	PixelPoolRecord *records;
+};
+static_assert(offsetof(PixelPool, records) == 0x18, "pixel pool layout");
+
+// The pool kinds AllocatePixelBufferPool takes, AMD's driver's.
+constexpr uint32_t kPixelPoolKinds[] = {0xe, 0x1b};
+
 // ScheduleAVDCommands: a list of commands, and a list the driver fills with a token per command,
 // which AppleGVA hands back in its status queries.
 struct Command {
@@ -357,6 +395,9 @@ struct DriverParamList {
 enum : uint32_t {
 	// Whether a function (its ID, sub-ID and engine) is listed, and its budget.
 	kParamFunctionAvailable = 9,
+	// Asked by the H.264 encoder as it sets a session up: answered as the decoders' limit is,
+	// which it takes.
+	kParam0c = 0xc,
 	// The decoders' pixel-rate limit.
 	kParamDecodeLimit = 0xd,
 	// The capability block, current: AppleGVA asks it before it sizes a session's buffers.
@@ -487,6 +528,10 @@ struct Context {
 	// Held across a schedule of its pictures (ScheduleCommands): one list of the context's at a
 	// time, so they reach its session in AppleGVA's order, while other contexts' lists go on.
 	std::mutex schedule{};
+	// An encode context's: the frames it sent, in display order, and whether the host failed one
+	// since its last schedule, which fails its next (RgfxVideoStatus.hpp).
+	uint64_t frames = 0;
+	std::atomic<bool> encode_failed{false};
 };
 
 // The live sessions, whose output textures go when AppleGVA frees its frames' pool.
@@ -509,6 +554,8 @@ constexpr size_t kMaxPools = 8;
 // layers in two in one process) freed the buffers the first was still writing access units in.
 struct Driver {
 	BitstreamBuffers pools[kMaxPools];
+	// The encoder's buffers AllocatePixelBufferPool hands out, by pool kind.
+	BitstreamBuffers pixelPools[kMaxPools];
 };
 
 // The live drivers, and their pools, under g_poolLock.
@@ -574,6 +621,11 @@ void freePool(BitstreamBuffers &b)
 struct Token {
 	uint64_t seqno;
 	void *work;
+	// An encode's: its context, and its command's parameters, where its access unit, cursors and
+	// length are published once it is done; and whether they were.
+	Context *encode;
+	uint8_t *parameters;
+	bool published;
 };
 constexpr size_t kTokens = 1024;
 std::mutex g_tokenLock;
@@ -633,6 +685,13 @@ const Command *decodeCommand(const Command *c)
 		c = (const Command *)c->output;
 	}
 	return nullptr;
+}
+
+// The work command of `c`: an encode, or the decode `c` leads to (decodeCommand); null where there
+// is none.
+const Command *workCommand(const Command *c)
+{
+	return c && c->function_id == kFunctionEncode ? c : decodeCommand(c);
 }
 
 // Logs, once a process, why a picture was not sent.
@@ -1089,6 +1148,184 @@ void *decodePicture(const Command *c)
 	return context->sub_id == kCodecHevc ? decodeHevcPicture(c) : decodeH264Picture(c);
 }
 
+// --- encode ----------------------------------------------------------------------------------
+
+// The host's encoder of `codec`: its caps, or null where the host lists none, or lists it with no
+// rate control (RgfxVideoEncodeCaps, which reads that as none).
+const RgfxVideoCodecCaps *hostEncoder(uint32_t codec)
+{
+	const RgfxVideoCodecCaps *caps = rgfx::video::hostCodec(codec, RGFX_VIDEO_ENCODE);
+	return caps && rgfx::video::encodeCaps(codec).rate_controls != 0 ? caps : nullptr;
+}
+
+// An H.264 encode command's parameters (Command::parameters, P), as AppleGVA's encoder fills them
+// for the encode function's sub-ID 0x800. Where the access unit goes: the bitstream buffer of the
+// driver's it names by pool and index, which is a ring of `capacity` bytes; the access unit starts
+// at `start`, and the driver writes the cursor past its last byte at `end`. Then the source frame,
+// an IOSurface; AppleGVA's own records of the stream it codes: its SPS and PPS, laid out as the
+// decoder's parsed ones (RgfxVideoH264.hpp), the picture's NAL header and its rate control; and
+// the record the driver writes the access unit's length in.
+constexpr size_t kEncodePool = 0x000, kEncodeIndex = 0x004, kEncodeCapacity = 0x008,
+                 kEncodeStart = 0x00c, kEncodeEnd = 0x010, kEncodeSource = 0x020,
+                 kEncodeSps = 0x2f0, kEncodePps = 0x2f8, kEncodeNal = 0x310, kEncodeRate = 0x328,
+                 kEncodeLength = 0x330;
+// The picture's NAL header (the record at P+0x310): its nal_unit_type, 5 for an IDR picture.
+constexpr size_t kNalUnitType = 0x0c;
+constexpr uint32_t kNalIdr = 5;
+// The rate control (the record at P+0x328): its mode, 0 for a QP of AppleGVA's own a frame, and
+// that QP. What the other modes and the other fields hold is not read yet.
+constexpr size_t kRateMode = 0x00, kRateQp = 0x10, kRateFrameRate = 0x24;
+constexpr uint32_t kRateConstantQp = 0;
+// The length record (P+0x330): the access unit's length in bits, which AppleGVA reads once the
+// command is done (it takes none of 7 bits or fewer).
+constexpr size_t kLengthBits = 0x6c;
+
+// The settings the host encodes the frame of command parameters `P` with, from the source
+// `source` and AppleGVA's records of its stream, into `out`; false, logged once a reason, where
+// they ask what the host does not encode.
+bool encodeSettings(Context *context, const uint8_t *P, IOSurfaceRef source,
+                    RgfxVideoEncodeSettings *out)
+{
+	const RgfxVideoCodecCaps *caps = hostEncoder(RGFX_VIDEO_CODEC_H264);
+	const uint8_t *spsRecord = (const uint8_t *)u64At(P, kEncodeSps);
+	const auto *pps = (const rgfx::video::h264::Pps *)u64At(P, kEncodePps);
+	const uint8_t *rate = (const uint8_t *)u64At(P, kEncodeRate);
+	if (!caps || !spsRecord || !pps || !rate) {
+		static std::atomic<bool> said;
+		notSent(said, "its encode names no SPS (+0x2f0), no PPS (+0x2f8) or no rate control "
+		              "(+0x328), or the host encodes no H.264");
+		return false;
+	}
+	const uint32_t width = (uint32_t)IOSurfaceGetWidth(source),
+	               height = (uint32_t)IOSurfaceGetHeight(source);
+	rgfx::video::h264::Sps sps;
+	if (!h264Sps(context, spsRecord, pps->seq_parameter_set_id, width, height, &sps))
+		return false;
+	const uint32_t profile = sps.profile_idc == 66    ? RGFX_VIDEO_H264_BASELINE
+	                         : sps.profile_idc == 77  ? RGFX_VIDEO_H264_MAIN
+	                         : sps.profile_idc == 100 ? RGFX_VIDEO_H264_HIGH
+	                                                  : 0;
+	if (!(caps->profiles & profile) || width % 2 || height % 2 ||
+	    !rgfx::video::sizeTaken(caps, width, height)) {
+		static std::atomic<bool> said;
+		notSent(said, "its encode asks a profile or a size the host does not encode");
+		return false;
+	}
+	RgfxVideoEncodeSettings s = {};
+	s.width = width;
+	s.height = height;
+	s.format = RGFX_VIDEO_FORMAT_NV12;
+	s.profile = profile;
+	s.level = sps.level_idc;
+	s.entropy = pps->entropy_coding_mode_flag ? RGFX_VIDEO_ENTROPY_CABAC : RGFX_VIDEO_ENTROPY_CAVLC;
+	s.full_range = IOSurfaceGetPixelFormat(source) == '420f';
+	// AppleGVA codes each frame's own keyframes (its NAL header says which): the host makes none
+	// of its own.
+	s.key_frame_interval = UINT32_MAX;
+	s.frame_rate_num = u32At(rate, kRateFrameRate);
+	s.frame_rate_den = u32At(rate, kRateFrameRate + 4);
+	if (s.frame_rate_num == 0 || s.frame_rate_den == 0)
+		s.frame_rate_num = s.frame_rate_den = 0;
+	s.quality = 50;
+	const uint32_t mode = u32At(rate, kRateMode);
+	if (mode != kRateConstantQp || !(rgfx::video::encodeCaps(RGFX_VIDEO_CODEC_H264).rate_controls &
+	                                 (1u << RGFX_VIDEO_RATE_CQP))) {
+		static std::atomic<bool> said;
+		notSent(said, "its encode's rate control is of a mode the driver does not read");
+		return false;
+	}
+	const uint32_t qp = std::min<uint32_t>(u32At(rate, kRateQp), 51);
+	s.rate_control = RGFX_VIDEO_RATE_CQP;
+	s.qp_i = s.qp_p = s.qp_b = qp;
+	*out = s;
+	return true;
+}
+
+// Commits the encode command `c`'s frame on its context's session: its work on the host, or null
+// where it could not be sent.
+void *encodeFrame(const Command *c)
+{
+	Context *context = (Context *)c->context;
+	const uint8_t *P = c->parameters;
+	if (!context || !context->session || context->function_id != kFunctionEncode || !P) {
+		static std::atomic<bool> said;
+		notSent(said, "its encode command names no encode session or no parameters");
+		return nullptr;
+	}
+	IOSurfaceRef source = (IOSurfaceRef)u64At(P, kEncodeSource);
+	const uint8_t *nal = (const uint8_t *)u64At(P, kEncodeNal);
+	const uint32_t capacity = u32At(P, kEncodeCapacity);
+	const uint8_t *ring;
+	size_t ringBytes;
+	if (!source || CFGetTypeID(source) != IOSurfaceGetTypeID() || !nal || capacity < 2 ||
+	    !bitstreamBuffer(context->driver, u32At(P, kEncodePool), u32At(P, kEncodeIndex), &ring,
+	                     &ringBytes) ||
+	    capacity > ringBytes || u32At(P, kEncodeStart) >= capacity) {
+		static std::atomic<bool> said;
+		notSent(said, "its encode names no source surface (+0x20), no NAL header (+0x310), or "
+		              "no bitstream ring of the driver's (+0x0 to +0xc)");
+		return nullptr;
+	}
+	rgfx::video::Encode e = {};
+	e.source = source;
+	if (!encodeSettings(context, P, source, &e.settings))
+		return nullptr;
+	e.frameIndex = context->frames;
+	e.forceKeyframe = u32At(nal, kNalUnitType) == kNalIdr;
+	// The ring holds the access unit; it never fills, as its cursors would then meet.
+	e.capacity = capacity - 1;
+	void *work = rgfx::video::encode(context->session, e);
+	if (!work) {
+		static std::atomic<bool> said;
+		notSent(said, "a source of no format the host reads, or no command buffer");
+		return nullptr;
+	}
+	context->frames++;
+	return work;
+}
+
+// Publishes the done encode of token `t` to AppleGVA: its access unit written in the bitstream
+// ring at the command's start, wrapping at the ring's end, the end cursor past it, and its length
+// in bits. A frame the host did not encode, or whose access unit is not fit to publish, leaves the
+// end at the start and a length of 0, which AppleGVA takes as no access unit, and fails the
+// context's next schedule. Once a token, under g_tokenLock.
+void publishEncoded(Token *t)
+{
+	if (t->published)
+		return;
+	t->published = true;
+	uint8_t *P = t->parameters;
+	uint8_t *length = (uint8_t *)u64At(P, kEncodeLength);
+	const uint32_t capacity = u32At(P, kEncodeCapacity), start = u32At(P, kEncodeStart);
+	RgfxVideoEncodeResult result = {};
+	const uint8_t *bytes = nullptr;
+	const uint8_t *ring = nullptr;
+	size_t ringBytes = 0;
+	const bool done = rgfx::video::encodeResult(t->work, &result, &bytes) &&
+	                  result.status == RGFX_VIDEO_ENCODE_OK && result.bitstream_size > 0 &&
+	                  result.bitstream_size < capacity && start < capacity && length &&
+	                  bitstreamBuffer(t->encode->driver, u32At(P, kEncodePool), u32At(P, kEncodeIndex),
+	                                  &ring, &ringBytes) &&
+	                  capacity <= ringBytes;
+	const uint32_t size = done ? (uint32_t)result.bitstream_size : 0;
+	if (done) {
+		uint8_t *to = const_cast<uint8_t *>(ring);
+		const uint32_t first = std::min(size, capacity - start);
+		memcpy(to + start, bytes, first);
+		memcpy(to, bytes + first, size - first);
+	} else {
+		t->encode->encode_failed = true;
+		static std::atomic<bool> said;
+		if (!said.exchange(true))
+			os_log_error(rgfxLog(), "RGFX: video: an encode not delivered: host status %u, %llu bytes",
+			             result.status, (unsigned long long)result.bitstream_size);
+	}
+	const uint32_t end = (uint32_t)(((uint64_t)start + size) % capacity), bits = size * 8;
+	memcpy(P + kEncodeEnd, &end, sizeof end);
+	if (length)
+		memcpy(length + kLengthBits, &bits, sizeof bits);
+}
+
 uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 {
 	switch (entry) {
@@ -1110,11 +1347,29 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			Context *context = fi ? new Context{(Driver *)a0, fi->function_id, fi->sub_id,
 							    fi->width, fi->height, nullptr, {}}
 					      : nullptr;
-			const uint32_t codec = !context || fi->function_id != kFunctionDecode ? 0
+			const bool encode = context && fi->function_id == kFunctionEncode;
+			const uint32_t codec = encode ? (fi->sub_id == kEncodeH264 ? RGFX_VIDEO_CODEC_H264 : 0)
+			                       : !context || fi->function_id != kFunctionDecode ? 0
 			                       : fi->sub_id == kCodecH264                       ? RGFX_VIDEO_CODEC_H264
 			                       : fi->sub_id == kCodecHevc                       ? RGFX_VIDEO_CODEC_HEVC
 			                                                                        : 0;
-			if (codec != 0) {
+			if (encode) {
+				// An encode of a coded size the host does not encode is refused here, where
+				// VideoToolbox hears of it at its session's create.
+				const RgfxVideoCodecCaps *caps = codec ? hostEncoder(codec) : nullptr;
+				if (caps && rgfx::video::sizeTaken(caps, fi->width, fi->height))
+					context->session = rgfx::video::openSession(codec, RGFX_VIDEO_ENCODE);
+				if (!context->session) {
+					for (uint32_t j = 0; j < i; j++) {
+						deleteContext((Context *)ci->info->contexts[j]);
+						ci->info->contexts[j] = nullptr;
+					}
+					delete context;
+					return kUnsupported;
+				}
+				std::lock_guard<std::mutex> hold(g_sessionLock);
+				g_sessions.push_back(context);
+			} else if (codec != 0) {
 				// An H.264 stream of a coded size the host does not decode is refused here, where
 				// VideoToolbox hears of it and turns to its software decoder: AppleGVA's H.264
 				// decoder hears of no failure later (RgfxVideoStatus.hpp).
@@ -1160,7 +1415,9 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		BitstreamRequirement *r = (BitstreamRequirement *)a1;
 		if (!r)
 			return kBadArgument;
-		const uint32_t alignment = bitstreamAlignment(r->sub_id);
+		// An encode's buffers are written by the driver alone: AMD's driver answers 8 bytes.
+		const uint32_t alignment =
+		    r->function_id == kFunctionEncode ? 8 : bitstreamAlignment(r->sub_id);
 		for (uint32_t &a : r->alignment)
 			a = alignment;
 		return kOk;
@@ -1241,9 +1498,10 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		// as AMD's driver on a Mac answers (rows of whole macroblocks, at 256 bytes): the planes'
 		// rows those, the frame's width as it is, and AppleGVA extends the planes below the
 		// frame by the rows past it.
-		const uint32_t codec = r->sub_id == kCodecHevc   ? RGFX_VIDEO_CODEC_HEVC
-		                       : r->sub_id == kCodecH264 ? RGFX_VIDEO_CODEC_H264
-		                                                 : 0;
+		const uint32_t codec = r->function_id == kFunctionEncode ? 0
+		                       : r->sub_id == kCodecHevc         ? RGFX_VIDEO_CODEC_HEVC
+		                       : r->sub_id == kCodecH264         ? RGFX_VIDEO_CODEC_H264
+		                                                         : 0;
 		const RgfxVideoOutputLayout layout = rgfx::video::outputLayout(codec);
 		uint32_t codedWidth = r->width, codedHeight = r->height;
 		if (layout.granularity[0] != 0 && layout.granularity[1] != 0 && layout.alignment != 0) {
@@ -1276,6 +1534,13 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		return kOk;
 	}
 	case 9: { // FreePixelBufferPool: the frames go, so do the textures over them
+		{
+			std::lock_guard<std::mutex> hold(g_poolLock);
+			if (Driver *driver = liveDriver(a0))
+				for (BitstreamBuffers &b : driver->pixelPools)
+					if (b.count && b.pool == (uint32_t)a1)
+						freePool(b);
+		}
 		std::lock_guard<std::mutex> hold(g_sessionLock);
 		for (Context *context : g_sessions)
 			rgfx::video::forgetOutputs(context->session);
@@ -1289,7 +1554,7 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		// The work of the list's HEVC decodes, held for the schedule to wait on its verdict
 		// (RgfxVideoStatus.hpp).
 		std::vector<void *> verdicts;
-		bool sent = true;
+		bool sent = true, hostFailed = false;
 		{
 			// One list of a context's at a time, so its pictures reach its session in AppleGVA's
 			// order: the schedule locks of the contexts the list names, taken in their order in
@@ -1297,7 +1562,7 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			// milliseconds (the first textures over a new output surface wait for the host).
 			std::vector<Context *> contexts;
 			for (uint32_t i = 0; i < cl->count; i++) {
-				const Command *decode = decodeCommand(cl->commands[i]);
+				const Command *decode = workCommand(cl->commands[i]);
 				Context *context = decode ? (Context *)decode->context : nullptr;
 				if (context &&
 				    std::find(contexts.begin(), contexts.end(), context) == contexts.end())
@@ -1309,30 +1574,38 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			for (Context *context : contexts)
 				holds.emplace_back(context->schedule);
 			for (uint32_t i = 0; i < cl->count && sent; i++) {
-				const Command *decode = decodeCommand(cl->commands[i]);
-				const Context *context = decode ? (const Context *)decode->context : nullptr;
-				void *work = decode ? decodePicture(decode) : nullptr;
+				const Command *decode = workCommand(cl->commands[i]);
+				Context *context = decode ? (Context *)decode->context : nullptr;
+				const bool encode = decode && decode->function_id == kFunctionEncode;
+				// An encode the host failed since this context's last schedule fails this one
+				// (publishEncoded).
+				const bool failed = encode && context && context->encode_failed.exchange(false);
+				hostFailed = hostFailed || failed;
+				void *work = !decode || failed ? nullptr
+				             : encode          ? encodeFrame(decode)
+				                               : decodePicture(decode);
 				{
 					std::lock_guard<std::mutex> tokens(g_tokenLock);
 					const uint64_t n = g_seqno++;
 					Token *t = &g_tokens[n % kTokens];
 					rgfx::video::releaseToken(t->work);
-					*t = {n, work};
+					*t = {n, work, encode && work ? context : nullptr,
+					      encode && work ? const_cast<uint8_t *>(decode->parameters) : nullptr, false};
 					tl->tokens[i] = t;
 				}
-				sent = !decode || work;
-				if (work && context && rgfx::video::waitsForHost(context->sub_id == kCodecHevc))
+				sent = !decode || work || failed;
+				if (work && context && !encode &&
+				    rgfx::video::waitsForHost(context->sub_id == kCodecHevc))
 					verdicts.push_back(rgfx::video::retainToken(work));
 			}
 		}
 		// Out of the lock, so other sessions' pictures go to the host meanwhile.
-		bool hostFailed = false;
 		for (void *work : verdicts) {
 			hostFailed = rgfx::video::waitToken(work) == -1 || hostFailed;
 			rgfx::video::releaseToken(work);
 		}
 		if (rgfx::video::scheduleFails(sent, hostFailed)) {
-			scheduleFailed(sent ? "the host failed its decode" : "the driver could not send it");
+			scheduleFailed(sent ? "the host failed its picture" : "the driver could not send it");
 			return rgfx::video::kNotSent;
 		}
 		return kOk;
@@ -1346,9 +1619,23 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			Token *t = (Token *)q.token;
 			if (!t)
 				return kBadArgument;
+			// A query of an encode with its detail set waits for it, out of the lock.
+			void *wait = nullptr;
+			{
+				std::lock_guard<std::mutex> hold(g_tokenLock);
+				if (t->encode && q.detail && t->work && rgfx::video::tokenStatus(t->work) == 0)
+					wait = rgfx::video::retainToken(t->work);
+			}
+			if (wait) {
+				rgfx::video::waitToken(wait);
+				rgfx::video::releaseToken(wait);
+			}
 			std::lock_guard<std::mutex> hold(g_tokenLock);
 			const int status = t->work ? rgfx::video::tokenStatus(t->work) : 1;
 			if (status != 0) {
+				// A done encode's access unit reaches AppleGVA's ring before it hears it is done.
+				if (t->encode && t->work)
+					publishEncoded(t);
 				rgfx::video::releaseToken(t->work);
 				t->work = nullptr;
 			}
@@ -1357,8 +1644,45 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		}
 		return kOk;
 	}
-	case 8: // AllocatePixelBufferPool: not on the decode path
-		return kUnsupported;
+	case 8: { // AllocatePixelBufferPool: an encoder's buffers, one a record
+		const PixelPool *p = (const PixelPool *)a1;
+		if (!p || !p->records || p->count == 0 || p->count > 32 ||
+		    std::find(std::begin(kPixelPoolKinds), std::end(kPixelPoolKinds), p->pool) ==
+		        std::end(kPixelPoolKinds))
+			return kBadArgument;
+		const uint64_t asked = (uint64_t)p->size_factors[0] * p->size_factors[1];
+		if (asked == 0 || asked > (1ull << 32))
+			return kBadArgument;
+		for (uint32_t i = 0; i < p->count; i++)
+			if (!p->records[i].address)
+				return kBadArgument;
+		std::lock_guard<std::mutex> hold(g_poolLock);
+		Driver *driver = liveDriver(a0);
+		if (!driver)
+			return kBadArgument;
+		BitstreamBuffers *slot = nullptr;
+		for (BitstreamBuffers &b : driver->pixelPools)
+			if (b.count && b.pool == p->pool)
+				freePool(*(slot = &b));
+		for (BitstreamBuffers &b : driver->pixelPools)
+			if (!slot && !b.count)
+				slot = &b;
+		if (!slot)
+			return kNoMemory;
+		slot->pool = p->pool;
+		slot->bytes = (asked + pageSize() - 1) & ~(pageSize() - 1);
+		for (uint32_t i = 0; i < p->count; i++) {
+			void *cpu = mmap(nullptr, slot->bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+			if (cpu == MAP_FAILED) {
+				freePool(*slot);
+				return kNoMemory;
+			}
+			slot->buffers[slot->count++] = (uint8_t *)cpu;
+		}
+		for (uint32_t i = 0; i < p->count; i++)
+			*p->records[i].address = (uint64_t)slot->buffers[i];
+		return kOk;
+	}
 	case 15: { // GetDriverParameter
 		DriverParamList *l = (DriverParamList *)a1;
 		if (!l || !l->params)
@@ -1377,7 +1701,7 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 						fa->budget = (uint32_t)b->function[f].field_18;
 				if (!fa->budget)
 					return kUnsupported;
-			} else if (param.id == kParamDecodeLimit && param.data) {
+			} else if ((param.id == kParamDecodeLimit || param.id == kParam0c) && param.data) {
 				*(uint32_t *)param.data = (uint32_t)(kEngineBudget / 0x5a000 * 0x5a000);
 			} else {
 				return kUnsupported;
@@ -1415,6 +1739,9 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		if (!driver)
 			return kBadArgument;
 		for (BitstreamBuffers &b : driver->pools)
+			if (b.count)
+				freePool(b);
+		for (BitstreamBuffers &b : driver->pixelPools)
 			if (b.count)
 				freePool(b);
 		g_drivers.erase(std::find(g_drivers.begin(), g_drivers.end(), driver));

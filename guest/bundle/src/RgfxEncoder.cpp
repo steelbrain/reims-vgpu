@@ -344,6 +344,15 @@ void RgfxEncoder::videoDecodeH265(const RgfxVideoOpDecodeH265 &body, const uint8
 	appendVideoDecode(RGFX_OP_VIDEO_DECODE_H265, &b, sizeof(b), parameterSets, size);
 }
 
+void RgfxEncoder::videoEncode(uint16_t tag, const RgfxVideoOpEncode &body,
+                              const RgfxVideoEncodeSettings *settings)
+{
+	RgfxVideoOpEncode b = body;
+	b.settings_size = settings != nullptr ? sizeof(*settings) : 0;
+	appendVideoDecode(tag, &b, sizeof(b), reinterpret_cast<const uint8_t *>(settings),
+	                  b.settings_size);
+}
+
 void RgfxEncoder::appendVideoDecode(uint16_t tag, const void *body, size_t n,
                                     const uint8_t *parameterSets, uint32_t size)
 {

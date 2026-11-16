@@ -994,6 +994,19 @@ void RgfxAccelerator::publishVideoCodecs()
 		setProperty("IOVARendererID", renderer);
 		renderer->release();
 	}
+	if (rgfxH264Encode(caps)) {
+		OSDictionary *h264 = OSDictionary::withCapacity(2);
+		OSNumber *rating = OSNumber::withNumber(kRgfxH264EncodeRating, 32);
+		OSNumber *quality = OSNumber::withNumber(kRgfxH264EncodeQualityRating, 32);
+		if (h264 && rating && quality && h264->setObject("VTRating", rating) &&
+		    h264->setObject("VTQualityRating", quality)) {
+			setProperty("IOGVAH264EncodeCapabilities", h264);
+			IOLog("RgfxAccelerator: H.264 encode\n");
+		}
+		OSSafeReleaseNULL(quality);
+		OSSafeReleaseNULL(rating);
+		OSSafeReleaseNULL(h264);
+	}
 	RgfxHevcDecode hevc;
 	if (!rgfxHevcDecode(caps, &hevc))
 		return;
