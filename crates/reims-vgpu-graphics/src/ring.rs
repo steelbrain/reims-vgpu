@@ -1050,3 +1050,6 @@ mod tests {
 
 #[cfg(test)]
 mod interleavings;
+
+#[cfg(test)]
+mod wakeups;
