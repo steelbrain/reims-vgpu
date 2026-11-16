@@ -3284,7 +3284,10 @@ pixels of its mode, and the buttons held):
   display's window, and positions handed on then left the cursor at their
   mirror on the display it was on, potluck job m3-max-37089),
   after which they go on as before, so a guest that never moves its cursor
-  loses nothing for longer. A position whose buttons changed always goes on:
+  loses nothing for longer. A cursor the guest keeps hidden never shows, so
+  its crossing holds the positions the whole second; a captured game, which
+  drives the guest's mouse instead ("A pointer for games"), is not held. A
+  position whose buttons changed always goes on:
   no click or release is held or lost. The device logs, at debug, how long
   each crossing took the guest.
 - **The x86-64 kext.** On the event, display 0's framebuffer takes the

@@ -32,7 +32,7 @@ const _: () = assert!(
 /// ([`PointerLink::pointer_at`]), before the event goes to the host's callback, which moves the
 /// guest's pointing device. The guest scales the one USB tablet over the display its cursor is
 /// on, so a window's pointer reaches its own display once the guest has moved its cursor there
-/// (docs/graphics-kext/design.md, "Multiple displays", X1): until then, for up to 100 ms, the
+/// (docs/graphics-kext/design.md, "Multiple displays", X1): until then, for up to a second, the
 /// device holds the event back from the host, but for one whose buttons changed, so the tablet
 /// never puts the cursor at the event's spot of the display it is still on. A window with no
 /// pointer callback has nothing to tell.
