@@ -81,6 +81,13 @@ pub const CONFIG: &str = "config.cpio";
 pub const EACS_ISC: &str = "isc.pre-eacs";
 /// Until [`finish_eacs`]: the auxiliary storage as the restore wrote it.
 pub const EACS_AUX: &str = "aux.pre-eacs";
+/// Until [`finish_eacs`]: the disk as the restore wrote it, a clone where the file system makes
+/// one, for [`finish_eacs`] to start the VM again from after a first boot whose EACS failed.
+pub const EACS_DISK: &str = "disk.pre-eacs";
+/// Until [`finish_eacs`]: how many first boots failed EACS and had the VM started again.
+pub const EACS_TRIES: &str = "eacs-tries";
+/// The first boots a VM gets to make its Data volume by EACS before [`finish_eacs`] gives up.
+pub const EACS_MAX_TRIES: u32 = 3;
 
 /// The auxiliary storage's size as QEMU attaches it.
 const AUX_SIZE: u64 = aux::SIZE as u64;
@@ -276,8 +283,16 @@ pub fn run(r: &Restore, events: &mut dyn FnMut(Event), cancel: &AtomicBool) -> R
             .with_context(|| format!("macOS {version}'s build {build} is not of the form 23G93"))?,
     };
     let written = write(&files, &table, &aux, &the_plan, src, events, cancel)
-        .and_then(|()| files.keep_for_eacs(&table));
-    match written.and_then(|()| files.finish(secrets.ecid, &bundle)) {
+        .and_then(|()| files.keep_for_eacs(&table))
+        .and_then(|()| files.keep_disk_for_eacs());
+    if let Ok(Some(used)) = &written {
+        events(Event::Note(format!(
+            "kept a copy of the restored disk, {}, for finish-eacs to start the VM again from \
+             if its first boot fails: this file system makes no clones",
+            gib(*used)
+        )));
+    }
+    match written.and_then(|_| files.finish(secrets.ecid, &bundle)) {
         Ok(()) => Ok(Restored {
             ecid: secrets.ecid,
             version,
@@ -436,6 +451,8 @@ fn check_dir(dir: &Path) -> Result<()> {
         MACHINE_IDENTIFIER,
         EACS_ISC,
         EACS_AUX,
+        EACS_DISK,
+        EACS_TRIES,
     ] {
         ensure!(
             !dir.join(f).exists(),
@@ -482,6 +499,23 @@ impl Files {
         copy_sparse(&aux, 0, AUX_SIZE, &self.part(EACS_AUX), 0)
     }
 
+    /// Keeps the disk as written for [`finish_eacs`] to start the VM again from: a clone, which
+    /// takes no space, where the file system makes one, else a sparse copy, once the space it
+    /// takes is free. Returns the bytes a copy takes, `None` for a clone.
+    fn keep_disk_for_eacs(&self) -> Result<Option<u64>> {
+        use std::os::unix::fs::MetadataExt as _;
+        let (from, to) = (self.part(DISK), self.part(EACS_DISK));
+        if clone_file(&from, &to) {
+            return Ok(None);
+        }
+        let f = File::open(&from).context("open the disk")?;
+        let m = f.metadata()?;
+        let used = m.blocks() * 512;
+        check_space(&self.dir, free_space(&self.dir)?, used)?;
+        copy_sparse(&f, 0, m.len(), &to, 0)?;
+        Ok(Some(used))
+    }
+
     /// Writes `aux.img`, the machine identifier and the anchor bundle, and moves the disks into
     /// place, with the copies [`finish_eacs`] puts back.
     fn finish(&self, ecid: u64, bundle: &[u8]) -> Result<()> {
@@ -500,8 +534,11 @@ impl Files {
         machine_identifier(ecid)
             .to_file_binary(&id)
             .with_context(|| format!("write {}", id.display()))?;
-        for name in [DISK, AUX_TRIMMED] {
+        for name in [DISK, AUX_TRIMMED, EACS_DISK] {
             let p = self.part(name);
+            if name == EACS_DISK && !p.exists() {
+                continue;
+            }
             File::open(&p)
                 .and_then(|f| f.sync_all())
                 .with_context(|| format!("flush {}", p.display()))?;
@@ -515,8 +552,14 @@ impl Files {
             CONFIG,
             EACS_ISC,
             EACS_AUX,
+            EACS_DISK,
             MACHINE_IDENTIFIER,
         ] {
+            // The disk's copy is kept by every restore (keep_disk_for_eacs); the tests' own
+            // restores make none.
+            if name == EACS_DISK && !self.part(name).exists() {
+                continue;
+            }
             let to = self.dir.join(name);
             if let Err(e) = std::fs::rename(self.part(name), &to) {
                 for m in moved {
@@ -541,9 +584,48 @@ impl Files {
             MACHINE_IDENTIFIER,
             EACS_ISC,
             EACS_AUX,
+            EACS_DISK,
         ] {
             let _ = std::fs::remove_file(self.part(name));
         }
+    }
+}
+
+/// Makes `to` a clone of `from` that shares its blocks, where the file system makes one: APFS
+/// (`clonefile`), btrfs or XFS (`FICLONE`). Returns false, leaving no `to`, where it doesn't.
+fn clone_file(from: &Path, to: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let (Ok(f), Ok(t)) = (
+            std::ffi::CString::new(from.as_os_str().as_encoded_bytes()),
+            std::ffi::CString::new(to.as_os_str().as_encoded_bytes()),
+        ) else {
+            return false;
+        };
+        // SAFETY: both are NUL-terminated paths that live across the call.
+        unsafe { libc::clonefile(f.as_ptr(), t.as_ptr(), 0) == 0 }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        let Ok(f) = File::open(from) else {
+            return false;
+        };
+        let Ok(t) = File::create(to) else {
+            return false;
+        };
+        // SAFETY: FICLONE takes the source's descriptor; both stay open across the call.
+        if unsafe { libc::ioctl(t.as_raw_fd(), libc::FICLONE, f.as_raw_fd()) } == 0 {
+            return true;
+        }
+        drop(t);
+        let _ = std::fs::remove_file(to);
+        false
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (from, to);
+        false
     }
 }
 
@@ -578,8 +660,9 @@ fn copy_sparse(from: &File, at: u64, len: u64, to: &Path, to_at: u64) -> Result<
 /// restore wrote it (EACS deleted the macOS LocalPolicy, which only the restore can sign) and the
 /// policy nonces back into NVRAM ([`aux::put_back_policy_entries`]), keeping what the guest
 /// wrote in the auxiliary storage, its keys in the ean storage among it; then removes the copies.
-/// Refuses after a first boot whose EACS failed ([`aux::recovery_boot_mode`]), and before the
-/// guest's keystore has made its keys. A run cut short can run again.
+/// Refuses before the guest's keystore has made its keys. After a first boot whose EACS failed
+/// ([`aux::recovery_boot_mode`]) it starts the VM again instead ([`start_again`]). A run cut
+/// short can run again.
 pub fn finish_eacs(dir: &Path) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
     let (isc, pre_aux) = (dir.join(EACS_ISC), dir.join(EACS_AUX));
@@ -595,11 +678,9 @@ pub fn finish_eacs(dir: &Path) -> Result<()> {
         "{AUX_TRIMMED} is not {} bytes",
         aux::SIZE
     );
-    ensure!(
-        !aux::recovery_boot_mode(&a),
-        "macOS's first boot failed to make its Data volume (its installer asked for recoveryOS): \
-         restore the VM again"
-    );
+    if aux::recovery_boot_mode(&a) {
+        return start_again(dir);
+    }
     ensure!(
         aux::ean_entries(&a[aux::EAN_AT..]).is_some_and(|n| n > 1),
         "the VM's first boot hasn't made its keys yet: boot it once, until macOS has made its \
@@ -644,17 +725,76 @@ pub fn finish_eacs(dir: &Path) -> Result<()> {
         done += n as u64;
     }
     disk.sync_all().context("flush the disk")?;
+    put_aux(dir, &a)?;
+    for f in [&isc, &pre_aux] {
+        std::fs::remove_file(f).with_context(|| format!("remove {}", f.display()))?;
+    }
+    for f in [dir.join(EACS_DISK), dir.join(EACS_TRIES)] {
+        if f.exists() {
+            std::fs::remove_file(&f).with_context(|| format!("remove {}", f.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// After a first boot whose EACS failed: puts the VM back as the restore left it, the disk from
+/// [`EACS_DISK`] and the auxiliary storage from [`EACS_AUX`], for another first boot, and counts
+/// the failed boot in [`EACS_TRIES`]; after [`EACS_MAX_TRIES`] failed boots it leaves the VM as
+/// it is. Either way it returns an error that says which, and what to do next.
+fn start_again(dir: &Path) -> Result<()> {
+    let tries = dir.join(EACS_TRIES);
+    let failed = std::fs::read_to_string(&tries)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        + 1;
+    ensure!(
+        failed < EACS_MAX_TRIES,
+        "macOS's first boot failed to make its Data volume in all {EACS_MAX_TRIES} tries (its \
+         installer asked for recoveryOS each time): restore the VM again"
+    );
+    let pre = dir.join(EACS_DISK);
+    ensure!(
+        pre.is_file(),
+        "macOS's first boot failed to make its Data volume (its installer asked for recoveryOS), \
+         and {} holds no copy of the restored disk to start again from: restore the VM again",
+        dir.display()
+    );
+    let part = dir.join(format!("{DISK}.part"));
+    if part.exists() {
+        std::fs::remove_file(&part).with_context(|| format!("remove {}", part.display()))?;
+    }
+    if !clone_file(&pre, &part) {
+        let f = File::open(&pre).with_context(|| format!("open {}", pre.display()))?;
+        copy_sparse(&f, 0, f.metadata()?.len(), &part, 0)?;
+    }
+    File::open(&part)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("flush {}", part.display()))?;
+    std::fs::rename(&part, dir.join(DISK)).context("move the restored disk back into place")?;
+    let restored = std::fs::read(dir.join(EACS_AUX))
+        .with_context(|| format!("read {}", dir.join(EACS_AUX).display()))?;
+    put_aux(dir, &restored)?;
+    std::fs::write(&tries, format!("{failed}\n"))
+        .with_context(|| format!("write {}", tries.display()))?;
+    bail!(
+        "macOS's first boot failed to make its Data volume (its installer asked for recoveryOS; \
+         try {failed} of {EACS_MAX_TRIES}): the VM is back as the restore left it, so boot it \
+         once more, until macOS has made its Data volume and reset, then finish again"
+    )
+}
+
+/// Writes the auxiliary storage `trimmed` as `aux.img.trimmed` and, behind VZ's header, as
+/// `aux.img`, each under a temporary name first.
+fn put_aux(dir: &Path, trimmed: &[u8]) -> Result<()> {
     let mut h = aux::vz_header();
-    h.extend_from_slice(&a);
-    for (name, bytes) in [(AUX_TRIMMED, &a), (AUX, &h)] {
+    h.extend_from_slice(trimmed);
+    for (name, bytes) in [(AUX_TRIMMED, trimmed), (AUX, &h[..])] {
         let p = dir.join(name);
         let tmp = dir.join(format!("{name}.part"));
         std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
         File::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, &p).with_context(|| format!("move {} into place", p.display()))?;
-    }
-    for f in [&isc, &pre_aux] {
-        std::fs::remove_file(f).with_context(|| format!("remove {}", f.display()))?;
     }
     Ok(())
 }
@@ -687,6 +827,7 @@ mod tests {
         std::fs::write(f.part(AUX_TRIMMED), b"nvram").unwrap();
         std::fs::write(f.part(EACS_ISC), b"isc").unwrap();
         std::fs::write(f.part(EACS_AUX), b"aux").unwrap();
+        std::fs::write(f.part(EACS_DISK), b"disk").unwrap();
         f.finish(0x1234_5678_9abc_def0, b"070701 a bundle").unwrap();
         assert_eq!(std::fs::read(d.join(CONFIG)).unwrap(), b"070701 a bundle");
         for n in [
@@ -696,6 +837,7 @@ mod tests {
             CONFIG,
             EACS_ISC,
             EACS_AUX,
+            EACS_DISK,
             MACHINE_IDENTIFIER,
         ] {
             assert!(d.join(n).is_file(), "{n}");
@@ -804,6 +946,8 @@ mod tests {
     fn finishing_eacs_puts_the_restores_isc_and_nonces_back() {
         let (d, t, n, _) = restored_for_eacs();
         boot_by_eacs(&d, &t, &n);
+        std::fs::write(d.join(EACS_DISK), b"the restored disk").unwrap();
+        std::fs::write(d.join(EACS_TRIES), b"1\n").unwrap();
         finish_eacs(&d).unwrap();
         let disk = d.join(DISK);
         let isc = t.isc();
@@ -837,7 +981,9 @@ mod tests {
         let vz = std::fs::read(d.join(AUX)).unwrap();
         assert_eq!(&vz[..aux::HEADER_LEN], &aux::vz_header()[..]);
         assert_eq!(&vz[aux::HEADER_LEN..], &a[..]);
-        assert!(!d.join(EACS_ISC).exists() && !d.join(EACS_AUX).exists());
+        for f in [EACS_ISC, EACS_AUX, EACS_DISK, EACS_TRIES] {
+            assert!(!d.join(f).exists(), "{f} is left");
+        }
         assert!(finish_eacs(&d).is_err(), "nothing left to finish");
         std::fs::remove_dir_all(&d).unwrap();
     }
@@ -875,6 +1021,86 @@ mod tests {
             b"the guest's Data"
         );
         assert!(d.join(EACS_ISC).exists() && d.join(EACS_AUX).exists());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_restore_keeps_its_disk_to_start_again_from() {
+        let d = temp_dir();
+        let f = Files::new(&d);
+        f.make(1 << 20).unwrap();
+        write_at(&f.part(DISK), 0x1000, b"the restored disk");
+        f.keep_disk_for_eacs().unwrap();
+        let kept = f.part(EACS_DISK);
+        assert_eq!(std::fs::metadata(&kept).unwrap().len(), 1 << 20);
+        assert_eq!(read_at(&kept, 0x1000, 17), b"the restored disk");
+        write_at(&f.part(DISK), 0x1000, b"the guest's bytes");
+        assert_eq!(read_at(&kept, 0x1000, 17), b"the restored disk", "a copy");
+        f.discard();
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
+        std::fs::remove_dir(&d).unwrap();
+    }
+
+    /// Sets a VM of the tests' small files back to after a first boot whose EACS failed: the
+    /// guest's disk, and the restore's auxiliary storage with NVRAM asking for recoveryOS.
+    fn fail_first_boot(d: &Path, restored: &[u8]) {
+        let mut a = restored.to_vec();
+        aux::add_system_entry(&mut a, 0, "recovery-boot-mode", b"the guest's");
+        std::fs::write(d.join(AUX_TRIMMED), &a).unwrap();
+        std::fs::write(d.join(DISK), b"the guest's disk").unwrap();
+    }
+
+    /// A VM of the tests' small files whose first boot's EACS failed, with what the restore
+    /// kept: the disk, the iBoot system container and the auxiliary storage.
+    fn failed_first_boot() -> (PathBuf, Vec<u8>) {
+        let d = temp_dir();
+        std::fs::write(d.join(EACS_DISK), b"the restored disk").unwrap();
+        std::fs::write(d.join(EACS_ISC), b"isc").unwrap();
+        let n = Nvram {
+            policy_nonces: [[1; 16]; 7],
+            container: Uuid::from_u128(1),
+            group: Uuid::from_u128(2),
+        };
+        let restored = aux::trimmed(&n, b"a ticket of the tests' own").unwrap();
+        std::fs::write(d.join(EACS_AUX), &restored).unwrap();
+        fail_first_boot(&d, &restored);
+        (d, restored)
+    }
+
+    #[test]
+    fn finishing_eacs_after_a_failed_first_boot_starts_the_vm_again() {
+        let (d, restored) = failed_first_boot();
+        for t in 1..EACS_MAX_TRIES {
+            let e = finish_eacs(&d).unwrap_err().to_string();
+            assert!(e.contains(&format!("try {t} of {EACS_MAX_TRIES}")), "{e}");
+            assert_eq!(std::fs::read(d.join(DISK)).unwrap(), b"the restored disk");
+            assert_eq!(std::fs::read(d.join(AUX_TRIMMED)).unwrap(), restored);
+            let vz = std::fs::read(d.join(AUX)).unwrap();
+            assert_eq!(&vz[..aux::HEADER_LEN], &aux::vz_header()[..]);
+            assert_eq!(&vz[aux::HEADER_LEN..], &restored[..]);
+            for f in [EACS_DISK, EACS_ISC, EACS_AUX] {
+                assert!(d.join(f).is_file(), "{f} is kept for the next try");
+            }
+            fail_first_boot(&d, &restored);
+        }
+        let e = finish_eacs(&d).unwrap_err().to_string();
+        assert!(e.contains(&format!("all {EACS_MAX_TRIES} tries")), "{e}");
+        assert_eq!(
+            std::fs::read(d.join(DISK)).unwrap(),
+            b"the guest's disk",
+            "left as it is"
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn finishing_eacs_after_a_failed_first_boot_needs_the_restored_disk() {
+        let (d, _) = failed_first_boot();
+        std::fs::remove_file(d.join(EACS_DISK)).unwrap();
+        let e = finish_eacs(&d).unwrap_err().to_string();
+        assert!(e.contains("no copy of the restored disk"), "{e}");
+        assert_eq!(std::fs::read(d.join(DISK)).unwrap(), b"the guest's disk");
+        assert!(!d.join(EACS_TRIES).exists());
         std::fs::remove_dir_all(&d).unwrap();
     }
 

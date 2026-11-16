@@ -364,6 +364,15 @@ Data out and has the first boot make it, by EACS:
   failed", `template_migration_failure_error` in NVRAM, then a recovery boot); with both as a
   restore of macOS leaves them, 6 of 6 completed **[measured, M3 Max under HVF]**. Which of the
   two it reads is not known.
+- A first boot whose template migration fails writes `recovery-boot-mode` into NVRAM's
+  `system` partition and restarts the VM, Data left unfinished; a first boot whose EACS
+  completes writes none (`aux::recovery_boot_mode`) **[measured]**. So the restore also keeps
+  the disk as it wrote it (`disk.pre-eacs`): a clone, which takes no space, where the file system
+  makes one (APFS's `clonefile`, btrfs's and XFS's `FICLONE`), else a sparse copy, whose size the
+  restore reports after checking it is free. `finish_eacs` after such a boot puts the disk and
+  the auxiliary storage back as the restore left them, counts the failed boot in `eacs-tries`
+  and asks for one more first boot; after 3 failed boots it leaves the VM as it is and asks for
+  a new restore. Finishing removes both files.
 
 So every VM takes one boot of the guest before it is ready (`pipeline::finish_eacs` after it):
 reims-ctl's `create` and the CLI's `restore` end by naming that boot and the step after it,
@@ -374,8 +383,8 @@ with Ambrosia, under HVF on a Mac or KVM on arm64 Linux.
 
 The tool writes into the VM's directory `disk.img`, `aux.img`, `aux.img.trimmed`, and
 `machine-identifier.bin`: VZ's form, a binary plist `{ECID: n}`. The ECID is random unless one is
-given. Every ticket and policy is bound to it. It also writes `isc.pre-eacs` and `aux.pre-eacs`,
-which `finish_eacs` consumes.
+given. Every ticket and policy is bound to it. It also writes `isc.pre-eacs`, `aux.pre-eacs` and
+`disk.pre-eacs`, which `finish_eacs` consumes.
 
 ## Reading the IPSW
 
