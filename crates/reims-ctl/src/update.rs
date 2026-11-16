@@ -125,7 +125,12 @@ fn current(i: &Install) -> Option<String> {
     let head = git_output(repo, &["rev-parse", "--verify", "-q", "HEAD^{commit}"])?;
     let installed = git_output(
         repo,
-        &["rev-parse", "--verify", "-q", &format!("{}^{{commit}}", i.commit)],
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("{}^{{commit}}", i.commit),
+        ],
     )?;
     let qemu_of_it = i.qemu.is_dir()
         && i.qemu
@@ -372,7 +377,12 @@ mod tests {
         commit_on(&origin, "one");
         run(
             &d,
-            &["clone", "-q", origin.to_str().unwrap(), clone.to_str().unwrap()],
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
         );
         let short = || git_output(&clone, &["rev-parse", "--short", "HEAD"]).unwrap();
         // As install-ctl.sh names a QEMU build: its time, then the commit it was built at.
@@ -388,7 +398,10 @@ mod tests {
             installed_at: String::new(),
         };
         let first = short();
-        assert_eq!(current(&install(&first, qemu_at(&first))), Some(first.clone()));
+        assert_eq!(
+            current(&install(&first, qemu_at(&first))),
+            Some(first.clone())
+        );
         // A commit on the remote: the update builds it.
         commit_on(&origin, "two");
         assert_eq!(current(&install(&first, qemu_at(&first))), None);
@@ -399,7 +412,10 @@ mod tests {
         // reims-ctl installed from it, with the first commit's QEMU kept.
         assert_eq!(current(&install(&second, qemu_at(&first))), None);
         assert_eq!(current(&install(&second, d.join("qemu/gone"))), None);
-        assert_eq!(current(&install(&second, qemu_at(&second))), Some(second.clone()));
+        assert_eq!(
+            current(&install(&second, qemu_at(&second))),
+            Some(second.clone())
+        );
         // No record of a commit, and a detached HEAD, which follows no remote branch.
         assert_eq!(current(&install("", qemu_at(&second))), None);
         run(&clone, &["switch", "-q", "--detach"]);
