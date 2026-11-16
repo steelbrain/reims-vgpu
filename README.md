@@ -62,8 +62,9 @@ It installs MSYS2 and Git for Windows with winget if you don't have them, turns 
 Hypervisor Platform that VMs run on (Windows asks for an administrator for that step alone, and you
 restart once before your first VM), clones the repository into your user folder, and runs
 `scripts/install-ctl.sh` in MSYS2's CLANG64 shell. That builds the library and QEMU with MSYS2's
-clang, installing Rust for the same toolchain if you don't have it, so you don't need Visual
-Studio, and installs `reims-ctl` into `%USERPROFILE%\.cargo\bin`. On an Intel Core i7-8700B a
+clang, with the Rust toolchain that goes with it: it installs Rust if you don't have it, and adds
+that toolchain beside yours if your Rust is set up for Visual Studio, so you don't need Visual
+Studio. It installs `reims-ctl` into `%USERPROFILE%\.cargo\bin`. On an Intel Core i7-8700B a
 first install took about 20 minutes, and running it again about a minute. From a clone,
 `powershell -ExecutionPolicy Bypass -File scripts\install.ps1` does the same. Windows support is
 newer than Linux's: the guest gets no hardware video decoding there yet.

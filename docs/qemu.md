@@ -903,9 +903,13 @@ and QEMU (WHPX, GTK, slirp, libusb, no guest agent), copies the CLANG64
 DLLs QEMU and qemu-img load beside them, and installs reims-ctl and
 reims-util into `%USERPROFILE%\.cargo\bin`. `install.toml` records the
 MSYS2 bash the install ran in, and `reims-ctl update` runs the script there,
-with `MSYSTEM=CLANG64`. A host whose rustup is already there with another
-default host builds with that host's toolchain, which nothing here has
-tested.
+with `MSYSTEM=CLANG64`. Whatever rustup's default host, the script builds
+with `rust-toolchain.toml`'s channel for the `x86_64-pc-windows-gnullvm` host
+(`RUSTUP_TOOLCHAIN`), which it installs with `rustup toolchain install`
+where it is missing, leaving the user's default as it was: with Windows'
+usual default host, `x86_64-pc-windows-msvc`, xtask, the build scripts,
+reims-ctl and reims-util would build for MSVC, which links only with Visual
+Studio's `link.exe`.
 
 **Measured** on the mini (2026-11-16, `m3-max-36191`), in a scratch MSYS2
 extracted from MSYS2's base archive (its package list of 2026-09-27, so the
@@ -926,6 +930,19 @@ update step had work to do) and a scratch user profile with rustup's
   stopped there for want of `windmc` (`m3-max-36094`); before install-ctl.sh
   tried it for a minute, the move of QEMU's staged install failed once with
   "Permission denied" (`m3-max-36159`).
+
+**Measured** on the mini (2026-11-16, `m3-max-36662`), with a scratch user
+profile whose rustup `rustup-init` made with the `x86_64-pc-windows-msvc`
+default host and the stable toolchain as its default, as a Windows user's
+usually is: install-ctl.sh took 943 s (the library's release build 6 min
+9 s), installing `nightly-2026-11-03-x86_64-pc-windows-gnullvm` beside the
+user's toolchains. `rustup default` still named
+`stable-x86_64-pc-windows-msvc` afterwards, and the user's PATH and rustup's
+uninstall entry were as before. reims-ctl.exe and reims-util.exe import the
+Universal CRT's `api-ms-win-crt-*` and no `VCRUNTIME140.dll`, which an MSVC
+build imports. `doctor` passed every line. The mini's own rustup has the
+MSVC default host too, with Visual Studio 18's build tools, so builds for
+that host link there; no host here lacks them.
 
 install.ps1's winget and hypervisor-platform steps ran only as dry runs
 (`-DryRun`, with `REIMS_INSTALL_PRETEND_MISSING` naming each step's check as
