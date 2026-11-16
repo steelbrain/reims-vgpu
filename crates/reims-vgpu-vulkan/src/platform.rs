@@ -557,8 +557,20 @@ pub const EXACT_ALL: &str = "all";
 /// default would take up to four ready together in one kernel submission on Mesa's drivers and
 /// see each but the last complete only once the last completed. When the host sees a command
 /// buffer complete is the guest's to observe (the stamps and interrupts core writes as its work
-/// completes), and the grouped form bought no frame rate in a guest's drag on the Iris Xe (15.7
-/// to 17.3 frames a second, against 16.4 to 17.6 exact), so no switch takes it. Its heap
+/// completes), and Metal's hosts see each at its own end, whatever is committed after it: of 48
+/// command buffers committed back to back on one queue, each of 0.5 to 5 ms of GPU work, each was
+/// seen complete (its completed handler, its status) 17 to 41 us after its own GPU end at the
+/// median and at most 141 us on a Radeon Pro 5300M and a UHD Graphics 630 (macOS 26.7.1), 86 to 106
+/// us and at most 0.8 ms on an M3 Max (macOS 27.0.1), and none only once the next had ended
+/// (2026-11-15). The grouped form sees a member complete late by the GPU time of the batches after
+/// it in its group, up to the runtime's 16 ms bound, and on RADV it bought nothing for that: in a
+/// guest's Launchpad on a Radeon 780M and an RX 7900 XTX it held no batch once Launchpad was open
+/// (21.6 to 24.5 kernel submissions a present either way) and saved 0.8 to 1 a present at its first
+/// opening, and in Geekbench 7's Metal pass it took 9% and 7% fewer kernel submissions for no
+/// shorter run (174.6 s against 172.6 exact on the 780M, 136.0 against 136.1 on the XTX), seeing
+/// command buffers complete up to 60 and 17.5 ms after their own GPU end (2.9 and 3.6 ms exact).
+/// Nor did it buy frame rate in a guest's drag on the Iris Xe (15.7 to 17.3 frames a second,
+/// against 16.4 to 17.6 exact). So no switch takes it. Its heap
 /// compression is the runtime's default (`HeapCompressionPolicy::Compressed`), which no name of
 /// [`EXACT_FORMS`] changes: on a driver whose compressed images may keep their texels apart from
 /// their bytes (ANV), a heap's colour texture that Metal keeps losslessly compressed, in a heap
