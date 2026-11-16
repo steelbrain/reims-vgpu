@@ -3764,9 +3764,15 @@ typedef struct {
   // The command buffer that finished.
   uint64_t cb_obj_id;
   // The host's monotonic clock when the GPU started the work, in nanoseconds;
-  // 0 when unknown (e.g. a recovery victim).
+  // 0 when unknown (e.g. a recovery victim). For a command buffer the host
+  // committed in parts, its first part's start.
   uint64_t gpu_start_ns;
-  // The host's monotonic clock when the GPU finished the work, in nanoseconds.
+  // `gpu_start_ns` plus the GPU time of the work, in nanoseconds of the host's
+  // monotonic clock: when the GPU finished the work, for a command buffer
+  // committed whole; for one committed in parts, its parts' GPU time summed,
+  // so no later than its last part's end. The guest reads only
+  // `gpu_end_ns - gpu_start_ns`, as the run's length (docs/graphics-kext/design.md,
+  // "Completion").
   uint64_t gpu_end_ns;
   // An `RGFX_CB_*`.
   uint32_t status;

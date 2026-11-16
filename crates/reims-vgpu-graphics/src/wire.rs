@@ -2632,9 +2632,15 @@ pub struct RgfxCbComplete {
     /// The command buffer that finished.
     pub cb_obj_id: u64,
     /// The host's monotonic clock when the GPU started the work, in nanoseconds;
-    /// 0 when unknown (e.g. a recovery victim).
+    /// 0 when unknown (e.g. a recovery victim). For a command buffer the host
+    /// committed in parts, its first part's start.
     pub gpu_start_ns: u64,
-    /// The host's monotonic clock when the GPU finished the work, in nanoseconds.
+    /// `gpu_start_ns` plus the GPU time of the work, in nanoseconds of the host's
+    /// monotonic clock: when the GPU finished the work, for a command buffer
+    /// committed whole; for one committed in parts, its parts' GPU time summed,
+    /// so no later than its last part's end. The guest reads only
+    /// `gpu_end_ns - gpu_start_ns`, as the run's length (docs/graphics-kext/design.md,
+    /// "Completion").
     pub gpu_end_ns: u64,
     /// An `RGFX_CB_*`.
     pub status: u32,
