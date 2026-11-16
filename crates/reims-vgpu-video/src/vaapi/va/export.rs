@@ -1,7 +1,10 @@
-//! A decode surface's memory as dma-bufs, for another device to read its planes
-//! ([`super::Frame::export`]): `vaExportSurfaceHandle`, read only, each plane a layer of its
-//! own, so each plane is one image of its own format (R8 and RG8 for NV12, R16 and RG16 for P010)
-//! in its object, at its offset and pitch, laid out as the object's DRM format modifier says.
+//! A surface's memory as dma-bufs, for another device to reach its planes: a decode surface's,
+//! read only, for the device to read ([`super::Frame::export`]), and an encoder's input
+//! surface's, write only, for the device to write the frame into
+//! ([`super::VideoEncoder::input_surface`]). Either is `vaExportSurfaceHandle`, each plane a layer
+//! of its own, so each plane is one image of its own format (R8 and RG8 for NV12, R16 and RG16 for
+//! P010) in its object, at its offset and pitch, laid out as the object's DRM format modifier
+//! says.
 //!
 //! A pool exports each of its surfaces once, at its first frame asked so, and keeps the export
 //! with the surface until the pool goes: the surfaces are lent again frame after frame, and the
@@ -39,7 +42,7 @@ pub struct ExportedPlane {
     pub pitch: u64,
 }
 
-/// A decode surface's memory as dma-bufs (module docs), kept while its pool lives.
+/// A surface's memory as dma-bufs (module docs), kept while its pool lives.
 #[derive(Debug)]
 pub struct SurfaceExport {
     objects: Vec<OwnedFd>,
@@ -60,7 +63,8 @@ impl SurfaceExport {
         self.objects[self.plane(plane).object].as_fd()
     }
 
-    /// The surface's width and height in luma samples: the decoded (coded) picture's.
+    /// The surface's width and height in luma samples: the decoded (coded) picture's, or the
+    /// encoder's coded size.
     pub fn size(&self) -> (u32, u32) {
         self.size
     }
@@ -72,12 +76,32 @@ impl SurfaceExport {
     }
 }
 
-/// Exports `surface`, of `size`, on `display` (module docs); `Err` where the driver exports none,
-/// or not as one plane a layer.
+/// Exports `surface`, of `size`, on `display`, for another device to read (module docs); `Err`
+/// where the driver exports none, or not as one plane a layer.
 pub(crate) fn export(
     display: &Display,
     surface: ffi::VASurfaceID,
     size: (u32, u32),
+) -> Result<SurfaceExport, Error> {
+    export_as(display, surface, size, ffi::VA_EXPORT_SURFACE_READ_ONLY)
+}
+
+/// Exports `surface`, of `size`, on `display`, for another device to write (module docs); `Err`
+/// where the driver exports none, or not as one plane a layer.
+pub(crate) fn export_for_write(
+    display: &Display,
+    surface: ffi::VASurfaceID,
+    size: (u32, u32),
+) -> Result<SurfaceExport, Error> {
+    export_as(display, surface, size, ffi::VA_EXPORT_SURFACE_WRITE_ONLY)
+}
+
+/// Exports `surface`, of `size`, on `display`, with `access`, a `VA_EXPORT_SURFACE_*_ONLY` flag.
+fn export_as(
+    display: &Display,
+    surface: ffi::VASurfaceID,
+    size: (u32, u32),
+    access: u32,
 ) -> Result<SurfaceExport, Error> {
     let mut descriptor = ffi::VADRMPRIMESurfaceDescriptor::default();
     check(
@@ -88,7 +112,7 @@ pub(crate) fn export(
                 raw,
                 surface,
                 ffi::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                ffi::VA_EXPORT_SURFACE_READ_ONLY | ffi::VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+                access | ffi::VA_EXPORT_SURFACE_SEPARATE_LAYERS,
                 (&raw mut descriptor).cast(),
             )
         })?,
@@ -113,7 +137,7 @@ fn planes_of(descriptor: &ffi::VADRMPRIMESurfaceDescriptor) -> Result<[ExportedP
         let layers =
             &descriptor.layers[..usize::try_from(descriptor.num_layers).unwrap_or(0).min(4)];
         Error::Unsupported(format!(
-            "the decode surface exported as {} objects and {} layers of {:?} planes: not a layer \
+            "the surface exported as {} objects and {} layers of {:?} planes: not a layer \
              of one plane for each of its two planes",
             descriptor.num_objects,
             descriptor.num_layers,

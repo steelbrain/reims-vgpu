@@ -14,18 +14,27 @@
 //! only where the device is lost.
 //!
 //! Each session logs at its end how many pictures went this way, and their GPU time.
+//!
+//! An encode session's frames go the other way the same way (`super::encode`'s module doc): the
+//! runtime device's GPU copies the source's planes, where they lie, into an input surface of the
+//! VA crate's encoder, exported as dma-bufs for writing, with the copier's fill
+//! (`PlaneCopier::fill`), which fills the margin to the coded size as the VA crate's upload
+//! fills it. The fill waits for the GPU as the copy does; the encode follows once it is done.
+//! Each encode session logs at its end how many frames went this way, and their GPU time.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use reims_vgpu_video::core::backend::DeviceWrite;
-use reims_vgpu_video::vaapi::Frame;
+use reims_vgpu_video::vaapi::{Frame, InputSurface};
 use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::gpu::device::VulkanDevice;
-use reims_vgpu_vulkan::os::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFormat};
+use reims_vgpu_vulkan::os::{
+    CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFill, PlaneFormat,
+};
 
 use super::super::video_host::{BackendError, OutputPlane};
-use super::{GpuCopier, GpuCopies, NAME, Room, crop_extent};
+use super::{GpuCopier, GpuCopies, GpuFiller, NAME, Room, crop_extent};
 
 /// The copies of a runtime device's sessions.
 pub(super) struct RuntimeCopies {
@@ -51,6 +60,126 @@ impl GpuCopies<VulkanPlatform> for RuntimeCopies {
             timed: 0,
             longest: Duration::ZERO,
         }))
+    }
+
+    fn filler(&self) -> Result<Box<dyn GpuFiller<VulkanPlatform>>, String> {
+        let copier = PlaneCopier::new(&self.device)?;
+        Ok(Box::new(RuntimeFiller {
+            copier,
+            times: Times::default(),
+        }))
+    }
+}
+
+/// The GPU times of a session's copies: how many, their sum over those the queue timed, and the
+/// longest.
+#[derive(Default)]
+struct Times {
+    count: u64,
+    gpu: Duration,
+    timed: u64,
+    longest: Duration,
+}
+
+impl Times {
+    fn add(&mut self, gpu: Option<Duration>) {
+        self.count += 1;
+        if let Some(gpu) = gpu {
+            self.gpu += gpu;
+            self.timed += 1;
+            self.longest = self.longest.max(gpu);
+        }
+    }
+
+    /// Their count, mean GPU time and longest, as the log lines say them.
+    fn said(&self) -> String {
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        let mean = self.gpu / u32::try_from(self.timed.max(1)).unwrap_or(u32::MAX);
+        format!(
+            "{}, {:.3} ms of GPU time each, {:.3} ms at most ({} timed)",
+            self.count,
+            ms(mean),
+            ms(self.longest),
+            self.timed
+        )
+    }
+}
+
+/// One encode session's fills of its encoder's input surfaces, and their times.
+struct RuntimeFiller {
+    copier: PlaneCopier,
+    times: Times,
+}
+
+impl GpuFiller<VulkanPlatform> for RuntimeFiller {
+    fn fill(
+        &mut self,
+        surface: &InputSurface,
+        luma: &OutputPlane<VulkanPlatform>,
+        chroma: &OutputPlane<VulkanPlatform>,
+        size: (u32, u32),
+        sample: u32,
+    ) -> Result<DeviceWrite, BackendError> {
+        let formats = match sample {
+            1 => [PlaneFormat::R8, PlaneFormat::Rg8],
+            2 => [PlaneFormat::R16, PlaneFormat::Rg16],
+            bytes => return Ok(DeviceWrite::Declined(format!("samples of {bytes} bytes"))),
+        };
+        let export = surface.export();
+        let (coded_width, coded_height) = export.size();
+        let (width, height) = size;
+        // A key a plane of this export: its life's address, unique while it lives.
+        let key = u64::try_from(Arc::as_ptr(export).addr()).unwrap_or(0);
+        let planes = [
+            (luma, [width, height], [coded_width, coded_height]),
+            (
+                chroma,
+                [width / 2, height / 2],
+                [coded_width / 2, coded_height / 2],
+            ),
+        ];
+        let fills: Vec<PlaneFill<'_>> = (planes.iter().zip(formats).enumerate())
+            .map(|(i, (&(plane, extent, size), format))| {
+                let exported = export.plane(i);
+                PlaneFill {
+                    into: DmaBufPlane {
+                        key: key.wrapping_mul(2).wrapping_add(u64::from(i == 1)),
+                        alive: export.alive(),
+                        fd: export.fd(i),
+                        modifier: exported.modifier,
+                        offset: exported.offset,
+                        pitch: exported.pitch,
+                        format,
+                        width: size[0],
+                        height: size[1],
+                    },
+                    from: &plane.buffer,
+                    offset: plane.offset,
+                    bytes_per_row: plane.bytes_per_row,
+                    extent,
+                }
+            })
+            .collect();
+        match self.copier.fill(&fills, Box::new(Arc::clone(export))) {
+            Ok(gpu) => {
+                self.times.add(gpu);
+                Ok(DeviceWrite::Written)
+            }
+            Err(CopyError::Refused(why)) => Ok(DeviceWrite::Declined(why)),
+            Err(CopyError::Failed(why)) => Err(format!("the GPU's copy of a frame: {why}").into()),
+        }
+    }
+}
+
+impl Drop for RuntimeFiller {
+    fn drop(&mut self) {
+        if self.times.count > 0 {
+            log::info!(
+                "hardware video: {NAME}: an encode session's frames copied by the GPU into the \
+                 encoder's input surfaces: {}",
+                self.times.said()
+            );
+        }
     }
 }
 

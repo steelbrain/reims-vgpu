@@ -29,6 +29,6 @@ pub(crate) use va::target_probe;
 pub(crate) use va::gated;
 
 pub use va::{
-    EncoderCapabilities, EncoderSupport, Feature, HevcBlockSizes, HevcFeatures, UploadMethod,
-    VideoEncoder, encoder_support,
+    EncoderCapabilities, EncoderSupport, Feature, HevcBlockSizes, HevcFeatures, InputSurface,
+    UploadMethod, VideoEncoder, encoder_support,
 };

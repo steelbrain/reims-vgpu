@@ -83,7 +83,7 @@ struct Encoder {
     answers: VecDeque<Answer>,
 }
 
-impl HostEncoder for Encoder {
+impl HostEncoder<P> for Encoder {
     fn check(&self, settings: &RgfxVideoEncodeSettings) -> Result<(), BackendError> {
         if settings.width > 4096 {
             return Err("past the test's largest".into());
@@ -91,7 +91,7 @@ impl HostEncoder for Encoder {
         Ok(())
     }
 
-    fn encode(&mut self, frame: EncodeFrame) -> Result<Box<dyn HostEncodedFrame>, BackendError> {
+    fn encode(&mut self, frame: EncodeFrame) -> Result<Box<dyn HostEncodedFrame<P>>, BackendError> {
         self.log.lock().push(Seen::Took(
             frame.frame_index,
             frame.settings.is_some(),
@@ -112,12 +112,13 @@ struct Frame {
     answer: Answer,
 }
 
-impl HostEncodedFrame for Frame {
+impl HostEncodedFrame<P> for Frame {
     fn finish(
         self: Box<Self>,
-        source: &EncodeSource,
+        source: &mut FrameSource<'_, P>,
         out: &mut [u8],
     ) -> Result<Encoded, BackendError> {
+        let source = source.host()?;
         // SAFETY: each plane's first row lies in the source's host bytes.
         let (luma, chroma) = unsafe { (*source.luma.at, *source.chroma.at) };
         (self.log.lock()).push(Seen::Finished(self.index, luma, chroma, out.len()));

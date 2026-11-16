@@ -1,8 +1,10 @@
 //! Copies by the GPU of planes another driver wrote into dma-bufs, a VA-API decode surface's
 //! planes exported with `vaExportSurfaceHandle`, into a runtime buffer, at the rows and offset
-//! the buffer's planes have ([`PlaneCopier`]): the reims-graphics device's VA-API pictures land so
-//! in their output surfaces, whose planes lie 32 bytes into their pages, as CoreVideo lays them
-//! out, where no driver's own video processing writes.
+//! the buffer's planes have ([`PlaneCopier::copy`]): the reims-graphics device's VA-API pictures
+//! land so in their output surfaces, whose planes lie 32 bytes into their pages, as CoreVideo lays
+//! them out, where no driver's own video processing writes. And the other way
+//! ([`PlaneCopier::fill`]): a runtime buffer's planes into dma-bufs another driver reads next, a
+//! VA-API encoder's input surface's, which the reims-graphics device's encode sources reach so.
 //!
 //! - **The source.** Each plane is imported as a single-plane image of its own format (R8 and
 //!   RG8 for NV12, R16 and RG16 for P010) over its dma-buf, at its offset and pitch, tiled as the
@@ -12,6 +14,14 @@
 //!   gone ([`DmaBufPlane::alive`]) or the copier goes; the driver's surfaces are lent again
 //!   picture after picture, so each is imported once. The image is taken from the driver's queue
 //!   family (`VK_QUEUE_FAMILY_FOREIGN_EXT`, in `GENERAL`) for the copy and handed back after it.
+//! - **A fill** ([`PlaneFill`]) is the copy the other way, `vkCmdCopyBufferToImage`: the
+//!   buffer's rows of the picture into the plane's image from its first texel, then the plane's
+//!   texels past the picture's columns and rows, to its own size, filled as the VA crate's upload
+//!   of a frame fills an encoder's margin, each past column with its row's last texel and each
+//!   past row with the picture's last row, so the driver encodes the same bytes either way. The
+//!   buffer is read as the destination of a copy is written: one whose pages are a copy the
+//!   runtime keeps is refused, since its `VkBuffer` may not hold the pages' bytes. The image is
+//!   imported for writes, and handed back to the driver's family with them made available.
 //! - **The destination** is a runtime buffer whose bytes are its memory: one in the device's own
 //!   memory, or over host pages the device imported in place. A buffer whose pages are a copy the
 //!   runtime keeps (`copied-host-pages`), or whose GPU writes never reach its memory, is refused: a write into its `VkBuffer` would never reach the pages.
@@ -150,6 +160,23 @@ pub struct PlaneCopy<'a> {
     pub bytes_per_row: u64,
 }
 
+/// One plane's fill (module docs): the picture's `extent` texels, rows `bytes_per_row` apart
+/// from byte `offset` of `from`, into `into` from its first texel, and its texels past them to
+/// its own size filled from the picture's last column and row.
+#[derive(Clone, Debug)]
+pub struct PlaneFill<'a> {
+    /// The plane written.
+    pub into: DmaBufPlane<'a>,
+    /// The buffer read.
+    pub from: &'a VulkanBuffer,
+    /// The byte of `from` the picture's first row starts at.
+    pub offset: u64,
+    /// The bytes from one row to the next in `from`.
+    pub bytes_per_row: u64,
+    /// The picture's texels: columns and rows, at most the plane's.
+    pub extent: [u32; 2],
+}
+
 /// Why a copy did not land ([`PlaneCopier::copy`]).
 #[derive(Debug)]
 pub enum CopyError {
@@ -172,6 +199,8 @@ impl std::fmt::Display for CopyError {
 /// A kept import of one plane.
 struct Import {
     key: u64,
+    /// Imported for the copier's writes (a fill's), else for its reads.
+    write: bool,
     alive: Weak<()>,
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -180,10 +209,10 @@ struct Import {
 }
 
 /// A copy whose fence answered an error, kept until its fence signals, with the caller's hold of
-/// its sources and the buffers it writes.
+/// its dma-bufs and the buffers it writes or reads.
 struct Pending {
     _hold: Box<dyn Any + Send>,
-    _targets: Vec<VulkanBuffer>,
+    _buffers: Vec<VulkanBuffer>,
 }
 
 /// The copies of one caller, a decode session's (module docs).
@@ -209,8 +238,9 @@ struct Objects {
     /// nanoseconds a tick.
     timestamps: Option<(vk::QueryPool, f64)>,
     imports: Vec<Import>,
-    /// The modifiers and formats the device refused to import, with why.
-    refused: Vec<(u64, PlaneFormat, String)>,
+    /// The modifiers and formats the device refused to import, for writes or for reads, with
+    /// why.
+    refused: Vec<(u64, PlaneFormat, bool, String)>,
     copies: u64,
     pending: Option<Pending>,
 }
@@ -240,6 +270,27 @@ impl PlaneCopier {
         copies: &[PlaneCopy<'_>],
         hold: Box<dyn Any + Send>,
     ) -> Result<Option<Duration>, CopyError> {
+        self.serve()?;
+        let objects = (self.objects.as_mut()).ok_or_else(Self::no_objects)?;
+        objects.copy(&self.queue, copies, hold)
+    }
+
+    /// Fills each of `fills` (module docs), as [`Self::copy`] copies: waits for the GPU as long
+    /// as it takes, keeps the fill with `hold` where its fence answers an error, and makes the
+    /// copier's objects again on the device's new `VkDevice` first where it recovered.
+    pub fn fill(
+        &mut self,
+        fills: &[PlaneFill<'_>],
+        hold: Box<dyn Any + Send>,
+    ) -> Result<Option<Duration>, CopyError> {
+        self.serve()?;
+        let objects = (self.objects.as_mut()).ok_or_else(Self::no_objects)?;
+        objects.fill(&self.queue, fills, hold)
+    }
+
+    /// Makes the objects again on the generation of the device that serves where the device
+    /// recovered since they were made; refused where the process is exiting.
+    fn serve(&mut self) -> Result<(), CopyError> {
         if rt::process_exiting() {
             return Err(CopyError::Refused("the process is exiting".to_owned()));
         }
@@ -258,10 +309,11 @@ impl PlaneCopier {
             );
             self.objects = Some(objects);
         }
-        let Some(objects) = self.objects.as_mut() else {
-            return Err(CopyError::Refused("the copier has no objects".to_owned()));
-        };
-        objects.copy(&self.queue, copies, hold)
+        Ok(())
+    }
+
+    fn no_objects() -> CopyError {
+        CopyError::Refused("the copier has no objects".to_owned())
     }
 
     /// The generations of the device the copier made its objects on: 1, and one more each time
@@ -371,30 +423,7 @@ impl Objects {
         let device = self.generation.device().clone();
         // SAFETY: the handles are used while the generation, which `device` holds, lives.
         let vk_device = unsafe { device.raw() }.device;
-        if self.pending.is_some() {
-            let fence = self.fence;
-            // SAFETY: the fence is this copier's.
-            let done = device.with_loader_word(|| unsafe { vk_device.get_fence_status(fence) });
-            match done {
-                // SAFETY: the fence is this copier's, signalled, and in no submission.
-                Ok(true) => {
-                    match device.with_loader_word(|| unsafe { vk_device.reset_fences(&[fence]) }) {
-                        Ok(()) => self.pending = None,
-                        Err(e) => {
-                            return Err(CopyError::Refused(format!(
-                                "its fence's reset answered {e}"
-                            )));
-                        }
-                    }
-                }
-                Ok(false) => {
-                    return Err(CopyError::Refused(
-                        "an earlier copy has not finished on the GPU".to_owned(),
-                    ));
-                }
-                Err(e) => return Err(CopyError::Refused(format!("its fence answered {e}"))),
-            }
-        }
+        self.ready(vk_device)?;
         let mut targets = Vec::with_capacity(copies.len());
         for copy in copies {
             targets.push(destination(copy, &self.generation)?);
@@ -403,13 +432,86 @@ impl Objects {
         self.copies += 1;
         let mut images = Vec::with_capacity(copies.len());
         for copy in copies {
-            images.push(self.import(vk_device, &copy.source)?);
+            images.push(self.import(vk_device, &copy.source, false)?);
         }
         device
             .with_loader_word(|| self.record(vk_device, copies, &images, &targets))
             .map_err(|e| CopyError::Refused(format!("its command buffer was refused ({e})")))?;
-        let buffers = [self.buffer];
-        let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
+        let buffers = copies.iter().map(|copy| copy.to.clone_ref()).collect();
+        self.run(queue, vk_device, hold, buffers)
+    }
+
+    /// [`PlaneCopier::fill`] with these objects, on `queue`, the copier's.
+    fn fill(
+        &mut self,
+        queue: &rt::CommandQueue,
+        fills: &[PlaneFill<'_>],
+        hold: Box<dyn Any + Send>,
+    ) -> Result<Option<Duration>, CopyError> {
+        let device = self.generation.device().clone();
+        // SAFETY: the handles are used while the generation, which `device` holds, lives.
+        let vk_device = unsafe { device.raw() }.device;
+        self.ready(vk_device)?;
+        let mut sources = Vec::with_capacity(fills.len());
+        for fill in fills {
+            sources.push(source(fill, &self.generation)?);
+        }
+        self.let_go_of_gone(vk_device);
+        self.copies += 1;
+        let mut images = Vec::with_capacity(fills.len());
+        for fill in fills {
+            images.push(self.import(vk_device, &fill.into, true)?);
+        }
+        device
+            .with_loader_word(|| self.record_fill(vk_device, fills, &images, &sources))
+            .map_err(|e| CopyError::Refused(format!("its command buffer was refused ({e})")))?;
+        let buffers = fills.iter().map(|fill| fill.from.clone_ref()).collect();
+        self.run(queue, vk_device, hold, buffers)
+    }
+
+    /// `Ok` once no copy is pending: the last one kept after its fence answered an error is let
+    /// go where its fence has signalled since; refused where it has not.
+    fn ready(&mut self, vk_device: &ash::Device) -> Result<(), CopyError> {
+        if self.pending.is_none() {
+            return Ok(());
+        }
+        let device = self.generation.device().clone();
+        let fence = self.fence;
+        // SAFETY: the fence is this copier's.
+        let done = device.with_loader_word(|| unsafe { vk_device.get_fence_status(fence) });
+        match done {
+            // SAFETY: the fence is this copier's, signalled, and in no submission.
+            Ok(true) => {
+                match device.with_loader_word(|| unsafe { vk_device.reset_fences(&[fence]) }) {
+                    Ok(()) => {
+                        self.pending = None;
+                        Ok(())
+                    }
+                    Err(e) => Err(CopyError::Refused(format!(
+                        "its fence's reset answered {e}"
+                    ))),
+                }
+            }
+            Ok(false) => Err(CopyError::Refused(
+                "an earlier copy has not finished on the GPU".to_owned(),
+            )),
+            Err(e) => Err(CopyError::Refused(format!("its fence answered {e}"))),
+        }
+    }
+
+    /// Submits the recorded command buffer on `queue` and waits for it (module docs), keeping
+    /// `hold` and `buffers` with it where its fence answers an error; the copy's GPU time once
+    /// done.
+    fn run(
+        &mut self,
+        queue: &rt::CommandQueue,
+        vk_device: &ash::Device,
+        hold: Box<dyn Any + Send>,
+        buffers: Vec<VulkanBuffer>,
+    ) -> Result<Option<Duration>, CopyError> {
+        let device = self.generation.device().clone();
+        let command_buffers = [self.buffer];
+        let submit = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
         let fence = self.fence;
         // SAFETY: the submission is the closure's only call, keeps no handle and waits for
         // nothing; the buffer is executable and not pending (no copy is pending), and the fence
@@ -424,10 +526,6 @@ impl Objects {
             ));
         };
         submitted.map_err(|e| CopyError::Refused(format!("its submission was refused ({e})")))?;
-        let pending = |hold: Box<dyn Any + Send>| Pending {
-            _hold: hold,
-            _targets: copies.iter().map(|copy| copy.to.clone_ref()).collect(),
-        };
         // No bound of its own but the generation's park (module docs).
         let look = u64::try_from(PARK_LOOK.as_nanos()).unwrap_or(u64::MAX);
         let waited = loop {
@@ -444,16 +542,22 @@ impl Objects {
             }
         };
         if let Err(why) = waited {
-            self.pending = Some(pending(hold));
+            self.pending = Some(Pending {
+                _hold: hold,
+                _buffers: buffers,
+            });
             return Err(CopyError::Failed(why));
         }
         // SAFETY: the fence is this copier's, signalled.
         let reset = device.with_loader_word(|| unsafe { vk_device.reset_fences(&[fence]) });
         if let Err(e) = reset {
-            self.pending = Some(pending(hold));
+            self.pending = Some(Pending {
+                _hold: hold,
+                _buffers: buffers,
+            });
             return Err(CopyError::Failed(format!("its fence's reset answered {e}")));
         }
-        drop(hold);
+        drop((hold, buffers));
         Ok(self.gpu_time(vk_device))
     }
 
@@ -496,25 +600,30 @@ impl Objects {
         });
     }
 
-    /// The image of `plane`, imported now or kept from an earlier copy.
+    /// The image of `plane`, imported now or kept from an earlier copy, for the copier's writes
+    /// where `write` (a fill's), else for its reads.
     fn import(
         &mut self,
         vk_device: &ash::Device,
         plane: &DmaBufPlane<'_>,
+        write: bool,
     ) -> Result<vk::Image, CopyError> {
         let copies = self.copies;
-        if let Some(kept) = self.imports.iter_mut().find(|i| i.key == plane.key) {
+        if let Some(kept) =
+            (self.imports.iter_mut()).find(|i| i.key == plane.key && i.write == write)
+        {
             kept.used = copies;
             return Ok(kept.image);
         }
-        if let Some((.., why)) = (self.refused.iter())
-            .find(|(modifier, format, _)| *modifier == plane.modifier && *format == plane.format)
-        {
+        if let Some((.., why)) = self.refused.iter().find(|(modifier, format, w, _)| {
+            *modifier == plane.modifier && *format == plane.format && *w == write
+        }) {
             return Err(CopyError::Refused(why.clone()));
         }
-        if let Err(why) = self.importable(plane) {
+        let usage = usage_of(write);
+        if let Err(why) = self.importable(plane, usage) {
             self.refused
-                .push((plane.modifier, plane.format, why.clone()));
+                .push((plane.modifier, plane.format, write, why.clone()));
             return Err(CopyError::Refused(why));
         }
         if self.imports.len() >= MOST_IMPORTS
@@ -527,10 +636,11 @@ impl Objects {
         }
         let device = self.generation.device().clone();
         let (image, memory) = device
-            .with_loader_word(|| self.make_import(vk_device, plane))
+            .with_loader_word(|| self.make_import(vk_device, plane, usage))
             .map_err(|why| CopyError::Refused(format!("the plane's import: {why}")))?;
         self.imports.push(Import {
             key: plane.key,
+            write,
             alive: plane.alive.clone(),
             image,
             memory,
@@ -540,8 +650,12 @@ impl Objects {
     }
 
     /// `Ok` where the device imports a dma-buf of `plane`'s modifier as an image of its format
-    /// that copies out; `Err` with why otherwise.
-    fn importable(&self, plane: &DmaBufPlane<'_>) -> Result<(), String> {
+    /// of `usage`, that copies out or in; `Err` with why otherwise.
+    fn importable(
+        &self,
+        plane: &DmaBufPlane<'_>,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<(), String> {
         // SAFETY: the handles are used while the generation lives.
         let handles = unsafe { self.generation.raw() };
         let mut modifier = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
@@ -553,7 +667,7 @@ impl Objects {
             .format(plane.format.vk())
             .ty(vk::ImageType::TYPE_2D)
             .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .usage(vk::ImageUsageFlags::TRANSFER_SRC)
+            .usage(usage)
             .push_next(&mut modifier)
             .push_next(&mut external);
         let mut external_props = vk::ExternalImageFormatProperties::default();
@@ -570,8 +684,12 @@ impl Objects {
         };
         let format = plane.format;
         let modifier = plane.modifier;
+        let usage = usage.as_raw();
         answered.map_err(|e| {
-            format!("the device makes no {format:?} image of modifier {modifier:#x} from a dma-buf ({e})")
+            format!(
+                "the device makes no {format:?} image of modifier {modifier:#x} of usage \
+                 {usage:#x} from a dma-buf ({e})"
+            )
         })?;
         let max = props.image_format_properties.max_extent;
         if !(external_props
@@ -592,11 +710,12 @@ impl Objects {
         Ok(())
     }
 
-    /// An image over `plane`'s dma-buf, and its import (module docs).
+    /// An image of `usage` over `plane`'s dma-buf, and its import (module docs).
     fn make_import(
         &self,
         vk_device: &ash::Device,
         plane: &DmaBufPlane<'_>,
+        usage: vk::ImageUsageFlags,
     ) -> Result<(vk::Image, vk::DeviceMemory), String> {
         let layouts = [vk::SubresourceLayout {
             offset: plane.offset,
@@ -622,7 +741,7 @@ impl Objects {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .usage(vk::ImageUsageFlags::TRANSFER_SRC)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut explicit)
@@ -818,6 +937,214 @@ impl Objects {
             );
             vk_device.end_command_buffer(cb)
         }
+    }
+}
+
+impl Objects {
+    /// Records the fills of `fills` from `sources` into `images` (module docs).
+    fn record_fill(
+        &self,
+        vk_device: &ash::Device,
+        fills: &[PlaneFill<'_>],
+        images: &[vk::Image],
+        sources: &[(vk::Buffer, u64)],
+    ) -> Result<(), vk::Result> {
+        let color = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let (foreign, ours) = (vk::QUEUE_FAMILY_FOREIGN_EXT, self.generation.family());
+        let acquires: Vec<_> = (images.iter())
+            .map(|&image| {
+                vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .subresource_range(color)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(foreign)
+                    .dst_queue_family_index(ours)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            })
+            .collect();
+        let releases: Vec<_> = (images.iter())
+            .map(|&image| {
+                vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .subresource_range(color)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(ours)
+                    .dst_queue_family_index(foreign)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            })
+            .collect();
+        // The buffers' bytes as the host and the device's earlier work wrote them.
+        let read = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+        let cb = self.buffer;
+        // SAFETY: the buffer is this copier's and not pending; every handle recorded is live
+        // through the fill (the images are kept, the buffers held by the caller's fills).
+        unsafe {
+            vk_device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            vk_device.begin_command_buffer(cb, &begin)?;
+            if let Some((pool, _)) = self.timestamps {
+                vk_device.cmd_reset_query_pool(cb, pool, 0, 2);
+            }
+            vk_device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &read,
+                &[],
+                &acquires,
+            );
+            if let Some((pool, _)) = self.timestamps {
+                vk_device.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, pool, 0);
+            }
+            for ((fill, &image), &(buffer, base)) in fills.iter().zip(images).zip(sources) {
+                let regions = fill_regions(fill, base);
+                vk_device.cmd_copy_buffer_to_image(
+                    cb,
+                    buffer,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &regions,
+                );
+            }
+            if let Some((pool, _)) = self.timestamps {
+                vk_device.cmd_write_timestamp(cb, vk::PipelineStageFlags::TRANSFER, pool, 1);
+            }
+            vk_device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &releases,
+            );
+            vk_device.end_command_buffer(cb)
+        }
+    }
+}
+
+/// The regions of `fill`, its picture at byte `base` of its `VkBuffer` (module docs): the
+/// picture's texels from the plane's first; each column past them, to the plane's width, from
+/// the picture's last column; and each row past them, to its height, from the picture's last
+/// row, with that row's last texel in each column past the picture's.
+fn fill_regions(fill: &PlaneFill<'_>, base: u64) -> Vec<vk::BufferImageCopy> {
+    let texel = fill.into.format.texel_bytes();
+    let row_length = u32::try_from(fill.bytes_per_row / texel).unwrap_or(u32::MAX);
+    let [width, height] = fill.extent;
+    let (plane_width, plane_height) = (fill.into.width, fill.into.height);
+    let region = |from: u64, x: u32, y: u32, w: u32, h: u32| vk::BufferImageCopy {
+        buffer_offset: from,
+        buffer_row_length: row_length,
+        buffer_image_height: h,
+        image_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        image_offset: vk::Offset3D {
+            x: i32::try_from(x).unwrap_or(i32::MAX),
+            y: i32::try_from(y).unwrap_or(i32::MAX),
+            z: 0,
+        },
+        image_extent: vk::Extent3D {
+            width: w,
+            height: h,
+            depth: 1,
+        },
+    };
+    let last_column = base + u64::from(width - 1) * texel;
+    let last_row = base + u64::from(height - 1) * fill.bytes_per_row;
+    let mut regions = vec![region(base, 0, 0, width, height)];
+    for x in width..plane_width {
+        regions.push(region(last_column, x, 0, 1, height));
+    }
+    for y in height..plane_height {
+        regions.push(region(last_row, 0, y, width, 1));
+        for x in width..plane_width {
+            regions.push(region(last_row + u64::from(width - 1) * texel, x, y, 1, 1));
+        }
+    }
+    regions
+}
+
+/// The `VkBuffer` `fill` reads and its byte there: `Err` where its buffer is of another
+/// generation of the device than the copier's `generation`, its `VkBuffer` may not hold its
+/// pages' bytes, or the picture lies past the buffer, off its texels' alignment or past the
+/// plane (module docs).
+fn source(fill: &PlaneFill<'_>, generation: &Generation) -> Result<(vk::Buffer, u64), CopyError> {
+    let refused = |why: String| CopyError::Refused(why);
+    let buffer = &fill.from.raw;
+    if !generation.is_of(&buffer.device()) {
+        return Err(refused(
+            "the buffer was made on the device's VkDevice before its recovery".to_owned(),
+        ));
+    }
+    if let Some(rt::HostBacking::Copied) = buffer.host_backing() {
+        return Err(refused(
+            "the buffer's pages are a copy the runtime keeps, which its VkBuffer may not hold"
+                .to_owned(),
+        ));
+    }
+    let texel = fill.into.format.texel_bytes();
+    let [width, height] = fill.extent;
+    if width == 0 || height == 0 {
+        return Err(refused("an empty plane".to_owned()));
+    }
+    if !fill.bytes_per_row.is_multiple_of(texel) || !fill.offset.is_multiple_of(texel) {
+        return Err(refused(format!(
+            "a plane at {} with rows of {} bytes, not of whole {texel}-byte texels",
+            fill.offset, fill.bytes_per_row
+        )));
+    }
+    let row = u64::from(width) * texel;
+    let end = (fill.bytes_per_row.checked_mul(u64::from(height - 1)))
+        .and_then(|rows| rows.checked_add(row))
+        .and_then(|bytes| bytes.checked_add(fill.offset));
+    if row > fill.bytes_per_row || !end.is_some_and(|end| end <= buffer.length()) {
+        return Err(refused(format!(
+            "a plane of {height} rows of {row} bytes, {} apart, at {}, past its buffer's {} bytes",
+            fill.bytes_per_row,
+            fill.offset,
+            buffer.length()
+        )));
+    }
+    if width > fill.into.width || height > fill.into.height {
+        return Err(refused(format!(
+            "a {width}x{height} picture in a {}x{} plane",
+            fill.into.width, fill.into.height
+        )));
+    }
+    // SAFETY: the copier uses the `VkBuffer` only while the caller's fill holds the buffer, and
+    // orders its read against the runtime's work as the module docs say.
+    let (vk_buffer, base) = unsafe { buffer.vk_buffer() };
+    let at = base + fill.offset;
+    if !at.is_multiple_of(texel) {
+        return Err(refused(format!(
+            "a plane at byte {at} of its VkBuffer, not on a {texel}-byte texel"
+        )));
+    }
+    Ok((vk_buffer, at))
+}
+
+/// The usage of an import for the copier's writes (a fill's), else for its reads.
+fn usage_of(write: bool) -> vk::ImageUsageFlags {
+    if write {
+        vk::ImageUsageFlags::TRANSFER_DST
+    } else {
+        vk::ImageUsageFlags::TRANSFER_SRC
     }
 }
 

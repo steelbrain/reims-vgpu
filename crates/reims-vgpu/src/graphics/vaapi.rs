@@ -79,7 +79,7 @@ use reims_vgpu_video::core::runtime::Runtime;
 use reims_vgpu_video::core::surfaces::{PlaneLayout, SurfaceLayout};
 use reims_vgpu_video::vaapi::{
     Capabilities, ConfigCapabilities, Display, EncoderSupport, Entrypoint, Frame, GuestWrites,
-    H264_MAX_MACROBLOCKS, H264Decoder, HevcDecoder, ImportWrites, PlaneRows, Profile,
+    H264_MAX_MACROBLOCKS, H264Decoder, HevcDecoder, ImportWrites, InputSurface, PlaneRows, Profile,
     TARGET_ALIGNMENT, Target, TargetChecks, TargetCodec, TargetFor, TargetFormat, TargetPlane,
     TargetShape, encoder_support,
 };
@@ -281,12 +281,17 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
         let entry = (self.caps.iter()).find(|c| c.codec == codec && c.direction == direction)?;
         if direction == RGFX_VIDEO_ENCODE {
             let caps = encode::encode_caps(entry, &self.encoders);
+            let filler = match self.copies.as_ref() {
+                Some(copies) => copies.filler(),
+                None => Err("the platform makes no GPU copies".to_owned()),
+            };
             let encoder = encode::VaEncoder::new(
                 &self.display,
                 codec,
                 Arc::clone(&self.encoders),
                 entry,
                 &caps,
+                filler,
             );
             let session = HostEncodeSession::new(&self.device, codec, NAME, Box::new(encoder))?;
             return Some(Arc::new(session));
@@ -924,10 +929,30 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
 }
 
 /// What makes the GPU copies of a video's sessions (the module doc's second way): one copier a
-/// session.
+/// decode session, and one filler an encode session (`encode`'s module doc).
 pub(crate) trait GpuCopies<P: Platform>: Send + Sync {
     /// A session's copier; `Err` with why where the device makes none.
     fn copier(&self) -> Result<Box<dyn GpuCopier<P>>, String>;
+
+    /// An encode session's filler; `Err` with why where the device makes none.
+    fn filler(&self) -> Result<Box<dyn GpuFiller<P>>, String>;
+}
+
+/// One encode session's GPU copies of its frames into its encoder's input surfaces.
+pub(crate) trait GpuFiller<P: Platform>: Send {
+    /// Writes the frame of `size`, of samples of `sample` bytes, in `luma` and `chroma` where they
+    /// lie, into `surface`, an input surface of the encoder's of its coded size, the margin past
+    /// the frame filled as the VA crate's upload fills it, and returns once the GPU wrote it;
+    /// [`DeviceWrite::Declined`] with why, nothing written, where it cannot. `Err` where the copy
+    /// failed once on the GPU, which may write the surface still.
+    fn fill(
+        &mut self,
+        surface: &InputSurface,
+        luma: &OutputPlane<P>,
+        chroma: &OutputPlane<P>,
+        size: (u32, u32),
+        sample: u32,
+    ) -> Result<DeviceWrite, BackendError>;
 }
 
 /// One session's GPU copies of its pictures into their outputs.

@@ -30,6 +30,7 @@ pub use surfaces::UploadMethod;
 
 use super::caps::{Entrypoint, Profile};
 use super::display::{Display, Error};
+use super::export::SurfaceExport;
 use super::ffi::{self, encode as enc};
 use super::wait::{self, Deadline};
 use crate::codec::encode::encoder::{DriverLimits, Encoder};
@@ -307,6 +308,43 @@ impl VideoEncoder {
     /// Uploads frames by `method` from now on.
     pub fn force_upload_method(&mut self, method: UploadMethod) {
         self.inner.accelerator_mut().force_upload_method(method);
+    }
+
+    /// A free input surface of the coded size, for another device to write the next frame into
+    /// through its memory as dma-bufs ([`InputSurface::export`]), then encoded by
+    /// [`Self::encode_surface`]. It goes back to its pool where it is dropped instead.
+    pub fn input_surface(&mut self) -> Result<InputSurface, Error> {
+        let (lent, export) = self.inner.accelerator_mut().lend_input()?;
+        Ok(InputSurface { lent, export })
+    }
+
+    /// [`Self::encode`] of the frame written into `surface`, whose whole coded size holds it:
+    /// the picture's rows and columns, and the margin to the coded size filled as an upload
+    /// fills it, its last column and row repeated. `frame`'s times, key-frame demand and tag are
+    /// taken, and its planes are not read.
+    pub fn encode_surface(
+        &mut self,
+        surface: InputSurface,
+        frame: &InputFrame<'_>,
+    ) -> Result<Vec<Coded<Error>>, Error> {
+        wait::by(&Deadline::default(), || {
+            self.inner.encode_input(surface.lent, frame)
+        })
+    }
+}
+
+/// An input surface of an encoder's, lent for another device to write a frame into
+/// ([`VideoEncoder::input_surface`]).
+pub struct InputSurface {
+    lent: surfaces::Lent,
+    export: Arc<SurfaceExport>,
+}
+
+impl InputSurface {
+    /// The surface's memory as dma-bufs, exported for writing: the encoder's coded size, its
+    /// planes where the export says, kept while the encoder's pool lives.
+    pub fn export(&self) -> &Arc<SurfaceExport> {
+        &self.export
     }
 }
 

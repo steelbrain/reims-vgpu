@@ -2,6 +2,9 @@ use reims_vgpu_graphics::wire::RGFX_VIDEO_DECODE;
 use reims_vgpu_video::core::runtime::StdRuntime;
 use reims_vgpu_video::vaapi::{H264Decoder, HevcDecoder, encoder_support};
 
+use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::core::platform::Handle as _;
+
 use super::*;
 
 /// Settings of a 320x192 stream of `profile` of `codec` at a constant QP.
@@ -389,9 +392,15 @@ fn each_profile_encodes_on_the_driver_and_decodes_back() {
             .filter(|b| entry.profiles & b != 0)
         {
             let s = settings(entry.codec, bit);
-            let mut encoder =
-                VaEncoder::new(&display, entry.codec, Arc::clone(&supports), entry, &rates);
-            encoder.check(&s).unwrap();
+            let encoder = VaEncoder::<VulkanPlatform>::new(
+                &display,
+                entry.codec,
+                Arc::clone(&supports),
+                entry,
+                &rates,
+                Err("the test copies none by the GPU".to_owned()),
+            );
+            HostEncoder::<VulkanPlatform>::check(&encoder, &s).unwrap();
             let sets: &[u8] = if entry.codec == RGFX_VIDEO_CODEC_H264 {
                 &[7, 8]
             } else {
@@ -405,7 +414,7 @@ fn each_profile_encodes_on_the_driver_and_decodes_back() {
                     frame_index: index,
                     force_keyframe: false,
                 };
-                let frame = encoder.encode(frame).unwrap();
+                let frame = encoder.frame(frame);
                 let (luma, chroma) = picture(&s, index);
                 let row = luma.len() / s.height as usize;
                 let source = EncodeSource {
@@ -425,7 +434,7 @@ fn each_profile_encodes_on_the_driver_and_decodes_back() {
                     height: s.height,
                 };
                 let mut out = vec![0u8; capacity(index)];
-                let encoded = frame.finish(&source, &mut out).unwrap();
+                let encoded = frame.finish_from_host(&source, &mut out).unwrap();
                 assert_eq!(encoded.frame_index, index);
                 let au = out[..encoded.size.min(out.len() as u64) as usize].to_vec();
                 let types = nal_types(entry.codec, &au);
@@ -478,5 +487,202 @@ fn each_profile_encodes_on_the_driver_and_decodes_back() {
                 entry.codec
             );
         }
+    }
+}
+
+/// A frame the runtime device's GPU copies into an input surface of the encoder's
+/// (`gpu_copy`'s filler) encodes as the same frame uploaded by the CPU, byte for byte: on the
+/// driver of the runtime device's GPU, for each codec and profile it encodes, 6 frames of a
+/// moving picture at a constant QP, 320x192 (no margin to the coded size) and 330x202 (a margin
+/// of columns and rows), each in a runtime buffer, its own memory or over host pages, by turns,
+/// rows wider than the picture's (512 bytes apart for 8-bit samples, 768 or 1024 for 16-bit)
+/// from byte 32. Two encoders of the same settings code the frames, one from the host bytes, one
+/// from the filled surfaces; every access unit of the second is the first's.
+/// A device with no GPU copier checks nothing: the test says so and ends.
+#[test]
+#[ignore = "needs a VA-API GPU: run on the VA-API host"]
+fn a_frame_filled_by_the_gpu_encodes_as_the_uploaded_frame_byte_for_byte() {
+    use reims_vgpu_video::codec::encode::{InputFrame, Plane};
+    use reims_vgpu_vulkan::core::platform::HostRange;
+    use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+    use reims_vgpu_vulkan::core::platform::os::vm::HostVm as _;
+    use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+    use reims_vgpu_vulkan::core::raise::OnFault;
+    use reims_vgpu_vulkan::remap::VulkanVm;
+
+    use super::super::super::video_host::OutputPlane;
+    use super::super::{GpuCopies as _, gpu_copy};
+
+    let platform = Arc::new(VulkanPlatform::new());
+    crate::entry::run(|_| {
+        let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+        let node = reims_vgpu_vulkan::host_gpus::render_node_of(&device.raw).expect("a node");
+        let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
+        let display = Display::open(&node, runtime).expect("a VA display on the device's GPU");
+        let copies = gpu_copy::RuntimeCopies::new(&device);
+        let mut filler = match copies.filler() {
+            Ok(filler) => filler,
+            Err(why) => {
+                assert!(
+                    why.starts_with("the device lists no "),
+                    "a GPU filler: {why}"
+                );
+                eprintln!("no GPU filler on the device, so no frame to compare: {why}");
+                return;
+            }
+        };
+        let supports: Arc<[EncoderSupport]> = encoder_support(&display).into();
+        let entries = encode_caps_of(&supports, &display.capabilities().unwrap());
+        assert!(
+            !entries.is_empty(),
+            "the driver encodes neither H.264 nor HEVC"
+        );
+        let vm = VulkanVm::new();
+        let first = 32u64;
+        let mut frames = 0;
+        for entry in &entries {
+            for bit in (0..32)
+                .map(|b| 1u32 << b)
+                .filter(|b| entry.profiles & b != 0)
+            {
+                for (width, height) in [(320u32, 192u32), (330, 202)] {
+                    let s = RgfxVideoEncodeSettings {
+                        width,
+                        height,
+                        ..settings(entry.codec, bit)
+                    };
+                    let what = format!("codec {} profile {bit:#x} {width}x{height}", entry.codec);
+                    let made = settings_of(entry.codec, &s, None).expect("the VA settings");
+                    let mut by_cpu = VideoEncoder::new(&display, made.clone()).expect("an encoder");
+                    let mut by_gpu = VideoEncoder::new(&display, made).expect("an encoder");
+                    let sample = made_sample(&s);
+                    let row = u64::from(width) * sample;
+                    // Rows wider than the picture's, from a byte past the buffer's start: 512
+                    // apart for 8-bit samples, 768 or 1024 for 16-bit ones.
+                    let pitch = (row + 128).next_multiple_of(256);
+                    let chroma_at = first + pitch * u64::from(height);
+                    let len = (chroma_at + pitch * u64::from(height / 2))
+                        .next_multiple_of(vm.page_size());
+                    for n in 0..6u64 {
+                        let (luma, chroma) = picture(&s, n);
+                        // The frame's bytes in a buffer: the device's own memory, or host pages.
+                        let (buffer, at) = if n % 2 == 0 {
+                            let buffer = (device.new_buffer_of_length(OnFault::Return, len, 0))
+                                .expect("no raise")
+                                .expect("a buffer");
+                            let at = buffer.contents();
+                            (buffer, at)
+                        } else {
+                            let at = vm.allocate_anywhere(len).expect("host pages");
+                            // SAFETY: the pages stay mapped until the runtime's release of the
+                            // buffer runs the deallocator, as `land_both_ways` keeps them.
+                            let bytes = unsafe { HostRange::new(at, len) };
+                            let unmap: Box<dyn FnOnce() + Send> = Box::new(move || {
+                                let _ = VulkanVm::new().deallocate(at, len);
+                            });
+                            let buffer = (device.new_buffer_over_host_memory(
+                                OnFault::Return,
+                                bytes,
+                                0,
+                                Some(unmap),
+                            ))
+                            .expect("no raise")
+                            .expect("a buffer over the pages");
+                            (buffer, at)
+                        };
+                        for (plane, from, rows) in [
+                            (first, &luma, u64::from(height)),
+                            (chroma_at, &chroma, u64::from(height / 2)),
+                        ] {
+                            for r in 0..rows {
+                                let src = &from[(r * row) as usize..((r + 1) * row) as usize];
+                                // SAFETY: the row lies in the buffer's `len` host bytes, which no
+                                // GPU work reaches yet.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        src.as_ptr(),
+                                        at.wrapping_add(plane + r * pitch).as_ptr::<u8>(),
+                                        src.len(),
+                                    );
+                                }
+                            }
+                        }
+                        let plane = |offset: u64, rows: u64, w: u64| OutputPlane {
+                            buffer: buffer.clone_ref(),
+                            offset,
+                            bytes_per_row: pitch,
+                            row_bytes: row,
+                            width: w,
+                            height: rows,
+                            rows_held: rows,
+                            cached: n % 2 == 0,
+                            host: Some(at.wrapping_add(offset)),
+                            pages: None,
+                            cache: None,
+                        };
+                        let luma_plane = plane(first, u64::from(height), u64::from(width));
+                        let chroma_plane =
+                            plane(chroma_at, u64::from(height / 2), u64::from(width / 2));
+                        let input = InputFrame {
+                            planes: [
+                                Plane {
+                                    data: &luma,
+                                    bytes_per_row: row as usize,
+                                },
+                                Plane {
+                                    data: &chroma,
+                                    bytes_per_row: row as usize,
+                                },
+                            ],
+                            pts: i64::try_from(n).expect("a time"),
+                            duration: 1,
+                            force_key_frame: false,
+                            id: n,
+                        };
+                        let uploaded = by_cpu.encode(&input).expect("the upload's encode");
+                        let surface = by_gpu.input_surface().expect("an input surface");
+                        let written = filler
+                            .fill(
+                                &surface,
+                                &luma_plane,
+                                &chroma_plane,
+                                (width, height),
+                                u32::try_from(sample).expect("a sample"),
+                            )
+                            .expect("the GPU's copy");
+                        match written {
+                            DeviceWrite::Written => {}
+                            DeviceWrite::Declined(why) => panic!("{what}: declined: {why}"),
+                        }
+                        let filled = by_gpu.encode_surface(surface, &input).expect("the encode");
+                        let data =
+                            |coded: &[Coded<reims_vgpu_video::vaapi::Error>]| -> Vec<Vec<u8>> {
+                                (coded.iter())
+                                    .map(|c| c.as_ref().expect("a sample").data.to_vec())
+                                    .collect()
+                            };
+                        let (a, b) = (data(&uploaded), data(&filled));
+                        assert_eq!(a.len(), b.len(), "{what} frame {n}: samples");
+                        assert!(
+                            a == b,
+                            "{what} frame {n}: the filled frame's access unit differs"
+                        );
+                        frames += 1;
+                        drop((luma_plane, chroma_plane, buffer));
+                    }
+                }
+            }
+        }
+        eprintln!("{frames} frames filled by the GPU encoded as uploaded");
+        assert!(frames > 0);
+    });
+}
+
+/// The bytes of a sample of `settings`' format.
+fn made_sample(settings: &RgfxVideoEncodeSettings) -> u64 {
+    if settings.format == RGFX_VIDEO_FORMAT_P010 {
+        2
+    } else {
+        1
     }
 }

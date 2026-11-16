@@ -18,12 +18,15 @@
 //! followed on the VCN by that picture. radeonsi's VCN hangs otherwise
 //! ([`super`]'s docs).
 
+use std::sync::Arc;
+
 use crate::core::runtime::MonoTime;
 use crate::core::sync::Mutex;
 
 use super::super::buffer::{Buffer, render_picture};
 use super::super::caps::{Config, Context, Entrypoint, Profile};
 use super::super::display::{Display, Error, check};
+use super::super::export::{SurfaceExport, export_for_write};
 use super::super::ffi::{self, encode as enc};
 use super::super::wait::{self, Work};
 use super::params;
@@ -67,6 +70,11 @@ struct Session {
     /// The references held, by number.
     references: Vec<(u64, Lent)>,
     uploader: Uploader,
+    /// The input surfaces' sizes, the coded size.
+    coded_size: (u32, u32),
+    /// The input surfaces exported for another device to write a frame into, each once, at its
+    /// first lend so ([`VaAccelerator::lend_input`]).
+    exports: Vec<(ffi::VASurfaceID, Arc<SurfaceExport>)>,
     /// From [`StreamParams`].
     b_frames: u32,
     intra_period: u32,
@@ -156,6 +164,23 @@ impl VaAccelerator {
 
     pub(crate) fn upload_method(&self) -> Option<UploadMethod> {
         self.session.as_ref().and_then(|s| s.uploader.method())
+    }
+
+    /// A free input surface of the coded size, for another device to write a frame into, with its
+    /// memory as dma-bufs, which it keeps while its pool lives: each surface is exported once.
+    pub(crate) fn lend_input(&mut self) -> Result<(Lent, Arc<SurfaceExport>), Error> {
+        self.unstalled()?;
+        let session = self.session.as_mut().ok_or_else(|| {
+            Error::Unsupported("a surface lent before the stream is configured".into())
+        })?;
+        let surface = session.inputs.get()?;
+        let id = surface.id();
+        if let Some((_, export)) = session.exports.iter().find(|(s, _)| *s == id) {
+            return Ok((surface, Arc::clone(export)));
+        }
+        let export = Arc::new(export_for_write(&self.display, id, session.coded_size)?);
+        session.exports.push((id, Arc::clone(&export)));
+        Ok((surface, export))
     }
 
     pub(crate) fn force_upload_method(&mut self, method: UploadMethod) {
@@ -279,6 +304,8 @@ impl Accelerator for VaAccelerator {
             reconstructed,
             references: Vec::new(),
             uploader,
+            coded_size: (width, height),
+            exports: Vec::new(),
             b_frames: stream.b_frames,
             intra_period: stream.intra_period,
             picture_qp: stream.picture_qp,

@@ -44,8 +44,8 @@ pub use caps::{
 };
 pub use display::{Display, Error};
 pub use encoder::{
-    EncoderCapabilities, EncoderSupport, Feature, HevcBlockSizes, HevcFeatures, UploadMethod,
-    VideoEncoder, encoder_support,
+    EncoderCapabilities, EncoderSupport, Feature, HevcBlockSizes, HevcFeatures, InputSurface,
+    UploadMethod, VideoEncoder, encoder_support,
 };
 pub use export::{ExportedPlane, SurfaceExport};
 pub use frame::{Frame, FrameHold, GuestWrites, PlaneRows, ReadBack};

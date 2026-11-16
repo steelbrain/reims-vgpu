@@ -413,9 +413,12 @@ fn each_profile_encodes_through_a_session_and_decodes_back_on_nvdec() {
                     ..s
                 },
             ] {
-                assert!(encoder.check(&refused).is_err(), "{what}: {refused:?}");
+                assert!(
+                    HostEncoder::<FakePlatform>::check(&encoder, &refused).is_err(),
+                    "{what}: {refused:?}"
+                );
             }
-            encoder.check(&s).expect("settings NVENC takes");
+            HostEncoder::<FakePlatform>::check(&encoder, &s).expect("settings NVENC takes");
             let session = HostEncodeSession::<FakePlatform>::new(
                 &p.device(),
                 entry.codec,

@@ -662,12 +662,33 @@ impl<A: Accelerator> Encoder<A> {
     /// several when it ends a run. `Err` is a frame not taken: one whose
     /// time stamp does not follow the last, or that does not upload.
     pub fn encode(&mut self, frame: &InputFrame<'_>) -> Result<Vec<Coded<A::Error>>, A::Error> {
-        if let Some(last) = self.last_pts {
-            check(frame.pts > last, || {
-                format!("PTS {} does not follow {last}", frame.pts)
-            })?;
-        }
+        self.follows(frame.pts)?;
         let input = self.accelerator.upload(frame)?;
+        Ok(self.push(input, frame))
+    }
+
+    /// [`Self::encode`] of a frame another device already wrote into `input`, an input of the
+    /// accelerator's: `frame`'s times, key-frame demand and tag are taken, and its planes are not
+    /// read. `Err` is a frame not taken, whose time stamp does not follow the last.
+    pub fn encode_input(
+        &mut self,
+        input: A::Input,
+        frame: &InputFrame<'_>,
+    ) -> Result<Vec<Coded<A::Error>>, A::Error> {
+        self.follows(frame.pts)?;
+        Ok(self.push(input, frame))
+    }
+
+    /// `Err` where `pts` does not follow the last frame's.
+    fn follows(&self, pts: i64) -> Result<(), A::Error> {
+        if let Some(last) = self.last_pts {
+            check(pts > last, || format!("PTS {pts} does not follow {last}"))?;
+        }
+        Ok(())
+    }
+
+    /// Takes `frame`, in `input`, and encodes what its plan gives.
+    fn push(&mut self, input: A::Input, frame: &InputFrame<'_>) -> Vec<Coded<A::Error>> {
         self.last_pts = Some(frame.pts);
         self.times.push(frame.pts);
         let pending = Pending {
@@ -680,7 +701,7 @@ impl<A: Accelerator> Encoder<A> {
         let planned = self
             .planner
             .push(pending, frame.pts, frame.force_key_frame || restart);
-        Ok(self.encode_all(planned))
+        self.encode_all(planned)
     }
 
     /// Encodes the frames still waiting and returns each with its own

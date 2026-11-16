@@ -104,6 +104,7 @@ pub(crate) const VA_SURFACE_ATTRIB_SETTABLE: u32 = 0x2;
 pub(crate) const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = 0x4000_0000;
 /// `vaExportSurfaceHandle`'s flags (va.h).
 pub(crate) const VA_EXPORT_SURFACE_READ_ONLY: u32 = 0x0001;
+pub(crate) const VA_EXPORT_SURFACE_WRITE_ONLY: u32 = 0x0002;
 pub(crate) const VA_EXPORT_SURFACE_SEPARATE_LAYERS: u32 = 0x0004;
 pub(crate) const VA_EXPORT_SURFACE_COMPOSED_LAYERS: u32 = 0x0008;
 /// `DRM_FORMAT_MOD_LINEAR` (drm_fourcc.h).
@@ -1023,6 +1024,7 @@ mod tests {
             VA_SURFACE_ATTRIB_SETTABLE,
             VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
             VA_EXPORT_SURFACE_READ_ONLY,
+            VA_EXPORT_SURFACE_WRITE_ONLY,
             VA_EXPORT_SURFACE_SEPARATE_LAYERS,
             VA_EXPORT_SURFACE_COMPOSED_LAYERS,
             DRM_FORMAT_MOD_LINEAR,

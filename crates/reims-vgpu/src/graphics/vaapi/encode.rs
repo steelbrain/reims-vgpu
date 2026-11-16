@@ -14,11 +14,16 @@
 //!   unit is a keyframe with its parameter sets; a change of the bitrates, QPs or frame rate goes
 //!   to the encoder from the next frame. `min_qp`, `max_qp` and a change of `quality` alone are
 //!   not taken: the VA crate's encoder has no such setting.
-//! - **A frame** ([`VaFrame`]) is read on the session's encode thread from the source's host
-//!   bytes, uploaded and encoded by the VA crate's encoder, and its sample, NAL units behind
-//!   four-byte lengths, written as Annex B: a keyframe's parameter sets first, from the encoder's
-//!   configuration record (`avcC`, `hvcC`). One that does not fit the capacity is not written,
-//!   and the next frame is made a keyframe.
+//! - **A frame** ([`VaFrame`]) reaches the encoder on the session's encode thread one of two
+//!   ways. By the runtime device's GPU, where the session has its copier (`super::gpu_copy`): a
+//!   copy of the source's planes, where they lie, in the surface's pages or its device caches,
+//!   into an input surface of the encoder's, exported as dma-bufs (the VA crate's
+//!   `VideoEncoder::input_surface`), its margin to the coded size filled as an upload fills it, so
+//!   the encoder codes the same bytes either way. Else, and where the copy is declined (said once
+//!   a session, with why, at info), from the source's host bytes, which the VA crate's encoder
+//!   uploads. Its sample, NAL units behind four-byte lengths, is written as Annex B: a keyframe's
+//!   parameter sets first, from the encoder's configuration record (`avcC`, `hvcC`). One that
+//!   does not fit the capacity is not written, and the next frame is made a keyframe.
 
 use std::sync::Arc;
 
@@ -33,16 +38,19 @@ use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
 };
 use reims_vgpu_video::codec::encode::{
-    ColourDescription, EncoderSettings, Entropy, FrameRate, FrameType, InputFrame, Plane,
+    Coded, ColourDescription, EncoderSettings, Entropy, FrameRate, FrameType, InputFrame, Plane,
     Profile as EncodeProfile, RateControl,
 };
-use reims_vgpu_video::vaapi::{Capabilities, Display, EncoderSupport, VideoEncoder};
+use reims_vgpu_video::core::backend::DeviceWrite;
+use reims_vgpu_video::vaapi::{Capabilities, Display, EncoderSupport, InputSurface, VideoEncoder};
+use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::super::video_host::{
-    BackendError, EncodeFrame, EncodeSource, Encoded, HostEncodedFrame, HostEncoder, SourcePlane,
+    BackendError, EncodeFrame, EncodeSource, Encoded, FrameSource, HostEncodedFrame, HostEncoder,
+    SourcePlane,
 };
-use super::{H264_TOP_LEVEL, HEVC_TOP_LEVEL, MIN_SIZE};
+use super::{GpuFiller, H264_TOP_LEVEL, HEVC_TOP_LEVEL, MIN_SIZE, NAME};
 
 /// `VA_RC_CBR`, `VA_RC_VBR` and `VA_RC_CQP` (va.h): rate control bits of
 /// `VAConfigAttribRateControl`.
@@ -320,9 +328,32 @@ impl State {
     }
 }
 
+/// A session's GPU filler, its frames' to share, or why it has none; and the reasons a frame was
+/// uploaded instead, each said once.
+struct Fills<P: Platform> {
+    filler: Result<Box<dyn GpuFiller<P>>, String>,
+    said: Vec<String>,
+    /// The input surfaces of fills that failed on the GPU, which may write them still: kept out
+    /// of the encoder's pool while the session lives.
+    failed: Vec<InputSurface>,
+}
+
+impl<P: Platform> Fills<P> {
+    /// Says, once a session, and at info once per process (`kind`), why a frame was uploaded by
+    /// the CPU.
+    fn uploaded_because(&mut self, why: String) {
+        if !self.said.contains(&why) {
+            log::info!(kind:% = why; "hardware video: {NAME}: a frame uploaded by the CPU: {why}");
+            self.said.push(why);
+        }
+    }
+}
+
 /// A session's encoder on VA-API ([`HostEncoder`]).
-pub(super) struct VaEncoder {
+pub(super) struct VaEncoder<P: Platform> {
     state: Arc<Mutex<State>>,
+    /// What writes its frames into the encoder's input surfaces on the GPU (module doc).
+    fills: Arc<Mutex<Fills<P>>>,
     /// The profiles the driver encodes, which [`HostEncoder::check`] holds settings to.
     supports: Arc<[EncoderSupport]>,
     /// The sizes the codec's entry gives.
@@ -332,15 +363,17 @@ pub(super) struct VaEncoder {
     rate_controls: u32,
 }
 
-impl VaEncoder {
+impl<P: Platform> VaEncoder<P> {
     /// An encoder of `codec` on `display`, which encodes `supports`, as its entry `entry` and
-    /// `encode` list them.
+    /// `encode` list them, its frames written into its input surfaces by `filler` where it is
+    /// given (or why not).
     pub(super) fn new(
         display: &Display,
         codec: u32,
         supports: Arc<[EncoderSupport]>,
         entry: &RgfxVideoCodecCaps,
         encode: &RgfxVideoEncodeCaps,
+        filler: Result<Box<dyn GpuFiller<P>>, String>,
     ) -> Self {
         let ranges = (supports.iter())
             .map(|s| (wire_profile(s.profile), s.capabilities.quality_range))
@@ -356,6 +389,11 @@ impl VaEncoder {
                 settings: None,
                 key_next: false,
             })),
+            fills: Arc::new(Mutex::new(Fills {
+                filler,
+                said: Vec::new(),
+                failed: Vec::new(),
+            })),
             supports,
             min_size: entry.min_size,
             max_size: entry.max_size,
@@ -364,7 +402,7 @@ impl VaEncoder {
     }
 }
 
-impl HostEncoder for VaEncoder {
+impl<P: Platform> HostEncoder<P> for VaEncoder<P> {
     fn check(&self, settings: &RgfxVideoEncodeSettings) -> Result<(), BackendError> {
         let codec = self.state.lock().codec;
         let profile = encode_profile(codec, settings.profile)
@@ -398,23 +436,104 @@ impl HostEncoder for VaEncoder {
         Ok(())
     }
 
-    fn encode(&mut self, frame: EncodeFrame) -> Result<Box<dyn HostEncodedFrame>, BackendError> {
-        Ok(Box::new(VaFrame {
+    fn encode(&mut self, frame: EncodeFrame) -> Result<Box<dyn HostEncodedFrame<P>>, BackendError> {
+        Ok(Box::new(self.frame(frame)))
+    }
+}
+
+impl<P: Platform> VaEncoder<P> {
+    /// The encode of `frame` ([`HostEncoder::encode`]).
+    fn frame(&self, frame: EncodeFrame) -> VaFrame<P> {
+        VaFrame {
             state: Arc::clone(&self.state),
+            fills: Arc::clone(&self.fills),
             frame,
-        }))
+        }
     }
 }
 
 /// One frame's encode on VA-API, which the session's encode thread finishes (module doc).
-struct VaFrame {
+struct VaFrame<P: Platform> {
     state: Arc<Mutex<State>>,
+    fills: Arc<Mutex<Fills<P>>>,
     frame: EncodeFrame,
 }
 
-impl HostEncodedFrame for VaFrame {
+impl<P: Platform> HostEncodedFrame<P> for VaFrame<P> {
     fn finish(
         self: Box<Self>,
+        source: &mut FrameSource<'_, P>,
+        out: &mut [u8],
+    ) -> Result<Encoded, BackendError> {
+        let mut state = self.state.lock();
+        if let Some(settings) = &self.frame.settings {
+            state.apply(settings)?;
+        }
+        let input = self.times(&state)?;
+        if let Some(encoded) = self.filled(&mut state, &input, source, out)? {
+            return Ok(encoded);
+        }
+        let host = source.host()?;
+        encode_host(&mut state, &input, &host, out)
+    }
+}
+
+impl<P: Platform> VaFrame<P> {
+    /// The frame encoded from `source`'s planes where they lie, copied by the GPU into an input
+    /// surface of the encoder's (module doc), into `out`; `None` where the copy was declined,
+    /// nothing written, which is said once a session. `Err` where the encode failed, or the copy
+    /// failed once on the GPU.
+    fn filled(
+        &self,
+        state: &mut State,
+        input: &InputFrame<'_>,
+        source: &FrameSource<'_, P>,
+        out: &mut [u8],
+    ) -> Result<Option<Encoded>, BackendError> {
+        let mut fills = self.fills.lock();
+        let declined = match &mut fills.filler {
+            Ok(filler) => {
+                let encoder = state.encoder.as_mut().ok_or("an encode with no settings")?;
+                match encoder.input_surface() {
+                    Ok(surface) => {
+                        let [luma, chroma] = source.planes();
+                        let sample = encoder.settings().input_format().bytes_per_sample();
+                        let sample = u32::try_from(sample).unwrap_or(0);
+                        match filler.fill(&surface, luma, chroma, source.size(), sample) {
+                            Ok(DeviceWrite::Written) => {
+                                drop(fills);
+                                let coded = encoder.encode_surface(surface, input)?;
+                                return finish_coded(state, coded, out).map(Some);
+                            }
+                            Ok(DeviceWrite::Declined(why)) => format!("the GPU's copy: {why}"),
+                            // The GPU may write the surface still: it stays out of the pool, and
+                            // the session's frames are uploaded from here on.
+                            Err(error) => {
+                                fills.failed.push(surface);
+                                fills.filler = Err(format!("the GPU's copy failed: {error}"));
+                                return Err(error);
+                            }
+                        }
+                    }
+                    // The driver's surfaces export so for none of its frames: the session's
+                    // frames are uploaded from here on.
+                    Err(why) => {
+                        let why = format!("no input surface for the GPU's copy: {why}");
+                        fills.filler = Err(why.clone());
+                        why
+                    }
+                }
+            }
+            Err(why) => why.clone(),
+        };
+        fills.uploaded_because(declined);
+        Ok(None)
+    }
+
+    /// [`HostEncodedFrame::finish`] from `source`'s host bytes, which the encoder uploads.
+    #[cfg(test)]
+    fn finish_from_host(
+        self,
         source: &EncodeSource,
         out: &mut [u8],
     ) -> Result<Encoded, BackendError> {
@@ -422,57 +541,92 @@ impl HostEncodedFrame for VaFrame {
         if let Some(settings) = &self.frame.settings {
             state.apply(settings)?;
         }
-        let codec = state.codec;
-        let force_key_frame = self.frame.force_keyframe || state.key_next;
-        let encoder = state.encoder.as_mut().ok_or("an encode with no settings")?;
+        let input = self.times(&state)?;
+        encode_host(&mut state, &input, source, out)
+    }
+
+    /// The frame's times, key-frame demand and tag as the encoder takes them, with no planes.
+    fn times(&self, state: &State) -> Result<InputFrame<'static>, BackendError> {
+        let encoder = state.encoder.as_ref().ok_or("an encode with no settings")?;
         let duration = i64::from(encoder.settings().frame_rate.denominator);
         let index = i64::try_from(self.frame.frame_index).unwrap_or(i64::MAX);
-        let input = InputFrame {
-            planes: [plane(&source.luma)?, plane(&source.chroma)?],
+        let none = Plane {
+            data: &[],
+            bytes_per_row: 0,
+        };
+        Ok(InputFrame {
+            planes: [none, none],
             pts: index.saturating_mul(duration),
             duration,
-            force_key_frame,
+            force_key_frame: self.frame.force_keyframe || state.key_next,
             id: self.frame.frame_index,
-        };
-        let mut coded = encoder.encode(&input)?;
-        let sample = match (coded.pop(), coded.len()) {
-            (Some(Ok(sample)), 0) => sample,
-            (Some(Err(failed)), 0) => {
-                let why = failed
-                    .error
-                    .map_or_else(|| "lost".to_owned(), |e| e.to_string());
-                return Err(format!("the frame's picture: {why}").into());
-            }
-            (None, _) => return Err("the encoder gave no sample for the frame".into()),
-            (Some(_), n) => return Err(format!("the encoder gave {} samples", n + 1).into()),
-        };
-        let configuration = sample.is_sync.then(|| encoder.configuration());
-        let au = annex_b(codec, configuration.as_deref(), &sample.data)?;
-        let mut encoded = Encoded {
-            size: au.len() as u64,
-            overflow: false,
-            keyframe: sample.is_sync,
-            parameter_sets: sample.is_sync,
-            frame_index: sample.id,
-            picture_type: match sample.frame_type {
-                FrameType::Idr => RGFX_VIDEO_PICTURE_I,
-                FrameType::P => RGFX_VIDEO_PICTURE_P,
-                FrameType::B => RGFX_VIDEO_PICTURE_B,
-            },
-        };
-        match out.get_mut(..au.len()) {
-            Some(to) => {
-                to.copy_from_slice(&au);
-                state.key_next = false;
-            }
-            None => {
-                // The frame is in the encoder's references: the next one starts afresh.
-                encoded.overflow = true;
-                state.key_next = true;
-            }
-        }
-        Ok(encoded)
+        })
     }
+}
+
+/// Encodes the frame of `input`'s times from `source`'s host bytes, which the encoder uploads,
+/// into `out`.
+fn encode_host(
+    state: &mut State,
+    input: &InputFrame<'_>,
+    source: &EncodeSource,
+    out: &mut [u8],
+) -> Result<Encoded, BackendError> {
+    let encoder = state.encoder.as_mut().ok_or("an encode with no settings")?;
+    let input = InputFrame {
+        planes: [plane(&source.luma)?, plane(&source.chroma)?],
+        ..*input
+    };
+    let coded = encoder.encode(&input)?;
+    finish_coded(state, coded, out)
+}
+
+/// Writes the one sample of `coded`, the frame's, into `out` as an Annex-B access unit where it
+/// fits (module doc), and answers what came of it.
+fn finish_coded(
+    state: &mut State,
+    mut coded: Vec<Coded<reims_vgpu_video::vaapi::Error>>,
+    out: &mut [u8],
+) -> Result<Encoded, BackendError> {
+    let codec = state.codec;
+    let encoder = state.encoder.as_mut().ok_or("an encode with no settings")?;
+    let sample = match (coded.pop(), coded.len()) {
+        (Some(Ok(sample)), 0) => sample,
+        (Some(Err(failed)), 0) => {
+            let why = failed
+                .error
+                .map_or_else(|| "lost".to_owned(), |e| e.to_string());
+            return Err(format!("the frame's picture: {why}").into());
+        }
+        (None, _) => return Err("the encoder gave no sample for the frame".into()),
+        (Some(_), n) => return Err(format!("the encoder gave {} samples", n + 1).into()),
+    };
+    let configuration = sample.is_sync.then(|| encoder.configuration());
+    let au = annex_b(codec, configuration.as_deref(), &sample.data)?;
+    let mut encoded = Encoded {
+        size: au.len() as u64,
+        overflow: false,
+        keyframe: sample.is_sync,
+        parameter_sets: sample.is_sync,
+        frame_index: sample.id,
+        picture_type: match sample.frame_type {
+            FrameType::Idr => RGFX_VIDEO_PICTURE_I,
+            FrameType::P => RGFX_VIDEO_PICTURE_P,
+            FrameType::B => RGFX_VIDEO_PICTURE_B,
+        },
+    };
+    match out.get_mut(..au.len()) {
+        Some(to) => {
+            to.copy_from_slice(&au);
+            state.key_next = false;
+        }
+        None => {
+            // The frame is in the encoder's references: the next one starts afresh.
+            encoded.overflow = true;
+            state.key_next = true;
+        }
+    }
+    Ok(encoded)
 }
 
 /// The rows of `p` as the VA crate's encoder reads a plane: from its first row's first byte to

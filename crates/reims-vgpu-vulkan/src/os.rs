@@ -61,10 +61,11 @@ pub(crate) use host_os::{
     COPIES_READ_ONLY, Drawables, ImportMade, allocate_aliasable, dma_buf_refusal, host_memory,
     host_memory_vouched, import_heap_view, import_view,
 };
-/// Copies by the GPU of planes another driver wrote into dma-bufs into a runtime buffer, on Linux
+/// Copies by the GPU of planes another driver wrote into dma-bufs into a runtime buffer, and of a
+/// runtime buffer's planes into dma-bufs another driver reads, on Linux
 /// (`os/linux/plane_copy.rs`).
 #[cfg(target_os = "linux")]
-pub use host_os::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFormat};
+pub use host_os::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFill, PlaneFormat};
 pub use host_os::{
     GuestMemoryLease, OsClock, OsThreads, OsVm, RegionMemory, default_driver_sizes,
     default_gpu_core_count, default_registry_id, install_process_services, lease_guest_memory,

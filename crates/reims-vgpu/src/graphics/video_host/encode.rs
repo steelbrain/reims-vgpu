@@ -10,10 +10,12 @@
 //!   result go in. It hands the encoder the frame, and sends it to the session's encode thread
 //!   (`reims-vgpu.graphics-video-encode`). A refusal faults the command buffer and spends no value
 //!   of the event.
-//! - **The encode thread** finishes each frame in the order the encodes were taken: it reads the
-//!   source's planes as host bytes, in the surface's pages, or, for a plane in the surface's
-//!   device cache, in a staging buffer the GPU copies the plane into first. The encode writes the
-//!   access unit into the bitstream buffer where it fits; the thread writes the frame's
+//! - **The encode thread** finishes each frame in the order the encodes were taken: the backend
+//!   reads the source's planes where they lie, in the surface's pages or its device caches, by a
+//!   device of its own ([`FrameSource::planes`]), or as host bytes ([`FrameSource::host`]): in the
+//!   surface's pages, or, for a plane in the surface's device cache, in a staging buffer the GPU
+//!   copies the plane into first. The encode writes the access unit into the bitstream buffer
+//!   where it fits; the thread writes the frame's
 //!   [`RgfxVideoEncodeResult`] after it, and then signals the encode's value. An access unit
 //!   past the capacity is not written ([`RGFX_VIDEO_ENCODE_OVERFLOW`]), and a frame the encode
 //!   fails gets [`RGFX_VIDEO_ENCODE_FAILED`]: the command buffer completes as any other.
@@ -69,7 +71,7 @@ pub(crate) struct EncodeFrame {
 
 /// A backend's encoder of one codec, whose session is a [`HostEncodeSession`]. Its calls run on
 /// the thread that takes each encode's command buffer, in the order the encodes were taken.
-pub(crate) trait HostEncoder: Send + 'static {
+pub(crate) trait HostEncoder<P: Platform>: Send + 'static {
     /// Checks settings an encode carries, beyond what the session checks of every backend's
     /// (their size, format, profile, rate control and entropy): what the hardware takes of them.
     /// `Err` faults the encode's command buffer.
@@ -78,23 +80,97 @@ pub(crate) trait HostEncoder: Send + 'static {
     /// Takes the next frame, in display order, with the settings it carries applied from it on,
     /// and answers its encode, which the session's encode thread finishes, in the order taken.
     /// `Err` faults the encode's command buffer.
-    fn encode(&mut self, frame: EncodeFrame) -> Result<Box<dyn HostEncodedFrame>, BackendError>;
+    fn encode(&mut self, frame: EncodeFrame) -> Result<Box<dyn HostEncodedFrame<P>>, BackendError>;
 }
 
 /// One frame's encode, which the session's encode thread finishes.
-pub(crate) trait HostEncodedFrame: Send {
+pub(crate) trait HostEncodedFrame<P: Platform>: Send {
     /// Encodes the frame from `source`'s planes, and writes its access unit, NAL units in
     /// Annex-B form, its keyframe's parameter sets before its slices, at the front of `out`
     /// where it fits there; where it does not, writes nothing of it. Answers what came of it;
     /// `Err` where the hardware did not encode it, which the session logs.
     fn finish(
         self: Box<Self>,
-        source: &EncodeSource,
+        source: &mut FrameSource<'_, P>,
         out: &mut [u8],
     ) -> Result<Encoded, BackendError>;
 }
 
-/// The source of one frame, as host bytes, which [`HostEncodedFrame::finish`] reads.
+/// One frame's source as a backend's encode reads it ([`HostEncodedFrame::finish`]): its planes
+/// where they lie, or their host bytes. Either way they hold the frame until its value is
+/// signalled (the module docs).
+pub(crate) struct FrameSource<'a, P: Platform> {
+    source: &'a Source<P>,
+    stage: &'a mut Stage<P>,
+    /// Where the planes in a device cache are staged, once [`Self::host`] staged them.
+    staged: Option<Staged>,
+}
+
+impl<P: Platform> FrameSource<'_, P> {
+    /// The luma plane and the chroma plane where they lie: in the surface's pages, or in its
+    /// device caches. Each holds the frame's rows from its first.
+    pub(crate) fn planes(&self) -> [&OutputPlane<P>; 2] {
+        [&self.source.luma, &self.source.chroma]
+    }
+
+    /// The frame's width and height, the settings'.
+    pub(crate) fn size(&self) -> (u32, u32) {
+        (self.source.width, self.source.height)
+    }
+
+    /// The planes' host bytes: each plane's own in the surface's pages, and, for a plane in a
+    /// device cache, the session's staging buffer, which the GPU copies the plane into at its own
+    /// pitch, once.
+    pub(crate) fn host(&mut self) -> Result<EncodeSource, BackendError> {
+        let staged = match self.staged {
+            Some(staged) => staged,
+            None => {
+                let staged =
+                    (self.stage).copy_out_of_caches(&self.source.luma, &self.source.chroma)?;
+                self.staged = Some(staged);
+                staged
+            }
+        };
+        let stage = &*self.stage;
+        let plane = |p: &OutputPlane<P>, at: Option<u64>| -> Result<SourcePlane, BackendError> {
+            let first = match (at, p.host) {
+                (Some(at), _) => {
+                    let buffer = stage.buffer.as_ref().ok_or("no staging buffer")?;
+                    buffer.contents().wrapping_add(at)
+                }
+                (None, Some(host)) => host,
+                (None, None) => return Err("a source plane with no host bytes".into()),
+            };
+            let (Ok(bytes_per_row), Ok(row_bytes), Ok(rows)) = (
+                usize::try_from(p.bytes_per_row),
+                usize::try_from(p.row_bytes),
+                usize::try_from(p.height),
+            ) else {
+                return Err("a source plane past the host's address space".into());
+            };
+            Ok(SourcePlane {
+                at: first.as_ptr::<u8>().cast_const(),
+                bytes_per_row,
+                row_bytes,
+                rows,
+            })
+        };
+        Ok(EncodeSource {
+            luma: plane(&self.source.luma, staged.luma)?,
+            chroma: plane(&self.source.chroma, staged.chroma)?,
+            width: self.source.width,
+            height: self.source.height,
+        })
+    }
+
+    /// Whether a plane was copied out of its device cache for [`Self::host`].
+    fn staged(&self) -> bool {
+        self.staged
+            .is_some_and(|staged| staged.luma.is_some() || staged.chroma.is_some())
+    }
+}
+
+/// The source of one frame, as host bytes ([`FrameSource::host`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EncodeSource {
     /// The luma plane: `height` rows of `width` samples.
@@ -287,7 +363,7 @@ impl<P: Platform> Out<P> {
 /// One encode's work for the encode thread.
 struct Job<P: Platform> {
     value: u64,
-    frame: Box<dyn HostEncodedFrame>,
+    frame: Box<dyn HostEncodedFrame<P>>,
     source: Source<P>,
     out: Out<P>,
 }
@@ -335,7 +411,7 @@ pub(crate) struct HostEncodeSession<P: Platform> {
 /// A session's encoder, the encode thread's queue, the last value an encode answered, and the
 /// settings in force.
 struct State<P: Platform> {
-    encoder: Box<dyn HostEncoder>,
+    encoder: Box<dyn HostEncoder<P>>,
     jobs: Option<mpsc::SyncSender<Job<P>>>,
     value: u64,
     settings: Option<RgfxVideoEncodeSettings>,
@@ -353,7 +429,7 @@ impl<P: Platform> HostEncodeSession<P> {
         device: &P::Device,
         codec: u32,
         name: &'static str,
-        encoder: Box<dyn HostEncoder>,
+        encoder: Box<dyn HostEncoder<P>>,
     ) -> Option<Self> {
         let Some(event) = device.new_shared_event() else {
             log::warn!("hardware video: {name}: no shared event for an encode session");
@@ -563,51 +639,25 @@ fn finish_frames<P: Platform>(
     }
 }
 
-/// Finishes `frame` from `source` into `out`, copying a source plane out of its device cache
-/// first, and answers what came of it and whether a plane was copied so.
+/// Finishes `frame` from `source` into `out`, and answers what came of it and whether a plane
+/// was copied out of its device cache for its host bytes.
 fn finish<P: Platform>(
-    frame: Box<dyn HostEncodedFrame>,
+    frame: Box<dyn HostEncodedFrame<P>>,
     source: &Source<P>,
     out: &Out<P>,
     stage: &mut Stage<P>,
 ) -> Result<(Encoded, bool), BackendError> {
-    let staged = stage.copy_out_of_caches(&source.luma, &source.chroma)?;
-    let plane = |p: &OutputPlane<P>, at: Option<u64>| -> Result<SourcePlane, BackendError> {
-        let first = match (at, p.host) {
-            (Some(at), _) => {
-                let buffer = stage.buffer.as_ref().ok_or("no staging buffer")?;
-                buffer.contents().wrapping_add(at)
-            }
-            (None, Some(host)) => host,
-            (None, None) => return Err("a source plane with no host bytes".into()),
-        };
-        let (Ok(bytes_per_row), Ok(row_bytes), Ok(rows)) = (
-            usize::try_from(p.bytes_per_row),
-            usize::try_from(p.row_bytes),
-            usize::try_from(p.height),
-        ) else {
-            return Err("a source plane past the host's address space".into());
-        };
-        Ok(SourcePlane {
-            at: first.as_ptr::<u8>().cast_const(),
-            bytes_per_row,
-            row_bytes,
-            rows,
-        })
-    };
-    let source = EncodeSource {
-        luma: plane(&source.luma, staged.luma)?,
-        chroma: plane(&source.chroma, staged.chroma)?,
-        width: source.width,
-        height: source.height,
+    let mut source = FrameSource {
+        source,
+        stage,
+        staged: None,
     };
     // SAFETY: the capacity's bytes from `at` lie in the bitstream's Shared buffer's host bytes
     // (the op's check), which `out` holds until the signal, and nothing else reads or writes them
     // until then: the guest's command buffer waits for the signal, and the result lies apart.
     let bytes = unsafe { std::slice::from_raw_parts_mut(out.at.as_ptr::<u8>(), out.capacity) };
-    let encoded = frame.finish(&source, bytes)?;
-    let staged = staged.luma.is_some() || staged.chroma.is_some();
-    Ok((encoded, staged))
+    let encoded = frame.finish(&mut source, bytes)?;
+    Ok((encoded, source.staged()))
 }
 
 /// The bytes a source plane takes staged out of its device cache: its rows at its pitch.

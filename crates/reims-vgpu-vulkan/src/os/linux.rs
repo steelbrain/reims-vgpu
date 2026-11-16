@@ -27,7 +27,7 @@ use metal2vulkan_runtime as rt;
 pub use clock::LinuxClock;
 pub use device_lend::{LendRefusal, LentDmaBuf, dma_buf_of_host, map_for_pointer};
 pub use lease::{GuestMemoryLease, lease_guest_memory};
-pub use plane_copy::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFormat};
+pub use plane_copy::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFill, PlaneFormat};
 pub use threads::LinuxThreads;
 pub use vm::{LinuxVm, RegionMemory};
 

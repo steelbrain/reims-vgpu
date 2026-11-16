@@ -40,10 +40,11 @@ use reims_vgpu_video::nvidia::{
     EncodeParams, EncodeProfile, EncodeProfileSupport, EncodeRateControl, Gpu, NvencEncoder,
     PictureType, RawFrame, Tuning,
 };
+use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::super::video_host::{
-    BackendError, EncodeFrame, EncodeSource, Encoded, HostEncodedFrame, HostEncoder, SourcePlane,
+    BackendError, EncodeFrame, Encoded, FrameSource, HostEncodedFrame, HostEncoder, SourcePlane,
 };
 use super::{H264_TOP_LEVEL, HEVC_TOP_LEVEL};
 
@@ -322,7 +323,7 @@ impl NvencHostEncoder {
     }
 }
 
-impl HostEncoder for NvencHostEncoder {
+impl<P: Platform> HostEncoder<P> for NvencHostEncoder {
     fn check(&self, settings: &RgfxVideoEncodeSettings) -> Result<(), BackendError> {
         let codec = self.state.lock().codec;
         let profile = encode_profile(codec, settings.profile)
@@ -356,7 +357,7 @@ impl HostEncoder for NvencHostEncoder {
         Ok(())
     }
 
-    fn encode(&mut self, frame: EncodeFrame) -> Result<Box<dyn HostEncodedFrame>, BackendError> {
+    fn encode(&mut self, frame: EncodeFrame) -> Result<Box<dyn HostEncodedFrame<P>>, BackendError> {
         Ok(Box::new(NvencFrame {
             state: Arc::clone(&self.state),
             frame,
@@ -370,12 +371,13 @@ struct NvencFrame {
     frame: EncodeFrame,
 }
 
-impl HostEncodedFrame for NvencFrame {
+impl<P: Platform> HostEncodedFrame<P> for NvencFrame {
     fn finish(
         self: Box<Self>,
-        source: &EncodeSource,
+        source: &mut FrameSource<'_, P>,
         out: &mut [u8],
     ) -> Result<Encoded, BackendError> {
+        let source = source.host()?;
         let mut state = self.state.lock();
         if let Some(settings) = &self.frame.settings {
             state.apply(settings)?;
