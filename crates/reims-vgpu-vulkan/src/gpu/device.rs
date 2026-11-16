@@ -263,10 +263,11 @@ pub(crate) fn take_if_only_kept()
 /// pass runs over the pipeline records earlier processes kept ([`crate::records`]), in the
 /// background, but in a test build. Its work counts go to the log where its filter names their
 /// target ([`crate::work_log`]), its GPU is kept awake while the guest draws ([`crate::awake`]),
-/// and the runtime's check of textures over host pages starts ([`start_in_place_checks`]). The exit
-/// gate's hook is registered, after the device's driver was loaded ([`crate::exit_gate`]): every
-/// process that holds a device of the process's, a test's or a host's, waits at its exit for the
-/// library's GPU work in progress.
+/// and the runtime's check of textures over host pages starts ([`start_in_place_checks`]), its
+/// report logged with what is known then ([`crate::in_place_log`]). The exit gate's hook is
+/// registered, after the device's driver was loaded ([`crate::exit_gate`]): every process that
+/// holds a device of the process's, a test's or a host's, waits at its exit for the library's GPU
+/// work in progress.
 pub fn adopt(raw: rt::Device) -> VulkanDevice {
     let id = registry_id(&raw);
     let mut devices = DEVICES.lock();
@@ -290,6 +291,7 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
     }
     threads.keep(crate::work_log::start(&raw, &threads.stop));
     start_in_place_checks(&raw);
+    crate::in_place_log::log_report(&raw, "as it is adopted");
     let made = Obj::new(DeviceObject {
         awake: crate::awake::Awake::start(&raw),
         raw,

@@ -18,7 +18,9 @@
 //!   imports of the guest RAM's regions kept on them (on Linux, `os/linux/dma_buf.rs`), and
 //!   each device's own threads ([`DeviceThreads`] and its keeping awake, `crate::awake`), stopped
 //!   and joined. Where that was a runtime device's last handle, the runtime tears it down on the
-//!   calling thread, its own threads stopped and waited for, before the let-go returns.
+//!   calling thread, its own threads stopped and waited for, before the let-go returns. First,
+//!   each device's report of its check of textures over host pages is logged, by then with the
+//!   verdict of every check that ran (`crate::in_place_log`).
 //! - **Only once nothing else holds one.** The let-go waits for every handle beyond those to go
 //!   (an object, a command buffer still running, a thread that holds one), looking every
 //!   [`POLL`], for at most the bound it is given. Where one outlives it, nothing goes, and the
@@ -55,6 +57,9 @@ pub fn let_go_of_devices(bound: Duration) -> Result<usize, String> {
         }
     };
     let let_go = devices.len();
+    for (_, device) in &devices {
+        crate::in_place_log::log_report(&device.raw, "as it is let go");
+    }
     // What holds a runtime device's handle and none of the platform's device objects first, then
     // the libraries, which hold the objects, and the objects last: the last handle of each
     // runtime device goes with its object, here.
