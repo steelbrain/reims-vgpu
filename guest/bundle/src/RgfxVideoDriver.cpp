@@ -3,7 +3,7 @@
  * driver.
  *
  * AppleGVA (the framework under VideoToolbox's hardware decoders and encoders on an x86-64
- * Mac) reads the accelerator's IODVDBundleName, which the kext sets to this bundle's name,
+ * Mac) reads the accelerator's IODVDBundleName, the bundle's name where the host decodes video,
  * loads /Library/GPUBundles/<name>.bundle/Contents/MacOS/<name>, and calls its
  * AVD_CreateAVDAccelerator for a table of sixteen entry points. It does so in
  * VTDecoderXPCService and VTEncoderXPCService, one of each per client process.

@@ -437,11 +437,15 @@ namespace {
 // a process reads each as a 64-bit CFNumber (kCFNumberSInt64Type).
 constexpr unsigned kDriverKeyNumberBits = 64;
 
+// The renderer ID the video driver's IOVARendererID carries: the AMD Navi family's, as an
+// iMac20,1's Radeon Pro answers (the bundle's RgfxVideoDriver.cpp answers the same).
+constexpr unsigned long long kVideoRendererID = 0x1020004ull;
+
 // The accelerator's driver keys, on its registry entry, where the guest's frameworks read them:
 // Metal the bundle and the class it makes the device of (MetalPluginName, MetalPluginClassName),
-// OpenGL its renderer (IOGLBundleName), AppleGVA its video driver (IODVDBundleName,
-// IOVARendererID, IOGVACodec), the display pipe's capabilities (AcceleratorProperties), and the
-// display count (DisplayPortCount); the same on x86-64 and arm64. The personality holds only what
+// OpenGL its renderer (IOGLBundleName), the display pipe's capabilities (AcceleratorProperties),
+// and the display count (DisplayPortCount); the same on x86-64 and arm64. AppleGVA's video driver
+// is named where the host decodes video (publishVideoCodecs). The personality holds only what
 // matches the provider and names the driver: Graft records the rest of a personality as the
 // provider's matching. Set at the start of start, before registerService lets any process find
 // the accelerator and before the bundle's check reads MetalPluginName.
@@ -451,21 +455,16 @@ bool setDriverKeys(IOService *service)
 	OSDictionary *accel = OSDictionary::withCapacity(2);
 	OSString *category = OSString::withCString("IOAccelerator");
 	OSNumber *ports = OSNumber::withNumber(1ull, kDriverKeyNumberBits);
-	OSNumber *renderer = OSNumber::withNumber(0x1020004ull, kDriverKeyNumberBits);
-	bool set = pipe && accel && category && ports && renderer &&
+	bool set = pipe && accel && category && ports &&
 	           pipe->setObject("DisplayPipeSupported", kOSBooleanTrue) &&
 	           pipe->setObject("TransactionsSupported", kOSBooleanTrue) &&
 	           accel->setObject("IOAccelDisplayPipeCapabilities", pipe) &&
 	           accel->setObject("IOMatchCategory", category) &&
 	           service->setProperty("AcceleratorProperties", accel) &&
 	           service->setProperty("DisplayPortCount", ports) &&
-	           service->setProperty("IODVDBundleName", "reims-graphics") &&
 	           service->setProperty("IOGLBundleName", "AppleMetalOpenGLRenderer") &&
-	           service->setProperty("IOGVACodec", "RgfxVideo") &&
-	           service->setProperty("IOVARendererID", renderer) &&
 	           service->setProperty("MetalPluginClassName", "RgfxMetalDevice") &&
 	           service->setProperty("MetalPluginName", "reims-graphics");
-	OSSafeReleaseNULL(renderer);
 	OSSafeReleaseNULL(ports);
 	OSSafeReleaseNULL(category);
 	OSSafeReleaseNULL(accel);
@@ -975,6 +974,19 @@ void RgfxAccelerator::publishVideoCodecs()
 	RgfxVideoCaps caps;
 	memcpy(&caps, reinterpret_cast<const UInt8 *>(info) + sizeof(RgfxDeviceInfo), sizeof(caps));
 	map->release();
+	// AppleGVA's video driver, the bundle (IODVDBundleName), where the host decodes video:
+	// named on a host with no decoder, VideoToolbox would answer a hardware H.264 decoder and
+	// list a hardware H.264 encoder that no session can have (RgfxVideoCodecs.hpp).
+	if (!rgfxDecodesVideo(caps)) {
+		IOLog("RgfxAccelerator: the host decodes no video: no video driver for AppleGVA\n");
+		return;
+	}
+	if (OSNumber *renderer = OSNumber::withNumber(kVideoRendererID, kDriverKeyNumberBits)) {
+		setProperty("IODVDBundleName", "reims-graphics");
+		setProperty("IOGVACodec", "RgfxVideo");
+		setProperty("IOVARendererID", renderer);
+		renderer->release();
+	}
 	RgfxHevcDecode hevc;
 	if (!rgfxHevcDecode(caps, &hevc))
 		return;

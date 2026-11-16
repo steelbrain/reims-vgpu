@@ -1,5 +1,5 @@
-// video_codecs_test: what the accelerator publishes of the host's HEVC decode
-// (RgfxVideoCodecs.hpp).
+// video_codecs_test: what the accelerator publishes of the host's video: its video driver, and
+// HEVC decode (RgfxVideoCodecs.hpp).
 #include <cstdio>
 #include <cstdlib>
 
@@ -59,6 +59,31 @@ int main()
 	RgfxVideoCaps past = caps(RGFX_VIDEO_HEVC_MAIN, 153);
 	past.codec_count = 1000;
 	CHECK(rgfxHevcDecode(past, &d));
+	// The video driver is named where the caps list a decoder: H.264 and HEVC, H.264 alone,
+	// HEVC alone.
+	CHECK(rgfxDecodesVideo(caps(RGFX_VIDEO_HEVC_MAIN, 153)));
+	CHECK(rgfxDecodesVideo(h264));
+	RgfxVideoCaps hevcOnly = caps(RGFX_VIDEO_HEVC_MAIN, 153);
+	hevcOnly.codecs[0] = hevcOnly.codecs[1];
+	hevcOnly.codec_count = 1;
+	CHECK(rgfxDecodesVideo(hevcOnly));
+	// Not where they list none: a host with no video arm writes no caps, an older host's are
+	// of no version, an entry of no profile decodes nothing, and an encoder is no decoder.
+	CHECK(!rgfxDecodesVideo(none));
+	RgfxVideoCaps old = caps(RGFX_VIDEO_HEVC_MAIN, 153);
+	old.version = 0;
+	CHECK(!rgfxDecodesVideo(old));
+	RgfxVideoCaps noProfile = caps(0, 153);
+	noProfile.codecs[0].profiles = 0;
+	CHECK(!rgfxDecodesVideo(noProfile));
+	RgfxVideoCaps encoders = caps(RGFX_VIDEO_HEVC_MAIN, 153);
+	encoders.codecs[0].direction = RGFX_VIDEO_ENCODE;
+	encoders.codecs[1].direction = RGFX_VIDEO_ENCODE;
+	CHECK(!rgfxDecodesVideo(encoders));
+	// An entry past the count is not read.
+	RgfxVideoCaps counted = caps(RGFX_VIDEO_HEVC_MAIN, 153);
+	counted.codec_count = 0;
+	CHECK(!rgfxDecodesVideo(counted));
 	std::printf("video_codecs_test: OK (%d checks)\n", checks);
 	return 0;
 }

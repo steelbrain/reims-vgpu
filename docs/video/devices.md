@@ -20,7 +20,11 @@ runtime device (reims-vgpu's `graphics/video_choice.rs`):
 
 Each arm that declines says why in one line at info. A Mac has no video arm, on either platform.
 Where no arm takes the device, the host writes no video caps, and the guest is offered no
-codec.
+codec: the kext names AppleGVA no video driver (`publishVideoCodecs`,
+`guest/kext/src/RgfxAccelerator.cpp`), so VideoToolbox answers that no codec decodes in hardware
+(`VTIsHardwareDecodeSupported`), lists no hardware encoder, refuses sessions that require
+hardware (`kVTCouldNotFindVideoDecoderErr`, `kVTCouldNotFindVideoEncoderErr`), and decodes and
+encodes every other session in software, as on a Mac without hardware video.
 
 ## The caps
 

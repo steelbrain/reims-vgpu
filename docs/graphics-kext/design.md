@@ -1337,11 +1337,20 @@ Stages:
     `/Library/GPUBundles` and open IOAccelerator user clients. A video
     plug-in of our own in `/Library/Video/Plug-Ins` is no way in: CoreMedia
     lists only Apple-signed plug-ins.
-    - **Identity:** the accelerator's registry entry names the bundle,
-      `reims-graphics`, as the video driver, with `IOVARendererID` 0x1020004,
-      the AMD Navi family's, and `IOGVACodec`; the bundle exports the two
-      entry points beside its Metal device
-      (`guest/bundle/src/RgfxVideoDriver.cpp`). AppleGVA drives an AMD driver
+    - **Identity:** where the host's caps list a decoder (H.264 or HEVC),
+      the accelerator's registry entry names the bundle, `reims-graphics`, as
+      the video driver, with `IOVARendererID` 0x1020004, the AMD Navi
+      family's, and `IOGVACodec` (`publishVideoCodecs`, before it
+      registers); the bundle exports the two entry points beside its Metal
+      device (`guest/bundle/src/RgfxVideoDriver.cpp`). On a host that decodes
+      nothing, one with no video arm, it names no video driver: with the
+      three keys VideoToolbox answered `VTIsHardwareDecodeSupported` true for
+      H.264 and listed AppleGVA's H.264 encoder as hardware, though no
+      session requiring hardware could be made (−12913 to decode, −12903 to
+      encode); without them it answers false and lists no hardware encoder,
+      and sessions requiring hardware fail as on a Mac without it (−12906,
+      −12908) (**measured**, macOS 26.7.2 guest, Windows host with a UHD
+      630, 2026-11-16). AppleGVA drives an AMD driver
       through high-level commands (picture parameters and slice data;
       rate-control settings), which map onto Vulkan Video. The driver decodes
       H.264 and HEVC, each where the host's caps list it; HEVC in the profiles
@@ -5606,10 +5615,12 @@ x86-64 and arm64: `MetalPluginName = reims-graphics` (the bundle
 `/Library/GPUBundles/reims-graphics.bundle`) and `MetalPluginClassName
 = RgfxMetalDevice`, which is how Metal (`IOServiceMatching("IOAccelerator")`)
 finds and loads the bundle; `IOGLBundleName` (OpenGL, below);
-`IODVDBundleName`, `IOVARendererID` and `IOGVACodec` (hardware video,
-Decided 16); `AcceleratorProperties`, whose
+`AcceleratorProperties`, whose
 `IOAccelDisplayPipeCapabilities` say the display pipe and its transactions
-are supported; and `DisplayPortCount` 1. The accelerator maps BAR 0 for the doorbell and
+are supported; and `DisplayPortCount` 1. Where the host decodes video it also
+sets `IODVDBundleName`, `IOVARendererID` and `IOGVACodec` (hardware video,
+Decided 16), before it registers (`publishVideoCodecs`). The accelerator maps
+BAR 0 for the doorbell and
 holds BAR 2 to map each process's part of it in; it touches no pixels and no
 control ring (the framebuffer owns those).
 
