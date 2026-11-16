@@ -2165,6 +2165,7 @@ pub(crate) mod tests {
                 contents: Some(bytes),
                 no_copy: true,
                 deallocator: None,
+                zero_from: None,
             })
         })
         .unwrap()
@@ -2890,6 +2891,7 @@ pub(crate) mod tests {
                         contents: Some(bytes),
                         no_copy: true,
                         deallocator: Some(Box::new(move |p, len| *s.lock() = Some((p, len)))),
+                        zero_from: None,
                     })
                     .unwrap();
                 made.map(|b| (b, pin))
@@ -2907,6 +2909,7 @@ pub(crate) mod tests {
                 contents: None,
                 no_copy: false,
                 deallocator: None,
+                zero_from: None,
             })
             .unwrap()
             .unwrap();
@@ -2920,6 +2923,7 @@ pub(crate) mod tests {
                 contents: Some(HostRange::of_slice(&words)),
                 no_copy: false,
                 deallocator: None,
+                zero_from: None,
             })
             .unwrap()
             .unwrap();
@@ -3706,6 +3710,93 @@ pub(crate) mod tests {
             .unwrap();
         let refused = catch_death(|| t.set_purgeable_state(9));
         assert_eq!(refused.unwrap_err().file, "setPurgeableState:");
+    }
+
+    /// A `Managed` no-copy buffer made with the word that its bytes read zero from an offset
+    /// (`BufferDesc::zero_from`) is made with the runtime's promise of them: on a GPU of its own
+    /// memory its GPU copy takes the bytes before the offset from the pages and zeros the device
+    /// writes from it (`managed_device_copies_zeroed`, `managed_bytes_zeroed`); on one that
+    /// shares the CPU's memory it lies in the pages, and the word changes nothing. The pages here
+    /// hold other bytes past the offset, so a GPU copy out of the buffer shows which bytes the GPU
+    /// reads: the guest gives the word only of bytes that read zero (`MANAGED_BUFFER_CREATE`)
+    #[test]
+    fn a_managed_buffer_s_zero_bytes_are_the_device_s_own() {
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::os::vm::HostVm as _;
+        use crate::core::platform::resource::Buffer as _;
+
+        use crate::os::PAGE;
+
+        let d = dev();
+        let length = 4 * PAGE;
+        let pages = crate::os::allocate_aliasable(length).unwrap();
+        // SAFETY: fresh pages of the test's own, which nothing uses yet.
+        unsafe { std::ptr::write_bytes(pages.as_ptr::<u8>(), 0x5a, length.to_usize()) };
+        let counts = || {
+            let counts = d.raw.work_counts();
+            (
+                counts.managed_device_copies_zeroed,
+                counts.managed_bytes_zeroed,
+            )
+        };
+        let before = counts();
+        // SAFETY: the pages outlive the buffer, which is dropped before they are freed.
+        let bytes = unsafe { HostRange::new(pages, length) };
+        let b = d
+            .new_buffer(BufferDesc {
+                length,
+                options: vec![OptionSet::ResourceOptions(0x10)],
+                pinned_gpu_address: None,
+                contents: Some(bytes),
+                no_copy: true,
+                deallocator: None,
+                zero_from: Some(PAGE),
+            })
+            .unwrap()
+            .expect("a Managed buffer over the pages");
+        let two_copies = !d.raw.properties().has_unified_memory;
+        let after = counts();
+        let zeroed = if two_copies {
+            (1, length - PAGE)
+        } else {
+            (0, 0)
+        };
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            zeroed,
+            "two copies: {two_copies}"
+        );
+        let out = shared(length);
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        let copy = BlitCmd::CopyBufferToBuffer {
+            source_buffer: Some(&b),
+            source_offset: 0,
+            destination_buffer: Some(&out),
+            destination_offset: 0,
+            size: length,
+        };
+        e.encode(OnFault::Die, copy).unwrap();
+        e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        let read = host_bytes_at(out.contents(), length.to_usize());
+        let (before_offset, from_offset) = read.split_at(PAGE.to_usize());
+        assert!(before_offset.iter().all(|&byte| byte == 0x5a));
+        let past = if two_copies { 0 } else { 0x5a };
+        assert!(
+            from_offset.iter().all(|&byte| byte == past),
+            "two copies: {two_copies}"
+        );
+        drop((cb, e, b));
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, length)
+                .is_success()
+        );
     }
 
     /// A descriptor of a `width` × `height` BGRA8Unorm 2D texture, read, written and viewed by

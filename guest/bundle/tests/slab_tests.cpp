@@ -302,6 +302,7 @@ void test_slab_zeroing()
 	RgfxSlabs slabs(source);
 	RgfxSlabs::Range r;
 	CHECK(slabs.take(0x3000, kShared, 0, &r) && allBytes(r.contents, 0x3000, 0));
+	CHECK(r.zeroFrom == 0); // a range reads zero from its caller's bytes on
 	// The rest of the slab is still the source's bytes until the background zeroes it.
 	CHECK(r.contents[0x3000] == 0xee && slabs.stats().dirtyBytes == 0x20000 - 0x3000);
 	std::memset(r.contents, 0xa5, 0x3000);
@@ -312,6 +313,7 @@ void test_slab_zeroing()
 	// The caller writes its first 256 bytes: the rest reads zero.
 	CHECK(again.contents[0] == 0xa5 && again.contents[0xff] == 0xa5 &&
 	      allBytes(again.contents + 0x100, 0x1f00, 0));
+	CHECK(again.zeroFrom == 0x100);
 	slabs.give(again);
 	while (slabs.step()) {
 	}
@@ -321,7 +323,13 @@ void test_slab_zeroing()
 	// Clean memory is taken as it is: a byte the background zeroed and nothing wrote since.
 	RgfxSlabs::Range clean;
 	CHECK(slabs.take(0x20000, kShared, 0, &clean) && allBytes(clean.contents, 0x20000, 0));
+	CHECK(clean.zeroFrom == 0);
 	slabs.give(clean);
+	// Bytes of the caller's past the range: none of it reads zero for sure.
+	RgfxSlabs::Range past;
+	CHECK(slabs.take(0x800, kShared, 0x5000, &past) && past.size == 0x1000 &&
+	      past.zeroFrom == 0x1000);
+	slabs.give(past);
 	// A source's zeroed slabs are clean from the start.
 	Source zeroed(64 * kMiB);
 	zeroed.zeroed = true;
@@ -1299,9 +1307,11 @@ void test_managed_buffers_over_shared_copies()
 	auto copy = expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET);
 	CHECK(copy.heap_obj_id == heap.obj_id && copy.offset == 0 && copy.length == 0x800 &&
 	      copy.options == kShared);
-	auto over = expectMessage<RgfxManagedBufferCreate>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+	auto overWhole = expectMessage<RgfxManagedBufferCreateWhole>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+	const RgfxManagedBufferCreate &over = overWhole.create;
 	CHECK(over.cpu_buffer_obj_id == copy.obj_id && over.length == 0x800 &&
 	      over.options == kManaged && over.gpu_address != 0);
+	CHECK(overWhole.zero.zero_from == 0); // taken with no bytes of the caller's
 	CHECK(made.objId == over.obj_id && made.gpuAddress == over.gpu_address && made.ownsAddress);
 	CHECK(slabs.take(0x1000, kShared, 0, &s) && s.slab == m.slab && s.offset == 0x1000);
 
@@ -1313,8 +1323,10 @@ void test_managed_buffers_over_shared_copies()
 	CHECK(slabs.makeBuffer(big, 3 * kMiB, kManaged, &made));
 	auto bigCopy = expectMessage<RgfxBufferOverPages>(ring, RGFX_CMD_BUFFER_OVER_PAGES);
 	CHECK(bigCopy.offset == 0 && bigCopy.length == 3 * kMiB && bigCopy.options == kShared);
-	auto bigOver = expectMessage<RgfxManagedBufferCreate>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+	auto bigWhole = expectMessage<RgfxManagedBufferCreateWhole>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+	const RgfxManagedBufferCreate &bigOver = bigWhole.create;
 	CHECK(bigOver.cpu_buffer_obj_id == bigCopy.obj_id && bigOver.length == 3 * kMiB);
+	CHECK(bigWhole.zero.zero_from == 0);
 	CHECK(made.objId == bigOver.obj_id && bigOver.gpu_address != bigCopy.gpu_address);
 	CHECK(slabs.stats().slabs == 2 && slabs.stats().firstSlabs == 2);
 
@@ -1330,8 +1342,11 @@ void test_managed_buffers_over_shared_copies()
 	CHECK(slabs.makeBuffer(r, 0x1000, kManaged | 0x1, &made));
 	auto regionCopy = expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET);
 	CHECK(regionCopy.heap_obj_id == regionHeap.obj_id && regionCopy.options == (kShared | 0x1));
-	auto regionOver = expectMessage<RgfxManagedBufferCreate>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+	auto regionWhole =
+	    expectMessage<RgfxManagedBufferCreateWhole>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+	const RgfxManagedBufferCreate &regionOver = regionWhole.create;
 	CHECK(regionOver.cpu_buffer_obj_id == regionCopy.obj_id && regionOver.options == (kManaged | 0x1));
+	CHECK(regionWhole.zero.zero_from == 0);
 
 	// Each give destroys its copy, and only then is the range free again: the small Managed
 	// buffer's range is taken again by the next buffer of the class.
@@ -1350,6 +1365,36 @@ void test_managed_buffers_over_shared_copies()
 	CHECK(expectMessage<RgfxObjectDestroy>(ring, RGFX_CMD_OBJECT_DESTROY).obj_id ==
 	      regionCopy.obj_id);
 	slabs.give(again);
+
+	// One whose caller writes its first bytes: its create says its bytes read zero from there,
+	// as they do; and nothing of one whose caller writes all of it.
+	auto nextCreate = [&]() {
+		RgfxManagedBufferCreateWhole whole = {};
+		while (ring.next(&h, &bytes)) {
+			if (h.type != RGFX_CMD_MANAGED_BUFFER_CREATE)
+				continue;
+			CHECK(bytes.size() == sizeof(whole));
+			std::memcpy(&whole, bytes.data(), sizeof(whole));
+			return whole;
+		}
+		CHECK(false);
+		return whole;
+	};
+	RgfxSlabs::Range kept, full;
+	CHECK(slabs.take(0x1000, kManaged, 0x300, &kept) && kept.zeroFrom == 0x300);
+	CHECK(allBytes(kept.contents + 0x300, 0xd00, 0));
+	CHECK(slabs.makeBuffer(kept, 0x800, kManaged, &made));
+	auto keptCreate = nextCreate();
+	CHECK(keptCreate.create.obj_id == made.objId && keptCreate.create.length == 0x800 &&
+	      keptCreate.zero.zero_from == 0x300);
+	CHECK(slabs.take(0x800, kManaged, 0x800, &full) && full.zeroFrom == 0x800);
+	CHECK(slabs.makeBuffer(full, 0x800, kManaged, &made));
+	auto fullCreate = nextCreate();
+	CHECK(fullCreate.create.obj_id == made.objId && fullCreate.zero.zero_from == 0x800);
+	slabs.give(kept);
+	slabs.give(full);
+	while (ring.next(&h, &bytes)) {
+	}
 	CHECK(slabs.reclaim() && slabs.stats().slabs == 0 && kext.pages.empty() && vm.held.empty());
 	while (ring.next(&h, &bytes)) {
 	}

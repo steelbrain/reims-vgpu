@@ -46,6 +46,7 @@ fn answers<P: Platform>(
             contents: None,
             no_copy: false,
             deallocator: None,
+            zero_from: None,
         })
         .unwrap()
         .unwrap();
@@ -222,6 +223,7 @@ fn textures_of_formats_metal_makes_none_of_die_where_metal_asserts() {
             contents: None,
             no_copy: false,
             deallocator: None,
+            zero_from: None,
         })
         .unwrap()
         .unwrap();

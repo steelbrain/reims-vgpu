@@ -2825,6 +2825,7 @@ fn usages<P: Platform>(
             contents: None,
             no_copy: false,
             deallocator: None,
+            zero_from: None,
         })
         .unwrap()
         .unwrap();
@@ -3060,6 +3061,7 @@ fn usage_bits_metal_does_not_define_die_where_textures_are_made() {
             contents: None,
             no_copy: false,
             deallocator: None,
+            zero_from: None,
         })
         .unwrap()
         .unwrap();

@@ -682,6 +682,75 @@ void test_device_buffers_answer_as_metal()
 	}
 }
 
+// A Managed device buffer over a Shared copy in a slab (MANAGED_BUFFER_SLABS) says in its create
+// which bytes of its CPU copy read zero (RgfxManagedBufferZero), so the host's GPU copy takes
+// them as zeros: one made with no bytes, from its first byte, over a slab whose memory held other
+// bytes and over a range a freed buffer wrote, both zeroed before the create; one made with
+// bytes, nothing, its zero bytes from its length.
+void test_managed_device_buffers_say_their_zero_bytes()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x80000, 0xee);
+	RgfxRegion region(mem.data(), mem.size());
+	RgfxRegionSlabSource source(region, fx.ser, false, true);
+	RgfxSlabs slabs(source);
+	auto make = [&](NSUInteger length, const void *bytes) {
+		return [RgfxBuffer bufferForDeviceWithLength:length
+		                                     options:MTLResourceStorageModeManaged
+		                                       bytes:bytes
+		                                   maxLength:0
+		                                       slabs:&slabs
+		                                      device:nil
+		                                  serializer:&fx.ser];
+	};
+	// The next MANAGED_BUFFER_CREATE on the ring, past the copies' creates and the destroys.
+	auto nextCreate = [&]() {
+		RgfxManagedBufferCreateWhole whole = {};
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		while (fx.ring.next(&h, &bytes)) {
+			if (h.type != RGFX_CMD_MANAGED_BUFFER_CREATE)
+				continue;
+			CHECK(h.size == sizeof(whole) && bytes.size() == sizeof(whole));
+			std::memcpy(&whole, bytes.data(), sizeof(whole));
+			return whole;
+		}
+		CHECK(false);
+		return whole;
+	};
+	uint8_t *firstContents = nullptr;
+	@autoreleasepool {
+		RgfxBuffer *none = make(0x1800, nullptr);
+		CHECK(none != nil && none.storageMode == MTLStorageModeManaged);
+		auto created = nextCreate();
+		CHECK(created.create.obj_id == none.rgfxObjId && created.create.length == 0x1800);
+		CHECK(created.zero.zero_from == 0);
+		firstContents = static_cast<uint8_t *>([none contents]);
+		CHECK(std::all_of(firstContents, firstContents + 0x1800, [](uint8_t b) { return b == 0; }));
+		std::memset(firstContents, 0xa5, 0x1800);
+
+		uint8_t pattern[0x100];
+		for (size_t i = 0; i < sizeof(pattern); i++)
+			pattern[i] = static_cast<uint8_t>(i * 7 + 3);
+		RgfxBuffer *bytes = make(sizeof(pattern), pattern);
+		CHECK(bytes != nil);
+		created = nextCreate();
+		CHECK(created.create.obj_id == bytes.rgfxObjId && created.create.length == sizeof(pattern));
+		CHECK(created.zero.zero_from == sizeof(pattern));
+		CHECK(std::memcmp([bytes contents], pattern, sizeof(pattern)) == 0);
+	}
+	drainRing(fx.ring);
+	@autoreleasepool {
+		// Over the freed buffer's range, which it wrote: zeroed before the create says so.
+		RgfxBuffer *again = make(0x1000, nullptr);
+		CHECK(again != nil && static_cast<uint8_t *>([again contents]) == firstContents);
+		auto created = nextCreate();
+		CHECK(created.create.obj_id == again.rgfxObjId && created.zero.zero_from == 0);
+		CHECK(std::all_of(firstContents, firstContents + 0x1000, [](uint8_t b) { return b == 0; }));
+	}
+	drainRing(fx.ring);
+}
+
 // What a device buffer in a slab answers, as both x86-64 Macs' GPUs agree (measured, AMD 5300M and
 // Intel 630): whole 4 KiB pages, its contents and GPU address a page apart from the next, its
 // heap none. A buffer made over a freed one's pages reads zeros, and the freed one's destroy comes
@@ -14310,10 +14379,13 @@ void test_no_copy_buffers_in_place()
 		CHECK(over.block_offset == pages.offset && over.block_size == pages.size);
 		CHECK((over.options & MTLResourceStorageModeMask) == MTLResourceStorageModeShared &&
 		      (over.options & MTLResourceCPUCacheModeMask) == MTLResourceCPUCacheModeWriteCombined);
-		auto made =
-		    expectMessage<RgfxManagedBufferCreate>(f.control, RGFX_CMD_MANAGED_BUFFER_CREATE);
+		auto madeWhole =
+		    expectMessage<RgfxManagedBufferCreateWhole>(f.control, RGFX_CMD_MANAGED_BUFFER_CREATE);
+		const RgfxManagedBufferCreate &made = madeWhole.create;
 		CHECK(made.obj_id == managed.rgfxObjId && made.cpu_buffer_obj_id == over.obj_id &&
 		      made.length == 0x2000);
+		// The app's own bytes: nothing said of them.
+		CHECK(madeWhole.zero.zero_from == 0x2000);
 		CHECK((made.options & MTLResourceStorageModeMask) == MTLResourceStorageModeManaged &&
 		      (made.options & MTLResourceCPUCacheModeMask) == MTLResourceCPUCacheModeWriteCombined);
 		CHECK(made.gpu_address == managed.gpuAddress && managed.gpuAddress % 0x1000 == 0x123 &&
@@ -14416,9 +14488,10 @@ void test_no_copy_buffers_in_place()
 			                                       serializer:&f.ser];
 			CHECK(m != nil && pages.asked.size() == 1);
 			copy = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES).obj_id;
-			auto mm =
-			    expectMessage<RgfxManagedBufferCreate>(f.control, RGFX_CMD_MANAGED_BUFFER_CREATE);
-			CHECK(mm.obj_id == m.rgfxObjId && mm.cpu_buffer_obj_id == copy);
+			auto mm = expectMessage<RgfxManagedBufferCreateWhole>(f.control,
+			                                                      RGFX_CMD_MANAGED_BUFFER_CREATE);
+			CHECK(mm.create.obj_id == m.rgfxObjId && mm.create.cpu_buffer_obj_id == copy);
+			CHECK(mm.zero.zero_from == 0x1000);
 			buffer = m.rgfxObjId;
 		}
 		CHECK(eventually([&] { return goneState.load() == 1; }));
@@ -14561,8 +14634,9 @@ void test_no_copy_buffers_over_the_same_bytes_share_a_block()
 			RgfxBuffer *managed = noCopy(p, 0x4000, 0x100000 | MTLResourceStorageModeManaged);
 			CHECK(managed != nil && [managed contents] == p && pages.asked == 1);
 			auto two = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
-			auto over =
-			    expectMessage<RgfxManagedBufferCreate>(f.control, RGFX_CMD_MANAGED_BUFFER_CREATE);
+			auto over = expectMessage<RgfxManagedBufferCreateWhole>(f.control,
+			                                                        RGFX_CMD_MANAGED_BUFFER_CREATE)
+			                .create;
 			CHECK(one.block_offset == joined && two.block_offset == joined);
 			CHECK(one.block_size == 0x5000 && two.block_size == 0x5000);
 			CHECK(one.obj_id == shared.rgfxObjId && over.obj_id == managed.rgfxObjId &&
@@ -20768,6 +20842,7 @@ int main(int argc, char **argv)
 		test_buffer_routing();
 		test_private_buffer_has_no_contents();
 		test_device_buffers_answer_as_metal();
+		test_managed_device_buffers_say_their_zero_bytes();
 		test_device_buffers_take_pages_of_slabs();
 		test_managed_buffers_place_their_cpu_copies_in_heaps();
 		test_device_heaps_answer_as_metal();

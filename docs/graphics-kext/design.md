@@ -3764,7 +3764,11 @@ the host's import, and the kext's block table holds one entry per slab:
   and GPU addresses start a page, as both x86-64 Macs' GPUs answer (AMD 5300M,
   Intel 630, measured with `tools/shmem`). Every new buffer reads zeros: a
   create zeroes what of its range is dirty, and a background thread zeroes
-  freed ranges first.
+  freed ranges first. So a Managed buffer's `MANAGED_BUFFER_CREATE` says which
+  bytes of its CPU copy read zero (`RgfxManagedBufferZero`, after the create):
+  all of them for a buffer made with no bytes, those past the bytes given for
+  one made with bytes, and none for one over the app's own memory, which its
+  program wrote ("Managed storage", below).
 - A buffer up to 1 MiB shares a slab of its class, the slabs growing from
   128 KiB to 2 MiB; a larger one takes a slab of its own, which is cached for
   reuse at offset 0 once freed (a sixteenth of the region at most, 2 s idle).
@@ -3954,7 +3958,13 @@ lies in the region.
   platform's runtime keeps a GPU copy in the GPU's memory, with the guest's
   bytes its CPU copy: copied in whole at the create, a range at each
   `didModifyRange:` before the next submission, and out whole at each
-  `synchronizeResource:` where the blit encoder runs it. Where the GPU's memory
+  `synchronizeResource:` where the blit encoder runs it. The bytes a
+  `MANAGED_BUFFER_CREATE` says read zero (its `RgfxManagedBufferZero`, from
+  `zero_from` to the length) are not copied in: the GPU writes zeros there in
+  its own memory, so a buffer made with no bytes moves nothing over the GPU's
+  link at its create, as a Mac's GPU copy of one starts as zeros. A guest write
+  there reaches the GPU copy by a `didModifyRange:`, as Metal's does; a create
+  without the tail, an older guest's, is copied in whole. Where the GPU's memory
   has no room for that copy, the buffer lies in its bytes, as a Shared one does,
   which the runtime announces. `BUFFER_DID_MODIFY_RANGE` is the platform's
   `didModifyRange:` of the range, and a blit's synchronize of the buffer the

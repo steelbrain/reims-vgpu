@@ -3328,6 +3328,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     contents: None,
                     no_copy: false,
                     deallocator: None,
+                    zero_from: None,
                 };
                 match device.new_buffer(desc)? {
                     Some(buffer) => self.insert(m.obj_id, ObjHandle::Buffer(buffer)),

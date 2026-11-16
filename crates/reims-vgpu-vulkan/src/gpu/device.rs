@@ -1547,6 +1547,9 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// cannot honour, and for no-copy contents of length 0, whose deallocator never runs, as
     /// Metal answers (measured: NULL contents of length 0). What the runtime's descriptor has no form for (no-copy without contents, a
     /// deallocator of a buffer that is not no-copy, copied contents of another length) dies.
+    /// A no-copy buffer's `zero_from` is the runtime's promise of its zero bytes
+    /// (`rt::HostMemory::with_zero_from`), which a `Managed` buffer's device copy on a GPU of its
+    /// own memory takes as zeros the device writes; other buffers take none.
     fn new_buffer(&self, desc: BufferDesc<'_>) -> RaiseResult<Option<VulkanBuffer>> {
         let sel = "newBufferWithDescriptor:";
         let held = descriptor_options(BUFFER_DESCRIPTOR_OPTIONS, &desc.options);
@@ -1603,12 +1606,16 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 );
                 read_only = mapped_read_only;
                 import_made = Some(made);
+                // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the
+                // deallocator runs, or for the buffer's life with none, and an unmap of core's
+                // through the platform's VM waits for the keep-alive; and a vouch is the table's
+                // record of the pages as they are mapped now.
+                let memory = unsafe { crate::os::host_memory_vouched(imported, vouched) };
                 rt::BufferContents::NoCopy {
-                    // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the
-                    // deallocator runs, or for the buffer's life with none, and an unmap of
-                    // core's through the platform's VM waits for the keep-alive; and a vouch is the
-                    // table's record of the pages as they are mapped now.
-                    memory: unsafe { crate::os::host_memory_vouched(imported, vouched) },
+                    memory: match desc.zero_from {
+                        Some(offset) => memory.with_zero_from(offset),
+                        None => memory,
+                    },
                     deallocator: run,
                     keep_alive: Some(keep),
                 }
@@ -2208,6 +2215,7 @@ pub(crate) mod tests {
             contents: None,
             no_copy: false,
             deallocator: None,
+            zero_from: None,
         }))
         .unwrap()
         .unwrap();
@@ -2355,6 +2363,7 @@ pub(crate) mod tests {
             contents: None,
             no_copy: false,
             deallocator: None,
+            zero_from: None,
         };
         let first = d.new_buffer(pinned()).unwrap().unwrap();
         assert_eq!(first.gpu_address(), pin);

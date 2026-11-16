@@ -386,7 +386,8 @@ RgfxCreated RgfxSerializer::createBufferManagedAtOffset(RgfxObjId heap, uint64_t
 }
 
 RgfxCreated RgfxSerializer::createManagedBuffer(RgfxObjId cpu_buffer, uint64_t length,
-                                                uint32_t options, uint64_t align, uint64_t offset)
+                                                uint32_t options, uint64_t zeroFrom,
+                                                uint64_t align, uint64_t offset)
 {
 	RgfxCreated out = {};
 	// The GPU copy's address, the pick holding the span from `offset` before it; no address left
@@ -398,12 +399,13 @@ RgfxCreated RgfxSerializer::createManagedBuffer(RgfxObjId cpu_buffer, uint64_t l
 		return out;
 	out.obj_id = m_ids.allocObjId();
 
-	RgfxManagedBufferCreate msg = {};
-	msg.obj_id = out.obj_id;
-	msg.gpu_address = out.gpu_address + offset;
-	msg.cpu_buffer_obj_id = cpu_buffer;
-	msg.length = length;
-	msg.options = RgfxHostResourceOptions(options);
+	RgfxManagedBufferCreateWhole msg = {};
+	msg.create.obj_id = out.obj_id;
+	msg.create.gpu_address = out.gpu_address + offset;
+	msg.create.cpu_buffer_obj_id = cpu_buffer;
+	msg.create.length = length;
+	msg.create.options = RgfxHostResourceOptions(options);
+	msg.zero.zero_from = zeroFrom < length ? zeroFrom : length;
 	out.posted = postUnwaited(RGFX_CMD_MANAGED_BUFFER_CREATE, &msg, sizeof(msg), &out.seqno);
 	return out;
 }

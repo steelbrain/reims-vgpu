@@ -461,6 +461,7 @@ mod tests {
                     contents: Some(bytes),
                     no_copy: true,
                     deallocator: None,
+                    zero_from: None,
                 })
                 .unwrap()
         };
@@ -474,6 +475,7 @@ mod tests {
                     contents: None,
                     no_copy: false,
                     deallocator: None,
+                    zero_from: None,
                 })
                 .unwrap()
                 .unwrap();

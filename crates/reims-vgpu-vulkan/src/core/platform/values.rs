@@ -55,7 +55,8 @@ pub type BufferDeallocator = Box<dyn FnOnce(HostPtr, u64) + Send>;
 
 /// The private `MTLBufferDescriptor`, as a value. Order: `setLength:`; the options in list order
 /// (`ResourceOptionsOr` reads `resourceOptions` first; a hazard-tracking mode is not sent);
-/// `setPinnedGPUAddress:`; `setContents:`; `setNoCopy:`; `setDeallocator:`.
+/// `setPinnedGPUAddress:`; `setContents:`; `setNoCopy:`; `setDeallocator:`. `zero_from` is no
+/// setter of Metal's.
 pub struct BufferDesc<'a> {
     /// `setLength:`.
     pub length: u64,
@@ -70,6 +71,13 @@ pub struct BufferDesc<'a> {
     pub no_copy: bool,
     /// `setDeallocator:`, when set.
     pub deallocator: Option<BufferDeallocator>,
+    /// Where set, the caller's word that a no-copy buffer's contents read zero from this byte to
+    /// the length as the buffer is made: a buffer the guest made with no bytes, or with fewer than
+    /// its length. A platform that keeps a GPU copy of a `Managed` buffer may start that copy with
+    /// zeros there rather than read them, so a write there that no `didModifyRange:` names is not
+    /// seen by the GPU, as a Metal GPU copy made at the buffer's making does not see it. No
+    /// setter of Metal's; a buffer that is not no-copy takes no such word.
+    pub zero_from: Option<u64>,
 }
 
 impl fmt::Debug for BufferDesc<'_> {
@@ -81,6 +89,7 @@ impl fmt::Debug for BufferDesc<'_> {
             .field("contents", &self.contents)
             .field("no_copy", &self.no_copy)
             .field("deallocator", &self.deallocator.is_some())
+            .field("zero_from", &self.zero_from)
             .finish()
     }
 }
@@ -1240,6 +1249,7 @@ mod tests {
                 contents: Some(HostRange::of_slice(&bytes)),
                 no_copy: true,
                 deallocator: None,
+                zero_from: None,
             })
             .unwrap()
             .unwrap();

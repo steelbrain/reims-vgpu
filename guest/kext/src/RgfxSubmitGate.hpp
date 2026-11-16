@@ -61,7 +61,9 @@ inline bool rgfxSubmitRoutesQueueDestroy(uint32_t type)
 // (the buffer a heap places at an offset), a TEXTURE_CREATE, a TEXTURE_VIEW, a
 // MANAGED_TEXTURE_CREATE and a MANAGED_BUFFER_CREATE; and a BUFFER_DID_MODIFY_RANGE, a write into
 // a Managed buffer the host carries out before any command buffer after it. None is waited for
-// nor names a block (rgfxRegionSpans), and each is of one size, which its header must name. A
+// nor names a block (rgfxRegionSpans), and each is of one size, which its header must name: a
+// MANAGED_BUFFER_CREATE's is the create with its zero bytes (RgfxManagedBufferZero at
+// RGFX_MANAGED_BUFFER_ZERO_OFFSET), as the bundle sends every one. A
 // TEXTURE_FROM_IOSURFACE is not taken: a present of the surface by any process waits for it on
 // the host, so it goes on the ring as it is made. The caller also checks each obj_id lies in the
 // sender's context, routes a queue's destroy as rgfxSubmitRoutesQueueDestroy says, and follows a
@@ -80,7 +82,7 @@ inline uint32_t rgfxSubmitBatchSize(uint32_t type)
 	case RGFX_CMD_MANAGED_TEXTURE_CREATE:
 		return sizeof(RgfxManagedTextureCreate);
 	case RGFX_CMD_MANAGED_BUFFER_CREATE:
-		return sizeof(RgfxManagedBufferCreate);
+		return RGFX_MANAGED_BUFFER_ZERO_OFFSET + sizeof(RgfxManagedBufferZero);
 	case RGFX_CMD_BUFFER_DID_MODIFY_RANGE:
 		return sizeof(RgfxBufferDidModifyRange);
 	default:

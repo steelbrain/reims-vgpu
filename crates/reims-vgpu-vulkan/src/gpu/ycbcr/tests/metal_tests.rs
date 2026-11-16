@@ -65,6 +65,7 @@ fn buffer<P: Platform>(d: &P::Device) -> P::Buffer {
         contents: None,
         no_copy: false,
         deallocator: None,
+        zero_from: None,
     };
     d.new_buffer(desc).unwrap().unwrap()
 }

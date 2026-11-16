@@ -43,7 +43,11 @@
  * ZEROING. A freed range, and a slab the source did not zero, are dirty. A create zeroes only
  * the dirty part of its range, past the bytes its caller writes itself; the background thread
  * (start) zeroes dirty free bytes in pieces of kZeroPiece, so in a steady state a create finds
- * its range clean. A piece being zeroed is in no free run, so no create takes it meanwhile.
+ * its range clean. A piece being zeroed is in no free run, so no create takes it meanwhile. So a
+ * range reads zero past those bytes as it is taken, and a Managed buffer over a copy says so in
+ * its create (MANAGED_BUFFER_CREATE's RgfxManagedBufferZero): where the host keeps a GPU copy of
+ * it, the copy starts with zeros its GPU writes there rather than with the bytes copied over its
+ * link, as a Mac's GPU copy of a buffer made with no bytes holds.
  *
  * LETTING GO. A class keeps up to two empty slabs, each for kCacheIdleMs at most; a third empty
  * one goes at once, and one left empty that long goes too, as does a cached slab past the cap or
@@ -171,8 +175,10 @@ public:
 	virtual bool overCopy(uint32_t options) const { return false; }
 
 	/// The Managed buffer of `length` bytes and `options` whose CPU copy is the Shared buffer
-	/// `copy` made in a slab of this source; false where the device never got it.
-	virtual bool makeOverCopy(const Made &copy, uint64_t length, uint32_t options, Made *out)
+	/// `copy` made in a slab of this source, its bytes from `zeroFrom` to the length zero (none
+	/// where `zeroFrom` is the length or more); false where the device never got it.
+	virtual bool makeOverCopy(const Made &copy, uint64_t length, uint32_t options,
+	                          uint64_t zeroFrom, Made *out)
 	{
 		return false;
 	}
@@ -207,7 +213,8 @@ public:
 	                uint32_t options, Made *out) override;
 	uint32_t classOptions(uint32_t options) const override;
 	bool overCopy(uint32_t options) const override;
-	bool makeOverCopy(const Made &copy, uint64_t length, uint32_t options, Made *out) override;
+	bool makeOverCopy(const Made &copy, uint64_t length, uint32_t options, uint64_t zeroFrom,
+	                  Made *out) override;
 	void dropCopy(const Made &copy, std::function<void()> then) override;
 
 	/// Metal's page, which a heap over host memory is made of.
@@ -293,12 +300,14 @@ private:
 class RgfxSlabs {
 public:
 	/// A range of a slab a buffer lies in: `size` bytes (allocatedSize) at `offset` of its slab,
-	/// at `contents` here. `slab` names it for give().
+	/// at `contents` here, whose bytes from `zeroFrom` (the take's `keep`) to its size read zero
+	/// as take() answers it. `slab` names it for give().
 	struct Range {
 		const void *slab = nullptr;
 		uint64_t offset = 0;
 		uint64_t size = 0;
 		uint8_t *contents = nullptr;
+		uint64_t zeroFrom = UINT64_MAX; // nothing said, but by take()
 	};
 
 	/// What the allocator holds, for the tests and diagnostics.
@@ -338,7 +347,9 @@ public:
 
 	/// The buffer of `length` bytes and `options` over `range` (RgfxSlabSource::makeBuffer): a
 	/// Managed one of a source over copies over a Shared buffer made there first, which give()
-	/// destroys (MANAGED OVER A COPY), where the Managed buffer was not made too.
+	/// destroys (MANAGED OVER A COPY), where the Managed buffer was not made too. The Managed
+	/// buffer's create says its bytes read zero from the range's `zeroFrom` (ZEROING), so the
+	/// caller writes nothing past its `keep` before this.
 	bool makeBuffer(const Range &range, uint64_t length, uint32_t options,
 	                RgfxSlabSource::Made *out);
 

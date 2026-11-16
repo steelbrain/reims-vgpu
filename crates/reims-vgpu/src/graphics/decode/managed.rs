@@ -10,7 +10,8 @@
 //! - **A buffer**, on any GPU: the platform's no-copy `Managed` buffer over its CPU copy's bytes,
 //!   at the guest's address. The platform keeps the copies Metal keeps: one where the GPU shares
 //!   the CPU's memory; on any other GPU a GPU copy in the GPU's memory, with the guest's bytes its
-//!   CPU copy, copied in whole at the make, a range at each `didModifyRange:` by the next
+//!   CPU copy, copied in whole at the make (but for the bytes a `MANAGED_BUFFER_CREATE` says read
+//!   zero, which start as zeros the GPU writes), a range at each `didModifyRange:` by the next
 //!   submission, and copied out whole at each `synchronizeResource:` where the blit encoder runs
 //!   it (the Vulkan platform's runtime, whose `managed_copy` module says so; where the GPU's
 //!   memory has no room for the copy, the buffer lies in its bytes, as a `Shared` one does, which
@@ -72,9 +73,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use reims_vgpu_graphics::managed::LinearLayout;
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
-    RGFX_MANAGED_TEXTURE_LINEAR, RgfxBufferDidModifyRange, RgfxBufferManagedAtOffset,
-    RgfxBufferOverHostMemory, RgfxManagedBufferCreate, RgfxManagedTextureCreate,
-    RgfxTextureReplaceRegion,
+    RGFX_MANAGED_BUFFER_ZERO_OFFSET, RGFX_MANAGED_TEXTURE_LINEAR, RgfxBufferDidModifyRange,
+    RgfxBufferManagedAtOffset, RgfxBufferOverHostMemory, RgfxManagedBufferCreate,
+    RgfxManagedBufferZero, RgfxManagedTextureCreate, RgfxTextureReplaceRegion,
 };
 use reims_vgpu_vulkan::core::host::HostPtr;
 use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder};
@@ -87,7 +88,7 @@ use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult};
 
 use super::tables::{Entry, GuestBytes};
 use super::{
-    DecodeError, Drain, GraphicsDecoder, ObjHandle, op_fault, read, refusing, texture_desc,
+    DecodeError, Drain, GraphicsDecoder, ObjHandle, op_fault, read, read_at, refusing, texture_desc,
 };
 
 /// `MTLStorageModeManaged`.
@@ -284,6 +285,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             contents: Some(bytes),
             no_copy: true,
             deallocator: Some(Box::new(move |_, _| drop(keep))),
+            zero_from: None,
         })
     }
 
@@ -363,7 +365,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             at,
             length: m.length,
         };
-        let Some(buffer) = self.buffer_over_bytes(device, bytes, m.length, options, pin, None)?
+        let Some(buffer) =
+            self.buffer_over_bytes(device, bytes, m.length, options, pin, None, None)?
         else {
             return Ok(Err(DecodeError::Refused));
         };
@@ -390,6 +393,13 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// than the buffer, is a bad reference; a buffer of no bytes is malformed, and one of options
     /// other than `Managed`, or whose CPU copy lies over pages its process maps read-only, which
     /// the copies would write ([`Self::copy_admitted`]), is refused.
+    ///
+    /// Where the message carries an [`RgfxManagedBufferZero`] from a byte before the buffer's
+    /// length, the guest says the CPU copy reads zero from there, and the platform is told so
+    /// (`BufferDesc::zero_from`): a GPU copy of the platform's starts with zeros its GPU writes
+    /// there, rather than with those bytes copied in, as Metal's GPU copy of a buffer made with no
+    /// bytes holds. A message without it, or from the length or past it, tells the platform
+    /// nothing, and the GPU copy starts as the CPU copy's bytes.
     pub(super) fn managed_buffer_create(
         &self,
         device: &P::Device,
@@ -405,6 +415,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         if m.length == 0 {
             return Ok(Err(DecodeError::Malformed));
         }
+        let zero_from = read_at::<RgfxManagedBufferZero>(message, RGFX_MANAGED_BUFFER_ZERO_OFFSET)
+            .map(|zero| zero.zero_from)
+            .filter(|&from| from < m.length);
         let (Some(ObjHandle::Buffer(cpu)), Some(bytes)) = (
             self.named(m.cpu_buffer_obj_id),
             self.bytes_of(m.cpu_buffer_obj_id),
@@ -421,7 +434,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let cpu = cpu.clone_ref();
         let pin = (m.gpu_address != 0).then_some(m.gpu_address);
         let Some(buffer) =
-            self.buffer_over_bytes(device, bytes, m.length, options, pin, Some(cpu))?
+            self.buffer_over_bytes(device, bytes, m.length, options, pin, Some(cpu), zero_from)?
         else {
             return Ok(Err(DecodeError::Refused));
         };
@@ -440,9 +453,14 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// A no-copy buffer of `options` over the first `length` bytes of the guest's `bytes`, at the
-    /// guest's `pin`: a `Managed` buffer over its CPU copy. It keeps `keep`, where given, the
-    /// `Shared` buffer whose contents the bytes are, until the platform frees it, so a pages
-    /// block's view they lie in stays mapped.
+    /// guest's `pin`: a `Managed` buffer over its CPU copy, whose bytes from `zero_from`, where
+    /// the guest said so, read zero. It keeps `keep`, where given, the `Shared` buffer whose
+    /// contents the bytes are, until the platform frees it, so a pages block's view they lie in
+    /// stays mapped.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the buffer's descriptor, its guest bytes and what it keeps"
+    )]
     fn buffer_over_bytes(
         &self,
         device: &P::Device,
@@ -451,6 +469,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         options: u64,
         pin: Option<u64>,
         keep: Option<P::Buffer>,
+        zero_from: Option<u64>,
     ) -> RaiseResult<Option<P::Buffer>> {
         let region = Arc::clone(&self.region);
         let first = match bytes.ram {
@@ -469,6 +488,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             contents: Some(range),
             no_copy: true,
             deallocator: Some(Box::new(move |_, _| drop((keep, region)))),
+            zero_from,
         })
     }
 
@@ -1118,6 +1138,7 @@ mod tests {
             contents: Some(bytes),
             no_copy: true,
             deallocator: Some(Box::new(|_, _| {})),
+            zero_from: None,
         })
     }
 
@@ -1780,6 +1801,7 @@ mod tests {
                         contents: Some(bytes),
                         no_copy: true,
                         deallocator: Some(Box::new(|_, _| {})),
+                        zero_from: None,
                     }),
                     "copy {cpu}, unified {unified}"
                 );
@@ -1808,6 +1830,58 @@ mod tests {
             assert!(r.dec.span_in_use(pages::BLOCK + 0x1_0000, 0x1_0000));
             assert_eq!(r.modified(61, 32, 4), Ok(()));
             assert!(r.synchronize(61, RGFX_BLIT_RESOURCE_BUFFER).unwrap());
+        }
+    }
+
+    /// A `MANAGED_BUFFER_CREATE` that says its CPU copy reads zero from a byte before its length
+    /// ([`RgfxManagedBufferZero`]) tells the platform so (`BufferDesc::zero_from`), on any GPU
+    /// and wherever the copy lies; one from its length or past it, and one without it (the
+    /// message of a guest that sends none), tell it nothing. The buffer is made as without it.
+    #[test]
+    fn a_managed_buffer_s_zero_bytes_reach_the_platform() {
+        let (mut r, ram, page) = pages_rig();
+        let copies = shared_copies(&mut r, &ram, page);
+        let mut obj_id = 60;
+        for (cpu, first) in copies {
+            for (zero, want) in [
+                (Some(0), Some(0)),
+                (Some(0x101), Some(0x101)),
+                (Some(0x2ff), Some(0x2ff)),
+                (Some(0x300), None),
+                (Some(u64::MAX), None),
+                (None, None),
+            ] {
+                let mut message = managed_over(obj_id, cpu, 0x300, MANAGED)
+                    .as_bytes()
+                    .to_vec();
+                if let Some(zero_from) = zero {
+                    message.extend_from_slice(RgfxManagedBufferZero { zero_from }.as_bytes());
+                }
+                let size = u32::try_from(message.len()).unwrap();
+                message[4..8].copy_from_slice(&size.to_le_bytes());
+                let mark = r.p.call_log().mark();
+                assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+                let calls = r.p.call_log().since(mark);
+                let news: Vec<_> = calls.iter().filter(|c| c.sel.starts_with("new")).collect();
+                assert_eq!(news.len(), 1, "copy {cpu}, zero {zero:?}");
+                // SAFETY: the range is only formatted.
+                let bytes = unsafe { HostRange::new(HostPtr::from_ptr(first as *mut u8), 0x300) };
+                assert_eq!(
+                    news[0].args[0],
+                    Arg::val(&BufferDesc {
+                        length: 0x300,
+                        options: vec![OptionSet::ResourceOptions(MANAGED.into())],
+                        pinned_gpu_address: Some(0x1_0000_0000 + obj_id * 0x10_0000),
+                        contents: Some(bytes),
+                        no_copy: true,
+                        deallocator: Some(Box::new(|_, _| {})),
+                        zero_from: want,
+                    }),
+                    "copy {cpu}, zero {zero:?}"
+                );
+                assert!(r.dec.managed_copy(obj_id).is_some());
+                obj_id += 1;
+            }
         }
     }
 

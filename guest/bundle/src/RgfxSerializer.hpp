@@ -87,6 +87,18 @@ static_assert(offsetof(RgfxSamplerCreateWhole, ext) == RGFX_SAMPLER_CREATE_EXT_O
                       RGFX_SAMPLER_CREATE_EXT_OFFSET + sizeof(RgfxSamplerCreateExt),
               "SAMPLER_CREATE and its extension");
 
+/// MANAGED_BUFFER_CREATE as the serialiser sends it: the create and the bytes of its CPU copy
+/// that read zero (RGFX_MANAGED_BUFFER_ZERO_OFFSET), from `zero_from` to the length; a
+/// `zero_from` of the length says nothing of them.
+struct RgfxManagedBufferCreateWhole {
+	RgfxManagedBufferCreate create;
+	RgfxManagedBufferZero zero;
+};
+static_assert(offsetof(RgfxManagedBufferCreateWhole, zero) == RGFX_MANAGED_BUFFER_ZERO_OFFSET &&
+                  sizeof(RgfxManagedBufferCreateWhole) ==
+                      RGFX_MANAGED_BUFFER_ZERO_OFFSET + sizeof(RgfxManagedBufferZero),
+              "MANAGED_BUFFER_CREATE and its zero bytes");
+
 /// A function reference a pipeline draws from: the library it lives in, its
 /// entry-point name, and the function constants that specialise it (`constants`
 /// may be null when `constant_count` is 0). The name is a NUL-terminated C
@@ -448,13 +460,17 @@ public:
 
 	/// A Managed buffer of `length` bytes at a picked GPU address, its CPU copy the first `length`
 	/// bytes of the Shared buffer `cpu_buffer` over the process's memory (`MANAGED_BUFFER_CREATE`,
-	/// where the device took RGFX_FEATURE_MANAGED_BUFFER_SLABS). The pick holds `offset` bytes
+	/// where the device took RGFX_FEATURE_MANAGED_BUFFER_SLABS), whose bytes from `zeroFrom` to
+	/// the length read zero as it is posted (RgfxManagedBufferZero): the host's GPU copy, where
+	/// it keeps one, starts with zeros there rather than the CPU copy's bytes. A `zeroFrom` of
+	/// `length` or more says nothing of them (sent as `length`). The pick holds `offset` bytes
 	/// more, and the buffer's address is the pick plus `offset`, as a no-copy buffer's over the
 	/// app's pages keeps its pointer's offset in its page (createBufferOverPages). The answer's
 	/// `gpu_address` is the address picked, given back through releaseAddress. No one waits for
 	/// it: held where the control ring batches, as createBufferAtOffset's buffer is.
 	RgfxCreated createManagedBuffer(RgfxObjId cpu_buffer, uint64_t length, uint32_t options,
-	                                uint64_t align = kDefaultAddressAlign, uint64_t offset = 0);
+	                                uint64_t zeroFrom, uint64_t align = kDefaultAddressAlign,
+	                                uint64_t offset = 0);
 
 	/// The process wrote `length` bytes at `location` of Managed buffer `buffer`'s CPU copy
 	/// (`didModifyRange:`): every command buffer committed after it sees them. Held where the

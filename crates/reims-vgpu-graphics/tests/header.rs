@@ -180,6 +180,8 @@ CHECK(offsetof(RgfxManagedBufferCreate, gpu_address) == 24);
 CHECK(offsetof(RgfxManagedBufferCreate, cpu_buffer_obj_id) == 32);
 CHECK(offsetof(RgfxManagedBufferCreate, length) == 40);
 CHECK(offsetof(RgfxManagedBufferCreate, options) == 48);
+CHECK(RGFX_MANAGED_BUFFER_ZERO_OFFSET == sizeof(RgfxManagedBufferCreate));
+CHECK(sizeof(RgfxManagedBufferZero) == 8);
 CHECK(RGFX_FEATURE_DISPLAY_COLOR == (1 << 24));
 CHECK(RGFX_FEATURE_MESH_PIPELINES == (1 << 25));
 CHECK(RGFX_CMD_MESH_RENDER_PIPELINE_CREATE == 0x22e);

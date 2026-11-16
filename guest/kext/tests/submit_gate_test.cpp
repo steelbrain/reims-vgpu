@@ -76,7 +76,8 @@ int main()
 		{RGFX_CMD_TEXTURE_CREATE, sizeof(RgfxTextureCreate), true},
 		{RGFX_CMD_TEXTURE_VIEW, sizeof(RgfxTextureView), true},
 		{RGFX_CMD_MANAGED_TEXTURE_CREATE, sizeof(RgfxManagedTextureCreate), true},
-		{RGFX_CMD_MANAGED_BUFFER_CREATE, sizeof(RgfxManagedBufferCreate), true},
+		{RGFX_CMD_MANAGED_BUFFER_CREATE,
+		 sizeof(RgfxManagedBufferCreate) + sizeof(RgfxManagedBufferZero), true},
 		{RGFX_CMD_BUFFER_DID_MODIFY_RANGE, sizeof(RgfxBufferDidModifyRange), false},
 	};
 	for (const Taken &t : taken) {

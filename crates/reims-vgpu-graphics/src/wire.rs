@@ -2467,6 +2467,29 @@ pub struct RgfxManagedBufferCreate {
     pub reserved_34: u32,
 }
 
+/// Where a `MANAGED_BUFFER_CREATE` message's [`RgfxManagedBufferZero`] starts: right after its
+/// [`RgfxManagedBufferCreate`]. A message whose `size` is at least
+/// `RGFX_MANAGED_BUFFER_ZERO_OFFSET + size_of::<RgfxManagedBufferZero>()` carries it.
+pub const RGFX_MANAGED_BUFFER_ZERO_OFFSET: u32 = 56;
+
+/// The bytes of a `MANAGED_BUFFER_CREATE`'s CPU copy that read zero as the guest posts it, after
+/// the [`RgfxManagedBufferCreate`] at [`RGFX_MANAGED_BUFFER_ZERO_OFFSET`]: every byte from
+/// `zero_from` to the buffer's `length`, as a buffer the guest made with no bytes, or with fewer
+/// than its length, holds. The host's GPU copy, where it keeps one, starts with zeros there that
+/// the host's GPU writes, rather than with the CPU copy's bytes copied in, so a guest write
+/// there reaches it through a `BUFFER_DID_MODIFY_RANGE`, as Metal's GPU copy of a `Managed`
+/// buffer takes a CPU write made after the buffer's making. A `zero_from` at or past `length`,
+/// and a create without it, say nothing of the bytes: the GPU copy starts as the CPU copy's
+/// bytes.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxManagedBufferZero {
+    /// The first byte of the CPU copy from which every byte to the buffer's length reads zero.
+    pub zero_from: u64,
+}
+
 /// `CB_COMPLETE`: a command buffer finished. `status` is an `RGFX_CB_*`, and
 /// `error_code` carries the host's raw `MTLCommandBufferError` code for
 /// diagnostics (0 when `status` is [`RGFX_CB_OK`]).
@@ -4815,6 +4838,8 @@ const _: () = {
     assert!(size_of::<RgfxRateMapAnswer>() == 48);
     assert!(size_of::<RgfxManagedTextureCreate>() == 112);
     assert!(size_of::<RgfxManagedBufferCreate>() == 56);
+    assert!(size_of::<RgfxManagedBufferCreate>() == RGFX_MANAGED_BUFFER_ZERO_OFFSET as usize);
+    assert!(size_of::<RgfxManagedBufferZero>() == 8);
     assert!(size_of::<RgfxTextureReplaceRegion>() == 56);
     assert!(size_of::<RgfxTextureView>() == 72);
     assert!(size_of::<RgfxHeapTextureSizeAndAlign>() == 72);

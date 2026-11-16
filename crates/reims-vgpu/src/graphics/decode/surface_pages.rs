@@ -2241,6 +2241,7 @@ pub(crate) fn buffer_over<P: Platform>(
         contents: Some(bytes),
         no_copy: true,
         deallocator: Some(Box::new(move |_, _| drop(keep))),
+        zero_from: None,
     })
 }
 

@@ -168,6 +168,7 @@ include = [
     "RgfxLinearTextureFromBuffer",
     "RgfxLinkedFunction",
     "RgfxManagedBufferCreate",
+    "RgfxManagedBufferZero",
     "RgfxManagedTextureCreate",
     "RgfxMeshPipelineReflection",
     "RgfxMeshRenderPipelineCreate",

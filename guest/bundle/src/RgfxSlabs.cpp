@@ -62,9 +62,9 @@ bool RgfxRegionSlabSource::overCopy(uint32_t options) const
 }
 
 bool RgfxRegionSlabSource::makeOverCopy(const Made &copy, uint64_t length, uint32_t options,
-                                        Made *out)
+                                        uint64_t zeroFrom, Made *out)
 {
-	RgfxCreated created = m_serializer.createManagedBuffer(copy.objId, length, options);
+	RgfxCreated created = m_serializer.createManagedBuffer(copy.objId, length, options, zeroFrom);
 	if (created.obj_id == 0 || m_serializer.refused(created))
 		return false; // no address left, or the device never got it
 	out->objId = created.obj_id;
@@ -569,6 +569,7 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 	out->offset = at;
 	out->size = size;
 	out->contents = in->memory.bytes + at;
+	out->zeroFrom = keep;
 	return true;
 }
 
@@ -584,7 +585,7 @@ bool RgfxSlabs::makeBuffer(const Range &range, uint64_t length, uint32_t options
 	if (!source.makeBuffer(slab->memory, slab->heap, range.offset, length, slab->options, &copy))
 		return false;
 	// Where the Managed buffer is not made, the caller's give() destroys the copy all the same.
-	const bool made = source.makeOverCopy(copy, length, options, out);
+	const bool made = source.makeOverCopy(copy, length, options, range.zeroFrom, out);
 	std::lock_guard<std::mutex> hold(m_lock);
 	slab->copies[range.offset] = copy;
 	return made;

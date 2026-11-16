@@ -548,8 +548,10 @@ bool rgfxTexelsPastAllocation(uint64_t length, uint64_t offset, uint64_t bytesPe
 	const RgfxObjId copy = managed ? created.obj_id : 0;
 	const uint64_t copyPick = created.gpu_address;
 	if (managed) {
+		// The app's own bytes, which its program wrote: nothing is said of them.
 		created = serializer->createManagedBuffer(copy, length, static_cast<uint32_t>(options),
-		                                          RgfxSerializer::kDefaultAddressAlign, offset);
+		                                          length, RgfxSerializer::kDefaultAddressAlign,
+		                                          offset);
 		if (created.obj_id == 0 || serializer->refused(created)) {
 			region->leavePages(at);
 			serializer->destroy(copy, [serializer, copyPick, region, at] {

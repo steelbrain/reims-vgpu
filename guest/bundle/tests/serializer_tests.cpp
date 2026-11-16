@@ -812,8 +812,8 @@ void test_creates_with_no_address_post_nothing()
 	RgfxCreated bh = ser.createBufferOverHostMemory(past, 0, 0x50000);
 	RgfxCreated bp = ser.createBufferOverPages(past, 0, 0x60000, 0x1000, 0x123);
 	RgfxCreated wraps = ser.createBufferOverPages(UINT64_MAX - 0x100, 0, 0x60000, 0x1000, 0x123);
-	RgfxCreated mp = ser.createManagedBuffer(1, past, 0x10);
-	RgfxCreated mwraps = ser.createManagedBuffer(1, UINT64_MAX - 0x100, 0x10,
+	RgfxCreated mp = ser.createManagedBuffer(1, past, 0x10, 0);
+	RgfxCreated mwraps = ser.createManagedBuffer(1, UINT64_MAX - 0x100, 0x10, 0,
 	                                             RgfxSerializer::kDefaultAddressAlign, 0x123);
 	RgfxCreated hp = ser.createHeapOverPages(past, 0, 1, 0x60000, 0x4000);
 	RgfxTextureDescriptor desc = {};
@@ -899,17 +899,31 @@ void test_lifecycle_messages()
 	(void)expectMessage<RgfxBufferCreate>(ring, RGFX_CMD_BUFFER_CREATE);
 
 	// A Managed buffer over that one, as a no-copy Managed buffer over the pages is: its pick
-	// holds the span from the page's start too, and its address keeps the offset.
-	RgfxCreated mb = ser.createManagedBuffer(bp.obj_id, 0x3000, 0x10,
+	// holds the span from the page's start too, and its address keeps the offset. The app's
+	// bytes: nothing said of them, its zero bytes from its length.
+	RgfxCreated mb = ser.createManagedBuffer(bp.obj_id, 0x3000, 0x10, 0x3000,
 	                                         RgfxSerializer::kDefaultAddressAlign, 0x123);
 	CHECK(mb.posted && mb.gpu_address % RgfxIdSpace::kAddressGranule == 0);
-	auto mbm = expectMessage<RgfxManagedBufferCreate>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
-	CHECK(mbm.obj_id == mb.obj_id && mbm.cpu_buffer_obj_id == bp.obj_id);
-	CHECK(mbm.gpu_address == mb.gpu_address + 0x123 && mbm.length == 0x3000 &&
-	      mbm.options == 0x10);
+	auto mbm = expectMessage<RgfxManagedBufferCreateWhole>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+	CHECK(mbm.create.obj_id == mb.obj_id && mbm.create.cpu_buffer_obj_id == bp.obj_id);
+	CHECK(mbm.create.gpu_address == mb.gpu_address + 0x123 && mbm.create.length == 0x3000 &&
+	      mbm.create.options == 0x10 && mbm.create.reserved_34 == 0);
+	CHECK(mbm.zero.zero_from == 0x3000);
 	RgfxCreated beyond = ser.createBuffer(0x1000, 0);
 	CHECK(beyond.gpu_address >= mb.gpu_address + RgfxIdSpace::addressSpan(0x3123));
 	(void)expectMessage<RgfxBufferCreate>(ring, RGFX_CMD_BUFFER_CREATE);
+
+	// Its CPU copy's zero bytes, as the caller gives them, up to its length: from a byte before
+	// the length, that byte; from the length or past it, the length, which says nothing.
+	const uint64_t zeroes[][2] = {{0, 0},           {0x80, 0x80},     {0xfff, 0xfff},
+	                              {0x1000, 0x1000}, {0x1001, 0x1000}, {UINT64_MAX, 0x1000}};
+	for (const auto &zero : zeroes) {
+		RgfxCreated z = ser.createManagedBuffer(bp.obj_id, 0x1000, 0x10, zero[0]);
+		CHECK(z.posted);
+		auto zm = expectMessage<RgfxManagedBufferCreateWhole>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+		CHECK(zm.create.obj_id == z.obj_id && zm.create.length == 0x1000);
+		CHECK(zm.zero.zero_from == zero[1]);
+	}
 
 	// A slab's heap over a pages block's guest RAM, at an address of its size.
 	RgfxCreated slab = ser.createHeapOverPages(0x200000, 0x200, 1, 0x60000, 0x4000);
@@ -2959,7 +2973,7 @@ void test_held_creates()
 		return c.obj_id;
 	});
 	heldAlone("managed buffer", RGFX_CMD_MANAGED_BUFFER_CREATE, [&] {
-		RgfxCreated c = ser.createManagedBuffer(0x79, 256, 0x10);
+		RgfxCreated c = ser.createManagedBuffer(0x79, 256, 0x10, 0);
 		CHECK(c.posted && c.obj_id != 0 && c.gpu_address != 0 && c.seqno == 0);
 		return c.obj_id;
 	});
@@ -2975,7 +2989,7 @@ void test_held_creates()
 	RgfxCreated a = ser.createBufferAtOffset(0x10, 0, 256, 0);
 	RgfxCreated v = ser.createTextureView(view);
 	CHECK(ser.bufferDidModifyRange(0x7a, 0, 16));
-	RgfxCreated m = ser.createManagedBuffer(a.obj_id, 256, 0x10);
+	RgfxCreated m = ser.createManagedBuffer(a.obj_id, 256, 0x10, 0);
 	CHECK(t.posted && t.gpu_address == 0 && a.posted && v.posted && m.posted);
 	CHECK(log.calls.empty());
 	CHECK(ser.postHeldCreates());
