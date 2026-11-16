@@ -1343,6 +1343,16 @@ impl<P: Platform> Presented<P> {
         }
     }
 
+    /// What a window draw holds where another command buffer took its presents and the surface's
+    /// block, the one that reads the surface (`sink`, "The compositor's GPU"): nothing.
+    pub(crate) fn drawn_by_none(self: &Arc<Self>) -> DrawnPresents<P> {
+        DrawnPresents {
+            presented: Arc::clone(self),
+            drawing: Drawing::default(),
+            hold: None,
+        }
+    }
+
     /// Whether the display shows a presented surface's texture in place of the scanout.
     fn shows_surface(&self) -> bool {
         self.texture.lock().is_some()
@@ -1407,10 +1417,11 @@ impl<P: Platform> DrawnPresents<P> {
         self.hold = Some(hold);
     }
 
-    /// The answers it holds, and the surface's block, are let go of after `command_buffer`, the
-    /// draw, has finished: its completed handler holds them. Called before its commit; where the
-    /// handler is refused, or the buffer is never committed, they are let go of as if it had
-    /// finished.
+    /// The answers it holds, and the surface's block, are let go of after `command_buffer` has
+    /// finished, the one that reads the surface: the draw, or on the compositor's GPU the window's
+    /// mirror's sync (`sink`, "The compositor's GPU"). Its completed handler holds them. Called
+    /// before its commit; where the handler is refused, or the buffer is never committed, they
+    /// are let go of as if it had finished.
     pub(crate) fn after(self, command_buffer: &P::CommandBuffer) {
         if self.drawing.is_empty() && self.hold.is_none() {
             return;

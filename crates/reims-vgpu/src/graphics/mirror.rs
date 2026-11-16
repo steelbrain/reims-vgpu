@@ -29,6 +29,13 @@
 //! draws come one at a time on the window's thread, so the last draw was committed or dropped by
 //! then, and it waited for the sync before it.
 //!
+//! **The surface's read.** Of the presented surface, only the sync's first command buffer reads
+//! anything: its copy into `now`. The draw on the compositor's GPU reads the mirror alone, which
+//! the order above keeps from the next sync. So what waits for the surface's read waits for that
+//! command buffer, not for the draw: the sync hands it to its caller before its commit
+//! ([`Mirror::sync`]'s `reading`), and the window's sink answers the presents it draws and lets
+//! the surface's block go once it has finished (`sink`, "The compositor's GPU").
+//!
 //! **On a copy engine.** Where the platform gives a queue whose copies run on a copy engine of
 //! the runtime's GPU (`GpuDevice::new_command_queue_for_copies`), the tiles cross the link there,
 //! apart from the engine that runs the guest's render and compute work:
@@ -352,12 +359,15 @@ impl<P: ApiPlatform> Mirror<P> {
     /// least: the runtime's buffer over it, once the sync has finished; `None` where the mirror
     /// does not carry the surface's format, or the runtime refuses an object or the sync. `now`
     /// reads the platform's monotonic clock, for the time the window's thread waits on the sync,
-    /// which the debug log counts.
+    /// which the debug log counts. `reading` is handed the command buffer that reads `surface`,
+    /// the sync's first, before its commit (the module doc, "The surface's read"); it is not
+    /// called where the sync ends before that buffer is encoded.
     pub(crate) fn sync(
         &self,
         surface: &P::Texture,
         align: u64,
         now: &dyn Fn() -> MonoTime,
+        reading: impl FnOnce(&P::CommandBuffer),
     ) -> Option<Synced<P>> {
         let started = now();
         let format = surface.pixel_format();
@@ -471,6 +481,8 @@ impl<P: ApiPlatform> Mirror<P> {
             },
         ));
         compute.end();
+        // The surface is read by this buffer alone, which the paths below commit.
+        reading(&command_buffer);
         let completion = match &self.copies {
             None => {
                 // `now` is the frame sent from here.
@@ -912,7 +924,7 @@ mod tests {
             surface.clone_ref(),
         );
         std::thread::spawn(move || {
-            let synced = mirror.sync(&surface, 256, &|| platform.clock().now_mono())?;
+            let synced = mirror.sync(&surface, 256, &|| platform.clock().now_mono(), |_| {})?;
             Some((synced.bytes_per_row, synced.completion.is_some()))
         })
     }
@@ -1191,8 +1203,9 @@ mod tests {
             // The mirror brought up to a `side` by `side` surface, its sync finished: the
             // mirror's first byte and length.
             let sync = |side: u64| {
-                let synced = (mirror.sync(&surface(side), 256, &|| platform.clock().now_mono()))
-                    .expect("a sync");
+                let synced =
+                    (mirror.sync(&surface(side), 256, &|| platform.clock().now_mono(), |_| {}))
+                        .expect("a sync");
                 if let Some(completion) = &synced.completion {
                     no_catch(completion.sync.wait_until_completed(OnFault::Die));
                 }
@@ -1276,8 +1289,8 @@ mod tests {
                     row * height,
                 )
                 .unwrap();
-            let synced =
-                (mirror.sync(&surface, 256, &|| platform.clock().now_mono())).expect("a sync");
+            let synced = (mirror.sync(&surface, 256, &|| platform.clock().now_mono(), |_| {}))
+                .expect("a sync");
             if let Some(completion) = &synced.completion {
                 no_catch(completion.sync.wait_until_completed(OnFault::Die));
             }
@@ -1319,8 +1332,8 @@ mod tests {
                 ..TextureDesc::default()
             });
             let surface = no_catch(device.new_texture(OnFault::Die, &descriptor)).unwrap();
-            let synced =
-                (mirror.sync(&surface, 256, &|| platform.clock().now_mono())).expect("a sync");
+            let synced = (mirror.sync(&surface, 256, &|| platform.clock().now_mono(), |_| {}))
+                .expect("a sync");
             if let Some(completion) = &synced.completion {
                 no_catch(completion.sync.wait_until_completed(OnFault::Die));
             }

@@ -29,7 +29,15 @@
 //! device draws from a linear texture over its import of the mirror's pages, as the surface's
 //! texture is drawn above. The draw waits for the mirror's sync on its own GPU where the sync's
 //! completion comes as a sync file, else the window's thread waits for it (`mirror`,
-//! "Ordering"). The import is made once a mirror, its deallocator holding the
+//! "Ordering"). Only the sync reads the guest's surface, its copy of it, and the draw reads the
+//! mirror alone, which the next sync writes only once the draw has finished: so the presents a
+//! draw there takes are answered, and the surface's block let go of, once that copy has finished,
+//! not the draw (`mirror`, "The surface's read"). The guest then draws into its surfaces again
+//! with no wait for the compositor's GPU, its link or any other work there: on a Radeon 780M
+//! with the compositor on an RTX 3090 behind PCIe 3.0 x4, the draws there ran 16.5 ms on the
+//! GPU on average and up to 228 ms, where the syncs ran 3.35 ms and none over 30 ms (a traced
+//! boot, 2026-11-15). The import is made once a
+//! mirror, its deallocator holding the
 //! runtime's buffer over the mirror, so the mirror's pages stay mapped while it lives. A
 //! presented surface the mirror cannot carry, or whose mirror, import or texture is refused,
 //! cannot be drawn there: the draw draws nothing, says so ([`ScanoutDraw::foreign_refused`]),
@@ -809,12 +817,20 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         cursor: Option<&DrawnCursor>,
     ) -> Option<(P::CommandBuffer, DrawnPresents<P>)> {
         self.scoped(|| {
-            let mut presents = self.presented.drawn();
-            let (command_buffer, hold) = self.encode_shown(texture, region)?;
-            if let Some(hold) = hold {
-                // The surface's block stays until the draw has read it.
-                presents.reading(hold);
-            }
+            let mut taken = Some(self.presented.drawn());
+            let (command_buffer, hold) = self.encode_shown_with(texture, region, &mut taken)?;
+            // On the compositor's GPU the mirror's sync took them, with the surface's block (the
+            // module doc, "The compositor's GPU"): this draw holds neither.
+            let presents = match taken {
+                Some(mut presents) => {
+                    if let Some(hold) = hold {
+                        // The surface's block stays until the draw has read it.
+                        presents.reading(hold);
+                    }
+                    presents
+                }
+                None => self.presented.drawn_by_none(),
+            };
             if let Some(cursor) = cursor
                 && !self.shown.asleep()
             {
@@ -912,6 +928,19 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         texture: &P::Texture,
         region: PixelRect,
     ) -> Option<(P::CommandBuffer, Option<Arc<DisplayHold>>)> {
+        self.encode_shown_with(texture, region, &mut None)
+    }
+
+    /// [`Self::encode_shown`], for a window draw that takes `presents`: on the compositor's GPU,
+    /// the mirror's sync that reads the presented surface takes them, with the surface's hold,
+    /// until it has finished, and leaves `None` (the module doc, "The compositor's GPU");
+    /// elsewhere they stay for the caller, as where the sync does not come to its read.
+    fn encode_shown_with(
+        &self,
+        texture: &P::Texture,
+        region: PixelRect,
+        presents: &mut Option<DrawnPresents<P>>,
+    ) -> Option<(P::CommandBuffer, Option<Arc<DisplayHold>>)> {
         self.forget_if_recovered();
         if self.shown.asleep() {
             // The display's panel is off: black, whatever the guest shows.
@@ -926,7 +955,12 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             Some(foreign) => match self.presented.shown() {
                 None => None,
                 Some((surface, hold)) => {
-                    let here = self.mirrored(foreign, &surface);
+                    let here = self.mirrored(foreign, &surface, |sync| {
+                        if let Some(mut taken) = presents.take() {
+                            taken.reading(Arc::clone(&hold));
+                            taken.after(sync);
+                        }
+                    });
                     let Some(here) = here else {
                         // Nothing drawn: the window presents from the runtime's GPU from now.
                         foreign.refuse(surface.pixel_format());
@@ -974,8 +1008,14 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     /// mirror, so its pages stay mapped while the import lives, and a linear texture over the
     /// import. The import is made again where the mirror is. `None` where the mirror cannot carry
     /// the surface, or the runtime or the device refuses the mirror, its sync, the import or the
-    /// texture.
-    fn mirrored(&self, foreign: &Foreign<P>, surface: &P::Texture) -> Option<P::Texture> {
+    /// texture. `reading` is handed the sync's command buffer that reads `surface`, before its
+    /// commit ([`Mirror::sync`]).
+    fn mirrored(
+        &self,
+        foreign: &Foreign<P>,
+        surface: &P::Texture,
+        reading: impl FnOnce(&P::CommandBuffer),
+    ) -> Option<P::Texture> {
         if foreign.mirror.made().is_some_and(|m| m.recovered()) {
             // The runtime's device recovered: its objects carry nothing on (the module doc, "A
             // recovered device").
@@ -986,7 +1026,12 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             .mirror
             .get_or_make(|| Mirror::new(self.platform.metal_device(None)?))?;
         let align = self.device.caps().limits.linear_texture_alignment_bytes;
-        let mut synced = mirror.sync(surface, align, &|| self.platform.clock().now_mono())?;
+        let mut synced = mirror.sync(
+            surface,
+            align,
+            &|| self.platform.clock().now_mono(),
+            reading,
+        )?;
         let completion = synced.completion.take();
         let texture = self.foreign_texture(foreign, surface.pixel_format(), &synced)?;
         // The draw of the texture waits for the sync ([`Self::surface_command_buffer`]).
@@ -1969,6 +2014,122 @@ mod tests {
                 .collect::<Vec<_>>(),
             drawn
         );
+    }
+
+    /// `presented` shows `surface`, under a hold of its own: the hold, weakly, whose strong count
+    /// is 1 while the display alone holds it.
+    fn show_held(
+        presented: &Presented<FakePlatform>,
+        surface: &<FakePlatform as Platform>::Texture,
+    ) -> std::sync::Weak<DisplayHold> {
+        let hold = Arc::new(DisplayHold {
+            span: None,
+            answers: Mutex::default(),
+        });
+        let weak = Arc::downgrade(&hold);
+        *presented.texture.lock() = Some(ShownTexture {
+            texture: surface.clone_ref(),
+            hold,
+        });
+        weak
+    }
+
+    /// The committed command buffers not yet completed, once there are `count` of them.
+    #[allow(clippy::disallowed_methods)] // test scaffolding: real time bounds the wait for the thread
+    fn committed(platform: &FakePlatform, count: usize) -> Vec<ObjId> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let committed = platform.world().committed();
+            if committed.len() >= count {
+                assert_eq!(committed.len(), count, "more command buffers than expected");
+                return committed;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{committed:?} of {count}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// On the compositor's GPU the mirror's sync is the only reader of the presented surface: the
+    /// presents a draw takes and the surface's block go once the sync has finished, while the
+    /// draw from the mirror is still running, and a draw held on its GPU holds neither. The next
+    /// sync writes the mirror only once that draw has finished
+    #[test]
+    fn on_the_compositors_gpu_the_presents_go_with_the_syncs_read_not_the_draw() {
+        let (platform, draw, drawable, surface) = rig_on_compositor(80);
+        let hold = show_held(&draw.presented, &surface);
+        let (command_buffer, presents) = draw.encode(&drawable, WHOLE, None).unwrap();
+        // The sync completed as it committed: the presents and the block went with it.
+        assert_eq!(hold.strong_count(), 1, "the sync let the surface go");
+        // The draw, held on its GPU, holds nothing of the surface's.
+        platform.world().set_auto_complete(None);
+        presents.after(&command_buffer);
+        no_catch(command_buffer.commit(OnFault::Die));
+        let running = committed(&platform, 1);
+        assert_eq!(running, [command_buffer.id()]);
+        assert_eq!(hold.strong_count(), 1, "the running draw holds no surface");
+        // The next draw's sync waits for that draw before it reads the surface or writes the
+        // mirror.
+        let draw = Arc::new(draw);
+        let log = platform.call_log();
+        let mark = log.mark();
+        let next = {
+            let (draw, drawable) = (Arc::clone(&draw), drawable.clone_ref());
+            #[allow(clippy::disallowed_methods)] // test helper thread: no Objective-C runs here
+            std::thread::spawn(move || draw.encode(&drawable, WHOLE, None).map(|(cb, _)| cb.id()))
+        };
+        #[allow(clippy::disallowed_methods)] // test scaffolding: real time lets the thread run
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            platform.world().committed(),
+            running,
+            "no sync while the draw runs"
+        );
+        assert!(
+            !log.since(mark)
+                .iter()
+                .any(|c| c.sel.starts_with("copyFromTexture")),
+            "nothing read or written"
+        );
+        platform.world().set_auto_complete(Some(CompleteOn::Thread));
+        assert!(platform.world().complete(
+            running[0],
+            CommandBufferStatus::COMPLETED,
+            None,
+            CompleteOn::Thread
+        ));
+        assert!(next.join().unwrap().is_some());
+        let calls = log.since(mark);
+        let read: Vec<_> = (calls.iter())
+            .filter(|c| c.sel.starts_with("copyFromTexture") && c.sel.contains("toBuffer"))
+            .collect();
+        assert_eq!(read.len(), 1, "the next sync, once the draw finished");
+        assert_eq!(read[0].args[0].as_obj(), Some(surface.id()));
+        assert_eq!(hold.strong_count(), 1);
+    }
+
+    /// On the runtime's own device the draw reads the presented surface itself: the presents it
+    /// takes and the surface's block go once the draw has finished, not before
+    #[test]
+    fn on_the_runtimes_device_the_presents_go_with_the_draw() {
+        let (platform, draw, presented, drawable) = rig();
+        let surface = texture(&draw, 80);
+        let hold = show_held(&presented, &surface);
+        let (command_buffer, presents) = draw.encode(&drawable, WHOLE, None).unwrap();
+        assert_eq!(hold.strong_count(), 2, "the draw holds the surface");
+        presents.after(&command_buffer);
+        no_catch(command_buffer.commit(OnFault::Die));
+        assert_eq!(committed(&platform, 1), [command_buffer.id()]);
+        assert_eq!(hold.strong_count(), 2, "while the draw runs");
+        assert!(platform.world().complete(
+            command_buffer.id(),
+            CommandBufferStatus::COMPLETED,
+            None,
+            CompleteOn::Thread
+        ));
+        assert_eq!(hold.strong_count(), 1, "until it has finished");
     }
 
     /// With no scanout and no presented surface, display 0's window draws nothing, and the window

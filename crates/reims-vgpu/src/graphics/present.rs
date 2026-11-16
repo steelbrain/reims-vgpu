@@ -71,7 +71,8 @@
 //!
 //! **Where a present's time goes.** Each answer is logged at debug, on [`TIMING`]'s target:
 //! how long after the device's last refresh its `PRESENT_SURFACE` was taken, how long it waited
-//! for its writers and fill to be shown, how long the window's draw of it took to finish, and at
+//! for its writers and fill to be shown, how long the window's draw of it took to finish (on the
+//! compositor's GPU, the window's mirror's sync, which reads its surface: `sink`), and at
 //! which refresh it was answered. It tells a present the host answers a refresh late (its show
 //! or its draw done past the first refresh after its take) from one the guest's compositor
 //! sent late in the refresh, which a guest's present latency alone does not.
