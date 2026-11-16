@@ -49,6 +49,10 @@ use crate::core::platform::os::vm::{HostAddr, HostVm as _};
 /// (`os/linux/import.rs`).
 #[cfg(target_os = "linux")]
 pub(crate) use host_os::learn_view_imports;
+/// Takes the imports of the guest RAM's regions the devices keep, on Linux
+/// (`os/linux/dma_buf.rs`), for the platform's let-go of its devices ([`crate::let_go`]).
+#[cfg(target_os = "linux")]
+pub(crate) use host_os::take_region_keeps;
 /// The calling thread's user-space instructions and cycles, which cost tests count in, on Linux
 /// (`os/linux/thread_counts.rs`).
 #[cfg(all(test, target_os = "linux"))]

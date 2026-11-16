@@ -14,7 +14,8 @@
 //!   8).
 //! - **What goes.** Every device adopted, and what the platform keeps of them: the libraries of
 //!   its own shaders, its no-draw and predication pipelines, the device the sampler mempool
-//!   follows, the device whose answers describe formats, the devices handed the guest's RAM, and
+//!   follows, the device whose answers describe formats, the devices handed the guest's RAM, the
+//!   imports of the guest RAM's regions kept on them (on Linux, `os/linux/dma_buf.rs`), and
 //!   each device's own threads ([`DeviceThreads`] and its keeping awake, `crate::awake`), stopped
 //!   and joined. Where that was a runtime device's last handle, the runtime tears it down on the
 //!   calling thread, its own threads stopped and waited for, before the let-go returns.
@@ -62,6 +63,8 @@ pub fn let_go_of_devices(bound: Duration) -> Result<usize, String> {
     drop(libraries);
     drop(crate::gpu::metal_space::take_sampler_ids());
     drop(crate::platform::take_answering_device());
+    #[cfg(target_os = "linux")]
+    drop(crate::os::take_region_keeps());
     #[cfg(any(target_os = "linux", windows))]
     drop(crate::os::take_ram_devices());
     drop(devices);

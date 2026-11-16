@@ -62,9 +62,10 @@
 //! granule), takes a dma-buf of its own, as memory of the library's own and read-only pages do.
 //! The table of regions ([`REGIONS`]) holds each file weakly: the runtime's imports of it hold
 //! it, and so does each import source that answered with a piece of it, which the runtime keeps
-//! with the imports it made (`super::import`'s `host_memory`), so it lives while any buffer or heap
-//! bound in it does and goes with the last, and a later request in the region makes it again (the
-//! trace's `ramregion` writes each made, and `rampiece` each request's answer). A region's first
+//! with the imports it made (`super::import`'s `host_memory`), and so do the imports of it the
+//! devices keep (below, "Kept imports"), so it lives while any buffer or heap bound in it does and
+//! for their linger after the last, and a later request in the region makes it again (the trace's
+//! `ramregion` writes each made, and `rampiece` each request's answer). A region's first
 //! piece from its first page is so a piece of a shared file, never a dma-buf of its own (the
 //! runtime takes a chunk at offset 0 whose `Arc` it alone holds as the buffer's own). While it
 //! lives it pins every page of its region and maps
@@ -81,6 +82,31 @@
 //! 53.6) and their take to show (a median of 12.4 to 12.7 ms) as before. A walk made 61 to 67
 //! region dma-bufs, at most 31 alive at once: 1.9 GiB of the guest's 8 GiB pinned, none of it
 //! memory the RAM did not already hold.
+//!
+//! **Kept imports.** Each region a no-copy buffer's or heap's source answered with is kept
+//! imported on the device that made the object ([`keep_regions`], on the thread that made it,
+//! once the runtime's call returned): the device's one import of the region's dma-buf, which the
+//! object's piece made or joined, is held by the device's keep (`rt::Device::import_shared_dma_buf`)
+//! besides the objects bound in it, so the region's next object joins it rather than importing the
+//! dma-buf again. Without the keep, a region whose objects come and go one at a time was imported
+//! again for each, and its dma-buf made again: on a Radeon 780M the import call took 820 to 907 us
+//! and the next submission started on the GPU about 3 ms after it, RADV mapping the import into
+//! the GPU's page tables first, against 25 to 69 us and 104 to 145 us joining a kept import
+//! (**measured** by metal2vulkan's lane, its `kept_file_bench`, RUNTIME 2389). A region is in use
+//! while a source that answered with it lives ([`RegionUse`]), which the runtime keeps with the
+//! imports it made through it, so while an object over a piece of it lives; once its last use
+//! goes, its kept imports linger [`LINGER_NS`], two seconds, then go, swept by a thread of their
+//! own ([`SWEEP`]), and with them the region's dma-buf, unless an object comes first. So a device
+//! holds an import of each region an object lay in within the last two seconds, at most the
+//! guest's RAM over 64 MiB of them (128 for 8 GiB), each in every submission's list on RADV, and
+//! the regions' pins hold no page the guest's RAM did not (`prealloc=on`, above). While one is
+//! kept, the runtime's residency thread releases no import of the region's objects: the keep is a
+//! hold of the file that is none of theirs, and the release would take nothing off the list. Kept
+//! only on a device the process adopted, which the platform's let-go lets go of with its keeps
+//! ([`take_region_keeps`]); the device's recovery carries its keeps to its new `VkDevice`, which
+//! imports the dma-buf again at the first object that needs it (the runtime's `kept.rs`). Nothing
+//! of it reaches the guest: an object lies at the same address over the same pages whether its
+//! piece imported the dma-buf or joined a kept import.
 //!
 //! **The pages' size** (**measured** 2026-10-26, RADV of Mesa 26.2.4, raw Vulkan with no runtime
 //! between, kernels of our own reading 64 MiB and writing 64 MiB, the median GPU time of five in
@@ -116,7 +142,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use crate::core::num::ToU64 as _;
 use crate::core::platform::os::vm::VmProt;
 use crate::core::sync::Mutex;
-use metal2vulkan_runtime::DmaBufChunk;
+use metal2vulkan_runtime::{self as rt, DmaBufChunk};
 
 use super::vm;
 use crate::os::files;
@@ -872,9 +898,12 @@ fn region_bytes() -> Option<u64> {
     (bytes >= vm::page_size()).then_some(bytes)
 }
 
-/// The region dma-bufs made and alive now, by the guest RAM file's identity (its `Arc`'s
-/// address), the regions' bytes and the region's index in the file (module docs, "Regions").
-static REGIONS: Mutex<BTreeMap<(usize, u64, u64), Region>> = Mutex::new(BTreeMap::new());
+/// A region of a guest RAM file (module docs, "Regions"): the file's identity (its `Arc`'s
+/// address), the regions' bytes and the region's index in the file.
+type RegionKey = (usize, u64, u64);
+
+/// The region dma-bufs made and alive now, by [`RegionKey`] (module docs, "Regions").
+static REGIONS: Mutex<BTreeMap<RegionKey, Region>> = Mutex::new(BTreeMap::new());
 
 /// A region's dma-buf in [`REGIONS`].
 #[derive(Debug)]
@@ -882,28 +911,102 @@ struct Region {
     /// The RAM's file, held weakly: its `Arc`'s allocation, whose address keys the entry, is not
     /// let go of while the entry lives, so no other file is ever found under the key.
     _ram: Weak<OwnedFd>,
-    /// The region's dma-buf: the runtime's imports of it, and an answer not yet imported, hold it.
+    /// The region's dma-buf: the runtime's imports of it, the sources that answered with it
+    /// ([`RegionUse`]) and its kept imports ([`Region::kept`]) hold it.
     file: Weak<OwnedFd>,
+    /// How many [`RegionUse`]s of it live: the sources that answered with a piece of it, which the
+    /// runtime keeps while an object it made through one lives.
+    users: u64,
+    /// When the last of them went, on the monotonic clock, where an import of it is kept: its
+    /// kept imports go [`LINGER_NS`] after (module docs, "Kept imports").
+    idle_since: Option<u64>,
+    /// Its import kept on each device an object over a piece of it was made on, by the device's
+    /// registry ID (`rt::Device::import_shared_dma_buf`, module docs, "Kept imports").
+    kept: Vec<(u64, rt::SharedDmaBufImport)>,
+    /// The devices, by registry ID, that refused to keep its import: none is asked again.
+    refused: Vec<u64>,
 }
 
 /// How many region dma-bufs were made (module docs, "Regions"): a diagnostic, which the trace
 /// writes as each is made.
 static REGIONS_MADE: AtomicU64 = AtomicU64::new(0);
 
+/// A source's use of a region's dma-buf ([`ram_pieces`]): the dma-buf held, and the region counted
+/// in use ([`Region::users`]) while it lives. The import source keeps one for each region it
+/// answered with (`super::import`'s `host_memory`), and the runtime keeps the source while an
+/// import made through it lives, so a region is in use while an object over a piece of it lives.
+#[derive(Debug)]
+pub(crate) struct RegionUse {
+    key: RegionKey,
+    file: Arc<OwnedFd>,
+}
+
+impl RegionUse {
+    /// Whether `self` and `other` are uses of one region's dma-buf.
+    pub(crate) fn same(&self, other: &RegionUse) -> bool {
+        Arc::ptr_eq(&self.file, &other.file)
+    }
+
+    /// The region, weakly: what [`keep_regions`] keeps on the device an object over a piece of
+    /// it was made on.
+    pub(crate) fn region(&self) -> RegionRef {
+        RegionRef {
+            key: self.key,
+            file: Arc::downgrade(&self.file),
+        }
+    }
+}
+
+impl Drop for RegionUse {
+    /// The region's last use going starts its kept imports' linger (module docs, "Kept imports").
+    fn drop(&mut self) {
+        let mut regions = REGIONS.lock();
+        let Some(region) = (regions.get_mut(&self.key))
+            .filter(|r| std::ptr::eq(r.file.as_ptr(), Arc::as_ptr(&self.file)))
+        else {
+            return;
+        };
+        region.users = region.users.saturating_sub(1);
+        let lingers = region.users == 0 && !region.kept.is_empty();
+        if lingers {
+            region.idle_since = Some(mono_now());
+        }
+        drop(regions);
+        if lingers {
+            SWEEP.wake();
+        }
+    }
+}
+
+/// A region a source answered with, weakly ([`RegionUse::region`]).
+#[derive(Clone, Debug)]
+pub(crate) struct RegionRef {
+    key: RegionKey,
+    file: Weak<OwnedFd>,
+}
+
+/// What [`ram_pieces`] answers: the pieces, in order, and a use of each region they lie in.
+#[derive(Debug)]
+pub(crate) struct RegionPieces {
+    pub(crate) chunks: Vec<DmaBufChunk>,
+    pub(crate) uses: Vec<RegionUse>,
+}
+
 /// Pieces of the guest RAM's region dma-bufs that hold the `length` bytes from `first` (whole
 /// pages) in order, as a no-copy buffer's or heap's request at `granule` and `alignment` takes
 /// them (module docs, "Regions"): each piece one run of a file's pages inside one region, at its
-/// offset in the region's dma-buf, made at the region's first piece. `None` where a byte shows no
-/// page of the guest's RAM mapped writable, where the pieces break the request's rules (a piece at
-/// an offset its alignment does not divide; several, where a boundary between two lies off the
-/// granule, or the length is not whole granules, which would take a pad of other pages), or where
-/// udmabuf makes no region's dma-buf: the request is answered as before then.
+/// offset in the region's dma-buf, made at the region's first piece, with a use of each region
+/// ([`RegionUse`]). `None` where a byte shows no page of the guest's RAM mapped writable, where the
+/// pieces break the request's rules (a piece at an offset its alignment does not divide; several,
+/// where a boundary between two lies off the granule, or the length is not whole granules, which
+/// would take a pad of other pages), or where udmabuf makes no region's dma-buf: the request is
+/// answered as before then.
 pub(crate) fn ram_pieces(
     first: u64,
     length: u64,
     granule: u64,
     alignment: u64,
-) -> Option<Vec<DmaBufChunk>> {
+) -> Option<RegionPieces> {
     ram_pieces_in(first, length, granule, alignment, region_bytes()?)
 }
 
@@ -936,12 +1039,12 @@ fn ram_pieces_in(
     granule: u64,
     alignment: u64,
     region: u64,
-) -> Option<Vec<DmaBufChunk>> {
+) -> Option<RegionPieces> {
     let answer = cut_in_regions(first, length, granule, alignment, region);
     // The trace's `rampiece`: the request's first byte, its length, the pieces answered, and
     // why none were where none were.
     let (count, why) = match &answer {
-        Ok(chunks) => (chunks.len().to_u64(), 0),
+        Ok(pieces) => (pieces.chunks.len().to_u64(), 0),
         Err(no) => (0, no.code()),
     };
     crate::core::trace::event("rampiece", &[first, length, count, why]);
@@ -955,7 +1058,7 @@ fn cut_in_regions(
     granule: u64,
     alignment: u64,
     region: u64,
-) -> Result<Vec<DmaBufChunk>, NoPieces> {
+) -> Result<RegionPieces, NoPieces> {
     debug_assert!(region.is_power_of_two() && region.is_multiple_of(vm::page_size()));
     let pieces = files::guest_ram_pieces(first, length).ok_or(NoPieces::NotRam)?;
     // Each piece cut where its pages cross into another region: (the RAM's file, the region's
@@ -976,16 +1079,26 @@ fn cut_in_regions(
         return Err(NoPieces::Rules);
     }
     let device = device().map_err(|_| NoPieces::Made)?;
-    cut.into_iter()
-        .map(|(ram, index, into, bytes)| {
-            let file = region_file(device, &ram, index, region).ok_or(NoPieces::Made)?;
-            Ok(DmaBufChunk {
-                file,
-                offset: into,
-                length: bytes,
-            })
-        })
-        .collect()
+    let mut uses: Vec<RegionUse> = Vec::new();
+    let mut chunks = Vec::with_capacity(cut.len());
+    for (ram, index, into, bytes) in cut {
+        let key = (Arc::as_ptr(&ram).addr(), region, index);
+        let file = match uses.iter().find(|u| u.key == key) {
+            Some(used) => Arc::clone(&used.file),
+            None => {
+                let used = region_use(device, &ram, index, region).ok_or(NoPieces::Made)?;
+                let file = Arc::clone(&used.file);
+                uses.push(used);
+                file
+            }
+        };
+        chunks.push(DmaBufChunk {
+            file,
+            offset: into,
+            length: bytes,
+        });
+    }
+    Ok(RegionPieces { chunks, uses })
 }
 
 /// Whether pieces of `shape`, each an offset in its file and a length, in order, answer a request
@@ -1016,22 +1129,22 @@ fn takes(shape: &[(u64, u64)], length: u64, granule: u64, alignment: u64) -> boo
     length.is_multiple_of(granule)
 }
 
-/// The dma-buf of region `index` of the RAM's file `ram`, `region` bytes from `index * region`
-/// (fewer at the file's end): the one alive in [`REGIONS`], or one made now and entered there. A
-/// region made meanwhile by another thread is the one answered, and this one goes. `None` where
-/// the file's size is not known or the kernel refuses the dma-buf.
-fn region_file(
-    device: &OwnedFd,
-    ram: &Arc<OwnedFd>,
-    index: u64,
-    region: u64,
-) -> Option<Arc<OwnedFd>> {
+/// A use of region `index` of the RAM's file `ram`, `region` bytes from `index * region` (fewer at
+/// the file's end): of its dma-buf alive in [`REGIONS`], or of one made now and entered there. A
+/// region made meanwhile by another thread is the one used, and this one goes. `None` where the
+/// file's size is not known or the kernel refuses the dma-buf.
+fn region_use(device: &OwnedFd, ram: &Arc<OwnedFd>, index: u64, region: u64) -> Option<RegionUse> {
     let key = (Arc::as_ptr(ram).addr(), region, index);
-    let alive = |regions: &BTreeMap<(usize, u64, u64), Region>| {
-        regions.get(&key).and_then(|r| r.file.upgrade())
+    // A use of the region's live dma-buf, counted, its linger ended.
+    let used = |regions: &mut BTreeMap<RegionKey, Region>| {
+        let entry = regions.get_mut(&key)?;
+        let file = entry.file.upgrade()?;
+        entry.users += 1;
+        entry.idle_since = None;
+        Some(RegionUse { key, file })
     };
-    if let Some(file) = alive(&REGIONS.lock()) {
-        return Some(file);
+    if let Some(used) = used(&mut REGIONS.lock()) {
+        return Some(used);
     }
     let start = index.checked_mul(region)?;
     let stat = stat_of(ram)?;
@@ -1052,15 +1165,20 @@ fn region_file(
         }
     };
     let mut regions = REGIONS.lock();
-    if let Some(file) = alive(&regions) {
-        return Some(file);
+    if let Some(used) = used(&mut regions) {
+        return Some(used);
     }
+    // An entry whose dma-buf went holds no kept import: each holds the dma-buf.
     regions.retain(|_, r| r.file.strong_count() > 0);
     regions.insert(
         key,
         Region {
             _ram: Arc::downgrade(ram),
             file: Arc::downgrade(&made),
+            users: 1,
+            idle_since: None,
+            kept: Vec::new(),
+            refused: Vec::new(),
         },
     );
     let live = regions.len().to_u64();
@@ -1076,7 +1194,190 @@ fn region_file(
         let event = [start, bytes, made_so_far, live, held(&stat), after];
         crate::core::trace::event("ramregion", &event);
     }
-    Some(made)
+    Some(RegionUse { key, file: made })
+}
+
+/// How long a region's kept imports stay once no object lies in it, in nanoseconds (module docs,
+/// "Kept imports"): two seconds, the first window the runtime's residency thread keeps an idle
+/// import of a no-copy buffer for before it releases it (`host_residency.rs`'s `IDLE`).
+pub(crate) const LINGER_NS: u64 = 2_000_000_000;
+
+/// Keeps the import of each region of `answered`, those a source answered with as an object was
+/// made on `device`, on that device (module docs, "Kept imports"): its one import of the region's
+/// dma-buf, which the object's piece joined, held from now on by the device's keep
+/// (`rt::Device::import_shared_dma_buf`), so the region's next object joins it rather than
+/// importing the dma-buf again. Only on a device the process adopted, which the platform's let-go
+/// lets go of ([`take_region_keeps`]); only for a region in use, as one whose source the runtime
+/// dropped had no import made through it; once per device; and never on a device that refused
+/// it once. Called on the thread that made the object, once the runtime's call returned.
+pub(crate) fn keep_regions(device: &rt::Device, answered: Vec<RegionRef>) {
+    if answered.is_empty() || !crate::gpu::device::adopted(device) {
+        return;
+    }
+    let id = device.registry_id();
+    for region in answered {
+        // The region's dma-buf, where it is in use and this device keeps none of it yet.
+        let file = {
+            let regions = REGIONS.lock();
+            let Some(entry) =
+                (regions.get(&region.key)).filter(|r| Weak::ptr_eq(&r.file, &region.file))
+            else {
+                continue;
+            };
+            let asked = entry.kept.iter().any(|&(at, _)| at == id) || entry.refused.contains(&id);
+            if asked || entry.users == 0 {
+                continue;
+            }
+            let Some(file) = region.file.upgrade() else {
+                continue;
+            };
+            file
+        };
+        let made = device.import_shared_dma_buf(&file, rt::ResourceOptions::default());
+        let mut regions = REGIONS.lock();
+        let entry = (regions.get_mut(&region.key)).filter(|r| Weak::ptr_eq(&r.file, &region.file));
+        // Whether it lingers already: its last use went while the keep was made.
+        let mut lingers = false;
+        let left = match (made, entry) {
+            (Ok(kept), Some(entry)) if !entry.kept.iter().any(|&(at, _)| at == id) => {
+                entry.kept.push((id, kept));
+                if entry.users == 0 {
+                    entry.idle_since = Some(mono_now());
+                    lingers = true;
+                }
+                None
+            }
+            (Ok(kept), _) => Some(kept),
+            (Err(error), entry) => {
+                if let Some(entry) = entry {
+                    entry.refused.push(id);
+                }
+                log::debug!(
+                    target: "reims_vgpu_vulkan::os",
+                    "the device keeps no import of a region dma-buf of the guest's RAM: {error}"
+                );
+                None
+            }
+        };
+        drop(regions);
+        // A keep made meanwhile by another thread is the one kept; this one goes, with no lock.
+        drop(left);
+        drop(file);
+        if lingers {
+            SWEEP.wake();
+        }
+    }
+}
+
+/// Every region import the devices keep, taken out of [`REGIONS`], for the platform's let-go of
+/// its devices (`crate::let_go`): each holds a handle of its device, which goes with the keep, and
+/// the imports go with their last buffer, or at once where none is bound in them.
+pub(crate) fn take_region_keeps() -> Vec<rt::SharedDmaBufImport> {
+    let mut regions = REGIONS.lock();
+    let mut taken = Vec::new();
+    for region in regions.values_mut() {
+        taken.extend(region.kept.drain(..).map(|(_, kept)| kept));
+        region.idle_since = None;
+    }
+    taken
+}
+
+/// The kept imports of the regions whose linger ended by `now` ([`LINGER_NS`]), taken out of
+/// [`REGIONS`], and when the next linger ends, where one goes on.
+fn lingered(now: u64) -> (Vec<rt::SharedDmaBufImport>, Option<u64>) {
+    let mut regions = REGIONS.lock();
+    let mut taken = Vec::new();
+    let mut next: Option<u64> = None;
+    for region in regions.values_mut() {
+        let Some(since) = region.idle_since.filter(|_| region.users == 0) else {
+            continue;
+        };
+        let ends = since.saturating_add(LINGER_NS);
+        if ends <= now {
+            taken.extend(region.kept.drain(..).map(|(_, kept)| kept));
+            region.idle_since = None;
+        } else {
+            next = Some(next.map_or(ends, |n| n.min(ends)));
+        }
+    }
+    (taken, next)
+}
+
+/// Ends every region's linger now, as [`LINGER_NS`] after its last use would, its kept imports let
+/// go of: for tests, which wait no two seconds.
+#[cfg(test)]
+pub(crate) fn end_lingers() {
+    drop(lingered(u64::MAX).0);
+}
+
+/// The sweep of the regions' kept imports whose linger ended ([`lingered`]), on a thread of its
+/// own, `reims-vgpu.region-keeps`, started with the first keep: it waits until the next linger
+/// ends, or with none for a keep or a region's last use, takes what lingered out and lets go of it
+/// with no lock held. It holds nothing of a device but what [`REGIONS`] holds.
+static SWEEP: Sweep = Sweep::new();
+
+/// [`SWEEP`]'s state.
+struct Sweep {
+    /// Set as a keep or a last use wakes the thread, cleared as it sweeps.
+    woken: Mutex<bool>,
+    /// Raised as it is woken.
+    wake: crate::core::sync::Condvar,
+    /// Whether the thread was started.
+    started: OnceLock<()>,
+}
+
+impl Sweep {
+    const fn new() -> Sweep {
+        Sweep {
+            woken: Mutex::new(false),
+            wake: crate::core::sync::Condvar::new(),
+            started: OnceLock::new(),
+        }
+    }
+
+    /// Wakes the thread, starting it first where it was not.
+    fn wake(&'static self) {
+        self.started.get_or_init(|| {
+            let spawned = std::thread::Builder::new()
+                .name("reims-vgpu.region-keeps".into())
+                .spawn(move || self.run());
+            if let Err(error) = spawned {
+                log::warn!(
+                    target: "reims_vgpu_vulkan::os",
+                    "no thread lets go of the guest RAM's region imports kept idle: {error}"
+                );
+            }
+        });
+        *self.woken.lock() = true;
+        self.wake.notify_one();
+    }
+
+    /// The thread's loop ([`SWEEP`]).
+    fn run(&self) {
+        use crate::core::platform::os::Clock as _;
+        use crate::core::platform::os::clock::{Deadline, MonoTime};
+        let clock = super::clock::LinuxClock::new();
+        loop {
+            let (gone, next) = lingered(clock.now_mono().as_nanos());
+            drop(gone);
+            let mut woken = self.woken.lock();
+            while !*woken {
+                match next {
+                    Some(ends) => {
+                        let deadline = Deadline::Mono(MonoTime::from_nanos(ends));
+                        if clock
+                            .wait_until(&self.wake, &mut woken, deadline)
+                            .timed_out()
+                        {
+                            break;
+                        }
+                    }
+                    None => clock.wait(&self.wake, &mut woken),
+                }
+            }
+            *woken = false;
+        }
+    }
 }
 
 /// The status of the file `fd`.
@@ -2020,6 +2321,88 @@ mod tests {
         }
     }
 
+    /// The uses ([`Region::users`]) and the kept imports of the region whose dma-buf is `file`.
+    fn region_of(file: &Arc<OwnedFd>) -> Option<(u64, usize)> {
+        let regions = REGIONS.lock();
+        (regions.values())
+            .find(|r| std::ptr::eq(r.file.as_ptr(), Arc::as_ptr(file)))
+            .map(|r| (r.users, r.kept.len()))
+    }
+
+    /// When the region whose dma-buf is `file` began to linger ([`Region::idle_since`]).
+    fn idle_since(file: &Arc<OwnedFd>) -> Option<u64> {
+        let regions = REGIONS.lock();
+        (regions.values())
+            .find(|r| std::ptr::eq(r.file.as_ptr(), Arc::as_ptr(file)))
+            .and_then(|r| r.idle_since)
+    }
+
+    /// A region an object was made over is kept imported on the device that made it, once
+    /// ([`keep_regions`]): its kept import lingers past its last use, which a use ends, the
+    /// region's own dma-buf answered again; the linger ends [`LINGER_NS`] after the last use, the
+    /// keep and the dma-buf with it. A region no source uses any more is not kept. Where udmabuf
+    /// does not open, or the device keeps no import of the dma-buf (NVIDIA's driver refuses one
+    /// dedicated to nothing this small), it says so and checks no more
+    #[test]
+    fn a_regions_kept_import_lingers_past_its_last_use() {
+        if !udmabuf() {
+            return;
+        }
+        let d = crate::gpu::device::tests::dev();
+        let page = vm::page_size();
+        let region = 16 * page;
+        let ram = TestRam::new(32);
+        let made = || REGIONS_MADE.load(Ordering::Relaxed);
+        let one = ram_pieces_in(ram.at, page, page, page, region).unwrap();
+        let file = Arc::clone(&one.chunks[0].file);
+        keep_regions(&d.raw, refs_of(&one));
+        if region_of(&file) != Some((1, 1)) {
+            eprintln!(
+                "skipped: {} keeps no import of a region's dma-buf ({:?})",
+                d.raw.properties().name,
+                region_of(&file)
+            );
+            return;
+        }
+        keep_regions(&d.raw, refs_of(&one));
+        assert_eq!(region_of(&file), Some((1, 1)), "kept once a device");
+        let two = ram_pieces_in(ram.at + page, page, page, page, region).unwrap();
+        assert_eq!(region_of(&file), Some((2, 1)));
+        drop((one, two));
+        assert_eq!(region_of(&file), Some((0, 1)), "kept past its last use");
+        let since = idle_since(&file).expect("lingering");
+        let (gone, next) = lingered(since);
+        assert!(gone.is_empty(), "lingering still");
+        assert_eq!(next, Some(since + LINGER_NS));
+        let before = made();
+        let three = ram_pieces_in(ram.at + 2 * page, page, page, page, region).unwrap();
+        assert!(
+            Arc::ptr_eq(&three.chunks[0].file, &file),
+            "its own dma-buf again"
+        );
+        assert_eq!(made(), before, "none made");
+        assert_eq!((region_of(&file), idle_since(&file)), (Some((1, 1)), None));
+        drop(three);
+        let since = idle_since(&file).expect("lingering again");
+        let (gone, next) = lingered(since + LINGER_NS);
+        assert_eq!((gone.len(), next), (1, None), "its linger ended");
+        drop(gone);
+        let held = Arc::downgrade(&file);
+        drop(file);
+        assert!(held.upgrade().is_none(), "the dma-buf went with its keep");
+        // A region whose last use went before the object's making returned is not kept.
+        let four = ram_pieces_in(ram.at + 17 * page, page, page, page, region).unwrap();
+        let (file, refs) = (Arc::clone(&four.chunks[0].file), refs_of(&four));
+        drop(four);
+        keep_regions(&d.raw, refs);
+        assert_eq!(region_of(&file), Some((0, 0)), "not kept");
+    }
+
+    /// The regions `pieces` lie in, weakly ([`RegionUse::region`]).
+    fn refs_of(pieces: &RegionPieces) -> Vec<RegionRef> {
+        pieces.uses.iter().map(RegionUse::region).collect()
+    }
+
     /// Two requests in one region of the guest's RAM are pieces of one file, at their pages'
     /// offsets in the region, which show those pages; one in another region is a piece of another
     /// file; the region's file is made once while a piece of it is held, and made again once the
@@ -2037,24 +2420,41 @@ mod tests {
         let before = made();
         let one = ram_pieces_in(ram.at + 2 * page, 3 * page, 3 * page, page, region).unwrap();
         let two = ram_pieces_in(ram.at + 9 * page, page, page, page, region).unwrap();
-        assert_eq!((one.len(), two.len()), (1, 1));
-        assert!(Arc::ptr_eq(&one[0].file, &two[0].file), "one file");
-        assert_eq!((one[0].offset, one[0].length), (2 * page, 3 * page));
-        assert_eq!((two[0].offset, two[0].length), (9 * page, page));
+        assert_eq!((one.chunks.len(), two.chunks.len()), (1, 1));
+        assert!(
+            Arc::ptr_eq(&one.chunks[0].file, &two.chunks[0].file),
+            "one file"
+        );
+        assert_eq!(
+            (one.chunks[0].offset, one.chunks[0].length),
+            (2 * page, 3 * page)
+        );
+        assert_eq!(
+            (two.chunks[0].offset, two.chunks[0].length),
+            (9 * page, page)
+        );
         assert_eq!(made() - before, 1, "made once");
         assert_eq!(
-            read_file(&one[0].file, 2 * page),
+            region_of(&one.chunks[0].file),
+            Some((2, 0)),
+            "a use of it each answer, kept nowhere"
+        );
+        assert_eq!(
+            read_file(&one.chunks[0].file, 2 * page),
             2,
             "the region's own pages"
         );
-        assert_eq!(read_file(&one[0].file, 9 * page), 9);
+        assert_eq!(read_file(&one.chunks[0].file, 9 * page), 9);
         let other = ram_pieces_in(ram.at + 17 * page, page, page, page, region).unwrap();
-        assert!(!Arc::ptr_eq(&one[0].file, &other[0].file), "another region");
-        assert_eq!(other[0].offset, page);
-        assert_eq!(read_file(&other[0].file, page), 17);
+        assert!(
+            !Arc::ptr_eq(&one.chunks[0].file, &other.chunks[0].file),
+            "another region"
+        );
+        assert_eq!(other.chunks[0].offset, page);
+        assert_eq!(read_file(&other.chunks[0].file, page), 17);
         assert_eq!(made() - before, 2);
         // The first region's pieces let go of: its file goes, and the next request makes it again.
-        let held = Arc::downgrade(&one[0].file);
+        let held = Arc::downgrade(&one.chunks[0].file);
         drop((one, two));
         assert!(
             held.upgrade().is_none(),
@@ -2062,7 +2462,7 @@ mod tests {
         );
         let again = ram_pieces_in(ram.at + 4 * page, page, page, page, region).unwrap();
         assert_eq!(made() - before, 3, "made again");
-        assert_eq!(read_file(&again[0].file, 4 * page), 4);
+        assert_eq!(read_file(&again.chunks[0].file, 4 * page), 4);
         drop((again, other));
     }
 
@@ -2080,11 +2480,21 @@ mod tests {
         let ram = TestRam::new(64);
         let across = ram_pieces_in(ram.at + 12 * page, 8 * page, 4 * page, 4 * page, region);
         let across = across.expect("a piece of each region");
-        assert_eq!(across.len(), 2);
-        assert_eq!((across[0].offset, across[0].length), (12 * page, 4 * page));
-        assert_eq!((across[1].offset, across[1].length), (0, 4 * page));
-        assert!(!Arc::ptr_eq(&across[0].file, &across[1].file));
-        assert_eq!(read_file(&across[1].file, 3 * page), 19);
+        assert_eq!(
+            (across.chunks.len(), across.uses.len()),
+            (2, 2),
+            "a use of each"
+        );
+        assert_eq!(
+            (across.chunks[0].offset, across.chunks[0].length),
+            (12 * page, 4 * page)
+        );
+        assert_eq!(
+            (across.chunks[1].offset, across.chunks[1].length),
+            (0, 4 * page)
+        );
+        assert!(!Arc::ptr_eq(&across.chunks[0].file, &across.chunks[1].file));
+        assert_eq!(read_file(&across.chunks[1].file, 3 * page), 19);
         assert!(
             ram_pieces_in(ram.at + 12 * page, 8 * page, 8 * page, page, region).is_none(),
             "one chunk alone"
@@ -2105,10 +2515,10 @@ mod tests {
         // The file's last region is cut at its end: 24 pages in regions of 16.
         let short = TestRam::new(24);
         let tail = ram_pieces_in(short.at + 18 * page, 2 * page, 2 * page, page, region).unwrap();
-        assert_eq!(tail[0].offset, 2 * page);
+        assert_eq!(tail.chunks[0].offset, 2 * page);
         // SAFETY: a dma-buf answers `SEEK_END` with its size.
-        let bytes = unsafe { libc::lseek(tail[0].file.as_raw_fd(), 0, libc::SEEK_END) };
+        let bytes = unsafe { libc::lseek(tail.chunks[0].file.as_raw_fd(), 0, libc::SEEK_END) };
         assert_eq!(u64::try_from(bytes).unwrap(), 8 * page);
-        assert_eq!(read_file(&tail[0].file, 3 * page), 19);
+        assert_eq!(read_file(&tail.chunks[0].file, 3 * page), 19);
     }
 }

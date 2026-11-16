@@ -18,8 +18,9 @@
 //! heap's request over a view in a group dma-buf is answered with the view's piece of the group's
 //! file (`super::dma_buf`'s module docs, "Groups"), where that piece's offset is a multiple of the
 //! alignment the request asks; one over the guest's RAM with pieces of the RAM's region dma-bufs,
-//! where they fit the request ("Regions"); a texture's and any other request with a dma-buf of
-//! its own, as before.
+//! where they fit the request ("Regions"), each region's import then kept on the device that made
+//! the object ([`ImportMade::made`], "Kept imports"); a texture's and any other request with a
+//! dma-buf of its own, as before.
 //!
 //! And every import carries the views' gate ([`import_gate`]), which the runtime asks before it
 //! imports a no-copy buffer's or heap's pages, or a buffer's new pages, by their pointer: where
@@ -165,12 +166,17 @@ impl Drop for Pinned {
 pub(crate) struct ImportMade(Option<(u64, u64)>);
 
 impl ImportMade {
-    /// The runtime's call that imports the pages on `device` returned: where the device keeps an
-    /// import of a pointer it made until it frees it, rather than releasing it while idle and
+    /// The runtime's call that imports the pages on `device` returned: the regions of the guest's
+    /// RAM the import's source answered with on this thread are kept on the device
+    /// (`super::dma_buf::keep_regions`); and where the device keeps an import of a pointer it made
+    /// until it frees it, rather than releasing it while idle and
     /// importing the pointer again at the next use (`rt::Device::releases_idle_pointer_imports`,
     /// which answers `false` for an import made before its check answered), the import is made,
     /// and its pages may be folded.
     pub(crate) fn made(self, device: &rt::Device) {
+        // The regions of the guest's RAM the import's source answered with, kept on the device
+        // (`super::dma_buf`'s module docs, "Kept imports").
+        super::dma_buf::keep_regions(device, ANSWERED_REGIONS.take());
         let Some(key) = self.0 else {
             return;
         };
@@ -1156,13 +1162,16 @@ unsafe fn host_memory_noting(
     at: NonNull<u8>,
     asked: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> rt::HostMemory {
-    // An earlier import's refusal is not this one's.
+    // An earlier import's refusal, and the regions its source answered with, are not this one's.
     REFUSAL.with_borrow_mut(|kept| *kept = None);
-    // The region dma-bufs the source answered with, held while the runtime keeps the source (with
-    // the imports it made of them): the runtime takes a chunk at offset 0 whose `Arc` it alone holds
-    // once the source returns as a dma-buf of its own, and a region's file, which the table of
-    // regions holds weakly, would be that at its first piece from its first page.
-    let answered: Mutex<Vec<Arc<std::os::fd::OwnedFd>>> = Mutex::new(Vec::new());
+    ANSWERED_REGIONS.with_borrow_mut(Vec::clear);
+    // A use of each region of the guest's RAM the source answered with, held while the runtime
+    // keeps the source (with the imports it made of them), so the region is in use while an
+    // object over a piece of it lives (`super::dma_buf::RegionUse`); and its dma-buf held: the
+    // runtime takes a chunk at offset 0 whose `Arc` it alone holds once the source returns as a
+    // dma-buf of its own, and a region's file, which the table of regions holds weakly, would be
+    // that at its first piece from its first page.
+    let regions: Mutex<Vec<super::dma_buf::RegionUse>> = Mutex::new(Vec::new());
     // The source's number in the trace's `dmabufsrc` (below): a diagnostic.
     static SOURCES: AtomicU64 = AtomicU64::new(0);
     let number = SOURCES.fetch_add(1, Ordering::Relaxed);
@@ -1193,16 +1202,20 @@ unsafe fn host_memory_noting(
                 log::debug!(
                     "{length:#x} bytes at {first:#x} as {} pieces of the guest RAM's region \
                      dma-bufs",
-                    pieces.len()
+                    pieces.chunks.len()
                 );
-                let mut held = answered.lock();
-                for piece in &pieces {
-                    if !held.iter().any(|f| Arc::ptr_eq(f, &piece.file)) {
-                        held.push(Arc::clone(&piece.file));
+                ANSWERED_REGIONS.with_borrow_mut(|answered| {
+                    answered.extend(pieces.uses.iter().map(super::dma_buf::RegionUse::region));
+                });
+                // One use of each region a source: one asked again (a recovery's) holds it once.
+                let mut held = regions.lock();
+                for used in pieces.uses {
+                    if !held.iter().any(|h| h.same(&used)) {
+                        held.push(used);
                     }
                 }
                 drop(held);
-                return Ok(pieces);
+                return Ok(pieces.chunks);
             }
         }
         // A whole view's pages, where it is mapped through one dma-buf kept for its imports: a
@@ -1486,6 +1499,11 @@ impl Kept {
 thread_local! {
     /// The last refusal of a dma-buf source on this thread ([`host_memory`]).
     static REFUSAL: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The regions of the guest's RAM the source of this thread's last import answered with
+    /// ([`host_memory`]), weakly, which [`ImportMade::made`] keeps on the device that made the
+    /// object (`super::dma_buf::keep_regions`).
+    static ANSWERED_REGIONS: RefCell<Vec<super::dma_buf::RegionRef>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Why this thread's last dma-buf source made none, taken, for the death of an import the runtime
@@ -3142,8 +3160,9 @@ mod tests {
     /// buffers over the guest's RAM in one region of its file are imported as pieces of the
     /// region's dma-buf (`super::dma_buf`'s module docs, "Regions"): the device imports the file
     /// at the first piece and the other joins that import; the GPU reads each buffer's own pages
-    /// and its fill reaches them; once the buffers go, so does the file's import. Elsewhere, said
-    /// on stderr, nothing is checked.
+    /// and its fill reaches them; the device keeps the import ("Kept imports"), so once the
+    /// buffers go it stays, and a buffer made after them joins it; once its linger ends, the
+    /// file's import goes. Elsewhere, said on stderr, nothing is checked.
     #[test]
     fn buffers_over_the_guests_ram_are_pieces_of_its_region() {
         let d = crate::gpu::device::tests::dev();
@@ -3220,12 +3239,36 @@ mod tests {
             (1, 1, before.dma_buf_shared_imports_live + 1),
             "the region's file imported once, the other piece joining it"
         );
+        assert_eq!(
+            after.dma_buf_shared_imports_kept,
+            before.dma_buf_shared_imports_kept + 1,
+            "the region's import kept on the device"
+        );
         let wait = std::time::Duration::from_secs(10);
         for (buffer, gone) in buffers {
             drop(buffer);
             assert_eq!(gone.recv_timeout(wait), Ok(()), "the deallocator ran");
         }
         let live = || d.raw.work_counts().dma_buf_shared_imports_live;
+        assert_eq!(
+            live(),
+            before.dma_buf_shared_imports_live + 1,
+            "the kept import stays past its buffers"
+        );
+        let joined = d.raw.work_counts();
+        let (buffer, gone) = no_copy(&d, HostAddr::from_addr((at + (2 << 20)).to_usize()), pages);
+        let later = d.raw.work_counts();
+        assert_eq!(
+            (
+                later.dma_buf_imports - joined.dma_buf_imports,
+                later.dma_buf_pieces_joined - joined.dma_buf_pieces_joined,
+            ),
+            (0, 1),
+            "a buffer after them joins the kept import"
+        );
+        drop(buffer);
+        assert_eq!(gone.recv_timeout(wait), Ok(()), "the deallocator ran");
+        super::super::dma_buf::end_lingers();
         for _ in 0..wait.as_millis() {
             if live() == before.dma_buf_shared_imports_live {
                 break;
@@ -3235,8 +3278,113 @@ mod tests {
         assert_eq!(
             live(),
             before.dma_buf_shared_imports_live,
-            "the file's import freed"
+            "the file's import freed as its linger ended"
         );
+        drop(lease);
+        let unmapped =
+            crate::remap::wait_unimported(NonNull::new(start.cast::<u8>()).unwrap(), length, wait);
+        assert!(unmapped, "the RAM's imports went");
+        // SAFETY: the mapping made above, which nothing imports any more.
+        assert_eq!(unsafe { libc::munmap(start, length.to_usize()) }, 0);
+    }
+
+    /// A no-copy buffer over the guest's RAM whose region the device keeps imported
+    /// (`super::dma_buf`'s module docs, "Kept imports") goes on through the device's recovery as
+    /// the same buffer: at the same GPU address, its GPU reading its pages and its fill reaching
+    /// them on the new `VkDevice`; a buffer made in the region after the recovery joins the
+    /// region's import there; once both go and the linger ends, no import of the file is left.
+    /// A device of its own, as the recovery moves every user of the device. Elsewhere (no view
+    /// through its dma-bufs, or udmabuf does not open), said on stderr, nothing is checked
+    #[test]
+    fn a_kept_region_goes_on_through_the_devices_recovery() {
+        let d = crate::gpu::device::adopt(rt::Device::system_default().expect("a runtime device"));
+        crate::gpu::device::tests::settle_device_checks(&d);
+        probes_gone();
+        if !groups_views() {
+            eprintln!(
+                "skipped: {} takes no view through its dma-bufs here, or udmabuf does not open",
+                d.raw.properties().name
+            );
+            return;
+        }
+        let length: u64 = 4 << 20;
+        let file = vm::memfd(length).unwrap();
+        // SAFETY: a fresh shared mapping of the file, which the test unmaps after the lease and
+        // every buffer over it.
+        let start = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length.to_usize(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                std::os::fd::AsRawFd::as_raw_fd(&*file),
+                0,
+            )
+        };
+        assert_ne!(start, libc::MAP_FAILED);
+        let at = start.addr().to_u64();
+        let lease = super::super::lease_guest_memory([crate::os::GuestRamFile {
+            host: at,
+            guest: 0,
+            length,
+            file,
+            offset: 0,
+        }]);
+        let pages = 16;
+        let counts = || d.raw.work_counts();
+        let live = || counts().dma_buf_shared_imports_live;
+        let base = live();
+        let check = FoldCheck {
+            own: at,
+            view: at,
+            pages,
+            round: 0,
+        };
+        check.write();
+        let (buffer, gone) = no_copy(&d, HostAddr::from_addr(at.to_usize()), pages);
+        let kept = counts().dma_buf_shared_imports_kept;
+        assert!(kept > 0, "the region's import kept");
+        let address = buffer.raw.gpu_address();
+        d.raw.recover_for_test().expect("the recovery");
+        assert_eq!(buffer.raw.gpu_address(), address, "the same GPU address");
+        let (_out, copied) = check.run(&d.raw, &buffer.raw, true).unwrap();
+        for i in 0..pages {
+            assert_eq!(
+                FoldCheck::ends(copied, i),
+                [check.written(i); 2],
+                "the buffer read its own pages on the new device"
+            );
+            let now = match i < pages / 2 {
+                true => FoldCheck::FILL,
+                false => check.written(i),
+            };
+            assert_eq!(FoldCheck::ends(at, i), [now; 2], "its fill reached them");
+        }
+        let before = counts();
+        let (later, later_gone) =
+            no_copy(&d, HostAddr::from_addr((at + (1 << 20)).to_usize()), pages);
+        let after = counts();
+        assert_eq!(
+            (
+                after.dma_buf_imports - before.dma_buf_imports,
+                after.dma_buf_pieces_joined - before.dma_buf_pieces_joined,
+            ),
+            (0, 1),
+            "a buffer after the recovery joins the region's import"
+        );
+        let wait = std::time::Duration::from_secs(10);
+        for (buffer, gone) in [(buffer, gone), (later, later_gone)] {
+            drop(buffer);
+            assert_eq!(gone.recv_timeout(wait), Ok(()), "the deallocator ran");
+        }
+        super::super::dma_buf::end_lingers();
+        for _ in 0..wait.as_millis() {
+            if live() == base {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(live(), base, "no import of the file left");
         drop(lease);
         let unmapped =
             crate::remap::wait_unimported(NonNull::new(start.cast::<u8>()).unwrap(), length, wait);

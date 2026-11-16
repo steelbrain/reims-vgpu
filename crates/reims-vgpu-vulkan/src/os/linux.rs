@@ -33,7 +33,7 @@ pub use vm::{LinuxVm, RegionMemory};
 
 pub(crate) use dma_buf::{
     fits_one as one_dma_buf_fits, fits_one_of as one_dma_buf_of_fits,
-    fits_pieces as one_dma_buf_of_pieces_fits,
+    fits_pieces as one_dma_buf_of_pieces_fits, take_region_keeps,
 };
 #[cfg(test)]
 pub(crate) use host_ram::ram_has_sources;

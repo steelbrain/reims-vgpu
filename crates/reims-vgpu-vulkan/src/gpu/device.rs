@@ -208,6 +208,14 @@ fn compile_error(
 /// a device adopted after it is a new runtime device.
 static DEVICES: Mutex<Vec<(u64, VulkanDevice)>> = Mutex::new(Vec::new());
 
+/// Whether `raw` is a device the process adopted ([`DEVICES`]), which the platform's let-go of its
+/// devices takes ([`crate::let_go`]), with what the platform keeps of it.
+#[cfg(target_os = "linux")]
+pub(crate) fn adopted(raw: &rt::Device) -> bool {
+    let id = registry_id(raw);
+    DEVICES.lock().iter().any(|(at, _)| *at == id)
+}
+
 /// The runtime device of the first device the process adopted, if it adopted one.
 pub(crate) fn first_adopted() -> Option<rt::Device> {
     let devices = DEVICES.lock();
