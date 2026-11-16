@@ -22,7 +22,8 @@
 //! - what a window decides, with no AppKit in it, each unit-tested: [`geometry`] (the image's
 //!   rectangle and the pointer's position in it), [`keymap`] (macOS key codes to USB usages),
 //!   [`keys`] (modifiers and the keys held down), [`capture`] (who gets the keyboard, and where
-//!   the pointer may go), [`scroll`] (wheel and trackpad deltas to notches or smooth scrolling)
+//!   the pointer may go), [`beyond`] (a captured pointer past the image's edge, onto the guest's
+//!   other displays), [`scroll`] (wheel and trackpad deltas to notches or smooth scrolling)
 //!   and [`env`](mod@env) (the `REIMS_VGPU_WINDOW_*` variables);
 //! - the host's screens ([`screens`]), as the OS lists them;
 //! - the window itself: [`handle`] (the [`Window`] the display holds), and its OS side
@@ -42,6 +43,7 @@
 //!   cursor, and AppKit's application, render thread, input and hot keys, with its own side in
 //!   `native/macos/sdl.rs`.
 
+pub mod beyond;
 pub mod capture;
 pub mod config;
 pub mod env;
@@ -60,9 +62,9 @@ pub mod scroll;
 mod sdl;
 
 pub use config::{
-    BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,
-    MomentumPhase, PointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn, WindowCallbacks,
-    WindowConfig,
+    BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn, Landed,
+    MomentumPhase, PointerBeyond, PointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn,
+    WindowCallbacks, WindowConfig,
 };
 pub use handle::{DrawnCursor, FrameSink, Glyph, PixelRect, Window};
 pub use present::{Drawn, Presenter, VulkanTarget};

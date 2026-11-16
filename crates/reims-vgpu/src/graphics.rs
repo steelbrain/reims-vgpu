@@ -702,9 +702,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 None => (0..count).map(|_| None).collect(),
             };
             let displays = u32::try_from(count).unwrap_or(u32::MAX);
-            // Where several displays' windows tell the guest which one the pointer is over: the
-            // device's link, once it is made.
+            // Where several displays' windows tell the guest which one the pointer is over, and
+            // carry a captured pointer past their edges: the device's link, once it is made.
             let pointer = Arc::new(OnceLock::new());
+            let desktop = crate::window::Desktop::new(Arc::clone(&pointer));
+            let mut by_display = Vec::with_capacity(count);
             let mut windows = Vec::new();
             let mut screens: Vec<Box<dyn Screen>> = Vec::with_capacity(count);
             let mut reads = Vec::with_capacity(count);
@@ -715,6 +717,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                         if displays > 1 {
                             let id = u32::try_from(display).unwrap_or(u32::MAX);
                             crate::window::tell_pointer(&mut window_config, id, &pointer);
+                            desktop.give(&mut window_config, id);
                         }
                         let (link, screen) = WindowScreen::open(
                             &platform,
@@ -723,11 +726,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                             window_config,
                             display.to_u64(),
                         );
+                        by_display.push(Some(link.weak()));
                         windows.push(link);
                         let shown = Arc::clone(&screen.shown);
                         (Arc::new(screen), shown)
                     }
                     None => {
+                        by_display.push(None);
                         let shown = Arc::new(Shown::default());
                         let screen = HeadlessScreen {
                             shown: Arc::clone(&shown),
@@ -755,6 +760,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             drop(first_shown);
             let device = reims_vgpu_graphics::Device::with_screens(region, host, screens)
                 .ok_or(Error::HostResources)?;
+            desktop.set_windows(by_display);
             let _ = pointer.set(device.pointer_link());
             LIVE.fetch_add(1, Ordering::SeqCst);
             Ok(GraphicsDevice {

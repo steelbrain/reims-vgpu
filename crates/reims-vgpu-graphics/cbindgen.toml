@@ -122,6 +122,7 @@ include = [
     "RgfxContextClose",
     "RgfxDepthStencilCreate",
     "RgfxDeviceInfo",
+    "RgfxDisplayBounds",
     "RgfxDisplayChanged",
     "RgfxDisplayColor",
     "RgfxDisplayEntry",

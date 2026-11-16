@@ -57,6 +57,7 @@ typedef graft_iomfb_word RgfxIOMFBWord;
 
 #include "RgfxBootConsole.hpp"
 #include "RgfxDeferredAnswers.hpp"
+#include "RgfxDisplayBounds.hpp"
 #include "RgfxDisplayModes.hpp"
 #include "RgfxDisplayTable.hpp"
 #include "RgfxPipeClients.hpp"
@@ -726,6 +727,15 @@ private:
 	void freePointer();
 	void pointerOver(const volatile UInt8 *payload, UInt32 size);
 	static void movePointer(thread_call_param_t self, thread_call_param_t);
+
+	// Each display's rectangle in the global space, told the host (DISPLAY_BOUNDS,
+	// RgfxDisplayBounds.hpp), display 0's alone: whether the host took DISPLAY_BOUNDS with
+	// POINTER_OVER and MULTI_DISPLAY, set at the start's features, and the rectangles it was
+	// told, under interruptLock, forgotten at each start. tellBounds, from any display's move of
+	// the cursor, posts each driven display's that changed. Never blocks.
+	bool displayBoundsTaken;
+	RgfxBoundsTold boundsTold;
+	void tellBounds();
 #endif
 
 #if defined(__arm64e__)

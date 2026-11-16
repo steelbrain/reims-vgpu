@@ -12,8 +12,10 @@
 //! the host's), the screen saver allowed (the windows keep the host from sleeping no more than
 //! any other window), `reims-vgpu` the windows' application ID (the task bar's entry on Wayland;
 //! SDL 3.4.18's Windows driver does not read it),
-//! cursors given for the screen's scale ([`crate::sdl::cursor`]), and no quit event when the last
-//! window closes, as the windows' end is the display's.
+//! cursors given for the screen's scale ([`crate::sdl::cursor`]), no quit event when the last
+//! window closes, as the windows' end is the display's, and the locked pointer's motion as the
+//! compositor or window system accelerates it, so a captured pointer gone past the image's edge
+//! (`crate::beyond`) moves on as fast as it moved over the image.
 //!
 //! Where SDL's video does not start (no Wayland compositor and no X server to reach on Linux), the
 //! reason is logged once, no window opens, the work posted is dropped, and the host's screens are
@@ -150,13 +152,14 @@ pub(crate) fn screens() -> Vec<HostScreen> {
 
 /// Sets SDL's settings (the module doc).
 fn set_hints() {
-    let hints: [(&CStr, &CStr); 6] = [
+    let hints: [(&CStr, &CStr); 7] = [
         (c"SDL_NO_SIGNAL_HANDLERS", c"1"),
         (c"SDL_VIDEO_ALLOW_SCREENSAVER", c"1"),
         (c"SDL_APP_ID", c"reims-vgpu"),
         (c"SDL_MOUSE_DPI_SCALE_CURSORS", c"1"),
         (c"SDL_QUIT_ON_LAST_WINDOW_CLOSE", c"0"),
         (c"SDL_MOUSE_FOCUS_CLICKTHROUGH", c"1"),
+        (c"SDL_MOUSE_RELATIVE_SYSTEM_SCALE", c"1"),
     ];
     for (name, value) in hints {
         // SAFETY: both are NUL-terminated strings SDL copies.

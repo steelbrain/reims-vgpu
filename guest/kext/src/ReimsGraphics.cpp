@@ -1596,6 +1596,10 @@ bool ReimsGraphics::start(IOService *provider)
 	displayPowerTaken = false;
 	pipelineAnswersTaken = false;
 	multiDisplayTaken = false;
+#if defined(__x86_64__)
+	displayBoundsTaken = false;
+	boundsTold = {};
+#endif
 	displayCount = 0;
 	refreshes = {};
 	wranglerNotifier = nullptr;
@@ -1761,6 +1765,11 @@ bool ReimsGraphics::start(IOService *provider)
 		    (took & (RGFX_FEATURE_PIPELINE_KEYS | RGFX_FEATURE_PIPELINE_ANSWERS)) ==
 		    (RGFX_FEATURE_PIPELINE_KEYS | RGFX_FEATURE_PIPELINE_ANSWERS);
 		multiDisplayTaken = (took & RGFX_FEATURE_MULTI_DISPLAY) != 0;
+#if defined(__x86_64__)
+		constexpr uint64_t kCarriesPast = RGFX_FEATURE_MULTI_DISPLAY | RGFX_FEATURE_POINTER_OVER |
+		                                  RGFX_FEATURE_DISPLAY_BOUNDS;
+		displayBoundsTaken = (took & kCarriesPast) == kCarriesPast;
+#endif
 	}
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
 	consumed = load64(ring(RGFX_CONTROL_COMPLETE_OFFSET) + kRingConsumer);
@@ -2873,7 +2882,8 @@ IOReturn ReimsGraphics::setCursorImage(void *cursorImage)
 }
 
 // IOFramebuffer gives the image's top-left corner; MOVE_CURSOR takes the
-// hotspot's place. Never blocks.
+// hotspot's place. On x86-64, the displays' rectangles that changed follow it
+// (tellBounds). Never blocks.
 IOReturn ReimsGraphics::setCursorState(SInt32 x, SInt32 y, bool visible)
 {
 	RgfxMoveCursor m = {};
@@ -2881,7 +2891,11 @@ IOReturn ReimsGraphics::setCursorState(SInt32 x, SInt32 y, bool visible)
 	m.x = x + static_cast<SInt32>(hotX);
 	m.y = y + static_cast<SInt32>(hotY);
 	m.visible = visible ? 1u : 0u;
-	return tryPost(RGFX_CMD_MOVE_CURSOR, &m, sizeof(m), nullptr) ? kIOReturnSuccess : kIOReturnBusy;
+	const bool posted = tryPost(RGFX_CMD_MOVE_CURSOR, &m, sizeof(m), nullptr);
+#if defined(__x86_64__)
+	(isHead() ? device : this)->tellBounds();
+#endif
+	return posted ? kIOReturnSuccess : kIOReturnBusy;
 }
 
 // MARK: - IOFramebuffer: vblank and connect interrupts

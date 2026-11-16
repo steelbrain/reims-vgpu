@@ -30,14 +30,27 @@
 //! - **No stuck keys**: losing the keyboard, releasing capture and closing send an up for every
 //!   key held; losing the keyboard and closing lift the buttons held too.
 //!
+//! - **Past the image's edge**, where the host gives the window the guest's other displays
+//!   ([`crate::PointerBeyond`]): the captured pointer moving toward an edge another display meets,
+//!   within reach of it, goes on onto it ([`crate::beyond`]). The window locks the host's pointer
+//!   (SDL's relative mode, [`Input::take_hold`]) and hands its motion to the guest's desktop,
+//!   which sends the guest the pointer, and the buttons and their changes, on whichever display
+//!   it lands on, through that display's window; the wheel goes on where the pointer is. Back
+//!   over the window's display, out of reach of the edge, the pointer is unlocked there and is
+//!   the window's again; releasing capture, losing the keyboard and closing unlock it where it
+//!   was held.
+//!
 //! While captured, the window grabs the keyboard (`SDL_SetWindowKeyboardGrab`): on Wayland the
 //! compositor's shortcuts inhibitor, so its own shortcuts reach the guest; and SDL holds the
 //! pointer over the image ([`Input::pointer_confinement`], `crate::sdl::shell`).
 
+use std::sync::Arc;
+
+use crate::beyond::{Back, Beyond, Hold};
 use crate::capture::{Capture, UNCAPTURED_SUFFIX};
 use crate::config::{
-    BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, ScrollEvent,
-    WindowCallbacks,
+    BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, PointerBeyond,
+    ScrollEvent, WindowCallbacks,
 };
 use crate::geometry::{self, Rect};
 use crate::keys::{KeyEvent, KeyState};
@@ -133,7 +146,7 @@ fn fixed(points: f64) -> i32 {
 }
 
 /// One window's input decisions (the module doc).
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Input {
     /// The keys the guest was told are down.
     keys: KeyState,
@@ -149,12 +162,72 @@ pub(crate) struct Input {
     focused_at: Option<u64>,
     /// What to send, in order, since [`send`] last took it.
     out: Vec<ToHost>,
+    /// Where the captured pointer goes past the image's edge, where the host gives it.
+    beyond: Option<Arc<dyn PointerBeyond>>,
+    /// Whether it has gone.
+    away: Beyond,
+    /// What the window does with the host's pointer next, since [`Self::take_hold`] last took it.
+    hold: Option<Hold>,
+}
+
+impl std::fmt::Debug for Input {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Input")
+            .field("capture", &self.capture)
+            .field("buttons", &self.buttons)
+            .field("away", &self.away)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Input {
     /// Nothing held, nothing captured, no keyboard.
+    #[cfg(test)]
     pub(crate) fn new() -> Input {
         Input::default()
+    }
+
+    /// [`Self::new`], its captured pointer going past the image's edge through `beyond`, where
+    /// the host gives it.
+    pub(crate) fn with_beyond(beyond: Option<Arc<dyn PointerBeyond>>) -> Input {
+        Input {
+            beyond,
+            ..Input::default()
+        }
+    }
+
+    /// Whether the captured pointer has gone past the image's edge: SDL reports its moves as
+    /// motion alone ([`Self::moved_by`]).
+    pub(crate) fn is_away(&self) -> bool {
+        self.away.is_away()
+    }
+
+    /// What the window does with the host's pointer next, taken: lock it as it goes past the
+    /// edge, or let it go where it comes back.
+    pub(crate) fn take_hold(&mut self) -> Option<Hold> {
+        self.hold.take()
+    }
+
+    /// The window could not lock the host's pointer: the pointer is the window's again, where it
+    /// was held.
+    pub(crate) fn lock_refused(&mut self) {
+        let beyond = self.beyond.clone();
+        if let Some(back) = self.away.let_go(beyond.as_deref()) {
+            self.came_back(back);
+        }
+    }
+
+    /// The pointer came back to the window at `back`: the host's pointer is let go there, and the
+    /// guest pixel is the last sent.
+    fn came_back(&mut self, back: Back) {
+        self.hold = Some(Hold::Unlock(back.point));
+        if let Some(ToHost::Pointer { mode, .. }) = self.last {
+            self.last = Some(ToHost::Pointer {
+                at: back.at,
+                mode,
+                buttons: self.buttons,
+            });
+        }
     }
 
     /// Whether input, the keyboard and the pointer, is captured.
@@ -196,15 +269,69 @@ impl Input {
         }
     }
 
-    /// The pointer moved.
+    /// The pointer moved. Captured, moving toward an edge another display meets and within reach
+    /// of it, it goes past it ([`crate::beyond`]). A place SDL reports while the pointer is away
+    /// is SDL's own (the lock's warp): the pointer's moves are [`Self::moved_by`]'s.
     pub(crate) fn moved(&mut self, at: &At) {
+        if self.away.is_away() {
+            return;
+        }
         if let (Some(point), Some(mode)) = (at.point, guest_mode(at)) {
+            let from = match self.last {
+                Some(ToHost::Pointer { at, .. }) => Some(at),
+                _ => None,
+            };
+            if self.capture.is_captured()
+                && let Some(beyond) = self.beyond.clone()
+                && let Some(hold) =
+                    self.away
+                        .reached(beyond.as_ref(), point, at.image, mode, self.buttons, from)
+            {
+                self.hold = Some(hold);
+                return;
+            }
             self.pointer(point, at.image, mode, false);
+        }
+    }
+
+    /// The pointer gone past the edge moved by `by`, in the window's points (SDL's relative
+    /// motion): it goes on, and comes back where it lands on the window's display, away from the
+    /// edge.
+    pub(crate) fn moved_by(&mut self, by: (f64, f64), at: &At) {
+        let Some(beyond) = self.beyond.clone() else {
+            return;
+        };
+        if let Some(back) = self.away.moved(beyond.as_ref(), by, at.image, self.buttons) {
+            self.came_back(back);
+        }
+    }
+
+    /// The buttons changed while away: the guest's desktop sends them where the pointer is.
+    fn away_buttons(&mut self) {
+        if let Some(beyond) = self.beyond.clone() {
+            self.away.buttons(beyond.as_ref(), self.buttons);
+        }
+    }
+
+    /// Lets go of the pointer gone past the edge, where it is: it is the window's again, where it
+    /// was held.
+    fn let_go_away(&mut self) {
+        let beyond = self.beyond.clone();
+        if let Some(back) = self.away.let_go(beyond.as_deref()) {
+            self.came_back(back);
         }
     }
 
     /// Button `bit` went down at `timestamp` (SDL's event clock).
     pub(crate) fn button_down(&mut self, bit: u32, timestamp: u64, at: &At) -> Reaction {
+        if self.away.is_away() {
+            // Captured: the button goes where the pointer is.
+            if bit != 0 {
+                self.buttons |= bit;
+                self.away_buttons();
+            }
+            return Reaction::default();
+        }
         let (Some(point), Some(mode)) = (at.point, guest_mode(at)) else {
             return Reaction::default();
         };
@@ -236,6 +363,10 @@ impl Input {
             return;
         }
         self.buttons &= !bit;
+        if self.away.is_away() {
+            self.away_buttons();
+            return;
+        }
         if let (Some(point), Some(mode)) = (at.point, guest_mode(at)) {
             self.pointer(point, at.image, mode, true);
         }
@@ -246,10 +377,12 @@ impl Input {
         let (Some(point), Some(_)) = (at.point, guest_mode(at)) else {
             return;
         };
-        if !geometry::contains(at.image, point) {
-            return;
+        if !self.away.is_away() {
+            if !geometry::contains(at.image, point) {
+                return;
+            }
+            self.moved(at);
         }
-        self.moved(at);
         let sign = if wheel.flipped { -1 } else { 1 };
         let notches = (
             wheel.notches.1.saturating_mul(sign),
@@ -297,6 +430,7 @@ impl Input {
         self.focused = false;
         self.lift_keys();
         self.lift_buttons();
+        self.let_go_away();
         Reaction {
             capture_changed: self.capture.resign_key(),
         }
@@ -305,6 +439,7 @@ impl Input {
     /// Releases capture, lifting every key held.
     pub(crate) fn release_capture(&mut self) -> Reaction {
         self.lift_keys();
+        self.let_go_away();
         Reaction {
             capture_changed: self.capture.release(),
         }
@@ -314,6 +449,7 @@ impl Input {
     pub(crate) fn closing(&mut self) {
         self.lift_keys();
         self.lift_buttons();
+        self.let_go_away();
         self.capture.release();
     }
 
@@ -329,6 +465,10 @@ impl Input {
             return;
         }
         self.buttons = 0;
+        if self.away.is_away() {
+            self.away_buttons();
+            return;
+        }
         if let Some(ToHost::Pointer { at, mode, .. }) = self.last {
             let event = ToHost::Pointer {
                 at,
@@ -374,6 +514,8 @@ pub(crate) fn send(callbacks: &WindowCallbacks, event: ToHost) {
 
 #[cfg(test)]
 mod tests {
+    use reims_vgpu_vulkan::core::sync::Mutex;
+
     use super::*;
 
     /// A 100×50 image at the window's origin, a 200×100 guest mode, the pointer at `point`.
@@ -581,6 +723,169 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A guest desktop of display 0 (the window's, 200 x 100) and display 1 right of it, in the
+    /// same mode, recording what it is told.
+    #[derive(Default)]
+    struct RightOfIt {
+        /// The pointer's column across both, and its row, while away.
+        at: Mutex<Option<(f64, f64)>>,
+        /// What it was told.
+        told: Mutex<Vec<String>>,
+    }
+
+    impl RightOfIt {
+        fn told(&self) -> Vec<String> {
+            std::mem::take(&mut *self.told.lock())
+        }
+    }
+
+    impl PointerBeyond for RightOfIt {
+        fn adjoins(&self, _at: (u16, u16), _mode: (u16, u16), outward: (i8, i8)) -> bool {
+            outward == (1, 0)
+        }
+
+        fn leave(&self, at: (u16, u16), _mode: (u16, u16)) -> bool {
+            *self.at.lock() = Some((f64::from(at.0) + 0.5, f64::from(at.1) + 0.5));
+            true
+        }
+
+        fn moved(&self, by: (f64, f64), buttons: u32) -> crate::config::Landed {
+            let mut at = self.at.lock();
+            let Some(point) = at.as_mut() else {
+                return crate::config::Landed::Lost;
+            };
+            *point = (point.0 + by.0, point.1 + by.1);
+            let (x, y) = (point.0.floor() as u16, point.1.floor() as u16);
+            if x < 200 {
+                self.told.lock().push(format!("0 {x},{y} {buttons}"));
+                crate::config::Landed::Here {
+                    at: (x, y),
+                    mode: (200, 100),
+                }
+            } else {
+                self.told
+                    .lock()
+                    .push(format!("1 {},{y} {buttons}", x - 200));
+                crate::config::Landed::Elsewhere
+            }
+        }
+
+        fn come_back(&self) {
+            self.told.lock().push("back".into());
+        }
+    }
+
+    /// A captured input with `desktop` beyond its image's edges.
+    fn captured_beside(desktop: &Arc<RightOfIt>) -> Input {
+        let beyond: Arc<dyn PointerBeyond> = desktop.clone();
+        let mut input = Input::with_beyond(Some(beyond));
+        input.focus_gained(0);
+        input.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
+        input.button_up(BUTTON_LEFT, &at((10.0, 10.0)));
+        input.take();
+        input
+    }
+
+    /// Captured, the pointer moving toward the image's edge where the guest's desktop puts another
+    /// display, within reach of it, goes past it, the host's pointer locked: its motion, a drag's
+    /// button and its release go to the desktop, keys and the wheel to the host as ever, and back
+    /// over the window's display, out of reach of the edge, it is the window's again, let go
+    /// where it is
+    #[test]
+    fn the_captured_pointer_at_a_shared_edge_goes_on_past_it() {
+        let desktop = Arc::new(RightOfIt::default());
+        let mut input = captured_beside(&desktop);
+        input.moved(&at((60.0, 25.0)));
+        assert_eq!(input.take_hold(), None, "out of reach of the edge");
+        input.button_down(BUTTON_LEFT, 2_000_000_000, &at((60.0, 25.0)));
+        input.moved(&at((75.0, 25.0)));
+        assert_eq!(input.take_hold(), Some(Hold::Lock));
+        assert!(input.is_away());
+        assert_eq!(
+            input.take(),
+            vec![pointer(120, 50, 0), pointer(120, 50, BUTTON_LEFT)]
+        );
+        assert_eq!(desktop.told(), ["0 150,50 1"]);
+        // SDL's motion, in points: two pixels each. A place SDL reports itself is ignored.
+        input.moved_by((30.0, 1.0), &at((75.0, 25.0)));
+        input.moved(&at((50.0, 25.0)));
+        input.key(0x04, true, false);
+        input.wheel(
+            Wheel {
+                notches: (0, 1),
+                lines: (0.0, 1.0),
+                flipped: false,
+            },
+            &at((99.9, 25.0)),
+        );
+        input.button_up(BUTTON_LEFT, &at((99.9, 25.0)));
+        assert_eq!(desktop.told(), ["1 10,52 1", "1 10,52 0"]);
+        assert_eq!(
+            input.take(),
+            vec![
+                ToHost::Key(KeyEvent::down(0x04)),
+                ToHost::Wheel {
+                    notches: (1, 0),
+                    smooth: (2560, 0)
+                },
+            ]
+        );
+        assert_eq!(input.take_hold(), None);
+        // Back across the edge, then in: the host's pointer goes where the guest's cursor is.
+        input.moved_by((-10.0, 0.0), &at((75.0, 25.0)));
+        assert_eq!(input.take_hold(), None, "within reach of the edge");
+        input.moved_by((-30.0, 0.0), &at((75.0, 25.0)));
+        assert_eq!(desktop.told(), ["0 190,52 0", "0 130,52 0", "back"]);
+        assert_eq!(input.take_hold(), Some(Hold::Unlock((65.25, 26.25))));
+        assert!(!input.is_away());
+        input.moved(&at((65.25, 26.25)));
+        assert_eq!(input.take(), vec![], "the pixel came back sent");
+        input.moved(&at((60.0, 26.25)));
+        assert_eq!(input.take(), vec![pointer(120, 52, 0)]);
+    }
+
+    /// Releasing capture, losing the keyboard or closing while away gives the window the host's
+    /// pointer where it was held, a button held lifted where the pointer is; without a desktop,
+    /// or uncaptured, the pointer holds at the image's edge as ever
+    #[test]
+    fn letting_go_while_away_gives_the_pointer_back_where_it_was_held() {
+        let desktop = Arc::new(RightOfIt::default());
+        let mut input = captured_beside(&desktop);
+        input.moved(&at((99.9, 10.0)));
+        assert_eq!(input.take_hold(), Some(Hold::Lock));
+        input.moved_by((10.0, 0.0), &at((99.9, 10.0)));
+        input.key(0xE0, true, false);
+        input.key(0xE2, true, false);
+        input.key(0xE3, true, false);
+        assert!(!input.is_captured() && !input.is_away());
+        assert_eq!(input.take_hold(), Some(Hold::Unlock((99.9, 10.0))));
+        desktop.told();
+
+        let mut input = captured_beside(&desktop);
+        input.button_down(BUTTON_LEFT, 2_000_000_000, &at((90.0, 10.0)));
+        input.moved(&at((99.9, 10.0)));
+        assert_eq!(input.take_hold(), Some(Hold::Lock));
+        input.moved_by((10.0, 0.0), &at((99.9, 10.0)));
+        desktop.told();
+        input.focus_lost();
+        assert_eq!(desktop.told(), ["1 19,20 0", "back"]);
+        assert_eq!(input.take_hold(), Some(Hold::Unlock((99.9, 10.0))));
+
+        let mut input = captured_beside(&desktop);
+        input.moved(&at((99.9, 10.0)));
+        input.closing();
+        assert_eq!(input.take_hold(), Some(Hold::Unlock((99.9, 10.0))));
+
+        let mut alone = focused();
+        alone.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
+        alone.moved(&at((99.9, 10.0)));
+        assert_eq!(alone.take_hold(), None);
+        let mut uncaptured = Input::with_beyond(Some(desktop.clone() as Arc<dyn PointerBeyond>));
+        uncaptured.moved(&at((99.9, 10.0)));
+        assert_eq!(uncaptured.take_hold(), None);
+        assert_eq!(uncaptured.take(), vec![pointer(199, 20, 0)]);
     }
 
     /// SDL's buttons to the host's bits

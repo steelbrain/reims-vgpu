@@ -41,6 +41,7 @@ use sdl3_sys::everything::*;
 use super::input::{self, At, Wheel};
 use super::keymap;
 use super::render::Target;
+use crate::beyond::Hold;
 use crate::geometry::{Insets, Rect};
 use crate::handle::Window;
 use crate::screens;
@@ -190,7 +191,9 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
     Some(Opened {
         sdl,
         asked: size,
-        input: Input(input::Input::new()),
+        input: Input(input::Input::with_beyond(
+            window.callbacks().and_then(|callbacks| callbacks.beyond),
+        )),
         state: State { display },
     })
 }
@@ -244,10 +247,17 @@ pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bo
     match kind {
         k if k == SDL_EVENT_MOUSE_MOTION.0 => {
             // SAFETY: a motion event.
-            let point = unsafe { (event.motion.x, event.motion.y) };
+            let motion = unsafe { event.motion };
+            let point = (motion.x, motion.y);
             let at = at(shell, point);
-            shell.input.0.moved(&at);
-            shell.pointer_over((f64::from(point.0), f64::from(point.1)));
+            if shell.input.0.is_away() {
+                // The pointer is locked: SDL reports its motion alone.
+                let by = (f64::from(motion.xrel), f64::from(motion.yrel));
+                shell.input.0.moved_by(by, &at);
+            } else {
+                shell.input.0.moved(&at);
+                shell.pointer_over((f64::from(point.0), f64::from(point.1)));
+            }
             false
         }
         k if k == SDL_EVENT_MOUSE_BUTTON_DOWN.0 || k == SDL_EVENT_MOUSE_BUTTON_UP.0 => {
@@ -290,6 +300,51 @@ pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bo
             })
         }
         _ => false,
+    }
+}
+
+/// Locks the host's pointer as the captured pointer goes past the image's edge, or lets it go
+/// where the pointer came back, as the input asks ([`input::Input::take_hold`]): SDL's relative
+/// mode, which on Wayland locks the pointer (pointer-constraints' lock) and reports its motion
+/// (relative-pointer), hiding it; on X11 it holds it in the window, hidden, and reports its raw
+/// motion. Letting go warps the pointer to the point first, so SDL puts it there as the lock
+/// ends (on Wayland the lock's cursor position hint, or pointer-warp). A lock SDL refuses gives
+/// the pointer back to the window, where it was held.
+pub(crate) fn apply_hold(shell: &mut Shell) {
+    let Some(hold) = shell.input.0.take_hold() else {
+        return;
+    };
+    match hold {
+        Hold::Lock => {
+            // SAFETY: the window is SDL's, on this thread.
+            let locked = unsafe { SDL_SetWindowRelativeMouseMode(shell.sdl, true) };
+            log::debug!(
+                target: "reims_vgpu_window",
+                "window {:?}: the captured pointer goes past the image's edge (locked: {locked})",
+                shell.window.title()
+            );
+            if !locked {
+                shell::refused(
+                    "no pointer lock, so the pointer stays at the image's edge",
+                    shell.window.title(),
+                );
+                shell.input.0.lock_refused();
+                apply_hold(shell);
+            }
+        }
+        Hold::Unlock(point) => {
+            // SAFETY: as above; in relative mode the warp sets where the pointer goes as it ends.
+            unsafe {
+                SDL_WarpMouseInWindow(shell.sdl, point.0 as f32, point.1 as f32);
+                SDL_SetWindowRelativeMouseMode(shell.sdl, false);
+            }
+            log::debug!(
+                target: "reims_vgpu_window",
+                "window {:?}: the pointer is back at {point:?}",
+                shell.window.title()
+            );
+            shell.refresh_cursor();
+        }
     }
 }
 

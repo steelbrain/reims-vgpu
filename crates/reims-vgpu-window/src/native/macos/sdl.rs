@@ -294,6 +294,10 @@ pub(crate) fn input_event(_shell: &mut Shell, _kind: u32, _event: &SDL_Event) ->
 /// and nothing more is grabbed.
 pub(crate) fn grab_keyboard(_shell: &Shell, _captured: bool) {}
 
+/// Nothing: AppKit's input holds the captured pointer at the image's edges, and never takes it
+/// past them (`crate::beyond` is the SDL window's on Linux and Windows).
+pub(crate) fn apply_hold(_shell: &mut Shell) {}
+
 /// Makes a windowed window not resizable while its input is captured, and resizable again when
 /// not, as AppKit's window does (`super::shell::resizable_change`): SDL's resizable flag, which
 /// SDL's Cocoa code makes the window's style. A borderless window keeps its style, which SDL would

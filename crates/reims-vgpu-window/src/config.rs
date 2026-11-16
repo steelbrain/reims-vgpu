@@ -87,6 +87,46 @@ pub type KeyFn = Arc<dyn Fn(u16, bool) + Send + Sync>;
 /// The person closed the window, or chose Quit: the host ends the VM.
 pub type CloseFn = Arc<dyn Fn() + Send + Sync>;
 
+/// Where a window's captured pointer goes past its image's edges: onto the guest's other
+/// displays, as the guest arranges them, through their own windows' pointers
+/// ([`WindowCallbacks::beyond`], [`crate::beyond`]). Its calls run on the window's UI thread, as
+/// the callbacks do.
+pub trait PointerBeyond: Send + Sync {
+    /// Whether another of the guest's displays lies past the window's display's edge toward
+    /// `outward` (across, then down: each -1, 0 or 1; both for a corner), at the row or column of
+    /// its pixel `at` of `mode`.
+    fn adjoins(&self, at: (u16, u16), mode: (u16, u16), outward: (i8, i8)) -> bool;
+    /// The captured pointer, at the window's pixel `at` of `mode`, within reach of an edge
+    /// another display meets ([`crate::beyond::REACH`]), leaves the window for the guest's
+    /// desktop, from that pixel: from now on its moves go to [`Self::moved`], until
+    /// [`Self::come_back`]. Whether it went: where not, it stays the window's.
+    fn leave(&self, at: (u16, u16), mode: (u16, u16)) -> bool;
+    /// The pointer gone past the edge moved by `by`, in pixels of the mode it left the window's
+    /// display in, with the `BUTTON_*` `buttons` held: it goes on to the guest, over whichever
+    /// display it lands on, through that display's window ([`crate::Window::pointer_from_beyond`]).
+    /// Where it landed.
+    fn moved(&self, by: (f64, f64), buttons: u32) -> Landed;
+    /// The pointer is the window's again.
+    fn come_back(&self);
+}
+
+/// Where a captured pointer gone past the image's edge landed ([`PointerBeyond::moved`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Landed {
+    /// Over the window's own display, at the pixel `at` of `mode` (the display's), sent already.
+    Here {
+        /// The pixel.
+        at: (u16, u16),
+        /// The mode it is of.
+        mode: (u16, u16),
+    },
+    /// Over another display.
+    Elsewhere,
+    /// Nowhere: the guest's desktop let it go (the guest reset its device); the window takes it
+    /// back.
+    Lost,
+}
+
 /// A window's callbacks, each on the UI thread (the module doc). `None` is a callback the host does not give:
 /// that input goes nowhere.
 #[derive(Clone, Default)]
@@ -102,6 +142,10 @@ pub struct WindowCallbacks {
     /// The wheel or a trackpad scrolled, smoothly and as notches. With it, scrolling comes here
     /// and not to `wheel`.
     pub scroll: Option<ScrollFn>,
+    /// Where the captured pointer goes past the image's edges, onto the guest's other displays.
+    /// Without it, it is held at the image's edges. Taken by the SDL window on Linux and Windows
+    /// alone: on macOS the window holds the pointer at its edges whatever this is.
+    pub beyond: Option<Arc<dyn PointerBeyond>>,
 }
 
 impl std::fmt::Debug for WindowCallbacks {
@@ -112,6 +156,7 @@ impl std::fmt::Debug for WindowCallbacks {
             .field("key", &self.key.is_some())
             .field("close", &self.close.is_some())
             .field("scroll", &self.scroll.is_some())
+            .field("beyond", &self.beyond.is_some())
             .finish()
     }
 }

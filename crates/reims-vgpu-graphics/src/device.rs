@@ -227,6 +227,7 @@ use zerocopy::{FromBytes, IntoBytes};
 use crate::clock::now_ns;
 use crate::control;
 use crate::device::backlog::Backlog;
+use crate::device::desktop::{Bounds, Place};
 use crate::device::gate::{Gate, Look, Offer, Waited};
 use crate::device::lanes::{Hand, Key, Lanes};
 use crate::display::{Mode, Scanout, Screen, offered_in_room, scanout_room, scanout_room_at};
@@ -237,6 +238,7 @@ use crate::wake::{self, Doorbell, RawDoorbell, Wake};
 use crate::wire::*;
 
 mod backlog;
+mod desktop;
 mod gate;
 mod guest_times;
 mod lanes;
@@ -329,7 +331,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 49.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 50.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -376,7 +378,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_DOORBELL_PAGES
     | RGFX_FEATURE_PIPELINE_ANSWERS
     | RGFX_FEATURE_MULTI_DISPLAY
-    | RGFX_FEATURE_POINTER_OVER;
+    | RGFX_FEATURE_POINTER_OVER
+    | RGFX_FEATURE_DISPLAY_BOUNDS;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -1007,9 +1010,16 @@ impl Queues {
     }
 }
 
+/// How long a crossing holds the pointer's positions back from the guest's pointing device
+/// ([`Shared::pointer_at`]), in nanoseconds: until the guest's cursor shows on the pointer's
+/// display, or this long after the `POINTER_OVER` that moves it there, should the guest not show
+/// it (a hidden cursor) or be slow to.
+const CROSSING_HOLD_NS: u64 = 100_000_000;
+
 /// What `POINTER_OVER` follows ([`Shared::pointer_at`]): the display the guest's cursor last
-/// showed on, and what the guest was told, each of one reset count. A reset makes it new: the
-/// cursor on display 0, the guest told nothing.
+/// showed on, what the guest was told, the displays' places in the guest's desktop, and where a
+/// captured pointer that went past its window's edge is ([`Away`]), each of one reset count. A
+/// reset makes it new: the cursor on display 0, the guest told nothing, no display placed.
 #[derive(Default)]
 struct Pointer {
     /// The reset count it is of.
@@ -1019,9 +1029,48 @@ struct Pointer {
     /// The (pointer's display, cursor's display) the guest was last told the pointer is over the
     /// first while its cursor is on the second, until the cursor shows on the pointer's display.
     told: Option<(u32, u32)>,
+    /// When it was told, on the device's clock: the pointer's positions over that display are
+    /// held back until the cursor shows there, or [`CROSSING_HOLD_NS`] after.
+    told_at: u64,
     /// That `POINTER_OVER`, until it is posted: one that found the ring held by another thread,
     /// full, or behind answers handed over goes at the next refresh of any display.
     owed: Option<RgfxPointerOver>,
+    /// The buttons of the last position handed on to the guest's pointing device: a position
+    /// whose buttons differ is never held back.
+    buttons: u32,
+    /// Each display's rectangle in the guest's desktop, as its last `DISPLAY_BOUNDS` gave it.
+    bounds: [Option<Bounds>; RGFX_DISPLAYS_MAX as usize],
+    /// The captured pointer gone past its window's edge, while it is.
+    away: Option<Away>,
+}
+
+/// A window's captured pointer gone past the image's edge onto the guest's desktop
+/// ([`PointerLink::leave`]): where it is, and how its moves are scaled.
+#[derive(Clone, Copy, Debug)]
+struct Away {
+    /// The desktop's points a pixel of the window's mode spans, across and down: the window's
+    /// moves, in those pixels, move the pointer that far, wherever it is.
+    per_pixel: (f64, f64),
+    /// The pointer's point in the desktop.
+    at: (f64, f64),
+    /// The display it is on.
+    on: u32,
+}
+
+/// Where a window's captured pointer is on the guest's desktop ([`PointerLink::away_moved`]): a
+/// display, and the pixel of its scanout, which is `width` by `height`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spot {
+    /// The display's id.
+    pub display: u32,
+    /// The pixel's column.
+    pub x: u16,
+    /// The pixel's row.
+    pub y: u16,
+    /// The scanout's width.
+    pub width: u16,
+    /// The scanout's height.
+    pub height: u16,
 }
 
 impl Pointer {
@@ -1055,9 +1104,60 @@ impl PointerLink {
     /// thread: a `POINTER_OVER` that finds the ring held or full goes at the next refresh. Does
     /// nothing on a device of one display, for a guest that sees one or did not take
     /// `POINTER_OVER`, for a display it does not see, or once the device has ended.
-    pub fn pointer_at(&self, display: u32, x: i32, y: i32, buttons: u32) {
+    ///
+    /// Whether the position goes on to the guest's pointing device now: not while the guest has
+    /// yet to move its cursor onto the display, after the `POINTER_OVER` that has it do so, for up
+    /// to 100 ms, so that the guest never takes the position as one of the display its cursor is
+    /// still on (where its tablet's place would land at the same spot of the other display), but
+    /// for a position whose buttons differ from the last that went on. True wherever nothing is
+    /// told.
+    pub fn pointer_at(&self, display: u32, x: i32, y: i32, buttons: u32) -> bool {
+        self.shared
+            .upgrade()
+            .is_none_or(|shared| shared.pointer_at(display, x, y, buttons))
+    }
+
+    /// Whether the guest's desktop puts another display past display `display`'s edge toward
+    /// `outward` (each of across and down -1, 0 or 1; both for the corner), at the row or column
+    /// of its pixel `at` of the window's `mode`: where the window's captured pointer, moving
+    /// toward its image's edge there, goes on onto that display ([`Self::leave`]). False where the
+    /// guest did not take [`RGFX_FEATURE_POINTER_OVER`] and [`RGFX_FEATURE_DISPLAY_BOUNDS`] or
+    /// gave no rectangle of the displays, and on a device of one display.
+    pub fn adjoins(
+        &self,
+        display: u32,
+        at: (u16, u16),
+        mode: (u16, u16),
+        outward: (i8, i8),
+    ) -> bool {
+        self.shared
+            .upgrade()
+            .is_some_and(|shared| shared.adjoins(display, at, mode, outward))
+    }
+
+    /// The captured pointer of display `display`'s window, at its pixel `at` of the window's
+    /// `mode`, leaves the window for the guest's desktop, from that pixel: its moves go on there
+    /// ([`Self::away_moved`]) until [`Self::come_back`]. False, and nothing done, where the
+    /// desktop has no place for the display ([`Self::adjoins`]).
+    pub fn leave(&self, display: u32, at: (u16, u16), mode: (u16, u16)) -> bool {
+        self.shared
+            .upgrade()
+            .is_some_and(|shared| shared.leave(display, at, mode))
+    }
+
+    /// The pointer gone onto the desktop moved by (`dx`, `dy`), in pixels of the mode of the
+    /// window it left: it goes onto the display whose rectangle holds where it lands, or is held
+    /// at the edge of the one it is on where no display does (`desktop::step`). Where it is now;
+    /// `None` where it is not away, or the guest reset the device or gave no place for the
+    /// display it is on, when the window takes it back.
+    pub fn away_moved(&self, dx: f64, dy: f64) -> Option<Spot> {
+        self.shared.upgrade()?.away_moved(dx, dy)
+    }
+
+    /// The pointer is its window's again: back over the window's display, or capture let go.
+    pub fn come_back(&self) {
         if let Some(shared) = self.shared.upgrade() {
-            shared.pointer_at(display, x, y, buttons);
+            shared.come_back();
         }
     }
 }
@@ -1937,12 +2037,13 @@ impl Shared {
     }
 
     /// The feature bits the device offers a guest whose driver took `taken`: the host's
-    /// ([`Host::features`]), [`RGFX_FEATURE_MULTI_DISPLAY`] and [`RGFX_FEATURE_POINTER_OVER`] on
-    /// a device of two displays or more (the device's to offer, whatever the host's answer), and
-    /// where `taken` holds [`RGFX_FEATURE_PAGES_16K`] and the host offers it, those it offers only
-    /// then ([`Host::features_with_16k_pages`]).
+    /// ([`Host::features`]), [`RGFX_FEATURE_MULTI_DISPLAY`], [`RGFX_FEATURE_POINTER_OVER`] and
+    /// [`RGFX_FEATURE_DISPLAY_BOUNDS`] on a device of two displays or more (the device's to offer,
+    /// whatever the host's answer), and where `taken` holds [`RGFX_FEATURE_PAGES_16K`] and the
+    /// host offers it, those it offers only then ([`Host::features_with_16k_pages`]).
     fn offered_to(&self, taken: u64) -> u64 {
-        let displays = RGFX_FEATURE_MULTI_DISPLAY | RGFX_FEATURE_POINTER_OVER;
+        let displays =
+            RGFX_FEATURE_MULTI_DISPLAY | RGFX_FEATURE_POINTER_OVER | RGFX_FEATURE_DISPLAY_BOUNDS;
         let features = (self.host.features() & !displays)
             | if self.display_count() > 1 {
                 displays
@@ -1999,27 +2100,184 @@ impl Shared {
         pointer.cursor = id;
         if pointer.told.is_some_and(|(over, _)| over == id) {
             // The guest moved its cursor where it was told: a later move elsewhere is told anew.
+            log::debug!(
+                target: "reims_vgpu_graphics",
+                "the guest's cursor showed on display {id} {} us after the POINTER_OVER",
+                now_ns().saturating_sub(pointer.told_at) / 1000
+            );
             pointer.told = None;
             pointer.owed = None;
         }
     }
 
-    /// [`PointerLink::pointer_at`]: the host's pointer is over display `id` at (`x`, `y`), with
-    /// `buttons` held.
-    pub(crate) fn pointer_at(&self, id: u32, x: i32, y: i32, buttons: u32) {
-        let seen = self.displays_seen();
-        if seen < 2 || id >= seen || !self.driver_took(RGFX_FEATURE_POINTER_OVER) || !self.started()
-        {
+    /// `DISPLAY_BOUNDS`: display `command.display`'s rectangle in the guest's desktop, kept until
+    /// the next of it or a reset; one of no area forgets it. Dropped for a display the guest does
+    /// not see.
+    pub(crate) fn display_bounds(&self, command: &RgfxDisplayBounds) {
+        if self.seen_display(command.display).is_none() {
             return;
         }
         let epoch = self.epoch.load(Ordering::Acquire);
+        let mut pointer = self.pointer.lock();
+        if let Some(slot) = pointer.at(epoch).bounds.get_mut(command.display as usize) {
+            *slot = Bounds::of(command);
+        }
+    }
+
+    /// Whether the window's captured pointer may go past its image's edge onto the guest's
+    /// desktop: the guest sees several displays, took `POINTER_OVER`, which moves its cursor
+    /// there, and `DISPLAY_BOUNDS`, which places them, and runs the device.
+    fn carries_beyond(&self) -> bool {
+        let wanted = RGFX_FEATURE_POINTER_OVER | RGFX_FEATURE_DISPLAY_BOUNDS;
+        self.displays_seen() > 1
+            && self.driver_features.load(Ordering::Acquire) & wanted == wanted
+            && self.started()
+    }
+
+    /// Each display's scanout size, of those the guest sees, read before the pointer's lock.
+    fn scanout_sizes(&self) -> Vec<Option<(u32, u32)>> {
+        (0..self.displays_seen())
+            .map(|id| {
+                let display = self.displays.get(id as usize)?;
+                let scanout = display.state.lock().scanout?;
+                (scanout.width > 0 && scanout.height > 0).then_some((scanout.width, scanout.height))
+            })
+            .collect()
+    }
+
+    /// The displays' places in the desktop: a display's where the guest gave its rectangle and
+    /// it has a scanout.
+    fn places(sizes: &[Option<(u32, u32)>], bounds: &[Option<Bounds>]) -> Vec<Option<Place>> {
+        sizes
+            .iter()
+            .zip(bounds)
+            .map(|(&pixels, &bounds)| {
+                Some(Place {
+                    bounds: bounds?,
+                    pixels: pixels?,
+                })
+            })
+            .collect()
+    }
+
+    /// [`PointerLink::adjoins`].
+    pub(crate) fn adjoins(
+        &self,
+        id: u32,
+        at: (u16, u16),
+        mode: (u16, u16),
+        outward: (i8, i8),
+    ) -> bool {
+        if !self.carries_beyond() || mode.0 == 0 || mode.1 == 0 {
+            return false;
+        }
+        let sizes = self.scanout_sizes();
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let mut pointer = self.pointer.lock();
+        let places = Self::places(&sizes, &pointer.at(epoch).bounds);
+        let Some(place) = places.get(id as usize).copied().flatten() else {
+            return false;
+        };
+        let centre = place.point_of(pixel_centre(at, mode, place.pixels));
+        let half = place.points_per_pixel();
+        let past = |toward: i8, at: f64, min: f64, max: f64, half: f64| match toward.signum() {
+            1 => max + half / 2.0,
+            -1 => min - half / 2.0,
+            _ => at,
+        };
+        let bounds = place.bounds;
+        let point = (
+            past(outward.0, centre.0, bounds.min.0, bounds.max.0, half.0),
+            past(outward.1, centre.1, bounds.min.1, bounds.max.1, half.1),
+        );
+        desktop::display_at(&places, id as usize, point).is_some_and(|d| d != id as usize)
+    }
+
+    /// [`PointerLink::leave`].
+    pub(crate) fn leave(&self, id: u32, at: (u16, u16), mode: (u16, u16)) -> bool {
+        if !self.carries_beyond() || mode.0 == 0 || mode.1 == 0 {
+            return false;
+        }
+        let sizes = self.scanout_sizes();
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let mut pointer = self.pointer.lock();
+        let pointer = pointer.at(epoch);
+        let places = Self::places(&sizes, &pointer.bounds);
+        let Some(place) = places.get(id as usize).copied().flatten() else {
+            return false;
+        };
+        let per_scanout_pixel = place.points_per_pixel();
+        pointer.away = Some(Away {
+            per_pixel: (
+                per_scanout_pixel.0 * f64::from(place.pixels.0) / f64::from(mode.0),
+                per_scanout_pixel.1 * f64::from(place.pixels.1) / f64::from(mode.1),
+            ),
+            at: place.point_of(pixel_centre(at, mode, place.pixels)),
+            on: id,
+        });
+        true
+    }
+
+    /// [`PointerLink::away_moved`].
+    pub(crate) fn away_moved(&self, dx: f64, dy: f64) -> Option<Spot> {
+        let carries = self.carries_beyond();
+        let sizes = self.scanout_sizes();
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let mut pointer = self.pointer.lock();
+        let pointer = pointer.at(epoch);
+        let away = pointer.away.take()?;
+        if !carries {
+            return None;
+        }
+        let places = Self::places(&sizes, &pointer.bounds);
+        let to = (
+            away.at.0 + dx * away.per_pixel.0,
+            away.at.1 + dy * away.per_pixel.1,
+        );
+        let (on, at) = desktop::step(&places, away.on as usize, away.at, to)?;
+        let place = places.get(on).copied().flatten()?;
+        let on = u32::try_from(on).ok()?;
+        pointer.away = Some(Away { at, on, ..away });
+        let pixel = place.pixel_of(at);
+        let narrow = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
+        Some(Spot {
+            display: on,
+            x: narrow(pixel.0),
+            y: narrow(pixel.1),
+            width: narrow(place.pixels.0),
+            height: narrow(place.pixels.1),
+        })
+    }
+
+    /// [`PointerLink::come_back`].
+    pub(crate) fn come_back(&self) {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        self.pointer.lock().at(epoch).away = None;
+    }
+
+    /// [`PointerLink::pointer_at`]: the host's pointer is over display `id` at (`x`, `y`), with
+    /// `buttons` held. Whether the position goes on to the guest's pointing device now.
+    pub(crate) fn pointer_at(&self, id: u32, x: i32, y: i32, buttons: u32) -> bool {
+        let seen = self.displays_seen();
+        if seen < 2 || id >= seen || !self.driver_took(RGFX_FEATURE_POINTER_OVER) || !self.started()
         {
+            return true;
+        }
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let now = now_ns();
+        let goes_on = {
             let mut pointer = self.pointer.lock();
             let pointer = pointer.at(epoch);
-            if pointer.cursor == id || pointer.told == Some((id, pointer.cursor)) {
-                return;
+            let buttons_changed = std::mem::replace(&mut pointer.buttons, buttons) != buttons;
+            if pointer.cursor == id {
+                return true;
+            }
+            if pointer.told == Some((id, pointer.cursor)) {
+                // Told already: held until the cursor shows there, for a while at most.
+                return buttons_changed || now.saturating_sub(pointer.told_at) >= CROSSING_HOLD_NS;
             }
             pointer.told = Some((id, pointer.cursor));
+            pointer.told_at = now;
             pointer.owed = Some(RgfxPointerOver {
                 header: event_header(RGFX_EVT_POINTER_OVER),
                 display: id,
@@ -2027,8 +2285,10 @@ impl Shared {
                 y,
                 buttons,
             });
-        }
+            buttons_changed
+        };
         self.post_pointer(epoch, false);
+        goes_on
     }
 
     /// Posts the `POINTER_OVER` owed at reset count `epoch`, where one is ([`Pointer::owed`]),
@@ -4243,6 +4503,15 @@ fn lock_ring(ring: &Mutex<Producer>, wait: bool) -> Option<MutexGuard<'_, Produc
     } else {
         ring.try_lock()
     }
+}
+
+/// The centre of pixel `at` of a window's `mode`, as a place over a scanout of `pixels`: the
+/// window's mode is the scanout's but while the two change.
+fn pixel_centre(at: (u16, u16), mode: (u16, u16), pixels: (u32, u32)) -> (f64, f64) {
+    (
+        (f64::from(at.0) + 0.5) * f64::from(pixels.0) / f64::from(mode.0),
+        (f64::from(at.1) + 0.5) * f64::from(pixels.1) / f64::from(mode.1),
+    )
 }
 
 /// The header of an event that answers no command: `seqno` 0, the size set when it is sized.

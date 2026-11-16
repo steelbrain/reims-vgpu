@@ -287,6 +287,9 @@ pub(crate) fn window_callbacks(t: &Arc<Table>, c: &RvgWindowCallbacks) -> Window
             });
             c
         }),
+        // The C API's host has no guest desktop to carry a captured pointer across: the library
+        // gives a graphics device's own windows theirs.
+        beyond: None,
     }
 }
 

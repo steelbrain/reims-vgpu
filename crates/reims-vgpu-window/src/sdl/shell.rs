@@ -472,9 +472,11 @@ impl Shell {
         close_asked(self);
     }
 
-    /// Sends what the input queued to the host's callbacks, while the window has them.
+    /// Sends what the input queued to the host's callbacks, while the window has them, and has
+    /// the OS hold the host's pointer as the input asks (`os::apply_hold`).
     pub(crate) fn flush(&mut self) {
         self.input.flush(&self.window);
+        os::apply_hold(self);
     }
 
     /// The input was captured or released: the holds follow ([`Shell::holds_follow_capture`]),
@@ -563,7 +565,7 @@ impl Shell {
     /// window draws it itself (`handle`'s module doc); the host's arrow elsewhere and before the
     /// guest has set one. SDL's cursor is the process's, so only the window the pointer is in
     /// (SDL's mouse focus) sets it ([`cursor_step`]).
-    fn refresh_cursor(&mut self) {
+    pub(crate) fn refresh_cursor(&mut self) {
         let guest = self.window.guest();
         // SAFETY: SDL's video runs on this thread.
         let has_pointer = unsafe { SDL_GetMouseFocus() } == self.sdl;

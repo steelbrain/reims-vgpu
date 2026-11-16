@@ -1356,6 +1356,7 @@ mod tests {
                     e.dy, e.dx, e.phase, e.momentum, e.notches
                 ));
             })),
+            beyond: None,
         };
         call_host(&callbacks, pointer(3, 4, BUTTON_RIGHT));
         call_host(&callbacks, ToHost::Wheel { dy: -1, dx: 2 });

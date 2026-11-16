@@ -1,6 +1,8 @@
 //! A device of several displays ([`GraphicsConfig::display_count`]): the counts and windows it
 //! takes, each display's read-back, and each display's cursor at the host's callbacks.
 
+use reims_vgpu_window::Landed;
+
 use super::*;
 
 /// A headless device of `count` displays on the testkit's platform, with `callbacks`.
@@ -228,10 +230,12 @@ fn a_guest_that_did_not_take_multi_display_has_no_display_1_cursor() {
 
 /// A window's pointer on a device of several displays tells a guest that took `POINTER_OVER`
 /// that the host's pointer is over the window's display: `POINTER_OVER` of that display at the
-/// event's point, with its buttons, is published before the host's pointer callback, which moves
-/// the guest's tablet, is called with the event; told once, the next event goes to the host alone
+/// event's point, with its buttons, is published, and the host's pointer callback, which moves
+/// the guest's tablet, waits until the guest's cursor shows on the window's display, so the
+/// tablet never puts the cursor at the event's spot of the display it is still on; a button's
+/// change goes on at once, and the guest is told once
 #[test]
-fn a_window_s_pointer_tells_the_guest_its_display_before_the_host() {
+fn a_window_s_pointer_tells_the_guest_its_display_and_waits_for_its_cursor() {
     let device = headless_of(2, GraphicsCallbacks::default());
     device.mmio_write(
         RGFX_REG_DRIVER_FEATURES_HI.into(),
@@ -240,31 +244,175 @@ fn a_window_s_pointer_tells_the_guest_its_display_before_the_host() {
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     let mut guest = Guest::new(&device);
     let producer = device.region_base() as usize + RGFX_CONTROL_COMPLETE_OFFSET as usize;
-    let seen: Arc<Mutex<Vec<(u16, u16, u64)>>> = Arc::default();
+    // Each call's point, buttons and the completion ring's producer as the call saw it.
+    type Calls = Mutex<Vec<(u16, u16, u32, u64)>>;
+    let seen: Arc<Calls> = Arc::default();
     let at = Arc::clone(&seen);
     let mut config = WindowConfig::default();
-    config.callbacks.pointer = Some(Arc::new(move |x, y, _width, _height, _buttons| {
+    config.callbacks.pointer = Some(Arc::new(move |x, y, _width, _height, buttons| {
         // SAFETY: the control completion ring's producer, in the device's region, which stays
         // mapped while the device lives.
         let produced = unsafe { AtomicU64::from_ptr(producer as *mut u64).load(Ordering::SeqCst) };
-        at.lock().push((x, y, produced));
+        at.lock().push((x, y, buttons, produced));
     }));
     let link = Arc::new(OnceLock::new());
     let _ = link.set(device.device.pointer_link());
     crate::window::tell_pointer(&mut config, 1, &link);
     let pointer = config.callbacks.pointer.clone().unwrap();
-    pointer(100, 50, 1920, 1080, reims_vgpu_window::BUTTON_LEFT);
+    pointer(100, 50, 1920, 1080, 0);
     let p = RgfxPointerOver::read_from_bytes(&guest.event().unwrap()).unwrap();
     assert_eq!(
         (p.header.r#type, p.display, p.x, p.y, p.buttons),
-        (RGFX_EVT_POINTER_OVER, 1, 100, 50, RGFX_POINTER_BUTTON_LEFT)
+        (RGFX_EVT_POINTER_OVER, 1, 100, 50, 0)
     );
-    // The host's callback saw the event's 32 bytes already published.
-    assert_eq!(*seen.lock(), [(100, 50, 32)]);
     pointer(101, 51, 1920, 1080, 0);
     assert!(
-        guest.quiet_for(200),
-        "told once while the cursor stays on display 0"
+        seen.lock().is_empty(),
+        "held while the cursor is on display 0"
     );
-    assert_eq!(seen.lock().len(), 2);
+    pointer(101, 51, 1920, 1080, reims_vgpu_window::BUTTON_LEFT);
+    // The button's change went on, after the event was published.
+    assert_eq!(
+        *seen.lock(),
+        [(101, 51, reims_vgpu_window::BUTTON_LEFT, 32)]
+    );
+    guest.send(&device, move_cursor(1, 101, 51));
+    assert_eq!(answered(&device, &mut guest, vblank(0, 0)), RGFX_STATUS_OK);
+    pointer(102, 52, 1920, 1080, reims_vgpu_window::BUTTON_LEFT);
+    assert_eq!(seen.lock().len(), 2, "the cursor is on display 1");
+    assert_eq!(seen.lock()[1].0, 102);
+    assert!(guest.quiet_for(100), "told once");
+}
+
+/// `SET_VBLANK` of `display`.
+fn vblank(display: u32, enabled: u32) -> Vec<u8> {
+    RgfxSetVblank {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_VBLANK,
+            size: 0,
+            seqno: 0,
+        },
+        display,
+        enabled,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A command `command` of no answer, then one answered, so the first is carried out.
+fn carried<P: ApiPlatform>(device: &GraphicsDevice<P>, guest: &mut Guest, command: Vec<u8>) {
+    guest.send(device, command);
+    assert_eq!(answered(device, guest, vblank(0, 0)), RGFX_STATUS_OK);
+}
+
+/// A captured pointer held at display 0's window's edge where the guest placed display 1 goes on
+/// through display 1's window: the guest is told `POINTER_OVER` of display 1 with the drag's
+/// button, display 1's host callback gets the positions once the guest's cursor shows there, and
+/// back over display 0 the pointer is display 0's window's again, the guest told it
+#[test]
+fn a_captured_pointer_past_the_shared_edge_goes_on_through_the_other_display_s_window() {
+    let told: Arc<Mutex<Vec<String>>> = Arc::default();
+    let window = |display: u32| {
+        let told = Arc::clone(&told);
+        let mut config = WindowConfig::default();
+        config.callbacks.pointer = Some(Arc::new(move |x, y, w, h, buttons| {
+            told.lock()
+                .push(format!("{display}: {x},{y} of {w}x{h} {buttons}"));
+        }));
+        config
+    };
+    let config = GraphicsConfig {
+        display_count: 2,
+        window: Some(window(0)),
+        display_windows: vec![window(1)],
+        ..GraphicsConfig::default()
+    };
+    let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+    device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_HI.into(),
+        ((RGFX_FEATURE_MULTI_DISPLAY | RGFX_FEATURE_POINTER_OVER | RGFX_FEATURE_DISPLAY_BOUNDS)
+            >> 32) as u32,
+    );
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    for display in 0..2u32 {
+        let scanout = RgfxSetScanout {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SET_SCANOUT,
+                size: 0,
+                seqno: 0,
+            },
+            display,
+            width: 1920,
+            height: 1080,
+            stride: 7680,
+            offset: RGFX_ALLOCATIONS_OFFSET + u64::from(display) * (64 << 20),
+        };
+        assert_eq!(
+            answered(&device, &mut guest, scanout.as_bytes().to_vec()),
+            RGFX_STATUS_OK
+        );
+        let bounds = RgfxDisplayBounds {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_DISPLAY_BOUNDS,
+                size: 0,
+                seqno: 0,
+            },
+            display,
+            min_x: 1920 * display as i32,
+            min_y: 0,
+            max_x: 1920 * (display as i32 + 1),
+            max_y: 1080,
+            reserved_24: 0,
+        };
+        carried(&device, &mut guest, bounds.as_bytes().to_vec());
+    }
+    // Display 0's window as the device gives it its desktop.
+    let link = Arc::new(OnceLock::new());
+    let _ = link.set(device.device.pointer_link());
+    let desktop = crate::window::Desktop::new(link);
+    desktop.set_windows(device.windows.iter().map(|w| Some(w.weak())).collect());
+    let mut config = WindowConfig::default();
+    desktop.give(&mut config, 0);
+    let beyond = config.callbacks.beyond.unwrap();
+    let windows: Vec<_> = device.windows.iter().map(|w| w.weak()).collect();
+    let left = reims_vgpu_window::BUTTON_LEFT;
+    let mode = (1920, 1080);
+
+    // The drag's click and its move to the edge, through display 0's window.
+    let zero = windows[0].upgrade().unwrap();
+    zero.pointer_from_beyond(1919, 500, 1920, 1080, left);
+    assert!(beyond.adjoins((1919, 500), mode, (1, 0)));
+    assert!(!beyond.adjoins((1919, 500), mode, (0, 1)));
+    assert!(beyond.leave((1919, 500), mode));
+    assert_eq!(beyond.moved((2.0, 0.0), left), Landed::Elsewhere);
+    let p = RgfxPointerOver::read_from_bytes(&guest.event().unwrap()).unwrap();
+    assert_eq!((p.display, p.x, p.y, p.buttons), (1, 1, 500, left));
+    assert_eq!(beyond.moved((3.0, 0.0), left), Landed::Elsewhere);
+    assert_eq!(
+        *told.lock(),
+        ["0: 1919,500 of 1920x1080 1"],
+        "held until the cursor is on 1"
+    );
+    carried(&device, &mut guest, move_cursor(1, 4, 500));
+    assert_eq!(beyond.moved((1.0, 2.0), left), Landed::Elsewhere);
+    assert_eq!(told.lock()[1], "1: 5,502 of 1920x1080 1");
+    // The button comes up on display 1; back over display 0, the guest is told it.
+    assert_eq!(beyond.moved((0.0, 0.0), 0), Landed::Elsewhere);
+    assert_eq!(told.lock()[2], "1: 5,502 of 1920x1080 0");
+    assert_eq!(
+        beyond.moved((-10.0, 0.0), 0),
+        Landed::Here {
+            at: (1915, 502),
+            mode
+        }
+    );
+    let p = RgfxPointerOver::read_from_bytes(&guest.event().unwrap()).unwrap();
+    assert_eq!((p.display, p.x, p.y, p.buttons), (0, 1915, 502, 0));
+    beyond.come_back();
+    assert_eq!(
+        beyond.moved((1.0, 0.0), 0),
+        Landed::Lost,
+        "the window's again"
+    );
 }

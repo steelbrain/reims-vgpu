@@ -457,6 +457,14 @@ pub const RGFX_FEATURE_MULTI_DISPLAY: u64 = 0x1_0000_0000_0000;
 /// more, and sends `POINTER_OVER` only to a guest that took both: one that took `MULTI_DISPLAY`
 /// alone (a kext built before this bit, the arm64e kext, Ambrosia's module) is never sent it.
 pub const RGFX_FEATURE_POINTER_OVER: u64 = 0x2_0000_0000_0000;
+/// `FEATURES_HI` bit 18, feature bit 50, `DISPLAY_BOUNDS`: ring 0 carries
+/// [`RGFX_CMD_DISPLAY_BOUNDS`], each display's rectangle in the guest's desktop, by which the
+/// host carries its captured pointer, held at a display's edge where another display meets it,
+/// onto that display (docs/graphics-kext/design.md, "Multiple displays"). The device offers it
+/// beside [`RGFX_FEATURE_MULTI_DISPLAY`] and [`RGFX_FEATURE_POINTER_OVER`], only where its host
+/// made it with two displays or more, and carries the pointer past a display's edge only for a
+/// guest that took all three and sent the displays' rectangles.
+pub const RGFX_FEATURE_DISPLAY_BOUNDS: u64 = 0x4_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -703,6 +711,9 @@ pub const RGFX_CMD_DISPLAY_COLOR: u32 = 7;
 /// Command `SET_DISPLAY_POWER` ([`RgfxSetDisplayPower`]), where the guest took
 /// [`RGFX_FEATURE_DISPLAY_POWER`]: answered by [`RGFX_EVT_COMPLETE`].
 pub const RGFX_CMD_SET_DISPLAY_POWER: u32 = 8;
+/// Command `DISPLAY_BOUNDS` ([`RgfxDisplayBounds`]), where the guest took
+/// [`RGFX_FEATURE_DISPLAY_BOUNDS`]: not answered.
+pub const RGFX_CMD_DISPLAY_BOUNDS: u32 = 9;
 /// Event `COMPLETE` ([`RgfxComplete`]): a command's answer, with its `seqno`.
 pub const RGFX_EVT_COMPLETE: u32 = 0x100;
 /// Event `DISPLAYS` ([`RgfxDisplays`]): `GET_DISPLAYS`'s answer, with its `seqno`.
@@ -1383,6 +1394,35 @@ pub struct RgfxSetDisplayPower {
     pub on: u32,
 }
 
+/// `DISPLAY_BOUNDS`: display `display` lies at (`min_x`, `min_y`) up to (`max_x`, `max_y`), the
+/// corner past it, of the guest's desktop: WindowServer's global space, in points, where the
+/// guest arranged its displays (the x86-64 kext's framebuffer's `getBoundingRect`). The guest
+/// sends each display's whenever it changes, and the host keeps the latest until a reset. The
+/// host's captured pointer, held at an edge of a display's window where another display's
+/// rectangle meets that display's, goes on onto that display, as the guest's cursor does on a
+/// Mac (docs/graphics-kext/design.md, "Multiple displays"). A rectangle of no area, or one of a
+/// display the guest does not see, is dropped.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxDisplayBounds {
+    /// [`RGFX_CMD_DISPLAY_BOUNDS`].
+    pub header: RgfxMsgHeader,
+    /// The display's id.
+    pub display: u32,
+    /// The rectangle's left edge, in the desktop's points.
+    pub min_x: i32,
+    /// Its top edge.
+    pub min_y: i32,
+    /// Its right edge, past its last column.
+    pub max_x: i32,
+    /// Its bottom edge, past its last row.
+    pub max_y: i32,
+    /// Keeps the size a multiple of 8; 0.
+    pub reserved_24: u32,
+}
+
 /// `PRESENT_SURFACE`: the display shows the IOSurface of global ID `iosurface_id` (plane 0), the
 /// display pipe's swap, in place of the scanout, until the next `PRESENT_SURFACE`; 0 shows the
 /// scanout again. The host shows the texture the device's decoder made over that surface
@@ -1675,6 +1715,7 @@ const _: () = {
     assert!(size_of::<RgfxDisplayChanged>() == 24);
     assert!(size_of::<RgfxVblank>() == 40);
     assert!(size_of::<RgfxPointerOver>() == 32);
+    assert!(size_of::<RgfxDisplayBounds>() == 40);
     assert!(RGFX_CONTROL_RING_DATA_SIZE.is_power_of_two());
     assert!(
         RGFX_RING_HEADER_SIZE as u64 + RGFX_CONTROL_RING_DATA_SIZE as u64 <= RGFX_CONTROL_RING_SPAN

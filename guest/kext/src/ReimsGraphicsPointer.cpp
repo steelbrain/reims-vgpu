@@ -17,6 +17,10 @@
  * The post runs on a thread call of display 0's framebuffer, off the device's work loop, as it
  * waits for IOHIDSystem's command gate. Each POINTER_OVER replaces the one before it that has not
  * moved the cursor yet: the latest is where the host's pointer is.
+ *
+ * The other way, each display's rectangle in the global space goes to the host in DISPLAY_BOUNDS
+ * whenever it changed, posted after a move of the cursor (RgfxDisplayBounds.hpp), by which the
+ * host carries its captured pointer past one display's edge onto the display there.
  */
 
 #include "ReimsGraphics.hpp"
@@ -150,4 +154,40 @@ void ReimsGraphics::movePointer(thread_call_param_t self, thread_call_param_t)
 		      "%d,%d of the desktop (0x%x)\n",
 		      at.display, at.x, at.y,
 		      move == RgfxPointerMove::moved ? "moves" : "is dragged", globalX, globalY, posted);
+}
+
+// Display 0's, from any display's setCursorState: each driven display's rectangle that differs
+// from the one the host was last told, posted, and counted told once it is on the ring. A
+// display whose framebuffer holds no rectangle yet is told once it has one.
+void ReimsGraphics::tellBounds()
+{
+	if (!displayBoundsTaken || !interruptLock)
+		return;
+	ReimsGraphics *fbs[RGFX_DISPLAYS_MAX];
+	const UInt32 n = copyDisplays(fbs);
+	for (UInt32 i = 0; i < n; i++) {
+		const UInt32 display = fbs[i]->displayId;
+		IOGBounds *bounds = nullptr;
+		fbs[i]->getBoundingRect(&bounds);
+		if (!bounds)
+			continue;
+		const RgfxGlobalRect rect = {bounds->minx, bounds->miny, bounds->maxx, bounds->maxy};
+		IOSimpleLockLock(interruptLock);
+		const bool tell = rgfxBoundsToTell(boundsTold, display, rect);
+		IOSimpleLockUnlock(interruptLock);
+		if (!tell)
+			continue;
+		const RgfxDisplayBounds command = rgfxBoundsCommand(display, rect);
+		if (!tryPost(RGFX_CMD_DISPLAY_BOUNDS, &command, sizeof(command), nullptr))
+			continue;
+		IOSimpleLockLock(interruptLock);
+		rgfxBoundsWereTold(&boundsTold, display, rect);
+		IOSimpleLockUnlock(interruptLock);
+		// The first two of each display's.
+		static char told;
+		if (rgfxFirstCalls(&told, display, 2))
+			IOLog("ReimsGraphics: display %u lies at %d,%d to %d,%d of the desktop\n", display,
+			      rect.minx, rect.miny, rect.maxx, rect.maxy);
+	}
+	releaseDisplays(fbs, n);
 }

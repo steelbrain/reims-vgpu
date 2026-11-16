@@ -72,6 +72,34 @@ fn take_pointer_over(rig: &Rig) {
     );
 }
 
+/// The guest's driver takes `MULTI_DISPLAY`, `POINTER_OVER` and `DISPLAY_BOUNDS`, before it
+/// starts the device.
+fn take_bounds(rig: &Rig) {
+    rig.device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_HI.into(),
+        ((RGFX_FEATURE_MULTI_DISPLAY | RGFX_FEATURE_POINTER_OVER | RGFX_FEATURE_DISPLAY_BOUNDS)
+            >> 32) as u32,
+    );
+}
+
+/// A `DISPLAY_BOUNDS` of `display`: at (`x`, `y`), `w` by `h` points.
+fn bounds_of(display: u32, x: i32, y: i32, w: i32, h: i32) -> Vec<u8> {
+    RgfxDisplayBounds {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_DISPLAY_BOUNDS,
+            ..Default::default()
+        },
+        display,
+        min_x: x,
+        min_y: y,
+        max_x: x + w,
+        max_y: y + h,
+        reserved_24: 0,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
 /// A `DISPLAYS` answer's words after its header.
 fn words(bytes: &[u8]) -> Vec<u32> {
     let header = RgfxMsgHeader::read_from_prefix(bytes).unwrap().0;
@@ -91,20 +119,21 @@ fn told_on(rig: &Rig, i: usize) -> Vec<Told> {
     }
 }
 
-/// `MULTI_DISPLAY` and `POINTER_OVER` (`FEATURES_HI` bits 16 and 17) are offered only by a
-/// device of two displays or more, and only there can the guest take them: a device of one reads
-/// the feature words it read before displays had rooms of their own
+/// `MULTI_DISPLAY`, `POINTER_OVER` and `DISPLAY_BOUNDS` (`FEATURES_HI` bits 16 to 18) are
+/// offered only by a device of two displays or more, and only there can the guest take them: a
+/// device of one reads the feature words it read before displays had rooms of their own
 #[test]
 fn multi_display_is_offered_only_by_a_device_of_two_displays_or_more() {
     for bit in [
         (RGFX_FEATURE_MULTI_DISPLAY >> 32) as u32,
         (RGFX_FEATURE_POINTER_OVER >> 32) as u32,
+        (RGFX_FEATURE_DISPLAY_BOUNDS >> 32) as u32,
     ] {
         for count in 1..=RGFX_DISPLAYS_MAX as usize {
             let rig = Rig::of_displays(count);
             let offered = rig.device.mmio_read(RGFX_REG_FEATURES_HI.into()) & bit != 0;
             assert_eq!(offered, count > 1, "bit {bit:#x}, {count} displays");
-            take_pointer_over(&rig);
+            take_bounds(&rig);
             let taken = rig.device.mmio_read(RGFX_REG_DRIVER_FEATURES_HI.into()) & bit != 0;
             assert_eq!(taken, count > 1, "bit {bit:#x}, {count} displays");
         }
@@ -611,4 +640,185 @@ fn a_pointer_over_the_full_ring_has_no_room_for_goes_at_the_next_refresh() {
     assert!(rig.quiet_for(100), "owed until a refresh");
     rig.refresh();
     assert_eq!(pointer_over(&mut rig), (1, 3, 4, 0));
+}
+
+/// A crossing holds the pointer's positions back from the guest's pointing device until the
+/// guest's cursor shows on the pointer's display, so that the guest never takes one as a place
+/// on the display its cursor is still on, where its tablet's place would land at the same spot
+/// of that display: the position after the cursor came is handed on; so is one whose buttons
+/// changed, and any once 100 ms have gone with no cursor there
+#[test]
+fn a_crossing_holds_the_pointer_until_the_guest_s_cursor_is_there() {
+    let mut rig = Rig::of_displays(2);
+    take_pointer_over(&rig);
+    rig.start();
+    rig.send(get_displays());
+    rig.event().unwrap();
+    let link = rig.device.pointer_link();
+    assert!(link.pointer_at(0, 10, 20, 0), "the cursor is on display 0");
+    assert!(
+        !link.pointer_at(1, 100, 200, 0),
+        "the crossing's own position"
+    );
+    assert_eq!(pointer_over(&mut rig), (1, 100, 200, 0));
+    assert!(
+        !link.pointer_at(1, 101, 201, 0),
+        "held while the cursor stays"
+    );
+    assert!(
+        link.pointer_at(1, 101, 201, RGFX_POINTER_BUTTON_LEFT),
+        "a button's change goes on"
+    );
+    assert!(!link.pointer_at(1, 102, 202, RGFX_POINTER_BUTTON_LEFT));
+    moved(&mut rig, move_on(1, 102, 202));
+    assert!(link.pointer_at(1, 103, 203, RGFX_POINTER_BUTTON_LEFT));
+    // Back to display 0, the guest never showing its cursor there: held 100 ms at most.
+    assert!(!link.pointer_at(0, 5, 5, RGFX_POINTER_BUTTON_LEFT));
+    assert_eq!(pointer_over(&mut rig), (0, 5, 5, RGFX_POINTER_BUTTON_LEFT));
+    std::thread::sleep(Duration::from_millis(110));
+    assert!(link.pointer_at(0, 6, 6, RGFX_POINTER_BUTTON_LEFT));
+    assert!(rig.quiet_for(100), "told once");
+    // A device of one display, and a guest that did not take POINTER_OVER, hold nothing.
+    let one = Rig::new();
+    one.start();
+    assert!(one.device.pointer_link().pointer_at(1, 1, 1, 0));
+    let untaken = Rig::of_displays(2);
+    take_multi_display(&untaken);
+    untaken.start();
+    assert!(untaken.device.pointer_link().pointer_at(1, 1, 1, 0));
+}
+
+/// A guest of two displays, each 1920 x 1080 scanned out at `scale` pixels a point, that took
+/// `DISPLAY_BOUNDS`, with display 1 at (`x1`, `y1`) of its desktop.
+fn placed(scale: u32, x1: i32, y1: i32) -> Rig {
+    let mut rig = Rig::of_displays(2);
+    take_bounds(&rig);
+    rig.start();
+    let (w, h) = (1920 * scale, 1080 * scale);
+    for display in 0..2 {
+        let at = RGFX_ALLOCATIONS_OFFSET + u64::from(display) * ROOM_OF_TWO;
+        let s = rig.send(scanout_on(display, w, h, w * 4, at));
+        assert_eq!(rig.complete(), (s, RGFX_STATUS_OK));
+    }
+    rig.send(bounds_of(0, 0, 0, 1920, 1080));
+    rig.send(bounds_of(1, x1, y1, 1920, 1080));
+    rig.send(get_displays());
+    rig.event().expect("DISPLAYS");
+    rig
+}
+
+/// The captured pointer held at an edge of display 0's window where the guest's desktop puts
+/// display 1 goes on onto display 1, as the guest arranged them, its moves scaled as over display
+/// 0's window, and comes back across the same edge; edges no display meets hold it
+#[test]
+fn a_pointer_past_a_shared_edge_goes_onto_the_display_there() {
+    let rig = placed(1, 1920, 0);
+    let link = rig.device.pointer_link();
+    let mode = (1920, 1080);
+    assert!(link.adjoins(0, (1919, 500), mode, (1, 0)));
+    assert!(
+        !link.adjoins(0, (1919, 500), mode, (0, 1)),
+        "the bottom edge"
+    );
+    assert!(!link.adjoins(0, (0, 500), mode, (-1, 0)), "the left edge");
+    assert!(!link.adjoins(0, (1919, 0), mode, (0, -1)), "the top edge");
+    assert!(link.adjoins(1, (0, 10), mode, (-1, 0)), "and back");
+    assert!(link.leave(0, (1919, 500), mode));
+    let spot = |display, x, y| Spot {
+        display,
+        x,
+        y,
+        width: 1920,
+        height: 1080,
+    };
+    assert_eq!(link.away_moved(0.4, 0.0), Some(spot(0, 1919, 500)));
+    assert_eq!(link.away_moved(1.0, 0.0), Some(spot(1, 0, 500)));
+    assert_eq!(link.away_moved(300.0, -20.0), Some(spot(1, 300, 480)));
+    // Up past display 1's top, which no display meets: held there.
+    assert_eq!(link.away_moved(0.0, -1000.0), Some(spot(1, 300, 0)));
+    assert_eq!(link.away_moved(-301.0, 10.0), Some(spot(0, 1919, 10)));
+    link.come_back();
+    assert_eq!(link.away_moved(1.0, 0.0), None, "the window's again");
+}
+
+/// The guest's arrangement decides: display 1 left of display 0 meets display 0's left edge,
+/// and a HiDPI guest's points carry the pointer as far as its pixels show
+#[test]
+fn the_guest_s_arrangement_decides_which_edge_meets_which_display() {
+    let rig = placed(2, -1920, 300);
+    let link = rig.device.pointer_link();
+    let mode = (3840, 2160);
+    assert!(
+        !link.adjoins(0, (3839, 1000), mode, (1, 0)),
+        "the right edge"
+    );
+    assert!(!link.adjoins(0, (0, 100), mode, (-1, 0)), "above display 1");
+    assert!(link.adjoins(0, (0, 1000), mode, (-1, 0)));
+    assert!(link.leave(0, (0, 1000), mode));
+    // Two pixels of display 0 are a point of the desktop, and four pixels of display 1.
+    let spot = link.away_moved(-4.0, 0.0).unwrap();
+    assert_eq!((spot.display, spot.x, spot.y), (1, 3836, 400));
+    assert_eq!((spot.width, spot.height), (3840, 2160));
+}
+
+/// Nothing goes past an edge for a guest that did not take `DISPLAY_BOUNDS` or gave no
+/// rectangles, nor for a display the guest does not see, and a reset forgets the rectangles and
+/// the pointer gone onto the desktop
+#[test]
+fn only_a_guest_that_placed_its_displays_carries_the_pointer_past_an_edge() {
+    let mode = (1920, 1080);
+    let mut untaken = Rig::of_displays(2);
+    take_pointer_over(&untaken);
+    untaken.start();
+    let at = RGFX_ALLOCATIONS_OFFSET + ROOM_OF_TWO;
+    for (display, at) in [(0, RGFX_ALLOCATIONS_OFFSET), (1, at)] {
+        let s = untaken.send(scanout_on(display, 1920, 1080, 7680, at));
+        assert_eq!(untaken.complete(), (s, RGFX_STATUS_OK));
+    }
+    untaken.send(bounds_of(0, 0, 0, 1920, 1080));
+    untaken.send(bounds_of(1, 1920, 0, 1920, 1080));
+    untaken.send(get_displays());
+    untaken.event().unwrap();
+    let link = untaken.device.pointer_link();
+    assert!(!link.adjoins(0, (1919, 500), mode, (1, 0)));
+    assert!(!link.leave(0, (1919, 500), mode));
+
+    let mut unplaced = Rig::of_displays(2);
+    take_bounds(&unplaced);
+    unplaced.start();
+    unplaced.send(bounds_of(0, 0, 0, 1920, 1080));
+    unplaced.send(bounds_of(1, 1920, 0, 1920, 1080));
+    unplaced.send(bounds_of(2, 0, 1080, 1920, 1080));
+    unplaced.send(get_displays());
+    unplaced.event().unwrap();
+    assert!(
+        !unplaced
+            .device
+            .pointer_link()
+            .adjoins(0, (1919, 500), mode, (1, 0)),
+        "no scanout"
+    );
+
+    let mut rig = placed(1, 1920, 0);
+    let link = rig.device.pointer_link();
+    assert!(!link.adjoins(2, (0, 0), mode, (1, 0)), "past the count");
+    // Display 1's rectangle of no area forgets it.
+    rig.send(bounds_of(1, 1920, 0, 0, 1080));
+    rig.send(get_displays());
+    rig.event().unwrap();
+    assert!(!link.adjoins(0, (1919, 500), mode, (1, 0)));
+    rig.send(bounds_of(1, 1920, 0, 1920, 1080));
+    rig.send(get_displays());
+    rig.event().unwrap();
+    assert!(link.leave(0, (1919, 500), mode));
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    (rig.produced, rig.consumed, rig.seqno) = (0, 0, 0);
+    take_bounds(&rig);
+    rig.start();
+    assert_eq!(link.away_moved(1.0, 0.0), None, "a reset ends it");
+    assert!(
+        !link.adjoins(0, (1919, 500), mode, (1, 0)),
+        "a reset forgets the rectangles"
+    );
 }

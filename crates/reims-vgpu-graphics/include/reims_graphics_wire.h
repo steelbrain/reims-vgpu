@@ -1505,6 +1505,15 @@
 // alone (a kext built before this bit, the arm64e kext, Ambrosia's module) is never sent it.
 #define RGFX_FEATURE_POINTER_OVER 562949953421312
 
+// `FEATURES_HI` bit 18, feature bit 50, `DISPLAY_BOUNDS`: ring 0 carries
+// [`RGFX_CMD_DISPLAY_BOUNDS`], each display's rectangle in the guest's desktop, by which the
+// host carries its captured pointer, held at a display's edge where another display meets it,
+// onto that display (docs/graphics-kext/design.md, "Multiple displays"). The device offers it
+// beside [`RGFX_FEATURE_MULTI_DISPLAY`] and [`RGFX_FEATURE_POINTER_OVER`], only where its host
+// made it with two displays or more, and carries the pointer past a display's edge only for a
+// guest that took all three and sent the displays' rectangles.
+#define RGFX_FEATURE_DISPLAY_BOUNDS 1125899906842624
+
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 #define RGFX_REG_STATUS 16
@@ -1737,6 +1746,10 @@
 // Command `SET_DISPLAY_POWER` ([`RgfxSetDisplayPower`]), where the guest took
 // [`RGFX_FEATURE_DISPLAY_POWER`]: answered by [`RGFX_EVT_COMPLETE`].
 #define RGFX_CMD_SET_DISPLAY_POWER 8
+
+// Command `DISPLAY_BOUNDS` ([`RgfxDisplayBounds`]), where the guest took
+// [`RGFX_FEATURE_DISPLAY_BOUNDS`]: not answered.
+#define RGFX_CMD_DISPLAY_BOUNDS 9
 
 // Event `COMPLETE` ([`RgfxComplete`]): a command's answer, with its `seqno`.
 #define RGFX_EVT_COMPLETE 256
@@ -4447,6 +4460,31 @@ typedef struct {
   // not list has none.
   RgfxFormatAnswers formats[RGFX_DEVICE_INFO_FORMATS];
 } RgfxDeviceInfo;
+
+// `DISPLAY_BOUNDS`: display `display` lies at (`min_x`, `min_y`) up to (`max_x`, `max_y`), the
+// corner past it, of the guest's desktop: WindowServer's global space, in points, where the
+// guest arranged its displays (the x86-64 kext's framebuffer's `getBoundingRect`). The guest
+// sends each display's whenever it changes, and the host keeps the latest until a reset. The
+// host's captured pointer, held at an edge of a display's window where another display's
+// rectangle meets that display's, goes on onto that display, as the guest's cursor does on a
+// Mac (docs/graphics-kext/design.md, "Multiple displays"). A rectangle of no area, or one of a
+// display the guest does not see, is dropped.
+typedef struct {
+  // [`RGFX_CMD_DISPLAY_BOUNDS`].
+  RgfxMsgHeader header;
+  // The display's id.
+  uint32_t display;
+  // The rectangle's left edge, in the desktop's points.
+  int32_t min_x;
+  // Its top edge.
+  int32_t min_y;
+  // Its right edge, past its last column.
+  int32_t max_x;
+  // Its bottom edge, past its last row.
+  int32_t max_y;
+  // Keeps the size a multiple of 8; 0.
+  uint32_t reserved_24;
+} RgfxDisplayBounds;
 
 // `DISPLAY_CHANGED`: what the display offers has changed; the guest asks `GET_DISPLAYS` again.
 typedef struct {

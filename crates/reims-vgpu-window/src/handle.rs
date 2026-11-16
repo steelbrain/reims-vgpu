@@ -135,6 +135,14 @@ impl CursorLead {
         std::mem::replace(&mut self.guest_leads, false)
     }
 
+    /// A pointer that is not the window's own moved the guest's cursor (another window's captured
+    /// pointer gone past its image's edge, `crate::beyond`): the host's pointer is not over the
+    /// image, so the guest leads, and the window draws the cursor. Whether that changed who does.
+    pub(crate) fn pointer_beyond(&mut self) -> bool {
+        self.pointer_sent = None;
+        !std::mem::replace(&mut self.guest_leads, true)
+    }
+
     /// The guest's cursor position last read.
     pub(crate) fn at(&self) -> Option<(u16, u16)> {
         self.at
@@ -402,6 +410,28 @@ impl Window {
         if drawn {
             self.surface.request_draw();
         }
+    }
+
+    /// A captured pointer gone past an image's edge onto the guest's desktop is over this
+    /// window's display at (`x`, `y`) of a `width` by `height` mode, with the `BUTTON_*`
+    /// `buttons` held (`crate::beyond`, [`crate::PointerBeyond`]): the host's pointer callback
+    /// gets it, while the window lives, as from the window's own pointer. The host's pointer is
+    /// not over the image (it is held, hidden, over the window it left, or over this one's edge),
+    /// so the window draws the guest's cursor where the guest puts it (the module doc) until its
+    /// own pointer moves it again. On the UI thread, as a callback.
+    pub fn pointer_from_beyond(&self, x: u16, y: u16, width: u16, height: u16, buttons: u32) {
+        let Some(pointer) = self.callbacks().and_then(|callbacks| callbacks.pointer) else {
+            return;
+        };
+        if self.guest.lock().lead.pointer_beyond() {
+            log::debug!(
+                target: "reims_vgpu_window",
+                "a pointer from beyond moves the guest's cursor: the window draws it"
+            );
+            self.post_cursor_refresh();
+            self.surface.request_draw();
+        }
+        pointer(x, y, width, height, buttons);
     }
 
     /// Posts a cursor refresh to the UI thread, unless one is posted and has not run yet: it
@@ -784,5 +814,40 @@ mod tests {
             "the guest following the pointer"
         );
         window.close();
+    }
+
+    /// A captured pointer gone past another window's image's edge goes to this window's host
+    /// callback while the window lives, and the window draws the guest's cursor there, as the
+    /// host's pointer is not over its image; its own pointer event gives the cursor back to the
+    /// host's
+    #[test]
+    fn a_pointer_from_beyond_reaches_the_host_and_the_window_draws_the_cursor() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let into = Arc::clone(&sent);
+        let mut config = WindowConfig::default();
+        config.callbacks.pointer = Some(Arc::new(move |x, y, w, h, buttons| {
+            into.lock().push((x, y, w, h, buttons));
+        }));
+        let window = Window::new(config, 1, title(1));
+        let g = glyph(4);
+        window.cursor_glyph(g.width, g.height, g.hot_spot, &g.rgba);
+        window.guest_mode(1920, 1080);
+        window.cursor_show(true);
+        window.cursor_at((10, 20));
+        window.pointer_sent();
+        assert!(window.drawn_cursor().is_none(), "the host's pointer leads");
+        window.pointer_from_beyond(0, 500, 1920, 1080, crate::BUTTON_LEFT);
+        assert_eq!(*sent.lock(), [(0, 500, 1920, 1080, crate::BUTTON_LEFT)]);
+        assert_eq!(window.drawn_cursor().unwrap().at, (10, 20));
+        window.cursor_at((1, 500));
+        assert_eq!(window.drawn_cursor().unwrap().at, (1, 500));
+        window.pointer_sent();
+        assert!(
+            window.drawn_cursor().is_none(),
+            "its own pointer leads again"
+        );
+        window.close();
+        window.pointer_from_beyond(2, 500, 1920, 1080, 0);
+        assert_eq!(sent.lock().len(), 1, "nothing after the end");
     }
 }
