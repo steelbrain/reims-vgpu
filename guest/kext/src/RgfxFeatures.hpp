@@ -157,7 +157,10 @@
 //    framebuffer's move of the cursor tells the host every display's rectangle in WindowServer's
 //    global space that changed (RgfxDisplayBounds.hpp), by which the host carries its captured
 //    pointer past one display's edge onto the display the guest placed there, which needs
-//    nothing of the bundle.
+//    nothing of the bundle;
+//  - POINTER_MOTION (bit 51), both kexts: the framebuffer publishes the guest's own mouse
+//    (RgfxPointerDevice.hpp) and hands it each POINTER_MOTION's reports
+//    (RgfxPointerMotion.hpp), which needs nothing of the bundle.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -198,6 +201,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_FUNCTION_POINTERS | RGFX_FEATURE_DYNAMIC_LIBRARIES | RGFX_FEATURE_PIPELINE_KEYS |
     RGFX_FEATURE_ICB_SLOTS_IN_PAGES | RGFX_FEATURE_DOORBELL_ASKS | RGFX_FEATURE_GUEST_TIMES |
     RGFX_FEATURE_READ_ONLY_PAGES | RGFX_FEATURE_DOORBELL_PAGES | RGFX_FEATURE_PIPELINE_ANSWERS |
+    RGFX_FEATURE_POINTER_MOTION |
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K
                       : RGFX_FEATURE_DISPLAY_POWER | RGFX_FEATURE_MULTI_DISPLAY |
                             RGFX_FEATURE_POINTER_OVER | RGFX_FEATURE_DISPLAY_BOUNDS);

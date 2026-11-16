@@ -30,6 +30,13 @@
 //! - **No stuck keys**: losing the keyboard, releasing capture and closing send an up for every
 //!   key held; losing the keyboard and closing lift the buttons held too.
 //!
+//! - **For games**, where the guest has its own mouse ([`crate::PointerMotion`]): captured, while
+//!   the guest hides its cursor on every display, the window locks the host's pointer (SDL's
+//!   relative mode, its motion the device's own counts) and hands its motion, its buttons
+//!   pressed meanwhile and its wheel to the guest's mouse ([`crate::game`]), until the guest shows
+//!   its cursor again, where the host's pointer is let go over it; a button comes up by the route
+//!   it went down by. Releasing capture, losing the keyboard and closing let the pointer go where
+//!   it was held.
 //! - **Past the image's edge**, where the host gives the window the guest's other displays
 //!   ([`crate::PointerBeyond`]): the captured pointer moving toward an edge another display meets,
 //!   within reach of it, goes on onto it ([`crate::beyond`]). The window locks the host's pointer
@@ -46,12 +53,13 @@
 
 use std::sync::Arc;
 
-use crate::beyond::{Back, Beyond, Hold};
+use crate::beyond::{Back, Beyond, Hold, point_of};
 use crate::capture::{Capture, UNCAPTURED_SUFFIX};
 use crate::config::{
     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, PointerBeyond,
-    ScrollEvent, WindowCallbacks,
+    PointerMotion, ScrollEvent, WindowCallbacks,
 };
+use crate::game::Game;
 use crate::geometry::{self, Rect};
 use crate::keys::{KeyEvent, KeyState};
 use crate::scroll::POINTS_PER_LINE;
@@ -72,6 +80,8 @@ pub(crate) struct At {
     pub(crate) image: Rect,
     /// The guest's mode, once it has set one.
     pub(crate) guest: Option<(u16, u16)>,
+    /// The guest's cursor, in its mode's pixels, where it shows over the window's display.
+    pub(crate) cursor: Option<(u16, u16)>,
 }
 
 /// What the window does after an event.
@@ -134,6 +144,14 @@ fn guest_mode(at: &At) -> Option<(u16, u16)> {
     at.guest.filter(|&(width, height)| width > 0 && height > 0)
 }
 
+/// The window's point over the guest's cursor in `at`, where it shows over the window's display.
+fn cursor_point(at: &At) -> Option<(f64, f64)> {
+    let mode = guest_mode(at)?;
+    let cursor = at.cursor?;
+    let inside = (cursor.0.min(mode.0 - 1), cursor.1.min(mode.1 - 1));
+    Some(point_of(inside, at.image, mode))
+}
+
 /// `points` in 1/256 point, rounded; 0 for what is not a number.
 fn fixed(points: f64) -> i32 {
     if points.is_finite() {
@@ -168,6 +186,10 @@ pub(crate) struct Input {
     away: Beyond,
     /// What the window does with the host's pointer next, since [`Self::take_hold`] last took it.
     hold: Option<Hold>,
+    /// The guest's own mouse, where the host gives it.
+    motion: Option<Arc<dyn PointerMotion>>,
+    /// Whether the captured pointer drives it.
+    game: Game,
 }
 
 impl std::fmt::Debug for Input {
@@ -176,6 +198,7 @@ impl std::fmt::Debug for Input {
             .field("capture", &self.capture)
             .field("buttons", &self.buttons)
             .field("away", &self.away)
+            .field("game", &self.game)
             .finish_non_exhaustive()
     }
 }
@@ -187,19 +210,36 @@ impl Input {
         Input::default()
     }
 
-    /// [`Self::new`], its captured pointer going past the image's edge through `beyond`, where
-    /// the host gives it.
-    pub(crate) fn with_beyond(beyond: Option<Arc<dyn PointerBeyond>>) -> Input {
+    /// [`Self::new`], its captured pointer going past the image's edge through `beyond`, and
+    /// driving the guest's own mouse `motion` while the guest hides its cursor, where the host
+    /// gives each.
+    pub(crate) fn with_links(
+        beyond: Option<Arc<dyn PointerBeyond>>,
+        motion: Option<Arc<dyn PointerMotion>>,
+    ) -> Input {
         Input {
             beyond,
+            motion,
             ..Input::default()
         }
     }
 
-    /// Whether the captured pointer has gone past the image's edge: SDL reports its moves as
-    /// motion alone ([`Self::moved_by`]).
+    /// Whether the captured pointer has gone past the image's edge.
+    #[cfg(test)]
     pub(crate) fn is_away(&self) -> bool {
         self.away.is_away()
+    }
+
+    /// Whether the host's pointer is locked: gone past the image's edge, or driving the guest's
+    /// mouse. SDL reports its moves as motion alone ([`Self::moved_by`]).
+    pub(crate) fn is_locked(&self) -> bool {
+        self.away.is_away() || self.game.is_on()
+    }
+
+    /// Whether the captured pointer drives the guest's own mouse.
+    #[cfg(test)]
+    pub(crate) fn drives_the_guest_s_mouse(&self) -> bool {
+        self.game.is_on()
     }
 
     /// What the window does with the host's pointer next, taken: lock it as it goes past the
@@ -211,6 +251,10 @@ impl Input {
     /// The window could not lock the host's pointer: the pointer is the window's again, where it
     /// was held.
     pub(crate) fn lock_refused(&mut self) {
+        if let Some(hold) = self.game.refused() {
+            self.hold = Some(hold);
+            return;
+        }
         let beyond = self.beyond.clone();
         if let Some(back) = self.away.let_go(beyond.as_deref()) {
             self.came_back(back);
@@ -269,14 +313,22 @@ impl Input {
         }
     }
 
-    /// The pointer moved. Captured, moving toward an edge another display meets and within reach
-    /// of it, it goes past it ([`crate::beyond`]). A place SDL reports while the pointer is away
-    /// is SDL's own (the lock's warp): the pointer's moves are [`Self::moved_by`]'s.
+    /// The pointer moved. Captured, with the guest's cursor hidden, it drives the guest's mouse
+    /// ([`crate::game`]); moving toward an edge another display meets and within reach of it, it
+    /// goes past it ([`crate::beyond`]). A place SDL reports while the pointer is locked is SDL's
+    /// own (the lock's warp): the pointer's moves are [`Self::moved_by`]'s.
     pub(crate) fn moved(&mut self, at: &At) {
-        if self.away.is_away() {
+        if self.is_locked() {
             return;
         }
         if let (Some(point), Some(mode)) = (at.point, guest_mode(at)) {
+            if self.capture.is_captured()
+                && let Some(motion) = self.motion.clone()
+                && let Some(hold) = self.game.begin(motion.as_ref(), point)
+            {
+                self.hold = Some(hold);
+                return;
+            }
             let from = match self.last {
                 Some(ToHost::Pointer { at, .. }) => Some(at),
                 _ => None,
@@ -294,10 +346,30 @@ impl Input {
         }
     }
 
-    /// The pointer gone past the edge moved by `by`, in the window's points (SDL's relative
-    /// motion): it goes on, and comes back where it lands on the window's display, away from the
-    /// edge.
+    /// The locked pointer moved by `by` (SDL's relative motion): driving the guest's mouse, by
+    /// the device's counts, until the guest shows its cursor; gone past the edge, by the window's
+    /// points, on, coming back where it lands on the window's display, away from the edge, or
+    /// driving the guest's mouse from where it is once the guest hides its cursor.
     pub(crate) fn moved_by(&mut self, by: (f64, f64), at: &At) {
+        if let Some(motion) = self.motion.clone() {
+            if self.game.is_on() {
+                let cursor = cursor_point(at);
+                if let Some(hold) = self.game.moved(motion.as_ref(), by, cursor) {
+                    self.hold = Some(hold);
+                }
+                return;
+            }
+            if self.away.is_away()
+                && let Some(back) = self.away.held()
+                && let Some(hold) = self.game.begin(motion.as_ref(), back)
+            {
+                // Away, the guest hid its cursor: the lock stays, its motion now raw.
+                let beyond = self.beyond.clone();
+                self.away.let_go(beyond.as_deref());
+                self.hold = Some(hold);
+                return;
+            }
+        }
         let Some(beyond) = self.beyond.clone() else {
             return;
         };
@@ -324,6 +396,9 @@ impl Input {
 
     /// Button `bit` went down at `timestamp` (SDL's event clock).
     pub(crate) fn button_down(&mut self, bit: u32, timestamp: u64, at: &At) -> Reaction {
+        if self.game.press(self.motion.as_deref(), bit) {
+            return Reaction::default();
+        }
         if self.away.is_away() {
             // Captured: the button goes where the pointer is.
             if bit != 0 {
@@ -357,14 +432,24 @@ impl Input {
         }
     }
 
-    /// Button `bit` went up: sent where the guest was told it is down, wherever the pointer is.
+    /// Button `bit` went up: sent where the guest was told it is down, wherever the pointer is,
+    /// by the route it went down by (the guest's mouse, or the tablet).
     pub(crate) fn button_up(&mut self, bit: u32, at: &At) {
+        if self.game.release(self.motion.as_deref(), bit) {
+            return;
+        }
         if self.buttons & bit == 0 {
             return;
         }
         self.buttons &= !bit;
         if self.away.is_away() {
             self.away_buttons();
+            return;
+        }
+        if self.game.is_on() {
+            // The tablet's button, pressed before the guest's mouse was driven: up where the
+            // tablet is.
+            self.resend_buttons();
             return;
         }
         if let (Some(point), Some(mode)) = (at.point, guest_mode(at)) {
@@ -377,7 +462,14 @@ impl Input {
         let (Some(point), Some(_)) = (at.point, guest_mode(at)) else {
             return;
         };
-        if !self.away.is_away() {
+        if self.game.is_on() {
+            let sign = if wheel.flipped { -1 } else { 1 };
+            let up = wheel.notches.1.saturating_mul(sign);
+            if up != 0 {
+                self.game.wheel(self.motion.as_deref(), up);
+                return;
+            }
+        } else if !self.away.is_away() {
             if !geometry::contains(at.image, point) {
                 return;
             }
@@ -430,6 +522,7 @@ impl Input {
         self.focused = false;
         self.lift_keys();
         self.lift_buttons();
+        self.let_go_game();
         self.let_go_away();
         Reaction {
             capture_changed: self.capture.resign_key(),
@@ -439,6 +532,7 @@ impl Input {
     /// Releases capture, lifting every key held.
     pub(crate) fn release_capture(&mut self) -> Reaction {
         self.lift_keys();
+        self.end_game();
         self.let_go_away();
         Reaction {
             capture_changed: self.capture.release(),
@@ -449,6 +543,7 @@ impl Input {
     pub(crate) fn closing(&mut self) {
         self.lift_keys();
         self.lift_buttons();
+        self.let_go_game();
         self.let_go_away();
         self.capture.release();
     }
@@ -457,6 +552,45 @@ impl Input {
     fn lift_keys(&mut self) {
         let ups = self.keys.release_all();
         self.out.extend(ups.into_iter().map(ToHost::Key));
+    }
+
+    /// The guest showed or hid its cursor: driving the guest's mouse, the pointer is the
+    /// window's again once the guest shows it, the host's pointer let go over it.
+    pub(crate) fn cursor_changed(&mut self, at: &At) {
+        if let Some(motion) = self.motion.clone()
+            && let Some(hold) = self.game.shown(motion.as_ref(), cursor_point(at))
+        {
+            self.hold = Some(hold);
+        }
+    }
+
+    /// Lifts the buttons held through the guest's mouse, and lets go of the pointer driving it
+    /// where it was held.
+    fn let_go_game(&mut self) {
+        self.game.lift(self.motion.as_deref());
+        self.end_game();
+    }
+
+    /// The pointer driving the guest's mouse is the window's again, where it was held; a refused
+    /// lock may be tried again.
+    fn end_game(&mut self) {
+        if let Some(hold) = self.game.end() {
+            self.hold = Some(hold);
+        }
+    }
+
+    /// The tablet's buttons changed while the pointer drives the guest's mouse: the last
+    /// pointer's pixel with them.
+    fn resend_buttons(&mut self) {
+        if let Some(ToHost::Pointer { at, mode, .. }) = self.last {
+            let event = ToHost::Pointer {
+                at,
+                mode,
+                buttons: self.buttons,
+            };
+            self.last = Some(event);
+            self.out.push(event);
+        }
     }
 
     /// A pointer event with no button, where one is held, at the last pointer's pixel.
@@ -517,6 +651,8 @@ mod tests {
     use reims_vgpu_vulkan::core::sync::Mutex;
 
     use super::*;
+    use crate::game::SETTLE_NS;
+    use crate::game::tests::Mouse;
 
     /// A 100×50 image at the window's origin, a 200×100 guest mode, the pointer at `point`.
     fn at(point: (f64, f64)) -> At {
@@ -529,6 +665,7 @@ mod tests {
                 height: 50.0,
             },
             guest: Some((200, 100)),
+            cursor: None,
         }
     }
 
@@ -780,7 +917,7 @@ mod tests {
     /// A captured input with `desktop` beyond its image's edges.
     fn captured_beside(desktop: &Arc<RightOfIt>) -> Input {
         let beyond: Arc<dyn PointerBeyond> = desktop.clone();
-        let mut input = Input::with_beyond(Some(beyond));
+        let mut input = Input::with_links(Some(beyond), None);
         input.focus_gained(0);
         input.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
         input.button_up(BUTTON_LEFT, &at((10.0, 10.0)));
@@ -882,10 +1019,227 @@ mod tests {
         alone.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
         alone.moved(&at((99.9, 10.0)));
         assert_eq!(alone.take_hold(), None);
-        let mut uncaptured = Input::with_beyond(Some(desktop.clone() as Arc<dyn PointerBeyond>));
+        let mut uncaptured =
+            Input::with_links(Some(desktop.clone() as Arc<dyn PointerBeyond>), None);
         uncaptured.moved(&at((99.9, 10.0)));
         assert_eq!(uncaptured.take_hold(), None);
         assert_eq!(uncaptured.take(), vec![pointer(199, 20, 0)]);
+    }
+
+    /// An input captured by a click, driving the guest's mouse `motion` where it is given.
+    fn captured_by(motion: Option<Arc<Mouse>>) -> Input {
+        let mut input = Input::with_links(None, motion.map(|m| m as Arc<dyn PointerMotion>));
+        input.focus_gained(0);
+        input.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
+        input.button_up(BUTTON_LEFT, &at((10.0, 10.0)));
+        input.take();
+        input
+    }
+
+    /// Moves, a drag past the image's edge and the wheel, as the tablet hears them.
+    fn desk_work(input: &mut Input) -> Vec<ToHost> {
+        input.moved(&at((20.0, 10.0)));
+        input.moved(&at((40.0, 20.0)));
+        input.button_down(BUTTON_RIGHT, 2_000_000_000, &at((40.0, 20.0)));
+        input.moved(&at((150.0, 10.0)));
+        input.button_up(BUTTON_RIGHT, &at((150.0, 10.0)));
+        input.moved(&at((60.0, 30.0)));
+        input.wheel(
+            Wheel {
+                notches: (0, 1),
+                lines: (0.0, 1.0),
+                flipped: false,
+            },
+            &at((60.0, 30.0)),
+        );
+        input.take()
+    }
+
+    /// Outside a game the tablet hears exactly what it hears with no guest's mouse, and the
+    /// guest's mouse nothing: captured while the guest shows its cursor, or has hidden it for
+    /// less than the settle, and uncaptured however long it hides it
+    #[test]
+    fn the_tablet_s_events_are_unchanged_outside_a_game() {
+        let plain = desk_work(&mut captured_by(None));
+        assert!(!plain.is_empty());
+        for hidden in [None, Some(SETTLE_NS - 1)] {
+            let mouse = Arc::new(Mouse::default());
+            *mouse.hidden.lock() = hidden;
+            let mut input = captured_by(Some(Arc::clone(&mouse)));
+            assert_eq!(desk_work(&mut input), plain, "hidden for {hidden:?}");
+            assert_eq!(input.take_hold(), None);
+            assert_eq!(mouse.take(), vec![]);
+        }
+        // Uncaptured: moves alone, since a click in the image captures.
+        let roam = |input: &mut Input| {
+            input.moved(&at((20.0, 10.0)));
+            input.moved(&at((150.0, 10.0)));
+            input.moved(&at((60.0, 30.0)));
+            input.take()
+        };
+        let uncaptured = roam(&mut focused());
+        let mouse = Arc::new(Mouse::default());
+        mouse.hide_for(SETTLE_NS);
+        let mut input = Input::with_links(None, Some(Arc::clone(&mouse) as Arc<dyn PointerMotion>));
+        input.focus_gained(0);
+        assert_eq!(roam(&mut input), uncaptured);
+        assert_eq!(input.take_hold(), None);
+        assert_eq!(mouse.take(), vec![]);
+    }
+
+    /// Captured, once the guest has hidden its cursor for the settle, the host's pointer is
+    /// locked where it is, and its motion, by whole counts, and the wheel's notches drive the
+    /// guest's mouse, however far: the tablet hears nothing. Once the guest shows its cursor the
+    /// pointer is the window's again, let go over the guest's cursor on the window's display, else
+    /// where it was held
+    #[test]
+    fn a_hidden_cursor_s_motion_drives_the_guest_s_mouse_until_it_shows() {
+        let mouse = Arc::new(Mouse::default());
+        let mut input = captured_by(Some(Arc::clone(&mouse)));
+        mouse.hide_for(SETTLE_NS);
+        input.moved(&at((99.0, 10.0)));
+        assert_eq!(input.take_hold(), Some(Hold::Raw));
+        assert!(input.is_locked() && input.drives_the_guest_s_mouse());
+        input.moved_by((500.0, 0.0), &at((99.0, 10.0)));
+        input.moved_by((300.5, -2.0), &at((99.0, 10.0)));
+        input.moved_by((0.5, 0.0), &at((99.0, 10.0)));
+        input.moved(&at((10.0, 10.0)));
+        input.wheel(
+            Wheel {
+                notches: (0, 2),
+                lines: (0.0, 2.0),
+                flipped: true,
+            },
+            &at((99.0, 10.0)),
+        );
+        assert_eq!(
+            mouse.take(),
+            vec![
+                ((500, 0), 0, 0),
+                ((300, -2), 0, 0),
+                ((1, 0), 0, 0),
+                ((0, 0), -2, 0)
+            ]
+        );
+        assert_eq!(input.take(), vec![], "the tablet hears nothing");
+        // The guest shows its cursor at pixel (50, 40) of the window's display.
+        mouse.show();
+        input.cursor_changed(&At {
+            cursor: Some((50, 40)),
+            ..at((99.0, 10.0))
+        });
+        assert_eq!(input.take_hold(), Some(Hold::Unlock((25.25, 20.25))));
+        assert!(!input.is_locked());
+        input.moved(&at((25.25, 20.25)));
+        input.moved(&at((30.0, 20.25)));
+        assert_eq!(input.take(), vec![pointer(50, 40, 0), pointer(60, 40, 0)]);
+        // Hidden again, then shown on another display, seen at the next motion.
+        mouse.hide_for(SETTLE_NS);
+        input.moved(&at((30.0, 20.0)));
+        assert_eq!(input.take_hold(), Some(Hold::Raw));
+        mouse.show();
+        input.moved_by((3.0, 0.0), &at((30.0, 20.0)));
+        assert_eq!(mouse.take(), vec![((3, 0), 0, 0)]);
+        assert_eq!(input.take_hold(), Some(Hold::Unlock((30.0, 20.0))));
+        assert!(!input.drives_the_guest_s_mouse());
+    }
+
+    /// A button comes up by the route it went down by, held across either switch: one pressed on
+    /// the tablet before the guest's mouse is driven comes up on the tablet where it last was; one
+    /// pressed through the guest's mouse comes up through it after the guest shows its cursor
+    #[test]
+    fn a_button_held_across_the_switch_comes_up_by_its_own_route() {
+        let mouse = Arc::new(Mouse::default());
+        let mut input = captured_by(Some(Arc::clone(&mouse)));
+        input.button_down(BUTTON_RIGHT, 2_000_000_000, &at((20.0, 10.0)));
+        assert_eq!(input.take(), vec![pointer(40, 20, BUTTON_RIGHT)]);
+        mouse.hide_for(SETTLE_NS);
+        input.moved(&at((21.0, 10.0)));
+        assert_eq!(input.take_hold(), Some(Hold::Raw));
+        input.moved_by((4.0, 0.0), &at((21.0, 10.0)));
+        input.button_down(BUTTON_LEFT, 3_000_000_000, &at((21.0, 10.0)));
+        input.moved_by((1.0, 1.0), &at((21.0, 10.0)));
+        input.button_up(BUTTON_RIGHT, &at((21.0, 10.0)));
+        assert_eq!(
+            mouse.take(),
+            vec![
+                ((4, 0), 0, 0),
+                ((0, 0), 0, BUTTON_LEFT),
+                ((1, 1), 0, BUTTON_LEFT)
+            ]
+        );
+        assert_eq!(
+            input.take(),
+            vec![pointer(40, 20, 0)],
+            "the tablet's comes up there"
+        );
+        mouse.show();
+        input.cursor_changed(&at((21.0, 10.0)));
+        assert_eq!(input.take_hold(), Some(Hold::Unlock((21.0, 10.0))));
+        input.button_up(BUTTON_LEFT, &at((21.0, 10.0)));
+        assert_eq!(
+            mouse.take(),
+            vec![((0, 0), 0, 0)],
+            "the mouse's comes up there"
+        );
+        assert_eq!(input.take(), vec![]);
+        input.button_down(BUTTON_LEFT, 4_000_000_000, &at((21.0, 10.0)));
+        assert_eq!(input.take(), vec![pointer(42, 20, BUTTON_LEFT)]);
+        assert_eq!(mouse.take(), vec![]);
+    }
+
+    /// Releasing capture (the chord), losing the keyboard and closing give the window back the
+    /// pointer driving the guest's mouse where it was held, a button held through the mouse lifted
+    /// on the keyboard's loss and the close; a lock the OS refuses gives it back too, and is not
+    /// tried again until capture changes
+    #[test]
+    fn letting_go_of_a_game_gives_the_pointer_back_where_it_was_held() {
+        let mouse = Arc::new(Mouse::default());
+        mouse.hide_for(SETTLE_NS);
+        let in_game = || {
+            let mut input = captured_by(Some(Arc::clone(&mouse)));
+            input.moved(&at((30.0, 10.0)));
+            assert_eq!(input.take_hold(), Some(Hold::Raw));
+            input
+        };
+        let mut input = in_game();
+        for usage in [0xE0, 0xE2, 0xE3] {
+            input.key(usage, true, false);
+        }
+        assert!(!input.is_captured() && !input.is_locked());
+        assert_eq!(input.take_hold(), Some(Hold::Unlock((30.0, 10.0))));
+
+        let mut input = in_game();
+        input.button_down(BUTTON_LEFT, 2_000_000_000, &at((30.0, 10.0)));
+        mouse.take();
+        input.focus_lost();
+        assert_eq!(mouse.take(), vec![((0, 0), 0, 0)]);
+        assert!(!input.is_locked());
+        assert_eq!(input.take_hold(), Some(Hold::Unlock((30.0, 10.0))));
+
+        let mut input = in_game();
+        input.button_down(BUTTON_MIDDLE, 2_000_000_000, &at((30.0, 10.0)));
+        mouse.take();
+        input.closing();
+        assert_eq!(mouse.take(), vec![((0, 0), 0, 0)]);
+        assert_eq!(input.take_hold(), Some(Hold::Unlock((30.0, 10.0))));
+
+        let mut input = in_game();
+        input.lock_refused();
+        assert_eq!(input.take_hold(), Some(Hold::Unlock((30.0, 10.0))));
+        assert!(!input.is_locked());
+        input.moved(&at((31.0, 10.0)));
+        assert_eq!(input.take_hold(), None, "not tried again while captured");
+        assert_eq!(input.take(), vec![pointer(62, 20, 0)]);
+        input.release_capture();
+        input.button_down(BUTTON_LEFT, 5_000_000_000, &at((31.0, 10.0)));
+        input.moved(&at((32.0, 10.0)));
+        assert_eq!(
+            input.take_hold(),
+            Some(Hold::Raw),
+            "tried again at the next capture"
+        );
+        assert_eq!(mouse.take(), vec![]);
     }
 
     /// SDL's buttons to the host's bits

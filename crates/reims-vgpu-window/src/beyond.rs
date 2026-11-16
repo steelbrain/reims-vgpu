@@ -25,8 +25,12 @@ use crate::geometry::{self, Rect};
 /// What the window does with the host's pointer as it leaves and comes back.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Hold {
-    /// Holds it still where it is, hidden, its moves reported as motion alone.
+    /// Holds it still where it is, hidden, its moves reported as motion alone, as the desktop
+    /// accelerates them.
     Lock,
+    /// Holds it still where it is, hidden, its moves reported as the device's own counts, as no
+    /// acceleration has changed them: the pointer for games ([`crate::game`]).
+    Raw,
     /// Lets it go at the window's point (in points), over the image.
     Unlock((f64, f64)),
 }
@@ -117,7 +121,7 @@ pub fn at_shared_edge(
 }
 
 /// The window's point at the centre of guest pixel `at` of `mode`, over `image`.
-fn point_of(at: (u16, u16), image: Rect, mode: (u16, u16)) -> (f64, f64) {
+pub(crate) fn point_of(at: (u16, u16), image: Rect, mode: (u16, u16)) -> (f64, f64) {
     (
         image.x + (f64::from(at.0) + 0.5) * image.width / f64::from(mode.0.max(1)),
         image.y + (f64::from(at.1) + 0.5) * image.height / f64::from(mode.1.max(1)),
@@ -217,6 +221,11 @@ impl Beyond {
                 })
             }
         }
+    }
+
+    /// Where the host's pointer was held when it went past the edge, while it is away.
+    pub fn held(&self) -> Option<(f64, f64)> {
+        self.away.map(|away| away.held)
     }
 
     /// A button went down or up while away: the pointer's new `buttons`, where it is.

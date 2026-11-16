@@ -801,13 +801,13 @@ fn a_producer_waiting_for_room_gets_a_record_after_the_host_s_take() {
 /// its own, and a later write before the driver is ready replaces what an earlier one took.
 #[test]
 fn driver_features_take_what_is_written_offered_and_known() {
-    // Bits 3 and 5 of the new ones, bit 45 of the high half, bit 9 (reserved) and bit 51, which
+    // Bits 3 and 5 of the new ones, bit 45 of the high half, bit 9 (reserved) and bit 52, which
     // the host does not know.
     let offered = PEER_FEATURES
         | u64::from(RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_QUEUE_BARRIER)
         | RGFX_FEATURE_READ_ONLY_PAGES
         | (1 << 9)
-        | (1 << 51);
+        | (1 << 52);
     let mut guest = FakeGuest::offered(offered);
     assert_eq!(guest.driver_features(), 0, "unwritten, it reads 0");
     guest.write(RGFX_REG_STATUS, RGFX_STATUS_RESET);

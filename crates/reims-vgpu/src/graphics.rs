@@ -77,10 +77,10 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
     RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_ANSWERS,
-    RGFX_FEATURE_PIPELINE_KEYS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_RATE_MAPS,
-    RGFX_FEATURE_READ_ONLY_PAGES, RGFX_FEATURE_SCHEDULED_ASK, RGFX_FEATURE_SHARED_EVENT_NAMES,
-    RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
-    RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
+    RGFX_FEATURE_PIPELINE_KEYS, RGFX_FEATURE_POINTER_MOTION, RGFX_FEATURE_PRIVATE_RENDER_STATE,
+    RGFX_FEATURE_RATE_MAPS, RGFX_FEATURE_READ_ONLY_PAGES, RGFX_FEATURE_SCHEDULED_ASK,
+    RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM,
+    RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
     RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
     RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA,
     RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
@@ -574,6 +574,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     0
                 } else {
                     u64::from(RGFX_FEATURE_MANAGED_AT_OFFSET)
+                }
+                // A window's captured pointer drives the guest's own mouse while a game hides
+                // the cursor ([`crate::window`]); a device with no window has no pointer to.
+                | if config.window.is_some() {
+                    RGFX_FEATURE_POINTER_MOTION
+                } else {
+                    0
                 };
             let pages_features = match (decoder.surface_pages_available(), unified_memory) {
                 (false, _) => 0,
@@ -703,7 +710,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             };
             let displays = u32::try_from(count).unwrap_or(u32::MAX);
             // Where several displays' windows tell the guest which one the pointer is over, and
-            // carry a captured pointer past their edges: the device's link, once it is made.
+            // carry a captured pointer past their edges, and where each window's captured pointer
+            // drives the guest's mouse: the device's link, once it is made.
             let pointer = Arc::new(OnceLock::new());
             let desktop = crate::window::Desktop::new(Arc::clone(&pointer));
             let mut by_display = Vec::with_capacity(count);
@@ -714,6 +722,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             for (display, window_config) in window_configs.into_iter().enumerate() {
                 let (screen, shown): (Arc<dyn Screen>, Arc<Shown>) = match window_config {
                     Some(mut window_config) => {
+                        crate::window::give_motion(&mut window_config, &pointer);
                         if displays > 1 {
                             let id = u32::try_from(display).unwrap_or(u32::MAX);
                             crate::window::tell_pointer(&mut window_config, id, &pointer);

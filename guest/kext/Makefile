@@ -67,7 +67,10 @@ GRAFT_INC = -I$(GRAFT_SDK)/include
 GUEST_FLAGS = -DRGFX_GUEST_ARM64=1
 endif
 
-FLAGS = $(ARCH) $(GRAFT_INC) $(GUEST_FLAGS) -mkernel -nostdinc -isystem $(KERNEL) -I../../crates/reims-vgpu-graphics/include \
+# src/shim: our own stand-ins for the two headers the SDK's IOHIDDevice.h includes and the SDK
+# does not ship (RgfxPointerDevice.hpp).
+FLAGS = $(ARCH) $(GRAFT_INC) $(GUEST_FLAGS) -mkernel -nostdinc -isystem $(KERNEL) -Isrc/shim \
+	-I../../crates/reims-vgpu-graphics/include \
 	-DKERNEL -DBUNDLE_VERSION='"$(VERSION)"' -DRGFX_FB_TRACE=$(TRACE) \
 	-Os -Wall -Wextra -Wshadow-all -Werror -Wno-unused-parameter \
 	-Wno-deprecated-declarations
@@ -75,11 +78,12 @@ FLAGS = $(ARCH) $(GRAFT_INC) $(GUEST_FLAGS) -mkernel -nostdinc -isystem $(KERNEL
 CXXFLAGS = $(FLAGS) -std=c++17 -fapple-kext -fno-rtti -fno-exceptions
 CFLAGS   = $(FLAGS) -std=c11
 
-HEADERS = $(wildcard src/*.hpp)
+HEADERS = $(wildcard src/*.hpp src/shim/*/*.h src/shim/*/*/*.h)
 
 # The Stage-2 framebuffer (ReimsGraphics), the Stage-3 Metal accelerator
-# (RgfxAccelerator) and its region-map + doorbell user client, and on x86-64 the device
-# control (RgfxDeviceControl) and the pointer's moves (ReimsGraphicsPointer), all one kext:
+# (RgfxAccelerator) and its region-map + doorbell user client, the guest's own mouse for
+# POINTER_MOTION (RgfxPointerDevice), and on x86-64 the device control (RgfxDeviceControl)
+# and the pointer's moves (ReimsGraphicsPointer), all one kext:
 # the objects both architectures build, with each architecture's own (OBJECTS_x86_64,
 # OBJECTS_arm64e) third in the link.
 OBJECTS_x86_64 = $(BUILD)/obj/RgfxDeviceControl.o $(BUILD)/obj/ReimsGraphicsPointer.o
@@ -87,6 +91,7 @@ OBJECTS_arm64e = $(BUILD)/obj/ReimsGraphicsMobile.o
 OBJECTS = $(BUILD)/obj/ReimsGraphics.o \
 	$(BUILD)/obj/RgfxAccelerator.o \
 	$(OBJECTS_$(ARCH_NAME)) \
+	$(BUILD)/obj/RgfxPointerDevice.o \
 	$(BUILD)/obj/RgfxAcceleratorUserClient.o \
 	$(BUILD)/obj/RgfxDisplayPipeUserClient.o \
 	$(BUILD)/obj/kmod_info.o \
@@ -152,7 +157,8 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/completion_arm_test $(BUILD)/tests/kept_service_test \
 	$(BUILD)/tests/queue_publish_test $(BUILD)/tests/doorbell_pages_test $(BUILD)/tests/top_down_test \
 	$(BUILD)/tests/display_table_test $(BUILD)/tests/agdc_displays_test \
-	$(BUILD)/tests/pointer_over_test $(BUILD)/tests/display_bounds_test
+	$(BUILD)/tests/pointer_over_test $(BUILD)/tests/display_bounds_test \
+	$(BUILD)/tests/pointer_motion_test
 
 $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)

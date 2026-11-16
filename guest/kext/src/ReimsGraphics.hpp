@@ -69,6 +69,7 @@ typedef graft_iomfb_word RgfxIOMFBWord;
 #include "reims_graphics_wire.h"
 
 class RgfxAccelerator;
+class RgfxPointerDevice;
 
 // The display front end each architecture's WindowServer drives: an IOFramebuffer on x86-64, and
 // on arm64, where WindowServer opens no IOFramebuffer, an IOMobileFramebuffer, the subclass of
@@ -705,6 +706,19 @@ private:
 	UInt32 displayCount;
 	bool multiDisplayTaken;
 	IOLock *cursorLock;
+
+	// The guest's own mouse, which the host's POINTER_MOTION drives (RgfxPointerDevice.hpp),
+	// display 0's alone: whether the host took POINTER_MOTION, set at the start's features; the
+	// device, made once the framebuffer has started where it took it (startPointerDevice) and
+	// stopped and let go in the stop once the work loop hands it nothing more
+	// (stopPointerDevice); and handleEvent's POINTER_MOTION, which hands it the event's reports
+	// on the work loop. The device is stored and read atomically: the work loop may take an
+	// event while the start makes it.
+	bool pointerMotionTaken;
+	RgfxPointerDevice *pointerDevice;
+	void startPointerDevice();
+	void stopPointerDevice();
+	void pointerMotion(const volatile UInt8 *payload, UInt32 size);
 
 	// The boot screen the scanout holds until clearBootScreen: the boot framebuffer the OS had at
 	// the start (publishBootConsole); the largest span a mode's scanout has had (setScanout, under

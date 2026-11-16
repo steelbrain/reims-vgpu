@@ -1,6 +1,7 @@
 //! A graphics device's window, as the device's last reference ends it ([`WindowLink`]), its
-//! pointer as it tells the guest which display it is over ([`tell_pointer`]), and its captured
-//! pointer as it goes past the image's edge onto the guest's other displays ([`Desktop`]).
+//! pointer as it tells the guest which display it is over ([`tell_pointer`]), its captured
+//! pointer as it goes past the image's edge onto the guest's other displays ([`Desktop`]), and as
+//! it drives the guest's own mouse while the guest hides its cursor ([`give_motion`]).
 
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -11,7 +12,7 @@ use reims_vgpu_graphics::wire::{
 };
 use reims_vgpu_window::{
     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, Landed, PointerBeyond,
-    Window, WindowConfig,
+    PointerMotion, Window, WindowConfig,
 };
 
 use crate::entry;
@@ -52,6 +53,37 @@ pub(crate) fn tell_pointer(
             pointer(x, y, width, height, buttons);
         }
     }));
+}
+
+/// Has a window, `config`'s, drive the guest's own mouse with its captured pointer while the guest
+/// hides its cursor (docs/graphics-kext/design.md, "A pointer for games"): through `link`, once
+/// the device is made, the device's `POINTER_MOTION`, which a guest that took it hands its mouse.
+/// A window with no pointer callback gives the guest no pointer, and so no mouse either.
+pub(crate) fn give_motion(config: &mut WindowConfig, link: &Arc<OnceLock<PointerLink>>) {
+    if config.callbacks.pointer.is_none() {
+        return;
+    }
+    config.callbacks.motion = Some(Arc::new(GuestMouse {
+        link: Arc::clone(link),
+    }));
+}
+
+/// The guest's own mouse, through the device's link once it is made ([`give_motion`]).
+struct GuestMouse {
+    /// The device's link.
+    link: Arc<OnceLock<PointerLink>>,
+}
+
+impl PointerMotion for GuestMouse {
+    fn hidden_for(&self) -> Option<u64> {
+        self.link.get()?.cursor_hidden_for()
+    }
+
+    fn moved(&self, by: (i32, i32), wheel: i32, buttons: u32) -> bool {
+        self.link
+            .get()
+            .is_some_and(|link| link.motion(by.0, by.1, wheel, buttons))
+    }
 }
 
 /// The guest's desktop, as a device of several displays' windows carry a captured pointer across

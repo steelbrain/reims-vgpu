@@ -47,6 +47,7 @@ pub mod beyond;
 pub mod capture;
 pub mod config;
 pub mod env;
+pub mod game;
 pub mod geometry;
 pub mod handle;
 pub mod keymap;
@@ -63,8 +64,8 @@ mod sdl;
 
 pub use config::{
     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn, Landed,
-    MomentumPhase, PointerBeyond, PointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn,
-    WindowCallbacks, WindowConfig,
+    MomentumPhase, PointerBeyond, PointerFn, PointerMotion, ScrollEvent, ScrollFn, ScrollPhase,
+    WheelFn, WindowCallbacks, WindowConfig,
 };
 pub use handle::{DrawnCursor, FrameSink, Glyph, PixelRect, Window};
 pub use present::{Drawn, Presenter, VulkanTarget};

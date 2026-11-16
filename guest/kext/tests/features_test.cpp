@@ -90,6 +90,8 @@ constexpr uint64_t kPointerOverCarried = RGFX_GUEST_ARM64 ? 0 : kPointerOver;
 // WindowServer's global space, and the arm64e kext does not.
 constexpr uint64_t kDisplayBounds = RGFX_FEATURE_DISPLAY_BOUNDS;
 constexpr uint64_t kDisplayBoundsCarried = RGFX_GUEST_ARM64 ? 0 : kDisplayBounds;
+// POINTER_MOTION, which both kexts carry, publishing the guest's own mouse for it.
+constexpr uint64_t kPointerMotion = RGFX_FEATURE_POINTER_MOTION;
 // Every bit the wire names from bit 3 that the kext does not carry out yet.
 constexpr uint64_t kNotCarried = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CONSUMED_DOORBELL |
                                  RGFX_FEATURE_QUEUE_BARRIER | RGFX_FEATURE_CB_PARTS |
@@ -172,7 +174,7 @@ constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kH
                               kSlotsInPages | kDoorbellAsks | kGuestTimes | kReadOnlyPages |
                               kDoorbellPages | kPipelineAnswers | kDisplayPowerCarried |
                               kMultiDisplayCarried | kPointerOverCarried | kDisplayBoundsCarried |
-                              k16KCarried;
+                              kPointerMotion | k16KCarried;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -187,8 +189,8 @@ int main()
 	// SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK, DISPLAY_SCALE,
 	// TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, PIPELINE_KEYS,
 	// ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, DOORBELL_PAGES,
-	// PIPELINE_ANSWERS and, the x86-64 kext, DISPLAY_POWER, MULTI_DISPLAY, POINTER_OVER and
-	// DISPLAY_BOUNDS, and writes each only where offered.
+	// PIPELINE_ANSWERS, POINTER_MOTION and, the x86-64 kext, DISPLAY_POWER, MULTI_DISPLAY,
+	// POINTER_OVER and DISPLAY_BOUNDS, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
 	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
@@ -197,8 +199,8 @@ int main()
 	      "SURFACE_CACHE_REFUSED, SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK, "
 	      "DISPLAY_SCALE, TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, "
 	      "PIPELINE_KEYS, ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, "
-	      "DOORBELL_PAGES, PIPELINE_ANSWERS and, on x86-64, DISPLAY_POWER, MULTI_DISPLAY, "
-	      "POINTER_OVER and DISPLAY_BOUNDS from bit 3");
+	      "DOORBELL_PAGES, PIPELINE_ANSWERS, POINTER_MOTION and, on x86-64, DISPLAY_POWER, "
+	      "MULTI_DISPLAY, POINTER_OVER and DISPLAY_BOUNDS from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -404,6 +406,11 @@ int main()
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kDisplayBounds) ==
 	          kDisplayBoundsCarried,
 	      "DISPLAY_BOUNDS offered, written by the x86-64 kext alone");
+	check(RGFX_FEATURE_POINTER_MOTION == (1ull << 51), "POINTER_MOTION is bit 51");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kPointerMotion) == kPointerMotion,
+	      "POINTER_MOTION offered, written by both kexts");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried) == 0,
+	      "POINTER_MOTION not offered, not written: the guest publishes no mouse");
 	// PAGES_16K: the arm64e kext writes it first where offered, and then with the rest; the
 	// x86-64 kext never writes it, and writes nothing first.
 	check(rgfxDriverFeaturesFirst(~0ull) == k16KCarried, "PAGES_16K first where carried");
@@ -414,9 +421,9 @@ int main()
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | k16K, k16K) == (kRgfxOfferedFeatures | k16KCarried),
 	      "PAGES_16K taken is in the word where carried");
 	check(rgfxDriverFeatures(0) == 0, "nothing offered, nothing written");
-	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | (1ull << 51)) == 0,
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | (1ull << 52)) == 0,
 	      "every other bit offered, none written");
-	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNew | (1ull << 51)) == kCarried,
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNew | (1ull << 52)) == kCarried,
 	      "every bit offered, the carried bits written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kPages) == kPages,
 	      "PAGES_BUFFERS offered, written");
@@ -457,7 +464,7 @@ int main()
 	      "SUBMIT_ROOM offered but not taken is not");
 	// A read-back of bits the kext never wrote, or of bits 0 to 2 the host does not offer, adds
 	// nothing.
-	check(rgfxFeatureWord(kRgfxOfferedFeatures, kNotCarried | (1ull << 51)) ==
+	check(rgfxFeatureWord(kRgfxOfferedFeatures, kNotCarried | (1ull << 52)) ==
 	          kRgfxOfferedFeatures,
 	      "taken bits the kext does not carry out are dropped");
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kNew, kNew) == (kRgfxOfferedFeatures | kCarried),

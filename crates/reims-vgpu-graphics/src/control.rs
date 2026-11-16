@@ -30,6 +30,9 @@ pub(crate) fn answer(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
             if let Some(command) = read::<RgfxMoveCursor>(message)
                 && let Some(display) = shared.seen_display(command.display)
             {
+                // The device knows first, so a window the move reaches asks it of a cursor
+                // shown or hidden already.
+                shared.cursor_visible(command.display, command.visible != 0);
                 display
                     .screen
                     .cursor_moved(command.x, command.y, command.visible != 0);

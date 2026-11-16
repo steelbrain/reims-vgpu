@@ -280,6 +280,7 @@ include = [
     "RgfxPipelineAnswersQuery",
     "RgfxPipelineLibrary",
     "RgfxPipelineReflection",
+    "RgfxPointerMotion",
     "RgfxPointerOver",
     "RgfxPresentSurface",
     "RgfxPresentSurfaceGen",

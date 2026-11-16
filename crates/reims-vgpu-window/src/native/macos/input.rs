@@ -32,6 +32,14 @@
 //!   releases capture.
 //! - **No stuck keys**: losing the keyboard, releasing capture and closing send an up for every
 //!   key held; losing the keyboard and closing lift the buttons held too.
+//! - **For games**, where the guest has its own mouse ([`crate::PointerMotion`]): captured, while
+//!   the guest hides its cursor on every display, the window holds the host's pointer still
+//!   (`CGAssociateMouseAndMouseCursorPosition(false)`, which the view applies) and hands its
+//!   unaccelerated motion (the events' `kCGEventUnacceleratedPointerMovementX` and `Y`, else
+//!   their deltas), its buttons pressed meanwhile and a mouse wheel's notches to the guest's
+//!   mouse ([`crate::game`]), until the guest shows its cursor again, where the host's pointer
+//!   is let go over it; a button comes up by the route it went down by. Releasing capture,
+//!   losing the keyboard and closing let the pointer go where it was held.
 //!
 //! While captured, the window holds the system's hot keys off ([`super::hotkeys`]), the host's
 //! pointer over the image ([`InputState::pointer_confinement`], which the view applies), and its
@@ -40,17 +48,34 @@
 use std::sync::Arc;
 
 use objc2_app_kit::{NSEvent, NSEventPhase, NSEventType};
-use objc2_core_graphics::{CGEvent, CGEventField};
+use objc2_core_foundation::CGPoint;
+use objc2_core_graphics::{CGError, CGEvent, CGEventField, CGWarpMouseCursorPosition};
 use reims_vgpu_vulkan::os::msg;
 
 use super::hotkeys;
+use crate::beyond::{Hold, point_of};
 use crate::capture::{Capture, Route};
-use crate::config::{MomentumPhase, ScrollEvent, ScrollPhase, WindowCallbacks};
+use crate::config::{MomentumPhase, PointerMotion, ScrollEvent, ScrollPhase, WindowCallbacks};
+use crate::game::Game;
 use crate::geometry::{self, Rect};
 use crate::handle::Window;
 use crate::keymap;
 use crate::keys::{FLAG_COMMAND, KeyEvent, KeyState};
 use crate::scroll::{self, Gesture, Scroll, ScrollInput};
+
+// CoreGraphics' own, which objc2-core-graphics binds only with its `libc` feature.
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C-unwind" {
+    fn CGAssociateMouseAndMouseCursorPosition(connected: libc::boolean_t) -> CGError;
+}
+
+/// Joins the host's pointer to the mouse again (`true`), or holds it still while the mouse's
+/// events go on reporting its motion: whether CoreGraphics did.
+fn associate_mouse(connected: bool) -> bool {
+    // SAFETY: CoreGraphics' function takes a boolean and returns its error, on any thread.
+    let error = unsafe { CGAssociateMouseAndMouseCursorPosition(libc::boolean_t::from(connected)) };
+    error == CGError::Success
+}
 
 /// What the view knows when an event reaches it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -64,6 +89,8 @@ pub(crate) struct ViewContext {
     pub(crate) guest: Option<(u16, u16)>,
     /// Whether the window was key when the event arrived.
     pub(crate) window_is_key: bool,
+    /// The guest's cursor, in its mode's pixels, where it shows over the window's display.
+    pub(crate) cursor: Option<(u16, u16)>,
 }
 
 /// What the view does after an event.
@@ -123,6 +150,14 @@ struct KeyInput {
     flags: u64,
     /// `isARepeat`; false for `flagsChanged:`, which has none.
     repeat: bool,
+}
+
+/// The view's point over the guest's cursor in `cx`, where it shows over the window's display.
+fn cursor_point(cx: &ViewContext) -> Option<(f64, f64)> {
+    let mode = guest_mode(cx)?;
+    let cursor = cx.cursor?;
+    let inside = (cursor.0.min(mode.0 - 1), cursor.1.min(mode.1 - 1));
+    Some(point_of(inside, cx.image, mode))
 }
 
 /// The guest's mode in `cx`, where it has one with pixels: the pointer is sent only then, since
@@ -193,6 +228,12 @@ struct InputLogic {
     last: Option<PointerAt>,
     /// What to send, in order, since the host's callbacks last took it.
     out: Vec<ToHost>,
+    /// The guest's own mouse, where the host gives it.
+    motion: Option<Arc<dyn PointerMotion>>,
+    /// Whether the captured pointer drives it.
+    game: Game,
+    /// What the view does with the host's pointer next, since it last took it.
+    hold: Option<Hold>,
 }
 
 impl InputLogic {
@@ -265,8 +306,11 @@ impl InputLogic {
     }
 
     /// A button went down: `bit` its `BUTTON_*` bit, 0 for one past the guest tablet's five,
-    /// `flags` the event's `modifierFlags`.
+    /// `flags` the event's `modifierFlags`. Driving the guest's mouse, it goes down there.
     fn button_down(&mut self, bit: u32, flags: u64, cx: &ViewContext) -> Reaction {
+        if self.game.press(self.motion.as_deref(), bit) {
+            return Reaction::default();
+        }
         let (Some(mode), Some(point)) = (guest_mode(cx), cx.point) else {
             return Reaction::default();
         };
@@ -286,14 +330,20 @@ impl InputLogic {
     }
 
     /// A button went up: `bit` its `BUTTON_*` bit. Sent only for a button the guest was told
-    /// is down, wherever the pointer is.
+    /// is down, wherever the pointer is, by the route it went down by (the guest's mouse, or the
+    /// tablet, where it last was while the pointer drives the mouse).
     fn button_up(&mut self, bit: u32, cx: &ViewContext) -> Reaction {
+        if self.game.release(self.motion.as_deref(), bit) {
+            return Reaction::default();
+        }
         if bit == 0 || self.buttons & bit == 0 {
             return Reaction::default();
         }
         self.buttons &= !bit;
         match (guest_mode(cx), cx.point) {
-            (Some(mode), Some(point)) => self.send_pointer(point, cx.image, mode),
+            (Some(mode), Some(point)) if !self.game.is_on() => {
+                self.send_pointer(point, cx.image, mode);
+            }
             _ => {
                 if let Some(last) = self.last {
                     self.send_pointer_at(last.at, last.mode);
@@ -303,17 +353,70 @@ impl InputLogic {
         Reaction::default()
     }
 
-    /// The pointer moved, or dragged.
-    fn moved(&mut self, cx: &ViewContext) -> Reaction {
+    /// The pointer moved, or dragged, by `by`, its device's unaccelerated counts. Captured,
+    /// with the guest's cursor hidden, it drives the guest's mouse ([`crate::game`]); else the
+    /// tablet goes where it is.
+    fn moved(&mut self, by: (f64, f64), cx: &ViewContext) -> Reaction {
+        if let Some(motion) = self.motion.clone() {
+            if self.game.is_on() {
+                let cursor = cursor_point(cx);
+                if let Some(hold) = self.game.moved(motion.as_ref(), by, cursor) {
+                    self.hold = Some(hold);
+                }
+                return Reaction::default();
+            }
+            if self.capture.is_captured()
+                && guest_mode(cx).is_some()
+                && let Some(point) = cx.point
+                && let Some(hold) = self.game.begin(motion.as_ref(), point)
+            {
+                self.hold = Some(hold);
+                return Reaction::default();
+            }
+        }
         if let (Some(mode), Some(point)) = (guest_mode(cx), cx.point) {
             self.move_pointer(point, cx.image, mode);
         }
         Reaction::default()
     }
 
+    /// The guest showed or hid its cursor: driving the guest's mouse, the pointer is the
+    /// window's again once the guest shows it, the host's pointer let go over it.
+    fn cursor_changed(&mut self, cx: &ViewContext) {
+        if let Some(motion) = self.motion.clone()
+            && let Some(hold) = self.game.shown(motion.as_ref(), cursor_point(cx))
+        {
+            self.hold = Some(hold);
+        }
+    }
+
+    /// The OS would not hold the host's pointer still: the pointer is the window's again, where
+    /// it was held.
+    fn lock_refused(&mut self) {
+        if let Some(hold) = self.game.refused() {
+            self.hold = Some(hold);
+        }
+    }
+
+    /// Capture ended (released, the keyboard lost, the window's end): the pointer driving the
+    /// guest's mouse is the window's again, where it was held.
+    fn end_game(&mut self) {
+        if let Some(hold) = self.game.end() {
+            self.hold = Some(hold);
+        }
+    }
+
     /// The wheel or a trackpad scrolled: as smooth scrolling when `smooth` (the host takes
     /// it), else as notches.
     fn scrolled(&mut self, input: ScrollInput, smooth: bool, cx: &ViewContext) -> Reaction {
+        if self.game.is_on() && !input.precise {
+            // A mouse's wheel, while the pointer drives the guest's mouse: its notches go there.
+            let (dy, _dx) = self.scroll.feed(input);
+            if dy != 0 {
+                self.game.wheel(self.motion.as_deref(), dy);
+                return Reaction::default();
+            }
+        }
         let over = match (guest_mode(cx), cx.point) {
             (Some(mode), Some(point)) if geometry::contains(cx.image, point) => Some((point, mode)),
             _ => None,
@@ -411,6 +514,7 @@ impl InputLogic {
             return Reaction::default();
         }
         self.lift_keys();
+        self.end_game();
         Reaction::capture(self.capture.release())
     }
 
@@ -433,6 +537,8 @@ impl InputLogic {
         let was = self.capture.resign_key();
         self.lift_keys();
         self.lift_buttons();
+        self.game.lift(self.motion.as_deref());
+        self.end_game();
         Reaction::capture(was)
     }
 
@@ -440,6 +546,7 @@ impl InputLogic {
     fn release_capture(&mut self) -> Reaction {
         let was = self.capture.release();
         self.lift_keys();
+        self.end_game();
         Reaction::capture(was)
     }
 
@@ -447,6 +554,8 @@ impl InputLogic {
     fn window_closing(&mut self) {
         self.lift_keys();
         self.lift_buttons();
+        self.game.lift(self.motion.as_deref());
+        self.end_game();
         self.capture.release();
     }
 }
@@ -502,6 +611,28 @@ fn key_input(event: &NSEvent, repeat: bool) -> KeyInput {
     }
 }
 
+/// A pointer event's motion, unaccelerated: its device's counts
+/// (`kCGEventUnacceleratedPointerMovementX` and `Y`), else, for an event with none, its deltas.
+fn unaccelerated_motion(event: &NSEvent) -> (f64, f64) {
+    let cg_event = msg::get("CGEvent", || event.CGEvent());
+    let field = |field: CGEventField| {
+        cg_event
+            .as_deref()
+            .map_or(0.0, |e| CGEvent::double_value_field(Some(e), field))
+    };
+    let raw = (
+        field(CGEventField::EventUnacceleratedPointerMovementX),
+        field(CGEventField::EventUnacceleratedPointerMovementY),
+    );
+    if raw != (0.0, 0.0) {
+        return raw;
+    }
+    (
+        msg::get("deltaX", || event.deltaX()),
+        msg::get("deltaY", || event.deltaY()),
+    )
+}
+
 /// A scroll event's values ([`ScrollInput`]).
 fn scroll_input(event: &NSEvent) -> ScrollInput {
     let cg_event = msg::get("CGEvent", || event.CGEvent());
@@ -542,11 +673,14 @@ pub(crate) struct InputState {
 }
 
 impl InputState {
-    /// The input state of `window`, made on the main thread.
+    /// The input state of `window`, made on the main thread, driving the guest's mouse where the
+    /// host gives it.
     pub(crate) fn new(window: Arc<Window>) -> InputState {
+        let mut logic = InputLogic::new(crate::native::is_iso_keyboard());
+        logic.motion = window.callbacks().and_then(|callbacks| callbacks.motion);
         InputState {
             window,
-            logic: InputLogic::new(crate::native::is_iso_keyboard()),
+            logic,
             holds_hotkeys: false,
         }
     }
@@ -592,9 +726,49 @@ impl InputState {
     }
 
     /// The pointer moved, with or without a button held (`mouseMoved:`, `*MouseDragged:`).
-    pub(crate) fn mouse_moved(&mut self, _event: &NSEvent, cx: &ViewContext) -> Reaction {
-        let reaction = self.logic.moved(cx);
+    pub(crate) fn mouse_moved(&mut self, event: &NSEvent, cx: &ViewContext) -> Reaction {
+        let reaction = self.logic.moved(unaccelerated_motion(event), cx);
         self.finish(reaction)
+    }
+
+    /// The guest showed or hid its cursor (the module doc).
+    pub(crate) fn cursor_changed(&mut self, cx: &ViewContext) {
+        self.logic.cursor_changed(cx);
+    }
+
+    /// Holds the host's pointer still while it drives the guest's mouse, or lets it go at a
+    /// point in the view's points, which `global` places in the displays' global coordinates, as
+    /// the logic asks: `CGAssociateMouseAndMouseCursorPosition`, whose events go on reporting the
+    /// mouse's motion with the pointer still. Letting go warps the pointer to the point and
+    /// joins it to the mouse again, which also ends the warp's pause of the mouse's events. A
+    /// hold the OS refuses gives the pointer back to the window, where it was held.
+    pub(crate) fn apply_hold(&mut self, global: impl Fn((f64, f64)) -> Option<CGPoint>) {
+        while let Some(hold) = self.logic.hold.take() {
+            let title = self.window.title();
+            match hold {
+                Hold::Raw | Hold::Lock => {
+                    let held = associate_mouse(false);
+                    log::debug!(
+                        "window {title:?}: the captured pointer drives the guest's mouse \
+                         (held: {held})"
+                    );
+                    if !held {
+                        log::warn!(
+                            "window {title:?}: the pointer cannot be held still, so a game's \
+                             mouse stops at the image's edge"
+                        );
+                        self.logic.lock_refused();
+                    }
+                }
+                Hold::Unlock(point) => {
+                    if let Some(at) = global(point) {
+                        CGWarpMouseCursorPosition(at);
+                    }
+                    associate_mouse(true);
+                    log::debug!("window {title:?}: the pointer is back at {point:?}");
+                }
+            }
+        }
     }
 
     /// The wheel or a trackpad scrolled (`scrollWheel:`): smoothly where the host's callbacks
@@ -708,7 +882,9 @@ mod tests {
     use reims_vgpu_vulkan::core::sync::Mutex;
 
     use super::*;
-    use crate::config::{BUTTON_LEFT, BUTTON_RIGHT};
+    use crate::config::{BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT};
+    use crate::game::SETTLE_NS;
+    use crate::game::tests::Mouse;
     use crate::keys::{FLAG_CONTROL, FLAG_OPTION, FLAG_SHIFT};
 
     /// Left Shift, Control, Option and Command as `modifierFlags` carries them.
@@ -750,6 +926,7 @@ mod tests {
             image: IMAGE,
             guest: Some(MODE),
             window_is_key: true,
+            cursor: None,
         }
     }
 
@@ -915,7 +1092,7 @@ mod tests {
                 ..at((500.0, 300.0))
             };
             assert_eq!(logic.button_down(BUTTON_LEFT, 0, &cx), Reaction::default());
-            logic.moved(&cx);
+            logic.moved((0.0, 0.0), &cx);
             for smooth in [false, true] {
                 logic.scrolled(
                     ScrollInput {
@@ -939,8 +1116,8 @@ mod tests {
     fn a_drag_keeps_going_outside_the_window() {
         let mut logic = captured();
         logic.button_down(BUTTON_LEFT, 0, &at((580.0, 350.0)));
-        logic.moved(&at((5000.0, 350.0)));
-        logic.moved(&at((5000.0, -40.0)));
+        logic.moved((0.0, 0.0), &at((5000.0, 350.0)));
+        logic.moved((0.0, 0.0), &at((5000.0, -40.0)));
         logic.button_up(BUTTON_LEFT, &at((6000.0, -80.0)));
         assert_eq!(
             sent(&mut logic),
@@ -957,10 +1134,10 @@ mod tests {
     #[test]
     fn moves_are_sent_where_the_guest_pixel_changes() {
         let mut logic = InputLogic::new(false);
-        logic.moved(&at((580.0, 350.0)));
-        logic.moved(&at((580.2, 350.2)));
-        logic.moved(&at((580.5, 350.0)));
-        logic.moved(&at((20.0, 350.0)));
+        logic.moved((0.0, 0.0), &at((580.0, 350.0)));
+        logic.moved((0.0, 0.0), &at((580.2, 350.2)));
+        logic.moved((0.0, 0.0), &at((580.5, 350.0)));
+        logic.moved((0.0, 0.0), &at((20.0, 350.0)));
         assert_eq!(
             sent(&mut logic),
             vec![
@@ -1297,6 +1474,172 @@ mod tests {
         assert_eq!(sent(&mut logic), vec![up(A), pointer(0, 0, 0)]);
     }
 
+    /// A captured logic driving `mouse` once the guest hides its cursor.
+    fn captured_with(mouse: &Arc<Mouse>) -> InputLogic {
+        let mut logic = captured();
+        logic.motion = Some(Arc::clone(mouse) as Arc<dyn PointerMotion>);
+        logic
+    }
+
+    /// Outside a game the tablet hears exactly what it hears with no guest's mouse, and the
+    /// guest's mouse nothing: captured while the guest shows its cursor or has hidden it for less
+    /// than the settle
+    #[test]
+    fn the_tablet_s_events_are_unchanged_outside_a_game() {
+        let desk_work = |logic: &mut InputLogic| {
+            logic.moved((3.0, 0.0), &at((580.0, 350.0)));
+            logic.button_down(BUTTON_RIGHT, 0, &at((600.0, 350.0)));
+            logic.moved((3.0, 0.0), &at((5000.0, 350.0)));
+            logic.button_up(BUTTON_RIGHT, &at((5000.0, 350.0)));
+            logic.scrolled(
+                ScrollInput {
+                    lines: (0, 2),
+                    ..ScrollInput::default()
+                },
+                false,
+                &at((580.0, 350.0)),
+            );
+            sent(logic)
+        };
+        let plain = desk_work(&mut captured());
+        assert!(!plain.is_empty());
+        for hidden in [None, Some(SETTLE_NS - 1)] {
+            let mouse = Arc::new(Mouse::default());
+            *mouse.hidden.lock() = hidden;
+            let mut logic = captured_with(&mouse);
+            assert_eq!(desk_work(&mut logic), plain, "hidden for {hidden:?}");
+            assert_eq!(logic.hold, None);
+            assert_eq!(mouse.take(), vec![]);
+        }
+    }
+
+    /// Captured, once the guest has hidden its cursor for the settle, the pointer is held still
+    /// and its unaccelerated motion, by whole counts, and a mouse wheel's notches drive the
+    /// guest's mouse; the tablet hears nothing. Once the guest shows its cursor, the pointer is
+    /// the window's again, let go over the guest's cursor, else where it was held
+    #[test]
+    fn a_hidden_cursor_s_motion_drives_the_guest_s_mouse_until_it_shows() {
+        let mouse = Arc::new(Mouse::default());
+        let mut logic = captured_with(&mouse);
+        mouse.hide_for(SETTLE_NS);
+        logic.moved((1.0, 0.0), &at((1000.0, 350.0)));
+        assert_eq!(logic.hold.take(), Some(Hold::Raw));
+        logic.moved((700.0, 0.0), &at((1000.0, 350.0)));
+        logic.moved((0.5, -3.5), &at((1000.0, 350.0)));
+        logic.moved((0.5, 0.5), &at((1000.0, 350.0)));
+        logic.scrolled(
+            ScrollInput {
+                lines: (0, -1),
+                ..ScrollInput::default()
+            },
+            false,
+            &at((1000.0, 350.0)),
+        );
+        assert_eq!(
+            mouse.take(),
+            vec![
+                ((700, 0), 0, 0),
+                ((0, -3), 0, 0),
+                ((1, 0), 0, 0),
+                ((0, 0), -1, 0)
+            ]
+        );
+        assert_eq!(sent(&mut logic), vec![], "the tablet hears nothing");
+        mouse.show();
+        logic.cursor_changed(&ViewContext {
+            cursor: Some((100, 60)),
+            ..at((1000.0, 350.0))
+        });
+        assert_eq!(logic.hold.take(), Some(Hold::Unlock((150.25, 80.25))));
+        logic.moved((0.0, 0.0), &at((150.25, 80.25)));
+        assert_eq!(sent(&mut logic), vec![pointer(100, 60, 0)]);
+        mouse.hide_for(SETTLE_NS);
+        logic.moved((1.0, 0.0), &at((150.0, 80.0)));
+        assert_eq!(logic.hold.take(), Some(Hold::Raw));
+        mouse.show();
+        logic.moved((2.0, 0.0), &at((150.0, 80.0)));
+        assert_eq!(mouse.take(), vec![((2, 0), 0, 0)]);
+        assert_eq!(logic.hold.take(), Some(Hold::Unlock((150.0, 80.0))));
+    }
+
+    /// A button comes up by the route it went down by, held across either switch
+    #[test]
+    fn a_button_held_across_the_switch_comes_up_by_its_own_route() {
+        let mouse = Arc::new(Mouse::default());
+        let mut logic = captured_with(&mouse);
+        logic.button_down(BUTTON_RIGHT, 0, &at((600.0, 350.0)));
+        assert_eq!(sent(&mut logic), vec![pointer(1000, 600, BUTTON_RIGHT)]);
+        mouse.hide_for(SETTLE_NS);
+        logic.moved((1.0, 0.0), &at((600.0, 350.0)));
+        assert_eq!(logic.hold.take(), Some(Hold::Raw));
+        logic.button_down(BUTTON_LEFT, 0, &at((600.0, 350.0)));
+        logic.button_up(BUTTON_RIGHT, &at((600.0, 350.0)));
+        assert_eq!(mouse.take(), vec![((0, 0), 0, BUTTON_LEFT)]);
+        assert_eq!(sent(&mut logic), vec![pointer(1000, 600, 0)]);
+        mouse.show();
+        logic.cursor_changed(&at((600.0, 350.0)));
+        assert_eq!(logic.hold.take(), Some(Hold::Unlock((600.0, 350.0))));
+        logic.button_up(BUTTON_LEFT, &at((600.0, 350.0)));
+        assert_eq!(mouse.take(), vec![((0, 0), 0, 0)]);
+        assert_eq!(sent(&mut logic), vec![]);
+    }
+
+    /// The release chord, Release Input, losing the keyboard and closing give the window back
+    /// the pointer driving the guest's mouse where it was held, a button held through the mouse
+    /// lifted on the keyboard's loss and the close; a hold the OS refuses gives it back too, and
+    /// is not tried again until capture changes
+    #[test]
+    fn letting_go_of_a_game_gives_the_pointer_back_where_it_was_held() {
+        let mouse = Arc::new(Mouse::default());
+        mouse.hide_for(SETTLE_NS);
+        let in_game = || {
+            let mut logic = captured_with(&mouse);
+            logic.moved((1.0, 0.0), &at((600.0, 350.0)));
+            assert_eq!(logic.hold.take(), Some(Hold::Raw));
+            logic
+        };
+        let mut logic = in_game();
+        logic.flags_changed(key(KVK_CONTROL, L_CONTROL));
+        logic.flags_changed(key(KVK_OPTION, L_CONTROL | L_OPTION));
+        logic.flags_changed(key(KVK_COMMAND, L_CONTROL | L_OPTION | L_COMMAND));
+        assert!(!logic.capture.is_captured());
+        assert_eq!(logic.hold.take(), Some(Hold::Unlock((600.0, 350.0))));
+
+        let mut logic = in_game();
+        logic.release_capture();
+        assert_eq!(logic.hold.take(), Some(Hold::Unlock((600.0, 350.0))));
+
+        let mut logic = in_game();
+        logic.button_down(BUTTON_LEFT, 0, &at((600.0, 350.0)));
+        mouse.take();
+        logic.focus_lost();
+        assert_eq!(mouse.take(), vec![((0, 0), 0, 0)]);
+        assert_eq!(logic.hold.take(), Some(Hold::Unlock((600.0, 350.0))));
+
+        let mut logic = in_game();
+        logic.button_down(BUTTON_MIDDLE, 0, &at((600.0, 350.0)));
+        mouse.take();
+        logic.window_closing();
+        assert_eq!(mouse.take(), vec![((0, 0), 0, 0)]);
+        assert_eq!(logic.hold.take(), Some(Hold::Unlock((600.0, 350.0))));
+
+        let mut logic = in_game();
+        logic.lock_refused();
+        assert_eq!(logic.hold.take(), Some(Hold::Unlock((600.0, 350.0))));
+        logic.moved((1.0, 0.0), &at((602.0, 350.0)));
+        assert_eq!(logic.hold.take(), None, "not tried again while captured");
+        assert_eq!(sent(&mut logic), vec![pointer(1004, 600, 0)]);
+        logic.release_capture();
+        logic.button_down(BUTTON_LEFT, 0, &at((602.0, 350.0)));
+        logic.moved((1.0, 0.0), &at((604.0, 350.0)));
+        assert_eq!(
+            logic.hold.take(),
+            Some(Hold::Raw),
+            "tried again at the next capture"
+        );
+        assert_eq!(mouse.take(), vec![]);
+    }
+
     /// The window's end, while the host's callback for the first key-up of a lift runs, drops
     /// the other key-ups: no callback of the host's starts after the end has returned
     #[test]
@@ -1357,6 +1700,7 @@ mod tests {
                 ));
             })),
             beyond: None,
+            motion: None,
         };
         call_host(&callbacks, pointer(3, 4, BUTTON_RIGHT));
         call_host(&callbacks, ToHost::Wheel { dy: -1, dx: 2 });

@@ -188,11 +188,15 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
         window.title(),
         display.0
     );
+    let callbacks = window.callbacks();
     Some(Opened {
         sdl,
         asked: size,
-        input: Input(input::Input::with_beyond(
-            window.callbacks().and_then(|callbacks| callbacks.beyond),
+        input: Input(input::Input::with_links(
+            callbacks
+                .as_ref()
+                .and_then(|callbacks| callbacks.beyond.clone()),
+            callbacks.and_then(|callbacks| callbacks.motion),
         )),
         state: State { display },
     })
@@ -236,9 +240,26 @@ pub(crate) fn screens_changed(_shell: &mut Shell) {}
 fn at(shell: &Shell, point: (f32, f32)) -> At {
     At {
         point: Some((f64::from(point.0), f64::from(point.1))),
+        ..at_no_point(shell)
+    }
+}
+
+/// What the window knows, with no pointer event.
+fn at_no_point(shell: &Shell) -> At {
+    At {
+        point: None,
         image: shell.layout.image,
         guest: shell.window.mode(),
+        cursor: shell.window.shown_cursor_at(),
     }
+}
+
+/// The guest showed or hid its cursor: the input may let go of the pointer driving the guest's
+/// mouse ([`input::Input::cursor_changed`]).
+pub(crate) fn cursor_changed(shell: &mut Shell) {
+    let at = at_no_point(shell);
+    shell.input.0.cursor_changed(&at);
+    apply_hold(shell);
 }
 
 /// An input event of type `kind` for the window: the pointer, a button, the wheel or a key, to
@@ -250,7 +271,7 @@ pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bo
             let motion = unsafe { event.motion };
             let point = (motion.x, motion.y);
             let at = at(shell, point);
-            if shell.input.0.is_away() {
+            if shell.input.0.is_locked() {
                 // The pointer is locked: SDL reports its motion alone.
                 let by = (f64::from(motion.xrel), f64::from(motion.yrel));
                 shell.input.0.moved_by(by, &at);
@@ -310,22 +331,42 @@ pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bo
 /// motion. Letting go warps the pointer to the point first, so SDL puts it there as the lock
 /// ends (on Wayland the lock's cursor position hint, or pointer-warp). A lock SDL refuses gives
 /// the pointer back to the window, where it was held.
+///
+/// Gone past the edge, the motion is the host's pointer's, in the window's points, scaled as
+/// the host moves its pointer (`SDL_MOUSE_RELATIVE_SYSTEM_SCALE` 1); driving the guest's mouse,
+/// it is the device's own counts (0: on Wayland relative-pointer's unaccelerated motion), which
+/// the guest scales as it scales a mouse's.
 pub(crate) fn apply_hold(shell: &mut Shell) {
     let Some(hold) = shell.input.0.take_hold() else {
         return;
     };
     match hold {
-        Hold::Lock => {
-            // SAFETY: the window is SDL's, on this thread.
-            let locked = unsafe { SDL_SetWindowRelativeMouseMode(shell.sdl, true) };
+        Hold::Lock | Hold::Raw => {
+            let raw = hold == Hold::Raw;
+            let scale = if raw { c"0" } else { c"1" };
+            // SAFETY: the window is SDL's, on this thread; both strings are NUL-terminated, and
+            // SDL copies them.
+            let locked = unsafe {
+                SDL_SetHint(c"SDL_MOUSE_RELATIVE_SYSTEM_SCALE".as_ptr(), scale.as_ptr());
+                SDL_SetWindowRelativeMouseMode(shell.sdl, true)
+            };
             log::debug!(
                 target: "reims_vgpu_window",
-                "window {:?}: the captured pointer goes past the image's edge (locked: {locked})",
-                shell.window.title()
+                "window {:?}: the captured pointer {} (locked: {locked})",
+                shell.window.title(),
+                if raw {
+                    "drives the guest's mouse"
+                } else {
+                    "goes past the image's edge"
+                }
             );
             if !locked {
                 shell::refused(
-                    "no pointer lock, so the pointer stays at the image's edge",
+                    if raw {
+                        "no pointer lock, so a game's mouse stops at the image's edge"
+                    } else {
+                        "no pointer lock, so the pointer stays at the image's edge"
+                    },
                     shell.window.title(),
                 );
                 shell.input.0.lock_refused();
@@ -434,6 +475,7 @@ mod tests {
                 height: 50.0,
             },
             guest: Some((200, 100)),
+            cursor: None,
         };
         input
             .0

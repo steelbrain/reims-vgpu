@@ -1,5 +1,6 @@
 //! A device of several displays ([`GraphicsConfig::display_count`]): the counts and windows it
-//! takes, each display's read-back, and each display's cursor at the host's callbacks.
+//! takes, each display's read-back, and each display's cursor at the host's callbacks; and a
+//! window's captured pointer driving the guest's own mouse (`POINTER_MOTION`).
 
 use reims_vgpu_window::Landed;
 
@@ -415,4 +416,71 @@ fn a_captured_pointer_past_the_shared_edge_goes_on_through_the_other_display_s_w
         Landed::Lost,
         "the window's again"
     );
+}
+
+/// A device with a window offers `POINTER_MOTION`, and a headless one does not; a window the
+/// device gives the guest's mouse ([`crate::window::give_motion`]), one with a pointer callback,
+/// is told how long the guest has hidden its cursor, and its motion reaches a guest that took
+/// `POINTER_MOTION` as the event; a window with no pointer callback is given no mouse
+#[test]
+fn a_window_s_device_offers_pointer_motion_and_drives_the_guest_s_mouse() {
+    let offers = |device: &GraphicsDevice<FakePlatform>| {
+        let hi = u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32;
+        hi & RGFX_FEATURE_POINTER_MOTION != 0
+    };
+    assert!(!offers(&headless_of(1, GraphicsCallbacks::default())));
+    let with_pointer = || {
+        let mut config = WindowConfig::default();
+        config.callbacks.pointer = Some(Arc::new(|_x, _y, _width, _height, _buttons| {}));
+        config
+    };
+    let config = GraphicsConfig {
+        window: Some(with_pointer()),
+        ..GraphicsConfig::default()
+    };
+    let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+    assert!(offers(&device));
+    device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_HI.into(),
+        (RGFX_FEATURE_POINTER_MOTION >> 32) as u32,
+    );
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let link = Arc::new(OnceLock::new());
+    let _ = link.set(device.device.pointer_link());
+    let mut no_pointer = WindowConfig::default();
+    crate::window::give_motion(&mut no_pointer, &link);
+    assert!(
+        no_pointer.callbacks.motion.is_none(),
+        "no pointer, no mouse"
+    );
+    let mut config = with_pointer();
+    crate::window::give_motion(&mut config, &link);
+    let mouse = config.callbacks.motion.unwrap();
+    assert_eq!(
+        mouse.hidden_for(),
+        None,
+        "the guest has not hidden its cursor"
+    );
+    let hide = RgfxMoveCursor {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_MOVE_CURSOR,
+            size: 0,
+            seqno: 0,
+        },
+        display: 0,
+        x: 10,
+        y: 10,
+        visible: 0,
+    };
+    carried(&device, &mut guest, hide.as_bytes().to_vec());
+    assert!(mouse.hidden_for().is_some(), "hidden on its one display");
+    assert!(mouse.moved((5, -3), 1, reims_vgpu_window::BUTTON_LEFT));
+    let m = RgfxPointerMotion::read_from_bytes(&guest.event().unwrap()).unwrap();
+    assert_eq!(
+        (m.header.r#type, m.dx, m.dy, m.wheel, m.buttons),
+        (RGFX_EVT_POINTER_MOTION, 5, -3, 1, RGFX_POINTER_BUTTON_LEFT)
+    );
+    carried(&device, &mut guest, move_cursor(0, 10, 10));
+    assert_eq!(mouse.hidden_for(), None, "shown again");
 }

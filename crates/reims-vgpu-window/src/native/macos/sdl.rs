@@ -298,6 +298,12 @@ pub(crate) fn grab_keyboard(_shell: &Shell, _captured: bool) {}
 /// past them (`crate::beyond` is the SDL window's on Linux and Windows).
 pub(crate) fn apply_hold(_shell: &mut Shell) {}
 
+/// The guest showed or hid its cursor: AppKit's window's input follows it
+/// ([`input::cursor_changed`]).
+pub(crate) fn cursor_changed(shell: &mut Shell) {
+    input::cursor_changed(shell);
+}
+
 /// Makes a windowed window not resizable while its input is captured, and resizable again when
 /// not, as AppKit's window does (`super::shell::resizable_change`): SDL's resizable flag, which
 /// SDL's Cocoa code makes the window's style. A borderless window keeps its style, which SDL would

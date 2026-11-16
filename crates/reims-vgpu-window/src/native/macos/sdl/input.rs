@@ -23,14 +23,17 @@
 use std::sync::Arc;
 
 use objc2::MainThreadMarker;
+use objc2::Message;
 use objc2::rc::Retained;
 use objc2_app_kit::{NSEvent, NSEventType, NSWindow};
+use objc2_foundation::NSPoint;
 use reims_vgpu_vulkan::os::msg;
 
 use crate::geometry::Rect;
 use crate::handle::Window;
 use crate::native::macos::input::{InputState, Reaction, ViewContext};
 use crate::native::macos::main_thread::shared_app;
+use crate::native::macos::view::global_of;
 use crate::sdl::shell::{self, Shell};
 
 /// A window's input: AppKit's window's ([`InputState`]), which calls the host's callbacks as each
@@ -118,7 +121,36 @@ fn context(shell: &Shell, event: &NSEvent, located: bool) -> ViewContext {
         image: shell.layout.image,
         guest: shell.window.mode(),
         window_is_key: msg::get("isKeyWindow", || window.isKeyWindow()),
+        cursor: shell.window.shown_cursor_at(),
     }
+}
+
+/// The guest showed or hid its cursor: a pointer driving the guest's mouse may be the window's
+/// again ([`InputState::cursor_changed`]).
+pub(crate) fn cursor_changed(shell: &mut Shell) {
+    let cx = ViewContext {
+        point: None,
+        image: shell.layout.image,
+        guest: shell.window.mode(),
+        window_is_key: msg::get("isKeyWindow", || shell.os.ns_window().isKeyWindow()),
+        cursor: shell.window.shown_cursor_at(),
+    };
+    shell.input.0.cursor_changed(&cx);
+    apply_hold(shell);
+}
+
+/// Holds the host's pointer still, or lets it go, as the input asks
+/// ([`InputState::apply_hold`]): points in the content's points, y down.
+fn apply_hold(shell: &mut Shell) {
+    let window = shell.os.ns_window().retain();
+    shell.input.0.apply_hold(|point| {
+        let content = msg::get("contentView", || window.contentView())?;
+        let height = msg::get("bounds", || content.bounds()).size.height;
+        let in_window = msg::get("convertPoint:toView:", || {
+            content.convertPoint_toView(NSPoint::new(point.0, height - point.1), None)
+        });
+        Some(global_of(&window, in_window))
+    });
 }
 
 /// Whether `point` is over `shell`'s content, in its points.
@@ -136,6 +168,7 @@ fn react(shell: &mut Shell, reaction: Reaction) {
     if reaction.capture_changed {
         shell.capture_changed();
     }
+    apply_hold(shell);
 }
 
 /// The application saw `event`, before AppKit dispatches it: true where one of SDL's windows'

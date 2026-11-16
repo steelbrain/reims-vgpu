@@ -12,6 +12,7 @@
 #include "RgfxDisplayPower.hpp"
 #include "RgfxFeatures.hpp"
 #include "RgfxPipeColor.hpp"
+#include "RgfxPointerDevice.hpp"
 #include "RgfxRegionMapping.hpp"
 
 #include <IOKit/IOLib.h>
@@ -1134,6 +1135,10 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		fb->release();
 		return;
 	}
+	case RGFX_EVT_POINTER_MOTION:
+		// The host's pointer drives the guest's own mouse (RgfxPointerDevice.hpp).
+		pointerMotion(payload, size);
+		return;
 #if defined(__x86_64__)
 	case RGFX_EVT_POINTER_OVER:
 		// The host's pointer is over another display: the cursor goes there
@@ -1144,6 +1149,46 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 	default:
 		return;
 	}
+}
+
+// Display 0's, once its start is done: the guest's own mouse, where the host took
+// POINTER_MOTION and none is up yet (a start after a reset keeps the one it has).
+void ReimsGraphics::startPointerDevice()
+{
+	if (!pointerMotionTaken || __atomic_load_n(&pointerDevice, __ATOMIC_ACQUIRE))
+		return;
+	RgfxPointerDevice *made = RgfxPointerDevice::withProvider(this);
+	if (!made) {
+		IOLog("ReimsGraphics: the guest's mouse for POINTER_MOTION did not start\n");
+		return;
+	}
+	__atomic_store_n(&pointerDevice, made, __ATOMIC_RELEASE);
+	IOLog("ReimsGraphics: the guest's mouse for POINTER_MOTION is up\n");
+}
+
+// Display 0's stop, once the work loop hands the device nothing more: the device stops and goes.
+void ReimsGraphics::stopPointerDevice()
+{
+	RgfxPointerDevice *mouse = __atomic_exchange_n(&pointerDevice, nullptr, __ATOMIC_ACQ_REL);
+	if (!mouse)
+		return;
+	mouse->terminate();
+	mouse->release();
+}
+
+// handleEvent's POINTER_MOTION, on the device's work loop: its reports to the guest's mouse.
+void ReimsGraphics::pointerMotion(const volatile UInt8 *payload, UInt32 size)
+{
+	RgfxMotion motion = {};
+	RgfxPointerDevice *mouse = __atomic_load_n(&pointerDevice, __ATOMIC_ACQUIRE);
+	if (!mouse || !rgfxPointerMotionRead(payload, size, &motion)) {
+		static char unread;
+		if (rgfxFirstCalls(&unread, size, 1))
+			IOLog("ReimsGraphics: a POINTER_MOTION of %u bytes moves nothing%s\n", size,
+			      mouse ? "" : " (no mouse is up)");
+		return;
+	}
+	mouse->post(motion);
 }
 
 // Hands a lifecycle message's answer to its waiting thread, or keeps a deferred create's for its
@@ -1596,6 +1641,7 @@ bool ReimsGraphics::start(IOService *provider)
 	displayPowerTaken = false;
 	pipelineAnswersTaken = false;
 	multiDisplayTaken = false;
+	pointerMotionTaken = false;
 #if defined(__x86_64__)
 	displayBoundsTaken = false;
 	boundsTold = {};
@@ -1765,6 +1811,7 @@ bool ReimsGraphics::start(IOService *provider)
 		    (took & (RGFX_FEATURE_PIPELINE_KEYS | RGFX_FEATURE_PIPELINE_ANSWERS)) ==
 		    (RGFX_FEATURE_PIPELINE_KEYS | RGFX_FEATURE_PIPELINE_ANSWERS);
 		multiDisplayTaken = (took & RGFX_FEATURE_MULTI_DISPLAY) != 0;
+		pointerMotionTaken = (took & RGFX_FEATURE_POINTER_MOTION) != 0;
 #if defined(__x86_64__)
 		constexpr uint64_t kCarriesPast = RGFX_FEATURE_MULTI_DISPLAY | RGFX_FEATURE_POINTER_OVER |
 		                                  RGFX_FEATURE_DISPLAY_BOUNDS;
@@ -1820,6 +1867,7 @@ bool ReimsGraphics::start(IOService *provider)
 	if (super::start(provider)) {
 		// The other displays' framebuffers, registered after this one.
 		startHeads();
+		startPointerDevice();
 		return true;
 	}
 fail:
@@ -1851,6 +1899,7 @@ void ReimsGraphics::stop(IOService *provider)
 	stopMobile();
 #endif
 	quiesce();
+	stopPointerDevice();
 #if defined(__arm64e__)
 	freeMobileChanges();
 #else

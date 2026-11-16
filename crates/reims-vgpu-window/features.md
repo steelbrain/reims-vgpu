@@ -210,6 +210,40 @@ Unset or unparsable values give the defaults below.
   `test: reims-vgpu-graphics::device::tests::displays::the_pointer_over_another_display_tells_the_guest_once`,
   `test: reims-vgpu-graphics::device::tests::displays::a_crossing_holds_the_pointer_until_the_guest_s_cursor_is_there`,
   `manual` (a VM with two displays)
+- In a game: captured, once the guest has hidden its cursor on every display
+  for 50 ms, as a game does that turns its camera by the mouse's motion, the
+  pointer drives the guest's own mouse (`POINTER_MOTION`,
+  docs/graphics-kext/design.md, "A pointer for games"), so the camera turns
+  however far the mouse moves, past the image's edge. The window holds the
+  host's pointer still (`CGAssociateMouseAndMouseCursorPosition`) and hands
+  the guest's mouse its unaccelerated motion, the buttons pressed meanwhile
+  and a mouse wheel's notches; the guest accelerates the motion once, as its
+  own mouse settings say. Once the guest shows its cursor again (the game's
+  menu, or the next move after typing hid it), the pointer is the absolute
+  one again, the host's pointer let go over the guest's cursor where it shows
+  on the window's display, else where it was held. A button comes up by the
+  route it went down by, so one held across either switch is never left
+  down. Releasing capture, losing the keyboard and closing let the pointer go
+  where it was held. On the desktop, and with a guest whose kext does not
+  take `POINTER_MOTION` (one built before it, the option ROM, Ambrosia's
+  module), the pointer is the absolute one only.
+  `test: game::the_guest_s_mouse_is_driven_once_its_cursor_stays_hidden`,
+  `test: game::moves_go_to_the_guest_s_mouse_until_it_shows_its_cursor`,
+  `test: game::a_button_comes_up_by_the_route_it_went_down_by`,
+  `test: game::the_wheel_goes_to_the_driven_mouse`,
+  `test: game::capture_s_end_and_a_refused_lock_give_the_pointer_back_where_held`,
+  `test: native::macos::input::the_tablet_s_events_are_unchanged_outside_a_game`,
+  `test: native::macos::input::a_hidden_cursor_s_motion_drives_the_guest_s_mouse_until_it_shows`,
+  `test: native::macos::input::a_button_held_across_the_switch_comes_up_by_its_own_route`,
+  `test: native::macos::input::letting_go_of_a_game_gives_the_pointer_back_where_it_was_held`,
+  `test: reims-vgpu::graphics::tests::displays::a_window_s_device_offers_pointer_motion_and_drives_the_guest_s_mouse`,
+  `test: reims-vgpu-graphics::device::tests::motion::a_guest_that_did_not_take_pointer_motion_gets_none`,
+  `test: reims-vgpu-graphics::device::tests::motion::the_cursor_is_hidden_once_every_display_it_sees_hides_it`,
+  `test: reims-vgpu-graphics::device::tests::motion::owed_motion_joins_and_a_press_never_does`,
+  `manual` (a game, or a probe that hides the cursor and reads its deltas:
+  the camera turns past the image's edge; a drag on the desktop lands where
+  the pointer is; typing in TextEdit hides the cursor, and the next move
+  shows it where the guest moved it, the host's pointer over it)
 
 ## Keyboard
 
@@ -254,7 +288,10 @@ Unset or unparsable values give the defaults below.
   too, never a resize of the window. Released, the pointer goes where the
   person moves it, and the window resizes again. In native full screen an
   image that reaches the screen's top or bottom edge takes the pointer there,
-  where macOS slides its own menu bar or Dock in.
+  where macOS slides its own menu bar or Dock in. While the pointer drives
+  the guest's mouse in a game (Pointer), the host's pointer is held still
+  instead, and capture's end lets it go where it was held.
+  `test: native::macos::input::letting_go_of_a_game_gives_the_pointer_back_where_it_was_held`,
   `test: capture::captured_input_holds_the_pointer_over_the_image`,
   `test: capture::a_captured_window_cannot_be_resized`,
   `test: native::macos::shell::a_windowed_window_is_not_resizable_while_captured`,
@@ -486,6 +523,23 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: handle::a_pointer_from_beyond_reaches_the_host_and_the_window_draws_the_cursor`,
   `manual` (a VM with two displays: a Finder window dragged across and back,
   display 1 right of display 0 and left of it)
+- In a game, as on macOS (Pointer): the window locks the host's pointer
+  (SDL's relative mode, the compositor's pointer lock on Wayland) and hands
+  the guest's mouse its unaccelerated motion (`SDL_MOUSE_RELATIVE_SYSTEM_SCALE`
+  0 while it does: relative-pointer's unaccelerated motion on Wayland, XInput2's
+  raw motion on X11), its buttons pressed meanwhile and the wheel's notches,
+  until the guest shows its cursor, where the host's pointer is let go over
+  it; a button comes up by the route it went down by; releasing capture
+  (Ctrl+Alt+Super), losing the keyboard and closing let it go where it was
+  held. Gone past a shared edge when the guest hides its cursor, the pointer
+  drives the guest's mouse from there. Where the compositor refuses the lock,
+  the pointer stays the absolute one until capture changes.
+  `test: native::sdl_thread::input::the_tablet_s_events_are_unchanged_outside_a_game`,
+  `test: native::sdl_thread::input::a_hidden_cursor_s_motion_drives_the_guest_s_mouse_until_it_shows`,
+  `test: native::sdl_thread::input::a_button_held_across_the_switch_comes_up_by_its_own_route`,
+  `test: native::sdl_thread::input::letting_go_of_a_game_gives_the_pointer_back_where_it_was_held`,
+  `test: reims-vgpu-graphics::device::tests::motion::motion_reaches_a_guest_that_took_it`,
+  `manual` (as on macOS, on a Linux host's guest boot)
 - Keys by position, as evdev reports them, so the guest's layout applies and
   ISO keys arrive as on a real ISO keyboard; media keys are dropped.
   `test: native::sdl_thread::keymap::scancodes_are_usb_usages`,
@@ -504,7 +558,8 @@ runtime's own device. The switches above apply, and `resolution=` too.
   compositor's pointer constraints keep on Wayland and XFixes barriers on
   X11 (where SDL has no mouse rect, its mouse grab holds the pointer in the
   whole window), except past an edge where the guest placed another display
-  (Pointer, above); the window stays resizable, its resize edges being the
+  and while it drives the guest's mouse in a game (Pointer, above); the
+  window stays resizable, its resize edges being the
   compositor's, outside its surface and beyond the hold; Ctrl+Alt+Super
   releases both; losing the keyboard releases; the window's end releases
   both, and the grab and the hold go with the capture before it hides; the

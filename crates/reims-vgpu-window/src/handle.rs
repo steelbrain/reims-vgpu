@@ -548,6 +548,13 @@ impl Window {
         })
     }
 
+    /// The guest's cursor's hot spot, in its mode's pixels, where the guest shows it on the
+    /// window's display.
+    pub(crate) fn shown_cursor_at(&self) -> Option<(u16, u16)> {
+        let guest = self.guest.lock();
+        guest.cursor_visible.then(|| guest.lead.at()).flatten()
+    }
+
     /// What the guest last reported.
     pub(crate) fn guest(&self) -> GuestState {
         self.guest.lock().clone()

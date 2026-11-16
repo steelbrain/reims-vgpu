@@ -110,6 +110,26 @@ pub trait PointerBeyond: Send + Sync {
     fn come_back(&self);
 }
 
+/// The guest's own relative pointing device, a mouse, which a window's captured pointer drives
+/// while the guest hides its cursor, as a game does that turns its camera by the mouse's motion
+/// ([`WindowCallbacks::motion`], [`crate::game`]): the reims-graphics device's `POINTER_MOTION`.
+/// Its calls run on the window's UI thread, as the callbacks do.
+pub trait PointerMotion: Send + Sync {
+    /// How long, in nanoseconds, the guest has hidden its cursor on every display it sees,
+    /// where it takes motion; `None` where it shows it on one, or takes none.
+    fn hidden_for(&self) -> Option<u64>;
+    /// The host's pointing device moved by `by` of its counts, unaccelerated, right then down,
+    /// turned its wheel `wheel` notches up, and holds the `BUTTON_*` `buttons` after it: the
+    /// guest's mouse does the same. Whether the guest took it.
+    fn moved(&self, by: (i32, i32), wheel: i32, buttons: u32) -> bool;
+}
+
+impl std::fmt::Debug for dyn PointerMotion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PointerMotion")
+    }
+}
+
 /// Where a captured pointer gone past the image's edge landed ([`PointerBeyond::moved`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Landed {
@@ -146,6 +166,10 @@ pub struct WindowCallbacks {
     /// Without it, it is held at the image's edges. Taken by the SDL window on Linux and Windows
     /// alone: on macOS the window holds the pointer at its edges whatever this is.
     pub beyond: Option<Arc<dyn PointerBeyond>>,
+    /// The guest's own mouse, which the captured pointer drives while the guest hides its cursor
+    /// ([`crate::game`]). Without it, the pointer stays the host's absolute one. Taken by the SDL
+    /// window on Linux and Windows and by the macOS window.
+    pub motion: Option<Arc<dyn PointerMotion>>,
 }
 
 impl std::fmt::Debug for WindowCallbacks {
@@ -157,6 +181,7 @@ impl std::fmt::Debug for WindowCallbacks {
             .field("close", &self.close.is_some())
             .field("scroll", &self.scroll.is_some())
             .field("beyond", &self.beyond.is_some())
+            .field("motion", &self.motion.is_some())
             .finish()
     }
 }

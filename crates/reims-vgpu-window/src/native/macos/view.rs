@@ -71,7 +71,8 @@ use objc2_app_kit::{
     NSEvent, NSEventType, NSResponder, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow,
     NSWindowOcclusionState, NSWindowStyleMask,
 };
-use objc2_core_foundation::CGFloat;
+use objc2_core_foundation::{CGFloat, CGPoint};
+use objc2_core_graphics::{CGDisplayBounds, CGMainDisplayID};
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize};
 use objc2_quartz_core::CAMetalLayer;
 use reims_vgpu_vulkan::core::rt::BlockEnv;
@@ -482,10 +483,34 @@ impl DisplayView {
         }
     }
 
-    /// The guest's cursor or its visibility changed.
+    /// The guest's cursor or its visibility changed: a pointer driving the guest's mouse may be
+    /// the window's again (`input`'s module doc).
     pub(crate) fn cursor_changed(&self) {
         self.ivars().window.take_cursor_refresh();
         self.invalidate_cursor();
+        let cx = self.context_now();
+        if let Ok(mut input) = self.ivars().input.try_borrow_mut() {
+            input.cursor_changed(&cx);
+        }
+        self.apply_hold();
+    }
+
+    /// Holds the host's pointer still while it drives the guest's mouse, or lets it go, as the
+    /// input asks ([`InputState::apply_hold`]).
+    fn apply_hold(&self) {
+        if let Ok(mut input) = self.ivars().input.try_borrow_mut() {
+            input.apply_hold(|point| self.global_point(point));
+        }
+    }
+
+    /// `point`, in the view's flipped points, in the displays' global coordinates (the main
+    /// display's top left the origin, y down), where the view is in a window.
+    fn global_point(&self, point: (f64, f64)) -> Option<CGPoint> {
+        let window = msg::get("window", || self.window())?;
+        let in_window = msg::get("convertPoint:toView:", || {
+            self.convertPoint_toView(NSPoint::new(point.0, point.1), None)
+        });
+        Some(global_of(&window, in_window))
     }
 
     /// The cursor rectangle over the image, with the guest's cursor, invisible while the window
@@ -527,6 +552,20 @@ impl DisplayView {
             image: self.ivars().layout.get().image,
             guest: self.ivars().window.mode(),
             window_is_key,
+            cursor: self.ivars().window.shown_cursor_at(),
+        }
+    }
+
+    /// What the view knows with no event: no point.
+    fn context_now(&self) -> ViewContext {
+        let window_is_key = msg::get("window", || self.window())
+            .is_some_and(|w| msg::get("isKeyWindow", || w.isKeyWindow()));
+        ViewContext {
+            point: None,
+            image: self.ivars().layout.get().image,
+            guest: self.ivars().window.mode(),
+            window_is_key,
+            cursor: self.ivars().window.shown_cursor_at(),
         }
     }
 
@@ -563,6 +602,7 @@ impl DisplayView {
             self.confine_pointer();
             self.hold_size();
         }
+        self.apply_hold();
         reaction.pass_on
     }
 
@@ -771,6 +811,16 @@ fn set_mouse_confinement(window: &NSWindow, rect: NSRect) {
     msg::get("setMouseConfinementRect:", || unsafe {
         let _: () = msg_send![window, setMouseConfinementRect: rect];
     });
+}
+
+/// `in_window`, a point in `window`'s coordinates, in the displays' global coordinates: the main
+/// display's top left the origin, y down.
+pub(crate) fn global_of(window: &NSWindow, in_window: NSPoint) -> CGPoint {
+    let on_screen = msg::get("convertPointToScreen:", || {
+        window.convertPointToScreen(in_window)
+    });
+    let main = CGDisplayBounds(CGMainDisplayID());
+    CGPoint::new(on_screen.x, main.size.height - on_screen.y)
 }
 
 /// `rect` as an NSRect in the flipped view's points.

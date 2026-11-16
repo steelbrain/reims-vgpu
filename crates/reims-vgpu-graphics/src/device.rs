@@ -331,7 +331,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 50.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 51.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -379,7 +379,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_PIPELINE_ANSWERS
     | RGFX_FEATURE_MULTI_DISPLAY
     | RGFX_FEATURE_POINTER_OVER
-    | RGFX_FEATURE_DISPLAY_BOUNDS;
+    | RGFX_FEATURE_DISPLAY_BOUNDS
+    | RGFX_FEATURE_POINTER_MOTION;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -926,6 +927,9 @@ pub(crate) struct Shared {
     control_handing: AtomicBool,
     /// Where the host's pointer and the guest's cursor are, for `POINTER_OVER` ([`Pointer`]).
     pointer: Mutex<Pointer>,
+    /// Held by the thread that posts the owed `POINTER_MOTION`s ([`Shared::post_motion`]), so
+    /// they go out in their order; a thread that finds it held leaves them to its holder.
+    motion_posting: Mutex<()>,
     /// The control submission ring's count through the last message the control thread has
     /// carried out, handed to the host or handed to a lane: a command buffer waits for it to pass
     /// the last message published before it that is its context's or every buffer's
@@ -1016,6 +1020,12 @@ impl Queues {
 /// it (a hidden cursor) or be slow to.
 const CROSSING_HOLD_NS: u64 = 100_000_000;
 
+/// The most `POINTER_MOTION`s owed at once ([`Pointer::motion`]): each press or release makes
+/// one, and motion joins the last. A guest that takes none for that long has the last take the
+/// next buttons too, so that what it is sent once it takes them again ends where the host's
+/// buttons are.
+const MOTION_OWED_MAX: usize = 64;
+
 /// What `POINTER_OVER` follows ([`Shared::pointer_at`]): the display the guest's cursor last
 /// showed on, what the guest was told, the displays' places in the guest's desktop, and where a
 /// captured pointer that went past its window's edge is ([`Away`]), each of one reset count. A
@@ -1042,6 +1052,16 @@ struct Pointer {
     bounds: [Option<Bounds>; RGFX_DISPLAYS_MAX as usize],
     /// The captured pointer gone past its window's edge, while it is.
     away: Option<Away>,
+    /// Each display's cursor as the guest's last `MOVE_CURSOR` of it left it: shown, hidden, or
+    /// `None` before the guest moved it ([`Shared::cursor_hidden_for`]).
+    shown: [Option<bool>; RGFX_DISPLAYS_MAX as usize],
+    /// Since when, on the device's clock, the guest has hidden its cursor on every display it
+    /// sees, while it has.
+    hidden_since: Option<u64>,
+    /// The `POINTER_MOTION`s not posted yet, oldest first: one that found the ring held by
+    /// another thread, full, or behind answers handed over goes at the next motion or the next
+    /// refresh of any display ([`Shared::pointer_motion`]).
+    motion: VecDeque<RgfxPointerMotion>,
 }
 
 /// A window's captured pointer gone past the image's edge onto the guest's desktop
@@ -1159,6 +1179,29 @@ impl PointerLink {
         if let Some(shared) = self.shared.upgrade() {
             shared.come_back();
         }
+    }
+
+    /// How long, in nanoseconds, the guest has hidden its cursor on every display it sees (its
+    /// last `MOVE_CURSOR` of each that it moved said hidden), where it took
+    /// [`RGFX_FEATURE_POINTER_MOTION`]: a window's captured pointer then drives the guest's
+    /// relative pointing device ([`Self::motion`]), as a game that hides the cursor reads its
+    /// motion. `None` where the cursor shows on a display, the guest has yet to move it since its
+    /// start, did not take the feature or is not started, and once the device has ended.
+    pub fn cursor_hidden_for(&self) -> Option<u64> {
+        self.shared.upgrade()?.cursor_hidden_for()
+    }
+
+    /// The host's pointing device moved by (`dx`, `dy`) of its counts, turned its wheel `wheel`
+    /// notches up, and holds the `RGFX_POINTER_BUTTON_*` `buttons` after it: where the guest took
+    /// [`RGFX_FEATURE_POINTER_MOTION`], it is sent `POINTER_MOTION` ([`RgfxPointerMotion`]).
+    /// Waits for no other thread: motion that finds the ring held or full joins the next of the
+    /// same buttons, and goes with it, or at the next refresh. Whether the guest takes it: false,
+    /// and nothing sent, where the guest did not take the feature or is not started, and once the
+    /// device has ended.
+    pub fn motion(&self, dx: i32, dy: i32, wheel: i32, buttons: u32) -> bool {
+        self.shared
+            .upgrade()
+            .is_some_and(|shared| shared.pointer_motion(dx, dy, wheel, buttons))
     }
 }
 
@@ -1458,6 +1501,7 @@ impl Device {
             control_handed: Mutex::new(Handed::default()),
             control_handing: AtomicBool::new(false),
             pointer: Mutex::new(Pointer::default()),
+            motion_posting: Mutex::new(()),
             control_done: AtomicU64::new(0),
             gate: Gate::default(),
             lanes: Arc::new(lanes),
@@ -2253,6 +2297,112 @@ impl Shared {
     pub(crate) fn come_back(&self) {
         let epoch = self.epoch.load(Ordering::Acquire);
         self.pointer.lock().at(epoch).away = None;
+    }
+
+    /// The guest's `MOVE_CURSOR` showed (`visible`) or hid its cursor on display `id`, one it
+    /// sees: where that leaves it hidden on every display it moved it on, and shown on none, the
+    /// cursor is hidden from now ([`Self::cursor_hidden_for`]).
+    pub(crate) fn cursor_visible(&self, id: u32, visible: bool) {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let seen = self.displays_seen() as usize;
+        let mut pointer = self.pointer.lock();
+        let pointer = pointer.at(epoch);
+        let Some(slot) = pointer.shown.get_mut(id as usize) else {
+            return;
+        };
+        *slot = Some(visible);
+        let hidden = pointer.shown[..seen.min(pointer.shown.len())]
+            .iter()
+            .all(|shown| *shown != Some(true));
+        if !hidden {
+            pointer.hidden_since = None;
+        } else if pointer.hidden_since.is_none() {
+            pointer.hidden_since = Some(now_ns());
+        }
+    }
+
+    /// [`PointerLink::cursor_hidden_for`].
+    pub(crate) fn cursor_hidden_for(&self) -> Option<u64> {
+        if !self.driver_took(RGFX_FEATURE_POINTER_MOTION) || !self.started() {
+            return None;
+        }
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let since = self.pointer.lock().at(epoch).hidden_since?;
+        Some(now_ns().saturating_sub(since))
+    }
+
+    /// [`PointerLink::motion`]: the motion joins the last owed `POINTER_MOTION` where that holds
+    /// the same buttons, else is owed after it, and the owed go out in order. Whether the guest
+    /// takes it.
+    pub(crate) fn pointer_motion(&self, dx: i32, dy: i32, wheel: i32, buttons: u32) -> bool {
+        if !self.driver_took(RGFX_FEATURE_POINTER_MOTION) || !self.started() {
+            return false;
+        }
+        let epoch = self.epoch.load(Ordering::Acquire);
+        {
+            let mut pointer = self.pointer.lock();
+            let owed = &mut pointer.at(epoch).motion;
+            let full = owed.len() >= MOTION_OWED_MAX;
+            match owed.back_mut() {
+                Some(last) if last.buttons == buttons || full => {
+                    last.dx = last.dx.saturating_add(dx);
+                    last.dy = last.dy.saturating_add(dy);
+                    last.wheel = last.wheel.saturating_add(wheel);
+                    last.buttons = buttons;
+                }
+                _ => {
+                    owed.push_back(RgfxPointerMotion {
+                        header: event_header(RGFX_EVT_POINTER_MOTION),
+                        dx,
+                        dy,
+                        wheel,
+                        buttons,
+                    });
+                }
+            }
+        }
+        self.post_motion(epoch, false);
+        true
+    }
+
+    /// Posts the `POINTER_MOTION`s owed at reset count `epoch`, oldest first, waiting for the
+    /// ring held elsewhere and for room where `wait`; stops at the first not posted, which stays
+    /// owed with those after it, as does one that finds answers handed over before it. Where
+    /// another thread posts them, it leaves them to it: that thread posts all it finds, and the
+    /// next refresh any it did not.
+    fn post_motion(&self, epoch: u64, wait: bool) {
+        let Some(_posting) = self.motion_posting.try_lock() else {
+            return;
+        };
+        loop {
+            let Some(event) = self.pointer.lock().at(epoch).motion.front().copied() else {
+                return;
+            };
+            if self.control_handing.load(Ordering::Acquire) {
+                return;
+            }
+            if !matches!(
+                self.post_on(&sized(&event), epoch, wait),
+                Post::Done | Post::Dropped
+            ) {
+                return;
+            }
+            let mut pointer = self.pointer.lock();
+            let owed = &mut pointer.at(epoch).motion;
+            let Some(front) = owed.front_mut() else {
+                return;
+            };
+            if *front == event {
+                owed.pop_front();
+            } else {
+                // Motion joined it while it was posted, the only change to the first owed while
+                // this thread posts: the guest has the event as it was, and what joined stays
+                // owed.
+                front.dx = front.dx.saturating_sub(event.dx);
+                front.dy = front.dy.saturating_sub(event.dy);
+                front.wheel = front.wheel.saturating_sub(event.wheel);
+            }
+        }
     }
 
     /// [`PointerLink::pointer_at`]: the host's pointer is over display `id` at (`x`, `y`), with
@@ -4087,8 +4237,9 @@ impl Shared {
                 display.state.lock().changed = false;
             }
         }
-        // A POINTER_OVER the window's thread could not post.
+        // A POINTER_OVER the window's thread could not post, and the motion.
         self.post_pointer(epoch, true);
+        self.post_motion(epoch, true);
         self.host.refreshed(id);
     }
 }

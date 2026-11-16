@@ -328,6 +328,7 @@ pub(crate) fn guest_mode_changed(id: u64) {
 /// The guest of window `id` changed its cursor or showed or hid it.
 pub(crate) fn cursor_changed(id: u64) {
     with_shell(id, |shell| {
+        os::cursor_changed(shell);
         shell.window.take_cursor_refresh();
         shell.refresh_cursor();
     });

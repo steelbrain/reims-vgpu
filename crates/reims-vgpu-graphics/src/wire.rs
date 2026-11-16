@@ -465,6 +465,14 @@ pub const RGFX_FEATURE_POINTER_OVER: u64 = 0x2_0000_0000_0000;
 /// made it with two displays or more, and carries the pointer past a display's edge only for a
 /// guest that took all three and sent the displays' rectangles.
 pub const RGFX_FEATURE_DISPLAY_BOUNDS: u64 = 0x4_0000_0000_0000;
+/// `FEATURES_HI` bit 19, feature bit 51, `POINTER_MOTION`: the guest's driver publishes a
+/// relative pointing device of its own, a mouse, which [`RGFX_EVT_POINTER_MOTION`] moves and
+/// clicks, beside the host's absolute one (QEMU's USB tablet). The device offers it where its
+/// host made it with a window, and sends `POINTER_MOTION` only to a guest that took it, while the
+/// window's captured pointer drives a game's hidden cursor (docs/graphics-kext/design.md, "A
+/// pointer for games"): a guest that did not take it (a kext built before this bit, the option ROM,
+/// Ambrosia's module) publishes no device and is never sent it.
+pub const RGFX_FEATURE_POINTER_MOTION: u64 = 0x8_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -726,6 +734,10 @@ pub const RGFX_EVT_VBLANK: u32 = 0x103;
 /// [`RGFX_FEATURE_POINTER_OVER`] and [`RGFX_FEATURE_MULTI_DISPLAY`]: the host's pointer is over a
 /// display the guest's cursor is not on, and the guest moves its cursor there.
 pub const RGFX_EVT_POINTER_OVER: u32 = 0x104;
+/// Event `POINTER_MOTION` ([`RgfxPointerMotion`]), sent only to a guest that took
+/// [`RGFX_FEATURE_POINTER_MOTION`]: the host's pointing device moved, turned its wheel or pressed
+/// or let go of a button, and the guest's relative pointing device does the same.
+pub const RGFX_EVT_POINTER_MOTION: u32 = 0x105;
 
 /// `COMPLETE`'s status: the command was done.
 pub const RGFX_STATUS_OK: u32 = 0;
@@ -1675,6 +1687,31 @@ pub struct RgfxPointerOver {
     pub buttons: u32,
 }
 
+/// `POINTER_MOTION`: the host's pointing device moved by (`dx`, `dy`), right and down, in its own
+/// counts, as no acceleration has changed them, turned its wheel `wheel` notches up (away from the
+/// person), and holds the `RGFX_POINTER_BUTTON_*` `buttons` after it. The guest's driver hands it
+/// to its relative pointing device as one report of a USB mouse, so the guest accelerates the
+/// motion as its own settings say, once, and a game that reads the device's counts gets the
+/// host's. Only a guest that took [`RGFX_FEATURE_POINTER_MOTION`] is sent it; motion that finds
+/// the ring held or full is added to the next event of the same buttons, so a press or a release
+/// is never lost.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxPointerMotion {
+    /// [`RGFX_EVT_POINTER_MOTION`], `seqno` 0.
+    pub header: RgfxMsgHeader,
+    /// The motion to the right, in the device's counts.
+    pub dx: i32,
+    /// The motion down, in the device's counts.
+    pub dy: i32,
+    /// Wheel notches, above 0 up (away from the person).
+    pub wheel: i32,
+    /// The buttons held after it: `RGFX_POINTER_BUTTON_*` bits.
+    pub buttons: u32,
+}
+
 /// [`RgfxPointerOver`]'s `buttons`: the left button held.
 pub const RGFX_POINTER_BUTTON_LEFT: u32 = 1 << 0;
 /// [`RgfxPointerOver`]'s `buttons`: the right button held.
@@ -1715,6 +1752,9 @@ const _: () = {
     assert!(size_of::<RgfxDisplayChanged>() == 24);
     assert!(size_of::<RgfxVblank>() == 40);
     assert!(size_of::<RgfxPointerOver>() == 32);
+    assert!(size_of::<RgfxPointerMotion>() == 32);
+    assert!(offset_of!(RgfxPointerMotion, wheel) == 24);
+    assert!(offset_of!(RgfxPointerMotion, buttons) == 28);
     assert!(size_of::<RgfxDisplayBounds>() == 40);
     assert!(RGFX_CONTROL_RING_DATA_SIZE.is_power_of_two());
     assert!(
@@ -5001,7 +5041,8 @@ const _: () = {
     assert!(size_of::<RgfxMeshPipelineReflection>() == 24);
     // Each exact size above is a multiple of 8, as a ring message must be.
     // The stage-3 opcodes do not collide with the stage-2 ones or each other.
-    assert!(RGFX_CMD_QUEUE_CREATE > RGFX_EVT_POINTER_OVER);
+    assert!(RGFX_CMD_QUEUE_CREATE > RGFX_EVT_POINTER_MOTION);
+    assert!(RGFX_EVT_POINTER_MOTION > RGFX_EVT_POINTER_OVER);
     assert!(RGFX_CMD_COMMAND_BUFFER > RGFX_CMD_FENCE_CREATE);
     assert!(RGFX_EVT_CB_COMPLETE > RGFX_CMD_COMMAND_BUFFER_IN_REGION);
     assert!(RGFX_CMD_COMMAND_BUFFER_IN_REGION > RGFX_CMD_COMMAND_BUFFER);

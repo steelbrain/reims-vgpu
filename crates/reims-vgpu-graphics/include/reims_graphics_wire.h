@@ -1514,6 +1514,15 @@
 // guest that took all three and sent the displays' rectangles.
 #define RGFX_FEATURE_DISPLAY_BOUNDS 1125899906842624
 
+// `FEATURES_HI` bit 19, feature bit 51, `POINTER_MOTION`: the guest's driver publishes a
+// relative pointing device of its own, a mouse, which [`RGFX_EVT_POINTER_MOTION`] moves and
+// clicks, beside the host's absolute one (QEMU's USB tablet). The device offers it where its
+// host made it with a window, and sends `POINTER_MOTION` only to a guest that took it, while the
+// window's captured pointer drives a game's hidden cursor (docs/graphics-kext/design.md, "A
+// pointer for games"): a guest that did not take it (a kext built before this bit, the option ROM,
+// Ambrosia's module) publishes no device and is never sent it.
+#define RGFX_FEATURE_POINTER_MOTION 2251799813685248
+
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 #define RGFX_REG_STATUS 16
@@ -1767,6 +1776,11 @@
 // [`RGFX_FEATURE_POINTER_OVER`] and [`RGFX_FEATURE_MULTI_DISPLAY`]: the host's pointer is over a
 // display the guest's cursor is not on, and the guest moves its cursor there.
 #define RGFX_EVT_POINTER_OVER 260
+
+// Event `POINTER_MOTION` ([`RgfxPointerMotion`]), sent only to a guest that took
+// [`RGFX_FEATURE_POINTER_MOTION`]: the host's pointing device moved, turned its wheel or pressed
+// or let go of a button, and the guest's relative pointing device does the same.
+#define RGFX_EVT_POINTER_MOTION 261
 
 // `COMPLETE`'s status: the command was done.
 #define RGFX_STATUS_OK 0
@@ -6570,6 +6584,27 @@ typedef struct {
   // The `RGFX_PIPELINE_REFLECT_*` flags.
   uint32_t flags;
 } RgfxPipelineReflection;
+
+// `POINTER_MOTION`: the host's pointing device moved by (`dx`, `dy`), right and down, in its own
+// counts, as no acceleration has changed them, turned its wheel `wheel` notches up (away from the
+// person), and holds the `RGFX_POINTER_BUTTON_*` `buttons` after it. The guest's driver hands it
+// to its relative pointing device as one report of a USB mouse, so the guest accelerates the
+// motion as its own settings say, once, and a game that reads the device's counts gets the
+// host's. Only a guest that took [`RGFX_FEATURE_POINTER_MOTION`] is sent it; motion that finds
+// the ring held or full is added to the next event of the same buttons, so a press or a release
+// is never lost.
+typedef struct {
+  // [`RGFX_EVT_POINTER_MOTION`], `seqno` 0.
+  RgfxMsgHeader header;
+  // The motion to the right, in the device's counts.
+  int32_t dx;
+  // The motion down, in the device's counts.
+  int32_t dy;
+  // Wheel notches, above 0 up (away from the person).
+  int32_t wheel;
+  // The buttons held after it: `RGFX_POINTER_BUTTON_*` bits.
+  uint32_t buttons;
+} RgfxPointerMotion;
 
 // `POINTER_OVER`: the host's pointer is over display `display`, at (`x`, `y`) in the display's
 // pixels of its mode, and the guest's cursor shows on another display. The guest moves its
