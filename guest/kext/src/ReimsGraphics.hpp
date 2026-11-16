@@ -51,6 +51,7 @@ typedef graft_iomfb_word RgfxIOMFBWord;
 #include "RgfxLegacySwapInfo.hpp"
 #include "RgfxLegacySwapLayout.hpp"
 #include "RgfxMobileCursor.hpp"
+#include "RgfxRegisterHold.hpp"
 #include "RgfxSwapRate.hpp"
 #endif
 #include <kern/thread_call.h>
@@ -87,6 +88,12 @@ public:
 	bool start(IOService *provider) override;
 	void stop(IOService *provider) override;
 	void free() override;
+#if defined(__arm64e__)
+	// The class's start registers the service as it ends; display 0's start holds each display's
+	// registration until the heads have started, so every display's service registers together
+	// (RgfxRegisterHold.hpp, holdRegistration).
+	void registerService(IOOptionBits options = 0) override;
+#endif
 
 #if defined(__x86_64__)
 	// IOFramebuffer: the device and its modes
@@ -530,9 +537,11 @@ private:
 	void publishBootConsole();
 
 	// The heads (display 0's): made, attached to the PCI device and started once display 0's
-	// framebuffer has started (startHeads), and terminated as it stops (stopHeads). A head's own
+	// framebuffer has started (startHeads, display by display with startHeadAt, which answers
+	// whether the display's head started), and terminated as it stops (stopHeads). A head's own
 	// start and stop (startHead, stopHead); dropHead takes `head` out of display 0's table.
 	void startHeads();
+	bool startHeadAt(UInt32 display);
 	void stopHeads();
 	bool startHead(IOService *provider);
 	void stopHead(IOService *provider);
@@ -831,6 +840,13 @@ private:
 	// as the paravirtual display records it; and the timing the display shows (setMobileMode).
 	bool mobileHotPlugged;
 	uint32_t mobileTimingId;
+	// The registrations display 0's start holds while it starts the heads (RgfxRegisterHold.hpp),
+	// display 0's alone, under stateLock: holdRegistration records display `display`'s where the
+	// hold is open, and answers whether it did; releaseRegistrations ends the hold and registers
+	// what it held, display 0's service first, then the heads' by display. With no lock held.
+	RgfxRegisterHold registerHold;
+	bool holdRegistration(UInt32 display, IOOptionBits options);
+	void releaseRegistrations();
 #endif
 
 	bool ready;

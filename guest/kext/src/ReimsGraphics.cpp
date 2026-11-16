@@ -1038,10 +1038,19 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		// each display the refresh was for.
 #if defined(__arm64e__)
 		// On arm64 a list that changed the modes is republished, off this work loop, and the
-		// processes told (republishMobileDisplay).
+		// processes told (republishMobileDisplay): display 0's, and each head's while it is in the
+		// table, which its stop takes it out of before it waits for its call (stopHead).
 		if (__atomic_exchange_n(&mobileListChanged, false, __ATOMIC_RELAXED) && mobileChangeCall &&
 		    hasStarted())
 			thread_call_enter(mobileChangeCall);
+		IOSimpleLockLock(interruptLock);
+		for (UInt32 i = 1; i < RGFX_DISPLAYS_MAX; i++) {
+			ReimsGraphics *head = heads[i];
+			if (head && __atomic_exchange_n(&head->mobileListChanged, false, __ATOMIC_RELAXED) &&
+			    head->mobileChangeCall && head->hasStarted())
+				thread_call_enter(head->mobileChangeCall);
+		}
+		IOSimpleLockUnlock(interruptLock);
 #endif
 		ReimsGraphics *fbs[RGFX_DISPLAYS_MAX];
 		const UInt32 displays = copyDisplays(fbs);
@@ -1861,12 +1870,27 @@ bool ReimsGraphics::start(IOService *provider)
 #endif
 
 	startDisplayPower();
+#if defined(__arm64e__)
+	// Where the heads start too, the class's start holds this display's registration, and each
+	// head's start its own, until the heads have started or the hold is due (RgfxRegisterHold.hpp).
+	{
+		uint64_t due = 0;
+		clock_interval_to_deadline(static_cast<uint32_t>(kRgfxRegisterHoldNs / 1000000),
+		                           kMillisecondScale, &due);
+		IOLockLock(stateLock);
+		registerHold.open(displayCount, due);
+		IOLockUnlock(stateLock);
+	}
+#endif
 	// The device is ours and its rings are up: contexts may open from here, as the class's start
 	// can register the framebuffer and WindowServer open it before it returns.
 	__atomic_store_n(&started, true, __ATOMIC_RELEASE);
 	if (super::start(provider)) {
 		// The other displays' framebuffers, registered after this one.
 		startHeads();
+#if defined(__arm64e__)
+		releaseRegistrations();
+#endif
 		startPointerDevice();
 		return true;
 	}
@@ -1874,6 +1898,12 @@ fail:
 	__atomic_store_n(&started, false, __ATOMIC_RELEASE);
 	stopDisplayPower();
 #if defined(__arm64e__)
+	// Nothing held is registered: the service did not start.
+	if (stateLock) {
+		IOLockLock(stateLock);
+		registerHold.release();
+		IOLockUnlock(stateLock);
+	}
 	stopMobile();
 #endif
 	quiesce();
@@ -2097,37 +2127,57 @@ void ReimsGraphics::publishFramebuffer()
 // display 0's is, at its display's location, and started there: its start (startHead) reads its
 // modes from the device and registers it, after display 0's, before WindowServer opens any of them
 // (IOGraphics links the framebuffers of a dependent ID that have started as the first one opens).
-// A head that does not start leaves its display undriven, its window black; the others go on.
+// On arm64 each framebuffer's registration is held meanwhile, and display 0's start registers them
+// together once the heads have started (RgfxRegisterHold.hpp); a head that fails to start, or a
+// hold past its deadline, ends the hold before the next head starts, and a head started after
+// that registers as it starts. A head that does not start leaves its display undriven, its window
+// black; the others go on.
 void ReimsGraphics::startHeads()
 {
 	const UInt32 count = displayCount;
 	for (UInt32 i = 1; i < count && i < RGFX_DISPLAYS_MAX; i++) {
-		ReimsGraphics *head = OSTypeAlloc(ReimsGraphics);
-		if (!head || !head->init()) {
-			OSSafeReleaseNULL(head);
-			IOLog("ReimsGraphics: display %u: no framebuffer for it: no memory\n", i);
-			continue;
-		}
-		retain();
-		head->device = this;
-		head->displayId = i;
-		char location[8];
-		snprintf(location, sizeof(location), "%u", i);
-		head->setLocation(location);
-		// The table holds the allocation's reference.
-		IOSimpleLockLock(interruptLock);
-		heads[i] = head;
-		IOSimpleLockUnlock(interruptLock);
-		const bool attached = head->attach(pci);
-		if (!attached || !head->start(pci)) {
-			IOLog("ReimsGraphics: display %u: its framebuffer did not start\n", i);
-			if (attached)
-				head->detach(pci);
-			dropHead(head);
-			continue;
-		}
-		IOLog("ReimsGraphics: display %u: its framebuffer started\n", i);
+		const bool headStarted = startHeadAt(i);
+#if defined(__arm64e__)
+		IOLockLock(stateLock);
+		const bool due = registerHold.due(!headStarted, mach_absolute_time());
+		IOLockUnlock(stateLock);
+		if (due)
+			releaseRegistrations();
+#else
+		(void)headStarted;
+#endif
 	}
+}
+
+// Display `i`'s head, made, attached to the PCI device and started: whether it started.
+bool ReimsGraphics::startHeadAt(UInt32 i)
+{
+	ReimsGraphics *head = OSTypeAlloc(ReimsGraphics);
+	if (!head || !head->init()) {
+		OSSafeReleaseNULL(head);
+		IOLog("ReimsGraphics: display %u: no framebuffer for it: no memory\n", i);
+		return false;
+	}
+	retain();
+	head->device = this;
+	head->displayId = i;
+	char location[8];
+	snprintf(location, sizeof(location), "%u", i);
+	head->setLocation(location);
+	// The table holds the allocation's reference.
+	IOSimpleLockLock(interruptLock);
+	heads[i] = head;
+	IOSimpleLockUnlock(interruptLock);
+	const bool attached = head->attach(pci);
+	if (!attached || !head->start(pci)) {
+		IOLog("ReimsGraphics: display %u: its framebuffer did not start\n", i);
+		if (attached)
+			head->detach(pci);
+		dropHead(head);
+		return false;
+	}
+	IOLog("ReimsGraphics: display %u: its framebuffer started\n", i);
+	return true;
 }
 
 // The heads go as display 0's framebuffer stops: out of the table, so the work loop hands them
@@ -2205,19 +2255,39 @@ bool ReimsGraphics::startHead(IOService *provider)
 	IOLog("ReimsGraphics: display %u, %u modes, scanout room 0x%llx bytes at 0x%llx\n", displayId,
 	      count, own.length, own.offset);
 	publishFramebuffer();
+#if defined(__arm64e__)
+	// The head's display as a process finds it, and its pipe, as display 0's start sets up its
+	// own.
+	if (!startMobile()) {
+		stopMobile();
+		freeMobileChanges();
+		OSSafeReleaseNULL(region);
+		return false;
+	}
+#endif
 	__atomic_store_n(&started, true, __ATOMIC_RELEASE);
 	if (super::start(provider))
 		return true;
 	__atomic_store_n(&started, false, __ATOMIC_RELEASE);
+#if defined(__arm64e__)
+	stopMobile();
+	freeMobileChanges();
+#endif
 	OSSafeReleaseNULL(region);
 	return false;
 }
 
-// A head's stop: out of display 0's table first, so the work loop hands it nothing more.
+// A head's stop: out of display 0's table first, so the work loop hands it nothing more. On arm64
+// the work loop asks for the head's display changes only while the head is in the table and
+// started (handleEvent), so its thread call is waited for and let go once the head is out.
 void ReimsGraphics::stopHead(IOService *provider)
 {
 	__atomic_store_n(&started, false, __ATOMIC_RELEASE);
 	device->dropHead(this);
+#if defined(__arm64e__)
+	stopMobile();
+	freeMobileChanges();
+#endif
 	super::stop(provider);
 	OSSafeReleaseNULL(region);
 }

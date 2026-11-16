@@ -282,6 +282,58 @@ void ReimsGraphics::freeMobileChanges()
 	thread_call_free(call);
 }
 
+// MARK: - The services' registration
+
+// The class's start registers the service as it ends (read from macOS 27.0.1's
+// IOMobileGraphicsFamily: IOMobileFramebufferLegacy::start's last call, virtual). Where display 0's
+// start holds the displays' registrations (RgfxRegisterHold.hpp), it is recorded instead, and
+// display 0's start registers it with the others (releaseRegistrations).
+void ReimsGraphics::registerService(IOOptionBits options)
+{
+	ReimsGraphics *owner = isHead() ? device : this;
+	const UInt32 display = isHead() ? displayId : 0;
+	if (owner->holdRegistration(display, options)) {
+		IOLog("ReimsGraphics: display %u: its service registers with the other displays'\n",
+		      display);
+		return;
+	}
+	IOMobileFramebufferLegacy::registerService(options);
+}
+
+bool ReimsGraphics::holdRegistration(UInt32 display, IOOptionBits options)
+{
+	if (!stateLock)
+		return false;
+	IOLockLock(stateLock);
+	const bool held = registerHold.hold(display, options);
+	IOLockUnlock(stateLock);
+	return held;
+}
+
+void ReimsGraphics::releaseRegistrations()
+{
+	IOLockLock(stateLock);
+	const uint32_t held = registerHold.release();
+	uint32_t options[RGFX_DISPLAYS_MAX];
+	for (UInt32 d = 0; d < RGFX_DISPLAYS_MAX; d++)
+		options[d] = registerHold.options[d];
+	IOLockUnlock(stateLock);
+	if (!held)
+		return;
+	UInt32 registered = 0;
+	for (UInt32 d = 0; d < RGFX_DISPLAYS_MAX; d++) {
+		if (!(held & (1u << d)))
+			continue;
+		ReimsGraphics *fb = copyDisplay(d);
+		if (!fb)
+			continue;
+		fb->IOMobileFramebufferLegacy::registerService(options[d]);
+		fb->release();
+		registered++;
+	}
+	IOLog("ReimsGraphics: %u displays' services registered together\n", registered);
+}
+
 // MARK: - The display as a process finds it
 
 namespace {
