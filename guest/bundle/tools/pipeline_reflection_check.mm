@@ -14,6 +14,9 @@
 //                r_more's
 //   r_more       v_more (more built-ins and outputs) and f_more, a vertex descriptor of buffers 1, 4
 //                and 30, buffer 30 holding only an attribute the function declares and does not read
+//   r_amplification  v_amplification and f_amplification, of vertex amplification's built-ins
+//   c_dispatch_groups  a kernel's dispatch_simdgroups_per_threadgroup,
+//                dispatch_quadgroups_per_threadgroup and thread_execution_width
 //   c_nested     an argument buffer of a struct of members, arrays of them, of samplers, buffers,
 //                constants and textures, and a pointer to another argument buffer
 //   c_nested_more  an argument buffer of C arrays of samplers and of pointers to argument
@@ -427,7 +430,8 @@ int main(int argc, char **argv)
 		                {"c_nested_more", "k_nested_more"}, {"c_tables", "k_tables"},
 		                {"c_ab_tables", "k_ab_tables"}, {"c_more_textures", "k_more_textures"},
 		                {"c_imageblock", "k_imageblock"}, {"c_deep_ab", "k_deep_ab"},
-		                {"c_imageblock_explicit", "k_imageblock_explicit"}, {"c_imageblock_late", "k_imageblock_late"}};
+		                {"c_imageblock_explicit", "k_imageblock_explicit"}, {"c_imageblock_late", "k_imageblock_late"},
+		                {"c_dispatch_groups", "k_dispatch_groups"}};
 		for (const auto &k : kKernels)
 			if (CASE(k.name))
 				computeCase(k.name, Fn{k.kernel, {}}, nil, false);
@@ -472,6 +476,10 @@ int main(int argc, char **argv)
 			           MTLPixelFormatRGBA16Float);
 		if (CASE("r_more"))
 			renderCase("r_more", Fn{"v_more", {}}, &more, vertexDescriptor(true), MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		const Fn amplification{"f_amplification", {}};
+		if (CASE("r_amplification"))
+			renderCase("r_amplification", Fn{"v_amplification", {}}, &amplification, nil, MTLPixelFormatBGRA8Unorm,
 			           MTLPixelFormatInvalid);
 		const Fn fetch{"f_fetch", {}}, tables{"f_tables", {}};
 		if (CASE("r_fetch"))

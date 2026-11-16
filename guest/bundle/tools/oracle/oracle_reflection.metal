@@ -517,6 +517,38 @@ kernel void k_ab_tables(device Tables &t [[buffer(0)]], device float *out [[buff
 	out[gid] = t.table[0](float(gid)) + hit.distance + hit2.distance;
 }
 
+// Vertex amplification's built-ins, in a vertex function and in a fragment function
+// (pipeline_reflection_check's r_amplification).
+struct AmplifiedOut {
+	float4 position [[position]];
+	uint view [[flat]];
+};
+
+vertex AmplifiedOut v_amplification(uint vid [[vertex_id]], uint view [[amplification_id]],
+                                    uint views [[amplification_count]])
+{
+	AmplifiedOut o;
+	o.position = float4(float(vid), float(view), float(views), 1);
+	o.view = view;
+	return o;
+}
+
+fragment float4 f_amplification(AmplifiedOut in [[stage_in]], uint view [[amplification_id]],
+                                uint views [[amplification_count]])
+{
+	return float4(float(in.view), float(view), float(views), 1);
+}
+
+// A kernel's built-ins of the dispatch's simdgroups and quadgroups, and its execution width
+// (pipeline_reflection_check's c_dispatch_groups).
+kernel void k_dispatch_groups(device uint *out [[buffer(0)]], uint width [[thread_execution_width]],
+                              uint simdgroups [[dispatch_simdgroups_per_threadgroup]],
+                              uint quads [[dispatch_quadgroups_per_threadgroup]],
+                              uint tid [[thread_index_in_threadgroup]])
+{
+	out[tid] = width + simdgroups + quads;
+}
+
 kernel void k_more_textures(texture2d<ushort> shorts [[texture(0)]],
                             depth2d_ms_array<float> depths [[texture(1)]],
                             texture_buffer<int, access::read_write> texels [[texture(2)]],
