@@ -718,6 +718,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 deferred_budget,
                 control: Arc::clone(&control),
                 vt,
+                vt_seen: Arc::default(),
             });
             // Display 0's window, then those of displays 1 and up, or none.
             let window_configs: Vec<Option<WindowConfig>> = match config.window {
@@ -3101,6 +3102,8 @@ struct CallbackHost<P: ApiPlatform> {
     /// The host's side of VideoToolbox's paravirtual messages ([`paravirt`]), over the decoders
     /// of the host's hardware video.
     vt: paravirt::Host,
+    /// The kinds of VideoToolbox message each way the log named (diagnostics, [`vt_first`]).
+    vt_seen: VtSeen,
 }
 
 impl<P: ApiPlatform> Host for CallbackHost<P> {
@@ -3272,7 +3275,8 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
             .into_iter()
             .map(|surface| Arc::new(GuestSurface(surface)) as Arc<dyn paravirt::LentSurface>)
             .collect();
-        let guest: Arc<dyn paravirt::Link> = Arc::new(GuestLink(link.clone()));
+        let guest: Arc<dyn paravirt::Link> =
+            Arc::new(GuestLink(link.clone(), Arc::clone(&self.vt_seen)));
         let Some(bytes) = self.control.decoder().guest_bytes(&message.runs, length) else {
             log::warn!(
                 target: "reims_vgpu::graphics",
@@ -3286,7 +3290,14 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
             return;
         };
         let answered = self.vt.deliver_lending(&bytes, lent, Some(guest));
+        vt_first(
+            &self.vt_seen,
+            false,
+            &bytes,
+            Some((answered.status, answered.replies.len())),
+        );
         for reply in &answered.replies {
+            vt_first(&self.vt_seen, true, reply, None);
             if !link.send(reply) {
                 log::warn!(
                     target: "reims_vgpu::graphics",
@@ -3314,12 +3325,51 @@ impl paravirt::LentSurface for GuestSurface {
     }
 }
 
-/// The device's link, as VideoToolbox's paravirtual host sends on it.
-struct GuestLink(VtLink);
+/// The device's link, as VideoToolbox's paravirtual host sends on it, and the kinds of message
+/// the log named.
+struct GuestLink(VtLink, VtSeen);
 
 impl paravirt::Link for GuestLink {
     fn send(&self, message: &[u8]) -> bool {
+        vt_first(&self.1, true, message, None);
         self.0.send(message)
+    }
+}
+
+/// The kinds of VideoToolbox message the log named, each with whether it went to the guest.
+type VtSeen = Arc<Mutex<Vec<(bool, [u8; 4])>>>;
+
+/// Logs the first VideoToolbox message of each kind each way at info (diagnostics): a `vtpv`
+/// message's type, or a box's (`rels`), its bytes, and for the guest's its status and replies.
+fn vt_first(seen: &VtSeen, to_guest: bool, bytes: &[u8], answered: Option<(i32, usize)>) {
+    let at = if bytes.get(4..8) == Some(b"vtpv".as_slice()) {
+        8
+    } else {
+        4
+    };
+    let kind: [u8; 4] = (bytes.get(at..at + 4))
+        .and_then(|k| k.try_into().ok())
+        .unwrap_or(*b"????");
+    {
+        let mut seen = seen.lock();
+        if seen.contains(&(to_guest, kind)) {
+            return;
+        }
+        seen.push((to_guest, kind));
+    }
+    let kind = String::from_utf8_lossy(&kind);
+    match answered {
+        Some((status, replies)) => log::info!(
+            target: "reims_vgpu::graphics",
+            "VideoToolbox: the guest's first '{kind}' ({} bytes): status {status}, {replies} \
+             replies",
+            bytes.len()
+        ),
+        None => log::info!(
+            target: "reims_vgpu::graphics",
+            "VideoToolbox: the host's first '{kind}' to the guest ({} bytes)",
+            bytes.len()
+        ),
     }
 }
 
