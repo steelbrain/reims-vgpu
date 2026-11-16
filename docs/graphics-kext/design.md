@@ -3503,10 +3503,9 @@ it.
   adds a node for each display the module reports, as far as the names go.
   The module takes `MULTI_DISPLAY` only under revision 2 and reports the count
   (architecture.md 11.5). A single name still makes display 0's node alone,
-  which every Ambrosia from 0.1.1 takes; a list is refused before 0.1.3. So
-  our configuration gives the list (`reims-display0` to `reims-display3`, one
-  bundle for every count) once Ambrosia 0.1.3 is released, and the single
-  name until then, with which an arm64 guest drives display 0 alone.
+  which every Ambrosia from 0.1.1 takes; a list is refused before 0.1.3. Our
+  configuration gives the list (`reims-display0` to `reims-display3`, one
+  bundle for every count), so it needs Ambrosia 0.1.3 or later.
 - A2, the arm64 services. How IOMobileFramebuffer.framework pairs the displays
   it counted with services, and what a second service of one kext needs for
   WindowServer to drive it (its index, its UUID, its swaps and cursor): read

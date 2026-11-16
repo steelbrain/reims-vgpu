@@ -754,7 +754,7 @@ config.plist             the bundle's configuration: the module, and the vtables
                          (Kernel > ExportVtableDiscriminators)
 tools/stage-config.py    our configuration: config.plist with a Kernel > Add entry for Graft and each
                          of our two kexts, after checking each is an arm64e kext with its identifier,
-                         and display 0's node in the device tree (Graphics > DisplayNode)
+                         and the displays' nodes in the device tree (Graphics > DisplayNode)
 check-boot.sh            boots an arm64 guest with a bundle and checks the boot (docs/qemu.md,
                          "arm64 guests: the boot check of our configuration")
 ```
@@ -783,9 +783,10 @@ the children of `IODeviceTree:/arm-io` whose `device_type` is `display-subsystem
 and waits up to 30 seconds for as many IOMobileFramebuffer services as it counted; a count of 0
 leaves the process with no display. Our kexts load from the auxiliary kernel collection, after
 WindowServer has counted, so the node must be in the device tree before the kernel starts. Our
-configuration's `Graphics` > `DisplayNode`, `reims-display0`, has Ambrosia add
-`/arm-io/reims-display0` with only a `name` and that `device_type` where the module drives a
-display, and ReimsGraphics uses that node as display 0's, attaching one of its own only where
+configuration's `Graphics` > `DisplayNode`, the list `reims-display0` to `reims-display3`, has
+Ambrosia 0.1.3 or later add `/arm-io/reims-display<i>` with only a `name` and that `device_type`
+for each display the module reports (one, display 0's, under Ambrosia's interface revision 1), and
+ReimsGraphics uses each node as its display's, attaching one of its own for display 0 only where
 none was placed. No personality matches the node: ReimsGraphics matches the PCI device, as
 Graft's activation gate requires. The module's bundle alone (`make bundle`) gives no node, since
 nothing would publish the service a process waits for.

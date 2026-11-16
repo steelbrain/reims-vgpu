@@ -5,16 +5,17 @@
     stage-config.py --identifiers
 
 OUT is written afresh: CONFIG, the config.plist that names the module, with a Kernel > Add entry
-for each kext and the display's node (Graphics > DisplayNode) as OUT/config.plist; MODULE as
+for each kext and the displays' nodes (Graphics > DisplayNode) as OUT/config.plist; MODULE as
 OUT/Drivers/ReimsGraphics.elf; and each kext as OUT/Kexts/<its name>.kext. The entries list the
 kexts in KEXTS' order, Graft before the two kexts that run on it.
 
-Graphics > DisplayNode has Ambrosia add /arm-io/<DISPLAY_NODE> to the device tree, a display-subsystem
-node, where the module drives a display: IOMobileFramebuffer.framework counts such nodes once in a
-process, WindowServer before the kexts load, and waits for as many framebuffer services as it
-counted. The node is given only with the kexts, which publish display 0's service and use the node
-as it stands; a bundle of the module alone gives none, so no process waits for a service that never
-comes.
+Graphics > DisplayNode, the names in DISPLAY_NODES, has Ambrosia add /arm-io/<name> to the device
+tree, a display-subsystem node, for each display the module says the device drives, in order and as
+far as the names go (Ambrosia's interface revision 2; revision 1 gives display 0's alone):
+IOMobileFramebuffer.framework counts such nodes once in a process, WindowServer before the kexts
+load, and waits for as many framebuffer services as it counted. The nodes are given only with the
+kexts, which publish a service for each display and use its node as it stands; a bundle of the
+module alone gives none, so no process waits for a service that never comes.
 
 Each kext must be a bundle whose Contents/Info.plist names the identifier KEXTS gives its role,
 and whose executable has an arm64e slice, the architecture of an arm64 guest's kernel. Every kext
@@ -36,9 +37,10 @@ KEXTS = [
     ("RGFXGATE", "RgfxGate.kext", "ai.aneesiqbal.RgfxGate"),
 ]
 
-# The name of display 0's node under /arm-io, the one ReimsGraphics looks for
-# (ReimsGraphicsMobile.cpp, attachMobileNode).
-DISPLAY_NODE = "reims-display0"
+# The names of the displays' nodes under /arm-io, display i's the i-th, the ones ReimsGraphics looks
+# for (ReimsGraphicsMobile.cpp, attachMobileNode): one for each display a device can have
+# (RGFX_DISPLAYS_MAX). Ambrosia adds as many as the device drives, so one bundle serves every count.
+DISPLAY_NODES = [f"reims-display{i}" for i in range(4)]
 
 CPU_TYPE_X86_64 = 0x01000007
 CPU_TYPE_ARM64 = 0x0100000C
@@ -127,7 +129,7 @@ def main(argv):
     with open(config, "rb") as f:
         plist = plistlib.load(f)
     plist.setdefault("Kernel", {})["Add"] = [{"BundlePath": f"Kexts/{name}"} for _, name, _ in KEXTS]
-    plist.setdefault("Graphics", {})["DisplayNode"] = DISPLAY_NODE
+    plist.setdefault("Graphics", {})["DisplayNode"] = DISPLAY_NODES
     if os.path.isdir(out):
         shutil.rmtree(out)
     os.makedirs(os.path.join(out, "Drivers"))

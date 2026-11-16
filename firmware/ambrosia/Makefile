@@ -14,8 +14,9 @@
 #   make config-bundle GRAFT=<Graft.kext> REIMS_GRAPHICS=<ReimsGraphics.kext>
 #                      RGFXGATE=<RgfxGate.kext>
 #                build/Config.cpio, our configuration: the bundle's config.plist with a
-#                Kernel > Add entry for each kext, in that order, and display 0's node
-#                (Graphics > DisplayNode), and the kexts under Kexts/
+#                Kernel > Add entry for each kext, in that order, and the displays' nodes
+#                (Graphics > DisplayNode, a list of names, which Ambrosia takes from its
+#                interface's revision 2 on and refuses before), and the kexts under Kexts/
 #                (tools/stage-config.py). Each must be given, and be a kext bundle
 #                with the identifier its role expects and an arm64e executable; where one
 #                is not, the target names it and why, and writes no bundle
