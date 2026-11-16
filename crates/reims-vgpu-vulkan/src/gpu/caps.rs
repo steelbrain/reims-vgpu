@@ -382,8 +382,11 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
 ///   shader cores).
 /// - Else none (Intel's drivers, lavapipe, and a device MoltenVK runs on another GPU than Metal's
 ///   default report no count): core writes no key 34 pair, as Apple's framework writes none for a
-///   device that does not respond to `gpuCoreCount`, and the guest's device then answers 0. Logged
-///   once, as the device's caps are read, naming the kind (`gpu-core-count-unknown`).
+///   device that does not respond to `gpuCoreCount`. An x86-64 guest's device does not respond to
+///   it on any host, as the AMD Radeon Pro 5300M's and the Intel UHD 630's do not (measured: macOS
+///   26.7.1, oracle_caps), so only an Apple GPU's, an arm64 guest's, answers the count, 0 where
+///   there is none. Logged once at info, as the device's caps are read, naming the kind
+///   (`gpu-core-count-unknown`).
 fn gpu_core_count(name: &str, reported: Option<u32>, registry_id: u64) -> Option<u64> {
     let metals = if crate::os::default_registry_id() == Some(registry_id) {
         crate::os::default_gpu_core_count()
@@ -392,11 +395,11 @@ fn gpu_core_count(name: &str, reported: Option<u32>, registry_id: u64) -> Option
     };
     let count = metals.or(reported.map(u64::from));
     if count.is_none() {
-        log::warn!(
-            target: "reims_vgpu_vulkan::caps",
-            "gpuCoreCount (gpu-core-count-unknown): {name}: its driver reports no core count and \
-             no Metal device stands for it, so the guest's device info carries none (key 34) and \
-             its device answers 0"
+        log::info!(
+            target: "reims_vgpu_vulkan::caps", kind = "gpu-core-count-unknown";
+            "gpuCoreCount: {name}: its driver reports no core count and no Metal device stands for \
+             it, so the guest's device info carries none (key 34): an arm64 guest's device answers \
+             0, and an x86-64 guest's answers none, as an x86 Mac's does"
         );
     }
     count
