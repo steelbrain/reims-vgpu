@@ -80,6 +80,8 @@
 		<string>2.0.0</string>
 		<key>com.apple.iokit.IOGraphicsFamily</key>
 		<string>1.0.0b1</string>
+		<key>com.apple.iokit.IOHIDFamily</key>
+		<string>2.0.0</string>
 		<key>com.apple.iokit.IOPCIFamily</key>
 		<string>2.9</string>
 		<key>com.apple.iokit.IOSurface</key>

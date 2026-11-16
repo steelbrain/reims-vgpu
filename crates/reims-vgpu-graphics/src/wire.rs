@@ -451,6 +451,12 @@ pub const RGFX_FEATURE_PIPELINE_ANSWERS: u64 = 0x8000_0000_0000;
 /// guest that did not sees display 0 alone, as from a device of one display, and is sent no event
 /// of another. Each display's scanout lies in a room of its own ([`RGFX_SCANOUT_ROOM_ALIGN`]).
 pub const RGFX_FEATURE_MULTI_DISPLAY: u64 = 0x1_0000_0000_0000;
+/// `FEATURES_HI` bit 17, feature bit 49, `POINTER_OVER`: the guest moves its cursor onto the
+/// display the host's pointer is over when [`RGFX_EVT_POINTER_OVER`] says so. The device offers
+/// it beside [`RGFX_FEATURE_MULTI_DISPLAY`], only where its host made it with two displays or
+/// more, and sends `POINTER_OVER` only to a guest that took both: one that took `MULTI_DISPLAY`
+/// alone (a kext built before this bit, the arm64e kext, Ambrosia's module) is never sent it.
+pub const RGFX_FEATURE_POINTER_OVER: u64 = 0x2_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -705,6 +711,10 @@ pub const RGFX_EVT_DISPLAYS: u32 = 0x101;
 pub const RGFX_EVT_DISPLAY_CHANGED: u32 = 0x102;
 /// Event `VBLANK` ([`RgfxVblank`]): a refresh of the display's host screen.
 pub const RGFX_EVT_VBLANK: u32 = 0x103;
+/// Event `POINTER_OVER` ([`RgfxPointerOver`]), sent only to a guest that took
+/// [`RGFX_FEATURE_POINTER_OVER`] and [`RGFX_FEATURE_MULTI_DISPLAY`]: the host's pointer is over a
+/// display the guest's cursor is not on, and the guest moves its cursor there.
+pub const RGFX_EVT_POINTER_OVER: u32 = 0x104;
 
 /// `COMPLETE`'s status: the command was done.
 pub const RGFX_STATUS_OK: u32 = 0;
@@ -1599,6 +1609,43 @@ pub struct RgfxVblank {
     pub host_time_ns: u64,
 }
 
+/// `POINTER_OVER`: the host's pointer is over display `display`, at (`x`, `y`) in the display's
+/// pixels of its mode, and the guest's cursor shows on another display. The guest moves its
+/// cursor onto display `display` at that point, so the host's pointer positions that follow, the
+/// USB tablet's scaled over that display's pixels, land on it: macOS scales the tablet over the
+/// display its cursor is on (docs/graphics-kext/design.md, "Multiple displays", X1). The host
+/// tells the guest once for each display the pointer comes over while the cursor is elsewhere,
+/// and again only after the cursor has shown on another display; only a guest that took
+/// [`RGFX_FEATURE_POINTER_OVER`] is told. `buttons` are the pointer's buttons held, so the move
+/// the guest makes is a drag where one is held.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxPointerOver {
+    /// [`RGFX_EVT_POINTER_OVER`], `seqno` 0.
+    pub header: RgfxMsgHeader,
+    /// The display's id.
+    pub display: u32,
+    /// The pointer's column, 0 up to the mode's width.
+    pub x: i32,
+    /// The pointer's row, 0 up to the mode's height.
+    pub y: i32,
+    /// The buttons held: `RGFX_POINTER_BUTTON_*` bits.
+    pub buttons: u32,
+}
+
+/// [`RgfxPointerOver`]'s `buttons`: the left button held.
+pub const RGFX_POINTER_BUTTON_LEFT: u32 = 1 << 0;
+/// [`RgfxPointerOver`]'s `buttons`: the right button held.
+pub const RGFX_POINTER_BUTTON_RIGHT: u32 = 1 << 1;
+/// [`RgfxPointerOver`]'s `buttons`: the middle button held.
+pub const RGFX_POINTER_BUTTON_MIDDLE: u32 = 1 << 2;
+/// [`RgfxPointerOver`]'s `buttons`: the side button held (back).
+pub const RGFX_POINTER_BUTTON_SIDE: u32 = 1 << 3;
+/// [`RgfxPointerOver`]'s `buttons`: the extra button held (forward).
+pub const RGFX_POINTER_BUTTON_EXTRA: u32 = 1 << 4;
+
 // The layout the tables of the design give.
 const _: () = {
     use core::mem::{offset_of, size_of};
@@ -1627,6 +1674,7 @@ const _: () = {
     assert!(size_of::<RgfxModeEntry>() == 12);
     assert!(size_of::<RgfxDisplayChanged>() == 24);
     assert!(size_of::<RgfxVblank>() == 40);
+    assert!(size_of::<RgfxPointerOver>() == 32);
     assert!(RGFX_CONTROL_RING_DATA_SIZE.is_power_of_two());
     assert!(
         RGFX_RING_HEADER_SIZE as u64 + RGFX_CONTROL_RING_DATA_SIZE as u64 <= RGFX_CONTROL_RING_SPAN
@@ -4912,7 +4960,7 @@ const _: () = {
     assert!(size_of::<RgfxMeshPipelineReflection>() == 24);
     // Each exact size above is a multiple of 8, as a ring message must be.
     // The stage-3 opcodes do not collide with the stage-2 ones or each other.
-    assert!(RGFX_CMD_QUEUE_CREATE > RGFX_EVT_VBLANK);
+    assert!(RGFX_CMD_QUEUE_CREATE > RGFX_EVT_POINTER_OVER);
     assert!(RGFX_CMD_COMMAND_BUFFER > RGFX_CMD_FENCE_CREATE);
     assert!(RGFX_EVT_CB_COMPLETE > RGFX_CMD_COMMAND_BUFFER_IN_REGION);
     assert!(RGFX_CMD_COMMAND_BUFFER_IN_REGION > RGFX_CMD_COMMAND_BUFFER);

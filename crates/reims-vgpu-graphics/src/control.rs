@@ -33,6 +33,9 @@ pub(crate) fn answer(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
                 display
                     .screen
                     .cursor_moved(command.x, command.y, command.visible != 0);
+                if command.visible != 0 {
+                    shared.cursor_shown_on(command.display);
+                }
             }
             return None;
         }

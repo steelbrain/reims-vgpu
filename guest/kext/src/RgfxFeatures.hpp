@@ -149,7 +149,10 @@
 //    more, its DISPLAYS answer lists them all and it sends each one's events, and the framebuffer
 //    drives each display with an IOFramebuffer of its own (ReimsGraphics.hpp, RgfxDisplayTable.hpp),
 //    which needs nothing of the bundle. The arm64e kext drives display 0 alone until its
-//    framebuffers for the others land (design.md, "Multiple displays").
+//    framebuffers for the others land (design.md, "Multiple displays");
+//  - POINTER_OVER (bit 49), the x86-64 kext alone, meaningful only with MULTI_DISPLAY: on the
+//    device's POINTER_OVER the framebuffer moves the cursor onto the display the host's pointer
+//    is over (ReimsGraphicsPointer.cpp, RgfxPointerOver.hpp), which needs nothing of the bundle.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -191,7 +194,8 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_ICB_SLOTS_IN_PAGES | RGFX_FEATURE_DOORBELL_ASKS | RGFX_FEATURE_GUEST_TIMES |
     RGFX_FEATURE_READ_ONLY_PAGES | RGFX_FEATURE_DOORBELL_PAGES | RGFX_FEATURE_PIPELINE_ANSWERS |
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K
-                      : RGFX_FEATURE_DISPLAY_POWER | RGFX_FEATURE_MULTI_DISPLAY);
+                      : RGFX_FEATURE_DISPLAY_POWER | RGFX_FEATURE_MULTI_DISPLAY |
+                            RGFX_FEATURE_POINTER_OVER);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)

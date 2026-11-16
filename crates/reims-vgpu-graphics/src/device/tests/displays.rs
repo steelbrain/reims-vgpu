@@ -64,6 +64,14 @@ fn take_multi_display(rig: &Rig) {
     );
 }
 
+/// The guest's driver takes `MULTI_DISPLAY` and `POINTER_OVER`, before it starts the device.
+fn take_pointer_over(rig: &Rig) {
+    rig.device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_HI.into(),
+        ((RGFX_FEATURE_MULTI_DISPLAY | RGFX_FEATURE_POINTER_OVER) >> 32) as u32,
+    );
+}
+
 /// A `DISPLAYS` answer's words after its header.
 fn words(bytes: &[u8]) -> Vec<u32> {
     let header = RgfxMsgHeader::read_from_prefix(bytes).unwrap().0;
@@ -83,19 +91,23 @@ fn told_on(rig: &Rig, i: usize) -> Vec<Told> {
     }
 }
 
-/// `MULTI_DISPLAY` (`FEATURES_HI` bit 16) is offered only by a device of two displays or more,
-/// and only there can the guest take it: a device of one reads the feature words it read before
-/// displays had rooms of their own
+/// `MULTI_DISPLAY` and `POINTER_OVER` (`FEATURES_HI` bits 16 and 17) are offered only by a
+/// device of two displays or more, and only there can the guest take them: a device of one reads
+/// the feature words it read before displays had rooms of their own
 #[test]
 fn multi_display_is_offered_only_by_a_device_of_two_displays_or_more() {
-    let bit = (RGFX_FEATURE_MULTI_DISPLAY >> 32) as u32;
-    for count in 1..=RGFX_DISPLAYS_MAX as usize {
-        let rig = Rig::of_displays(count);
-        let offered = rig.device.mmio_read(RGFX_REG_FEATURES_HI.into()) & bit != 0;
-        assert_eq!(offered, count > 1, "{count} displays");
-        take_multi_display(&rig);
-        let taken = rig.device.mmio_read(RGFX_REG_DRIVER_FEATURES_HI.into()) & bit != 0;
-        assert_eq!(taken, count > 1, "{count} displays");
+    for bit in [
+        (RGFX_FEATURE_MULTI_DISPLAY >> 32) as u32,
+        (RGFX_FEATURE_POINTER_OVER >> 32) as u32,
+    ] {
+        for count in 1..=RGFX_DISPLAYS_MAX as usize {
+            let rig = Rig::of_displays(count);
+            let offered = rig.device.mmio_read(RGFX_REG_FEATURES_HI.into()) & bit != 0;
+            assert_eq!(offered, count > 1, "bit {bit:#x}, {count} displays");
+            take_pointer_over(&rig);
+            let taken = rig.device.mmio_read(RGFX_REG_DRIVER_FEATURES_HI.into()) & bit != 0;
+            assert_eq!(taken, count > 1, "bit {bit:#x}, {count} displays");
+        }
     }
     let one = Rig::new();
     assert_eq!(one.device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
@@ -433,4 +445,170 @@ fn a_reset_lets_go_of_the_take_and_leaves_each_display_as_display_0() {
     rig.device.shared.refresh(1, 9);
     assert_eq!(told_on(&rig, 1), [Told::Present]);
     assert!(rig.quiet_for(500));
+}
+
+/// The next event, as a `POINTER_OVER`: its display, point and buttons.
+fn pointer_over(rig: &mut Rig) -> (u32, i32, i32, u32) {
+    let p = RgfxPointerOver::read_from_bytes(&rig.event().expect("a POINTER_OVER")).unwrap();
+    assert_eq!(
+        (p.header.r#type, p.header.size, p.header.seqno),
+        (RGFX_EVT_POINTER_OVER, 32, 0)
+    );
+    (p.display, p.x, p.y, p.buttons)
+}
+
+/// Sends `command`, a `MOVE_CURSOR`, and waits for the control thread to have carried it out: it
+/// carries out the answered `GET_DISPLAYS` after it.
+fn moved(rig: &mut Rig, command: Vec<u8>) {
+    rig.send(command);
+    rig.send(get_displays());
+    rig.event().expect("DISPLAYS");
+}
+
+/// The host's pointer over a display the guest's cursor is not on sends the guest that took
+/// `POINTER_OVER` a `POINTER_OVER` of that display at the pointer's point, with its buttons, once
+/// while the cursor stays where it was, and none while the cursor is on the pointer's display;
+/// once the cursor has shown on the pointer's display, the pointer's next display is told anew
+#[test]
+fn the_pointer_over_another_display_tells_the_guest_once() {
+    let mut rig = Rig::of_displays(2);
+    take_pointer_over(&rig);
+    rig.start();
+    rig.send(get_displays());
+    rig.event().unwrap();
+    let link = rig.device.pointer_link();
+    // The cursor starts on display 0.
+    link.pointer_at(0, 10, 20, 0);
+    assert!(rig.quiet_for(200), "the cursor is on the pointer's display");
+    link.pointer_at(1, 100, 200, 0);
+    assert_eq!(pointer_over(&mut rig), (1, 100, 200, 0));
+    link.pointer_at(1, 101, 201, 0);
+    assert!(
+        rig.quiet_for(200),
+        "told once while the cursor stays on display 0"
+    );
+    // The guest moved its cursor onto display 1: the pointer there tells nothing.
+    moved(&mut rig, move_on(1, 101, 201));
+    link.pointer_at(1, 102, 202, 0);
+    assert!(rig.quiet_for(200), "the cursor is on display 1");
+    // Back over display 0's window, a button held: the guest is told it, to drag there.
+    link.pointer_at(0, 5, 6, RGFX_POINTER_BUTTON_LEFT);
+    assert_eq!(pointer_over(&mut rig), (0, 5, 6, RGFX_POINTER_BUTTON_LEFT));
+    moved(&mut rig, move_on(0, 5, 6));
+    link.pointer_at(1, 7, 8, 0);
+    assert_eq!(pointer_over(&mut rig), (1, 7, 8, 0));
+    // A hidden cursor's moves are not where it shows.
+    let mut hidden = RgfxMoveCursor::read_from_bytes(&move_on(1, 7, 8)).unwrap();
+    hidden.visible = 0;
+    moved(&mut rig, hidden.as_bytes().to_vec());
+    link.pointer_at(1, 9, 9, 0);
+    assert!(
+        rig.quiet_for(200),
+        "told once while the cursor shows on display 0"
+    );
+}
+
+/// The guest's cursor moved off the pointer's display by the guest itself, while the pointer
+/// stays over that display's window, is sent back: the pointer's display is told again
+#[test]
+fn the_cursor_moved_away_under_the_pointer_is_told_the_pointer_s_display() {
+    let mut rig = Rig::of_displays(3);
+    take_pointer_over(&rig);
+    rig.start();
+    rig.send(get_displays());
+    rig.event().unwrap();
+    let link = rig.device.pointer_link();
+    link.pointer_at(1, 1, 2, 0);
+    assert_eq!(pointer_over(&mut rig), (1, 1, 2, 0));
+    moved(&mut rig, move_on(1, 1, 2));
+    moved(&mut rig, move_on(2, 30, 40));
+    link.pointer_at(1, 3, 4, 0);
+    assert_eq!(pointer_over(&mut rig), (1, 3, 4, 0));
+}
+
+/// No `POINTER_OVER` goes to a guest that did not take `MULTI_DISPLAY`, which sees display 0
+/// alone, to one that took `MULTI_DISPLAY` alone (a driver that knows no `POINTER_OVER`), to one
+/// whose device has one display, before the driver starts the device, nor of a display past the
+/// count
+#[test]
+fn the_pointer_tells_only_a_guest_that_took_pointer_over() {
+    let mut one = Rig::new();
+    one.start();
+    one.device.pointer_link().pointer_at(0, 1, 1, 0);
+    one.device.pointer_link().pointer_at(1, 1, 1, 0);
+    assert!(one.quiet_for(200), "a device of one display");
+
+    let mut untaken = Rig::of_displays(2);
+    untaken.start();
+    untaken.device.pointer_link().pointer_at(1, 1, 1, 0);
+    assert!(untaken.quiet_for(200), "a guest that sees display 0 alone");
+
+    let mut displays_only = Rig::of_displays(2);
+    take_multi_display(&displays_only);
+    displays_only.start();
+    displays_only.send(get_displays());
+    assert_eq!(
+        words(&displays_only.event().unwrap())[0],
+        2,
+        "it sees both displays"
+    );
+    displays_only.device.pointer_link().pointer_at(1, 1, 1, 0);
+    displays_only.refresh();
+    assert!(
+        displays_only.quiet_for(200),
+        "a guest that took MULTI_DISPLAY alone"
+    );
+
+    let mut early = Rig::of_displays(2);
+    take_pointer_over(&early);
+    early.device.pointer_link().pointer_at(1, 1, 1, 0);
+    early.start();
+    early.device.pointer_link().pointer_at(2, 1, 1, 0);
+    assert!(early.quiet_for(200), "before the start, and past the count");
+    early.device.pointer_link().pointer_at(1, 1, 1, 0);
+    assert_eq!(pointer_over(&mut early), (1, 1, 1, 0));
+}
+
+/// A reset forgets what the guest was told: the next driver, its cursor on display 0, is told
+/// of the pointer over display 1 again
+#[test]
+fn a_reset_forgets_what_the_pointer_told() {
+    let mut rig = Rig::of_displays(2);
+    take_pointer_over(&rig);
+    rig.start();
+    let link = rig.device.pointer_link();
+    link.pointer_at(1, 1, 1, 0);
+    assert_eq!(pointer_over(&mut rig), (1, 1, 1, 0));
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    (rig.produced, rig.consumed, rig.seqno) = (0, 0, 0);
+    take_pointer_over(&rig);
+    rig.start();
+    link.pointer_at(1, 2, 2, 0);
+    assert_eq!(pointer_over(&mut rig), (1, 2, 2, 0));
+}
+
+/// A `POINTER_OVER` that finds the control completion ring full is owed, and goes at the next
+/// refresh once the guest has taken room
+#[test]
+fn a_pointer_over_the_full_ring_has_no_room_for_goes_at_the_next_refresh() {
+    let mut rig = Rig::of_displays(2);
+    take_pointer_over(&rig);
+    rig.start();
+    // 24-byte answers: the 32 KiB ring holds 1365 of them.
+    let count = 1400u64;
+    for _ in 0..count {
+        rig.send(vblank_on(0, 0));
+    }
+    assert!(
+        eventually(|| !rig.degraded.lock().is_empty()),
+        "the ring never filled"
+    );
+    rig.device.pointer_link().pointer_at(1, 3, 4, 0);
+    for seqno in 1..=count {
+        assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    }
+    assert!(rig.quiet_for(100), "owed until a refresh");
+    rig.refresh();
+    assert_eq!(pointer_over(&mut rig), (1, 3, 4, 0));
 }

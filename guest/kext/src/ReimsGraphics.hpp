@@ -52,14 +52,15 @@ typedef graft_iomfb_word RgfxIOMFBWord;
 #include "RgfxLegacySwapLayout.hpp"
 #include "RgfxMobileCursor.hpp"
 #include "RgfxSwapRate.hpp"
-#include <kern/thread_call.h>
 #endif
+#include <kern/thread_call.h>
 
 #include "RgfxBootConsole.hpp"
 #include "RgfxDeferredAnswers.hpp"
 #include "RgfxDisplayModes.hpp"
 #include "RgfxDisplayTable.hpp"
 #include "RgfxPipeClients.hpp"
+#include "RgfxPointerOver.hpp"
 #include "RgfxRingRoom.hpp"
 #include "RgfxScanoutOwner.hpp"
 #include "RgfxSharedPipelines.hpp"
@@ -712,6 +713,20 @@ private:
 	UInt64 largestScanout;
 	UInt64 bootScreenSeqno;
 	bool bootScreenCleared;
+
+#if defined(__x86_64__)
+	// The host's pointer over another display (POINTER_OVER, ReimsGraphicsPointer.cpp), display
+	// 0's alone: the latest display, point and buttons the work loop took, under interruptLock,
+	// and the thread call that moves the cursor there, off the work loop, as IOHIDSystem's
+	// command gate may wait. Made in the start (startPointer), and waited for and let go once the
+	// work loop can ask for it no more (freePointer).
+	RgfxPointerAt pointerAt;
+	thread_call_t pointerCall;
+	bool startPointer();
+	void freePointer();
+	void pointerOver(const volatile UInt8 *payload, UInt32 size);
+	static void movePointer(thread_call_param_t self, thread_call_param_t);
+#endif
 
 #if defined(__arm64e__)
 	// The arm64e front end's (ReimsGraphicsMobile.cpp): set up in start before the class's own

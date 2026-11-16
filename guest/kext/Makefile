@@ -79,9 +79,10 @@ HEADERS = $(wildcard src/*.hpp)
 
 # The Stage-2 framebuffer (ReimsGraphics), the Stage-3 Metal accelerator
 # (RgfxAccelerator) and its region-map + doorbell user client, and on x86-64 the device
-# control (RgfxDeviceControl), all one kext: the objects both architectures build, with
-# each architecture's own (OBJECTS_x86_64, OBJECTS_arm64e) third in the link.
-OBJECTS_x86_64 = $(BUILD)/obj/RgfxDeviceControl.o
+# control (RgfxDeviceControl) and the pointer's moves (ReimsGraphicsPointer), all one kext:
+# the objects both architectures build, with each architecture's own (OBJECTS_x86_64,
+# OBJECTS_arm64e) third in the link.
+OBJECTS_x86_64 = $(BUILD)/obj/RgfxDeviceControl.o $(BUILD)/obj/ReimsGraphicsPointer.o
 OBJECTS_arm64e = $(BUILD)/obj/ReimsGraphicsMobile.o
 OBJECTS = $(BUILD)/obj/ReimsGraphics.o \
 	$(BUILD)/obj/RgfxAccelerator.o \
@@ -150,7 +151,8 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/control_ring_test $(BUILD)/tests/control_ring_arm64_test \
 	$(BUILD)/tests/completion_arm_test $(BUILD)/tests/kept_service_test \
 	$(BUILD)/tests/queue_publish_test $(BUILD)/tests/doorbell_pages_test $(BUILD)/tests/top_down_test \
-	$(BUILD)/tests/display_table_test $(BUILD)/tests/agdc_displays_test
+	$(BUILD)/tests/display_table_test $(BUILD)/tests/agdc_displays_test \
+	$(BUILD)/tests/pointer_over_test
 
 $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)

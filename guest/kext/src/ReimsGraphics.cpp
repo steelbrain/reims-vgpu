@@ -1134,6 +1134,13 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		fb->release();
 		return;
 	}
+#if defined(__x86_64__)
+	case RGFX_EVT_POINTER_OVER:
+		// The host's pointer is over another display: the cursor goes there
+		// (ReimsGraphicsPointer.cpp).
+		pointerOver(payload, size);
+		return;
+#endif
 	default:
 		return;
 	}
@@ -1792,6 +1799,9 @@ bool ReimsGraphics::start(IOService *provider)
 #if defined(__arm64e__)
 	if (!startMobile())
 		goto fail;
+#else
+	if (!startPointer())
+		goto fail;
 #endif
 
 	startDisplayPower();
@@ -1812,6 +1822,8 @@ fail:
 	quiesce();
 #if defined(__arm64e__)
 	freeMobileChanges();
+#else
+	freePointer();
 #endif
 	teardown();
 	return false;
@@ -1832,6 +1844,8 @@ void ReimsGraphics::stop(IOService *provider)
 	quiesce();
 #if defined(__arm64e__)
 	freeMobileChanges();
+#else
+	freePointer();
 #endif
 	super::stop(provider);
 	teardown();

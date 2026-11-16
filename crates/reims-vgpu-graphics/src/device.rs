@@ -329,7 +329,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 48.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 49.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -375,7 +375,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_READ_ONLY_PAGES
     | RGFX_FEATURE_DOORBELL_PAGES
     | RGFX_FEATURE_PIPELINE_ANSWERS
-    | RGFX_FEATURE_MULTI_DISPLAY;
+    | RGFX_FEATURE_MULTI_DISPLAY
+    | RGFX_FEATURE_POINTER_OVER;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -920,6 +921,8 @@ pub(crate) struct Shared {
     /// Whether `control_handed` holds an answer or a thread is posting them: every post onto the
     /// control completion ring then goes behind them.
     control_handing: AtomicBool,
+    /// Where the host's pointer and the guest's cursor are, for `POINTER_OVER` ([`Pointer`]).
+    pointer: Mutex<Pointer>,
     /// The control submission ring's count through the last message the control thread has
     /// carried out, handed to the host or handed to a lane: a command buffer waits for it to pass
     /// the last message published before it that is its context's or every buffer's
@@ -1001,6 +1004,61 @@ impl Queues {
             self.by_ring.remove(&queue.ring_id);
         }
         queue.end();
+    }
+}
+
+/// What `POINTER_OVER` follows ([`Shared::pointer_at`]): the display the guest's cursor last
+/// showed on, and what the guest was told, each of one reset count. A reset makes it new: the
+/// cursor on display 0, the guest told nothing.
+#[derive(Default)]
+struct Pointer {
+    /// The reset count it is of.
+    epoch: u64,
+    /// The display of the guest's last `MOVE_CURSOR` that showed its cursor.
+    cursor: u32,
+    /// The (pointer's display, cursor's display) the guest was last told the pointer is over the
+    /// first while its cursor is on the second, until the cursor shows on the pointer's display.
+    told: Option<(u32, u32)>,
+    /// That `POINTER_OVER`, until it is posted: one that found the ring held by another thread,
+    /// full, or behind answers handed over goes at the next refresh of any display.
+    owed: Option<RgfxPointerOver>,
+}
+
+impl Pointer {
+    /// The state of reset count `epoch`: made new where it is of an earlier one.
+    fn at(&mut self, epoch: u64) -> &mut Pointer {
+        if self.epoch != epoch {
+            *self = Pointer {
+                epoch,
+                ..Pointer::default()
+            };
+        }
+        self
+    }
+}
+
+/// A handle that tells the guest where the host's pointer is, from any thread ([`Self::pointer_at`]):
+/// a display's window holds one. It holds the device weakly, so it keeps it alive no longer.
+#[derive(Clone)]
+pub struct PointerLink {
+    /// The device's shared state, weakly.
+    shared: Weak<Shared>,
+}
+
+impl PointerLink {
+    /// The host's pointer is at (`x`, `y`) in display `display`'s pixels of its mode, over the
+    /// display (its window), with the `RGFX_POINTER_BUTTON_*` `buttons` held: where the guest took
+    /// [`RGFX_FEATURE_POINTER_OVER`] and [`RGFX_FEATURE_MULTI_DISPLAY`] and its cursor shows on
+    /// another display, the guest is sent `POINTER_OVER`, once for that display and the display
+    /// the cursor is on ([`RgfxPointerOver`]). Call it before the position goes to the guest's
+    /// pointing device, so the guest moves its cursor onto the display first. Waits for no other
+    /// thread: a `POINTER_OVER` that finds the ring held or full goes at the next refresh. Does
+    /// nothing on a device of one display, for a guest that sees one or did not take
+    /// `POINTER_OVER`, for a display it does not see, or once the device has ended.
+    pub fn pointer_at(&self, display: u32, x: i32, y: i32, buttons: u32) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.pointer_at(display, x, y, buttons);
+        }
     }
 }
 
@@ -1299,6 +1357,7 @@ impl Device {
             control_full: AtomicBool::new(false),
             control_handed: Mutex::new(Handed::default()),
             control_handing: AtomicBool::new(false),
+            pointer: Mutex::new(Pointer::default()),
             control_done: AtomicU64::new(0),
             gate: Gate::default(),
             lanes: Arc::new(lanes),
@@ -1493,6 +1552,14 @@ impl Device {
         }
         self.shared.wake.wake();
         true
+    }
+
+    /// The handle a display's window tells the guest of the host's pointer through
+    /// ([`PointerLink::pointer_at`]).
+    pub fn pointer_link(&self) -> PointerLink {
+        PointerLink {
+            shared: Arc::downgrade(&self.shared),
+        }
     }
 
     /// The host's reset of the device, as `STATUS` 0 (the module doc).
@@ -1870,14 +1937,15 @@ impl Shared {
     }
 
     /// The feature bits the device offers a guest whose driver took `taken`: the host's
-    /// ([`Host::features`]), [`RGFX_FEATURE_MULTI_DISPLAY`] on a device of two displays or more
-    /// (the device's to offer, whatever the host's answer), and where `taken` holds
-    /// [`RGFX_FEATURE_PAGES_16K`] and the host offers it, those it offers only then
-    /// ([`Host::features_with_16k_pages`]).
+    /// ([`Host::features`]), [`RGFX_FEATURE_MULTI_DISPLAY`] and [`RGFX_FEATURE_POINTER_OVER`] on
+    /// a device of two displays or more (the device's to offer, whatever the host's answer), and
+    /// where `taken` holds [`RGFX_FEATURE_PAGES_16K`] and the host offers it, those it offers only
+    /// then ([`Host::features_with_16k_pages`]).
     fn offered_to(&self, taken: u64) -> u64 {
-        let features = (self.host.features() & !RGFX_FEATURE_MULTI_DISPLAY)
+        let displays = RGFX_FEATURE_MULTI_DISPLAY | RGFX_FEATURE_POINTER_OVER;
+        let features = (self.host.features() & !displays)
             | if self.display_count() > 1 {
-                RGFX_FEATURE_MULTI_DISPLAY
+                displays
             } else {
                 0
             };
@@ -1920,6 +1988,69 @@ impl Shared {
         (id < self.displays_seen())
             .then(|| self.displays.get(id as usize))
             .flatten()
+    }
+
+    /// The guest's `MOVE_CURSOR` showed its cursor on display `id`, one it sees: the display
+    /// `POINTER_OVER` follows ([`Self::pointer_at`]).
+    pub(crate) fn cursor_shown_on(&self, id: u32) {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let mut pointer = self.pointer.lock();
+        let pointer = pointer.at(epoch);
+        pointer.cursor = id;
+        if pointer.told.is_some_and(|(over, _)| over == id) {
+            // The guest moved its cursor where it was told: a later move elsewhere is told anew.
+            pointer.told = None;
+            pointer.owed = None;
+        }
+    }
+
+    /// [`PointerLink::pointer_at`]: the host's pointer is over display `id` at (`x`, `y`), with
+    /// `buttons` held.
+    pub(crate) fn pointer_at(&self, id: u32, x: i32, y: i32, buttons: u32) {
+        let seen = self.displays_seen();
+        if seen < 2 || id >= seen || !self.driver_took(RGFX_FEATURE_POINTER_OVER) || !self.started()
+        {
+            return;
+        }
+        let epoch = self.epoch.load(Ordering::Acquire);
+        {
+            let mut pointer = self.pointer.lock();
+            let pointer = pointer.at(epoch);
+            if pointer.cursor == id || pointer.told == Some((id, pointer.cursor)) {
+                return;
+            }
+            pointer.told = Some((id, pointer.cursor));
+            pointer.owed = Some(RgfxPointerOver {
+                header: event_header(RGFX_EVT_POINTER_OVER),
+                display: id,
+                x,
+                y,
+                buttons,
+            });
+        }
+        self.post_pointer(epoch, false);
+    }
+
+    /// Posts the `POINTER_OVER` owed at reset count `epoch`, where one is ([`Pointer::owed`]),
+    /// waiting for the ring held elsewhere and for room where `wait`. One that finds answers
+    /// handed over before it, or that is not posted, stays owed.
+    fn post_pointer(&self, epoch: u64, wait: bool) {
+        let Some(event) = self.pointer.lock().at(epoch).owed else {
+            return;
+        };
+        if self.control_handing.load(Ordering::Acquire) {
+            return;
+        }
+        if matches!(
+            self.post_on(&sized(&event), epoch, wait),
+            Post::Done | Post::Dropped
+        ) {
+            let mut pointer = self.pointer.lock();
+            let pointer = pointer.at(epoch);
+            if pointer.owed == Some(event) {
+                pointer.owed = None;
+            }
+        }
     }
 
     /// The mode `display` offers its guest now: its screen's ([`Screen::mode`]), sized to its
@@ -3696,6 +3827,8 @@ impl Shared {
                 display.state.lock().changed = false;
             }
         }
+        // A POINTER_OVER the window's thread could not post.
+        self.post_pointer(epoch, true);
         self.host.refreshed(id);
     }
 }

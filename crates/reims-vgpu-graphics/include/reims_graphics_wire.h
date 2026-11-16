@@ -1498,6 +1498,13 @@
 // of another. Each display's scanout lies in a room of its own ([`RGFX_SCANOUT_ROOM_ALIGN`]).
 #define RGFX_FEATURE_MULTI_DISPLAY 281474976710656
 
+// `FEATURES_HI` bit 17, feature bit 49, `POINTER_OVER`: the guest moves its cursor onto the
+// display the host's pointer is over when [`RGFX_EVT_POINTER_OVER`] says so. The device offers
+// it beside [`RGFX_FEATURE_MULTI_DISPLAY`], only where its host made it with two displays or
+// more, and sends `POINTER_OVER` only to a guest that took both: one that took `MULTI_DISPLAY`
+// alone (a kext built before this bit, the arm64e kext, Ambrosia's module) is never sent it.
+#define RGFX_FEATURE_POINTER_OVER 562949953421312
+
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 #define RGFX_REG_STATUS 16
@@ -1742,6 +1749,11 @@
 
 // Event `VBLANK` ([`RgfxVblank`]): a refresh of the display's host screen.
 #define RGFX_EVT_VBLANK 259
+
+// Event `POINTER_OVER` ([`RgfxPointerOver`]), sent only to a guest that took
+// [`RGFX_FEATURE_POINTER_OVER`] and [`RGFX_FEATURE_MULTI_DISPLAY`]: the host's pointer is over a
+// display the guest's cursor is not on, and the guest moves its cursor there.
+#define RGFX_EVT_POINTER_OVER 260
 
 // `COMPLETE`'s status: the command was done.
 #define RGFX_STATUS_OK 0
@@ -2402,6 +2414,21 @@
 
 // Where a `DISPLAYS` message's first display record starts: right after `count`.
 #define RGFX_DISPLAYS_ENTRIES_OFFSET 20
+
+// [`RgfxPointerOver`]'s `buttons`: the left button held.
+#define RGFX_POINTER_BUTTON_LEFT (1 << 0)
+
+// [`RgfxPointerOver`]'s `buttons`: the right button held.
+#define RGFX_POINTER_BUTTON_RIGHT (1 << 1)
+
+// [`RgfxPointerOver`]'s `buttons`: the middle button held.
+#define RGFX_POINTER_BUTTON_MIDDLE (1 << 2)
+
+// [`RgfxPointerOver`]'s `buttons`: the side button held (back).
+#define RGFX_POINTER_BUTTON_SIDE (1 << 3)
+
+// [`RgfxPointerOver`]'s `buttons`: the extra button held (forward).
+#define RGFX_POINTER_BUTTON_EXTRA (1 << 4)
 
 // Where a `QUEUE_CREATE` message's [`RgfxQueueCreateFlags`] starts: right after its
 // [`RgfxQueueCreate`]. A message whose `size` is at least
@@ -6505,6 +6532,28 @@ typedef struct {
   // The `RGFX_PIPELINE_REFLECT_*` flags.
   uint32_t flags;
 } RgfxPipelineReflection;
+
+// `POINTER_OVER`: the host's pointer is over display `display`, at (`x`, `y`) in the display's
+// pixels of its mode, and the guest's cursor shows on another display. The guest moves its
+// cursor onto display `display` at that point, so the host's pointer positions that follow, the
+// USB tablet's scaled over that display's pixels, land on it: macOS scales the tablet over the
+// display its cursor is on (docs/graphics-kext/design.md, "Multiple displays", X1). The host
+// tells the guest once for each display the pointer comes over while the cursor is elsewhere,
+// and again only after the cursor has shown on another display; only a guest that took
+// [`RGFX_FEATURE_POINTER_OVER`] is told. `buttons` are the pointer's buttons held, so the move
+// the guest makes is a drag where one is held.
+typedef struct {
+  // [`RGFX_EVT_POINTER_OVER`], `seqno` 0.
+  RgfxMsgHeader header;
+  // The display's id.
+  uint32_t display;
+  // The pointer's column, 0 up to the mode's width.
+  int32_t x;
+  // The pointer's row, 0 up to the mode's height.
+  int32_t y;
+  // The buttons held: `RGFX_POINTER_BUTTON_*` bits.
+  uint32_t buttons;
+} RgfxPointerOver;
 
 // `PRESENT_SURFACE`: the display shows the IOSurface of global ID `iosurface_id` (plane 0), the
 // display pipe's swap, in place of the scanout, until the next `PRESENT_SURFACE`; 0 shows the

@@ -225,3 +225,46 @@ fn a_guest_that_did_not_take_multi_display_has_no_display_1_cursor() {
     eventually(|| !told.lock().is_empty());
     assert!(told.lock().iter().all(|(display, _)| *display == 0));
 }
+
+/// A window's pointer on a device of several displays tells a guest that took `POINTER_OVER`
+/// that the host's pointer is over the window's display: `POINTER_OVER` of that display at the
+/// event's point, with its buttons, is published before the host's pointer callback, which moves
+/// the guest's tablet, is called with the event; told once, the next event goes to the host alone
+#[test]
+fn a_window_s_pointer_tells_the_guest_its_display_before_the_host() {
+    let device = headless_of(2, GraphicsCallbacks::default());
+    device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_HI.into(),
+        ((RGFX_FEATURE_MULTI_DISPLAY | RGFX_FEATURE_POINTER_OVER) >> 32) as u32,
+    );
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let producer = device.region_base() as usize + RGFX_CONTROL_COMPLETE_OFFSET as usize;
+    let seen: Arc<Mutex<Vec<(u16, u16, u64)>>> = Arc::default();
+    let at = Arc::clone(&seen);
+    let mut config = WindowConfig::default();
+    config.callbacks.pointer = Some(Arc::new(move |x, y, _width, _height, _buttons| {
+        // SAFETY: the control completion ring's producer, in the device's region, which stays
+        // mapped while the device lives.
+        let produced = unsafe { AtomicU64::from_ptr(producer as *mut u64).load(Ordering::SeqCst) };
+        at.lock().push((x, y, produced));
+    }));
+    let link = Arc::new(OnceLock::new());
+    let _ = link.set(device.device.pointer_link());
+    crate::window::tell_pointer(&mut config, 1, &link);
+    let pointer = config.callbacks.pointer.clone().unwrap();
+    pointer(100, 50, 1920, 1080, reims_vgpu_window::BUTTON_LEFT);
+    let p = RgfxPointerOver::read_from_bytes(&guest.event().unwrap()).unwrap();
+    assert_eq!(
+        (p.header.r#type, p.display, p.x, p.y, p.buttons),
+        (RGFX_EVT_POINTER_OVER, 1, 100, 50, RGFX_POINTER_BUTTON_LEFT)
+    );
+    // The host's callback saw the event's 32 bytes already published.
+    assert_eq!(*seen.lock(), [(100, 50, 32)]);
+    pointer(101, 51, 1920, 1080, 0);
+    assert!(
+        guest.quiet_for(200),
+        "told once while the cursor stays on display 0"
+    );
+    assert_eq!(seen.lock().len(), 2);
+}

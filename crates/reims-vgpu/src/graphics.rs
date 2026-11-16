@@ -268,7 +268,8 @@ pub struct GraphicsConfig {
     pub window: Option<WindowConfig>,
     /// How many displays the device has: 0 and 1 are one display, as a config made before the
     /// field has; 2 to `RGFX_DISPLAYS_MAX` (4) make a device of that many, which offers the
-    /// guest `RGFX_FEATURE_MULTI_DISPLAY`. Any other count is [`Error::InvalidArgument`].
+    /// guest `RGFX_FEATURE_MULTI_DISPLAY` and `RGFX_FEATURE_POINTER_OVER`. Any other count is
+    /// [`Error::InvalidArgument`].
     pub display_count: u32,
     /// The windows of displays 1 to `display_count - 1`, given exactly where
     /// [`Self::window`] is: `display_count - 1` of them with it, none without it; otherwise
@@ -701,13 +702,20 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 None => (0..count).map(|_| None).collect(),
             };
             let displays = u32::try_from(count).unwrap_or(u32::MAX);
+            // Where several displays' windows tell the guest which one the pointer is over: the
+            // device's link, once it is made.
+            let pointer = Arc::new(OnceLock::new());
             let mut windows = Vec::new();
             let mut screens: Vec<Box<dyn Screen>> = Vec::with_capacity(count);
             let mut reads = Vec::with_capacity(count);
             let mut first_shown = None;
             for (display, window_config) in window_configs.into_iter().enumerate() {
                 let (screen, shown): (Arc<dyn Screen>, Arc<Shown>) = match window_config {
-                    Some(window_config) => {
+                    Some(mut window_config) => {
+                        if displays > 1 {
+                            let id = u32::try_from(display).unwrap_or(u32::MAX);
+                            crate::window::tell_pointer(&mut window_config, id, &pointer);
+                        }
                         let (link, screen) = WindowScreen::open(
                             &platform,
                             &region,
@@ -747,6 +755,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             drop(first_shown);
             let device = reims_vgpu_graphics::Device::with_screens(region, host, screens)
                 .ok_or(Error::HostResources)?;
+            let _ = pointer.set(device.pointer_link());
             LIVE.fetch_add(1, Ordering::SeqCst);
             Ok(GraphicsDevice {
                 windows,
