@@ -597,6 +597,16 @@ pub fn report_gpu_time(
         .is_ok()
 }
 
+/// Why `Swapchain::make` made no swapchain, by whether Vulkan was asked for one with the old
+/// swapchain as its `oldSwapchain`, which retires the old one whatever the answer.
+#[derive(Debug)]
+enum Unmade {
+    /// Refused before the create: the old swapchain is still the window's.
+    Unasked(Refused),
+    /// The create, or the wrap of its images, refused: the old swapchain is retired.
+    Asked(Refused),
+}
+
 /// A refusal naming `what` failed with `result`.
 fn refused(what: &str, result: vk::Result) -> Refused {
     Refused(format!("{what}: {result}"))
@@ -1114,12 +1124,30 @@ impl Swapchain {
             size,
             old.as_ref().map_or(vk::SwapchainKHR::null(), |c| c.raw),
         );
-        // Retired whether or not the new one was made.
-        self.retired.extend(old);
-        self.collect();
-        self.chain = Some(made?);
-        self.stale = false;
-        Ok(())
+        match made {
+            Ok(chain) => {
+                self.retired.extend(old);
+                self.collect();
+                self.chain = Some(chain);
+                self.stale = false;
+                Ok(())
+            }
+            // Vulkan was never handed the old swapchain, so it is still the window's: it stays the
+            // current one, stale, and the next remake hands it over as `oldSwapchain`. Retired
+            // here, the next create would pass none while it lives, which Windows refuses
+            // (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`) at every draw from then on.
+            Err(Unmade::Unasked(e)) => {
+                self.chain = old;
+                self.stale = true;
+                Err(e)
+            }
+            // A create that refused retired the old swapchain all the same.
+            Err(Unmade::Asked(e)) => {
+                self.retired.extend(old);
+                self.collect();
+                Err(e)
+            }
+        }
     }
 
     /// Takes the swapchain out once its frames have completed, waiting on nothing else; its
@@ -1300,16 +1328,21 @@ impl Swapchain {
 
     /// A swapchain for a window of `size` pixels, passing `old` as its `oldSwapchain`, its images
     /// wrapped as runtime textures (the module doc). A refusal for a lost surface marks it lost.
-    fn make(&mut self, size: (u64, u64), old: vk::SwapchainKHR) -> Result<Chain, Refused> {
+    fn make(&mut self, size: (u64, u64), old: vk::SwapchainKHR) -> Result<Chain, Unmade> {
         let _wsi = WSI.lock();
         // SAFETY: the surface and physical device are live, of one instance.
         let caps = unsafe {
             self.surface_api
                 .get_physical_device_surface_capabilities(self.physical, self.surface)
         }
-        .map_err(|e| self.refused_by("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", e))?;
-        let extent = extent_for(size, &caps)
-            .ok_or_else(|| Refused("the window's surface has no pixels for now".to_owned()))?;
+        .map_err(|e| {
+            Unmade::Unasked(self.refused_by("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", e))
+        })?;
+        let extent = extent_for(size, &caps).ok_or_else(|| {
+            Unmade::Unasked(Refused(
+                "the window's surface has no pixels for now".to_owned(),
+            ))
+        })?;
         let wanted = if self.is_mailbox() {
             MAILBOX_IMAGES
         } else {
@@ -1348,11 +1381,14 @@ impl Swapchain {
         }
         // SAFETY: a valid create info over the live surface; `old` is this swapchain's last.
         let raw = unsafe { self.swapchain_api.create_swapchain(&info) }
-            .map_err(|e| self.refused_by("vkCreateSwapchainKHR", e))?;
-        let images = self.wrap(raw, extent, usage, sharing).inspect_err(|_| {
-            // SAFETY: nothing was presented from the new swapchain.
-            unsafe { self.swapchain_api.destroy_swapchain(raw) };
-        })?;
+            .map_err(|e| Unmade::Asked(self.refused_by("vkCreateSwapchainKHR", e)))?;
+        let images = self
+            .wrap(raw, extent, usage, sharing)
+            .inspect_err(|_| {
+                // SAFETY: nothing was presented from the new swapchain.
+                unsafe { self.swapchain_api.destroy_swapchain(raw) };
+            })
+            .map_err(Unmade::Asked)?;
         Ok(Chain {
             raw,
             size,
