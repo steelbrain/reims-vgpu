@@ -132,6 +132,11 @@ of four volumes sized by the default, listed one **[measured]**), so the writer 
 container at least as many slots as it holds volumes, and sizes the checkpoint data area, which
 grows with that count, from the same figure.
 
+Each volume records a meta-crypto state, the one an unencrypted volume carries (version 5,
+class 6), and in it an OS version: the restored build's, as a restore of macOS leaves it
+(`write::key_os_version`; `23G93` is `0x1747005d`, the major number, the letter and the number in
+the low half) **[measured, 14.6.1: a Virtualization.framework restore]**.
+
 ## The system volume's seal
 
 The kernel mounts the system volume only if its sealed root hash equals the one the boot hands it:
@@ -353,6 +358,12 @@ Data out and has the first boot make it, by EACS:
   guest wrote (the ean storage's keys among it), then removes the copies. It refuses while the
   ean storage holds only `aptk`. The next boot unwraps the D-key, unlocks Data (boot mode
   `_autounlock`) and goes to Setup Assistant **[measured]**.
+- Its template migration (`templateMigrator`, in the BaseSystem) depends on how the restore left
+  the Update volume. With every volume recording 26A434's OS version and no
+  `Update/Hardware/Battery`, 9 of 16 fresh 14.6.1 restores failed it ("MobileObliteration
+  failed", `template_migration_failure_error` in NVRAM, then a recovery boot); with both as a
+  restore of macOS leaves them, 6 of 6 completed **[measured, M3 Max under HVF]**. Which of the
+  two it reads is not known.
 
 So every VM takes one boot of the guest before it is ready (`pipeline::finish_eacs` after it):
 reims-ctl's `create` and the CLI's `restore` end by naming that boot and the step after it,
