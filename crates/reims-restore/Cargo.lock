@@ -1197,6 +1197,7 @@ dependencies = [
  "sha2 0.11.1",
  "ureq",
  "uuid",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

@@ -57,12 +57,11 @@ pub fn list() -> Vec<Item> {
             if !m.is_file() {
                 continue;
             }
-            use std::os::unix::fs::MetadataExt as _;
             out.push(Item {
                 path: e.path(),
                 what: what(&name),
                 // what it takes on disk: a sparse image takes less than its length
-                bytes: (m.blocks() * 512).min(m.len()),
+                bytes: crate::os::allocated(&m).min(m.len()),
             });
         }
     }
@@ -154,9 +153,9 @@ fn being_downloaded(path: &Path) -> bool {
     let Ok(f) = std::fs::OpenOptions::new().read(true).open(&lock) else {
         return false;
     };
-    use std::os::fd::AsRawFd as _;
-    // SAFETY: flock on a descriptor this function holds; closing it lets go.
-    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
+    // flock(LOCK_EX | LOCK_NB) on Unix, LockFileEx on Windows, on a file this function holds:
+    // closing it lets go.
+    f.try_lock().is_err()
 }
 
 #[cfg(test)]
@@ -238,12 +237,7 @@ mod tests {
             .write(true)
             .open(reims_restore::download::lock_path(&inst, base))
             .unwrap();
-        use std::os::fd::AsRawFd as _;
-        // SAFETY: flock on an open descriptor.
-        assert_eq!(
-            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        held.try_lock().unwrap();
         let e = delete(part).unwrap_err().to_string();
         assert!(e.contains("is being downloaded now"), "{e}");
         drop(held);

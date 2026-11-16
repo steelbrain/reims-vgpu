@@ -275,7 +275,6 @@ pub fn lock_path(dir: &Path, name: &str) -> PathBuf {
 /// Takes the lock of a download of `name` into `dir`, held until the file returned closes, or
 /// says another download has it.
 fn lock(dir: &Path, name: &str) -> Result<File> {
-    use std::os::fd::AsRawFd as _;
     let path = lock_path(dir, name);
     let f = OpenOptions::new()
         .create(true)
@@ -283,8 +282,9 @@ fn lock(dir: &Path, name: &str) -> Result<File> {
         .write(true)
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
-    // SAFETY: flock on an open descriptor; the lock goes when the file is closed.
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    // flock(LOCK_EX | LOCK_NB) on Unix, LockFileEx on Windows; the lock goes when the file is
+    // closed.
+    if f.try_lock().is_err() {
         bail!("another download of {name} is running");
     }
     Ok(f)
@@ -327,15 +327,7 @@ fn header<'a>(r: &'a ureq::http::Response<ureq::Body>, name: &str) -> Option<&'a
 
 /// The space free to this user on the file system `dir` is on.
 pub fn free_space(dir: &Path) -> Result<u64> {
-    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())?;
-    // SAFETY: statvfs fills the struct it is given, from a NUL-terminated path.
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("statvfs {}", dir.display()));
-    }
-    #[allow(clippy::useless_conversion)]
-    Ok(u64::from(s.f_bavail) * u64::from(s.f_frsize))
+    crate::sys::free_space(dir)
 }
 
 fn gib(bytes: u64) -> String {

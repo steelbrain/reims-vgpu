@@ -3,8 +3,9 @@
 
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::sync::Arc;
+
+use reims_apfs::file_at::FileAt;
 
 /// Bytes read at offsets, from any thread.
 pub trait ReadAt: Send + Sync {

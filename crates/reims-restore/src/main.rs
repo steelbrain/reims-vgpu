@@ -335,7 +335,7 @@ fn extract(
         let n = buf.len().min((src.len() - off) as usize);
         src.read_exact_at(off, &mut buf[..n])?;
         if buf[..n].iter().any(|&b| b != 0) {
-            use std::os::unix::fs::FileExt as _;
+            use reims_apfs::file_at::FileAt as _;
             f.write_all_at(&buf[..n], off)?;
         }
         off += n as u64;

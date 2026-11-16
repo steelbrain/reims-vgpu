@@ -49,7 +49,7 @@ p384 = { version = "0.14.0", features = ["ecdsa", "pkcs8", "pem"] }
 # BuildManifest.plist, Restore.plist, the TSS request and response, UDIF's resource fork.
 plist = "1.10.3"
 getrandom = "0.4.3"
-# statvfs, for the space free where the VM goes (pipeline.rs), and the CLI's signal handler.
+# statvfs, for the space free where the VM goes (src/sys/unix.rs), and the CLI's signal handler.
 libc = "0.2.191"
 # The SHA-1 Apple's catalog gives for an IPSW, checked as it downloads (download.rs).
 sha1 = "0.11.0"
@@ -61,6 +61,10 @@ ureq = "3.5.1"
 uuid = { version = "1.29.2", features = ["v4"] }
 # The IPSW is a zip (ipsw.rs).
 zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2"] }
+
+# The space free on a volume (src/sys/windows.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 # Writes the tests' synthetic IPSWs.

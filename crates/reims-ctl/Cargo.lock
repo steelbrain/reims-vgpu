@@ -2022,7 +2022,7 @@ dependencies = [
  "serde_json",
  "shlex",
  "toml",
- "windows-sys",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2050,6 +2050,7 @@ dependencies = [
  "sha2 0.11.1",
  "ureq",
  "uuid",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

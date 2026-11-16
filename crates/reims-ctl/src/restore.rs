@@ -224,13 +224,11 @@ pub fn check_download_space(
 /// Whether `a` and `b`, or the nearest directories above them that exist, are on one file
 /// system.
 fn same_file_system(a: &Path, b: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    let dev = |p: &Path| {
-        p.ancestors()
-            .find_map(|q| std::fs::metadata(q).ok())
-            .map(|m| m.dev())
-    };
-    dev(a).is_some() && dev(a) == dev(b)
+    let existing = |p: &Path| p.ancestors().find(|q| q.exists()).map(Path::to_path_buf);
+    match (existing(a), existing(b)) {
+        (Some(a), Some(b)) => crate::os::same_file_system(&a, &b),
+        _ => false,
+    }
 }
 
 fn gib(bytes: u64) -> String {
@@ -290,20 +288,11 @@ impl Drop for Busy {
     }
 }
 
-/// Ctrl-C (SIGINT) and SIGTERM stop the restores of this process, and the downloads of their
-/// IPSWs: a restore's VM directory is removed, a download keeps its part, and the create says the
-/// VM was not made.
+/// Ctrl-C (SIGINT) and SIGTERM, and Ctrl+Break on Windows, stop the restores of this process,
+/// and the downloads of their IPSWs: a restore's VM directory is removed, a download keeps its
+/// part, and the create says the VM was not made.
 pub fn stop_at_interrupt() {
-    extern "C" fn stop(_: libc::c_int) {
-        // An atomic store is all a signal handler may do here.
-        CANCEL.store(true, Ordering::SeqCst);
-    }
-    let handler = stop as extern "C" fn(libc::c_int) as libc::sighandler_t;
-    // SAFETY: the handler only stores to an atomic.
-    unsafe {
-        libc::signal(libc::SIGINT, handler);
-        libc::signal(libc::SIGTERM, handler);
-    }
+    crate::os::set_at_interrupt(&CANCEL);
 }
 
 #[cfg(test)]

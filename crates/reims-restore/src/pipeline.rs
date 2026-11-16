@@ -407,15 +407,7 @@ pub fn free_space(path: &Path) -> Result<u64> {
     while !p.exists() {
         p = p.parent().context("no directory above it exists")?;
     }
-    let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes())?;
-    // SAFETY: statvfs fills the struct it is given, from a NUL-terminated path.
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("statvfs {}", p.display()));
-    }
-    #[allow(clippy::useless_conversion)]
-    Ok(u64::from(s.f_bavail) * u64::from(s.f_frsize))
+    crate::sys::free_space(p)
 }
 
 /// Refuses a restore into `dir` where `free` (the space free there) is short of `need`, saying
@@ -503,14 +495,13 @@ impl Files {
     /// takes no space, where the file system makes one, else a sparse copy, once the space it
     /// takes is free. Returns the bytes a copy takes, `None` for a clone.
     fn keep_disk_for_eacs(&self) -> Result<Option<u64>> {
-        use std::os::unix::fs::MetadataExt as _;
         let (from, to) = (self.part(DISK), self.part(EACS_DISK));
         if clone_file(&from, &to) {
             return Ok(None);
         }
         let f = File::open(&from).context("open the disk")?;
         let m = f.metadata()?;
-        let used = m.blocks() * 512;
+        let used = crate::sys::allocated(&m);
         check_space(&self.dir, free_space(&self.dir)?, used)?;
         copy_sparse(&f, 0, m.len(), &to, 0)?;
         Ok(Some(used))
@@ -632,7 +623,7 @@ fn clone_file(from: &Path, to: &Path) -> bool {
 /// Copies `len` bytes of `from` at `at` into a new file `to` at `to_at`, writing only the 4 KiB
 /// blocks that aren't all zeroes, so the copy stays sparse.
 fn copy_sparse(from: &File, at: u64, len: u64, to: &Path, to_at: u64) -> Result<()> {
-    use std::os::unix::fs::FileExt as _;
+    use reims_apfs::file_at::FileAt as _;
     let out = File::create(to).with_context(|| format!("make {}", to.display()))?;
     out.set_len(to_at + len)?;
     let mut buf = vec![0u8; 1 << 20];
@@ -664,7 +655,7 @@ fn copy_sparse(from: &File, at: u64, len: u64, to: &Path, to_at: u64) -> Result<
 /// ([`aux::recovery_boot_mode`]) it starts the VM again instead ([`start_again`]). A run cut
 /// short can run again.
 pub fn finish_eacs(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::FileExt as _;
+    use reims_apfs::file_at::FileAt as _;
     let (isc, pre_aux) = (dir.join(EACS_ISC), dir.join(EACS_AUX));
     ensure!(
         isc.is_file() && pre_aux.is_file(),
@@ -858,7 +849,7 @@ mod tests {
     }
 
     fn write_at(p: &Path, at: u64, b: &[u8]) {
-        use std::os::unix::fs::FileExt as _;
+        use reims_apfs::file_at::FileAt as _;
         OpenOptions::new()
             .write(true)
             .open(p)
@@ -868,7 +859,7 @@ mod tests {
     }
 
     fn read_at(p: &Path, at: u64, n: usize) -> Vec<u8> {
-        use std::os::unix::fs::FileExt as _;
+        use reims_apfs::file_at::FileAt as _;
         let mut b = vec![0u8; n];
         File::open(p).unwrap().read_exact_at(&mut b, at).unwrap();
         b

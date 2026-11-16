@@ -3,10 +3,10 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
 use crate::Result;
+use crate::file_at::FileAt as _;
 
 /// Bytes read at offsets, from any thread.
 pub trait Source: Send + Sync {

@@ -896,3 +896,52 @@ mod tests {
         );
     }
 }
+
+/// The space the file `m` describes takes on its volume, counted as its length: a sparse file's
+/// holes count as written.
+pub fn allocated(m: &std::fs::Metadata) -> u64 {
+    m.len()
+}
+
+/// Whether `a` and `b`, which exist, are on one volume: the same volume path
+/// (`GetVolumePathNameW`, which a folder a volume is mounted on answers too).
+pub fn same_file_system(a: &Path, b: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+    let volume = |p: &Path| -> Option<String> {
+        let wide: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
+        let mut root = vec![0u16; 1024];
+        // SAFETY: wide is NUL-terminated, and root holds its length in UTF-16 units.
+        if unsafe { GetVolumePathNameW(wide.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
+            return None;
+        }
+        let n = root.iter().position(|&c| c == 0).unwrap_or(root.len());
+        Some(String::from_utf16_lossy(&root[..n]).to_lowercase())
+    };
+    matches!((volume(a), volume(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// The flag [`set_at_interrupt`] gave, for its console handler.
+static INTERRUPT_FLAG: std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicBool> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// From now, Ctrl+C and Ctrl+Break set `flag`, and end the process no more: the console's
+/// handler takes them as handled, as Unix's set_at_interrupt takes SIGINT and SIGTERM.
+pub fn set_at_interrupt(flag: &'static std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
+    };
+    unsafe extern "system" fn stop(ctrl: u32) -> windows_sys::core::BOOL {
+        let ours = ctrl == CTRL_C_EVENT || ctrl == CTRL_BREAK_EVENT;
+        let flag = INTERRUPT_FLAG.load(Ordering::SeqCst);
+        // SAFETY: a null pointer, or the &'static flag set_at_interrupt stored.
+        if let (true, Some(flag)) = (ours, unsafe { flag.as_ref() }) {
+            flag.store(true, Ordering::SeqCst);
+        }
+        ours.into()
+    }
+    INTERRUPT_FLAG.store(std::ptr::from_ref(flag).cast_mut(), Ordering::SeqCst);
+    // SAFETY: stop is a function for the process's life.
+    unsafe { SetConsoleCtrlHandler(Some(stop), 1) };
+}

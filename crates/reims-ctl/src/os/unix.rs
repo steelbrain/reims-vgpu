@@ -334,3 +334,43 @@ pub fn read_terminal(buf: &mut [u8], timeout: std::time::Duration) -> io::Result
     let r = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
     Ok(r.max(0) as usize)
 }
+
+/// The space the file `m` describes takes on its file system: its 512-byte blocks, fewer than
+/// its length where it is sparse.
+pub fn allocated(m: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    m.blocks() * 512
+}
+
+/// Whether `a` and `b`, which exist, are on one file system: the same device.
+pub fn same_file_system(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev(),
+        _ => false,
+    }
+}
+
+/// The flag [`set_at_interrupt`] gave, for its signal handler.
+static INTERRUPT_FLAG: std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicBool> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// From now, Ctrl-C (SIGINT) and SIGTERM set `flag`, and end the process no more.
+pub fn set_at_interrupt(flag: &'static std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::Ordering;
+    extern "C" fn stop(_: libc::c_int) {
+        // An atomic load and store are all a signal handler may do here.
+        let flag = INTERRUPT_FLAG.load(Ordering::SeqCst);
+        // SAFETY: a null pointer, or the &'static flag set_at_interrupt stored.
+        if let Some(flag) = unsafe { flag.as_ref() } {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+    INTERRUPT_FLAG.store(std::ptr::from_ref(flag).cast_mut(), Ordering::SeqCst);
+    let handler = stop as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // SAFETY: the handler only loads and stores atomics.
+    unsafe {
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+    }
+}

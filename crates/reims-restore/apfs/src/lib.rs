@@ -20,6 +20,7 @@ pub mod canon;
 pub mod decmpfs;
 pub mod dev;
 pub mod file;
+pub mod file_at;
 pub mod fletcher;
 pub mod fs;
 pub mod gpt;
