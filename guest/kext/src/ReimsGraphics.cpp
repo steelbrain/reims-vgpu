@@ -151,7 +151,9 @@ inline UInt32 field32(const volatile UInt8 *payload, UInt32 offset)
 			IOLog("RGFX fb " fmt "\n", ##__VA_ARGS__);                          \
 	} while (0)
 
-// An attribute's call, logged for the first few calls of each (kind, attribute).
+#if defined(__x86_64__)
+// An attribute's call, logged for the first few calls of each (kind, attribute). Its callers, the
+// IOFramebuffer attribute methods, are x86-64's alone.
 void traceAttribute(const char *kind, IOIndex connect, IOSelect attribute, uintptr_t value,
                     IOReturn r)
 {
@@ -183,6 +185,7 @@ void traceAttribute(const char *kind, IOIndex connect, IOSelect attribute, uintp
 	IOLog("RGFX fb %s conn %d '%s' (0x%x) value 0x%lx -> 0x%x\n", kind, static_cast<int>(connect),
 	      cc, attribute, static_cast<unsigned long>(value), r);
 }
+#endif
 #else
 #define FBTRACE(...) do {} while (0)
 #if defined(__x86_64__)
