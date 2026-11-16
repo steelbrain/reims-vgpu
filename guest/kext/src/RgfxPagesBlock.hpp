@@ -3,7 +3,8 @@
 // the kext for as long as the block lives, which the device maps in place for the process's
 // buffers over them (RGFX_FEATURE_PAGES_BUFFERS, BUFFER_OVER_PAGES). A chunked pages block
 // (kRgfxAccelMethodPagesChunked, 12) is one over the kext's own chunks of kRgfxPagesChunk bytes
-// instead, mapped into the process, its runs found the same way.
+// instead, each one run of guest RAM at a multiple of its bytes (kRgfxPagesChunkMask), mapped into
+// the process, its runs found the same way.
 //
 // Memory the process maps read-only takes a block where the guest took RGFX_FEATURE_READ_ONLY_PAGES
 // alone: its pages are wired for reading, and the block's SURFACE_PAGES is marked
@@ -26,10 +27,34 @@
 
 #include <stdint.h>
 
+#include "RgfxUserClientABI.hpp"
 #include "reims_graphics_wire.h"
 
 // The most bytes one pages block covers, its pages rounded out: 64 GiB, more than a guest has.
 constexpr uint64_t kRgfxPagesBlockMaxBytes = 1ull << 36;
+
+// The physical alignment of the memory IOBufferMemoryDescriptor::inTaskWithPhysicalMask gives
+// under `mask`: one more than the mask's clear low bits, and at least a `page`. Read from xnu's
+// source (iokit/Kernel/IOBufferMemoryDescriptor.cpp, initWithPhysicalMask, which
+// inTaskWithPhysicalMask calls with an alignment of 1): `alignment = (~mask & (mask - 1)) + 1`,
+// raised to the page; IOKernelAllocateWithPhysicalRestrict then asks kmem_alloc_contig for
+// physical pages at a multiple of it. A mask of 0 asks for no alignment: the page.
+constexpr uint64_t rgfxPhysicalMaskAlignment(uint64_t mask, uint64_t page)
+{
+	const uint64_t alignment = mask == 0 ? page : (~mask & (mask - 1)) + 1;
+	return alignment < page ? page : alignment;
+}
+
+// The physical mask of the chunks of a chunked pages block (kRgfxAccelMethodPagesChunked): guest
+// RAM below 2^48, each chunk at a multiple of its own bytes, so a block of chunks is runs of
+// guest RAM that start and end at multiples of 64 KiB, the granule at which the host binds a
+// buffer over several pieces of its import of guest RAM (a sparse buffer's alignment on RADV),
+// rather than importing the block's pages apart.
+constexpr uint64_t kRgfxPagesChunkMask = 0x0000'FFFF'FFFF'0000ull;
+static_assert(rgfxPhysicalMaskAlignment(kRgfxPagesChunkMask, 0x1000) == kRgfxPagesChunk,
+              "each chunk at a multiple of its own bytes");
+static_assert(rgfxPhysicalMaskAlignment(kRgfxPagesChunkMask, 0x4000) == kRgfxPagesChunk,
+              "on an arm64 guest's 16 KiB pages too");
 
 // The pages a call's range lies in: `length` bytes from `base`, a page, and the call's first byte
 // `offset` bytes into them.

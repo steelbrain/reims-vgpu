@@ -2837,8 +2837,8 @@ IOReturn RgfxAccelerator::pagesChunked(RgfxAcceleratorUserClient *client, UInt32
 		return kIOReturnUnsupported;
 	if (length == 0 || length % kRgfxPagesChunk != 0 || length > kRgfxPagesChunkedMaxBytes)
 		return kIOReturnBadArgument;
-	// The chunks, each a run of RAM of its own, wired as the kernel's memory is, and zero-filled:
-	// the process sees them.
+	// The chunks, each a run of RAM of its own at a multiple of its bytes (kRgfxPagesChunkMask),
+	// wired as the kernel's memory is, and zero-filled: the process sees them.
 	const UInt32 count = static_cast<UInt32>(length / kRgfxPagesChunk);
 	const vm_size_t listBytes = count * sizeof(IOMemoryDescriptor *);
 	IOMemoryDescriptor **chunks = static_cast<IOMemoryDescriptor **>(IOMalloc(listBytes));
@@ -2849,7 +2849,7 @@ IOReturn RgfxAccelerator::pagesChunked(RgfxAcceleratorUserClient *client, UInt32
 		IOBufferMemoryDescriptor *chunk = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
 		    kernel_task,
 		    kIODirectionOutIn | kIOMemoryPhysicallyContiguous | kIOMemoryKernelUserShared,
-		    kRgfxPagesChunk, 0x0000FFFFFFFFF000ULL);
+		    kRgfxPagesChunk, kRgfxPagesChunkMask);
 		if (!chunk)
 			break;
 		bzero(chunk->getBytesNoCopy(), kRgfxPagesChunk);

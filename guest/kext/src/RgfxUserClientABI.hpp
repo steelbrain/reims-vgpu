@@ -112,12 +112,13 @@ enum {
 	// A pages block over memory of the kext's own (kRgfxKextFeaturePagesChunked;
 	// RgfxPagesBlock.hpp): in the memory's length, a multiple of kRgfxPagesChunk (below); out its address
 	// in the process, the block's region offset and its size. The kext takes the length in
-	// physically contiguous chunks of kRgfxPagesChunk bytes each, zero-filled, maps them into the
-	// process in order, read and write, and makes the block of their runs as PagesBlock makes one
-	// of the process's pages: so a 2 MiB slab is a few runs of the guest's RAM where the
-	// process's own pages are hundreds. The memory is the block's: the process never unmaps it,
-	// and kRgfxAccelMethodFree of the block takes it with the block, unmapped from the process and
-	// freed once the device has answered the block's release, or the client's close.
+	// physically contiguous chunks of kRgfxPagesChunk bytes each, each at a multiple of its bytes
+	// in guest RAM, zero-filled, maps them into the process in order, read and write, and makes the
+	// block of their runs as PagesBlock makes one of the process's pages: so a 2 MiB slab is a few
+	// runs of the guest's RAM where the process's own pages are hundreds. The memory is the
+	// block's: the process never unmaps it, and kRgfxAccelMethodFree of the block takes it with the
+	// block, unmapped from the process and freed once the device has answered the block's release,
+	// or the client's close.
 	// kIOReturnUnsupported as for PagesBlock; kIOReturnBadArgument for a length of no chunks, not a
 	// multiple of one, or past kRgfxPagesChunkedMaxBytes; kIOReturnNoMemory where the kernel has
 	// not that many chunks to give, which the process then takes plain pages for.
@@ -305,12 +306,13 @@ enum {
 	kRgfxSharedEventMethodImport = 11,
 };
 
-// PagesChunked's (12) chunk, 64 KiB, and the most bytes one call takes, 1 GiB. A 64 KiB run of
-// RAM is one the kernel finds at once, however long the guest has run: measured on an x86-64
-// macOS 26.7.2 guest of 8 GiB on the Radeon 780M host, 4,096 such chunks in a row each took
-// 0.033 ms, and 0.036 ms once 978 MiB of 4 KiB pages had been taken, none longer than 0.74 ms,
-// none refused. Of 128 runs of 2 MiB asked, it gave 28 on the quiet guest and 16 once memory had
-// been taken, the slowest in 264 ms.
+// PagesChunked's (12) chunk, 64 KiB, each at a multiple of 64 KiB of guest RAM
+// (RgfxPagesBlock.hpp, kRgfxPagesChunkMask), and the most bytes one call takes, 1 GiB. A 64 KiB
+// run of RAM is one the kernel finds at once, however long the guest has run: measured on an
+// x86-64 macOS 26.7.2 guest of 8 GiB on the Radeon 780M host, with chunks at any multiple of
+// 4 KiB, 4,096 such chunks in a row each took 0.033 ms, and 0.036 ms once 978 MiB of 4 KiB pages
+// had been taken, none longer than 0.74 ms, none refused. Of 128 runs of 2 MiB asked, it gave 28
+// on the quiet guest and 16 once memory had been taken, the slowest in 264 ms.
 enum {
 	kRgfxPagesChunk = 0x10000,
 	kRgfxPagesChunkedMaxBytes = 0x40000000,

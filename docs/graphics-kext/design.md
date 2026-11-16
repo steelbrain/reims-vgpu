@@ -3874,9 +3874,14 @@ the host's import, and the kext's block table holds one entry per slab:
   deallocates its pages.
 - The kext's chunks first (selector 12, `PagesChunked`, where the kext's word
   holds `PagesChunked`): the kext takes the slab's bytes in physically
-  contiguous chunks of 64 KiB, zero-filled, maps them into the process in
-  order and makes the pages block of their runs, so a 2 MiB slab is 32 runs
-  of guest RAM at most, where plain pages are up to 512. The host maps each
+  contiguous chunks of 64 KiB, each at a multiple of 64 KiB of guest RAM
+  (the physical mask `0x0000FFFFFFFF0000`), zero-filled, maps them into the
+  process in order and makes the pages block of their runs, so a 2 MiB slab is
+  32 runs of guest RAM at most, where plain pages are up to 512. Each run
+  starts and ends at a multiple of 64 KiB, the granule at which the host binds
+  a buffer over several pieces of its import of guest RAM (RADV's sparse
+  buffer alignment), so such a buffer lies in the guest RAM's import rather
+  than in an import of its own on every submission's list. The host maps each
   run of a view apart, against a budget of mappings per process
   (`vm.max_map_count` on Linux, 65530 by default): on NVIDIA, views of
   scattered pages, slabs' among them, used it up, and the buffers made after
@@ -3886,8 +3891,8 @@ the host's import, and the kext's block table holds one entry per slab:
   kernel finds at once however long the guest has run: on the guest and host
   the superpages below were measured on, 4,096 chunks in a row each took
   0.033 ms, and 0.036 ms once 978 MiB of 4 KiB pages had been taken, the
-  slowest 0.74 ms, none refused. A slab the kext gives no chunks for is plain
-  pages.
+  slowest 0.74 ms, none refused (chunks then at any multiple of 4 KiB). A slab
+  the kext gives no chunks for is plain pages.
 - Plain pages, never superpages (`VM_FLAGS_SUPERPAGE_SIZE_2MB`, 2 MiB of RAM in
   one run): superpages run out, and asking for one stalls the process, on
   whatever thread asks. Measured on an x86-64 macOS 26.7.2 guest of 8 GiB on

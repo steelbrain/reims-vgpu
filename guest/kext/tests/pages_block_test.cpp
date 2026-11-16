@@ -2,7 +2,8 @@
 // the call's offset in the first, its runs counted and then written as one per stretch of
 // contiguous segments, and its size in whole pages; and a span's runs and length taken to the
 // end of its last 16 KiB page, as PAGES_16K names them; and how a block's pages are wired, and
-// marked, for memory the process maps writable or read-only.
+// marked, for memory the process maps writable or read-only; and the physical alignment of the
+// kext's chunks.
 #include "RgfxPagesBlock.hpp"
 
 #include <cstdio>
@@ -128,6 +129,35 @@ int main()
 	      "read-only memory makes no block where the host did not take READ_ONLY_PAGES");
 	check(rgfxPagesWiring(false, 0).access == RgfxPagesAccess::kRefused,
 	      "nor with no feature at all");
+
+	// The chunks' physical mask: each chunk at a multiple of its own 64 KiB, on 4 KiB and on
+	// 16 KiB pages; a mask that clears only the page's bits gives the page alone.
+	check(rgfxPhysicalMaskAlignment(kRgfxPagesChunkMask, kPage) == kRgfxPagesChunk,
+	      "the chunks' mask: 64 KiB");
+	check(rgfxPhysicalMaskAlignment(kRgfxPagesChunkMask, kRgfxPage16K) == kRgfxPagesChunk,
+	      "the chunks' mask on 16 KiB pages: 64 KiB");
+	check(rgfxPhysicalMaskAlignment(0x0000'FFFF'FFFF'F000ull, kPage) == kPage,
+	      "a mask clear of the page's bits alone: the page");
+	check(rgfxPhysicalMaskAlignment(0x0000'FFFF'FFFF'F000ull, kRgfxPage16K) == kRgfxPage16K,
+	      "raised to the page");
+	check(rgfxPhysicalMaskAlignment(0x0000'0000'FFFF'FFFFull, kPage) == kPage,
+	      "a 32-bit mask asks no more than the page");
+	check(rgfxPhysicalMaskAlignment(0, kPage) == kPage, "no mask: the page");
+	check(kRgfxPagesChunkMask == (((1ull << 48) - 1) & ~uint64_t{kRgfxPagesChunk - 1}),
+	      "any multiple of 64 KiB of guest RAM below 2^48");
+	// A block of four such chunks, two of them meeting: its runs start and end at multiples of
+	// the chunk, so every boundary between two lies on the host's 64 KiB granule.
+	Pages chunks = {};
+	for (uint64_t chunk : {0x4'0000ull, 0x5'0000ull, 0x9'0000ull, 0x2'0000ull})
+		for (uint64_t at = 0; at < kRgfxPagesChunk; at += kPage)
+			chunks.pages.push_back(chunk + at);
+	RgfxPageRun chunkRuns[4] = {};
+	check(rgfxPagesRuns(4 * kRgfxPagesChunk, chunks, chunkRuns, 4) == 3,
+	      "four chunks, two meeting: three runs");
+	for (const RgfxPageRun &run : {chunkRuns[0], chunkRuns[1], chunkRuns[2]})
+		check(run.address % kRgfxPagesChunk == 0 && run.length % kRgfxPagesChunk == 0,
+		      "each run of chunks starts and ends at a multiple of 64 KiB");
+	check(chunkRuns[0].length == 2 * kRgfxPagesChunk, "the two chunks that meet are one run");
 
 	std::printf("pages_block_test: OK (%d checks)\n", checks);
 	return 0;
