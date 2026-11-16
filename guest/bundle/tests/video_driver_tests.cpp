@@ -1794,7 +1794,7 @@ void checkPixelPools()
 // driver writes, P+0x0 to P+0x10), the source surface (P+0x20), its SPS and PPS records (P+0x2f0,
 // P+0x2f8), its NAL header (P+0x310, nal_unit_type at +0xc), its rate control (P+0x328: the mode,
 // the QP at +0x10 and the frame rate at +0x24) and the record the driver writes the access unit's
-// length in bits in (P+0x330, at +0x6c).
+// length in bits in (P+0x330, at +0x6c, and at +0x3c for AppleGVA's rate control).
 struct H264Encode {
 	std::vector<uint8_t> sps;
 	rgfx::video::h264::Pps pps;
@@ -1824,6 +1824,7 @@ struct H264Encode {
 	}
 	uint32_t end() const { return u32(parameters + 0x10); }
 	uint32_t bits() const { return u32(length + 0x6c); }
+	uint32_t field3c() const { return u32(length + 0x3c); }
 	static uint32_t u32(const uint8_t *at)
 	{
 		uint32_t v;
@@ -1932,6 +1933,8 @@ void checkEncodeFrames()
 	CHECK(queryEncode(token) == kQueryDone, "the IDR frame not done");
 	CHECK(published(0) && idr.end() == 300 && idr.bits() == 2400,
 	      "the IDR frame's access unit: end %u, %u bits", idr.end(), idr.bits());
+	// The rate control's word takes the same bits.
+	CHECK(idr.field3c() == 2400, "the IDR frame's +0x3c: %u", idr.field3c());
 	std::memset(ring, 0, kRing);
 	CHECK(queryEncode(token) == kQueryDone && ring[0] == 0, "a second query published again");
 	// A P frame near the ring's end: its access unit wraps.
@@ -1951,6 +1954,7 @@ void checkEncodeFrames()
 	CHECK(queryEncode(token) == kQueryDone, "the failed frame not done");
 	CHECK(failed.end() == 0x100 && failed.bits() == 0, "the failed frame published: end %#x, %u bits",
 	      failed.end(), failed.bits());
+	CHECK(failed.field3c() == 0, "the failed frame's +0x3c: %u", failed.field3c());
 	const size_t before = g_encodes.size();
 	H264Encode after(spsRecordOn12(sps), pps, source, kRing, 0x100, 1, 0, 30);
 	CHECK(scheduleEncode(context, after, &token) == kNotSent, "the frame after a failed one scheduled");

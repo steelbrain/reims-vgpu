@@ -1177,8 +1177,12 @@ constexpr uint32_t kNalIdr = 5;
 constexpr size_t kRateMode = 0x00, kRateQp = 0x10, kRateFrameRate = 0x24;
 constexpr uint32_t kRateConstantQp = 0;
 // The length record (P+0x330): the access unit's length in bits, which AppleGVA reads once the
-// command is done (it takes none of 7 bits or fewer).
-constexpr size_t kLengthBits = 0x6c;
+// command is done (it takes none of 7 bits or fewer). AppleGVA's rate control reads the word at
+// +0x3c, whose name nothing states: with the access unit's bits there too, it moves its QP each
+// frame toward the session's average bitrate; with 0, it keeps one QP a session, and an 8 Mbit/s
+// stream at 1080p came out at 6.6 Mbit/s (measured on a macOS 26.7.2 guest, Iris Xe host,
+// 2026-11-16).
+constexpr size_t kLengthBits = 0x6c, kLengthField3c = 0x3c;
 
 // The settings the host encodes the frame of command parameters `P` with, from the source
 // `source` and AppleGVA's records of its stream, into `out`; false, logged once a reason, where
@@ -1288,7 +1292,8 @@ void *encodeFrame(const Command *c)
 // ring at the command's start, wrapping at the ring's end, the end cursor past it, and its length
 // in bits. A frame the host did not encode, or whose access unit is not fit to publish, leaves the
 // end at the start and a length of 0, which AppleGVA takes as no access unit, and fails the
-// context's next schedule. Once a token, under g_tokenLock.
+// context's next schedule. The length record's +0x3c takes the bits as well, for AppleGVA's rate
+// control (kLengthField3c). Once a token, under g_tokenLock.
 void publishEncoded(Token *t)
 {
 	if (t->published)
@@ -1322,8 +1327,10 @@ void publishEncoded(Token *t)
 	}
 	const uint32_t end = (uint32_t)(((uint64_t)start + size) % capacity), bits = size * 8;
 	memcpy(P + kEncodeEnd, &end, sizeof end);
-	if (length)
+	if (length) {
 		memcpy(length + kLengthBits, &bits, sizeof bits);
+		memcpy(length + kLengthField3c, &bits, sizeof bits);
+	}
 }
 
 uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)

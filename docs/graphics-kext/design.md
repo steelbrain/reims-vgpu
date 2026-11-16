@@ -1498,7 +1498,12 @@ Stages:
       the access unit into the ring at AppleGVA's start cursor, wrapping at
       its capacity, then writes the end cursor and the access unit's length
       in bits, which AppleGVA reads to take it out
-      (`guest/bundle/src/RgfxVideoDriver.cpp`). AppleGVA schedules a frame
+      (`guest/bundle/src/RgfxVideoDriver.cpp`). The same bits go in the
+      length record's word at +0x3c, which AppleGVA's rate control reads:
+      with 0 there it keeps one QP a session, and an 8 Mbit/s stream at
+      1080p came out at 6.6 Mbit/s; with the bits it moves its QP each
+      frame toward the session's average bitrate (**measured**, macOS 26.7.2
+      guest, Iris Xe host, 2026-11-16). AppleGVA schedules a frame
       only once it has the last one's status, so one frame is in flight.
     - **The HEVC output surface is named in the parameters, not on the
       command.** An H.264 decode arrives as a pipeline whose transfer command
