@@ -84,6 +84,33 @@ OSNumber *RgfxPointerDevice::newPrimaryUsagePageNumber() const
 	return OSNumber::withNumber(static_cast<unsigned long long>(kHIDPage_GenericDesktop), 32);
 }
 
+bool RgfxPointerDevice::willTerminate(IOService *provider, IOOptionBits options)
+{
+	return IOHIDDevice::willTerminate(provider, options);
+}
+
+bool RgfxPointerDevice::didTerminate(IOService *provider, IOOptionBits options, bool *defer)
+{
+	return IOHIDDevice::didTerminate(provider, options, defer);
+}
+
+IOReturn RgfxPointerDevice::updateElementValues(IOHIDElementCookie *cookies, UInt32 cookieCount,
+                                                IOOptionBits options, UInt32 completionTimeout,
+                                                IOHIDCompletion *completion,
+                                                IOBufferMemoryDescriptor *elementData)
+{
+	return IOHIDDevice::updateElementValues(cookies, cookieCount, options, completionTimeout,
+	                                        completion, elementData);
+}
+
+IOReturn RgfxPointerDevice::postElementValues(IOHIDElementCookie *cookies, UInt32 cookieCount,
+                                              IOOptionBits options, UInt32 completionTimeout,
+                                              IOHIDCompletion *completion)
+{
+	return IOHIDDevice::postElementValues(cookies, cookieCount, options, completionTimeout,
+	                                      completion);
+}
+
 void RgfxPointerDevice::free()
 {
 	if (reportBuffer) {

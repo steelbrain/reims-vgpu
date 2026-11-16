@@ -8,6 +8,18 @@
 // 0x5247, the PCI IDs of the device it belongs to. It is a child of display 0's framebuffer,
 // started by it once the guest took the feature and stopped with it.
 //
+// It imports only what every release of both sets defines (x86-64 11 to 26, arm64 14 to 27).
+// The SDK's IOHIDDevice.h is the newest release's, and a class inheriting a method imports it by
+// name: its vtable names the parent's definition, which the kernel collection must define.
+// Ambrosia's linker binds each import by name and patches no vtable, so a name an older release
+// lacks refuses the kext there, and the whole display with it (arm64 14.6.1 and 15.6.1 lack
+// IOHIDDevice::didTerminate); OpenCore's linker left the kext out of x86-64 11.7.11 (measured).
+// Each IOHIDDevice method an older release lacks is overridden below, and the override calls
+// IOHIDDevice's: a qualified call to a virtual method, which under -fapple-kext loads the method
+// from IOHIDDevice's own vtable at its slot, not by its name. So every release runs what its
+// IOHIDDevice keeps in that slot: its own method where it defines one, IOService's where it does
+// not. guest/'s kc-check holds the sets to this (guest/Makefile).
+//
 // Our own code.
 #ifndef RGFX_POINTER_DEVICE_HPP_
 #define RGFX_POINTER_DEVICE_HPP_
@@ -37,8 +49,39 @@ public:
 	OSNumber *newPrimaryUsageNumber() const override;
 	OSNumber *newPrimaryUsagePageNumber() const override;
 
+	// IOHIDDevice's own methods that an older release's IOHIDDevice does not define, each called
+	// through IOHIDDevice's vtable (above). willTerminate and didTerminate are IOService's slots:
+	// x86-64 11 and 12 define neither for IOHIDDevice, and x86-64 13 to 15 and arm64 14 and 15
+	// not didTerminate, so those releases run IOService's.
+	bool willTerminate(IOService *provider, IOOptionBits options) override;
+	bool didTerminate(IOService *provider, IOOptionBits options, bool *defer) override;
+
+	// The forms that take a completion fill IOHIDDevice's reserved slots 16 and 17 from macOS 13
+	// on. On x86-64 11 and 12 those slots are still placeholders, which a vtable entry naming a
+	// method there does not match: a linker that patches vtables (kxld's rule) refuses such a kext
+	// as built against a newer class, and leaves alone an entry the kext defines itself. The
+	// forwards would load the placeholder there, which nothing calls: those releases' HID stack
+	// does not know these methods.
+	using IOHIDDevice::postElementValues;
+	using IOHIDDevice::updateElementValues;
+	IOReturn updateElementValues(IOHIDElementCookie *cookies, UInt32 cookieCount,
+	                             IOOptionBits options, UInt32 completionTimeout,
+	                             IOHIDCompletion *completion = 0,
+	                             IOBufferMemoryDescriptor *elementData = 0) override;
+	IOReturn postElementValues(IOHIDElementCookie *cookies, UInt32 cookieCount,
+	                           IOOptionBits options, UInt32 completionTimeout,
+	                           IOHIDCompletion *completion = 0) override;
+
 private:
 	void free() override;
+
+	// IOService's IOReporting slots, which IOHIDDevice overrides as private methods from macOS
+	// 13 on and x86-64 11 and 12 do not: forwarded through IOHIDDevice's vtable as the others, in
+	// a file of their own (RgfxPointerReporting.cpp).
+	IOReturn configureReport(IOReportChannelList *channels, IOReportConfigureAction action,
+	                         void *result, void *destination) override;
+	IOReturn updateReport(IOReportChannelList *channels, IOReportUpdateAction action,
+	                      void *result, void *destination) override;
 
 	// The buffer each report is written into before the HID stack reads it.
 	IOBufferMemoryDescriptor *reportBuffer;

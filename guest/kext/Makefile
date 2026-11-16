@@ -92,6 +92,7 @@ OBJECTS = $(BUILD)/obj/ReimsGraphics.o \
 	$(BUILD)/obj/RgfxAccelerator.o \
 	$(OBJECTS_$(ARCH_NAME)) \
 	$(BUILD)/obj/RgfxPointerDevice.o \
+	$(BUILD)/obj/RgfxPointerReporting.o \
 	$(BUILD)/obj/RgfxAcceleratorUserClient.o \
 	$(BUILD)/obj/RgfxDisplayPipeUserClient.o \
 	$(BUILD)/obj/kmod_info.o \
@@ -109,6 +110,10 @@ all: $(BINARY)
 $(BUILD)/obj/%.o: src/%.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
 	xcrun clang++ $(CXXFLAGS) -c $< -o $@
+
+# RgfxPointerDevice's two IOReporting forwards call IOHIDDevice's private overrides through its
+# vtable (src/RgfxPointerReporting.cpp): that file alone compiles with access control off.
+$(BUILD)/obj/RgfxPointerReporting.o: CXXFLAGS += -fno-access-control
 
 $(BUILD)/obj/%.o: src/%.c Makefile
 	@mkdir -p $(@D)
