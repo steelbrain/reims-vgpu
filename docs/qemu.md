@@ -107,7 +107,7 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | the device gives the library the guest RAM's map and the files behind it | `e3e5ef1d` |
 | the device tells the library the guest's architecture (`guest_arch`: arm64 where `target_aarch64()`, else x86-64), which the device's `isFramebufferReadSupported` answer follows, and the class of Mac whose GPU results the library's devices give (`GuestArch::mac_class`) | `308b5fc6` |
 | the device raises its interrupt through an irqfd where KVM's in-kernel irqchip takes MSI-X through one | `967400b3` |
-| on WHPX with the hypervisor's APIC (kernel-irqchip), the raising thread asks the hypervisor for the vector's MSI itself (`whpx_send_msi_direct`), with no BQL, so a hold of the main loop (a PNG screendump's 120 ms) no longer holds the guest's completions back | `243971f2` |
+| on WHPX with the hypervisor's APIC (kernel-irqchip), the raising thread asks the hypervisor for the vector's MSI itself (`whpx_send_msi_direct`), with no BQL, so a hold of the main loop no longer holds the guest's completions back | `243971f2` |
 | on WHPX with kernel-irqchip, a vCPU with no NMI, SMI, INIT, TPR or HARD request pending runs on without the BQL (`whpx_vcpu_pre_run`, as `kvm_arch_pre_run` with KVM's in-kernel irqchip), so an exit to the device's lockless BARs no longer waits for the BQL's holder | `0fdbf381` |
 | a command buffer is taken, and answered, on the vCPU that rings its queue's doorbell, with the plain register write | `945a86b7`, `f16ca588`, `142c8e72` |
 | a command queue's plain doorbell, which the library routes where the guest took `DOORBELL_ASKS` (`route_doorbell`), is an ioeventfd matching the ring's id that signals the queue's eventfd, added and dropped under the BQL as the library asks, at most 128 at once | `db9cb35f` |
@@ -121,6 +121,7 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | file-backed guest RAM (the memfd of `reims-ctl`'s VMs) mapped 2 MiB-aligned on Linux, as anonymous RAM is, so transparent huge pages can back it where the host allows them ("Linux hosts: huge pages for guest RAM", below) | `5e83e90dc2` |
 | `isa-applesmc` answers GET_KEY_BY_INDEX, listing its keys by name and 0xb8 past the last, so the key walk macOS 15.4 and later make at boot ends ("x86-64 macOS guests: the SMC", below) | `83de566436` |
 | QMP's `screendump` in PPM, its default format, writes rows of width × 3 bytes. Upstream's wrote each row with its line buffer's stride, which pixman rounds up to 4 bytes, so a display whose width is not a multiple of 4 (a window of 3662 × 2039 pixels) read back sheared, its colours rotating from row to row; PNG's rows were right. `tests/qtest/display-screendump-test.c` dumps `bochs-display` at widths of 64, 66 and 67 | `e1360002ad` |
+| QMP's and HMP's `screendump` copy the console's surface under the BQL, then encode and write the copy on a thread of the pool with the BQL let go (`thread_pool_submit_co`), so a vCPU that touches a device the BQL guards no longer waits out the encode: a PNG of 2880x1620 takes about 120 ms on a Mac mini 2018 ("The reims-graphics device", below) | `500d30fb` |
 | the input layer's smooth `scroll` events (`qemu_input_queue_scroll`, `qemu_input_scrolls_smoothly`, QMP `input-send-event`); a device without them (`usb-tablet`, which every x86-64 VM has) gets the event's wheel notches | `9017d7e47e` |
 | `vmapple` ("arm64 guests", below): patches 1 to 6 of the RFC v7 series "vmapple: make it work on the latest macOS release" (Mohamed Mediouni), and the branch's commits for HVF's ISV=0 data aborts and in-kernel vGIC, the secondary CPUs' pointer authentication keys, macOS 14 and later and macOS 27 guests, the AES engine's refusal without a crypto library, and `usb-vmapple-tablet`, Virtualization.framework's USB pointing device | `00eb197889`, `4d4daab1a0`, `1161969f05`, `d24cde8e6e`, `ab4c3018f4`, `d10ee1dd7b`, `1d0776ac53`, `3deaf0f735`, `74d5134fb9`, `29043c9b34`, `eb67b81577`, `743bbba8f9`, `ffca79f534`, `6a54a097bd`, `eae5dd4a5c`, `4a39ef8d54`, `d01f28c9ed`, `93f9f40cdc` |
 | apple-gfx, Apple's paravirtualized GPU device on the library, with its windows, its option ROM, its IOSurface device and the VideoToolbox and M2 scaler devices, removed: `vmapple`, whose display was `apple-gfx-mmio`, stayed in the tree unbuilt until the next row's commits; the option that finds the library is `reims_vgpu` (`--enable-reims-vgpu`) | `96e1b470` |
@@ -217,18 +218,28 @@ is its transport:
   enabled, unmasked vector's MSI from the hypervisor itself
   (`whpx_send_msi_direct`, WHvRequestInterrupt). Elsewhere (HVF, TCG, a
   masked vector, WHPX without kernel-irqchip) a BH sends it under the BQL.
-  The BH waits for the main loop, which a PNG screendump of 2880x1620 holds
-  for about 120 ms (a busy desktop's: 1.4 s) on a Mac mini 2018.
+  The BH waits for the main loop.
 - On WHPX the vCPU loop took the BQL before each run of a vCPU
   (`whpx_vcpu_pre_run`), so a vCPU that exited to the device's lockless
   BARs, to ring a doorbell, waited for the BQL's holder too. With
   kernel-irqchip and no interrupt request pending it now runs on without it,
-  as KVM's does. Both changes are needed for a screendump to cost the guest
-  no frame. With neither, an on-screen app's frames had a 7-refresh gap at
-  each PNG screendump on the mini (gap max 128-148 ms). With the interrupts
-  alone the gap stayed at 116.6-133.7 ms, with the vCPUs waiting 111-123 ms
-  for the BQL. With both, gap max was 33.7-34.0 ms (measured 11-16). Under KVM, the
-  same screendump costs no frame (ms01's Iris Xe, 33.3-33.7 ms).
+  as KVM's does.
+- A screendump copies the console's surface under the BQL, then encodes
+  and writes the copy on a thread of the pool with the BQL let go
+  (`500d30fb`). Encoded under the BQL, a PNG of 2880x1620 held it, and the
+  main loop, for about 120 ms on a Mac mini 2018 (a busy desktop's up to
+  1.7 s), and a vCPU that touched another device's MMIO, which takes the
+  BQL, waited as long: a build that logged the BQL's waits found a vCPU
+  waiting 127 ms at 0x806492b4 while a full-screen present loop stalled
+  133-283 ms (measured 11-16).
+- Measured on the mini (UHD 630, macOS 26.7.2, present_probe full screen
+  with a PNG screendump at +6 s, runs 2 to 6; run 1 meets the guest's
+  burst of work after login): with none of the three changes, gap max
+  128-148 ms at each screendump; with the interrupts alone 116.6-133.7 ms,
+  the vCPUs waiting 111-123 ms for the BQL in `whpx_vcpu_pre_run`; with the
+  interrupts and `whpx_vcpu_pre_run`, 116.7-157.9 ms in 4 of 5 runs and
+  33.8 ms in one. Under KVM, without the screendump's change, the same
+  screendump cost no frame (ms01's Iris Xe, 33.3-33.7 ms).
 - **Displays:** the `displays` property gives the device 1 to 4 displays
   (`RvgGraphicsDeviceConfig`'s `display_count`), 1 by default; realize
   refuses 0 and anything above 4. Display i is head i of QEMU's UI, with a
