@@ -3301,10 +3301,14 @@ pixels of its mode, and the buttons held):
     1x screen and half of it above 1x, as arm64's WindowServer runs it ("The
     display's density", above).
   - **A crossing.** On the event, display 0's framebuffer posts at the
-    display's pixel of the rectangle held for it. Where the cursor shows on
-    another display instead, or shows no move in 250 ms (its point held at
-    the very pixel the cursor was at, as a captured pointer pushed past its
-    window's edge is after the displays were rearranged), it posts again at
+    display's pixel of the rectangle held for it. A post that shows no move
+    in 250 ms left the cursor where it was: where its display last showed
+    the cursor at the post's pixel, it was there already (the device told
+    the crossing before it saw the cursor there), and the crossing is over.
+    Where the cursor shows on another display instead, or shows no move and
+    is not there (its point held at the very pixel the cursor was at, as a
+    captured pointer pushed past its window's edge is after the displays
+    were rearranged), it posts again at
     that pixel of the display placed beside each other display in turn
     (right of it, left, below, above, top or left edges aligned), until the
     cursor lands on its display, wherever on it, as the tablet's next

@@ -59,9 +59,11 @@
 //    m3-max-35515): the crossing waits kRgfxSpillWaitNs for the landing on the display aimed at
 //    before it posts again;
 //  - a hot spot past the display's edge is the image over it alone.
-// A post that shows no move in kRgfxLandingWaitNs left the cursor where it was: its point was
-// held at the very pixel the cursor was at (a captured pointer pushed past its window's edge
-// after the displays were rearranged), and the crossing posts again.
+// A post that shows no move in kRgfxLandingWaitNs left the cursor where it was: at the pixel it
+// aimed at already, where the crossing's display last showed the cursor there (the host told the
+// crossing before it saw the cursor there), which ends the crossing; otherwise its point was held
+// at the very pixel the cursor was at (a captured pointer pushed past its window's edge after the
+// displays were rearranged), and the crossing posts again.
 //
 // Header-only and free of the kernel's headers, so its native test (tests/display_places_test.cpp)
 // builds it as the kext does.
@@ -507,16 +509,46 @@ inline uint64_t rgfxCrossingDeadline(const RgfxCrossing &c)
 	return c.held ? c.heldAt + kRgfxSpillWaitNs : c.postedAt + kRgfxLandingWaitNs;
 }
 
+// The cursor as a display's last MOVE_CURSOR showed it: whether it is shown, and its hot spot's
+// pixel.
+struct RgfxCursorShown {
+	bool visible;
+	int32_t x;
+	int32_t y;
+};
+
 // At `now`, the post out waited for until its deadline with no landing on the display aimed at:
-// the cursor is not there, and the crossing, where one goes on, posts again (`again`); `none`
-// before the deadline or with no post out.
-inline RgfxCrossingStep rgfxCrossingWaited(RgfxCrossing *c, uint64_t now)
+// where the crossing's display shows the cursor at the pixel the post aimed at (`shown`, that
+// display's last MOVE_CURSOR), the cursor was there already, and the post, which moved it
+// nowhere, showed nothing: the crossing is over (`arrived`); otherwise the cursor is not there,
+// and the crossing, where one goes on, posts again (`again`). `none` before the deadline or with
+// no post out.
+inline RgfxCrossingStep rgfxCrossingWaited(const RgfxDisplayPlaces &places, RgfxCrossing *c,
+                                           uint64_t now, const RgfxCursorShown &shown)
 {
 	if (!c->waiting || now < rgfxCrossingDeadline(*c))
 		return RgfxCrossingStep::none;
 	c->waiting = false;
 	c->held = false;
-	return c->active ? RgfxCrossingStep::again : RgfxCrossingStep::none;
+	if (!c->active)
+		return RgfxCrossingStep::none;
+	if (shown.visible && c->aimedAt == c->display && c->display < RGFX_DISPLAYS_MAX) {
+		const RgfxDisplayPlace &p = places.at[c->display];
+		const int64_t spanX = static_cast<int64_t>(c->aimed.maxx) - c->aimed.minx;
+		const int64_t spanY = static_cast<int64_t>(c->aimed.maxy) - c->aimed.miny;
+		if (p.width && p.height && spanX > 0 && spanY > 0) {
+			bool past = false;
+			int64_t by = 0;
+			const int64_t hx = rgfxPlaceHeld(c->aimed.minx, spanX, p.width, c->gx, &past, &by);
+			const int64_t hy = rgfxPlaceHeld(c->aimed.miny, spanY, p.height, c->gy, &past, &by);
+			if (!past && rgfxPlaceAbs(shown.x - hx) <= 1 + p.width / spanX &&
+			    rgfxPlaceAbs(shown.y - hy) <= 1 + p.height / spanY) {
+				c->active = false;
+				return RgfxCrossingStep::arrived;
+			}
+		}
+	}
+	return RgfxCrossingStep::again;
 }
 
 #endif // RGFX_DISPLAY_PLACES_HPP_

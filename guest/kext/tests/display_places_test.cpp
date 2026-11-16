@@ -96,7 +96,8 @@ Crossed cross(RgfxDisplayPlaces *places, RgfxCrossing *c, const Desktop &desk, u
 		if (s == RgfxCrossingStep::none || s == RgfxCrossingStep::held) {
 			check(c->waiting, "a post that shows nothing, or is held, is waited for");
 			*now = rgfxCrossingDeadline(*c);
-			s = rgfxCrossingWaited(c, *now);
+			s = rgfxCrossingWaited(*places, c, *now,
+			                       {desk.shown && desk.on == display, desk.ax, desk.ay});
 		}
 		if (s == RgfxCrossingStep::arrived) {
 			out.arrived = true;
@@ -443,11 +444,11 @@ int main()
 		check(rgfxCrossingLanded(&places, &c, 0, 1919, 500, now + 10000000, &confirmed) ==
 		              RgfxCrossingStep::held,
 		      "held at display 0's edge, within a cursor's reach: waited on");
-		check(rgfxCrossingWaited(&c, now + 10000000 + kRgfxSpillWaitNs - 1) ==
+		check(rgfxCrossingWaited(places, &c, now + 10000000 + kRgfxSpillWaitNs - 1, {}) ==
 		              RgfxCrossingStep::none &&
 		          c.waiting,
 		      "for kRgfxSpillWaitNs");
-		check(rgfxCrossingWaited(&c, now + 10000000 + kRgfxSpillWaitNs) ==
+		check(rgfxCrossingWaited(places, &c, now + 10000000 + kRgfxSpillWaitNs, {}) ==
 		              RgfxCrossingStep::again &&
 		          !c.waiting,
 		      "then posted again");
@@ -509,17 +510,19 @@ int main()
 		check(rgfxCrossingNext(slow, &w, now, &gx, &gy), "a post");
 		check(!rgfxCrossingNext(slow, &w, now + 1000, &gx, &gy) && w.active,
 		      "none while one is out");
-		check(rgfxCrossingWaited(&w, now + kRgfxLandingWaitNs - 1) == RgfxCrossingStep::none &&
+		check(rgfxCrossingWaited(slow, &w, now + kRgfxLandingWaitNs - 1, {}) ==
+		              RgfxCrossingStep::none &&
 		          w.waiting,
 		      "waited for");
 		uint64_t t = now + kRgfxLandingWaitNs;
 		uint32_t posts = 1;
-		check(rgfxCrossingWaited(&w, t) == RgfxCrossingStep::again && !w.waiting && w.active,
+		check(rgfxCrossingWaited(slow, &w, t, {}) == RgfxCrossingStep::again && !w.waiting &&
+		          w.active,
 		      "then posted again");
 		while (rgfxCrossingNext(slow, &w, t, &gx, &gy)) {
 			posts++;
 			t = rgfxCrossingDeadline(w);
-			check(rgfxCrossingWaited(&w, t) == RgfxCrossingStep::again, "and again");
+			check(rgfxCrossingWaited(slow, &w, t, {}) == RgfxCrossingStep::again, "and again");
 		}
 		check(posts == kRgfxCrossingPosts && !w.active && !w.waiting,
 		      "at most kRgfxCrossingPosts, then over");
@@ -543,6 +546,23 @@ int main()
 		      "whose landing confirms display 1, and the new crossing goes on");
 		check(rgfxCrossingNext(two, &n, now + 2000, &gx, &gy) && gx == 700 && gy == 500,
 		      "onto display 0");
+		// A crossing told while the cursor is on its display already, at the post's pixel (the
+		// host had not yet seen it there, say for the image's part over the edge on the display
+		// beside it): the post shows nothing, and the display last showed the cursor there, so
+		// the crossing is over, with no post elsewhere; shown at another pixel, it is not there.
+		RgfxCrossing a = {};
+		rgfxCrossingStart(&a, 1, 0, 500, now + 3000);
+		check(rgfxCrossingNext(two, &a, now + 3000, &gx, &gy) && gx == 1920, "a post onto display 1");
+		check(rgfxCrossingWaited(two, &a, now + 3000 + kRgfxLandingWaitNs, {true, 0, 500}) ==
+		              RgfxCrossingStep::arrived &&
+		          !a.active && !a.waiting && a.posts == 1,
+		      "the cursor already there: over in one post");
+		rgfxCrossingStart(&a, 1, 0, 500, now + 4000);
+		check(rgfxCrossingNext(two, &a, now + 4000, &gx, &gy), "again a post onto display 1");
+		check(rgfxCrossingWaited(two, &a, now + 4000 + kRgfxLandingWaitNs, {true, 900, 500}) ==
+		              RgfxCrossingStep::again &&
+		          a.active,
+		      "shown elsewhere on it: not there, posted again");
 	}
 
 	std::printf("display_places_test: %d checks passed\n", checks);
