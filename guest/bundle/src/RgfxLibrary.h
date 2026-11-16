@@ -67,6 +67,10 @@ static const MTLFunctionType kRgfxFunctionTypeExtern = (MTLFunctionType)4;
 /// The shadow, made on first use; nil where the library keeps no source or Metal refused it.
 - (nullable id<MTLLibrary>)rgfxShadow;
 
+/// The shadow it was given (`rgfxAdoptShadow:`): Metal's own library of the compile, link or
+/// stitching that made it; nil where it was given none (a shadow made over its bytes is not).
+- (nullable id<MTLLibrary>)rgfxAdoptedShadow;
+
 /// The private MTLLibrary members Core Image calls (measured: macOS 27 and 26.6.1): the
 /// shadow's extern function names (empty with no shadow), and the function of `name` whose
 /// shadow is the shadow's own extern function of it, of its `functionType` (nil where the

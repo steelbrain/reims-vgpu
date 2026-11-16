@@ -226,8 +226,10 @@ void RgfxPipelineReflectionUseClassesForTests(NSDictionary<NSString *, id> *_Nul
 
 // The stage input attributes `function`, one of our libraries' (RgfxFunction), answers: those its
 // library declares for it, as its constant values specialise them (RgfxSpecialiseStageAttributes),
-// in Metal's objects (RgfxStageAttributesMake, of MTLVertexAttributeInternal for a vertex
-// function); nil where it declares none, and nil, logged once per reason, where they are not made.
+// or where its library's metadata declares none, those of Metal's own function of the same values
+// in the library Metal compiled, linked or stitched (the library's adopted shadow); in Metal's
+// objects (RgfxStageAttributesMake, of MTLVertexAttributeInternal for a vertex function); nil
+// where neither declares any, and nil, logged once per reason, where they are not made.
 NSArray *_Nullable RgfxStageAttributesOf(id<MTLFunction> function);
 
 // The reflection a function answers by itself (RgfxFunctionReflectionMake): nil, logged once per

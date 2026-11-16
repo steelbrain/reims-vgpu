@@ -441,6 +441,7 @@ struct LibraryToolState {
 	RgfxShadowMaker _shadowMaker;
 	id<MTLLibrary> _shadow;                   // Metal's own over _source, made on first use
 	BOOL _shadowTried;
+	BOOL _shadowAdopted;                      // whether _shadow was given (rgfxAdoptShadow:)
 	BOOL _madeFromURL; // newLibraryWithURL:'s, which Metal does not serialize
 	NSString *_fileName; // the last part of newLibraryWithURL:'s URL, nil for any other
 	NSURL *_url;         // newLibraryWithURL:'s URL, nil for any other
@@ -1151,6 +1152,13 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 	std::lock_guard<std::mutex> hold(_shadowLock);
 	_shadow = shadow;
 	_shadowTried = YES;
+	_shadowAdopted = YES;
+}
+
+- (id<MTLLibrary>)rgfxAdoptedShadow
+{
+	std::lock_guard<std::mutex> hold(_shadowLock);
+	return _shadowAdopted ? _shadow : nil;
 }
 
 - (id<MTLLibrary>)rgfxShadow

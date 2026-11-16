@@ -9526,7 +9526,119 @@ void test_function_patch_answers()
 @implementation RgfxTestsAttributeNoFlags
 @end
 
+// Metal's own library as a library's adopted shadow, keeping the names of the functions asked of
+// it (test_function_stage_attributes_from_the_shadow).
+@interface RgfxTestsAskedLibrary : NSProxy
+- (instancetype)initWithLibrary:(id<MTLLibrary>)library;
+@property(nonatomic, readonly) NSMutableSet<NSString *> *asked;
+@end
+
+@implementation RgfxTestsAskedLibrary {
+	id<MTLLibrary> _library;
+	NSMutableSet<NSString *> *_asked;
+}
+
+- (instancetype)initWithLibrary:(id<MTLLibrary>)library
+{
+	_library = library;
+	_asked = [NSMutableSet set];
+	return self;
+}
+
+- (NSMutableSet<NSString *> *)asked
+{
+	return _asked;
+}
+
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name
+{
+	[_asked addObject:name];
+	return [_library newFunctionWithName:name];
+}
+
+- (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)descriptor error:(NSError **)error
+{
+	[_asked addObject:descriptor.name ?: @""];
+	return [_library newFunctionWithDescriptor:descriptor error:error];
+}
+
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector
+{
+	return [(NSObject *)_library methodSignatureForSelector:selector];
+}
+
+- (void)forwardInvocation:(NSInvocation *)invocation
+{
+	[invocation invokeWithTarget:_library];
+}
+@end
+
 namespace {
+
+NSUInteger attributeNumber(id object, const char *member)
+{
+	return ((NSUInteger(*)(id, SEL))objc_msgSend)(object, sel_registerName(member));
+}
+
+int attributeFlag(id object, const char *member)
+{
+	return ((BOOL (*)(id, SEL))objc_msgSend)(object, sel_registerName(member)) ? 1 : 0;
+}
+
+// Each attribute's class, name, index, type, use and patch flags, in their order; "nil" for none.
+NSString *describeAttributes(NSArray *list)
+{
+	if (list == nil)
+		return @"nil";
+	NSMutableArray *parts = [NSMutableArray array];
+	for (id a in list)
+		[parts addObject:[NSString stringWithFormat:@"%@ %@ %lu type %lu active %d patch %d point %d",
+		                                            NSStringFromClass([a class]), [a valueForKey:@"name"],
+		                                            (unsigned long)attributeNumber(a, "attributeIndex"),
+		                                            (unsigned long)attributeNumber(a, "attributeType"),
+		                                            attributeFlag(a, "isActive"), attributeFlag(a, "isPatchData"),
+		                                            attributeFlag(a, "isPatchControlPointData")]];
+	return [parts componentsJoinedByString:@"; "];
+}
+
+// `ours` answers the stage input attributes `theirs`, Metal's own, does: both getters' described
+// alike, a vertex function's vertexAttributes the same objects as its stageInputAttributes where
+// Metal's are, and ours made once. Adds the attributes compared to `attributes`.
+void sameStageAttributes(id<MTLFunction> ours, id<MTLFunction> theirs, NSString *what, size_t &attributes)
+{
+	CHECK(ours != nil && theirs != nil);
+	if (ours == nil || theirs == nil)
+		return;
+	NSArray *a[2] = {ours.vertexAttributes, ours.stageInputAttributes};
+	NSArray *b[2] = {theirs.vertexAttributes, theirs.stageInputAttributes};
+	for (int k = 0; k < 2; k++) {
+		NSString *d = describeAttributes(a[k]), *e = describeAttributes(b[k]);
+		if (![d isEqualToString:e])
+			NSLog(@"FAIL detail: %@ %s: ours %@, Metal's %@", what, k ? "stageInputAttributes" : "vertexAttributes", d,
+			      e);
+		CHECK([d isEqualToString:e]);
+		attributes += a[k].count;
+	}
+	for (NSUInteger i = 0; i < b[0].count && i < b[1].count; i++)
+		CHECK((a[0][i] == a[1][i]) == (b[0][i] == b[1][i]));
+	CHECK(ours.vertexAttributes == a[0]); // made once
+}
+
+// Constant values by name, each a Bool or an Int.
+using NamedValues = std::vector<std::tuple<const char *, MTLDataType, int>>;
+
+// The constant values `values` set, each also described onto `what`.
+MTLFunctionConstantValues *constantValuesOf(const NamedValues &values, NSMutableString *what)
+{
+	MTLFunctionConstantValues *out = [MTLFunctionConstantValues new];
+	for (const auto &[name, type, value] : values) {
+		const bool b = value != 0;
+		const int i = value;
+		[out setConstantValue:type == MTLDataTypeBool ? (const void *)&b : (const void *)&i type:type withName:@(name)];
+		[what appendFormat:@" %s=%d", name, value];
+	}
+	return out;
+}
 
 // A function's stage input attributes are Metal's own for the same bytes (RgfxStageAttributesOf):
 // every function of the oracle probe's libraries (tools/oracle/oracle_fnreflect.metal and
@@ -9570,40 +9682,9 @@ void test_function_stage_attributes_as_metal()
 		CHECK(ours != nil && theirs != nil);
 		return {ours, theirs};
 	};
-	auto number = [](id object, const char *member) {
-		return ((NSUInteger(*)(id, SEL))objc_msgSend)(object, sel_registerName(member));
-	};
-	auto flag = [](id object, const char *member) {
-		return ((BOOL (*)(id, SEL))objc_msgSend)(object, sel_registerName(member)) ? 1 : 0;
-	};
-	auto describe = [&](NSArray *list) -> NSString * {
-		if (list == nil)
-			return @"nil";
-		NSMutableArray *parts = [NSMutableArray array];
-		for (id a in list)
-			[parts addObject:[NSString stringWithFormat:@"%@ %@ %lu type %lu active %d patch %d point %d",
-			                                            NSStringFromClass([a class]), [a valueForKey:@"name"],
-			                                            (unsigned long)number(a, "attributeIndex"),
-			                                            (unsigned long)number(a, "attributeType"), flag(a, "isActive"),
-			                                            flag(a, "isPatchData"), flag(a, "isPatchControlPointData")]];
-		return [parts componentsJoinedByString:@"; "];
-	};
 	size_t attributes = 0, functions = 0;
 	auto same = [&](id<MTLFunction> ours, id<MTLFunction> theirs, NSString *what) {
-		CHECK(ours != nil && theirs != nil);
-		NSArray *a[2] = {ours.vertexAttributes, ours.stageInputAttributes};
-		NSArray *b[2] = {theirs.vertexAttributes, theirs.stageInputAttributes};
-		for (int k = 0; k < 2; k++) {
-			NSString *d = describe(a[k]), *e = describe(b[k]);
-			if (![d isEqualToString:e])
-				NSLog(@"FAIL detail: %@ %s: ours %@, Metal's %@", what, k ? "stageInputAttributes" : "vertexAttributes",
-				      d, e);
-			CHECK([d isEqualToString:e]);
-			attributes += a[k].count;
-		}
-		for (NSUInteger i = 0; i < b[0].count && i < b[1].count; i++)
-			CHECK((a[0][i] == a[1][i]) == (b[0][i] == b[1][i]));
-		CHECK(ours.vertexAttributes == a[0]); // made once
+		sameStageAttributes(ours, theirs, what, attributes);
 		functions++;
 	};
 	const char *envs[] = {"RGFX_ORACLE_FNREFLECT", "RGFX_ORACLE_REFLECTION", "RGFX_PATCH", "RGFX_STAGE_ATTRIBUTES"};
@@ -9671,6 +9752,122 @@ void test_function_stage_attributes_as_metal()
 	CHECK([fn.ours newFunctionWithName:@"v_order"].stageInputAttributes == nil);
 	RgfxPipelineReflectionUseClassesForTests(nil);
 	CHECK([fn.ours newFunctionWithName:@"v_order"].vertexAttributes.count == 4);
+}
+
+// A function whose library's metadata declares no stage input attributes answers those of Metal's
+// own function of the same constant values in the library Metal compiled, its library's adopted
+// shadow (RgfxStageAttributesOf): the libraries Metal compiles from tests/stage_attributes.metal and
+// the oracle probe's oracle_fnreflect.metal, their bytes made ours without their VATT and VATY
+// tags, as macOS 11.7.11 on x86-64 writes none for a library it compiles, answer Metal's own for
+// every function and for values that specialise them, each specialisation asked of the shadow.
+// With the tags, the shadow is never asked of a function that declares attributes.
+void test_function_stage_attributes_from_the_shadow()
+{
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	CHECK(metal != nil);
+	struct Source {
+		const char *env;
+		std::vector<std::pair<const char *, NamedValues>> cases;
+	};
+	const Source sources[] = {
+	    {"RGFX_STAGE_ATTRIBUTES_SRC",
+	     {{"v_expr", {{"kA", MTLDataTypeBool, 1}, {"kB", MTLDataTypeBool, 0}}},
+	      {"v_expr", {{"kA", MTLDataTypeBool, 1}, {"kB", MTLDataTypeBool, 1}}},
+	      {"v_expr", {{"kA", MTLDataTypeBool, 0}, {"kB", MTLDataTypeBool, 0}}},
+	      {"k_expr", {{"kA", MTLDataTypeBool, 0}, {"kB", MTLDataTypeBool, 0}}},
+	      {"k_expr", {{"kA", MTLDataTypeBool, 1}, {"kB", MTLDataTypeBool, 1}}}}},
+	    {"RGFX_ORACLE_FNREFLECT_SRC",
+	     {{"v_gated", {{"kOffset", MTLDataTypeBool, 1}, {"kColor", MTLDataTypeBool, 0}}},
+	      {"v_gated", {{"kOffset", MTLDataTypeBool, 0}, {"kColor", MTLDataTypeBool, 0}}},
+	      {"v_deadread", {{"kColor", MTLDataTypeBool, 0}}},
+	      {"v_deadread", {{"kColor", MTLDataTypeBool, 1}}}}},
+	};
+	size_t attributes = 0, functions = 0, renamed = 0, declaring = 0;
+	for (const Source &src : sources) {
+		const char *path = getenv(src.env);
+		CHECK(path != nullptr);
+		if (path == nullptr)
+			continue;
+		NSString *text = [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:nil];
+		NSError *err = nil;
+		id<MTLLibrary> genuine = text != nil ? [metal newLibraryWithSource:text options:nil error:&err] : nil;
+		CHECK(genuine != nil);
+		NSData *bytes = [(id<RgfxMetalLibraryInternals>)genuine libraryDataContents];
+		CHECK(bytes.length > 0x38);
+		if (genuine == nil || bytes.length <= 0x38)
+			continue;
+		for (int strip = 0; strip < 2; strip++) {
+			NSMutableData *copy = [bytes mutableCopy];
+			if (strip) {
+				// Each VATT and VATY tag of the public metadata (offset and size at 0x28 and 0x30)
+				// renamed to one no reader knows.
+				uint8_t *p = static_cast<uint8_t *>(copy.mutableBytes);
+				uint64_t at = 0, size = 0;
+				std::memcpy(&at, p + 0x28, 8);
+				std::memcpy(&size, p + 0x30, 8);
+				CHECK(at <= copy.length && size <= copy.length - at);
+				for (uint64_t i = at; size >= 4 && i <= at + size - 4; i++) {
+					if (std::memcmp(p + i, "VATT", 4) == 0 || std::memcmp(p + i, "VATY", 4) == 0) {
+						p[i] = 'X';
+						renamed++;
+					}
+				}
+			}
+			uint32_t ringBytes = 0x80000; // the library's bytes fit, twice over
+			while (ringBytes < 2 * copy.length)
+				ringBytes *= 2;
+			Fixture *fx = new Fixture(ringBytes); // kept for the library's life
+			uint32_t status = 0;
+			RgfxLibrary *ours = [RgfxLibrary libraryWithData:copy.bytes
+			                                          length:copy.length
+			                                             key:nullptr
+			                                          device:nil
+			                                      serializer:&fx->ser
+			                                          status:&status];
+			CHECK(ours != nil);
+			if (ours == nil)
+				continue;
+			dispatch_data_t data = dispatch_data_create(copy.bytes, copy.length, nil, ^{
+				(void)copy;
+			});
+			[ours rgfxSetSource:data
+			        shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+				        return nil;
+			        }];
+			RgfxTestsAskedLibrary *shadow = [[RgfxTestsAskedLibrary alloc] initWithLibrary:genuine];
+			[ours rgfxAdoptShadow:(id<MTLLibrary>)shadow];
+			for (NSString *name in [genuine.functionNames sortedArrayUsingSelector:@selector(compare:)]) {
+				id<MTLFunction> theirs = [genuine newFunctionWithName:name];
+				sameStageAttributes([ours newFunctionWithName:name], theirs,
+				                    [NSString stringWithFormat:@"%s %@%s", src.env, name, strip ? " untagged" : ""],
+				                    attributes);
+				functions++;
+				if (!strip && theirs.stageInputAttributes.count > 0) {
+					CHECK(![shadow.asked containsObject:name]);
+					declaring++;
+				}
+			}
+			for (const auto &[function, values] : src.cases) {
+				NSMutableString *what = [NSMutableString stringWithFormat:@"%s%s", function, strip ? " untagged" : ""];
+				MTLFunctionConstantValues *v = constantValuesOf(values, what);
+				NSError *e = nil, *f = nil;
+				id<MTLFunction> mine = [ours newFunctionWithName:@(function) constantValues:v error:&e];
+				id<MTLFunction> theirs = [genuine newFunctionWithName:@(function) constantValues:v error:&f];
+				CHECK(e == nil && f == nil);
+				[shadow.asked removeAllObjects];
+				sameStageAttributes(mine, theirs, what, attributes);
+				functions++;
+				CHECK([shadow.asked containsObject:@(function)] == (strip != 0));
+			}
+		}
+	}
+	fprintf(stderr,
+	        "test_function_stage_attributes_from_the_shadow: %zu functions, %zu attributes compared, %zu tags renamed, "
+	        "%zu functions declaring theirs\n",
+	        functions, attributes, renamed, declaring);
+	// Both tags gone from every function that declares attributes (measured: macOS 27.0.1's compiler,
+	// 42 functions and 9 declaring theirs).
+	CHECK(functions >= 40 && attributes >= 200 && declaring >= 9 && renamed == 2 * declaring);
 }
 
 // A render pipeline's imageblockSampleLength is the host's answer on an Apple GPU's device, and 0 on
@@ -21121,6 +21318,7 @@ int main(int argc, char **argv)
 		test_core_image_extern_functions();
 		test_function_patch_answers();
 		test_function_stage_attributes_as_metal();
+		test_function_stage_attributes_from_the_shadow();
 		test_imageblock_sample_length_on_apple_gpus_alone();
 		test_overlapping_arguments_refused_as_metal();
 		test_function_constants_make_follows_no_body();

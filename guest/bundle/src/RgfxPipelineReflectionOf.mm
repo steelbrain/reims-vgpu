@@ -138,6 +138,40 @@ id RgfxFunctionReflectionOf(id<MTLFunction> function)
 	return r;
 }
 
+// The stage input attributes Metal's own function declares, where `f`'s library was given Metal's
+// own library of the compile, link or stitching that made it as its shadow: each attribute's name,
+// index, type, use and patch flags, for a vertex function from vertexAttributes and for a kernel
+// from stageInputAttributes. The function is Metal's own of the same name and constant values
+// (rgfxShadowOrMake), so `specialised` is set where Metal specialised them; where `f` does not hold
+// the values it was specialised by, Metal's own unspecialised function, for its AIR to specialise.
+// None where its library was given no shadow or the shadow holds no such function.
+// measured: on x86-64 macOS 11.7.11 the metadata of oracle_fnreflect's library compiled from
+// source declares no function's attributes (the bundle reads no VATT or VATY tag of it), and
+// Metal's own unspecialised function there leaves out an attribute under a function constant,
+// where on 26.7.2 the metadata declares them and Metal's function answers that one too.
+static void shadowStageAttributes(RgfxFunction *f, std::vector<RgfxStageAttributeDecl> &out, bool &specialised)
+{
+	RgfxResource *library = [f rgfxLibrary];
+	if (![library isKindOfClass:[RgfxLibrary class]] || [(RgfxLibrary *)library rgfxAdoptedShadow] == nil)
+		return;
+	id<MTLFunction> genuine = [f rgfxShadowOrMake];
+	specialised = genuine != nil && [f rgfxConstantCount] != 0;
+	if (genuine == nil && f.name != nil)
+		genuine = [[(RgfxLibrary *)library rgfxAdoptedShadow] newFunctionWithName:f.name];
+	NSArray *list = f.functionType == MTLFunctionTypeVertex ? (NSArray *)genuine.vertexAttributes
+	                                                        : (NSArray *)genuine.stageInputAttributes;
+	for (MTLAttribute *a in list) {
+		RgfxStageAttributeDecl d;
+		d.name = a.name.UTF8String ?: "";
+		d.index = static_cast<uint32_t>(a.attributeIndex);
+		d.type = static_cast<uint32_t>(a.attributeType);
+		d.active = a.active;
+		d.patchControlPoint = a.patchControlPointData;
+		d.patchData = a.patchData;
+		out.push_back(std::move(d));
+	}
+}
+
 NSArray *RgfxStageAttributesOf(id<MTLFunction> function)
 {
 	if (![(id)function isKindOfClass:[RgfxFunction class]])
@@ -145,11 +179,17 @@ NSArray *RgfxStageAttributesOf(id<MTLFunction> function)
 	RgfxFunction *f = (RgfxFunction *)function;
 	std::vector<RgfxStageAttributeDecl> attributes;
 	NSString *why = nil;
-	if (![f rgfxDeclaredStageAttributes:attributes]) {
+	const bool read = [f rgfxDeclaredStageAttributes:attributes];
+	// Where the metadata declares none, Metal's own function's, where its library has Metal's own
+	// library (a function of no stage input declares none there either).
+	bool specialised = false;
+	if (read && attributes.empty())
+		shadowStageAttributes(f, attributes, specialised);
+	if (!read) {
 		why = @"its library's metadata of it was not read";
 	} else if (attributes.empty()) {
 		return nil;
-	} else if ([f rgfxConstantCount] != 0) {
+	} else if ([f rgfxConstantCount] != 0 && !specialised) {
 		RgfxResource *library = [f rgfxLibrary];
 		std::shared_ptr<const RgfxAirEntries> module =
 		    [library isKindOfClass:[RgfxLibrary class]]

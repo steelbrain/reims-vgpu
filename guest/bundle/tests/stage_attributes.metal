@@ -1,5 +1,6 @@
 // The stage input attributes of tests/shell_tests.mm's test_function_stage_attributes_as_metal,
-// specialised beside the oracle probe's (tools/oracle/oracle_fnreflect.metal): attributes under a
+// specialised beside the oracle probe's (tools/oracle/oracle_fnreflect.metal), and of its
+// test_function_stage_attributes_from_the_shadow, which has Metal compile both: attributes under a
 // predicate that is an expression of function constants, one under a constant of its own, one read
 // only under a constant, at scattered indices, and a kernel's stage input under a constant. Our own
 // source; the Makefile builds it, and nothing of it is committed but this.
