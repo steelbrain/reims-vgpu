@@ -77,7 +77,12 @@
 #include "RgfxPointerOver.hpp"
 #include "reims_graphics_wire.h"
 
-// A crossing's posts: the first, and at most three more.
+// A crossing's posts: the first, and at most three more. The count is the crossing's one bound,
+// with no cutoff at the host's hold (the device's CROSSING_HOLD_NS, 100 ms): an arm64 guest under
+// TCG shows even a first post's landing 18 to 153 ms after the POINTER_OVER (14.6.1 at two
+// displays, potluck job m3-max-35541), so a crossing cut off at the hold would end before its
+// landing showed that a display had moved. Under HVF a whole crossing ends inside the hold (27.0.1:
+// landings 5.8 to 35 ms after their post, job m3-max-35651).
 constexpr uint32_t kRgfxCrossingPosts = 4;
 // How long a post waits for its landing: past it, the cursor is taken to have stayed where it was.
 constexpr uint64_t kRgfxLandingWaitNs = 250000000;
