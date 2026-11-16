@@ -181,10 +181,14 @@ std::string rgfxDataTypeName(uint32_t type)
 	return "MTLDataType(" + std::to_string(type) + ")";
 }
 
-bool rgfxReadConstantTable(const uint8_t *bytes, size_t length, uint64_t offset,
-                           std::vector<RgfxConstantDecl> &out)
+namespace {
+
+// Walks the tags of the function whose public metadata starts `offset` bytes into the .metallib's
+// public metadata section, each tag's name, data and size to `tag`, up to `ENDT`: false where the
+// bytes do not hold the entry whole, or `tag` answers false.
+template <typename Tag>
+bool readPublicEntry(const uint8_t *bytes, size_t length, uint64_t offset, Tag tag)
 {
-	out.clear();
 	if (bytes == nullptr || length < kPublicMetadataSize + 8)
 		return false;
 	const uint64_t section = rd64(bytes + kPublicMetadataOffset);
@@ -207,16 +211,97 @@ bool rgfxReadConstantTable(const uint8_t *bytes, size_t length, uint64_t offset,
 		if (std::memcmp(entry + at, "ENDT", 4) == 0)
 			return true;
 		if (end - at < 6)
-			break;
+			return false;
 		const uint16_t tagSize = rd16(entry + at + 4);
 		if (tagSize > end - at - 6)
-			break;
-		if (std::memcmp(entry + at, "CNST", 4) == 0 && !readCnst(entry + at + 6, tagSize, out))
-			break;
+			return false;
+		if (!tag(entry + at, entry + at + 6, tagSize))
+			return false;
 		at += 6 + static_cast<size_t>(tagSize);
 	}
+	return false;
+}
+
+// Reads one `VATT` tag's entries (rgfxReadStageAttributes), each type left 0.
+bool readVatt(const uint8_t *p, size_t n, std::vector<RgfxStageAttributeDecl> &out)
+{
+	if (n < 2)
+		return false;
+	const uint16_t count = rd16(p);
+	size_t at = 2;
+	for (uint16_t i = 0; i < count; i++) {
+		const void *nul = at < n ? std::memchr(p + at, 0, n - at) : nullptr;
+		if (nul == nullptr)
+			return false;
+		const size_t nameLen = static_cast<const uint8_t *>(nul) - (p + at);
+		RgfxStageAttributeDecl a;
+		a.name.assign(reinterpret_cast<const char *>(p + at), nameLen);
+		at += nameLen + 1;
+		if (n - at < 2)
+			return false;
+		const uint16_t v = rd16(p + at);
+		a.index = v & 0x1fffu;
+		a.active = (v & 0x8000u) != 0;
+		a.patchControlPoint = (v & 0x4000u) != 0;
+		a.patchData = (v & 0x2000u) != 0;
+		at += 2;
+		out.push_back(std::move(a));
+	}
+	return true;
+}
+
+// Reads one `VATY` tag's types (rgfxReadStageAttributes).
+bool readVaty(const uint8_t *p, size_t n, std::vector<uint32_t> &out)
+{
+	if (n < 2 || n - 2 < rd16(p))
+		return false;
+	out.assign(p + 2, p + 2 + rd16(p));
+	return true;
+}
+
+} // namespace
+
+bool rgfxReadConstantTable(const uint8_t *bytes, size_t length, uint64_t offset,
+                           std::vector<RgfxConstantDecl> &out)
+{
+	out.clear();
+	if (readPublicEntry(bytes, length, offset, [&](const uint8_t *name, const uint8_t *data, uint16_t size) {
+		    return std::memcmp(name, "CNST", 4) != 0 || readCnst(data, size, out);
+	    }))
+		return true;
 	out.clear();
 	return false;
+}
+
+bool rgfxReadStageAttributes(const uint8_t *bytes, size_t length, uint64_t offset,
+                             std::vector<RgfxStageAttributeDecl> &out)
+{
+	out.clear();
+	std::vector<uint32_t> types;
+	bool vatt = false, vaty = false;
+	const bool whole =
+	    readPublicEntry(bytes, length, offset, [&](const uint8_t *name, const uint8_t *data, uint16_t size) {
+		    if (std::memcmp(name, "VATT", 4) == 0) {
+			    if (vatt)
+				    return false;
+			    vatt = true;
+			    return readVatt(data, size, out);
+		    }
+		    if (std::memcmp(name, "VATY", 4) == 0) {
+			    if (vaty)
+				    return false;
+			    vaty = true;
+			    return readVaty(data, size, types);
+		    }
+		    return true;
+	    });
+	if (!whole || vatt != vaty || types.size() != out.size()) {
+		out.clear();
+		return false;
+	}
+	for (size_t i = 0; i < out.size(); i++)
+		out[i].type = types[i];
+	return true;
 }
 
 bool rgfxResolveConstants(const std::vector<RgfxConstantDecl> &decls,

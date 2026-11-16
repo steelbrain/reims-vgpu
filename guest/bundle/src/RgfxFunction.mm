@@ -132,6 +132,10 @@ bool isRendererPluginData(NSData *data)
 	NSData *_pluginData;                            //   bindings, and its plugin data
 	std::mutex _relocationsLock;                    // guards _relocations
 	NSArray *_relocations;                          // what -relocations answers, as set
+	std::vector<RgfxStageAttributeDecl> _declaredAttributes; // its entry's, from its library
+	BOOL _haveDeclaredAttributes;                            //   (set before it is vended)
+	std::once_flag _attributesMade;                          // _attributes, made once
+	NSArray *_attributes;                                    // what the two getters answer
 }
 
 + (instancetype)functionWithLibrary:(RgfxResource *)library
@@ -288,18 +292,39 @@ bool isRendererPluginData(NSData *data)
 	return _unspecialised ?: @{};
 }
 
-// A vertex function's attributes, and a kernel's stage-in attributes, which Metal reads from the
-// function's reflection: the bundle reads none of it from the library, so it answers nil, logged.
+- (void)rgfxSetDeclaredStageAttributes:(const std::vector<RgfxStageAttributeDecl> &)attributes
+{
+	_declaredAttributes = attributes;
+	_haveDeclaredAttributes = YES;
+}
+
+- (BOOL)rgfxDeclaredStageAttributes:(std::vector<RgfxStageAttributeDecl> &)out
+{
+	out = _declaredAttributes;
+	return _haveDeclaredAttributes;
+}
+
+// The function's stage input attributes, made once (RgfxStageAttributesOf).
+- (NSArray *)rgfxStageAttributes
+{
+	std::call_once(_attributesMade, [self] { _attributes = RgfxStageAttributesOf(self); });
+	return _attributes;
+}
+
+// A vertex function's stage input attributes, and a kernel's, as Metal's function answers them: a
+// vertex function answers the same objects for both getters, a kernel answers its own for
+// stageInputAttributes and nil for vertexAttributes, and a fragment function nil for both
+// (measured: tools/oracle/oracle_fnreflect, the AMD 5300M and the Intel 630 on macOS 26.7.1 and the
+// M3 Max on macOS 27.0.1).
 - (NSArray<MTLVertexAttribute *> *)vertexAttributes
 {
-	RGFX_UNSUPPORTED("a function's vertex attributes (its reflection is not read)");
-	return nil;
+	return self.functionType == MTLFunctionTypeVertex ? [self rgfxStageAttributes] : nil;
 }
 
 - (NSArray<MTLAttribute *> *)stageInputAttributes
 {
-	RGFX_UNSUPPORTED("a function's stage-in attributes (its reflection is not read)");
-	return nil;
+	const MTLFunctionType type = self.functionType;
+	return type == MTLFunctionTypeVertex || type == MTLFunctionTypeKernel ? [self rgfxStageAttributes] : nil;
 }
 
 // The MTLFunction SPI reflectionWithOptions:, which the system's GL renderer sends each kernel of

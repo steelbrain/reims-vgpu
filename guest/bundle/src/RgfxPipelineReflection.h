@@ -91,6 +91,7 @@
 #include <vector>
 
 #include "RgfxAirArguments.hpp"
+#include "RgfxFunctionConstants.hpp" // RgfxStageAttributeDecl
 #include "reims_graphics_wire.h" // RgfxFunctionConstant
 
 NS_ASSUME_NONNULL_BEGIN
@@ -171,6 +172,35 @@ id _Nullable RgfxComputePipelineReflectionMake(const RgfxStageReflection &kernel
 // alike, OpenCL C and Metal kernels). nil, with `*why`, as RgfxComputePipelineReflectionMake.
 id _Nullable RgfxFunctionReflectionMake(const RgfxStageReflection &stage, NSString *__strong _Nullable *_Nonnull why);
 
+// A function's stage input attributes, as Metal's function answers them as its vertexAttributes
+// and stageInputAttributes (measured: tools/oracle/oracle_fnreflect, the AMD 5300M and the Intel
+// 630 on macOS 26.7.1 and the M3 Max on macOS 27.0.1, the same answers): a function made by name
+// answers each attribute its library's metadata declares (rgfxReadStageAttributes), as declared, in
+// their order; one specialised by constant values answers them as the values specialise its AIR
+// (RgfxAirArguments.hpp, "An entry point's specialisation"): an attribute whose predicate the
+// values make false is left out, and one the specialised code does not read is inactive; a
+// control point's attribute stays as declared, active whether or not the function reads it. These
+// are `attributes` specialised by the `count` constant values at `values` of the entry point
+// `entry` of `module`, each matched to its stage input node by its index: false, with `*why`,
+// where a value a predicate needs is not known, or no node of the entry is the attribute's. Where
+// the module's code is not one the reader follows, an attribute only code the values remove reads
+// stays active, where Metal answers it inactive.
+bool RgfxSpecialiseStageAttributes(const RgfxAirEntries &module, const RgfxAirEntry &entry,
+                                   const RgfxFunctionConstant *_Nullable values, uint32_t count,
+                                   std::vector<RgfxStageAttributeDecl> &attributes,
+                                   NSString *__strong _Nullable *_Nonnull why);
+
+// Metal's objects of `attributes`, in their order: of MTLVertexAttributeInternal where `vertex` (a
+// vertex function's, which answers the same objects as its vertexAttributes and its
+// stageInputAttributes), else of MTLAttributeInternal (a kernel's stageInputAttributes). Each is
+// made by `init` and its instance variables set: `_name`, `_attributeIndex`, `_attributeType` and
+// `_flags`, whose bit 0 is isActive, bit 1 isPatchData and bit 2 isPatchControlPointData (measured:
+// each bit set alone on objects of both classes against their getters, macOS 26.7.1 on the AMD
+// 5300M and macOS 27.0.1 on the M3 Max, and the bits of every attribute Metal makes). nil, with
+// `*why`, where Metal lacks the class or one of the instance variables.
+NSArray *_Nullable RgfxStageAttributesMake(const std::vector<RgfxStageAttributeDecl> &attributes, bool vertex,
+                                           NSString *__strong _Nullable *_Nonnull why);
+
 // Metal's render pipeline reflection of its stages' answers, null for a stage the pipeline does not
 // have: a vertex pipeline's (`vertex`, `fragment`), or a mesh pipeline's (`object`, `mesh`,
 // `fragment`, with `mesh` not null). nil, with `*why`, as RgfxComputePipelineReflectionMake.
@@ -193,6 +223,12 @@ id _Nullable RgfxRenderPipelineReflectionOf(id<MTLFunction> _Nullable vertex,
 // class's name, to its stand-in, or to NSNull for one Metal is to lack), as on a release whose
 // Metal has those; nil goes back to Metal's own.
 void RgfxPipelineReflectionUseClassesForTests(NSDictionary<NSString *, id> *_Nullable standIns);
+
+// The stage input attributes `function`, one of our libraries' (RgfxFunction), answers: those its
+// library declares for it, as its constant values specialise them (RgfxSpecialiseStageAttributes),
+// in Metal's objects (RgfxStageAttributesMake, of MTLVertexAttributeInternal for a vertex
+// function); nil where it declares none, and nil, logged once per reason, where they are not made.
+NSArray *_Nullable RgfxStageAttributesOf(id<MTLFunction> function);
 
 // The reflection a function answers by itself (RgfxFunctionReflectionMake): nil, logged once per
 // reason, where it is not made.

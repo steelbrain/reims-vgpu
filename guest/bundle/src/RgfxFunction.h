@@ -28,6 +28,7 @@
 
 #include "RgfxAirArguments.hpp" // RgfxAirFunction
 #include "RgfxClMode.hpp"         // RgfxClBindings
+#include "RgfxFunctionConstants.hpp" // RgfxStageAttributeDecl
 #include "RgfxSerializer.hpp"   // RgfxLinkedFunctionRef
 #endif
 
@@ -162,6 +163,14 @@ typedef struct {
 /// what its pipelines bind, which their reflection follows (RgfxClMode.hpp), and the plugin data
 /// it was made with, which `pluginData` answers.
 - (void)rgfxSetClBindings:(std::shared_ptr<const RgfxClBindings>)bindings pluginData:(NSData *)pluginData;
+/// Sets the stage input attributes the function's entry declares, as its library's metadata
+/// holds them (rgfxReadStageAttributes; none for a function of no stage input): what its
+/// vertexAttributes and stageInputAttributes answer, as its constant values specialise them
+/// (RgfxStageAttributesOf).
+- (void)rgfxSetDeclaredStageAttributes:(const std::vector<RgfxStageAttributeDecl> &)attributes;
+/// Copies what `rgfxSetDeclaredStageAttributes:` set into `out`: false where it was not set, the
+/// library having read no metadata of the function.
+- (BOOL)rgfxDeclaredStageAttributes:(std::vector<RgfxStageAttributeDecl> &)out;
 /// What `rgfxSetClBindings:pluginData:` set; null for any other function.
 - (std::shared_ptr<const RgfxClBindings>)rgfxClBindings;
 #endif

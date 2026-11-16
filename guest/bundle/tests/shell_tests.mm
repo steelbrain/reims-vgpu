@@ -9512,6 +9512,167 @@ void test_function_patch_answers()
 	}
 }
 
+} // namespace
+
+// A stand-in for Metal's MTLVertexAttributeInternal of no `_flags`, as a release whose class keeps
+// none would be (test_function_stage_attributes_as_metal).
+@interface RgfxTestsAttributeNoFlags : NSObject {
+	NSString *_name;
+	NSUInteger _attributeIndex;
+	NSUInteger _attributeType;
+}
+@end
+
+@implementation RgfxTestsAttributeNoFlags
+@end
+
+namespace {
+
+// A function's stage input attributes are Metal's own for the same bytes (RgfxStageAttributesOf):
+// every function of the oracle probe's libraries (tools/oracle/oracle_fnreflect.metal and
+// oracle_reflection.metal), of tests/patch.metal and of tests/stage_attributes.metal, made by name,
+// and functions they specialise by constant values (a predicate the values make false, or an
+// expression of constants that is false, leaves its attribute out; an attribute only removed code
+// reads is inactive; a control point's stays active): each attribute's class, name, index, type,
+// use and patch flags, in their order, and a vertex function's vertexAttributes the same objects as
+// its stageInputAttributes where Metal's are. Where Metal's class is missing, or keeps no `_flags`,
+// none (RgfxPipelineReflectionUseClassesForTests).
+void test_function_stage_attributes_as_metal()
+{
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	CHECK(metal != nil);
+	struct Pair {
+		RgfxLibrary *ours;
+		id<MTLLibrary> theirs;
+	};
+	auto load = [&](const char *env) -> Pair {
+		const char *path = getenv(env);
+		CHECK(path != nullptr);
+		NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+		CHECK(bytes.length > 0);
+		Fixture *fx = new Fixture(0x80000); // the library's bytes fit; kept for the library's life
+		uint32_t status = 0;
+		RgfxLibrary *ours = [RgfxLibrary libraryWithData:bytes.bytes
+		                                          length:bytes.length
+		                                             key:nullptr
+		                                          device:nil
+		                                      serializer:&fx->ser
+		                                          status:&status];
+		dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+			(void)bytes;
+		});
+		// The bytes kept, as the device keeps a library's, which its functions' AIR is read from.
+		[ours rgfxSetSource:data
+		        shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+			        return nil;
+		        }];
+		id<MTLLibrary> theirs = [metal newLibraryWithData:data error:nil];
+		CHECK(ours != nil && theirs != nil);
+		return {ours, theirs};
+	};
+	auto number = [](id object, const char *member) {
+		return ((NSUInteger(*)(id, SEL))objc_msgSend)(object, sel_registerName(member));
+	};
+	auto flag = [](id object, const char *member) {
+		return ((BOOL (*)(id, SEL))objc_msgSend)(object, sel_registerName(member)) ? 1 : 0;
+	};
+	auto describe = [&](NSArray *list) -> NSString * {
+		if (list == nil)
+			return @"nil";
+		NSMutableArray *parts = [NSMutableArray array];
+		for (id a in list)
+			[parts addObject:[NSString stringWithFormat:@"%@ %@ %lu type %lu active %d patch %d point %d",
+			                                            NSStringFromClass([a class]), [a valueForKey:@"name"],
+			                                            (unsigned long)number(a, "attributeIndex"),
+			                                            (unsigned long)number(a, "attributeType"), flag(a, "isActive"),
+			                                            flag(a, "isPatchData"), flag(a, "isPatchControlPointData")]];
+		return [parts componentsJoinedByString:@"; "];
+	};
+	size_t attributes = 0, functions = 0;
+	auto same = [&](id<MTLFunction> ours, id<MTLFunction> theirs, NSString *what) {
+		CHECK(ours != nil && theirs != nil);
+		NSArray *a[2] = {ours.vertexAttributes, ours.stageInputAttributes};
+		NSArray *b[2] = {theirs.vertexAttributes, theirs.stageInputAttributes};
+		for (int k = 0; k < 2; k++) {
+			NSString *d = describe(a[k]), *e = describe(b[k]);
+			if (![d isEqualToString:e])
+				NSLog(@"FAIL detail: %@ %s: ours %@, Metal's %@", what, k ? "stageInputAttributes" : "vertexAttributes",
+				      d, e);
+			CHECK([d isEqualToString:e]);
+			attributes += a[k].count;
+		}
+		for (NSUInteger i = 0; i < b[0].count && i < b[1].count; i++)
+			CHECK((a[0][i] == a[1][i]) == (b[0][i] == b[1][i]));
+		CHECK(ours.vertexAttributes == a[0]); // made once
+		functions++;
+	};
+	const char *envs[] = {"RGFX_ORACLE_FNREFLECT", "RGFX_ORACLE_REFLECTION", "RGFX_PATCH", "RGFX_STAGE_ATTRIBUTES"};
+	std::map<std::string, Pair> libs;
+	for (const char *env : envs) {
+		Pair p = load(env);
+		libs[env] = p;
+		for (NSString *name in [p.theirs.functionNames sortedArrayUsingSelector:@selector(compare:)])
+			same([p.ours newFunctionWithName:name], [p.theirs newFunctionWithName:name],
+			     [NSString stringWithFormat:@"%s %@", env, name]);
+	}
+	// Specialised by values: each of both libraries' functions of the same name made with the same
+	// values.
+	struct Value {
+		const char *name;
+		MTLDataType type;
+		int value;
+	};
+	struct Case {
+		const char *env, *function;
+		std::vector<Value> values;
+	};
+	const Case cases[] = {
+	    {"RGFX_ORACLE_FNREFLECT", "v_gated", {{"kOffset", MTLDataTypeBool, 1}, {"kColor", MTLDataTypeBool, 0}}},
+	    {"RGFX_ORACLE_FNREFLECT", "v_gated", {{"kOffset", MTLDataTypeBool, 1}, {"kColor", MTLDataTypeBool, 1}}},
+	    {"RGFX_ORACLE_FNREFLECT", "v_gated", {{"kOffset", MTLDataTypeBool, 0}, {"kColor", MTLDataTypeBool, 0}}},
+	    {"RGFX_ORACLE_FNREFLECT", "v_deadread", {{"kColor", MTLDataTypeBool, 0}}},
+	    {"RGFX_ORACLE_FNREFLECT", "v_deadread", {{"kColor", MTLDataTypeBool, 1}}},
+	    {"RGFX_ORACLE_REFLECTION", "v_specialised", {{"kMode", MTLDataTypeInt, 0}}},
+	    {"RGFX_ORACLE_REFLECTION", "v_specialised", {{"kMode", MTLDataTypeInt, 1}}},
+	    {"RGFX_ORACLE_REFLECTION", "v_specialised", {{"kMode", MTLDataTypeInt, 2}}},
+	    {"RGFX_STAGE_ATTRIBUTES", "v_expr", {{"kA", MTLDataTypeBool, 1}, {"kB", MTLDataTypeBool, 0}}},
+	    {"RGFX_STAGE_ATTRIBUTES", "v_expr", {{"kA", MTLDataTypeBool, 1}, {"kB", MTLDataTypeBool, 1}}},
+	    {"RGFX_STAGE_ATTRIBUTES", "v_expr", {{"kA", MTLDataTypeBool, 0}, {"kB", MTLDataTypeBool, 0}}},
+	    {"RGFX_STAGE_ATTRIBUTES", "k_expr", {{"kA", MTLDataTypeBool, 0}, {"kB", MTLDataTypeBool, 0}}},
+	    {"RGFX_STAGE_ATTRIBUTES", "k_expr", {{"kA", MTLDataTypeBool, 1}, {"kB", MTLDataTypeBool, 1}}},
+	};
+	for (const Case &c : cases) {
+		MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+		NSMutableString *what = [NSMutableString stringWithFormat:@"%s", c.function];
+		for (const Value &v : c.values) {
+			const bool b = v.value != 0;
+			const int i = v.value;
+			[values setConstantValue:v.type == MTLDataTypeBool ? (const void *)&b : (const void *)&i
+			                    type:v.type
+			                withName:@(v.name)];
+			[what appendFormat:@" %s=%d", v.name, v.value];
+		}
+		const Pair &p = libs[c.env];
+		NSError *e = nil, *f = nil;
+		id<MTLFunction> ours = [p.ours newFunctionWithName:@(c.function) constantValues:values error:&e];
+		id<MTLFunction> theirs = [p.theirs newFunctionWithName:@(c.function) constantValues:values error:&f];
+		CHECK(e == nil && f == nil);
+		same(ours, theirs, what);
+	}
+	fprintf(stderr, "test_function_stage_attributes_as_metal: %zu functions, %zu attributes compared\n", functions,
+	        attributes);
+	CHECK(functions >= 80 && attributes >= 200);
+	// A release whose Metal has no such class, or whose class keeps no `_flags`: no attributes.
+	const Pair &fn = libs["RGFX_ORACLE_FNREFLECT"];
+	RgfxPipelineReflectionUseClassesForTests(@{@"MTLVertexAttributeInternal" : [NSNull null]});
+	CHECK([fn.ours newFunctionWithName:@"v_order"].vertexAttributes == nil);
+	CHECK([fn.ours newFunctionWithName:@"k_stage"].stageInputAttributes.count == 4);
+	RgfxPipelineReflectionUseClassesForTests(@{@"MTLVertexAttributeInternal" : [RgfxTestsAttributeNoFlags class]});
+	CHECK([fn.ours newFunctionWithName:@"v_order"].stageInputAttributes == nil);
+	RgfxPipelineReflectionUseClassesForTests(nil);
+	CHECK([fn.ours newFunctionWithName:@"v_order"].vertexAttributes.count == 4);
+}
+
 // A Core Image kernel library's extern functions come from its shadow, Metal's own library over
 // the same bytes: their names, each a function of functionType 4 that holds Metal's own, and nil
 // for a name the shadow does not hold; functionNames leaves them out, as Metal's does. Core
@@ -20907,6 +21068,7 @@ int main(int argc, char **argv)
 		test_linked_function_specialised_on_the_wire();
 		test_core_image_extern_functions();
 		test_function_patch_answers();
+		test_function_stage_attributes_as_metal();
 		test_overlapping_arguments_refused_as_metal();
 		test_function_constants_make_follows_no_body();
 		test_stitched_library_over_shadows();

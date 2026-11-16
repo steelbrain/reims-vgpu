@@ -43,8 +43,8 @@
 namespace {
 
 // One entry of a .metallib's function list: the entry point, its stage, its HASH tag (the
-// SHA-256 of its bitcode) when the entry has one, and the constants its public metadata declares
-// (`haveConstants` where that table was read).
+// SHA-256 of its bitcode) when the entry has one, and the constants and stage input attributes its
+// public metadata declares (`haveConstants` and `haveAttributes` where they were read).
 struct MetallibFunction {
 	std::string name;
 	MTLFunctionType type;
@@ -56,6 +56,8 @@ struct MetallibFunction {
 	bool haveConstants = false;
 	uint8_t tess = 0; // the TESS tag of a post-tessellation vertex function (rgfxPatchOf)
 	bool hasTess = false;
+	std::vector<RgfxStageAttributeDecl> attributes; // its stage input attributes (VATT, VATY),
+	bool haveAttributes = false;                    //   where its public metadata read
 	bool exported = false; // a dynamic library's exported function: TYPE 3 (metallibStage)
 };
 
@@ -237,8 +239,10 @@ bool readMetallibFunctions(const uint8_t *p, size_t n, std::vector<MetallibFunct
 			t += 6 + static_cast<uint64_t>(size);
 		}
 		if (!f.name.empty()) {
-			if (f.haveOffsets)
+			if (f.haveOffsets) {
 				f.haveConstants = rgfxReadConstantTable(p, n, f.publicOffset, f.constants);
+				f.haveAttributes = rgfxReadStageAttributes(p, n, f.publicOffset, f.attributes);
+			}
 			out.push_back(std::move(f));
 		}
 		q = end;
@@ -648,6 +652,8 @@ static bool rgfxMetallibIsDynamic(const uint8_t *bytes, size_t length)
 			rgfxPatchOf(entry->tess, &patchType, &controlPoints);
 			[fn rgfxSetPatchType:patchType controlPointCount:controlPoints];
 		}
+		if (entry->haveAttributes)
+			[fn rgfxSetDeclaredStageAttributes:entry->attributes];
 		if (entry->type == MTLFunctionTypeVertex || entry->type == MTLFunctionTypeFragment ||
 		    entry->type == MTLFunctionTypeKernel)
 			[fn rgfxSetAirFunction:[self rgfxAirFunctionNamed:entry->name]];

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iterator>
+#include <map>
 #include <set>
 #include <string>
 
@@ -350,6 +351,7 @@ Classes lookUpClasses(NSDictionary<NSString *, id> *standIns)
 }
 
 const Classes *gTestClassSet; // the stand-ins' (RgfxPipelineReflectionUseClassesForTests), or null
+NSDictionary<NSString *, id> *gTestStandIns; // the stand-ins themselves, or nil
 
 const Classes &classes()
 {
@@ -547,8 +549,8 @@ struct Maker {
 		return true;
 	}
 
-	// Sets `o`'s unsigned instance variable `name`, of the encoding `type` ('Q', 'I', 'S', 'c' or
-	// 'B').
+	// Sets `o`'s unsigned instance variable `name`, of the encoding `type` ('Q', 'I', 'S', 'c', 'C'
+	// or 'B').
 	bool setNumber(id o, const char *name, char type, uint64_t value)
 	{
 		Ivar v = ivarOf(o, name, type);
@@ -1307,10 +1309,12 @@ void RgfxPipelineReflectionUseClassesForTests(NSDictionary<NSString *, id> *stan
 	static Classes set;
 	if (standIns == nil) {
 		gTestClassSet = nullptr;
+		gTestStandIns = nil;
 		return;
 	}
 	set = lookUpClasses(standIns);
 	gTestClassSet = &set;
+	gTestStandIns = [standIns copy];
 }
 
 std::vector<RgfxDescriptorBuffer> RgfxVertexDescriptorBuffers(MTLVertexDescriptor *descriptor)
@@ -1608,6 +1612,76 @@ id RgfxFunctionReflectionMake(const RgfxStageReflection &stage, NSString *__stro
 		return nil;
 	}
 	return r;
+}
+
+bool RgfxSpecialiseStageAttributes(const RgfxAirEntries &module, const RgfxAirEntry &entry,
+                                   const RgfxFunctionConstant *values, uint32_t count,
+                                   std::vector<RgfxStageAttributeDecl> &attributes, NSString *__strong *why)
+{
+	RgfxAirSpecialisation spec;
+	const bool specialised = rgfxAirSpecialise(module, entry, values, count, spec);
+	// Each attribute's node, by its index: whether the values keep it, and whether the specialised
+	// code reads it. A control point's attributes are its control points node's.
+	struct Fate {
+		bool kept = true, read = true;
+	};
+	std::map<uint32_t, Fate> fates;
+	for (const RgfxAirNode &n : entry.arguments) {
+		if (n.kind == "air.patch_control_point_input") {
+			for (const RgfxAirNode &p : n.controlPoints)
+				fates[p.index] = Fate{};
+			continue;
+		}
+		if (!isStageInput(n.kind) || !n.hasLocation)
+			continue;
+		RgfxAirNode s = n;
+		bool kept = true;
+		if (!specialise(s, specialised ? &spec : nullptr, module, values, count, kept, why))
+			return false;
+		fates[s.index] = Fate{kept, !s.unused};
+	}
+	std::vector<RgfxStageAttributeDecl> out;
+	out.reserve(attributes.size());
+	for (RgfxStageAttributeDecl &a : attributes) {
+		auto it = fates.find(a.index);
+		if (it == fates.end()) {
+			*why = [NSString stringWithFormat:@"no stage input of its AIR is its attribute %u", a.index];
+			return false;
+		}
+		if (!it->second.kept)
+			continue;
+		a.active = a.active && (a.patchControlPoint || it->second.read);
+		out.push_back(std::move(a));
+	}
+	attributes = std::move(out);
+	return true;
+}
+
+NSArray *RgfxStageAttributesMake(const std::vector<RgfxStageAttributeDecl> &attributes, bool vertex,
+                                 NSString *__strong *why)
+{
+	static Class vertexClass = NSClassFromString(@"MTLVertexAttributeInternal");
+	static Class attributeClass = NSClassFromString(@"MTLAttributeInternal");
+	const char *name = vertex ? "MTLVertexAttributeInternal" : "MTLAttributeInternal";
+	Class cls = gTestClassSet != nullptr ? classNamed(gTestStandIns, name) : vertex ? vertexClass : attributeClass;
+	if (cls == Nil || ![cls instancesRespondToSelector:@selector(init)]) {
+		*why = vertex ? @"Metal has no MTLVertexAttributeInternal" : @"Metal has no MTLAttributeInternal";
+		return nil;
+	}
+	Maker m{classes()};
+	NSMutableArray *list = [NSMutableArray arrayWithCapacity:attributes.size()];
+	for (const RgfxStageAttributeDecl &a : attributes) {
+		id o = [[cls alloc] init];
+		const uint8_t flags = (a.active ? 1u : 0u) | (a.patchData ? 2u : 0u) | (a.patchControlPoint ? 4u : 0u);
+		if (o == nil || !m.setObject(o, "_name", @(a.name.c_str())) ||
+		    !m.setNumber(o, "_attributeIndex", 'Q', a.index) || !m.setNumber(o, "_attributeType", 'Q', a.type) ||
+		    !m.setNumber(o, "_flags", 'C', flags)) {
+			*why = m.why ?: @"Metal's attribute was not made";
+			return nil;
+		}
+		[list addObject:o];
+	}
+	return [list copy];
 }
 
 id RgfxRenderPipelineReflectionMake(const RgfxStageReflection *vertex, const RgfxStageReflection *fragment,

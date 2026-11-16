@@ -30,6 +30,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <set>
 #include <string>
 #include <thread>
@@ -297,6 +298,60 @@ std::vector<uint8_t> moduleBytes(const std::vector<uint8_t> &lib, const std::str
 	if (!rgfxMetallibBitcode(lib.data(), lib.size(), name, &bc, &n))
 		return {};
 	return std::vector<uint8_t>(bc, bc + n);
+}
+
+// Every vertex function's and kernel's stage input attributes, as its VATT and VATY tags declare them
+// (rgfxReadStageAttributes), against its entry point's nodes (rgfxReadAirEntries), whose
+// specialisation RgfxSpecialiseStageAttributes matches to the attributes by their index: each
+// declared attribute is the stage input node of its index (a control point's where it is one, a
+// patch's input where it is a patch's own), active where the node is not marked unused (a control
+// point's whatever its node says), and each stage input node is declared. A fragment function
+// declares none. Answers how many functions it compared, and how many of them declare attributes.
+std::pair<size_t, size_t> attributesAsVatt(const std::vector<uint8_t> &lib, const std::string &what)
+{
+	size_t compared = 0, withAttributes = 0;
+	for (const Listed &f : listed(lib)) {
+		std::vector<RgfxStageAttributeDecl> declared;
+		check(rgfxReadStageAttributes(lib.data(), lib.size(), f.publicOffset, declared),
+		      what + " " + f.name + ": its VATT and VATY tags read");
+		if (f.type < 0 || f.type > 2)
+			continue;
+		if (f.type == 1) {
+			check(declared.empty(), what + " " + f.name + ": a fragment function declares no attribute");
+			continue;
+		}
+		const std::vector<uint8_t> bc = moduleBytes(lib, f.name);
+		RgfxAirEntries e;
+		if (bc.empty() || !rgfxReadAirEntries(bc.data(), bc.size(), e))
+			continue;
+		auto it = std::find_if(e.entries.begin(), e.entries.end(),
+		                       [&](const RgfxAirEntry &x) { return x.name == f.name; });
+		if (it == e.entries.end() || !it->nodesRead)
+			continue;
+		struct Node {
+			bool unused, controlPoint, patch;
+		};
+		std::map<uint32_t, Node> nodes;
+		for (const RgfxAirNode &n : it->arguments) {
+			if (n.kind == "air.patch_control_point_input") {
+				for (const RgfxAirNode &p : n.controlPoints)
+					nodes[p.index] = Node{p.unused, true, false};
+			} else if ((n.kind == "air.vertex_input" || n.kind == "air.stage_in" || n.kind == "air.patch_input") &&
+			           n.hasLocation) {
+				nodes[n.index] = Node{n.unused, false, n.kind == "air.patch_input"};
+			}
+		}
+		compared++;
+		withAttributes += declared.empty() ? 0 : 1;
+		bool same = nodes.size() == declared.size();
+		for (const RgfxStageAttributeDecl &a : declared) {
+			auto n = nodes.find(a.index);
+			same = same && n != nodes.end() && n->second.controlPoint == a.patchControlPoint &&
+			       n->second.patch == a.patchData && (a.patchControlPoint ? a.active : a.active == !n->second.unused);
+		}
+		check(same, what + " " + f.name + ": its stage input nodes are its VATT tag's attributes");
+	}
+	return {compared, withAttributes};
 }
 
 // One read of each function's module answers what each of the three readers answers for it, and
@@ -1489,6 +1544,41 @@ int main()
 	      "every function's constants compared (" + std::to_string(compared.first) + ", " +
 	          std::to_string(compared.second) + " with constants)");
 
+	// Stage input attributes, as the VATT and VATY tags declare them: a vertex function's, a
+	// post-tessellation vertex function's control point and patch input, and a kernel's; and every
+	// function's against its nodes.
+	{
+		auto declaredOf = [&](const std::string &name) {
+			std::vector<RgfxStageAttributeDecl> out;
+			for (const Listed &f : listed(lib))
+				if (f.name == name)
+					check(rgfxReadStageAttributes(lib.data(), lib.size(), f.publicOffset, out),
+					      name + ": its attributes read");
+			return out;
+		};
+		auto is = [](const std::vector<RgfxStageAttributeDecl> &d, size_t i, const char *name, uint32_t index,
+		             uint32_t type, bool active, bool controlPoint, bool patch) {
+			return i < d.size() && d[i].name == name && d[i].index == index && d[i].type == type &&
+			       d[i].active == active && d[i].patchControlPoint == controlPoint && d[i].patchData == patch;
+		};
+		const auto vertexIn = declaredOf("reads_attributes");
+		check(vertexIn.size() == 1 && is(vertexIn, 0, "position", 0, 6, true, false, false),
+		      "reads_attributes: a float4 at attribute 0, read");
+		const auto patchIn = declaredOf("reads_patch");
+		check(patchIn.size() == 2 && is(patchIn, 0, "p", 0, 6, true, true, false) &&
+		          is(patchIn, 1, "color", 1, 6, true, false, true),
+		      "reads_patch: a control point's float4 at 0, and the patch's own at 1");
+		const auto kernelIn = declaredOf("reads_stage_in");
+		check(kernelIn.size() == 1 && is(kernelIn, 0, "position", 0, 6, true, false, false),
+		      "reads_stage_in: a kernel's float4 at attribute 0");
+		check(declaredOf("writes_in_fragment").empty() && declaredOf("every_access").empty(),
+		      "a fragment function and a kernel of no stage input declare none");
+		const auto attrs = attributesAsVatt(lib, "air_arguments");
+		check(attrs.first >= 10 && attrs.second >= 3,
+		      "every function's attributes compared (" + std::to_string(attrs.first) + ", " +
+		          std::to_string(attrs.second) + " with attributes)");
+	}
+
 	// Modules built for macOS 10.12, of LLVM 3.5's metadata nodes: each entry point's arguments,
 	// and its constants as its CNST tag lists them.
 	{
@@ -1521,6 +1611,7 @@ int main()
 		          !rgfxAirWritesTexture(oldFragment, 0),
 		      "old_fragment writes texture 5 alone");
 		const auto oldCompared = constantsAsCnst(old);
+		attributesAsVatt(old, "air_arguments_old");
 		check(oldCompared.first == 3 && oldCompared.second == 1,
 		      "the older functions' constants compared (" + std::to_string(oldCompared.first) +
 		          ", " + std::to_string(oldCompared.second) + " with constants)");
@@ -1534,6 +1625,9 @@ int main()
 		const char *path11 = std::getenv("RGFX_AIR_ARGUMENTS_11");
 		check(path11 != nullptr, "RGFX_AIR_ARGUMENTS_11 names the macOS 11 test library");
 		const std::vector<uint8_t> lib11 = readFile(path11);
+		const auto attrs11 = attributesAsVatt(lib11, "air_arguments_11");
+		check(attrs11.second >= 1, "the macOS 11 functions' attributes compared (" + std::to_string(attrs11.first) +
+		                               ", " + std::to_string(attrs11.second) + " with attributes)");
 		auto entry11 = [&](const std::string &name) {
 			const uint8_t *bc = nullptr;
 			size_t n = 0;
@@ -1612,6 +1706,10 @@ int main()
 	const char *oraclePath = std::getenv("RGFX_ORACLE_REFLECTION");
 	check(oraclePath != nullptr, "RGFX_ORACLE_REFLECTION names the oracle probe's library");
 	const std::vector<uint8_t> oracle = readFile(oraclePath);
+	const auto oracleAttributes = attributesAsVatt(oracle, "oracle_reflection");
+	check(oracleAttributes.second >= 8, "the oracle probe's functions' attributes compared (" +
+	                                        std::to_string(oracleAttributes.first) + ", " +
+	                                        std::to_string(oracleAttributes.second) + " with attributes)");
 	auto entriesOf = [&](const std::string &name) {
 		const uint8_t *bc = nullptr;
 		size_t n = 0;
@@ -2097,6 +2195,8 @@ int main()
 				const std::vector<uint8_t> one(p, p + n);
 				const bool cut = file.size() >= 22 && file.compare(file.size() - 22, 22, "/kernel_trunc.metallib") == 0;
 				const std::vector<Listed> fns = listed(one);
+				if (!(file.size() >= 22 && file.compare(file.size() - 22, 22, "/kernel_trunc.metallib") == 0))
+					attributesAsVatt(one, file);
 				check(!fns.empty(), file + ": its function list reads");
 				libraries++;
 				for (const Listed &f : fns) {

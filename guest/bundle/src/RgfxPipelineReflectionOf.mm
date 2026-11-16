@@ -138,6 +138,35 @@ id RgfxFunctionReflectionOf(id<MTLFunction> function)
 	return r;
 }
 
+NSArray *RgfxStageAttributesOf(id<MTLFunction> function)
+{
+	if (![(id)function isKindOfClass:[RgfxFunction class]])
+		return nil;
+	RgfxFunction *f = (RgfxFunction *)function;
+	std::vector<RgfxStageAttributeDecl> attributes;
+	NSString *why = nil;
+	if (![f rgfxDeclaredStageAttributes:attributes]) {
+		why = @"its library's metadata of it was not read";
+	} else if (attributes.empty()) {
+		return nil;
+	} else if ([f rgfxConstantCount] != 0) {
+		RgfxResource *library = [f rgfxLibrary];
+		std::shared_ptr<const RgfxAirEntries> module =
+		    [library isKindOfClass:[RgfxLibrary class]]
+		        ? [(RgfxLibrary *)library rgfxAirEntryNamed:[f rgfxEntryPointUTF8]]
+		        : nullptr;
+		if (module == nullptr || module->entries.size() != 1)
+			why = @"its function's AIR was not read";
+		else
+			RgfxSpecialiseStageAttributes(*module, module->entries[0], [f rgfxConstants], [f rgfxConstantCount],
+			                              attributes, &why);
+	}
+	NSArray *list = why == nil ? RgfxStageAttributesMake(attributes, f.functionType == MTLFunctionTypeVertex, &why) : nil;
+	if (list == nil)
+		logOnce([NSString stringWithFormat:@"stage input attributes of %@", f.name], why);
+	return list;
+}
+
 id RgfxRenderPipelineReflectionOf(id<MTLFunction> vertex, MTLVertexDescriptor *vertexDescriptor,
                                   id<MTLFunction> fragment, MTLPipelineOption options)
 {

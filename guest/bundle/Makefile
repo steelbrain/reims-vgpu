@@ -306,6 +306,25 @@ $(ORACLE_OVERLAP_LIB): tools/oracle/oracle_overlap.metal Makefile
 		-o $(BUILD)/oracle_overlap.air
 	xcrun -sdk macosx metallib $(BUILD)/oracle_overlap.air -o $@
 
+# The stage input attributes' functions of the oracle probe oracle_fnreflect
+# (tools/oracle/oracle_fnreflect.metal), built for macOS 26 and Metal 3.0 as build.sh builds it, whose
+# functions' attributes the x86 Macs' and the M3 Max's answers were measured over, and the shell
+# tests' own (tests/stage_attributes.metal); never committed.
+ORACLE_FNREFLECT_LIB = $(BUILD)/oracle_fnreflect.metallib
+STAGE_ATTRIBUTES_LIB = $(BUILD)/stage_attributes.metallib
+
+$(ORACLE_FNREFLECT_LIB): tools/oracle/oracle_fnreflect.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -c -std=metal3.0 -mmacosx-version-min=26.0 tools/oracle/oracle_fnreflect.metal \
+		-o $(BUILD)/oracle_fnreflect.air
+	xcrun -sdk macosx metallib $(BUILD)/oracle_fnreflect.air -o $@
+
+$(STAGE_ATTRIBUTES_LIB): tests/stage_attributes.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -c -std=metal3.1 -mmacosx-version-min=14.0 tests/stage_attributes.metal \
+		-o $(BUILD)/stage_attributes.air
+	xcrun -sdk macosx metallib $(BUILD)/stage_attributes.air -o $@
+
 # The library of pipeline_reflection_check's c_atomic_texture case, of a language Metal 3.0 has not
 # (tools/oracle/oracle_reflection_31.metal); never committed.
 ORACLE_REFLECTION_31_LIB = $(BUILD)/oracle_reflection_31.metallib
@@ -396,7 +415,7 @@ $(VIDEO_DRIVER_TESTBIN): $(VIDEO_DRIVER_TESTOBJS) tests/video_driver_tests.cpp $
 		-framework IOSurface -framework CoreFoundation -o $@
 
 test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_11_LIB) $(AIR_REFLECTED) $(ORACLE_REFLECTION_LIB) \
-	$(ORACLE_OVERLAP_LIB) \
+	$(ORACLE_OVERLAP_LIB) $(ORACLE_FNREFLECT_LIB) $(STAGE_ATTRIBUTES_LIB) \
 	$(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) $(STITCH_CONSTANTS) $(PATCH_LIB) $(STAGE_IN_ORACLE_LIB) \
 	$(INHERIT_TESTBIN) \
 	$(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) $(VIDEO_H265_TESTBIN) $(VIDEO_DRIVER_TESTBIN) $(BUNDLEBIN)
@@ -408,7 +427,8 @@ test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_11_LIB) $(AI
 		RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_ARGUMENTS_11=$(AIR_11_LIB) RGFX_LIBRARY_FILE=$(LIBRARY_FILE) \
 		RGFX_AIR_REFLECTED=$(AIR_REFLECTED) RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) \
 		RGFX_PATCH=$(PATCH_LIB) RGFX_ORACLE_OVERLAP=$(ORACLE_OVERLAP_LIB) \
-		RGFX_STAGE_IN_ORACLE=$(STAGE_IN_ORACLE_LIB) $(SHELL_TESTBIN)
+		RGFX_STAGE_IN_ORACLE=$(STAGE_IN_ORACLE_LIB) RGFX_ORACLE_FNREFLECT=$(ORACLE_FNREFLECT_LIB) \
+		RGFX_STAGE_ATTRIBUTES=$(STAGE_ATTRIBUTES_LIB) $(SHELL_TESTBIN)
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(MEMBERS_TESTBIN) $(BUNDLEBIN) tests/protocol_members.txt \
 		tests/protocol_members_releases.txt src

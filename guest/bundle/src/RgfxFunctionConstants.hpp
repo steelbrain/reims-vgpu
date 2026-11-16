@@ -1,6 +1,6 @@
 /*
  * RgfxFunctionConstants: a function's constants and the values a process sets for them,
- * resolved as Metal resolves them.
+ * resolved as Metal resolves them, and the stage input attributes the function declares.
  *
  * A .metallib holds each function's constants in its public metadata (the `CNST` tag): the
  * constant's name, its MTLDataType, its index and whether it is required. Metal specialises a
@@ -13,6 +13,10 @@
  * - a required constant left without a value reads 0, and the function is made;
  * - a constant that is not required (one the function tests with
  *   `is_function_constant_defined`) left without a value is not defined.
+ *
+ * The same metadata holds a vertex function's and a kernel's stage input attributes (the `VATT`
+ * and `VATY` tags), which Metal's function answers as its vertexAttributes and
+ * stageInputAttributes (rgfxReadStageAttributes).
  *
  * Our own C++; no Apple code.
  */
@@ -56,6 +60,29 @@ std::string rgfxDataTypeName(uint32_t type);
 /// entry whole.
 bool rgfxReadConstantTable(const uint8_t *bytes, size_t length, uint64_t offset,
                            std::vector<RgfxConstantDecl> &out);
+
+/// One stage input attribute a function declares: its `VATT` entry and its `VATY` type.
+struct RgfxStageAttributeDecl {
+	std::string name;
+	uint32_t index = 0; // [[attribute(index)]]
+	uint32_t type = 0;  // MTLDataType
+	bool active = false;            // the function reads it
+	bool patchControlPoint = false; // a post-tessellation vertex function's control point's
+	bool patchData = false;         // a post-tessellation vertex function's patch's own
+};
+
+/// Reads the stage input attributes of the function whose public metadata starts `offset` bytes
+/// into the .metallib's public metadata section, from the `length` bytes at `bytes`, in the order
+/// the function declares them. `VATT` is a u16 count, then per attribute its NUL-terminated name
+/// and a u16 holding its index in the low 13 bits, 0x8000 where it is active, 0x4000 where it is a
+/// control point's and 0x2000 where it is a patch's own; `VATY` a u16 count and one u8 MTLDataType
+/// an attribute, in VATT's order (measured: Apple's metal compiler's output for macOS 11 and 26,
+/// two-step and one-step builds alike, against what Metal's functions answer for them on the AMD
+/// 5300M and the Intel 630 on macOS 26.7.1 and the M3 Max on macOS 27.0.1). A function with
+/// neither tag (a fragment function, one of no stage input) declares none. Answers false, leaving
+/// `out` empty, where the bytes do not hold the entry whole or the two tags disagree.
+bool rgfxReadStageAttributes(const uint8_t *bytes, size_t length, uint64_t offset,
+                             std::vector<RgfxStageAttributeDecl> &out);
 
 /// A value whose type is not its constant's: the constant (an index into the declarations) and
 /// the value's type.
