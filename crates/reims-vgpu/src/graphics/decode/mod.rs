@@ -827,6 +827,10 @@ pub(crate) struct Shared<P: Platform> {
     /// ([`GraphicsDecoder::deal_chunk_bytes`]).
     #[cfg(test)]
     deal_chunk_bytes: Mutex<Option<usize>>,
+    /// The walks cut and deal their buffers as though nothing their queue committed were
+    /// incomplete (for the tests of the cuts themselves: [`GraphicsDecoder::set_cut_behind_work`]).
+    #[cfg(test)]
+    cut_behind_work: AtomicBool,
     /// A walk dealt to two threads waits for a helper to start its chunks before it walks its
     /// own (for the tests: [`GraphicsDecoder::set_helper_first`]).
     #[cfg(test)]
@@ -1079,6 +1083,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             deal_min_bytes: Mutex::new(None),
             #[cfg(test)]
             deal_chunk_bytes: Mutex::new(None),
+            #[cfg(test)]
+            cut_behind_work: AtomicBool::new(false),
             #[cfg(test)]
             helper_first: AtomicBool::new(false),
             #[cfg(test)]
@@ -2656,6 +2662,25 @@ impl<P: Platform> GraphicsDecoder<P> {
             return bytes;
         }
         cmdbuf::DEAL_CHUNK_BYTES
+    }
+
+    /// Has the walks cut and deal their buffers as though nothing their queue committed were
+    /// incomplete (for the tests of the cuts themselves, which complete no part as they walk).
+    #[cfg(test)]
+    pub(crate) fn set_cut_behind_work(&self, cut: bool) {
+        self.shared.cut_behind_work.store(cut, Ordering::Relaxed);
+    }
+
+    /// Whether a walk is behind work its queue committed, `out` the queue's count of its command
+    /// buffers committed and not complete ([`tables::QueueCounts::out`]): where it is, it cuts no
+    /// part and deals in two chunks at most ([`split`], "How many parts"; the tests may have it
+    /// cut regardless).
+    pub(crate) fn behind_work(&self, out: &std::sync::atomic::AtomicUsize) -> bool {
+        #[cfg(test)]
+        if self.shared.cut_behind_work.load(Ordering::Relaxed) {
+            return false;
+        }
+        out.load(Ordering::Acquire) != 0
     }
 
     /// Has a walk dealt to two threads wait for a helper to start its chunks before it walks its

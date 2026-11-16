@@ -630,20 +630,44 @@ const TAKE_IN_FLIGHT_MAX: usize = 48;
 
 /// A command buffer's place in its queue's count of the host's command buffers made on the queue
 /// and not completed, which it leaves when dropped: with its completion handler, once that has run
-/// ([`leaving`]), or with the buffer where it is never committed.
-struct InFlight(Arc<AtomicUsize>);
+/// ([`leaving`]), or with the buffer where it is never committed. From its commit on
+/// ([`Self::commits`]) it holds a place in the queue's count of those committed too
+/// ([`QueueCounts::out`](super::tables::QueueCounts::out)), which it leaves with the other.
+struct InFlight {
+    count: Arc<AtomicUsize>,
+    out: Arc<AtomicUsize>,
+    committed: bool,
+}
 
 impl InFlight {
-    /// A place in `count`.
-    fn new(count: &Arc<AtomicUsize>) -> InFlight {
+    /// A place in `count`, a queue's count of command buffers made and not completed, whose count
+    /// of those committed is `out`.
+    fn new(count: &Arc<AtomicUsize>, out: &Arc<AtomicUsize>) -> InFlight {
         count.fetch_add(1, Ordering::AcqRel);
-        InFlight(Arc::clone(count))
+        InFlight {
+            count: Arc::clone(count),
+            out: Arc::clone(out),
+            committed: false,
+        }
+    }
+
+    /// The place, its command buffer about to be committed: in its queue's count of committed
+    /// command buffers too, until dropped.
+    fn commits(mut self) -> InFlight {
+        if !self.committed {
+            self.out.fetch_add(1, Ordering::AcqRel);
+            self.committed = true;
+        }
+        self
     }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        if self.committed {
+            self.out.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -671,6 +695,8 @@ struct Splitting {
     context: u32,
     /// Its queue's count of command buffers made and not completed ([`InFlight`]).
     in_flight: Arc<AtomicUsize>,
+    /// Its queue's count of those committed ([`QueueCounts::out`](super::tables::QueueCounts::out)).
+    out: Arc<AtomicUsize>,
     /// When the walk of the part it is walking began.
     since: MonoTime,
     /// Its context's gate, from its first part's commit to its last ([`SplitHold`]).
@@ -736,6 +762,8 @@ struct Deal<'a, P: Platform> {
     ours: VecDeque<(P::CommandBuffer, InFlight)>,
     /// Its queue's count of command buffers made and not completed ([`InFlight`]).
     in_flight: Arc<AtomicUsize>,
+    /// Its queue's count of those committed ([`QueueCounts::out`](super::tables::QueueCounts::out)).
+    out: Arc<AtomicUsize>,
     /// This thread's chunks walked and not yet committed or folded, at their index.
     own: Vec<Option<Walked<P>>>,
     /// The next chunk to commit or fold.
@@ -1749,7 +1777,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             return Ok(Err(DecodeError::Refused));
         };
         super::work::command_buffer(self.context);
-        let in_flight = InFlight::new(&counts.in_flight);
+        let in_flight = InFlight::new(&counts.in_flight, &counts.out);
         // Its queue's commit marks rise to it, where its begin on a queue's service thread did
         // not note it already: begun now, and committed as the message ends
         // ([`super::commit_order`]).
@@ -1920,7 +1948,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             .flatten()
             .map(|context| Splitting {
                 context,
-                in_flight: Arc::clone(&in_flight.0),
+                in_flight: Arc::clone(&in_flight.count),
+                out: Arc::clone(&in_flight.out),
                 since: self.shared.platform.clock().now_mono(),
                 hold: None,
                 parts: None,
@@ -1929,9 +1958,19 @@ impl<P: Platform> GraphicsDecoder<P> {
             });
         let mut cb = cb;
         // Dealt to two threads at once, where it may be cut and its queue holds room for a command
-        // buffer of each chunk but its first ([`super::split`], "Two threads at once").
+        // buffer of each chunk but its first ([`super::split`], "Two threads at once"); in two
+        // chunks, one a thread, where work its queue committed before is not yet complete
+        // ([`DEALT_BEHIND_WORK`]).
         let cuts = (split.as_ref())
-            .map(|s| TAKE_IN_FLIGHT_MAX.saturating_sub(s.in_flight.load(Ordering::Acquire)) + 1)
+            .map(|s| {
+                let room = TAKE_IN_FLIGHT_MAX.saturating_sub(s.in_flight.load(Ordering::Acquire));
+                let most = if self.behind_work(&s.out) {
+                    DEALT_BEHIND_WORK
+                } else {
+                    usize::MAX
+                };
+                (room + 1).min(most)
+            })
             .and_then(|most| deal(ops, self.deal_min_bytes(), self.deal_chunk_bytes(), most));
         let walked = match cuts {
             Some(cuts) => self.walk_dealt(
@@ -1986,7 +2025,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             if let Some(submission) = submission {
                 cb.add_submission_handler(ON, submission)?;
             }
-            cb.add_completion_seen_handler(ON, leaving(handler, in_flight))?;
+            cb.add_completion_seen_handler(ON, leaving(handler, in_flight.commits()))?;
             if let Some(order_hold) = &order_hold {
                 order_hold.queue.fetch_add(1, Ordering::AcqRel);
             }
@@ -2108,7 +2147,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             self.order_release(device, queue_obj_id, marks, seqno, names, Some(queue))?;
             return Ok(false);
         };
-        let in_flight = InFlight::new(&counts.in_flight);
+        let in_flight = InFlight::new(&counts.in_flight, &counts.out);
         let mut events = EventOps::default();
         let carried = event_ops(ops);
         // A signal before a wait the stand-in carries is reached before the stand-in's end
@@ -2164,7 +2203,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             (None, held.clone(), None),
         );
         let handler = signalling(handler, signalled);
-        cb.add_completion_seen_handler(ON, leaving(handler, in_flight))?;
+        cb.add_completion_seen_handler(ON, leaving(handler, in_flight.commits()))?;
         // In the commit order where the buffer was, after its context's range messages before it
         // ([`Self::wait_to_commit`]).
         self.wait_to_commit();
@@ -2391,9 +2430,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// At an encoder's end, ops left after it: where the part of the buffer walked since the
-    /// last took [`Self::split_after`], its queue holds room for another command buffer, the buffer
-    /// could be committed now ([`Self::may_commit_now`]) and its context's gate is free or its
-    /// own, hands the platform that part ([`CommandBuffer::split`]) and goes on in the command
+    /// last took [`Self::split_after`], its queue holds room for another command buffer and no
+    /// command buffer it committed is incomplete ([`Self::behind_work`]), the buffer could be
+    /// committed now ([`Self::may_commit_now`]) and its context's gate is free or its own, hands
+    /// the platform that part ([`CommandBuffer::split`]) and goes on in the command
     /// buffer it answers, `cb` from then on ([`super::split`]). It waits for nothing. Where the
     /// platform keeps the buffer whole, it is walked whole from there.
     fn split_here(
@@ -2407,6 +2447,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let clock = self.shared.platform.clock();
         if clock.now_mono().saturating_duration_since(s.since) < self.split_after()
             || s.in_flight.load(Ordering::Acquire) >= TAKE_IN_FLIGHT_MAX
+            || self.behind_work(&s.out)
             || !self.may_commit_now()
         {
             return Ok(());
@@ -2422,7 +2463,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let parts = Arc::clone(s.parts.get_or_insert_with(Arc::default));
         // The part's own place among its queue's command buffers, until its completion; the
         // buffer's goes on to its last part.
-        let part = parts.part_handler(InFlight::new(&s.in_flight));
+        let part = parts.part_handler(InFlight::new(&s.in_flight, &s.out).commits());
         cb.add_completion_seen_handler(ON, part)?;
         let joins = joins_next::<P>(cb, s);
         match cb.split(ON)? {
@@ -2545,7 +2586,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         events: &mut EventOps,
         split: &mut Option<Splitting>,
     ) -> RaiseResult<Result<(), DecodeError>> {
-        let Some(in_flight) = split.as_ref().map(|s| Arc::clone(&s.in_flight)) else {
+        let Some((in_flight, out)) =
+            (split.as_ref()).map(|s| (Arc::clone(&s.in_flight), Arc::clone(&s.out)))
+        else {
             return self.walk_ops(ops, cb, events, split);
         };
         let ends = cuts.iter().copied().chain(std::iter::once(ops.len()));
@@ -2564,7 +2607,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         for _ in 1..n {
             let room = in_flight.load(Ordering::Acquire) < TAKE_IN_FLIGHT_MAX;
             match if room { cb.part(ON)? } else { None } {
-                Some(part) => parts.push((part, InFlight::new(&in_flight))),
+                Some(part) => parts.push((part, InFlight::new(&in_flight, &out))),
                 None => {
                     drop(parts);
                     return self.walk_ops(ops, cb, events, split);
@@ -2617,6 +2660,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             hand: &hand,
             ours,
             in_flight,
+            out,
             own: (0..n).map(|_| None).collect(),
             next: 0,
             kept: Kept::No,
@@ -2898,7 +2942,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                         Some((part, place)) => (Some(part), place),
                         None => (None, deal.place.take()),
                     };
-                    let place = place.unwrap_or_else(|| InFlight::new(&deal.in_flight));
+                    let place = (place
+                        .unwrap_or_else(|| InFlight::new(&deal.in_flight, &deal.out)))
+                    .commits();
                     let parts = Arc::clone(s.parts.get_or_insert_with(Arc::default));
                     let committing = part.as_ref().unwrap_or(&*cb);
                     committing.add_completion_seen_handler(ON, parts.part_handler(place))?;
@@ -3709,6 +3755,14 @@ pub(super) const DEAL_MIN_ENCODERS: usize = 8;
 /// measured): so about 31 chunks of about 0.5 ms of walk each, near the 36 parts its walk on one
 /// thread cut of it (m3-max-30753, [`super::split::SPLIT_AFTER`]).
 pub(super) const DEAL_CHUNK_BYTES: usize = 4 * 1024;
+
+/// The most chunks a command buffer is dealt in where work its queue committed before is not yet
+/// complete as its walk starts: one a thread. Its chunks are cut [`DEAL_CHUNK_BYTES`] apart so the
+/// GPU, idle, starts on the first while the rest is walked; behind earlier work the GPU is busy,
+/// and each further chunk is one more part, so one more submission to the driver and one more job
+/// of its scheduler, which the GPU waits on where it runs out of work ([`super::split`], "How many
+/// parts").
+const DEALT_BEHIND_WORK: usize = 2;
 
 /// Where a command buffer's op stream `ops` is cut into chunks dealt to two threads at once
 /// ([`super::split`], "Two threads at once"): at the end of each encoder, before the stream's
@@ -9153,6 +9207,8 @@ mod tests {
     fn splitting() -> Split {
         let (p, mut dec) = setup();
         dec.set_context(Some(0));
+        // The cuts themselves: no part completes as these tests walk.
+        dec.set_cut_behind_work(true);
         p.world().split_command_buffers();
         let clock = Arc::clone(&p);
         dec.set_walk_hook(Some(Arc::new(move |_| {
@@ -9694,6 +9750,95 @@ mod tests {
             .collect();
         assert_eq!(waited, parts[..1], "the wait in its first part");
         assert_eq!(marks(&p, parts), [false, true, false]);
+    }
+
+    /// A walk cuts no part of its buffer while a command buffer its queue committed is not yet
+    /// seen complete, and deals a buffer behind one in two chunks, one a thread
+    /// ([`super::super::split`], "How many parts"): behind its own first part it walks on into
+    /// its last; with each part seen complete as the walk goes, it cuts at each encoder's end as
+    /// before; behind an earlier buffer of its queue it cuts none; dealt behind one, it is two
+    /// parts, and dealt with nothing out, a part each chunk. The guest has each buffer's
+    /// `CB_COMPLETE` once, after its last part, as before.
+    #[test]
+    fn a_walk_cuts_no_part_while_work_its_queue_committed_is_out() {
+        let Split {
+            p, mut dec, posted, ..
+        } = splitting();
+        dec.set_cut_behind_work(false);
+        let device = p.device();
+        let ok = (RGFX_EVT_CB_COMPLETE, RGFX_CB_OK);
+
+        // Behind its own first part: two parts.
+        let cut = dec.parts_cut();
+        let message = command_buffer_message(400, 130, &passes(4));
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(dec.parts_cut() - cut, 1, "its first part");
+        assert_eq!(
+            p.world().committed().len(),
+            2,
+            "its first part and its last"
+        );
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(answered(&posted).last(), Some(&ok));
+
+        // Each part seen complete as the walk goes: a part each encoder, as before.
+        let world = Arc::clone(&p);
+        dec.set_walk_hook(Some(Arc::new(move |_| {
+            world.virtual_clock().advance(SPLIT_AFTER);
+            world.world().complete_all(CompleteOn::Caller);
+        })));
+        let cut = dec.parts_cut();
+        let message = command_buffer_message(401, 131, &passes(4));
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(dec.parts_cut() - cut, 3, "a part each encoder but the last");
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(answered(&posted).last(), Some(&ok));
+        let clock = Arc::clone(&p);
+        dec.set_walk_hook(Some(Arc::new(move |_| {
+            clock.virtual_clock().advance(SPLIT_AFTER);
+        })));
+
+        // Behind an earlier buffer of its queue, not yet complete: whole.
+        let earlier = command_buffer_message(402, 132, &blit_ops());
+        assert_eq!(dec.decode(&device, &earlier).unwrap(), Ok(()));
+        let cut = dec.parts_cut();
+        let message = command_buffer_message(403, 133, &passes(4));
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(dec.parts_cut() - cut, 0, "no part");
+        assert_eq!(
+            p.world().committed().len(),
+            2,
+            "the earlier buffer and this one"
+        );
+        p.world().complete_all(CompleteOn::Caller);
+        let completes: Vec<_> = (answered(&posted).into_iter())
+            .filter(|(kind, _)| *kind == RGFX_EVT_CB_COMPLETE)
+            .collect();
+        assert_eq!(completes, [ok, ok]);
+
+        // Dealt, a chunk each encoder: behind an earlier buffer, two parts, one a thread; with
+        // nothing out, a part each chunk.
+        dec.set_deal_min_bytes(Some(0));
+        dec.set_deal_chunk_bytes(Some(0));
+        dec.set_helper_first(true);
+        let earlier = command_buffer_message(404, 134, &blit_ops());
+        assert_eq!(dec.decode(&device, &earlier).unwrap(), Ok(()));
+        let message = command_buffer_message(405, 135, &passes(8));
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(
+            p.world().committed().len(),
+            3,
+            "the earlier buffer and two parts"
+        );
+        p.world().complete_all(CompleteOn::Caller);
+        let message = command_buffer_message(406, 136, &passes(8));
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(p.world().committed().len(), 8, "a part each chunk");
+        p.world().complete_all(CompleteOn::Caller);
+        let completes: Vec<_> = (answered(&posted).into_iter())
+            .filter(|(kind, _)| *kind == RGFX_EVT_CB_COMPLETE)
+            .collect();
+        assert_eq!(completes, [ok, ok, ok]);
     }
 
     /// `n` passes of [`render_ops`].

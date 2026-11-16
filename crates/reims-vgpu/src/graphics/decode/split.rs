@@ -32,13 +32,29 @@
 //! measured (metal2vulkan c796a88d6a) does more work for an encoder the more encoders its command
 //! buffer holds before it, and a part holds fewer.
 //!
-//! **How many parts.** A part is cut each [`SPLIT_AFTER`] however many of the buffer's parts are
-//! out, up to its queue's room for command buffers (`TAKE_IN_FLIGHT_MAX`, [`super::cmdbuf`]). A
-//! limit on the parts out, under which the walk goes on into a longer part while the GPU is
-//! behind, gained nothing measured. `dispatch_cost` (the decoder alone, release, the median of 5
-//! runs of 6 repetitions) measured its fluid shape and its heavy one, whose GPU work outlasts its
-//! walk as Fluid Simulation's does on a Radeon 780M, with at most 2 or 16 parts out against no
-//! limit, on metal2vulkan afba68e6e4:
+//! **How many parts.** A part is cut each [`SPLIT_AFTER`] while nothing the buffer's queue
+//! committed, its earlier parts and buffers, is incomplete (`QueueCounts::out`, counted from each
+//! commit to its completion's handler), up to its queue's room for command buffers
+//! (`TAKE_IN_FLIGHT_MAX`, [`super::cmdbuf`]); behind such work the walk goes on into the part it
+//! is in, and cuts at the first encoder's end after it is seen complete. A buffer dealt to two
+//! threads behind such work is dealt in two chunks, one a thread ("Two threads at once", below).
+//! Each part is a submission to the driver and a job of its scheduler, and a part committed
+//! behind work only adds one: the GPU starts it no earlier than the work before it ends. On an
+//! RX 7900 XTX, where a job waits 0.12 to 0.19 ms from its submission to its start on the GPU
+//! (amdgpu's scheduler, measured by metal2vulkan's jobstart lane), Geekbench 7's Metal pass took 1,437 parts
+//! for Particle Physics' 111 command buffers of its own and 2,631 for Fluid Simulation's 882,
+//! 1,256 and 1,703 of their cuts made while an earlier part was not yet seen complete, where
+//! Geekbench's own Vulkan pass on the host ran 111 and 882 jobs (perfscout9's gb-xtx-2 and its
+//! native run, measured). On an Iris Xe,
+//! WindowServer's frames of an animating page took 8.96 parts a command buffer, 22,155 of
+//! 25,856 cuts behind incomplete work, 847 of its 2,394 dealt walks begun behind it (lane joins'
+//! ja-dev, measured).
+//!
+//! Before that rule, a limit on the parts out, under which the walk went on into a longer part
+//! while the GPU was behind, gained nothing measured by the decoder alone: `dispatch_cost`
+//! (release, the median of 5 runs of 6 repetitions) measured its fluid shape and its heavy one,
+//! whose GPU work outlasts its walk as Fluid Simulation's does on a Radeon 780M, with at most 2
+//! or 16 parts out against no limit, on metal2vulkan afba68e6e4:
 //! - Radeon 780M (RADV): the heavy shape's latency 166.8 and 167.0 ms against 166.2 ms, its walk
 //!   6.6 and 7.0 µs a dispatch against 7.3 µs; the fluid shape's GPU keeps up, so neither limit
 //!   was reached;
@@ -153,7 +169,9 @@
 //! [`DEAL_MIN_ENCODERS`](super::cmdbuf::DEAL_MIN_ENCODERS) at least, all of them render and
 //! blit encoders that hold no event, rate map, indirect command buffer or residency of
 //! resources (`cmdbuf.rs`'s `deal`), is cut at encoder ends into chunks of
-//! [`DEAL_CHUNK_BYTES`](super::cmdbuf::DEAL_CHUNK_BYTES) of ops or more, dealt to the lane's
+//! [`DEAL_CHUNK_BYTES`](super::cmdbuf::DEAL_CHUNK_BYTES) of ops or more (into two chunks, at the
+//! first encoder's end past half its ops, where its walk starts behind work its queue committed
+//! and not yet complete: "How many parts"), dealt to the lane's
 //! thread and a helper thread ([`super::helpers`]), handed over at once as the walk starts: the
 //! first chunk to the lane's thread, then the longest first, each to the thread dealt fewer bytes
 //! so far (`cmdbuf.rs`'s `helper_chunks`), so the longest starts at once on the thread that is

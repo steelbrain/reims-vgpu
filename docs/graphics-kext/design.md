@@ -5551,7 +5551,10 @@ commit. Each outcome the new design allows is one of those two:
   (`decode/split.rs`): at an encoder's end, once the part walked since the last
   took 250 µs, it hands the platform that part (`CommandBuffer::split`), which
   commits it on the buffer's queue and answers a command buffer of the queue
-  that goes on from it, and the walk goes on in that one. On the M3 Max (MoltenVK)
+  that goes on from it, and the walk goes on in that one. It cuts none while
+  a command buffer its queue committed is not yet seen complete: each part is
+  a job of the driver's scheduler, and one behind work adds a job and starts
+  no sooner (`decode/split.rs`, "How many parts"). On the M3 Max (MoltenVK)
   a frame of 60 passes then completed in 6.0 ms from its message's take, where
   it took 9.5 ms whole (`decode/split.rs`, "What it gains"). A part is committed
   only where the whole buffer could be committed then, waiting for nothing:
@@ -5603,7 +5606,8 @@ commit. Each outcome the new design allows is one of those two:
   `a_split_after_a_mid_buffer_signal_keeps_the_signal_before_the_cut`,
   `a_split_after_a_skipped_encoder_answers_as_the_whole`,
   `a_buffer_s_parts_but_its_last_join_the_next_completion_unless_they_signal`
-  and `a_first_part_that_waits_from_its_begin_is_not_marked` (the decoder's
+  `a_first_part_that_waits_from_its_begin_is_not_marked` and
+  `a_walk_cuts_no_part_while_work_its_queue_committed_is_out` (the decoder's
   `cmdbuf` tests), and the gate's own (`decode/split.rs`).
 - **What still waits on ring 0's thread:** a block named again, for that
   block's writers; a present's fill, for that block's users begun and not

@@ -59,6 +59,10 @@ pub(crate) struct QueueCounts {
     /// How many command buffers the host made on it have not completed (a take on a doorbell's
     /// thread).
     pub(crate) in_flight: Arc<AtomicUsize>,
+    /// How many of those are committed: work of the queue's on the GPU, or on its way there, whose
+    /// completion is not yet seen. A walk cuts no part of its buffer while it holds one
+    /// ([`super::split`], "How many parts").
+    pub(crate) out: Arc<AtomicUsize>,
     /// Its marks in the surface order, which a command buffer that holds no op reads and writes
     /// with no lock ([`super::surface_order::Marks`]).
     pub(crate) order: Arc<super::surface_order::Marks>,
@@ -82,6 +86,7 @@ impl QueueCounts {
         QueueCounts {
             held: Arc::default(),
             in_flight: Arc::default(),
+            out: Arc::default(),
             order,
             line: Arc::default(),
             lane: Some(lane),
