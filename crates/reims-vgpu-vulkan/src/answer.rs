@@ -3179,17 +3179,7 @@ mod tests {
         //   drawn content a buffer's fill over its bytes covered and the fill's bytes where it held
         //   only a clear (the runtime's measurement), and Apple documents no layout of a texture's
         //   bytes in a heap. Announced inside the heap's creator of the texture.
-        // - `LineWriteBack`: a render target over host pages that takes its image in place where
-        //   its rows' padding is free, its renders' check failed for those rows' ends, and the
-        //   device's own copies lose the same padding: the device writes back the whole line of
-        //   host memory it fetched (64 bytes on the Iris Xe, the runtime's measurement), so a CPU
-        //   write to a row's padding inside the line that holds the row's last texel is lost while
-        //   a pass, a kernel store or a blit writes that line; rows that end on a line are never
-        //   touched, and a pass that writes no texel changes nothing. Metal's device leaves the
-        //   padding as the CPU wrote it. A shadow of the texture loses the same bytes on such a
-        //   device, so in place costs nothing a shadow would keep. Announced once per device that
-        //   takes a texture in place by that rule.
-        const PRECISION: [D; 17] = [
+        const PRECISION: [D; 16] = [
             D::UncalibratedGpuTimes,
             D::LooselyCalibratedGpuTimes,
             D::UntimedCommandBuffer,
@@ -3206,7 +3196,6 @@ mod tests {
             D::FloatTininessAfterRounding,
             D::DeviceBooleanVisibility,
             D::HeapTextureCompressed,
-            D::LineWriteBack,
         ];
         // A pipeline stage's precision notes, each arithmetic, filtering or ordering of the device
         // that its documentation says can differ from Metal's: relayed, but those [`DIES`] and

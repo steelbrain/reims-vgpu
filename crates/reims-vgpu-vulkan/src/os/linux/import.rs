@@ -299,11 +299,12 @@ fn one_dma_buf_imports() -> bool {
 /// m3-max-31405), so NVIDIA's driver does not take the route. **Measured** 2026-11-15 with
 /// metal2vulkan fb33065288: on homelab-ms01-1's Iris Xe (ANV, Linux 7.3.1, Mesa 26.2.6, job
 /// m3-max-33714) both textures of [`view_textures`] lie in place, the one whose rows are a texel
-/// short of a page too, so ANV takes the route. With metal2vulkan 9ce951f521 that one was a
-/// shadow there (job m3-max-33240): the runtime's check had found a render pass's load and store
-/// over pages imported as dma-bufs changing bytes the CPU wrote beside texels in the line of
-/// memory they share, which the runtime now takes in place where the buffer holds the texture's
-/// last row to its pitch (its `line-write-back` degradation).
+/// short of a page too, so ANV takes the route. Since metal2vulkan 56d06bc71d (RUNTIME 2444) a
+/// render target whose rows end inside a line of memory is a shadow over host pages whatever
+/// imports them, as a Mac keeps the padding beside its rows; such a shadow is the device's
+/// check's (`host_texture_shadows_check_failed`, or `_check_pending` before the device's
+/// verdicts are kept), not the dma-buf's, so the probe counts only the shadows the import itself
+/// refuses.
 static ONE_DMA_BUF_VIEWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// [`ONE_DMA_BUF_VIEWS`].
@@ -317,12 +318,11 @@ pub(super) fn one_dma_buf_views() -> bool {
 enum ViewTextures {
     /// None made: the buffer was not, or was not imported through its dma-buf.
     Unmade,
-    /// Every one lay in place.
+    /// None was a shadow the import refused: each lay in place, or was a shadow by the device's
+    /// check alone, as it would be over pages imported any other way.
     InPlace,
-    /// One was a shadow only as the device's check of such textures had not answered yet (a
-    /// driver's first process, before the runtime keeps its verdicts).
-    Pending,
-    /// One was a shadow for another cause, or was refused.
+    /// One was a shadow the import refused (no linear image over one dma-buf of its pages, or no
+    /// one dma-buf of them), or was refused.
     Shadowed,
 }
 
@@ -330,19 +330,18 @@ enum ViewTextures {
 /// dma-buf holds, lie in place: two of 16 rows a page apart, one whose rows fill the page and one
 /// a texel short, so its rows' last texels share a line of memory with the bytes beside them
 /// (the runtime's checks tell the two apart), each sampled, written by a shader and rendered
-/// into (the accesses its checks give verdicts of). Made heard by no one, as the probe that makes
-/// the buffer is ([`crate::answer`]'s `unheard`; the runtime announces each shadow,
-/// [`crate::platform`]'s `announced_each`).
+/// into (the accesses its checks give verdicts of): whether the import refused either one, by
+/// the runtime's count of each shadow's cause (a shadow the device's check takes, such as the
+/// short one's on a device whose stores write back whole lines, is one any import takes). Made
+/// heard by no one, as the probe that makes the buffer is ([`crate::answer`]'s `unheard`; the
+/// runtime announces each shadow, [`crate::platform`]'s `announced_each`).
 fn view_textures(device: &rt::Device, buffer: &rt::Buffer, page: u64) -> ViewTextures {
     use metal2vulkan::metal::{PixelFormat, TextureUsage};
-    let counts = || {
+    let refused = || {
         let counts = device.work_counts();
-        (
-            counts.shadowed_textures,
-            counts.host_texture_shadows_check_pending,
-        )
+        counts.host_texture_shadows_refused_dma_buf + counts.host_texture_shadows_refused_source
     };
-    let before = counts();
+    let before = refused();
     for width in [page / 4, page / 4 - 1] {
         let mut descriptor =
             rt::TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, width, 16, false);
@@ -352,12 +351,9 @@ fn view_textures(device: &rt::Device, buffer: &rt::Buffer, page: u64) -> ViewTex
             return ViewTextures::Shadowed;
         }
     }
-    let after = counts();
-    let (shadows, pending) = (after.0 - before.0, after.1 - before.1);
-    match (shadows, pending) {
-        (0, _) => ViewTextures::InPlace,
-        (shadows, pending) if shadows > pending => ViewTextures::Shadowed,
-        _ => ViewTextures::Pending,
+    match refused() - before {
+        0 => ViewTextures::InPlace,
+        _ => ViewTextures::Shadowed,
     }
 }
 
@@ -559,10 +555,6 @@ pub(crate) fn learn_view_imports(device: &rt::Device) {
                 match textures {
                     ViewTextures::InPlace => {
                         "lie in place, so a view one dma-buf holds is mapped through it"
-                    }
-                    ViewTextures::Pending => {
-                        "wait on the device's check, which has not answered in this process, so \
-                         views stay mapped from their files in it"
                     }
                     ViewTextures::Shadowed | ViewTextures::Unmade => {
                         "are shadows, so views stay mapped from their files"
