@@ -2394,8 +2394,8 @@ pages now, as its Managed buffers' CPU copies and its encoders' upload chunks
 do ("Managed storage"), so what WindowServer keeps in the region is what no page
 of its own can hold: its rings, its command buffers' bodies and its surfaces'
 blocks. The entries hold three times the
-1358 blocks. A larger display, or a second one, needs the reserve measured
-again.
+1358 blocks. Four displays of 3840 × 2160 took WindowServer's blocks to
+20360 KiB and 460 blocks at most (measured; "Multiple displays", X5).
 
 The kext knows WindowServer's client by two tests at its open: the opening
 process is named `WindowServer`, and it holds the entitlement
@@ -2958,12 +2958,14 @@ device").
 
 ## Multiple displays
 
-Status: designed, not built (the owner's decision of 2026-11-15: several
-displays on this device, each in a window of its own, on x86-64 macOS 11 to 26
-and arm64 macOS from 14). The wire's definitions are in `wire.rs`
-(`RGFX_FEATURE_MULTI_DISPLAY`, `RGFX_DISPLAYS_MAX`, `RGFX_SCANOUT_ROOM_ALIGN`,
-`RGFX_SCANOUT_STRIDE_ALIGN`); no host offers the feature and no kext takes it
-yet. The lanes at the end of this section build it.
+Status: the host's side and the x86-64 kext are built (the owner's decision
+of 2026-11-15: several displays on this device, each in a window of its own,
+on x86-64 macOS 11 to 26 and arm64 macOS from 14). The wire's definitions are
+in `wire.rs` (`RGFX_FEATURE_MULTI_DISPLAY`, `RGFX_DISPLAYS_MAX`,
+`RGFX_SCANOUT_ROOM_ALIGN`, `RGFX_SCANOUT_STRIDE_ALIGN`); a host of two
+displays or more offers the feature (lane mmhost), and the x86-64 kext takes it
+(lane mmx86). The pointer crossing, reims-ctl's setting and the arm64e kext,
+lanes at the end of this section, are still to build.
 
 **A device of one display is what it was.** A device has 1 to
 `RGFX_DISPLAYS_MAX` (4) displays, 1 by default, fixed when it is made. With
@@ -3110,9 +3112,12 @@ changes.
 **The pointer across displays.** Each window's pointer goes to its display's
 console, in that display's pixels, and keys from every window reach the one
 keyboard. A VM has one USB tablet, which reports a position in its range with
-no display in it, so how a pointer over display 1's window reaches the guest's
-display 1 waits on X1 (below). Until it is settled, reims-ctl offers no
-setting for it (its lane lands last).
+no display in it. The guest scales it over the display its cursor is on (X1,
+below), so a pointer over display 1's window reaches the guest's display 1
+once a crossing has moved the cursor there: the pointer crossing lane's. Until
+it lands, every window's pointer moves the cursor over the display it is on,
+display 0 from the guest's start, and reims-ctl offers no setting for it (its
+lane lands last).
 
 **The windows.** One window per display, as the window crate already makes
 them (`Window::new(config, port, title(port))`, `screens::screen_for_port`):
@@ -3139,23 +3144,36 @@ share a screen. In features.md:
 **The x86-64 kext.** `ReimsGraphics` stays the device's driver and display
 0's IOFramebuffer. Where it took `MULTI_DISPLAY` and `DISPLAYS` lists more
 displays, its start makes an IOFramebuffer of the kext's for each display from
-1, registered after display 0's (where each attaches in the service plane is
-the lane's to settle), each with:
+1 (a head), attached to the PCI device as display 0's is and registered after
+it, each with:
 - its own connection, mode list (`RgfxDisplayModes.hpp`), timings, EDID (its
   serial is the display's already, `rgfxDisplaySerial`), cursor, vblank and
   connect interrupts, and server connection's scanout owner;
 - `IOFBDependentID` display 0's registry ID and `IOFBDependentIndex` i, as
-  IOGraphics groups one GPU's framebuffers, and `IOAccelTypes` and
-  `IOAccelIndex` 0, the one accelerator;
+  IOGraphics groups one GPU's framebuffers, `IOAccelTypes` the one
+  accelerator, and `IOAccelIndex` i, the display's pipe of it, as a Mac's GPU
+  numbers its framebuffers (measured on a MacBook Pro 2019 on macOS 26.7.1:
+  its Radeon Pro 5300M's five framebuffers have `IOAccelIndex` 0 to 4, each
+  its `IOFBDependentIndex`; with `IOAccelIndex` 0 on both, a guest's
+  `system_profiler` listed one display);
 - its aperture and VRAM range in display i's room (`scanoutLimit` per
   display);
 - its commands posted on display 0's control ring under its lock, naming
   display i; the work loop hands display i's `VBLANK` and `DISPLAY_CHANGED` to
   framebuffer i.
-Each display pipe client works on the framebuffer whose index IOPresentment
-associates it with (X3), and the scanout grant (selector 0x108) grants the room
-of the display the surface is drawn for. `DisplayPortCount` is the count where
-the bit was taken (X4). The x86-64 build carries the bit
+The device control (`RgfxDeviceControl`, the AGDC) lists every display's
+framebuffer in its attribute 0x980 and answers 0x925, 0x711 and 0x986 for each
+display by its index (`RgfxAgdcDisplays.hpp`): IOPresentment builds a
+framebuffer's display pipe only where 0x980 lists it, and CoreDisplay shows
+nothing on a framebuffer without one (read from macOS 26.7.1's IOPresentment,
+`ioPresentmentPopulateIOFramebufferEntries`; measured on 26.7.2: with display 0
+alone listed, display 1 stayed black, WindowServer logging "Unable to find
+display pipe for IOFB service"). With one display the control answers as it did
+before (`tests/agdc_displays_test.cpp`). Each display pipe client works on the
+framebuffer whose index IOPresentment associates it with, the framebuffer's
+index in 0x980's list (X3), and the scanout grant (selector 0x108) grants the
+room of the display the surface is drawn for. `DisplayPortCount` is the count
+where the bit was taken (X4). The x86-64 build carries the bit
 (`kRgfxCarriedFeatures`) only once all of this lands, and the arm64e build once
 its own lane lands.
 
@@ -3188,34 +3206,82 @@ viewer shows display 0, the head its screendumps name.
 **Unknowns.** None is guessed: each lane measures its own before it builds on
 it.
 - X1, the pointer. Where macOS 11 to 26 puts the USB tablet's position with
-  two displays: over the box around all its displays, or over its main display
-  alone. Found on mmx86's first boot with two displays: with display 1's window
-  sending known positions, read where the guest puts its cursor
-  (`MOVE_CURSOR`'s display, x and y, logged by the host) beside the displays'
-  arrangement (`system_profiler SPDisplaysDataType`, and the screens' frames
-  from a tool of our own). Over the box, the host maps window i's pointer by
-  display i's place in the guest's arrangement, which it learns from the
-  cursor's moves or from the guest, in a command added to `MULTI_DISPLAY`
-  before any host offers it (an x86-64 IOFramebuffer is told its screen's
-  bounds, `extSetBounds` into its shared memory's `screenBounds` in IOGraphics'
-  public source, to be checked on the guests). Over the main display alone, no
-  mapping on the host reaches display 1, and the pointer needs a pointing
-  service of the kext's own: a lane of its own.
+  two displays. Measured on x86-64 26.7.2 with two displays, display 1 at
+  (1920, 0) of the guest's arrangement (lane mmx86's potluck jobs m3-max-33937
+  and m3-max-33972, on homelab-um790's RX 7900 XTX: QMP's `input-send-event`
+  of the tablet, then a tool of our own reading CoreGraphics' displays and
+  cursor): the tablet's 0 to 32767 is scaled over the display the guest's
+  cursor is on, neither the box around the displays nor the main display
+  alone.
+  - With the cursor on display 0, x 3276, 16384 and 32700 (y 16384) put it at
+    192, 960 and 1916, y 540, of display 0, and no position reached display 1.
+  - With the cursor moved onto display 1 first (`CGWarpMouseCursorPosition`
+    to 2880, 540), x 16384, 8192 (y 8192) and 32700 put it at 2880, 2400
+    (y 270) and 3836, all on display 1.
+
+  So the tablet reaches display i once the cursor is on it, and never carries
+  it across: the pointer needs a crossing that moves the guest's cursor onto
+  display i when window i takes the pointer, after which window i's positions,
+  sent as the tablet's over display i's pixels, land on display i. The host
+  knows which display the cursor is on: the one whose `MOVE_CURSOR` shows it. A
+  relative mouse beside the tablet, pushed over a shared edge, was declined:
+  it depends on the guest's arrangement and its pointer acceleration. The
+  crossing is a lane of its own, after mmx86 ("pointer crossing" below): an
+  event under `MULTI_DISPLAY`, added to the wire before a kext that takes the
+  bit ships, says the pointer is over display i at x, y, and the kext moves
+  the cursor there. Its lead, read from IOHIDFamily's public source:
+  `IOHIDSystem::extSetMouseLocation` (`IOHIDSystem.cpp`, a public virtual of
+  `IOHIDSystem::instance()`, selector 4 of its user client in
+  `IOHIDUserClient.cpp`), which sets the desktop location and calls
+  `_setCursorPosition`. Whether WindowServer on 11 to 26 follows a location
+  set there is that lane's first measurement. mmx86's boot matrix repeated
+  both sweeps on 11.7.11, 12.7.6, 13.7.8, 14.8.9 and 15.8.2, with the same
+  reading on each as on 26.7.2.
 - X2, the second display's connection. Whether macOS 11 to 26 runs two
   displays that both say they are built in (`kIOConnectionBuiltIn`, which
   display 0 says so that its HiDPI start follows its density): booted with
   displays 1 and up built in, then external, reading CoreDisplay's choice of
   default mode and System Settings' names. External would start display 1 at
-  1x below 3800 pixels wide ("The display's density", above).
+  1x below 3800 pixels wide ("The display's density", above). Measured on
+  x86-64 26.7.2 with two displays, each 1920 × 1080 with no window (potluck
+  jobs m3-max-34242, displays 1 and up built in, and m3-max-34261, external;
+  diagnosis builds of the kext): both run the desktop on both displays, each
+  at 1920 × 1080 at 1x and named "Reims Display". With display 1 external,
+  CoreGraphics says it is not built in and `system_profiler` gives it no
+  connection type, where built in it says "Internal". So the arms differ only
+  in the density rule, which built in keeps on every display: the kext says
+  every display is built in. With two displays, both built in, x86-64
+  11.7.11, 12.7.6, 13.7.8, 14.8.9, 15.8.2 and 26.7.2 each ran the desktop on
+  both displays (lane mmx86's boot matrix, m3-max-34283 to m3-max-34294, on an
+  RX 7900 XTX and an RTX 3090).
 - X3, the pipe's index. Which index IOPresentment associates display 1's pipe
   client with (today's kext takes 0 and 0xffffffff), read from the kext's log
-  of each associate on the first boot with two displays.
+  of each associate on the first boot with two displays. Measured on x86-64
+  26.7.2 with two displays (potluck job m3-max-34242, a diagnosis build of the
+  kext logging each associate): WindowServer opens two pipe clients per
+  display, display 0's associating index 0 and display 1's index 1, the
+  framebuffer's index in the device control's 0x980 list. With one display,
+  the same two clients associate index 0 (m3-max-34138). Before 0x980 listed
+  display 1, display 1 had no pipe client at all (m3-max-34102).
 - X4, `DisplayPortCount`. What on x86-64 reads the accelerator's
   `DisplayPortCount`; on arm64 IOMobileFramebuffer.framework reads it only of an
-  AppleParavirtGPU (`ReimsGraphicsMobile.cpp`).
+  AppleParavirtGPU (`ReimsGraphicsMobile.cpp`). Measured on x86-64 26.7.2 with
+  two displays (m3-max-34242, a build logging each property a process reads of
+  the accelerator by its key): no process read it. The trace does not see a
+  read of every property at once, nor the kernel's. A Mac's GPU has none: the
+  Radeon Pro 5300M's accelerator on a MacBook Pro 2019 (macOS 26.7.1) has no
+  `DisplayPortCount` (measured). The kext states the count all the same, as
+  arm64 needs it.
 - X5, WindowServer's reserve. WindowServer's peak blocks at four displays of
   3840 × 2160 against the reserve's 160 MiB and 4096 entries, from the kext's
-  log of its peak ("WindowServer's reserve", above).
+  log of its peak ("WindowServer's reserve", above). Measured on x86-64 26.6.1
+  with four displays, each a window on an RTX 5080 Laptop host's screen at
+  1.9x and run at 3840 × 2160 HiDPI at 120 Hz (potluck job m3-max-34342, a
+  diagnosis build of the kext keeping its log): at login WindowServer's blocks
+  came to 20360 KiB at most, in 30 blocks; with five apps opened they stayed at
+  that most and came to 460 blocks, the table holding 535 entries. With one
+  display of 1920 × 1080 (26.7.2, m3-max-34242) they came to 18284 KiB at most.
+  The reserve holds four displays with room to spare, so it stays as it is.
 - A1, the arm64 display nodes. Ambrosia adds one node, `Graphics` >
   `DisplayNode` (a string; Ambrosia's docs/configuration.md), and a
   process waits up to 30 seconds for a service for each node it counted, so
@@ -3243,6 +3309,7 @@ it.
 | mmhost | the device crate (each display's state, rooms, mode sizing, events by the bit, the offer), `reims-vgpu` (each display's screen, window, presents, colour, read-back and cursor), the C API, its header and docs/api.md, `vendor/qemu` (`displays`, a console and window per display), features.md's new entries, docs/qemu.md, and the pointer's host side once X1 is settled | this design | `cargo xtask check` (the Mac's and Linux's); QEMU built, realized paused (`-S`) at `displays` 1 and 4, refused at 0 and 5; boots of x86-64 26.7 at `displays` 1 (the feature words unchanged) and 2 with today's kexts (display 0 as before, display 1's window black); features.md's entries for several windows walked on a Linux host |
 | mmx86 | `guest/kext`: the owner's code per display shared by both architectures (the display table, events by display, the cursor slot's lock), the x86-64 framebuffers per display, X1 to X5 and the guest side of the pointer; both prebuilt sets | mmhost, for its boots | `make -C guest test`; `make -C guest prebuilt` and `prebuilt-arm64e` committed; boots of x86-64 11.7, 12.7, 13.7, 14.8, 15.8 and 26.7 at `displays` 2 and 1 |
 | mma64 | the arm64e framebuffers per display (`ReimsGraphicsMobile.cpp`), `firmware/ambrosia`'s nodes, A1 to A3 | mmhost; mmx86's shared code; Ambrosia's nodes (A1) | `make -C guest test`; `make -C guest prebuilt` and `prebuilt-arm64e` committed (each set's record lists every kext source); `make -C firmware/ambrosia bundle` and `config-bundle`; boots of arm64 14, 15 and 26 under TCG and 27 under HVF on the M3 at `displays` 2 and 1 |
+| pointer crossing | the event that says the pointer is over display i at x, y (`wire.rs`, the host's side in the window and the library, with the ROM's and both sets' records), and the x86-64 kext's move of the cursor onto display i (X1) | mmx86 | as mmhost's and mmx86's, for what it touches; boots at `displays` 2 where a pointer over each window moves the guest's cursor on that window's display |
 | mmctl | `crates/reims-ctl`: the setting, the QEMU command, the terminal UI and the command line | mmhost's `displays` landed, and the pointer reaching display 1 (X1) | `cargo test`, `cargo fmt --check` and `cargo clippy --all-targets` in it; an install and a boot at `displays` 2 on a Linux host |
 
 mmhost, mmctl and the reading for X2 to X5, A1 and A2 start at once; mmx86
