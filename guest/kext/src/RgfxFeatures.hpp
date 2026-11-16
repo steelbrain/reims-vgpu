@@ -216,7 +216,7 @@ inline uint64_t rgfxDriverFeatures(uint64_t offered, uint32_t mobileNodes = RGFX
 {
 	uint64_t carried = kRgfxCarriedFeatures;
 	if (RGFX_GUEST_ARM64 && mobileNodes < 2)
-		carried &= ~RGFX_FEATURE_MULTI_DISPLAY;
+		carried &= ~static_cast<uint64_t>(RGFX_FEATURE_MULTI_DISPLAY);
 	return offered & carried;
 }
 
