@@ -243,14 +243,18 @@ pub(crate) fn dispatches(tag: u16) -> bool {
     )
 }
 
-/// The bindings at `first` on of the `recs` a resolve of each, `resolve`, names: an object whose
-/// create the host refused is nil, and marks its slot of `bound` in `marks` ([`refused`]).
+/// The bindings at `first` on of the `recs` a resolve of each, `resolve`, names, pushed onto
+/// `named`: an object whose create the host refused is nil, and marks its slot of `bound` in
+/// `marks` ([`refused`]). The caller's list is filled where it lies, so no `?` copies it: a
+/// [`Listed`] handed back in a `RaiseResult` is copied whole (16 entries and its length) through
+/// the `?` at each bind, measured at 0.4% of the dispatch cost test's decoder thread (780M) and
+/// 0.8% of the walks' samples in an XTX Geekbench 7.1.0 timed pass.
 fn bind_each<'a, R: FromBytes + Immutable, T>(
     recs: &Tail<'_, R>,
     (marks, bound, first): (&Marks, Bound, u64),
+    named: &mut Listed<Option<&'a T>>,
     resolve: impl Fn(&R) -> RaiseResult<Option<&'a T>>,
-) -> RaiseResult<Listed<Option<&'a T>>> {
-    let mut named = Listed::new(recs.len());
+) -> RaiseResult<()> {
     for (i, r) in (0u64..).zip(recs.iter()) {
         named.push(refused::bind!(
             marks,
@@ -258,7 +262,7 @@ fn bind_each<'a, R: FromBytes + Immutable, T>(
             resolve(&r)
         ));
     }
-    Ok(named)
+    Ok(())
 }
 
 /// The objects compute op `tag` names, read from its body `payload` with the types [`decode_op`]
@@ -480,10 +484,13 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetBuffers>(),
                 m.length as usize,
             )?;
-            let buffers: Listed<Option<&P::Buffer>> =
-                bind_each(&recs, (marks, Bound::Buffer, m.location), |r| {
-                    objs.get_buffer(r.buffer_obj_id)
-                })?;
+            let mut buffers: Listed<Option<&P::Buffer>> = Listed::new(recs.len());
+            bind_each(
+                &recs,
+                (marks, Bound::Buffer, m.location),
+                &mut buffers,
+                |r| objs.get_buffer(r.buffer_obj_id),
+            )?;
             let offsets = Listed::of(recs.len(), recs.iter().map(|r| r.offset));
             enc.encode(
                 on,
@@ -502,10 +509,13 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetBuffersAttributeStrides>(),
                 m.length as usize,
             )?;
-            let buffers: Listed<Option<&P::Buffer>> =
-                bind_each(&recs, (marks, Bound::Buffer, m.location), |r| {
-                    objs.get_buffer(r.buffer_obj_id)
-                })?;
+            let mut buffers: Listed<Option<&P::Buffer>> = Listed::new(recs.len());
+            bind_each(
+                &recs,
+                (marks, Bound::Buffer, m.location),
+                &mut buffers,
+                |r| objs.get_buffer(r.buffer_obj_id),
+            )?;
             let offsets = Listed::of(recs.len(), recs.iter().map(|r| r.offset));
             let strides = Listed::of(recs.len(), recs.iter().map(|r| r.stride));
             enc.encode(
@@ -556,10 +566,14 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetVisibleFunctionTables>(),
                 m.length as usize,
             )?;
-            let function_tables: Listed<Option<&P::VisibleFunctionTable>> =
-                bind_each(&recs, (marks, Bound::Buffer, m.location), |r| {
-                    objs.get_function_table(r.table_obj_id)
-                })?;
+            let mut function_tables: Listed<Option<&P::VisibleFunctionTable>> =
+                Listed::new(recs.len());
+            bind_each(
+                &recs,
+                (marks, Bound::Buffer, m.location),
+                &mut function_tables,
+                |r| objs.get_function_table(r.table_obj_id),
+            )?;
             enc.encode(
                 on,
                 ComputeCmd::SetVisibleFunctionTables {
@@ -576,10 +590,13 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetTextures>(),
                 m.length as usize,
             )?;
-            let textures: Listed<Option<&P::Texture>> =
-                bind_each(&recs, (marks, Bound::Texture, m.location), |r| {
-                    objs.get_texture(r.texture_obj_id)
-                })?;
+            let mut textures: Listed<Option<&P::Texture>> = Listed::new(recs.len());
+            bind_each(
+                &recs,
+                (marks, Bound::Texture, m.location),
+                &mut textures,
+                |r| objs.get_texture(r.texture_obj_id),
+            )?;
             enc.encode(
                 on,
                 ComputeCmd::SetTextures {
@@ -596,10 +613,13 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetSamplerStates>(),
                 m.length as usize,
             )?;
-            let samplers: Listed<Option<&P::SamplerState>> =
-                bind_each(&recs, (marks, Bound::Sampler, m.location), |r| {
-                    objs.get_sampler(r.sampler_obj_id)
-                })?;
+            let mut samplers: Listed<Option<&P::SamplerState>> = Listed::new(recs.len());
+            bind_each(
+                &recs,
+                (marks, Bound::Sampler, m.location),
+                &mut samplers,
+                |r| objs.get_sampler(r.sampler_obj_id),
+            )?;
             enc.encode(
                 on,
                 ComputeCmd::SetSamplerStates {
@@ -616,10 +636,13 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetSamplerStatesLodClamps>(),
                 m.length as usize,
             )?;
-            let samplers: Listed<Option<&P::SamplerState>> =
-                bind_each(&recs, (marks, Bound::Sampler, m.location), |r| {
-                    objs.get_sampler(r.sampler_obj_id)
-                })?;
+            let mut samplers: Listed<Option<&P::SamplerState>> = Listed::new(recs.len());
+            bind_each(
+                &recs,
+                (marks, Bound::Sampler, m.location),
+                &mut samplers,
+                |r| objs.get_sampler(r.sampler_obj_id),
+            )?;
             let lod_min = Listed::of(
                 recs.len(),
                 recs.iter().map(|r| f32::from_bits(r.lod_min_clamp_bits)),
