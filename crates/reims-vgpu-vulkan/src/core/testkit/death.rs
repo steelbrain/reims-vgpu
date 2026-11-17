@@ -1160,7 +1160,7 @@ impl Report {
     }
 
     /// Guest RAM at guest-physical `pa..pa+len`, inside one range the child shared
-    /// ([`Child::share_ram`]), as the child left it.
+    /// (`Child::share_ram`), as the child left it.
     pub fn ram(&self, pa: u64, len: u64) -> Option<Vec<u8>> {
         let e = self.dir.iter().find(|e| {
             e.kind == DIR_PA
@@ -1184,7 +1184,7 @@ impl Report {
         Some(u64::from_le_bytes(b.try_into().ok()?))
     }
 
-    /// The whole region the child shared under `tag` ([`Child::share_region`]).
+    /// The whole region the child shared under `tag` (`Child::share_region`).
     pub fn region(&self, tag: &str) -> Option<Vec<u8>> {
         let e = self
             .dir
