@@ -47,11 +47,11 @@ pub const COPY_QUEUE: &str = "newCommandQueue (copies)";
 /// under: no selector of Metal's names it.
 pub const PADDING_UNOBSERVED_BUFFER: &str = "newBufferWithLength:options: (padding unobserved)";
 
-/// The name the fake logs and scripts [`GpuDevice::new_dma_buf_buffer_of_length_padding_unobserved`]
+/// The name the fake logs and scripts `GpuDevice::new_dma_buf_buffer_of_length_padding_unobserved`
 /// under: no selector of Metal's names it.
 pub const DMA_BUF_BUFFER: &str = "newBufferWithLength:options: (dma-buf, padding unobserved)";
 
-/// The name the fake logs and scripts [`GpuDevice::new_exportable_buffer_of_length`] under: no
+/// The name the fake logs and scripts `GpuDevice::new_exportable_buffer_of_length` under: no
 /// selector of Metal's names it.
 pub const EXPORTABLE_BUFFER: &str = "newBufferWithLength:options: (exportable)";
 
