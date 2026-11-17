@@ -719,7 +719,12 @@ Stages:
         nonvolatile again (op 6, or op 7), a surface is neither volatile nor
         empty for this. A let-go block's `BLOCK_RELEASE` copies the cache
         into the pages where a buffer wrote it since the last copy, and a
-        lock waits for the answer; the kext releases the device cache, then
+        lock waits for the answer. The host makes the releases' copies one at
+        a time, each once the last has landed and as long again as it held
+        the GPU has passed, or 2 s after its ask at most, so a burst of
+        let-gos leaves the GPU to other work, the host's NVDEC among it,
+        between them (`reims-vgpu`'s `surface_cache.rs`, "Releases' pace").
+        The kext releases the device cache, then
         the surface, then unwires the memory. Where the surface has no
         client left as the release is posted, the release says so
         (`RGFX_BLOCK_RELEASE_NO_CLIENT`), and the host copies all the same,

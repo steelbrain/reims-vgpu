@@ -1539,7 +1539,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                      into, {} not; {} made with their surface's first plane on 256 bytes of \
                      their memory; {} laid out at the GPU's pitch; the GPU's time in the \
                      fills {} ms, in the copies out {} ms; {} MiB held at most, {} blocks of {} \
-                     MiB in place past the caches' budget",
+                     MiB in place past the caches' budget; {} releases' copies waited for their \
+                     turns, {} ms in all, {} ms at most",
                     d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.decode_firsts,
                     d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread,
@@ -1552,7 +1553,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     d.fills_deferred, d.cpu_waits, d.doorbell_free, d.doorbell_waits,
                     d.exportable, d.unexportable, d.dma_buf, d.no_dma_buf, d.aligned,
                     d.repitched, d.fill_gpu_ns / 1_000_000, d.out_gpu_ns / 1_000_000,
-                    d.held_most >> 20, d.past_budget, d.past_budget_bytes >> 20
+                    d.held_most >> 20, d.past_budget, d.past_budget_bytes >> 20, d.paced,
+                    d.paced_us / 1000, d.paced_most_us / 1000
                 );
             }
         }
@@ -2323,8 +2325,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         let worker = Arc::clone(&self.shared.surface_worker);
         let let_go = Box::new(move |cache| worker.drop_later(offset, offset, cache));
         let region = Arc::clone(&self.shared.region);
+        let now: surface_cache::Now = {
+            let platform = Arc::clone(&self.platform);
+            Arc::new(move || platform.clock().now_mono())
+        };
         (self.surface_caches).release(
-            device, offset, flags, region, ran, trace, done, failed, let_go,
+            device, offset, flags, region, ran, trace, done, failed, let_go, now,
         );
     }
 

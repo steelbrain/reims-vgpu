@@ -189,6 +189,20 @@
 //!   finish, and a buffer begun after it that reads what it writes, or writes what it reads,
 //!   waits for it on the GPU, on the cache's own event ([`Caches`]): no begin of a buffer, no
 //!   present and no ring-0 copy waits on the CPU for another queue's walk.
+//! - **Releases' pace.** A release's copy into the pages waits for its turn ([`ReleasePace`]):
+//!   until the last release's copy has landed, and as long again as that copy held the GPU has
+//!   passed, so a burst of releases leaves the GPU to other work between its copies and takes at
+//!   most half its time. A decoder's process lets its output surfaces' blocks go together,
+//!   and the kext lets past its caps go at once those its client still holds (a decode-back
+//!   holding every frame), each with a written cache to copy. Back to back, 61 such copies of
+//!   12.4 MB into the guest's RAM kept an RTX 3090 79 to 100% busy for 400 ms; NVDEC decodes
+//!   of the same guest's session made meanwhile took 60 to 377 ms, against 14 ms at the median,
+//!   and 3 of them answered failed (status 8), where the same stream decoded on NVDEC with no VM
+//!   beside CUDA copies of the same size and rate into host memory failed none (**measured**
+//!   2026-11-16, an x86-64 macOS 26.7.2 guest's VideoToolbox decode-back of a 2160p H.264
+//!   stream, jobs m3-max-38963 and 39112). A release waits [`RELEASE_TURN_MOST`] at most, far
+//!   inside the 10 s the kext waits for its answer; one that copies nothing takes no turn. The
+//!   pages take the same bytes; the answer comes later.
 //! - **The host's own writes.** A device of the host that writes a surface's pages itself (a
 //!   video arm's frame, [`crate::device_writes`]) moves no generation, so each cache's pages
 //!   are watched: a write over them makes the cache's next use fill it whatever its generation,
@@ -526,7 +540,8 @@ struct Landing {
     /// The answers waiting; `None` once it landed.
     waiting: Mutex<Option<Vec<Answer>>>,
     landed: Condvar,
-    /// What its command buffer's completion gave of the copy, for a slow answer's line.
+    /// What its command buffer's completion gave of the copy, for a slow answer's line, and a
+    /// release's pace ([`ReleasePace`]).
     times: Mutex<CopyTimes>,
 }
 
@@ -731,6 +746,285 @@ fn after_landings(mut landings: Vec<Arc<Landing>>, done: Answer) {
     match landings.pop() {
         Some(landing) => landing.then(Box::new(move || after_landings(landings, done))),
         None => done(),
+    }
+}
+
+/// The longest a release waits for its turn ([`ReleasePace`]), from its ask: past it, its copy is
+/// made at once, beside any other. The kext waits 10 s for a release's answer, at a lock of its
+/// surface and at a new block over its pages, before it goes on over pages the copy may not have
+/// reached (`kRgfxWriteBackWaitMs`); the copy itself then still waits for the GPU.
+const RELEASE_TURN_MOST: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What a release carries out on the caches once its turn comes ([`Caches::release`]): with its
+/// turn, where it took one.
+type PacedOp<P> = Box<dyn FnOnce(&mut SurfaceCaches<P>, Option<Turn<P>>) + Send>;
+
+/// The turns of the releases' copies of their caches into their pages (the module doc,
+/// "Releases' pace"). A release whose cache may need copying ([`SurfaceCaches::release_may_copy`])
+/// takes a turn: at once where no release waits, no other's turn is out, and the last release's
+/// copy landed at least as long ago as it held the GPU ([`turn_at`]); else it waits, in the order
+/// asked, and a thread of the pace's own carries it out once its turn comes, or once it waited
+/// [`RELEASE_TURN_MOST`]. A turn is out from its take until its release's copy is committed
+/// ([`Turn::made`]), or the release made none. Times are the platform's monotonic clock's.
+struct ReleasePace<P: Platform> {
+    state: Mutex<PaceState<P>>,
+    moved: Condvar,
+}
+
+/// [`ReleasePace`]'s state.
+struct PaceState<P: Platform> {
+    /// The releases waiting for their turns, in the order asked.
+    waiting: VecDeque<Paced<P>>,
+    /// The turns out.
+    turns: u32,
+    /// The last copy a release made into its pages.
+    last: Option<LastCopy>,
+    /// Whether the pace's thread is carrying out `waiting`.
+    draining: bool,
+}
+
+/// The last copy a release made into its pages, and when it landed, once it has.
+struct LastCopy {
+    copy: Arc<Landing>,
+    landed: Option<MonoTime>,
+}
+
+/// A release waiting for its turn.
+struct Paced<P: Platform> {
+    device: P::Device,
+    block: u64,
+    op: PacedOp<P>,
+    asked: MonoTime,
+    now: Now,
+}
+
+/// When the next release may take its turn ([`turn_at`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnAt {
+    Now,
+    At(MonoTime),
+    /// Once a turn out is given back, or the last copy lands.
+    Later,
+}
+
+/// When the next release may take its turn, at `now`, with `turns` out and `last` the last
+/// release's copy: at once where none is out and no copy was made; else once the copy landed
+/// and as long again as its command buffer held the GPU passed (its GPU times, none where the
+/// platform gave none), so that the releases' copies take at most half the GPU's time.
+fn turn_at(turns: u32, last: Option<&LastCopy>, now: MonoTime) -> TurnAt {
+    if turns > 0 {
+        return TurnAt::Later;
+    }
+    let Some(last) = last else {
+        return TurnAt::Now;
+    };
+    let Some(landed) = last.landed else {
+        return TurnAt::Later;
+    };
+    let held = (last.copy.times.lock().gpu).map_or(0, |(start, end)| end.saturating_sub(start));
+    let at = landed.saturating_add(std::time::Duration::from_nanos(held));
+    if at <= now {
+        TurnAt::Now
+    } else {
+        TurnAt::At(at)
+    }
+}
+
+impl<P: Platform> ReleasePace<P> {
+    fn new() -> Self {
+        ReleasePace {
+            state: Mutex::new(PaceState {
+                waiting: VecDeque::new(),
+                turns: 0,
+                last: None,
+                draining: false,
+            }),
+            moved: Condvar::new(),
+        }
+    }
+
+    /// A turn taken at once, where one may be ([`turn_at`]) and no release waits for its own.
+    fn turn_now(self: &Arc<Self>, now: &Now) -> Option<Turn<P>> {
+        let mut state = self.state.lock();
+        if !state.waiting.is_empty()
+            || turn_at(state.turns, state.last.as_ref(), now()) != TurnAt::Now
+        {
+            return None;
+        }
+        state.turns += 1;
+        Some(Turn {
+            pace: Arc::clone(self),
+            waited: None,
+            now: Arc::clone(now),
+        })
+    }
+
+    /// The release of the block at `block` waits for its turn, `op` carried out on `caches` once
+    /// it comes ([`Caches::after_writers`]): on the pace's thread, started where none runs. Where
+    /// the thread cannot be started, every release waiting is carried out here, as if its turn
+    /// had come.
+    fn wait_turn(
+        caches: &Arc<Caches<P>>,
+        device: &P::Device,
+        block: u64,
+        op: PacedOp<P>,
+        now: Now,
+    ) {
+        let pace = &caches.pace;
+        let mut state = pace.state.lock();
+        state.waiting.push_back(Paced {
+            device: device.clone_ref(),
+            block,
+            op,
+            asked: now(),
+            now,
+        });
+        if state.draining {
+            return;
+        }
+        state.draining = true;
+        drop(state);
+        let spawned = {
+            let caches = Arc::clone(caches);
+            std::thread::Builder::new()
+                .name("reims-vgpu.graphics-release-pace".into())
+                .spawn(move || ReleasePace::drain(&caches))
+        };
+        let Err(error) = spawned else {
+            return;
+        };
+        log::warn!(
+            target: "reims_vgpu::graphics", kind:% = "release-pace";
+            "the releases' pace has no thread ({error}): a release's copy waits for no other's"
+        );
+        let waiting = {
+            let mut state = pace.state.lock();
+            state.draining = false;
+            state.turns += u32::try_from(state.waiting.len()).unwrap_or(u32::MAX);
+            std::mem::take(&mut state.waiting)
+        };
+        for paced in waiting {
+            let Paced {
+                device,
+                block,
+                op,
+                asked,
+                now,
+            } = paced;
+            let turn = Turn {
+                pace: Arc::clone(pace),
+                waited: Some(now().saturating_duration_since(asked)),
+                now,
+            };
+            caches.after_writers(&device, block, Box::new(move |state| op(state, Some(turn))));
+        }
+    }
+
+    /// The pace's thread: carries out each release waiting as its turn comes ([`turn_at`]), or
+    /// once it waited [`RELEASE_TURN_MOST`], until none waits. It looks again at least every
+    /// [`FILL_WAIT_SLICE`], as the clock it times by may not be the one its waits count.
+    fn drain(caches: &Arc<Caches<P>>) {
+        let pace = &caches.pace;
+        loop {
+            let paced = {
+                let mut state = pace.state.lock();
+                loop {
+                    let Some(first) = state.waiting.front() else {
+                        state.draining = false;
+                        return;
+                    };
+                    let now = (first.now)();
+                    let due = first.asked.saturating_add(RELEASE_TURN_MOST);
+                    let until = match turn_at(state.turns, state.last.as_ref(), now) {
+                        TurnAt::Now => break,
+                        _ if now >= due => break,
+                        TurnAt::At(at) => at.min(due),
+                        TurnAt::Later => due,
+                    };
+                    let slice = until.saturating_duration_since(now).min(FILL_WAIT_SLICE);
+                    let _ = pace.moved.wait_for(&mut state, slice);
+                }
+                state.turns += 1;
+                state.waiting.pop_front()
+            };
+            let Some(Paced {
+                device,
+                block,
+                op,
+                asked,
+                now,
+            }) = paced
+            else {
+                continue;
+            };
+            let turn = Turn {
+                pace: Arc::clone(pace),
+                waited: Some(now().saturating_duration_since(asked)),
+                now,
+            };
+            crate::entry::run(|_| {
+                caches.after_writers(&device, block, Box::new(move |state| op(state, Some(turn))));
+            });
+        }
+    }
+
+    /// The release whose turn is out made `copy` into its pages: the next release's turn is
+    /// timed from its landing, on `now`'s clock ([`turn_at`]), which wakes the pace's thread.
+    fn copied(self: &Arc<Self>, copy: Arc<Landing>, now: Now) {
+        let id = Arc::as_ptr(&copy) as usize;
+        self.state.lock().last = Some(LastCopy {
+            copy: Arc::clone(&copy),
+            landed: None,
+        });
+        let pace = Arc::downgrade(self);
+        copy.then(Box::new(move || {
+            let Some(pace) = pace.upgrade() else {
+                return;
+            };
+            let mut state = pace.state.lock();
+            if let Some(last) =
+                (state.last.as_mut()).filter(|last| Arc::as_ptr(&last.copy) as usize == id)
+            {
+                last.landed = Some(now());
+            }
+            drop(state);
+            pace.moved.notify_all();
+        }));
+    }
+}
+
+/// A release's turn ([`ReleasePace`]), out until its release's copy is committed: given back as
+/// it is dropped.
+struct Turn<P: Platform> {
+    pace: Arc<ReleasePace<P>>,
+    /// How long its release waited for it; `None` where it was taken at once.
+    waited: Option<std::time::Duration>,
+    now: Now,
+}
+
+impl<P: Platform> Turn<P> {
+    /// The release of the block at `block` was carried out on `caches`, making `copy` into its
+    /// pages where it made one: counted where it waited for its turn, which is given back.
+    fn made(self, caches: &mut SurfaceCaches<P>, block: u64, copy: Option<Arc<Landing>>) {
+        if let Some(waited) = self.waited {
+            let waited_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX);
+            caches.counts.paced += 1;
+            caches.counts.paced_us += waited_us;
+            caches.counts.paced_most_us = caches.counts.paced_most_us.max(waited_us);
+            reims_vgpu_vulkan::core::trace::event("relpaced", &[block, waited_us]);
+        }
+        if let Some(copy) = copy {
+            self.pace.copied(copy, Arc::clone(&self.now));
+        }
+    }
+}
+
+impl<P: Platform> Drop for Turn<P> {
+    fn drop(&mut self) {
+        let mut state = self.pace.state.lock();
+        state.turns = state.turns.saturating_sub(1);
+        drop(state);
+        self.pace.moved.notify_all();
     }
 }
 
@@ -1112,6 +1406,11 @@ pub(crate) struct CacheCounts {
     pub(crate) past_budget: u64,
     pub(crate) past_budget_bytes: u64,
     pub(crate) held_most: u64,
+    /// Releases whose copy into the pages waited for its turn behind another release's
+    /// ([`ReleasePace`]), the microseconds they waited in all, and the most one waited.
+    pub(crate) paced: u64,
+    pub(crate) paced_us: u64,
+    pub(crate) paced_most_us: u64,
 }
 
 /// One cache's pages, host addresses in the guest's RAM, and how many times a device of the host
@@ -1253,6 +1552,9 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// once one did, which every copy between a cache and its home waits for
     /// ([`Self::writes_fence`]).
     fence: Option<P::Fence>,
+    /// The copy into its pages the last release made ([`Self::released`]), until the release's
+    /// turn takes it ([`ReleasePace`]).
+    release_copy: Option<Arc<Landing>>,
 }
 
 /// The command buffers begun and not finished that use one block's cache, by the number each was
@@ -1425,6 +1727,7 @@ impl<P: Platform> SurfaceCaches<P> {
             recoveries: 0,
             unlocked,
             fence: None,
+            release_copy: None,
         }
     }
 
@@ -3304,6 +3607,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 self.counts.retaken += 1;
             }
             self.write_back(device, block, done, trace)?;
+            self.release_copy = self.out_copy(block);
         }
         let gone = self.by_block.remove(&block);
         self.owed.remove(&block);
@@ -3325,6 +3629,22 @@ impl<P: Platform> SurfaceCaches<P> {
     fn out_copy(&self, block: u64) -> Option<Arc<Landing>> {
         let out = self.by_block.get(&block)?.out.as_ref()?;
         (!out.landing.landed()).then(|| Arc::clone(&out.landing))
+    }
+
+    /// Whether a release of the block at `block` asked now may copy its cache into its pages
+    /// ([`Self::released`]), and so waits for its turn ([`ReleasePace`]): its cache lies over
+    /// named pages, and a buffer wrote it since its last copy, or one begun and not finished, or a
+    /// copy deferred behind one, may still. Not one the kext flags unheld whose header counts no
+    /// client (`unheld`), which drops the cache uncopied. A release that copies nothing all the
+    /// same (a device of the host wrote the pages, or the CPU's generation moved) gives its turn
+    /// back at once.
+    fn release_may_copy(&self, block: u64, unheld: bool) -> bool {
+        let Some(cache) = self.by_block.get(&block) else {
+            return false;
+        };
+        !unheld
+            && cache.pages.is_some()
+            && (cache.written || self.pending(block, true) > 0 || self.deferring(block))
     }
 
     /// Notes a copy into the pages of host addresses `runs` asked and not yet landed, letting go of
@@ -3715,6 +4035,8 @@ pub(crate) struct Caches<P: Platform> {
     state: Mutex<SurfaceCaches<P>>,
     /// What a begin reads of `state` without its lock ([`Self::before_answering`]).
     unlocked: Arc<Unlocked>,
+    /// The turns of the releases' copies into their pages ([`ReleasePace`]).
+    pace: Arc<ReleasePace<P>>,
     moved: Condvar,
     /// What each fill tells as it finishes ([`Self::on_fill_done`]).
     on_fill_done: Arc<OnceLock<FillHook>>,
@@ -4015,6 +4337,7 @@ impl<P: Platform> Caches<P> {
                 Arc::clone(&unlocked),
             )),
             unlocked,
+            pace: Arc::new(ReleasePace::new()),
             moved: Condvar::new(),
             on_fill_done,
             homes: AtomicBool::new(false),
@@ -4654,10 +4977,12 @@ impl<P: Platform> Caches<P> {
     /// ([`Self::after_writers`]), `ran` as it is carried out then: `done` once the pages hold the
     /// cache, or `failed` where the platform raised at the copy, and the cache handed to
     /// `let_go`, which lets go of it on a thread of its own, with no lock of the caches' held.
-    /// Nothing names the block until it is answered: the kext gives it out again only then.
-    #[allow(clippy::too_many_arguments)] // the release, its answers, and what the copy reads
+    /// A release that may copy its cache waits for its turn first ([`ReleasePace`]), timed by
+    /// `now`, the platform's monotonic clock. Nothing names the block until it is answered: the
+    /// kext gives it out again only then.
+    #[allow(clippy::too_many_arguments)] // the release, its answers, what the copy reads, a clock
     pub(crate) fn release(
-        &self,
+        self: &Arc<Self>,
         device: &P::Device,
         block: u64,
         flags: u32,
@@ -4667,12 +4992,17 @@ impl<P: Platform> Caches<P> {
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
         let_go: Box<dyn FnOnce(SurfaceCache<P>) + Send>,
+        now: Now,
     ) {
         let on = device.clone_ref();
+        let unheld =
+            flags & RGFX_BLOCK_RELEASE_UNHELD != 0 && surface_clients(&region, block) == Some(0);
         // Its copy into the pages lands with its answer, which a `SURFACE_PAGES` over the same
-        // pages waits for from here, while the copy waits for the buffers that write the cache.
-        let (done, failed) = {
+        // pages waits for from here, while the copy waits for the buffers that write the cache,
+        // and for its turn.
+        let (done, failed, may_copy) = {
             let mut state = self.state.lock();
+            let may_copy = state.release_may_copy(block, unheld);
             let runs = (state.by_block.contains_key(&block))
                 .then(|| (state.watched.0.lock().get(&block)).map(|p| p.runs.clone()))
                 .flatten();
@@ -4689,28 +5019,39 @@ impl<P: Platform> Caches<P> {
                         landing.land();
                         failed(raise);
                     });
-                    (done, failed)
+                    (done, failed, may_copy)
                 }
-                None => (done, failed),
+                None => (done, failed, may_copy),
             }
         };
-        self.after_writers(
-            device,
-            block,
-            Box::new(move |state| {
-                ran();
-                let device = on;
-                let cpu = cpu_generation(&region, block);
-                let clients = surface_clients(&region, block);
-                match refusing(|| {
-                    state.released(&device, block, flags, cpu, clients, done, Some(&trace))
-                }) {
-                    Ok(Some(cache)) => let_go(cache),
-                    Ok(None) => {}
-                    Err(raise) => failed(raise),
-                }
-            }),
-        );
+        let op: PacedOp<P> = Box::new(move |state, turn| {
+            ran();
+            let device = on;
+            let cpu = cpu_generation(&region, block);
+            let clients = surface_clients(&region, block);
+            let released = refusing(|| {
+                state.released(&device, block, flags, cpu, clients, done, Some(&trace))
+            });
+            let copy = state.release_copy.take();
+            if let Some(turn) = turn {
+                turn.made(state, block, copy);
+            }
+            match released {
+                Ok(Some(cache)) => let_go(cache),
+                Ok(None) => {}
+                Err(raise) => failed(raise),
+            }
+        });
+        if !may_copy {
+            self.after_writers(device, block, Box::new(move |state| op(state, None)));
+            return;
+        }
+        match self.pace.turn_now(&now) {
+            Some(turn) => {
+                self.after_writers(device, block, Box::new(move |state| op(state, Some(turn))));
+            }
+            None => ReleasePace::wait_turn(self, device, block, op, now),
+        }
     }
 
     /// Runs `op` on the caches once every command buffer begun and not finished that may write
@@ -6740,6 +7081,132 @@ mod tests {
             "a written cache never named: dropped uncopied"
         );
         assert_eq!(counts.unheld_bytes, 2 * page);
+    }
+
+    /// Polls `done` for up to 5 s of the host's time: what the releases' pace's thread does.
+    fn eventually(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..2500 {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        done()
+    }
+
+    /// A burst of releases of written caches (a decoder's process letting its output surfaces'
+    /// blocks go together, past the kext's caps) copies them into their pages one at a time
+    /// ([`ReleasePace`]): a release asked while another's copy is in flight makes its own only
+    /// once that one landed, on the pace's thread, and is answered once its own lands, counted
+    /// as paced. A release that copies nothing takes no turn, and is answered at once. Made back
+    /// to back, 61 such copies of 12.4 MB kept an RTX 3090 busy for 400 ms, and NVDEC failed
+    /// decodes of another session meanwhile
+    #[test]
+    fn a_burst_of_releases_copies_one_at_a_time() {
+        let mut r = cached();
+        let page = r.page;
+        let (other, unwritten) = (BLOCK + 0x10000, BLOCK + 0x20000);
+        assert_eq!(r.pages_cached(other, &[(4, 1)], page, true), RGFX_STATUS_OK);
+        assert_eq!(
+            r.pages_cached(unwritten, &[(6, 1)], page, true),
+            RGFX_STATUS_OK
+        );
+        let uses = [(BLOCK, 0, true), (other, 0, true), (unwritten, 0, false)];
+        use_surfaces(&mut r, 1, 0x101, &uses);
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let mark = r.p.call_log().mark();
+        let first = release(&r, BLOCK);
+        assert_eq!(
+            copies(&r.p.call_log().since(mark)).len(),
+            1,
+            "no other release's copy in flight: copied at once"
+        );
+        let mark = r.p.call_log().mark();
+        let second = release(&r, other);
+        let third = release(&r, unwritten);
+        assert!(
+            third.load(Ordering::SeqCst),
+            "nothing to copy: answered at once, behind no turn"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "the second's copy waits for the first's"
+        );
+        assert!(!second.load(Ordering::SeqCst));
+
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(first.load(Ordering::SeqCst));
+        assert!(
+            eventually(|| copies(&r.p.call_log().since(mark)).len() == 1),
+            "the second copies once the first landed"
+        );
+        assert!(!second.load(Ordering::SeqCst), "answered as its copy lands");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(second.load(Ordering::SeqCst));
+        let counts = r.dec.caches().counts();
+        assert_eq!((counts.downloads, counts.paced), (2, 1));
+        assert_eq!(r.dec.caches().len(), 0, "each cache goes with its block");
+    }
+
+    /// A release waits for its turn at most [`RELEASE_TURN_MOST`] of the platform's clock: past
+    /// it, its copy is made beside the one in flight, so its answer comes well within the 10 s
+    /// the kext waits for it at a lock of its surface before reading pages the copy may not have
+    /// reached
+    #[test]
+    fn a_release_waits_for_its_turn_at_most_its_bound() {
+        let mut r = cached();
+        let page = r.page;
+        let other = BLOCK + 0x10000;
+        assert_eq!(r.pages_cached(other, &[(4, 1)], page, true), RGFX_STATUS_OK);
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, true), (other, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let first = release(&r, BLOCK);
+        let mark = r.p.call_log().mark();
+        let second = release(&r, other);
+        let short = RELEASE_TURN_MOST - std::time::Duration::from_millis(1);
+        r.p.virtual_clock().advance(short);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "within its bound: waits for the first's copy"
+        );
+        r.p.virtual_clock()
+            .advance(std::time::Duration::from_millis(1));
+        assert!(
+            eventually(|| copies(&r.p.call_log().since(mark)).len() == 1),
+            "past it: copied with the first's still in flight"
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(first.load(Ordering::SeqCst) && second.load(Ordering::SeqCst));
+    }
+
+    /// A release's turn comes once no other's is out and the last release's copy landed as long
+    /// ago as its command buffer held the GPU, so the releases' copies take at most half the
+    /// GPU's time: at once where no copy was made, or the platform gave no GPU times
+    #[test]
+    fn a_release_turn_comes_its_copy_s_gpu_time_after_the_last_landed() {
+        use std::time::Duration;
+        let at = MonoTime::from_nanos;
+        assert_eq!(turn_at(0, None, at(5)), TurnAt::Now);
+        assert_eq!(turn_at(1, None, at(5)), TurnAt::Later, "a turn out");
+        let copy = Landing::new();
+        copy.land_timed(Some((1_000_000, 9_000_000)), Duration::ZERO);
+        let mut last = LastCopy { copy, landed: None };
+        assert_eq!(turn_at(0, Some(&last), at(5)), TurnAt::Later, "in flight");
+        last.landed = Some(at(100));
+        let gap = 8_000_000;
+        assert_eq!(turn_at(0, Some(&last), at(100)), TurnAt::At(at(100 + gap)));
+        assert_eq!(turn_at(0, Some(&last), at(100 + gap)), TurnAt::Now);
+        assert_eq!(turn_at(1, Some(&last), at(100 + gap)), TurnAt::Later);
+        let untimed = Landing::new();
+        untimed.land();
+        let last = LastCopy {
+            copy: untimed,
+            landed: Some(at(100)),
+        };
+        assert_eq!(turn_at(0, Some(&last), at(100)), TurnAt::Now);
     }
 
     /// A download asked while the cache's last copy into its pages is still in flight on the
