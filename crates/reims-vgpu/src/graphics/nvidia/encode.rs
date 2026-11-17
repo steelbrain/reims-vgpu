@@ -225,9 +225,9 @@ fn frame_rate_of(settings: &RgfxVideoEncodeSettings) -> (u32, u32) {
 ///
 /// | size, bitrate | P4 | P2 | P1 | the 5300M |
 /// |---|---|---|---|---|
-/// | 3840x2160, 30 Mbit/s | 41-42 fps, 44.95 dB | 45-46 fps, 44.72 dB | 46 fps, 44.73 dB | 72-76 fps, 43.40 dB |
-/// | 2560x1440, 16 Mbit/s | 86-87 fps, 45.77 dB | 96-100 fps, 45.50 dB | | 118-120 fps, 44.42 dB |
-/// | 1920x1080, 6 Mbit/s | 162 fps, 43.61 dB | | 168 fps, 43.44 dB | 177-275 fps, 41.91 dB |
+/// | 3840x2160, 30 Mbit/s | 41-42 fps, 44.95 dB | 45-46 fps, 44.72 dB | 45-47 fps, 44.73 dB | 72-76 fps, 43.40 dB |
+/// | 2560x1440, 16 Mbit/s | 86-87 fps, 45.77 dB | 96-100 fps, 45.50 dB | 97-103 fps, 45.50 dB | 118-120 fps, 44.42 dB |
+/// | 1920x1080, 6 Mbit/s | 162 fps, 43.61 dB | | 155-175 fps, 43.44 dB | 177-275 fps, 41.91 dB |
 ///
 /// P1 is the fastest and still beats the Mac's quality by 1.3 to 1.5 dB, so the middle quality
 /// takes it. NVENC's own single-frame time at P1 for 4K is about 15 ms, above the Mac's whole
