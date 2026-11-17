@@ -119,6 +119,17 @@ WINDOWS=0 USER_HOME=$HOME
 if [[ ${PLATFORM:-} == windows-* ]]; then
   WINDOWS=1 USER_HOME="$(cygpath -u "$USERPROFILE")"
 fi
+# shown PATH: PATH as the user names it, for a message: on Windows in Windows'
+# own form (C:\Users\me\...), which PowerShell and cmd take, where MSYS2's
+# (/c/Users/me/...) is this bash's alone; elsewhere as it is.
+shown() {
+  if [[ $WINDOWS == 1 ]]; then cygpath -w "$1"; else printf '%s' "$1"; fi
+}
+# This script as the messages that send the user back to it name it: on Windows
+# scripts\install.ps1, which runs it in MSYS2's CLANG64 shell (as reims-ctl's
+# messages name it there).
+SELF=$0
+[[ $WINDOWS == 1 ]] && SELF='scripts\install.ps1'
 
 # The XDG directory VAR names, else ~/FALLBACK: ignored unless absolute (as
 # reims-ctl does).
@@ -136,7 +147,7 @@ if [[ $SKIP_QEMU == 1 && $BUILDS_QEMU == 0 ]]; then
   die "--skip-qemu keeps the installed QEMU, and this host has none: reims-ctl makes arm64 VMs here by a restore, which runs no QEMU; run this without --skip-qemu"
 fi
 if [[ $SKIP_QEMU == 1 && ! -x "$DATA/qemu/current/bin/$QEMU_BINARY" ]]; then
-  die "--skip-qemu keeps the installed QEMU, and none is installed ($DATA/qemu/current/bin/$QEMU_BINARY is missing): run this without --skip-qemu, which builds it"
+  die "--skip-qemu keeps the installed QEMU, and none is installed ($(shown "$DATA/qemu/current/bin/$QEMU_BINARY") is missing): run this without --skip-qemu, which builds it"
 fi
 
 # ------------------------------------------------------------------ update
@@ -158,7 +169,7 @@ published() {
 }
 
 if [[ $UPDATE == 1 ]]; then
-  say "Pulling $ROOT"
+  say "Pulling $(shown "$ROOT")"
   if upref=$(git -C "$ROOT" rev-parse --symbolic-full-name '@{u}' 2>/dev/null); then
     # The build writes Cargo.lock again (cargo adds the git sources the
     # committed lock leaves out), and a changed lock stops a pull that changes
@@ -175,18 +186,18 @@ if [[ $UPDATE == 1 ]]; then
       git -C "$ROOT" fetch -q "$remote" "+$merge:$upref" || die "git fetch from $remote failed"
     fi
     if git -C "$ROOT" merge-base --is-ancestor HEAD "$upref"; then
-      git -C "$ROOT" merge -q --ff-only "$upref" || die "the checkout's local changes stop the update: commit or set them aside, then run $0"
+      git -C "$ROOT" merge -q --ff-only "$upref" || die "the checkout's local changes stop the update: commit or set them aside, then run $SELF"
     elif published "$before"; then
       # The checkout's commit is kept on a branch of its own, made once the
       # move has worked; --keep refuses to move over a local change the move
       # would overwrite.
       old=$(git -C "$ROOT" rev-parse HEAD)
-      git -C "$ROOT" reset -q --keep "$upref" || die "the checkout's local changes stop the update: commit or set them aside, then run $0"
+      git -C "$ROOT" reset -q --keep "$upref" || die "the checkout's local changes stop the update: commit or set them aside, then run $SELF"
       backup="$branch-before-update-$(date +%Y%m%d-%H%M%S)"
       git -C "$ROOT" branch "$backup" "$old"
       warn "${upref#refs/remotes/} was force-pushed: the checkout's earlier commit stays on the branch $backup"
     else
-      die "the checkout has commits of its own that ${upref#refs/remotes/} lacks: update it yourself, then run $0"
+      die "the checkout has commits of its own that ${upref#refs/remotes/} lacks: update it yourself, then run $SELF"
     fi
     # bash reads on from the file it opened, which the move replaced: where the
     # move changed this script, the new one runs the update instead, its pull
@@ -240,9 +251,9 @@ fi
 # and SDL3 on a checkout in the profile.
 if [[ $WINDOWS == 1 && $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
   [[ $ROOT != *[[:space:]]* ]] ||
-    die "the checkout's path, $(cygpath -w "$ROOT"), has a space, which QEMU's build and SDL3's refuse: clone the repository into a folder without spaces (install.ps1 -Checkout C:\\reims-vgpu), and run it there"
+    die "the checkout's path, $(shown "$ROOT"), has a space, which QEMU's build and SDL3's refuse: clone the repository into a folder without spaces (install.ps1 -Checkout C:\\reims-vgpu), and run it there"
   [[ ${CARGO_TARGET_DIR:-} != *[[:space:]]* ]] ||
-    die "CARGO_TARGET_DIR, $CARGO_TARGET_DIR, has a space, which SDL3's build refuses: give it a folder without spaces, or unset it"
+    die "CARGO_TARGET_DIR, $(shown "$CARGO_TARGET_DIR"), has a space, which SDL3's build refuses: give it a folder without spaces, or unset it"
 fi
 
 # ------------------------------------------------------------------ dependencies
@@ -460,7 +471,7 @@ if [[ -x "$CARGO_BIN/rustup" ]]; then
 fi
 if ! command -v rustup >/dev/null 2>&1; then
   if command -v cargo >/dev/null 2>&1; then
-    say "$(command -v cargo) is a cargo without rustup: the build needs the toolchain rust-toolchain.toml pins, which rustup installs beside it"
+    say "$(shown "$(command -v cargo)") is a cargo without rustup: the build needs the toolchain rust-toolchain.toml pins, which rustup installs beside it"
   else
     say "Rust is not installed"
   fi
@@ -479,7 +490,7 @@ fi
 # link.exe. RUSTUP_TOOLCHAIN reaches every cargo run below, reims-util's install among them.
 if [[ $WINDOWS == 1 ]]; then
   CHANNEL="$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "$ROOT/rust-toolchain.toml")"
-  [[ -n $CHANNEL ]] || die "$ROOT/rust-toolchain.toml names no channel"
+  [[ -n $CHANNEL ]] || die "$(shown "$ROOT/rust-toolchain.toml") names no channel"
   export RUSTUP_TOOLCHAIN="$CHANNEL-x86_64-pc-windows-gnullvm"
   rustup toolchain install --profile minimal "$RUSTUP_TOOLCHAIN" ||
     die "rustup could not install $RUSTUP_TOOLCHAIN, the toolchain the build runs on Windows"
@@ -514,7 +525,7 @@ if [[ $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
   commondir="$(cd "$ROOT" && cd "$(git rev-parse --git-common-dir)" && pwd)"
   if [[ ! -f "$ROOT/vendor/qemu/configure" ]]; then
     if [[ "$gitdir" != "$commondir" ]]; then
-      die "this is a git worktree, and vendor/qemu is empty: run $0 in the main checkout, or clone vendor/qemu into this worktree yourself"
+      die "this is a git worktree, and vendor/qemu is empty: run $SELF in the main checkout, or clone vendor/qemu into this worktree yourself"
     fi
     say "Fetching QEMU's source (vendor/qemu, without its own submodules)"
     fetch_qemu
@@ -583,7 +594,7 @@ QEMU_BUILDS="$CACHE"
 if [[ $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
   say "Building the library (cargo xtask dist --platform vulkan)"
   (cd "$ROOT" && CARGO_TARGET_DIR="$TARGET" cargo xtask dist --platform vulkan)
-  [[ -f "$DIST/lib/pkgconfig/reims-vgpu.pc" ]] || die "cargo xtask dist wrote no $DIST/lib/pkgconfig/reims-vgpu.pc"
+  [[ -f "$DIST/lib/pkgconfig/reims-vgpu.pc" ]] || die "cargo xtask dist wrote no $(shown "$DIST/lib/pkgconfig/reims-vgpu.pc")"
 
   BUILD="$QEMU_BUILDS/qemu-build-$PLATFORM"
   PC="$DIST/lib/pkgconfig"
@@ -690,7 +701,7 @@ BIN="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin/reims-ctl"
 if [[ $WINDOWS == 1 ]]; then
   BIN="$(cygpath -u "${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$USER_HOME/.cargo}}")/bin/reims-ctl.exe"
 fi
-[[ -x "$BIN" ]] || die "cargo install left no $BIN"
+[[ -x "$BIN" ]] || die "cargo install left no $(shown "$BIN")"
 if [[ $WINDOWS == 1 ]]; then
   # reims-ctl, a Windows program, takes Windows paths; its update runs this
   # script in this bash.
@@ -708,7 +719,7 @@ else
   echo "  reims-ctl            the interactive interface: make arm64 VMs from IPSWs"
 fi
 echo "  reims-ctl help       the same from a shell"
-[[ -z $QEMU_DIR ]] || echo "  QEMU                 $QEMU_DIR"
+[[ -z $QEMU_DIR ]] || echo "  QEMU                 $(shown "$QEMU_DIR")"
 echo
 if [[ $WINDOWS == 1 ]]; then
   # rustup put cargo's bin on the user's PATH, which a new window has.
