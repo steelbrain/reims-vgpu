@@ -441,8 +441,13 @@ impl GraphicsVideo<VulkanPlatform> for Shared {
             RGFX_VIDEO_CODEC_HEVC if video.hevc.is_some() => AnnexBCodec::Hevc,
             _ => return None,
         };
+        let mut annex_b = AnnexBDecoder::new(&video.gpu, annex_b, &video.runtime);
+        // AppleGVA's H.264 path reports no failure (docs/video/bugs.md, D25): a picture NVDEC
+        // failed lands as NVDEC left it, and the pictures after it decode from it, as a Mac's
+        // hardware decoder hands them on, rather than as zeros.
+        annex_b.copy_failed_h264_pictures();
         let decoder = NvdecDecoder {
-            decoder: AnnexBDecoder::new(&video.gpu, annex_b, &video.runtime),
+            decoder: annex_b,
             video: Arc::clone(video),
             declined: Arc::new(AtomicBool::new(false)),
         };
@@ -555,6 +560,41 @@ impl NvdecPicture {
                 "hardware video: {NAME}: a session's pictures are copied by the CPU: {why}"
             );
         }
+    }
+
+    /// Writes the picture into the output's planes: in their device caches, in their pages by
+    /// the GPU, or read back and copied by the CPU.
+    fn land_planes(&self, to: &mut Landing<'_, VulkanPlatform>) -> Result<(), BackendError> {
+        let (luma, chroma) = (to.luma, to.chroma);
+        let sample = u64::try_from(self.picture.bytes_per_sample()).unwrap_or(u64::MAX);
+        if luma.width.checked_mul(sample) != Some(luma.row_bytes) {
+            return Err(format!(
+                "a picture of {sample}-byte samples for a luma plane of {} pixels in {} bytes",
+                luma.width, luma.row_bytes
+            )
+            .into());
+        }
+        let (Ok(width), Ok(height)) = (u32::try_from(luma.width), u32::try_from(luma.height))
+        else {
+            return Err("a plane past 2^32 pixels".into());
+        };
+        if self.write_in_cache((width, height), luma, chroma)? {
+            return Ok(());
+        }
+        if self.write_in_place((width, height), luma, chroma)? {
+            return Ok(());
+        }
+        let read = self.picture.read_back((width, height))?;
+        let source = |plane: &ReadPlane<'_>| SourcePlane {
+            at: plane.bytes.as_ptr(),
+            bytes_per_row: plane.bytes_per_row,
+            row_bytes: plane.bytes_per_row,
+            rows: usize::try_from(plane.rows).unwrap_or(0),
+        };
+        let [luma, chroma] = read.planes();
+        // SAFETY: each plane's rows lie in the decoder's staging memory, packed, which `read`
+        // holds through the copy and which lies apart from the output's planes.
+        unsafe { to.copy_rows(source(&luma), source(&chroma)) }
     }
 
     /// Writes the picture into `luma` and `chroma`'s device caches by a copy within the GPU,
@@ -695,36 +735,15 @@ fn memory_plane<'a>(
 
 impl HostPicture<VulkanPlatform> for NvdecPicture {
     fn land(self: Box<Self>, to: &mut Landing<'_, VulkanPlatform>) -> Result<(), BackendError> {
-        let (luma, chroma) = (to.luma, to.chroma);
-        let sample = u64::try_from(self.picture.bytes_per_sample()).unwrap_or(u64::MAX);
-        if luma.width.checked_mul(sample) != Some(luma.row_bytes) {
-            return Err(format!(
-                "a picture of {sample}-byte samples for a luma plane of {} pixels in {} bytes",
-                luma.width, luma.row_bytes
-            )
-            .into());
+        let landed = self.land_planes(to);
+        if landed.is_ok()
+            && let Some(status) = self.picture.copied_failed()
+        {
+            to.hardware_failed(format!(
+                "NVDEC reports the picture's decode failed (status {status})"
+            ));
         }
-        let (Ok(width), Ok(height)) = (u32::try_from(luma.width), u32::try_from(luma.height))
-        else {
-            return Err("a plane past 2^32 pixels".into());
-        };
-        if self.write_in_cache((width, height), luma, chroma)? {
-            return Ok(());
-        }
-        if self.write_in_place((width, height), luma, chroma)? {
-            return Ok(());
-        }
-        let read = self.picture.read_back((width, height))?;
-        let source = |plane: &ReadPlane<'_>| SourcePlane {
-            at: plane.bytes.as_ptr(),
-            bytes_per_row: plane.bytes_per_row,
-            row_bytes: plane.bytes_per_row,
-            rows: usize::try_from(plane.rows).unwrap_or(0),
-        };
-        let [luma, chroma] = read.planes();
-        // SAFETY: each plane's rows lie in the decoder's staging memory, packed, which `read`
-        // holds through the copy and which lies apart from the output's planes.
-        unsafe { to.copy_rows(source(&luma), source(&chroma)) }
+        landed
     }
 }
 

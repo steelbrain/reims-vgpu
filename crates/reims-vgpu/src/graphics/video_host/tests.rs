@@ -61,6 +61,8 @@ enum Picture {
     Gated(u8, Log, mpsc::Receiver<()>),
     /// A failure to land.
     Fail,
+    /// As `Fill`, of a decode the hardware answered failed.
+    FailedFill(u8, Log),
 }
 
 impl HostPicture<P> for Picture {
@@ -107,6 +109,10 @@ impl HostPicture<P> for Picture {
                 Ok(())
             }
             Picture::Fail => Err("the hardware failed".into()),
+            Picture::FailedFill(n, log) => {
+                to.hardware_failed("status 8".to_owned());
+                fill(to, n, &log)
+            }
         }
     }
 }
@@ -470,6 +476,31 @@ fn a_failed_landing_is_signalled_and_a_refusal_spends_no_value() {
     assert_eq!(next.value, 2);
     assert!(event_of(&s).wait_until_signaled_value(2, 10_000));
     assert!(next.landed.as_deref().is_some_and(|l| !l.failed()));
+}
+
+/// A picture the hardware answered failed that its backend lands all the same lands as any, its
+/// value signalled and its command buffer completing as any landed picture's, and is counted
+/// apart from the pictures that failed to land.
+#[test]
+fn a_picture_the_hardware_failed_lands_as_any_and_is_counted() {
+    let p = FakePlatform::new();
+    let log = Log::default();
+    let s = session(
+        &p,
+        vec![Ok(Some(Picture::FailedFill(7, Arc::clone(&log))))],
+        &log,
+    );
+    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
+    let pages = buffer(&p, 16384, STORAGE_SHARED);
+    let decoded = s
+        .decode(&decode(&bitstream, &[], planes(&pages, &pages, 96)))
+        .unwrap();
+    assert!(event_of(&s).wait_until_signaled_value(1, 10_000));
+    let b = bytes(&pages);
+    assert!(holds(&b, 0, 64, 96, 7) && holds(&b, 8192, 32, 96, 7));
+    assert!(decoded.landed.as_deref().is_some_and(|l| !l.failed()));
+    let counts = s.counts.lock();
+    assert_eq!((counts.failed, counts.landed_failed), (0, 1));
 }
 
 /// A session's end waits for its last picture to land.

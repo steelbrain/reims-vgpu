@@ -22,7 +22,10 @@
 //! - **A picture NVDEC fails** fails its write or read back, as bad data
 //!   ([`Error::DecodeFailed`]), and the decoder then fails each picture
 //!   after it until an I picture (H.264) or an IRAP picture (HEVC) decodes
-//!   (`crate::nvidia::decode`'s `Failures`).
+//!   (`crate::nvidia::decode`'s `Failures`); or, for H.264 where the caller
+//!   asks ([`AnnexBDecoder::copy_failed_h264_pictures`]), is written or read
+//!   back as NVDEC left it, telling its status, and the pictures after it
+//!   decode, as a Mac's hardware decoder hands them on.
 //! - **A picture holds its decode surface** until it drops: the decoder has
 //!   [`AnnexBDecoder::SPARE_PICTURES`] surfaces beyond its references and
 //!   the picture being decoded, and a decode with none free is
@@ -41,7 +44,7 @@ use crate::nvidia::decode::Failures;
 use crate::nvidia::error::Error;
 use crate::nvidia::external::ImportedBuffer;
 use crate::nvidia::nvdec::decoder::{
-    Crop, Destination, InPlace, Memory, Picture, PictureReadBack, SPARE_SURFACES,
+    Crop, Destination, InPlace, Memory, OnFailed, Picture, PictureReadBack, SPARE_SURFACES,
 };
 use crate::nvidia::nvdec::h264::NvdecH264;
 use crate::nvidia::nvdec::hevc::NvdecHevc;
@@ -63,6 +66,9 @@ pub struct AnnexBDecoder {
     failures: Failures,
     /// The id the next sample is decoded with.
     next_id: u64,
+    /// What its H.264 pictures' writes and read backs do with a decode NVDEC
+    /// answers failed ([`Self::copy_failed_h264_pictures`]).
+    h264_failed: OnFailed,
 }
 
 /// The codec crate's decoder of the stream, with NVDEC as its accelerator.
@@ -108,7 +114,25 @@ impl AnnexBDecoder {
             codec,
             failures: Failures::default(),
             next_id: 0,
+            h264_failed: OnFailed::Refuse,
         }
+    }
+
+    /// Has each H.264 picture NVDEC answers failed written or read back as
+    /// NVDEC left it, rather than failed, and the pictures after it decoded as
+    /// any, predicting from it, rather than refused until an I picture: as a
+    /// Mac's hardware decoder hands its client a picture it decoded with an
+    /// error, concealed, its status 0, and decodes on from it (**measured** on
+    /// a MacBook Pro of 2019, macOS 26.7.1, VideoToolbox's hardware decode of
+    /// an H.264 stream of 90 pictures whose 20th, a P picture, was cut to half
+    /// its slice or had 64 bytes of it changed: every picture came back with
+    /// status 0, the 20th and those after it 26.5 to 29.7 dB from the
+    /// undamaged stream's luma and none all zeros, until the IDR picture at
+    /// 45, which came back as the undamaged stream's). Each such picture tells
+    /// its status ([`AnnexBPicture::copied_failed`]). HEVC's pictures are failed
+    /// as before.
+    pub fn copy_failed_h264_pictures(&mut self) {
+        self.h264_failed = OnFailed::Copy;
     }
 
     /// Takes parameter sets (H.264's SPS and PPS, HEVC's VPS, SPS and PPS),
@@ -156,6 +180,10 @@ impl AnnexBDecoder {
         let id = self.next_id;
         self.next_id += 1;
         let failed = self.failures.take();
+        let on_failed = match &self.codec {
+            Codec::H264(_) => self.h264_failed,
+            Codec::Hevc(_) => OnFailed::Refuse,
+        };
         let outputs = match &mut self.codec {
             Codec::H264(decoder) => {
                 if failed {
@@ -205,6 +233,7 @@ impl AnnexBDecoder {
                     height,
                 },
                 failures: self.failures.clone(),
+                on_failed,
             }),
         )
     }
@@ -320,6 +349,9 @@ pub struct AnnexBPicture {
     crop: Crop,
     /// Its decoder's, which a failed decode is noted in.
     failures: Failures,
+    /// Whether its writes and read backs fail a decode NVDEC answers failed, or
+    /// copy it as NVDEC left it ([`AnnexBDecoder::copy_failed_h264_pictures`]).
+    on_failed: OnFailed,
 }
 
 impl AnnexBPicture {
@@ -327,6 +359,15 @@ impl AnnexBPicture {
     /// sample's high bits, as P010's).
     pub fn bytes_per_sample(&self) -> usize {
         self.picture.bytes_per_sample()
+    }
+
+    /// NVDEC's status of its decode, where NVDEC answered it failed and a
+    /// write or read back of it copied it as NVDEC left it
+    /// ([`AnnexBDecoder::copy_failed_h264_pictures`]): 8
+    /// (`cuvidDecodeStatus_Error`) or 9 (`cuvidDecodeStatus_Error_Concealed`).
+    /// Such a picture is not noted as failed, and the pictures after it decode.
+    pub fn copied_failed(&self) -> Option<u32> {
+        self.picture.copied_failed()
     }
 
     /// The stream's crop of it: x, y, width and height in luma samples.
@@ -353,9 +394,10 @@ impl AnnexBPicture {
     /// `luma` and `chroma` by the GPU's copies, each plane's rows alone, as
     /// much as fits: one `cuMemcpy2D` a plane from the mapped picture into
     /// the memory's view, registered with CUDA once per mapping (module
-    /// docs). The outer `Err` is the picture's: a decode NVDEC failed, or
-    /// work not done by its deadline, which keeps `hold` and the
-    /// registrations until the GPU is done. The inner `Err` says why the
+    /// docs). The outer `Err` is the picture's: a decode NVDEC failed (but
+    /// for one copied as NVDEC left it, [`Self::copied_failed`]), or work not
+    /// done by its deadline, which keeps `hold` and the registrations until
+    /// the GPU is done. The inner `Err` says why the
     /// memory could not be written so: a view CUDA does not register, a
     /// plane past its memory, or a copy that failed, after which the planes
     /// may hold part of the picture.
@@ -409,7 +451,14 @@ impl AnnexBPicture {
         // GPU write and nothing else, for as long as `written` (its hold and
         // the registrations) lives.
         let copied = unsafe {
-            (self.picture).write_into(self.crop_at(size), luma, chroma, written, &deadline)
+            (self.picture).write_into(
+                self.crop_at(size),
+                luma,
+                chroma,
+                written,
+                &deadline,
+                self.on_failed,
+            )
         };
         match copied {
             Ok(Ok(())) => Ok(Ok(())),
@@ -472,7 +521,14 @@ impl AnnexBPicture {
         // picture's GPU and mapped in its context, which the caller lets the GPU write and
         // nothing else, for as long as `written` (its hold and the imports) lives.
         let copied = unsafe {
-            (self.picture).write_into(self.crop_at(size), luma, chroma, written, &deadline)
+            (self.picture).write_into(
+                self.crop_at(size),
+                luma,
+                chroma,
+                written,
+                &deadline,
+                self.on_failed,
+            )
         };
         match copied {
             Ok(Ok(())) => Ok(Ok(())),
@@ -486,9 +542,11 @@ impl AnnexBPicture {
     /// CPU to copy. `Err` as [`Self::write_into`]'s outer one.
     pub fn read_back(&self, size: (u32, u32)) -> Result<ReadBack<'_>, Error> {
         let deadline = Deadline::default();
-        (self.picture.read_back(self.crop_at(size), &deadline))
-            .map(ReadBack)
-            .map_err(|error| self.failures.noted(error))
+        (self
+            .picture
+            .read_back(self.crop_at(size), &deadline, self.on_failed))
+        .map(ReadBack)
+        .map_err(|error| self.failures.noted(error))
     }
 }
 

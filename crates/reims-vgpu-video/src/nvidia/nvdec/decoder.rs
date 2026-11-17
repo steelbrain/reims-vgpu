@@ -71,7 +71,7 @@
 use std::any::Any;
 use std::ffi::{c_int, c_ulong, c_ulonglong, c_void};
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::core::runtime::{Answer, Unanswered};
@@ -569,6 +569,7 @@ impl Decoder {
                 inner: Arc::clone(&self.inner),
             }),
             stand_in: false,
+            copied_failed: AtomicU32::new(0),
         })
     }
 
@@ -718,6 +719,20 @@ pub(crate) struct Picture {
     hold: Arc<SurfaceHold>,
     /// Whether it stands in for a lost frame ([`Picture::stand_in`]).
     stand_in: bool,
+    /// NVDEC's status of a decode it answered failed that a copy copied all the same
+    /// ([`OnFailed::Copy`]), 0 for none.
+    copied_failed: AtomicU32,
+}
+
+/// What a copy of a picture does where NVDEC answers its decode failed
+/// (`cuvidDecodeStatus_Error` or `cuvidDecodeStatus_Error_Concealed`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OnFailed {
+    /// The copy fails, as [`Error::DecodeFailed`], and copies nothing.
+    Refuse,
+    /// The picture is copied as NVDEC left its surface, and the status kept
+    /// ([`Picture::copied_failed`]).
+    Copy,
 }
 
 /// A decode surface no new picture may take: its index goes back to the
@@ -876,12 +891,20 @@ impl Picture {
             inner: Arc::clone(&self.inner),
             hold: Arc::clone(&self.hold),
             stand_in: true,
+            copied_failed: AtomicU32::new(0),
         }
     }
 
     /// Whether it stands in for a lost frame.
     pub(crate) fn is_stand_in(&self) -> bool {
         self.stand_in
+    }
+
+    /// NVDEC's status of its decode, where NVDEC answered it failed and a copy
+    /// ([`OnFailed::Copy`]) copied it all the same.
+    pub(crate) fn copied_failed(&self) -> Option<u32> {
+        let status = self.copied_failed.load(Ordering::Acquire);
+        (status != 0).then_some(status)
     }
 
     /// The size it is mapped at.
@@ -905,13 +928,14 @@ impl Picture {
     /// bounded (module docs). What it returns holds the crop for the CPU's
     /// copies alone ([`PictureReadBack::planes`]), and holds the staging
     /// memory until dropped. A decode NVDEC reports as failed is
-    /// [`Error::DecodeFailed`]. Work not done by `deadline` is
-    /// [`Error::Stalled`], and the staging memory, which its copies may
-    /// still write, is kept with it.
+    /// [`Error::DecodeFailed`], or copied as NVDEC left it, as `on_failed`
+    /// says. Work not done by `deadline` is [`Error::Stalled`], and the
+    /// staging memory, which its copies may still write, is kept with it.
     pub(crate) fn read_back(
         &self,
         crop: Crop,
         deadline: &wait::Deadline,
+        on_failed: OnFailed,
     ) -> Result<PictureReadBack<'_>, Error> {
         let inner = &self.inner;
         let mut staging = inner.staging.lock();
@@ -920,7 +944,7 @@ impl Picture {
         // `with_mapped` has waited for the copies, or the memory is kept
         // with them where they are not done by its deadline (below).
         let mapped = unsafe {
-            self.with_mapped(crop, deadline, |mapped| {
+            self.with_mapped(crop, deadline, on_failed, |mapped| {
                 let luma = StagedPlane {
                     offset: 0,
                     row_bytes: mapped.row_bytes[0],
@@ -972,9 +996,10 @@ impl Picture {
     /// picture's GPU (`crate::nvidia::external`), which a copy within the GPU
     /// fills; with no staging and no copy by the CPU either way. The outer
     /// `Err` is the picture's, as [`Self::read_back`]'s: its map, a decode
-    /// NVDEC reports as failed, or work not done by `deadline`, which is
-    /// kept with `written` until the GPU is done. The inner is the copy's,
-    /// after which the destinations may hold part of the picture.
+    /// NVDEC reports as failed where `on_failed` refuses it, or work not done
+    /// by `deadline`, which is kept with `written` until the GPU is done. The
+    /// inner is the copy's, after which the destinations may hold part of the
+    /// picture.
     ///
     /// # Safety
     ///
@@ -991,11 +1016,12 @@ impl Picture {
         chroma: Destination,
         written: Vec<Box<dyn Any + Send>>,
         deadline: &wait::Deadline,
+        on_failed: OnFailed,
     ) -> Result<Result<(), Error>, Error> {
         // SAFETY: the caller's destinations, registered with CUDA, which
         // `written` keeps, as the function's contract says.
         let mapped = unsafe {
-            self.with_mapped(crop, deadline, |mapped| {
+            self.with_mapped(crop, deadline, on_failed, |mapped| {
                 let copies = Copies {
                     planes: mapped.planes(luma, chroma),
                     pageable: false,
@@ -1024,9 +1050,12 @@ impl Picture {
     /// Each wait asks after its work until `deadline`
     /// (module docs): copies into pageable memory are made on the
     /// call thread, and their answer waited for, the rest queued on the
-    /// decoder's stream, and the stream asked after. The outer `Err` is the
-    /// map's, the decode's, the unmap's, or the work's not done by its
-    /// deadline; the inner the copies'.
+    /// decoder's stream, and the stream asked after. A decode NVDEC answered
+    /// failed is the outer `Err` where `on_failed` refuses it ([`after_status`]),
+    /// and is otherwise mapped and copied as any, its status kept
+    /// ([`Self::copied_failed`]). The outer `Err` is the map's, the decode's,
+    /// the unmap's, or the work's not done by its deadline; the inner the
+    /// copies'.
     ///
     /// # Safety
     ///
@@ -1040,6 +1069,7 @@ impl Picture {
         &self,
         crop: Crop,
         deadline: &wait::Deadline,
+        on_failed: OnFailed,
         plan: impl FnOnce(&Mapped) -> (Copies, T),
     ) -> Result<Result<T, Error>, Missed> {
         let inner = &self.inner;
@@ -1062,7 +1092,9 @@ impl Picture {
         let Some(status) = status else {
             return Err(self.stalled(Waiting::Decode, None));
         };
-        check_status(status?)?;
+        if let Some(failed) = after_status(status?, on_failed)? {
+            self.copied_failed.store(failed, Ordering::Release);
+        }
         let mut target = inner.calls.lock();
         inner.check_not_stalled()?;
         let _current = inner.gpu.push()?;
@@ -1162,6 +1194,21 @@ fn check_status(status: Option<ffi::cuvidDecodeStatus>) -> Result<(), Error> {
             )))
         }
         _ => Ok(()),
+    }
+}
+
+/// What a copy does after NVDEC's status of the decode, `status`: goes on with
+/// no failure (`Ok(None)`); goes on with NVDEC's failed status, to copy the
+/// picture as NVDEC left it, where `on_failed` copies (`Ok(Some)`); or fails,
+/// as [`check_status`] does, where it refuses.
+fn after_status(
+    status: Option<ffi::cuvidDecodeStatus>,
+    on_failed: OnFailed,
+) -> Result<Option<u32>, Error> {
+    match (check_status(status), on_failed) {
+        (Ok(()), _) => Ok(None),
+        (Err(_), OnFailed::Copy) => Ok(status),
+        (Err(error), OnFailed::Refuse) => Err(error),
     }
 }
 
@@ -1708,6 +1755,26 @@ pub(crate) mod tests {
         assert_eq!(rows_that_fit(3, 4, 3, 8), 0);
         assert_eq!(rows_that_fit(3, 0, 64, 8), 0);
         assert_eq!(rows_that_fit(0, 4, 64, 8), 0);
+    }
+
+    /// A copy refuses a decode NVDEC answered failed, or goes on with its
+    /// status kept, as it is asked to; any other status goes on as decoded.
+    #[test]
+    fn a_failed_decode_is_refused_or_copied_with_its_status() {
+        for failed in [
+            ffi::cuvidDecodeStatus_Error,
+            ffi::cuvidDecodeStatus_Error_Concealed,
+        ] {
+            let refused = after_status(Some(failed), OnFailed::Refuse);
+            assert!(matches!(refused, Err(Error::DecodeFailed(_))), "{failed}");
+            let copied = after_status(Some(failed), OnFailed::Copy);
+            assert_eq!(copied.ok(), Some(Some(failed)));
+        }
+        for on_failed in [OnFailed::Refuse, OnFailed::Copy] {
+            // Decoded (`cuvidDecodeStatus_Success`, 2), and a codec NVDEC keeps no status for.
+            assert_eq!(after_status(Some(2), on_failed).ok(), Some(None));
+            assert_eq!(after_status(None, on_failed).ok(), Some(None));
+        }
     }
 
     #[test]

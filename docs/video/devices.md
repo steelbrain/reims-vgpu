@@ -149,6 +149,10 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   design.md, "A decode the driver cannot complete is a decode error"); an H.264 picture reaches
   the guest as decoded, as AppleGVA's H.264 decoder reports no failure, so the driver refuses what
   it can tell before a picture, its size, at the create ([bugs.md](bugs.md), D25).
+- **An H.264 picture NVDEC answers failed** lands as NVDEC left it, its command buffer completing
+  as any, and the pictures after it decode from it, as a Mac's hardware decoder hands such a
+  picture on with no error ([nvidia.md](nvidia.md), "An H.264 picture NVDEC failed lands as
+  NVDEC left it").
 - **A picture the stream's random access skips** lands nothing, and its command buffer
   completes as any other.
 

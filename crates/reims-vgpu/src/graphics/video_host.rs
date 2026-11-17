@@ -28,7 +28,10 @@
 //!
 //!   A picture that fails to land is logged and counted, and its value is signalled all the
 //!   same: the command buffer goes on with its output as the landing left it, as a GPU decode's
-//!   error leaves one.
+//!   error leaves one. A picture the hardware answered failed that the backend lands all the
+//!   same, as the hardware left it ([`Landing::hardware_failed`]), is logged and counted apart,
+//!   and lands as any other: a Mac's hardware H.264 decoder hands such a picture on with no
+//!   error (`super::nvidia`).
 //!
 //!   A picture holds the hardware's surface until it has landed, so the session holds no more
 //!   pictures unlanded than the decoder spares ([`HostDecoder::most_unlanded`]): a decode past
@@ -219,6 +222,9 @@ pub(crate) struct Landing<'a, P: Platform> {
     /// Whether the hardware decoded the picture straight into the output's planes
     /// ([`Landing::decoded_there`]).
     decoded: bool,
+    /// What the hardware answered of a decode it failed whose picture lands all the same
+    /// ([`Landing::hardware_failed`]).
+    hardware_failed: Option<String>,
 }
 
 /// Where the planes in a device cache are staged in the staging buffer: each one's first byte.
@@ -233,6 +239,13 @@ impl<P: Platform> Landing<'_, P> {
     /// nothing was copied (`super::vaapi`).
     pub(crate) fn decoded_there(&mut self) {
         self.decoded = true;
+    }
+
+    /// Says that the hardware answered the picture's decode failed, `why`, and that the picture
+    /// lands all the same, as the hardware left it: the session counts and logs it, and signals
+    /// its value as any landed picture's.
+    pub(crate) fn hardware_failed(&mut self, why: String) {
+        self.hardware_failed = Some(why);
     }
 
     /// The host bytes the picture's planes land in: each plane's own in the surface's pages, and,
@@ -668,6 +681,8 @@ struct Counts {
     skipped: u64,
     /// Pictures that failed to land.
     failed: u64,
+    /// Pictures the hardware answered failed that landed as it left them.
+    landed_failed: u64,
 }
 
 /// A video session on a host API ([`HostDecoder`]): its decodes' pictures landed by its landing
@@ -809,14 +824,15 @@ impl<P: Platform> Drop for HostVideoSession<P> {
             .collect::<Vec<_>>();
         log::info!(
             "hardware video: {name}: a session ended after {last} decodes: landed {}; {} skipped, \
-             {} failed",
+             {} failed, {} landed as the hardware failed them",
             if landed.is_empty() {
                 "none".to_owned()
             } else {
                 landed.join(", ")
             },
             counts.skipped,
-            counts.failed
+            counts.failed,
+            counts.landed_failed
         );
     }
 }
@@ -845,8 +861,18 @@ fn land_pictures<P: Platform>(
         } = job;
         match picture.map(|picture| land(picture, &output, &mut stage)) {
             None => counts.lock().skipped += 1,
-            Some(Ok(way)) => {
+            Some(Ok((way, hardware_failed))) => {
                 let mut counts = counts.lock();
+                if let Some(why) = hardware_failed {
+                    counts.landed_failed += 1;
+                    if counts.landed_failed <= FAILURES_LOGGED {
+                        log::warn!(
+                            kind:% = why;
+                            "hardware video: {name}: a picture the hardware failed landed as it \
+                             left it: {why}"
+                        );
+                    }
+                }
                 if let Some(i) = Way::ALL.iter().position(|w| *w == way) {
                     // A session's first of each way; once per process at info (`kind`).
                     if counts.landed[i] == 0 {
@@ -883,12 +909,13 @@ fn land_pictures<P: Platform>(
 }
 
 /// Lands `picture` in `output`, copying its staged planes into their device caches, and answers
-/// how.
+/// how, and what the hardware answered where it failed the decode and the picture landed all the
+/// same ([`Landing::hardware_failed`]).
 fn land<P: Platform>(
     picture: Box<dyn HostPicture<P>>,
     output: &DecodeOutput<P>,
     stage: &mut Stage<P>,
-) -> Result<Way, BackendError> {
+) -> Result<(Way, Option<String>), BackendError> {
     let mut landing = Landing {
         luma: &output.luma,
         chroma: &output.chroma,
@@ -896,6 +923,7 @@ fn land<P: Platform>(
         staged: None,
         by_cpu: false,
         decoded: false,
+        hardware_failed: None,
     };
     picture.land(&mut landing)?;
     let Landing {
@@ -903,6 +931,7 @@ fn land<P: Platform>(
         by_cpu,
         decoded,
         stage,
+        hardware_failed,
         ..
     } = landing;
     let is_staged = staged.is_some_and(|s| s.luma.is_some() || s.chroma.is_some());
@@ -911,9 +940,9 @@ fn land<P: Platform>(
     }
     let cached = output.luma.cached || output.chroma.cached;
     if decoded && cached && !is_staged && !by_cpu {
-        return Ok(Way::Decoded);
+        return Ok((Way::Decoded, hardware_failed));
     }
-    Ok(Way::of(is_staged, cached, by_cpu))
+    Ok((Way::of(is_staged, cached, by_cpu), hardware_failed))
 }
 
 mod encode;
