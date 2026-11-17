@@ -41,6 +41,8 @@
 //!
 //!   Elsewhere, and where CUDA refuses the import or the view (logged once a session with why),
 //!   the picture is read back into the decoder's staging memory and copied by the CPU.
+//! - **An encode's frame** is copied by the GPU into an exportable buffer CUDA imported, which
+//!   NVENC reads, where CUDA imports the device's exportable buffers (`encode`'s module doc).
 //! - **A picture the GPU does not finish** by its deadline fails its landing, and every later
 //!   picture of the decoder; its copy keeps the planes' mappings and CUDA's registrations of them
 //!   until the GPU is done, but not the guest's buffers, so a copy that ends that late may write
@@ -403,8 +405,22 @@ impl GraphicsVideo<VulkanPlatform> for Shared {
         if direction == RGFX_VIDEO_ENCODE {
             let entry = (video.encode.iter()).find(|c| c.codec == codec)?;
             let caps = encode::encode_caps(entry, &video.encoders);
-            let encoder =
-                encode::NvencHostEncoder::new(&video.gpu, codec, &video.encoders, entry, &caps);
+            let filler = match video.imports {
+                Some(_) => Ok(encode::Filler::new(
+                    &video.device,
+                    &video.gpu,
+                    &video.runtime,
+                )),
+                None => Err("CUDA imports no exportable buffer of the device".to_owned()),
+            };
+            let encoder = encode::NvencHostEncoder::new(
+                &video.gpu,
+                codec,
+                &video.encoders,
+                entry,
+                &caps,
+                filler,
+            );
             let session =
                 HostEncodeSession::new(&video.device, codec, ENCODE_NAME, Box::new(encoder))?;
             return Some(Arc::new(session));

@@ -16,6 +16,7 @@ use std::mem::MaybeUninit;
 use std::sync::{Arc, OnceLock};
 
 use crate::nvidia::cuda::Gpu;
+use crate::nvidia::cuda::ffi::CUdeviceptr;
 use crate::nvidia::dl::Library;
 use crate::nvidia::error::Error;
 use crate::nvidia::wait;
@@ -142,7 +143,9 @@ pub(crate) fn check_status(
 ///
 /// It keeps the buffers it makes ([`Session::create_input`] and the
 /// others), which its owner names by [`Buffer`], and destroys each once,
-/// before itself, as the header asks. The driver's handles never leave it:
+/// before itself, as the header asks; so too the device memory it
+/// registers as input ([`Session::register_input`]), unregistered once,
+/// after its last mapping is undone. The driver's handles never leave it:
 /// each call that names a buffer is made here, from the buffer's own
 /// handle, so that no other value reaches the driver as one.
 ///
@@ -166,6 +169,10 @@ pub(crate) struct Session {
     /// The output buffers submitted and not yet locked: what NVENC may
     /// still write, and what it may lock.
     submitted: RefCell<Submitted>,
+    /// The registered inputs mapped for a picture submitted and not yet
+    /// locked: each picture's output buffer, and the mapping, undone once
+    /// the output is locked ([`Session::lock_bitstream`]).
+    mapped: RefCell<Vec<(*mut c_void, *mut c_void)>>,
     /// Its lock thread, started with its first lock; `None` where no thread
     /// starts, or in a session finished on the thread of the session it
     /// was.
@@ -199,15 +206,25 @@ enum BufferKind {
     },
     /// A bitstream buffer (`nvEncCreateBitstreamBuffer`).
     Bitstream,
+    /// Device memory registered as input (`nvEncRegisterResource`), of
+    /// frames of this size and format, rows `pitch` apart.
+    Registered {
+        width: u32,
+        height: u32,
+        format: ffi::NV_ENC_BUFFER_FORMAT,
+        pitch: u32,
+    },
 }
 
 /// What [`Session::encode_picture`] submits.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Submission {
-    /// A frame from an input buffer, uploaded at `pitch`, into a bitstream
-    /// buffer: `index` numbers it (`frameIdx`), `timestamp` comes back with
-    /// its packet, and `idr` makes it an IDR picture with its parameter
-    /// sets before it.
+    /// A frame from an input buffer, uploaded at `pitch`, or from
+    /// registered device memory, at its own pitch (`pitch` unread), mapped
+    /// until the picture's output is locked, into a bitstream buffer:
+    /// `index` numbers it (`frameIdx`), `timestamp` comes back with its
+    /// packet, and `idr` makes it an IDR picture with its parameter sets
+    /// before it.
     Frame {
         input: Buffer,
         output: Buffer,
@@ -261,6 +278,7 @@ impl Session {
             config: None,
             buffers: Vec::new(),
             submitted: RefCell::new(Submitted::default()),
+            mapped: RefCell::new(Vec::new()),
             locks: OnceCell::new(),
             stuck: RefCell::new(None),
         })
@@ -363,6 +381,50 @@ impl Session {
         self.keep("nvEncCreateInputBuffer", input.inputBuffer, kind)
     }
 
+    /// Registers the device memory at `address`, on the session's GPU, as
+    /// an input of `width` by `height` frames in `format`, rows `pitch`
+    /// apart, the chroma's rows after the luma's `height` rows
+    /// (`nvEncRegisterResource`, a CUDA device pointer). The memory must
+    /// hold those rows for as long as the session lives.
+    pub(crate) fn register_input(
+        &mut self,
+        address: CUdeviceptr,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        format: ffi::NV_ENC_BUFFER_FORMAT,
+    ) -> Result<Buffer, Error> {
+        let register = entry!(self.nvenc, nvEncRegisterResource)?;
+        self.check_not_stalled()?;
+        let address = usize::try_from(address)
+            .map_err(|_| Error::Unsupported(format!("a device pointer of {address:#x}")))?;
+        let mut resource = ffi::NV_ENC_REGISTER_RESOURCE::zeroed();
+        resource.version = ffi::NV_ENC_REGISTER_RESOURCE_VER;
+        resource.resourceType = ffi::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
+        resource.width = width;
+        resource.height = height;
+        resource.pitch = pitch;
+        // The header: the device pointer itself, as the resource's handle.
+        resource.resourceToRegister = std::ptr::with_exposed_provenance_mut(address);
+        resource.bufferFormat = format;
+        resource.bufferUsage = ffi::NV_ENC_INPUT_IMAGE;
+        {
+            let _current = self.gpu.push()?;
+            // SAFETY: a live, initialised session; the parameters are live
+            // and versioned, and name the caller's device memory.
+            self.check("nvEncRegisterResource", unsafe {
+                register(self.encoder, &raw mut resource)
+            })?;
+        }
+        let kind = BufferKind::Registered {
+            width,
+            height,
+            format,
+            pitch,
+        };
+        self.keep("nvEncRegisterResource", resource.registeredResource, kind)
+    }
+
     /// Makes a bitstream buffer, of NVENC's own size.
     pub(crate) fn create_bitstream(&mut self) -> Result<Buffer, Error> {
         let create = entry!(self.nvenc, nvEncCreateBitstreamBuffer)?;
@@ -415,6 +477,85 @@ impl Session {
                     },
             }) => Ok((handle, width, height, format)),
             _ => Err(not_for_the_call(input)),
+        }
+    }
+
+    /// What a picture from `input` reads: an input buffer's handle and
+    /// format, at the caller's pitch; or registered memory, mapped with the
+    /// GPU's context current (the caller's), at its own pitch, and the
+    /// mapping, which the caller undoes. Each with the frame's size.
+    fn picture_input(&self, input: Buffer) -> Result<PictureInput, Error> {
+        let Some(&Kept {
+            handle,
+            kind:
+                BufferKind::Registered {
+                    width,
+                    height,
+                    pitch,
+                    ..
+                },
+        }) = self.buffers.get(input.0)
+        else {
+            let (handle, width, height, format) = self.input(input)?;
+            return Ok(PictureInput {
+                handle,
+                format,
+                width,
+                height,
+                pitch: None,
+                mapped: None,
+            });
+        };
+        let map = entry!(self.nvenc, nvEncMapInputResource)?;
+        let mut mapping = ffi::NV_ENC_MAP_INPUT_RESOURCE::zeroed();
+        mapping.version = ffi::NV_ENC_MAP_INPUT_RESOURCE_VER;
+        mapping.registeredResource = handle;
+        // SAFETY: a live session and one of its registered resources; the
+        // parameters are live and versioned.
+        self.check("nvEncMapInputResource", unsafe {
+            map(self.encoder, &raw mut mapping)
+        })?;
+        if mapping.mappedResource.is_null() {
+            return Err(Error::Unsupported(
+                "nvEncMapInputResource gave no input".to_owned(),
+            ));
+        }
+        Ok(PictureInput {
+            handle: mapping.mappedResource,
+            format: mapping.mappedBufferFmt,
+            width,
+            height,
+            pitch: Some(pitch),
+            mapped: Some(mapping.mappedResource),
+        })
+    }
+
+    /// Undoes `mapped`, a mapping of a registered input of the session's,
+    /// with the GPU's context current (the caller's); what fails is
+    /// logged.
+    fn unmap(&self, mapped: *mut c_void) {
+        let Some(unmap) = self.nvenc.api.nvEncUnmapInputResource else {
+            return;
+        };
+        // SAFETY: a live session and one of its mappings, undone once.
+        let status = unsafe { unmap(self.encoder, mapped) };
+        if let Err(e) = self.check("nvEncUnmapInputResource", status) {
+            log::warn!(kind:% = e; "{e}");
+        }
+    }
+
+    /// Undoes the mapping of the input of the picture submitted into
+    /// `output`, if it read registered memory, once its output is locked.
+    fn unmap_for(&self, output: *mut c_void) {
+        let mapped = {
+            let mut mapped = self.mapped.borrow_mut();
+            let at = mapped.iter().position(|&(o, _)| o == output);
+            at.map(|at| mapped.remove(at).1)
+        };
+        let Some(mapped) = mapped else { return };
+        match self.gpu.push() {
+            Ok(_current) => self.unmap(mapped),
+            Err(e) => log::warn!(kind:% = e; "{e}"),
         }
     }
 
@@ -509,8 +650,10 @@ impl Session {
         self.check_not_stalled()?;
         self.submitted.borrow().check_pending(output)?;
         let Lock { status, locked } = self.wait_for_lock(call, output)?;
-        // Made, whatever it answers: a buffer is locked once a submission.
+        // Made, whatever it answers: a buffer is locked once a submission,
+        // and NVENC has done with the picture's input.
         self.submitted.borrow_mut().locked(output);
+        self.unmap_for(output);
         self.check("nvEncLockBitstream", status)?;
         let _current = self.gpu.push()?;
         let guard = Locked::new(self, output, unlock, "nvEncUnlockBitstream");
@@ -589,6 +732,7 @@ impl Session {
                 }
                 Err(e) => log::warn!(kind:% = e; "{e}"),
             }
+            self.unmap_for(output);
         }
     }
 
@@ -599,6 +743,10 @@ impl Session {
     pub(crate) fn encode_picture(&self, submission: Submission) -> Result<NVENCSTATUS, Error> {
         let encode = entry!(self.nvenc, nvEncEncodePicture)?;
         self.check_not_stalled()?;
+        let _current = self.gpu.push()?;
+        // The mapping of a registered input, and the output it is undone
+        // with.
+        let mut mapped = None;
         let mut picture = ffi::NV_ENC_PIC_PARAMS::zeroed();
         picture.version = ffi::NV_ENC_PIC_PARAMS_VER;
         match submission {
@@ -610,15 +758,16 @@ impl Session {
                 timestamp,
                 idr,
             } => {
-                let (input, width, height, format) = self.input(input)?;
                 let output = self.output(output, &[BufferKind::Bitstream])?;
                 self.submitted.borrow().check_free(output)?;
-                picture.inputWidth = width;
-                picture.inputHeight = height;
-                picture.inputPitch = pitch;
-                picture.inputBuffer = input;
+                let input = self.picture_input(input)?;
+                mapped = input.mapped.map(|mapped| (output, mapped));
+                picture.inputWidth = input.width;
+                picture.inputHeight = input.height;
+                picture.inputPitch = input.pitch.unwrap_or(pitch);
+                picture.inputBuffer = input.handle;
                 picture.outputBitstream = output;
-                picture.bufferFmt = format;
+                picture.bufferFmt = input.format;
                 picture.pictureStruct = ffi::NV_ENC_PIC_STRUCT_FRAME;
                 picture.inputTimeStamp = timestamp;
                 // The header: monotonically increasing from 0 where
@@ -632,16 +781,25 @@ impl Session {
             }
             Submission::End => picture.encodePicFlags = ffi::NV_ENC_PIC_FLAG_EOS,
         }
-        let _current = self.gpu.push()?;
         // SAFETY: a live session; the parameters are live and versioned,
-        // and name two of this session's own buffers, not locked, or none
-        // for the end.
+        // and name two of this session's own buffers, not locked, or a
+        // mapping of a registered input of its and one of its buffers, or
+        // none for the end.
         let status = unsafe { encode(self.encoder, &raw mut picture) };
-        if status != ffi::NV_ENC_ERR_NEED_MORE_INPUT {
-            self.check("nvEncEncodePicture", status)?;
+        if status != ffi::NV_ENC_ERR_NEED_MORE_INPUT
+            && let Err(e) = self.check("nvEncEncodePicture", status)
+        {
+            // Not taken: NVENC reads nothing of the input.
+            if let Some((_, mapped)) = mapped {
+                self.unmap(mapped);
+            }
+            return Err(e);
         }
         if !picture.outputBitstream.is_null() {
             self.submitted.borrow_mut().submit(picture.outputBitstream);
+        }
+        if let Some(mapped) = mapped {
+            self.mapped.borrow_mut().push(mapped);
         }
         Ok(status)
     }
@@ -829,12 +987,18 @@ impl Drop for Session {
             .push()
             .inspect_err(|e| log::warn!(kind:% = e; "{e}"));
         let api = &self.nvenc.api;
-        // Its buffers first, as the header asks; none is locked, since each
-        // lock is undone before the call that made it returns.
+        // The mappings of registered inputs still standing, whose pictures
+        // were never locked, then its buffers, as the header asks; none is
+        // locked, since each lock is undone before the call that made it
+        // returns.
+        for (_, mapped) in self.mapped.take() {
+            self.unmap(mapped);
+        }
         for kept in &self.buffers {
             let destroy = match kept.kind {
                 BufferKind::Input { .. } => api.nvEncDestroyInputBuffer,
                 BufferKind::Bitstream => api.nvEncDestroyBitstreamBuffer,
+                BufferKind::Registered { .. } => api.nvEncUnregisterResource,
             };
             let Some(destroy) = destroy else { continue };
             // SAFETY: a buffer of this live session, of the kind this entry
@@ -876,6 +1040,7 @@ impl Session {
             config: self.config.take(),
             buffers: std::mem::take(&mut self.buffers),
             submitted: RefCell::new(submitted),
+            mapped: RefCell::new(self.mapped.take()),
             locks: OnceCell::from(None),
             stuck: RefCell::new(None),
         };
@@ -935,6 +1100,19 @@ impl Submitted {
     fn locked(&mut self, output: *mut c_void) {
         self.0.retain(|&submitted| submitted != output);
     }
+}
+
+/// What a picture reads ([`Session::encode_picture`]): the input NVENC
+/// is given, its format and frame size, its own pitch where it has one,
+/// and the mapping to undo once the picture is locked, for registered
+/// memory.
+struct PictureInput {
+    handle: *mut c_void,
+    format: ffi::NV_ENC_BUFFER_FORMAT,
+    width: u32,
+    height: u32,
+    pitch: Option<u32>,
+    mapped: Option<*mut c_void>,
 }
 
 /// The refusal of `buffer`, of another kind than a call takes.

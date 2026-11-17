@@ -18,11 +18,16 @@
 //!   an IDR picture with its parameter sets; a change of the bitrates, QPs or frame rate goes to
 //!   the encoder from the next frame. `min_qp`, `max_qp` and a change of `quality` alone are not
 //!   taken, as the VA-API arm takes none of them.
-//! - **A frame** ([`NvencFrame`]) is read on the session's encode thread from the source's host
-//!   bytes into NVENC's input buffer and encoded there. NVENC writes the access unit in Annex-B
-//!   form, its parameter sets before each IDR picture (the crate's `repeatSPSPPS`), so it is
-//!   written as it comes. One that does not fit the capacity is not written, and the next frame
-//!   is made an IDR picture.
+//! - **A frame** ([`NvencFrame`]) reaches NVENC on the session's encode thread one of two ways.
+//!   By the runtime device's GPU, where CUDA imports the device's exportable buffers
+//!   (`super::imports_caches`): a copy of the source's planes, where they lie, in the surface's
+//!   pages or its device caches, into memory NVENC registers as input ([`fill`]), so that no CPU
+//!   copies the frame. Else, and where the copy or NVENC's read of it is declined (said once a
+//!   session, with why, at info), from the source's host bytes, which NVENC's input buffer takes
+//!   by the CPU's copy. NVENC encodes the same bytes either way. It writes the access unit in
+//!   Annex-B form, its parameter sets before each IDR picture (the crate's `repeatSPSPPS`), so it
+//!   is written as it comes. One that does not fit the capacity is not written, and the next
+//!   frame is made an IDR picture.
 
 use std::sync::Arc;
 
@@ -37,8 +42,8 @@ use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
 };
 use reims_vgpu_video::nvidia::{
-    EncodeParams, EncodeProfile, EncodeProfileSupport, EncodeRateControl, Gpu, NvencEncoder,
-    PictureType, RawFrame, Tuning,
+    Bitstream, DeviceFrame, EncodeParams, EncodeProfile, EncodeProfileSupport, EncodeRateControl,
+    Gpu, NvencEncoder, PictureType, RawFrame, Tuning,
 };
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::sync::Mutex;
@@ -46,7 +51,11 @@ use reims_vgpu_vulkan::core::sync::Mutex;
 use super::super::video_host::{
     BackendError, EncodeFrame, Encoded, FrameSource, HostEncodedFrame, HostEncoder, SourcePlane,
 };
-use super::{H264_TOP_LEVEL, HEVC_TOP_LEVEL};
+use super::{ENCODE_NAME, H264_TOP_LEVEL, HEVC_TOP_LEVEL};
+use fill::Filled;
+pub(super) use fill::Filler;
+
+mod fill;
 
 /// Ours, as the VA-API arm's: a VBR's peak where the guest sets none, as a share of its
 /// average: 1.05.
@@ -282,9 +291,32 @@ impl State {
     }
 }
 
+/// A session's GPU filler, its frames' to share, or why it has none; and the reasons a frame was
+/// uploaded instead, each said once.
+struct Fills<P: Platform> {
+    filler: Result<Filler<P>, String>,
+    said: Vec<String>,
+}
+
+impl<P: Platform> Fills<P> {
+    /// Says, once a session, and at info once per process (`kind`), why a frame was uploaded by
+    /// the CPU.
+    fn uploaded_because(&mut self, why: String) {
+        if !self.said.contains(&why) {
+            log::info!(
+                kind:% = why;
+                "hardware video: {ENCODE_NAME}: a frame uploaded by the CPU: {why}"
+            );
+            self.said.push(why);
+        }
+    }
+}
+
 /// A session's encoder on NVENC ([`HostEncoder`]).
-pub(super) struct NvencHostEncoder {
+pub(super) struct NvencHostEncoder<P: Platform> {
     state: Arc<Mutex<State>>,
+    /// What writes its frames into memory NVENC reads, on the GPU (module doc).
+    fills: Arc<Mutex<Fills<P>>>,
     /// The profiles NVENC encodes of the codec, which [`HostEncoder::check`] holds settings to.
     profiles: Vec<EncodeProfile>,
     /// The sizes the codec's entry gives.
@@ -294,15 +326,17 @@ pub(super) struct NvencHostEncoder {
     rate_controls: u32,
 }
 
-impl NvencHostEncoder {
+impl<P: Platform> NvencHostEncoder<P> {
     /// An encoder of `codec` on `gpu`, which encodes `supports`, as its entry `entry` and
-    /// `encode` list them.
+    /// `encode` list them, its frames written into memory NVENC reads by `filler` where it is
+    /// given (or why not).
     pub(super) fn new(
         gpu: &Arc<Gpu>,
         codec: u32,
         supports: &[EncodeProfileSupport],
         entry: &RgfxVideoCodecCaps,
         encode: &RgfxVideoEncodeCaps,
+        filler: Result<Filler<P>, String>,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(State {
@@ -311,6 +345,10 @@ impl NvencHostEncoder {
                 encoder: None,
                 settings: None,
                 key_next: false,
+            })),
+            fills: Arc::new(Mutex::new(Fills {
+                filler,
+                said: Vec::new(),
             })),
             profiles: (supports.iter())
                 .map(|s| s.profile)
@@ -323,7 +361,7 @@ impl NvencHostEncoder {
     }
 }
 
-impl<P: Platform> HostEncoder<P> for NvencHostEncoder {
+impl<P: Platform> HostEncoder<P> for NvencHostEncoder<P> {
     fn check(&self, settings: &RgfxVideoEncodeSettings) -> Result<(), BackendError> {
         let codec = self.state.lock().codec;
         let profile = encode_profile(codec, settings.profile)
@@ -360,29 +398,34 @@ impl<P: Platform> HostEncoder<P> for NvencHostEncoder {
     fn encode(&mut self, frame: EncodeFrame) -> Result<Box<dyn HostEncodedFrame<P>>, BackendError> {
         Ok(Box::new(NvencFrame {
             state: Arc::clone(&self.state),
+            fills: Arc::clone(&self.fills),
             frame,
         }))
     }
 }
 
 /// One frame's encode on NVENC, which the session's encode thread finishes (module doc).
-struct NvencFrame {
+struct NvencFrame<P: Platform> {
     state: Arc<Mutex<State>>,
+    fills: Arc<Mutex<Fills<P>>>,
     frame: EncodeFrame,
 }
 
-impl<P: Platform> HostEncodedFrame<P> for NvencFrame {
+impl<P: Platform> HostEncodedFrame<P> for NvencFrame<P> {
     fn finish(
         self: Box<Self>,
         source: &mut FrameSource<'_, P>,
         out: &mut [u8],
     ) -> Result<Encoded, BackendError> {
-        let source = source.host()?;
         let mut state = self.state.lock();
         if let Some(settings) = &self.frame.settings {
             state.apply(settings)?;
         }
         let force_idr = self.frame.force_keyframe || state.key_next;
+        if let Some(packets) = self.filled(&mut state, source, force_idr)? {
+            return finish_packets(&mut state, packets, out);
+        }
+        let source = source.host()?;
         let encoder = state.encoder.as_mut().ok_or("an encode with no settings")?;
         let raw = RawFrame {
             luma: (plane(&source.luma)?, source.luma.bytes_per_row),
@@ -390,40 +433,106 @@ impl<P: Platform> HostEncodedFrame<P> for NvencFrame {
             index: self.frame.frame_index,
             force_idr,
         };
-        let mut packets = encoder.encode(&raw)?;
-        let packet = match (packets.pop(), packets.len()) {
-            (Some(Ok(packet)), 0) => packet,
-            (Some(Err(error)), 0) => return Err(format!("the frame's access unit: {error}").into()),
-            (None, _) => return Err("NVENC gave no access unit for the frame".into()),
-            (Some(_), n) => return Err(format!("NVENC gave {} access units", n + 1).into()),
-        };
-        let keyframe = packet.picture_type == PictureType::Idr;
-        let mut encoded = Encoded {
-            size: packet.data.len() as u64,
-            overflow: false,
-            keyframe,
-            // NVENC writes the parameter sets before each IDR picture (module doc).
-            parameter_sets: keyframe,
-            frame_index: packet.index,
-            picture_type: match packet.picture_type {
-                PictureType::Idr | PictureType::Intra => RGFX_VIDEO_PICTURE_I,
-                PictureType::Predicted | PictureType::NonReferencePredicted => RGFX_VIDEO_PICTURE_P,
-                PictureType::Bidirectional => RGFX_VIDEO_PICTURE_B,
-            },
-        };
-        match out.get_mut(..packet.data.len()) {
-            Some(to) => {
-                to.copy_from_slice(&packet.data);
-                state.key_next = false;
-            }
-            None => {
-                // The frame is in the encoder's references: the next one starts afresh.
-                encoded.overflow = true;
-                state.key_next = true;
-            }
-        }
-        Ok(encoded)
+        let packets = encoder.encode(&raw)?;
+        finish_packets(&mut state, packets, out)
     }
+}
+
+impl<P: Platform> NvencFrame<P> {
+    /// The frame's packets, encoded from `source`'s planes where they lie, copied by the GPU into
+    /// memory NVENC reads (module doc); `None` where the copy or NVENC's read of it was declined,
+    /// nothing encoded, which is said once a session. `Err` where the copy failed once on the
+    /// GPU, or NVENC did not take the frame it read.
+    fn filled(
+        &self,
+        state: &mut State,
+        source: &FrameSource<'_, P>,
+        force_idr: bool,
+    ) -> Result<Option<Vec<Bitstream>>, BackendError> {
+        let mut fills = self.fills.lock();
+        let declined = match &mut fills.filler {
+            Ok(filler) => {
+                let encoder = state.encoder.as_mut().ok_or("an encode with no settings")?;
+                let [luma, chroma] = source.planes();
+                let sample = if encoder.params().profile.bit_depth() > 8 {
+                    2
+                } else {
+                    1
+                };
+                match filler.fill(luma, chroma, source.size(), sample) {
+                    Ok(Filled::Written { input, pitch }) => {
+                        let frame = DeviceFrame {
+                            input: &input,
+                            pitch,
+                            index: self.frame.frame_index,
+                            force_idr,
+                        };
+                        match encoder.encode_device(&frame) {
+                            Ok(packets) => return Ok(Some(packets)),
+                            // NVENC took nothing of the frame: it is uploaded, and so are the
+                            // session's frames from here on.
+                            Err(error) => {
+                                let why = format!("NVENC's read of the GPU's copy: {error}");
+                                fills.filler = Err(why.clone());
+                                why
+                            }
+                        }
+                    }
+                    Ok(Filled::Declined(why)) => format!("the GPU's copy: {why}"),
+                    // The GPU may write the input still: the session's frames are uploaded from
+                    // here on.
+                    Err(error) => {
+                        fills.filler = Err(format!("the GPU's copy failed: {error}"));
+                        return Err(error);
+                    }
+                }
+            }
+            Err(why) => why.clone(),
+        };
+        fills.uploaded_because(declined);
+        Ok(None)
+    }
+}
+
+/// Writes the one access unit of `packets`, the frame's, into `out` where it fits (module doc),
+/// and answers what came of it.
+fn finish_packets(
+    state: &mut State,
+    mut packets: Vec<Bitstream>,
+    out: &mut [u8],
+) -> Result<Encoded, BackendError> {
+    let packet = match (packets.pop(), packets.len()) {
+        (Some(Ok(packet)), 0) => packet,
+        (Some(Err(error)), 0) => return Err(format!("the frame's access unit: {error}").into()),
+        (None, _) => return Err("NVENC gave no access unit for the frame".into()),
+        (Some(_), n) => return Err(format!("NVENC gave {} access units", n + 1).into()),
+    };
+    let keyframe = packet.picture_type == PictureType::Idr;
+    let mut encoded = Encoded {
+        size: packet.data.len() as u64,
+        overflow: false,
+        keyframe,
+        // NVENC writes the parameter sets before each IDR picture (module doc).
+        parameter_sets: keyframe,
+        frame_index: packet.index,
+        picture_type: match packet.picture_type {
+            PictureType::Idr | PictureType::Intra => RGFX_VIDEO_PICTURE_I,
+            PictureType::Predicted | PictureType::NonReferencePredicted => RGFX_VIDEO_PICTURE_P,
+            PictureType::Bidirectional => RGFX_VIDEO_PICTURE_B,
+        },
+    };
+    match out.get_mut(..packet.data.len()) {
+        Some(to) => {
+            to.copy_from_slice(&packet.data);
+            state.key_next = false;
+        }
+        None => {
+            // The frame is in the encoder's references: the next one starts afresh.
+            encoded.overflow = true;
+            state.key_next = true;
+        }
+    }
+    Ok(encoded)
 }
 
 /// The rows of `p` as NVENC's upload reads a plane: from its first row's first byte to its last

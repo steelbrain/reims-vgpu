@@ -1,5 +1,7 @@
 //! Another API's memory imported into CUDA ([`ImportedBuffer`]), for a picture to land in a
-//! device's own memory by one copy within the GPU ([`crate::nvidia::AnnexBPicture::write_into_device`]):
+//! device's own memory by one copy within the GPU ([`crate::nvidia::AnnexBPicture::write_into_device`]),
+//! and for NVENC to read a frame where the device's GPU wrote it
+//! ([`crate::nvidia::NvencEncoder::encode_device`]):
 //! a Vulkan device's buffer whose memory it exported as an opaque file descriptor
 //! (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`), imported with `cuImportExternalMemory` and
 //! mapped whole with `cuExternalMemoryGetMappedBuffer`. The memory is the exporter's GPU's, so
@@ -9,8 +11,10 @@
 //! file descriptor, and closes it where it fails. The mapping is freed (`cuMemFree`) and the
 //! import destroyed as the [`ImportedBuffer`] drops, with its GPU's context pushed. The exporter's
 //! buffer must outlive it: what the GPU writes through an import of freed memory lands nowhere
-//! anyone owns.
+//! anyone owns. An import may hold the exporter's buffer itself ([`ImportedBuffer::holding`]),
+//! which it lets go of only once the import is destroyed.
 
+use std::any::Any;
 use std::os::fd::{IntoRawFd as _, OwnedFd};
 use std::sync::Arc;
 
@@ -30,6 +34,8 @@ pub struct ImportedBuffer {
     address: CUdeviceptr,
     /// Its bytes.
     length: usize,
+    /// What it holds until it is destroyed ([`ImportedBuffer::holding`]).
+    owner: Option<Box<dyn Any + Send + Sync>>,
 }
 
 // SAFETY: the import and the mapping are the driver's handles, which any thread may use with
@@ -117,7 +123,17 @@ impl ImportedBuffer {
             memory,
             address,
             length,
+            owner: None,
         })
+    }
+
+    /// The import, holding `owner`, the exporter's buffer, until the import is destroyed, so
+    /// that the memory outlives every use of the import (module docs). An import that cannot be
+    /// destroyed as it drops (its GPU's context not to be had) never lets go of it.
+    #[must_use]
+    pub fn holding(mut self, owner: Box<dyn Any + Send + Sync>) -> Self {
+        self.owner = Some(owner);
+        self
     }
 
     /// Its bytes.
@@ -144,6 +160,7 @@ impl Drop for ImportedBuffer {
         };
         let Ok(_current) = self.gpu.push() else {
             log::warn!("an imported buffer stays imported: its GPU's context is not to be had");
+            std::mem::forget(self.owner.take());
             return;
         };
         // SAFETY: the mapping `cuExternalMemoryGetMappedBuffer` gave, freed once, as CUDA's

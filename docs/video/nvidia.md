@@ -239,7 +239,13 @@ synchronous mode, the only one on Linux: raw 4:2:0 frames in, NV12 or P010,
 H.264 or HEVC access units out, in decode order.
 
 - **Pictures in and out.** Each frame is copied into an NVENC input buffer
-  and encoded with `frameIdx` counting from 0 in submission order;
+  (`encode`), or read where another API's GPU wrote it, in memory CUDA
+  imported (`encode_device`, a `DeviceFrame`): registered with the session
+  at its pitch on its first frame (`nvEncRegisterResource`, a CUDA device
+  pointer), mapped for each frame (`nvEncMapInputResource`) and unmapped
+  once its output is locked, and unregistered as the session goes, before
+  the import, which holds the exporter's buffer (`ImportedBuffer::holding`).
+  Each is encoded with `frameIdx` counting from 0 in submission order;
   `NV_ENC_ERR_NEED_MORE_INPUT` means nothing yet, and after a success the
   pending output buffers are locked in submission order, each its picture
   in coding order. A flush sends a picture with the end-of-stream flag

@@ -515,6 +515,15 @@ fn nvenc_checks(checks: &mut Checks) {
     layout!(checks, enc::NV_ENC_LOCK_INPUT_BUFFER, "NV_ENC_LOCK_INPUT_BUFFER" {
         version, inputBuffer, bufferDataPtr, pitch, reserved1, reserved2,
     });
+    layout!(checks, enc::NV_ENC_REGISTER_RESOURCE, "NV_ENC_REGISTER_RESOURCE" {
+        version, resourceType, width, height, pitch, subResourceIndex, resourceToRegister,
+        registeredResource, bufferFormat, bufferUsage, pInputFencePoint, chromaOffset,
+        chromaOffsetIn, reserved1, reserved2,
+    });
+    layout!(checks, enc::NV_ENC_MAP_INPUT_RESOURCE, "NV_ENC_MAP_INPUT_RESOURCE" {
+        version, subResourceIndex, inputResource, registeredResource, mappedResource,
+        mappedBufferFmt, reserved1, reserved2,
+    });
     layout!(checks, enc::NV_ENC_SEQUENCE_PARAM_PAYLOAD, "NV_ENC_SEQUENCE_PARAM_PAYLOAD" {
         version, inBufferSize, spsId, ppsId, spsppsBuffer, outSPSPPSPayloadSize, reserved,
         reserved2,
@@ -571,6 +580,14 @@ fn nvenc_checks(checks: &mut Checks) {
             enc::NV_ENC_LOCK_INPUT_BUFFER_VER,
         ),
         (
+            "NV_ENC_REGISTER_RESOURCE_VER",
+            enc::NV_ENC_REGISTER_RESOURCE_VER,
+        ),
+        (
+            "NV_ENC_MAP_INPUT_RESOURCE_VER",
+            enc::NV_ENC_MAP_INPUT_RESOURCE_VER,
+        ),
+        (
             "NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER",
             enc::NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER,
         ),
@@ -609,6 +626,11 @@ fn nvenc_checks(checks: &mut Checks) {
             "NV_ENC_MEMORY_HEAP_AUTOSELECT",
             enc::NV_ENC_MEMORY_HEAP_AUTOSELECT,
         ),
+        (
+            "NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR",
+            enc::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
+        ),
+        ("NV_ENC_INPUT_IMAGE", enc::NV_ENC_INPUT_IMAGE),
         (
             "NV_ENC_TUNING_INFO_HIGH_QUALITY",
             enc::NV_ENC_TUNING_INFO_HIGH_QUALITY,
@@ -738,13 +760,11 @@ fn nvenc_checks(checks: &mut Checks) {
     // The entries taking structs this binding does not declare are passed
     // as `void *` here and never called; their places in the list are
     // checked above. reserved1 is not an entry point.
-    const NOT_CALLED: [&str; 10] = [
+    const NOT_CALLED: [&str; 8] = [
         "reserved1",
         "nvEncGetEncodeStats",
         "nvEncRegisterAsyncEvent",
         "nvEncUnregisterAsyncEvent",
-        "nvEncMapInputResource",
-        "nvEncRegisterResource",
         "nvEncCreateMVBuffer",
         "nvEncRunMotionEstimationOnly",
         "nvEncRestoreEncoderState",

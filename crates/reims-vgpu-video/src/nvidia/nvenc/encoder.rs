@@ -4,7 +4,9 @@
 //! NVENC decides each picture's type (`enablePTD`), writes its own
 //! parameter sets and slice headers, and keeps its own references; this
 //! module configures it from a preset, copies each frame into an input
-//! buffer of NVENC's, and reads each access unit back. A key frame is
+//! buffer of NVENC's, or has NVENC read it where another API's GPU wrote
+//! it, in memory CUDA imported ([`NvencEncoder::encode_device`]), and reads
+//! each access unit back. A key frame is
 //! forced where the caller asks for one; NVENC places the rest by its GOP
 //! length. B pictures are never references here, so a reference is encoded
 //! at most one frame ahead of its display order.
@@ -16,6 +18,7 @@ use super::ffi::{self, GUID, Zeroed};
 use super::{Buffer, Session, Submission};
 use crate::nvidia::cuda::Gpu;
 use crate::nvidia::error::Error;
+use crate::nvidia::external::ImportedBuffer;
 
 /// A profile NVENC is asked to encode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -220,11 +223,41 @@ pub struct RawFrame<'a> {
     pub force_idr: bool,
 }
 
+/// One raw frame in device memory another API's GPU wrote, imported on the
+/// encoder's GPU ([`NvencEncoder::encode_device`]): its luma's rows from
+/// the import's first byte, `pitch` apart, then its chroma's rows, half as
+/// many (rounded up), at the same pitch, at the profile's bit depth.
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceFrame<'a> {
+    /// The memory the frame lies in.
+    pub input: &'a Arc<ImportedBuffer>,
+    /// Bytes from one row to the next: a multiple of 4, as NVENC takes it.
+    pub pitch: u32,
+    /// The caller's index for the frame, given back with its packet; each
+    /// later than the last.
+    pub index: u64,
+    /// Whether it must be an IDR picture.
+    pub force_idr: bool,
+}
+
 /// An input buffer and a bitstream buffer of the session.
 struct Slot {
     input: Buffer,
     output: Buffer,
 }
+
+/// Device memory registered with the session as input
+/// ([`NvencEncoder::encode_device`]), at a pitch, and held while the
+/// session lives.
+struct DeviceInput {
+    import: Arc<ImportedBuffer>,
+    pitch: u32,
+    registered: Buffer,
+}
+
+/// Ours: the most device inputs a session registers. A caller writes its
+/// frames into a few memories in turn.
+const MOST_DEVICE_INPUTS: usize = 8;
 
 /// An NVENC encoder.
 pub struct NvencEncoder {
@@ -240,7 +273,14 @@ pub struct NvencEncoder {
     submitted: u32,
     /// The parameter sets, Annex B, as `nvEncGetSequenceParams` gives them.
     sequence_parameters: Vec<u8>,
+    /// The registered input each slot's pending frame reads, if it is
+    /// device memory.
+    slot_inputs: Vec<Option<Buffer>>,
     session: Session,
+    /// The device memory registered as input. After the session, which
+    /// unregisters it as it drops, so that the imports outlive their
+    /// registrations.
+    device_inputs: Vec<DeviceInput>,
 }
 
 /// Ours: input and bitstream buffers beyond what NVENC holds, so that a
@@ -287,7 +327,9 @@ impl NvencEncoder {
             held: params.b_frames,
             submitted: 0,
             sequence_parameters: Vec::new(),
+            slot_inputs: Vec::new(),
             session,
+            device_inputs: Vec::new(),
         };
         let count = usize::try_from(encoder.held).unwrap_or(0) + 1 + EXTRA_SLOTS;
         for _ in 0..count {
@@ -300,6 +342,7 @@ impl NvencEncoder {
                 output: encoder.session.create_bitstream()?,
             };
             encoder.slots.push(slot);
+            encoder.slot_inputs.push(None);
         }
         encoder.sequence_parameters = encoder
             .session
@@ -329,33 +372,143 @@ impl NvencEncoder {
     /// decode order, each with its own result. `Err` is a frame NVENC did
     /// not take.
     pub fn encode(&mut self, frame: &RawFrame<'_>) -> Result<Vec<Bitstream>, Error> {
-        let slot_index = self.next;
-        if self.pending.contains(&slot_index) {
+        let slot_index = self.free_slot()?;
+        let input = self.slots[slot_index].input;
+        let pitch = self.session.upload(
+            input,
+            frame.luma,
+            frame.chroma,
+            self.row_bytes(),
+            self.rows(),
+        )?;
+        self.submit(slot_index, input, pitch, frame.index, frame.force_idr)
+    }
+
+    /// Encodes one frame NVENC reads where another API's GPU wrote it
+    /// ([`DeviceFrame`]), as [`Self::encode`] encodes one it copies: the
+    /// memory is registered with the session on its first frame at its
+    /// pitch, and mapped for each frame until its packet comes out. The
+    /// caller writes it, and waits for the writes, before the call, and not
+    /// again until the frame's packet came out. `Err` is a frame NVENC did
+    /// not take: memory of another GPU, too short or at a pitch NVENC does
+    /// not take, or still read for a frame not out yet.
+    pub fn encode_device(&mut self, frame: &DeviceFrame<'_>) -> Result<Vec<Bitstream>, Error> {
+        let registered = self.device_input(frame.input, frame.pitch)?;
+        let in_flight =
+            (self.pending.iter()).any(|&slot| self.slot_inputs[slot] == Some(registered));
+        if in_flight {
             return Err(Error::Unsupported(
-                "NVENC holds more frames than it has buffers".to_owned(),
+                "device memory NVENC still reads for a frame not out yet".to_owned(),
             ));
         }
-        let Slot { input, output } = self.slots[slot_index];
+        let slot_index = self.free_slot()?;
+        self.slot_inputs[slot_index] = Some(registered);
+        self.submit(
+            slot_index,
+            registered,
+            frame.pitch,
+            frame.index,
+            frame.force_idr,
+        )
+    }
+
+    /// The bytes of a frame's row: its width in samples of its bit depth.
+    fn row_bytes(&self) -> usize {
         let bytes_per_sample = if self.params.profile.bit_depth() > 8 {
             2
         } else {
             1
         };
-        let row_bytes = usize::try_from(self.params.width)
+        usize::try_from(self.params.width)
             .unwrap_or(0)
-            .saturating_mul(bytes_per_sample);
-        let rows = usize::try_from(self.params.height).unwrap_or(0);
-        let pitch = self
-            .session
-            .upload(input, frame.luma, frame.chroma, row_bytes, rows)?;
+            .saturating_mul(bytes_per_sample)
+    }
+
+    /// A frame's luma rows.
+    fn rows(&self) -> usize {
+        usize::try_from(self.params.height).unwrap_or(0)
+    }
+
+    /// The slot the next frame goes in, where its last frame is out.
+    fn free_slot(&self) -> Result<usize, Error> {
+        if self.pending.contains(&self.next) {
+            return Err(Error::Unsupported(
+                "NVENC holds more frames than it has buffers".to_owned(),
+            ));
+        }
+        Ok(self.next)
+    }
+
+    /// `import`'s registration with the session at `pitch`: the one made
+    /// for an earlier frame, else a new one, where the memory is the
+    /// session's GPU's and holds a frame at that pitch.
+    fn device_input(&mut self, import: &Arc<ImportedBuffer>, pitch: u32) -> Result<Buffer, Error> {
+        let kept = (self.device_inputs.iter())
+            .find(|d| Arc::ptr_eq(&d.import, import) && d.pitch == pitch);
+        if let Some(kept) = kept {
+            return Ok(kept.registered);
+        }
+        if !Arc::ptr_eq(import.gpu(), &self.session.gpu) {
+            return Err(Error::Unsupported(
+                "device memory imported on another GPU than the encoder's".to_owned(),
+            ));
+        }
+        let rows = self.rows();
+        let wide = usize::try_from(pitch).unwrap_or(0);
+        let needed = wide.checked_mul(rows + rows.div_ceil(2));
+        if pitch % 4 != 0 || wide < self.row_bytes() || needed.is_none_or(|n| n > import.length()) {
+            return Err(Error::Unsupported(format!(
+                "device memory of {} bytes for {}x{} frames at a pitch of {pitch}",
+                import.length(),
+                self.params.width,
+                self.params.height
+            )));
+        }
+        if self.device_inputs.len() >= MOST_DEVICE_INPUTS {
+            return Err(Error::Unsupported(format!(
+                "more than {MOST_DEVICE_INPUTS} device memories as NVENC's input"
+            )));
+        }
+        let registered = self.session.register_input(
+            import.address_at(0),
+            self.params.width,
+            self.params.height,
+            pitch,
+            self.params.profile.buffer_format(),
+        )?;
+        self.device_inputs.push(DeviceInput {
+            import: Arc::clone(import),
+            pitch,
+            registered,
+        });
+        Ok(registered)
+    }
+
+    /// Submits the frame in `input` at `pitch` into `slot_index`'s
+    /// bitstream buffer, and reads what comes out ([`Self::encode`]).
+    fn submit(
+        &mut self,
+        slot_index: usize,
+        input: Buffer,
+        pitch: u32,
+        index: u64,
+        force_idr: bool,
+    ) -> Result<Vec<Bitstream>, Error> {
         let status = self.session.encode_picture(Submission::Frame {
             input,
-            output,
+            output: self.slots[slot_index].output,
             pitch,
             index: self.submitted,
-            timestamp: frame.index,
-            idr: frame.force_idr,
-        })?;
+            timestamp: index,
+            idr: force_idr,
+        });
+        let status = match status {
+            Ok(status) => status,
+            Err(e) => {
+                self.slot_inputs[slot_index] = None;
+                return Err(e);
+            }
+        };
         self.submitted = self.submitted.wrapping_add(1);
         self.next = (slot_index + 1) % self.slots.len();
         self.pending.push_back(slot_index);
@@ -383,6 +536,7 @@ impl NvencEncoder {
         while let Some(slot_index) = self.pending.pop_front() {
             let output = self.slots[slot_index].output;
             bitstreams.push(self.read_bitstream(output));
+            self.slot_inputs[slot_index] = None;
         }
         bitstreams
     }

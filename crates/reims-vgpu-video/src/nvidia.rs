@@ -11,7 +11,8 @@
 //! - [`Gpu`] is a GPU and its CUDA context; [`devices`] lists the host's.
 //! - [`decode_capabilities`] and [`encoder_report`] say what NVDEC and
 //!   NVENC answer.
-//! - [`NvencEncoder`] encodes raw frames to H.264 or HEVC.
+//! - [`NvencEncoder`] encodes raw frames to H.264 or HEVC, from host bytes
+//!   or from another API's device memory CUDA imported ([`ImportedBuffer`]).
 //! - [`AnnexBDecoder`] decodes whole Annex B access units, one picture
 //!   each, for a device that says where each picture goes, as the
 //!   reims-graphics device's video does.
@@ -49,8 +50,8 @@ pub use error::Error;
 pub use external::ImportedBuffer;
 pub use nvdec::{ChromaFormat, DecodeCapabilities, NvdecCodec, SurfaceFormat, decode_capabilities};
 pub use nvenc::encoder::{
-    Bitstream, EncodeParams, EncodeProfile, EncodeProfileSupport, EncodeRateControl, NvencEncoder,
-    Packet, PictureType, RawFrame, Tuning, encode_profiles,
+    Bitstream, DeviceFrame, EncodeParams, EncodeProfile, EncodeProfileSupport, EncodeRateControl,
+    NvencEncoder, Packet, PictureType, RawFrame, Tuning, encode_profiles,
 };
 pub use nvenc::max_api_version;
 pub use probe::{EncodeCodecReport, EncoderReport, encoder_report};

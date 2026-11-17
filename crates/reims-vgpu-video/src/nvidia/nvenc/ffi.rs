@@ -1,7 +1,8 @@
 //! NVENC's declarations (`nvEncodeAPI.h`), the subset this crate uses, at
 //! NVENC API 13.1: the function list, sessions on a CUDA context, the codec,
 //! profile and preset GUIDs, caps, the configuration and initialisation,
-//! input and bitstream buffers, pictures, and the sequence parameters.
+//! input and bitstream buffers, CUDA memory registered and mapped as input,
+//! pictures, and the sequence parameters.
 //!
 //! Field names are the header's, so that `crate::nvidia::layout`'s test can check
 //! each size and offset against ffnvcodec's `nvEncodeAPI.h` (13.1.15.0).
@@ -67,6 +68,8 @@ pub(crate) const NV_ENC_PRESET_CONFIG_VER: u32 = struct_version(5) | (1 << 31);
 pub(crate) const NV_ENC_PIC_PARAMS_VER: u32 = struct_version(7) | (1 << 31);
 pub(crate) const NV_ENC_LOCK_BITSTREAM_VER: u32 = struct_version(2) | (1 << 31);
 pub(crate) const NV_ENC_LOCK_INPUT_BUFFER_VER: u32 = struct_version(1);
+pub(crate) const NV_ENC_REGISTER_RESOURCE_VER: u32 = struct_version(5);
+pub(crate) const NV_ENC_MAP_INPUT_RESOURCE_VER: u32 = struct_version(4);
 pub(crate) const NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER: u32 = struct_version(1);
 pub(crate) const NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER: u32 = struct_version(1);
 pub(crate) const NV_ENCODE_API_FUNCTION_LIST_VER: u32 = struct_version(2);
@@ -115,6 +118,11 @@ pub(crate) const NV_ENC_BUFFER_FORMAT_NV12: NV_ENC_BUFFER_FORMAT = 0x1;
 pub(crate) const NV_ENC_BUFFER_FORMAT_YUV420_10BIT: NV_ENC_BUFFER_FORMAT = 0x1_0000;
 
 pub(crate) const NV_ENC_MEMORY_HEAP_AUTOSELECT: NvEncEnum = 0;
+
+/// `NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR`: a CUDA device pointer.
+pub(crate) const NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR: NvEncEnum = 1;
+/// `NV_ENC_INPUT_IMAGE`: a registered resource used as an input picture.
+pub(crate) const NV_ENC_INPUT_IMAGE: NvEncEnum = 0;
 
 pub(crate) const NV_ENC_TUNING_INFO_HIGH_QUALITY: NV_ENC_TUNING_INFO = 1;
 pub(crate) const NV_ENC_TUNING_INFO_LOW_LATENCY: NV_ENC_TUNING_INFO = 2;
@@ -763,6 +771,41 @@ pub(crate) struct NV_ENC_LOCK_INPUT_BUFFER {
     pub(crate) reserved2: [*mut c_void; 64],
 }
 
+/// `NV_ENC_REGISTER_RESOURCE`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NV_ENC_REGISTER_RESOURCE {
+    pub(crate) version: u32,
+    pub(crate) resourceType: NvEncEnum,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pitch: u32,
+    pub(crate) subResourceIndex: u32,
+    pub(crate) resourceToRegister: *mut c_void,
+    pub(crate) registeredResource: *mut c_void,
+    pub(crate) bufferFormat: NV_ENC_BUFFER_FORMAT,
+    pub(crate) bufferUsage: NvEncEnum,
+    pub(crate) pInputFencePoint: *mut c_void,
+    pub(crate) chromaOffset: [u32; 2],
+    pub(crate) chromaOffsetIn: [u32; 2],
+    pub(crate) reserved1: [u32; 244],
+    pub(crate) reserved2: [*mut c_void; 61],
+}
+
+/// `NV_ENC_MAP_INPUT_RESOURCE`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NV_ENC_MAP_INPUT_RESOURCE {
+    pub(crate) version: u32,
+    pub(crate) subResourceIndex: u32,
+    pub(crate) inputResource: *mut c_void,
+    pub(crate) registeredResource: *mut c_void,
+    pub(crate) mappedResource: *mut c_void,
+    pub(crate) mappedBufferFmt: NV_ENC_BUFFER_FORMAT,
+    pub(crate) reserved1: [u32; 251],
+    pub(crate) reserved2: [*mut c_void; 63],
+}
+
 /// `NV_ENC_SEQUENCE_PARAM_PAYLOAD`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -904,13 +947,13 @@ function_list! {
         nvEncGetSequenceParams: fn(Encoder, *mut NV_ENC_SEQUENCE_PARAM_PAYLOAD) -> NVENCSTATUS;
         nvEncRegisterAsyncEvent: fn(Encoder, *mut c_void) -> NVENCSTATUS;
         nvEncUnregisterAsyncEvent: fn(Encoder, *mut c_void) -> NVENCSTATUS;
-        nvEncMapInputResource: fn(Encoder, *mut c_void) -> NVENCSTATUS;
+        nvEncMapInputResource: fn(Encoder, *mut NV_ENC_MAP_INPUT_RESOURCE) -> NVENCSTATUS;
         nvEncUnmapInputResource: fn(Encoder, *mut c_void) -> NVENCSTATUS;
         nvEncDestroyEncoder: fn(Encoder) -> NVENCSTATUS;
         nvEncInvalidateRefFrames: fn(Encoder, u64) -> NVENCSTATUS;
         nvEncOpenEncodeSessionEx: fn(*mut NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, *mut Encoder)
             -> NVENCSTATUS;
-        nvEncRegisterResource: fn(Encoder, *mut c_void) -> NVENCSTATUS;
+        nvEncRegisterResource: fn(Encoder, *mut NV_ENC_REGISTER_RESOURCE) -> NVENCSTATUS;
         nvEncUnregisterResource: fn(Encoder, *mut c_void) -> NVENCSTATUS;
         nvEncReconfigureEncoder: fn(Encoder, *mut NV_ENC_RECONFIGURE_PARAMS) -> NVENCSTATUS;
         reserved1: fn() -> NVENCSTATUS;
@@ -970,6 +1013,10 @@ unsafe impl Zeroed for NV_ENC_LOCK_BITSTREAM {}
 // SAFETY: as above.
 unsafe impl Zeroed for NV_ENC_LOCK_INPUT_BUFFER {}
 // SAFETY: as above.
+unsafe impl Zeroed for NV_ENC_REGISTER_RESOURCE {}
+// SAFETY: as above.
+unsafe impl Zeroed for NV_ENC_MAP_INPUT_RESOURCE {}
+// SAFETY: as above.
 unsafe impl Zeroed for NV_ENC_SEQUENCE_PARAM_PAYLOAD {}
 // SAFETY: as above.
 unsafe impl Zeroed for NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {}
@@ -996,6 +1043,8 @@ const _: () = {
     assert!(size_of::<NV_ENC_PIC_PARAMS>() == 3360);
     assert!(size_of::<NV_ENC_LOCK_BITSTREAM>() == 1544);
     assert!(size_of::<NV_ENC_LOCK_INPUT_BUFFER>() == 1544);
+    assert!(size_of::<NV_ENC_REGISTER_RESOURCE>() == 1536);
+    assert!(size_of::<NV_ENC_MAP_INPUT_RESOURCE>() == 1544);
     assert!(size_of::<NV_ENC_SEQUENCE_PARAM_PAYLOAD>() == 1544);
     assert!(size_of::<NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS>() == 1552);
     assert!(size_of::<NV_ENCODE_API_FUNCTION_LIST>() == 2552);

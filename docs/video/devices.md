@@ -158,9 +158,13 @@ buffer of an encode session's process (reims-vgpu's `graphics/video_host/encode.
   a change of the bitrates, QPs or frame rate goes to the encoder from the next frame.
   `min_qp`, `max_qp` and a change of `quality` alone are not taken.
 - **The frame is encoded** on the session's encode thread (`reims-vgpu.graphics-video-encode`),
-  in the order the encodes were taken, once the command buffer's waits are done: its two planes
-  are read as host bytes, in the surface's pages, or, for a plane in a device cache, in a staging
-  buffer the GPU copies it into first.
+  in the order the encodes were taken, once the command buffer's waits are done. The runtime
+  device's GPU copies its two planes, where they lie, in the surface's pages or its device
+  caches, into the encoder's own input: a VA-API input surface exported as dma-bufs, or an
+  exportable buffer CUDA imported, which NVENC registers and maps for the frame. Where the arm
+  declines that copy (said once a session), the planes are read as host bytes, in the surface's
+  pages, or, for a plane in a device cache, in a staging buffer the GPU copies it into first, and
+  the encoder's upload copies them. The encoder codes the same bytes either way.
 - **The access unit is written** in Annex-B form into the bitstream buffer, a keyframe's with
   its parameter sets first, and the frame's `RgfxVideoEncodeResult` after it. One past the
   capacity is not written (`RGFX_VIDEO_ENCODE_OVERFLOW`, with the bytes it needed), and the
