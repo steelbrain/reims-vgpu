@@ -1183,14 +1183,16 @@ unsafe fn host_memory_noting(
     // Each view's dma-buf the source answered with, held as a region's is: the runtime takes a
     // view's first piece from its first page as a dma-buf of its own where it alone holds it.
     let views: Mutex<Vec<Arc<std::os::fd::OwnedFd>>> = Mutex::new(Vec::new());
-    // The source's number in the trace's `dmabufsrc` (below): a diagnostic.
+    // The source's number in the trace's `dmabufsrc` and `dmabufans` (below), and its end, the
+    // trace's `dmabufend` as the runtime drops it ([`SourceTrace`]): a diagnostic.
     static SOURCES: AtomicU64 = AtomicU64::new(0);
-    let number = SOURCES.fetch_add(1, Ordering::Relaxed);
+    let traced = SourceTrace(SOURCES.fetch_add(1, Ordering::Relaxed));
     let kept: Mutex<Kept> = Mutex::new(Kept::default());
     let source: rt::DmaBufSource = Arc::new(move |request: rt::DmaBufRequest| {
         if let Some(asked) = &asked {
             asked.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        let number = traced.0;
         let first = addr_of(request.start);
         let (length, granule) = (request.length, request.granule);
         // A buffer's or a heap's import of a grouped view's pages: a piece of the group's file
@@ -1204,6 +1206,7 @@ unsafe fn host_memory_noting(
                 log::debug!(
                     "{length:#x} bytes at {first:#x} as the piece at {offset:#x} of a group dma-buf"
                 );
+                traced.answer(Kind::Group, first, length, Some((&file, offset)), 1);
                 return Ok(vec![rt::DmaBufChunk {
                     file,
                     offset,
@@ -1217,6 +1220,8 @@ unsafe fn host_memory_noting(
                      dma-buf",
                     piece.chunk.offset
                 );
+                let at = Some((&piece.chunk.file, piece.chunk.offset));
+                traced.answer(Kind::Region, first, length, at, 1);
                 let used = piece.region;
                 ANSWERED_REGIONS.with_borrow_mut(|answered| answered.push(used.region()));
                 // One use of each region a source: one asked again (a recovery's) holds it once.
@@ -1235,6 +1240,7 @@ unsafe fn host_memory_noting(
             log::debug!(
                 "{length:#x} bytes at {first:#x} as the dma-buf their view is mapped through"
             );
+            traced.answer(Kind::OwnView, first, length, None, 1);
             return Ok(vec![rt::DmaBufChunk {
                 file: Arc::new(file),
                 offset: 0,
@@ -1251,6 +1257,7 @@ unsafe fn host_memory_noting(
                 "{length:#x} bytes at {first:#x} as the piece at {:#x} of their view's dma-buf",
                 chunk.offset
             );
+            traced.answer(Kind::View, first, length, Some((&chunk.file, chunk.offset)), 1);
             let mut held = views.lock();
             if !held.iter().any(|h| Arc::ptr_eq(h, &chunk.file)) {
                 held.push(Arc::clone(&chunk.file));
@@ -1309,6 +1316,11 @@ unsafe fn host_memory_noting(
                 u64::from(stands),
             ];
             crate::core::trace::event("dmabufsrc", &event);
+            let kind = match request.shared_files {
+                true => Kind::Own,
+                false => Kind::Texture,
+            };
+            traced.answer(kind, first, length, None, chunks);
         }
         match made {
             Ok((chunks, _)) => {
@@ -1342,6 +1354,59 @@ unsafe fn host_memory_noting(
     // the object lies in its chunk; where it lists its imports in every submission, in a chunk a
     // copy imported, and else in an import of its own, as with no runs.
     memory.with_runs(Arc::clone(&RUNS))
+}
+
+/// A dma-buf source's number in the trace ([`host_memory`]), which writes `dmabufend` with it as the
+/// runtime drops the source: once the imports and images it made through it went, or with the
+/// call where it asked nothing. A diagnostic: it holds nothing and reads nothing with an effect.
+struct SourceTrace(u64);
+
+/// What a source answered a request with, as the trace's `dmabufans` numbers it
+/// ([`SourceTrace::answer`]).
+#[derive(Clone, Copy)]
+enum Kind {
+    /// A piece of a group dma-buf (`super::dma_buf`'s module docs, "Groups").
+    Group = 1,
+    /// A piece of a guest RAM region's dma-buf ("Regions").
+    Region = 2,
+    /// A piece of a view's dma-buf ("Views").
+    View = 3,
+    /// The dma-buf a view is mapped through whole, a descriptor of its own ([`own_view_buf`]).
+    OwnView = 4,
+    /// Dma-bufs of their own, for a buffer's or a heap's request.
+    Own = 5,
+    /// Dma-bufs of their own, for a texture's request (its own pages).
+    Texture = 6,
+}
+
+impl SourceTrace {
+    /// The trace's `dmabufans`: the source's number, what it answered (`kind`), the request's
+    /// first byte and length, the shared file's identity (its `Arc`'s address, which the runtime
+    /// keys its one import of the file by) and the piece's offset in it, 0 and 0 for dma-bufs of
+    /// their own, and the dma-bufs answered (0 where refused).
+    fn answer(
+        &self,
+        kind: Kind,
+        first: u64,
+        length: u64,
+        piece: Option<(&Arc<std::os::fd::OwnedFd>, u64)>,
+        chunks: u64,
+    ) {
+        if !crate::core::trace::on() {
+            return;
+        }
+        let (file, offset) = piece.map_or((0, 0), |(file, offset)| {
+            (Arc::as_ptr(file).addr().to_u64(), offset)
+        });
+        let event = [self.0, kind as u64, first, length, file, offset, chunks];
+        crate::core::trace::event("dmabufans", &event);
+    }
+}
+
+impl Drop for SourceTrace {
+    fn drop(&mut self) {
+        crate::core::trace::event("dmabufend", &[self.0]);
+    }
 }
 
 /// How many requests of a texture's own pages the import sources answered with dma-bufs made for

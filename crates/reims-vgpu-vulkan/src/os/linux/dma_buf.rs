@@ -1308,6 +1308,10 @@ pub(crate) fn keep_regions(device: &rt::Device, answered: Vec<RegionRef>) {
         let left = match (made, entry) {
             (Ok(kept), Some(entry)) if !entry.kept.iter().any(|&(at, _)| at == id) => {
                 entry.kept.push((id, kept));
+                // The trace's `regionkeep`: the region dma-buf's identity (its `Arc`'s address, as
+                // the import source's `dmabufans` writes it) and the device that keeps it.
+                let file = Arc::as_ptr(&file).addr().to_u64();
+                crate::core::trace::event("regionkeep", &[file, id]);
                 if entry.users == 0 {
                     entry.idle_since = Some(mono_now());
                     lingers = true;
@@ -1343,10 +1347,20 @@ pub(crate) fn take_region_keeps() -> Vec<rt::SharedDmaBufImport> {
     let mut regions = REGIONS.lock();
     let mut taken = Vec::new();
     for region in regions.values_mut() {
+        if !region.kept.is_empty() {
+            trace_let_go(region);
+        }
         taken.extend(region.kept.drain(..).map(|(_, kept)| kept));
         region.idle_since = None;
     }
     taken
+}
+
+/// The trace's `regionletgo`: the identity of a region dma-buf whose kept imports are let go of
+/// (as `regionkeep` writes it), and how many.
+fn trace_let_go(region: &Region) {
+    let file = Weak::as_ptr(&region.file).addr().to_u64();
+    crate::core::trace::event("regionletgo", &[file, region.kept.len().to_u64()]);
 }
 
 /// The kept imports of the regions whose linger ended by `now` ([`LINGER_NS`]), taken out of
@@ -1361,6 +1375,9 @@ fn lingered(now: u64) -> (Vec<rt::SharedDmaBufImport>, Option<u64>) {
         };
         let ends = since.saturating_add(LINGER_NS);
         if ends <= now {
+            if !region.kept.is_empty() {
+                trace_let_go(region);
+            }
             taken.extend(region.kept.drain(..).map(|(_, kept)| kept));
             region.idle_since = None;
         } else {
