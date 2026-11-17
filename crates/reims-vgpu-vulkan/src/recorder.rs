@@ -27,9 +27,9 @@
 //!   under one lock as the call returns, so the stream's order keeps each thread's, with what
 //!   only the call's moment has: its objects' ids, the bytes it consumes and the memory a commit
 //!   reaches. A thread of the recorder's own (`reims-vgpu.recorder`) takes the queue every
-//!   [`DRAIN`] and, in its order, reads the text, shapes and tracks each call and encodes it. A
-//!   commit or a copy out of the guest's RAM first takes what is queued on its own thread, since
-//!   its capture needs every earlier call tracked.
+//!   [`BUSY`] while calls come ([`DRAIN`] while none do) and, in its order, reads the text, shapes
+//!   and tracks each call and encodes it. A commit or a copy out of the guest's RAM first takes
+//!   what is queued on its own thread, since its capture needs every earlier call tracked.
 //! - **The file.** The writer writes the stream out every [`FLUSH`], into segments
 //!   `<pid>.NNNN.m2vr` of at most [`SEGMENT`] bytes, each starting with the header. Libraries go
 //!   once each into the `blobs` directory beside the stream's, by the hex of their SHA-256.
@@ -69,8 +69,11 @@ pub const ENV_VAR: &str = "REIMS_VGPU_RECORD";
 /// How long a record may wait in the buffer.
 const FLUSH: Duration = Duration::from_millis(50);
 
-/// How long a call may wait in the queue before the writer shapes it.
+/// How long a call may wait in the queue before the writer shapes it, while none came.
 const DRAIN: Duration = Duration::from_millis(1);
+
+/// How long, while calls come.
+const BUSY: Duration = Duration::from_micros(50);
 
 /// How often the counts are written.
 const STATS: Duration = Duration::from_secs(5);
@@ -98,7 +101,57 @@ thread_local! {
     static DEPTH: Cell<u32> = const { Cell::new(0) };
     /// Whether this thread formats an argument for the stream: an `Obj` then prints as its id.
     static FORMATTING: Cell<bool> = const { Cell::new(false) };
+    /// This thread's reading and queueing time not yet in the counts, and its calls since.
+    static TIMES: Cell<(u64, u64, u32)> = const { Cell::new((0, 0, 0)) };
 }
+
+/// How many calls a thread's times wait for before they reach the counts ([`add_times`]).
+const TIMES_EVERY: u32 = 256;
+
+/// Adds a calling thread's time reading a call (`read`) and queueing it (`finish`, which ends the
+/// call) to the counts once every [`TIMES_EVERY`] calls: a shared counter written on every call
+/// would move its cache line between the threads, the writer's among them, on every call.
+fn add_times(state: &State, read: u64, finish: u64, ends: bool) {
+    TIMES.with(|t| {
+        let (r, f, n) = t.get();
+        let (r, f, n) = (r + read, f + finish, n + u32::from(ends));
+        if n < TIMES_EVERY {
+            t.set((r, f, n));
+            return;
+        }
+        t.set((0, 0, 0));
+        state.stats.read_ns.fetch_add(r, Ordering::Relaxed);
+        state.stats.finish_ns.fetch_add(f, Ordering::Relaxed);
+    });
+}
+
+/// The hasher of the recorder's maps, whose keys are pointers and stream ids: a multiply and a
+/// shift, where the default's SipHash costs a calling thread more on each lookup.
+#[derive(Default, Clone, Copy)]
+struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.write_u64(u64::from(*b));
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        let h = (self.0 ^ n).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        self.0 = h ^ (h >> 32);
+    }
+}
+
+/// A map by pointer or stream id.
+type KeyMap<V> = HashMap<u64, V, std::hash::BuildHasherDefault<KeyHasher>>;
+
+/// A set of stream ids.
+type KeySet = HashSet<u64, std::hash::BuildHasherDefault<KeyHasher>>;
 
 /// Whether the process records: one relaxed load.
 #[inline]
@@ -191,7 +244,7 @@ pub fn begin<S: Into<Cow<'static, str>>>(
         let t0 = now_ns();
         let (selector, receiver, args) = read();
         if let Some(state) = state() {
-            (state.stats.read_ns).fetch_add(now_ns() - t0, Ordering::Relaxed);
+            add_times(state, now_ns() - t0, 0, false);
         }
         Call {
             selector: selector.into().into_owned(),
@@ -225,7 +278,7 @@ pub fn begin_cmd<C: typed::Command + std::fmt::Debug>(
     let receiver = receiver();
     let (args, text) = cmd_call(cmd);
     if let Some(state) = state() {
-        (state.stats.read_ns).fetch_add(now_ns() - t0, Ordering::Relaxed);
+        add_times(state, now_ns() - t0, 0, false);
     }
     Active {
         token,
@@ -790,7 +843,7 @@ pub fn finish(active: Active, made: Option<Made>) {
         text,
         shape: true,
     });
-    (state.stats.finish_ns).fetch_add(now_ns() - t0, Ordering::Relaxed);
+    add_times(state, 0, now_ns() - t0, true);
     drop(token);
 }
 
@@ -823,7 +876,7 @@ pub fn draws<T: Send + Sync + 'static>(
             });
         }
     }
-    (state.stats.read_ns).fetch_add(now_ns() - t0, Ordering::Relaxed);
+    add_times(state, now_ns() - t0, 0, false);
 }
 
 /// Before a commit: shapes what is queued, waits for the earlier command buffers that can run,
@@ -982,7 +1035,7 @@ struct Info {
     /// Its GPU range, where the guest pinned it.
     pin: Option<(u64, u64)>,
     /// The objects a descriptor's calls named.
-    refs: HashSet<u64>,
+    refs: KeySet,
     /// Whether its last reference went: its release is queued, and its memory no longer read.
     dead: bool,
 }
@@ -996,16 +1049,19 @@ enum Item {
         text: Option<String>,
         shape: bool,
     },
-    /// A record written as it is, counted by its selector where `count`.
-    Plain { call: Call, count: bool },
+    /// A record written as it is.
+    Plain(Call),
+    /// An `m2v.write` of the chunks a capture found changed: its chunks scanned for addresses
+    /// (`scan_addresses`), then written, counted by its selector.
+    Write(Call),
     /// An object's release: its last record, after which the recorder forgets it.
     Release(u64),
 }
 
 #[derive(Default)]
 struct Objects {
-    by_ptr: HashMap<u64, u64>,
-    info: HashMap<u64, Info>,
+    by_ptr: KeyMap<u64>,
+    info: KeyMap<Info>,
     next: u64,
     /// Live pinned ranges: start, then end and id.
     pins: BTreeMap<u64, (u64, u64)>,
@@ -1014,9 +1070,9 @@ struct Objects {
 /// A command buffer's reach and its event waits and signals.
 #[derive(Default)]
 struct Cb {
-    reach: HashSet<u64>,
+    reach: KeySet,
     /// What its passes render into and its blits write: bytes only the GPU writes.
-    gpu_writes: HashSet<u64>,
+    gpu_writes: KeySet,
     waits: Vec<(u64, u64)>,
     signals: Vec<(u64, u64)>,
 }
@@ -1033,10 +1089,10 @@ struct Pending {
 
 #[derive(Default)]
 struct SyncState {
-    cbs: HashMap<u64, Cb>,
+    cbs: KeyMap<Cb>,
     pending: Vec<Pending>,
     /// The highest value the CPU, or a completed command buffer, signalled each event to.
-    signalled: HashMap<u64, u64>,
+    signalled: KeyMap<u64>,
 }
 
 /// One span of host memory to compare: `start..end` of the target's bytes, the target's first
@@ -1067,7 +1123,8 @@ struct Stats {
     /// chunks (`compare`), and shaping what is queued before a commit (`drain_ns`, with the
     /// wait for the writer's turn, over `drained_here` records); and the writer's: reading,
     /// shaping, tracking and encoding records wherever they ran (`process_ns`), and its file
-    /// writes.
+    /// writes. A thread's `read_ns` and `finish_ns` reach the counts every [`TIMES_EVERY`] of
+    /// its calls.
     read_ns: AtomicU64,
     finish_ns: AtomicU64,
     hash_ns: AtomicU64,
@@ -1106,7 +1163,7 @@ struct State {
     stream: Mutex<Stream>,
     objects: Mutex<Objects>,
     sync: Mutex<SyncState>,
-    baselines: Mutex<HashMap<u64, Vec<u64>>>,
+    baselines: Mutex<KeyMap<Vec<u64>>>,
     selectors: Mutex<BTreeMap<String, u64>>,
     stats: Stats,
 }
@@ -1125,7 +1182,7 @@ impl State {
             stream: Mutex::new(Stream::new()),
             objects: Mutex::new(Objects::default()),
             sync: Mutex::new(SyncState::default()),
-            baselines: Mutex::new(HashMap::new()),
+            baselines: Mutex::new(KeyMap::default()),
             selectors: Mutex::new(BTreeMap::new()),
             stats: Stats::default(),
         }
@@ -1159,8 +1216,10 @@ impl State {
         let mut flushed = now_ns();
         let mut counted = flushed;
         loop {
-            std::thread::sleep(DRAIN);
-            self.drain(false);
+            // While calls come, the queue is taken every `BUSY`, so a commit finds little left
+            // to shape on its own thread.
+            let busy = self.drain(false) > 0;
+            std::thread::sleep(if busy { BUSY } else { DRAIN });
             let now = now_ns();
             if now - flushed < flush {
                 continue;
@@ -1203,29 +1262,39 @@ impl State {
 
     /// Queues a record written as it is.
     fn push_plain(&self, call: Call) {
-        self.push(Item::Plain { call, count: false });
+        self.push(Item::Plain(call));
     }
 
     /// Shapes and writes every queued record, in order: on the writer's thread, or on a calling
-    /// thread (`here`) whose capture needs them tracked.
-    fn drain(&self, here: bool) {
+    /// thread (`here`) whose capture needs them tracked. How many it wrote.
+    fn drain(&self, here: bool) -> u64 {
         let t0 = now_ns();
         let _shaping = self.shaping.lock();
         let items = std::mem::take(&mut *self.queue.lock());
-        let t1 = now_ns();
         let n = items.len() as u64;
-        for item in items {
-            self.process(item);
+        if n > 0 {
+            let t1 = now_ns();
+            let mut bytes = 0;
+            for item in items {
+                bytes += self.process(item) as u64;
+            }
+            self.stats.records.fetch_add(n, Ordering::Relaxed);
+            self.stats.bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.stats
+                .process_ns
+                .fetch_add(now_ns() - t1, Ordering::Relaxed);
         }
-        let t2 = now_ns();
-        self.stats.process_ns.fetch_add(t2 - t1, Ordering::Relaxed);
         if here {
-            self.stats.drain_ns.fetch_add(t2 - t0, Ordering::Relaxed);
+            self.stats
+                .drain_ns
+                .fetch_add(now_ns() - t0, Ordering::Relaxed);
             self.stats.drained_here.fetch_add(n, Ordering::Relaxed);
         }
+        n
     }
 
-    fn process(&self, item: Item) {
+    /// Shapes and writes one record: the length of its call record.
+    fn process(&self, item: Item) -> usize {
         match item {
             Item::Call {
                 mut call,
@@ -1244,9 +1313,18 @@ impl State {
                     self.shape(&mut call);
                 }
                 self.track(&call);
-                self.emit(call, false);
+                self.emit(call)
             }
-            Item::Plain { call, count } => self.emit(call, count),
+            Item::Plain(call) => self.emit(call),
+            Item::Write(call) => {
+                for v in &call.args {
+                    if let Value::Bytes(data) = v {
+                        self.scan_addresses(data);
+                    }
+                }
+                self.count_selector(&call.selector);
+                self.emit(call)
+            }
             Item::Release(id) => {
                 {
                     let mut objects = self.objects.lock();
@@ -1257,14 +1335,11 @@ impl State {
                     }
                 }
                 self.sync.lock().cbs.remove(&id);
-                self.emit(
-                    Call {
-                        selector: "release".to_owned(),
-                        receiver: id,
-                        ..Call::default()
-                    },
-                    false,
-                );
+                self.emit(Call {
+                    selector: "release".to_owned(),
+                    receiver: id,
+                    ..Call::default()
+                })
             }
         }
     }
@@ -1473,11 +1548,7 @@ impl State {
 
     /// Keeps what a call tells of command buffers: their encoders, reach, events and commits.
     fn track(&self, call: &Call) {
-        *self
-            .selectors
-            .lock()
-            .entry(call.selector.clone())
-            .or_insert(0) += 1;
+        self.count_selector(&call.selector);
         let recv_type = self.type_of(call.receiver);
         let cb_type = std::any::type_name::<CommandBufferObject>();
         let mut named = Vec::new();
@@ -1808,6 +1879,7 @@ impl State {
     fn compare(&self, spans: &[Span], emit: bool) {
         let t0 = now_ns();
         let mut writes: BTreeMap<u64, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
+        let (mut hashed, mut refreshed) = (0, 0);
         {
             let mut baselines = self.baselines.lock();
             let mut buf = vec![0u8; CHUNK as usize];
@@ -1839,7 +1911,7 @@ impl State {
                             n,
                         );
                     }
-                    self.stats.chunks_hashed.fetch_add(1, Ordering::Relaxed);
+                    hashed += 1;
                     let h = hash64(dst);
                     let Some(slot) = base.get_mut(c as usize) else {
                         continue;
@@ -1849,41 +1921,41 @@ impl State {
                     }
                     *slot = h;
                     if emit {
-                        self.scan_addresses(dst);
                         writes
                             .entry(s.target)
                             .or_default()
                             .push((off, dst.to_vec()));
                     } else {
-                        self.stats.chunks_refreshed.fetch_add(1, Ordering::Relaxed);
+                        refreshed += 1;
                     }
                 }
             }
         }
         let t1 = now_ns();
-        self.stats.hash_ns.fetch_add(t1 - t0, Ordering::Relaxed);
+        let s = &self.stats;
+        s.hash_ns.fetch_add(t1 - t0, Ordering::Relaxed);
+        s.chunks_hashed.fetch_add(hashed, Ordering::Relaxed);
+        s.chunks_refreshed.fetch_add(refreshed, Ordering::Relaxed);
+        let (mut written, mut bytes) = (0, 0);
         for (target, chunks) in writes {
             let mut args = Vec::with_capacity(chunks.len() * 2);
             for (off, data) in chunks {
-                self.stats.chunks_written.fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .write_bytes
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+                written += 1;
+                bytes += data.len() as u64;
                 args.push(Value::Uint(off));
                 // A chunk of `BLOB_MIN` bytes or more is written as a blob ([`blob_long`]).
                 args.push(Value::Bytes(data));
             }
-            self.push(Item::Plain {
-                call: Call {
-                    selector: "m2v.write".to_owned(),
-                    receiver: target,
-                    args,
-                    ..Call::default()
-                },
-                count: true,
-            });
+            self.push(Item::Write(Call {
+                selector: "m2v.write".to_owned(),
+                receiver: target,
+                args,
+                ..Call::default()
+            }));
         }
-        (self.stats.write_ns).fetch_add(now_ns() - t1, Ordering::Relaxed);
+        s.chunks_written.fetch_add(written, Ordering::Relaxed);
+        s.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+        s.write_ns.fetch_add(now_ns() - t1, Ordering::Relaxed);
     }
 
     /// Counts the 8-byte words of `data` that lie in a live pinned range: at 8-aligned offsets,
@@ -1922,27 +1994,24 @@ impl State {
         }
     }
 
-    /// Writes a record into the stream, counted by its selector where `count`.
-    fn emit(&self, mut call: Call, count: bool) {
+    /// Writes a record into the stream: the length of its call record.
+    fn emit(&self, mut call: Call) -> usize {
         let mut stream = self.stream.lock();
         // Long inline data goes as a blob.
         for v in &mut call.args {
             blob_long(v, &mut stream);
         }
-        let n = stream.call(&call);
-        drop(stream);
-        self.count(n, if count { &call.selector } else { "" });
+        stream.call(&call)
     }
 
-    fn count(&self, n: usize, selector: &str) {
-        self.stats.records.fetch_add(1, Ordering::Relaxed);
-        self.stats.bytes.fetch_add(n as u64, Ordering::Relaxed);
-        if !selector.is_empty() {
-            *self
-                .selectors
-                .lock()
-                .entry(selector.to_owned())
-                .or_insert(0) += 1;
+    /// Counts a record by its selector.
+    fn count_selector(&self, selector: &str) {
+        let mut selectors = self.selectors.lock();
+        match selectors.get_mut(selector) {
+            Some(n) => *n += 1,
+            None => {
+                selectors.insert(selector.to_owned(), 1);
+            }
         }
     }
 }
@@ -2722,18 +2791,16 @@ mod tests {
             text: None,
             shape: true,
         });
-        state.push(Item::Plain {
-            call: Call {
-                selector: "m2v.write".to_owned(),
-                receiver: 6,
-                args: vec![Value::Uint(4096), Value::Bytes(vec![7; 4096])],
-                ..Call::default()
-            },
-            count: true,
-        });
+        state.push(Item::Write(Call {
+            selector: "m2v.write".to_owned(),
+            receiver: 6,
+            args: vec![Value::Uint(4096), Value::Bytes(vec![7; 4096])],
+            ..Call::default()
+        }));
         state.push(Item::Release(6));
         assert_eq!(state.queue.lock().len(), 4);
-        state.drain(true);
+        assert_eq!(state.drain(true), 4);
+        assert_eq!(state.stats.records.load(Ordering::Relaxed), 4);
         assert!(state.queue.lock().is_empty());
         assert_eq!(state.stats.drained_here.load(Ordering::Relaxed), 4);
         let mut bytes = format::HEADER.to_vec();
