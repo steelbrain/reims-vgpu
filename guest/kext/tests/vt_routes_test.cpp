@@ -159,6 +159,43 @@ int main()
 		RgfxVtLent six[6] = {};
 		check(rgfxVtPackMessage(0x200, runs, 1, six, 6, out, sizeof(out)) == 0,
 		      "more surfaces than a message names");
+		// A surface whose runs are its run table's: the flag stays in its record, and its runs
+		// are counted without it.
+		lent[1].record.run_count = 1 | RGFX_VT_SURFACE_RUN_TABLE;
+		check(rgfxVtSurfaceRuns(lent[1].record) == 1, "a run table's runs are counted");
+		check(rgfxVtPackMessage(0x200, runs, 1, lent, 2, out, sizeof(out)) == expected,
+		      "a message lending a run table packs as one lending runs");
+		std::memcpy(&record, out + second_at, sizeof(record));
+		std::memcpy(&run, out + second_at + sizeof(record), sizeof(run));
+		check(record.run_count == (1 | RGFX_VT_SURFACE_RUN_TABLE) && run.address == 0xa0000,
+		      "the record keeps the flag, the table's run follows it");
+	}
+
+	// The room each surface a message lends has for its runs: what the message, its runs and the
+	// surfaces before it leave, shared evenly with those after it.
+	{
+		RgfxVtLent lent[2] = {};
+		const uint32_t max = 16384;
+		const uint32_t alone = (max - RGFX_VT_MESSAGE_RUNS_OFFSET - 16 - sizeof(RgfxVtSurface)) / 16;
+		check(rgfxVtSurfaceRunsRoom(1, lent, 0, 0, max) == alone, "one surface takes the rest");
+		check(rgfxVtSurfaceRunsRoom(1, lent, 0, 1, max) ==
+		          ((max - RGFX_VT_MESSAGE_RUNS_OFFSET - 16) / 2 - sizeof(RgfxVtSurface)) / 16,
+		      "two surfaces share it");
+		lent[0].record.run_count = 100 | RGFX_VT_SURFACE_RUN_TABLE;
+		check(rgfxVtSurfaceRunsRoom(1, lent, 1, 0, max) ==
+		          (max - RGFX_VT_MESSAGE_RUNS_OFFSET - 16 - 2 * sizeof(RgfxVtSurface) - 100 * 16) /
+		              16,
+		      "the surface after one lent takes what it left");
+		check(rgfxVtSurfaceRunsRoom(1020, lent, 0, 0, max) == 0, "a message's runs fill it");
+		// A surface given its room packs into the message.
+		RgfxPageRun one[1] = {{0x4000, 0x4000}};
+		static RgfxPageRun many[1024];
+		lent[0].record.run_count = alone;
+		lent[0].runs = many;
+		static uint8_t out[16384];
+		check(rgfxVtPackMessage(0x200, one, 1, lent, 1, out, max) != 0, "its room fits");
+		lent[0].record.run_count = alone + 1;
+		check(rgfxVtPackMessage(0x200, one, 1, lent, 1, out, max) == 0, "a run more does not");
 	}
 
 	// The service serves a host whose caps list a decode entry of H.264 or HEVC with a profile.

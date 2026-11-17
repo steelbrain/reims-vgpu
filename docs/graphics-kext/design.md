@@ -1673,7 +1673,18 @@ Stages:
       the guest RAM runs of the client's message buffer that hold it, and
       each IOSurface it lends as a record (`RgfxVtSurface`: the kext's name
       for the lend, the surface's ID, pixel format, size and planes) and the
-      runs of its pages. It waits for no
+      runs of its pages. A command on ring 0 is at most 16 KiB, about 1,000
+      runs: a surface whose pages make more (a large frame's, its pages
+      scattered: a 4K frame of 10-bit samples is about 1,500 pages of 16
+      KiB) sends the runs of its run table instead
+      (`RGFX_VT_SURFACE_RUN_TABLE`), wired memory of the kext's that lists
+      its runs in order, which the host reads as it takes the message and
+      the kext frees as it lets go of the lend (measured: a 4K Main 10
+      stream's hardware decode on arm64 macOS 15.6.1 under TCG on a 780M
+      host failed every frame -12902 while the kext refused such lends, and
+      matched the software decode with a run table of 1,520 runs,
+      2026-11-16, lane a64video, potluck jobs m3-max-39017 and
+      m3-max-39070). It waits for no
       command buffer and no buffer waits for it. The host reads the message
       from guest RAM, hands it to its session layer, and answers
       `VT_STATUS` with the status VideoToolbox's host side would return. A

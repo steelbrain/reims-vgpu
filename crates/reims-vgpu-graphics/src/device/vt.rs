@@ -179,13 +179,16 @@ pub struct VtMessage {
 }
 
 /// One surface a `VT_MESSAGE` lends: its record, and its runs of guest RAM, `(address, length)`,
-/// in order, which hold its `length` bytes from the first run's first byte.
+/// in order, which hold its `length` bytes from the first run's first byte, or where `table`, its
+/// run table's ([`RGFX_VT_SURFACE_RUN_TABLE`]), which the host reads from guest RAM.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VtSurface {
     /// The record as the guest posted it.
     pub surface: RgfxVtSurface,
-    /// Its runs.
+    /// Its runs, or its run table's.
     pub runs: Vec<(u64, u64)>,
+    /// Whether `runs` hold its run table.
+    pub table: bool,
 }
 
 /// Runs of guest RAM, `(address, length)`, in order.
@@ -211,9 +214,9 @@ fn read_runs(bytes: &[u8], count: u32, length: u64) -> Option<(Runs, &[u8])> {
 
 /// `message` as a `VT_MESSAGE`, checked: `None` where it is shorter than its struct and runs,
 /// lends more surfaces than [`RGFX_VT_MESSAGE_SURFACES`] or more than its records hold, a record's
-/// lend is not the one `surfaces` names for it, its own runs do not hold its `length`, or the
-/// message's `length` is under a `vtpv` header's 48 bytes, over [`RGFX_VT_MESSAGE_MAX`] or more
-/// than its runs hold.
+/// lend is not the one `surfaces` names for it, its own runs do not hold its `length` (a run
+/// table's, one run's record), or the message's `length` is under a `vtpv` header's 48 bytes,
+/// over [`RGFX_VT_MESSAGE_MAX`] or more than its runs hold.
 pub(crate) fn read_message(message: &Message) -> Option<VtMessage> {
     let (command, rest) = RgfxVtMessage::read_from_prefix(&message.bytes).ok()?;
     let length = command.length;
@@ -229,8 +232,18 @@ pub(crate) fn read_message(message: &Message) -> Option<VtMessage> {
         if surface.lend != lend || lend == 0 {
             return None;
         }
-        let (runs, after) = read_runs(after, surface.run_count, surface.length)?;
-        surfaces.push(VtSurface { surface, runs });
+        let table = surface.run_count & RGFX_VT_SURFACE_RUN_TABLE != 0;
+        let held = if table {
+            size_of::<RgfxPageRun>() as u64
+        } else {
+            surface.length
+        };
+        let (runs, after) = read_runs(after, surface.run_count & !RGFX_VT_SURFACE_RUN_TABLE, held)?;
+        surfaces.push(VtSurface {
+            surface,
+            runs,
+            table,
+        });
         rest = after;
     }
     Some(VtMessage {
@@ -397,6 +410,36 @@ mod tests {
         assert!(read_message(&short).is_none());
         // A surface whose runs do not hold its length.
         assert!(read_message(&lending(1, 0x4001, &[9])).is_none());
+        assert!(!read.surfaces[0].table);
+    }
+
+    /// A surface whose record has [`RGFX_VT_SURFACE_RUN_TABLE`] is read with its table's runs,
+    /// which need hold only one run's record of its length; with no run, it is refused.
+    #[test]
+    fn a_surface_with_a_run_table_is_read_with_the_tables_runs() {
+        let mut lent = lending(1, 0x100_0000, &[9]);
+        let at = size_of::<RgfxVtMessage>() + size_of::<RgfxPageRun>();
+        let mut record = RgfxVtSurface::read_from_prefix(&lent.bytes[at..])
+            .unwrap()
+            .0;
+        record.run_count = 1 | RGFX_VT_SURFACE_RUN_TABLE;
+        lent.bytes[at..at + size_of::<RgfxVtSurface>()].copy_from_slice(record.as_bytes());
+        let read = read_message(&lent).unwrap();
+        assert!(read.surfaces[0].table);
+        assert_eq!(read.surfaces[0].runs, vec![(0x20000, 0x4000)]);
+        assert_eq!(
+            read.surfaces[0].surface.run_count,
+            1 | RGFX_VT_SURFACE_RUN_TABLE
+        );
+        // The same record without the flag: its one run does not hold its 16 MiB.
+        record.run_count = 1;
+        lent.bytes[at..at + size_of::<RgfxVtSurface>()].copy_from_slice(record.as_bytes());
+        assert!(read_message(&lent).is_none());
+        // A table of no run.
+        record.run_count = RGFX_VT_SURFACE_RUN_TABLE;
+        lent.bytes[at..at + size_of::<RgfxVtSurface>()].copy_from_slice(record.as_bytes());
+        lent.bytes.truncate(at + size_of::<RgfxVtSurface>());
+        assert!(read_message(&lent).is_none());
     }
 
     #[test]

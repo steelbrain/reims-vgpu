@@ -1236,15 +1236,16 @@ pub const RGFX_CMD_SURFACE_DOWNLOAD: u32 = 0x2f7;
 /// message as VideoToolbox writes it (docs/graphics-kext/design.md, "Decided", 17), its `length`
 /// bytes in the guest RAM the runs name, in order, from the first run's first byte. The
 /// IOSurfaces the message lends follow its runs, `surface_count` of them, each an
-/// [`RgfxVtSurface`] and then its own `run_count` runs, which hold its `length` bytes; `surfaces`
-/// names each by its lend, in the same order, the rest 0. The kext holds each lent surface, its
+/// [`RgfxVtSurface`] and then its own `run_count` runs, which hold its `length` bytes, or, with
+/// [`RGFX_VT_SURFACE_RUN_TABLE`], its run table; `surfaces` names each by its lend, in the same
+/// order, the rest 0. The kext holds each lent surface, its
 /// pages wired, until the host lets go of it with a `rels` naming its lend (the `VT_MESSAGE`
 /// event), and the host writes its pages only meanwhile. No command buffer waits for it, and it
 /// waits for none. Answered [`RGFX_EVT_VT_STATUS`] with its `seqno`: the status VideoToolbox's host
 /// side returns for the message, or [`RGFX_VT_STATUS_MALFORMED`] where the runs do not hold
 /// `length` bytes of guest RAM, `length` is under the 48 bytes of a `vtpv` header or over
-/// [`RGFX_VT_MESSAGE_MAX`], or the surfaces' records do not read; the host lets go of the
-/// surfaces of a message it does not take.
+/// [`RGFX_VT_MESSAGE_MAX`], the surfaces' records do not read, or a run table does not hold its
+/// surface's bytes; the host lets go of the surfaces of a message it does not take.
 pub const RGFX_CMD_VT_MESSAGE: u32 = 0x2fa;
 /// Where a `VT_MESSAGE`'s runs start: right after its [`RgfxVtMessage`].
 pub const RGFX_VT_MESSAGE_RUNS_OFFSET: u32 = 72;
@@ -1253,6 +1254,12 @@ pub const RGFX_VT_MESSAGE_SURFACES: usize = 5;
 /// The longest message a `VT_MESSAGE` carries: 10 MiB, the most the kext's message buffer holds,
 /// as Apple's kext of the service sizes its own.
 pub const RGFX_VT_MESSAGE_MAX: u64 = 0xa0_0000;
+/// [`RgfxVtSurface::run_count`]'s flag for a surface whose runs are more than its `VT_MESSAGE`
+/// holds (a 16 KiB command on ring 0): the runs that follow its record, `run_count` without the
+/// flag of them, hold its run table instead, [`RgfxPageRun`]s in guest RAM from the table's first
+/// byte, which hold the surface's `length` bytes in order, as many as do. The kext keeps the
+/// table, wired, while it holds the lend; the host reads it as it takes the message.
+pub const RGFX_VT_SURFACE_RUN_TABLE: u32 = 0x8000_0000;
 /// The longest message a [`RGFX_EVT_VT_MESSAGE`] carries: 16 KiB, the buffer VideoToolbox's
 /// guest side takes each host message into.
 pub const RGFX_VT_HOST_MESSAGE_MAX: u32 = 0x4000;
@@ -2532,7 +2539,8 @@ pub struct RgfxVtMessage {
 pub const RGFX_VT_SURFACE_PLANES: usize = 2;
 
 /// One IOSurface a `VT_MESSAGE` lends, as the kext reads it of the surface: then its `run_count`
-/// [`RgfxPageRun`]s, which hold its `length` bytes from its first.
+/// [`RgfxPageRun`]s, which hold its `length` bytes from its first, or those of its run table
+/// ([`RGFX_VT_SURFACE_RUN_TABLE`]).
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
@@ -2554,7 +2562,8 @@ pub struct RgfxVtSurface {
     /// `IOSurface::getPlaneCount`: 0 for a surface without planes, whose plane 0 describes it
     /// whole.
     pub plane_count: u32,
-    /// How many runs follow.
+    /// How many runs follow; with [`RGFX_VT_SURFACE_RUN_TABLE`], the runs of the surface's run
+    /// table.
     pub run_count: u32,
     /// Its planes, those past `plane_count` (past 1 for a surface without planes) zero.
     pub planes: [RgfxVtSurfacePlane; RGFX_VT_SURFACE_PLANES],

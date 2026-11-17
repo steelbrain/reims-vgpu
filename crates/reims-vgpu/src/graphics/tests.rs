@@ -13748,6 +13748,65 @@ fn a_group_closes_at_its_limits() {
     }
 }
 
+/// A lent surface whose record has a run table takes the table's entries as its runs, as many as
+/// hold its bytes, read from the guest RAM the table's runs name; one whose table does not read,
+/// has an empty entry or holds fewer bytes is refused, and one without a table keeps its runs.
+#[test]
+fn a_lent_surfaces_run_table_gives_its_runs() {
+    let surface = |length: u64, runs: Vec<(u64, u64)>, table: bool| VtSurface {
+        surface: RgfxVtSurface {
+            lend: 3,
+            length,
+            run_count: u32::try_from(runs.len()).unwrap() | RGFX_VT_SURFACE_RUN_TABLE,
+            ..RgfxVtSurface::default()
+        },
+        runs,
+        table,
+    };
+    let entries = |runs: &[(u64, u64)]| -> Vec<u8> {
+        let mut bytes: Vec<u8> = (runs.iter())
+            .flat_map(|&(address, length)| RgfxPageRun { address, length }.as_bytes().to_vec())
+            .collect();
+        // The rest of the table's page, zeros.
+        bytes.resize(0x4000, 0);
+        bytes
+    };
+    let pieces = [
+        (0x10_0000, 0x4000),
+        (0x20_0000, 0x8000),
+        (0x40_0000, 0x4000),
+    ];
+    let table = entries(&pieces);
+    let read = |runs: &[(u64, u64)], n: u64| {
+        assert_eq!(runs, [(0x9000_0000, 0x4000)]);
+        Some(table[..usize::try_from(n).unwrap()].to_vec())
+    };
+    let resolved =
+        with_table_runs(surface(0x10000, vec![(0x9000_0000, 0x4000)], true), read).unwrap();
+    assert_eq!(resolved.runs, pieces);
+    assert!(!resolved.table);
+    // A surface of fewer bytes takes the entries that hold them.
+    let resolved =
+        with_table_runs(surface(0xc000, vec![(0x9000_0000, 0x4000)], true), read).unwrap();
+    assert_eq!(resolved.runs, pieces[..2]);
+    // More bytes than the entries hold: the next entry is empty.
+    assert!(with_table_runs(surface(0x10001, vec![(0x9000_0000, 0x4000)], true), read).is_none());
+    // A table that does not read.
+    assert!(
+        with_table_runs(
+            surface(0x4000, vec![(0x9000_0000, 0x4000)], true),
+            |_, _| None
+        )
+        .is_none()
+    );
+    // Without a table, the runs are the surface's own, and nothing is read.
+    let own = with_table_runs(surface(0x4000, vec![(0x10_0000, 0x4000)], false), |_, _| {
+        panic!("read")
+    })
+    .unwrap();
+    assert_eq!(own.runs, [(0x10_0000, 0x4000)]);
+}
+
 /// The host offers `VT_MESSAGES` where VideoToolbox's paravirtual path lists a decoder, and not
 /// where it lists none: a host whose video arm lands no picture in the guest's surfaces.
 #[test]

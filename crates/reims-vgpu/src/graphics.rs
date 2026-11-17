@@ -3316,24 +3316,36 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn vt_message(&self, message: VtMessage, answer: VtAnswer, link: VtLink) {
         let length = message.message.length;
-        let lent: Vec<Arc<dyn paravirt::LentSurface>> = message
-            .surfaces
+        let lends: Vec<u64> = (message.surfaces.iter())
+            .map(|surface| surface.surface.lend)
+            .collect();
+        // Refused: the lends go back, as for a message the device could not read.
+        let refuse = |why: &str, answer: VtAnswer| {
+            log::warn!(target: "reims_vgpu::graphics", "a VT_MESSAGE of {length} bytes: {why}");
+            if !lends.is_empty() {
+                link.send(&paravirt::surface_release(&lends));
+            }
+            answer.answer(RGFX_VT_STATUS_MALFORMED);
+        };
+        let decoder = self.control.decoder();
+        let Some(surfaces) = (message.surfaces.into_iter())
+            .map(|surface| with_table_runs(surface, |runs, n| decoder.guest_bytes(runs, n)))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return refuse(
+                "a surface's run table lies outside the guest RAM the host maps, or does not \
+                 hold its bytes",
+                answer,
+            );
+        };
+        let lent: Vec<Arc<dyn paravirt::LentSurface>> = surfaces
             .into_iter()
             .map(|surface| Arc::new(GuestSurface(surface)) as Arc<dyn paravirt::LentSurface>)
             .collect();
         let guest: Arc<dyn paravirt::Link> =
             Arc::new(GuestLink(link.clone(), Arc::clone(&self.vt_seen)));
-        let Some(bytes) = self.control.decoder().guest_bytes(&message.runs, length) else {
-            log::warn!(
-                target: "reims_vgpu::graphics",
-                "a VT_MESSAGE of {length} bytes: its runs lie outside the guest RAM the host maps"
-            );
-            if !lent.is_empty() {
-                let lends: Vec<u64> = lent.iter().map(|surface| surface.id()).collect();
-                link.send(&paravirt::surface_release(&lends));
-            }
-            answer.answer(RGFX_VT_STATUS_MALFORMED);
-            return;
+        let Some(bytes) = decoder.guest_bytes(&message.runs, length) else {
+            return refuse("its runs lie outside the guest RAM the host maps", answer);
         };
         let answered = self.vt.deliver_lending(&bytes, lent, Some(guest));
         vt_first(
@@ -3354,6 +3366,52 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         }
         answer.answer(answered.status);
     }
+}
+
+/// `surface` with its own runs: where its record has a run table
+/// ([`RGFX_VT_SURFACE_RUN_TABLE`](reims_vgpu_graphics::wire::RGFX_VT_SURFACE_RUN_TABLE)), the
+/// table's entries, in order, as many as hold the surface's `length` bytes, of the table's bytes
+/// as `read` gives them (the first `n` bytes the runs hold, as the decoder's `guest_bytes` reads
+/// them). `None` where the table does not read, an entry is empty, or the
+/// entries do not hold `length` bytes.
+fn with_table_runs(
+    mut surface: VtSurface,
+    read: impl FnOnce(&[(u64, u64)], u64) -> Option<Vec<u8>>,
+) -> Option<VtSurface> {
+    if !surface.table {
+        return Some(surface);
+    }
+    let held = (surface.runs.iter()).try_fold(0u64, |sum, &(_, n)| sum.checked_add(n))?;
+    let table = read(&surface.runs, held)?;
+    let mut runs = Vec::new();
+    let mut sum = 0u64;
+    for entry in table.as_chunks::<{ size_of::<RgfxPageRun>() }>().0 {
+        if sum >= surface.surface.length {
+            break;
+        }
+        let run = RgfxPageRun::read_from_bytes(entry).ok()?;
+        if run.length == 0 {
+            return None;
+        }
+        sum = sum.checked_add(run.length)?;
+        runs.push((run.address, run.length));
+    }
+    (sum >= surface.surface.length).then(|| {
+        // Diagnostics: the first surface of a boot whose runs came in a run table.
+        static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !TOLD.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::info!(
+                target: "reims_vgpu::graphics",
+                "VideoToolbox: a lent surface of {} bytes came with a run table of {} runs \
+                 (told once)",
+                surface.surface.length,
+                runs.len()
+            );
+        }
+        surface.runs = runs;
+        surface.table = false;
+        surface
+    })
 }
 
 /// A surface a `VT_MESSAGE` lent, as the device read it: its record and its runs of guest RAM,

@@ -8,6 +8,7 @@
 
 #include "ReimsGraphics.hpp"
 #include "RgfxIOSurfaceKPI.hpp"
+#include "RgfxPagesBlock.hpp"
 #include "RgfxSurfaceBlocks.hpp"
 #include "RgfxTrace.hpp"
 #include "RgfxVtRing.hpp"
@@ -379,6 +380,13 @@ IOReturn AppleVideoToolboxParavirtualizationDriver::lend(task_t task, uint32_t s
 		walked = phys && segment && rgfxSurfaceAppendRun(runs, &n, max, phys, take);
 		at += take;
 	}
+	// Runs past what the message holds (a large surface's, its pages scattered): their table,
+	// whose own runs the message carries instead.
+	IOBufferMemoryDescriptor *table = nullptr;
+	if (!walked) {
+		table = runTable(memory, base, length, runs, max, &n);
+		walked = table != nullptr;
+	}
 	*record = {};
 	record->length = length;
 	record->surface_id = rgfxIOSurfaceID(surface);
@@ -386,7 +394,7 @@ IOReturn AppleVideoToolboxParavirtualizationDriver::lend(task_t task, uint32_t s
 	record->width = rgfxIOSurfaceWidth(surface);
 	record->height = rgfxIOSurfaceHeight(surface);
 	record->plane_count = rgfxIOSurfacePlaneCount(surface);
-	record->run_count = n;
+	record->run_count = n | (table ? static_cast<uint32_t>(RGFX_VT_SURFACE_RUN_TABLE) : 0);
 	if (record->plane_count == 0) {
 		record->planes[0].bytes_per_row = rgfxIOSurfaceBytesPerRow(surface);
 		record->planes[0].width = record->width;
@@ -403,7 +411,7 @@ IOReturn AppleVideoToolboxParavirtualizationDriver::lend(task_t task, uint32_t s
 	if (held) {
 		lastLend = lastLend + 1 ? lastLend + 1 : 1;
 		record->lend = lastLend;
-		lends[lendCount++] = {lastLend, surface, memory};
+		lends[lendCount++] = {lastLend, surface, memory, table};
 	}
 	IOLockUnlock(lock);
 	if (!held) {
@@ -411,13 +419,74 @@ IOReturn AppleVideoToolboxParavirtualizationDriver::lend(task_t task, uint32_t s
 		if (rgfxFirstCalls(&refused, walked, 1))
 			IOLog("RgfxVtService: IOSurface %u is not lent: %s\n", surfaceId,
 			      walked ? "the service holds the most lends it holds"
-			             : "its runs are more than a message carries");
+			             : "its run table was not made");
+		if (table) {
+			table->complete(kIODirectionOut);
+			table->release();
+		}
 		memory->complete(kIODirectionInOut);
 		memory->release();
 		surface->release();
 		return walked ? kIOReturnNoResources : kIOReturnNoSpace;
 	}
 	return kIOReturnSuccess;
+}
+
+IOBufferMemoryDescriptor *AppleVideoToolboxParavirtualizationDriver::runTable(
+    IOMemoryDescriptor *memory, uint64_t base, uint64_t length, RgfxPageRun *runs, uint32_t max,
+    uint32_t *count)
+{
+	// Each segment of the bytes, and how many runs they make, adjacent ones one.
+	uint32_t total = 0;
+	uint64_t end = 0;
+	for (uint64_t at = base; at < base + length;) {
+		IOByteCount segment = 0;
+		const addr64_t phys = memory->getPhysicalSegment(at, &segment, kIOMemoryMapperNone);
+		if (!phys || !segment)
+			return nullptr;
+		const uint64_t take = segment < base + length - at ? segment : base + length - at;
+		if (!total || end != phys)
+			total++;
+		end = phys + take;
+		at += take;
+	}
+	const uint64_t bytes = rgfxToPageEnd(uint64_t(total) * sizeof(RgfxPageRun), kRgfxPage16K);
+	IOBufferMemoryDescriptor *table =
+	    IOBufferMemoryDescriptor::withOptions(kIODirectionOut, bytes, kRgfxPage16K);
+	if (!table)
+		return nullptr;
+	if (table->prepare(kIODirectionOut) != kIOReturnSuccess) {
+		table->release();
+		return nullptr;
+	}
+	RgfxPageRun *entries = static_cast<RgfxPageRun *>(table->getBytesNoCopy());
+	if (entries)
+		bzero(entries, bytes);
+	uint32_t written = 0;
+	bool made = entries != nullptr;
+	for (uint64_t at = base; made && at < base + length;) {
+		IOByteCount segment = 0;
+		const addr64_t phys = memory->getPhysicalSegment(at, &segment, kIOMemoryMapperNone);
+		const uint64_t take = segment < base + length - at ? segment : base + length - at;
+		made = phys && segment && rgfxSurfaceAppendRun(entries, &written, total, phys, take);
+		at += take;
+	}
+	// The table's own runs, of its whole pages.
+	uint32_t n = 0;
+	for (uint64_t at = 0; made && at < bytes;) {
+		IOByteCount segment = 0;
+		const addr64_t phys = table->getPhysicalSegment(at, &segment, kIOMemoryMapperNone);
+		const uint64_t take = segment < bytes - at ? segment : bytes - at;
+		made = phys && segment && rgfxSurfaceAppendRun(runs, &n, max, phys, take);
+		at += take;
+	}
+	if (!made) {
+		table->complete(kIODirectionOut);
+		table->release();
+		return nullptr;
+	}
+	*count = n;
+	return table;
 }
 
 void AppleVideoToolboxParavirtualizationDriver::letGoLend(uint64_t name)
@@ -434,6 +503,10 @@ void AppleVideoToolboxParavirtualizationDriver::letGoLend(uint64_t name)
 	IOLockUnlock(lock);
 	if (!gone.surface)
 		return;
+	if (gone.table) {
+		gone.table->complete(kIODirectionOut);
+		gone.table->release();
+	}
 	gone.memory->complete(kIODirectionInOut);
 	gone.memory->release();
 	gone.surface->release();
@@ -699,12 +772,19 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::sendMessage(IOExternalMe
 			const uint32_t id = static_cast<uint32_t>(a->scalarInput[i]);
 			if (!id)
 				continue;
+			// The surfaces still to lend after this one share the message's room with it.
+			uint32_t after = 0;
+			for (uint32_t j = i + 1; j < a->scalarInputCount; j++)
+				after += a->scalarInput[j] != 0;
+			uint32_t room = rgfxVtSurfaceRunsRoom(n, lent, lentCount, after,
+			                                      ReimsGraphics::kLifecycleMessageMax);
+			room = room < kVtRunsMax - used ? room : kVtRunsMax - used;
 			RgfxVtLent &l = lent[lentCount];
-			lending = service->lend(task, id, &l.record, surfaceRuns + used, kVtRunsMax - used) ==
-			          kIOReturnSuccess;
+			lending = room && service->lend(task, id, &l.record, surfaceRuns + used, room) ==
+			                      kIOReturnSuccess;
 			if (lending) {
 				l.runs = surfaceRuns + used;
-				used += l.record.run_count;
+				used += rgfxVtSurfaceRuns(l.record);
 				lentCount++;
 			}
 		}

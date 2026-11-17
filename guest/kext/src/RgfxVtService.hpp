@@ -83,8 +83,9 @@ public:
 	// before it returns.
 	void deliver(const volatile uint8_t *message, uint32_t length);
 	// Lends the host the IOSurface `surfaceId` as `task` sees it: held, its memory wired, its
-	// record, named by its new lend, into *record and its runs into `runs` (at most `max`).
-	// kIOReturnSuccess, or why not, with nothing held.
+	// record, named by its new lend, into *record and its runs into `runs` (at most `max`); where
+	// they are more, a run table of them, which the lend holds, and the table's runs instead
+	// (RGFX_VT_SURFACE_RUN_TABLE). kIOReturnSuccess, or why not, with nothing held.
 	IOReturn lend(task_t task, uint32_t surfaceId, RgfxVtSurface *record, RgfxPageRun *runs,
 	              uint32_t max);
 	// Lets go of the lend `name`, where the service holds it.
@@ -96,7 +97,15 @@ private:
 		uint64_t name;
 		OSObject *surface;
 		IOMemoryDescriptor *memory;
+		// The surface's run table, prepared, where its runs were more than its message holds.
+		IOBufferMemoryDescriptor *table;
 	};
+	// The run table of `memory`'s `length` bytes from `base`: wired memory of the service's,
+	// prepared, of whole pages, that holds their runs (RgfxPageRun, in order), its own runs into
+	// `runs` (at most `max`) and *count. nullptr where it is not made or its runs are more.
+	static IOBufferMemoryDescriptor *runTable(IOMemoryDescriptor *memory, uint64_t base,
+	                                          uint64_t length, RgfxPageRun *runs, uint32_t max,
+	                                          uint32_t *count);
 	// Lets go of every lend.
 	void letGoLends();
 	// Sends the host `-uui` of `uuid`, from forgetBuffer.

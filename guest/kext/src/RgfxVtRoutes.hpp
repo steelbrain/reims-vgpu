@@ -113,15 +113,42 @@ static inline uint32_t rgfxVtReleasedLends(const uint8_t *message, uint32_t leng
 	return n;
 }
 
-// One surface a message lends, as the kext read it of its IOSurface, and its runs.
+// One surface a message lends, as the kext read it of its IOSurface, and its runs: its own, or
+// those of its run table (RGFX_VT_SURFACE_RUN_TABLE in the record's `run_count`).
 struct RgfxVtLent {
 	RgfxVtSurface record;
 	const RgfxPageRun *runs;
 };
 
+// How many runs follow a surface's record: `run_count` without RGFX_VT_SURFACE_RUN_TABLE.
+static inline uint32_t rgfxVtSurfaceRuns(const RgfxVtSurface &record)
+{
+	return record.run_count & ~static_cast<uint32_t>(RGFX_VT_SURFACE_RUN_TABLE);
+}
+
+// The runs the next surface a VT_MESSAGE of `max` bytes lends may carry after its record: the
+// message's own `count` runs and the `lentCount` surfaces lent before it take their bytes, and it
+// and the `after` surfaces still to lend after it share the rest evenly. A surface whose runs are
+// more carries its run table's instead (RgfxVtService.cpp). 0 where no run fits.
+static inline uint32_t rgfxVtSurfaceRunsRoom(uint32_t count, const RgfxVtLent *lent,
+                                             uint32_t lentCount, uint32_t after, uint32_t max)
+{
+	uint64_t used = RGFX_VT_MESSAGE_RUNS_OFFSET + uint64_t(count) * sizeof(RgfxPageRun);
+	for (uint32_t i = 0; i < lentCount; i++)
+		used += sizeof(RgfxVtSurface) +
+		        uint64_t(rgfxVtSurfaceRuns(lent[i].record)) * sizeof(RgfxPageRun);
+	if (used >= max)
+		return 0;
+	const uint64_t share = (max - used) / (uint64_t(after) + 1);
+	if (share <= sizeof(RgfxVtSurface))
+		return 0;
+	return static_cast<uint32_t>((share - sizeof(RgfxVtSurface)) / sizeof(RgfxPageRun));
+}
+
 // The bytes of a VT_MESSAGE of a message of `length` bytes in `runs` (`count` of them), lending
 // `lentCount` surfaces, into `out` of `max` bytes: its struct, its runs, then each surface's record
-// and runs, `surfaces` naming each surface's lend. Its size, or 0 where it does not fit.
+// and runs (or its run table's), `surfaces` naming each surface's lend. Its size, or 0 where it
+// does not fit.
 static inline uint32_t rgfxVtPackMessage(uint64_t length, const RgfxPageRun *runs, uint32_t count,
                                          const RgfxVtLent *lent, uint32_t lentCount, uint8_t *out,
                                          uint32_t max)
@@ -130,7 +157,8 @@ static inline uint32_t rgfxVtPackMessage(uint64_t length, const RgfxPageRun *run
 		return 0;
 	uint64_t size = RGFX_VT_MESSAGE_RUNS_OFFSET + uint64_t(count) * sizeof(RgfxPageRun);
 	for (uint32_t i = 0; i < lentCount; i++)
-		size += sizeof(RgfxVtSurface) + uint64_t(lent[i].record.run_count) * sizeof(RgfxPageRun);
+		size += sizeof(RgfxVtSurface) +
+		        uint64_t(rgfxVtSurfaceRuns(lent[i].record)) * sizeof(RgfxPageRun);
 	if (size > max)
 		return 0;
 	RgfxVtMessage head = {};
@@ -147,8 +175,8 @@ static inline uint32_t rgfxVtPackMessage(uint64_t length, const RgfxPageRun *run
 	for (uint32_t i = 0; i < lentCount; i++) {
 		memcpy(at, &lent[i].record, sizeof(RgfxVtSurface));
 		at += sizeof(RgfxVtSurface);
-		memcpy(at, lent[i].runs, lent[i].record.run_count * sizeof(RgfxPageRun));
-		at += lent[i].record.run_count * sizeof(RgfxPageRun);
+		memcpy(at, lent[i].runs, rgfxVtSurfaceRuns(lent[i].record) * sizeof(RgfxPageRun));
+		at += rgfxVtSurfaceRuns(lent[i].record) * sizeof(RgfxPageRun);
 	}
 	return static_cast<uint32_t>(size);
 }
