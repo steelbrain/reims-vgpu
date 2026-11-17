@@ -385,6 +385,7 @@ enum Release {
     /// it drops.
     Derived(Image),
     /// A read of a decode surface's own dma-buf, to end.
+    #[cfg(unix)]
     EndRead(std::os::fd::RawFd),
 }
 
@@ -474,6 +475,7 @@ impl Drop for SurfaceReadBack<'_> {
             // Mapped by the read back, unmapped once, before the image is
             // destroyed as the field drops after this.
             Release::Derived(image) => image::unmap_buffer(display, image.raw().buf),
+            #[cfg(unix)]
             Release::EndRead(fd) => readback::end_read(*fd),
         }
     }
@@ -599,7 +601,10 @@ impl Surface {
                     planes: mapped.planes,
                     bounds: (pool.width, pool.height),
                     copy: readback::copy_row_streaming,
+                    #[cfg(unix)]
                     release: Release::EndRead(mapped.fd),
+                    #[cfg(windows)]
+                    release: Release::Nothing,
                 })
             }
             // The region is the whole surface, which the image matches.

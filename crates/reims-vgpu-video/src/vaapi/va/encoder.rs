@@ -349,6 +349,7 @@ impl InputSurface {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use crate::codec::encode::Plane;

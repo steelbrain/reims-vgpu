@@ -418,6 +418,7 @@ impl<T> Slot<T> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;

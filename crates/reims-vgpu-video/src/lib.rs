@@ -8,7 +8,8 @@
 //! - [`paravirt`] is VideoToolbox's paravirtual protocol, the host's side: the messages an arm64
 //!   guest's VideoToolbox sends, and the host's answers.
 //! - `vaapi` is VA-API through libva, and `nvidia` NVDEC and NVENC over the CUDA driver API, each
-//!   with its libraries loaded at run time: Linux's alone.
+//!   with its libraries loaded at run time: Linux's, and `vaapi` Windows's too, over Mesa's
+//!   VA-on-D3D12 driver.
 
 pub mod codec;
 pub mod core;
@@ -17,5 +18,5 @@ pub mod nvidia;
 pub mod paravirt;
 #[cfg(all(test, target_os = "linux"))]
 mod probes;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod vaapi;

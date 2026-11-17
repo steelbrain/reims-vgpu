@@ -277,8 +277,10 @@ pub(crate) fn kept(display: &Display) -> usize {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod gpu;
 #[cfg(test)]
+#[cfg(unix)]
 mod held;
 
 #[cfg(test)]

@@ -21,11 +21,11 @@ pub use va::{
 };
 
 /// The probe of decodes into targets over memory of ours, which `crate::probes` runs by hand.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use va::target_probe;
 
 /// The tests' runtime with an exit gate, which the NVIDIA arm's tests run on too.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use va::gated;
 
 pub use va::{

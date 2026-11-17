@@ -17,6 +17,7 @@
 //! surface's own dma-buf and reads it with streaming loads.
 //!
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
@@ -26,6 +27,7 @@ use crate::core::runtime::MonoTime;
 use super::caps::{Config, Context, Entrypoint, Profile};
 use super::display::{Display, Error, check};
 use super::ffi;
+#[cfg(unix)]
 use super::host_memory::HostMemory;
 use super::surface::{Rect, SurfaceFormat};
 use super::vpp_ffi as vpp;
@@ -278,6 +280,7 @@ impl HostFormat {
 /// the GPU writes and the CPU reads cached: the staged copy back's. Each
 /// plane's rows are 256-byte aligned, as AMD's linear surfaces need, and
 /// each plane starts at a page.
+#[cfg(unix)]
 pub(crate) struct HostSurface {
     display: Display,
     surface: ffi::VASurfaceID,
@@ -286,6 +289,7 @@ pub(crate) struct HostSurface {
     planes: Vec<(usize, usize)>,
 }
 
+#[cfg(unix)]
 impl HostSurface {
     /// A surface of `format`, `width` by `height`, imported from host
     /// memory made for it: refused where the memory cannot be made, as
@@ -340,6 +344,7 @@ impl HostSurface {
     }
 }
 
+#[cfg(unix)]
 impl Drop for HostSurface {
     fn drop(&mut self) {
         // Made behind the display's calls in hand; the driver holds the
@@ -353,6 +358,7 @@ impl Drop for HostSurface {
 /// pitches: refused where the descriptor's 32-bit fields cannot hold them,
 /// or where the driver refuses the import. The driver holds what it
 /// imports until it destroys the surface, so `fd` may be closed after.
+#[cfg(unix)]
 fn import(
     display: &Display,
     format: HostFormat,
@@ -431,6 +437,7 @@ fn import(
 /// `surface`'s memory, exported for reading (`vaExportSurfaceHandle`, its
 /// layers composed into one): the descriptor, and its objects' dma-bufs,
 /// owned.
+#[cfg(unix)]
 fn export(
     display: &Display,
     surface: ffi::VASurfaceID,
@@ -460,6 +467,7 @@ fn export(
 
 /// The staged way back: a [`HostSurface`] of the pool's format, and a
 /// video-processing context that copies a decode surface into it.
+#[cfg(unix)]
 pub(crate) struct Staging {
     /// Destroyed before the surface and the memory under it: the fields
     /// drop in their order.
@@ -467,6 +475,7 @@ pub(crate) struct Staging {
     host: HostSurface,
 }
 
+#[cfg(unix)]
 impl Staging {
     /// A staging surface for `width` by `height` frames of `format`.
     pub(crate) fn new(
@@ -583,10 +592,12 @@ pub(crate) fn destroy_surface(display: &Display, mut surface: ffi::VASurfaceID) 
 /// The `mapped` way back, for comparison: each decode surface's own
 /// dma-buf, mapped once, read with streaming loads.
 #[derive(Default)]
+#[cfg(unix)]
 pub(crate) struct Mappings {
     by_surface: HashMap<ffi::VASurfaceID, Mapping>,
 }
 
+#[cfg(unix)]
 struct Mapping {
     fd: OwnedFd,
     map: *mut u8,
@@ -595,8 +606,10 @@ struct Mapping {
 }
 
 // SAFETY: a read-only mapping of the dma-buf, owned by this value.
+#[cfg(unix)]
 unsafe impl Send for Mapping {}
 
+#[cfg(unix)]
 unsafe extern "C" {
     fn mmap(
         address: *mut core::ffi::c_void,
@@ -618,6 +631,7 @@ const DMA_BUF_SYNC_READ: u64 = 1;
 const DMA_BUF_SYNC_START: u64 = 0;
 const DMA_BUF_SYNC_END: u64 = 1 << 2;
 
+#[cfg(unix)]
 impl Mapping {
     /// The surface's own dma-buf, mapped: refused, with its layout, where
     /// it is not one linear dma-buf.
@@ -659,6 +673,7 @@ impl Mapping {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Mapping {
     fn drop(&mut self) {
         // SAFETY: the mapping made in `Mappings::read`, unmapped once.
@@ -666,6 +681,7 @@ impl Drop for Mapping {
     }
 }
 
+#[cfg(unix)]
 impl Mappings {
     /// Begins a read of `surface` through its own mapping, made on first
     /// use: its bytes, its planes' offsets and pitches, and the dma-buf's
@@ -697,6 +713,7 @@ impl Mappings {
 
 /// A read [`Mappings::begin_read`] began: the surface's bytes, its planes'
 /// offsets and pitches, and the dma-buf whose read [`end_read`] ends.
+#[cfg(unix)]
 pub(crate) struct MappedRead<'a> {
     pub(crate) bytes: &'a [u8],
     pub(crate) planes: [(usize, usize); 2],
@@ -704,11 +721,13 @@ pub(crate) struct MappedRead<'a> {
 }
 
 /// Ends a read [`Mappings::begin_read`] began of the dma-buf `fd`.
+#[cfg(unix)]
 pub(crate) fn end_read(fd: RawFd) {
     sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
 }
 
 /// `DMA_BUF_IOCTL_SYNC` of the dma-buf `fd` with `flags`.
+#[cfg(unix)]
 fn sync(fd: RawFd, flags: u64) {
     // SAFETY: a dma-buf's descriptor and a `struct dma_buf_sync`.
     unsafe { ioctl(fd, DMA_BUF_IOCTL_SYNC, &raw const flags) };
@@ -716,6 +735,71 @@ fn sync(fd: RawFd, flags: u64) {
 
 fn to_usize(value: u32) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+/// The staged way back on Windows: none, as Windows makes no dma-buf to import host memory of
+/// ours as a surface; a pool's frames come back through images there.
+#[cfg(windows)]
+pub(crate) enum Staging {}
+
+#[cfg(windows)]
+impl Staging {
+    /// Refused: the host imports no memory of ours as a surface.
+    pub(crate) fn new(
+        _display: &Display,
+        _format: SurfaceFormat,
+        _width: u32,
+        _height: u32,
+    ) -> Result<Self, Error> {
+        Err(Error::Unsupported(
+            "a staged copy back: this host makes no dma-buf to import host memory".to_owned(),
+        ))
+    }
+
+    /// The staging surface.
+    pub(crate) fn surface(&self) -> ffi::VASurfaceID {
+        match *self {}
+    }
+
+    /// Never called: no staging is made.
+    pub(crate) fn stage(
+        &self,
+        _source: ffi::VASurfaceID,
+        _deadline: MonoTime,
+    ) -> Result<(), Error> {
+        match *self {}
+    }
+
+    /// Never called: no staging is made.
+    pub(crate) fn bytes(&self) -> (&[u8], [(usize, usize); 2]) {
+        match *self {}
+    }
+}
+
+/// Reads of a decode surface's own dma-buf, on Windows: none, as it makes no dma-buf.
+#[cfg(windows)]
+#[derive(Default)]
+pub(crate) struct Mappings {}
+
+#[cfg(windows)]
+impl Mappings {
+    /// Refused: the host makes no dma-buf of a surface.
+    pub(crate) fn begin_read(
+        &mut self,
+        _display: &Display,
+        _surface: ffi::VASurfaceID,
+    ) -> Result<MappedRead<'_>, Error> {
+        Err(Error::Unsupported(
+            "a mapped read: this host makes no dma-buf of a surface".to_owned(),
+        ))
+    }
+}
+
+/// A read of a surface's own dma-buf, which Windows never begins.
+#[cfg(windows)]
+pub(crate) struct MappedRead<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) planes: [(usize, usize); 2],
 }
 
 #[cfg(test)]

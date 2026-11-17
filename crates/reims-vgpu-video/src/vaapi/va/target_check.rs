@@ -45,6 +45,7 @@ use std::path::Path;
 
 use super::display::Display;
 use super::frame::Frame;
+#[cfg(unix)]
 use super::host_memory::HostMemory;
 use super::target::{Target, TargetFormat, TargetPlane, TargetShape};
 use super::{Entrypoint, H264Decoder, HevcDecoder, Profile};
@@ -215,12 +216,14 @@ fn write(file: &Path, key: &str, checks: &TargetChecks) -> std::io::Result<()> {
 
 /// Memory of the check's own for a target of `shape`, laid out as the module docs say, every byte
 /// [`UNWRITTEN`].
+#[cfg(unix)]
 struct Laid {
     memory: HostMemory,
     planes: [TargetPlane; 2],
     shape: TargetShape,
 }
 
+#[cfg(unix)]
 impl Laid {
     fn new(shape: TargetShape) -> Result<Laid, String> {
         let (width, height) = shape.coded;
@@ -392,6 +395,17 @@ impl Decoder {
 
 /// The check of `codec` into `format` (module docs) on `display`: `Err` with why it failed, or
 /// why it was not run.
+/// Refused on Windows, which makes no dma-buf: no decode is handed a target there.
+#[cfg(windows)]
+fn check_kind(
+    _display: &Display,
+    _codec: TargetCodec,
+    _format: TargetFormat,
+) -> Result<(), String> {
+    Err("this host makes no dma-buf to decode into".to_owned())
+}
+
+#[cfg(unix)]
 fn check_kind(display: &Display, codec: TargetCodec, format: TargetFormat) -> Result<(), String> {
     let profile = match (codec, format) {
         (TargetCodec::H264, TargetFormat::Nv12) => Profile::H264_CONSTRAINED_BASELINE,
@@ -462,6 +476,7 @@ fn check_kind(display: &Display, codec: TargetCodec, format: TargetFormat) -> Re
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use crate::codec::encode::{EncoderSettings, InputFrame, Plane, Profile as Encoded};

@@ -1,12 +1,17 @@
-//! A VA display on a DRM render node, and libva's errors.
+//! A VA display on a DRM render node, or on Windows on a DXGI adapter, and
+//! libva's errors.
 
 use std::ffi::CStr;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use crate::core::runtime::{MonoTime, Runtime, park_for_good};
+use crate::core::runtime::{ExitStep, MonoTime, Runtime, park_for_good};
 use crate::core::sync::Mutex;
 
 use super::calls::{Calls, Late};
@@ -56,7 +61,10 @@ impl std::fmt::Display for Error {
         match self {
             Self::Load(e) => write!(f, "{e}"),
             Self::Open(e) => write!(f, "cannot open the render node: {e}"),
+            #[cfg(unix)]
             Self::NoDisplay => write!(f, "vaGetDisplayDRM returned no display"),
+            #[cfg(windows)]
+            Self::NoDisplay => write!(f, "vaGetDisplayWin32 returned no display"),
             Self::Va {
                 call,
                 status,
@@ -89,7 +97,7 @@ impl From<crate::codec::hevc::Error> for Error {
 /// `Ok` for `VA_STATUS_SUCCESS`, else the error with libva's text.
 pub(crate) fn check(call: &'static str, status: ffi::VAStatus) -> Result<(), Error> {
     // The session-start probe's timeline of the calls (`crate::probes::timeline`).
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     crate::probes::timeline::stamp(call);
     if status == ffi::VA_STATUS_SUCCESS {
         return Ok(());
@@ -176,6 +184,7 @@ impl Display {
     /// What is made on it runs on `runtime`. Once the process's exit began,
     /// the thread parks for good before any call of libva's, as before each
     /// call of the display's (`super::calls`, "The process's exit").
+    #[cfg(unix)]
     pub fn open(path: impl AsRef<Path>, runtime: Arc<dyn Runtime>) -> Result<Self, Error> {
         let path = path.as_ref();
         // The open's own calls of libva, `vaInitialize` and a failed one's `vaTerminate` among
@@ -197,6 +206,51 @@ impl Display {
         if raw.is_null() {
             return Err(Error::NoDisplay);
         }
+        Self::initialise(raw, path.display().to_string(), Some(node), runtime, step)
+    }
+
+    /// Initialises VA-API on the DXGI adapter whose LUID is `luid` (the
+    /// Vulkan device's `deviceLUID`), as [`Display::open`] does on a render
+    /// node: libva-win32 picks the adapter's driver, Mesa's VA-on-D3D12
+    /// (`vaon12`) where the adapter's registry names none. `None` is the
+    /// adapter the driver picks, for the examples. No import check runs:
+    /// Windows makes no dma-buf, so the driver is lent no import
+    /// ([`Display::import_writes`] says so) and frames come back through
+    /// images.
+    #[cfg(windows)]
+    pub fn open_adapter(luid: Option<[u8; 8]>, runtime: Arc<dyn Runtime>) -> Result<Self, Error> {
+        let Some(step) = runtime.exit_step() else {
+            park_for_good()
+        };
+        super::libva::load().map_err(Error::Load)?;
+        let adapter = luid
+            .as_ref()
+            .map_or(core::ptr::null(), |luid| luid.as_ptr().cast());
+        // SAFETY: `adapter` is null or a LUID's 8 bytes (`LowPart` then
+        // `HighPart`, little-endian, as Vulkan's `deviceLUID` holds them),
+        // read during the call alone.
+        let raw = unsafe { ffi::vaGetDisplayWin32(adapter) };
+        if raw.is_null() {
+            return Err(Error::NoDisplay);
+        }
+        let name = match luid {
+            Some(luid) => format!("the DXGI adapter of LUID {:#x}", u64::from_le_bytes(luid)),
+            None => "the DXGI adapter the driver picks".to_owned(),
+        };
+        Self::initialise(raw, name, None, runtime, step)
+    }
+
+    /// The rest of an open, on the display `raw` libva made: `vaInitialize`,
+    /// the driver's answers and, where Linux makes dma-bufs, the import
+    /// check. `step` is the open's step of the host's exit gate, ended once
+    /// libva's own calls of the open are made.
+    fn initialise(
+        raw: ffi::VADisplay,
+        path: String,
+        node: Option<File>,
+        runtime: Arc<dyn Runtime>,
+        step: ExitStep,
+    ) -> Result<Self, Error> {
         // SAFETY: `raw` is a display; a null callback disables the
         // messages (va.h, vaSetInfoCallback).
         unsafe { ffi::vaSetInfoCallback(raw, None, core::ptr::null_mut()) };
@@ -229,9 +283,9 @@ impl Display {
                 calls: Calls::new(raw, Arc::clone(&runtime)),
                 version: (major, minor),
                 vendor,
-                path: path.display().to_string(),
+                path,
                 answers: Mutex::new(Answers::default()),
-                node: Some(node),
+                node,
                 runtime,
                 import_writes: OnceLock::new(),
             }),
@@ -372,6 +426,7 @@ fn held() -> Error {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};

@@ -21,10 +21,13 @@
 //! Vulkan's driver of the same GPU (RADV, ANV) imported each plane as an image of that modifier
 //! and copied it byte for byte.
 
+#[cfg(unix)]
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Weak};
 
-use super::display::{Display, Error, check};
+#[cfg(unix)]
+use super::display::check;
+use super::display::{Display, Error};
 use super::ffi;
 
 /// One plane of a [`SurfaceExport`]: where it lies in its dma-buf, and how.
@@ -45,6 +48,7 @@ pub struct ExportedPlane {
 /// A surface's memory as dma-bufs (module docs), kept while its pool lives.
 #[derive(Debug)]
 pub struct SurfaceExport {
+    #[cfg(unix)]
     objects: Vec<OwnedFd>,
     planes: [ExportedPlane; 2],
     size: (u32, u32),
@@ -59,6 +63,7 @@ impl SurfaceExport {
     }
 
     /// The dma-buf `plane` lies in, owned by the export.
+    #[cfg(unix)]
     pub fn fd(&self, plane: usize) -> BorrowedFd<'_> {
         self.objects[self.plane(plane).object].as_fd()
     }
@@ -97,6 +102,7 @@ pub(crate) fn export_for_write(
 }
 
 /// Exports `surface`, of `size`, on `display`, with `access`, a `VA_EXPORT_SURFACE_*_ONLY` flag.
+#[cfg(unix)]
 fn export_as(
     display: &Display,
     surface: ffi::VASurfaceID,
@@ -130,8 +136,23 @@ fn export_as(
     })
 }
 
+/// Refused on Windows, which makes no dma-buf: a surface's planes reach another device there by
+/// no export of the driver's.
+#[cfg(windows)]
+fn export_as(
+    _display: &Display,
+    _surface: ffi::VASurfaceID,
+    _size: (u32, u32),
+    _access: u32,
+) -> Result<SurfaceExport, Error> {
+    Err(Error::Unsupported(
+        "a surface exported as dma-bufs: this host makes none".to_owned(),
+    ))
+}
+
 /// The two planes of an export of separate layers: each layer one plane in an object the export
 /// holds; `Err` with the export's shape otherwise.
+#[cfg(unix)]
 fn planes_of(descriptor: &ffi::VADRMPRIMESurfaceDescriptor) -> Result<[ExportedPlane; 2], Error> {
     let shape = || {
         let layers =
@@ -165,6 +186,7 @@ fn planes_of(descriptor: &ffi::VADRMPRIMESurfaceDescriptor) -> Result<[ExportedP
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 

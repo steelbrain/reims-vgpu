@@ -53,6 +53,7 @@
 
 use std::time::Duration;
 
+#[cfg(unix)]
 use crate::core::device_memory::{
     DeviceMemory, DmaBufError, GuestTarget, MemoryIdentity, MemoryLife, SurfaceDmaBuf,
 };
@@ -62,6 +63,7 @@ use crate::core::sync::Mutex;
 
 use super::display::{Display, Error};
 use super::ffi;
+#[cfg(unix)]
 use super::host_memory::HostMemory;
 use super::image::Image;
 use super::surface::{SurfaceFormat, SurfacePool};
@@ -166,7 +168,15 @@ impl ImportWrites {
     }
 }
 
+/// On Windows, which makes no dma-buf, no trial runs: the driver is lent no import, and its
+/// frames come back through images ("The copy back").
+#[cfg(windows)]
+pub(crate) fn learn(_display: &Display) -> ImportWrites {
+    ImportWrites::none("this host makes no dma-buf to import")
+}
+
 /// Runs the trial for both formats on `display`, on this thread (module docs).
+#[cfg(unix)]
 pub(crate) fn learn(display: &Display) -> ImportWrites {
     let clock = display.runtime();
     let start = clock.now();
@@ -204,6 +214,7 @@ pub(crate) fn learn(display: &Display) -> ImportWrites {
 
 /// The first of [`ALIGNMENTS`] at which an import of `format` is written right, in any rows or
 /// in rows of whole alignments (module docs), or why none is.
+#[cfg(unix)]
 fn learn_format(display: &Display, format: SurfaceFormat) -> Result<ImportWrite, String> {
     let picture = Picture {
         format,
@@ -504,6 +515,7 @@ fn place_of(
 /// imported as `write` says: `Ok(None)` where the import is taken and the run writes it right,
 /// `Ok(Some)` with what it wrote wrong, and `Err` with why where the import or the run is
 /// refused.
+#[cfg(unix)]
 fn trial(
     display: &Display,
     source: &Source,
@@ -515,6 +527,7 @@ fn trial(
 }
 
 /// [`trial`], in `strips` strips where given (zero copy's least that fit where not).
+#[cfg(unix)]
 fn trial_in(
     display: &Display,
     source: &Source,
@@ -553,11 +566,13 @@ fn trial_in(
 
 /// Memory of the trial's own, as a guest buffer's is lent to a device: its pages as dma-bufs
 /// of ranges of them.
+#[cfg(unix)]
 struct TrialMemory {
     memory: Mutex<HostMemory>,
     life: MemoryLife,
 }
 
+#[cfg(unix)]
 impl TrialMemory {
     /// `size` bytes, every one [`UNTOUCHED`].
     fn new(size: usize) -> Result<Self, Error> {
@@ -570,6 +585,7 @@ impl TrialMemory {
     }
 }
 
+#[cfg(unix)]
 impl DeviceMemory for TrialMemory {
     fn identity(&self) -> MemoryIdentity {
         self.life.identity()
@@ -603,6 +619,7 @@ fn to_usize(value: u32) -> usize {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 

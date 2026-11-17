@@ -63,13 +63,14 @@
 //! with each strip. The frame's pool is stalled with it
 //! (`super::surface`).
 
+#[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::Arc;
 
 use crate::core::backend::DeviceWrite;
-use crate::core::device_memory::{
-    DeviceImports, DmaBufError, GuestTarget, SurfaceDmaBuf, TargetPlane,
-};
+use crate::core::device_memory::{DeviceImports, GuestTarget, TargetPlane};
+#[cfg(unix)]
+use crate::core::device_memory::{DmaBufError, SurfaceDmaBuf};
 use crate::core::runtime::MonoTime;
 use crate::core::sync::Mutex;
 
@@ -154,6 +155,7 @@ struct Strip {
     top: u32,
     rows: u32,
     /// The dma-buf of its rows, which the surface's buffer object holds too.
+    #[cfg(unix)]
     dma_buf: OwnedFd,
 }
 
@@ -412,6 +414,7 @@ impl GuestImport {
         }
         // The runs' fences, waited for with no lock of the driver's held,
         // so that the display's other calls go on meanwhile (`fence.rs`).
+        #[cfg(unix)]
         super::fence::wait_for_writes(
             &**self.display.runtime(),
             deadline,
@@ -474,6 +477,7 @@ enum Cut {
 /// `size` (module docs): each an even number of the frame's rows, a dma-buf
 /// of their luma rows and their chroma rows, and a linear VA surface over it
 /// at the guest's own pitches, as `write` says the driver takes it.
+#[cfg(unix)]
 fn strips(
     display: &Display,
     target: &GuestTarget<'_>,
@@ -583,6 +587,23 @@ fn destroy(display: &Display, strips: &[Strip]) {
     }
 }
 
+/// On Windows, which makes no dma-buf: no strip is had (the display lends no import there, so
+/// [`write`] declines before it asks).
+#[cfg(windows)]
+fn strips(
+    _display: &Display,
+    _target: &GuestTarget<'_>,
+    _format: SurfaceFormat,
+    _size: (u32, u32),
+    _count: usize,
+    _write: ImportWrite,
+) -> Result<Vec<Strip>, Cut> {
+    Err(Cut::Refused(
+        "this host makes no dma-buf of a buffer".to_owned(),
+    ))
+}
+
+#[cfg(unix)]
 impl Strip {
     /// A linear VA surface of `size` over `dma_buf`, the strip's luma rows
     /// and its chroma rows, at `planes`' pitches, as `write` says the driver

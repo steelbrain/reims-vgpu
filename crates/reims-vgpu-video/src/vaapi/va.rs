@@ -8,6 +8,9 @@
 //! constants are checked against libva's headers by `ffi`'s ignored tests.
 
 #![deny(clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]
+// Windows makes no dma-buf: the module's dma-buf half is compiled out there where it names Unix's
+// descriptors, and what is left of it, unused there, is let be.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
 
 mod buffer;
 mod calls;
@@ -15,24 +18,29 @@ mod caps;
 mod display;
 mod encoder;
 mod export;
+#[cfg(unix)]
 mod fence;
 mod ffi;
 mod frame;
 #[cfg(test)]
+#[cfg(unix)]
 pub(crate) mod gated;
 mod h264;
 mod hevc;
+#[cfg(unix)]
 mod host_memory;
 mod image;
 mod import_check;
 mod libva;
 mod readback;
 #[cfg(test)]
+#[cfg(unix)]
 mod spin;
 mod surface;
 mod target;
 mod target_check;
 #[cfg(test)]
+#[cfg(unix)]
 pub(crate) mod target_probe;
 mod vpp_ffi;
 mod wait;

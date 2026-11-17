@@ -1,7 +1,10 @@
 //! libva and libva-drm, loaded at run time with `dlopen` and `dlsym`, so
 //! that a QEMU built with this crate starts on a host without them and
 //! links nothing of libva's. The nvidia crate loads NVIDIA's libraries the
-//! same way.
+//! same way. On Windows the two are libva and libva-win32 (`libva.dll` and
+//! `libva_win32.dll`, MSYS2 CLANG64's builds), loaded with `LoadLibraryW`
+//! and `GetProcAddress`; libva finds its driver, Mesa's VA-on-D3D12
+//! (`vaon12_drv_video.dll`), beside `libva.dll`.
 //!
 //! Every libva function the binding calls has a wrapper here of the same
 //! name and signature. `ffi` and `ffi::encode` re-export them, so no call
@@ -25,6 +28,7 @@ use super::ffi::{
     VASurfaceAttrib, VASurfaceID,
 };
 
+#[cfg(unix)]
 #[link(name = "dl")]
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
@@ -34,16 +38,35 @@ unsafe extern "C" {
 
 /// `RTLD_NOW`: resolve every symbol at load, so that a broken library
 /// fails here rather than at its first call. glibc's value.
+#[cfg(unix)]
 const RTLD_NOW: c_int = 2;
 /// `RTLD_LOCAL`: keep the library's symbols out of the global scope.
 /// glibc's value. libva-drm names libva as a dependency, and libva's
 /// driver names what it needs, so neither looks for them globally.
+#[cfg(unix)]
 const RTLD_LOCAL: c_int = 0;
 
 /// libva's file name: its soname, as a host's loader finds it.
+#[cfg(unix)]
 const LIBVA: &CStr = c"libva.so.2";
 /// libva-drm's.
+#[cfg(unix)]
 const LIBVA_DRM: &CStr = c"libva-drm.so.2";
+
+/// libva's file name on Windows, as MSYS2 CLANG64 names it: found beside
+/// the executable, or on the DLL search path.
+#[cfg(windows)]
+const LIBVA: &CStr = c"libva.dll";
+/// libva-win32's, which makes a display on a DXGI adapter.
+#[cfg(windows)]
+const LIBVA_WIN32: &CStr = c"libva_win32.dll";
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LoadLibraryW(name: *const u16) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+}
 
 /// Why libva or one of its functions could not be loaded.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +91,7 @@ impl fmt::Display for LoadError {
 impl std::error::Error for LoadError {}
 
 /// The text of the last `dlopen` or `dlsym` failure on this thread.
+#[cfg(unix)]
 fn last_error() -> String {
     // SAFETY: dlerror takes no arguments; it returns NULL or a
     // NUL-terminated string that stays valid until the next dl call on
@@ -89,6 +113,14 @@ struct Library {
     name: &'static str,
 }
 
+/// The text of the last `LoadLibraryW` or `GetProcAddress` failure on this
+/// thread: the system's message for its code.
+#[cfg(windows)]
+fn last_error() -> String {
+    std::io::Error::last_os_error().to_string()
+}
+
+#[cfg(unix)]
 impl Library {
     /// Loads the library `name` from the loader's search path.
     fn open(name: &'static CStr) -> Result<Self, LoadError> {
@@ -120,6 +152,44 @@ impl Library {
         // SAFETY: the handle is a live dlopen handle (never closed) and the
         // name is NUL-terminated.
         let address = unsafe { dlsym(self.handle.as_ptr(), name.as_ptr()) };
+        NonNull::new(address).ok_or_else(|| missing(last_error()))
+    }
+}
+
+#[cfg(windows)]
+impl Library {
+    /// Loads the library `name` from the DLL search path: the executable's
+    /// directory first.
+    fn open(name: &'static CStr) -> Result<Self, LoadError> {
+        let library = name.to_str().unwrap_or("?");
+        let wide: Vec<u16> = library.encode_utf16().chain([0]).collect();
+        // SAFETY: `wide` is NUL-terminated UTF-16; the library's
+        // initialisers register nothing in this process's globals.
+        let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
+        match NonNull::new(handle) {
+            Some(handle) => Ok(Self {
+                handle,
+                name: library,
+            }),
+            None => Err(LoadError {
+                library,
+                symbol: None,
+                reason: last_error(),
+            }),
+        }
+    }
+
+    /// The address of the function `symbol`.
+    fn symbol(&self, symbol: &'static str) -> Result<NonNull<c_void>, LoadError> {
+        let missing = |reason: String| LoadError {
+            library: self.name,
+            symbol: Some(symbol),
+            reason,
+        };
+        let name = CString::new(symbol).map_err(|e| missing(e.to_string()))?;
+        // SAFETY: the handle is a live module handle (never freed) and the
+        // name is NUL-terminated.
+        let address = unsafe { GetProcAddress(self.handle.as_ptr(), name.as_ptr()) };
         NonNull::new(address).ok_or_else(|| missing(last_error()))
     }
 }
@@ -343,6 +413,7 @@ functions! {
     }
 }
 
+#[cfg(unix)]
 functions! {
     /// libva-drm's function (va_drm.h).
     struct VaDrm in drm {
@@ -350,10 +421,22 @@ functions! {
     }
 }
 
+#[cfg(windows)]
+functions! {
+    /// libva-win32's function (va_win32.h): a display on the DXGI adapter
+    /// whose LUID `adapter_luid` points at.
+    struct VaWin32 in win32 {
+        fn vaGetDisplayWin32(adapter_luid: *const c_void) -> VADisplay;
+    }
+}
+
 /// Both libraries' functions.
 struct Loaded {
     va: Va,
+    #[cfg(unix)]
     drm: VaDrm,
+    #[cfg(windows)]
+    win32: VaWin32,
 }
 
 /// What [`load`] found, once for the process.
@@ -362,12 +445,22 @@ static LOADED: OnceLock<Result<Loaded, LoadError>> = OnceLock::new();
 /// Loads libva and libva-drm, and every function the binding calls from
 /// them, on the first call; later calls give the first one's answer.
 pub(crate) fn load() -> Result<(), LoadError> {
+    #[cfg(unix)]
     let loaded = LOADED.get_or_init(|| {
         let va = Library::open(LIBVA)?;
         let drm = Library::open(LIBVA_DRM)?;
         Ok(Loaded {
             va: Va::load(&va)?,
             drm: VaDrm::load(&drm)?,
+        })
+    });
+    #[cfg(windows)]
+    let loaded = LOADED.get_or_init(|| {
+        let va = Library::open(LIBVA)?;
+        let win32 = Library::open(LIBVA_WIN32)?;
+        Ok(Loaded {
+            va: Va::load(&va)?,
+            win32: VaWin32::load(&win32)?,
         })
     });
     match loaded {
@@ -400,6 +493,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_missing_function_names_itself() {
         // glibc's libc is in every process here, and has no libva function.
         let library = Library::open(c"libc.so.6");
@@ -407,6 +501,18 @@ mod tests {
         assert_eq!(
             error.as_ref().map(|e| (e.library, e.symbol)),
             Some(("libc.so.6", Some("vaInitialize")))
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_missing_function_names_itself() {
+        // kernel32 is in every process here, and has no libva function.
+        let library = Library::open(c"kernel32.dll");
+        let error = library.and_then(|l| l.symbol("vaInitialize")).err();
+        assert_eq!(
+            error.as_ref().map(|e| (e.library, e.symbol)),
+            Some(("kernel32.dll", Some("vaInitialize")))
         );
     }
 }

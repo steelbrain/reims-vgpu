@@ -566,15 +566,19 @@ pub(crate) mod hevc_long_slice_flags {
 
 // libva's functions, loaded at run time rather than linked (`super::libva`):
 // wrappers of the same names and signatures.
+#[cfg(unix)]
+pub(crate) use super::libva::vaGetDisplayDRM;
+#[cfg(windows)]
+pub(crate) use super::libva::vaGetDisplayWin32;
 pub(crate) use super::libva::{
     vaBeginPicture, vaCreateBuffer, vaCreateConfig, vaCreateContext, vaCreateImage,
     vaCreateSurfaces, vaDeriveImage, vaDestroyBuffer, vaDestroyConfig, vaDestroyContext,
     vaDestroyImage, vaDestroySurfaces, vaEndPicture, vaErrorStr, vaExportSurfaceHandle,
-    vaGetConfigAttributes, vaGetDisplayDRM, vaGetImage, vaInitialize, vaMapBuffer,
-    vaMaxNumEntrypoints, vaMaxNumImageFormats, vaMaxNumProfiles, vaPutImage,
-    vaQueryConfigEntrypoints, vaQueryConfigProfiles, vaQueryImageFormats, vaQuerySurfaceAttributes,
-    vaQueryVendorString, vaQueryVideoProcFilters, vaRenderPicture, vaSetInfoCallback,
-    vaSyncSurface, vaSyncSurface2, vaTerminate, vaUnmapBuffer,
+    vaGetConfigAttributes, vaGetImage, vaInitialize, vaMapBuffer, vaMaxNumEntrypoints,
+    vaMaxNumImageFormats, vaMaxNumProfiles, vaPutImage, vaQueryConfigEntrypoints,
+    vaQueryConfigProfiles, vaQueryImageFormats, vaQuerySurfaceAttributes, vaQueryVendorString,
+    vaQueryVideoProcFilters, vaRenderPicture, vaSetInfoCallback, vaSyncSurface, vaSyncSurface2,
+    vaTerminate, vaUnmapBuffer,
 };
 
 #[cfg(test)]

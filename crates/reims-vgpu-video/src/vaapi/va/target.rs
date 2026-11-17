@@ -35,6 +35,7 @@
 //!   keep ([`Target::import`]), until the last of it and its pictures goes; the surface is then
 //!   destroyed (`Display::release`).
 
+#[cfg(unix)]
 use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};
 use std::sync::Arc;
 
@@ -128,6 +129,7 @@ struct Imported {
     id: ffi::VASurfaceID,
     shape: TargetShape,
     /// The memory's descriptor, held for the surface's life.
+    #[cfg(unix)]
     _dma_buf: OwnedFd,
     /// What the caller gave to keep while the surface lives.
     _keep: Box<dyn Send + Sync>,
@@ -158,7 +160,8 @@ impl Target {
     /// planes lie at `luma` and `chroma`, keeping `keep` while the surface lives. `Err` where the
     /// driver refuses the import, or the layout does not fit the dma-buf: a plane whose rows do not
     /// hold the coded picture's samples, whose rows run past the dma-buf, or which overlaps the
-    /// other.
+    /// other. Unix's alone: Windows makes no dma-buf.
+    #[cfg(unix)]
     pub fn import(
         display: &Display,
         dma_buf: BorrowedFd<'_>,
