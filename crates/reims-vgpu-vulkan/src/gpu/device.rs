@@ -2127,7 +2127,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     sel,
                     timing::DISPATCH_LATER,
                     || match plain_at(sel, || self.raw.new_compute_pipeline_state(&d, &options)) {
-                        Ok(state) => Ok(Some(Obj::new(ComputePipelineObject::new(state)))),
+                        Ok(state) => Ok(Some(Obj::new(ComputePipelineObject::linking(
+                            state,
+                            !desc.linked.is_empty(),
+                        )))),
                         Err(e) => Err(compile_error(sel, e, Some(&d))),
                     },
                     || format!("kernel {}", timing::stage(&d.kernel)),

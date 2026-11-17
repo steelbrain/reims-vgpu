@@ -602,6 +602,9 @@ pub struct ComputePipelineObject {
     pub raw: rt::ComputePipelineState,
     /// Its `uniqueIdentifier`.
     pub unique_identifier: u64,
+    /// Whether its descriptor linked functions (`MTLLinkedFunctions`): the recorder snapshots the
+    /// Private buffers its dispatches bind ([`crate::recorder::private`]).
+    pub links_functions: bool,
 }
 
 impl ComputePipelineObject {
@@ -613,6 +616,15 @@ impl ComputePipelineObject {
         ComputePipelineObject {
             raw,
             unique_identifier,
+            links_functions: false,
+        }
+    }
+
+    /// [`Self::new`], of a descriptor that linked functions where `links_functions`.
+    pub fn linking(raw: rt::ComputePipelineState, links_functions: bool) -> ComputePipelineObject {
+        ComputePipelineObject {
+            links_functions,
+            ..ComputePipelineObject::new(raw)
         }
     }
 }

@@ -142,13 +142,14 @@ pub fn unzigzag(v: u64) -> i64 {
 }
 
 /// The writer's side of a stream: the bytes written since the last [`Stream::take`], the names
-/// and blobs defined so far, which carry across segments.
+/// and blobs defined so far and the call records written, which carry across segments.
 #[derive(Debug, Default)]
 pub struct Stream {
     out: Vec<u8>,
     names: HashMap<String, u64>,
     blobs: HashSet<Hash>,
     scratch: Vec<u8>,
+    calls: u64,
 }
 
 impl Stream {
@@ -170,6 +171,12 @@ impl Stream {
     /// How many bytes wait to be taken.
     pub fn pending(&self) -> usize {
         self.out.len()
+    }
+
+    /// How many call records it wrote, across its segments: the next call's position in the
+    /// stream, from 0, as a player counts the calls it played.
+    pub fn calls(&self) -> u64 {
+        self.calls
     }
 
     fn record(out: &mut Vec<u8>, kind: u8, payload: &[u8]) {
@@ -236,6 +243,7 @@ impl Stream {
         let before = self.out.len();
         Self::record(&mut self.out, KIND_CALL, &p);
         self.scratch = p;
+        self.calls += 1;
         self.out.len() - before
     }
 

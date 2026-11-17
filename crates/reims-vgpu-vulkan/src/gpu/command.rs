@@ -380,6 +380,12 @@ impl CommandBufferObject {
         }
     }
 
+    /// How many runtime encoders it has made ([`Self::made_encoder`]).
+    #[cfg(test)]
+    pub(crate) fn encoders_made(&self) -> usize {
+        self.made.load(Ordering::SeqCst)
+    }
+
     /// A runtime encoder it made, for an encoder of Metal's (`whole`) or a part of one: its place
     /// among the encoders the runtime ends. An encoder of Metal's made under protection options
     /// other than 0 fails the command buffer from it, with
@@ -1596,11 +1602,16 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     }
 
     /// Its compute encoders keep no bindings for command predication, and its dispatches take
-    /// no hold of its predication's state ([`Predication::hold_none`]).
+    /// no hold of its predication's state ([`Predication::hold_none`]); but in a process that
+    /// records, whose recorder reads the bindings of a dispatch it snapshots
+    /// ([`crate::recorder::private`]), and where a record of command predication then runs as in
+    /// any other command buffer.
     fn holds_no_predication(&self) {
         let recorded_call = crate::recorder::rec_call!("m2v.holdsNoPredication", self);
         crate::recorder::run(|| {
-            self.predication.hold_none();
+            if recorded_call.is_none() {
+                self.predication.hold_none();
+            }
         });
         crate::recorder::rec_done!(recorded_call, ());
     }

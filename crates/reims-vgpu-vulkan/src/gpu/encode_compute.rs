@@ -181,7 +181,8 @@ impl Concurrent for VulkanComputeEncoder {
 
 impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
     fn encode(&self, _on: OnFault, cmd: ComputeCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
-        let recorded_call = crate::recorder::rec_call!(@cmd self, cmd);
+        let mut recorded_call = crate::recorder::rec_call!(@cmd self, cmd);
+        let snapshot = crate::recorder::private::before(&recorded_call, self, &cmd);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
             let sel = cmd.selector();
             predication::observe(self, &cmd);
@@ -505,6 +506,8 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                 ComputeCmd::WaitForFence { fence } => caught(&mut |e| e.wait_for_fence(fence)),
             }
         });
+        let sent = recorded_answer.is_ok();
+        crate::recorder::private::after(&mut recorded_call, self, snapshot, sent);
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }

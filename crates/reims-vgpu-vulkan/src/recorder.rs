@@ -26,6 +26,11 @@
 //!   the guest's memory is written as its block's bytes. A copy out of the guest's RAM carries the
 //!   bytes it reads as its arguments ([`guest_ram_source`]), and a buffer made as a copy of host
 //!   memory the bytes it starts with ([`contents`]).
+//! - **Private buffers around dispatches.** Around each recorded dispatch of a compute pipeline
+//!   made with linked functions, a blit copies each Private buffer range it binds into a Shared
+//!   buffer of the recorder's own, before the dispatch and after it, and at the command buffer's
+//!   completion an `m2v.privateBytes` record names the dispatch and holds both bytes as blobs
+//!   ([`private`]).
 //! - **The calling thread captures; the writer shapes.** Each call's record is queued, owned,
 //!   under one lock as the call returns, so the stream's order keeps each thread's, with what
 //!   only the call's moment has: its objects' ids, the bytes it consumes and the memory a commit
@@ -35,7 +40,8 @@
 //!   what is queued on its own thread, since its capture needs every earlier call tracked.
 //! - **The file.** The writer writes the stream out every [`FLUSH`], into segments
 //!   `<pid>.NNNN.m2vr` of at most [`SEGMENT`] bytes, each starting with the header. Libraries go
-//!   once each into the `blobs` directory beside the stream's, by the hex of their SHA-256.
+//!   once each into the `blobs` directory beside the stream's, by the hex of their SHA-256, and
+//!   so do the bytes of `m2v.privateBytes`.
 //!   `<pid>.stats.txt` says what was written, every few seconds.
 //!
 //! Recordings hold the guest's data: they stay on the host that made them and are never
@@ -43,6 +49,7 @@
 
 pub mod debug_value;
 pub mod format;
+pub mod private;
 pub mod typed;
 
 use std::any::Any;
@@ -236,6 +243,8 @@ pub struct Active {
     pending: Option<Call>,
     /// An encoder command's `Debug` text, which the writer reads into its arguments.
     text: Option<String>,
+    /// The snapshot of the dispatch it is, whose record names its position ([`private`]).
+    snap: Option<u64>,
 }
 
 /// Opens a call: its selector, receiver and arguments, read only where it is the outermost.
@@ -260,6 +269,7 @@ pub fn begin<S: Into<Cow<'static, str>>>(
         token,
         pending,
         text: None,
+        snap: None,
     }
 }
 
@@ -275,6 +285,7 @@ pub fn begin_cmd<C: typed::Command + std::fmt::Debug>(
             token,
             pending: None,
             text: None,
+            snap: None,
         };
     }
     let t0 = now_ns();
@@ -292,6 +303,7 @@ pub fn begin_cmd<C: typed::Command + std::fmt::Debug>(
             ..Call::default()
         }),
         text,
+        snap: None,
     }
 }
 
@@ -887,6 +899,7 @@ pub fn finish(active: Active, made: Option<Made>) {
         token,
         pending,
         text,
+        snap,
     } = active;
     let Some(mut call) = pending else { return };
     let Some(state) = state() else { return };
@@ -899,6 +912,7 @@ pub fn finish(active: Active, made: Option<Made>) {
         call,
         text,
         shape: true,
+        snap,
     });
     add_times(state, 0, now_ns() - t0, true);
     drop(token);
@@ -930,6 +944,7 @@ pub fn draws<T: Send + Sync + 'static>(
                 call,
                 text,
                 shape: false,
+                snap: None,
             });
         }
     }
@@ -1175,12 +1190,17 @@ struct Info {
 /// What a calling thread hands the writer, in the stream's order.
 enum Item {
     /// A hooked call: its text read (the command's where `text`), shaped where `shape`, tracked
-    /// and written.
+    /// and written; where it is a dispatch snapshotted (`snap`), its position kept for the
+    /// snapshot's records.
     Call {
         call: Call,
         text: Option<String>,
         shape: bool,
+        snap: Option<u64>,
     },
+    /// A dispatch's snapshot, read at its command buffer's completion: its `m2v.privateBytes`
+    /// records ([`private`]).
+    Private(private::Read),
     /// A record written as it is.
     Plain(Call),
     /// An `m2v.write` of the chunks a capture found changed: its chunks scanned for addresses
@@ -1281,6 +1301,13 @@ struct Stats {
     /// 8-byte words in a live pinned range: at 8-aligned offsets, and at offsets 4 mod 8.
     address_words_aligned: AtomicU64,
     address_words_misaligned: AtomicU64,
+    /// Private buffer ranges written around dispatches, and their bytes, before and after
+    /// ([`private`]); and the dispatches or ranges not written: a dispatch over
+    /// [`private::MOST`] bytes, a buffer the stream never made, a staging buffer or a handler the
+    /// runtime refused, a command buffer that failed.
+    private_ranges: AtomicU64,
+    private_bytes: AtomicU64,
+    private_skipped: AtomicU64,
 }
 
 struct State {
@@ -1299,6 +1326,10 @@ struct State {
     sync: Mutex<SyncState>,
     baselines: Mutex<KeyMap<Vec<u64>>>,
     selectors: Mutex<BTreeMap<String, u64>>,
+    /// The last dispatch snapshot numbered ([`private`]).
+    snaps: AtomicU64,
+    /// Each snapshotted dispatch's position in the stream, by its snapshot, until its records.
+    dispatched: Mutex<KeyMap<u64>>,
     stats: Stats,
 }
 
@@ -1320,6 +1351,8 @@ impl State {
             sync: Mutex::new(SyncState::default()),
             baselines: Mutex::new(KeyMap::default()),
             selectors: Mutex::new(BTreeMap::new()),
+            snaps: AtomicU64::new(0),
+            dispatched: Mutex::new(KeyMap::default()),
             stats: Stats::default(),
         }
     }
@@ -1410,11 +1443,13 @@ impl State {
         let n = items.len() as u64;
         if n > 0 {
             let t1 = now_ns();
-            let mut bytes = 0;
+            let (mut bytes, mut records) = (0, 0);
             for item in items {
-                bytes += self.process(item) as u64;
+                let (b, r) = self.process(item);
+                bytes += b as u64;
+                records += r;
             }
-            self.stats.records.fetch_add(n, Ordering::Relaxed);
+            self.stats.records.fetch_add(records, Ordering::Relaxed);
             self.stats.bytes.fetch_add(bytes, Ordering::Relaxed);
             self.stats
                 .process_ns
@@ -1429,13 +1464,14 @@ impl State {
         n
     }
 
-    /// Shapes and writes one record: the length of its call record.
-    fn process(&self, item: Item) -> usize {
+    /// Shapes and writes one item: the length of its call records, and how many.
+    fn process(&self, item: Item) -> (usize, u64) {
         match item {
             Item::Call {
                 mut call,
                 text,
                 shape,
+                snap,
             } => {
                 if let Some(text) = text {
                     call.args = cmd_args_text(&text);
@@ -1449,9 +1485,15 @@ impl State {
                     self.shape(&mut call);
                 }
                 self.track(&call);
-                self.emit(call)
+                let n = self.emit(call);
+                if let Some(snap) = snap {
+                    // Items are shaped one at a time (`shaping`), so the last call written is this.
+                    let at = self.stream.lock().calls().saturating_sub(1);
+                    self.dispatched.lock().insert(snap, at);
+                }
+                (n, 1)
             }
-            Item::Plain(call) => self.emit(call),
+            Item::Plain(call) => (self.emit(call), 1),
             Item::Write(call) => {
                 for v in &call.args {
                     if let Value::Bytes(data) = v {
@@ -1459,8 +1501,9 @@ impl State {
                     }
                 }
                 self.count_selector(&call.selector);
-                self.emit(call)
+                (self.emit(call), 1)
             }
+            Item::Private(read) => self.private_records(read),
             Item::Release(id) => {
                 {
                     let mut objects = self.objects.lock();
@@ -1471,11 +1514,12 @@ impl State {
                     }
                 }
                 self.sync.lock().cbs.remove(&id);
-                self.emit(Call {
+                let n = self.emit(Call {
                     selector: "release".to_owned(),
                     receiver: id,
                     ..Call::default()
-                })
+                });
+                (n, 1)
             }
         }
     }
@@ -1537,6 +1581,9 @@ impl State {
             "address_words_misaligned",
             &s.address_words_misaligned,
         );
+        line(&mut out, "private_ranges", &s.private_ranges);
+        line(&mut out, "private_bytes", &s.private_bytes);
+        line(&mut out, "private_skipped", &s.private_skipped);
         let _ = writeln!(out, "live_objects {}", self.objects.lock().info.len());
         for (sel, n) in self.selectors.lock().iter() {
             let _ = writeln!(out, "selector {n} {sel}");
@@ -1644,17 +1691,7 @@ impl State {
             }
             "newLibraryWithData:error:" => {
                 if let Some(Value::Bytes(data)) = call.args.first() {
-                    let hash = format::sha256(data);
-                    let path = self.blobs_dir.join(hex(&hash));
-                    if !path.exists() {
-                        let tmp =
-                            self.blobs_dir
-                                .join(format!("{}.{}", hex(&hash), std::process::id()));
-                        if std::fs::write(&tmp, data).is_ok() {
-                            let _ = std::fs::rename(&tmp, &path);
-                        }
-                    }
-                    call.args = vec![Value::Blob(hash)];
+                    call.args = vec![Value::Blob(self.blob_file(data))];
                 }
             }
             _ => {}
@@ -1662,6 +1699,19 @@ impl State {
         for v in &mut call.args {
             read_host(v, &call.selector);
         }
+    }
+
+    /// Writes `data` once into the blob directory, as the hex of its SHA-256: its hash.
+    fn blob_file(&self, data: &[u8]) -> Hash {
+        let hash = format::sha256(data);
+        let path = self.blobs_dir.join(hex(&hash));
+        if !path.exists() {
+            let tmp = (self.blobs_dir).join(format!("{}.{}", hex(&hash), std::process::id()));
+            if std::fs::write(&tmp, data).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+        hash
     }
 
     fn pin_locked(&self, objects: &mut Objects, call: &mut Call, start: u64, len: u64) {
@@ -2951,6 +3001,7 @@ mod tests {
             },
             text: Some("SetCullMode { cull_mode: 2 }".to_owned()),
             shape: true,
+            snap: None,
         });
         state.push(Item::Call {
             call: Call {
@@ -2963,6 +3014,7 @@ mod tests {
             },
             text: None,
             shape: true,
+            snap: None,
         });
         state.push(Item::Write(Call {
             selector: "m2v.write".to_owned(),
@@ -3059,6 +3111,7 @@ mod tests {
                 call,
                 text: None,
                 shape: true,
+                snap: None,
             });
         }
         state.drain(true);

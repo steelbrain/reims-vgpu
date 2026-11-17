@@ -1691,6 +1691,17 @@ impl Unit {
     /// The open encoder's runtime encoder ended and a fresh one in its place, with the guest's
     /// bindings and residency: the runtime has no unset of a pipeline, and the guest set none.
     fn refresh(&mut self, enc: &VulkanComputeEncoder, sel: &'static str) {
+        self.renew(enc, sel, |_| Ok(()));
+    }
+
+    /// As [`Self::refresh`], with what `between` encodes into the command buffer, in encoders of
+    /// its own, between the ended runtime encoder and the fresh one.
+    fn renew(
+        &mut self,
+        enc: &VulkanComputeEncoder,
+        sel: &'static str,
+        between: impl FnOnce(&CommandBufferObject) -> Result<(), rt::Error>,
+    ) {
         // A command buffer core let go of commits no more, so nothing encoded here runs.
         let Some(cb) = Obj::upgrade(&enc.command_buffer) else {
             return;
@@ -1702,6 +1713,7 @@ impl Unit {
         };
         let dispatch_type = old.dispatch_type();
         made(sel, || old.end_encoding());
+        made(sel, || between(&cb));
         let mut fresh = made(sel, || {
             cb.raw
                 .compute_command_encoder_with_dispatch_type(dispatch_type)
@@ -1865,6 +1877,54 @@ pub fn observe(enc: &VulkanComputeEncoder, cmd: &ComputeCmd<'_, VulkanPlatform>)
         u.log.push(Arc::new(Logged::Cmd(owned)));
     }
     u.bindings.apply(cmd);
+}
+
+/// For the recorder's snapshot of a dispatch ([`crate::recorder::private`]): each buffer the
+/// guest bound to `enc`, the open encoder, that `keep` takes, with its offset, where the pipeline
+/// state the guest set is one `wanted` takes. None where the dispatch may run as its indirect
+/// form, many times or not at all (a block of command predication is open, a loop's body is laid
+/// down, an unbalanced record emptied the unit), nor where the encoder keeps no bindings
+/// ([`Predication::hold_none`], which a recording process does not take).
+pub(crate) fn bound_buffers(
+    enc: &VulkanComputeEncoder,
+    wanted: impl FnOnce(&VulkanComputePipeline) -> bool,
+    keep: impl Fn(&VulkanBuffer) -> bool,
+) -> Option<Vec<(VulkanBuffer, u64)>> {
+    if enc.predication.holds_none() {
+        return None;
+    }
+    let u = enc.predication.unit.lock();
+    if u.encoder != Some(enc.number) || !u.stack.is_empty() || u.cursor.is_some() || u.emptied {
+        return None;
+    }
+    if !wanted(u.bindings.pipeline.as_ref()?) {
+        return None;
+    }
+    let bound = u.bindings.buffers.values();
+    let kept = bound.filter(|(b, _, _)| keep(b));
+    Some(
+        kept.map(|(b, offset, _)| (b.clone_ref(), *offset))
+            .collect(),
+    )
+}
+
+/// The recorder's blit between `enc`'s commands ([`crate::recorder::private`]): `enc`'s runtime
+/// encoder ended, `copy` encoded into a blit encoder of the command buffer's, and a fresh compute
+/// encoder of the same dispatch type in its place, given the guest's bindings and residency again
+/// as [`Unit::refresh`] gives them. The unit of command predication goes on across them: the
+/// blit is no guest's.
+pub(crate) fn blit_between(
+    enc: &VulkanComputeEncoder,
+    sel: &'static str,
+    copy: impl FnOnce(&mut rt::BlitCommandEncoder) -> Result<(), rt::Error>,
+) {
+    let mut u = enc.predication.unit.lock();
+    u.renew(enc, sel, |cb| {
+        let mut blit = cb.raw.blit_command_encoder()?;
+        cb.made_encoder(false);
+        copy(&mut blit)?;
+        blit.end_encoding()
+    });
 }
 
 /// A dispatch or an indirect command buffer execution, in the runtime's terms: each variant's
