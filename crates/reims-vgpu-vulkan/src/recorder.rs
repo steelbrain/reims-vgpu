@@ -171,7 +171,11 @@ pub fn begin<S: Into<Cow<'static, str>>>(
     read: impl FnOnce() -> (S, u64, Vec<Value>),
 ) -> Active {
     let pending = token.outer.then(|| {
+        let t0 = now_ns();
         let (selector, receiver, args) = read();
+        if let Some(state) = state() {
+            (state.stats.read_ns).fetch_add(now_ns() - t0, Ordering::Relaxed);
+        }
         Call {
             selector: selector.into().into_owned(),
             receiver,
@@ -612,12 +616,14 @@ pub fn finish(active: Active, made: Option<Made>) {
     let Active { token, pending } = active;
     let Some(mut call) = pending else { return };
     let Some(state) = state() else { return };
+    let t0 = now_ns();
     if let Some(made) = made {
         call.result = state.register(made);
     }
     state.shape(&mut call);
     state.track(&call);
     state.emit(call);
+    (state.stats.finish_ns).fetch_add(now_ns() - t0, Ordering::Relaxed);
     drop(token);
 }
 
@@ -672,11 +678,20 @@ pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
         .unwrap_or_default();
     let ranges = state.ranges_of(&reach);
     state.capture(&ranges);
-    state
-        .stats
-        .capture_ns
-        .fetch_add(now_ns() - t1, Ordering::Relaxed);
+    let t2 = now_ns();
+    (state.stats.capture_ns).fetch_add(t2 - t1, Ordering::Relaxed);
     state.stats.commits.fetch_add(1, Ordering::Relaxed);
+    let took = t2 - t0;
+    (state.stats.commit_max_ns).fetch_max(took, Ordering::Relaxed);
+    for (over, count) in [
+        (1_000_000, &state.stats.commits_over_1ms),
+        (4_000_000, &state.stats.commits_over_4ms),
+        (8_000_000, &state.stats.commits_over_8ms),
+    ] {
+        if took > over {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The guest's RAM a copy into `destination` reads (`m2v.copyFromGuestRam`,
@@ -843,6 +858,19 @@ struct Stats {
     guest_ram_bytes: AtomicU64,
     wait_ns: AtomicU64,
     capture_ns: AtomicU64,
+    /// Where a recording thread spends its time: reading a call's arguments ([`begin`]),
+    /// shaping and writing its record ([`finish`]), copying and hashing memory and writing the
+    /// changed chunks (`compare`); and the writer thread's file writes.
+    read_ns: AtomicU64,
+    finish_ns: AtomicU64,
+    hash_ns: AtomicU64,
+    write_ns: AtomicU64,
+    flush_ns: AtomicU64,
+    /// How long the longest commit's wait and capture took, and how many took over 1, 4 and 8 ms.
+    commit_max_ns: AtomicU64,
+    commits_over_1ms: AtomicU64,
+    commits_over_4ms: AtomicU64,
+    commits_over_8ms: AtomicU64,
     waits: AtomicU64,
     held: AtomicU64,
     wait_timeouts: AtomicU64,
@@ -914,6 +942,7 @@ impl State {
         loop {
             std::thread::sleep(FLUSH);
             let bytes = self.stream.lock().take();
+            let t0 = now_ns();
             if !bytes.is_empty() {
                 if file.is_none() || written >= SEGMENT {
                     let path = PathBuf::from(format!("{}.{segment:04}.m2vr", self.base.display()));
@@ -934,6 +963,7 @@ impl State {
                     written += bytes.len() as u64;
                 }
             }
+            (self.stats.flush_ns).fetch_add(now_ns() - t0, Ordering::Relaxed);
             ticks += 1;
             if ticks.is_multiple_of(100) {
                 self.write_stats();
@@ -954,6 +984,15 @@ impl State {
         line(&mut out, "guest_ram_bytes", &s.guest_ram_bytes);
         line(&mut out, "wait_ns", &s.wait_ns);
         line(&mut out, "capture_ns", &s.capture_ns);
+        line(&mut out, "read_ns", &s.read_ns);
+        line(&mut out, "finish_ns", &s.finish_ns);
+        line(&mut out, "hash_ns", &s.hash_ns);
+        line(&mut out, "write_ns", &s.write_ns);
+        line(&mut out, "flush_ns", &s.flush_ns);
+        line(&mut out, "commit_max_ns", &s.commit_max_ns);
+        line(&mut out, "commits_over_1ms", &s.commits_over_1ms);
+        line(&mut out, "commits_over_4ms", &s.commits_over_4ms);
+        line(&mut out, "commits_over_8ms", &s.commits_over_8ms);
         line(&mut out, "waits", &s.waits);
         line(&mut out, "held", &s.held);
         line(&mut out, "wait_timeouts", &s.wait_timeouts);
@@ -1451,6 +1490,7 @@ impl State {
     /// Compares each 4 KiB of `spans` with the stream's: where `emit`, a changed one is written
     /// as a write; else it is only taken as the stream's.
     fn compare(&self, spans: &[Span], emit: bool) {
+        let t0 = now_ns();
         let mut writes: BTreeMap<u64, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
         {
             let mut baselines = self.baselines.lock();
@@ -1504,6 +1544,8 @@ impl State {
                 }
             }
         }
+        let t1 = now_ns();
+        self.stats.hash_ns.fetch_add(t1 - t0, Ordering::Relaxed);
         for (target, chunks) in writes {
             let mut args = Vec::with_capacity(chunks.len() * 2);
             let mut stream = self.stream.lock();
@@ -1528,6 +1570,7 @@ impl State {
             drop(stream);
             self.count(n, "m2v.write");
         }
+        (self.stats.write_ns).fetch_add(now_ns() - t1, Ordering::Relaxed);
     }
 
     /// Counts the 8-byte words of `data` that lie in a live pinned range: at 8-aligned offsets,
