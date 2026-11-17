@@ -339,28 +339,38 @@ impl<P: Platform> SurfaceViews<P> {
         let cached: HashSet<*const SurfaceView<P>> =
             (self.cache.iter()).map(|c| Arc::as_ptr(&c.view)).collect();
         let mut by_context: HashMap<u32, Vec<(MonoTime, Candidate<P>)>> = HashMap::new();
+        // The trace's `regcand`: the blocks with no view, then how many blocks each check below
+        // left out, the first that did, in their order, how many were taken, and the views the
+        // cache holds (a diagnostic).
+        let mut left = [0u64; 16];
         for (&block, p) in &self.private {
             let Some((view, _)) = &p.view else {
+                left[0] += 1;
                 continue;
             };
             let old = p
                 .made
                 .is_some_and(|made| now.saturating_duration_since(made) >= REGROUP_AGE);
-            if !old
-                || p.runs.len() < 2
-                || p.length > REGROUP_MEMBER_MOST
-                || p.heaped
-                || p.stays
-                || p.queued
-                || p.read_only
-                || p.regrouped.is_some()
-                || self.regroups.ready.contains_key(&p.context)
-                || view.group.lock().is_some()
-                || cached.contains(&Arc::as_ptr(view))
-                || view.length() != p.length
-            {
+            let out = [
+                p.made.is_none(),
+                !old,
+                p.runs.len() < 2,
+                p.length > REGROUP_MEMBER_MOST,
+                p.heaped,
+                p.stays,
+                p.queued,
+                p.read_only,
+                p.regrouped.is_some(),
+                self.regroups.ready.contains_key(&p.context),
+                view.group.lock().is_some(),
+                cached.contains(&Arc::as_ptr(view)),
+                view.length() != p.length,
+            ];
+            if let Some(first) = out.iter().position(|&o| o) {
+                left[first + 1] += 1;
                 continue;
             }
+            left[14] += 1;
             let made = p.made.unwrap_or(now);
             let candidate = (block, Arc::clone(view), p.runs.clone(), p.length);
             by_context
@@ -368,6 +378,8 @@ impl<P: Platform> SurfaceViews<P> {
                 .or_default()
                 .push((made, candidate));
         }
+        left[15] = self.cache.len().to_u64();
+        reims_vgpu_vulkan::core::trace::event("regcand", &left);
         let mut out = Vec::new();
         for (context, mut found) in by_context {
             found.sort_by_key(|(made, c)| (made.as_nanos(), c.0));
