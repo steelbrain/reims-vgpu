@@ -92,8 +92,14 @@ does. What the guest and the host observe is the contract, in its order:
   its rings' messages and events;
 - interrupts, and their order relative to guest-visible writes;
 - the display's frames, pixels, modes and the cursor;
-- GPU results: what the guest's Metal calls produce, Metal's answer the
-  reference;
+- GPU results: what documented Metal lets the guest observe, with Metal's
+  answer the reference. Arithmetic and value answers (float/half maths, NaN
+  bits, rounding, texel and colour conversion, filtering) are the device's
+  own, and an operation whose answer can differ from Metal's carries a
+  static note. Undocumented or undefined Metal behaviour is not emulated,
+  with one exception: behaviour that the guest's own frameworks
+  demonstrably rely on, shown by a guest-visible failure, counts as
+  observable. It is kept, with a replay snippet or test that pins it;
 - every value that reaches the guest: object IDs, GPU addresses, resource
   indices and numbering;
 - where a run dies or hangs.
