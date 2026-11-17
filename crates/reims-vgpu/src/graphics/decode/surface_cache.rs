@@ -3774,7 +3774,7 @@ impl CacheMaker {
         layout: Option<&[PagesPlane]>,
     ) -> RaiseResult<NewCache<P>> {
         let repitched = layout.and_then(|planes| {
-            Repitched::of(planes, |row_bytes, rows| {
+            Repitched::of(planes, length, |row_bytes, rows| {
                 device.linear_rows_pitch(row_bytes, rows)
             })
         });
@@ -5120,6 +5120,27 @@ pub(crate) struct CachePlane {
     pub(crate) offset: u64,
     /// Bytes from one of its rows to the next in the cache.
     pub(crate) bytes_per_row: u64,
+    /// The rows the cache holds for it, before the next plane's: the rows the surface holds for
+    /// it ([`held_rows`]), its own and those below them.
+    pub(crate) rows: u64,
+}
+
+/// The rows the surface of `length` bytes laid out as `planes` holds for `plane`, one of them,
+/// from its first: its own, and those below whose bytes lie before the next plane's first byte
+/// or the surface's end, where a decoder writes a picture's coded rows past its crop's
+/// (CoreVideo's extended pixels: a 1080p `420v` surface's 1088 luma rows and 544 chroma rows).
+fn held_rows(planes: &[PagesPlane], plane: &PagesPlane, length: u64) -> u64 {
+    let next = (planes.iter())
+        .map(|p| p.offset)
+        .filter(|&offset| offset > plane.offset)
+        .fold(length, u64::min);
+    let past_first = next
+        .checked_sub(plane.offset)
+        .and_then(|bytes| bytes.checked_sub(plane.row_bytes));
+    match (past_first, plane.bytes_per_row) {
+        (Some(bytes), pitch) if pitch != 0 => (bytes / pitch + 1).max(plane.rows),
+        _ => plane.rows,
+    }
 }
 
 /// Where a texture over a cache laid out at the GPU's pitch lies in it ([`Repitched::place`]).
@@ -5150,7 +5171,9 @@ const PLANE_START: u64 = 4096;
 /// RADV's at 256) would make it. The cache holds its planes' texels alone: its copies move each
 /// row between its place in the pages and its place in the cache ([`Self::cut`]), the bytes
 /// between rows and outside the planes staying the guest's CPU's in the pages, as no texture's
-/// texel lies there.
+/// texel lies there. Each plane has the room there for the rows the surface holds below its own
+/// ([`held_rows`]), which no copy moves, so that a decode into the cache writes a picture's coded
+/// rows past its crop's (`VideoPlane::rows_room`), as it does in the surface's own layout.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Repitched {
     /// The planes, in the surface's plane order.
@@ -5160,14 +5183,16 @@ pub(crate) struct Repitched {
 }
 
 impl Repitched {
-    /// The layout of a cache of a surface laid out as `planes`, where `pitch` answers each
-    /// plane's rows' pitch from its row's bytes and its rows ([`GpuDevice::linear_rows_pitch`]);
-    /// `None` where each plane's rows already lie at it (the cache then keeps the pages'
-    /// layout), where it answers none for a plane or one short of the plane's row, and where the
-    /// planes overlap in the surface, as two planes' rows in one byte would be two bytes of the
-    /// cache.
+    /// The layout of a cache of a surface of `length` bytes laid out as `planes`, where `pitch`
+    /// answers each plane's rows' pitch from its row's bytes and its rows
+    /// ([`GpuDevice::linear_rows_pitch`]), each plane with the room for the rows the surface
+    /// holds for it ([`held_rows`]); `None` where each plane's rows already lie at it (the cache
+    /// then keeps the pages' layout), where it answers none for a plane or one short of the
+    /// plane's row, and where the planes overlap in the surface, as two planes' rows in one byte
+    /// would be two bytes of the cache.
     pub(crate) fn of(
         planes: &[PagesPlane],
+        length: u64,
         pitch: impl Fn(u64, u64) -> Option<u64>,
     ) -> Option<Self> {
         let mut laid = Vec::with_capacity(planes.len());
@@ -5178,13 +5203,15 @@ impl Repitched {
             }
             let rows = pitch(p.row_bytes, p.rows).filter(|&rows| rows >= p.row_bytes)?;
             moved |= rows != p.bytes_per_row;
+            let held = held_rows(planes, p, length);
             laid.push(CachePlane {
                 surface: *p,
                 offset: at,
                 bytes_per_row: rows,
+                rows: held,
             });
             at = at
-                .checked_add(rows.checked_mul(p.rows)?)?
+                .checked_add(rows.checked_mul(held)?)?
                 .checked_next_multiple_of(PLANE_START)?;
         }
         let mut spans: Vec<Range<u64>> = (planes.iter())
@@ -5221,6 +5248,18 @@ impl Repitched {
     /// that far apart and whose texels hold `offset`, its rows at the plane's pitch in the
     /// cache; `None` where no plane's do.
     pub(crate) fn place(&self, offset: u64, bytes_per_row: u64) -> Option<Placed> {
+        let (c, row, byte) = self.locate(offset, bytes_per_row)?;
+        let p = &c.surface;
+        Some(Placed {
+            offset: c.offset + row * c.bytes_per_row + byte,
+            bytes_per_row: c.bytes_per_row,
+            room: (p.row_bytes - byte, p.rows - row),
+        })
+    }
+
+    /// The plane whose texels hold the surface's byte `offset` in rows `bytes_per_row` apart, and
+    /// the row and byte of it there; `None` where no plane's do.
+    fn locate(&self, offset: u64, bytes_per_row: u64) -> Option<(&CachePlane, u64, u64)> {
         self.planes.iter().find_map(|c| {
             let p = &c.surface;
             let from = offset.checked_sub(p.offset)?;
@@ -5228,21 +5267,18 @@ impl Repitched {
                 return None;
             }
             let (row, byte) = (from / p.bytes_per_row, from % p.bytes_per_row);
-            (row < p.rows && byte < p.row_bytes).then(|| Placed {
-                offset: c.offset + row * c.bytes_per_row + byte,
-                bytes_per_row: c.bytes_per_row,
-                room: (p.row_bytes - byte, p.rows - row),
-            })
+            (row < p.rows && byte < p.row_bytes).then_some((c, row, byte))
         })
     }
 
     /// The rows the cache holds for the plane of a texture whose first byte is `offset` of the
     /// surface, its rows `bytes_per_row` apart, from the texture's first row on, past which the
-    /// next plane's lie in the cache; `None` where no plane's texels hold that byte at that pitch
+    /// next plane's lie in the cache: the plane's own and the room below them
+    /// ([`CachePlane::rows`]); `None` where no plane's texels hold that byte at that pitch
     /// ([`Self::place`]).
     pub(crate) fn rows_from(&self, offset: u64, bytes_per_row: u64) -> Option<u64> {
-        self.place(offset, bytes_per_row)
-            .map(|placed| placed.room.1)
+        let (c, row, _) = self.locate(offset, bytes_per_row)?;
+        Some(c.rows - row)
     }
 
     /// Each row of the surface's planes: its texels' bytes in the surface and its first byte in
@@ -9208,6 +9244,18 @@ mod tests {
         move |row_bytes, _| Some(row_bytes.next_multiple_of(align))
     }
 
+    /// [`Repitched::of`] of a surface that ends with its planes' last row.
+    fn laid_at(
+        planes: &[PagesPlane],
+        pitch: impl Fn(u64, u64) -> Option<u64>,
+    ) -> Option<Repitched> {
+        let length = (planes.iter())
+            .filter_map(PagesPlane::end)
+            .max()
+            .unwrap_or(0);
+        Repitched::of(planes, length, pitch)
+    }
+
     /// `420v` 100 x 10 as CoreVideo lays it, 32 bytes into its surface: luma rows of 100 bytes
     /// 128 apart, then chroma's 5 rows of 50 two-byte pairs.
     fn yuv() -> [PagesPlane; 2] {
@@ -9222,17 +9270,18 @@ mod tests {
     /// one short of its row, and planes that overlap are laid out as their pages
     #[test]
     fn a_surface_off_the_gpus_pitch_is_laid_out_at_it() {
-        let laid = Repitched::of(&[plane(0, 704, 704, 3)], rows_at(256)).unwrap();
+        let laid = laid_at(&[plane(0, 704, 704, 3)], rows_at(256)).unwrap();
         assert_eq!(
             laid.planes(),
             [CachePlane {
                 surface: plane(0, 704, 704, 3),
                 offset: 0,
                 bytes_per_row: 768,
+                rows: 3,
             }]
         );
         assert_eq!(laid.length(), 4096);
-        let laid = Repitched::of(&yuv(), rows_at(256)).unwrap();
+        let laid = laid_at(&yuv(), rows_at(256)).unwrap();
         let laid_out: Vec<(u64, u64)> = (laid.planes().iter())
             .map(|c| (c.offset, c.bytes_per_row))
             .collect();
@@ -9252,15 +9301,11 @@ mod tests {
             ),
             (vec![plane(0, 704, 0, 3)], "no texels"),
         ] {
-            assert_eq!(Repitched::of(&planes, rows_at(256)), None, "{why}");
+            assert_eq!(laid_at(&planes, rows_at(256)), None, "{why}");
         }
         let one = [plane(0, 704, 704, 3)];
-        assert_eq!(Repitched::of(&one, |_, _| None), None, "no pitch");
-        assert_eq!(
-            Repitched::of(&one, |_, _| Some(512)),
-            None,
-            "short of the row"
-        );
+        assert_eq!(laid_at(&one, |_, _| None), None, "no pitch");
+        assert_eq!(laid_at(&one, |_, _| Some(512)), None, "short of the row");
     }
 
     /// A texture over a plane of a laid-out cache's surface lies at the same byte of the same row
@@ -9270,7 +9315,7 @@ mod tests {
     /// rows, past a plane's rows, or at another pitch than a plane's lies in none
     #[test]
     fn a_texture_over_a_laid_out_cache_lies_at_its_row_and_byte() {
-        let laid = Repitched::of(&yuv(), rows_at(256)).unwrap();
+        let laid = laid_at(&yuv(), rows_at(256)).unwrap();
         let placed = |offset, bytes_per_row, room| Placed {
             offset,
             bytes_per_row,
@@ -9302,12 +9347,49 @@ mod tests {
     /// and no more: the next plane's lie past them. A byte in no plane's texels holds none
     #[test]
     fn a_plane_in_a_laid_out_cache_holds_its_rows_there() {
-        let laid = Repitched::of(&yuv(), rows_at(256)).unwrap();
+        let laid = laid_at(&yuv(), rows_at(256)).unwrap();
         assert_eq!(laid.rows_from(0x20, 128), Some(10));
         assert_eq!(laid.rows_from(0x520, 128), Some(5));
         assert_eq!(laid.rows_from(0x20 + 3 * 128, 128), Some(7), "from row 3");
         assert_eq!(laid.rows_from(0x20 + 100, 128), None, "between rows");
         assert_eq!(laid.rows_from(0x20, 256), None, "another pitch");
+    }
+
+    /// A plane of a laid-out cache has the room for the rows its surface holds below its own,
+    /// before the next plane's, which its copies do not move: a 1080p `420v` surface as a guest's
+    /// VideoToolbox decode lays it (32 bytes in, rows of 1920 bytes, its planes extended below by
+    /// 8 and 4 rows, chroma at 2088992 of its 3136352 bytes) laid out at RADV's 256 holds 1088
+    /// luma rows, chroma past them on the 4 KiB boundary, and 545 chroma rows to the surface's
+    /// end, room for the coded 1920x1088 picture; its copies move its 1080 and 540 rows alone
+    #[test]
+    fn a_laid_out_plane_has_room_for_the_surfaces_rows_below_it() {
+        let planes = [
+            plane(32, 1920, 1920, 1080),
+            plane(2_088_992, 1920, 1920, 540),
+        ];
+        let laid = Repitched::of(&planes, 3_136_352, rows_at(256)).unwrap();
+        let laid_out: Vec<(u64, u64, u64)> = (laid.planes().iter())
+            .map(|c| (c.offset, c.bytes_per_row, c.rows))
+            .collect();
+        assert_eq!(laid_out, [(0, 2048, 1088), (1088 * 2048, 2048, 545)]);
+        assert_eq!(
+            laid.length(),
+            (1088 + 545_u64)
+                .checked_mul(2048)
+                .unwrap()
+                .next_multiple_of(4096)
+        );
+        assert_eq!(laid.rows_from(32, 1920), Some(1088));
+        assert_eq!(laid.rows_from(2_088_992, 1920), Some(545));
+        assert_eq!(laid.texel_bytes(), (1080 + 540) * 1920);
+        // A texture over a plane still has its plane's own rows for room.
+        assert_eq!(
+            laid.place(2_088_992, 1920).map(|p| p.room),
+            Some((1920, 540))
+        );
+        // A surface that ends with its planes' rows leaves them none.
+        let tight = laid_at(&planes, rows_at(256)).unwrap();
+        assert_eq!(tight.rows_from(2_088_992, 1920), Some(540));
     }
 
     /// A laid-out cache's copies move each row's texels between its place in the surface and its
@@ -9316,7 +9398,7 @@ mod tests {
     /// crosses from one to the next, each part at its own byte of the cache
     #[test]
     fn a_laid_out_caches_copies_move_each_row_to_its_place() {
-        let laid = Repitched::of(&[plane(0, 704, 704, 3)], rows_at(256)).unwrap();
+        let laid = laid_at(&[plane(0, 704, 704, 3)], rows_at(256)).unwrap();
         assert_eq!(
             laid.cut([(0..3 * 704, 0)]),
             [(0, 0, 704), (704, 768, 704), (1408, 1536, 704)]
@@ -9336,7 +9418,7 @@ mod tests {
             "a piece cut to the rows it lies in"
         );
         // Chroma's rows follow on in the surface and at its pitch in the cache: one part.
-        let laid = Repitched::of(
+        let laid = laid_at(
             &[plane(0, 704, 704, 2), plane(0x1000, 256, 256, 2)],
             rows_at(256),
         )
@@ -9367,7 +9449,7 @@ mod tests {
 
     /// `planes` laid out at RADV's pitch.
     fn laid_one(planes: &[PagesPlane]) -> Repitched {
-        Repitched::of(planes, rows_at(256)).unwrap()
+        laid_at(planes, rows_at(256)).unwrap()
     }
 
     /// On a device whose linear images lay rows at another pitch than the surface's, a cached
@@ -9686,7 +9768,7 @@ mod tests {
         };
         let at = |offset| SurfacePlane { offset, ..surface };
         for (pitch, why) in [(64, "a cache pitch of 64"), (256, "a cache pitch of 256")] {
-            let laid = Repitched::of(&[plane(0, 128, 64, 64)], rows_at(pitch)).unwrap();
+            let laid = laid_at(&[plane(0, 128, 64, 64)], rows_at(pitch)).unwrap();
             let fits = super::super::laid_plane(&laid, surface, 64, 64).expect(why);
             assert_eq!((fits.offset, fits.bytes_per_row), (0, pitch), "{why}");
             let row = super::super::laid_plane(&laid, at(3 * 128 + 8), 56, 4).expect(why);
