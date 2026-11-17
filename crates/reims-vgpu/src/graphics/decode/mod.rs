@@ -212,6 +212,7 @@ pub use video::{
     Decoded, GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput,
     GuestSource, Landed, PlanePages, VideoDecode, VideoEncode, VideoPlane,
 };
+pub(crate) use video::{rate_past_first_frame, same_rate_mode};
 
 pub(crate) use cmdbuf::Begun;
 pub(crate) use function_table::named_pipeline as function_table_pipeline;

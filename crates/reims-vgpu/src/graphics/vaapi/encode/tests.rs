@@ -1027,7 +1027,8 @@ fn support(profile: EncodeProfile, max_width: u32, max_height: u32) -> EncoderSu
 
 /// The guest's encoder list has one encoder for each codec the driver encodes a profile of, with
 /// its profiles in the driver's order and the largest picture any of them takes; `Quality` maps
-/// onto the profile's levels as `quality` does.
+/// onto the profile's levels as `quality` does, and a constant QP the driver does not take is
+/// the codec's default rate.
 #[test]
 fn the_guest_encoders_are_the_drivers_codecs() {
     let supports = [
@@ -1052,7 +1053,11 @@ fn the_guest_encoders_are_the_drivers_codecs() {
             },
         ]
     );
-    let ranges = vec![(EncodeProfile::H264High, Some(7))];
+    let ranges = vec![GuestProfile {
+        profile: EncodeProfile::H264High,
+        quality_range: Some(7),
+        constant_qp: true,
+    }];
     let config = |quality| EncoderConfig {
         settings: EncoderSettings::new(EncodeProfile::H264High, 64, 48),
         quality,
@@ -1069,5 +1074,25 @@ fn the_guest_encoders_are_the_drivers_codecs() {
     assert_eq!(
         guest_settings(&config(Some(0.5)), &ranges).quality_level,
         quality_level(50, Some(7))
+    );
+    // A constant QP is coded where the driver takes one, and is the codec's default rate where
+    // it does not.
+    let mut constant = config(Some(0.75));
+    constant.settings.rate_control = RateControl::ConstantQp {
+        intra: 21,
+        predicted: 21,
+        bidirectional: 21,
+    };
+    assert_eq!(
+        guest_settings(&constant, &ranges).rate_control,
+        constant.settings.rate_control
+    );
+    let no_constant_qp = [GuestProfile {
+        constant_qp: false,
+        ..ranges[0]
+    }];
+    assert_eq!(
+        guest_settings(&constant, &no_constant_qp).rate_control,
+        EncoderSettings::new(EncodeProfile::H264High, 64, 48).rate_control
     );
 }

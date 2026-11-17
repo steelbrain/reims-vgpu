@@ -9,7 +9,9 @@
 //! - `ProfileLevel`: each profile the encoder lists, at each level H.264 names and at
 //!   `AutoLevel`, which leaves the level to the encoder; none set is the encoder's highest 8-bit
 //!   profile, at `AutoLevel`.
-//! - `AverageBitRate` and `DataRateLimits` (pairs of bytes and seconds): a variable bitrate
+//! - `Quality` with no `DataRateLimits`: every picture at one QP, the M3's for that `Quality`
+//!   ([`QUALITY_QPS`]), an `AverageBitRate` left out, as the M3's encoder leaves it.
+//! - Else `AverageBitRate` and `DataRateLimits` (pairs of bytes and seconds): a variable bitrate
 //!   around the average, under the tightest limit, which then holds as a hard limit over its
 //!   window. A limit with no average makes the average the limit; neither is the codec's
 //!   default rate ([`EncoderSettings::new`]).
@@ -17,7 +19,7 @@
 //!   `AllowTemporalCompression` (false makes every frame a key frame).
 //! - `AllowFrameReordering` (true where unset, as VideoToolbox's default is) and
 //!   `MaxFrameDelayCount` (-1 for no limit).
-//! - `ExpectedFrameRate`, `Quality` (the backend maps it onto its driver's quality levels),
+//! - `ExpectedFrameRate`, `Quality` (the backend also maps it onto its driver's quality levels),
 //!   `H264EntropyMode` for H.264, and `ColorPrimaries`, `TransferFunction` and `YCbCrMatrix`,
 //!   which the VUI carries.
 //! - `RealTime`, `MaximizePowerEfficiency` and `PrioritizeEncodingSpeedOverQuality` are kept
@@ -404,7 +406,14 @@ impl Properties {
             .and_then(|bits| u32::try_from(bits).ok())
             .filter(|&bits| bits > 0);
         let limit = self.data_rate_limit();
-        if average.is_some() || limit.is_some() {
+        if let (Some(quality), None) = (self.number(QUALITY), limit) {
+            let qp = quality_qp(quality);
+            settings.rate_control = RateControl::ConstantQp {
+                intra: qp,
+                predicted: qp,
+                bidirectional: qp,
+            };
+        } else if average.is_some() || limit.is_some() {
             let peak = limit.map(|(rate, _)| rate);
             let average = average.or(peak).unwrap_or(1);
             settings.rate_control = RateControl::VariableBitRate {
@@ -488,6 +497,70 @@ fn frame_rate(rate: f64) -> Option<FrameRate> {
 )]
 fn whole_number(value: f64) -> Option<u64> {
     (value.is_finite() && value >= 0.0).then(|| value.round() as u64)
+}
+
+/// The QP an M3's encoder codes every picture at, I, P and B alike, H.264's and HEVC's, at a
+/// `Quality` with no `DataRateLimits`, beside an `AverageBitRate` or not: from each percent of
+/// `Quality` on, its QP (macOS 27.0.1, measured at each percent from 0 to 100).
+const QUALITY_QPS: [(u8, u8); 49] = [
+    (0, 48),
+    (11, 47),
+    (14, 46),
+    (17, 45),
+    (19, 44),
+    (22, 43),
+    (25, 42),
+    (28, 41),
+    (30, 40),
+    (33, 39),
+    (36, 38),
+    (38, 37),
+    (41, 36),
+    (43, 35),
+    (46, 34),
+    (48, 33),
+    (51, 32),
+    (53, 31),
+    (55, 30),
+    (57, 29),
+    (60, 28),
+    (62, 27),
+    (64, 26),
+    (66, 25),
+    (68, 24),
+    (70, 23),
+    (72, 22),
+    (74, 21),
+    (76, 20),
+    (78, 19),
+    (79, 18),
+    (81, 17),
+    (83, 16),
+    (84, 15),
+    (86, 14),
+    (87, 13),
+    (88, 12),
+    (89, 11),
+    (90, 10),
+    (91, 9),
+    (92, 8),
+    (93, 7),
+    (94, 6),
+    (95, 5),
+    (96, 4),
+    (97, 3),
+    (98, 2),
+    (99, 1),
+    (100, 0),
+];
+
+/// The QP of `quality`, 0 to 1 ([`QUALITY_QPS`]).
+fn quality_qp(quality: f64) -> u8 {
+    // A millionth of a percent over, so that a percent's own value, 0.29 for one, reads as it.
+    let percent = quality * 100.0 + 1e-6;
+    (QUALITY_QPS.iter().rev())
+        .find(|(from, _)| f64::from(*from) <= percent)
+        .map_or(QUALITY_QPS[0].1, |(_, qp)| *qp)
 }
 
 /// `quality`, 0 to 1, as an `f32`.
@@ -621,6 +694,48 @@ mod tests {
             properties.colour_extensions(),
             vec![("CVImageBufferColorPrimaries", "ITU_R_709_2".to_owned())]
         );
+    }
+
+    /// A `Quality` codes every picture at the M3's QP for it, beside an `AverageBitRate` too; a
+    /// `DataRateLimits` beside it keeps the bitrate's rate control.
+    #[test]
+    fn a_quality_is_the_m3s_constant_qp_unless_a_limit_is_set() {
+        let qp = |quality: f64, others: &[(&str, Value)]| {
+            let mut properties = h264();
+            assert_eq!(properties.set(QUALITY, Some(Value::Real(quality))), 0);
+            for (key, value) in others {
+                assert_eq!(properties.set(key, Some(value.clone())), 0, "{key}");
+            }
+            properties.config(640, 480).unwrap().settings.rate_control
+        };
+        let constant = |qp| RateControl::ConstantQp {
+            intra: qp,
+            predicted: qp,
+            bidirectional: qp,
+        };
+        for (quality, want) in [
+            (0.0, 48),
+            (0.1, 48),
+            (0.11, 47),
+            (0.29, 41),
+            (0.5, 33),
+            (0.75, 21),
+            (0.9, 10),
+            (0.99, 1),
+            (1.0, 0),
+        ] {
+            assert_eq!(qp(quality, &[]), constant(want), "{quality}");
+        }
+        let average = [(AVERAGE_BIT_RATE, Value::Integer(1_000_000))];
+        assert_eq!(qp(0.9, &average), constant(10));
+        let limit = [(
+            DATA_RATE_LIMITS,
+            Value::Array(vec![Value::Integer(20_000), Value::Integer(1)]),
+        )];
+        assert!(matches!(
+            qp(0.9, &limit),
+            RateControl::VariableBitRate { .. }
+        ));
     }
 
     /// With nothing set, the encoder writes its highest profile at the codec's defaults, frames

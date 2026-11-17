@@ -33,7 +33,7 @@ use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RgfxSurfaceFacts,
     RgfxVideoCodecCaps, RgfxVideoDecodeCaps, RgfxVideoEncodeCaps, RgfxVideoOutputLayout,
 };
-use reims_vgpu_video::codec::encode::Coded;
+use reims_vgpu_video::codec::encode::{Coded, RateControl};
 use reims_vgpu_video::core::backend::BackendError as VideoError;
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity};
 #[cfg(target_os = "linux")]
@@ -183,8 +183,28 @@ pub trait GuestEncoder<P: Platform>: Send {
     fn flush(&mut self) -> Result<Vec<Coded<VideoError>>, VideoError>;
     /// Takes `config` from the next frame on: after the first frame, of a change that makes a new
     /// sequence only its bitrate, frame rate and key-frame interval, the running sequence keeping
-    /// the rest to its end, as Apple's hardware encoders do.
+    /// the rest to its end, as Apple's hardware encoders do. A change of the rate control's mode
+    /// makes a new sequence, and past the first frame its rate control is
+    /// `rate_past_first_frame`'s.
     fn reconfigure(&mut self, config: &EncoderConfig) -> Result<(), VideoError>;
+}
+
+/// The rate control a guest encoder running at `running` codes at from the next frame, once its
+/// first frame is coded, where `asked` is asked for: a new bitrate in the same mode, and else
+/// `running`. A constant QP, which a `Quality` with no `DataRateLimits` makes, and a change of
+/// mode, are left out, as an M3's encoder leaves out a `Quality` set past the first frame, and an
+/// `AverageBitRate` set over a `Quality` (macOS 27.0.1, measured).
+pub(crate) fn rate_past_first_frame(running: RateControl, asked: RateControl) -> RateControl {
+    match (running, asked) {
+        (RateControl::ConstantQp { .. }, _) => running,
+        _ if same_rate_mode(running, asked) => asked,
+        _ => running,
+    }
+}
+
+/// Whether `a` and `b` are of one rate control mode, between which a running encoder changes.
+pub(crate) fn same_rate_mode(a: RateControl, b: RateControl) -> bool {
+    std::mem::discriminant(&a) == std::mem::discriminant(&b)
 }
 
 /// A surface the guest lent, as a [`GuestEncoder`] reads a frame from it.
@@ -1106,5 +1126,26 @@ mod tests {
         assert_eq!(row(BC1, 1024, 2048), 2048);
         assert_eq!(row((BLOCKS, [8, 0, 4, 1]), 6, 2048), 2048);
         assert_eq!(row((0, [0; 4]), 512, 2048), 2048);
+    }
+
+    /// Past a guest encoder's first frame a bitrate changes within its mode, while a constant QP
+    /// and a change of mode stay as they were.
+    #[test]
+    fn past_the_first_frame_only_a_bitrate_changes_within_its_mode() {
+        let vbr = |average| RateControl::VariableBitRate {
+            average_bits_per_second: average,
+            peak_bits_per_second: average * 2,
+        };
+        let cqp = |qp| RateControl::ConstantQp {
+            intra: qp,
+            predicted: qp,
+            bidirectional: qp,
+        };
+        assert_eq!(rate_past_first_frame(vbr(1_000), vbr(2_000)), vbr(2_000));
+        assert_eq!(rate_past_first_frame(cqp(21), cqp(10)), cqp(21));
+        assert_eq!(rate_past_first_frame(cqp(21), vbr(2_000)), cqp(21));
+        assert_eq!(rate_past_first_frame(vbr(1_000), cqp(10)), vbr(1_000));
+        assert!(same_rate_mode(vbr(1_000), vbr(2_000)));
+        assert!(!same_rate_mode(vbr(1_000), cqp(10)));
     }
 }

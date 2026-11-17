@@ -22,9 +22,10 @@
 //!   picture's sample.
 //! - **A change** of the bitrate or the frame rate goes to the encoder from the next frame
 //!   (`NvencEncoder::reconfigure`), and of the key-frame interval to the placing of key frames;
-//!   one of anything else NVENC is made with makes a new encoder before the first frame, and
-//!   after it is answered as taken and left out, the running sequence keeping its settings to its
-//!   end, as the VA-API arm's.
+//!   one of anything else NVENC is made with, or of the rate control's mode, makes a new encoder
+//!   before the first frame, and after it is answered as taken and left out, the running
+//!   sequence keeping its settings to its end, as the VA-API arm's. Past the first frame a
+//!   constant QP, a `Quality`'s, stays as it is.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -43,7 +44,9 @@ use reims_vgpu_video::nvidia::{
 use reims_vgpu_video::paravirt::{Encoder, EncoderConfig, SourceFrame};
 use reims_vgpu_vulkan::core::platform::Platform;
 
-use super::super::super::decode::{GuestEncoder, GuestSource};
+use super::super::super::decode::{
+    GuestEncoder, GuestSource, rate_past_first_frame, same_rate_mode,
+};
 use super::super::super::vt_encode::{
     buffer_planes, encoders_of, host_planes, quality_percent, source_planes,
 };
@@ -343,18 +346,25 @@ impl<P: Platform> GuestEncoder<P> for NvGuestEncoder<P> {
     }
 
     /// The bitrate and the frame rate go to the encoder from the next frame, and the key-frame
-    /// interval to the placing of key frames; anything else NVENC is made with makes a new
-    /// encoder before the first frame, and after it is taken and left out: the running sequence
-    /// keeps its own to its end.
+    /// interval to the placing of key frames; anything else NVENC is made with, a change of the
+    /// rate control's mode among it, makes a new encoder before the first frame, and after it is
+    /// taken and left out: the running sequence keeps its own to its end, and its rate control
+    /// is `rate_past_first_frame`'s.
     fn reconfigure(&mut self, config: &EncoderConfig) -> Result<(), VideoError> {
         let mut config = config.clone();
+        let running = self.config.settings.rate_control;
+        if self.encoded {
+            config.settings.rate_control =
+                rate_past_first_frame(running, config.settings.rate_control);
+        }
         let mut new = params_of(&config);
         let old = self.encoder.params();
         let same_sequence = EncodeParams {
             rate_control: old.rate_control,
             frame_rate: old.frame_rate,
             ..new.clone()
-        } == *old;
+        } == *old
+            && same_rate_mode(running, config.settings.rate_control);
         if !same_sequence && self.encoded {
             let settings = config.settings;
             config = self.config.clone();

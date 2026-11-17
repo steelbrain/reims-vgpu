@@ -32,9 +32,11 @@
 //!   lent, into an input surface of the encoder's; else, and where the copy is declined (said
 //!   once a session), from the host's view of the pages, which the VA crate's encoder uploads.
 //!   A change of the bitrate, frame rate or key-frame interval goes to the encoder from the next
-//!   frame; one that makes a new sequence makes a new encoder before the first frame, and after
-//!   it is answered as taken and left out, the running sequence keeping its settings to its end,
-//!   as Apple's hardware encoders keep theirs.
+//!   frame; one that makes a new sequence, or changes the rate control's mode, makes a new
+//!   encoder before the first frame, and after it is answered as taken and left out, the running
+//!   sequence keeping its settings to its end, as Apple's hardware encoders keep theirs. Past the
+//!   first frame a constant QP, a `Quality`'s, stays as it is. A constant QP the driver does not
+//!   code at is the codec's default rate.
 
 use std::sync::Arc;
 
@@ -60,7 +62,7 @@ use reims_vgpu_video::vaapi::{Capabilities, Display, EncoderSupport, InputSurfac
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::sync::Mutex;
 
-use super::super::decode::{GuestEncoder, GuestSource};
+use super::super::decode::{GuestEncoder, GuestSource, rate_past_first_frame, same_rate_mode};
 use super::super::video_host::{
     BackendError, EncodeFrame, EncodeSource, Encoded, FrameSource, HostEncodedFrame, HostEncoder,
     SourcePlane,
@@ -716,8 +718,9 @@ pub(super) fn guest_encoders(supports: &[EncoderSupport]) -> Vec<Encoder> {
 /// frames read from the surfaces the guest lends.
 pub(super) struct VaGuestEncoder<P: Platform> {
     display: Display,
-    /// The quality range of each profile the driver encodes.
-    ranges: Vec<(EncodeProfile, Option<u32>)>,
+    /// Each profile the driver encodes, with its quality range and whether it codes at a
+    /// constant QP.
+    ranges: Vec<GuestProfile>,
     encoder: VideoEncoder,
     settings: EncoderSettings,
     /// Whether a frame was encoded: until then, settings that make a new sequence make a new
@@ -737,7 +740,11 @@ impl<P: Platform> VaGuestEncoder<P> {
         filler: Result<Box<dyn GpuFiller<P>>, String>,
     ) -> Result<Self, VideoError> {
         let ranges: Vec<_> = (supports.iter())
-            .map(|s| (s.profile, s.capabilities.quality_range))
+            .map(|s| GuestProfile {
+                profile: s.profile,
+                quality_range: s.capabilities.quality_range,
+                constant_qp: s.capabilities.rate_control.unwrap_or(0) & VA_RC_CQP != 0,
+            })
             .collect();
         let settings = guest_settings(config, &ranges);
         let encoder = VideoEncoder::new(display, settings.clone()).map_err(super::video_error)?;
@@ -803,18 +810,31 @@ impl<P: Platform> VaGuestEncoder<P> {
     }
 }
 
+/// A profile a guest encoder codes, as the driver answers it.
+#[derive(Clone, Copy, Debug)]
+struct GuestProfile {
+    profile: EncodeProfile,
+    /// `VAConfigAttribEncQualityRange`.
+    quality_range: Option<u32>,
+    /// Whether its rate controls take a constant QP (`VA_RC_CQP`).
+    constant_qp: bool,
+}
+
 /// The VA crate's settings of `config`: its settings, `Quality` (0 to 1) onto the profile's
-/// quality levels as the device's `quality` (0 to 100) maps onto them.
-fn guest_settings(
-    config: &EncoderConfig,
-    ranges: &[(EncodeProfile, Option<u32>)],
-) -> EncoderSettings {
+/// quality levels as the device's `quality` (0 to 100) maps onto them. A constant QP the
+/// profile's driver does not code at is the codec's default rate instead.
+fn guest_settings(config: &EncoderConfig, ranges: &[GuestProfile]) -> EncoderSettings {
     let mut settings = config.settings.clone();
-    let range = (ranges.iter())
-        .find(|(profile, _)| *profile == settings.profile)
-        .and_then(|(_, range)| *range);
+    let profile = (ranges.iter()).find(|p| p.profile == settings.profile);
+    let range = profile.and_then(|p| p.quality_range);
     settings.quality_level =
         (config.quality).and_then(|quality| quality_level(quality_percent(quality), range));
+    if matches!(settings.rate_control, RateControl::ConstantQp { .. })
+        && !profile.is_some_and(|p| p.constant_qp)
+    {
+        let defaults = EncoderSettings::new(settings.profile, settings.width, settings.height);
+        settings.rate_control = defaults.rate_control;
+    }
     settings
 }
 
@@ -881,16 +901,20 @@ impl<P: Platform> GuestEncoder<P> for VaGuestEncoder<P> {
     }
 
     /// The bitrate, the frame rate and the key-frame interval go to the encoder from the next
-    /// frame; anything else makes a new encoder before the first frame, and after it is taken
-    /// and left out: the running sequence keeps its own to its end.
+    /// frame; anything else, a change of the rate control's mode among it, makes a new encoder
+    /// before the first frame, and after it is taken and left out: the running sequence keeps
+    /// its own to its end, and its rate control is `rate_past_first_frame`'s.
     fn reconfigure(&mut self, config: &EncoderConfig) -> Result<(), VideoError> {
         let mut new = guest_settings(config, &self.ranges);
+        if self.encoded {
+            new.rate_control = rate_past_first_frame(self.settings.rate_control, new.rate_control);
+        }
         let mut same_sequence = self.settings.clone();
         same_sequence.rate_control = new.rate_control;
         same_sequence.frame_rate = new.frame_rate;
         same_sequence.key_frame_interval = new.key_frame_interval;
         same_sequence.key_frame_interval_duration = new.key_frame_interval_duration;
-        if same_sequence != new {
+        if same_sequence != new || !same_rate_mode(self.settings.rate_control, new.rate_control) {
             if self.encoded {
                 new = same_sequence;
             } else {
