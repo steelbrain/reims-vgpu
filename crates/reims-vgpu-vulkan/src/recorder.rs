@@ -23,7 +23,8 @@
 //!   run, then writes `m2v.write` records of every 4 KiB of host memory the command buffer can
 //!   reach that changed since the stream last held it ([`before_commit`]). A buffer in a heap over
 //!   the guest's memory is written as its block's bytes. A copy out of the guest's RAM carries the
-//!   bytes it reads as its arguments ([`guest_ram_source`]).
+//!   bytes it reads as its arguments ([`guest_ram_source`]), and a buffer made as a copy of host
+//!   memory the bytes it starts with ([`contents`]).
 //! - **The calling thread captures; the writer shapes.** Each call's record is queued, owned,
 //!   under one lock as the call returns, so the stream's order keeps each thread's, with what
 //!   only the call's moment has: its objects' ids, the bytes it consumes and the memory a commit
@@ -992,6 +993,39 @@ pub fn answer(active: &mut Option<Active>, key: &'static str, value: impl FnOnce
         && let Some(call) = a.pending.as_mut()
     {
         call.answers.push((key.to_owned(), value()));
+    }
+}
+
+/// The bytes a buffer made as a copy of host memory starts with (`newBufferWithDescriptor:`'s
+/// `contents`, not no-copy), read now, while the call holds them: its descriptor's `contents`
+/// becomes them, a blob where they are long. Memory a no-copy buffer is made over stays nil: its
+/// bytes arrive as writes.
+pub fn contents(active: &mut Option<Active>, bytes: crate::core::platform::HostRange<'_>) {
+    let Some(a) = active else { return };
+    if !a.recorded() || bytes.ptr().addr() == 0 {
+        return;
+    }
+    let Some(call) = a.pending.as_mut() else {
+        return;
+    };
+    let n = usize::try_from(bytes.len()).unwrap_or(0);
+    let mut data = vec![0u8; n];
+    // SAFETY: the range is the call's argument, which its caller keeps mapped for the call
+    // (`HostRange`'s contract), and the call is in progress.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.ptr().as_ptr::<u8>(), data.as_mut_ptr(), n);
+    }
+    let Some(desc) = call.args.first_mut() else {
+        return;
+    };
+    if let Value::Debug(text) = desc {
+        let read = parse_text(text);
+        *desc = read;
+    }
+    if let Value::Map(fields) = desc
+        && let Some((_, v)) = fields.iter_mut().find(|(k, _)| k == "contents")
+    {
+        *v = Value::Bytes(data);
     }
 }
 
@@ -3079,5 +3113,47 @@ mod tests {
         assert_eq!(get("texture"), Some(&Value::Object(0)));
         assert_eq!(get("resolveTexture"), Some(&Value::Nil));
         assert_eq!(get("level"), Some(&Value::Uint(1)));
+    }
+
+    /// A buffer made as a copy of host memory carries the bytes it starts with, its descriptor's
+    /// `contents`, through the stream and back: a blob where they are long, inline where short.
+    #[test]
+    fn a_copied_buffer_carries_its_contents() {
+        use crate::core::platform::HostRange;
+        use crate::core::platform::values::BufferDesc;
+        let long: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        let short = [9u8; 8];
+        let calls = [&long[..], &short[..]].map(|data| {
+            let desc = BufferDesc {
+                length: u64::try_from(data.len()).unwrap(),
+                options: Vec::new(),
+                pinned_gpu_address: None,
+                contents: Some(HostRange::of_slice(data)),
+                no_copy: false,
+                deallocator: None,
+                zero_from: None,
+            };
+            let mut active = Some(begin(enter_recording(), || {
+                (
+                    "newBufferWithDescriptor:",
+                    0,
+                    vec![crate::recorder::rec_val!(desc)],
+                )
+            }));
+            contents(&mut active, HostRange::of_slice(data));
+            queued(active)
+        });
+        let (calls, blobs) = written(calls.into());
+        let hash = format::sha256(&long);
+        assert_eq!(blobs, [(hash, long.clone())]);
+        let contents_of = |c: &Call| match c.args.first() {
+            Some(Value::Map(fields)) => fields
+                .iter()
+                .find(|(k, _)| k == "contents")
+                .map(|(_, v)| v.clone()),
+            _ => None,
+        };
+        assert_eq!(contents_of(&calls[0]), Some(Value::Blob(hash)));
+        assert_eq!(contents_of(&calls[1]), Some(Value::Bytes(short.to_vec())));
     }
 }

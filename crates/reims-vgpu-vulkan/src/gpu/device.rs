@@ -1705,7 +1705,14 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// (`rt::HostMemory::with_zero_from`), which a `Managed` buffer's device copy on a GPU of its
     /// own memory takes as zeros the device writes; other buffers take none.
     fn new_buffer(&self, desc: BufferDesc<'_>) -> RaiseResult<Option<VulkanBuffer>> {
-        let recorded_call = crate::recorder::rec_call!("newBufferWithDescriptor:", self, desc);
+        let mut recorded_call = crate::recorder::rec_call!("newBufferWithDescriptor:", self, desc);
+        // The bytes a copy starts with; a no-copy buffer's arrive as writes.
+        if recorded_call.is_some()
+            && !desc.no_copy
+            && let Some(bytes) = desc.contents
+        {
+            crate::recorder::contents(&mut recorded_call, bytes);
+        }
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanBuffer>> {
             let sel = "newBufferWithDescriptor:";
             let held = descriptor_options(BUFFER_DESCRIPTOR_OPTIONS, &desc.options);
