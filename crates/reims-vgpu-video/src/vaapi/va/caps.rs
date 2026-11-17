@@ -3,7 +3,7 @@
 //! video processing, filters.
 //!
 //! A display keeps the driver's first answer to each of these queries
-//! ([`Answers`]), and [`Display::open`] asks them all on the thread that
+//! ([`Answers`]), and `Display::open` asks them all on the thread that
 //! opens it ([`Display::prime`]). A session, on a thread of its own, then
 //! reads what the driver said there, and never asks it again: NVIDIA's
 //! driver answers some of them only on the opening thread.
@@ -325,7 +325,7 @@ impl Display {
     /// Asks the driver, on this thread, every query a session may ask
     /// later: the profiles, each one's entrypoints, every pair's
     /// [`ASKED_ATTRIBUTES`] and surface attributes, and the image formats.
-    /// [`Display::open`] calls it, so the answers are the opening thread's.
+    /// `Display::open` calls it, so the answers are the opening thread's.
     /// A query that fails here is left to be asked again where it is next
     /// needed, which says why.
     pub(crate) fn prime(&self) {

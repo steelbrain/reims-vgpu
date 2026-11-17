@@ -12,7 +12,7 @@
 //!
 //! [`load`] loads both libraries once, for the life of the process, and
 //! keeps its answer: a host without libva is told so at each open, without
-//! a retry. [`super::Display::open`] calls it before any libva call, and
+//! a retry. `super::Display::open` calls it before any libva call, and
 //! every other call needs a display that open made, so no wrapper runs
 //! before a load that succeeded. The libraries are never unloaded: libva
 //! loads the driver, whose threads and state outlive any one display.
@@ -238,7 +238,7 @@ macro_rules! functions {
             /// # Safety
             ///
             /// As for the C function. Called only on a display that
-            /// [`super::Display::open`] made, so after [`load`] succeeded.
+            /// `super::Display::open` made, so after [`load`] succeeded.
             #[allow(non_snake_case, clippy::too_many_arguments)]
             pub(crate) unsafe fn $name($($arg: $ty),*) -> $ret {
                 // SAFETY: the caller's, as for the C function.
@@ -470,7 +470,7 @@ pub(crate) fn load() -> Result<(), LoadError> {
 }
 
 /// The loaded functions. Only a wrapper calls this, and only on a display
-/// [`super::Display::open`] made after [`load`] succeeded.
+/// `super::Display::open` made after [`load`] succeeded.
 fn loaded() -> &'static Loaded {
     match LOADED.get() {
         Some(Ok(loaded)) => loaded,

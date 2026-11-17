@@ -210,7 +210,7 @@ impl Display {
     }
 
     /// Initialises VA-API on the DXGI adapter whose LUID is `luid` (the
-    /// Vulkan device's `deviceLUID`), as [`Display::open`] does on a render
+    /// Vulkan device's `deviceLUID`), as `Display::open` does on a render
     /// node: libva-win32 picks the adapter's driver, Mesa's VA-on-D3D12
     /// (`vaon12`) where the adapter's registry names none. `None` is the
     /// adapter the driver picks, for the examples. No import check runs:

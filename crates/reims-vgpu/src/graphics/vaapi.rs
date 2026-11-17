@@ -47,7 +47,7 @@
 //!   2. **By the runtime device's GPU** (`gpu_copy`): the decode surface exported as dma-bufs and
 //!      each plane copied into the plane's buffer, the guest's pages or the surface's device
 //!      cache, at its own rows and offset, the crop alone as the CPU's copy writes it
-//!      ([`crop_extent`]). It is taken wherever the open made a copier on the runtime device
+//!      (`crop_extent`). It is taken wherever the open made a copier on the runtime device
 //!      ([`open_on`]), the device imports the driver's surfaces as images, and the planes'
 //!      buffer is their memory.
 //!   3. **By the CPU**: the frame read back (staged, or `vaGetImage`, the VA crate's way back),
@@ -1272,7 +1272,7 @@ pub(crate) trait GpuFiller<P: Platform>: Send {
 /// One session's GPU copies of its pictures into their outputs.
 pub(crate) trait GpuCopier<P: Platform>: Send {
     /// Writes `frame` into `luma` and `chroma` where they lie, its crop as the CPU's copy writes
-    /// it ([`crop_extent`]), once its decode is done, and returns once the GPU wrote it;
+    /// it (`crop_extent`), once its decode is done, and returns once the GPU wrote it;
     /// [`DeviceWrite::Declined`] with why, nothing written, where it cannot. `Err` where the
     /// decode failed, or the copy failed once on the GPU, which may write the planes still.
     fn copy(

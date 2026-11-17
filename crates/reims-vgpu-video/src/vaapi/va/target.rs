@@ -32,7 +32,7 @@
 //!   decoder still holds ([`Target::is_held`]) is not handed a decode again, a new import of the
 //!   same memory being made for it instead.
 //! - **What it keeps.** A target holds its memory's descriptor and what the caller gives it to
-//!   keep ([`Target::import`]), until the last of it and its pictures goes; the surface is then
+//!   keep (`Target::import`), until the last of it and its pictures goes; the surface is then
 //!   destroyed (`Display::release`).
 
 #[cfg(unix)]

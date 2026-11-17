@@ -588,7 +588,7 @@ fn destroy(display: &Display, strips: &[Strip]) {
 }
 
 /// On Windows, which makes no dma-buf: no strip is had (the display lends no import there, so
-/// [`write`] declines before it asks).
+/// [`write()`] declines before it asks).
 #[cfg(windows)]
 fn strips(
     _display: &Display,

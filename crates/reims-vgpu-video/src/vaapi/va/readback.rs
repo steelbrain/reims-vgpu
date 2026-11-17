@@ -4,7 +4,7 @@
 //! A pool reads its frames back in one of these ways, the first that its
 //! driver serves:
 //! - **staged**: a video-processing run copies the whole surface on the GPU
-//!   into a linear surface over [`HostMemory`] of ours, and the CPU copies
+//!   into a linear surface over `HostMemory` of ours, and the CPU copies
 //!   the frame's rectangle out of that cached memory;
 //! - **an image**: `vaGetImage` into an image of the pool's format, mapped
 //!   and copied out;
@@ -207,7 +207,7 @@ fn copy_streaming_sse41(dst: &mut [u8], src: &[u8]) {
     dst[i..len].copy_from_slice(&src[i..len]);
 }
 
-/// A format a [`HostSurface`] is laid out in: the decoders' two.
+/// A format a `HostSurface` is laid out in: the decoders' two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostFormat {
     /// `VA_FOURCC_NV12`: luma, then the chroma pairs.
@@ -241,7 +241,7 @@ impl HostFormat {
         }
     }
 
-    /// Where each plane of a [`HostSurface`] of `width` by `height` is, its
+    /// Where each plane of a `HostSurface` of `width` by `height` is, its
     /// offset and pitch, and the bytes of the whole: each plane's rows
     /// 256-byte aligned, and each plane at a page and a whole number of the
     /// first plane's rows from its first byte, as iHD writes a chroma plane
