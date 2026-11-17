@@ -536,11 +536,18 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
     }
 
     fn encode_end_if(&self) -> RaiseResult<bool> {
-        predication::end_if(self, "encodeEndIf")
+        let recorded_call = crate::recorder::rec_call!("encodeEndIf", self);
+        let recorded_answer = crate::recorder::run(|| predication::end_if(self, "encodeEndIf"));
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn encode_end_while(&self) -> RaiseResult<bool> {
-        predication::end_while(self, "encodeEndWhile")
+        let recorded_call = crate::recorder::rec_call!("encodeEndWhile", self);
+        let recorded_answer =
+            crate::recorder::run(|| predication::end_while(self, "encodeEndWhile"));
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 }
 
