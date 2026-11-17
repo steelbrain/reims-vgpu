@@ -46,8 +46,10 @@
 //!   mirror and for the last copy into it, so the compare runs beside those two;
 //! - then it copies the listed tiles out of `now` into the mirror on the copy engine's queue: a
 //!   run of tiles side by side is one copy in each of its pixel rows, a run of whole rows of
-//!   tiles one copy, and a copy that meets the one before it joins it. With no tile changed,
-//!   nothing is copied and the draw waits for nothing;
+//!   tiles one copy, and a copy that meets the one before it joins it. The list is host data the
+//!   GPU writes, so only the frame's tiles are copied, each once: a number past them, or one
+//!   listed twice, copies nothing more. With no tile changed, nothing is copied and the draw
+//!   waits for nothing;
 //! - the copy's completion goes to the draw as a sync's does above, and `now` becomes `sent`.
 //!
 //! The kernel's own writes into host memory hold the GPU engine that every queue of its
@@ -240,17 +242,38 @@ struct Span {
     length: u64,
 }
 
-/// The copies that carry the tiles `tiles` (their numbers, a row of tiles after another, sorted)
-/// of a frame of `width` by `height` pixels of `bytes` bytes, its rows `bytes_per_row` apart: a
-/// run of tiles side by side is a copy of its bytes in each of its rows, and a run across a
-/// whole row of tiles a copy of its rows whole; a copy that starts where the one before it ends
-/// joins it. No byte of a tile not listed is copied, but the bytes past a row's last pixel, up to
-/// the next row, in a whole row's copy.
+/// The tiles of `listed`, the numbers a compare's list holds, that a frame of `all` tiles has:
+/// sorted, each once. The list is host data on the runtime's device, which the GPU writes and
+/// which a guest's work can reach once every byte on the device is guest-writable, so a number
+/// at or past `all` is dropped, as is a second of one number, and the order plays no part.
+fn frame_tiles(listed: &[u32], all: u64) -> Vec<u32> {
+    let mut tiles: Vec<u32> = (listed.iter().copied())
+        .filter(|&t| u64::from(t) < all)
+        .collect();
+    tiles.sort_unstable();
+    tiles.dedup();
+    tiles
+}
+
+/// The copies that carry the tiles `tiles` (their numbers, a row of tiles after another) of a
+/// frame of `width` by `height` pixels of `bytes` bytes, its rows `bytes_per_row` apart: a run of
+/// tiles side by side is a copy of its bytes in each of its rows, and a run across a whole row of
+/// tiles a copy of its rows whole; a copy that starts where the one before it ends joins it. No
+/// byte of a tile not listed is copied, but the bytes past a row's last pixel, up to the next
+/// row, in a whole row's copy.
+///
+/// Only the frame's tiles count ([`frame_tiles`]), in their order, each once, whatever `tiles`
+/// holds. So each tile's row lies above the frame's last and its column left of its last, and
+/// every copy lies inside the frame's `height` rows of `bytes_per_row` bytes: no length wraps,
+/// nor does an end.
 fn spans(tiles: &[u32], width: u64, height: u64, bytes: u64, bytes_per_row: u64) -> Vec<Span> {
     let across = width.div_ceil(TILE);
+    let tiles = frame_tiles(tiles, across.saturating_mul(height.div_ceil(TILE)));
     let mut spans: Vec<Span> = Vec::new();
     let mut push = |span: Span| match spans.last_mut() {
-        Some(before) if before.at + before.length == span.at => before.length += span.length,
+        Some(before) if before.at.checked_add(before.length) == Some(span.at) => {
+            before.length += span.length;
+        }
         _ => spans.push(span),
     };
     let mut at = 0;
@@ -584,12 +607,13 @@ impl<P: ApiPlatform> Mirror<P> {
         let list = frame.list.as_ref()?;
         // SAFETY: the shared list, one word of count and one for each tile, which the finished
         // compare wrote, and no command buffer since.
-        let mut listed: Vec<u32> = unsafe {
+        let listed: Vec<u32> = unsafe {
             let at = list.contents().as_ptr::<u32>();
             let count = u64::from(at.read()).min(all);
             std::slice::from_raw_parts(at.add(1), count as usize).to_vec()
         };
-        listed.sort_unstable();
+        // The list is the GPU's: only the frame's tiles, each once ([`frame_tiles`]).
+        let listed = frame_tiles(&listed, all);
         // `now` is the frame sent from here.
         std::mem::swap(&mut frame.now, &mut frame.sent);
         frame.fresh = false;
@@ -887,6 +911,42 @@ mod tests {
         assert_eq!(spans, rows);
     }
 
+    /// A list the GPU wrote wrong (host data on the device, which a guest can write) copies only
+    /// inside the frame: a tile number at or past the frame's count of tiles is dropped, one
+    /// listed twice is copied once, and the list's order plays no part. 256 x 128 pixels of 4
+    /// bytes, rows 1024 bytes apart, eight tiles
+    #[test]
+    fn a_forged_list_copies_inside_the_frame_alone() {
+        let at = |tiles: &[u32]| spans(tiles, 256, 128, 4, 1024);
+        assert!(at(&[8]).is_empty(), "one past the last tile");
+        assert!(at(&[u32::MAX]).is_empty());
+        assert!(at(&[u32::MAX, 8, u32::MAX - 1]).is_empty());
+        assert_eq!(at(&[u32::MAX, 8, 1, 2, 9]), at(&[1, 2]));
+        assert_eq!(at(&[2, 1, 2, 1, 1]), at(&[1, 2]), "duplicates, unsorted");
+        assert_eq!(
+            at(&[7, 6, 5, 4, 3, 2, 1, 0, 0, 7]),
+            [span(0, 128 * 1024)],
+            "every tile, backwards and twice"
+        );
+        let forged = [
+            vec![u32::MAX; 3],
+            (0..40).rev().collect(),
+            vec![7, 8, u32::MAX - 1, 0, 3, 3],
+            (0..32).map(|t| u32::MAX - t).collect(),
+        ];
+        for list in forged {
+            for s in at(&list) {
+                assert!(
+                    s.length > 0 && s.at + s.length <= 128 * 1024,
+                    "{s:?} of {list:?}"
+                );
+            }
+        }
+        // A frame of no tiles has none to copy.
+        assert!(spans(&[0, 1], 0, 128, 4, 1024).is_empty());
+        assert!(spans(&[0, 1], 256, 0, 4, 1024).is_empty());
+    }
+
     /// A mirror on the fake platform, whose devices give a queue for copies where `copies`, with
     /// a 256 x 128 surface of 4 bytes a pixel; command buffers complete only as the test
     /// completes them.
@@ -1104,6 +1164,60 @@ mod tests {
         assert!(copies(&log.since(mark)).is_empty());
         assert_eq!(mirror.last_sent(), 0);
         assert!(!mirror.last_asked());
+    }
+
+    /// The compare's list of words `words`, its count then its tiles, written over the buffer
+    /// `list` from its start, as a GPU that wrote it wrong would leave it.
+    fn forged_list(platform: &FakePlatform, list: Option<ObjId>, words: &[u32]) {
+        let buffer = (platform.world().find(list.unwrap()))
+            .and_then(|b| b.cast::<kind::Buffer>())
+            .unwrap();
+        assert!(buffer.length() >= 4 * words.len() as u64);
+        // SAFETY: the fake buffer's contents, which no command buffer reads now.
+        unsafe {
+            let at: *mut u32 = buffer.contents().as_ptr();
+            std::ptr::copy_nonoverlapping(words.as_ptr(), at, words.len());
+        }
+    }
+
+    /// Where a queue for copies copies the listed tiles, a list the GPU wrote wrong copies only
+    /// the frame's tiles: a tile number at or past the frame's eight is dropped, one listed twice
+    /// is copied once, and a count past the frame's tiles reads no further than them; a list of
+    /// nothing but such numbers copies nothing, and the draw waits for nothing
+    #[test]
+    fn with_a_queue_for_copies_a_forged_list_copies_only_the_frames_tiles() {
+        let (platform, mirror, surface) = fake(true);
+        let log = platform.call_log();
+        let mark = log.mark();
+        let first = sync_on_a_thread(&platform, &mirror, &surface);
+        let compare = committed(&platform, 1)[0];
+        let buffers = bound(&log.since(mark));
+        let now = buffers[0];
+        list(&platform, buffers[2], &[u32::MAX, 5, 8, 4, 5, u32::MAX - 1]);
+        let mark = log.mark();
+        complete(&platform, compare);
+        let copy = committed(&platform, 1)[0];
+        let rows: Vec<_> = (64..128).map(|y| (now, y * 1024, 512)).collect();
+        assert_eq!(
+            (copies(&log.since(mark)).iter())
+                .map(|c| (c.0, c.1, c.3))
+                .collect::<Vec<_>>(),
+            rows,
+            "tiles 4 and 5 alone, each once"
+        );
+        complete(&platform, copy);
+        assert_eq!(first.join().unwrap(), Some((1024, false)));
+        assert_eq!(mirror.last_sent(), 2);
+        // A count past the frame's tiles, and nothing but numbers past them.
+        let mark = log.mark();
+        let second = sync_on_a_thread(&platform, &mirror, &surface);
+        let compare = committed(&platform, 1)[0];
+        forged_list(&platform, bound(&log.since(mark))[2], &[u32::MAX; 9]);
+        complete(&platform, compare);
+        assert_eq!(second.join().unwrap(), Some((1024, false)));
+        assert!(platform.world().committed().is_empty());
+        assert!(copies(&log.since(mark)).is_empty());
+        assert_eq!(mirror.last_sent(), 0);
     }
 
     /// Where the platform gives no queue for copies (the default), the mirror asks for none in
