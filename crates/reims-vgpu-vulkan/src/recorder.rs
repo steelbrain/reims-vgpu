@@ -17,7 +17,8 @@
 //!   ([`typed`]), integers, booleans and ranges as themselves, and host memory, bytes, strings and
 //!   events as such ([`spec`]); the rest is formatted as its `Debug` text, its objects as their
 //!   stream ids, which the writer reads into values ([`debug_value`]). Text that names objects by
-//!   pointer (`ObjId(..)`) is read at once, while the pointers are the objects'.
+//!   pointer (`ObjId(..)`) has them named by their stream ids at once, while the pointers are the
+//!   objects' ([`resolve_ptrs`]).
 //! - **Memory.** Before each commit, the recorder waits for the earlier command buffers that can
 //!   run, then writes `m2v.write` records of every 4 KiB of host memory the command buffer can
 //!   reach that changed since the stream last held it ([`before_commit`]). A buffer in a heap over
@@ -293,18 +294,79 @@ pub fn begin_cmd<C: typed::Command + std::fmt::Debug>(
 }
 
 /// A command's arguments: read from its fields where it is one [`typed`] reads; else its text,
-/// read now where it names objects by pointer, or left for the writer.
+/// left for the writer, its objects named by pointer named by their ids now ([`resolve_ptrs`]).
 fn cmd_call<C: typed::Command + std::fmt::Debug>(cmd: &C) -> (Vec<Value>, Option<String>) {
     let mut cx = typed::Cx::new(&id_at);
     if let Some(args) = cmd.typed(&mut cx) {
         count_unrecorded(cx.unrecorded);
         return (args, None);
     }
-    let text = debug_text(cmd);
+    (Vec::new(), Some(stream_text(debug_text(cmd))))
+}
+
+/// `text`, its objects named by pointer named by their stream ids ([`resolve_ptrs`]).
+fn stream_text(text: String) -> String {
     if text.contains("ObjId(") {
-        return (cmd_args_text(&text), None);
+        resolve_ptrs(&text, &id_at)
+    } else {
+        text
     }
-    (Vec::new(), Some(text))
+}
+
+/// `text` with each object it names by pointer (`ObjId(p)`) named by its stream id instead,
+/// `ObjRef(id)`, or `Unrecorded(0)` where `ids` has none, as the reader would read it now:
+/// the writer reads the same values from it later, when the pointers may be other objects'.
+/// Quoted strings are left as they are.
+fn resolve_ptrs(text: &str, ids: &dyn Fn(u64) -> Option<u64>) -> String {
+    const TAG: &[u8] = b"ObjId(";
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let (mut at, mut copied, mut quoted) = (0, 0, false);
+    while let Some(&b) = bytes.get(at) {
+        if quoted {
+            match b {
+                b'\\' => at += 1,
+                b'"' => quoted = false,
+                _ => {}
+            }
+            at += 1;
+            continue;
+        }
+        if b == b'"' {
+            quoted = true;
+            at += 1;
+            continue;
+        }
+        let named = bytes.get(at..).is_some_and(|r| r.starts_with(TAG))
+            && !at
+                .checked_sub(1)
+                .and_then(|p| bytes.get(p))
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_');
+        if named {
+            let digits = at + TAG.len();
+            let end = digits
+                + bytes
+                    .get(digits..)
+                    .map_or(0, |r| r.iter().take_while(|c| c.is_ascii_digit()).count());
+            if bytes.get(end) == Some(&b')')
+                && let Some(ptr) = text.get(digits..end).and_then(|d| d.parse::<u64>().ok())
+            {
+                out.push_str(text.get(copied..at).unwrap_or_default());
+                match ids(ptr) {
+                    Some(id) => {
+                        let _ = write!(out, "ObjRef({id})");
+                    }
+                    None => out.push_str("Unrecorded(0)"),
+                }
+                at = end + 1;
+                copied = at;
+                continue;
+            }
+        }
+        at += 1;
+    }
+    out.push_str(text.get(copied..).unwrap_or_default());
+    out
 }
 
 fn count_unrecorded(n: u64) {
@@ -588,13 +650,9 @@ pub mod spec {
     }
 
     /// `x`'s value from its `Debug` text, objects as their stream ids: the text, which the
-    /// writer reads ([`Value::Debug`]), but where it names objects by pointer, read now.
+    /// writer reads ([`Value::Debug`]), objects it names by pointer named by their ids now.
     pub fn debug_value_of<T: std::fmt::Debug + ?Sized>(x: &T) -> Value {
-        let text = super::debug_text(x);
-        if text.contains("ObjId(") {
-            return super::parse_text(&text);
-        }
-        Value::Debug(text)
+        Value::Debug(super::stream_text(super::debug_text(x)))
     }
 
     /// An answer that names an object the call made, or none.
@@ -714,9 +772,10 @@ pub fn fmt_obj(ptr: u64, type_name: &str, f: &mut std::fmt::Formatter<'_>) -> st
     }
 }
 
-/// The stream id of the object at `ptr`.
+/// The stream id of the object at `ptr`: under a lock of its own, which the calling threads
+/// alone take, never the writer's.
 fn id_at(ptr: u64) -> Option<u64> {
-    state()?.objects.lock().by_ptr.get(&ptr).copied()
+    state()?.ptrs.lock().get(&ptr).copied()
 }
 
 fn object_value<T: Send + Sync + 'static>(o: &Obj<T>) -> Value {
@@ -810,16 +869,12 @@ pub fn present(t: &dyn Any) {
 /// no longer read.
 pub fn released(ptr: u64) {
     let Some(state) = state() else { return };
-    let id = {
-        let mut objects = state.objects.lock();
-        let Some(id) = objects.by_ptr.remove(&ptr) else {
-            return;
-        };
-        if let Some(info) = objects.info.get_mut(&id) {
-            info.dead = true;
-        }
-        id
+    let Some(id) = state.ptrs.lock().remove(&ptr) else {
+        return;
     };
+    if let Some(info) = state.objects.lock().info.get_mut(&id) {
+        info.dead = true;
+    }
     state.baselines.lock().remove(&id);
     state.push(Item::Release(id));
 }
@@ -1060,9 +1115,7 @@ enum Item {
 
 #[derive(Default)]
 struct Objects {
-    by_ptr: KeyMap<u64>,
     info: KeyMap<Info>,
-    next: u64,
     /// Live pinned ranges: start, then end and id.
     pins: BTreeMap<u64, (u64, u64)>,
 }
@@ -1161,6 +1214,10 @@ struct State {
     /// Held while queued records are shaped, so they are shaped in order.
     shaping: Mutex<()>,
     stream: Mutex<Stream>,
+    /// Each live object's stream id by its pointer ([`id_at`]).
+    ptrs: Mutex<KeyMap<u64>>,
+    /// The last stream id given.
+    next: AtomicU64,
     objects: Mutex<Objects>,
     sync: Mutex<SyncState>,
     baselines: Mutex<KeyMap<Vec<u64>>>,
@@ -1180,6 +1237,8 @@ impl State {
             queue: Mutex::new(Vec::new()),
             shaping: Mutex::new(()),
             stream: Mutex::new(Stream::new()),
+            ptrs: Mutex::new(KeyMap::default()),
+            next: AtomicU64::new(0),
             objects: Mutex::new(Objects::default()),
             sync: Mutex::new(SyncState::default()),
             baselines: Mutex::new(KeyMap::default()),
@@ -1409,28 +1468,23 @@ impl State {
         let _ = std::fs::write(path, out);
     }
 
+    /// Gives the object `made` its stream id: its information first, then its pointer's id, so
+    /// a call that finds the id finds the object.
     fn register(&self, made: Made) -> u64 {
-        let (id, stale) = {
-            let mut objects = self.objects.lock();
-            objects.next += 1;
-            let id = objects.next;
-            let stale = objects.by_ptr.insert(made.ptr, id);
-            if let Some(old) = stale
-                && let Some(info) = objects.info.get_mut(&old)
-            {
+        let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        self.objects.lock().info.insert(
+            id,
+            Info {
+                type_name: made.type_name,
+                weak: Some(made.weak),
+                ..Info::default()
+            },
+        );
+        let stale = self.ptrs.lock().insert(made.ptr, id);
+        if let Some(old) = stale {
+            if let Some(info) = self.objects.lock().info.get_mut(&old) {
                 info.dead = true;
             }
-            objects.info.insert(
-                id,
-                Info {
-                    type_name: made.type_name,
-                    weak: Some(made.weak),
-                    ..Info::default()
-                },
-            );
-            (id, stale)
-        };
-        if let Some(old) = stale {
             // The object at this address went with no release seen: its release comes first.
             self.baselines.lock().remove(&old);
             self.push(Item::Release(old));
@@ -2757,10 +2811,33 @@ mod tests {
         };
         assert_eq!(parse_text(&text), read(format!("{desc:?}")));
         let by_ptr = Some(ObjId(0x1000));
+        let Value::Debug(text) = rec_val!(by_ptr) else {
+            panic!("text naming an object by pointer waits for the writer");
+        };
+        assert_eq!(text, "Some(Unrecorded(0))", "no object at 0x1000");
+        let (v, notes) = debug_value::parse(&text, &|_| None);
+        assert_eq!((v, notes.unrecorded), (Value::Nil, 1));
+    }
+
+    /// Objects named by pointer are named by their stream ids, or as unrecorded, so the text
+    /// reads later as it reads now; a quoted string and a longer name are left as they are.
+    #[test]
+    fn objects_by_pointer_are_named_by_their_ids() {
+        let ids = |p: u64| (p == 4096).then_some(21);
+        let text = "Desc { f: ObjId(4096), g: Some(ObjId(8192)), h: [ObjId(4096)], \
+                    label: \"ObjId(4096) \\\" ObjId(4096)\", i: MyObjId(4096) }";
+        let named = resolve_ptrs(text, &ids);
         assert_eq!(
-            rec_val!(by_ptr),
-            Value::Nil,
-            "read at once: no object at 0x1000"
+            named,
+            "Desc { f: ObjRef(21), g: Some(Unrecorded(0)), h: [ObjRef(21)], \
+             label: \"ObjId(4096) \\\" ObjId(4096)\", i: MyObjId(4096) }"
+        );
+        let now = debug_value::parse(text, &ids);
+        let later = debug_value::parse(&named, &|_| None);
+        assert_eq!(later.0, now.0);
+        assert_eq!(
+            (later.1.unrecorded, later.1.unread),
+            (now.1.unrecorded, now.1.unread)
         );
     }
 
