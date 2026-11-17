@@ -55,16 +55,14 @@ fn a_fault_writes_its_module_offset_and_callers() {
     let head = format!("reims-vgpu: exception 0xc0000005 at {file}+0x");
     let firsts: Vec<&str> = stderr
         .lines()
-        .filter(|l| l.starts_with(&head) && l.contains("thread "))
+        .filter(|l| {
+            l.starts_with(&head) && l.ends_with("; the process ends unless a handler takes it")
+        })
         .collect();
     assert_eq!(firsts.len(), 1, "{stderr}");
     let first = firsts[0];
     assert!(
         first.contains(" (an access violation, a write of 0x0000000000000018), thread "),
-        "{first}"
-    );
-    assert!(
-        first.ends_with("; the process ends unless a handler takes it"),
         "{first}"
     );
     let rest = &first[head.len()..];
@@ -81,6 +79,13 @@ fn a_fault_writes_its_module_offset_and_callers() {
         .unwrap_or_else(|| panic!("no callers' line: {stderr}"));
     let called_from = &callers[callers.find(": called from ").unwrap()..];
     assert!(called_from.contains(&format!(" {file}+0x")), "{callers}");
+    // libtest runs the test on a thread it names for the test.
+    assert!(
+        stderr.lines().any(|l| l.starts_with(&head)
+            && l.contains(": on thread ")
+            && l.ends_with(&format!("\"{TEST}\""))),
+        "{stderr}"
+    );
 }
 
 /// Each site writes its lines once: a key is new once, and a full table lets every key write.
