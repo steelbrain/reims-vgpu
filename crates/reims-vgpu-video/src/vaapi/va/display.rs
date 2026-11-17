@@ -9,6 +9,8 @@ use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::path::Path;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::core::runtime::{ExitStep, MonoTime, Runtime, park_for_good};
@@ -158,7 +160,24 @@ struct DisplayInner {
     adapter: Option<[u8; 8]>,
     #[cfg(windows)]
     d3d12: OnceLock<Result<super::d3d12::Device, String>>,
+    /// On Windows, the display's live contexts and the teardowns held while one lives
+    /// ([`Display::release_teardown`]).
+    #[cfg(windows)]
+    teardowns: Mutex<Teardowns>,
 }
+
+/// On Windows, a display's contexts made and not yet let go, and the teardowns asked for while
+/// one lived, in the order asked ([`Display::release_teardown`]).
+#[cfg(windows)]
+#[derive(Default)]
+struct Teardowns {
+    live: usize,
+    held: Vec<Box<dyn FnOnce(ffi::VADisplay) + Send>>,
+}
+
+/// Whether a teardown was held yet in this process, which the log says once.
+#[cfg(windows)]
+static HELD_LOGGED: AtomicBool = AtomicBool::new(false);
 
 // SAFETY: "All VAAPI functions implemented in libva are thread-safe" and
 // a backend's must be too (va.h, "Multithreading Guide"). The handle is
@@ -318,6 +337,8 @@ impl Display {
                 adapter,
                 #[cfg(windows)]
                 d3d12: OnceLock::new(),
+                #[cfg(windows)]
+                teardowns: Mutex::default(),
             }),
         };
         display.prime();
@@ -446,6 +467,65 @@ impl Display {
     /// thread. Never waited for.
     pub(crate) fn release(&self, release: impl FnOnce(ffi::VADisplay) + Send + 'static) {
         self.inner.calls.release(release);
+    }
+
+    /// Counts a context made on the display, which on Windows holds the teardowns asked for
+    /// while it lives ([`Display::release_teardown`]).
+    pub(crate) fn context_made(&self) {
+        #[cfg(windows)]
+        {
+            self.inner.teardowns.lock().live += 1;
+        }
+    }
+
+    /// `release`, the teardown of a context (`ends_context`), of a config or of a pool's
+    /// surfaces, made as [`Display::release`] makes a release.
+    ///
+    /// On Windows it is held while another context lives on the display, and made, behind the
+    /// teardowns held before it, once the teardown of the display's last live context is asked
+    /// for. **Measured** on the UHD Graphics 630 (vaon12 of Mesa 26.2.7 over Intel's Direct3D 12
+    /// video driver, 2026-11-17), two threads each decoding a 4K H.264 stream on one display,
+    /// their decoders let go round after round or kept (`super::teardown`): a decoder let go
+    /// while another lived ended the process in an access violation inside Intel's
+    /// `igd12dxva64.dll` at the other's next `vaEndPicture`, or had that call fail, in every run
+    /// of every shape tried: with the other decoder idle and its last picture done and read
+    /// back; with no teardown between another context's `vaBeginPicture` and its
+    /// `vaEndPicture`'s return; with each context's pictures submitted alone, once the other
+    /// contexts' last pictures were done. With teardowns held until no context lived, and with
+    /// the decoders kept until both threads ended, every run passed, as one thread making and
+    /// letting go decoders one after another did. A teardown held keeps its surfaces' memory
+    /// meanwhile.
+    pub(crate) fn release_teardown(
+        &self,
+        ends_context: bool,
+        release: impl FnOnce(ffi::VADisplay) + Send + 'static,
+    ) {
+        #[cfg(windows)]
+        {
+            let held = {
+                let mut teardowns = self.inner.teardowns.lock();
+                if ends_context {
+                    teardowns.live = teardowns.live.saturating_sub(1);
+                }
+                if teardowns.live > 0 {
+                    if !HELD_LOGGED.swap(true, Ordering::Relaxed) {
+                        log::info!(
+                            "hardware video: VA-API: a session's teardown is held while another \
+                             session lives on the display, and made once none does"
+                        );
+                    }
+                    teardowns.held.push(Box::new(release));
+                    return;
+                }
+                std::mem::take(&mut teardowns.held)
+            };
+            for teardown in held {
+                self.release(teardown);
+            }
+        }
+        #[cfg(unix)]
+        let _ = ends_context;
+        self.release(release);
     }
 }
 

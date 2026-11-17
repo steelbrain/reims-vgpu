@@ -160,7 +160,7 @@ impl Drop for PoolInner {
             // SAFETY: every surface was made by vaCreateSurfaces on this
             // display, and none is lent, since each lent Surface holds the
             // pool; destroyed once, here, behind every call on them.
-            self.display.release(move |raw| unsafe {
+            self.display.release_teardown(false, move |raw| unsafe {
                 ffi::vaDestroySurfaces(raw, all.as_mut_ptr(), count);
                 #[cfg(windows)]
                 drop(textures);

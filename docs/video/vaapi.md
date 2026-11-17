@@ -641,6 +641,36 @@ The thread starts with the first order and ends after `vaTerminate`.
 Where it cannot start, the log says so, and orders are made on their
 callers' threads with no bound.
 
+**On Windows a teardown waits for the display's other contexts**
+(`Display::release_teardown`): the destroy of a context, of a config or
+of a pool's surfaces, asked for while another context lives on the
+display, is held, and made once the last live context's teardown is
+asked for, in the order asked. **Measured** on the UHD Graphics 630
+(vaon12 of Mesa 26.2.7 over Intel's Direct3D 12 video driver,
+2026-11-17), two threads each decoding a 4K H.264 stream of 240 pictures
+on one display, their decoders let go round after round or kept
+(`src/vaapi/va/teardown.rs`): a decoder let go while another lived ended
+the process in an access violation inside Intel's `igd12dxva64.dll` at
+the other's next `vaEndPicture` (under Mesa's
+`d3d12_video_decoder_end_frame`), or had that call fail, in every run of
+every shape tried:
+- the other decoder idle, its last picture done and read back;
+- no teardown between another context's `vaBeginPicture` and its
+  `vaEndPicture`'s return;
+- each context's pictures submitted alone, once the other contexts'
+  last pictures were done;
+- every call of the display's made alone.
+
+With the teardowns held until no context lived, and with the decoders
+kept until both threads ended, every run passed, as one thread making
+and letting go decoders one after another (2,880 pictures) did. QEMU's
+fault as a guest's 4K H.264 session ended beside its next was in the same
+call, in `D3D12Core.dll` called from `igd12dxva64.dll`. A teardown held
+keeps its surfaces' memory until then; the log says so once a process.
+On Linux the same test passed on the Radeon 780M (radeonsi, Mesa 26.2.6)
+with every teardown made at once, so there a teardown is a release as
+any other.
+
 **What the gate costs** is the driver's lock's: a call that waits holds
 the gate as long as the driver held its lock for it, and every other call
 on the display waits for the gate meanwhile. So the crate makes such a
@@ -1345,7 +1375,11 @@ host session's on the fake platform (`video_host`'s tests).
 
 The module's ignored tests need a VA-API GPU and the installed headers:
 the binding's layouts against libva's headers, the import check's sweep,
-and the bounded waits ("Waiting for the GPU", "Its tests"):
+the bounded waits ("Waiting for the GPU", "Its tests"), and two threads'
+decoders let go while the other decodes ("On Windows a teardown waits for
+the display's other contexts"; on a driver with no H.264 encoder, such as
+vaon12 on the UHD Graphics 630, `RVG_VA_H264` names an Annex B stream to
+decode):
 
 ```sh
 cargo nextest run -p reims-vgpu-video --run-ignored only -E 'test(/^vaapi::/)'

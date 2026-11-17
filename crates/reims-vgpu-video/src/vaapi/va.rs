@@ -44,6 +44,8 @@ mod target_check;
 #[cfg(test)]
 #[cfg(unix)]
 pub(crate) mod target_probe;
+#[cfg(test)]
+mod teardown;
 mod vpp_ffi;
 mod wait;
 mod zero_copy;

@@ -656,7 +656,7 @@ impl Drop for Config {
         // SAFETY: made by vaCreateConfig on this display, destroyed once,
         // here, behind the destroy of every context on it, as each holds
         // its config.
-        self.display.release(move |raw| unsafe {
+        self.display.release_teardown(false, move |raw| unsafe {
             ffi::vaDestroyConfig(raw, id);
         });
     }
@@ -705,6 +705,7 @@ impl Context {
                 )
             })?,
         )?;
+        display.context_made();
         Ok(Self {
             display: display.clone_ref(),
             id,
@@ -725,7 +726,7 @@ impl Drop for Context {
         let id = self.id;
         // SAFETY: made by vaCreateContext on this display, destroyed once,
         // here, before its config, whose destroy is made behind this.
-        self.display.release(move |raw| unsafe {
+        self.display.release_teardown(true, move |raw| unsafe {
             ffi::vaDestroyContext(raw, id);
         });
     }

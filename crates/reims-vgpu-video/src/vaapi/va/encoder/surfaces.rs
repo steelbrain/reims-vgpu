@@ -91,7 +91,7 @@ impl Drop for Pool {
         // SAFETY: made by vaCreateSurfaces on this display, destroyed once,
         // here. The session destroys its context first; a Lent outliving
         // the pool only pushes its ID onto the free list.
-        self.display.release(move |raw| unsafe {
+        self.display.release_teardown(false, move |raw| unsafe {
             ffi::vaDestroySurfaces(raw, ids.as_mut_ptr(), count);
         });
     }
