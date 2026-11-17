@@ -77,8 +77,10 @@ public:
 	// says whether the message reached the ring, after which the host lets go of the lends.
 	IOReturn send(const RgfxPageRun *runs, uint32_t count, uint64_t length, const RgfxVtLent *lent,
 	              uint32_t lentCount, int32_t *status, bool *posted);
-	// handleEvent's VT_MESSAGE, on the device's work loop: the `length` bytes of the host's
-	// message, to the clients RgfxVtRoutes.hpp routes it to, or the lends a `rels` lets go of.
+	// A host message, on the device's work loop, from handleEvent's VT_MESSAGE or a VT_RING's
+	// take of the VideoToolbox ring (ReimsGraphics::vtMessage): its `length` bytes, to the
+	// clients RgfxVtRoutes.hpp routes it to, or the lends a `rels` lets go of. It copies them
+	// before it returns.
 	void deliver(const volatile uint8_t *message, uint32_t length);
 	// Lends the host the IOSurface `surfaceId` as `task` sees it: held, its memory wired, its
 	// record, named by its new lend, into *record and its runs into `runs` (at most `max`).
