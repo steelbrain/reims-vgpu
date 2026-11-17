@@ -548,7 +548,7 @@ fn command_buffer_copy_cost() {
 }
 
 /// What the pool's host callbacks were asked, for [`a_pool_s_pieces_reach_the_host_and_back`].
-static POOL_ASKS: std::sync::Mutex<Vec<(bool, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+static POOL_ASKS: parking_lot::Mutex<Vec<(bool, u64, u64)>> = parking_lot::Mutex::new(Vec::new());
 
 unsafe extern "C-unwind" fn pool_add(
     _ctx: *mut c_void,
@@ -557,17 +557,11 @@ unsafe extern "C-unwind" fn pool_add(
     length: u64,
 ) {
     assert!(!host_address.is_null());
-    POOL_ASKS
-        .lock()
-        .unwrap()
-        .push((true, physical_address, length));
+    POOL_ASKS.lock().push((true, physical_address, length));
 }
 
 unsafe extern "C-unwind" fn pool_remove(_ctx: *mut c_void, physical_address: u64, length: u64) {
-    POOL_ASKS
-        .lock()
-        .unwrap()
-        .push((false, physical_address, length));
+    POOL_ASKS.lock().push((false, physical_address, length));
 }
 
 /// A pool needs both of its callbacks and a range of whole 2 MiB; a device without one refuses
@@ -637,12 +631,12 @@ fn a_pool_s_pieces_reach_the_host_and_back() {
         );
         assert_eq!(rvg_graphics_device_pool_grow(device, 1), RVG_OK);
         for _ in 0..10_000 {
-            if !POOL_ASKS.lock().unwrap().is_empty() {
+            if !POOL_ASKS.lock().is_empty() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert_eq!(*POOL_ASKS.lock().unwrap(), [(true, BASE, 256 << 20)]);
+        assert_eq!(*POOL_ASKS.lock(), [(true, BASE, 256 << 20)]);
         assert_eq!(rvg_graphics_device_pool_added(device, BASE), RVG_OK);
         assert_eq!(
             rvg_graphics_device_pool_added(device, BASE),
@@ -656,5 +650,5 @@ fn a_pool_s_pieces_reach_the_host_and_back() {
         assert_eq!(rvg_graphics_device_pool_removed(device, BASE), RVG_OK);
         rvg_graphics_device_release(device);
     }
-    assert_eq!(POOL_ASKS.lock().unwrap().len(), 1);
+    assert_eq!(POOL_ASKS.lock().len(), 1);
 }

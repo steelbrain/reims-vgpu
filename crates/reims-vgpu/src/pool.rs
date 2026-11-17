@@ -93,9 +93,9 @@ pub struct BlockId(pub u32);
 impl BlockId {
     /// The number.
     #[allow(
-    dead_code,
-    reason = "metal2vulkan-rt's shape, kept whole so only the source changes when it lands"
-)]
+        dead_code,
+        reason = "metal2vulkan-rt's shape, kept whole so only the source changes when it lands"
+    )]
     pub fn get(self) -> u32 {
         self.0
     }
