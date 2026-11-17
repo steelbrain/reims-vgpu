@@ -68,7 +68,9 @@ that toolchain beside yours if your Rust is set up for Visual Studio, so you don
 Studio. It installs `reims-ctl` into `%USERPROFILE%\.cargo\bin`. On an Intel Core i7-8700B a
 first install took about 20 minutes, and running it again about a minute. From a clone,
 `powershell -ExecutionPolicy Bypass -File scripts\install.ps1` does the same. Windows support is
-newer than Linux's: the guest gets no hardware video decoding there yet.
+newer than Linux's. The guest's H.264 and HEVC video decodes on your GPU there through Mesa's VA-API
+driver for Direct3D 12, which the install adds from MSYS2. On an Intel UHD 630 that driver doesn't
+encode, so the guest encodes video in software there.
 
 ### Set up a VM
 
