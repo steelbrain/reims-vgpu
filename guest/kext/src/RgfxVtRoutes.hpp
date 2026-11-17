@@ -263,12 +263,12 @@ static inline bool rgfxVtServesDecoders(const RgfxVideoCaps &caps)
 	return false;
 }
 
-// Whether the service serves the guest whose kernel's major version is `kernelMajor`: macOS 26
-// (Darwin 25) and later, the releases whose VideoToolbox the host's decoder sessions are checked
-// against. macOS 14 and 15 decode in software, as with no service.
+// Whether the service serves the guest whose kernel's major version is `kernelMajor`: macOS 15
+// (Darwin 24) and later, the releases whose VideoToolbox the host's decoder and encoder sessions
+// are checked against. macOS 14 decodes in software, as with no service.
 static inline bool rgfxVtServesRelease(int kernelMajor)
 {
-	return kernelMajor >= 25;
+	return kernelMajor >= 24;
 }
 
 #endif // RGFX_VT_ROUTES_HPP_

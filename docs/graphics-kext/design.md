@@ -1740,9 +1740,12 @@ Stages:
       the guest's VideoToolbox is then not a guest's.
     - **The host offers `VT_MESSAGES` where its arm lands decodes in the
       guest's surfaces**: on VA-API and on NVDEC, each where it decodes
-      H.264 or HEVC. The arm64e kext publishes the service on macOS 26
-      and later alone (`rgfxVtServesRelease`); macOS 14 and 15 decode in
-      software, as before the bit.
+      H.264 or HEVC. The arm64e kext publishes the service on macOS 15
+      and later alone (`rgfxVtServesRelease`): macOS 15's VideoToolbox
+      runs the host's sessions as 26's does (measured: an arm64 macOS
+      15.6.1 guest under TCG on a 780M host decoded and encoded H.264 and
+      HEVC to the checks 26.6.2 passes, 2026-11-16, lane a64video, potluck
+      job m3-max-38778); macOS 14 decodes in software, as before the bit.
     - **A lend locks the surface first.** Before it lends a surface, the
       kext takes a read-write CPU lock of it and lets it go, as a process
       would: what the GPU wrote of it is in its pages, its seed moves, and
