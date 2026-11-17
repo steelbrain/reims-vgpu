@@ -3,7 +3,8 @@
 //! The process-wide state (the serial number set, the latest IOSurface host device) lives in one
 //! platform instance (D17), so every public constructor goes through the process's: [`platform`],
 //! one `VulkanPlatform` per process, made on first use. Making it installs the aborting panic hook
-//! first (6.5), then the stderr logger if `REIMS_VGPU_LOG` asks for it
+//! first (6.5), and on Windows the handler whose lines name a fault's module and offset
+//! (`faults.rs`), then the stderr logger if `REIMS_VGPU_LOG` asks for it
 //! (`reims_vgpu_vulkan::core::logging::init`). Every function of the C API installs the hook too, before
 //! its body runs, since some make no platform.
 
@@ -40,8 +41,13 @@ pub(crate) fn hook_message(info: &dyn std::fmt::Display) -> String {
 /// graphics lane's ops) it is refused as a death there is: the line is written, and the panic
 /// unwinds to the scope, which refuses the op (`reims_vgpu_vulkan::core::raise::refusals`, "Panics"). A
 /// panic anywhere else is the host's own, and goes to the previous hook.
+///
+/// On Windows it adds, with the hook, the exception handler whose lines name a fault's module
+/// and offset (`faults.rs`): a fault anywhere in the process, the host's or a driver's too.
 pub fn install_panic_hook() {
     HOOK.call_once(|| {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        crate::faults::install();
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             if is_our_thread() {

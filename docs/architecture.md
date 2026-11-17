@@ -900,6 +900,13 @@ Apple's paravirtualized device.
   (docs/conventions.md). A line on a per-event path is debug or trace.
 - **Tests** that are about a line read it through `testkit::logs::capture`, which relies on
   nextest's one process per test.
+- **A fault on Windows** (an access violation, an illegal instruction, a stack overflow, and the
+  other exceptions that end a process no handler takes them in) writes its lines on stderr before
+  any frame's handler sees it: `reims-vgpu: exception <code> at <module>+0x<offset> (…)`, the
+  callers the modules' unwind tables name, and the thread's name (`reims-vgpu/src/faults.rs`, a
+  vectored exception handler the panic hook's install adds, 6.5). It takes nothing, so the process
+  goes on or ends as it would have, and each site writes its lines once per process. Where
+  Windows Error Reporting writes nothing, the exit status is otherwise all a fault leaves.
 
 Kept: every read a line's arguments did, before the line. Free (diagnostics): the text, targets and
 levels of lines.

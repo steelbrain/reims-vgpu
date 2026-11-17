@@ -26,6 +26,8 @@ mod cursor;
 mod device_writes;
 mod entry;
 mod error;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod faults;
 mod graphics;
 mod memory;
 pub mod platform;
