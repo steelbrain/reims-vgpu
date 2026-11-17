@@ -4,7 +4,8 @@
 //! NVIDIA's loads no CUDA.
 //!
 //! 1. NVDEC, where the device is an NVIDIA GPU that CUDA opens (Linux: `super::nvidia`).
-//! 2. VA-API, on the device's render node, whatever its vendor (Linux: `super::vaapi`).
+//! 2. VA-API, on the device's render node, whatever its vendor (Linux: `super::vaapi`), or on
+//!    Windows on its DXGI adapter, over Mesa's VA-on-D3D12 driver (`super::vaapi`).
 
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ pub(crate) fn graphics_video(
     if let Some(video) = super::nvidia::open(device, &runtime) {
         return Some(video);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     if let Some(video) = super::vaapi::open_on(device, Arc::clone(&runtime)) {
         return Some(video);
     }

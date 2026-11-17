@@ -69,6 +69,7 @@
 //!   even rows and columns, and the alignment the import check found for the codec's formats;
 //!   all zero where it found none.
 
+#[cfg(unix)]
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Weak};
@@ -80,23 +81,33 @@ use reims_vgpu_graphics::wire::{
     RgfxVideoEncodeCaps, RgfxVideoOutputLayout,
 };
 use reims_vgpu_video::core::backend::{BackendError as VideoError, DeviceWrite};
+#[cfg(unix)]
 use reims_vgpu_video::core::device_memory::{
-    DeviceImports, DeviceMemory, DmaBufError, GuestTarget, MemoryIdentity, SurfaceDmaBuf,
+    DeviceImports, DmaBufError, MemoryIdentity, SurfaceDmaBuf,
 };
+use reims_vgpu_video::core::device_memory::{DeviceMemory, GuestTarget};
 use reims_vgpu_video::core::fourcc::FourCc;
 use reims_vgpu_video::core::runtime::Runtime;
 use reims_vgpu_video::core::surfaces::{PlaneLayout, SurfaceLayout};
 use reims_vgpu_video::vaapi::{
     Capabilities, ConfigCapabilities, Display, EncoderSupport, Entrypoint, Frame, GuestWrites,
     H264_MAX_MACROBLOCKS, H264Decoder, HevcDecoder, ImportWrites, InputSurface, PlaneRows, Profile,
-    TARGET_ALIGNMENT, Target, TargetChecks, TargetCodec, TargetFor, TargetFormat, TargetPlane,
-    TargetShape, encoder_support,
+    TargetCodec, TargetFor, encoder_support,
 };
-use reims_vgpu_vulkan::core::num::{ToU64 as _, ToUsize as _};
+#[cfg(unix)]
+use reims_vgpu_video::vaapi::{
+    TARGET_ALIGNMENT, Target, TargetChecks, TargetFormat, TargetPlane, TargetShape,
+};
+#[cfg(unix)]
+use reims_vgpu_vulkan::core::num::ToU64 as _;
+use reims_vgpu_vulkan::core::num::ToUsize as _;
 use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::Platform;
+#[cfg(unix)]
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+#[cfg(unix)]
 use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+#[cfg(unix)]
 use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::core::sync::Mutex;
 
@@ -113,6 +124,7 @@ use super::video_host::{
 };
 
 mod encode;
+#[cfg(unix)]
 mod gpu_copy;
 
 /// The backend's name in the session's log lines.
@@ -136,8 +148,49 @@ const H264_TOP_LEVEL: u32 = 62;
 const H264_WIDEST: u32 = 4096;
 const HEVC_TOP_LEVEL: u32 = 186;
 
+/// Where a VA display is opened ([`open`]): a render node, or on Windows a DXGI adapter by its
+/// LUID.
+pub(crate) enum DisplayAt<'a> {
+    /// A DRM render node (`/dev/dri/renderD128`, say).
+    #[cfg(unix)]
+    Node(&'a Path),
+    /// The DXGI adapter of this LUID, as Vulkan's `deviceLUID` holds it.
+    #[cfg(windows)]
+    Adapter([u8; 8], std::marker::PhantomData<&'a ()>),
+}
+
+impl DisplayAt<'_> {
+    /// A display opened there, its work on `runtime`.
+    fn open(&self, runtime: Arc<dyn Runtime>) -> Result<Display, reims_vgpu_video::vaapi::Error> {
+        match self {
+            #[cfg(unix)]
+            DisplayAt::Node(node) => Display::open(node, runtime),
+            #[cfg(windows)]
+            DisplayAt::Adapter(luid, _) => Display::open_adapter(Some(*luid), runtime),
+        }
+    }
+}
+
+impl std::fmt::Display for DisplayAt<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(unix)]
+            DisplayAt::Node(node) => write!(f, "{}", node.display()),
+            #[cfg(windows)]
+            DisplayAt::Adapter(luid, _) => {
+                write!(
+                    f,
+                    "the DXGI adapter of LUID {:#x}",
+                    u64::from_le_bytes(*luid)
+                )
+            }
+        }
+    }
+}
+
 /// The VA-API video of the runtime device `device`: on the render node of its GPU
 /// (`host_gpus::render_node_of`), as [`open`] opens it; `None`, logged, where its GPU has none.
+#[cfg(unix)]
 pub(crate) fn open_on(
     device: &VulkanDevice,
     runtime: Arc<dyn Runtime>,
@@ -152,14 +205,37 @@ pub(crate) fn open_on(
     open::<VulkanPlatform>(
         device,
         device.registry_id,
-        &node,
+        DisplayAt::Node(&node),
         runtime,
         Some(copies),
         checks,
     )
 }
 
-/// The VA-API video of `device`'s GPU, on its render node `node`, its decoders' threads and waits
+/// The VA-API video of the runtime device `device` on Windows: on the DXGI adapter of its GPU, by
+/// the LUID Vulkan answers for it (`host_gpus::adapter_luid_of`), over Mesa's VA-on-D3D12 driver;
+/// `None`, logged, where its GPU names none. Its pictures land by the CPU's copy alone: Windows
+/// makes no dma-buf, so there is no GPU copier, no write in place and no decode into a cache.
+#[cfg(windows)]
+pub(crate) fn open_on(
+    device: &VulkanDevice,
+    runtime: Arc<dyn Runtime>,
+) -> Option<Arc<dyn GraphicsVideo<VulkanPlatform>>> {
+    let Some(luid) = reims_vgpu_vulkan::host_gpus::adapter_luid_of(&device.raw) else {
+        log::info!("hardware video: no VA-API: the device's GPU names no DXGI adapter");
+        return None;
+    };
+    open::<VulkanPlatform>(
+        device,
+        device.registry_id,
+        DisplayAt::Adapter(luid, std::marker::PhantomData),
+        runtime,
+        None,
+        None,
+    )
+}
+
+/// The VA-API video of `device`'s GPU, on its render node `at` (on Windows its adapter), its decoders' threads and waits
 /// on `runtime`, its pictures copied by the GPU through `copies` where given, the driver's check
 /// of decodes into device caches kept in `checks` where given; one per device while it lives, by
 /// `registry_id`. `None`, logged at `info` with why, where libva does not load, the node opens no
@@ -167,7 +243,7 @@ pub(crate) fn open_on(
 pub(crate) fn open<P: Platform>(
     device: &P::Device,
     registry_id: u64,
-    node: &Path,
+    at: DisplayAt<'_>,
     runtime: Arc<dyn Runtime>,
     copies: Option<Arc<dyn GpuCopies<P>>>,
     checks: Option<PathBuf>,
@@ -182,10 +258,10 @@ pub(crate) fn open<P: Platform>(
     if let Some(video) = kept {
         return Some(video);
     }
-    let video = match VaapiVideo::<P>::new(device, node, runtime, copies, checks.as_deref()) {
+    let video = match VaapiVideo::<P>::new(device, &at, runtime, copies, checks.as_deref()) {
         Ok(video) => Arc::new(video),
         Err(why) => {
-            log::info!("hardware video: no VA-API at {}: {why}", node.display());
+            log::info!("hardware video: no VA-API at {at}: {why}");
             return None;
         }
     };
@@ -216,13 +292,13 @@ struct VaapiVideo<P: Platform> {
 impl<P: Platform> VaapiVideo<P> {
     fn new(
         device: &P::Device,
-        node: &Path,
+        at: &DisplayAt<'_>,
         runtime: Arc<dyn Runtime>,
         copies: Option<Arc<dyn GpuCopies<P>>>,
         checks: Option<&Path>,
     ) -> Result<Self, String> {
         let started = runtime.now();
-        let display = Display::open(node, Arc::clone(&runtime)).map_err(|e| e.to_string())?;
+        let display = at.open(Arc::clone(&runtime)).map_err(|e| e.to_string())?;
         let capabilities = display.capabilities().map_err(|e| e.to_string())?;
         let encoders: Arc<[EncoderSupport]> = encoder_support(&display).into();
         let mut caps = caps_of(&capabilities);
@@ -232,9 +308,8 @@ impl<P: Platform> VaapiVideo<P> {
         }
         let writes_imports = display.import_writes();
         log::info!(
-            "hardware video: {NAME} at {}: {}, opened in {:.2} ms on thread {:?}; in place: NV12 \
+            "hardware video: {NAME} at {at}: {}, opened in {:.2} ms on thread {:?}; in place: NV12 \
              {:?}, P010 {:?}",
-            node.display(),
             display.vendor(),
             runtime.elapsed_since(started).as_secs_f64() * 1e3,
             std::thread::current().name().unwrap_or("unnamed"),
@@ -498,17 +573,21 @@ pub(crate) fn layout(codec: &RgfxVideoCodecCaps, writes: &ImportWrites) -> RgfxV
 
 /// The bytes of the cache the open makes to learn whether the platform makes caches of dma-bufs:
 /// a 4K NV12 picture's.
+#[cfg(unix)]
 const PROBE_BYTES: u64 = 3840 * 2160 * 3 / 2;
 
 /// `MTLStorageModePrivate`, a device cache's storage.
+#[cfg(unix)]
 const STORAGE_PRIVATE: u64 = 2 << 4;
 
 /// The most device caches whose memory is kept exported at once: a few decoders' output pools.
+#[cfg(unix)]
 const MOST_CACHES: usize = 64;
 
 /// What decodes the video's pictures straight into their outputs' device caches (module doc):
 /// the driver's check's answers, and each cache's memory as a dma-buf, by the cache's identity,
 /// while the cache lives.
+#[cfg(unix)]
 struct CacheTargets<P: Platform> {
     display: Display,
     checks: TargetChecks,
@@ -516,6 +595,7 @@ struct CacheTargets<P: Platform> {
 }
 
 /// A device cache's memory, exported as a dma-buf, and the last target imported over it.
+#[cfg(unix)]
 struct CacheMemory<P: Platform> {
     dma_buf: OwnedFd,
     /// The allocation's bytes, and the cache's first byte in it.
@@ -527,6 +607,7 @@ struct CacheMemory<P: Platform> {
     last: Mutex<Option<(Target, [TargetPlane; 2])>>,
 }
 
+#[cfg(unix)]
 impl<P: Platform> CacheTargets<P> {
     /// Where `device`'s platform makes caches of dma-bufs, as a cache of a 4K picture's bytes made
     /// so and exported shows, the answers of the driver's check (kept in `checks` where given),
@@ -734,11 +815,13 @@ impl<P: Platform> CacheTargets<P> {
 /// A device cache's bytes as the driver's video processing writes them
 /// ([`CacheTargets::in_cache`]): its memory's dma-buf, from the cache's first byte, by the cache's
 /// identity, so that an import of it goes as the cache does.
+#[cfg(unix)]
 struct CacheBytes<P: Platform> {
     memory: Arc<CacheMemory<P>>,
     identity: MemoryIdentity,
 }
 
+#[cfg(unix)]
 impl<P: Platform> DeviceMemory for CacheBytes<P> {
     fn identity(&self) -> MemoryIdentity {
         self.identity.clone()
@@ -764,8 +847,43 @@ impl<P: Platform> DeviceMemory for CacheBytes<P> {
     }
 }
 
+/// On Windows, which makes no dma-buf, nothing decodes into a device cache or writes one in place:
+/// none is made ([`CacheTargets::new`] answers `None`), and `target_for` is never called.
+#[cfg(windows)]
+struct CacheTargets<P: Platform> {
+    never: std::convert::Infallible,
+    _platform: std::marker::PhantomData<fn() -> P>,
+}
+
+#[cfg(windows)]
+impl<P: Platform> CacheTargets<P> {
+    /// `None`: Windows makes no dma-buf of a device cache.
+    fn new(
+        _device: &P::Device,
+        _display: &Display,
+        _runtime: &Arc<dyn Runtime>,
+        _checks: Option<&Path>,
+    ) -> Option<Self> {
+        log::info!(
+            "hardware video: {NAME}: no picture is decoded into a device cache: this host makes \
+             no dma-buf"
+        );
+        None
+    }
+
+    fn target_for(
+        self: &Arc<Self>,
+        _codec: TargetCodec,
+        _output: &DecodeOutput<P>,
+        _said: &Arc<Mutex<Vec<String>>>,
+    ) -> Option<TargetFor> {
+        match self.never {}
+    }
+}
+
 /// Logs `why` once in `said`'s session, and at info once per process (`kind`): why a picture was
 /// not decoded into its cache.
+#[cfg(unix)]
 fn say(said: &Mutex<Vec<String>>, why: String) {
     let mut said = said.lock();
     if !said.contains(&why) {
@@ -1056,6 +1174,7 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
     fn land(self: Box<Self>, to: &mut Landing<'_, P>) -> Result<(), BackendError> {
         // Decoded into its output's cache: there once its decode is done, and the device's
         // reads of the cache see it once the platform acquired what the driver wrote.
+        #[cfg(unix)]
         if self.frame.is_in_target() {
             self.frame.sync()?;
             to.luma.buffer.external_write_done()?;
@@ -1067,6 +1186,7 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
             // In its device cache, through the cache's memory as a dma-buf, where the video
             // decodes into caches: the driver's check refused the picture's codec and format, or
             // its planes do not lie as a decode's target must.
+            #[cfg(unix)]
             Some(targets) if to.luma.cached || to.chroma.cached => {
                 match targets.in_cache(to.luma, to.chroma, bit_depth) {
                     Ok((layout, bytes)) => match self.write_in_place(&layout, &bytes)? {
@@ -1165,6 +1285,7 @@ pub(crate) trait GpuCopier<P: Platform>: Send {
 
 /// What one output plane holds of a picture, as the CPU's copy fits a picture to it: the bytes of
 /// its rows, the bytes from one row to the next, and its rows.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Room {
     pub(crate) row_bytes: u64,
@@ -1172,6 +1293,7 @@ pub(crate) struct Room {
     pub(crate) rows: u64,
 }
 
+#[cfg(unix)]
 impl Room {
     /// What `plane` holds: its row's bytes and pitch, and its crop's rows.
     pub(crate) fn of<P: Platform>(plane: &OutputPlane<P>) -> Room {
@@ -1188,6 +1310,7 @@ impl Room {
 /// as the picture, each plane's rows and its rows' bytes hold, the chroma plane's columns in whole
 /// pairs; `None` for none. The chroma plane takes half of each, rounded up, from half the crop's
 /// origin.
+#[cfg(unix)]
 pub(crate) fn crop_extent(
     size: (u32, u32),
     sample: u64,
@@ -1255,6 +1378,7 @@ struct Place {
     rows_held: u64,
 }
 
+#[cfg(unix)]
 impl Place {
     /// Where `plane` lies in its buffer, from the buffer's first byte: a device cache's plane as
     /// the cache's memory holds it ([`CacheTargets::in_cache`]).
@@ -1313,4 +1437,5 @@ fn in_place_layout(luma: Place, chroma: Place, bit_depth: u32) -> Result<Surface
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

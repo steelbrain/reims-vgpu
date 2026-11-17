@@ -33,7 +33,7 @@ pub mod device_choice;
 pub mod exit_gate;
 pub(crate) mod generation;
 pub mod gpu;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod host_gpus;
 pub(crate) mod in_place_log;
 pub mod let_go;

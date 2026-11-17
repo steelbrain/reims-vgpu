@@ -155,12 +155,12 @@ mod nvidia;
 mod present;
 mod read;
 mod sink;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod vaapi;
 mod video_choice;
 mod video_host;
 mod vt;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod vt_encode;
 mod vulkan;
 

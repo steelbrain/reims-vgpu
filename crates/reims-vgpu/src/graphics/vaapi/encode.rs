@@ -549,6 +549,7 @@ impl<P: Platform> VaFrame<P> {
 
     /// [`HostEncodedFrame::finish`] from `source`'s host bytes, which the encoder uploads.
     #[cfg(test)]
+    #[cfg(unix)]
     fn finish_from_host(
         self,
         source: &EncodeSource,
@@ -912,4 +913,5 @@ impl<P: Platform> GuestEncoder<P> for VaGuestEncoder<P> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;
