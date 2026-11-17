@@ -11712,6 +11712,9 @@ fn a_reset_waits_for_a_close_s_slow_release() {
         0,
         "the reset left context 2's sampler"
     );
+    // The reset takes a context's objects out of the tables first and lets go of them after
+    // (`GraphicsDecoder::drop_context`), so the count reaches 0 before the platform's releases return.
+    eventually(|| world.live("MTLSamplerState").is_empty());
     assert!(world.live("MTLSamplerState").is_empty());
 }
 
