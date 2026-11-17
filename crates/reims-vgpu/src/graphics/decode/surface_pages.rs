@@ -795,6 +795,10 @@ pub(crate) enum Joined {
     Opened(u64),
 }
 
+/// A pages block's view, with the buffer over the whole of it that holds the runtime's import of
+/// its pages, where it has one ([`Private`]'s `view`).
+type PrivateView<P> = (Arc<SurfaceView<P>>, Option<<P as Platform>::Buffer>);
+
 /// A view the cache keeps, with the buffer that holds the runtime's import of its pages, where
 /// it has one: a read-only pages block's view has none (the module doc, "Read-only pages
 /// blocks").
@@ -850,7 +854,7 @@ pub(crate) struct Private<P: Platform> {
     /// it that holds the runtime's import of its pages for the buffers over its parts; none for a
     /// block of pages its process maps read-only, whose buffers lie over copies of the pages (the
     /// module doc, "Read-only pages blocks").
-    view: Option<(Arc<SurfaceView<P>>, Option<P::Buffer>)>,
+    view: Option<PrivateView<P>>,
     /// The view mapped as it joined a group, whose import its group's seal did not make (a view
     /// the platform left alone, or whose piece was refused): made, alone, by the block's first
     /// message carried out ([`SurfaceViews::private_view`]).
@@ -4353,9 +4357,9 @@ pub(super) mod tests {
     /// A read-only pages block's view is mapped with no import: its buffers, of bit 24, lie over
     /// copies of its pages, which read the view, so its first `BUFFER_OVER_PAGES` makes the
     /// buffer alone. At the release the cache keeps the view as it is, which a later read-only
-    /// block over the same runs takes, where a writable block or a surface's block over them,
-    /// whose buffers lie in the view's import, makes a view of its own; and a writable block's
-    /// view, with its import, serves a writable block again
+    /// block over the same runs takes, where a writable block over them, whose buffers lie in the
+    /// view's import, makes a view of its own; and a writable block's view, with its import,
+    /// serves a writable block and a surface's block again, where the read-only one does not
     #[test]
     fn a_read_only_pages_block_s_view_holds_no_import() {
         let mut r = rig(16);
@@ -4435,11 +4439,6 @@ pub(super) mod tests {
         );
         let own = r.private_view(writable);
         assert!(!Arc::ptr_eq(&first, &own));
-        // A surface's block over them: a view of its own too.
-        let surface = BLOCK + 0x10000;
-        assert_eq!(r.pages(surface, &runs, 3 * page), RGFX_STATUS_OK);
-        assert!(!Arc::ptr_eq(&first, &r.view(surface)));
-        assert_eq!(r.dec.views_of_surfaces().counts().reused, 0);
 
         // A read-only block over them takes the cached view, with no import made.
         let again = BLOCK + 0x18000;
@@ -4469,6 +4468,12 @@ pub(super) mod tests {
         assert!(Arc::ptr_eq(&own, &r.private_view(later)));
         let c = r.dec.views_of_surfaces().counts();
         assert_eq!((c.private, c.private_reused), (2, 2));
+        // A surface's block over them takes the cached view with an import, ahead of whose place
+        // in the cache the read-only one lies.
+        let surface = BLOCK + 0x10000;
+        assert_eq!(r.pages(surface, &runs, 3 * page), RGFX_STATUS_OK);
+        assert!(Arc::ptr_eq(&own, &r.view(surface)));
+        assert_eq!(r.dec.views_of_surfaces().counts().reused, 1);
     }
 
     /// A `BUFFER_OVER_PAGES` is the sender's own pages block's alone: a block the sender does not
