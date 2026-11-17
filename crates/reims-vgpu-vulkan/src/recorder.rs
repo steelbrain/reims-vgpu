@@ -984,6 +984,23 @@ pub fn unmade(active: &mut Option<Active>) {
     }
 }
 
+/// Adds the answer `key` to the call `active` records: what the call answered that the program
+/// sees, `value`, read only where the call is recorded.
+pub fn answer(active: &mut Option<Active>, key: &'static str, value: impl FnOnce() -> Value) {
+    if let Some(a) = active
+        && a.token.outer
+        && let Some(call) = a.pending.as_mut()
+    {
+        call.answers.push((key.to_owned(), value()));
+    }
+}
+
+/// `x` as its `Debug` text reads, read now ([`debug_value`]): an enum value without data is its
+/// name, one with data `{Name: value}`.
+pub fn text_value<T: std::fmt::Debug>(x: &T) -> Value {
+    parse_text(&debug_text(x))
+}
+
 /// The guest's RAM a copy into `destination` reads (`m2v.copyFromGuestRam`,
 /// `m2v.copyFromGuestRamAt`), where the platform encoded the copy: once the earlier command
 /// buffers that can run have finished, as before a commit ([`before_commit`]), each run's bytes,
@@ -2945,5 +2962,74 @@ mod tests {
             "newBufferWithBytesNoCopy:length:options:deallocator:",
         );
         assert_eq!(v, Value::Nil);
+    }
+
+    /// The call `active` opened, as it is queued.
+    fn queued(active: Option<Active>) -> Call {
+        active
+            .and_then(|a| a.pending)
+            .expect("the call is recorded")
+    }
+
+    /// `calls`, queued as calls are, shaped and written by the writer and read back by the crate's
+    /// reader: the call records and the blobs.
+    fn written(calls: Vec<Call>) -> (Vec<Call>, Vec<(Hash, Vec<u8>)>) {
+        let state = State::new(PathBuf::from("/nonexistent/recorder"));
+        for call in calls {
+            state.push(Item::Call {
+                call,
+                text: None,
+                shape: true,
+            });
+        }
+        state.drain(true);
+        let mut bytes = format::HEADER.to_vec();
+        bytes.extend(state.stream.lock().take());
+        let read = format::read(&bytes, &mut Vec::new()).unwrap();
+        let (mut calls, mut blobs) = (Vec::new(), Vec::new());
+        for r in read.records {
+            match r {
+                format::Record::Call(c) => calls.push(c),
+                format::Record::Blob(hash, data) => blobs.push((hash, data)),
+                _ => {}
+            }
+        }
+        (calls, blobs)
+    }
+
+    /// `m2v.commitPart` answers whether it cut its command buffer, `cut`, as an enum's value:
+    /// `"Cut"`, `"Fails"` or `{Whole: reason}`, through the stream and back.
+    #[test]
+    fn a_commit_part_answers_its_cut() {
+        use crate::core::platform::command::{KeptWhole, PartCut};
+        let cuts = [
+            PartCut::Cut,
+            PartCut::Fails,
+            PartCut::Whole(KeptWhole::Committed),
+        ];
+        let calls = cuts
+            .iter()
+            .map(|cut| {
+                let mut active = Some(begin(enter_recording(), || {
+                    ("m2v.commitPart", 3, Vec::new())
+                }));
+                answer(&mut active, "cut", || text_value(cut));
+                queued(active)
+            })
+            .collect();
+        let (calls, _) = written(calls);
+        let answers: Vec<_> = calls.iter().map(|c| c.answers.clone()).collect();
+        let cut = |v| vec![("cut".to_owned(), v)];
+        assert_eq!(
+            answers,
+            [
+                cut(Value::Str("Cut".to_owned())),
+                cut(Value::Str("Fails".to_owned())),
+                cut(Value::Map(vec![(
+                    "Whole".to_owned(),
+                    Value::Str("Committed".to_owned())
+                )])),
+            ]
+        );
     }
 }

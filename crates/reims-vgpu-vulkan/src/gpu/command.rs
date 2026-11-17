@@ -1623,7 +1623,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// encoders on ([`CommandBufferObject::fails_from_an_encoder`]), every encoder after it
     /// running nothing.
     fn commit_part(&self, on: OnFault) -> RaiseResult<PartCut> {
-        let recorded_call = crate::recorder::rec_call!("m2v.commitPart", self);
+        let mut recorded_call = crate::recorder::rec_call!("m2v.commitPart", self);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<PartCut> {
             if let Some(reason) = self.kept_whole_by() {
                 return Ok(PartCut::Whole(reason));
@@ -1634,6 +1634,12 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
             self.commit(on)?;
             Ok(PartCut::Cut)
         });
+        // Whether it was cut, which a player follows: `"Cut"` alone commits.
+        if let Ok(cut) = &recorded_answer {
+            crate::recorder::answer(&mut recorded_call, "cut", || {
+                crate::recorder::text_value(cut)
+            });
+        }
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
