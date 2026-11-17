@@ -33,7 +33,9 @@ use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RgfxSurfaceFacts,
     RgfxVideoCodecCaps, RgfxVideoDecodeCaps, RgfxVideoEncodeCaps, RgfxVideoOutputLayout,
 };
-use reims_vgpu_video::codec::encode::{Coded, RateControl};
+use reims_vgpu_video::codec::encode::Coded;
+#[cfg(any(target_os = "linux", windows))]
+use reims_vgpu_video::codec::encode::RateControl;
 use reims_vgpu_video::core::backend::BackendError as VideoError;
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity};
 #[cfg(target_os = "linux")]
@@ -194,6 +196,7 @@ pub trait GuestEncoder<P: Platform>: Send {
 /// `running`. A constant QP, which a `Quality` with no `DataRateLimits` makes, and a change of
 /// mode, are left out, as an M3's encoder leaves out a `Quality` set past the first frame, and an
 /// `AverageBitRate` set over a `Quality` (macOS 27.0.1, measured).
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn rate_past_first_frame(running: RateControl, asked: RateControl) -> RateControl {
     match (running, asked) {
         (RateControl::ConstantQp { .. }, _) => running,
@@ -203,6 +206,7 @@ pub(crate) fn rate_past_first_frame(running: RateControl, asked: RateControl) ->
 }
 
 /// Whether `a` and `b` are of one rate control mode, between which a running encoder changes.
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn same_rate_mode(a: RateControl, b: RateControl) -> bool {
     std::mem::discriminant(&a) == std::mem::discriminant(&b)
 }
@@ -1130,6 +1134,7 @@ mod tests {
 
     /// Past a guest encoder's first frame a bitrate changes within its mode, while a constant QP
     /// and a change of mode stay as they were.
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn past_the_first_frame_only_a_bitrate_changes_within_its_mode() {
         let vbr = |average| RateControl::VariableBitRate {
