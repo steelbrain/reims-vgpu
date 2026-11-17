@@ -39,7 +39,12 @@ repeats the ones code cites.
     hardware rule forbids use in place, and only of the area drawn or
     changed. The driver is asked, not assumed: NVIDIA's drivers lack the
     core colour-attachment bit for linear images, and give it through
-    `VK_NV_linear_color_attachment`.
+    `VK_NV_linear_color_attachment`. This is the current runtime's rule,
+    and it ends at the cutover to metal2vulkan's new runtime, whose
+    contract reverses it (AGENTS.md, "metal2vulkan's runtime is being
+    replaced"). There, the runtime allocates GPU memory, the device maps its
+    host-visible blocks into the guest, and textures are device images
+    synced at the guest's events. No new work extends the in-place path.
   - **Stalls are fixed on the Vulkan side**: in this crate (caches, their
     keys, when states are made) and in the runtime (translation speed,
     sharing, making ahead), never by making core or the device's lanes

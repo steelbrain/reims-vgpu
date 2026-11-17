@@ -261,10 +261,31 @@ Three tiers:
   diff first) and its target directory. When a VM round ends, remove its
   disk clones and keep its logs. Never remove a worktree or cache someone
   else made.
-- **The metal2vulkan pin in `Cargo.toml` moves in batches**: to a newer
-  runtime commit once a set of changes has landed, or one the work waits
-  on, with one merge's checks for the move and what rides with it, never a
-  check per runtime commit.
+- **The metal2vulkan pin in `Cargo.toml` is an exact commit on
+  metal2vulkan's `development` branch**: never a branch name, a side
+  branch or a bundle of chosen commits. The commit is on the remote's
+  `development` before reims-vgpu's `development` is pushed. The pin moves
+  forward to a newer development commit in a merge batch of its own, with
+  one merge's checks for the move, never a check per runtime commit. A
+  regression a move brings is fixed forward on development, in metal2vulkan
+  or here. Holding, dropping or rolling back the pin never routes around it.
+- **metal2vulkan's runtime is being replaced** by a new runtime crate with
+  one path for every device: no vendor, device or driver IDs, no
+  device-start checks and no policy switches. Until reims-vgpu cuts over to
+  it:
+  - the current runtime takes regression fixes only, from one lane at most.
+    No new work extends it, its device tables, its device checks or its
+    queue-sharing policies (Adaptive, Grouped, Exact);
+  - reims-vgpu builds its side of the new runtime's contract with
+    metal2vulkan. The runtime allocates GPU memory, and the device maps its
+    host-visible blocks into the guest. Textures are device images synced at
+    the guest's events (surface lock and unlock, didModifyRange,
+    replaceRegion), with no page logs. gpuAddress is the Vulkan device
+    address and gpuResourceID a descriptor index, with one VkDevice per guest
+    process. At the cutover this replaces "guest memory in place"
+    ([docs/conventions.md](docs/conventions.md));
+  - lanes split by feature, never by vendor, and a check fans out one leg
+    per GPU kind at once.
 - **Decide what the rules decide.** A routine trade-off (a residual, an
   interim difference, where a death goes, the order of work) is decided from
   these rules and the docs, and reported with its reason. The owner decides
@@ -312,8 +333,9 @@ Three tiers:
   test, which `features_md_guards_exist` keeps, or a manual check on a VM
   boot. Dropping or changing an entry is a deliberate change, made in its
   own commit that updates the file and says why.
-- **The Vulkan platform's rules** (guest memory in place, where stalls are
-  fixed, what is the runtime's, dependencies as released) are in
+- **The Vulkan platform's rules** (guest memory in place until the
+  runtime's cutover, where stalls are fixed, what is the runtime's,
+  dependencies as released) are in
   [docs/conventions.md](docs/conventions.md).
 - **Never guess a name.** A field of a guest record or of a copy of a Metal
   struct whose meaning nothing states is `field_xx`, `xx` its byte offset in
