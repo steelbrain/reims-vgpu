@@ -1,4 +1,4 @@
-//! Dma-bufs of the pages behind a range the backing table resolves ([`super::files`]), for a
+//! Dma-bufs of the pages behind a range the backing table resolves ([`crate::os::files`]), for a
 //! device that imports no shared memory as host memory.
 //!
 //! RADV imports host memory as an amdgpu userptr, which Mesa asks for with

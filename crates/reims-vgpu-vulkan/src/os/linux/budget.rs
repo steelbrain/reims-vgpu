@@ -13,7 +13,7 @@
 //! ends the process, naming what it would have mapped, the mappings and the limit.
 //!
 //! The mappings the library holds are counted exactly where it makes them: the backing table's
-//! runs, each protect or unmap that cuts one included ([`super::files::mappings`]), and its own
+//! runs, each protect or unmap that cuts one included ([`crate::os::files::mappings`]), and its own
 //! memory ([`super::vm::OwnMemory`]). What it does not count is the reserve's to cover
 //! ([`RESERVE`]).
 //!

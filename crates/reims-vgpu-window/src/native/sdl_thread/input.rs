@@ -210,7 +210,7 @@ impl Input {
         Input::default()
     }
 
-    /// [`Self::new`], its captured pointer going past the image's edge through `beyond`, and
+    /// `Self::new`, its captured pointer going past the image's edge through `beyond`, and
     /// driving the guest's own mouse `motion` while the guest hides its cursor, where the host
     /// gives each.
     pub(crate) fn with_links(
