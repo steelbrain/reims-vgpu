@@ -48,7 +48,7 @@
 //! - **VideoToolbox's paravirtual decoders** (`NvGuestDecoder`, `super::vt`): an arm64 guest's
 //!   decode, on a decoder of whole access units of its own, lands in the IOSurface its kext lent,
 //!   laid out as the kext read the surface and checked against its memory
-//!   ([`GuestTarget`](reims_vgpu_video::core::device_memory::GuestTarget)): written there by the
+//!   ([`GuestTarget`]): written there by the
 //!   GPU, one `cuMemcpy2D` a plane into the view of its pages registered with CUDA, as into an
 //!   output's pages above, else read back and copied by the CPU, each reason logged once a
 //!   decoder. So every decode codec of the caps has one, and the device offers `VT_MESSAGES`
