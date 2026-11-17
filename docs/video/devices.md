@@ -188,7 +188,7 @@ buffer of an encode session's process (reims-vgpu's `graphics/video_host/encode.
 
 | arm | encoder | its access unit |
 |---|---|---|
-| NVENC | `NvencEncoder` ([nvidia.md](nvidia.md)); `quality` picks the presets P1 to P7 at the high-quality tuning, and the keyframe interval is the GOP (`graphics/nvidia/encode.rs`) | Annex B as NVENC writes it, its parameter sets before each IDR picture |
+| NVENC | `NvencEncoder` ([nvidia.md](nvidia.md)); `quality` picks the preset at the high-quality tuning: P1 up to the middle, 50, then P2 to P7, and the keyframe interval is the GOP (`graphics/nvidia/encode.rs`) | Annex B as NVENC writes it, its parameter sets before each IDR picture |
 | VA-API | `VideoEncoder` ([vaapi.md](vaapi.md)), on `EncSlice`, else `EncSliceLP`; `quality` maps onto the driver's quality levels (`graphics/vaapi/encode.rs`) | the encoder's length-prefixed sample, written as Annex B, a keyframe's parameter sets first from its configuration record |
 
 ## How each arm lands a picture

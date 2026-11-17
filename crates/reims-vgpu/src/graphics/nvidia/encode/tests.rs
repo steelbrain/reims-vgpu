@@ -120,8 +120,8 @@ fn an_entry_s_rate_controls_are_cqp_and_what_nvenc_lists() {
 
 /// The NVIDIA crate's settings of the wire's: the profile of each bit, 30 frames a second where
 /// it says none, a VBR's peak 1.05 times its average where it sets none, a second's buffer
-/// where it gives no window, the level, entropy, keyframe interval and colour as given, presets
-/// P1 to P7 for quality 0 to 100, and no B-frames.
+/// where it gives no window, the level, entropy, keyframe interval and colour as given, preset
+/// P1 for quality up to 50 and P1 to P7 over 50 to 100, and no B-frames.
 #[test]
 fn the_nvenc_settings_of_the_wire_s() {
     let base = settings(RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_H264_HIGH, 1920, 1080);
@@ -179,7 +179,7 @@ fn the_nvenc_settings_of_the_wire_s() {
     assert_eq!((made.gop_length, made.level), (Some(60), Some(40)));
     assert_eq!(made.cabac, Some(false));
     assert_eq!((made.colour, made.full_range), (Some((1, 1, 1)), true));
-    assert_eq!(made.preset, 4);
+    assert_eq!(made.preset, 1);
     let made = params_of(
         RGFX_VIDEO_CODEC_H264,
         &RgfxVideoEncodeSettings {
@@ -203,8 +203,8 @@ fn the_nvenc_settings_of_the_wire_s() {
     assert_eq!(made.profile, EncodeProfile::HevcMain10);
     assert!(params_of(RGFX_VIDEO_CODEC_HEVC, &base).is_err());
     assert_eq!(
-        [0, 8, 9, 24, 25, 50, 91, 92, 100, 1000].map(preset_of),
-        [1, 1, 2, 2, 3, 4, 6, 7, 7, 7]
+        [0, 25, 50, 54, 55, 62, 63, 91, 95, 96, 100, 1000].map(preset_of),
+        [1, 1, 1, 1, 2, 2, 3, 6, 6, 7, 7, 7]
     );
 }
 

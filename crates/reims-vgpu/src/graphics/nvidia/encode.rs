@@ -10,14 +10,15 @@
 //!   its access unit out.
 //! - **The settings** ([`params_of`]) map onto the NVIDIA crate's: the profile, size, level,
 //!   entropy coder and colour; a VBR with no peak peaks at 1.05 times its average, as the VA-API
-//!   arm's does; `quality` 0 to 100 onto NVENC's presets P1 (the fastest) to P7 (the best), at
-//!   its high-quality tuning, whose lookahead the crate turns off; the keyframe interval onto
-//!   the GOP, and with none NVENC places no IDR picture of its own. NVENC holds every stream to
-//!   its VBV buffer, the window's length at the peak, so the wire's `HARD_LIMIT` asks nothing
-//!   more. A change of what makes a new sequence makes a new encoder, whose first access unit is
-//!   an IDR picture with its parameter sets; a change of the bitrates, QPs or frame rate goes to
-//!   the encoder from the next frame. `min_qp`, `max_qp` and a change of `quality` alone are not
-//!   taken, as the VA-API arm takes none of them.
+//!   arm's does; `quality` 0 to 100 onto NVENC's presets ([`preset_of`]): P1 (the fastest) up
+//!   to the middle, 50, which an x86 guest's encodes and VideoToolbox's default ask, then P2 to
+//!   P7 (the best) above it, at its high-quality tuning, whose lookahead the crate turns off;
+//!   the keyframe interval onto the GOP, and with none NVENC places no IDR picture of its own.
+//!   NVENC holds every stream to its VBV buffer, the window's length at the peak, so the wire's
+//!   `HARD_LIMIT` asks nothing more. A change of what makes a new sequence makes a new encoder,
+//!   whose first access unit is an IDR picture with its parameter sets; a change of the
+//!   bitrates, QPs or frame rate goes to the encoder from the next frame. `min_qp`, `max_qp` and
+//!   a change of `quality` alone are not taken, as the VA-API arm takes none of them.
 //! - **A frame** ([`NvencFrame`]) reaches NVENC on the session's encode thread one of two ways.
 //!   By the runtime device's GPU, where CUDA imports the device's exportable buffers
 //!   (`super::imports_caches`): a copy of the source's planes, where they lie, in the surface's
@@ -211,10 +212,30 @@ fn frame_rate_of(settings: &RgfxVideoEncodeSettings) -> (u32, u32) {
     }
 }
 
-/// NVENC's preset of `quality`, 0 the fastest to 100 the best: P1 to P7, the nearest.
+/// NVENC's preset of `quality`, 0 the fastest to 100 the best: P1 up to the middle, 50, then
+/// P1 to P7 over 50 to 100, the nearest.
+///
+/// A guest encodes one frame at a time: AppleGVA submits a frame and waits for it before the
+/// next, on a real Mac as here, so a frame's encode time is its rate, and the preset is NVENC's
+/// one lever on it (on the host alone, no QP, entropy coder, slice count, adaptive quantisation,
+/// reference count or low-latency tuning moved it). **Measured** on the RTX 3090 (driver
+/// 620.70.06, 2026-11-17), an x86 guest's 300-frame encodes at the middle quality with the
+/// preset set by hand, against a MacBook Pro's Radeon Pro 5300M, the same source (PSNR Y
+/// against it, at matched bitrates):
+///
+/// | size, bitrate | P4 | P2 | P1 | the 5300M |
+/// |---|---|---|---|---|
+/// | 3840x2160, 30 Mbit/s | 41-42 fps, 44.95 dB | 45-46 fps, 44.72 dB | 46 fps, 44.73 dB | 72-76 fps, 43.40 dB |
+/// | 2560x1440, 16 Mbit/s | 86-87 fps, 45.77 dB | 96-100 fps, 45.50 dB | | 118-120 fps, 44.42 dB |
+/// | 1920x1080, 6 Mbit/s | 162 fps, 43.61 dB | | 168 fps, 43.44 dB | 177-275 fps, 41.91 dB |
+///
+/// P1 is the fastest and still beats the Mac's quality by 1.3 to 1.5 dB, so the middle quality
+/// takes it. NVENC's own single-frame time at P1 for 4K is about 15 ms, above the Mac's whole
+/// chain of about 13 ms a frame, so the 3090 does not reach the Mac's 4K rate one frame at a
+/// time. A guest that asks for more quality than the middle gets the slower presets.
 fn preset_of(quality: u32) -> u8 {
-    let quality = quality.min(100);
-    u8::try_from(1 + (quality * 6 + 50) / 100).unwrap_or(7)
+    let above_middle = quality.min(100).saturating_sub(50);
+    u8::try_from(1 + (above_middle * 6 + 25) / 50).unwrap_or(7)
 }
 
 /// NVENC's preset and tuning of the device's `quality` (module doc): an x86 guest's encodes
