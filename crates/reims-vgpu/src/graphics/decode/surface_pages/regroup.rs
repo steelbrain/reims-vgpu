@@ -658,7 +658,8 @@ impl<P: Platform> super::super::GraphicsDecoder<P> {
                     p.queued = false;
                     let same = (p.view.as_ref()).is_some_and(|(made, _)| Arc::ptr_eq(made, &old));
                     (same && p.regrouped.is_none()).then(|| {
-                        let import = p.view.as_ref().map(|(_, i)| i.clone_ref());
+                        let import =
+                            (p.view.as_ref()).and_then(|(_, i)| i.as_ref().map(|i| i.clone_ref()));
                         (import, p.buffers.clone(), p.length, p.block_size)
                     })
                 })
