@@ -261,16 +261,36 @@ fn bool_arg() -> clap::Arg {
 /// `create --help`'s examples, under a header styled as clap styles its own.
 fn create_examples() -> String {
     let h = *clap::builder::Styles::default().get_header();
-    format!("{h}Examples:{h:#}{CREATE_EXAMPLES}")
+    format!("{h}Examples:{h:#}{}", create_examples_on(Host::current()))
 }
 
 /// `e`, followed by the examples: for a create that was not given enough to make a VM.
 fn with_create_examples(e: impl std::fmt::Display) -> anyhow::Error {
-    anyhow!("{e}\n\nExamples:{CREATE_EXAMPLES}")
+    anyhow!("{e}\n\nExamples:{}", create_examples_on(Host::current()))
 }
 
-const CREATE_EXAMPLES: &str = r"
-  An x86-64 guest on Linux:
+/// The examples of a create on `host`. Each guest's are headed by the hosts that make it: the
+/// x86-64 guest's by `host`'s own system where it makes that guest ([`Profile::supported_on`]).
+/// Their paths are in `host`'s own form: on Windows with `\` between their parts, as reims-ctl
+/// prints paths there (paths.rs).
+fn create_examples_on(host: Host) -> String {
+    let x86 = if !Profile::supported_on(host).contains(&Profile::Q35X86_64) {
+        "x86-64 Linux or Windows"
+    } else if host.os == crate::host::Os::Windows {
+        "Windows"
+    } else {
+        "Linux"
+    };
+    let path = |p: &str| {
+        if host.os == crate::host::Os::Windows {
+            p.replace('/', "\\")
+        } else {
+            p.to_string()
+        }
+    };
+    format!(
+        r"
+  An x86-64 guest on {x86}:
 
     # Download macOS Tahoe from Apple, make the VM's OpenCore image and a new
     # 128G disk, and start it: the installer boots into macOS Recovery. Once
@@ -282,16 +302,16 @@ const CREATE_EXAMPLES: &str = r"
     reims-ctl create mac --macos 26.6.2 --offline --network false --start
 
     # An installer of your own, such as a recovery image (BaseSystem.dmg)
-    reims-ctl create mac --installer ~/Downloads/BaseSystem.dmg
+    reims-ctl create mac --installer {installer}
 
     # A disk that already has macOS installed (copied; see --disk-mode): the
     # new OpenCore image presents the Mac of the one beside it, opencore.qcow2,
     # as a VM's directory holds them, so macOS sees no new Mac. A copy of the
     # disk of a VM reims-ctl has is a Mac of its own, as it runs beside it
-    reims-ctl create mac --disk ~/vms/old/disk.qcow2
+    reims-ctl create mac --disk {old_disk}
 
     # Or with the OpenCore image it booted from, copied, which keeps its Mac too
-    reims-ctl create mac --disk ~/vms/mac.qcow2 --opencore ~/vms/OpenCore.qcow2
+    reims-ctl create mac --disk {disk} --opencore {opencore}
 
   An arm64 guest on an arm64 Mac or arm64 Linux:
 
@@ -303,7 +323,14 @@ const CREATE_EXAMPLES: &str = r"
     # An IPSW of your own, read where it is: Apple offers only the current macOS to download.
     # macOS makes its Data volume at the VM's first boot and then resets the VM: after that
     # boot, reims-restore finish-eacs DIR makes it ready for Setup Assistant
-    reims-ctl create mac --ipsw ~/Downloads/UniversalMac_14.6.1_23G93_Restore.ipsw";
+    reims-ctl create mac --ipsw {ipsw}",
+        installer = path("~/Downloads/BaseSystem.dmg"),
+        old_disk = path("~/vms/old/disk.qcow2"),
+        disk = path("~/vms/mac.qcow2"),
+        opencore = path("~/vms/OpenCore.qcow2"),
+        ipsw = path("~/Downloads/UniversalMac_14.6.1_23G93_Restore.ipsw"),
+    )
+}
 
 #[derive(Subcommand)]
 pub enum DownloadsCmd {
@@ -1791,6 +1818,46 @@ fn plural(n: usize, what: &str) -> String {
 mod tests {
     use super::*;
     use crate::testenv::Env;
+
+    /// `create --help`'s examples head the x86-64 guest's by the host's own system where it
+    /// makes that guest, Windows on Windows, and by the hosts that do elsewhere; on Windows their
+    /// paths have `\` alone. The examples are the same on every host.
+    #[test]
+    fn create_examples_name_the_host_that_makes_each_guest() {
+        use crate::host::{Arch, Os};
+        let on = |os, arch| create_examples_on(Host { os, arch });
+        let windows = on(Os::Windows, Arch::X86_64);
+        assert!(windows.contains("An x86-64 guest on Windows:"), "{windows}");
+        assert!(!windows.contains("on Linux:"), "{windows}");
+        assert!(!windows.contains('/'), "{windows}");
+        assert!(
+            windows.contains(r"--installer ~\Downloads\BaseSystem.dmg"),
+            "{windows}"
+        );
+        let linux = on(Os::Linux, Arch::X86_64);
+        assert!(linux.contains("An x86-64 guest on Linux:"), "{linux}");
+        assert!(
+            linux.contains("--installer ~/Downloads/BaseSystem.dmg"),
+            "{linux}"
+        );
+        assert_eq!(
+            windows
+                .replace('\\', "/")
+                .replace("on Windows:", "on Linux:"),
+            linux
+        );
+        for (os, arch) in [(Os::Mac, Arch::Aarch64), (Os::Linux, Arch::Aarch64)] {
+            let e = on(os, arch);
+            assert!(
+                e.contains("An x86-64 guest on x86-64 Linux or Windows:"),
+                "{e}"
+            );
+            assert!(
+                e.contains("An arm64 guest on an arm64 Mac or arm64 Linux:"),
+                "{e}"
+            );
+        }
+    }
 
     /// `name`, registered with `dir`, its settings `config`.
     fn register(name: &str, dir: &Path, config: &str) {
