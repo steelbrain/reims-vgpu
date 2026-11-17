@@ -2687,8 +2687,8 @@ mod tests {
     }
 
     /// The pass descriptor's sets read from their fields are the values their `Debug` text,
-    /// which names objects by pointer, reads as: objects made and not, nil sets, set values and
-    /// non-finite colours
+    /// which names objects by pointer, reads as, but for an object set to nil (object 0): objects
+    /// made and not, nil sets, set values and non-finite colours
     #[test]
     fn typed_sets_are_the_values_their_text_reads_as() {
         use crate::core::platform::Handle as _;
@@ -2707,12 +2707,29 @@ mod tests {
         let buf: Fk<kind::Buffer> = w.new_obj(Model::None);
         let made = [(tex.id().0, 21), (buf.id().0, 22)];
         let ids = |p: u64| made.iter().find(|m| m.0 == p).map(|m| m.1);
+        // The text reads nil for an object set to nil (`Some(None)`) and for one left unset; the
+        // set's value is object 0 for the first.
         let check = |read: &dyn Fn(&mut typed::Cx<'_>) -> Value, text: String| {
             let mut cx = typed::Cx::new(&ids);
             let v = read(&mut cx);
-            let (want, notes) = debug_value::parse(&text, &ids);
+            let (mut want, notes) = debug_value::parse(&text, &ids);
             assert!(!notes.unread, "{text}");
             assert_eq!(cx.unrecorded, notes.unrecorded, "{text}");
+            let objects = [
+                ("visibilityResultBuffer", "visibility_result_buffer"),
+                ("rasterizationRateMap", "rasterization_rate_map"),
+                ("texture", "texture"),
+                ("resolveTexture", "resolve_texture"),
+            ];
+            for (key, field) in objects {
+                let nil = format!(" {field}: Some(None)");
+                if (text.contains(&format!("{{{nil}")) || text.contains(&format!(",{nil}")))
+                    && let Value::Map(fields) = &mut want
+                    && let Some((_, f)) = fields.iter_mut().find(|(k, _)| k == key)
+                {
+                    *f = Value::Object(0);
+                }
+            }
             assert_eq!(record("s", &[v]), record("s", &[want]), "{text}");
         };
         let passes: [PassSet<'_, F>; 3] = [
@@ -2727,6 +2744,7 @@ mod tests {
             },
             PassSet {
                 visibility_result_buffer: Some(None),
+                rasterization_rate_map: Some(None),
                 render_target_array_length: Some(0),
                 default_raster_sample_count: Some(4),
                 default_color_sample_count: Some(4),
@@ -2776,6 +2794,7 @@ mod tests {
                 load_action: Some(2),
                 clear_depth: Some(1.0),
                 depth_resolve_filter: Some(1),
+                resolve_texture: Some(None),
                 ..DepthAttachmentSet::default()
             },
         ];
@@ -3031,5 +3050,34 @@ mod tests {
                 )])),
             ]
         );
+    }
+
+    /// An attachment's texture set to nil is object 0, and one left unset nil, through the stream
+    /// and back, so a player tells them apart.
+    #[test]
+    fn an_object_set_to_nil_is_object_0() {
+        use crate::core::platform::values::ColorAttachmentSet;
+        use crate::core::testkit::FakePlatform;
+        let set: ColorAttachmentSet<'_, FakePlatform> = ColorAttachmentSet {
+            texture: Some(None),
+            level: Some(1),
+            ..ColorAttachmentSet::default()
+        };
+        let none = |_: u64| None::<u64>;
+        let mut cx = typed::Cx::new(&none);
+        let call = Call {
+            selector: "m2v.setColorAttachment".to_owned(),
+            receiver: 4,
+            args: vec![Value::Uint(0), typed::color_attachment(&set, &mut cx)],
+            ..Call::default()
+        };
+        let (calls, _) = written(vec![call]);
+        let Some(Value::Map(fields)) = calls[0].args.get(1) else {
+            panic!("the set did not read back: {:?}", calls[0]);
+        };
+        let get = |key: &str| fields.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+        assert_eq!(get("texture"), Some(&Value::Object(0)));
+        assert_eq!(get("resolveTexture"), Some(&Value::Nil));
+        assert_eq!(get("level"), Some(&Value::Uint(1)));
     }
 }

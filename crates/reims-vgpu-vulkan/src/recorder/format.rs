@@ -68,7 +68,7 @@ pub enum Value {
     F32(f32),
     /// Tag 6: a double.
     F64(f64),
-    /// Tag 7: an object, by its stream id.
+    /// Tag 7: an object, by its stream id; 0, which no object is, a property set to nil.
     Object(u64),
     /// Tag 8: a GPU address, which the player relocates.
     Address(u64),

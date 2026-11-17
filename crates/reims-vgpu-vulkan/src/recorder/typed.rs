@@ -6,7 +6,9 @@
 //!   (its recorder's counts by selector: binds, draws, fences, barriers, scissors, viewports,
 //!   pipeline and sampler states). Any other command answers `None`, and is read from its text.
 //! - **The pass descriptor's sets** (`m2v.setPass`, `m2v.set*Attachment`), whose `Debug` names
-//!   objects by their pointers.
+//!   objects by their pointers. An object property set to nil is object 0, which no object is,
+//!   where the text reads nil for it and for one left unset alike: a player clears the one and
+//!   keeps what the descriptor had for the other.
 //! - **Objects** are their stream ids where the stream made them, else nil, counted as the text's
 //!   `Unrecorded(..)` and `ObjId(..)` of an unknown pointer are.
 
@@ -61,11 +63,13 @@ impl<'a> Cx<'a> {
         Value::List(hs.iter().map(|h| self.opt(*h)).collect())
     }
 
-    /// A set's object, `Option<Option<ObjId>>`: `Some(Some(ObjId(p)))` is the object at `p`.
+    /// A set's object, `Option<Option<&H>>`: `Some(Some(h))` is `h`'s object, `Some(None)`, a
+    /// property set to nil, object 0, which no object is, and `None`, one left unset, nil.
     fn set_obj<H: Handle>(&mut self, h: Option<Option<&H>>) -> Value {
         match h {
             Some(Some(h)) => self.obj(h),
-            _ => Value::Nil,
+            Some(None) => Value::Object(0),
+            None => Value::Nil,
         }
     }
 }
