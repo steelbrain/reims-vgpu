@@ -7,8 +7,9 @@
 //! NT handle (`VA_SURFACE_ATTRIB_MEM_TYPE_NTHANDLE`), so that what decodes into them can be read
 //! by others that open the same handle: the Vulkan platform's copy of a picture into the guest's
 //! planes. vaon12's own surfaces are not shared, and their export fails (measured on the UHD 630,
-//! Mesa 26.2.7, 2026-11-16). A copy of one texture into another runs on a copy queue of this
-//! device's, which the module waits for on its fence.
+//! Mesa 26.2.7, 2026-11-16). A copy of one texture into another (a stand-in for a lost frame,
+//! `super::surface`) runs on a copy queue of this device's, which the module waits for on its
+//! fence.
 //!
 //! The binding is written by hand: the functions are loaded from `d3d12.dll` and `dxgi.dll` with
 //! `LoadLibraryW` and `GetProcAddress`, as libva is (`super::libva`), and each COM method is

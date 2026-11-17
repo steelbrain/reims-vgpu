@@ -24,7 +24,7 @@ use crate::core::sync::{Mutex, MutexGuard};
 
 use super::caps::{Config, Context, Entrypoint, Profile};
 #[cfg(windows)]
-use super::d3d12::SharedTexture;
+use super::d3d12::{CopyError, SharedTexture};
 use super::display::{Display, Error, check};
 use super::export::{self, SurfaceExport};
 use super::ffi;
@@ -33,6 +33,10 @@ use super::readback::{self, Mappings, ReadbackTimes, ReadbackWay, Staging, copy_
 use super::target::{Target, TargetFormat, TargetShape};
 use super::vpp_ffi as vpp;
 use super::wait::{self, Unfinished, Work};
+
+#[cfg(test)]
+#[cfg(windows)]
+mod shared;
 
 /// The most surfaces a pool makes. A DPB holds 16 frames at most (A.3.1),
 /// so the rest are the current picture and frames the caller holds; past
@@ -107,6 +111,7 @@ struct PoolInner {
     times: Mutex<ReadbackTimes>,
     /// The image [`Surface::copy_to`] copies through, made on first use:
     /// `None` until then, `Some(None)` where the driver makes none.
+    #[cfg(unix)]
     copy_image: Mutex<Option<Option<Image>>>,
     /// The video-processing context [`Surface::copy_to`] copies a target through, made on first
     /// use: `None` until then, `Some(None)` where the driver makes none.
@@ -184,6 +189,7 @@ impl SurfacePool {
             }),
             readback: Mutex::new(Readback::Unknown),
             times: Mutex::new(ReadbackTimes::default()),
+            #[cfg(unix)]
             copy_image: Mutex::new(None),
             processing: Mutex::new(None),
             stalled: OnceLock::new(),
@@ -919,10 +925,11 @@ impl PoolInner {
 }
 
 impl Surface {
-    /// Copies the whole surface into `to`, a surface of the same pool,
-    /// through an image of the pool's format: `vaGetImage`, then
-    /// `vaPutImage`. `false`, with nothing copied, where the driver makes no
-    /// such image.
+    /// Copies the whole surface into `to`, a surface of the same pool: on
+    /// Linux through an image of the pool's format, `vaGetImage` then
+    /// `vaPutImage`, and on Windows on the GPU, between the surfaces' shared
+    /// textures. `false`, with nothing copied, where the driver makes no such
+    /// image, or a surface is no shared texture.
     ///
     /// A target over the caller's memory is copied by one video-processing run instead, which
     /// reads it on the GPU: the driver's CPU map of an import may fault (`super::target`), and the
@@ -995,6 +1002,42 @@ impl Surface {
         Ok(true)
     }
 
+    /// [`Surface::copy_to`] of a surface of the same pool, on Windows: a copy
+    /// of the surface's shared texture into `to`'s, on the GPU
+    /// (`super::d3d12`), once its decode is done. `false`, with nothing
+    /// copied, where either is not a shared texture.
+    ///
+    /// Not through an image, as on Linux: `vaon12`'s `vaPutImage` writes the
+    /// luma wrong (measured on the UHD 630, Mesa 26.2.7, 2026-11-16: of a
+    /// 1080p NV12 picture put and got back, 2065503 of the 2073600 luma
+    /// samples differed, the chroma exact).
+    #[cfg(windows)]
+    fn copy_within_pool(&self, to: &Surface) -> Result<bool, Error> {
+        let (Some(from_texture), Some(to_texture)) = (self.texture(), to.texture()) else {
+            return Ok(false);
+        };
+        self.sync()?;
+        let display = self.display();
+        let deadline = wait::current(display);
+        let left = deadline.saturating_duration_since(display.runtime().now());
+        let device = display.d3d12().map_err(Error::Unsupported)?;
+        match device.copy(&from_texture, &to_texture, left) {
+            Ok(()) => Ok(true),
+            Err(CopyError::Late(copy)) => {
+                wait::keep_work(display, "a stand-in's texture copy", Box::new(copy));
+                Err(Error::Stalled("a stand-in's texture copy in time".into()))
+            }
+            Err(CopyError::Failed(why, copy)) => {
+                if let Some(copy) = copy {
+                    wait::keep_work(display, "a failed stand-in's texture copy", Box::new(copy));
+                }
+                Err(Error::Unsupported(format!(
+                    "a stand-in's texture copy: {why}"
+                )))
+            }
+        }
+    }
+
     /// The shared texture the surface is, on Windows, where its pool made it
     /// of one ([`shared_surfaces`]).
     #[cfg(windows)]
@@ -1006,6 +1049,7 @@ impl Surface {
     }
 
     /// [`Surface::copy_to`] of a surface of the same pool.
+    #[cfg(unix)]
     fn copy_within_pool(&self, to: &Surface) -> Result<bool, Error> {
         self.sync()?;
         let pool = &self.pool;
