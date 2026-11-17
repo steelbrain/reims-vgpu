@@ -9454,10 +9454,10 @@ mod tests {
 
     /// On a device whose linear images lay rows at another pitch than the surface's, a cached
     /// block whose message carries its layout gets a cache laid out at the device's pitch, made
-    /// of its planes' bytes with no byte placed and the bytes between its rows unobserved: its
-    /// fill and its download through the block's view move each row between its place in the
-    /// pages and its place in the cache, the bytes between the pages' rows left as the guest's
-    /// CPU wrote them
+    /// of its plane's rows and the room for those the surface holds below them, with no byte
+    /// placed and the bytes between its rows unobserved: its fill and its download through the
+    /// block's view move each of the plane's rows between its place in the pages and its place
+    /// in the cache, the bytes between the pages' rows left as the guest's CPU wrote them
     #[test]
     fn a_cache_off_the_gpus_pitch_copies_each_row_to_its_place() {
         use super::super::surface_pages::tests::one_plane;
@@ -9484,10 +9484,14 @@ mod tests {
             .filter(|c| c.sel == PADDING_UNOBSERVED_BUFFER)
             .collect();
         assert_eq!(made.len(), 1);
+        // The surface is one host page long: the plane's three rows and the rows below them
+        // whose bytes end in it, 5 at 4 KiB pages and 23 at 16 KiB.
+        let held = (page - 704) / 704 + 1;
         assert_eq!(
             (made[0].args[0].clone(), made[0].args[2].clone()),
-            (Arg::U64(4096), Arg::U64(0)),
-            "three rows 768 apart, to the 4 KiB boundary, no byte placed"
+            (Arg::U64((held * 768).next_multiple_of(4096)), Arg::U64(0)),
+            "the rows the surface holds for the plane 768 apart, to the 4 KiB boundary, no byte \
+             placed"
         );
         assert_eq!(r.dec.caches().counts().repitched, 1);
         let mark = r.p.call_log().mark();
