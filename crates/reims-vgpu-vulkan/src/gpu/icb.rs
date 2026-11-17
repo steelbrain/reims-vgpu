@@ -1195,7 +1195,7 @@ pub(crate) fn new_indirect_command_buffer(
 impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
     /// The runtime's ID of the buffer, Metal's (the module docs).
     fn gpu_resource_id(&self) -> u64 {
-        plain(|| self.raw.gpu_resource_id().0)
+        crate::recorder::plain_resource_id(self, || plain(|| self.raw.gpu_resource_id().0))
     }
 
     /// The runtime's setters of the command, which Metal hands out at any index and of a buffer

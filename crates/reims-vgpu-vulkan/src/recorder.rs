@@ -7,7 +7,8 @@
 //! - **What is recorded.** Each method of the platform's handles that core calls (the
 //!   `impl <Trait><VulkanPlatform>` methods of `gpu`) opens with [`rec_call!`] and ends with
 //!   [`rec_done!`]: one call record per call core made, the outermost call alone where the
-//!   platform calls itself (a thread's depth, [`enter`]). Getters and queries are not hooked.
+//!   platform calls itself (a thread's depth, [`enter`]). Getters and queries are not hooked, but
+//!   for `gpuResourceID`, whose answer the program saw ([`resource_id`]).
 //!   The selector is Metal's, as the trait's `sel:` line names it, or an `m2v.` name for what
 //!   Metal has no call for; an encoder's command is its enum's selector. The receiver and every
 //!   object an argument names are the objects' stream ids, which the recorder gives each object
@@ -994,6 +995,31 @@ pub fn answer(active: &mut Option<Active>, key: &'static str, value: impl FnOnce
     {
         call.answers.push((key.to_owned(), value()));
     }
+}
+
+/// `object`'s `gpuResourceID` as `read` answers it, recorded as a call of Metal's getter on it
+/// with its answer `gpuResourceID`: the ID the program saw, which a replay gives again where its
+/// runtime can. A getter that raises answers nothing.
+pub fn resource_id<T: Send + Sync + 'static, E>(
+    object: &Obj<T>,
+    read: impl FnOnce() -> Result<u64, E>,
+) -> Result<u64, E> {
+    let mut active = rec_call!("gpuResourceID", object);
+    let id = run(read);
+    if let Ok(id) = &id {
+        answer(&mut active, "gpuResourceID", || Value::Uint(*id));
+    }
+    rec_done!(active, ());
+    id
+}
+
+/// [`resource_id`] of a getter that never raises.
+pub fn plain_resource_id<T: Send + Sync + 'static>(
+    object: &Obj<T>,
+    read: impl FnOnce() -> u64,
+) -> u64 {
+    let Ok(id) = resource_id(object, || Ok::<u64, std::convert::Infallible>(read()));
+    id
 }
 
 /// The bytes a buffer made as a copy of host memory starts with (`newBufferWithDescriptor:`'s
@@ -3155,5 +3181,25 @@ mod tests {
         };
         assert_eq!(contents_of(&calls[0]), Some(Value::Blob(hash)));
         assert_eq!(contents_of(&calls[1]), Some(Value::Bytes(short.to_vec())));
+    }
+
+    /// A `gpuResourceID` getter's call is on its object, with the ID it answered under
+    /// `gpuResourceID`, through the stream and back.
+    #[test]
+    fn a_resource_id_is_its_getters_answer() {
+        let mut active = Some(begin(enter_recording(), || {
+            ("gpuResourceID", 5, Vec::new())
+        }));
+        answer(&mut active, "gpuResourceID", || Value::Uint(7));
+        let (calls, _) = written(vec![queued(active)]);
+        assert_eq!(
+            calls,
+            [Call {
+                selector: "gpuResourceID".to_owned(),
+                receiver: 5,
+                answers: vec![("gpuResourceID".to_owned(), Value::Uint(7))],
+                ..Call::default()
+            }]
+        );
     }
 }

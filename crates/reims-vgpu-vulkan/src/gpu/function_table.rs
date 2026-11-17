@@ -54,7 +54,9 @@ pub(crate) fn compute_table(
 /// of Metal's for, which Metal's validation stops, raises, and sets none.
 impl VisibleFunctionTable<VulkanPlatform> for VulkanVisibleFunctionTable {
     fn gpu_resource_id(&self) -> u64 {
-        crate::answer::plain(|| rt::VisibleFunctionTable::gpu_resource_id(self)).0
+        crate::recorder::plain_resource_id(self, || {
+            crate::answer::plain(|| rt::VisibleFunctionTable::gpu_resource_id(self)).0
+        })
     }
 
     fn allocated_size(&self) -> u64 {

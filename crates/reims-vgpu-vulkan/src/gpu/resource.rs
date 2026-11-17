@@ -1357,7 +1357,7 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     }
 
     fn gpu_resource_id(&self) -> u64 {
-        plain(|| self.raw.gpu_resource_id()).0
+        crate::recorder::plain_resource_id(self, || plain(|| self.raw.gpu_resource_id()).0)
     }
 
     fn height(&self) -> u64 {
@@ -2020,7 +2020,9 @@ impl Heap<VulkanPlatform> for VulkanHeap {
 /// `render_objects_placement_sampler`).
 impl SamplerState for VulkanSamplerState {
     fn gpu_resource_id(&self) -> u64 {
-        plain(|| rt::SamplerState::gpu_resource_id(self)).0
+        crate::recorder::plain_resource_id(self, || {
+            plain(|| rt::SamplerState::gpu_resource_id(self)).0
+        })
     }
 
     fn resource_index(&self) -> u64 {
@@ -2033,10 +2035,12 @@ impl SamplerState for VulkanSamplerState {
 /// So the guest's info request, which reads both, raises, as on Metal.
 impl DepthStencilState for VulkanDepthStencilState {
     fn gpu_resource_id(&self) -> RaiseResult<u64> {
-        send("gpuResourceID", Policy::Caught, || {
-            rt::DepthStencilState::gpu_resource_id(self)
+        crate::recorder::resource_id(self, || {
+            send("gpuResourceID", Policy::Caught, || {
+                rt::DepthStencilState::gpu_resource_id(self)
+            })
+            .map(|id| id.0)
         })
-        .map(|id| id.0)
     }
 
     fn resource_index(&self) -> RaiseResult<u64> {
@@ -2051,7 +2055,9 @@ impl DepthStencilState for VulkanDepthStencilState {
 /// support answer the ID for both, 1 and 2 in a fresh process).
 impl ComputePipeline<VulkanPlatform> for VulkanComputePipeline {
     fn gpu_resource_id(&self) -> u64 {
-        plain(|| rt::ComputePipelineState::gpu_resource_id(self)).0
+        crate::recorder::plain_resource_id(self, || {
+            plain(|| rt::ComputePipelineState::gpu_resource_id(self)).0
+        })
     }
 
     /// The runtime's handle ([`crate::gpu::function_table`]).
@@ -2140,7 +2146,7 @@ impl ComputePipeline<VulkanPlatform> for VulkanComputePipeline {
 /// reads {3, 3}).
 impl RenderPipeline for VulkanRenderPipeline {
     fn gpu_resource_id(&self) -> u64 {
-        plain(|| self.raw.gpu_resource_id()).0
+        crate::recorder::plain_resource_id(self, || plain(|| self.raw.gpu_resource_id()).0)
     }
 
     /// The runtime's answer, which is Metal's: `info_replies`' 458 reads 256 for 8 by 8 of a
