@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use super::gop::{DecodeTimes, GopConfig, GopPlanner, Planned};
 use super::limit_rate::LimitRate;
+use super::record::Record;
 use super::{
     Codec, Coded, EncodedSample, EncoderSettings, FailedSample, FrameRate, FrameType, InputFrame,
     Profile, RateControl, Unsupported, h264, hevc, nal,
@@ -263,11 +264,8 @@ pub struct Encoder<A: Accelerator> {
     coded_size: (u32, u32),
     b_frames: u32,
     max_references: usize,
-    /// The configuration record, and the parameter set units in it.
-    record: Arc<[u8]>,
-    record_units: Vec<Vec<u8>>,
-    /// Whether the record goes out with the next sample.
-    record_due: bool,
+    /// The configuration record, as the hardware's parameter sets make it.
+    record: Record,
     planner: GopPlanner<Pending<A::Input>>,
     times: DecodeTimes,
     dpb: VecDeque<ReferencePicture>,
@@ -578,7 +576,7 @@ impl<A: Accelerator> Encoder<A> {
         };
         let limit_rate = limit_rate(s, limits, coded_size)?;
         let (parameter_sets, record_units) = parameter_sets(&headers)?;
-        let record = record_of(&headers, &record_units)
+        let record = Record::new(settings.profile.codec(), record_units)
             .ok_or_else(|| Unsupported("our own SPS did not read back".into()))?;
         accelerator.configure(&StreamParams {
             settings: &settings,
@@ -602,9 +600,7 @@ impl<A: Accelerator> Encoder<A> {
             coded_size,
             b_frames,
             max_references: max_references.to_usize(),
-            record: record.into(),
-            record_units,
-            record_due: true,
+            record,
             planner,
             times: DecodeTimes::new(),
             dpb: VecDeque::new(),
@@ -626,7 +622,7 @@ impl<A: Accelerator> Encoder<A> {
     /// The configuration record (`avcC` or `hvcC`) of the parameter sets
     /// in use.
     pub fn configuration(&self) -> Arc<[u8]> {
-        self.record.clone()
+        self.record.current()
     }
 
     /// The size the hardware encodes, before cropping.
@@ -1041,9 +1037,10 @@ impl<A: Accelerator> Encoder<A> {
         if frame_type == FrameType::Idr {
             self.idr_pic_id = idr_pic_id.wrapping_add(1) % 65_536;
         }
-        let data = self.sample_data(&coded, frame_type == FrameType::Idr)?;
-        let configuration = self.record_due.then(|| self.record.clone());
-        self.record_due = false;
+        let data = self
+            .record
+            .sample_data(&coded, frame_type == FrameType::Idr)?;
+        let configuration = self.record.take_due();
         Ok(EncodedSample {
             id: frame.id,
             data,
@@ -1057,84 +1054,12 @@ impl<A: Accelerator> Encoder<A> {
             configuration,
         })
     }
-
-    /// The sample's NAL units, length-prefixed, without parameter sets and
-    /// delimiters. Parameter sets the hardware wrote that differ from the
-    /// record's replace it, and the new record goes with this sample.
-    fn sample_data(&mut self, coded: &[u8], idr: bool) -> Result<Vec<u8>, Unsupported> {
-        let codec = self.settings.profile.codec();
-        let mut data = Vec::with_capacity(coded.len());
-        let mut seen: Vec<Vec<u8>> = Vec::new();
-        let mut sliced = false;
-        for unit in nal::split_annex_b(coded) {
-            match unit_role(codec, unit) {
-                Role::ParameterSet(index) => {
-                    while seen.len() <= index {
-                        seen.push(Vec::new());
-                    }
-                    if let Some(set) = seen.get_mut(index) {
-                        *set = unit.to_vec();
-                    }
-                }
-                Role::Delimiter => {}
-                Role::Slice => {
-                    sliced = true;
-                    nal::push_length_prefixed(&mut data, unit);
-                }
-                Role::Other => nal::push_length_prefixed(&mut data, unit),
-            }
-        }
-        check(sliced, || "the hardware wrote no slice".into())?;
-        if idr
-            && !seen.is_empty()
-            && seen.iter().all(|u| !u.is_empty())
-            && seen != self.record_units
-        {
-            let record = record_of(&self.headers, &seen)
-                .ok_or_else(|| Unsupported("the hardware's parameter sets do not read".into()))?;
-            self.record = record.into();
-            self.record_units = seen;
-            self.record_due = true;
-        }
-        Ok(data)
-    }
 }
 
 /// The bits of `coded`, as a float, as the rate control counts them.
 #[expect(clippy::as_conversions, reason = "a length as a float")]
 fn bits_of(coded: &[u8]) -> f64 {
     coded.len() as f64 * 8.0
-}
-
-/// What a NAL unit is to a sample.
-enum Role {
-    /// A parameter set, by its index in the record's order (VPS, SPS, PPS
-    /// for HEVC; SPS, PPS for H.264).
-    ParameterSet(usize),
-    Delimiter,
-    Slice,
-    Other,
-}
-
-fn unit_role(codec: Codec, unit: &[u8]) -> Role {
-    let first = unit.first().copied().unwrap_or(0);
-    match codec {
-        Codec::H264 => match first & 0x1f {
-            h264::nal_type::SPS => Role::ParameterSet(0),
-            h264::nal_type::PPS => Role::ParameterSet(1),
-            h264::nal_type::AUD => Role::Delimiter,
-            1..=5 => Role::Slice,
-            _ => Role::Other,
-        },
-        Codec::Hevc => match (first >> 1) & 0x3f {
-            hevc::nal_type::VPS => Role::ParameterSet(0),
-            hevc::nal_type::SPS => Role::ParameterSet(1),
-            hevc::nal_type::PPS => Role::ParameterSet(2),
-            hevc::nal_type::AUD => Role::Delimiter,
-            0..=31 => Role::Slice,
-            _ => Role::Other,
-        },
-    }
 }
 
 /// The packed parameter sets of a stream, and its units for the record.
@@ -1155,15 +1080,6 @@ fn parameter_sets(headers: &Headers) -> Result<(Vec<PackedUnit>, Vec<Vec<u8>>), 
         .map(|(kind, unit)| PackedUnit::whole(*kind, unit))
         .collect::<Result<_, _>>()?;
     Ok((packed, units.into_iter().map(|(_, unit)| unit).collect()))
-}
-
-/// The configuration record of parameter set units in the record's order.
-fn record_of(headers: &Headers, units: &[Vec<u8>]) -> Option<Vec<u8>> {
-    match (headers, units) {
-        (Headers::H264 { .. }, [sps, pps]) => Some(h264::avcc(sps, pps)),
-        (Headers::Hevc { .. }, [vps, sps, pps]) => hevc::hvcc(vps, sps, pps),
-        _ => None,
-    }
 }
 
 /// The encoder's tests, and their fake accelerator.

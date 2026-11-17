@@ -48,22 +48,24 @@ use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
 };
 use reims_vgpu_video::codec::encode::{
-    Codec as EncodeCodec, Coded, ColourDescription, EncoderSettings, Entropy, FailedSample,
-    FrameRate, FrameType, InputFormat, InputFrame, Plane, Profile as EncodeProfile, RateControl,
+    Coded, ColourDescription, EncoderSettings, Entropy, FailedSample, FrameRate, FrameType,
+    InputFrame, Plane, Profile as EncodeProfile, RateControl,
 };
 use reims_vgpu_video::core::backend::BackendError as VideoError;
 use reims_vgpu_video::core::backend::DeviceWrite;
 use reims_vgpu_video::core::surfaces::PlaneLayout;
-use reims_vgpu_video::paravirt::{Codec, Encoder, EncoderConfig, SourceFrame};
+use reims_vgpu_video::paravirt::{Encoder, EncoderConfig, SourceFrame};
 use reims_vgpu_video::vaapi::{Capabilities, Display, EncoderSupport, InputSurface, VideoEncoder};
-use reims_vgpu_vulkan::core::num::{ToU64 as _, ToUsize as _};
-use reims_vgpu_vulkan::core::platform::{Handle as _, Platform};
+use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::super::decode::{GuestEncoder, GuestSource};
 use super::super::video_host::{
     BackendError, EncodeFrame, EncodeSource, Encoded, FrameSource, HostEncodedFrame, HostEncoder,
-    OutputPlane, SourcePlane,
+    SourcePlane,
+};
+use super::super::vt_encode::{
+    buffer_planes, encoders_of, host_planes, quality_percent, source_planes,
 };
 use super::{GpuFiller, H264_TOP_LEVEL, HEVC_TOP_LEVEL, MIN_SIZE, NAME};
 
@@ -705,27 +707,7 @@ pub(super) fn annex_b(
 /// codec of which it encodes a profile, with those profiles and the largest picture any of them
 /// takes.
 pub(super) fn guest_encoders(supports: &[EncoderSupport]) -> Vec<Encoder> {
-    let mut encoders: Vec<Encoder> = Vec::new();
-    for support in supports {
-        let codec = match support.profile.codec() {
-            EncodeCodec::H264 => Codec::H264,
-            EncodeCodec::Hevc => Codec::Hevc,
-        };
-        match encoders.iter_mut().find(|e| e.codec == codec) {
-            Some(encoder) => {
-                encoder.profiles.push(support.profile);
-                encoder.max_width = encoder.max_width.max(support.max_width);
-                encoder.max_height = encoder.max_height.max(support.max_height);
-            }
-            None => encoders.push(Encoder {
-                codec,
-                profiles: vec![support.profile],
-                max_width: support.max_width,
-                max_height: support.max_height,
-            }),
-        }
-    }
-    encoders
+    encoders_of((supports.iter()).map(|s| (s.profile, s.max_width, s.max_height)))
 }
 
 /// A VideoToolbox paravirtual encoder on the VA crate's `VideoEncoder` (module doc), its source
@@ -778,7 +760,7 @@ impl<P: Platform> VaGuestEncoder<P> {
     fn filled(
         &mut self,
         buffer: &P::Buffer,
-        planes: [&PlaneLayout; 2],
+        planes: &[PlaneLayout; 2],
         times: &InputFrame<'_>,
     ) -> Result<Option<Vec<Coded<reims_vgpu_video::vaapi::Error>>>, VideoError> {
         let declined = match &mut self.fills.filler {
@@ -787,22 +769,7 @@ impl<P: Platform> VaGuestEncoder<P> {
                     let (width, height) = (self.settings.width, self.settings.height);
                     let sample = self.settings.input_format().bytes_per_sample();
                     let sample = u32::try_from(sample).unwrap_or(0);
-                    // A plane of `w` samples (a chroma plane's of two each) by `h` rows.
-                    let plane = |plane: &PlaneLayout, w: u32, h: u32, samples: u32| OutputPlane {
-                        buffer: buffer.clone_ref(),
-                        offset: plane.offset.to_u64(),
-                        bytes_per_row: plane.bytes_per_row.to_u64(),
-                        row_bytes: u64::from(w) * u64::from(samples * sample),
-                        width: u64::from(w),
-                        height: u64::from(h),
-                        rows_held: plane.height.into(),
-                        cached: false,
-                        host: None,
-                        pages: None,
-                        cache: None,
-                    };
-                    let luma = plane(planes[0], width, height, 1);
-                    let chroma = plane(planes[1], width / 2, height / 2, 2);
+                    let [luma, chroma] = buffer_planes(buffer, planes, (width, height), sample);
                     match filler.fill(&surface, &luma, &chroma, (width, height), sample) {
                         Ok(DeviceWrite::Written) => {
                             let coded = (self.encoder.encode_surface(surface, times))
@@ -845,19 +812,8 @@ fn guest_settings(
         .find(|(profile, _)| *profile == settings.profile)
         .and_then(|(_, range)| *range);
     settings.quality_level =
-        (config.quality).and_then(|quality| quality_level(percent(quality), range));
+        (config.quality).and_then(|quality| quality_level(quality_percent(quality), range));
     settings
-}
-
-/// `quality`, 0 to 1, as a whole percentage.
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "a float within 0 to 100 to an integer: `as` saturates, NaN to 0"
-)]
-fn percent(quality: f32) -> u32 {
-    (quality.clamp(0.0, 1.0) * 100.0).round() as u32
 }
 
 /// `coded`'s errors as a guest's session sees them.
@@ -878,50 +834,7 @@ impl<P: Platform> GuestEncoder<P> for VaGuestEncoder<P> {
         source: &GuestSource<'_, P>,
         frame: &SourceFrame,
     ) -> Result<Vec<Coded<VideoError>>, VideoError> {
-        let layout = &source.layout;
-        let format = match &layout.pixel_format.to_be_bytes() {
-            b"420v" | b"420f" => InputFormat::Nv12,
-            b"x420" | b"xf20" => InputFormat::P010,
-            _ => {
-                return Err(VideoError::Unsupported(format!(
-                    "a source frame in '{}'",
-                    layout.pixel_format
-                )));
-            }
-        };
-        if format != self.settings.input_format() {
-            return Err(VideoError::Unsupported(format!(
-                "a source frame in '{}' for a {:?} stream",
-                layout.pixel_format, self.settings.profile
-            )));
-        }
-        let [luma, chroma] = layout.planes[..] else {
-            return Err(VideoError::Unsupported(format!(
-                "a source of {} planes",
-                layout.planes.len()
-            )));
-        };
-        // Luma's bytes run to chroma's first, chroma's to the surface's end: each plane the
-        // encoder's rows of at least the stream's size, at the plane's pitch.
-        let sample = format.bytes_per_sample();
-        let holds = |plane: &PlaneLayout, bytes: usize, rows: u32, row_bytes: usize| {
-            let rows = rows.to_usize();
-            rows <= plane.height.to_usize()
-                && row_bytes <= plane.bytes_per_row
-                && (plane.bytes_per_row.checked_mul(rows.saturating_sub(1)))
-                    .and_then(|n| n.checked_add(row_bytes))
-                    .is_some_and(|n| n <= bytes)
-        };
-        let (width, height) = (self.settings.width.to_usize(), self.settings.height);
-        let length = source.memory.length();
-        if !(luma.offset < chroma.offset && chroma.offset < length)
-            || !holds(&luma, chroma.offset - luma.offset, height, width * sample)
-            || !holds(&chroma, length - chroma.offset, height / 2, width * sample)
-        {
-            return Err(VideoError::Unsupported(
-                "a source whose planes do not hold the stream's picture".to_owned(),
-            ));
-        }
+        let [luma, chroma] = source_planes(source, &self.settings)?;
         let none = Plane {
             data: &[],
             bytes_per_row: 0,
@@ -934,26 +847,14 @@ impl<P: Platform> GuestEncoder<P> for VaGuestEncoder<P> {
             id: frame.id,
         };
         if let Some(buffer) = source.buffer
-            && let Some(coded) = self.filled(buffer, [&luma, &chroma], &times)?
+            && let Some(coded) = self.filled(buffer, &[luma, chroma], &times)?
         {
             self.encoded = true;
             return Ok(guest_coded(coded));
         }
         let view = (source.memory.host_view())
             .map_err(|error| VideoError::Malfunction(error.to_string()))?;
-        let y_at = view.offset.checked_add(luma.offset);
-        let uv_at = view.offset.checked_add(chroma.offset);
-        let (Some(y_at), Some(uv_at)) = (y_at, uv_at) else {
-            return Err(VideoError::Unsupported("planes past the view".to_owned()));
-        };
-        // SAFETY: the view's `size` bytes from `first` are the host's mapping of the surface's
-        // pages, which `view.hold` keeps mapped until it drops after the encode; the guest's
-        // kext holds the surface lent, its pages wired, until the host's `rels`, sent once the
-        // frame is encoded and emitted. Each plane is taken of the view's bytes by `get`.
-        let all = unsafe { std::slice::from_raw_parts(view.first.as_ptr(), view.size) };
-        let (Some(y), Some(uv)) = (all.get(y_at..uv_at), all.get(uv_at..)) else {
-            return Err(VideoError::Unsupported("planes past the view".to_owned()));
-        };
+        let [y, uv] = host_planes(&view, &[luma, chroma])?;
         let input = InputFrame {
             planes: [
                 Plane {

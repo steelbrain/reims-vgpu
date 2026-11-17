@@ -22,6 +22,7 @@ pub mod h264;
 pub mod hevc;
 pub mod limit_rate;
 pub mod nal;
+pub mod record;
 
 use std::num::NonZeroU32;
 use std::sync::Arc;

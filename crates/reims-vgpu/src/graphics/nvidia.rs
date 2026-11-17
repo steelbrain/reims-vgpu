@@ -292,6 +292,17 @@ impl NvidiaVideo {
     }
 }
 
+impl NvidiaVideo {
+    /// A new encode session's GPU filler, where CUDA imports the device's exportable buffers
+    /// (`encode`'s module doc), or why it has none.
+    fn filler(&self) -> Result<encode::Filler<VulkanPlatform>, String> {
+        match self.imports {
+            Some(_) => Ok(encode::Filler::new(&self.device, &self.gpu, &self.runtime)),
+            None => Err("CUDA imports no exportable buffer of the device".to_owned()),
+        }
+    }
+}
+
 /// CUDA's imports of `device`'s device caches, where it imports one: a buffer of a 4K picture's
 /// bytes made exportable, its memory exported and imported on `gpu`, once, as the video opens.
 /// The line at info says which way pictures land, with the make's and the import's times, the
@@ -405,21 +416,13 @@ impl GraphicsVideo<VulkanPlatform> for Shared {
         if direction == RGFX_VIDEO_ENCODE {
             let entry = (video.encode.iter()).find(|c| c.codec == codec)?;
             let caps = encode::encode_caps(entry, &video.encoders);
-            let filler = match video.imports {
-                Some(_) => Ok(encode::Filler::new(
-                    &video.device,
-                    &video.gpu,
-                    &video.runtime,
-                )),
-                None => Err("CUDA imports no exportable buffer of the device".to_owned()),
-            };
             let encoder = encode::NvencHostEncoder::new(
                 &video.gpu,
                 codec,
                 &video.encoders,
                 entry,
                 &caps,
-                filler,
+                video.filler(),
             );
             let session =
                 HostEncodeSession::new(&video.device, codec, ENCODE_NAME, Box::new(encoder))?;

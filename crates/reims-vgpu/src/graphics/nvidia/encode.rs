@@ -49,7 +49,8 @@ use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::super::video_host::{
-    BackendError, EncodeFrame, Encoded, FrameSource, HostEncodedFrame, HostEncoder, SourcePlane,
+    BackendError, EncodeFrame, Encoded, FrameSource, HostEncodedFrame, HostEncoder, OutputPlane,
+    SourcePlane,
 };
 use super::{ENCODE_NAME, H264_TOP_LEVEL, HEVC_TOP_LEVEL};
 use fill::Filled;
@@ -211,6 +212,11 @@ fn preset_of(quality: u32) -> u8 {
     u8::try_from(1 + (quality * 6 + 50) / 100).unwrap_or(7)
 }
 
+/// NVENC's preset and tuning of the device's `quality` (module doc).
+fn speed_of(quality: u32) -> (u8, Tuning) {
+    (preset_of(quality), Tuning::HighQuality)
+}
+
 /// The NVIDIA crate's settings of `settings` of `codec` (module doc).
 pub(super) fn params_of(
     codec: u32,
@@ -220,6 +226,7 @@ pub(super) fn params_of(
         .ok_or_else(|| format!("profile {:#x} of codec {codec}", settings.profile))?;
     let (primaries, transfer, matrix) =
         (settings.color_primaries, settings.transfer, settings.matrix);
+    let (preset, tuning) = speed_of(settings.quality);
     Ok(EncodeParams {
         profile,
         width: settings.width,
@@ -242,8 +249,8 @@ pub(super) fn params_of(
         colour: (primaries != 0 || transfer != 0 || matrix != 0)
             .then_some((primaries, transfer, matrix)),
         display_aspect: None,
-        preset: preset_of(settings.quality),
-        tuning: Tuning::HighQuality,
+        preset,
+        tuning,
     })
 }
 
@@ -309,6 +316,60 @@ impl<P: Platform> Fills<P> {
             );
             self.said.push(why);
         }
+    }
+
+    /// The packets of frame `index` of `size`, encoded by `encoder` from `planes`, luma and
+    /// chroma, where they lie, copied by the GPU into memory NVENC reads (module doc); `None`
+    /// where the copy or NVENC's read of it was declined, nothing encoded, which is said once a
+    /// session. `Err` where the copy failed once on the GPU, or NVENC did not take the frame it
+    /// read.
+    fn encode_filled(
+        &mut self,
+        encoder: &mut NvencEncoder,
+        [luma, chroma]: [&OutputPlane<P>; 2],
+        size: (u32, u32),
+        index: u64,
+        force_idr: bool,
+    ) -> Result<Option<Vec<Bitstream>>, BackendError> {
+        let declined = match &mut self.filler {
+            Ok(filler) => {
+                let sample = if encoder.params().profile.bit_depth() > 8 {
+                    2
+                } else {
+                    1
+                };
+                match filler.fill(luma, chroma, size, sample) {
+                    Ok(Filled::Written { input, pitch }) => {
+                        let frame = DeviceFrame {
+                            input: &input,
+                            pitch,
+                            index,
+                            force_idr,
+                        };
+                        match encoder.encode_device(&frame) {
+                            Ok(packets) => return Ok(Some(packets)),
+                            // NVENC took nothing of the frame: it is uploaded, and so are the
+                            // session's frames from here on.
+                            Err(error) => {
+                                let why = format!("NVENC's read of the GPU's copy: {error}");
+                                self.filler = Err(why.clone());
+                                why
+                            }
+                        }
+                    }
+                    Ok(Filled::Declined(why)) => format!("the GPU's copy: {why}"),
+                    // The GPU may write the input still: the session's frames are uploaded from
+                    // here on.
+                    Err(error) => {
+                        self.filler = Err(format!("the GPU's copy failed: {error}"));
+                        return Err(error);
+                    }
+                }
+            }
+            Err(why) => why.clone(),
+        };
+        self.uploaded_because(declined);
+        Ok(None)
     }
 }
 
@@ -449,48 +510,14 @@ impl<P: Platform> NvencFrame<P> {
         source: &FrameSource<'_, P>,
         force_idr: bool,
     ) -> Result<Option<Vec<Bitstream>>, BackendError> {
-        let mut fills = self.fills.lock();
-        let declined = match &mut fills.filler {
-            Ok(filler) => {
-                let encoder = state.encoder.as_mut().ok_or("an encode with no settings")?;
-                let [luma, chroma] = source.planes();
-                let sample = if encoder.params().profile.bit_depth() > 8 {
-                    2
-                } else {
-                    1
-                };
-                match filler.fill(luma, chroma, source.size(), sample) {
-                    Ok(Filled::Written { input, pitch }) => {
-                        let frame = DeviceFrame {
-                            input: &input,
-                            pitch,
-                            index: self.frame.frame_index,
-                            force_idr,
-                        };
-                        match encoder.encode_device(&frame) {
-                            Ok(packets) => return Ok(Some(packets)),
-                            // NVENC took nothing of the frame: it is uploaded, and so are the
-                            // session's frames from here on.
-                            Err(error) => {
-                                let why = format!("NVENC's read of the GPU's copy: {error}");
-                                fills.filler = Err(why.clone());
-                                why
-                            }
-                        }
-                    }
-                    Ok(Filled::Declined(why)) => format!("the GPU's copy: {why}"),
-                    // The GPU may write the input still: the session's frames are uploaded from
-                    // here on.
-                    Err(error) => {
-                        fills.filler = Err(format!("the GPU's copy failed: {error}"));
-                        return Err(error);
-                    }
-                }
-            }
-            Err(why) => why.clone(),
-        };
-        fills.uploaded_because(declined);
-        Ok(None)
+        let encoder = state.encoder.as_mut().ok_or("an encode with no settings")?;
+        (self.fills.lock()).encode_filled(
+            encoder,
+            source.planes(),
+            source.size(),
+            self.frame.frame_index,
+            force_idr,
+        )
     }
 }
 

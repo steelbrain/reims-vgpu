@@ -4,9 +4,11 @@ use std::ptr::NonNull;
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity, MemoryLife};
 use reims_vgpu_video::core::runtime::StdRuntime;
 use reims_vgpu_video::core::surfaces::{SurfaceError, SurfaceLayout};
+use reims_vgpu_video::paravirt::Codec;
 use reims_vgpu_video::vaapi::{H264Decoder, HevcDecoder, encoder_support};
 
 use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::core::platform::Handle as _;
 
 use super::*;
 

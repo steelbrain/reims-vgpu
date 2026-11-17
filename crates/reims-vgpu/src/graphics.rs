@@ -160,6 +160,8 @@ mod vaapi;
 mod video_choice;
 mod video_host;
 mod vt;
+#[cfg(target_os = "linux")]
+mod vt_encode;
 mod vulkan;
 
 pub(crate) use video_choice::graphics_video as vulkan_graphics_video;
