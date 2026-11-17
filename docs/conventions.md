@@ -124,8 +124,10 @@ repeats the ones code cites.
     `queue-ring-post-waited`) and its
     decoder's (`two-ranges-kept-whole`, a command buffer dealt to two
     threads that the platform kept whole at a chunk's end, which fails at
-    its stand-in); a boot's degradations are read from its last such
-    line. `reims-vgpu INFO reims_vgpu_vulkan::core::logging: lines
+    its stand-in), and the Vulkan platform's command predication's
+    (`predication-loop-overrun`, a command buffer whose loop ran past the
+    iterations laid down for it, which fails); a boot's degradations are
+    read from its last such line. `reims-vgpu INFO reims_vgpu_vulkan::core::logging: lines
     repeated since the last count: <n> more of <file>:<line>[ [<kind>]]
     (<target>: <the first line's message>); …` is how many lines of each
     kind the logger wrote at debug since its last such line.

@@ -80,9 +80,18 @@
 //!   recorded as the guest sends it and encoded again for each iteration up to a fixed count
 //!   ([`UNROLL`], or [`NESTED_UNROLL`] inside another loop). Each copy starts from the bindings
 //!   the loop started with, and is predicated on the loop's condition. After the last copy, a
-//!   loop still running sets a flag. At the command buffer's completion, before the handlers core
-//!   adds after the encoding, a set flag ends the process, naming the loop: Metal would run it
-//!   on.
+//!   loop still running sets a flag.
+//! - **A loop that ran past its copies fails its command buffer.** Metal would run it on, which
+//!   the adapter cannot. Where nothing else failed the command buffer, each read of its completion
+//!   (a completed or completion-seen handler's, `status`, `error` and `waitUntilCompleted` once it
+//!   completed) reads the flags, and a set one is a failure that is none of Metal's
+//!   ([`Overruns::check`]). As every such failure ([`crate::gpu::command`]), it dies where it is
+//!   read, naming the loop at its End's selector. Inside the graphics lane's refusal scope, which
+//!   every guest command buffer's handlers carry, that refuses the completion: the command buffer
+//!   completes with status `Error` and an internal error, after its event signals and in its
+//!   queue's order, and the process goes on. Each command buffer that overran is counted once
+//!   as the degradation [`OVERRUN_CODE`]. The flags are host data the GPU writes, so a forged one
+//!   fails only the command buffer it belongs to.
 //!
 //! # What dies
 //!
@@ -98,7 +107,6 @@
 //! - a fence inside a block, or in an emptied unit, which is not measured.
 //! - a loop inside two others, which the counts laid down bound.
 //! - a condition word past its buffer's end, which is not measured.
-//! - a loop that runs past its iterations laid down, at completion.
 //! - a unit's first indirect dispatch in an encoder of another dispatch type than the unit's
 //!   first encoder's, as Metal ends the process there.
 //!
@@ -128,7 +136,6 @@ use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
 use crate::core::platform::types::{MtlRegion, MtlSize, NsRange};
 use crate::core::raise::death::{DeathId, DeathKind, fatal_with_detail};
 use crate::core::raise::{OnFault, RaiseResult};
-use crate::core::rt::BlockEnv;
 use crate::core::sync::Mutex;
 use metal2vulkan::metal::{BarrierScope, DispatchType, ResourceUsage};
 use metal2vulkan_runtime as rt;
@@ -176,6 +183,10 @@ const STATE_BYTES: u64 = 4096;
 
 /// The loops one command buffer can flag.
 const FLAGS: usize = 1023;
+
+/// The degradation code of a command buffer that a loop running past its copies failed
+/// ([`Overruns::check`]), in the process's degradation counts (docs/conventions.md).
+pub const OVERRUN_CODE: &str = "predication-loop-overrun";
 
 /// The buffer slots a step binds, which are the guest's again after it.
 const STEP_SLOTS: u32 = 3;
@@ -1204,7 +1215,7 @@ struct Gpu {
     steps: u64,
     /// Each flagged loop's End selector and name, by flag.
     loops: Arc<Mutex<Vec<(&'static str, String)>>>,
-    /// Whether the completion's overrun check is added.
+    /// Whether the command buffer's completion reads the flags ([`Overruns::watch`]).
     checked: bool,
 }
 
@@ -1270,21 +1281,61 @@ fn word(buffer: &rt::Buffer, at: usize) -> u32 {
     unsafe { base.as_ptr().cast::<u32>().add(at).read_volatile() }
 }
 
-/// The completion's check of `state`'s flags: a loop that ran past its copies ends the process,
-/// naming it.
-fn overruns(state: &rt::Buffer, loops: &Mutex<Vec<(&'static str, String)>>) {
-    let loops = loops.lock();
-    for (flag, (sel, name)) in loops.iter().enumerate() {
-        if word(state, 1 + flag) != 0 {
-            dies(
-                sel,
-                &format!(
-                    "{name} ran past the iterations laid down for it: Metal runs a loop until \
-                     its condition fails, and the adapter encodes a fixed number of copies of \
-                     its body"
-                ),
-            );
+/// What a command buffer's completion reads of the loops laid down in it ([`Overruns::check`]):
+/// its state buffer and each flagged loop's End selector and name, by flag, from the first
+/// overrun step on. Each read of the completion takes it ([`crate::gpu::command`]), so it is made
+/// with the command buffer and filled as that step is encoded.
+#[derive(Default)]
+pub(crate) struct Overruns {
+    watched: Mutex<Option<Watched>>,
+    /// Whether a loop's overrun was counted ([`OVERRUN_CODE`]): once per command buffer, however
+    /// many reads find it.
+    counted: AtomicBool,
+}
+
+/// The state buffer, and each flagged loop's End selector and name, by flag.
+type Watched = (rt::Buffer, Arc<Mutex<Vec<(&'static str, String)>>>);
+
+impl Overruns {
+    /// Its command buffer's state buffer `state` and its flagged loops `loops`, at the first
+    /// overrun step.
+    fn watch(&self, state: rt::Buffer, loops: Arc<Mutex<Vec<(&'static str, String)>>>) {
+        self.watched.lock().get_or_insert((state, loops));
+    }
+
+    /// The check of the flags once the command buffer's work is done, read where nothing else
+    /// failed it: a loop that ran past its copies is a failure that is none of Metal's, which
+    /// dies naming the loop at its End's selector. Inside a refusal scope (the graphics lane's
+    /// handlers) the death refuses the read, and the command buffer fails with an internal
+    /// error; the first such read of a command buffer counts it as [`OVERRUN_CODE`].
+    ///
+    /// Each flag index is under [`FLAGS`], so its word lies inside the state buffer whatever
+    /// the GPU wrote; a flag's value only says whether the loop overran.
+    pub(crate) fn check(&self) {
+        let overran = {
+            let watched = self.watched.lock();
+            let Some((state, loops)) = &*watched else {
+                return;
+            };
+            let loops = loops.lock();
+            (loops.iter().enumerate())
+                .find(|&(flag, _)| word(state, 1 + flag) != 0)
+                .map(|(_, &(sel, ref name))| (sel, name.clone()))
+        };
+        let Some((sel, name)) = overran else {
+            return;
+        };
+        if !self.counted.swap(true, Ordering::Relaxed) {
+            crate::answer::count_kind(OVERRUN_CODE);
         }
+        dies(
+            sel,
+            &format!(
+                "{name} ran past the iterations laid down for it: Metal runs a loop until its \
+                 condition fails, and the adapter encodes a fixed number of copies of its body, \
+                 so the command buffer fails"
+            ),
+        );
     }
 }
 
@@ -1296,6 +1347,8 @@ pub struct Predication {
     /// The caller's word that no record comes ([`Self::hold_none`]): its encoders keep nothing
     /// for one.
     none: AtomicBool,
+    /// What its completion reads of its loops laid down.
+    overruns: Arc<Overruns>,
 }
 
 impl std::fmt::Debug for Predication {
@@ -1311,7 +1364,19 @@ impl Predication {
             unit: Mutex::new(Unit::default()),
             device: device.clone_ref(),
             none: AtomicBool::new(false),
+            overruns: Arc::default(),
         })
+    }
+
+    /// What its command buffer's completion reads of its loops laid down
+    /// ([`Overruns::check`]).
+    pub(crate) fn overruns(&self) -> Arc<Overruns> {
+        Arc::clone(&self.overruns)
+    }
+
+    /// Its command buffer's completion's read of its loops laid down ([`Overruns::check`]).
+    pub(crate) fn check_overruns(&self) {
+        self.overruns.check();
     }
 
     /// The caller's word that no record of command predication comes to the command buffer's
@@ -1579,8 +1644,8 @@ impl Unit {
         self.step(predication, enc, sel, Step::testing(op, cond), Some(guest));
     }
 
-    /// The overrun step of the loop flagged `flag`, and the completion's check, added with the
-    /// command buffer's first.
+    /// The overrun step of the loop flagged `flag`; with the command buffer's first, the flags
+    /// its completion reads ([`Overruns::check`]).
     fn overrun(
         &mut self,
         predication: &Predication,
@@ -1592,18 +1657,9 @@ impl Unit {
         step.flag = u32::try_from(flag).unwrap_or(0);
         self.step(predication, enc, sel, step, None);
         let gpu = self.gpu(predication, sel);
-        // A command buffer core let go of commits no more, so nothing of it runs on.
-        if !gpu.checked
-            && let Some(cb) = Obj::upgrade(&enc.command_buffer)
-        {
+        if !gpu.checked {
             gpu.checked = true;
-            let (state, loops) = (gpu.state.clone(), Arc::clone(&gpu.loops));
-            let check: rt::Handler = Box::new(move |_: &rt::CommandBuffer| {
-                // A callout on the runtime's thread: marked ours, so a panic here aborts.
-                let _env = BlockEnv::foreign();
-                overruns(&state, &loops);
-            });
-            made(sel, || cb.raw.add_completed_handler(check));
+            (predication.overruns).watch(gpu.state.clone(), Arc::clone(&gpu.loops));
         }
     }
 
@@ -3424,26 +3480,114 @@ mod tests {
         });
     }
 
+    /// The loop of `cb`'s compute encoder that counts `c[0]` up while it is not 1000, which runs
+    /// past its copies laid down ([`UNROLL`]).
+    fn loop_past_its_copies(
+        cb: &VulkanCommandBuffer,
+        inc: &VulkanComputePipeline,
+        c: &VulkanBuffer,
+    ) {
+        let e = compute(cb);
+        encode_all(
+            &e,
+            [
+                set(inc),
+                bind(&[Some(c)], &[0]),
+                start_while(c, 0, 1, 1000),
+                one(),
+            ],
+        );
+        e.encode_end_while().unwrap();
+        e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
+    }
+
+    /// The process's count of command buffers a loop ran past its copies in ([`OVERRUN_CODE`]).
+    fn overruns_counted() -> u64 {
+        (crate::answer::degradation_counts().into_iter())
+            .find(|(code, _)| code == OVERRUN_CODE)
+            .map_or(0, |(_, n)| n)
+    }
+
+    /// A loop still running after its iterations laid down fails its command buffer where its
+    /// completion is read: inside a refusal scope (the graphics lane's, which every guest command
+    /// buffer's handlers carry), each completed and completion-seen handler is handed it failed,
+    /// status `Error` and an internal error naming the loop at its End's selector, and the
+    /// process goes on. The copies laid down ran, and the command buffer is counted once as a
+    /// degradation, however many reads found it
+    #[test]
+    fn a_loop_past_its_copies_fails_its_command_buffer_in_a_refusal_scope() {
+        use crate::core::platform::command::{CompletedHandler, CompletedInfo};
+        use crate::core::platform::types::CommandBufferStatus;
+        use crate::core::raise::refusals;
+        let inc = kernel(INC, "inc_k");
+        let c = shared(64);
+        let cb = command_buffer();
+        loop_past_its_copies(&cb, &inc, &c);
+        let before = overruns_counted();
+        let (tx, rx) = std::sync::mpsc::channel::<CompletedInfo>();
+        let handler = |tx: &std::sync::mpsc::Sender<CompletedInfo>| -> CompletedHandler {
+            let tx = tx.clone();
+            Box::new(move |info| tx.send(info).unwrap())
+        };
+        refusals::refusing(|| {
+            cb.add_completed_handler(OnFault::Return, handler(&tx))
+                .unwrap();
+            cb.add_completed_handler(OnFault::Return, handler(&tx))
+                .unwrap();
+            cb.add_completion_seen_handler(OnFault::Return, handler(&tx))
+                .unwrap();
+        })
+        .unwrap();
+        cb.commit(OnFault::Return).unwrap();
+        for _ in 0..3 {
+            let info = rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+            assert!(info.is_refused(), "{info:?}");
+            assert_eq!(info.status, CommandBufferStatus::ERROR);
+            let description = info.error.unwrap().description;
+            assert!(
+                description.contains("encodeEndWhile") && description.contains("ran past"),
+                "{description}"
+            );
+        }
+        assert_eq!(words(&c)[0], UNROLL, "the copies laid down ran");
+        assert_eq!(overruns_counted(), before + 1);
+    }
+
+    /// A loop that ends within its copies laid down fails nothing: its command buffer completes,
+    /// its handlers in a refusal scope are handed it completed, and nothing is counted
+    #[test]
+    fn a_loop_within_its_copies_fails_nothing() {
+        use crate::core::platform::command::CompletedHandler;
+        use crate::core::raise::refusals;
+        let inc = kernel(INC, "inc_k");
+        let c = holding(&[1000 - UNROLL, 0, 0, 0]);
+        let cb = command_buffer();
+        loop_past_its_copies(&cb, &inc, &c);
+        let before = overruns_counted();
+        let (tx, rx) = std::sync::mpsc::channel();
+        refusals::refusing(|| {
+            let block: CompletedHandler = Box::new(move |info| tx.send(info).unwrap());
+            cb.add_completed_handler(OnFault::Return, block).unwrap();
+        })
+        .unwrap();
+        completes(&cb);
+        let info = rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+        assert!(!info.is_refused() && info.error.is_none(), "{info:?}");
+        assert_eq!(words(&c)[0], 1000);
+        assert_eq!(overruns_counted(), before);
+    }
+
     crate::death_test!(
-        /// A loop still running after its iterations laid down ends the process at the command
-        /// buffer's completion, at its End's selector: Metal would run it on
+        /// A loop still running after its iterations laid down, outside every refusal scope (no
+        /// guest command buffer's), ends the process where its command buffer's completion is
+        /// first read, here at the wait, at its End's selector, as every failure that is none of
+        /// Metal's does: Metal would run it on
         a_loop_past_its_copies_dies_at_completion,
         |_child| {
             let inc = kernel(INC, "inc_k");
             let c = shared(64);
             let cb = command_buffer();
-            let e = compute(&cb);
-            encode_all(
-                &e,
-                [
-                    set(&inc),
-                    bind(&[Some(&c)], &[0]),
-                    start_while(&c, 0, 1, 1000),
-                    one(),
-                ],
-            );
-            e.encode_end_while().unwrap();
-            e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
+            loop_past_its_copies(&cb, &inc, &c);
             cb.commit(OnFault::Return).unwrap();
             cb.wait_until_completed(OnFault::Return).unwrap();
         },

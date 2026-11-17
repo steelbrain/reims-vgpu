@@ -119,7 +119,10 @@
 //!   returns, and dies where Metal's answer is not measured, by the cause the runtime names
 //!   ([`refused_wait`]).
 //! - **Command predication**'s units of compute encoders end at a blit or render encoder, an
-//!   event and the commit ([`predication::boundary`]).
+//!   event and the commit ([`predication::boundary`]). A loop of it that ran past its copies is
+//!   a failure that is none of Metal's, read where the runtime's are once the command buffer
+//!   completed with none ([`predication::Overruns::check`]): it dies there, which inside the
+//!   graphics lane's refusal scope fails the command buffer with an internal error.
 //! - **How Metal's GPU fails a command buffer for what its encoders did** is injected at its
 //!   commit ([`rt::CommandBuffer::commit_failed`]): Metal's code, the first encoder that runs
 //!   nothing, every one after it running nothing too, and whether its event signals fire
@@ -525,6 +528,15 @@ impl CommandBufferObject {
             executions: Mutex::new(Vec::new()),
             signals_scheduled: AtomicBool::new(false),
         }))
+    }
+
+    /// Once it completed, nothing having failed it: a loop of its command predication that ran
+    /// past its copies dies, naming the loop, as a failure that is none of Metal's does where it
+    /// is read ([`predication::Overruns::check`]).
+    fn overran(&self) {
+        if self.raw.status() == rt::CommandBufferStatus::Completed {
+            self.predication.check_overruns();
+        }
     }
 
     /// Records `failing`, which its commit fails it with ([`CommandBufferObject::failure`]).
@@ -1346,6 +1358,16 @@ fn failure_error(cb: &rt::CommandBuffer) -> Option<NsErrorText> {
     Some(command_buffer_error(e, cb.error_description()))
 }
 
+/// A completed or completion-seen handler's read of `cb`, whose work is done: why it failed
+/// ([`failure`]), and where nothing did, the loops of its command predication `overruns`, one
+/// that ran past its copies dying as a failure that is none of Metal's
+/// ([`predication::Overruns::check`]).
+fn read(cb: &rt::CommandBuffer, overruns: &predication::Overruns) {
+    if failure(cb).is_none() {
+        overruns.check();
+    }
+}
+
 /// The runtime's handler of core's completed handler `block`: it hands `block` the command
 /// buffer's `status` and `error` as they are then, after `read`, its read of the failure, which
 /// dies for a failure that is none of Metal's ([`failure`]). Added inside a refusal scope (the graphics lane's), the read and `block` run
@@ -1418,9 +1440,8 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// Refused once the buffer is committed, as Metal's validation refuses it. A failure that is
     /// none of Metal's dies as the handler reads it ([`completed_handler`]).
     fn add_completed_handler(&self, _on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
-        let handler = completed_handler(block, |cb| {
-            failure(cb);
-        });
+        let overruns = self.predication.overruns();
+        let handler = completed_handler(block, move |cb| read(cb, &overruns));
         send("addCompletedHandler:", Policy::Dies, || {
             self.raw.add_completed_handler(handler)
         })
@@ -1454,9 +1475,8 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         _on: OnFault,
         block: CompletedHandler,
     ) -> RaiseResult<()> {
-        let handler = completed_handler(block, |cb| {
-            failure(cb);
-        });
+        let overruns = self.predication.overruns();
+        let handler = completed_handler(block, move |cb| read(cb, &overruns));
         send("addCompletionSeenHandler", Policy::Dies, || {
             self.raw.add_completion_seen_handler(handler)
         })
@@ -1766,8 +1786,14 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         recorded_answer
     }
 
+    /// A loop of its command predication that ran past its copies dies here once it completed,
+    /// as a failure that is none of Metal's does ([`CommandBufferObject::overran`]).
     fn error(&self) -> Option<NsErrorText> {
-        plain(|| failure_error(&self.raw))
+        plain(|| {
+            let error = failure_error(&self.raw);
+            self.overran();
+            error
+        })
     }
 
     /// An encoder of the pass, nil where Metal answers nil (`encode_render::open`).
@@ -1827,11 +1853,14 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         recorded_answer
     }
 
-    /// Scheduled or completed once its submission handler ran ([`tiler_handler`]).
+    /// Scheduled or completed once its submission handler ran ([`tiler_handler`]). A loop of its
+    /// command predication that ran past its copies dies here once it completed
+    /// ([`CommandBufferObject::overran`]).
     fn status(&self) -> CommandBufferStatus {
         let status = plain(|| {
             let status = self.raw.status();
             failure(&self.raw);
+            self.overran();
             status
         });
         CommandBufferStatus(status.raw())
@@ -1841,7 +1870,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// hangs, as Metal's does, and one whose answer on Metal is not measured dies ([`waiting`]).
     /// A command buffer a draw's pipeline failed, or a host step's refusal, or any failure
     /// that is none of Metal's, dies as the wait returns ([`failed_pipeline`],
-    /// [`refused_step`], [`answered`]), where no completed handler read its failure first.
+    /// [`refused_step`], [`answered`]), where no completed handler read its failure first; so
+    /// does one a loop of its command predication ran past its copies in
+    /// ([`CommandBufferObject::overran`]).
     fn wait_until_completed(&self, _on: OnFault) -> RaiseResult<()> {
         let recorded_call = crate::recorder::rec_call!("waitUntilCompleted", self);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
@@ -1853,7 +1884,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
                 }
                 Some(rt::CommandBufferError::Refused) => refused_step(SEL, &self.raw),
                 Some(e) => answered(SEL, e, Some(&self.raw)),
-                None => {}
+                None => plain(|| self.overran()),
             }
             Ok(())
         });

@@ -2685,17 +2685,18 @@ pub fn out_of_host_memory_count() -> u64 {
     OUT_OF_HOST_MEMORY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The kinds a caller outside this crate counts by code ([`count_kind`]), each with how many
-/// times: `reims-vgpu`'s, as its reims-graphics device tells it of its completion rings
-/// (`control-ring-full`, `control-ring-post-waited`, `vblank-dropped`, `queue-ring-full`,
-/// `queue-ring-post-waited`), and as its decoder keeps a buffer dealt to two threads whole
-/// (`two-ranges-kept-whole`).
+/// The kinds counted by code ([`count_kind`]), each with how many times: `reims-vgpu`'s, as its
+/// reims-graphics device tells it of its completion rings (`control-ring-full`,
+/// `control-ring-post-waited`, `vblank-dropped`, `queue-ring-full`, `queue-ring-post-waited`),
+/// and as its decoder keeps a buffer dealt to two threads whole (`two-ranges-kept-whole`); and
+/// this platform's command predication's, a command buffer a loop ran past its copies in
+/// (`predication-loop-overrun`, [`crate::gpu::predication::OVERRUN_CODE`]).
 static COUNTED: crate::core::sync::Mutex<Vec<(&'static str, u64)>> =
     crate::core::sync::Mutex::new(Vec::new());
 
-/// Counts one more of the kind of code `code`, kept outside this crate, which
-/// [`degradation_counts`] gives with the rest. Its line is the caller's to log, once per kind
-/// (docs/conventions.md).
+/// Counts one more of the kind of code `code`, kept outside the runtime's and this crate's own
+/// tables, which [`degradation_counts`] gives with the rest. Its line is the caller's to log, once
+/// per kind (docs/conventions.md).
 pub fn count_kind(code: &'static str) {
     let mut counted = COUNTED.lock();
     match counted.iter_mut().find(|(c, _)| *c == code) {
@@ -2718,7 +2719,7 @@ pub fn inexact_counts() -> Vec<(Inexact, u64)> {
 /// [`RELAYED_ONCE`] and the others the runtime announced, the kinds of [`Inexact`]
 /// ([`inexact_counts`]), the calls answered as when memory runs out (`out-of-host-memory`,
 /// [`out_of_host_memory_count`]), the driver's and layers' messages relayed, by id name
-/// ([`relay`]), and the kinds counted outside this crate ([`count_kind`]). Sorted by code, a code
+/// ([`relay`]), and the kinds counted by code ([`count_kind`]). Sorted by code, a code
 /// met twice summed.
 pub fn degradation_counts() -> Vec<(String, u64)> {
     use std::sync::atomic::Ordering;
