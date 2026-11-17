@@ -230,7 +230,10 @@ use crate::device::backlog::Backlog;
 use crate::device::desktop::{Bounds, Place};
 use crate::device::gate::{Gate, Look, Offer, Waited};
 use crate::device::lanes::{Hand, Key, Lanes};
-use crate::display::{Mode, Scanout, Screen, offered_in_room, scanout_room, scanout_room_at};
+use crate::display::cursor_color::CursorColor;
+use crate::display::{
+    CursorImage, Mode, Scanout, Screen, offered_in_room, scanout_room, scanout_room_at,
+};
 use crate::ops::RgfxCommandBuffer;
 use crate::region::Region;
 use crate::ring::{Consumer, Message, Posted, Producer, RingAt, sized};
@@ -335,7 +338,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 53.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 55.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -387,7 +390,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_POINTER_MOTION
     | RGFX_FEATURE_VT_MESSAGES
     | RGFX_FEATURE_UPLOADS_WRITTEN
-    | RGFX_FEATURE_VT_RING;
+    | RGFX_FEATURE_VT_RING
+    | RGFX_FEATURE_CURSOR_COLOR;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -1520,6 +1524,11 @@ pub(crate) struct DisplayState {
     pub(crate) told: Option<Mode>,
     /// A `DISPLAY_CHANGED` is owed.
     changed: bool,
+    /// The cursor's image as the guest's last `SET_CURSOR` set it, straight RGBA, before its
+    /// colour chain: what a new chain converts again.
+    pub(crate) cursor_image: Option<CursorImage>,
+    /// The cursor's colour chain (`CURSOR_COLOR`), `None` while it is off.
+    pub(crate) cursor_color: Option<CursorColor>,
 }
 
 impl Device {

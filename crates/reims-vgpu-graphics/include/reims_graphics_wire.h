@@ -1567,6 +1567,17 @@
 // where its host offers `VT_MESSAGES`; the arm64e kext takes it with `VT_MESSAGES`.
 #define RGFX_FEATURE_VT_RING 18014398509481984
 
+// `FEATURES_HI` bit 23, feature bit 55, `CURSOR_COLOR`: ring 0 carries
+// [`RGFX_CMD_CURSOR_COLOR`], the colour chain a display's cursor plane converts its pixels
+// through, and the host shows the cursor's image converted (docs/graphics-kext/design.md, "The
+// cursor's colour"). An arm64 WindowServer gives its cursor's layer a chain of its own, from
+// standard sRGB to the display's blend space, the space the guest's desktop is drawn in. Every
+// host offers it (the device converts the image before the host's screen is handed it); the
+// arm64e kext takes it, and takes the cursor layer's chain from WindowServer only where the host
+// took it. A guest that did not take it (the x86-64 kext, the option ROM, Ambrosia's module) has
+// its cursor shown as its pixels are.
+#define RGFX_FEATURE_CURSOR_COLOR 36028797018963968
+
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 #define RGFX_REG_STATUS 16
@@ -1818,6 +1829,10 @@
 // Command `DISPLAY_BOUNDS` ([`RgfxDisplayBounds`]), where the guest took
 // [`RGFX_FEATURE_DISPLAY_BOUNDS`]: not answered.
 #define RGFX_CMD_DISPLAY_BOUNDS 9
+
+// Command `CURSOR_COLOR` ([`RgfxCursorColor`]), where the guest took
+// [`RGFX_FEATURE_CURSOR_COLOR`]: not answered.
+#define RGFX_CMD_CURSOR_COLOR 10
 
 // Event `COMPLETE` ([`RgfxComplete`]): a command's answer, with its `seqno`.
 #define RGFX_EVT_COMPLETE 256
@@ -2520,6 +2535,24 @@
 
 // A command buffer's status: a resource the work named was invalid.
 #define RGFX_CB_INVALID_RESOURCE 5
+
+// [`RgfxCursorCurve::form`]: `y = x`, no curve; its parameters are not read.
+#define RGFX_CURVE_BYPASS 0
+
+// [`RgfxCursorCurve::form`]: `y = x^g`.
+#define RGFX_CURVE_TYPE0 1
+
+// [`RgfxCursorCurve::form`]: `y = (a x + b)^g` where `a x + b >= 0`, else 0.
+#define RGFX_CURVE_TYPE1 2
+
+// [`RgfxCursorCurve::form`]: `y = (a x + b)^g + c` where `a x + b >= 0`, else `c`.
+#define RGFX_CURVE_TYPE2 3
+
+// [`RgfxCursorCurve::form`]: `y = (a x + b)^g` where `x >= d`, else `c x`.
+#define RGFX_CURVE_TYPE3 4
+
+// [`RgfxCursorCurve::form`]: `y = (a x + b)^g + e` where `x >= d`, else `c x + f`.
+#define RGFX_CURVE_TYPE4 5
 
 // [`RgfxPresentSurface::flags`]: the display keeps what it shows, a surface or the scanout, and
 // `iosurface_id` is 0. The present changes only the colour the `DISPLAY_COLOR`s before it staged,
@@ -4452,6 +4485,44 @@ typedef struct {
   // Zero.
   uint32_t reserved_14;
 } RgfxContextClose;
+
+// One channel's curve of a [`RgfxCursorColor`]: one of the ICC's parametric curves, in the
+// forms and with the numbers an arm64 WindowServer's ICC curve blocks give them (QuartzCore's
+// `Bypass` and `Type0` to `Type4`).
+typedef struct {
+  // An `RGFX_CURVE_*` form.
+  uint32_t form;
+  // The parameters `g`, `a`, `b`, `c`, `d`, `e` and `f`, `f32`s as bits; those the form does
+  // not use are not read.
+  uint32_t params[7];
+} RgfxCursorCurve;
+
+// `CURSOR_COLOR`: display `display`'s cursor converts its pixels through the chain that follows
+// where `on` is not 0, and shows them as they are where it is 0, its state from the device's
+// start. Each pixel's straight colour, its red, green and blue in [0, 1], goes through
+// `source_curves` channel by channel, then `to_xyz` and `from_xyz` (each three rows of three
+// `f32`s, as bits: output channel `i` is row `i` times the input), then `blend_curves` channel
+// by channel, and is clamped to [0, 1]; its alpha is kept. The host converts the image the
+// guest's last `SET_CURSOR` set, and each one it sets after, until the next `CURSOR_COLOR` of the
+// display; a reset turns it off. A curve of a form the host does not know, a parameter or entry
+// that is not finite, or a display the guest does not see, drops the message, and the cursor
+// keeps its chain. Not answered.
+typedef struct {
+  // [`RGFX_CMD_CURSOR_COLOR`].
+  RgfxMsgHeader header;
+  // The display's id.
+  uint32_t display;
+  // Whether the chain applies: 0 shows the cursor's pixels as they are.
+  uint32_t on;
+  // The source's curves, red, green and blue: WindowServer's `Src2XYZ` curve.
+  RgfxCursorCurve source_curves[3];
+  // The source's matrix to XYZ, row by row: WindowServer's `Src2XYZ` matrix.
+  uint32_t to_xyz[9];
+  // The matrix from XYZ to the blend space, row by row: WindowServer's `XYZ2Blend` matrix.
+  uint32_t from_xyz[9];
+  // The blend space's curves, red, green and blue: WindowServer's `XYZ2Blend` curve.
+  RgfxCursorCurve blend_curves[3];
+} RgfxCursorColor;
 
 // One face's stencil state, as `MTLStencilDescriptor` gives it.
 typedef struct {

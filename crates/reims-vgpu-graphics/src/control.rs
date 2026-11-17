@@ -1,8 +1,8 @@
 //! The control commands (`wire`'s `RGFX_CMD_*`), as the control thread takes them: each checked,
 //! done, and answered with a `COMPLETE` carrying its `seqno` and a status, or with `DISPLAYS`
-//! for `GET_DISPLAYS`; `MOVE_CURSOR` and `DISPLAY_BOUNDS` are not answered. A command that is
-//! refused changes nothing. A message of a type the device has no command for is answered
-//! [`RGFX_STATUS_UNKNOWN_COMMAND`], and one shorter than its command
+//! for `GET_DISPLAYS`; `MOVE_CURSOR`, `DISPLAY_BOUNDS` and `CURSOR_COLOR` are not answered. A
+//! command that is refused changes nothing. A message of a type the device has no command for is
+//! answered [`RGFX_STATUS_UNKNOWN_COMMAND`], and one shorter than its command
 //! [`RGFX_STATUS_INVALID_ARGUMENT`]. A display command naming a display the guest does not see
 //! (`Shared::seen_display`: past the device's count, or past display 0 where the guest did not
 //! take [`RGFX_FEATURE_MULTI_DISPLAY`]) is refused [`RGFX_STATUS_NO_DISPLAY`].
@@ -10,6 +10,7 @@
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::device::{CursorShape, Shared};
+use crate::display::cursor_color::CursorColor;
 use crate::display::{CursorImage, Scanout, straight_rgba};
 use crate::ring::{Message, set_size, sized};
 use crate::wire::*;
@@ -46,6 +47,10 @@ pub(crate) fn answer(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
             if let Some(command) = read::<RgfxDisplayBounds>(message) {
                 shared.display_bounds(&command);
             }
+            return None;
+        }
+        RGFX_CMD_CURSOR_COLOR => {
+            cursor_color(shared, message);
             return None;
         }
         RGFX_CMD_SET_VBLANK => read(message).map_or(RGFX_STATUS_INVALID_ARGUMENT, |command| {
@@ -340,6 +345,7 @@ fn set_cursor(shared: &Shared, command: &RgfxSetCursor) -> u32 {
         return RGFX_STATUS_NO_DISPLAY;
     };
     if command.width == 0 {
+        display.state.lock().cursor_image = None;
         display.screen.cursor_image(None);
         shared.cursor_shape(command.display, None);
         return RGFX_STATUS_OK;
@@ -360,12 +366,19 @@ fn set_cursor(shared: &Shared, command: &RgfxSetCursor) -> u32 {
     let Some(bgra) = shared.region.read(command.offset, len as usize) else {
         return RGFX_STATUS_INVALID_ARGUMENT;
     };
-    display.screen.cursor_image(Some(CursorImage {
+    let image = CursorImage {
         width,
         height,
         hot_spot: (command.hot_x, command.hot_y),
         rgba: straight_rgba(&bgra),
-    }));
+    };
+    let shown = {
+        let mut state = display.state.lock();
+        let shown = converted(&image, state.cursor_color.as_ref());
+        state.cursor_image = Some(image);
+        shown
+    };
+    display.screen.cursor_image(Some(shown));
     shared.cursor_shape(
         command.display,
         Some(CursorShape {
@@ -375,6 +388,88 @@ fn set_cursor(shared: &Shared, command: &RgfxSetCursor) -> u32 {
         }),
     );
     RGFX_STATUS_OK
+}
+
+/// `image` as the screen shows it: converted through `color` where the cursor has a chain.
+fn converted(image: &CursorImage, color: Option<&CursorColor>) -> CursorImage {
+    let mut shown = image.clone();
+    if let Some(color) = color {
+        color.convert(&mut shown.rgba);
+    }
+    shown
+}
+
+/// `CURSOR_COLOR`, where the guest took [`RGFX_FEATURE_CURSOR_COLOR`]: the display's cursor
+/// converts its image through the chain from now on, and the screen is handed the last image
+/// again where the chain changed. A message the device cannot read, of a display the guest does
+/// not see, or from a guest that did not take the feature, is dropped, and the cursor keeps its
+/// chain (logged once a kind).
+fn cursor_color(shared: &Shared, message: &Message) {
+    let Some(command) = read::<RgfxCursorColor>(message) else {
+        log::warn!(
+            target: "reims_vgpu_graphics",
+            "a CURSOR_COLOR shorter than its fields was dropped"
+        );
+        return;
+    };
+    if !shared.driver_took(RGFX_FEATURE_CURSOR_COLOR) {
+        log::warn!(
+            target: "reims_vgpu_graphics",
+            "a CURSOR_COLOR from a guest that did not take CURSOR_COLOR was dropped"
+        );
+        return;
+    }
+    let Some(display) = shared.seen_display(command.display) else {
+        log::warn!(
+            target: "reims_vgpu_graphics",
+            "a CURSOR_COLOR of display {} was dropped: there is no such display",
+            command.display
+        );
+        return;
+    };
+    let color = match CursorColor::read(&command) {
+        Ok(color) => color,
+        Err(dropped) => {
+            log::warn!(
+                target: "reims_vgpu_graphics", kind:? = dropped;
+                "a CURSOR_COLOR of display {} was dropped ({dropped:?}): the cursor keeps its \
+                 colour",
+                command.display
+            );
+            return;
+        }
+    };
+    let (shown, probe) = {
+        let mut state = display.state.lock();
+        if state.cursor_color == color {
+            return;
+        }
+        state.cursor_color = color;
+        let color = state.cursor_color.as_ref();
+        let probe = color.map(|color| {
+            [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255]].map(|rgb| color.pixel(rgb))
+        });
+        let shown = (state.cursor_image.as_ref()).map(|image| converted(image, color));
+        (shown, probe)
+    };
+    // A state change, which the guest makes at its login and at each change of the display's
+    // profile: what the chain does to sRGB's primaries and to white, the boots' read-back.
+    match probe {
+        Some([red, green, blue, white]) => log::info!(
+            target: "reims_vgpu_graphics",
+            "display {}'s cursor converts its colours through the guest's chain: red (255, 0, 0) \
+             shows as {red:?}, green as {green:?}, blue as {blue:?}, white as {white:?}",
+            command.display
+        ),
+        None => log::info!(
+            target: "reims_vgpu_graphics",
+            "display {}'s cursor shows its colours as they are",
+            command.display
+        ),
+    }
+    if let Some(shown) = shown {
+        display.screen.cursor_image(Some(shown));
+    }
 }
 
 /// `PRESENT_SURFACE`, with no ring held, taken at reset count `epoch`: what answers it where it is

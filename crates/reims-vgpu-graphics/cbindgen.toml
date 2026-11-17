@@ -120,6 +120,8 @@ include = [
     "RgfxComputeTextureBinding",
     "RgfxComputeVisibleFunctionTableBinding",
     "RgfxContextClose",
+    "RgfxCursorColor",
+    "RgfxCursorCurve",
     "RgfxDepthStencilCreate",
     "RgfxDeviceInfo",
     "RgfxDisplayBounds",

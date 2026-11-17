@@ -11,6 +11,7 @@ use zerocopy::{FromBytes, FromZeros, IntoBytes};
 use super::*;
 use crate::display::CursorImage;
 
+mod cursor_color;
 mod displays;
 mod motion;
 mod posting;

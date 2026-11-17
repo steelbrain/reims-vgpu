@@ -2322,6 +2322,12 @@ only where no negotiation can carry it.
   `VT_MESSAGE` event, after the `VT_RING`s of the messages before it. The
   device offers the bit wherever the host offers `VT_MESSAGES`; the arm64e
   kext takes it with `VT_MESSAGES`, and nothing else does (item 17).
+- Bit 55, `FEATURES_HI`'s bit 23, is `CURSOR_COLOR`: ring 0 carries
+  `CURSOR_COLOR` (10), the colour chain a display's cursor converts its
+  pixels through ("The cursor's colour", below). Every host offers it. The
+  arm64e kext takes it, and takes the cursor layer's ICC chain from
+  WindowServer only where the host took it; nothing else takes it, and a
+  guest that did not has its cursor shown as its pixels are.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -3030,6 +3036,7 @@ named.
 | 5 | `SET_VBLANK` | display u32, enabled u32 | `COMPLETE` |
 | 8 | `SET_DISPLAY_POWER` | display u32, on u32; 0 turns the display's panel off (`DISPLAY_POWER`) | `COMPLETE` |
 | 9 | `DISPLAY_BOUNDS` | display u32, min_x i32, min_y i32, max_x i32, max_y i32, a reserved u32: the display's rectangle in the guest's desktop, in points (`DISPLAY_BOUNDS`) | none |
+| 10 | `CURSOR_COLOR` | display u32, on u32, then the source's curves (red, green, blue: form u32 and seven f32 parameters each), the source's matrix to XYZ and the matrix from XYZ to the blend space (nine f32 each, row by row), and the blend space's curves (`CURSOR_COLOR`) | none |
 
 Scanout pixels are 32-bit BGRA8 (`kIO32BGRAPixelFormat`), the one format in
 stage 2.
@@ -3072,6 +3079,28 @@ while it waits), a download's as its copy lands. One the ring has no room
 for, or that finds answers handed over before it, is handed to the control
 thread, which posts them in their order ahead of its own answers; a `VBLANK`
 that finds answers handed over is dropped, as one that finds no room is.
+
+**The cursor's colour.** An arm64 WindowServer gives each layer a colour
+chain of its own (item 13): the layer's source curve and matrix to XYZ
+(`Src2XYZ`), then XYZ's matrix and curve to the blend space (`XYZ2Blend`), the
+space the layers are blended in. Layer 0's chain is the identity, and the
+cursor's, layer 1, is not: its image is standard sRGB, and its blend space the
+display's profile's. Where the guest took `CURSOR_COLOR`, it sends the
+cursor's chain as WindowServer set it, the floats as their bits, and the host
+converts each cursor image through it before the host's screen is handed the
+image (`crates/reims-vgpu-graphics/src/display/cursor_color.rs`), so the
+host's cursor, QEMU's console and the window's drawn cursor all show it
+converted. Each pixel's straight colour goes through the source's curves
+channel by channel, the two matrices, and the blend space's curves, is
+clamped to [0, 1] and rounded to 8 bits; its alpha is kept. A new chain
+converts the last image again; `on` 0 turns the chain off, and so does a
+reset. The arm64e kext posts the chain at the first swap after it changed,
+before that swap's cursor, as a display engine latches a layer's colour
+stages with the flip, and posts it off until the chain is whole (no `Src2XYZ`
+comes for layer 1 before the cursor's first image) and where the chain is the
+identity within its own precision (2^-14), so an identity costs the host
+nothing. The measured chains keep black and white exact; after a switch of the
+profile to Display P3, sRGB's red shows as (234, 51, 35).
 
 **The display's density.** Where the guest took `DISPLAY_SCALE`, the host
 tells it the scale of the screen its window was last drawn on, and the kext

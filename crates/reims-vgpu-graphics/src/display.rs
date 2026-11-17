@@ -17,7 +17,9 @@
 //!
 //! **Cursor.** `SET_CURSOR` copies the guest's image, premultiplied BGRA8, out of the region,
 //! and hands the screen straight-alpha RGBA ([`straight_rgba`]); `MOVE_CURSOR` tells it where the
-//! cursor is and whether it shows.
+//! cursor is and whether it shows. Where the guest set the cursor's colour chain
+//! (`CURSOR_COLOR`, [`cursor_color`]), the screen is handed the image converted through it, and
+//! a new chain hands it the last image again, converted through the new one.
 //!
 //! **The panel.** `SET_DISPLAY_POWER` turns the display's panel off while the guest's display
 //! sleeps and on at its wake ([`Screen::power`]): while it is off, the screen shows black and no
@@ -31,6 +33,8 @@
 //! ([`scanout_room`], [`scanout_room_at`]), so one display keeps the whole room, as before any
 //! display had a room of its own. On a device of more than one display each display offers only
 //! a mode whose scanout fits its room ([`offered_in_room`]); with one, the screen's mode as it is.
+
+pub(crate) mod cursor_color;
 
 use crate::wire::{
     RGFX_ALLOCATIONS_OFFSET, RGFX_SCANOUT_BYTES_PER_PIXEL, RGFX_SCANOUT_ROOM_ALIGN,

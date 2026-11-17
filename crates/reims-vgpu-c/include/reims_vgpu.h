@@ -228,7 +228,9 @@ typedef struct {
   size_t rgba_length;
 } RvgCursorGlyph;
 
-// `cursor_glyph(ctx, glyph)`: the guest set its cursor's image.
+// `cursor_glyph(ctx, glyph)`: the guest set its cursor's image, or the colour chain the display
+// shows it through (an arm64 guest's, `CURSOR_COLOR`): the image is the guest's converted
+// through that chain, where it set one.
 //
 // Thread: the library's display thread, a serial worker that runs every display callback of
 // the process one at a time, in the order the library queued them, and never inside a call of
@@ -303,7 +305,7 @@ typedef bool (*RvgGraphicsRouteDoorbellPageFn)(void *ctx,
                                                int32_t bell);
 
 // `cursor_glyph_at(ctx, display, glyph)`: the guest set the cursor's image of display `display`,
-// 1 or above (display 0's is cursor_glyph).
+// 1 or above, or its colour chain (display 0's is cursor_glyph).
 //
 // Thread, and what it may call: as RvgCursorGlyphFn, in order with every display callback.
 typedef void (*RvgCursorGlyphAtFn)(void *ctx, uint32_t display, const RvgCursorGlyph *glyph);

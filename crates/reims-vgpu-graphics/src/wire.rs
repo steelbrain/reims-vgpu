@@ -501,6 +501,16 @@ pub const RGFX_FEATURE_UPLOADS_WRITTEN: u64 = 0x20_0000_0000_0000;
 /// that did not take the bit (docs/graphics-kext/design.md, "Decided", 17). The device offers it
 /// where its host offers `VT_MESSAGES`; the arm64e kext takes it with `VT_MESSAGES`.
 pub const RGFX_FEATURE_VT_RING: u64 = 0x40_0000_0000_0000;
+/// `FEATURES_HI` bit 23, feature bit 55, `CURSOR_COLOR`: ring 0 carries
+/// [`RGFX_CMD_CURSOR_COLOR`], the colour chain a display's cursor plane converts its pixels
+/// through, and the host shows the cursor's image converted (docs/graphics-kext/design.md, "The
+/// cursor's colour"). An arm64 WindowServer gives its cursor's layer a chain of its own, from
+/// standard sRGB to the display's blend space, the space the guest's desktop is drawn in. Every
+/// host offers it (the device converts the image before the host's screen is handed it); the
+/// arm64e kext takes it, and takes the cursor layer's chain from WindowServer only where the host
+/// took it. A guest that did not take it (the x86-64 kext, the option ROM, Ambrosia's module) has
+/// its cursor shown as its pixels are.
+pub const RGFX_FEATURE_CURSOR_COLOR: u64 = 0x80_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -764,6 +774,9 @@ pub const RGFX_CMD_SET_DISPLAY_POWER: u32 = 8;
 /// Command `DISPLAY_BOUNDS` ([`RgfxDisplayBounds`]), where the guest took
 /// [`RGFX_FEATURE_DISPLAY_BOUNDS`]: not answered.
 pub const RGFX_CMD_DISPLAY_BOUNDS: u32 = 9;
+/// Command `CURSOR_COLOR` ([`RgfxCursorColor`]), where the guest took
+/// [`RGFX_FEATURE_CURSOR_COLOR`]: not answered.
+pub const RGFX_CMD_CURSOR_COLOR: u32 = 10;
 /// Event `COMPLETE` ([`RgfxComplete`]): a command's answer, with its `seqno`.
 pub const RGFX_EVT_COMPLETE: u32 = 0x100;
 /// Event `DISPLAYS` ([`RgfxDisplays`]): `GET_DISPLAYS`'s answer, with its `seqno`.
@@ -1523,6 +1536,65 @@ pub struct RgfxDisplayBounds {
     pub max_y: i32,
     /// Keeps the size a multiple of 8; 0.
     pub reserved_24: u32,
+}
+
+/// [`RgfxCursorCurve::form`]: `y = x`, no curve; its parameters are not read.
+pub const RGFX_CURVE_BYPASS: u32 = 0;
+/// [`RgfxCursorCurve::form`]: `y = x^g`.
+pub const RGFX_CURVE_TYPE0: u32 = 1;
+/// [`RgfxCursorCurve::form`]: `y = (a x + b)^g` where `a x + b >= 0`, else 0.
+pub const RGFX_CURVE_TYPE1: u32 = 2;
+/// [`RgfxCursorCurve::form`]: `y = (a x + b)^g + c` where `a x + b >= 0`, else `c`.
+pub const RGFX_CURVE_TYPE2: u32 = 3;
+/// [`RgfxCursorCurve::form`]: `y = (a x + b)^g` where `x >= d`, else `c x`.
+pub const RGFX_CURVE_TYPE3: u32 = 4;
+/// [`RgfxCursorCurve::form`]: `y = (a x + b)^g + e` where `x >= d`, else `c x + f`.
+pub const RGFX_CURVE_TYPE4: u32 = 5;
+
+/// One channel's curve of a [`RgfxCursorColor`]: one of the ICC's parametric curves, in the
+/// forms and with the numbers an arm64 WindowServer's ICC curve blocks give them (QuartzCore's
+/// `Bypass` and `Type0` to `Type4`).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxCursorCurve {
+    /// An `RGFX_CURVE_*` form.
+    pub form: u32,
+    /// The parameters `g`, `a`, `b`, `c`, `d`, `e` and `f`, `f32`s as bits; those the form does
+    /// not use are not read.
+    pub params: [u32; 7],
+}
+
+/// `CURSOR_COLOR`: display `display`'s cursor converts its pixels through the chain that follows
+/// where `on` is not 0, and shows them as they are where it is 0, its state from the device's
+/// start. Each pixel's straight colour, its red, green and blue in [0, 1], goes through
+/// `source_curves` channel by channel, then `to_xyz` and `from_xyz` (each three rows of three
+/// `f32`s, as bits: output channel `i` is row `i` times the input), then `blend_curves` channel
+/// by channel, and is clamped to [0, 1]; its alpha is kept. The host converts the image the
+/// guest's last `SET_CURSOR` set, and each one it sets after, until the next `CURSOR_COLOR` of the
+/// display; a reset turns it off. A curve of a form the host does not know, a parameter or entry
+/// that is not finite, or a display the guest does not see, drops the message, and the cursor
+/// keeps its chain. Not answered.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxCursorColor {
+    /// [`RGFX_CMD_CURSOR_COLOR`].
+    pub header: RgfxMsgHeader,
+    /// The display's id.
+    pub display: u32,
+    /// Whether the chain applies: 0 shows the cursor's pixels as they are.
+    pub on: u32,
+    /// The source's curves, red, green and blue: WindowServer's `Src2XYZ` curve.
+    pub source_curves: [RgfxCursorCurve; 3],
+    /// The source's matrix to XYZ, row by row: WindowServer's `Src2XYZ` matrix.
+    pub to_xyz: [u32; 9],
+    /// The matrix from XYZ to the blend space, row by row: WindowServer's `XYZ2Blend` matrix.
+    pub from_xyz: [u32; 9],
+    /// The blend space's curves, red, green and blue: WindowServer's `XYZ2Blend` curve.
+    pub blend_curves: [RgfxCursorCurve; 3],
 }
 
 /// `PRESENT_SURFACE`: the display shows the IOSurface of global ID `iosurface_id` (plane 0), the
