@@ -273,6 +273,15 @@ fn wait_counts(blocks: &HostBlocks, out: usize, ready: usize) {
     }
 }
 
+/// Waits until the pool's live pieces the guest may use are `n`.
+fn wait_live(pool: &Pool, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pool.live().len() != n {
+        assert!(Instant::now() < deadline, "{:?}", pool.live());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn an_empty_piece_above_the_headroom_goes_back_after_the_delay() {
     let delay = Duration::from_millis(300);
@@ -353,6 +362,7 @@ fn a_block_taken_again_keeps_its_address_and_asks_the_host_nothing() {
     // one out again.
     pool.piece_used(BASE).unwrap();
     wait_counts(&blocks, 2, 0);
+    wait_live(&pool, 2);
     assert_eq!(
         pool.live(),
         [(BASE, BLOCK_LEN), (BASE + BLOCK_LEN, BLOCK_LEN)]
@@ -385,4 +395,33 @@ fn ready_blocks_past_two_are_unmapped_before_they_are_freed() {
     std::thread::sleep(delay * 4);
     assert_eq!(host.calls().len(), 5);
     assert!(pool.source().is_some());
+}
+
+#[test]
+fn a_piece_given_back_and_taken_again_reads_zero() {
+    let delay = Duration::from_millis(50);
+    let host = Arc::new(Host::default());
+    let (pool, blocks) = pool(range(64), &host, delay);
+    pool.grow(BLOCK_LEN);
+    pool.grow(BLOCK_LEN);
+    host.wait_for(2);
+    pool.added(BASE).unwrap();
+    pool.added(BASE + BLOCK_LEN).unwrap();
+    // The guest writes into the upper piece, then empties it; it goes back past the delay.
+    pool.piece_used(BASE + BLOCK_LEN).unwrap();
+    {
+        let hold = pool.find(BASE + BLOCK_LEN + 4096, 8).unwrap();
+        // SAFETY: inside the block, which the hold keeps.
+        unsafe { hold.host.as_ptr().cast::<u64>().write(0xdead_beef) };
+    }
+    pool.piece_empty(BASE + BLOCK_LEN).unwrap();
+    wait_counts(&blocks, 1, 1);
+    // The headroom piece is used: the ready block goes out again, at its address, zeroed.
+    pool.piece_used(BASE).unwrap();
+    wait_counts(&blocks, 2, 0);
+    wait_live(&pool, 2);
+    let hold = pool.find(BASE + BLOCK_LEN + 4096, 8).unwrap();
+    // SAFETY: as above.
+    assert_eq!(unsafe { hold.host.as_ptr().cast::<u64>().read() }, 0);
+    assert_eq!(host.calls().len(), 2);
 }

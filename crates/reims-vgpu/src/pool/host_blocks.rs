@@ -4,7 +4,8 @@
 //!
 //! Each block is zeroed memory of the process's, aligned to 2 MiB and touched a byte a page before
 //! it goes out, as the runtime touches a Shared block. A block given back goes to the ready set
-//! with its id and mapping; past two ready blocks, the oldest is freed after the pool's
+//! with its id and mapping, and reads zero again when it goes out anew, as a new Metal buffer
+//! does; past two ready blocks, the oldest is freed after the pool's
 //! [`BlockMappings::unmap`], on the thread that gave the block back. At the source's end, once
 //! nothing holds it, every block it handed out or keeps ready is unmapped, then freed. Its blocks
 //! have no GPU: `gpu_address` is 0.
@@ -51,6 +52,16 @@ impl Block {
             },
             layout,
         })
+    }
+}
+
+impl Block {
+    /// Zeroes the whole block: a block taken again reads as a new one.
+    fn zero(&self) {
+        if let Some(ptr) = self.info.contents {
+            // SAFETY: the block's own allocation, which nothing else uses while it is ready.
+            unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, self.layout.size()) };
+        }
     }
 }
 
@@ -109,8 +120,10 @@ impl BlockSource for HostBlocks {
         if len <= BLOCK_LEN
             && let Some(block) = b.ready.pop_front()
         {
+            drop(b);
+            block.zero();
             let info = block.info;
-            b.out.insert(info.id, block);
+            self.blocks.lock().out.insert(info.id, block);
             return Ok(info);
         }
         let id = BlockId(b.next);
