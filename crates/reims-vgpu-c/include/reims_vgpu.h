@@ -304,6 +304,24 @@ typedef bool (*RvgGraphicsRouteDoorbellPageFn)(void *ctx,
                                                uint32_t ring_id,
                                                int32_t bell);
 
+// `cursor_glyph_at(ctx, display, glyph)`: the guest set the cursor's image of display `display`,
+// 1 or above, or its colour chain (display 0's is cursor_glyph).
+//
+// Thread, and what it may call: as RvgCursorGlyphFn, in order with every display callback.
+typedef void (*RvgCursorGlyphAtFn)(void *ctx, uint32_t display, const RvgCursorGlyph *glyph);
+
+// `cursor_show_at(ctx, display, show)`: whether display `display`'s cursor shows changed, 1 or
+// above (display 0's is cursor_show).
+//
+// Thread, and what it may call: as RvgCursorGlyphFn, in order with every display callback.
+typedef void (*RvgCursorShowAtFn)(void *ctx, uint32_t display, uint8_t show);
+
+// `cursor_move_at(ctx, display)`: the guest moved display `display`'s cursor, 1 or above
+// (display 0's is cursor_move); rvg_graphics_device_cursor_position_at reads where.
+//
+// Thread, and what it may call: as RvgCursorGlyphFn, in order with every display callback.
+typedef void (*RvgCursorMoveAtFn)(void *ctx, uint32_t display);
+
 // `pool_add(ctx, physical_address, host_address, length)`: map `length` bytes of host memory
 // from `host_address` into the guest at `physical_address`, a piece of the guest's Shared pool
 // (RvgGraphicsDeviceConfig's `pool_physical_address` and `pool_physical_length`, which hold the
@@ -337,24 +355,6 @@ typedef void (*RvgGraphicsPoolAddFn)(void *ctx,
 // begun: the host removes every piece it added before it releases the device. May call: nothing
 // of the library's. Needed with a pool.
 typedef void (*RvgGraphicsPoolRemoveFn)(void *ctx, uint64_t physical_address, uint64_t length);
-
-// `cursor_glyph_at(ctx, display, glyph)`: the guest set the cursor's image of display `display`,
-// 1 or above, or its colour chain (display 0's is cursor_glyph).
-//
-// Thread, and what it may call: as RvgCursorGlyphFn, in order with every display callback.
-typedef void (*RvgCursorGlyphAtFn)(void *ctx, uint32_t display, const RvgCursorGlyph *glyph);
-
-// `cursor_show_at(ctx, display, show)`: whether display `display`'s cursor shows changed, 1 or
-// above (display 0's is cursor_show).
-//
-// Thread, and what it may call: as RvgCursorGlyphFn, in order with every display callback.
-typedef void (*RvgCursorShowAtFn)(void *ctx, uint32_t display, uint8_t show);
-
-// `cursor_move_at(ctx, display)`: the guest moved display `display`'s cursor, 1 or above
-// (display 0's is cursor_move); rvg_graphics_device_cursor_position_at reads where.
-//
-// Thread, and what it may call: as RvgCursorGlyphFn, in order with every display callback.
-typedef void (*RvgCursorMoveAtFn)(void *ctx, uint32_t display);
 
 // The graphics device's callbacks.
 //

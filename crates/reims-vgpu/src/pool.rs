@@ -74,6 +74,7 @@ pub const RELEASE_DELAY: Duration = Duration::from_secs(5);
 
 /// A block's storage mode as the guest's buffers in it see it (metal2vulkan-rt's `MemoryClass`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[allow(dead_code, reason = "metal2vulkan-rt's shape, kept whole so only the source changes when it lands")]
 pub enum MemoryClass {
     /// Device-local, never mapped, no host pointer.
     Private,
@@ -87,6 +88,7 @@ pub struct BlockId(pub u32);
 
 impl BlockId {
     /// The number.
+    #[allow(dead_code, reason = "metal2vulkan-rt's shape, kept whole so only the source changes when it lands")]
     pub fn get(self) -> u32 {
         self.0
     }
@@ -94,6 +96,7 @@ impl BlockId {
 
 /// A block a source handed out (metal2vulkan-rt's `BlockInfo`): plain data.
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code, reason = "metal2vulkan-rt's shape, kept whole so only the source changes when it lands")]
 pub struct BlockInfo {
     /// Its number.
     pub id: BlockId,
@@ -252,6 +255,7 @@ struct Shared {
 }
 
 /// A hold on a live piece: while it lives, an unmap of its block waits.
+#[allow(dead_code, reason = "the guest's side of the pool (its ring messages) calls it once it lands")]
 pub struct PieceHold {
     shared: Arc<Shared>,
     physical_address: u64,
@@ -399,6 +403,7 @@ impl Pool {
     /// The guest put something in the piece at `physical_address`. Where no other piece is
     /// empty, the pool asks for a block more, so one stays as headroom.
     /// [`Error::InvalidArgument`] for an address where no piece the guest may use starts.
+    #[allow(dead_code, reason = "the guest's side of the pool (its ring messages) calls it once it lands")]
     pub fn piece_used(&self, physical_address: u64) -> Result<(), Error> {
         let mut st = self.shared.state.lock();
         let p = (st.pieces.get_mut(&physical_address)).ok_or(Error::InvalidArgument)?;
@@ -422,6 +427,7 @@ impl Pool {
     /// empty too, its block goes back to the source, and the guest may not use it again until the
     /// device hands it out anew. [`Error::InvalidArgument`] for an address where no piece the
     /// guest may use starts.
+    #[allow(dead_code, reason = "the guest's side of the pool (its ring messages) calls it once it lands")]
     pub fn piece_empty(&self, physical_address: u64) -> Result<(), Error> {
         let mut st = self.shared.state.lock();
         let p = (st.pieces.get_mut(&physical_address)).ok_or(Error::InvalidArgument)?;
@@ -438,6 +444,7 @@ impl Pool {
 
     /// The live piece the guest may use that holds `length` bytes from `physical_address`, held
     /// until the answer drops; `None` where none holds all of them.
+    #[allow(dead_code, reason = "the guest's side of the pool (its ring messages) calls it once it lands")]
     pub fn find(&self, physical_address: u64, length: u64) -> Option<PieceHold> {
         let mut st = self.shared.state.lock();
         let (&start, p) = st.pieces.range_mut(..=physical_address).next_back()?;
@@ -464,6 +471,7 @@ impl Pool {
 
     /// The pieces the guest may use and the host mapped, by address: `(physical_address,
     /// length)`.
+    #[allow(dead_code, reason = "the guest's side of the pool (its ring messages) calls it once it lands")]
     pub fn live(&self) -> Vec<(u64, u64)> {
         let st = self.shared.state.lock();
         (st.pieces.iter())
@@ -645,9 +653,7 @@ impl Shared {
                             }
                         );
                     }
-                    let _ = self
-                        .changed
-                        .wait_for(&mut st, Duration::from_millis(250));
+                    let _ = self.changed.wait_for(&mut st, Duration::from_millis(250));
                 }
             }
         }

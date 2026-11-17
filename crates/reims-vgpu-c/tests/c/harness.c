@@ -134,9 +134,11 @@ static void check_graphics(void) {
                                NULL,
                                NULL,
                                NULL,
+                               NULL,
+                               NULL,
                                NULL};
     RvgGraphicsDeviceConfig c = {
-        sizeof c, &cb, NULL, NULL, NULL, RVG_GUEST_ARCH_X86_64, 2, 0, NULL};
+        sizeof c, &cb, NULL, NULL, NULL, RVG_GUEST_ARCH_X86_64, 2, 0, NULL, 0, 0};
     RvgGraphicsDevice *d = NULL;
     graphics_destroyed = 0;
     graphics_raised = 0;
@@ -163,6 +165,10 @@ static void check_graphics(void) {
      * MULTI_DISPLAY, bit 48, with one display. */
     CHECK((rvg_graphics_device_mmio_read(d, 0x00c) >> 14) & 1);
     CHECK(!((rvg_graphics_device_mmio_read(d, 0x00c) >> 16) & 1));
+    /* A device made with no pool range refuses the pool's calls. */
+    CHECK_STATUS(rvg_graphics_device_pool_grow(d, 256u << 20), RVG_ERR_INVALID_ARGUMENT);
+    CHECK_STATUS(rvg_graphics_device_pool_added(d, 52ull << 30), RVG_ERR_INVALID_ARGUMENT);
+    CHECK_STATUS(rvg_graphics_device_pool_removed(d, 52ull << 30), RVG_ERR_INVALID_ARGUMENT);
 
 #if defined(_WIN32)
     /* NULL names no handle; the device takes a copy of the event, and refuses a second. */
@@ -257,7 +263,7 @@ static void check_displays(void) {
     cb.ctx = &displays_destroyed;
     cb.destroy = on_graphics_destroy;
     RvgGraphicsDeviceConfig c = {
-        sizeof c, &cb, NULL, NULL, NULL, RVG_GUEST_ARCH_X86_64, 0, 2, NULL};
+        sizeof c, &cb, NULL, NULL, NULL, RVG_GUEST_ARCH_X86_64, 0, 2, NULL, 0, 0};
     RvgGraphicsDevice *d = NULL;
     displays_destroyed = 0;
     CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_OK);
@@ -396,7 +402,7 @@ static void check_memory_files(void) {
     cb.ctx = &files_destroyed;
     cb.destroy = on_graphics_destroy;
     RvgGraphicsDeviceConfig c = {
-        sizeof c, &cb, NULL, &map, &file, RVG_GUEST_ARCH_X86_64, 0, 0, NULL};
+        sizeof c, &cb, NULL, &map, &file, RVG_GUEST_ARCH_X86_64, 0, 0, NULL, 0, 0};
     files_destroyed = 0;
     RvgGraphicsDevice *d = NULL;
     CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_OK);

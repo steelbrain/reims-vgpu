@@ -125,7 +125,6 @@ use crate::cursor::{
 use crate::entry;
 use crate::entry::no_catch;
 use crate::error::Error;
-use crate::pool::{HostBlocks, Pool, PoolAddFn, PoolConfig, PoolHost, PoolRemoveFn};
 use crate::graphics::answers::PipelineAnswers;
 use crate::graphics::color::{ColorChange, ColorStaging, DisplayColor};
 use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
@@ -143,6 +142,7 @@ use crate::graphics::present::{Drawing, PresentAnswers, PresentQueue};
 use crate::graphics::read::DisplayRead;
 use crate::memory::{GuestMemoryLease, MemoryMap};
 use crate::platform::{ApiPlatform, api_state};
+use crate::pool::{HostBlocks, Pool, PoolAddFn, PoolConfig, PoolHost, PoolRemoveFn};
 use crate::window::WindowLink;
 
 mod answers;

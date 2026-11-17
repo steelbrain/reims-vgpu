@@ -233,9 +233,8 @@ pub type RvgGraphicsPoolAddFn = Option<
 /// loop). Once a piece, after its pool_add. Not called once rvg_graphics_device_release has
 /// begun: the host removes every piece it added before it releases the device. May call: nothing
 /// of the library's. Needed with a pool.
-pub type RvgGraphicsPoolRemoveFn = Option<
-    unsafe extern "C-unwind" fn(ctx: *mut c_void, physical_address: u64, length: u64),
->;
+pub type RvgGraphicsPoolRemoveFn =
+    Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, physical_address: u64, length: u64)>;
 
 /// The graphics device's callbacks.
 ///
@@ -673,7 +672,11 @@ pub unsafe extern "C" fn rvg_graphics_device_pool_added(
 ) -> RvgStatus {
     ffi::export(|| {
         // SAFETY: the caller's contract.
-        unsafe { pool_call(device, "rvg_graphics_device_pool_added", |d| d.pool_added(physical_address)) }
+        unsafe {
+            pool_call(device, "rvg_graphics_device_pool_added", |d| {
+                d.pool_added(physical_address)
+            })
+        }
     })
 }
 
@@ -693,7 +696,11 @@ pub unsafe extern "C" fn rvg_graphics_device_pool_removed(
 ) -> RvgStatus {
     ffi::export(|| {
         // SAFETY: the caller's contract.
-        unsafe { pool_call(device, "rvg_graphics_device_pool_removed", |d| d.pool_removed(physical_address)) }
+        unsafe {
+            pool_call(device, "rvg_graphics_device_pool_removed", |d| {
+                d.pool_removed(physical_address)
+            })
+        }
     })
 }
 
@@ -712,7 +719,11 @@ pub unsafe extern "C" fn rvg_graphics_device_pool_grow(
 ) -> RvgStatus {
     ffi::export(|| {
         // SAFETY: the caller's contract.
-        unsafe { pool_call(device, "rvg_graphics_device_pool_grow", |d| d.pool_grow(length)) }
+        unsafe {
+            pool_call(device, "rvg_graphics_device_pool_grow", |d| {
+                d.pool_grow(length)
+            })
+        }
     })
 }
 

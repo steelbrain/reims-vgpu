@@ -331,7 +331,10 @@ fn a_piece_used_again_within_the_delay_is_kept() {
     pool.piece_used(BASE).unwrap();
     pool.piece_used(BASE + BLOCK_LEN).unwrap();
     // Using the last empty piece asked for a block more: the headroom.
-    assert_eq!(host.wait_for(3)[2], Call::Add(BASE + 2 * BLOCK_LEN, BLOCK_LEN));
+    assert_eq!(
+        host.wait_for(3)[2],
+        Call::Add(BASE + 2 * BLOCK_LEN, BLOCK_LEN)
+    );
     pool.added(BASE + 2 * BLOCK_LEN).unwrap();
     // Emptied, then used again within the delay: kept.
     pool.piece_empty(BASE + BLOCK_LEN).unwrap();
@@ -343,7 +346,10 @@ fn a_piece_used_again_within_the_delay_is_kept() {
     // one above it, empty past the delay, goes.
     pool.piece_empty(BASE + BLOCK_LEN).unwrap();
     wait_counts(&blocks, 2, 1);
-    assert_eq!(pool.live(), [(BASE, BLOCK_LEN), (BASE + BLOCK_LEN, BLOCK_LEN)]);
+    assert_eq!(
+        pool.live(),
+        [(BASE, BLOCK_LEN), (BASE + BLOCK_LEN, BLOCK_LEN)]
+    );
     assert_eq!(host.calls().len(), 3);
 }
 

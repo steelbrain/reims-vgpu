@@ -146,14 +146,14 @@ fn refused_graphics_configs() {
             rvg_graphics_device_create(&c, &mut device),
             RVG_ERR_INVALID_ARGUMENT
         );
-        let mut big = [0u8; 80];
+        let mut big = [0u8; 96];
         std::ptr::copy_nonoverlapping(
             std::ptr::from_ref(&config(&cb)).cast::<u8>(),
             big.as_mut_ptr(),
             size_of::<RvgGraphicsDeviceConfig>(),
         );
-        big[0] = 80;
-        big[76] = 1;
+        big[0] = 96;
+        big[88] = 1;
         assert_eq!(
             rvg_graphics_device_create(big.as_ptr().cast(), &mut device),
             RVG_ERR_UNSUPPORTED
