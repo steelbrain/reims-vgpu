@@ -15,6 +15,8 @@
 mod buffer;
 mod calls;
 mod caps;
+#[cfg(windows)]
+mod d3d12;
 mod display;
 mod encoder;
 mod export;

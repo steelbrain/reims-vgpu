@@ -9,6 +9,12 @@
 //! memory and the decoder's context once the decoder lets it go
 //! ([`end_context`]), is kept until the GPU is done with every one of its
 //! surfaces.
+//!
+//! On Windows a pool's surfaces are Direct3D 12 textures of ours, made
+//! shared, that the driver imports by their NT handles
+//! (`shared_surfaces`, `super::d3d12`), so that another device can open
+//! what decodes into them; where the adapter's device makes no such texture
+//! or the driver imports none, they are the driver's own, as on Linux.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -17,6 +23,8 @@ use crate::core::runtime::MonoTime;
 use crate::core::sync::{Mutex, MutexGuard};
 
 use super::caps::{Config, Context, Entrypoint, Profile};
+#[cfg(windows)]
+use super::d3d12::SharedTexture;
 use super::display::{Display, Error, check};
 use super::export::{self, SurfaceExport};
 use super::ffi;
@@ -109,6 +117,11 @@ struct PoolInner {
     /// Each surface's export as dma-bufs, made at its first frame asked
     /// so ([`Surface::export`]) and kept while the pool lives.
     exports: Mutex<Vec<(ffi::VASurfaceID, Arc<SurfaceExport>)>>,
+    /// On Windows, the shared texture each surface is, where the pool made
+    /// it of one ([`shared_surfaces`]), kept while the pool lives and let
+    /// go behind its surfaces' destruction.
+    #[cfg(windows)]
+    textures: Mutex<Vec<(ffi::VASurfaceID, Arc<SharedTexture>)>>,
 }
 
 struct PoolState {
@@ -134,6 +147,9 @@ impl Drop for PoolInner {
         // The processing context goes before the surfaces it wrote into.
         drop(self.processing.get_mut().take());
         let mut all = std::mem::take(&mut self.state.get_mut().all);
+        // The textures the surfaces are go after them.
+        #[cfg(windows)]
+        let textures = std::mem::take(self.textures.get_mut());
         if !all.is_empty() {
             let count = i32::try_from(all.len()).unwrap_or(0);
             // SAFETY: every surface was made by vaCreateSurfaces on this
@@ -141,6 +157,8 @@ impl Drop for PoolInner {
             // pool; destroyed once, here, behind every call on them.
             self.display.release(move |raw| unsafe {
                 ffi::vaDestroySurfaces(raw, all.as_mut_ptr(), count);
+                #[cfg(windows)]
+                drop(textures);
             });
         }
     }
@@ -170,8 +188,13 @@ impl SurfacePool {
             processing: Mutex::new(None),
             stalled: OnceLock::new(),
             exports: Mutex::new(Vec::new()),
+            #[cfg(windows)]
+            textures: Mutex::new(Vec::new()),
         });
+        #[cfg(unix)]
         let made = create_surfaces(display, format, width, height, count)?;
+        #[cfg(windows)]
+        let made = shared_surfaces(&inner, count)?;
         {
             let mut state = inner.state.lock();
             state.all.extend(&made);
@@ -197,8 +220,16 @@ impl SurfacePool {
                     return Err(Error::OutOfSurfaces);
                 }
                 let inner = &self.inner;
+                #[cfg(unix)]
                 let made =
                     create_surfaces(&inner.display, inner.format, inner.width, inner.height, 1)?;
+                // On Windows, of the kind the pool was made of.
+                #[cfg(windows)]
+                let made = if inner.textures.lock().is_empty() {
+                    create_surfaces(&inner.display, inner.format, inner.width, inner.height, 1)?
+                } else {
+                    shared_surfaces(inner, 1)?
+                };
                 state.all.extend(&made);
                 made[0]
             }
@@ -315,6 +346,99 @@ fn create_surfaces(
         })?,
     )?;
     Ok(ids)
+}
+
+/// `count` surfaces of `pool`'s format and size, on Windows: each a shared
+/// texture of the display's Direct3D 12 device that the driver imports by its
+/// NT handle (`super::d3d12`), so that another device can read what decodes
+/// into it; or, where the device makes no such texture or the driver imports
+/// none, surfaces of the driver's own, as on Linux, with why at info once a
+/// process (`kind`).
+#[cfg(windows)]
+fn shared_surfaces(pool: &PoolInner, count: usize) -> Result<Vec<ffi::VASurfaceID>, Error> {
+    let display = &pool.display;
+    let (format, width, height) = (pool.format, pool.width, pool.height);
+    let own = |why: String| {
+        log::info!(
+            kind:% = why;
+            "{} {width}x{height} surfaces are the driver's own, not shared: {why}",
+            format.name()
+        );
+        create_surfaces(display, format, width, height, count)
+    };
+    let device = match display.d3d12() {
+        Ok(device) => device,
+        Err(why) => return own(format!("no Direct3D 12 device: {why}")),
+    };
+    let mut made = Vec::with_capacity(count);
+    for _ in 0..count {
+        let imported = device
+            .shared_texture(format, width, height)
+            .map_err(Error::Unsupported)
+            .and_then(|texture| {
+                Ok((
+                    import_texture(display, format, width, height, &texture)?,
+                    texture,
+                ))
+            });
+        match imported {
+            Ok((id, texture)) => {
+                made.push(id);
+                pool.textures.lock().push((id, Arc::new(texture)));
+            }
+            Err(error @ Error::Stalled(_)) => return Err(error),
+            Err(why) if made.is_empty() => return own(format!("a shared texture: {why}")),
+            Err(why) => return Err(why),
+        }
+    }
+    Ok(made)
+}
+
+/// A surface of `format`, `width` by `height`, that the driver imports from
+/// `texture`'s NT handle (`VA_SURFACE_ATTRIB_MEM_TYPE_NTHANDLE`).
+#[cfg(windows)]
+fn import_texture(
+    display: &Display,
+    format: SurfaceFormat,
+    width: u32,
+    height: u32,
+    texture: &SharedTexture,
+) -> Result<ffi::VASurfaceID, Error> {
+    let mut handles = [texture.handle()];
+    let mut attributes = [ffi::VASurfaceAttrib::zeroed(); 3];
+    attributes[0].type_ = ffi::VASurfaceAttribPixelFormat;
+    attributes[0].value.type_ = ffi::VAGenericValueTypeInteger;
+    attributes[0].value.value.i = i32::from_ne_bytes(format.fourcc().to_ne_bytes());
+    attributes[1].type_ = ffi::VASurfaceAttribMemoryType;
+    attributes[1].value.type_ = ffi::VAGenericValueTypeInteger;
+    attributes[1].value.value.i =
+        i32::from_ne_bytes(ffi::VA_SURFACE_ATTRIB_MEM_TYPE_NTHANDLE.to_ne_bytes());
+    attributes[2].type_ = ffi::VASurfaceAttribExternalBufferDescriptor;
+    attributes[2].value.type_ = ffi::VAGenericValueTypePointer;
+    attributes[2].value.value.p = handles.as_mut_ptr().cast();
+    for attribute in &mut attributes {
+        attribute.flags = ffi::VA_SURFACE_ATTRIB_SETTABLE;
+    }
+    let mut id = ffi::VA_INVALID_SURFACE;
+    check(
+        "vaCreateSurfaces",
+        // SAFETY: `id` holds one entry; the attributes are valid, the
+        // descriptor points at one NT handle, which the call reads and the
+        // texture keeps open.
+        display.call(|raw| unsafe {
+            ffi::vaCreateSurfaces(
+                raw,
+                format.rt_format(),
+                width,
+                height,
+                &mut id,
+                1,
+                attributes.as_mut_ptr(),
+                3,
+            )
+        })?,
+    )?;
+    Ok(id)
 }
 
 /// A surface on loan from its pool, back in the pool when dropped; or a target over the caller's
@@ -869,6 +993,16 @@ impl Surface {
         drop(processing);
         to.sync()?;
         Ok(true)
+    }
+
+    /// The shared texture the surface is, on Windows, where its pool made it
+    /// of one ([`shared_surfaces`]).
+    #[cfg(windows)]
+    pub(crate) fn texture(&self) -> Option<Arc<SharedTexture>> {
+        let textures = self.pool.textures.lock();
+        (textures.iter())
+            .find(|(id, _)| *id == self.id)
+            .map(|(_, texture)| Arc::clone(texture))
     }
 
     /// [`Surface::copy_to`] of a surface of the same pool.

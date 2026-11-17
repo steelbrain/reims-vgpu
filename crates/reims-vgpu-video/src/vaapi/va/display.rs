@@ -150,6 +150,14 @@ struct DisplayInner {
     /// What the driver's video processing writes into imported memory, as
     /// the check at the opening found it (`super::import_check`).
     import_writes: OnceLock<ImportWrites>,
+    /// On Windows, the LUID of the DXGI adapter the display was opened on
+    /// (`None`: the adapter the driver picked), and the Direct3D 12 device
+    /// on it that the display's pools make their textures with
+    /// (`super::d3d12`), made at its first use.
+    #[cfg(windows)]
+    adapter: Option<[u8; 8]>,
+    #[cfg(windows)]
+    d3d12: OnceLock<Result<super::d3d12::Device, String>>,
 }
 
 // SAFETY: "All VAAPI functions implemented in libva are thread-safe" and
@@ -206,7 +214,14 @@ impl Display {
         if raw.is_null() {
             return Err(Error::NoDisplay);
         }
-        Self::initialise(raw, path.display().to_string(), Some(node), runtime, step)
+        Self::initialise(
+            raw,
+            path.display().to_string(),
+            Some(node),
+            None,
+            runtime,
+            step,
+        )
     }
 
     /// Initialises VA-API on the DXGI adapter whose LUID is `luid` (the
@@ -237,7 +252,15 @@ impl Display {
             Some(luid) => format!("the DXGI adapter of LUID {:#x}", u64::from_le_bytes(luid)),
             None => "the DXGI adapter the driver picks".to_owned(),
         };
-        Self::initialise(raw, name, None, runtime, step)
+        Self::initialise(raw, name, None, luid, runtime, step)
+    }
+
+    /// The Direct3D 12 device on the display's adapter, which its pools
+    /// make their shared textures with (`super::d3d12`); `Err` with why
+    /// where none is made.
+    #[cfg(windows)]
+    pub(crate) fn d3d12(&self) -> Result<&super::d3d12::Device, String> {
+        super::d3d12::device_of(&self.inner.d3d12, self.inner.adapter)
     }
 
     /// The rest of an open, on the display `raw` libva made: `vaInitialize`,
@@ -248,9 +271,12 @@ impl Display {
         raw: ffi::VADisplay,
         path: String,
         node: Option<File>,
+        adapter: Option<[u8; 8]>,
         runtime: Arc<dyn Runtime>,
         step: ExitStep,
     ) -> Result<Self, Error> {
+        #[cfg(unix)]
+        let _ = adapter;
         // SAFETY: `raw` is a display; a null callback disables the
         // messages (va.h, vaSetInfoCallback).
         unsafe { ffi::vaSetInfoCallback(raw, None, core::ptr::null_mut()) };
@@ -288,6 +314,10 @@ impl Display {
                 node,
                 runtime,
                 import_writes: OnceLock::new(),
+                #[cfg(windows)]
+                adapter,
+                #[cfg(windows)]
+                d3d12: OnceLock::new(),
             }),
         };
         display.prime();
