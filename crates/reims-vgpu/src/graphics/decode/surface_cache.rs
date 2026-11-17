@@ -3764,7 +3764,7 @@ impl CacheMaker {
     /// ([`aligned_byte`]), so that textures over its surface's planes lie in it rather than in
     /// copies of their own ([`GpuDevice::new_buffer_of_length_padding_unobserved`]); else as any
     /// other buffer. An exportable cache places that byte alike
-    /// ([`GpuDevice::new_exportable_buffer_of_length`]). With the buffer, the cache's life where
+    /// (`GpuDevice::new_exportable_buffer_of_length`). With the buffer, the cache's life where
     /// its memory was made for the host's video, exportable or a dma-buf
     /// ([`SurfaceCache::life`]).
     fn make<P: Platform>(

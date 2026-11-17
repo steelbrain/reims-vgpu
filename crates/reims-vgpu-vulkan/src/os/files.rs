@@ -14,8 +14,8 @@
 //!   last. The C API duplicates the host's descriptors for each device it makes, so devices over
 //!   the same RAM register it each under its own: a byte resolves through the first registration
 //!   that holds it, and every one shows the same file pages.
-//! - **Runs** the library mapped: every view [`super::linux::LinuxVm`] made, and every range of
-//!   [`super::linux::allocate_aliasable`]. A run shows `end - first` bytes of its file from its
+//! - **Runs** the library mapped: every view `super::linux::LinuxVm` made, and every range of
+//!   `super::linux::allocate_aliasable`. A run shows `end - first` bytes of its file from its
 //!   offset, with the protection last set on it. Runs never overlap: a new run replaces what of
 //!   another it covers, and an unmap or an overwrite drops what of the runs it covers.
 //!
