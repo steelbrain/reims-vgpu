@@ -283,9 +283,10 @@ dnf_pkgs=()
 # Windows: MSYS2's own git and curl, make (the cmake crate, building SDL3, looks
 # for it to choose CMake's generator, and stops without it), and CLANG64's clang
 # and lld, which build the library (x86_64-pc-windows-gnullvm) and QEMU, QEMU's
-# build tools and the libraries it links.
+# build tools and the libraries it links; and libva and Mesa, whose VA-API driver
+# on Direct3D 12 (vaon12) decodes the reims-graphics device's video.
 msys2_pkgs=(git curl diffutils make
-  mingw-w64-clang-x86_64-{clang,lld,pkgconf,meson,ninja,cmake,python,glib2,pixman,libslirp,gtk3,libusb,zstd})
+  mingw-w64-clang-x86_64-{clang,lld,pkgconf,meson,ninja,cmake,python,glib2,pixman,libslirp,gtk3,libusb,zstd,libva,mesa})
 if [[ $BUILDS_QEMU == 0 ]]; then
   # reims-ctl alone, for arm64 Linux: a C compiler and linker for Rust's
   # builds, git, and curl for rustup. Fedora is Asahi Linux's own distribution.
@@ -634,10 +635,18 @@ if [[ $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
     PREFIX="${staged%/bin/*}" PREFIX="${PREFIX#"$STAGE"}"
     # The CLANG64 DLLs QEMU and qemu-img load, copied beside them: reims-ctl
     # starts QEMU outside MSYS2, and an update of MSYS2's packages then changes
-    # no build a VM runs.
-    for exe in "$QEMU_BINARY" qemu-img.exe; do
-      ldd "$STAGE$PREFIX/bin/$exe" | awk '$3 ~ "^/clang64/" { print $3 }'
-    done | sort -u | while read -r dll; do cp "$dll" "$STAGE$PREFIX/bin/"; done
+    # no build a VM runs. libva's and its vaon12 driver too, with what they
+    # load, which the library opens by name when the device's video starts
+    # (so ldd lists none of them): libva looks for the driver beside itself.
+    {
+      for exe in "$QEMU_BINARY" qemu-img.exe; do
+        ldd "$STAGE$PREFIX/bin/$exe" | awk '$3 ~ "^/clang64/" { print $3 }'
+      done
+      for dll in libva libva_win32 vaon12_drv_video; do
+        echo "/clang64/bin/$dll.dll"
+        ldd "/clang64/bin/$dll.dll" | awk '$3 ~ "^/clang64/" { print $3 }'
+      done
+    } | sort -u | while read -r dll; do cp "$dll" "$STAGE$PREFIX/bin/"; done
   else
     DESTDIR="$STAGE" ninja -C "$BUILD" install >/dev/null
   fi
