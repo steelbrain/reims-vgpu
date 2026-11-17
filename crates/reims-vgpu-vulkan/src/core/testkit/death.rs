@@ -18,7 +18,7 @@
 //!   and a death marker a signal handler appends on the dying thread. Each record fills a
 //!   fixed slot, so a record a thread had reserved but not written when the child ended hides
 //!   none after it;
-//! - guest RAM and raw regions the body shares ([`Child::share_ram`], [`Child::share_region`]):
+//! - guest RAM and raw regions the body shares (`Child::share_ram`, `Child::share_region`):
 //!   their pages are remapped in place onto the file, at the same addresses.
 //!
 //! `Died { id, op, thread }` comes from the child's stderr death line (the id), the marker's
@@ -39,7 +39,7 @@
 //! marks itself on the dying thread before it aborts (`dying`), and a fault is marked by the
 //! child's unhandled-exception filter on the faulting thread (`sys::arm`). A death's record carries
 //! the signal a Unix child would have died of. The body shares no memory in place there
-//! ([`Child::share_ram`] and [`Child::share_region`] are Linux's and macOS's): heap pages cannot be
+//! (`Child::share_ram` and `Child::share_region` are Linux's and macOS's): heap pages cannot be
 //! replaced in place by a view.
 //!
 //! No product change: the child uses the capture's public switch, and this module is
