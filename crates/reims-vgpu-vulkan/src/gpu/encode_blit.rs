@@ -524,7 +524,7 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
         destination: &VulkanBuffer,
         destination_offset: u64,
     ) -> RaiseResult<bool> {
-        let recorded_call = crate::recorder::rec_call!(
+        let mut recorded_call = crate::recorder::rec_call!(
             "m2v.copyFromGuestRam",
             self,
             runs,
@@ -559,6 +559,16 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
                 Ok(false)
             }
         });
+        if matches!(recorded_answer, Ok(true)) {
+            // The runs' bytes land one after another from the destination's offset.
+            let mut at = destination_offset;
+            let runs = runs.iter().map(|run| {
+                let byte = at;
+                at = at.saturating_add(run.end.saturating_sub(run.start));
+                (byte, run.clone())
+            });
+            crate::recorder::guest_ram_source(&mut recorded_call, destination, runs);
+        }
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -571,7 +581,7 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
         runs: &[(u64, std::ops::Range<u64>)],
         destination: &VulkanBuffer,
     ) -> RaiseResult<bool> {
-        let recorded_call =
+        let mut recorded_call =
             crate::recorder::rec_call!("m2v.copyFromGuestRamAt", self, runs, destination);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<bool> {
             #[cfg(any(target_os = "linux", windows))]
@@ -595,6 +605,13 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
                 Ok(false)
             }
         });
+        if matches!(recorded_answer, Ok(true)) {
+            crate::recorder::guest_ram_source(
+                &mut recorded_call,
+                destination,
+                runs.iter().cloned(),
+            );
+        }
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }

@@ -18,7 +18,8 @@
 //! - **Memory.** Before each commit, the recorder waits for the earlier command buffers that can
 //!   run, then writes `m2v.write` records of every 4 KiB of host memory the command buffer can
 //!   reach that changed since the stream last held it ([`before_commit`]). A buffer in a heap over
-//!   the guest's memory is written as its block's bytes.
+//!   the guest's memory is written as its block's bytes. A copy out of the guest's RAM carries the
+//!   bytes it reads as its arguments ([`guest_ram_source`]).
 //! - **The file.** Records are appended to a buffer under one lock as each call returns, so the
 //!   stream's order keeps each thread's; a thread of the recorder's own (`reims-vgpu.recorder`)
 //!   writes the buffer out every [`FLUSH`], into segments `<pid>.NNNN.m2vr` of at most
@@ -678,6 +679,69 @@ pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
     state.stats.commits.fetch_add(1, Ordering::Relaxed);
 }
 
+/// The guest's RAM a copy into `destination` reads (`m2v.copyFromGuestRam`,
+/// `m2v.copyFromGuestRamAt`), where the platform encoded the copy: once the earlier command
+/// buffers that can run have finished, as before a commit ([`before_commit`]), each run's bytes,
+/// read now, and the byte of `destination` they land from become the call's arguments,
+/// `[destination, [[byte, bytes], …]]`, the bytes a blob where they are long.
+pub fn guest_ram_source(
+    active: &mut Option<Active>,
+    destination: &VulkanBuffer,
+    runs: impl Iterator<Item = (u64, std::ops::Range<u64>)>,
+) {
+    let Some(a) = active else { return };
+    if !a.recorded() {
+        return;
+    }
+    let Some(state) = state() else { return };
+    let t0 = now_ns();
+    let mut written = state.reap();
+    state.wait_for_earlier();
+    written.extend(state.reap());
+    state.refresh(&written);
+    state.stats.wait_ns.fetch_add(now_ns() - t0, Ordering::Relaxed);
+    let destination = id_at(destination.id().0).map_or(Value::Nil, Value::Object);
+    // SAFETY: the platform copied the runs, so they lie in guest RAM a live lease holds
+    // (`os::ram_over`), mapped while the lease lives.
+    let (args, n) = unsafe { guest_ram_args(destination, runs) };
+    state.stats.guest_ram_bytes.fetch_add(n, Ordering::Relaxed);
+    if let Some(call) = a.pending.as_mut() {
+        call.args = args;
+    }
+}
+
+/// A copy's arguments from the guest's RAM it reads, `[destination, [[byte, bytes], …]]`, each
+/// run's bytes read now, and how many bytes they are.
+///
+/// # Safety
+///
+/// Each run is host memory mapped for the call.
+unsafe fn guest_ram_args(
+    destination: Value,
+    runs: impl Iterator<Item = (u64, std::ops::Range<u64>)>,
+) -> (Vec<Value>, u64) {
+    let mut pieces = Vec::new();
+    let mut total = 0;
+    for (byte, run) in runs {
+        let n = usize::try_from(run.end.saturating_sub(run.start)).unwrap_or(0);
+        let mut data = vec![0u8; n];
+        if n > 0 {
+            // SAFETY: the run is mapped (the caller's contract); the bytes are the guest's, which
+            // its CPU may write meanwhile, as a copy of bytes tolerates.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    HostPtr::from_addr(usize::try_from(run.start).unwrap_or(0)).as_ptr::<u8>(),
+                    data.as_mut_ptr(),
+                    n,
+                );
+            }
+        }
+        total += n as u64;
+        pieces.push(Value::List(vec![Value::Uint(byte), Value::Bytes(data)]));
+    }
+    (vec![destination, Value::List(pieces)], total)
+}
+
 /// Before `didModifyRange:` of a `Managed` buffer: the range's bytes, as a write.
 pub fn before_modify(active: &Option<Active>, buffer: &VulkanBuffer, range: &NsRange) {
     let Some(a) = active else { return };
@@ -775,6 +839,8 @@ struct Stats {
     bytes: AtomicU64,
     commits: AtomicU64,
     presents: AtomicU64,
+    /// Bytes of the guest's RAM read for copies out of it ([`guest_ram_source`]).
+    guest_ram_bytes: AtomicU64,
     wait_ns: AtomicU64,
     capture_ns: AtomicU64,
     waits: AtomicU64,
@@ -885,6 +951,7 @@ impl State {
         line(&mut out, "bytes", &s.bytes);
         line(&mut out, "commits", &s.commits);
         line(&mut out, "presents", &s.presents);
+        line(&mut out, "guest_ram_bytes", &s.guest_ram_bytes);
         line(&mut out, "wait_ns", &s.wait_ns);
         line(&mut out, "capture_ns", &s.capture_ns);
         line(&mut out, "waits", &s.waits);
@@ -1643,6 +1710,55 @@ fn hash64(data: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A copy out of the guest's RAM carries the bytes it reads through the stream and back, each
+    /// run with the byte it lands from: a long run as a blob, a short one inline.
+    #[test]
+    fn a_copy_from_guest_ram_carries_its_bytes() {
+        let ram: Vec<u8> = (0..=255u8).cycle().take(8192).collect();
+        let base = ram.as_ptr().addr() as u64;
+        let runs = [(16, base + 4096..base + 8192), (0, base + 8..base + 24)];
+        // SAFETY: the runs lie in `ram`, which lives through the call.
+        let (args, n) = unsafe { guest_ram_args(Value::Object(7), runs.into_iter()) };
+        assert_eq!(n, 4096 + 16);
+        let mut call = Call {
+            selector: "m2v.copyFromGuestRamAt".to_owned(),
+            receiver: 3,
+            args,
+            ..Call::default()
+        };
+        let mut stream = Stream::new();
+        stream.header();
+        for v in &mut call.args {
+            blob_long(v, &mut stream);
+        }
+        stream.call(&call);
+        let read = format::read(&stream.take(), &mut Vec::new()).unwrap();
+        let blobs: Vec<_> = read
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                format::Record::Blob(hash, data) => Some((*hash, data.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blobs.len(), 1);
+        let (hash, data) = blobs[0].clone();
+        assert_eq!(data, ram[4096..]);
+        let Some(format::Record::Call(back)) = read.records.last() else {
+            panic!("the call did not read back");
+        };
+        assert_eq!(
+            back.args,
+            vec![
+                Value::Object(7),
+                Value::List(vec![
+                    Value::List(vec![Value::Uint(16), Value::Blob(hash)]),
+                    Value::List(vec![Value::Uint(0), Value::Bytes(ram[8..24].to_vec())]),
+                ]),
+            ]
+        );
+    }
 
     /// The chunk hash tells changed bytes apart, and is never the "never held" 0
     #[test]
