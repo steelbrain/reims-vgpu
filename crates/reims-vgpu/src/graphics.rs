@@ -689,8 +689,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     );
                     let encoders = video.guest_encoders();
                     if !encoders.is_empty() {
-                        let backend =
-                            vt::VtEncoderBackend::new(Arc::clone(&video), decoder.lent_views());
+                        let backend = vt::VtEncoderBackend::new(
+                            Arc::clone(&video),
+                            decoder.lent_views(),
+                            gpu_device.clone_ref(),
+                        );
                         vt = vt.with_encoders(
                             encoders,
                             Arc::new(backend),

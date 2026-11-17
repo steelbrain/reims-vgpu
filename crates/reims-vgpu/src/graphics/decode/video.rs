@@ -102,7 +102,10 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     }
     /// An encoder of `config`, its codec one of [`Self::guest_encoders`]'; the error the guest's
     /// session is refused with where the arm cannot make it.
-    fn guest_encoder(&self, _config: &EncoderConfig) -> Result<Box<dyn GuestEncoder>, VideoError> {
+    fn guest_encoder(
+        &self,
+        _config: &EncoderConfig,
+    ) -> Result<Box<dyn GuestEncoder<P>>, VideoError> {
         Err(VideoError::Unsupported(
             "the arm encodes no guest's frames".to_owned(),
         ))
@@ -145,13 +148,13 @@ pub trait GuestDecoder: Send {
 
 /// An encoder of one codec whose source frames come in surfaces the guest lent: VideoToolbox's
 /// paravirtual encoders' (`super::super::vt`), one call at a time.
-pub trait GuestEncoder: Send {
+pub trait GuestEncoder<P: Platform>: Send {
     /// Encodes `frame` from `source`, whose top left holds the picture at the stream's size, and
     /// returns each frame that comes out, in decode order, with its own result: none while the
     /// encoder holds it back. `Err` is a frame not taken.
     fn encode(
         &mut self,
-        source: &GuestOutput<'_>,
+        source: &GuestSource<'_, P>,
         frame: &SourceFrame,
     ) -> Result<Vec<Coded<VideoError>>, VideoError>;
     /// Encodes the frames it holds back, and returns each with its own result.
@@ -160,8 +163,18 @@ pub trait GuestEncoder: Send {
     fn reconfigure(&mut self, config: &EncoderConfig) -> Result<(), VideoError>;
 }
 
-/// A surface the guest lent, as a [`GuestDecoder`] lands a picture in it, or a [`GuestEncoder`]
-/// reads a frame from it.
+/// A surface the guest lent, as a [`GuestEncoder`] reads a frame from it.
+pub struct GuestSource<'a, P: Platform> {
+    /// Its layout: its CoreVideo format, its size and its two planes.
+    pub layout: SurfaceLayout,
+    /// Its memory, the surface's first byte its first.
+    pub memory: &'a dyn DeviceMemory,
+    /// A Shared buffer of the device's over its pages, the surface's first byte its first, for
+    /// the device's GPU to read them in place; `None` where the device made none.
+    pub buffer: Option<&'a P::Buffer>,
+}
+
+/// A surface the guest lent, as a [`GuestDecoder`] lands a picture in it.
 pub struct GuestOutput<'a> {
     /// Its layout: its CoreVideo format, its size and its two planes.
     pub layout: SurfaceLayout,

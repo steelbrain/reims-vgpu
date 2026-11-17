@@ -1706,12 +1706,13 @@ Stages:
       (`kVTInvalidSessionErr`) where the host lists none. A create of a
       listed encoder, by that ID or by none, starts an encoder session
       (`paravirt`'s `encoder`): the arm encodes each source frame
-      from the surface the guest lent for it, read through the host's view
-      of its pages, and the session emits the samples, asking the guest
-      for the stream's format description first (`Efds`), then lets go of
-      the surface. `meps` lists no processor; a create of an encoder not
-      listed is answered with a refusal in its reply's `,err`, as for a
-      codec the host lacks.
+      from the surface the guest lent for it, copied by the GPU from a
+      buffer over its pages into an input surface of the encoder's (else
+      read through the host's view of the pages), and the session emits
+      the samples, asking the guest for the stream's format description
+      first (`Efds`), then lets go of the surface. `meps` lists no
+      processor; a create of an encoder not listed is answered with a
+      refusal in its reply's `,err`, as for a codec the host lacks.
       A host with no arm offers no caps and the kext publishes no service:
       the guest's VideoToolbox is then not a guest's.
     - **The host offers `VT_MESSAGES` where its arm lands decodes in the

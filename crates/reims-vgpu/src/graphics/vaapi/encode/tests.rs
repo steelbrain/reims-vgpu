@@ -7,7 +7,6 @@ use reims_vgpu_video::core::surfaces::{SurfaceError, SurfaceLayout};
 use reims_vgpu_video::vaapi::{H264Decoder, HevcDecoder, encoder_support};
 
 use reims_vgpu_vulkan::VulkanPlatform;
-use reims_vgpu_vulkan::core::platform::Handle as _;
 
 use super::*;
 
@@ -774,13 +773,20 @@ fn a_guest_encoder_encodes_the_frames_of_the_surfaces_it_is_lent() {
             settings,
             quality: Some(0.5),
         };
-        let mut guest = VaGuestEncoder::new(&display, &supports, &config).unwrap();
+        let mut guest = VaGuestEncoder::<VulkanPlatform>::new(
+            &display,
+            &supports,
+            &config,
+            Err("no GPU copies in this test".to_owned()),
+        )
+        .unwrap();
         let mut samples = Vec::new();
         for index in 0..8 {
             let (layout, memory) = guest_surface(index);
-            let source = GuestOutput {
+            let source = GuestSource {
                 layout,
                 memory: &memory,
+                buffer: None,
             };
             let frame = SourceFrame {
                 id: index as u64,
@@ -860,6 +866,121 @@ fn a_guest_encoder_encodes_the_frames_of_the_surfaces_it_is_lent() {
         }
         assert_eq!(sizes, vec![(64, 48); 8], "{profile:?}");
     }
+}
+
+/// On the driver of the runtime device's GPU, each guest encoder it answers, at each profile it
+/// encodes, at a constant QP: 6 frames of a 64x48 stream read from guest surfaces wider and
+/// taller than it, copied by the GPU (`gpu_copy`'s filler) from a buffer of the device's that
+/// holds the surface's bytes, code as the same frames read by the CPU from the surface's host
+/// bytes, sample for sample and byte for byte. A device with no GPU filler checks nothing: the
+/// test says so and ends.
+#[test]
+#[ignore = "needs a VA-API GPU: run on the VA-API host"]
+fn a_guest_encoders_frames_filled_by_the_gpu_code_as_read_by_the_cpu() {
+    use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+    use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+    use reims_vgpu_vulkan::core::raise::OnFault;
+
+    use super::super::{GpuCopies as _, gpu_copy};
+
+    let platform = Arc::new(VulkanPlatform::new());
+    crate::entry::run(|_| {
+        let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+        let node = reims_vgpu_vulkan::host_gpus::render_node_of(&device.raw).expect("a node");
+        let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
+        let display = Display::open(&node, runtime).expect("a VA display on the device's GPU");
+        let copies = gpu_copy::RuntimeCopies::new(&device);
+        if let Err(why) = copies.filler() {
+            assert!(
+                why.starts_with("the device lists no "),
+                "a GPU filler: {why}"
+            );
+            eprintln!("no GPU filler on the device, so no frame to compare: {why}");
+            return;
+        }
+        let supports: Arc<[EncoderSupport]> = encoder_support(&display).into();
+        let encoders = guest_encoders(&supports);
+        assert!(
+            !encoders.is_empty(),
+            "the driver encodes neither H.264 nor HEVC"
+        );
+        let mut frames = 0;
+        for encoder in &encoders {
+            for &profile in &encoder.profiles {
+                if profile.bit_depth() != 8 {
+                    continue;
+                }
+                let mut settings = EncoderSettings::new(profile, 64, 48);
+                settings.timescale = 90_000;
+                settings.rate_control = RateControl::ConstantQp {
+                    intra: 26,
+                    predicted: 28,
+                    bidirectional: 30,
+                };
+                let config = EncoderConfig {
+                    settings,
+                    quality: Some(0.5),
+                };
+                let open = |filler| {
+                    VaGuestEncoder::<VulkanPlatform>::new(&display, &supports, &config, filler)
+                        .expect("a guest encoder")
+                };
+                let mut by_cpu = open(Err("read by the CPU in this test".to_owned()));
+                let mut by_gpu = open(copies.filler());
+                let (mut read, mut filled) = (Vec::new(), Vec::new());
+                for index in 0..6 {
+                    let (layout, memory) = guest_surface(index);
+                    let length = memory.bytes.len() as u64;
+                    let buffer = (device.new_buffer_of_length(OnFault::Return, length, 0))
+                        .expect("no raise")
+                        .expect("a buffer");
+                    // SAFETY: the buffer's `length` host bytes, which no GPU work reaches yet.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            memory.bytes.as_ptr(),
+                            buffer.contents().as_ptr::<u8>(),
+                            memory.bytes.len(),
+                        );
+                    }
+                    let frame = SourceFrame {
+                        id: index as u64,
+                        pts: index as i64 * 3000,
+                        duration: 3000,
+                        force_key_frame: false,
+                    };
+                    let from_host = GuestSource::<VulkanPlatform> {
+                        layout: layout.clone(),
+                        memory: &memory,
+                        buffer: None,
+                    };
+                    let from_buffer = GuestSource {
+                        layout,
+                        memory: &memory,
+                        buffer: Some(&buffer),
+                    };
+                    read.extend(by_cpu.encode(&from_host, &frame).unwrap());
+                    filled.extend(by_gpu.encode(&from_buffer, &frame).unwrap());
+                    frames += 1;
+                }
+                read.extend(by_cpu.flush().unwrap());
+                filled.extend(by_gpu.flush().unwrap());
+                assert!(
+                    by_gpu.fills.said.is_empty(),
+                    "{profile:?}: frames uploaded by the CPU: {:?}",
+                    by_gpu.fills.said
+                );
+                let data = |coded: Vec<Coded<VideoError>>| -> Vec<Vec<u8>> {
+                    let samples = coded.into_iter().map(|c| c.expect("a sample").data);
+                    samples.collect()
+                };
+                let (a, b) = (data(read), data(filled));
+                assert_eq!(a.len(), 6, "{profile:?}: samples");
+                assert!(a == b, "{profile:?}: a filled frame's sample differs");
+            }
+        }
+        eprintln!("{frames} guest frames filled by the GPU coded as read by the CPU");
+        assert!(frames > 0);
+    });
 }
 
 /// A driver's answer for `profile` up to `max_width` by `max_height`, with no attribute but its

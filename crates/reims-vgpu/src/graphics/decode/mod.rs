@@ -209,8 +209,8 @@ mod work;
 pub(crate) mod worker;
 
 pub use video::{
-    Decoded, GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput, Landed,
-    PlanePages, VideoDecode, VideoEncode, VideoPlane,
+    Decoded, GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput,
+    GuestSource, Landed, PlanePages, VideoDecode, VideoEncode, VideoPlane,
 };
 
 pub(crate) use cmdbuf::Begun;
@@ -935,6 +935,30 @@ impl<P: Platform> LentViews<P> {
             memory,
             _view: Box::new(view),
         })
+    }
+
+    /// A Shared buffer of `device`'s over `view`'s pages, the surface's first byte its first,
+    /// for the device's GPU to read them in place ([`surface_pages::buffer_over`]): it holds the
+    /// view's mapping until the platform frees it. `Err` says why not: a refusal of the
+    /// platform's is not raised.
+    pub(crate) fn buffer_over(
+        &self,
+        device: &P::Device,
+        view: &LentView,
+    ) -> Result<P::Buffer, String> {
+        let surface = view
+            ._view
+            .downcast_ref::<Arc<surface_pages::SurfaceView<P>>>();
+        let surface = surface.ok_or("a view of another platform's")?;
+        let made = refusals::refusing(|| {
+            surface_pages::buffer_over(device, surface, 0, surface.length(), 0, None)
+        });
+        match made {
+            Ok(Ok(Some(buffer))) => Ok(buffer),
+            Ok(Ok(None)) => Err("the device makes no buffer over its pages".to_owned()),
+            Ok(Err(raise)) => Err(format!("the device's buffer over its pages: {raise:?}")),
+            Err(refusal) => Err(format!("the device's buffer over its pages: {refusal}")),
+        }
     }
 }
 

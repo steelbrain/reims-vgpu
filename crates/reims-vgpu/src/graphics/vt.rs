@@ -9,13 +9,15 @@
 //!
 //! Its paravirtual encoders are the arm's too ([`VtEncoderBackend`]): each session's encoder is
 //! one of the arm's [`GuestEncoder`]s, which reads each source frame from the IOSurface the guest
-//! lent for it, through a view of its pages laid out as the kext read the surface; the session
-//! emits the samples, and lets go of each frame's surface once it is encoded and emitted.
+//! lent for it, through a view of its pages laid out as the kext read the surface, and a Shared
+//! buffer of the device's over them, for the device's GPU to read them in place
+//! ([`LentViews::buffer_over`]); the session emits the samples, and lets go of each frame's
+//! surface once it is encoded and emitted.
 //!
 //! A decoder or encoder keeps the views of the last [`VIEWS_KEPT`] surfaces it used, by their
 //! runs, as VideoToolbox's pool lends the same few surfaces again and again: a view maps the
 //! guest's RAM, so a kept one never goes stale, and what the arm made of its memory (the driver's
-//! import of it) is kept with it.
+//! import of it) is kept with it, as is an encoder's buffer over it.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -33,10 +35,12 @@ use reims_vgpu_video::paravirt::{
     EncoderConfig, LentSurface, SourceFrame,
 };
 use reims_vgpu_vulkan::core::num::ToUsize as _;
-use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::{Handle as _, Platform};
 
 use super::GuestSurface;
-use super::decode::{GraphicsVideo, GuestDecoder, GuestEncoder, GuestOutput, LentView, LentViews};
+use super::decode::{
+    GraphicsVideo, GuestDecoder, GuestEncoder, GuestOutput, GuestSource, LentView, LentViews,
+};
 
 /// The views a decoder keeps, of the surfaces it landed in last.
 const VIEWS_KEPT: usize = 8;
@@ -75,33 +79,37 @@ impl<P: Platform> Backend for VtBackend<P> {
 struct VtDecoder<P: Platform> {
     decoder: Box<dyn GuestDecoder>,
     views: LentViews<P>,
-    kept: Kept,
+    kept: Kept<()>,
     /// The reasons a decode failed, each logged once.
     said: Vec<String>,
 }
 
-/// The views a decoder keeps, by their runs and bytes, the newest last.
-type Kept = VecDeque<(Vec<(u64, u64)>, u64, LentView)>;
+/// The views a decoder or encoder keeps, by their runs and bytes, the newest last, each with
+/// what it made of the view (`T`: an encoder's buffer over it).
+type Kept<T> = VecDeque<(Vec<(u64, u64)>, u64, LentView, T)>;
 
-/// The view of the surface of `length` bytes in `runs`: one of `kept`, or one `views` makes now,
-/// kept.
-fn view_of<'a, P: Platform>(
-    kept: &'a mut Kept,
+/// The view of the surface of `length` bytes in `runs`, and what was made of it: one of `kept`,
+/// or one `views` makes now, kept with `T`'s default.
+fn view_of<'a, P: Platform, T: Default>(
+    kept: &'a mut Kept<T>,
     views: &LentViews<P>,
     runs: &[(u64, u64)],
     length: u64,
-) -> Result<&'a LentView, String> {
-    let at = (kept.iter()).position(|(r, n, _)| r.as_slice() == runs && *n == length);
+) -> Result<(&'a LentView, &'a mut T), String> {
+    let at = (kept.iter()).position(|(r, n, _, _)| r.as_slice() == runs && *n == length);
     let view = match at.and_then(|at| kept.remove(at)) {
         Some(found) => found,
-        None => (runs.to_vec(), length, views.view(runs, length)?),
+        None => {
+            let view = views.view(runs, length)?;
+            (runs.to_vec(), length, view, T::default())
+        }
     };
     if kept.len() == VIEWS_KEPT {
         kept.pop_front();
     }
     kept.push_back(view);
-    let (_, _, view) = kept.back().ok_or("no view kept")?;
-    Ok(view)
+    let (_, _, view, made) = kept.back_mut().ok_or("no view kept")?;
+    Ok((view, made))
 }
 
 impl<P: Platform> VtDecoder<P> {
@@ -140,7 +148,7 @@ impl<P: Platform> BackendDecoder for VtDecoder<P> {
             &surface.runs,
             surface.surface.length,
         ) {
-            Ok(view) => view,
+            Ok((view, ())) => view,
             Err(why) => return Err(self.failed(status::VIDEO_DECODER_MALFUNCTION, why)),
         };
         let output = GuestOutput {
@@ -166,13 +174,22 @@ impl<P: Platform> BackendDecoder for VtDecoder<P> {
 pub(super) struct VtEncoderBackend<P: Platform> {
     video: Arc<dyn GraphicsVideo<P>>,
     views: LentViews<P>,
+    device: P::Device,
 }
 
 impl<P: Platform> VtEncoderBackend<P> {
     /// The backend of `video`'s guest encoders, reading source frames through views `views`
-    /// makes.
-    pub(super) fn new(video: Arc<dyn GraphicsVideo<P>>, views: LentViews<P>) -> Self {
-        Self { video, views }
+    /// makes, and buffers of `device`'s over them.
+    pub(super) fn new(
+        video: Arc<dyn GraphicsVideo<P>>,
+        views: LentViews<P>,
+        device: P::Device,
+    ) -> Self {
+        Self {
+            video,
+            views,
+            device,
+        }
     }
 }
 
@@ -202,18 +219,21 @@ impl<P: Platform> EncoderBackend for VtEncoderBackend<P> {
         Ok(Box::new(VtEncoder {
             encoder,
             views: self.views.clone(),
+            device: self.device.clone_ref(),
             kept: VecDeque::new(),
             said: Vec::new(),
         }))
     }
 }
 
-/// One session's encoder, and the views of the surfaces it read last.
+/// One session's encoder, and the views of the surfaces it read last, each with the buffer over
+/// its pages, or why there is none, once one was asked for.
 struct VtEncoder<P: Platform> {
-    encoder: Box<dyn GuestEncoder>,
+    encoder: Box<dyn GuestEncoder<P>>,
     views: LentViews<P>,
-    kept: Kept,
-    /// The reasons an encode failed, each logged once.
+    device: P::Device,
+    kept: Kept<Option<Result<P::Buffer, String>>>,
+    /// The reasons an encode failed, or a view has no buffer, each logged once.
     said: Vec<String>,
 }
 
@@ -265,10 +285,27 @@ impl<P: Platform> BackendEncoder for VtEncoder<P> {
         )
         .map_err(VideoError::Malfunction);
         let coded = match view {
-            Ok(view) => {
-                let source = GuestOutput {
+            Ok((view, buffer)) => {
+                let buffer =
+                    buffer.get_or_insert_with(|| self.views.buffer_over(&self.device, view));
+                let buffer = match buffer {
+                    Ok(buffer) => Some(&*buffer),
+                    Err(why) => {
+                        if !self.said.contains(why) {
+                            log::info!(
+                                target: "reims_vgpu::graphics::vt",
+                                "hardware video: a VideoToolbox source frame read by the CPU: \
+                                 {why}"
+                            );
+                            self.said.push(why.clone());
+                        }
+                        None
+                    }
+                };
+                let source = GuestSource {
                     layout,
                     memory: &**view.memory(),
+                    buffer,
                 };
                 self.encoder.encode(&source, frame)
             }

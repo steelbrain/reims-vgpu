@@ -61,8 +61,10 @@
 //!   (`Frame::write_to_guest`, the first way above) where the import check takes the surface's
 //!   layout and memory, else read back and copied by the CPU into the surface's pages.
 //! - **VideoToolbox's paravirtual encoders** (`encode::VaGuestEncoder`, `super::vt`): an arm64
-//!   guest's encoder reads each source frame from the IOSurface its kext lent, through the host's
-//!   view of its pages, and the VA crate's encoder uploads it.
+//!   guest's encoder reads each source frame from the IOSurface its kext lent: copied by the
+//!   runtime device's GPU from a buffer over its pages into an input surface of the encoder's,
+//!   as an x86 guest's frames are (`encode`'s module doc), else through the host's view of its
+//!   pages, which the VA crate's encoder uploads.
 //! - **The layout** ([`layout`]) is granularity [2, 2], so that each plane holds the crop's
 //!   even rows and columns, and the alignment the import check found for the codec's formats;
 //!   all zero where it found none.
@@ -336,8 +338,15 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
         encode::guest_encoders(&self.encoders)
     }
 
-    fn guest_encoder(&self, config: &EncoderConfig) -> Result<Box<dyn GuestEncoder>, VideoError> {
-        let encoder = encode::VaGuestEncoder::new(&self.display, &self.encoders, config)?;
+    fn guest_encoder(
+        &self,
+        config: &EncoderConfig,
+    ) -> Result<Box<dyn GuestEncoder<P>>, VideoError> {
+        let filler = match self.copies.as_ref() {
+            Some(copies) => copies.filler(),
+            None => Err("the platform makes no GPU copies".to_owned()),
+        };
+        let encoder = encode::VaGuestEncoder::new(&self.display, &self.encoders, config, filler)?;
         Ok(Box::new(encoder))
     }
 

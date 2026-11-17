@@ -27,10 +27,13 @@
 //! - **VideoToolbox's paravirtual encoders** (`VaGuestEncoder`, `super::super::vt`): an arm64
 //!   guest's encoders, one for each codec the driver encodes a profile of ([`guest_encoders`]),
 //!   whose settings the guest's session properties make, `Quality` onto the quality levels as
-//!   `quality` maps. Each source frame is read from the host's view of the IOSurface the guest
-//!   lent, which the VA crate's encoder uploads. A change of the bitrate, frame rate or
-//!   key-frame interval goes to the encoder from the next frame; one that makes a new sequence
-//!   makes a new encoder before the first frame and is refused after it.
+//!   `quality` maps. Each source frame reaches the encoder as an x86 guest's frame does: copied by
+//!   the runtime device's GPU from a Shared buffer over the IOSurface's pages, which the guest
+//!   lent, into an input surface of the encoder's; else, and where the copy is declined (said
+//!   once a session), from the host's view of the pages, which the VA crate's encoder uploads.
+//!   A change of the bitrate, frame rate or key-frame interval goes to the encoder from the next
+//!   frame; one that makes a new sequence makes a new encoder before the first frame and is
+//!   refused after it.
 
 use std::sync::Arc;
 
@@ -53,14 +56,14 @@ use reims_vgpu_video::core::backend::DeviceWrite;
 use reims_vgpu_video::core::surfaces::PlaneLayout;
 use reims_vgpu_video::paravirt::{Codec, Encoder, EncoderConfig, SourceFrame};
 use reims_vgpu_video::vaapi::{Capabilities, Display, EncoderSupport, InputSurface, VideoEncoder};
-use reims_vgpu_vulkan::core::num::ToUsize as _;
-use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::num::{ToU64 as _, ToUsize as _};
+use reims_vgpu_vulkan::core::platform::{Handle as _, Platform};
 use reims_vgpu_vulkan::core::sync::Mutex;
 
-use super::super::decode::{GuestEncoder, GuestOutput};
+use super::super::decode::{GuestEncoder, GuestSource};
 use super::super::video_host::{
     BackendError, EncodeFrame, EncodeSource, Encoded, FrameSource, HostEncodedFrame, HostEncoder,
-    SourcePlane,
+    OutputPlane, SourcePlane,
 };
 use super::{GpuFiller, H264_TOP_LEVEL, HEVC_TOP_LEVEL, MIN_SIZE, NAME};
 
@@ -727,7 +730,7 @@ pub(super) fn guest_encoders(supports: &[EncoderSupport]) -> Vec<Encoder> {
 
 /// A VideoToolbox paravirtual encoder on the VA crate's `VideoEncoder` (module doc), its source
 /// frames read from the surfaces the guest lends.
-pub(super) struct VaGuestEncoder {
+pub(super) struct VaGuestEncoder<P: Platform> {
     display: Display,
     /// The quality range of each profile the driver encodes.
     ranges: Vec<(EncodeProfile, Option<u32>)>,
@@ -736,14 +739,18 @@ pub(super) struct VaGuestEncoder {
     /// Whether a frame was encoded: until then, settings that make a new sequence make a new
     /// encoder.
     encoded: bool,
+    /// What writes its source frames into the encoder's input surfaces on the GPU (module doc).
+    fills: Fills<P>,
 }
 
-impl VaGuestEncoder {
-    /// An encoder of `config` on `display`, whose driver encodes `supports`.
+impl<P: Platform> VaGuestEncoder<P> {
+    /// An encoder of `config` on `display`, whose driver encodes `supports`, its frames written
+    /// into its input surfaces by `filler` where it is given (or why not).
     pub(super) fn new(
         display: &Display,
         supports: &[EncoderSupport],
         config: &EncoderConfig,
+        filler: Result<Box<dyn GpuFiller<P>>, String>,
     ) -> Result<Self, VideoError> {
         let ranges: Vec<_> = (supports.iter())
             .map(|s| (s.profile, s.capabilities.quality_range))
@@ -756,7 +763,74 @@ impl VaGuestEncoder {
             encoder,
             settings,
             encoded: false,
+            fills: Fills {
+                filler,
+                said: Vec::new(),
+                failed: Vec::new(),
+            },
         })
+    }
+
+    /// The frame of `times` encoded from `planes`, the source surface's luma and chroma in
+    /// `buffer`, over its pages, copied by the GPU into an input surface of the encoder's
+    /// (module doc); `None` where the copy was declined, nothing written, which is said once a
+    /// session. `Err` where the encode failed, or the copy failed once on the GPU.
+    fn filled(
+        &mut self,
+        buffer: &P::Buffer,
+        planes: [&PlaneLayout; 2],
+        times: &InputFrame<'_>,
+    ) -> Result<Option<Vec<Coded<reims_vgpu_video::vaapi::Error>>>, VideoError> {
+        let declined = match &mut self.fills.filler {
+            Ok(filler) => match self.encoder.input_surface() {
+                Ok(surface) => {
+                    let (width, height) = (self.settings.width, self.settings.height);
+                    let sample = self.settings.input_format().bytes_per_sample();
+                    let sample = u32::try_from(sample).unwrap_or(0);
+                    // A plane of `w` samples (a chroma plane's of two each) by `h` rows.
+                    let plane = |plane: &PlaneLayout, w: u32, h: u32, samples: u32| OutputPlane {
+                        buffer: buffer.clone_ref(),
+                        offset: plane.offset.to_u64(),
+                        bytes_per_row: plane.bytes_per_row.to_u64(),
+                        row_bytes: u64::from(w) * u64::from(samples * sample),
+                        width: u64::from(w),
+                        height: u64::from(h),
+                        rows_held: plane.height.into(),
+                        cached: false,
+                        host: None,
+                        pages: None,
+                        cache: None,
+                    };
+                    let luma = plane(planes[0], width, height, 1);
+                    let chroma = plane(planes[1], width / 2, height / 2, 2);
+                    match filler.fill(&surface, &luma, &chroma, (width, height), sample) {
+                        Ok(DeviceWrite::Written) => {
+                            let coded = (self.encoder.encode_surface(surface, times))
+                                .map_err(super::video_error)?;
+                            return Ok(Some(coded));
+                        }
+                        Ok(DeviceWrite::Declined(why)) => format!("the GPU's copy: {why}"),
+                        // The GPU may write the surface still: it stays out of the pool, and the
+                        // session's frames are uploaded from here on.
+                        Err(error) => {
+                            self.fills.failed.push(surface);
+                            self.fills.filler = Err(format!("the GPU's copy failed: {error}"));
+                            return Err(VideoError::Malfunction(error.to_string()));
+                        }
+                    }
+                }
+                // The driver's surfaces export so for none of its frames: the session's frames
+                // are uploaded from here on.
+                Err(why) => {
+                    let why = format!("no input surface for the GPU's copy: {why}");
+                    self.fills.filler = Err(why.clone());
+                    why
+                }
+            },
+            Err(why) => why.clone(),
+        };
+        self.fills.uploaded_because(declined);
+        Ok(None)
     }
 }
 
@@ -798,10 +872,10 @@ fn guest_coded(coded: Vec<Coded<reims_vgpu_video::vaapi::Error>>) -> Vec<Coded<V
         .collect()
 }
 
-impl GuestEncoder for VaGuestEncoder {
+impl<P: Platform> GuestEncoder<P> for VaGuestEncoder<P> {
     fn encode(
         &mut self,
-        source: &GuestOutput<'_>,
+        source: &GuestSource<'_, P>,
         frame: &SourceFrame,
     ) -> Result<Vec<Coded<VideoError>>, VideoError> {
         let layout = &source.layout;
@@ -827,9 +901,7 @@ impl GuestEncoder for VaGuestEncoder {
                 layout.planes.len()
             )));
         };
-        let view = (source.memory.host_view())
-            .map_err(|error| VideoError::Malfunction(error.to_string()))?;
-        // Luma's bytes run to chroma's first, chroma's to the view's end: each plane the
+        // Luma's bytes run to chroma's first, chroma's to the surface's end: each plane the
         // encoder's rows of at least the stream's size, at the plane's pitch.
         let sample = format.bytes_per_sample();
         let holds = |plane: &PlaneLayout, bytes: usize, rows: u32, row_bytes: usize| {
@@ -841,23 +913,43 @@ impl GuestEncoder for VaGuestEncoder {
                     .is_some_and(|n| n <= bytes)
         };
         let (width, height) = (self.settings.width.to_usize(), self.settings.height);
-        let y_at = view.offset.checked_add(luma.offset);
-        let uv_at = view.offset.checked_add(chroma.offset);
-        let (Some(y_at), Some(uv_at)) = (y_at, uv_at) else {
-            return Err(VideoError::Unsupported("planes past the view".to_owned()));
-        };
-        if !(y_at < uv_at && uv_at < view.size)
-            || !holds(&luma, uv_at - y_at, height, width * sample)
-            || !holds(&chroma, view.size - uv_at, height / 2, width * sample)
+        let length = source.memory.length();
+        if !(luma.offset < chroma.offset && chroma.offset < length)
+            || !holds(&luma, chroma.offset - luma.offset, height, width * sample)
+            || !holds(&chroma, length - chroma.offset, height / 2, width * sample)
         {
             return Err(VideoError::Unsupported(
                 "a source whose planes do not hold the stream's picture".to_owned(),
             ));
         }
+        let none = Plane {
+            data: &[],
+            bytes_per_row: 0,
+        };
+        let times = InputFrame {
+            planes: [none, none],
+            pts: frame.pts,
+            duration: frame.duration,
+            force_key_frame: frame.force_key_frame,
+            id: frame.id,
+        };
+        if let Some(buffer) = source.buffer
+            && let Some(coded) = self.filled(buffer, [&luma, &chroma], &times)?
+        {
+            self.encoded = true;
+            return Ok(guest_coded(coded));
+        }
+        let view = (source.memory.host_view())
+            .map_err(|error| VideoError::Malfunction(error.to_string()))?;
+        let y_at = view.offset.checked_add(luma.offset);
+        let uv_at = view.offset.checked_add(chroma.offset);
+        let (Some(y_at), Some(uv_at)) = (y_at, uv_at) else {
+            return Err(VideoError::Unsupported("planes past the view".to_owned()));
+        };
         // SAFETY: the view's `size` bytes from `first` are the host's mapping of the surface's
         // pages, which `view.hold` keeps mapped until it drops after the encode; the guest's
         // kext holds the surface lent, its pages wired, until the host's `rels`, sent once the
-        // frame is encoded and emitted. Both planes lie inside the view (checked above).
+        // frame is encoded and emitted. Each plane is taken of the view's bytes by `get`.
         let all = unsafe { std::slice::from_raw_parts(view.first.as_ptr(), view.size) };
         let (Some(y), Some(uv)) = (all.get(y_at..uv_at), all.get(uv_at..)) else {
             return Err(VideoError::Unsupported("planes past the view".to_owned()));
@@ -873,10 +965,7 @@ impl GuestEncoder for VaGuestEncoder {
                     bytes_per_row: chroma.bytes_per_row,
                 },
             ],
-            pts: frame.pts,
-            duration: frame.duration,
-            force_key_frame: frame.force_key_frame,
-            id: frame.id,
+            ..times
         };
         let coded = self.encoder.encode(&input).map_err(super::video_error)?;
         drop(view);
