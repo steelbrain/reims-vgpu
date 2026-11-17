@@ -2276,12 +2276,13 @@ only where no negotiation can carry it.
   so the buffer waits at the gate for no range message on ring 0: no command
   buffer committed before it uses a chunk it names, as the bundle gives a
   chunk back only once the buffer that used it has completed. A record of an
-  object that is no Managed buffer, or of bytes past one, fails the buffer,
-  and none of its records is carried out. Every host offers it, and both kexts
-  take it; the bundle names the bytes there where its chunks are Managed (the
-  device answers `hasUnifiedMemory` NO), and else, on a host that did not
-  offer it, sends a `BUFFER_DID_MODIFY_RANGE` of each chunk ahead of the
-  buffer, as before the bit.
+  object that is no Managed buffer, or of bytes past one, is dropped (logged
+  once), as a range message the host refuses is, and the buffer runs, the
+  same whether or not it was answered at its doorbell. Every host
+  offers the bit, and both kexts take it. The bundle names the bytes there
+  where its chunks are Managed (the device answers `hasUnifiedMemory` NO), and
+  on a host that did not offer the bit it sends a `BUFFER_DID_MODIFY_RANGE` of
+  each chunk ahead of the buffer, as before the bit.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed

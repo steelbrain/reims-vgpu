@@ -219,6 +219,20 @@ fn in_place_shape(create: &RgfxManagedTextureCreate) -> bool {
         && d.sample_count <= 1
 }
 
+/// Logs, the first time, an `UPLOADS_WRITTEN` record the host drops: `what` it does wrong.
+fn log_upload_dropped(w: &RgfxUploadWritten, what: &str) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::warn!(
+            target: "reims_vgpu::graphics",
+            "an UPLOADS_WRITTEN record of object {:#x}, {} bytes, {what}: dropped, and its \
+             command buffer runs (logged once)",
+            w.buffer_obj_id,
+            w.length
+        );
+    }
+}
+
 /// Logs, the first time, a `Managed` texture of a shape that lies over its CPU copy on a GPU that
 /// shares the CPU's memory, whose texture over its CPU copy's buffer the platform refused: it is
 /// two copies, and the guest, which knows the shape alone, reads its CPU copy, which shows the
@@ -567,11 +581,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `didModifyRange:` of each buffer's bytes from its start, which brings them to its GPU copy
     /// by the buffer's commit, at once, as the buffer's own chunks are used by no command buffer
     /// committed before it (the module doc). A buffer whose create the host refused holds
-    /// nothing to bring over ([`super::refused`]). A bad reference for an object that is no
-    /// `Managed` buffer, malformed for bytes past it, each before any is carried out; a raise of
-    /// the platform's is logged, and the rest are carried out, as a range message's is.
-    pub(super) fn uploads_written(&self, written: &[RgfxUploadWritten]) -> Result<(), DecodeError> {
-        let mut buffers = Vec::with_capacity(written.len());
+    /// nothing to bring over ([`super::refused`]). A record of an object that is no `Managed`
+    /// buffer, or of bytes past one, is dropped (logged once), and so is one the platform raises
+    /// at (logged), as a range message the host refuses or cannot carry out is, and the buffer
+    /// runs, as it would behind such a message, the same whether or not it was answered at its
+    /// doorbell before its begin.
+    pub(super) fn uploads_written(&self, written: &[RgfxUploadWritten]) {
         for w in written {
             if let Some(ObjHandle::Refused(r)) = self.named(w.buffer_obj_id) {
                 r.used(w.buffer_obj_id);
@@ -581,17 +596,17 @@ impl<P: Platform> GraphicsDecoder<P> {
                 self.named(w.buffer_obj_id),
                 self.managed_copy(w.buffer_obj_id),
             ) else {
-                return Err(DecodeError::BadReference);
+                log_upload_dropped(w, "names no Managed buffer");
+                continue;
             };
             if copy.layout.is_some() || w.length > copy.length {
-                return Err(DecodeError::Malformed);
+                log_upload_dropped(w, "reaches past its Managed buffer");
+                continue;
             }
-            if w.length != 0 {
-                buffers.push((w.buffer_obj_id, buffer.clone_ref(), w.length));
+            if w.length == 0 {
+                continue;
             }
-        }
-        for (obj_id, buffer, length) in buffers {
-            let range = NsRange::new(0, length);
+            let (obj_id, range) = (w.buffer_obj_id, NsRange::new(0, w.length));
             if let Err(raise) = refusing(|| buffer.did_modify_range(OnFault::Return, range)) {
                 log::warn!(
                     target: "reims_vgpu::graphics", kind:% = raise;
@@ -600,7 +615,6 @@ impl<P: Platform> GraphicsDecoder<P> {
                 );
             }
         }
-        Ok(())
     }
 
     /// Whether a `Managed` object `name` makes may take the CPU copy that lies over `span` (its

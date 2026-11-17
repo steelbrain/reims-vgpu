@@ -1799,9 +1799,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         // The bytes it wrote in its `Managed` chunks reach their GPU copies by its commit, before
         // its work, as a range message of each before it would bring them.
-        if let Err(e) = self.uploads_written(&take.written) {
-            return Ok(Err(e));
-        }
+        self.uploads_written(&take.written);
         let Some(cb) = queue.command_buffer(ON)? else {
             return Ok(Err(DecodeError::Refused));
         };
