@@ -165,8 +165,8 @@ public:
 	/// not taken: true means pump again before sleeping. False for a ringless reader.
 	/// A ring armed by an earlier call that found nothing, whose `producer` has not moved
 	/// since, is armed still, as the host clears `armed` only as it publishes a record: then
-	/// only `producer` is read, as the region's header is uncached memory to the guest and a
-	/// store there costs more than a load (RgfxRegion.hpp).
+	/// only `producer` is read, as the region's header is uncached memory to the guest under
+	/// xnu's PAT and a store there costs more than a load (RgfxRegion.hpp).
 	bool armAndCheck();
 
 	/// Whether the ring holds, among the records not yet taken, the host's word that the command

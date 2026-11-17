@@ -3,9 +3,10 @@
  * ICB_SLOTS (crates/reims-vgpu-graphics/src/icb.rs, "Slots"): in a chunked pages block of the
  * kext's (RgfxRegion::acquireChunkedPages) where the host also took ICB_SLOTS_IN_PAGES, memory of
  * the process's own that its kernel maps cached and the host reads in place, else in a block of the
- * process's region. The region is uncached in the guest of an AMD host
- * (docs/graphics-kext/design.md, "The BAR is one host memory region"), so each of a setter's stores
- * and atomic ORs into a region block is an uncached access there, and its slots are only the
+ * process's region. The region is uncached in the guest of an AMD host under xnu's PAT, and
+ * write-back once the x86-64 kext sets the PAT's entry 2 (guest/kext/src/RgfxPat.hpp;
+ * docs/graphics-kext/design.md, "The BAR is one host memory region"); uncached, each of a setter's
+ * stores and atomic ORs into a region block is an uncached access, and its slots are only the
  * fallback where no chunked pages block is given. Each command has a slot of its own, `stride`
  * bytes from the next; a setter writes its field there and sets the field's bit in the slot's mask
  * with an atomic OR, as a GPU's driver writes a command's record into memory the GPU reads, and

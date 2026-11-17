@@ -8,7 +8,8 @@
  * BUFFER_OVER_HOST_MEMORY on ring 0 when the chunk is made, none after); Shared, or Managed on a
  * GPU of its own memory (below). The host sees a Shared chunk in place, so the bytes are copied
  * once, into the chunk, and never again. The pages first: the
- * region is mapped uncached in the guest, which an AMD host applies (RgfxRegion.hpp). A command
+ * region is mapped uncached in the guest under xnu's PAT, which an AMD host applies, until the
+ * x86-64 kext sets the PAT's entry 2 to write-back (RgfxRegion.hpp). A command
  * buffer holds one RgfxUploadArena: it takes chunks from its queue's pool as its encoders need
  * room, packs each call's bytes at the next 256-byte boundary (the largest constant-buffer
  * offset alignment of the host GPUs, Metal's included), and gives the chunks back to the pool

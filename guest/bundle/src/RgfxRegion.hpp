@@ -26,16 +26,18 @@
  * aligned to a cache line so the ring header's 64-byte lines never share one; resource
  * blocks default to a page so a block can later back a mapping.
  *
- * WRITE-COMBINED PARTS. The region is no RAM of the guest's, so the kernel maps it uncached
- * whatever the kext asks for write-back (xnu's pmap sets PCD on every page it does not manage),
- * and an AMD host applies the guest's memory type: plain stores there cost about 0.3 us per
- * 4 bytes. Where the kext maps part of a block write-combined (setWriteCombinedSource,
+ * WRITE-COMBINED PARTS. The region is no RAM of the guest's, so the kernel maps a write-back ask of
+ * it through the guest PAT's entry 2 (xnu's pmap sets PCD on every page it does not manage), which
+ * xnu's PAT holds UC-, and an AMD host or Windows' hypervisor applies the guest's memory type:
+ * plain stores there cost about 0.3 us per 4 bytes. The x86-64 kext sets that entry to write-back
+ * on every CPU at its start (guest/kext/src/RgfxPat.hpp), so a write-back ask is write-back from
+ * then on. Where the kext maps part of a block write-combined (setWriteCombinedSource,
  * kRgfxKextFeatureWriteCombined), the bytes the process only writes take that part: a submission
  * ring's data (allocateRingPair, its header alone in the page before it), command buffers' bodies
- * and a library's staging chunks (allocate's `writeCombinedFrom`). Write-combined stores are
- * weakly ordered: the ring writer fences them (sfence) before it publishes a message that names
- * them, and a lock or a fence orders them for another thread, as for any store. The process never
- * reads them back, nor takes an atomic there: loads there are uncached, and a locked operation on
+ * and a library's staging chunks (allocate's `writeCombinedFrom`). Write-combined stores are weakly
+ * ordered: the ring writer fences them (sfence) before it publishes a message that names them, and
+ * a lock or a fence orders them for another thread, as for any store. The process never reads them
+ * back, nor takes an atomic there: loads there are uncached, and a locked operation on
  * write-combined memory is not atomic.
  *
  * Our own code; depends only on the committed wire header. In a unit test the region

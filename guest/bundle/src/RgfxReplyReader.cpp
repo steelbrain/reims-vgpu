@@ -414,7 +414,7 @@ uint32_t RgfxReplyReader::pump()
 			m_consumed += size;
 		}
 		// Publish the consumer count so the host's producer sees the room freed, where it moved:
-		// the header is uncached memory to the guest (RgfxRegion.hpp).
+		// the header is device memory, uncached to the guest under xnu's PAT (RgfxRegion.hpp).
 		if (m_consumed != taken)
 			store64(m_header + kConsumer, m_consumed);
 	}

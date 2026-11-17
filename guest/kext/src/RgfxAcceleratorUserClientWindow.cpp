@@ -161,8 +161,9 @@ IOReturn RgfxAcceleratorUserClient::mapSpan(UInt64 offset, UInt64 length, bool w
 	} else {
 		const UInt64 start = mach_absolute_time();
 		// The region's bytes over the window's: write-back as asked, which xnu's x86-64 pmap
-		// maps uncached for a page it does not manage (PCD, the guest PAT's UC-) and its arm64
-		// pmap maps Normal write-back, or write-combined (PCD and PAT, the guest PAT's WC).
+		// maps through the guest PAT's entry 2 for a page it does not manage (PCD), write-back
+		// as the kext set it (RgfxPat.hpp), and its arm64 pmap maps Normal write-back; or
+		// write-combined (PCD and PAT, the guest PAT's WC).
 		const IOOptionBits cache = combined ? kIOMapWriteCombineCache : kIOMapCopybackCache;
 		IOMemoryMap *map = region->createMappingInTask(task, windowBase + offset,
 		                                               kIOMapOverwrite | cache, offset, length);

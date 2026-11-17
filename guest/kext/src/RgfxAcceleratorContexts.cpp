@@ -1279,9 +1279,9 @@ IOReturn RgfxAccelerator::allocBlock(RgfxAcceleratorUserClient *owner, UInt32 co
 		// ring or a queue's. The block is pinned until then, so no free overtakes either. Its
 		// bytes from `writeCombinedFrom` are the ones the process only writes (a submission
 		// ring's data, command buffers' bodies, a library's staging chunks), mapped
-		// write-combined: an AMD host applies the guest's memory type, and the region's pages,
-		// which are no RAM of the guest's, are mapped uncached for any other ask (xnu's pmap
-		// sets PCD on every page it does not manage). The process fences its stores before it
+		// write-combined, the rest write-back: on x86-64 through the guest PAT's entry 2, which
+		// xnu's pmap gives every page it does not manage (PCD) for any other ask, and which the
+		// kext sets to write-back (RgfxPat.hpp). The process fences its stores before it
 		// publishes them.
 		const UInt64 combined = rgfxWindowWriteBackPart(size, bytes, writeCombinedFrom);
 		IOReturn posted = combined ? owner->mapSpan(pin.offset, combined) : kIOReturnSuccess;

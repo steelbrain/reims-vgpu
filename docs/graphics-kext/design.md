@@ -127,17 +127,30 @@ Stages:
    - The BAR is one host memory region that the device reserves at start and
      registers with KVM once. Blocks are ranges inside it, so making or
      freeing a block never changes the VM's memory map. It is ordinary
-     cached memory on the host, but the guest's kernel maps it uncached
-     wherever the kext asks for write-back: xnu's pmap sets PCD on every page
-     it does not manage (its PAT's UC-), and the region is no RAM of the
-     guest's. A write-combined ask takes, since the region's descriptor is
-     physically contiguous and xnu's fault path maps such an object's pages
-     in its own mode (read from the public xnu source: vm_fault's
-     `pmap_map_block_addr`). An AMD
-     host applies the guest's memory type, where an Intel host's EPT ignores
-     it: measured on the Radeon 780M host, the guest's stores there ran at
-     13 MB/s and its loads at 8 to 180 MB/s, against 5.6 to 123 GB/s in its
-     own RAM. Uncached loads cost 79-138 ns against 2-4 ns cached. So what
+     cached memory on the host, and the guest maps it write-back where the
+     kext asks for write-back. xnu's x86-64 pmap gives every page it does
+     not manage, and the region is no RAM of the guest's, PAT entry 2 for
+     any ask but write-combined (it sets PCD), and xnu's PAT holds UC-
+     there. An AMD host's nested paging and Windows' hypervisor (WHP) apply
+     the guest's memory type, where KVM on an Intel host ignores it for
+     RAM-backed pages. So the x86-64 kext sets entry 2 to write-back on
+     every CPU at its start, entry 6 left write-combining as xnu sets it,
+     and again at each wake (`guest/kext/src/RgfxPat.hpp`, which lists what
+     else entry 2 covers: device registers the host traps, where no memory
+     type reaches a device, and RAM a driver asks uncached). xnu writes the
+     PAT again only at a CPU's start and at a wake, and keeps a PAT whose
+     entry 6 is write-combining; a CPU taken offline and back online keeps
+     its PAT under KVM and WHP. Measured on 26.7.2 guests through entry 2:
+     43-46 GB/s for stores and loads on AMD KVM (the Radeon 780M host) and
+     16.5/8.8 GB/s on WHP (the UHD 630 Mac mini) with the rewrite, against
+     78-202 MB/s without it; Intel KVM runs at write-back speed either way.
+     The rewrite takes 10.7-22.6 us a CPU. A write-combined ask takes, since
+     the region's descriptor is physically contiguous and xnu's fault path
+     maps such an object's pages in its own mode (read from the public xnu
+     source: vm_fault's `pmap_map_block_addr`). With entry 2 UC-, measured
+     on the Radeon 780M host, the guest's stores there ran at 13 MB/s and
+     its loads at 8 to 180 MB/s, against 5.6 to 123 GB/s in its own RAM, and
+     uncached loads cost 79-138 ns against 2-4 ns cached. So what
      the CPU touches most lies in the process's own pages instead (its Shared
      and Managed buffers' slabs and its upload chunks, "Managed storage", and
      its indirect command buffers' slots, `ICB_SLOTS_IN_PAGES`),
@@ -155,9 +168,10 @@ Stages:
      to take it back (`RgfxAccelerator::copyWriteCombinedRegion`).
      The kext writes ring 0's submit data the same way on x86-64: the
      data's whole 4 KiB pages past its header's, through a write-combined
-     map of a descriptor of their own, the header's page uncached
-     (`RgfxControlRing.hpp`). A write-combined store is ordered with no
-     later store, so the kext fences its stores (SFENCE) before it stores
+     map of a descriptor of their own, the header's page in the rings'
+     write-back map (`RgfxControlRing.hpp`). A write-combined store is
+     ordered with no later store, so the kext fences its stores (SFENCE)
+     before it stores
      the producer: the host never sees the producer before the data it
      covers. arm64 maps no write-combined part, and its release store of the
      producer orders the data's stores before it. `control_ring_test` holds
@@ -2211,8 +2225,10 @@ only where no negotiation can carry it.
   nothing without `ICB_SLOTS` and `PAGES_BUFFERS`: an indirect command
   buffer's slots may lie in the pages of a pages block of the process's, its
   own memory, rather than in a block of the region, which the guest's kernel
-  maps uncached on an AMD host. Ring 0 carries `ICB_SLOTS_IN_PAGES` (0x23a,
-  `RgfxIcbSlots` then `RgfxIcbSlotPagesRun`s: an `ICB_SLOTS` run whose first
+  maps uncached on an AMD host under xnu's PAT (write-back once the kext
+  sets the PAT's entry 2: "The BAR is one host memory region"). Ring 0
+  carries `ICB_SLOTS_IN_PAGES` (0x23a, `RgfxIcbSlots` then
+  `RgfxIcbSlotPagesRun`s: an `ICB_SLOTS` run whose first
   slot lies `pages_offset` bytes into the pages of the pages block at
   `block_offset`), which the host reads and takes in place, in the guest's RAM
   for a block of one run and in the block's view for one of more. The bundle
@@ -3035,9 +3051,11 @@ own 64-byte line:
   the 1 undoes nothing of the guest's. The fix is the host's alone: no kext or
   bundle changes, and ring 0's completion ring takes it too.
 - The completion thread's arm, once. The header is uncached memory to the
-  guest on an AMD host, so the completion thread writes it only where
-  something changed (`RgfxReplyReader::armAndCheck`): a ring its last arm
-  found empty, from which it has taken nothing since, it does not arm again
+  guest on an AMD host under xnu's PAT (write-back once the kext sets the
+  PAT's entry 2: "The BAR is one host memory region"), so the completion
+  thread writes it only where something changed
+  (`RgfxReplyReader::armAndCheck`): a ring its last arm found empty, from
+  which it has taken nothing since, it does not arm again
   while `producer` reads as it did then, as the host clears `armed` only in a
   post, after its publish; and a pump that took nothing leaves `consumer` as
   it was.

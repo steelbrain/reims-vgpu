@@ -275,8 +275,9 @@ struct RgfxPagesMemory {
 /// waits for the device's answer), then its plain pages; chunks go with the release.
 ///
 /// Why the process's own pages: the region is no RAM of the guest's, which the kernel maps
-/// uncached, as an AMD host applies (13 MB/s for a process's stores there, against 56 to 123 GB/s
-/// in a superpage of its own RAM; RgfxRegion.hpp).
+/// uncached under xnu's PAT, as an AMD host applies (13 MB/s for a process's stores there, against
+/// 56 to 123 GB/s in a superpage of its own RAM; RgfxRegion.hpp), until the x86-64 kext sets the
+/// PAT's entry 2 to write-back at its start.
 ///
 /// Why plain pages, never superpages: the kernel's 2 MiB superpages, each one run of RAM, run out
 /// within minutes of a boot (measured on an x86-64 macOS 26.7.2 guest of 8 GiB: 19 for one

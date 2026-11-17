@@ -4,15 +4,17 @@
 // region (`Words`, ReimsGraphics's), so the native tests (tests/control_ring_test.cpp, built for
 // both architectures' rules) check the order as the kext keeps it.
 //
-// The region is uncached to the guest's kernel on an AMD host (docs/graphics-kext/design.md, "The
-// region"), where a store to it runs at 13 MB/s: a SubmitBatch call, a few creates and destroys
-// posted here, took 33.6 us p50 on a 780M host against 15.2 us on an Iris Xe host, whose EPT
-// ignores the guest's memory type (measured, 11-14, Geekbench's Metal Super Resolution). Where the region's write-combined mappings are ordinary memory
-// (x86-64's, RgfxRegionMapping.hpp), the kext writes the ring's data through a write-combined
-// mapping of its own instead: the whole 4 KiB pages of the data past the header's page, which
-// stays uncached, as the header's words are the protocol's atomics and no page of it is mapped
-// write-combined. A write-combined store is ordered with no later store, so a store fence comes
-// before the producer's publish: the host never sees the producer before the data it covers.
+// The region is uncached to the guest's kernel on an AMD host under xnu's PAT, where a store to it
+// runs at 13 MB/s, until the kext sets the PAT's entry 2 to write-back at its start (RgfxPat.hpp;
+// docs/graphics-kext/design.md, "The region"): a SubmitBatch call, a few creates and destroys
+// posted here, took 33.6 us p50 on a 780M host with the region uncached against 15.2 us on an
+// Iris Xe host, whose EPT ignores the guest's memory type (measured, 11-14, Geekbench's Metal
+// Super Resolution). Where the region's write-combined mappings are ordinary memory (x86-64's,
+// RgfxRegionMapping.hpp), the kext writes the ring's data through a write-combined mapping of its
+// own: the whole 4 KiB pages of the data past the header's page, which stays in the rings'
+// write-back mapping, as the header's words are the protocol's atomics and no page of it is
+// mapped write-combined. A write-combined store is ordered with no later store, so a store fence
+// comes before the producer's publish: the host never sees the producer before the data it covers.
 // arm64 maps no write-combined part, and its release store of the producer orders the data's
 // stores before it.
 //

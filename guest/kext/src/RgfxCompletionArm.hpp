@@ -4,8 +4,9 @@
 // kernel's headers, over the kext's accesses to the ring's header (`Ring`), so the native test
 // (tests/completion_arm_test.cpp) checks the rule as the kext keeps it.
 //
-// The header is uncached memory to the guest on an AMD host (docs/graphics-kext/design.md, "The
-// region"), so the kext touches it only where something changed, as the bundle's completion thread
+// The header is uncached memory to the guest on an AMD host under xnu's PAT, and write-back once
+// the kext sets the PAT's entry 2 at its start (RgfxPat.hpp; docs/graphics-kext/design.md, "The
+// region"); the kext touches it only where something changed, as the bundle's completion thread
 // arms its queues' rings (RgfxReplyReader::armAndCheck): a take that finds nothing leaves the
 // consumer as it was, and a ring whose last arm found it empty, from which nothing has been taken
 // since, is not armed again while `producer` reads as it did then, as the host clears `armed` only

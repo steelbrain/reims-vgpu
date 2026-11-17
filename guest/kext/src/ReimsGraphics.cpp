@@ -11,6 +11,7 @@
 #include "RgfxControlRing.hpp"
 #include "RgfxDisplayPower.hpp"
 #include "RgfxFeatures.hpp"
+#include "RgfxPat.hpp"
 #include "RgfxPipeColor.hpp"
 #include "RgfxPointerDevice.hpp"
 #include "RgfxRegionMapping.hpp"
@@ -1725,6 +1726,13 @@ bool ReimsGraphics::start(IOService *provider)
 		      readRegister(RGFX_REG_VERSION), RGFX_VERSION);
 		goto fail;
 	}
+#if defined(__x86_64__)
+	// Before the region's first mapping: the guest PAT's entry 2 to write-back on every CPU, so
+	// that the region's write-back asks are write-back on AMD and Windows hosts, and again at each
+	// wake (RgfxPat.hpp).
+	rgfxPatWriteBackEverywhere("start");
+	rgfxPatWatchWakes();
+#endif
 
 	region = pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
 	if (!region) {
@@ -1944,6 +1952,10 @@ bool ReimsGraphics::start(IOService *provider)
 fail:
 	__atomic_store_n(&started, false, __ATOMIC_RELEASE);
 	stopDisplayPower();
+#if defined(__x86_64__)
+	// The PAT keeps its entry 2 write-back; no wake reapplies it once the kext's code may go.
+	rgfxPatStopWatching();
+#endif
 #if defined(__arm64e__)
 	// Nothing held is registered: the service did not start.
 	if (stateLock) {
@@ -1975,6 +1987,9 @@ void ReimsGraphics::stop(IOService *provider)
 #endif
 	stopHeads();
 	stopDisplayPower();
+#if defined(__x86_64__)
+	rgfxPatStopWatching();
+#endif
 #if defined(__arm64e__)
 	stopMobile();
 #endif
