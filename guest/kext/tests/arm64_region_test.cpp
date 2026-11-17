@@ -2,6 +2,7 @@
 // Makefile's rule for this test): a process's page is 16 KiB, so a window's span and a block are
 // whole 16 KiB pages, and no write-combined part is offered, so every span is mapped write-back.
 #include "RgfxBlockTable.hpp"
+#include "RgfxPat.hpp"
 #include "RgfxSurfaceBlocks.hpp"
 #include "RgfxWindowSpans.hpp"
 
@@ -81,6 +82,7 @@ int main()
 	      "the window and the blocks are in the process's pages");
 	check(!kRgfxRegionWriteCombines && kRgfxKextFeatureRegionWriteCombined == 0,
 	      "no write-combined part is offered");
+	check(kRgfxKextFeatureCpuPatsRead == 0, "no PAT read is offered: an arm64 CPU has none");
 	check(RGFX_ALLOCATIONS_OFFSET % kRgfxProcessPage == 0 &&
 	          RGFX_CONTEXT_ALLOCATIONS_OFFSET % kRgfxProcessPage == 0,
 	      "the region's reserved head and the scanout end on a 16 KiB page");

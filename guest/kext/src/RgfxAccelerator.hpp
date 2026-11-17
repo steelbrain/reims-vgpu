@@ -57,6 +57,7 @@
 #include "RgfxDeviceName.hpp"
 #include "RgfxDoorbellPages.hpp"
 #include "RgfxMemorySize.hpp"
+#include "RgfxPat.hpp"
 #include "RgfxRegionMapping.hpp"
 #include "RgfxUserClientABI.hpp"
 #include "reims_graphics_wire.h"
@@ -92,8 +93,9 @@ enum {
 // deferred and shared flags and TakeAnswers, OpenContext's span, shared events' ports and Alloc's
 // write-combined part, where the region's write-combined mappings are ordinary memory
 // (RgfxRegionMapping.hpp), SurfaceSeeds, which Features leaves out where IOSurface exports no
-// unlock seed (rgfxSurfaceUnlockSeedExported), SubmitBatch's publish of a queue's ring, and
-// OpenContext's doorbell page. Each bit is set by the change that lands its call.
+// unlock seed (rgfxSurfaceUnlockSeedExported), SubmitBatch's publish of a queue's ring,
+// OpenContext's doorbell page, and on x86-64 CpuPats (RgfxPat.hpp). Each bit is set by the change
+// that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeaturePagesChunked |
                                           kRgfxKextFeatureSubmitBatch |
@@ -104,7 +106,8 @@ constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeatureContextSpan |
                                           kRgfxKextFeatureSharedEvents |
                                           kRgfxKextFeatureSurfaceSeeds |
-                                          kRgfxKextFeatureRegionWriteCombined;
+                                          kRgfxKextFeatureRegionWriteCombined |
+                                          kRgfxKextFeatureCpuPatsRead;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;

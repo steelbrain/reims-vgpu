@@ -12,6 +12,7 @@
 #include "ReimsGraphics.hpp"
 #include "RgfxContextSlots.hpp"
 #include "RgfxFeatures.hpp"
+#include "RgfxPat.hpp"
 #include "RgfxRegionSpans.hpp"
 #include "RgfxSharedEventPorts.hpp"
 #include "RgfxSharedEventUserClient.hpp"
@@ -20,6 +21,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <kern/clock.h>
+#include <kern/task.h>
 #include <sys/proc.h>
 
 namespace {
@@ -106,6 +108,8 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	}
 	case kRgfxAccelMethodDeviceInfo:
 		return deviceInfoMethod(a);
+	case kRgfxAccelMethodCpuPats:
+		return cpuPatsMethod(a);
 	case kRgfxAccelMethodResourceIds: {
 		// The chunk's first id, and, where asked, how many ids it holds.
 		if (a->scalarOutputCount != 1 && a->scalarOutputCount != 2)
@@ -1108,6 +1112,41 @@ void RgfxAcceleratorUserClient::releaseContext()
 	// because an object lay in it may now be free to go.
 	if (closed == RgfxAccelerator::kCloseAnswered)
 		accel->retryRefusedBlocks();
+}
+
+// kRgfxAccelMethodCpuPats (RgfxUserClientABI.hpp): every online CPU's PAT, each read by its CPU
+// into its own entry of a record sized to the kernel's CPU count (RgfxPat.hpp), for an
+// administrator's process, as the read stops every CPU for a moment.
+IOReturn RgfxAcceleratorUserClient::cpuPatsMethod(IOExternalMethodArguments *a)
+{
+#if defined(__x86_64__)
+	if (a->scalarInputCount != 0 || a->scalarOutputCount != 3 || a->structureInputSize != 0 ||
+	    a->structureOutputDescriptor || a->structureOutputSize % sizeof(uint64_t) != 0 ||
+	    (a->structureOutputSize && !a->structureOutput))
+		return kIOReturnBadArgument;
+	if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) !=
+	    kIOReturnSuccess)
+		return kIOReturnNotPrivileged;
+	const uint32_t count = rgfxPatCpuCount();
+	const vm_size_t bytes = count * sizeof(uint64_t);
+	uint64_t *pats = count ? static_cast<uint64_t *>(IOMalloc(bytes)) : nullptr;
+	if (!pats)
+		return kIOReturnNoMemory;
+	RgfxCpuPats record = {pats, count, 0, 0};
+	rgfxPatRead(&record);
+	const uint32_t fit = static_cast<uint32_t>(a->structureOutputSize / sizeof(uint64_t));
+	const uint32_t words = fit < count ? fit : count;
+	if (words)
+		memcpy(a->structureOutput, pats, words * sizeof(uint64_t));
+	a->structureOutputSize = static_cast<uint32_t>(words * sizeof(uint64_t));
+	a->scalarOutput[0] = record.answered;
+	a->scalarOutput[1] = count;
+	a->scalarOutput[2] = record.outside;
+	IOFree(pats, bytes);
+	return kIOReturnSuccess;
+#else
+	return kIOReturnUnsupported;
+#endif
 }
 
 // kRgfxAccelMethodDeviceInfo (RgfxUserClientABI.hpp): the device info the host wrote, read from

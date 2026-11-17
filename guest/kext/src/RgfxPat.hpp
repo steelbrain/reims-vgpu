@@ -1,7 +1,9 @@
 // RgfxPat: the guest's page attribute table (IA32_PAT), whose entry 2 the x86-64 kext sets to
-// write-back on every CPU (RgfxPat.cpp). Header-only and free of the kernel's headers but for the
-// kext's own calls at its end, so the native test (tests/pat_test.cpp) builds its values as the
-// kext does. C as in C++.
+// write-back on every CPU (RgfxPat.cpp), and the record of every CPU's PAT that the accelerator's
+// user client reads out (kRgfxAccelMethodCpuPats). Header-only and free of the kernel's headers
+// but for the kext's own calls at its end, so the native test (tests/pat_test.cpp) and the guest's
+// tool (guest/bundle/tools/pat_probe.c) build its values and its record as the kext does. C as in
+// C++.
 //
 // Why entry 2. xnu's x86-64 pmap maps every page it does not manage (not its RAM: any PCI BAR)
 // with PCD set and PWT and PAT clear, which is PAT entry 2, for every cache mode but
@@ -38,6 +40,12 @@
 
 #include <stdint.h>
 
+#include "RgfxUserClientABI.hpp"
+
+#ifndef RGFX_GUEST_ARM64
+#define RGFX_GUEST_ARM64 0
+#endif
+
 // The PAT's MSR, its entries' width, and the memory types its entries take (the Intel SDM, Vol.
 // 3A, "Page Attribute Table"; AMD's APM, Vol. 2, "Page-Attribute Table Mechanism").
 #define RGFX_MSR_PAT 0x277u
@@ -52,6 +60,9 @@
 #define RGFX_PAT_WRITE_COMBINED_ENTRY 6u
 // xnu's PAT, as its pat_init leaves it on every CPU.
 #define RGFX_PAT_XNU 0x0001040600070406ull
+// A CPU number no CPU answered for, in the record: a PAT's reserved bits are zero, so no PAT is
+// this.
+#define RGFX_PAT_NONE 0xffffffffffffffffull
 
 // The type entry `entry` (0 to 7) of `pat` holds.
 static inline uint32_t rgfxPatEntry(uint64_t pat, uint32_t entry)
@@ -65,6 +76,52 @@ static inline uint64_t rgfxPatWithDeviceWriteBack(uint64_t pat)
 	const uint32_t shift = RGFX_PAT_DEVICE_ENTRY * RGFX_PAT_ENTRY_BITS;
 	return (pat & ~(0xffull << shift)) | ((uint64_t)RGFX_PAT_WRITE_BACK << shift);
 }
+
+// Whether a CPU's PAT is the one the kext keeps: entry 2 write-back, and entry 6
+// write-combining, as xnu's pat_init sets it on every CPU it starts.
+static inline int rgfxPatHeld(uint64_t pat)
+{
+	return pat != RGFX_PAT_NONE &&
+	       rgfxPatEntry(pat, RGFX_PAT_DEVICE_ENTRY) == RGFX_PAT_WRITE_BACK &&
+	       rgfxPatEntry(pat, RGFX_PAT_WRITE_COMBINED_ENTRY) == RGFX_PAT_WRITE_COMBINING;
+}
+
+// Every CPU's PAT, recorded by each CPU itself in a rendezvous: `pats` holds `count` entries, by
+// CPU number, sized to the kernel's CPU count; `answered` counts the CPUs that recorded, and
+// `outside` those whose number lies past `count`, which are counted and not kept. Each CPU writes
+// only its own entry, and both counts atomically.
+typedef struct RgfxCpuPats {
+	uint64_t *pats;
+	uint32_t count;
+	uint32_t answered;
+	uint32_t outside;
+} RgfxCpuPats;
+
+// Empties the record: every entry RGFX_PAT_NONE, both counts 0.
+static inline void rgfxCpuPatsClear(RgfxCpuPats *t)
+{
+	for (uint32_t i = 0; i < t->count; i++)
+		t->pats[i] = RGFX_PAT_NONE;
+	t->answered = 0;
+	t->outside = 0;
+}
+
+// CPU `cpu` records its PAT.
+static inline void rgfxCpuPatsRecord(RgfxCpuPats *t, int cpu, uint64_t pat)
+{
+	__atomic_fetch_add(&t->answered, 1u, __ATOMIC_RELAXED);
+	if (cpu < 0 || (uint32_t)cpu >= t->count) {
+		__atomic_fetch_add(&t->outside, 1u, __ATOMIC_RELAXED);
+		return;
+	}
+	t->pats[cpu] = pat;
+}
+
+#ifdef __cplusplus
+// The kext's CpuPats feature bit (kRgfxKextFeatureCpuPats), where the kext reads the PAT: on
+// x86-64. An arm64 CPU has no PAT.
+constexpr uint64_t kRgfxKextFeatureCpuPatsRead = RGFX_GUEST_ARM64 ? 0 : kRgfxKextFeatureCpuPats;
+#endif
 
 #if defined(KERNEL) && defined(__x86_64__)
 // The kext's calls (RgfxPat.cpp), x86-64 only.
@@ -84,6 +141,10 @@ RgfxPatRun rgfxPatWriteBackEverywhere(const char *why);
 // interest back.
 void rgfxPatWatchWakes(void);
 void rgfxPatStopWatching(void);
+// The kernel's CPU count, which sizes a record.
+uint32_t rgfxPatCpuCount(void);
+// Reads every online CPU's PAT into `t`, emptied first, each CPU its own with its interrupts off.
+void rgfxPatRead(RgfxCpuPats *t);
 #endif
 
 #endif // RGFX_PAT_HPP_

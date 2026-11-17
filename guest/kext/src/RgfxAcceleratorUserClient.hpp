@@ -143,6 +143,8 @@ private:
 	void openDoorbellPage();
 	void closeDoorbellPage();
 	IOReturn deviceInfoMethod(IOExternalMethodArguments *arguments);
+	// Every CPU's PAT (kRgfxAccelMethodCpuPats), on x86-64.
+	IOReturn cpuPatsMethod(IOExternalMethodArguments *arguments);
 	// The surfaces a command buffer writes (kRgfxAccelMethodSurfaceWrites), and whether a queue is
 	// one of the client's open ones.
 	IOReturn surfaceWritesMethod(IOExternalMethodArguments *arguments);

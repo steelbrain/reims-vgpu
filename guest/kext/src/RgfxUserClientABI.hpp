@@ -132,6 +132,14 @@ enum {
 	// syncs again once the unlock seed moves. kIOReturnNotFound where the process holds no such
 	// surface; kIOReturnUnsupported where IOSurface has no unlock seed to read.
 	kRgfxAccelMethodSurfaceSeeds = 13,
+	// Every CPU's page attribute table, IA32_PAT, which the x86-64 kext reads on each online CPU
+	// itself (kRgfxKextFeatureCpuPats; the kext's RgfxPat.hpp): no input; struct out, inline, a
+	// 64-bit word per CPU number from 0, as many as fit, RGFX_PAT_NONE for a CPU that did not
+	// answer (one offline); out the CPUs that answered, the kernel's CPU count, and the CPUs that
+	// answered with a number past that count, which the struct does not hold. For an
+	// administrator's process alone, as the read stops every CPU for a moment:
+	// kIOReturnNotPrivileged for any other. kIOReturnUnsupported on arm64, which has no PAT.
+	kRgfxAccelMethodCpuPats = 15,
 	// A new selector takes the next number design.md's registry gives out.
 };
 
@@ -264,6 +272,7 @@ static inline int rgfxAccelContextSelector(unsigned selector)
 	case kRgfxAccelMethodPagesBlock:
 	case kRgfxAccelMethodPagesChunked:
 	case kRgfxAccelMethodSurfaceSeeds:
+	case kRgfxAccelMethodCpuPats:
 	case kRgfxAccelMethodSubmitBatch:
 	case kRgfxAccelMethodTakeAnswers:
 	case kRgfxAccelMethodSurfaceBlockRelease:
@@ -368,6 +377,8 @@ enum {
 	kRgfxKextFeatureQueuePublish = 1 << 11,
 	// OpenContext's (0x100) seventh output, the context's doorbell page in the process.
 	kRgfxKextFeatureDoorbellPage = 1 << 12,
+	// CpuPats, 15.
+	kRgfxKextFeatureCpuPats = 1 << 13,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

@@ -15,8 +15,12 @@
  * rounds each way of a store on one CPU and a load on the other, and GPU and host writes read by
  * both), no load saw stale data, so a CPU not yet rewritten is slow, not wrong.
  *
- * The kernel calls are com.apple.kpi.unsupported's on x86_64 (xnu's config/Unsupported.x86_64.exports),
- * which the kext links, and IOKit's registerPrioritySleepWakeInterest.
+ * The reads of every CPU's PAT for the accelerator's user client (kRgfxAccelMethodCpuPats) take
+ * the same rendezvous, each CPU recording its own in a record sized to the kernel's CPU count.
+ *
+ * The kernel calls are com.apple.kpi.unsupported's on x86_64 (xnu's
+ * config/Unsupported.x86_64.exports), which the kext links, and IOKit's
+ * registerPrioritySleepWakeInterest.
  *
  * Our own code.
  */
@@ -32,6 +36,8 @@
 extern "C" {
 // com.apple.kpi.unsupported, x86_64; no SDK header declares them.
 void mp_rendezvous_no_intrs(void (*action)(void *), void *arg);
+int cpu_number(void);
+extern unsigned int real_ncpus;
 
 // IOKit's, with C linkage, as IOKit/pwr_mgt/RootDomain.h declares it. That header does not
 // compile in the macOS 27.2 SDK: its IOPMAssertionTypes.h no longer defines the
@@ -105,6 +111,12 @@ void writeBackAction(void *arg)
 	__atomic_fetch_add(&counts->cpus, 1u, __ATOMIC_RELAXED);
 }
 
+// One CPU, its interrupts off.
+void readAction(void *arg)
+{
+	rgfxCpuPatsRecord(static_cast<RgfxCpuPats *>(arg), cpu_number(), readPat());
+}
+
 IONotifier *wakeInterest = nullptr;
 
 // A wake: the rewrite runs at both of its messages, the second changing no CPU where the first
@@ -153,4 +165,15 @@ void rgfxPatStopWatching(void)
 {
 	if (IONotifier *interest = __atomic_exchange_n(&wakeInterest, nullptr, __ATOMIC_ACQ_REL))
 		interest->remove();
+}
+
+uint32_t rgfxPatCpuCount(void)
+{
+	return real_ncpus;
+}
+
+void rgfxPatRead(RgfxCpuPats *t)
+{
+	rgfxCpuPatsClear(t);
+	mp_rendezvous_no_intrs(readAction, t);
 }

@@ -1,5 +1,7 @@
 // The native test of RgfxPat.hpp: the PAT the x86-64 kext writes on every CPU, entry 2 write-back
-// and every other entry as it was, from xnu's PAT and from the one a CPU comes out of reset with.
+// and every other entry as it was, from xnu's PAT and from the one a CPU comes out of reset with;
+// which PAT counts as held; and the record of every CPU's PAT the user client reads out, by CPU
+// number, whatever number a CPU answers with.
 #include "RgfxPat.hpp"
 
 #include <cstdio>
@@ -64,6 +66,46 @@ int main()
 		          othersKept(pat, after),
 		      "entry 2 alone, from any value");
 	}
+
+	// Held: entry 2 write-back and entry 6 write-combining. xnu's PAT is not, the kext's is; a CPU
+	// with entry 2 rewritten that xnu never started (6 still UC-) is not; no answer is not.
+	check(!rgfxPatHeld(RGFX_PAT_XNU), "xnu's PAT is not held");
+	check(rgfxPatHeld(kept), "the kext's PAT is held");
+	check(!rgfxPatHeld(reset), "a PAT xnu never wrote is not held, entry 6 UC-");
+	check(!rgfxPatHeld(RGFX_PAT_NONE), "no answer is not held");
+	check(RGFX_PAT_NONE != RGFX_PAT_XNU && RGFX_PAT_NONE != kept && RGFX_PAT_NONE != kQemuReset,
+	      "no PAT a CPU holds reads as no answer");
+
+	// The record: a CPU writes its own entry; entries no CPU answered stay RGFX_PAT_NONE; a CPU
+	// whose number lies past the record, 32 and 64 among them where a 32- or 64-bit mask would
+	// overflow, is counted and writes nothing.
+	{
+		uint64_t pats[6];
+		for (uint64_t &p : pats)
+			p = 0x5a5a5a5a5a5a5a5aull;
+		RgfxCpuPats t = {pats, 4, 7, 7};
+		rgfxCpuPatsClear(&t);
+		check(t.answered == 0 && t.outside == 0, "the counts emptied");
+		bool none = true;
+		for (uint32_t i = 0; i < 4; i++)
+			none = none && pats[i] == RGFX_PAT_NONE;
+		check(none, "every entry RGFX_PAT_NONE");
+		check(pats[4] == 0x5a5a5a5a5a5a5a5aull, "nothing past the record emptied");
+		rgfxCpuPatsRecord(&t, 0, kept);
+		rgfxCpuPatsRecord(&t, 3, RGFX_PAT_XNU);
+		rgfxCpuPatsRecord(&t, 4, kept);
+		rgfxCpuPatsRecord(&t, 32, kept);
+		rgfxCpuPatsRecord(&t, 64, kept);
+		rgfxCpuPatsRecord(&t, -1, kept);
+		check(t.answered == 6 && t.outside == 4, "six answered, four past the record");
+		check(pats[0] == kept && pats[3] == RGFX_PAT_XNU, "each CPU's own entry");
+		check(pats[1] == RGFX_PAT_NONE && pats[2] == RGFX_PAT_NONE, "no answer at 1 and 2");
+		check(pats[4] == 0x5a5a5a5a5a5a5a5aull && pats[5] == 0x5a5a5a5a5a5a5a5aull,
+		      "no CPU past the record writes past it");
+	}
+
+	// The x86-64 kext offers the read, as CpuPats in its feature word.
+	check(kRgfxKextFeatureCpuPatsRead == kRgfxKextFeatureCpuPats, "x86-64 offers CpuPats");
 
 	std::printf("pat_test: OK (%d checks)\n", checks);
 	return 0;
