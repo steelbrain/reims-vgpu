@@ -196,6 +196,56 @@ is its transport:
   allocations from there. It has no dirty log: the library's window draws
   the guest's scanout again at each of the display's refreshes while it
   shows no presented surface.
+- **The guest's Shared pool**: at realize the device reserves `x-pool-size`
+  bytes of guest physical addresses with no RAM under them (an internal
+  property, 64 GiB by default, whole GiB; 0 for none), from the host
+  bridge's `pci-hole64-end` rounded up to 1 GiB and below three quarters of
+  the guest's physical address space: 0xac0000000 (43 GiB) on `reims-ctl`'s
+  8 GiB q35 machine. It raises fw_cfg's `etc/reserved-memory-end` past the
+  range, so OVMF places its 64-bit PCI window above it; macOS lays the
+  device's BARs out below 4 GiB anyway. It adds no e820 entry: QEMU's e820
+  table is the i386 board's, which a device's common code cannot reach, and
+  OVMF leaves reserved entries above 4 GiB out of the EFI memory map. The
+  library maps its blocks of host memory into the range as the guest's pool
+  grows (`pool_add`, docs/api.md) and takes them out as it shrinks
+  (`pool_remove`). Each block is a RAM region of its own, unmergeable, owned
+  by an object of its own, added or removed in a transaction of its own on
+  the main loop: an add removes nothing, and a removal touches no other
+  piece. A piece's end, which tells the library the memory may go, waits for
+  the flat views and DMA maps that hold it. KVM's
+  `KVM_X86_QUIRK_SLOT_ZAP_ALL` is turned off at realize
+  (`KVM_CAP_DISABLE_QUIRKS2`), so a piece's removal zaps only its own slot's
+  second-level maps. Under WHPX the hypervisor's map of an add and its unmap
+  of a removal run on the library's thread, outside the BQL
+  (`whpx_map_ahead`, `whpx_unmap_before_del`), and the listener skips them.
+  The teardown takes every piece out before the library's release.
+- Measured 11-17 with the pool's measurement arm (the vCPUs' BQL waits from
+  a piece's ask to 20 ms past its add or removal; a 4-thread spinner in the
+  guest; macOS 26.7.2). On um790's 780M under KVM, adds of 256 MiB, 256 MiB
+  and 1 GiB held the BQL 0.56, 1.87 and 0.90 ms (`KVM_SET_USER_MEMORY_REGION`
+  0.02-1.05 ms for each address space, `need_inhibit` 0), and a 1 GiB
+  removal 2.1 ms (its slot's delete 1.7 ms); the vCPUs waited for the BQL
+  at most 0.020 ms over the adds and 0.034 ms over the removal, against
+  1.08 ms over an idle 10 s, and the spinner's longest gap was 2.9 ms
+  during the grows against 2.3 ms at its baseline. On the Mac mini 2018
+  under WHPX, the maps ahead took 5.1, 6.8 and 21.7 ms outside the BQL and
+  the adds held it 0.55-0.62 ms, where the stock listener held it 8.9, 9.0
+  and 26.8 ms; the vCPUs waited at most 0.055 ms over the adds. A 1 GiB
+  removal held it 0.61-0.66 ms with its unmap ahead (43-50 ms outside the
+  BQL), where the listener's unmap had held it 46 ms and a vCPU had waited
+  34.6 ms of it.
+- Under WHPX, a UEFI application that wrote and read the first two pieces
+  every 0.5 ms while the add's and the removal's queueing were held back 3 s
+  found (11-17): before a piece's map an access exits and QEMU drops it
+  (it reads all ones); from the map ahead on, through the held-back add,
+  it goes straight to memory; between the unmap ahead and the removal it
+  exits and QEMU carries it out on the piece's memory; after the removal
+  it is dropped again. An access to a range while the hypervisor maps or
+  unmaps that range waits for the call (35 ms for 1 GiB's map, 50 ms for
+  its unmap); the other piece's accesses meanwhile took at most 4 us. No
+  WHPX error, and the VM ran on. The guest touches a piece only between the device's word that
+  it is in and its own word that it emptied it, so neither wait is one it
+  meets.
 - **The guest's RAM**: on Linux the device gives the library the map of the
   RAM ranges that are a shared file in pages of the host's size (the memfd of
   `reims-ctl`'s VMs), with the files behind them, and the GPU uses an
