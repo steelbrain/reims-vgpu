@@ -483,7 +483,8 @@ so a block that takes a recursive lock its caller holds would re-enter it.
   (`reims-vgpu.graphics-surfaces-<i>`), ICB creation (`reims-vgpu.icb-create-<i>`), a closed
   process's releases (`reims-vgpu.graphics-closes-<i>`), video (`reims-vgpu.graphics-video-<i>`)
   and event waits (`reims-vgpu.graphics-event-waits`). How long a pool keeps an idle thread is
-  `reims-vgpu-graphics`'s `keep`.
+  `reims-vgpu-graphics`'s `keep`. The guest's Shared pool has a thread of its own
+  (`reims-vgpu.graphics-pool`, 15.1), which takes blocks and gives them back.
 - A worker per serial queue while it has work (it ends after 5 s idle), the process's display
   thread among them.
 - Metal's completion threads, and the host's own threads inside a call that may call back (both
@@ -923,6 +924,21 @@ and through the platform's imports of it (on Linux, views of the guest's pages m
 files, and dma-bufs of them, `reims-vgpu-vulkan/src/os/linux`), never through a Rust reference
 (D18). The device's own memory is its region, BAR 2, which the library maps and the guest maps
 write-back.
+
+The guest's Shared pool (`pool.rs`, api.md "The guest's Shared pool") is a range of guest physical
+addresses with no RAM under it, which the host reserves and names in the config. The pool's thread
+takes Shared blocks from its block source, places each at the range's lowest free 2 MiB-aligned
+address, and has the host map it there (`pool_add`); a piece is found only once the host says it is
+in (`pool_added`). The source is metal2vulkan-rt's block calls in shape (`take_block`,
+`release_block`, and the `BlockMappings::unmap` hook it calls before it frees any block); until the
+device runs on that runtime it is `HostBlocks`, the process's own memory. The pool keeps one empty
+piece as headroom and gives a piece that stays empty past `RELEASE_DELAY` back to the source, which
+keeps it ready, mapped, or frees it; a block taken again keeps its piece. The unmap hook takes the
+piece out of the lookups, waits for the device's holds on it, asks the host to remove it
+(`pool_remove`), and returns once the host says it is out (`pool_removed`), so no guest access and no
+thread touches a block after its free. The device's drop closes the pool after its windows: the
+pool's thread ends, then the source unmaps and frees every block; the host has removed every piece
+before the release (QEMU at its teardown), so those unmaps ask it nothing.
 
 ### 15.3 Drop order is explicit
 
