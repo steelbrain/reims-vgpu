@@ -60,9 +60,12 @@ pub(crate) struct QueueCounts {
     /// thread).
     pub(crate) in_flight: Arc<AtomicUsize>,
     /// How many of those are committed: work of the queue's on the GPU, or on its way there, whose
-    /// completion is not yet seen. A walk cuts no part of its buffer while it holds one
-    /// ([`super::split`], "How many parts").
+    /// completion is not yet seen. A walk behind one cuts its buffer's parts by their estimated
+    /// GPU time ([`super::split`], "How many parts").
     pub(crate) out: Arc<AtomicUsize>,
+    /// Its last rate of GPU time to walk time, as a walk in parts of one of its buffers measured
+    /// it ([`super::split`], "How far ahead of the GPU").
+    pub(crate) rate: Arc<super::split::QueueRate>,
     /// Its marks in the surface order, which a command buffer that holds no op reads and writes
     /// with no lock ([`super::surface_order::Marks`]).
     pub(crate) order: Arc<super::surface_order::Marks>,
@@ -87,6 +90,7 @@ impl QueueCounts {
             held: Arc::default(),
             in_flight: Arc::default(),
             out: Arc::default(),
+            rate: Arc::default(),
             order,
             line: Arc::default(),
             lane: Some(lane),

@@ -399,6 +399,8 @@ impl<P: ApiPlatform> Bench<P> {
         }
         // Its messages are a process's, in context 0, whose objects the ids above are.
         decoder.set_context(Some(0));
+        // Its walks paced as a lane's thread's are ([`super::split`], "How far ahead of the GPU").
+        decoder.set_pace_anywhere(true);
         let split_us = std::env::var("DISPATCH_COST_SPLIT_US").ok();
         if let Some(us) = split_us.and_then(|v| v.parse().ok()) {
             decoder.set_split_after(Some(Duration::from_micros(us)));

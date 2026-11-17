@@ -93,6 +93,17 @@ impl CommitMark {
         }
     }
 
+    /// Whether a thread waits on the mark: a commit of another of the process's queues that names
+    /// the queue ([`wait`]).
+    pub(crate) fn has_waiters(&self) -> bool {
+        self.waiters.load(Ordering::SeqCst) > 0
+    }
+
+    /// Whether the queue ended ([`Self::end`]).
+    pub(crate) fn has_ended(&self) -> bool {
+        self.ended.load(Ordering::SeqCst)
+    }
+
     /// The queue ended: its waiters go on.
     pub(crate) fn end(&self) {
         self.ended.store(true, Ordering::SeqCst);
@@ -362,6 +373,13 @@ mod tests {
                 .collect()
         }
 
+        /// Whether a thread waits on queue `queue`'s mark.
+        fn waited_on(&self, queue: u64) -> bool {
+            (self.dec.shared.surface_order.lock().marks(queue))
+                .commit
+                .has_waiters()
+        }
+
         /// How far queue `queue`'s buffers were begun and committed.
         fn state(&self, queue: u64) -> (u64, u64) {
             self.dec
@@ -413,7 +431,8 @@ mod tests {
 
     /// A buffer that names a buffer of another queue of its process takes its place among the
     /// tickets only once that buffer is begun, and is committed only once it is: the host took
-    /// it first, and commits it after.
+    /// it first, and commits it after. Meanwhile it waits on the named queue's mark, which a walk
+    /// of that queue in parts sees ([`CommitMark::has_waiters`]).
     #[test]
     fn a_buffer_is_begun_and_committed_after_the_buffer_of_another_queue_it_names() {
         let r = rig();
@@ -430,6 +449,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.state(A), (5, 0));
         until("its begin", || r.state(A2).0 == 3);
+        until("its wait on the named queue", || r.waited_on(A));
         std::thread::sleep(WATCH);
         assert!(
             r.commits().is_empty(),

@@ -5751,19 +5751,32 @@ commit. Each outcome the new design allows is one of those two:
   (`decode/split.rs`): at an encoder's end, once the part walked since the last
   took 250 µs, it hands the platform that part (`CommandBuffer::split`), which
   commits it on the buffer's queue and answers a command buffer of the queue
-  that goes on from it, and the walk goes on in that one. It cuts none while
-  a command buffer its queue committed is not yet seen complete: each part is
-  a job of the driver's scheduler, and one behind work adds a job and starts
-  no sooner (`decode/split.rs`, "How many parts"). On the M3 Max (MoltenVK)
+  that goes on from it, and the walk goes on in that one. While a command
+  buffer its queue committed is not yet seen complete, it cuts a part only once
+  the part's estimated GPU time reaches 16 ms, from the GPU time its parts seen
+  complete took against their walk, or its walk 2 ms: each part is a job of the
+  driver's scheduler, and one behind work adds a job and the GPU's boundary
+  between jobs, about 0.1 ms on a Radeon 780M (`decode/split.rs`, "How many
+  parts").
+  Where the GPU is far slower than the walk, every queue's work shares one
+  `VkQueue` in submission order, so a buffer of another queue, a compositor's
+  frame, committed after the walk's parts waits for all of them: a walk on its
+  lane waits after a cut while two or more of its parts are out and their
+  estimated GPU time is over 16 ms. It is not paced once it waited for or
+  signalled an event by an op, nor once a buffer of its context waits for its
+  last commit (at the split's gate, in the commit order, or for its tickets and
+  range messages), which a paced walk would otherwise hold up
+  (`decode/split.rs`, "How far ahead of the GPU"). On the M3 Max (MoltenVK)
   a frame of 60 passes then completed in 6.0 ms from its message's take, where
   it took 9.5 ms whole (`decode/split.rs`, "What it gains"). A part is committed
   only where the whole buffer could be committed then, waiting for nothing:
   its turn is next, every ticket and range message before its begin is done,
   and the buffers its `COMMIT_ORDER` names are committed. Every wait of the
-  last commit is met at the first part, so the walk never waits between
-  parts. The parts run in their order on the queue, as one buffer's encoders
-  do. The buffer's handlers, records, ticket and commit marks are its last
-  part's, and its outcome is all of them: the first failed part's error, and
+  last commit is met at the first part, so the walk waits between parts for
+  nothing but its own parts' completions where it is paced. The parts run in
+  their order on the queue, as one buffer's encoders do. The buffer's
+  handlers, records, ticket and commit marks are its last part's, and its
+  outcome is all of them: the first failed part's error, and
   GPU times that start at the first part's start and span the parts' GPU time
   summed, never ending after the last part's end (`decode/split.rs`, "Its GPU
   times": the GPU's waits between parts are for the host's walk, which a
@@ -5806,9 +5819,14 @@ commit. Each outcome the new design allows is one of those two:
   `a_split_after_a_mid_buffer_signal_keeps_the_signal_before_the_cut`,
   `a_split_after_a_skipped_encoder_answers_as_the_whole`,
   `a_buffer_s_parts_but_its_last_join_the_next_completion_unless_they_signal`
-  `a_first_part_that_waits_from_its_begin_is_not_marked` and
-  `a_walk_cuts_no_part_while_work_its_queue_committed_is_out` (the decoder's
-  `cmdbuf` tests), and the gate's own (`decode/split.rs`).
+  `a_first_part_that_waits_from_its_begin_is_not_marked`,
+  `a_walk_behind_incomplete_work_cuts_its_parts_by_their_estimated_gpu_time`,
+  `a_paced_walk_waits_while_its_parts_run_far_ahead_of_the_gpu`,
+  `a_paced_walk_s_wait_ends_at_a_reset_its_queue_s_end_a_fault_or_its_bound`,
+  `a_walk_that_waits_for_or_signals_an_event_by_an_op_is_not_paced` and
+  `a_paced_walk_goes_on_unpaced_once_a_buffer_of_its_context_waits_for_it`
+  (the decoder's `cmdbuf` tests), and the gate's and the estimate's own
+  (`decode/split.rs`).
 - **What still waits on ring 0's thread:** a block named again, for that
   block's writers; a present's fill, for that block's users begun and not
   finished (not for the fill itself: the fill is committed there, and the

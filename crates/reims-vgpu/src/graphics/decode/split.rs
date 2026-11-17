@@ -35,11 +35,20 @@
 //! **How many parts.** A part is cut each [`SPLIT_AFTER`] while nothing the buffer's queue
 //! committed, its earlier parts and buffers, is incomplete (`QueueCounts::out`, counted from each
 //! commit to its completion's handler), up to its queue's room for command buffers
-//! (`TAKE_IN_FLIGHT_MAX`, [`super::cmdbuf`]); behind such work the walk goes on into the part it
-//! is in, and cuts at the first encoder's end after it is seen complete. A buffer dealt to two
-//! threads behind such work is dealt in two chunks, one a thread ("Two threads at once", below).
+//! (`TAKE_IN_FLIGHT_MAX`, [`super::cmdbuf`]). Behind such work a part is cut once its estimated
+//! GPU time reaches [`PART_GPU`] ([`Estimate::cuts`]): its walk times the rate of GPU time to
+//! walk time that the buffer's parts seen complete measured, else its queue's last walk in parts
+//! ([`QueueRate`]); with neither, each [`SPLIT_AFTER`], until a part is seen complete; and never
+//! where its parts had no GPU times. Its walk is cut at [`PART_WALK_MOST`] whatever the estimate:
+//! a compute encoder's GPU time follows its grid and not its walk, so the parts before measure
+//! the next one poorly. On the UHD Graphics 630, consecutive parts of an ML burst's buffer took
+//! 0.4 to 102 times their walk, and the rate its first parts measured let a later one run for
+//! 16.6 ms of walk, which took 642 ms of GPU time (lane splitcut, m3-max-38430). Such a part is committed unmarked ("Its parts'
+//! completions", below), so its completion is seen at its own end. A buffer dealt to two threads
+//! behind such work is dealt in two chunks, one a thread ("Two threads at once", below).
 //! Each part is a submission to the driver and a job of its scheduler, and a part committed
-//! behind work only adds one: the GPU starts it no earlier than the work before it ends. On an
+//! behind work only adds one where the GPU keeps up with the walk: the GPU starts it no earlier
+//! than the work before it ends. On an
 //! RX 7900 XTX, where a job waits 0.12 to 0.19 ms from its submission to its start on the GPU
 //! (amdgpu's scheduler, measured by metal2vulkan's jobstart lane), Geekbench 7's Metal pass took 1,437 parts
 //! for Particle Physics' 111 command buffers of its own and 2,631 for Fluid Simulation's 882,
@@ -48,7 +57,56 @@
 //! native run, measured). On an Iris Xe,
 //! WindowServer's frames of an animating page took 8.96 parts a command buffer, 22,155 of
 //! 25,856 cuts behind incomplete work, 847 of its 2,394 dealt walks begun behind it (lane joins'
-//! ja-dev, measured).
+//! ja-dev, measured). So a part behind work is cut only where its GPU time is long: where the GPU
+//! is far slower than the walk, a walk that cut nothing behind its first part went on into parts
+//! of several hundred milliseconds of GPU time. On the UHD Graphics 630 of a Mac mini 2018 host
+//! (Windows, macOS 26.7.2 guest), an ML burst's command buffer of 794 dispatches in 582 compute
+//! encoders went to the GPU in three parts of 22.3, 855.1 and 923.8 ms, one of 541 dispatches in
+//! parts of 0.2, 66.2 and 507.3 ms, and the compositor's buffers committed behind them waited 442
+//! to 523 ms to start, the desktop's frames 550 ms apart (m3-max-38035, read by lane splitcut).
+//!
+//! **How far ahead of the GPU.** Every command queue of the guest's may share one `VkQueue`
+//! (metal2vulkan's `queue_share.rs`: RADV's single graphics queue, any device with fewer queues
+//! than the guest's), whose work runs in its submission order, and the runtime submits each
+//! command buffer's batches as they are ready, at its commit. So a buffer of another queue,
+//! WindowServer's among them, committed after a walk's parts runs after all of them: in the burst
+//! above, the walk committed its parts within 39 ms, and the probe's buffers committed 1.3 s
+//! later still waited 460 ms for the last. Cutting smaller parts alone would not have helped
+//! them. A walk on its queue's lane therefore waits, after a cut, while two or more of its parts
+//! are out and their estimated GPU time is over [`PACE_AHEAD`] ([`Estimate::waits`]; with
+//! nothing to estimate it from yet, while their walk is over [`PACE_UNKNOWN_WALK`]), or the
+//! oldest of them was committed [`PACE_AHEAD`] ago or more, and goes on as its parts are seen
+//! complete. The oldest's age is what the GPU itself shows: an estimate from the parts seen
+//! complete is blind while none completes, as the GPU runs a part far longer than it estimated.
+//! In the burst above, a buffer of 541 dispatches walked parts that its first four, of 0.0 to 0.6
+//! times their walk, estimated at 0.6 ms each, and that took 164, 23, 55, 38 and up to 120 ms,
+//! none seen complete as its 22 parts were committed within 44 ms (lane splitcut, m3-max-38627).
+//! One part out never holds the walk, so the GPU runs a part while the walk walks the next, and
+//! a buffer of another queue committed meanwhile waits for about two of the walk's parts at most
+//! ([`PART_GPU`]), or for an encoder longer than that, which no cut divides. Where the GPU keeps
+//! up with the walk, its parts complete well within [`PACE_AHEAD`] and nothing waits. The wait is
+//! the lane's job's (`Lane::waiting`), so the lane's next buffer walks meanwhile, and only a
+//! lane's thread waits: never a queue's service thread or a doorbell's, which walk only short
+//! buffers.
+//!
+//! A walk is never paced once it waited for or signalled an event by an op: a part's completion
+//! may then wait for a buffer committed only after the walk's last part, as one whose process
+//! signals the event once it sees the walk's buffer scheduled; and a buffer that waits for an
+//! event by an op is not cut at all ("Which buffers"). Nor is it paced once a buffer of its
+//! context waits for its last commit: a commit at the gate below, a buffer dealt to two threads
+//! that is to take the gate, a commit of another of the process's queues that names the walk's
+//! queue in the commit order ([`super::commit_order`]), or one that waits for the context's
+//! tickets or range messages ([`super::sequencer`]). Such a buffer would wait for a paced walk's
+//! end, and a part may wait for it on the GPU: a part's waits from its begin, for a cache's fill
+//! (which waits for the buffers begun that use the cache) or for another queue's buffer in the
+//! surface order, are for buffers committed or still to be committed, and the walk goes on
+//! unpaced once one of those waits for it. A wait ends at once where a reset of the device
+//! begins, the buffer's queue ends or a part fails, within a [`WAIT_SLICE`] where such a buffer
+//! waits, and once [`PACE_WAIT_MOST`] passes with none of its parts seen complete; the walk then
+//! goes on unpaced to its end, cutting and committing its parts as before. A lost device fails
+//! its parts, whose completions end the wait. What the guest sees changes only in time: a paced
+//! buffer's last part, and so its `CB_SCHEDULED` where it waits for that, comes once the GPU has
+//! nearly finished its earlier parts rather than at the walk's speed.
 //!
 //! Before that rule, a limit on the parts out, under which the walk went on into a longer part
 //! while the GPU was behind, gained nothing measured by the decoder alone: `dispatch_cost`
@@ -77,8 +135,9 @@
 //! buffer do, and each part is committed only where the whole buffer could be committed then,
 //! waiting for nothing (`GraphicsDecoder::may_commit_now`): its turn on its queue is next, every
 //! ticket and range message before its begin is done, and the buffers its `COMMIT_ORDER` names
-//! are committed. Every wait of the last commit was met at the first part, so the walk never
-//! waits between parts. Its handlers, records and tickets are the last part's, and come as they
+//! are committed. Every wait of the last commit was met at the first part, so the walk waits
+//! between parts for nothing but its own parts' completions where it is paced ("How far ahead of
+//! the GPU"). Its handlers, records and tickets are the last part's, and come as they
 //! came: its `CB_SUBMITTED`, `CB_SCHEDULED` and `CB_COMPLETE` once each, its ticket given back
 //! at the last commit, its commit marks raised there. Its outcome is all the parts' ([`Parts`]):
 //! the first failed part's error, else the last part's; and GPU times that start at the first
@@ -137,8 +196,9 @@
 //! which carries the buffer's handlers, records, tickets and its queue's surface signal; never a
 //! part that waits for or signals an event, at its begin (a device cache's fill, a buffer of
 //! another queue in the surface order) or by an op, whose value another queue's GPU, the guest
-//! or the device's listener waits for; and a part the platform keeps whole is unmarked again, as
-//! its commit is then the whole's. A fence a marked part updates is reached as late as its
+//! or the device's listener waits for; never a part cut behind incomplete work its queue committed
+//! ("How many parts"), whose completion a paced walk waits for ("How far ahead of the GPU"); and
+//! a part the platform keeps whole is unmarked again, as its commit is then the whole's. A fence a marked part updates is reached as late as its
 //! completion: the GPU's order of its work is unchanged, and a wait of another queue's for it is
 //! met at the end of the part's submission, never early. A fault in a marked part fails the
 //! buffer as before: its error reaches the last part's record, whose handler runs after every
@@ -210,14 +270,17 @@
 //! the commit, in the chunks' order) is done once. A `cbpar` trace event gives each buffer's
 //! chunks and their walks, and a `cbdeal` event each chunk's.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use reims_vgpu_vulkan::core::platform::command::{CompletedHandler, CompletedInfo};
+use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
 use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, NsErrorText};
 use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 
+use super::commit_order::WAIT_SLICE;
 use super::sequencer::RangeOp;
 
 /// How long a part of a command buffer is walked, at least, before the walk commits it at an
@@ -225,6 +288,148 @@ use super::sequencer::RangeOp;
 /// the GPU's wait for the part before it at their boundary. The fastest of those measured (the
 /// module docs, "What it gains").
 pub(crate) const SPLIT_AFTER: Duration = Duration::from_micros(250);
+
+/// The GPU time, as estimated ([`Estimate`]), a part cut behind its queue's incomplete work is
+/// walked to ("How many parts"): a refresh at 60 Hz, as [`PACE_AHEAD`], so a buffer of another
+/// queue committed behind a paced walk's parts waits for about two of them at most. Each part
+/// costs its boundary: on a Radeon 780M (RADV), `dispatch_cost`'s heavy shape cut behind work at
+/// 4 ms took 51.0 parts a command buffer against 3.0, and 186.4 ms against 181.8 ms, and at
+/// 16 ms 14.3 parts and 183.5 ms against 181.5 ms (lane splitcut, m3-max-38121 and
+/// m3-max-38356); Geekbench 7's Fluid Simulation took 2% more GPU time at 4 ms (m3-max-38192
+/// against m3-max-38191); an Iris Xe and the M3 Max lost nothing. A boundary's own GPU cost there
+/// is smaller, a full barrier at the part's end and two timestamps, about 34 µs of span at the
+/// median (metal2vulkan's fills of 64 MiB in 3 or 51 parts, m3-max-38426); the rest is not
+/// measured, the overlap of independent dispatches lost across a cut its expected cause. Chosen
+/// from those.
+pub(crate) const PART_GPU: Duration = Duration::from_millis(16);
+
+/// The longest a part cut behind its queue's incomplete work is walked, whatever its estimated
+/// GPU time ("How many parts"): on the UHD Graphics 630, a rate of GPU time to walk time of 100
+/// makes it 200 ms of GPU time, as long as one of its longest compute encoders; on a Radeon 780M,
+/// `dispatch_cost`'s heavy shape reaches [`PART_GPU`] in less. Chosen, not measured.
+pub(crate) const PART_WALK_MOST: Duration = Duration::from_millis(2);
+
+/// The GPU time, as estimated, of a walk's parts committed and not seen complete above which the
+/// walk waits before it goes on, and the age of the oldest of them at which it waits whatever
+/// the estimate ("How far ahead of the GPU"): a refresh at 60 Hz, which a compositor's buffer
+/// committed behind them waits at most besides the part the GPU is running. Chosen, not
+/// measured.
+pub(crate) const PACE_AHEAD: Duration = Duration::from_millis(16);
+
+/// The walk of a buffer's parts committed and not seen complete above which the walk waits,
+/// where nothing estimates their GPU time yet (no part of the buffer is seen complete, and no
+/// buffer of its queue was measured): on the UHD Graphics 630 of a Mac mini 2018 host, a part of
+/// an ML burst's compute encoders took 37 to 69 times its walk in GPU time (lane splitcut's
+/// reading of m3-max-38035), so 1 ms of walk is about 55 ms of its GPU's. Chosen, not measured.
+pub(crate) const PACE_UNKNOWN_WALK: Duration = Duration::from_millis(1);
+
+/// The longest a walk waits at one cut with none of its parts seen complete ("How far ahead of
+/// the GPU"), after which it goes on unpaced to its end, as a walk did before it was paced: a
+/// bound on a wait whose completion never comes. A part's own GPU time is what a wait for it
+/// needs, and on the UHD Graphics 630 of a Mac mini 2018 host one compute encoder of an ML burst,
+/// which no cut divides, took 267 ms (lane splitcut, m3-max-38307); twice that. Chosen, not
+/// measured.
+pub(crate) const PACE_WAIT_MOST: Duration = Duration::from_millis(500);
+
+/// What a walk in parts estimates a part's GPU time from ("How far ahead of the GPU").
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Estimate {
+    /// GPU time a walk time: the buffer's parts' seen complete with GPU times, summed, against
+    /// their walks summed; else the last such rate a walk of its queue measured.
+    Rate(f64),
+    /// None yet: no part of the buffer is seen complete, and no walk of its queue measured a rate.
+    Unknown,
+    /// None: the buffer's parts seen complete had no GPU times.
+    Untimed,
+}
+
+impl Estimate {
+    /// Whether a walk cuts its part at an encoder's end, the part walked `walked`, `behind`
+    /// incomplete work its queue committed ("How many parts").
+    pub(crate) fn cuts(self, walked: Duration, behind: bool) -> bool {
+        if !behind {
+            return walked >= SPLIT_AFTER;
+        }
+        match self {
+            Estimate::Rate(rate) => {
+                walked.as_secs_f64() * rate >= PART_GPU.as_secs_f64() || walked >= PART_WALK_MOST
+            }
+            Estimate::Unknown => walked >= SPLIT_AFTER,
+            Estimate::Untimed => false,
+        }
+    }
+
+    /// Whether a walk waits before it goes on, `out` of its parts committed and not seen complete,
+    /// walked `walked` summed, the oldest of them committed `oldest` ago ("How far ahead of the
+    /// GPU"): their estimated GPU time is over [`PACE_AHEAD`], or the oldest is that old. One
+    /// part out never holds a walk: the GPU runs it while the walk walks the next.
+    pub(crate) fn waits(self, out: usize, walked: Duration, oldest: Duration) -> bool {
+        if out < 2 {
+            return false;
+        }
+        match self {
+            Estimate::Rate(rate) => {
+                walked.as_secs_f64() * rate > PACE_AHEAD.as_secs_f64() || oldest >= PACE_AHEAD
+            }
+            Estimate::Unknown => walked > PACE_UNKNOWN_WALK || oldest >= PACE_AHEAD,
+            Estimate::Untimed => false,
+        }
+    }
+}
+
+/// How long a walk's wait has gone with none of its parts seen complete ([`PACE_WAIT_MOST`]):
+/// how many were seen complete when the count last rose, and when that was.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Progress {
+    completed: Option<u64>,
+    at: MonoTime,
+}
+
+impl From<MonoTime> for Progress {
+    /// A wait that began at `began`.
+    fn from(began: MonoTime) -> Progress {
+        Progress {
+            completed: None,
+            at: began,
+        }
+    }
+}
+
+impl Progress {
+    /// The time since the wait's begin or the last part seen complete, at `now`, with
+    /// `completed` of its parts seen complete so far.
+    pub(crate) fn since(&mut self, completed: u64, now: MonoTime) -> Duration {
+        match self.completed {
+            Some(seen) if seen == completed => {}
+            None => self.completed = Some(completed),
+            Some(_) => {
+                self.completed = Some(completed);
+                self.at = now;
+            }
+        }
+        now.saturating_duration_since(self.at)
+    }
+}
+
+/// A queue's last rate of GPU time to walk time, as a walk in parts of one of its buffers
+/// measured it ([`Estimate::Rate`]), its `f64`'s bits; 0 before the first.
+#[derive(Default)]
+pub(crate) struct QueueRate(AtomicU64);
+
+impl QueueRate {
+    /// The last rate measured, where one was.
+    pub(crate) fn get(&self) -> Option<f64> {
+        let bits = self.0.load(Ordering::Relaxed);
+        (bits != 0).then(|| f64::from_bits(bits))
+    }
+
+    /// Notes `rate`, a walk's measure.
+    pub(crate) fn set(&self, rate: f64) {
+        if rate.is_finite() && rate > 0.0 {
+            self.0.store(rate.to_bits(), Ordering::Relaxed);
+        }
+    }
+}
 
 /// The contexts with a buffer whose parts are out, and the commits and range messages of each
 /// context under way (the module docs).
@@ -342,6 +547,13 @@ impl SplitGate {
         }
     }
 
+    /// Whether a buffer of `context` waits for the last commit of the context's buffer whose parts
+    /// are out: a commit, or a buffer dealt to two threads that is to take the gate for its parts
+    /// ([`Self::split`]).
+    pub(crate) fn holds_back(&self, context: u32) -> bool {
+        (self.contexts.lock().get(&context)).is_some_and(|g| g.waiting > 0 || g.splitting > 0)
+    }
+
     /// How many commits of `context` wait for a buffer's parts (for the tests).
     #[cfg(test)]
     pub(crate) fn waiting(&self, context: u32) -> usize {
@@ -403,10 +615,16 @@ impl Drop for SplitHold {
 }
 
 /// What the completions of a command buffer's parts before its last found, which the last
-/// part's completion makes the buffer's ([`Parts::merged`]).
+/// part's completion makes the buffer's ([`Parts::merged`]), and how far its parts run ahead of
+/// the GPU, which its walk waits on ([`Parts::wait_ahead`]).
 #[derive(Default)]
 pub(crate) struct Parts {
     seen: Mutex<Seen>,
+    ahead: Mutex<Ahead>,
+    /// Woken as a part the walk counts is seen complete.
+    moved: Condvar,
+    /// Its queue's rate of GPU time to walk time, which its parts' completions update.
+    rate: Arc<QueueRate>,
 }
 
 #[derive(Default)]
@@ -419,10 +637,68 @@ struct Seen {
     error: Option<NsErrorText>,
 }
 
+/// How far a walk's parts run ahead of the GPU ("How far ahead of the GPU"): of the parts it cut
+/// with their walk's time ([`Parts::part_handler`]).
+#[derive(Default)]
+struct Ahead {
+    /// Those committed and not seen complete.
+    out: usize,
+    /// Their walks, summed.
+    out_walk: Duration,
+    /// When each was committed, the oldest first: a queue's parts are seen complete in their
+    /// commit order.
+    out_at: VecDeque<MonoTime>,
+    /// One was seen complete.
+    seen: bool,
+    /// The walks of those seen complete with GPU times, summed.
+    timed_walk: Duration,
+    /// Their GPU times, summed.
+    timed_gpu: Duration,
+    /// How many were seen complete.
+    completed: u64,
+    /// One failed.
+    failed: bool,
+}
+
+impl Ahead {
+    /// The walk's estimate: its parts' own rate, else, where none was seen complete, its queue's.
+    fn estimate(&self, queue: &QueueRate) -> Estimate {
+        if !self.timed_walk.is_zero() {
+            return Estimate::Rate(self.timed_gpu.as_secs_f64() / self.timed_walk.as_secs_f64());
+        }
+        if self.seen {
+            return Estimate::Untimed;
+        }
+        queue.get().map_or(Estimate::Unknown, Estimate::Rate)
+    }
+}
+
 impl Parts {
+    /// A buffer's parts, on a queue whose rate of GPU time to walk time is `rate`.
+    pub(crate) fn on(rate: Arc<QueueRate>) -> Parts {
+        Parts {
+            rate,
+            ..Parts::default()
+        }
+    }
+
     /// The completion handler of a part before the last: it notes what the part's completion
-    /// found, then lets `keep` go (the part's place among its queue's command buffers).
-    pub(crate) fn part_handler<K: Send + 'static>(self: &Arc<Self>, keep: K) -> CompletedHandler {
+    /// found, then lets `keep` go (the part's place among its queue's command buffers). A part cut
+    /// with its walk's time and its commit's, `cut`, counts as out from then to its completion,
+    /// which notes its GPU time against that walk ("How far ahead of the GPU"); one cut without
+    /// (a chunk walked at once with others) counts for none of it.
+    pub(crate) fn part_handler<K: Send + 'static>(
+        self: &Arc<Self>,
+        keep: K,
+        cut: Option<(Duration, MonoTime)>,
+    ) -> CompletedHandler {
+        let walk = cut.map(|(walk, _)| walk);
+        if let Some((walk, at)) = cut {
+            let mut ahead = self.ahead.lock();
+            ahead.out += 1;
+            ahead.out_walk = ahead.out_walk.saturating_add(walk);
+            ahead.out_at.push_back(at);
+        }
         let parts = Arc::clone(self);
         Box::new(move |info: CompletedInfo| {
             let mut seen = parts.seen.lock();
@@ -430,12 +706,65 @@ impl Parts {
                 seen.gpu_start.get_or_insert(start);
                 seen.gpu_busy = seen.gpu_busy.saturating_add(end.saturating_sub(start));
             }
+            if let Some(walk) = walk {
+                let mut ahead = parts.ahead.lock();
+                ahead.out = ahead.out.saturating_sub(1);
+                ahead.out_walk = ahead.out_walk.saturating_sub(walk);
+                ahead.out_at.pop_front();
+                ahead.seen = true;
+                ahead.completed += 1;
+                ahead.failed |= info.error.is_some();
+                if let Some((start, end)) = info.gpu_times_ns
+                    && !walk.is_zero()
+                {
+                    ahead.timed_walk = ahead.timed_walk.saturating_add(walk);
+                    let gpu = Duration::from_nanos(end.saturating_sub(start));
+                    ahead.timed_gpu = ahead.timed_gpu.saturating_add(gpu);
+                    let rate = ahead.timed_gpu.as_secs_f64() / ahead.timed_walk.as_secs_f64();
+                    parts.rate.set(rate);
+                }
+                drop(ahead);
+                parts.moved.notify_all();
+            }
             if seen.error.is_none() {
                 seen.error = info.error;
             }
             drop(seen);
             drop(keep);
         })
+    }
+
+    /// The walk's estimate of its parts' GPU time ([`Estimate`]).
+    pub(crate) fn estimate(&self) -> Estimate {
+        self.ahead.lock().estimate(&self.rate)
+    }
+
+    /// Waits, with no lock of the caller's held, while the walk's parts run so far ahead of the
+    /// GPU that it is to wait ([`Estimate::waits`]), its estimate taken again as each part is seen
+    /// complete and the oldest out's age at `now`, in slices of [`WAIT_SLICE`] at most, until
+    /// `over`, handed how many of the parts were seen complete so far, says the wait ends (a
+    /// reset, its queue's end, [`PACE_WAIT_MOST`] passed with none seen complete). Whether the
+    /// walk may go on paced: `false` where `over` ended the wait, or a part failed.
+    pub(crate) fn wait_ahead(
+        &self,
+        now: impl Fn() -> MonoTime,
+        over: impl Fn(u64) -> bool,
+    ) -> bool {
+        let mut ahead = self.ahead.lock();
+        loop {
+            if ahead.failed {
+                return false;
+            }
+            let oldest = (ahead.out_at.front())
+                .map_or(Duration::ZERO, |&at| now().saturating_duration_since(at));
+            if !(ahead.estimate(&self.rate)).waits(ahead.out, ahead.out_walk, oldest) {
+                return true;
+            }
+            if over(ahead.completed) {
+                return false;
+            }
+            let _ = self.moved.wait_for(&mut ahead, WAIT_SLICE);
+        }
     }
 
     /// `handler`, the last part's, handed the whole buffer's outcome: the first failed part's
@@ -466,6 +795,37 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    /// When the tests' parts are committed, and when they wait, unless they say otherwise.
+    const AT: MonoTime = MonoTime::from_nanos(1_000_000_000);
+
+    /// While a buffer of a context has parts out, a commit of the context waiting at the gate, or
+    /// a buffer dealt to two threads waiting to take it, holds the context back
+    /// ([`SplitGate::holds_back`]), and nothing else does: a walk in parts then goes on unpaced.
+    #[test]
+    fn a_commit_or_split_waiting_at_the_gate_holds_its_context_back() {
+        let gate = Arc::new(SplitGate::default());
+        assert!(!gate.holds_back(1));
+        let hold = gate.try_split(1).expect("the gate is free");
+        gate.range(1, Box::new(|| {}));
+        assert!(!gate.holds_back(1), "a range message waits for no one");
+        std::thread::scope(|scope| {
+            let commit = scope.spawn(|| drop(gate.commit(1)));
+            assert!(crate::graphics::tests::eventually(|| gate.holds_back(1)));
+            assert!(!gate.holds_back(2), "another context");
+            drop(hold);
+            commit.join().unwrap();
+        });
+        assert!(!gate.holds_back(1));
+        let hold = gate.try_split(1).expect("the gate is free");
+        std::thread::scope(|scope| {
+            let split = scope.spawn(|| drop(gate.split(1)));
+            assert!(crate::graphics::tests::eventually(|| gate.holds_back(1)));
+            drop(hold);
+            split.join().unwrap();
+        });
+        assert!(!gate.holds_back(1));
+    }
 
     /// A buffer's take of its context's gate for its parts waits while a commit of the context is
     /// under way, and while another buffer of it has parts out, and takes the gate once that
@@ -578,8 +938,8 @@ mod tests {
         let outcome = |parts: [CompletedInfo; 3]| {
             let p = Arc::new(Parts::default());
             let [first, second, last] = parts;
-            p.part_handler(())(first);
-            p.part_handler(())(second);
+            p.part_handler((), None)(first);
+            p.part_handler((), None)(second);
             let got = Arc::new(Mutex::new(None));
             let into = Arc::clone(&got);
             Arc::clone(&p).merged(Box::new(move |info| *into.lock() = Some(info)))(last);
@@ -624,5 +984,200 @@ mod tests {
             ok(30, 50),
             "a part with no GPU times adds none"
         );
+    }
+
+    /// Where a walk cuts its part ("How many parts"): with nothing out, at [`SPLIT_AFTER`];
+    /// behind incomplete work, once the part's estimated GPU time reaches [`PART_GPU`], or with
+    /// nothing to estimate it from yet at [`SPLIT_AFTER`], and never where its parts had no GPU
+    /// times.
+    #[test]
+    fn a_part_behind_incomplete_work_is_cut_at_its_estimated_gpu_time() {
+        let ms = Duration::from_millis;
+        let us = Duration::from_micros;
+        for estimate in [Estimate::Rate(0.1), Estimate::Unknown, Estimate::Untimed] {
+            assert!(!estimate.cuts(us(249), false), "{estimate:?}");
+            assert!(estimate.cuts(SPLIT_AFTER, false), "{estimate:?}");
+        }
+        assert!(!Estimate::Rate(0.1).cuts(us(1_999), true));
+        assert!(
+            Estimate::Rate(0.1).cuts(PART_WALK_MOST, true),
+            "its walk's bound"
+        );
+        assert!(!Estimate::Rate(10.0).cuts(us(1_599), true));
+        assert!(
+            Estimate::Rate(10.0).cuts(us(1_600), true),
+            "16 ms at 10 times its walk"
+        );
+        assert!(
+            !Estimate::Rate(55.0).cuts(us(290), true),
+            "16 ms at 55 times its walk"
+        );
+        assert!(Estimate::Rate(55.0).cuts(us(291), true));
+        assert!(!Estimate::Unknown.cuts(us(249), true));
+        assert!(Estimate::Unknown.cuts(SPLIT_AFTER, true));
+        assert!(!Estimate::Untimed.cuts(ms(1000), true));
+    }
+
+    /// Where a walk waits after a cut ("How far ahead of the GPU"): never with one part out;
+    /// with two or more, while their estimated GPU time is over [`PACE_AHEAD`], or, with nothing
+    /// to estimate it from yet, while their walk is over [`PACE_UNKNOWN_WALK`], or while the
+    /// oldest of them was committed [`PACE_AHEAD`] ago or more; never where its parts had no GPU
+    /// times.
+    #[test]
+    fn a_walk_waits_while_its_parts_out_run_far_ahead_of_the_gpu() {
+        let ms = Duration::from_millis;
+        let young = ms(15);
+        assert!(
+            !Estimate::Rate(100.0).waits(1, ms(100), ms(100)),
+            "one part out"
+        );
+        assert!(!Estimate::Rate(1.0).waits(2, ms(16), young));
+        assert!(Estimate::Rate(1.0).waits(2, ms(17), young));
+        assert!(Estimate::Rate(55.0).waits(4, ms(1), young), "55 ms ahead");
+        assert!(!Estimate::Rate(0.5).waits(48, ms(30), young), "15 ms ahead");
+        assert!(
+            Estimate::Rate(0.5).waits(2, ms(1), PACE_AHEAD),
+            "the oldest out that old, whatever the estimate"
+        );
+        assert!(!Estimate::Unknown.waits(8, PACE_UNKNOWN_WALK, young));
+        assert!(Estimate::Unknown.waits(2, PACE_UNKNOWN_WALK + Duration::from_nanos(1), young));
+        assert!(Estimate::Unknown.waits(2, ms(0), PACE_AHEAD));
+        assert!(!Estimate::Untimed.waits(48, ms(1000), ms(1000)));
+    }
+
+    /// A walk's estimate is its queue's last rate until a part of its own is seen complete with
+    /// GPU times, then its own parts' GPU time against their walk, which its queue keeps; parts
+    /// seen complete with no GPU times leave it none.
+    #[test]
+    fn a_walk_estimates_from_its_own_parts_then_its_queue_s() {
+        let ms = Duration::from_millis;
+        let rate = Arc::new(QueueRate::default());
+        let done = |gpu_times_ns| CompletedInfo {
+            status: CommandBufferStatus::COMPLETED,
+            error: None,
+            gpu_times_ns,
+        };
+        let parts = Arc::new(Parts::on(Arc::clone(&rate)));
+        assert_eq!(parts.estimate(), Estimate::Unknown);
+        rate.set(2.0);
+        assert_eq!(parts.estimate(), Estimate::Rate(2.0), "its queue's");
+        let first = parts.part_handler((), Some((ms(1), AT)));
+        let second = parts.part_handler((), Some((ms(3), AT)));
+        let near = |estimate: Estimate, want: f64| matches!(estimate, Estimate::Rate(r) if (r - want).abs() < 1e-9);
+        first(done(Some((0, 10_000_000))));
+        assert!(
+            near(parts.estimate(), 10.0),
+            "10 ms of GPU for 1 ms of walk"
+        );
+        second(done(Some((10_000_000, 16_000_000))));
+        assert!(near(parts.estimate(), 4.0), "16 ms for 4 ms");
+        assert!(
+            near(Estimate::Rate(rate.get().unwrap()), 4.0),
+            "kept by its queue"
+        );
+        let untimed = Arc::new(Parts::on(Arc::new(QueueRate::default())));
+        untimed.part_handler((), Some((ms(1), AT)))(done(None));
+        assert_eq!(untimed.estimate(), Estimate::Untimed);
+        let dealt = Arc::new(Parts::on(Arc::new(QueueRate::default())));
+        dealt.part_handler((), None)(done(Some((0, 10_000_000))));
+        assert_eq!(
+            dealt.estimate(),
+            Estimate::Unknown,
+            "a chunk dealt counts for none"
+        );
+    }
+
+    /// A wait's bound runs from its begin, then from the last of its parts seen complete
+    /// ([`PACE_WAIT_MOST`]).
+    #[test]
+    fn a_wait_s_bound_runs_from_its_last_part_seen_complete() {
+        let at = |ms: u64| MonoTime::from_nanos(ms * 1_000_000);
+        let ms = Duration::from_millis;
+        let mut progress = Progress::from(at(1_000));
+        assert_eq!(
+            progress.since(3, at(1_000)),
+            ms(0),
+            "the count it began with"
+        );
+        assert_eq!(progress.since(3, at(1_400)), ms(400));
+        assert_eq!(progress.since(4, at(1_450)), ms(0), "a part seen complete");
+        assert_eq!(progress.since(4, at(1_900)), ms(450));
+        assert_eq!(progress.since(4, at(1_950)), PACE_WAIT_MOST);
+    }
+
+    /// A walk whose parts' estimate says they are close to the GPU waits while the oldest of them
+    /// out was committed [`PACE_AHEAD`] ago or more, and goes on as it is seen complete.
+    #[test]
+    fn a_walk_waits_while_its_oldest_part_out_is_a_refresh_old() {
+        let ms = Duration::from_millis;
+        let rate = Arc::new(QueueRate::default());
+        rate.set(0.1);
+        let parts = Arc::new(Parts::on(rate));
+        let first = parts.part_handler((), Some((ms(1), AT)));
+        let _second = parts.part_handler((), Some((ms(1), AT)));
+        let young = || AT.saturating_add(ms(15));
+        assert!(
+            parts.wait_ahead(young, |_| false),
+            "0.2 ms ahead, 15 ms old"
+        );
+        let went = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                assert!(parts.wait_ahead(|| AT.saturating_add(PACE_AHEAD), |_| false));
+                went.store(true, Ordering::Release);
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                !went.load(Ordering::Acquire),
+                "went on with its oldest 16 ms old"
+            );
+            first(CompletedInfo {
+                status: CommandBufferStatus::COMPLETED,
+                error: None,
+                gpu_times_ns: Some((0, 100_000)),
+            });
+        });
+        assert!(went.load(Ordering::Acquire));
+    }
+
+    /// A walk's wait for its parts ends as a part's completion leaves them close enough to the
+    /// GPU, and at once where `over`, handed how many were seen complete, says so or a part
+    /// failed.
+    #[test]
+    fn a_walk_s_wait_for_its_parts_ends_at_a_completion_its_end_or_a_failure() {
+        let ms = Duration::from_millis;
+        let rate = Arc::new(QueueRate::default());
+        rate.set(10.0);
+        let parts = Arc::new(Parts::on(rate));
+        let first = parts.part_handler((), Some((ms(1), AT)));
+        let _second = parts.part_handler((), Some((ms(1), AT)));
+        // 20 ms ahead: waits until the first part is seen complete.
+        let went = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                assert!(parts.wait_ahead(|| AT, |_| false));
+                went.store(true, Ordering::Release);
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!went.load(Ordering::Acquire), "went on 20 ms ahead");
+            first(CompletedInfo {
+                status: CommandBufferStatus::COMPLETED,
+                error: None,
+                gpu_times_ns: Some((0, 10_000_000)),
+            });
+        });
+        assert!(went.load(Ordering::Acquire));
+        let _third = parts.part_handler((), Some((ms(2), AT)));
+        assert!(
+            !parts.wait_ahead(|| AT, |completed| completed == 1),
+            "ended by `over`, handed the one part seen complete"
+        );
+        let failed = parts.part_handler((), Some((ms(1), AT)));
+        failed(CompletedInfo {
+            status: CommandBufferStatus::ERROR,
+            error: Some(error(3)),
+            gpu_times_ns: None,
+        });
+        assert!(!parts.wait_ahead(|| AT, |_| false), "a part failed");
     }
 }

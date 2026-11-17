@@ -389,6 +389,8 @@ impl<P: ApiPlatform> Bench<P> {
         // Its frames are a process's, as a queue's ring hands them, in context 0, whose objects
         // the ids above are.
         decoder.set_context(Some(0));
+        // Its walks paced as a lane's thread's are ([`super::split`], "How far ahead of the GPU").
+        decoder.set_pace_anywhere(true);
         if let Some(us) = shape.split_us {
             decoder.set_split_after(Some(Duration::from_micros(us)));
         }

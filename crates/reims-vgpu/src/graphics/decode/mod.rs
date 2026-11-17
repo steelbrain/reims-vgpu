@@ -834,6 +834,10 @@ pub(crate) struct Shared<P: Platform> {
     /// incomplete (for the tests of the cuts themselves: [`GraphicsDecoder::set_cut_behind_work`]).
     #[cfg(test)]
     cut_behind_work: AtomicBool,
+    /// The walks pace their parts on any thread, not only on their queue's lane's (for the tests
+    /// and the benches, which walk on the thread that decodes: [`GraphicsDecoder::set_pace_anywhere`]).
+    #[cfg(test)]
+    pace_anywhere: AtomicBool,
     /// A walk dealt to two threads waits for a helper to start its chunks before it walks its
     /// own (for the tests: [`GraphicsDecoder::set_helper_first`]).
     #[cfg(test)]
@@ -1163,6 +1167,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             deal_chunk_bytes: Mutex::new(None),
             #[cfg(test)]
             cut_behind_work: AtomicBool::new(false),
+            #[cfg(test)]
+            pace_anywhere: AtomicBool::new(false),
             #[cfg(test)]
             helper_first: AtomicBool::new(false),
             #[cfg(test)]
@@ -2777,15 +2783,33 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Whether a walk is behind work its queue committed, `out` the queue's count of its command
-    /// buffers committed and not complete ([`tables::QueueCounts::out`]): where it is, it cuts no
-    /// part and deals in two chunks at most ([`split`], "How many parts"; the tests may have it
-    /// cut regardless).
+    /// buffers committed and not complete ([`tables::QueueCounts::out`]): where it is, it cuts its
+    /// parts by their estimated GPU time and deals in two chunks at most ([`split`], "How many
+    /// parts"; the tests may have it cut regardless).
     pub(crate) fn behind_work(&self, out: &std::sync::atomic::AtomicUsize) -> bool {
         #[cfg(test)]
         if self.shared.cut_behind_work.load(Ordering::Relaxed) {
             return false;
         }
         out.load(Ordering::Acquire) != 0
+    }
+
+    /// Has the walks pace their parts on the thread that decodes them, as on a lane's (for the
+    /// tests and the benches, which walk there).
+    #[cfg(test)]
+    pub(crate) fn set_pace_anywhere(&self, pace: bool) {
+        self.shared.pace_anywhere.store(pace, Ordering::Relaxed);
+    }
+
+    /// Whether a walk may wait here for its parts' completions ([`split`], "How far ahead of the
+    /// GPU"): on its queue's lane's thread alone, never on a queue's service thread or a
+    /// doorbell's, whose waits would hold back what they take (the tests may have it anywhere).
+    pub(crate) fn paces_here(&self) -> bool {
+        #[cfg(test)]
+        if self.shared.pace_anywhere.load(Ordering::Relaxed) {
+            return true;
+        }
+        self.lane().is_some_and(|lane| lane.runs_here())
     }
 
     /// Has a walk dealt to two threads wait for a helper to start its chunks before it walks its

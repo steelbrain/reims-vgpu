@@ -60,6 +60,9 @@ struct Open {
     /// before an older one stays until that one is.
     tickets: VecDeque<(u64, Option<u32>, bool)>,
     ranges: HashMap<u32, Ranges>,
+    /// The threads waiting for tickets or range messages ([`Sequencer::wait_for`],
+    /// [`Sequencer::wait_for_ranges`]), by the context of the command buffer each is to commit.
+    waiting: HashMap<Option<u32>, usize>,
 }
 
 impl Default for Open {
@@ -67,6 +70,7 @@ impl Default for Open {
         Open {
             tickets: VecDeque::with_capacity(TICKETS_ROOM),
             ranges: HashMap::new(),
+            waiting: HashMap::new(),
         }
     }
 }
@@ -78,6 +82,16 @@ impl Open {
             .take_while(move |&&(number, _, _)| number <= mark)
             .filter(|&&(_, _, given_back)| !given_back)
             .map(|&(_, context, _)| context)
+    }
+
+    /// A thread waiting to commit a command buffer of `context` stops waiting.
+    fn stop_waiting(&mut self, context: Option<u32>) {
+        if let Some(n) = self.waiting.get_mut(&context) {
+            *n -= 1;
+            if *n == 0 {
+                self.waiting.remove(&context);
+            }
+        }
     }
 }
 
@@ -175,11 +189,27 @@ impl Sequencer {
             return;
         }
         let mut open = self.open.lock();
+        let mut waits = false;
         while self.done_through.load(Ordering::Acquire) < mark
             && open.out_through(mark).any(|holder| orders(context, holder))
         {
+            if !std::mem::replace(&mut waits, true) {
+                *open.waiting.entry(context).or_default() += 1;
+            }
             self.given_back.wait(&mut open);
         }
+        if waits {
+            open.stop_waiting(context);
+        }
+    }
+
+    /// Whether a thread waits to commit a command buffer that `context`'s tickets or range
+    /// messages hold up ([`Self::wait_for`], [`Self::wait_for_ranges`]): one of `context`, or of
+    /// none. `false` where the order is busy. Waits for nothing.
+    pub(crate) fn holds_up(&self, context: u32) -> bool {
+        self.open
+            .try_lock()
+            .is_some_and(|open| (open.waiting.keys()).any(|&waiter| orders(waiter, Some(context))))
     }
 
     /// Whether a command buffer of `context` marked at `mark` would be committed now, waiting for
@@ -234,8 +264,15 @@ impl Sequencer {
     /// carried out.
     pub(crate) fn wait_for_ranges(&self, context: u32, asked: u64) {
         let mut open = self.open.lock();
+        let mut waits = false;
         while open.ranges.get(&context).is_some_and(|r| r.done < asked) {
+            if !std::mem::replace(&mut waits, true) {
+                *open.waiting.entry(Some(context)).or_default() += 1;
+            }
             self.given_back.wait(&mut open);
+        }
+        if waits {
+            open.stop_waiting(Some(context));
         }
     }
 
@@ -346,6 +383,48 @@ mod tests {
             drop(ticket);
         });
         assert!(went.load(Ordering::Acquire));
+    }
+
+    /// A thread waiting to commit a buffer of a context, for a ticket or for a range message,
+    /// holds up that context while it waits, and a thread of no context holds up every one
+    /// ([`Sequencer::holds_up`]): a walk of the context in parts then goes on unpaced.
+    #[test]
+    fn a_commit_waiting_for_tickets_or_ranges_holds_up_its_context() {
+        type Wait = dyn Fn(&Sequencer, u64, u64) + Sync;
+        let case = |what: &str, wait: &Wait, holds: [bool; 2]| {
+            let s = Arc::new(Sequencer::default());
+            let ticket = s.issue(Some(1), false).unwrap();
+            let mark = s.mark();
+            s.after_context(1, Box::new(|| {}));
+            let asked = s.ranges_asked(1, false).unwrap().unwrap();
+            assert!(!s.holds_up(1) && !s.holds_up(2), "{what}: none waits");
+            std::thread::scope(|scope| {
+                let waiter = scope.spawn(|| wait(&s, mark, asked));
+                assert!(
+                    crate::graphics::tests::eventually(|| [s.holds_up(1), s.holds_up(2)] == holds),
+                    "{what}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+                assert!(!waiter.is_finished(), "{what}: waits for the ticket");
+                drop(ticket);
+            });
+            assert!(!s.holds_up(1) && !s.holds_up(2), "{what}: the wait ended");
+        };
+        case(
+            "a ticket, context 1",
+            &|s, mark, _| s.wait_for(Some(1), mark),
+            [true, false],
+        );
+        case(
+            "a ticket, no context",
+            &|s, mark, _| s.wait_for(None, mark),
+            [true, true],
+        );
+        case(
+            "a range message, context 1",
+            &|s, _, asked| s.wait_for_ranges(1, asked),
+            [true, false],
+        );
     }
 
     /// Tickets given back out of order: the order holds through the oldest still out.

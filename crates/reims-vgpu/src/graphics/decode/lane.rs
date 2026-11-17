@@ -481,6 +481,12 @@ impl Lane {
         }
     }
 
+    /// Whether this thread runs and walks a job of the lane's now (not inside a wait of
+    /// [`Self::waiting`]'s).
+    pub(crate) fn runs_here(self: &Arc<Self>) -> bool {
+        WALKING.get() == Arc::as_ptr(self).addr()
+    }
+
     /// Runs `wait`, a wait of the job this thread runs for what is committed before its command
     /// buffer (its turn, its tickets in the commit order, the buffers its `COMMIT_ORDER` names, a
     /// split of its context), with the thread not among the lane's walking ones meanwhile: the

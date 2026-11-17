@@ -164,7 +164,7 @@ use super::helpers::{Hand, Slots};
 use super::lane::{Lane, Turn};
 use super::sequencer::Ticket;
 use super::shares::FanOut;
-use super::split::{Parts, SplitHold};
+use super::split::{Estimate, PACE_WAIT_MOST, Parts, Progress, QueueRate, SplitHold};
 use super::surface_cache::{Reach, Uses};
 use super::surface_order::{Marks, Signalled};
 use super::tables::QueueCounts;
@@ -711,6 +711,16 @@ struct Splitting {
     /// its begin, for a cache's fill or another queue's buffer ([`Begun`]'s `waits_at_begin`),
     /// or by an op, so its completion is observed: committed unmarked ([`joins_next`]).
     events: bool,
+    /// Its queue's rate of GPU time to walk time, which its parts' completions update.
+    rate: Arc<QueueRate>,
+    /// Its queue's marks: a wait for its parts ends as the queue ends.
+    marks: Arc<Marks>,
+    /// Its walk waits for its parts' completions where they run far ahead of the GPU
+    /// ([`super::split`], "How far ahead of the GPU"): not once it waited for or signalled an
+    /// event by an op, whose part's completion may wait for a buffer that is committed only after
+    /// its last part, nor once a buffer of its context waited for its last commit, a wait was
+    /// cut short or a part failed.
+    paced: bool,
 }
 
 /// A chunk of a command buffer dealt to two threads, walked ([`GraphicsDecoder::walk_dealt`]).
@@ -853,6 +863,9 @@ pub(crate) struct Begun<P: Platform> {
     waits_at_begin: bool,
     /// Its queue's records the host may post at their commit.
     line: Arc<Line>,
+    /// Its queue's rate of GPU time to walk time ([`super::split`], "How far ahead of the
+    /// GPU").
+    rate: Arc<QueueRate>,
     /// Its `CB_SUBMITTED`, where it asks for one.
     submitted: Option<Arc<Submitted>>,
     /// Its `CB_SCHEDULED`, where there is a sink.
@@ -1888,6 +1901,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             waits_for_order,
             waits_at_begin: fill_waits || waits_for_order,
             line: Arc::clone(&counts.line),
+            rate: Arc::clone(&counts.rate),
             submitted,
             scheduled,
             first,
@@ -1937,6 +1951,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             waits_for_order,
             waits_at_begin,
             line,
+            rate,
             submitted,
             scheduled,
             held,
@@ -1987,6 +2002,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 parts: None,
                 whole: false,
                 events: waits_at_begin,
+                rate: Arc::clone(&rate),
+                marks: Arc::clone(&marks),
+                paced: true,
             });
         let mut cb = cb;
         // Dealt to two threads at once, where it may be cut and its queue holds room for a command
@@ -2462,12 +2480,14 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// At an encoder's end, ops left after it: where the part of the buffer walked since the
-    /// last took [`Self::split_after`], its queue holds room for another command buffer and no
-    /// command buffer it committed is incomplete ([`Self::behind_work`]), the buffer could be
-    /// committed now ([`Self::may_commit_now`]) and its context's gate is free or its own, hands
-    /// the platform that part ([`CommandBuffer::split`]) and goes on in the command
-    /// buffer it answers, `cb` from then on ([`super::split`]). It waits for nothing. Where the
-    /// platform keeps the buffer whole, it is walked whole from there.
+    /// last is long enough to cut ([`Estimate::cuts`]: [`Self::split_after`] where no command
+    /// buffer its queue committed is incomplete, else by its estimated GPU time,
+    /// [`Self::behind_work`]), its queue holds room for another command buffer, the buffer could
+    /// be committed now ([`Self::may_commit_now`]) and its context's gate is free or its own,
+    /// hands the platform that part ([`CommandBuffer::split`]) and goes on in the command buffer
+    /// it answers, `cb` from then on ([`super::split`]). It waits for nothing to cut; once it cut,
+    /// it waits, where it is paced, while its parts run too far ahead of the GPU
+    /// ([`Self::pace`]). Where the platform keeps the buffer whole, it is walked whole from there.
     fn split_here(
         &self,
         cb: &mut P::CommandBuffer,
@@ -2477,9 +2497,19 @@ impl<P: Platform> GraphicsDecoder<P> {
             return Ok(());
         };
         let clock = self.shared.platform.clock();
-        if clock.now_mono().saturating_duration_since(s.since) < self.split_after()
+        let walked = clock.now_mono().saturating_duration_since(s.since);
+        let behind = self.behind_work(&s.out);
+        let estimate = (s.parts.as_ref()).map_or_else(
+            || s.rate.get().map_or(Estimate::Unknown, Estimate::Rate),
+            |parts| parts.estimate(),
+        );
+        let cuts = if behind {
+            estimate.cuts(walked, true)
+        } else {
+            walked >= self.split_after()
+        };
+        if !cuts
             || s.in_flight.load(Ordering::Acquire) >= TAKE_IN_FLIGHT_MAX
-            || self.behind_work(&s.out)
             || !self.may_commit_now()
         {
             return Ok(());
@@ -2492,19 +2522,25 @@ impl<P: Platform> GraphicsDecoder<P> {
             },
         };
         let first = s.parts.is_none();
-        let parts = Arc::clone(s.parts.get_or_insert_with(Arc::default));
+        let parts =
+            Arc::clone((s.parts).get_or_insert_with(|| Arc::new(Parts::on(Arc::clone(&s.rate)))));
         // The part's own place among its queue's command buffers, until its completion; the
-        // buffer's goes on to its last part.
-        let part = parts.part_handler(InFlight::new(&s.in_flight, &s.out).commits());
-        cb.add_completion_seen_handler(ON, part)?;
-        let joins = joins_next::<P>(cb, s);
+        // buffer's goes on to its last part. A part cut behind incomplete work is committed
+        // unmarked, so its completion is seen at its own end, which a paced walk waits for.
+        let place = InFlight::new(&s.in_flight, &s.out).commits();
+        let cut = (walked, clock.now_mono());
+        cb.add_completion_seen_handler(ON, parts.part_handler(place, Some(cut)))?;
+        let joins = !behind && joins_next::<P>(cb, s);
         match cb.split(ON)? {
             Some(next) => {
                 *cb = next;
                 s.hold = Some(hold);
-                s.since = clock.now_mono();
                 s.events = false;
                 self.note_part_cut();
+                if s.paced && self.paces_here() {
+                    s.paced = self.pace(&parts, s.context, &s.marks);
+                }
+                s.since = clock.now_mono();
             }
             None => {
                 // Kept whole: the handler just added sees the buffer's own completion, which
@@ -2520,6 +2556,75 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
         }
         Ok(())
+    }
+
+    /// Waits, after a cut, while the buffer's parts `parts` run too far ahead of the GPU
+    /// ([`Parts::wait_ahead`]), as a wait of its lane's job ([`Self::waiting`]), so the lane's
+    /// next job walks meanwhile ([`super::split`], "How far ahead of the GPU"). The wait ends at
+    /// once where a reset of the device begins, the buffer's queue ends (`marks`), a buffer of
+    /// its context waits for its last commit ([`Self::held_back`]), or [`PACE_WAIT_MOST`] passes
+    /// with none of its parts seen complete.
+    /// Whether the walk goes on paced: not where the wait was cut short or a part failed.
+    fn pace(&self, parts: &Parts, context: u32, marks: &Marks) -> bool {
+        let clock = self.shared.platform.clock();
+        let began = clock.now_mono();
+        let cancel = &self.shared.commit_cancel;
+        let reset = cancel.now();
+        // Why the wait was cut short: 1 a reset, 2 the queue's end, 3 a buffer of the context
+        // waiting, 4 the bound.
+        let cut = std::cell::Cell::new(0_u64);
+        let progress = std::cell::Cell::new(Progress::from(began));
+        let paced = self.waiting(|| {
+            parts.wait_ahead(
+                || clock.now_mono(),
+                |completed| {
+                    let now = clock.now_mono();
+                    let mut stalled = progress.get();
+                    let since = stalled.since(completed, now);
+                    progress.set(stalled);
+                    let why = if cancel.cut_since(reset) {
+                        1
+                    } else if marks.commit.has_ended() {
+                        2
+                    } else if self.held_back(context, marks) {
+                        3
+                    } else if since >= PACE_WAIT_MOST {
+                        4
+                    } else {
+                        0
+                    };
+                    cut.set(why);
+                    why != 0
+                },
+            )
+        });
+        if reims_vgpu_vulkan::core::trace::on() {
+            let waited = clock.now_mono().saturating_duration_since(began);
+            // cbpace: the walk's wait after a cut, in ns, whether it goes on paced, and why the
+            // wait was cut short (0 for not, or for a failed part)
+            reims_vgpu_vulkan::core::trace::event(
+                "cbpace",
+                &[
+                    u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX),
+                    u64::from(paced),
+                    cut.get(),
+                ],
+            );
+        }
+        paced
+    }
+
+    /// Whether a command buffer of `context` waits for the last commit of the buffer of its queue
+    /// (`marks`) whose parts are out ([`super::split`], "How far ahead of the GPU"): a commit at
+    /// the split's gate or a buffer dealt to two threads to take it
+    /// ([`super::split::SplitGate::holds_back`]), a commit of another of the process's queues
+    /// that names the queue in the commit order
+    /// ([`super::commit_order::CommitMark::has_waiters`]), or one waiting for the context's
+    /// tickets or range messages ([`super::sequencer::Sequencer::holds_up`]).
+    fn held_back(&self, context: u32, marks: &Marks) -> bool {
+        self.shared.split_gate.holds_back(context)
+            || marks.commit.has_waiters()
+            || self.shared.sequencer.holds_up(context)
     }
 
     /// Whether the command buffer could be committed now, waiting for nothing: its turn is next,
@@ -2977,9 +3082,11 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let place = (place
                         .unwrap_or_else(|| InFlight::new(&deal.in_flight, &deal.out)))
                     .commits();
-                    let parts = Arc::clone(s.parts.get_or_insert_with(Arc::default));
+                    let parts = Arc::clone(
+                        (s.parts).get_or_insert_with(|| Arc::new(Parts::on(Arc::clone(&s.rate)))),
+                    );
                     let committing = part.as_ref().unwrap_or(&*cb);
-                    committing.add_completion_seen_handler(ON, parts.part_handler(place))?;
+                    committing.add_completion_seen_handler(ON, parts.part_handler(place, None))?;
                     let joins = joins_next::<P>(committing, s);
                     match committing.commit_part(ON)? {
                         PartCut::Cut => {
@@ -3131,6 +3238,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                         && let Some(s) = split.as_mut()
                     {
                         s.events = true;
+                        s.paced = false;
                     }
                     self.framing_op((tag, body, &ops[len..]), cb, encoder, events)?;
                     if tag == RGFX_OP_ENCODER_END {
@@ -4056,6 +4164,7 @@ mod tests {
         Decoded, GraphicsVideo, GraphicsVideoSession, Landed, VideoDecode, VideoPlane, no_raise,
     };
     use super::*;
+    use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
 
     /// One op: its header then its body, `len` the whole op.
     fn op(tag: u16, body: &[u8]) -> Vec<u8> {
@@ -9786,32 +9895,34 @@ mod tests {
         assert_eq!(marks(&p, parts), [false, true, false]);
     }
 
-    /// A walk cuts no part of its buffer while a command buffer its queue committed is not yet
-    /// seen complete, and deals a buffer behind one in two chunks, one a thread
-    /// ([`super::super::split`], "How many parts"): behind its own first part it walks on into
-    /// its last; with each part seen complete as the walk goes, it cuts at each encoder's end as
-    /// before; behind an earlier buffer of its queue it cuts none; dealt behind one, it is two
-    /// parts, and dealt with nothing out, a part each chunk. The guest has each buffer's
-    /// `CB_COMPLETE` once, after its last part, as before.
+    /// A walk behind a command buffer its queue committed and has not yet seen complete cuts its
+    /// parts by their estimated GPU time, and deals a buffer behind one in two chunks, one a
+    /// thread ([`super::super::split`], "How many parts"): behind its own first part, with nothing
+    /// to estimate its GPU time from, it cuts each [`SPLIT_AFTER`] as with nothing out; with each
+    /// part seen complete as the walk goes, it cuts at each encoder's end as before; behind an
+    /// earlier buffer of its queue whose walks measured a low rate of GPU time to walk time it
+    /// cuts none, and behind one whose walks measured a high one it cuts at each encoder's end;
+    /// a part cut behind such work is committed unmarked, so its completion is seen at its own
+    /// end; dealt behind one, it is two parts, and dealt with nothing out, a part each chunk. The
+    /// guest has each buffer's `CB_COMPLETE` once, after its last part, as before.
     #[test]
-    fn a_walk_cuts_no_part_while_work_its_queue_committed_is_out() {
+    fn a_walk_behind_incomplete_work_cuts_its_parts_by_their_estimated_gpu_time() {
         let Split {
             p, mut dec, posted, ..
         } = splitting();
         dec.set_cut_behind_work(false);
         let device = p.device();
         let ok = (RGFX_EVT_CB_COMPLETE, RGFX_CB_OK);
+        let rate = Arc::clone(&dec.queue_counts(1).expect("queue 1").rate);
 
-        // Behind its own first part: two parts.
+        // Behind its own first part, nothing estimated: a part each encoder, its first marked and
+        // the others, cut behind it, not.
         let cut = dec.parts_cut();
         let message = command_buffer_message(400, 130, &passes(4));
         assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
-        assert_eq!(dec.parts_cut() - cut, 1, "its first part");
-        assert_eq!(
-            p.world().committed().len(),
-            2,
-            "its first part and its last"
-        );
+        assert_eq!(dec.parts_cut() - cut, 3, "a part each encoder but the last");
+        let parts = p.world().committed();
+        assert_eq!(marks(&p, &parts), [true, false, false, false]);
         p.world().complete_all(CompleteOn::Caller);
         assert_eq!(answered(&posted).last(), Some(&ok));
 
@@ -9832,7 +9943,9 @@ mod tests {
             clock.virtual_clock().advance(SPLIT_AFTER);
         })));
 
-        // Behind an earlier buffer of its queue, not yet complete: whole.
+        // Behind an earlier buffer of its queue, not yet complete: whole where its queue's walks
+        // measured a GPU time a tenth of their walk's, which a part reaches only at 160 ms of walk.
+        rate.set(0.1);
         let earlier = command_buffer_message(402, 132, &blit_ops());
         assert_eq!(dec.decode(&device, &earlier).unwrap(), Ok(()));
         let cut = dec.parts_cut();
@@ -9850,14 +9963,31 @@ mod tests {
             .collect();
         assert_eq!(completes, [ok, ok]);
 
+        // Where they measured a GPU time 100 times their walk's, a part reaches 16 ms at 160 µs of
+        // walk: a part each encoder, none marked.
+        rate.set(100.0);
+        let earlier = command_buffer_message(404, 134, &blit_ops());
+        assert_eq!(dec.decode(&device, &earlier).unwrap(), Ok(()));
+        let cut = dec.parts_cut();
+        let message = command_buffer_message(405, 135, &passes(4));
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(dec.parts_cut() - cut, 3, "a part each encoder but the last");
+        let parts = p.world().committed();
+        assert_eq!(marks(&p, &parts[1..]), [false, false, false, false]);
+        p.world().complete_all(CompleteOn::Caller);
+        let completes: Vec<_> = (answered(&posted).into_iter())
+            .filter(|(kind, _)| *kind == RGFX_EVT_CB_COMPLETE)
+            .collect();
+        assert_eq!(completes, [ok, ok]);
+
         // Dealt, a chunk each encoder: behind an earlier buffer, two parts, one a thread; with
         // nothing out, a part each chunk.
         dec.set_deal_min_bytes(Some(0));
         dec.set_deal_chunk_bytes(Some(0));
         dec.set_helper_first(true);
-        let earlier = command_buffer_message(404, 134, &blit_ops());
+        let earlier = command_buffer_message(406, 136, &blit_ops());
         assert_eq!(dec.decode(&device, &earlier).unwrap(), Ok(()));
-        let message = command_buffer_message(405, 135, &passes(8));
+        let message = command_buffer_message(407, 137, &passes(8));
         assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
         assert_eq!(
             p.world().committed().len(),
@@ -9865,7 +9995,7 @@ mod tests {
             "the earlier buffer and two parts"
         );
         p.world().complete_all(CompleteOn::Caller);
-        let message = command_buffer_message(406, 136, &passes(8));
+        let message = command_buffer_message(408, 138, &passes(8));
         assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
         assert_eq!(p.world().committed().len(), 8, "a part each chunk");
         p.world().complete_all(CompleteOn::Caller);
@@ -9873,6 +10003,308 @@ mod tests {
             .filter(|(kind, _)| *kind == RGFX_EVT_CB_COMPLETE)
             .collect();
         assert_eq!(completes, [ok, ok, ok]);
+    }
+
+    /// [`splitting`], its walks paced on the thread that decodes them, as a lane's are.
+    fn pacing() -> Split {
+        let split = splitting();
+        split.dec.set_pace_anywhere(true);
+        split
+    }
+
+    /// Waits, in real time, until `p` has `n` command buffers or more committed and not
+    /// complete, and answers them.
+    fn committed_at_least(p: &FakePlatform, n: usize) -> Vec<ObjId> {
+        let mut waited = std::time::Duration::ZERO;
+        loop {
+            let committed = p.world().committed();
+            if committed.len() >= n {
+                return committed;
+            }
+            assert!(
+                waited < std::time::Duration::from_secs(10),
+                "{} committed",
+                committed.len()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            waited += std::time::Duration::from_millis(1);
+        }
+    }
+
+    /// A paced walk waits after a cut while its parts out run far ahead of the GPU
+    /// ([`super::super::split`], "How far ahead of the GPU"): with nothing to estimate their GPU
+    /// time from, once two parts or more are out and walked over [`PACE_UNKNOWN_WALK`]; it goes
+    /// on as a part is seen complete, and, its parts' GPU time a small share of their walk's, cuts
+    /// and commits the rest without waiting again. Its queue keeps the rate measured. The guest
+    /// has one `CB_COMPLETE`, after its last part.
+    #[test]
+    fn a_paced_walk_waits_while_its_parts_run_far_ahead_of_the_gpu() {
+        let Split {
+            p, mut dec, posted, ..
+        } = pacing();
+        let device = p.device();
+        let rate = Arc::clone(&dec.queue_counts(1).expect("queue 1").rate);
+        let message = command_buffer_message(410, 140, &passes(8));
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| dec.decode(&device, &message).unwrap());
+            let out = committed_at_least(&p, 2);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let held = p.world().committed();
+            assert!(!walk.is_finished(), "waits with {} parts out", held.len());
+            assert!(held.len() < 8, "{} parts out", held.len());
+            // A tenth of a millisecond of GPU time against at least 250 µs of walk.
+            assert!(p.world().set_gpu_times(out[0], 1_000, 101_000));
+            assert!(p.world().complete(
+                out[0],
+                CommandBufferStatus::COMPLETED,
+                None,
+                CompleteOn::Caller
+            ));
+            assert_eq!(walk.join().unwrap(), Ok(()));
+        });
+        assert_eq!(p.world().committed().len(), 7, "the rest committed");
+        assert!(
+            rate.get().is_some_and(|r| r > 0.0 && r < 1.0),
+            "{:?}",
+            rate.get()
+        );
+        p.world().complete_all(CompleteOn::Caller);
+        let completes: Vec<_> = (answered(&posted).into_iter())
+            .filter(|(kind, _)| *kind == RGFX_EVT_CB_COMPLETE)
+            .collect();
+        assert_eq!(completes, [(RGFX_EVT_CB_COMPLETE, RGFX_CB_OK)]);
+    }
+
+    /// A paced walk whose parts' estimated GPU time stays low waits after a cut while the oldest
+    /// of its parts out was committed [`PACE_AHEAD`] ago or more ([`super::super::split`], "How
+    /// far ahead of the GPU"): its queue's walks measured a GPU time a hundredth of their walk's,
+    /// and its ops walk 4 ms each, so its parts reach that age with a fraction of a millisecond
+    /// estimated. It goes on once they are seen complete. The guest has one `CB_COMPLETE`, after
+    /// its last part.
+    #[test]
+    fn a_paced_walk_waits_while_its_oldest_part_out_is_a_refresh_old() {
+        use std::sync::atomic::AtomicU64;
+        let Split {
+            p, mut dec, posted, ..
+        } = pacing();
+        let device = p.device();
+        let step = Arc::new(AtomicU64::new(4_000_000));
+        let clock = Arc::clone(&p);
+        let steps = Arc::clone(&step);
+        dec.set_walk_hook(Some(Arc::new(move |_| {
+            let ns = steps.load(std::sync::atomic::Ordering::Relaxed);
+            clock.virtual_clock().advance(Duration::from_nanos(ns));
+        })));
+        dec.queue_counts(1).expect("queue 1").rate.set(0.01);
+        let message = command_buffer_message(415, 145, &passes(8));
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| dec.decode(&device, &message).unwrap());
+            committed_at_least(&p, 2);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let held = p.world().committed();
+            assert!(!walk.is_finished(), "waits with {} parts out", held.len());
+            assert!(held.len() < 8, "{} parts out", held.len());
+            // The rest walks in no time, so it is one part.
+            step.store(0, std::sync::atomic::Ordering::Relaxed);
+            for part in held {
+                assert!(p.world().set_gpu_times(part, 1_000, 2_000));
+                assert!(p.world().complete(
+                    part,
+                    CommandBufferStatus::COMPLETED,
+                    None,
+                    CompleteOn::Caller
+                ));
+            }
+            assert_eq!(walk.join().unwrap(), Ok(()));
+        });
+        p.world().complete_all(CompleteOn::Caller);
+        let completes: Vec<_> = (answered(&posted).into_iter())
+            .filter(|(kind, _)| *kind == RGFX_EVT_CB_COMPLETE)
+            .collect();
+        assert_eq!(completes, [(RGFX_EVT_CB_COMPLETE, RGFX_CB_OK)]);
+    }
+
+    /// What ends a paced walk's wait at once ([`super::super::split`], "How far ahead of the
+    /// GPU").
+    #[derive(Clone, Copy, Debug)]
+    enum PaceEnd {
+        /// A reset of the device begins.
+        Reset,
+        /// The buffer's queue ends.
+        QueueEnd,
+        /// A part out fails.
+        Fault,
+        /// [`PACE_WAIT_MOST`] passes.
+        Bound,
+    }
+
+    /// A paced walk's wait ends at once where a reset of the device begins, its queue ends, a part
+    /// out fails or [`PACE_WAIT_MOST`] passes, none of its parts seen complete; it then walks on
+    /// unpaced to its end, cutting and committing the rest as a walk did before it was paced, so
+    /// nothing is left half-committed. The guest has one `CB_COMPLETE`, after its last part, with
+    /// the failed part's error.
+    #[test]
+    fn a_paced_walk_s_wait_ends_at_a_reset_its_queue_s_end_a_fault_or_its_bound() {
+        use reims_vgpu_vulkan::core::platform::types::NsErrorText;
+        for end in [
+            PaceEnd::Reset,
+            PaceEnd::QueueEnd,
+            PaceEnd::Fault,
+            PaceEnd::Bound,
+        ] {
+            let Split {
+                p, mut dec, posted, ..
+            } = pacing();
+            let device = p.device();
+            let shared = Arc::clone(&dec.shared);
+            let marks = Arc::clone(&dec.queue_counts(1).expect("queue 1").order);
+            let message = command_buffer_message(420, 150, &passes(8));
+            std::thread::scope(|scope| {
+                let walk = scope.spawn(|| dec.decode(&device, &message).unwrap());
+                let out = committed_at_least(&p, 2);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                assert!(!walk.is_finished(), "{end:?}: waits");
+                match end {
+                    PaceEnd::Reset => shared.commit_cancel.begin(),
+                    PaceEnd::QueueEnd => marks.commit.end(),
+                    PaceEnd::Fault => assert!(p.world().complete(
+                        out[0],
+                        CommandBufferStatus::ERROR,
+                        Some(NsErrorText {
+                            domain: "MTLCommandBufferErrorDomain".to_owned(),
+                            code: 3,
+                            description: "Page Fault".to_owned(),
+                        }),
+                        CompleteOn::Caller
+                    )),
+                    PaceEnd::Bound => p.virtual_clock().advance(PACE_WAIT_MOST),
+                }
+                assert_eq!(walk.join().unwrap(), Ok(()), "{end:?}");
+            });
+            let left = p.world().committed().len();
+            let expected = if matches!(end, PaceEnd::Fault) { 7 } else { 8 };
+            assert_eq!(left, expected, "{end:?}: every part committed");
+            p.world().complete_all(CompleteOn::Caller);
+            let status = if matches!(end, PaceEnd::Fault) {
+                reims_vgpu_graphics::wire::RGFX_CB_PAGE_FAULT
+            } else {
+                RGFX_CB_OK
+            };
+            let completes: Vec<_> = (answered(&posted).into_iter())
+                .filter(|(kind, _)| *kind == RGFX_EVT_CB_COMPLETE)
+                .collect();
+            assert_eq!(completes, [(RGFX_EVT_CB_COMPLETE, status)], "{end:?}");
+        }
+    }
+
+    /// A walk that waits for an event by an op, or signals one, is never paced
+    /// ([`super::super::split`], "How far ahead of the GPU"): a part's completion may wait for a
+    /// buffer committed only after the walk's last part (one of its context's, which waits at the
+    /// split's gate). One that signals in its first part cuts and commits every part with none
+    /// seen complete; a buffer that waits for an event its context's other queue signals is
+    /// committed whole, walked with nothing seen complete, and the signalling buffer is committed
+    /// after it.
+    #[test]
+    fn a_walk_that_waits_for_or_signals_an_event_by_an_op_is_not_paced() {
+        let Split { p, mut dec, .. } = pacing();
+        let device = p.device();
+        create_events(&p, &mut dec, 0);
+        create_queue(&p, &mut dec, 9);
+
+        // Signals plain event 6 in its first part.
+        let mut ops = event_op(RGFX_OP_SIGNAL_EVENT, 6, 1);
+        ops.extend(passes(8));
+        let message = command_buffer_message(434, 162, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(p.world().committed().len(), 8, "8 parts");
+        p.world().complete_all(CompleteOn::Caller);
+
+        // Waits for shared event 7, which queue 9 of its context signals after it.
+        let mut ops = event_op(RGFX_OP_WAIT_EVENT, 7, 1);
+        ops.extend(passes(8));
+        let message = command_buffer_message(436, 163, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(p.world().committed().len(), 1, "whole");
+        let mut ops = event_op(RGFX_OP_SIGNAL_EVENT, 7, 1);
+        ops.extend(render_ops());
+        let signal = command_buffer_on(9, 437, &ops);
+        assert_eq!(dec.decode(&device, &signal).unwrap(), Ok(()));
+        assert_eq!(
+            p.world().committed().len(),
+            2,
+            "the signal committed after it"
+        );
+        p.world().complete_all(CompleteOn::Caller);
+    }
+
+    /// A walk that waits from its begin for another queue's buffer is paced, and goes on unpaced
+    /// once a buffer of its context waits for its last commit ([`super::super::split`], "How far
+    /// ahead of the GPU"): the next buffer of that queue, of the same context, waits at the
+    /// split's gate, which ends the walk's wait within a slice with none of its parts seen
+    /// complete. The walk cuts and commits the rest, and the other queue's buffer is committed
+    /// after its last part.
+    #[test]
+    fn a_paced_walk_goes_on_unpaced_once_a_buffer_of_its_context_waits_for_it() {
+        use reims_vgpu_graphics::ops::{RGFX_OP_SURFACE_ORDER, RgfxSurfaceOrderWait};
+        let Split { p, mut dec, .. } = pacing();
+        let device = p.device();
+        create_queue(&p, &mut dec, 9);
+        // Queue 9's buffer, committed and not complete, which the walk waits for from its begin.
+        let order = |waits: &[RgfxSurfaceOrderWait]| op(RGFX_OP_SURFACE_ORDER, waits.as_bytes());
+        let read = command_buffer_on(9, 440, &order(&[]));
+        assert_eq!(dec.decode(&device, &read).unwrap(), Ok(()));
+        let mut ops = order(&[RgfxSurfaceOrderWait {
+            queue_obj_id: 9,
+            seqno: 440,
+        }]);
+        ops.extend(passes(8));
+        let message = command_buffer_message(441, 170, &ops);
+        let later = command_buffer_on(9, 442, &render_ops());
+        let mut other = dec.sender(Some(0), super::super::Sinks::default());
+        let commits = || {
+            (p.call_log().calls().into_iter())
+                .filter(|c| c.sel == "commit" || c.sel == "split")
+                .filter_map(|c| c.thread)
+                .filter(|t| t == "parts" || t == "other")
+                .collect::<Vec<_>>()
+        };
+        std::thread::scope(|scope| {
+            let walk = std::thread::Builder::new()
+                .name("parts".into())
+                .spawn_scoped(scope, || dec.decode(&p.device(), &message).unwrap())
+                .unwrap();
+            committed_at_least(&p, 3);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!walk.is_finished(), "paced from its begin's wait");
+            let out = commits().len();
+            assert!(out < 8, "{out} parts out");
+            let b = std::thread::Builder::new()
+                .name("other".into())
+                .spawn_scoped(scope, || other.decode(&p.device(), &later).unwrap())
+                .unwrap();
+            assert_eq!(walk.join().unwrap(), Ok(()));
+            assert_eq!(b.join().unwrap(), Ok(()));
+        });
+        assert_eq!(
+            commits(),
+            [vec!["parts".to_owned(); 8], vec!["other".to_owned()]].concat(),
+            "every part, none seen complete, then the other queue's buffer"
+        );
+        p.world().complete_all(CompleteOn::Caller);
+    }
+
+    /// Makes queue `obj_id` of `dec`'s context.
+    fn create_queue(p: &FakePlatform, dec: &mut GraphicsDecoder<FakePlatform>, obj_id: u64) {
+        let queue = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            ..RgfxQueueCreate::default()
+        };
+        assert_eq!(dec.decode(&p.device(), queue.as_bytes()).unwrap(), Ok(()));
     }
 
     /// `n` passes of [`render_ops`].
