@@ -780,7 +780,7 @@ void ReimsGraphics::startVtService()
 		return;
 	}
 	if (!rgfxVtServesRelease(version_major)) {
-		IOLog("ReimsGraphics: no VideoToolbox service on kernel %d: macOS 15 and later only\n",
+		IOLog("ReimsGraphics: no VideoToolbox service on kernel %d: macOS 14 and later only\n",
 		      version_major);
 		return;
 	}
