@@ -24,7 +24,7 @@ Arch = "arm64e"
 MinKernel = "23.0.0"
 MaxKernel = ""
 Comment = "The reims-graphics display and accelerator"
-sha256 = "80136bf26466884230cd807bc3651c845a68120039c14a305cc8b15cff9b50c4"
+sha256 = "3ab261bbd3fdaca93c91af30e220b302500a65b5914502208d08be4f14f4b6af"
 
 [[kext]]
 BundlePath = "RgfxGate.kext"
