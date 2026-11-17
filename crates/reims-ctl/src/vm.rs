@@ -806,13 +806,16 @@ impl Vm {
         &self.config.name
     }
 
-    /// `p` against the VM's directory, unless absolute.
+    /// `p` against the VM's directory, unless absolute, in the host's own form
+    /// ([`paths::native`]): on Windows the settings of a VM made before reims-ctl wrote its paths
+    /// there with `\` alone can name a file with `/` inside its path, as an installer reims-util
+    /// downloaded into `~\.local/share\reims-ctl\installers`.
     pub fn path(&self, p: &Path) -> PathBuf {
-        if p.is_absolute() {
+        paths::native(if p.is_absolute() {
             p.to_path_buf()
         } else {
             self.dir.join(p)
-        }
+        })
     }
 
     pub fn disk(&self) -> PathBuf {
@@ -910,13 +913,23 @@ pub struct Entry {
 }
 
 impl Registry {
+    /// The registry, each VM's directory in the host's own form ([`paths::native`]): on Windows a
+    /// reims-ctl from before it wrote its paths there with `\` alone recorded a new VM's directory
+    /// with `/` inside it (`C:\Users\me\.local/share\reims-ctl\vms\mac`), which every message
+    /// naming the directory or a file in it would show. The next save writes it in that form.
     pub fn load() -> Result<Registry> {
         let file = paths::registry_file();
-        match std::fs::read_to_string(&file) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("parse {}", file.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Registry::default()),
-            Err(e) => Err(e).with_context(|| format!("read {}", file.display())),
+        let mut reg: Registry = match std::fs::read_to_string(&file) {
+            Ok(text) => {
+                toml::from_str(&text).with_context(|| format!("parse {}", file.display()))?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Registry::default(),
+            Err(e) => return Err(e).with_context(|| format!("read {}", file.display())),
+        };
+        for e in &mut reg.vms {
+            e.dir = paths::native(std::mem::take(&mut e.dir));
         }
+        Ok(reg)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -1376,6 +1389,65 @@ pub(crate) mod tests {
         c.network.ssh_port = None;
         let none = toml::to_string_pretty(&c).unwrap();
         assert_eq!(toml::from_str::<VmConfig>(&none).unwrap(), c);
+    }
+
+    /// A VM a reims-ctl from before its paths on Windows had `\` alone made there: the registry
+    /// names its directory, and its settings its installer, with `/` inside the path, as that
+    /// reims-ctl joined `.local/share` in one part (`C:\Users\me\.local/share\reims-ctl\vms\old`).
+    /// On Windows both are read in Windows' own form, so the messages and QEMU's command that
+    /// name them, or a file in the directory, show `\` alone, and the registry's next save
+    /// writes the directory so; a QEMU started from the recorded directory still runs the VM.
+    /// Elsewhere a path is kept as recorded.
+    #[test]
+    fn a_vm_recorded_with_slashes_inside_is_named_in_the_host_s_form() {
+        use std::path::MAIN_SEPARATOR_STR as SEP;
+        let env = crate::testenv::Env::new("mixed-dir");
+        let data = format!("{}{SEP}.local/share{SEP}reims-ctl", env.root.display());
+        let dir = PathBuf::from(format!("{data}{SEP}vms{SEP}old"));
+        let installer = PathBuf::from(format!("{data}{SEP}installers{SEP}BaseSystem.img"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = x86_64_config();
+        c.name = "old".into();
+        c.q35.as_mut().unwrap().installer = Some(installer.clone());
+        let old = Vm {
+            dir: dir.clone(),
+            config: c,
+        };
+        old.save().unwrap();
+        std::fs::create_dir_all(paths::config_dir()).unwrap();
+        std::fs::write(
+            paths::registry_file(),
+            format!(
+                "[[vm]]\nname = \"old\"\ndir = \"{}\"\n",
+                crate::testenv::toml_path(&dir)
+            ),
+        )
+        .unwrap();
+
+        // A QEMU that reims-ctl started from the recorded directory, which names its pid file so.
+        let mut qemu = crate::runtime::test_qemu(&pidfile_in(&dir), 30);
+        let reg = Registry::load().unwrap();
+        let vm = reg.open("old").unwrap();
+        let running = crate::runtime::running(&vm);
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        assert!(running, "{}", vm.pidfile().display());
+        let shown = |p: &Path| p.display().to_string();
+        if cfg!(windows) {
+            assert_eq!(shown(&vm.dir), shown(&dir).replace('/', "\\"));
+            let named = [reg.find("old").unwrap().dir.clone(), vm.qemu_log()];
+            for p in named.iter().chain(&vm.files()) {
+                assert!(!shown(p).contains('/'), "{}", shown(p));
+            }
+            let want = shown(&installer).replace('/', "\\");
+            assert!(vm.files().iter().any(|p| shown(p) == want), "{want}");
+            reg.save().unwrap();
+            let text = std::fs::read_to_string(paths::registry_file()).unwrap();
+            assert!(!text.contains('/'), "{text}");
+        } else {
+            assert_eq!(vm.dir, dir);
+            assert!(vm.files().contains(&installer));
+        }
     }
 
     /// A VM is an x86-64 one, with its [q35] settings; VMware SVGA is one of its devices.

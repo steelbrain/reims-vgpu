@@ -34,14 +34,28 @@ pub fn pid(vm: &Vm) -> Option<i32> {
 }
 
 /// The pid of the QEMU that writes `pidfile`, while it runs: what [`pid`] reads, for a VM whose
-/// settings may not read.
+/// settings may not read. QEMU is known by `pidfile` on its command line. On Windows a `/` there
+/// is the same as a `\`: a QEMU an earlier reims-ctl started from a VM directory it recorded with
+/// `/` inside its path (`vm::Registry::load`) names its pid file so.
 pub fn pid_at(pidfile: &Path) -> Option<i32> {
     let pid: i32 = std::fs::read_to_string(pidfile).ok()?.trim().parse().ok()?;
     if pid <= 0 || !alive(pid) || !crate::os::may_be_qemu(pid) {
         return None;
     }
-    let needle = pidfile.as_os_str().as_encoded_bytes();
-    let cmd = crate::os::cmdline(pid)?;
+    let sep = |b: &u8| {
+        if cfg!(windows) && *b == b'/' {
+            b'\\'
+        } else {
+            *b
+        }
+    };
+    let needle: Vec<u8> = pidfile
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .map(sep)
+        .collect();
+    let cmd: Vec<u8> = crate::os::cmdline(pid)?.iter().map(sep).collect();
     cmd.windows(needle.len())
         .any(|w| w == needle)
         .then_some(pid)
