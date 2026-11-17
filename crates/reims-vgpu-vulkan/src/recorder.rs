@@ -694,6 +694,14 @@ pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
     }
 }
 
+/// The call `active` opened encoded nothing, so the stream holds no record of it: a copy between
+/// a buffer and the guest's RAM that the platform did not make (it answered false, or a refusal).
+pub fn unmade(active: &mut Option<Active>) {
+    if let Some(a) = active {
+        a.pending = None;
+    }
+}
+
 /// The guest's RAM a copy into `destination` reads (`m2v.copyFromGuestRam`,
 /// `m2v.copyFromGuestRamAt`), where the platform encoded the copy: once the earlier command
 /// buffers that can run have finished, as before a commit ([`before_commit`]), each run's bytes,
@@ -1756,6 +1764,16 @@ fn hash64(data: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A copy the platform did not make leaves its call nothing to record.
+    #[test]
+    fn an_unmade_copy_is_not_recorded() {
+        let token = enter_recording();
+        let mut active = Some(begin(token, || ("m2v.copyFromGuestRam", 3, Vec::new())));
+        assert!(active.as_ref().is_some_and(Active::recorded));
+        unmade(&mut active);
+        assert!(!active.as_ref().is_some_and(Active::recorded));
+    }
 
     /// A copy out of the guest's RAM carries the bytes it reads through the stream and back, each
     /// run with the byte it lands from: a long run as a blob, a short one inline.
