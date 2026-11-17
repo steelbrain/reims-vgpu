@@ -873,9 +873,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // The guest's Shared pool, its blocks the process's own memory until the device runs
             // on metal2vulkan-rt, whose blocks then fill it through the same calls.
             let pool = match pool_host {
-                Some((range, host)) => Some(Pool::new(range, host, |mappings| {
-                    Arc::new(HostBlocks::new(mappings))
-                })?),
+                Some((range, host)) => {
+                    let clock = Arc::clone(&platform);
+                    let now = Box::new(move || clock.clock().now_mono());
+                    Some(Pool::new(range, host, now, |mappings| {
+                        Arc::new(HostBlocks::new(mappings))
+                    })?)
+                }
                 None => None,
             };
             let device = reims_vgpu_graphics::Device::with_screens(region, host, screens)

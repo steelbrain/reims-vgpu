@@ -1,4 +1,8 @@
-use std::sync::Arc;
+// Test scaffolding: real time bounds the waits and runs the delays, and a helper thread stands in
+// for a thread of the device's.
+#![allow(clippy::disallowed_methods)]
+
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
@@ -56,11 +60,17 @@ impl Host {
     }
 }
 
+/// The tests' monotonic clock: nanoseconds since its first reading.
+fn now() -> PoolNow {
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+    Box::new(|| MonoTime::from_nanos(u64::try_from(START.elapsed().as_nanos()).unwrap()))
+}
+
 /// The host blocks the pool takes from, kept for the tests' counts.
 fn pool(range: PoolConfig, host: &Arc<Host>, delay: Duration) -> (Pool, Arc<HostBlocks>) {
     let kept: Arc<Mutex<Option<Arc<HostBlocks>>>> = Arc::default();
     let k = Arc::clone(&kept);
-    let pool = Pool::with_delay(range, host.pool_host(), delay, move |m| {
+    let pool = Pool::with_delay(range, host.pool_host(), delay, now(), move |m| {
         let blocks = Arc::new(HostBlocks::new(m));
         *k.lock() = Some(Arc::clone(&blocks));
         let source: Arc<dyn BlockSource> = blocks;
@@ -102,9 +112,9 @@ fn a_range_must_be_whole_large_pages_and_not_empty() {
     }
     let host = Arc::new(Host::default());
     assert_eq!(
-        Pool::new(PoolConfig::default(), host.pool_host(), |m| Arc::new(
-            HostBlocks::new(m)
-        ))
+        Pool::new(PoolConfig::default(), host.pool_host(), now(), |m| {
+            Arc::new(HostBlocks::new(m))
+        })
         .err(),
         Some(Error::InvalidArgument)
     );

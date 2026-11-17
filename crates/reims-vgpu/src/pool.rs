@@ -53,9 +53,10 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
+use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
 
 pub(crate) use host_blocks::HostBlocks;
 
@@ -74,7 +75,10 @@ pub const RELEASE_DELAY: Duration = Duration::from_secs(5);
 
 /// A block's storage mode as the guest's buffers in it see it (metal2vulkan-rt's `MemoryClass`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[allow(dead_code, reason = "metal2vulkan-rt's shape, kept whole so only the source changes when it lands")]
+#[allow(
+    dead_code,
+    reason = "metal2vulkan-rt's shape, kept whole so only the source changes when it lands"
+)]
 pub enum MemoryClass {
     /// Device-local, never mapped, no host pointer.
     Private,
@@ -88,7 +92,10 @@ pub struct BlockId(pub u32);
 
 impl BlockId {
     /// The number.
-    #[allow(dead_code, reason = "metal2vulkan-rt's shape, kept whole so only the source changes when it lands")]
+    #[allow(
+    dead_code,
+    reason = "metal2vulkan-rt's shape, kept whole so only the source changes when it lands"
+)]
     pub fn get(self) -> u32 {
         self.0
     }
@@ -96,7 +103,10 @@ impl BlockId {
 
 /// A block a source handed out (metal2vulkan-rt's `BlockInfo`): plain data.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code, reason = "metal2vulkan-rt's shape, kept whole so only the source changes when it lands")]
+#[allow(
+    dead_code,
+    reason = "metal2vulkan-rt's shape, kept whole so only the source changes when it lands"
+)]
 pub struct BlockInfo {
     /// Its number.
     pub id: BlockId,
@@ -159,8 +169,8 @@ impl PoolConfig {
     /// past the address space.
     pub fn is_valid(self) -> bool {
         self.physical_length != 0
-            && self.physical_address % PIECE_ALIGN == 0
-            && self.physical_length % PIECE_ALIGN == 0
+            && self.physical_address.is_multiple_of(PIECE_ALIGN)
+            && self.physical_length.is_multiple_of(PIECE_ALIGN)
             && self
                 .physical_address
                 .checked_add(self.physical_length)
@@ -185,6 +195,9 @@ pub type PoolAddFn = Arc<dyn Fn(u64, *mut u8, u64) + Send + Sync>;
 /// on the source's thread, with no lock of the device's held; it must not wait for a lock the host
 /// holds while it calls the device.
 pub type PoolRemoveFn = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+/// The platform's monotonic clock, which times an empty piece's delay.
+pub(crate) type PoolNow = Box<dyn Fn() -> MonoTime + Send + Sync>;
 
 /// The host's side of the pool.
 #[derive(Clone)]
@@ -217,7 +230,7 @@ struct Piece {
     /// source unmaps it, and nothing finds it.
     held: bool,
     /// Since when nothing of the guest's lies in it; `None` while something does.
-    empty_since: Option<Instant>,
+    empty_since: Option<MonoTime>,
     /// Holds on it ([`PieceHold`]).
     holds: u64,
 }
@@ -250,12 +263,17 @@ struct Shared {
     host: PoolHost,
     /// [`RELEASE_DELAY`], shorter in the tests.
     release_delay: Duration,
+    /// The platform's monotonic clock.
+    now: PoolNow,
     state: Mutex<State>,
     changed: Condvar,
 }
 
 /// A hold on a live piece: while it lives, an unmap of its block waits.
-#[allow(dead_code, reason = "the guest's side of the pool (its ring messages) calls it once it lands")]
+#[allow(
+    dead_code,
+    reason = "the guest's side of the pool (its ring messages) calls it once it lands"
+)]
 pub struct PieceHold {
     shared: Arc<Shared>,
     physical_address: u64,
@@ -317,15 +335,16 @@ impl std::fmt::Debug for Pool {
 }
 
 impl Pool {
-    /// A pool over `range`, its blocks from what `source` makes with the pool's hook, and its
-    /// thread started. [`Error::InvalidArgument`] for a range [`PoolConfig::is_valid`] refuses,
-    /// [`Error::HostResources`] where the thread is refused.
+    /// A pool over `range`, timed by `now`, its blocks from what `source` makes with the pool's
+    /// hook, and its thread started. [`Error::InvalidArgument`] for a range
+    /// [`PoolConfig::is_valid`] refuses, [`Error::HostResources`] where the thread is refused.
     pub(crate) fn new(
         range: PoolConfig,
         host: PoolHost,
+        now: PoolNow,
         source: impl FnOnce(Arc<dyn BlockMappings>) -> Arc<dyn BlockSource>,
     ) -> Result<Pool, Error> {
-        Pool::with_delay(range, host, RELEASE_DELAY, source)
+        Pool::with_delay(range, host, RELEASE_DELAY, now, source)
     }
 
     /// [`Pool::new`], its pieces given back after `release_delay`.
@@ -333,6 +352,7 @@ impl Pool {
         range: PoolConfig,
         host: PoolHost,
         release_delay: Duration,
+        now: PoolNow,
         source: impl FnOnce(Arc<dyn BlockMappings>) -> Arc<dyn BlockSource>,
     ) -> Result<Pool, Error> {
         if !range.is_valid() {
@@ -342,6 +362,7 @@ impl Pool {
             range,
             host,
             release_delay,
+            now,
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
         });
@@ -403,7 +424,10 @@ impl Pool {
     /// The guest put something in the piece at `physical_address`. Where no other piece is
     /// empty, the pool asks for a block more, so one stays as headroom.
     /// [`Error::InvalidArgument`] for an address where no piece the guest may use starts.
-    #[allow(dead_code, reason = "the guest's side of the pool (its ring messages) calls it once it lands")]
+    #[allow(
+        dead_code,
+        reason = "the guest's side of the pool (its ring messages) calls it once it lands"
+    )]
     pub fn piece_used(&self, physical_address: u64) -> Result<(), Error> {
         let mut st = self.shared.state.lock();
         let p = (st.pieces.get_mut(&physical_address)).ok_or(Error::InvalidArgument)?;
@@ -427,7 +451,10 @@ impl Pool {
     /// empty too, its block goes back to the source, and the guest may not use it again until the
     /// device hands it out anew. [`Error::InvalidArgument`] for an address where no piece the
     /// guest may use starts.
-    #[allow(dead_code, reason = "the guest's side of the pool (its ring messages) calls it once it lands")]
+    #[allow(
+        dead_code,
+        reason = "the guest's side of the pool (its ring messages) calls it once it lands"
+    )]
     pub fn piece_empty(&self, physical_address: u64) -> Result<(), Error> {
         let mut st = self.shared.state.lock();
         let p = (st.pieces.get_mut(&physical_address)).ok_or(Error::InvalidArgument)?;
@@ -435,7 +462,7 @@ impl Pool {
             return Err(Error::InvalidArgument);
         }
         if p.empty_since.is_none() {
-            p.empty_since = Some(Instant::now());
+            p.empty_since = Some((self.shared.now)());
         }
         drop(st);
         self.shared.changed.notify_all();
@@ -444,7 +471,10 @@ impl Pool {
 
     /// The live piece the guest may use that holds `length` bytes from `physical_address`, held
     /// until the answer drops; `None` where none holds all of them.
-    #[allow(dead_code, reason = "the guest's side of the pool (its ring messages) calls it once it lands")]
+    #[allow(
+        dead_code,
+        reason = "the guest's side of the pool (its ring messages) calls it once it lands"
+    )]
     pub fn find(&self, physical_address: u64, length: u64) -> Option<PieceHold> {
         let mut st = self.shared.state.lock();
         let (&start, p) = st.pieces.range_mut(..=physical_address).next_back()?;
@@ -471,7 +501,10 @@ impl Pool {
 
     /// The pieces the guest may use and the host mapped, by address: `(physical_address,
     /// length)`.
-    #[allow(dead_code, reason = "the guest's side of the pool (its ring messages) calls it once it lands")]
+    #[allow(
+        dead_code,
+        reason = "the guest's side of the pool (its ring messages) calls it once it lands"
+    )]
     pub fn live(&self) -> Vec<(u64, u64)> {
         let st = self.shared.state.lock();
         (st.pieces.iter())
@@ -521,7 +554,7 @@ impl Shared {
                 }
                 continue;
             }
-            let now = Instant::now();
+            let now = (self.now)();
             let (due, next) = self.due(&st, now);
             if let Some((at, block)) = due {
                 if let Some(p) = st.pieces.get_mut(&at) {
@@ -536,29 +569,30 @@ impl Shared {
                 continue;
             }
             match next {
-                Some(when) => {
-                    let _ = self.changed.wait_until(&mut st, when);
+                Some(after) => {
+                    let _ = self.changed.wait_for(&mut st, after);
                 }
                 None => self.changed.wait(&mut st),
             }
         }
     }
 
-    /// The piece whose block goes back now, if any, and when the next may: of the empty pieces
-    /// the guest may use, every one but the lowest, once empty for the delay.
-    fn due(&self, st: &State, now: Instant) -> (Option<(u64, BlockId)>, Option<Instant>) {
+    /// The piece whose block goes back now, if any, and how long until the next may: of the
+    /// empty pieces the guest may use, every one but the lowest, once empty for the delay.
+    fn due(&self, st: &State, now: MonoTime) -> (Option<(u64, BlockId)>, Option<Duration>) {
         let mut empty = (st.pieces.iter()).filter_map(|(&at, p)| {
             let since = p.empty_since.filter(|_| p.usable())?;
-            Some((at, p.block.id, since.checked_add(self.release_delay)?))
+            Some((at, p.block.id, since.saturating_add(self.release_delay)))
         });
         // The lowest empty piece is the headroom.
         let _ = empty.next();
-        let mut next: Option<Instant> = None;
+        let mut next: Option<Duration> = None;
         for (at, block, when) in empty {
             if when <= now {
                 return (Some((at, block)), None);
             }
-            next = Some(next.map_or(when, |n| n.min(when)));
+            let after = when.saturating_duration_since(now);
+            next = Some(next.map_or(after, |n| n.min(after)));
         }
         (None, next)
     }
@@ -570,7 +604,7 @@ impl Shared {
         if let Some(&at) = st.by_block.get(&block.id) {
             if let Some(p) = st.pieces.get_mut(&at) {
                 p.held = true;
-                p.empty_since = Some(Instant::now());
+                p.empty_since = Some((self.now)());
             }
             return;
         }
@@ -598,7 +632,7 @@ impl Shared {
                 block,
                 mapped: Mapped::Adding,
                 held: true,
-                empty_since: Some(Instant::now()),
+                empty_since: Some((self.now)()),
                 holds: 0,
             },
         );
@@ -614,7 +648,7 @@ impl Shared {
             return;
         }
         let mut warned = false;
-        let started = Instant::now();
+        let started = (self.now)();
         loop {
             let closed = st.closed;
             let Some(&at) = st.by_block.get(&block) else {
@@ -642,7 +676,8 @@ impl Shared {
                     return;
                 }
                 _ => {
-                    if !warned && started.elapsed() > Duration::from_secs(1) {
+                    let waited = (self.now)().saturating_duration_since(started);
+                    if !warned && waited > Duration::from_secs(1) {
                         warned = true;
                         log::warn!(
                             "pool: the unmap of the piece at {at:#x} still waits after 1 s: {}",
