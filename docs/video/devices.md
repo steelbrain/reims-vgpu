@@ -21,8 +21,9 @@ runtime device (reims-vgpu's `graphics/video_choice.rs`):
 On Windows the device's video runs on VA-API alone, through libva-win32 on the DXGI adapter of
 the runtime device's GPU (the LUID Vulkan answers for it) and Mesa's VA-API driver on Direct3D 12,
 `vaon12`, which reims-ctl's install takes from MSYS2's CLANG64 packages. Windows makes no
-dma-buf, so its pictures come back through `vaGetImage` and the CPU's copy into the guest's
-planes ([vaapi.md](vaapi.md), "Loading libva"). On Intel's UHD 630 (driver 31.0.101.2145)
+dma-buf: its pictures decode into shared Direct3D 12 textures, which the runtime device's GPU
+copies into the guest's planes, or their device caches; where the device imports none, they come
+back through `vaGetImage` and the CPU's copy ([vaapi.md](vaapi.md), "Loading libva"). On Intel's UHD 630 (driver 31.0.101.2145)
 `vaon12` decodes H.264 and HEVC Main and Main 10 and encodes nothing, so the device lists no
 encoder there.
 

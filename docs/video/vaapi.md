@@ -47,6 +47,17 @@ over memory of ours, the import check (`Display::import_writes` finds no
 import), and the staged and mapped copies back. Its frames come back through
 `vaGetImage`, and its tests that need dma-bufs are Linux's.
 
+On Windows a pool's surfaces are shared Direct3D 12 textures of ours
+(`src/vaapi/va/d3d12.rs`): each made on the display's adapter, NV12 or
+P010, in a shared heap, and imported by the driver through its NT handle
+(`VA_SURFACE_ATTRIB_MEM_TYPE_NTHANDLE`), so that the Vulkan platform opens
+what decodes into it (`Frame::texture`). `vaon12`'s own surfaces are not
+shared, and their export fails (UHD 630, Mesa 26.2.7). Where the adapter's
+device makes no such texture or the driver imports none, the pool's surfaces
+are the driver's own, and why is logged at info once a process. The
+Direct3D 12 binding is written by hand: `d3d12.dll` and `dxgi.dll` loaded
+as libva is, each COM method called through its vtable.
+
 ### Loading libva
 
 The binding's 37 functions come from `dlopen` and `dlsym`, on Windows from
@@ -451,7 +462,11 @@ the render node of the runtime device's own GPU, whatever its vendor
      format and DRM format modifier, and copied out with
      `vkCmdCopyImageToBuffer` on a queue of the session's copier
      (reims-vgpu's `src/graphics/vaapi/gpu_copy.rs`, the Vulkan
-     platform's `PlaneCopier`). It writes the crop the CPU's copy writes,
+     platform's `PlaneCopier`). On Windows the source is the shared texture
+     the surface is (`Frame::texture`), imported once by its NT handle as
+     one two-plane image (`VK_KHR_external_memory_win32`, which the
+     platform enables where the device lists it), each plane copied from
+     its aspect. It writes the crop the CPU's copy writes,
      and nothing past it (`crop_extent`), once the decode is done, and the
      session signals the decode once the copy is done on the GPU, however
      long the GPU takes: the copier's wait for its fence has no bound of its
@@ -800,7 +815,14 @@ list names a frame the gap process inferred where the SPS allows gaps.
 Where it allows none, the gap is frames lost. Each lost frame is then a
 copy of the last reference, made by `vaGetImage` and `vaPutImage` through
 an image the pool keeps for it (`Accelerator::conceal`,
-`Surface::copy_to`), so the frames after it decode.
+`Surface::copy_to`), so the frames after it decode. On Windows the copy is
+the GPU's, between the two surfaces' shared textures (`CopyResource` on a
+copy queue of the adapter's Direct3D 12 device), waited for by the frame's
+deadline: `vaon12`'s `vaPutImage` writes the luma wrong (of a 1080p NV12
+picture put and got back, 2065503 of 2073600 luma samples differed, the
+chroma exact; UHD 630, Mesa 26.2.7). Where a surface is not a shared
+texture, no stand-in is made, and what predicts from the lost frame is
+refused with `MissingReference`, as where the driver makes no image.
 
 After a sample that does not decode, each picture is still decoded, so
 that its references go on. Each is refused with `h264::Error::Unrecovered`,
