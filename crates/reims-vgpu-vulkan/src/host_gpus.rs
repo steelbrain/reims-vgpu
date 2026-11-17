@@ -2,8 +2,8 @@
 //! the reims-graphics device's VA-API arm (reims-vgpu's `graphics::vaapi`) opens the runtime
 //! device's. It is the node the device's `VK_EXT_physical_device_drm` names, else the one sysfs
 //! lists for the PCI address its `VK_EXT_pci_bus_info` names; none where neither does.
-//! On Windows the GPU is opened by its DXGI adapter's LUID instead ([`adapter_luid_of`]): the
-//! one Vulkan answers for the physical device of the runtime device's UUID.
+//! On Windows the GPU is opened by its DXGI adapter's LUID instead (`adapter_luid_of`, built for
+//! Windows alone): the one Vulkan answers for the physical device of the runtime device's UUID.
 
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
