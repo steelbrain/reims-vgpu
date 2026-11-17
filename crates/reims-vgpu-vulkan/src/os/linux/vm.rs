@@ -4,7 +4,7 @@
 //! a view of guest pages ("virtual memory layouts") maps their files instead: the address space
 //! is reserved first (core's `allocate_anywhere`), then each run of the source's bytes is mapped
 //! over it with `mmap(MAP_SHARED | MAP_FIXED)` from the file and offset the backing table names
-//! for it ([`super::files`]), and the view is recorded there as runs of its own. A view of a view
+//! for it ([`files`]), and the view is recorded there as runs of its own. A view of a view
 //! maps the file too, so it keeps showing the pages after the first view goes, as Mach's aliases
 //! do; runs whose file offsets follow on are one VMA to the kernel.
 //!
@@ -72,7 +72,7 @@
 //! pages backwards, made in 0.1 ms and mapped in 5 µs, read and written through either), and holds
 //! them while it lives, as an import of them does. The backing table still names each run's file,
 //! which a view of the view and a dma-buf of its pages are made of, and the dma-buf it lies in
-//! ([`super::files`]). The kernel maps a dma-buf as `VM_PFNMAP`, which nothing can pin, so a view
+//! ([`files`]). The kernel maps a dma-buf as `VM_PFNMAP`, which nothing can pin, so a view
 //! is mapped from its files where udmabuf is not the process's to open, where it refuses a
 //! piece's file (one not a memfd sealed against shrinking), and for a run alone.
 //!
