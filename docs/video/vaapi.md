@@ -948,7 +948,7 @@ is the `vaapi` module's.
 | SPS/VUI/PPS/slice headers, `avcC`, levels (Table A-1) | `src/codec/encode/h264.rs` |
 | VPS/SPS/VUI/PPS/slice segment headers, `hvcC`, levels (Tables A.8, A.9) | `src/codec/encode/hevc.rs` |
 | Picture types and order, references, decode times | `src/codec/encode/gop.rs` |
-| The configuration record of the parameter sets the hardware writes, and samples without them | `src/codec/encode/record.rs` |
+| The configuration record of the parameter sets the hardware writes, and samples without them (NVENC's guest encoders' too) | `src/codec/encode/record.rs` |
 | Our rate control under a hard limit (below) | `src/codec/encode/limit_rate.rs` |
 | The core over an `Accelerator` trait, as `h264::Decoder` is | `src/codec/encode/encoder.rs` |
 | libva's encode binding, checked against the headers | `src/vaapi/va/ffi/encode.rs`, `src/vaapi/va/ffi/encode_layout.c` |

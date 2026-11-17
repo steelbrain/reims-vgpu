@@ -55,6 +55,10 @@
 //!   output's pages above, else read back and copied by the CPU, each reason logged once a
 //!   decoder. So every decode codec of the caps has one, and the device offers `VT_MESSAGES`
 //!   where NVDEC decodes H.264 or HEVC.
+//! - **VideoToolbox's paravirtual encoders** (`encode`'s `guest`): an arm64 guest's encode, of
+//!   each codec NVENC encodes a profile of, on an NVENC encoder of its own, each source frame read
+//!   from the IOSurface its kext lent: copied by the GPU into memory NVENC reads, as an x86
+//!   guest's frame is, else read by the CPU.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
@@ -75,6 +79,7 @@ use reims_vgpu_video::nvidia::{
     EncodeProfileSupport, Gpu, GpuSelector, ImportedBuffer, MemoryPlane, NvdecCodec, ReadPlane,
     decode_capabilities, encode_profiles,
 };
+use reims_vgpu_video::paravirt::{Encoder, EncoderConfig};
 use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
@@ -84,7 +89,9 @@ use reims_vgpu_vulkan::core::sync::Mutex;
 use reims_vgpu_vulkan::gpu::device::VulkanDevice;
 use reims_vgpu_vulkan::gpu::resource::VulkanBuffer;
 
-use super::decode::{GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestOutput, PlanePages};
+use super::decode::{
+    GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput, PlanePages,
+};
 use super::video_host::{
     BackendError, DecodeOutput, HostDecoder, HostEncodeSession, HostPicture, HostVideoSession,
     Landing, OutputPlane, SourcePlane,
@@ -455,6 +462,20 @@ impl GraphicsVideo<VulkanPlatform> for Shared {
     /// by the CPU.
     fn guest_decodes(&self) -> bool {
         true
+    }
+
+    /// One for each codec NVENC encodes a profile of (`encode::guest_encoders`).
+    fn guest_encoders(&self) -> Vec<Encoder> {
+        encode::guest_encoders(&self.0.encoders)
+    }
+
+    fn guest_encoder(
+        &self,
+        config: &EncoderConfig,
+    ) -> Result<Box<dyn GuestEncoder<VulkanPlatform>>, VideoError> {
+        let video = &self.0;
+        let encoder = encode::NvGuestEncoder::new(&video.gpu, config, video.filler())?;
+        Ok(Box::new(encoder))
     }
 
     fn guest_decoder(&self, codec: u32) -> Option<Box<dyn GuestDecoder>> {

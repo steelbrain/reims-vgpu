@@ -28,6 +28,9 @@
 //!   Annex-B form, its parameter sets before each IDR picture (the crate's `repeatSPSPPS`), so it
 //!   is written as it comes. One that does not fit the capacity is not written, and the next
 //!   frame is made an IDR picture.
+//! - **VideoToolbox's paravirtual encoders** ([`guest`]) take the same preset and tuning of the
+//!   device's quality ([`speed_of`]), and their frames reach NVENC the same two ways
+//!   ([`Fills::encode_filled`]).
 
 use std::sync::Arc;
 
@@ -55,8 +58,10 @@ use super::super::video_host::{
 use super::{ENCODE_NAME, H264_TOP_LEVEL, HEVC_TOP_LEVEL};
 use fill::Filled;
 pub(super) use fill::Filler;
+pub(super) use guest::{NvGuestEncoder, guest_encoders};
 
 mod fill;
+mod guest;
 
 /// Ours, as the VA-API arm's: a VBR's peak where the guest sets none, as a share of its
 /// average: 1.05.
@@ -212,7 +217,8 @@ fn preset_of(quality: u32) -> u8 {
     u8::try_from(1 + (quality * 6 + 50) / 100).unwrap_or(7)
 }
 
-/// NVENC's preset and tuning of the device's `quality` (module doc).
+/// NVENC's preset and tuning of the device's `quality` (module doc): an x86 guest's encodes
+/// and VideoToolbox's (`guest`) both.
 fn speed_of(quality: u32) -> (u8, Tuning) {
     (preset_of(quality), Tuning::HighQuality)
 }

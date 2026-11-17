@@ -1720,7 +1720,7 @@ Stages:
       takes the surface's layout, on NVDEC by the GPU into the surface's
       pages registered with CUDA, else copied by the CPU). `encs` lists one
       encoder for each codec the arm encodes the guest's frames of (on
-      VA-API, each codec it encodes a profile of), by the ID of Apple's
+      VA-API and on NVENC, each codec it encodes a profile of), by the ID of Apple's
       hardware encoder of the codec (`com.apple.videotoolbox.videoencoder.ave.avc`,
       `.ave.hevc`): the guest's VideoToolbox registers each entry as
       `paravirtualized:<ID>`, and its own two paravirtual encoders, the
@@ -1729,8 +1729,9 @@ Stages:
       listed encoder, by that ID or by none, starts an encoder session
       (`paravirt`'s `encoder`): the arm encodes each source frame
       from the surface the guest lent for it, copied by the GPU from a
-      buffer over its pages into an input surface of the encoder's (else
-      read through the host's view of the pages), and the session emits
+      buffer over its pages into an input surface of the encoder's (on
+      NVENC, into memory CUDA imported, which NVENC registers as input;
+      else read through the host's view of the pages), and the session emits
       the samples, asking the guest for the stream's format description
       first (`Efds`), then lets go of the surface. `meps` lists no
       processor; a create of an encoder not listed is answered with a
