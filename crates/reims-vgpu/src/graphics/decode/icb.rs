@@ -3992,4 +3992,304 @@ mod tests {
         let c = icb.render_command(0).unwrap().unwrap();
         assert_eq!(c.draw_args().unwrap().vertex_count, 7);
     }
+
+    /// The marker that makes a run of
+    /// [`on_vulkan_a_recording_holds_each_command_the_cpu_encodes`] the child, which records.
+    const RECORD_CHILD: &str = "REIMS_VGPU_ICB_RECORD_CHILD";
+
+    /// With the process recording, every command the guest's CPU encodes into an indirect command
+    /// buffer reaches the stream as a call on the buffer, with its arguments, its objects their
+    /// stream ids, in the order the platform carried them out: each record of an `ICB_WRITE` an
+    /// `indirectRenderCommandAtIndex:` or `indirectComputeCommandAtIndex:` of its command alone,
+    /// and each slot of an `ICB_SLOTS` one such call listing the commands its fields make, of a
+    /// render and a compute buffer alike. The recorder is the process's, so the test runs in a
+    /// child of its own, recording into a scratch directory.
+    #[test]
+    fn on_vulkan_a_recording_holds_each_command_the_cpu_encodes() {
+        use reims_vgpu_vulkan::recorder::ENV_VAR;
+        if std::env::var_os(RECORD_CHILD).is_some() {
+            let streams = std::env::var_os(ENV_VAR).expect("the child records");
+            recorded_icb_commands(std::path::Path::new(&streams));
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("rvg-recorder-icb-{}", std::process::id()));
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "graphics::decode::icb::tests::on_vulkan_a_recording_holds_each_command_the_cpu_encodes",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(RECORD_CHILD, "1")
+            .env(ENV_VAR, dir.join("streams"))
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "{out:?}");
+        let ran = String::from_utf8_lossy(&out.stdout).contains("1 passed");
+        assert!(ran, "the child ran no test: {out:?}");
+    }
+
+    /// [`on_vulkan_a_recording_holds_each_command_the_cpu_encodes`]'s child, recording into
+    /// `streams`.
+    fn recorded_icb_commands(streams: &std::path::Path) {
+        use crate::platform::ApiPlatform;
+        use reims_vgpu_vulkan::VulkanPlatform as V;
+        use reims_vgpu_vulkan::core::raise::OnFault;
+        use reims_vgpu_vulkan::recorder::format::{self, Call, Value};
+
+        let platform = <V as ApiPlatform>::process();
+        assert!(
+            reims_vgpu_vulkan::recorder::on(),
+            "the child does not record"
+        );
+        let device = platform.metal_device(None).unwrap();
+        let size = SLOTS + 0x2_0000 + RGFX_CURSOR_SPAN;
+        let region = Arc::new(crate::platform::test_region(&*platform, size as usize));
+        let mut dec = GraphicsDecoder::<V>::new(Arc::clone(&platform), Arc::clone(&region));
+        // A render buffer of draws, and a compute one, with no inheritance; two buffers.
+        let icb = |obj_id, command_types, max_command_count| RgfxIcbCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_ICB_CREATE,
+                size: size_of::<RgfxIcbCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            max_command_count,
+            command_types,
+            max_vertex_buffer_bind_count: 2,
+            max_fragment_buffer_bind_count: 1,
+            max_kernel_buffer_bind_count: 3,
+            max_kernel_threadgroup_memory_bind_count: 31,
+            ..RgfxIcbCreate::default()
+        };
+        for m in [icb(RENDER_ICB, 1, 8), icb(COMPUTE_ICB, COMPUTE_TYPES, 4)] {
+            assert_eq!(dec.decode(&device, m.as_bytes()).unwrap(), Ok(()));
+        }
+        for (obj_id, length) in [(2, 12288), (3, 20480)] {
+            let b = (device.new_buffer_of_length(OnFault::Die, length, 0))
+                .unwrap()
+                .unwrap();
+            assert_eq!(dec.insert(obj_id, ObjHandle::Buffer(b)).unwrap(), Ok(()));
+        }
+        dec.end_message();
+
+        let buffer = |obj_id, offset, index| RgfxIcbBuffer {
+            obj_id,
+            offset,
+            index,
+            reserved_14: 0,
+        };
+        let render_records = [
+            record(RGFX_ICB_OP_VERTEX_BUFFER, 1, &buffer(2, 16, 1)),
+            record(RGFX_ICB_OP_FRAGMENT_BUFFER, 1, &buffer(3, 0, 0)),
+            record(RGFX_ICB_OP_DRAW, 1, &draw(6)),
+            bare(RGFX_ICB_OP_RENDER_SET_BARRIER, 1),
+            bare(RGFX_ICB_OP_RENDER_RESET, 2),
+        ];
+        let compute_records = [
+            record(RGFX_ICB_OP_KERNEL_BUFFER, 0, &buffer(2, 32, 2)),
+            record(
+                RGFX_ICB_OP_THREADGROUP_MEMORY,
+                0,
+                &RgfxIcbThreadgroupMemory {
+                    length: 256,
+                    index: 0,
+                },
+            ),
+            record(
+                RGFX_ICB_OP_DISPATCH_THREADGROUPS,
+                0,
+                &RgfxIcbDispatch {
+                    grid: [4, 2, 1],
+                    threadgroup: [8, 8, 1],
+                },
+            ),
+            bare(RGFX_ICB_OP_COMPUTE_CLEAR_BARRIER, 0),
+        ];
+        for m in [
+            write(RENDER_ICB, &render_records),
+            write(COMPUTE_ICB, &compute_records),
+        ] {
+            assert_eq!(dec.decode(&device, &m).unwrap(), Ok(()));
+        }
+        dec.end_message();
+
+        let b0 = RGFX_ICB_SLOT_BUFFER_0;
+        let drawn = RgfxIcbRenderSlot {
+            mask: RGFX_ICB_SLOT_ACTION | RGFX_ICB_SLOT_BARRIER | b0,
+            mask_b: 1,
+            op: RGFX_ICB_OP_DRAW,
+            barrier: 1,
+            action: action(&draw(3)),
+            ..RgfxIcbRenderSlot::default()
+        };
+        let none = RgfxIcbSlotBuffer::default();
+        let render_bindings = [bound(3, 64, 0), none, bound(2, 128, 0)];
+        assert!(region.write(SLOTS, &render_slot(&drawn, render_bindings)));
+        let dispatched = RgfxIcbComputeSlot {
+            mask: RGFX_ICB_SLOT_ACTION | b0 << 1,
+            mask_b: 1,
+            op: RGFX_ICB_OP_DISPATCH_THREADS,
+            dispatch: RgfxIcbDispatch {
+                grid: [64, 2, 1],
+                threadgroup: [32, 1, 1],
+            },
+            ..RgfxIcbComputeSlot::default()
+        };
+        let at = SLOTS + 0x1_0000;
+        let kernel_bindings = [none, bound(3, 8, 0), none];
+        let slot = compute_slot(&dispatched, kernel_bindings, &[(0, 512)]);
+        assert!(region.write(at, &slot));
+        for m in [
+            slots(&[run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, SLOTS, 5, 1)]),
+            slots(&[run(COMPUTE_ICB, RGFX_ICB_SLOTS_COMPUTE, at, 3, 1)]),
+        ] {
+            assert_eq!(dec.decode(&device, &m).unwrap(), Ok(()));
+        }
+        dec.end_message();
+
+        // The stream's calls, once it holds the eleven sends of commands.
+        let segment = streams.join(format!("{}.0000.m2vr", std::process::id()));
+        let sends = |calls: &[Call]| -> Vec<Call> {
+            let sent = calls.iter().filter(|c| c.selector.starts_with("indirect"));
+            sent.cloned().collect()
+        };
+        let mut calls = Vec::new();
+        for _ in 0..200 {
+            let read = std::fs::read(&segment)
+                .ok()
+                .and_then(|b| format::read(&b, &mut Vec::new()).ok());
+            calls = (read.into_iter().flat_map(|r| r.records))
+                .filter_map(|r| match r {
+                    format::Record::Call(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            if sends(&calls).len() >= 11 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // Each object by the record that made it: the buffers by their lengths, the indirect
+        // command buffers by their sizes.
+        let made = |sel: &str, at: usize, value: u64| -> Value {
+            let call = calls
+                .iter()
+                .find(|c| c.selector == sel && c.args.get(at) == Some(&Value::Uint(value)));
+            Value::Object(call.unwrap_or_else(|| panic!("no {sel} of {value}")).result)
+        };
+        let new_icb = "newIndirectCommandBufferWithDescriptor:maxCommandCount:options:";
+        let Value::Object(render_icb) = made(new_icb, 1, 8) else {
+            unreachable!()
+        };
+        let Value::Object(compute_icb) = made(new_icb, 1, 4) else {
+            unreachable!()
+        };
+        let (b2, b3) = (
+            made("newBufferWithLength:options:", 0, 12288),
+            made("newBufferWithLength:options:", 0, 20480),
+        );
+        let u = Value::Uint;
+        let size = |width, height, depth| {
+            Value::Map(vec![
+                ("width".to_owned(), u(width)),
+                ("height".to_owned(), u(height)),
+                ("depth".to_owned(), u(depth)),
+            ])
+        };
+        let cmd =
+            |sel: &str, args: Vec<Value>| Value::Map(vec![(sel.to_owned(), Value::List(args))]);
+        let send = |receiver: u64, index: u64, cmds: Vec<Value>| Call {
+            selector: if receiver == render_icb {
+                "indirectRenderCommandAtIndex:"
+            } else {
+                "indirectComputeCommandAtIndex:"
+            }
+            .to_owned(),
+            receiver,
+            args: vec![u(index), Value::List(cmds)],
+            ..Call::default()
+        };
+        let draw_sel = "drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:";
+        let expected = vec![
+            send(
+                render_icb,
+                1,
+                vec![cmd(
+                    "setVertexBuffer:offset:atIndex:",
+                    vec![b2.clone(), u(16), u(1)],
+                )],
+            ),
+            send(
+                render_icb,
+                1,
+                vec![cmd(
+                    "setFragmentBuffer:offset:atIndex:",
+                    vec![b3.clone(), u(0), u(0)],
+                )],
+            ),
+            send(
+                render_icb,
+                1,
+                vec![cmd(draw_sel, vec![u(4), u(1), u(6), u(2), u(7)])],
+            ),
+            send(render_icb, 1, vec![cmd("setBarrier", vec![])]),
+            send(render_icb, 2, vec![cmd("reset", vec![])]),
+            send(
+                compute_icb,
+                0,
+                vec![cmd(
+                    "setKernelBuffer:offset:atIndex:",
+                    vec![b2.clone(), u(32), u(2)],
+                )],
+            ),
+            send(
+                compute_icb,
+                0,
+                vec![cmd(
+                    "setThreadgroupMemoryLength:atIndex:",
+                    vec![u(256), u(0)],
+                )],
+            ),
+            send(
+                compute_icb,
+                0,
+                vec![cmd(
+                    "concurrentDispatchThreadgroups:threadsPerThreadgroup:",
+                    vec![size(4, 2, 1), size(8, 8, 1)],
+                )],
+            ),
+            send(compute_icb, 0, vec![cmd("clearBarrier", vec![])]),
+            send(
+                render_icb,
+                5,
+                vec![
+                    cmd(
+                        "setVertexBuffer:offset:atIndex:",
+                        vec![b3.clone(), u(64), u(0)],
+                    ),
+                    cmd(
+                        "setFragmentBuffer:offset:atIndex:",
+                        vec![b2.clone(), u(128), u(0)],
+                    ),
+                    cmd(draw_sel, vec![u(4), u(1), u(3), u(2), u(7)]),
+                    cmd("setBarrier", vec![]),
+                ],
+            ),
+            send(
+                compute_icb,
+                3,
+                vec![
+                    cmd("setKernelBuffer:offset:atIndex:", vec![b3, u(8), u(1)]),
+                    cmd("setThreadgroupMemoryLength:atIndex:", vec![u(512), u(0)]),
+                    cmd(
+                        "concurrentDispatchThreads:threadsPerThreadgroup:",
+                        vec![size(64, 2, 1), size(32, 1, 1)],
+                    ),
+                ],
+            ),
+        ];
+        assert_eq!(sends(&calls), expected);
+    }
 }

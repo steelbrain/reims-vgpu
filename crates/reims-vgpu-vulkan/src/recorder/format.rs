@@ -13,6 +13,14 @@
 //!
 //! A stream split into segments starts each with the header ([`Stream::header`]); names and
 //! blobs carry across segments, so the writer keeps its tables across them.
+//!
+//! The commands the CPU encodes into an indirect command buffer are call records on the buffer,
+//! `indirectRenderCommandAtIndex:` or `indirectComputeCommandAtIndex:`, whose arguments are
+//! `[index, commands]` (the spec's section 8): the command's index, and a list of the commands
+//! sent to it, in order, each a map of one pair whose name is the command's selector
+//! (`MTLIndirectRenderCommand`'s or `MTLIndirectComputeCommand`'s) and whose value is the list of
+//! its arguments, as an encoder's command of that selector carries them: objects by their ids
+//! (nil for none), sizes and regions as maps, a command of no arguments an empty list.
 
 use std::collections::{HashMap, HashSet};
 

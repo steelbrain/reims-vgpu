@@ -1238,47 +1238,24 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
     /// runtime's error, as those calls die: the sets before it made, those after it not taken. A
     /// command whose [`encode`] dies before the runtime is called (a nil object, a primitive
     /// type 9) ends the call, and is sent alone, after it, through [`encode`], which dies there;
-    /// the sets after it go on in another call.
+    /// the sets after it go on in another call. Recorded, the call's commands are those it took,
+    /// read as it took them ([`crate::recorder::icb_commands`]).
     ///
     /// [`encode`]: IndirectRenderCommand::encode
     #[inline(always)]
     fn encode_render_command<'c>(
         &self,
         command_index: u64,
-        mut cmds: impl Iterator<Item = IcbRenderCmd<'c, VulkanPlatform>>,
+        cmds: impl Iterator<Item = IcbRenderCmd<'c, VulkanPlatform>>,
     ) -> RaiseResult<bool> {
         let recorded_call =
-            crate::recorder::rec_call!("indirectRenderCommandAtIndex:", self, command_index, cmds);
-        let recorded_answer = crate::recorder::run(|| -> RaiseResult<bool> {
-            const TAKE: &str = "indirectRenderCommandAtIndex:";
-            let index = command_index.low_u32();
-            loop {
-                let mut sets = Sets {
-                    icb: self,
-                    index,
-                    cmds: &mut cmds,
-                    sel: TAKE,
-                    after: After::Nothing,
-                    alone: None,
-                    kind: PhantomData::<RenderSets>,
-                };
-                let done = plain_at(TAKE, || {
-                    self.raw.set_render_command(command_index, &mut sets)
-                });
-                if let Err((_, e)) = done {
-                    return decide(sets.sel, Policy::Dies, e);
-                }
-                sets.note();
-                let Some(cmd) = sets.alone else {
-                    return Ok(true);
-                };
-                if let Some(c) = self.render_command(command_index)? {
-                    c.encode(cmd)?;
-                }
-            }
-        });
-        crate::recorder::rec_done!(recorded_call, recorded_answer);
-        recorded_answer
+            crate::recorder::rec_call!("indirectRenderCommandAtIndex:", self, command_index);
+        match recorded_call {
+            Some(active) if active.recorded() => crate::recorder::icb_commands(active, cmds, |c| {
+                send_render_command(self, command_index, c)
+            }),
+            _ => send_render_command(self, command_index, cmds),
+        }
     }
 
     /// The runtime's `set_compute_command`, as
@@ -1289,40 +1266,16 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
     fn encode_compute_command<'c>(
         &self,
         command_index: u64,
-        mut cmds: impl Iterator<Item = IcbComputeCmd<'c, VulkanPlatform>>,
+        cmds: impl Iterator<Item = IcbComputeCmd<'c, VulkanPlatform>>,
     ) -> RaiseResult<bool> {
         let recorded_call =
-            crate::recorder::rec_call!("indirectComputeCommandAtIndex:", self, command_index, cmds);
-        let recorded_answer = crate::recorder::run(|| -> RaiseResult<bool> {
-            const TAKE: &str = "indirectComputeCommandAtIndex:";
-            let index = command_index.low_u32();
-            loop {
-                let mut sets = Sets {
-                    icb: self,
-                    index,
-                    cmds: &mut cmds,
-                    sel: TAKE,
-                    after: After::Nothing,
-                    alone: None,
-                    kind: PhantomData::<ComputeSets>,
-                };
-                let done = plain_at(TAKE, || {
-                    self.raw.set_compute_command(command_index, &mut sets)
-                });
-                if let Err((_, e)) = done {
-                    return decide(sets.sel, Policy::Dies, e);
-                }
-                sets.note();
-                let Some(cmd) = sets.alone else {
-                    return Ok(true);
-                };
-                if let Some(c) = self.compute_command(command_index)? {
-                    c.encode(cmd)?;
-                }
-            }
-        });
-        crate::recorder::rec_done!(recorded_call, recorded_answer);
-        recorded_answer
+            crate::recorder::rec_call!("indirectComputeCommandAtIndex:", self, command_index);
+        match recorded_call {
+            Some(active) if active.recorded() => crate::recorder::icb_commands(active, cmds, |c| {
+                send_compute_command(self, command_index, c)
+            }),
+            _ => send_compute_command(self, command_index, cmds),
+        }
     }
 
     /// The runtime's `reset_with_range`, one call for the range, which refuses a range past the
@@ -1368,6 +1321,76 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
             );
         }
         plain(|| self.raw.unique_identifier())
+    }
+}
+
+/// The body of [`IndirectCommandBuffer::encode_render_command`] on `icb`, recorded or not.
+#[inline(always)]
+fn send_render_command<'c>(
+    icb: &VulkanIcb,
+    command_index: u64,
+    mut cmds: impl Iterator<Item = IcbRenderCmd<'c, VulkanPlatform>>,
+) -> RaiseResult<bool> {
+    const TAKE: &str = "indirectRenderCommandAtIndex:";
+    let index = command_index.low_u32();
+    loop {
+        let mut sets = Sets {
+            icb,
+            index,
+            cmds: &mut cmds,
+            sel: TAKE,
+            after: After::Nothing,
+            alone: None,
+            kind: PhantomData::<RenderSets>,
+        };
+        let done = plain_at(TAKE, || {
+            icb.raw.set_render_command(command_index, &mut sets)
+        });
+        if let Err((_, e)) = done {
+            return decide(sets.sel, Policy::Dies, e);
+        }
+        sets.note();
+        let Some(cmd) = sets.alone else {
+            return Ok(true);
+        };
+        if let Some(c) = icb.render_command(command_index)? {
+            c.encode(cmd)?;
+        }
+    }
+}
+
+/// The body of [`IndirectCommandBuffer::encode_compute_command`] on `icb`, recorded or not.
+#[inline(always)]
+fn send_compute_command<'c>(
+    icb: &VulkanIcb,
+    command_index: u64,
+    mut cmds: impl Iterator<Item = IcbComputeCmd<'c, VulkanPlatform>>,
+) -> RaiseResult<bool> {
+    const TAKE: &str = "indirectComputeCommandAtIndex:";
+    let index = command_index.low_u32();
+    loop {
+        let mut sets = Sets {
+            icb,
+            index,
+            cmds: &mut cmds,
+            sel: TAKE,
+            after: After::Nothing,
+            alone: None,
+            kind: PhantomData::<ComputeSets>,
+        };
+        let done = plain_at(TAKE, || {
+            icb.raw.set_compute_command(command_index, &mut sets)
+        });
+        if let Err((_, e)) = done {
+            return decide(sets.sel, Policy::Dies, e);
+        }
+        sets.note();
+        let Some(cmd) = sets.alone else {
+            return Ok(true);
+        };
+        if let Some(c) = icb.compute_command(command_index)? {
+            c.encode(cmd)?;
+        }
     }
 }
 
@@ -1911,7 +1934,7 @@ const TYPE_9: &str = "a draw of primitive type 9 in an indirect command, which M
      a range given at the execution's call, as the records stand then, and runs nothing of one \
      written after the call or among a range a buffer holds";
 
-impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand<'_> {
+impl CommandObject<'_, rt::IndirectRenderCommand> {
     /// One runtime setter per command. A nil pipeline state, index buffer or tessellation factor
     /// buffer, which the runtime's setters take none of, dies. A nil buffer the runtime holds at
     /// its offset (the module docs).
@@ -1920,7 +1943,7 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand<'_> {
     /// it is made: handed over in a call, it went through memory, and the loads that read it back
     /// waited for the stores that had just written it. A plain `#[inline]` left it out of line.
     #[inline(always)]
-    fn encode(&self, cmd: IcbRenderCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
+    fn apply(&self, cmd: IcbRenderCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
         let c = &self.raw;
         match cmd {
@@ -2089,6 +2112,23 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand<'_> {
             }
         }
     }
+}
+
+impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand<'_> {
+    /// [`apply`](Self::apply), recorded as a call of `indirectRenderCommandAtIndex:` on the
+    /// buffer with this command alone.
+    #[inline(always)]
+    fn encode(&self, cmd: IcbRenderCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
+        let recorded_call = crate::recorder::rec_call!(
+            "indirectRenderCommandAtIndex:",
+            self.icb,
+            u64::from(self.index),
+            crate::recorder::IcbCommands(std::slice::from_ref(&cmd))
+        );
+        let recorded_answer = crate::recorder::run(|| self.apply(cmd));
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
+    }
 
     /// The record's draw kind, as `MTLIndirectCommandType`; 0 for none: the runtime's.
     fn command_type(&self) -> u64 {
@@ -2248,11 +2288,11 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand<'_> {
     }
 }
 
-impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand<'_> {
+impl CommandObject<'_, rt::IndirectComputeCommand> {
     /// One runtime setter per command. A nil pipeline state, which the runtime's setter takes
-    /// none of, dies. Inlined always, as [`IndirectRenderCommand::encode`] is.
+    /// none of, dies. Inlined always, as a render command's is.
     #[inline(always)]
-    fn encode(&self, cmd: IcbComputeCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
+    fn apply(&self, cmd: IcbComputeCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
         let c = &self.raw;
         match cmd {
@@ -2337,6 +2377,23 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand<'_>
                 Ok(())
             }
         }
+    }
+}
+
+impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand<'_> {
+    /// [`apply`](Self::apply), recorded as a call of `indirectComputeCommandAtIndex:` on the
+    /// buffer with this command alone.
+    #[inline(always)]
+    fn encode(&self, cmd: IcbComputeCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
+        let recorded_call = crate::recorder::rec_call!(
+            "indirectComputeCommandAtIndex:",
+            self.icb,
+            u64::from(self.index),
+            crate::recorder::IcbCommands(std::slice::from_ref(&cmd))
+        );
+        let recorded_answer = crate::recorder::run(|| self.apply(cmd));
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The record's dispatch kind, as `MTLIndirectCommandType`; 0 for none.

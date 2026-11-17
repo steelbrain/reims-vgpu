@@ -14,6 +14,15 @@
 //!   object an argument names are the objects' stream ids, which the recorder gives each object
 //!   as a call makes it (`State::register`) and never gives again; an object's last reference going
 //!   (`Obj`'s drop) is its `release` record.
+//! - **Indirect command buffers' commands.** What the CPU encodes into an indirect command buffer
+//!   lives in the runtime's records, which no memory write carries, so each send of commands to
+//!   one is a call record on the buffer: `indirectRenderCommandAtIndex:` or
+//!   `indirectComputeCommandAtIndex:`, `[index, commands]`, the commands in the order the
+//!   platform carried them out, each a map of one pair, `MTLIndirectRenderCommand`'s or
+//!   `MTLIndirectComputeCommand`'s selector and the list of its arguments
+//!   ([`typed::icb_command`]). A command sent on its own (`IndirectRenderCommand::encode`) is a
+//!   list of one; the commands of one call (`encode_render_command`) are those it took, read as
+//!   it took them ([`icb_commands`]).
 //! - **Arguments.** The hottest commands and the pass descriptor's sets are read from their fields
 //!   ([`typed`]), integers, booleans and ranges as themselves, and host memory, bytes, strings and
 //!   events as such ([`spec`]); the rest is formatted as its `Debug` text, its objects as their
@@ -431,8 +440,8 @@ macro_rules! rec_val {
     ($e:expr) => {{
         #[allow(unused_imports)]
         use $crate::recorder::spec::{
-            ViaBytes as _, ViaDebug as _, ViaEvent as _, ViaHost as _, ViaNil as _, ViaScalar as _,
-            ViaSet as _, ViaStr as _,
+            ViaBytes as _, ViaCommands as _, ViaDebug as _, ViaEvent as _, ViaHost as _,
+            ViaNil as _, ViaScalar as _, ViaSet as _, ViaStr as _,
         };
         (&&&$crate::recorder::spec::V(&$e)).rec_value()
     }};
@@ -580,6 +589,17 @@ pub mod spec {
         }
     }
 
+    /// An indirect command buffer's commands, each read from its fields.
+    pub trait ViaCommands {
+        /// The value.
+        fn rec_value(&self) -> Value;
+    }
+    impl<C: typed::Command> ViaCommands for &&V<'_, super::IcbCommands<'_, C>> {
+        fn rec_value(&self) -> Value {
+            with_cx(|cx| Value::List(self.0.0.iter().map(|c| typed::icb_command(c, cx)).collect()))
+        }
+    }
+
     fn with_cx(read: impl FnOnce(&mut typed::Cx<'_>) -> Value) -> Value {
         let mut cx = typed::Cx::new(&super::id_at);
         let v = read(&mut cx);
@@ -698,6 +718,47 @@ pub mod spec {
     }
 }
 
+/// Commands sent to an indirect command buffer, as a call's argument: the list of each one read
+/// from its fields ([`typed::icb_command`]).
+pub struct IcbCommands<'a, C>(
+    /// The commands, in the order sent.
+    pub &'a [C],
+);
+
+/// Sends the commands `cmds` hands out to an indirect command buffer through `send`, in the call
+/// `active` records (`encode_render_command`, `encode_compute_command`): each read from its
+/// fields as `send` takes it, so the call's last argument lists those it took, in that order,
+/// which are those the platform carried out, the one whose send raised the last. Out of line and
+/// over one iterator type, so the platform's own path, which records nothing, keeps its shape.
+#[cold]
+#[inline(never)]
+pub fn icb_commands<C: typed::Command, R>(
+    mut active: Active,
+    cmds: impl Iterator<Item = C>,
+    send: impl FnOnce(&mut dyn Iterator<Item = C>) -> R,
+) -> R {
+    let answer = take_commands(&mut active, &id_at, cmds, send);
+    finish(active, None);
+    answer
+}
+
+/// [`icb_commands`]'s sends and reads, the stream ids of objects by pointer from `ids`.
+fn take_commands<C: typed::Command, R>(
+    active: &mut Active,
+    ids: &dyn Fn(u64) -> Option<u64>,
+    cmds: impl Iterator<Item = C>,
+    send: impl FnOnce(&mut dyn Iterator<Item = C>) -> R,
+) -> R {
+    let mut taken = Vec::new();
+    let mut cx = typed::Cx::new(ids);
+    let answer = send(&mut cmds.inspect(|c| taken.push(typed::icb_command(c, &mut cx))));
+    count_unrecorded(cx.unrecorded);
+    if let Some(call) = active.pending.as_mut() {
+        call.args.push(Value::List(taken));
+    }
+    answer
+}
+
 /// An object a call made: its pointer, a weak reference and its type.
 pub struct Made {
     ptr: u64,
@@ -761,6 +822,21 @@ impl<T: Send + Sync + 'static> Receiver for Obj<T> {
 impl Receiver for crate::platform::VulkanPlatform {
     fn stream_id(&self) -> u64 {
         0
+    }
+}
+
+/// An indirect command buffer a command lent from it names: the buffer's object's id, its value's
+/// address as an `Obj`'s is.
+impl Receiver for crate::gpu::icb::IcbObject {
+    fn stream_id(&self) -> u64 {
+        use crate::core::num::ToU64 as _;
+        let ptr = std::ptr::from_ref(self).cast::<u8>().addr().to_u64();
+        id_at(ptr).unwrap_or_else(|| {
+            if let Some(state) = state() {
+                (state.stats.unrecorded_receivers).fetch_add(1, Ordering::Relaxed);
+            }
+            0
+        })
     }
 }
 
@@ -2477,6 +2553,7 @@ mod tests {
         use crate::core::platform::Handle as _;
         use crate::core::platform::blit::BlitCmd as B;
         use crate::core::platform::compute::ComputeCmd as Cc;
+        use crate::core::platform::icb::{IcbComputeCmd as Ic, IcbRenderCmd as Ir};
         use crate::core::platform::render::RenderCmd as R;
         use crate::core::platform::types::{
             MtlOrigin, MtlRegion, MtlScissorRect, MtlSize, MtlViewport, NsRange,
@@ -2787,7 +2864,137 @@ mod tests {
         for c in &blit {
             check(&|cx| of(c, cx));
         }
-        assert_eq!(checked, render.len() + compute.len() + blit.len());
+        let icb_render: Vec<Ir<'_, F>> = vec![
+            Ir::ClearBarrier,
+            Ir::DrawIndexedPatches {
+                number_of_patch_control_points: 4,
+                patch_start: 1,
+                patch_count: 2,
+                patch_index_buffer: Some(&buf),
+                patch_index_buffer_offset: 8,
+                control_point_index_buffer: None,
+                control_point_index_buffer_offset: 16,
+                instance_count: 3,
+                base_instance: 4,
+                buffer: Some(&lost),
+                offset: 48,
+                instance_stride: 12,
+            },
+            Ir::DrawIndexedPrimitives {
+                primitive_type: 3,
+                index_count: 6,
+                index_type: 1,
+                index_buffer: Some(&buf),
+                index_buffer_offset: 64,
+                instance_count: 1,
+                base_vertex: -4,
+                base_instance: 0,
+            },
+            Ir::DrawIndexedPrimitives {
+                primitive_type: 3,
+                index_count: 3,
+                index_type: 0,
+                index_buffer: None,
+                index_buffer_offset: u64::MAX,
+                instance_count: 2,
+                base_vertex: i64::MAX,
+                base_instance: 7,
+            },
+            Ir::DrawPatches {
+                number_of_patch_control_points: 3,
+                patch_start: 0,
+                patch_count: 9,
+                patch_index_buffer: None,
+                patch_index_buffer_offset: 0,
+                instance_count: 1,
+                base_instance: 0,
+                buffer: Some(&buf),
+                offset: 4,
+                instance_stride: 0,
+            },
+            Ir::DrawPrimitives {
+                primitive_type: 4,
+                vertex_start: 1,
+                vertex_count: 6,
+                instance_count: 2,
+                base_instance: 7,
+            },
+            Ir::Reset,
+            Ir::SetBarrier,
+            Ir::SetFragmentBuffer {
+                buffer: Some(&buf),
+                offset: 16,
+                index: 0,
+            },
+            Ir::SetRenderPipelineState {
+                pipeline_state: Some(&rps),
+            },
+            Ir::SetRenderPipelineState {
+                pipeline_state: None,
+            },
+            Ir::SetVertexBuffer {
+                buffer: None,
+                offset: 0,
+                index: 30,
+            },
+            Ir::SetVertexBufferAttributeStride {
+                buffer: Some(&lost),
+                offset: 8,
+                stride: 24,
+                index: 1,
+            },
+        ];
+        for c in &icb_render {
+            check(&|cx| of(c, cx));
+        }
+        let icb_compute: Vec<Ic<'_, F>> = vec![
+            Ic::ClearBarrier,
+            Ic::ConcurrentDispatchThreadgroups {
+                threadgroups_per_grid: size(8, 4, 1),
+                threads_per_threadgroup: size(32, 1, 1),
+            },
+            Ic::ConcurrentDispatchThreads {
+                threads_per_grid: size(u64::MAX, 1, 0),
+                threads_per_threadgroup: size(16, 16, 1),
+            },
+            Ic::Reset,
+            Ic::SetBarrier,
+            Ic::SetComputePipelineState {
+                pipeline_state: Some(&cps),
+            },
+            Ic::SetComputePipelineState {
+                pipeline_state: None,
+            },
+            Ic::SetImageblockWidth {
+                width: 16,
+                height: 8,
+            },
+            Ic::SetKernelBuffer {
+                buffer: Some(&buf),
+                offset: 32,
+                index: 2,
+            },
+            Ic::SetKernelBufferAttributeStride {
+                buffer: Some(&lost),
+                offset: 16,
+                stride: 12,
+                index: 0,
+            },
+            Ic::SetStageInRegion {
+                region: MtlRegion::new(MtlOrigin::new(1, 2, 3), size(4, 5, 6)),
+            },
+            Ic::SetThreadgroupMemoryLength {
+                length: 256,
+                index: 30,
+            },
+        ];
+        for c in &icb_compute {
+            check(&|cx| of(c, cx));
+        }
+        assert_eq!(
+            checked,
+            render.len() + compute.len() + blit.len() + icb_render.len() + icb_compute.len()
+        );
         let mut cx = typed::Cx::new(&ids);
         let untyped: R<'_, F> = R::SetLineWidth { line_width: 1.5 };
         assert!(
@@ -3253,6 +3460,73 @@ mod tests {
                 answers: vec![("gpuResourceID".to_owned(), Value::Uint(7))],
                 ..Call::default()
             }]
+        );
+    }
+
+    /// The commands one call sends to an indirect command buffer are its last argument: those it
+    /// took, in the order it took them, each a map of its selector to its arguments, its objects
+    /// their stream ids, through the stream and back; a command it never took is not among them.
+    /// A command sent on its own is a list of one.
+    #[test]
+    fn an_icb_call_lists_the_commands_it_took() {
+        use crate::core::platform::Handle as _;
+        use crate::core::platform::icb::IcbRenderCmd as Ir;
+        use crate::core::testkit::objects::Model;
+        use crate::core::testkit::{FakePlatform, Fk, kind};
+        let p = FakePlatform::new();
+        let w = p.world();
+        let buf: Fk<kind::Buffer> = w.new_obj(Model::None);
+        let lost: Fk<kind::Buffer> = w.new_obj(Model::None);
+        let ids = |ptr: u64| (ptr == buf.id().0).then_some(9);
+        let cmds: Vec<Ir<'_, FakePlatform>> = vec![
+            Ir::SetVertexBuffer {
+                buffer: Some(&buf),
+                offset: 16,
+                index: 1,
+            },
+            Ir::SetFragmentBuffer {
+                buffer: Some(&lost),
+                offset: 0,
+                index: 0,
+            },
+            Ir::SetBarrier,
+            Ir::Reset,
+        ];
+        let mut active = begin(enter_recording(), || {
+            ("indirectRenderCommandAtIndex:", 4, vec![Value::Uint(3)])
+        });
+        // A send that stops after three commands, as one whose third raised.
+        let took = take_commands(&mut active, &ids, cmds.into_iter(), |c| c.take(3).count());
+        assert_eq!(took, 3);
+        let (calls, _) = written(vec![queued(Some(active))]);
+        let cmd =
+            |sel: &str, args: Vec<Value>| Value::Map(vec![(sel.to_owned(), Value::List(args))]);
+        assert_eq!(
+            calls,
+            [Call {
+                selector: "indirectRenderCommandAtIndex:".to_owned(),
+                receiver: 4,
+                args: vec![
+                    Value::Uint(3),
+                    Value::List(vec![
+                        cmd(
+                            "setVertexBuffer:offset:atIndex:",
+                            vec![Value::Object(9), Value::Uint(16), Value::Uint(1)]
+                        ),
+                        cmd(
+                            "setFragmentBuffer:offset:atIndex:",
+                            vec![Value::Nil, Value::Uint(0), Value::Uint(0)]
+                        ),
+                        cmd("setBarrier", vec![]),
+                    ]),
+                ],
+                ..Call::default()
+            }]
+        );
+        let alone: Ir<'_, FakePlatform> = Ir::Reset;
+        assert_eq!(
+            crate::recorder::rec_val!(IcbCommands(std::slice::from_ref(&alone))),
+            Value::List(vec![cmd("reset", vec![])])
         );
     }
 }
