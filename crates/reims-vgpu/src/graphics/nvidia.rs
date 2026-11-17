@@ -776,12 +776,47 @@ impl GuestDecoder for NvGuestDecoder {
         au: &[u8],
         output: &GuestOutput<'_>,
     ) -> Result<bool, VideoError> {
+        self.land(parameter_sets, au, output, None)
+    }
+
+    /// The picture's crop narrows to the region, which then lands as a whole picture does, by
+    /// the GPU's copy into the registered pages or the CPU's.
+    fn decodes_regions(&self) -> bool {
+        true
+    }
+
+    fn decode_region(
+        &mut self,
+        parameter_sets: &[u8],
+        au: &[u8],
+        output: &GuestOutput<'_>,
+        region: [u32; 4],
+    ) -> Result<bool, VideoError> {
+        self.land(parameter_sets, au, output, Some(region))
+    }
+}
+
+impl NvGuestDecoder {
+    /// Decodes `au` after `parameter_sets`, and lands its picture, or `region` of it (`x`, `y`,
+    /// `width`, `height`), in `output`.
+    fn land(
+        &mut self,
+        parameter_sets: &[u8],
+        au: &[u8],
+        output: &GuestOutput<'_>,
+        region: Option<[u32; 4]>,
+    ) -> Result<bool, VideoError> {
         if !parameter_sets.is_empty() {
             (self.decoder.parameter_sets(parameter_sets)).map_err(video_error)?;
         }
-        let Some(picture) = self.decoder.decode(au).map_err(video_error)? else {
+        let Some(mut picture) = self.decoder.decode(au).map_err(video_error)? else {
             return Ok(false);
         };
+        if let Some([x, y, width, height]) = region {
+            picture
+                .crop_within(x, y, width, height)
+                .map_err(VideoError::Unsupported)?;
+        }
         let target =
             GuestTarget::new(&output.layout, output.memory).map_err(VideoError::Unsupported)?;
         let sample = picture.bytes_per_sample();

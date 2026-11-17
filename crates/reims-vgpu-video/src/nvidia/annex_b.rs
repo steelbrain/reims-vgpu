@@ -38,6 +38,7 @@ use crate::codec::h264::{Decoder as H264Decoder, nal::NalFormat};
 use crate::codec::hevc::Decoder as HevcDecoder;
 use crate::core::device_memory::DeviceMemory;
 use crate::core::runtime::Runtime;
+use crate::core::surfaces::crop_within;
 
 use crate::nvidia::cuda::Gpu;
 use crate::nvidia::decode::Failures;
@@ -379,6 +380,34 @@ impl AnnexBPicture {
             height,
         } = self.crop;
         (x, y, width, height)
+    }
+
+    /// Narrows the crop to the `width` by `height` samples from (`x`, `y`) of it: what its writes
+    /// and read back take from then on, as they take an odd crop. `x` and `y` are even and the
+    /// rect lies inside the crop ([`crop_within`]); `Err` says why not, the crop left as it was.
+    pub fn crop_within(&mut self, x: u32, y: u32, width: u32, height: u32) -> Result<(), String> {
+        let Crop {
+            x: crop_x,
+            y: crop_y,
+            width: crop_width,
+            height: crop_height,
+        } = self.crop;
+        let [x, y, width, height] = crop_within(
+            [crop_x, crop_y, crop_width, crop_height],
+            [x, y, width, height],
+        )
+        .ok_or_else(|| {
+            format!(
+                "a crop of {width}x{height} at ({x}, {y}) of a picture's {crop_width}x{crop_height}"
+            )
+        })?;
+        self.crop = Crop {
+            x,
+            y,
+            width,
+            height,
+        };
+        Ok(())
     }
 
     /// The crop at `size`: the stream's, from its corner, `size` at most.

@@ -1742,10 +1742,10 @@ Stages:
       pages registered with CUDA, else copied by the CPU). A decoder
       session also starts a tile session (`dsts`), as CMPhoto's
       `VTTileDecompressionSession` asks of a HEIC image's grid, where the arm
-      lands a part of a picture (on VA-API: the frame's crop narrowed to the
-      tile's region, written as a whole picture is): each tile (`dtil`)
-      lands in the surface it lends, emitted (`TDem`) before its reply.
-      Elsewhere, on NVDEC today, the session answers `kVTUnimplementedErr`,
+      lands a part of a picture (on VA-API and on NVDEC: the picture's crop
+      narrowed to the tile's region, written as a whole picture is): each
+      tile (`dtil`) lands in the surface it lends, emitted (`TDem`) before
+      its reply. An arm that lands no parts answers `kVTUnimplementedErr`,
       and VideoToolbox decodes the image in software. Measured on an M3 Max
       on macOS 27.0.1 (oracle job m3-max-39549): CMPhoto decodes Mac Blue,
       6016x6016, as 36 tiles of 1024x1024, each whole into a 1024x1024

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::core::backend::DeviceWrite;
 use crate::core::device_memory::GuestTarget;
+use crate::core::surfaces::crop_within;
 
 use super::display::{Display, Error};
 use super::export::SurfaceExport;
@@ -78,12 +79,24 @@ impl Frame {
     /// crops start, and the rect lies inside the crop; [`Error::Unsupported`] otherwise, the crop
     /// left as it was.
     pub fn crop_within(&mut self, x: u32, y: u32, width: u32, height: u32) -> Result<(), Error> {
-        self.rect = narrowed(self.rect, x, y, width, height).ok_or_else(|| {
+        let Rect {
+            x: crop_x,
+            y: crop_y,
+            width: crop_width,
+            height: crop_height,
+        } = self.rect;
+        let crop = [crop_x, crop_y, crop_width, crop_height];
+        let [x, y, width, height] = crop_within(crop, [x, y, width, height]).ok_or_else(|| {
             Error::Unsupported(format!(
-                "a crop of {width}x{height} at ({x}, {y}) of a frame of {}x{}",
-                self.rect.width, self.rect.height
+                "a crop of {width}x{height} at ({x}, {y}) of a frame of {crop_width}x{crop_height}"
             ))
         })?;
+        self.rect = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
         Ok(())
     }
 
@@ -364,70 +377,5 @@ impl Frame {
         wait::by(&self.deadline, || {
             super::zero_copy::write(self, target, &writes.0, size)
         })
-    }
-}
-
-/// `rect`'s `width` by `height` samples from (`x`, `y`) of it, where `x` and `y` are even and the
-/// rect lies inside `rect` and holds a sample; `None` otherwise.
-fn narrowed(rect: Rect, x: u32, y: u32, width: u32, height: u32) -> Option<Rect> {
-    let even = (x | y) & 1 == 0;
-    let inside = (x.checked_add(width)).is_some_and(|end| end <= rect.width)
-        && (y.checked_add(height)).is_some_and(|end| end <= rect.height);
-    (even && inside && width != 0 && height != 0).then(|| Rect {
-        x: rect.x + x,
-        y: rect.y + y,
-        width,
-        height,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn rect(x: u32, y: u32, width: u32, height: u32) -> Rect {
-        Rect {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-
-    fn parts(rect: Option<Rect>) -> Option<(u32, u32, u32, u32)> {
-        rect.map(|r| (r.x, r.y, r.width, r.height))
-    }
-
-    #[test]
-    fn a_crop_within_a_crop_starts_from_the_crops_origin() {
-        let crop = rect(0, 8, 1024, 1016);
-        assert_eq!(
-            parts(narrowed(crop, 0, 0, 1024, 1016)),
-            Some((0, 8, 1024, 1016))
-        );
-        assert_eq!(
-            parts(narrowed(crop, 128, 64, 896, 952)),
-            Some((128, 72, 896, 952))
-        );
-    }
-
-    #[test]
-    fn a_crop_may_end_on_an_odd_column_or_row() {
-        let crop = rect(0, 0, 1024, 1024);
-        assert_eq!(
-            parts(narrowed(crop, 512, 0, 511, 1023)),
-            Some((512, 0, 511, 1023))
-        );
-    }
-
-    #[test]
-    fn a_crop_past_the_frame_from_an_odd_sample_or_empty_is_refused() {
-        let crop = rect(0, 0, 1024, 1024);
-        assert_eq!(parts(narrowed(crop, 0, 0, 1026, 1024)), None);
-        assert_eq!(parts(narrowed(crop, 2, 0, 1024, 1024)), None);
-        assert_eq!(parts(narrowed(crop, 1, 0, 512, 512)), None);
-        assert_eq!(parts(narrowed(crop, 0, 3, 512, 512)), None);
-        assert_eq!(parts(narrowed(crop, 0, 0, 0, 512)), None);
-        assert_eq!(parts(narrowed(crop, u32::MAX - 1, 0, 2, 2)), None);
     }
 }
