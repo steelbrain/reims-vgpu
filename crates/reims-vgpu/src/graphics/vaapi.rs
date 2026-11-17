@@ -1024,6 +1024,36 @@ impl GuestDecoder for VaGuestDecoder {
         au: &[u8],
         output: &GuestOutput<'_>,
     ) -> Result<bool, VideoError> {
+        self.land(parameter_sets, au, output, None)
+    }
+
+    /// The crop narrows to the region, which then lands as a whole picture does, by the driver's
+    /// video processing in place or the CPU's copy.
+    fn decodes_regions(&self) -> bool {
+        true
+    }
+
+    fn decode_region(
+        &mut self,
+        parameter_sets: &[u8],
+        au: &[u8],
+        output: &GuestOutput<'_>,
+        region: [u32; 4],
+    ) -> Result<bool, VideoError> {
+        self.land(parameter_sets, au, output, Some(region))
+    }
+}
+
+impl VaGuestDecoder {
+    /// Decodes `au` after `parameter_sets`, and lands its picture, or `region` of it (`x`, `y`,
+    /// `width`, `height`), in `output`.
+    fn land(
+        &mut self,
+        parameter_sets: &[u8],
+        au: &[u8],
+        output: &GuestOutput<'_>,
+        region: Option<[u32; 4]>,
+    ) -> Result<bool, VideoError> {
         if !parameter_sets.is_empty() {
             let n = self.frames(parameter_sets)?.len();
             if n != 0 {
@@ -1033,7 +1063,7 @@ impl GuestDecoder for VaGuestDecoder {
             }
         }
         let mut frames = self.frames(au)?;
-        let frame = match (frames.pop(), frames.len()) {
+        let mut frame = match (frames.pop(), frames.len()) {
             (None, _) => return Ok(false),
             (Some(frame), 0) => frame,
             (Some(_), n) => {
@@ -1043,6 +1073,11 @@ impl GuestDecoder for VaGuestDecoder {
                 )));
             }
         };
+        if let Some([x, y, width, height]) = region {
+            frame
+                .crop_within(x, y, width, height)
+                .map_err(video_error)?;
+        }
         let declined = match GuestTarget::new(&output.layout, output.memory) {
             Ok(target) => match frame.write_to_guest(&target, &self.imports) {
                 Ok(DeviceWrite::Written) => return Ok(true),

@@ -43,7 +43,7 @@ pub mod sample_buffer;
 mod session;
 pub mod status;
 
-pub use decoder::{Backend, BackendDecoder, Decoded, DecoderConfig};
+pub use decoder::{Backend, BackendDecoder, Decoded, DecoderConfig, TileLimits, TileRegion};
 pub use encoder::{BackendEncoder, Encoder, EncoderBackend, EncoderConfig, SourceFrame};
 pub use host::{Answer, Codec, Decoder, Host};
 pub use session::{LentSurface, Link, surface_release};

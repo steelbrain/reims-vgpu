@@ -58,21 +58,30 @@ impl LentSurface for Surface {
 /// output's ID, a decode each.
 type Calls = Arc<Mutex<Vec<(Vec<u8>, Vec<u8>, u64)>>>;
 
+/// The regions the fake backend's decoders landed tiles in, a tile each.
+type Regions = Arc<Mutex<Vec<TileRegion>>>;
+
 struct FakeBackend {
     calls: Calls,
+    regions: Regions,
     result: Result<Decoded, OsStatus>,
+    tiles: Option<TileLimits>,
 }
 
 struct FakeDecoder {
     calls: Calls,
+    regions: Regions,
     result: Result<Decoded, OsStatus>,
+    tiles: Option<TileLimits>,
 }
 
 impl Backend for FakeBackend {
     fn open(&self, _config: &DecoderConfig) -> Result<Box<dyn BackendDecoder>, OsStatus> {
         Ok(Box::new(FakeDecoder {
             calls: Arc::clone(&self.calls),
+            regions: Arc::clone(&self.regions),
             result: self.result,
+            tiles: self.tiles,
         }))
     }
 }
@@ -89,6 +98,24 @@ impl BackendDecoder for FakeDecoder {
             .push((parameter_sets.to_vec(), access_unit.to_vec(), output.id()));
         self.result
     }
+
+    fn tile_limits(&self) -> Option<TileLimits> {
+        self.tiles
+    }
+
+    fn decode_tile(
+        &mut self,
+        parameter_sets: &[u8],
+        access_unit: &[u8],
+        output: &dyn LentSurface,
+        region: TileRegion,
+    ) -> Result<Decoded, OsStatus> {
+        if self.tiles.is_none() {
+            return Err(status::UNIMPLEMENTED);
+        }
+        self.regions.lock().push(region);
+        self.decode(parameter_sets, access_unit, output)
+    }
 }
 
 /// The guest's side of one session: the host, the messages it sent, and the session's UUID.
@@ -98,14 +125,23 @@ struct Guest {
     sent: mpsc::Receiver<Vec<u8>>,
     uuid: GuestUuid,
     calls: Calls,
+    regions: Regions,
 }
 
 impl Guest {
     fn new(result: Result<Decoded, OsStatus>) -> Self {
+        Self::with_tiles(result, None)
+    }
+
+    /// A session on a backend whose decoders decode `tiles`.
+    fn with_tiles(result: Result<Decoded, OsStatus>, tiles: Option<TileLimits>) -> Self {
         let calls = Calls::default();
+        let regions = Regions::default();
         let backend = Arc::new(FakeBackend {
             calls: Arc::clone(&calls),
+            regions: Arc::clone(&regions),
             result,
+            tiles,
         });
         let decoders = vec![Decoder {
             codec: Codec::H264,
@@ -119,6 +155,7 @@ impl Guest {
             sent,
             uuid: GuestUuid([0x5a; 16]),
             calls,
+            regions,
         };
         let answer = guest.send(
             b"+dec",
@@ -208,6 +245,68 @@ impl Guest {
                 m.image_description(names::FORMAT_DESCRIPTION, &description);
                 m.s32(names::GUEST_POOL, 0);
             },
+        );
+    }
+
+    /// Starts a tile session on a 64x48 description of `record`.
+    fn start_tiles(&self, record: &[u8]) {
+        let description = hand_written(b"avc1", 64, 48, record);
+        self.send(
+            b"dsts",
+            MessageFlags::GUEST_EXPECTS_REPLY,
+            3,
+            Vec::new(),
+            |m| {
+                m.image_description(names::FORMAT_DESCRIPTION, &description);
+            },
+        );
+    }
+
+    /// Sends tile `tile`, its sample `sample`, landing the `size` columns and rows from `origin`
+    /// at `at` of the surface `surface` it lends, the buffer `buffer`.
+    fn tile(
+        &self,
+        tile: i64,
+        (origin, size, at): ((i32, i32), (i32, i32), (i32, i32)),
+        buffer: GuestUuid,
+        surface: u64,
+        sample: &[u8],
+    ) {
+        self.send(
+            b"dtil",
+            MessageFlags::GUEST_EXPECTS_REPLY,
+            200 + tile as u64,
+            vec![Arc::new(Surface(surface))],
+            |m| {
+                m.s64(names::TILE, tile);
+                m.i32_pair(names::TILE_SOURCE_ORIGIN, ValueType::Point, origin);
+                m.i32_pair(names::TILE_SOURCE_SIZE, ValueType::Size, size);
+                m.uuid(names::TILE_BUFFER_UUID, buffer);
+                m.i32_pair(names::TILE_OUTPUT_POINT, ValueType::Point, at);
+                m.u32(names::DECODE_FLAGS, 1);
+                m.sample_buffer_with_limit(names::SAMPLE_BUFFER, usize::MAX, sample);
+            },
+        );
+    }
+
+    /// Checks the host's `TDem` of tile `tile` with `status` and `buffer`, answers it, and checks
+    /// that `surface` goes back and the `dtil` is answered noErr.
+    fn tile_emitted(&self, tile: i64, status: OsStatus, buffer: GuestUuid, surface: u64) {
+        let (tdem, emitted) = self.next_of(b"TDem");
+        assert!(tdem.flags.contains(MessageFlags::HOST_EXPECTS_REPLY));
+        let message = Message::parse(&emitted).unwrap();
+        assert_eq!(message.s64(names::TILE).unwrap(), Some(tile));
+        assert_eq!(status_of(&emitted), Some(status));
+        assert_eq!(info_of(&emitted), Some(0));
+        assert_eq!(message.uuid(names::TILE_BUFFER_UUID).unwrap(), Some(buffer));
+        self.answer(&tdem, 0, None);
+        let (header, reply) = self.next_of(b"dtil");
+        assert_eq!(header.reply_id, 200 + tile as u64);
+        assert_eq!((status_of(&reply), info_of(&reply)), (Some(0), Some(0)));
+        assert_eq!(
+            self.next(),
+            surface_release(&[surface]),
+            "the surface goes back"
         );
     }
 
@@ -681,4 +780,173 @@ fn a_create_of_a_codec_the_list_lacks_is_refused() {
         status_of(&answer.replies[0]),
         Some(status::COULD_NOT_FIND_VIDEO_DECODER)
     );
+}
+
+/// The tiles the fake backend's decoders decode, where a test lets them.
+const TILES: TileLimits = TileLimits {
+    max_width: 8192,
+    max_height: 4352,
+    min_width: 64,
+    min_height: 64,
+};
+
+#[test]
+fn a_tile_session_sends_its_requirements_then_its_reply() {
+    let guest = Guest::with_tiles(Ok(Decoded::Landed), Some(TILES));
+    guest.start_tiles(&avcc(&SPS, 4));
+    let (tdrs, requirements) = guest.next_of(b"TDrs");
+    assert!(!tdrs.flags.contains(MessageFlags::HOST_EXPECTS_REPLY));
+    let attributes = plist_of(&requirements, names::TILE_BUFFER_ATTRIBUTES);
+    assert_eq!(
+        attributes.get("PixelFormatType"),
+        Some(&Value::Array(vec![Value::Integer(0x3432_3076)])),
+        "420v"
+    );
+    assert_eq!(attributes.get("Width"), None, "the guest sizes its buffers");
+    let tiles = plist_of(&requirements, names::TILE_REQUIREMENTS);
+    for (key, value) in [
+        ("MaximumTileWidth", 8192),
+        ("MaximumTileHeight", 4352),
+        ("MinimumTileWidth", 64),
+        ("MinimumTileHeight", 64),
+        ("MinimumDecodableWidth", 64),
+        ("MinimumDecodableHeight", 64),
+        ("TileWidthPixelAlignment", 8),
+        ("TileHeightPixelAlignment", 8),
+        ("TileByteAlignment", 64),
+        ("MaximumCanvasRowBytes", 16384),
+    ] {
+        assert_eq!(tiles.get(key), Some(&Value::Integer(value)), "{key}");
+    }
+    let (header, reply) = guest.next_of(b"dsts");
+    assert!(header.flags.contains(MessageFlags::REPLY_TO_GUEST));
+    assert_eq!(status_of(&reply), Some(0));
+}
+
+#[test]
+fn a_tile_session_on_a_backend_that_decodes_no_tiles_is_refused_unimplemented() {
+    let guest = Guest::new(Ok(Decoded::Landed));
+    guest.start_tiles(&avcc(&SPS, 4));
+    let (_, reply) = guest.next_of(b"dsts");
+    assert_eq!(
+        status_of(&reply),
+        Some(status::UNIMPLEMENTED),
+        "no TDrs first"
+    );
+    let buffer = GuestUuid([0xc0; 16]);
+    guest.tile(
+        0,
+        ((0, 0), (64, 48), (0, 0)),
+        buffer,
+        30,
+        &one_sample(&SAMPLE, None, false),
+    );
+    guest.tile_emitted(0, NO_DECODER, buffer, 30);
+    assert!(guest.calls.lock().is_empty());
+    assert!(guest.quiet());
+}
+
+#[test]
+fn a_tile_lands_its_region_in_the_surface_it_lends_then_is_emitted_and_let_go() {
+    let guest = Guest::with_tiles(Ok(Decoded::Landed), Some(TILES));
+    guest.start_tiles(&avcc(&SPS, 4));
+    guest.next_of(b"TDrs");
+    guest.next_of(b"dsts");
+    let buffer = GuestUuid([0xc1; 16]);
+    guest.tile(
+        0,
+        ((0, 0), (64, 48), (0, 0)),
+        buffer,
+        31,
+        &one_sample(&SAMPLE, None, false),
+    );
+    guest.tile_emitted(0, 0, buffer, 31);
+    guest.tile(
+        1,
+        ((16, 8), (47, 39), (64, 48)),
+        buffer,
+        32,
+        &one_sample(&SAMPLE, None, false),
+    );
+    guest.tile_emitted(1, 0, buffer, 32);
+    let mut au = START_CODE.to_vec();
+    au.extend_from_slice(&[0x65, 0x88]);
+    assert_eq!(
+        *guest.calls.lock(),
+        vec![(annex_b_sets(), au.clone(), 31), (Vec::new(), au, 32)],
+        "the record's sets go first, once"
+    );
+    assert_eq!(
+        *guest.regions.lock(),
+        vec![
+            TileRegion {
+                source_x: 0,
+                source_y: 0,
+                width: 64,
+                height: 48,
+                x: 0,
+                y: 0,
+            },
+            TileRegion {
+                source_x: 16,
+                source_y: 8,
+                width: 47,
+                height: 39,
+                x: 64,
+                y: 48,
+            },
+        ],
+        "an odd width and height at the image's edge"
+    );
+    guest.send(
+        b"dtfi",
+        MessageFlags::GUEST_EXPECTS_REPLY,
+        4,
+        Vec::new(),
+        |_| {},
+    );
+    let (_, finished) = guest.next_of(b"dtfi");
+    assert_eq!(status_of(&finished), Some(0), "no tile left to finish");
+    assert!(guest.quiet());
+}
+
+#[test]
+fn a_tile_the_host_cannot_place_is_emitted_with_a_parameter_error_undecoded() {
+    let guest = Guest::with_tiles(Ok(Decoded::Landed), Some(TILES));
+    guest.start_tiles(&avcc(&SPS, 4));
+    guest.next_of(b"TDrs");
+    guest.next_of(b"dsts");
+    let buffer = GuestUuid([0xc2; 16]);
+    for (tile, region) in [
+        (0, ((0, 0), (64, 48), (4, 0))),
+        (1, ((1, 0), (62, 48), (0, 0))),
+        (2, ((0, 0), (0, 48), (0, 0))),
+        (3, ((0, -2), (64, 48), (0, 0))),
+    ] {
+        guest.tile(tile, region, buffer, 33, &one_sample(&SAMPLE, None, false));
+        guest.tile_emitted(tile, status::PARAMETER, buffer, 33);
+    }
+    assert!(guest.calls.lock().is_empty());
+}
+
+#[test]
+fn a_tile_that_does_not_decode_is_emitted_with_its_status_and_the_next_gets_the_sets() {
+    let guest = Guest::with_tiles(Err(status::VIDEO_DECODER_BAD_DATA), Some(TILES));
+    guest.start_tiles(&avcc(&SPS, 4));
+    guest.next_of(b"TDrs");
+    guest.next_of(b"dsts");
+    let buffer = GuestUuid([0xc3; 16]);
+    for tile in 0..2 {
+        guest.tile(
+            tile,
+            ((0, 0), (64, 48), (0, 0)),
+            buffer,
+            34,
+            &one_sample(&SAMPLE, None, false),
+        );
+        guest.tile_emitted(tile, status::VIDEO_DECODER_BAD_DATA, buffer, 34);
+    }
+    let calls = guest.calls.lock();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|(sets, _, _)| *sets == annex_b_sets()));
 }

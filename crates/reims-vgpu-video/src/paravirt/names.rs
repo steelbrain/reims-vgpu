@@ -79,6 +79,25 @@ pub(crate) const CREATE_PIXEL_BUFFER: FourCc = FourCc::new(*b"Dbuf");
 pub(crate) const EMIT_DECODED_FRAME: FourCc = FourCc::new(*b"Demt");
 /// `Dfub`: output buffers let go of unemitted.
 pub(crate) const FREE_UNUSED_PIXEL_BUFFERS: FourCc = FourCc::new(*b"Dfub");
+/// `TDrs`: what a tile session's output buffers are to have, and the tiles it decodes.
+pub(crate) const SET_TILE_DECODE_REQUIREMENTS: FourCc = FourCc::new(*b"TDrs");
+/// `TDem`: emit a decoded tile.
+pub(crate) const EMIT_DECODED_TILE: FourCc = FourCc::new(*b"TDem");
+
+/// `,til`: a tile's identifier, `=s64`.
+pub(crate) const TILE: FourCc = FourCc::new(*b",til");
+/// `,tco`: the first column and row of the tile's picture that land, `=32p`.
+pub(crate) const TILE_SOURCE_ORIGIN: FourCc = FourCc::new(*b",tco");
+/// `,tcd`: the columns and rows of the tile's picture that land, `=32s`.
+pub(crate) const TILE_SOURCE_SIZE: FourCc = FourCc::new(*b",tcd");
+/// `,obp`: where in the output buffer they land, `=32p`.
+pub(crate) const TILE_OUTPUT_POINT: FourCc = FourCc::new(*b",obp");
+/// `,uiu`: a tile's output buffer's UUID, `=uui`.
+pub(crate) const TILE_BUFFER_UUID: FourCc = FourCc::new(*b",uiu");
+/// `,cba`: a tile session's output buffer attributes, `=pls`.
+pub(crate) const TILE_BUFFER_ATTRIBUTES: FourCc = FourCc::new(*b",cba");
+/// `,trd`: a tile session's tile requirements, `=pls`.
+pub(crate) const TILE_REQUIREMENTS: FourCc = FourCc::new(*b",trd");
 
 /// `,fds`: a format description, `=fds`.
 pub(crate) const FORMAT_DESCRIPTION: FourCc = FourCc::new(*b",fds");

@@ -144,6 +144,28 @@ pub trait GuestDecoder: Send {
         au: &[u8],
         output: &GuestOutput<'_>,
     ) -> Result<bool, reims_vgpu_video::core::backend::BackendError>;
+
+    /// Whether it lands a part of a picture ([`GuestDecoder::decode_region`]): false, the
+    /// default, where it lands only whole pictures.
+    fn decodes_regions(&self) -> bool {
+        false
+    }
+
+    /// Decodes `au` as [`GuestDecoder::decode`] does, and lands the `width` by `height` samples
+    /// of its picture from (`x`, `y`), `region` in that order, at `output`'s top left, `output`
+    /// laid out that size; [`VideoError::Unsupported`], the default, where it lands no parts.
+    fn decode_region(
+        &mut self,
+        parameter_sets: &[u8],
+        au: &[u8],
+        output: &GuestOutput<'_>,
+        region: [u32; 4],
+    ) -> Result<bool, VideoError> {
+        let _ = (parameter_sets, au, output, region);
+        Err(VideoError::Unsupported(
+            "the arm lands no part of a picture".to_owned(),
+        ))
+    }
 }
 
 /// An encoder of one codec whose source frames come in surfaces the guest lent: VideoToolbox's

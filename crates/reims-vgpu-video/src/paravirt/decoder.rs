@@ -26,11 +26,21 @@
 //!   `dinv`) it answers [`NO_DECODER`] and sends nothing else.
 //! - A sample buffer whose format description carries another configuration record reopens the
 //!   decoder from that sample.
+//! - **Tiles** (a `VTTileDecompressionSession`'s, such as CMPhoto's for a HEIC image's grid):
+//!   `dsts` starts a tile session on its format description (`,fds`) where the backend decodes
+//!   tiles into regions ([`BackendDecoder::tile_limits`]), sending `TDrs` first: the attributes
+//!   the guest's output buffers are to have (`,cba`) and the tiles it decodes (`,trd`); else it
+//!   answers `kVTUnimplementedErr`, and the guest's VideoToolbox decodes the image in software.
+//!   `dtil` decodes one tile's sample (`,sbf`, in fragments as `dfrm`'s) into the one surface it
+//!   lends: the `,tcd` columns and rows of the tile's picture from `,tco` land at `,obp` in it
+//!   ([`TileRegion`]). The host emits the tile (`TDem`: its `,til`, status, info flags and the
+//!   buffer's `,uiu`, waiting [`EMIT_REPLY_WAIT`]) before the reply, which says noErr, and lets
+//!   go of the surface. Tiles decode in order, one a `dtil`, so `dtfi` has none left to finish.
 //! - **The rest**: `dsup` lists `UsingHardwareAcceleratedVideoDecoder` (true, read-only),
 //!   `RealTime` and `MaximizePowerEfficiency` (taken); `dcop` and `dset` answer them;
 //!   `Paravirtualized` is the guest's own, and a `dset` of it gets no reply; `dcan` answers
 //!   whether the decoder goes on with another format description; `dinv` drops the decoder;
-//!   `dfin`, `dmul`, `dsav`, `dtfi`, `dsts` and `dtil` answer `kVTUnimplementedErr`.
+//!   `dfin`, `dmul` and `dsav` answer `kVTUnimplementedErr`.
 //!
 //! A message for a surface the session does not hold, and a surface lent with a message that
 //! takes none, is let go of at once (`rels`): the guest's kext holds each surface it lent until
@@ -51,7 +61,9 @@ use crate::core::runtime::Runtime;
 use crate::paravirt::WireError;
 use crate::paravirt::host::Codec;
 use crate::paravirt::image_description::{AVC_CONFIGURATION, HEVC_CONFIGURATION, ImageDescription};
-use crate::paravirt::message::{GuestUuid, Message, MessageFlags, MessageHeader, MessageWriter};
+use crate::paravirt::message::{
+    GuestUuid, Message, MessageFlags, MessageHeader, MessageWriter, ValueType,
+};
 use crate::paravirt::names;
 use crate::paravirt::plist::Value;
 use crate::paravirt::sample_buffer::{SampleBuffer, SerializedFormatDescription};
@@ -76,6 +88,17 @@ const DECODE_ASYNCHRONOUSLY: u32 = 1 << 0;
 const INFO_ASYNCHRONOUS: u32 = 1 << 0;
 /// `kVTDecodeInfo_FrameDropped`.
 const INFO_FRAME_DROPPED: u32 = 1 << 1;
+
+/// The alignment a tile session asks of its tiles (`TileWidthPixelAlignment`,
+/// `TileHeightPixelAlignment`): Apple's hardware decoder's, measured on an M3 Max on macOS 27.0.1,
+/// which the guest's CMPhoto meets. A tile lands where its place in its output buffer is a
+/// multiple of it, which keeps every region on 4:2:0's even rows and columns.
+pub const TILE_PIXEL_ALIGNMENT: u32 = 8;
+/// A tile's first byte in its output buffer is a multiple of this: Apple's hardware decoder's
+/// `TileByteAlignment`, measured as [`TILE_PIXEL_ALIGNMENT`] was.
+pub const TILE_BYTE_ALIGNMENT: u32 = 64;
+/// The bytes of a 10-bit sample, which bound an output buffer's row by the widest tile.
+const WIDEST_SAMPLE_BYTES: u32 = 2;
 
 /// The property the guest's VideoToolbox keeps for itself.
 const PARAVIRTUALIZED: &str = "Paravirtualized";
@@ -114,6 +137,36 @@ pub enum Decoded {
     Skipped,
 }
 
+/// The part of a tile's picture a `dtil` lands, and where in its output buffer, in luma samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileRegion {
+    /// The picture's first column and row that land (`,tco`).
+    pub source_x: u32,
+    /// See `source_x`.
+    pub source_y: u32,
+    /// The columns that land (`,tcd`).
+    pub width: u32,
+    /// The rows that land (`,tcd`).
+    pub height: u32,
+    /// The output buffer's column they land at (`,obp`).
+    pub x: u32,
+    /// The output buffer's row they land at (`,obp`).
+    pub y: u32,
+}
+
+/// The tiles a backend decoder decodes into regions: the largest and smallest picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileLimits {
+    /// The widest.
+    pub max_width: u32,
+    /// The tallest.
+    pub max_height: u32,
+    /// The narrowest.
+    pub min_width: u32,
+    /// The shortest.
+    pub min_height: u32,
+}
+
 /// The host's video arm, as the decoder sessions take it.
 pub trait Backend: Send + Sync {
     /// A decoder of `config`, on the session's thread at its `dsta`, or the status the guest sees
@@ -132,6 +185,26 @@ pub trait BackendDecoder: Send {
         access_unit: &[u8],
         output: &dyn LentSurface,
     ) -> Result<Decoded, OsStatus>;
+
+    /// The tiles it decodes into regions of an output ([`BackendDecoder::decode_tile`]); `None`,
+    /// the default, where it decodes none, and a tile session is refused.
+    fn tile_limits(&self) -> Option<TileLimits> {
+        None
+    }
+
+    /// Decodes `access_unit` as [`BackendDecoder::decode`] does, and lands `region` of its
+    /// picture in `output`, the rest of `output` left as it was; `kVTUnimplementedErr`, the
+    /// default, where it decodes no tiles.
+    fn decode_tile(
+        &mut self,
+        parameter_sets: &[u8],
+        access_unit: &[u8],
+        output: &dyn LentSurface,
+        region: TileRegion,
+    ) -> Result<Decoded, OsStatus> {
+        let _ = (parameter_sets, access_unit, output, region);
+        Err(status::UNIMPLEMENTED)
+    }
 }
 
 /// Starts a decoder session of `codec` for `uuid`, its thread on `runtime`, decoding on
@@ -159,6 +232,7 @@ pub(crate) fn start(
             properties: Vec::new(),
             fragments: Vec::new(),
             discarding: false,
+            tiles: None,
         }
         .run();
     })
@@ -170,6 +244,15 @@ struct FrameReply {
     sent: bool,
     /// Its `,inf`.
     info: u32,
+}
+
+/// A tile session's decoder, and what it reads its samples with.
+struct TileSession {
+    decoder: Box<dyn BackendDecoder>,
+    /// The bytes before each NAL unit of the tiles' samples.
+    length_size: u8,
+    /// The configuration's parameter sets in Annex-B form, for its first decode; empty after it.
+    parameter_sets: Vec<u8>,
 }
 
 /// An output buffer the guest lent for a frame.
@@ -201,12 +284,14 @@ struct Worker {
     fragments: Vec<u8>,
     /// Whether the fragments of a `dfrm` past [`MAX_FRAME_MESSAGE_BYTES`] are being dropped.
     discarding: bool,
+    /// The tile session a `dsts` started.
+    tiles: Option<TileSession>,
 }
 
 impl Worker {
     fn run(mut self) {
         while let Ok(job) = self.jobs.recv() {
-            if let Err(error) = self.handle(&job.bytes) {
+            if let Err(error) = self.handle(&job.bytes, &job.surfaces) {
                 log::warn!("hardware video: a VideoToolbox message the host cannot read: {error}");
             }
             // A session's own messages lend nothing it keeps.
@@ -234,7 +319,7 @@ impl Worker {
         Ok(())
     }
 
-    fn handle(&mut self, bytes: &[u8]) -> Handled {
+    fn handle(&mut self, bytes: &[u8], surfaces: &[Arc<dyn LentSurface>]) -> Handled {
         let message = Message::parse(bytes)?;
         let kind = message.header().message_type;
         match &kind.to_be_bytes() {
@@ -249,9 +334,10 @@ impl Worker {
                 self.decoder = None;
                 self.reply_status(&message, status::NO_ERROR)
             }
-            b"dfin" | b"dsav" | b"dtfi" | b"dsts" | b"dtil" => {
-                self.reply_status(&message, status::UNIMPLEMENTED)
-            }
+            b"dsts" => self.start_tiles(&message),
+            b"dtil" => self.decode_tile(bytes, message.header(), surfaces),
+            b"dtfi" => self.reply_status(&message, status::NO_ERROR),
+            b"dfin" | b"dsav" => self.reply_status(&message, status::UNIMPLEMENTED),
             _ => {
                 log::warn!("hardware video: an unknown decoder message {kind}");
                 self.reply_status(&message, status::UNIMPLEMENTED)
@@ -298,12 +384,7 @@ impl Worker {
     /// lands in, the description's size, IOSurface backing, which the host needs to reach them,
     /// and the row and plane alignments and cache mode a hardware decoder's buffers have.
     fn send_buffer_attributes(&self, config: &DecoderConfig, record: &Record) {
-        let format = match (record.ten_bit, record.full_range) {
-            (false, false) => *b"420v",
-            (false, true) => *b"420f",
-            (true, false) => *b"x420",
-            (true, true) => *b"xf20",
-        };
+        let format = pixel_format(record);
         let attributes = Value::dictionary([
             (
                 "PixelFormatType",
@@ -333,29 +414,8 @@ impl Worker {
     /// whose reply goes to the last fragment's header. A message past
     /// [`MAX_FRAME_MESSAGE_BYTES`] is dropped, its fragments up to the last too, with no reply.
     fn decode_frame(&mut self, bytes: &[u8], last: MessageHeader) -> Handled {
-        let more = last.flags.contains(MessageFlags::MORE_FRAGMENTS);
-        if !self.discarding
-            && self.fragments.len().saturating_add(bytes.len()) > MAX_FRAME_MESSAGE_BYTES
-        {
-            self.fragments = Vec::new();
-            self.discarding = true;
-        }
-        if self.discarding {
-            self.discarding = more;
-            return Err(WireError::Malformed(
-                "a frame message past the host's bound",
-            ));
-        }
-        if more {
-            self.fragments.extend_from_slice(bytes);
+        let Some(whole) = self.gather(bytes, last)? else {
             return Ok(());
-        }
-        let whole = if self.fragments.is_empty() {
-            bytes.to_vec()
-        } else {
-            let mut whole = std::mem::take(&mut self.fragments);
-            whole.extend_from_slice(bytes);
-            whole
         };
         let message = Message::parse(&whole)?;
         let frame = message.s64(names::FRAME)?.unwrap_or(0);
@@ -382,6 +442,226 @@ impl Worker {
         self.decode_sample(frame, &sample, &mut reply);
         self.send_frame_reply(&mut reply, status::NO_ERROR);
         Ok(())
+    }
+
+    /// A `dfrm`'s or `dtil`'s fragment: kept where flagged with more to come (`None`), else the
+    /// whole message, this fragment last. A message past [`MAX_FRAME_MESSAGE_BYTES`] is dropped,
+    /// its fragments up to the last too.
+    fn gather(&mut self, bytes: &[u8], last: MessageHeader) -> Result<Option<Vec<u8>>, WireError> {
+        let more = last.flags.contains(MessageFlags::MORE_FRAGMENTS);
+        if !self.discarding
+            && self.fragments.len().saturating_add(bytes.len()) > MAX_FRAME_MESSAGE_BYTES
+        {
+            self.fragments = Vec::new();
+            self.discarding = true;
+        }
+        if self.discarding {
+            self.discarding = more;
+            return Err(WireError::Malformed(
+                "a frame message past the host's bound",
+            ));
+        }
+        if more {
+            self.fragments.extend_from_slice(bytes);
+            return Ok(None);
+        }
+        Ok(Some(if self.fragments.is_empty() {
+            bytes.to_vec()
+        } else {
+            let mut whole = std::mem::take(&mut self.fragments);
+            whole.extend_from_slice(bytes);
+            whole
+        }))
+    }
+
+    /// `dsts`: starts a tile session on the format description, or answers why not (the module
+    /// doc).
+    fn start_tiles(&mut self, message: &Message<'_>) -> Handled {
+        let description = message
+            .image_description(names::FORMAT_DESCRIPTION)?
+            .ok_or(WireError::Malformed("no format description"))?;
+        let description = ImageDescription::parse(description)?;
+        let config = config_from_description(&description).filter(|c| c.codec == self.codec);
+        let status = match config {
+            Some(config) => match self.open_tiles(&config) {
+                Ok(()) => NO_ERROR,
+                Err(status) => status,
+            },
+            None => status::VIDEO_DECODER_UNSUPPORTED_DATA_FORMAT,
+        };
+        self.reply_status(message, status)
+    }
+
+    /// Opens a tile session's decoder of `config`, sending `TDrs`, or the status it is refused
+    /// with: `kVTUnimplementedErr` where the backend decodes no tiles.
+    fn open_tiles(&mut self, config: &DecoderConfig) -> Result<(), OsStatus> {
+        self.tiles = None;
+        let record = read_record(config)?;
+        let decoder = self.backend.open(config)?;
+        let limits = decoder.tile_limits().ok_or(status::UNIMPLEMENTED)?;
+        self.send_tile_requirements(&record, limits);
+        self.tiles = Some(TileSession {
+            decoder,
+            length_size: record.length_size,
+            parameter_sets: record.parameter_sets,
+        });
+        Ok(())
+    }
+
+    /// `TDrs`: the attributes the guest's output buffers are to have (the format the tiles land
+    /// in, IOSurface backing, and a hardware decoder's row and plane alignments), and the tiles
+    /// the session decodes: the backend's largest and smallest picture, [`TILE_PIXEL_ALIGNMENT`],
+    /// [`TILE_BYTE_ALIGNMENT`], and rows of an output buffer up to the widest tile's.
+    fn send_tile_requirements(&self, record: &Record, limits: TileLimits) {
+        let attributes = Value::dictionary([
+            (
+                "PixelFormatType",
+                Value::Array(vec![Value::Integer(i64::from(u32::from_be_bytes(
+                    pixel_format(record),
+                )))]),
+            ),
+            ("IOSurfaceProperties", Value::Dictionary(Vec::new())),
+            ("BytesPerRowAlignment", Value::Integer(64)),
+            ("PlaneAlignment", Value::Integer(256)),
+        ]);
+        let widest_row = limits
+            .max_width
+            .saturating_mul(WIDEST_SAMPLE_BYTES)
+            .next_multiple_of(TILE_BYTE_ALIGNMENT);
+        let requirements = Value::dictionary([
+            (
+                "MaximumCanvasRowBytes",
+                Value::Integer(i64::from(widest_row)),
+            ),
+            (
+                "MaximumTileHeight",
+                Value::Integer(i64::from(limits.max_height)),
+            ),
+            (
+                "MaximumTileWidth",
+                Value::Integer(i64::from(limits.max_width)),
+            ),
+            (
+                "MinimumDecodableHeight",
+                Value::Integer(i64::from(limits.min_height)),
+            ),
+            (
+                "MinimumDecodableWidth",
+                Value::Integer(i64::from(limits.min_width)),
+            ),
+            (
+                "MinimumTileHeight",
+                Value::Integer(i64::from(limits.min_height)),
+            ),
+            (
+                "MinimumTileWidth",
+                Value::Integer(i64::from(limits.min_width)),
+            ),
+            (
+                "TileByteAlignment",
+                Value::Integer(i64::from(TILE_BYTE_ALIGNMENT)),
+            ),
+            (
+                "TileHeightPixelAlignment",
+                Value::Integer(i64::from(TILE_PIXEL_ALIGNMENT)),
+            ),
+            (
+                "TileWidthPixelAlignment",
+                Value::Integer(i64::from(TILE_PIXEL_ALIGNMENT)),
+            ),
+        ]);
+        let mut message = MessageWriter::new(
+            names::SET_TILE_DECODE_REQUIREMENTS,
+            MessageFlags::NONE,
+            Some(self.shared.uuid),
+            0,
+        );
+        message.property_list(names::TILE_BUFFER_ATTRIBUTES, Some(&attributes));
+        message.property_list(names::TILE_REQUIREMENTS, Some(&requirements));
+        self.send(&message.finish());
+    }
+
+    /// `dtil`: decodes one tile into the surface it lends, emits it, then replies (the module
+    /// doc). Fragments are kept as `dfrm`'s.
+    fn decode_tile(
+        &mut self,
+        bytes: &[u8],
+        last: MessageHeader,
+        surfaces: &[Arc<dyn LentSurface>],
+    ) -> Handled {
+        let Some(whole) = self.gather(bytes, last)? else {
+            return Ok(());
+        };
+        let message = Message::parse(&whole)?;
+        let tile = message.s64(names::TILE)?.unwrap_or(0);
+        let origin =
+            (message.i32_pair(names::TILE_SOURCE_ORIGIN, ValueType::Point)?).unwrap_or((0, 0));
+        let size = (message.i32_pair(names::TILE_SOURCE_SIZE, ValueType::Size)?)
+            .ok_or(WireError::Malformed("no tile size"))?;
+        let at = (message.i32_pair(names::TILE_OUTPUT_POINT, ValueType::Point)?).unwrap_or((0, 0));
+        let buffer = message.uuid(names::TILE_BUFFER_UUID)?;
+        let serialization = message
+            .sample_buffer(names::SAMPLE_BUFFER)?
+            .ok_or(WireError::Malformed("no sample buffer"))?;
+        let sample = SampleBuffer::parse(&serialization)?;
+        let status = match tile_region(origin, size, at) {
+            Some(region) => self.land_tile(&sample, region, surfaces.first()),
+            None => status::PARAMETER,
+        };
+        self.emit_tile(tile, status, buffer);
+        let mut reply = MessageWriter::reply_to(&last, MessageFlags::REPLY_TO_GUEST);
+        reply.s32(names::ERROR, status::NO_ERROR);
+        reply.u32(names::INFO_FLAGS, 0);
+        self.send(&reply.finish());
+        Ok(())
+    }
+
+    /// Decodes `sample`, a tile, and lands `region` of it in `output`: the status its `TDem`
+    /// carries.
+    fn land_tile(
+        &mut self,
+        sample: &SampleBuffer,
+        region: TileRegion,
+        output: Option<&Arc<dyn LentSurface>>,
+    ) -> OsStatus {
+        let Some(tiles) = self.tiles.as_mut() else {
+            return NO_DECODER;
+        };
+        let Some(output) = output else {
+            return status::PARAMETER;
+        };
+        let access_unit = (sample.data.as_deref())
+            .ok_or(status::VIDEO_DECODER_BAD_DATA)
+            .and_then(|data| annex_b(data, tiles.length_size));
+        let parameter_sets = std::mem::take(&mut tiles.parameter_sets);
+        let decoded = access_unit
+            .and_then(|au| (tiles.decoder).decode_tile(&parameter_sets, &au, &**output, region));
+        match decoded {
+            Ok(Decoded::Landed) => NO_ERROR,
+            // A tile is a picture of its own: one its decode skips landed nothing.
+            Ok(Decoded::Skipped) => status::VIDEO_DECODER_BAD_DATA,
+            Err(status) => {
+                // The next tile gets the parameter sets this one did not land with.
+                tiles.parameter_sets = parameter_sets;
+                status
+            }
+        }
+    }
+
+    /// `TDem`: the tile's status, and its output buffer; the guest's answer is waited for and not
+    /// read.
+    fn emit_tile(&mut self, tile: i64, status: OsStatus, buffer: Option<GuestUuid>) {
+        let sent = self.request(names::EMIT_DECODED_TILE, EMIT_REPLY_WAIT, |message| {
+            message.s64(names::TILE, tile);
+            message.s32(names::ERROR, status);
+            message.u32(names::INFO_FLAGS, 0);
+            if let Some(uuid) = buffer {
+                message.uuid(names::TILE_BUFFER_UUID, uuid);
+            }
+        });
+        if let Ok(reply) = sent {
+            self.shared.let_go(&reply.surfaces);
+        }
     }
 
     /// Decodes `sample`, frame `frame`, into a buffer the guest lends, and emits it.
@@ -675,6 +955,34 @@ fn config_from_format(format: &SerializedFormatDescription) -> Option<DecoderCon
             .unwrap_or_default()
             .to_vec(),
     })
+}
+
+/// The CoreVideo format a configuration's pictures land in: 8 or 10 bits, video or full range.
+fn pixel_format(record: &Record) -> [u8; 4] {
+    match (record.ten_bit, record.full_range) {
+        (false, false) => *b"420v",
+        (false, true) => *b"420f",
+        (true, false) => *b"x420",
+        (true, true) => *b"xf20",
+    }
+}
+
+/// A `dtil`'s region from its `,tco`, `,tcd` and `,obp`: `None` for a negative or empty one, one
+/// from an odd column or row of the picture, or one off [`TILE_PIXEL_ALIGNMENT`] in its output. Its
+/// width and height may be odd, as an image's last column and row of tiles' are.
+fn tile_region(origin: (i32, i32), size: (i32, i32), at: (i32, i32)) -> Option<TileRegion> {
+    let value = |v: i32| u32::try_from(v).ok();
+    let region = TileRegion {
+        source_x: value(origin.0)?,
+        source_y: value(origin.1)?,
+        width: value(size.0)?,
+        height: value(size.1)?,
+        x: value(at.0)?,
+        y: value(at.1)?,
+    };
+    let even = (region.source_x | region.source_y) & 1 == 0;
+    let aligned = (region.x | region.y).is_multiple_of(TILE_PIXEL_ALIGNMENT);
+    (even && aligned && region.width != 0 && region.height != 0).then_some(region)
 }
 
 /// What the host reads of a configuration record.
