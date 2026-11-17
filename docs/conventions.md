@@ -115,7 +115,8 @@ repeats the ones code cites.
     (`metal2vulkan-degrade-…`), `inexact-…`, `out-of-host-memory`, the
     driver's message id names, and the reims-graphics device's completion
     rings' (`control-ring-full`, `control-ring-post-waited`,
-    `vblank-dropped`, `queue-ring-full`, `queue-ring-post-waited`) and its
+    `vblank-dropped`, `vt-ring-full`, `queue-ring-full`,
+    `queue-ring-post-waited`) and its
     decoder's (`two-ranges-kept-whole`, a command buffer dealt to two
     threads that the platform kept whole at a chunk's end, which fails at
     its stand-in); a boot's degradations are read from its last such

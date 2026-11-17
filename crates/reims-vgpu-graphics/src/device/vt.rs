@@ -3,14 +3,20 @@
 //! [`VtAnswer`], and the messages of the host's side to the guest's, which it sends through a
 //! [`VtLink`] (docs/graphics-kext/design.md, "Decided", 17). The device reads neither message: it
 //! checks a `VT_MESSAGE`'s runs and length, and frames the host's messages.
+//!
+//! A host message goes into the VideoToolbox ring where the guest took [`RGFX_FEATURE_VT_RING`],
+//! followed by a `VT_RING` on the control completion ring that carries the ring's count through
+//! it; else, or where that ring has no room, onto the control completion ring as a `VT_MESSAGE`
+//! event. Either way the guest takes it at its place among the control ring's events: a
+//! `VT_MESSAGE` event sent after a message the ring holds follows that message's `VT_RING`.
 
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
 
 use zerocopy::{FromBytes, IntoBytes};
 
-use super::Shared;
-use crate::ring::Message;
+use super::{RingDegradation, Shared};
+use crate::ring::{Message, Posted};
 use crate::wire::*;
 
 /// The `VT_STATUS` a `VT_MESSAGE` owes, which the host gives from any thread once its side took
@@ -65,9 +71,11 @@ impl std::fmt::Debug for VtLink {
 
 impl VtLink {
     /// Sends `message`, a `vtpv` message or a `rels` box of at most [`RGFX_VT_HOST_MESSAGE_MAX`]
-    /// bytes, as a `VT_MESSAGE` event, in the order sent, waiting for nothing: posted here where
-    /// the ring has room and nothing is handed over before it, else handed to the control thread.
-    /// False, with nothing sent, for a longer message, a guest that did not take
+    /// bytes, in the order sent, waiting for nothing (the module doc): into the VideoToolbox ring
+    /// with its `VT_RING`, where the guest took [`RGFX_FEATURE_VT_RING`] and the ring has room,
+    /// else as a `VT_MESSAGE` event. Each event is posted here where the control completion ring
+    /// has room and nothing is handed over before it, else handed to the control thread. False,
+    /// with nothing sent, for a longer message, a guest that did not take
     /// [`RGFX_FEATURE_VT_MESSAGES`], a device that has ended or is not started, or a reset since
     /// the link was made.
     pub fn send(&self, message: &[u8]) -> bool {
@@ -83,7 +91,9 @@ impl VtLink {
         {
             return false;
         }
-        shared.post_unwaiting(&event, self.epoch);
+        if !(shared.driver_took(RGFX_FEATURE_VT_RING) && shared.post_vt_ring(&event, self.epoch)) {
+            shared.post_unwaiting(&event, self.epoch);
+        }
         true
     }
 
@@ -110,6 +120,21 @@ pub(crate) fn vt_status(seqno: u64, status: i32) -> Vec<u8> {
         },
         status,
         reserved_14: 0,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// The `VT_RING` that says the VideoToolbox ring holds the host's messages through count
+/// `produced`.
+pub(crate) fn vt_ring(produced: u64) -> Vec<u8> {
+    RgfxVtRing {
+        header: RgfxMsgHeader {
+            r#type: RGFX_EVT_VT_RING,
+            size: size_of::<RgfxVtRing>() as u32,
+            seqno: 0,
+        },
+        produced,
     }
     .as_bytes()
     .to_vec()
@@ -232,6 +257,40 @@ impl Shared {
             shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
             epoch,
         }
+    }
+
+    /// Writes `event`, a `VT_MESSAGE` record of work begun at reset count `epoch`, into the
+    /// VideoToolbox ring, then posts the `VT_RING` of the ring's count through it, waiting for
+    /// nothing ([`Self::post_unwaiting`]), both with the ring held: the `VT_RING`s go out in the
+    /// order of their counts. True where it is written, or dropped for a reset since `epoch` or a
+    /// device not started; false, with nothing written, where the ring has no room for it or is
+    /// broken, for the caller to post it as a `VT_MESSAGE` event. The first of a spell of those
+    /// is told ([`RingDegradation::VtRingFull`]).
+    pub(crate) fn post_vt_ring(&self, event: &[u8], epoch: u64) -> bool {
+        let mut ring = self.vt_ring.lock();
+        if self.epoch.load(Ordering::Acquire) != epoch || !self.started() {
+            return true;
+        }
+        let refused = match ring.post(&self.region, event) {
+            // The guest never arms the ring: its `VT_RING` raises the vector.
+            Posted::Yes { .. } => {
+                self.vt_full.store(false, Ordering::Relaxed);
+                self.post_unwaiting(&vt_ring(ring.count()), epoch);
+                return true;
+            }
+            Posted::NoRoom => "has no room".to_string(),
+            Posted::Broken(broken) => format!("is broken ({broken})"),
+        };
+        if !self.vt_full.swap(true, Ordering::Relaxed) {
+            drop(ring);
+            log::warn!(
+                target: "reims_vgpu_graphics",
+                "the VideoToolbox ring {refused}: the host's messages to the guest's VideoToolbox \
+                 go onto the control completion ring until it has room"
+            );
+            self.host.ring_degraded(RingDegradation::VtRingFull);
+        }
+        false
     }
 }
 

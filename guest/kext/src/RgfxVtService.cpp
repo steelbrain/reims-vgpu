@@ -10,6 +10,7 @@
 #include "RgfxIOSurfaceKPI.hpp"
 #include "RgfxSurfaceBlocks.hpp"
 #include "RgfxTrace.hpp"
+#include "RgfxVtRing.hpp"
 
 #include <IOKit/IOLib.h>
 #include <libkern/version.h>
@@ -818,4 +819,36 @@ void ReimsGraphics::vtMessage(const volatile UInt8 *payload, UInt32 size)
 		return;
 	}
 	service->deliver(payload + kBytesAt, length);
+}
+
+void ReimsGraphics::vtRing(const volatile UInt8 *payload, UInt32 size)
+{
+	// The event's count, which its take of the control completion ring read after an acquire of
+	// that ring's producer: the host wrote the ring's records before it.
+	if (size < sizeof(RgfxVtRing) - sizeof(RgfxMsgHeader)) {
+		static char unread;
+		if (rgfxFirstCalls(&unread, size, 1))
+			IOLog("ReimsGraphics: a VT_RING of %u bytes is not read\n", size);
+		return;
+	}
+	const UInt64 produced = *reinterpret_cast<const volatile UInt64 *>(payload);
+	volatile UInt8 *header = ring(RGFX_VT_RING_OFFSET);
+	const RgfxVtRingTaken taken = rgfxTakeVtRing(
+	    header + RGFX_RING_HEADER_SIZE, vtConsumed, produced,
+	    [this](const volatile UInt8 *message, UInt32 length) { vtMessage(message, length); });
+	if (taken.fault != RgfxVtRingFault::None) {
+		static char faulted;
+		if (rgfxFirstCalls(&faulted, static_cast<UInt32>(taken.fault), 1))
+			IOLog("ReimsGraphics: the VideoToolbox ring's %s is out of range: its messages from "
+			      "0x%llx to 0x%llx are dropped\n",
+			      taken.fault == RgfxVtRingFault::Count ? "count" : "record", vtConsumed,
+			      produced);
+	}
+	if (taken.consumed == vtConsumed)
+		return;
+	vtConsumed = taken.consumed;
+	// The host may write the bytes taken again once it reads this.
+	__atomic_store_n(reinterpret_cast<volatile UInt64 *>(
+	                     header + __builtin_offsetof(RgfxRingHeader, consumer)),
+	                 vtConsumed, __ATOMIC_RELEASE);
 }

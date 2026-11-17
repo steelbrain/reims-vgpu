@@ -551,6 +551,11 @@ impl Producer {
         self.at.initialize(region, false);
     }
 
+    /// The host's count: what it has published.
+    pub(crate) fn count(&self) -> u64 {
+        self.count
+    }
+
     /// Whether [`Self::post`] of a message of `len` bytes would find room now, a pad to the
     /// ring's end included: false too where the guest's count is out of reach. The guest only
     /// makes more room, so a post that follows with no other post between finds it.

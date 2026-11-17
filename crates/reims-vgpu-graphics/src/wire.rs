@@ -488,6 +488,19 @@ pub const RGFX_FEATURE_VT_MESSAGES: u64 = 0x10_0000_0000_0000;
 /// answers `hasUnifiedMemory` NO), and a guest that did not take it tells the host each chunk's
 /// bytes with a [`RGFX_CMD_BUFFER_DID_MODIFY_RANGE`] on ring 0 instead.
 pub const RGFX_FEATURE_UPLOADS_WRITTEN: u64 = 0x20_0000_0000_0000;
+/// `FEATURES_HI` bit 22, feature bit 54, `VT_RING`, which means something only with
+/// [`RGFX_FEATURE_VT_MESSAGES`]: the host's side's messages to the guest's VideoToolbox go into
+/// the VideoToolbox ring ([`RGFX_VT_RING_OFFSET`]), each followed on the control completion ring
+/// by a [`RGFX_EVT_VT_RING`] that carries the ring's count through it, instead of onto the control
+/// completion ring as `VT_MESSAGE` events. The guest takes the ring's messages through that count
+/// where it takes the event, so they keep their place among the control ring's events, and the
+/// control ring carries 24 bytes for each instead of up to 16 KiB: an encode's frames, two or
+/// more such messages each at 1080p and 8 Mbit/s, filled that ring, which then held back the
+/// display's `VBLANK`s and the presents' answers. A message that finds the VideoToolbox ring
+/// with no room goes onto the control completion ring as a `VT_MESSAGE` event, as for a guest
+/// that did not take the bit (docs/graphics-kext/design.md, "Decided", 17). The device offers it
+/// where its host offers `VT_MESSAGES`; the arm64e kext takes it with `VT_MESSAGES`.
+pub const RGFX_FEATURE_VT_RING: u64 = 0x40_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -650,6 +663,20 @@ pub const RGFX_CONTROL_RING_DATA_SIZE: u32 = 0x8000;
 pub const RGFX_DEVICE_INFO_OFFSET: u64 = RGFX_CONTROL_COMPLETE_OFFSET
     + RGFX_RING_HEADER_SIZE as u64
     + RGFX_CONTROL_RING_DATA_SIZE as u64;
+
+/// Where the VideoToolbox ring is in the region ([`RGFX_FEATURE_VT_RING`]): host to guest, right
+/// after the control completion ring's span, in the room before the guest's allocations that no
+/// other ring or record takes and the kexts map with the control rings. It is a ring's header
+/// ([`RgfxRingHeader`]) and its byte ring of [`RGFX_VT_RING_DATA_SIZE`] bytes. The guest never
+/// arms it: each [`RGFX_EVT_VT_RING`] on the control completion ring says what to take. It is the
+/// device's memory, as the control rings are: nothing of the guest's RAM is wired for it.
+pub const RGFX_VT_RING_OFFSET: u64 = RGFX_CONTROL_COMPLETE_OFFSET + RGFX_CONTROL_RING_SPAN;
+/// The size of the VideoToolbox ring's byte ring: 2 MiB, the largest power of two that fits
+/// after its header before the guest's allocations. It holds 127 of the longest messages, 16 KiB
+/// each: an encode's session sends a frame's messages one after another and waits for the guest
+/// only at its last, so a frame of up to 127 of them, about 2 MiB, goes in before the guest takes
+/// any of it.
+pub const RGFX_VT_RING_DATA_SIZE: u32 = 0x20_0000;
 
 /// Where the video caps ([`RgfxVideoCaps`]) sit in the region: right after the device-info blob
 /// (whose size is 1432 bytes and 64 per format), written with it at the device's init. A host
@@ -1319,6 +1346,14 @@ pub const RGFX_EVT_VT_STATUS: u32 = 0x40d;
 pub const RGFX_EVT_VT_MESSAGE: u32 = 0x40e;
 /// Where a `VT_MESSAGE` event's bytes start: right after its [`RgfxVtHostMessage`].
 pub const RGFX_VT_HOST_MESSAGE_BYTES_OFFSET: u32 = 24;
+/// Event `VT_RING` ([`RgfxVtRing`], on the control completion ring), `seqno` 0, sent only to a
+/// guest that took [`RGFX_FEATURE_VT_RING`]: the VideoToolbox ring holds the host's messages
+/// through `produced`, the ring's count after its latest. Each is a `VT_MESSAGE` record as the
+/// event of that name is ([`RgfxVtHostMessage`], then its bytes, its `size` a multiple of 8),
+/// with a pad to the ring's end ([`RGFX_MSG_PAD`]) where the bytes left there are fewer than the
+/// record. The guest takes them in order where it takes the event, then stores `produced` to the
+/// ring's `consumer`; a `VT_RING` whose count it has taken already takes nothing.
+pub const RGFX_EVT_VT_RING: u32 = 0x40f;
 
 /// A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 pub const RGFX_CB_OK: u32 = 0;
@@ -1795,6 +1830,19 @@ const _: () = {
     assert!(size_of::<RgfxVtSurfacePlane>() == 24);
     assert!(size_of::<RgfxVtStatus>() == 24);
     assert!(size_of::<RgfxVtHostMessage>() == RGFX_VT_HOST_MESSAGE_BYTES_OFFSET as usize);
+    assert!(size_of::<RgfxVtRing>() == 24);
+    // The VideoToolbox ring lies past the video caps and the control completion ring's span, and
+    // before the guest's allocations.
+    assert!(
+        RGFX_VIDEO_CAPS_OFFSET + size_of::<RgfxVideoCaps>() as u64
+            <= RGFX_CONTROL_COMPLETE_OFFSET + RGFX_CONTROL_RING_SPAN
+    );
+    assert!(RGFX_VT_RING_OFFSET >= RGFX_CONTROL_COMPLETE_OFFSET + RGFX_CONTROL_RING_SPAN);
+    assert!(
+        RGFX_VT_RING_OFFSET + RGFX_RING_HEADER_SIZE as u64 + RGFX_VT_RING_DATA_SIZE as u64
+            <= RGFX_ALLOCATIONS_OFFSET
+    );
+    assert!(RGFX_VT_RING_DATA_SIZE.is_power_of_two());
     assert!(size_of::<RgfxGetDisplays>() == 16);
     assert!(size_of::<RgfxSetScanout>() == 40);
     assert!(size_of::<RgfxSetCursor>() == 48);
@@ -2473,6 +2521,18 @@ pub struct RgfxVtStatus {
     pub status: i32,
     /// Pads the message to a multiple of 8; 0.
     pub reserved_14: u32,
+}
+
+/// `VT_RING`: the VideoToolbox ring holds the host's messages through `produced`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxVtRing {
+    /// [`RGFX_EVT_VT_RING`], `seqno` 0.
+    pub header: RgfxMsgHeader,
+    /// The ring's count after the host's latest message there, which the guest takes through.
+    pub produced: u64,
 }
 
 /// The `VT_MESSAGE` event: one message of VideoToolbox's host side, its `length` bytes after

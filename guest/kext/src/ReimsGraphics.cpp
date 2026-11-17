@@ -1160,6 +1160,11 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		// The host's side's message, for the guest's VideoToolbox (RgfxVtService.hpp).
 		vtMessage(payload, size);
 		return;
+	case RGFX_EVT_VT_RING:
+		// The host's side's messages in the VideoToolbox ring, through the count the event
+		// carries, at the event's place among the others (RgfxVtRing.hpp).
+		vtRing(payload, size);
+		return;
 #endif
 	case RGFX_EVT_POINTER_OVER:
 		// The host's pointer is over another display: the cursor goes there
@@ -1665,6 +1670,7 @@ bool ReimsGraphics::start(IOService *provider)
 #if defined(__arm64e__)
 	vtMessagesTaken = false;
 	vtService = nullptr;
+	vtConsumed = 0;
 #endif
 	displayBoundsTaken = false;
 	boundsTold = {};
@@ -1851,6 +1857,13 @@ bool ReimsGraphics::start(IOService *provider)
 	}
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
 	consumed = load64(ring(RGFX_CONTROL_COMPLETE_OFFSET) + kRingConsumer);
+#if defined(__arm64e__)
+	// The VideoToolbox ring lies in the rings' mapping, before the guest's allocations.
+	static_assert(RGFX_VT_RING_OFFSET + RGFX_RING_HEADER_SIZE + RGFX_VT_RING_DATA_SIZE <=
+	                  RGFX_ALLOCATIONS_OFFSET,
+	              "the VideoToolbox ring lies in the rings' mapping");
+	vtConsumed = load64(ring(RGFX_VT_RING_OFFSET) + kRingConsumer);
+#endif
 	armedAt = kRgfxNotArmed;
 	writeRegister(RGFX_REG_STATUS, RGFX_STATUS_DRIVER_READY);
 	ready = true;

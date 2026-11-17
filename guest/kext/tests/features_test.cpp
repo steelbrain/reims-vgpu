@@ -99,8 +99,12 @@ constexpr uint64_t kVtMessagesCarried = RGFX_GUEST_ARM64 ? kVtMessages : 0;
 // UPLOADS_WRITTEN, which both kexts carry, their bundle naming its Managed upload chunks' bytes in
 // each command buffer's stream.
 constexpr uint64_t kUploadsWritten = RGFX_FEATURE_UPLOADS_WRITTEN;
+// VT_RING, which the arm64e kext carries with VT_MESSAGES, taking the host's messages from the
+// VideoToolbox ring, and the x86-64 kext does not.
+constexpr uint64_t kVtRing = RGFX_FEATURE_VT_RING;
+constexpr uint64_t kVtRingCarried = RGFX_GUEST_ARM64 ? kVtRing : 0;
 // A bit the wire does not name.
-constexpr uint64_t kUnnamed = 1ull << 54;
+constexpr uint64_t kUnnamed = 1ull << 55;
 // Every bit the wire names from bit 3 that the kext does not carry out yet.
 constexpr uint64_t kNotCarried = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CONSUMED_DOORBELL |
                                  RGFX_FEATURE_QUEUE_BARRIER | RGFX_FEATURE_CB_PARTS |
@@ -109,7 +113,8 @@ constexpr uint64_t kNotCarried = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CON
                                  (kMultiDisplay & ~kMultiDisplayCarried) |
                                  (kPointerOver & ~kPointerOverCarried) |
                                  (kDisplayBounds & ~kDisplayBoundsCarried) |
-                                 (kVtMessages & ~kVtMessagesCarried);
+                                 (kVtMessages & ~kVtMessagesCarried) |
+                                 (kVtRing & ~kVtRingCarried);
 // The ones it does: the bundle lays no-copy buffers over pages blocks the kext makes, orders its
 // command buffers over IOSurfaces and places its Managed buffers' CPU copies in its heaps, neither
 // of which needs anything of the kext, makes indirect command buffers, whose creates and writes,
@@ -184,7 +189,8 @@ constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kH
                               kSlotsInPages | kDoorbellAsks | kGuestTimes | kReadOnlyPages |
                               kDoorbellPages | kPipelineAnswers | kDisplayPowerCarried |
                               kMultiDisplayCarried | kPointerOverCarried | kDisplayBoundsCarried |
-                              kPointerMotion | k16KCarried | kVtMessagesCarried | kUploadsWritten;
+                              kPointerMotion | k16KCarried | kVtMessagesCarried | kUploadsWritten |
+                              kVtRingCarried;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -200,8 +206,8 @@ int main()
 	// TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, PIPELINE_KEYS,
 	// ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, DOORBELL_PAGES,
 	// PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, DISPLAY_BOUNDS,
-	// UPLOADS_WRITTEN and, the x86-64 kext, DISPLAY_POWER, or, the arm64e kext, PAGES_16K and
-	// VT_MESSAGES, and writes each only where offered.
+	// UPLOADS_WRITTEN and, the x86-64 kext, DISPLAY_POWER, or, the arm64e kext, PAGES_16K,
+	// VT_MESSAGES and VT_RING, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
 	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
@@ -211,8 +217,8 @@ int main()
 	      "DISPLAY_SCALE, TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, "
 	      "PIPELINE_KEYS, ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, "
 	      "DOORBELL_PAGES, PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, "
-	      "DISPLAY_BOUNDS, UPLOADS_WRITTEN and, on x86-64, DISPLAY_POWER, on arm64e PAGES_16K and "
-	      "VT_MESSAGES, from bit 3");
+	      "DISPLAY_BOUNDS, UPLOADS_WRITTEN and, on x86-64, DISPLAY_POWER, on arm64e PAGES_16K, "
+	      "VT_MESSAGES and VT_RING, from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -470,6 +476,10 @@ int main()
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kUploadsWritten, kUploadsWritten) ==
 	          (kRgfxOfferedFeatures | kUploadsWritten),
 	      "UPLOADS_WRITTEN taken is in the word");
+	check(RGFX_FEATURE_VT_RING == (1ull << 54), "VT_RING is bit 54");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kVtMessages | kVtRing) ==
+	          (kVtMessagesCarried | kVtRingCarried),
+	      "VT_MESSAGES and VT_RING offered, both written by the arm64e kext alone");
 	// PAGES_16K: the arm64e kext writes it first where offered, and then with the rest; the
 	// x86-64 kext never writes it, and writes nothing first.
 	check(rgfxDriverFeaturesFirst(~0ull) == k16KCarried, "PAGES_16K first where carried");

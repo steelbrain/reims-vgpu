@@ -164,7 +164,8 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/queue_publish_test $(BUILD)/tests/doorbell_pages_test $(BUILD)/tests/top_down_test \
 	$(BUILD)/tests/display_table_test $(BUILD)/tests/agdc_displays_test \
 	$(BUILD)/tests/pointer_over_test $(BUILD)/tests/display_bounds_test $(BUILD)/tests/display_places_test \
-	$(BUILD)/tests/pointer_motion_test $(BUILD)/tests/register_hold_test $(BUILD)/tests/vt_routes_test
+	$(BUILD)/tests/pointer_motion_test $(BUILD)/tests/register_hold_test $(BUILD)/tests/vt_routes_test \
+	$(BUILD)/tests/vt_ring_test
 
 $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)

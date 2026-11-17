@@ -752,6 +752,12 @@ private:
 	void startVtService();
 	void stopVtService();
 	void vtMessage(const volatile UInt8 *payload, UInt32 size);
+	// The VideoToolbox ring (RGFX_FEATURE_VT_RING, RgfxVtRing.hpp): the count the work loop has
+	// taken it through, read from its header at the start as the control rings' counts are; and
+	// handleEvent's VT_RING, which takes it through the event's count on the work loop, handing
+	// each message to vtMessage as a VT_MESSAGE event's.
+	UInt64 vtConsumed;
+	void vtRing(const volatile UInt8 *payload, UInt32 size);
 #endif
 
 	// The boot screen the scanout holds until clearBootScreen: the boot framebuffer the OS had at

@@ -386,7 +386,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_DISPLAY_BOUNDS
     | RGFX_FEATURE_POINTER_MOTION
     | RGFX_FEATURE_VT_MESSAGES
-    | RGFX_FEATURE_UPLOADS_WRITTEN;
+    | RGFX_FEATURE_UPLOADS_WRITTEN
+    | RGFX_FEATURE_VT_RING;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -403,6 +404,11 @@ const SUBMIT: RingAt = RingAt {
 const COMPLETE: RingAt = RingAt {
     header: RGFX_CONTROL_COMPLETE_OFFSET,
     data_size: RGFX_CONTROL_RING_DATA_SIZE as u64,
+};
+/// The VideoToolbox ring ([`RGFX_FEATURE_VT_RING`]).
+const VT_RING: RingAt = RingAt {
+    header: RGFX_VT_RING_OFFSET,
+    data_size: RGFX_VT_RING_DATA_SIZE as u64,
 };
 
 /// What the device asks of the host that runs it (QEMU, through the C API's callbacks). Each is
@@ -858,6 +864,11 @@ pub enum RingDegradation {
     /// A `VBLANK` found no room and was dropped: the guest gets no event for that refresh, and the
     /// next `VBLANK` carries the count.
     VblankDropped,
+    /// A message of the host's side to the guest's VideoToolbox found the VideoToolbox ring
+    /// ([`RGFX_FEATURE_VT_RING`]) with no room, or broken, where the message before it went in: a
+    /// spell begins in which each such message goes onto the control completion ring as a
+    /// `VT_MESSAGE` event, until one finds room.
+    VtRingFull,
     /// A post that waits for room found a command queue's completion ring with none where the
     /// post that waited on it before had gone on: a spell begins in which the queue's posts that
     /// wait for room wait for the guest's process to take more.
@@ -875,6 +886,7 @@ impl RingDegradation {
             Self::ControlRingFull => "control-ring-full",
             Self::ControlPostWaited => "control-ring-post-waited",
             Self::VblankDropped => "vblank-dropped",
+            Self::VtRingFull => "vt-ring-full",
             Self::QueueRingFull => "queue-ring-full",
             Self::QueuePostWaited => "queue-ring-post-waited",
         }
@@ -939,6 +951,14 @@ pub(crate) struct Shared {
     /// the ring held, so a full spell is told once, at its first post that found no room
     /// ([`RingDegradation::ControlRingFull`]).
     control_full: AtomicBool,
+    /// The VideoToolbox ring ([`RGFX_FEATURE_VT_RING`]), held while a host message is written
+    /// into it and its `VT_RING` posted, so the `VT_RING`s go out in the order of their counts.
+    /// Taken before the control completion ring's locks, never while one is held.
+    vt_ring: Mutex<Producer>,
+    /// Whether the last host message for the VideoToolbox ring found no room there, or the ring
+    /// broken: set and cleared with the ring held, so a full spell is told once
+    /// ([`RingDegradation::VtRingFull`]).
+    vt_full: AtomicBool,
     /// The answers a thread that may not wait for room on the control completion ring handed
     /// over ([`CompleteAnswer::answer`]), for the control thread, or the next thread that posts
     /// onto the ring waiting for room, to post in their order.
@@ -1553,6 +1573,8 @@ impl Device {
         consumer.reset(&region);
         let mut producer = Producer::new(COMPLETE);
         producer.reset(&region);
+        let mut vt_ring = Producer::new(VT_RING);
+        vt_ring.reset(&region);
         let shared = Arc::new(Shared {
             host,
             displays,
@@ -1574,6 +1596,8 @@ impl Device {
             room: Room::default(),
             room_poll_ns: AtomicU64::new(u64::try_from(ROOM_POLL.as_nanos()).unwrap_or(u64::MAX)),
             control_full: AtomicBool::new(false),
+            vt_ring: Mutex::new(vt_ring),
+            vt_full: AtomicBool::new(false),
             control_handed: Mutex::new(Handed::default()),
             control_handing: AtomicBool::new(false),
             pointer: Mutex::new(Pointer::default()),
@@ -2102,6 +2126,14 @@ impl Shared {
         let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
         // Nothing the lanes were handed before it is begun now.
         self.lanes.reset(epoch);
+        // The VideoToolbox ring as new. Its lock comes before the control completion ring's, so
+        // it is taken here with no other ring held. A link that takes it after this finds the new
+        // reset count and writes nothing; what one wrote before is dropped with its `VT_RING`.
+        {
+            let mut vt_ring = self.vt_ring.lock();
+            vt_ring.reset(&self.region);
+            self.vt_full.store(false, Ordering::Relaxed);
+        }
         let mut submit = self.submit.lock();
         let mut states: Vec<MutexGuard<'_, DisplayState>> =
             self.displays.iter().map(|d| d.state.lock()).collect();
@@ -2158,15 +2190,21 @@ impl Shared {
 
     /// The feature bits the device offers a guest whose driver took `taken`: the host's
     /// ([`Host::features`]), [`RGFX_FEATURE_MULTI_DISPLAY`], [`RGFX_FEATURE_POINTER_OVER`] and
-    /// [`RGFX_FEATURE_DISPLAY_BOUNDS`] on a device of two displays or more (the device's to offer,
-    /// whatever the host's answer), and where `taken` holds [`RGFX_FEATURE_PAGES_16K`] and the
-    /// host offers it, those it offers only then ([`Host::features_with_16k_pages`]).
+    /// [`RGFX_FEATURE_DISPLAY_BOUNDS`] on a device of two displays or more, and
+    /// [`RGFX_FEATURE_VT_RING`] where the host offers [`RGFX_FEATURE_VT_MESSAGES`] (the device's to
+    /// offer, whatever the host's answer), and where `taken` holds [`RGFX_FEATURE_PAGES_16K`] and
+    /// the host offers it, those it offers only then ([`Host::features_with_16k_pages`]).
     fn offered_to(&self, taken: u64) -> u64 {
         let displays =
             RGFX_FEATURE_MULTI_DISPLAY | RGFX_FEATURE_POINTER_OVER | RGFX_FEATURE_DISPLAY_BOUNDS;
-        let features = (self.host.features() & !displays)
-            | if self.display_count() > 1 {
+        let host = self.host.features() & !(displays | RGFX_FEATURE_VT_RING);
+        let features =
+            host | if self.display_count() > 1 {
                 displays
+            } else {
+                0
+            } | if host & RGFX_FEATURE_VT_MESSAGES != 0 {
+                RGFX_FEATURE_VT_RING
             } else {
                 0
             };

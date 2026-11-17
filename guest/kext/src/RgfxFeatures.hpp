@@ -173,7 +173,10 @@
 //  - UPLOADS_WRITTEN (bit 53), both kexts: where the bundle's upload chunks are Managed (its
 //    device answers hasUnifiedMemory NO), each command buffer names the bytes its encoders wrote
 //    in them in its own stream (RGFX_OP_UPLOADS_WRITTEN, RgfxUploads.h), in place of a
-//    BUFFER_DID_MODIFY_RANGE of each on ring 0, which needs nothing of the kext.
+//    BUFFER_DID_MODIFY_RANGE of each on ring 0, which needs nothing of the kext;
+//  - VT_RING (bit 54), the arm64e kext alone, with VT_MESSAGES: the framebuffer takes the host's
+//    messages from the VideoToolbox ring through each VT_RING event's count (RgfxVtRing.hpp) and
+//    hands them on as VT_MESSAGE events', which needs nothing of the bundle.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -216,7 +219,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_READ_ONLY_PAGES | RGFX_FEATURE_DOORBELL_PAGES | RGFX_FEATURE_PIPELINE_ANSWERS |
     RGFX_FEATURE_POINTER_MOTION | RGFX_FEATURE_MULTI_DISPLAY |
     RGFX_FEATURE_POINTER_OVER | RGFX_FEATURE_DISPLAY_BOUNDS | RGFX_FEATURE_UPLOADS_WRITTEN |
-    (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K | RGFX_FEATURE_VT_MESSAGES
+    (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K | RGFX_FEATURE_VT_MESSAGES | RGFX_FEATURE_VT_RING
                       : RGFX_FEATURE_DISPLAY_POWER);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer and, on arm64, the

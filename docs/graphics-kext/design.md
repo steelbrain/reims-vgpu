@@ -1673,10 +1673,32 @@ Stages:
       from guest RAM, hands it to its session layer, and answers
       `VT_STATUS` with the status VideoToolbox's host side would return. A
       message from the host (a reply, a request, an emitted frame; 16 KiB
-      at most, the framework's dequeue buffer) comes as `VT_MESSAGE` on the
-      control completion ring, its bytes inline; the kext gives it to every
-      client that registered its UUID, and a `Bye!` to every client with
-      each UUID written in, as Apple's kext does. A deregistration of a
+      at most, the framework's dequeue buffer) goes into the VideoToolbox
+      ring, a 2 MiB ring of the device's at region offset 0x20000, and a
+      24-byte `VT_RING` on the control completion ring carries the ring's
+      count through it; the kext takes the ring's messages through that
+      count as it takes the event, so each keeps its place among the
+      control ring's events. Where the guest did not take `VT_RING`, or
+      the ring has no room for the message, it comes as a `VT_MESSAGE`
+      event on the control completion ring, its bytes inline. The kext
+      gives it to every client that registered its UUID, and a `Bye!` to
+      every client with each UUID written in, as Apple's kext does.
+    - **The host's messages keep off the control completion ring.** An
+      encode's frame at 1080p and 8 Mbit/s is two or more messages of 16
+      KiB, and two of them do not fit that ring's 32 KiB at once: while
+      the messages went there, an encode filled it about once a frame
+      (`control-ring-full` and `control-ring-post-waited` about 590 times
+      in a boot's encode bench, arm64 26.6.2 under TCG, lane a64video,
+      potluck job m3-max-38178), and a full ring holds back the display's
+      `VBLANK`s and the presents' answers. The VideoToolbox ring holds 127
+      such messages, and the session waits for the guest only at a frame's
+      last, so a frame of up to about 2 MiB goes in at once. The ring is
+      the device's memory, in the room between the control completion
+      ring's span and the guest's allocations, which the kexts map with the
+      control rings: the kext wires nothing of the guest's RAM for it, and
+      there is nothing to free at the service's stop or the kext's unload.
+      A message that finds it full goes onto the control completion ring
+      (`vt-ring-full`, once a spell). A deregistration of a
       UUID the client registered sends the host `-uui` for it, and so does
       a client's close for each UUID it holds, as Apple's kext does.
     - **A lent surface is the host's until its `rels`.** The kext holds
@@ -2283,6 +2305,18 @@ only where no negotiation can carry it.
   where its chunks are Managed (the device answers `hasUnifiedMemory` NO), and
   on a host that did not offer the bit it sends a `BUFFER_DID_MODIFY_RANGE` of
   each chunk ahead of the buffer, as before the bit.
+- Bit 54, `FEATURES_HI`'s bit 22, is `VT_RING`, which means something only
+  with `VT_MESSAGES`: the host's side's messages go into the VideoToolbox ring
+  (`RGFX_VT_RING_OFFSET`, 0x20000: a ring header, then 2 MiB of byte ring;
+  records as the `VT_MESSAGE` event's, with pads to the ring's end), each
+  followed on the control completion ring by the event `VT_RING` (0x40f,
+  `RgfxVtRing`: the ring's count through it, `seqno` 0). The guest takes the
+  ring's records through that count as it takes the event, then stores the
+  count to the ring's `consumer`; it never arms the ring. A message that finds
+  the ring with no room, or broken, goes onto the control completion ring as a
+  `VT_MESSAGE` event, after the `VT_RING`s of the messages before it. The
+  device offers the bit wherever the host offers `VT_MESSAGES`; the arm64e
+  kext takes it with `VT_MESSAGES`, and nothing else does (item 17).
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -2310,6 +2344,7 @@ at 0x4000_0000. The device stays on `pcie.0`: a root port does not help.
 |---|---|---|
 | 0x00000 | 64 KiB | control submission ring, id 0 (the kexts to host) |
 | 0x10000 | 64 KiB | control completion ring (host to kext), MSI-X vector 0; the device info at 0x18100 |
+| 0x20000 | 2 MiB + 256 | the VideoToolbox ring (host to the arm64e kext, `VT_RING`), never armed |
 | 0x400000 | 128 MiB | the framebuffer's scanout (`RGFX_SCANOUT_SPAN`) |
 | 0x8400000 | to the cursor | the accelerator kext's blocks: every process's queue rings, Shared buffers and heaps, surfaces |
 | end − 256 KiB | 256 KiB | the framebuffer's cursor image |
