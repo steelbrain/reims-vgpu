@@ -85,6 +85,10 @@ pub enum Value {
     /// Host memory an argument names: its address and length. The recorder reads or drops it
     /// before a call is written; written alone, it is nil.
     Host(usize, u64),
+    /// An argument's `Debug` text, its objects already their stream ids: the recorder's writer
+    /// reads it into its value ([`super::debug_value`]) before the call is written; written
+    /// alone, it is nil.
+    Debug(String),
 }
 
 impl Value {
@@ -237,7 +241,7 @@ impl Stream {
 
     fn value(&mut self, p: &mut Vec<u8>, v: &Value) {
         match v {
-            Value::Nil | Value::Host(..) => p.push(0),
+            Value::Nil | Value::Host(..) | Value::Debug(_) => p.push(0),
             Value::Bool(false) => p.push(1),
             Value::Bool(true) => p.push(2),
             Value::Uint(u) => {

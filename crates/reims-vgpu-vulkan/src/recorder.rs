@@ -13,25 +13,34 @@
 //!   object an argument names are the objects' stream ids, which the recorder gives each object
 //!   as a call makes it (`State::register`) and never gives again; an object's last reference going
 //!   (`Obj`'s drop) is its `release` record.
-//! - **Arguments** are read from their `Debug` text ([`debug_value`]), but for host memory, bytes,
-//!   strings and events ([`spec`]).
+//! - **Arguments.** The hottest commands and the pass descriptor's sets are read from their fields
+//!   ([`typed`]), integers, booleans and ranges as themselves, and host memory, bytes, strings and
+//!   events as such ([`spec`]); the rest is formatted as its `Debug` text, its objects as their
+//!   stream ids, which the writer reads into values ([`debug_value`]). Text that names objects by
+//!   pointer (`ObjId(..)`) is read at once, while the pointers are the objects'.
 //! - **Memory.** Before each commit, the recorder waits for the earlier command buffers that can
 //!   run, then writes `m2v.write` records of every 4 KiB of host memory the command buffer can
 //!   reach that changed since the stream last held it ([`before_commit`]). A buffer in a heap over
 //!   the guest's memory is written as its block's bytes. A copy out of the guest's RAM carries the
 //!   bytes it reads as its arguments ([`guest_ram_source`]).
-//! - **The file.** Records are appended to a buffer under one lock as each call returns, so the
-//!   stream's order keeps each thread's; a thread of the recorder's own (`reims-vgpu.recorder`)
-//!   writes the buffer out every [`FLUSH`], into segments `<pid>.NNNN.m2vr` of at most
-//!   [`SEGMENT`] bytes, each starting with the header. Libraries go once each into the `blobs`
-//!   directory beside the stream's, by the hex of their SHA-256. `<pid>.stats.txt` says what was
-//!   written, every few seconds.
+//! - **The calling thread captures; the writer shapes.** Each call's record is queued, owned,
+//!   under one lock as the call returns, so the stream's order keeps each thread's, with what
+//!   only the call's moment has: its objects' ids, the bytes it consumes and the memory a commit
+//!   reaches. A thread of the recorder's own (`reims-vgpu.recorder`) takes the queue every
+//!   [`DRAIN`] and, in its order, reads the text, shapes and tracks each call and encodes it. A
+//!   commit or a copy out of the guest's RAM first takes what is queued on its own thread, since
+//!   its capture needs every earlier call tracked.
+//! - **The file.** The writer writes the stream out every [`FLUSH`], into segments
+//!   `<pid>.NNNN.m2vr` of at most [`SEGMENT`] bytes, each starting with the header. Libraries go
+//!   once each into the `blobs` directory beside the stream's, by the hex of their SHA-256.
+//!   `<pid>.stats.txt` says what was written, every few seconds.
 //!
 //! Recordings hold the guest's data: they stay on the host that made them and are never
 //! committed.
 
 pub mod debug_value;
 pub mod format;
+pub mod typed;
 
 use std::any::Any;
 use std::borrow::Cow;
@@ -59,6 +68,12 @@ pub const ENV_VAR: &str = "REIMS_VGPU_RECORD";
 
 /// How long a record may wait in the buffer.
 const FLUSH: Duration = Duration::from_millis(50);
+
+/// How long a call may wait in the queue before the writer shapes it.
+const DRAIN: Duration = Duration::from_millis(1);
+
+/// How often the counts are written.
+const STATS: Duration = Duration::from_secs(5);
 
 /// The most bytes a segment holds before the next starts.
 const SEGMENT: u64 = 1 << 30;
@@ -163,6 +178,8 @@ fn enter_recording() -> Token {
 pub struct Active {
     token: Token,
     pending: Option<Call>,
+    /// An encoder command's `Debug` text, which the writer reads into its arguments.
+    text: Option<String>,
 }
 
 /// Opens a call: its selector, receiver and arguments, read only where it is the outermost.
@@ -183,7 +200,66 @@ pub fn begin<S: Into<Cow<'static, str>>>(
             ..Call::default()
         }
     });
-    Active { token, pending }
+    Active {
+        token,
+        pending,
+        text: None,
+    }
+}
+
+/// Opens an encoder's command, `cmd` on the encoder `receiver` names, read only where it is the
+/// outermost.
+pub fn begin_cmd<C: typed::Command + std::fmt::Debug>(
+    token: Token,
+    receiver: impl FnOnce() -> u64,
+    cmd: &C,
+) -> Active {
+    if !token.outer {
+        return Active {
+            token,
+            pending: None,
+            text: None,
+        };
+    }
+    let t0 = now_ns();
+    let receiver = receiver();
+    let (args, text) = cmd_call(cmd);
+    if let Some(state) = state() {
+        (state.stats.read_ns).fetch_add(now_ns() - t0, Ordering::Relaxed);
+    }
+    Active {
+        token,
+        pending: Some(Call {
+            selector: cmd.sel().to_owned(),
+            receiver,
+            args,
+            ..Call::default()
+        }),
+        text,
+    }
+}
+
+/// A command's arguments: read from its fields where it is one [`typed`] reads; else its text,
+/// read now where it names objects by pointer, or left for the writer.
+fn cmd_call<C: typed::Command + std::fmt::Debug>(cmd: &C) -> (Vec<Value>, Option<String>) {
+    let mut cx = typed::Cx::new(&id_at);
+    if let Some(args) = cmd.typed(&mut cx) {
+        count_unrecorded(cx.unrecorded);
+        return (args, None);
+    }
+    let text = debug_text(cmd);
+    if text.contains("ObjId(") {
+        return (cmd_args_text(&text), None);
+    }
+    (Vec::new(), Some(text))
+}
+
+fn count_unrecorded(n: u64) {
+    if n > 0
+        && let Some(state) = state()
+    {
+        state.stats.unrecorded_refs.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 impl Active {
@@ -199,13 +275,11 @@ macro_rules! rec_call {
     (@cmd $recv:expr, $cmd:expr) => {
         match $crate::recorder::enter() {
             None => None,
-            Some(token) => Some($crate::recorder::begin(token, || {
-                (
-                    $cmd.selector(),
-                    $crate::recorder::Receiver::stream_id($recv),
-                    $crate::recorder::cmd_args(&$cmd),
-                )
-            })),
+            Some(token) => Some($crate::recorder::begin_cmd(
+                token,
+                || $crate::recorder::Receiver::stream_id($recv),
+                &$cmd,
+            )),
         }
     };
     ($sel:expr, $recv:expr $(, $arg:expr)* $(,)?) => {
@@ -228,7 +302,8 @@ macro_rules! rec_val {
     ($e:expr) => {{
         #[allow(unused_imports)]
         use $crate::recorder::spec::{
-            ViaBytes as _, ViaDebug as _, ViaEvent as _, ViaHost as _, ViaNil as _, ViaStr as _,
+            ViaBytes as _, ViaDebug as _, ViaEvent as _, ViaHost as _, ViaNil as _, ViaScalar as _,
+            ViaSet as _, ViaStr as _,
         };
         (&&&$crate::recorder::spec::V(&$e)).rec_value()
     }};
@@ -253,9 +328,39 @@ pub fn run<R>(body: impl FnOnce() -> R) -> R {
     body()
 }
 
-/// An encoder command's arguments: its variant's fields, in order.
+/// An encoder command's arguments, read from its `Debug` text: its variant's fields, in order.
 pub fn cmd_args<T: std::fmt::Debug>(cmd: &T) -> Vec<Value> {
-    match spec::debug_value_of(cmd) {
+    cmd_args_text(&debug_text(cmd))
+}
+
+/// `x`'s `Debug` text, its objects as their stream ids.
+fn debug_text<T: std::fmt::Debug + ?Sized>(x: &T) -> String {
+    formatting(|| format!("{x:?}"))
+}
+
+/// The value `text`, an argument's `Debug` text, reads as, what it did not read counted.
+fn parse_text(text: &str) -> Value {
+    let (v, notes) = debug_value::parse(text, &id_at);
+    if let Some(state) = state() {
+        state
+            .stats
+            .unrecorded_refs
+            .fetch_add(notes.unrecorded, Ordering::Relaxed);
+        if notes.unread {
+            state.stats.unread_args.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    v
+}
+
+/// An encoder command's arguments from its `Debug` text.
+fn cmd_args_text(text: &str) -> Vec<Value> {
+    cmd_args_of(parse_text(text))
+}
+
+/// An encoder command's arguments from the value its text reads as.
+fn cmd_args_of(v: Value) -> Vec<Value> {
+    match v {
         Value::Map(fields) => match fields.len() {
             // A tuple variant reads as one pair of its name and its value(s).
             1 if fields
@@ -276,13 +381,82 @@ pub fn cmd_args<T: std::fmt::Debug>(cmd: &T) -> Vec<Value> {
 }
 
 /// The values of arguments by kind, by autoref specialisation: host memory, bytes, strings and
-/// events are read as such, anything else that prints itself from its `Debug` text, and the rest
-/// (blocks and handlers) is nil.
+/// events are read as such, integers, booleans, ranges and the pass descriptor's sets from their
+/// fields ([`typed`]), anything else that prints itself from its `Debug` text, and the
+/// rest (blocks and handlers) is nil.
 pub mod spec {
-    use super::{Value, debug_value};
+    use super::{Value, typed};
     use crate::core::platform::event::EventRef;
     use crate::core::platform::host_range::HostRange;
+    use crate::core::platform::types::NsRange;
+    use crate::core::platform::values::{
+        ColorAttachmentSet, DepthAttachmentSet, PassSet, StencilAttachmentSet,
+    };
     use crate::platform::VulkanPlatform;
+
+    /// Integers, booleans and ranges, as their text reads.
+    pub trait ViaScalar {
+        /// The value.
+        fn rec_value(&self) -> Value;
+    }
+    impl ViaScalar for &&V<'_, u64> {
+        fn rec_value(&self) -> Value {
+            typed::uint(*self.0)
+        }
+    }
+    impl ViaScalar for &&V<'_, u32> {
+        fn rec_value(&self) -> Value {
+            typed::uint(u64::from(*self.0))
+        }
+    }
+    impl ViaScalar for &&V<'_, i64> {
+        fn rec_value(&self) -> Value {
+            typed::sint(*self.0)
+        }
+    }
+    impl ViaScalar for &&V<'_, bool> {
+        fn rec_value(&self) -> Value {
+            Value::Bool(*self.0)
+        }
+    }
+    impl ViaScalar for &&V<'_, NsRange> {
+        fn rec_value(&self) -> Value {
+            typed::ns_range(*self.0)
+        }
+    }
+
+    /// The pass descriptor's sets, from their fields.
+    pub trait ViaSet {
+        /// The value.
+        fn rec_value(&self) -> Value;
+    }
+    impl ViaSet for &&V<'_, &PassSet<'_, VulkanPlatform>> {
+        fn rec_value(&self) -> Value {
+            with_cx(|cx| typed::pass_set(self.0, cx))
+        }
+    }
+    impl ViaSet for &&V<'_, &ColorAttachmentSet<'_, VulkanPlatform>> {
+        fn rec_value(&self) -> Value {
+            with_cx(|cx| typed::color_attachment(self.0, cx))
+        }
+    }
+    impl ViaSet for &&V<'_, &DepthAttachmentSet<'_, VulkanPlatform>> {
+        fn rec_value(&self) -> Value {
+            with_cx(|cx| typed::depth_attachment(self.0, cx))
+        }
+    }
+    impl ViaSet for &&V<'_, &StencilAttachmentSet<'_, VulkanPlatform>> {
+        fn rec_value(&self) -> Value {
+            with_cx(|cx| typed::stencil_attachment(self.0, cx))
+        }
+    }
+
+    fn with_cx(read: impl FnOnce(&mut typed::Cx<'_>) -> Value) -> Value {
+        let mut cx = typed::Cx::new(&super::id_at);
+        let v = read(&mut cx);
+        super::count_unrecorded(cx.unrecorded);
+        v
+    }
 
     /// An argument, borrowed.
     pub struct V<'a, T: ?Sized>(
@@ -360,23 +534,14 @@ pub mod spec {
         }
     }
 
-    /// `x`'s value from its `Debug` text, objects as their stream ids.
+    /// `x`'s value from its `Debug` text, objects as their stream ids: the text, which the
+    /// writer reads ([`Value::Debug`]), but where it names objects by pointer, read now.
     pub fn debug_value_of<T: std::fmt::Debug + ?Sized>(x: &T) -> Value {
-        let text = super::formatting(|| format!("{x:?}"));
-        let (v, notes) = debug_value::parse(&text, &super::id_at);
-        if let Some(state) = super::state() {
-            state
-                .stats
-                .unrecorded_refs
-                .fetch_add(notes.unrecorded, super::Ordering::Relaxed);
-            if notes.unread {
-                state
-                    .stats
-                    .unread_args
-                    .fetch_add(1, super::Ordering::Relaxed);
-            }
+        let text = super::debug_text(x);
+        if text.contains("ObjId(") {
+            return super::parse_text(&text);
         }
-        v
+        Value::Debug(text)
     }
 
     /// An answer that names an object the call made, or none.
@@ -522,7 +687,7 @@ fn receiver_id<T: Send + Sync + 'static>(o: &Obj<T>) -> u64 {
     }
     if std::any::type_name::<T>() == std::any::type_name::<crate::gpu::device::DeviceObject>() {
         let id = state.register(Made::of(o));
-        state.emit(Call {
+        state.push_plain(Call {
             selector: "MTLCreateSystemDefaultDevice".to_owned(),
             result: id,
             ..Call::default()
@@ -556,7 +721,7 @@ pub fn adopt_texture(t: &VulkanTexture) {
         ("storageMode".to_owned(), Value::Uint(2)),
     ]);
     let id = state.register(Made::of(t));
-    state.emit(Call {
+    state.push_plain(Call {
         selector: "newTextureWithDescriptor:".to_owned(),
         result: id,
         args: vec![desc],
@@ -579,7 +744,7 @@ pub fn present(t: &dyn Any) {
     adopt_texture(t);
     let Some(state) = state() else { return };
     let arg = id_at(t.id().0).map_or(Value::Nil, Value::Object);
-    state.emit(Call {
+    state.push_plain(Call {
         selector: "m2v.present".to_owned(),
         args: vec![arg],
         ..Call::default()
@@ -587,7 +752,9 @@ pub fn present(t: &dyn Any) {
     state.stats.presents.fetch_add(1, Ordering::Relaxed);
 }
 
-/// An object's last reference went, at `ptr`: its `release` record.
+/// An object's last reference went, at `ptr`: its `release` record, after every record queued
+/// before it. Its pointer is no longer the object's at once, and memory reached through it is
+/// no longer read.
 pub fn released(ptr: u64) {
     let Some(state) = state() else { return };
     let id = {
@@ -595,34 +762,34 @@ pub fn released(ptr: u64) {
         let Some(id) = objects.by_ptr.remove(&ptr) else {
             return;
         };
-        if let Some(info) = objects.info.remove(&id)
-            && let Some((start, _)) = info.pin
-        {
-            objects.pins.remove(&start);
+        if let Some(info) = objects.info.get_mut(&id) {
+            info.dead = true;
         }
         id
     };
-    state.sync.lock().cbs.remove(&id);
     state.baselines.lock().remove(&id);
-    state.emit(Call {
-        selector: "release".to_owned(),
-        receiver: id,
-        ..Call::default()
-    });
+    state.push(Item::Release(id));
 }
 
-/// Records the call `active` opened, with the object it made.
+/// Records the call `active` opened, with the object it made: queued, for the writer to shape.
 pub fn finish(active: Active, made: Option<Made>) {
-    let Active { token, pending } = active;
+    let Active {
+        token,
+        pending,
+        text,
+    } = active;
     let Some(mut call) = pending else { return };
     let Some(state) = state() else { return };
     let t0 = now_ns();
     if let Some(made) = made {
         call.result = state.register(made);
     }
-    state.shape(&mut call);
-    state.track(&call);
-    state.emit(call);
+    state.capture_now(&mut call);
+    state.push(Item::Call {
+        call,
+        text,
+        shape: true,
+    });
     (state.stats.finish_ns).fetch_add(now_ns() - t0, Ordering::Relaxed);
     drop(token);
 }
@@ -638,23 +805,29 @@ pub fn draws<T: Send + Sync + 'static>(
         return;
     }
     let Some(state) = state() else { return };
+    let t0 = now_ns();
     let receiver = receiver_id(encoder);
     for d in draws {
         for cmd in [d.vertex_buffer(), d.primitives()] {
+            let (args, text) = cmd_call(&cmd);
             let call = Call {
                 selector: cmd.selector().to_owned(),
                 receiver,
-                args: cmd_args(&cmd),
+                args,
                 ..Call::default()
             };
-            state.track(&call);
-            state.emit(call);
+            state.push(Item::Call {
+                call,
+                text,
+                shape: false,
+            });
         }
     }
+    (state.stats.read_ns).fetch_add(now_ns() - t0, Ordering::Relaxed);
 }
 
-/// Before a commit: waits for the earlier command buffers that can run, then writes the memory
-/// the command buffer reaches that changed.
+/// Before a commit: shapes what is queued, waits for the earlier command buffers that can run,
+/// then writes the memory the command buffer reaches that changed.
 pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
     let Some(a) = active else { return };
     if !a.recorded() {
@@ -662,6 +835,7 @@ pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
     }
     let Some(state) = state() else { return };
     let Some(id) = id_at(cb.id().0) else { return };
+    state.drain(true);
     let t0 = now_ns();
     let mut written = state.reap();
     state.wait_for_earlier();
@@ -717,6 +891,7 @@ pub fn guest_ram_source(
         return;
     }
     let Some(state) = state() else { return };
+    state.drain(true);
     let t0 = now_ns();
     let mut written = state.reap();
     state.wait_for_earlier();
@@ -808,6 +983,23 @@ struct Info {
     pin: Option<(u64, u64)>,
     /// The objects a descriptor's calls named.
     refs: HashSet<u64>,
+    /// Whether its last reference went: its release is queued, and its memory no longer read.
+    dead: bool,
+}
+
+/// What a calling thread hands the writer, in the stream's order.
+enum Item {
+    /// A hooked call: its text read (the command's where `text`), shaped where `shape`, tracked
+    /// and written.
+    Call {
+        call: Call,
+        text: Option<String>,
+        shape: bool,
+    },
+    /// A record written as it is, counted by its selector where `count`.
+    Plain { call: Call, count: bool },
+    /// An object's release: its last record, after which the recorder forgets it.
+    Release(u64),
 }
 
 #[derive(Default)]
@@ -835,7 +1027,8 @@ struct Pending {
     gpu_writes: Vec<u64>,
     waits: Vec<(u64, u64)>,
     signals: Vec<(u64, u64)>,
-    weak: Weak<CommandBufferObject>,
+    /// The command buffer, never upgraded by the writer ([`upgrade_cb`]).
+    weak: Weak<dyn Any + Send + Sync>,
 }
 
 #[derive(Default)]
@@ -870,12 +1063,18 @@ struct Stats {
     wait_ns: AtomicU64,
     capture_ns: AtomicU64,
     /// Where a recording thread spends its time: reading a call's arguments ([`begin`]),
-    /// shaping and writing its record ([`finish`]), copying and hashing memory and writing the
-    /// changed chunks (`compare`); and the writer thread's file writes.
+    /// queueing its record ([`finish`]), copying and hashing memory and queueing the changed
+    /// chunks (`compare`), and shaping what is queued before a commit (`drain_ns`, with the
+    /// wait for the writer's turn, over `drained_here` records); and the writer's: reading,
+    /// shaping, tracking and encoding records wherever they ran (`process_ns`), and its file
+    /// writes.
     read_ns: AtomicU64,
     finish_ns: AtomicU64,
     hash_ns: AtomicU64,
     write_ns: AtomicU64,
+    drain_ns: AtomicU64,
+    drained_here: AtomicU64,
+    process_ns: AtomicU64,
     flush_ns: AtomicU64,
     /// How long the longest commit's wait and capture took, and how many took over 1, 4 and 8 ms.
     commit_max_ns: AtomicU64,
@@ -900,6 +1099,10 @@ struct Stats {
 struct State {
     base: PathBuf,
     blobs_dir: PathBuf,
+    /// The records not yet shaped, in the stream's order.
+    queue: Mutex<Vec<Item>>,
+    /// Held while queued records are shaped, so they are shaped in order.
+    shaping: Mutex<()>,
     stream: Mutex<Stream>,
     objects: Mutex<Objects>,
     sync: Mutex<SyncState>,
@@ -917,6 +1120,8 @@ impl State {
         State {
             base: dir.join(pid.to_string()),
             blobs_dir,
+            queue: Mutex::new(Vec::new()),
+            shaping: Mutex::new(()),
             stream: Mutex::new(Stream::new()),
             objects: Mutex::new(Objects::default()),
             sync: Mutex::new(SyncState::default()),
@@ -949,9 +1154,18 @@ impl State {
         let mut segment = 0u32;
         let mut file: Option<std::fs::File> = None;
         let mut written = 0u64;
-        let mut ticks = 0u64;
+        let flush = u64::try_from(FLUSH.as_nanos()).unwrap_or(u64::MAX);
+        let stats = u64::try_from(STATS.as_nanos()).unwrap_or(u64::MAX);
+        let mut flushed = now_ns();
+        let mut counted = flushed;
         loop {
-            std::thread::sleep(FLUSH);
+            std::thread::sleep(DRAIN);
+            self.drain(false);
+            let now = now_ns();
+            if now - flushed < flush {
+                continue;
+            }
+            flushed = now;
             let bytes = self.stream.lock().take();
             let t0 = now_ns();
             if !bytes.is_empty() {
@@ -975,10 +1189,99 @@ impl State {
                 }
             }
             (self.stats.flush_ns).fetch_add(now_ns() - t0, Ordering::Relaxed);
-            ticks += 1;
-            if ticks.is_multiple_of(100) {
+            if now - counted >= stats {
+                counted = now;
                 self.write_stats();
             }
+        }
+    }
+
+    /// Queues a record, in the stream's order.
+    fn push(&self, item: Item) {
+        self.queue.lock().push(item);
+    }
+
+    /// Queues a record written as it is.
+    fn push_plain(&self, call: Call) {
+        self.push(Item::Plain { call, count: false });
+    }
+
+    /// Shapes and writes every queued record, in order: on the writer's thread, or on a calling
+    /// thread (`here`) whose capture needs them tracked.
+    fn drain(&self, here: bool) {
+        let t0 = now_ns();
+        let _shaping = self.shaping.lock();
+        let items = std::mem::take(&mut *self.queue.lock());
+        let t1 = now_ns();
+        let n = items.len() as u64;
+        for item in items {
+            self.process(item);
+        }
+        let t2 = now_ns();
+        self.stats.process_ns.fetch_add(t2 - t1, Ordering::Relaxed);
+        if here {
+            self.stats.drain_ns.fetch_add(t2 - t0, Ordering::Relaxed);
+            self.stats.drained_here.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    fn process(&self, item: Item) {
+        match item {
+            Item::Call {
+                mut call,
+                text,
+                shape,
+            } => {
+                if let Some(text) = text {
+                    call.args = cmd_args_text(&text);
+                }
+                for v in &mut call.args {
+                    if let Value::Debug(text) = v {
+                        *v = parse_text(text);
+                    }
+                }
+                if shape {
+                    self.shape(&mut call);
+                }
+                self.track(&call);
+                self.emit(call, false);
+            }
+            Item::Plain { call, count } => self.emit(call, count),
+            Item::Release(id) => {
+                {
+                    let mut objects = self.objects.lock();
+                    if let Some(info) = objects.info.remove(&id)
+                        && let Some((start, _)) = info.pin
+                    {
+                        objects.pins.remove(&start);
+                    }
+                }
+                self.sync.lock().cbs.remove(&id);
+                self.emit(
+                    Call {
+                        selector: "release".to_owned(),
+                        receiver: id,
+                        ..Call::default()
+                    },
+                    false,
+                );
+            }
+        }
+    }
+
+    /// What a call's record must take at its moment, before it is queued: the bytes of the host
+    /// memory it consumes (`replaceRegion:`), and a block's memory, which captures read.
+    fn capture_now(&self, call: &mut Call) {
+        if call.selector.starts_with("replaceRegion:") {
+            for v in &mut call.args {
+                read_host(v, &call.selector);
+            }
+        }
+        if call.selector == "m2v.newBlockWithLength:storageMode:"
+            && let Some(Value::Host(p, l)) = call.args.first()
+            && let Some(info) = self.objects.lock().info.get_mut(&call.result)
+        {
+            info.block = Some((*p, *l));
         }
     }
 
@@ -999,6 +1302,9 @@ impl State {
         line(&mut out, "finish_ns", &s.finish_ns);
         line(&mut out, "hash_ns", &s.hash_ns);
         line(&mut out, "write_ns", &s.write_ns);
+        line(&mut out, "drain_ns", &s.drain_ns);
+        line(&mut out, "drained_here", &s.drained_here);
+        line(&mut out, "process_ns", &s.process_ns);
         line(&mut out, "flush_ns", &s.flush_ns);
         line(&mut out, "commit_max_ns", &s.commit_max_ns);
         line(&mut out, "commits_over_1ms", &s.commits_over_1ms);
@@ -1035,10 +1341,9 @@ impl State {
             let id = objects.next;
             let stale = objects.by_ptr.insert(made.ptr, id);
             if let Some(old) = stale
-                && let Some(info) = objects.info.remove(&old)
-                && let Some((start, _)) = info.pin
+                && let Some(info) = objects.info.get_mut(&old)
             {
-                objects.pins.remove(&start);
+                info.dead = true;
             }
             objects.info.insert(
                 id,
@@ -1052,11 +1357,8 @@ impl State {
         };
         if let Some(old) = stale {
             // The object at this address went with no release seen: its release comes first.
-            self.emit(Call {
-                selector: "release".to_owned(),
-                receiver: old,
-                ..Call::default()
-            });
+            self.baselines.lock().remove(&old);
+            self.push(Item::Release(old));
         }
         id
     }
@@ -1261,10 +1563,8 @@ impl State {
                 let info = objects.info.get(&cb);
                 let queue = info.map_or(0, |i| i.parent);
                 let weak = info
-                    .and_then(|i| i.weak.clone())
-                    .and_then(|w| w.upgrade())
-                    .and_then(|a| a.downcast::<CommandBufferObject>().ok())
-                    .map(|a| Arc::downgrade(&a));
+                    .filter(|i| i.type_name == cb_type)
+                    .and_then(|i| i.weak.clone());
                 drop(objects);
                 if let Some(weak) = weak {
                     sync.pending.push(Pending {
@@ -1291,7 +1591,7 @@ impl State {
             // release).
             let mut done = Vec::new();
             sync.pending.retain(|p| {
-                let finished = match p.weak.upgrade() {
+                let finished = match upgrade_cb(&p.weak) {
                     None => true,
                     Some(cb) => {
                         let finished = finished(&cb);
@@ -1328,7 +1628,7 @@ impl State {
     /// event waits a CPU signal, a completed command buffer or another that can run satisfies,
     /// and whose queue's earlier one can run.
     fn wait_for_earlier(&self) {
-        let runnable: Vec<Weak<CommandBufferObject>> = {
+        let runnable: Vec<Weak<dyn Any + Send + Sync>> = {
             let sync = self.sync.lock();
             let n = sync.pending.len();
             let mut can = vec![false; n];
@@ -1375,7 +1675,7 @@ impl State {
         for weak in runnable {
             self.stats.waits.fetch_add(1, Ordering::Relaxed);
             loop {
-                let Some(cb) = weak.upgrade() else { break };
+                let Some(cb) = upgrade_cb(&weak) else { break };
                 let done = finished(&cb);
                 let_go_cb(cb);
                 if done {
@@ -1400,7 +1700,7 @@ impl State {
             }
             let (weak, block) = {
                 let objects = self.objects.lock();
-                let Some(info) = objects.info.get(&id) else {
+                let Some(info) = objects.info.get(&id).filter(|i| !i.dead) else {
                     continue;
                 };
                 (info.weak.clone(), info.block)
@@ -1451,7 +1751,12 @@ impl State {
     }
 
     fn block_of(&self, id: u64) -> Option<(usize, u64)> {
-        self.objects.lock().info.get(&id).and_then(|i| i.block)
+        let objects = self.objects.lock();
+        objects
+            .info
+            .get(&id)
+            .filter(|i| !i.dead)
+            .and_then(|i| i.block)
     }
 
     fn buffer_span(
@@ -1559,27 +1864,24 @@ impl State {
         self.stats.hash_ns.fetch_add(t1 - t0, Ordering::Relaxed);
         for (target, chunks) in writes {
             let mut args = Vec::with_capacity(chunks.len() * 2);
-            let mut stream = self.stream.lock();
             for (off, data) in chunks {
                 self.stats.chunks_written.fetch_add(1, Ordering::Relaxed);
                 self.stats
                     .write_bytes
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
                 args.push(Value::Uint(off));
-                args.push(if data.len() >= BLOB_MIN {
-                    Value::Blob(stream.blob(&data))
-                } else {
-                    Value::Bytes(data)
-                });
+                // A chunk of `BLOB_MIN` bytes or more is written as a blob ([`blob_long`]).
+                args.push(Value::Bytes(data));
             }
-            let n = stream.call(&Call {
-                selector: "m2v.write".to_owned(),
-                receiver: target,
-                args,
-                ..Call::default()
+            self.push(Item::Plain {
+                call: Call {
+                    selector: "m2v.write".to_owned(),
+                    receiver: target,
+                    args,
+                    ..Call::default()
+                },
+                count: true,
             });
-            drop(stream);
-            self.count(n, "m2v.write");
         }
         (self.stats.write_ns).fetch_add(now_ns() - t1, Ordering::Relaxed);
     }
@@ -1620,7 +1922,8 @@ impl State {
         }
     }
 
-    fn emit(&self, mut call: Call) {
+    /// Writes a record into the stream, counted by its selector where `count`.
+    fn emit(&self, mut call: Call, count: bool) {
         let mut stream = self.stream.lock();
         // Long inline data goes as a blob.
         for v in &mut call.args {
@@ -1628,7 +1931,7 @@ impl State {
         }
         let n = stream.call(&call);
         drop(stream);
-        self.count(n, "");
+        self.count(n, if count { &call.selector } else { "" });
     }
 
     fn count(&self, n: usize, selector: &str) {
@@ -1640,6 +1943,18 @@ impl State {
                 .lock()
                 .entry(selector.to_owned())
                 .or_insert(0) += 1;
+        }
+    }
+}
+
+/// The committed command buffer `weak` names, while it lives: upgraded on a calling thread
+/// alone, so the writer never holds an object's last reference.
+fn upgrade_cb(weak: &Weak<dyn Any + Send + Sync>) -> Option<Arc<CommandBufferObject>> {
+    match weak.upgrade()?.downcast::<CommandBufferObject>() {
+        Ok(cb) => Some(cb),
+        Err(other) => {
+            let_go_any(other);
+            None
         }
     }
 }
@@ -1872,6 +2187,605 @@ mod tests {
         );
         assert_eq!(cmd_args(&Cmd::One(7)), [Value::Uint(7)]);
         assert!(cmd_args(&Cmd::End).is_empty());
+    }
+
+    /// A call record of `args`, as the stream writes it.
+    fn record(selector: &str, args: &[Value]) -> Vec<u8> {
+        let mut s = Stream::new();
+        s.call(&Call {
+            selector: selector.to_owned(),
+            receiver: 1,
+            args: args.to_vec(),
+            ..Call::default()
+        });
+        s.take()
+    }
+
+    /// The fake platform's `Debug` text of `text`'s objects as the Vulkan platform's prints while
+    /// formatted for the stream: `ObjRef(id)` for an object the stream made, `Unrecorded(..)`
+    /// for one it did not. `objs` holds each object's own text and its stream id.
+    fn as_stream(text: &str, objs: &[(String, Option<u64>)]) -> String {
+        let mut objs = objs.to_vec();
+        objs.sort_by_key(|(t, _)| std::cmp::Reverse(t.len()));
+        let mut out = text.to_owned();
+        for (t, id) in objs {
+            let by = id.map_or_else(
+                || "Unrecorded(\"x\")".to_owned(),
+                |id| format!("ObjRef({id})"),
+            );
+            out = out.replace(&t, &by);
+        }
+        out
+    }
+
+    /// Each command [`typed`] reads from its fields is the record its `Debug` text makes, byte
+    /// for byte, with the same objects the stream never made counted: every typed command of each
+    /// encoder, with objects made and not, empty and full lists, negative, extreme and
+    /// non-finite numbers. A command it does not read is left to its text.
+    #[test]
+    fn typed_commands_are_the_records_their_text_makes() {
+        use crate::core::platform::Handle as _;
+        use crate::core::platform::blit::BlitCmd as B;
+        use crate::core::platform::compute::ComputeCmd as Cc;
+        use crate::core::platform::render::RenderCmd as R;
+        use crate::core::platform::types::{
+            MtlOrigin, MtlRegion, MtlScissorRect, MtlSize, MtlViewport, NsRange,
+        };
+        use crate::core::testkit::objects::Model;
+        use crate::core::testkit::{FakePlatform, Fk, kind};
+        use std::fmt::Debug;
+        use typed::Command as _;
+        type F = FakePlatform;
+
+        let p = FakePlatform::new();
+        let w = p.world();
+        let buf: Fk<kind::Buffer> = w.new_obj(Model::None);
+        let lost: Fk<kind::Buffer> = w.new_obj(Model::None);
+        let tex: Fk<kind::Texture> = w.new_obj(Model::None);
+        let samp: Fk<kind::SamplerState> = w.new_obj(Model::None);
+        let fence: Fk<kind::Fence> = w.new_obj(Model::None);
+        let rps: Fk<kind::RenderPipeline> = w.new_obj(Model::None);
+        let dss: Fk<kind::DepthStencilState> = w.new_obj(Model::None);
+        let cps: Fk<kind::ComputePipeline> = w.new_obj(Model::None);
+        let made: Vec<(u64, String, Option<u64>)> = vec![
+            (buf.id().0, format!("{buf:?}"), Some(11)),
+            (lost.id().0, format!("{lost:?}"), None),
+            (tex.id().0, format!("{tex:?}"), Some(12)),
+            (samp.id().0, format!("{samp:?}"), Some(13)),
+            (fence.id().0, format!("{fence:?}"), Some(14)),
+            (rps.id().0, format!("{rps:?}"), Some(15)),
+            (dss.id().0, format!("{dss:?}"), Some(16)),
+            (cps.id().0, format!("{cps:?}"), Some(170_000)),
+        ];
+        let ids = |p: u64| made.iter().find(|m| m.0 == p).and_then(|m| m.2);
+        let objs: Vec<(String, Option<u64>)> = made.iter().map(|m| (m.1.clone(), m.2)).collect();
+        /// A command's selector, its `Debug` text and its arguments read from its fields.
+        struct Seen {
+            sel: String,
+            text: String,
+            args: Option<Vec<Value>>,
+        }
+        fn of<C: typed::Command + Debug>(c: &C, cx: &mut typed::Cx<'_>) -> Seen {
+            Seen {
+                sel: c.sel().to_owned(),
+                text: format!("{c:?}"),
+                args: c.typed(cx),
+            }
+        }
+        let mut checked = 0;
+        let mut check = |cmd: &dyn Fn(&mut typed::Cx<'_>) -> Seen| {
+            let mut cx = typed::Cx::new(&ids);
+            let seen = cmd(&mut cx);
+            let sel = seen.sel;
+            let args = (seen.args).unwrap_or_else(|| panic!("{sel} is not typed"));
+            let text = as_stream(&seen.text, &objs);
+            let (v, notes) = debug_value::parse(&text, &ids);
+            assert!(!notes.unread, "{text}");
+            assert_eq!(cx.unrecorded, notes.unrecorded, "{text}");
+            assert_eq!(record(&sel, &args), record(&sel, &cmd_args_of(v)), "{text}");
+            checked += 1;
+        };
+
+        let bufs = [Some(&buf), None, Some(&lost)];
+        let no_bufs: [Option<&Fk<kind::Buffer>>; 0] = [];
+        let offs = [0, 16, u64::MAX];
+        let samps = [Some(&samp), None];
+        let texs = [Some(&tex), None];
+        let size = |width, height, depth| MtlSize {
+            width,
+            height,
+            depth,
+        };
+        let viewports = [
+            MtlViewport {
+                origin_x: 0.0,
+                origin_y: -0.0,
+                width: 1920.5,
+                height: 1e-7,
+                znear: f64::NAN,
+                zfar: f64::INFINITY,
+            },
+            MtlViewport {
+                origin_x: -f64::NAN,
+                origin_y: f64::NEG_INFINITY,
+                width: 1e300,
+                height: 0.1,
+                znear: -2.5,
+                zfar: 1.0,
+            },
+        ];
+        let render: Vec<R<'_, F>> = vec![
+            R::DrawIndexedPrimitives {
+                primitive_type: 3,
+                index_count: 6,
+                index_type: 1,
+                index_buffer: &buf,
+                index_buffer_offset: 64,
+            },
+            R::DrawIndexedPrimitives {
+                primitive_type: 3,
+                index_count: 6,
+                index_type: 0,
+                index_buffer: &lost,
+                index_buffer_offset: 0,
+            },
+            R::DrawIndexedPrimitivesInstances {
+                primitive_type: 4,
+                index_count: 300,
+                index_type: 1,
+                index_buffer: &buf,
+                index_buffer_offset: 8,
+                instance_count: 2,
+            },
+            R::DrawIndexedPrimitivesBase {
+                primitive_type: 3,
+                index_count: 3,
+                index_type: 1,
+                index_buffer: &buf,
+                index_buffer_offset: 0,
+                instance_count: 1,
+                base_vertex: -4,
+                base_instance: 7,
+            },
+            R::DrawIndexedPrimitivesBase {
+                primitive_type: 3,
+                index_count: 3,
+                index_type: 1,
+                index_buffer: &buf,
+                index_buffer_offset: 0,
+                instance_count: 1,
+                base_vertex: i64::MAX,
+                base_instance: 0,
+            },
+            R::DrawPrimitives {
+                primitive_type: 4,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+            R::DrawPrimitivesInstances {
+                primitive_type: 4,
+                vertex_start: 6,
+                vertex_count: 3,
+                instance_count: 9,
+            },
+            R::DrawPrimitivesBase {
+                primitive_type: 4,
+                vertex_start: 6,
+                vertex_count: 3,
+                instance_count: 9,
+                base_instance: 2,
+            },
+            R::EndEncoding,
+            R::MemoryBarrierWithScope {
+                scope: 1,
+                after: 2,
+                before: 4,
+            },
+            R::SetCullMode { cull_mode: 2 },
+            R::SetDepthStencilState {
+                depth_stencil_state: Some(&dss),
+            },
+            R::SetDepthStencilState {
+                depth_stencil_state: None,
+            },
+            R::SetFragmentBuffer {
+                buffer: Some(&buf),
+                offset: 16,
+                index: 0,
+            },
+            R::SetFragmentBuffer {
+                buffer: None,
+                offset: 0,
+                index: 30,
+            },
+            R::SetVertexBuffer {
+                buffer: Some(&lost),
+                offset: u64::MAX,
+                index: 1,
+            },
+            R::SetFragmentBufferOffset {
+                offset: 256,
+                index: 1,
+            },
+            R::SetVertexBufferOffset {
+                offset: 4096,
+                index: 2,
+            },
+            R::SetFragmentBuffers {
+                buffers: &bufs,
+                offsets: &offs,
+                range: NsRange::new(0, 3),
+            },
+            R::SetVertexBuffers {
+                buffers: &no_bufs,
+                offsets: &[],
+                range: NsRange::new(4, 0),
+            },
+            R::SetFragmentSamplerStates {
+                samplers: &samps,
+                range: NsRange::new(0, 2),
+            },
+            R::SetVertexSamplerStates {
+                samplers: &samps,
+                range: NsRange::new(14, 2),
+            },
+            R::SetFragmentTexture {
+                texture: Some(&tex),
+                index: 3,
+            },
+            R::SetFragmentTexture {
+                texture: None,
+                index: 0,
+            },
+            R::SetFragmentTextures {
+                textures: &texs,
+                range: NsRange::new(1, 2),
+            },
+            R::SetVertexTextures {
+                textures: &texs,
+                range: NsRange::new(0, 2),
+            },
+            R::SetFrontFacingWinding {
+                front_facing_winding: 1,
+            },
+            R::SetRenderPipelineState {
+                pipeline_state: Some(&rps),
+            },
+            R::SetScissorRect {
+                rect: MtlScissorRect {
+                    x: 1,
+                    y: 2,
+                    width: 3,
+                    height: 4,
+                },
+            },
+            R::SetStencilFrontReferenceValue {
+                front_reference_value: 0xff,
+                back_reference_value: u32::MAX,
+            },
+            R::SetTriangleFillMode { fill_mode: 1 },
+            R::SetViewport {
+                viewport: viewports[0],
+            },
+            R::SetViewport {
+                viewport: viewports[1],
+            },
+            R::UpdateFence {
+                fence: &fence,
+                stages: 1,
+            },
+            R::WaitForFence {
+                fence: &fence,
+                stages: 2,
+            },
+        ];
+        for c in &render {
+            check(&|cx| of(c, cx));
+        }
+        let compute: Vec<Cc<'_, F>> = vec![
+            Cc::DispatchThreadgroups {
+                threadgroups_per_grid: size(8, 4, 1),
+                threads_per_threadgroup: size(32, 1, 1),
+            },
+            Cc::DispatchThreads {
+                threads_per_grid: size(1920, 1080, 1),
+                threads_per_threadgroup: size(16, 16, 1),
+            },
+            Cc::EndEncoding,
+            Cc::MemoryBarrierWithScope { scope: 1 },
+            Cc::SetBufferOffset {
+                offset: 4,
+                index: 2,
+            },
+            Cc::SetBuffers {
+                buffers: &bufs,
+                offsets: &offs,
+                range: NsRange::new(0, 3),
+            },
+            Cc::SetComputePipelineState { state: Some(&cps) },
+            Cc::SetComputePipelineState { state: None },
+            Cc::SetSamplerStates {
+                samplers: &samps,
+                range: NsRange::new(0, 2),
+            },
+            Cc::SetStageInRegion {
+                region: MtlRegion::new(MtlOrigin::new(1, 2, 3), size(4, 5, 6)),
+            },
+            Cc::SetTexture {
+                texture: Some(&tex),
+                index: 0,
+            },
+            Cc::SetTextures {
+                textures: &texs,
+                range: NsRange::new(0, 2),
+            },
+            Cc::SetThreadgroupMemoryLength {
+                length: 1024,
+                index: 0,
+            },
+            Cc::UpdateFence { fence: &fence },
+            Cc::WaitForFence { fence: &fence },
+        ];
+        for c in &compute {
+            check(&|cx| of(c, cx));
+        }
+        let blit: Vec<B<'_, F>> = vec![
+            B::EndEncoding,
+            B::UpdateFence { fence: &fence },
+            B::WaitForFence { fence: &fence },
+        ];
+        for c in &blit {
+            check(&|cx| of(c, cx));
+        }
+        assert_eq!(checked, render.len() + compute.len() + blit.len());
+        let mut cx = typed::Cx::new(&ids);
+        let untyped: R<'_, F> = R::SetLineWidth { line_width: 1.5 };
+        assert!(
+            untyped.typed(&mut cx).is_none(),
+            "an f32 is read from its text"
+        );
+    }
+
+    /// The pass descriptor's sets read from their fields are the values their `Debug` text,
+    /// which names objects by pointer, reads as: objects made and not, nil sets, set values and
+    /// non-finite colours
+    #[test]
+    fn typed_sets_are_the_values_their_text_reads_as() {
+        use crate::core::platform::Handle as _;
+        use crate::core::platform::types::ClearColor;
+        use crate::core::platform::values::{
+            ColorAttachmentSet, DepthAttachmentSet, PassSet, StencilAttachmentSet,
+        };
+        use crate::core::testkit::objects::Model;
+        use crate::core::testkit::{FakePlatform, Fk, kind};
+        type F = FakePlatform;
+
+        let p = FakePlatform::new();
+        let w = p.world();
+        let tex: Fk<kind::Texture> = w.new_obj(Model::None);
+        let lost: Fk<kind::Texture> = w.new_obj(Model::None);
+        let buf: Fk<kind::Buffer> = w.new_obj(Model::None);
+        let made = [(tex.id().0, 21), (buf.id().0, 22)];
+        let ids = |p: u64| made.iter().find(|m| m.0 == p).map(|m| m.1);
+        let check = |read: &dyn Fn(&mut typed::Cx<'_>) -> Value, text: String| {
+            let mut cx = typed::Cx::new(&ids);
+            let v = read(&mut cx);
+            let (want, notes) = debug_value::parse(&text, &ids);
+            assert!(!notes.unread, "{text}");
+            assert_eq!(cx.unrecorded, notes.unrecorded, "{text}");
+            assert_eq!(record("s", &[v]), record("s", &[want]), "{text}");
+        };
+        let passes: [PassSet<'_, F>; 3] = [
+            PassSet::default(),
+            PassSet {
+                visibility_result_buffer: Some(Some(&buf)),
+                visibility_result_type: Some(1),
+                render_target_width: Some(1920),
+                render_target_height: Some(1080),
+                tile_width: Some(32),
+                ..PassSet::default()
+            },
+            PassSet {
+                visibility_result_buffer: Some(None),
+                render_target_array_length: Some(0),
+                default_raster_sample_count: Some(4),
+                default_color_sample_count: Some(4),
+                imageblock_sample_length: Some(16),
+                threadgroup_memory_length: Some(1024),
+                tile_height: Some(16),
+                ..PassSet::default()
+            },
+        ];
+        for s in &passes {
+            check(&|cx| typed::pass_set(s, cx), format!("{s:?}"));
+        }
+        let colors: [ColorAttachmentSet<'_, F>; 3] = [
+            ColorAttachmentSet::default(),
+            ColorAttachmentSet {
+                texture: Some(Some(&tex)),
+                resolve_texture: Some(Some(&lost)),
+                level: Some(1),
+                slice: Some(2),
+                depth_plane: Some(3),
+                resolve_level: Some(4),
+                resolve_slice: Some(5),
+                resolve_depth_plane: Some(6),
+                load_action: Some(2),
+                store_action: Some(1),
+                store_action_options: Some(0),
+                clear_color: Some(ClearColor {
+                    red: 0.5,
+                    green: f64::NAN,
+                    blue: -0.0,
+                    alpha: f64::INFINITY,
+                }),
+            },
+            ColorAttachmentSet {
+                texture: Some(None),
+                clear_color: Some(ClearColor::default()),
+                ..ColorAttachmentSet::default()
+            },
+        ];
+        for s in &colors {
+            check(&|cx| typed::color_attachment(s, cx), format!("{s:?}"));
+        }
+        let depths: [DepthAttachmentSet<'_, F>; 2] = [
+            DepthAttachmentSet::default(),
+            DepthAttachmentSet {
+                texture: Some(Some(&tex)),
+                load_action: Some(2),
+                clear_depth: Some(1.0),
+                depth_resolve_filter: Some(1),
+                ..DepthAttachmentSet::default()
+            },
+        ];
+        for s in &depths {
+            check(&|cx| typed::depth_attachment(s, cx), format!("{s:?}"));
+        }
+        let stencils: [StencilAttachmentSet<'_, F>; 2] = [
+            StencilAttachmentSet::default(),
+            StencilAttachmentSet {
+                texture: Some(Some(&lost)),
+                store_action: Some(0),
+                clear_stencil: Some(u32::MAX),
+                stencil_resolve_filter: Some(0),
+                ..StencilAttachmentSet::default()
+            },
+        ];
+        for s in &stencils {
+            check(&|cx| typed::stencil_attachment(s, cx), format!("{s:?}"));
+        }
+    }
+
+    /// Integers, booleans and ranges are the values their text reads as; any other argument is
+    /// its text, read by the writer as it would have been read at once, but for text naming
+    /// objects by pointer, read at once
+    #[test]
+    fn scalars_are_their_text_and_the_rest_waits_for_the_writer() {
+        use crate::core::platform::ObjId;
+        use crate::core::platform::types::NsRange;
+        let read = |text: String| debug_value::parse(&text, &|_| None).0;
+        let (a, b, c, d, e): (u64, u32, i64, i64, bool) = (u64::MAX, 7, -3, 9, true);
+        let r = NsRange::new(4, 12);
+        assert_eq!(rec_val!(a), read(format!("{a:?}")));
+        assert_eq!(rec_val!(b), read(format!("{b:?}")));
+        assert_eq!(rec_val!(c), read(format!("{c:?}")));
+        assert_eq!(rec_val!(d), read(format!("{d:?}")));
+        assert_eq!(rec_val!(e), read(format!("{e:?}")));
+        assert_eq!(rec_val!(r), read(format!("{r:?}")));
+        #[derive(Debug)]
+        #[allow(dead_code)] // read through its `Debug` alone
+        struct Desc {
+            pixel_format: u64,
+            label: &'static str,
+        }
+        let desc = Desc {
+            pixel_format: 80,
+            label: "a",
+        };
+        let Value::Debug(text) = rec_val!(desc) else {
+            panic!("a struct waits for the writer");
+        };
+        assert_eq!(parse_text(&text), read(format!("{desc:?}")));
+        let by_ptr = Some(ObjId(0x1000));
+        assert_eq!(
+            rec_val!(by_ptr),
+            Value::Nil,
+            "read at once: no object at 0x1000"
+        );
+    }
+
+    /// The writer shapes what calling threads queued in their order: a command's text and an
+    /// argument's text read into values, a write's long chunk a blob before it, counted by its
+    /// selector, and a release after the calls before it
+    #[test]
+    fn the_writer_shapes_queued_records_in_order() {
+        let state = State::new(PathBuf::from("/nonexistent/recorder"));
+        state.push(Item::Call {
+            call: Call {
+                selector: "setCullMode:".to_owned(),
+                receiver: 5,
+                ..Call::default()
+            },
+            text: Some("SetCullMode { cull_mode: 2 }".to_owned()),
+            shape: true,
+        });
+        state.push(Item::Call {
+            call: Call {
+                selector: "m2v.textureDescriptor".to_owned(),
+                result: 6,
+                args: vec![Value::Debug(
+                    "TextureDesc { pixel_format: 80, width: Some(64) }".to_owned(),
+                )],
+                ..Call::default()
+            },
+            text: None,
+            shape: true,
+        });
+        state.push(Item::Plain {
+            call: Call {
+                selector: "m2v.write".to_owned(),
+                receiver: 6,
+                args: vec![Value::Uint(4096), Value::Bytes(vec![7; 4096])],
+                ..Call::default()
+            },
+            count: true,
+        });
+        state.push(Item::Release(6));
+        assert_eq!(state.queue.lock().len(), 4);
+        state.drain(true);
+        assert!(state.queue.lock().is_empty());
+        assert_eq!(state.stats.drained_here.load(Ordering::Relaxed), 4);
+        let mut bytes = format::HEADER.to_vec();
+        bytes.extend(state.stream.lock().take());
+        let read = format::read(&bytes, &mut Vec::new()).unwrap();
+        let calls: Vec<Call> = read
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                format::Record::Call(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        let hash = format::sha256(&[7; 4096]);
+        assert!(
+            read.records
+                .contains(&format::Record::Blob(hash, vec![7; 4096]))
+        );
+        assert_eq!(
+            calls,
+            [
+                Call {
+                    selector: "setCullMode:".to_owned(),
+                    receiver: 5,
+                    args: vec![Value::Uint(2)],
+                    ..Call::default()
+                },
+                Call {
+                    selector: "m2v.textureDescriptor".to_owned(),
+                    result: 6,
+                    args: vec![Value::Map(vec![
+                        ("pixelFormat".to_owned(), Value::Uint(80)),
+                        ("width".to_owned(), Value::Uint(64)),
+                    ])],
+                    ..Call::default()
+                },
+                Call {
+                    selector: "m2v.write".to_owned(),
+                    receiver: 6,
+                    args: vec![Value::Uint(4096), Value::Blob(hash)],
+                    ..Call::default()
+                },
+                Call {
+                    selector: "release".to_owned(),
+                    receiver: 6,
+                    ..Call::default()
+                },
+            ]
+        );
+        let selectors = state.selectors.lock();
+        assert_eq!(selectors.get("m2v.write"), Some(&1));
+        assert_eq!(selectors.get("setCullMode:"), Some(&1));
     }
 
     /// Host memory a call consumes is read as bytes; any other is nil
