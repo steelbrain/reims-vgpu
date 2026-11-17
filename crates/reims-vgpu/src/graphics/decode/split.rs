@@ -11,6 +11,18 @@
 //! the walk goes on in that one. The platform keeps a buffer whole where a part would answer
 //! otherwise than the whole (its docs list where).
 //!
+//! **Where a part is cut.** At an encoder's end that another encoder follows, by a cut as by a
+//! deal ("Two threads at once"). Between encoders a stream holds only framing ops, which put no
+//! work on the GPU: an event's signal or wait, and what the walk reads at the take. The bundle
+//! puts the buffer's ask for its submission (`SUBMITTED`) last, after its last encoder, on every
+//! buffer of a queue that presents, WindowServer's among them. A cut at the last encoder's end so
+//! left a last part of those ops alone, with no GPU work and a submission of its own, which a
+//! paced walk waited to commit: 3,736 of the 31,222 parts of an Iris Xe desk walk, a third of
+//! those of its Safari video step, and 1,676 of the 55,784 of a Radeon 780M's walk with a window
+//! drag, every one a split buffer's last part (perfdiff's walks i-C1 and m-C1, m3-max-38812 and
+//! m3-max-38802, read from their traces). The ops after the last encoder go with it into the last
+//! part, as in a buffer committed whole, so what they signal still follows its work.
+//!
 //! **What it gains** (measured on the M3 Max under macOS 27.0.1, the Vulkan platform on
 //! MoltenVK, release, by `composite_cost`: a buffer of 60 render passes of 3 blended quads each,
 //! frames one at a time, 200 a run, two runs). From the take of a frame's message to its

@@ -2479,19 +2479,21 @@ impl<P: Platform> GraphicsDecoder<P> {
         signals.push(op.event_obj_id, op.value);
     }
 
-    /// At an encoder's end, ops left after it: where the part of the buffer walked since the
-    /// last is long enough to cut ([`Estimate::cuts`]: [`Self::split_after`] where no command
-    /// buffer its queue committed is incomplete, else by its estimated GPU time,
-    /// [`Self::behind_work`]), its queue holds room for another command buffer, the buffer could
-    /// be committed now ([`Self::may_commit_now`]) and its context's gate is free or its own,
-    /// hands the platform that part ([`CommandBuffer::split`]) and goes on in the command buffer
-    /// it answers, `cb` from then on ([`super::split`]). It waits for nothing to cut; once it cut,
-    /// it waits, where it is paced, while its parts run too far ahead of the GPU
-    /// ([`Self::pace`]). Where the platform keeps the buffer whole, it is walked whole from there.
+    /// At an encoder's end, `rest` the ops left after it: where the part of the buffer walked
+    /// since the last is long enough to cut ([`Estimate::cuts`]: [`Self::split_after`] where no
+    /// command buffer its queue committed is incomplete, else by its estimated GPU time,
+    /// [`Self::behind_work`]), an encoder begins in `rest` ([`encoder_follows`]), its queue holds
+    /// room for another command buffer, the buffer could be committed now
+    /// ([`Self::may_commit_now`]) and its context's gate is free or its own, hands the platform
+    /// that part ([`CommandBuffer::split`]) and goes on in the command buffer it answers, `cb`
+    /// from then on ([`super::split`]). It waits for nothing to cut; once it cut, it waits, where
+    /// it is paced, while its parts run too far ahead of the GPU ([`Self::pace`]). Where the
+    /// platform keeps the buffer whole, it is walked whole from there.
     fn split_here(
         &self,
         cb: &mut P::CommandBuffer,
         split: &mut Option<Splitting>,
+        rest: &[u8],
     ) -> RaiseResult<()> {
         let Some(s) = split.as_mut().filter(|s| !s.whole) else {
             return Ok(());
@@ -2509,6 +2511,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             walked >= self.split_after()
         };
         if !cuts
+            || !encoder_follows(rest)
             || s.in_flight.load(Ordering::Acquire) >= TAKE_IN_FLIGHT_MAX
             || !self.may_commit_now()
         {
@@ -2875,8 +2878,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 if let Err(e) = outcome? {
                     return Ok(Err(e));
                 }
-                self.split_here(cb, split)?;
-                return self.walk_range(&ops[deal.chunks[1].start..], cb, events, split);
+                let rest = &ops[deal.chunks[1].start..];
+                self.split_here(cb, split, rest)?;
+                return self.walk_range(rest, cb, events, split);
             }
             let walked = Walked {
                 cb: None,
@@ -3245,7 +3249,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                         self.reconcile_laid(cb)?;
                     }
                     if tag == RGFX_OP_ENCODER_END && len < ops.len() {
-                        self.split_here(cb, split)?;
+                        self.split_here(cb, split, &ops[len..])?;
                     }
                 }
                 // An op of an encoder skipped whole ([`OpenEncoder::Skipped`]): dropped.
@@ -3840,6 +3844,33 @@ fn next_op(ops: &[u8]) -> Option<(u16, &[u8], usize)> {
     Some((h.tag, &ops[RGFX_OP_BODY_OFFSET as usize..len], len))
 }
 
+/// Whether an encoder begins in `rest`, the ops after an encoder's end, so a part cut there
+/// leaves work for the next ([`super::split`], "Where a part is cut"): between encoders a stream
+/// holds only framing ops, which put no work on the GPU of their own, an event's signal or wait
+/// and what the walk reads at the take, `SUBMITTED` among them, which the bundle puts last.
+/// Reads op headers up to the first encoder's begin. An op of another group, and one that does
+/// not parse, answer `true`: the walk faults there, after the cut as before.
+fn encoder_follows(mut rest: &[u8]) -> bool {
+    while !rest.is_empty() {
+        let Some((tag, _, len)) = next_op(rest) else {
+            return true;
+        };
+        if op_group(tag) != RGFX_OP_GROUP_FRAMING
+            || matches!(
+                tag,
+                RGFX_OP_ENCODER_BEGIN_RENDER
+                    | RGFX_OP_ENCODER_BEGIN_COMPUTE
+                    | RGFX_OP_ENCODER_BEGIN_BLIT
+                    | RGFX_OP_ENCODER_BEGIN_VIDEO
+            )
+        {
+            return true;
+        }
+        rest = &rest[len..];
+    }
+    false
+}
+
 /// The degradation a command buffer dealt to two threads counts where the platform keeps it
 /// whole at a chunk's end for a reason of [`KeptWhole`] ([`kept_whole`]).
 pub(super) const KEPT_WHOLE: &str = "two-ranges-kept-whole";
@@ -3906,27 +3937,29 @@ pub(super) const DEAL_CHUNK_BYTES: usize = 4 * 1024;
 const DEALT_BEHIND_WORK: usize = 2;
 
 /// Where a command buffer's op stream `ops` is cut into chunks dealt to two threads at once
-/// ([`super::split`], "Two threads at once"): at the end of each encoder, before the stream's
-/// last op, that ends `chunk_bytes` of ops after the last cut or more (a `most`th of the stream,
-/// where that is more), into `most` chunks at most; where it holds [`DEAL_MIN_ENCODERS`]
-/// encoders and `min_bytes` of ops at least, every one of them a render or blit encoder or an op
-/// the walk reads before it starts (`SURFACE_USE`, `SUBMITTED`, `SURFACE_ORDER`,
-/// `COMMIT_ORDER`, `GUEST_TIMES`), and none of them a pass of a rasterization rate map, an
-/// indirect command buffer's execution, reset, copy or optimization, or a residency of resources
-/// (`useResource:`, which may name an indirect command buffer): what each of those does keeps the
-/// platform's progress of the command buffer, or commands read at its commit, which keep it whole
-/// (the Vulkan platform's `CommandBufferObject::splits`). So no event's signal or wait, compute or
-/// video encoder, rate map or indirect command buffer lies in any chunk, and the platform cuts
-/// the buffer at each chunk's end, or keeps it whole only where it fails from an encoder in it
-/// on ([`PartCut`]). `None` otherwise, and for a stream that does not parse, which the walk then
-/// faults at. Reads each op's header, and a render pass's flags; a stream shorter than
-/// `min_bytes` is not read.
+/// ([`super::split`], "Two threads at once"): at the end of each encoder that another encoder
+/// follows ([`encoder_follows`]), that ends `chunk_bytes` of ops after the last cut or more (a
+/// `most`th of the stream, where that is more), into `most` chunks at most; where it holds
+/// [`DEAL_MIN_ENCODERS`] encoders and `min_bytes` of ops at least, every one of them a render or
+/// blit encoder or an op the walk reads before it starts (`SURFACE_USE`, `SUBMITTED`,
+/// `SURFACE_ORDER`, `COMMIT_ORDER`, `GUEST_TIMES`), and none of them a pass of a rasterization
+/// rate map, an indirect command buffer's execution, reset, copy or optimization, or a residency
+/// of resources (`useResource:`, which may name an indirect command buffer): what each of those
+/// does keeps the platform's progress of the command buffer, or commands read at its commit,
+/// which keep it whole (the Vulkan platform's `CommandBufferObject::splits`). So no event's
+/// signal or wait, compute or video encoder, rate map or indirect command buffer lies in any
+/// chunk, every chunk holds an encoder, and the platform cuts the buffer at each chunk's end, or
+/// keeps it whole only where it fails from an encoder in it on ([`PartCut`]). `None` otherwise,
+/// and for a stream that does not parse, which the walk then faults at. Reads each op's header,
+/// and a render pass's flags; a stream shorter than `min_bytes` is not read.
 fn deal(ops: &[u8], min_bytes: usize, chunk_bytes: usize, most: usize) -> Option<Vec<usize>> {
     if ops.len() < min_bytes || most < 2 {
         return None;
     }
     let each = chunk_bytes.max(ops.len() / most);
     let (mut at, mut encoders, mut from) = (0, 0, 0);
+    // Where the last encoder seen begins: a cut after it has no encoder after it.
+    let mut last_begin = 0;
     let mut cuts = Vec::new();
     while at < ops.len() {
         let (tag, body, len) = next_op(&ops[at..])?;
@@ -3937,8 +3970,12 @@ fn deal(ops: &[u8], min_bytes: usize, chunk_bytes: usize, most: usize) -> Option
                     return None;
                 }
                 encoders += 1;
+                last_begin = at;
             }
-            RGFX_OP_ENCODER_BEGIN_BLIT => encoders += 1,
+            RGFX_OP_ENCODER_BEGIN_BLIT => {
+                encoders += 1;
+                last_begin = at;
+            }
             RGFX_OP_ENCODER_END => {
                 let end = at + len;
                 if end < ops.len() && end - from >= each && cuts.len() + 1 < most {
@@ -3964,6 +4001,9 @@ fn deal(ops: &[u8], min_bytes: usize, chunk_bytes: usize, most: usize) -> Option
         }
         at += len;
     }
+    // The last chunk holds an encoder: a cut after the last one would leave it only the framing
+    // ops after it, no work.
+    cuts.retain(|&cut| cut <= last_begin);
     (!cuts.is_empty() && encoders >= DEAL_MIN_ENCODERS).then_some(cuts)
 }
 
@@ -9751,6 +9791,122 @@ mod tests {
         posted.lock().clear();
         p.world().complete_all(CompleteOn::Caller);
         assert_eq!(*posted.lock(), [(RGFX_EVT_CB_COMPLETE, 350, RGFX_CB_OK)]);
+    }
+
+    /// No part is cut at an encoder's end that only framing ops follow ([`super::super::split`],
+    /// "Where a part is cut"): a buffer whose last encoder is followed by a signal of a shared
+    /// event and its ask for its submission (`SUBMITTED`, which the bundle puts last on every
+    /// buffer of a queue that presents) is committed in a part for each encoder, its last part
+    /// holding its last encoder and the signal, rather than in one more part with no work. The
+    /// signal still follows the last encoder's work, and goes to the guest ahead of the buffer's
+    /// completion; a cut or a deal whose last encoder is followed by an encoder still cuts there.
+    #[test]
+    fn no_part_is_cut_where_no_encoder_follows() {
+        use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
+        let Split {
+            p, mut dec, posted, ..
+        } = splitting();
+        let device = p.device();
+        create_events(&p, &mut dec, 0);
+        let signals = Arc::clone(&posted);
+        dec.set_signal_sink(Arc::new(move |m| {
+            let value = u32::try_from(m.value).unwrap();
+            signals.lock().push((m.header.r#type, m.obj_id, value));
+        }));
+        let tail = [
+            event_op(RGFX_OP_SIGNAL_EVENT, 7, 2),
+            op(RGFX_OP_SUBMITTED, &[]),
+        ]
+        .concat();
+        let ops = [passes(3), tail.clone()].concat();
+        let mark = p.call_log().mark();
+        let message = command_buffer_message(355, 85, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(p.call_log().calls_to("split").len(), 2, "a cut a pass");
+        let parts = p.world().committed();
+        assert_eq!(parts.len(), 3, "a part a pass, none of the tail alone");
+        let signalled: Vec<_> = (p.call_log().since(mark).into_iter())
+            .filter(|c| c.sel == "encodeSignalEvent:value:")
+            .map(|c| c.obj)
+            .collect();
+        assert_eq!(signalled, [parts[2]], "the signal in the last pass's part");
+        posted.lock().clear();
+        for part in &parts[..2] {
+            let ok = CommandBufferStatus::COMPLETED;
+            assert!(p.world().complete(*part, ok, None, CompleteOn::Caller));
+        }
+        assert!(posted.lock().is_empty(), "posted before its last part");
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            *posted.lock(),
+            [
+                (RGFX_EVT_EVENT_SIGNALLED, 7, 2),
+                (RGFX_EVT_CB_COMPLETE, 355, RGFX_CB_OK),
+            ]
+        );
+
+        // Dealt to two threads, a chunk an encoder: the last chunk holds the last pass and the
+        // ask, so 8 parts, as without the ask.
+        dec.set_deal_min_bytes(Some(0));
+        dec.set_deal_chunk_bytes(Some(0));
+        dec.set_helper_first(true);
+        let ops = [passes(8), op(RGFX_OP_SUBMITTED, &[])].concat();
+        let mark = p.call_log().mark();
+        let message = command_buffer_message(356, 86, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let sels = p.call_log().sels_since(mark);
+        assert_eq!(sels.iter().filter(|s| **s == "part").count(), 7);
+        assert_eq!(sels.iter().filter(|s| **s == "commitPart").count(), 7);
+        assert!(!sels.contains(&"split"), "no cut inside a chunk");
+        assert_eq!(p.world().committed().len(), 8, "a part a pass");
+        posted.lock().clear();
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(*posted.lock(), [(RGFX_EVT_CB_COMPLETE, 356, RGFX_CB_OK)]);
+
+        // Where a deal is cut.
+        let pass = render_ops().len();
+        let at = |passes: &[usize]| Some(passes.iter().map(|n| n * pass).collect::<Vec<_>>());
+        let asked = [passes(8), op(RGFX_OP_SUBMITTED, &[])].concat();
+        assert_eq!(
+            deal(&asked, 0, 0, 64),
+            at(&[1, 2, 3, 4, 5, 6, 7]),
+            "no cut after the last encoder"
+        );
+        assert_eq!(
+            deal(&asked, 0, 0, 2),
+            at(&[5]),
+            "2 chunks, cut at the first encoder's end past half the stream"
+        );
+        let long = pass_of(
+            &(0..64)
+                .map(|i| draw_ops(2, 16 * i, i))
+                .collect::<Vec<_>>()
+                .concat(),
+        );
+        let last_long = [passes(7), long, op(RGFX_OP_SUBMITTED, &[])].concat();
+        assert_eq!(
+            deal(&last_long, 0, 0, 2),
+            None,
+            "2 chunks at most, the first encoder's end past half the stream the last's"
+        );
+
+        // What follows an encoder's end.
+        assert!(!encoder_follows(&[]));
+        assert!(!encoder_follows(&tail));
+        assert!(!encoder_follows(&event_op(RGFX_OP_WAIT_EVENT, 7, 2)));
+        assert!(encoder_follows(&[tail.clone(), blit_ops()].concat()));
+        assert!(encoder_follows(&[tail.clone(), render_ops()].concat()));
+        let compute = op(RGFX_OP_ENCODER_BEGIN_COMPUTE, &[]);
+        assert!(encoder_follows(&[tail.clone(), compute].concat()));
+        let mut short = tail.clone();
+        short.truncate(tail.len() - 4);
+        assert!(encoder_follows(&short), "a stream that does not parse");
+        assert!(
+            encoder_follows(
+                &render_ops()[op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin_render_body()).len()..]
+            ),
+            "an encoder's op, which the walk faults at"
+        );
     }
 
     /// Whether each of `parts` is marked to join the next one's completion

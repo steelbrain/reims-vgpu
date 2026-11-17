@@ -5752,8 +5752,9 @@ commit. Each outcome the new design allows is one of those two:
   WindowServer's composite of a Liquid Glass desktop walked 2.6 to 3.5 ms and
   then ran 1.6 to 3.3 ms on an RTX 5080 Laptop GPU, each frame, against a
   refresh of 8.33 ms. So the walk commits such a buffer in parts
-  (`decode/split.rs`): at an encoder's end, once the part walked since the last
-  took 250 µs, it hands the platform that part (`CommandBuffer::split`), which
+  (`decode/split.rs`): at an encoder's end that another encoder follows, once
+  the part walked since the last took 250 µs, it hands the platform that part
+  (`CommandBuffer::split`), which
   commits it on the buffer's queue and answers a command buffer of the queue
   that goes on from it, and the walk goes on in that one. While a command
   buffer its queue committed is not yet seen complete, it cuts a part only once
