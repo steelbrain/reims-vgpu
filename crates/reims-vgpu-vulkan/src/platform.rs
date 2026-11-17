@@ -595,7 +595,18 @@ pub const EXACT_ALL: &str = "all";
 /// texture's planes in place, on a device whose memory is the host's, converts and filters every
 /// tap as Metal does (`YCbCrInPlacePolicy::Exact`), where the runtime's default samples by
 /// Vulkan's Y'CbCr model in the device's arithmetic, outside the bound of Metal's answers
-/// `gpu::ycbcr::sampling`'s tests hold. Each field of [`EXACT_FORMS`] that `exact`,
+/// `gpu::ycbcr::sampling`'s tests hold. Its queue turns are always commit order, with no switch
+/// (`QueueTurnPolicy::CommitOrder`): every ready batch is submitted at once, in commit order, so
+/// on a `VkQueue` two command queues share a command buffer waits behind every batch submitted
+/// there before it. The runtime's default (`QueueTurnPolicy::Fair`) holds a queue's batch while
+/// 2 ms of that queue's own work is in flight there, which puts a compositor's commit behind
+/// about 16 ms of another queue's burst rather than all of it (on a Radeon 780M, its commit to
+/// completion p50 17.6 ms against 71.1); but a command buffer waiting on the GPU for an event
+/// that a batch of another queue on the same `VkQueue` signals can be held behind that very batch,
+/// and the runtime's watchdog ends it after 20.2 s as a hang (metal2vulkan's validation on a
+/// Radeon 780M and an RX 7900 XTX, 2026-11-16). A guest's plain `MTLEvent` waited across two of
+/// its queues is that wait on RADV and ANV, whose one graphics queue the guest's queues share.
+/// Each field of [`EXACT_FORMS`] that `exact`,
 /// `REIMS_VGPU_EXACT`'s comma-separated list, names takes the runtime's exact form too, and
 /// [`EXACT_ALL`] every such form:
 /// `batch_order`'s barriers between batches, `host_page_textures`' copies of each sampled texture
@@ -613,12 +624,13 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
         BatchOrderPolicy, CompletionPolicy, DevicePolicy, DontCareColorPolicy,
         ExtendedRangeBlitPolicy, HalfChainPolicy, HeapAnswerPolicy, HostPageTexturePolicy,
         IndirectRecordsPolicy, ManagedCopyInPolicy, PipelineWaitPolicy, QueueSharingPolicy,
-        RateMapRegionPolicy, UnstoredDontCarePolicy, VertexReachPolicy, WideLinePolicy,
-        YCbCrInPlacePolicy,
+        QueueTurnPolicy, RateMapRegionPolicy, UnstoredDontCarePolicy, VertexReachPolicy,
+        WideLinePolicy, YCbCrInPlacePolicy,
     };
     let mut policy = DevicePolicy::default();
     policy.completion = CompletionPolicy::Exact;
     policy.ycbcr_in_place_reads = YCbCrInPlacePolicy::Exact;
+    policy.queue_turns = QueueTurnPolicy::CommitOrder;
     for name in (exact.unwrap_or_default().split(',').map(str::trim)).filter(|n| !n.is_empty()) {
         match name {
             EXACT_ALL => policy = policy.exact_answers(),
@@ -906,28 +918,31 @@ pub(crate) mod tests {
     }
 
     /// Without `REIMS_VGPU_EXACT` the device policy is the runtime's default, its native forms,
-    /// its compressed heap textures among them, but for its exact completion and exact in-place
-    /// YCbCr reads, which every device takes and no name selects; each name of `EXACT_FORMS`
+    /// its compressed heap textures among them, but for its exact completion, exact in-place
+    /// YCbCr reads and commit-order queue turns, which every device takes and no name selects,
+    /// `all` included; each name of `EXACT_FORMS`
     /// takes that field's exact form alone, in any order, spaces around a name ignored; `all`
     /// takes the runtime's `exact_answers()`, every one and uncompressed heap textures, which no
-    /// other name takes; another name, `completion`, `heap_compression`, `ycbcr_in_place_reads`
-    /// and `sampling` among them, changes nothing
+    /// other name takes; another name, `completion`, `heap_compression`, `ycbcr_in_place_reads`,
+    /// `queue_turns` and `sampling` among them, changes nothing
     #[test]
     fn reims_vgpu_exact_names_the_policys_exact_forms() {
         use metal2vulkan::device::{
             BatchOrderPolicy, CompletionPolicy, DevicePolicy, DontCareColorPolicy,
             ExtendedRangeBlitPolicy, HalfChainPolicy, HeapAnswerPolicy, HeapCompressionPolicy,
             HostPageTexturePolicy, IndirectRecordsPolicy, ManagedCopyInPolicy, PipelineWaitPolicy,
-            QueueSharingPolicy, RateMapRegionPolicy, UnstoredDontCarePolicy, VertexReachPolicy,
-            WideLinePolicy, YCbCrInPlacePolicy,
+            QueueSharingPolicy, QueueTurnPolicy, RateMapRegionPolicy, UnstoredDontCarePolicy,
+            VertexReachPolicy, WideLinePolicy, YCbCrInPlacePolicy,
         };
         let runtimes = DevicePolicy::default();
         assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
         assert_eq!(runtimes.heap_compression, HeapCompressionPolicy::Compressed);
         assert_eq!(runtimes.ycbcr_in_place_reads, YCbCrInPlacePolicy::Model);
+        assert_eq!(runtimes.queue_turns, QueueTurnPolicy::Fair);
         let mut fast = runtimes;
         fast.completion = CompletionPolicy::Exact;
         fast.ycbcr_in_place_reads = YCbCrInPlacePolicy::Exact;
+        fast.queue_turns = QueueTurnPolicy::CommitOrder;
         assert_eq!(fast.heap_compression, HeapCompressionPolicy::Compressed);
         assert_eq!(fast.batch_order, BatchOrderPolicy::Ends);
         assert_eq!(fast.host_page_textures, HostPageTexturePolicy::InPlace);
@@ -954,6 +969,7 @@ pub(crate) mod tests {
             Some("completion"),
             Some("heap_compression"),
             Some("ycbcr_in_place_reads"),
+            Some("queue_turns"),
             Some("sampling"),
         ] {
             assert_eq!(exact_policy(unchanged), fast, "{unchanged:?}");
@@ -1014,6 +1030,7 @@ pub(crate) mod tests {
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
         assert_eq!(every.heap_compression, HeapCompressionPolicy::Compressed);
         assert_eq!(one(EXACT_ALL), fast.exact_answers());
+        assert_eq!(one(EXACT_ALL).queue_turns, QueueTurnPolicy::CommitOrder);
         let mut all = every;
         all.heap_compression = HeapCompressionPolicy::Uncompressed;
         assert_eq!(fast.exact_answers(), all);
