@@ -21,13 +21,27 @@
 //! one's completion, after one frame not counted, which makes the pipeline and the imports. The
 //! device's making, the pipeline's and the teardown are logged, not compared.
 //!
-//! **Unheard.** What the runtime announces on the timing thread is heard by no one
-//! (`crate::answer::unheard`): neither counted nor relayed, nor dying in strict mode. The devices
-//! are made with the process's options (`crate::platform::device_options`), so they share its
-//! instance, and are dropped before the process's own device is made, which then announces what
-//! it meets as before.
+//! **Apart from the process's device.** The devices are made with the process's options
+//! (`crate::platform::device_options`) but a message sink of their own, which hears nothing
+//! ([`options`]): what the runtime announces of them, on any thread, is neither counted nor
+//! relayed, nor dying in strict mode. The runtime keeps the devices of another sink in a group of
+//! their own, on an instance of their own, so no make of the process's device is answered with
+//! one of them. With the process's own sink one was: while a handle of a device lives, the
+//! runtime answers a device of the same GPU made with equal options with that device
+//! (`Device::with_registry_id` and `Device::system_default_with`), and its own threads still hold
+//! a timed device after the workload dropped its last handle. **Measured** on 2026-11-17 on um790
+//! (Mesa 26.2.6, NVIDIA 620.70.06), in an empty cache directory: a device of the same GPU made 0
+//! to 50 ms after the workload returned was the timed one on the RX 7900 XTX and the RTX 2080,
+//! and up to 5 ms after it on the Radeon 780M; none was 300 ms after it, nor, in the cache
+//! directory the tests share, kept from earlier runs, one made at once. Its texture ID pool
+//! had handed IDs out, so the graphics device's reservation of the guest's texture IDs came too
+//! late and was ignored, and the host's textures took the guest's IDs from 1. In the choice the
+//! XTX, the pick and the runtime's own default device, was timed first and the other two after
+//! it, and the process's device was the XTX's timed one in 4 of 8 cold starts of a graphics
+//! device (reims-vgpu's `on_vulkan_a_cold_device_takes_no_guest_texture_id`).
 
 use std::ptr::NonNull;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
@@ -57,7 +71,7 @@ pub(super) fn time_on(at: usize, device: &Seen) -> Option<Duration> {
     let id = device.registry_id()?;
     let clock = crate::os::OsClock::new();
     let start = clock.now_mono();
-    let timed = crate::answer::unheard(|| run(id, &clock));
+    let timed = run(id, &clock);
     let all = clock.now_mono().saturating_duration_since(start);
     match &timed {
         Ok(time) => log::info!(
@@ -82,10 +96,25 @@ pub(super) fn millis(time: Duration) -> f64 {
     time.as_secs_f64() * 1e3
 }
 
-/// The workload on a device of registry ID `id`, made for it and dropped at the end: the timed
-/// frames' wall time on `clock`.
+/// The options of the devices the workload runs on: the process's
+/// (`crate::platform::device_options`) with a message sink of their own, which drops what it
+/// hears, and hears only what the runtime always hands a sink, errors and its degrade notices
+/// (`MessageSink::with_least_severity`). So the runtime keeps the devices in a group of their own,
+/// apart from the process's (the module doc).
+fn options() -> &'static rt::DeviceOptions {
+    static OPTIONS: LazyLock<rt::DeviceOptions> = LazyLock::new(|| {
+        let mut options = crate::platform::device_options().clone();
+        let sink = rt::MessageSink::new(|_| {});
+        options.messages = Some(sink.with_least_severity(rt::MessageSeverity::Error));
+        options
+    });
+    &OPTIONS
+}
+
+/// The workload on a device of registry ID `id` of its own ([`options`]), made for it and dropped
+/// at the end: the timed frames' wall time on `clock`.
 fn run(id: u64, clock: &crate::os::OsClock) -> Result<Duration, rt::Error> {
-    let device = rt::Device::with_registry_id(id, crate::platform::device_options())?;
+    let device = rt::Device::with_registry_id(id, options())?;
     let library = device.new_library_with_data(crate::gpu::shaders::METALLIB)?;
     let vertex = library.new_function_with_name("displayPresentVertex")?;
     let fragment = library.new_function_with_name("displayPresentFragment")?;
@@ -236,6 +265,72 @@ fn host_textures(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The variable that makes [`a_device_made_after_the_timing_is_a_new_one`]'s process the
+    /// child, which runs in the new empty `HOME` its parent made, its user cache directory in it.
+    const COLD_CHILD: &str = "RVG_TIMING_COLD_CHILD";
+
+    /// A device of the GPU made with the process's options right after the choice's workload ran
+    /// on it ([`time_on`]) is a new device, which the guest's texture IDs are reserved on before
+    /// any is handed out, so a plain texture takes none of them: never the timed device, which
+    /// the runtime's threads still held then, and whose pool had handed IDs out (the module doc).
+    /// Cold, as the choice times the GPUs only where no verdict is kept: the child runs in a new
+    /// empty `HOME` that holds its user cache directory (`crate::os::TESTS_CACHE_DIRECTORY`, as
+    /// Windows' is not under `HOME`). With the timing on the process's own options, the
+    /// reservation was ignored and the plain texture took ID 1, on each of um790's RX 7900 XTX,
+    /// RTX 2080 and Radeon 780M; in the cache directory the tests share, kept from earlier runs,
+    /// the device was a new one on all three
+    #[test]
+    fn a_device_made_after_the_timing_is_a_new_one() {
+        const LINE: &str = "TIMED-COLD: ";
+        if std::env::var_os(COLD_CHILD).is_none() {
+            let home = std::env::temp_dir().join(format!("rvg-timing-cold-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&home);
+            std::fs::create_dir_all(&home).unwrap();
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "device_choice::timing::tests::a_device_made_after_the_timing_is_a_new_one",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(COLD_CHILD, "1")
+                .env("HOME", &home)
+                .env(crate::os::TESTS_CACHE_DIRECTORY, home.join(".cache"))
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(&home);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stdout}{stderr}");
+            // The child's line follows libtest's own `test NAME ... ` on its line.
+            let ran = stdout.lines().find_map(|l| l.find(LINE).map(|at| &l[at..]));
+            let Some(ran) = ran else {
+                panic!("the child timed no GPU: {stdout}{stderr}");
+            };
+            println!("{ran}");
+            return;
+        }
+        let options = crate::platform::device_options();
+        let gpu = rt::Device::system_default_identity_with(options).expect("a Vulkan device");
+        let mut seen = crate::os::seen_devices().iter().enumerate();
+        let (at, timed) = (seen.find(|(_, s)| s.registry_id() == Some(gpu.registry_id)))
+            .expect("the window's probe lists the runtime's default GPU");
+        time_on(at, timed).expect("the workload");
+        let device = rt::Device::with_registry_id(gpu.registry_id, options).unwrap();
+        let guests = 1..=64;
+        let reserved: Vec<rt::ResourceId> = guests.clone().map(rt::ResourceId).collect();
+        (device.reserve_resource_ids(rt::ResourceIdKind::Texture, &reserved)).unwrap();
+        let mut plain = rt::TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, 4, 4, false);
+        plain.resource_options = rt::ResourceOptions::private();
+        let id = device.new_texture(&plain).unwrap().gpu_resource_id().0;
+        assert!(
+            !guests.contains(&id),
+            "{}: a plain texture took the reserved ID {id}",
+            gpu.name
+        );
+        println!("{LINE}{}: a plain texture took ID {id}", gpu.name);
+    }
 
     /// The quads go round the target's four quarters, each a quarter of it
     #[test]

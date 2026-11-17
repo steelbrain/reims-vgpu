@@ -30,7 +30,8 @@
 //!   llvmpipe), that GPU, never timed.
 //! - Where several are, the one that ran a fixed workload fastest ([`measured`]): the display's
 //!   composite at a fixed size and one pass over textures in host memory, timed on a device made
-//!   for each GPU and torn down after (`timing.rs`). The verdict is kept in the library's cache
+//!   for each GPU and torn down after, apart from the process's own device, which is never one of
+//!   them (`timing.rs`). The verdict is kept in the library's cache
 //!   directory, under a key of every timed GPU's UUID and driver version (`verdict.rs`), so only
 //!   the first open after a GPU or driver change times them; a verdict that does not read times
 //!   them again. Where the runtime refuses any GPU's workload, nothing is kept and the runtime's

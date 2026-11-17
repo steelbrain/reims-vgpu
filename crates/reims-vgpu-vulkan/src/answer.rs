@@ -1663,7 +1663,7 @@ thread_local! {
     /// [`HEARD`] the runtime announced on this thread inside it. The list lies on the hearing's
     /// stack, and the hearing puts back the one outside it before it reads its own.
     static HEARING: Cell<Option<NonNull<Vec<rt::Degradation>>>> = const { Cell::new(None) };
-    /// Whether this thread runs an [`unheard`] call.
+    /// Whether this thread runs an `unheard` call (a probe's, on Linux).
     static UNHEARD: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -1805,11 +1805,11 @@ pub fn hearing<T>(call: impl FnOnce() -> T) -> (T, Vec<rt::Degradation>) {
 }
 
 /// Runs `call`, a probe of the device's own outside any guest's work (`crate::os`'s
-/// `learn_view_imports`, on Linux), or a device's own made and dropped for one
-/// (`crate::device_choice`'s timing), with what the runtime announces on this thread inside it
+/// `learn_view_imports`, on Linux), with what the runtime announces on this thread inside it
 /// heard by no one: neither relayed, counted, kept nor dying. A kind the runtime announces once
 /// per device is announced at every occurrence where a probe of the process's device may meet it
 /// ([`crate::platform`]'s `announced_each`), so that the probe's takes no later occurrence's line.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn unheard<T>(call: impl FnOnce() -> T) -> T {
     /// Puts back the outer state on drop, an unwinding call's included.
     struct Restore(bool);
