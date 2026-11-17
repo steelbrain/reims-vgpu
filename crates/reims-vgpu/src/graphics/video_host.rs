@@ -496,14 +496,16 @@ impl<P: Platform> DecodeOutput<P> {
     }
 }
 
-/// The output plane of the op's `plane`, holding `rows` rows where they lie in its buffer
-/// ([`OutputPlane::rows_held`]).
+/// The output plane of the op's `plane`, holding `rows` rows where they lie in its buffer, and
+/// in the rows the buffer holds for the plane where the host laid it out
+/// ([`VideoPlane::rows_room`]), as many of them as do there ([`OutputPlane::rows_held`]).
 fn output_plane<P: Platform>(plane: &VideoPlane<'_, P>, rows: u64) -> RaiseResult<OutputPlane<P>> {
     let length = plane.buffer.length();
     let end = |rows| plane_end(plane.offset, plane.bytes_per_row, rows, plane.row_bytes);
     if !end(plane.height).is_some_and(|end| end <= length) {
         return Err(decode_fault("an output plane past its buffer"));
     }
+    let rows = rows.min(plane.rows_room.unwrap_or(u64::MAX));
     let rows_held = if rows > plane.height && end(rows).is_some_and(|end| end <= length) {
         rows
     } else {

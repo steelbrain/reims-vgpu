@@ -193,6 +193,7 @@ fn planes<'a>(
         cached: buffer.contents().is_null(),
         pages: None,
         cache: None,
+        rows_room: None,
     };
     (plane(luma, 0, 96, 64), plane(chroma, 8192, 48, 32))
 }
@@ -528,7 +529,10 @@ fn an_output_past_its_buffer_faults_before_the_decoder() {
 }
 
 /// A plane holds the op's `output_rows` where they lie in its buffer, half as many chroma rows,
-/// and its crop's rows where they do not.
+/// and its crop's rows where they do not; and no more than the rows the host's layout of the
+/// plane holds where it laid the plane out, so that a picture's rows past the plane's never run
+/// into the next plane's (a 1080p luma plane's 1088 coded rows, where chroma lies right past its
+/// 1080 in a cache laid out at the GPU's pitch).
 #[test]
 fn a_plane_holds_the_output_rows_that_lie_in_its_buffer() {
     let p = FakePlatform::new();
@@ -539,6 +543,18 @@ fn a_plane_holds_the_output_rows_that_lie_in_its_buffer() {
     assert_eq!(output_plane(&luma, 0).unwrap().rows_held, 64);
     // 66 chroma rows from 8192 end past the buffer's 16384 bytes.
     assert_eq!(output_plane(&chroma, 66).unwrap().rows_held, 32);
+    // Where the host laid the plane out, the rows it holds there bound it: no more than 66 rows
+    // of luma, whatever the buffer's bytes past them.
+    let laid = VideoPlane {
+        rows_room: Some(66),
+        ..planes(&pages, &pages, 96).0
+    };
+    assert_eq!(output_plane(&laid, 68).unwrap().rows_held, 66);
+    let laid = VideoPlane {
+        rows_room: Some(64),
+        ..planes(&pages, &pages, 96).0
+    };
+    assert_eq!(output_plane(&laid, 68).unwrap().rows_held, 64);
     let bitstream = buffer(&p, 4096, STORAGE_SHARED);
     let mut d = decode(&bitstream, &[], planes(&pages, &pages, 96));
     d.output_rows = 68;

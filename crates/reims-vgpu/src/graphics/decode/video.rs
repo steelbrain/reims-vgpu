@@ -411,6 +411,13 @@ pub struct VideoPlane<'a, P: Platform> {
     /// it and let go of once it ends. `None` for a cache made as any other buffer, which no
     /// device of the host's video reaches in place.
     pub cache: Option<MemoryIdentity>,
+    /// The rows the buffer holds for the plane from its first, where the host laid the plane
+    /// out: in a device cache laid out at the GPU's pitch, the plane's rows there, past which the
+    /// next plane's lie ([`Repitched::rows_from`]). `None` where the buffer keeps the surface's
+    /// own layout, whose rows the op's `output_rows` counts.
+    ///
+    /// [`Repitched::rows_from`]: super::surface_cache::Repitched::rows_from
+    pub rows_room: Option<u64>,
 }
 
 /// The memory a plane's buffer lies in, as the host's video devices take it
@@ -823,6 +830,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         for block in luma_cache.into_iter().chain(chroma_cache) {
             self.wait_for_cache(tag, block)?;
         }
+        // A plane in a cache laid out at the GPU's pitch holds its rows there and no more: the
+        // next plane's lie past them, wherever the surface's own lie.
+        let rows_room = |place: &PlanePlace, cache: Option<u64>| {
+            let laid = self.surface_caches.repitched(cache?)?;
+            Some((laid.rows_from(place.in_surface.0, place.in_surface.1)).unwrap_or(place.height))
+        };
         let plane = |place: PlanePlace, buffer, cache: Option<u64>| VideoPlane {
             buffer,
             offset: place.offset,
@@ -835,6 +848,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 .then(|| self.plane_pages(place.buffer_obj_id, buffer))
                 .flatten(),
             cache: cache.and_then(|block| self.surface_caches.identity(block)),
+            rows_room: rows_room(&place, cache),
         };
         Ok((
             plane(luma_place, luma, luma_cache),

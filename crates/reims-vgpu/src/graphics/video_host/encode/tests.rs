@@ -171,6 +171,7 @@ fn planes(source: &FakeBuffer, width: u64, height: u64) -> (VideoPlane<'_, P>, V
         cached: source.contents().is_null(),
         pages: None,
         cache: None,
+        rows_room: None,
     };
     (plane(0, height), plane(8192, height / 2))
 }

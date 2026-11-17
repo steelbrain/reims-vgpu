@@ -4132,6 +4132,12 @@ impl<P: Platform> Caches<P> {
         self.state.lock().has(block)
     }
 
+    /// The block at `block`'s cache's layout at the GPU's pitch, where it lays its surface out so
+    /// ([`SurfaceCaches::repitched`]).
+    pub(crate) fn repitched(&self, block: u64) -> Option<Arc<Repitched>> {
+        self.state.lock().repitched(block)
+    }
+
     /// The block at `block`'s wide home, made where it has none ([`SurfaceCaches::wide_home`]).
     pub(crate) fn wide_home(
         &self,
@@ -5228,6 +5234,15 @@ impl Repitched {
                 room: (p.row_bytes - byte, p.rows - row),
             })
         })
+    }
+
+    /// The rows the cache holds for the plane of a texture whose first byte is `offset` of the
+    /// surface, its rows `bytes_per_row` apart, from the texture's first row on, past which the
+    /// next plane's lie in the cache; `None` where no plane's texels hold that byte at that pitch
+    /// ([`Self::place`]).
+    pub(crate) fn rows_from(&self, offset: u64, bytes_per_row: u64) -> Option<u64> {
+        self.place(offset, bytes_per_row)
+            .map(|placed| placed.room.1)
     }
 
     /// Each row of the surface's planes: its texels' bytes in the surface and its first byte in
@@ -9281,6 +9296,18 @@ mod tests {
         ] {
             assert_eq!(laid.place(offset, bytes_per_row), None, "{why}");
         }
+    }
+
+    /// A decode's plane in a laid-out cache holds its plane's rows there from its first row on,
+    /// and no more: the next plane's lie past them. A byte in no plane's texels holds none
+    #[test]
+    fn a_plane_in_a_laid_out_cache_holds_its_rows_there() {
+        let laid = Repitched::of(&yuv(), rows_at(256)).unwrap();
+        assert_eq!(laid.rows_from(0x20, 128), Some(10));
+        assert_eq!(laid.rows_from(0x520, 128), Some(5));
+        assert_eq!(laid.rows_from(0x20 + 3 * 128, 128), Some(7), "from row 3");
+        assert_eq!(laid.rows_from(0x20 + 100, 128), None, "between rows");
+        assert_eq!(laid.rows_from(0x20, 256), None, "another pitch");
     }
 
     /// A laid-out cache's copies move each row's texels between its place in the surface and its
