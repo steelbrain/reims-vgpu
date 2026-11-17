@@ -6,7 +6,10 @@
 //!
 //! - **The properties** (`esup`, `ecop`, `eset`, `emul`) are [`properties`]'. A set the running
 //!   encoder cannot take ([`BackendEncoder::reconfigure`]) is refused with the backend's status,
-//!   and the properties stay as they were. `eset` of `Paravirtualized`, a `,key` that is no
+//!   and the properties stay as they were. Past the first frame, the host's arms take a set that
+//!   would make a new sequence (a profile, an entropy coder, frame reordering) and leave it out,
+//!   the stream going on as it was while the property reads as set, as an M3's encoder does
+//!   (macOS 27.0.1, measured). `eset` of `Paravirtualized`, a `,key` that is no
 //!   string and an `emul` with nothing but `Paravirtualized` get no reply; `emul` sets each in
 //!   turn and answers the first refusal.
 //! - **`esta`** opens the backend's encoder at the source frames' size, `,vdi`. A side under 1

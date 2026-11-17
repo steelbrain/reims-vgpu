@@ -756,7 +756,7 @@ fn guest_surface(index: usize) -> (SurfaceLayout, HostSurface) {
 /// frames read from a guest surface wider and taller than the 64x48 stream come out as 8
 /// samples, the first a sync sample with the configuration record, and the driver's own decoder
 /// decodes each to a 64x48 picture; a reconfigure of the bitrate is taken after a frame, and one
-/// of the profile is not.
+/// of the profile is taken and left out, every configuration record the first's.
 #[test]
 #[ignore = "needs a VA-API GPU: run on the VA-API host"]
 fn a_guest_encoder_encodes_the_frames_of_the_surfaces_it_is_lent() {
@@ -806,12 +806,7 @@ fn a_guest_encoder_encodes_the_frames_of_the_surfaces_it_is_lent() {
                 guest.reconfigure(&faster).unwrap();
                 let mut other = faster.clone();
                 other.settings.profile = *encoder.profiles.last().unwrap();
-                if other.settings.profile != profile {
-                    assert!(matches!(
-                        guest.reconfigure(&other),
-                        Err(VideoError::Unsupported(_))
-                    ));
-                }
+                guest.reconfigure(&other).unwrap();
             }
         }
         samples.extend(guest.flush().unwrap());
@@ -820,6 +815,11 @@ fn a_guest_encoder_encodes_the_frames_of_the_surfaces_it_is_lent() {
         assert!(
             samples[0].is_sync && samples[0].configuration.is_some(),
             "{profile:?}"
+        );
+        assert!(
+            (samples.iter())
+                .all(|s| s.configuration.is_none() || s.configuration == samples[0].configuration),
+            "{profile:?}: the profile's change made a new sequence"
         );
         let codec = match encoder.codec {
             Codec::H264 => RGFX_VIDEO_CODEC_H264,

@@ -22,8 +22,9 @@
 //!   picture's sample.
 //! - **A change** of the bitrate or the frame rate goes to the encoder from the next frame
 //!   (`NvencEncoder::reconfigure`), and of the key-frame interval to the placing of key frames;
-//!   one of anything else NVENC is made with makes a new encoder before the first frame, and is
-//!   refused after it, as the VA-API arm's.
+//!   one of anything else NVENC is made with makes a new encoder before the first frame, and
+//!   after it is answered as taken and left out, the running sequence keeping its settings to its
+//!   end, as the VA-API arm's.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -343,22 +344,28 @@ impl<P: Platform> GuestEncoder<P> for NvGuestEncoder<P> {
 
     /// The bitrate and the frame rate go to the encoder from the next frame, and the key-frame
     /// interval to the placing of key frames; anything else NVENC is made with makes a new
-    /// encoder before the first frame, and is refused after it.
+    /// encoder before the first frame, and after it is taken and left out: the running sequence
+    /// keeps its own to its end.
     fn reconfigure(&mut self, config: &EncoderConfig) -> Result<(), VideoError> {
-        let new = params_of(config);
+        let mut config = config.clone();
+        let mut new = params_of(&config);
         let old = self.encoder.params();
         let same_sequence = EncodeParams {
             rate_control: old.rate_control,
             frame_rate: old.frame_rate,
             ..new.clone()
         } == *old;
-        if !same_sequence {
-            if self.encoded {
-                return Err(VideoError::Unsupported(
-                    "a setting that makes a new sequence, after the first frame".to_owned(),
-                ));
-            }
-            let (encoder, record) = Self::made(&self.gpu, config)?;
+        if !same_sequence && self.encoded {
+            let settings = config.settings;
+            config = self.config.clone();
+            config.settings.rate_control = settings.rate_control;
+            config.settings.frame_rate = settings.frame_rate;
+            config.settings.key_frame_interval = settings.key_frame_interval;
+            config.settings.key_frame_interval_duration = settings.key_frame_interval_duration;
+            new = params_of(&config);
+        }
+        if !same_sequence && !self.encoded {
+            let (encoder, record) = Self::made(&self.gpu, &config)?;
             self.encoder = encoder;
             self.samples.record = record;
         } else if new.rate_control != old.rate_control || new.frame_rate != old.frame_rate {
@@ -371,7 +378,7 @@ impl<P: Platform> GuestEncoder<P> for NvGuestEncoder<P> {
             settings.key_frame_interval,
             settings.key_frame_interval_duration,
         );
-        self.config = config.clone();
+        self.config = config;
         Ok(())
     }
 }

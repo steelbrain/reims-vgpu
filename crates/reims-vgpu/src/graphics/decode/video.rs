@@ -181,7 +181,9 @@ pub trait GuestEncoder<P: Platform>: Send {
     ) -> Result<Vec<Coded<VideoError>>, VideoError>;
     /// Encodes the frames it holds back, and returns each with its own result.
     fn flush(&mut self) -> Result<Vec<Coded<VideoError>>, VideoError>;
-    /// Takes `config` from the next frame on; [`VideoError::Unsupported`] where it cannot now.
+    /// Takes `config` from the next frame on: after the first frame, of a change that makes a new
+    /// sequence only its bitrate, frame rate and key-frame interval, the running sequence keeping
+    /// the rest to its end, as Apple's hardware encoders do.
     fn reconfigure(&mut self, config: &EncoderConfig) -> Result<(), VideoError>;
 }
 

@@ -32,8 +32,9 @@
 //!   lent, into an input surface of the encoder's; else, and where the copy is declined (said
 //!   once a session), from the host's view of the pages, which the VA crate's encoder uploads.
 //!   A change of the bitrate, frame rate or key-frame interval goes to the encoder from the next
-//!   frame; one that makes a new sequence makes a new encoder before the first frame and is
-//!   refused after it.
+//!   frame; one that makes a new sequence makes a new encoder before the first frame, and after
+//!   it is answered as taken and left out, the running sequence keeping its settings to its end,
+//!   as Apple's hardware encoders keep theirs.
 
 use std::sync::Arc;
 
@@ -880,24 +881,24 @@ impl<P: Platform> GuestEncoder<P> for VaGuestEncoder<P> {
     }
 
     /// The bitrate, the frame rate and the key-frame interval go to the encoder from the next
-    /// frame; anything else makes a new encoder before the first frame, and is refused after it.
+    /// frame; anything else makes a new encoder before the first frame, and after it is taken
+    /// and left out: the running sequence keeps its own to its end.
     fn reconfigure(&mut self, config: &EncoderConfig) -> Result<(), VideoError> {
-        let new = guest_settings(config, &self.ranges);
-        let mut same_sequence = new.clone();
-        same_sequence.rate_control = self.settings.rate_control;
-        same_sequence.frame_rate = self.settings.frame_rate;
-        same_sequence.key_frame_interval = self.settings.key_frame_interval;
-        same_sequence.key_frame_interval_duration = self.settings.key_frame_interval_duration;
-        if same_sequence != self.settings {
+        let mut new = guest_settings(config, &self.ranges);
+        let mut same_sequence = self.settings.clone();
+        same_sequence.rate_control = new.rate_control;
+        same_sequence.frame_rate = new.frame_rate;
+        same_sequence.key_frame_interval = new.key_frame_interval;
+        same_sequence.key_frame_interval_duration = new.key_frame_interval_duration;
+        if same_sequence != new {
             if self.encoded {
-                return Err(VideoError::Unsupported(
-                    "a setting that makes a new sequence, after the first frame".to_owned(),
-                ));
+                new = same_sequence;
+            } else {
+                self.encoder =
+                    VideoEncoder::new(&self.display, new.clone()).map_err(super::video_error)?;
+                self.settings = new;
+                return Ok(());
             }
-            self.encoder =
-                VideoEncoder::new(&self.display, new.clone()).map_err(super::video_error)?;
-            self.settings = new;
-            return Ok(());
         }
         if new.rate_control != self.settings.rate_control {
             (self.encoder.set_rate_control(new.rate_control)).map_err(super::video_error)?;

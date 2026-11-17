@@ -378,10 +378,10 @@ fn access_unit(codec: Codec, record: Option<&[u8]>, sample: &[u8]) -> Vec<u8> {
 /// On the NVIDIA host, each guest encoder the arm answers, at each of its 8-bit profiles, at a
 /// constant QP: 12 frames of a 640x360 stream read from `420v` surfaces wider and taller than it,
 /// with a forced key frame (frame 5) and a key-frame interval of 8, a change of the QPs after
-/// the first frame and one of the profile refused. Read by the CPU from the surfaces' host
+/// the first frame and one of the profile taken and left out. Read by the CPU from the surfaces' host
 /// bytes, and copied by the GPU from a Shared buffer of the device's that holds them, every frame
 /// the GPU's way, they come out as the same samples byte for byte: one a frame, in order, at its
-/// times, sync samples at frames 0 and 5 alone, the record on the first. Each decodes back on
+/// times, sync samples at frames 0 and 5 alone, the record on the first alone. Each decodes back on
 /// NVDEC to a 640x360 picture whose luma is the frame's top left.
 #[test]
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
@@ -481,12 +481,7 @@ fn a_guest_encoders_frames_code_alike_from_the_cpu_and_the_gpu_and_decode_back()
                     if n == 0 {
                         for guest in [&mut by_cpu, &mut by_gpu] {
                             guest.reconfigure(&sharper).expect("a change of the QPs");
-                            if other.settings.profile != profile {
-                                assert!(matches!(
-                                    guest.reconfigure(&other),
-                                    Err(VideoError::Unsupported(_))
-                                ));
-                            }
+                            guest.reconfigure(&other).expect("a change of the profile");
                         }
                     }
                     sources.push(memory);
@@ -510,6 +505,10 @@ fn a_guest_encoders_frames_code_alike_from_the_cpu_and_the_gpu_and_decode_back()
                 let sync: Vec<u64> = (read.iter()).filter(|s| s.is_sync).map(|s| s.id).collect();
                 assert_eq!(sync, [0, 5], "{profile:?}");
                 assert!(read[0].configuration.is_some(), "{profile:?}");
+                assert!(
+                    read[1..].iter().all(|s| s.configuration.is_none()),
+                    "{profile:?}: the profile's change made a new sequence"
+                );
                 for (n, sample) in read.iter().enumerate() {
                     let id = u64::try_from(n).expect("an id");
                     let at = i64::try_from(n).expect("a time") * 3000;
