@@ -714,7 +714,10 @@ pub fn guest_ram_source(
     state.wait_for_earlier();
     written.extend(state.reap());
     state.refresh(&written);
-    state.stats.wait_ns.fetch_add(now_ns() - t0, Ordering::Relaxed);
+    state
+        .stats
+        .wait_ns
+        .fetch_add(now_ns() - t0, Ordering::Relaxed);
     let destination = id_at(destination.id().0).map_or(Value::Nil, Value::Object);
     // SAFETY: the platform copied the runs, so they lie in guest RAM a live lease holds
     // (`os::ram_over`), mapped while the lease lives.
