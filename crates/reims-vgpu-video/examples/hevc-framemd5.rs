@@ -9,6 +9,9 @@
 //! hevc-framemd5 /dev/dri/renderD128 stream.mp4 [options]
 //! ```
 //!
+//! On Windows the first argument is a DXGI adapter's LUID in hex, or
+//! `default` for the adapter the driver picks.
+//!
 //! - An `.mp4` is read as VideoToolbox is handed a stream: the `hvcC`
 //!   record and length-prefixed samples. Anything else is an Annex B
 //!   stream, split into access units.
@@ -25,17 +28,21 @@
 //! Prints `frame <index> id <sample> poc <poc> <md5>` per frame, and the
 //! time spent to stderr.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 use reims_vgpu_video_conformance::{md5, mp4};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[path = "common/readback.rs"]
 mod readback;
 
-#[cfg(target_os = "linux")]
+#[cfg(windows)]
+#[path = "common/adapter.rs"]
+mod adapter;
+
+#[cfg(any(target_os = "linux", windows))]
 fn main() -> std::process::ExitCode {
     readback::read_back_as_asked();
-    match linux::run() {
+    match decode::run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("hevc-framemd5: {e}");
@@ -44,13 +51,13 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn main() {
-    eprintln!("hevc-framemd5 needs Linux and libva");
+    eprintln!("hevc-framemd5 needs Linux or Windows, and libva");
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", windows))]
+mod decode {
     use reims_vgpu_video::core::runtime::{Runtime, StdRuntime};
     use std::collections::VecDeque;
     use std::time::Duration;
@@ -183,8 +190,13 @@ mod linux {
             return Err("MD5 fails its own test vectors".into());
         }
         let options = options()?;
+        #[cfg(target_os = "linux")]
         let display =
             Display::open(&options.node, StdRuntime::shared()).map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        let display =
+            Display::open_adapter(super::adapter::luid(&options.node)?, StdRuntime::shared())
+                .map_err(|e| e.to_string())?;
         let file = std::fs::read(&options.input).map_err(|e| format!("{}: {e}", options.input))?;
         let (mut decoder, samples): (HevcDecoder, Vec<Vec<u8>>) = if options.input.ends_with(".mp4")
         {
