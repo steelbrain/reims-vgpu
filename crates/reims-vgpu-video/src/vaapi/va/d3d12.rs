@@ -20,7 +20,7 @@
 
 use std::ffi::{CStr, c_void};
 use std::ptr::{NonNull, null, null_mut};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use crate::core::sync::Mutex;
@@ -218,6 +218,7 @@ fn check(what: &str, result: Hresult) -> Result<(), String> {
 }
 
 /// A COM object we hold one reference of, released when dropped.
+#[derive(Debug)]
 struct Com(NonNull<c_void>);
 
 // SAFETY: the objects held are Direct3D 12's and DXGI's, which are free-threaded: their methods
@@ -333,6 +334,7 @@ pub(crate) enum CopyError {
 }
 
 /// An NT handle, closed when dropped.
+#[derive(Debug)]
 struct Handle(NonNull<c_void>);
 
 // SAFETY: a handle is the process's, usable from any thread.
@@ -348,15 +350,45 @@ impl Drop for Handle {
 }
 
 /// A shared texture of a pool's: the resource, and the NT handle that opens it elsewhere.
-pub(crate) struct SharedTexture {
+///
+/// Another device opens it by its NT handle ([`SharedTexture::handle`]), which stays the
+/// texture's: an import of it is let go once [`SharedTexture::alive`] no longer upgrades.
+#[derive(Debug)]
+pub struct SharedTexture {
     resource: Com,
     handle: Handle,
+    format: SurfaceFormat,
+    size: (u32, u32),
+    /// Its life, which another device's imports of it are let go by.
+    life: Arc<()>,
 }
 
 impl SharedTexture {
-    /// The NT handle that opens the texture, which stays the texture's.
-    pub(crate) fn handle(&self) -> *mut c_void {
+    /// The NT handle that opens the texture, as a pointer, for the driver's import.
+    pub(crate) fn raw_handle(&self) -> *mut c_void {
         self.handle.0.as_ptr()
+    }
+
+    /// The NT handle that opens the texture, which stays the texture's.
+    pub fn handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        // SAFETY: the handle is open while the texture lives, and the borrow ends with it.
+        unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(self.handle.0.as_ptr()) }
+    }
+
+    /// Whether its samples are 10-bit in 16 (P010), else 8-bit (NV12).
+    pub fn is_10_bit(&self) -> bool {
+        self.format == SurfaceFormat::P010
+    }
+
+    /// Its width and height in luma samples: the pool's, the decoded (coded) picture's.
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// A reference that lives as long as the texture: an import of it is let go once it no
+    /// longer upgrades.
+    pub fn alive(&self) -> Weak<()> {
+        Arc::downgrade(&self.life)
     }
 }
 
@@ -469,7 +501,13 @@ impl Device {
         let handle = NonNull::new(handle)
             .map(Handle)
             .ok_or("CreateSharedHandle made no handle")?;
-        Ok(SharedTexture { resource, handle })
+        Ok(SharedTexture {
+            resource,
+            handle,
+            format,
+            size: (width, height),
+            life: Arc::new(()),
+        })
     }
 
     /// Copies the whole of `from` into `to`, textures of the same format and size, on the

@@ -15,6 +15,11 @@ pub use va::{
     SurfaceCapabilities, SurfaceExport, proc_filter_name, read_back_by, rt_format_names,
 };
 
+/// A pool's surface on Windows, a shared Direct3D 12 texture, which a frame names
+/// (`Frame::texture`).
+#[cfg(windows)]
+pub use va::SharedTexture;
+
 pub use va::{
     TARGET_ALIGNMENT, Target, TargetChecks, TargetCodec, TargetFor, TargetFormat, TargetPlane,
     TargetShape,

@@ -80,6 +80,15 @@ impl Frame {
         self.surface.export()
     }
 
+    /// The frame's surface as the shared Direct3D 12 texture it is, on Windows, for another
+    /// device to read its planes by the texture's NT handle (`super::d3d12`); `None` where its
+    /// pool's surfaces are the driver's own. It reads the decode only once [`Frame::sync`]
+    /// returned.
+    #[cfg(windows)]
+    pub fn texture(&self) -> Option<Arc<super::d3d12::SharedTexture>> {
+        self.surface.texture()
+    }
+
     /// A hold of the frame's surface, which keeps it out of its pool, so that no later frame is
     /// decoded into it, while the hold lives: for another device's read of the surface that may
     /// outlast the frame.

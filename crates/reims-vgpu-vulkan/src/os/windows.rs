@@ -11,6 +11,7 @@ mod clock;
 mod hints;
 mod import;
 mod lease;
+mod plane_copy;
 mod threads;
 mod vm;
 
@@ -21,6 +22,7 @@ use metal2vulkan_runtime as rt;
 
 pub use clock::WindowsClock;
 pub use lease::{GuestMemoryLease, lease_guest_memory};
+pub use plane_copy::{CopyError, PlaneCopier, PlaneCopy, SharedPlanes, TextureFormat};
 pub use threads::WindowsThreads;
 pub use vm::{RegionMemory, WindowsVm};
 
@@ -41,6 +43,20 @@ pub(crate) const WINDOW_SURFACE_EXTENSIONS: [&CStr; 1] = [ash::khr::win32_surfac
 
 /// The device extensions a window's swapchain needs besides `VK_KHR_swapchain`: none.
 pub(crate) const WINDOW_DEVICE_EXTENSIONS: [&CStr; 0] = [];
+
+/// Adds to `options` the device extension the video's copies take here
+/// (`plane_copy`): `VK_KHR_external_memory_win32`, which a device enables where it lists it, so
+/// that it imports the video's shared textures by their NT handles.
+pub(crate) fn add_video_extensions(options: &mut rt::DeviceOptions) {
+    let name = ash::khr::external_memory_win32::NAME;
+    if !options
+        .optional_device_extensions
+        .iter()
+        .any(|n| n.as_c_str() == name)
+    {
+        options.optional_device_extensions.push(name.to_owned());
+    }
+}
 
 /// The Vulkan loader, opened by its usual name (`vulkan-1.dll`), as the runtime opens it.
 pub(crate) fn open_loader() -> Result<ash::Entry, ash::LoadingError> {

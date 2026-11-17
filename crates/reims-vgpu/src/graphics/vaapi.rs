@@ -44,12 +44,12 @@
 //!      CoreVideo's planes, 32 bytes into their pages, are written so by no driver: radeonsi
 //!      imports planes 256 bytes apart alone, iHD writes a plane only at its dma-buf's first byte
 //!      (`docs/video/bugs.md`, U26).
-//!   2. **By the runtime device's GPU** (`gpu_copy`): the decode surface exported as dma-bufs and
-//!      each plane copied into the plane's buffer, the guest's pages or the surface's device
-//!      cache, at its own rows and offset, the crop alone as the CPU's copy writes it
-//!      (`crop_extent`). It is taken wherever the open made a copier on the runtime device
-//!      ([`open_on`]), the device imports the driver's surfaces as images, and the planes'
-//!      buffer is their memory.
+//!   2. **By the runtime device's GPU** (`gpu_copy`): the decode surface exported as dma-bufs (on
+//!      Windows, the shared Direct3D 12 texture it is) and each plane copied into the plane's
+//!      buffer, the guest's pages or the surface's device cache, at its own rows and offset, the
+//!      crop alone as the CPU's copy writes it ([`crop_extent`]). It is taken wherever the open
+//!      made a copier on the runtime device ([`open_on`]), the device imports the driver's
+//!      surfaces as images, and the planes' buffer is their memory.
 //!   3. **By the CPU**: the frame read back (staged, or `vaGetImage`, the VA crate's way back),
 //!      and copied into the planes' host bytes, or into the session's staging for a plane in a
 //!      device cache.
@@ -124,7 +124,6 @@ use super::video_host::{
 };
 
 mod encode;
-#[cfg(unix)]
 mod gpu_copy;
 
 /// The backend's name in the session's log lines.
@@ -214,8 +213,9 @@ pub(crate) fn open_on(
 
 /// The VA-API video of the runtime device `device` on Windows: on the DXGI adapter of its GPU, by
 /// the LUID Vulkan answers for it (`host_gpus::adapter_luid_of`), over Mesa's VA-on-D3D12 driver;
-/// `None`, logged, where its GPU names none. Its pictures land by the CPU's copy alone: Windows
-/// makes no dma-buf, so there is no GPU copier, no write in place and no decode into a cache.
+/// `None`, logged, where its GPU names none. Its pictures land by the runtime device's GPU, from
+/// the shared texture each decodes into (`gpu_copy`), else by the CPU's copy: Windows makes no
+/// dma-buf, so there is no write in place and no decode into a cache.
 #[cfg(windows)]
 pub(crate) fn open_on(
     device: &VulkanDevice,
@@ -225,12 +225,13 @@ pub(crate) fn open_on(
         log::info!("hardware video: no VA-API: the device's GPU names no DXGI adapter");
         return None;
     };
+    let copies: Arc<dyn GpuCopies<VulkanPlatform>> = Arc::new(gpu_copy::RuntimeCopies::new(device));
     open::<VulkanPlatform>(
         device,
         device.registry_id,
         DisplayAt::Adapter(luid, std::marker::PhantomData),
         runtime,
-        None,
+        Some(copies),
         None,
     )
 }
@@ -1285,7 +1286,6 @@ pub(crate) trait GpuCopier<P: Platform>: Send {
 
 /// What one output plane holds of a picture, as the CPU's copy fits a picture to it: the bytes of
 /// its rows, the bytes from one row to the next, and its rows.
-#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Room {
     pub(crate) row_bytes: u64,
@@ -1293,7 +1293,6 @@ pub(crate) struct Room {
     pub(crate) rows: u64,
 }
 
-#[cfg(unix)]
 impl Room {
     /// What `plane` holds: its row's bytes and pitch, and its crop's rows.
     pub(crate) fn of<P: Platform>(plane: &OutputPlane<P>) -> Room {
@@ -1310,7 +1309,6 @@ impl Room {
 /// as the picture, each plane's rows and its rows' bytes hold, the chroma plane's columns in whole
 /// pairs; `None` for none. The chroma plane takes half of each, rounded up, from half the crop's
 /// origin.
-#[cfg(unix)]
 pub(crate) fn crop_extent(
     size: (u32, u32),
     sample: u64,
@@ -1437,5 +1435,10 @@ fn in_place_layout(luma: Place, chroma: Place, bit_depth: u32) -> Result<Surface
 }
 
 #[cfg(test)]
+mod both_ways;
+#[cfg(test)]
 #[cfg(unix)]
 mod tests;
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_tests;

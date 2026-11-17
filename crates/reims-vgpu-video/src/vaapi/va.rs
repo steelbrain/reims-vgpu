@@ -52,6 +52,8 @@ pub use caps::{
     Capabilities, ConfigCapabilities, Entrypoint, Fourcc, Profile, SurfaceCapabilities,
     proc_filter_name, rt_format_names,
 };
+#[cfg(windows)]
+pub use d3d12::SharedTexture;
 pub use display::{Display, Error};
 pub use encoder::{
     EncoderCapabilities, EncoderSupport, Feature, HevcBlockSizes, HevcFeatures, InputSurface,

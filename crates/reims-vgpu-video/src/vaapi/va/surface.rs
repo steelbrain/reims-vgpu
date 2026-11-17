@@ -410,7 +410,7 @@ fn import_texture(
     height: u32,
     texture: &SharedTexture,
 ) -> Result<ffi::VASurfaceID, Error> {
-    let mut handles = [texture.handle()];
+    let mut handles = [texture.raw_handle()];
     let mut attributes = [ffi::VASurfaceAttrib::zeroed(); 3];
     attributes[0].type_ = ffi::VASurfaceAttribPixelFormat;
     attributes[0].value.type_ = ffi::VAGenericValueTypeInteger;

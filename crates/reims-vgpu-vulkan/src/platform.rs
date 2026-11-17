@@ -431,6 +431,8 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
     static OPTIONS: LazyLock<rt::DeviceOptions> = LazyLock::new(|| {
         let mut options = rt::DeviceOptions::default();
         crate::os::add_window_extensions(&mut options);
+        #[cfg(windows)]
+        crate::os::add_video_extensions(&mut options);
         options.load_no_dynamic_library_file = true;
         options.mac_class = *MAC_CLASS.get_or_init(|| None);
         options.policy = exact_policy(std::env::var("REIMS_VGPU_EXACT").ok().as_deref());

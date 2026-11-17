@@ -45,6 +45,9 @@ use host_os::cache_directory as host_cache_directory;
 
 use crate::core::platform::os::vm::{HostAddr, HostVm as _};
 
+/// The device extension the video's copies take, on Windows (`os/windows/plane_copy.rs`).
+#[cfg(windows)]
+pub(crate) use host_os::add_video_extensions;
 /// Learns whether a device imports views of guest pages mapped through dma-bufs, on Linux
 /// (`os/linux/import.rs`).
 #[cfg(target_os = "linux")]
@@ -66,6 +69,10 @@ pub(crate) use host_os::{
 /// (`os/linux/plane_copy.rs`).
 #[cfg(target_os = "linux")]
 pub use host_os::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFill, PlaneFormat};
+/// Copies by the GPU of the planes another driver wrote into a shared Direct3D 12 texture into a
+/// runtime buffer, on Windows (`os/windows/plane_copy.rs`).
+#[cfg(windows)]
+pub use host_os::{CopyError, PlaneCopier, PlaneCopy, SharedPlanes, TextureFormat};
 pub use host_os::{
     GuestMemoryLease, OsClock, OsThreads, OsVm, RegionMemory, default_driver_sizes,
     default_gpu_core_count, default_registry_id, install_process_services, lease_guest_memory,
