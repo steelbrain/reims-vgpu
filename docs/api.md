@@ -56,14 +56,16 @@ Every struct the host fills in, and every struct the library hands out, starts w
     zero, and is `RVG_ERR_UNSUPPORTED` otherwise. A host built against a newer header then works
     with an older library as long as it leaves the new fields at zero.
   - `RvgWindowConfig` and `RvgWindowCallbacks` are at their first version.
-    `RvgGraphicsDeviceConfig` is at its fourth: the second added `guest_arch`, and a host built
+    `RvgGraphicsDeviceConfig` is at its fifth: the second added `guest_arch`, and a host built
     before it, whose `struct_size` ends before that field, serves an x86-64 guest; the third added
     `doorbell_pages`, and a host built before it maps no doorbell pages; the fourth added
     `display_count` and `display_windows`, and a host built before it makes a device of one
-    display. `RvgGraphicsCallbacks` is at its fourth: the second added `route_doorbell`, and a host
-    built before it routes no doorbell; the third added `route_doorbell_page`, and a host built
-    before it routes none on a doorbell page; the fourth added `cursor_glyph_at`, `cursor_show_at`
-    and `cursor_move_at`, and a host built before it is told the cursor of display 0 alone. A
+    display; the fifth added `pool_physical_address` and `pool_physical_length`, and a host built
+    before it has no pool. `RvgGraphicsCallbacks` is at its fifth: the second added
+    `route_doorbell`, and a host built before it routes no doorbell; the third added
+    `route_doorbell_page`, and a host built before it routes none on a doorbell page; the fourth
+    added `cursor_glyph_at`, `cursor_show_at` and `cursor_move_at`, and a host built before it is
+    told the cursor of display 0 alone; the fifth added `pool_add` and `pool_remove`. A
     struct that
     grows keeps its first version's size as the least it accepts, and reads the later fields of a
     host built before them as zero.
@@ -82,7 +84,7 @@ unknown status as a failure.
 | value | name | when |
 |---|---|---|
 | 0 | `RVG_OK` | |
-| 1 | `RVG_ERR_INVALID_ARGUMENT` | a NULL handle, config or out-pointer where one is needed; a `struct_size` too small; a refused memory file; a `guest_arch` that is none of `RVG_GUEST_ARCH_*`; a `doorbell_pages` other than 0 or 1; a `display_count` past `RVG_GRAPHICS_DISPLAYS_MAX`, or `display_windows` not given exactly where `window` is (one for each display from 1), or holding NULL; a doorbell that is not open, or a second one; `read_display`'s destination missing or too short; `read_display_at`'s display at or past the device's count |
+| 1 | `RVG_ERR_INVALID_ARGUMENT` | a NULL handle, config or out-pointer where one is needed; a `struct_size` too small; a refused memory file; a `guest_arch` that is none of `RVG_GUEST_ARCH_*`; a `doorbell_pages` other than 0 or 1; a `display_count` past `RVG_GRAPHICS_DISPLAYS_MAX`, or `display_windows` not given exactly where `window` is (one for each display from 1), or holding NULL; a pool range not in whole 2 MiB, past the address space, overlapping the memory map, or given without `pool_add` and `pool_remove`; a doorbell that is not open, or a second one; `read_display`'s destination missing or too short; `read_display_at`'s display at or past the device's count; a pool call on a device without a pool, an address the device asked no add at, a second `pool_added` of one piece, or a `pool_grow` of 0 bytes |
 | 2 | `RVG_ERR_UNSUPPORTED` | a larger `struct_size` with non-zero bytes the library does not know |
 | 3 | `RVG_ERR_METAL` | the platform refused the display's texture or its draw (`rvg_graphics_device_read_display`) |
 | 4 | `RVG_ERR_GPU` | the call's GPU work ended with an error |
@@ -170,6 +172,21 @@ starts again. QEMU releases its device as it quits, once the VM stopped for good
 `vm_shutdown`), with the BQL held, which none of its callbacks takes; a VM whose shutdown action
 pauses it keeps its device to the exit, and so does a quit while a read of its display
 (`rvg_graphics_device_read_display`) still waits for its draw on the GPU 5 s into the teardown.
+
+### The guest's Shared pool
+
+A host that reserves a range of guest physical addresses for the guest's Shared pool
+(`pool_physical_address`, `pool_physical_length`) maps the device's blocks there as the pool grows
+(`pool_add`, answered by `rvg_graphics_device_pool_added`) and unmaps them as the device frees them
+(`pool_remove`, answered by `rvg_graphics_device_pool_removed`). The device frees a block only once
+the host said its piece is out of the guest's address space and no thread of the host's touches it,
+and once no thread of its own holds it. Before the release the host takes out every piece it added
+and says so for each, as QEMU's teardown does; the release then frees every block before it
+returns, so none is freed by a driver's exit handler (on NVIDIA's driver, which unmaps its memory
+inside `exit()`, a thread still reading a block then faults). QEMU reserves the range at realize past
+the RAM and the PCI host bridge's default 64-bit window, raises fw_cfg `etc/reserved-memory-end`
+past it so OVMF's 64-bit window goes above it, maps each piece as a RAM region of its own (an add is
+a pure add), and under WHPX runs the hypervisor's map outside its BQL (`whpx_map_ahead`).
 
 ## 2. The C header
 
@@ -283,6 +300,9 @@ returns. The library logs through the `log` crate; a Rust host installs its own 
 | `rvg_graphics_device_cursor_position` | never | nothing |
 | `rvg_graphics_device_read_display_at` | never | its draw on the GPU |
 | `rvg_graphics_device_cursor_position_at` | never | nothing |
+| `rvg_graphics_device_pool_added` | never | nothing |
+| `rvg_graphics_device_pool_removed` | never | nothing |
+| `rvg_graphics_device_pool_grow` | never | nothing |
 
 ## 5. Callbacks and threads
 
@@ -293,6 +313,8 @@ returns. The library logs through the `log` crate; a Rust host installs its own 
 | `raise_interrupt` | the thread that posts the event it raises for: the device's control thread, `reims-vgpu.graphics-control`; one of ring 0's threads, `reims-vgpu.graphics-ring0-<i>`, which carry out a guest process's control messages, its presents and a block's pages and downloads, each on its lane; a display's refresh thread, `reims-vgpu.graphics-refresh` (display 0's) and, on a device of several displays, `reims-vgpu.graphics-refresh-<i>`; a command queue's service thread, `reims-vgpu.graphics-queue-<id>`, or one of its lane's threads, which walk and commit its command buffers, `reims-vgpu.graphics-lane-<id>`; a pipeline compile's thread, `reims-vgpu.graphics-compile-<n>`; a thread that makes IOSurfaces' and pages blocks' views, `reims-vgpu.graphics-surfaces-<i>`; a thread that makes indirect command buffers, `reims-vgpu.icb-create-<i>`; a thread that lets go of a closed process's objects and answers its close, `reims-vgpu.graphics-closes-<i>`; or the platform's thread that runs a command buffer's scheduled or completed handler; or the host's own, inside `rvg_graphics_device_mmio_write_taking` or `rvg_graphics_device_doorbell_write`. Never inside another call of the host's | nothing: they may call at once | each after the completion ring's message it raises for is published |
 | `route_doorbell`, `route_doorbell_page` (the route of a queue whose process has a doorbell page, at that page's doorbell in BAR 4) | one of ring 0's threads, `reims-vgpu.graphics-ring0-<i>`, or the control thread, `reims-vgpu.graphics-control`, as a command queue is made, destroyed or its process closed, with no lock of the library's held, where it may wait for a lock the host holds while it calls the device (QEMU's BQL), since no function the host calls under it waits for a thread inside the callback but the release of the process's last device, at most 5 s; dropping a route, also the host's own inside `rvg_graphics_device_mmio_write_taking` (a STATUS write of 0, or a `DOORBELL_PAGE_BIND` write that binds a page to another context) or `rvg_graphics_device_reset`, where it must not wait for a lock the host holds around that call | nothing: they may call at once | a queue's route before its create is answered, and its drop once its queue has ended and before its destroy, its process's close or the reset is answered; a dropped route takes no write once the call returns |
 | `cursor_glyph`, `cursor_show`, `cursor_move` (display 0's), and `cursor_glyph_at`, `cursor_show_at`, `cursor_move_at` (each display's from 1, named) | the display thread: one serial worker for the whole process (after 5 s idle it exits, and the next callback starts a new one) | every display callback of the process: one at a time | the order the device's control thread took the guest's cursor and display power commands, of every display, and its resets |
+| `pool_add` | the device's pool thread, `reims-vgpu.graphics-pool`, with no lock of the library's held; never inside a call of the host's; it must not wait for a lock the host holds while it calls the device (QEMU queues the add for its main loop) | one at a time | the order the device places the pieces, each before its `pool_remove`; the host answers each with `rvg_graphics_device_pool_added` once the guest's address space has it |
+| `pool_remove` | the thread that frees the piece's block: the pool thread, or the block source's own (metal2vulkan-rt's block-maker thread), inside its unmap hook, with no lock of the library's held; never inside a call of the host's; it must not wait for a lock the host holds while it calls the device | nothing | once a piece, after its `pool_add`, never once the release has begun; the host answers with `rvg_graphics_device_pool_removed` once the piece is out of the guest's address space and no thread of its own touches it, and the device frees the block only then |
 | a window's `pointer`, `wheel`, `key`, `close`, `scroll` | on macOS the process's main thread, where AppKit runs; on Linux and Windows the library's thread `reims-vgpu.ui`; never inside a call of the host's | every window callback of the process: one at a time | the order the events arrived |
 | `destroy` (each table) | the device's: once its threads have ended, after their last callback, possibly on one of them after the release has returned; the window's: once the release has closed the window, on the releasing thread or, while a window callback runs, the window's thread once it returns; either, on the caller's thread, in a refused create | nothing | once, after every call of its table |
 

@@ -25,6 +25,8 @@ fn callbacks() -> RvgGraphicsCallbacks {
         cursor_glyph_at: None,
         cursor_show_at: None,
         cursor_move_at: None,
+        pool_add: None,
+        pool_remove: None,
     }
 }
 
@@ -39,6 +41,8 @@ fn config(callbacks: &RvgGraphicsCallbacks) -> RvgGraphicsDeviceConfig {
         doorbell_pages: 0,
         display_count: 0,
         display_windows: std::ptr::null(),
+        pool_physical_address: 0,
+        pool_physical_length: 0,
     }
 }
 
@@ -541,4 +545,116 @@ fn command_buffer_copy_cost() {
             100.0 * (two - one) / two
         );
     }
+}
+
+/// What the pool's host callbacks were asked, for [`a_pool_s_pieces_reach_the_host_and_back`].
+static POOL_ASKS: std::sync::Mutex<Vec<(bool, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+unsafe extern "C-unwind" fn pool_add(
+    _ctx: *mut c_void,
+    physical_address: u64,
+    host_address: *mut c_void,
+    length: u64,
+) {
+    assert!(!host_address.is_null());
+    POOL_ASKS
+        .lock()
+        .unwrap()
+        .push((true, physical_address, length));
+}
+
+unsafe extern "C-unwind" fn pool_remove(_ctx: *mut c_void, physical_address: u64, length: u64) {
+    POOL_ASKS
+        .lock()
+        .unwrap()
+        .push((false, physical_address, length));
+}
+
+/// A pool needs both of its callbacks and a range of whole 2 MiB; a device without one refuses
+/// the pool's calls; a device with one grows on the host's ask, on its pool thread, takes the
+/// host's word that it added the piece once, and its removal; a config of the fourth version,
+/// whose `struct_size` ends before the pool's fields, has no pool whatever lies past its size
+#[test]
+fn a_pool_s_pieces_reach_the_host_and_back() {
+    const BASE: u64 = 52 << 30;
+    let plain = RvgGraphicsCallbacks {
+        destroy: None,
+        ..callbacks()
+    };
+    let with_pool = RvgGraphicsCallbacks {
+        pool_add: Some(pool_add),
+        pool_remove: Some(pool_remove),
+        ..plain
+    };
+    let mut device = std::ptr::null_mut();
+    // SAFETY: live configs and out-pointers; then live devices, released.
+    unsafe {
+        for (cb, address, length) in [
+            (&plain, BASE, 64 << 30),
+            (&with_pool, BASE + 4096, 64 << 30),
+            (&with_pool, BASE, (64 << 30) + 4096),
+            (&with_pool, BASE, 0),
+        ] {
+            let c = RvgGraphicsDeviceConfig {
+                pool_physical_address: address,
+                pool_physical_length: length,
+                ..config(cb)
+            };
+            assert_eq!(
+                rvg_graphics_device_create(&c, &mut device),
+                RVG_ERR_INVALID_ARGUMENT,
+                "{address:#x} {length:#x}"
+            );
+        }
+        // The fourth version: no pool, whatever its fields hold.
+        let c = RvgGraphicsDeviceConfig {
+            struct_size: std::mem::offset_of!(RvgGraphicsDeviceConfig, pool_physical_address)
+                as u32,
+            pool_physical_address: BASE,
+            pool_physical_length: 64 << 30,
+            ..config(&plain)
+        };
+        assert_eq!(rvg_graphics_device_create(&c, &mut device), RVG_OK);
+        assert_eq!(
+            rvg_graphics_device_pool_grow(device, 1),
+            RVG_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            rvg_graphics_device_pool_added(device, BASE),
+            RVG_ERR_INVALID_ARGUMENT
+        );
+        rvg_graphics_device_release(device);
+
+        let c = RvgGraphicsDeviceConfig {
+            pool_physical_address: BASE,
+            pool_physical_length: 64 << 30,
+            ..config(&with_pool)
+        };
+        assert_eq!(rvg_graphics_device_create(&c, &mut device), RVG_OK);
+        assert_eq!(
+            rvg_graphics_device_pool_grow(device, 0),
+            RVG_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(rvg_graphics_device_pool_grow(device, 1), RVG_OK);
+        for _ in 0..10_000 {
+            if !POOL_ASKS.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(*POOL_ASKS.lock().unwrap(), [(true, BASE, 256 << 20)]);
+        assert_eq!(rvg_graphics_device_pool_added(device, BASE), RVG_OK);
+        assert_eq!(
+            rvg_graphics_device_pool_added(device, BASE),
+            RVG_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            rvg_graphics_device_pool_removed(device, BASE + (256 << 20)),
+            RVG_ERR_INVALID_ARGUMENT
+        );
+        // The host removes its pieces before the release, and the release asks it nothing.
+        assert_eq!(rvg_graphics_device_pool_removed(device, BASE), RVG_OK);
+        rvg_graphics_device_release(device);
+    }
+    assert_eq!(POOL_ASKS.lock().unwrap().len(), 1);
 }

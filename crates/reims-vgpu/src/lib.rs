@@ -31,6 +31,7 @@ mod faults;
 mod graphics;
 mod memory;
 pub mod platform;
+mod pool;
 pub mod singleton;
 mod video;
 mod window;
@@ -47,6 +48,7 @@ pub use graphics::{
 };
 pub use memory::{HostFile, MemoryFile, MemoryMap};
 pub use platform::ApiPlatform;
+pub use pool::{BLOCK_LEN, PIECE_ALIGN, PoolAddFn, PoolConfig, PoolRemoveFn, RELEASE_DELAY};
 pub use reims_vgpu_graphics::RawDoorbell;
 pub use reims_vgpu_vulkan::VulkanPlatform;
 

@@ -304,6 +304,40 @@ typedef bool (*RvgGraphicsRouteDoorbellPageFn)(void *ctx,
                                                uint32_t ring_id,
                                                int32_t bell);
 
+// `pool_add(ctx, physical_address, host_address, length)`: map `length` bytes of host memory
+// from `host_address` into the guest at `physical_address`, a piece of the guest's Shared pool
+// (RvgGraphicsDeviceConfig's `pool_physical_address` and `pool_physical_length`, which hold the
+// piece), and call rvg_graphics_device_pool_added with `physical_address` once the guest's
+// address space has it (QEMU: a RAM region over the memory, added on its main loop, unmergeable
+// with its neighbours). The memory stays mapped, and the device asks no other piece over its
+// addresses, until the host has said the piece is removed (rvg_graphics_device_pool_removed).
+// `physical_address`, `host_address` and `length` are multiples of 2 MiB, 4 KiB and 2 MiB.
+//
+// Thread: the device's pool thread (`reims-vgpu.graphics-pool`), never inside a call of the
+// host's, with no lock of the library's held. It must not wait for a lock the host holds while
+// it calls the device (QEMU's BQL): QEMU queues the add for its main loop. One piece at a time,
+// in the order the device places them, each before its pool_remove. May call: nothing of the
+// library's. Needed with a pool.
+typedef void (*RvgGraphicsPoolAddFn)(void *ctx,
+                                     uint64_t physical_address,
+                                     void *host_address,
+                                     uint64_t length);
+
+// `pool_remove(ctx, physical_address, length)`: unmap the piece of the pool at
+// `physical_address` that pool_add mapped, and call rvg_graphics_device_pool_removed with
+// `physical_address` once it is out of the guest's address space and no thread of the host's
+// touches its memory (QEMU: once its region's last reference goes, past its RCU grace period).
+// The device frees the memory only after that. A remove of a piece whose add the host has not
+// carried out yet follows that add: the host carries out the add, then the remove.
+//
+// Thread: the one that frees the piece's block (the device's pool thread, or the block source's
+// own), never inside a call of the host's, with no lock of the library's held. It must not wait
+// for a lock the host holds while it calls the device (QEMU queues the remove for its main
+// loop). Once a piece, after its pool_add. Not called once rvg_graphics_device_release has
+// begun: the host removes every piece it added before it releases the device. May call: nothing
+// of the library's. Needed with a pool.
+typedef void (*RvgGraphicsPoolRemoveFn)(void *ctx, uint64_t physical_address, uint64_t length);
+
 // `cursor_glyph_at(ctx, display, glyph)`: the guest set the cursor's image of display `display`,
 // 1 or above, or its colour chain (display 0's is cursor_glyph).
 //
@@ -366,6 +400,11 @@ typedef struct {
   // cursor_move of display 1 and up: rvg_graphics_device_cursor_position_at reads where. A
   // host built before it gives none.
   RvgCursorMoveAtFn cursor_move_at;
+  // Maps a piece of the guest's Shared pool. A host built before it, whose `struct_size` ends
+  // before it, gives none, and has no pool.
+  RvgGraphicsPoolAddFn pool_add;
+  // Unmaps a piece of the guest's Shared pool. A host built before it gives none.
+  RvgGraphicsPoolRemoveFn pool_remove;
 } RvgGraphicsCallbacks;
 
 // `pointer(ctx, x, y, width, height, buttons)`: the pointer is at (`x`, `y`) in the guest's
@@ -600,6 +639,16 @@ typedef struct {
   // display, missing where `window` is given and it has several, or a NULL entry. A host built
   // before this field gives none.
   const RvgWindowConfig *const *display_windows;
+  // The first guest physical address of the range the host reserved for the guest's Shared
+  // pool, with no RAM or device under it, which the device fills with blocks of host memory as
+  // the pool grows (pool_add). 0, with `pool_physical_length` 0, for none, as a host built
+  // before this field, whose `struct_size` ends before it, has. Refused
+  // (RVG_ERR_INVALID_ARGUMENT): a range not in whole multiples of 2 MiB, one past the address
+  // space, one a range of `memory_map` overlaps, and one given without both pool_add and
+  // pool_remove.
+  uint64_t pool_physical_address;
+  // The range's length in bytes: 0 for none.
+  uint64_t pool_physical_length;
 } RvgGraphicsDeviceConfig;
 
 #ifdef __cplusplus
@@ -622,6 +671,36 @@ const char *rvg_status_message(RvgStatus status);
 // `config` is NULL or a live config; `device` is NULL or writable.
 RvgStatus rvg_graphics_device_create(const RvgGraphicsDeviceConfig *config,
                                      RvgGraphicsDevice **device);
+
+// The host mapped the pool's piece at `physical_address` that pool_add asked for: the guest's
+// address space has it from now on. RVG_ERR_INVALID_ARGUMENT for a device without a pool, an
+// address the device asked no add at, or one the host said it added already. On any thread, the
+// host's lock (QEMU's BQL) held or not: waits for nothing. Calls back: never.
+//
+// # Safety
+// `device` is a live graphics device handle.
+RvgStatus rvg_graphics_device_pool_added(RvgGraphicsDevice *device, uint64_t physical_address);
+
+// The host took the pool's piece at `physical_address` out of the guest's address space, and no
+// thread of its own touches its memory: asked to by pool_remove, or of its own, as it does with
+// every piece it added before it releases the device. The device may free the piece's memory
+// from now on. RVG_ERR_INVALID_ARGUMENT for a device without a pool, or an address the device
+// asked no add at. On any thread, the host's lock (QEMU's BQL) held or not: waits for nothing.
+// Calls back: never.
+//
+// # Safety
+// `device` is a live graphics device handle.
+RvgStatus rvg_graphics_device_pool_removed(RvgGraphicsDevice *device, uint64_t physical_address);
+
+// Asks for at least `length` more bytes of the guest's Shared pool now, ahead of the guest's own
+// ask, as that ask does: the device's pool thread takes a block (256 MiB, or `length` rounded up
+// to 2 MiB past that) and asks the host to map it (pool_add). QEMU calls it for its device's
+// `x-pool-grow` property. RVG_ERR_INVALID_ARGUMENT for a device without a pool or a `length` of
+// 0. On any thread: waits for nothing. Calls back: never.
+//
+// # Safety
+// `device` is a live graphics device handle.
+RvgStatus rvg_graphics_device_pool_grow(RvgGraphicsDevice *device, uint64_t length);
 
 // Drops the host's reference; the last one closes the window, waiting for nothing, and ends the
 // device's threads without waiting for them: the callbacks' destroy runs once both have ended,

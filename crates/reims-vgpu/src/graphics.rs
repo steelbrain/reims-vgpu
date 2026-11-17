@@ -125,6 +125,7 @@ use crate::cursor::{
 use crate::entry;
 use crate::entry::no_catch;
 use crate::error::Error;
+use crate::pool::{HostBlocks, Pool, PoolAddFn, PoolConfig, PoolHost, PoolRemoveFn};
 use crate::graphics::answers::PipelineAnswers;
 use crate::graphics::color::{ColorChange, ColorStaging, DisplayColor};
 use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
@@ -265,6 +266,11 @@ pub struct GraphicsCallbacks {
     /// bell, at the page, or drops the route. Without it such a queue is not routed, and its
     /// writes come through [`GraphicsDevice::doorbell_write`].
     pub route_doorbell_page: Option<GraphicsRouteDoorbellPageFn>,
+    /// Maps a piece of the guest's Shared pool into the guest ([`PoolAddFn`]); needed with
+    /// [`GraphicsConfig::pool`], on the pool's thread.
+    pub pool_add: Option<PoolAddFn>,
+    /// Unmaps a piece of the pool ([`PoolRemoveFn`]); needed with [`GraphicsConfig::pool`].
+    pub pool_remove: Option<PoolRemoveFn>,
 }
 
 /// A graphics device's config.
@@ -303,6 +309,12 @@ pub struct GraphicsConfig {
     /// `RGFX_FEATURE_DOORBELL_PAGES`, on which the kext maps each process's own page, which it
     /// rings its queues' doorbells on with no call into the kext.
     pub doorbell_pages: bool,
+    /// The guest physical range the host reserved for the guest's Shared pool, with no RAM under
+    /// it, which the device fills with blocks as the pool grows (`crate::pool`); `None` is no pool.
+    /// Given, it needs [`GraphicsCallbacks::pool_add`] and `pool_remove`, a range
+    /// [`PoolConfig::is_valid`] takes, and none of [`Self::memory_map`]'s ranges overlapping it:
+    /// otherwise [`Error::InvalidArgument`].
+    pub pool: Option<PoolConfig>,
 }
 
 /// The architecture of the macOS guest a graphics device serves ([`GraphicsConfig::guest_arch`]).
@@ -388,6 +400,28 @@ fn display_count(config: &GraphicsConfig) -> Result<usize, Error> {
     Ok(count)
 }
 
+/// The pool `config` gives, with the host's side of it: `None` without one;
+/// [`Error::InvalidArgument`] for a range [`PoolConfig::is_valid`] refuses, one a range of the
+/// memory map overlaps, or one without both of the host's pool callbacks.
+fn pool_host(config: &GraphicsConfig) -> Result<Option<(PoolConfig, PoolHost)>, Error> {
+    let Some(range) = config.pool else {
+        return Ok(None);
+    };
+    let (Some(add), Some(remove)) = (&config.callbacks.pool_add, &config.callbacks.pool_remove)
+    else {
+        return Err(Error::InvalidArgument);
+    };
+    let mut ram = (config.memory_map.iter()).flat_map(|m| m.ranges());
+    if !range.is_valid() || ram.any(|r| range.overlaps(r.physical_address, r.physical_length)) {
+        return Err(Error::InvalidArgument);
+    }
+    let host = PoolHost {
+        add: Arc::clone(add),
+        remove: Arc::clone(remove),
+    };
+    Ok(Some((range, host)))
+}
+
 /// The reims-graphics device.
 pub struct GraphicsDevice<P: ApiPlatform = DefaultPlatform> {
     /// The displays' windows, display `i`'s at index `i`, none without them, which close when
@@ -410,6 +444,8 @@ pub struct GraphicsDevice<P: ApiPlatform = DefaultPlatform> {
     /// The stage-3 decoder's state while it lives: once the device ended, what holds the GPU
     /// device until its threads, its objects and their GPU work let go ([`ENDING`]).
     ending: Weak<GraphicsControl<P>>,
+    /// The guest's Shared pool, where the host reserved one.
+    pool: Option<Pool>,
     /// The platform the decoder runs on.
     platform: PhantomData<fn() -> P>,
 }
@@ -449,6 +485,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     pub fn with_platform(platform: Arc<P>, config: GraphicsConfig) -> Result<Self, Error> {
         entry::run(|_| {
             let count = display_count(&config)?;
+            let pool_host = pool_host(&config)?;
             let size = usize::try_from(reims_vgpu_graphics::REGION_SIZE)
                 .map_err(|_| Error::HostResources)?;
             let region = platform
@@ -833,6 +870,14 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let shown = first_shown.filter(|_| !windows.is_empty());
             #[cfg(not(test))]
             drop(first_shown);
+            // The guest's Shared pool, its blocks the process's own memory until the device runs
+            // on metal2vulkan-rt, whose blocks then fill it through the same calls.
+            let pool = match pool_host {
+                Some((range, host)) => Some(Pool::new(range, host, |mappings| {
+                    Arc::new(HostBlocks::new(mappings))
+                })?),
+                None => None,
+            };
             let device = reims_vgpu_graphics::Device::with_screens(region, host, screens)
                 .ok_or(Error::HostResources)?;
             desktop.set_windows(by_display);
@@ -848,9 +893,45 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 #[cfg(test)]
                 shown,
                 reads,
+                pool,
                 platform: PhantomData,
             })
         })
+    }
+
+    /// The host mapped the pool's piece at `physical_address` it was asked to add
+    /// ([`GraphicsCallbacks::pool_add`]): the guest's address space has it from now on. Any
+    /// thread, the host's lock held or not; waits for nothing and calls back never.
+    /// [`Error::InvalidArgument`] without a pool, or for an address the device asked no add at,
+    /// or one the host said it added already.
+    pub fn pool_added(&self, physical_address: u64) -> Result<(), Error> {
+        (self.pool.as_ref())
+            .ok_or(Error::InvalidArgument)?
+            .added(physical_address)
+    }
+
+    /// The host took the pool's piece at `physical_address` out of the guest's address space,
+    /// and no thread of its own touches it: asked to ([`GraphicsCallbacks::pool_remove`]), or of
+    /// its own, as it does with every piece before the device's release. Any thread, the host's
+    /// lock held or not; waits for nothing and calls back never. [`Error::InvalidArgument`]
+    /// without a pool, or for an address the device asked no add at.
+    pub fn pool_removed(&self, physical_address: u64) -> Result<(), Error> {
+        (self.pool.as_ref())
+            .ok_or(Error::InvalidArgument)?
+            .removed(physical_address)
+    }
+
+    /// Asks for at least `length` more bytes of the guest's Shared pool now, as the guest's own
+    /// ask does: the pool's thread takes a block and asks the host to map it
+    /// ([`GraphicsCallbacks::pool_add`]). Waits for nothing and calls back never.
+    /// [`Error::InvalidArgument`] without a pool, or for a `length` of 0.
+    pub fn pool_grow(&self, length: u64) -> Result<(), Error> {
+        let pool = self.pool.as_ref().ok_or(Error::InvalidArgument)?;
+        if length == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        pool.grow(length);
+        Ok(())
     }
 
     /// The region's first byte: BAR 2's memory, which the host maps into the guest, write-back.
@@ -1013,6 +1094,9 @@ impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
         entry::run(|_| {
             drop(std::mem::take(&mut self.windows));
         });
+        // The host removed every piece of the pool before the release: the pool's thread ends
+        // and its source goes, unmapping each block it handed out before it frees it.
+        drop(self.pool.take());
         let ending: Weak<dyn std::any::Any + Send + Sync> = self.ending.clone();
         let mut ended = ENDING.lock();
         ended.retain(|state| state.strong_count() > 0);
