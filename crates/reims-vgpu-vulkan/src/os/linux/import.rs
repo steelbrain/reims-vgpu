@@ -1257,7 +1257,13 @@ unsafe fn host_memory_noting(
                 "{length:#x} bytes at {first:#x} as the piece at {:#x} of their view's dma-buf",
                 chunk.offset
             );
-            traced.answer(Kind::View, first, length, Some((&chunk.file, chunk.offset)), 1);
+            traced.answer(
+                Kind::View,
+                first,
+                length,
+                Some((&chunk.file, chunk.offset)),
+                1,
+            );
             let mut held = views.lock();
             if !held.iter().any(|h| Arc::ptr_eq(h, &chunk.file)) {
                 held.push(Arc::clone(&chunk.file));
