@@ -99,8 +99,10 @@
 #              to set accessibility matrix" line (ReimsGraphics' colour filter, its set_parameter).
 #   icc        WindowServer's ICC chain took (ReimsGraphics' set_block, RgfxMobileICC.hpp): this
 #              boot's log has no "Failed to set ICC curve" line and at most one "Failed to set ICC
-#              matrix" line, the cursor's layer 1, whose standard-sRGB source the display's blend
-#              space does not invert.
+#              matrix" line, a layer's XYZ2Blend that came a swap before its Src2XYZ (measured on
+#              14.6.1's login and 27.2.1's FileVault unlock, not at every boot). The cursor's
+#              layer 1 logs none where the host converts the cursor (CURSOR_COLOR); a host
+#              without it has the display refuse the cursor's matrix, one line a login.
 #   amfi-refuse
 #              AMFI refuses a signature it rejects, through RgfxGate's signature hook, with the
 #              guest up: a copy of /usr/bin/true signed ad hoc with com.apple.rootless.install, an

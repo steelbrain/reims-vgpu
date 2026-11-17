@@ -437,21 +437,26 @@ Stages:
       (three at login, and one after each switch of the display's profile
       to Generic RGB, to Display P3 and back), layer 0's half and the
       display's half are each the identity: WindowServer composites in the
-      profile's own space. The display applies no chain. It takes a block
-      only where the chain the block leaves is the identity, and so is what
-      the display shows. The halves are judged as pairs, because
+      profile's own space. The display applies no chain to layer 0 or the
+      display's half. It takes a block there only where the chain the block
+      leaves is the identity, and so is what the display shows. The halves
+      are judged as pairs, because
       WindowServer sends each half's first block before its second: the
       first is held, and the second is taken where it inverts the first
       (matrices' product, and curves' composition at 1025 inputs, within
-      2^-14). It refuses the rest, as the class does: user gamma (the
-      curves CG's transfer formulas and tables set), the cursor's
-      layer 1, whose standard-sRGB source the display's blend space does
-      not invert (0.0024 off at login, from the published white, and 0.25
-      to 0.35 after a switch to Generic RGB or Display P3), and what it
-      cannot read (RgfxMobileICC.hpp). So a login logs one "Failed to set
-      ICC matrix", the cursor's, where it logged 32 lines before, and the
-      host's colour stages stay off: the accessibility matrix stays alone in
-      the matrix stage.
+      2^-14). The cursor's layer 1 is the exception: its standard-sRGB
+      source is not what the display's blend space inverts (0.0024 off at
+      login, from the published white, and 0.25 to 0.35 after a switch to
+      Generic RGB or Display P3, whose curve differs from sRGB's too), so
+      where the host took `CURSOR_COLOR` the display takes each block of
+      layer 1's chain it reads, and the host converts the cursor's image
+      through it ("The cursor's colour"); where it did not, layer 1 is
+      judged as the others are. It refuses the rest, as the class does:
+      user gamma (the curves CG's transfer formulas and tables set), and
+      what it cannot read (RgfxMobileICC.hpp). So a login logs no "Failed
+      to set ICC" line where it logged 32 before (one, the cursor's matrix,
+      on a host without `CURSOR_COLOR`), and the host's colour stages stay
+      off: the accessibility matrix stays alone in the matrix stage.
 14. **IOSurfaces follow the discrete model.** IOSurface.kext allocates
     surfaces in guest RAM, CAMetalLayer drawables and window backing stores
     included. The accelerator gets a per-surface device cache with a sync

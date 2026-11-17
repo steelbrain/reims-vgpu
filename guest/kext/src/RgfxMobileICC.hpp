@@ -56,10 +56,17 @@
 // published primaries and white, 0.0024 off sRGB's product at login), and another profile's after a
 // switch (0.25 to 0.35 off).
 //
-// What the display does: it applies no chain. The host shows layer 0's surface as it is, and the
-// cursor outside the colour stages. So it takes a block only where the chain it leaves is the
-// identity, which is then what the display shows, and refuses the rest kIOReturnUnsupported, as
-// the class does (rgfxICCTake):
+// What the display does: it applies no chain to layer 0 or to the display's half. The host shows
+// layer 0's surface as it is, so the display takes a block there only where the chain it leaves is
+// the identity, which is then what the display shows, and refuses the rest kIOReturnUnsupported, as
+// the class does (rgfxICCTake). The cursor's layer, 1, is the exception where the host took
+// RGFX_FEATURE_CURSOR_COLOR (RgfxICCCursor below): the host converts the cursor's image through
+// the layer's chain, so each of its four colour-space blocks the display can read is taken and
+// kept, and the chain goes to the host (CURSOR_COLOR, rgfxICCCursorColor) at the next swap. Where
+// the host did not take it, layer 1 is judged as the others are. The rules:
+// - layer 1's Src2XYZ curve and matrix and XYZ2Blend matrix and curve, where the host converts
+//   the cursor, are taken where the display reads them, whatever they hold, and a Src2XYZ block it
+//   cannot read is refused and drops its stage from the chain the host is sent;
 // - a pair's first block (Src2XYZ, Blend2XYZ) is held, and taken;
 // - its second (a layer's XYZ2Blend, the display's XYZ2Device) is taken where it inverts what is
 //   held: the matrices' product within kRgfxICCTolerance of the identity, entry by entry, and the
@@ -84,12 +91,14 @@
 // The tolerance, 2^-14, is above the floats' rounding in what WindowServer sends (2.2e-5 at most,
 // measured) and a sixteenth of an 8-bit step.
 //
-// Our own code; it depends on nothing but <stddef.h> and <stdint.h>.
+// Our own code; it depends on nothing but <stddef.h>, <stdint.h> and the wire header.
 #ifndef RGFX_MOBILE_ICC_HPP_
 #define RGFX_MOBILE_ICC_HPP_
 
 #include <stddef.h>
 #include <stdint.h>
+
+#include "reims_graphics_wire.h"
 
 // The matrix block's size, on every release measured.
 constexpr uint32_t kRgfxICCMatrixBlockSize = 0x40;
@@ -205,6 +214,10 @@ inline bool rgfxICCMatrixLocation(const RgfxICCRelease &release, uint64_t locati
 
 // The layers whose pairs the display keeps (WindowServer sets 0 to 2: 27.0.1).
 constexpr uint32_t kRgfxICCLayers = 4;
+
+// The cursor's layer: WindowServer gives its cursor as each swap's layer 1 (RgfxMobileCursor.hpp),
+// the display's CursorPlane.
+constexpr uint32_t kRgfxICCCursorLayer = 1;
 
 // One, in Q32.
 constexpr int64_t kRgfxQ32One = int64_t(1) << 32;
@@ -482,14 +495,139 @@ struct RgfxICCPair {
 	RgfxICCCurve curve[3];
 };
 
+// The cursor layer's chain as WindowServer set it, for the host, which converts the cursor's
+// image through it (CURSOR_COLOR): each stage the display holds, its values as the block carried
+// them (the floats as bits, for the host) and as the display reads them (Q32, to judge the
+// identity). `host` says the host took RGFX_FEATURE_CURSOR_COLOR; `changes` counts the changes to
+// the chain, and `posted` the count the last CURSOR_COLOR the host was sent carried.
+struct RgfxICCCursor {
+	bool host;
+	uint32_t changes;
+	uint32_t posted;
+	bool toXYZHeld;
+	bool fromXYZHeld;
+	bool sourceHeld[3];
+	bool blendHeld[3];
+	uint32_t toXYZ[9];
+	uint32_t fromXYZ[9];
+	RgfxCursorCurve source[3];
+	RgfxCursorCurve blend[3];
+	RgfxICCMatrix toXYZQ;
+	RgfxICCMatrix fromXYZQ;
+	RgfxICCCurve sourceQ[3];
+	RgfxICCCurve blendQ[3];
+};
+
 // A display's pairs: each layer's (Src2XYZ, XYZ2Blend) and the display's (Blend2XYZ,
-// XYZ2Device), and its release's numbering (rgfxICCReleaseOf). Zeroed, it holds nothing and
-// takes nothing.
+// XYZ2Device), its release's numbering (rgfxICCReleaseOf), and the cursor layer's chain. Zeroed,
+// it holds nothing and takes nothing.
 struct RgfxICCState {
 	RgfxICCPair layer[kRgfxICCLayers];
 	RgfxICCPair display;
 	RgfxICCRelease release;
+	RgfxICCCursor cursor;
 };
+
+// Records a matrix block of the cursor's chain into `bits` and `q`, from its data as
+// rgfxICCParseMatrix read it into `m`.
+inline void rgfxICCCursorMatrix(uint32_t bits[9], RgfxICCMatrix *q, const uint8_t *data,
+                                const RgfxICCMatrix &m)
+{
+	for (uint32_t i = 0; i < 9; i++)
+		bits[i] = rgfxICCWord(data, 0x10 + 4 * i);
+	*q = m;
+}
+
+// Records a curve block of the cursor's chain, for the channels of `mask`, into `wire` and `q`
+// and their `held`, from its data as rgfxICCParseCurve read it into `c`; a Bypass carries no
+// parameters.
+inline void rgfxICCCursorCurve(RgfxCursorCurve wire[3], RgfxICCCurve q[3], bool held[3],
+                               uint32_t mask, const uint8_t *data, const RgfxICCCurve &c)
+{
+	for (uint32_t ch = 0; ch < 3; ch++) {
+		if (!(mask & (1u << ch)))
+			continue;
+		wire[ch].form = c.type;
+		for (uint32_t i = 0; i < 7; i++)
+			wire[ch].params[i] =
+			    c.type == kRgfxICCCurveBypass ? 0 : rgfxICCWord(data, 0x0c + 4 * i);
+		q[ch] = c;
+		held[ch] = true;
+	}
+}
+
+// Whether the cursor's chain has a change the host was not sent; read with no lock held, as each
+// swap asks before it takes the lock (rgfxICCCursorColor).
+inline bool rgfxICCCursorDue(const RgfxICCState *state)
+{
+	const RgfxICCCursor &c = state->cursor;
+	return c.host && __atomic_load_n(&c.changes, __ATOMIC_RELAXED) !=
+	                     __atomic_load_n(&c.posted, __ATOMIC_RELAXED);
+}
+
+// Whether the chain the cursor holds is whole and, within kRgfxICCTolerance, the identity: the
+// matrices' product, entry by entry, and each channel's curves' composition at kRgfxICCSamples + 1
+// inputs, a channel whose curves are another's checked once.
+inline bool rgfxICCCursorIsIdentity(const RgfxICCCursor &c)
+{
+	if (!rgfxICCMatrixIsIdentity(rgfxICCMatrixMul(c.fromXYZQ, c.toXYZQ)))
+		return false;
+	for (uint32_t ch = 0; ch < 3; ch++) {
+		bool same = false;
+		for (uint32_t before = 0; before < ch && !same; before++) {
+			same = c.sourceQ[before].type == c.sourceQ[ch].type &&
+			       c.blendQ[before].type == c.blendQ[ch].type;
+			for (uint32_t i = 0; same && i < 7; i++)
+				same = c.sourceQ[before].p[i] == c.sourceQ[ch].p[i] &&
+				       c.blendQ[before].p[i] == c.blendQ[ch].p[i];
+		}
+		if (!same && !rgfxICCCurvesAreIdentity(c.sourceQ[ch], &c.blendQ[ch]))
+			return false;
+	}
+	return true;
+}
+
+// The CURSOR_COLOR the cursor's chain asks for, but its header and display, into `*message`, and
+// the count of changes it carries into `*changes`, where the chain changed since the host was last
+// sent one: `on` where every stage of the chain is held and the chain is not the identity within
+// kRgfxICCTolerance, so an identity costs the host nothing, and the cursor shows as it is until
+// the chain is whole (no Src2XYZ is set for layer 1 before the cursor's first image: 27.0.1).
+// False where nothing is due. rgfxICCCursorPosted records the post once it went out.
+inline bool rgfxICCCursorColor(RgfxICCState *state, RgfxCursorColor *message, uint32_t *changes)
+{
+	if (!rgfxICCCursorDue(state))
+		return false;
+	const RgfxICCCursor &c = state->cursor;
+	*message = RgfxCursorColor{};
+	*changes = c.changes;
+	bool whole = c.toXYZHeld && c.fromXYZHeld;
+	for (uint32_t ch = 0; ch < 3; ch++)
+		whole = whole && c.sourceHeld[ch] && c.blendHeld[ch];
+	if (!whole || rgfxICCCursorIsIdentity(c))
+		return true;
+	message->on = 1;
+	for (uint32_t ch = 0; ch < 3; ch++) {
+		message->source_curves[ch] = c.source[ch];
+		message->blend_curves[ch] = c.blend[ch];
+	}
+	for (uint32_t i = 0; i < 9; i++) {
+		message->to_xyz[i] = c.toXYZ[i];
+		message->from_xyz[i] = c.fromXYZ[i];
+	}
+	return true;
+}
+
+// Records that the CURSOR_COLOR of `changes` changes went out to the host.
+inline void rgfxICCCursorPosted(RgfxICCState *state, uint32_t changes)
+{
+	__atomic_store_n(&state->cursor.posted, changes, __ATOMIC_RELAXED);
+}
+
+// Counts a change to the cursor's chain.
+inline void rgfxICCCursorChanged(RgfxICCCursor *c)
+{
+	__atomic_store_n(&c->changes, c->changes + 1, __ATOMIC_RELAXED);
+}
 
 // A pair's second matrix: taken where it inverts the first held, or nothing is held.
 inline bool rgfxICCSecondMatrix(const RgfxICCPair &pair, const RgfxICCMatrix &second)
@@ -585,10 +723,43 @@ inline bool rgfxICCTake(RgfxICCState *state, uint32_t type, uint32_t offset,
 						first->curve[ch] = c;
 				}
 		}
+		// The cursor's source, kept for the host where it converts the cursor; one the display
+		// cannot read leaves its stage out of the chain.
+		RgfxICCCursor &cursor = state->cursor;
+		if (cursor.host && first == &state->layer[kRgfxICCCursorLayer]) {
+			if (isMatrix) {
+				cursor.toXYZHeld = read;
+				if (read)
+					rgfxICCCursorMatrix(cursor.toXYZ, &cursor.toXYZQ, data, m);
+			} else if (read) {
+				rgfxICCCursorCurve(cursor.source, cursor.sourceQ, cursor.sourceHeld, mask, data, c);
+			} else {
+				for (uint32_t ch = 0; ch < 3; ch++)
+					if (channels & (1u << ch))
+						cursor.sourceHeld[ch] = false;
+			}
+			rgfxICCCursorChanged(&cursor);
+		}
 		return read;
 	}
 	if (!read)
 		return false;
+	// The cursor's blend space, kept for the host where it converts the cursor: taken, whatever it
+	// holds.
+	RgfxICCCursor &cursor = state->cursor;
+	if (cursor.host && layer == kRgfxICCCursorLayer) {
+		if (isMatrix && location == kRgfxICCMatrixXYZ2Blend) {
+			cursor.fromXYZHeld = true;
+			rgfxICCCursorMatrix(cursor.fromXYZ, &cursor.fromXYZQ, data, m);
+			rgfxICCCursorChanged(&cursor);
+			return true;
+		}
+		if (!isMatrix && location == kRgfxICCCurveXYZ2Blend) {
+			rgfxICCCursorCurve(cursor.blend, cursor.blendQ, cursor.blendHeld, mask, data, c);
+			rgfxICCCursorChanged(&cursor);
+			return true;
+		}
+	}
 	if (isMatrix) {
 		switch (location) {
 		case kRgfxICCMatrixXYZ2Blend:

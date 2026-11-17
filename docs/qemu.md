@@ -2060,8 +2060,10 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   is printed under the verdict as a `check-boot: finding:` line, not a
   failure. `ax-matrix`: the boot's log has no `not able to set accessibility
   matrix` line from WindowServer. `icc`: the boot's log has no `Failed to
-  set ICC curve` line and at most one `Failed to set ICC matrix`, the
-  cursor's layer 1 (ReimsGraphics' `set_block`, RgfxMobileICC.hpp); the
+  set ICC curve` line and at most one `Failed to set ICC matrix`, a layer's
+  `XYZ2Blend` that came a swap before its `Src2XYZ` (14.6.1's login, not at
+  every boot; ReimsGraphics' `set_block`, RgfxMobileICC.hpp). The cursor's
+  layer 1 logs none where the host converts the cursor (`CURSOR_COLOR`); the
   read counts only where the log printed its header. `amfi-refuse`: last of the guest's checks,
   a copy of `/usr/bin/true` signed ad hoc with `com.apple.rootless.install`
   is killed by AMFI (exit 137), its refusal passing through RgfxGate's

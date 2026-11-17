@@ -1668,6 +1668,7 @@ bool ReimsGraphics::start(IOService *provider)
 	multiDisplayTaken = false;
 	pointerMotionTaken = false;
 #if defined(__arm64e__)
+	cursorColorTaken = false;
 	vtMessagesTaken = false;
 	vtService = nullptr;
 	vtConsumed = 0;
@@ -1850,6 +1851,7 @@ bool ReimsGraphics::start(IOService *provider)
 		pointerMotionTaken = (took & RGFX_FEATURE_POINTER_MOTION) != 0;
 #if defined(__arm64e__)
 		vtMessagesTaken = (took & RGFX_FEATURE_VT_MESSAGES) != 0;
+		cursorColorTaken = (took & RGFX_FEATURE_CURSOR_COLOR) != 0;
 #endif
 		constexpr uint64_t kCarriesPast = RGFX_FEATURE_MULTI_DISPLAY | RGFX_FEATURE_POINTER_OVER |
 		                                  RGFX_FEATURE_DISPLAY_BOUNDS;
@@ -2283,6 +2285,9 @@ bool ReimsGraphics::startHead(IOService *provider)
 	regionSize = device->regionSize;
 	cursorPixels = device->cursorPixels;
 	displayColorTaken = device->displayColorTaken;
+#if defined(__arm64e__)
+	cursorColorTaken = device->cursorColorTaken;
+#endif
 	displayScaleTaken = device->displayScaleTaken;
 	displayPowerTaken = device->displayPowerTaken;
 	assignedLength = device->assignedLength;

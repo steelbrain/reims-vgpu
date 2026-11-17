@@ -619,6 +619,11 @@ private:
 	bool submitRoom;
 	// The host took DISPLAY_COLOR (displayColor), set before `ready`.
 	bool displayColorTaken;
+#if defined(__arm64e__)
+	// The host took CURSOR_COLOR: it converts the cursor's image through the cursor layer's ICC
+	// chain, which set_block then takes (RgfxMobileICC.hpp); set before `ready`.
+	bool cursorColorTaken;
+#endif
 	// The host took DISPLAY_SCALE: its DISPLAYS answers carry each display's scale
 	// (parseDisplays), set before `ready`.
 	bool displayScaleTaken;
@@ -882,6 +887,7 @@ private:
 	bool showMobileCursor(OSObject *surface, int32_t x, int32_t y);
 	IOReturn setMobileCursorImage(OSObject *surface, const RgfxMobileCursorImage &image);
 	bool postMobileCursorMove(int32_t x, int32_t y, bool visible);
+	void postMobileCursorColor();
 	RgfxMobileCursor mobileCursor;
 	// A change of the device's modes for the display (parseDisplays), taken to the processes as
 	// the paravirtual display takes its host's (mobileDisplayChanged): set where the last list

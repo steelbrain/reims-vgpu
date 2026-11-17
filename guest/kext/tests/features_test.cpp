@@ -103,8 +103,12 @@ constexpr uint64_t kUploadsWritten = RGFX_FEATURE_UPLOADS_WRITTEN;
 // VideoToolbox ring, and the x86-64 kext does not.
 constexpr uint64_t kVtRing = RGFX_FEATURE_VT_RING;
 constexpr uint64_t kVtRingCarried = RGFX_GUEST_ARM64 ? kVtRing : 0;
+// CURSOR_COLOR, which the arm64e kext carries, posting the cursor layer's ICC chain, and the
+// x86-64 kext does not.
+constexpr uint64_t kCursorColor = RGFX_FEATURE_CURSOR_COLOR;
+constexpr uint64_t kCursorColorCarried = RGFX_GUEST_ARM64 ? kCursorColor : 0;
 // A bit the wire does not name.
-constexpr uint64_t kUnnamed = 1ull << 55;
+constexpr uint64_t kUnnamed = 1ull << 56;
 // Every bit the wire names from bit 3 that the kext does not carry out yet.
 constexpr uint64_t kNotCarried = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CONSUMED_DOORBELL |
                                  RGFX_FEATURE_QUEUE_BARRIER | RGFX_FEATURE_CB_PARTS |
@@ -114,7 +118,8 @@ constexpr uint64_t kNotCarried = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CON
                                  (kPointerOver & ~kPointerOverCarried) |
                                  (kDisplayBounds & ~kDisplayBoundsCarried) |
                                  (kVtMessages & ~kVtMessagesCarried) |
-                                 (kVtRing & ~kVtRingCarried);
+                                 (kVtRing & ~kVtRingCarried) |
+                                 (kCursorColor & ~kCursorColorCarried);
 // The ones it does: the bundle lays no-copy buffers over pages blocks the kext makes, orders its
 // command buffers over IOSurfaces and places its Managed buffers' CPU copies in its heaps, neither
 // of which needs anything of the kext, makes indirect command buffers, whose creates and writes,
@@ -190,7 +195,7 @@ constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kH
                               kDoorbellPages | kPipelineAnswers | kDisplayPowerCarried |
                               kMultiDisplayCarried | kPointerOverCarried | kDisplayBoundsCarried |
                               kPointerMotion | k16KCarried | kVtMessagesCarried | kUploadsWritten |
-                              kVtRingCarried;
+                              kVtRingCarried | kCursorColorCarried;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -207,7 +212,7 @@ int main()
 	// ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, DOORBELL_PAGES,
 	// PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, DISPLAY_BOUNDS,
 	// UPLOADS_WRITTEN and, the x86-64 kext, DISPLAY_POWER, or, the arm64e kext, PAGES_16K,
-	// VT_MESSAGES and VT_RING, and writes each only where offered.
+	// VT_MESSAGES, VT_RING and CURSOR_COLOR, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
 	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
@@ -218,7 +223,7 @@ int main()
 	      "PIPELINE_KEYS, ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, "
 	      "DOORBELL_PAGES, PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, "
 	      "DISPLAY_BOUNDS, UPLOADS_WRITTEN and, on x86-64, DISPLAY_POWER, on arm64e PAGES_16K, "
-	      "VT_MESSAGES and VT_RING, from bit 3");
+	      "VT_MESSAGES, VT_RING and CURSOR_COLOR, from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -480,6 +485,10 @@ int main()
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kVtMessages | kVtRing) ==
 	          (kVtMessagesCarried | kVtRingCarried),
 	      "VT_MESSAGES and VT_RING offered, both written by the arm64e kext alone");
+	check(RGFX_FEATURE_CURSOR_COLOR == (1ull << 55), "CURSOR_COLOR is bit 55");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kCursorColor) ==
+	          kCursorColorCarried,
+	      "CURSOR_COLOR offered, written by the arm64e kext alone");
 	// PAGES_16K: the arm64e kext writes it first where offered, and then with the rest; the
 	// x86-64 kext never writes it, and writes nothing first.
 	check(rgfxDriverFeaturesFirst(~0ull) == k16KCarried, "PAGES_16K first where carried");

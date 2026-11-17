@@ -823,6 +823,141 @@ void releases()
 	      "a state with no numbering takes nothing", "releases");
 }
 
+// The CURSOR_COLOR the cursor's chain asks for, where one is due; checks it carries `toXYZ`,
+// `fromXYZ` and the curves as the blocks did, where `on`.
+bool cursorPost(RgfxCursorColor *c)
+{
+	uint32_t changes = 0;
+	if (!rgfxICCCursorColor(&state, c, &changes))
+		return false;
+	check(changes == state.cursor.changes, "it carries the count of changes", "cursor post");
+	rgfxICCCursorPosted(&state, changes);
+	check(!rgfxICCCursorDue(&state), "once posted, nothing is due", "cursor post");
+	return true;
+}
+
+void checkCurves(const RgfxCursorCurve curves[3], uint32_t type, const float p[7], const char *about)
+{
+	for (int ch = 0; ch < 3; ch++) {
+		check(curves[ch].form == type, "a channel's curve carries the block's type", about);
+		for (int i = 0; i < 7; i++)
+			check(curves[ch].params[i] == (type == kRgfxICCCurveBypass ? 0 : bitsOf(p[i])),
+			      "and its parameters' bits", about);
+	}
+}
+
+void checkMatrix(const uint32_t m[9], const float want[9], const char *about)
+{
+	for (int i = 0; i < 9; i++)
+		check(m[i] == bitsOf(want[i]), "a matrix carries the block's floats' bits", about);
+}
+
+// Where the host converts the cursor (it took CURSOR_COLOR), each block of layer 1's chain the
+// display reads is taken, whatever it holds, and the chain goes to the host whole: off until the
+// cursor's first image completes it, on with the blocks' values after it and after each profile
+// switch, nothing again until it changes, and off where it is the identity within the guest's
+// precision. Layer 0's and the display's halves are judged as before, and so is layer 1 where
+// the host did not take CURSOR_COLOR (bursts).
+void cursorChain()
+{
+	fresh(27, "cursor");
+	state.cursor.host = true;
+	const bool all[3] = {true, true, true};
+	RgfxCursorColor c{};
+	check(!cursorPost(&c), "nothing is due before a block", "cursor");
+	// The login's first burst: layers 1 and 2 get their XYZ2Blend halves alone.
+	swapId = 1;
+	displayHalf(kDisplayP3, kDisplayP3Inverse, kRgfxICCCurveType3, kSRGBDecode,
+	            kRgfxICCCurveType4, kSRGBEncode, true, "cursor start");
+	layerHalf(0, kDisplayP3, kRgfxICCCurveType3, kSRGBDecode, kDisplayP3Inverse,
+	          kRgfxICCCurveType4, kSRGBEncode, all, all, "cursor start");
+	check(cursorPost(&c) && c.on == 0, "half a chain is posted off", "cursor start");
+	// The display's own profile.
+	swapId = 0x4b;
+	displayHalf(kPublished, kPublishedInverse, kRgfxICCCurveType3, kSRGBDecode,
+	            kRgfxICCCurveType4, kSRGBEncode, true, "cursor own");
+	layerHalf(0, kPublished, kRgfxICCCurveType3, kSRGBDecode, kPublishedInverse,
+	          kRgfxICCCurveType4, kSRGBEncode, all, all, "cursor own");
+	check(cursorPost(&c) && c.on == 0, "still half a chain", "cursor own");
+	// The cursor's first image: its standard sRGB source, 0.0024 off the blend space's inverse, is
+	// taken now, and the chain goes to the host on.
+	swapId = 0x8c;
+	layerHalf(1, kSRGB, kRgfxICCCurveType3, kSRGBDecode, kPublishedInverse, kRgfxICCCurveType4,
+	          kSRGBEncode, all, all, "cursor image");
+	check(cursorPost(&c) && c.on == 1, "the whole chain is posted on", "cursor image");
+	checkCurves(c.source_curves, kRgfxICCCurveType3, kSRGBDecode, "cursor image");
+	checkMatrix(c.to_xyz, kSRGB, "cursor image");
+	checkMatrix(c.from_xyz, kPublishedInverse, "cursor image");
+	checkCurves(c.blend_curves, kRgfxICCCurveType4, kSRGBEncode, "cursor image");
+	check(!cursorPost(&c), "nothing again until it changes", "cursor image");
+	// Generic RGB: layer 1 keeps its source, and its blend space's matrix and curve, Generic
+	// RGB's, which the source's do not invert, are taken.
+	swapId = 0xc5;
+	displayHalf(kGenericRGB, kGenericRGBInverse, kRgfxICCCurveType3, kGamma18,
+	            kRgfxICCCurveType3, kGamma18Inverse, true, "cursor Generic RGB");
+	layerHalf(0, kGenericRGB, kRgfxICCCurveType3, kGenericDecode, kGenericRGBInverse,
+	          kRgfxICCCurveType3, kGenericEncode, all, all, "cursor Generic RGB");
+	check(cursorPost(&c) && c.on == 1, "Generic RGB's chain is posted", "cursor Generic RGB");
+	checkCurves(c.source_curves, kRgfxICCCurveType3, kSRGBDecode, "cursor Generic RGB");
+	checkMatrix(c.to_xyz, kSRGB, "cursor Generic RGB");
+	checkMatrix(c.from_xyz, kGenericRGBInverse, "cursor Generic RGB");
+	checkCurves(c.blend_curves, kRgfxICCCurveType3, kGenericEncode, "cursor Generic RGB");
+	// Display P3.
+	swapId = 0xc8;
+	displayHalf(kDisplayP3, kDisplayP3Inverse, kRgfxICCCurveType3, kSRGBDecode,
+	            kRgfxICCCurveType4, kSRGBEncode, true, "cursor P3");
+	layerHalf(0, kDisplayP3, kRgfxICCCurveType3, kSRGBDecode, kDisplayP3Inverse,
+	          kRgfxICCCurveType4, kSRGBEncode, all, all, "cursor P3");
+	check(cursorPost(&c) && c.on == 1, "Display P3's chain is posted", "cursor P3");
+	checkMatrix(c.from_xyz, kDisplayP3Inverse, "cursor P3");
+	checkCurves(c.blend_curves, kRgfxICCCurveType4, kSRGBEncode, "cursor P3");
+	// A source the blend space inverts: the chain is the identity, posted off.
+	check(curve(kRgfxICCCurveSrc2XYZ, 7, 1, kRgfxICCCurveType3, kSRGBDecode) &&
+	          matrix(kRgfxICCMatrixSrc2XYZ, 1, kDisplayP3),
+	      "a Display P3 source is taken", "cursor identity");
+	check(cursorPost(&c) && c.on == 0, "an identity chain is posted off", "cursor identity");
+	// Channel by channel: green's blend curve alone changes, and the chain is on again.
+	check(curve(kRgfxICCCurveXYZ2Blend, 2, 1, kRgfxICCCurveType3, kGamma18Inverse),
+	      "a curve of green alone is taken", "cursor channels");
+	check(cursorPost(&c) && c.on == 1, "the chain is posted on", "cursor channels");
+	check(c.blend_curves[0].form == kRgfxICCCurveType4 &&
+	          c.blend_curves[1].form == kRgfxICCCurveType3 &&
+	          c.blend_curves[2].form == kRgfxICCCurveType4,
+	      "with green's curve its own", "cursor channels");
+	// A source the display cannot read leaves the chain without it: off.
+	float nan[9];
+	std::memcpy(nan, kSRGB, sizeof(nan));
+	nan[4] = NAN;
+	check(!matrix(kRgfxICCMatrixSrc2XYZ, 1, nan), "a NaN source matrix is refused",
+	      "cursor unread");
+	check(cursorPost(&c) && c.on == 0, "the chain without it is posted off", "cursor unread");
+	check(!curve(kRgfxICCCurveXYZ2Blend, 7, 1, 7, kZeros), "a PQ blend curve is refused",
+	      "cursor unread");
+	check(!rgfxICCCursorDue(&state), "and changes nothing", "cursor unread");
+	check(matrix(kRgfxICCMatrixSrc2XYZ, 1, kSRGB), "a readable source is taken again",
+	      "cursor unread");
+	check(cursorPost(&c) && c.on == 1, "and the chain is on again", "cursor unread");
+	// Other layers are judged as before: layer 2's XYZ2Blend against its own source.
+	check(matrix(kRgfxICCMatrixSrc2XYZ, 2, kSRGB) &&
+	          !matrix(kRgfxICCMatrixXYZ2Blend, 2, kDisplayP3Inverse),
+	      "layer 2's half is still judged", "cursor others");
+	// A post that did not go out leaves the chain due.
+	check(matrix(kRgfxICCMatrixXYZ2Blend, 1, kPublishedInverse), "a new blend matrix", "cursor due");
+	uint32_t changes = 0;
+	check(rgfxICCCursorColor(&state, &c, &changes) && rgfxICCCursorDue(&state),
+	      "built but not posted, it stays due", "cursor due");
+	check(matrix(kRgfxICCMatrixXYZ2Blend, 1, kDisplayP3Inverse), "another, meanwhile",
+	      "cursor due");
+	rgfxICCCursorPosted(&state, changes);
+	check(rgfxICCCursorDue(&state), "a change after the one posted stays due", "cursor due");
+	// A host that did not take CURSOR_COLOR is never sent the chain.
+	fresh(27, "cursor no host");
+	const bool judged[3] = {true, false, true};
+	layerHalf(1, kSRGB, kRgfxICCCurveType3, kSRGBDecode, kPublishedInverse, kRgfxICCCurveType4,
+	          kSRGBEncode, judged, all, "cursor no host");
+	check(!rgfxICCCursorDue(&state) && !cursorPost(&c), "nothing is due", "cursor no host");
+}
+
 std::string readFile(const char *path)
 {
 	std::ifstream in(path);
@@ -852,6 +987,26 @@ void source()
 	check(src.find("rgfxICCReleaseOf(version_major, &iccRelease)") != std::string::npos &&
 	          src.find("mobileICC->release = iccRelease;") != std::string::npos,
 	      "the display takes its release's block types by the kernel's major version", "source");
+	check(src.find("mobileICC->cursor.host = cursorColorTaken;") != std::string::npos,
+	      "the cursor's chain is the host's where it took CURSOR_COLOR", "source");
+	// Each swap posts the cursor's chain where it changed, before its cursor's image.
+	const size_t swaps = src.find("void ReimsGraphics::beginMobileSwaps()");
+	const size_t swapsEnd = src.find("\n}\n", swaps);
+	check(swaps != std::string::npos && swapsEnd != std::string::npos, "the swaps begin", "source");
+	const std::string begin = src.substr(swaps, swapsEnd - swaps);
+	const size_t posted = begin.find("postMobileCursorColor();");
+	check(posted != std::string::npos && posted < begin.find("showMobileCursor("),
+	      "the chain is posted before the swap's cursor", "source");
+	const size_t post = src.find("void ReimsGraphics::postMobileCursorColor()");
+	const size_t postEnd = src.find("\n}\n", post);
+	check(post != std::string::npos && postEnd != std::string::npos, "the post is defined",
+	      "source");
+	const std::string postBody = src.substr(post, postEnd - post);
+	check(postBody.find("rgfxICCCursorColor(mobileICC, &c, &changes)") != std::string::npos &&
+	          postBody.find("tryPost(RGFX_CMD_CURSOR_COLOR, &c, sizeof(c), nullptr)") !=
+	              std::string::npos &&
+	          postBody.find("rgfxICCCursorPosted(mobileICC, changes)") > postBody.find("tryPost("),
+	      "it posts the chain without waiting, and records it once it went out", "source");
 }
 
 } // namespace
@@ -869,6 +1024,7 @@ int main()
 	releases();
 	pairs();
 	others();
+	cursorChain();
 	source();
 	std::printf("mobile_icc_test: %d checks passed\n", checks);
 	return 0;

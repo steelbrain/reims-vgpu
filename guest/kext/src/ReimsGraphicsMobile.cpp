@@ -39,7 +39,9 @@
  * WindowServer, which sets its accessibility matrix at each swap until the call succeeds, sets it
  * once: it answers 0 and the display shows the matrix (RgfxMobileColor.hpp). And it overrides
  * set_block, which the class answers kIOReturnUnsupported, to take the ICC blocks that leave the
- * display's colour chain the identity, the chain it shows (RgfxMobileICC.hpp).
+ * display's colour chain the identity, the chain it shows, and, where the host converts the
+ * cursor (CURSOR_COLOR), the cursor layer's chain, which the swaps post to the host
+ * (RgfxMobileICC.hpp).
  *
  * A process finds the display as IOMobileFramebuffer.framework counts displays: by a node of the
  * device tree (attachMobileNode), then the framebuffer's service and the properties it publishes
@@ -193,6 +195,7 @@ enum MobileCall : unsigned {
 	kSwapDropped,
 	kSwapCursor,
 	kCursorRefused,
+	kCursorColor,
 	kDisplayChanged,
 	kMobileCalls,
 };
@@ -240,6 +243,8 @@ bool ReimsGraphics::startMobile()
 		*mobileICC = RgfxICCState();
 		if (iccKnown)
 			mobileICC->release = iccRelease;
+		// The cursor layer's chain is the host's to apply where it took CURSOR_COLOR.
+		mobileICC->cursor.host = cursorColorTaken;
 		IOLockUnlock(mobileICCLock);
 	}
 	if (!iccKnown)
@@ -942,8 +947,10 @@ void ReimsGraphics::beginMobileSwaps()
 		// the gate. The present's seqno is written before the host can answer it. Layer 1, where
 		// the swap gives it, is the display's cursor; a layer-1 surface with no image is shown in
 		// place of layer 0's, as the paravirtual display's program_hardware_gated has it
-		// (RgfxMobileCursor.hpp).
+		// (RgfxMobileCursor.hpp). The cursor layer's colour chain, where it changed, goes to the
+		// host first, so the cursor's image is converted from this swap on.
 		OSObject *surface = static_cast<OSObject *>(queue.surface(swap, 0));
+		postMobileCursorColor();
 		if (queue.hasLayer(swap, 1)) {
 			OSObject *cursor = static_cast<OSObject *>(queue.surface(swap, 1));
 			int32_t x = 0, y = 0;
@@ -1069,6 +1076,33 @@ IOReturn ReimsGraphics::setMobileCursorImage(OSObject *surface, const RgfxMobile
 	const IOReturn r = command(RGFX_CMD_SET_CURSOR, &c, sizeof(c));
 	unlockCursorSlot();
 	return r;
+}
+
+// CURSOR_COLOR where the cursor layer's ICC chain changed since the host was last sent it
+// (RgfxMobileICC.hpp, rgfxICCCursorColor), in the class's gate, before the swap's cursor: the
+// host converts the cursor's image through it from then on, as a display engine latches a layer's
+// colour stages with the swap. Never waits: a post the ring has no room for is left, and the next
+// swap posts the chain again.
+void ReimsGraphics::postMobileCursorColor()
+{
+	if (!mobileICC || !mobileICCLock || !rgfxICCCursorDue(mobileICC))
+		return;
+	RgfxCursorColor c = {};
+	uint32_t changes = 0;
+	IOLockLock(mobileICCLock);
+	const bool due = rgfxICCCursorColor(mobileICC, &c, &changes);
+	IOLockUnlock(mobileICCLock);
+	if (!due)
+		return;
+	c.display = displayId;
+	if (!tryPost(RGFX_CMD_CURSOR_COLOR, &c, sizeof(c), nullptr))
+		return;
+	IOLockLock(mobileICCLock);
+	rgfxICCCursorPosted(mobileICC, changes);
+	IOLockUnlock(mobileICCLock);
+	if (logged(kCursorColor))
+		IOLog("ReimsGraphics: the cursor's colour chain (%u changes) posted: %s\n", changes,
+		      c.on ? "on" : "off");
 }
 
 // MOVE_CURSOR where the cursor's place or visibility changes: the hot spot at the swap's position
@@ -1496,7 +1530,9 @@ RgfxIOMFBWord ReimsGraphics::set_parameter(IOMFBParameterName name, const uint64
 
 // The ICC matrices and curves WindowServer sets by IOMobileFramebufferSetBlock (RgfxMobileICC.hpp):
 // a block that leaves the display's chain the identity, which is what the display shows, is
-// answered 0, and the rest kIOReturnUnsupported, as the class answers every block. Nothing is
+// answered 0, and so is a block of the cursor layer's chain the display reads where the host
+// converts the cursor; the rest kIOReturnUnsupported, as the class answers every block. The
+// cursor's chain goes to the host at the next swap (postMobileCursorColor); nothing else is
 // posted: the host's colour stages stay as they are. The user client calls it ungated, in
 // WindowServer's thread, as it calls swap_set_color_matrix (measured on 27.0.1); the pairs it
 // holds are the framebuffer's, under their lock, and a framebuffer without them refuses every
