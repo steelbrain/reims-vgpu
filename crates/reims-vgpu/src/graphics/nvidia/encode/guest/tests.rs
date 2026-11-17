@@ -378,11 +378,12 @@ fn access_unit(codec: Codec, record: Option<&[u8]>, sample: &[u8]) -> Vec<u8> {
 /// On the NVIDIA host, each guest encoder the arm answers, at each of its 8-bit profiles, at a
 /// constant QP: 12 frames of a 640x360 stream read from `420v` surfaces wider and taller than it,
 /// with a forced key frame (frame 5) and a key-frame interval of 8, a change of the QPs after
-/// the first frame and one of the profile taken and left out. Read by the CPU from the surfaces' host
-/// bytes, and copied by the GPU from a Shared buffer of the device's that holds them, every frame
-/// the GPU's way, they come out as the same samples byte for byte: one a frame, in order, at its
-/// times, sync samples at frames 0 and 5 alone, the record on the first alone. Each decodes back on
-/// NVDEC to a 640x360 picture whose luma is the frame's top left.
+/// the first frame, and one of the profile (to the next the encoder lists, HEVC's Main10 from
+/// Main) and one of the colour (to BT.2020's primaries) taken and left out. Read by the CPU from
+/// the surfaces' host bytes, and copied by the GPU from a Shared buffer of the device's that
+/// holds them, every frame the GPU's way, they come out as the same samples byte for byte: one a
+/// frame, in order, at its times, sync samples at frames 0 and 5 alone, the record on the first
+/// alone. Each decodes back on NVDEC to a 640x360 picture whose luma is the frame's top left.
 #[test]
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
 fn a_guest_encoders_frames_code_alike_from_the_cpu_and_the_gpu_and_decode_back() {
@@ -438,6 +439,12 @@ fn a_guest_encoders_frames_code_alike_from_the_cpu_and_the_gpu_and_decode_back()
                     .iter()
                     .find(|p| **p != profile)
                     .unwrap_or(&profile);
+                let mut tinted = sharper.clone();
+                tinted.settings.colour = Some(ColourDescription {
+                    primaries: 9,
+                    transfer: 1,
+                    matrix: 9,
+                });
                 let open = |filler| {
                     NvGuestEncoder::<VulkanPlatform>::new(&video.gpu, &config, filler)
                         .expect("a guest encoder")
@@ -482,6 +489,9 @@ fn a_guest_encoders_frames_code_alike_from_the_cpu_and_the_gpu_and_decode_back()
                         for guest in [&mut by_cpu, &mut by_gpu] {
                             guest.reconfigure(&sharper).expect("a change of the QPs");
                             guest.reconfigure(&other).expect("a change of the profile");
+                            guest
+                                .reconfigure(&tinted)
+                                .expect("a change of the primaries");
                         }
                     }
                     sources.push(memory);

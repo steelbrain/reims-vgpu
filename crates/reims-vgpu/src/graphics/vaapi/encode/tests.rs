@@ -756,7 +756,8 @@ fn guest_surface(index: usize) -> (SurfaceLayout, HostSurface) {
 /// frames read from a guest surface wider and taller than the 64x48 stream come out as 8
 /// samples, the first a sync sample with the configuration record, and the driver's own decoder
 /// decodes each to a 64x48 picture; a reconfigure of the bitrate is taken after a frame, and one
-/// of the profile is taken and left out, every configuration record the first's.
+/// of the profile (to the last, Main10 where the driver writes it) and one of the colour (to
+/// BT.2020's primaries) are taken and left out, every configuration record the first's.
 #[test]
 #[ignore = "needs a VA-API GPU: run on the VA-API host"]
 fn a_guest_encoder_encodes_the_frames_of_the_surfaces_it_is_lent() {
@@ -807,6 +808,13 @@ fn a_guest_encoder_encodes_the_frames_of_the_surfaces_it_is_lent() {
                 let mut other = faster.clone();
                 other.settings.profile = *encoder.profiles.last().unwrap();
                 guest.reconfigure(&other).unwrap();
+                let mut tinted = faster.clone();
+                tinted.settings.colour = Some(ColourDescription {
+                    primaries: 9,
+                    transfer: 1,
+                    matrix: 9,
+                });
+                guest.reconfigure(&tinted).unwrap();
             }
         }
         samples.extend(guest.flush().unwrap());
