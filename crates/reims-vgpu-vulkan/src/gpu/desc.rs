@@ -708,51 +708,79 @@ pub type VulkanRenderPassDescriptor = Obj<RenderPassDescriptorObject>;
 
 impl TextureDescriptor<VulkanPlatform> for VulkanTextureDescriptor {
     fn set_resource_options(&self, options: u64) {
-        let options = resource_options("setResourceOptions:", options);
-        plain(|| self.fields.lock().desc.resource_options = options);
+        let recorded_call = crate::recorder::rec_call!("setResourceOptions:", self, options);
+        crate::recorder::run(|| {
+            let options = resource_options("setResourceOptions:", options);
+            plain(|| self.fields.lock().desc.resource_options = options);
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     /// Kept as set, any value (measured: the module's docs).
     fn set_rotation(&self, rotation: u64) {
-        plain(|| self.fields.lock().rotation = rotation);
+        let recorded_call = crate::recorder::rec_call!("setRotation:", self, rotation);
+        crate::recorder::run(|| {
+            plain(|| self.fields.lock().rotation = rotation);
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     /// Every bit, as Metal's descriptor keeps it (measured: the module's docs).
     fn set_usage(&self, usage: u64) {
-        let (usage, private_usage) = usage_set(usage);
-        plain(|| {
-            let mut fields = self.fields.lock();
-            fields.desc.usage = usage;
-            fields.private_usage = private_usage;
+        let recorded_call = crate::recorder::rec_call!("setUsage:", self, usage);
+        crate::recorder::run(|| {
+            let (usage, private_usage) = usage_set(usage);
+            plain(|| {
+                let mut fields = self.fields.lock();
+                fields.desc.usage = usage;
+                fields.private_usage = private_usage;
+            });
         });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     fn set_width(&self, width: u64) {
-        plain(|| self.fields.lock().desc.width = width);
+        let recorded_call = crate::recorder::rec_call!("setWidth:", self, width);
+        crate::recorder::run(|| {
+            plain(|| self.fields.lock().desc.width = width);
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     fn set_height(&self, height: u64) {
-        plain(|| self.fields.lock().desc.height = height);
+        let recorded_call = crate::recorder::rec_call!("setHeight:", self, height);
+        crate::recorder::run(|| {
+            plain(|| self.fields.lock().desc.height = height);
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     fn set_depth(&self, depth: u64) {
-        plain(|| self.fields.lock().desc.depth = depth);
+        let recorded_call = crate::recorder::rec_call!("setDepth:", self, depth);
+        crate::recorder::run(|| {
+            plain(|| self.fields.lock().desc.depth = depth);
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     /// Any value, as Metal's setter takes it: one the runtime has no type of is kept raw, and
     /// every creator aborts at it.
     fn set_texture_type(&self, raw: u64) {
-        let t = crate::gpu::runtime_texture_type(raw);
-        plain(|| {
-            let mut fields = self.fields.lock();
-            match t {
-                Some(t) => {
-                    fields.desc.texture_type = t;
-                    fields.raw_texture_type = None;
+        let recorded_call = crate::recorder::rec_call!("setTextureType:", self, raw);
+        crate::recorder::run(|| {
+            let t = crate::gpu::runtime_texture_type(raw);
+            plain(|| {
+                let mut fields = self.fields.lock();
+                match t {
+                    Some(t) => {
+                        fields.desc.texture_type = t;
+                        fields.raw_texture_type = None;
+                    }
+                    None => fields.raw_texture_type = Some(raw),
                 }
-                None => fields.raw_texture_type = Some(raw),
-            }
+            });
         });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     /// A format the runtime has, and the other values Metal's setter takes kept raw: the formats
@@ -760,13 +788,17 @@ impl TextureDescriptor<VulkanPlatform> for VulkanTextureDescriptor {
     /// dies where it is made, or is nil ([`lacked`]). Any other value dies, as Metal's setter
     /// asserts.
     fn set_pixel_format(&self, raw: u64) {
-        let (format, no_texture_format, lacked_format) = format_set("setPixelFormat:", raw);
-        plain(|| {
-            let mut fields = self.fields.lock();
-            fields.desc.pixel_format = format;
-            fields.no_texture_format = no_texture_format;
-            fields.lacked_format = lacked_format;
+        let recorded_call = crate::recorder::rec_call!("setPixelFormat:", self, raw);
+        crate::recorder::run(|| {
+            let (format, no_texture_format, lacked_format) = format_set("setPixelFormat:", raw);
+            plain(|| {
+                let mut fields = self.fields.lock();
+                fields.desc.pixel_format = format;
+                fields.no_texture_format = no_texture_format;
+                fields.lacked_format = lacked_format;
+            });
         });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     fn rotation(&self) -> u64 {
@@ -958,65 +990,76 @@ impl RenderPassDescriptor<VulkanPlatform> for VulkanRenderPassDescriptor {
     /// Kept as set: the encoder's creation checks them against the pass, where Metal's
     /// assertions stop a count or a coordinate it does not take.
     fn set_sample_positions(&self, positions: &[MtlSamplePosition]) -> RaiseResult<()> {
-        let positions: Vec<_> = positions
-            .iter()
-            .map(|p| rt::SamplePosition::new(p.x, p.y))
-            .collect();
-        plain(|| self.desc.lock().sample_positions = positions);
-        Ok(())
+        let recorded_call =
+            crate::recorder::rec_call!("setSamplePositions:count:", self, positions);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let positions: Vec<_> = positions
+                .iter()
+                .map(|p| rt::SamplePosition::new(p.x, p.y))
+                .collect();
+            plain(|| self.desc.lock().sample_positions = positions);
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn set_pass(&self, set: &PassSet<'_, VulkanPlatform>) {
-        let mut d = plain(|| self.desc.lock());
-        if let Some(b) = set.visibility_result_buffer {
-            d.visibility_result_buffer = b.map(|b| b.raw.clone());
-            plain(|| self.sources.lock().visibility = b.map(Handle::clone_ref));
-        }
-        // `setVisibilityResultType:` is kept nowhere: the runtime has no accumulation, so a pass
-        // of `Accumulate` resets its results as one of `Reset` does, as the AMD Radeon Pro
-        // 5300M and the Intel UHD 630 do under macOS 26.7.1, where the M3 Max under macOS 27
-        // adds a `Counting` result to the word's and ORs a `Boolean` one into it (measured), as
-        // Metal's docs promise. Accumulating is the runtime's to build.
-        if set.visibility_result_type.is_some_and(|t| t != 0) {
-            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                log::warn!(
-                    target: "reims_vgpu_vulkan::gpu",
-                    "a render pass of visibilityResultType Accumulate: the runtime resets its \
-                     visibility results"
-                );
+        let recorded_call = crate::recorder::rec_call!("m2v.setPass", self, set);
+        crate::recorder::run(|| {
+            let mut d = plain(|| self.desc.lock());
+            if let Some(b) = set.visibility_result_buffer {
+                d.visibility_result_buffer = b.map(|b| b.raw.clone());
+                plain(|| self.sources.lock().visibility = b.map(Handle::clone_ref));
             }
-        }
-        if let Some(v) = set.render_target_array_length {
-            d.render_target_array_length = v;
-        }
-        if let Some(v) = set.render_target_width {
-            d.render_target_width = v;
-        }
-        if let Some(v) = set.render_target_height {
-            d.render_target_height = v;
-        }
-        if let Some(v) = set.default_raster_sample_count {
-            d.default_raster_sample_count = v;
-        }
-        // `setDefaultColorSampleCount:` (SPI) is kept nowhere: on this host it changes nothing a
-        // pass shows, with attachments or without (`mutgap_dec_render_default_color_samples`).
-        let _ = set.default_color_sample_count;
-        if let Some(map) = set.rasterization_rate_map {
-            *plain(|| self.rate_map.lock()) = map.map(Handle::clone_ref);
-        }
-        if let Some(v) = set.imageblock_sample_length {
-            d.imageblock_sample_length = v;
-        }
-        if let Some(v) = set.threadgroup_memory_length {
-            d.threadgroup_memory_length = v;
-        }
-        if let Some(v) = set.tile_width {
-            d.tile_width = v;
-        }
-        if let Some(v) = set.tile_height {
-            d.tile_height = v;
-        }
+            // `setVisibilityResultType:` is kept nowhere: the runtime has no accumulation, so a pass
+            // of `Accumulate` resets its results as one of `Reset` does, as the AMD Radeon Pro
+            // 5300M and the Intel UHD 630 do under macOS 26.7.1, where the M3 Max under macOS 27
+            // adds a `Counting` result to the word's and ORs a `Boolean` one into it (measured), as
+            // Metal's docs promise. Accumulating is the runtime's to build.
+            if set.visibility_result_type.is_some_and(|t| t != 0) {
+                static SAID: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::warn!(
+                        target: "reims_vgpu_vulkan::gpu",
+                        "a render pass of visibilityResultType Accumulate: the runtime resets its \
+                     visibility results"
+                    );
+                }
+            }
+            if let Some(v) = set.render_target_array_length {
+                d.render_target_array_length = v;
+            }
+            if let Some(v) = set.render_target_width {
+                d.render_target_width = v;
+            }
+            if let Some(v) = set.render_target_height {
+                d.render_target_height = v;
+            }
+            if let Some(v) = set.default_raster_sample_count {
+                d.default_raster_sample_count = v;
+            }
+            // `setDefaultColorSampleCount:` (SPI) is kept nowhere: on this host it changes nothing a
+            // pass shows, with attachments or without (`mutgap_dec_render_default_color_samples`).
+            let _ = set.default_color_sample_count;
+            if let Some(map) = set.rasterization_rate_map {
+                *plain(|| self.rate_map.lock()) = map.map(Handle::clone_ref);
+            }
+            if let Some(v) = set.imageblock_sample_length {
+                d.imageblock_sample_length = v;
+            }
+            if let Some(v) = set.threadgroup_memory_length {
+                d.threadgroup_memory_length = v;
+            }
+            if let Some(v) = set.tile_width {
+                d.tile_width = v;
+            }
+            if let Some(v) = set.tile_height {
+                d.tile_height = v;
+            }
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     /// An index past the eight attachments raises before any set, as Metal's subscript does.
@@ -1026,50 +1069,63 @@ impl RenderPassDescriptor<VulkanPlatform> for VulkanRenderPassDescriptor {
         index: u64,
         set: &ColorAttachmentSet<'_, VulkanPlatform>,
     ) -> RaiseResult<()> {
-        let i = color_index(Policy::On(on), index)?;
-        let mut d = plain(|| self.desc.lock());
-        let mut sources = plain(|| self.sources.lock());
-        let mut raw = plain(|| self.raw.lock());
-        let a = &mut d.color_attachments[i];
-        set_attachment_common!(set, a, sources.color[i], raw, i);
-        if let Some(c) = set.clear_color {
-            a.clear_color = clear_color(c);
-        }
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!("m2v.setColorAttachment", self, index, set);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let i = color_index(Policy::On(on), index)?;
+            let mut d = plain(|| self.desc.lock());
+            let mut sources = plain(|| self.sources.lock());
+            let mut raw = plain(|| self.raw.lock());
+            let a = &mut d.color_attachments[i];
+            set_attachment_common!(set, a, sources.color[i], raw, i);
+            if let Some(c) = set.clear_color {
+                a.clear_color = clear_color(c);
+            }
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn set_depth_attachment(&self, set: &DepthAttachmentSet<'_, VulkanPlatform>) {
-        let mut d = plain(|| self.desc.lock());
-        let mut sources = plain(|| self.sources.lock());
-        let mut raw = plain(|| self.raw.lock());
-        let a = &mut d.depth_attachment;
-        set_attachment_common!(set, a, sources.depth, raw, DEPTH);
-        if let Some(v) = set.clear_depth {
-            a.clear_depth = v;
-        }
-        if let Some(v) = set.depth_resolve_filter {
-            let key = (DEPTH, "setDepthResolveFilter:");
-            if let Some(v) = raw.held(key, v, rt::MultisampleDepthResolveFilter::from_raw) {
-                a.depth_resolve_filter = v;
+        let recorded_call = crate::recorder::rec_call!("m2v.setDepthAttachment", self, set);
+        crate::recorder::run(|| {
+            let mut d = plain(|| self.desc.lock());
+            let mut sources = plain(|| self.sources.lock());
+            let mut raw = plain(|| self.raw.lock());
+            let a = &mut d.depth_attachment;
+            set_attachment_common!(set, a, sources.depth, raw, DEPTH);
+            if let Some(v) = set.clear_depth {
+                a.clear_depth = v;
             }
-        }
+            if let Some(v) = set.depth_resolve_filter {
+                let key = (DEPTH, "setDepthResolveFilter:");
+                if let Some(v) = raw.held(key, v, rt::MultisampleDepthResolveFilter::from_raw) {
+                    a.depth_resolve_filter = v;
+                }
+            }
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     fn set_stencil_attachment(&self, set: &StencilAttachmentSet<'_, VulkanPlatform>) {
-        let mut d = plain(|| self.desc.lock());
-        let mut sources = plain(|| self.sources.lock());
-        let mut raw = plain(|| self.raw.lock());
-        let a = &mut d.stencil_attachment;
-        set_attachment_common!(set, a, sources.stencil, raw, STENCIL);
-        if let Some(v) = set.clear_stencil {
-            a.clear_stencil = v;
-        }
-        if let Some(v) = set.stencil_resolve_filter {
-            let key = (STENCIL, "setStencilResolveFilter:");
-            if let Some(v) = raw.held(key, v, rt::MultisampleStencilResolveFilter::from_raw) {
-                a.stencil_resolve_filter = v;
+        let recorded_call = crate::recorder::rec_call!("m2v.setStencilAttachment", self, set);
+        crate::recorder::run(|| {
+            let mut d = plain(|| self.desc.lock());
+            let mut sources = plain(|| self.sources.lock());
+            let mut raw = plain(|| self.raw.lock());
+            let a = &mut d.stencil_attachment;
+            set_attachment_common!(set, a, sources.stencil, raw, STENCIL);
+            if let Some(v) = set.clear_stencil {
+                a.clear_stencil = v;
             }
-        }
+            if let Some(v) = set.stencil_resolve_filter {
+                let key = (STENCIL, "setStencilResolveFilter:");
+                if let Some(v) = raw.held(key, v, rt::MultisampleStencilResolveFilter::from_raw) {
+                    a.stencil_resolve_filter = v;
+                }
+            }
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     /// An index past the eight attachments raises, the caller's to catch.

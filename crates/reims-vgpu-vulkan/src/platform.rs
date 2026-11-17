@@ -75,8 +75,19 @@ impl<T: Send + Sync + 'static> Obj<T> {
 }
 
 impl<T: Send + Sync + 'static> Drop for Obj<T> {
-    /// The release.
+    /// The release. While the process records its calls ([`crate::recorder`]), the last
+    /// reference's is the object's `release` record, written before the object goes.
     fn drop(&mut self) {
+        if crate::recorder::on() {
+            // SAFETY: the reference is taken once, here, and never touched after.
+            let arc = unsafe { ManuallyDrop::take(&mut self.0) };
+            let ptr = Arc::as_ptr(&arc).cast::<u8>().addr().to_u64();
+            if let Some(inner) = Arc::into_inner(arc) {
+                crate::recorder::released(ptr);
+                drop(inner);
+            }
+            return;
+        }
         // SAFETY: the reference is released once, here, and never touched after.
         unsafe { ManuallyDrop::drop(&mut self.0) }
     }
@@ -90,7 +101,12 @@ impl<T: Send + Sync + 'static> std::ops::Deref for Obj<T> {
 }
 
 impl<T: Send + Sync + fmt::Debug + 'static> fmt::Debug for Obj<T> {
+    /// Its pointer and its object; while formatted for the recorder's stream, its stream id
+    /// ([`crate::recorder::fmt_obj`]).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if crate::recorder::on() && crate::recorder::is_formatting() {
+            return crate::recorder::fmt_obj(self.id().0, std::any::type_name::<T>(), f);
+        }
         write!(f, "<{:#x} {:?}>", self.id().0, **self.0)
     }
 }
@@ -138,6 +154,7 @@ impl VulkanPlatform {
     /// pool core's pools push, as Foundation still autoreleases into it.
     pub fn new() -> VulkanPlatform {
         crate::os::install_process_services();
+        crate::recorder::start_from_env();
         VulkanPlatform {
             vm: VulkanVm::new(),
             clock: OsClock::new(),
@@ -762,7 +779,12 @@ impl Platform for VulkanPlatform {
 
     /// A descriptor of Metal's defaults.
     fn new_render_pass_descriptor(&self) -> VulkanRenderPassDescriptor {
-        Obj::new(plain(RenderPassDescriptorObject::new))
+        let recorded_call = crate::recorder::rec_call!("MTLRenderPassDescriptor.new", self);
+        let recorded_answer = crate::recorder::run(|| -> VulkanRenderPassDescriptor {
+            Obj::new(plain(RenderPassDescriptorObject::new))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A handle of the process's one runtime listener ([`LISTENER`]), made at the first call.
@@ -776,7 +798,13 @@ impl Platform for VulkanPlatform {
 
     /// A descriptor of Metal's defaults, as `+new` makes.
     fn render_pass_descriptor(&self) -> VulkanRenderPassDescriptor {
-        Obj::new(plain(RenderPassDescriptorObject::new))
+        let recorded_call =
+            crate::recorder::rec_call!("MTLRenderPassDescriptor.renderPassDescriptor", self);
+        let recorded_answer = crate::recorder::run(|| -> VulkanRenderPassDescriptor {
+            Obj::new(plain(RenderPassDescriptorObject::new))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A 2D descriptor with the full chain of levels when `mipmapped`, its pixel format taken as
@@ -790,16 +818,29 @@ impl Platform for VulkanPlatform {
         height: u64,
         mipmapped: bool,
     ) -> RaiseResult<VulkanTextureDescriptor> {
-        let sel = "texture2DDescriptorWithPixelFormat:width:height:mipmapped:";
-        let (format, no_texture_format, lacked_format) =
-            crate::gpu::desc::format_set(sel, pixel_format);
-        let desc = plain(|| rt::TextureDescriptor::texture_2d(format, width, height, mipmapped));
-        Ok(Obj::new(TextureDescriptorObject::new(TextureFields {
-            desc,
-            no_texture_format,
-            lacked_format,
-            ..TextureFields::default()
-        })))
+        let recorded_call = crate::recorder::rec_call!(
+            "MTLTextureDescriptor.texture2DDescriptorWithPixelFormat:width:height:mipmapped:",
+            self,
+            pixel_format,
+            width,
+            height,
+            mipmapped
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<VulkanTextureDescriptor> {
+            let sel = "texture2DDescriptorWithPixelFormat:width:height:mipmapped:";
+            let (format, no_texture_format, lacked_format) =
+                crate::gpu::desc::format_set(sel, pixel_format);
+            let desc =
+                plain(|| rt::TextureDescriptor::texture_2d(format, width, height, mipmapped));
+            Ok(Obj::new(TextureDescriptorObject::new(TextureFields {
+                desc,
+                no_texture_format,
+                lacked_format,
+                ..TextureFields::default()
+            })))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A layer of zeroed samples, nil for a count of 0 on either axis
@@ -809,16 +850,36 @@ impl Platform for VulkanPlatform {
         _on: OnFault,
         sample_count: MtlSize,
     ) -> RaiseResult<Option<VulkanRateMapLayerDescriptor>> {
-        Ok(crate::gpu::rate_map::new_layer(sample_count))
+        let recorded_call = crate::recorder::rec_call!(
+            "MTLRasterizationRateLayerDescriptor.initWithSampleCount:",
+            self,
+            sample_count
+        );
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<VulkanRateMapLayerDescriptor>> {
+                Ok(crate::gpu::rate_map::new_layer(sample_count))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A new descriptor with the value's properties, set in its order.
     fn texture_descriptor(&self, desc: &TextureDesc) -> VulkanTextureDescriptor {
-        Obj::new(TextureDescriptorObject::new(TextureFields::of(desc)))
+        let recorded_call = crate::recorder::rec_call!("m2v.textureDescriptor", self, desc);
+        let recorded_answer = crate::recorder::run(|| -> VulkanTextureDescriptor {
+            Obj::new(TextureDescriptorObject::new(TextureFields::of(desc)))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn rate_map_descriptor(&self, desc: &RateMapDesc) -> VulkanRateMapDescriptor {
-        crate::gpu::rate_map::new_descriptor(desc)
+        let recorded_call = crate::recorder::rec_call!("m2v.rateMapDescriptor", self, desc);
+        let recorded_answer = crate::recorder::run(|| -> VulkanRateMapDescriptor {
+            crate::gpu::rate_map::new_descriptor(desc)
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The device of the runtime's `Device::all_with` (`MTLCopyAllDevices`) whose registry ID, as
@@ -828,15 +889,21 @@ impl Platform for VulkanPlatform {
     /// it must be ([`opened`]): a device made before is that object, answered with no runtime call
     /// ([`device::kept`]).
     fn open_device(&self, registry_id: u64) -> Option<VulkanDevice> {
-        opened(
-            registry_id,
-            || {
-                made_devices(OPEN_DEVICE, || {
-                    Ok(default_device().ok().into_iter().collect())
-                })
-            },
-            || made_devices(OPEN_DEVICE, || rt::Device::all_with(device_options())),
-        )
+        let recorded_call =
+            crate::recorder::rec_call!("MTLCreateSystemDefaultDevice", self, registry_id);
+        let recorded_answer = crate::recorder::run(|| -> Option<VulkanDevice> {
+            opened(
+                registry_id,
+                || {
+                    made_devices(OPEN_DEVICE, || {
+                        Ok(default_device().ok().into_iter().collect())
+                    })
+                },
+                || made_devices(OPEN_DEVICE, || rt::Device::all_with(device_options())),
+            )
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn vm(&self) -> &dyn HostVm {

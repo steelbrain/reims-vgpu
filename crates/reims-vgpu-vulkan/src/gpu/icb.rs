@@ -1247,32 +1247,38 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
         command_index: u64,
         mut cmds: impl Iterator<Item = IcbRenderCmd<'c, VulkanPlatform>>,
     ) -> RaiseResult<bool> {
-        const TAKE: &str = "indirectRenderCommandAtIndex:";
-        let index = command_index.low_u32();
-        loop {
-            let mut sets = Sets {
-                icb: self,
-                index,
-                cmds: &mut cmds,
-                sel: TAKE,
-                after: After::Nothing,
-                alone: None,
-                kind: PhantomData::<RenderSets>,
-            };
-            let done = plain_at(TAKE, || {
-                self.raw.set_render_command(command_index, &mut sets)
-            });
-            if let Err((_, e)) = done {
-                return decide(sets.sel, Policy::Dies, e);
+        let recorded_call =
+            crate::recorder::rec_call!("indirectRenderCommandAtIndex:", self, command_index, cmds);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<bool> {
+            const TAKE: &str = "indirectRenderCommandAtIndex:";
+            let index = command_index.low_u32();
+            loop {
+                let mut sets = Sets {
+                    icb: self,
+                    index,
+                    cmds: &mut cmds,
+                    sel: TAKE,
+                    after: After::Nothing,
+                    alone: None,
+                    kind: PhantomData::<RenderSets>,
+                };
+                let done = plain_at(TAKE, || {
+                    self.raw.set_render_command(command_index, &mut sets)
+                });
+                if let Err((_, e)) = done {
+                    return decide(sets.sel, Policy::Dies, e);
+                }
+                sets.note();
+                let Some(cmd) = sets.alone else {
+                    return Ok(true);
+                };
+                if let Some(c) = self.render_command(command_index)? {
+                    c.encode(cmd)?;
+                }
             }
-            sets.note();
-            let Some(cmd) = sets.alone else {
-                return Ok(true);
-            };
-            if let Some(c) = self.render_command(command_index)? {
-                c.encode(cmd)?;
-            }
-        }
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's `set_compute_command`, as
@@ -1285,44 +1291,55 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
         command_index: u64,
         mut cmds: impl Iterator<Item = IcbComputeCmd<'c, VulkanPlatform>>,
     ) -> RaiseResult<bool> {
-        const TAKE: &str = "indirectComputeCommandAtIndex:";
-        let index = command_index.low_u32();
-        loop {
-            let mut sets = Sets {
-                icb: self,
-                index,
-                cmds: &mut cmds,
-                sel: TAKE,
-                after: After::Nothing,
-                alone: None,
-                kind: PhantomData::<ComputeSets>,
-            };
-            let done = plain_at(TAKE, || {
-                self.raw.set_compute_command(command_index, &mut sets)
-            });
-            if let Err((_, e)) = done {
-                return decide(sets.sel, Policy::Dies, e);
+        let recorded_call =
+            crate::recorder::rec_call!("indirectComputeCommandAtIndex:", self, command_index, cmds);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<bool> {
+            const TAKE: &str = "indirectComputeCommandAtIndex:";
+            let index = command_index.low_u32();
+            loop {
+                let mut sets = Sets {
+                    icb: self,
+                    index,
+                    cmds: &mut cmds,
+                    sel: TAKE,
+                    after: After::Nothing,
+                    alone: None,
+                    kind: PhantomData::<ComputeSets>,
+                };
+                let done = plain_at(TAKE, || {
+                    self.raw.set_compute_command(command_index, &mut sets)
+                });
+                if let Err((_, e)) = done {
+                    return decide(sets.sel, Policy::Dies, e);
+                }
+                sets.note();
+                let Some(cmd) = sets.alone else {
+                    return Ok(true);
+                };
+                if let Some(c) = self.compute_command(command_index)? {
+                    c.encode(cmd)?;
+                }
             }
-            sets.note();
-            let Some(cmd) = sets.alone else {
-                return Ok(true);
-            };
-            if let Some(c) = self.compute_command(command_index)? {
-                c.encode(cmd)?;
-            }
-        }
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's `reset_with_range`, one call for the range, which refuses a range past the
     /// size as Metal's validation does (a death: core passes one inside it); then the commands'
     /// sides as a CPU reset leaves them ([`IcbObject::rewritten_range`]).
     fn reset_with_range(&self, location: u64, length: u64) -> RaiseResult<()> {
-        let range = location..location.saturating_add(length);
-        send("resetWithRange:", Policy::Dies, || {
-            self.raw.reset_with_range(range.clone())
-        })?;
-        self.rewritten_range(range);
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!("resetWithRange:", self, location, length);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let range = location..location.saturating_add(length);
+            send("resetWithRange:", Policy::Dies, || {
+                self.raw.reset_with_range(range.clone())
+            })?;
+            self.rewritten_range(range);
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Metal's `resourceIndex` of an indirect command buffer is its `gpuResourceID` (measured,

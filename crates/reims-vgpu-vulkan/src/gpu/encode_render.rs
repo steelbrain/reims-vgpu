@@ -2181,1055 +2181,1095 @@ fn marked_by(sel: &'static str, m: Marks) {
 impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
     #[expect(clippy::too_many_lines, reason = "one arm per command")]
     fn encode(&self, _on: OnFault, cmd: RenderCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
-        // The two commands of nearly every draw take paths of their own, which run what the
-        // arms below run for them, in their order, without the dispatch on every command first.
-        match cmd {
-            RenderCmd::SetVertexBuffer {
-                buffer,
-                offset,
-                index,
-            } => return self.vertex_buffer(buffer, offset, index),
-            RenderCmd::DrawPrimitives {
-                primitive_type,
-                vertex_start,
-                vertex_count,
-            } => {
-                let sel = DRAW_PRIMITIVES;
-                return self.primitives(sel, primitive_type, (vertex_start, vertex_count, 1, 0));
-            }
-            _ => {}
-        }
-        let sel = cmd.selector();
-        let encoded = |call: Call<'_>| self.run(sel, call);
-        match cmd {
-            RenderCmd::DispatchThreadsPerTile { threads_per_tile } => {
-                self.tiled(sel);
-                encoded(&mut |e| e.dispatch_threads_per_tile(size(threads_per_tile)))
-            }
-            RenderCmd::DispatchThreadsPerTileInRegion {
-                threads_per_tile,
-                region: r,
-            } => {
-                self.tiled(sel);
-                encoded(&mut |e| {
-                    e.dispatch_threads_per_tile_in_region(size(threads_per_tile), region(r), None)
-                })
-            }
-            RenderCmd::DispatchThreadsPerTileInRegionIndex {
-                threads_per_tile,
-                region: r,
-                render_target_array_index,
-            } => {
-                self.tiled(sel);
-                encoded(&mut |e| {
-                    e.dispatch_threads_per_tile_in_region(
-                        size(threads_per_tile),
-                        region(r),
-                        Some(render_target_array_index),
-                    )
-                })
-            }
-            RenderCmd::DrawIndexedPatchesIndirect {
-                number_of_patch_control_points,
-                patch_index_buffer,
-                patch_index_buffer_offset,
-                control_point_index_buffer,
-                control_point_index_buffer_offset,
-                indirect_buffer,
-                indirect_buffer_offset,
-            } => {
-                let points = small(sel, number_of_patch_control_points);
-                let shape = Shape::Patches;
-                self.draw(sel, (Some((shape, ())), false), |e, ()| {
-                    e.draw_indexed_patches_indirect(
-                        points,
-                        patch_index_buffer.map(|b| &b.raw),
-                        patch_index_buffer_offset,
-                        &control_point_index_buffer.raw,
-                        control_point_index_buffer_offset,
-                        &indirect_buffer.raw,
-                        indirect_buffer_offset,
-                    )
-                })
-            }
-            RenderCmd::DrawIndexedPatches {
-                number_of_patch_control_points,
-                patch_start,
-                patch_count,
-                patch_index_buffer,
-                patch_index_buffer_offset,
-                control_point_index_buffer,
-                control_point_index_buffer_offset,
-                instance_count,
-                base_instance,
-            } => {
-                let points = small(sel, number_of_patch_control_points);
-                let (start, count) = (small(sel, patch_start), small(sel, patch_count));
-                let (instances, base) = (small(sel, instance_count), small(sel, base_instance));
-                let shape = Shape::Patches;
-                let empty = count == 0 || instances == 0;
-                self.draw(sel, (Some((shape, ())), empty), |e, ()| {
-                    e.draw_indexed_patches(
-                        points,
-                        start,
-                        count,
-                        patch_index_buffer.map(|b| &b.raw),
-                        patch_index_buffer_offset,
-                        &control_point_index_buffer.raw,
-                        control_point_index_buffer_offset,
-                        instances,
-                        base,
-                    )
-                })
-            }
-            RenderCmd::DrawIndexedPrimitives {
-                primitive_type,
-                index_count,
-                index_type: raw_index_type,
-                index_buffer,
-                index_buffer_offset,
-            } => self.indexed(
-                sel,
-                (primitive_type, raw_index_type),
-                (index_count, 1, 0, 0),
-                (index_buffer, index_buffer_offset),
-            ),
-            RenderCmd::DrawIndexedPrimitivesInstances {
-                primitive_type,
-                index_count,
-                index_type: raw_index_type,
-                index_buffer,
-                index_buffer_offset,
-                instance_count,
-            } => self.indexed(
-                sel,
-                (primitive_type, raw_index_type),
-                (index_count, instance_count, 0, 0),
-                (index_buffer, index_buffer_offset),
-            ),
-            RenderCmd::DrawIndexedPrimitivesBase {
-                primitive_type,
-                index_count,
-                index_type: raw_index_type,
-                index_buffer,
-                index_buffer_offset,
-                instance_count,
-                base_vertex,
-                base_instance,
-            } => self.indexed(
-                sel,
-                (primitive_type, raw_index_type),
-                (index_count, instance_count, base_vertex, base_instance),
-                (index_buffer, index_buffer_offset),
-            ),
-            RenderCmd::DrawIndexedPrimitivesIndirect {
-                primitive_type,
-                index_type: raw_index_type,
-                index_buffer,
-                index_buffer_offset,
-                indirect_buffer,
-                indirect_buffer_offset,
-            } => {
-                let kinds = indexed_kinds(sel, primitive_type, raw_index_type);
-                let call = |e: &mut rt::RenderCommandEncoder, (t, i)| {
-                    e.draw_indexed_primitives_indirect(
-                        t,
-                        i,
-                        &index_buffer.raw,
-                        index_buffer_offset,
-                        &indirect_buffer.raw,
-                        indirect_buffer_offset,
-                    )
-                };
-                if let Some((t @ rt::DrawPrimitiveType::Nine, i)) = kinds {
-                    let victim = Some(rt::CommandBufferError::GpuRecoveryVictim);
-                    return self.nine(sel, victim, &mut |e| call(e, (t, i)));
+        let recorded_call = crate::recorder::rec_call!(@cmd self, cmd);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            // The two commands of nearly every draw take paths of their own, which run what the
+            // arms below run for them, in their order, without the dispatch on every command first.
+            match cmd {
+                RenderCmd::SetVertexBuffer {
+                    buffer,
+                    offset,
+                    index,
+                } => return self.vertex_buffer(buffer, offset, index),
+                RenderCmd::DrawPrimitives {
+                    primitive_type,
+                    vertex_start,
+                    vertex_count,
+                } => {
+                    let sel = DRAW_PRIMITIVES;
+                    return self.primitives(
+                        sel,
+                        primitive_type,
+                        (vertex_start, vertex_count, 1, 0),
+                    );
                 }
-                let drawn = kinds.map(|(t, i)| (Shape::Primitives(t), (t, i)));
-                self.draw(sel, (drawn, false), call)
+                _ => {}
             }
-            RenderCmd::DrawPatchesIndirect {
-                number_of_patch_control_points,
-                patch_index_buffer,
-                patch_index_buffer_offset,
-                indirect_buffer,
-                indirect_buffer_offset,
-            } => {
-                let points = small(sel, number_of_patch_control_points);
-                let shape = Shape::Patches;
-                self.draw(sel, (Some((shape, ())), false), |e, ()| {
-                    e.draw_patches_indirect(
-                        points,
-                        patch_index_buffer.map(|b| &b.raw),
-                        patch_index_buffer_offset,
-                        &indirect_buffer.raw,
-                        indirect_buffer_offset,
-                    )
-                })
-            }
-            RenderCmd::DrawPatches {
-                number_of_patch_control_points,
-                patch_start,
-                patch_count,
-                patch_index_buffer,
-                patch_index_buffer_offset,
-                instance_count,
-                base_instance,
-            } => {
-                let points = small(sel, number_of_patch_control_points);
-                let (start, count) = (small(sel, patch_start), small(sel, patch_count));
-                let (instances, base) = (small(sel, instance_count), small(sel, base_instance));
-                let shape = Shape::Patches;
-                let empty = count == 0 || instances == 0;
-                self.draw(sel, (Some((shape, ())), empty), |e, ()| {
-                    e.draw_patches(
-                        points,
-                        start,
-                        count,
-                        patch_index_buffer.map(|b| &b.raw),
-                        patch_index_buffer_offset,
-                        instances,
-                        base,
-                    )
-                })
-            }
-            RenderCmd::DrawPrimitivesIndirect {
-                primitive_type,
-                indirect_buffer,
-                indirect_buffer_offset,
-            } => {
-                let t = draw_type(sel, primitive_type);
-                let call = |e: &mut rt::RenderCommandEncoder, t| {
-                    e.draw_primitives_indirect(t, &indirect_buffer.raw, indirect_buffer_offset)
-                };
-                if t == rt::DrawPrimitiveType::Nine {
-                    let victim = Some(rt::CommandBufferError::GpuRecoveryVictim);
-                    return self.nine(sel, victim, &mut |e| call(e, t));
+            let sel = cmd.selector();
+            let encoded = |call: Call<'_>| self.run(sel, call);
+            match cmd {
+                RenderCmd::DispatchThreadsPerTile { threads_per_tile } => {
+                    self.tiled(sel);
+                    encoded(&mut |e| e.dispatch_threads_per_tile(size(threads_per_tile)))
                 }
-                self.draw(sel, (Some((Shape::Primitives(t), t)), false), call)
-            }
-            RenderCmd::SetVertexBuffer { .. } | RenderCmd::DrawPrimitives { .. } => {
-                unreachable!("{sel} takes its own path above")
-            }
-            RenderCmd::DrawPrimitivesInstances {
-                primitive_type,
-                vertex_start,
-                vertex_count,
-                instance_count,
-            } => self.primitives(
-                sel,
-                primitive_type,
-                (vertex_start, vertex_count, instance_count, 0),
-            ),
-            RenderCmd::DrawPrimitivesBase {
-                primitive_type,
-                vertex_start,
-                vertex_count,
-                instance_count,
-                base_instance,
-            } => self.primitives(
-                sel,
-                primitive_type,
-                (vertex_start, vertex_count, instance_count, base_instance),
-            ),
-            RenderCmd::EndEncoding => {
-                // A store action left `Unknown` stores nothing and resolves nothing, as on Metal
-                // (`render_pass_unknown_store`; `mutgap2_rdec_depth_stencil_resolve`: a depth
-                // left `Unknown` over a resolve texture resolves nothing), as the runtime's end
-                // settles it (`unknown_stores_over_resolves_resolve_nothing`).
-                // The runtime decides the pass's resolves as it ends, and announces a colour
-                // resolve the device averages and rounds there (`DeviceRoundedResolve`), which a
-                // native device relays ([`crate::answer::native::NATIVE_RELAYED`]).
-                // A pass over a mutable map that no draw of the guest's took the place of ends
-                // with a draw of no vertices, which keeps the runtime from failing it as a GPU
-                // hang where nothing drew in it, as Metal's GPU hangs at such a pass
-                // (`rate_map::no_draw`). It is the pass's last command, so its
-                // pipeline is bound for nothing the guest encodes. Its pipeline is made here,
-                // once per device; where the command buffer is gone, nothing encoded here runs,
-                // and the pass needs no draw.
-                if self.undrawn.load(Ordering::Acquire)
-                    && let Some(cb) = self.encoder.command_buffer()
-                {
-                    let no_draw = crate::gpu::rate_map::no_draw(sel, &cb.device);
-                    self.run(sel, &mut |e| {
-                        e.set_render_pipeline_state(&no_draw)?;
-                        e.draw_primitives(PrimitiveType::Triangle, 0, 0, 1, 0)
-                    })?;
+                RenderCmd::DispatchThreadsPerTileInRegion {
+                    threads_per_tile,
+                    region: r,
+                } => {
+                    self.tiled(sel);
+                    encoded(&mut |e| {
+                        e.dispatch_threads_per_tile_in_region(
+                            size(threads_per_tile),
+                            region(r),
+                            None,
+                        )
+                    })
                 }
-                self.encoder.end(sel, |e| e.end_encoding())
-            }
-            RenderCmd::ExecuteCommandsIndirect {
-                indirect_commandbuffer,
-                indirect_range_buffer,
-                indirect_buffer_offset,
-            } => {
-                let checked = self.executable(sel, (indirect_commandbuffer, None), false);
-                let mut check = checked.as_ref().and_then(Execution::host_step_check);
-                let progress = self.encoder.progress(sel);
-                indirect_commandbuffer.executed(sel, None, progress.as_ref());
-                encoded(&mut |e| {
-                    let (icb, buffer) = (&indirect_commandbuffer.raw, &indirect_range_buffer.raw);
-                    match check.take() {
-                        Some((check, _)) => e.execute_commands_in_buffer_indirect_checked(
-                            icb,
-                            buffer,
+                RenderCmd::DispatchThreadsPerTileInRegionIndex {
+                    threads_per_tile,
+                    region: r,
+                    render_target_array_index,
+                } => {
+                    self.tiled(sel);
+                    encoded(&mut |e| {
+                        e.dispatch_threads_per_tile_in_region(
+                            size(threads_per_tile),
+                            region(r),
+                            Some(render_target_array_index),
+                        )
+                    })
+                }
+                RenderCmd::DrawIndexedPatchesIndirect {
+                    number_of_patch_control_points,
+                    patch_index_buffer,
+                    patch_index_buffer_offset,
+                    control_point_index_buffer,
+                    control_point_index_buffer_offset,
+                    indirect_buffer,
+                    indirect_buffer_offset,
+                } => {
+                    let points = small(sel, number_of_patch_control_points);
+                    let shape = Shape::Patches;
+                    self.draw(sel, (Some((shape, ())), false), |e, ()| {
+                        e.draw_indexed_patches_indirect(
+                            points,
+                            patch_index_buffer.map(|b| &b.raw),
+                            patch_index_buffer_offset,
+                            &control_point_index_buffer.raw,
+                            control_point_index_buffer_offset,
+                            &indirect_buffer.raw,
                             indirect_buffer_offset,
-                            check,
-                            rt::IndirectCommandCheckNeeds::ALL,
-                        ),
-                        None => e.execute_commands_in_buffer_indirect(
-                            icb,
-                            buffer,
-                            indirect_buffer_offset,
-                        ),
-                    }
-                })?;
-                self.checked_at_commit(checked);
-                if let Some(progress) = progress {
-                    progress.executes(sel, indirect_commandbuffer.clone_ref());
+                        )
+                    })
                 }
-                Ok(())
-            }
-            RenderCmd::ExecuteCommandsInBuffer {
-                indirect_command_buffer,
-                execution_range,
-            } => {
-                let range = range_of(sel, execution_range);
-                let checked = self.executable(
+                RenderCmd::DrawIndexedPatches {
+                    number_of_patch_control_points,
+                    patch_start,
+                    patch_count,
+                    patch_index_buffer,
+                    patch_index_buffer_offset,
+                    control_point_index_buffer,
+                    control_point_index_buffer_offset,
+                    instance_count,
+                    base_instance,
+                } => {
+                    let points = small(sel, number_of_patch_control_points);
+                    let (start, count) = (small(sel, patch_start), small(sel, patch_count));
+                    let (instances, base) = (small(sel, instance_count), small(sel, base_instance));
+                    let shape = Shape::Patches;
+                    let empty = count == 0 || instances == 0;
+                    self.draw(sel, (Some((shape, ())), empty), |e, ()| {
+                        e.draw_indexed_patches(
+                            points,
+                            start,
+                            count,
+                            patch_index_buffer.map(|b| &b.raw),
+                            patch_index_buffer_offset,
+                            &control_point_index_buffer.raw,
+                            control_point_index_buffer_offset,
+                            instances,
+                            base,
+                        )
+                    })
+                }
+                RenderCmd::DrawIndexedPrimitives {
+                    primitive_type,
+                    index_count,
+                    index_type: raw_index_type,
+                    index_buffer,
+                    index_buffer_offset,
+                } => self.indexed(
                     sel,
-                    (indirect_command_buffer, Some(range.clone())),
-                    range.is_empty(),
-                );
-                let mut check = checked.as_ref().and_then(Execution::host_step_check);
-                let progress = self.encoder.progress(sel);
-                indirect_command_buffer.executed(sel, Some(range.clone()), progress.as_ref());
-                // An empty range runs nothing, as Metal's does under any pipeline state
-                // (`render_draw_icb`), as the runtime runs it.
-                encoded(&mut |e| {
-                    let icb = &indirect_command_buffer.raw;
-                    match check.take() {
-                        Some((check, needs)) => {
-                            e.execute_commands_in_buffer_checked(icb, range.clone(), check, needs)
-                        }
-                        None => e.execute_commands_in_buffer(icb, range.clone()),
+                    (primitive_type, raw_index_type),
+                    (index_count, 1, 0, 0),
+                    (index_buffer, index_buffer_offset),
+                ),
+                RenderCmd::DrawIndexedPrimitivesInstances {
+                    primitive_type,
+                    index_count,
+                    index_type: raw_index_type,
+                    index_buffer,
+                    index_buffer_offset,
+                    instance_count,
+                } => self.indexed(
+                    sel,
+                    (primitive_type, raw_index_type),
+                    (index_count, instance_count, 0, 0),
+                    (index_buffer, index_buffer_offset),
+                ),
+                RenderCmd::DrawIndexedPrimitivesBase {
+                    primitive_type,
+                    index_count,
+                    index_type: raw_index_type,
+                    index_buffer,
+                    index_buffer_offset,
+                    instance_count,
+                    base_vertex,
+                    base_instance,
+                } => self.indexed(
+                    sel,
+                    (primitive_type, raw_index_type),
+                    (index_count, instance_count, base_vertex, base_instance),
+                    (index_buffer, index_buffer_offset),
+                ),
+                RenderCmd::DrawIndexedPrimitivesIndirect {
+                    primitive_type,
+                    index_type: raw_index_type,
+                    index_buffer,
+                    index_buffer_offset,
+                    indirect_buffer,
+                    indirect_buffer_offset,
+                } => {
+                    let kinds = indexed_kinds(sel, primitive_type, raw_index_type);
+                    let call = |e: &mut rt::RenderCommandEncoder, (t, i)| {
+                        e.draw_indexed_primitives_indirect(
+                            t,
+                            i,
+                            &index_buffer.raw,
+                            index_buffer_offset,
+                            &indirect_buffer.raw,
+                            indirect_buffer_offset,
+                        )
+                    };
+                    if let Some((t @ rt::DrawPrimitiveType::Nine, i)) = kinds {
+                        let victim = Some(rt::CommandBufferError::GpuRecoveryVictim);
+                        return self.nine(sel, victim, &mut |e| call(e, (t, i)));
                     }
-                })?;
-                self.checked_at_commit(checked);
-                if let Some(progress) = progress {
-                    progress.executes(sel, indirect_command_buffer.clone_ref());
+                    let drawn = kinds.map(|(t, i)| (Shape::Primitives(t), (t, i)));
+                    self.draw(sel, (drawn, false), call)
                 }
-                Ok(())
-            }
-            RenderCmd::MemoryBarrierWithScope {
-                scope,
-                after,
-                before,
-            } => {
-                let scope: BarrierScope = metal_value(sel, "barrier scope", scope);
-                let after: RenderStages = metal_value(sel, "render stages", after);
-                let before: RenderStages = metal_value(sel, "render stages", before);
-                // A barrier after the fragment stage and before the vertex stage orders nothing
-                // on this GPU, which runs a pass's vertex stages first: it does not split the
-                // pass (`mutgap_dec_render_fragment_vertex_barrier`: the later draw's vertices
-                // see none of the earlier draw's fragment writes), where the runtime splits it.
-                if after == RenderStages::FRAGMENT && before == RenderStages::VERTEX {
-                    return self.encoder.nothing(sel);
+                RenderCmd::DrawPatchesIndirect {
+                    number_of_patch_control_points,
+                    patch_index_buffer,
+                    patch_index_buffer_offset,
+                    indirect_buffer,
+                    indirect_buffer_offset,
+                } => {
+                    let points = small(sel, number_of_patch_control_points);
+                    let shape = Shape::Patches;
+                    self.draw(sel, (Some((shape, ())), false), |e, ()| {
+                        e.draw_patches_indirect(
+                            points,
+                            patch_index_buffer.map(|b| &b.raw),
+                            patch_index_buffer_offset,
+                            &indirect_buffer.raw,
+                            indirect_buffer_offset,
+                        )
+                    })
                 }
-                encoded(&mut |e| {
-                    e.memory_barrier_with_scope(scope, after, before);
+                RenderCmd::DrawPatches {
+                    number_of_patch_control_points,
+                    patch_start,
+                    patch_count,
+                    patch_index_buffer,
+                    patch_index_buffer_offset,
+                    instance_count,
+                    base_instance,
+                } => {
+                    let points = small(sel, number_of_patch_control_points);
+                    let (start, count) = (small(sel, patch_start), small(sel, patch_count));
+                    let (instances, base) = (small(sel, instance_count), small(sel, base_instance));
+                    let shape = Shape::Patches;
+                    let empty = count == 0 || instances == 0;
+                    self.draw(sel, (Some((shape, ())), empty), |e, ()| {
+                        e.draw_patches(
+                            points,
+                            start,
+                            count,
+                            patch_index_buffer.map(|b| &b.raw),
+                            patch_index_buffer_offset,
+                            instances,
+                            base,
+                        )
+                    })
+                }
+                RenderCmd::DrawPrimitivesIndirect {
+                    primitive_type,
+                    indirect_buffer,
+                    indirect_buffer_offset,
+                } => {
+                    let t = draw_type(sel, primitive_type);
+                    let call = |e: &mut rt::RenderCommandEncoder, t| {
+                        e.draw_primitives_indirect(t, &indirect_buffer.raw, indirect_buffer_offset)
+                    };
+                    if t == rt::DrawPrimitiveType::Nine {
+                        let victim = Some(rt::CommandBufferError::GpuRecoveryVictim);
+                        return self.nine(sel, victim, &mut |e| call(e, t));
+                    }
+                    self.draw(sel, (Some((Shape::Primitives(t), t)), false), call)
+                }
+                RenderCmd::SetVertexBuffer { .. } | RenderCmd::DrawPrimitives { .. } => {
+                    unreachable!("{sel} takes its own path above")
+                }
+                RenderCmd::DrawPrimitivesInstances {
+                    primitive_type,
+                    vertex_start,
+                    vertex_count,
+                    instance_count,
+                } => self.primitives(
+                    sel,
+                    primitive_type,
+                    (vertex_start, vertex_count, instance_count, 0),
+                ),
+                RenderCmd::DrawPrimitivesBase {
+                    primitive_type,
+                    vertex_start,
+                    vertex_count,
+                    instance_count,
+                    base_instance,
+                } => self.primitives(
+                    sel,
+                    primitive_type,
+                    (vertex_start, vertex_count, instance_count, base_instance),
+                ),
+                RenderCmd::EndEncoding => {
+                    // A store action left `Unknown` stores nothing and resolves nothing, as on Metal
+                    // (`render_pass_unknown_store`; `mutgap2_rdec_depth_stencil_resolve`: a depth
+                    // left `Unknown` over a resolve texture resolves nothing), as the runtime's end
+                    // settles it (`unknown_stores_over_resolves_resolve_nothing`).
+                    // The runtime decides the pass's resolves as it ends, and announces a colour
+                    // resolve the device averages and rounds there (`DeviceRoundedResolve`), which a
+                    // native device relays ([`crate::answer::native::NATIVE_RELAYED`]).
+                    // A pass over a mutable map that no draw of the guest's took the place of ends
+                    // with a draw of no vertices, which keeps the runtime from failing it as a GPU
+                    // hang where nothing drew in it, as Metal's GPU hangs at such a pass
+                    // (`rate_map::no_draw`). It is the pass's last command, so its
+                    // pipeline is bound for nothing the guest encodes. Its pipeline is made here,
+                    // once per device; where the command buffer is gone, nothing encoded here runs,
+                    // and the pass needs no draw.
+                    if self.undrawn.load(Ordering::Acquire)
+                        && let Some(cb) = self.encoder.command_buffer()
+                    {
+                        let no_draw = crate::gpu::rate_map::no_draw(sel, &cb.device);
+                        self.run(sel, &mut |e| {
+                            e.set_render_pipeline_state(&no_draw)?;
+                            e.draw_primitives(PrimitiveType::Triangle, 0, 0, 1, 0)
+                        })?;
+                    }
+                    self.encoder.end(sel, |e| e.end_encoding())
+                }
+                RenderCmd::ExecuteCommandsIndirect {
+                    indirect_commandbuffer,
+                    indirect_range_buffer,
+                    indirect_buffer_offset,
+                } => {
+                    let checked = self.executable(sel, (indirect_commandbuffer, None), false);
+                    let mut check = checked.as_ref().and_then(Execution::host_step_check);
+                    let progress = self.encoder.progress(sel);
+                    indirect_commandbuffer.executed(sel, None, progress.as_ref());
+                    encoded(&mut |e| {
+                        let (icb, buffer) =
+                            (&indirect_commandbuffer.raw, &indirect_range_buffer.raw);
+                        match check.take() {
+                            Some((check, _)) => e.execute_commands_in_buffer_indirect_checked(
+                                icb,
+                                buffer,
+                                indirect_buffer_offset,
+                                check,
+                                rt::IndirectCommandCheckNeeds::ALL,
+                            ),
+                            None => e.execute_commands_in_buffer_indirect(
+                                icb,
+                                buffer,
+                                indirect_buffer_offset,
+                            ),
+                        }
+                    })?;
+                    self.checked_at_commit(checked);
+                    if let Some(progress) = progress {
+                        progress.executes(sel, indirect_commandbuffer.clone_ref());
+                    }
                     Ok(())
-                })
-            }
-            RenderCmd::SetAlphaTestReferenceValue { reference_value } => {
-                encoded(&mut |e| e.set_alpha_test_reference_value(reference_value))
-            }
-            RenderCmd::SetBlendColorRed {
-                red,
-                green,
-                blue,
-                alpha,
-            } => encoded(&mut |e| {
-                e.set_blend_color(red, green, blue, alpha);
-                Ok(())
-            }),
-            RenderCmd::SetColorResolveTexture {
-                texture,
-                slice,
-                depth_plane,
-                level,
-                y_invert: _,
-                index,
-            } => {
-                let at = usize::try_from(index)
-                    .ok()
-                    .filter(|&i| i < rt::MAX_COLOR_ATTACHMENTS)
-                    .unwrap_or_else(|| unrepresentable(sel, &format!("colour attachment {index}")));
-                let index = small(sel, index);
-                if let Some(d) = self.dropped_resolve(index) {
-                    // Relayed, it stays dropped: the texture is left untouched, as plain Metal
-                    // leaves the descriptor's.
-                    crate::answer::inexact(sel, crate::answer::Inexact::LateResolve, || {
-                        format!(
-                            "a late resolve texture of colour attachment {index}, whose resolve \
+                }
+                RenderCmd::ExecuteCommandsInBuffer {
+                    indirect_command_buffer,
+                    execution_range,
+                } => {
+                    let range = range_of(sel, execution_range);
+                    let checked = self.executable(
+                        sel,
+                        (indirect_command_buffer, Some(range.clone())),
+                        range.is_empty(),
+                    );
+                    let mut check = checked.as_ref().and_then(Execution::host_step_check);
+                    let progress = self.encoder.progress(sel);
+                    indirect_command_buffer.executed(sel, Some(range.clone()), progress.as_ref());
+                    // An empty range runs nothing, as Metal's does under any pipeline state
+                    // (`render_draw_icb`), as the runtime runs it.
+                    encoded(&mut |e| {
+                        let icb = &indirect_command_buffer.raw;
+                        match check.take() {
+                            Some((check, needs)) => e.execute_commands_in_buffer_checked(
+                                icb,
+                                range.clone(),
+                                check,
+                                needs,
+                            ),
+                            None => e.execute_commands_in_buffer(icb, range.clone()),
+                        }
+                    })?;
+                    self.checked_at_commit(checked);
+                    if let Some(progress) = progress {
+                        progress.executes(sel, indirect_command_buffer.clone_ref());
+                    }
+                    Ok(())
+                }
+                RenderCmd::MemoryBarrierWithScope {
+                    scope,
+                    after,
+                    before,
+                } => {
+                    let scope: BarrierScope = metal_value(sel, "barrier scope", scope);
+                    let after: RenderStages = metal_value(sel, "render stages", after);
+                    let before: RenderStages = metal_value(sel, "render stages", before);
+                    // A barrier after the fragment stage and before the vertex stage orders nothing
+                    // on this GPU, which runs a pass's vertex stages first: it does not split the
+                    // pass (`mutgap_dec_render_fragment_vertex_barrier`: the later draw's vertices
+                    // see none of the earlier draw's fragment writes), where the runtime splits it.
+                    if after == RenderStages::FRAGMENT && before == RenderStages::VERTEX {
+                        return self.encoder.nothing(sel);
+                    }
+                    encoded(&mut |e| {
+                        e.memory_barrier_with_scope(scope, after, before);
+                        Ok(())
+                    })
+                }
+                RenderCmd::SetAlphaTestReferenceValue { reference_value } => {
+                    encoded(&mut |e| e.set_alpha_test_reference_value(reference_value))
+                }
+                RenderCmd::SetBlendColorRed {
+                    red,
+                    green,
+                    blue,
+                    alpha,
+                } => encoded(&mut |e| {
+                    e.set_blend_color(red, green, blue, alpha);
+                    Ok(())
+                }),
+                RenderCmd::SetColorResolveTexture {
+                    texture,
+                    slice,
+                    depth_plane,
+                    level,
+                    y_invert: _,
+                    index,
+                } => {
+                    let at = usize::try_from(index)
+                        .ok()
+                        .filter(|&i| i < rt::MAX_COLOR_ATTACHMENTS)
+                        .unwrap_or_else(|| {
+                            unrepresentable(sel, &format!("colour attachment {index}"))
+                        });
+                    let index = small(sel, index);
+                    if let Some(d) = self.dropped_resolve(index) {
+                        // Relayed, it stays dropped: the texture is left untouched, as plain Metal
+                        // leaves the descriptor's.
+                        crate::answer::inexact(sel, crate::answer::Inexact::LateResolve, || {
+                            format!(
+                                "a late resolve texture of colour attachment {index}, whose resolve \
                              by {:?} into {} the pass was made without, as plain Metal leaves \
                              that texture untouched; a late resolve texture there is not measured",
-                            d.store,
-                            d.into.name()
+                                d.store,
+                                d.into.name()
+                            )
+                        });
+                        return self.encoder.nothing(sel);
+                    }
+                    if !self.pass.color_resolves[at]
+                        || self.resolve_unused(Attachment::Color(index))
+                    {
+                        return self.encoder.nothing(sel);
+                    }
+                    let at = (slice, depth_plane, level);
+                    let target = self.late_resolve(sel, Attachment::Color(index), texture, at);
+                    encoded(&mut |e| e.set_color_resolve_target(target.clone(), index))
+                }
+                RenderCmd::SetColorStoreAction {
+                    store_action: raw,
+                    color_attachment_index,
+                } => {
+                    let (action, index) =
+                        (store_action(sel, raw), small(sel, color_attachment_index));
+                    self.late_store(sel, Attachment::Color(index), action, &mut |e| {
+                        e.set_color_store_action(action, index)
+                    })
+                }
+                RenderCmd::SetColorStoreActionOptions {
+                    store_action_options: raw,
+                    color_attachment_index,
+                } => {
+                    let options = store_action_options(sel, raw);
+                    let index = small(sel, color_attachment_index);
+                    self.late_options(sel, Attachment::Color(index), options, &mut |e| {
+                        e.set_color_store_action_options(options, index)
+                    })
+                }
+                RenderCmd::SetCullMode { cull_mode } => {
+                    let mode: CullMode = metal_value(sel, "cull mode", cull_mode);
+                    encoded(&mut |e| {
+                        e.set_cull_mode(mode);
+                        Ok(())
+                    })
+                }
+                RenderCmd::SetDepthBias {
+                    depth_bias,
+                    slope_scale,
+                    clamp,
+                } => encoded(&mut |e| e.set_depth_bias(depth_bias, slope_scale, clamp)),
+                // The cleared hints change nothing drawn on this host, over loaded values too
+                // (`mutgap_dec_render_depth_stencil_cleared`): they encode nothing.
+                RenderCmd::SetDepthCleared | RenderCmd::SetStencilCleared => {
+                    self.encoder.nothing(sel)
+                }
+                RenderCmd::SetDepthClipModeSpi { mode } => {
+                    let mode: DepthClipMode = metal_value(sel, "depth clip mode", mode);
+                    encoded(&mut |e| e.set_depth_clip_mode(mode))
+                }
+                RenderCmd::SetDepthResolveTexture {
+                    texture,
+                    slice,
+                    depth_plane,
+                    level,
+                    y_invert: _,
+                } => {
+                    if self.resolve_unused(Attachment::Depth) {
+                        return self.encoder.nothing(sel);
+                    }
+                    if texture.is_some() {
+                        self.resolves_beside_dropped(sel, Attachment::Depth);
+                    }
+                    let at = (slice, depth_plane, level);
+                    let target = self.late_resolve(sel, Attachment::Depth, texture, at);
+                    encoded(&mut |e| e.set_depth_resolve_target(target.clone()))
+                }
+                RenderCmd::SetDepthStencilState {
+                    depth_stencil_state,
+                } => encoded(&mut |e| e.set_depth_stencil_state(depth_stencil_state.map(|s| &**s))),
+                RenderCmd::SetDepthStoreAction { store_action: raw } => {
+                    let action = store_action(sel, raw);
+                    self.late_store(sel, Attachment::Depth, action, &mut |e| {
+                        e.set_depth_store_action(action)
+                    })
+                }
+                RenderCmd::SetFragmentBuffer {
+                    buffer,
+                    offset,
+                    index,
+                } => {
+                    let index = small(sel, index);
+                    self.run(sel, &mut |e| {
+                        e.set_fragment_buffer(buffer.map(|b| &b.raw), offset, index)
+                    })
+                }
+                RenderCmd::SetFragmentBufferOffset { offset, index } => {
+                    let index = small(sel, index);
+                    encoded(&mut |e| e.set_fragment_buffer_offset(offset, index))
+                }
+                RenderCmd::SetFragmentBuffers {
+                    buffers: list,
+                    offsets,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    let (_, offsets) = ranged(sel, range, offsets);
+                    buffers(list, |list| {
+                        encoded(&mut |e| e.set_fragment_buffers(list, offsets, at))
+                    })
+                }
+                RenderCmd::SetFragmentSamplerStatesLodClamps {
+                    samplers: list,
+                    lod_min_clamps,
+                    lod_max_clamps,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    let (_, min) = ranged(sel, range, lod_min_clamps);
+                    let (_, max) = ranged(sel, range, lod_max_clamps);
+                    samplers(list, |list| {
+                        encoded(&mut |e| e.set_fragment_sampler_states(list, Some((min, max)), at))
+                    })
+                }
+                RenderCmd::SetFragmentSamplerStates {
+                    samplers: list,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    samplers(list, |list| {
+                        encoded(&mut |e| e.set_fragment_sampler_states(list, None, at))
+                    })
+                }
+                RenderCmd::SetFragmentTexture { texture, index } => {
+                    let index = small(sel, index);
+                    let texture = texture.map(|t| t.texels(sel));
+                    self.run(sel, &mut |e| e.set_fragment_texture(texture, index))
+                }
+                RenderCmd::SetFragmentTextures {
+                    textures: list,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    textures(sel, list, |list| {
+                        encoded(&mut |e| e.set_fragment_textures(list, at))
+                    })
+                }
+                RenderCmd::SetFrontFacingWinding {
+                    front_facing_winding,
+                } => {
+                    let winding: Winding = metal_value(sel, "winding", front_facing_winding);
+                    encoded(&mut |e| {
+                        e.set_front_facing_winding(winding);
+                        Ok(())
+                    })
+                }
+                // The runtime's encoder draws the width as Metal does (the module docs).
+                RenderCmd::SetLineWidth { line_width } => {
+                    encoded(&mut |e| e.set_line_width(line_width))
+                }
+                // Metal draws alike at every point size on this host, and a vertex function's
+                // `[[point_size]]` decides a point's: it encodes nothing.
+                RenderCmd::SetPointSize { .. } => self.encoder.nothing(sel),
+                // A mesh draw draws as a draw of primitives does ([`Self::draw`]), its threadgroups
+                // held to its state's ([`threads_held`]); one of a grid with an axis of none draws
+                // nothing, as on Metal. The runtime draws it as Metal does, or refuses it, which dies
+                // (`render/mesh.rs`): with a state that is not a mesh render pipeline's, among them,
+                // which stops Metal.
+                RenderCmd::DrawMeshThreadgroups {
+                    threadgroups_per_grid,
+                    threads_per_object_threadgroup: object,
+                    threads_per_mesh_threadgroup: mesh,
+                } => {
+                    let shape = Shape::Mesh { object, mesh };
+                    let empty = empty_grid(threadgroups_per_grid);
+                    let grid = size(threadgroups_per_grid);
+                    self.draw(sel, (Some((shape, ())), empty), |e, ()| {
+                        e.draw_mesh_threadgroups(grid, size(object), size(mesh))
+                    })
+                }
+                RenderCmd::DrawMeshThreads {
+                    threads_per_grid,
+                    threads_per_object_threadgroup: object,
+                    threads_per_mesh_threadgroup: mesh,
+                } => {
+                    let shape = Shape::Mesh { object, mesh };
+                    let empty = empty_grid(threads_per_grid);
+                    let grid = size(threads_per_grid);
+                    self.draw(sel, (Some((shape, ())), empty), |e, ()| {
+                        e.draw_mesh_threads(grid, size(object), size(mesh))
+                    })
+                }
+                RenderCmd::DrawMeshThreadgroupsIndirect {
+                    indirect_buffer,
+                    indirect_buffer_offset,
+                    threads_per_object_threadgroup: object,
+                    threads_per_mesh_threadgroup: mesh,
+                } => {
+                    let shape = Shape::Mesh { object, mesh };
+                    self.draw(sel, (Some((shape, ())), false), |e, ()| {
+                        e.draw_mesh_threadgroups_indirect(
+                            &indirect_buffer.raw,
+                            indirect_buffer_offset,
+                            size(object),
+                            size(mesh),
                         )
+                    })
+                }
+                RenderCmd::SetMeshBufferOffset { offset, index } => {
+                    let index = small(sel, index);
+                    encoded(&mut |e| e.set_mesh_buffer_offset(offset, index))
+                }
+                RenderCmd::SetMeshBuffers {
+                    buffers: list,
+                    offsets,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    let (_, offsets) = ranged(sel, range, offsets);
+                    buffers(list, |list| {
+                        encoded(&mut |e| e.set_mesh_buffers(list, offsets, at))
+                    })
+                }
+                RenderCmd::SetMeshSamplerStatesLodClamps {
+                    samplers: list,
+                    lod_min_clamps,
+                    lod_max_clamps,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    let (_, min) = ranged(sel, range, lod_min_clamps);
+                    let (_, max) = ranged(sel, range, lod_max_clamps);
+                    samplers(list, |list| {
+                        encoded(&mut |e| e.set_mesh_sampler_states(list, Some((min, max)), at))
+                    })
+                }
+                RenderCmd::SetMeshSamplerStates {
+                    samplers: list,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    samplers(list, |list| {
+                        encoded(&mut |e| e.set_mesh_sampler_states(list, None, at))
+                    })
+                }
+                RenderCmd::SetMeshTextures {
+                    textures: list,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    textures(sel, list, |list| {
+                        encoded(&mut |e| e.set_mesh_textures(list, at))
+                    })
+                }
+                RenderCmd::SetObjectBufferOffset { offset, index } => {
+                    let index = small(sel, index);
+                    encoded(&mut |e| e.set_object_buffer_offset(offset, index))
+                }
+                RenderCmd::SetObjectBuffers {
+                    buffers: list,
+                    offsets,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    let (_, offsets) = ranged(sel, range, offsets);
+                    buffers(list, |list| {
+                        encoded(&mut |e| e.set_object_buffers(list, offsets, at))
+                    })
+                }
+                RenderCmd::SetObjectSamplerStatesLodClamps {
+                    samplers: list,
+                    lod_min_clamps,
+                    lod_max_clamps,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    let (_, min) = ranged(sel, range, lod_min_clamps);
+                    let (_, max) = ranged(sel, range, lod_max_clamps);
+                    samplers(list, |list| {
+                        encoded(&mut |e| e.set_object_sampler_states(list, Some((min, max)), at))
+                    })
+                }
+                RenderCmd::SetObjectSamplerStates {
+                    samplers: list,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    samplers(list, |list| {
+                        encoded(&mut |e| e.set_object_sampler_states(list, None, at))
+                    })
+                }
+                RenderCmd::SetObjectTextures {
+                    textures: list,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    textures(sel, list, |list| {
+                        encoded(&mut |e| e.set_object_textures(list, at))
+                    })
+                }
+                // The length the object function's `[[threadgroup(index)]]` argument takes in the
+                // encoder's later mesh draws, which the runtime checks at each draw against the
+                // device's workgroup memory for the stage.
+                RenderCmd::SetObjectThreadgroupMemoryLength { length, index } => {
+                    let (length, index) = (small(sel, length), small(sel, index));
+                    encoded(&mut |e| e.set_object_threadgroup_memory_length(length, index))
+                }
+                // Metal's indexed strips restart at the index set, until the encoder ends, and
+                // nothing else changes (the module docs), as the runtime's do.
+                RenderCmd::SetPrimitiveRestartEnabled { enabled, index } => {
+                    plain(|| {
+                        self.drawing.lock().borrow_mut().marks.restart = Some((enabled, index))
                     });
-                    return self.encoder.nothing(sel);
+                    encoded(&mut |e| {
+                        e.set_primitive_restart_enabled(enabled, index);
+                        Ok(())
+                    })
                 }
-                if !self.pass.color_resolves[at] || self.resolve_unused(Attachment::Color(index)) {
-                    return self.encoder.nothing(sel);
+                // The runtime draws the encoder's draws after it as Metal does at the mode, or
+                // announces what it draws otherwise (the module docs).
+                RenderCmd::SetProvokingVertexMode { mode } => {
+                    encoded(&mut |e| e.set_provoking_vertex_mode(mode))
                 }
-                let at = (slice, depth_plane, level);
-                let target = self.late_resolve(sel, Attachment::Color(index), texture, at);
-                encoded(&mut |e| e.set_color_resolve_target(target.clone(), index))
-            }
-            RenderCmd::SetColorStoreAction {
-                store_action: raw,
-                color_attachment_index,
-            } => {
-                let (action, index) = (store_action(sel, raw), small(sel, color_attachment_index));
-                self.late_store(sel, Attachment::Color(index), action, &mut |e| {
-                    e.set_color_store_action(action, index)
-                })
-            }
-            RenderCmd::SetColorStoreActionOptions {
-                store_action_options: raw,
-                color_attachment_index,
-            } => {
-                let options = store_action_options(sel, raw);
-                let index = small(sel, color_attachment_index);
-                self.late_options(sel, Attachment::Color(index), options, &mut |e| {
-                    e.set_color_store_action_options(options, index)
-                })
-            }
-            RenderCmd::SetCullMode { cull_mode } => {
-                let mode: CullMode = metal_value(sel, "cull mode", cull_mode);
-                encoded(&mut |e| {
-                    e.set_cull_mode(mode);
+                RenderCmd::SetRenderPipelineState { pipeline_state } => match pipeline_state {
+                    None => {
+                        self.encoder.nothing(sel)?;
+                        plain(|| self.drawing.lock().borrow_mut().nil_pipeline = true);
+                        self.encoder.pipeline.store(0, Ordering::Relaxed);
+                        self.encoder.encodes_icbs.store(false, Ordering::SeqCst);
+                        Ok(())
+                    }
+                    Some(state) => {
+                        self.run(sel, &mut |e| e.set_render_pipeline_state(&state.raw))?;
+                        let f = *state.drawn.get_or_init(|| StateFacts::of(state));
+                        self.encoder
+                            .pipeline
+                            .store(state.unique_identifier(), Ordering::Relaxed);
+                        self.encoder.encodes_icbs.store(f.encodes, Ordering::SeqCst);
+                        plain(|| {
+                            let locked = self.drawing.lock();
+                            let mut drawing = locked.borrow_mut();
+                            drawing.nil_pipeline = false;
+                            let m = &mut drawing.marks;
+                            m.pipeline = true;
+                            m.points_sized = f.points_sized;
+                            m.half_apart = f.half_apart;
+                            m.mesh = f.mesh;
+                        });
+                        Ok(())
+                    }
+                },
+                RenderCmd::SetScissorRect { rect } => {
+                    let rect = scissor(rect);
+                    encoded(&mut |e| e.set_scissor_rect(rect))
+                }
+                RenderCmd::SetScissorRects { scissor_rects } => {
+                    let rects: Vec<_> = scissor_rects.iter().copied().map(scissor).collect();
+                    encoded(&mut |e| e.set_scissor_rects(&rects))
+                }
+                RenderCmd::SetStencilFrontReferenceValue {
+                    front_reference_value,
+                    back_reference_value,
+                } => encoded(&mut |e| {
+                    e.set_stencil_reference_values(front_reference_value, back_reference_value);
                     Ok(())
-                })
-            }
-            RenderCmd::SetDepthBias {
-                depth_bias,
-                slope_scale,
-                clamp,
-            } => encoded(&mut |e| e.set_depth_bias(depth_bias, slope_scale, clamp)),
-            // The cleared hints change nothing drawn on this host, over loaded values too
-            // (`mutgap_dec_render_depth_stencil_cleared`): they encode nothing.
-            RenderCmd::SetDepthCleared | RenderCmd::SetStencilCleared => self.encoder.nothing(sel),
-            RenderCmd::SetDepthClipModeSpi { mode } => {
-                let mode: DepthClipMode = metal_value(sel, "depth clip mode", mode);
-                encoded(&mut |e| e.set_depth_clip_mode(mode))
-            }
-            RenderCmd::SetDepthResolveTexture {
-                texture,
-                slice,
-                depth_plane,
-                level,
-                y_invert: _,
-            } => {
-                if self.resolve_unused(Attachment::Depth) {
-                    return self.encoder.nothing(sel);
+                }),
+                RenderCmd::SetStencilResolveTexture {
+                    texture,
+                    slice,
+                    depth_plane,
+                    level,
+                    y_invert: _,
+                } => {
+                    if self.resolve_unused(Attachment::Stencil) {
+                        return self.encoder.nothing(sel);
+                    }
+                    if texture.is_some() {
+                        self.resolves_beside_dropped(sel, Attachment::Stencil);
+                    }
+                    let at = (slice, depth_plane, level);
+                    let target = self.late_resolve(sel, Attachment::Stencil, texture, at);
+                    encoded(&mut |e| e.set_stencil_resolve_target(target.clone()))
                 }
-                if texture.is_some() {
-                    self.resolves_beside_dropped(sel, Attachment::Depth);
+                RenderCmd::SetStencilStoreAction { store_action: raw } => {
+                    let action = store_action(sel, raw);
+                    self.late_store(sel, Attachment::Stencil, action, &mut |e| {
+                        e.set_stencil_store_action(action)
+                    })
                 }
-                let at = (slice, depth_plane, level);
-                let target = self.late_resolve(sel, Attachment::Depth, texture, at);
-                encoded(&mut |e| e.set_depth_resolve_target(target.clone()))
-            }
-            RenderCmd::SetDepthStencilState {
-                depth_stencil_state,
-            } => encoded(&mut |e| e.set_depth_stencil_state(depth_stencil_state.map(|s| &**s))),
-            RenderCmd::SetDepthStoreAction { store_action: raw } => {
-                let action = store_action(sel, raw);
-                self.late_store(sel, Attachment::Depth, action, &mut |e| {
-                    e.set_depth_store_action(action)
-                })
-            }
-            RenderCmd::SetFragmentBuffer {
-                buffer,
-                offset,
-                index,
-            } => {
-                let index = small(sel, index);
-                self.run(sel, &mut |e| {
-                    e.set_fragment_buffer(buffer.map(|b| &b.raw), offset, index)
-                })
-            }
-            RenderCmd::SetFragmentBufferOffset { offset, index } => {
-                let index = small(sel, index);
-                encoded(&mut |e| e.set_fragment_buffer_offset(offset, index))
-            }
-            RenderCmd::SetFragmentBuffers {
-                buffers: list,
-                offsets,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                let (_, offsets) = ranged(sel, range, offsets);
-                buffers(list, |list| {
-                    encoded(&mut |e| e.set_fragment_buffers(list, offsets, at))
-                })
-            }
-            RenderCmd::SetFragmentSamplerStatesLodClamps {
-                samplers: list,
-                lod_min_clamps,
-                lod_max_clamps,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                let (_, min) = ranged(sel, range, lod_min_clamps);
-                let (_, max) = ranged(sel, range, lod_max_clamps);
-                samplers(list, |list| {
-                    encoded(&mut |e| e.set_fragment_sampler_states(list, Some((min, max)), at))
-                })
-            }
-            RenderCmd::SetFragmentSamplerStates {
-                samplers: list,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                samplers(list, |list| {
-                    encoded(&mut |e| e.set_fragment_sampler_states(list, None, at))
-                })
-            }
-            RenderCmd::SetFragmentTexture { texture, index } => {
-                let index = small(sel, index);
-                let texture = texture.map(|t| t.texels(sel));
-                self.run(sel, &mut |e| e.set_fragment_texture(texture, index))
-            }
-            RenderCmd::SetFragmentTextures {
-                textures: list,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                textures(sel, list, |list| {
-                    encoded(&mut |e| e.set_fragment_textures(list, at))
-                })
-            }
-            RenderCmd::SetFrontFacingWinding {
-                front_facing_winding,
-            } => {
-                let winding: Winding = metal_value(sel, "winding", front_facing_winding);
-                encoded(&mut |e| {
-                    e.set_front_facing_winding(winding);
-                    Ok(())
-                })
-            }
-            // The runtime's encoder draws the width as Metal does (the module docs).
-            RenderCmd::SetLineWidth { line_width } => {
-                encoded(&mut |e| e.set_line_width(line_width))
-            }
-            // Metal draws alike at every point size on this host, and a vertex function's
-            // `[[point_size]]` decides a point's: it encodes nothing.
-            RenderCmd::SetPointSize { .. } => self.encoder.nothing(sel),
-            // A mesh draw draws as a draw of primitives does ([`Self::draw`]), its threadgroups
-            // held to its state's ([`threads_held`]); one of a grid with an axis of none draws
-            // nothing, as on Metal. The runtime draws it as Metal does, or refuses it, which dies
-            // (`render/mesh.rs`): with a state that is not a mesh render pipeline's, among them,
-            // which stops Metal.
-            RenderCmd::DrawMeshThreadgroups {
-                threadgroups_per_grid,
-                threads_per_object_threadgroup: object,
-                threads_per_mesh_threadgroup: mesh,
-            } => {
-                let shape = Shape::Mesh { object, mesh };
-                let empty = empty_grid(threadgroups_per_grid);
-                let grid = size(threadgroups_per_grid);
-                self.draw(sel, (Some((shape, ())), empty), |e, ()| {
-                    e.draw_mesh_threadgroups(grid, size(object), size(mesh))
-                })
-            }
-            RenderCmd::DrawMeshThreads {
-                threads_per_grid,
-                threads_per_object_threadgroup: object,
-                threads_per_mesh_threadgroup: mesh,
-            } => {
-                let shape = Shape::Mesh { object, mesh };
-                let empty = empty_grid(threads_per_grid);
-                let grid = size(threads_per_grid);
-                self.draw(sel, (Some((shape, ())), empty), |e, ()| {
-                    e.draw_mesh_threads(grid, size(object), size(mesh))
-                })
-            }
-            RenderCmd::DrawMeshThreadgroupsIndirect {
-                indirect_buffer,
-                indirect_buffer_offset,
-                threads_per_object_threadgroup: object,
-                threads_per_mesh_threadgroup: mesh,
-            } => {
-                let shape = Shape::Mesh { object, mesh };
-                self.draw(sel, (Some((shape, ())), false), |e, ()| {
-                    e.draw_mesh_threadgroups_indirect(
-                        &indirect_buffer.raw,
-                        indirect_buffer_offset,
-                        size(object),
-                        size(mesh),
+                RenderCmd::SetStencilStoreActionOptions {
+                    store_action_options: raw,
+                } => {
+                    let options = store_action_options(sel, raw);
+                    self.late_options(sel, Attachment::Stencil, options, &mut |e| {
+                        e.set_stencil_store_action_options(options)
+                    })
+                }
+                RenderCmd::SetDepthStoreActionOptions {
+                    store_action_options: raw,
+                } => {
+                    let options = store_action_options(sel, raw);
+                    self.late_options(sel, Attachment::Depth, options, &mut |e| {
+                        e.set_depth_store_action_options(options)
+                    })
+                }
+                RenderCmd::SetTessellationFactorBuffer {
+                    buffer,
+                    offset,
+                    instance_stride,
+                } => encoded(&mut |e| {
+                    e.set_tessellation_factor_buffer(
+                        buffer.map(|b| &b.raw),
+                        offset,
+                        instance_stride,
                     )
-                })
-            }
-            RenderCmd::SetMeshBufferOffset { offset, index } => {
-                let index = small(sel, index);
-                encoded(&mut |e| e.set_mesh_buffer_offset(offset, index))
-            }
-            RenderCmd::SetMeshBuffers {
-                buffers: list,
-                offsets,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                let (_, offsets) = ranged(sel, range, offsets);
-                buffers(list, |list| {
-                    encoded(&mut |e| e.set_mesh_buffers(list, offsets, at))
-                })
-            }
-            RenderCmd::SetMeshSamplerStatesLodClamps {
-                samplers: list,
-                lod_min_clamps,
-                lod_max_clamps,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                let (_, min) = ranged(sel, range, lod_min_clamps);
-                let (_, max) = ranged(sel, range, lod_max_clamps);
-                samplers(list, |list| {
-                    encoded(&mut |e| e.set_mesh_sampler_states(list, Some((min, max)), at))
-                })
-            }
-            RenderCmd::SetMeshSamplerStates {
-                samplers: list,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                samplers(list, |list| {
-                    encoded(&mut |e| e.set_mesh_sampler_states(list, None, at))
-                })
-            }
-            RenderCmd::SetMeshTextures {
-                textures: list,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                textures(sel, list, |list| {
-                    encoded(&mut |e| e.set_mesh_textures(list, at))
-                })
-            }
-            RenderCmd::SetObjectBufferOffset { offset, index } => {
-                let index = small(sel, index);
-                encoded(&mut |e| e.set_object_buffer_offset(offset, index))
-            }
-            RenderCmd::SetObjectBuffers {
-                buffers: list,
-                offsets,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                let (_, offsets) = ranged(sel, range, offsets);
-                buffers(list, |list| {
-                    encoded(&mut |e| e.set_object_buffers(list, offsets, at))
-                })
-            }
-            RenderCmd::SetObjectSamplerStatesLodClamps {
-                samplers: list,
-                lod_min_clamps,
-                lod_max_clamps,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                let (_, min) = ranged(sel, range, lod_min_clamps);
-                let (_, max) = ranged(sel, range, lod_max_clamps);
-                samplers(list, |list| {
-                    encoded(&mut |e| e.set_object_sampler_states(list, Some((min, max)), at))
-                })
-            }
-            RenderCmd::SetObjectSamplerStates {
-                samplers: list,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                samplers(list, |list| {
-                    encoded(&mut |e| e.set_object_sampler_states(list, None, at))
-                })
-            }
-            RenderCmd::SetObjectTextures {
-                textures: list,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                textures(sel, list, |list| {
-                    encoded(&mut |e| e.set_object_textures(list, at))
-                })
-            }
-            // The length the object function's `[[threadgroup(index)]]` argument takes in the
-            // encoder's later mesh draws, which the runtime checks at each draw against the
-            // device's workgroup memory for the stage.
-            RenderCmd::SetObjectThreadgroupMemoryLength { length, index } => {
-                let (length, index) = (small(sel, length), small(sel, index));
-                encoded(&mut |e| e.set_object_threadgroup_memory_length(length, index))
-            }
-            // Metal's indexed strips restart at the index set, until the encoder ends, and
-            // nothing else changes (the module docs), as the runtime's do.
-            RenderCmd::SetPrimitiveRestartEnabled { enabled, index } => {
-                plain(|| self.drawing.lock().borrow_mut().marks.restart = Some((enabled, index)));
-                encoded(&mut |e| {
-                    e.set_primitive_restart_enabled(enabled, index);
+                }),
+                RenderCmd::SetTessellationFactorScale { scale } => encoded(&mut |e| {
+                    e.set_tessellation_factor_scale(scale);
                     Ok(())
-                })
-            }
-            // The runtime draws the encoder's draws after it as Metal does at the mode, or
-            // announces what it draws otherwise (the module docs).
-            RenderCmd::SetProvokingVertexMode { mode } => {
-                encoded(&mut |e| e.set_provoking_vertex_mode(mode))
-            }
-            RenderCmd::SetRenderPipelineState { pipeline_state } => match pipeline_state {
-                None => {
-                    self.encoder.nothing(sel)?;
-                    plain(|| self.drawing.lock().borrow_mut().nil_pipeline = true);
-                    self.encoder.pipeline.store(0, Ordering::Relaxed);
-                    self.encoder.encodes_icbs.store(false, Ordering::SeqCst);
-                    Ok(())
+                }),
+                RenderCmd::SetThreadgroupMemoryLength {
+                    length,
+                    offset,
+                    index,
+                } => {
+                    let index = small(sel, index);
+                    encoded(&mut |e| e.set_threadgroup_memory_length(length, offset, index))
                 }
-                Some(state) => {
-                    self.run(sel, &mut |e| e.set_render_pipeline_state(&state.raw))?;
-                    let f = *state.drawn.get_or_init(|| StateFacts::of(state));
-                    self.encoder
-                        .pipeline
-                        .store(state.unique_identifier(), Ordering::Relaxed);
-                    self.encoder.encodes_icbs.store(f.encodes, Ordering::SeqCst);
+                RenderCmd::SetTileBufferOffset { offset, index } => {
+                    let index = small(sel, index);
+                    encoded(&mut |e| e.set_tile_buffer_offset(offset, index))
+                }
+                RenderCmd::SetTileBuffers {
+                    buffers: list,
+                    offsets,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    let (_, offsets) = ranged(sel, range, offsets);
+                    buffers(list, |list| {
+                        encoded(&mut |e| e.set_tile_buffers(list, offsets, at))
+                    })
+                }
+                RenderCmd::SetTileSamplerStatesLodClamps {
+                    samplers: list,
+                    lod_min_clamps,
+                    lod_max_clamps,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    let (_, min) = ranged(sel, range, lod_min_clamps);
+                    let (_, max) = ranged(sel, range, lod_max_clamps);
+                    samplers(list, |list| {
+                        encoded(&mut |e| e.set_tile_sampler_states(list, Some((min, max)), at))
+                    })
+                }
+                RenderCmd::SetTileSamplerStates {
+                    samplers: list,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    samplers(list, |list| {
+                        encoded(&mut |e| e.set_tile_sampler_states(list, None, at))
+                    })
+                }
+                RenderCmd::SetTileTextures {
+                    textures: list,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    textures(sel, list, |list| {
+                        encoded(&mut |e| e.set_tile_textures(list, at))
+                    })
+                }
+                RenderCmd::SetTriangleFillMode { fill_mode } => {
+                    let mode: TriangleFillMode = metal_value(sel, "triangle fill mode", fill_mode);
+                    encoded(&mut |e| e.set_triangle_fill_mode(mode))
+                }
+                RenderCmd::SetVertexAmplificationCount { view_mappings } => {
+                    let count = u64::try_from(view_mappings.len()).unwrap_or_else(|_| {
+                        unrepresentable(sel, &format!("{} view mappings", view_mappings.len()))
+                    });
+                    let mappings: Vec<_> = view_mappings
+                        .iter()
+                        .map(|m| {
+                            rt::VertexAmplificationViewMapping::new(
+                                m.viewport_array_index_offset,
+                                m.render_target_array_index_offset,
+                            )
+                        })
+                        .collect();
+                    let mappings = (!mappings.is_empty()).then_some(mappings.as_slice());
+                    encoded(&mut |e| e.set_vertex_amplification_count(count, mappings))?;
                     plain(|| {
                         let locked = self.drawing.lock();
                         let mut drawing = locked.borrow_mut();
-                        drawing.nil_pipeline = false;
                         let m = &mut drawing.marks;
-                        m.pipeline = true;
-                        m.points_sized = f.points_sized;
-                        m.half_apart = f.half_apart;
-                        m.mesh = f.mesh;
+                        m.amplification = Some(count);
+                        m.amplified = false;
                     });
                     Ok(())
                 }
-            },
-            RenderCmd::SetScissorRect { rect } => {
-                let rect = scissor(rect);
-                encoded(&mut |e| e.set_scissor_rect(rect))
-            }
-            RenderCmd::SetScissorRects { scissor_rects } => {
-                let rects: Vec<_> = scissor_rects.iter().copied().map(scissor).collect();
-                encoded(&mut |e| e.set_scissor_rects(&rects))
-            }
-            RenderCmd::SetStencilFrontReferenceValue {
-                front_reference_value,
-                back_reference_value,
-            } => encoded(&mut |e| {
-                e.set_stencil_reference_values(front_reference_value, back_reference_value);
-                Ok(())
-            }),
-            RenderCmd::SetStencilResolveTexture {
-                texture,
-                slice,
-                depth_plane,
-                level,
-                y_invert: _,
-            } => {
-                if self.resolve_unused(Attachment::Stencil) {
-                    return self.encoder.nothing(sel);
+                // The count it sets, which keeps the view mappings set before, is the runtime's
+                // where it equals the runtime's (the module docs).
+                RenderCmd::SetVertexAmplificationMode { mode, value } => {
+                    plain(|| {
+                        let locked = self.drawing.lock();
+                        let mut drawing = locked.borrow_mut();
+                        let m = &mut drawing.marks;
+                        let runtime = m.amplification.unwrap_or(1);
+                        m.amplified = amplification_count(mode, value) != Some(runtime);
+                    });
+                    self.encoder.nothing(sel)
                 }
-                if texture.is_some() {
-                    self.resolves_beside_dropped(sel, Attachment::Stencil);
+                RenderCmd::SetVertexBufferOffset { offset, index } => {
+                    let index = small(sel, index);
+                    encoded(&mut |e| e.set_vertex_buffer_offset(offset, index))
                 }
-                let at = (slice, depth_plane, level);
-                let target = self.late_resolve(sel, Attachment::Stencil, texture, at);
-                encoded(&mut |e| e.set_stencil_resolve_target(target.clone()))
-            }
-            RenderCmd::SetStencilStoreAction { store_action: raw } => {
-                let action = store_action(sel, raw);
-                self.late_store(sel, Attachment::Stencil, action, &mut |e| {
-                    e.set_stencil_store_action(action)
-                })
-            }
-            RenderCmd::SetStencilStoreActionOptions {
-                store_action_options: raw,
-            } => {
-                let options = store_action_options(sel, raw);
-                self.late_options(sel, Attachment::Stencil, options, &mut |e| {
-                    e.set_stencil_store_action_options(options)
-                })
-            }
-            RenderCmd::SetDepthStoreActionOptions {
-                store_action_options: raw,
-            } => {
-                let options = store_action_options(sel, raw);
-                self.late_options(sel, Attachment::Depth, options, &mut |e| {
-                    e.set_depth_store_action_options(options)
-                })
-            }
-            RenderCmd::SetTessellationFactorBuffer {
-                buffer,
-                offset,
-                instance_stride,
-            } => encoded(&mut |e| {
-                e.set_tessellation_factor_buffer(buffer.map(|b| &b.raw), offset, instance_stride)
-            }),
-            RenderCmd::SetTessellationFactorScale { scale } => encoded(&mut |e| {
-                e.set_tessellation_factor_scale(scale);
-                Ok(())
-            }),
-            RenderCmd::SetThreadgroupMemoryLength {
-                length,
-                offset,
-                index,
-            } => {
-                let index = small(sel, index);
-                encoded(&mut |e| e.set_threadgroup_memory_length(length, offset, index))
-            }
-            RenderCmd::SetTileBufferOffset { offset, index } => {
-                let index = small(sel, index);
-                encoded(&mut |e| e.set_tile_buffer_offset(offset, index))
-            }
-            RenderCmd::SetTileBuffers {
-                buffers: list,
-                offsets,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                let (_, offsets) = ranged(sel, range, offsets);
-                buffers(list, |list| {
-                    encoded(&mut |e| e.set_tile_buffers(list, offsets, at))
-                })
-            }
-            RenderCmd::SetTileSamplerStatesLodClamps {
-                samplers: list,
-                lod_min_clamps,
-                lod_max_clamps,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                let (_, min) = ranged(sel, range, lod_min_clamps);
-                let (_, max) = ranged(sel, range, lod_max_clamps);
-                samplers(list, |list| {
-                    encoded(&mut |e| e.set_tile_sampler_states(list, Some((min, max)), at))
-                })
-            }
-            RenderCmd::SetTileSamplerStates {
-                samplers: list,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                samplers(list, |list| {
-                    encoded(&mut |e| e.set_tile_sampler_states(list, None, at))
-                })
-            }
-            RenderCmd::SetTileTextures {
-                textures: list,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                textures(sel, list, |list| {
-                    encoded(&mut |e| e.set_tile_textures(list, at))
-                })
-            }
-            RenderCmd::SetTriangleFillMode { fill_mode } => {
-                let mode: TriangleFillMode = metal_value(sel, "triangle fill mode", fill_mode);
-                encoded(&mut |e| e.set_triangle_fill_mode(mode))
-            }
-            RenderCmd::SetVertexAmplificationCount { view_mappings } => {
-                let count = u64::try_from(view_mappings.len()).unwrap_or_else(|_| {
-                    unrepresentable(sel, &format!("{} view mappings", view_mappings.len()))
-                });
-                let mappings: Vec<_> = view_mappings
-                    .iter()
-                    .map(|m| {
-                        rt::VertexAmplificationViewMapping::new(
-                            m.viewport_array_index_offset,
-                            m.render_target_array_index_offset,
-                        )
+                RenderCmd::SetVertexBufferOffsetAttributeStride {
+                    offset,
+                    stride,
+                    index,
+                } => {
+                    let index = small(sel, index);
+                    encoded(&mut |e| e.set_vertex_buffer_offset_with_stride(offset, stride, index))
+                }
+                RenderCmd::SetVertexBuffersAttributeStrides {
+                    buffers: list,
+                    offsets,
+                    strides,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    let (_, offsets) = ranged(sel, range, offsets);
+                    let (_, strides) = ranged(sel, range, strides);
+                    buffers(list, |list| {
+                        encoded(&mut |e| {
+                            e.set_vertex_buffers_with_strides(list, offsets, strides, at)
+                        })
                     })
-                    .collect();
-                let mappings = (!mappings.is_empty()).then_some(mappings.as_slice());
-                encoded(&mut |e| e.set_vertex_amplification_count(count, mappings))?;
-                plain(|| {
-                    let locked = self.drawing.lock();
-                    let mut drawing = locked.borrow_mut();
-                    let m = &mut drawing.marks;
-                    m.amplification = Some(count);
-                    m.amplified = false;
-                });
-                Ok(())
-            }
-            // The count it sets, which keeps the view mappings set before, is the runtime's
-            // where it equals the runtime's (the module docs).
-            RenderCmd::SetVertexAmplificationMode { mode, value } => {
-                plain(|| {
-                    let locked = self.drawing.lock();
-                    let mut drawing = locked.borrow_mut();
-                    let m = &mut drawing.marks;
-                    let runtime = m.amplification.unwrap_or(1);
-                    m.amplified = amplification_count(mode, value) != Some(runtime);
-                });
-                self.encoder.nothing(sel)
-            }
-            RenderCmd::SetVertexBufferOffset { offset, index } => {
-                let index = small(sel, index);
-                encoded(&mut |e| e.set_vertex_buffer_offset(offset, index))
-            }
-            RenderCmd::SetVertexBufferOffsetAttributeStride {
-                offset,
-                stride,
-                index,
-            } => {
-                let index = small(sel, index);
-                encoded(&mut |e| e.set_vertex_buffer_offset_with_stride(offset, stride, index))
-            }
-            RenderCmd::SetVertexBuffersAttributeStrides {
-                buffers: list,
-                offsets,
-                strides,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                let (_, offsets) = ranged(sel, range, offsets);
-                let (_, strides) = ranged(sel, range, strides);
-                buffers(list, |list| {
-                    encoded(&mut |e| e.set_vertex_buffers_with_strides(list, offsets, strides, at))
-                })
-            }
-            RenderCmd::SetVertexBuffers {
-                buffers: list,
-                offsets,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                let (_, offsets) = ranged(sel, range, offsets);
-                buffers(list, |list| {
-                    encoded(&mut |e| e.set_vertex_buffers(list, offsets, at))
-                })
-            }
-            RenderCmd::SetVertexSamplerStatesLodClamps {
-                samplers: list,
-                lod_min_clamps,
-                lod_max_clamps,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                let (_, min) = ranged(sel, range, lod_min_clamps);
-                let (_, max) = ranged(sel, range, lod_max_clamps);
-                samplers(list, |list| {
-                    encoded(&mut |e| e.set_vertex_sampler_states(list, Some((min, max)), at))
-                })
-            }
-            RenderCmd::SetVertexSamplerStates {
-                samplers: list,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                samplers(list, |list| {
-                    encoded(&mut |e| e.set_vertex_sampler_states(list, None, at))
-                })
-            }
-            RenderCmd::SetVertexTextures {
-                textures: list,
-                range,
-            } => {
-                let (at, list) = ranged(sel, range, list);
-                textures(sel, list, |list| {
-                    encoded(&mut |e| e.set_vertex_textures(list, at))
-                })
-            }
-            RenderCmd::SetViewport { viewport: v } => {
-                let v = viewport(v);
-                self.run(sel, &mut |e| e.set_viewport(v))
-            }
-            RenderCmd::SetViewportTransformEnabled { enabled } => {
-                encoded(&mut |e| e.set_viewport_transform_enabled(enabled))
-            }
-            RenderCmd::SetViewports { viewports } => {
-                let list: Vec<_> = viewports.iter().copied().map(viewport).collect();
-                encoded(&mut |e| e.set_viewports(&list))
-            }
-            RenderCmd::SetVisibilityResultMode { mode, offset } => {
-                let mode = rt::VisibilityResultMode::from_raw(mode).unwrap_or_else(|_| {
-                    unrepresentable(sel, &format!("visibility result mode {mode}"))
-                });
-                encoded(&mut |e| e.set_visibility_result_mode(mode, offset))
-            }
-            RenderCmd::UpdateFence { fence, stages } => {
-                let stages: RenderStages = metal_value(sel, "render stages", stages);
-                encoded(&mut |e| e.update_fence(fence, stages))
-            }
-            RenderCmd::UseHeaps { heaps: list } => {
-                let list = heaps(list);
-                encoded(&mut |e| e.use_heaps(&list, VERTEX_AND_FRAGMENT))
-            }
-            RenderCmd::UseHeapsStages {
-                heaps: list,
-                stages,
-            } => {
-                let list = heaps(list);
-                let stages: RenderStages = metal_value(sel, "render stages", stages);
-                encoded(&mut |e| e.use_heaps(&list, stages))
-            }
-            RenderCmd::UseResources {
-                resources: list,
-                usage,
-            } => {
-                let some = present(list);
-                let usage: ResourceUsage = metal_value(sel, "resource usage", usage);
-                let icbs = crate::gpu::icb::made_resident(list);
-                if !icbs.is_empty() {
-                    // A function of the encoder's may copy any of their commands.
-                    let progress = self.encoder.progress(sel);
-                    for icb in &icbs {
-                        icb.resident(sel, progress.as_ref(), usage.contains(ResourceUsage::WRITE));
+                }
+                RenderCmd::SetVertexBuffers {
+                    buffers: list,
+                    offsets,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    let (_, offsets) = ranged(sel, range, offsets);
+                    buffers(list, |list| {
+                        encoded(&mut |e| e.set_vertex_buffers(list, offsets, at))
+                    })
+                }
+                RenderCmd::SetVertexSamplerStatesLodClamps {
+                    samplers: list,
+                    lod_min_clamps,
+                    lod_max_clamps,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    let (_, min) = ranged(sel, range, lod_min_clamps);
+                    let (_, max) = ranged(sel, range, lod_max_clamps);
+                    samplers(list, |list| {
+                        encoded(&mut |e| e.set_vertex_sampler_states(list, Some((min, max)), at))
+                    })
+                }
+                RenderCmd::SetVertexSamplerStates {
+                    samplers: list,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    samplers(list, |list| {
+                        encoded(&mut |e| e.set_vertex_sampler_states(list, None, at))
+                    })
+                }
+                RenderCmd::SetVertexTextures {
+                    textures: list,
+                    range,
+                } => {
+                    let (at, list) = ranged(sel, range, list);
+                    textures(sel, list, |list| {
+                        encoded(&mut |e| e.set_vertex_textures(list, at))
+                    })
+                }
+                RenderCmd::SetViewport { viewport: v } => {
+                    let v = viewport(v);
+                    self.run(sel, &mut |e| e.set_viewport(v))
+                }
+                RenderCmd::SetViewportTransformEnabled { enabled } => {
+                    encoded(&mut |e| e.set_viewport_transform_enabled(enabled))
+                }
+                RenderCmd::SetViewports { viewports } => {
+                    let list: Vec<_> = viewports.iter().copied().map(viewport).collect();
+                    encoded(&mut |e| e.set_viewports(&list))
+                }
+                RenderCmd::SetVisibilityResultMode { mode, offset } => {
+                    let mode = rt::VisibilityResultMode::from_raw(mode).unwrap_or_else(|_| {
+                        unrepresentable(sel, &format!("visibility result mode {mode}"))
+                    });
+                    encoded(&mut |e| e.set_visibility_result_mode(mode, offset))
+                }
+                RenderCmd::UpdateFence { fence, stages } => {
+                    let stages: RenderStages = metal_value(sel, "render stages", stages);
+                    encoded(&mut |e| e.update_fence(fence, stages))
+                }
+                RenderCmd::UseHeaps { heaps: list } => {
+                    let list = heaps(list);
+                    encoded(&mut |e| e.use_heaps(&list, VERTEX_AND_FRAGMENT))
+                }
+                RenderCmd::UseHeapsStages {
+                    heaps: list,
+                    stages,
+                } => {
+                    let list = heaps(list);
+                    let stages: RenderStages = metal_value(sel, "render stages", stages);
+                    encoded(&mut |e| e.use_heaps(&list, stages))
+                }
+                RenderCmd::UseResources {
+                    resources: list,
+                    usage,
+                } => {
+                    let some = present(list);
+                    let usage: ResourceUsage = metal_value(sel, "resource usage", usage);
+                    let icbs = crate::gpu::icb::made_resident(list);
+                    if !icbs.is_empty() {
+                        // A function of the encoder's may copy any of their commands.
+                        let progress = self.encoder.progress(sel);
+                        for icb in &icbs {
+                            icb.resident(
+                                sel,
+                                progress.as_ref(),
+                                usage.contains(ResourceUsage::WRITE),
+                            );
+                        }
                     }
-                }
-                encoded(&mut |e| e.use_resources(&some, usage, VERTEX_AND_FRAGMENT))?;
-                if usage.contains(ResourceUsage::WRITE) {
-                    // A function of the encoder's may write their records.
-                    self.writable(&icbs);
-                }
-                if !icbs.is_empty() {
-                    self.encoder.hold(sel, icbs);
-                }
-                Ok(())
-            }
-            RenderCmd::UseResourcesStages {
-                resources: list,
-                usage,
-                stages,
-            } => {
-                let some = present(list);
-                let usage: ResourceUsage = metal_value(sel, "resource usage", usage);
-                let stages: RenderStages = metal_value(sel, "render stages", stages);
-                let icbs = crate::gpu::icb::made_resident(list);
-                if !icbs.is_empty() {
-                    // A function of the encoder's may copy any of their commands.
-                    let progress = self.encoder.progress(sel);
-                    for icb in &icbs {
-                        icb.resident(sel, progress.as_ref(), usage.contains(ResourceUsage::WRITE));
+                    encoded(&mut |e| e.use_resources(&some, usage, VERTEX_AND_FRAGMENT))?;
+                    if usage.contains(ResourceUsage::WRITE) {
+                        // A function of the encoder's may write their records.
+                        self.writable(&icbs);
                     }
+                    if !icbs.is_empty() {
+                        self.encoder.hold(sel, icbs);
+                    }
+                    Ok(())
                 }
-                encoded(&mut |e| e.use_resources(&some, usage, stages))?;
-                if usage.contains(ResourceUsage::WRITE) {
-                    // A function of the encoder's may write their records.
-                    self.writable(&icbs);
+                RenderCmd::UseResourcesStages {
+                    resources: list,
+                    usage,
+                    stages,
+                } => {
+                    let some = present(list);
+                    let usage: ResourceUsage = metal_value(sel, "resource usage", usage);
+                    let stages: RenderStages = metal_value(sel, "render stages", stages);
+                    let icbs = crate::gpu::icb::made_resident(list);
+                    if !icbs.is_empty() {
+                        // A function of the encoder's may copy any of their commands.
+                        let progress = self.encoder.progress(sel);
+                        for icb in &icbs {
+                            icb.resident(
+                                sel,
+                                progress.as_ref(),
+                                usage.contains(ResourceUsage::WRITE),
+                            );
+                        }
+                    }
+                    encoded(&mut |e| e.use_resources(&some, usage, stages))?;
+                    if usage.contains(ResourceUsage::WRITE) {
+                        // A function of the encoder's may write their records.
+                        self.writable(&icbs);
+                    }
+                    if !icbs.is_empty() {
+                        self.encoder.hold(sel, icbs);
+                    }
+                    Ok(())
                 }
-                if !icbs.is_empty() {
-                    self.encoder.hold(sel, icbs);
+                RenderCmd::WaitForFence { fence, stages } => {
+                    let stages: RenderStages = metal_value(sel, "render stages", stages);
+                    // A wait for a fence this encoder updated before completes on Metal
+                    // (`render_objects_fence`'s update then wait), as the runtime's waits for the
+                    // update before the encoder.
+                    encoded(&mut |e| e.wait_for_fence(fence, stages))
                 }
-                Ok(())
             }
-            RenderCmd::WaitForFence { fence, stages } => {
-                let stages: RenderStages = metal_value(sel, "render stages", stages);
-                // A wait for a fence this encoder updated before completes on Metal
-                // (`render_objects_fence`'s update then wait), as the runtime's waits for the
-                // update before the encoder.
-                encoded(&mut |e| e.wait_for_fence(fence, stages))
-            }
-        }
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A run of draws in a pass whose draws ask nothing of what the encoder holds
@@ -3240,6 +3280,8 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
         on: OnFault,
         draws: &[VertexDraw<'_, VulkanPlatform>],
     ) -> RaiseResult<()> {
+        let recorded_draws = crate::recorder::enter();
+        crate::recorder::draws(&recorded_draws, self, draws);
         self.encoding(|| match self.draws_quietly() {
             Some(held) => self.quiet_draws(&held, draws),
             None => encode_each(self, on, draws),

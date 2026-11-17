@@ -232,6 +232,7 @@ Everything a host can set that shapes what the library does, beside the guest's 
   | `REIMS_VGPU_CENSUS_DIR` | the Vulkan platform on Linux, a diagnostic for inventory runs: each difference that would end the process is recorded in that directory and logged instead, and the run says it is not faithful to Metal |
   | `REIMS_VGPU_TRACE` | the Vulkan platform, a diagnostic for profiling: a timeline of the device's work, a line per event, written to the file it names (core's `trace`) |
   | `REIMS_VGPU_TRACE_DEGRADE` | with `REIMS_VGPU_TRACE`, `1`: every occurrence of every difference from Metal the runtime announces is written to the trace |
+  | `REIMS_VGPU_RECORD` | the Vulkan platform, a diagnostic for replay: every call core makes of the platform, the guest's presents as the display shows them, and the host memory each command buffer reaches as it changes, written as a replay stream (metal2vulkan's format version 2) into the directory it names, the libraries into a `blobs` directory beside it (the crate's `recorder`). The stream holds the guest's data: it stays on the host that made it |
 
   Of these, only `REIMS_VGPU_STRICT`, `REIMS_VGPU_EXACT` and `REIMS_VGPU_CENSUS_DIR` change what the
   guest or host observes, and only on the Vulkan platform; `REIMS_VGPU_WINDOW_SCREENS` and

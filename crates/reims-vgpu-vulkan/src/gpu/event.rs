@@ -23,13 +23,18 @@ pub type VulkanSharedEventListener = Obj<rt::SharedEventListener>;
 impl SharedEvent<VulkanPlatform> for VulkanSharedEvent {
     /// The value becomes at least `signaled_value`; the runtime refuses no value.
     fn set_signaled_value(&self, signaled_value: u64) -> RaiseResult<()> {
-        // evset: event, value: the guest's or the device's host set
-        crate::core::trace::event(
-            "evset",
-            &[crate::gpu::command::event_id(self), signaled_value],
-        );
-        plain(|| rt::SharedEvent::set_signaled_value(self, signaled_value));
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!("setSignaledValue:", self, signaled_value);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            // evset: event, value: the guest's or the device's host set
+            crate::core::trace::event(
+                "evset",
+                &[crate::gpu::command::event_id(self), signaled_value],
+            );
+            plain(|| rt::SharedEvent::set_signaled_value(self, signaled_value));
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's value: the event's timeline as the GPU and the CPU have raised it.
@@ -39,13 +44,23 @@ impl SharedEvent<VulkanPlatform> for VulkanSharedEvent {
 
     /// Blocks up to `milliseconds`.
     fn wait_until_signaled_value(&self, value: u64, milliseconds: u64) -> bool {
-        plain(|| {
-            rt::SharedEvent::wait_until_signaled_value(
-                self,
-                value,
-                Duration::from_millis(milliseconds),
-            )
-        })
+        let recorded_call = crate::recorder::rec_call!(
+            "waitUntilSignaledValue:timeoutMS:",
+            self,
+            value,
+            milliseconds
+        );
+        let recorded_answer = crate::recorder::run(|| -> bool {
+            plain(|| {
+                rt::SharedEvent::wait_until_signaled_value(
+                    self,
+                    value,
+                    Duration::from_millis(milliseconds),
+                )
+            })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's notification: `block` runs once on the listener's thread, once the value

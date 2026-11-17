@@ -181,317 +181,332 @@ impl Concurrent for VulkanComputeEncoder {
 
 impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
     fn encode(&self, _on: OnFault, cmd: ComputeCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
-        let sel = cmd.selector();
-        predication::observe(self, &cmd);
-        let caught =
-            |call: &mut dyn FnMut(&mut rt::ComputeCommandEncoder) -> Result<(), rt::Error>| {
-                send(sel, Policy::Dies, || self.with(sel, |e| call(e)))
-            };
-        if matches!(
-            cmd,
-            ComputeCmd::DispatchThreadgroups { .. }
-                | ComputeCmd::DispatchThreadgroupsIndirect { .. }
-                | ComputeCmd::DispatchThreads { .. }
-                | ComputeCmd::DispatchThreadsIndirect { .. }
-        ) {
-            dispatchable(self, sel);
-        }
-        match cmd {
-            ComputeCmd::DispatchThreadgroups {
-                threadgroups_per_grid,
-                threads_per_threadgroup,
-            } => predication::work(
-                self,
-                sel,
-                Work::Threadgroups {
-                    groups: threadgroups_per_grid,
-                    threads: threads_per_threadgroup,
-                },
-            ),
-            ComputeCmd::DispatchThreadgroupsIndirect {
-                indirect_buffer,
-                indirect_buffer_offset,
-                threads_per_threadgroup,
-            } => {
-                let buffer = some(sel, indirect_buffer, "indirect buffer");
-                let work = Work::ThreadgroupsIndirect {
-                    buffer: &buffer.raw,
-                    offset: indirect_buffer_offset,
-                    threads: threads_per_threadgroup,
+        let recorded_call = crate::recorder::rec_call!(@cmd self, cmd);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let sel = cmd.selector();
+            predication::observe(self, &cmd);
+            let caught =
+                |call: &mut dyn FnMut(&mut rt::ComputeCommandEncoder) -> Result<(), rt::Error>| {
+                    send(sel, Policy::Dies, || self.with(sel, |e| call(e)))
                 };
-                predication::work(self, sel, work)
+            if matches!(
+                cmd,
+                ComputeCmd::DispatchThreadgroups { .. }
+                    | ComputeCmd::DispatchThreadgroupsIndirect { .. }
+                    | ComputeCmd::DispatchThreads { .. }
+                    | ComputeCmd::DispatchThreadsIndirect { .. }
+            ) {
+                dispatchable(self, sel);
             }
-            ComputeCmd::DispatchThreads {
-                threads_per_grid,
-                threads_per_threadgroup,
-            } => predication::work(
-                self,
-                sel,
-                Work::Threads {
-                    threads: threads_per_grid,
-                    per_group: threads_per_threadgroup,
-                },
-            ),
-            ComputeCmd::DispatchThreadsIndirect {
-                indirect_buffer,
-                indirect_buffer_offset,
-            } => {
-                let buffer = some(sel, indirect_buffer, "indirect buffer");
-                let work = Work::ThreadsIndirect {
-                    buffer: &buffer.raw,
-                    offset: indirect_buffer_offset,
-                };
-                predication::work(self, sel, work)
-            }
-            ComputeCmd::EncodeStartDoWhile => predication::start_do_while(self, sel),
-            ComputeCmd::EncodeStartElse => predication::start_else(self, sel),
-            ComputeCmd::EncodeStartIf {
-                buffer,
-                offset,
-                comparison,
-                reference_value,
-            } => predication::start_if(self, sel, buffer, offset, comparison, reference_value),
-            ComputeCmd::EncodeStartWhile {
-                buffer,
-                offset,
-                comparison,
-                reference_value,
-            } => predication::start_while(self, sel, buffer, offset, comparison, reference_value),
-            ComputeCmd::EndEncoding => self.end(sel, |e| e.end_encoding()),
-            ComputeCmd::ExecuteCommandsIndirect {
-                indirect_commandbuffer,
-                indirect_range_buffer,
-                indirect_buffer_offset,
-            } => {
-                let checked = executes(self, sel, (indirect_commandbuffer, None), false);
-                let progress = self.progress(sel);
-                indirect_commandbuffer.executed(sel, None, progress.as_ref());
-                let work = Work::ExecuteIndirect {
-                    icb: &indirect_commandbuffer.raw,
-                    buffer: &indirect_range_buffer.raw,
-                    offset: indirect_buffer_offset,
-                    inherits: indirect_commandbuffer.inherits,
-                    check: Cell::new(checked.as_ref().and_then(Execution::host_step_check)),
-                };
-                predication::work(self, sel, work)?;
-                checked_at_commit(self, checked);
-                if let Some(progress) = progress {
-                    progress.executes(sel, indirect_commandbuffer.clone_ref());
-                }
-                Ok(())
-            }
-            ComputeCmd::ExecuteCommandsInBuffer {
-                indirect_command_buffer,
-                execution_range,
-            } => {
-                let range = crate::gpu::range(execution_range).unwrap_or_else(|| {
-                    unrepresentable(sel, &format!("the range {execution_range:?}"))
-                });
-                let execution = (indirect_command_buffer, Some(range.clone()));
-                let checked = executes(self, sel, execution, range.is_empty());
-                let progress = self.progress(sel);
-                indirect_command_buffer.executed(sel, Some(range.clone()), progress.as_ref());
-                let work = Work::Execute {
-                    icb: &indirect_command_buffer.raw,
-                    range,
-                    inherits: indirect_command_buffer.inherits,
-                    check: Cell::new(checked.as_ref().and_then(Execution::host_step_check)),
-                };
-                predication::work(self, sel, work)?;
-                checked_at_commit(self, checked);
-                if let Some(progress) = progress {
-                    progress.executes(sel, indirect_command_buffer.clone_ref());
-                }
-                Ok(())
-            }
-            ComputeCmd::CompressedTextureReinterpretationFlush => caught(&mut |e| {
-                e.insert_compressed_texture_reinterpretation_flush();
-                Ok(())
-            }),
-            ComputeCmd::MemoryBarrierWithResources { resources: list } => {
-                let some = resources(list);
-                if some.is_empty() && !list.is_empty() {
-                    return caught(&mut |e| {
-                        e.memory_barrier_with_scope(
-                            BarrierScope::BUFFERS.union(BarrierScope::TEXTURES),
-                        );
-                        Ok(())
-                    });
-                }
-                caught(&mut |e| e.memory_barrier_with_resources(&some))
-            }
-            ComputeCmd::MemoryBarrierWithScope { scope } => {
-                let scope: BarrierScope = metal_value(sel, "barrier scope", scope);
-                caught(&mut |e| {
-                    e.memory_barrier_with_scope(scope);
-                    Ok(())
-                })
-            }
-            ComputeCmd::SetBufferOffset { offset, index } => {
-                let index = small(sel, index);
-                caught(&mut |e| e.set_buffer_offset(offset, index))
-            }
-            ComputeCmd::SetBufferOffsetAttributeStride {
-                offset,
-                stride,
-                index,
-            } => {
-                let index = small(sel, index);
-                caught(&mut |e| e.set_buffer_offset_with_stride(offset, stride, index))
-            }
-            ComputeCmd::SetBuffersAttributeStrides {
-                buffers,
-                offsets,
-                strides,
-                range,
-            } => {
-                let at = first(sel, range, &[buffers.len(), offsets.len(), strides.len()]);
-                listed(
-                    buffers,
-                    |b| b.map(|b| &b.raw),
-                    |buffers| {
-                        caught(&mut |e| e.set_buffers_with_strides(buffers, offsets, strides, at))
+            match cmd {
+                ComputeCmd::DispatchThreadgroups {
+                    threadgroups_per_grid,
+                    threads_per_threadgroup,
+                } => predication::work(
+                    self,
+                    sel,
+                    Work::Threadgroups {
+                        groups: threadgroups_per_grid,
+                        threads: threads_per_threadgroup,
                     },
-                )
-            }
-            ComputeCmd::SetBuffers {
-                buffers,
-                offsets,
-                range,
-            } => {
-                let at = first(sel, range, &[buffers.len(), offsets.len()]);
-                listed(
-                    buffers,
-                    |b| b.map(|b| &b.raw),
-                    |buffers| caught(&mut |e| e.set_buffers(buffers, offsets, at)),
-                )
-            }
-            ComputeCmd::SetComputePipelineState { state } => {
-                let state = some(sel, state, "pipeline state");
-                caught(&mut |e| e.set_compute_pipeline_state(state))?;
-                let encodes = plain(|| state.can_encode_indirect_commands());
-                self.encodes_icbs.store(encodes, Ordering::Relaxed);
-                self.pipeline
-                    .store(state.unique_identifier, Ordering::Relaxed);
-                Ok(())
-            }
-            ComputeCmd::SetImageblockWidth { width, height } => {
-                caught(&mut |e| e.set_imageblock_size(width, height))
-            }
-            ComputeCmd::SetSamplerStatesLodClamps {
-                samplers,
-                lod_min_clamps,
-                lod_max_clamps,
-                range,
-            } => {
-                let lengths = [samplers.len(), lod_min_clamps.len(), lod_max_clamps.len()];
-                let at = first(sel, range, &lengths);
-                listed(
-                    samplers,
-                    |s| s.map(|s| &**s),
-                    |samplers| {
-                        caught(&mut |e| {
-                            e.set_sampler_states_with_lod_clamps(
-                                samplers,
-                                lod_min_clamps,
-                                lod_max_clamps,
-                                at,
-                            )
-                        })
-                    },
-                )
-            }
-            ComputeCmd::SetSamplerStates { samplers, range } => {
-                let at = first(sel, range, &[samplers.len()]);
-                listed(
-                    samplers,
-                    |s| s.map(|s| &**s),
-                    |samplers| caught(&mut |e| e.set_sampler_states(samplers, at)),
-                )
-            }
-            ComputeCmd::SetStageInRegion { region: r } => {
-                caught(&mut |e| e.set_stage_in_region(region(r)))
-            }
-            ComputeCmd::SetStageInRegionIndirect {
-                indirect_buffer,
-                indirect_buffer_offset,
-            } => caught(&mut |e| {
-                e.set_stage_in_region_indirect(&indirect_buffer.raw, indirect_buffer_offset)
-            }),
-            ComputeCmd::SetTexture { texture, index } => {
-                let index = small(sel, index);
-                let texture = texture.map(|t| t.texels(sel));
-                caught(&mut |e| e.set_texture(texture, index))
-            }
-            ComputeCmd::SetTextures { textures, range } => {
-                let at = first(sel, range, &[textures.len()]);
-                listed(
-                    textures,
-                    |t| t.map(|t| t.texels(sel)),
-                    |textures| caught(&mut |e| e.set_textures(textures, at)),
-                )
-            }
-            ComputeCmd::SetThreadgroupMemoryLength { length, index } => {
-                let (length, index) = (small(sel, length), small(sel, index));
-                caught(&mut |e| e.set_threadgroup_memory_length(length, index))
-            }
-            ComputeCmd::SetVisibleFunctionTable {
-                function_table,
-                buffer_index,
-            } => {
-                let index = small(sel, buffer_index);
-                caught(&mut |e| e.set_visible_function_table(function_table.map(|t| &**t), index))
-            }
-            ComputeCmd::SetVisibleFunctionTables {
-                function_tables,
-                range,
-            } => {
-                let at = first(sel, range, &[function_tables.len()]);
-                listed(
-                    function_tables,
-                    |t| t.map(|t| &**t),
-                    |tables| caught(&mut |e| e.set_visible_function_tables(tables, at)),
-                )
-            }
-            ComputeCmd::UpdateFence { fence } => caught(&mut |e| e.update_fence(fence)),
-            ComputeCmd::UseHeaps { heaps } => {
-                let heaps: Vec<&rt::Heap> = heaps.iter().flatten().map(|h| &h.raw).collect();
-                caught(&mut |e| e.use_heaps(&heaps))
-            }
-            ComputeCmd::UseResources {
-                resources: list,
-                usage,
-            } => {
-                if list.iter().any(Option::is_none) && self.concurrent(sel) {
-                    unrepresentable(
-                        sel,
-                        "a nil resource in a concurrent encoder, which ends Metal's process",
-                    );
+                ),
+                ComputeCmd::DispatchThreadgroupsIndirect {
+                    indirect_buffer,
+                    indirect_buffer_offset,
+                    threads_per_threadgroup,
+                } => {
+                    let buffer = some(sel, indirect_buffer, "indirect buffer");
+                    let work = Work::ThreadgroupsIndirect {
+                        buffer: &buffer.raw,
+                        offset: indirect_buffer_offset,
+                        threads: threads_per_threadgroup,
+                    };
+                    predication::work(self, sel, work)
                 }
-                let some = resources(list);
-                let usage: ResourceUsage = metal_value(sel, "resource usage", usage);
-                let icbs = crate::gpu::icb::made_resident(list);
-                if !icbs.is_empty() {
-                    // A kernel may copy any of their commands.
+                ComputeCmd::DispatchThreads {
+                    threads_per_grid,
+                    threads_per_threadgroup,
+                } => predication::work(
+                    self,
+                    sel,
+                    Work::Threads {
+                        threads: threads_per_grid,
+                        per_group: threads_per_threadgroup,
+                    },
+                ),
+                ComputeCmd::DispatchThreadsIndirect {
+                    indirect_buffer,
+                    indirect_buffer_offset,
+                } => {
+                    let buffer = some(sel, indirect_buffer, "indirect buffer");
+                    let work = Work::ThreadsIndirect {
+                        buffer: &buffer.raw,
+                        offset: indirect_buffer_offset,
+                    };
+                    predication::work(self, sel, work)
+                }
+                ComputeCmd::EncodeStartDoWhile => predication::start_do_while(self, sel),
+                ComputeCmd::EncodeStartElse => predication::start_else(self, sel),
+                ComputeCmd::EncodeStartIf {
+                    buffer,
+                    offset,
+                    comparison,
+                    reference_value,
+                } => predication::start_if(self, sel, buffer, offset, comparison, reference_value),
+                ComputeCmd::EncodeStartWhile {
+                    buffer,
+                    offset,
+                    comparison,
+                    reference_value,
+                } => {
+                    predication::start_while(self, sel, buffer, offset, comparison, reference_value)
+                }
+                ComputeCmd::EndEncoding => self.end(sel, |e| e.end_encoding()),
+                ComputeCmd::ExecuteCommandsIndirect {
+                    indirect_commandbuffer,
+                    indirect_range_buffer,
+                    indirect_buffer_offset,
+                } => {
+                    let checked = executes(self, sel, (indirect_commandbuffer, None), false);
                     let progress = self.progress(sel);
-                    for icb in &icbs {
-                        icb.resident(sel, progress.as_ref(), usage.contains(ResourceUsage::WRITE));
+                    indirect_commandbuffer.executed(sel, None, progress.as_ref());
+                    let work = Work::ExecuteIndirect {
+                        icb: &indirect_commandbuffer.raw,
+                        buffer: &indirect_range_buffer.raw,
+                        offset: indirect_buffer_offset,
+                        inherits: indirect_commandbuffer.inherits,
+                        check: Cell::new(checked.as_ref().and_then(Execution::host_step_check)),
+                    };
+                    predication::work(self, sel, work)?;
+                    checked_at_commit(self, checked);
+                    if let Some(progress) = progress {
+                        progress.executes(sel, indirect_commandbuffer.clone_ref());
                     }
+                    Ok(())
                 }
-                caught(&mut |e| e.use_resources(&some, usage))?;
-                if usage.contains(ResourceUsage::WRITE) {
-                    plain(|| {
-                        let mut writable = self.writable_icbs.lock();
-                        writable.extend(icbs.iter().map(|icb| icb.clone_ref()));
+                ComputeCmd::ExecuteCommandsInBuffer {
+                    indirect_command_buffer,
+                    execution_range,
+                } => {
+                    let range = crate::gpu::range(execution_range).unwrap_or_else(|| {
+                        unrepresentable(sel, &format!("the range {execution_range:?}"))
                     });
+                    let execution = (indirect_command_buffer, Some(range.clone()));
+                    let checked = executes(self, sel, execution, range.is_empty());
+                    let progress = self.progress(sel);
+                    indirect_command_buffer.executed(sel, Some(range.clone()), progress.as_ref());
+                    let work = Work::Execute {
+                        icb: &indirect_command_buffer.raw,
+                        range,
+                        inherits: indirect_command_buffer.inherits,
+                        check: Cell::new(checked.as_ref().and_then(Execution::host_step_check)),
+                    };
+                    predication::work(self, sel, work)?;
+                    checked_at_commit(self, checked);
+                    if let Some(progress) = progress {
+                        progress.executes(sel, indirect_command_buffer.clone_ref());
+                    }
+                    Ok(())
                 }
-                if !icbs.is_empty() {
-                    self.hold(sel, icbs);
+                ComputeCmd::CompressedTextureReinterpretationFlush => caught(&mut |e| {
+                    e.insert_compressed_texture_reinterpretation_flush();
+                    Ok(())
+                }),
+                ComputeCmd::MemoryBarrierWithResources { resources: list } => {
+                    let some = resources(list);
+                    if some.is_empty() && !list.is_empty() {
+                        return caught(&mut |e| {
+                            e.memory_barrier_with_scope(
+                                BarrierScope::BUFFERS.union(BarrierScope::TEXTURES),
+                            );
+                            Ok(())
+                        });
+                    }
+                    caught(&mut |e| e.memory_barrier_with_resources(&some))
                 }
-                Ok(())
+                ComputeCmd::MemoryBarrierWithScope { scope } => {
+                    let scope: BarrierScope = metal_value(sel, "barrier scope", scope);
+                    caught(&mut |e| {
+                        e.memory_barrier_with_scope(scope);
+                        Ok(())
+                    })
+                }
+                ComputeCmd::SetBufferOffset { offset, index } => {
+                    let index = small(sel, index);
+                    caught(&mut |e| e.set_buffer_offset(offset, index))
+                }
+                ComputeCmd::SetBufferOffsetAttributeStride {
+                    offset,
+                    stride,
+                    index,
+                } => {
+                    let index = small(sel, index);
+                    caught(&mut |e| e.set_buffer_offset_with_stride(offset, stride, index))
+                }
+                ComputeCmd::SetBuffersAttributeStrides {
+                    buffers,
+                    offsets,
+                    strides,
+                    range,
+                } => {
+                    let at = first(sel, range, &[buffers.len(), offsets.len(), strides.len()]);
+                    listed(
+                        buffers,
+                        |b| b.map(|b| &b.raw),
+                        |buffers| {
+                            caught(&mut |e| {
+                                e.set_buffers_with_strides(buffers, offsets, strides, at)
+                            })
+                        },
+                    )
+                }
+                ComputeCmd::SetBuffers {
+                    buffers,
+                    offsets,
+                    range,
+                } => {
+                    let at = first(sel, range, &[buffers.len(), offsets.len()]);
+                    listed(
+                        buffers,
+                        |b| b.map(|b| &b.raw),
+                        |buffers| caught(&mut |e| e.set_buffers(buffers, offsets, at)),
+                    )
+                }
+                ComputeCmd::SetComputePipelineState { state } => {
+                    let state = some(sel, state, "pipeline state");
+                    caught(&mut |e| e.set_compute_pipeline_state(state))?;
+                    let encodes = plain(|| state.can_encode_indirect_commands());
+                    self.encodes_icbs.store(encodes, Ordering::Relaxed);
+                    self.pipeline
+                        .store(state.unique_identifier, Ordering::Relaxed);
+                    Ok(())
+                }
+                ComputeCmd::SetImageblockWidth { width, height } => {
+                    caught(&mut |e| e.set_imageblock_size(width, height))
+                }
+                ComputeCmd::SetSamplerStatesLodClamps {
+                    samplers,
+                    lod_min_clamps,
+                    lod_max_clamps,
+                    range,
+                } => {
+                    let lengths = [samplers.len(), lod_min_clamps.len(), lod_max_clamps.len()];
+                    let at = first(sel, range, &lengths);
+                    listed(
+                        samplers,
+                        |s| s.map(|s| &**s),
+                        |samplers| {
+                            caught(&mut |e| {
+                                e.set_sampler_states_with_lod_clamps(
+                                    samplers,
+                                    lod_min_clamps,
+                                    lod_max_clamps,
+                                    at,
+                                )
+                            })
+                        },
+                    )
+                }
+                ComputeCmd::SetSamplerStates { samplers, range } => {
+                    let at = first(sel, range, &[samplers.len()]);
+                    listed(
+                        samplers,
+                        |s| s.map(|s| &**s),
+                        |samplers| caught(&mut |e| e.set_sampler_states(samplers, at)),
+                    )
+                }
+                ComputeCmd::SetStageInRegion { region: r } => {
+                    caught(&mut |e| e.set_stage_in_region(region(r)))
+                }
+                ComputeCmd::SetStageInRegionIndirect {
+                    indirect_buffer,
+                    indirect_buffer_offset,
+                } => caught(&mut |e| {
+                    e.set_stage_in_region_indirect(&indirect_buffer.raw, indirect_buffer_offset)
+                }),
+                ComputeCmd::SetTexture { texture, index } => {
+                    let index = small(sel, index);
+                    let texture = texture.map(|t| t.texels(sel));
+                    caught(&mut |e| e.set_texture(texture, index))
+                }
+                ComputeCmd::SetTextures { textures, range } => {
+                    let at = first(sel, range, &[textures.len()]);
+                    listed(
+                        textures,
+                        |t| t.map(|t| t.texels(sel)),
+                        |textures| caught(&mut |e| e.set_textures(textures, at)),
+                    )
+                }
+                ComputeCmd::SetThreadgroupMemoryLength { length, index } => {
+                    let (length, index) = (small(sel, length), small(sel, index));
+                    caught(&mut |e| e.set_threadgroup_memory_length(length, index))
+                }
+                ComputeCmd::SetVisibleFunctionTable {
+                    function_table,
+                    buffer_index,
+                } => {
+                    let index = small(sel, buffer_index);
+                    caught(&mut |e| {
+                        e.set_visible_function_table(function_table.map(|t| &**t), index)
+                    })
+                }
+                ComputeCmd::SetVisibleFunctionTables {
+                    function_tables,
+                    range,
+                } => {
+                    let at = first(sel, range, &[function_tables.len()]);
+                    listed(
+                        function_tables,
+                        |t| t.map(|t| &**t),
+                        |tables| caught(&mut |e| e.set_visible_function_tables(tables, at)),
+                    )
+                }
+                ComputeCmd::UpdateFence { fence } => caught(&mut |e| e.update_fence(fence)),
+                ComputeCmd::UseHeaps { heaps } => {
+                    let heaps: Vec<&rt::Heap> = heaps.iter().flatten().map(|h| &h.raw).collect();
+                    caught(&mut |e| e.use_heaps(&heaps))
+                }
+                ComputeCmd::UseResources {
+                    resources: list,
+                    usage,
+                } => {
+                    if list.iter().any(Option::is_none) && self.concurrent(sel) {
+                        unrepresentable(
+                            sel,
+                            "a nil resource in a concurrent encoder, which ends Metal's process",
+                        );
+                    }
+                    let some = resources(list);
+                    let usage: ResourceUsage = metal_value(sel, "resource usage", usage);
+                    let icbs = crate::gpu::icb::made_resident(list);
+                    if !icbs.is_empty() {
+                        // A kernel may copy any of their commands.
+                        let progress = self.progress(sel);
+                        for icb in &icbs {
+                            icb.resident(
+                                sel,
+                                progress.as_ref(),
+                                usage.contains(ResourceUsage::WRITE),
+                            );
+                        }
+                    }
+                    caught(&mut |e| e.use_resources(&some, usage))?;
+                    if usage.contains(ResourceUsage::WRITE) {
+                        plain(|| {
+                            let mut writable = self.writable_icbs.lock();
+                            writable.extend(icbs.iter().map(|icb| icb.clone_ref()));
+                        });
+                    }
+                    if !icbs.is_empty() {
+                        self.hold(sel, icbs);
+                    }
+                    Ok(())
+                }
+                ComputeCmd::WaitForFence { fence } => caught(&mut |e| e.wait_for_fence(fence)),
             }
-            ComputeCmd::WaitForFence { fence } => caught(&mut |e| e.wait_for_fence(fence)),
-        }
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn encode_end_do_while(
@@ -501,8 +516,20 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
         comparison: u64,
         reference_value: u32,
     ) -> RaiseResult<bool> {
-        let sel = "encodeEndDoWhile:offset:comparison:referenceValue:";
-        predication::end_do_while(self, sel, buffer, offset, comparison, reference_value)
+        let recorded_call = crate::recorder::rec_call!(
+            "encodeEndDoWhile:offset:comparison:referenceValue:",
+            self,
+            buffer,
+            offset,
+            comparison,
+            reference_value
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<bool> {
+            let sel = "encodeEndDoWhile:offset:comparison:referenceValue:";
+            predication::end_do_while(self, sel, buffer, offset, comparison, reference_value)
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn encode_end_if(&self) -> RaiseResult<bool> {

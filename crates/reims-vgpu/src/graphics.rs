@@ -1316,6 +1316,9 @@ impl<P: Platform> Presented<P> {
             }
             *shown = (shown.0.wrapping_add(1), Arc::new(next));
         }
+        if let Shows::Surface(_, Some(shown)) = &shows {
+            reims_vgpu_vulkan::recorder::present(&shown.texture);
+        }
         let hold = match shows {
             Shows::Kept => None,
             Shows::Surface(id, texture) => self.swap(id, texture),

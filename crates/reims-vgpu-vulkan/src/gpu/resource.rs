@@ -812,11 +812,16 @@ impl GpuResource<VulkanPlatform> for VulkanBuffer {
     /// The state before the change. A raw state no `MTLPurgeableState` is is refused, as Metal's
     /// validation refuses it.
     fn set_purgeable_state(&self, state: u64) -> RaiseResult<u64> {
-        send("setPurgeableState:", Policy::Dies, || {
-            self.raw
-                .set_purgeable_state(rt::PurgeableState::from_raw(state)?)
-        })
-        .map(rt::PurgeableState::raw)
+        let recorded_call = crate::recorder::rec_call!("setPurgeableState:", self, state);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<u64> {
+            send("setPurgeableState:", Policy::Dies, || {
+                self.raw
+                    .set_purgeable_state(rt::PurgeableState::from_raw(state)?)
+            })
+            .map(rt::PurgeableState::raw)
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn storage_mode(&self) -> u64 {
@@ -835,10 +840,16 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
     /// range past the buffer, as Metal's validation refuses it. A range whose end passes
     /// `u64::MAX` dies.
     fn did_modify_range(&self, _on: OnFault, range: NsRange) -> RaiseResult<()> {
-        let sel = "didModifyRange:";
-        let range = crate::gpu::range(range)
-            .unwrap_or_else(|| unrepresentable(sel, &format!("the range {range:?}")));
-        send(sel, Policy::Dies, || self.raw.did_modify_range(range))
+        let recorded_call = crate::recorder::rec_call!("didModifyRange:", self, range);
+        crate::recorder::before_modify(&recorded_call, self, &range);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let sel = "didModifyRange:";
+            let range = crate::gpu::range(range)
+                .unwrap_or_else(|| unrepresentable(sel, &format!("the range {range:?}")));
+            send(sel, Policy::Dies, || self.raw.did_modify_range(range))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn gpu_address(&self) -> u64 {
@@ -859,22 +870,34 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         bytes_per_row: u64,
         bytes_per_image: u64,
     ) -> RaiseResult<Option<VulkanTexture>> {
-        let sel = "newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:";
-        let fields = descriptor.fields();
-        let desc = fields.descriptor(sel, Maker::Other);
-        let format = fields.raw_pixel_format();
-        let Some(raw) = create(sel, Policy::Dies, Nil::Never, || {
-            (self
-                .raw
-                .new_linear_texture(&desc, offset, bytes_per_row, bytes_per_image))
-            .map_err(|e| created_format_refused(sel, "a texture of", format, e))
-        })?
-        else {
-            return Ok(None);
-        };
-        let bytes = texel_bytes(&desc, (offset, bytes_per_row), plain(|| self.raw.length()));
-        let under = Under::Buffer(self.clone_ref(), bytes);
-        Ok(Some(self.device.texture_in(raw, under, 0)))
+        let recorded_call = crate::recorder::rec_call!(
+            "newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:",
+            self,
+            descriptor,
+            offset,
+            bytes_per_row,
+            bytes_per_image
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanTexture>> {
+            let sel = "newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:";
+            let fields = descriptor.fields();
+            let desc = fields.descriptor(sel, Maker::Other);
+            let format = fields.raw_pixel_format();
+            let Some(raw) = create(sel, Policy::Dies, Nil::Never, || {
+                (self
+                    .raw
+                    .new_linear_texture(&desc, offset, bytes_per_row, bytes_per_image))
+                .map_err(|e| created_format_refused(sel, "a texture of", format, e))
+            })?
+            else {
+                return Ok(None);
+            };
+            let bytes = texel_bytes(&desc, (offset, bytes_per_row), plain(|| self.raw.length()));
+            let under = Under::Buffer(self.clone_ref(), bytes);
+            Ok(Some(self.device.texture_in(raw, under, 0)))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A texture of the buffer's bytes from `offset`, rows `bytes_per_row` apart. Refused as
@@ -889,20 +912,31 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         offset: u64,
         bytes_per_row: u64,
     ) -> RaiseResult<Option<VulkanTexture>> {
-        let sel = "newTextureWithDescriptor:offset:bytesPerRow:";
-        let fields = descriptor.fields();
-        let desc = fields.descriptor(sel, Maker::Other);
-        let format = fields.raw_pixel_format();
-        let Some(raw) = create(sel, Policy::Dies, Nil::Never, || {
-            buffer_texture_type(sel, self.raw.new_texture(&desc, offset, bytes_per_row))
-                .map_err(|e| created_format_refused(sel, "a texture of", format, e))
-        })?
-        else {
-            return Ok(None);
-        };
-        let bytes = texel_bytes(&desc, (offset, bytes_per_row), plain(|| self.raw.length()));
-        let under = Under::Buffer(self.clone_ref(), bytes);
-        Ok(Some(self.device.texture_in(raw, under, 0)))
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureWithDescriptor:offset:bytesPerRow:",
+            self,
+            descriptor,
+            offset,
+            bytes_per_row
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanTexture>> {
+            let sel = "newTextureWithDescriptor:offset:bytesPerRow:";
+            let fields = descriptor.fields();
+            let desc = fields.descriptor(sel, Maker::Other);
+            let format = fields.raw_pixel_format();
+            let Some(raw) = create(sel, Policy::Dies, Nil::Never, || {
+                buffer_texture_type(sel, self.raw.new_texture(&desc, offset, bytes_per_row))
+                    .map_err(|e| created_format_refused(sel, "a texture of", format, e))
+            })?
+            else {
+                return Ok(None);
+            };
+            let bytes = texel_bytes(&desc, (offset, bytes_per_row), plain(|| self.raw.length()));
+            let under = Under::Buffer(self.clone_ref(), bytes);
+            Ok(Some(self.device.texture_in(raw, under, 0)))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's tiled texture (`Buffer::new_tiled_texture`): one level is the texture
@@ -919,20 +953,31 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         offset: u64,
         bytes_per_row: u64,
     ) -> RaiseResult<Option<VulkanTexture>> {
-        let sel = "newTiledTextureWithDescriptor:offset:bytesPerRow:";
-        let fields = descriptor.fields();
-        let desc = fields.descriptor(sel, Maker::Other);
-        let format = fields.raw_pixel_format();
-        let Some(raw) = create(sel, Policy::Dies, Nil::Never, || {
-            (self.raw.new_tiled_texture(&desc, offset, bytes_per_row))
-                .map_err(|e| created_format_refused(sel, "a texture of", format, e))
-        })?
-        else {
-            return Ok(None);
-        };
-        let bytes = texel_bytes(&desc, (offset, bytes_per_row), plain(|| self.raw.length()));
-        let under = Under::Buffer(self.clone_ref(), bytes);
-        Ok(Some(self.device.texture_in(raw, under, 0)))
+        let recorded_call = crate::recorder::rec_call!(
+            "newTiledTextureWithDescriptor:offset:bytesPerRow:",
+            self,
+            descriptor,
+            offset,
+            bytes_per_row
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanTexture>> {
+            let sel = "newTiledTextureWithDescriptor:offset:bytesPerRow:";
+            let fields = descriptor.fields();
+            let desc = fields.descriptor(sel, Maker::Other);
+            let format = fields.raw_pixel_format();
+            let Some(raw) = create(sel, Policy::Dies, Nil::Never, || {
+                (self.raw.new_tiled_texture(&desc, offset, bytes_per_row))
+                    .map_err(|e| created_format_refused(sel, "a texture of", format, e))
+            })?
+            else {
+                return Ok(None);
+            };
+            let bytes = texel_bytes(&desc, (offset, bytes_per_row), plain(|| self.raw.length()));
+            let under = Under::Buffer(self.clone_ref(), bytes);
+            Ok(Some(self.device.texture_in(raw, under, 0)))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A texture of the buffer's bytes as Metal's IOSurface creator makes one over the plane of
@@ -957,58 +1002,70 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         descriptor: &VulkanTextureDescriptor,
         plane: SurfacePlane,
     ) -> RaiseResult<Option<VulkanTexture>> {
-        use crate::gpu::device::{PlaneFacts, plane_facts_taken};
-        let Some(facts) = plane.facts else {
-            return self.new_texture(on, descriptor, plane.offset, plane.bytes_per_row);
-        };
-        let sel = "newTextureWithDescriptor:iosurface:plane:";
-        let fields = descriptor.fields();
-        let device = &self.device.raw;
-        let Some(desc) = crate::gpu::device::surface_plane_descriptor(device, sel, &fields)? else {
-            return Ok(None);
-        };
-        // Metal asserts at a plane past 0 of a surface without planes, whatever the format
-        // ("IOSurface is non-planar, but plane 1 specified"), and answers nil at a plane past a
-        // planar surface's last (measured: `textures_over_planes_a_surface_lacks_are_metals`).
-        if plane.plane != 0 && facts.plane_count == 0 {
-            let what = format!("plane {} of a surface without planes", plane.plane);
-            metal_aborts(sel, &what);
-        }
-        if facts.plane_count != 0 && plane.plane >= facts.plane_count {
-            return Ok(None);
-        }
-        let taken = plane_facts_taken(desc.pixel_format).filter(|_| facts.plane_count >= 2);
-        let ycbcr = taken.map(|kind| {
-            let size = [facts.width, facts.height];
-            let (chroma, rows) = (facts.chroma_offset, facts.chroma_bytes_per_row);
-            let read = rt::IoSurfaceYCbCr::new(facts.pixel_format, plane.plane, size, chroma, rows);
-            match (kind, facts.ycbcr_matrix) {
-                (PlaneFacts::YCbCr, Some(matrix)) => read.with_matrix(ycbcr_matrix(matrix)),
-                _ => read,
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureWithDescriptor:iosurface:plane:",
+            self,
+            descriptor,
+            plane
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanTexture>> {
+            use crate::gpu::device::{PlaneFacts, plane_facts_taken};
+            let Some(facts) = plane.facts else {
+                return self.new_texture(on, descriptor, plane.offset, plane.bytes_per_row);
+            };
+            let sel = "newTextureWithDescriptor:iosurface:plane:";
+            let fields = descriptor.fields();
+            let device = &self.device.raw;
+            let Some(desc) = crate::gpu::device::surface_plane_descriptor(device, sel, &fields)?
+            else {
+                return Ok(None);
+            };
+            // Metal asserts at a plane past 0 of a surface without planes, whatever the format
+            // ("IOSurface is non-planar, but plane 1 specified"), and answers nil at a plane past a
+            // planar surface's last (measured: `textures_over_planes_a_surface_lacks_are_metals`).
+            if plane.plane != 0 && facts.plane_count == 0 {
+                let what = format!("plane {} of a surface without planes", plane.plane);
+                metal_aborts(sel, &what);
             }
+            if facts.plane_count != 0 && plane.plane >= facts.plane_count {
+                return Ok(None);
+            }
+            let taken = plane_facts_taken(desc.pixel_format).filter(|_| facts.plane_count >= 2);
+            let ycbcr = taken.map(|kind| {
+                let size = [facts.width, facts.height];
+                let (chroma, rows) = (facts.chroma_offset, facts.chroma_bytes_per_row);
+                let read =
+                    rt::IoSurfaceYCbCr::new(facts.pixel_format, plane.plane, size, chroma, rows);
+                match (kind, facts.ycbcr_matrix) {
+                    (PlaneFacts::YCbCr, Some(matrix)) => read.with_matrix(ycbcr_matrix(matrix)),
+                    _ => read,
+                }
+            });
+            let at = rt::IoSurfacePlane::new(plane.offset, plane.bytes_per_row, plane.planar);
+            let at = match ycbcr {
+                Some(ycbcr) => at.with_ycbcr(ycbcr),
+                None => at,
+            };
+            let raw = crate::gpu::device::texture_over_plane(sel, &fields, &self.raw, &desc, at)?;
+            let Some(raw) = raw else {
+                return Ok(None);
+            };
+            let length = plain(|| self.raw.length());
+            let mut bytes = texel_bytes(&desc, (plane.offset, plane.bytes_per_row), length);
+            if ycbcr.is_some() && plane.plane == 0 {
+                let rows = facts.chroma_bytes_per_row.saturating_mul(facts.height);
+                let end = facts.chroma_offset.saturating_add(rows).min(length);
+                bytes = bytes.start.min(facts.chroma_offset.min(length))..bytes.end.max(end);
+            }
+            let under = Under::Buffer(self.clone_ref(), bytes);
+            let surface = match facts.plane_count {
+                0 => OverSurface::Whole,
+                _ => OverSurface::Plane,
+            };
+            Ok(Some(self.device.texture_over_surface(raw, under, surface)))
         });
-        let at = rt::IoSurfacePlane::new(plane.offset, plane.bytes_per_row, plane.planar);
-        let at = match ycbcr {
-            Some(ycbcr) => at.with_ycbcr(ycbcr),
-            None => at,
-        };
-        let raw = crate::gpu::device::texture_over_plane(sel, &fields, &self.raw, &desc, at)?;
-        let Some(raw) = raw else {
-            return Ok(None);
-        };
-        let length = plain(|| self.raw.length());
-        let mut bytes = texel_bytes(&desc, (plane.offset, plane.bytes_per_row), length);
-        if ycbcr.is_some() && plane.plane == 0 {
-            let rows = facts.chroma_bytes_per_row.saturating_mul(facts.height);
-            let end = facts.chroma_offset.saturating_add(rows).min(length);
-            bytes = bytes.start.min(facts.chroma_offset.min(length))..bytes.end.max(end);
-        }
-        let under = Under::Buffer(self.clone_ref(), bytes);
-        let surface = match facts.plane_count {
-            0 => OverSurface::Whole,
-            _ => OverSurface::Plane,
-        };
-        Ok(Some(self.device.texture_over_surface(raw, under, surface)))
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's export of the buffer's memory (`export_memory_fd`): a buffer the runtime
@@ -1048,51 +1105,57 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         bytes: HostRange<'_>,
         deallocator: Option<NoCopyDeallocator>,
     ) -> Result<(), String> {
-        use crate::gpu::device::{NoCopyImport, no_copy_release, runtime_deallocator};
-        if self.backing.read_only_now() {
-            return Err("a buffer whose GPU writes are dropped".to_owned());
-        }
-        if bytes.len() != plain(|| self.raw.length()) {
-            return Err("new bytes of another length".to_owned());
-        }
-        let Some(start) = NonNull::new(bytes.ptr().as_ptr::<u8>()) else {
-            return Err("new bytes at no address".to_owned());
-        };
-        let slot = deallocator.map(|d| Arc::new(Mutex::new(Some(d))));
-        let run = slot
-            .as_ref()
-            .map(|slot| runtime_deallocator(slot, |d: NoCopyDeallocator, _, _| d()));
-        let NoCopyImport {
-            at,
-            run,
-            keep,
-            read_only,
-            vouched,
-            made,
-        } = no_copy_release(
-            start,
-            bytes.len(),
-            run,
-            crate::gpu::backing::ImportSite::NoCopyDescriptor,
-        );
-        if read_only {
-            return Err("new bytes mapped read-only".to_owned());
-        }
-        // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the deallocator runs,
-        // and the keep-alive holds the import's pages mapped until the runtime freed it. The
-        // runtime's rebind allows encodes and commits of the buffer on other threads; the trait's
-        // caller moves no other of its bytes and makes no texture over them meanwhile.
-        let rebound = plain(|| unsafe {
-            let memory = crate::os::host_memory_vouched(at, vouched);
-            self.raw.rebind_bytes_no_copy(memory, run, Some(keep))
-        });
-        match rebound {
-            Ok(()) => {
-                made.made(&self.device.raw);
-                Ok(())
+        let recorded_call =
+            crate::recorder::rec_call!("m2v.rebindNoCopy", self, bytes, deallocator);
+        let recorded_answer = crate::recorder::run(|| -> Result<(), String> {
+            use crate::gpu::device::{NoCopyImport, no_copy_release, runtime_deallocator};
+            if self.backing.read_only_now() {
+                return Err("a buffer whose GPU writes are dropped".to_owned());
             }
-            Err(error) => Err(error.to_string()),
-        }
+            if bytes.len() != plain(|| self.raw.length()) {
+                return Err("new bytes of another length".to_owned());
+            }
+            let Some(start) = NonNull::new(bytes.ptr().as_ptr::<u8>()) else {
+                return Err("new bytes at no address".to_owned());
+            };
+            let slot = deallocator.map(|d| Arc::new(Mutex::new(Some(d))));
+            let run = slot
+                .as_ref()
+                .map(|slot| runtime_deallocator(slot, |d: NoCopyDeallocator, _, _| d()));
+            let NoCopyImport {
+                at,
+                run,
+                keep,
+                read_only,
+                vouched,
+                made,
+            } = no_copy_release(
+                start,
+                bytes.len(),
+                run,
+                crate::gpu::backing::ImportSite::NoCopyDescriptor,
+            );
+            if read_only {
+                return Err("new bytes mapped read-only".to_owned());
+            }
+            // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the deallocator runs,
+            // and the keep-alive holds the import's pages mapped until the runtime freed it. The
+            // runtime's rebind allows encodes and commits of the buffer on other threads; the trait's
+            // caller moves no other of its bytes and makes no texture over them meanwhile.
+            let rebound = plain(|| unsafe {
+                let memory = crate::os::host_memory_vouched(at, vouched);
+                self.raw.rebind_bytes_no_copy(memory, run, Some(keep))
+            });
+            match rebound {
+                Ok(()) => {
+                    made.made(&self.device.raw);
+                    Ok(())
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 }
 
@@ -1128,11 +1191,16 @@ impl GpuResource<VulkanPlatform> for VulkanTexture {
     /// it; `NonVolatile` where Metal answers that to every request. A raw state no
     /// `MTLPurgeableState` is is refused, as Metal's validation refuses it.
     fn set_purgeable_state(&self, state: u64) -> RaiseResult<u64> {
-        send("setPurgeableState:", Policy::Dies, || {
-            self.raw
-                .set_purgeable_state(rt::PurgeableState::from_raw(state)?)
-        })
-        .map(rt::PurgeableState::raw)
+        let recorded_call = crate::recorder::rec_call!("setPurgeableState:", self, state);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<u64> {
+            send("setPurgeableState:", Policy::Dies, || {
+                self.raw
+                    .set_purgeable_state(rt::PurgeableState::from_raw(state)?)
+            })
+            .map(rt::PurgeableState::raw)
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's.
@@ -1283,7 +1351,9 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     /// command buffer, as an x86 Mac's does (docs/graphics-kext/dgpu-oracle.md, Q11); any other
     /// texture is left as it is.
     fn did_modify_data(&self) {
-        plain(|| self.raw.did_modify_data())
+        let recorded_call = crate::recorder::rec_call!("didModifyData", self);
+        crate::recorder::run(|| plain(|| self.raw.did_modify_data()));
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     fn gpu_resource_id(&self) -> u64 {
@@ -1304,24 +1374,36 @@ impl Texture<VulkanPlatform> for VulkanTexture {
 
     /// An in-process handle; nil for a texture that is not shareable, as Metal answers.
     fn new_shared_texture_handle(&self) -> RaiseResult<Option<VulkanSharedTextureHandle>> {
-        let sel = "newSharedTextureHandle";
-        let made = plain_at(sel, || self.raw.new_shared_texture_handle());
-        Ok(made.ok().map(|raw| {
-            Obj::new(SharedTextureHandleObject {
-                raw,
-                private_usage: self.private_usage,
-                space: Arc::clone(&self.space),
-            })
-        }))
+        let recorded_call = crate::recorder::rec_call!("newSharedTextureHandle", self);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<VulkanSharedTextureHandle>> {
+                let sel = "newSharedTextureHandle";
+                let made = plain_at(sel, || self.raw.new_shared_texture_handle());
+                Ok(made.ok().map(|raw| {
+                    Obj::new(SharedTextureHandleObject {
+                        raw,
+                        private_usage: self.private_usage,
+                        space: Arc::clone(&self.space),
+                    })
+                }))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn new_texture_view(&self, pixel_format: u64) -> RaiseResult<Option<VulkanTexture>> {
-        let sel = "newTextureViewWithPixelFormat:";
-        if self.no_view_of(sel, pixel_format) {
-            return Ok(None);
-        }
-        let format = view_format(sel, pixel_format);
-        self.view(sel, pixel_format, false, |t| t.new_texture_view(format))
+        let recorded_call =
+            crate::recorder::rec_call!("newTextureViewWithPixelFormat:", self, pixel_format);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanTexture>> {
+            let sel = "newTextureViewWithPixelFormat:";
+            if self.no_view_of(sel, pixel_format) {
+                return Ok(None);
+            }
+            let format = view_format(sel, pixel_format);
+            self.view(sel, pixel_format, false, |t| t.new_texture_view(format))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn new_texture_view_at_index(
@@ -1329,14 +1411,24 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         pixel_format: u64,
         resource_index: u64,
     ) -> RaiseResult<Option<VulkanTexture>> {
-        let sel = "newTextureViewWithPixelFormat:resourceIndex:";
-        if self.no_view_of(sel, pixel_format) {
-            return Ok(None);
-        }
-        let format = view_format(sel, pixel_format);
-        self.view(sel, pixel_format, false, |t| {
-            t.new_texture_view_with_placement(format, at(resource_index))
-        })
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureViewWithPixelFormat:resourceIndex:",
+            self,
+            pixel_format,
+            resource_index
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanTexture>> {
+            let sel = "newTextureViewWithPixelFormat:resourceIndex:";
+            if self.no_view_of(sel, pixel_format) {
+                return Ok(None);
+            }
+            let format = view_format(sel, pixel_format);
+            self.view(sel, pixel_format, false, |t| {
+                t.new_texture_view_with_placement(format, at(resource_index))
+            })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn new_texture_subview(
@@ -1346,16 +1438,28 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         level_range: NsRange,
         slice_range: NsRange,
     ) -> RaiseResult<Option<VulkanTexture>> {
-        let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:";
-        if self.no_view_of(sel, pixel_format) {
-            return Ok(None);
-        }
-        let kind = crate::gpu::texture_type(sel, texture_type);
-        let (levels, slices) = (indices(sel, level_range), indices(sel, slice_range));
-        let format = view_format(sel, pixel_format);
-        self.view(sel, pixel_format, false, |t| {
-            t.new_texture_view_with_levels_slices(format, kind, levels, slices)
-        })
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureViewWithPixelFormat:textureType:levels:slices:",
+            self,
+            pixel_format,
+            texture_type,
+            level_range,
+            slice_range
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanTexture>> {
+            let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:";
+            if self.no_view_of(sel, pixel_format) {
+                return Ok(None);
+            }
+            let kind = crate::gpu::texture_type(sel, texture_type);
+            let (levels, slices) = (indices(sel, level_range), indices(sel, slice_range));
+            let format = view_format(sel, pixel_format);
+            self.view(sel, pixel_format, false, |t| {
+                t.new_texture_view_with_levels_slices(format, kind, levels, slices)
+            })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn new_swizzled_texture_subview(
@@ -1366,17 +1470,30 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         slice_range: NsRange,
         swizzle: Swizzle,
     ) -> RaiseResult<Option<VulkanTexture>> {
-        let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:";
-        if self.no_view_of(sel, pixel_format) {
-            return Ok(None);
-        }
-        let kind = crate::gpu::texture_type(sel, texture_type);
-        let (levels, slices) = (indices(sel, level_range), indices(sel, slice_range));
-        let swizzle = crate::gpu::swizzle(sel, swizzle);
-        let format = view_format(sel, pixel_format);
-        self.view(sel, pixel_format, !swizzle.is_default(), |t| {
-            t.new_texture_view_with_swizzle(format, kind, levels, slices, swizzle)
-        })
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:",
+            self,
+            pixel_format,
+            texture_type,
+            level_range,
+            slice_range,
+            swizzle
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanTexture>> {
+            let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:";
+            if self.no_view_of(sel, pixel_format) {
+                return Ok(None);
+            }
+            let kind = crate::gpu::texture_type(sel, texture_type);
+            let (levels, slices) = (indices(sel, level_range), indices(sel, slice_range));
+            let swizzle = crate::gpu::swizzle(sel, swizzle);
+            let format = view_format(sel, pixel_format);
+            self.view(sel, pixel_format, !swizzle.is_default(), |t| {
+                t.new_texture_view_with_swizzle(format, kind, levels, slices, swizzle)
+            })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn new_swizzled_texture_subview_at_index(
@@ -1388,24 +1505,39 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         swizzle: Swizzle,
         resource_index: u64,
     ) -> RaiseResult<Option<VulkanTexture>> {
-        let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:resourceIndex:";
-        if self.no_view_of(sel, pixel_format) {
-            return Ok(None);
-        }
-        let kind = crate::gpu::texture_type(sel, texture_type);
-        let (levels, slices) = (indices(sel, levels), indices(sel, slices));
-        let swizzle = crate::gpu::swizzle(sel, swizzle);
-        let format = view_format(sel, pixel_format);
-        self.view(sel, pixel_format, !swizzle.is_default(), |t| {
-            t.new_texture_subview_with_placement(
-                format,
-                kind,
-                levels,
-                slices,
-                Some(swizzle),
-                at(resource_index),
-            )
-        })
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:resourceIndex:",
+            self,
+            pixel_format,
+            texture_type,
+            levels,
+            slices,
+            swizzle,
+            resource_index
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanTexture>> {
+            let sel =
+                "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:resourceIndex:";
+            if self.no_view_of(sel, pixel_format) {
+                return Ok(None);
+            }
+            let kind = crate::gpu::texture_type(sel, texture_type);
+            let (levels, slices) = (indices(sel, levels), indices(sel, slices));
+            let swizzle = crate::gpu::swizzle(sel, swizzle);
+            let format = view_format(sel, pixel_format);
+            self.view(sel, pixel_format, !swizzle.is_default(), |t| {
+                t.new_texture_subview_with_placement(
+                    format,
+                    kind,
+                    levels,
+                    slices,
+                    Some(swizzle),
+                    at(resource_index),
+                )
+            })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn new_texture_subview_at_index(
@@ -1416,23 +1548,36 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         slices: NsRange,
         resource_index: u64,
     ) -> RaiseResult<Option<VulkanTexture>> {
-        let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:resourceIndex:";
-        if self.no_view_of(sel, pixel_format) {
-            return Ok(None);
-        }
-        let kind = crate::gpu::texture_type(sel, texture_type);
-        let (levels, slices) = (indices(sel, levels), indices(sel, slices));
-        let format = view_format(sel, pixel_format);
-        self.view(sel, pixel_format, false, |t| {
-            t.new_texture_subview_with_placement(
-                format,
-                kind,
-                levels,
-                slices,
-                None,
-                at(resource_index),
-            )
-        })
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureViewWithPixelFormat:textureType:levels:slices:resourceIndex:",
+            self,
+            pixel_format,
+            texture_type,
+            levels,
+            slices,
+            resource_index
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanTexture>> {
+            let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:resourceIndex:";
+            if self.no_view_of(sel, pixel_format) {
+                return Ok(None);
+            }
+            let kind = crate::gpu::texture_type(sel, texture_type);
+            let (levels, slices) = (indices(sel, levels), indices(sel, slices));
+            let format = view_format(sel, pixel_format);
+            self.view(sel, pixel_format, false, |t| {
+                t.new_texture_subview_with_placement(
+                    format,
+                    kind,
+                    levels,
+                    slices,
+                    None,
+                    at(resource_index),
+                )
+            })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's.
@@ -1469,26 +1614,40 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         bytes_per_row: u64,
         bytes_per_image: u64,
     ) -> RaiseResult<()> {
-        let sel = "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:";
-        let raw = self.copied(sel);
-        let bytes = guest_bytes(sel, pixel_bytes);
-        if crate::gpu::writes::texture_pages_read_only(self) {
-            metal_aborts(
-                sel,
-                "a CPU write of a texture over pages the process maps read-only, through that \
+        let recorded_call = crate::recorder::rec_call!(
+            "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:",
+            self,
+            region,
+            level,
+            slice,
+            pixel_bytes,
+            bytes_per_row,
+            bytes_per_image
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let sel = "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:";
+            let raw = self.copied(sel);
+            let bytes = guest_bytes(sel, pixel_bytes);
+            if crate::gpu::writes::texture_pages_read_only(self) {
+                metal_aborts(
+                    sel,
+                    "a CPU write of a texture over pages the process maps read-only, through that \
                  mapping (a bus error)",
-            );
-        }
-        send(sel, Policy::Dies, || {
-            raw.replace_region_with_host_bytes(
-                crate::gpu::region(region),
-                level,
-                slice,
-                bytes,
-                bytes_per_row,
-                bytes_per_image,
-            )
-        })
+                );
+            }
+            send(sel, Policy::Dies, || {
+                raw.replace_region_with_host_bytes(
+                    crate::gpu::region(region),
+                    level,
+                    slice,
+                    bytes,
+                    bytes_per_row,
+                    bytes_per_image,
+                )
+            })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The texture's resource ID: on Metal a texture's `resourceIndex` is its `gpuResourceID`
@@ -1694,22 +1853,33 @@ impl Heap<VulkanPlatform> for VulkanHeap {
         options: u64,
         offset: u64,
     ) -> RaiseResult<Option<VulkanBuffer>> {
-        let sel = "newBufferWithLength:options:offset:";
-        let options = with_heap_tracking(sel, options);
-        let first = plain(|| self.placed.lock().attempt());
-        create(sel, Policy::Dies, Nil::Placed, || {
-            placed(sel, self.raw.new_buffer_at_offset(length, options, offset))
-        })
-        .map(|b| {
-            b.map(|raw| {
-                let buffer = self.device.placed_buffer(raw, self);
-                let range = offset..offset.saturating_add(length);
-                let cover = first && offset == 0 && length >= self.descriptor_size;
-                let object: Weak<dyn std::any::Any + Send + Sync> = Obj::downgrade(&buffer);
-                plain(|| self.placed.lock().place_buffer(sel, range, object, cover));
-                buffer
+        let recorded_call = crate::recorder::rec_call!(
+            "newBufferWithLength:options:offset:",
+            self,
+            length,
+            options,
+            offset
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanBuffer>> {
+            let sel = "newBufferWithLength:options:offset:";
+            let options = with_heap_tracking(sel, options);
+            let first = plain(|| self.placed.lock().attempt());
+            create(sel, Policy::Dies, Nil::Placed, || {
+                placed(sel, self.raw.new_buffer_at_offset(length, options, offset))
             })
-        })
+            .map(|b| {
+                b.map(|raw| {
+                    let buffer = self.device.placed_buffer(raw, self);
+                    let range = offset..offset.saturating_add(length);
+                    let cover = first && offset == 0 && length >= self.descriptor_size;
+                    let object: Weak<dyn std::any::Any + Send + Sync> = Obj::downgrade(&buffer);
+                    plain(|| self.placed.lock().place_buffer(sel, range, object, cover));
+                    buffer
+                })
+            })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A texture `offset` bytes into a placement heap, of the heap's options
@@ -1755,59 +1925,69 @@ impl Heap<VulkanPlatform> for VulkanHeap {
         descriptor: &VulkanTextureDescriptor,
         offset: u64,
     ) -> RaiseResult<Option<VulkanTexture>> {
-        let sel = "newTextureWithDescriptor:offset:";
-        let fields = descriptor.fields();
-        let mut desc = fields.descriptor(sel, Maker::Other);
-        desc.resource_options = with_heap_tracking(sel, desc.resource_options.raw());
-        plain(|| self.placed.lock().attempt());
-        let format = fields.raw_pixel_format();
-        let (made, heard) = hearing(|| {
-            create(sel, Policy::Dies, Nil::Placed, || {
-                let made = self.raw.new_texture_at_offset(&desc, offset);
-                placed(
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureWithDescriptor:offset:",
+            self,
+            descriptor,
+            offset
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanTexture>> {
+            let sel = "newTextureWithDescriptor:offset:";
+            let fields = descriptor.fields();
+            let mut desc = fields.descriptor(sel, Maker::Other);
+            desc.resource_options = with_heap_tracking(sel, desc.resource_options.raw());
+            plain(|| self.placed.lock().attempt());
+            let format = fields.raw_pixel_format();
+            let (made, heard) = hearing(|| {
+                create(sel, Policy::Dies, Nil::Placed, || {
+                    let made = self.raw.new_texture_at_offset(&desc, offset);
+                    placed(
+                        sel,
+                        made.map_err(|e| created_format_refused(sel, "a texture of", format, e)),
+                    )
+                })
+            });
+            // A nil at or past the heap's end is Metal's whatever the texture's size.
+            let past_the_end = || matches!(made, Ok(None)) && offset >= plain(|| self.raw.size());
+            if heard.contains(&rt::Degradation::UnmeasuredHeapTextureSize) && !past_the_end() {
+                crate::gpu::metal_space::unmeasured_size(
                     sel,
-                    made.map_err(|e| created_format_refused(sel, "a texture of", format, e)),
-                )
+                    "a placement in a heap, by its size, of",
+                    &desc,
+                );
+            }
+            let optimized = heard.contains(&rt::Degradation::OptimizedDepthStencilTexture);
+            if optimized && matches!(made, Ok(None)) && offset < plain(|| self.raw.size()) {
+                self.optimized_nil(sel, &desc, offset);
+            }
+            made.map(|t| {
+                t.map(|raw| {
+                    // Its bytes in the heap, the size the runtime placed it by, which its
+                    // `allocatedSize` answers with no query; the rest of the heap where it has none.
+                    let size = plain(|| raw.allocated_size());
+                    let end = size.map_or(u64::MAX, |size| offset.saturating_add(size));
+                    let heap_size = plain(|| self.raw.size());
+                    if optimized {
+                        self.optimized_made(sel, &desc, offset, size);
+                    }
+                    let bytes = offset.min(heap_size)..end.min(heap_size);
+                    let under = Under::Heap(self.clone_ref(), bytes.clone());
+                    let texture = self.device.texture_in(raw, under, 0);
+                    // An untiled one, its bytes the device's rows, is kept among the others
+                    // ([`Placements`]).
+                    let alone = if heard.contains(&rt::Degradation::HeapTwoPlaneTexture) {
+                        Some(Alone::TwoPlane)
+                    } else {
+                        optimized.then_some(Alone::Optimized)
+                    };
+                    let object = texture.life();
+                    plain(|| self.placed.lock().place(sel, bytes, object, alone));
+                    texture
+                })
             })
         });
-        // A nil at or past the heap's end is Metal's whatever the texture's size.
-        let past_the_end = || matches!(made, Ok(None)) && offset >= plain(|| self.raw.size());
-        if heard.contains(&rt::Degradation::UnmeasuredHeapTextureSize) && !past_the_end() {
-            crate::gpu::metal_space::unmeasured_size(
-                sel,
-                "a placement in a heap, by its size, of",
-                &desc,
-            );
-        }
-        let optimized = heard.contains(&rt::Degradation::OptimizedDepthStencilTexture);
-        if optimized && matches!(made, Ok(None)) && offset < plain(|| self.raw.size()) {
-            self.optimized_nil(sel, &desc, offset);
-        }
-        made.map(|t| {
-            t.map(|raw| {
-                // Its bytes in the heap, the size the runtime placed it by, which its
-                // `allocatedSize` answers with no query; the rest of the heap where it has none.
-                let size = plain(|| raw.allocated_size());
-                let end = size.map_or(u64::MAX, |size| offset.saturating_add(size));
-                let heap_size = plain(|| self.raw.size());
-                if optimized {
-                    self.optimized_made(sel, &desc, offset, size);
-                }
-                let bytes = offset.min(heap_size)..end.min(heap_size);
-                let under = Under::Heap(self.clone_ref(), bytes.clone());
-                let texture = self.device.texture_in(raw, under, 0);
-                // An untiled one, its bytes the device's rows, is kept among the others
-                // ([`Placements`]).
-                let alone = if heard.contains(&rt::Degradation::HeapTwoPlaneTexture) {
-                    Some(Alone::TwoPlane)
-                } else {
-                    optimized.then_some(Alone::Optimized)
-                };
-                let object = texture.life();
-                plain(|| self.placed.lock().place(sel, bytes, object, alone));
-                texture
-            })
-        })
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The heap's modes, an untracked mode where its descriptor named the default, as Metal's.
@@ -1817,11 +1997,16 @@ impl Heap<VulkanPlatform> for VulkanHeap {
 
     /// The state before the change, as a buffer's ([`GpuResource::set_purgeable_state`]).
     fn set_purgeable_state(&self, state: u64) -> RaiseResult<u64> {
-        send("setPurgeableState:", Policy::Dies, || {
-            self.raw
-                .set_purgeable_state(rt::PurgeableState::from_raw(state)?)
-        })
-        .map(rt::PurgeableState::raw)
+        let recorded_call = crate::recorder::rec_call!("setPurgeableState:", self, state);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<u64> {
+            send("setPurgeableState:", Policy::Dies, || {
+                self.raw
+                    .set_purgeable_state(rt::PurgeableState::from_raw(state)?)
+            })
+            .map(rt::PurgeableState::raw)
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn storage_mode(&self) -> u64 {
@@ -1874,7 +2059,15 @@ impl ComputePipeline<VulkanPlatform> for VulkanComputePipeline {
         &self,
         function: &VulkanFunction,
     ) -> RaiseResult<Option<crate::gpu::function_table::VulkanFunctionHandle>> {
-        crate::gpu::function_table::compute_handle(&self.raw, function)
+        let recorded_call =
+            crate::recorder::rec_call!("functionHandleWithFunction:", self, function);
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<crate::gpu::function_table::VulkanFunctionHandle>> {
+                crate::gpu::function_table::compute_handle(&self.raw, function)
+            },
+        );
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's table ([`crate::gpu::function_table`]).
@@ -1882,7 +2075,18 @@ impl ComputePipeline<VulkanPlatform> for VulkanComputePipeline {
         &self,
         function_count: u64,
     ) -> RaiseResult<Option<crate::gpu::function_table::VulkanVisibleFunctionTable>> {
-        crate::gpu::function_table::compute_table(&self.raw, function_count)
+        let recorded_call = crate::recorder::rec_call!(
+            "newVisibleFunctionTableWithDescriptor:",
+            self,
+            function_count
+        );
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<crate::gpu::function_table::VulkanVisibleFunctionTable>> {
+                crate::gpu::function_table::compute_table(&self.raw, function_count)
+            },
+        );
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn imageblock_memory_length(&self, imageblock_dimensions: MtlSize) -> RaiseResult<u64> {
@@ -2020,23 +2224,28 @@ impl Library<VulkanPlatform> for VulkanLibrary {
         _on: OnFault,
         function_name: &str,
     ) -> RaiseResult<Option<VulkanFunction>> {
-        let sel = "newFunctionWithName:";
-        crate::gpu::timing::creation(
-            sel,
-            "",
-            || {
-                create(sel, Policy::Dies, Nil::MissingFunction, || {
-                    self.raw.new_function_with_name(function_name)
-                })
-            },
-            || format!("{function_name:?}"),
-            |made| match made {
-                Ok(Some(_)) => "found".to_owned(),
-                Ok(None) => "nil".to_owned(),
-                Err(_) => "raised".to_owned(),
-            },
-        )
-        .map(|made| made.map(Obj::new))
+        let recorded_call = crate::recorder::rec_call!("newFunctionWithName:", self, function_name);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanFunction>> {
+            let sel = "newFunctionWithName:";
+            crate::gpu::timing::creation(
+                sel,
+                "",
+                || {
+                    create(sel, Policy::Dies, Nil::MissingFunction, || {
+                        self.raw.new_function_with_name(function_name)
+                    })
+                },
+                || format!("{function_name:?}"),
+                |made| match made {
+                    Ok(Some(_)) => "found".to_owned(),
+                    Ok(None) => "nil".to_owned(),
+                    Err(_) => "raised".to_owned(),
+                },
+            )
+            .map(|made| made.map(Obj::new))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's `newFunctionWithName:constantValues:error:`: each constant by its index.
@@ -2048,27 +2257,37 @@ impl Library<VulkanPlatform> for VulkanLibrary {
         function_name: &str,
         constants: &[crate::core::platform::resource::FunctionConstant],
     ) -> RaiseResult<Option<VulkanFunction>> {
-        let sel = "newFunctionWithName:constantValues:error:";
-        let Some(values) = constant_values(function_name, constants) else {
-            return Ok(None);
-        };
-        crate::gpu::timing::creation(
-            sel,
-            "",
-            || {
-                create(sel, Policy::Dies, Nil::MissingFunction, || {
-                    self.raw
-                        .new_function_with_name_constant_values(function_name, &values)
-                })
-            },
-            || format!("{function_name:?} with {} constants", constants.len()),
-            |made| match made {
-                Ok(Some(_)) => "found".to_owned(),
-                Ok(None) => "nil".to_owned(),
-                Err(_) => "raised".to_owned(),
-            },
-        )
-        .map(|made| made.map(Obj::new))
+        let recorded_call = crate::recorder::rec_call!(
+            "newFunctionWithName:constantValues:error:",
+            self,
+            function_name,
+            constants
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanFunction>> {
+            let sel = "newFunctionWithName:constantValues:error:";
+            let Some(values) = constant_values(function_name, constants) else {
+                return Ok(None);
+            };
+            crate::gpu::timing::creation(
+                sel,
+                "",
+                || {
+                    create(sel, Policy::Dies, Nil::MissingFunction, || {
+                        self.raw
+                            .new_function_with_name_constant_values(function_name, &values)
+                    })
+                },
+                || format!("{function_name:?} with {} constants", constants.len()),
+                |made| match made {
+                    Ok(Some(_)) => "found".to_owned(),
+                    Ok(None) => "nil".to_owned(),
+                    Err(_) => "raised".to_owned(),
+                },
+            )
+            .map(|made| made.map(Obj::new))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's `newFunctionWithDescriptor:error:`: the descriptor's constant values nil
@@ -2085,40 +2304,52 @@ impl Library<VulkanPlatform> for VulkanLibrary {
         options: u64,
         specialized_name: Option<&str>,
     ) -> RaiseResult<Option<VulkanFunction>> {
-        let sel = "newFunctionWithDescriptor:error:";
-        let mut descriptor = rt::FunctionDescriptor::new(function_name);
-        if let Some(specialized) = specialized_name {
-            descriptor = descriptor.with_specialized_name(specialized);
-        }
-        if !constants.is_empty() {
-            let Some(values) = constant_values(function_name, constants) else {
-                return Ok(None);
-            };
-            descriptor.constant_values = Some(values);
-        }
-        descriptor.options = gpu::metal_value(sel, "function options", options);
-        crate::gpu::timing::creation(
-            sel,
-            "",
-            || {
-                create(sel, Policy::Dies, Nil::MissingFunction, || {
-                    self.raw.new_function_with_descriptor(&descriptor)
-                })
-            },
-            || {
-                format!(
-                    "{function_name:?} with {} constants, options {options:#x}, specialized \
+        let recorded_call = crate::recorder::rec_call!(
+            "newFunctionWithDescriptor:error:",
+            self,
+            function_name,
+            constants,
+            options,
+            specialized_name
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanFunction>> {
+            let sel = "newFunctionWithDescriptor:error:";
+            let mut descriptor = rt::FunctionDescriptor::new(function_name);
+            if let Some(specialized) = specialized_name {
+                descriptor = descriptor.with_specialized_name(specialized);
+            }
+            if !constants.is_empty() {
+                let Some(values) = constant_values(function_name, constants) else {
+                    return Ok(None);
+                };
+                descriptor.constant_values = Some(values);
+            }
+            descriptor.options = gpu::metal_value(sel, "function options", options);
+            crate::gpu::timing::creation(
+                sel,
+                "",
+                || {
+                    create(sel, Policy::Dies, Nil::MissingFunction, || {
+                        self.raw.new_function_with_descriptor(&descriptor)
+                    })
+                },
+                || {
+                    format!(
+                        "{function_name:?} with {} constants, options {options:#x}, specialized \
                      name {specialized_name:?}",
-                    constants.len()
-                )
-            },
-            |made| match made {
-                Ok(Some(_)) => "found".to_owned(),
-                Ok(None) => "nil".to_owned(),
-                Err(_) => "raised".to_owned(),
-            },
-        )
-        .map(|made| made.map(Obj::new))
+                        constants.len()
+                    )
+                },
+                |made| match made {
+                    Ok(Some(_)) => "found".to_owned(),
+                    Ok(None) => "nil".to_owned(),
+                    Err(_) => "raised".to_owned(),
+                },
+            )
+            .map(|made| made.map(Obj::new))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 }
 

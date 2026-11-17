@@ -70,20 +70,26 @@ impl VisibleFunctionTable<VulkanPlatform> for VulkanVisibleFunctionTable {
         functions: &[Option<&VulkanFunctionHandle>],
         range: NsRange,
     ) -> RaiseResult<()> {
-        let sel = "setFunctions:withRange:";
-        // A table holds at most `u32::MAX` entries, so a range from past that is past it.
-        let Ok(first) = u32::try_from(range.location) else {
-            return Err(Raise::platform(sel)
-                .with_detail(format!("the range {range:?} is past every table")));
-        };
-        listed(
-            functions,
-            |f| f.map(|f| &**f),
-            |handles| {
-                send(sel, Policy::Caught, || {
-                    rt::VisibleFunctionTable::set_functions(self, handles, first)
-                })
-            },
-        )
+        let recorded_call =
+            crate::recorder::rec_call!("setFunctions:withRange:", self, functions, range);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let sel = "setFunctions:withRange:";
+            // A table holds at most `u32::MAX` entries, so a range from past that is past it.
+            let Ok(first) = u32::try_from(range.location) else {
+                return Err(Raise::platform(sel)
+                    .with_detail(format!("the range {range:?} is past every table")));
+            };
+            listed(
+                functions,
+                |f| f.map(|f| &**f),
+                |handles| {
+                    send(sel, Policy::Caught, || {
+                        rt::VisibleFunctionTable::set_functions(self, handles, first)
+                    })
+                },
+            )
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 }

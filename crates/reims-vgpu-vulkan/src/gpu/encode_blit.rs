@@ -524,26 +524,43 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
         destination: &VulkanBuffer,
         destination_offset: u64,
     ) -> RaiseResult<bool> {
-        #[cfg(any(target_os = "linux", windows))]
-        {
-            let device = &destination.device.raw;
-            let Some(ram) = (crate::os::copies_guest_ram(device))
-                .then(|| crate::os::ram_over(device, runs.iter()))
-                .flatten()
-            else {
-                return Ok(false);
-            };
-            metal_space::first_use(FirstUse::BlitCommand);
-            let copied = self.with(GUEST_RAM_TO_BUFFER, |e| {
-                crate::os::copy_from_host_ram(e, &ram, runs, &destination.raw, destination_offset)
-            });
-            Ok(copied.is_ok())
-        }
-        #[cfg(not(any(target_os = "linux", windows)))]
-        {
-            let _ = (runs, destination, destination_offset);
-            Ok(false)
-        }
+        let recorded_call = crate::recorder::rec_call!(
+            "m2v.copyFromGuestRam",
+            self,
+            runs,
+            destination,
+            destination_offset
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<bool> {
+            #[cfg(any(target_os = "linux", windows))]
+            {
+                let device = &destination.device.raw;
+                let Some(ram) = (crate::os::copies_guest_ram(device))
+                    .then(|| crate::os::ram_over(device, runs.iter()))
+                    .flatten()
+                else {
+                    return Ok(false);
+                };
+                metal_space::first_use(FirstUse::BlitCommand);
+                let copied = self.with(GUEST_RAM_TO_BUFFER, |e| {
+                    crate::os::copy_from_host_ram(
+                        e,
+                        &ram,
+                        runs,
+                        &destination.raw,
+                        destination_offset,
+                    )
+                });
+                Ok(copied.is_ok())
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
+            {
+                let _ = (runs, destination, destination_offset);
+                Ok(false)
+            }
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// As [`Self::copy_from_guest_ram`], each run to its own byte of `destination` (the runtime's
@@ -554,26 +571,32 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
         runs: &[(u64, std::ops::Range<u64>)],
         destination: &VulkanBuffer,
     ) -> RaiseResult<bool> {
-        #[cfg(any(target_os = "linux", windows))]
-        {
-            let device = &destination.device.raw;
-            let Some(ram) = (crate::os::copies_guest_ram(device))
-                .then(|| crate::os::ram_over(device, runs.iter().map(|(_, run)| run)))
-                .flatten()
-            else {
-                return Ok(false);
-            };
-            metal_space::first_use(FirstUse::BlitCommand);
-            let copied = self.with(GUEST_RAM_RUNS_TO_BUFFER, |e| {
-                crate::os::copy_runs_from_host_ram(e, &ram, runs, &destination.raw)
-            });
-            Ok(copied.is_ok())
-        }
-        #[cfg(not(any(target_os = "linux", windows)))]
-        {
-            let _ = (runs, destination);
-            Ok(false)
-        }
+        let recorded_call =
+            crate::recorder::rec_call!("m2v.copyFromGuestRamAt", self, runs, destination);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<bool> {
+            #[cfg(any(target_os = "linux", windows))]
+            {
+                let device = &destination.device.raw;
+                let Some(ram) = (crate::os::copies_guest_ram(device))
+                    .then(|| crate::os::ram_over(device, runs.iter().map(|(_, run)| run)))
+                    .flatten()
+                else {
+                    return Ok(false);
+                };
+                metal_space::first_use(FirstUse::BlitCommand);
+                let copied = self.with(GUEST_RAM_RUNS_TO_BUFFER, |e| {
+                    crate::os::copy_runs_from_host_ram(e, &ram, runs, &destination.raw)
+                });
+                Ok(copied.is_ok())
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
+            {
+                let _ = (runs, destination);
+                Ok(false)
+            }
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// As [`Self::copy_from_guest_ram`], the other way, through the RAM the source's device uses.
@@ -583,26 +606,31 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
         source: &VulkanBuffer,
         runs: &[(u64, std::ops::Range<u64>)],
     ) -> RaiseResult<bool> {
-        #[cfg(any(target_os = "linux", windows))]
-        {
-            let device = &source.device.raw;
-            let Some(ram) = (crate::os::copies_guest_ram(device))
-                .then(|| crate::os::ram_over(device, runs.iter().map(|(_, run)| run)))
-                .flatten()
-            else {
-                return Ok(false);
-            };
-            metal_space::first_use(FirstUse::BlitCommand);
-            let copied = self.with(BUFFER_TO_GUEST_RAM, |e| {
-                crate::os::copy_to_host_ram(e, &source.raw, &ram, runs)
-            });
-            Ok(copied.is_ok())
-        }
-        #[cfg(not(any(target_os = "linux", windows)))]
-        {
-            let _ = (source, runs);
-            Ok(false)
-        }
+        let recorded_call = crate::recorder::rec_call!("m2v.copyToGuestRam", self, source, runs);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<bool> {
+            #[cfg(any(target_os = "linux", windows))]
+            {
+                let device = &source.device.raw;
+                let Some(ram) = (crate::os::copies_guest_ram(device))
+                    .then(|| crate::os::ram_over(device, runs.iter().map(|(_, run)| run)))
+                    .flatten()
+                else {
+                    return Ok(false);
+                };
+                metal_space::first_use(FirstUse::BlitCommand);
+                let copied = self.with(BUFFER_TO_GUEST_RAM, |e| {
+                    crate::os::copy_to_host_ram(e, &source.raw, &ram, runs)
+                });
+                Ok(copied.is_ok())
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
+            {
+                let _ = (source, runs);
+                Ok(false)
+            }
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Each command but `endEncoding` is a first use of Metal's device
@@ -610,431 +638,442 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
     /// a reset or copy of an indirect command buffer is work for Metal's tiler
     /// ([`FirstUse::TilerBlit`]).
     fn encode(&self, _on: OnFault, cmd: BlitCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
-        let sel = cmd.selector();
-        if let Some(options) = self.aborts {
-            metal_aborts(
-                sel,
-                &format!("a blit encoder's first command under protection options {options}"),
-            );
-        }
-        match &cmd {
-            BlitCmd::EndEncoding => {}
-            BlitCmd::ResetCommandsInBuffer { .. } | BlitCmd::CopyIndirectCommandBuffer { .. } => {
-                metal_space::first_use(FirstUse::BlitCommand);
-                if let Some(cb) = self.command_buffer() {
-                    cb.tiler_work(sel, FirstUse::TilerBlit);
-                }
+        let recorded_call = crate::recorder::rec_call!(@cmd self, cmd);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let sel = cmd.selector();
+            if let Some(options) = self.aborts {
+                metal_aborts(
+                    sel,
+                    &format!("a blit encoder's first command under protection options {options}"),
+                );
             }
-            _ => metal_space::first_use(FirstUse::BlitCommand),
-        }
-        let caught =
-            |call: &mut dyn FnMut(&mut rt::BlitCommandEncoder) -> Result<(), rt::Error>| {
-                send(sel, Policy::Dies, || self.with(sel, |e| call(e)))
-            };
-        // A copy between a buffer and a texture, whose refusal names the copy's shape
-        // ([`buffer_copy_shape`]).
-        let shaped = |shape: &dyn Fn() -> String,
-                      call: &mut dyn FnMut(
-            &mut rt::BlitCommandEncoder,
-        ) -> Result<(), rt::Error>| {
-            send_describing(sel, Policy::Dies, shape, || self.with(sel, |e| call(e)))
-        };
-        match cmd {
-            BlitCmd::CopyBufferToTexture {
-                source_buffer,
-                source_offset,
-                source_bytes_per_row,
-                source_bytes_per_image,
-                source_size,
-                destination_texture,
-                destination_slice,
-                destination_level,
-                destination_origin,
-            } => {
-                let destination = destination_texture.copied(sel);
-                let shape = || {
-                    buffer_copy_shape(
-                        destination,
-                        (destination_level, destination_slice),
-                        (destination_origin, source_size),
-                        (source_bytes_per_row, source_bytes_per_image),
-                    )
-                };
-                shaped(&shape, &mut |e| {
-                    e.copy_from_buffer_to_texture(
-                        &source_buffer.raw,
-                        source_offset,
-                        source_bytes_per_row,
-                        source_bytes_per_image,
-                        size(source_size),
-                        destination,
-                        destination_slice,
-                        destination_level,
-                        origin(destination_origin),
-                        rt::BlitOption::None,
-                    )
-                })
-            }
-            BlitCmd::CopyBufferToTextureOptions {
-                source_buffer,
-                source_offset,
-                source_bytes_per_row,
-                source_bytes_per_image,
-                source_size,
-                destination_texture,
-                destination_slice,
-                destination_level,
-                destination_origin,
-                options,
-            } => {
-                let source = some(sel, source_buffer, "buffer");
-                let destination = some(sel, destination_texture, "texture").copied(sel);
-                let options = blit_option(sel, options);
-                let shape = || {
-                    buffer_copy_shape(
-                        destination,
-                        (destination_level, destination_slice),
-                        (destination_origin, source_size),
-                        (source_bytes_per_row, source_bytes_per_image),
-                    )
-                };
-                shaped(&shape, &mut |e| {
-                    e.copy_from_buffer_to_texture(
-                        &source.raw,
-                        source_offset,
-                        source_bytes_per_row,
-                        source_bytes_per_image,
-                        size(source_size),
-                        destination,
-                        destination_slice,
-                        destination_level,
-                        origin(destination_origin),
-                        options,
-                    )
-                })
-            }
-            BlitCmd::CopyBufferToBuffer {
-                source_buffer,
-                source_offset,
-                destination_buffer,
-                destination_offset,
-                size,
-            } => {
-                let source = some(sel, source_buffer, "buffer");
-                let destination = some(sel, destination_buffer, "buffer");
-                caught(&mut |e| {
-                    e.copy_from_buffer_to_buffer(
-                        &source.raw,
-                        source_offset,
-                        &destination.raw,
-                        destination_offset,
-                        size,
-                    )
-                })
-            }
-            BlitCmd::CopyTextureToBuffer {
-                source_texture,
-                source_slice,
-                source_level,
-                source_origin,
-                source_size,
-                destination_buffer,
-                destination_offset,
-                destination_bytes_per_row,
-                destination_bytes_per_image,
-            } => {
-                let source = source_texture.copied(sel);
-                let shape = || {
-                    buffer_copy_shape(
-                        source,
-                        (source_level, source_slice),
-                        (source_origin, source_size),
-                        (destination_bytes_per_row, destination_bytes_per_image),
-                    )
-                };
-                shaped(&shape, &mut |e| {
-                    e.copy_from_texture_to_buffer(
-                        source,
-                        source_slice,
-                        source_level,
-                        origin(source_origin),
-                        size(source_size),
-                        &destination_buffer.raw,
-                        destination_offset,
-                        destination_bytes_per_row,
-                        destination_bytes_per_image,
-                        rt::BlitOption::None,
-                    )
-                })
-            }
-            BlitCmd::CopyTextureToBufferOptions {
-                source_texture,
-                source_slice,
-                source_level,
-                source_origin,
-                source_size,
-                destination_buffer,
-                destination_offset,
-                destination_bytes_per_row,
-                destination_bytes_per_image,
-                options,
-            } => {
-                let source = some(sel, source_texture, "texture").copied(sel);
-                let destination = some(sel, destination_buffer, "buffer");
-                let options = blit_option(sel, options);
-                let shape = || {
-                    buffer_copy_shape(
-                        source,
-                        (source_level, source_slice),
-                        (source_origin, source_size),
-                        (destination_bytes_per_row, destination_bytes_per_image),
-                    )
-                };
-                shaped(&shape, &mut |e| {
-                    e.copy_from_texture_to_buffer(
-                        source,
-                        source_slice,
-                        source_level,
-                        origin(source_origin),
-                        size(source_size),
-                        &destination.raw,
-                        destination_offset,
-                        destination_bytes_per_row,
-                        destination_bytes_per_image,
-                        options,
-                    )
-                })
-            }
-            BlitCmd::CopyTextureRegion {
-                source_texture,
-                source_slice,
-                source_level,
-                source_origin,
-                source_size,
-                destination_texture,
-                destination_slice,
-                destination_level,
-                destination_origin,
-            }
-            | BlitCmd::CopyTextureRegionOptions {
-                source_texture,
-                source_slice,
-                source_level,
-                source_origin,
-                source_size,
-                destination_texture,
-                destination_slice,
-                destination_level,
-                destination_origin,
-                options: 0,
-            } => {
-                let (source, destination) =
-                    (source_texture.copied(sel), destination_texture.copied(sel));
-                caught(&mut |e| {
-                    e.copy_from_texture_to_texture(
-                        source,
-                        source_slice,
-                        source_level,
-                        origin(source_origin),
-                        size(source_size),
-                        destination,
-                        destination_slice,
-                        destination_level,
-                        origin(destination_origin),
-                    )
-                })
-            }
-            BlitCmd::CopyTextureRegionOptions { options, .. } => {
-                unrepresentable(sel, &format!("texture copy options {options:#x}"))
-            }
-            BlitCmd::CopyTextureSlices {
-                source_texture,
-                source_slice,
-                source_level,
-                destination_texture,
-                destination_slice,
-                destination_level,
-                slice_count,
-                level_count,
-            } => {
-                let (source, destination) =
-                    (source_texture.copied(sel), destination_texture.copied(sel));
-                caught(&mut |e| {
-                    e.copy_texture_slices(
-                        source,
-                        source_slice,
-                        source_level,
-                        destination,
-                        destination_slice,
-                        destination_level,
-                        slice_count,
-                        level_count,
-                    )
-                })
-            }
-            BlitCmd::CopyIndirectCommandBuffer {
-                source,
-                source_range,
-                destination,
-                destination_index,
-            } => {
-                let from = indices(sel, source_range);
-                source.copied_intact(sel, &from);
-                let (count, size) = (from.end - from.start, destination.size());
-                let past = destination_index
-                    .checked_add(count)
-                    .map(|end| end.saturating_sub(size));
-                let fitting = match past {
-                    Some(0) => count,
-                    Some(past)
-                        if overrun_measured(
-                            (count, size, destination_index, past),
-                            (source.overrun_shape, source.size()),
-                            destination.overrun_shape,
-                        ) && !std::ptr::eq(&**source, &**destination) =>
-                    {
-                        size - destination_index
+            match &cmd {
+                BlitCmd::EndEncoding => {}
+                BlitCmd::ResetCommandsInBuffer { .. }
+                | BlitCmd::CopyIndirectCommandBuffer { .. } => {
+                    metal_space::first_use(FirstUse::BlitCommand);
+                    if let Some(cb) = self.command_buffer() {
+                        cb.tiler_work(sel, FirstUse::TilerBlit);
                     }
-                    _ => unrepresentable(
-                        sel,
-                        &format!(
-                            "a copy of {count} commands to index {destination_index} of an \
+                }
+                _ => metal_space::first_use(FirstUse::BlitCommand),
+            }
+            let caught =
+                |call: &mut dyn FnMut(&mut rt::BlitCommandEncoder) -> Result<(), rt::Error>| {
+                    send(sel, Policy::Dies, || self.with(sel, |e| call(e)))
+                };
+            // A copy between a buffer and a texture, whose refusal names the copy's shape
+            // ([`buffer_copy_shape`]).
+            let shaped = |shape: &dyn Fn() -> String,
+                          call: &mut dyn FnMut(
+                &mut rt::BlitCommandEncoder,
+            ) -> Result<(), rt::Error>| {
+                send_describing(sel, Policy::Dies, shape, || self.with(sel, |e| call(e)))
+            };
+            match cmd {
+                BlitCmd::CopyBufferToTexture {
+                    source_buffer,
+                    source_offset,
+                    source_bytes_per_row,
+                    source_bytes_per_image,
+                    source_size,
+                    destination_texture,
+                    destination_slice,
+                    destination_level,
+                    destination_origin,
+                } => {
+                    let destination = destination_texture.copied(sel);
+                    let shape = || {
+                        buffer_copy_shape(
+                            destination,
+                            (destination_level, destination_slice),
+                            (destination_origin, source_size),
+                            (source_bytes_per_row, source_bytes_per_image),
+                        )
+                    };
+                    shaped(&shape, &mut |e| {
+                        e.copy_from_buffer_to_texture(
+                            &source_buffer.raw,
+                            source_offset,
+                            source_bytes_per_row,
+                            source_bytes_per_image,
+                            size(source_size),
+                            destination,
+                            destination_slice,
+                            destination_level,
+                            origin(destination_origin),
+                            rt::BlitOption::None,
+                        )
+                    })
+                }
+                BlitCmd::CopyBufferToTextureOptions {
+                    source_buffer,
+                    source_offset,
+                    source_bytes_per_row,
+                    source_bytes_per_image,
+                    source_size,
+                    destination_texture,
+                    destination_slice,
+                    destination_level,
+                    destination_origin,
+                    options,
+                } => {
+                    let source = some(sel, source_buffer, "buffer");
+                    let destination = some(sel, destination_texture, "texture").copied(sel);
+                    let options = blit_option(sel, options);
+                    let shape = || {
+                        buffer_copy_shape(
+                            destination,
+                            (destination_level, destination_slice),
+                            (destination_origin, source_size),
+                            (source_bytes_per_row, source_bytes_per_image),
+                        )
+                    };
+                    shaped(&shape, &mut |e| {
+                        e.copy_from_buffer_to_texture(
+                            &source.raw,
+                            source_offset,
+                            source_bytes_per_row,
+                            source_bytes_per_image,
+                            size(source_size),
+                            destination,
+                            destination_slice,
+                            destination_level,
+                            origin(destination_origin),
+                            options,
+                        )
+                    })
+                }
+                BlitCmd::CopyBufferToBuffer {
+                    source_buffer,
+                    source_offset,
+                    destination_buffer,
+                    destination_offset,
+                    size,
+                } => {
+                    let source = some(sel, source_buffer, "buffer");
+                    let destination = some(sel, destination_buffer, "buffer");
+                    caught(&mut |e| {
+                        e.copy_from_buffer_to_buffer(
+                            &source.raw,
+                            source_offset,
+                            &destination.raw,
+                            destination_offset,
+                            size,
+                        )
+                    })
+                }
+                BlitCmd::CopyTextureToBuffer {
+                    source_texture,
+                    source_slice,
+                    source_level,
+                    source_origin,
+                    source_size,
+                    destination_buffer,
+                    destination_offset,
+                    destination_bytes_per_row,
+                    destination_bytes_per_image,
+                } => {
+                    let source = source_texture.copied(sel);
+                    let shape = || {
+                        buffer_copy_shape(
+                            source,
+                            (source_level, source_slice),
+                            (source_origin, source_size),
+                            (destination_bytes_per_row, destination_bytes_per_image),
+                        )
+                    };
+                    shaped(&shape, &mut |e| {
+                        e.copy_from_texture_to_buffer(
+                            source,
+                            source_slice,
+                            source_level,
+                            origin(source_origin),
+                            size(source_size),
+                            &destination_buffer.raw,
+                            destination_offset,
+                            destination_bytes_per_row,
+                            destination_bytes_per_image,
+                            rt::BlitOption::None,
+                        )
+                    })
+                }
+                BlitCmd::CopyTextureToBufferOptions {
+                    source_texture,
+                    source_slice,
+                    source_level,
+                    source_origin,
+                    source_size,
+                    destination_buffer,
+                    destination_offset,
+                    destination_bytes_per_row,
+                    destination_bytes_per_image,
+                    options,
+                } => {
+                    let source = some(sel, source_texture, "texture").copied(sel);
+                    let destination = some(sel, destination_buffer, "buffer");
+                    let options = blit_option(sel, options);
+                    let shape = || {
+                        buffer_copy_shape(
+                            source,
+                            (source_level, source_slice),
+                            (source_origin, source_size),
+                            (destination_bytes_per_row, destination_bytes_per_image),
+                        )
+                    };
+                    shaped(&shape, &mut |e| {
+                        e.copy_from_texture_to_buffer(
+                            source,
+                            source_slice,
+                            source_level,
+                            origin(source_origin),
+                            size(source_size),
+                            &destination.raw,
+                            destination_offset,
+                            destination_bytes_per_row,
+                            destination_bytes_per_image,
+                            options,
+                        )
+                    })
+                }
+                BlitCmd::CopyTextureRegion {
+                    source_texture,
+                    source_slice,
+                    source_level,
+                    source_origin,
+                    source_size,
+                    destination_texture,
+                    destination_slice,
+                    destination_level,
+                    destination_origin,
+                }
+                | BlitCmd::CopyTextureRegionOptions {
+                    source_texture,
+                    source_slice,
+                    source_level,
+                    source_origin,
+                    source_size,
+                    destination_texture,
+                    destination_slice,
+                    destination_level,
+                    destination_origin,
+                    options: 0,
+                } => {
+                    let (source, destination) =
+                        (source_texture.copied(sel), destination_texture.copied(sel));
+                    caught(&mut |e| {
+                        e.copy_from_texture_to_texture(
+                            source,
+                            source_slice,
+                            source_level,
+                            origin(source_origin),
+                            size(source_size),
+                            destination,
+                            destination_slice,
+                            destination_level,
+                            origin(destination_origin),
+                        )
+                    })
+                }
+                BlitCmd::CopyTextureRegionOptions { options, .. } => {
+                    unrepresentable(sel, &format!("texture copy options {options:#x}"))
+                }
+                BlitCmd::CopyTextureSlices {
+                    source_texture,
+                    source_slice,
+                    source_level,
+                    destination_texture,
+                    destination_slice,
+                    destination_level,
+                    slice_count,
+                    level_count,
+                } => {
+                    let (source, destination) =
+                        (source_texture.copied(sel), destination_texture.copied(sel));
+                    caught(&mut |e| {
+                        e.copy_texture_slices(
+                            source,
+                            source_slice,
+                            source_level,
+                            destination,
+                            destination_slice,
+                            destination_level,
+                            slice_count,
+                            level_count,
+                        )
+                    })
+                }
+                BlitCmd::CopyIndirectCommandBuffer {
+                    source,
+                    source_range,
+                    destination,
+                    destination_index,
+                } => {
+                    let from = indices(sel, source_range);
+                    source.copied_intact(sel, &from);
+                    let (count, size) = (from.end - from.start, destination.size());
+                    let past = destination_index
+                        .checked_add(count)
+                        .map(|end| end.saturating_sub(size));
+                    let fitting = match past {
+                        Some(0) => count,
+                        Some(past)
+                            if overrun_measured(
+                                (count, size, destination_index, past),
+                                (source.overrun_shape, source.size()),
+                                destination.overrun_shape,
+                            ) && !std::ptr::eq(&**source, &**destination) =>
+                        {
+                            size - destination_index
+                        }
+                        _ => unrepresentable(
+                            sel,
+                            &format!(
+                                "a copy of {count} commands to index {destination_index} of an \
                              indirect command buffer of {size}, past its end, in a shape nothing \
                              measured (more commands than the destination holds, an index at or \
                              past its end, more than {OVERRUN_MEASURED} past it, a buffer into \
                              itself, or buffers other than two of one measured shape and one \
                              count: 2 to 64 Shared commands of 2 kernel buffers or of 2 vertex and \
                              2 fragment buffers)"
+                            ),
                         ),
-                    ),
-                };
-                let landing = from.start..from.start + fitting;
-                caught(&mut |e| {
-                    e.copy_indirect_command_buffer(
-                        &source.raw,
-                        landing.clone(),
-                        &destination.raw,
-                        destination_index,
-                    )
-                })?;
-                let progress = self.progress(sel);
-                if fitting < count {
-                    destination.overrun(sel, progress.clone(), 0..destination_index);
+                    };
+                    let landing = from.start..from.start + fitting;
+                    caught(&mut |e| {
+                        e.copy_indirect_command_buffer(
+                            &source.raw,
+                            landing.clone(),
+                            &destination.raw,
+                            destination_index,
+                        )
+                    })?;
+                    let progress = self.progress(sel);
+                    if fitting < count {
+                        destination.overrun(sel, progress.clone(), 0..destination_index);
+                    }
+                    if !landing.is_empty() {
+                        crate::gpu::command::executions::gpu_writes(sel, destination);
+                    }
+                    source.copied(progress, landing, destination, destination_index);
+                    Ok(())
                 }
-                if !landing.is_empty() {
-                    crate::gpu::command::executions::gpu_writes(sel, destination);
+                BlitCmd::OptimizeIndirectCommandBuffer {
+                    indirect_command_buffer,
+                    range,
+                } => {
+                    let range = indices(sel, range);
+                    caught(&mut |e| {
+                        e.optimize_indirect_command_buffer(
+                            &indirect_command_buffer.raw,
+                            range.clone(),
+                        )
+                    })
                 }
-                source.copied(progress, landing, destination, destination_index);
-                Ok(())
-            }
-            BlitCmd::OptimizeIndirectCommandBuffer {
-                indirect_command_buffer,
-                range,
-            } => {
-                let range = indices(sel, range);
-                caught(&mut |e| {
-                    e.optimize_indirect_command_buffer(&indirect_command_buffer.raw, range.clone())
-                })
-            }
-            BlitCmd::ResetCommandsInBuffer { buffer, range } => {
-                let range = indices(sel, range);
-                caught(&mut |e| e.reset_commands_in_buffer(&buffer.raw, range.clone()))?;
-                if !range.is_empty() {
-                    crate::gpu::command::executions::gpu_writes(sel, buffer);
+                BlitCmd::ResetCommandsInBuffer { buffer, range } => {
+                    let range = indices(sel, range);
+                    caught(&mut |e| e.reset_commands_in_buffer(&buffer.raw, range.clone()))?;
+                    if !range.is_empty() {
+                        crate::gpu::command::executions::gpu_writes(sel, buffer);
+                    }
+                    buffer.reset(self.progress(sel), range);
+                    Ok(())
                 }
-                buffer.reset(self.progress(sel), range);
-                Ok(())
+                BlitCmd::FillBufferPattern4 {
+                    buffer,
+                    range,
+                    pattern,
+                } => {
+                    let range = indices(sel, range);
+                    caught(&mut |e| e.fill_buffer_pattern4(&buffer.raw, range.clone(), pattern))
+                }
+                BlitCmd::FillTexture {
+                    texture,
+                    level,
+                    slice,
+                    region,
+                    bytes,
+                } => self.fill_texture(sel, texture, (level, slice, region), bytes),
+                BlitCmd::FillTextureColor {
+                    texture,
+                    level,
+                    slice,
+                    region,
+                    color,
+                    pixel_format,
+                } => {
+                    let format = fill::colour_format(sel, pixel_format);
+                    let place = (level, slice, region);
+                    self.fill_texture_color(sel, texture, place, color, format)
+                }
+                BlitCmd::EndEncoding => self.end(sel, |e| e.end_encoding()),
+                BlitCmd::FillBuffer {
+                    buffer,
+                    range,
+                    value,
+                } => {
+                    let range = indices(sel, range);
+                    caught(&mut |e| e.fill_buffer(&buffer.raw, range.clone(), value))
+                }
+                BlitCmd::GenerateMipmaps { texture } => {
+                    let texture = some(sel, texture, "texture").copied(sel);
+                    caught(&mut |e| e.generate_mipmaps(texture))
+                }
+                BlitCmd::InvalidateCompressedTexture { texture } => {
+                    let texture = texture.copied(sel);
+                    caught(&mut |e| e.invalidate_compressed_texture(texture))
+                }
+                BlitCmd::InvalidateCompressedTextureSlice {
+                    texture,
+                    slice,
+                    level,
+                } => {
+                    let texture = texture.copied(sel);
+                    caught(&mut |e| e.invalidate_compressed_texture_slice(texture, slice, level))
+                }
+                BlitCmd::OptimizeForCpu { texture } => {
+                    caught(&mut |e| e.optimize_contents_for_cpu_access(texture.kept(sel)))
+                }
+                BlitCmd::OptimizeForCpuSlice {
+                    texture,
+                    slice,
+                    level,
+                } => caught(&mut |e| {
+                    e.optimize_contents_for_cpu_access_slice_level(texture.kept(sel), slice, level)
+                }),
+                BlitCmd::OptimizeForGpu { texture } => {
+                    caught(&mut |e| e.optimize_contents_for_gpu_access(texture.kept(sel)))
+                }
+                BlitCmd::OptimizeForGpuSlice {
+                    texture,
+                    slice,
+                    level,
+                } => caught(&mut |e| {
+                    e.optimize_contents_for_gpu_access_slice_level(texture.kept(sel), slice, level)
+                }),
+                BlitCmd::SynchronizeResource { resource } => {
+                    let resource = match resource {
+                        // Metal encodes nothing for nil (`blit_texture_maintenance`).
+                        None => return self.nothing(sel),
+                        Some(ResourceRef::Buffer(b)) => rt::ResourceRef::Buffer(&b.raw),
+                        Some(ResourceRef::Texture(t)) => rt::ResourceRef::Texture(t.kept(sel)),
+                        Some(ResourceRef::Icb(icb)) => {
+                            rt::ResourceRef::IndirectCommandBuffer(&icb.raw)
+                        }
+                    };
+                    caught(&mut |e| e.synchronize_resource(resource))
+                }
+                BlitCmd::SynchronizeTexture {
+                    texture,
+                    slice,
+                    level,
+                } => caught(&mut |e| e.synchronize_texture(texture.kept(sel), slice, level)),
+                BlitCmd::UpdateFence { fence } => caught(&mut |e| e.update_fence(fence)),
+                BlitCmd::WaitForFence { fence } => caught(&mut |e| e.wait_for_fence(fence)),
             }
-            BlitCmd::FillBufferPattern4 {
-                buffer,
-                range,
-                pattern,
-            } => {
-                let range = indices(sel, range);
-                caught(&mut |e| e.fill_buffer_pattern4(&buffer.raw, range.clone(), pattern))
-            }
-            BlitCmd::FillTexture {
-                texture,
-                level,
-                slice,
-                region,
-                bytes,
-            } => self.fill_texture(sel, texture, (level, slice, region), bytes),
-            BlitCmd::FillTextureColor {
-                texture,
-                level,
-                slice,
-                region,
-                color,
-                pixel_format,
-            } => {
-                let format = fill::colour_format(sel, pixel_format);
-                let place = (level, slice, region);
-                self.fill_texture_color(sel, texture, place, color, format)
-            }
-            BlitCmd::EndEncoding => self.end(sel, |e| e.end_encoding()),
-            BlitCmd::FillBuffer {
-                buffer,
-                range,
-                value,
-            } => {
-                let range = indices(sel, range);
-                caught(&mut |e| e.fill_buffer(&buffer.raw, range.clone(), value))
-            }
-            BlitCmd::GenerateMipmaps { texture } => {
-                let texture = some(sel, texture, "texture").copied(sel);
-                caught(&mut |e| e.generate_mipmaps(texture))
-            }
-            BlitCmd::InvalidateCompressedTexture { texture } => {
-                let texture = texture.copied(sel);
-                caught(&mut |e| e.invalidate_compressed_texture(texture))
-            }
-            BlitCmd::InvalidateCompressedTextureSlice {
-                texture,
-                slice,
-                level,
-            } => {
-                let texture = texture.copied(sel);
-                caught(&mut |e| e.invalidate_compressed_texture_slice(texture, slice, level))
-            }
-            BlitCmd::OptimizeForCpu { texture } => {
-                caught(&mut |e| e.optimize_contents_for_cpu_access(texture.kept(sel)))
-            }
-            BlitCmd::OptimizeForCpuSlice {
-                texture,
-                slice,
-                level,
-            } => caught(&mut |e| {
-                e.optimize_contents_for_cpu_access_slice_level(texture.kept(sel), slice, level)
-            }),
-            BlitCmd::OptimizeForGpu { texture } => {
-                caught(&mut |e| e.optimize_contents_for_gpu_access(texture.kept(sel)))
-            }
-            BlitCmd::OptimizeForGpuSlice {
-                texture,
-                slice,
-                level,
-            } => caught(&mut |e| {
-                e.optimize_contents_for_gpu_access_slice_level(texture.kept(sel), slice, level)
-            }),
-            BlitCmd::SynchronizeResource { resource } => {
-                let resource = match resource {
-                    // Metal encodes nothing for nil (`blit_texture_maintenance`).
-                    None => return self.nothing(sel),
-                    Some(ResourceRef::Buffer(b)) => rt::ResourceRef::Buffer(&b.raw),
-                    Some(ResourceRef::Texture(t)) => rt::ResourceRef::Texture(t.kept(sel)),
-                    Some(ResourceRef::Icb(icb)) => rt::ResourceRef::IndirectCommandBuffer(&icb.raw),
-                };
-                caught(&mut |e| e.synchronize_resource(resource))
-            }
-            BlitCmd::SynchronizeTexture {
-                texture,
-                slice,
-                level,
-            } => caught(&mut |e| e.synchronize_texture(texture.kept(sel), slice, level)),
-            BlitCmd::UpdateFence { fence } => caught(&mut |e| e.update_fence(fence)),
-            BlitCmd::WaitForFence { fence } => caught(&mut |e| e.wait_for_fence(fence)),
-        }
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 }
 

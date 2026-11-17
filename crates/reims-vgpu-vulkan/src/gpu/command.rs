@@ -1067,24 +1067,30 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
     /// Blocks while the queue holds 64 uncompleted command buffers, as Metal's does, and hangs
     /// where none can complete first ([`waiting`]).
     fn command_buffer(&self, _on: OnFault) -> RaiseResult<Option<VulkanCommandBuffer>> {
-        let raw = waiting("commandBuffer", || self.raw.command_buffer())?;
-        let predication = Predication::new(&self.device);
-        Ok(Some(Obj::new(CommandBufferObject {
-            raw,
-            device: self.device.clone_ref(),
-            open_encoders: Arc::default(),
-            progress: Mutex::new(None),
-            predication,
-            committed: AtomicBool::new(false),
-            made: AtomicUsize::new(0),
-            failing: Mutex::new(Vec::new()),
-            by_runtime: Mutex::new(Vec::new()),
-            stores: Mutex::new(Vec::new()),
-            protection: Mutex::new(Protection::default()),
-            tiler: AtomicBool::new(false),
-            executions: Mutex::new(Vec::new()),
-            signals_scheduled: AtomicBool::new(false),
-        })))
+        let recorded_call = crate::recorder::rec_call!("commandBuffer", self);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<VulkanCommandBuffer>> {
+                let raw = waiting("commandBuffer", || self.raw.command_buffer())?;
+                let predication = Predication::new(&self.device);
+                Ok(Some(Obj::new(CommandBufferObject {
+                    raw,
+                    device: self.device.clone_ref(),
+                    open_encoders: Arc::default(),
+                    progress: Mutex::new(None),
+                    predication,
+                    committed: AtomicBool::new(false),
+                    made: AtomicUsize::new(0),
+                    failing: Mutex::new(Vec::new()),
+                    by_runtime: Mutex::new(Vec::new()),
+                    stores: Mutex::new(Vec::new()),
+                    protection: Mutex::new(Protection::default()),
+                    tiler: AtomicBool::new(false),
+                    executions: Mutex::new(Vec::new()),
+                    signals_scheduled: AtomicBool::new(false),
+                })))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn set_label(&self, label: &str) {
@@ -1459,11 +1465,16 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// Refused while another encoder is open and after the commit, as Metal's validation
     /// refuses them.
     fn blit_encoder(&self, _on: OnFault) -> RaiseResult<Option<VulkanBlitEncoder>> {
-        let raw = encoding("blitCommandEncoder", Policy::Dies, || {
-            predication::boundary(&self.predication, "blitCommandEncoder");
-            self.raw.blit_command_encoder().map(Box::new)
-        })?;
-        Ok(Some(Obj::new(EncoderObject::new(raw, self))))
+        let recorded_call = crate::recorder::rec_call!("blitCommandEncoder", self);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanBlitEncoder>> {
+            let raw = encoding("blitCommandEncoder", Policy::Dies, || {
+                predication::boundary(&self.predication, "blitCommandEncoder");
+                self.raw.blit_command_encoder().map(Box::new)
+            })?;
+            Ok(Some(Obj::new(EncoderObject::new(raw, self))))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Refused while an encoder is open or after a commit, as Metal's validation refuses it.
@@ -1487,37 +1498,49 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// go to a guest knows it runs on the committing thread, which may be one that must not post
     /// them.
     fn commit(&self, _on: OnFault) -> RaiseResult<()> {
-        // The guest's GPU work, which keeps the GPU awake ([`crate::awake`]).
-        self.device.awake.touch();
-        let progress = self.progress.lock().clone();
-        encoding("commit", Policy::Dies, || {
-            predication::boundary(&self.predication, "commit");
-            self.committed.store(true, Ordering::SeqCst);
-            let failure = self.failure("commit");
-            let failed = self.runs_nothing_from(failure.as_ref());
-            self.check_executions(failed, progress.as_deref());
-            if let Some(progress) = &progress {
-                progress.committing();
-            }
-            committing(|| {
-                timing::commit(&self.raw, || match failure {
-                    Some(failure) => self.raw.commit_failed(failure),
-                    None => committing_here(|| self.raw.commit_and_submit()),
+        let recorded_call = crate::recorder::rec_call!("commit", self);
+        crate::recorder::before_commit(&recorded_call, self);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            // The guest's GPU work, which keeps the GPU awake ([`crate::awake`]).
+            self.device.awake.touch();
+            let progress = self.progress.lock().clone();
+            encoding("commit", Policy::Dies, || {
+                predication::boundary(&self.predication, "commit");
+                self.committed.store(true, Ordering::SeqCst);
+                let failure = self.failure("commit");
+                let failed = self.runs_nothing_from(failure.as_ref());
+                self.check_executions(failed, progress.as_deref());
+                if let Some(progress) = &progress {
+                    progress.committing();
+                }
+                committing(|| {
+                    timing::commit(&self.raw, || match failure {
+                        Some(failure) => self.raw.commit_failed(failure),
+                        None => committing_here(|| self.raw.commit_and_submit()),
+                    })
                 })
             })
-        })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A serial encoder, refused as `blitCommandEncoder` is; under protection options 1, 3 and 7
     /// it dies ([`CommandBufferObject::protected_creation`]). A first use of Metal's device
     /// ([`FirstUse::ComputeEncoder`]).
     fn compute_encoder(&self, _on: OnFault) -> RaiseResult<Option<VulkanComputeEncoder>> {
-        let raw = encoding("computeCommandEncoder", Policy::Dies, || {
-            self.protected_creation("computeCommandEncoder");
-            self.raw.compute_command_encoder().map(Box::new)
-        })?;
-        metal_space::first_use(FirstUse::ComputeEncoder);
-        Ok(Some(predication::encoder(raw, self)))
+        let recorded_call = crate::recorder::rec_call!("computeCommandEncoder", self);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<VulkanComputeEncoder>> {
+                let raw = encoding("computeCommandEncoder", Policy::Dies, || {
+                    self.protected_creation("computeCommandEncoder");
+                    self.raw.compute_command_encoder().map(Box::new)
+                })?;
+                metal_space::first_use(FirstUse::ComputeEncoder);
+                Ok(Some(predication::encoder(raw, self)))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn device(&self) -> Option<VulkanDevice> {
@@ -1555,16 +1578,26 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// Its compute encoders keep no bindings for command predication, and its dispatches take
     /// no hold of its predication's state ([`Predication::hold_none`]).
     fn holds_no_predication(&self) {
-        self.predication.hold_none();
+        let recorded_call = crate::recorder::rec_call!("m2v.holdsNoPredication", self);
+        crate::recorder::run(|| {
+            self.predication.hold_none();
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     fn split(&self, on: OnFault) -> RaiseResult<Option<VulkanCommandBuffer>> {
-        if !self.splits() {
-            return Ok(None);
-        }
-        let next = self.next_part()?;
-        self.commit(on)?;
-        Ok(Some(next))
+        let recorded_call = crate::recorder::rec_call!("m2v.split", self);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<VulkanCommandBuffer>> {
+                if !self.splits() {
+                    return Ok(None);
+                }
+                let next = self.next_part()?;
+                self.commit(on)?;
+                Ok(Some(next))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The command buffer of its queue a later range of its work is encoded into while the rest
@@ -1573,10 +1606,16 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// on from this one's; `None` otherwise. The range before it holds no compute encoder, so
     /// the unit carried is the one at the make.
     fn part(&self, _on: OnFault) -> RaiseResult<Option<VulkanCommandBuffer>> {
-        if !self.splits() {
-            return Ok(None);
-        }
-        self.next_part().map(Some)
+        let recorded_call = crate::recorder::rec_call!("m2v.part", self);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<VulkanCommandBuffer>> {
+                if !self.splits() {
+                    return Ok(None);
+                }
+                self.next_part().map(Some)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Commits it as a part where it may be cut ([`CommandBufferObject::splits`]); else nothing,
@@ -1584,20 +1623,29 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// encoders on ([`CommandBufferObject::fails_from_an_encoder`]), every encoder after it
     /// running nothing.
     fn commit_part(&self, on: OnFault) -> RaiseResult<PartCut> {
-        if let Some(reason) = self.kept_whole_by() {
-            return Ok(PartCut::Whole(reason));
-        }
-        if self.fails_from_an_encoder() {
-            return Ok(PartCut::Fails);
-        }
-        self.commit(on)?;
-        Ok(PartCut::Cut)
+        let recorded_call = crate::recorder::rec_call!("m2v.commitPart", self);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<PartCut> {
+            if let Some(reason) = self.kept_whole_by() {
+                return Ok(PartCut::Whole(reason));
+            }
+            if self.fails_from_an_encoder() {
+                return Ok(PartCut::Fails);
+            }
+            self.commit(on)?;
+            Ok(PartCut::Cut)
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Takes in how Metal's GPU fails `later`'s encoders, as though they had been made in this
     /// one after its own ([`CommandBufferObject::fold`]).
     fn fold(&self, later: VulkanCommandBuffer) {
-        CommandBufferObject::fold(self, &later);
+        let recorded_call = crate::recorder::rec_call!("m2v.fold", self, later);
+        crate::recorder::run(|| {
+            CommandBufferObject::fold(self, &later);
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     /// The runtime's (`CommandBuffer::set_completion_joins_next`): under the exact completion
@@ -1609,7 +1657,11 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// once per device ([`crate::answer`]). A no-op where the runtime cannot group (MoltenVK,
     /// whose queues' failures it relays). `false` where the runtime refuses it: after the commit.
     fn set_completion_joins_next(&self, joins: bool) -> bool {
-        self.raw.set_completion_joins_next(joins).is_ok()
+        let recorded_call = crate::recorder::rec_call!("m2v.setCompletionJoinsNext", self, joins);
+        let recorded_answer =
+            crate::recorder::run(|| -> bool { self.raw.set_completion_joins_next(joins).is_ok() });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's, but once an encoder made under protection options failed it, after which
@@ -1620,18 +1672,24 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         event: Option<EventRef<'_, VulkanPlatform>>,
         value: u64,
     ) -> RaiseResult<()> {
-        let sel = "encodeSignalEvent:value:";
-        // evsig: command buffer, event, value
-        trace_event("evsig", &self.raw, event.as_ref(), value);
-        let withheld = self.withholds_signals();
-        encoding(sel, Policy::Dies, || {
-            let event = self::event(sel, event);
-            predication::boundary(&self.predication, sel);
-            match withheld {
-                true => Ok(()),
-                false => self.raw.encode_signal_event(event, value),
-            }
-        })
+        let recorded_call =
+            crate::recorder::rec_call!("encodeSignalEvent:value:", self, event, value);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let sel = "encodeSignalEvent:value:";
+            // evsig: command buffer, event, value
+            trace_event("evsig", &self.raw, event.as_ref(), value);
+            let withheld = self.withholds_signals();
+            encoding(sel, Policy::Dies, || {
+                let event = self::event(sel, event);
+                predication::boundary(&self.predication, sel);
+                match withheld {
+                    true => Ok(()),
+                    false => self.raw.encode_signal_event(event, value),
+                }
+            })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's: the event's value becomes at least `value` as the command buffer is
@@ -1649,23 +1707,36 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         signal_event_scheduled: Option<&VulkanSharedEvent>,
         value: u64,
     ) -> RaiseResult<()> {
-        let sel = "encodeSignalEventScheduled:value:";
-        self.signals_scheduled.store(true, Ordering::SeqCst);
-        let traced = signal_event_scheduled.map_or(0, event_id);
-        // evsched: command buffer, event, value
-        trace_event_id("evsched", &self.raw, traced, value);
-        encoding(sel, Policy::Dies, || {
-            let event =
-                signal_event_scheduled.unwrap_or_else(|| unrepresentable(sel, "a nil event"));
-            match self.raw.encode_signal_event_scheduled(event, value) {
-                Err(rt::Error::Invalid(invalid))
-                    if matches!(invalid.problem, rt::Problem::ScheduledSignalAfterCompletion) =>
-                {
-                    signal_after_completion(sel)
+        let recorded_call = crate::recorder::rec_call!(
+            "encodeSignalEventScheduled:value:",
+            self,
+            signal_event_scheduled,
+            value
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let sel = "encodeSignalEventScheduled:value:";
+            self.signals_scheduled.store(true, Ordering::SeqCst);
+            let traced = signal_event_scheduled.map_or(0, event_id);
+            // evsched: command buffer, event, value
+            trace_event_id("evsched", &self.raw, traced, value);
+            encoding(sel, Policy::Dies, || {
+                let event =
+                    signal_event_scheduled.unwrap_or_else(|| unrepresentable(sel, "a nil event"));
+                match self.raw.encode_signal_event_scheduled(event, value) {
+                    Err(rt::Error::Invalid(invalid))
+                        if matches!(
+                            invalid.problem,
+                            rt::Problem::ScheduledSignalAfterCompletion
+                        ) =>
+                    {
+                        signal_after_completion(sel)
+                    }
+                    made => made,
                 }
-                made => made,
-            }
-        })
+            })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn encode_wait(
@@ -1673,14 +1744,20 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         event: Option<EventRef<'_, VulkanPlatform>>,
         value: u64,
     ) -> RaiseResult<()> {
-        let sel = "encodeWaitForEvent:value:";
-        // evwait: command buffer, event, value
-        trace_event("evwait", &self.raw, event.as_ref(), value);
-        encoding(sel, Policy::Dies, || {
-            let event = self::event(sel, event);
-            predication::boundary(&self.predication, sel);
-            self.raw.encode_wait_for_event(event, value)
-        })
+        let recorded_call =
+            crate::recorder::rec_call!("encodeWaitForEvent:value:", self, event, value);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let sel = "encodeWaitForEvent:value:";
+            // evwait: command buffer, event, value
+            trace_event("evwait", &self.raw, event.as_ref(), value);
+            encoding(sel, Policy::Dies, || {
+                let event = self::event(sel, event);
+                predication::boundary(&self.predication, sel);
+                self.raw.encode_wait_for_event(event, value)
+            })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn error(&self) -> Option<NsErrorText> {
@@ -1693,9 +1770,19 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         on: OnFault,
         render_pass_descriptor: &VulkanRenderPassDescriptor,
     ) -> RaiseResult<Option<VulkanRenderEncoder>> {
-        let sel = "renderCommandEncoderWithDescriptor:";
-        plain_at(sel, || predication::boundary(&self.predication, sel));
-        crate::gpu::encode_render::open(self, on, render_pass_descriptor)
+        let recorded_call = crate::recorder::rec_call!(
+            "renderCommandEncoderWithDescriptor:",
+            self,
+            render_pass_descriptor
+        );
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<VulkanRenderEncoder>> {
+                let sel = "renderCommandEncoderWithDescriptor:";
+                plain_at(sel, || predication::boundary(&self.predication, sel));
+                crate::gpu::encode_render::open(self, on, render_pass_descriptor)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Kept here, as the runtime has no protected content: the encoders made under them decide
@@ -1706,27 +1793,32 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// options once an encoder was made under some, or after options from 0x10 up, which
     /// nothing measured.
     fn set_protection_options(&self, _on: OnFault, options: u64) -> RaiseResult<()> {
-        let sel = "setProtectionOptions:";
-        if self.open_encoders.load(Ordering::SeqCst) != 0 {
-            uncommitted_encoder(sel);
-        }
-        send(sel, Policy::Dies, || {
-            self.raw
-                .set_protection_options(rt::DEFAULT_PROTECTION_OPTIONS)
-        })?;
-        let was = plain(|| *self.protection.lock());
-        let kept = was.used || protection_code(was.options) == INVALID_INPUT;
-        if kept && options != was.options {
-            unrepresentable(
-                sel,
-                &format!(
-                    "protection options {options:#x} after {:#x}, which nothing measured",
-                    was.options
-                ),
-            );
-        }
-        plain(|| self.protection.lock().options = options);
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!("setProtectionOptions:", self, options);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let sel = "setProtectionOptions:";
+            if self.open_encoders.load(Ordering::SeqCst) != 0 {
+                uncommitted_encoder(sel);
+            }
+            send(sel, Policy::Dies, || {
+                self.raw
+                    .set_protection_options(rt::DEFAULT_PROTECTION_OPTIONS)
+            })?;
+            let was = plain(|| *self.protection.lock());
+            let kept = was.used || protection_code(was.options) == INVALID_INPUT;
+            if kept && options != was.options {
+                unrepresentable(
+                    sel,
+                    &format!(
+                        "protection options {options:#x} after {:#x}, which nothing measured",
+                        was.options
+                    ),
+                );
+            }
+            plain(|| self.protection.lock().options = options);
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Scheduled or completed once its submission handler ran ([`tiler_handler`]).
@@ -1745,21 +1837,33 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// that is none of Metal's, dies as the wait returns ([`failed_pipeline`],
     /// [`refused_step`], [`answered`]), where no completed handler read its failure first.
     fn wait_until_completed(&self, _on: OnFault) -> RaiseResult<()> {
-        const SEL: &str = "waitUntilCompleted";
-        waiting(SEL, || self.raw.wait_until_completed())?;
-        match plain(|| self.raw.error()) {
-            Some(rt::CommandBufferError::PipelineCreation(_)) => failed_pipeline(SEL, &self.raw),
-            Some(rt::CommandBufferError::Refused) => refused_step(SEL, &self.raw),
-            Some(e) => answered(SEL, e, Some(&self.raw)),
-            None => {}
-        }
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!("waitUntilCompleted", self);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            const SEL: &str = "waitUntilCompleted";
+            waiting(SEL, || self.raw.wait_until_completed())?;
+            match plain(|| self.raw.error()) {
+                Some(rt::CommandBufferError::PipelineCreation(_)) => {
+                    failed_pipeline(SEL, &self.raw)
+                }
+                Some(rt::CommandBufferError::Refused) => refused_step(SEL, &self.raw),
+                Some(e) => answered(SEL, e, Some(&self.raw)),
+                None => {}
+            }
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Blocks, and hangs or dies, as `wait_until_completed` does. It returns once the command
     /// buffer's submission handler ran ([`tiler_handler`]).
     fn wait_until_scheduled(&self) -> RaiseResult<()> {
-        waiting("waitUntilScheduled", || self.raw.wait_until_scheduled())
+        let recorded_call = crate::recorder::rec_call!("waitUntilScheduled", self);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            waiting("waitUntilScheduled", || self.raw.wait_until_scheduled())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The pass's dispatch type, serial when unset as Metal's descriptor's is. Metal makes an
@@ -1773,25 +1877,34 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         &self,
         desc: &ComputePassDesc,
     ) -> RaiseResult<Option<VulkanComputeEncoder>> {
-        let dispatch_type = plain_at("setDispatchType:", || match desc.dispatch_type {
-            None => DispatchType::Serial,
-            Some(raw) => match u32::try_from(raw) {
-                Ok(raw) => DispatchType::try_from(raw).unwrap_or(DispatchType::Serial),
-                Err(_) => unrepresentable(
-                    "setDispatchType:",
-                    &format!("dispatch type {raw:#x}, past 32 bits, which nothing measured"),
-                ),
-            },
-        });
-        let sel = "computeCommandEncoderWithDescriptor:";
-        let raw = encoding(sel, Policy::Dies, || {
-            self.protected_creation(sel);
-            self.raw
-                .compute_command_encoder_with_dispatch_type(dispatch_type)
-                .map(Box::new)
-        })?;
-        metal_space::first_use(FirstUse::ComputeEncoder);
-        Ok(Some(predication::encoder(raw, self)))
+        let recorded_call =
+            crate::recorder::rec_call!("computeCommandEncoderWithDescriptor:", self, desc);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<VulkanComputeEncoder>> {
+                let dispatch_type = plain_at("setDispatchType:", || match desc.dispatch_type {
+                    None => DispatchType::Serial,
+                    Some(raw) => match u32::try_from(raw) {
+                        Ok(raw) => DispatchType::try_from(raw).unwrap_or(DispatchType::Serial),
+                        Err(_) => unrepresentable(
+                            "setDispatchType:",
+                            &format!(
+                                "dispatch type {raw:#x}, past 32 bits, which nothing measured"
+                            ),
+                        ),
+                    },
+                });
+                let sel = "computeCommandEncoderWithDescriptor:";
+                let raw = encoding(sel, Policy::Dies, || {
+                    self.protected_creation(sel);
+                    self.raw
+                        .compute_command_encoder_with_dispatch_type(dispatch_type)
+                        .map(Box::new)
+                })?;
+                metal_space::first_use(FirstUse::ComputeEncoder);
+                Ok(Some(predication::encoder(raw, self)))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 }
 

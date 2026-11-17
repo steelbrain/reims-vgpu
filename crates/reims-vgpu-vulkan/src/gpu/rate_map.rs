@@ -270,19 +270,25 @@ impl RateMapDescriptor<VulkanPlatform> for VulkanRateMapDescriptor {
         layer: &VulkanRateMapLayerDescriptor,
         layer_index: u64,
     ) -> RaiseResult<()> {
-        let sel = "setLayer:atIndex:";
-        let at = usize::try_from(layer_index)
-            .ok()
-            .filter(|&at| at < 1 << 16)
-            .unwrap_or_else(|| unrepresentable(sel, &format!("layer {layer_index}")));
-        plain(|| {
-            let mut layers = self.layers.lock();
-            if layers.len() <= at {
-                layers.resize_with(at + 1, || None);
-            }
-            layers[at] = Some(layer.clone_ref());
+        let recorded_call =
+            crate::recorder::rec_call!("setLayer:atIndex:", self, layer, layer_index);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let sel = "setLayer:atIndex:";
+            let at = usize::try_from(layer_index)
+                .ok()
+                .filter(|&at| at < 1 << 16)
+                .unwrap_or_else(|| unrepresentable(sel, &format!("layer {layer_index}")));
+            plain(|| {
+                let mut layers = self.layers.lock();
+                if layers.len() <= at {
+                    layers.resize_with(at + 1, || None);
+                }
+                layers[at] = Some(layer.clone_ref());
+            });
+            Ok(())
         });
-        Ok(())
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn layer_count(&self) -> u64 {
@@ -581,10 +587,16 @@ impl RateMap<VulkanPlatform> for VulkanRateMap {
     /// for them first. A refusal of the runtime's (a `Private` buffer, where Metal's copy ends the
     /// process) dies.
     fn copy_parameter_data(&self, buffer: &VulkanBuffer, offset: u64) -> RaiseResult<()> {
-        let sel = "copyParameterDataToBuffer:offset:";
-        send(sel, Policy::Dies, || {
-            self.raw.copy_parameter_data_to_buffer(&buffer.raw, offset)
-        })
+        let recorded_call =
+            crate::recorder::rec_call!("copyParameterDataToBuffer:offset:", self, buffer, offset);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let sel = "copyParameterDataToBuffer:offset:";
+            send(sel, Policy::Dies, || {
+                self.raw.copy_parameter_data_to_buffer(&buffer.raw, offset)
+            })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn layer_count(&self) -> u64 {
@@ -598,11 +610,23 @@ impl RateMap<VulkanPlatform> for VulkanRateMap {
         physical_coordinates: MtlCoordinate2D,
         layer_index: u64,
     ) -> RaiseResult<MtlCoordinate2D> {
-        let sel = "mapPhysicalToScreenCoordinates:forLayer:";
-        Ok(mapped(sel, || {
-            self.raw
-                .map_physical_to_screen_coordinates(coordinate(physical_coordinates), layer_index)
-        }))
+        let recorded_call = crate::recorder::rec_call!(
+            "mapPhysicalToScreenCoordinates:forLayer:",
+            self,
+            physical_coordinates,
+            layer_index
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<MtlCoordinate2D> {
+            let sel = "mapPhysicalToScreenCoordinates:forLayer:";
+            Ok(mapped(sel, || {
+                self.raw.map_physical_to_screen_coordinates(
+                    coordinate(physical_coordinates),
+                    layer_index,
+                )
+            }))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's map, (0, 0) for a mutable map not yet reset, as Metal's; Metal ends its
@@ -612,11 +636,21 @@ impl RateMap<VulkanPlatform> for VulkanRateMap {
         screen_coordinates: MtlCoordinate2D,
         layer_index: u64,
     ) -> RaiseResult<MtlCoordinate2D> {
-        let sel = "mapScreenToPhysicalCoordinates:forLayer:";
-        Ok(mapped(sel, || {
-            self.raw
-                .map_screen_to_physical_coordinates(coordinate(screen_coordinates), layer_index)
-        }))
+        let recorded_call = crate::recorder::rec_call!(
+            "mapScreenToPhysicalCoordinates:forLayer:",
+            self,
+            screen_coordinates,
+            layer_index
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<MtlCoordinate2D> {
+            let sel = "mapScreenToPhysicalCoordinates:forLayer:";
+            Ok(mapped(sel, || {
+                self.raw
+                    .map_screen_to_physical_coordinates(coordinate(screen_coordinates), layer_index)
+            }))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn mutability(&self) -> u64 {
@@ -646,9 +680,14 @@ impl RateMap<VulkanPlatform> for VulkanRateMap {
     /// The runtime's, which is Metal's: 0 by 0 for a mutable map not yet reset, and past the
     /// layers the width the map last held for that layer below 2, which a reset keeps.
     fn physical_size(&self, layer_index: u64) -> RaiseResult<MtlSize> {
-        Ok(mtl_size(plain(|| {
-            self.raw.physical_size_for_layer(layer_index)
-        })))
+        let recorded_call = crate::recorder::rec_call!("physicalSizeForLayer:", self, layer_index);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<MtlSize> {
+            Ok(mtl_size(plain(|| {
+                self.raw.physical_size_for_layer(layer_index)
+            })))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's: the descriptor's width and height, depth 1, as Metal answers on an M3 Max
@@ -667,38 +706,42 @@ impl RateMap<VulkanPlatform> for VulkanRateMap {
     /// map as reset within it, which no measurement compared with Metal's. The reset holds the
     /// map's lock, which a pass's creation holds too.
     fn reset(&self, descriptor: &VulkanRateMapDescriptor) {
-        let sel = "resetUsingDescriptor:";
-        let mut inner = plain(|| self.inner.lock());
-        let d = descriptor.compiled(sel);
-        let ((), heard) = hearing(|| get(sel, || self.raw.reset_using_descriptor(&d)));
-        let class = Class::compiled(&self.raw, &heard);
-        let (width, height) = screen(&self.raw);
-        inner.passes.retain(|t| t.progress.running());
-        if let Some(took) = inner.passes.iter().find(|t| !t.class.holds_over(class)) {
-            unrepresentable(
-                sel,
-                &format!(
-                    "a reset to a map of class {class:?} before a pass that took the map as \
+        let recorded_call = crate::recorder::rec_call!("resetUsingDescriptor:", self, descriptor);
+        crate::recorder::run(|| {
+            let sel = "resetUsingDescriptor:";
+            let mut inner = plain(|| self.inner.lock());
+            let d = descriptor.compiled(sel);
+            let ((), heard) = hearing(|| get(sel, || self.raw.reset_using_descriptor(&d)));
+            let class = Class::compiled(&self.raw, &heard);
+            let (width, height) = screen(&self.raw);
+            inner.passes.retain(|t| t.progress.running());
+            if let Some(took) = inner.passes.iter().find(|t| !t.class.holds_over(class)) {
+                unrepresentable(
+                    sel,
+                    &format!(
+                        "a reset to a map of class {class:?} before a pass that took the map as \
                      {:?} has run: the runtime draws the pass by the map as reset, as Metal's \
                      GPU reads it, but what its encoder decided by the map it took stands",
-                    took.class
-                ),
-            );
-        }
-        let resized = inner.passes.iter().find(|t| t.screen != (width, height));
-        if let Some(took) = resized.filter(|_| class != Class::Identity) {
-            let (w, h) = took.screen;
-            unrepresentable(
-                sel,
-                &format!(
-                    "a reset to a map of class {class:?} of a {width} by {height} screen before a \
+                        took.class
+                    ),
+                );
+            }
+            let resized = inner.passes.iter().find(|t| t.screen != (width, height));
+            if let Some(took) = resized.filter(|_| class != Class::Identity) {
+                let (w, h) = took.screen;
+                unrepresentable(
+                    sel,
+                    &format!(
+                        "a reset to a map of class {class:?} of a {width} by {height} screen before a \
                      pass that took the map of a {w} by {h} screen has run: Metal's GPU draws the \
                      pass over the screen the map had at the encoder's creation, and the runtime's \
                      by the map as reset within it, which no measurement compared with Metal's"
-                ),
-            );
-        }
-        inner.class = class;
+                    ),
+                );
+            }
+            inner.class = class;
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 }
 

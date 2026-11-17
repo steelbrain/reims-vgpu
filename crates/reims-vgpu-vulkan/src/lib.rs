@@ -39,6 +39,7 @@ pub(crate) mod in_place_log;
 pub mod let_go;
 pub mod os;
 pub mod platform;
+pub mod recorder;
 pub(crate) mod records;
 pub mod remap;
 pub mod swapchain;

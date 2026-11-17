@@ -1099,10 +1099,15 @@ impl Swapchain {
     /// The texture over `frame`'s image, which the display's present pass draws into.
     pub fn texture(&self, frame: Frame) -> Option<&VulkanTexture> {
         let chain = self.chain.as_ref()?;
-        chain
+        let texture = chain
             .images
             .get(usize::try_from(frame.index).ok()?)
-            .map(|i| &i.texture)
+            .map(|i| &i.texture);
+        // A recorded stream makes the drawable before its first use.
+        if let Some(t) = texture {
+            crate::recorder::adopt_texture(t);
+        }
+        texture
     }
 
     /// Encodes in `command_buffer` the signal of `frame`'s semaphore, after what it encoded:

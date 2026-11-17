@@ -21,6 +21,8 @@ metal2vulkan-runtime.workspace = true
 metal2vulkan.workspace = true
 # The debug lines that time the runtime's compiles (gpu/timing.rs), through core's logger.
 log.workspace = true
+# The call recorder's blob hashes (`recorder::format`), SHA-256 as the replay format names them.
+sha2.workspace = true
 # A display window's swapchain (`swapchain.rs`) and the window system's extensions
 # (`os/wsi.rs`), through ash, on either OS.
 ash.workspace = true
