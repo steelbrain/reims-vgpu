@@ -287,8 +287,12 @@ Three tiers:
     host-visible blocks into the guest. Textures are device images synced at
     the guest's events (surface lock and unlock, didModifyRange,
     replaceRegion), with no page logs. gpuAddress is the Vulkan device
-    address and gpuResourceID a descriptor index, with one VkDevice per guest
-    process. At the cutover this replaces "guest memory in place"
+    address and gpuResourceID a descriptor index, with one VkDevice per VM
+    (the host process) for everything, the compositor's work included, and no
+    path that shares objects across devices. Guest processes are therefore
+    not isolated from each other on the device. Every byte on it is
+    guest-writable, and the host never parses or trusts host data it keeps
+    there. At the cutover this replaces "guest memory in place"
     ([docs/conventions.md](docs/conventions.md));
   - lanes split by feature, never by vendor, and a check fans out one leg
     per GPU kind at once.
