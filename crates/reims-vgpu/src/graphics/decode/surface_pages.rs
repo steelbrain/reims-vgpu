@@ -107,11 +107,14 @@
 //! copies to read, with no buffer over the whole of it and no import, and it goes into the cache
 //! at the release as it is, with none. A later read-only block over the same runs takes it so; a
 //! writable block or a surface's block, whose buffers lie in its import, takes only a cached view
-//! that has one, and makes its own otherwise. On a device that lists every import in every
-//! submission (RADV) such an import cost every submission and served nothing: **measured**
-//! 2026-11-16 on homelab-um790-xtx-1's Radeon 780M, a macOS 26.7.2 guest's desktop walk
-//! (m3-max-38623, traced), 101 to 137 of the live pages blocks during the window drags were
-//! read-only blocks with a view, each view's import a file of its own.
+//! that has one, and makes its own otherwise. Such an import served nothing, and on a device that
+//! lists every live import in every submission (RADV) cost each submission while it lived.
+//! **Measured** 2026-11-16 on homelab-um790-xtx-1, a macOS 26.7.2 guest's desktop walk: 101 to
+//! 137 of the live pages blocks were read-only blocks with a view (m3-max-38623, traced), and
+//! with none of their views imported each submission during the window drags listed 105 to 111
+//! shared dma-buf files on the Radeon 780M, against 133 to 135 (two walks each: m3-max-38741 and
+//! 38743 against 38553 and 38555), and 106 on the RX 7900 XTX, against 136 (38742 against
+//! 38554); during Launchpad's opens and closes as many as before.
 //!
 //! **Heaps over pages** (`RGFX_FEATURE_HEAP_OVER_PAGES`). A pages block, a slab of the guest's, can
 //! hold a `HEAP_OVER_PAGES`, the buffers placed in it costing what a heap over host memory's do. A
