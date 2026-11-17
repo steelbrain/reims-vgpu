@@ -831,22 +831,22 @@ void ReimsGraphics::vtRing(const volatile UInt8 *payload, UInt32 size)
 			IOLog("ReimsGraphics: a VT_RING of %u bytes is not read\n", size);
 		return;
 	}
-	const UInt64 produced = *reinterpret_cast<const volatile UInt64 *>(payload);
+	const UInt64 through = *reinterpret_cast<const volatile UInt64 *>(payload);
 	volatile UInt8 *header = ring(RGFX_VT_RING_OFFSET);
-	const RgfxVtRingTaken taken = rgfxTakeVtRing(
-	    header + RGFX_RING_HEADER_SIZE, vtConsumed, produced,
+	const RgfxVtRingTaken took = rgfxTakeVtRing(
+	    header + RGFX_RING_HEADER_SIZE, vtConsumed, through,
 	    [this](const volatile UInt8 *message, UInt32 length) { vtMessage(message, length); });
-	if (taken.fault != RgfxVtRingFault::None) {
+	if (took.fault != RgfxVtRingFault::None) {
 		static char faulted;
-		if (rgfxFirstCalls(&faulted, static_cast<UInt32>(taken.fault), 1))
+		if (rgfxFirstCalls(&faulted, static_cast<UInt32>(took.fault), 1))
 			IOLog("ReimsGraphics: the VideoToolbox ring's %s is out of range: its messages from "
 			      "0x%llx to 0x%llx are dropped\n",
-			      taken.fault == RgfxVtRingFault::Count ? "count" : "record", vtConsumed,
-			      produced);
+			      took.fault == RgfxVtRingFault::Count ? "count" : "record", vtConsumed,
+			      through);
 	}
-	if (taken.consumed == vtConsumed)
+	if (took.consumed == vtConsumed)
 		return;
-	vtConsumed = taken.consumed;
+	vtConsumed = took.consumed;
 	// The host may write the bytes taken again once it reads this.
 	__atomic_store_n(reinterpret_cast<volatile UInt64 *>(
 	                     header + __builtin_offsetof(RgfxRingHeader, consumer)),
