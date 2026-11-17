@@ -38,16 +38,21 @@ Intel runs were made on the Iris Xe of an i9-13900H on iHD. Paths are
 | HEVC's hardware check and its tools | `tools/hevc-check.sh`, `examples/hevc-framemd5.rs`, `examples/hevc-info.rs`, `examples/hevc-cut.rs`, `examples/hevc-craft.rs` |
 | The encoders' tool | `examples/vaapi-encode/` |
 
-`src/vaapi.rs` and `src/vaapi/` are Linux's alone (lib.rs picks them with `cfg`). Every
-`unsafe` block of the module is there, each with its reason. On Linux the library
-links neither `libva` nor `libva-drm`: it loads them when its first
-display opens ("Loading libva").
+`src/vaapi.rs` and `src/vaapi/` are Linux's and Windows's (lib.rs picks them
+with `cfg`). Every `unsafe` block of the module is there, each with its
+reason. The library links no libva: it loads it when its first display
+opens ("Loading libva"). Windows makes no dma-buf, so there the pieces built
+on them are left out (`cfg(unix)`): a surface's export, decodes into targets
+over memory of ours, the import check (`Display::import_writes` finds no
+import), and the staged and mapped copies back. Its frames come back through
+`vaGetImage`, and its tests that need dma-bufs are Linux's.
 
 ### Loading libva
 
-The binding's 37 functions come from `dlopen` and `dlsym`
-(`src/vaapi/va/libva.rs`), as the nvidia crate loads NVIDIA's libraries, so a
-QEMU built with the library starts on a host without libva.
+The binding's 37 functions come from `dlopen` and `dlsym`, on Windows from
+`LoadLibraryW` and `GetProcAddress` (`src/vaapi/va/libva.rs`), as the
+nvidia crate loads NVIDIA's libraries, so a QEMU built with the library
+starts on a host without libva.
 - Each function has a wrapper of the same name and signature, which
   `ffi` and `ffi::encode` re-export, so no call site names the loaded
   table.
@@ -57,6 +62,15 @@ QEMU built with the library starts on a host without libva.
   libva.so.2: ...". The graphics device's VA-API arm then declines, its
   line at info saying why, and the device's video goes to the next arm
   ([devices.md](devices.md), "Which hardware").
+- On Windows `Display::open_adapter` loads `libva.dll` and
+  `libva_win32.dll` instead (`LoadLibraryW`, so the program's own folder
+  first, then the system's and `PATH`), and opens the display with
+  `vaGetDisplayWin32` on the DXGI adapter whose LUID Vulkan answers for
+  the runtime device (reims-vgpu-vulkan's `host_gpus::adapter_luid_of`).
+  libva-win32 loads the driver the adapter's registry names, else
+  `vaon12`, Mesa's driver on Direct3D 12, which MSYS2's libva looks for
+  beside its own DLL. reims-ctl's install (`scripts/install-ctl.sh`)
+  copies the three DLLs beside QEMU.
 - Every other libva call needs a display that `open` made, so no wrapper
   runs before a load that succeeded. The libraries are never unloaded,
   since libva loads the driver, whose threads and state outlive a display.
@@ -403,7 +417,8 @@ The reims-graphics device's H.264 and HEVC decode runs on this crate
 where its GPU is not one NVDEC opens: the device's video chooser
 (reims-vgpu's `src/graphics/video_choice.rs`) tries NVDEC, then VA-API on
 the render node of the runtime device's own GPU, whatever its vendor
-(`host_gpus::render_node_of`). The arm
+(`host_gpus::render_node_of`), or on Windows on its DXGI adapter
+(`host_gpus::adapter_luid_of`). The arm
 (`src/graphics/vaapi.rs`) runs the module's `H264Decoder` and
 `HevcDecoder` in a host video session of reims-vgpu's
 (`src/graphics/video_host.rs`), whose event the host signals.

@@ -18,6 +18,14 @@ runtime device (reims-vgpu's `graphics/video_choice.rs`):
 2. VA-API, on the device's render node, whatever its vendor (`graphics/vaapi.rs`,
    [vaapi.md](vaapi.md)).
 
+On Windows the device's video runs on VA-API alone, through libva-win32 on the DXGI adapter of
+the runtime device's GPU (the LUID Vulkan answers for it) and Mesa's VA-API driver on Direct3D 12,
+`vaon12`, which reims-ctl's install takes from MSYS2's CLANG64 packages. Windows makes no
+dma-buf, so its pictures come back through `vaGetImage` and the CPU's copy into the guest's
+planes ([vaapi.md](vaapi.md), "Loading libva"). On Intel's UHD 630 (driver 31.0.101.2145)
+`vaon12` decodes H.264 and HEVC Main and Main 10 and encodes nothing, so the device lists no
+encoder there.
+
 Each arm that declines says why in one line at info. A Mac has no video arm, on either platform.
 Where no arm takes the device, the host writes no video caps, and the guest is offered no
 codec: the kext names AppleGVA no video driver (`publishVideoCodecs`,

@@ -51,7 +51,8 @@ reims-vgpu's `graphics` module holds the arms themselves: `graphics/nvidia.rs` a
 
 `graphics_video` (`graphics/video_choice.rs`) asks each arm in turn for the runtime device:
 NVIDIA's (NVDEC and NVENC), then VA-API. Each that declines says why in one line at info, and costs no more than
-asking: a GPU that is not NVIDIA's loads no CUDA. Both are built on Linux alone.
+asking: a GPU that is not NVIDIA's loads no CUDA. NVIDIA's is built on Linux alone, VA-API's on Linux
+and Windows.
 
 ## Tests
 
