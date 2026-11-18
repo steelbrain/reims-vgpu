@@ -246,6 +246,20 @@ is its transport:
   WHPX error, and the VM ran on. The guest touches a piece only between the device's word that
   it is in and its own word that it emptied it, so neither wait is one it
   meets.
+- Under HVF, measured 11-18 on the M3 Max (macOS 27.0.1) with a program on
+  Hypervisor.framework alone, not yet through QEMU or the pool: four vCPUs
+  swept 1 GiB of standing guest RAM while blocks of 16 and 64 MiB were each
+  mapped at an address of their own and unmapped, 400 to 600 cycles a size.
+  `hv_vm_map` took about 3 us at either size, since HVF fills its stage-2
+  tables at the guest's first touch of each 16 KiB page. That touch cost
+  about 1.2 us a page (1.2 ms over a 16 MiB block, 4.8 ms over 64 MiB), and
+  about 1.5 us over a page the host had never touched. `hv_vm_unmap` of a
+  touched block took about 70 ns a page with the vCPUs running (71 us for
+  16 MiB and 281-288 us for 64 MiB at the median, 0.68 ms at most), and
+  58 ns with them idle. Neither call stalled a vCPU, and no unmap dropped
+  the other mappings: the vCPUs' longest gaps, and their next sweep over the
+  standing RAM, matched a control with no call. A Metal Shared buffer's
+  contents mapped and behaved as anonymous memory does.
 - **The guest's RAM**: on Linux the device gives the library the map of the
   RAM ranges that are a shared file in pages of the host's size (the memfd of
   `reims-ctl`'s VMs), with the files behind them, and the GPU uses an
