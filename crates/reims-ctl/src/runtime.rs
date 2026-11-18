@@ -69,28 +69,12 @@ pub fn running(vm: &Vm) -> bool {
     pid(vm).is_some()
 }
 
-/// What reims-ctl says of a start of a VM it makes and doesn't start, an arm64 VM: where its
-/// restored macOS is.
-pub fn not_started(vm: &Vm) -> String {
-    format!(
-        "reims-ctl doesn't start arm64 VMs yet: {}'s macOS is restored in {} (its disk, {}, and \
-         its auxiliary storage, aux.img), which boots on QEMU's vmapple with Ambrosia, our arm64 \
-         firmware",
-        vm.name(),
-        crate::paths::tilde(&vm.dir),
-        vm.config.disk.display()
-    )
-}
-
 /// What is wrong with the host or the VM's files for a start, if anything.
 pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
     let c = &vm.config;
     c.check()?;
     if !crate::host::Profile::supported_on(host).contains(&c.profile) {
         bail!("{}", crate::host::UNSUPPORTED);
-    }
-    if !c.profile.starts() {
-        bail!("{}", not_started(vm));
     }
     let need = |p: &Path, what: &str| -> Result<()> {
         if !p.exists() {
@@ -116,9 +100,25 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
                 );
             }
         }
-        Profile::VmappleArm64 => {}
+        Profile::VmappleArm64 => {
+            let a = c.vmapple.as_ref().unwrap();
+            if !vm.aux_trimmed().exists() {
+                need(&vm.path(&a.aux), "the auxiliary storage")?;
+            }
+            if c.graphics() != Graphics::ReimsVgpu {
+                bail!(
+                    "an arm64 VM runs on reims-vgpu's own device, not {}: reims-ctl set {} \
+                     --graphics reims-vgpu",
+                    c.graphics().name(),
+                    c.name
+                );
+            }
+            if !c.usb.is_empty() {
+                bail!("USB passthrough: {}", crate::host::X86_64_ONLY);
+            }
+        }
     }
-    if host.os == Os::Linux {
+    if host.os == Os::Linux && c.profile.accel(host) == "kvm" {
         let kvm = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -422,6 +422,13 @@ pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
              one with it"
         );
     }
+    let arm64 = match vm.config.profile {
+        Profile::VmappleArm64 => Some(qemu::Arm64Boot {
+            ambrosia: crate::ambrosia::path(),
+            bundle: crate::prebuilt::ambrosia_bundle(&vm.ambrosia_config())?,
+        }),
+        Profile::Q35X86_64 => None,
+    };
     Ok(Ctx {
         host,
         qemu,
@@ -430,17 +437,55 @@ pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
         nested_vmx: crate::host::kvm_nested_vmx(),
         screen,
         graphics_rom: graphics_rom(vm)?,
+        arm64,
     })
 }
 
-/// The option ROM of reims-vgpu's own device, written into the data directory for a VM on it
-/// ([`crate::prebuilt::graphics_rom`]); an empty path, which no command names, for another.
+/// The option ROM of reims-vgpu's own device, written into the data directory for an x86-64 VM
+/// on it ([`crate::prebuilt::graphics_rom`]); an empty path, which no command names, for another
+/// VM. An arm64 VM's device has no option ROM: Ambrosia drives it with its module.
 fn graphics_rom(vm: &Vm) -> Result<std::path::PathBuf> {
-    if vm.config.graphics() == Graphics::ReimsVgpu {
+    if vm.config.profile == Profile::Q35X86_64 && vm.config.graphics() == Graphics::ReimsVgpu {
         crate::prebuilt::graphics_rom()
     } else {
         Ok(std::path::PathBuf::new())
     }
+}
+
+/// The header of Virtualization.framework's auxiliary storage, which a restore leaves at the
+/// start of an arm64 VM's `aux.img`, and which QEMU's vmapple takes without.
+const AUX_HEADER: usize = 16 << 10;
+
+/// Makes an arm64 VM's `aux.img.trimmed`, its auxiliary storage as QEMU attaches it, from its
+/// `aux.img` where it has none: the same bytes without [`AUX_HEADER`]. From its first start on,
+/// the guest keeps its NVRAM in the trimmed copy, which is never made again.
+pub fn trim_aux(vm: &Vm) -> Result<()> {
+    let Some(a) = &vm.config.vmapple else {
+        return Ok(());
+    };
+    let trimmed = vm.aux_trimmed();
+    if trimmed.exists() {
+        return Ok(());
+    }
+    let aux = vm.path(&a.aux);
+    let bytes = std::fs::read(&aux).with_context(|| format!("read {}", aux.display()))?;
+    if bytes.len() <= AUX_HEADER {
+        bail!(
+            "{} is not an auxiliary storage: it is {} bytes",
+            aux.display(),
+            bytes.len()
+        );
+    }
+    let mut tmp = trimmed.as_os_str().to_os_string();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    let written =
+        std::fs::write(&tmp, &bytes[AUX_HEADER..]).and_then(|()| std::fs::rename(&tmp, &trimmed));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("write {}", trimmed.display()));
+    }
+    Ok(())
 }
 
 /// The invocation `start` would run, with QEMU's real path where it is installed.
@@ -455,6 +500,11 @@ pub fn invocation_for_print(vm: &Vm, host: Host) -> Result<Invocation> {
             nested_vmx: crate::host::kvm_nested_vmx(),
             screen: crate::host::has_screen(&vm.config.extra_env),
             graphics_rom: graphics_rom(vm).unwrap_or_else(|_| crate::prebuilt::graphics_rom_path()),
+            arm64: (vm.config.profile == Profile::VmappleArm64).then(|| qemu::Arm64Boot {
+                ambrosia: crate::ambrosia::path(),
+                bundle: crate::prebuilt::ambrosia_bundle_path(&vm.ambrosia_config())
+                    .unwrap_or_default(),
+            }),
         }
     });
     qemu::invocation(vm, &ctx)
@@ -730,6 +780,10 @@ pub fn start(vm: &Vm, host: Host) -> Result<Started> {
         );
     }
     preflight(vm, host)?;
+    if vm.config.profile == Profile::VmappleArm64 {
+        crate::ambrosia::image()?;
+        trim_aux(vm)?;
+    }
     let ctx = context(vm, host)?;
     let inv = qemu::invocation(vm, &ctx)?;
     let launch = launch(vm.name(), UserManager::current());

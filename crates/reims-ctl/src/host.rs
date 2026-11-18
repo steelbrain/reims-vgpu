@@ -5,11 +5,15 @@
 //! - Linux and Windows on x86-64: [`Profile::Q35X86_64`], `q35` booted through OpenCore, with
 //!   reims-vgpu's own GPU device, on KVM on Linux and on the Windows Hypervisor Platform (WHPX)
 //!   on Windows;
-//! - an arm64 Mac (HVF) and arm64 Linux (KVM): [`Profile::VmappleArm64`], QEMU's `vmapple`, whose
-//!   VMs reims-ctl makes by restoring macOS from an IPSW (restore.rs) and does not start yet
-//!   ([`Profile::starts`]).
+//! - an arm64 Mac, arm64 Linux and Linux on x86-64: [`Profile::VmappleArm64`], QEMU's `vmapple`
+//!   booted by Ambrosia (ambrosia.rs), with reims-vgpu's own GPU device, whose VMs reims-ctl
+//!   makes by restoring macOS from an IPSW (restore.rs): on Hypervisor.framework (HVF) on a Mac,
+//!   on KVM on arm64 Linux, and emulated by QEMU's TCG on x86-64, where an arm64 guest runs
+//!   several times slower than on an arm64 host. On Linux on x86-64 it is the second profile, an
+//!   IPSW's, and q35 the default.
 //!
-//! Any other host runs none ([`UNSUPPORTED`]).
+//! Any other host runs none ([`UNSUPPORTED`]). Windows on x86-64 runs no arm64 VM: its QEMU is
+//! built for x86-64 guests alone (scripts/install-ctl.sh).
 //!
 //! Another host or guest architecture is another profile (x86-64 guests on an Intel Mac would be
 //! `q35` on HVF, without the memfd RAM only Linux has): add it here and in `qemu.rs`.
@@ -19,10 +23,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// What reims-ctl tells a host it runs no VMs on, for a create or a start there.
-pub const UNSUPPORTED: &str = "reims-ctl runs VMs on Linux and Windows x86-64 hosts, and \
-                               makes arm64 VMs from an IPSW on arm64 Macs and arm64 Linux";
+pub const UNSUPPORTED: &str = "reims-ctl runs x86-64 VMs on Linux and Windows x86-64 hosts, \
+                               and arm64 VMs on arm64 Macs, arm64 Linux and Linux on x86-64";
 
-/// What reims-ctl tells an arm64 host of the work only x86-64 VMs have (GPUs, USB devices).
+/// What reims-ctl tells of the work only x86-64 VMs have (USB devices, VMware SVGA).
 pub const X86_64_ONLY: &str = "that's for x86-64 VMs, which run on Linux and Windows x86-64 hosts";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,7 +134,8 @@ pub enum Profile {
 impl Profile {
     pub fn supported_on(host: Host) -> &'static [Profile] {
         match (host.os, host.arch) {
-            (Os::Linux | Os::Windows, Arch::X86_64) => &[Profile::Q35X86_64],
+            (Os::Linux, Arch::X86_64) => &[Profile::Q35X86_64, Profile::VmappleArm64],
+            (Os::Windows, Arch::X86_64) => &[Profile::Q35X86_64],
             (Os::Mac | Os::Linux, Arch::Aarch64) => &[Profile::VmappleArm64],
             _ => &[],
         }
@@ -145,10 +150,14 @@ impl Profile {
 
     /// What it is, with its accelerator on `host`.
     pub fn describe(self, host: Host) -> &'static str {
-        match (self, host.os) {
-            (Profile::Q35X86_64, Os::Windows) => "x86-64 macOS guest (q35 and OpenCore, WHPX)",
+        match (self, self.accel(host)) {
+            (Profile::Q35X86_64, "whpx") => "x86-64 macOS guest (q35 and OpenCore, WHPX)",
             (Profile::Q35X86_64, _) => "x86-64 macOS guest (q35 and OpenCore, KVM)",
-            (Profile::VmappleArm64, _) => "arm64 macOS guest (vmapple), restored from an IPSW",
+            (Profile::VmappleArm64, "hvf") => "arm64 macOS guest (vmapple and Ambrosia, HVF)",
+            (Profile::VmappleArm64, "kvm") => "arm64 macOS guest (vmapple and Ambrosia, KVM)",
+            (Profile::VmappleArm64, _) => {
+                "arm64 macOS guest (vmapple and Ambrosia, emulated by TCG)"
+            }
         }
     }
 
@@ -161,21 +170,28 @@ impl Profile {
         }
     }
 
-    /// The accelerator on `host`: KVM, on Windows the Windows Hypervisor Platform, and for an
-    /// arm64 guest on a Mac, Hypervisor.framework.
+    /// The accelerator on `host`: for an x86-64 guest KVM, and on Windows the Windows Hypervisor
+    /// Platform; for an arm64 guest Hypervisor.framework on a Mac, KVM on arm64 Linux, and TCG,
+    /// QEMU's emulation, on an x86-64 host.
     pub fn accel(self, host: Host) -> &'static str {
-        match (self, host.os) {
-            (Profile::Q35X86_64, Os::Windows) => "whpx",
-            (Profile::Q35X86_64, _) => "kvm",
-            (Profile::VmappleArm64, Os::Mac) => "hvf",
-            (Profile::VmappleArm64, _) => "kvm",
+        match (self, host.os, host.arch) {
+            (Profile::Q35X86_64, Os::Windows, _) => "whpx",
+            (Profile::Q35X86_64, ..) => "kvm",
+            (Profile::VmappleArm64, Os::Mac, _) => "hvf",
+            (Profile::VmappleArm64, _, Arch::Aarch64) => "kvm",
+            (Profile::VmappleArm64, ..) => "tcg",
         }
     }
 
-    /// Whether reims-ctl starts its VMs. An arm64 VM is made, by a restore, and not started:
-    /// its boot, on Ambrosia with reims-vgpu's device, is not reims-ctl's yet.
-    pub fn starts(self) -> bool {
-        self == Profile::Q35X86_64
+    /// QEMU's `-accel` for it on `host`: [`Profile::accel`] with its options. An arm64 guest runs
+    /// with the GIC in the kernel on HVF, and on TCG a thread for each vCPU; these are the options
+    /// Ambrosia's boot check runs it with (firmware/ambrosia/check-boot.sh).
+    pub fn accel_arg(self, host: Host) -> &'static str {
+        match (self, self.accel(host)) {
+            (Profile::VmappleArm64, "hvf") => "hvf,kernel-irqchip=on",
+            (Profile::VmappleArm64, "tcg") => "tcg,thread=multi",
+            (_, accel) => accel,
+        }
     }
 
     /// Whether the guest's RAM must be a shared memfd: the library on Linux builds its views of
@@ -191,10 +207,10 @@ impl Profile {
         host.os == Os::Windows
     }
 
-    /// Whether a Vulkan GPU can be chosen: the library runs on Vulkan on Linux and Windows, for
-    /// the x86-64 VMs it runs.
+    /// Whether a Vulkan GPU can be chosen: the library runs on the host's Vulkan GPUs on Linux
+    /// and Windows, and on a Mac on MoltenVK, over the Mac's one GPU.
     pub fn gpu_choice(self, host: Host) -> bool {
-        self == Profile::Q35X86_64 && matches!(host.os, Os::Linux | Os::Windows)
+        matches!(host.os, Os::Linux | Os::Windows)
     }
 }
 
@@ -208,9 +224,9 @@ impl fmt::Display for Profile {
 mod tests {
     use super::*;
 
-    /// Linux on x86-64 runs x86-64 guests on KVM in memfd RAM; an arm64 Mac and arm64 Linux
-    /// make arm64 guests on vmapple, which they don't start; an Intel Mac, Windows on arm64 and
-    /// any other host run none.
+    /// Linux on x86-64 runs x86-64 guests on KVM in memfd RAM, and arm64 guests on vmapple under
+    /// TCG; an arm64 Mac and arm64 Linux run arm64 guests on vmapple, under HVF and KVM; an Intel
+    /// Mac, Windows on arm64 and any other host run none.
     #[test]
     fn each_host_has_its_profile() {
         let linux = Host {
@@ -218,21 +234,29 @@ mod tests {
             arch: Arch::X86_64,
         };
         assert_eq!(linux.default_profile(), Some(Profile::Q35X86_64));
+        assert_eq!(
+            Profile::supported_on(linux),
+            [Profile::Q35X86_64, Profile::VmappleArm64]
+        );
         assert!(Profile::Q35X86_64.memfd_ram(linux));
         assert!(!Profile::Q35X86_64.section_ram(linux));
         assert_eq!(Profile::Q35X86_64.accel(linux), "kvm");
-        assert!(Profile::Q35X86_64.starts());
+        assert_eq!(Profile::Q35X86_64.accel_arg(linux), "kvm");
+        let arm = Profile::VmappleArm64;
+        assert_eq!(arm.accel(linux), "tcg");
+        assert_eq!(arm.accel_arg(linux), "tcg,thread=multi");
+        assert!(arm.memfd_ram(linux) && arm.gpu_choice(linux));
+        assert!(arm.describe(linux).ends_with("emulated by TCG)"));
         for os in [Os::Mac, Os::Linux] {
             let host = Host {
                 os,
                 arch: Arch::Aarch64,
             };
             assert_eq!(
-                host.default_profile(),
-                Some(Profile::VmappleArm64),
+                Profile::supported_on(host),
+                [Profile::VmappleArm64],
                 "{os:?}"
             );
-            assert!(!Profile::VmappleArm64.gpu_choice(host));
         }
         let (mac, arm_linux) = (
             Host {
@@ -244,10 +268,15 @@ mod tests {
                 arch: Arch::Aarch64,
             },
         );
-        assert_eq!(Profile::VmappleArm64.accel(mac), "hvf");
-        assert_eq!(Profile::VmappleArm64.accel(arm_linux), "kvm");
-        assert!(!Profile::VmappleArm64.starts());
-        assert_eq!(Profile::VmappleArm64.qemu_binary(), "qemu-system-aarch64");
+        assert_eq!(arm.accel(mac), "hvf");
+        assert_eq!(arm.accel_arg(mac), "hvf,kernel-irqchip=on");
+        assert!(!arm.memfd_ram(mac) && !arm.gpu_choice(mac));
+        assert!(arm.describe(mac).ends_with("HVF)"));
+        assert_eq!(arm.accel(arm_linux), "kvm");
+        assert_eq!(arm.accel_arg(arm_linux), "kvm");
+        assert!(arm.memfd_ram(arm_linux) && arm.gpu_choice(arm_linux));
+        assert!(arm.describe(arm_linux).ends_with("KVM)"));
+        assert_eq!(arm.qemu_binary(), "qemu-system-aarch64");
         for (os, arch) in [
             (Os::Mac, Arch::X86_64),
             (Os::Windows, Arch::Aarch64),
@@ -266,7 +295,7 @@ mod tests {
             arch: Arch::X86_64,
         };
         let q35 = Profile::Q35X86_64;
-        assert_eq!(windows.default_profile(), Some(q35));
+        assert_eq!(Profile::supported_on(windows), [q35]);
         assert_eq!(q35.accel(windows), "whpx");
         assert!(q35.section_ram(windows) && !q35.memfd_ram(windows));
         assert!(q35.gpu_choice(windows));

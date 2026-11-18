@@ -13,9 +13,11 @@
 //! VM's settings name its graphics: reims-vgpu's own device unless the create chose another.
 //!
 //! An arm64 VM (`vmapple-arm64`) is macOS restored from an IPSW onto a new raw disk
-//! (restore.rs), with the auxiliary storage and ECID the restore leaves beside it. Its IPSW is
-//! found, and downloaded where it isn't here (ipsw.rs), before its directory is made; the restore
-//! checks the space it writes before it writes anything.
+//! (restore.rs), with the auxiliary storage and ECID the restore leaves beside it, on reims-vgpu's
+//! own device. Its IPSW is found, and downloaded where it isn't here (ipsw.rs), before its
+//! directory is made; the restore checks the space it writes before it writes anything. An IPSW
+//! makes an arm64 VM on any host that runs one, so on Linux on x86-64, whose default is an x86-64
+//! VM, `--ipsw` picks it.
 
 use crate::copy;
 use crate::host::{Host, Profile};
@@ -167,6 +169,7 @@ pub fn create_with(
     }
     let profile = match spec.profile {
         Some(p) => p,
+        None if spec.ipsw.is_some() => Profile::VmappleArm64,
         None => host.default_profile().context(crate::host::UNSUPPORTED)?,
     };
     if !Profile::supported_on(host).contains(&profile) {
@@ -176,7 +179,7 @@ pub fn create_with(
         return create_vmapple(spec, progress, restorer, cancel);
     }
     if spec.ipsw.is_some() {
-        bail!("an IPSW makes an arm64 VM, which arm64 Macs and arm64 Linux make");
+        bail!("an IPSW makes an arm64 VM, not an x86-64 one");
     }
     // The image reims-util makes holds them.
     if graphics == Graphics::ReimsVgpu && spec.opencore.is_none() {
@@ -294,8 +297,8 @@ fn create_vmapple(
              for x86-64 VMs"
         );
     }
-    if spec.graphics.is_some() {
-        bail!("an arm64 VM has no choice of graphics");
+    if spec.graphics.is_some_and(|g| g != Graphics::ReimsVgpu) {
+        bail!("an arm64 VM runs on reims-vgpu's own device, with no choice of graphics");
     }
     let dir = spec.dir.clone().unwrap_or_else(|| default_dir(&spec.name));
     if dir.exists() && std::fs::read_dir(&dir)?.next().is_some() {
@@ -398,8 +401,6 @@ fn make_vmapple(
         VMAPPLE_DISK.into(),
         ImageFormat::Raw,
     );
-    // Its boot, on Ambrosia, is not reims-ctl's yet: no device is chosen.
-    c.graphics = None;
     c.vmapple = Some(Vmapple {
         aux: VMAPPLE_AUX.into(),
         ecid: restored.ecid,
@@ -416,13 +417,13 @@ fn make_vmapple(
 }
 
 /// What the VM's first boot asks of the create after the restore: one boot, in which macOS makes
-/// its Data volume by EACS and resets the VM, and then reims-restore's finish step; reims-ctl
-/// starts no arm64 VM yet, so it names the step left.
+/// its Data volume by EACS and resets the VM, and then reims-restore's finish step, which
+/// reims-ctl doesn't run, so it names the step left.
 fn first_boot(dir: &Path, progress: &mut dyn FnMut(&str)) {
     progress(&format!(
         "one step is left: macOS makes its Data volume at the VM's first boot and then resets \
-         the VM, which doesn't start again until it is finished; after that boot, run \
-         `reims-restore finish-eacs {}`, and the next boot goes to Setup Assistant",
+         the VM, which doesn't boot again until it is finished; after that boot, stop the VM, \
+         run `reims-restore finish-eacs {}`, and the next start goes to Setup Assistant",
         paths::tilde(dir)
     ));
 }
@@ -1411,14 +1412,44 @@ mod tests {
             saved.config.vmapple.as_ref().unwrap().ecid,
             0xc208_f7ea_febd_c581
         );
-        assert!(saved.config.graphics.is_none());
-        let e = crate::runtime::preflight(&saved, arm64())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            e.starts_with("reims-ctl doesn't start arm64 VMs yet"),
-            "{e}"
-        );
+        assert_eq!(saved.config.graphics, Some(Graphics::ReimsVgpu));
+        // It starts: on a Mac, whose start needs no /dev/kvm, the restore's files are what it
+        // needs.
+        let mac = Host {
+            os: crate::host::Os::Mac,
+            arch: crate::host::Arch::Aarch64,
+        };
+        crate::runtime::preflight(&saved, mac).unwrap();
+    }
+
+    /// On Linux on x86-64, whose default is an x86-64 VM, an IPSW makes an arm64 one, which
+    /// runs there on TCG.
+    #[test]
+    fn an_ipsw_makes_an_arm64_vm_on_x86_64_linux() {
+        let env = crate::testenv::Env::new("create-arm64-x86");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let linux = Host {
+            os: crate::host::Os::Linux,
+            arch: crate::host::Arch::X86_64,
+        };
+        let vm = create_with(
+            arm64_spec(&env),
+            linux,
+            &mut |_| {},
+            &Fake::Succeeds,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(vm.config.profile, Profile::VmappleArm64);
+        let windows = Host {
+            os: crate::host::Os::Windows,
+            arch: crate::host::Arch::X86_64,
+        };
+        let mut spec = arm64_spec(&env);
+        spec.name = "w".into();
+        spec.dir = Some(env.root.join("vms/w"));
+        let e = create_with(spec, windows, &mut |_| {}, &Fake::Succeeds, &cancel).unwrap_err();
+        assert_eq!(e.to_string(), crate::host::UNSUPPORTED);
     }
 
     /// A failed or stopped restore leaves no VM: its directory goes, with what the restore wrote,
@@ -1587,15 +1618,27 @@ mod tests {
             ..arm64_spec(&env)
         });
         assert!(e.contains("not an existing one"), "{e}");
-        // And an x86-64 host takes no IPSW.
+        // An IPSW makes no x86-64 VM, and a Windows host runs no arm64 one.
         let x86 = Host {
             os: crate::host::Os::Linux,
             arch: crate::host::Arch::X86_64,
         };
-        let e = create_with(arm64_spec(&env), x86, &mut |_| {}, &Fake::Succeeds, &cancel)
+        let q35 = Spec {
+            profile: Some(Profile::Q35X86_64),
+            ..arm64_spec(&env)
+        };
+        let e = create_with(q35, x86, &mut |_| {}, &Fake::Succeeds, &cancel)
             .unwrap_err()
             .to_string();
         assert!(e.starts_with("an IPSW makes an arm64 VM"), "{e}");
+        let win = Host {
+            os: crate::host::Os::Windows,
+            arch: crate::host::Arch::X86_64,
+        };
+        let e = create_with(arm64_spec(&env), win, &mut |_| {}, &Fake::Succeeds, &cancel)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, crate::host::UNSUPPORTED);
         assert!(!dir.exists());
     }
 }

@@ -154,7 +154,7 @@ pub enum Cmd {
     RecordInstall {
         #[arg(long)]
         repo: PathBuf,
-        /// The QEMU build installed; none on an arm64 host, which makes VMs without one.
+        /// The QEMU build installed.
         #[arg(long)]
         qemu: Option<PathBuf>,
         #[arg(long, default_value = "")]
@@ -313,12 +313,13 @@ fn create_examples_on(host: Host) -> String {
     # Or with the OpenCore image it booted from, copied, which keeps its Mac too
     reims-ctl create mac --disk {disk} --opencore {opencore}
 
-  An arm64 guest on an arm64 Mac or arm64 Linux:
+  An arm64 guest on an arm64 Mac, arm64 Linux or x86-64 Linux:
 
     # Download the current macOS's IPSW from Apple (about 25 GB, kept for the next VM; a
-    # stopped download continues) and restore it onto a new 128G disk, with tickets Apple
-    # signs for the VM (reims-ctl doesn't start arm64 VMs yet)
-    reims-ctl create mac --ipsw latest
+    # stopped download continues), restore it onto a new 128G disk, with tickets Apple
+    # signs for the VM, and start it. On x86-64 Linux the VM runs emulated (QEMU's TCG),
+    # far slower than on an arm64 host
+    reims-ctl create mac --ipsw latest --start
 
     # An IPSW of your own, read where it is: Apple offers only the current macOS to download.
     # macOS makes its Data volume at the VM's first boot and then resets the VM: after that
@@ -439,7 +440,8 @@ pub struct CreateArgs {
     /// image's BaseSystem.img, or a DMG, converted to a raw image in the VM's directory
     #[arg(long)]
     pub installer: Option<PathBuf>,
-    /// On an arm64 Mac or arm64 Linux: the IPSW to restore an arm64 VM's macOS from: latest,
+    /// On an arm64 Mac, arm64 Linux or x86-64 Linux: the IPSW to restore an arm64 VM's macOS
+    /// from: latest,
     /// the current macOS, downloaded from Apple once and kept (reims-ctl downloads lists it),
     /// or an IPSW's path, read where it is. The VM needs one boot, which makes its Data volume,
     /// and then `reims-restore finish-eacs DIR`
@@ -699,6 +701,16 @@ pub fn main(cli: Cli) -> Result<i32> {
                 shell: shell.unwrap_or_default(),
             }
             .save()?;
+            // What an arm64 VM boots on, so its first start needs no network (ambrosia.rs).
+            if Profile::supported_on(host).contains(&Profile::VmappleArm64)
+                && !crate::ambrosia::is_kept()
+            {
+                println!(
+                    "==> Downloading Ambrosia {}, the arm64 VMs' firmware",
+                    crate::ambrosia::VERSION
+                );
+                crate::ambrosia::image()?;
+            }
             // What makes a new x86-64 VM's OpenCore image and installer, and on any host one
             // already beside reims-ctl, moved to the commit reims-ctl pins (reims_util.rs).
             if host.default_profile() == Some(Profile::Q35X86_64) || reims_util::beside().is_some()
@@ -832,10 +844,7 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
         || a.disk.is_some()
         || a.opencore.is_some()
         || a.ipsw.is_some();
-    let arm64 = host.default_profile() == Some(Profile::VmappleArm64);
-    if arm64 && a.start {
-        bail!("reims-ctl doesn't start arm64 VMs yet: create it without --start");
-    }
+    let arm64 = a.ipsw.is_some() || host.default_profile() == Some(Profile::VmappleArm64);
     let mut s = Spec::new(&name);
     s.dir = a
         .dir
@@ -1063,11 +1072,6 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
     if let Some(a) = &c.vmapple {
         add("aux", paths::tilde(&vm.path(&a.aux)));
         add("ecid", format!("{:#018x}", a.ecid));
-    }
-    // Its devices are those of its start, which an arm64 VM doesn't have yet.
-    if !c.profile.starts() {
-        add("start", "not yet: reims-ctl doesn't start arm64 VMs".into());
-        return v;
     }
     let graphics = c.graphics();
     match graphics {
@@ -1363,7 +1367,9 @@ fn gpus(host: Host) {
     match host.default_profile() {
         None => return println!("{}", crate::host::UNSUPPORTED),
         Some(p) if !p.gpu_choice(host) => {
-            return println!("A VM's GPU: {}", crate::host::X86_64_ONLY);
+            return println!(
+                "A VM runs on this Mac's GPU, through MoltenVK: there is none to choose"
+            );
         }
         Some(_) => {}
     }
@@ -1517,10 +1523,10 @@ fn doctor(host: Host) -> Result<i32> {
         format!(
             "{host}{}",
             profile
-                .map(|p| if p.starts() {
-                    format!(", runs {p} VMs")
-                } else {
-                    format!(", makes {p} VMs from IPSWs (it doesn't start them yet)")
+                .map(|_| {
+                    let profiles: Vec<_> =
+                        Profile::supported_on(host).iter().map(|p| p.id()).collect();
+                    format!(", runs {} VMs", profiles.join(" and "))
                 })
                 .unwrap_or_else(|| format!(": {}", crate::host::UNSUPPORTED))
         ),
@@ -1535,13 +1541,19 @@ fn doctor(host: Host) -> Result<i32> {
         ),
     );
     let Some(profile) = profile else { return Ok(1) };
-    // An arm64 VM is made by a restore, which runs no QEMU, and isn't started.
-    if profile.starts() {
-        match install::qemu_binary(profile) {
+    for &p in Profile::supported_on(host) {
+        // The default profile's QEMU is "qemu", as it was before a host ran two.
+        let what = if p == profile {
+            "qemu".to_string()
+        } else {
+            format!("qemu for {} VMs", p.id())
+        };
+        let what = what.as_str();
+        match install::qemu_binary(p) {
             Ok(q) => {
                 line(
                     true,
-                    "qemu",
+                    what,
                     format!(
                         "{} ({})",
                         q.display(),
@@ -1559,8 +1571,40 @@ fn doctor(host: Host) -> Result<i32> {
                     ),
                 );
             }
-            Err(e) => line(false, "qemu", format!("{e:#}")),
+            Err(e) => line(false, what, format!("{e:#}")),
         }
+    }
+    if Profile::supported_on(host).contains(&Profile::VmappleArm64) {
+        // What an arm64 VM boots on: Ambrosia, which a start downloads where it is missing, and
+        // the configuration bundle of what this reims-ctl carries.
+        line(
+            true,
+            "ambrosia",
+            if crate::ambrosia::is_kept() {
+                format!(
+                    "{} {}",
+                    crate::ambrosia::VERSION,
+                    paths::tilde(&crate::ambrosia::path())
+                )
+            } else {
+                format!(
+                    "{} is not downloaded yet: an arm64 VM's start downloads it",
+                    crate::ambrosia::VERSION
+                )
+            },
+        );
+        let carried = crate::prebuilt::carries_arm64();
+        line(
+            carried,
+            "arm64 bundle",
+            if carried {
+                "the arm64 guest's kexts and the device's module for Ambrosia".into()
+            } else {
+                "this reims-ctl was built without the arm64 guest's kexts or the device's module \
+                 for Ambrosia, which clang builds: install clang, then run reims-ctl update"
+                    .to_string()
+            },
+        );
     }
     match install::Install::load() {
         Some(i) => line(
@@ -1582,23 +1626,16 @@ fn doctor(host: Host) -> Result<i32> {
             ),
         ),
     }
-    // KVM and the library's needs, for the x86-64 VMs Linux runs.
+    // KVM and the library's needs, for the x86-64 VMs Linux runs; KVM alone for the arm64 VMs
+    // arm64 Linux runs.
     match host.os {
+        crate::host::Os::Linux if profile.accel(host) == "kvm" && profile != Profile::Q35X86_64 => {
+            let (ok, detail) = kvm_check();
+            line(ok, "/dev/kvm", detail);
+        }
         crate::host::Os::Linux if profile == Profile::Q35X86_64 => {
-            let kvm = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/kvm");
-            line(
-                kvm.is_ok(),
-                "/dev/kvm",
-                match kvm {
-                    Ok(_) => "usable".into(),
-                    Err(e) => format!(
-                        "{e}: add yourself to the kvm group (sudo usermod -aG kvm $USER) and log in again"
-                    ),
-                },
-            );
+            let (ok, detail) = kvm_check();
+            line(ok, "/dev/kvm", detail);
             let udmabuf = runtime::udmabuf_problem();
             line(
                 udmabuf.is_none(),
@@ -1751,6 +1788,23 @@ fn doctor(host: Host) -> Result<i32> {
     Ok(if bad == 0 { 0 } else { 1 })
 }
 
+/// Whether this user can open /dev/kvm, and what doctor says of it.
+fn kvm_check() -> (bool, String) {
+    let kvm = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm");
+    match kvm {
+        Ok(_) => (true, "usable".into()),
+        Err(e) => (
+            false,
+            format!(
+                "{e}: add yourself to the kvm group (sudo usermod -aG kvm $USER) and log in again"
+            ),
+        ),
+    }
+}
+
 /// doctor's checks of a Windows host, each a `line`.
 #[cfg(windows)]
 fn windows_checks(line: &mut dyn FnMut(bool, &str, String)) {
@@ -1853,7 +1907,7 @@ mod tests {
                 "{e}"
             );
             assert!(
-                e.contains("An arm64 guest on an arm64 Mac or arm64 Linux:"),
+                e.contains("An arm64 guest on an arm64 Mac, arm64 Linux or x86-64 Linux:"),
                 "{e}"
             );
         }

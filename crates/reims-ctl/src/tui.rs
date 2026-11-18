@@ -351,7 +351,7 @@ impl App {
                 &format!("reims-ctl runs no VMs on {host} yet"),
                 Level::Error,
             );
-        } else if app.qemu.is_none() && host.default_profile().is_some_and(Profile::starts) {
+        } else if app.qemu.is_none() {
             app.say(
                 &format!(
                     "QEMU is not installed: run {} in your reims-vgpu checkout",
@@ -1227,13 +1227,12 @@ impl App {
             .and_then(Channel::of);
         // __record-install installs reims-util where the host makes x86-64 VMs, or where one is
         // beside reims-ctl (cli.rs).
-        // An arm64 host builds no QEMU (scripts/install-ctl.sh).
-        let what = match (self.host.default_profile(), reims_util::beside().is_some()) {
-            (Some(Profile::Q35X86_64), _) => "reims-ctl, the library, QEMU and reims-util",
-            (Some(Profile::VmappleArm64), true) => "reims-ctl and reims-util",
-            (Some(Profile::VmappleArm64), false) => "reims-ctl",
-            (None, true) => "reims-ctl, the library, QEMU and reims-util",
-            (None, false) => "reims-ctl, the library and QEMU",
+        let what = if self.host.default_profile() == Some(Profile::Q35X86_64)
+            || reims_util::beside().is_some()
+        {
+            "reims-ctl, the library, QEMU and reims-util"
+        } else {
+            "reims-ctl, the library and QEMU"
         };
         let mut options = vec![("Cancel", Action::None), ("Update", Action::Update(None))];
         for c in Channel::ALL.into_iter().filter(|&c| Some(c) != current) {
@@ -1568,8 +1567,7 @@ impl App {
                      this VM, as a Mac restores one. Apple offers only the current macOS to \
                      download: reims-ctl downloads its IPSW once (about 25 GB) and keeps it for \
                      the next VM (D lists what's kept); a stopped download continues. For \
-                     another macOS, give an IPSW of your own. reims-ctl doesn't start arm64 VMs \
-                     yet.",
+                     another macOS, give an IPSW of your own.",
                 ),
                 Field::path(
                     "ipsw",
@@ -1682,7 +1680,8 @@ impl App {
             ),
             Field::text("memory", "Memory", &format_mib(c.memory_mib), "Such as 8G."),
         ];
-        if !c.profile.starts() {
+        // An arm64 VM's form has these two alone: its displays are reims-ctl set's.
+        if c.profile == Profile::VmappleArm64 {
             let form = Form::new(&format!("Edit {}", c.name), "save", fields);
             self.overlay = Some(Overlay::Form(FormKind::Edit(c.name.clone()), form));
             return;
@@ -1835,11 +1834,13 @@ impl App {
                 let name = spec.name.clone();
                 self.spawn_for(f, &name, "creating", move |p| {
                     let vm = create::create(spec, host, p)?;
-                    if !vm.config.profile.starts() {
+                    if vm.config.profile == Profile::VmappleArm64 {
                         return Ok(format!(
-                            "created {} in {}: its macOS is restored (reims-ctl doesn't start \
-                             arm64 VMs yet)",
+                            "created {} in {}: its macOS is restored · s starts it; after its \
+                             first boot, which makes its Data volume, stop it and run \
+                             reims-restore finish-eacs {}",
                             vm.name(),
+                            paths::tilde(&vm.dir),
                             paths::tilde(&vm.dir)
                         ));
                     }
@@ -2148,8 +2149,7 @@ impl App {
             ),
             Span::raw(format!("  {} · {profile}", self.host)),
         ];
-        // An arm64 host has no QEMU: its VMs are made by a restore, which runs none.
-        if self.host.default_profile().is_none_or(Profile::starts) {
+        if self.host.default_profile().is_some() {
             spans.push(Span::raw(" · "));
             spans.push(match &self.qemu {
                 Some(q) => Span::styled(q.clone(), Style::new().fg(Color::Green)),
@@ -2540,8 +2540,8 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     let c = &mut vm.config;
     c.cpus = f.text("cpus").parse().context("CPU cores: a number")?;
     c.memory_mib = parse_size_mib(&f.text("memory")).context("memory")?;
-    // An arm64 VM's form has these two alone: the rest is its start's.
-    if !c.profile.starts() {
+    // An arm64 VM's form has these two alone (open_edit).
+    if c.profile == Profile::VmappleArm64 {
         return c.check();
     }
     if f.is_shown("graphics") {
@@ -2697,7 +2697,7 @@ of its own. A VM runs reims-vgpu's own GPU device unless its settings choose ano
               Esc closes it meanwhile, and it opens again if the create fails. On an arm64
               Mac or arm64 Linux, it makes an arm64 VM: from the current macOS, which
               reims-ctl downloads from Apple (about 25 GB) and keeps for the next, or an IPSW
-              you have, restored onto its new disk. reims-ctl doesn't start arm64 VMs yet
+              you have, restored onto its new disk
   s           start it
   x           stop it: the guest is asked to shut down, and powered off if it has not
               when its shutdown timeout ends (edit e to change it)

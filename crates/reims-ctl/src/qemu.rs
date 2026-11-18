@@ -70,6 +70,20 @@
 //!   GTK's window would end QEMU as it starts, so it is `-display none` there, and the guest runs
 //!   headless, as on the library's window.
 //!
+//! The arm64 machine, `vmapple-arm64` ([`vmapple`]), is QEMU's `vmapple`, with the command line
+//! Ambrosia's boot check boots arm64 guests on (firmware/ambrosia/check-boot.sh, docs/qemu.md
+//! "arm64 guests"): Ambrosia's image as its firmware (`-bios`, ambrosia.rs); the VM's auxiliary
+//! storage without its header and its disk, each as a pflash drive and as the machine's
+//! `vmapple-virtio-blk-pci` of its variant; virtio-net; reims-vgpu's own device,
+//! `reims-graphics-pci`, which has no option ROM there; and the configuration bundle reims-ctl
+//! carries ([`crate::prebuilt::ambrosia_bundle`]), loaded at 0x120000000, where Ambrosia reads
+//! it: its config.plist starts the device's driver module and adds the guest's kexts. The machine
+//! has its own xHCI controller with a keyboard and a tablet, and its `uuid` is the VM's ECID, which
+//! the tickets of its macOS are bound to. It runs on HVF on a Mac, with the GIC in the kernel, on
+//! KVM on arm64 Linux, and on TCG, a thread for each vCPU, on x86-64 ([`Profile::accel_arg`]). On
+//! Linux its RAM is a shared memfd, as the library there needs, not allocated as QEMU starts.
+//! It takes no host USB device, no VMware SVGA and no sound device.
+//!
 //! The xHCI controller has seven ports (`p2=7,p3=7`), each taking a USB 2 and a USB 3 device:
 //! the keyboard, the tablet, and up to [`crate::vm::USB_DEVICES_MAX`] host devices, at their
 //! own speeds. Its 14 ports are within the 15 macOS numbers on one controller. QEMU's default of
@@ -110,7 +124,20 @@ pub struct Ctx {
     /// The option ROM of reims-vgpu's own device, which its `romfile` names
     /// ([`crate::prebuilt::graphics_rom`]).
     pub graphics_rom: PathBuf,
+    /// What an arm64 VM boots on; None for an x86-64 VM.
+    pub arm64: Option<Arm64Boot>,
 }
+
+/// What an arm64 VM boots on: Ambrosia's image ([`crate::ambrosia::image`]) and the
+/// configuration bundle it boots with ([`crate::prebuilt::ambrosia_bundle`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Arm64Boot {
+    pub ambrosia: PathBuf,
+    pub bundle: PathBuf,
+}
+
+/// Where QEMU loads the configuration bundle in an arm64 guest's memory, and Ambrosia reads it.
+pub const BUNDLE_ADDR: &str = "0x120000000";
 
 /// A value inside a QEMU option list: commas doubled.
 pub fn opt(s: &str) -> String {
@@ -128,7 +155,7 @@ pub fn invocation(vm: &Vm, ctx: &Ctx) -> Result<Invocation> {
     push(&["-name", &c.name]);
     match c.profile {
         Profile::Q35X86_64 => q35(vm, ctx, &mut a)?,
-        Profile::VmappleArm64 => bail!("{}", crate::runtime::not_started(vm)),
+        Profile::VmappleArm64 => vmapple(vm, ctx, &mut a)?,
     }
     common(vm, ctx, &mut a)?;
     a.extend(c.extra_args.iter().cloned());
@@ -380,6 +407,86 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// The arm64 machine's options (the module doc), in the order Ambrosia's boot check gives them,
+/// which is the order QEMU gives the devices their PCI slots in.
+fn vmapple(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
+    let c = &vm.config;
+    let v = c.vmapple.as_ref().context("no [vmapple] settings")?;
+    let boot = ctx.arm64.as_ref().context("no Ambrosia for an arm64 VM")?;
+    if c.graphics() != Graphics::ReimsVgpu {
+        bail!(
+            "an arm64 VM runs on reims-vgpu's own device, not {}",
+            c.graphics().name()
+        );
+    }
+    if !c.usb.is_empty() {
+        bail!("USB passthrough: {}", crate::host::X86_64_ONLY);
+    }
+    let mem = format!("{}M", c.memory_mib);
+    let mut push = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
+    push(&["-accel", c.profile.accel_arg(ctx.host)]);
+    let mut machine = format!("vmapple,uuid=0x{:016x}", v.ecid);
+    if c.profile.memfd_ram(ctx.host) {
+        machine.push_str(",memory-backend=ram,dump-guest-core=off");
+    }
+    push(&["-machine", &machine, "-m", &mem]);
+    if c.profile.memfd_ram(ctx.host) {
+        push(&[
+            "-object",
+            &format!("memory-backend-memfd,id=ram,size={mem},share=on"),
+        ]);
+    }
+    push(&["-smp", &c.cpus.to_string()]);
+    push(&["-bios", &boot.ambrosia.to_string_lossy()]);
+    let aux = optp(&vm.aux_trimmed());
+    let disk = optp(&vm.disk());
+    let format = c.disk_format.as_str();
+    push(&[
+        "-drive",
+        &format!("file={aux},if=pflash,format=raw"),
+        "-drive",
+        &format!("file={disk},if=pflash,format={format}"),
+        "-drive",
+        &format!("file={aux},if=none,id=aux,format=raw"),
+        "-drive",
+        &format!("file={disk},if=none,id=root,format={format}"),
+        "-device",
+        "vmapple-virtio-blk-pci,variant=aux,drive=aux",
+        "-device",
+        "vmapple-virtio-blk-pci,variant=root,drive=root",
+    ]);
+    if c.network.enabled {
+        push(&["-netdev", &netdev(vm)]);
+        push(&[
+            "-device",
+            &format!(
+                "virtio-net-pci,netdev=net0,id=net0,mac={},romfile=",
+                c.network.mac
+            ),
+        ]);
+    }
+    push(&[
+        "-device",
+        &format!(
+            "reims-graphics-pci,id=gfx{}{}",
+            c.display
+                .qemu_displays()
+                .map_or(String::new(), |n| format!(",displays={n}")),
+            c.display
+                .window_size()
+                .map_or(String::new(), |(w, h)| format!(",resolution={w}x{h}"))
+        ),
+    ]);
+    push(&[
+        "-device",
+        &format!(
+            "loader,file={},addr={BUNDLE_ADDR},force-raw=on",
+            optp(&boot.bundle)
+        ),
+    ]);
+    Ok(())
+}
+
 fn netdev(vm: &Vm) -> String {
     let mut n = "user,id=net0,ipv6=off".to_string();
     if let Some(p) = vm.config.network.ssh_port {
@@ -578,7 +685,184 @@ mod tests {
             nested_vmx: false,
             screen: true,
             graphics_rom: "/d/firmware/ReimsGraphics-0123456789abcdef.rom".into(),
+            arm64: None,
         }
+    }
+
+    fn arm64_vm() -> Vm {
+        let mut vm = q35_vm();
+        let c = &mut vm.config;
+        c.profile = Profile::VmappleArm64;
+        c.cpus = 4;
+        c.memory_mib = 8192;
+        c.disk = "disk.img".into();
+        c.disk_format = ImageFormat::Raw;
+        c.graphics = Some(Graphics::ReimsVgpu);
+        c.q35 = None;
+        c.vmapple = Some(Vmapple {
+            aux: "aux.img".into(),
+            ecid: 0x9e35_f01e_dc0c_5536,
+        });
+        vm
+    }
+
+    fn arm64_ctx(host: Host) -> Ctx {
+        Ctx {
+            graphics_rom: std::path::PathBuf::new(),
+            arm64: Some(Arm64Boot {
+                ambrosia: "/d/ambrosia/ambrosia-0.1.3.bin".into(),
+                bundle: "/d/prebuilt/Config-0123456789abcdef.cpio".into(),
+            }),
+            ..ctx(host)
+        }
+    }
+
+    /// The machine's options on each host, as Ambrosia's boot check runs them
+    /// (firmware/ambrosia/check-boot.sh): `head` is the accelerator and the RAM, which differ by
+    /// host; the rest is every host's.
+    fn arm64_command_line(head: &[&str]) -> Vec<String> {
+        let rest = [
+            "-smp",
+            "4",
+            "-bios",
+            "/d/ambrosia/ambrosia-0.1.3.bin",
+            "-drive",
+            "file=/vms/t/aux.img.trimmed,if=pflash,format=raw",
+            "-drive",
+            "file=/vms/t/disk.img,if=pflash,format=raw",
+            "-drive",
+            "file=/vms/t/aux.img.trimmed,if=none,id=aux,format=raw",
+            "-drive",
+            "file=/vms/t/disk.img,if=none,id=root,format=raw",
+            "-device",
+            "vmapple-virtio-blk-pci,variant=aux,drive=aux",
+            "-device",
+            "vmapple-virtio-blk-pci,variant=root,drive=root",
+            "-netdev",
+            "user,id=net0,ipv6=off,hostfwd=tcp:127.0.0.1:2326-:22",
+            "-device",
+            "virtio-net-pci,netdev=net0,id=net0,mac=52:54:00:aa:bb:cc,romfile=",
+            "-device",
+            "reims-graphics-pci,id=gfx",
+            "-device",
+            "loader,file=/d/prebuilt/Config-0123456789abcdef.cpio,addr=0x120000000,force-raw=on",
+            "-display",
+            "none",
+            "-serial",
+            "none",
+            "-monitor",
+            "none",
+            "-qmp",
+            "unix:/vms/t/qmp.sock,server=on,wait=off",
+            "-pidfile",
+            "/vms/t/qemu.pid",
+        ];
+        ["-name", "t"]
+            .iter()
+            .chain(head)
+            .chain(&rest)
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// An arm64 VM on an x86-64 Linux host: vmapple under TCG, a thread for each vCPU, in memfd
+    /// RAM, which the library on Linux needs.
+    #[test]
+    fn arm64_on_x86_64_linux_runs_on_tcg() {
+        let inv = invocation(&arm64_vm(), &arm64_ctx(linux())).unwrap();
+        let want = arm64_command_line(&[
+            "-accel",
+            "tcg,thread=multi",
+            "-machine",
+            "vmapple,uuid=0x9e35f01edc0c5536,memory-backend=ram,dump-guest-core=off",
+            "-m",
+            "8192M",
+            "-object",
+            "memory-backend-memfd,id=ram,size=8192M,share=on",
+        ]);
+        assert_eq!(unix_paths(&inv.args), want);
+    }
+
+    /// On arm64 Linux the same machine runs on KVM.
+    #[test]
+    fn arm64_on_arm64_linux_runs_on_kvm() {
+        let arm_linux = Host {
+            os: Os::Linux,
+            arch: Arch::Aarch64,
+        };
+        let inv = invocation(&arm64_vm(), &arm64_ctx(arm_linux)).unwrap();
+        let want = arm64_command_line(&[
+            "-accel",
+            "kvm",
+            "-machine",
+            "vmapple,uuid=0x9e35f01edc0c5536,memory-backend=ram,dump-guest-core=off",
+            "-m",
+            "8192M",
+            "-object",
+            "memory-backend-memfd,id=ram,size=8192M,share=on",
+        ]);
+        assert_eq!(unix_paths(&inv.args), want);
+    }
+
+    /// On a Mac it runs on HVF, the GIC in the kernel, in QEMU's own RAM: macOS has no memfd,
+    /// and QEMU there refuses `dump-guest-core=off`.
+    #[test]
+    fn arm64_on_a_mac_runs_on_hvf() {
+        let inv = invocation(&arm64_vm(), &arm64_ctx(mac())).unwrap();
+        let want = arm64_command_line(&[
+            "-accel",
+            "hvf,kernel-irqchip=on",
+            "-machine",
+            "vmapple,uuid=0x9e35f01edc0c5536",
+            "-m",
+            "8192M",
+        ]);
+        assert_eq!(unix_paths(&inv.args), want);
+        // The library's window is its own, as for an x86-64 VM.
+        assert!(inv.unset.contains(&"REIMS_VGPU_WINDOW".to_string()));
+    }
+
+    /// The device has the VM's displays and their windows' first size; the VM's logs, its
+    /// network and its ECID reach the command; and what an arm64 VM can't have is refused.
+    #[test]
+    fn arm64_takes_the_vms_settings() {
+        let mut vm = arm64_vm();
+        vm.config.display.count = 2;
+        vm.config.display.resolution = "2560x1440".into();
+        vm.config.logs.enabled = true;
+        vm.config.network.ssh_port = None;
+        vm.config.vmapple.as_mut().unwrap().ecid = 7;
+        let inv = invocation(&vm, &arm64_ctx(mac())).unwrap();
+        assert!(has(
+            &inv.args,
+            &[
+                "-device",
+                "reims-graphics-pci,id=gfx,displays=2,resolution=2560x1440"
+            ]
+        ));
+        assert!(has(
+            &inv.args,
+            &["-machine", "vmapple,uuid=0x0000000000000007"]
+        ));
+        assert!(has(&inv.args, &["-netdev", "user,id=net0,ipv6=off"]));
+        assert!(has(&inv.args, &["-serial", "file:/vms/t/logs/serial.log"]));
+        assert!(inv.env.iter().any(|(k, _)| k == "REIMS_VGPU_LOG"));
+        vm.config.network.enabled = false;
+        let inv = invocation(&vm, &arm64_ctx(mac())).unwrap();
+        assert!(has(&inv.args, &["-nic", "none"]));
+        assert!(!inv.args.iter().any(|a| a.starts_with("virtio-net-pci")));
+
+        let mut svga = arm64_vm();
+        svga.config.graphics = Some(Graphics::VmwareSvga);
+        assert!(invocation(&svga, &arm64_ctx(mac())).is_err());
+        let mut usb = arm64_vm();
+        usb.config.usb = vec![UsbDevice {
+            id: "1234:5678".into(),
+            port: None,
+            name: String::new(),
+        }];
+        assert!(invocation(&usb, &arm64_ctx(mac())).is_err());
+        assert!(invocation(&arm64_vm(), &ctx(mac())).is_err(), "no Ambrosia");
     }
 
     fn has(args: &[String], pair: &[&str]) -> bool {
