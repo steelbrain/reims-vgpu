@@ -2922,7 +2922,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                         self.encoder
                             .pipeline
                             .store(state.unique_identifier(), Ordering::Relaxed);
-                        self.encoder.encodes_icbs.store(f.encodes, Ordering::Relaxed);
+                        self.encoder
+                            .encodes_icbs
+                            .store(f.encodes, Ordering::Relaxed);
                         plain(|| {
                             let locked = self.drawing.lock();
                             let mut drawing = locked.borrow_mut();
