@@ -235,6 +235,340 @@ pub(crate) fn draws(tag: u16) -> bool {
     )
 }
 
+/// The objects render op `tag` names, read from its body `payload` with the types [`decode_op`]
+/// reads it with, for a walk to find them in its view of the table before it reaches them
+/// (`cmdbuf`'s `find_named`), as `compute::names` reads a compute op's: each id but nil goes to
+/// `found`, in the order the op names them, until it answers false. `None` for a tag
+/// [`decode_op`] does not decode; `Some(false)` where `found` answered false, or the body is too
+/// short for what it names, where the walk faults; else `Some(true)`. Each op [`decode_op`]
+/// decodes has an arm here, those that name no object among them
+/// (`every_render_op_decoded_is_read_for_its_names`).
+pub(super) fn names(tag: u16, payload: &[u8], found: &mut impl FnMut(u64) -> bool) -> Option<bool> {
+    /// Op body `T`, as [`body`] reads it.
+    fn head<T: FromBytes>(payload: &[u8]) -> Option<T> {
+        T::read_from_prefix(payload).ok().map(|(t, _)| t)
+    }
+    /// The `count` elements of `E` after head `H`, as [`elems`] reads them: `None` where the body
+    /// is too short for them.
+    fn run<H, E: FromBytes>(payload: &[u8], count: u64) -> Option<impl Iterator<Item = E>> {
+        let count = usize::try_from(count).ok()?;
+        let stride = size_of::<E>();
+        let tail = payload.get(size_of::<H>()..)?;
+        if count > tail.len() / stride {
+            return None;
+        }
+        Some(
+            tail.chunks_exact(stride)
+                .take(count)
+                .filter_map(|e| E::read_from_bytes(e).ok()),
+        )
+    }
+    /// Each of `ids` but nil to `found`: whether it wants more.
+    fn each(found: &mut impl FnMut(u64) -> bool, ids: impl IntoIterator<Item = u64>) -> bool {
+        ids.into_iter().filter(|&id| id != 0).all(found)
+    }
+    /// The buffers of buffer-binding array op `H`, whose head holds the array's length.
+    fn buffers<H: FromBytes>(
+        payload: &[u8],
+        length: impl Fn(&H) -> u64,
+        found: &mut impl FnMut(u64) -> bool,
+    ) -> Option<bool> {
+        head::<H>(payload)
+            .and_then(|m| run::<H, RgfxBufferBinding>(payload, length(&m)))
+            .map(|r| each(found, r.map(|e| e.buffer_obj_id)))
+    }
+    /// The textures of texture-binding array op `H`, as [`buffers`] reads its buffers.
+    fn textures<H: FromBytes>(
+        payload: &[u8],
+        length: impl Fn(&H) -> u64,
+        found: &mut impl FnMut(u64) -> bool,
+    ) -> Option<bool> {
+        head::<H>(payload)
+            .and_then(|m| run::<H, RgfxTextureBinding>(payload, length(&m)))
+            .map(|r| each(found, r.map(|e| e.texture_obj_id)))
+    }
+    /// The samplers of sampler-binding array op `H`, as [`buffers`] reads its buffers.
+    fn samplers<H: FromBytes>(
+        payload: &[u8],
+        length: impl Fn(&H) -> u64,
+        found: &mut impl FnMut(u64) -> bool,
+    ) -> Option<bool> {
+        head::<H>(payload)
+            .and_then(|m| run::<H, RgfxSamplerBinding>(payload, length(&m)))
+            .map(|r| each(found, r.map(|e| e.sampler_obj_id)))
+    }
+    /// The samplers of sampler-with-LOD-clamps array op `H`, as [`buffers`] reads its buffers.
+    fn samplers_lod<H: FromBytes>(
+        payload: &[u8],
+        length: impl Fn(&H) -> u64,
+        found: &mut impl FnMut(u64) -> bool,
+    ) -> Option<bool> {
+        head::<H>(payload)
+            .and_then(|m| run::<H, RgfxSamplerLodBinding>(payload, length(&m)))
+            .map(|r| each(found, r.map(|e| e.sampler_obj_id)))
+    }
+    /// The heaps of heap array op `H`, whose head holds the array's count.
+    fn heaps<H: FromBytes>(
+        payload: &[u8],
+        count: impl Fn(&H) -> u64,
+        found: &mut impl FnMut(u64) -> bool,
+    ) -> Option<bool> {
+        head::<H>(payload)
+            .and_then(|m| run::<H, RgfxHeapBinding>(payload, count(&m)))
+            .map(|r| each(found, r.map(|e| e.heap_obj_id)))
+    }
+    /// The objects of resource array op `H`, as [`resolve_resource`] resolves them: a nil kind
+    /// names none.
+    fn resources<H: FromBytes>(
+        payload: &[u8],
+        count: impl Fn(&H) -> u64,
+        found: &mut impl FnMut(u64) -> bool,
+    ) -> Option<bool> {
+        head::<H>(payload)
+            .and_then(|m| run::<H, RgfxResourceBinding>(payload, count(&m)))
+            .map(|r| {
+                each(
+                    found,
+                    r.filter(|e| e.kind != RGFX_RESOURCE_KIND_NONE)
+                        .map(|e| e.obj_id),
+                )
+            })
+    }
+    let more = match tag {
+        RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE => head::<RgfxOpSetRenderPipelineState>(payload)
+            .map(|m| each(found, [m.pipeline_obj_id])),
+        RGFX_OP_RENDER_SET_VERTEX_BUFFER => {
+            head::<RgfxOpSetVertexBuffer>(payload).map(|m| each(found, [m.buffer_obj_id]))
+        }
+        RGFX_OP_RENDER_SET_FRAGMENT_BUFFER => {
+            head::<RgfxOpSetFragmentBuffer>(payload).map(|m| each(found, [m.buffer_obj_id]))
+        }
+        RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE => {
+            head::<RgfxOpSetFragmentTexture>(payload).map(|m| each(found, [m.texture_obj_id]))
+        }
+        RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES => head::<RgfxOpDrawIndexedPrimitives>(payload)
+            .map(|m| each(found, [m.index_buffer_obj_id])),
+        RGFX_OP_RENDER_DRAW_PRIMITIVES_INDIRECT => head::<RgfxOpDrawPrimitivesIndirect>(payload)
+            .map(|m| each(found, [m.indirect_buffer_obj_id])),
+        RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES_INSTANCES => {
+            head::<RgfxOpDrawIndexedPrimitivesInstances>(payload)
+                .map(|m| each(found, [m.index_buffer_obj_id]))
+        }
+        RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES_BASE => {
+            head::<RgfxOpDrawIndexedPrimitivesBase>(payload)
+                .map(|m| each(found, [m.index_buffer_obj_id]))
+        }
+        RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES_INDIRECT => {
+            head::<RgfxOpDrawIndexedPrimitivesIndirect>(payload)
+                .map(|m| each(found, [m.index_buffer_obj_id, m.indirect_buffer_obj_id]))
+        }
+        RGFX_OP_RENDER_DRAW_PATCHES => {
+            head::<RgfxOpDrawPatches>(payload).map(|m| each(found, [m.patch_index_buffer_obj_id]))
+        }
+        RGFX_OP_RENDER_DRAW_PATCHES_INDIRECT => head::<RgfxOpDrawPatchesIndirect>(payload)
+            .map(|m| each(found, [m.patch_index_buffer_obj_id, m.indirect_buffer_obj_id])),
+        RGFX_OP_RENDER_DRAW_INDEXED_PATCHES => head::<RgfxOpDrawIndexedPatches>(payload).map(|m| {
+            each(
+                found,
+                [
+                    m.patch_index_buffer_obj_id,
+                    m.control_point_index_buffer_obj_id,
+                ],
+            )
+        }),
+        RGFX_OP_RENDER_DRAW_INDEXED_PATCHES_INDIRECT => {
+            head::<RgfxOpDrawIndexedPatchesIndirect>(payload).map(|m| {
+                each(
+                    found,
+                    [
+                        m.patch_index_buffer_obj_id,
+                        m.control_point_index_buffer_obj_id,
+                        m.indirect_buffer_obj_id,
+                    ],
+                )
+            })
+        }
+        RGFX_OP_RENDER_EXECUTE_COMMANDS_IN_BUFFER => head::<RgfxOpExecuteCommandsInBuffer>(payload)
+            .map(|m| each(found, [m.indirect_command_buffer_obj_id])),
+        RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT => {
+            head::<RgfxOpExecuteCommandsIndirect>(payload).map(|m| {
+                each(
+                    found,
+                    [
+                        m.indirect_command_buffer_obj_id,
+                        m.indirect_range_buffer_obj_id,
+                    ],
+                )
+            })
+        }
+        RGFX_OP_RENDER_UPDATE_FENCE => {
+            head::<RgfxOpUpdateFence>(payload).map(|m| each(found, [m.fence_obj_id]))
+        }
+        RGFX_OP_RENDER_WAIT_FOR_FENCE => {
+            head::<RgfxOpWaitForFence>(payload).map(|m| each(found, [m.fence_obj_id]))
+        }
+        RGFX_OP_RENDER_SET_DEPTH_STENCIL_STATE => head::<RgfxOpSetDepthStencilState>(payload)
+            .map(|m| each(found, [m.depth_stencil_state_obj_id])),
+        RGFX_OP_RENDER_SET_COLOR_RESOLVE_TEXTURE => {
+            head::<RgfxOpSetColorResolveTexture>(payload).map(|m| each(found, [m.texture_obj_id]))
+        }
+        RGFX_OP_RENDER_SET_DEPTH_RESOLVE_TEXTURE => {
+            head::<RgfxOpSetDepthResolveTexture>(payload).map(|m| each(found, [m.texture_obj_id]))
+        }
+        RGFX_OP_RENDER_SET_STENCIL_RESOLVE_TEXTURE => {
+            head::<RgfxOpSetStencilResolveTexture>(payload)
+                .map(|m| each(found, [m.texture_obj_id]))
+        }
+        RGFX_OP_RENDER_SET_TESSELLATION_FACTOR_BUFFER => {
+            head::<RgfxOpSetTessellationFactorBuffer>(payload)
+                .map(|m| each(found, [m.buffer_obj_id]))
+        }
+        RGFX_OP_RENDER_SET_VERTEX_BUFFERS => {
+            buffers(payload, |m: &RgfxOpSetVertexBuffers| m.range_length, found)
+        }
+        RGFX_OP_RENDER_SET_FRAGMENT_BUFFERS => {
+            buffers(payload, |m: &RgfxOpSetFragmentBuffers| m.range_length, found)
+        }
+        RGFX_OP_RENDER_SET_TILE_BUFFERS => {
+            buffers(payload, |m: &RgfxOpSetTileBuffers| m.range_length, found)
+        }
+        RGFX_OP_RENDER_SET_OBJECT_BUFFERS => {
+            buffers(payload, |m: &RgfxOpSetObjectBuffers| m.range_length, found)
+        }
+        RGFX_OP_RENDER_SET_MESH_BUFFERS => {
+            buffers(payload, |m: &RgfxOpSetMeshBuffers| m.range_length, found)
+        }
+        RGFX_OP_RENDER_SET_VERTEX_BUFFERS_ATTRIBUTE_STRIDES => {
+            head::<RgfxOpSetVertexBuffersAttributeStrides>(payload)
+                .and_then(|m| {
+                    run::<RgfxOpSetVertexBuffersAttributeStrides, RgfxBufferStrideBinding>(
+                        payload,
+                        m.range_length,
+                    )
+                })
+                .map(|r| each(found, r.map(|e| e.buffer_obj_id)))
+        }
+        RGFX_OP_RENDER_SET_VERTEX_TEXTURES => {
+            textures(payload, |m: &RgfxOpSetVertexTextures| m.range_length, found)
+        }
+        RGFX_OP_RENDER_SET_FRAGMENT_TEXTURES => {
+            textures(payload, |m: &RgfxOpSetFragmentTextures| m.range_length, found)
+        }
+        RGFX_OP_RENDER_SET_TILE_TEXTURES => {
+            textures(payload, |m: &RgfxOpSetTileTextures| m.range_length, found)
+        }
+        RGFX_OP_RENDER_SET_OBJECT_TEXTURES => {
+            textures(payload, |m: &RgfxOpSetObjectTextures| m.range_length, found)
+        }
+        RGFX_OP_RENDER_SET_MESH_TEXTURES => {
+            textures(payload, |m: &RgfxOpSetMeshTextures| m.range_length, found)
+        }
+        RGFX_OP_RENDER_SET_VERTEX_SAMPLER_STATES => {
+            samplers(payload, |m: &RgfxOpSetVertexSamplerStates| m.range_length, found)
+        }
+        RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES => {
+            samplers(payload, |m: &RgfxOpSetFragmentSamplerStates| m.range_length, found)
+        }
+        RGFX_OP_RENDER_SET_TILE_SAMPLER_STATES => {
+            samplers(payload, |m: &RgfxOpSetTileSamplerStates| m.range_length, found)
+        }
+        RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES => {
+            samplers(payload, |m: &RgfxOpSetObjectSamplerStates| m.range_length, found)
+        }
+        RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES => {
+            samplers(payload, |m: &RgfxOpSetMeshSamplerStates| m.range_length, found)
+        }
+        RGFX_OP_RENDER_SET_VERTEX_SAMPLER_STATES_LOD_CLAMPS => samplers_lod(
+            payload,
+            |m: &RgfxOpSetVertexSamplerStatesLodClamps| m.range_length,
+            found,
+        ),
+        RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES_LOD_CLAMPS => samplers_lod(
+            payload,
+            |m: &RgfxOpSetFragmentSamplerStatesLodClamps| m.range_length,
+            found,
+        ),
+        RGFX_OP_RENDER_SET_TILE_SAMPLER_STATES_LOD_CLAMPS => samplers_lod(
+            payload,
+            |m: &RgfxOpSetTileSamplerStatesLodClamps| m.range_length,
+            found,
+        ),
+        RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES_LOD_CLAMPS => samplers_lod(
+            payload,
+            |m: &RgfxOpSetObjectSamplerStatesLodClamps| m.range_length,
+            found,
+        ),
+        RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES_LOD_CLAMPS => samplers_lod(
+            payload,
+            |m: &RgfxOpSetMeshSamplerStatesLodClamps| m.range_length,
+            found,
+        ),
+        RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT => {
+            head::<RgfxOpDrawMeshThreadgroupsIndirect>(payload)
+                .map(|m| each(found, [m.indirect_buffer_obj_id]))
+        }
+        RGFX_OP_RENDER_USE_HEAPS => heaps(payload, |m: &RgfxOpUseHeaps| m.count, found),
+        RGFX_OP_RENDER_USE_HEAPS_STAGES => {
+            heaps(payload, |m: &RgfxOpUseHeapsStages| m.count, found)
+        }
+        RGFX_OP_RENDER_USE_RESOURCES => {
+            resources(payload, |m: &RgfxOpUseResources| m.count, found)
+        }
+        RGFX_OP_RENDER_USE_RESOURCES_STAGES => {
+            resources(payload, |m: &RgfxOpUseResourcesStages| m.count, found)
+        }
+        // The ops that name no object.
+        RGFX_OP_RENDER_SET_VIEWPORT
+        | RGFX_OP_RENDER_SET_SCISSOR_RECT
+        | RGFX_OP_RENDER_DRAW_PRIMITIVES
+        | RGFX_OP_RENDER_DRAW_PRIMITIVES_INSTANCES
+        | RGFX_OP_RENDER_DRAW_PRIMITIVES_BASE
+        | RGFX_OP_RENDER_DISPATCH_THREADS_PER_TILE
+        | RGFX_OP_RENDER_DISPATCH_THREADS_PER_TILE_IN_REGION
+        | RGFX_OP_RENDER_DISPATCH_THREADS_PER_TILE_IN_REGION_INDEX
+        | RGFX_OP_RENDER_MEMORY_BARRIER_WITH_SCOPE
+        | RGFX_OP_RENDER_SET_CULL_MODE
+        | RGFX_OP_RENDER_SET_FRONT_FACING_WINDING
+        | RGFX_OP_RENDER_SET_TRIANGLE_FILL_MODE
+        | RGFX_OP_RENDER_SET_DEPTH_CLIP_MODE_SPI
+        | RGFX_OP_RENDER_SET_PROVOKING_VERTEX_MODE
+        | RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION
+        | RGFX_OP_RENDER_SET_STENCIL_STORE_ACTION
+        | RGFX_OP_RENDER_SET_STENCIL_STORE_ACTION_OPTIONS
+        | RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS
+        | RGFX_OP_RENDER_SET_COLOR_STORE_ACTION
+        | RGFX_OP_RENDER_SET_COLOR_STORE_ACTION_OPTIONS
+        | RGFX_OP_RENDER_SET_VISIBILITY_RESULT_MODE
+        | RGFX_OP_RENDER_SET_VERTEX_AMPLIFICATION_MODE
+        | RGFX_OP_RENDER_SET_VERTEX_BUFFER_OFFSET
+        | RGFX_OP_RENDER_SET_FRAGMENT_BUFFER_OFFSET
+        | RGFX_OP_RENDER_SET_TILE_BUFFER_OFFSET
+        | RGFX_OP_RENDER_SET_VERTEX_BUFFER_OFFSET_ATTRIBUTE_STRIDE
+        | RGFX_OP_RENDER_SET_THREADGROUP_MEMORY_LENGTH
+        | RGFX_OP_RENDER_SET_ALPHA_TEST_REFERENCE_VALUE
+        | RGFX_OP_RENDER_SET_LINE_WIDTH
+        | RGFX_OP_RENDER_SET_POINT_SIZE
+        | RGFX_OP_RENDER_SET_TESSELLATION_FACTOR_SCALE
+        | RGFX_OP_RENDER_SET_BLEND_COLOR_RED
+        | RGFX_OP_RENDER_SET_DEPTH_BIAS
+        | RGFX_OP_RENDER_SET_VIEWPORT_TRANSFORM_ENABLED
+        | RGFX_OP_RENDER_SET_PRIMITIVE_RESTART_ENABLED
+        | RGFX_OP_RENDER_SET_STENCIL_FRONT_REFERENCE_VALUE
+        | RGFX_OP_RENDER_SET_DEPTH_CLEARED
+        | RGFX_OP_RENDER_SET_STENCIL_CLEARED
+        | RGFX_OP_RENDER_SET_OBJECT_BUFFER_OFFSET
+        | RGFX_OP_RENDER_SET_MESH_BUFFER_OFFSET
+        | RGFX_OP_RENDER_SET_OBJECT_THREADGROUP_MEMORY_LENGTH
+        | RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS
+        | RGFX_OP_RENDER_DRAW_MESH_THREADS
+        | RGFX_OP_RENDER_SET_SCISSOR_RECTS
+        | RGFX_OP_RENDER_SET_VIEWPORTS
+        | RGFX_OP_RENDER_SET_VERTEX_AMPLIFICATION_COUNT => Some(true),
+        _ => return None,
+    };
+    Some(more.unwrap_or(false))
+}
+
 /// A grid or threadgroup size of the wire (width, height, depth) as Metal's `MTLSize`.
 fn size([width, height, depth]: [u64; 3]) -> MtlSize {
     MtlSize::new(width, height, depth)
@@ -3353,5 +3687,116 @@ mod tests {
         let (p, dec) = setup();
         let (_cb, enc) = encoder(&p);
         assert!(!decode_op(0x1fff, &[], &dec, &enc, &no_pass(), ON).unwrap());
+    }
+
+    /// Each render op [`decode_op`] decodes, [`names`] reads for the objects it names or lists as
+    /// naming none, and it reads none that [`decode_op`] does not decode: a new op fails here until
+    /// its names are read with its body's types, or it is listed as naming none.
+    #[test]
+    fn every_render_op_decoded_is_read_for_its_names() {
+        use reims_vgpu_graphics::ops::RGFX_OP_GROUP_RENDER;
+        let (p, dec) = setup();
+        let (_cb, enc) = encoder(&p);
+        let zeros = [0u8; 512];
+        let first = RGFX_OP_GROUP_RENDER << 12;
+        let mut decoded = 0;
+        for tag in first..=first | 0xfff {
+            let decodes = !matches!(
+                decode_op(tag, &zeros, &dec, &enc, &no_pass(), ON),
+                Ok(false)
+            );
+            let read = names(tag, &zeros, &mut |_| true);
+            assert_eq!(decodes, read.is_some(), "render op {tag:#06x}");
+            decoded += usize::from(decodes);
+        }
+        assert!(decoded >= 94, "the render ops decode: {decoded}");
+    }
+
+    /// [`names`] reads each id a render op names, in its order, nil and a nil resource kind left
+    /// out; stops where its body is too short for the elements its head counts; and stops at once
+    /// where `found` answers false.
+    #[test]
+    fn names_reads_a_render_op_s_ids_in_its_order() {
+        let read = |tag, body: &[u8]| {
+            let mut ids = Vec::new();
+            let more = names(tag, body, &mut |id| {
+                ids.push(id);
+                true
+            });
+            (more, ids)
+        };
+        let uses = tailed(
+            RgfxOpUseResources { count: 3, usage: 1 }.as_bytes(),
+            &[
+                RgfxResourceBinding {
+                    obj_id: 21,
+                    kind: RGFX_RESOURCE_KIND_BUFFER,
+                    reserved_0c: 0,
+                }
+                .as_bytes(),
+                RgfxResourceBinding {
+                    obj_id: 99,
+                    kind: RGFX_RESOURCE_KIND_NONE,
+                    reserved_0c: 0,
+                }
+                .as_bytes(),
+                RgfxResourceBinding {
+                    obj_id: 22,
+                    kind: RGFX_RESOURCE_KIND_TEXTURE,
+                    reserved_0c: 0,
+                }
+                .as_bytes(),
+            ],
+        );
+        assert_eq!(
+            read(RGFX_OP_RENDER_USE_RESOURCES, &uses),
+            (Some(true), vec![21, 22])
+        );
+        let binding = |buffer_obj_id| RgfxBufferBinding {
+            buffer_obj_id,
+            offset: 256,
+        };
+        let (b11, b0, b12) = (binding(11), binding(0), binding(12));
+        let binds = tailed(
+            RgfxOpSetFragmentBuffers {
+                range_location: 0,
+                range_length: 3,
+            }
+            .as_bytes(),
+            &[b11.as_bytes(), b0.as_bytes(), b12.as_bytes()],
+        );
+        assert_eq!(
+            read(RGFX_OP_RENDER_SET_FRAGMENT_BUFFERS, &binds),
+            (Some(true), vec![11, 12])
+        );
+        let short = &binds[..binds.len() - 8];
+        assert_eq!(
+            read(RGFX_OP_RENDER_SET_FRAGMENT_BUFFERS, short),
+            (Some(false), vec![]),
+            "its elements run past its body"
+        );
+        let draw = RgfxOpDrawIndexedPrimitivesIndirect {
+            index_buffer_obj_id: 3,
+            indirect_buffer_obj_id: 4,
+            ..RgfxOpDrawIndexedPrimitivesIndirect::default()
+        };
+        assert_eq!(
+            read(RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES_INDIRECT, draw.as_bytes()),
+            (Some(true), vec![3, 4])
+        );
+        assert_eq!(
+            read(
+                RGFX_OP_RENDER_SET_VERTEX_BUFFER,
+                &RgfxOpSetVertexBuffer::default().as_bytes()[..8]
+            ),
+            (Some(false), vec![]),
+            "a head too short"
+        );
+        let mut first = Vec::new();
+        let more = names(RGFX_OP_RENDER_SET_FRAGMENT_BUFFERS, &binds, &mut |id| {
+            first.push(id);
+            false
+        });
+        assert_eq!((more, first), (Some(false), vec![11]));
     }
 }

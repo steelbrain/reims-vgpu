@@ -168,7 +168,7 @@ use super::shares::FanOut;
 use super::split::{Estimate, PACE_WAIT_MOST, Parts, Progress, QueueRate, SplitHold};
 use super::surface_cache::{Reach, Uses};
 use super::surface_order::{Marks, Signalled};
-use super::tables::QueueCounts;
+use super::tables::{FOUND_A_HOLD, QueueCounts};
 use super::{
     DecodeError, Decoders, Drain, GraphicsDecoder, ObjHandle, ScheduledSink, SignalSink,
     SubmittedSink, blit, compute, context_of, op_fault, read, refused, refusing, render, video,
@@ -178,10 +178,15 @@ use super::{
 /// raise returns for the handler to catch.
 const ON: OnFault = OnFault::Return;
 
-/// How many names of its op stream a command buffer's walk finds at its start
-/// ([`GraphicsDecoder::find_named`]): every name of a few dozen dispatches, and no more of a
-/// longer buffer's, whose walk finds the rest as it reaches them.
+/// How many names of its op stream that its view has not found yet a command buffer's walk finds
+/// at its start ([`GraphicsDecoder::find_named`]): every object of a few dozen dispatches or draws,
+/// and no more of a longer buffer's, whose walk finds the rest as it reaches them.
 const NAMES_AT_ONCE: usize = 128;
+
+/// How many names of its op stream, found already or not, a command buffer's walk reads at its
+/// start at most ([`GraphicsDecoder::find_named`]): a render pass names its pipeline and buffers
+/// again at each draw, and the read of a long one stops here.
+const NAMES_READ: usize = 1024;
 
 /// `MTLRenderStageFragment`: a render encoder's update of the writers' fence covers its fragment
 /// stage and every stage before it, its render targets' writes among them.
@@ -3148,10 +3153,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         fault.outcome
     }
 
-    /// Finds the first [`NAMES_AT_ONCE`] objects of the current context the compute ops of the
-    /// command buffer's op stream `ops` name ([`each_named`]) in its view of the context's table,
-    /// where it has one, a few under each hold of the table's lock ([`View::find_all`]): the walk
-    /// then answers them from the view's names, as it would have found them as it reached them.
+    /// Finds the first [`NAMES_AT_ONCE`] objects of the current context that the compute and
+    /// render ops of the command buffer's op stream `ops` name ([`each_named`]), of the first
+    /// [`NAMES_READ`] names, and that its view of the context's table has not found yet, in that
+    /// view, where it has one: [`FOUND_A_HOLD`] under each hold of the table's lock
+    /// ([`View::find_all`]). The walk then answers them from the view's names, as it would have
+    /// found them as it reached them, and takes no lock of the table's for them between the
+    /// commands it encodes. A name the view found already is not looked for again, so a draw's
+    /// names, which the draws after it name again, are looked for once.
     ///
     /// [`View::find_all`]: super::tables::View::find_all
     fn find_named(&self, ops: &[u8]) {
@@ -3162,14 +3171,20 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(view) = views.iter().find(|v| v.context().id == context) else {
             return;
         };
-        let mut ids = [0u64; NAMES_AT_ONCE];
-        let mut n = 0;
+        let mut ids = [0u64; FOUND_A_HOLD];
+        let (mut n, mut looked, mut read) = (0, 0, 0);
         each_named(ops, |id| {
-            if self.owned(id) {
+            read += 1;
+            if self.owned(id) && !view.found(id) {
                 ids[n] = id;
                 n += 1;
+                looked += 1;
+                if n == FOUND_A_HOLD {
+                    view.find_all(ids);
+                    n = 0;
+                }
             }
-            n < NAMES_AT_ONCE
+            looked < NAMES_AT_ONCE && read < NAMES_READ
         });
         view.find_all(ids[..n].iter().copied());
     }
@@ -4070,15 +4085,19 @@ fn walk_counts(mut ops: &[u8]) -> [u64; 5] {
     counts
 }
 
-/// Calls `found` with each object id (not nil) the compute ops of the op stream `ops` name, read
-/// as the walk reads them ([`next_op`], [`compute::names`]), in stream order, until it answers
-/// false, the stream ends or is malformed, or a compute op's body is too short for what it names
-/// or its tag is one the walk does not decode: where the walk faults, if it gets there.
+/// Calls `found` with each object id (not nil) the compute and render ops of the op stream `ops`
+/// name, read as the walk reads them ([`next_op`], [`compute::names`], [`render::names`]), in
+/// stream order, until it answers false, the stream ends or is malformed, or a compute or render
+/// op's body is too short for what it names or its tag is one the walk does not decode: where the
+/// walk faults, if it gets there.
 fn each_named(mut ops: &[u8], mut found: impl FnMut(u64) -> bool) {
     while let Some((tag, body, len)) = next_op(ops) {
-        if op_group(tag) == RGFX_OP_GROUP_COMPUTE
-            && compute::names(tag, body, &mut found) != Some(true)
-        {
+        let more = match op_group(tag) {
+            RGFX_OP_GROUP_COMPUTE => compute::names(tag, body, &mut found),
+            RGFX_OP_GROUP_RENDER => render::names(tag, body, &mut found),
+            _ => Some(true),
+        };
+        if more != Some(true) {
             return;
         }
         ops = &ops[len..];
@@ -8975,6 +8994,69 @@ mod tests {
         ));
         ops.extend(op(RGFX_OP_ENCODER_END, &[]));
         assert_eq!(named(&ops), [7, 11, 12, 31]);
+    }
+
+    /// The ids [`each_named`] reads off a render pass: its render ops' in stream order, each time
+    /// an op names one, nil ids, ops that name nothing and the begin's attachments left out.
+    #[test]
+    fn a_stream_s_render_names_come_in_order() {
+        let mut ops = op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin_render_body());
+        ops.extend(op(
+            RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
+            RgfxOpSetRenderPipelineState { pipeline_obj_id: 7 }.as_bytes(),
+        ));
+        for buffer_obj_id in [11, 0, 11] {
+            ops.extend(op(
+                RGFX_OP_RENDER_SET_VERTEX_BUFFER,
+                RgfxOpSetVertexBuffer {
+                    buffer_obj_id,
+                    offset: 0,
+                    index: 0,
+                }
+                .as_bytes(),
+            ));
+            ops.extend(op(
+                RGFX_OP_RENDER_DRAW_PRIMITIVES,
+                RgfxOpDrawPrimitives {
+                    primitive_type: 3,
+                    vertex_start: 0,
+                    vertex_count: 3,
+                }
+                .as_bytes(),
+            ));
+        }
+        ops.extend(op(
+            RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE,
+            RgfxOpSetFragmentTexture {
+                texture_obj_id: 21,
+                index: 0,
+            }
+            .as_bytes(),
+        ));
+        ops.extend(op(
+            RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES,
+            RgfxOpDrawIndexedPrimitives {
+                primitive_type: 3,
+                index_count: 3,
+                index_type: 0,
+                index_buffer_obj_id: 12,
+                index_buffer_offset: 0,
+            }
+            .as_bytes(),
+        ));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        assert_eq!(named(&ops), [7, 11, 11, 21, 12]);
+        let mut unknown = op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin_render_body());
+        unknown.extend(op(0x1fff, &[0; 8]));
+        unknown.extend(op(
+            RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
+            RgfxOpSetRenderPipelineState { pipeline_obj_id: 7 }.as_bytes(),
+        ));
+        assert_eq!(
+            named(&unknown),
+            Vec::<u64>::new(),
+            "a render op the walk does not decode"
+        );
     }
 
     /// [`each_named`] reads no further than the walk decodes: an op whose head counts more records

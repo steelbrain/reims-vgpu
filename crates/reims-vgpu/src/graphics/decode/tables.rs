@@ -636,7 +636,7 @@ const SEEN_ROOM: usize = 32;
 /// How many entries [`View::find_all`] looks for under one hold of the table's lock: a command
 /// buffer of a few dispatches finds every name it has in one, and the table's makes and removals
 /// wait no longer than as many lookups.
-const FOUND_A_HOLD: usize = 32;
+pub(super) const FOUND_A_HOLD: usize = 32;
 
 /// A message's view of one context's table (the module doc): open from its taking until it drops,
 /// which lets go of the removed entries only it still kept. It lends the entries it finds for its
@@ -716,6 +716,12 @@ impl<P: Platform> View<P> {
         // names it, so it is freed only once no such view is open, and this one is until it
         // drops: it outlives `&self`.
         found.map(|p| unsafe { p.as_ref() })
+    }
+
+    /// Whether the view has its answer for `id` already, found, made or removed: a
+    /// [`Self::get`] of it takes no lock of the table's.
+    pub(crate) fn found(&self, id: u64) -> bool {
+        self.seen.borrow().contains_key(&id)
     }
 
     /// Finds each of `ids` the view has not found yet, [`FOUND_A_HOLD`] of them under each hold
