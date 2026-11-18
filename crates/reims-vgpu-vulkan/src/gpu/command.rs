@@ -373,7 +373,10 @@ impl Noted {
     /// The first encoder that a failure the runtime makes itself fails, by its place
     /// ([`Noted::runs_nothing_from`]).
     fn runtime_fails_from(&self) -> Option<usize> {
-        (self.by_runtime.iter()).chain(&self.stores).map(|w| w.from).min()
+        (self.by_runtime.iter())
+            .chain(&self.stores)
+            .map(|w| w.from)
+            .min()
     }
 
     /// How Metal's GPU fails it, at its commit (`sel`): what its encoders did ([`Failing`]),
@@ -571,7 +574,11 @@ impl CommandBufferObject {
     fn standing(&self) -> Standing {
         let (fails, protection, executions) = plain(|| {
             let noted = self.noted.lock();
-            (noted.fails(), noted.protection, !noted.executions.is_empty())
+            (
+                noted.fails(),
+                noted.protection,
+                !noted.executions.is_empty(),
+            )
         });
         let holds = |reason: KeptWhole| match reason {
             KeptWhole::OpenEncoder => self.open_encoders.load(Ordering::SeqCst) != 0,
@@ -655,7 +662,9 @@ impl CommandBufferObject {
         }
     }
 
-    /// Records `failing`, which its commit fails it with ([`Noted::failure`]).
+    /// Records `failing`, which its commit fails it with ([`Noted::failure`]): the tests' way to
+    /// the failure [`CommandBufferObject::made_encoder`] records under its own hold.
+    #[cfg(test)]
     pub(crate) fn fail(&self, failing: Failing) {
         self.noted.lock().failing.push(failing);
     }
