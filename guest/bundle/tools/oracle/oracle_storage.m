@@ -42,6 +42,22 @@
 //                 controls. A means the GPU's copy took the bytes at didModifyRange: (or at the
 //                 commit, where B came after it), B at a later point: the submission, the GPU's
 //                 read, or the second didModifyRange: itself
+//   mtexcap [full|part]  which texels of a 256 x 256 RGBA8 Managed texture a committed command
+//                 buffer's blit (into a Shared buffer) reads where replaceRegion: writes B over
+//                 A after the commit: the whole texture (full, the default) or the rect
+//                 (64,64)-(192,128) (part). The buffer first waits on a shared event (value 1),
+//                 which the CPU signals after B. Steps: A, commit, signal (control: A); A, B,
+//                 commit, signal (control: B); A, commit, B at once, signal. Where that last
+//                 step leaves the point open (B read, and B written before the GPU started the
+//                 buffer), B again after the buffer is scheduled (polled for at most 1 s) and
+//                 20 ms more, then, if still open, with a spinning kernel (spin_atomic) in place
+//                 of the event wait, B landing while the GPU runs it. A in the third step means
+//                 the bytes were taken at the commit; A later, by the scheduling (the
+//                 submission) or, with the spin, by the GPU's start. B written after the GPU
+//                 started the buffer means at the replaceRegion: call (or the blit's own run);
+//                 B written before it leaves the submission, the GPU's run and the call open.
+//                 The read prints as A, B (part: B in its rect, A elsewhere) or mixed, with the
+//                 rect that bounds B's texels and their count
 // A buffer's bytes print as runs, "A[0,4096)" or "B[0,256) A[256,4096)", each letter a byte.
 // Build: see README.md.
 #import "oracle_common.h"
@@ -1042,6 +1058,167 @@ static void case_capture(NSUInteger n)
 		capture_step(spin, copy, n, step, what[step]);
 }
 
+// One step of case_mtexcap over a fresh texture: 0 and 1 the controls, 2 B at once after the
+// commit, 3 B after the scheduling, 4 as 3 with the spin in place of the event wait. Returns
+// whether the step settles the point: A read in a step that wrote B after the commit, or B read
+// where B was written after the GPU started the buffer.
+static bool mtexcap_step(id<MTLComputePipelineState> spin, bool part, int step, const char *what)
+{
+	const int w = 256, h = 256;
+	const int rx = part ? 64 : 0, ry = part ? 64 : 0, rw = part ? 128 : w, rh = part ? 64 : h;
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                                       width:w
+	                                                      height:h
+	                                                   mipmapped:NO];
+	td.storageMode = MTLStorageModeManaged;
+	td.usage = MTLTextureUsageShaderRead;
+	id<MTLTexture> t = [D newTextureWithDescriptor:td];
+	id<MTLBuffer> rb = [D newBufferWithLength:(size_t)w * h * 4 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> flag = [D newBufferWithLength:64 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> res = [D newBufferWithLength:64 options:MTLResourceStorageModeShared];
+	memset(rb.contents, 0xee, rb.length);
+	memset(res.contents, 0, 64);
+	((volatile uint32_t *)flag.contents)[0] = 0;
+	id<MTLSharedEvent> ev = [D newSharedEvent];
+	tex_replace(t, 0, 0, w, h, 'A');
+	if (step == 1)
+		tex_replace(t, rx, ry, rw, rh, 'B');
+	id<MTLCommandBuffer> cb = [Q commandBuffer];
+	if (step == 4) {
+		uint32_t max = gSpinPolls;
+		id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+		[e setComputePipelineState:spin];
+		[e setBuffer:flag offset:0 atIndex:0];
+		[e setBuffer:res offset:0 atIndex:1];
+		[e setBytes:&max length:4 atIndex:2];
+		[e dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+		[e endEncoding];
+	} else {
+		[cb encodeWaitForEvent:ev value:1];
+	}
+	id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+	[e copyFromTexture:t
+	         sourceSlice:0
+	         sourceLevel:0
+	        sourceOrigin:MTLOriginMake(0, 0, 0)
+	          sourceSize:MTLSizeMake(w, h, 1)
+	            toBuffer:rb
+	   destinationOffset:0
+	destinationBytesPerRow:(NSUInteger)w * 4
+	destinationBytesPerImage:(NSUInteger)w * h * 4];
+	[e endEncoding];
+	double t0 = oracle_now_ms();
+	__block double ts = -1;
+	[cb addScheduledHandler:^(id<MTLCommandBuffer> _) { ts = oracle_now_ms() - t0; }];
+	[cb commit];
+	double tr = oracle_now_ms() - t0, tb = -1, tw = -1;
+	bool sched = false;
+	if (step == 2) {
+		tb = oracle_now_ms() - t0;
+		tex_replace(t, rx, ry, rw, rh, 'B');
+		tw = oracle_now_ms() - t0;
+	} else if (step >= 3) {
+		while (cb.status < MTLCommandBufferStatusScheduled && oracle_now_ms() - t0 < 1000)
+			usleep(100);
+		sched = cb.status >= MTLCommandBufferStatusScheduled;
+		usleep(20000);
+		tb = oracle_now_ms() - t0;
+		tex_replace(t, rx, ry, rw, rh, 'B');
+		tw = oracle_now_ms() - t0;
+	}
+	double tsg = oracle_now_ms() - t0;
+	if (step == 4)
+		((volatile uint32_t *)flag.contents)[0] = 7;
+	else
+		ev.signaledValue = 1;
+	[cb waitUntilCompleted];
+	double tc = oracle_now_ms() - t0, tg = cb.GPUStartTime * 1e3 - t0, te = cb.GPUEndTime * 1e3 - t0;
+	// Count the texels: A, B (and the rect bounding B's), anything else.
+	const uint8_t *p = rb.contents;
+	size_t na = 0, nb = 0, nx = 0;
+	int x0 = w, y0 = h, x1 = 0, y1 = 0;
+	for (int y = 0; y < h; y++) {
+		for (int x = 0; x < w; x++) {
+			const uint8_t *q = p + ((size_t)y * w + x) * 4;
+			uint8_t v = q[0];
+			if ((v != 'A' && v != 'B') || q[1] != v || q[2] != v || q[3] != v) {
+				nx++;
+				continue;
+			}
+			if (v == 'A') {
+				na++;
+				continue;
+			}
+			nb++;
+			x0 = MIN(x0, x);
+			y0 = MIN(y0, y);
+			x1 = MAX(x1, x + 1);
+			y1 = MAX(y1, y + 1);
+		}
+	}
+	const bool whole = nb == (size_t)rw * rh && x0 == rx && y0 == ry && x1 == rx + rw && y1 == ry + rh;
+	char seen[200];
+	if (nb == 0 && nx == 0)
+		snprintf(seen, sizeof seen, "A");
+	else if (whole && nx == 0)
+		snprintf(seen, sizeof seen, part ? "B (B in its rect, A elsewhere)" : "B");
+	else if (nb)
+		snprintf(seen, sizeof seen, "mixed: B %zu in (%d,%d)-(%d,%d), other %zu", nb, x0, y0, x1,
+		         y1, nx);
+	else
+		snprintf(seen, sizeof seen, "mixed: A %zu, other %zu", na, nx);
+	line(what, seen, tc);
+	uint32_t *r = res.contents;
+	if (step == 4)
+		printf("    spin polls %u, saw flag %u\n", r[0], r[1]);
+	printf("    texels A %zu, B %zu, other %zu; status %ld%s%s\n", na, nb, nx, (long)cb.status,
+	       cb.error ? " error " : "", cb.error ? cb.error.description.UTF8String : "");
+	char tbs[64] = "";
+	if (tb >= 0)
+		snprintf(tbs, sizeof tbs, "B replaced from %.2f to %.2f ms, ", tb, tw);
+	printf("    the commit returned at %.2f ms, %sscheduled at %.2f ms, %s at %.2f ms, GPU from "
+	       "%.2f to %.2f ms, completed at %.1f ms\n",
+	       tr, tbs, ts, step == 4 ? "the spin let go" : "signalled", tsg, tg, te, tc);
+	if (step < 2)
+		return true;
+	if (step >= 3 && !sched)
+		printf("    not scheduled within 1 s of the commit: B landed before the scheduling\n");
+	else if (step == 2 && (ts < 0 || ts > tb))
+		printf("    B landed before the scheduling\n");
+	if (nb == 0 && nx == 0)
+		return true;
+	if (tg > 0 && tg < tb) {
+		printf("    B landed %.2f ms after the GPU started the buffer\n", tb - tg);
+		return true;
+	}
+	printf("    B landed before the GPU started the buffer: open\n");
+	return false;
+}
+
+static void case_mtexcap(const char *mode)
+{
+	const bool part = !strcmp(mode, "part");
+	printf("case mtexcap %s: a 256x256 RGBA8 Managed texture replaced %s after the commit of a "
+	       "command buffer that reads it\n",
+	       part ? "part" : "full", part ? "in (64,64)-(192,128)" : "whole");
+	const char *what[] = {
+	    "A, commit, signal",
+	    "A, B, commit, signal",
+	    "A, commit, B at once, signal",
+	    "A, commit, scheduled + 20 ms, B, signal",
+	    "A, commit (spin), scheduled + 20 ms, B, let go",
+	};
+	mtexcap_step(nil, part, 0, what[0]);
+	mtexcap_step(nil, part, 1, what[1]);
+	if (mtexcap_step(nil, part, 2, what[2]) || mtexcap_step(nil, part, 3, what[3]))
+		return;
+	id<MTLLibrary> lib = oracle_library(D, gArgv0, "oracle");
+	id<MTLComputePipelineState> spin = lib ? pipeline(lib, "spin_atomic") : nil;
+	if (spin)
+		mtexcap_step(spin, part, 4, what[4]);
+}
+
 static int run_case(int argc, char **argv)
 {
 	const char *c = argv[0];
@@ -1069,6 +1246,8 @@ static int run_case(int argc, char **argv)
 		case_spin();
 	else if (!strcmp(c, "capture"))
 		case_capture(argc > 1 ? strtoull(argv[1], NULL, 0) : 4096);
+	else if (!strcmp(c, "mtexcap"))
+		case_mtexcap(argc > 1 ? argv[1] : "full");
 	else {
 		printf("unknown case %s\n", c);
 		return 2;
@@ -1102,6 +1281,7 @@ int main(int argc, char **argv)
 	    {"argenc", "managed"}, {"nocopy", NULL}, {"didmodify", "length"},
 	    {"didmodify", "nocopy"}, {"linalign", NULL}, {"linarray", "spi"},
 	    {"linarray", "public"}, {"lintypes", "public:3"}, {"spin", NULL}, {"capture", NULL},
+	    {"mtexcap", "full"},
 	};
 	size_t n = sizeof all / sizeof all[0];
 	for (size_t i = 0; i < n; i++) {
