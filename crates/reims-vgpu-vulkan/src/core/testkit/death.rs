@@ -476,7 +476,8 @@ fn child_main(body: impl FnOnce(&Child)) {
     child.finish();
 }
 
-/// Makes this process a child of [`spawn_command`]: maps the scratch file [`ENV_FILE`] names, turns
+/// Makes this process a child of [`spawn_command`]: on Unix sets its soft core limit to 0 (a death
+/// leaves no core, `sys::dump_no_core`), maps the scratch file [`ENV_FILE`] names, turns
 /// the capture off (a death aborts as in production), gives the calling thread an alternate signal
 /// stack its nested handlers fit on (`sys::widen_alternate_stack`), arms the death marker's
 /// signal handlers, and records the calling thread as the body's. A child that is not a libtest test (a tool's binary)
@@ -484,6 +485,8 @@ fn child_main(body: impl FnOnce(&Child)) {
 /// [`Child::finish`] if the body returns: a body that panics unwinds past the `Child`, whose `Drop`
 /// records it (the test then fails with `f`'s panic).
 pub fn enter() -> Child {
+    #[cfg(unix)]
+    sys::dump_no_core();
     let Some(path) = std::env::var_os(ENV_FILE) else {
         panic!("death harness: {ENV_FILE} is not set");
     };
@@ -1687,6 +1690,26 @@ mod tests {
             assert_eq!(r.ram_u32(0x1_0000_0040), Some(0xdead_beef));
         }
     );
+
+    /// A child leaves no core when it dies: its soft core limit is 0 though its parent's is not.
+    /// The parent first sets its own to 1 KiB, or to its hard limit where that is lower: not 0,
+    /// so the child's 0 is the harness's doing, and too small for a core of the parent's own.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_leaves_no_core() {
+        sys::set_core_limit(1024);
+        run(
+            Expect::Death,
+            Options::default(),
+            module_path!(),
+            "a_child_leaves_no_core",
+            |t| {
+                t.op(&format!("core limit {:?}", sys::core_limit()));
+                abort()
+            },
+            |r| assert_eq!(r.died().op.as_deref(), Some("core limit Some(0)")),
+        );
+    }
 
     death_test!(
         /// A death under a held lock never lets a blocked second thread record

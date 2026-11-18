@@ -16,6 +16,8 @@ pub const SA_ONSTACK: c_int = 0x0001;
 pub const SA_SIGINFO: c_int = 0x0040;
 pub const SIG_DFL: usize = 0;
 pub const SIG_IGN: usize = 1;
+/// `RLIMIT_CORE`: the largest core file the process may leave.
+const RLIMIT_CORE: c_int = 4;
 
 /// `struct sigaction`'s handler union.
 #[repr(C)]
@@ -50,6 +52,13 @@ impl SigAction {
     }
 }
 
+/// Darwin's `struct rlimit` (`rlim_t` is 64 bits).
+#[repr(C)]
+struct Rlimit {
+    cur: u64,
+    max: u64,
+}
+
 unsafe extern "C" {
     pub fn mmap(
         addr: *mut c_void,
@@ -66,6 +75,35 @@ unsafe extern "C" {
     pub fn pthread_threadid_np(thread: *mut c_void, id: *mut u64) -> c_int;
     pub fn pthread_getname_np(thread: *mut c_void, name: *mut c_char, len: usize) -> c_int;
     pub safe fn _exit(status: c_int) -> !;
+    fn getrlimit(resource: c_int, limit: *mut Rlimit) -> c_int;
+    fn setrlimit(resource: c_int, limit: *const Rlimit) -> c_int;
+}
+
+/// Leaves no core file when this process dies: the soft `RLIMIT_CORE` set to 0, the hard limit
+/// kept. A harness child dies on purpose, and systemd-coredump keeps every core it is given, so a
+/// run that lifts the limit to catch a test process's own crash gets no core of a child's.
+pub fn dump_no_core() {
+    set_core_limit(0);
+}
+
+/// Sets the soft `RLIMIT_CORE` to `soft` bytes, or to the hard limit where that is lower.
+pub fn set_core_limit(soft: u64) {
+    let mut limit = Rlimit { cur: 0, max: 0 };
+    // SAFETY: the call writes one `Rlimit`.
+    if unsafe { getrlimit(RLIMIT_CORE, &raw mut limit) } != 0 {
+        return;
+    }
+    limit.cur = soft.min(limit.max);
+    // SAFETY: `limit` is an `Rlimit` whose hard limit is the process's own.
+    let _ = unsafe { setrlimit(RLIMIT_CORE, &raw const limit) };
+}
+
+/// The soft `RLIMIT_CORE`, or `None` where the call fails.
+#[cfg(test)]
+pub fn core_limit() -> Option<u64> {
+    let mut limit = Rlimit { cur: 0, max: 0 };
+    // SAFETY: the call writes one `Rlimit`.
+    (unsafe { getrlimit(RLIMIT_CORE, &raw mut limit) } == 0).then_some(limit.cur)
 }
 
 /// The calling thread's system-wide id (`pthread_threadid_np`), without allocating.
