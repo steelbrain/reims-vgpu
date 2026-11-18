@@ -69,9 +69,10 @@ pub const DEFAULT_OUT: &str = "dist-vulkan";
 pub const BUILD_COMMIT: &str = "RVG_BUILD_COMMIT";
 
 /// The commit the tree is at, `git rev-parse HEAD`, with `-dirty` where a tracked file differs
-/// from it, submodules and `crates/reims-ctl` (a workspace of its own, linking nothing of the
-/// library) aside, or where git cannot say. `None` where there is no commit to name (no git, or
-/// no checkout).
+/// from it or where git cannot say. Left aside: submodules, `crates/reims-ctl` (a workspace of
+/// its own, linking nothing of the library), and `Cargo.lock`, which is committed without
+/// metal2vulkan's git `source` lines and which every build writes them back into. `None` where
+/// there is no commit to name (no git, or no checkout).
 pub fn build_commit(tools: &mut dyn Tools) -> Option<String> {
     let head = tools.output("git", &strs(&["rev-parse", "HEAD"])).ok()?;
     if head.is_empty() {
@@ -87,6 +88,7 @@ pub fn build_commit(tools: &mut dyn Tools) -> Option<String> {
             "--",
             ".",
             ":(exclude)crates/reims-ctl",
+            ":(exclude)Cargo.lock",
         ]),
     );
     Some(match changed {
