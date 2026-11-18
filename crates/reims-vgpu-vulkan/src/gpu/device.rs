@@ -42,8 +42,8 @@ use crate::gpu::backing::{self, Backing};
 use crate::gpu::caps;
 use crate::gpu::command::{QueueObject, VulkanCommandQueue};
 use crate::gpu::desc::{
-    Maker, TextureDescriptorObject, TextureFields, VulkanTextureDescriptor,
-    created_format_refused, format_refused,
+    Maker, TextureDescriptorObject, TextureFields, VulkanTextureDescriptor, created_format_refused,
+    format_refused,
 };
 use crate::gpu::event::{VulkanEvent, VulkanSharedEvent};
 use crate::gpu::icb::VulkanIcb;
