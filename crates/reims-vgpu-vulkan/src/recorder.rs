@@ -52,24 +52,39 @@
 //!   carries the bytes its create copied into the device's copy ([`no_copy_contents`]), which
 //!   only a `didModifyRange:` changes afterwards.
 //!
-//!   What the GPU writes, the player's own run writes again, so it is taken as the stream's
-//!   without a write: the ranges a blit writes (a buffer copy's or fill's range, a guest-RAM
-//!   copy's runs; all of a texture, and of a buffer a copy from a texture writes) and all of each
-//!   attachment of a pass. They are taken when the platform first sees the command buffer
-//!   complete, in the first of its completion-seen handlers to run, before any of them or its
-//!   completed handlers tell the guest, and before `waitUntilCompleted` returns
-//!   ([`completion_seen`]); one whose status read final first is taken when the next commit
-//!   reaps it ([`State::absorb_reaped`]). Only a 4 KiB chunk wholly inside what one command
-//!   buffer wrote is taken, so a CPU write into the rest of a chunk still reaches the stream.
+//!   What a blit or a pass writes, the player's own run writes again, so it is taken as the
+//!   stream's without a write: the ranges a blit writes (a buffer copy's or fill's range, a
+//!   guest-RAM copy's runs; all of a texture, and of a buffer a copy from a texture writes) and
+//!   all of each attachment of a pass, each 4 KiB chunk wholly inside what one command buffer
+//!   wrote. What else its GPU work could have changed is compared with the stream's at the
+//!   completion, as at a commit, and each chunk that differs is written there
+//!   ([`State::complete`]): the chunks a blit wrote only part of, and those its kernels and
+//!   render stages could store to, which are what the calls of its compute and render encoders
+//!   reach (the recorder knows no pipeline's arguments: every buffer, texture and heap they bind
+//!   or use, what an indirect command buffer they execute binds, but a resource a
+//!   `useResources:` names for reading alone), in host memory the GPU's work writes in place
+//!   (not a `Managed` buffer's where the device keeps two copies of it). So the stream holds the
+//!   GPU's bytes there from the completion on, and a CPU write after it differs from them, one
+//!   that puts back the bytes from before the command buffer ran included (a guest that zeroes
+//!   the counters its kernels add to). Such a write follows the record of the call that
+//!   committed the command buffer, held while that call runs ([`release_completions`]), so a
+//!   player, which waits before each write for the command buffers that can complete, puts it in
+//!   after its own run of the command buffer. Both are done when the platform first sees the
+//!   command buffer complete, in the first of its completion-seen handlers to run, before any of
+//!   them or its completed handlers tell the guest, and before `waitUntilCompleted` returns
+//!   ([`completion_seen`]); for one whose status read final first, when the next commit reaps it
+//!   ([`State::absorb_reaped`]).
 //!
 //!   Two cases still lose a CPU write from the writes before a commit (an announce, below, still
-//!   writes it). One is a write made while the command buffer runs, into the very bytes its GPU
-//!   work writes: it is taken with the GPU's bytes (the guest raced its own GPU work). The other
-//!   is a write the guest makes once it learns of the completion before those handlers run: from
-//!   an event the command buffer signals (the runtime signals its events and sets its status
-//!   before it runs the handlers), or from its status read in that gap, which lasts
-//!   microseconds. The hashing runs on the runtime's thread that saw the completion, and holds
-//!   back other completions while it runs.
+//!   writes it). One is a write made while the command buffer runs, into the very bytes a blit
+//!   or a pass of it writes: it is taken with the GPU's bytes (the guest raced its own GPU work);
+//!   one into what its kernels could store to is in the completion's write. The other is a write
+//!   the guest makes once it learns of the completion before those handlers run: from an event
+//!   the command buffer signals (the runtime signals its events and sets its status before it
+//!   runs the handlers), or from its status read in that gap, which lasts microseconds. The
+//!   hashing runs on the runtime's thread that saw the completion, and holds back other
+//!   completions while it runs: `<pid>.stats.txt` counts its time and chunks
+//!   (`completion_*`).
 //!
 //!   An announce, a `didModifyRange:` of a `Managed` buffer, also writes each chunk of its range
 //!   whose bytes differ from those the stream's last write of it recorded, or that no write
@@ -109,7 +124,7 @@ mod memory_tests;
 
 use std::any::Any;
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -168,6 +183,9 @@ thread_local! {
     static FORMATTING: Cell<bool> = const { Cell::new(false) };
     /// This thread's reading and queueing time not yet in the counts, and its calls since.
     static TIMES: Cell<(u64, u64, u32)> = const { Cell::new((0, 0, 0)) };
+    /// The command buffers this thread committed inside its outermost call, whose writes at
+    /// their completions wait for that call's record ([`release_completions`]).
+    static COMMITTED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
 /// How many calls a thread's times wait for before they reach the counts ([`add_times`]).
@@ -1086,7 +1104,9 @@ pub fn released(ptr: u64) {
     state.push(Item::Release(id));
 }
 
-/// Records the call `active` opened, with the object it made: queued, for the writer to shape.
+/// Records the call `active` opened, with the object it made: queued, for the writer to shape;
+/// then, where it is the thread's outermost, what the completions of the command buffers it
+/// committed wrote ([`release_completions`]).
 pub fn finish(active: Active, made: Option<Made>) {
     let Active {
         token,
@@ -1094,8 +1114,13 @@ pub fn finish(active: Active, made: Option<Made>) {
         text,
         snap,
     } = active;
-    let Some(mut call) = pending else { return };
     let Some(state) = state() else { return };
+    let Some(mut call) = pending else {
+        if token.outer {
+            release_completions(state);
+        }
+        return;
+    };
     let t0 = now_ns();
     let mut identity = None;
     if let Some(mut made) = made {
@@ -1111,6 +1136,7 @@ pub fn finish(active: Active, made: Option<Made>) {
         snap,
     };
     state.push_made(item, result, identity);
+    release_completions(state);
     add_times(state, 0, now_ns() - t0, true);
     drop(token);
 }
@@ -1151,9 +1177,11 @@ pub fn draws<T: Send + Sync + 'static>(
 /// Before a commit: shapes what is queued, waits for the earlier command buffers that can run,
 /// then writes the memory the command buffer reaches that changed. A commit inside another call
 /// (`m2v.split`, `m2v.commitPart`), which records no `commit` of its own, writes it too, before
-/// that call's record. The bytes the command buffer's GPU work writes are kept, to be taken as
-/// the stream's at its completion ([`completion_seen`]), by a completion-seen handler of the
-/// recorder's added now.
+/// that call's record. The memory the command buffer's GPU work writes, and the memory its
+/// kernels and render stages could store to, are kept for its completion ([`completion_seen`]),
+/// which a completion-seen handler of the recorder's added now runs: the first taken as the
+/// stream's, the second written where it changed, after the record of the call that committed it
+/// ([`release_completions`]).
 pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
     if active.is_none() {
         return;
@@ -1168,17 +1196,32 @@ pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
     let t1 = now_ns();
     state.absorb_reaped(&reaped);
     state.stats.wait_ns.fetch_add(t1 - t0, Ordering::Relaxed);
-    let (reach, writes): (Vec<u64>, _) = {
+    let (reach, writes, stores): (Vec<u64>, _, Vec<u64>) = {
         let sync = state.sync.lock();
         (sync.cbs.get(&id))
-            .map(|c| (c.reach.iter().copied().collect(), c.gpu_writes.clone()))
+            .map(|c| {
+                let reach = c.reach.iter().copied().collect();
+                (
+                    reach,
+                    c.gpu_writes.clone(),
+                    c.stores.iter().copied().collect(),
+                )
+            })
             .unwrap_or_default()
     };
     let ranges = state.ranges_of(&reach);
     state.capture(&ranges);
-    let written = state.written_spans(&writes);
-    if !written.is_empty() {
-        state.sync.lock().absorbs.insert(id, written);
+    let completion = Completion {
+        written: state.written_spans(&writes),
+        stored: state.stored_spans(&stores),
+    };
+    if !completion.written.is_empty() || !completion.stored.is_empty() {
+        {
+            let mut sync = state.sync.lock();
+            sync.absorbs.insert(id, completion);
+            sync.unqueued.insert(id);
+        }
+        COMMITTED.with(|c| c.borrow_mut().push(id));
         // Run where the runtime sees the command buffer complete, after any of core's added
         // before (whose hook takes the bytes first), before its completed handlers and before
         // `waitUntilCompleted` returns. Refused, the bytes are taken once it is reaped.
@@ -1213,17 +1256,38 @@ pub fn completion_key(cb: &VulkanCommandBuffer) -> Option<u64> {
 }
 
 /// The command buffer of stream id `id` seen complete, by the first of its completion-seen
-/// handlers to run, before it or any later handler tells the guest: the bytes its GPU work wrote
-/// that fill whole chunks become the stream's ([`State::absorb`]), so a CPU write the guest makes
-/// once told reaches the stream. Called again, or for a command buffer whose writes were taken
-/// already ([`State::absorb_reaped`]), it does nothing. Runs on the runtime's thread, which it
-/// holds while it hashes; it takes the recorder's locks, which no thread holds while it waits
-/// for the device, and holds no object.
+/// handlers to run, before it or any later handler tells the guest ([`State::complete`]): the
+/// bytes its blits and passes wrote that fill whole chunks become the stream's, and each chunk
+/// its kernels and render stages could store to, or its blits wrote part of, is written where it
+/// differs from the stream's, so a CPU write the guest makes once told reaches the stream, one
+/// that puts back the bytes the stream held before the command buffer ran included. Called
+/// again, or for a command buffer whose writes were taken already ([`State::absorb_reaped`]),
+/// it does nothing. Runs on the runtime's thread, which it holds while it hashes; it takes the
+/// recorder's locks, which no thread holds while it waits for the device, and holds no object.
 pub fn completion_seen(id: u64) {
     let Some(state) = state() else { return };
     let mut sync = state.sync.lock();
-    if let Some(spans) = sync.absorbs.remove(&id) {
-        state.absorb(&spans);
+    if let Some(completion) = sync.absorbs.remove(&id) {
+        state.complete(&mut sync, id, completion);
+    }
+}
+
+/// After the record of a thread's outermost call is queued: the writes at the completions of
+/// the command buffers it committed ([`before_commit`]) that came before that record are queued
+/// now, after it, and those to come are queued as they come. So a completion's writes, the bytes
+/// of the command buffer's own GPU work among them, follow its commit in the stream, though the
+/// runtime may see it complete before the call that committed it returns.
+fn release_completions(state: &State) {
+    let ids = COMMITTED.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if ids.is_empty() {
+        return;
+    }
+    let mut sync = state.sync.lock();
+    for id in ids {
+        sync.unqueued.remove(&id);
+        if let Some(writes) = sync.held.remove(&id) {
+            writes.into_iter().for_each(|w| state.push(Item::Write(w)));
+        }
     }
 }
 
@@ -1548,6 +1612,9 @@ struct Cb {
     /// What its passes render into and its blits write, bytes only the GPU writes: each object
     /// with the byte ranges of it written, all of it where `None`.
     gpu_writes: KeyMap<Option<Vec<(u64, u64)>>>,
+    /// What its kernels and render stages could store to: what the calls of its compute and
+    /// render encoders reach, but for a `useResources:` whose usage holds no write.
+    stores: KeySet,
     waits: Vec<(u64, u64)>,
     signals: Vec<(u64, u64)>,
 }
@@ -1583,9 +1650,25 @@ struct SyncState {
     pending: Vec<Pending>,
     /// The highest value the CPU, or a completed command buffer, signalled each event to.
     signalled: KeyMap<u64>,
-    /// The host memory each committed command buffer's GPU work writes, by its stream id, until
-    /// it is taken as the stream's at its completion ([`completion_seen`]).
-    absorbs: KeyMap<Vec<Span>>,
+    /// The host memory each committed command buffer's GPU work writes or could store to, by
+    /// its stream id, until its completion ([`completion_seen`]).
+    absorbs: KeyMap<Completion>,
+    /// The committed command buffers whose commit's record is not queued yet: the call that
+    /// committed each is still running ([`release_completions`]).
+    unqueued: KeySet,
+    /// The writes of the completions of those command buffers, held until that record is.
+    held: KeyMap<Vec<Call>>,
+}
+
+/// What a committed command buffer's completion does with host memory ([`State::complete`]).
+#[derive(Default)]
+struct Completion {
+    /// What its blits and passes write, bytes only the GPU writes ([`Cb::gpu_writes`]): each
+    /// chunk wholly inside taken as the stream's, each it writes part of compared.
+    written: Vec<Span>,
+    /// What its kernels and render stages could store to ([`Cb::stores`]), in CPU-visible
+    /// memory the GPU's work writes in place: compared.
+    stored: Vec<Span>,
 }
 
 /// One span of host memory to compare: `start..end` of the target's bytes, the target's first
@@ -1623,6 +1706,9 @@ enum Compare {
     /// At a completion, of what the GPU wrote: none; each chunk's bytes become its comparison
     /// point.
     Absorb,
+    /// At a completion, of what the GPU could have written besides: each chunk whose bytes
+    /// differ from its comparison point, as at a commit.
+    Complete,
 }
 
 #[derive(Default)]
@@ -1655,6 +1741,15 @@ struct Stats {
     commits_over_1ms: AtomicU64,
     commits_over_4ms: AtomicU64,
     commits_over_8ms: AtomicU64,
+    /// Of the counts above, the completions' ([`State::complete`]): their time, the chunks they
+    /// hashed, the writes they made, the chunks and bytes of those, and the writes held for the
+    /// record of the call that committed their command buffer ([`release_completions`]).
+    completion_ns: AtomicU64,
+    completion_chunks_hashed: AtomicU64,
+    completion_writes: AtomicU64,
+    completion_chunks_written: AtomicU64,
+    completion_write_bytes: AtomicU64,
+    completion_writes_held: AtomicU64,
     waits: AtomicU64,
     held: AtomicU64,
     wait_timeouts: AtomicU64,
@@ -2021,6 +2116,28 @@ impl State {
         line(&mut out, "commits_over_1ms", &s.commits_over_1ms);
         line(&mut out, "commits_over_4ms", &s.commits_over_4ms);
         line(&mut out, "commits_over_8ms", &s.commits_over_8ms);
+        line(&mut out, "completion_ns", &s.completion_ns);
+        line(
+            &mut out,
+            "completion_chunks_hashed",
+            &s.completion_chunks_hashed,
+        );
+        line(&mut out, "completion_writes", &s.completion_writes);
+        line(
+            &mut out,
+            "completion_chunks_written",
+            &s.completion_chunks_written,
+        );
+        line(
+            &mut out,
+            "completion_write_bytes",
+            &s.completion_write_bytes,
+        );
+        line(
+            &mut out,
+            "completion_writes_held",
+            &s.completion_writes_held,
+        );
         line(&mut out, "waits", &s.waits);
         line(&mut out, "held", &s.held);
         line(&mut out, "wait_timeouts", &s.wait_timeouts);
@@ -2286,8 +2403,12 @@ impl State {
         if recv_type.contains("BlitCommandEncoder") {
             gpu_writes.extend(blit_writes(call, &named));
         }
+        let stores = may_store(recv_type, call);
         let mut sync = self.sync.lock();
         let entry = sync.cbs.entry(cb).or_default();
+        if stores {
+            entry.stores.extend(reach.iter().copied());
+        }
         entry.reach.extend(reach);
         for (id, bytes) in gpu_writes {
             entry.writes(id, bytes);
@@ -2373,7 +2494,7 @@ impl State {
         reaped
     }
 
-    /// Takes what the GPU work of each reaped command buffer wrote as the stream's, where its
+    /// Does the completion of each reaped command buffer ([`State::complete`]) where its
     /// completion hook has not ([`completion_seen`]): one whose status read final before the hook
     /// ran (a wait for earlier work returns there), or whose hook the runtime refused. A released
     /// one's is dropped, its chunks written again where they changed. The sync lock is held
@@ -2385,12 +2506,38 @@ impl State {
         }
         let mut sync = self.sync.lock();
         for &(id, seen) in reaped {
-            if let Some(spans) = sync.absorbs.remove(&id)
+            if let Some(completion) = sync.absorbs.remove(&id)
                 && seen
             {
-                self.absorb(&spans);
+                self.complete(&mut sync, id, completion);
             }
         }
+    }
+
+    /// The completion of the command buffer of stream id `id`, the sync lock held (`sync`): what
+    /// its blits and passes wrote that fills whole chunks becomes the stream's
+    /// ([`State::absorb`]); then each chunk of what its kernels and render stages could store
+    /// to, and of what its blits wrote part of, is written where its bytes differ from the
+    /// stream's ([`Compare::Complete`]), so the stream's bytes there are the GPU's from here on
+    /// and a CPU write after it, one that puts back the bytes before included, differs from
+    /// them. Its writes are queued now, or, while the call that committed the command buffer has
+    /// not queued its record, held until it does ([`release_completions`]).
+    fn complete(&self, sync: &mut SyncState, id: u64, completion: Completion) {
+        let t0 = now_ns();
+        let mut spans = self.absorb(&completion.written);
+        spans.extend(completion.stored);
+        let writes = self.compare(&spans, Compare::Complete);
+        let n = writes.len() as u64;
+        if n > 0 {
+            self.stats.completion_writes.fetch_add(n, Ordering::Relaxed);
+            if sync.unqueued.contains(&id) {
+                (self.stats.completion_writes_held).fetch_add(n, Ordering::Relaxed);
+                sync.held.entry(id).or_default().extend(writes);
+            } else {
+                writes.into_iter().for_each(|w| self.push(Item::Write(w)));
+            }
+        }
+        (self.stats.completion_ns).fetch_add(now_ns() - t0, Ordering::Relaxed);
     }
 
     /// The host memory a command buffer's GPU work writes, `writes` ([`Cb::gpu_writes`]): each
@@ -2417,9 +2564,11 @@ impl State {
     }
 
     /// Takes as the stream's each 4 KiB of `spans`, what a command buffer's GPU work wrote, that
-    /// lies wholly in them, spans of one target that meet joined: a chunk the GPU wrote only part
-    /// of keeps its comparison point, so a CPU write into the rest of it still reaches the stream.
-    fn absorb(&self, spans: &[Span]) {
+    /// lies wholly in them, spans of one target that meet joined; what lies in chunks they write
+    /// only part of is the answer, for the completion to compare ([`State::complete`]): such a
+    /// chunk keeps its comparison point, so a CPU write into the rest of it still reaches the
+    /// stream.
+    fn absorb(&self, spans: &[Span]) -> Vec<Span> {
         let mut spans = spans.to_vec();
         spans.sort_by_key(|s| (s.target, s.start));
         let mut joined: Vec<Span> = Vec::with_capacity(spans.len());
@@ -2429,18 +2578,28 @@ impl State {
                 _ => joined.push(s),
             }
         }
-        let whole: Vec<Span> = (joined.into_iter())
-            .filter_map(|j| {
-                let start = j.start.next_multiple_of(CHUNK);
-                let end = if j.end >= j.len {
-                    j.len
-                } else {
-                    j.end / CHUNK * CHUNK
-                };
-                (start < end).then_some(Span { start, end, ..j })
-            })
-            .collect();
+        let (mut whole, mut parts) = (Vec::new(), Vec::new());
+        for j in joined {
+            let start = j.start.next_multiple_of(CHUNK);
+            let end = if j.end >= j.len {
+                j.len
+            } else {
+                j.end / CHUNK * CHUNK
+            };
+            if start >= end {
+                parts.push(j);
+                continue;
+            }
+            whole.push(Span { start, end, ..j });
+            if j.start < start {
+                parts.push(Span { end: start, ..j });
+            }
+            if end < j.end {
+                parts.push(Span { start: end, ..j });
+            }
+        }
         self.compare(&whole, Compare::Absorb);
+        parts
     }
 
     /// Waits, at most [`WAIT_BOUND`], for each committed command buffer that can run: one whose
@@ -2511,6 +2670,22 @@ impl State {
 
     /// The host memory each object of `ids` lies in, as spans of their targets.
     fn ranges_of(&self, ids: &[u64]) -> Vec<Span> {
+        self.spans_of(ids, false)
+    }
+
+    /// The host memory of `ids`, what a command buffer's kernels and render stages could store
+    /// to, that their stores reach in place: each object's spans ([`State::ranges_of`]) but a
+    /// `Managed` buffer's where the device keeps two copies of it, whose CPU copy the GPU's work
+    /// never writes (a blit's `synchronizeResource:` brings its bytes back, which the completion
+    /// takes as a blit's) and whose CPU writes an announce records ([`before_modify`]). Where the
+    /// device keeps one copy, a `Managed` buffer's bytes are the GPU's, as a `Shared` one's are.
+    fn stored_spans(&self, ids: &[u64]) -> Vec<Span> {
+        self.spans_of(ids, true)
+    }
+
+    /// The spans of `ids` ([`State::ranges_of`]), but, where `stored`, a buffer's of which the
+    /// GPU writes a copy apart from the CPU's ([`gpu_copy_apart`]).
+    fn spans_of(&self, ids: &[u64], stored: bool) -> Vec<Span> {
         let mut spans = Vec::new();
         let mut seen = HashSet::new();
         for &id in ids {
@@ -2539,9 +2714,12 @@ impl State {
                 continue;
             };
             if let Some(b) = any.downcast_ref::<BufferObject>() {
-                self.buffer_span(id, b, None, &mut spans);
+                if !(stored && gpu_copy_apart(b)) {
+                    self.buffer_span(id, b, None, &mut spans);
+                }
             } else if let Some(t) = any.downcast_ref::<TextureObject>() {
                 match &t.under {
+                    Some(Under::Buffer(buffer, _)) if stored && gpu_copy_apart(buffer) => {}
                     Some(Under::Buffer(buffer, bytes)) => {
                         if let Some(bid) = id_at(buffer.id().0) {
                             self.buffer_span(bid, buffer, Some(bytes.clone()), &mut spans);
@@ -2619,22 +2797,24 @@ impl State {
 
     /// Writes each 4 KiB of `spans` whose bytes changed since the stream last held them.
     fn capture(&self, spans: &[Span]) {
-        self.compare(spans, Compare::Commit);
+        let writes = self.compare(spans, Compare::Commit);
+        writes.into_iter().for_each(|w| self.push(Item::Write(w)));
     }
 
     /// Writes each 4 KiB of `spans` whose bytes differ from the stream's or from those its last
     /// write of them recorded, or that no write recorded ([`before_modify`]).
     fn announce(&self, spans: &[Span]) {
-        self.compare(spans, Compare::Announce);
+        let writes = self.compare(spans, Compare::Announce);
+        writes.into_iter().for_each(|w| self.push(Item::Write(w)));
     }
 
-    /// Compares each 4 KiB of `spans` with the stream's: a chunk `how` writes is written as a
-    /// write, its bytes then both its comparison point and its recorded bytes; else, where `how`
-    /// absorbs, its bytes are only taken as the stream's. A target released since its span was
-    /// read is skipped: its release ([`released`]) marks it so before it takes the comparison
-    /// points' lock, and the object goes only after that, so a target found live stays mapped
-    /// while it is read.
-    fn compare(&self, spans: &[Span], how: Compare) {
+    /// Compares each 4 KiB of `spans` with the stream's: a chunk `how` writes is in the answer,
+    /// one `m2v.write` a target, for the caller to queue, its bytes then both its comparison
+    /// point and its recorded bytes; else, where `how` absorbs, its bytes are only taken as the
+    /// stream's. A target released since its span was read is skipped: its release
+    /// ([`released`]) marks it so before it takes the comparison points' lock, and the object
+    /// goes only after that, so a target found live stays mapped while it is read.
+    fn compare(&self, spans: &[Span], how: Compare) -> Vec<Call> {
         let t0 = now_ns();
         let mut writes: BTreeMap<u64, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
         let (mut hashed, mut refreshed) = (0, 0);
@@ -2680,7 +2860,7 @@ impl State {
                         continue;
                     };
                     let write = match how {
-                        Compare::Commit => slot.point != h,
+                        Compare::Commit | Compare::Complete => slot.point != h,
                         Compare::Announce => {
                             slot.point != h || slot.recorded != h || slot.recorded == 0
                         }
@@ -2712,6 +2892,7 @@ impl State {
         s.chunks_hashed.fetch_add(hashed, Ordering::Relaxed);
         s.chunks_refreshed.fetch_add(refreshed, Ordering::Relaxed);
         let (mut written, mut bytes) = (0, 0);
+        let mut calls = Vec::with_capacity(writes.len());
         for (target, chunks) in writes {
             let mut args = Vec::with_capacity(chunks.len() * 2);
             for (off, data) in chunks {
@@ -2721,16 +2902,22 @@ impl State {
                 // A chunk of `BLOB_MIN` bytes or more is written as a blob ([`blob_long`]).
                 args.push(Value::Bytes(data));
             }
-            self.push(Item::Write(Call {
+            calls.push(Call {
                 selector: "m2v.write".to_owned(),
                 receiver: target,
                 args,
                 ..Call::default()
-            }));
+            });
         }
         s.chunks_written.fetch_add(written, Ordering::Relaxed);
         s.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if how == Compare::Complete {
+            (s.completion_chunks_hashed).fetch_add(hashed, Ordering::Relaxed);
+            (s.completion_chunks_written).fetch_add(written, Ordering::Relaxed);
+            (s.completion_write_bytes).fetch_add(bytes, Ordering::Relaxed);
+        }
         s.write_ns.fetch_add(now_ns() - t1, Ordering::Relaxed);
+        calls
     }
 
     /// Counts the 8-byte words of `data` that lie in a live pinned range: at 8-aligned offsets,
@@ -2803,6 +2990,30 @@ fn upgrade_cb(weak: &Weak<dyn Any + Send + Sync>) -> Option<Arc<CommandBufferObj
     }
 }
 
+/// `MTLResourceUsageWrite`.
+const USAGE_WRITE: u64 = 2;
+
+/// Whether what `call`, on an object of type `recv_type`, reaches is memory a kernel or a render
+/// stage could store to: a call of a compute or render encoder, but a `useResources:` whose
+/// usage holds no write, which Metal's residency takes as the GPU's word that it only reads them.
+/// The recorder knows no pipeline's arguments, so any buffer, texture or heap such a call binds
+/// is taken as written, and so are the resources an argument buffer names, as `useResources:`
+/// with a write and `useHeaps:` name them, and what an indirect command buffer's commands bind.
+fn may_store(recv_type: &str, call: &Call) -> bool {
+    let compute = std::any::type_name::<crate::gpu::predication::PredicatedEncoder>();
+    let render = std::any::type_name::<crate::gpu::encode_render::RenderEncoderObject>();
+    if recv_type != compute && recv_type != render {
+        return false;
+    }
+    if !call.selector.starts_with("useResources:count:usage:") {
+        return true;
+    }
+    match call.args.get(1) {
+        Some(Value::Uint(usage)) => usage & USAGE_WRITE != 0,
+        _ => true,
+    }
+}
+
 /// What the blit `call`, naming `named`, writes: each object with the byte range of it written,
 /// all of it where `None`. A copy between buffers and a fill write their ranges; a copy from the
 /// guest's RAM each run's bytes from where it lands, and one into the guest's RAM no object; any
@@ -2850,6 +3061,12 @@ fn blit_writes(call: &Call, named: &[u64]) -> Vec<(u64, Option<(u64, u64)>)> {
         let written = named.iter().skip(usize::from(named.len() > 1));
         written.map(|&id| (id, None)).collect()
     })
+}
+
+/// Whether the GPU's work writes a copy of `b` apart from the CPU's: a `Managed` buffer of a
+/// device that keeps two copies of one.
+fn gpu_copy_apart(b: &BufferObject) -> bool {
+    b.raw.storage_mode().raw() == MANAGED && !b.device.raw.properties().has_unified_memory
 }
 
 /// Whether the command buffer completed or failed.

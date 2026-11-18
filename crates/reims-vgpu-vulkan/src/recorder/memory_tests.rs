@@ -1,10 +1,12 @@
 //! The memory a recording holds, on the Vulkan platform: what reaches the stream as `m2v.write`
-//! records around commits ([`super::before_commit`]) and announces ([`super::before_modify`]).
+//! records around commits ([`super::before_commit`]), completions ([`super::completion_seen`])
+//! and announces ([`super::before_modify`]).
 //! The recorder is the process's, started once, so each test records in a child copy of the
 //! test binary of its own ([`in_recording_child`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::format::{self, Record, Value};
@@ -17,16 +19,17 @@ use crate::core::platform::command::{
 };
 use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
 use crate::core::platform::device::GpuDevice as _;
+use crate::core::platform::event::{EventRef, SharedEvent as _};
 use crate::core::platform::icb::{
     IcbComputeCmd, IndirectCommandBuffer as _, IndirectComputeCommand as _,
 };
-use crate::core::platform::resource::{Buffer as _, Heap as _};
-use crate::core::platform::types::NsRange;
+use crate::core::platform::resource::{Buffer as _, Heap as _, Library as _};
+use crate::core::platform::types::{MtlSize, NsRange};
 use crate::core::platform::values::IcbDesc;
 use crate::core::raise::OnFault;
 use crate::gpu::command::{VulkanCommandBuffer, VulkanCommandQueue};
 use crate::gpu::icb::VulkanIcb;
-use crate::gpu::resource::{VulkanBuffer, VulkanHeap};
+use crate::gpu::resource::{VulkanBuffer, VulkanComputePipeline, VulkanHeap};
 use crate::platform::VulkanPlatform;
 
 /// The marker that makes a run of a recording test its child, which records: the test's name.
@@ -34,6 +37,15 @@ const RECORD_CHILD: &str = "REIMS_VGPU_RECORDER_CHILD";
 
 /// The bytes of the block the tests' buffer fills.
 const BLOCK: u64 = 0x1_0000;
+
+/// `inc_k`: one thread adds 1 to `c[0]`, and marks `c[n]` with `n * 0x11` below 16.
+const INC: &[u8] = include_bytes!("../../../../tests/shaders/compute_inc.metallib");
+
+/// `MTLResourceUsageRead`.
+const READ: u64 = 1;
+
+/// `MTLResourceUsageRead | MTLResourceUsageWrite`.
+const READ_WRITE: u64 = 3;
 
 /// Runs `body` in a child copy of this test binary that records into a scratch directory of its
 /// own, `body` given the directory its stream goes into; in the child, runs it.
@@ -247,6 +259,44 @@ impl Rig {
         icb
     }
 
+    /// Encodes in `cb` a compute encoder of its own that runs one thread of `inc` ([`INC`]) on
+    /// `c`, and, where `used` names one, makes that buffer resident with that usage first
+    /// (`useResources:count:usage:`).
+    fn count(
+        &self,
+        cb: &VulkanCommandBuffer,
+        inc: &VulkanComputePipeline,
+        c: &VulkanBuffer,
+        used: Option<(&VulkanBuffer, u64)>,
+    ) {
+        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+        let buffers = [Some(c)];
+        let resources = used.map(|(b, usage)| ([Some(ResourceRef::Buffer(b))], usage));
+        let mut cmds = Vec::new();
+        if let Some((resources, usage)) = &resources {
+            cmds.push(ComputeCmd::UseResources {
+                resources,
+                usage: *usage,
+            });
+        }
+        cmds.extend([
+            ComputeCmd::SetComputePipelineState { state: Some(inc) },
+            ComputeCmd::SetBuffers {
+                buffers: &buffers,
+                offsets: &[0],
+                range: NsRange::new(0, 1),
+            },
+            ComputeCmd::DispatchThreads {
+                threads_per_grid: MtlSize::new(1, 1, 1),
+                threads_per_threadgroup: MtlSize::new(1, 1, 1),
+            },
+            ComputeCmd::EndEncoding,
+        ]);
+        for cmd in cmds {
+            e.encode(OnFault::Return, cmd).unwrap();
+        }
+    }
+
     /// Encodes in `cb` an execution of `icb`'s command, in a compute encoder of its own that
     /// names nothing else.
     fn execute(&self, cb: &VulkanCommandBuffer, icb: &VulkanIcb) {
@@ -259,6 +309,44 @@ impl Rig {
             e.encode(OnFault::Return, cmd).unwrap();
         }
     }
+}
+
+/// The pipeline of `inc_k` ([`INC`]).
+fn inc_pipeline() -> VulkanComputePipeline {
+    let d = crate::gpu::device::tests::dev();
+    let library = d.new_library(INC).unwrap().unwrap().unwrap();
+    let f = library.new_function(OnFault::Return, "inc_k").unwrap();
+    d.new_compute_pipeline_state_for_function(f.as_ref())
+        .unwrap()
+        .unwrap()
+}
+
+/// The host address of `b`'s bytes, a `Shared` buffer's.
+fn base_of(b: &VulkanBuffer) -> usize {
+    b.contents().as_ptr::<u8>().addr()
+}
+
+/// What `inc_k` ([`INC`]) leaves in a chunk of zeros it ran on once: `c[0]` and `c[1]`, 1 and
+/// `0x11`.
+fn counted_once() -> Vec<u8> {
+    chunk(&[(1, 1), (0, 3), (0x11, 1)])
+}
+
+/// The bytes each `m2v.write` record of `target` among `records[range]` writes at its byte `at`,
+/// in the stream's order.
+fn writes_at(
+    records: &[Record],
+    target: u64,
+    range: std::ops::Range<usize>,
+    at: u64,
+) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for i in range {
+        if let Some(bytes) = writes_of(records, target, i..i + 1).remove(&at) {
+            out.push(bytes);
+        }
+    }
+    out
 }
 
 /// Writes `value` into `bytes` from the host address `base`, as the CPU: the tests' buffer's.
@@ -409,8 +497,8 @@ fn on_vulkan_chunks_a_copy_writes_whole_are_taken_at_completion() {
     });
 }
 
-/// The chunk a fill wrote only part of is written before the next commit that reaches it, the
-/// GPU's bytes with the rest of it.
+/// The chunk a fill wrote only part of is written at its command buffer's completion, before the
+/// next commit, the GPU's bytes with the rest of it.
 #[test]
 fn on_vulkan_a_chunk_a_fill_writes_part_of_is_written() {
     let test = "recorder::memory_tests::on_vulkan_a_chunk_a_fill_writes_part_of_is_written";
@@ -642,5 +730,150 @@ fn on_vulkan_an_announce_of_recorded_bytes_writes_nothing() {
         let w = writes_before_announces(streams, &m, 2);
         assert_eq!(w[0].len(), 2, "the CPU's write");
         assert_eq!(w[1], BTreeMap::new());
+    });
+}
+
+/// A CPU write that puts back what a kernel changed is written: a counter a kernel added to,
+/// zeroed again by the CPU, is written with the kernel's bytes at its command buffer's
+/// completion, after its commit, and with the zeros before the next commit that reaches it.
+#[test]
+fn on_vulkan_a_cpu_write_that_restores_what_a_kernel_changed_is_written() {
+    let test = "recorder::memory_tests::on_vulkan_a_cpu_write_that_restores_what_a_kernel_changed_is_written";
+    in_recording_child(test, |streams| {
+        let (r, inc) = (Rig::new(), inc_pipeline());
+        write_at(base_of(&r.z), 0..4096, 0);
+        let first = r.command_buffer();
+        r.count(&first, &inc, &r.z, None);
+        run(&first);
+        write_at(base_of(&r.z), 0..8, 0);
+        let second = r.command_buffer();
+        r.count(&second, &inc, &r.z, None);
+        run(&second);
+        let z = id_at(r.z.id().0).expect("the buffer is recorded");
+        let records = records_once(streams, |rs| place(rs, "commit", 1).is_some());
+        let commits = [0, 1].map(|n| place(&records, "commit", n).expect("a commit's record"));
+        let between = writes_at(&records, z, commits[0]..commits[1], 0);
+        assert_eq!(between, vec![counted_once(), bytes(0, 4096)]);
+        assert_eq!(
+            writes_at(&records, z, 0..commits[0], 0),
+            vec![bytes(0, 4096)]
+        );
+    });
+}
+
+/// A CPU write made while a kernel's command buffer runs, into a chunk the kernel stores to, is
+/// written with the kernel's bytes at the completion: the stream's bytes are not taken as the
+/// GPU's without a write there.
+#[test]
+fn on_vulkan_a_cpu_write_while_a_kernel_runs_is_written() {
+    let test = "recorder::memory_tests::on_vulkan_a_cpu_write_while_a_kernel_runs_is_written";
+    in_recording_child(test, |streams| {
+        let (r, inc) = (Rig::new(), inc_pipeline());
+        write_at(base_of(&r.z), 0..4096, 0);
+        let gate = crate::gpu::device::tests::dev().new_shared_event().unwrap();
+        let held = r.command_buffer();
+        held.encode_wait(Some(EventRef::Shared(&gate)), 1).unwrap();
+        r.count(&held, &inc, &r.z, None);
+        held.commit(OnFault::Return).unwrap();
+        write_at(base_of(&r.z), 1024..1040, 0x5e);
+        gate.set_signaled_value(1).unwrap();
+        held.wait_until_completed(OnFault::Return).unwrap();
+        let next = r.command_buffer();
+        r.read_back(&next);
+        run(&next);
+        let z = id_at(r.z.id().0).expect("the buffer is recorded");
+        let records = records_once(streams, |rs| place(rs, "commit", 1).is_some());
+        let commits = [0, 1].map(|n| place(&records, "commit", n).expect("a commit's record"));
+        let mut both = counted_once();
+        both[1024..1040].fill(0x5e);
+        assert_eq!(
+            writes_at(&records, z, commits[0]..commits[1], 0),
+            vec![both]
+        );
+    });
+}
+
+/// What a blit writes whole is still taken as the stream's without a write where a kernel runs
+/// beside it in its command buffer, and the kernel's bytes are written at the completion.
+#[test]
+fn on_vulkan_a_blits_chunks_beside_a_kernel_are_taken_without_a_write() {
+    let test = "recorder::memory_tests::on_vulkan_a_blits_chunks_beside_a_kernel_are_taken_without_a_write";
+    in_recording_child(test, |streams| {
+        let (r, inc) = (Rig::new(), inc_pipeline());
+        write_at(base_of(&r.z), 0..4096, 0);
+        let source = crate::gpu::resource::tests::shared(8192);
+        write_at(base_of(&source), 0..8192, 0x44);
+        let both = r.command_buffer();
+        r.copy_in(&both, &source, 0..8192);
+        r.count(&both, &inc, &r.z, None);
+        run(&both);
+        let next = r.command_buffer();
+        r.read_back(&next);
+        run(&next);
+        let z = id_at(r.z.id().0).expect("the buffer is recorded");
+        let records = records_once(streams, |rs| place(rs, "commit", 1).is_some());
+        let commits = [0, 1].map(|n| place(&records, "commit", n).expect("a commit's record"));
+        let block = writes_of(&records, r.block(), commits[0]..commits[1]);
+        assert_eq!(block.get(&0), None, "the copy's own bytes are the stream's");
+        assert_eq!(
+            block.get(&4096),
+            None,
+            "the copy's own bytes are the stream's"
+        );
+        let kernel = writes_at(&records, z, commits[0]..commits[1], 0);
+        assert_eq!(kernel, vec![counted_once()]);
+    });
+}
+
+/// A completion hashes only what a kernel could store to: of a command buffer whose kernel binds
+/// one chunk and that makes a block buffer of 16 resident for reading, the one chunk; with the
+/// block buffer resident for writing too, all 17.
+#[test]
+fn on_vulkan_a_completion_hashes_only_what_a_kernel_could_store_to() {
+    let test =
+        "recorder::memory_tests::on_vulkan_a_completion_hashes_only_what_a_kernel_could_store_to";
+    in_recording_child(test, |_| {
+        let (r, inc) = (Rig::new(), inc_pipeline());
+        let hashed = || {
+            let stats = &state().expect("the child records").stats;
+            stats.completion_chunks_hashed.load(Ordering::Relaxed)
+        };
+        let read = r.command_buffer();
+        r.count(&read, &inc, &r.z, Some((&r.y, READ)));
+        let was = hashed();
+        run(&read);
+        assert_eq!(hashed() - was, 1, "the bound chunk alone");
+        let written = r.command_buffer();
+        r.count(&written, &inc, &r.z, Some((&r.y, READ_WRITE)));
+        let was = hashed();
+        run(&written);
+        assert_eq!(
+            hashed() - was,
+            1 + BLOCK / 4096,
+            "the bound chunk and the block's"
+        );
+    });
+}
+
+/// A CPU write that puts back what a fill wrote in part of a chunk is written: the chunk is
+/// written with the fill's bytes at the completion, and with the CPU's before the next commit
+/// that reaches it.
+#[test]
+fn on_vulkan_a_cpu_write_that_restores_what_a_fill_wrote_part_of_is_written() {
+    let test = "recorder::memory_tests::on_vulkan_a_cpu_write_that_restores_what_a_fill_wrote_part_of_is_written";
+    in_recording_child(test, |streams| {
+        let r = Rig::new();
+        r.write(0..4096, 0);
+        let filled = r.command_buffer();
+        r.fill(&filled, 0..256, 0x01);
+        run(&filled);
+        r.write(0..256, 0);
+        let next = r.command_buffer();
+        r.read_back(&next);
+        run(&next);
+        let records = records_once(streams, |rs| place(rs, "commit", 1).is_some());
+        let commits = [0, 1].map(|n| place(&records, "commit", n).expect("a commit's record"));
+        let between = writes_at(&records, r.block(), commits[0]..commits[1], 0);
+        assert_eq!(between, vec![chunk(&[(0x01, 256)]), bytes(0, 4096)]);
     });
 }
