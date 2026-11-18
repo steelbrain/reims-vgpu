@@ -1510,7 +1510,10 @@ struct Cb {
 impl Cb {
     /// Notes that its GPU work writes `bytes` of the object `id`, all of it where `None`.
     fn writes(&mut self, id: u64, bytes: Option<(u64, u64)>) {
-        let held = self.gpu_writes.entry(id).or_insert_with(|| Some(Vec::new()));
+        let held = self
+            .gpu_writes
+            .entry(id)
+            .or_insert_with(|| Some(Vec::new()));
         match (held, bytes) {
             (Some(ranges), Some(range)) => ranges.push(range),
             (held, _) => *held = None,
@@ -2709,19 +2712,20 @@ fn blit_writes(call: &Call, named: &[u64]) -> Vec<(u64, Option<(u64, u64)>)> {
             Value::Object(b) => Some(vec![(*b, range(*at, *len))]),
             _ => Some(Vec::new()),
         },
-        ("m2v.copyFromGuestRam" | "m2v.copyFromGuestRamAt", [Value::Object(b), Value::List(runs)]) => {
-            (runs.iter())
-                .map(|run| match run {
-                    Value::List(r) => match r.as_slice() {
-                        [Value::Uint(at), Value::Bytes(data)] => {
-                            Some((*b, range(*at, data.len() as u64)))
-                        }
-                        _ => None,
-                    },
+        (
+            "m2v.copyFromGuestRam" | "m2v.copyFromGuestRamAt",
+            [Value::Object(b), Value::List(runs)],
+        ) => (runs.iter())
+            .map(|run| match run {
+                Value::List(r) => match r.as_slice() {
+                    [Value::Uint(at), Value::Bytes(data)] => {
+                        Some((*b, range(*at, data.len() as u64)))
+                    }
                     _ => None,
-                })
-                .collect()
-        }
+                },
+                _ => None,
+            })
+            .collect(),
         ("m2v.copyToGuestRam", _) => Some(Vec::new()),
         _ => None,
     };

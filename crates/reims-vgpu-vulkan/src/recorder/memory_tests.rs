@@ -339,7 +339,8 @@ fn on_vulkan_a_cpu_write_beside_a_running_fill_is_written() {
 /// reaches it, and one into the other before the commit after.
 #[test]
 fn on_vulkan_chunks_a_copy_writes_whole_are_taken_at_completion() {
-    let test = "recorder::memory_tests::on_vulkan_chunks_a_copy_writes_whole_are_taken_at_completion";
+    let test =
+        "recorder::memory_tests::on_vulkan_chunks_a_copy_writes_whole_are_taken_at_completion";
     in_recording_child(test, |streams| {
         let r = Rig::new();
         let source = crate::gpu::resource::tests::shared(8192);
@@ -357,7 +358,11 @@ fn on_vulkan_chunks_a_copy_writes_whole_are_taken_at_completion() {
         run(&third);
         let w = writes_between_commits(streams, r.block(), 3);
         assert_eq!(w[0].get(&0), Some(&chunk(&[(0x55, 16), (0x44, 4080)])));
-        assert_eq!(w[0].get(&4096), None, "the copy's own bytes are the stream's");
+        assert_eq!(
+            w[0].get(&4096),
+            None,
+            "the copy's own bytes are the stream's"
+        );
         assert_eq!(w[1].get(&4096), Some(&chunk(&[(0x66, 16), (0x44, 4080)])));
     });
 }
@@ -394,9 +399,13 @@ fn on_vulkan_writes_its_handlers_make_are_written() {
         r.copy_in(&copied, &source, 0..8192);
         let base = r.y.contents().as_ptr::<u8>().addr();
         let seen: CompletedHandler = Box::new(move |_| write_at(base, 0..16, 0x77));
-        copied.add_completion_seen_handler(OnFault::Return, seen).unwrap();
+        copied
+            .add_completion_seen_handler(OnFault::Return, seen)
+            .unwrap();
         let completed: CompletedHandler = Box::new(move |_| write_at(base, 4096..4112, 0x78));
-        copied.add_completed_handler(OnFault::Return, completed).unwrap();
+        copied
+            .add_completed_handler(OnFault::Return, completed)
+            .unwrap();
         run(&copied);
         let next = r.command_buffer();
         r.read_back(&next);
