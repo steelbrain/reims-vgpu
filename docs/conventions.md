@@ -124,7 +124,11 @@ repeats the ones code cites.
     `queue-ring-post-waited`) and its
     decoder's (`two-ranges-kept-whole`, a command buffer dealt to two
     threads that the platform kept whole at a chunk's end, which fails at
-    its stand-in), and the Vulkan platform's command predication's
+    its stand-in; `read-only-pages-buffers`, the no-copy buffers it made
+    over pages their process maps read-only, and `read-only-pages-kib`,
+    their bytes' sum in KiB, rounded up: a copy of each on Linux and
+    Windows, and no degradation on macOS, where the platform imports the
+    pages in place), and the Vulkan platform's command predication's
     (`predication-loop-overrun`, a command buffer whose loop ran past the
     iterations laid down for it, which fails); a boot's degradations are
     read from its last such line. `reims-vgpu INFO reims_vgpu_vulkan::core::logging: lines

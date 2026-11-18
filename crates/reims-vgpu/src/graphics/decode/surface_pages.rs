@@ -109,6 +109,11 @@
 //! writable block or a surface's block, whose buffers lie in its import, takes only a cached view
 //! that has one, and makes its own otherwise. Such an import served nothing, and on a device that
 //! lists every live import in every submission (RADV) cost each submission while it lived.
+//! These buffers are the only no-copy buffers or heaps the device makes over pages their process
+//! maps read-only: a heap, an indirect command buffer's slots and a Managed object's CPU copy over
+//! such a block are refused. Each one made is counted, with its bytes, in the degradation counts'
+//! line, on every host (`read-only-pages-buffers` and `read-only-pages-kib`,
+//! [`READ_ONLY_PAGES_BUFFERS`]).
 //! **Measured** 2026-11-16 on homelab-um790-xtx-1, a macOS 26.7.2 guest's desktop walk: 101 to
 //! 137 of the live pages blocks were read-only blocks with a view (m3-max-38623, traced), and
 //! with none of their views imported each submission during the window drags listed 105 to 111
@@ -291,7 +296,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_HEAP_OVER_PAGES, RGFX_SURFACE_PAGES_PLANES,
@@ -2370,6 +2375,34 @@ fn make_view<P: Platform>(
 /// one kind of object that lies over a block of pages its process maps read-only.
 pub(crate) const READ_ONLY_OPTION: u32 = 1 << 24;
 
+/// The kind a buffer made over a block of pages its process maps read-only
+/// (`RGFX_SURFACE_PAGES_READ_ONLY`) is counted as, once each, in the degradation counts' line
+/// (`reims_vgpu_vulkan::answer::degradation_counts`, docs/conventions.md; the module doc,
+/// "Read-only pages blocks"). It is counted on every host: on Linux and Windows the platform
+/// makes each such buffer over a copy of its pages, and on macOS it imports them in place,
+/// where the buffer is no degradation.
+pub(crate) const READ_ONLY_PAGES_BUFFERS: &str = "read-only-pages-buffers";
+
+/// The kind the bytes of the buffers counted as [`READ_ONLY_PAGES_BUFFERS`] are counted as, in
+/// KiB: their sum's, rounded up.
+pub(crate) const READ_ONLY_PAGES_KIB: &str = "read-only-pages-kib";
+
+/// The bytes of the buffers this process counted as [`READ_ONLY_PAGES_BUFFERS`], whose KiB
+/// [`READ_ONLY_PAGES_KIB`] counts.
+static READ_ONLY_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a buffer of `length` bytes made over a block of pages its process maps read-only
+/// ([`READ_ONLY_PAGES_BUFFERS`], [`READ_ONLY_PAGES_KIB`]): the KiB counted grow to the KiB of
+/// the bytes' new sum, rounded up. A diagnostic: the guest sees nothing of it.
+fn count_read_only_pages_buffer(length: u64) {
+    use reims_vgpu_vulkan::answer::{count_kind, count_kind_by};
+    count_kind(READ_ONLY_PAGES_BUFFERS);
+    let before = READ_ONLY_BYTES.fetch_add(length, Ordering::Relaxed);
+    let kib = |bytes: u64| bytes.div_ceil(1024);
+    let (from, to) = (kib(before), kib(before.saturating_add(length)));
+    count_kind_by(READ_ONLY_PAGES_KIB, to.saturating_sub(from));
+}
+
 /// A Shared buffer of `options` over the `length` bytes at `offset` in `view`, at GPU address
 /// `pin` where given, which holds the view until the platform frees it.
 pub(crate) fn buffer_over<P: Platform>(
@@ -2540,7 +2573,8 @@ impl<P: Platform> super::GraphicsDecoder<P> {
     /// its context's, or a range past its view, is refused, and so is a buffer longer than the
     /// device's `maxBufferLength` ([`Self::past_max_buffer_length`]) and a buffer over a block
     /// of pages its process maps read-only whose options do not drop its GPU writes
-    /// ([`Self::read_only_pages_admit`]).
+    /// ([`Self::read_only_pages_admit`]). A buffer made over such a block is counted, with its
+    /// length ([`READ_ONLY_PAGES_BUFFERS`], [`READ_ONLY_PAGES_KIB`]).
     pub(super) fn buffer_over_pages(
         &self,
         device: &P::Device,
@@ -2601,7 +2635,14 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             .over(Some((m.block_offset, m.block_size)))
             .with_bytes(Some(bytes));
         self.store(m.obj_id, entry);
-        (self.shared.surface_views.lock()).buffer_made(m.block_offset, m.obj_id);
+        let read_only = {
+            let mut views = self.shared.surface_views.lock();
+            views.buffer_made(m.block_offset, m.obj_id);
+            views.private_read_only(m.block_offset)
+        };
+        if read_only {
+            count_read_only_pages_buffer(m.length);
+        }
         Ok(Ok(()))
     }
 
@@ -4401,6 +4442,49 @@ pub(super) mod tests {
             ),
             RGFX_STATUS_INVALID_ARGUMENT
         );
+    }
+
+    /// A buffer made over a block of pages its process maps read-only is counted in the
+    /// degradation counts, once each, with its bytes' KiB, of their sum rounded up
+    /// (`read-only-pages-buffers`, `read-only-pages-kib`); a buffer over a writable pages block,
+    /// with bit 24 or without, and one refused over the read-only block are not
+    #[test]
+    fn a_buffer_over_read_only_pages_is_counted_with_its_bytes() {
+        let mut r = rig(16);
+        let page = r.page;
+        let read_only = RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_READ_ONLY;
+        let writable = BLOCK + 0x8000;
+        let length = 4 * page;
+        assert_eq!(
+            r.pages_flagged(BLOCK, 0, &[(0, 4)], length, read_only),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(
+            r.pages_flagged(writable, 0, &[(8, 4)], length, RGFX_SURFACE_PAGES_PRIVATE),
+            RGFX_STATUS_OK
+        );
+        // The process's counts, which another test in it may have counted before.
+        let counted = |code: &str| {
+            (reims_vgpu_vulkan::answer::degradation_counts().into_iter())
+                .find(|(c, _)| c == code)
+                .map_or(0, |(_, n)| n)
+        };
+        let codes = (READ_ONLY_PAGES_BUFFERS, READ_ONLY_PAGES_KIB);
+        let counts = || (counted(codes.0), counted(codes.1));
+        let (buffers, kib) = counts();
+        let bit = READ_ONLY_OPTION;
+        assert_eq!(r.pages_buffer_of(10, 0, writable, 0, page, 0), Ok(()));
+        assert_eq!(r.pages_buffer_of(11, 0, writable, 0, page, bit), Ok(()));
+        assert_eq!(
+            r.pages_buffer_of(12, 0, BLOCK, 0, page, 0),
+            Err(DecodeError::Refused)
+        );
+        assert_eq!(counts(), (buffers, kib), "none counted");
+        // 0x1001 and 0x3ff bytes: 5 KiB together, where each rounded up alone would be 6.
+        assert_eq!(r.pages_buffer_of(13, 0, BLOCK, 0, 0x1001, bit), Ok(()));
+        assert_eq!(counts().0, buffers + 1);
+        assert_eq!(r.pages_buffer_of(14, 0, BLOCK, 0, 0x3ff, bit), Ok(()));
+        assert_eq!(counts(), (buffers + 2, kib + 5));
     }
 
     /// A read-only pages block's view is mapped with no import: its buffers, of bit 24, lie over

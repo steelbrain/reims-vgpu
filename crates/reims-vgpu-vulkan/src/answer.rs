@@ -2685,11 +2685,13 @@ pub fn out_of_host_memory_count() -> u64 {
     OUT_OF_HOST_MEMORY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The kinds counted by code ([`count_kind`]), each with how many times: `reims-vgpu`'s, as its
-/// reims-graphics device tells it of its completion rings (`control-ring-full`,
-/// `control-ring-post-waited`, `vblank-dropped`, `queue-ring-full`, `queue-ring-post-waited`),
-/// and as its decoder keeps a buffer dealt to two threads whole (`two-ranges-kept-whole`); and
-/// this platform's command predication's, a command buffer a loop ran past its copies in
+/// The kinds counted by code ([`count_kind`], [`count_kind_by`]), each with how many times:
+/// `reims-vgpu`'s, as its reims-graphics device tells it of its completion rings
+/// (`control-ring-full`, `control-ring-post-waited`, `vblank-dropped`, `queue-ring-full`,
+/// `queue-ring-post-waited`), as its decoder keeps a buffer dealt to two threads whole
+/// (`two-ranges-kept-whole`), and as it makes a no-copy buffer over pages their process maps
+/// read-only (`read-only-pages-buffers`, and their bytes' KiB, `read-only-pages-kib`); and this
+/// platform's command predication's, a command buffer a loop ran past its copies in
 /// (`predication-loop-overrun`, [`crate::gpu::predication::OVERRUN_CODE`]).
 static COUNTED: crate::core::sync::Mutex<Vec<(&'static str, u64)>> =
     crate::core::sync::Mutex::new(Vec::new());
@@ -2698,10 +2700,19 @@ static COUNTED: crate::core::sync::Mutex<Vec<(&'static str, u64)>> =
 /// tables, which [`degradation_counts`] gives with the rest. Its line is the caller's to log, once
 /// per kind (docs/conventions.md).
 pub fn count_kind(code: &'static str) {
+    count_kind_by(code, 1);
+}
+
+/// Counts `n` more of the kind of code `code` ([`count_kind`]): a kind whose count is an amount,
+/// such as bytes, rather than how many times it was met. None is nothing.
+pub fn count_kind_by(code: &'static str, n: u64) {
+    if n == 0 {
+        return;
+    }
     let mut counted = COUNTED.lock();
     match counted.iter_mut().find(|(c, _)| *c == code) {
-        Some((_, n)) => *n += 1,
-        None => counted.push((code, 1)),
+        Some((_, k)) => *k = k.saturating_add(n),
+        None => counted.push((code, n)),
     }
 }
 
@@ -2964,6 +2975,21 @@ mod tests {
         count_kind(code);
         count_kind(code);
         assert_eq!(counted(), Some((code.to_owned(), 2)));
+    }
+
+    /// A kind counted by an amount ([`count_kind_by`]) is in the degradation counts with the sum
+    /// of its amounts, a kind counted once a time added to it alike, and an amount of none counts
+    /// nothing, so a kind met with none is not in them
+    #[test]
+    fn a_kind_counted_by_an_amount_sums_its_amounts() {
+        let (code, none) = ("test-counted-by-amount", "test-counted-by-none");
+        let counted = |code: &str| (degradation_counts().into_iter()).find(|(c, _)| c == code);
+        count_kind_by(code, 6);
+        count_kind_by(code, 3);
+        count_kind(code);
+        assert_eq!(counted(code), Some((code.to_owned(), 10)));
+        count_kind_by(none, 0);
+        assert_eq!(counted(none), None);
     }
 
     /// Every kind of degradation the runtime has is placed here once: it dies ([`DIES`]), a
