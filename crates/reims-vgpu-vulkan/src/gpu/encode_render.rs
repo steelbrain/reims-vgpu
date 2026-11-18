@@ -1269,55 +1269,76 @@ pub(crate) fn open(
     descriptor: &VulkanRenderPassDescriptor,
 ) -> RaiseResult<Option<VulkanRenderEncoder>> {
     command_buffer.protected_creation("renderCommandEncoderWithDescriptor:");
-    if let Some((attachment, setter, raw)) = descriptor.raw_value() {
-        crate::answer::metal_aborts(
-            "renderCommandEncoderWithDescriptor:",
-            &format!(
-                "a pass whose {attachment} holds {raw:#x} from {setter}, which Metal's validation \
-                 refuses"
-            ),
-        );
-    }
-    let (mut d, map) = descriptor.pass();
-    let sources = descriptor.sources();
-    if crate::os::COPIES_READ_ONLY
-        && let Some(what) = kept_attachment(&d, &sources)
-    {
-        crate::gpu::writes::kept_write("renderCommandEncoderWithDescriptor:", what);
-    }
-    // The colour resolves into a texture of another format, decided by the rate map the pass
-    // takes, as it takes it.
-    let settled = |d: &mut rt::RenderPassDescriptor, mapped: PassMap| {
-        if let Some(what) = refused_resolve_format(d, &sources, mapped) {
-            unrepresentable("renderCommandEncoderWithDescriptor:", &what);
+    // The pass is read under the descriptor's one hold, and borrowed where nothing of it is
+    // changed for the runtime: no rate map and no resolve texture.
+    descriptor.held(|held| {
+        if let Some((attachment, setter, raw)) = held.raw_value() {
+            crate::answer::metal_aborts(
+                "renderCommandEncoderWithDescriptor:",
+                &format!(
+                    "a pass whose {attachment} holds {raw:#x} from {setter}, which Metal's \
+                     validation refuses"
+                ),
+            );
         }
-        untouched_resolves(d, &sources, mapped)
-    };
-    let made = match map {
-        None => {
-            let dropped = settled(&mut d, PassMap::Unmapped);
-            make(command_buffer, &mut d, dropped, Taken::UNMAPPED)
+        let sources = &held.sources;
+        if crate::os::COPIES_READ_ONLY
+            && let Some(what) = kept_attachment(&held.desc, sources)
+        {
+            crate::gpu::writes::kept_write("renderCommandEncoderWithDescriptor:", what);
         }
-        Some(map) => map.for_pass(command_buffer, |raw, class| {
-            let mapped = match class {
-                Class::Unset => PassMap::Unset,
-                Class::NoLayers | Class::Identity => PassMap::Identity,
-                Class::Varying => PassMap::Varying,
-            };
-            let dropped = settled(&mut d, mapped);
-            d.rasterization_rate_map = Some(raw);
-            let taken = Taken {
-                class: Some(class),
-                mutable: map.is_mutable(),
-            };
-            make(command_buffer, &mut d, dropped, taken)
-        }),
-    };
-    if let Ok(Some(e)) = &made {
-        e.undecided_dropped(&sources);
-        e.read_only_stores(&sources);
-    }
-    made
+        // The colour resolves into a texture of another format, decided by the rate map the pass
+        // takes, as it takes it.
+        let settled = |d: &mut rt::RenderPassDescriptor, mapped: PassMap| {
+            if let Some(what) = refused_resolve_format(d, sources, mapped) {
+                unrepresentable("renderCommandEncoderWithDescriptor:", &what);
+            }
+            let dropped = untouched_resolves(d, sources, mapped);
+            without_unused_resolves(d);
+            dropped
+        };
+        let made = match &held.rate_map {
+            None if !has_resolve_texture(&held.desc) => {
+                make(command_buffer, &held.desc, Vec::new(), Taken::UNMAPPED)
+            }
+            None => {
+                let mut d = plain(|| held.desc.clone());
+                let dropped = settled(&mut d, PassMap::Unmapped);
+                make(command_buffer, &d, dropped, Taken::UNMAPPED)
+            }
+            Some(map) => {
+                let mut d = plain(|| held.desc.clone());
+                map.for_pass(command_buffer, |raw, class| {
+                    let mapped = match class {
+                        Class::Unset => PassMap::Unset,
+                        Class::NoLayers | Class::Identity => PassMap::Identity,
+                        Class::Varying => PassMap::Varying,
+                    };
+                    let dropped = settled(&mut d, mapped);
+                    d.rasterization_rate_map = Some(raw);
+                    let taken = Taken {
+                        class: Some(class),
+                        mutable: map.is_mutable(),
+                    };
+                    make(command_buffer, &d, dropped, taken)
+                })
+            }
+        };
+        if let Ok(Some(e)) = &made {
+            e.undecided_dropped(sources);
+            e.read_only_stores(sources);
+        }
+        made
+    })
+}
+
+/// Whether an attachment of the pass `d` has a resolve texture: only such a pass has resolves
+/// that [`open`] drops ([`untouched_resolves`], [`without_unused_resolves`]) or refuses
+/// ([`refused_resolve_format`]).
+fn has_resolve_texture(d: &rt::RenderPassDescriptor) -> bool {
+    d.color_attachments.iter().any(|a| a.resolve_texture.is_some())
+        || d.depth_attachment.resolve_texture.is_some()
+        || d.stencil_attachment.resolve_texture.is_some()
 }
 
 /// The colour attachment of the pass `d` of a bfloat format (`R16Bfloat`, `RG16Bfloat`,
@@ -1380,17 +1401,16 @@ impl Taken {
 }
 
 /// The encoder of the pass `d` on `command_buffer`, with its rate map as [`open`] took it,
-/// `taken`, and without the colour resolves it `dropped` ([`untouched_resolves`]). One made is
-/// work for Metal's tiler ([`crate::gpu::command::CommandBufferObject::tiler_work`]).
+/// `taken`, and without the colour resolves it `dropped` ([`untouched_resolves`]) and its unused
+/// depth and stencil resolves ([`without_unused_resolves`]), which [`open`] took from `d`. One
+/// made is work for Metal's tiler ([`crate::gpu::command::CommandBufferObject::tiler_work`]).
 fn make(
     command_buffer: &VulkanCommandBuffer,
-    d: &mut rt::RenderPassDescriptor,
+    d: &rt::RenderPassDescriptor,
     dropped: Vec<Dropped>,
     taken: Taken,
 ) -> RaiseResult<Option<VulkanRenderEncoder>> {
     let sel = "renderCommandEncoderWithDescriptor:";
-    without_unused_resolves(d);
-    let d = &*d;
     match plain_at(sel, || command_buffer.raw.render_command_encoder(d)) {
         Ok(raw) => {
             command_buffer.tiler_work(sel, crate::gpu::metal_space::FirstUse::RenderEncoder);

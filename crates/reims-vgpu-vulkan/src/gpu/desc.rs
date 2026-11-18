@@ -543,19 +543,48 @@ pub struct TextureDescriptorObject {
 /// `MTLTextureDescriptor *`.
 pub type VulkanTextureDescriptor = Obj<TextureDescriptorObject>;
 
-/// `MTLRenderPassDescriptor *`: the runtime's descriptor, which core's sets change.
+/// `MTLRenderPassDescriptor *`: the runtime's descriptor, which core's sets change, and what
+/// Metal's descriptor holds beside it, behind one lock: each set takes it once, and an encoder's
+/// creation once for everything it reads ([`RenderPassDescriptorObject::held`]). A lock and its
+/// release are each a locked instruction on x86-64, which costs about 0.49 µs between two
+/// recorded Vulkan commands on RADV, whose command buffers are write-combined memory
+/// (metal2vulkan's measurement on an RX 7900 XTX); one lock per part made a pass's attachment
+/// set three and its encoder's creation four.
 #[derive(Debug)]
 pub struct RenderPassDescriptorObject {
-    /// The runtime's descriptor.
-    pub desc: Mutex<rt::RenderPassDescriptor>,
+    /// The descriptor's parts.
+    held: Mutex<PassHeld>,
+}
+
+/// What a render pass descriptor holds ([`RenderPassDescriptorObject`]).
+#[derive(Debug)]
+pub struct PassHeld {
+    /// The runtime's descriptor, without its rate map.
+    pub desc: rt::RenderPassDescriptor,
     /// The rate map set, held by reference as Metal holds it: an encoder takes its class as it is
     /// at the encoder's creation ([`crate::gpu::rate_map`]).
-    rate_map: Mutex<Option<VulkanRateMap>>,
+    pub rate_map: Option<VulkanRateMap>,
     /// What the attachments' textures are beyond the runtime's textures.
-    sources: Mutex<Sources>,
+    pub sources: Sources,
     /// The attachments' properties the runtime has no value of, raw, as their setters took them
     /// ([`RawPass`]).
-    raw: Mutex<RawPass>,
+    raw: RawPass,
+}
+
+impl PassHeld {
+    /// The first property the runtime holds raw ([`RawPass`]), by attachment then setter: the
+    /// attachment's name, the setter and the value.
+    pub fn raw_value(&self) -> Option<(String, &'static str, u64)> {
+        let first = (self.raw.0.first_key_value()).map(|(&at, &value)| (at, value));
+        first.map(|((attachment, sel), value)| {
+            let name = match attachment {
+                DEPTH => "the depth attachment".to_owned(),
+                STENCIL => "the stencil attachment".to_owned(),
+                i => format!("colour attachment {i}"),
+            };
+            (name, sel, value)
+        })
+    }
 }
 
 /// The values of a pass's attachment properties the runtime has no value of, raw, as Metal's
@@ -563,7 +592,7 @@ pub struct RenderPassDescriptorObject {
 /// [`STENCIL`]) and the property's setter: a load or store action, store action options, a
 /// resolve filter. The runtime's attachment keeps the value before; core reads the load and
 /// store actions back raw, and the encoder's creation asserts at one, as Metal's
-/// ([`RenderPassDescriptorObject::raw_value`]).
+/// ([`PassHeld::raw_value`]).
 #[derive(Debug, Default, Clone)]
 pub struct RawPass(std::collections::BTreeMap<(usize, &'static str), u64>);
 
@@ -830,43 +859,35 @@ impl RenderPassDescriptorObject {
     /// A descriptor of Metal's defaults (`+new` and `+renderPassDescriptor` alike).
     pub fn new() -> RenderPassDescriptorObject {
         RenderPassDescriptorObject {
-            desc: Mutex::new(rt::RenderPassDescriptor::new()),
-            rate_map: Mutex::new(None),
-            sources: Mutex::new(Sources::default()),
-            raw: Mutex::new(RawPass::default()),
+            held: Mutex::new(PassHeld {
+                desc: rt::RenderPassDescriptor::new(),
+                rate_map: None,
+                sources: Sources::default(),
+                raw: RawPass::default(),
+            }),
         }
     }
 
-    /// The first property the runtime holds raw ([`RawPass`]), by attachment then setter: the
-    /// attachment's name, the setter and the value.
-    pub fn raw_value(&self) -> Option<(String, &'static str, u64)> {
-        let first =
-            plain(|| (self.raw.lock().0.first_key_value()).map(|(&at, &value)| (at, value)));
-        first.map(|((attachment, sel), value)| {
-            let name = match attachment {
-                DEPTH => "the depth attachment".to_owned(),
-                STENCIL => "the stencil attachment".to_owned(),
-                i => format!("colour attachment {i}"),
-            };
-            (name, sel, value)
-        })
-    }
-
-    /// What the attachments' textures are as they stand ([`Source`]).
-    pub fn sources(&self) -> Sources {
-        plain(|| self.sources.lock().clone())
+    /// Runs `read` with what the descriptor holds as it stands, under one hold of its lock: an
+    /// encoder's creation reads it there, borrowing it whole, with no copy of its textures'
+    /// references. Nothing `read` runs reaches this descriptor again.
+    pub fn held<T>(&self, read: impl FnOnce(&PassHeld) -> T) -> T {
+        let held = plain(|| self.held.lock());
+        read(&held)
     }
 
     /// The runtime's descriptor as it stands, without its rate map.
     pub fn descriptor(&self) -> rt::RenderPassDescriptor {
-        plain(|| self.desc.lock().clone())
+        self.held(|held| plain(|| held.desc.clone()))
     }
 
     /// The runtime's descriptor as it stands, without its rate map, and the rate map set, whose
     /// class an encoder of it takes at the encoder's creation ([`crate::gpu::rate_map`]).
     pub fn pass(&self) -> (rt::RenderPassDescriptor, Option<VulkanRateMap>) {
-        let map = plain(|| self.rate_map.lock().as_ref().map(Handle::clone_ref));
-        (self.descriptor(), map)
+        self.held(|held| {
+            let map = held.rate_map.as_ref().map(Handle::clone_ref);
+            (plain(|| held.desc.clone()), map)
+        })
     }
 }
 
@@ -997,7 +1018,7 @@ impl RenderPassDescriptor<VulkanPlatform> for VulkanRenderPassDescriptor {
                 .iter()
                 .map(|p| rt::SamplePosition::new(p.x, p.y))
                 .collect();
-            plain(|| self.desc.lock().sample_positions = positions);
+            plain(|| self.held.lock().desc.sample_positions = positions);
             Ok(())
         });
         crate::recorder::rec_done!(recorded_call, recorded_answer);
@@ -1007,10 +1028,12 @@ impl RenderPassDescriptor<VulkanPlatform> for VulkanRenderPassDescriptor {
     fn set_pass(&self, set: &PassSet<'_, VulkanPlatform>) {
         let recorded_call = crate::recorder::rec_call!("m2v.setPass", self, set);
         crate::recorder::run(|| {
-            let mut d = plain(|| self.desc.lock());
+            let mut held = plain(|| self.held.lock());
+            let held = &mut *held;
+            let d = &mut held.desc;
             if let Some(b) = set.visibility_result_buffer {
                 d.visibility_result_buffer = b.map(|b| b.raw.clone());
-                plain(|| self.sources.lock().visibility = b.map(Handle::clone_ref));
+                held.sources.visibility = b.map(Handle::clone_ref);
             }
             // `setVisibilityResultType:` is kept nowhere: the runtime has no accumulation, so a pass
             // of `Accumulate` resets its results as one of `Reset` does, as the AMD Radeon Pro
@@ -1044,7 +1067,7 @@ impl RenderPassDescriptor<VulkanPlatform> for VulkanRenderPassDescriptor {
             // pass shows, with attachments or without (`mutgap_dec_render_default_color_samples`).
             let _ = set.default_color_sample_count;
             if let Some(map) = set.rasterization_rate_map {
-                *plain(|| self.rate_map.lock()) = map.map(Handle::clone_ref);
+                held.rate_map = map.map(Handle::clone_ref);
             }
             if let Some(v) = set.imageblock_sample_length {
                 d.imageblock_sample_length = v;
@@ -1072,9 +1095,13 @@ impl RenderPassDescriptor<VulkanPlatform> for VulkanRenderPassDescriptor {
         let recorded_call = crate::recorder::rec_call!("m2v.setColorAttachment", self, index, set);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
             let i = color_index(Policy::On(on), index)?;
-            let mut d = plain(|| self.desc.lock());
-            let mut sources = plain(|| self.sources.lock());
-            let mut raw = plain(|| self.raw.lock());
+            let mut held = plain(|| self.held.lock());
+            let PassHeld {
+                desc: d,
+                sources,
+                raw,
+                ..
+            } = &mut *held;
             let a = &mut d.color_attachments[i];
             set_attachment_common!(set, a, sources.color[i], raw, i);
             if let Some(c) = set.clear_color {
@@ -1089,9 +1116,13 @@ impl RenderPassDescriptor<VulkanPlatform> for VulkanRenderPassDescriptor {
     fn set_depth_attachment(&self, set: &DepthAttachmentSet<'_, VulkanPlatform>) {
         let recorded_call = crate::recorder::rec_call!("m2v.setDepthAttachment", self, set);
         crate::recorder::run(|| {
-            let mut d = plain(|| self.desc.lock());
-            let mut sources = plain(|| self.sources.lock());
-            let mut raw = plain(|| self.raw.lock());
+            let mut held = plain(|| self.held.lock());
+            let PassHeld {
+                desc: d,
+                sources,
+                raw,
+                ..
+            } = &mut *held;
             let a = &mut d.depth_attachment;
             set_attachment_common!(set, a, sources.depth, raw, DEPTH);
             if let Some(v) = set.clear_depth {
@@ -1110,9 +1141,13 @@ impl RenderPassDescriptor<VulkanPlatform> for VulkanRenderPassDescriptor {
     fn set_stencil_attachment(&self, set: &StencilAttachmentSet<'_, VulkanPlatform>) {
         let recorded_call = crate::recorder::rec_call!("m2v.setStencilAttachment", self, set);
         crate::recorder::run(|| {
-            let mut d = plain(|| self.desc.lock());
-            let mut sources = plain(|| self.sources.lock());
-            let mut raw = plain(|| self.raw.lock());
+            let mut held = plain(|| self.held.lock());
+            let PassHeld {
+                desc: d,
+                sources,
+                raw,
+                ..
+            } = &mut *held;
             let a = &mut d.stencil_attachment;
             set_attachment_common!(set, a, sources.stencil, raw, STENCIL);
             if let Some(v) = set.clear_stencil {
@@ -1131,23 +1166,23 @@ impl RenderPassDescriptor<VulkanPlatform> for VulkanRenderPassDescriptor {
     /// An index past the eight attachments raises, the caller's to catch.
     fn color_attachment_state(&self, index: u64) -> RaiseResult<AttachmentState> {
         let i = color_index(Policy::Caught, index)?;
-        let d = plain(|| self.desc.lock());
-        let raw = plain(|| self.raw.lock());
+        let held = plain(|| self.held.lock());
+        let (d, raw) = (&held.desc, &held.raw);
         let a = &d.color_attachments[i];
-        Ok(attachment_state(&raw, i, a.load_action, a.store_action))
+        Ok(attachment_state(raw, i, a.load_action, a.store_action))
     }
 
     fn depth_attachment_state(&self) -> AttachmentState {
-        let d = plain(|| self.desc.lock());
-        let raw = plain(|| self.raw.lock());
+        let held = plain(|| self.held.lock());
+        let (d, raw) = (&held.desc, &held.raw);
         let a = &d.depth_attachment;
-        attachment_state(&raw, DEPTH, a.load_action, a.store_action)
+        attachment_state(raw, DEPTH, a.load_action, a.store_action)
     }
 
     fn stencil_attachment_state(&self) -> AttachmentState {
-        let d = plain(|| self.desc.lock());
-        let raw = plain(|| self.raw.lock());
+        let held = plain(|| self.held.lock());
+        let (d, raw) = (&held.desc, &held.raw);
         let a = &d.stencil_attachment;
-        attachment_state(&raw, STENCIL, a.load_action, a.store_action)
+        attachment_state(raw, STENCIL, a.load_action, a.store_action)
     }
 }
