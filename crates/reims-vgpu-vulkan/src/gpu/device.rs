@@ -697,13 +697,22 @@ impl VulkanDevice {
     /// A texture of `descriptor` of the platform's own, for a helper the guest never reaches
     /// (the window's cursor glyph): it takes no range of Metal's space ([`metal_space::Hold`]'s
     /// `NONE`) and no resource ID (the runtime's `IdPlacement::Outside`, whose texture answers 0),
-    /// so no guest-visible address or ID depends on it. `None` where the runtime refuses it.
+    /// so no guest-visible address or ID depends on it. `None` where the runtime refuses it. A
+    /// recording holds it as an ordinary `newTextureWithDescriptor:` on the device
+    /// ([`crate::recorder`]), so its later calls (the glyph's `replaceRegion:`) and the commands
+    /// that bind it name it.
     pub fn new_own_texture(&self, descriptor: &VulkanTextureDescriptor) -> Option<VulkanTexture> {
-        let fields = descriptor.fields();
-        let mut desc = fields.descriptor("newTextureWithDescriptor:", Maker::Other);
-        desc.placement = rt::IdPlacement::Outside;
-        let raw = plain(|| self.raw.new_texture(&desc)).ok()?;
-        Some(self.texture_of(raw, 0, Arc::new(metal_space::Hold::NONE)))
+        let recorded_call =
+            crate::recorder::rec_call!("newTextureWithDescriptor:", self, descriptor);
+        let recorded_answer = crate::recorder::run(|| -> Option<VulkanTexture> {
+            let fields = descriptor.fields();
+            let mut desc = fields.descriptor("newTextureWithDescriptor:", Maker::Other);
+            desc.placement = rt::IdPlacement::Outside;
+            let raw = plain(|| self.raw.new_texture(&desc)).ok()?;
+            Some(self.texture_of(raw, 0, Arc::new(metal_space::Hold::NONE)))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// `newBufferWithLength:options:`'s buffer (`new_buffer_of_length`), declaring the bytes

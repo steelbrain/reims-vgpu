@@ -12,8 +12,10 @@
 //!   The selector is Metal's, as the trait's `sel:` line names it, or an `m2v.` name for what
 //!   Metal has no call for; an encoder's command is its enum's selector. The receiver and every
 //!   object an argument names are the objects' stream ids, which the recorder gives each object
-//!   as a call makes it (`State::register`) and never gives again; an object's last reference going
-//!   (`Obj`'s drop) is its `release` record.
+//!   as a call makes it (`State::register`) and never gives again, a texture of the platform's
+//!   own (the window's cursor glyph, `VulkanDevice::new_own_texture`) as any other
+//!   `newTextureWithDescriptor:`; an object's last reference going (`Obj`'s drop) is its
+//!   `release` record.
 //! - **The device's identity.** Right after the record that made a device, an
 //!   [`IDENTITY`] record on it answers what decides how a player makes its resources: the
 //!   device's `name`, which the guest's device info gives, and `hasUnifiedMemory`, by which a
@@ -4211,6 +4213,111 @@ mod tests {
                     (queue.selector.as_str(), queue.receiver),
                     ("newCommandQueue", made.result)
                 );
+            },
+        );
+    }
+
+    /// The count `key` of the stats file of this process's stream in `streams`, written once
+    /// every queued call is: the writer's own write of it can meet the read, which then reads
+    /// again.
+    fn stat(streams: &std::path::Path, key: &str) -> u64 {
+        let state = state().expect("the child records");
+        let path = streams.join(format!("{}.stats.txt", std::process::id()));
+        for _ in 0..10 {
+            state.drain(true);
+            state.write_stats();
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let value = text.lines().find_map(|line| {
+                let (k, n) = line.split_once(' ')?;
+                if k != key {
+                    return None;
+                }
+                n.parse().ok()
+            });
+            if let Some(value) = value {
+                return value;
+            }
+        }
+        panic!("no count {key} in {}", path.display());
+    }
+
+    /// A texture of the platform's own (the window's cursor glyph) is a `newTextureWithDescriptor:`
+    /// on the device of its descriptor, as any other: the stream names it as the receiver of its
+    /// `replaceRegion:` and the argument of the `setFragmentTexture:atIndex:` that binds it, and
+    /// counts no object it could not name.
+    #[test]
+    fn on_vulkan_an_own_texture_is_named_where_it_is_used() {
+        in_recording_child(
+            "recorder::tests::on_vulkan_an_own_texture_is_named_where_it_is_used",
+            |streams| {
+                use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+                use crate::core::platform::device::GpuDevice as _;
+                use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+                use crate::core::platform::resource::Texture as _;
+                use crate::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+                use crate::core::platform::values::TextureDesc;
+                use crate::core::platform::{HostRange, Platform as _};
+                use crate::core::raise::OnFault;
+                const REPLACE: &str =
+                    "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:";
+                const BIND: &str = "setFragmentTexture:atIndex:";
+                const MADE: &str = "newTextureWithDescriptor:";
+                let (platform, device) = recording_device();
+                let (_target, pass) =
+                    crate::gpu::encode_render::tests::pass_of(&platform, &device, (4, 4));
+                let descriptor = platform.texture_descriptor(&TextureDesc {
+                    width: 4,
+                    height: 4,
+                    ..TextureDesc::default()
+                });
+                let own = device.new_own_texture(&descriptor).expect("an own texture");
+                let pixels = [0x7fu8; 64];
+                let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(4, 4, 1));
+                (own.replace_region(region, 0, 0, HostRange::of_slice(&pixels), 16, 64)).unwrap();
+                let queue = device.new_command_queue().expect("a queue");
+                let cb = queue.command_buffer(OnFault::Die).unwrap().unwrap();
+                let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+                let bind = RenderCmd::SetFragmentTexture {
+                    texture: Some(&own),
+                    index: 0,
+                };
+                for cmd in [bind, RenderCmd::EndEncoding] {
+                    e.encode(OnFault::Die, cmd).unwrap();
+                }
+                cb.commit(OnFault::Die).unwrap();
+                cb.wait_until_completed(OnFault::Die).unwrap();
+                let (calls, _) = recorded(streams, |calls| {
+                    calls.iter().any(|c| c.selector == "commit")
+                });
+                let one = |selector: &str| {
+                    let mut of = calls.iter().filter(|c| c.selector == selector);
+                    let call = of.next().unwrap_or_else(|| panic!("no {selector}: {calls:?}"));
+                    assert!(of.next().is_none(), "two of {selector}: {calls:?}");
+                    call
+                };
+                let replace = one(REPLACE);
+                assert_ne!(replace.receiver, 0, "the replace's receiver is unnamed");
+                let made = (calls.iter())
+                    .find(|c| c.selector == MADE && c.result == replace.receiver)
+                    .unwrap_or_else(|| panic!("nothing made the replace's receiver: {calls:?}"));
+                let own_descriptor = (calls.iter())
+                    .rfind(|c| c.selector == "m2v.textureDescriptor")
+                    .expect("the own texture's descriptor");
+                let device_id = calls.first().expect("the device's record").result;
+                assert_eq!(made.receiver, device_id, "{made:?}");
+                assert_eq!(
+                    made.args.first(),
+                    Some(&Value::Object(own_descriptor.result)),
+                    "{made:?}"
+                );
+                assert_eq!(
+                    one(BIND).args.first(),
+                    Some(&Value::Object(replace.receiver)),
+                    "{calls:?}"
+                );
+                assert_eq!(stat(streams, "unrecorded_refs"), 0);
+                assert_eq!(stat(streams, "unrecorded_receivers"), 0);
+                drop((own, descriptor));
             },
         );
     }
