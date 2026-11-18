@@ -39,7 +39,10 @@
 //!   reach that changed since the stream last held it ([`before_commit`]). A buffer in a heap over
 //!   the guest's memory is written as its block's bytes. A copy out of the guest's RAM carries the
 //!   bytes it reads as its arguments ([`guest_ram_source`]), and a buffer made as a copy of host
-//!   memory the bytes it starts with ([`contents`]).
+//!   memory the bytes it starts with ([`contents`]). A no-copy buffer's bytes arrive as writes;
+//!   on a device that keeps two copies of a `Managed` buffer, a `Managed` one's record also
+//!   carries the bytes its create copied into the device's copy ([`no_copy_contents`]), which
+//!   only a `didModifyRange:` changes afterwards.
 //! - **Private buffers around dispatches.** Around each recorded dispatch of a compute pipeline
 //!   made with linked functions, a blit copies each Private buffer range it binds into a Shared
 //!   buffer of the recorder's own, before the dispatch and after it, and at the command buffer's
@@ -1171,23 +1174,34 @@ pub fn plain_resource_id<T: Send + Sync + 'static>(
 
 /// The bytes a buffer made as a copy of host memory starts with (`newBufferWithDescriptor:`'s
 /// `contents`, not no-copy), read now, while the call holds them: its descriptor's `contents`
-/// becomes them, a blob where they are long. Memory a no-copy buffer is made over stays nil: its
-/// bytes arrive as writes.
+/// becomes them, a blob where they are long. Memory a no-copy buffer is made over stays nil
+/// ([`no_copy_contents`] but for a `Managed` one on a device that keeps two copies): its bytes
+/// arrive as writes.
 pub fn contents(active: &mut Option<Active>, bytes: crate::core::platform::HostRange<'_>) {
     let Some(a) = active else { return };
     if !a.recorded() || bytes.ptr().addr() == 0 {
         return;
     }
-    let Some(call) = a.pending.as_mut() else {
-        return;
-    };
-    let n = usize::try_from(bytes.len()).unwrap_or(0);
+    let data = read_range(bytes, bytes.len());
+    if let Some(call) = a.pending.as_mut() {
+        put_contents(call, data);
+    }
+}
+
+/// The first `n` bytes of `bytes`, read now.
+fn read_range(bytes: crate::core::platform::HostRange<'_>, n: u64) -> Vec<u8> {
+    let n = usize::try_from(n.min(bytes.len())).unwrap_or(0);
     let mut data = vec![0u8; n];
     // SAFETY: the range is the call's argument, which its caller keeps mapped for the call
-    // (`HostRange`'s contract), and the call is in progress.
+    // (`HostRange`'s contract), the call is in progress, and `n` is at most its length.
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.ptr().as_ptr::<u8>(), data.as_mut_ptr(), n);
     }
+    data
+}
+
+/// Makes `data` the `contents` of the descriptor `call` takes first (`newBufferWithDescriptor:`).
+fn put_contents(call: &mut Call, data: Vec<u8>) {
     let Some(desc) = call.args.first_mut() else {
         return;
     };
@@ -1201,6 +1215,77 @@ pub fn contents(active: &mut Option<Active>, bytes: crate::core::platform::HostR
         *v = Value::Bytes(data);
     }
 }
+
+/// `MTLResourceOptions`' storage mode `Managed`, in its bits 4 to 7.
+const MANAGED: u64 = 1;
+
+/// How many bytes of a no-copy buffer's pages, from its first, its create copies into a copy of
+/// the device's own: on a device that keeps two copies of a `Managed` buffer (`two_copies`, its
+/// `hasUnifiedMemory` NO), a `Managed` one's (by `options`, the buffer's resource options) of
+/// `length` bytes, but those from `zero_from` on, which the caller said read zero and which the
+/// device's copy starts as zeros (`BufferDesc::zero_from`); else none: a `Shared` or `Private`
+/// buffer, or any on a device that keeps one copy, lies in the pages alone.
+fn create_copies(two_copies: bool, options: u64, length: u64, zero_from: Option<u64>) -> u64 {
+    if !two_copies || (options >> 4) & 0xf != MANAGED {
+        return 0;
+    }
+    zero_from.map_or(length, |z| z.min(length))
+}
+
+/// The bytes of a no-copy buffer's pages its create copies into the device's own copy, read now,
+/// while the call holds them ([`create_copies`]: a `Managed` buffer of resource options `options`
+/// on a device that keeps two copies, its bytes before `zero_from`): the descriptor's `contents`
+/// of `newBufferWithDescriptor:`, or the first argument of
+/// `newBufferWithBytesNoCopy:length:options:deallocator:`, a blob where they are long. A player
+/// rebuilds the device's copy from them, which only a `didModifyRange:` changes afterwards
+/// (docs/graphics-kext/dgpu-oracle.md, "A no-copy Managed buffer"). Elsewhere, and where the
+/// create copies no byte, the record keeps nil there.
+pub fn no_copy_contents(
+    active: &mut Option<Active>,
+    device: &crate::gpu::device::VulkanDevice,
+    options: u64,
+    bytes: crate::core::platform::HostRange<'_>,
+    zero_from: Option<u64>,
+) {
+    if !active.as_ref().is_some_and(Active::recorded) {
+        return;
+    }
+    let two_copies = !device.raw.properties().has_unified_memory;
+    no_copy_contents_with(active, two_copies, options, bytes, zero_from);
+}
+
+/// [`no_copy_contents`] on a device that keeps two copies of a `Managed` buffer where
+/// `two_copies`.
+fn no_copy_contents_with(
+    active: &mut Option<Active>,
+    two_copies: bool,
+    options: u64,
+    bytes: crate::core::platform::HostRange<'_>,
+    zero_from: Option<u64>,
+) {
+    let Some(a) = active else { return };
+    if !a.recorded() || bytes.ptr().addr() == 0 {
+        return;
+    }
+    let n = create_copies(two_copies, options, bytes.len(), zero_from);
+    if n == 0 {
+        return;
+    }
+    let data = read_range(bytes, n);
+    let Some(call) = a.pending.as_mut() else {
+        return;
+    };
+    if call.selector == NO_COPY_BYTES {
+        if let Some(first) = call.args.first_mut() {
+            *first = Value::Bytes(data);
+        }
+    } else {
+        put_contents(call, data);
+    }
+}
+
+/// The selector of a no-copy buffer over host memory.
+const NO_COPY_BYTES: &str = "newBufferWithBytesNoCopy:length:options:deallocator:";
 
 /// `x` as its `Debug` text reads, read now ([`debug_value`]): an enum value without data is its
 /// name, one with data `{Name: value}`.
@@ -1883,14 +1968,20 @@ impl State {
                     self.pin_locked(&mut objects, call, pin, len);
                 }
             }
-            "newBufferWithBytesNoCopy:length:options:deallocator:" => {
-                // new_buffer_over_host_memory(bytes, options, deallocator)
-                let len = match call.args.first() {
-                    Some(Value::Host(_, l)) => *l,
-                    _ => 0,
+            NO_COPY_BYTES => {
+                // new_buffer_over_host_memory(bytes, options, deallocator): the bytes nil, but
+                // those the create copied into the device's own copy ([`no_copy_contents`]).
+                let mut args = std::mem::take(&mut call.args).into_iter();
+                let (bytes, len) = match args.next() {
+                    Some(Value::Host(_, l)) => (Value::Nil, l),
+                    Some(Value::Bytes(data)) => {
+                        let len = data.len() as u64;
+                        (Value::Bytes(data), len)
+                    }
+                    _ => (Value::Nil, 0),
                 };
-                let options = call.args.get(1).cloned().unwrap_or(Value::Nil);
-                call.args = vec![Value::Nil, Value::Uint(len), options, Value::Nil];
+                let options = args.next().unwrap_or(Value::Nil);
+                call.args = vec![bytes, Value::Uint(len), options, Value::Nil];
             }
             "newBufferWithLength:options:offset:" => {
                 // Heap::new_buffer_of_length(length, options, offset)
@@ -3880,4 +3971,196 @@ mod tests {
         );
     }
 
+    /// The descriptor `contents` of a `newBufferWithDescriptor:` record.
+    fn contents_of(c: &Call) -> Option<Value> {
+        match c.args.first() {
+            Some(Value::Map(fields)) => fields
+                .iter()
+                .find(|(k, _)| k == "contents")
+                .map(|(_, v)| v.clone()),
+            _ => None,
+        }
+    }
+
+    /// On a device that keeps two copies of a `Managed` buffer (the answer forced here), a
+    /// no-copy `Managed` buffer's record carries the bytes its create copied into the device's
+    /// copy, as a blob through the stream and back: a descriptor's `contents`, those before its
+    /// `zeroFrom` (none where that is 0), and the first argument of
+    /// `newBufferWithBytesNoCopy:length:options:deallocator:`, all of its bytes. On a device that
+    /// keeps one copy, and for a `Shared` buffer, both stay nil.
+    #[test]
+    fn a_no_copy_managed_buffer_carries_its_create_bytes_where_the_device_keeps_two_copies() {
+        use crate::core::platform::HostRange;
+        use crate::core::platform::values::{BufferDesc, OptionSet};
+        let pages: Vec<u8> = (0..8192u32).map(|i| (i / 7) as u8).collect();
+        let (managed, shared) = (0x10, 0);
+        let by_desc = |two_copies, options, zero_from| {
+            let desc = BufferDesc {
+                length: 8192,
+                options: vec![OptionSet::ResourceOptions(options)],
+                pinned_gpu_address: None,
+                contents: Some(HostRange::of_slice(&pages)),
+                no_copy: true,
+                deallocator: None,
+                zero_from,
+            };
+            let mut active = Some(begin(enter_recording(), || {
+                (
+                    "newBufferWithDescriptor:",
+                    1,
+                    vec![crate::recorder::rec_val!(desc)],
+                )
+            }));
+            let bytes = HostRange::of_slice(&pages);
+            no_copy_contents_with(&mut active, two_copies, options, bytes, zero_from);
+            queued(active)
+        };
+        let by_bytes = |two_copies, options: u64| {
+            let bytes = HostRange::of_slice(&pages);
+            let mut active = Some(begin(enter_recording(), || {
+                (
+                    NO_COPY_BYTES,
+                    1,
+                    vec![
+                        crate::recorder::rec_val!(bytes),
+                        crate::recorder::rec_val!(options),
+                        Value::Nil,
+                    ],
+                )
+            }));
+            no_copy_contents_with(&mut active, two_copies, options, bytes, None);
+            queued(active)
+        };
+        let calls = vec![
+            by_desc(true, managed, Some(4096)),
+            by_desc(true, managed, None),
+            by_desc(true, managed, Some(0)),
+            by_desc(false, managed, None),
+            by_desc(true, shared, None),
+            by_bytes(true, managed),
+            by_bytes(false, managed),
+            by_bytes(true, shared),
+        ];
+        let (calls, blobs) = written(calls);
+        let blob = |data: &[u8]| Value::Blob(format::sha256(data));
+        let descs: Vec<_> = calls[..5].iter().map(contents_of).collect();
+        assert_eq!(
+            descs,
+            [
+                Some(blob(&pages[..4096])),
+                Some(blob(&pages)),
+                Some(Value::Nil),
+                Some(Value::Nil),
+                Some(Value::Nil),
+            ]
+        );
+        let args =
+            |first, options| vec![first, Value::Uint(8192), Value::Uint(options), Value::Nil];
+        assert_eq!(calls[5].args, args(blob(&pages), managed));
+        assert_eq!(calls[6].args, args(Value::Nil, managed));
+        assert_eq!(calls[7].args, args(Value::Nil, shared));
+        let hashes: Vec<_> = blobs.iter().map(|(h, _)| *h).collect();
+        assert_eq!(
+            hashes,
+            [format::sha256(&pages[..4096]), format::sha256(&pages)]
+        );
+    }
+
+    /// Recording a host's own device, a no-copy `Managed` buffer's record carries the bytes the
+    /// create copied into the device's own copy where the device keeps two (its
+    /// `hasUnifiedMemory` NO): a descriptor's those before its `zeroFrom`, a
+    /// `newBufferWithBytesNoCopy:` one's all; where it keeps one, neither does. A no-copy
+    /// `Shared` buffer's carries none on either.
+    #[test]
+    fn on_vulkan_a_no_copy_managed_buffer_carries_what_its_create_copied() {
+        in_recording_child(
+            "recorder::tests::on_vulkan_a_no_copy_managed_buffer_carries_what_its_create_copied",
+            |streams| {
+                use crate::core::platform::HostRange;
+                use crate::core::platform::device::GpuDevice as _;
+                use crate::core::platform::values::{BufferDesc, OptionSet};
+                use crate::core::raise::OnFault;
+                use crate::os::PAGE;
+                let (_platform, device) = recording_device();
+                let two_copies = device.identity_caps().flags.has_unified_memory == Some(false);
+                let length = 2 * PAGE;
+                let n = usize::try_from(length).unwrap();
+                // Three runs of pages of the test's own, which outlive the buffers: the process
+                // ends with them.
+                let pages = crate::os::allocate_aliasable(3 * length).unwrap();
+                let run = |i: u64| {
+                    pages
+                        .as_ptr::<u8>()
+                        .wrapping_add(usize::try_from(i * length).unwrap())
+                };
+                for i in 0..3u64 {
+                    // SAFETY: fresh pages of the test's own, which nothing uses yet.
+                    let bytes = unsafe { std::slice::from_raw_parts_mut(run(i), n) };
+                    for (at, b) in bytes.iter_mut().enumerate() {
+                        *b = u8::try_from((at / 64 + usize::try_from(i).unwrap() * 3) % 251)
+                            .unwrap();
+                    }
+                }
+                // SAFETY: the pages are the test's own, never freed.
+                let range = |i| unsafe { HostRange::new(HostPtr::from_ptr(run(i)), length) };
+                // SAFETY: as above, and nothing writes them any more.
+                let data = |i| unsafe { std::slice::from_raw_parts(run(i), n) }.to_vec();
+                let (managed, shared) = (0x10, 0);
+                let by_desc = device
+                    .new_buffer(BufferDesc {
+                        length,
+                        options: vec![OptionSet::ResourceOptions(managed)],
+                        pinned_gpu_address: None,
+                        contents: Some(range(0)),
+                        no_copy: true,
+                        deallocator: None,
+                        zero_from: Some(PAGE),
+                    })
+                    .unwrap()
+                    .expect("a Managed buffer over the pages");
+                let by_bytes =
+                    (device.new_buffer_over_host_memory(OnFault::Die, range(1), managed, None))
+                        .unwrap()
+                        .expect("a Managed buffer over the pages");
+                let shared_bytes =
+                    (device.new_buffer_over_host_memory(OnFault::Die, range(2), shared, None))
+                        .unwrap()
+                        .expect("a Shared buffer over the pages");
+                let (calls, blobs) = recorded(streams, |calls| {
+                    calls.iter().filter(|c| c.selector == NO_COPY_BYTES).count() == 2
+                });
+                let desc = (calls.iter())
+                    .find(|c| c.selector == "newBufferWithDescriptor:")
+                    .expect("the descriptor's record");
+                let over: Vec<&Call> = calls
+                    .iter()
+                    .filter(|c| c.selector == NO_COPY_BYTES)
+                    .collect();
+                let blob = |bytes: &[u8]| Value::Blob(format::sha256(bytes));
+                let (first, all) = (data(0), data(1));
+                let held = |bytes: &[u8]| {
+                    blobs
+                        .iter()
+                        .any(|(h, d)| *h == format::sha256(bytes) && d == bytes)
+                };
+                if two_copies {
+                    assert_eq!(
+                        contents_of(desc),
+                        Some(blob(&first[..usize::try_from(PAGE).unwrap()]))
+                    );
+                    assert_eq!(over[0].args.first(), Some(&blob(&all)));
+                    assert!(held(&first[..usize::try_from(PAGE).unwrap()]) && held(&all));
+                } else {
+                    assert_eq!(contents_of(desc), Some(Value::Nil));
+                    assert_eq!(over[0].args.first(), Some(&Value::Nil));
+                }
+                assert_eq!(
+                    over[0].args.get(1..3),
+                    Some(&[Value::Uint(length), Value::Uint(managed)][..])
+                );
+                assert_eq!(over[1].args.first(), Some(&Value::Nil));
+                drop((by_desc, by_bytes, shared_bytes));
+            },
+        );
+    }
 }

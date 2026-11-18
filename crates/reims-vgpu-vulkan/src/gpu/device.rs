@@ -929,13 +929,17 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         options: u64,
         deallocator: Option<NoCopyDeallocator>,
     ) -> RaiseResult<Option<VulkanBuffer>> {
-        let recorded_call = crate::recorder::rec_call!(
+        let mut recorded_call = crate::recorder::rec_call!(
             "newBufferWithBytesNoCopy:length:options:deallocator:",
             self,
             bytes,
             options,
             deallocator
         );
+        // The bytes the create copies into the device's own copy of a `Managed` buffer.
+        if recorded_call.is_some() {
+            crate::recorder::no_copy_contents(&mut recorded_call, self, options, bytes, None);
+        }
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanBuffer>> {
             let sel = "newBufferWithBytesNoCopy:length:options:deallocator:";
             let bit_24 = options & READ_ONLY_OPTION != 0;
@@ -1706,12 +1710,23 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// own memory takes as zeros the device writes; other buffers take none.
     fn new_buffer(&self, desc: BufferDesc<'_>) -> RaiseResult<Option<VulkanBuffer>> {
         let mut recorded_call = crate::recorder::rec_call!("newBufferWithDescriptor:", self, desc);
-        // The bytes a copy starts with; a no-copy buffer's arrive as writes.
+        // The bytes a copy starts with; a no-copy buffer's arrive as writes, but those the create
+        // copies into the device's own copy of a `Managed` one.
         if recorded_call.is_some()
-            && !desc.no_copy
             && let Some(bytes) = desc.contents
         {
-            crate::recorder::contents(&mut recorded_call, bytes);
+            if desc.no_copy {
+                let options = descriptor_options(BUFFER_DESCRIPTOR_OPTIONS, &desc.options);
+                crate::recorder::no_copy_contents(
+                    &mut recorded_call,
+                    self,
+                    options,
+                    bytes,
+                    desc.zero_from,
+                );
+            } else {
+                crate::recorder::contents(&mut recorded_call, bytes);
+            }
         }
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<VulkanBuffer>> {
             let sel = "newBufferWithDescriptor:";

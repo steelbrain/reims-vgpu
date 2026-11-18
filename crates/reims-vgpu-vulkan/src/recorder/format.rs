@@ -18,6 +18,13 @@
 //! also follows the record that made each device: the header itself stays the magic, the
 //! version and flags `0`.
 //!
+//! A no-copy buffer's bytes arrive as writes, but where the device keeps two copies of a
+//! `Managed` buffer (`hasUnifiedMemory` NO), a no-copy `Managed` one's record carries those its
+//! create copied into the device's copy, from its first byte: the descriptor's `contents` of
+//! `newBufferWithDescriptor:`, the bytes before its `zeroFrom` (nil where that is 0), and the
+//! first argument of `newBufferWithBytesNoCopy:length:options:deallocator:`, all its bytes, each
+//! a blob where long, as a copied buffer's `contents` are.
+//!
 //! The commands the CPU encodes into an indirect command buffer are call records on the buffer,
 //! `indirectRenderCommandAtIndex:` or `indirectComputeCommandAtIndex:`, whose arguments are
 //! `[index, commands]` (the spec's section 8): the command's index, and a list of the commands
