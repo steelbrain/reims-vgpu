@@ -1475,14 +1475,22 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
 
     /// The runtime's completion-seen handler: run on the thread that saw the buffer complete,
     /// before its completed handlers, a failure read as a completed handler reads it
-    /// ([`completed_handler`]). Refused once the buffer is committed.
+    /// ([`completed_handler`]). Refused once the buffer is committed. In a process that records,
+    /// the recorder takes what the buffer's GPU work wrote first, before `block` can tell the
+    /// guest ([`crate::recorder::completion_seen`]).
     fn add_completion_seen_handler(
         &self,
         _on: OnFault,
         block: CompletedHandler,
     ) -> RaiseResult<()> {
         let overruns = self.predication.overruns();
-        let handler = completed_handler(block, move |cb| read(cb, &overruns));
+        let recorded = crate::recorder::completion_key(self);
+        let handler = completed_handler(block, move |cb| {
+            if let Some(id) = recorded {
+                crate::recorder::completion_seen(id);
+            }
+            read(cb, &overruns);
+        });
         send("addCompletionSeenHandler", Policy::Dies, || {
             self.raw.add_completion_seen_handler(handler)
         })
