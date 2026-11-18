@@ -483,7 +483,7 @@ Probe: `oracle_caps DEVICE`. Where the x86 GPUs' answers differ from the M3's or
 
 | answer | AMD | Intel 630 | M3 | ours (5080) |
 |---|---|---|---|---|
-| `maxBufferLength` | 3208642560 | 2147483648 | 41747087360 | 12821200896 (4ee4bcaf0; 1099511627776 before) |
+| `maxBufferLength` | 3208642560 | 2147483648 | 41747087360 | 2147483648 (c795bf3d5; 12821200896 from 4ee4bcaf0, 1099511627776 before) |
 | `maxThreadgroupMemoryLength` | 65536 | 65536 | 32768 | 32768 |
 | `maxArgumentBufferSamplerCount` | 2048 | 2048 | 500000 | 0 |
 | `readWriteTextureSupport` | 2 | 1 | 2 | 2 |
@@ -518,7 +518,10 @@ which no x86 Mac does; with no Apple family claimed, frameworks should not ask f
 
 **Relaxation: none** for performance. One answer helps the host, and the lane gives it, as a
 choice inside the envelope *(class 2)*: `maxBufferLength` at most three quarters of
-`recommendedMaxWorkingSetSize`, the rule the 5300M and the M3 answer by (4ee4bcaf0).
+`recommendedMaxWorkingSetSize`, the rule the 5300M and the M3 answer by (4ee4bcaf0), and at most
+2147483648, the Intel's own answer, which the Vulkan platform's shaders address whole in their
+direct form (c795bf3d5): today's runtime lands an access 4 GiB or more past a buffer's bound
+address 4 GiB lower in it.
 `minimumLinearTextureAlignmentForPixelFormat:` and the SPI linear alignments describe the GPU,
 each Mac answering its own, so the device answers the host GPU's: the platform's, 256 on RADV
 and 128 on NVIDIA's driver (`device_info.rs`). Both x86 GPUs answer one value for every format;
