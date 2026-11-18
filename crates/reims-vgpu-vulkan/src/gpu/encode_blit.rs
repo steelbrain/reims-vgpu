@@ -144,7 +144,12 @@ pub struct EncoderObject<E> {
     /// Its command buffer, held weakly: once it goes, nothing encoded here runs.
     command_buffer: Weak<CommandBufferObject>,
     /// Whether the pipeline state a compute or render encoder set last can encode indirect
-    /// commands (the runtime's `can_encode_indirect_commands`).
+    /// commands (the runtime's `can_encode_indirect_commands`). Stored and loaded `Relaxed`: the
+    /// thread encoding the commands sets and reads it in their order, and nothing is published
+    /// through it. A `SeqCst` store would be a locked instruction (`xchg`) on x86-64 at every
+    /// pipeline state set, and a locked instruction between two recorded Vulkan commands costs
+    /// about 0.49 µs on RADV, whose command buffers are write-combined memory (metal2vulkan's
+    /// measurement on an RX 7900 XTX: 17 ns a draw alone, 504 ns with one locked add between two).
     pub(crate) encodes_icbs: AtomicBool,
     /// The indirect command buffers a compute or render encoder made resident for writing, whose
     /// records work of a pipeline state that can encode indirect commands may write

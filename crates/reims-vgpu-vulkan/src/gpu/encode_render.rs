@@ -1830,7 +1830,7 @@ impl VulkanRenderEncoder {
         Held {
             nil_pipeline,
             marks,
-            encodes: self.encoder.encodes_icbs.load(Ordering::SeqCst),
+            encodes: self.encoder.encodes_icbs.load(Ordering::Relaxed),
         }
     }
 
@@ -1996,7 +1996,7 @@ impl VulkanRenderEncoder {
     /// commands, its functions may write the records of each buffer the encoder made resident for
     /// writing ([`crate::gpu::command::executions::gpu_writes`]).
     fn encodes(&self, sel: &'static str) {
-        if plain(|| self.encoder.encodes_icbs.load(Ordering::SeqCst)) {
+        if plain(|| self.encoder.encodes_icbs.load(Ordering::Relaxed)) {
             self.icbs_written(sel);
         }
     }
@@ -2913,7 +2913,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                         self.encoder.nothing(sel)?;
                         plain(|| self.drawing.lock().borrow_mut().nil_pipeline = true);
                         self.encoder.pipeline.store(0, Ordering::Relaxed);
-                        self.encoder.encodes_icbs.store(false, Ordering::SeqCst);
+                        self.encoder.encodes_icbs.store(false, Ordering::Relaxed);
                         Ok(())
                     }
                     Some(state) => {
@@ -2922,7 +2922,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                         self.encoder
                             .pipeline
                             .store(state.unique_identifier(), Ordering::Relaxed);
-                        self.encoder.encodes_icbs.store(f.encodes, Ordering::SeqCst);
+                        self.encoder.encodes_icbs.store(f.encodes, Ordering::Relaxed);
                         plain(|| {
                             let locked = self.drawing.lock();
                             let mut drawing = locked.borrow_mut();
