@@ -173,7 +173,9 @@ Probe: `oracle_storage DEVICE mbuf 4096|67108864`, `mtex` and `capture` (11-12, 
 the AMD, 22554 on the Intel; not run on the M3); `capture 4096|67108864` with steps 5 to 7
 (11-17: m3-max-44786 and 44795 on the AMD, 44789 and 44796 on the Intel; 44788 and 44790, at
 64 MiB, ended at their 1 GiB cap in step 7 and agree on steps 0 to 6). A 64 MiB `capture`
-peaks at 1.0 GiB, so it runs with `--ram 2`.
+peaks at 1.0 GiB, so it runs with `--ram 2`. `mtexcap full|part` (11-18: m3-max-45008 and 45010
+on the AMD, 45011 and 45012 on the Intel, macOS 26.7.1 (25G241), API validation off; not run on
+the M3).
 
 | | AMD | Intel 630 and M3 |
 |---|---|---|
@@ -189,6 +191,9 @@ peaks at 1.0 GiB, so it runs with `--ram 2`.
 | buffer: as step 5, then a second `didModifyRange:` of the range at once (step 7) | seen (4 KiB and 64 MiB), as without it | seen |
 | texture: GPU write without `synchronizeTexture:`, then `getBytes:` | old bytes, also 200 ms later | new |
 | texture: unsynchronized GPU write, then `replaceRegion:` of a 16 x 1 corner | the whole CPU copy is uploaded: the GPU's write is lost outside the corner | corner new, GPU's write kept |
+| texture: `replaceRegion:` of the whole texture (B over A) after the commit of a buffer that waits on an unsignalled shared event, then blits the texture, made at once (0.01 ms after the commit) or 1 s later, the CPU signalling after it (`mtexcap full`) | seen, both: the buffer is scheduled only at the signal (Q7), 0.05 to 0.27 ms after it | seen |
+| texture: as above, with a first kernel that spins in place of the event wait, the replace 24 ms after the GPU started the buffer (`mtexcap full`, last step) | not seen: the blit reads A | seen |
+| texture: the three above with only the rect (64,64)-(192,128) replaced (`mtexcap part`) | B in the rect, A elsewhere, while the wait holds the buffer; A where the replace came 29 ms after the GPU's start | B in the rect, A elsewhere, in all three |
 
 Our stack: on a discrete host Managed resources are two copies. `didModifyRange:` copies exactly
 the named range to the GPU copy, ordered before the next commit; `synchronizeResource:` copies
@@ -209,6 +214,14 @@ nothing copied the bytes before the write was done; a write 20 ms after the buff
 command buffer already running. At 64 MiB the buffer was scheduled 1.7 to 2.9 ms after the
 commit and started on the GPU about 11 ms later (at 4 KiB: 0.2 to 0.4 ms, then at most
 0.08 ms), consistent with an upload of the 64 MiB (6 GB/s) before its first kernel.
+
+When the 5300M takes a Managed texture's bytes (`mtexcap`, 11-18): at the submission, as a
+buffer's, and not at the `replaceRegion:` call. A replace made after the commit, of the whole
+texture or a part of it, is seen for as long as the buffer is not yet scheduled, which a wait
+on an unsignalled shared event stretches to the signal (1 s here); one made after the GPU started
+the buffer is not. The spin step cannot tell the submission from the GPU's start (the buffer was
+scheduled 1.98 ms after the commit and started 0.03 ms later). No read was mixed: each replace
+was seen whole or not at all.
 
 Ours, by `capture` in an x86-64 macOS 26.7.2 guest on two-copy hosts, 11-12: on the RX 7900 XTX
 (m3-max-22650, metal2vulkan 38ab829481) the five steps read A, B, B, A, B, the 5300M's answers;
