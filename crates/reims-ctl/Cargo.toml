@@ -28,11 +28,19 @@ ratatui = "0.30.2"
 reims-restore = { path = "../reims-restore" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.153"
+# Checks the Ambrosia release an arm64 VM boots on against its pin (ambrosia.rs).
+sha2 = "0.11.1"
 shlex = "2.0.1"
 toml = "1.1.2"
+# Downloads that release's zip from its release page (ambrosia.rs), with rustls, as reims-restore
+# downloads from Apple.
+ureq = "3.5.1"
+# Reads the image out of the release's zip (ambrosia.rs), whose files are stored.
+zip = { version = "9.5.1", default-features = false }
 
 [build-dependencies]
-# Reads guest/prebuilt/set.toml, the guest's kexts build.rs embeds.
+# Reads guest/prebuilt/set.toml and guest/prebuilt-arm64e/set.toml, the guest's kexts build.rs
+# embeds.
 toml = "1.1.2"
 
 [target.'cfg(unix)'.dependencies]

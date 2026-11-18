@@ -1,7 +1,9 @@
-//! reims-ctl: creates, boots and manages x86-64 macOS VMs on Linux, on the QEMU
-//! scripts/install-ctl.sh builds with reims-vgpu, and makes arm64 macOS VMs from an IPSW on arm64
-//! Macs and arm64 Linux (restore.rs). With no command it opens its interactive interface.
+//! reims-ctl: creates, boots and manages macOS VMs on the QEMU scripts/install-ctl.sh builds with
+//! reims-vgpu: x86-64 VMs on Linux and Windows, and arm64 VMs, restored from an IPSW (restore.rs)
+//! and booted by Ambrosia (ambrosia.rs), on arm64 Macs, arm64 Linux and Linux on x86-64. With no
+//! command it opens its interactive interface.
 
+mod ambrosia;
 mod cli;
 mod copy;
 mod create;
