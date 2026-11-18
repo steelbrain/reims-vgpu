@@ -12,7 +12,11 @@
 //!   blob directory) is named by its hash alone, with no blob record.
 //!
 //! A stream split into segments starts each with the header ([`Stream::header`]); names and
-//! blobs carry across segments, so the writer keeps its tables across them.
+//! blobs carry across segments, so the writer keeps its tables across them. The recorder starts
+//! each segment after the first with the identity record of each device then live
+//! (`m2v.deviceIdentity`, on the device, answering its `name` and `hasUnifiedMemory`), which
+//! also follows the record that made each device: the header itself stays the magic, the
+//! version and flags `0`.
 //!
 //! The commands the CPU encodes into an indirect command buffer are call records on the buffer,
 //! `indirectRenderCommandAtIndex:` or `indirectComputeCommandAtIndex:`, whose arguments are

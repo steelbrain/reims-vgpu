@@ -14,6 +14,11 @@
 //!   object an argument names are the objects' stream ids, which the recorder gives each object
 //!   as a call makes it (`State::register`) and never gives again; an object's last reference going
 //!   (`Obj`'s drop) is its `release` record.
+//! - **The device's identity.** Right after the record that made a device, an
+//!   [`IDENTITY`] record on it answers what decides how a player makes its resources: the
+//!   device's `name`, which the guest's device info gives, and `hasUnifiedMemory`, by which a
+//!   `Managed` buffer is one copy or two ([`Identity`]). Each later segment starts with the
+//!   identity record of each device then live.
 //! - **Indirect command buffers' commands.** What the CPU encodes into an indirect command buffer
 //!   lives in the runtime's records, which no memory write carries, so each send of commands to
 //!   one is a call record on the buffer: `indirectRenderCommandAtIndex:` or
@@ -48,7 +53,8 @@
 //!   and tracks each call and encodes it. A commit or a copy out of the guest's RAM first takes
 //!   what is queued on its own thread, since its capture needs every earlier call tracked.
 //! - **The file.** The writer writes the stream out every [`FLUSH`], into segments
-//!   `<pid>.NNNN.m2vr` of at most [`SEGMENT`] bytes, each starting with the header. Libraries go
+//!   `<pid>.NNNN.m2vr` of at most [`SEGMENT`] bytes, each starting with the header, a later one
+//!   with the devices' identities after it ([`State::write_out`]). Libraries go
 //!   once each into the `blobs` directory beside the stream's, by the hex of their SHA-256, and
 //!   so do the bytes of `m2v.privateBytes`.
 //!   `<pid>.stats.txt` says what was written, every few seconds.
@@ -759,11 +765,12 @@ fn take_commands<C: typed::Command, R>(
     answer
 }
 
-/// An object a call made: its pointer, a weak reference and its type.
+/// An object a call made: its pointer, a weak reference and its type, and a device's identity.
 pub struct Made {
     ptr: u64,
     weak: Weak<dyn Any + Send + Sync>,
     type_name: &'static str,
+    identity: Option<Identity>,
 }
 
 impl Made {
@@ -773,6 +780,48 @@ impl Made {
             ptr: o.id().0,
             weak,
             type_name: std::any::type_name::<T>(),
+            identity: (o as &dyn Any)
+                .downcast_ref::<crate::gpu::device::VulkanDevice>()
+                .map(Identity::of),
+        }
+    }
+}
+
+/// The selector of a device's identity record ([`Identity`]).
+pub const IDENTITY: &str = "m2v.deviceIdentity";
+
+/// What a device answered the program that decides how a player makes its resources, read as
+/// the stream first names the device: its `name`, which the guest's device info gives, and
+/// whether its GPU shares the CPU's memory (`hasUnifiedMemory`), by which a `Managed` buffer is
+/// one copy or two (docs/graphics-kext/design.md, "Managed storage"). Its record, an
+/// [`IDENTITY`] call on the device with the two as its answers, follows the record that made
+/// the device, and starts each later segment once for each device then live
+/// ([`State::write_out`]).
+#[derive(Debug, Clone, PartialEq)]
+struct Identity {
+    name: String,
+    unified: bool,
+}
+
+impl Identity {
+    fn of(device: &crate::gpu::device::VulkanDevice) -> Identity {
+        let props = device.raw.properties();
+        Identity {
+            name: props.name.clone(),
+            unified: props.has_unified_memory,
+        }
+    }
+
+    /// Its record, on the device of stream id `device`.
+    fn record(&self, device: u64) -> Call {
+        Call {
+            selector: IDENTITY.to_owned(),
+            receiver: device,
+            answers: vec![
+                ("name".to_owned(), Value::Str(self.name.clone())),
+                ("hasUnifiedMemory".to_owned(), Value::Bool(self.unified)),
+            ],
+            ..Call::default()
         }
     }
 }
@@ -881,19 +930,22 @@ fn object_value<T: Send + Sync + 'static>(o: &Obj<T>) -> Value {
 }
 
 /// The receiver's id; a device the stream has not seen is adopted, with its
-/// `MTLCreateSystemDefaultDevice` record.
+/// `MTLCreateSystemDefaultDevice` record and its identity's.
 fn receiver_id<T: Send + Sync + 'static>(o: &Obj<T>) -> u64 {
     let Some(state) = state() else { return 0 };
     if let Some(id) = id_at(o.id().0) {
         return id;
     }
     if std::any::type_name::<T>() == std::any::type_name::<crate::gpu::device::DeviceObject>() {
-        let id = state.register(Made::of(o));
-        state.push_plain(Call {
+        let mut made = Made::of(o);
+        let identity = made.identity.take();
+        let id = state.register(made);
+        let adopted = Item::Plain(Call {
             selector: "MTLCreateSystemDefaultDevice".to_owned(),
             result: id,
             ..Call::default()
         });
+        state.push_made(adopted, id, identity);
         return id;
     }
     state
@@ -980,16 +1032,20 @@ pub fn finish(active: Active, made: Option<Made>) {
     let Some(mut call) = pending else { return };
     let Some(state) = state() else { return };
     let t0 = now_ns();
-    if let Some(made) = made {
+    let mut identity = None;
+    if let Some(mut made) = made {
+        identity = made.identity.take();
         call.result = state.register(made);
     }
     state.capture_now(&mut call);
-    state.push(Item::Call {
+    let result = call.result;
+    let item = Item::Call {
         call,
         text,
         shape: true,
         snap,
-    });
+    };
+    state.push_made(item, result, identity);
     add_times(state, 0, now_ns() - t0, true);
     drop(token);
 }
@@ -1279,6 +1335,9 @@ enum Item {
     Private(private::Read),
     /// A record written as it is.
     Plain(Call),
+    /// A device's identity record ([`Identity`]), written as it is and kept for each later
+    /// segment's start.
+    Identity(Call),
     /// An `m2v.write` of the chunks a capture found changed: its chunks scanned for addresses
     /// (`scan_addresses`), then written, counted by its selector.
     Write(Call),
@@ -1386,6 +1445,71 @@ struct Stats {
     private_skipped: AtomicU64,
 }
 
+/// The files a stream is written to: segments `<base>.NNNN.m2vr` of at most `limit` bytes past
+/// one record, each starting with the header.
+struct Segments {
+    base: PathBuf,
+    limit: u64,
+    next: u32,
+    file: Option<std::fs::File>,
+    written: u64,
+}
+
+impl Segments {
+    fn new(base: PathBuf, limit: u64) -> Segments {
+        Segments {
+            base,
+            limit,
+            next: 0,
+            file: None,
+            written: 0,
+        }
+    }
+
+    /// Whether `bytes` more fill the segment they go to, so the bytes after them start the next.
+    fn fills(&self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return false;
+        }
+        let at = if self.starts() {
+            format::HEADER.len() as u64
+        } else {
+            self.written
+        };
+        at.saturating_add(bytes as u64) >= self.limit
+    }
+
+    /// Whether the next bytes start a segment.
+    fn starts(&self) -> bool {
+        self.file.is_none() || self.written >= self.limit
+    }
+
+    /// Writes `bytes`, after a new segment's header where they start one.
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.starts() {
+            let path = PathBuf::from(format!("{}.{:04}.m2vr", self.base.display(), self.next));
+            self.next += 1;
+            self.file = std::fs::File::create(&path)
+                .inspect_err(|e| {
+                    log::warn!(target: "reims_vgpu_vulkan::recorder", "{}: {e}", path.display());
+                })
+                .ok();
+            self.written = 0;
+            if let Some(f) = self.file.as_mut() {
+                let _ = f.write_all(&format::HEADER);
+                self.written += format::HEADER.len() as u64;
+            }
+        }
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.write_all(bytes);
+            self.written += bytes.len() as u64;
+        }
+    }
+}
+
 struct State {
     base: PathBuf,
     blobs_dir: PathBuf,
@@ -1406,6 +1530,9 @@ struct State {
     snaps: AtomicU64,
     /// Each snapshotted dispatch's position in the stream, by its snapshot, until its records.
     dispatched: Mutex<KeyMap<u64>>,
+    /// The identity record of each device whose identity the stream holds and whose release it
+    /// does not, by its stream id: what each later segment starts with. Taken under `stream`.
+    identities: Mutex<BTreeMap<u64, Call>>,
     stats: Stats,
 }
 
@@ -1429,6 +1556,7 @@ impl State {
             selectors: Mutex::new(BTreeMap::new()),
             snaps: AtomicU64::new(0),
             dispatched: Mutex::new(KeyMap::default()),
+            identities: Mutex::new(BTreeMap::new()),
             stats: Stats::default(),
         }
     }
@@ -1453,9 +1581,7 @@ impl State {
     }
 
     fn write_loop(&self) {
-        let mut segment = 0u32;
-        let mut file: Option<std::fs::File> = None;
-        let mut written = 0u64;
+        let mut segments = Segments::new(self.base.clone(), SEGMENT);
         let flush = u64::try_from(FLUSH.as_nanos()).unwrap_or(u64::MAX);
         let stats = u64::try_from(STATS.as_nanos()).unwrap_or(u64::MAX);
         let mut flushed = now_ns();
@@ -1470,28 +1596,8 @@ impl State {
                 continue;
             }
             flushed = now;
-            let bytes = self.stream.lock().take();
             let t0 = now_ns();
-            if !bytes.is_empty() {
-                if file.is_none() || written >= SEGMENT {
-                    let path = PathBuf::from(format!("{}.{segment:04}.m2vr", self.base.display()));
-                    segment += 1;
-                    file = std::fs::File::create(&path)
-                        .inspect_err(|e| {
-                            log::warn!(target: "reims_vgpu_vulkan::recorder", "{}: {e}", path.display());
-                        })
-                        .ok();
-                    written = 0;
-                    if let Some(f) = file.as_mut() {
-                        let _ = f.write_all(&format::HEADER);
-                        written += format::HEADER.len() as u64;
-                    }
-                }
-                if let Some(f) = file.as_mut() {
-                    let _ = f.write_all(&bytes);
-                    written += bytes.len() as u64;
-                }
-            }
+            self.write_out(&mut segments);
             (self.stats.flush_ns).fetch_add(now_ns() - t0, Ordering::Relaxed);
             if now - counted >= stats {
                 counted = now;
@@ -1503,6 +1609,38 @@ impl State {
     /// Queues a record, in the stream's order.
     fn push(&self, item: Item) {
         self.queue.lock().push(item);
+    }
+
+    /// Writes the stream's bytes since the last write out to its segments. Where they fill the
+    /// segment, the identity record of each device then live is written at once, under the
+    /// stream's lock, so the next bytes, which start the next segment, start with them: names
+    /// carry across segments, so their records use the names the stream defined before. Under
+    /// `shaping`, so no queued record is half processed meanwhile (a dispatch's position is read
+    /// after its call is written).
+    fn write_out(&self, segments: &mut Segments) {
+        let bytes = {
+            let _shaping = self.shaping.lock();
+            let mut stream = self.stream.lock();
+            let bytes = stream.take();
+            if segments.fills(bytes.len()) {
+                for call in self.identities.lock().values() {
+                    stream.call(call);
+                }
+            }
+            bytes
+        };
+        segments.write(&bytes);
+    }
+
+    /// Queues `item`, which made the object of stream id `id`, and right after it, where the
+    /// object is a device, its identity record ([`Identity`]): under one lock, so no other
+    /// thread's record comes between.
+    fn push_made(&self, item: Item, id: u64, identity: Option<Identity>) {
+        let mut queue = self.queue.lock();
+        queue.push(item);
+        if let Some(identity) = identity {
+            queue.push(Item::Identity(identity.record(id)));
+        }
     }
 
     /// Queues a record written as it is.
@@ -1570,6 +1708,14 @@ impl State {
                 (n, 1)
             }
             Item::Plain(call) => (self.emit(call), 1),
+            Item::Identity(call) => {
+                // Kept as it is written, under the stream's lock, so a segment that starts after
+                // it starts with it ([`State::write_out`]).
+                let mut stream = self.stream.lock();
+                let n = stream.call(&call);
+                self.identities.lock().insert(call.receiver, call);
+                (n, 1)
+            }
             Item::Write(call) => {
                 for v in &call.args {
                     if let Value::Bytes(data) = v {
@@ -1590,6 +1736,7 @@ impl State {
                     }
                 }
                 self.sync.lock().cbs.remove(&id);
+                self.identities.lock().remove(&id);
                 let n = self.emit(Call {
                     selector: "release".to_owned(),
                     receiver: id,
@@ -3529,4 +3676,208 @@ mod tests {
             Value::List(vec![cmd("reset", vec![])])
         );
     }
+
+    /// The call records of `segment`, read with the names the segments before it defined
+    /// (`names`, which grows).
+    fn calls_of(segment: &[u8], names: &mut Vec<String>) -> Vec<Call> {
+        let read = format::read(segment, names).unwrap();
+        assert!(!read.truncated);
+        (read.records.into_iter())
+            .filter_map(|r| match r {
+                format::Record::Call(c) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A device's identity record is written right after the record that made the device; each
+    /// later segment starts with the identity record of each device then live, after its header,
+    /// and a released device's is not among them. Read across the segments, the names those
+    /// records use are the ones the first defined.
+    #[test]
+    fn each_segment_starts_with_the_live_devices_identities() {
+        let dir =
+            std::env::temp_dir().join(format!("rvg-recorder-segments-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = State::new(dir.join("streams"));
+        let mut segments = Segments::new(dir.join("stream"), 256);
+        let made = |id| Call {
+            selector: "MTLCreateSystemDefaultDevice".to_owned(),
+            result: id,
+            ..Call::default()
+        };
+        let discrete = Identity {
+            name: "A discrete GPU".to_owned(),
+            unified: false,
+        };
+        let integrated = Identity {
+            name: "An integrated GPU".to_owned(),
+            unified: true,
+        };
+        state.push_made(Item::Plain(made(1)), 1, Some(discrete.clone()));
+        state.push_made(Item::Plain(made(2)), 2, Some(integrated.clone()));
+        state.push(Item::Release(2));
+        // Long enough to fill the first segment.
+        let commit = |args| Call {
+            selector: "commit".to_owned(),
+            receiver: 1,
+            args,
+            ..Call::default()
+        };
+        state.push_plain(commit(vec![Value::Bytes(vec![1; 300])]));
+        state.drain(true);
+        state.write_out(&mut segments);
+        state.push_plain(commit(Vec::new()));
+        state.drain(true);
+        state.write_out(&mut segments);
+        let segment = |n: u32| std::fs::read(dir.join(format!("stream.{n:04}.m2vr"))).unwrap();
+        let (first, second) = (segment(0), segment(1));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut names = Vec::new();
+        let release = Call {
+            selector: "release".to_owned(),
+            receiver: 2,
+            ..Call::default()
+        };
+        let first = calls_of(&first, &mut names);
+        assert_eq!(
+            first[..5],
+            [
+                made(1),
+                discrete.record(1),
+                made(2),
+                integrated.record(2),
+                release
+            ]
+        );
+        assert_eq!(first.len(), 6, "{first:?}");
+        assert_eq!(second.get(..16), Some(&format::HEADER[..]));
+        let second = calls_of(&second, &mut names);
+        assert_eq!(second, [discrete.record(1), commit(Vec::new())]);
+        assert_eq!(
+            discrete.record(1).answers,
+            [
+                ("name".to_owned(), Value::Str("A discrete GPU".to_owned())),
+                ("hasUnifiedMemory".to_owned(), Value::Bool(false)),
+            ]
+        );
+        assert_eq!(
+            state.stream.lock().calls(),
+            8,
+            "the identity counts as a call"
+        );
+    }
+
+    /// The marker that makes a run of a test that records its own process the child, which
+    /// records.
+    const RECORD_CHILD: &str = "REIMS_VGPU_RECORDER_CHILD";
+
+    /// Runs the test `name` (its path in the crate) in a child process of its own that records
+    /// into a scratch directory, since the recorder is the process's, and fails where the child
+    /// fails or runs no test. In the child, runs `child` with the directory its streams go to.
+    fn in_recording_child(name: &str, child: impl FnOnce(&std::path::Path)) {
+        if std::env::var_os(RECORD_CHILD).is_some() {
+            let streams = std::env::var_os(ENV_VAR).expect("the child records");
+            child(std::path::Path::new(&streams));
+            return;
+        }
+        let leaf = name.rsplit("::").next().unwrap_or(name);
+        let dir = std::env::temp_dir().join(format!("rvg-recorder-{leaf}-{}", std::process::id()));
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(RECORD_CHILD, "1")
+            .env(ENV_VAR, dir.join("streams"))
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "{out:?}");
+        let ran = String::from_utf8_lossy(&out.stdout).contains("1 passed");
+        assert!(ran, "the child ran no test: {out:?}");
+    }
+
+    /// The call records and blobs of the first segment this process wrote into `streams`, once
+    /// its calls hold what `done` waits for, or after 10 s.
+    fn recorded(
+        streams: &std::path::Path,
+        done: impl Fn(&[Call]) -> bool,
+    ) -> (Vec<Call>, Vec<(Hash, Vec<u8>)>) {
+        let segment = streams.join(format!("{}.0000.m2vr", std::process::id()));
+        let (mut calls, mut blobs) = (Vec::new(), Vec::new());
+        for _ in 0..200 {
+            let read = std::fs::read(&segment)
+                .ok()
+                .and_then(|b| format::read(&b, &mut Vec::new()).ok());
+            (calls, blobs) = (Vec::new(), Vec::new());
+            for r in read.into_iter().flat_map(|r| r.records) {
+                match r {
+                    format::Record::Call(c) => calls.push(c),
+                    format::Record::Blob(hash, data) => blobs.push((hash, data)),
+                    format::Record::Name(_) => {}
+                }
+            }
+            if done(&calls) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        (calls, blobs)
+    }
+
+    /// The process's platform, recording, and its default device, opened through it as the
+    /// device's host opens it.
+    fn recording_device() -> (
+        crate::platform::VulkanPlatform,
+        crate::gpu::device::VulkanDevice,
+    ) {
+        use crate::core::platform::Platform as _;
+        let platform = crate::platform::VulkanPlatform::new();
+        assert!(on(), "the child does not record");
+        let registry_id = crate::os::default_registry_id()
+            .or_else(crate::platform::VulkanPlatform::default_device_registry_id)
+            .expect("a Vulkan device");
+        let device = platform
+            .open_device(registry_id)
+            .expect("the default device");
+        (platform, device)
+    }
+
+    /// A stream starts with the device's making and then its identity: the name the guest's
+    /// device info gives (the device's `caps`) and whether its GPU shares the CPU's memory (its
+    /// identity's `hasUnifiedMemory`, which the guest is given unchanged), before any call on
+    /// the device.
+    #[test]
+    fn on_vulkan_a_stream_starts_with_the_devices_identity() {
+        in_recording_child(
+            "recorder::tests::on_vulkan_a_stream_starts_with_the_devices_identity",
+            |streams| {
+                use crate::core::platform::device::GpuDevice as _;
+                let (_platform, device) = recording_device();
+                let _queue = device.new_command_queue().expect("a queue");
+                let (calls, _) = recorded(streams, |calls| {
+                    calls.iter().any(|c| c.selector == "newCommandQueue")
+                });
+                let made = calls.first().expect("a record");
+                assert_eq!(made.selector, "MTLCreateSystemDefaultDevice", "{calls:?}");
+                assert_ne!(made.result, 0);
+                let name = device.caps().name.clone().expect("a name");
+                let unified = device.identity_caps().flags.has_unified_memory;
+                let identity = Identity {
+                    name,
+                    unified: unified.expect("an answer"),
+                };
+                assert_eq!(
+                    calls.get(1),
+                    Some(&identity.record(made.result)),
+                    "{calls:?}"
+                );
+                let queue = calls.get(2).expect("the queue's record");
+                assert_eq!(
+                    (queue.selector.as_str(), queue.receiver),
+                    ("newCommandQueue", made.result)
+                );
+            },
+        );
+    }
+
 }
