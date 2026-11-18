@@ -22,10 +22,10 @@ drivers drive in x86-64 macOS guests:
 
 The guest's Metal bundle serialises its Metal calls onto the device's rings,
 and the library carries them out on the host's GPU, on the Vulkan platform
-(`crates/reims-vgpu-vulkan`), over metal2vulkan's Metal-shaped runtime: on
-Linux, and on a Mac over MoltenVK, a build for development and tests.
-Windows is being brought up on homelab-mac-mini-2018; nothing ships for it
-yet.
+(`crates/reims-vgpu-vulkan`), over metal2vulkan's Metal-shaped runtime, on
+Linux, Windows and macOS hosts: on a Mac over MoltenVK, Vulkan rather than
+Metal. x86-64 VMs run on Linux and Windows hosts, and arm64 VMs on Apple
+silicon Macs. Windows is tested on homelab-mac-mini-2018.
 The device's video decodes run on the host's VA-API or NVDEC.
 
 [README.md](README.md) says what the project is, and
@@ -355,10 +355,11 @@ Three tiers:
   the guest or host observes. They do not cite the earlier ports, which
   stay at their tags (`byte-exact-parity`, `rust-port-parity`,
   `native-parity`).
-- **Linux ships; the Mac builds arm64.** The library ships for Linux
-  alone, as `x86_64-unknown-linux-gnu`, built there. On a Mac it builds
-  over MoltenVK for development and tests, and every Rust binary built for
-  macOS is arm64 (`aarch64-apple-darwin`): rustc's arm64e target has no
+- **Linux, Windows and macOS hosts; the Mac builds arm64.** The library
+  runs on Linux as `x86_64-unknown-linux-gnu` and on Windows as
+  `x86_64-pc-windows-gnullvm`, each built on its own host, Windows' under
+  MSYS2 CLANG64. On a Mac it runs over MoltenVK, and every Rust binary built
+  for macOS is arm64 (`aarch64-apple-darwin`): rustc's arm64e target has no
   pointer authentication, and its binaries crash before `main`
   (`rust-toolchain.toml`).
   `cargo xtask check` on a Mac also clippy-checks the Linux target, and, where
@@ -366,8 +367,7 @@ Three tiers:
   below `core::`) as `x86_64-apple-darwin`, for the x86-64 guest's 4 KiB
   pages and instructions; it skips them, saying so, where Rosetta is not.
   No x86-64 macOS binary ships. On the Mac and on Linux the check also
-  clippy-checks `x86_64-pc-windows-gnullvm`, the Windows target the library
-  is being brought up on, built there under MSYS2 CLANG64.
+  clippy-checks `x86_64-pc-windows-gnullvm`, the Windows target.
 - **Run `cargo xtask check` once before a branch that changes the library
   merges**, not before each commit (Checking a change).
 - **Stage explicit paths, and never commit build output.** Before each
