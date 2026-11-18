@@ -25,7 +25,7 @@ use crate::core::platform::types::{
 use crate::core::platform::values::{
     ArgumentDesc, BufferDeallocator, BufferDesc, DepthStencilDesc, FullComputePipelineDesc,
     FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc, OptionSet,
-    PagesInPlace, PagesPlane, RenderPipelineDesc, SamplerDesc,
+    PagesInPlace, PagesPlane, RenderPipelineDesc, SamplerDesc, TextureDesc,
 };
 use crate::core::platform::{Handle, HostRange};
 use crate::core::raise::{Kept, OnFault, RaiseResult, keep_forever};
@@ -42,7 +42,8 @@ use crate::gpu::backing::{self, Backing};
 use crate::gpu::caps;
 use crate::gpu::command::{QueueObject, VulkanCommandQueue};
 use crate::gpu::desc::{
-    Maker, TextureFields, VulkanTextureDescriptor, created_format_refused, format_refused,
+    Maker, TextureDescriptorObject, TextureFields, VulkanTextureDescriptor,
+    created_format_refused, format_refused,
 };
 use crate::gpu::event::{VulkanEvent, VulkanSharedEvent};
 use crate::gpu::icb::VulkanIcb;
@@ -694,16 +695,21 @@ impl VulkanDevice {
         })
     }
 
-    /// A texture of `descriptor` of the platform's own, for a helper the guest never reaches
-    /// (the window's cursor glyph): it takes no range of Metal's space ([`metal_space::Hold`]'s
-    /// `NONE`) and no resource ID (the runtime's `IdPlacement::Outside`, whose texture answers 0),
-    /// so no guest-visible address or ID depends on it. `None` where the runtime refuses it. A
-    /// recording holds it as an ordinary `newTextureWithDescriptor:` on the device
-    /// ([`crate::recorder`]), so its later calls (the glyph's `replaceRegion:`) and the commands
-    /// that bind it name it.
-    pub fn new_own_texture(&self, descriptor: &VulkanTextureDescriptor) -> Option<VulkanTexture> {
+    /// A texture of `desc` of the platform's own, for a helper the guest never reaches (the
+    /// window's cursor glyph): it takes no range of Metal's space ([`metal_space::Hold`]'s `NONE`)
+    /// and no resource ID (the runtime's `IdPlacement::Outside`, whose texture answers 0), so no
+    /// guest-visible address or ID depends on it. `None` where the runtime refuses it. A recording
+    /// holds it as an ordinary `newTextureWithDescriptor:` on the device, of a descriptor whose
+    /// `m2v.textureDescriptor` record marks it [`crate::recorder::OUTSIDE`]
+    /// ([`crate::recorder::outside_descriptor`]), so a player places it outside the guest's
+    /// texture indices, and its later calls (the glyph's `replaceRegion:`) and the commands that
+    /// bind it name it.
+    pub fn new_own_texture(&self, desc: &TextureDesc) -> Option<VulkanTexture> {
+        let descriptor: VulkanTextureDescriptor =
+            Obj::new(TextureDescriptorObject::new(TextureFields::of(desc)));
+        crate::recorder::outside_descriptor(&descriptor, desc);
         let recorded_call =
-            crate::recorder::rec_call!("newTextureWithDescriptor:", self, descriptor);
+            crate::recorder::rec_call!("newTextureWithDescriptor:", self, &descriptor);
         let recorded_answer = crate::recorder::run(|| -> Option<VulkanTexture> {
             let fields = descriptor.fields();
             let mut desc = fields.descriptor("newTextureWithDescriptor:", Maker::Other);
@@ -3468,11 +3474,12 @@ pub(crate) mod tests {
         use crate::core::platform::values::TextureDesc;
         let p = crate::platform::tests::platform();
         let d = dev();
-        let desc = p.texture_descriptor(&TextureDesc {
+        let value = TextureDesc {
             width: 32,
             height: 32,
             ..TextureDesc::default()
-        });
+        };
+        let desc = p.texture_descriptor(&value);
         let guest = || {
             let texture = d.new_texture(OnFault::Return, &desc).unwrap().unwrap();
             let buffer = d
@@ -3482,7 +3489,7 @@ pub(crate) mod tests {
             (texture.unique_identifier(), buffer.gpu_address())
         };
         let without = guest();
-        let own = d.new_own_texture(&desc).unwrap();
+        let own = d.new_own_texture(&value).unwrap();
         assert_eq!(own.unique_identifier(), 0);
         assert_eq!(guest(), without);
         let held = d.new_texture(OnFault::Return, &desc).unwrap().unwrap();

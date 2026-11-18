@@ -14,8 +14,9 @@
 //!   object an argument names are the objects' stream ids, which the recorder gives each object
 //!   as a call makes it (`State::register`) and never gives again, a texture of the platform's
 //!   own (the window's cursor glyph, `VulkanDevice::new_own_texture`) as any other
-//!   `newTextureWithDescriptor:`; an object's last reference going (`Obj`'s drop) is its
-//!   `release` record.
+//!   `newTextureWithDescriptor:`, of a descriptor whose `m2v.textureDescriptor` map holds
+//!   [`OUTSIDE`] (`outside: true`) so a player places it outside the guest's texture indices; an
+//!   object's last reference going (`Obj`'s drop) is its `release` record.
 //! - **The device's identity.** Right after the record that made a device, an
 //!   [`IDENTITY`] record on it answers what decides how a player makes its resources: the
 //!   device's `name`, which the guest's device info gives, and `hasUnifiedMemory`, by which a
@@ -1013,6 +1014,31 @@ pub fn adopt_texture(t: &VulkanTexture) {
         answers: vec![("m2v.drawable".to_owned(), Value::Bool(true))],
         ..Call::default()
     });
+}
+
+/// The key of an `m2v.textureDescriptor` record's map that marks a descriptor of a texture of the
+/// platform's own (the window's cursor glyph), `true`: its texture takes no resource ID and no
+/// range of Metal's space, so a player places it outside the guest's texture indices. Only such
+/// a descriptor carries it ([`outside_descriptor`]).
+pub const OUTSIDE: &str = "outside";
+
+/// Records the making of `descriptor`, of `desc`, for a texture of the platform's own
+/// (`VulkanDevice::new_own_texture`): an `m2v.textureDescriptor` on the platform, as its
+/// `texture_descriptor` records one, whose map ends with [`OUTSIDE`] `true`. The texture's
+/// `newTextureWithDescriptor:` names it as any other's names its descriptor.
+pub fn outside_descriptor(
+    descriptor: &crate::gpu::desc::VulkanTextureDescriptor,
+    desc: &crate::core::platform::values::TextureDesc,
+) {
+    let Some(token) = enter() else { return };
+    let active = begin(token, || {
+        let mut fields = parse_text(&debug_text(desc));
+        if let Value::Map(pairs) = &mut fields {
+            pairs.push((OUTSIDE.to_owned(), Value::Bool(true)));
+        }
+        ("m2v.textureDescriptor", 0, vec![fields])
+    });
+    finish(active, Some(Made::of(descriptor)));
 }
 
 /// The guest's frame ends here, showing `t`: the texture over the surface a present names, as
@@ -4242,7 +4268,9 @@ mod tests {
     }
 
     /// A texture of the platform's own (the window's cursor glyph) is a `newTextureWithDescriptor:`
-    /// on the device of its descriptor, as any other: the stream names it as the receiver of its
+    /// on the device, as any other, of a descriptor whose `m2v.textureDescriptor` map is its
+    /// `TextureDesc`'s with [`OUTSIDE`] `true` after it, where a guest texture's of the same
+    /// value has no such key; the stream names the texture as the receiver of its
     /// `replaceRegion:` and the argument of the `setFragmentTexture:atIndex:` that binds it, and
     /// counts no object it could not name.
     #[test]
@@ -4262,18 +4290,23 @@ mod tests {
                     "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:";
                 const BIND: &str = "setFragmentTexture:atIndex:";
                 const MADE: &str = "newTextureWithDescriptor:";
+                const DESCRIPTOR: &str = "m2v.textureDescriptor";
                 let (platform, device) = recording_device();
                 let (_target, pass) =
                     crate::gpu::encode_render::tests::pass_of(&platform, &device, (4, 4));
-                let descriptor = platform.texture_descriptor(&TextureDesc {
+                let value = TextureDesc {
                     width: 4,
                     height: 4,
                     ..TextureDesc::default()
-                });
-                let own = device.new_own_texture(&descriptor).expect("an own texture");
+                };
+                let own = device.new_own_texture(&value).expect("an own texture");
                 let pixels = [0x7fu8; 64];
                 let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(4, 4, 1));
                 (own.replace_region(region, 0, 0, HostRange::of_slice(&pixels), 16, 64)).unwrap();
+                let guest_descriptor = platform.texture_descriptor(&value);
+                let guest = (device.new_texture(OnFault::Die, &guest_descriptor))
+                    .unwrap()
+                    .expect("a guest texture");
                 let queue = device.new_command_queue().expect("a queue");
                 let cb = queue.command_buffer(OnFault::Die).unwrap().unwrap();
                 let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
@@ -4297,21 +4330,38 @@ mod tests {
                     assert!(of.next().is_none(), "two of {selector}: {calls:?}");
                     call
                 };
+                // The map of the descriptor the create `made` names.
+                let descriptor_of = |made: &Call| {
+                    let Some(&Value::Object(id)) = made.args.first() else {
+                        panic!("no descriptor named: {made:?}");
+                    };
+                    let record = (calls.iter())
+                        .find(|c| c.selector == DESCRIPTOR && c.result == id)
+                        .unwrap_or_else(|| panic!("nothing made descriptor {id}: {calls:?}"));
+                    match record.args.first() {
+                        Some(Value::Map(pairs)) => pairs.clone(),
+                        other => panic!("a descriptor's map: {other:?}"),
+                    }
+                };
                 let replace = one(REPLACE);
                 assert_ne!(replace.receiver, 0, "the replace's receiver is unnamed");
                 let made = (calls.iter())
                     .find(|c| c.selector == MADE && c.result == replace.receiver)
                     .unwrap_or_else(|| panic!("nothing made the replace's receiver: {calls:?}"));
-                let own_descriptor = (calls.iter())
-                    .rfind(|c| c.selector == "m2v.textureDescriptor")
-                    .expect("the own texture's descriptor");
                 let device_id = calls.first().expect("the device's record").result;
                 assert_eq!(made.receiver, device_id, "{made:?}");
+                let guest_made = (calls.iter())
+                    .rfind(|c| c.selector == MADE)
+                    .expect("the guest texture's record");
+                assert_ne!(guest_made.result, made.result, "{calls:?}");
+                let (mut own_map, guest_map) = (descriptor_of(made), descriptor_of(guest_made));
                 assert_eq!(
-                    made.args.first(),
-                    Some(&Value::Object(own_descriptor.result)),
+                    own_map.pop(),
+                    Some((OUTSIDE.to_owned(), Value::Bool(true))),
                     "{made:?}"
                 );
+                assert_eq!(own_map, guest_map);
+                assert!(guest_map.iter().all(|(key, _)| key != OUTSIDE));
                 assert_eq!(
                     one(BIND).args.first(),
                     Some(&Value::Object(replace.receiver)),
@@ -4319,7 +4369,7 @@ mod tests {
                 );
                 assert_eq!(stat(streams, "unrecorded_refs"), 0);
                 assert_eq!(stat(streams, "unrecorded_receivers"), 0);
-                drop((own, descriptor));
+                drop((own, guest));
             },
         );
     }

@@ -262,14 +262,14 @@ fn glyph_texture<P: ApiPlatform>(
     let mut bytes = glyph.rgba.get(..length).unwrap_or(&glyph.rgba).to_vec();
     bytes.resize(length, 0);
     premultiply(&mut bytes);
-    let descriptor = platform.texture_descriptor(&TextureDesc {
+    let desc = TextureDesc {
         pixel_format: GLYPH_FORMAT,
         width,
         height,
         usage: GLYPH_USAGE,
         ..TextureDesc::default()
-    });
-    let texture = platform.own_texture(device, &descriptor)?;
+    };
+    let texture = platform.own_texture(device, &desc)?;
     no_catch(texture.replace_region(
         MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(width, height, 1)),
         0,

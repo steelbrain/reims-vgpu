@@ -24,9 +24,9 @@ impl ApiPlatform for VulkanPlatform {
     fn own_texture(
         &self,
         device: &<Self as Platform>::Device,
-        descriptor: &<Self as Platform>::TextureDescriptor,
+        desc: &TextureDesc,
     ) -> Option<<Self as Platform>::Texture> {
-        device.new_own_texture(descriptor)
+        device.new_own_texture(desc)
     }
 
     /// The process's default device (`MTLCreateSystemDefaultDevice()`, the GPU the platform's

@@ -16,6 +16,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use reims_vgpu_vulkan::core::host::HostQueue;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::values::TextureDesc;
 use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::core::rt::{Executor, Job, SerialQueue};
 use reims_vgpu_vulkan::core::sync::Mutex;
@@ -54,16 +55,13 @@ pub trait ApiPlatform: Platform {
     /// `bytes_per_row` after the last. The caller has checked that `dst` holds them.
     fn read_pixels(&self, texture: &Self::Texture, dst: &mut [u8], bytes_per_row: usize);
 
-    /// A texture of `descriptor` on `device` of the platform's own, for a helper the guest never
+    /// A texture of `desc` on `device` of the platform's own, for a helper the guest never
     /// reaches (the window's glyph of the guest's cursor, `graphics::sink`'s `cursor`), so that no
-    /// address or ID the guest reads depends on it: a plain texture by default. `None` where the
-    /// platform refuses it.
-    fn own_texture(
-        &self,
-        device: &Self::Device,
-        descriptor: &Self::TextureDescriptor,
-    ) -> Option<Self::Texture> {
-        crate::entry::no_catch(device.new_texture(OnFault::Die, descriptor))
+    /// address or ID the guest reads depends on it: a plain texture of a descriptor of `desc` by
+    /// default. `None` where the platform refuses it.
+    fn own_texture(&self, device: &Self::Device, desc: &TextureDesc) -> Option<Self::Texture> {
+        let descriptor = self.texture_descriptor(desc);
+        crate::entry::no_catch(device.new_texture(OnFault::Die, &descriptor))
     }
 
     /// What the platform holds of the guest's RAM while a graphics device made over `map` lives:

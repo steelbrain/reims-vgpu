@@ -32,6 +32,13 @@
 //! (`MTLIndirectRenderCommand`'s or `MTLIndirectComputeCommand`'s) and whose value is the list of
 //! its arguments, as an encoder's command of that selector carries them: objects by their ids
 //! (nil for none), sizes and regions as maps, a command of no arguments an empty list.
+//!
+//! A texture of the recording platform's own (the window's cursor glyph), which takes no
+//! resource ID and no range of Metal's space, is a `newTextureWithDescriptor:` on the device as
+//! any other, naming a descriptor whose `m2v.textureDescriptor` record's map ends with the key
+//! `outside`, `true` ([`super::OUTSIDE`]): a player places the texture outside the guest's
+//! texture indices, so the guest's textures after it keep their indices. No other descriptor
+//! carries the key.
 
 use std::collections::{HashMap, HashSet};
 
