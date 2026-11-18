@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use reims_vgpu_vulkan::core::testkit::death::exit_signal;
+use reims_vgpu_vulkan::core::testkit::death::{exit_signal, no_core_at_spawn};
 
 #[path = "support/cdylib.rs"]
 mod cdylib;
@@ -78,6 +78,10 @@ fn harness(name: &str) -> Harness {
 /// PATH, where the loader looks for it.
 fn run(h: &Harness, args: &[&str]) -> Output {
     let mut command = Command::new(&h.bin);
+    // `die-null` ends the harness on purpose: it leaves no core.
+    if args.first() == Some(&"die-null") {
+        no_core_at_spawn(&mut command);
+    }
     command.args(args);
     if cfg!(windows) {
         let path = std::env::var_os("PATH").unwrap_or_default();

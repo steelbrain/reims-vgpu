@@ -455,6 +455,28 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Resu
     Ok(())
 }
 
+/// Makes the process `cmd` starts leave no core when it dies, as [`enter`] makes the harness's
+/// own children: on Unix its soft core limit is set to 0 before it runs, the hard limit kept.
+/// Every test that starts a process meant to die outside the harness (a child of the test
+/// binary run again, a C program) starts it so, since systemd-coredump keeps every core it is
+/// given and a run may lift the limit to catch a test process's own crash. Nothing on Windows,
+/// which has no core limit.
+pub fn no_core_at_spawn(cmd: &mut Command) -> &mut Command {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: the closure runs in the child between `fork` and `exec`, and calls only
+        // `getrlimit` and `setrlimit`, which are async-signal-safe and allocate nothing.
+        unsafe {
+            cmd.pre_exec(|| {
+                sys::dump_no_core();
+                Ok(())
+            });
+        }
+    }
+    cmd
+}
+
 /// The signal a child's exit status says it died of; `None` for an exit. Other crates' tests of
 /// a child's end read it here, so one assertion holds on every OS.
 #[cfg(unix)]
@@ -1711,6 +1733,23 @@ mod tests {
         );
     }
 
+    /// A process started with [`no_core_at_spawn`] starts with a soft core limit of 0, though its
+    /// parent's is not: the parent first sets its own to 1 KiB, as `a_child_leaves_no_core` does,
+    /// and a process started without it keeps that.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_started_to_leave_no_core_has_a_core_limit_of_0() {
+        sys::set_core_limit(1024);
+        let limit = |cmd: &mut Command| {
+            let out = cmd.args(["-c", "ulimit -S -c"]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        assert_eq!(limit(no_core_at_spawn(&mut Command::new("/bin/sh"))), "0");
+        if sys::core_limit() != Some(0) {
+            assert_ne!(limit(&mut Command::new("/bin/sh")), "0");
+        }
+    }
+
     death_test!(
         /// A death under a held lock never lets a blocked second thread record
         a_death_under_a_held_lock_never_lets_a_blocked_thread_record,
@@ -2250,7 +2289,7 @@ mod tests {
             let _ = recurse(0);
             return;
         }
-        let out = Command::new(std::env::current_exe().unwrap())
+        let out = no_core_at_spawn(&mut Command::new(std::env::current_exe().unwrap()))
             .args([
                 "core::testkit::death::tests::a_stack_overflow_without_the_harness_aborts",
                 "--exact",

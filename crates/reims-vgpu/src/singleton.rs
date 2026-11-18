@@ -69,13 +69,13 @@ mod tests {
 
     use std::process::Command;
 
-    use reims_vgpu_vulkan::core::testkit::death::exit_signal;
+    use reims_vgpu_vulkan::core::testkit::death::{exit_signal, no_core_at_spawn};
 
     use super::*;
 
-    /// Re-runs this test binary on one test with `var` set.
+    /// Re-runs this test binary on one test with `var` set, leaving no core should it die.
     fn child(test: &str, var: &str) -> std::process::Output {
-        Command::new(std::env::current_exe().unwrap())
+        no_core_at_spawn(&mut Command::new(std::env::current_exe().unwrap()))
             .args(["--exact", test, "--nocapture", "--test-threads=1"])
             .env(var, "1")
             .output()
