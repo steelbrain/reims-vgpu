@@ -41,7 +41,7 @@
 //!   the queue, uncommitted, where the buffer may be cut then, and at the end of the range before
 //!   it `commit_part` commits the buffer as a part where it may be cut, as `split` does, the later
 //!   one going on from it. Where only a way Metal's GPU fails it from an encoder on keeps it whole
-//!   ([`CommandBufferObject::fails_from_an_encoder`]), `commit_part` commits nothing and answers
+//!   ([`CommandBufferObject::standing`]), `commit_part` commits nothing and answers
 //!   so, and `fold` takes the later one's ways of failing into it, as though its encoders had
 //!   been made there, and lets the later one go uncommitted: its encoders run nothing either way.
 //! - **The records of an indirect command buffer an execution runs** are checked by the runtime
@@ -63,7 +63,7 @@
 //!   command that decides a death ([`executions`]). An encoder the command buffer's failure runs
 //!   nothing of is not asked, whether this platform commits the failure or the runtime makes it
 //!   itself, at a draw of primitive type 9 or a pass's store into read-only memory
-//!   ([`CommandBufferObject::runs_nothing_from`]).
+//!   ([`Noted::runs_nothing_from`]).
 //! - **A draw's or dispatch's pipeline the driver did not make**, which the runtime makes while
 //!   the command goes on and reports as the command buffer's failure
 //!   (`CommandBufferError::PipelineCreation`), dies
@@ -182,8 +182,8 @@
 //!   m3-max-28796 and m3-max-28797; the runtime's `command_buffer/revocation.rs`;
 //!   `read_only_faults_revoke_queues_as_metals`). Other queues serve on.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::core::platform::Handle;
 use crate::core::platform::command::committing as committing_here;
@@ -248,36 +248,21 @@ pub struct CommandBufferObject {
     /// How many of its encoders are open: `setProtectionOptions:`, which the runtime answers
     /// whatever is open, dies while one is.
     pub open_encoders: Arc<AtomicUsize>,
-    /// Its progress, once an encoder needed it ([`CommandBufferObject::progress`]).
-    progress: Mutex<Option<Arc<Progress>>>,
+    /// Its progress, once an encoder needed it ([`CommandBufferObject::progress`]): read with a
+    /// load once made, where a lock and its release would be two locked instructions.
+    progress: OnceLock<Arc<Progress>>,
     /// Its command predication.
     pub(crate) predication: Arc<Predication>,
-    /// Whether it was committed: it is split no more ([`CommandBufferObject::splits`]).
+    /// Whether it was committed: it is split no more ([`CommandBufferObject::splits`]). Stored
+    /// `Relaxed`: nothing is published through it, and a `SeqCst` store is a locked instruction
+    /// (`xchg`) on x86-64 at every commit.
     committed: AtomicBool,
-    /// How many runtime encoders it has made: each encoder of Metal's, or a part of one where
-    /// [`predication`] ends a compute encoder's runtime encoder and makes another. As no two are
-    /// open at once, each one's count before it is its place among the encoders the runtime
-    /// ended, which [`rt::CommitFailure::encoders`] counts.
-    made: AtomicUsize,
-    /// How Metal's GPU fails it for what its encoders did ([`Failing`]), which its commit fails
-    /// it with ([`CommandBufferObject::failure`]).
-    failing: Mutex<Vec<Failing>>,
-    /// How Metal's GPU fails it where the runtime fails it so itself at its draws of primitive
-    /// type 9 ([`CommandBufferObject::fails_at_type_9`]).
-    by_runtime: Mutex<Vec<Failing>>,
-    /// How Metal's GPU faults it where the runtime faults it so itself at its render passes'
-    /// stores into read-only memory the runtime copies
-    /// ([`CommandBufferObject::faults_at_read_only_store`]).
-    stores: Mutex<Vec<Failing>>,
-    /// The protection options `setProtectionOptions:` set, which the runtime does not hold.
-    protection: Mutex<Protection>,
+    /// What it noted of its encoders, behind one lock ([`Noted`]).
+    noted: Mutex<Noted>,
     /// Whether it carries the submission handler that takes Metal's allocation for its work for
     /// the tiler ([`tiler_handler`]), added at its first such work while the process has not
     /// taken it ([`CommandBufferObject::tiler_work`]).
     tiler: AtomicBool,
-    /// The executions of indirect command buffers whose commands its commit reads, each with its
-    /// encoder's place ([`CommandBufferObject::checked_at_commit`]).
-    executions: Mutex<Vec<(usize, executions::Execution)>>,
     /// Whether it signals an event as it is scheduled (`encodeSignalEventScheduled:value:`),
     /// which keeps it whole ([`CommandBufferObject::splits`]).
     signals_scheduled: AtomicBool,
@@ -347,261 +332,48 @@ struct Protection {
     used: bool,
 }
 
-/// Whether protection options end the process where an encoder is made under them: 1, 3 and 7,
-/// at a compute or render encoder's creation and a blit encoder's first command (measured on
-/// the M3 Max: SIGABRT, no message).
-fn aborts_encoders(options: u64) -> bool {
-    matches!(options, 1 | 3 | 7)
+/// What a command buffer notes of its encoders as they are made and encode, behind one lock: an
+/// encoder's making takes it once, and each check of the command buffer at a cut or a commit
+/// once for all it reads ([`CommandBufferObject::standing`], [`CommandBufferObject::commit`]). A
+/// lock and its release are each a locked instruction on x86-64, which costs about 0.49 µs
+/// between two recorded Vulkan commands on RADV, whose command buffers are write-combined memory
+/// (metal2vulkan's measurement on an RX 7900 XTX); a lock per part took up to eleven a check.
+#[derive(Debug, Default)]
+struct Noted {
+    /// How many runtime encoders it has made: each encoder of Metal's, or a part of one where
+    /// [`predication`] ends a compute encoder's runtime encoder and makes another. As no two are
+    /// open at once, each one's count before it is its place among the encoders the runtime
+    /// ended, which [`rt::CommitFailure::encoders`] counts.
+    made: usize,
+    /// How Metal's GPU fails it for what its encoders did ([`Failing`]), which its commit fails
+    /// it with ([`Noted::failure`]).
+    failing: Vec<Failing>,
+    /// How Metal's GPU fails it where the runtime fails it so itself at its draws of primitive
+    /// type 9 ([`CommandBufferObject::fails_at_type_9`]).
+    by_runtime: Vec<Failing>,
+    /// How Metal's GPU faults it where the runtime faults it so itself at its render passes'
+    /// stores into read-only memory the runtime copies
+    /// ([`CommandBufferObject::faults_at_read_only_store`]).
+    stores: Vec<Failing>,
+    /// The protection options `setProtectionOptions:` set, which the runtime does not hold.
+    protection: Protection,
+    /// The executions of indirect command buffers whose commands its commit reads, each with its
+    /// encoder's place ([`CommandBufferObject::checked_at_commit`]).
+    executions: Vec<(usize, executions::Execution)>,
 }
 
-impl CommandBufferObject {
-    /// Work for Metal's tiler encoded by `sel`, `first`: a render encoder made, or a blit's reset
-    /// or copy of an indirect command buffer. Metal's own allocations for it the first time, and
-    /// the command buffer's submission a first use too, which its submission handler takes, added
-    /// here while the process has not taken it ([`tiler_handler`]).
-    pub(crate) fn tiler_work(&self, sel: &'static str, first: FirstUse) {
-        metal_space::first_use(first);
-        if !metal_space::taken(FirstUse::TilerSubmission)
-            && !self.tiler.swap(true, Ordering::SeqCst)
-        {
-            get(sel, || self.raw.add_submission_handler(tiler_handler()));
-        }
-    }
-
-    /// Dies at `sel`, the creation of a compute or render encoder, under protection options that
-    /// end the process there ([`aborts_encoders`]).
-    pub(crate) fn protected_creation(&self, sel: &'static str) {
-        let options = plain(|| self.protection.lock().options);
-        if aborts_encoders(options) {
-            metal_aborts(
-                sel,
-                &format!("an encoder made under protection options {options}"),
-            );
-        }
-    }
-
-    /// How many runtime encoders it has made ([`Self::made_encoder`]).
-    #[cfg(test)]
-    pub(crate) fn encoders_made(&self) -> usize {
-        self.made.load(Ordering::SeqCst)
-    }
-
-    /// A runtime encoder it made, for an encoder of Metal's (`whole`) or a part of one: its place
-    /// among the encoders the runtime ends. An encoder of Metal's made under protection options
-    /// other than 0 fails the command buffer from it, with
-    /// [`PROTECTION_VIOLATION`] below 0x10 and [`INVALID_INPUT`] from there up, its event
-    /// signals firing none; under options that end the process at its first command (a blit
-    /// encoder's, [`aborts_encoders`]) it answers them, which that command dies at.
-    pub(crate) fn made_encoder(&self, whole: bool) -> (usize, Option<u64>) {
-        let at = self.made.fetch_add(1, Ordering::SeqCst);
-        if !whole {
-            return (at, None);
-        }
-        let options = {
-            let mut protection = self.protection.lock();
-            if protection.options != 0 {
-                protection.used = true;
-            }
-            protection.options
-        };
-        if options == 0 {
-            return (at, None);
-        }
-        if aborts_encoders(options) {
-            return (at, Some(options));
-        }
-        self.fail(Failing {
-            code: protection_code(options),
-            from: at,
-            signals: false,
-        });
-        (at, None)
-    }
-
-    /// Whether its work encoded so far may be committed as a part of it (`split`, the module
-    /// docs' "A command buffer in parts"): no encoder open; none of the ways Metal's GPU fails
-    /// it for what its encoders did, nor a draw of primitive type 9, which fail it from an
-    /// encoder on, every one after it running nothing; no protection options set; no execution
-    /// of an indirect command buffer whose commands its commit reads, and no progress kept to
-    /// its completion (a rate map's reset, an indirect command buffer's numbers); no block of
-    /// command predication open, and no unit an unbalanced record emptied
-    /// ([`Predication::cuttable`]; a unit of compute encoders goes on in the next part); and no
-    /// event signalled as it is scheduled. Not committed.
-    fn splits(&self) -> bool {
-        !self.fails() && self.kept_whole_by().is_none()
-    }
-
+impl Noted {
     /// Whether a way Metal's GPU fails it for what its encoders did is noted: a [`Failing`] of
     /// its own, a draw of primitive type 9, a store into read-only memory, each from an encoder
     /// on ([`CommandBufferObject::splits`]).
     fn fails(&self) -> bool {
-        plain(|| {
-            !self.failing.lock().is_empty()
-                || !self.by_runtime.lock().is_empty()
-                || !self.stores.lock().is_empty()
-        })
+        !self.failing.is_empty() || !self.by_runtime.is_empty() || !self.stores.is_empty()
     }
 
-    /// Why it may not be cut, but for how Metal's GPU fails it ([`CommandBufferObject::fails`]):
-    /// the first of [`KeptWhole::ALL`] that holds ([`CommandBufferObject::splits`]); `None` where
-    /// none does.
-    fn kept_whole_by(&self) -> Option<KeptWhole> {
-        plain(|| {
-            let protection = *self.protection.lock();
-            [
-                self.open_encoders.load(Ordering::SeqCst) != 0,
-                protection.options != 0 || protection.used,
-                !self.executions.lock().is_empty(),
-                self.progress.lock().is_some(),
-                !self.predication.cuttable(),
-                self.signals_scheduled.load(Ordering::SeqCst),
-                self.committed.load(Ordering::SeqCst),
-            ]
-            .into_iter()
-            .zip(KeptWhole::ALL)
-            .find_map(|(holds, reason)| holds.then_some(reason))
-        })
-    }
-
-    /// Whether it is kept whole ([`CommandBufferObject::splits`]) only by how Metal's GPU fails it
-    /// for what its encoders did, a draw of primitive type 9 or a store into read-only memory,
-    /// each from an encoder on, every encoder after it running nothing: then a later range's
-    /// encoders run nothing in it either, and need only what they noted of how they fail
-    /// ([`CommandBufferObject::fold`]).
-    fn fails_from_an_encoder(&self) -> bool {
-        self.fails() && self.kept_whole_by().is_none()
-    }
-
-    /// Takes in what `later`, made for a later range of its work (`CommandBuffer::part`) and
-    /// encoded, noted of how Metal's GPU fails it, each failing encoder's place counted after
-    /// this one's encoders, and the encoders it made; and the tiler's submission handler, where
-    /// `later` took it and this one did not ([`CommandBufferObject::tiler_work`]): so its commit
-    /// answers as it would had `later`'s encoders been made in it ([`CommandBufferObject::failure`]),
-    /// a way of failing of `later`'s beside its own dying where two would. Called where it fails
-    /// from an encoder on ([`CommandBufferObject::fails_from_an_encoder`]), before every one of
-    /// `later`'s, which run nothing.
-    fn fold(&self, later: &CommandBufferObject) {
-        let base = self.made.load(Ordering::SeqCst);
-        let after = |ways: &Mutex<Vec<Failing>>| -> Vec<Failing> {
-            (ways.lock().iter())
-                .map(|w| Failing {
-                    from: w.from + base,
-                    ..*w
-                })
-                .collect()
-        };
-        plain(|| {
-            let (failing, by_runtime, stores) = (
-                after(&later.failing),
-                after(&later.by_runtime),
-                after(&later.stores),
-            );
-            self.failing.lock().extend(failing);
-            self.by_runtime.lock().extend(by_runtime);
-            self.stores.lock().extend(stores);
-        });
-        (self.made).fetch_add(later.made.load(Ordering::SeqCst), Ordering::SeqCst);
-        if later.tiler.load(Ordering::SeqCst) && !self.tiler.swap(true, Ordering::SeqCst) {
-            get("commit", || {
-                self.raw.add_submission_handler(tiler_handler())
-            });
-        }
-    }
-
-    /// The next part of it, made on its queue ([`CommandBuffer::split`], `CommandBuffer::part`):
-    /// a command buffer of no encoder yet, its predication going on from this one's, as the unit
-    /// of compute encoders open at a cut goes on in the next part. Its make waits while the
-    /// queue holds 64 uncompleted command buffers, as `commandBuffer` does.
-    fn next_part(&self) -> RaiseResult<VulkanCommandBuffer> {
-        let raw = waiting("commandBuffer", || {
-            self.raw.command_queue().command_buffer()
-        })?;
-        let predication = Predication::new(&self.device);
-        predication.go_on(&self.predication);
-        Ok(Obj::new(CommandBufferObject {
-            raw,
-            device: self.device.clone_ref(),
-            open_encoders: Arc::default(),
-            progress: Mutex::new(None),
-            predication,
-            committed: AtomicBool::new(false),
-            made: AtomicUsize::new(0),
-            failing: Mutex::new(Vec::new()),
-            by_runtime: Mutex::new(Vec::new()),
-            stores: Mutex::new(Vec::new()),
-            protection: Mutex::new(Protection::default()),
-            tiler: AtomicBool::new(false),
-            executions: Mutex::new(Vec::new()),
-            signals_scheduled: AtomicBool::new(false),
-        }))
-    }
-
-    /// Once it completed, nothing having failed it: a loop of its command predication that ran
-    /// past its copies dies, naming the loop, as a failure that is none of Metal's does where it
-    /// is read ([`predication::Overruns::check`]).
-    fn overran(&self) {
-        if self.raw.status() == rt::CommandBufferStatus::Completed {
-            self.predication.check_overruns();
-        }
-    }
-
-    /// Records `failing`, which its commit fails it with ([`CommandBufferObject::failure`]).
-    pub(crate) fn fail(&self, failing: Failing) {
-        self.failing.lock().push(failing);
-    }
-
-    /// Whether it sends no more event signals: one of its encoders fails it with signals that do
-    /// not fire after it ([`Failing::signals`]), as an encoder made under protection options does,
-    /// after which Metal's GPU fires none of its signals (the M3 Max and the AMD 5300M; the Intel
-    /// UHD 630 fires them all; dgpu-oracle.md Q39). Those encoded before it fire.
-    fn withholds_signals(&self) -> bool {
-        plain(|| self.failing.lock().iter().any(|f| !f.signals))
-    }
-
-    /// Records that the render pass at `from`, in the order the runtime ended its encoders, stores
-    /// an attachment into read-only memory the runtime copies, at which Metal's GPU faults it from
-    /// that pass on, its event signals firing, as the runtime faults it itself (the module docs):
-    /// a failure of its own, by its protection options, stands beside the fault, and its commit
-    /// dies where a type-9 draw fails it another way too ([`CommandBufferObject::failure`]).
-    pub(crate) fn faults_at_read_only_store(&self, from: usize) {
-        plain(|| {
-            self.stores.lock().push(Failing {
-                code: rt::CommandBufferError::PageFault.metal_code(),
-                from,
-                signals: true,
-            });
-        });
-    }
-
-    /// Records `failing`, how a draw of primitive type 9 in it fails it, as Metal's GPU does,
-    /// which the runtime fails it with itself (`crate::gpu::encode_render`'s `nine`): its
-    /// commit dies where it fails another way too ([`CommandBufferObject::failure`]).
-    pub(crate) fn fails_at_type_9(&self, failing: Failing) {
-        plain(|| self.by_runtime.lock().push(failing));
-    }
-
-    /// `execution`, a command of the encoder it made last, is checked at its commit, where its
-    /// commands' records stand as the runtime runs them ([`executions`]).
-    pub(crate) fn checked_at_commit(&self, execution: executions::Execution) {
-        let at = self.made.load(Ordering::SeqCst).saturating_sub(1);
-        plain(|| self.executions.lock().push((at, execution)));
-    }
-
-    /// Checks at its commit the executions [`CommandBufferObject::checked_at_commit`] took, in
-    /// their order, but those of an encoder from `failed` on, which run nothing; each whose
-    /// records it read for a death is held as read until it ends ([`executions::reads`]).
-    fn check_executions(&self, failed: Option<usize>, progress: Option<&Progress>) {
-        let taken = std::mem::take(&mut *self.executions.lock());
-        let read: Vec<_> = taken
-            .into_iter()
-            .filter(|(at, _)| failed.is_none_or(|from| *at < from))
-            .filter_map(|(_, execution)| execution.check())
-            .collect();
-        if let Some(progress) = progress {
-            for icb in &read {
-                executions::reads(icb, progress);
-            }
-        }
+    /// The first encoder that a failure the runtime makes itself fails, by its place
+    /// ([`Noted::runs_nothing_from`]).
+    fn runtime_fails_from(&self) -> Option<usize> {
+        (self.by_runtime.iter()).chain(&self.stores).map(|w| w.from).min()
     }
 
     /// How Metal's GPU fails it, at its commit (`sel`): what its encoders did ([`Failing`]),
@@ -632,19 +404,17 @@ impl CommandBufferObject {
     /// encoders the runtime records with it; the encoders before it run all the same
     /// (`protection_options_fail_compute_encoders_from_the_one_made_under_them`).
     fn failure(&self, sel: &'static str) -> Option<rt::CommitFailure> {
-        let mut own = plain(|| self.failing.lock().clone());
-        let protection = plain(|| *self.protection.lock());
+        let mut own = self.failing.clone();
         // No encoder fails, and no signal follows the first that runs nothing.
-        if protection_code(protection.options) == INVALID_INPUT && !protection.used {
+        if protection_code(self.protection.options) == INVALID_INPUT && !self.protection.used {
             own.push(Failing {
                 code: INVALID_INPUT,
-                from: self.made.load(Ordering::SeqCst),
+                from: self.made,
                 signals: false,
             });
         }
-        let nines = plain(|| self.by_runtime.lock().clone());
-        let stores = plain(|| self.stores.lock().clone());
-        let by_runtime: Vec<Failing> = nines.iter().chain(&stores).copied().collect();
+        let nines = &self.by_runtime;
+        let by_runtime: Vec<Failing> = nines.iter().chain(&self.stores).copied().collect();
         let differ = |ways: &[Failing]| {
             ways.first().is_some_and(|f| {
                 ways.iter()
@@ -671,8 +441,8 @@ impl CommandBufferObject {
     }
 
     /// The first of its encoders that runs nothing, by its place among those the runtime ended:
-    /// the first that `failure` ([`CommandBufferObject::failure`]) fails, or that a failure the
-    /// runtime makes itself fails ([`CommandBufferObject::fails_at_type_9`],
+    /// the first that `failure` ([`Noted::failure`]) fails, or that a failure the runtime makes
+    /// itself fails ([`CommandBufferObject::fails_at_type_9`],
     /// [`CommandBufferObject::faults_at_read_only_store`]), each failing every encoder from its
     /// own on; `None` where none fails.
     fn runs_nothing_from(&self, failure: Option<&rt::CommitFailure>) -> Option<usize> {
@@ -680,11 +450,298 @@ impl CommandBufferObject {
             Some(rt::FailedEncoders::From(from)) => Some(*from),
             _ => None,
         };
-        let by_runtime = plain(|| {
-            let (nines, stores) = (self.by_runtime.lock(), self.stores.lock());
-            nines.iter().chain(stores.iter()).map(|w| w.from).min()
+        own.into_iter().chain(self.runtime_fails_from()).min()
+    }
+}
+
+/// What a command buffer's commit reads of what it noted ([`CommandBufferObject::at_commit`]):
+/// how Metal's GPU fails it, the first of its encoders that runs nothing, and the executions its
+/// commit checks.
+type AtCommit = (
+    Option<rt::CommitFailure>,
+    Option<usize>,
+    Vec<(usize, executions::Execution)>,
+);
+
+/// How a command buffer stands for a cut ([`CommandBufferObject::standing`]).
+#[derive(Debug, Clone, Copy)]
+struct Standing {
+    /// Whether a way Metal's GPU fails it for what its encoders did is noted ([`Noted::fails`]).
+    fails: bool,
+    /// Why it may not be cut, but for how Metal's GPU fails it: the first of [`KeptWhole::ALL`]
+    /// that holds; `None` where none does.
+    kept_whole_by: Option<KeptWhole>,
+}
+
+/// Whether protection options end the process where an encoder is made under them: 1, 3 and 7,
+/// at a compute or render encoder's creation and a blit encoder's first command (measured on
+/// the M3 Max: SIGABRT, no message).
+fn aborts_encoders(options: u64) -> bool {
+    matches!(options, 1 | 3 | 7)
+}
+
+impl CommandBufferObject {
+    /// Work for Metal's tiler encoded by `sel`, `first`: a render encoder made, or a blit's reset
+    /// or copy of an indirect command buffer. Metal's own allocations for it the first time, and
+    /// the command buffer's submission a first use too, which its submission handler takes, added
+    /// here while the process has not taken it ([`tiler_handler`]).
+    pub(crate) fn tiler_work(&self, sel: &'static str, first: FirstUse) {
+        metal_space::first_use(first);
+        if !metal_space::taken(FirstUse::TilerSubmission)
+            && !self.tiler.swap(true, Ordering::SeqCst)
+        {
+            get(sel, || self.raw.add_submission_handler(tiler_handler()));
+        }
+    }
+
+    /// Dies at `sel`, the creation of a compute or render encoder, under protection options that
+    /// end the process there ([`aborts_encoders`]).
+    pub(crate) fn protected_creation(&self, sel: &'static str) {
+        let options = plain(|| self.noted.lock().protection.options);
+        if aborts_encoders(options) {
+            metal_aborts(
+                sel,
+                &format!("an encoder made under protection options {options}"),
+            );
+        }
+    }
+
+    /// How many runtime encoders it has made ([`Self::made_encoder`]).
+    #[cfg(test)]
+    pub(crate) fn encoders_made(&self) -> usize {
+        self.noted.lock().made
+    }
+
+    /// A runtime encoder it made, for an encoder of Metal's (`whole`) or a part of one: its place
+    /// among the encoders the runtime ends. An encoder of Metal's made under protection options
+    /// other than 0 fails the command buffer from it, with
+    /// [`PROTECTION_VIOLATION`] below 0x10 and [`INVALID_INPUT`] from there up, its event
+    /// signals firing none; under options that end the process at its first command (a blit
+    /// encoder's, [`aborts_encoders`]) it answers them, which that command dies at.
+    pub(crate) fn made_encoder(&self, whole: bool) -> (usize, Option<u64>) {
+        let mut noted = plain(|| self.noted.lock());
+        let at = noted.made;
+        noted.made += 1;
+        if !whole {
+            return (at, None);
+        }
+        let options = noted.protection.options;
+        if options == 0 {
+            return (at, None);
+        }
+        noted.protection.used = true;
+        if aborts_encoders(options) {
+            return (at, Some(options));
+        }
+        noted.failing.push(Failing {
+            code: protection_code(options),
+            from: at,
+            signals: false,
         });
-        own.into_iter().chain(by_runtime).min()
+        (at, None)
+    }
+
+    /// Whether its work encoded so far may be committed as a part of it (`split`, the module
+    /// docs' "A command buffer in parts"): no encoder open; none of the ways Metal's GPU fails
+    /// it for what its encoders did, nor a draw of primitive type 9, which fail it from an
+    /// encoder on, every one after it running nothing; no protection options set; no execution
+    /// of an indirect command buffer whose commands its commit reads, and no progress kept to
+    /// its completion (a rate map's reset, an indirect command buffer's numbers); no block of
+    /// command predication open, and no unit an unbalanced record emptied
+    /// ([`Predication::cuttable`]; a unit of compute encoders goes on in the next part); and no
+    /// event signalled as it is scheduled. Not committed.
+    fn splits(&self) -> bool {
+        let Standing {
+            fails,
+            kept_whole_by,
+        } = self.standing();
+        !fails && kept_whole_by.is_none()
+    }
+
+    /// How it stands for a cut ([`CommandBufferObject::splits`]): whether a way Metal's GPU fails
+    /// it for what its encoders did is noted ([`Noted::fails`]), and why it may not be cut but for
+    /// that, the first of [`KeptWhole::ALL`] that holds. What it noted is read under one hold, and
+    /// each later reason is asked only where none before it holds, every one a read of its state
+    /// that changes nothing.
+    ///
+    /// Kept whole only by how Metal's GPU fails it for what its encoders did, a draw of primitive
+    /// type 9 or a store into read-only memory, each from an encoder on, every encoder after it
+    /// running nothing, it fails from an encoder on: then a later range's encoders run nothing in
+    /// it either, and need only what they noted of how they fail ([`CommandBufferObject::fold`]).
+    fn standing(&self) -> Standing {
+        let (fails, protection, executions) = plain(|| {
+            let noted = self.noted.lock();
+            (noted.fails(), noted.protection, !noted.executions.is_empty())
+        });
+        let holds = |reason: KeptWhole| match reason {
+            KeptWhole::OpenEncoder => self.open_encoders.load(Ordering::SeqCst) != 0,
+            KeptWhole::ProtectionOptions => protection.options != 0 || protection.used,
+            KeptWhole::Execution => executions,
+            KeptWhole::Progress => self.progress.get().is_some(),
+            KeptWhole::Predication => !plain(|| self.predication.cuttable()),
+            KeptWhole::ScheduledSignal => self.signals_scheduled.load(Ordering::SeqCst),
+            KeptWhole::Committed => self.committed.load(Ordering::SeqCst),
+        };
+        Standing {
+            fails,
+            kept_whole_by: KeptWhole::ALL.into_iter().find(|&reason| holds(reason)),
+        }
+    }
+
+    /// Takes in what `later`, made for a later range of its work (`CommandBuffer::part`) and
+    /// encoded, noted of how Metal's GPU fails it, each failing encoder's place counted after
+    /// this one's encoders, and the encoders it made; and the tiler's submission handler, where
+    /// `later` took it and this one did not ([`CommandBufferObject::tiler_work`]): so its commit
+    /// answers as it would had `later`'s encoders been made in it ([`Noted::failure`]),
+    /// a way of failing of `later`'s beside its own dying where two would. Called where it fails
+    /// from an encoder on ([`CommandBufferObject::standing`]), before every one of `later`'s,
+    /// which run nothing.
+    fn fold(&self, later: &CommandBufferObject) {
+        plain(|| {
+            let (made, [failing, by_runtime, stores]) = {
+                let later = later.noted.lock();
+                let ways = [&later.failing, &later.by_runtime, &later.stores];
+                (later.made, ways.map(Vec::clone))
+            };
+            let mut noted = self.noted.lock();
+            let base = noted.made;
+            let after = |ways: Vec<Failing>| {
+                ways.into_iter().map(move |w| Failing {
+                    from: w.from + base,
+                    ..w
+                })
+            };
+            noted.failing.extend(after(failing));
+            noted.by_runtime.extend(after(by_runtime));
+            noted.stores.extend(after(stores));
+            noted.made += made;
+        });
+        if later.tiler.load(Ordering::SeqCst) && !self.tiler.swap(true, Ordering::SeqCst) {
+            get("commit", || {
+                self.raw.add_submission_handler(tiler_handler())
+            });
+        }
+    }
+
+    /// The next part of it, made on its queue ([`CommandBuffer::split`], `CommandBuffer::part`):
+    /// a command buffer of no encoder yet, its predication going on from this one's, as the unit
+    /// of compute encoders open at a cut goes on in the next part. Its make waits while the
+    /// queue holds 64 uncompleted command buffers, as `commandBuffer` does.
+    fn next_part(&self) -> RaiseResult<VulkanCommandBuffer> {
+        let raw = waiting("commandBuffer", || {
+            self.raw.command_queue().command_buffer()
+        })?;
+        let predication = Predication::new(&self.device);
+        predication.go_on(&self.predication);
+        Ok(Obj::new(CommandBufferObject {
+            raw,
+            device: self.device.clone_ref(),
+            open_encoders: Arc::default(),
+            progress: OnceLock::new(),
+            predication,
+            committed: AtomicBool::new(false),
+            noted: Mutex::new(Noted::default()),
+            tiler: AtomicBool::new(false),
+            signals_scheduled: AtomicBool::new(false),
+        }))
+    }
+
+    /// Once it completed, nothing having failed it: a loop of its command predication that ran
+    /// past its copies dies, naming the loop, as a failure that is none of Metal's does where it
+    /// is read ([`predication::Overruns::check`]).
+    fn overran(&self) {
+        if self.raw.status() == rt::CommandBufferStatus::Completed {
+            self.predication.check_overruns();
+        }
+    }
+
+    /// Records `failing`, which its commit fails it with ([`Noted::failure`]).
+    pub(crate) fn fail(&self, failing: Failing) {
+        self.noted.lock().failing.push(failing);
+    }
+
+    /// Whether it sends no more event signals: one of its encoders fails it with signals that do
+    /// not fire after it ([`Failing::signals`]), as an encoder made under protection options does,
+    /// after which Metal's GPU fires none of its signals (the M3 Max and the AMD 5300M; the Intel
+    /// UHD 630 fires them all; dgpu-oracle.md Q39). Those encoded before it fire.
+    fn withholds_signals(&self) -> bool {
+        plain(|| self.noted.lock().failing.iter().any(|f| !f.signals))
+    }
+
+    /// Records that the render pass at `from`, in the order the runtime ended its encoders, stores
+    /// an attachment into read-only memory the runtime copies, at which Metal's GPU faults it from
+    /// that pass on, its event signals firing, as the runtime faults it itself (the module docs):
+    /// a failure of its own, by its protection options, stands beside the fault, and its commit
+    /// dies where a type-9 draw fails it another way too ([`Noted::failure`]).
+    pub(crate) fn faults_at_read_only_store(&self, from: usize) {
+        plain(|| {
+            self.noted.lock().stores.push(Failing {
+                code: rt::CommandBufferError::PageFault.metal_code(),
+                from,
+                signals: true,
+            });
+        });
+    }
+
+    /// Records `failing`, how a draw of primitive type 9 in it fails it, as Metal's GPU does,
+    /// which the runtime fails it with itself (`crate::gpu::encode_render`'s `nine`): its
+    /// commit dies where it fails another way too ([`Noted::failure`]).
+    pub(crate) fn fails_at_type_9(&self, failing: Failing) {
+        plain(|| self.noted.lock().by_runtime.push(failing));
+    }
+
+    /// `execution`, a command of the encoder it made last, is checked at its commit, where its
+    /// commands' records stand as the runtime runs them ([`executions`]).
+    pub(crate) fn checked_at_commit(&self, execution: executions::Execution) {
+        plain(|| {
+            let mut noted = self.noted.lock();
+            let at = noted.made.saturating_sub(1);
+            noted.executions.push((at, execution));
+        });
+    }
+
+    /// Checks at its commit the executions [`CommandBufferObject::checked_at_commit`] took,
+    /// `taken`, in their order, but those of an encoder from `failed` on, which run nothing; each
+    /// whose records it read for a death is held as read until it ends ([`executions::reads`]).
+    fn check_executions(
+        taken: Vec<(usize, executions::Execution)>,
+        failed: Option<usize>,
+        progress: Option<&Progress>,
+    ) {
+        let read: Vec<_> = taken
+            .into_iter()
+            .filter(|(at, _)| failed.is_none_or(|from| *at < from))
+            .filter_map(|(_, execution)| execution.check())
+            .collect();
+        if let Some(progress) = progress {
+            for icb in &read {
+                executions::reads(icb, progress);
+            }
+        }
+    }
+
+    /// How Metal's GPU fails it at its commit (`sel`), as what it noted says ([`Noted::failure`]).
+    #[cfg(test)]
+    fn failure(&self, sel: &'static str) -> Option<rt::CommitFailure> {
+        plain(|| self.noted.lock()).failure(sel)
+    }
+
+    /// The first of its encoders that runs nothing, `failure` failing it
+    /// ([`Noted::runs_nothing_from`]).
+    #[cfg(test)]
+    fn runs_nothing_from(&self, failure: Option<&rt::CommitFailure>) -> Option<usize> {
+        plain(|| self.noted.lock()).runs_nothing_from(failure)
+    }
+
+    /// What its commit (`sel`) reads of what it noted, under one hold: how Metal's GPU fails it
+    /// ([`Noted::failure`]), the first of its encoders that runs nothing
+    /// ([`Noted::runs_nothing_from`]), and the executions its commit checks, taken
+    /// ([`CommandBufferObject::check_executions`]).
+    fn at_commit(&self, sel: &'static str) -> AtCommit {
+        let mut noted = plain(|| self.noted.lock());
+        let failure = noted.failure(sel);
+        let failed = noted.runs_nothing_from(failure.as_ref());
+        (failure, failed, std::mem::take(&mut noted.executions))
     }
 
     /// Its progress ([`Progress`]), for `sel`, an encoder's command: made the first time one asks,
@@ -692,10 +749,11 @@ impl CommandBufferObject {
     /// once it has encoded. An encoder's command comes before the commit, which refuses an open
     /// encoder, so the handler's refusal after the commit never comes.
     pub(crate) fn progress(&self, sel: &'static str) -> Arc<Progress> {
-        let mut kept = plain(|| self.progress.lock());
-        if let Some(progress) = &*kept {
-            return Arc::clone(progress);
-        }
+        Arc::clone(self.progress.get_or_init(|| self.ended_progress(sel)))
+    }
+
+    /// A new progress, with the completed handler that ends it added ([`Self::progress`]).
+    fn ended_progress(&self, sel: &'static str) -> Arc<Progress> {
         let progress = Arc::new(Progress::default());
         let ending = Ending {
             progress: Some(Arc::clone(&progress)),
@@ -705,7 +763,6 @@ impl CommandBufferObject {
         };
         let handler: rt::Handler = Box::new(move |cb: &rt::CommandBuffer| ending.run(cb));
         plain(|| self.raw.add_completed_handler(handler)).unwrap_or_else(|e| refused(sel, &e));
-        *kept = Some(Arc::clone(&progress));
         progress
     }
 }
@@ -1094,16 +1151,11 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
                     raw,
                     device: self.device.clone_ref(),
                     open_encoders: Arc::default(),
-                    progress: Mutex::new(None),
+                    progress: OnceLock::new(),
                     predication,
                     committed: AtomicBool::new(false),
-                    made: AtomicUsize::new(0),
-                    failing: Mutex::new(Vec::new()),
-                    by_runtime: Mutex::new(Vec::new()),
-                    stores: Mutex::new(Vec::new()),
-                    protection: Mutex::new(Protection::default()),
+                    noted: Mutex::new(Noted::default()),
                     tiler: AtomicBool::new(false),
-                    executions: Mutex::new(Vec::new()),
                     signals_scheduled: AtomicBool::new(false),
                 })))
             });
@@ -1514,7 +1566,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// Refused while an encoder is open or after a commit, as Metal's validation refuses it.
     /// Every refusal dies naming the runtime's, and one of the records of an indirect command
     /// buffer it executes says so ([`committing`]). One that Metal's GPU fails for what its encoders did is committed failed
-    /// ([`CommandBufferObject::failure`]); any other is committed as it is. A slow commit
+    /// ([`Noted::failure`]); any other is committed as it is. A slow commit
     /// and a late completion are debug lines ([`timing::commit`]). One that holds work for
     /// Metal's tiler takes Metal's allocation for it as the runtime submits it
     /// ([`tiler_handler`]). One committed while a command buffer of its queue that Metal's GPU
@@ -1537,14 +1589,14 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
             // The guest's GPU work, which keeps the GPU awake ([`crate::awake`]).
             self.device.awake.touch();
-            let progress = self.progress.lock().clone();
+            let progress = self.progress.get();
             encoding("commit", Policy::Dies, || {
                 predication::boundary(&self.predication, "commit");
-                self.committed.store(true, Ordering::SeqCst);
-                let failure = self.failure("commit");
-                let failed = self.runs_nothing_from(failure.as_ref());
-                self.check_executions(failed, progress.as_deref());
-                if let Some(progress) = &progress {
+                self.committed.store(true, Ordering::Relaxed);
+                let (failure, failed, executions) = self.at_commit("commit");
+                let progress = progress.map(|progress| &**progress);
+                CommandBufferObject::check_executions(executions, failed, progress);
+                if let Some(progress) = progress {
                     progress.committing();
                 }
                 committing(|| {
@@ -1659,15 +1711,18 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
 
     /// Commits it as a part where it may be cut ([`CommandBufferObject::splits`]); else nothing,
     /// [`PartCut::Fails`] where it is kept whole only by how Metal's GPU fails it from one of its
-    /// encoders on ([`CommandBufferObject::fails_from_an_encoder`]), every encoder after it
-    /// running nothing.
+    /// encoders on ([`CommandBufferObject::standing`]), every encoder after it running nothing.
     fn commit_part(&self, on: OnFault) -> RaiseResult<PartCut> {
         let mut recorded_call = crate::recorder::rec_call!("m2v.commitPart", self);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<PartCut> {
-            if let Some(reason) = self.kept_whole_by() {
+            let Standing {
+                fails,
+                kept_whole_by,
+            } = self.standing();
+            if let Some(reason) = kept_whole_by {
                 return Ok(PartCut::Whole(reason));
             }
-            if self.fails_from_an_encoder() {
+            if fails {
                 return Ok(PartCut::Fails);
             }
             self.commit(on)?;
@@ -1854,7 +1909,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
                 self.raw
                     .set_protection_options(rt::DEFAULT_PROTECTION_OPTIONS)
             })?;
-            let was = plain(|| *self.protection.lock());
+            let was = plain(|| self.noted.lock().protection);
             let kept = was.used || protection_code(was.options) == INVALID_INPUT;
             if kept && options != was.options {
                 unrepresentable(
@@ -1865,7 +1920,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
                     ),
                 );
             }
-            plain(|| self.protection.lock().options = options);
+            plain(|| self.noted.lock().protection.options = options);
             Ok(())
         });
         crate::recorder::rec_done!(recorded_call, recorded_answer);
@@ -3473,15 +3528,15 @@ mod tests {
         for (theirs, dies) in [(hang, false), (fault, true)] {
             let cb = buffer(&q);
             let later = cb.part(OnFault::Return).unwrap().unwrap();
-            cb.made.store(3, Ordering::SeqCst);
+            cb.noted.lock().made = 3;
             cb.fails_at_type_9(Failing { from: 2, ..hang });
-            later.made.store(2, Ordering::SeqCst);
+            later.noted.lock().made = 2;
             later.fails_at_type_9(Failing { from: 1, ..theirs });
             assert_eq!(cb.commit_part(OnFault::Return).unwrap(), PartCut::Fails);
             assert!(!cb.committed.load(Ordering::SeqCst), "nothing committed");
             cb.fold(later);
-            assert_eq!(cb.made.load(Ordering::SeqCst), 5);
-            let froms: Vec<usize> = cb.by_runtime.lock().iter().map(|w| w.from).collect();
+            assert_eq!(cb.noted.lock().made, 5);
+            let froms: Vec<usize> = cb.noted.lock().by_runtime.iter().map(|w| w.from).collect();
             assert_eq!(froms, [2, 4], "the later one's counted after this one's");
             assert_eq!(cb.runs_nothing_from(None), Some(2));
             match dies {
