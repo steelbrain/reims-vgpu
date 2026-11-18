@@ -170,7 +170,10 @@ x86.
 ## Q2: Managed storage
 
 Probe: `oracle_storage DEVICE mbuf 4096|67108864`, `mtex` and `capture` (11-12, m3-max-22553 on
-the AMD, 22554 on the Intel; not run on the M3).
+the AMD, 22554 on the Intel; not run on the M3); `capture 4096|67108864` with steps 5 to 7
+(11-17: m3-max-44786 and 44795 on the AMD, 44789 and 44796 on the Intel; 44788 and 44790, at
+64 MiB, ended at their 1 GiB cap in step 7 and agree on steps 0 to 6). A 64 MiB `capture`
+peaks at 1.0 GiB, so it runs with `--ram 2`.
 
 | | AMD | Intel 630 and M3 |
 |---|---|---|
@@ -179,8 +182,11 @@ the AMD, 22554 on the Intel; not run on the M3).
 | buffer: GPU write pending (no sync), then CPU [0,256) + `didModifyRange:` of it | only [0,256) uploaded; the GPU's bytes stay elsewhere | (one copy) |
 | buffer: GPU write without `synchronizeResource:` (completion, 200 ms) | never seen by the CPU | seen at once |
 | buffer: `didModifyRange:` after the reading command buffer was encoded, before its commit | seen: the upload happens at commit | seen |
-| buffer: CPU bytes written again after `didModifyRange:`, before the commit (`capture`) | seen, the command buffer encoded before the write or after it | seen |
-| buffer: CPU bytes written again after the commit, 30 ms in, while the command buffer's first kernel holds the GPU (1.27 s on AMD, 637 ms on Intel) | not seen: the kernel reads the bytes of the commit | seen |
+| buffer: CPU bytes written again after `didModifyRange:`, before the commit (`capture` steps 1 and 2) | seen, the command buffer encoded before the write or after it (4 KiB and 64 MiB) | seen |
+| buffer: CPU bytes written again after the commit, 20 ms after it is scheduled, while the command buffer's first kernel holds the GPU (1.27 s on AMD, 400 to 640 ms on Intel; step 3) | not seen (4 KiB and 64 MiB): the kernel reads the bytes taken at the submission | seen |
+| buffer: CPU bytes written again at once after the commit returns, before the command buffer is scheduled (step 5: on AMD the write was done 0.03 ms after the commit at 4 KiB and 2.1 ms at 64 MiB, and the buffer scheduled at 0.25 and 2.9 ms) | seen (4 KiB and 64 MiB): the bytes are taken at the submission, after the commit returns | seen |
+| buffer: as step 3, then a second `didModifyRange:` of the range while the first kernel still holds the GPU (step 6) | not seen (4 KiB and 64 MiB): the call does not reach a command buffer already running | seen |
+| buffer: as step 5, then a second `didModifyRange:` of the range at once (step 7) | seen (4 KiB and 64 MiB), as without it | seen |
 | texture: GPU write without `synchronizeTexture:`, then `getBytes:` | old bytes, also 200 ms later | new |
 | texture: unsynchronized GPU write, then `replaceRegion:` of a 16 x 1 corner | the whole CPU copy is uploaded: the GPU's write is lost outside the corner | corner new, GPU's write kept |
 
@@ -196,6 +202,14 @@ looser than Metal in one way that costs us nothing: it uploads more than the nam
 GPU copy is clean, so an app with a short `didModifyRange:` works on AMD, where ours uploads the
 range alone.
 
+When the 5300M takes the bytes (`capture`, 11-17): after the commit returns and by the time the
+command buffer starts on the GPU. A write in that window (step 5) is seen whole at 64 MiB, so
+nothing copied the bytes before the write was done; a write 20 ms after the buffer is scheduled
+(step 3) is not, nor is one followed by `didModifyRange:` (step 6): the call does not reach a
+command buffer already running. At 64 MiB the buffer was scheduled 1.7 to 2.9 ms after the
+commit and started on the GPU about 11 ms later (at 4 KiB: 0.2 to 0.4 ms, then at most
+0.08 ms), consistent with an upload of the 64 MiB (6 GB/s) before its first kernel.
+
 Ours, by `capture` in an x86-64 macOS 26.7.2 guest on two-copy hosts, 11-12: on the RX 7900 XTX
 (m3-max-22650, metal2vulkan 38ab829481) the five steps read A, B, B, A, B, the 5300M's answers;
 on the RX 550 (m3-max-22791, metal2vulkan 86d01646ae, which takes the range's bytes at the commit)
@@ -203,10 +217,11 @@ the first four read A, B, B, A, and the fifth has no answer: the fourth step's s
 for 2 s there, until the driver recovered the context (`radv/amdgpu: ... guilty of a soft
 recovery`), and the fifth step's command buffer was discarded as its victim. A CPU write
 after the commit, while the command buffer's first kernel runs, is not seen on either, as on the
-5300M; no step writes after the commit while the command buffer waits behind other work, where
-taking the bytes at the commit and at the submission's start would differ. On the XTX the spin
-saw the CPU's write to its Shared flag 140 ms in, which the 5300M's never did (Q3: ours is in
-place).
+5300M. Steps 5 to 7 have not run on ours. Step 5, a write after the commit returns and before
+the command buffer is scheduled, is where taking the bytes at the commit and at the submission
+differ: the 5300M and the Intel 630 both read B there. On the XTX the spin saw the CPU's write
+to its Shared flag 140 ms in; the 5300M's saw it once in the 11-17 runs (44786, step 7, about
+1.06 s after the write) and in no other held step (Q3: ours is in place).
 
 ## Q3: Shared storage
 
