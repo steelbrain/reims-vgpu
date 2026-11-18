@@ -334,7 +334,7 @@ struct Protection {
 
 /// What a command buffer notes of its encoders as they are made and encode, behind one lock: an
 /// encoder's making takes it once, and each check of the command buffer at a cut or a commit
-/// once for all it reads ([`CommandBufferObject::standing`], [`CommandBufferObject::commit`]). A
+/// once for all it reads ([`CommandBufferObject::standing`], [`CommandBuffer::commit`]). A
 /// lock and its release are each a locked instruction on x86-64, which costs about 0.49 µs
 /// between two recorded Vulkan commands on RADV, whose command buffers are write-combined memory
 /// (metal2vulkan's measurement on an RX 7900 XTX); a lock per part took up to eleven a check.
