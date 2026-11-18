@@ -70,6 +70,9 @@ pub mod format;
 pub mod private;
 pub mod typed;
 
+#[cfg(test)]
+mod memory_tests;
+
 use std::any::Any;
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -1087,10 +1090,11 @@ pub fn draws<T: Send + Sync + 'static>(
 }
 
 /// Before a commit: shapes what is queued, waits for the earlier command buffers that can run,
-/// then writes the memory the command buffer reaches that changed.
+/// then writes the memory the command buffer reaches that changed. A commit inside another call
+/// (`m2v.split`, `m2v.commitPart`), which records no `commit` of its own, writes it too, before
+/// that call's record.
 pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
-    let Some(a) = active else { return };
-    if !a.recorded() {
+    if active.is_none() {
         return;
     }
     let Some(state) = state() else { return };
@@ -2051,11 +2055,18 @@ impl State {
             a.each_object(&mut |id| named.push(id));
         }
         // An object a command buffer or its encoder makes is the command buffer's; a command
-        // buffer is its queue's.
+        // buffer is its queue's, and so is the next part a command buffer makes.
         if call.result != 0 {
             let mut objects = self.objects.lock();
+            let parent = match call.selector.as_str() {
+                "m2v.split" | "m2v.part" => objects
+                    .info
+                    .get(&call.receiver)
+                    .map_or(call.receiver, |i| i.parent),
+                _ => call.receiver,
+            };
             if let Some(info) = objects.info.get_mut(&call.result) {
-                info.parent = call.receiver;
+                info.parent = parent;
             }
         }
         let cb = if recv_type == cb_type {
@@ -2112,6 +2123,15 @@ impl State {
             (Some(Value::Object(e)), Some(Value::Uint(v))) => Some((*e, *v)),
             _ => None,
         };
+        // A split that made the next part committed the command buffer, and so did a part's
+        // commit that cut it ([`before_commit`]).
+        let committed = match call.selector.as_str() {
+            "commit" => true,
+            "m2v.split" => call.result != 0,
+            "m2v.commitPart" => (call.answers.iter())
+                .any(|(k, v)| k == "cut" && matches!(v, Value::Str(s) if s == "Cut")),
+            _ => false,
+        };
         match call.selector.as_str() {
             "encodeSignalEvent:value:" | "encodeSignalEventScheduled:value:" => {
                 if let Some(s) = event(&call.args) {
@@ -2123,7 +2143,7 @@ impl State {
                     entry.waits.push(w);
                 }
             }
-            "commit" => {
+            _ if committed => {
                 let cb_info = sync.cbs.remove(&cb).unwrap_or_default();
                 let objects = self.objects.lock();
                 let info = objects.info.get(&cb);
