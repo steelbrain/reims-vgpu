@@ -458,7 +458,8 @@ pub struct Q35 {
 pub struct Vmapple {
     /// The auxiliary storage, in the VM's directory: iBoot's NVRAM and the boot's records, with
     /// Virtualization.framework's 16 KiB header; `aux.img.trimmed` beside it is the same without
-    /// the header, which QEMU attaches.
+    /// the header, which QEMU attaches ([`Vm::aux_trimmed`]): a start makes it where it is
+    /// missing, and the guest keeps its NVRAM there from then on.
     pub aux: PathBuf,
     /// The VM's ECID, which every ticket of its macOS is bound to, and QEMU's `vmapple,uuid`.
     /// Saved as text, `0x` and 16 hex digits: TOML's integers stop at 2^63, below many ECIDs.
@@ -848,8 +849,31 @@ impl Vm {
         }
         if let Some(a) = &self.config.vmapple {
             v.push(self.path(&a.aux));
+            v.push(self.aux_trimmed());
+            v.push(self.ambrosia_config());
         }
         v
+    }
+
+    /// An arm64 VM's own configuration for Ambrosia, `config.cpio` beside its [`Vmapple::aux`]:
+    /// reims-restore writes it for a VM it restores, the patches that swap the guest's
+    /// LocalPolicy anchors for the project's, which reims-ctl adds to the bundle the VM boots with
+    /// ([`crate::prebuilt::ambrosia_bundle`]). A VM Virtualization.framework installed has none.
+    pub fn ambrosia_config(&self) -> PathBuf {
+        self.aux_trimmed().with_file_name("config.cpio")
+    }
+
+    /// An arm64 VM's auxiliary storage as QEMU attaches it: `<aux>.trimmed`, beside its
+    /// [`Vmapple::aux`], without its header ([`crate::runtime::trim_aux`]).
+    pub fn aux_trimmed(&self) -> PathBuf {
+        let aux = self
+            .config
+            .vmapple
+            .as_ref()
+            .map_or_else(|| PathBuf::from("aux.img"), |a| a.aux.clone());
+        let mut name = self.path(&aux).into_os_string();
+        name.push(".trimmed");
+        PathBuf::from(name)
     }
 
     /// The QMP socket ([`qmp_socket_in`] the runtime directory).
