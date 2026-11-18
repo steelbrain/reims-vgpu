@@ -166,7 +166,7 @@ reims-vgpu-graphics, reims-vgpu-video-*  <-  reims-vgpu  <-  reims-vgpu-c  <-  Q
   gestures' phases), `policy` (the modes and density offered for a host screen) and `env` (the
   `REIMS_VGPU_WINDOW_*` variables). `handle.rs` is the `Window` the device holds, `Send` and `Sync`
   with no AppKit object in it; `present.rs` is `FrameSink`, the trait it draws through, and the
-  presenter both OSes' render threads draw through.
+  presenter every OS's render threads draw through.
   - **On macOS** (`native/macos/`) the AppKit side runs on the main thread (7.3), its state in
     statics only that thread reaches (`main_thread::MainOnly`): `main_thread.rs` posts work to the
     main run loop in order, and the application's start, alone; `app.rs` is the application, its

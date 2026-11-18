@@ -1,6 +1,6 @@
-//! A graphics display's window sink on the Vulkan platform, on either OS: [`VulkanScanoutSink`]
-//! makes a presenter over a swapchain of the window's surface, and each draw blits the scanout
-//! into the swapchain's next image (its usage takes transfers) and presents it.
+//! A graphics display's window sink on the Vulkan platform, on Linux, Windows and macOS:
+//! [`VulkanScanoutSink`] makes a presenter over a swapchain of the window's surface, and each draw
+//! blits the scanout into the swapchain's next image (its usage takes transfers) and presents it.
 //!
 //! **The compositor's GPU.** Where the host's compositor composites the window on another GPU
 //! than the runtime's (the window system names it: [`VulkanTarget::compositor_device`]), every

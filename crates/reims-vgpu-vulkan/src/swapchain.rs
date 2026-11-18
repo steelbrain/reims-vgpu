@@ -1,9 +1,10 @@
 //! A display window's swapchain on the runtime's own device: what the window's render thread
-//! presents through, on either OS. No copy: each of the swapchain's images is a runtime texture
-//! (`new_texture_with_vk_image`), which the display's present pass renders into in a command
-//! buffer of the frame queue, and the image is presented from the swapchain's own presenting
-//! queue. The surface is the window's: on Linux SDL's (Wayland's or X11's), on macOS one over
-//! the window's `CAMetalLayer` (`VK_EXT_metal_surface`), whose drawables MoltenVK's images are.
+//! presents through, on Linux, Windows and macOS. No copy: each of the swapchain's images is a
+//! runtime texture (`new_texture_with_vk_image`), which the display's present pass renders into in
+//! a command buffer of the frame queue, and the image is presented from the swapchain's own
+//! presenting queue. The surface is the window's: on Linux SDL's (Wayland's or X11's), on Windows
+//! SDL's (`VK_KHR_win32_surface`), on macOS one over the window's `CAMetalLayer`
+//! (`VK_EXT_metal_surface`), whose drawables MoltenVK's images are.
 //!
 //! **The presenting queue.** Each swapchain presents on a queue made for presenting
 //! (`Device::new_command_queue_for_presenting`), whose `VkQueue` the runtime reserves apart from

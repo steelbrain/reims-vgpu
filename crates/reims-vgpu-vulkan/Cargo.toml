@@ -24,7 +24,7 @@ log.workspace = true
 # The call recorder's blob hashes (`recorder::format`), SHA-256 as the replay format names them.
 sha2.workspace = true
 # A display window's swapchain (`swapchain.rs`) and the window system's extensions
-# (`os/wsi.rs`), through ash, on either OS.
+# (`os/wsi.rs`), through ash, on Linux, Windows and macOS.
 ash.workspace = true
 
 # On macOS the OS services are this crate's own (`os/macos.rs`): threads, clocks, Mach VM, the

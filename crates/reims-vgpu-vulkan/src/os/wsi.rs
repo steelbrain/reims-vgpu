@@ -4,20 +4,20 @@
 //!
 //! The instance takes `VK_KHR_surface` and each of the OS's surface extensions the loader lists
 //! (`crate::os`'s `WINDOW_SURFACE_EXTENSIONS`: on Linux Wayland's, XCB's and Xlib's, so a window
-//! opens over whichever the window library picks; on macOS `VK_EXT_metal_surface`, over a
-//! window's `CAMetalLayer`). The device takes `VK_KHR_swapchain`, and the OS's own device
-//! extensions (`WINDOW_DEVICE_EXTENSIONS`: on macOS `VK_EXT_metal_objects`, whose export of an
-//! image's Metal texture fetches its drawable, `crate::swapchain`), where every physical device
-//! lists them: the runtime refuses a device whose extension it asked for is missing, and which
-//! physical device it picks is its own choice, so a host where one of them lacks one gets no
-//! swapchain at all, and its windows say so and stay closed, rather than losing the device. The
-//! physical devices' lists are read through an instance of the probe's own, made with no
-//! extensions but `VK_KHR_portability_enumeration` where the loader lists it, as the runtime
+//! opens over whichever the window library picks; on Windows `VK_KHR_win32_surface`; on macOS
+//! `VK_EXT_metal_surface`, over a window's `CAMetalLayer`). The device takes `VK_KHR_swapchain`,
+//! and the OS's own device extensions (`WINDOW_DEVICE_EXTENSIONS`: on macOS `VK_EXT_metal_objects`,
+//! whose export of an image's Metal texture fetches its drawable, `crate::swapchain`), where every
+//! physical device lists them: the runtime refuses a device whose extension it asked for is
+//! missing, and which physical device it picks is its own choice, so a host where one of them lacks
+//! one gets no swapchain at all, and its windows say so and stay closed, rather than losing the
+//! device. The physical devices' lists are read through an instance of the probe's own, made with
+//! no extensions but `VK_KHR_portability_enumeration` where the loader lists it, as the runtime
 //! makes its own (so the probe lists MoltenVK, a portability driver, as the runtime does), and
 //! destroyed at once. The loader is the one the runtime opens (`crate::os`'s `open_loader`). The
-//! probe runs once a process ([`HOST`]), and the library's choice of device reads what it read
-//! of each physical device too ([`seen_devices`], [`crate::device_choice`]), so the choice costs
-//! no instance of its own.
+//! probe runs once a process ([`HOST`]), and the library's choice of device reads what it read of
+//! each physical device too ([`seen_devices`], [`crate::device_choice`]), so the choice costs no
+//! instance of its own.
 //!
 //! **Present fences.** The device also takes `VK_KHR_swapchain_maintenance1` (or, where a device
 //! lists only that, `VK_EXT_swapchain_maintenance1`), and the instance its surface counterpart

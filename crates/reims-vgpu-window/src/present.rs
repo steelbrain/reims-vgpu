@@ -1,7 +1,7 @@
 //! What a window's render thread presents through: the display's sink presents the frames itself,
-//! over a Vulkan swapchain of the window's surface, on either OS. The sink makes a [`Presenter`]
-//! over the window ([`VulkanTarget`]: SDL's window on Linux, the window's `CAMetalLayer` on macOS),
-//! and the render thread has it draw each frame ([`Presenting`]).
+//! over a Vulkan swapchain of the window's surface, on Linux, Windows and macOS. The sink makes a
+//! [`Presenter`] over the window ([`VulkanTarget`]: SDL's window on Linux and Windows, the window's
+//! `CAMetalLayer` on macOS), and the render thread has it draw each frame ([`Presenting`]).
 //!
 //! **The presenter's life.** At its first draw the render thread asks the sink for a presenter;
 //! without one (no swapchain on this host) it never draws, and the window stays empty. Each draw

@@ -26,8 +26,8 @@ repeats the ones code cites.
   code. Code some OSes share and others do not
   goes in a module of its own that the index picks for those OSes (the
   window crate's `native/sdl_thread/`, SDL on the library's own thread, for
-  Linux and Windows). It sits in the crates both OSes share: no crate is one
-  OS's. A file both OSes share is the exception, where
+  Linux and Windows). It sits in the crates the OSes share: no crate is one
+  OS's. A file the OSes share is the exception, where
   splitting cannot be avoided, and keeps its `cfg`s to a few whole items;
   index files that pick modules are exempt.
 - **The Vulkan platform** answers as Metal does through metal2vulkan's
