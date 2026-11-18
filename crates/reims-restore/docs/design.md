@@ -385,8 +385,8 @@ Data out and has the first boot make it, by EACS:
 
 So every VM takes one boot of the guest before it is ready (`pipeline::finish_eacs` after it):
 reims-ctl's `create` and the CLI's `restore` end by naming that boot and the step after it,
-`reims-restore finish-eacs DIR`. On a host, that boot needs what any boot does: QEMU's `vmapple`
-with Ambrosia, under HVF on a Mac or KVM on arm64 Linux.
+`reims-restore finish-eacs DIR`. That boot is `reims-ctl start`'s, on QEMU's `vmapple` with
+Ambrosia: under HVF on a Mac, KVM on arm64 Linux and TCG on x86-64 Linux.
 
 ## The ECID and the result
 

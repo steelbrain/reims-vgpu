@@ -26,28 +26,34 @@ and runs macOS VMs for you.
 We don't ship disk images: macOS comes straight from Apple. `reims-ctl` downloads the installer
 from Apple and sets the VM up for you, or uses a disk that already has macOS on it.
 
-You need an x86-64 Linux host or an x86-64 Windows PC. Our drivers load on macOS 26.4 and later
-for now; we've tested macOS 26 on an RTX 5080 laptop GPU and a Radeon 780M on Linux, and on an Intel
-UHD 630 on Windows 11.
+x86-64 macOS needs an x86-64 Linux host or an x86-64 Windows PC. Our drivers load on macOS 26.4
+and later for now; we've tested macOS 26 on an RTX 5080 laptop GPU and a Radeon 780M on Linux, and
+on an Intel UHD 630 on Windows 11.
 
-On an Apple silicon Mac, arm64 macOS 14 to 27 runs on QEMU with Ambrosia, our own arm64 firmware,
-and the same virtual GPU. `reims-ctl` doesn't set these VMs up: you install macOS with a tool
-built on Apple's Virtualization.framework first, then boot it with Ambrosia, which adds our drivers
-to the guest as it starts. [docs/qemu.md](docs/qemu.md), "arm64 guests", has the details.
+arm64 macOS 14 to 27 runs on QEMU too, with Ambrosia, our own arm64 firmware, and the same virtual
+GPU. On an Apple silicon Mac it runs under HVF, macOS's hypervisor, and on arm64 Linux under KVM.
+An x86-64 Linux host runs arm64 VMs as well, with QEMU emulating the CPU (TCG), which is much
+slower; we've checked macOS 14, 15 and 26 that way. `reims-ctl` makes an arm64 VM by restoring
+macOS from an IPSW, Apple's restore image, onto a new disk, and boots it with Ambrosia, which adds
+our drivers to the guest as it starts. [docs/qemu.md](docs/qemu.md), "arm64 guests", has the
+details.
 
 ### Install reims-ctl
 
-On Linux, clone the repository (without `--recursive`: QEMU's own submodules are not needed) and
-run:
+On Linux or an Apple silicon Mac, clone the repository (without `--recursive`: QEMU's own
+submodules are not needed) and run:
 
 ```sh
 scripts/install-ctl.sh
 ```
 
-It installs what the build needs (apt on Ubuntu and Debian, pacman on Arch and CachyOS; Rust
-through rustup.rs), fetches `vendor/qemu`, builds the library on Vulkan and QEMU on it, installs
-QEMU into `~/.local/share/reims-ctl/qemu`, and `reims-ctl` into `~/.cargo/bin`, with
-[reims-util](https://github.com/steelbrain/reims-util) beside it. `vendor/qemu` is
+It installs what the build needs (apt on Ubuntu and Debian, pacman on Arch and CachyOS, Homebrew
+on a Mac; Rust through rustup.rs), fetches `vendor/qemu`, builds the library on Vulkan (on a Mac,
+through MoltenVK) and QEMU on it, installs QEMU into `~/.local/share/reims-ctl/qemu`, and
+`reims-ctl` into `~/.cargo/bin`. Where x86-64 VMs run, it installs
+[reims-util](https://github.com/steelbrain/reims-util) beside it; where arm64 VMs run, it installs
+`reims-restore` beside it and downloads [Ambrosia](https://github.com/steelbrain/ambrosia)'s
+release, which `reims-ctl` checks against the hash it pins. `vendor/qemu` is
 fetched from its public repository (`steelbrain/qemu-reims-vgpu`), at the commit this checkout
 pins, and Cargo fetches metal2vulkan from its public repository, at the commit the workspace's
 `Cargo.toml` names. `reims-ctl doctor` checks the host and the install.
@@ -87,7 +93,7 @@ encode, so the guest encodes video in software there.
    guest works at your distribution's default.
 
    On Windows there's nothing to prepare once the installer has turned on the Windows Hypervisor
-   Platform and you've restarted.
+   Platform and you've restarted, and on a Mac there's nothing to prepare at all.
 
 2. **Create a VM.** Run `reims-ctl`, press `n`, pick a macOS version and press Ctrl-S. It downloads
    the installer from Apple and makes the VM's OpenCore image and disk; then press `s` to start it.
@@ -114,6 +120,19 @@ encode, so the guest encodes video in software there.
    VMs, which can then run beside it, the VM is a new Mac to that macOS, so it opens Setup Assistant
    once at its first boot; finish it in the window, since it won't shut down until you do.
    `--installer` takes an installer of your own.
+
+   An arm64 VM comes from an IPSW instead. On a Mac or arm64 Linux that's what `create` makes; on
+   x86-64 Linux, `--ipsw` asks for one:
+
+   ```sh
+   reims-ctl create mac --ipsw latest --start   # downloads the current macOS's IPSW, about 25 GB
+   reims-ctl create mac --ipsw ~/Downloads/UniversalMac_14.6.1_23G93_Restore.ipsw
+   ```
+
+   Apple offers only the current macOS to download, so an older one needs an IPSW you have. The
+   download is kept for your next VM. The VM's first boot makes macOS's Data volume and then
+   resets the VM, which won't start again until you finish it: stop it, run
+   `reims-restore finish-eacs` with the VM's folder, and the next start goes to Setup Assistant.
 
 ### Day to day
 
@@ -199,7 +218,8 @@ device's command stream. On the host, QEMU's `reims-graphics-pci` hands that str
 library, which runs it on Vulkan through [`metal2vulkan`](https://github.com/steelbrain/metal2vulkan)
 and draws the guest's display into a window of its own. On a Mac the library runs on Vulkan too,
 over MoltenVK rather than Metal, and the guest's side is built there. x86-64 VMs run on Linux and
-Windows hosts, and arm64 VMs on Apple silicon Macs ([docs/qemu.md](docs/qemu.md), "arm64 guests").
+Windows hosts, and arm64 VMs under HVF on Apple silicon Macs, under KVM on arm64 Linux and under
+TCG on x86-64 Linux ([docs/qemu.md](docs/qemu.md), "arm64 guests").
 
 The library's C API (`crates/reims-vgpu-c/include/reims_vgpu.h`, specified in
 [docs/api.md](docs/api.md)) is its interface to QEMU: `cargo xtask dist` writes the library, the
@@ -209,8 +229,9 @@ it needs itself; working on the code needs the following.
 
 ### Requirements
 
-- A Linux host on x86-64 for the library and for VMs, and an Apple silicon Mac for the metallibs
-  and the guest's kexts. Every Rust binary built on the Mac is arm64
+- A Linux host for the library and for VMs (on x86-64, x86-64 VMs under KVM and arm64 VMs under
+  TCG; on arm64, arm64 VMs under KVM), and an Apple silicon Mac for the metallibs and the guest's
+  kexts, where arm64 VMs run under HVF. Every Rust binary built on the Mac is arm64
   (`aarch64-apple-darwin`): rustc's arm64e target has no pointer authentication, and its binaries
   crash before `main` (`rust-toolchain.toml`).
 - The toolchain `rust-toolchain.toml` pins: nightly-2026-11-03 with rustfmt and clippy, for rustc's
@@ -224,7 +245,7 @@ it needs itself; working on the code needs the following.
   `molten-vk`, the Vulkan the library runs on there. The guest's kexts build with Xcode and a
   macOS 26 KDK (`guest/Makefile`).
 - clang and lld for the option ROM and the Ambrosia module (`firmware/`; on a Mac, Homebrew's
-  `lld`).
+  `lld`). reims-ctl's build makes the module itself with clang and the Rust toolchain's own lld.
 - For `make qemu`: the `vendor/qemu` submodule (`git submodule update --init vendor/qemu`) and
   QEMU's build dependencies (`meson`, `ninja`, `pkg-config`, `glib`, `pixman` and so on).
 

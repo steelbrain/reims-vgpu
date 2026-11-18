@@ -12,15 +12,16 @@ measured facts QEMU's side and the guests rely on.
 
 `make qemu` builds no `qemu-system-aarch64`. QEMU's `vmapple` machine,
 without the Apple paravirtualized GPU it once had, builds again in an
-`aarch64-softmmu` build, under HVF or TCG, for Ambrosia, our own arm64
-firmware ("arm64 guests", below). On an arm64 Mac or arm64 Linux,
-`reims-ctl` makes arm64 VMs by restoring macOS from an IPSW onto their disk
-(`crates/reims-restore`), which runs no QEMU, and doesn't start them;
-`scripts/install-ctl.sh` builds no QEMU there. Each VM needs one boot
-before it is ready: macOS makes its Data volume at its first boot and resets
-the VM, and `reims-restore finish-eacs DIR` then makes it bootable for Setup
-Assistant (`crates/reims-restore/docs/design.md`, "The Data volume, by
-EACS").
+`aarch64-softmmu` build, under HVF, KVM or TCG, for Ambrosia, our own arm64
+firmware ("arm64 guests", below). `reims-ctl` makes an arm64 VM by
+restoring macOS from an IPSW onto its disk (`crates/reims-restore`), and
+starts it on `vmapple`: under HVF on an arm64 Mac, under KVM on arm64
+Linux, and under TCG on x86-64 Linux. `scripts/install-ctl.sh` builds the
+`qemu-system-aarch64` it runs on each of those hosts, beside
+`qemu-system-x86_64` on x86-64 Linux. Each VM needs one boot before it is
+ready: macOS makes its Data volume at its first boot and resets the VM, and
+`reims-restore finish-eacs DIR` then makes it bootable for Setup Assistant
+(`crates/reims-restore/docs/design.md`, "The Data volume, by EACS").
 
 No test runs QEMU, so a VM boot is the only check of QEMU's side of the
 API ([lessons.md](lessons.md)). Each measurement below names its host and
@@ -1895,14 +1896,34 @@ shared memory.
 
 arm64 macOS guests ran on QEMU's `vmapple` machine on an Apple silicon Mac,
 and the machine's display was Apple's paravirtualized GPU. That device is
-gone from the library and from QEMU: `make qemu` builds no
-`qemu-system-aarch64`, and `reims-ctl` starts no arm64 VMs (it makes them,
-by a restore from an IPSW, above). `vmapple` builds
-again, without the device, in an `aarch64-softmmu` build, and runs under HVF
-or TCG on Ambrosia, our own arm64 firmware, which enters macOS's kernel
-itself. Virtualization.framework's firmware, AVPBooter, does not boot on the
+gone from the library and from QEMU, and `make qemu` builds no
+`qemu-system-aarch64`. `vmapple` builds again, without the device, in an
+`aarch64-softmmu` build, and runs under HVF, KVM or TCG on Ambrosia, our
+own arm64 firmware, which enters macOS's kernel itself.
+Virtualization.framework's firmware, AVPBooter, does not boot on the
 machine's layout now. The branch's commits for it ("What vendor/qemu
 carries", above) say what each one changes and why.
+
+`reims-ctl start` runs an arm64 VM on that machine as `check-boot.sh` boots
+one ("arm64 guests: the boot check of our configuration", below), with:
+- the image of Ambrosia's release that `crates/reims-ctl/src/ambrosia.rs`
+  pins, 0.1.3, by its zip's and its image's SHA-256. The installer's
+  `reims-ctl __record-install` downloads it into the data directory, and a
+  start downloads it where it is missing;
+- the device, `reims-graphics-pci`;
+- the configuration bundle, loaded at 0x120000000: the device's module,
+  which reims-ctl's build makes from `firmware/ambrosia` with clang and the
+  Rust toolchain's lld, and the arm64e set in `guest/prebuilt-arm64e`, with
+  the VM's own kernel patches added, the `config.cpio` reims-restore writes
+  beside its disks.
+
+Its accelerator is the host's: `hvf,kernel-irqchip=on` on an arm64 Mac,
+`kvm` on arm64 Linux, and `tcg,thread=multi` on x86-64 Linux. On Linux the
+guest's RAM is a shared memfd. Windows runs no arm64 VM: its QEMU is built
+for x86-64 guests alone. `scripts/install-ctl.sh` builds that
+`qemu-system-aarch64` with `--enable-gnutls`, since vmapple's AES engine
+needs a crypto library, and on a Mac with `--enable-hvf`, signing it with
+HVF's entitlement.
 
 ### arm64 guests: the device on Ambrosia
 
