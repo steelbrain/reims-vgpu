@@ -32,12 +32,16 @@
 //                 spi or tiled): made, nil, or where Metal's assertion ends the process
 //   spin          a Shared buffer the CPU writes while one GPU thread polls it (atomic and plain
 //                 loads), and one the GPU writes step by step while the CPU polls it
-//   capture       which of a Managed buffer's CPU bytes a command buffer's kernel reads where the
-//                 CPU writes the range again after its didModifyRange: (A, then B): B written
-//                 before the commit (the buffer encoded before A, or after B), and B written
-//                 after the commit while the buffer's first kernel spins; A alone and B with a
-//                 second didModifyRange: are the controls. A means the GPU's copy took the bytes
-//                 at didModifyRange: (or at the commit, where B came after it), B at a later point
+//   capture [BYTES]  which of a Managed buffer's CPU bytes (BYTES of them, 4096 by default) a
+//                 command buffer's kernel reads where the CPU writes the range again after its
+//                 didModifyRange: (A, then B): B written before the commit (the buffer encoded
+//                 before A, or after B), B written after the commit while the buffer's first
+//                 kernel spins, and B written at once after the commit returns, before the buffer
+//                 is scheduled; each of the last two again with a second didModifyRange: right
+//                 after B. A alone and B with a second didModifyRange: before the commit are the
+//                 controls. A means the GPU's copy took the bytes at didModifyRange: (or at the
+//                 commit, where B came after it), B at a later point: the submission, the GPU's
+//                 read, or the second didModifyRange: itself
 // A buffer's bytes print as runs, "A[0,4096)" or "B[0,256) A[256,4096)", each letter a byte.
 // Build: see README.md.
 #import "oracle_common.h"
@@ -907,9 +911,8 @@ static void case_spin(void)
 
 // One step of case_capture: `step` of its table, over a fresh Managed buffer of `n` bytes.
 static void capture_step(id<MTLComputePipelineState> spin, id<MTLComputePipelineState> copy,
-                         int step, const char *what)
+                         NSUInteger n, int step, const char *what)
 {
-	const NSUInteger n = 4096;
 	id<MTLBuffer> m = [D newBufferWithLength:n options:MTLResourceStorageModeManaged];
 	id<MTLBuffer> out = [D newBufferWithLength:n options:MTLResourceStorageModeShared];
 	id<MTLBuffer> flag = [D newBufferWithLength:64 options:MTLResourceStorageModeShared];
@@ -922,9 +925,10 @@ static void capture_step(id<MTLComputePipelineState> spin, id<MTLComputePipeline
 	[zero waitUntilCompleted];
 	memset(out.contents, 0xee, n);
 	memset(res.contents, 0, 64);
-	// The spin ends at once unless the step holds it for a write after the commit.
-	const bool after = step == 3;
-	((volatile uint32_t *)flag.contents)[0] = after ? 0 : 1;
+	// The spin ends at once unless the step holds it for a write after the commit: during the
+	// spin (after), or at once after the commit returns (atonce).
+	const bool after = step == 3 || step == 6, atonce = step == 5 || step == 7;
+	((volatile uint32_t *)flag.contents)[0] = after || atonce ? 0 : 1;
 	__block id<MTLCommandBuffer> cb = nil;
 	void (^encode)(void) = ^{
 		uint32_t max = gSpinPolls;
@@ -948,6 +952,13 @@ static void capture_step(id<MTLComputePipelineState> spin, id<MTLComputePipeline
 	// 2: A, didModifyRange:, B, encode, commit
 	// 3: A, didModifyRange:, encode, commit, B while the first kernel spins, then the read
 	// 4: A, didModifyRange:, B, didModifyRange:, encode, commit (control: B)
+	// 5: A, didModifyRange:, encode, commit, B at once (no wait), then the spin let go as in 3:
+	//    A means the bytes were taken by the time the commit returned, B at the submission or
+	//    the GPU's read
+	// 6: as 3, then a second didModifyRange: of the range before the spin is let go: B means
+	//    didModifyRange: reaches a command buffer already running, at the call
+	// 7: as 5, then a second didModifyRange: right after B: B means it reaches a command buffer
+	//    already committed, before the GPU schedules it
 	if (step == 1)
 		encode();
 	memset(m.contents, 'A', n);
@@ -959,13 +970,31 @@ static void capture_step(id<MTLComputePipelineState> spin, id<MTLComputePipeline
 	if (step != 1)
 		encode();
 	double t0 = oracle_now_ms();
+	__block double ts = -1;
+	if (step >= 5)
+		[cb addScheduledHandler:^(id<MTLCommandBuffer> _) { ts = oracle_now_ms() - t0; }];
 	[cb commit];
-	double tw = -1;
-	if (after) {
+	double tr = oracle_now_ms() - t0, tb = -1, tw = -1, tg = -1;
+	// B, and its second didModifyRange: in steps 6 and 7, from tb to tw.
+	void (^writeB)(void) = ^{
+		memset(m.contents, 'B', n);
+		if (step == 6 || step == 7)
+			[m didModifyRange:NSMakeRange(0, n)];
+	};
+	if (atonce) {
+		tb = oracle_now_ms() - t0;
+		writeB();
+		tw = oracle_now_ms() - t0;
+	}
+	if (after || atonce) {
 		[cb waitUntilScheduled];
 		usleep(20000);
-		memset(m.contents, 'B', n);
-		tw = oracle_now_ms() - t0;
+		if (after) {
+			tb = oracle_now_ms() - t0;
+			writeB();
+			tw = oracle_now_ms() - t0;
+		}
+		tg = oracle_now_ms() - t0;
 		((volatile uint32_t *)flag.contents)[0] = 7;
 	}
 	[cb waitUntilCompleted];
@@ -977,14 +1006,21 @@ static void capture_step(id<MTLComputePipelineState> spin, id<MTLComputePipeline
 	printf("    spin polls %u, saw flag %u%s; status %ld%s%s\n", r[0], r[1],
 	       tw >= 0 ? "" : " (not held)", (long)cb.status, cb.error ? " error " : "",
 	       cb.error ? cb.error.description.UTF8String : "");
-	if (tw >= 0)
+	if (step == 3)
 		printf("    B written %.1f ms after the commit, the buffer completed at %.1f ms\n", tw, tc);
+	else if (step >= 5)
+		printf("    B%s written from %.2f to %.2f ms after the commit, which returned at %.2f ms; "
+		       "scheduled at %.2f ms, GPU start at %.2f ms, the spin let go at %.1f ms, the "
+		       "buffer completed at %.1f ms\n",
+		       step == 5 ? "" : " and didModifyRange:", tb, tw, tr, ts,
+		       cb.GPUStartTime * 1e3 - t0, tg, tc);
 }
 
-static void case_capture(void)
+static void case_capture(NSUInteger n)
 {
-	printf("case capture: the CPU bytes a kernel reads of a Managed buffer written again after "
-	       "didModifyRange:\n");
+	printf("case capture: the CPU bytes a kernel reads of a Managed buffer of %lu bytes written "
+	       "again after didModifyRange:\n",
+	       (unsigned long)n);
 	id<MTLLibrary> lib = oracle_library(D, gArgv0, "oracle");
 	if (!lib)
 		return;
@@ -998,9 +1034,12 @@ static void case_capture(void)
 	    "A, didModifyRange:, B, encode, commit",
 	    "A, didModifyRange:, encode, commit, B during the spin",
 	    "A, didModifyRange:, B, didModifyRange:, encode, commit",
+	    "A, didModifyRange:, encode, commit, B at once",
+	    "as 3, then didModifyRange: during the spin",
+	    "as 5, then didModifyRange: at once",
 	};
-	for (int step = 0; step < 5; step++)
-		capture_step(spin, copy, step, what[step]);
+	for (int step = 0; step < 8; step++)
+		capture_step(spin, copy, n, step, what[step]);
 }
 
 static int run_case(int argc, char **argv)
@@ -1029,7 +1068,7 @@ static int run_case(int argc, char **argv)
 	else if (!strcmp(c, "spin"))
 		case_spin();
 	else if (!strcmp(c, "capture"))
-		case_capture();
+		case_capture(argc > 1 ? strtoull(argv[1], NULL, 0) : 4096);
 	else {
 		printf("unknown case %s\n", c);
 		return 2;
