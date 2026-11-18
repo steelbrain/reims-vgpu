@@ -2161,7 +2161,7 @@ impl State {
         if cb == 0 {
             // A descriptor keeps what its calls name, for the encoder made of it.
             // So does an indirect command buffer what its commands name, for the command buffers
-            // that execute it: a command holds none of it.
+            // that execute it, whose calls name only the buffer.
             let icb = recv_type == std::any::type_name::<crate::gpu::icb::IcbObject>();
             if (recv_type.contains("Descriptor") || icb) && !named.is_empty() {
                 let mut objects = self.objects.lock();
@@ -2201,7 +2201,7 @@ impl State {
                 info.refs.extend(refs);
             }
             // An indirect command buffer named here lets go of what was released since its
-            // commands named it, which no command of it reaches now.
+            // commands named it, which a capture skips (`ranges_of`), so its refs stay few.
             let icb = std::any::type_name::<crate::gpu::icb::IcbObject>();
             for id in &named {
                 let Some(info) = objects.info.get(id).filter(|i| i.type_name == icb) else {
