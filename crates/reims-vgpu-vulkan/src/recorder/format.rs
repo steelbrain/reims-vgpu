@@ -2,9 +2,14 @@
 //! its three record kinds (a name, a blob, a call) and the values a call carries, written by
 //! [`Stream`] and read back by [`read`].
 //!
-//! - **The file:** [`HEADER`] (`M2VRSTRM`, the version as a little-endian `u32`, flags `0`), then
-//!   records: a kind byte, the payload's length as a varint, the payload. Varints are unsigned
-//!   LEB128; a signed value is zigzag-encoded first.
+//! - **The file:** [`HEADER`] (`M2VRSTRM`, the version and the flags, [`FLAGS`], each as a
+//!   little-endian `u32`), then records: a kind byte, the payload's length as a varint, the
+//!   payload. Varints are unsigned LEB128; a signed value is zigzag-encoded first.
+//! - **Flags** say what a stream promises beyond the version's records. Bit 0,
+//!   [`FLAG_ANNOUNCED_BYTES_RECORDED`]: at each `didModifyRange:`, the stream's last
+//!   `m2v.write` of each 4 KiB chunk of the range holds the guest's bytes, so a player pushes the
+//!   recorded bytes there; one reading a stream without it pushes its own read-back. A reader
+//!   checks the magic and the version alone ([`read`]), so a stream with the bit reads as before.
 //! - **Names** are interned: the n-th name record defines name id n, from 1, before the first
 //!   record that uses it. A selector and a map key are name ids.
 //! - **Blobs** are named by the SHA-256 of their bytes, each written once per stream before its
@@ -16,7 +21,7 @@
 //! each segment after the first with the identity record of each device then live
 //! (`m2v.deviceIdentity`, on the device, answering its `name` and `hasUnifiedMemory`), which
 //! also follows the record that made each device: the header itself stays the magic, the
-//! version and flags `0`.
+//! version and [`FLAGS`].
 //!
 //! A no-copy buffer's bytes arrive as writes, but where the device keeps two copies of a
 //! `Managed` buffer (`hasUnifiedMemory` NO), a no-copy `Managed` one's record carries those its
@@ -47,6 +52,16 @@ use sha2::{Digest as _, Sha256};
 /// The format's version.
 pub const VERSION: u32 = 2;
 
+/// Header flag bit 0: at each `didModifyRange:` record of a buffer, for each 4 KiB chunk of the
+/// range (of the target its writes name: the buffer, or the block it lies in), the last
+/// `m2v.write` before it that carries the chunk holds the bytes the CPU's copy held at the call,
+/// bytes the GPU wrote and the stream took without a write included. So a player pushes its
+/// recorded bytes at an announce, never its own read-back of a buffer the GPU wrote.
+pub const FLAG_ANNOUNCED_BYTES_RECORDED: u32 = 1;
+
+/// The flags every stream the recorder writes carries in its header.
+pub const FLAGS: u32 = FLAG_ANNOUNCED_BYTES_RECORDED;
+
 /// The file's first 16 bytes: the magic, the version and the flags.
 pub const HEADER: [u8; 16] = {
     let mut h = [0u8; 16];
@@ -61,6 +76,11 @@ pub const HEADER: [u8; 16] = {
     h[9] = v[1];
     h[10] = v[2];
     h[11] = v[3];
+    let f = FLAGS.to_le_bytes();
+    h[12] = f[0];
+    h[13] = f[1];
+    h[14] = f[2];
+    h[15] = f[3];
     h
 };
 
@@ -649,12 +669,14 @@ mod tests {
         ]
     }
 
-    /// The header is the magic, version 2 and flags 0
+    /// The header is the magic, version 2 and the flags, bit 0 set: the stream holds the guest's
+    /// bytes at each announce
     #[test]
     fn the_header_is_the_magic_version_and_flags() {
         assert_eq!(&HEADER[..8], b"M2VRSTRM");
         assert_eq!(HEADER[8..12], 2u32.to_le_bytes());
-        assert_eq!(HEADER[12..], [0; 4]);
+        assert_eq!(HEADER[12..], 1u32.to_le_bytes());
+        assert_eq!(FLAG_ANNOUNCED_BYTES_RECORDED, 1, "bit 0");
     }
 
     /// Varints and zigzag round-trip at their edges

@@ -62,13 +62,21 @@
 //!   reaps it ([`State::absorb_reaped`]). Only a 4 KiB chunk wholly inside what one command
 //!   buffer wrote is taken, so a CPU write into the rest of a chunk still reaches the stream.
 //!
-//!   Two cases still lose a CPU write. One is a write made while the command buffer runs, into
-//!   the very bytes its GPU work writes: it is taken with the GPU's bytes (the guest raced its
-//!   own GPU work). The other is a write the guest makes once it learns of the completion before
-//!   those handlers run: from an event the command buffer signals (the runtime signals its events
-//!   and sets its status before it runs the handlers), or from its status read in that gap,
-//!   which lasts microseconds. The hashing runs on the runtime's thread that saw the completion,
-//!   and holds back other completions while it runs.
+//!   Two cases still lose a CPU write from the writes before a commit (an announce, below, still
+//!   writes it). One is a write made while the command buffer runs, into the very bytes its GPU
+//!   work writes: it is taken with the GPU's bytes (the guest raced its own GPU work). The other
+//!   is a write the guest makes once it learns of the completion before those handlers run: from
+//!   an event the command buffer signals (the runtime signals its events and sets its status
+//!   before it runs the handlers), or from its status read in that gap, which lasts
+//!   microseconds. The hashing runs on the runtime's thread that saw the completion, and holds
+//!   back other completions while it runs.
+//!
+//!   An announce, a `didModifyRange:` of a `Managed` buffer, also writes each chunk of its range
+//!   whose bytes differ from those the stream's last write of it recorded, or that no write
+//!   recorded ([`before_modify`]): so at every announce the stream's last recorded bytes of the
+//!   range are the guest's, those the GPU wrote and the guest read back included, however late
+//!   their completion was taken. The header says so ([`format::FLAG_ANNOUNCED_BYTES_RECORDED`]),
+//!   for a player that pushes the recorded bytes at an announce.
 //! - **Private buffers around dispatches.** Around each recorded dispatch of a compute pipeline
 //!   made with linked functions, a blit copies each Private buffer range it binds into a Shared
 //!   buffer of the recorder's own, before the dispatch and after it, and at the command buffer's
@@ -1451,7 +1459,12 @@ unsafe fn guest_ram_args(
     (vec![destination, Value::List(pieces)], total)
 }
 
-/// Before `didModifyRange:` of a `Managed` buffer: the range's bytes, as a write.
+/// Before `didModifyRange:` of a `Managed` buffer, an announce: the range's bytes, as a write of
+/// each chunk whose bytes differ from its comparison point or from those the stream last
+/// recorded for it, or for which it recorded none ([`State::announce`]). So at the announce the
+/// stream's last recorded bytes of the range are the guest's, those the GPU wrote and the stream
+/// took without a write ([`State::absorb`]) included, whenever it took them: what
+/// [`format::FLAG_ANNOUNCED_BYTES_RECORDED`] promises a player.
 pub fn before_modify(active: &Option<Active>, buffer: &VulkanBuffer, range: &NsRange) {
     let Some(a) = active else { return };
     if !a.recorded() {
@@ -1475,7 +1488,7 @@ pub fn before_modify(active: &Option<Active>, buffer: &VulkanBuffer, range: &NsR
             })
         })
         .collect();
-    state.capture(&ranges);
+    state.announce(&ranges);
 }
 
 /// What the recorder knows of one object.
@@ -1586,6 +1599,30 @@ struct Span {
     from: u64,
     start: u64,
     end: u64,
+}
+
+/// What the stream holds of one 4 KiB chunk of a target, as hashes of its bytes ([`hash64`]),
+/// each 0 for none: bytes that hash to 0 are only written more often.
+#[derive(Debug, Default, Clone, Copy)]
+struct Chunk {
+    /// The comparison point: the bytes the stream holds for it, from a write or taken as the
+    /// GPU's at a completion ([`State::absorb`]).
+    point: u64,
+    /// The bytes the stream's last `m2v.write` of it recorded, 0 where none did.
+    recorded: u64,
+}
+
+/// What a comparison of chunks with the stream's writes ([`State::compare`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compare {
+    /// Before a commit: each chunk whose bytes differ from its comparison point.
+    Commit,
+    /// Before a `didModifyRange:`: each chunk whose bytes differ from its comparison point or
+    /// from the bytes last recorded for it, or for which none were.
+    Announce,
+    /// At a completion, of what the GPU wrote: none; each chunk's bytes become its comparison
+    /// point.
+    Absorb,
 }
 
 #[derive(Default)]
@@ -1719,7 +1756,8 @@ struct State {
     next: AtomicU64,
     objects: Mutex<Objects>,
     sync: Mutex<SyncState>,
-    baselines: Mutex<KeyMap<Vec<u64>>>,
+    /// What the stream holds of each target's chunks, by the target's stream id.
+    baselines: Mutex<KeyMap<Vec<Chunk>>>,
     selectors: Mutex<BTreeMap<String, u64>>,
     /// The last dispatch snapshot numbered ([`private`]).
     snaps: AtomicU64,
@@ -2402,7 +2440,7 @@ impl State {
                 (start < end).then_some(Span { start, end, ..j })
             })
             .collect();
-        self.compare(&whole, false);
+        self.compare(&whole, Compare::Absorb);
     }
 
     /// Waits, at most [`WAIT_BOUND`], for each committed command buffer that can run: one whose
@@ -2581,15 +2619,22 @@ impl State {
 
     /// Writes each 4 KiB of `spans` whose bytes changed since the stream last held them.
     fn capture(&self, spans: &[Span]) {
-        self.compare(spans, true);
+        self.compare(spans, Compare::Commit);
     }
 
-    /// Compares each 4 KiB of `spans` with the stream's: where `emit`, a changed one is written
-    /// as a write; else it is only taken as the stream's. A target released since its span was
+    /// Writes each 4 KiB of `spans` whose bytes differ from the stream's or from those its last
+    /// write of them recorded, or that no write recorded ([`before_modify`]).
+    fn announce(&self, spans: &[Span]) {
+        self.compare(spans, Compare::Announce);
+    }
+
+    /// Compares each 4 KiB of `spans` with the stream's: a chunk `how` writes is written as a
+    /// write, its bytes then both its comparison point and its recorded bytes; else, where `how`
+    /// absorbs, its bytes are only taken as the stream's. A target released since its span was
     /// read is skipped: its release ([`released`]) marks it so before it takes the comparison
     /// points' lock, and the object goes only after that, so a target found live stays mapped
     /// while it is read.
-    fn compare(&self, spans: &[Span], emit: bool) {
+    fn compare(&self, spans: &[Span], how: Compare) {
         let t0 = now_ns();
         let mut writes: BTreeMap<u64, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
         let (mut hashed, mut refreshed) = (0, 0);
@@ -2610,7 +2655,7 @@ impl State {
                 let chunks = s.len.div_ceil(CHUNK) as usize;
                 let base = baselines.entry(s.target).or_default();
                 if base.len() < chunks {
-                    base.resize(chunks, 0);
+                    base.resize(chunks, Chunk::default());
                 }
                 for c in first..=last {
                     let off = c * CHUNK;
@@ -2634,18 +2679,30 @@ impl State {
                     let Some(slot) = base.get_mut(c as usize) else {
                         continue;
                     };
-                    if *slot == h {
+                    let write = match how {
+                        Compare::Commit => slot.point != h,
+                        Compare::Announce => {
+                            slot.point != h || slot.recorded != h || slot.recorded == 0
+                        }
+                        Compare::Absorb => {
+                            if slot.point != h {
+                                slot.point = h;
+                                refreshed += 1;
+                            }
+                            continue;
+                        }
+                    };
+                    if !write {
                         continue;
                     }
-                    *slot = h;
-                    if emit {
-                        writes
-                            .entry(s.target)
-                            .or_default()
-                            .push((off, dst.to_vec()));
-                    } else {
-                        refreshed += 1;
-                    }
+                    *slot = Chunk {
+                        point: h,
+                        recorded: h,
+                    };
+                    writes
+                        .entry(s.target)
+                        .or_default()
+                        .push((off, dst.to_vec()));
                 }
             }
         }

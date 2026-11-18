@@ -1,7 +1,7 @@
 //! The memory a recording holds, on the Vulkan platform: what reaches the stream as `m2v.write`
-//! records around commits ([`super::before_commit`]). The recorder is the process's, started
-//! once, so each test records in a child copy of the test binary of its own
-//! ([`in_recording_child`]).
+//! records around commits ([`super::before_commit`]) and announces ([`super::before_modify`]).
+//! The recorder is the process's, started once, so each test records in a child copy of the
+//! test binary of its own ([`in_recording_child`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use super::format::{self, Record, Value};
 use super::{ENV_VAR, id_at, on, start_from_env, state};
 use crate::core::host::HostPtr;
 use crate::core::platform::Handle as _;
-use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+use crate::core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
 use crate::core::platform::command::{
     CommandBuffer as _, CommandQueue as _, CompletedHandler, PartCut,
 };
@@ -504,5 +504,143 @@ fn on_vulkan_a_write_a_copied_indirect_command_binds_is_written() {
         run(&executed);
         let w = writes_between_commits(streams, r.block(), 2);
         assert_eq!(w[0].get(&0), Some(&chunk(&[(0x5d, 16)])));
+    });
+}
+
+/// A `Managed` buffer of two chunks.
+fn managed() -> VulkanBuffer {
+    let d = crate::gpu::device::tests::dev();
+    let made = d.new_buffer_of_length(OnFault::Return, 8192, 0x10);
+    made.unwrap().expect("a Managed buffer")
+}
+
+/// Writes `value` into `bytes` of `m`, as the CPU.
+fn write_into(m: &VulkanBuffer, bytes: std::ops::Range<u64>, value: u8) {
+    write_at(m.contents().as_ptr::<u8>().addr(), bytes, value);
+}
+
+/// `didModifyRange:` of all of `m`: an announce.
+fn announce(m: &VulkanBuffer) {
+    m.did_modify_range(OnFault::Return, NsRange::new(0, m.length()))
+        .unwrap();
+}
+
+/// Runs, in a command buffer of `r`'s queue, a fill of `bytes` of `m` with `value` and then a
+/// `synchronizeResource:` of `m`: the GPU's write read back into the CPU's copy, as a guest
+/// reads a `Managed` buffer the GPU wrote (on a device of one copy, the synchronize does
+/// nothing).
+fn fill_and_read_back(r: &Rig, m: &VulkanBuffer, bytes: std::ops::Range<u64>, value: u8) {
+    let cb = r.command_buffer();
+    let range = NsRange {
+        location: bytes.start,
+        length: bytes.end - bytes.start,
+    };
+    let fill = BlitCmd::FillBuffer {
+        buffer: m,
+        range,
+        value,
+    };
+    let synchronize = BlitCmd::SynchronizeResource {
+        resource: Some(ResourceRef::Buffer(m)),
+    };
+    r.blit(&cb, vec![fill, synchronize]);
+    run(&cb);
+}
+
+/// `m`'s writes before each `didModifyRange:` record of the stream, once it holds `n` of them:
+/// the `i`th map those after the one before announce `i` (from the stream's start for the
+/// first), up to it.
+fn writes_before_announces(
+    streams: &Path,
+    m: &VulkanBuffer,
+    n: usize,
+) -> Vec<BTreeMap<u64, Vec<u8>>> {
+    let target = id_at(m.id().0).expect("the buffer is recorded");
+    let records = records_once(streams, |rs| place(rs, "didModifyRange:", n - 1).is_some());
+    let mut ends = vec![0];
+    for i in 0..n {
+        ends.push(place(&records, "didModifyRange:", i).expect("the announce's record"));
+    }
+    (ends.windows(2))
+        .map(|w| writes_of(&records, target, w[0]..w[1]))
+        .collect()
+}
+
+/// What the GPU wrote and the guest read back is in the stream at its announce: a `Managed`
+/// buffer whose two chunks a fill wrote whole and a `synchronizeResource:` brought back,
+/// announced with no CPU write since, is written with the GPU's bytes before that
+/// `didModifyRange:`, though the stream took them at the completion without a write. An announce
+/// after it writes nothing.
+#[test]
+fn on_vulkan_an_announce_writes_what_the_gpu_wrote() {
+    let test = "recorder::memory_tests::on_vulkan_an_announce_writes_what_the_gpu_wrote";
+    in_recording_child(test, |streams| {
+        let r = Rig::new();
+        let m = managed();
+        write_into(&m, 0..8192, 0xa1);
+        announce(&m);
+        fill_and_read_back(&r, &m, 0..8192, 0x4e);
+        announce(&m);
+        announce(&m);
+        let w = writes_before_announces(streams, &m, 3);
+        let all = |value| BTreeMap::from([(0, bytes(value, 4096)), (4096, bytes(value, 4096))]);
+        assert_eq!(w[0], all(0xa1), "the CPU's write");
+        assert_eq!(w[1], all(0x4e), "the GPU's write, read back");
+        assert_eq!(w[2], BTreeMap::new(), "nothing changed since");
+    });
+}
+
+/// A `synchronizeResource:` takes all of its buffer as the GPU's write: of a `Managed` buffer a
+/// fill wrote only part of a chunk of, read back and announced with no CPU write since, that
+/// chunk is written before the `didModifyRange:`, the GPU's bytes with the CPU's beside them,
+/// and the chunk nothing wrote is not.
+#[test]
+fn on_vulkan_an_announce_writes_what_a_synchronize_took() {
+    let test = "recorder::memory_tests::on_vulkan_an_announce_writes_what_a_synchronize_took";
+    in_recording_child(test, |streams| {
+        let r = Rig::new();
+        let m = managed();
+        write_into(&m, 0..8192, 0xa2);
+        announce(&m);
+        fill_and_read_back(&r, &m, 0..16, 0x4f);
+        announce(&m);
+        let w = writes_before_announces(streams, &m, 2);
+        let part = chunk(&[(0x4f, 16), (0xa2, 4080)]);
+        assert_eq!(w[1], BTreeMap::from([(0, part)]));
+    });
+}
+
+/// A CPU write over the GPU's is what an announce writes: of a `Managed` buffer the GPU wrote
+/// and the guest read back, then wrote again as the CPU, the CPU's bytes are written before the
+/// `didModifyRange:`.
+#[test]
+fn on_vulkan_an_announce_writes_a_cpu_write_over_the_gpus() {
+    let test = "recorder::memory_tests::on_vulkan_an_announce_writes_a_cpu_write_over_the_gpus";
+    in_recording_child(test, |streams| {
+        let r = Rig::new();
+        let m = managed();
+        write_into(&m, 0..8192, 0xa3);
+        announce(&m);
+        fill_and_read_back(&r, &m, 0..8192, 0x50);
+        write_into(&m, 0..8192, 0xa3);
+        announce(&m);
+        let w = writes_before_announces(streams, &m, 2);
+        let all = BTreeMap::from([(0, bytes(0xa3, 4096)), (4096, bytes(0xa3, 4096))]);
+        assert_eq!(w[1], all);
+    });
+}
+
+/// An announce of bytes the stream's last write of them recorded writes nothing.
+#[test]
+fn on_vulkan_an_announce_of_recorded_bytes_writes_nothing() {
+    let test = "recorder::memory_tests::on_vulkan_an_announce_of_recorded_bytes_writes_nothing";
+    in_recording_child(test, |streams| {
+        let m = managed();
+        write_into(&m, 0..8192, 0xa4);
+        announce(&m);
+        announce(&m);
+        let w = writes_before_announces(streams, &m, 2);
+        assert_eq!(w[0].len(), 2, "the CPU's write");
+        assert_eq!(w[1], BTreeMap::new());
     });
 }
