@@ -4291,7 +4291,9 @@ mod tests {
                 });
                 let one = |selector: &str| {
                     let mut of = calls.iter().filter(|c| c.selector == selector);
-                    let call = of.next().unwrap_or_else(|| panic!("no {selector}: {calls:?}"));
+                    let call = of
+                        .next()
+                        .unwrap_or_else(|| panic!("no {selector}: {calls:?}"));
                     assert!(of.next().is_none(), "two of {selector}: {calls:?}");
                     call
                 };
