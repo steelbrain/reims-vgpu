@@ -372,10 +372,15 @@ mod tests {
     /// own run (metal2vulkan's `host_ram.rs`, "An object over a chunk not imported yet"). The test
     /// makes the first buffer, waits for the chunk's import, and makes the second; both lie in the
     /// chunk, which is imported once. Where the plan is listed instead (the RAM has a source of
-    /// dma-bufs and each held import costs every submission, the device's submission check
-    /// measured: `releases_idle_pointer_imports`), a chunk is imported only for a copy over it, and
-    /// an object over a chunk not imported takes its own import and asks for none: neither buffer
-    /// lies in the RAM, and no chunk is imported.
+    /// dma-bufs, each held import costs every submission, the device's submission check
+    /// measured: `releases_idle_pointer_imports`, and the driver took the RAM's first page as one
+    /// of the source's dma-bufs as the use began, the runtime's `ram_plan`), a chunk is imported
+    /// only for a copy over it, and an object over a chunk not imported takes its own import and
+    /// asks for none: neither buffer lies in the RAM, and no chunk is imported. A driver that
+    /// refused that page's dma-buf (the lease's `host_ram_dma_buf_imports_failed`) imports the
+    /// RAM ahead: the RTX 3090's on NVIDIA's 620.70.06 (measured on metal2vulkan 4da77d8518,
+    /// which refuses a dma-buf import of shared memory where the first memory type the driver
+    /// offers for it is not host-coherent, as that driver's is not).
     #[test]
     fn a_buffer_over_one_run_of_the_ram_is_bound_in_its_chunk() {
         let device = dev();
@@ -389,6 +394,8 @@ mod tests {
             (c.host_ram_chunks_imported, c.chunk_bound_buffers_made)
         };
         let before = counts();
+        let refusals = || device.raw.work_counts().host_ram_dma_buf_imports_failed;
+        let refused_before = refusals();
         let lease = lease_guest_memory([GuestRamFile {
             host: at,
             guest: 0,
@@ -404,9 +411,12 @@ mod tests {
                 .unwrap()
                 .unwrap()
         };
-        // The plan is fixed as the RAM's use begins, after the device's checks answered.
-        let listed =
-            super::super::host_os::ram_has_sources() && device.raw.releases_idle_pointer_imports();
+        // The plan is fixed as the RAM's use begins (the lease), after the device's checks
+        // answered: the driver's answer to the RAM's first page as a dma-buf is counted by then.
+        let taken = refusals() == refused_before;
+        let listed = super::super::host_os::ram_has_sources()
+            && device.raw.releases_idle_pointer_imports()
+            && taken;
         let a = over(MIB, 2 * PAGE);
         let after_a = counts();
         if !listed {
