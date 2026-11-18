@@ -24,8 +24,9 @@ The guest's Metal bundle serialises its Metal calls onto the device's rings,
 and the library carries them out on the host's GPU, on the Vulkan platform
 (`crates/reims-vgpu-vulkan`), over metal2vulkan's Metal-shaped runtime, on
 Linux, Windows and macOS hosts: on a Mac over MoltenVK, Vulkan rather than
-Metal. x86-64 VMs run on Linux and Windows hosts, and arm64 VMs on Apple
-silicon Macs. Windows is tested on homelab-mac-mini-2018.
+Metal. x86-64 VMs run on Linux and Windows hosts, and arm64 VMs on Ambrosia
+under HVF on arm64 Macs, KVM on arm64 Linux and TCG on other hosts. Windows
+is tested on homelab-mac-mini-2018.
 The device's video decodes run on the host's VA-API or NVDEC.
 
 [README.md](README.md) says what the project is, and
