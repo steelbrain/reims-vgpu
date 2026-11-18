@@ -1336,7 +1336,9 @@ pub(crate) fn open(
 /// that [`open`] drops ([`untouched_resolves`], [`without_unused_resolves`]) or refuses
 /// ([`refused_resolve_format`]).
 fn has_resolve_texture(d: &rt::RenderPassDescriptor) -> bool {
-    d.color_attachments.iter().any(|a| a.resolve_texture.is_some())
+    d.color_attachments
+        .iter()
+        .any(|a| a.resolve_texture.is_some())
         || d.depth_attachment.resolve_texture.is_some()
         || d.stencil_attachment.resolve_texture.is_some()
 }

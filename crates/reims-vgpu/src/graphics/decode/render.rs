@@ -335,8 +335,9 @@ pub(super) fn names(tag: u16, payload: &[u8], found: &mut impl FnMut(u64) -> boo
             })
     }
     let more = match tag {
-        RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE => head::<RgfxOpSetRenderPipelineState>(payload)
-            .map(|m| each(found, [m.pipeline_obj_id])),
+        RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE => {
+            head::<RgfxOpSetRenderPipelineState>(payload).map(|m| each(found, [m.pipeline_obj_id]))
+        }
         RGFX_OP_RENDER_SET_VERTEX_BUFFER => {
             head::<RgfxOpSetVertexBuffer>(payload).map(|m| each(found, [m.buffer_obj_id]))
         }
@@ -365,8 +366,14 @@ pub(super) fn names(tag: u16, payload: &[u8], found: &mut impl FnMut(u64) -> boo
         RGFX_OP_RENDER_DRAW_PATCHES => {
             head::<RgfxOpDrawPatches>(payload).map(|m| each(found, [m.patch_index_buffer_obj_id]))
         }
-        RGFX_OP_RENDER_DRAW_PATCHES_INDIRECT => head::<RgfxOpDrawPatchesIndirect>(payload)
-            .map(|m| each(found, [m.patch_index_buffer_obj_id, m.indirect_buffer_obj_id])),
+        RGFX_OP_RENDER_DRAW_PATCHES_INDIRECT => {
+            head::<RgfxOpDrawPatchesIndirect>(payload).map(|m| {
+                each(
+                    found,
+                    [m.patch_index_buffer_obj_id, m.indirect_buffer_obj_id],
+                )
+            })
+        }
         RGFX_OP_RENDER_DRAW_INDEXED_PATCHES => head::<RgfxOpDrawIndexedPatches>(payload).map(|m| {
             each(
                 found,
@@ -390,8 +397,8 @@ pub(super) fn names(tag: u16, payload: &[u8], found: &mut impl FnMut(u64) -> boo
         }
         RGFX_OP_RENDER_EXECUTE_COMMANDS_IN_BUFFER => head::<RgfxOpExecuteCommandsInBuffer>(payload)
             .map(|m| each(found, [m.indirect_command_buffer_obj_id])),
-        RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT => {
-            head::<RgfxOpExecuteCommandsIndirect>(payload).map(|m| {
+        RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT => head::<RgfxOpExecuteCommandsIndirect>(payload)
+            .map(|m| {
                 each(
                     found,
                     [
@@ -399,8 +406,7 @@ pub(super) fn names(tag: u16, payload: &[u8], found: &mut impl FnMut(u64) -> boo
                         m.indirect_range_buffer_obj_id,
                     ],
                 )
-            })
-        }
+            }),
         RGFX_OP_RENDER_UPDATE_FENCE => {
             head::<RgfxOpUpdateFence>(payload).map(|m| each(found, [m.fence_obj_id]))
         }
@@ -416,8 +422,7 @@ pub(super) fn names(tag: u16, payload: &[u8], found: &mut impl FnMut(u64) -> boo
             head::<RgfxOpSetDepthResolveTexture>(payload).map(|m| each(found, [m.texture_obj_id]))
         }
         RGFX_OP_RENDER_SET_STENCIL_RESOLVE_TEXTURE => {
-            head::<RgfxOpSetStencilResolveTexture>(payload)
-                .map(|m| each(found, [m.texture_obj_id]))
+            head::<RgfxOpSetStencilResolveTexture>(payload).map(|m| each(found, [m.texture_obj_id]))
         }
         RGFX_OP_RENDER_SET_TESSELLATION_FACTOR_BUFFER => {
             head::<RgfxOpSetTessellationFactorBuffer>(payload)
@@ -426,9 +431,11 @@ pub(super) fn names(tag: u16, payload: &[u8], found: &mut impl FnMut(u64) -> boo
         RGFX_OP_RENDER_SET_VERTEX_BUFFERS => {
             buffers(payload, |m: &RgfxOpSetVertexBuffers| m.range_length, found)
         }
-        RGFX_OP_RENDER_SET_FRAGMENT_BUFFERS => {
-            buffers(payload, |m: &RgfxOpSetFragmentBuffers| m.range_length, found)
-        }
+        RGFX_OP_RENDER_SET_FRAGMENT_BUFFERS => buffers(
+            payload,
+            |m: &RgfxOpSetFragmentBuffers| m.range_length,
+            found,
+        ),
         RGFX_OP_RENDER_SET_TILE_BUFFERS => {
             buffers(payload, |m: &RgfxOpSetTileBuffers| m.range_length, found)
         }
@@ -451,9 +458,11 @@ pub(super) fn names(tag: u16, payload: &[u8], found: &mut impl FnMut(u64) -> boo
         RGFX_OP_RENDER_SET_VERTEX_TEXTURES => {
             textures(payload, |m: &RgfxOpSetVertexTextures| m.range_length, found)
         }
-        RGFX_OP_RENDER_SET_FRAGMENT_TEXTURES => {
-            textures(payload, |m: &RgfxOpSetFragmentTextures| m.range_length, found)
-        }
+        RGFX_OP_RENDER_SET_FRAGMENT_TEXTURES => textures(
+            payload,
+            |m: &RgfxOpSetFragmentTextures| m.range_length,
+            found,
+        ),
         RGFX_OP_RENDER_SET_TILE_TEXTURES => {
             textures(payload, |m: &RgfxOpSetTileTextures| m.range_length, found)
         }
@@ -463,21 +472,31 @@ pub(super) fn names(tag: u16, payload: &[u8], found: &mut impl FnMut(u64) -> boo
         RGFX_OP_RENDER_SET_MESH_TEXTURES => {
             textures(payload, |m: &RgfxOpSetMeshTextures| m.range_length, found)
         }
-        RGFX_OP_RENDER_SET_VERTEX_SAMPLER_STATES => {
-            samplers(payload, |m: &RgfxOpSetVertexSamplerStates| m.range_length, found)
-        }
-        RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES => {
-            samplers(payload, |m: &RgfxOpSetFragmentSamplerStates| m.range_length, found)
-        }
-        RGFX_OP_RENDER_SET_TILE_SAMPLER_STATES => {
-            samplers(payload, |m: &RgfxOpSetTileSamplerStates| m.range_length, found)
-        }
-        RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES => {
-            samplers(payload, |m: &RgfxOpSetObjectSamplerStates| m.range_length, found)
-        }
-        RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES => {
-            samplers(payload, |m: &RgfxOpSetMeshSamplerStates| m.range_length, found)
-        }
+        RGFX_OP_RENDER_SET_VERTEX_SAMPLER_STATES => samplers(
+            payload,
+            |m: &RgfxOpSetVertexSamplerStates| m.range_length,
+            found,
+        ),
+        RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES => samplers(
+            payload,
+            |m: &RgfxOpSetFragmentSamplerStates| m.range_length,
+            found,
+        ),
+        RGFX_OP_RENDER_SET_TILE_SAMPLER_STATES => samplers(
+            payload,
+            |m: &RgfxOpSetTileSamplerStates| m.range_length,
+            found,
+        ),
+        RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES => samplers(
+            payload,
+            |m: &RgfxOpSetObjectSamplerStates| m.range_length,
+            found,
+        ),
+        RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES => samplers(
+            payload,
+            |m: &RgfxOpSetMeshSamplerStates| m.range_length,
+            found,
+        ),
         RGFX_OP_RENDER_SET_VERTEX_SAMPLER_STATES_LOD_CLAMPS => samplers_lod(
             payload,
             |m: &RgfxOpSetVertexSamplerStatesLodClamps| m.range_length,
@@ -511,9 +530,7 @@ pub(super) fn names(tag: u16, payload: &[u8], found: &mut impl FnMut(u64) -> boo
         RGFX_OP_RENDER_USE_HEAPS_STAGES => {
             heaps(payload, |m: &RgfxOpUseHeapsStages| m.count, found)
         }
-        RGFX_OP_RENDER_USE_RESOURCES => {
-            resources(payload, |m: &RgfxOpUseResources| m.count, found)
-        }
+        RGFX_OP_RENDER_USE_RESOURCES => resources(payload, |m: &RgfxOpUseResources| m.count, found),
         RGFX_OP_RENDER_USE_RESOURCES_STAGES => {
             resources(payload, |m: &RgfxOpUseResourcesStages| m.count, found)
         }
@@ -3781,7 +3798,10 @@ mod tests {
             ..RgfxOpDrawIndexedPrimitivesIndirect::default()
         };
         assert_eq!(
-            read(RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES_INDIRECT, draw.as_bytes()),
+            read(
+                RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES_INDIRECT,
+                draw.as_bytes()
+            ),
             (Some(true), vec![3, 4])
         );
         assert_eq!(
