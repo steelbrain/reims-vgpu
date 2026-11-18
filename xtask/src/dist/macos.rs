@@ -1,5 +1,5 @@
 //! `cargo xtask dist` on macOS: the library for arm64 macOS [`DEPLOYMENT_TARGET`], on the Vulkan
-//! platform over MoltenVK, a build for development and tests. The dylib's install name is
+//! platform over MoltenVK. The dylib's install name is
 //! `@rpath/libreims_vgpu.dylib`, and it is signed ad hoc again after the name changes, both on a
 //! copy under the target dir that is then installed, so a dylib whose bytes come out the same is
 //! left as it was. `Libs.private` names every library the dylib links (`otool -L`).

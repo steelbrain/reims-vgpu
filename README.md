@@ -5,10 +5,10 @@
 > **Beta.** reims-vgpu has largely stabilized. We're now working through differences between
 > platforms and GPU drivers, so how well it runs can still depend on your host and its GPU.
 
-reims-vgpu is a virtual GPU for macOS VMs. It gives x86-64 macOS running in QEMU on Linux
-accelerated graphics, on your GPU's Vulkan driver. The guest drives it with macOS drivers of our
-own, which `reims-ctl` puts in the VM's OpenCore image, so there's nothing to install in the guest
-yourself.
+reims-vgpu is a virtual GPU for macOS VMs. It gives x86-64 macOS running in QEMU on Linux or
+Windows accelerated graphics, on your GPU's Vulkan driver. The guest drives it with macOS drivers
+of our own, which `reims-ctl` puts in the VM's OpenCore image, so there's nothing to install in the
+guest yourself.
 
 Alongside the GPU, we ship a QEMU build that uses it, and `reims-ctl`, a small tool that creates
 and runs macOS VMs for you.
@@ -197,8 +197,9 @@ The reims-graphics device (PCI `1234:5247`) and everything on both sides of it a
 guest, our kexts drive the device, and our Metal bundle turns macOS's Metal calls into the
 device's command stream. On the host, QEMU's `reims-graphics-pci` hands that stream to the
 library, which runs it on Vulkan through [`metal2vulkan`](https://github.com/steelbrain/metal2vulkan)
-and draws the guest's display into a window of its own. The library also builds on a Mac, over
-MoltenVK, for development and tests, and the guest's side is built there; VMs run on Linux.
+and draws the guest's display into a window of its own. On a Mac the library runs on Vulkan too,
+over MoltenVK rather than Metal, and the guest's side is built there. x86-64 VMs run on Linux and
+Windows hosts, and arm64 VMs on Apple silicon Macs ([docs/qemu.md](docs/qemu.md), "arm64 guests").
 
 The library's C API (`crates/reims-vgpu-c/include/reims_vgpu.h`, specified in
 [docs/api.md](docs/api.md)) is its interface to QEMU: `cargo xtask dist` writes the library, the

@@ -215,8 +215,8 @@ mod tests {
 
     /// The installer's prune keeps a build older than the newest three while a QEMU runs from
     /// it, started as reims-ctl starts it, through `qemu/current`, which a newer build then
-    /// took; and removes the old builds nothing runs. The installer runs on Linux alone, whose
-    /// /proc names each process's executable.
+    /// took; and removes the old builds nothing runs. The test runs on Linux alone, whose /proc
+    /// names each process's executable.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_installers_prune_keeps_a_build_a_running_qemu_executes() {

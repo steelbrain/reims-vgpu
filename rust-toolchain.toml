@@ -4,9 +4,9 @@
 # The crates' `rust-version` (Cargo.toml) stays the stable floor clippy's `incompatible_msrv` checks
 # the standard library's items against. D32: the Metal platform is aarch64-apple-darwin alone; the
 # Vulkan platform builds for aarch64 and x86-64, on macOS and Linux, and x86_64-unknown-linux-gnu is
-# what ships on Linux (built there, type-checked from the Mac by `cargo xtask check`).
-# x86_64-pc-windows-gnullvm is the Windows the library is being brought up on (built there under
-# MSYS2 CLANG64, type-checked from the Mac and Linux by `cargo xtask check`).
+# what ships on Linux (built there, type-checked from the Mac by `cargo xtask check`),
+# x86_64-pc-windows-gnullvm what ships on Windows (built there under MSYS2 CLANG64, type-checked
+# from the Mac and Linux by `cargo xtask check`), and aarch64-apple-darwin what runs on a Mac.
 # x86_64-apple-darwin runs core's tests under Rosetta, with the x86-64 guest's pages and
 # instructions, on a Mac that has Rosetta (check skips them on one without).
 # No Rust binary is arm64e: rustc's arm64e-apple-darwin target has no pointer authentication, and

@@ -24,7 +24,7 @@
 //! compiles the Vulkan crate again.
 //!
 //! The library is built on the Vulkan platform (architecture 2.2), its only one: natively on
-//! Linux, and over MoltenVK on macOS, a build for development and tests. `--platform vulkan`
+//! Linux and Windows, and over MoltenVK on macOS. `--platform vulkan`
 //! names it, for the builds that pass it; any other platform is refused.
 
 use std::path::{Path, PathBuf};

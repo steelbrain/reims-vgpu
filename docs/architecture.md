@@ -147,8 +147,8 @@ reims-vgpu-graphics, reims-vgpu-video-*  <-  reims-vgpu  <-  reims-vgpu-c  <-  Q
 
 - **The Vulkan platform** (`reims-vgpu-vulkan`) is the library's `Platform`, over
   `metal2vulkan-runtime`, the Metal-shaped API on Vulkan of metal2vulkan, at the commit of its
-  public repository `Cargo.toml` names, on the host's Vulkan driver, or MoltenVK on a Mac (a build
-  for development and tests). Its OS services are its own: on macOS over the system's (`os/macos/`:
+  public repository `Cargo.toml` names, on the host's Vulkan driver, or MoltenVK on a Mac. Its OS
+  services are its own: on macOS over the system's (`os/macos/`:
   Mach VM, the clock, threads, the autorelease pool, and the message layer, 4.6); on Linux
   `os/linux/` (a host VM over `mmap` of the guest RAM's files, and the GPU's copies of a video
   driver's planes in dma-bufs into a runtime buffer). It compiles the library's shaders (4.7). Where its answer differs from Metal's it logs the difference and goes on, and dies

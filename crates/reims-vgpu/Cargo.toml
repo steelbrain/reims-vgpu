@@ -38,8 +38,8 @@ log.workspace = true
 # it cross threads.
 parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
 
-# The Vulkan platform (architecture 2.2), the library's only one: natively on Linux, and over
-# MoltenVK on macOS, a build for development and tests.
+# The Vulkan platform (architecture 2.2), the library's only one: natively on Linux and Windows,
+# and over MoltenVK on macOS.
 reims-vgpu-vulkan.workspace = true
 metal2vulkan-runtime.workspace = true
 

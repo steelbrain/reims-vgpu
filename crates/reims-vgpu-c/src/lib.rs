@@ -13,9 +13,9 @@
 //! - every struct the host writes starts with `struct_size` ([`sized`]);
 //! - every callback table has one `ctx` and one `destroy` ([`table`]).
 //!
-//! The exports are made over [`Plat`]: `VulkanPlatform`, natively on Linux and over MoltenVK on
-//! macOS (a build for development and tests); and core's testkit platform in this crate's unit
-//! tests, which then run the product's code.
+//! The exports are made over [`Plat`]: `VulkanPlatform`, natively on Linux and Windows and over
+//! MoltenVK on macOS; and core's testkit platform in this crate's unit tests, which then run the
+//! product's code.
 
 // On the Vulkan platform, a debug build's proof that the runtime's types are `Send` and `Sync`
 // nests deeper than rustc's default limit of 128 (E0275).

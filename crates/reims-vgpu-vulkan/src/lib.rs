@@ -1,6 +1,6 @@
 //! The `Platform` implementation over `metal2vulkan-runtime`, a Metal-shaped API on Vulkan
-//! (architecture D1): the library's only platform, natively on Linux, and over MoltenVK on macOS,
-//! a build for development and tests.
+//! (architecture D1): the library's only platform, natively on Linux and Windows, and over MoltenVK
+//! on macOS.
 //!
 //! - **Core** ([`core`]): what the reims-graphics device and its platform share,
 //!   generic over one `P: Platform`: the platform traits, the runtime, raises and deaths, the
