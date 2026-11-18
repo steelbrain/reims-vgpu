@@ -110,6 +110,10 @@
 //!   once each into the `blobs` directory beside the stream's, by the hex of their SHA-256, and
 //!   so do the bytes of `m2v.privateBytes`.
 //!   `<pid>.stats.txt` says what was written, every few seconds.
+//! - **Its build.** `<pid>.stats.txt` names the commit the library was built from
+//!   (`recorder_commit`, [`COMMIT`]) and each change to what a stream holds that the recorder
+//!   carries (a `recorder_fix` line for each of [`FIXES`]), so a recording says which recorder
+//!   made it. A change to what the recorder writes adds its name to [`FIXES`] in its own commit.
 //!
 //! Recordings hold the guest's data: they stay on the host that made them and are never
 //! committed.
@@ -157,6 +161,45 @@ const BUSY: Duration = Duration::from_micros(50);
 
 /// How often the counts are written.
 const STATS: Duration = Duration::from_secs(5);
+
+/// The commit the library was built from, which `cargo xtask dist` names for its Cargo steps in
+/// `RVG_BUILD_COMMIT` (`git rev-parse HEAD`, with `-dirty` where the tree differs from it), else
+/// `unknown`. The stats file writes it as `recorder_commit`.
+pub const COMMIT: &str = match option_env!("RVG_BUILD_COMMIT") {
+    Some(commit) => commit,
+    None => "unknown",
+};
+
+/// Each change to what a stream holds since format version 2, by name, in the order they
+/// landed, with the commit that made it. The stats file writes a `recorder_fix <name>` line for
+/// each.
+pub const FIXES: &[&str] = &[
+    "guest-ram-copy-reads",          // 82b8c2e2a: the guest RAM a copy out of it reads
+    "no-unmade-ram-copy",            // bec103226: no record of a copy the platform did not make
+    "commit-part-cut",               // 967d30b73: whether m2v.commitPart cut its command buffer
+    "nil-property-object-0",         // d04d02436: an object property set to nil as object 0
+    "host-copy-start-bytes",         // 82be400ae: a buffer copied from host memory's first bytes
+    "gpu-resource-ids",              // 0d42c7cb8: each gpuResourceID the platform answers
+    "private-around-linked-kernels", // 00d59542b: Private buffers around linked-kernel dispatches
+    "icb-cpu-commands",              // b27a603cb: commands a CPU encodes into an ICB
+    "device-identity",               // 0ba37884a: each device's identity at each segment's start
+    "no-copy-managed-create-bytes",  // 285f0bdd6: a no-copy Managed buffer's create-time bytes
+    "split-capture",                 // 7fc1cc427: memory before split and cut commits
+    "cpu-writes-over-gpu-writes",    // 7cf445307: CPU writes into bytes the GPU work wrote
+    "icb-reach",                     // cb7db3a59: what indirect commands bind
+    "own-textures",                  // 248751c3c, 642ef0ff9: the platform's own textures, marked
+    "announce-bytes",                // 0061da1f6: the guest's bytes at each Managed announce
+    "kernel-writes-at-completion",   // e3898c754: what kernels changed, at their completion
+];
+
+/// The stats file's lines that name the recorder's build: its commit ([`COMMIT`]), then one for
+/// each of [`FIXES`].
+fn write_build(out: &mut String) {
+    let _ = writeln!(out, "recorder_commit {COMMIT}");
+    for fix in FIXES {
+        let _ = writeln!(out, "recorder_fix {fix}");
+    }
+}
 
 /// The most bytes a segment holds before the next starts.
 const SEGMENT: u64 = 1 << 30;
@@ -2094,6 +2137,7 @@ impl State {
     fn write_stats(&self) {
         let s = &self.stats;
         let mut out = String::new();
+        write_build(&mut out);
         let line = |out: &mut String, name: &str, v: &AtomicU64| {
             let _ = writeln!(out, "{name} {}", v.load(Ordering::Relaxed));
         };
@@ -3189,6 +3233,28 @@ fn hash64(data: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stats file names the recorder's build first: one `recorder_commit` line, then a
+    /// `recorder_fix` line for each fix, in their order, each name a single word given once.
+    #[test]
+    fn the_stats_name_the_recorders_build() {
+        let mut out = String::new();
+        write_build(&mut out);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.first().copied(), Some(format!("recorder_commit {COMMIT}").as_str()));
+        let fixes: Vec<&str> = lines[1..]
+            .iter()
+            .filter_map(|l| l.strip_prefix("recorder_fix "))
+            .collect();
+        assert_eq!(fixes, FIXES, "{out}");
+        assert_eq!(lines.len(), 1 + FIXES.len(), "{out}");
+        let names: HashSet<&str> = FIXES.iter().copied().collect();
+        assert_eq!(names.len(), FIXES.len(), "a name given twice: {FIXES:?}");
+        assert!(
+            FIXES.iter().chain([&COMMIT]).all(|n| !n.is_empty() && !n.contains(char::is_whitespace)),
+            "{out}"
+        );
+    }
 
     /// A copy the platform did not make leaves its call nothing to record.
     #[test]

@@ -19,13 +19,17 @@
 //! bytes are those the tree already holds is left as it was, mtime included
 //! ([`replace_if_changed`]), so a dist of an unchanged build has QEMU's build do nothing.
 //!
+//! Its Cargo steps run with [`BUILD_COMMIT`] naming the commit the tree is at ([`build_commit`]),
+//! which the recorder writes into each recording's stats file, so a dist at another commit
+//! compiles the Vulkan crate again.
+//!
 //! The library is built on the Vulkan platform (architecture 2.2), its only one: natively on
 //! Linux, and over MoltenVK on macOS, a build for development and tests. `--platform vulkan`
 //! names it, for the builds that pass it; any other platform is refused.
 
 use std::path::{Path, PathBuf};
 
-use crate::tools::{Profile, System, target_dir};
+use crate::tools::{Profile, System, Tools, target_dir};
 use crate::util::{Res, repo_root};
 
 #[cfg(any(target_os = "linux", windows))]
@@ -58,6 +62,38 @@ pub const LICENSES: &str = "LICENSES";
 
 /// The tree's directory under the target dir when `--out` names none.
 pub const DEFAULT_OUT: &str = "dist-vulkan";
+
+/// The variable `dist` sets for its Cargo steps: the commit the library is built from
+/// ([`build_commit`]), which `crates/reims-vgpu-vulkan/src/recorder.rs` compiles in as
+/// `recorder::COMMIT`. Cargo and kache key the crate on it.
+pub const BUILD_COMMIT: &str = "RVG_BUILD_COMMIT";
+
+/// The commit the tree is at, `git rev-parse HEAD`, with `-dirty` where a tracked file differs
+/// from it, submodules and `crates/reims-ctl` (a workspace of its own, linking nothing of the
+/// library) aside, or where git cannot say. `None` where there is no commit to name (no git, or
+/// no checkout).
+pub fn build_commit(tools: &mut dyn Tools) -> Option<String> {
+    let head = tools.output("git", &strs(&["rev-parse", "HEAD"])).ok()?;
+    if head.is_empty() {
+        return None;
+    }
+    let changed = tools.output(
+        "git",
+        &strs(&[
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+            "--ignore-submodules",
+            "--",
+            ".",
+            ":(exclude)crates/reims-ctl",
+        ]),
+    );
+    Some(match changed {
+        Ok(changed) if changed.is_empty() => head,
+        _ => format!("{head}-dirty"),
+    })
+}
 
 /// `cargo xtask dist`'s arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +229,11 @@ pub fn install_license(root: &Path, out: &Path) -> Res<Vec<String>> {
 pub fn cmd_dist(args: &[String]) -> Res<bool> {
     let target = target_dir(&mut System)?;
     let o = parse_args(args, &target)?;
+    if let Some(commit) = build_commit(&mut System) {
+        // SAFETY: xtask runs on one thread, and every program it has run so far has exited:
+        // nothing reads the environment while it changes. The Cargo steps below inherit it.
+        unsafe { std::env::set_var(BUILD_COMMIT, commit) };
+    }
     let header = repo_root().join("crates/reims-vgpu-c/include").join(HEADER);
     let out = native::dist(&mut System, &o, &target, &header)?;
     let license = install_license(&repo_root(), &out)?;
@@ -343,6 +384,40 @@ mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Answers `git rev-parse HEAD` with `head` and `git status` with `status`.
+    struct Git {
+        head: Res<String>,
+        status: Res<String>,
+    }
+
+    impl Tools for Git {
+        fn run(&mut self, program: &str, _: &[String]) -> Res<()> {
+            Err(format!("{program}: not run here"))
+        }
+        fn output(&mut self, program: &str, args: &[String]) -> Res<String> {
+            assert_eq!(program, "git");
+            match args.first().map(String::as_str) {
+                Some("rev-parse") => self.head.clone(),
+                Some("status") => self.status.clone(),
+                _ => Err(format!("git {args:?}")),
+            }
+        }
+    }
+
+    /// The build commit is HEAD's, marked dirty where a tracked file differs or git cannot say,
+    /// and absent with no commit to name.
+    #[test]
+    fn build_commit_names_head_and_marks_a_changed_tree() {
+        let head = "0123456789abcdef0123456789abcdef01234567".to_owned();
+        let at = |head: Res<String>, status: Res<String>| build_commit(&mut Git { head, status });
+        assert_eq!(at(Ok(head.clone()), Ok(String::new())), Some(head.clone()));
+        let dirty = Some(format!("{head}-dirty"));
+        assert_eq!(at(Ok(head.clone()), Ok(" M Cargo.toml".into())), dirty);
+        assert_eq!(at(Ok(head.clone()), Err("git status failed".into())), dirty);
+        assert_eq!(at(Err("not a git repository".into()), Ok(String::new())), None);
+        assert_eq!(at(Ok(String::new()), Ok(String::new())), None);
+    }
 
     #[test]
     fn parse_args_every_option() {
