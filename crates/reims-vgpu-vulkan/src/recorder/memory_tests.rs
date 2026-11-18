@@ -15,11 +15,17 @@ use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
 use crate::core::platform::command::{
     CommandBuffer as _, CommandQueue as _, CompletedHandler, PartCut,
 };
+use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
 use crate::core::platform::device::GpuDevice as _;
+use crate::core::platform::icb::{
+    IcbComputeCmd, IndirectCommandBuffer as _, IndirectComputeCommand as _,
+};
 use crate::core::platform::resource::{Buffer as _, Heap as _};
 use crate::core::platform::types::NsRange;
+use crate::core::platform::values::IcbDesc;
 use crate::core::raise::OnFault;
 use crate::gpu::command::{VulkanCommandBuffer, VulkanCommandQueue};
+use crate::gpu::icb::VulkanIcb;
 use crate::gpu::resource::{VulkanBuffer, VulkanHeap};
 use crate::platform::VulkanPlatform;
 
@@ -217,6 +223,42 @@ impl Rig {
     fn write(&self, bytes: std::ops::Range<u64>, value: u8) {
         write_at(self.y.contents().as_ptr::<u8>().addr(), bytes, value);
     }
+
+    /// An indirect command buffer of one compute command, which the CPU encoded binding the
+    /// buffer where `bound` (and dispatching nothing), else none.
+    fn icb(&self, bound: bool) -> VulkanIcb {
+        let desc = IcbDesc {
+            command_types: 0x60,
+            max_kernel_buffer_bind_count: 1,
+            ..IcbDesc::default()
+        };
+        let d = crate::gpu::device::tests::dev();
+        let made = d.new_indirect_command_buffer(&desc, 1, 0);
+        let icb = made.unwrap().unwrap();
+        if bound {
+            let command = icb.compute_command(0).unwrap().unwrap();
+            let bind = IcbComputeCmd::SetKernelBuffer {
+                buffer: Some(&self.y),
+                offset: 0,
+                index: 0,
+            };
+            command.encode(bind).unwrap();
+        }
+        icb
+    }
+
+    /// Encodes in `cb` an execution of `icb`'s command, in a compute encoder of its own that
+    /// names nothing else.
+    fn execute(&self, cb: &VulkanCommandBuffer, icb: &VulkanIcb) {
+        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+        let execute = ComputeCmd::ExecuteCommandsInBuffer {
+            indirect_command_buffer: icb,
+            execution_range: NsRange::new(0, 1),
+        };
+        for cmd in [execute, ComputeCmd::EndEncoding] {
+            e.encode(OnFault::Return, cmd).unwrap();
+        }
+    }
 }
 
 /// Writes `value` into `bytes` from the host address `base`, as the CPU: the tests' buffer's.
@@ -413,5 +455,54 @@ fn on_vulkan_writes_its_handlers_make_are_written() {
         let w = writes_between_commits(streams, r.block(), 2);
         assert_eq!(w[0].get(&0), Some(&chunk(&[(0x77, 16), (0x44, 4080)])));
         assert_eq!(w[0].get(&4096), Some(&chunk(&[(0x78, 16), (0x44, 4080)])));
+    });
+}
+
+/// A command buffer reaches what the commands of an indirect command buffer it executes name: a
+/// CPU write into a block buffer only such a command binds is in the stream before the commit of
+/// the next command buffer that executes it.
+#[test]
+fn on_vulkan_a_write_an_indirect_command_binds_is_written() {
+    let test = "recorder::memory_tests::on_vulkan_a_write_an_indirect_command_binds_is_written";
+    in_recording_child(test, |streams| {
+        let r = Rig::new();
+        let icb = r.icb(true);
+        let first = r.command_buffer();
+        r.execute(&first, &icb);
+        run(&first);
+        r.write(0..16, 0x5c);
+        let second = r.command_buffer();
+        r.execute(&second, &icb);
+        run(&second);
+        let w = writes_between_commits(streams, r.block(), 2);
+        assert_eq!(w[0].get(&0), Some(&chunk(&[(0x5c, 16)])));
+    });
+}
+
+/// A copy of indirect commands copies what they name: a CPU write into a block buffer only a
+/// command copied into another buffer binds is in the stream before the commit of a command
+/// buffer that executes the copy.
+#[test]
+fn on_vulkan_a_write_a_copied_indirect_command_binds_is_written() {
+    let test =
+        "recorder::memory_tests::on_vulkan_a_write_a_copied_indirect_command_binds_is_written";
+    in_recording_child(test, |streams| {
+        let r = Rig::new();
+        let (icb, copy) = (r.icb(true), r.icb(false));
+        let copied = r.command_buffer();
+        let into = BlitCmd::CopyIndirectCommandBuffer {
+            source: &icb,
+            source_range: NsRange::new(0, 1),
+            destination: &copy,
+            destination_index: 0,
+        };
+        r.blit(&copied, vec![into]);
+        run(&copied);
+        r.write(0..16, 0x5d);
+        let executed = r.command_buffer();
+        r.execute(&executed, &copy);
+        run(&executed);
+        let w = writes_between_commits(streams, r.block(), 2);
+        assert_eq!(w[0].get(&0), Some(&chunk(&[(0x5d, 16)])));
     });
 }

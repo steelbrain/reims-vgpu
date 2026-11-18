@@ -37,13 +37,17 @@
 //! - **Memory.** Before each commit, the recorder waits for the earlier command buffers that can
 //!   run, then writes `m2v.write` records of every 4 KiB of host memory the command buffer can
 //!   reach that changed since the stream last held it ([`before_commit`]), a commit inside
-//!   `m2v.split` or `m2v.commitPart` too. A buffer in a heap over the guest's memory is written as
-//!   its block's bytes. A copy out of the guest's RAM carries the bytes it reads as its arguments
-//!   ([`guest_ram_source`]), and a buffer made as a copy of host memory the bytes it starts with
-//!   ([`contents`]). A no-copy buffer's bytes arrive as writes; on a device that keeps two copies
-//!   of a `Managed` buffer, a `Managed` one's record also carries the bytes its create copied
-//!   into the device's copy ([`no_copy_contents`]), which only a `didModifyRange:` changes
-//!   afterwards.
+//!   `m2v.split` or `m2v.commitPart` too. It can reach what its encoders' calls name, what a
+//!   pass's descriptor named, and what the commands of an indirect command buffer it executes
+//!   named, through copies of them too. Memory its GPU work finds by address alone, through an
+//!   argument buffer or an address in a buffer, it reaches only where the guest names it
+//!   (`useResource:usage:`, `useHeap:`), as Metal's residency asks. A buffer in a heap over the
+//!   guest's memory is written as its block's bytes. A copy out of the guest's RAM carries the
+//!   bytes it reads as its arguments ([`guest_ram_source`]), and a buffer made as a copy of host
+//!   memory the bytes it starts with ([`contents`]). A no-copy buffer's bytes arrive as writes;
+//!   on a device that keeps two copies of a `Managed` buffer, a `Managed` one's record also
+//!   carries the bytes its create copied into the device's copy ([`no_copy_contents`]), which
+//!   only a `didModifyRange:` changes afterwards.
 //!
 //!   What the GPU writes, the player's own run writes again, so it is taken as the stream's
 //!   without a write: the ranges a blit writes (a buffer copy's or fill's range, a guest-RAM
@@ -1457,7 +1461,7 @@ struct Info {
     block: Option<(usize, u64)>,
     /// Its GPU range, where the guest pinned it.
     pin: Option<(u64, u64)>,
-    /// The objects a descriptor's calls named.
+    /// The objects a descriptor's calls named, or an indirect command buffer's commands.
     refs: KeySet,
     /// Whether its last reference went: its release is queued, and its memory no longer read.
     dead: bool,
@@ -2156,7 +2160,10 @@ impl State {
         };
         if cb == 0 {
             // A descriptor keeps what its calls name, for the encoder made of it.
-            if recv_type.contains("Descriptor") && !named.is_empty() {
+            // So does an indirect command buffer what its commands name, for the command buffers
+            // that execute it: a command holds none of it.
+            let icb = recv_type == std::any::type_name::<crate::gpu::icb::IcbObject>();
+            if (recv_type.contains("Descriptor") || icb) && !named.is_empty() {
                 let mut objects = self.objects.lock();
                 if let Some(info) = objects.info.get_mut(&call.receiver) {
                     info.refs.extend(named.iter().copied());
@@ -2174,13 +2181,38 @@ impl State {
         let mut reach: Vec<u64> = named.clone();
         let mut gpu_writes = Vec::new();
         {
-            let objects = self.objects.lock();
+            let mut objects = self.objects.lock();
             for id in &named {
                 if let Some(info) = objects.info.get(id) {
                     reach.extend(info.refs.iter().copied());
                     // A pass's descriptor names what the pass renders into, all of each.
                     if call.selector.starts_with("renderCommandEncoder") {
                         gpu_writes.extend(info.refs.iter().map(|&r| (r, None)));
+                    }
+                }
+            }
+            // A copy of indirect commands copies what they name too.
+            let copy = "copyIndirectCommandBuffer:sourceRange:destination:destinationIndex:";
+            if call.selector == copy
+                && let [Value::Object(from), _, Value::Object(to), ..] = call.args.as_slice()
+                && let Some(refs) = objects.info.get(from).map(|i| i.refs.clone())
+                && let Some(info) = objects.info.get_mut(to)
+            {
+                info.refs.extend(refs);
+            }
+            // An indirect command buffer named here lets go of what was released since its
+            // commands named it, which no command of it reaches now.
+            let icb = std::any::type_name::<crate::gpu::icb::IcbObject>();
+            for id in &named {
+                let Some(info) = objects.info.get(id).filter(|i| i.type_name == icb) else {
+                    continue;
+                };
+                let gone: Vec<u64> = (info.refs.iter().copied())
+                    .filter(|r| objects.info.get(r).is_none_or(|o| o.dead))
+                    .collect();
+                if let Some(info) = objects.info.get_mut(id) {
+                    for r in &gone {
+                        info.refs.remove(r);
                     }
                 }
             }
