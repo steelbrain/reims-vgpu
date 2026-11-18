@@ -5,17 +5,22 @@
 #
 #   scripts/install-ctl.sh [--yes] [--update] [--skip-qemu]
 #
-# Linux on x86-64 (Ubuntu or Debian, Arch or CachyOS; other distributions get
-# the list of what to install), where the library runs on Vulkan and VMs run;
-# Windows on x86-64, in MSYS2's CLANG64 shell, whose clang builds the library
-# and QEMU (QEMU builds on Windows only with MinGW), where VMs run on the
-# Windows Hypervisor Platform; and arm64 Macs and arm64 Linux (Ubuntu or Debian, Arch, Fedora), where
-# reims-ctl makes arm64 VMs by restoring macOS from an IPSW, which runs no
-# QEMU: there it installs reims-ctl alone (step 4). It:
+# The library runs on Vulkan everywhere (on a Mac through MoltenVK), and VMs
+# run on QEMU built on it:
+# - Linux on x86-64 (Ubuntu or Debian, Arch or CachyOS; other distributions
+#   get the list of what to install): x86-64 VMs on KVM, and arm64 VMs,
+#   emulated by TCG;
+# - Windows on x86-64, in MSYS2's CLANG64 shell, whose clang builds the
+#   library and QEMU (QEMU builds on Windows only with MinGW): x86-64 VMs on
+#   the Windows Hypervisor Platform;
+# - arm64 Macs: arm64 VMs on HVF;
+# - Linux on arm64 (Ubuntu or Debian, Arch): arm64 VMs on KVM.
+# reims-ctl makes an arm64 VM by restoring macOS from an IPSW, and boots it
+# with Ambrosia. This script:
 #   1. checks the build's dependencies, and offers to install those missing
-#      (apt, pacman or dnf, through sudo; on a Mac, Xcode's command line tools
-#      are needed), and rustup through rustup.rs, beside any other cargo, whose
-#      installer asks its own questions;
+#      (apt, pacman or dnf, through sudo; on a Mac, Homebrew's, and Xcode's
+#      command line tools are needed), and rustup through rustup.rs, beside
+#      any other cargo, whose installer asks its own questions;
 #   2. fetches vendor/qemu, QEMU's source, without QEMU's own submodules (its
 #      build fetches what it needs); cargo fetches metal2vulkan itself, at the
 #      commit the library's Cargo.toml names;
@@ -25,12 +30,15 @@
 #      build never replaces another: a running VM keeps the binary it started
 #      with;
 #   4. installs reims-ctl with cargo install (into ~/.cargo/bin, or
-#      CARGO_INSTALL_ROOT's bin);
-#   5. installs reims-util beside it, which makes a new VM's OpenCore image and
-#      downloads its macOS installer from Apple. reims-ctl does
-#      (__record-install), at the commit it names
+#      CARGO_INSTALL_ROOT's bin), and where arm64 VMs run reims-restore beside
+#      it, whose finish-eacs readies an arm64 VM after its first boot;
+#   5. installs reims-util beside it, which makes a new x86-64 VM's OpenCore
+#      image and downloads its macOS installer from Apple, where x86-64 VMs
+#      run, and downloads Ambrosia, the arm64 VMs' firmware, where they run.
+#      reims-ctl does (__record-install): reims-util at the commit it names
 #      (crates/reims-ctl/src/reims_util.rs), replacing one from another commit
-#      and leaving one at that commit as it is.
+#      and leaving one at that commit as it is, and Ambrosia's release
+#      (crates/reims-ctl/src/ambrosia.rs).
 #
 # --yes       install what is missing without asking (rustup with -y too)
 # --update    pull this checkout first (fast-forward only), putting back the
@@ -85,19 +93,21 @@ ask() {
 }
 
 OS="$(uname -s)" ARCH="$(uname -m)"
-# BUILDS_QEMU: whether this host runs VMs, on QEMU built on the library: Linux
-# x86-64. An arm64 host makes arm64 VMs by a restore, which runs no QEMU, and
-# reims-ctl doesn't start them: it gets reims-ctl alone.
-BUILDS_QEMU=1
+# QEMU_BINARIES: the QEMU binaries this host's VMs run on, x86-64 VMs on
+# qemu-system-x86_64 and arm64 VMs on qemu-system-aarch64, with QEMU_BINARY the
+# first. gnutls, where arm64 VMs run, gives QEMU its ciphers: without a crypto
+# library QEMU has no AES, which vmapple's AES engine needs (a macOS guest uses
+# it as it mounts its root volume), and refuses to start an arm64 VM. It is
+# enabled by name, so that configure stops where it is missing, as are libusb
+# (usb-host, USB passthrough) and SPICE (-spice, a display a SPICE client
+# connects to): configure leaves out an optional feature whose library it does
+# not find, saying nothing.
 case "$OS/$ARCH" in
   Linux/x86_64)
     PLATFORM=linux-x86_64
-    # libusb (usb-host, USB passthrough) and SPICE (-spice, a display a SPICE
-    # client connects to) are enabled by name: configure leaves out an
-    # optional feature whose library it does not find, saying nothing.
-    QEMU_CONFIGURE=(--target-list=x86_64-softmmu --enable-kvm --disable-sdl --enable-gtk --enable-slirp
-      --enable-libusb --enable-spice)
-    QEMU_BINARY=qemu-system-x86_64
+    QEMU_CONFIGURE=(--target-list=x86_64-softmmu,aarch64-softmmu --enable-kvm --disable-sdl --enable-gtk
+      --enable-slirp --enable-libusb --enable-spice --enable-gnutls)
+    QEMU_BINARIES=(qemu-system-x86_64 qemu-system-aarch64)
     ;;
   MINGW*/x86_64 | MSYS*/x86_64)
     [[ ${MSYSTEM:-} == CLANG64 ]] || die "on Windows, run this in MSYS2's CLANG64 shell (\"MSYS2 CLANG64\" in the Start menu), whose clang builds the library and QEMU; this is its ${MSYSTEM:-MSYS} shell"
@@ -108,11 +118,24 @@ case "$OS/$ARCH" in
     # windmc, which none of the packages below provides.
     QEMU_CONFIGURE=(--target-list=x86_64-softmmu --enable-whpx --disable-sdl --enable-gtk --enable-slirp
       --enable-libusb --disable-guest-agent --bindir=bin)
-    QEMU_BINARY=qemu-system-x86_64.exe
+    QEMU_BINARIES=(qemu-system-x86_64.exe)
     ;;
-  Darwin/arm64 | Linux/aarch64) BUILDS_QEMU=0 ;;
-  *) die "reims-ctl runs VMs on Linux and Windows x86-64 hosts, and makes arm64 VMs from an IPSW on arm64 Macs and arm64 Linux; this is $OS on $ARCH" ;;
+  Darwin/arm64)
+    PLATFORM=macos-arm64
+    # HVF, and no window of QEMU's own: the display's window is the library's.
+    QEMU_CONFIGURE=(--target-list=aarch64-softmmu --enable-hvf --disable-sdl --disable-gtk --enable-slirp
+      --enable-gnutls)
+    QEMU_BINARIES=(qemu-system-aarch64)
+    ;;
+  Linux/aarch64)
+    PLATFORM=linux-arm64
+    QEMU_CONFIGURE=(--target-list=aarch64-softmmu --enable-kvm --disable-sdl --disable-gtk --enable-slirp
+      --enable-gnutls)
+    QEMU_BINARIES=(qemu-system-aarch64)
+    ;;
+  *) die "reims-ctl runs x86-64 VMs on Linux and Windows x86-64 hosts, and arm64 VMs on arm64 Macs, arm64 Linux and Linux on x86-64; this is $OS on $ARCH" ;;
 esac
+QEMU_BINARY=${QEMU_BINARIES[0]}
 # WINDOWS: in MSYS2 on Windows, whose own HOME is not the user's profile, where
 # reims-ctl keeps its files (%USERPROFILE%, as rustup and cargo do).
 WINDOWS=0 USER_HOME=$HOME
@@ -143,9 +166,6 @@ CACHE="$(xdg XDG_CACHE_HOME .cache)/reims-ctl"
 mkdir -p "$DATA" "$CACHE"
 
 # Every VM runs on QEMU: --skip-qemu keeps the installed one, and needs one.
-if [[ $SKIP_QEMU == 1 && $BUILDS_QEMU == 0 ]]; then
-  die "--skip-qemu keeps the installed QEMU, and this host has none: reims-ctl makes arm64 VMs here by a restore, which runs no QEMU; run this without --skip-qemu"
-fi
 if [[ $SKIP_QEMU == 1 && ! -x "$DATA/qemu/current/bin/$QEMU_BINARY" ]]; then
   die "--skip-qemu keeps the installed QEMU, and none is installed ($(shown "$DATA/qemu/current/bin/$QEMU_BINARY") is missing): run this without --skip-qemu, which builds it"
 fi
@@ -249,7 +269,7 @@ fi
 # cache directory is in one (QEMU_BUILDS below). Measured on the mini with a
 # profile named "Test User", 2026-11-16: QEMU's configure stopped on the cache,
 # and SDL3 on a checkout in the profile.
-if [[ $WINDOWS == 1 && $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
+if [[ $WINDOWS == 1 && $SKIP_QEMU == 0 ]]; then
   [[ $ROOT != *[[:space:]]* ]] ||
     die "the checkout's path, $(shown "$ROOT"), has a space, which QEMU's build and SDL3's refuse: clone the repository into a folder without spaces (install.ps1 -Checkout C:\\reims-vgpu), and run it there"
   [[ ${CARGO_TARGET_DIR:-} != *[[:space:]]* ]] ||
@@ -260,9 +280,21 @@ fi
 
 missing=()
 
-# A Mac's C compiler and linker, which Rust's builds use.
+# A Mac's C compiler and linker, which Rust's builds use, and Homebrew's
+# packages: QEMU's build tools and the libraries it links, CMake for SDL3,
+# which the library builds from source, and the Vulkan loader and MoltenVK,
+# its Vulkan driver, which the library opens.
 if [[ $OS == Darwin ]]; then
   xcode-select -p >/dev/null 2>&1 || die "Xcode's command line tools are missing: run xcode-select --install, then this again"
+  command -v brew >/dev/null 2>&1 || die "Homebrew is missing (https://brew.sh): install it, then run this again"
+  for f in ninja pkgconf cmake glib pixman libslirp gnutls vulkan-loader molten-vk; do
+    brew list --formula "$f" >/dev/null 2>&1 || missing+=("$f")
+  done
+  if ((${#missing[@]})); then
+    say "Missing Homebrew packages: ${missing[*]}"
+    ask "Install them with brew?" || die "install them (brew install ${missing[*]}), then run this again"
+    brew install "${missing[@]}"
+  fi
 fi
 
 distro_id="" distro_like=""
@@ -277,17 +309,19 @@ fi
 # for SDL3's video, which it builds from source), and QEMU (glib, pixman, libslirp; GTK 3 for
 # its own window, which a VM on VMware SVGA shows its display in; pipewire,
 # pulse and ALSA for its audio backends; libusb for USB passthrough; the
-# SPICE server for -spice; bzip2 unpacks its firmware). A new x86-64 VM's
-# OVMF comes from reims-util, with its OpenCore image.
+# SPICE server for -spice; gnutls for the arm64 VMs' AES; bzip2 unpacks its
+# firmware); and clang, which builds reims-ctl's driver module for Ambrosia,
+# the arm64 VMs' firmware. A new x86-64 VM's OVMF comes from reims-util, with
+# its OpenCore image.
 apt_pkgs=(build-essential git curl ca-certificates pkg-config python3 python3-venv ninja-build
-  flex bison bzip2 cmake binutils libglib2.0-dev libpixman-1-dev libslirp-dev
+  flex bison bzip2 cmake binutils clang libglib2.0-dev libpixman-1-dev libslirp-dev
   zlib1g-dev libfdt-dev libpipewire-0.3-dev libpulse-dev libasound2-dev libusb-1.0-0-dev
-  libspice-server-dev libvulkan1
+  libspice-server-dev libgnutls28-dev libvulkan1
   libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev
   libxtst-dev libxkbcommon-dev libwayland-dev libwayland-bin libdecor-0-dev
   libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev libgtk-3-dev)
-pacman_pkgs=(base-devel git curl python ninja pkgconf flex bison bzip2 cmake
-  glib2 pixman libslirp zlib dtc pipewire libpulse alsa-lib libusb spice vulkan-icd-loader
+pacman_pkgs=(base-devel git curl python ninja pkgconf flex bison bzip2 cmake clang
+  glib2 pixman libslirp zlib dtc pipewire libpulse alsa-lib libusb spice gnutls vulkan-icd-loader
   libx11 libxext libxrandr libxcursor libxi libxfixes libxss libxtst libxkbcommon
   wayland libdecor mesa libdrm dbus systemd-libs gtk3)
 dnf_pkgs=()
@@ -298,13 +332,6 @@ dnf_pkgs=()
 # on Direct3D 12 (vaon12) decodes the reims-graphics device's video.
 msys2_pkgs=(git curl diffutils make
   mingw-w64-clang-x86_64-{clang,lld,pkgconf,meson,ninja,cmake,python,glib2,pixman,libslirp,gtk3,libusb,zstd,libva,mesa})
-if [[ $BUILDS_QEMU == 0 ]]; then
-  # reims-ctl alone, for arm64 Linux: a C compiler and linker for Rust's
-  # builds, git, and curl for rustup. Fedora is Asahi Linux's own distribution.
-  apt_pkgs=(build-essential git curl ca-certificates)
-  pacman_pkgs=(base-devel git curl)
-  dnf_pkgs=(gcc make git curl)
-fi
 case "$OS $distro_id $distro_like " in
   Darwin*) ;;
   MINGW* | MSYS*)
@@ -363,8 +390,9 @@ if [[ $WINDOWS == 1 ]]; then
   [[ $whp == 1 ]] || warn "the Windows Hypervisor Platform is off, and VMs run on it: turn it on in Windows Features (run optionalfeatures, tick Windows Hypervisor Platform), then restart Windows"
 fi
 # The rest of the host's checks are for the VMs Linux runs: KVM, the library's
-# GPU access to the guest's memory, and USB passthrough.
-if [[ $BUILDS_QEMU == 1 && $WINDOWS == 0 ]]; then
+# GPU access to the guest's memory, and USB passthrough. KVM runs x86-64 VMs on
+# x86-64 and arm64 VMs on arm64; arm64 VMs on x86-64 are emulated by TCG.
+if [[ $OS == Linux ]]; then
   if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
     warn "/dev/kvm is not usable by you: enable virtualization in the firmware and add yourself to the kvm group (sudo usermod -aG kvm \$USER; log in again), or VMs will not start"
   fi
@@ -430,7 +458,7 @@ if [[ $BUILDS_QEMU == 1 && $WINDOWS == 0 ]]; then
       say "echo 0 | sudo tee $min_ttl_file turns it off now, and $keep, keeps it at 0 after a restart"
     fi
   fi
-  # USB passthrough (reims-ctl usb): QEMU opens a USB device's file in
+  # USB passthrough (reims-ctl usb), which x86-64 VMs alone take: QEMU opens a USB device's file in
   # /dev/bus/usb, which only root may write unless a udev rule says otherwise.
   # This one gives USB devices other than hubs to the kvm group, over SSH too,
   # and to the user at the host's screen (uaccess, which a file sorting before
@@ -438,7 +466,7 @@ if [[ $BUILDS_QEMU == 1 && $WINDOWS == 0 ]]; then
   # line, which its tests check.
   usb_rule_file=/etc/udev/rules.d/70-reims-ctl-usb.rules
   usb_rule='SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{bDeviceClass}!="09", GROUP="kvm", MODE="0664", TAG+="uaccess"'
-  if ! grep -qsxF "$usb_rule" "$usb_rule_file"; then
+  if [[ $ARCH == x86_64 ]] && ! grep -qsxF "$usb_rule" "$usb_rule_file"; then
     say "A VM can be given this host's USB devices once QEMU, running as you, may open them"
     if ask "Add the udev rule $usb_rule_file, giving USB devices other than hubs to the kvm group and to you at this host's screen, with sudo?"; then
       printf '# reims-ctl: USB devices for VMs (reims-ctl usb --help)\n%s\n' "$usb_rule" |
@@ -517,7 +545,7 @@ fetch_qemu() {
     die "could not fetch vendor/qemu's commit $(git -C "$ROOT" ls-tree HEAD vendor/qemu | awk '{print $3}') from $(git -C "$ROOT" config -f .gitmodules --get submodule.vendor/qemu.url): check that you can read that repository; a commit it does not have was not pushed to it"
 }
 
-if [[ $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
+if [[ $SKIP_QEMU == 0 ]]; then
   # A linked worktree shares the main checkout's module repository: initialising
   # vendor/qemu here would rewrite that repository's core.worktree for every
   # worktree (docs/lessons.md).
@@ -537,14 +565,19 @@ fi
 # ------------------------------------------------------------------ the library and QEMU
 
 # The files running processes execute, their links resolved, a line each:
-# every process's /proc/PID/exe. A QEMU's executable names the build it started
-# from, where its command line, and ps, show only qemu/current, through which
-# reims-ctl runs QEMU, and which a new build moves.
+# every process's /proc/PID/exe; on a Mac the txt files lsof lists of the
+# processes whose name starts with qemu (QEMU, qemu-img). A QEMU's executable
+# names the build it started from, where its command line, and ps, show only
+# qemu/current, through which reims-ctl runs QEMU, and which a new build moves.
 qemu_executables() {
   if [[ ${WINDOWS:-0} == 1 ]]; then
     # Windows' own list, as MSYS2 paths: there is no /proc/PID/exe for a Windows program.
     powershell -NoProfile -Command '(Get-CimInstance Win32_Process).ExecutablePath' 2>/dev/null |
       tr -d '\r' | grep . | cygpath -u -f - 2>/dev/null || true
+    return 0
+  fi
+  if [[ ! -d /proc/self ]]; then
+    lsof -nP -a -c qemu -d txt -Fn 2>/dev/null | sed -n 's/^n//p' || true
     return 0
   fi
   readlink /proc/[0-9]*/exe 2>/dev/null || true
@@ -591,7 +624,7 @@ DIST="$TARGET/dist-vulkan"
 QEMU_BUILDS="$CACHE"
 [[ $WINDOWS == 1 && $CACHE == *[[:space:]]* ]] && QEMU_BUILDS="$TARGET"
 
-if [[ $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
+if [[ $SKIP_QEMU == 0 ]]; then
   say "Building the library (cargo xtask dist --platform vulkan)"
   (cd "$ROOT" && CARGO_TARGET_DIR="$TARGET" cargo xtask dist --platform vulkan)
   [[ -f "$DIST/lib/pkgconfig/reims-vgpu.pc" ]] || die "cargo xtask dist wrote no $(shown "$DIST/lib/pkgconfig/reims-vgpu.pc")"
@@ -661,8 +694,14 @@ if [[ $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
   else
     DESTDIR="$STAGE" ninja -C "$BUILD" install >/dev/null
   fi
-  [[ -x "$STAGE$PREFIX/bin/$QEMU_BINARY" ]] || die "QEMU's install has no bin/$QEMU_BINARY"
-  "$STAGE$PREFIX/bin/$QEMU_BINARY" -device help 2>/dev/null | grep -q '"reims-graphics-pci"' || die "QEMU's install has no reims-graphics-pci: was it configured with reims-vgpu?"
+  for bin in "${QEMU_BINARIES[@]}"; do
+    [[ -x "$STAGE$PREFIX/bin/$bin" ]] || die "QEMU's install has no bin/$bin"
+    # A Mac's QEMU runs on HVF with the hypervisor entitlement, which QEMU's build signs it with.
+    if [[ $OS == Darwin ]] && ! codesign -d --entitlements - "$STAGE$PREFIX/bin/$bin" 2>/dev/null | grep -q com.apple.security.hypervisor; then
+      codesign -s - -f --entitlements "$ROOT/vendor/qemu/accel/hvf/entitlements.plist" "$STAGE$PREFIX/bin/$bin"
+    fi
+    "$STAGE$PREFIX/bin/$bin" -device help 2>/dev/null | grep -q '"reims-graphics-pci"' || die "QEMU's $bin has no reims-graphics-pci: was it configured with reims-vgpu?"
+  done
   ID="$(date +%Y%m%d-%H%M%S)-$COMMIT"
   mkdir -p "$DATA/qemu"
   if [[ $WINDOWS == 1 ]]; then
@@ -686,11 +725,13 @@ if [[ $BUILDS_QEMU == 1 && $SKIP_QEMU == 0 ]]; then
   fi
   prune_qemu "$DATA/qemu"
   QEMU_DIR="$DATA/qemu/$ID"
-elif [[ $BUILDS_QEMU == 1 ]]; then
+else
   QEMU_DIR="$(cd "$DATA/qemu/current" && pwd -P)"
   kept_qemu "$QEMU_DIR" | while read -r why; do warn "$why"; done
-else
-  QEMU_DIR=""
+  # A QEMU installed before this host ran arm64 VMs has no qemu-system-aarch64.
+  for bin in "${QEMU_BINARIES[@]}"; do
+    [[ -x $QEMU_DIR/bin/$bin ]] || warn "the installed QEMU has no $bin, which $([[ $bin == qemu-system-aarch64* ]] && echo arm64 || echo x86-64) VMs run on: run this without --skip-qemu to build it"
+  done
 fi
 
 # ------------------------------------------------------------------ reims-ctl
@@ -702,6 +743,14 @@ if [[ $WINDOWS == 1 ]]; then
   BIN="$(cygpath -u "${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$USER_HOME/.cargo}}")/bin/reims-ctl.exe"
 fi
 [[ -x "$BIN" ]] || die "cargo install left no $(shown "$BIN")"
+# reims-restore beside it, where arm64 VMs run (every host but Windows): an arm64 VM's first boot
+# makes macOS's Data volume and resets the VM, and its finish-eacs makes the VM start again, as
+# reims-ctl create says.
+if [[ $WINDOWS == 0 ]]; then
+  say "Installing reims-restore (cargo install)"
+  (cd "$ROOT" && CARGO_TARGET_DIR="$CACHE/ctl-target" cargo install --locked --force --quiet --path crates/reims-restore)
+  [[ -x "$(dirname "$BIN")/reims-restore" ]] || die "cargo install left no $(dirname "$BIN")/reims-restore"
+fi
 if [[ $WINDOWS == 1 ]]; then
   # reims-ctl, a Windows program, takes Windows paths; its update runs this
   # script in this bash.
@@ -713,11 +762,7 @@ fi
 
 echo
 printf '%sreims-ctl is installed.%s\n' "$green$bold" "$off"
-if [[ $BUILDS_QEMU == 1 ]]; then
-  echo "  reims-ctl            the interactive interface: create, start and stop VMs"
-else
-  echo "  reims-ctl            the interactive interface: make arm64 VMs from IPSWs"
-fi
+echo "  reims-ctl            the interactive interface: create, start and stop VMs"
 echo "  reims-ctl help       the same from a shell"
 [[ -z $QEMU_DIR ]] || echo "  QEMU                 $(shown "$QEMU_DIR")"
 echo
