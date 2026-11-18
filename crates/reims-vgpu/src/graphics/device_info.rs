@@ -312,7 +312,7 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 /// | `supportsCounterSampling:` | no, at every point | counter sample buffers |
 /// | `maximumConcurrentCompilationTaskCount` | the device's compile threads, which run its pipeline compiles | nothing: the device's own answer |
 /// | `recommendedMaxWorkingSetSize` | on a GPU that shares the CPU's memory, three quarters of the guest's RAM rounded down to 16 KiB, or the platform's where that is less or the host maps no RAM; on a GPU of its own memory the platform's ([`lane_working_set`]) | nothing: a choice |
-/// | `maxBufferLength` | the platform's, but at most three quarters of `recommendedMaxWorkingSetSize`, rounded down to 16 KiB ([`lane_max_buffer_length`]) | nothing: a choice |
+/// | `maxBufferLength` | the platform's, but at most three quarters of `recommendedMaxWorkingSetSize`, rounded down to 16 KiB, and at most 2 GiB ([`lane_max_buffer_length`], [`BUFFER_LENGTH_CAP`]) | nothing: a choice, under the most the platform's shaders address in a buffer |
 /// | `isFramebufferReadSupported` (SPI) | no for an x86-64 guest; the platform's for an arm64 guest ([`lane_flags`]) | nothing: a choice |
 /// | `supportsTileShaders`, `supportsNonSquareTileShaders`, `supportsImageBlocks` (SPI) | no ([`lane_flags`]) | tile pipelines, their non-square dispatch and imageblocks, Apple4's and Apple5's pieces |
 ///
@@ -438,20 +438,37 @@ fn lane_working_set(platform: Option<u64>, unified: bool, guest_ram: Option<u64>
     }
 }
 
+/// The most `maxBufferLength` answers, whatever the platform and the working set: 2 GiB, the
+/// Intel UHD 630 Mac's own answer (2147483648 bytes, docs/graphics-kext/dgpu-oracle.md, Q9).
+/// The Vulkan platform's runtime keeps a shader's offset from a buffer argument's bound address in
+/// 32 bits, so a shader's access 4 GiB or more past it lands exactly 4 GiB lower, in the same
+/// buffer, with no fault: metal2vulkan's test `scratch_accesses_past_4_gib` (job m3-max-42921,
+/// metal2vulkan development 4e02a34a38) read or wrote the word 4 GiB below in all 24 of its
+/// accesses past 4 GiB, on the CPU interpreter, lavapipe and RDNA3, and its own word in each
+/// access within 4 GiB. metal2vulkan's new runtime has one direct access form for a buffer
+/// argument, which needs a buffer of at most 2 GiB; at 2 GiB it timed level with or ahead of the
+/// old runtime's on every row metal2vulkan timed (an RX 550, an RX 7900 XTX, an RTX 2080). Each
+/// Mac answers its own GPU's (an AMD Radeon Pro 5300M 3208642560 bytes, an Apple M3 Max
+/// 41747087360), so a guest's frameworks take 2 GiB as a real Mac's answer.
+const BUFFER_LENGTH_CAP: u64 = 1 << 31;
+
 /// `maxBufferLength`: the platform's, but at most three quarters of `recommended_max_working_set`,
-/// rounded down to 16 KiB; the platform's alone where it gives no working set. That is the rule
+/// rounded down to 16 KiB, and at most [`BUFFER_LENGTH_CAP`]; the platform's under that cap alone
+/// where it gives no working set, and none where it gives no answer. Three quarters is the rule
 /// both Macs measured with GPU memory of their own answer by: an AMD Radeon Pro 5300M (macOS
 /// 26.7.1) 3208642560 of 4278190080 bytes, three quarters exactly, and an Apple M3 Max (macOS
 /// 27.0.1) 41747087360 of 55662788608, three quarters rounded down to its 16 KiB pages. It keeps the
 /// answer to a buffer the host's memory can hold: the Vulkan platform answers the driver's
 /// `maxBufferSize` (a terabyte on an RTX 5080), which no allocation reaches, and its working set is
-/// the GPU's device-local memory. Never above the platform's answer.
+/// the GPU's device-local memory. The cap keeps it to a buffer the platform's shaders address
+/// whole, in its direct form. Never above the platform's answer.
 fn lane_max_buffer_length(platform: Option<u64>, working_set: Option<u64>) -> Option<u64> {
     const PAGE: u64 = 16 << 10;
-    match (platform, working_set) {
+    let length = match (platform, working_set) {
         (Some(length), Some(set)) => Some(length.min(set / 4 * 3 / PAGE * PAGE)),
         (length, _) => length,
-    }
+    };
+    length.map(|length| length.min(BUFFER_LENGTH_CAP))
 }
 
 /// The device's `BOOL` SPI answers where the lane's differ from the platform's, for a guest of
@@ -947,9 +964,12 @@ mod tests {
             info.sizes[0],
             identity.sizes.recommended_max_working_set_size.unwrap()
         );
+        // maxBufferLength the platform's, an M3 Max's 41747087360 on the fake, past the lane's
+        // 2 GiB.
+        assert_eq!(identity.sizes.max_buffer_length, Some(41_747_087_360));
         assert_eq!(
             info.sizes[reims_vgpu_graphics::wire::RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH],
-            identity.sizes.max_buffer_length.unwrap()
+            BUFFER_LENGTH_CAP
         );
         // maximum_concurrent_compilation_task_count is the device's compile threads.
         assert_eq!(info.sizes[12], 4);
@@ -970,32 +990,49 @@ mod tests {
     }
 
     /// `maxBufferLength` is three quarters of the working set rounded down to 16 KiB where that is
-    /// below the platform's answer, as the 5300M's and the M3 Max's answers are of theirs, and the
-    /// platform's otherwise; the linear texture alignments are the platform's, below 256 bytes as
-    /// past it; for an x86-64 guest the framebuffer read, tile shader and imageblock answers are
-    /// no, whatever the platform's, and the other SPI flags the platform's.
+    /// below the platform's answer, and the platform's otherwise, but never past 2 GiB, the Intel
+    /// UHD 630's answer, which the platform's shaders address whole; the linear texture
+    /// alignments are the platform's, below 256 bytes as past it; for an x86-64 guest the
+    /// framebuffer read, tile shader and imageblock answers are no, whatever the platform's, and
+    /// the other SPI flags the platform's.
     #[test]
     fn the_lanes_buffer_length_and_spi_flags_and_the_platforms_linear_alignments() {
-        // An RTX 5080 on the Vulkan platform: a terabyte against 17094934528 bytes of VRAM.
+        const CAP: u64 = 2_147_483_648;
+        assert_eq!(BUFFER_LENGTH_CAP, CAP);
+        // An RTX 5080 on the Vulkan platform: a terabyte against 17094934528 bytes of VRAM, whose
+        // three quarters, 12821200896 bytes, pass the cap.
         assert_eq!(
             lane_max_buffer_length(Some(1 << 40), Some(17_094_934_528)),
-            Some(12_821_200_896)
+            Some(CAP)
         );
-        // The 5300M's and the M3 Max's own answers, from their working sets.
+        // The 5300M's and the M3 Max's working sets give the cap, where the 5300M answers
+        // 3208642560 bytes, three quarters of its, and the M3 Max 41747087360.
         assert_eq!(
             lane_max_buffer_length(Some(u64::MAX), Some(4_278_190_080)),
-            Some(3_208_642_560)
+            Some(CAP)
         );
         assert_eq!(
             lane_max_buffer_length(Some(u64::MAX), Some(55_662_788_608)),
-            Some(41_747_087_360)
+            Some(CAP)
         );
-        // Never above the platform's; the platform's where it gives no working set.
+        // Of a working set of 3 GiB the cap, where three quarters are 2.25 GiB; of one of 2 GiB
+        // three quarters, 1.5 GiB.
+        assert_eq!(
+            lane_max_buffer_length(Some(u64::MAX), Some(3 << 30)),
+            Some(CAP)
+        );
+        assert_eq!(
+            lane_max_buffer_length(Some(u64::MAX), Some(2 << 30)),
+            Some(1_610_612_736)
+        );
+        // Never above the platform's; the platform's where it gives no working set, but never
+        // past the cap; none where the platform answers none.
         assert_eq!(
             lane_max_buffer_length(Some(4096), Some(1 << 34)),
             Some(4096)
         );
         assert_eq!(lane_max_buffer_length(Some(4096), None), Some(4096));
+        assert_eq!(lane_max_buffer_length(Some(1 << 40), None), Some(CAP));
         assert_eq!(lane_max_buffer_length(None, Some(1 << 34)), None);
 
         let p = Arc::new(FakePlatform::new());
@@ -1005,7 +1042,7 @@ mod tests {
         identity.sizes.recommended_max_working_set_size = Some(17_094_934_528);
         // The fake answers 16 for both alignments, and yes for every SPI flag.
         let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None);
-        assert_eq!(info.sizes[7], 12_821_200_896);
+        assert_eq!(info.sizes[7], CAP);
         // device_linear_texture_alignment_bytes first, linear_texture_alignment_bytes fourth: the
         // fake's 16, as an M3 Max answers.
         assert_eq!(info.limits[0], 16);
@@ -1062,7 +1099,7 @@ mod tests {
     /// On a GPU that shares the CPU's memory the working set is three quarters of the guest's RAM
     /// rounded down to 16 KiB, for an x86-64 and an arm64 guest alike, or the platform's where that
     /// is less or the host maps no RAM; on a GPU of its own memory it is the platform's;
-    /// `maxBufferLength` follows the working set
+    /// `maxBufferLength` follows the working set, up to 2 GiB
     #[test]
     fn a_unified_gpu_s_working_set_is_three_quarters_of_the_guest_s_ram() {
         const GIB: u64 = 1 << 30;
@@ -1090,7 +1127,8 @@ mod tests {
         assert_eq!(lane_working_set(geforce, false, Some(8 * GIB)), geforce);
 
         // In the blob: the working set first, and maxBufferLength three quarters of it, alike
-        // for both architectures.
+        // for both architectures, but at most 2 GiB: three quarters of 6 GiB are 4831838208
+        // bytes.
         const MAX_BUFFER_LENGTH: usize =
             reims_vgpu_graphics::wire::RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH;
         let p = Arc::new(FakePlatform::new());
@@ -1102,13 +1140,20 @@ mod tests {
         for guest in [GuestArch::X86_64, GuestArch::Arm64] {
             let info = device_info(&caps, identity.clone(), 4, guest, Some(8 * GIB));
             assert_eq!(info.sizes[0], 6 * GIB, "{guest:?}");
-            assert_eq!(info.sizes[MAX_BUFFER_LENGTH], 4_831_838_208, "{guest:?}");
+            assert_eq!(info.sizes[MAX_BUFFER_LENGTH], 2_147_483_648, "{guest:?}");
         }
         identity.flags.has_unified_memory = Some(false);
         identity.sizes.recommended_max_working_set_size = geforce;
-        let info = device_info(&caps, identity, 4, GuestArch::X86_64, Some(8 * GIB));
+        let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64, Some(8 * GIB));
         assert_eq!(info.sizes[0], 17_094_934_528);
-        assert_eq!(info.sizes[MAX_BUFFER_LENGTH], 12_821_200_896);
+        assert_eq!(info.sizes[MAX_BUFFER_LENGTH], 2_147_483_648);
+        // A guest of 3 GiB on a GPU that shares the CPU's memory: three quarters of its 2.25 GiB,
+        // below the cap.
+        identity.flags.has_unified_memory = Some(true);
+        identity.sizes.recommended_max_working_set_size = radeon;
+        let info = device_info(&caps, identity, 4, GuestArch::X86_64, Some(3 * GIB));
+        assert_eq!(info.sizes[0], 2_415_919_104);
+        assert_eq!(info.sizes[MAX_BUFFER_LENGTH], 1_811_939_328);
     }
 
     /// `isFramebufferReadSupported` follows the guest: an x86-64 guest's device answers no, an
