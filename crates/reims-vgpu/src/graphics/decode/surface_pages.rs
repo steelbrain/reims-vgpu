@@ -2537,8 +2537,9 @@ impl<P: Platform> super::GraphicsDecoder<P> {
     /// pages block of the sender's (the module doc), at the guest's GPU address, lying over the
     /// block, so the block is not released while it lives, its contents those bytes of the view.
     /// A block the sender does not hold is a guest protocol error; one that is no pages block of
-    /// its context's, or a range past its view, is refused, and so is a buffer over a block of
-    /// pages its process maps read-only whose options do not drop its GPU writes
+    /// its context's, or a range past its view, is refused, and so is a buffer longer than the
+    /// device's `maxBufferLength` ([`Self::past_max_buffer_length`]) and a buffer over a block
+    /// of pages its process maps read-only whose options do not drop its GPU writes
     /// ([`Self::read_only_pages_admit`]).
     pub(super) fn buffer_over_pages(
         &self,
@@ -2550,6 +2551,9 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         };
         if !self.in_own_block(m.block_offset, m.block_size) {
             return Ok(Err(super::DecodeError::BadReference));
+        }
+        if self.past_max_buffer_length("BUFFER_OVER_PAGES", m.length) {
+            return Ok(Err(super::DecodeError::Refused));
         }
         // Its block's `SURFACE_PAGES` is carried out on the surface worker.
         self.settle_surface(m.block_offset);
@@ -4188,6 +4192,51 @@ pub(super) mod tests {
             3,
             "the test, the cache and the import the cache keeps hold the view"
         );
+    }
+
+    /// A `BUFFER_OVER_PAGES` longer than the device's `maxBufferLength`, as the bundle's
+    /// `newBufferWithBytesNoCopy:` makes one over the app's pages at any length, is refused though
+    /// its view holds it, and its id stands for a refused object, as any refused posted create's
+    /// does; one of exactly the length is made, and with no length set none is refused for its
+    /// length
+    #[test]
+    fn a_pages_buffer_past_max_buffer_length_is_refused() {
+        let mut r = rig(8);
+        let page = r.page;
+        assert_eq!(
+            r.pages_flagged(BLOCK, 0, &[(1, 4)], 4 * page, RGFX_SURFACE_PAGES_PRIVATE),
+            RGFX_STATUS_OK
+        );
+        let most = 2 * page;
+        r.dec.set_max_buffer_length(most);
+        assert_eq!(r.pages_buffer(10, 0, BLOCK, 0, most), Ok(()));
+        assert!(matches!(
+            r.dec.object(10),
+            Some(super::super::ObjHandle::Buffer(_))
+        ));
+        let past = RgfxBufferOverPages {
+            header: header(RGFX_CMD_BUFFER_OVER_PAGES),
+            obj_id: 11,
+            gpu_address: 0,
+            block_offset: BLOCK,
+            block_size: 0x2000,
+            offset: 0,
+            length: most + 4096,
+            options: 0,
+            reserved_44: 0,
+        };
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec.decode_refusing(&r.device, past.as_bytes()).unwrap(),
+            Err(DecodeError::Refused)
+        );
+        assert_eq!(r.p.call_log().sels_since(mark), Vec::<&str>::new());
+        assert!(matches!(
+            r.dec.object(11),
+            Some(super::super::ObjHandle::Refused(_))
+        ));
+        r.dec.set_max_buffer_length(0);
+        assert_eq!(r.pages_buffer(12, 0, BLOCK, 0, most + 4096), Ok(()));
     }
 
     /// A pages block made again over the runs of one released, as the guest makes one again over

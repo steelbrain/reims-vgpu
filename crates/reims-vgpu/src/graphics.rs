@@ -66,9 +66,9 @@ use reims_vgpu_graphics::wire::{
     RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_PIPELINE_ANSWERS, RGFX_CMD_RATE_MAP_CREATE,
     RGFX_CMD_RATE_MAP_QUERY, RGFX_CMD_RATE_MAP_RESET, RGFX_CMD_RENDER_PIPELINE_CREATE,
     RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT, RGFX_CMD_SHARED_EVENT_NAME,
-    RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
-    RGFX_DISPLAYS_MAX, RGFX_EVT_FUNCTION_POINTER_STATE, RGFX_EVT_ICB_STATE,
-    RGFX_EVT_RATE_MAP_ANSWER, RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE,
+    RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH,
+    RGFX_DEVICE_INFO_OFFSET, RGFX_DISPLAYS_MAX, RGFX_EVT_FUNCTION_POINTER_STATE,
+    RGFX_EVT_ICB_STATE, RGFX_EVT_RATE_MAP_ANSWER, RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE,
     RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_CURSOR_COLOR,
     RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_DISPLAY_POWER, RGFX_FEATURE_DISPLAY_SCALE,
     RGFX_FEATURE_DOORBELL_ASKS, RGFX_FEATURE_DOORBELL_PAGES, RGFX_FEATURE_DYNAMIC_LIBRARIES,
@@ -526,6 +526,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             );
             let mut decoder = GraphicsDecoder::new(Arc::clone(&platform), Arc::clone(&region));
             decoder.set_unified_memory(unified_memory);
+            // The guest's `maxBufferLength`, past which the decoder refuses a buffer over a
+            // process's own pages, which the bundle's no-copy buffers make at any length.
+            decoder.set_max_buffer_length(info.sizes[RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH]);
             // The platform's lease on the guest's RAM, held by the views of the surfaces' pages
             // made through the map, so it outlives the last of them.
             if let Some(map) = &config.memory_map {

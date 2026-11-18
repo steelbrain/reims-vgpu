@@ -877,7 +877,8 @@ fn device_info_is_written_into_the_region_at_init() {
 
 /// The guest's RAM the host maps reaches the blob: on the fake's GPU, which shares the CPU's
 /// memory, the working set is three quarters of it rounded down to 16 KiB and `maxBufferLength`
-/// three quarters of that, for an x86-64 and an arm64 guest alike; with no map, the platform's
+/// three quarters of that, for an x86-64 and an arm64 guest alike; with no map, the platform's.
+/// The decoder holds the blob's `maxBufferLength`, past which it refuses a no-copy buffer
 #[test]
 fn the_blob_answers_a_unified_gpu_s_working_set_from_the_guest_s_mapped_ram() {
     use reims_vgpu_vulkan::core::testkit::GuestRam;
@@ -908,10 +909,14 @@ fn the_blob_answers_a_unified_gpu_s_working_set_from_the_guest_s_mapped_ram() {
         };
         let device = GraphicsDevice::with_platform(platform, config).unwrap();
         let info = device_info_of(&device);
-        (
-            info.sizes[0],
-            info.sizes[reims_vgpu_graphics::wire::RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH],
-        )
+        let max_buffer_length =
+            info.sizes[reims_vgpu_graphics::wire::RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH];
+        // The decoder refuses a buffer over a process's pages past the blob's answer.
+        assert_eq!(
+            device.control.decoder().max_buffer_length(),
+            max_buffer_length
+        );
+        (info.sizes[0], max_buffer_length)
     };
     // 1 MiB of RAM: 786432 bytes, 48 pages of 16 KiB, and 589824, 36 of them.
     for guest in [GuestArch::X86_64, GuestArch::Arm64] {
@@ -13288,7 +13293,9 @@ fn a_view_of_more_than_a_mib_stays_alone() {
         vec![(4, half), (5 + half, half)],
         vec![(6 + 2 * half, 1), (8 + 2 * half, 1)],
     ];
-    let mut r = Regrouping::of(Duration::from_secs(3), 10 + 2 * half, &runs);
+    // Twice the RAM the runs take, so the device's maxBufferLength, nine sixteenths of it on the
+    // fake's GPU, which shares the CPU's memory, holds the large block's buffer.
+    let mut r = Regrouping::of(Duration::from_secs(3), 2 * (10 + 2 * half), &runs);
     r.message();
     assert_eq!(r.rebinds(), 4, "the two small blocks' buffers");
     let base = |r: &Regrouping, i: usize| {

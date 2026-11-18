@@ -758,6 +758,10 @@ pub(crate) struct Shared<P: Platform> {
     /// Whether the device's GPU shares the CPU's memory, where a `Managed` texture is one copy
     /// over its CPU copy ([`GraphicsDecoder::set_unified_memory`]).
     unified_memory: AtomicBool,
+    /// The device's `maxBufferLength`, as its info blob answers it, past which a buffer over a
+    /// process's own pages is refused ([`GraphicsDecoder::set_max_buffer_length`]); 0 where none
+    /// is set.
+    max_buffer_length: AtomicU64,
     /// The views of the IOSurfaces whose blocks name their own guest pages ([`surface_pages`]).
     surface_views: Mutex<surface_pages::SurfaceViews<P>>,
     /// Held while a context's lane moves buffers into regroups' views, so that one context's
@@ -1138,6 +1142,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             ),
             closed: ClosedContexts::default(),
             unified_memory: AtomicBool::new(false),
+            max_buffer_length: AtomicU64::new(0),
             surface_views: Mutex::new(surface_pages::SurfaceViews::new(None, None)),
             regroup_moves: Mutex::new(()),
             block_lives: Mutex::new(HashMap::new()),
@@ -1295,6 +1300,48 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// device's make; without it the caches hold what the platform makes.
     pub(crate) fn set_cache_budget(&self, budget: u64) {
         self.surface_caches.set_cache_budget(budget);
+    }
+
+    /// Sets the device's `maxBufferLength`, the one its info blob answers the guest: set once, at
+    /// the device's make. A buffer over a process's own pages longer than it is refused
+    /// ([`Self::past_max_buffer_length`]); without it no length is refused for that.
+    pub(crate) fn set_max_buffer_length(&self, length: u64) {
+        (self.shared.max_buffer_length).store(length, Ordering::Release);
+    }
+
+    /// The device's `maxBufferLength` as set ([`Self::set_max_buffer_length`]; for the tests).
+    #[cfg(test)]
+    pub(crate) fn max_buffer_length(&self) -> u64 {
+        (self.shared.max_buffer_length).load(Ordering::Acquire)
+    }
+
+    /// Whether the buffer of `length` bytes the message `name` makes is longer than the device's
+    /// `maxBufferLength` ([`Self::set_max_buffer_length`]), which refuses it; a refusal is logged.
+    ///
+    /// The guest's bundle makes no buffer, heap or texture longer than `maxBufferLength` from a
+    /// length alone, but its `newBufferWithBytesNoCopy:` makes one over the app's bytes of any
+    /// length, a `BUFFER_OVER_PAGES` of the app's own pages or of the pages of a slab range that
+    /// shadows them. The host refuses such a buffer past the length, which is at most what the
+    /// Vulkan platform's shaders address of a buffer in their direct form (`device_info`'s
+    /// `BUFFER_LENGTH_CAP`, 2 GiB); today's runtime lands a shader's access 4 GiB or more past a
+    /// buffer's bound address 4 GiB lower in it, with no fault. Its create is posted, so the
+    /// refusal takes the path of any refused posted create ([`Self::decode_refusing`],
+    /// [`refused`]): its id stands for a refused object, bound as nil, an op that uses it dropped,
+    /// and its command buffers go on. What Metal does with a no-copy buffer past `maxBufferLength`
+    /// is unmeasured on the oracles (the AMD Radeon Pro 5300M and the Intel UHD 630). A
+    /// `BUFFER_OVER_HOST_MEMORY` needs no such refusal: it lies in one block of the region,
+    /// whose 1 GiB ([`reims_vgpu_graphics::REGION_SIZE`]) the platform's shaders address whole.
+    fn past_max_buffer_length(&self, name: &str, length: u64) -> bool {
+        let most = (self.shared.max_buffer_length).load(Ordering::Acquire);
+        let past = most != 0 && length > most;
+        if past {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "{name} of {length:#x} bytes: refused, longer than the device's maxBufferLength \
+                 {most:#x}"
+            );
+        }
+        past
     }
 
     /// Has a deferred block ask with its surface's layout from now on, as the device offers
