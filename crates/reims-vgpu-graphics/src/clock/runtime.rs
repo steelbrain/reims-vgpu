@@ -62,8 +62,9 @@ pub enum Domain {
 }
 
 /// The clock the platform's GPU times count: the device's, as the runtime the library runs counts
-/// (the module documentation).
-pub const PLATFORM: Domain = Domain::Device;
+/// (the module documentation). Crate-private: cbindgen writes the crate's public constants into
+/// the device's wire header (`cbindgen.toml`).
+pub(crate) const PLATFORM: Domain = Domain::Device;
 
 /// A command buffer's GPU start and end, `times`, in nanoseconds of [`PLATFORM`]'s clock, on the
 /// device's: the same values where the platform counts the device's clock, as today, at the cost

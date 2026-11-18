@@ -5873,7 +5873,7 @@ mod tests {
     /// completed handler runs, in nanoseconds of the host's clock, which the guest bundle reports
     /// as `GPUStartTime` and `GPUEndTime`; a failed buffer the platform gives none of carries 0.
     /// They are the platform's values bit for bit, as the platform's clock is the device's
-    /// (`reims_vgpu_graphics::clock::runtime::PLATFORM`).
+    /// (`PLATFORM` in `reims_vgpu_graphics::clock::runtime`).
     #[test]
     fn a_completion_record_carries_the_platforms_gpu_times() {
         use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, NsErrorText};
