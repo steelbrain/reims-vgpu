@@ -174,22 +174,38 @@ pub const COMMIT: &str = match option_env!("RVG_BUILD_COMMIT") {
 /// landed, with the commit that made it. The stats file writes a `recorder_fix <name>` line for
 /// each.
 pub const FIXES: &[&str] = &[
-    "guest-ram-copy-reads",          // 82b8c2e2a: the guest RAM a copy out of it reads
-    "no-unmade-ram-copy",            // bec103226: no record of a copy the platform did not make
-    "commit-part-cut",               // 967d30b73: whether m2v.commitPart cut its command buffer
-    "nil-property-object-0",         // d04d02436: an object property set to nil as object 0
-    "host-copy-start-bytes",         // 82be400ae: a buffer copied from host memory's first bytes
-    "gpu-resource-ids",              // 0d42c7cb8: each gpuResourceID the platform answers
-    "private-around-linked-kernels", // 00d59542b: Private buffers around linked-kernel dispatches
-    "icb-cpu-commands",              // b27a603cb: commands a CPU encodes into an ICB
-    "device-identity",               // 0ba37884a: each device's identity at each segment's start
-    "no-copy-managed-create-bytes",  // 285f0bdd6: a no-copy Managed buffer's create-time bytes
-    "split-capture",                 // 7fc1cc427: memory before split and cut commits
-    "cpu-writes-over-gpu-writes",    // 7cf445307: CPU writes into bytes the GPU work wrote
-    "icb-reach",                     // cb7db3a59: what indirect commands bind
-    "own-textures",                  // 248751c3c, 642ef0ff9: the platform's own textures, marked
-    "announce-bytes",                // 0061da1f6: the guest's bytes at each Managed announce
-    "kernel-writes-at-completion",   // e3898c754: what kernels changed, at their completion
+    // 82b8c2e2a: the guest RAM a copy out of it reads
+    "guest-ram-copy-reads",
+    // bec103226: no record of a copy the platform did not make
+    "no-unmade-ram-copy",
+    // 967d30b73: whether m2v.commitPart cut its command buffer
+    "commit-part-cut",
+    // d04d02436: an object property set to nil as object 0
+    "nil-property-object-0",
+    // 82be400ae: a buffer copied from host memory's first bytes
+    "host-copy-start-bytes",
+    // 0d42c7cb8: each gpuResourceID the platform answers
+    "gpu-resource-ids",
+    // 00d59542b: Private buffers around linked-kernel dispatches
+    "private-around-linked-kernels",
+    // b27a603cb: commands a CPU encodes into an ICB
+    "icb-cpu-commands",
+    // 0ba37884a: each device's identity at each segment's start
+    "device-identity",
+    // 285f0bdd6: a no-copy Managed buffer's create-time bytes
+    "no-copy-managed-create-bytes",
+    // 7fc1cc427: memory before split and cut commits
+    "split-capture",
+    // 7cf445307: CPU writes into bytes the GPU work wrote
+    "cpu-writes-over-gpu-writes",
+    // cb7db3a59: what indirect commands bind
+    "icb-reach",
+    // 248751c3c, 642ef0ff9: the platform's own textures, marked
+    "own-textures",
+    // 0061da1f6: the guest's bytes at each Managed announce
+    "announce-bytes",
+    // e3898c754: what kernels changed, at their completion
+    "kernel-writes-at-completion",
 ];
 
 /// The stats file's lines that name the recorder's build: its commit ([`COMMIT`]), then one for
@@ -3241,7 +3257,10 @@ mod tests {
         let mut out = String::new();
         write_build(&mut out);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.first().copied(), Some(format!("recorder_commit {COMMIT}").as_str()));
+        assert_eq!(
+            lines.first().copied(),
+            Some(format!("recorder_commit {COMMIT}").as_str())
+        );
         let fixes: Vec<&str> = lines[1..]
             .iter()
             .filter_map(|l| l.strip_prefix("recorder_fix "))
@@ -3251,7 +3270,10 @@ mod tests {
         let names: HashSet<&str> = FIXES.iter().copied().collect();
         assert_eq!(names.len(), FIXES.len(), "a name given twice: {FIXES:?}");
         assert!(
-            FIXES.iter().chain([&COMMIT]).all(|n| !n.is_empty() && !n.contains(char::is_whitespace)),
+            FIXES
+                .iter()
+                .chain([&COMMIT])
+                .all(|n| !n.is_empty() && !n.contains(char::is_whitespace)),
             "{out}"
         );
     }

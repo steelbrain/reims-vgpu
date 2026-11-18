@@ -417,7 +417,10 @@ mod tests {
         let dirty = Some(format!("{head}-dirty"));
         assert_eq!(at(Ok(head.clone()), Ok(" M Cargo.toml".into())), dirty);
         assert_eq!(at(Ok(head.clone()), Err("git status failed".into())), dirty);
-        assert_eq!(at(Err("not a git repository".into()), Ok(String::new())), None);
+        assert_eq!(
+            at(Err("not a git repository".into()), Ok(String::new())),
+            None
+        );
         assert_eq!(at(Ok(String::new()), Ok(String::new())), None);
     }
 
