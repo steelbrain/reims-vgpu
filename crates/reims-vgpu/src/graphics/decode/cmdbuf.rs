@@ -101,6 +101,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use reims_vgpu_graphics::clock::runtime;
 use reims_vgpu_graphics::ops::blit::{
     RGFX_OP_BLIT_COPY_INDIRECT_COMMAND_BUFFER, RGFX_OP_BLIT_OPTIMIZE_INDIRECT_COMMAND_BUFFER,
     RGFX_OP_BLIT_RESET_COMMANDS_IN_BUFFER, RGFX_OP_BLIT_UPDATE_FENCE, RGFX_OP_BLIT_WAIT_FOR_FENCE,
@@ -2420,7 +2421,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             // buffer that failed may have signalled them before its fault, and a guest waiting
             // for one would wait for good: each is posted whatever the outcome.
             signals.finish();
-            let (start, end) = info.gpu_times_ns.unwrap_or((0, 0));
+            // The GPU times on the device's clock, the one the guest's kext maps the device's
+            // times by; none is 0 for each.
+            let (start, end) = info.gpu_times_ns.map(runtime::gpu_times).unwrap_or((0, 0));
             let record = if stand_in {
                 cb_failed(cb_obj_id, seqno)
             } else if info.error.is_none() && landings.iter().any(|landed| landed.failed()) {
@@ -5869,6 +5872,8 @@ mod tests {
     /// A command buffer's completion record carries the GPU times the platform answers as its
     /// completed handler runs, in nanoseconds of the host's clock, which the guest bundle reports
     /// as `GPUStartTime` and `GPUEndTime`; a failed buffer the platform gives none of carries 0.
+    /// They are the platform's values bit for bit, as the platform's clock is the device's
+    /// (`reims_vgpu_graphics::clock::runtime::PLATFORM`).
     #[test]
     fn a_completion_record_carries_the_platforms_gpu_times() {
         use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, NsErrorText};

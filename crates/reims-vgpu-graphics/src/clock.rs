@@ -2,12 +2,16 @@
 //! `_HI`, and what each `VBLANK` and the device's other times are stamped on, each OS's own
 //! (`unix.rs`, `windows.rs`). Each runs at the rate the guest's clock does, a counter's that
 //! nothing disciplines, so the kext's offset of the two clocks holds between its readings.
+//! [`runtime`] places the platform's GPU times on it before they reach the guest.
 
+pub mod runtime;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) use unix::monotonic_ns;
 #[cfg(unix)]
 pub(crate) use unix::now_ns;
 #[cfg(windows)]

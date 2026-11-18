@@ -15,12 +15,24 @@
 
 /// The host's monotonic clock at the counter's rate, in nanoseconds.
 pub(crate) fn now_ns() -> u64 {
+    read_ns(libc::CLOCK_MONOTONIC_RAW)
+}
+
+/// `CLOCK_MONOTONIC` now, in nanoseconds: the clock metal2vulkan's new runtime counts its times
+/// on outside macOS, which `runtime` places on [`now_ns`]'s.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn monotonic_ns() -> u64 {
+    read_ns(libc::CLOCK_MONOTONIC)
+}
+
+/// The system's clock `id` now, in nanoseconds.
+fn read_ns(id: libc::clockid_t) -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     // SAFETY: `clock_gettime` writes the timespec.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) };
+    unsafe { libc::clock_gettime(id, &mut ts) };
     let secs = u64::try_from(ts.tv_sec).unwrap_or(0);
     let nanos = u64::try_from(ts.tv_nsec).unwrap_or(0);
     secs.saturating_mul(1_000_000_000).saturating_add(nanos)

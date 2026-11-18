@@ -5005,7 +5005,12 @@ end less its start before that, no earlier than the buffer's post
 (`rgfxNoteGPUTimes:`, held by `test_reply_reader_completion`); a buffer with
 no times (a failed one) starts as it ends. A buffer committed in parts sends
 its first part's start and its parts' GPU time summed, so its record's end
-can fall before its last part's end ("A command buffer in parts").
+can fall before its last part's end ("A command buffer in parts"). The host
+places the platform's GPU times on the device's clock as it writes the record
+(`reims-vgpu-graphics`'s `clock::runtime`), both by one paired read of the
+two clocks, so the run's length stays the GPU's: unchanged while the platform
+counts the device's clock, as metal2vulkan's runtime does on Linux and
+Windows.
 The ring's armed/interrupt handshake is the stage-2 one.
 The buffer's completion-seen handler posts it, with the values of the shared
 events it signalled ahead of it: on metal2vulkan the runtime's thread that saw

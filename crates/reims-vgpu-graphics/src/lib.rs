@@ -17,8 +17,10 @@
 //!   modes, scanout and cursor, and [`region`] the region's memory.
 //! - [`keep`] is how long the device's pools of threads, and the host's, keep a thread with
 //!   nothing to do.
+//! - [`clock`] is the device's clock, `HOST_TIME`'s, and [`clock::runtime`] places the
+//!   platform's GPU times on it before they reach the guest.
 
-mod clock;
+pub mod clock;
 mod control;
 pub mod device;
 pub mod display;
