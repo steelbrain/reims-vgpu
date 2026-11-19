@@ -2054,7 +2054,8 @@ tree lists RAM alone, so macOS places nothing there, and the library maps
 its blocks there as the pool grows.
 
 **Measured** 2026-11-18 with `vendor/qemu` at `66e66267` on the library of
-`818dd28e6`, the guest with 8 GiB:
+`818dd28e6`, which are `0590cfde` and `9d42ed8e1` before their rebase onto
+`d4896daf` and `a39e43e99`, the guest with 8 GiB:
 - Under HVF on the M3 Max (macOS 27.0.1), Hypervisor.framework's default IPA
   size is 36 bits and its largest 40 (`hv_vm_config_get_max_ipa_size`),
   where the host's `kern.hv.ipa_size_16k` reads 2^42 and
@@ -2068,6 +2069,14 @@ its blocks there as the pool grows.
   the ask, and a 1 GiB piece at 0x310000000, which the library gave back once
   it was empty. The checks after it, metal-app's 600 frames among them, ran
   with the 256 MiB piece in (m3-max-49311).
+- A cold boot of macOS 26.6.2 (25G83) under TCG on a Linux host's Radeon
+  780M passed check-boot's 16 checks with no fatal line (m3-max-49362). The
+  machine answered the same room, 1012 GiB at 0x300000000 to 2^40 (the
+  `max` CPU's `PARange` is 52 bits under TCG, and the room stops at 40), and
+  the library took 16978 MiB of it for the GPU's 16977 MiB of heaps. Grown
+  over QMP once the desktop was drawn, a 256 MiB piece at 0x300000000 was
+  mapped 0.5 s after the ask, and a 1 GiB piece at 0x310000000, which the
+  library gave back once it was empty.
 - A 40-bit IPA costs the guest nothing measurable against 36 bits. A program
   on Hypervisor.framework alone (one vCPU, 4 GiB of guest RAM the host had
   touched, 12 rounds alternating the sizes) measured a guest's first touch
