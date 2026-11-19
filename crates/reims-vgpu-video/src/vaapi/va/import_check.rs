@@ -567,15 +567,15 @@ fn trial_in(
 /// Memory of the trial's own, as a guest buffer's is lent to a device: its pages as dma-bufs
 /// of ranges of them.
 #[cfg(unix)]
-struct TrialMemory {
-    memory: Mutex<HostMemory>,
+pub(super) struct TrialMemory {
+    pub(super) memory: Mutex<HostMemory>,
     life: MemoryLife,
 }
 
 #[cfg(unix)]
 impl TrialMemory {
     /// `size` bytes, every one [`UNTOUCHED`].
-    fn new(size: usize) -> Result<Self, Error> {
+    pub(super) fn new(size: usize) -> Result<Self, Error> {
         let mut memory = HostMemory::new(size)?;
         memory.bytes_mut().fill(UNTOUCHED);
         Ok(Self {

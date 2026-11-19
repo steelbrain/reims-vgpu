@@ -95,7 +95,7 @@ impl Work {
 
     /// The driver's answer now, with no wait for the display's gate: `None`
     /// while the work runs, or while a call that waits holds the display.
-    fn ask_now(self, display: &Display) -> Option<ffi::VAStatus> {
+    pub(super) fn ask_now(self, display: &Display) -> Option<ffi::VAStatus> {
         let status = display.try_call(|raw| self.question(raw))?;
         (status != ffi::VA_STATUS_ERROR_TIMEDOUT).then_some(status)
     }

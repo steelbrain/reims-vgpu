@@ -17,7 +17,7 @@ use super::encoder::VideoEncoder;
 use super::h264::H264Decoder;
 
 /// The size the encoder's stream is made at.
-const SIZE: (u32, u32) = (3840, 2160);
+pub(super) const SIZE: (u32, u32) = (3840, 2160);
 
 /// The pictures of the encoder's stream.
 const FRAMES: u64 = 16;
@@ -25,7 +25,7 @@ const FRAMES: u64 = 16;
 /// The decoders each thread makes and lets go.
 const ROUNDS: usize = 4;
 
-fn display() -> Display {
+pub(super) fn display() -> Display {
     #[cfg(windows)]
     let display = Display::open_adapter(None, crate::core::runtime::StdRuntime::shared());
     #[cfg(unix)]
@@ -37,14 +37,14 @@ fn display() -> Display {
 }
 
 /// A stream the decoders decode: its avcC where it has one (the encoder's), and its samples.
-struct Stream {
+pub(super) struct Stream {
     avcc: Option<Vec<u8>>,
-    samples: Vec<Vec<u8>>,
+    pub(super) samples: Vec<Vec<u8>>,
 }
 
 impl Stream {
     /// `RVG_VA_H264`'s access units, or [`FRAMES`] pictures of noise by the driver's encoder.
-    fn new(display: &Display) -> Stream {
+    pub(super) fn new(display: &Display) -> Stream {
         if let Some(path) = std::env::var_os("RVG_VA_H264") {
             let file = std::fs::read(&path).expect("RVG_VA_H264: an Annex B file");
             let samples = crate::codec::h264::nal::access_units(&file)
@@ -104,7 +104,7 @@ impl Stream {
         }
     }
 
-    fn decoder(&self, display: &Display) -> H264Decoder {
+    pub(super) fn decoder(&self, display: &Display) -> H264Decoder {
         match &self.avcc {
             Some(avcc) => H264Decoder::new(display, avcc).expect("a decoder"),
             None => H264Decoder::new_annex_b(display),

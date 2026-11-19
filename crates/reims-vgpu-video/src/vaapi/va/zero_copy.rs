@@ -25,7 +25,8 @@
 //! mapping goes.
 //! Each frame is then one run a strip, from the decode surface's rows into
 //! it, and their syncs: the staged copy back's run, into the guest's pages
-//! instead of ours.
+//! instead of ours. The runs are issued right behind the frame's decode,
+//! which is waited for after their issue and before theirs.
 //!
 //! What the driver takes is learned as its display opens (`super::import_check`): the least
 //! alignment of rows and of planes from a dma-buf's first byte at which its imports of each
@@ -181,7 +182,9 @@ fn declined(why: impl Into<String>) -> DeviceWrite {
 /// (`Frame::write_to_guest`). [`DeviceWrite::Declined`] where the driver
 /// takes no such buffer, or the host lends no dma-buf of it; an `Err` where
 /// the frame did not decode, or the GPU did not finish the frame by its
-/// deadline.
+/// deadline. The runs are issued before the decode is waited for, so a frame
+/// that did not decode leaves the buffer holding what they copied from its
+/// decode surface.
 pub(crate) fn write(
     frame: &Frame,
     target: &GuestTarget<'_>,
@@ -255,18 +258,28 @@ pub(crate) fn write(
         Ok(import) => import,
         Err(why) => return Ok(declined(why)),
     };
-    // The decode, waited for: a failure here is the frame's, as a read
-    // back's would be.
+    // The runs go to the driver right behind the decode, before it is waited
+    // for, so that the GPU starts them as it finishes the decode rather than
+    // once the CPU has heard of it: the driver orders a run that reads the
+    // decode's surface after the decode
+    // (`runs_issued_right_behind_a_decode_write_what_it_decoded`). The decode
+    // is waited for between their issue and their wait.
     let deadline = wait::current(display);
-    frame.surface.sync_by(deadline)?;
-    match import.run(frame.surface.id(), x, y, w, deadline) {
+    let mut decoded = Ok(());
+    let ran = import.run(frame.surface.id(), x, y, w, deadline, || {
+        decoded = frame.surface.sync_by(deadline);
+    });
+    if let Err(Error::Stalled(_)) = &ran {
+        let works = import.works();
+        let held = Arc::clone(&import);
+        wait::keep(display, "a stalled write into a guest buffer", works, held);
+    }
+    // The decode: a failure here is the frame's, as a read back's would be,
+    // whatever the runs behind it wrote.
+    decoded?;
+    match ran {
         Ok(()) => Ok(DeviceWrite::Written),
-        Err(Error::Stalled(what)) => {
-            let works = import.works();
-            let held = Arc::clone(&import);
-            wait::keep(display, "a stalled write into a guest buffer", works, held);
-            frame.surface.stalled_if(Err(Error::Stalled(what)))
-        }
+        Err(Error::Stalled(what)) => frame.surface.stalled_if(Err(Error::Stalled(what))),
         Err(error) => Ok(declined(format!(
             "the video processing run failed: {error}"
         ))),
@@ -359,9 +372,10 @@ impl GuestImport {
     }
 
     /// One run from `source`'s region of `width` columns and the frame's
-    /// rows at (`x`, `y`) into each strip, a wait for their dma-bufs' fences,
-    /// and their syncs, until `deadline`: then the frame is in the guest's
-    /// pages.
+    /// rows at (`x`, `y`) into each strip, `between` once they are all
+    /// issued, then a wait for their dma-bufs' fences and their syncs, until
+    /// `deadline`: then the frame is in the guest's pages. `between` is not
+    /// called where a run's issue fails.
     fn run(
         &self,
         source: ffi::VASurfaceID,
@@ -369,6 +383,7 @@ impl GuestImport {
         y: i16,
         width: u16,
         deadline: MonoTime,
+        between: impl FnOnce(),
     ) -> Result<(), Error> {
         let Some(context) = &self.context else {
             return Err(Error::Unsupported("an import with no context".into()));
@@ -412,6 +427,7 @@ impl GuestImport {
             )?;
             super::buffer::render_picture(&self.display, context.id, strip.surface, &[&[&buffer]])?;
         }
+        between();
         // The runs' fences, waited for with no lock of the driver's held,
         // so that the display's other calls go on meanwhile (`fence.rs`).
         #[cfg(unix)]
@@ -449,7 +465,7 @@ pub(crate) fn trial(
     let Ok(columns) = u16::try_from(width) else {
         return Err("a trial too wide for a video-processing region".to_owned());
     };
-    match import.run(source.id(), 0, 0, columns, wait::deadline(display)) {
+    match import.run(source.id(), 0, 0, columns, wait::deadline(display), || {}) {
         Ok(()) => Ok(()),
         Err(Error::Stalled(what)) => {
             let works = import.works();
@@ -785,5 +801,106 @@ mod tests {
         }
         assert_eq!(gcd(3840, PAGE), 256);
         assert_eq!(gcd(1344, PAGE), 64);
+    }
+
+    /// A frame's runs, issued right behind its decode with no wait between them
+    /// ([`write`]), write what the read back of the same frame copies once its
+    /// decode is done: the driver orders a run that reads a surface after the
+    /// decode that writes it. Each picture of a 4K H.264 stream with no
+    /// reordering, written as soon as its decode is issued, into one target the
+    /// earlier pictures' import is kept for, so that nothing comes between the
+    /// two but the run's issue; at least one decode must still be running as its
+    /// runs are issued, or the order went untested.
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "needs a VA-API driver that decodes H.264 at 4K, on its GPU: run on a VA-API host"]
+    fn runs_issued_right_behind_a_decode_write_what_it_decoded() {
+        use super::super::frame::{GuestWrites, PlaneRows};
+        use super::super::import_check::TrialMemory;
+        use super::super::teardown::{SIZE, Stream, display};
+        use crate::core::fourcc::FourCc;
+        use crate::core::surfaces::{PlaneLayout, SurfaceLayout};
+
+        let display = display();
+        let stream = Stream::new(&display);
+        let mut decoder = stream.decoder(&display);
+        let writes = GuestWrites::new(&display);
+        let (width, height) = (SIZE.0 as usize, SIZE.1 as usize);
+        // Rows of 3840 bytes, a multiple of every alignment a driver's imports
+        // take, and the chroma plane at a page, whole rows after the luma.
+        let pitch = width;
+        let chroma_at = pitch * height;
+        let size = (chroma_at + pitch * height / 2).next_multiple_of(PAGE);
+        let plane = |offset: usize, w: u32, h: u32| PlaneLayout {
+            offset,
+            bytes_per_row: pitch,
+            width: w,
+            height: h,
+        };
+        let layout = SurfaceLayout {
+            pixel_format: FourCc::new(*b"420v"),
+            width: SIZE.0,
+            height: SIZE.1,
+            planes: vec![
+                plane(0, SIZE.0, SIZE.1),
+                plane(chroma_at, SIZE.0 / 2, SIZE.1 / 2),
+            ],
+            bytes_per_row: 0,
+        };
+        let memory = TrialMemory::new(size).expect("the target's memory");
+        let target = GuestTarget::new(&layout, &memory).expect("a target");
+        let (mut written, mut running) = (0, 0);
+        let mut check = |id: usize, frame: &Frame| {
+            if Work::Surface(frame.surface.id()).ask_now(&display).is_none() {
+                running += 1;
+            }
+            match frame.write_to_guest(&target, &writes).expect("the write") {
+                DeviceWrite::Written => {}
+                DeviceWrite::Declined(why) => panic!("picture {id} declined: {why}"),
+            }
+            let mut luma = vec![0; pitch * height];
+            let mut chroma = vec![0; pitch * height / 2];
+            (frame.read_back().expect("a read back"))
+                .copy_into(
+                    PlaneRows {
+                        bytes: &mut luma,
+                        bytes_per_row: pitch,
+                        rows: height,
+                        row_bytes: width,
+                    },
+                    PlaneRows {
+                        bytes: &mut chroma,
+                        bytes_per_row: pitch,
+                        rows: height / 2,
+                        row_bytes: width,
+                    },
+                )
+                .expect("the CPU's copy");
+            let held = memory.memory.lock();
+            let bytes = held.bytes();
+            let first = ((0..luma.len()).find(|&i| bytes[i] != luma[i]))
+                .map(|i| ("luma", i))
+                .or_else(|| {
+                    ((0..chroma.len()).find(|&i| bytes[chroma_at + i] != chroma[i]))
+                        .map(|i| ("chroma", i))
+                });
+            assert_eq!(first, None, "picture {id}: the run's byte differs from the read back's");
+            written += 1;
+        };
+        for (id, sample) in stream.samples.iter().enumerate() {
+            memory.memory.lock().bytes_mut().fill(0xa5);
+            let frames = decoder
+                .decode(sample, u64::try_from(id).expect("an id"))
+                .expect("a decode");
+            for frame in &frames {
+                check(id, frame);
+            }
+        }
+        for frame in &decoder.flush().expect("a flush") {
+            check(stream.samples.len(), frame);
+        }
+        assert_eq!(written, stream.samples.len(), "every picture written");
+        assert!(running > 0, "no decode was still running as its runs were issued");
+        eprintln!("{written} pictures written, {running} of them behind a decode still running");
     }
 }
