@@ -107,6 +107,19 @@ pub const TAKE_ZEROED_BYTES_CODE: &str = "pool-take-zeroed-bytes";
 /// ([`BlockInfo::zeroed`], `takes`). Counted by the byte.
 pub const TAKE_ZERO_SKIPPED_BYTES_CODE: &str = "pool-take-zero-skipped-bytes";
 
+/// The code of the takes answered, whose waits [`TAKE_WAIT_CODES`] count (`takes`).
+pub const TAKE_WAITS_CODE: &str = "pool-take-waits";
+
+/// The codes of the answered takes' waits, from each take's carry-out to its answer (`takes`):
+/// the whole wait, then its parts behind the context's earlier takes, for a piece of the take's
+/// own, and the take worker's zeroing; each the nanoseconds in all, then the longest.
+pub const TAKE_WAIT_CODES: [(&str, &str); 4] = [
+    ("pool-take-wait-ns", "pool-take-wait-max-ns"),
+    ("pool-take-wait-queue-ns", "pool-take-wait-queue-max-ns"),
+    ("pool-take-wait-growth-ns", "pool-take-wait-growth-max-ns"),
+    ("pool-take-wait-zero-ns", "pool-take-wait-zero-max-ns"),
+];
+
 /// A pooled block's length, metal2vulkan-rt's `BLOCK_LEN`: 256 MiB.
 pub const BLOCK_LEN: u64 = 256 << 20;
 

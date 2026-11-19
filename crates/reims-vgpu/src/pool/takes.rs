@@ -25,6 +25,12 @@
 //!
 //! [`Placed`]: reims_vgpu_vulkan::core::memory::placed::Placed
 //!
+//! Each answered take's wait, from its carry-out to its answer, is counted by its cause
+//! ([`super::TAKE_WAIT_CODES`]): behind its context's earlier takes (its worker's start among
+//! them), for a piece of its own, and its worker's zeroing; the whole wait apart, as the three
+//! leave out the waits for the pool's lock. Each is counted in nanoseconds in all and at its
+//! longest, and a take whose whole wait is the longest yet is logged with its three.
+//!
 //! A take ends only at its answer, its context's close or the device's reset: there is no
 //! timeout. A take whose context closed, or that the reset ended, before its answer is given back
 //! here and never answered.
@@ -54,14 +60,15 @@
 use std::collections::VecDeque;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::MutexGuard;
 use reims_vgpu_vulkan::answer::count_kind_by;
 
 use super::{
-    Ask, Error, Mapped, MonoTime, Shared, State, TAKE_ZERO_SKIPPED_BYTES_CODE,
-    TAKE_ZEROED_BYTES_CODE,
+    Ask, Error, Mapped, MonoTime, Shared, State, TAKE_WAIT_CODES, TAKE_WAITS_CODE,
+    TAKE_ZERO_SKIPPED_BYTES_CODE, TAKE_ZEROED_BYTES_CODE,
 };
 
 /// A block's alignment and its length's granule: 64 KiB, the wire's `RGFX_POOL_BLOCK_ALIGN`.
@@ -159,6 +166,43 @@ struct Job {
     /// Its carve, where one fit at the take: its address and number.
     carved: Option<(u64, u64)>,
     answer: TakeAnswer,
+    /// When it was carried out, before the pool's lock: its wait's start.
+    asked: MonoTime,
+}
+
+/// The longest of each of [`TAKE_WAIT_CODES`]' waits so far, in nanoseconds, which their
+/// `-max-ns` codes' counts rise to.
+static TAKE_WAIT_MAX_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Counts an answered take's wait ([`TAKE_WAIT_CODES`]): its whole, then behind its context's
+/// earlier takes, for a piece of its own and zeroing; the take itself last
+/// ([`TAKE_WAITS_CODE`]), once its waits are counted. Logs the take, `len` bytes of context
+/// `context`'s, where its whole wait is the longest yet.
+fn count_wait(context: u32, len: u64, waits: [Duration; 4]) {
+    let mut longest = false;
+    for (i, wait) in waits.iter().enumerate() {
+        let ns = u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX);
+        let (all, max) = TAKE_WAIT_CODES[i];
+        count_kind_by(all, ns);
+        let was = TAKE_WAIT_MAX_NS[i].fetch_max(ns, Ordering::Relaxed);
+        if ns > was {
+            count_kind_by(max, ns - was);
+            longest |= i == 0;
+        }
+    }
+    if longest {
+        let ms = |i: usize| waits[i].as_secs_f64() * 1000.0;
+        log::info!(
+            "pool: context {context}'s take of {} KiB waited {:.2} ms, the longest yet: {:.2} ms \
+             behind its earlier takes, {:.2} ms for a piece, {:.2} ms zeroing",
+            len >> 10,
+            ms(0),
+            ms(1),
+            ms(2),
+            ms(3)
+        );
+    }
+    count_kind_by(TAKE_WAITS_CODE, 1);
 }
 
 /// A context's takes.
@@ -267,6 +311,7 @@ impl PoolLedger {
         let len = length
             .checked_next_multiple_of(TAKE_ALIGN)
             .ok_or(Error::InvalidArgument)?;
+        let asked = (self.shared.now)();
         let mut st = self.shared.state.lock();
         if st.closed {
             return Ok(());
@@ -291,6 +336,7 @@ impl PoolLedger {
             len,
             carved,
             answer,
+            asked,
         });
         if taker.working {
             drop(st);
@@ -613,10 +659,12 @@ impl Shared {
                     None => break,
                 }
             };
+            let started = (self.now)();
             let carved = match job.carved {
                 Some(carved) => Grown::At(carved.0, carved.1, None),
                 None => self.carve_grown(&mut st, context, job.life, job.len),
             };
+            let grown = (self.now)().saturating_duration_since(started);
             let (at, serial, waited) = match carved {
                 Grown::At(at, serial, waited) => (at, serial, waited),
                 Grown::NoRoom => {
@@ -640,6 +688,7 @@ impl Shared {
             let carve = st.carves.get(&at).filter(|c| c.serial == serial);
             let written = carve.map_or(job.len, |c| c.written.min(job.len));
             let zeroes = usize::try_from(written).ok();
+            let zeroing = (self.now)();
             MutexGuard::unlocked(&mut st, || {
                 if let (Some(host), Some(zeroes)) = (host, zeroes) {
                     // SAFETY: the carve lies in its live piece's mapping, and the piece's block
@@ -655,6 +704,7 @@ impl Shared {
                     }
                 }
             });
+            let zeroed = (self.now)().saturating_duration_since(zeroing);
             let stands = st.stands(context, job.life);
             if stands
                 && let Some(c) = st.carves.get_mut(&at)
@@ -667,7 +717,10 @@ impl Shared {
                     gpu_address: c.gpu_address.get(),
                 };
                 MutexGuard::unlocked(&mut st, || {
+                    let whole = (self.now)().saturating_duration_since(job.asked);
+                    let queued = started.saturating_duration_since(job.asked);
                     (job.answer)(Some(taken));
+                    count_wait(context, job.len, [whole, queued, grown, zeroed]);
                     // Each wait for a piece, in every boot's log: the first line, then a count.
                     if let Some(waited) = waited {
                         log::info!(

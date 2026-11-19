@@ -722,6 +722,58 @@ fn a_take_that_fits_no_piece_grows_the_pool_and_waits_for_the_hosts_map() {
     assert_eq!(host.wait_for(2)[1], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
 }
 
+/// An answered take's wait is counted by its cause ([`TAKE_WAIT_CODES`]), the take counted once
+/// its waits are: a take that fits no piece waits for one of its own, which the host maps 50 ms
+/// after its ask, and that wait is its growth part's and at most the longest's; its parts lie
+/// within its whole wait
+#[test]
+fn a_takes_wait_is_counted_by_its_cause() {
+    let counted = |code: &str| {
+        (reims_vgpu_vulkan::answer::counted_kinds().into_iter())
+            .find(|(c, _)| *c == code)
+            .map_or(0, |(_, n)| n)
+    };
+    let codes = || {
+        [
+            TAKE_WAITS_CODE,
+            TAKE_WAIT_CODES[0].0,
+            TAKE_WAIT_CODES[1].0,
+            TAKE_WAIT_CODES[2].0,
+            TAKE_WAIT_CODES[3].0,
+            TAKE_WAIT_CODES[2].1,
+        ]
+        .map(counted)
+    };
+    let before = codes();
+    let host = Arc::new(Host::default());
+    let (pool, _blocks) = pool(range(64), &host, LONG);
+    let ledger = pool.ledger();
+    let rx = take(&ledger, 1, TAKE_ALIGN);
+    assert_eq!(host.wait_for(1)[0], Call::Add(BASE, BLOCK_LEN));
+    let held = Duration::from_millis(50);
+    std::thread::sleep(held);
+    pool.added(BASE).unwrap();
+    assert_eq!(answer(&rx), Some((0, TAKE_ALIGN)));
+    // Counted on the take's worker, just after its answer.
+    let start = Instant::now();
+    while counted(TAKE_WAITS_CODE) == before[0] {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the take is counted"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let after = codes();
+    let grew = |i: usize| after[i] - before[i];
+    let held = u64::try_from(held.as_nanos()).unwrap();
+    assert!(grew(3) >= held, "waited for a piece: {} ns", grew(3));
+    assert!(after[5] >= held, "the longest wait for a piece");
+    assert!(
+        grew(2) + grew(3) + grew(4) <= grew(1),
+        "the parts within the whole"
+    );
+}
+
 /// The guest's driver's take of the pool asks for a piece ahead of the first take, which that
 /// take then finds, answered with no piece of its own asked or mapped; taken again with the piece
 /// still empty, as after a reset, it asks none
