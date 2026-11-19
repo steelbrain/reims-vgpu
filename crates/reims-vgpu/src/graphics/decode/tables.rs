@@ -46,6 +46,7 @@ use reims_vgpu_vulkan::core::sync::Mutex;
 use super::lane::Lane;
 use super::managed::ManagedCopy;
 use super::surface_cache::Repitched;
+use super::surface_cache::shapes::ShapeUse;
 use super::video::PlanePlace;
 use super::{Drain, ObjHandle, drop_refused};
 
@@ -161,6 +162,10 @@ pub(crate) struct Entry<P: Platform> {
     /// whether it lies in the cache or in the block's wide home ([`LaidUse`]); `None` for any
     /// other object.
     pub(crate) laid_use: Option<LaidUse>,
+    /// A texture, or a view of one, that is a view of a shape's image over a device cache in the
+    /// per-shape form, and the reference it holds to the shape ([`ShapeUse`]); `None` for any
+    /// other object.
+    pub(crate) shape: Option<ShapeUse>,
     /// A no-copy buffer whose identity the guest may hand on with no message naming it, and
     /// whether it did ([`super::escape`]); `None` for any other object.
     pub(crate) escape: Option<super::escape::Escape>,
@@ -186,6 +191,7 @@ impl<P: Platform> Entry<P> {
             icb_dropped: None,
             laid_out: None,
             laid_use: None,
+            shape: None,
             escape: None,
             made: 0,
             seen: 0,

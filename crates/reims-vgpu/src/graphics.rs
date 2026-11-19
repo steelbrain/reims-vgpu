@@ -761,6 +761,16 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // A GPU that shares the CPU's memory holds every device cache in the host's RAM
             // beside the guest's pages: they all fit one budget together, past which a surface
             // lies in place, so the copies stay bounded on a small host.
+            // A platform of the per-shape form has each texture over a device cache be a view of
+            // its shape's image, an own texture of the platform's (`decode::surface_shapes`).
+            if P::SURFACE_SHAPES {
+                let platform = Arc::clone(&platform);
+                decoder.set_surface_shapes(Arc::new(
+                    move |device: &P::Device, desc: &TextureDesc| {
+                        platform.own_texture(device, desc)
+                    },
+                ));
+            }
             if unified_memory {
                 let cache_budget = cache_budget(own_memory);
                 decoder.set_cache_budget(cache_budget);

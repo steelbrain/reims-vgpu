@@ -27,6 +27,12 @@ use crate::memory::MemoryMap;
 /// What the API asks of a platform beyond core's: the process's instance, its GPU device, a
 /// texture's pixels, what it holds of the guest's RAM, a graphics device's region and its video.
 pub trait ApiPlatform: Platform {
+    /// Whether a graphics device on the platform keeps the per-shape form of the textures over
+    /// its IOSurface device caches (`graphics::decode::surface_shapes`): each a view of its
+    /// shape's image ([`ApiPlatform::own_texture`]) rather than a texture over the cache's buffer,
+    /// and every surface cached. False by default.
+    const SURFACE_SHAPES: bool = false;
+
     /// The process's platform, made on first use.
     fn process() -> Arc<Self>;
 

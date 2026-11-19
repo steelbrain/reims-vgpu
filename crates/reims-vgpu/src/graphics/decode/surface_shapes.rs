@@ -1,0 +1,394 @@
+//! `TEXTURE_FROM_IOSURFACE` over a device cache in the per-shape form (`surface_cache::shapes`):
+//! the guest's texture is a view, at the guest's resource index and in the guest's format, of
+//! its shape's image, which the cache keeps for every texture of that shape over the surface.
+//!
+//! A texture takes a shape where it is a 2D texture of one level, one slice and one sample in a
+//! colour format of texels ([`shapes::texel_bytes`]) lying wholly inside the cache's buffer; any
+//! other, and one whose image or view the platform does not make, lies over the buffer as in the
+//! default form, counted (`ShapeCounts::unshaped`).
+//!
+//! Every surface takes a device cache in the per-shape form: no texture lies in place over a
+//! surface's pages. A `SURFACE_PAGES` that asks whether its block needs one is answered that it
+//! does, and one that names its block uncached, or cached where the platform made no cache, is
+//! refused ([`UNCACHED_COPIED`]), so the kext gives the surface a copy block.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use reims_vgpu_graphics::wire::{RGFX_STATUS_REFUSED, RgfxTextureFromIOSurface};
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, Texture as _};
+use reims_vgpu_vulkan::core::platform::types::{NsRange, PixelFormatInfo};
+use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+use reims_vgpu_vulkan::core::raise::RaiseResult;
+
+use super::surface_cache::STORAGE_PRIVATE;
+use super::surface_cache::ShapeMaker;
+use super::surface_cache::shapes::{self, ShapeCounts, ShapeKey, ShapeUse};
+use super::{GraphicsDecoder, ObjHandle, TEXTURE_USAGE_WRITES, texture_desc};
+
+/// `MTLTextureType2D`.
+const TEXTURE_TYPE_2D: u64 = 2;
+
+/// The degradation code of a block refused as uncached in the per-shape form, which the kext
+/// gives a copy block instead (module doc).
+pub(super) const UNCACHED_COPIED: &str = "rt-surface-uncached-copied";
+
+/// Whether a block was refused as uncached ([`UNCACHED_COPIED`]): its line is logged the first
+/// time alone, the rest counted (docs/conventions.md).
+static UNCACHED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+impl<P: Platform> GraphicsDecoder<P> {
+    /// Takes the per-shape form from now on (module doc), each shape's image made by `maker`:
+    /// set once, at the device's make, before any surface is named.
+    pub(crate) fn set_surface_shapes(&self, maker: ShapeMaker<P>) {
+        self.surface_caches.set_shapes(maker);
+    }
+
+    /// Refuses the block at `block` as uncached in the per-shape form (module doc): any device
+    /// cache it had goes, as at a release, and so does any view of its pages, the refusal counted
+    /// ([`UNCACHED_COPIED`]). [`RGFX_STATUS_REFUSED`].
+    pub(super) fn refuse_uncached(&self, device: &P::Device, block: u64) -> u32 {
+        self.uncache_surface(device, block);
+        let idle = self.platform.vm().idle_view_mappings();
+        let old = self.shared.surface_views.lock().released(block, idle);
+        drop(old);
+        self.surface_caches
+            .count_shapes(|c| c.uncached_refused += 1);
+        reims_vgpu_vulkan::answer::count_kind(UNCACHED_COPIED);
+        if !UNCACHED_LOGGED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = UNCACHED_COPIED;
+                "the IOSurface block at {block:#x}: named with no device cache, which every \
+                 surface takes in the per-shape form; refused, the surface takes a copy block \
+                 ({UNCACHED_COPIED}; the rest are counted)"
+            );
+        }
+        RGFX_STATUS_REFUSED
+    }
+
+    /// The texture `m` asks, of the format `info` describes, as a view of its shape's image over
+    /// the cache of the block at `block` (module doc), with the shape it holds a reference to.
+    /// `None` where the caches take the default form, or the texture takes no shape here, which
+    /// is counted where the block has a cache in the per-shape form.
+    pub(super) fn shaped_surface_texture(
+        &self,
+        device: &P::Device,
+        m: &RgfxTextureFromIOSurface,
+        block: Option<u64>,
+        info: &PixelFormatInfo,
+    ) -> RaiseResult<Option<(P::Texture, ShapeUse)>> {
+        let caches = &self.surface_caches;
+        let Some(block) = block.filter(|&block| caches.shaped() && caches.has(block)) else {
+            return Ok(None);
+        };
+        let unshaped = |count: fn(&mut ShapeCounts)| {
+            caches.count_shapes(|c| {
+                count(c);
+                c.unshaped += 1;
+            });
+            Ok(None)
+        };
+        let d = &m.desc;
+        let pixel_format = u64::from(d.pixel_format);
+        let one = |n: u32| n <= 1;
+        let plain = u64::from(d.texture_type) == TEXTURE_TYPE_2D
+            && one(d.mipmap_level_count)
+            && one(d.array_length)
+            && one(d.sample_count)
+            && one(d.depth);
+        let Some(texel_bytes) = shapes::texel_bytes(pixel_format, info).filter(|_| plain) else {
+            return unshaped(|_| {});
+        };
+        let key = ShapeKey {
+            plane: u64::from(m.plane),
+            offset: m.offset,
+            bytes_per_row: m.bytes_per_row,
+            width: u64::from(d.width),
+            height: u64::from(d.height),
+            texel_bytes,
+        };
+        let length = match self.named(m.buffer_obj_id) {
+            Some(ObjHandle::Buffer(buffer)) => buffer.length(),
+            _ => 0,
+        };
+        let row = key.width.saturating_mul(texel_bytes);
+        if key.span().end > length || key.bytes_per_row < row {
+            return unshaped(|_| {});
+        }
+        // The image: the guest's format and size, Private, of Metal's Unknown usage, which takes
+        // every use and a view in any format of the texel's size, at no index of the guest's.
+        let image = TextureDesc {
+            texture_type: TEXTURE_TYPE_2D,
+            pixel_format,
+            width: key.width,
+            height: key.height,
+            usage: 0,
+            resource_options: Some(STORAGE_PRIVATE),
+            ..TextureDesc::default()
+        };
+        let Some((reference, image)) = caches.shape(device, block, key, &image) else {
+            return unshaped(|_| {});
+        };
+        let swizzle = texture_desc(d, m.resource_id).swizzle;
+        let one_of = NsRange::new(0, 1);
+        let view = match swizzle {
+            Some(swizzle) => image.new_swizzled_texture_subview_at_index(
+                pixel_format,
+                TEXTURE_TYPE_2D,
+                one_of,
+                one_of,
+                swizzle,
+                m.resource_id,
+            )?,
+            None => image.new_texture_view_at_index(pixel_format, m.resource_id)?,
+        };
+        let Some(view) = view else {
+            return unshaped(|c| c.views_refused += 1);
+        };
+        let shape = ShapeUse {
+            block,
+            writes: d.usage == 0 || u64::from(d.usage) & TEXTURE_USAGE_WRITES != 0,
+            reference,
+        };
+        Ok(Some((view, shape)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use reims_vgpu_graphics::wire::{RGFX_STATUS_CACHE, RGFX_STATUS_OK};
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::testkit::calllog::{Arg, Call};
+
+    use super::super::surface_cache::tests::{
+        cache_id, cached, copies, queues, surface_texture, surface_texture_as, surface_textures,
+        use_surfaces,
+    };
+    use super::super::surface_pages::tests::{BLOCK, Rig, one_plane, rig};
+    use super::*;
+    use crate::platform::ApiPlatform as _;
+
+    /// A shape's image (`ApiPlatform::own_texture`).
+    const IMAGE: &str = "newTextureWithDescriptor:";
+    /// A guest texture as a view of its shape's image, at its resource index.
+    const VIEW: &str = "newTextureViewWithPixelFormat:resourceIndex:";
+    /// A shape's fill from its cache's buffer ([`shapes::fill`]).
+    const FILL: &str = "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:\
+                        sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:";
+
+    /// The rig's decoder takes the per-shape form, each image the platform's own texture.
+    fn take_shapes(r: &Rig) {
+        let p = Arc::clone(&r.p);
+        r.dec.set_surface_shapes(Arc::new(
+            move |device: &<FakePlatform as Platform>::Device, desc: &TextureDesc| {
+                p.own_texture(device, desc)
+            },
+        ));
+    }
+
+    /// [`cached`]'s rig in the per-shape form, its texture resource ids held, with buffer 10 over
+    /// the block's two pages.
+    fn shaped() -> Rig {
+        let mut r = rig(8);
+        let page = r.page;
+        take_shapes(&r);
+        r.dec.hold_resource_ids(0, 1);
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        queues(&mut r);
+        assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
+        r
+    }
+
+    /// Texture `obj_id` over buffer 10, of `format` and `size`.
+    fn texture(r: &mut Rig, obj_id: u64, format: u32, size: (u32, u32)) {
+        let message = surface_texture(obj_id, 10, format, size);
+        assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+    }
+
+    /// The (image, pixel format, resource index) of each view in `calls`.
+    fn views(calls: &[Call]) -> Vec<(u64, u64, u64)> {
+        (calls.iter())
+            .filter(|c| c.sel == VIEW)
+            .map(|c| {
+                let at = |i: usize| c.args[i].as_u64().unwrap_or(u64::MAX);
+                (c.obj.0, at(0), at(1))
+            })
+            .collect()
+    }
+
+    /// The (buffer, offset, image) of each fill of a shape in `calls`.
+    fn fills(calls: &[Call]) -> Vec<(u64, u64, u64)> {
+        let id = |a: &Arg| a.as_obj().map_or(0, |o| o.0);
+        (calls.iter())
+            .filter(|c| c.sel == FILL)
+            .map(|c| {
+                (
+                    id(&c.args[0]),
+                    c.args[1].as_u64().unwrap_or(0),
+                    id(&c.args[5]),
+                )
+            })
+            .collect()
+    }
+
+    /// In the per-shape form a texture over a cache is a view, at the guest's resource index and
+    /// in the guest's format, of its shape's image, and no texture lies over the buffer: a second
+    /// texture of the same shape, in another format of the texel's size, is another view of the
+    /// same image; one of another size has an image of its own. Each holds its shape, and writes
+    /// it where its usage lets a shader write. In the default form the texture lies over the
+    /// buffer and holds no shape
+    #[test]
+    fn a_texture_over_a_cache_is_a_view_of_its_shapes_image() {
+        let mut r = shaped();
+        let mark = r.p.call_log().mark();
+        texture(&mut r, 21, 80, (32, 8));
+        texture(&mut r, 22, 80, (32, 8));
+        texture(&mut r, 23, 70, (32, 8));
+        texture(&mut r, 24, 80, (16, 8));
+        let message = surface_texture_as(25, 10, 80, (32, 8), (0x2, 0));
+        assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+        let calls = r.p.call_log().since(mark);
+        assert!(surface_textures(&calls).is_empty(), "none over the buffer");
+        assert_eq!(calls.iter().filter(|c| c.sel == IMAGE).count(), 2);
+        let seen = views(&calls);
+        let at = |n: u64| (seen[0].0, if n == 23 { 70 } else { 80 }, 0x40 + n);
+        assert_eq!(seen.len(), 5);
+        assert_eq!(seen[..3], [at(21), at(22), at(23)]);
+        assert_ne!(seen[3].0, seen[0].0, "another shape, another image");
+        assert_eq!((seen[3].1, seen[3].2), (80, 0x40 + 24));
+        assert_eq!(seen[4], at(25));
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.made, counts.found, counts.unshaped), (2, 3, 0));
+        assert_eq!(counts.made_bytes, 32 * 8 * 4 + 16 * 8 * 4);
+        let shape = |n: u64| {
+            let entry = r.dec.entry(n).unwrap();
+            entry.shape.as_ref().map(|s| (s.block, s.writes))
+        };
+        assert_eq!(shape(21), Some((BLOCK, false)));
+        assert_eq!(shape(25), Some((BLOCK, true)), "ShaderWrite writes");
+
+        let mut r = cached();
+        r.dec.hold_resource_ids(0, 1);
+        assert_eq!(r.buffer(10, BLOCK, 2 * r.page), Ok(()));
+        let mark = r.p.call_log().mark();
+        texture(&mut r, 21, 80, (32, 8));
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(surface_textures(&calls), [(cache_id(&r), 0, 128)]);
+        assert!(views(&calls).is_empty());
+        assert!(r.dec.entry(21).unwrap().shape.is_none());
+        assert_eq!(r.dec.caches().counts().shapes, ShapeCounts::default());
+    }
+
+    /// A new shape owes its fill from the buffer, which the next command buffer that names the
+    /// block makes, the cache's own first fill refilling every shape; a shape made later is filled
+    /// alone in the next that names the block, with no copy from the pages; a newer generation
+    /// fills the buffer from the pages and every shape from the buffer again
+    #[test]
+    fn a_new_shape_takes_the_buffers_bytes_before_its_first_use() {
+        let mut r = shaped();
+        let cache = cache_id(&r);
+        texture(&mut r, 21, 80, (32, 8));
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 2, false)]);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(copies(&calls).len(), 1, "the cache's first fill");
+        let first = fills(&calls);
+        assert_eq!(first.len(), 1);
+        assert_eq!((first[0].0, first[0].1), (cache, 0));
+        // A second shape, filled alone.
+        texture(&mut r, 22, 80, (16, 4));
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 2, false)]);
+        let calls = r.p.call_log().since(mark);
+        assert!(copies(&calls).is_empty(), "no copy from the pages");
+        let second = fills(&calls);
+        assert_eq!(second.len(), 1);
+        assert_ne!(second[0].2, first[0].2, "the new shape's image");
+        // Nothing owed: nothing filled.
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x102, &[(BLOCK, 2, false)]);
+        assert!(fills(&r.p.call_log().since(mark)).is_empty());
+        // A newer generation: the buffer, then every shape.
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x103, &[(BLOCK, 3, false)]);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(copies(&calls).len(), 1);
+        assert_eq!(fills(&calls).len(), 2);
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!(counts.fills, 4);
+        assert_eq!(counts.filled_bytes, 2 * (32 * 8 * 4 + 16 * 4 * 4));
+    }
+
+    /// The bound: once a texture's shape is unreferenced it stays, up to four of the block's
+    /// unreferenced shapes, the least recently used going first, counted with its bytes; a
+    /// texture of a shape that went makes it again, counted, and a referenced shape never goes
+    #[test]
+    fn unreferenced_shapes_past_four_go_least_recently_used_first() {
+        use reims_vgpu_graphics::wire::{
+            RGFX_CMD_OBJECT_DESTROY, RgfxMsgHeader, RgfxObjectDestroy,
+        };
+        use zerocopy::IntoBytes as _;
+        let mut r = shaped();
+        texture(&mut r, 20, 80, (32, 8));
+        for (n, width) in (1..=6).enumerate() {
+            let obj_id = 21 + n as u64;
+            texture(&mut r, obj_id, 80, (width, 8));
+            let destroy = RgfxObjectDestroy {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_OBJECT_DESTROY,
+                    size: size_of::<RgfxObjectDestroy>() as u32,
+                    seqno: 0,
+                },
+                obj_id,
+            };
+            assert_eq!(r.dec.decode(&r.device, destroy.as_bytes()).unwrap(), Ok(()));
+        }
+        // Width 1 went at width 6's make, five unreferenced then.
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.made, counts.dropped), (7, 1));
+        assert_eq!(counts.dropped_bytes, 8 * 4, "width 1's");
+        // Width 1 again: made again, counted, and width 2 goes; width 6 is still held.
+        texture(&mut r, 30, 80, (1, 8));
+        texture(&mut r, 31, 80, (6, 8));
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.made, counts.again, counts.found), (8, 1, 1));
+        assert_eq!(counts.dropped, 2, "the referenced one kept");
+        assert_eq!(counts.dropped_bytes, (1 + 2) * 8 * 4);
+        assert!(r.dec.entry(20).unwrap().shape.is_some());
+    }
+
+    /// In the per-shape form every surface takes a device cache: a block that asks whether it
+    /// needs one is answered that it does, with no view made, and takes its cache when named
+    /// cached; a block named uncached is refused, so the kext gives it a copy block, keeping no
+    /// view, counted
+    #[test]
+    fn every_surface_takes_a_device_cache() {
+        let mut r = rig(16);
+        let page = r.page;
+        take_shapes(&r);
+        let layout = one_plane(page, page - 16, 2);
+        assert_eq!(
+            r.pages_asking(BLOCK, &[(1, 2)], 2 * page, Some(layout)),
+            RGFX_STATUS_CACHE
+        );
+        assert!(r.dec.views_of_surfaces().view(BLOCK).is_none());
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        assert!(r.dec.caches().has(BLOCK));
+        let second = BLOCK + 0x8000;
+        assert_eq!(
+            r.pages_cached(second, &[(3, 2)], 2 * page, false),
+            RGFX_STATUS_REFUSED
+        );
+        assert!(r.dec.views_of_surfaces().view(second).is_none());
+        assert!(!r.dec.caches().has(second));
+        assert_eq!(r.dec.caches().counts().shapes.uncached_refused, 1);
+    }
+}

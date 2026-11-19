@@ -333,7 +333,7 @@ use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent as _};
 use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
 use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 use reims_vgpu_vulkan::core::platform::types::NsRange;
-use reims_vgpu_vulkan::core::platform::values::PagesPlane;
+use reims_vgpu_vulkan::core::platform::values::{PagesPlane, TextureDesc};
 use reims_vgpu_vulkan::core::platform::{Handle, Platform};
 use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult, refusals};
 use reims_vgpu_vulkan::core::sync::{Condvar, Mutex, MutexGuard};
@@ -341,6 +341,10 @@ use reims_vgpu_vulkan::core::sync::{Condvar, Mutex, MutexGuard};
 use super::refusing;
 use super::surface_pages::{SurfaceView, Unmade, buffer_over};
 use crate::device_writes::{self, Watcher};
+
+pub(crate) mod shapes;
+
+use shapes::{Held, ShapeCounts, ShapeKey, ShapeTable};
 
 /// The copies run under a live raise handler (the ring loop's, or the entry of the ring-0 thread
 /// that asks for them).
@@ -462,6 +466,9 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// Where the cache is laid out at the GPU's pitch, the buffer the textures over the surface
     /// that pass their plane's texels there lie over, once one is made ([`WideHome`]).
     wide: Option<WideHome<P>>,
+    /// The images of the shapes of texture made over the surface, in the per-shape form
+    /// ([`shapes`]); none in the default form.
+    shapes: ShapeTable<P::Texture>,
 }
 
 /// A laid-out cache's wide home (the module doc, "Wider than the plane"): a buffer that keeps
@@ -478,6 +485,12 @@ struct WideHome<P: Platform> {
 }
 
 impl<P: Platform> SurfaceCache<P> {
+    /// The bytes the cache holds in the caches' budget: its buffer's, and its shapes' images'
+    /// ([`shapes`]).
+    fn held(&self) -> u64 {
+        self.bytes.saturating_add(self.shapes.bytes())
+    }
+
     /// The bytes a copy `way` moves between the cache and its pages: a fill's, all of the
     /// surface's the cache holds; a copy out's, its texels where its layout is known, else all
     /// of the surface's.
@@ -1428,6 +1441,8 @@ pub(crate) struct CacheCounts {
     pub(crate) paced: u64,
     pub(crate) paced_us: u64,
     pub(crate) paced_most_us: u64,
+    /// What the per-shape form's shapes did ([`shapes`]).
+    pub(crate) shapes: ShapeCounts,
 }
 
 /// One cache's pages, host addresses in the guest's RAM, and how many times a device of the host
@@ -1572,6 +1587,11 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// The copy into its pages the last release made ([`Self::released`]), until the release's
     /// turn takes it ([`ReleasePace`]).
     release_copy: Option<Arc<Landing>>,
+    /// The per-shape form ([`shapes`]; [`Caches::set_shapes`]): no cache is laid out at the
+    /// GPU's pitch, and none is refused past the caches' budget, which trims unreferenced shapes.
+    shaped: bool,
+    /// The shapes' clock, a tick a use: what orders their last uses ([`ShapeTable::sweep`]).
+    shape_clock: u64,
 }
 
 /// The command buffers begun and not finished that use one block's cache, by the number each was
@@ -1757,6 +1777,8 @@ impl<P: Platform> SurfaceCaches<P> {
             unlocked,
             fence: None,
             release_copy: None,
+            shaped: false,
+            shape_clock: 0,
         }
     }
 
@@ -1791,6 +1813,12 @@ impl<P: Platform> SurfaceCaches<P> {
         }
         self.recoveries = now;
         self.unlocked.recoveries.store(now, Ordering::Release);
+        // Each shape's image lost what it held: it is filled from its buffer again, by the fill
+        // below where the buffer is, else before what reads it next ([`Self::owed_shapes_in`]).
+        for shape in self.by_block.values_mut().flat_map(|c| c.shapes.iter_mut()) {
+            shape.owed = true;
+            shape.dirty = false;
+        }
         // A cache made for the host's video keeps its bytes over its own memory: only its users,
         // whose work went with the lost device, go.
         let mut video = 0usize;
@@ -1914,6 +1942,12 @@ impl<P: Platform> SurfaceCaches<P> {
         let Some((cache, life, repitched)) = cache.take(&mut self.counts) else {
             return Ok(false);
         };
+        if self.shaped
+            && let Some(budget) = self.cache_budget
+            && self.cache_bytes.saturating_add(length) > budget
+        {
+            self.counts.shapes.past_budget += 1;
+        }
         let Some(pages) = pages else {
             return Ok(false);
         };
@@ -1951,6 +1985,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 out: None,
                 life,
                 wide: None,
+                shapes: ShapeTable::default(),
             },
         );
         let pages = Pages {
@@ -2176,6 +2211,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 out: None,
                 life,
                 wide: None,
+                shapes: ShapeTable::default(),
             },
         );
         if carries {
@@ -2364,11 +2400,14 @@ impl<P: Platform> SurfaceCaches<P> {
     /// The room the caches' budget has for the block at `block`'s cache, the cache the block has
     /// going first ([`Self::make_with`], [`Self::make_deferred`]): all there is where the device
     /// sets no budget ([`Self::set_cache_budget`]).
+    ///
+    /// In the per-shape form every block keeps its cache past the budget, which trims its
+    /// unreferenced shapes instead ([`Self::sweep_shapes`]): all there is, a make past it counted.
     fn cache_room(&self, block: u64) -> u64 {
-        let Some(budget) = self.cache_budget else {
+        let Some(budget) = self.cache_budget.filter(|_| !self.shaped) else {
             return u64::MAX;
         };
-        let going = self.by_block.get(&block).map_or(0, |cache| cache.bytes);
+        let going = self.by_block.get(&block).map_or(0, SurfaceCache::held);
         budget.saturating_sub(self.cache_bytes.saturating_sub(going))
     }
 
@@ -2438,6 +2477,7 @@ impl<P: Platform> SurfaceCaches<P> {
         CacheMaker {
             exportable: self.exportable,
             dma_buf: self.dma_buf,
+            shaped: self.shaped,
         }
     }
 
@@ -2585,7 +2625,8 @@ impl<P: Platform> SurfaceCaches<P> {
         let count = self.hold(block, u.flags & RGFX_SURFACE_USE_WRITES != 0);
         let follows = filled
             .and_then(|()| self.follow(cb, count))
-            .and_then(|follows| self.home_in(cb, block).map(|()| follows));
+            .and_then(|follows| self.home_in(cb, block).map(|()| follows))
+            .and_then(|follows| self.owed_shapes_in(cb, block).map(|()| follows));
         (Some(count), follows)
     }
 
@@ -2665,6 +2706,94 @@ impl<P: Platform> SurfaceCaches<P> {
                 home.stale = true;
             }
         }
+    }
+
+    /// The block at `block`'s shapes that owe a fill ([`shapes::Shape::owed`]) take the buffer's bytes
+    /// first in command buffer `cb`, after what `cb` waits for ([`shapes`]).
+    fn owed_shapes_in(&mut self, cb: &P::CommandBuffer, block: u64) -> RaiseResult<()> {
+        let Some(cache) = self.by_block.get_mut(&block) else {
+            return Ok(());
+        };
+        let (buffer, table) = (&cache.device, &mut cache.shapes);
+        shapes::fill::<P>(
+            cb,
+            buffer,
+            table,
+            |shape| shape.owed,
+            &mut self.counts.shapes,
+        )
+    }
+
+    /// The shape `key` of the block at `block`'s cache, where the cache holds it: a reference to
+    /// it and its image. `None` where the block has no cache; `Some(None)` where it holds no such
+    /// shape.
+    fn find_shape(&mut self, block: u64, key: &ShapeKey) -> Option<Option<Held<P::Texture>>> {
+        let cache = self.by_block.get_mut(&block)?;
+        self.shape_clock += 1;
+        let found = cache.shapes.find(key, self.shape_clock);
+        if found.is_some() {
+            self.counts.shapes.found += 1;
+        }
+        Some(found.map(|(reference, shape)| (reference, shape.image.clone_ref())))
+    }
+
+    /// Adds the shape `key` of the block at `block`'s cache, its image `image` made with the lock
+    /// let go of, where the cache holds no such shape yet: it owes its fill from the buffer, made
+    /// in the next command buffer that uses the block ([`Self::owed_shapes_in`]). Then the
+    /// shapes past the bound and the caches' budget go ([`Self::sweep_shapes`]). A reference to
+    /// the shape and its image, `None` where the block has no cache; and what goes, `image`
+    /// among it where the cache held the shape already, for the caller to let go of with the
+    /// lock let go of.
+    fn add_shape(
+        &mut self,
+        block: u64,
+        key: ShapeKey,
+        image: P::Texture,
+    ) -> (Option<Held<P::Texture>>, Vec<P::Texture>) {
+        match self.find_shape(block, &key) {
+            None => return (None, vec![image]),
+            Some(Some(found)) => return (Some(found), vec![image]),
+            Some(None) => {}
+        }
+        let Some(cache) = self.by_block.get_mut(&block) else {
+            return (None, vec![image]);
+        };
+        let made = image.clone_ref();
+        let (reference, again) = cache.shapes.insert(key, image, true, self.shape_clock);
+        let bytes = key.bytes();
+        self.counts.shapes.made += 1;
+        self.counts.shapes.made_bytes += bytes;
+        if again {
+            self.counts.shapes.again += 1;
+        }
+        self.hold_bytes(bytes);
+        (Some((reference, made)), self.sweep_shapes(block))
+    }
+
+    /// The shapes that go: the block at `block`'s unreferenced ones past the bound
+    /// ([`ShapeTable::sweep`]), then, past the caches' budget, the unreferenced ones of any block
+    /// least recently used first, until the caches hold no more than the budget or no
+    /// unreferenced shape is left. Their images, for the caller to let go of with the lock let go
+    /// of.
+    fn sweep_shapes(&mut self, block: u64) -> Vec<P::Texture> {
+        let mut gone = (self.by_block.get_mut(&block)).map_or_else(Vec::new, |c| c.shapes.sweep());
+        while let Some(budget) = self.cache_budget
+            && self.cache_bytes > budget
+        {
+            let oldest = (self.by_block.iter())
+                .filter_map(|(&at, c)| Some((c.shapes.oldest_unreferenced()?, at)))
+                .min();
+            let Some(((_, id), at)) = oldest else {
+                break;
+            };
+            gone.extend((self.by_block.get_mut(&at)).and_then(|c| c.shapes.take_id(id)));
+        }
+        for shape in &gone {
+            self.cache_bytes = self.cache_bytes.saturating_sub(shape.bytes);
+            self.counts.shapes.dropped += 1;
+            self.counts.shapes.dropped_bytes += shape.bytes;
+        }
+        gone.into_iter().map(|shape| shape.image).collect()
     }
 
     /// The block at `block`'s wide home's buffer, and whether it lies over the pages (for the
@@ -3448,6 +3577,10 @@ impl<P: Platform> SurfaceCaches<P> {
         if let Some(staged) = staged {
             cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| drop(staged)))?;
         }
+        // Every shape takes the CPU's bytes the buffer took, its own writes not copied out
+        // overwritten as the buffer's are (the module doc of `shapes`).
+        let (buffer, table) = (&cache.device, &mut cache.shapes);
+        shapes::fill::<P>(&cb, buffer, table, |_| true, &mut self.counts.shapes)?;
         transfer.signalled += 1;
         let value = transfer.signalled;
         cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
@@ -3674,7 +3807,7 @@ impl<P: Platform> SurfaceCaches<P> {
         let gone = self.by_block.remove(&block);
         self.owed.remove(&block);
         if let Some(cache) = &gone {
-            self.cache_bytes = self.cache_bytes.saturating_sub(cache.bytes);
+            self.cache_bytes = self.cache_bytes.saturating_sub(cache.held());
         }
         if let Some(cache) = gone.as_ref().filter(|c| c.deferred.is_some()) {
             self.deferred_bytes = self.deferred_bytes.saturating_sub(cache.bytes);
@@ -4105,7 +4238,18 @@ pub(crate) struct Caches<P: Platform> {
     /// A wide home was made ([`Self::wide_home`]): until then no walk notes its encoders' uses
     /// of textures over laid-out caches, nor takes the caches' lock at their ends.
     homes: AtomicBool,
+    /// What makes a shape's image, in the per-shape form ([`Self::set_shapes`]).
+    shape_maker: OnceLock<ShapeMaker<P>>,
 }
+
+/// What makes a shape's image ([`shapes`]): a texture of the descriptor on the device, of the
+/// platform's own, at no resource index the guest names (`ApiPlatform::own_texture`); `None`
+/// where the platform makes none.
+pub(crate) type ShapeMaker<P> = Arc<
+    dyn Fn(&<P as Platform>::Device, &TextureDesc) -> Option<<P as Platform>::Texture>
+        + Send
+        + Sync,
+>;
 
 /// How a new cache's buffer is made ([`SurfaceCaches::maker`]): read under the caches' lock and
 /// used with it let go of, as a new block of the device's memory may take tens of milliseconds
@@ -4129,6 +4273,9 @@ struct CacheMaker {
     /// Laid-out caches of two planes are made with their memory a dma-buf
     /// ([`Caches::set_dma_buf`]).
     dma_buf: bool,
+    /// The per-shape form: no cache is laid out at the GPU's pitch, as no texture lies over it
+    /// ([`shapes`]).
+    shaped: bool,
 }
 
 impl CacheMaker {
@@ -4157,7 +4304,7 @@ impl CacheMaker {
         length: u64,
         layout: Option<&[PagesPlane]>,
     ) -> RaiseResult<NewCache<P>> {
-        let repitched = layout.and_then(|planes| {
+        let repitched = layout.filter(|_| !self.shaped).and_then(|planes| {
             Repitched::of(planes, length, |row_bytes, rows| {
                 device.linear_rows_pitch(row_bytes, rows)
             })
@@ -4403,7 +4550,59 @@ impl<P: Platform> Caches<P> {
             moved: Condvar::new(),
             on_fill_done,
             homes: AtomicBool::new(false),
+            shape_maker: OnceLock::new(),
         }
+    }
+
+    /// Takes the per-shape form from now on ([`shapes`]), each shape's image made by `maker`: set
+    /// once, at the device's make, before any cache; a second is ignored.
+    pub(crate) fn set_shapes(&self, maker: ShapeMaker<P>) {
+        if self.shape_maker.set(maker).is_ok() {
+            self.state.lock().shaped = true;
+        }
+    }
+
+    /// Whether the caches take the per-shape form ([`Self::set_shapes`]).
+    pub(crate) fn shaped(&self) -> bool {
+        self.shape_maker.get().is_some()
+    }
+
+    /// The shape `key` of the block at `block`'s cache, its image made of `desc` where the cache
+    /// holds none yet, with the lock let go of, and added ([`SurfaceCaches::add_shape`]): a
+    /// reference to it and its image. `None` where the caches take the default form, the block
+    /// has no cache, or the platform made no image (counted). What goes is let go of with no lock
+    /// held, a refusal logged.
+    pub(crate) fn shape(
+        &self,
+        device: &P::Device,
+        block: u64,
+        key: ShapeKey,
+        desc: &TextureDesc,
+    ) -> Option<Held<P::Texture>> {
+        let maker = self.shape_maker.get()?;
+        match self.state.lock().find_shape(block, &key) {
+            None => return None,
+            Some(Some(found)) => return Some(found),
+            Some(None) => {}
+        }
+        let Some(image) = maker(device, desc) else {
+            self.state.lock().counts.shapes.images_refused += 1;
+            return None;
+        };
+        let (shape, gone) = self.state.lock().add_shape(block, key, image);
+        if let Err(refusal) = refusals::refusing(move || drop(gone)) {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = refusal;
+                "the IOSurface block at {block:#x}'s shapes past their bound were let go of, and \
+                 a release was refused: {refusal}"
+            );
+        }
+        shape
+    }
+
+    /// A count of the per-shape form's, `count` picking it ([`ShapeCounts`]).
+    pub(crate) fn count_shapes(&self, count: impl FnOnce(&mut ShapeCounts)) {
+        count(&mut self.state.lock().counts.shapes);
     }
 
     /// Whether the transfer queue and the end events are made with the command queues
@@ -6006,7 +6205,7 @@ fn copy<P: Platform>(
 mod costs;
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::atomic::AtomicBool;
 
     use reims_vgpu_graphics::ops::{
@@ -6044,7 +6243,7 @@ mod tests {
 
     /// A rig whose block at [`BLOCK`] is two pages of a surface, marked cached, with command
     /// queues 1 and 2.
-    fn cached() -> Rig {
+    pub(crate) fn cached() -> Rig {
         let mut r = rig(8);
         let page = r.page;
         assert_eq!(
@@ -6057,7 +6256,7 @@ mod tests {
 
     /// Command buffer `cb_obj_id` on queue `queue`, which uses each (block, generation, writes)
     /// of `uses` and does nothing else.
-    fn use_surfaces(r: &mut Rig, queue: u64, cb_obj_id: u64, uses: &[(u64, u64, bool)]) {
+    pub(crate) fn use_surfaces(r: &mut Rig, queue: u64, cb_obj_id: u64, uses: &[(u64, u64, bool)]) {
         use_surfaces_asking(r, queue, cb_obj_id, uses, false);
     }
 
@@ -6155,7 +6354,7 @@ mod tests {
     }
 
     /// The (source, destination) of each copy in `calls`.
-    fn copies(calls: &[Call]) -> Vec<(u64, u64)> {
+    pub(crate) fn copies(calls: &[Call]) -> Vec<(u64, u64)> {
         (calls.iter())
             .filter(|c| c.sel == COPY)
             .map(|c| {
@@ -6166,7 +6365,7 @@ mod tests {
     }
 
     /// The id of the block's cache.
-    fn cache_id(r: &Rig) -> u64 {
+    pub(crate) fn cache_id(r: &Rig) -> u64 {
         let caches = r.dec.caches();
         let cache = caches.buffer(BLOCK).unwrap();
         Arg::obj(cache).as_obj().unwrap().0
@@ -6288,6 +6487,7 @@ mod tests {
         let maker = CacheMaker {
             exportable: false,
             dma_buf: false,
+            shaped: false,
         };
         let desc = platform.texture_descriptor(&TextureDesc {
             pixel_format: 80, // BGRA8Unorm
@@ -10526,13 +10726,18 @@ mod tests {
     /// The `TEXTURE_FROM_IOSURFACE` of texture `obj_id` over plane 0 of surface 0x77, at its
     /// first byte and rows 128 bytes apart, in buffer `buffer`: `format` (10 R8Unorm), `size`
     /// texels, usage ShaderRead.
-    fn surface_texture(obj_id: u64, buffer: u64, format: u32, size: (u32, u32)) -> Vec<u8> {
+    pub(crate) fn surface_texture(
+        obj_id: u64,
+        buffer: u64,
+        format: u32,
+        size: (u32, u32),
+    ) -> Vec<u8> {
         surface_texture_as(obj_id, buffer, format, size, (1, 0))
     }
 
     /// [`surface_texture`]'s message with `(usage, options)` its descriptor's usage and resource
     /// options.
-    fn surface_texture_as(
+    pub(crate) fn surface_texture_as(
         obj_id: u64,
         buffer: u64,
         format: u32,
@@ -10577,7 +10782,7 @@ mod tests {
 
     /// The buffer each `newTextureWithDescriptor:iosurface:plane:` in `calls` was made over, and
     /// its offset and pitch there.
-    fn surface_textures(calls: &[Call]) -> Vec<(u64, u64, u64)> {
+    pub(crate) fn surface_textures(calls: &[Call]) -> Vec<(u64, u64, u64)> {
         (calls.iter())
             .filter(|c| c.sel == "newTextureWithDescriptor:iosurface:plane:")
             .map(|c| {
@@ -11275,7 +11480,7 @@ mod tests {
     }
 
     /// Command queues 1 and 2.
-    fn queues(r: &mut Rig) {
+    pub(crate) fn queues(r: &mut Rig) {
         for obj_id in [1, 2] {
             let queue = RgfxQueueCreate {
                 header: RgfxMsgHeader {

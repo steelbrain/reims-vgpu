@@ -211,6 +211,7 @@ mod split;
 mod surface_cache;
 mod surface_order;
 mod surface_pages;
+mod surface_shapes;
 mod tables;
 mod video;
 mod view;
@@ -1629,6 +1630,20 @@ impl<P: Platform> GraphicsDecoder<P> {
                     d.paced_us / 1000, d.paced_most_us / 1000
                 );
             }
+            let sh = d.shapes;
+            if sh != surface_cache::shapes::ShapeCounts::default() {
+                log::info!(
+                    target: "reims_vgpu::graphics",
+                    "IOSurface device caches' shapes: {} made of {} MiB, {} textures of a shape \
+                     held, {} made again after their drop; {} filled from their buffers ({} MiB); \
+                     {} unreferenced dropped ({} MiB); {} textures over the buffer instead ({} \
+                     images and {} views refused); {} caches kept past the budget; {} blocks \
+                     refused uncached",
+                    sh.made, sh.made_bytes >> 20, sh.found, sh.again, sh.fills,
+                    sh.filled_bytes >> 20, sh.dropped, sh.dropped_bytes >> 20, sh.unshaped,
+                    sh.images_refused, sh.views_refused, sh.past_budget, sh.uncached_refused
+                );
+            }
         }
         Some(status)
     }
@@ -1693,6 +1708,26 @@ impl<P: Platform> GraphicsDecoder<P> {
             _ => surface_cache::CacheLayout::Unknown,
         };
         let views = &self.shared.surface_views;
+        // In the per-shape form every surface takes a device cache (`surface_shapes`): an ask is
+        // answered so with no view made, and a block named uncached is refused, counted.
+        if self.surface_caches.shaped() && !private && !cached {
+            let block = pages.block_offset;
+            let asked = planes.as_deref().map(|planes| {
+                surface_pages::SurfaceViews::cache_unmade(
+                    views,
+                    &self.platform,
+                    pages,
+                    runs,
+                    planes,
+                    settle,
+                )
+            });
+            return match asked {
+                Some(None) => None,
+                Some(Some(true)) => Some(RGFX_STATUS_CACHE),
+                Some(Some(false)) | None => Some(self.refuse_uncached(device, block)),
+            };
+        }
         // An ask whose textures would lie in place over no buffer of its pages the device makes
         // is answered that it needs a device cache with no view made, which the answer would let
         // go of unused; where its runs fail a view's checks, the view's path refuses them.
@@ -1773,7 +1808,14 @@ impl<P: Platform> GraphicsDecoder<P> {
                 }
                 _ => {
                     self.cache_surface(device, pages.block_offset, runs, cached, carried);
-                    RGFX_STATUS_OK
+                    // In the per-shape form a block the platform made no cache for is refused,
+                    // as one named uncached is (`surface_shapes`).
+                    if self.surface_caches.shaped() && !self.surface_caches.has(pages.block_offset)
+                    {
+                        self.refuse_uncached(device, pages.block_offset)
+                    } else {
+                        RGFX_STATUS_OK
+                    }
                 }
             },
             Ok(Some(Err(why))) => {
@@ -4051,6 +4093,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 };
                 let info = device.pixel_format_info(u64::from(m.desc.pixel_format));
                 let row_bytes = video::row_bytes(&info, m.desc.width, m.bytes_per_row);
+                // In the per-shape form a texture over a cache is a view of its shape's image
+                // (`surface_shapes`).
+                let shaped =
+                    self.shaped_surface_texture(device, &m, span.map(|(at, _)| at), &info)?;
                 // Over a device cache laid out at the GPU's pitch the texture lies at the same
                 // byte of the same row of its plane in the cache, its rows at the cache's pitch
                 // (`surface_cache::Repitched`); one past its plane's texels there lies over the
@@ -4100,29 +4146,32 @@ impl<P: Platform> GraphicsDecoder<P> {
                     _ => descriptor,
                 };
                 let at = (plane.offset, plane.bytes_per_row);
-                let made = {
-                    let Some(ObjHandle::Buffer(cache)) = self.named(m.buffer_obj_id) else {
-                        return Ok(Err(DecodeError::BadReference));
-                    };
-                    let buffer = wide.as_ref().map_or(cache, |(home, _)| home);
-                    let made = buffer.new_texture_over_surface_plane(
-                        OnFault::Return,
-                        &descriptor,
-                        plane,
-                    )?;
-                    if made.is_none() {
-                        log_refused_texture(&TextureOverBuffer {
-                            obj_id: m.obj_id,
-                            buffer_obj_id: m.buffer_obj_id,
-                            buffer_length: buffer.length(),
-                            desc: &m.desc,
-                            offset: m.offset,
-                            bytes_per_row: m.bytes_per_row,
-                            bytes_per_image: None,
-                            surface: Some((m.iosurface_id, m.plane, facts)),
-                        });
+                let (made, shape) = match shaped {
+                    Some((texture, shape)) => (Some(texture), Some(shape)),
+                    None => {
+                        let Some(ObjHandle::Buffer(cache)) = self.named(m.buffer_obj_id) else {
+                            return Ok(Err(DecodeError::BadReference));
+                        };
+                        let buffer = wide.as_ref().map_or(cache, |(home, _)| home);
+                        let made = buffer.new_texture_over_surface_plane(
+                            OnFault::Return,
+                            &descriptor,
+                            plane,
+                        )?;
+                        if made.is_none() {
+                            log_refused_texture(&TextureOverBuffer {
+                                obj_id: m.obj_id,
+                                buffer_obj_id: m.buffer_obj_id,
+                                buffer_length: buffer.length(),
+                                desc: &m.desc,
+                                offset: m.offset,
+                                bytes_per_row: m.bytes_per_row,
+                                bytes_per_image: None,
+                                surface: Some((m.iosurface_id, m.plane, facts)),
+                            });
+                        }
+                        (made, None)
                     }
-                    made
                 };
                 match made {
                     Some(texture) => {
@@ -4148,6 +4197,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                             ),
                         });
                         entry.laid_use = laid_use;
+                        entry.shape = shape;
                         entry.over_view = matches!(wide, Some((_, true)));
                         self.store(m.obj_id, entry);
                         if m.plane == 0 {

@@ -80,10 +80,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         // A view of a texture over a plane of a laid-out device cache, or over its wide home,
         // lies where its parent does, and its uses are noted as the parent's are.
         let laid_use = self.entry(m.parent_obj_id).and_then(|e| e.laid_use);
+        // A view of a view of a shape's image is one too, and holds a reference to the shape.
+        let shape =
+            (self.entry(m.parent_obj_id)).and_then(|e| e.shape.as_ref().map(|s| s.clone_ref()));
         match made {
             Some(view) => {
                 let mut entry = Entry::of(ObjHandle::Texture(view)).over(span);
                 entry.laid_use = laid_use;
+                entry.shape = shape;
                 self.store(m.obj_id, entry);
                 Ok(Ok(()))
             }
