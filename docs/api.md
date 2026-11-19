@@ -201,8 +201,8 @@ it added and says so for each, as QEMU's teardown does; the release then waits f
 holds and frees every block before it returns, so none is freed by a driver's exit handler (on
 NVIDIA's driver, which unmaps its memory inside `exit()`, a thread still reading a block then
 faults). QEMU gives the device the addresses past the RAM and the PCI host bridge's default 64-bit
-window, up to three quarters of the guest's physical address space, and at realize, once the device
-is made, raises fw_cfg
+window, up to three quarters of the guest's physical address space and, under KVM and WHPX, at most
+to the end of the host's, and at realize, once the device is made, raises fw_cfg
 `etc/reserved-memory-end` past the range it took, rounded up to 1 GiB, so OVMF's 64-bit window goes
 above it, maps each piece as a RAM region of its own (an add is a pure add), and under WHPX runs
 the hypervisor's map outside its BQL (`whpx_map_ahead`).

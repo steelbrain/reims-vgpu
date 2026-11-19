@@ -202,7 +202,10 @@ is its transport:
   memory heaps hold, every heap summed. It offers the library the room from
   the host bridge's `pci-hole64-end` rounded up to 1 GiB (0xac0000000, 43
   GiB, on `reims-ctl`'s 8 GiB q35 machine) to three quarters of the guest's
-  physical address space, in whole GiB, and after the create reserves the
+  physical address space, and under KVM and WHPX at most to the end of the
+  host's (CPUID 0x80000008's bits, 39 on the Windows mini's Coffee Lake
+  against the guest's default 40), which they refuse to map past, in whole
+  GiB, and after the create reserves the
   range the library took of it (`rvg_graphics_device_pool_range`,
   docs/api.md "The guest's Shared pool"), its end rounded up to 1 GiB. The
   `reims_graphics_pool_reserved` trace prints the range and that end, and
