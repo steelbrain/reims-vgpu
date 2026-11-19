@@ -1,6 +1,7 @@
 //! Our side of metal2vulkan-rt's seam: what the Vulkan platform gives the runtime that replaces
 //! metal2vulkan-runtime at the cutover, built on rt at the commit the workspace pins. No path of
-//! the library's reaches it before the cutover; its tests run it on the GPU each test host holds.
+//! the library's reaches it before the cutover; its tests run it on the GPU each test host holds,
+//! but on the Mac, whose Vulkan, MoltenVK, rt's floor refuses (it lacks `nullDescriptor`).
 //!
 //! - **Sampler IDs** ([`sampler_ids`]): rt's creation of a pipeline state takes one sampler ID
 //!   for each sampler the state numbers, each constexpr sampler's an index of a live grant.
@@ -72,7 +73,10 @@ mod testkit {
             })
             .collect();
         let count = listed.len();
-        format!("none of {count} physical devices meets rt's floor: {}", each.join("; "))
+        format!(
+            "none of {count} physical devices meets rt's floor: {}",
+            each.join("; ")
+        )
     }
 
     /// The `vendor:device` IDs a selection variable's value names.

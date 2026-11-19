@@ -88,6 +88,10 @@ fn kernel(library: &Library, name: &str) -> ComputePipelineDescriptor {
 /// numbering gives it, the grant being the device's whole sampler range; a second state of an
 /// equal sampler shares the ID, which goes back with the last of them.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+)]
 fn on_vulkan_a_constexpr_sampler_takes_a_granted_id_an_equal_one_shares() {
     let device = device();
     let ids = SamplerIds::new(&device).unwrap();
@@ -116,6 +120,10 @@ fn on_vulkan_a_constexpr_sampler_takes_a_granted_id_an_equal_one_shares() {
 
 /// A read and a write take IDs as a constexpr sampler does, in the order the states are made.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+)]
 fn on_vulkan_reads_and_writes_take_ids_beside_constexpr_samplers() {
     let device = device();
     let ids = SamplerIds::new(&device).unwrap();
@@ -136,6 +144,10 @@ fn on_vulkan_reads_and_writes_take_ids_beside_constexpr_samplers() {
 
 /// Each of five constexpr samplers of one kernel takes an ID of its own.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+)]
 fn on_vulkan_five_constexpr_samplers_take_five_ids() {
     let device = device();
     let ids = SamplerIds::new(&device).unwrap();
@@ -149,6 +161,10 @@ fn on_vulkan_five_constexpr_samplers_take_five_ids() {
 
 /// rt's render path takes the same numbering: a fragment function's read takes an ID.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+)]
 fn on_vulkan_a_render_state_numbers_its_fragment_functions_read() {
     let device = device();
     let ids = SamplerIds::new(&device).unwrap();
@@ -165,6 +181,10 @@ fn on_vulkan_a_render_state_numbers_its_fragment_functions_read() {
 
 /// The grant is the device's once: a second numbering of it is rt's refusal.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+)]
 fn on_vulkan_a_second_numbering_of_a_device_is_refused() {
     let device = device();
     let _ids = SamplerIds::new(&device).unwrap();
@@ -184,6 +204,10 @@ fn on_vulkan_a_second_numbering_of_a_device_is_refused() {
 
 /// A state whose sampler finds no free ID is refused holding none, and is made once one is free.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+)]
 fn on_vulkan_a_state_with_no_free_id_is_refused_holding_nothing() {
     let device = device();
     let ids = SamplerIds::new(&device).unwrap();
@@ -205,6 +229,10 @@ fn on_vulkan_a_state_with_no_free_id_is_refused_holding_nothing() {
 
 /// A state rt refuses before it numbers the samplers holds no ID.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+)]
 fn on_vulkan_a_state_rt_refuses_holds_no_id() {
     let device = device();
     let ids = SamplerIds::new(&device).unwrap();

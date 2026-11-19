@@ -62,6 +62,10 @@ fn run(command_buffer: &CommandBuffer) {
 /// Options 0 is rt's copy, both ways: a texture filled from one buffer reads back into another
 /// byte for byte.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+)]
 fn on_vulkan_a_copy_with_no_option_is_rts_copy() {
     let device = device();
     let block = device.take_block(MemoryClass::Shared, 1).unwrap();
@@ -100,6 +104,10 @@ fn on_vulkan_a_copy_with_no_option_is_rts_copy() {
 /// Any options but none are refused, both ways, with nothing recorded: the command buffer
 /// completes, and the bytes the refused copies name are untouched.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+)]
 fn on_vulkan_a_copy_with_an_option_is_refused_with_nothing_recorded() {
     let device = device();
     let block = device.take_block(MemoryClass::Shared, 1).unwrap();

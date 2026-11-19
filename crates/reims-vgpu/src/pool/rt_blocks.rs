@@ -1,6 +1,7 @@
 //! [`RtBlocks`], the pool's [`BlockSource`] over metal2vulkan-rt's blocks (`Device::take_block`
 //! and `release_block`), the runtime the device runs on from the cutover. No path of the
-//! library's makes one before then; its tests run it on the GPU each test host holds.
+//! library's makes one before then; its tests run it on the GPU each test host holds, but on the
+//! Mac, whose Vulkan, MoltenVK, rt's floor refuses.
 //!
 //! rt hands out a `Block` handle and takes a block back by its handle, and the pool names a block
 //! by its number ([`BlockId`]). The source keeps each handle it hands out by its number, the
@@ -112,6 +113,10 @@ mod tests {
     /// A block is taken from rt and given back by its number alone: the map hands rt its handle,
     /// which rt then reuses, and a number not handed out, or given back already, is not held.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+    )]
     fn on_vulkan_rt_blocks_give_a_block_back_by_its_number() {
         let (device, name) = reims_vgpu_vulkan::seam::test_device().unwrap();
         println!("rt's device: {name}");
