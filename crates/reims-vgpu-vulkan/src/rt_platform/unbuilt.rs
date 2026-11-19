@@ -533,8 +533,12 @@ mod tests {
         let (error, relayed) = relaying_gaps(|| rt_refused_error("test", &rt::Error::Quiesced));
         assert!(relayed);
         assert_eq!(error.domain, RT_DOMAIN);
-        assert!(error.description.ends_with("(rt-refused-quiesced)"), "{error}");
-        let (error, relayed) = relaying_gaps(|| refused_error_as("test", RtRefusal::Limit, &"full"));
+        assert!(
+            error.description.ends_with("(rt-refused-quiesced)"),
+            "{error}"
+        );
+        let (error, relayed) =
+            relaying_gaps(|| refused_error_as("test", RtRefusal::Limit, &"full"));
         assert!(relayed);
         assert_eq!(
             error.description,

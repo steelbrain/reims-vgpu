@@ -34,15 +34,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use metal2vulkan::Budget;
 use metal2vulkan::metal::{AttributeFormat, IndexType, StepFunction};
 use metal2vulkan::pipeline::{
-    LinkedFunction, LinkedFunctions, StageEntries, StageInputAttributeDescriptor, StageInputDescriptor,
-    StageInputLayoutDescriptor,
+    LinkedFunction, LinkedFunctions, StageEntries, StageInputAttributeDescriptor,
+    StageInputDescriptor, StageInputLayoutDescriptor,
 };
 use metal2vulkan_rt as rt;
 
 use crate::core::platform::resource::ComputePipeline;
-use crate::core::platform::{Handle, Platform};
 use crate::core::platform::types::{MtlSize, NsErrorText};
 use crate::core::platform::values::{FullComputePipelineDesc, LinkedFunctionsDesc, StageInputDesc};
+use crate::core::platform::{Handle, Platform};
 use crate::core::raise::RaiseResult;
 use crate::core::sync::Mutex;
 
@@ -50,7 +50,9 @@ use super::device::RtDevice;
 use super::library::RtFunction;
 use super::state::value;
 use super::texture::OwnIndices;
-use super::unbuilt::{RtRefusal, Unbuilt, refuse, refuse_create, refused_error_as, rt_refused_error};
+use super::unbuilt::{
+    RtRefusal, Unbuilt, refuse, refuse_create, refused_error_as, rt_refused_error,
+};
 use super::{RtObj, RtPlatform};
 
 /// `newComputePipelineStateWithFunction:error:`.
@@ -311,18 +313,21 @@ fn make(
 ) -> Result<RtObj<RtComputePipeline>, NsErrorText> {
     let mut taken = (Vec::new(), Vec::new());
     let mut exhausted = false;
-    let made = device.rt().new_compute_pipeline_state(descriptor, |samplers| {
-        let indices = (device.numbering()).take(device.sampler_indices(), device.rt(), samplers)?;
-        let Some(indices) = indices else {
-            exhausted = true;
-            return Err(rt::Error::Refused(rt::Refusal::IndicesNotGranted {
-                class: rt::IndexClass::Sampler,
-                index: 0,
-            }));
-        };
-        taken = (samplers.to_vec(), indices.clone());
-        Ok(indices)
-    });
+    let made = device
+        .rt()
+        .new_compute_pipeline_state(descriptor, |samplers| {
+            let indices =
+                (device.numbering()).take(device.sampler_indices(), device.rt(), samplers)?;
+            let Some(indices) = indices else {
+                exhausted = true;
+                return Err(rt::Error::Refused(rt::Refusal::IndicesNotGranted {
+                    class: rt::IndexClass::Sampler,
+                    index: 0,
+                }));
+            };
+            taken = (samplers.to_vec(), indices.clone());
+            Ok(indices)
+        });
     let lease = Lease {
         device: device.clone_ref(),
         samplers: taken.0,
@@ -467,7 +472,10 @@ mod tests {
         assert_eq!(one.stride, Some(16));
         assert_eq!(one.step_function, StepFunction::ThreadPositionInGridX);
         let two = out.layouts.get(&2).expect("layout 2");
-        assert_eq!((two.stride, two.step_function), (None, StepFunction::Constant));
+        assert_eq!(
+            (two.stride, two.step_function),
+            (None, StepFunction::Constant)
+        );
         let attribute = StageInputAttributeDescriptor::new(AttributeFormat::Float4, 4, 1);
         assert_eq!(out.attributes.get(&3), Some(&attribute));
 
@@ -492,10 +500,21 @@ mod tests {
         assert!(junk.is_err());
         assert_eq!(counted(translation), before + 1);
 
-        let shaders = device.new_shader_library().expect("our shaders").expect("a library");
-        let again = device.new_shader_library().expect("our shaders").expect("a library");
+        let shaders = device
+            .new_shader_library()
+            .expect("our shaders")
+            .expect("a library");
+        let again = device
+            .new_shader_library()
+            .expect("our shaders")
+            .expect("a library");
         assert_eq!(shaders.id(), again.id());
-        assert!(shaders.function_names().iter().any(|n| n == "displayMirrorTile"));
+        assert!(
+            shaders
+                .function_names()
+                .iter()
+                .any(|n| n == "displayMirrorTile")
+        );
 
         let library = device.new_library(NUMBERED).expect("never a raise");
         let library = library.expect("a metallib").expect("a library");
@@ -503,7 +522,12 @@ mod tests {
         for name in ["numbered_read", "numbered_sample", "numbered_write"] {
             assert!(names.iter().any(|n| n == name), "{names:?}");
         }
-        assert!(library.new_function(on, "absent").expect("never a raise").is_none());
+        assert!(
+            library
+                .new_function(on, "absent")
+                .expect("never a raise")
+                .is_none()
+        );
         let function = |name: &str| {
             let made = library.new_function(on, name).expect("never a raise");
             made.expect("a function of the table")
@@ -518,7 +542,10 @@ mod tests {
         let sample = function("numbered_sample");
         let first = state(&sample);
         let second = state(&sample);
-        assert!(matches!(first.samplers(), [rt::NumberedSampler::Constexpr(_)]));
+        assert!(matches!(
+            first.samplers(),
+            [rt::NumberedSampler::Constexpr(_)]
+        ));
         assert_eq!(first.sampler_indices(), [last]);
         assert_eq!(second.sampler_indices(), [last]);
         assert_eq!(device.numbering().held(), held + 1);
@@ -535,8 +562,18 @@ mod tests {
         assert_ne!(first.unique_identifier(), second.unique_identifier());
 
         let tables = counted(Unbuilt::FunctionTable.code());
-        assert!(first.function_handle(&sample).expect("never a raise").is_none());
-        assert!(first.new_visible_function_table(2).expect("never a raise").is_none());
+        assert!(
+            first
+                .function_handle(&sample)
+                .expect("never a raise")
+                .is_none()
+        );
+        assert!(
+            first
+                .new_visible_function_table(2)
+                .expect("never a raise")
+                .is_none()
+        );
         assert_eq!(counted(Unbuilt::FunctionTable.code()), tables + 2);
         let queries = counted(Unbuilt::PipelineQuery.code());
         assert_eq!(first.static_threadgroup_memory_length(), 0);
@@ -553,7 +590,9 @@ mod tests {
 
         let optional = device.new_library(OPTIONAL).expect("never a raise");
         let optional = optional.expect("a metallib").expect("a library");
-        let plain = optional.new_function(on, "optional_constant").expect("never a raise");
+        let plain = optional
+            .new_function(on, "optional_constant")
+            .expect("never a raise");
         let plain = plain.expect("a function of the table");
         let before = counted(metal);
         let refused = device.new_compute_pipeline_state_for_function(Some(&plain));
@@ -565,10 +604,14 @@ mod tests {
             value: [5; FunctionConstant::MAX_BYTES],
         };
         let made = optional.new_function_with_constants(on, "optional_constant", &[five]);
-        let specialized = made.expect("never a raise").expect("a specialized function");
+        let specialized = made
+            .expect("never a raise")
+            .expect("a specialized function");
         assert!(state(&specialized).max_total_threads_per_threadgroup() > 0);
         let made = optional.new_function_with_options(on, "optional_constant", &[], 0, Some("o"));
-        let named = made.expect("never a raise").expect("a function made by a descriptor");
+        let named = made
+            .expect("never a raise")
+            .expect("a function made by a descriptor");
         assert_eq!(named.name(), "o");
         assert!(state(&named).max_total_threads_per_threadgroup() > 0);
 
