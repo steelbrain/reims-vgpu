@@ -14438,3 +14438,25 @@ fn a_guest_s_private_block_is_taken_held_by_its_objects_and_given_back() {
     device.reset();
     assert!(eventually(|| blocks.held().is_empty()));
 }
+
+/// On the rt platform, which presents nothing yet, a display's window has no sink: its present is
+/// refused, counted (`rt-unbuilt-present`), before anything of the GPU is asked.
+#[cfg(feature = "rt")]
+#[test]
+fn rt_s_window_present_is_refused_counted() {
+    use reims_vgpu_vulkan::RtPlatform;
+    use reims_vgpu_vulkan::rt_platform::Unbuilt;
+    let counted = |code: &str| {
+        (reims_vgpu_vulkan::answer::degradation_counts().into_iter())
+            .find(|(c, _)| c == code)
+            .map_or(0, |(_, n)| n)
+    };
+    let code = Unbuilt::Present.code();
+    let before = counted(code);
+    let platform = Arc::new(RtPlatform::new());
+    let region = Arc::new(Region::new(reims_vgpu_graphics::REGION_SIZE as usize).unwrap());
+    let presented = Arc::new(Presented::<RtPlatform>::default());
+    let shown = Arc::new(Shown::default());
+    assert!(scanout_sink(&platform, &region, &shown, &presented).is_none());
+    assert_eq!(counted(code), before + 1);
+}

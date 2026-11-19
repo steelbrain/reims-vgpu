@@ -4521,7 +4521,8 @@ impl Screen for WindowScreen {
 
 /// The window's sink over `region` on `platform` ([`sink::ScanoutDraw`]): the Vulkan platform's
 /// swapchain presenter; `None` on any other platform (the testkit's), or where the platform
-/// refuses a command queue.
+/// refuses a command queue. On the rt platform, which presents nothing yet, `None` is the
+/// present's refusal, counted (`rt-unbuilt-present`).
 fn scanout_sink<P: ApiPlatform>(
     platform: &Arc<P>,
     region: &Arc<Region>,
@@ -4529,6 +4530,12 @@ fn scanout_sink<P: ApiPlatform>(
     presented: &Arc<Presented<P>>,
 ) -> Option<Arc<dyn FrameSink>> {
     let any: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(platform) as _;
+    #[cfg(feature = "rt")]
+    if any.is::<reims_vgpu_vulkan::RtPlatform>() {
+        use reims_vgpu_vulkan::rt_platform::unbuilt::{Unbuilt, refuse};
+        refuse(Unbuilt::Present, "presentDrawable:");
+        return None;
+    }
     let presented_any: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(presented) as _;
     if let (Ok(vulkan), Ok(presented)) = (
         Arc::clone(&any).downcast::<reims_vgpu_vulkan::VulkanPlatform>(),
