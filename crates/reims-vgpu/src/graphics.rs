@@ -2497,6 +2497,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     "a message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
                      carried out: {e:?}"
                 );
+                e.count();
                 if !stood_in {
                     self.fail_queue_command_buffer(poster, message);
                 }
@@ -2508,6 +2509,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     "a message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) faulted: \
                      {raise}"
                 );
+                reims_vgpu_vulkan::answer::count_kind(decode::FAULTED);
                 if !stood_in {
                     self.fail_queue_command_buffer(poster, message);
                 }
@@ -2738,6 +2740,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     "a pipeline create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
                      carried out: {e:?}"
                 );
+                e.count();
                 // Refused at its op, and answered at once: its process waits for the reply.
                 if let Some(refused) = refused_reply(message) {
                     poster.post(refused.as_bytes());
@@ -3406,6 +3409,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     "a library create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
                      carried out: {error:?}"
                 );
+                error.count();
                 if let Some(seqno) = answer {
                     poster.post(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT).as_bytes());
                 }

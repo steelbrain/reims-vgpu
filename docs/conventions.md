@@ -124,7 +124,12 @@ repeats the ones code cites.
     `queue-ring-post-waited`) and its
     decoder's (`two-ranges-kept-whole`, a command buffer dealt to two
     threads that the platform kept whole at a chunk's end, which fails at
-    its stand-in; `read-only-pages-buffers`, the no-copy buffers it made
+    its stand-in; `decode-malformed`, `decode-unknown-command`,
+    `decode-refused`, `decode-bad-reference` and `decode-bad-resource-id`,
+    the messages it did not carry out, by why (`DecodeError`; one of a
+    context closed before it came is owed nothing, and not counted), and
+    `decode-faulted`, those a raise kept it from, each kind's first logged;
+    `read-only-pages-buffers`, the no-copy buffers it made
     over pages their process maps read-only, and `read-only-pages-kib`,
     their bytes' sum in KiB, rounded up: a copy of each on Linux and
     Windows, and no degradation on macOS, where the platform imports the

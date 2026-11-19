@@ -626,6 +626,33 @@ pub enum DecodeError {
     ContextClosed,
 }
 
+/// The code of a message a raise kept from being carried out, in the degradation counts
+/// (docs/conventions.md), counted as [`DecodeError::code`]'s are.
+pub const FAULTED: &str = "decode-faulted";
+
+impl DecodeError {
+    /// The code a message not carried out for this is counted by in the degradation counts
+    /// (docs/conventions.md), each time, where its line is logged once a kind: `None` for a
+    /// [`DecodeError::ContextClosed`], which is owed nothing.
+    pub fn code(self) -> Option<&'static str> {
+        match self {
+            DecodeError::Malformed => Some("decode-malformed"),
+            DecodeError::UnknownCommand => Some("decode-unknown-command"),
+            DecodeError::Refused => Some("decode-refused"),
+            DecodeError::BadReference => Some("decode-bad-reference"),
+            DecodeError::BadResourceId => Some("decode-bad-resource-id"),
+            DecodeError::ContextClosed => None,
+        }
+    }
+
+    /// Counts a message not carried out for this in the degradation counts ([`Self::code`]).
+    pub fn count(self) {
+        if let Some(code) = self.code() {
+            reims_vgpu_vulkan::answer::count_kind(code);
+        }
+    }
+}
+
 /// How long the logs of what the surface views did wait after the last: the first
 /// `SURFACE_PAGES` after it logs them ([`views_log_due`]). A summary at info comes at most once a
 /// minute, however many `SURFACE_PAGES` a desktop's churn sends (docs/conventions.md); a run
@@ -4520,6 +4547,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     "{what} of object {obj_id:#x} was not carried out: the platform raised \
                      ({raise:?})"
                 );
+                reims_vgpu_vulkan::answer::count_kind(FAULTED);
             }
             drop(drain);
         };

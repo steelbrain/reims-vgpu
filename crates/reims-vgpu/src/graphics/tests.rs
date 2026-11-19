@@ -963,6 +963,46 @@ fn an_object_create_reaches_the_decoder() {
     assert!(grew, "the create never reached the decoder");
 }
 
+/// A message the decoder does not carry out is counted in the degradation counts each time, by
+/// why, and only the first of its kind is logged at warn (docs/conventions.md): two event creates
+/// the platform answers nil write one line and count `decode-refused` twice, and the next event
+/// is made
+#[test]
+fn a_kind_of_message_not_carried_out_is_logged_once_and_counted_each_time() {
+    use reims_vgpu_vulkan::core::logging;
+    use reims_vgpu_vulkan::core::testkit::Step;
+
+    let refused = || {
+        (reims_vgpu_vulkan::answer::degradation_counts().into_iter())
+            .find(|(code, _)| code == "decode-refused")
+            .map_or(0, |(_, n)| n)
+    };
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&lines);
+    assert!(logging::set_hook(
+        log::LevelFilter::Warn,
+        Box::new(move |_, _, message| seen.lock().push(message.to_owned())),
+    ));
+    let before = refused();
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    platform.script().push_n("newEvent", 2, Step::Nil);
+    let mut guest = Guest::new(&device);
+    for n in 1..=3 {
+        guest.send(&device, event_create(obj(3, n)));
+    }
+    carried_out_of(&device, &mut guest, 3);
+    logging::clear_hook();
+    assert_eq!(platform.call_log().calls_to("newEvent").len(), 3);
+    assert_eq!(refused() - before, 2);
+    let not_carried_out: Vec<String> = (lines.lock().iter())
+        .filter(|line| line.contains("was not carried out"))
+        .cloned()
+        .collect();
+    assert_eq!(not_carried_out.len(), 1, "{not_carried_out:?}");
+}
+
 /// A `RESOURCE_ID_CHUNK` giving `context` chunk `chunk` of the texture resource ids.
 fn resource_id_chunk(context: u32, chunk: u32) -> Vec<u8> {
     id_grant(RGFX_CMD_RESOURCE_ID_CHUNK, context, chunk)
