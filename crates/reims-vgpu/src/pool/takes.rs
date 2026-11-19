@@ -777,7 +777,8 @@ impl State {
         if !in_piece || claim.range.end <= offset {
             return (zero, None);
         }
-        let claimed = claim.range.start.saturating_sub(offset)..claim.range.end.saturating_sub(offset);
+        let claimed =
+            claim.range.start.saturating_sub(offset)..claim.range.end.saturating_sub(offset);
         let all = total(&zero);
         let rest = cut(zero, claimed);
         let left = total(&rest) < all;
@@ -871,7 +872,10 @@ impl Shared {
             let host = st.host_of(at);
             let carve = st.carves.get(&at).filter(|c| c.serial == serial);
             let written = carve.map_or(job.len, |c| c.written.min(job.len));
-            let zero = carve.map_or_else(|| vec![0..written], |c| c.zero.clone());
+            let zero = carve.map_or_else(
+                || std::iter::once(0..written).collect(),
+                |c| c.zero.clone(),
+            );
             // The bytes the zeroer zeroes now are left to it: the rest first, then its chunk's
             // end (the module doc's "Zeros after a free").
             let (zero, claimed) = st.leave_claimed(at, zero);
@@ -895,7 +899,10 @@ impl Shared {
                     count_kind_by(TAKE_ZEROED_BYTES_CODE, zeroes);
                 }
                 if written > zeroes {
-                    count_kind_by(TAKE_ZERO_PREZEROED_BYTES_CODE, written.saturating_sub(zeroes));
+                    count_kind_by(
+                        TAKE_ZERO_PREZEROED_BYTES_CODE,
+                        written.saturating_sub(zeroes),
+                    );
                 }
                 if written < job.len {
                     let skipped = job.len.saturating_sub(written);
