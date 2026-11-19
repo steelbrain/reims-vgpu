@@ -379,4 +379,21 @@ pub trait BlitEncoder<P: Platform>: Handle {
         source: &P::Buffer,
         runs: &[(u64, Range<u64>)],
     ) -> RaiseResult<bool>;
+    /// No Metal counterpart: hands `buffer`'s exported memory
+    /// ([`GpuDevice::new_exportable_buffer_of_length`], [`Buffer::export_memory`]) to the other
+    /// API that imported it, which reads what the encoder's commands before this call wrote into
+    /// it once the command buffer has completed and the caller waited for it: NVENC reading the
+    /// frame a blit copied into its input. Recorded after the encoder's commands before it; from
+    /// then until the device's next write of the buffer, the caller encodes no read of it. `Ok`
+    /// by default, for a platform whose devices hand such memory over with the command buffer's
+    /// completion alone (the Vulkan platform's); `Err` says why the other API may not read the
+    /// writes, and the caller then commits nothing it encoded.
+    ///
+    /// [`GpuDevice::new_exportable_buffer_of_length`]: super::device::GpuDevice::new_exportable_buffer_of_length
+    /// [`Buffer::export_memory`]: super::resource::Buffer::export_memory
+    #[cfg(unix)]
+    fn release_to_external(&self, buffer: &P::Buffer) -> Result<(), String> {
+        let _ = buffer;
+        Ok(())
+    }
 }

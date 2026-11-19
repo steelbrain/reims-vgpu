@@ -8,11 +8,11 @@
 //!    Windows on its DXGI adapter, over Mesa's VA-on-D3D12 driver (`super::vaapi`). The rt
 //!    platform's is Linux's alone (`super::vaapi::open_on_rt`).
 //!
-//! On the rt platform the arms decode alone: NVENC reads a buffer the GPU copied a frame into,
-//! and VA-API's encoders a surface likewise, which rt's platform does not release to them yet
-//! (`super::nvidia::open`'s `encodes`, `super::vaapi::PlatformRules`). VA-API decodes a reference
-//! picture into a surface of its own there, not into its output's cache
-//! (`super::vaapi::CachedReferences`).
+//! On the rt platform VA-API decodes alone: its encoders read a surface the GPU copied a frame
+//! into, which rt's platform does not release to the driver (`super::vaapi::PlatformRules`), and
+//! it decodes a reference picture into a surface of its own, not into its output's cache
+//! (`super::vaapi::CachedReferences`). NVENC's input is released to CUDA after each frame's copy
+//! (`super::nvidia::encode::fill`).
 
 use std::sync::Arc;
 
@@ -29,8 +29,7 @@ pub(crate) fn graphics_video(
     runtime: Arc<dyn Runtime>,
 ) -> Option<Arc<dyn GraphicsVideo<VulkanPlatform>>> {
     #[cfg(target_os = "linux")]
-    if let Some(video) =
-        super::nvidia::open::<VulkanPlatform>(device, nvidia_gpu(device), &runtime, true)
+    if let Some(video) = super::nvidia::open::<VulkanPlatform>(device, nvidia_gpu(device), &runtime)
     {
         return Some(video);
     }
@@ -69,7 +68,6 @@ pub(crate) fn rt_graphics_video(
         device,
         rt_nvidia_gpu(device),
         &runtime,
-        false,
     ) {
         return Some(video);
     }

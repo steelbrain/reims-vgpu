@@ -15,7 +15,10 @@
 //! - **A frame** is copied from the source's planes, where they lie, in the surface's pages or
 //!   its device caches, by a blit on a queue of the filler's own: each plane's rows of the
 //!   frame's samples, as NVENC's upload copies them, so NVENC encodes the same bytes either way.
-//!   The copy is waited for before NVENC maps the input, as the upload is.
+//!   The blit then hands the input to CUDA (`BlitEncoder::release_to_external`: rt's release of
+//!   its block, nothing on the Vulkan platform), and the copy is waited for before NVENC maps the
+//!   input, as the upload is. Nothing reads the input through the device: the next frame's copy
+//!   writes it anew.
 //! - **Refusals** ([`Filled::Declined`]) come before anything is submitted, and the frame is
 //!   uploaded instead; an input the device or CUDA refuses to make is not tried again in the
 //!   session. A copy that failed once submitted is an error: its input is kept out of
@@ -282,6 +285,9 @@ impl<P: Platform> Filler<P> {
                     return Ok(Some(format!("a copy: {raise}")));
                 }
             }
+        }
+        if let Err(why) = blit.release_to_external(destination) {
+            return Ok(Some(format!("its release to CUDA: {why}")));
         }
         if let Err(raise) = blit.encode(OnFault::Return, BlitCmd::EndEncoding) {
             return Ok(Some(format!("its end: {raise}")));

@@ -102,7 +102,7 @@ fn a_picture_lands_in_an_imported_device_cache_as_it_reads_back() {
         let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let gpu = super::super::video_choice::nvidia_gpu(&device);
-        let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime, true)
+        let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime)
             .expect("NVDEC on the device's GPU");
         lands_in_an_imported_device_cache(&device, &video, &runtime);
     });
@@ -121,21 +121,22 @@ fn a_picture_lands_in_an_imported_rt_cache_as_it_reads_back() {
         let device = platform.system_default_device().expect("an rt device");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let gpu = super::super::video_choice::rt_nvidia_gpu(&device);
-        let video = NvidiaVideo::<RtPlatform>::new(&device, gpu, &runtime, false)
+        let video = NvidiaVideo::<RtPlatform>::new(&device, gpu, &runtime)
             .expect("NVDEC on the device's GPU");
         lands_in_an_imported_device_cache(&device, &video, &runtime);
     });
 }
 
 /// On the rt platform the guest's caps name each codec NVDEC decodes on the GPU, with the
-/// profiles it decodes, and no other, and decodes alone: no NVENC, whose reads of a buffer rt
-/// releases to CUDA in no command buffer yet, and no encoder for VideoToolbox. They say each
-/// picture lands in the device's caches, as every cache on rt is a shape's (`video_caps`), and
-/// the arm imports the device's exportable caches, rt's exported blocks, to write them in.
+/// profiles it decodes, then each NVENC encodes, as on the Vulkan platform (the input released
+/// to CUDA after each frame's copy, `encode::fill`), and no other; VideoToolbox's encoders are
+/// NVENC's. They say each picture lands in the device's caches, as every cache on rt is a
+/// shape's (`video_caps`), and the arm imports the device's exportable caches, rt's exported
+/// blocks, to write them in.
 #[cfg(feature = "rt")]
 #[test]
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
-fn the_rt_platforms_caps_name_only_what_nvdec_decodes() {
+fn the_rt_platforms_caps_name_what_nvdec_decodes_and_nvenc_encodes() {
     use reims_vgpu_graphics::wire::RGFX_VIDEO_CAPS_OUTPUT_CACHED;
     use reims_vgpu_vulkan::RtPlatform;
     let platform = Arc::new(RtPlatform::new());
@@ -143,7 +144,7 @@ fn the_rt_platforms_caps_name_only_what_nvdec_decodes() {
         let device = platform.system_default_device().expect("an rt device");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let gpu = super::super::video_choice::rt_nvidia_gpu(&device);
-        let nvdec = NvidiaVideo::<RtPlatform>::new(&device, gpu, &runtime, false)
+        let nvdec = NvidiaVideo::<RtPlatform>::new(&device, gpu, &runtime)
             .expect("NVDEC on the device's GPU");
         let decodes = |codec, bit_depth| supported(&nvdec.gpu, codec, bit_depth).is_some();
         let mut expected = Vec::new();
@@ -163,6 +164,9 @@ fn the_rt_platforms_caps_name_only_what_nvdec_decodes() {
             expected.push((RGFX_VIDEO_CODEC_HEVC, hevc_profiles));
         }
         assert!(!expected.is_empty(), "NVDEC decodes neither codec");
+        let encodes: Vec<(u32, u32)> = (nvdec.encode.iter())
+            .map(|caps| (caps.codec, caps.profiles))
+            .collect();
         drop(nvdec);
 
         let video = (crate::graphics::rt_graphics_video(&device, Arc::clone(&runtime)))
@@ -172,15 +176,24 @@ fn the_rt_platforms_caps_name_only_what_nvdec_decodes() {
         assert_ne!(caps.flags & RGFX_VIDEO_CAPS_OUTPUT_CACHED, 0);
         assert!(video.imports_device_caches(), "CUDA imports no rt export");
         let named = &caps.codecs[..usize::try_from(caps.codec_count).expect("a count")];
-        assert_eq!(named.len(), expected.len(), "{named:?}");
-        for (caps, (codec, profiles)) in named.iter().zip(&expected) {
+        assert_eq!(named.len(), expected.len() + encodes.len(), "{named:?}");
+        let (decodes, encoded) = named.split_at(expected.len());
+        for (caps, (codec, profiles)) in decodes.iter().zip(&expected) {
             assert_eq!((caps.codec, caps.direction), (*codec, RGFX_VIDEO_DECODE));
             assert_eq!(caps.profiles & profiles, *profiles, "codec {codec:#x}");
             if *codec == RGFX_VIDEO_CODEC_HEVC {
                 assert_eq!(caps.profiles, *profiles, "HEVC's profiles");
             }
         }
-        assert!(video.guest_encoders().is_empty());
+        for (caps, (codec, profiles)) in encoded.iter().zip(&encodes) {
+            assert_eq!((caps.codec, caps.direction), (*codec, RGFX_VIDEO_ENCODE));
+            assert_eq!(caps.profiles, *profiles, "codec {codec:#x}");
+        }
+        assert_eq!(
+            video.guest_encoders().len(),
+            encodes.len(),
+            "VideoToolbox's encoders"
+        );
         assert!(video.guest_decodes());
     });
 }
@@ -355,7 +368,7 @@ fn an_encode_first_processs_waits_run_on_the_arms_runtime() {
             });
             let runtime: Arc<dyn Runtime> = Arc::<Naming>::clone(&naming);
             let gpu = super::super::video_choice::nvidia_gpu(&device);
-            let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime, true)
+            let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime)
                 .expect("NVDEC on the device's GPU");
             let params = params(EncodeProfile::H264High, 1920, 1080);
             let mut encoder =
@@ -521,7 +534,7 @@ fn a_videotoolbox_picture_lands_in_the_lent_surfaces_pages_as_it_reads_back() {
         let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let gpu = super::super::video_choice::nvidia_gpu(&device);
-        let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime, true);
+        let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime);
         let video = Arc::new(video.expect("NVDEC on the device's GPU"));
         let shared = Shared(Arc::clone(&video));
         assert!(shared.guest_decodes());

@@ -606,171 +606,199 @@ struct Layout {
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
 fn each_frame_filled_by_the_gpu_encodes_as_uploaded() {
     use reims_vgpu_vulkan::VulkanPlatform;
-    use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
-    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
 
     let platform = Arc::new(VulkanPlatform::new());
     crate::entry::run(|_| {
         let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let gpu = crate::graphics::video_choice::nvidia_gpu(&device);
-        let video = super::super::NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime, true)
+        let video = super::super::NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime)
             .expect("NVENC on the GPU");
         assert!(video.imports.is_some(), "CUDA imports no exportable buffer");
-        let queue = device.new_command_queue().expect("a command queue");
-        let (width, height) = (1920u32, 1080u32);
-        let layouts = [
-            Layout {
-                what: "pages at one pitch",
-                cached: false,
-                planes: [(0x20, 2048), (0x20 + 2048 * 1080, 2048)],
-            },
-            Layout {
-                what: "a device cache at two pitches",
-                cached: true,
-                planes: [(0, 1984), (1984 * 1080, 2112)],
-            },
-        ];
-        for (codec, profile) in [
-            (RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_H264_HIGH),
-            (RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_HEVC_MAIN),
-        ] {
-            let entry = (video.encode.iter())
-                .find(|e| e.codec == codec)
-                .expect("an encode entry");
-            let caps = encode_caps(entry, &video.encoders);
-            let s = settings(codec, profile, width, height);
-            for layout in &layouts {
-                let what = format!("codec {codec} profile {profile:#x}, {}", layout.what);
-                let [_, (chroma_at, chroma_pitch)] = layout.planes;
-                let len = (chroma_at + chroma_pitch * height as usize / 2) as u64;
-                let buffer = |len, options| {
-                    (device.new_buffer_of_length(OnFault::Return, len, options))
-                        .expect("no raise")
-                        .expect("a buffer")
+        frames_filled_by_the_gpu_encode_as_uploaded(&device, &video);
+    });
+}
+
+/// [`each_frame_filled_by_the_gpu_encodes_as_uploaded`] on the rt platform: its input is a
+/// buffer of rt's exported block, which each frame's blit releases to CUDA after its copies
+/// (`fill`'s module doc).
+#[cfg(feature = "rt")]
+#[test]
+#[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
+fn each_frame_filled_by_the_gpu_encodes_as_uploaded_on_rt() {
+    use reims_vgpu_vulkan::RtPlatform;
+
+    let platform = Arc::new(RtPlatform::new());
+    crate::entry::run(|_| {
+        let device = platform.system_default_device().expect("an rt device");
+        let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
+        let gpu = crate::graphics::video_choice::rt_nvidia_gpu(&device);
+        let video = super::super::NvidiaVideo::<RtPlatform>::new(&device, gpu, &runtime)
+            .expect("NVENC on the GPU");
+        assert!(video.imports.is_some(), "CUDA imports no rt export");
+        frames_filled_by_the_gpu_encode_as_uploaded(&device, &video);
+    });
+}
+
+/// The body of the fill tests, on `P`'s `device`, NVENC's arm on it `video`.
+fn frames_filled_by_the_gpu_encode_as_uploaded<P: Platform>(
+    device: &P::Device,
+    video: &super::super::NvidiaVideo<P>,
+) {
+    use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
+    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
+
+    let queue = device.new_command_queue().expect("a command queue");
+    let (width, height) = (1920u32, 1080u32);
+    let layouts = [
+        Layout {
+            what: "pages at one pitch",
+            cached: false,
+            planes: [(0x20, 2048), (0x20 + 2048 * 1080, 2048)],
+        },
+        Layout {
+            what: "a device cache at two pitches",
+            cached: true,
+            planes: [(0, 1984), (1984 * 1080, 2112)],
+        },
+    ];
+    for (codec, profile) in [
+        (RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_H264_HIGH),
+        (RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_HEVC_MAIN),
+    ] {
+        let entry = (video.encode.iter())
+            .find(|e| e.codec == codec)
+            .expect("an encode entry");
+        let caps = encode_caps(entry, &video.encoders);
+        let s = settings(codec, profile, width, height);
+        for layout in &layouts {
+            let what = format!("codec {codec} profile {profile:#x}, {}", layout.what);
+            let [_, (chroma_at, chroma_pitch)] = layout.planes;
+            let len = (chroma_at + chroma_pitch * height as usize / 2) as u64;
+            let buffer = |len, options| {
+                (device.new_buffer_of_length(OnFault::Return, len, options))
+                    .expect("no raise")
+                    .expect("a buffer")
+            };
+            let staging = buffer(len, SHARED);
+            let cache = buffer(len, super::super::STORAGE_PRIVATE);
+            let source = if layout.cached { &cache } else { &staging };
+            let (bitstream, result) = (buffer(4 << 20, SHARED), buffer(64, SHARED));
+            let plane = |(offset, pitch): (usize, usize), rows| VideoPlane {
+                buffer: source,
+                offset: offset as u64,
+                bytes_per_row: pitch as u64,
+                row_bytes: u64::from(width),
+                width: u64::from(width),
+                height: rows,
+                cached: layout.cached,
+                pages: None,
+                cache: None,
+                rows_room: None,
+            };
+            let mut streams = Vec::new();
+            for filled in [false, true] {
+                let filler = if filled {
+                    Ok(Filler::new(device, &video.gpu, &video.runtime))
+                } else {
+                    Err("uploaded by the test".to_owned())
                 };
-                let staging = buffer(len, SHARED);
-                let cache = buffer(len, super::super::STORAGE_PRIVATE);
-                let source = if layout.cached { &cache } else { &staging };
-                let (bitstream, result) = (buffer(4 << 20, SHARED), buffer(64, SHARED));
-                let plane = |(offset, pitch): (usize, usize), rows| VideoPlane {
-                    buffer: source,
-                    offset: offset as u64,
-                    bytes_per_row: pitch as u64,
-                    row_bytes: u64::from(width),
-                    width: u64::from(width),
-                    height: rows,
-                    cached: layout.cached,
-                    pages: None,
-                    cache: None,
-                    rows_room: None,
+                let encoder = NvencHostEncoder::<P>::new(
+                    &video.gpu,
+                    codec,
+                    &video.encoders,
+                    entry,
+                    &caps,
+                    filler,
+                );
+                let fills = Arc::clone(&encoder.fills);
+                let session = HostEncodeSession::new(device, codec, "NVENC", Box::new(encoder))
+                    .expect("a session");
+                let event = match session.event() {
+                    EventRef::Shared(event) => event,
+                    EventRef::Event(_) => panic!("a plain event"),
                 };
-                let mut streams = Vec::new();
-                for filled in [false, true] {
-                    let filler = if filled {
-                        Ok(Filler::new(&device, &video.gpu, &video.runtime))
-                    } else {
-                        Err("uploaded by the test".to_owned())
-                    };
-                    let encoder = NvencHostEncoder::<VulkanPlatform>::new(
-                        &video.gpu,
-                        codec,
-                        &video.encoders,
-                        entry,
-                        &caps,
-                        filler,
-                    );
-                    let fills = Arc::clone(&encoder.fills);
-                    let session =
-                        HostEncodeSession::new(&device, codec, "NVENC", Box::new(encoder))
-                            .expect("a session");
-                    let event = match session.event() {
-                        EventRef::Shared(event) => event,
-                        EventRef::Event(_) => panic!("a plain event"),
-                    };
-                    let mut units = Vec::new();
-                    for n in 0..12u64 {
-                        write_planes::<VulkanPlatform>(&staging, &s, layout.planes, n as usize);
-                        if layout.cached {
-                            let cb = (queue.command_buffer(OnFault::Return))
-                                .expect("no raise")
-                                .expect("a command buffer");
-                            let blit = (cb.blit_encoder(OnFault::Return))
-                                .expect("no raise")
-                                .expect("a blit encoder");
-                            let copy = BlitCmd::CopyBufferToBuffer {
-                                source_buffer: Some(&staging),
-                                source_offset: 0,
-                                destination_buffer: Some(&cache),
-                                destination_offset: 0,
-                                size: len,
-                            };
-                            blit.encode(OnFault::Return, copy).expect("the copy");
-                            (blit.encode(OnFault::Return, BlitCmd::EndEncoding)).expect("its end");
-                            cb.commit(OnFault::Return).expect("its commit");
-                            (cb.wait_until_completed(OnFault::Return)).expect("its wait");
-                            assert_eq!(cb.status(), CommandBufferStatus::COMPLETED);
-                        }
-                        let encode = VideoEncode {
-                            luma: plane(layout.planes[0], u64::from(height)),
-                            chroma: plane(layout.planes[1], u64::from(height / 2)),
-                            bitstream: &bitstream,
-                            bitstream_offset: 0,
-                            bitstream_capacity: 4 << 20,
-                            result: &result,
-                            result_offset: 0,
-                            frame_index: n,
-                            force_keyframe: n == 6,
-                            settings: (n == 0).then_some(s),
+                let mut units = Vec::new();
+                for n in 0..12u64 {
+                    write_planes::<P>(&staging, &s, layout.planes, n as usize);
+                    if layout.cached {
+                        let cb = (queue.command_buffer(OnFault::Return))
+                            .expect("no raise")
+                            .expect("a command buffer");
+                        let blit = (cb.blit_encoder(OnFault::Return))
+                            .expect("no raise")
+                            .expect("a blit encoder");
+                        let copy = BlitCmd::CopyBufferToBuffer {
+                            source_buffer: Some(&staging),
+                            source_offset: 0,
+                            destination_buffer: Some(&cache),
+                            destination_offset: 0,
+                            size: len,
                         };
-                        let value = session
-                            .encode(&encode)
-                            .expect("an encode the session takes");
-                        assert!(
-                            event.wait_until_signaled_value(value, 10_000),
-                            "{what} frame {n}"
-                        );
-                        // SAFETY: the Shared buffers hold their bytes, which the session wrote
-                        // before its signal and writes no more until the next encode.
-                        let (result_bytes, au) = unsafe {
-                            (
-                                std::slice::from_raw_parts(result.contents().as_ptr::<u8>(), 32),
-                                std::slice::from_raw_parts(
-                                    bitstream.contents().as_ptr::<u8>(),
-                                    4 << 20,
-                                ),
-                            )
-                        };
-                        let r =
-                            RgfxVideoEncodeResult::read_from_bytes(result_bytes).expect("a result");
-                        assert_eq!(r.status, RGFX_VIDEO_ENCODE_OK, "{what} frame {n}: {r:?}");
-                        units.push(au[..r.bitstream_size as usize].to_vec());
+                        blit.encode(OnFault::Return, copy).expect("the copy");
+                        (blit.encode(OnFault::Return, BlitCmd::EndEncoding)).expect("its end");
+                        cb.commit(OnFault::Return).expect("its commit");
+                        (cb.wait_until_completed(OnFault::Return)).expect("its wait");
+                        assert_eq!(cb.status(), CommandBufferStatus::COMPLETED);
                     }
-                    drop(session);
-                    let fills = fills.lock();
-                    let count = fills.filler.as_ref().map(Filler::filled);
-                    if filled {
-                        assert_eq!(count, Ok(12), "{what}: frames the GPU filled");
-                    }
-                    streams.push(units);
-                }
-                let [uploaded, filled] = [&streams[0], &streams[1]];
-                for (n, (up, gpu)) in uploaded.iter().zip(filled).enumerate() {
-                    let first = up.iter().zip(gpu.iter()).position(|(a, b)| a != b);
+                    let encode = VideoEncode {
+                        luma: plane(layout.planes[0], u64::from(height)),
+                        chroma: plane(layout.planes[1], u64::from(height / 2)),
+                        bitstream: &bitstream,
+                        bitstream_offset: 0,
+                        bitstream_capacity: 4 << 20,
+                        result: &result,
+                        result_offset: 0,
+                        frame_index: n,
+                        force_keyframe: n == 6,
+                        settings: (n == 0).then_some(s),
+                    };
+                    let value = session
+                        .encode(&encode)
+                        .expect("an encode the session takes");
                     assert!(
-                        up == gpu,
-                        "{what} frame {n}: {} bytes uploaded, {} filled, first differing at {first:?}",
-                        up.len(),
-                        gpu.len()
+                        event.wait_until_signaled_value(value, 10_000),
+                        "{what} frame {n}"
                     );
+                    // SAFETY: the Shared buffers hold their bytes, which the session wrote
+                    // before its signal and writes no more until the next encode.
+                    let (result_bytes, au) = unsafe {
+                        (
+                            std::slice::from_raw_parts(result.contents().as_ptr::<u8>(), 32),
+                            std::slice::from_raw_parts(
+                                bitstream.contents().as_ptr::<u8>(),
+                                4 << 20,
+                            ),
+                        )
+                    };
+                    let r = RgfxVideoEncodeResult::read_from_bytes(result_bytes).expect("a result");
+                    assert_eq!(r.status, RGFX_VIDEO_ENCODE_OK, "{what} frame {n}: {r:?}");
+                    units.push(au[..r.bitstream_size as usize].to_vec());
                 }
-                eprintln!(
-                    "{what}: {} access units equal, {} bytes",
-                    filled.len(),
-                    filled.iter().map(Vec::len).sum::<usize>()
+                drop(session);
+                let fills = fills.lock();
+                let count = fills.filler.as_ref().map(Filler::filled);
+                if filled {
+                    assert_eq!(count, Ok(12), "{what}: frames the GPU filled");
+                }
+                streams.push(units);
+            }
+            let [uploaded, filled] = [&streams[0], &streams[1]];
+            for (n, (up, gpu)) in uploaded.iter().zip(filled).enumerate() {
+                let first = up.iter().zip(gpu.iter()).position(|(a, b)| a != b);
+                assert!(
+                    up == gpu,
+                    "{what} frame {n}: {} bytes uploaded, {} filled, first differing at {first:?}",
+                    up.len(),
+                    gpu.len()
                 );
             }
+            eprintln!(
+                "{what}: {} access units equal, {} bytes",
+                filled.len(),
+                filled.iter().map(Vec::len).sum::<usize>()
+            );
         }
-    });
+    }
 }

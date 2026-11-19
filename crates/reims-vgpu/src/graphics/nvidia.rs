@@ -7,9 +7,8 @@
 //!   device is NVIDIA's and CUDA opens the GPU there. Anywhere else the arm declines, with one
 //!   line at info, and the device's video goes to the next arm (`super::video_choice`). One video
 //!   a platform device, shared by its sessions while one lives. The arm is the same on either
-//!   platform (`VulkanPlatform`'s, and under the `rt` feature `RtPlatform`'s), but for NVENC,
-//!   which a platform takes only where it releases a buffer to CUDA before NVENC reads it
-//!   ([`open`]'s `encodes`).
+//!   platform (`VulkanPlatform`'s, and under the `rt` feature `RtPlatform`'s): NVENC's input is
+//!   handed to CUDA by the platform's release after each frame's copy (`encode::fill`).
 //! - **The decode caps** are NVDEC's own answers (`cuvidGetDecoderCaps`): H.264's Baseline, Main and
 //!   High where NVDEC decodes H.264 at 8 bits, and HEVC's Main where it decodes HEVC at 8 bits
 //!   and Main 10 where it does at 10, each into its format (NV12, P010), at the least of their
@@ -143,15 +142,13 @@ pub(crate) struct NvidiaGpu {
 
 /// NVDEC's video for `device`'s sessions, whose GPU is `gpu`: the one they share, made on first
 /// use, the NVIDIA crate's threads and waits `runtime`'s, every session kind's, unless a video
-/// opened before handed it another; NVENC's encodes with it where `encodes`, which a platform
-/// asks only where its buffers' GPU copies reach what CUDA reads of them (`encode`'s module doc).
-/// `None`, with a line at info, where the device is not an NVIDIA GPU CUDA opens, or NVDEC
-/// decodes and NVENC encodes neither H.264 nor HEVC there (decodes alone where not `encodes`).
+/// opened before handed it another; NVENC's encodes with it. `None`, with a line at info, where
+/// the device is not an NVIDIA GPU CUDA opens, or NVDEC decodes and NVENC encodes neither H.264
+/// nor HEVC there.
 pub(crate) fn open<P: Platform>(
     device: &P::Device,
     gpu: NvidiaGpu,
     runtime: &Arc<dyn Runtime>,
-    encodes: bool,
 ) -> Option<Arc<dyn GraphicsVideo<P>>> {
     static MADE: LazyLock<Mutex<MadeVideos>> = LazyLock::new(|| Mutex::new(Vec::new()));
     let mut made = MADE.lock();
@@ -162,7 +159,7 @@ pub(crate) fn open<P: Platform>(
     let video = match kept {
         Some(video) => video,
         None => {
-            let video = Arc::new(NvidiaVideo::<P>::new(device, gpu, runtime, encodes)?);
+            let video = Arc::new(NvidiaVideo::<P>::new(device, gpu, runtime)?);
             let any: Arc<dyn Any + Send + Sync> = Arc::<NvidiaVideo<P>>::clone(&video);
             made.push((gpu.registry_id, Arc::downgrade(&any)));
             video
@@ -195,12 +192,7 @@ struct NvidiaVideo<P: Platform> {
 }
 
 impl<P: Platform> NvidiaVideo<P> {
-    fn new(
-        device: &P::Device,
-        facts: NvidiaGpu,
-        runtime: &Arc<dyn Runtime>,
-        encodes: bool,
-    ) -> Option<Self> {
+    fn new(device: &P::Device, facts: NvidiaGpu, runtime: &Arc<dyn Runtime>) -> Option<Self> {
         if facts.vendor_id != NVIDIA_VENDOR {
             log::info!(
                 "hardware video: not on {NAME}: the GPU ({:#06x}) is not NVIDIA's",
@@ -268,13 +260,6 @@ impl<P: Platform> NvidiaVideo<P> {
             })
         };
         let encoders = match encode_profiles(Arc::clone(&gpu)) {
-            Ok(_) if !encodes => {
-                log::info!(
-                    "hardware video: no {ENCODE_NAME} at {address}: the platform releases no \
-                     buffer to CUDA before NVENC reads it"
-                );
-                Vec::new()
-            }
             Ok(encoders) => encoders,
             Err(error) => {
                 log::info!("hardware video: no {ENCODE_NAME} at {address}: {error}");

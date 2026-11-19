@@ -28,6 +28,13 @@
 //! and writes every other one there by its video processing (reims-vgpu's `graphics::vaapi`), so
 //! that no decode reads a reference from the block.
 //!
+//! **The release.** An opaque fd's buffer that the device writes for CUDA to read, NVENC's input
+//! (reims-vgpu's `graphics::nvidia::encode::fill`), is handed over by rt's
+//! `BlitCommandEncoder::release_to_external` (`BlitEncoder::release_to_external`), recorded after
+//! the blit's copies into it, before CUDA reads it once the command buffer completed. No acquire
+//! comes back: nothing reads the buffer through the device before its next copy, which writes it
+//! anew (rt's contract).
+//!
 //! **Refusals.** Where rt makes no exported block (a device that exports no opaque fd, a dma-buf
 //! without the foreign queue family, a limit) or no buffer in it, the call answers `None` and the
 //! caller makes the buffer as any other: counted ([`EXPORT_REFUSED_CODE`]), the process's first

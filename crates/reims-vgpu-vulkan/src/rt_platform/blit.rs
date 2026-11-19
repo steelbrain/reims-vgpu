@@ -469,6 +469,17 @@ impl BlitEncoder<RtPlatform> for RtObj<RtBlitEncoder> {
         let _ = (on, source, runs);
         Ok(false)
     }
+
+    /// rt's release of the exported buffer's block to the other API's queue family
+    /// (`BlitCommandEncoder::release_to_external`, `super::export`, "The release"): one barrier
+    /// in the command buffer, after the encoder's commands before it. `Err` after `endEncoding`,
+    /// and where rt refuses it: a buffer not made exportable, or another device's.
+    #[cfg(unix)]
+    fn release_to_external(&self, buffer: &<RtPlatform as Platform>::Buffer) -> Result<(), String> {
+        let mut open = self.rt.lock();
+        let encoder = open.as_mut().ok_or("the encoder has ended")?;
+        (encoder.release_to_external(buffer.rt())).map_err(|error| format!("rt's release: {error}"))
+    }
 }
 
 #[cfg(test)]
