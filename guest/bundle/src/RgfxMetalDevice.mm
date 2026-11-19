@@ -333,7 +333,7 @@ bool rgfxRegionReclaim(void *context)
 // The slabs' reuse counts (RgfxSlabs, CHURN), one line a process at most every
 // RgfxSlabs::kChurnLogMs once they changed: what the slabs' sources would serve with no empty or
 // cached slab kept.
-static void rgfxLogSlabChurn(void *, const RgfxSlabs::Churn &c)
+static void rgfxLogSlabChurn(void *pool, const RgfxSlabs::Churn &c)
 {
 	// The wall clock, so a run places each line in its own steps.
 	struct timespec now = {};
@@ -345,6 +345,16 @@ static void rgfxLogSlabChurn(void *, const RgfxSlabs::Churn &c)
 	       static_cast<long long>(now.tv_sec), now.tv_nsec / 1000000, c.classMade,
 	       c.classMadeBytes >> 10, c.emptied, c.refilled, c.refilledBytes >> 10,
 	       c.emptyLetGo, c.dedicatedMade, c.dedicatedReused, c.dedicatedReusedBytes >> 10);
+	// The Shared pool's takes, where its blocks are the slabs (`pool`, the RgfxPoolSlabSource):
+	// how long the threads that made the slabs waited for the host.
+	if (pool == nullptr)
+		return;
+	const RgfxPoolSlabSource::Takes t = static_cast<RgfxPoolSlabSource *>(pool)->takes();
+	os_log(rgfxLog(),
+	       "RGFX pool takes at %lld.%03ld s: %llu taken (%llu KiB), %llu refused, %llu us waited, "
+	       "longest %llu us; %llu given back",
+	       static_cast<long long>(now.tv_sec), now.tv_nsec / 1000000, t.taken, t.takenBytes >> 10,
+	       t.refused, t.waitUs, t.longestUs, t.given);
 }
 
 // The kext's chunks of texture resource ids, as RgfxIdSpace's chunk source; `context` is the
@@ -578,6 +588,36 @@ int rgfxPlainPages(void *, uint64_t size, uint8_t **bytes)
 void rgfxUnmapPages(void *, uint8_t *bytes, uint64_t size)
 {
 	mach_vm_deallocate(mach_task_self(), reinterpret_cast<mach_vm_address_t>(bytes), size);
+}
+
+// The pool source's memory (RgfxPoolMemory): a block of the Shared pool the kext maps into the
+// process once the host answers its take, and its give; `context` is the kext link
+// (rgfxKextConn, whose held destroys, a slab's heap's among them, go before the give).
+int rgfxKextPoolTake(void *context, uint64_t size, uint8_t **bytes, uint64_t *offset)
+{
+	io_connect_t conn = rgfxKextConn(context);
+	uint64_t out[3] = {};
+	uint32_t outCount = 3;
+	const kern_return_t kr =
+	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodPoolTake, &size, 1, out, &outCount);
+	if (kr != KERN_SUCCESS)
+		return kr;
+	if (outCount != 3 || out[0] == 0)
+		return KERN_FAILURE;
+	if (out[2] != size) {
+		// Not the block asked for (the kext answers the take's length): back at once.
+		IOConnectCallScalarMethod(conn, kRgfxAccelMethodPoolGive, &out[1], 1, nullptr, nullptr);
+		return KERN_FAILURE;
+	}
+	*bytes = reinterpret_cast<uint8_t *>(out[0]);
+	*offset = out[1];
+	return KERN_SUCCESS;
+}
+
+void rgfxKextPoolGive(void *context, uint64_t offset)
+{
+	io_connect_t conn = rgfxKextConn(context);
+	IOConnectCallScalarMethod(conn, kRgfxAccelMethodPoolGive, &offset, 1, nullptr, nullptr);
 }
 
 void rgfxKextSurfaceRelease(void *context, uint64_t offset)
@@ -861,9 +901,11 @@ id rgfxTargetDeviceArchitecture()
 	volatile uint32_t *_doorbellPage;
 	std::atomic<bool> _metalAssertions; // setMetalAssertionsEnabled:'s, read back
 	RgfxStateCache *_stateCache; // samplers and depth/stencil states; nil until the handshake
-	// The slabs Shared and Managed buffers lie in, and their sources: the region's, and the
-	// process's own pages before it where the host maps them; null until then.
+	// The slabs Shared and Managed buffers lie in, and their sources: the region's, and before
+	// it the Shared pool's where the device has one, else the process's own pages where the host
+	// maps them; null until then.
 	std::unique_ptr<RgfxRegionSlabSource> _slabSource;
+	std::unique_ptr<RgfxPoolSlabSource> _poolSource;
 	std::unique_ptr<RgfxPagesSlabSource> _pagesSource;
 	std::unique_ptr<RgfxSlabs> _slabs;
 	// Shared events across processes: the sharer's link, and the queue whose completion ring
@@ -1124,11 +1166,22 @@ RGFX_LOG_UNRECOGNIZED
 	                                                     managedOverCopy);
 	_slabSource->setZeroedBlocks((_caps.kextFeatures() & kRgfxKextFeatureZeroedBlocks) != 0);
 	_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
-	// The slabs whose buffers lie in heaps, and large Shared buffers, are the kext's chunks, or
-	// the process's own plain pages, wired into pages blocks the host makes heaps or buffers over,
+	// The slabs whose buffers lie in heaps, and large Shared buffers, are blocks of the Shared
+	// pool, where the device has one and the kext maps its blocks; else the kext's chunks, or the
+	// process's own plain pages, wired into pages blocks the host makes heaps or buffers over,
 	// where the region has a pages block source (above) and the device took HEAP_OVER_PAGES; else
 	// the region's.
-	if (_region->hasPagesBlocks() && (_caps.features() & RGFX_FEATURE_HEAP_OVER_PAGES) != 0) {
+	if ((_caps.kextFeatures() & kRgfxKextFeaturePool) != 0 &&
+	    (_caps.features() & RGFX_FEATURE_POOL) != 0) {
+		RgfxPoolMemory memory;
+		memory.context = connContext;
+		memory.take = &rgfxKextPoolTake;
+		memory.give = &rgfxKextPoolGive;
+		_poolSource = std::make_unique<RgfxPoolSlabSource>(*_region, *_serializer, memory,
+		                                                   managedAtOffset, managedOverCopy);
+		_slabs->setFirst(_poolSource.get());
+	} else if (_region->hasPagesBlocks() &&
+	           (_caps.features() & RGFX_FEATURE_HEAP_OVER_PAGES) != 0) {
 		RgfxPagesMemory memory;
 		memory.pages = &rgfxPlainPages;
 		memory.unmap = &rgfxUnmapPages;
@@ -1137,7 +1190,7 @@ RGFX_LOG_UNRECOGNIZED
 		    managedAtOffset, managedOverCopy);
 		_slabs->setFirst(_pagesSource.get());
 	}
-	_slabs->setChurnLog(&rgfxLogSlabChurn, nullptr);
+	_slabs->setChurnLog(&rgfxLogSlabChurn, _poolSource.get());
 	if (!_slabs->start())
 		os_log_error(rgfxLog(),
 		             "RGFX: no slab thread; creates zero and frees let slabs go themselves");

@@ -285,6 +285,97 @@ bool RgfxPagesSlabSource::makeBuffer(const Memory &memory, const Heap &heap, uin
 	return true;
 }
 
+// --- the Shared pool's blocks ----------------------------------------------------------------
+
+static_assert(RgfxPoolSlabSource::kUnit == RGFX_POOL_BLOCK_ALIGN, "a pool slab is whole blocks");
+static_assert(RgfxPoolSlabSource::kTakeMax == RGFX_POOL_TAKE_MAX, "the longest take");
+
+RgfxPoolSlabSource::RgfxPoolSlabSource(RgfxRegion &region, RgfxSerializer &serializer,
+                                       const RgfxPoolMemory &memory, bool managedAtOffset,
+                                       bool managedOverCopy)
+    : RgfxRegionSlabSource(region, serializer, managedAtOffset, managedOverCopy), m_memory(memory)
+{
+}
+
+bool RgfxPoolSlabSource::serves(uint32_t options, uint64_t size, bool dedicated) const
+{
+	// A heaped class's slab, or a buffer's own, in one block: a class's up to slabMax().
+	if (!heaped(options) || size == 0 || size % kUnit != 0 || size > kTakeMax)
+		return false;
+	return dedicated || size <= kSlabMax;
+}
+
+bool RgfxPoolSlabSource::heapedSlab(uint64_t size, uint32_t options, bool dedicated) const
+{
+	// Every slab is a heap over its block, a large buffer's own included.
+	return heaped(options);
+}
+
+bool RgfxPoolSlabSource::take(uint64_t size, bool heap, Memory *out)
+{
+	if (m_memory.take == nullptr || size == 0 || size % kUnit != 0 || size > kTakeMax)
+		return false;
+	uint8_t *bytes = nullptr;
+	uint64_t offset = 0;
+	const auto from = std::chrono::steady_clock::now();
+	const int kr = m_memory.take(m_memory.context, size, &bytes, &offset);
+	const uint64_t us = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+	                                                          from)
+	        .count());
+	m_waitUs.fetch_add(us, std::memory_order_relaxed);
+	uint64_t longest = m_longestUs.load(std::memory_order_relaxed);
+	while (us > longest &&
+	       !m_longestUs.compare_exchange_weak(longest, us, std::memory_order_relaxed)) {
+	}
+	if (kr != KERN_SUCCESS || bytes == nullptr) {
+		m_refused.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	m_taken.fetch_add(1, std::memory_order_relaxed);
+	m_takenBytes.fetch_add(size, std::memory_order_relaxed);
+	out->bytes = bytes;
+	out->size = size;
+	out->regionOffset = offset; // its offset in the pool, which HEAP_OVER_POOL names
+	out->zeroed = true;         // the host zeroes a block as it gives it
+	return true;
+}
+
+void RgfxPoolSlabSource::give(const Memory &memory)
+{
+	// After the heap's destroy, which every call into the kext follows (rgfxKextConn): the host
+	// refuses the give of a block a heap still lies over.
+	if (m_memory.give == nullptr)
+		return;
+	m_memory.give(m_memory.context, memory.regionOffset);
+	m_given.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool RgfxPoolSlabSource::makeHeap(const Memory &memory, uint32_t options, Heap *out)
+{
+	// As a region slab's: Shared, of the class's cache mode and hazard tracking.
+	RgfxCreated created = m_serializer.createHeapOverPool(memory.size, options & ~kStorageMask,
+	                                                      kHeapTypePlacement,
+	                                                      memory.regionOffset);
+	if (created.obj_id == 0 || m_serializer.refused(created))
+		return false; // no address left, or the device never got it
+	out->objId = created.obj_id;
+	out->gpuAddress = created.gpu_address;
+	return true;
+}
+
+RgfxPoolSlabSource::Takes RgfxPoolSlabSource::takes() const
+{
+	Takes t;
+	t.taken = m_taken.load(std::memory_order_relaxed);
+	t.takenBytes = m_takenBytes.load(std::memory_order_relaxed);
+	t.refused = m_refused.load(std::memory_order_relaxed);
+	t.waitUs = m_waitUs.load(std::memory_order_relaxed);
+	t.longestUs = m_longestUs.load(std::memory_order_relaxed);
+	t.given = m_given.load(std::memory_order_relaxed);
+	return t;
+}
+
 // --- runs ----------------------------------------------------------------------------------
 
 void RgfxSlabs::Runs::add(uint64_t at, uint64_t length)
@@ -695,7 +786,10 @@ void RgfxSlabs::giveBack(const Range &range)
 		slab->dirty.add(range.offset, range.size);
 		slab->used -= range.size;
 		m_dirtySlabs.insert(slab);
-		if (slab->dedicated) {
+		if (slab->dedicated && !slab->source->keepsFreed()) {
+			// Its source's slabs are not kept: it goes with its buffer.
+			doom(slab);
+		} else if (slab->dedicated) {
 			// Cached for a later buffer, the oldest of its source's let go past a sixteenth of the
 			// source.
 			slab->idleSince = nowMs();
@@ -713,7 +807,8 @@ void RgfxSlabs::giveBack(const Range &range)
 				m_churn.emptied++;
 				churned();
 			}
-			if (slab->used == 0 && ++cls.empty > kEmptyKept) {
+			// Counted empty first: doom() counts it out again.
+			if (slab->used == 0 && (++cls.empty > kEmptyKept || !slab->source->keepsFreed())) {
 				doom(slab);
 			} else if (slab->used == 0) {
 				// Kept for kCacheIdleMs, then let go where nothing took from it meanwhile.

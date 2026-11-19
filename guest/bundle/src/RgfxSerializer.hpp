@@ -434,6 +434,11 @@ public:
 	                                uint64_t block_offset, uint64_t block_size,
 	                                uint64_t align = kDefaultAddressAlign);
 
+	/// A Shared heap over `size_bytes` of the Shared pool's block the process holds at
+	/// `pool_offset` (HEAP_OVER_POOL, where the device took RGFX_FEATURE_POOL).
+	RgfxCreated createHeapOverPool(uint64_t size_bytes, uint32_t options, int32_t heap_type,
+	                               uint64_t pool_offset, uint64_t align = kDefaultAddressAlign);
+
 	// --- buffers --------------------------------------------------------------
 
 	/// A device buffer of `length` bytes at a picked GPU address.

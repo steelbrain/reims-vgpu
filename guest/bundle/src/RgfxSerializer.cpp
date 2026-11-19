@@ -304,6 +304,29 @@ RgfxCreated RgfxSerializer::createHeapOverPages(uint64_t size_bytes, uint32_t op
 	return out;
 }
 
+RgfxCreated RgfxSerializer::createHeapOverPool(uint64_t size_bytes, uint32_t options,
+                                               int32_t heap_type, uint64_t pool_offset,
+                                               uint64_t align)
+{
+	RgfxCreated out = {};
+	// No address left for it: no object, as for a heap over host memory.
+	out.gpu_address = m_ids.allocAddress(size_bytes, align);
+	if (out.gpu_address == 0)
+		return out;
+	out.obj_id = m_ids.allocObjId();
+
+	// HEAP_OVER_HOST_MEMORY's message, its region_offset the block's offset in the pool.
+	RgfxHeapOverHostMemory msg = {};
+	msg.obj_id = out.obj_id;
+	msg.gpu_address = out.gpu_address;
+	msg.region_offset = pool_offset;
+	msg.size_bytes = size_bytes;
+	msg.options = RgfxHostResourceOptions(options);
+	msg.heap_type = heap_type;
+	out.posted = m_control.tryPost(RGFX_CMD_HEAP_OVER_POOL, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
 RgfxCreated RgfxSerializer::createBuffer(uint64_t length, uint32_t options, uint64_t align)
 {
 	RgfxCreated out = {};

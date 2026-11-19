@@ -1579,6 +1579,220 @@ void test_managed_buffers_over_shared_copies()
 	}
 }
 
+// The kext's blocks of the device's Shared pool for the pool source: first fit in 64 KiB blocks
+// of a pool of `size` bytes whose first block another process holds, each block `fill` (0, as the
+// host zeroes it) as it comes. Each take and give is logged, and a give first logs the destroys
+// on the ring then, which the slab's let-go posted before it.
+struct PoolKext {
+	RgfxHeapRanges free;
+	std::map<uint64_t, std::vector<uint8_t>> blocks; // by offset in the pool
+	std::vector<std::string> *log;
+	TestRing *ring;
+	bool refuse = false;
+	uint8_t fill = 0;
+
+	PoolKext(uint64_t size, std::vector<std::string> *events, TestRing *posted)
+	    : free(size), log(events), ring(posted)
+	{
+		uint64_t held = 0;
+		free.take(RgfxPoolSlabSource::kUnit, RgfxPoolSlabSource::kUnit, &held);
+	}
+	static int take(void *context, uint64_t size, uint8_t **bytes, uint64_t *offset)
+	{
+		PoolKext *k = static_cast<PoolKext *>(context);
+		const std::string what = "take " + std::to_string(size);
+		if (k->refuse || !k->free.take(size, RgfxPoolSlabSource::kUnit, offset)) {
+			k->log->push_back(what + " refused");
+			return KERN_NO_SPACE;
+		}
+		k->log->push_back(what);
+		std::vector<uint8_t> memory(size, k->fill);
+		*bytes = memory.data();
+		k->blocks[*offset] = std::move(memory);
+		return KERN_SUCCESS;
+	}
+	static void give(void *context, uint64_t offset)
+	{
+		PoolKext *k = static_cast<PoolKext *>(context);
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		while (k->ring->next(&h, &bytes)) {
+			if (h.type != RGFX_CMD_OBJECT_DESTROY || bytes.size() != sizeof(RgfxObjectDestroy)) {
+				k->log->push_back("message " + std::to_string(h.type));
+				continue;
+			}
+			RgfxObjectDestroy destroy;
+			std::memcpy(&destroy, bytes.data(), sizeof(destroy));
+			k->log->push_back("destroy " + std::to_string(destroy.obj_id));
+		}
+		auto it = k->blocks.find(offset);
+		if (it == k->blocks.end()) {
+			k->log->push_back("give of no block");
+			return;
+		}
+		k->free.give(offset, it->second.size());
+		k->log->push_back("give " + std::to_string(it->second.size()));
+		k->blocks.erase(it);
+	}
+};
+
+// The device's Shared pool as the first source: a heaped class's slab is a block of the pool the
+// kext maps, zero as the host gives it, made one HEAP_OVER_POOL whose region_offset is the block's
+// offset in the pool, its buffers placed in it (BUFFER_AT_OFFSET, and BUFFER_MANAGED_AT_OFFSET
+// where the device took MANAGED_AT_OFFSET). A class holds buffers of up to 4 MiB in slabs of up to
+// 16 MiB, and a larger buffer has a block and a heap of its own. A Managed buffer without
+// MANAGED_AT_OFFSET, and a buffer the kext takes no block for, are the region's. No slab of the
+// pool is kept once empty: its heap's destroy is posted, then its block given back.
+void test_pool_slab_source()
+{
+	using Pool = RgfxPoolSlabSource;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
+	TestRing ring(0x10000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxRegion region(mem.data(), mem.size());
+	std::vector<std::string> log;
+	PagesKext regionKext(16 * kMiB, &log);
+	region.setBlockSource(&PagesKext::alloc, &PagesKext::release, &regionKext);
+	PoolKext kext(64 * kMiB, &log, &ring);
+	RgfxPoolMemory calls;
+	calls.context = &kext;
+	calls.take = &PoolKext::take;
+	calls.give = &PoolKext::give;
+	RgfxRegionSlabSource regionSource(region, ser);
+	Pool pool(region, ser, calls);
+	CHECK(pool.unit() == 64 * 1024 && pool.smallMax() == 4 * kMiB && pool.slabMax() == 16 * kMiB);
+	CHECK(!pool.keepsFreed() && pool.heaped(kShared) && !pool.heaped(kManaged));
+	CHECK(pool.serves(kShared, Pool::kUnit, false) && pool.serves(kSharedUntracked, 16 * kMiB, false));
+	CHECK(!pool.serves(kShared, 32 * kMiB, false) && pool.serves(kShared, 32 * kMiB, true));
+	CHECK(!pool.serves(kShared, 0x4000, false) && !pool.serves(kShared, 0, true));
+	CHECK(pool.serves(kShared, Pool::kTakeMax, true));
+	CHECK(!pool.serves(kShared, Pool::kTakeMax + Pool::kUnit, true));
+	CHECK(!pool.serves(kManaged, Pool::kUnit, false) && !pool.serves(kManaged, 8 * kMiB, true));
+	CHECK(pool.heapedSlab(32 * kMiB, kShared, true));
+	RgfxSlabs slabs(regionSource);
+	slabs.setFirst(&pool);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	auto drain = [&] {
+		while (ring.next(&h, &bytes)) {
+		}
+	};
+
+	// The thread has no work and takes nothing; the first take takes the class's slab, past the
+	// block another process holds. The host zeroed it, and the allocator writes none of it: a
+	// block the test fills with 0xee reads 0xee.
+	CHECK(!slabs.step() && log.empty());
+	RgfxSlabs::Range a, b;
+	kext.fill = 0xee;
+	CHECK(slabs.take(256, kShared, 0, &a) && a.offset == 0 && a.size == 0x1000);
+	kext.fill = 0;
+	CHECK(log == std::vector<std::string>({"take 131072"}) && kext.blocks.size() == 1);
+	CHECK(a.contents == kext.blocks.at(Pool::kUnit).data() && allBytes(a.contents, a.size, 0xee));
+	CHECK(slabs.stats().dirtyBytes == 0 && slabs.stats().firstSlabs == 1);
+	auto heap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_POOL);
+	CHECK(heap.region_offset == Pool::kUnit && heap.size_bytes == 128 * 1024);
+	CHECK(heap.options == kShared && heap.heap_type == 1 && heap.gpu_address != 0);
+	CHECK(slabs.take(0x3000, kShared, 0, &b) && b.slab == a.slab && b.offset == 0x1000);
+	RgfxSlabSource::Made made;
+	CHECK(slabs.makeBuffer(b, 0x2800, kShared, &made));
+	auto at = expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET);
+	CHECK(at.heap_obj_id == heap.obj_id && at.offset == 0x1000 && at.length == 0x2800);
+	CHECK(made.objId == at.obj_id && made.gpuAddress == heap.gpu_address + 0x1000);
+	CHECK(!made.ownsAddress && !slabs.step() && log.size() == 1);
+
+	// A 3 MiB buffer shares its class's slab, 8 MiB from the pool; a buffer past 4 MiB has a block
+	// of its own, whole blocks, with its heap, its buffer at the heap's start.
+	RgfxSlabs::Range c, d;
+	CHECK(slabs.take(3 * kMiB, kShared, 0, &c) && c.offset == 0 && c.slab != a.slab);
+	CHECK(endsWith(log, {"take 8388608"}));
+	auto cheap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_POOL);
+	CHECK(cheap.region_offset == 3 * Pool::kUnit && cheap.size_bytes == 8 * kMiB);
+	CHECK(slabs.take(5 * kMiB + 0x1000, kShared, 0, &d) && d.offset == 0);
+	CHECK(d.size == 5 * kMiB + 0x1000 && endsWith(log, {"take 5308416"}));
+	auto dheap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_POOL);
+	CHECK(dheap.region_offset == 3 * Pool::kUnit + 8 * kMiB && dheap.size_bytes == 5308416);
+	CHECK(slabs.makeBuffer(d, 5 * kMiB + 0x1000, kShared, &made));
+	auto dat = expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET);
+	CHECK(dat.heap_obj_id == dheap.obj_id && dat.offset == 0 && dat.length == 5 * kMiB + 0x1000);
+	CHECK(made.gpuAddress == dheap.gpu_address && !made.ownsAddress);
+
+	// Managed, with no MANAGED_AT_OFFSET: the region's slab, nothing taken.
+	const size_t asked = log.size();
+	RgfxSlabs::Range m;
+	CHECK(slabs.take(0x1000, kManaged, 0, &m) && slabs.makeBuffer(m, 0x1000, kManaged, &made));
+	CHECK(log.size() == asked);
+	CHECK(expectMessage<RgfxBufferOverHostMemory>(ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY).length ==
+	      0x1000);
+	// A take the kext refuses: the region's heaped slab.
+	RgfxSlabs::Range f;
+	kext.refuse = true;
+	CHECK(slabs.take(0x1000, kSharedUntracked, 0, &f) && endsWith(log, {"take 131072 refused"}));
+	kext.refuse = false;
+	auto fheap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
+	CHECK(fheap.region_offset >= RGFX_ALLOCATIONS_OFFSET && fheap.size_bytes == 128 * 1024);
+	CHECK(slabs.stats().slabs == 5 && slabs.stats().firstSlabs == 3);
+	Pool::Takes t = pool.takes();
+	CHECK(t.taken == 3 && t.takenBytes == 131072 + 8388608 + 5308416 && t.refused == 1);
+	CHECK(t.given == 0 && t.longestUs <= t.waitUs);
+
+	// Each slab of the pool goes with its last buffer, its heap destroyed before its block is
+	// given back: none is kept for a later buffer.
+	drain();
+	log.clear();
+	slabs.give(c);
+	CHECK(log == std::vector<std::string>(
+	                 {"destroy " + std::to_string(cheap.obj_id), "give 8388608"}));
+	slabs.give(d);
+	CHECK(endsWith(log, {"destroy " + std::to_string(dheap.obj_id), "give 5308416"}));
+	CHECK(slabs.stats().cachedSlabs == 0 && slabs.stats().emptySlabs == 0);
+	slabs.give(a);
+	CHECK(log.size() == 4);
+	slabs.give(b);
+	CHECK(endsWith(log, {"destroy " + std::to_string(heap.obj_id), "give 131072"}));
+	CHECK(log.size() == 6 && kext.blocks.empty() && slabs.stats().firstSlabs == 0);
+	CHECK(slabs.churn().emptyLetGo == 2 && slabs.churn().refilled == 0);
+	CHECK(pool.takes().given == 3 && pool.takes().taken == 3);
+	// A later buffer of the class takes a block again.
+	RgfxSlabs::Range again;
+	CHECK(slabs.take(0x1000, kShared, 0, &again) && log.size() == 7);
+	CHECK(log.back().rfind("take ", 0) == 0 && kext.blocks.size() == 1);
+	drain();
+	slabs.give(again);
+	CHECK(log.size() == 9 && endsWith(log, {"give " + log[6].substr(5)}) && kext.blocks.empty());
+	slabs.give(m);
+	slabs.give(f);
+	drain();
+	CHECK(slabs.reclaim() && slabs.stats().slabs == 0 && regionKext.blocks.empty());
+	CHECK(pool.takes().taken == 4 && pool.takes().given == 4 && pool.takes().refused == 1);
+	drain();
+
+	// With MANAGED_AT_OFFSET, a Managed class's slab is a block of the pool too, its buffers' CPU
+	// copies placed in its Shared heap.
+	Pool managed(region, ser, calls, true);
+	CHECK(managed.heaped(kManaged) && managed.serves(kManaged, Pool::kUnit, false));
+	RgfxRegionSlabSource managedRegion(region, ser, true);
+	RgfxSlabs both(managedRegion);
+	both.setFirst(&managed);
+	log.clear();
+	RgfxSlabs::Range g;
+	CHECK(both.take(0x1000, kManaged, 0, &g) && log == std::vector<std::string>({"take 131072"}));
+	auto mheap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_POOL);
+	CHECK(mheap.options == kShared && mheap.size_bytes == 128 * 1024);
+	CHECK(mheap.region_offset == kext.blocks.begin()->first);
+	CHECK(both.makeBuffer(g, 0x800, kManaged, &made));
+	auto mat = expectMessage<RgfxBufferManagedAtOffset>(ring, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET);
+	CHECK(mat.heap_obj_id == mheap.obj_id && mat.offset == 0 && mat.length == 0x800);
+	CHECK(made.ownsAddress && made.gpuAddress == mat.gpu_address);
+	drain();
+	both.give(g);
+	CHECK(endsWith(log, {"destroy " + std::to_string(mheap.obj_id), "give 131072"}));
+	CHECK(kext.blocks.empty() && managed.takes().given == 1);
+	drain();
+}
+
 } // namespace
 
 void rgfxSlabTests()
@@ -1603,4 +1817,5 @@ void rgfxSlabTests()
 	test_pages_slab_source_chunks();
 	test_chunked_slabs_grow();
 	test_managed_buffers_over_shared_copies();
+	test_pool_slab_source();
 }
