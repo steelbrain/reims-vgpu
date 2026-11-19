@@ -904,7 +904,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// waited for first, so a picture never lands over a fill's older bytes and a copy never
     /// reads a picture landing, and a read finds the cache whole. A `decode` whose textures show
     /// their cache's planes whole, where it keeps them in a surface, is given the surface's planes
-    /// ([`VideoPlane::surface`]).
+    /// (`VideoPlane::surface`, on Unix hosts).
     fn video_planes(
         &self,
         tag: u16,

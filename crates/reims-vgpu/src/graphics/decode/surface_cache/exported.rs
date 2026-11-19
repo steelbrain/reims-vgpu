@@ -7,13 +7,13 @@
 //! or `R16Unorm` and `RG16Unorm` (16-bit), of `ShaderRead | RenderTarget | PixelFormatView`, so a
 //! guest texture over the plane in another format of the texel's size (an `R8Uint`) is a view of
 //! it, in the memory the host's video imports through the surface's handle
-//! ([`new_exported_surface`]). The planes are the cache's plane shapes, which the
-//! bound never drops. Each plane holds room for a coded picture's rows below its own (a
+//! (`GpuDevice::new_exported_surface`, on Unix hosts). The planes are the cache's plane shapes,
+//! which the bound never drops. Each plane holds room for a coded picture's rows below its own (a
 //! multiple of 64 luma rows, 32 chroma), for VA-API's decodes into it; the pitch and each plane's
 //! start are multiples of 256, as VA-API's imports and CUDA's copies take them.
 //!
 //! A decode whose luma and chroma textures show the planes whole is given the surface's planes
-//! ([`Caches::surface_targets`]), and its picture lands there, by the hardware or by a copy into
+//! (`Caches::surface_targets`), and its picture lands there, by the hardware or by a copy into
 //! the plane images: its command buffer leaves the plane shapes holding the picture and every
 //! other shape owing a fill ([`owe_video`]). The cache's buffer stays a copy of its own, so the
 //! plane shapes are dirty after such a write, and its copies out and the other shapes' fills take
@@ -22,8 +22,6 @@
 //!
 //! A platform that makes no such surface (the default, and one that exports no such memory)
 //! answers `None`, counted, and the cache's shapes are made as any other's.
-//!
-//! [`new_exported_surface`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::new_exported_surface
 
 #[cfg(unix)]
 use std::sync::Arc;
@@ -108,7 +106,7 @@ pub(super) struct CacheSurface<P: Platform> {
     #[cfg(unix)]
     made: Option<PlaneSurface<P>>,
     /// A decode of the command buffer being walked was given the surface's planes
-    /// ([`Caches::surface_targets`]); taken at its finish ([`take_landed`]).
+    /// (`Caches::surface_targets`); taken at its finish ([`take_landed`]).
     landed: bool,
     /// A decode given the planes answered no picture ([`skipped`]): the command buffer wrote
     /// nothing of the cache.
