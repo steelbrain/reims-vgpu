@@ -157,8 +157,9 @@ pub(super) struct Taker {
 
 /// What came of a carve that waited for the pool to grow.
 enum Grown {
-    /// Carved at this address, under this number.
-    At(u64, u64),
+    /// Carved at this address, under this number, and how long the take waited for a piece of
+    /// its own where it asked for one.
+    At(u64, u64, Option<Duration>),
     /// The pool has no room for it.
     NoRoom,
     /// The take ended unanswered: its context closed, the device was reset or released.
@@ -571,11 +572,11 @@ impl Shared {
                 }
             };
             let carved = match job.carved {
-                Some(carved) => Grown::At(carved.0, carved.1),
+                Some(carved) => Grown::At(carved.0, carved.1, None),
                 None => self.carve_grown(&mut st, context, job.life, job.len),
             };
-            let (at, serial) = match carved {
-                Grown::At(at, serial) => (at, serial),
+            let (at, serial, waited) = match carved {
+                Grown::At(at, serial, waited) => (at, serial, waited),
                 Grown::NoRoom => {
                     MutexGuard::unlocked(&mut st, || {
                         log::warn!(
@@ -614,7 +615,18 @@ impl Shared {
                     length: job.len,
                     gpu_address: c.gpu_address.get(),
                 };
-                MutexGuard::unlocked(&mut st, || (job.answer)(Some(taken)));
+                MutexGuard::unlocked(&mut st, || {
+                    (job.answer)(Some(taken));
+                    // Each wait for a piece, in every boot's log: the first line, then a count.
+                    if let Some(waited) = waited {
+                        log::info!(
+                            kind:% = "pool-take-waited";
+                            "pool: context {context}'s take of {} KiB waited {:.1} ms for a piece",
+                            job.len >> 10,
+                            waited.as_secs_f64() * 1000.0
+                        );
+                    }
+                });
             } else {
                 let now = (self.now)();
                 st.uncarve(at, serial, now);
@@ -649,13 +661,16 @@ impl Shared {
         life: u64,
         len: u64,
     ) -> Grown {
+        let mut asked: Option<MonoTime> = None;
         loop {
             if !st.stands(context, life) {
                 return Grown::Stale;
             }
             if let Some((at, serial)) = st.carve(context, len) {
-                return Grown::At(at, serial);
+                let waited = asked.map(|since| (self.now)().saturating_duration_since(since));
+                return Grown::At(at, serial, waited);
             }
+            asked = asked.or_else(|| Some((self.now)()));
             let wait = st.next_serial();
             st.waits.insert(wait, None);
             st.asks.push_back(Ask {
