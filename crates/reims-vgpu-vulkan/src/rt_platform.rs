@@ -549,6 +549,8 @@ mod tests {
     fn on_vulkan_a_quiesce_with_the_device_live_stops_it_and_answers_false() {
         use std::sync::atomic::Ordering;
 
+        use crate::core::platform::command::CommandQueue as _;
+
         const TEST: &str = "rt_platform::tests::\
             on_vulkan_a_quiesce_with_the_device_live_stops_it_and_answers_false";
         unsafe extern "C" {
