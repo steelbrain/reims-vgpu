@@ -243,9 +243,9 @@ pub(crate) fn dispatches(tag: u16) -> bool {
     )
 }
 
-/// The bindings at `first` on of the `recs` a resolve of each, `resolve`, names, pushed onto
-/// `named`: an object whose create the host refused is nil, and marks its slot of `bound` in
-/// `marks` ([`refused`]). The caller's list is filled where it lies, so no `?` copies it: a
+/// The bindings at `first` on of the `recs` a resolve of each, `resolve`, names from its slot's
+/// index and its record, pushed onto `named`: an object whose create the host refused is nil, and
+/// marks its slot of `bound` in `marks` ([`refused`]). The caller's list is filled where it lies, so no `?` copies it: a
 /// [`Listed`] handed back in a `RaiseResult` is copied whole (16 entries and its length) through
 /// the `?` at each bind, measured at 0.4% of the dispatch cost test's decoder thread (780M) and
 /// 0.8% of the walks' samples in an XTX Geekbench 7.1.0 timed pass.
@@ -253,13 +253,14 @@ fn bind_each<'a, R: FromBytes + Immutable, T>(
     recs: &Tail<'_, R>,
     (marks, bound, first): (&Marks, Bound, u64),
     named: &mut Listed<Option<&'a T>>,
-    resolve: impl Fn(&R) -> RaiseResult<Option<&'a T>>,
+    resolve: impl Fn(u64, &R) -> RaiseResult<Option<&'a T>>,
 ) -> RaiseResult<()> {
     for (i, r) in (0u64..).zip(recs.iter()) {
+        let index = first.wrapping_add(i);
         named.push(refused::bind!(
             marks,
-            Slot::new(Stage::Kernel, bound, first.wrapping_add(i)),
-            resolve(&r)
+            Slot::new(Stage::Kernel, bound, index),
+            resolve(index, &r)
         ));
     }
     Ok(())
@@ -443,9 +444,11 @@ pub(crate) fn decode_op<P: Platform>(
             // A refused pipeline is not set: the encoder's dispatches are dropped until the next
             // ([`refused`]).
             if marks.holds(slot) {
+                objs.pipeline_bound(0);
                 return Ok(true);
             }
             enc.encode(on, ComputeCmd::SetComputePipelineState { state })?;
+            objs.pipeline_bound(m.pipeline_obj_id);
         }
         RGFX_OP_COMPUTE_SET_BUFFER_OFFSET => {
             let m: RgfxComputeOpSetBufferOffset = body(tag, payload)?;
@@ -489,7 +492,7 @@ pub(crate) fn decode_op<P: Platform>(
                 &recs,
                 (marks, Bound::Buffer, m.location),
                 &mut buffers,
-                |r| objs.get_buffer(r.buffer_obj_id),
+                |_, r| objs.get_buffer(r.buffer_obj_id),
             )?;
             let offsets = Listed::of(recs.len(), recs.iter().map(|r| r.offset));
             enc.encode(
@@ -514,7 +517,7 @@ pub(crate) fn decode_op<P: Platform>(
                 &recs,
                 (marks, Bound::Buffer, m.location),
                 &mut buffers,
-                |r| objs.get_buffer(r.buffer_obj_id),
+                |_, r| objs.get_buffer(r.buffer_obj_id),
             )?;
             let offsets = Listed::of(recs.len(), recs.iter().map(|r| r.offset));
             let strides = Listed::of(recs.len(), recs.iter().map(|r| r.stride));
@@ -533,7 +536,7 @@ pub(crate) fn decode_op<P: Platform>(
             let texture = refused::bind!(
                 marks,
                 Slot::new(Stage::Kernel, Bound::Texture, m.index),
-                objs.get_texture(m.texture_obj_id)
+                objs.slot_texture((Stage::Kernel, m.index), m.texture_obj_id)
             );
             enc.encode(
                 on,
@@ -572,7 +575,7 @@ pub(crate) fn decode_op<P: Platform>(
                 &recs,
                 (marks, Bound::Buffer, m.location),
                 &mut function_tables,
-                |r| objs.get_function_table(r.table_obj_id),
+                |_, r| objs.get_function_table(r.table_obj_id),
             )?;
             enc.encode(
                 on,
@@ -595,7 +598,7 @@ pub(crate) fn decode_op<P: Platform>(
                 &recs,
                 (marks, Bound::Texture, m.location),
                 &mut textures,
-                |r| objs.get_texture(r.texture_obj_id),
+                |index, r| objs.slot_texture((Stage::Kernel, index), r.texture_obj_id),
             )?;
             enc.encode(
                 on,
@@ -618,7 +621,7 @@ pub(crate) fn decode_op<P: Platform>(
                 &recs,
                 (marks, Bound::Sampler, m.location),
                 &mut samplers,
-                |r| objs.get_sampler(r.sampler_obj_id),
+                |_, r| objs.get_sampler(r.sampler_obj_id),
             )?;
             enc.encode(
                 on,
@@ -641,7 +644,7 @@ pub(crate) fn decode_op<P: Platform>(
                 &recs,
                 (marks, Bound::Sampler, m.location),
                 &mut samplers,
-                |r| objs.get_sampler(r.sampler_obj_id),
+                |_, r| objs.get_sampler(r.sampler_obj_id),
             )?;
             let lod_min = Listed::of(
                 recs.len(),

@@ -38,8 +38,11 @@
 //! and logged once), and the shape the walk noted last is taken as the plane's write.
 //!
 //! **Dirty.** A command buffer's walk notes each shape a use may write: a blit's destination, a
-//! render pass's attachment, and, outside a blit encoder, a texture whose usage lets a shader
-//! write it. It holds each, so the bound keeps it, until the buffer's finish marks it dirty; where
+//! render pass's attachment or resolve texture, a texture bound at a slot that a pipeline bound
+//! with it may write (its access in the function's interface write or read-write, not read or
+//! sample), and, outside a blit encoder, a texture whose usage lets a shader write it where no
+//! interface is at hand (a pipeline that answers none, a use through an argument buffer),
+//! counted ([`ShapeCounts::usage_writes`]). It holds each, so the bound keeps it, until the buffer's finish marks it dirty; where
 //! the buffer was counted behind a deferred copy of the cache, once that copy is made, as the
 //! buffer's write follows it (`SurfaceCaches::shapes_written`). Every copy of the buffer into the
 //! pages (a download, a release, a block named again, an early copy) copies the dirty shapes into
@@ -271,6 +274,14 @@ pub(crate) struct ShapeCounts {
     pub(crate) straddled: u64,
     /// Encoders that may have written two shapes of one plane ([`UNORDERED_WRITES`]).
     pub(crate) unordered: u64,
+    /// Uses of a shape's view taken as writes by the texture's usage alone, with no pipeline's
+    /// interface at hand to say whether its function writes the slot (`GraphicsDecoder`'s
+    /// `note_shape`).
+    pub(crate) usage_writes: u64,
+    /// Views of shapes' images that their usage lets a shader write, bound at a slot that no
+    /// pipeline bound with them may write, so taken as read (`GraphicsDecoder`'s
+    /// `note_slot_shape`).
+    pub(crate) slot_reads: u64,
 }
 
 /// One shape's image and its state.

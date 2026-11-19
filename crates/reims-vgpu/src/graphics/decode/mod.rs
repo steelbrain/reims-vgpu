@@ -146,8 +146,8 @@ use reims_vgpu_vulkan::core::platform::device::GpuDevice;
 use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent};
 use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, MonoTime};
 use reims_vgpu_vulkan::core::platform::resource::{
-    Buffer, ComputePipeline, ConstantLane, FunctionConstant, Heap, Library, RenderPipeline,
-    SamplerState, Texture as _,
+    Buffer, ComputePipeline, ConstantLane, FunctionConstant, Heap, Library, RenderFunction,
+    RenderPipeline, SamplerState, Texture as _,
 };
 use reims_vgpu_vulkan::core::platform::types::{MtlSize, Swizzle};
 use reims_vgpu_vulkan::core::platform::values::{
@@ -1069,6 +1069,12 @@ pub struct GraphicsDecoder<P: Platform> {
     /// and once, in the order the walk last noted them ([`Self::note_shape`]): at the encoder's
     /// end each other shape of their planes takes their write ([`Self::reconcile_shapes`]).
     encoder_shapes: RefCell<Vec<(u64, surface_cache::shapes::ShapeRef)>>,
+    /// In the per-shape form, the views of shapes' images bound at slots of the encoder being
+    /// walked that their usage lets a shader write, each by its slot, while no pipeline bound
+    /// with them may write the slot ([`Self::note_slot_shape`]); and the pipeline the encoder
+    /// has bound, 0 for none ([`Self::pipeline_bound`]).
+    slot_shapes: RefCell<Vec<(refused::Stage, u64, surface_cache::shapes::ShapeUse)>>,
+    slot_pipeline: Cell<u64>,
     /// The encoder being walked is a blit encoder, which writes only the destinations its ops
     /// name ([`Self::texture_written`]), whatever its textures' usage.
     laid_blit: Cell<bool>,
@@ -1236,6 +1242,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             laid_written: RefCell::new(Vec::new()),
             shapes_written: RefCell::new(Vec::new()),
             encoder_shapes: RefCell::new(Vec::new()),
+            slot_shapes: RefCell::new(Vec::new()),
+            slot_pipeline: Cell::new(0),
             laid_blit: Cell::new(false),
         }
     }
@@ -1655,13 +1663,15 @@ impl<P: Platform> GraphicsDecoder<P> {
                      back ({} MiB), {} kept dirty past the bound; {} took another shape's write \
                      ({} MiB), {} texels in part, {} dropped at one; {} encoders wrote two \
                      shapes of a plane; {} writes no shape's; {} unreferenced dropped ({} MiB); \
-                     {} textures over the buffer instead ({} images and {} views refused); {} \
+                     {} binds written as their usage says, {} read as their slots say; {} \
+                     textures over the buffer instead ({} images and {} views refused); {} \
                      caches kept past the budget; {} blocks refused uncached",
                     sh.made, sh.made_bytes >> 20, sh.found, sh.again, sh.fills,
                     sh.filled_bytes >> 20, sh.fills_made, sh.fills_deferred, sh.written_back,
                     sh.written_back_bytes >> 20, sh.kept_dirty, sh.overlap_copies,
                     sh.overlap_bytes >> 20, sh.straddled, sh.overlap_dropped, sh.unordered,
-                    sh.unseen, sh.dropped, sh.dropped_bytes >> 20, sh.unshaped,
+                    sh.unseen, sh.dropped, sh.dropped_bytes >> 20, sh.usage_writes,
+                    sh.slot_reads, sh.unshaped,
                     sh.images_refused, sh.views_refused, sh.past_budget, sh.uncached_refused
                 );
             }
@@ -6288,6 +6298,143 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.require_texture(id).map(Some)
     }
 
+    /// The texture `id` names, `None` for 0, bound at slot `index` of `stage`'s textures in the
+    /// encoder being walked: noted as [`Self::require_texture`] notes it, but a view of a shape's
+    /// image is noted written only once a pipeline whose function may write the slot is bound
+    /// with it ([`Self::note_slot_shape`]).
+    pub(crate) fn slot_texture(
+        &self,
+        (stage, index): (refused::Stage, u64),
+        id: u64,
+    ) -> RaiseResult<Option<&P::Texture>> {
+        if id == 0 {
+            self.note_slot_shape((stage, index), None);
+            return Ok(None);
+        }
+        match self.entry(id) {
+            Some(Entry {
+                handle: ObjHandle::Texture(h),
+                laid_use,
+                shape,
+                ..
+            }) => {
+                if let Some(used) = laid_use {
+                    self.note_laid(*used, false);
+                }
+                self.note_slot_shape((stage, index), shape.as_ref());
+                Ok(Some(h))
+            }
+            Some(Entry {
+                handle: ObjHandle::Refused(r),
+                ..
+            }) => {
+                self.note_slot_shape((stage, index), None);
+                Err(r.reference(id))
+            }
+            _ => Err(bad_reference()),
+        }
+    }
+
+    /// The encoder being walked bound the pipeline `id` (0 for none, or one whose create the host
+    /// refused): each view of a shape's image bound at a slot that it may write is noted written
+    /// from now ([`Self::note_slot_shape`]).
+    pub(crate) fn pipeline_bound(&self, id: u64) {
+        self.slot_pipeline.set(id);
+        if id == 0 || self.slot_shapes.borrow().is_empty() {
+            return;
+        }
+        let bound = std::mem::take(&mut *self.slot_shapes.borrow_mut());
+        let mut kept = Vec::with_capacity(bound.len());
+        for (stage, index, used) in bound {
+            match self.slot_access((stage, index)) {
+                Some(Some(false)) | None => kept.push((stage, index, used)),
+                Some(Some(true)) => self.note_shape(&used, true),
+                Some(None) => self.note_shape(&used, false),
+            }
+        }
+        *self.slot_shapes.borrow_mut() = kept;
+    }
+
+    /// What the pipeline the encoder being walked has bound answers of slot `index` of `stage`'s
+    /// textures ([`ComputePipeline::texture_slot_writes`], [`RenderPipeline::texture_slot_writes`]):
+    /// whether its function may write it, `None` where the pipeline has no interface at hand.
+    /// `None` where no pipeline is bound.
+    fn slot_access(&self, (stage, index): (refused::Stage, u64)) -> Option<Option<bool>> {
+        use refused::Stage;
+        let id = self.slot_pipeline.get();
+        if id == 0 {
+            return None;
+        }
+        let function = match stage {
+            Stage::Kernel => {
+                let pipeline = self.get_compute_pipeline(id).ok().flatten()?;
+                return Some(pipeline.texture_slot_writes(index));
+            }
+            Stage::Vertex => RenderFunction::Vertex,
+            Stage::Fragment => RenderFunction::Fragment,
+            Stage::Tile => RenderFunction::Tile,
+            Stage::Object => RenderFunction::Object,
+            Stage::Mesh => RenderFunction::Mesh,
+            Stage::Encoder => return None,
+        };
+        let pipeline = self.get_render_pipeline(id).ok().flatten()?;
+        Some(pipeline.texture_slot_writes(function, index))
+    }
+
+    /// In the per-shape form, the use `used` of a view of a shape's image (`None` for any other
+    /// texture, or nil) is bound at slot `index` of `stage`'s textures in the encoder being
+    /// walked, in place of what the slot held. A shader writes a texture where the slot's access
+    /// in its function's interface is write or read-write, not where it is read or sample, so
+    /// one whose usage lets a shader write it is noted written ([`Self::note_shape`]) once a
+    /// pipeline bound with it may write the slot: where the pipeline bound answers so, then, or
+    /// when one bound later does. A pipeline with no interface at hand leaves the texture's
+    /// usage to decide, which notes it written (counted, [`ShapeCounts::usage_writes`]). One no
+    /// pipeline bound with it may write is counted read ([`ShapeCounts::slot_reads`]) as the slot
+    /// is bound again or the encoder ends ([`Self::slots_end`]).
+    ///
+    /// [`ShapeCounts::usage_writes`]: surface_cache::shapes::ShapeCounts::usage_writes
+    /// [`ShapeCounts::slot_reads`]: surface_cache::shapes::ShapeCounts::slot_reads
+    fn note_slot_shape(
+        &self,
+        (stage, index): (refused::Stage, u64),
+        used: Option<&surface_cache::shapes::ShapeUse>,
+    ) {
+        if !self.slot_shapes.borrow().is_empty() {
+            let mut bound = self.slot_shapes.borrow_mut();
+            let before = bound.len();
+            bound.retain(|(s, i, _)| (*s, *i) != (stage, index));
+            if bound.len() < before {
+                drop(bound);
+                self.surface_caches.count_shapes(|c| c.slot_reads += 1);
+            }
+        }
+        let Some(used) = used.filter(|u| u.writes) else {
+            return;
+        };
+        if !self.surface_caches.shaped() {
+            return;
+        }
+        match self.slot_access((stage, index)) {
+            Some(Some(false)) | None => {
+                (self.slot_shapes.borrow_mut()).push((stage, index, used.clone_ref()));
+            }
+            Some(Some(true)) => self.note_shape(used, true),
+            Some(None) => self.note_shape(used, false),
+        }
+    }
+
+    /// The encoder being walked ended: its slots' shapes no pipeline bound with them may write
+    /// are counted read ([`Self::note_slot_shape`]), and it has no pipeline bound.
+    fn slots_end(&self) {
+        use reims_vgpu_vulkan::core::num::ToU64 as _;
+        self.slot_pipeline.set(0);
+        let bound = std::mem::take(&mut *self.slot_shapes.borrow_mut());
+        if !bound.is_empty() {
+            let reads = bound.len().to_u64();
+            self.surface_caches.count_shapes(|c| c.slot_reads += reads);
+        }
+    }
+
     /// The texture `id` names is a blit's destination or a render pass's attachment: noted as
     /// written, whatever its usage ([`Self::note_laid`], [`Self::note_shape`]). Nothing for 0.
     pub(crate) fn texture_written(&self, id: u64) {
@@ -6304,14 +6451,20 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// In the per-shape form, notes the use `used` of a view of a shape's image by the encoder
     /// being walked where it may write the shape: `written` (a blit's destination, a render
-    /// pass's attachment) or, outside a blit encoder, where the texture's usage lets a shader
-    /// write it. The shape is held, once, until the command buffer's finish marks it dirty
-    /// ([`surface_cache::Caches::finish`]), and noted among the encoder's, last
-    /// ([`Self::reconcile_shapes`]). In the default form the use's shape is the shadow's, which
-    /// holds no image: nothing is noted.
+    /// pass's attachment, a slot a pipeline bound with it may write) or, outside a blit encoder,
+    /// where the texture's usage lets a shader write it and nothing says more, counted
+    /// ([`ShapeCounts::usage_writes`]). The shape is held, once, until the command buffer's
+    /// finish marks it dirty ([`surface_cache::Caches::finish`]), and noted among the encoder's,
+    /// last ([`Self::reconcile_shapes`]). In the default form the use's shape is the shadow's,
+    /// which holds no image: nothing is noted.
+    ///
+    /// [`ShapeCounts::usage_writes`]: surface_cache::shapes::ShapeCounts::usage_writes
     fn note_shape(&self, used: &surface_cache::shapes::ShapeUse, written: bool) {
         if !(written || (used.writes && !self.laid_blit.get())) || !self.surface_caches.shaped() {
             return;
+        }
+        if !written {
+            self.surface_caches.count_shapes(|c| c.usage_writes += 1);
         }
         let id = used.reference.id();
         let mut noted = self.shapes_written.borrow_mut();

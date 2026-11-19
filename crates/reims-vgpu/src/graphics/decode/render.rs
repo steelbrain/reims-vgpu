@@ -137,7 +137,8 @@ fn resolve_buffers<'a, P: Platform>(
 }
 
 /// Resolves a texture-binding array of `stage`'s from slot `first` into its objects (nil for
-/// 0), in order, as [`resolve_buffers`] does.
+/// 0), in order, as [`resolve_buffers`] does, each bound at its slot
+/// ([`GraphicsDecoder::slot_texture`]).
 fn resolve_textures<'a, P: Platform>(
     objs: &'a GraphicsDecoder<P>,
     es: &[RgfxTextureBinding],
@@ -145,10 +146,11 @@ fn resolve_textures<'a, P: Platform>(
 ) -> RaiseResult<Vec<Option<&'a P::Texture>>> {
     let mut named = Vec::with_capacity(es.len());
     for (i, e) in (0u64..).zip(es) {
+        let index = first.wrapping_add(i);
         named.push(refused::bind!(
             marks,
-            Slot::new(stage, Bound::Texture, first.wrapping_add(i)),
-            objs.get_texture(e.texture_obj_id)
+            Slot::new(stage, Bound::Texture, index),
+            objs.slot_texture((stage, index), e.texture_obj_id)
         ));
     }
     Ok(named)
@@ -672,6 +674,7 @@ pub(crate) fn decode_op<P: Platform>(
             // A refused pipeline is not set: the encoder's draws are dropped until the next
             // ([`refused`]).
             if pass.refused.holds(slot) {
+                objs.pipeline_bound(0);
                 return Ok(true);
             }
             enc.encode(
@@ -680,6 +683,7 @@ pub(crate) fn decode_op<P: Platform>(
                     pipeline_state: pipeline,
                 },
             )?;
+            objs.pipeline_bound(m.pipeline_obj_id);
         }
         RGFX_OP_RENDER_SET_VERTEX_BUFFER => {
             let m: RgfxOpSetVertexBuffer = body(tag, payload)?;
@@ -718,7 +722,7 @@ pub(crate) fn decode_op<P: Platform>(
             let texture = refused::bind!(
                 pass.refused,
                 Slot::new(Stage::Fragment, Bound::Texture, m.index),
-                objs.get_texture(m.texture_obj_id)
+                objs.slot_texture((Stage::Fragment, m.index), m.texture_obj_id)
             );
             enc.encode(
                 on,
@@ -1393,6 +1397,8 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_RENDER_SET_COLOR_RESOLVE_TEXTURE => {
             let m: RgfxOpSetColorResolveTexture = body(tag, payload)?;
             let texture = objs.get_texture(m.texture_obj_id)?;
+            // The pass writes its resolve texture as it ends.
+            objs.texture_written(m.texture_obj_id);
             enc.encode(
                 on,
                 RenderCmd::SetColorResolveTexture {
@@ -1408,6 +1414,8 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_RENDER_SET_DEPTH_RESOLVE_TEXTURE => {
             let m: RgfxOpSetDepthResolveTexture = body(tag, payload)?;
             let texture = objs.get_texture(m.texture_obj_id)?;
+            // The pass writes its resolve texture as it ends.
+            objs.texture_written(m.texture_obj_id);
             enc.encode(
                 on,
                 RenderCmd::SetDepthResolveTexture {
@@ -1422,6 +1430,8 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_RENDER_SET_STENCIL_RESOLVE_TEXTURE => {
             let m: RgfxOpSetStencilResolveTexture = body(tag, payload)?;
             let texture = objs.get_texture(m.texture_obj_id)?;
+            // The pass writes its resolve texture as it ends.
+            objs.texture_written(m.texture_obj_id);
             enc.encode(
                 on,
                 RenderCmd::SetStencilResolveTexture {

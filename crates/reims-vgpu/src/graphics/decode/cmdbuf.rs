@@ -2698,6 +2698,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.laid_written.borrow_mut().clear();
         self.shapes_written.borrow_mut().clear();
         self.encoder_shapes.borrow_mut().clear();
+        self.slot_shapes.borrow_mut().clear();
+        self.slot_pipeline.set(0);
     }
 
     /// [`Self::walk_ops`]' walk of `ops`, the whole of a command buffer's op stream or a range
@@ -3259,6 +3261,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// the write through any texture over the plane, as the Macs' next encoders read it
     /// (docs/graphics-kext/dgpu-oracle.md, Q37).
     fn reconcile_shapes(&self, cb: &P::CommandBuffer) -> RaiseResult<()> {
+        self.slots_end();
         let written = std::mem::take(&mut *self.encoder_shapes.borrow_mut());
         if written.is_empty() {
             return Ok(());
