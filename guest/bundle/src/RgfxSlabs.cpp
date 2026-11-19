@@ -516,14 +516,21 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 				uncache(best);
 				in = best;
 				wake = best->dirty.bytes != 0;
+				m_churn.dedicatedReused++;
+				m_churn.dedicatedReusedBytes += best->memory.size;
+				wake = churned() || wake;
 			}
 		} else {
 			Class &cls = classOf(options);
 			for (Slab *slab : cls.open) {
 				const bool wasEmpty = slab->used == 0;
 				if (slab->free.bytes >= size && takeIn(slab, size, keep, &zero, &at)) {
-					if (wasEmpty)
+					if (wasEmpty) {
 						cls.empty--;
+						m_churn.refilled++;
+						m_churn.refilledBytes += slab->memory.size;
+						wake = churned() || wake;
+					}
 					if (slab->free.bytes == 0)
 						cls.open.erase(slab);
 					in = slab;
@@ -578,6 +585,13 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 			m_dirtySlabs.insert(made);
 			wake = true;
 		}
+		if (dedicated) {
+			m_churn.dedicatedMade++;
+		} else {
+			m_churn.classMade++;
+			m_churn.classMadeBytes += made->memory.size;
+		}
+		wake = churned() || wake;
 		if (!dedicated) {
 			Class &cls = classOf(options);
 			cls.slabs.push_back(made);
@@ -640,8 +654,12 @@ void RgfxSlabs::doom(Slab *slab)
 		auto it = std::find(cls.slabs.begin(), cls.slabs.end(), slab);
 		if (it != cls.slabs.end())
 			cls.slabs.erase(it);
-		if (slab->used == 0 && cls.empty > 0)
-			cls.empty--;
+		if (slab->used == 0) {
+			if (cls.empty > 0)
+				cls.empty--;
+			m_churn.emptyLetGo++;
+			churned();
+		}
 	}
 	m_dirtySlabs.erase(slab);
 	m_doomed.push_back(slab);
@@ -691,6 +709,10 @@ void RgfxSlabs::giveBack(const Range &range)
 		} else {
 			Class &cls = classOf(slab->options);
 			cls.open.insert(slab);
+			if (slab->used == 0) {
+				m_churn.emptied++;
+				churned();
+			}
 			if (slab->used == 0 && ++cls.empty > kEmptyKept) {
 				doom(slab);
 			} else if (slab->used == 0) {
@@ -796,6 +818,7 @@ size_t RgfxSlabs::dropDoomed(bool evict)
 
 bool RgfxSlabs::step()
 {
+	logChurn();
 	Slab *drops = nullptr;
 	Slab *zeroIn = nullptr;
 	uint64_t at = 0, length = 0;
@@ -872,7 +895,11 @@ void RgfxSlabs::run()
 		const bool work = !m_doomed.empty() || !m_dirtySlabs.empty();
 		if (work)
 			continue;
-		const int64_t left = idleWait(nowMs());
+		const uint64_t now = nowMs();
+		int64_t left = idleWait(now);
+		const int64_t logLeft = churnWait(now);
+		if (logLeft >= 0 && (left < 0 || logLeft < left))
+			left = logLeft;
 		if (left < 0)
 			m_wake.wait(hold);
 		else
@@ -913,6 +940,58 @@ int64_t RgfxSlabs::idleWait(uint64_t now) const
 	if (due == 0)
 		return -1;
 	return due > now ? static_cast<int64_t>(due - now) : 0;
+}
+
+int64_t RgfxSlabs::churnWait(uint64_t now) const
+{
+	if (m_churnLog == nullptr || !m_churnChanged)
+		return -1;
+	if (!m_churnLogged)
+		return 0;
+	const uint64_t due = m_churnLoggedAt + kChurnLogMs;
+	return due > now ? static_cast<int64_t>(due - now) : 0;
+}
+
+bool RgfxSlabs::churned()
+{
+	const bool first = !m_churnChanged;
+	m_churnChanged = true;
+	return first && m_churnLog != nullptr;
+}
+
+void RgfxSlabs::logChurn()
+{
+	Churn counts;
+	ChurnLog log = nullptr;
+	void *context = nullptr;
+	{
+		std::lock_guard<std::mutex> hold(m_lock);
+		if (m_churnLog == nullptr || !m_churnChanged)
+			return;
+		const uint64_t now = nowMs();
+		if (m_churnLogged && now < m_churnLoggedAt + kChurnLogMs)
+			return;
+		m_churnChanged = false;
+		m_churnLogged = true;
+		m_churnLoggedAt = now;
+		counts = m_churn;
+		log = m_churnLog;
+		context = m_churnLogContext;
+	}
+	log(context, counts);
+}
+
+RgfxSlabs::Churn RgfxSlabs::churn()
+{
+	std::lock_guard<std::mutex> hold(m_lock);
+	return m_churn;
+}
+
+void RgfxSlabs::setChurnLog(ChurnLog log, void *context)
+{
+	std::lock_guard<std::mutex> hold(m_lock);
+	m_churnLog = log;
+	m_churnLogContext = context;
 }
 
 RgfxSlabs::Stats RgfxSlabs::stats()

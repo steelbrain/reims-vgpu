@@ -329,6 +329,19 @@ bool rgfxRegionReclaim(void *context)
 	return slabs || views;
 }
 
+// The slabs' reuse counts (RgfxSlabs, CHURN), one line a process at most every
+// RgfxSlabs::kChurnLogMs once they changed: what the slabs' sources would serve with no empty or
+// cached slab kept.
+static void rgfxLogSlabChurn(void *, const RgfxSlabs::Churn &c)
+{
+	os_log(rgfxLog(),
+	       "RGFX slab churn: small slabs made %llu (%llu KiB), emptied %llu, refilled while kept "
+	       "%llu (%llu KiB), empty let go %llu; large slabs made %llu, taken from the cache %llu "
+	       "(%llu KiB)",
+	       c.classMade, c.classMadeBytes >> 10, c.emptied, c.refilled, c.refilledBytes >> 10,
+	       c.emptyLetGo, c.dedicatedMade, c.dedicatedReused, c.dedicatedReusedBytes >> 10);
+}
+
 // The kext's chunks of texture resource ids, as RgfxIdSpace's chunk source; `context` is the
 // kext link (rgfxKextConn). False once every chunk of the guest's pool is held.
 bool rgfxKextResourceIds(void *context, uint64_t *first_id, uint64_t *ids)
@@ -1119,6 +1132,7 @@ RGFX_LOG_UNRECOGNIZED
 		    managedAtOffset, managedOverCopy);
 		_slabs->setFirst(_pagesSource.get());
 	}
+	_slabs->setChurnLog(&rgfxLogSlabChurn, nullptr);
 	if (!_slabs->start())
 		os_log_error(rgfxLog(),
 		             "RGFX: no slab thread; creates zero and frees let slabs go themselves");

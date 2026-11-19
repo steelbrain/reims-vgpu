@@ -429,6 +429,70 @@ void test_slab_idle_empty_slabs_go()
 	CHECK(slabs.stats().cachedSlabs == 0 && slabs.stats().slabs == 0);
 }
 
+// CHURN: the slabs made, the small buffers' slabs emptied, the empty ones kept that a buffer took
+// from again and those let go, and the cached slabs large buffers took, counted; the background's
+// step calls the churn log with them once they changed, kChurnLogMs after its last call at the
+// soonest.
+std::vector<RgfxSlabs::Churn> g_churnLines;
+void testChurnLog(void *, const RgfxSlabs::Churn &churn) { g_churnLines.push_back(churn); }
+
+void test_slab_churn_counts()
+{
+	Source source(64 * kMiB);
+	RgfxSlabs slabs(source);
+	g_testNowMs = 1000;
+	g_churnLines.clear();
+	slabs.setClock(&testClock, nullptr);
+	slabs.setChurnLog(&testChurnLog, nullptr);
+	auto drain = [&]() {
+		while (slabs.step()) {
+		}
+	};
+	drain();
+	CHECK(g_churnLines.empty()); // nothing counted yet
+	// Slabs of 256 KiB, 512 KiB, 1 and 2 MiB, each emptied: the last two let go.
+	std::vector<RgfxSlabs::Range> held;
+	while (source.takes < 4) {
+		RgfxSlabs::Range r;
+		CHECK(slabs.take(0x20000, kShared, 0, &r));
+		held.push_back(r);
+	}
+	for (auto &r : held)
+		slabs.give(r);
+	RgfxSlabs::Churn c = slabs.churn();
+	CHECK(c.classMade == 4 && c.classMadeBytes == 3840 * 1024 && c.emptied == 4);
+	CHECK(c.emptyLetGo == 2 && c.refilled == 0 && c.dedicatedMade == 0);
+	// A kept empty slab taken from again, the oldest: 256 KiB.
+	RgfxSlabs::Range r;
+	CHECK(slabs.take(0x1000, kShared, 0, &r) && source.takes == 4);
+	c = slabs.churn();
+	CHECK(c.refilled == 1 && c.refilledBytes == 256 * 1024 && c.classMade == 4);
+	// The first log line at the first step with the counts changed.
+	drain();
+	CHECK(g_churnLines.size() == 1 && g_churnLines[0].refilled == 1 &&
+	      g_churnLines[0].emptyLetGo == 2);
+	// A large buffer's slab made, cached at its free, taken again: counted, logged no sooner
+	// than kChurnLogMs after the last line.
+	RgfxSlabs::Range big, again;
+	CHECK(slabs.take(3 * kMiB, kShared, 0, &big));
+	slabs.give(big);
+	CHECK(slabs.take(2 * kMiB, kShared, 0, &again) && again.slab == big.slab);
+	c = slabs.churn();
+	CHECK(c.dedicatedMade == 1 && c.dedicatedReused == 1 && c.dedicatedReusedBytes == 3 * kMiB);
+	g_testNowMs += RgfxSlabs::kChurnLogMs - 1;
+	drain();
+	CHECK(g_churnLines.size() == 1);
+	g_testNowMs += 1;
+	drain();
+	CHECK(g_churnLines.size() == 2 && g_churnLines[1].dedicatedReused == 1);
+	// No line where nothing changed.
+	g_testNowMs += 2 * RgfxSlabs::kChurnLogMs;
+	drain();
+	CHECK(g_churnLines.size() == 2);
+	slabs.give(again);
+	slabs.give(r);
+}
+
 // A buffer past 1 MiB takes a slab of its own; once freed the slab is cached, and a later buffer
 // of its class that needs at least half of it lies there at offset 0, its bytes zeroed. The cache
 // holds a sixteenth of the source, the oldest let go first.
@@ -1525,6 +1589,7 @@ void rgfxSlabTests()
 	test_slab_zeroing();
 	test_slab_empty_slabs_go();
 	test_slab_idle_empty_slabs_go();
+	test_slab_churn_counts();
 	test_slab_dedicated_cache();
 	test_slab_fallbacks();
 	test_slab_first_source();

@@ -68,6 +68,12 @@
  * once. Every buffer in a slab had its destroy posted before its range came back, so the heap's
  * destroy follows theirs.
  *
+ * CHURN. The allocator counts what keeping slabs saved its sources (Churn): slabs made, slabs of
+ * small buffers emptied, the empty ones a class kept that a buffer took from again, those let go,
+ * and the cached slabs large buffers took. The device logs the counts (one line a process, at most
+ * every kChurnLogMs, once they changed), so a run tells how many takes and give-backs a source
+ * would serve without the empty and cached slabs kept.
+ *
  * THE SOURCES. A new slab comes from the first source where one is set (setFirst), at its unit,
  * and from the region's source only where the first has no memory for it; a slab keeps the source
  * it came from, which makes its buffers and takes it back, and its cache's cap is a sixteenth of
@@ -359,6 +365,25 @@ public:
 		uint64_t firstSlabs = 0;   // of the slabs, those the first source made
 	};
 
+	/// What the slabs' reuse saved their sources, counted since the allocator was made: each
+	/// refill of an empty slab a class kept, and each cached slab a large buffer took, is a slab
+	/// its source would otherwise have taken back and given again (CHURN).
+	struct Churn {
+		uint64_t classMade = 0;            // slabs of small buffers made
+		uint64_t classMadeBytes = 0;
+		uint64_t emptied = 0;              // slabs of small buffers left with no buffer in them
+		uint64_t refilled = 0;             // empty slabs a class kept, taken from again
+		uint64_t refilledBytes = 0;        // their sizes
+		uint64_t emptyLetGo = 0;           // empty slabs of small buffers let go
+		uint64_t dedicatedMade = 0;        // slabs of large buffers made
+		uint64_t dedicatedReused = 0;      // cached slabs a large buffer took
+		uint64_t dedicatedReusedBytes = 0; // their sizes
+	};
+
+	/// Called with the counts on the background thread (step), at most every kChurnLogMs and only
+	/// where they changed since the last call.
+	typedef void (*ChurnLog)(void *context, const Churn &churn);
+
 	/// Slabs of `source`: the region's, which RgfxRegion::setReclaim asks to give room back.
 	explicit RgfxSlabs(RgfxSlabSource &source);
 
@@ -413,6 +438,16 @@ public:
 	bool step();
 
 	Stats stats();
+
+	/// The reuse counts so far (CHURN).
+	Churn churn();
+
+	/// Where set, the background thread calls `log(context, counts)` once the counts changed,
+	/// kChurnLogMs after its last call at the soonest. Set before start().
+	void setChurnLog(ChurnLog log, void *context);
+
+	/// How often, at most, the churn log is called, in ms.
+	static constexpr uint64_t kChurnLogMs = 5000;
 
 	/// A buffer's page: what its range is a multiple of, and its offset in its slab.
 	static constexpr uint64_t kGranule = 0x1000;
@@ -508,6 +543,14 @@ private:
 	/// How long the thread may wait before a cached or empty slab is due to go, in ms; -1 where
 	/// none is. Caller holds the lock.
 	int64_t idleWait(uint64_t now) const;
+	/// How long the thread may wait before the churn log is due, in ms; -1 where it is not.
+	/// Caller holds the lock.
+	int64_t churnWait(uint64_t now) const;
+	/// Calls the churn log where it is due. Called without the lock.
+	void logChurn();
+	/// Marks the counts changed: whether the thread needs waking for the log. Caller holds the
+	/// lock.
+	bool churned();
 	void run();
 	uint64_t nowMs() const;
 
@@ -527,6 +570,12 @@ private:
 	std::condition_variable m_dropped;       // a drop is done
 	std::set<Slab *, BySerial> m_dirtySlabs; // slabs with dirty free bytes
 	uint64_t m_nextSerial = 1;
+	Churn m_churn;
+	bool m_churnChanged = false;   // since the last log
+	bool m_churnLogged = false;    // the log was called once
+	uint64_t m_churnLoggedAt = 0;  // when, in ms
+	ChurnLog m_churnLog = nullptr;
+	void *m_churnLogContext = nullptr;
 	std::thread m_thread;
 	bool m_running = false;
 	bool m_stop = false;
