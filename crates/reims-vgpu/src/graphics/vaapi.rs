@@ -501,7 +501,8 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
             targets: self.targets.clone(),
             roles: Arc::new(RoleCounts::default()),
         };
-        let session = HostVideoSession::new(&self.device, codec, NAME, Box::new(decoder))?;
+        let clock = Arc::clone(self.display.runtime());
+        let session = HostVideoSession::new(&self.device, clock, codec, NAME, Box::new(decoder))?;
         Some(Arc::new(session))
     }
 

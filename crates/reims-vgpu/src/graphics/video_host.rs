@@ -52,9 +52,10 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use reims_vgpu_video::core::device_memory::MemoryIdentity;
+use reims_vgpu_video::core::runtime::{MonoTime, Runtime};
 use reims_vgpu_vulkan::core::host::HostPtr;
 use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::Platform;
@@ -218,6 +219,8 @@ pub(crate) struct Landing<'a, P: Platform> {
     /// The output's chroma plane.
     pub(crate) chroma: &'a OutputPlane<P>,
     stage: &'a mut Stage<P>,
+    /// The clock the CPU's copy is timed on: the video crates' runtime's.
+    clock: &'a dyn Runtime,
     /// Where each plane in a device cache is staged in `stage`'s buffer, once asked.
     staged: Option<Staged>,
     /// Whether the CPU copied the picture.
@@ -229,7 +232,7 @@ pub(crate) struct Landing<'a, P: Platform> {
     /// ([`Landing::hardware_failed`]).
     hardware_failed: Option<String>,
     /// When the CPU's copy of the picture started, once [`Landing::host_for_cpu`] answered.
-    cpu_from: Option<Instant>,
+    cpu_from: Option<MonoTime>,
     /// How long [`Landing::copy_rows`]'s copy took.
     cpu_took: Option<Duration>,
 }
@@ -319,7 +322,7 @@ impl<P: Platform> Landing<'_, P> {
     pub(crate) fn host_for_cpu(&mut self) -> Result<HostPlanes<P>, BackendError> {
         let planes = self.host()?;
         self.by_cpu = true;
-        self.cpu_from = Some(Instant::now());
+        self.cpu_from = Some(self.clock.now());
         Ok(planes)
     }
 
@@ -338,7 +341,7 @@ impl<P: Platform> Landing<'_, P> {
         chroma: SourcePlane,
     ) -> Result<(), BackendError> {
         let planes = self.host()?;
-        let started = Instant::now();
+        let started = self.clock.now();
         for (from, to) in [(luma, &planes.luma), (chroma, &planes.chroma)] {
             let rows = u64::try_from(from.rows).map_or(to.rows, |rows| rows.min(to.rows));
             let bytes = u64::try_from(from.row_bytes).map_or(to.row_bytes, |b| b.min(to.row_bytes));
@@ -363,7 +366,7 @@ impl<P: Platform> Landing<'_, P> {
                 }
             }
         }
-        self.cpu_took = Some(started.elapsed());
+        self.cpu_took = Some(self.clock.elapsed_since(started));
         self.by_cpu = true;
         Ok(())
     }
@@ -760,10 +763,11 @@ struct State<P: Platform> {
 
 impl<P: Platform> HostVideoSession<P> {
     /// A session of `codec` (`RGFX_VIDEO_CODEC_*`) on `decoder`, the backend `name`'s, its event
-    /// and its copies into device caches on `device`; `None`, logged, where the device makes no
-    /// shared event or no thread starts.
+    /// and its copies into device caches on `device`, the CPU's copies timed on `clock`'s clock;
+    /// `None`, logged, where the device makes no shared event or no thread starts.
     pub(crate) fn new(
         device: &P::Device,
+        clock: Arc<dyn Runtime>,
         codec: u32,
         name: &'static str,
         decoder: Box<dyn HostDecoder<P>>,
@@ -784,7 +788,7 @@ impl<P: Platform> HostVideoSession<P> {
             let (event, counts) = (event.clone_ref(), Arc::clone(&counts));
             std::thread::Builder::new()
                 .name("reims-vgpu.graphics-video-land".into())
-                .spawn(move || land_pictures(&taken, stage, &event, &counts, name))
+                .spawn(move || land_pictures(&taken, stage, &*clock, &event, &counts, name))
         };
         let landing = match landing {
             Ok(landing) => landing,
@@ -917,6 +921,7 @@ impl<P: Platform> Drop for HostVideoSession<P> {
 fn land_pictures<P: Platform>(
     jobs: &mpsc::Receiver<Job<P>>,
     mut stage: Stage<P>,
+    clock: &dyn Runtime,
     event: &P::SharedEvent,
     counts: &Mutex<Counts>,
     name: &'static str,
@@ -934,7 +939,7 @@ fn land_pictures<P: Platform>(
             _bitstream,
             landed,
         } = job;
-        match picture.map(|picture| land(picture, &output, &mut stage)) {
+        match picture.map(|picture| land(picture, &output, &mut stage, clock)) {
             None => counts.lock().skipped += 1,
             Some(Ok((way, hardware_failed, cpu))) => {
                 let mut counts = counts.lock();
@@ -996,11 +1001,13 @@ fn land<P: Platform>(
     picture: Box<dyn HostPicture<P>>,
     output: &DecodeOutput<P>,
     stage: &mut Stage<P>,
+    clock: &dyn Runtime,
 ) -> Result<(Way, Option<String>, Option<Duration>), BackendError> {
     let mut landing = Landing {
         luma: &output.luma,
         chroma: &output.chroma,
         stage,
+        clock,
         staged: None,
         by_cpu: false,
         decoded: false,
@@ -1009,7 +1016,11 @@ fn land<P: Platform>(
         cpu_took: None,
     };
     picture.land(&mut landing)?;
-    let cpu = (landing.cpu_took).or_else(|| landing.cpu_from.map(|from| from.elapsed()));
+    let cpu = match (landing.cpu_took, landing.cpu_from) {
+        (Some(took), _) => Some(took),
+        (None, Some(from)) => Some(clock.elapsed_since(from)),
+        (None, None) => None,
+    };
     let Landing {
         staged,
         by_cpu,

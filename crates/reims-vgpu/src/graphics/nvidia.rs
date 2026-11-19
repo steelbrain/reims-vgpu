@@ -462,7 +462,8 @@ impl<P: Platform> GraphicsVideo<P> for Shared<P> {
             video: Arc::clone(video),
             declined: Arc::new(AtomicBool::new(false)),
         };
-        let session = HostVideoSession::new(&video.device, codec, NAME, Box::new(decoder))?;
+        let clock = Arc::clone(&video.runtime);
+        let session = HostVideoSession::new(&video.device, clock, codec, NAME, Box::new(decoder))?;
         Some(Arc::new(session))
     }
 
