@@ -175,7 +175,10 @@ impl RtRenderEncoder {
                 let indices = indices(index_buffer, index_buffer_offset, index_type)?;
                 let (kind, count) = (primitive(primitive_type)?, small(index_count)?);
                 let instances = small(instance_count)?;
-                let bases = (i32::try_from(base_vertex).map_err(|_| WIDE)?, small(base_instance)?);
+                let bases = (
+                    i32::try_from(base_vertex).map_err(|_| WIDE)?,
+                    small(base_instance)?,
+                );
                 e.draw_indexed_primitives(kind, count, indices, instances, bases.0, bases.1)?;
             }
             RenderCmd::DrawPatches {
@@ -326,9 +329,8 @@ impl RtRenderEncoder {
             }
             RenderCmd::SetScissorRect { rect } => e.set_scissor_rect(scissor(rect)),
             RenderCmd::SetScissorRects { scissor_rects } => {
-                let rects: Vec<rt::ScissorRect> = (scissor_rects.iter().copied())
-                    .map(scissor)
-                    .collect();
+                let rects: Vec<rt::ScissorRect> =
+                    (scissor_rects.iter().copied()).map(scissor).collect();
                 e.set_scissor_rects(&rects)?;
             }
             RenderCmd::SetViewport { viewport: v } => e.set_viewport(viewport(v))?,
@@ -473,7 +475,9 @@ fn unbuilt_unless(at_default: bool) -> Result<(), Stop> {
 /// The Metal enumeration `T`'s value of `raw`; one it has none of, which `what` names, is Metal's
 /// refusal.
 fn named<T: TryFrom<u32>>(raw: u64, what: &'static str) -> Result<T, Stop> {
-    let value = u32::try_from(raw).ok().and_then(|raw| T::try_from(raw).ok());
+    let value = u32::try_from(raw)
+        .ok()
+        .and_then(|raw| T::try_from(raw).ok());
     value.ok_or(Stop::Metal(what))
 }
 
@@ -752,7 +756,10 @@ mod tests {
 
         // A pass Metal refuses, and one rt refuses: nil, counted.
         let before = counted(metal);
-        assert!(matches!(made().render_encoder(on, &pass(&target, 7)), Ok(None)));
+        assert!(matches!(
+            made().render_encoder(on, &pass(&target, 7)),
+            Ok(None)
+        ));
         assert_eq!(counted(metal), before + 1);
         let gaps = counted(RtRefusal::Gap.code());
         let empty = platform.new_render_pass_descriptor();

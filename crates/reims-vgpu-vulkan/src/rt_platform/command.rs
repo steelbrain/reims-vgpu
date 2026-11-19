@@ -63,12 +63,10 @@ use crate::core::sync::Mutex;
 
 use super::blit::RtBlitEncoder;
 use super::compute::RtComputeEncoder;
-use super::render::RtRenderEncoder;
 use super::device::RtDevice;
+use super::render::RtRenderEncoder;
 use super::texture::refused_metal;
-use super::unbuilt::{
-    RtRefusal, Unbuilt, refuse, refused_as, rt_refused, rt_refused_create,
-};
+use super::unbuilt::{RtRefusal, Unbuilt, refuse, refused_as, rt_refused, rt_refused_create};
 use super::{RtObj, RtPlatform};
 
 /// `MTLCommandBufferErrorDomain`, the domain of a failed command buffer's error.
