@@ -67,6 +67,7 @@ class RgfxReplyReader;
 class RgfxRingWriter;
 class RgfxCompletionThread;
 class RgfxSlabs;
+class RgfxPoolSlabSource;
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -126,6 +127,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// The slabs of the region the device's Shared and Managed buffers lie in (RgfxSlabs). Null
 /// until the wire handshake maps the region.
 - (nullable RgfxSlabs *)slabs;
+
+/// The Shared pool's source, where it is the slabs' one source (RgfxSlabs.hpp, THE SOURCES): what
+/// a Shared heap's block comes from too (RgfxHeap). Null where the device has no pool.
+- (nullable RgfxPoolSlabSource *)rgfxPool;
 
 /// The reader of the control completion ring (RgfxReplyReader): command-buffer
 /// completions, pipeline reflections and shared-event signals. Null until the

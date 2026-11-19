@@ -4898,11 +4898,14 @@ reads it once.
   out of the process before its `CONTEXT_CLOSE`, which gives back every block
   the context still holds the same way. The device's reset frees every block
   at once.
-- **What moves.** Only buffers' slabs: a class's and a large buffer's own,
+- **What moves.** Buffers' slabs: a class's and a large buffer's own,
   and so every buffer that lies in one, upload chunks and Managed buffers'
-  copies among them. None of them falls back to the region: a buffer the
-  pool has no block for is nil, and an upload chunk none, which fails its
-  command buffer as out of memory. The rings, command buffers' bodies,
+  copies among them; and a Shared heap, which an Apple GPU's device makes
+  (an arm64 guest's), a block of its own of the heap's size rounded up to
+  64 KiB, made one `HEAP_OVER_POOL` of the heap's size, type and options.
+  None of them falls back to the region: a buffer the
+  pool has no block for is nil, as is a Shared heap, and an upload chunk
+  none, which fails its command buffer as out of memory. The rings, command buffers' bodies,
   surface copy blocks, the scanout and the cursor stay in the region, and
   the ICB slots where they were (the kext's chunks, else the region).
 - **No empty slab kept.** On the Radeon 780M host (an x86-64 macOS guest's

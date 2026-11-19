@@ -20,6 +20,7 @@
 #include "RgfxHeapSizes.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp" // RgfxSerializer
+#include "RgfxSlabs.hpp"      // RgfxPoolSlabSource
 
 /// Metal's page, which a heap's size is rounded up to.
 static constexpr uint64_t kHeapPage = 0x4000;
@@ -55,15 +56,20 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 - (nullable RgfxBuffer *)rgfxPlaceBufferOfLength:(NSUInteger)length
                                          options:(MTLResourceOptions)options
                                        alignment:(uint64_t)alignment NS_RETURNS_RETAINED;
++ (nullable instancetype)heapOverPoolWithDescriptor:(MTLHeapDescriptor *)descriptor
+                                               pool:(RgfxPoolSlabSource *)pool
+                                             device:(nullable id<MTLDevice>)device
+                                         serializer:(RgfxSerializer *)serializer;
 @end
 
 @implementation RgfxHeap {
 	uint64_t _size; // the descriptor's, rounded up to kHeapPage
 	MTLResourceOptions _options;
 	MTLHeapType _type;
-	void (^_deallocator)(void); // gives a Shared heap's region block back
+	void (^_deallocator)(void); // gives a Shared heap's region or pool block back
 	uint64_t _gpuAddress;       // the GPU address its create picked, given back after its destroy
-	uint8_t *_contents;         // a Shared heap's bytes, its region block's; null for any other
+	BOOL _hostAddress;          // its address is the host's for its pool block: none to give back
+	uint8_t *_contents;         // a Shared heap's bytes, its region or pool block's; null for any other
 	// An Automatic heap's placements, under _rangesLock; null for a heap of another type.
 	std::unique_ptr<RgfxHeapRanges> _ranges;
 	std::mutex _rangesLock;
@@ -83,11 +89,11 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 {
 	void (^deallocator)(void) = _deallocator;
 	RgfxSerializer *serializer = _serializer;
-	uint64_t address = _gpuAddress;
+	uint64_t address = _hostAddress ? 0 : _gpuAddress;
 	[self rgfxRetireThen:[deallocator, serializer, address] {
 		if (deallocator != nil)
 			deallocator();
-		if (serializer != nullptr)
+		if (serializer != nullptr && address != 0)
 			serializer->releaseAddress(address);
 	}];
 }
@@ -123,6 +129,7 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 + (instancetype)heapForDeviceWithDescriptor:(MTLHeapDescriptor *)descriptor
                                   maxLength:(NSUInteger)maxLength
                                      region:(RgfxRegion *)region
+                                       pool:(RgfxPoolSlabSource *)pool
                                      device:(id<MTLDevice>)device
                                  serializer:(RgfxSerializer *)serializer
 {
@@ -138,6 +145,11 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 		return nil;
 	if (descriptor.storageMode != MTLStorageModeShared)
 		return [RgfxHeap heapWithDescriptor:descriptor device:device serializer:serializer];
+	if (pool != nullptr && serializer != nullptr)
+		return [RgfxHeap heapOverPoolWithDescriptor:descriptor
+		                                       pool:pool
+		                                     device:device
+		                                 serializer:serializer];
 	if (region == nullptr || serializer == nullptr)
 		return nil;
 	// A Shared one's memory is a block of the region, on the host too, whole pages of Metal's
@@ -161,6 +173,51 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	                                                serializer:serializer];
 	if (heap == nil)
 		region->release(offset); // no heap lies over the block
+	return heap;
+}
+
+// A Shared heap over a block of the Shared pool (heapForDeviceWithDescriptor:), whose bytes the
+// host zeroed as it gave it: its size rounded up to the pool's 64 KiB, a block of its own, made one
+// HEAP_OVER_POOL, as a slab of the pool is, of the descriptor's size, options and type. It lies at
+// the block's GPU address where the host gave one, which its destroy gives nothing back for, else
+// at the process's pick. The block goes back to the pool once the host has dropped the heap. Nil
+// where the pool has no block for it, as Metal's heap is where memory runs out, past the longest
+// block, or where the device never got the heap.
++ (instancetype)heapOverPoolWithDescriptor:(MTLHeapDescriptor *)descriptor
+                                      pool:(RgfxPoolSlabSource *)pool
+                                    device:(id<MTLDevice>)device
+                                serializer:(RgfxSerializer *)serializer
+{
+	const uint64_t size = static_cast<uint64_t>(descriptor.size);
+	const uint64_t unit = RgfxPoolSlabSource::kUnit;
+	if (size > RgfxPoolSlabSource::kTakeMax)
+		return nil;
+	RgfxSlabSource::Memory memory;
+	if (!pool->take((size + unit - 1) & ~(unit - 1), true, &memory))
+		return nil;
+	const uint32_t options = static_cast<uint32_t>(descriptor.resourceOptions);
+	const int32_t type = static_cast<int32_t>(descriptor.type);
+	RgfxCreated created =
+	    memory.gpuAddress != 0
+	        ? serializer->createHeapOverPoolAt(size, options, type, memory.regionOffset,
+	                                           memory.gpuAddress)
+	        : serializer->createHeapOverPool(size, options, type, memory.regionOffset);
+	if (created.obj_id == 0 || serializer->refused(created)) {
+		pool->give(memory); // no heap lies over the block
+		return nil;
+	}
+	RgfxHeap *heap = [[RgfxHeap alloc] initWithObjId:created.obj_id
+	                                          device:device
+	                                      serializer:serializer];
+	if (heap == nil)
+		return nil;
+	heap->_traceId = RgfxNextTraceObjectId();
+	[heap rgfxTakeDescriptor:descriptor gpuAddress:created.gpu_address];
+	heap->_hostAddress = memory.gpuAddress != 0;
+	heap->_contents = memory.bytes;
+	heap->_deallocator = ^{
+		pool->give(memory);
+	};
 	return heap;
 }
 

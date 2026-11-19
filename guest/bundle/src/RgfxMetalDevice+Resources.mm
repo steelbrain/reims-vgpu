@@ -446,11 +446,13 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
 
 - (id<MTLHeap>)newHeapWithDescriptor:(MTLHeapDescriptor *)descriptor
 {
-	// A Shared heap lives in the device region so the host sees its sub-resources in place, or
-	// is nil; any other storage mode is a device heap (createHeap).
+	// A Shared heap lives in a block of the Shared pool where the device has one, else in the
+	// device region, so the host sees its sub-resources in place, or is nil; any other storage
+	// mode is a device heap (createHeap).
 	id<MTLHeap> heap = [RgfxHeap heapForDeviceWithDescriptor:descriptor
 	                                               maxLength:[self maxBufferLength]
 	                                                  region:[self region]
+	                                                    pool:[self rgfxPool]
 	                                                  device:self
 	                                              serializer:[self serializer]];
 	if (heap == nil) {

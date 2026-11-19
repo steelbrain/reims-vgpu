@@ -1348,6 +1348,11 @@ RGFX_LOG_UNRECOGNIZED
 	return _slabs.get();
 }
 
+- (RgfxPoolSlabSource *)rgfxPool
+{
+	return _poolSource.get();
+}
+
 // A texture over a legacy IOAccel surface, which is how WindowServer's CoreDisplay reaches the
 // surface a display is drawn into. The kext answers where the surface's memory lies, the
 // framebuffer's scanout in the region, and lets this process name it; the texture lies over a

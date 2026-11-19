@@ -40,6 +40,7 @@
 #import "RgfxResource.h"
 
 #ifdef __cplusplus
+class RgfxPoolSlabSource;
 class RgfxRegion;
 class RgfxSerializer;
 #endif
@@ -63,7 +64,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// heapbuffers), but on an Apple GPU (rgfxAppleGPU), where it is made over a block of `region`
 /// (heapOverHostMemoryWithDescriptor:), its buffers' contents there, as the M3 Max under macOS
 /// 27.0.1 makes one, with buffers whose contents the CPU reaches and a texture (oracle_bundle Apple
-/// heap.shared, 11-13); nil where the region has no room.
+/// heap.shared, 11-13); nil where the region has no room. Where the device has the Shared pool
+/// (`pool`, the slabs' one source: RgfxSlabs.hpp, THE SOURCES), the Shared heap is a block of the
+/// pool instead, made one HEAP_OVER_POOL at the block's GPU address where the host gave one, else
+/// at the process's pick, and nil where the pool has no block for it: none is the region's.
 ///
 /// Nil where Metal makes none (measured on the M3 Max, macOS 27.0.1, plain and under
 /// MTL_DEBUG_LAYER, Private, Automatic and Placement): for a size of 0, and for one past
@@ -71,6 +75,7 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable instancetype)heapForDeviceWithDescriptor:(nullable MTLHeapDescriptor *)descriptor
                                            maxLength:(NSUInteger)maxLength
                                               region:(nullable RgfxRegion *)region
+                                                pool:(nullable RgfxPoolSlabSource *)pool
                                               device:(nullable id<MTLDevice>)device
                                           serializer:(nullable RgfxSerializer *)serializer;
 #endif

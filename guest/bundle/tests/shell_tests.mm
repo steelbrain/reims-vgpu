@@ -684,43 +684,53 @@ void test_device_buffers_answer_as_metal()
 	}
 }
 
+// The kext's blocks of the Shared pool, for a pool source: each block of the size asked, zero, at
+// the next offset of the pool from its second 64 KiB (its first another process's), at the GPU
+// address `gpuBase` plus its offset where `gpuBase` is set, else none; no block where `refuse`.
+struct TestPoolKext {
+	bool refuse = false;
+	uint64_t gpuBase = 0;
+	std::map<uint64_t, std::vector<uint8_t>> blocks; // by offset in the pool
+	uint64_t next = RgfxPoolSlabSource::kUnit;
+	static int take(void *context, uint64_t size, uint8_t **bytes, uint64_t *offset,
+	                uint64_t *gpu_address)
+	{
+		TestPoolKext *k = static_cast<TestPoolKext *>(context);
+		if (k->refuse)
+			return KERN_NO_SPACE;
+		*offset = k->next;
+		k->next += size;
+		k->blocks[*offset].assign(size, 0);
+		*bytes = k->blocks[*offset].data();
+		*gpu_address = k->gpuBase != 0 ? k->gpuBase + *offset : 0;
+		return KERN_SUCCESS;
+	}
+	static void give(void *context, uint64_t offset)
+	{
+		static_cast<TestPoolKext *>(context)->blocks.erase(offset);
+	}
+	RgfxPoolMemory calls()
+	{
+		RgfxPoolMemory memory;
+		memory.context = this;
+		memory.take = &TestPoolKext::take;
+		memory.give = &TestPoolKext::give;
+		return memory;
+	}
+};
+
 // Where the slabs are the Shared pool's alone (RgfxSlabs.hpp, THE SOURCES), a queue's upload chunk
 // is a buffer of a pool block's heap, or none: where the kext has no block for it, the region,
 // with room, gives none either, nothing is posted, and the chunk's command buffer fails as out of
 // memory (RgfxUploads.h). Over the region's slabs a chunk lies in the region, as before.
 void test_upload_chunks_of_the_pool_alone()
 {
-	struct Kext {
-		bool refuse = true;
-		std::map<uint64_t, std::vector<uint8_t>> blocks; // by offset in the pool
-		uint64_t next = RgfxPoolSlabSource::kUnit;
-		static int take(void *context, uint64_t size, uint8_t **bytes, uint64_t *offset,
-		                uint64_t *gpu_address)
-		{
-			Kext *k = static_cast<Kext *>(context);
-			if (k->refuse)
-				return KERN_NO_SPACE;
-			*offset = k->next;
-			k->next += size;
-			k->blocks[*offset].assign(size, 0);
-			*bytes = k->blocks[*offset].data();
-			*gpu_address = 0;
-			return KERN_SUCCESS;
-		}
-		static void give(void *context, uint64_t offset)
-		{
-			static_cast<Kext *>(context)->blocks.erase(offset);
-		}
-	};
 	Fixture fx;
 	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x80000, 0xee);
 	RgfxRegion region(mem.data(), mem.size());
-	Kext kext;
-	RgfxPoolMemory calls;
-	calls.context = &kext;
-	calls.take = &Kext::take;
-	calls.give = &Kext::give;
-	RgfxPoolSlabSource pool(region, fx.ser, calls, false, true);
+	TestPoolKext kext;
+	kext.refuse = true;
+	RgfxPoolSlabSource pool(region, fx.ser, kext.calls(), false, true);
 	RgfxSlabs slabs(pool);
 	CHECK(!slabs.inRegion());
 	auto nothingPosted = [&]() {
@@ -1028,6 +1038,7 @@ void test_device_heaps_answer_as_metal()
 		return [RgfxHeap heapForDeviceWithDescriptor:d
 		                                   maxLength:maxLength
 		                                      region:nullptr
+		                                        pool:nullptr
 		                                      device:nil
 		                                  serializer:&fx.ser];
 	};
@@ -3056,6 +3067,7 @@ static int dies_case(const char *name)
 		(void)[RgfxHeap heapForDeviceWithDescriptor:d
 		                                  maxLength:0
 		                                     region:nullptr
+		                                       pool:nullptr
 		                                     device:nil
 		                                 serializer:&fx.ser];
 	}
@@ -3737,6 +3749,7 @@ void test_apple_textures_past_a_buffers_allocation_answer_nil()
 		RgfxHeap *heap = [RgfxHeap heapForDeviceWithDescriptor:hd
 		                                             maxLength:0x100000
 		                                                region:&region
+		                                                  pool:nullptr
 		                                                device:(id<MTLDevice>)apple
 		                                            serializer:&fx.ser];
 		CHECK(heap != nil && heap.size == 0x10000);
@@ -3991,6 +4004,7 @@ void test_shared_heaps_on_an_apple_gpu()
 		return [RgfxHeap heapForDeviceWithDescriptor:d
 		                                   maxLength:maxLength
 		                                      region:&region
+		                                        pool:nullptr
 		                                      device:(id<MTLDevice>)device
 		                                  serializer:&fx.ser];
 	};
@@ -4020,6 +4034,74 @@ void test_shared_heaps_on_an_apple_gpu()
 #endif
 	}
 	drainRing(fx.ring);
+}
+
+// Where the device has the Shared pool (RgfxSlabs.hpp, THE SOURCES), a Shared heap on an Apple GPU
+// is a block of the pool of its size rounded up to 64 KiB, zero as the host gives it, made one
+// HEAP_OVER_POOL of the descriptor's size at the block's GPU address where the host gave one, its
+// buffers its bytes there; its drop gives the block back and no pick of the process's, though one
+// starts at that address. Nil where the pool has no block for it, or where no address is left for
+// a block the host gave none, its block given back: none is the region's.
+void test_shared_heaps_of_the_pool_on_an_apple_gpu()
+{
+	TestRing ring(0x10000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	// Room for one pick of a page, which the process holds: no heap picks an address.
+	RgfxIdSpace ids(RGFX_CONTEXT_VA_BASE, RgfxIdSpace::addressSpan(0x1000));
+	const uint64_t picked = ids.allocAddress(0x1000, 1);
+	CHECK(picked == RGFX_CONTEXT_VA_BASE && ids.allocAddress(0x1000, 1) == 0);
+	RgfxSerializer ser(writer, ids);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x20000, 0xee);
+	RgfxRegion region(mem.data(), mem.size());
+	TestPoolKext kext;
+	RgfxPoolSlabSource pool(region, ser, kext.calls(), false, true);
+	auto make = [&](uint64_t size, id device) {
+		MTLHeapDescriptor *d = [MTLHeapDescriptor new];
+		d.size = size;
+		d.storageMode = MTLStorageModeShared;
+		return [RgfxHeap heapForDeviceWithDescriptor:d
+		                                   maxLength:0x100000
+		                                      region:&region
+		                                        pool:&pool
+		                                      device:(id<MTLDevice>)device
+		                                  serializer:&ser];
+	};
+	id apple = [RgfxAppleHeapDevice new];
+	@autoreleasepool {
+		// The host's address for the block is where the process's pick starts.
+		kext.gpuBase = picked - RgfxPoolSlabSource::kUnit;
+		RgfxHeap *heap = make(0x1000, apple);
+		CHECK(heap != nil && heap.storageMode == MTLStorageModeShared && heap.size == 0x4000);
+		CHECK(kext.blocks.size() == 1 && kext.blocks.begin()->second.size() == 0x10000);
+		uint8_t *at = static_cast<uint8_t *>(heap.rgfxContents);
+		CHECK(at == kext.blocks.begin()->second.data() && at[0] == 0 && at[0xffff] == 0);
+		auto over = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_POOL);
+		CHECK(over.obj_id == heap.rgfxObjId && over.region_offset == RgfxPoolSlabSource::kUnit);
+		CHECK(over.size_bytes == 0x1000 && over.gpu_address == picked &&
+		      heap.gpuAddress == picked);
+		id<MTLBuffer> b = [heap newBufferWithLength:100 options:MTLResourceStorageModeShared];
+		CHECK(b != nil);
+		uint8_t *contents = static_cast<uint8_t *>([b contents]);
+		CHECK(contents >= at && contents + 100 <= at + 0x4000);
+		CHECK(b.gpuAddress == picked + static_cast<uint64_t>(contents - at));
+		auto placed = expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET);
+		CHECK(placed.heap_obj_id == over.obj_id);
+	} // the buffer, then the heap, go
+	drainRing(ring);
+	CHECK(kext.blocks.empty() && ids.allocAddress(0x1000, 1) == 0);
+	@autoreleasepool {
+		// A block with no address of the host's, and none left to pick: nil, the block given back.
+		kext.gpuBase = 0;
+		CHECK(make(0x1000, apple) == nil && kext.blocks.empty() && ringEmpty(ring));
+		// No block: nil.
+		kext.refuse = true;
+		CHECK(make(0x1000, apple) == nil && ringEmpty(ring));
+		CHECK(pool.takes().taken == 2 && pool.takes().given == 2 && pool.takes().refused == 1);
+	}
+	ids.freeAddress(picked);
+	CHECK(ids.allocAddress(0x1000, 1) == picked);
+	drainRing(ring);
 }
 
 // A Shared heap the device is asked for, and a depth or stencil texture the CPU reaches (over a
@@ -21968,6 +22050,7 @@ int main(int argc, char **argv)
 		test_textures_past_max_buffer_length_are_nil();
 		test_shared_heaps_and_cpu_depth_textures_end_the_process();
 		test_shared_heaps_on_an_apple_gpu();
+		test_shared_heaps_of_the_pool_on_an_apple_gpu();
 		test_depth_buffer_textures_as_an_apple_gpu();
 		test_second_buffer_is_monotonic();
 		test_wrapper_guards_and_base();
