@@ -70,6 +70,28 @@ static inline uint32_t rgfxPatEntry(uint64_t pat, uint32_t entry)
 	return (uint32_t)((pat >> (entry * RGFX_PAT_ENTRY_BITS)) & 0xffu);
 }
 
+// A memory type's name as the SDM spells it (Intel SDM Vol. 3A, "PAT Memory Types and Their
+// Encodings"); "?" for the reserved encodings.
+static inline const char *rgfxPatTypeName(uint32_t type)
+{
+	switch (type) {
+	case RGFX_PAT_UNCACHEABLE:
+		return "UC";
+	case RGFX_PAT_WRITE_COMBINING:
+		return "WC";
+	case 0x04u:
+		return "WT";
+	case 0x05u:
+		return "WP";
+	case RGFX_PAT_WRITE_BACK:
+		return "WB";
+	case RGFX_PAT_UNCACHED_MINUS:
+		return "UC-";
+	default:
+		return "?";
+	}
+}
+
 // `pat` with entry 2 write-back and every other entry as it is.
 static inline uint64_t rgfxPatWithDeviceWriteBack(uint64_t pat)
 {
@@ -135,7 +157,8 @@ typedef struct RgfxPatRun {
 
 // Sets entry 2 of every online CPU's PAT to write-back where it is not already, each CPU with its
 // interrupts off and through the SDM's sequence for a PAT change, and logs what it did, `why`
-// naming the caller. Called with interrupts on and no spin lock held.
+// naming the caller: the count of CPUs and of changes, the time, and each CPU's entry 2 as it
+// found it and as it read it back after. Called with interrupts on and no spin lock held.
 RgfxPatRun rgfxPatWriteBackEverywhere(const char *why);
 // From the first call on, the rewrite runs again at each wake; rgfxPatStopWatching takes the
 // interest back.

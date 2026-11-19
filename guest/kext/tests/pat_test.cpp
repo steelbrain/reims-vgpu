@@ -1,11 +1,12 @@
 // The native test of RgfxPat.hpp: the PAT the x86-64 kext writes on every CPU, entry 2 write-back
 // and every other entry as it was, from xnu's PAT and from the one a CPU comes out of reset with;
-// which PAT counts as held; and the record of every CPU's PAT the user client reads out, by CPU
+// which PAT counts as held; the types' names the rewrite logs; and the record of every CPU's PAT the user client reads out, by CPU
 // number, whatever number a CPU answers with.
 #include "RgfxPat.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace {
 int checks = 0;
@@ -43,6 +44,18 @@ int main()
 	check(rgfxPatEntry(RGFX_PAT_XNU, RGFX_PAT_WRITE_COMBINED_ENTRY) == RGFX_PAT_WRITE_COMBINING,
 	      "entry 6, such a page asked write-combined, WC in xnu's PAT");
 	check(RGFX_MSR_PAT == 0x277, "IA32_PAT");
+
+	// The types' names in the rewrite's log line: the SDM's six, "?" for the reserved two and
+	// past them.
+	check(!strcmp(rgfxPatTypeName(RGFX_PAT_UNCACHEABLE), "UC") &&
+	          !strcmp(rgfxPatTypeName(RGFX_PAT_WRITE_COMBINING), "WC") &&
+	          !strcmp(rgfxPatTypeName(0x04), "WT") && !strcmp(rgfxPatTypeName(0x05), "WP") &&
+	          !strcmp(rgfxPatTypeName(RGFX_PAT_WRITE_BACK), "WB") &&
+	          !strcmp(rgfxPatTypeName(RGFX_PAT_UNCACHED_MINUS), "UC-"),
+	      "the six types' names");
+	check(!strcmp(rgfxPatTypeName(0x02), "?") && !strcmp(rgfxPatTypeName(0x03), "?") &&
+	          !strcmp(rgfxPatTypeName(0x08), "?") && !strcmp(rgfxPatTypeName(0xff), "?"),
+	      "reserved encodings");
 
 	// The kext's PAT: entry 2 write-back, every other entry xnu's.
 	const uint64_t kept = rgfxPatWithDeviceWriteBack(RGFX_PAT_XNU);
