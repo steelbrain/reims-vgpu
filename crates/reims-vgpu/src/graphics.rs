@@ -792,6 +792,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             if let Some(imports) = platform.view_imports() {
                 decoder.set_view_imports(imports);
             }
+            // One that keeps no view of an IOSurface's pages has its surfaces take device caches
+            // whose copies move their bytes (`decode::surface_pages`, "Surfaces with no views").
+            if !P::SURFACE_VIEWS {
+                decoder.set_surfaces_unviewed();
+            }
             // A GPU that shares the CPU's memory holds every device cache in the host's RAM
             // beside the guest's pages: they all fit one budget together, past which a surface
             // lies in place, so the copies stay bounded on a small host.

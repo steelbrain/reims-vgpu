@@ -157,6 +157,15 @@
 //! where Metal drops it and the M3 Max faults a render pass's store-out (metal2vulkan-rt's
 //! `rt-no-copy-read-only`). The refusals above stay.
 //!
+//! **Surfaces with no views** (`ApiPlatform::SURFACE_VIEWS`). A platform may keep no view of an
+//! IOSurface's pages (metal2vulkan-rt, whose surfaces are device images that the device cache's
+//! copies sync at the guest's events): an IOSurface block's `SURFACE_PAGES`, and a deferred
+//! block's pages, then make no view and import nothing, however the guest's RAM is mapped, its
+//! runs checked as a view's are ([`PagesRefusal::Unviewed`], counted), and a block named by its
+//! runs that gets no device cache makes none either ([`Unmade::make`]). The surface takes a copy
+//! of its pages as it does where the host makes no view. A pages block, an app's no-copy memory,
+//! still takes its view and its import, where the GPU must see the app's later writes.
+//!
 //! **Heaps over pages** (`RGFX_FEATURE_HEAP_OVER_PAGES`). A pages block, a slab of the guest's, can
 //! hold a `HEAP_OVER_PAGES`, the buffers placed in it costing what a heap over host memory's do. A
 //! block of one run holds it over that run where the guest's RAM is mapped for the host (the memory
@@ -595,6 +604,9 @@ pub(crate) enum PagesRefusal {
     ///
     /// [`HostVm::view_room`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::view_room
     NoRoom,
+    /// The platform keeps no view of an IOSurface's pages (`ApiPlatform::SURFACE_VIEWS`, the
+    /// module doc, "Surfaces with no views"): the block's runs are good, and no view is made.
+    Unviewed,
 }
 
 /// What the views did, for the log ([`SurfaceViews::counts`]).
@@ -635,6 +647,9 @@ pub(crate) struct ViewCounts {
     pub(crate) groups: u64,
     /// Of `private`, the views whose import is a piece of a group dma-buf.
     pub(crate) grouped: u64,
+    /// IOSurface blocks and deferred blocks' pages given no view, the platform keeping none of a
+    /// surface's pages ([`PagesRefusal::Unviewed`]).
+    pub(crate) unviewed: u64,
 }
 
 /// How a block that asked whether it needs a device cache was answered, for the counts
@@ -984,6 +999,9 @@ pub(crate) struct Unmade<P: Platform> {
     /// Whether the view takes a buffer over the whole of it, which holds the runtime's import of
     /// its pages: none where the device caches' copies are staged ([`SurfaceViews::set_staged`]).
     import: bool,
+    /// Whether the platform keeps no view of a surface's pages, so none is made
+    /// ([`PagesRefusal::Unviewed`]).
+    unviewed: bool,
 }
 
 impl<P: Platform> Unmade<P> {
@@ -994,8 +1012,12 @@ impl<P: Platform> Unmade<P> {
 
     /// The view, mapped now, and a Shared buffer over the whole of it on `device`, which holds
     /// the view and the runtime's import of its pages, where the view takes one; the refusal
-    /// where either is not made.
+    /// where either is not made, [`PagesRefusal::Unviewed`] on a platform that keeps no view of a
+    /// surface's pages.
     pub(crate) fn make(&self, device: &P::Device) -> RaiseResult<Result<Made<P>, PagesRefusal>> {
+        if self.unviewed {
+            return Ok(Err(PagesRefusal::Unviewed));
+        }
         let view = match map_view(
             &self.memory,
             Arc::clone(&self.lease),
@@ -1080,6 +1102,8 @@ pub(crate) struct SurfaceViews<P: Platform> {
     /// The device caches' copies are staged ([`Self::set_staged`]): a surface's view takes no
     /// import of its pages.
     staged: bool,
+    /// Whether the platform keeps no view of an IOSurface's pages ([`PagesRefusal::Unviewed`]).
+    surfaces_unviewed: bool,
 }
 
 /// What a `SURFACE_PAGES` found under the views' lock ([`SurfaceViews::surface_pages`]).
@@ -1133,6 +1157,7 @@ impl<P: Platform> SurfaceViews<P> {
             view_addresses: Arc::new(Mutex::new(HostAddresses::imports())),
             known_imports: None,
             staged: false,
+            surfaces_unviewed: false,
         }
     }
 
@@ -1140,6 +1165,12 @@ impl<P: Platform> SurfaceViews<P> {
     /// ([`ViewImports`]).
     pub(crate) fn set_view_imports(&mut self, imports: ViewImports<P>) {
         self.known_imports = Some(imports);
+    }
+
+    /// The platform keeps no view of an IOSurface's pages: [`Self::surface_pages`] makes none
+    /// ([`PagesRefusal::Unviewed`]).
+    pub(crate) fn set_surfaces_unviewed(&mut self) {
+        self.surfaces_unviewed = true;
     }
 
     /// Whether the platform knows a pages block's view's import as a block ([`ViewImports`]).
@@ -1271,7 +1302,9 @@ impl<P: Platform> SurfaceViews<P> {
     /// only their own entries, and two views made at once over the same runs are both cached.
     /// What leaves the views goes once the lock is let go, on this thread. A block that `ask`s
     /// whether it needs a device cache, whose view the platform has no room for, gets none
-    /// ([`PagesRefusal::NoRoom`]). `None` where the device was reset since `settle` began it.
+    /// ([`PagesRefusal::NoRoom`]); on a platform that keeps no view of a surface's pages, no
+    /// block gets one, its runs checked ([`PagesRefusal::Unviewed`]). `None` where the device was
+    /// reset since `settle` began it.
     ///
     /// [`Worker`]: super::worker::Worker
     #[allow(clippy::too_many_arguments)] // the block, its runs, and how its message asks
@@ -1299,6 +1332,16 @@ impl<P: Platform> SurfaceViews<P> {
                 drop(v);
                 drop(old);
                 return Ok(Some(Ok(())));
+            }
+            if v.surfaces_unviewed {
+                let why = match v.checked_runs(platform, pages, runs) {
+                    Ok(_) => PagesRefusal::Unviewed,
+                    Err(why) => why,
+                };
+                let why = v.refused(why);
+                drop(v);
+                drop(old);
+                return Ok(Some(Err(why)));
             }
             (old, v.find(platform, pages, runs))
         };
@@ -1514,6 +1557,8 @@ impl<P: Platform> SurfaceViews<P> {
     fn refused(&mut self, why: PagesRefusal) -> PagesRefusal {
         if matches!(why, PagesRefusal::Unaligned | PagesRefusal::Length) {
             self.counts.bad_runs += 1;
+        } else if why == PagesRefusal::Unviewed {
+            self.counts.unviewed += 1;
         } else {
             self.counts.not_mapped += 1;
         }
@@ -1545,6 +1590,7 @@ impl<P: Platform> SurfaceViews<P> {
             key,
             length: pages.length,
             import: !self.staged,
+            unviewed: self.surfaces_unviewed,
         };
         let block = ByRuns {
             runs: host,
@@ -4750,6 +4796,69 @@ pub(super) mod tests {
         assert_eq!(r.dec.views_of_surfaces().view_addresses_held(), 1);
         r.dec.reset(&r.device);
         assert_eq!(r.dec.views_of_surfaces().view_addresses_held(), 0);
+    }
+
+    /// On a platform that keeps no view of an IOSurface's pages (`ApiPlatform::SURFACE_VIEWS`
+    /// false, metal2vulkan-rt's), an IOSurface block's `SURFACE_PAGES` makes no view and imports
+    /// nothing, though the guest's RAM is mapped, counted as kept unviewed, and bad runs are still
+    /// refused as bad runs; a pages block, an app's no-copy memory, still takes its view and its
+    /// known import, at its `SURFACE_PAGES` answer
+    #[test]
+    fn surfaces_take_no_view_where_the_platform_keeps_none_but_pages_blocks_do() {
+        const IMPORTS: u64 = 0x6_0000_0000;
+        let mut r = rig(16);
+        let page = r.page;
+        // The lengths of the known imports made.
+        let log: Arc<Mutex<Vec<u64>>> = Arc::default();
+        let made = Arc::clone(&log);
+        let imports: ViewImports<FakePlatform> = Arc::new(move |_, _, length, then| {
+            let at = IMPORTS + made.lock().len().to_u64() * 0x100_0000;
+            made.lock().push(length);
+            Some((at, then))
+        });
+        r.dec.set_view_imports(imports);
+        r.dec.set_surfaces_unviewed();
+        let surface = BLOCK + 0x8000;
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.pages_cached(surface, &[(1, 2)], 2 * page, true),
+            RGFX_STATUS_REFUSED,
+            "no view: the surface takes a copy"
+        );
+        assert!(r.dec.views_of_surfaces().view(surface).is_none());
+        let made_buffers = r.p.call_log().sels_since(mark);
+        assert!(
+            !made_buffers.iter().any(|sel| sel.starts_with("newBuffer")),
+            "no buffer over a view: {made_buffers:?}"
+        );
+        assert_eq!(
+            r.pages_cached(surface, &[(1, 1)], 2 * page, true),
+            RGFX_STATUS_REFUSED,
+            "runs short of the surface"
+        );
+        let c = r.dec.views_of_surfaces().counts();
+        assert_eq!((c.made, c.unviewed, c.bad_runs, c.not_mapped), (0, 1, 1, 0));
+        assert!(log.lock().is_empty(), "no import of a surface's pages");
+        // The app's pages block: its view and its known import at the answer.
+        let private = RGFX_SURFACE_PAGES_PRIVATE;
+        assert_eq!(
+            r.pages_flagged(BLOCK, 0, &[(5, 2), (1, 1)], 3 * page, private),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(r.dec.pages_address(&r.device, BLOCK), IMPORTS);
+        assert!(r.has_private_view(BLOCK), "made at the answer");
+        assert_eq!(*log.lock(), [3 * page], "the view's import");
+        assert_eq!(r.dec.views_of_surfaces().counts().unviewed, 1);
+        // Where the caches' copies are staged, a cached block is named by its runs, and what
+        // would make its view, where it got no device cache, makes none.
+        r.dec.set_staged_surface_copies();
+        let named = BLOCK + 0x10000;
+        r.pages_cached(named, &[(9, 2)], 2 * page, true);
+        let unmade = r.dec.views_of_surfaces().by_runs(named).map(|(_, unmade)| unmade);
+        let made = unmade.expect("named by its runs").make(&r.device);
+        assert!(matches!(made, Ok(Err(PagesRefusal::Unviewed))));
+        assert!(r.dec.views_of_surfaces().view(named).is_none());
+        assert_eq!(*log.lock(), [3 * page], "no import of a surface's pages");
     }
 
     /// Where the platform knows a view's import as a block (metal2vulkan-rt's,

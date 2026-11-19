@@ -1586,6 +1586,13 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.shared.surface_views.lock().set_view_imports(imports);
     }
 
+    /// The platform keeps no view of an IOSurface's pages (`ApiPlatform::SURFACE_VIEWS`): an
+    /// IOSurface block's `SURFACE_PAGES`, and a deferred block's pages, make no view
+    /// ([`surface_pages::PagesRefusal::Unviewed`]).
+    pub(crate) fn set_surfaces_unviewed(&self) {
+        self.shared.surface_views.lock().set_surfaces_unviewed();
+    }
+
     /// Carries out the `SURFACE_PAGES` `settle` began: the view of `runs` for the block `pages`
     /// names, which its `BUFFER_OVER_SURFACE_PAGES` buffers lie over, with a buffer over it on
     /// `device` that holds its import: [`RGFX_STATUS_OK`], else [`RGFX_STATUS_REFUSED`] with
@@ -1658,14 +1665,14 @@ impl<P: Platform> GraphicsDecoder<P> {
                 target: "reims_vgpu::graphics",
                 "IOSurface pages in place: {} views made, {} taken from the cache, {} let go of \
                  from it unheld for their mappings; {} pages blocks' views made, {} taken from \
-                 the cache; {} named by their runs; refused: {} for bad runs, {} not mapped; \
-                 asked whether they need a device cache: {} in place, {} in place while the \
-                 device's verdict was pending, {} answered a cache, {} of them for want of room \
-                 for their views; {} pages blocks' views imported as pieces of group dma-bufs, \
-                 in {} groups",
+                 the cache; {} named by their runs; refused: {} for bad runs, {} not mapped, {} \
+                 kept unviewed by the platform; asked whether they need a device cache: {} in \
+                 place, {} in place while the device's verdict was pending, {} answered a cache, \
+                 {} of them for want of room for their views; {} pages blocks' views imported \
+                 as pieces of group dma-bufs, in {} groups",
                 c.made, c.reused, c.idle_returned, c.private, c.private_reused, c.by_runs,
-                c.bad_runs, c.not_mapped, c.asked_in_place, c.asked_pending, c.asked_cache,
-                c.asked_room, c.grouped, c.groups
+                c.bad_runs, c.not_mapped, c.unviewed, c.asked_in_place, c.asked_pending,
+                c.asked_cache, c.asked_room, c.grouped, c.groups
             );
             let (r, held) = {
                 let mut v = views.lock();

@@ -22,6 +22,11 @@ impl ApiPlatform for RtPlatform {
     /// submission for: a surface's cache copies its pages through the host's CPU instead.
     const STAGED_SURFACE_COPIES: bool = true;
 
+    /// rt keeps no view of an IOSurface's pages: a surface is a device image whose bytes the
+    /// device cache's copies move at the guest's events (lock, unlock and the GPU's work that
+    /// uses it), and the views and imports of guest RAM serve an app's own no-copy memory alone.
+    const SURFACE_VIEWS: bool = false;
+
     fn process() -> Arc<RtPlatform> {
         crate::singleton::rt_platform()
     }

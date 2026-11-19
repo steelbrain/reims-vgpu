@@ -62,6 +62,13 @@ pub trait ApiPlatform: Platform {
     /// host's memory may cost each of the platform's submissions while it lives. False by default.
     const STAGED_SURFACE_COPIES: bool = false;
 
+    /// Whether a graphics device on the platform makes views of an IOSurface's pages
+    /// (`graphics::decode::surface_pages`): where false, an IOSurface block's `SURFACE_PAGES`, and
+    /// a deferred block's pages, make no view and import nothing, however the guest's RAM is
+    /// mapped, and the surface takes a device cache whose copies move its bytes at the guest's
+    /// events. A pages block, an app's own no-copy memory, still takes its view. True by default.
+    const SURFACE_VIEWS: bool = true;
+
     /// The process's platform, made on first use.
     fn process() -> Arc<Self>;
 
