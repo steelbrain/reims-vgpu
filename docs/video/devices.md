@@ -149,6 +149,14 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   design.md, "A decode the driver cannot complete is a decode error"); an H.264 picture reaches
   the guest as decoded, as AppleGVA's H.264 decoder reports no failure, so the driver refuses what
   it can tell before a picture, its size, at the create ([bugs.md](bugs.md), D25).
+- **A failed picture's output holds what the driver wrote** where the driver writes the output
+  itself: a picture decoded into its output's cache, and one the driver's video processing
+  copies there or into the pages, which on VA-API is issued right behind its decode and copies
+  the decode surface whatever the decode answers (the VA crate's `zero_copy.rs`), the rt
+  platform's references among them. So does an H.264 picture NVDEC answers failed (below). Where
+  the runtime device's GPU or the CPU copies a picture, VA-API's last two ways, each waits for
+  the decode first, and a failed picture is not copied: its output holds what it held before, as
+  does an HEVC picture NVDEC answers failed, which it refuses (`OnFailed::Refuse`).
 - **An H.264 picture NVDEC answers failed** lands as NVDEC left it, its command buffer completing
   as any, and the pictures after it decode from it, as a Mac's hardware decoder hands such a
   picture on with no error ([nvidia.md](nvidia.md), "An H.264 picture NVDEC failed lands as
