@@ -766,11 +766,12 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
         &self,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::SharedTextureHandle>> {
         let recorded_call = crate::recorder::rec_call!("newSharedTextureHandle", self);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::SharedTextureHandle>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::SharedTextureHandle>> {
                 refuse_create(Unbuilt::SharedTexture, "newSharedTextureHandle");
                 Ok(None)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -892,7 +893,8 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
             resource_index
         );
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtTexture>>> {
-            let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:resourceIndex:";
+            let sel =
+                "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:resourceIndex:";
             let (levels, slices) = (Some(levels), Some(slices));
             let (texture_type, swizzle) = (Some(texture_type), Some(swizzle));
             Ok(self.view(
@@ -992,7 +994,8 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
             if level == 0
                 && let Some(tiled) = self.tiled()
             {
-                if let Err((kind, why)) = tiled.replace(region, u64::from(slice), &bytes, bytes_per_row)
+                if let Err((kind, why)) =
+                    tiled.replace(region, u64::from(slice), &bytes, bytes_per_row)
                 {
                     refused_as(REPLACE, kind, &why);
                 }

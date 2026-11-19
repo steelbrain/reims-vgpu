@@ -41,8 +41,8 @@ impl CommandQueue<RtPlatform> for RtObj<RtQueue> {
         on: OnFault,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
         let recorded_call = crate::recorder::rec_call!("commandBuffer", self);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
                 let _ = on;
                 Ok(match self.rt.command_buffer() {
                     Ok(made) => Some(RtObj::new(RtCommandBuffer::new(
@@ -55,7 +55,8 @@ impl CommandQueue<RtPlatform> for RtObj<RtQueue> {
                         None
                     }
                 })
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }

@@ -433,9 +433,8 @@ impl Platform for RtPlatform {
 
     fn new_render_pass_descriptor(&self) -> RtObj<PassFields> {
         let recorded_call = crate::recorder::rec_call!("MTLRenderPassDescriptor.new", self);
-        let recorded_answer = crate::recorder::run(|| -> RtObj<PassFields> {
-            RtObj::new(PassFields::default())
-        });
+        let recorded_answer =
+            crate::recorder::run(|| -> RtObj<PassFields> { RtObj::new(PassFields::default()) });
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -447,9 +446,8 @@ impl Platform for RtPlatform {
     fn render_pass_descriptor(&self) -> RtObj<PassFields> {
         let recorded_call =
             crate::recorder::rec_call!("MTLRenderPassDescriptor.renderPassDescriptor", self);
-        let recorded_answer = crate::recorder::run(|| -> RtObj<PassFields> {
-            RtObj::new(PassFields::default())
-        });
+        let recorded_answer =
+            crate::recorder::run(|| -> RtObj<PassFields> { RtObj::new(PassFields::default()) });
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -490,12 +488,13 @@ impl Platform for RtPlatform {
             self,
             sample_count
         );
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<Unmade<kinds::RateMapLayerDescriptor>>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<Unmade<kinds::RateMapLayerDescriptor>>> {
                 let _ = (on, sample_count);
                 refuse_create(Unbuilt::RateMap, "initWithSampleCount:");
                 Ok(None)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }

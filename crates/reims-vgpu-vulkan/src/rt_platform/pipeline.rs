@@ -451,12 +451,13 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
     ) -> RaiseResult<Option<<RtPlatform as Platform>::FunctionHandle>> {
         let recorded_call =
             crate::recorder::rec_call!("functionHandleWithFunction:", self, function);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::FunctionHandle>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::FunctionHandle>> {
                 let _ = function;
                 refuse_create(Unbuilt::FunctionTable, "functionHandleWithFunction:");
                 Ok(None)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -471,15 +472,16 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
             self,
             function_count
         );
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::VisibleFunctionTable>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::VisibleFunctionTable>> {
                 let _ = function_count;
                 refuse_create(
                     Unbuilt::FunctionTable,
                     "newVisibleFunctionTableWithDescriptor:",
                 );
                 Ok(None)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }

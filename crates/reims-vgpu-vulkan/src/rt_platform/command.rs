@@ -435,8 +435,8 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         on: OnFault,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::BlitEncoder>> {
         let recorded_call = crate::recorder::rec_call!("blitCommandEncoder", self);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::BlitEncoder>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::BlitEncoder>> {
                 let _ = on;
                 Ok(match self.rt.blit_command_encoder() {
                     Ok(encoder) => {
@@ -448,7 +448,8 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                         None
                     }
                 })
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -489,7 +490,9 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 seen.push(Box::new(move |_made: &rt::CommandBuffer| drop(kept)));
             }
             let run = |handlers: Vec<Handler>| {
-                move |made: &rt::CommandBuffer| handlers.into_iter().for_each(|handler| handler(made))
+                move |made: &rt::CommandBuffer| {
+                    handlers.into_iter().for_each(|handler| handler(made))
+                }
             };
             let committed = || -> Result<(), rt::Error> {
                 if !submission.is_empty() {
@@ -517,12 +520,13 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         on: OnFault,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::ComputeEncoder>> {
         let recorded_call = crate::recorder::rec_call!("computeCommandEncoder", self);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::ComputeEncoder>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::ComputeEncoder>> {
                 let _ = on;
                 let serial = rt::DispatchType::Serial;
                 Ok(self.compute_encoder_of("computeCommandEncoder", serial))
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -618,8 +622,8 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
             self,
             render_pass_descriptor
         );
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::RenderEncoder>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::RenderEncoder>> {
                 let _ = on;
                 let sel = "renderCommandEncoderWithDescriptor:";
                 let pass = match render_pass_descriptor.rt_pass() {
@@ -645,7 +649,8 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                         None
                     }
                 })
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -707,16 +712,19 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     ) -> RaiseResult<Option<<RtPlatform as Platform>::ComputeEncoder>> {
         let recorded_call =
             crate::recorder::rec_call!("computeCommandEncoderWithDescriptor:", self, desc);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::ComputeEncoder>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::ComputeEncoder>> {
                 let sel = "computeCommandEncoderWithDescriptor:";
                 let dispatch_type = match desc.dispatch_type {
                     None | Some(0) => rt::DispatchType::Serial,
                     Some(1) => rt::DispatchType::Concurrent,
-                    Some(other) => return Ok(refused_metal(sel, &format!("MTLDispatchType {other}"))),
+                    Some(other) => {
+                        return Ok(refused_metal(sel, &format!("MTLDispatchType {other}")));
+                    }
                 };
                 Ok(self.compute_encoder_of(sel, dispatch_type))
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -726,8 +734,8 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     /// kept whole.
     fn split(&self, on: OnFault) -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
         let recorded_call = crate::recorder::rec_call!("m2v.split", self);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
                 if self.kept_whole_by().is_some() {
                     return Ok(None);
                 }
@@ -736,7 +744,8 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 };
                 self.commit(on)?;
                 Ok(Some(next))
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -745,14 +754,15 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     /// otherwise, or where rt refuses it, counted.
     fn part(&self, on: OnFault) -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
         let recorded_call = crate::recorder::rec_call!("m2v.part", self);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
                 let _ = on;
                 if self.kept_whole_by().is_some() {
                     return Ok(None);
                 }
                 Ok(self.next_part())
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }

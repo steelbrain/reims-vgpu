@@ -1849,7 +1849,9 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
             if let Some(why) = tiled::bad_layout(rt_device, &desc, length, offset, bytes_per_row) {
                 return Ok(refused_metal(sel, &why));
             }
-            let own = |d: &rt::TextureDescriptor, index: Option<u32>| rt_device.new_texture(d, index);
+            let own = |d: &rt::TextureDescriptor, index: Option<u32>| {
+                rt_device.new_texture(d, index)
+            };
             let held = (self.options, texture::STORAGE_BITS);
             let diag = |shape: &Shape| Made::new(Call::Tiled, shape);
             let made = texture::make_over(&self.device, sel, &desc, held, own, diag);

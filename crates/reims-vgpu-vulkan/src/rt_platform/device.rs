@@ -623,15 +623,24 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
                 None,
             );
         }
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
                 let _ = on;
                 let sel = "newBufferWithBytesNoCopy:length:options:deallocator:";
                 let length = bytes.len();
-                let made =
-                    buffer::over_host_memory(self, sel, bytes, length, options, None, None, deallocator);
+                let made = buffer::over_host_memory(
+                    self,
+                    sel,
+                    bytes,
+                    length,
+                    options,
+                    None,
+                    None,
+                    deallocator,
+                );
                 Ok(made)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -646,12 +655,13 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
         let recorded_call =
             crate::recorder::rec_call!("newBufferWithLength:options:", self, length, options);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
                 let _ = on;
                 let sel = "newBufferWithLength:options:";
                 Ok(buffer::of_length(self, sel, length, options))
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -666,12 +676,13 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
         let recorded_call =
             crate::recorder::rec_call!("newBufferWithLength:options:", self, length, options);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
                 let _ = on;
                 let sel = "newBufferWithLength:options:";
                 Ok(buffer::scratch_of_length(self, sel, length, options))
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -694,14 +705,16 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
             options,
             aligned_byte
         );
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
                 let _ = on;
                 let sel = "newBufferWithLength:options: (exportable)";
                 let handle = rt::ExportHandle::OpaqueFd;
-                let made = super::export::exportable(self, sel, handle, length, options, aligned_byte);
+                let made =
+                    super::export::exportable(self, sel, handle, length, options, aligned_byte);
                 Ok(made)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -725,14 +738,16 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
             options,
             aligned_byte
         );
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
                 let _ = on;
                 let sel = "newBufferWithLength:options: (dma-buf)";
                 let handle = rt::ExportHandle::DmaBuf;
-                let made = super::export::exportable(self, sel, handle, length, options, aligned_byte);
+                let made =
+                    super::export::exportable(self, sel, handle, length, options, aligned_byte);
                 Ok(made)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -769,9 +784,8 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     /// work to its one GPU queue.
     fn new_command_queue_unshared(&self) -> Option<RtObj<RtQueue>> {
         let recorded_call = crate::recorder::rec_call!("m2v.newCommandQueueUnshared", self);
-        let recorded_answer = crate::recorder::run(|| -> Option<RtObj<RtQueue>> {
-            self.new_command_queue()
-        });
+        let recorded_answer =
+            crate::recorder::run(|| -> Option<RtObj<RtQueue>> { self.new_command_queue() });
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -799,13 +813,14 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
             self,
             compute_function
         );
-        let recorded_answer =
-            crate::recorder::run(|| -> Result<Option<<RtPlatform as Platform>::ComputePipeline>, NsErrorText> {
+        let recorded_answer = crate::recorder::run(
+            || -> Result<Option<<RtPlatform as Platform>::ComputePipeline>, NsErrorText> {
                 let Some(function) = compute_function else {
                     return Ok(None);
                 };
                 pipeline::of_function(self, function).map(Some)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -813,10 +828,11 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     /// The platform's shaders, read once (`super::library`).
     fn new_shader_library(&self) -> Result<Option<<RtPlatform as Platform>::Library>, NsErrorText> {
         let recorded_call = crate::recorder::rec_call!("newLibraryWithSource:options:error:", self);
-        let recorded_answer =
-            crate::recorder::run(|| -> Result<Option<<RtPlatform as Platform>::Library>, NsErrorText> {
+        let recorded_answer = crate::recorder::run(
+            || -> Result<Option<<RtPlatform as Platform>::Library>, NsErrorText> {
                 library::shader_library(&self.shaders).map(Some)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -854,10 +870,11 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         data: &[u8],
     ) -> RaiseResult<Result<Option<<RtPlatform as Platform>::Library>, NsErrorText>> {
         let recorded_call = crate::recorder::rec_call!("newLibraryWithData:error:", self, data);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Result<Option<<RtPlatform as Platform>::Library>, NsErrorText>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Result<Option<<RtPlatform as Platform>::Library>, NsErrorText>> {
                 Ok(library::new_library(data).map(Some))
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -887,12 +904,13 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     ) -> RaiseResult<Option<<RtPlatform as Platform>::RateMap>> {
         let recorded_call =
             crate::recorder::rec_call!("newRasterizationRateMapWithDescriptor:", self, descriptor);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::RateMap>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::RateMap>> {
                 let _ = descriptor;
                 refuse_create(Unbuilt::RateMap, "newRasterizationRateMapWithDescriptor:");
                 Ok(None)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -921,12 +939,13 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
         let recorded_call =
             crate::recorder::rec_call!("newSharedTextureWithDescriptor:", self, descriptor);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
                 let _ = descriptor;
                 refuse_create(Unbuilt::SharedTexture, "newSharedTextureWithDescriptor:");
                 Ok(None)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -943,8 +962,8 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
             handle,
             resource_index
         );
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
                 if let Some(handle) = handle {
                     handle.unreachable()
                 }
@@ -954,7 +973,8 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
                     "newSharedTextureWithHandle:withResourceIndex:",
                 );
                 Ok(None)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -968,12 +988,13 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
         let recorded_call =
             crate::recorder::rec_call!("newTextureWithDescriptor:", self, descriptor);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
                 let _ = on;
                 let sel = "newTextureWithDescriptor:";
                 Ok(super::texture::make(self, sel, &descriptor.desc()))
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -1090,10 +1111,11 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
                 crate::recorder::contents(&mut recorded_call, bytes);
             }
         }
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
                 Ok(buffer::of_desc(self, desc))
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -1141,10 +1163,11 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     ) -> RaiseResult<Option<<RtPlatform as Platform>::SamplerState>> {
         let recorded_call =
             crate::recorder::rec_call!("newSamplerStateWithDescriptor:", self, desc);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::SamplerState>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::SamplerState>> {
                 Ok(super::state::new_sampler_state(self, desc))
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -1157,10 +1180,11 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     ) -> RaiseResult<Option<<RtPlatform as Platform>::DepthStencilState>> {
         let recorded_call =
             crate::recorder::rec_call!("newDepthStencilStateWithDescriptor:", self, desc);
-        let recorded_answer =
-            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::DepthStencilState>> {
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::DepthStencilState>> {
                 Ok(super::state::new_depth_stencil_state(self, desc))
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -1199,10 +1223,11 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     ) -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
         let recorded_call =
             crate::recorder::rec_call!("newRenderPipelineStateWithDescriptor:error:", self, desc);
-        let recorded_answer =
-            crate::recorder::run(|| -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
+        let recorded_answer = crate::recorder::run(
+            || -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
                 render_pipeline::of_value(self, desc).map(Some)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -1214,10 +1239,11 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     ) -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
         let recorded_call =
             crate::recorder::rec_call!("newRenderPipelineStateWithDescriptor:error:", self, desc);
-        let recorded_answer =
-            crate::recorder::run(|| -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
+        let recorded_answer = crate::recorder::run(
+            || -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
                 render_pipeline::of_descriptor(self, desc).map(Some)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -1232,10 +1258,11 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
             self,
             desc
         );
-        let recorded_answer =
-            crate::recorder::run(|| -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
+        let recorded_answer = crate::recorder::run(
+            || -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
                 render_pipeline::of_mesh_descriptor(desc).map(Some)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
@@ -1250,10 +1277,11 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
             self,
             desc
         );
-        let recorded_answer =
-            crate::recorder::run(|| -> Result<Option<<RtPlatform as Platform>::ComputePipeline>, NsErrorText> {
+        let recorded_answer = crate::recorder::run(
+            || -> Result<Option<<RtPlatform as Platform>::ComputePipeline>, NsErrorText> {
                 pipeline::of_descriptor(self, desc).map(Some)
-            });
+            },
+        );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }

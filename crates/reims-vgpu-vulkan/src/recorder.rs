@@ -166,7 +166,6 @@ use std::time::Duration;
 
 use crate::core::host::HostPtr;
 use crate::core::platform::Handle as _;
-use crate::core::platform::resource::Texture as _;
 use crate::core::platform::types::{CommandBufferStatus, NsRange};
 use crate::core::sync::Mutex;
 use crate::gpu::command::{CommandBufferObject, VulkanCommandBuffer};
@@ -698,10 +697,10 @@ fn cmd_args_of(v: Value) -> Vec<Value> {
 /// rest (blocks and handlers) is nil.
 pub mod spec {
     use super::{Value, typed};
+    use crate::core::platform::Platform;
     use crate::core::platform::event::EventRef;
     use crate::core::platform::host_range::HostRange;
     use crate::core::platform::types::NsRange;
-    use crate::core::platform::Platform;
     use crate::core::platform::values::{
         ColorAttachmentSet, DepthAttachmentSet, PassSet, StencilAttachmentSet,
     };
@@ -1649,10 +1648,7 @@ pub fn resource_id<O: Receiver + ?Sized, E>(
 }
 
 /// [`resource_id`] of a getter that never raises.
-pub fn plain_resource_id<O: Receiver + ?Sized>(
-    object: &O,
-    read: impl FnOnce() -> u64,
-) -> u64 {
+pub fn plain_resource_id<O: Receiver + ?Sized>(object: &O, read: impl FnOnce() -> u64) -> u64 {
     let Ok(id) = resource_id(object, || Ok::<u64, std::convert::Infallible>(read()));
     id
 }
