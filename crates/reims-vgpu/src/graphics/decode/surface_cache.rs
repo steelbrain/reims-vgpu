@@ -60,6 +60,15 @@
 //!   pages, the CPU's writes, over it. On a block that reads back (Early copy, below), the
 //!   write's early copy lands in the pages whenever the GPU runs it, among the CPU's writes, as
 //!   a GPU's write lands where the GPU shares the CPU's memory, and the fill waits for it.
+//! - **Refill.** The generation moves at a read-write lock, not at its unlock, so a buffer
+//!   committed while a CPU holds the lock fills the cache with the pages as they were mid-write,
+//!   and the CPU's writes after it would reach the cache only at the next lock. A guest that took
+//!   `RGFX_FEATURE_SURFACE_REFILL` tracks each cached surface's unlock seed from such a commit,
+//!   and once the unlock has come, the next buffer's use carries `RGFX_SURFACE_USE_REFILL`: the
+//!   cache is filled again at the generation it holds, as for a newer one, unless a buffer that
+//!   may write it was committed since its last copy into the pages, whose write a fill would
+//!   lose: the cache is then kept, as without the flag ([`SurfaceCaches::refill`]). Both are
+//!   counted in the caches' summary.
 //! - **Download.** The pages are written from the cache only at a `SURFACE_DOWNLOAD` (a CPU lock
 //!   after a GPU write), at the block's `BLOCK_RELEASE` and where the kext names the block's pages
 //!   again (`SURFACE_PAGES`), and only where a buffer that may write the surface was committed
@@ -307,7 +316,9 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use reims_vgpu_graphics::ops::{RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
+use reims_vgpu_graphics::ops::{
+    RGFX_SURFACE_USE_REFILL, RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse,
+};
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
     RGFX_BLOCK_RELEASE_NO_CLIENT, RGFX_BLOCK_RELEASE_UNHELD, RgfxBufferOverSurfacePages,
@@ -1322,6 +1333,12 @@ pub(crate) struct CacheCounts {
     /// Fills a device of the host's write over the pages asked, and downloads and releases of a
     /// written cache it kept from copying.
     pub(crate) host_writes: u64,
+    /// Fills a use's [`RGFX_SURFACE_USE_REFILL`] asked at the generation the cache holds, the CPU
+    /// having written the pages after the lock that moved it; and refills not made, as a command
+    /// buffer that may write the cache was committed since its last copy into the pages
+    /// ([`SurfaceCaches::refill`]).
+    pub(crate) refills: u64,
+    pub(crate) refills_kept: u64,
     /// Releases of a written cache whose surface had no client left
     /// (`RGFX_BLOCK_RELEASE_NO_CLIENT`), copied into the pages all the same.
     pub(crate) unread: u64,
@@ -1630,6 +1647,18 @@ struct Since {
     users: HashMap<u64, u64>,
     written: bool,
     writes: u32,
+}
+
+/// What a use's [`RGFX_SURFACE_USE_REFILL`] asks of its block's cache
+/// ([`SurfaceCaches::refill`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refill {
+    /// No refill: the use asks none, or the cache holds another generation than the use's.
+    None,
+    /// The cache is filled again at the generation it holds.
+    Fill,
+    /// The cache is kept: it holds a command buffer's write its pages lack.
+    Kept,
 }
 
 /// A fill made: its transfer queue's fills, and the value at which it is done.
@@ -2478,9 +2507,34 @@ impl<P: Platform> SurfaceCaches<P> {
         })
     }
 
-    /// [`Self::needs_fill_at`] of a use's block and generation.
+    /// Whether the use `u` needs a fill of its block's cache first: [`Self::needs_fill_at`] of its
+    /// block and generation, or a refill it asks that is made ([`Self::refill`]).
     fn needs_fill(&self, u: &RgfxOpSurfaceUse) -> bool {
-        self.needs_fill_at(u.block_offset, u.cpu_gen)
+        self.needs_fill_at(u.block_offset, u.cpu_gen) || self.refill(u) == Refill::Fill
+    }
+
+    /// What the use `u` asks with [`RGFX_SURFACE_USE_REFILL`]: the guest's process saw a CPU
+    /// write the surface's pages after the read-write lock that moved the surface to `u`'s
+    /// generation (the lock was held as an earlier command buffer was committed, and its unlock
+    /// has come since), so the cache, which holds that generation, or will once the fills asked
+    /// of it are made ([`Self::will_hold`]), may hold the pages as they were mid-write. It is
+    /// filled again ([`Refill::Fill`]), unless a command buffer that may write it was committed
+    /// since its last copy into the pages ([`Refill::Kept`]): a fill would lose that buffer's
+    /// writes, which the pages lack, and the cache stays as at an equal generation without the
+    /// flag. [`Refill::None`] where the use asks none, its block has no cache, or the cache
+    /// holds another generation: an older one is filled whatever the flag, and a newer one was
+    /// filled from the pages after a later lock.
+    fn refill(&self, u: &RgfxOpSurfaceUse) -> Refill {
+        if u.flags & RGFX_SURFACE_USE_REFILL == 0 {
+            return Refill::None;
+        }
+        let block = u.block_offset;
+        if self.will_hold(block).and_then(|(held, _)| held) != Some(u.cpu_gen) {
+            return Refill::None;
+        }
+        let written = (self.by_block.get(&block)).is_some_and(|cache| cache.written)
+            || (self.deferred.get(&block)).is_some_and(|q| q.iter().any(|d| d.since.written));
+        if written { Refill::Kept } else { Refill::Fill }
     }
 
     /// The use `u` of a block with a cache, before command buffer `cb` runs: its count among the
@@ -2511,10 +2565,16 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         let older = held.is_none_or(|held| u.cpu_gen > held);
         let host_wrote = self.watched.writes(block) > host;
+        let refill = self.refill(u);
+        if refill == Refill::Kept {
+            self.counts.refills_kept += 1;
+        }
         let mut filled = Ok(());
-        if older || host_wrote {
-            if !older {
+        if older || host_wrote || refill == Refill::Fill {
+            if !older && host_wrote {
                 self.counts.host_writes += 1;
+            } else if !older {
+                self.counts.refills += 1;
             }
             if self.pending(block, false) > 0 || self.deferring(block) {
                 self.defer_fill(device, block, u.cpu_gen);
@@ -2821,7 +2881,9 @@ impl<P: Platform> SurfaceCaches<P> {
             return Some(true);
         };
         let host_writes = self.watched.try_writes(block)?;
-        let fills = held.is_none_or(|held| u.cpu_gen > held) || host_writes > host;
+        let fills = held.is_none_or(|held| u.cpu_gen > held)
+            || host_writes > host
+            || self.refill(u) == Refill::Fill;
         let writes = u.flags & RGFX_SURFACE_USE_WRITES != 0;
         let follows = (self.deferred.get(&block))
             .is_some_and(|q| writes || q.iter().any(|d| matches!(d.copy, Asked::Fill { .. })));
@@ -6018,12 +6080,36 @@ mod tests {
         uses: &[(u64, u64, bool)],
         asks: bool,
     ) -> Vec<u8> {
+        let flagged: Vec<_> = (uses.iter())
+            .map(|&(block, generation, writes)| {
+                let flags = if writes { RGFX_SURFACE_USE_WRITES } else { 0 };
+                (block, generation, flags)
+            })
+            .collect();
+        flagged_message(queue, cb_obj_id, &flagged, asks)
+    }
+
+    /// Command buffer `cb_obj_id` on queue `queue`, which uses each (block, generation,
+    /// `RGFX_SURFACE_USE_*` flags) of `uses` and does nothing else.
+    fn use_flagged(r: &mut Rig, queue: u64, cb_obj_id: u64, uses: &[(u64, u64, u32)]) {
+        let message = flagged_message(queue, cb_obj_id, uses, false);
+        assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+    }
+
+    /// The `COMMAND_BUFFER` message of [`use_flagged`], asking for its `CB_SUBMITTED` where it
+    /// `asks`.
+    fn flagged_message(
+        queue: u64,
+        cb_obj_id: u64,
+        uses: &[(u64, u64, u32)],
+        asks: bool,
+    ) -> Vec<u8> {
         let mut ops = Vec::new();
-        for &(block_offset, cpu_gen, writes) in uses {
+        for &(block_offset, cpu_gen, flags) in uses {
             let body = RgfxOpSurfaceUse {
                 block_offset,
                 cpu_gen,
-                flags: if writes { RGFX_SURFACE_USE_WRITES } else { 0 },
+                flags,
                 reserved_14: 0,
             };
             let header = RgfxOpHeader {
@@ -6616,6 +6702,146 @@ mod tests {
             );
         }
         assert_eq!(r.dec.caches().counts().fills, 2, "1's, the first, and 3's");
+    }
+
+    /// A use that carries `RGFX_SURFACE_USE_REFILL` at the generation the cache holds fills it
+    /// again from the pages: the CPU wrote them after the lock that moved the generation, whose
+    /// first use filled the cache mid-write. The same use without the flag, as an older guest
+    /// sends it, fills nothing, nor does one of a flag bit the host does not know.
+    #[test]
+    fn a_refill_at_the_cache_s_generation_fills_it_again() {
+        let mut r = cached();
+        let cache = cache_id(&r);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        use_flagged(&mut r, 1, 0x101, &[(BLOCK, 1, 0)]);
+        use_flagged(&mut r, 1, 0x102, &[(BLOCK, 1, 1 << 2)]);
+        assert_eq!(copies(&r.p.call_log().since(mark)), [], "no flag asks none");
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        use_flagged(&mut r, 1, 0x103, &[(BLOCK, 1, RGFX_SURFACE_USE_REFILL)]);
+        let calls = r.p.call_log().since(mark);
+        let filled = copies(&calls);
+        assert_eq!(filled.len(), 1, "{filled:?}");
+        assert_eq!(filled[0].1, cache, "into the cache");
+        let transfer = events(&calls, SIGNAL)[0];
+        assert!(
+            events(&calls, WAIT).contains(&transfer),
+            "the buffer waits for its refill"
+        );
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (counts.fills, counts.refills, counts.refills_kept),
+            (2, 1, 0)
+        );
+        // Each use that carries it fills again: the guest sets it once for each unlock it sees.
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        use_flagged(&mut r, 1, 0x104, &[(BLOCK, 1, RGFX_SURFACE_USE_REFILL)]);
+        assert_eq!(copies(&r.p.call_log().since(mark)).len(), 1);
+        assert_eq!(r.dec.caches().counts().refills, 2);
+    }
+
+    /// A refill asks nothing of a cache of another generation: an older use's cache was filled
+    /// from the pages after a later lock, and a newer use's is filled whatever the flag, counted
+    /// as a fill of a newer generation, not as a refill.
+    #[test]
+    fn a_refill_of_another_generation_asks_nothing_more() {
+        let mut r = cached();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 3, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        use_flagged(&mut r, 1, 0x101, &[(BLOCK, 2, RGFX_SURFACE_USE_REFILL)]);
+        assert_eq!(copies(&r.p.call_log().since(mark)), [], "older");
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        use_flagged(&mut r, 1, 0x102, &[(BLOCK, 4, RGFX_SURFACE_USE_REFILL)]);
+        assert_eq!(copies(&r.p.call_log().since(mark)).len(), 1, "newer");
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (counts.fills, counts.refills, counts.refills_kept),
+            (2, 0, 0)
+        );
+    }
+
+    /// A refill keeps a cache that a command buffer may have written since its last copy into
+    /// the pages, as at an equal generation without the flag: a fill would lose the write, which
+    /// the pages lack. Once a download copied the cache into the pages, a refill fills again. A
+    /// writer begun and not finished keeps it too, as does one that uses the cache behind a fill
+    /// asked of it.
+    #[test]
+    fn a_refill_keeps_a_cache_a_command_buffer_wrote() {
+        let mut r = cached();
+        let cache = cache_id(&r);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, true)]);
+        let mark = r.p.call_log().mark();
+        use_flagged(&mut r, 2, 0x101, &[(BLOCK, 1, RGFX_SURFACE_USE_REFILL)]);
+        assert_eq!(
+            copies(&r.p.call_log().since(mark)),
+            [],
+            "the writer is running"
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        use_flagged(&mut r, 1, 0x102, &[(BLOCK, 1, RGFX_SURFACE_USE_REFILL)]);
+        assert_eq!(copies(&r.p.call_log().since(mark)), [], "written");
+        let counts = r.dec.caches().counts();
+        assert_eq!((counts.refills, counts.refills_kept), (0, 2));
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+        use_flagged(&mut r, 1, 0x103, &[(BLOCK, 1, RGFX_SURFACE_USE_REFILL)]);
+        let copied = copies(&r.p.call_log().since(mark));
+        assert_eq!(copied.len(), 2, "{copied:?}");
+        let pages = copied[0].1;
+        assert_eq!(
+            copied,
+            [(cache, pages), (pages, cache)],
+            "the download, then the refill"
+        );
+        assert_eq!(r.dec.caches().counts().refills, 1);
+        // A buffer begun and not finished that uses the cache defers the refill to its finish,
+        // and a writer counted behind the deferred fill keeps the next refill: once the fill is
+        // made, the writer's write lies in the cache alone.
+        r.p.world().complete_all(CompleteOn::Caller);
+        let queue = r.device.new_command_queue().unwrap();
+        let use_of = |flags| {
+            [RgfxOpSurfaceUse {
+                block_offset: BLOCK,
+                cpu_gen: 1,
+                flags,
+                reserved_14: 0,
+            }]
+        };
+        let begin = |flags| {
+            let cb = queue.command_buffer(ON).unwrap().unwrap();
+            let (waits, uses) = (r.dec.surface_caches)
+                .before(&r.device, &cb, &use_of(flags), &NO_REACH)
+                .unwrap();
+            (waits, (uses, cb))
+        };
+        let (_, read) = begin(0);
+        let mark = r.p.call_log().mark();
+        let (waits, refilled) = begin(RGFX_SURFACE_USE_REFILL);
+        assert!(waits, "waits for its refill");
+        assert_eq!(copies(&r.p.call_log().since(mark)), [], "deferred");
+        let (_, written) = begin(RGFX_SURFACE_USE_WRITES);
+        let (_, kept) = begin(RGFX_SURFACE_USE_REFILL);
+        let counts = r.dec.caches().counts();
+        assert_eq!((counts.refills, counts.refills_kept), (2, 3));
+        let mark = r.p.call_log().mark();
+        drop(read);
+        assert_eq!(
+            copies(&r.p.call_log().since(mark)).len(),
+            1,
+            "made at the reader's finish"
+        );
+        assert_eq!(r.dec.caches().counts().fills_deferred, 1);
+        drop((refilled, written, kept));
+        r.p.world().complete_all(CompleteOn::Caller);
     }
 
     /// A buffer that asks for its `CB_SUBMITTED` and uses a cache its begin fills at once (no

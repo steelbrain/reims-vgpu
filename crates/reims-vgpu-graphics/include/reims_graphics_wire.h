@@ -170,8 +170,8 @@
 // committed. One for each such block the buffer uses (an attachment, a bound texture or buffer, a
 // resource it declares it uses, a blit's source or destination), before its first encoder. The
 // host fills the cache from the surface's pages before the buffer's work where the cache holds an
-// older generation, and orders a later copy of the cache after the buffer. An op naming a block
-// with no cache does nothing.
+// older generation, or the op carries [`RGFX_SURFACE_USE_REFILL`], and orders a later copy of the
+// cache after the buffer. An op naming a block with no cache does nothing.
 #define RGFX_OP_SURFACE_USE 7
 
 // Op `SUBMITTED` (no body), where the device has
@@ -248,6 +248,15 @@
 
 // [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
 #define RGFX_SURFACE_USE_WRITES (1 << 0)
+
+// [`RgfxOpSurfaceUse::flags`]: a CPU wrote the surface's pages after the read-write lock that
+// moved it to `cpu_gen` (the lock was held while an earlier buffer was committed, and its unlock
+// has come since), so the host fills the cache from the pages before the buffer's work even
+// where the cache holds `cpu_gen` already. The host keeps the cache, as at an equal generation
+// without the flag, where a command buffer that may write it was committed since it was last
+// copied into the pages: a fill would lose that buffer's writes. Set only by a guest that took
+// [`RGFX_FEATURE_SURFACE_REFILL`](crate::wire::RGFX_FEATURE_SURFACE_REFILL).
+#define RGFX_SURFACE_USE_REFILL (1 << 1)
 
 // Where a `COMMAND_BUFFER` message whose op stream starts with an [`RGFX_OP_GUEST_TIMES`] holds
 // its [`RgfxOpGuestTimes::posted_ns`]: the op's body's third field.
@@ -1597,6 +1606,19 @@
 // where it reserved a pool, but on Windows; the x86-64 kext takes it, and a guest that did not
 // take it is refused every one of those messages and keeps its slabs in the region.
 #define RGFX_FEATURE_POOL 144115188075855872
+
+// `FEATURES_HI` bit 26, feature bit 58, `SURFACE_REFILL`: an
+// [`RGFX_OP_SURFACE_USE`](crate::ops::RGFX_OP_SURFACE_USE) may carry
+// [`RGFX_SURFACE_USE_REFILL`](crate::ops::RGFX_SURFACE_USE_REFILL), the guest's word that a CPU
+// wrote a cached surface's pages after the read-write lock that moved its generation, so the
+// host fills the cache again at the generation it holds (docs/graphics-kext/design.md, Decided
+// 14, "The device cache"). The guest's process tracks each cached surface's unlock seed while a
+// buffer is committed during a CPU's write lock, and sets the flag at the next buffer that uses
+// the surface once the unlock has come. Every host offers it, and carries the flag out wherever
+// a use carries it (the host reads no feature for a command buffer's ops); the x86-64 and arm64e
+// kexts take it, and the bundle sets the flag only where they did, so a guest that did not take
+// it never sets it, and a host that does not offer it never sees it.
+#define RGFX_FEATURE_SURFACE_REFILL 288230376151711744
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -6777,7 +6799,8 @@ typedef struct {
   uint64_t block_offset;
   // The kext's count of the surface's read-write CPU locks when the buffer was committed.
   uint64_t cpu_gen;
-  // `RGFX_SURFACE_USE_*`: [`RGFX_SURFACE_USE_WRITES`].
+  // `RGFX_SURFACE_USE_*`: [`RGFX_SURFACE_USE_WRITES`], [`RGFX_SURFACE_USE_REFILL`]. The host
+  // ignores any other bit.
   uint32_t flags;
   // Zero.
   uint32_t reserved_14;

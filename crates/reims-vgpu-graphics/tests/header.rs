@@ -82,6 +82,8 @@ CHECK(sizeof(RgfxBufferEscaped) == 32);
 CHECK(offsetof(RgfxBufferEscaped, obj_id) == 16);
 CHECK(offsetof(RgfxBufferEscaped, kind) == 24);
 CHECK(RGFX_BUFFER_ESCAPED_GPU_ADDRESS == 0 && RGFX_BUFFER_ESCAPED_RESIDENCY_SET == 3);
+CHECK(RGFX_FEATURE_SURFACE_REFILL == (1ULL << 58));
+CHECK(RGFX_SURFACE_USE_WRITES == 1 && RGFX_SURFACE_USE_REFILL == 2);
 CHECK(sizeof(RgfxCursorCurve) == 32 && offsetof(RgfxCursorCurve, params) == 4);
 CHECK(sizeof(RgfxCursorColor) == 288);
 CHECK(RGFX_FEATURE_POOL == (1ULL << 57));

@@ -634,7 +634,24 @@ Stages:
       cache's copies into the pages copy those planes' rows alone from then
       on, so the pages' other bytes (CoreVideo's header) stay as the CPU wrote
       them; a decode that answers no picture makes the fill. A block named
-      again over the same pages is filled again, as of the count then. The pages
+      again over the same pages is filled again, as of the count then. The
+      count moves at a read-write lock, and IOSurface calls no control
+      function at its unlock, so a buffer committed while a CPU holds the lock
+      fills the cache with the pages as they were mid-write. Where the kext
+      took `RGFX_FEATURE_SURFACE_REFILL`, the bundle reads the surface's lock
+      and unlock seeds from the kext (`kRgfxAccelMethodSurfaceSeeds`) as a
+      commit first names a count, and records them in the block's header (the
+      bundle's `RgfxSurfaceHeader`, which the kext's count shares); where they
+      show the lock held, or show none (the kext moves the count inside the
+      lock, before IOSurface moves its lock seed, so a commit can read the new
+      count before the seed), the next commit that names the count reads them
+      again, and once the unlock seed has moved past the recorded one, that
+      commit's use carries `RGFX_SURFACE_USE_REFILL`. The host then fills the
+      cache again at the count it holds, unless a buffer that may write it was
+      committed since the cache was last copied into the pages, whose write a
+      fill would lose: it keeps the cache, as without the flag. Both are
+      counted, the bundle's in its surface copies' summary and the host's in
+      the caches' (`reims-vgpu`'s `surface_cache.rs`, "Refill"). The pages
       are written from the cache only at `SURFACE_DOWNLOAD`, which the kext asks
       at a CPU lock that follows a GPU write, and at the block's
       `BLOCK_RELEASE`, and only where a buffer that may write the surface was
@@ -662,9 +679,13 @@ Stages:
         a read-write lock reaches the GPU only at the next fill, as on a GPU
         of its own memory (the M3 sees it at once); a command buffer
         committed before a CPU write and still running reads what it read,
-        since a fill waits for it; a buffer of an older count taken after a
-        fill of a newer one (two queues' buffers committed apart and taken in
-        the other order) reads the newer bytes; a download of a cache nothing
+        since a fill waits for it; a buffer committed while a CPU holds the
+        surface locked for writing reads the pages as they were then, and the
+        CPU's writes after it reach the first buffer committed after the
+        unlock that names the surface (the refill, above); a buffer of an
+        older count taken after a fill of a newer one (two queues' buffers
+        committed apart and taken in the other order) reads the newer bytes;
+        a download of a cache nothing
         wrote since its last copy copies nothing; a decoder's new output whose
         picture fails to land, or lands short of its planes, reads zeros where
         the picture did not write, where the pages would give their bytes
@@ -5108,10 +5129,13 @@ opens the `Platform` command buffer and walks the ops:
   buffer). The end of the message closes it: the host commits and registers an
   `add_completed_handler` that writes the completion record.
 - `SURFACE_USE` (block offset, the kext's count of the surface's read-write
-  locks, whether the buffer may write it), one for each IOSurface with a device
+  locks, whether the buffer may write it, and, where the guest took
+  `SURFACE_REFILL`, whether a CPU wrote the pages after the lock that moved
+  the count: `RGFX_SURFACE_USE_REFILL`), one for each IOSurface with a device
   cache the buffer uses, before its first encoder: the host fills the cache
-  before the buffer's work where it holds an older count (Decided 14, "The
-  device cache"). One naming a block with no cache does nothing.
+  before the buffer's work where it holds an older count, or the refill asks
+  it at the count it holds (Decided 14, "The device cache"). One naming a
+  block with no cache does nothing.
 - `SUBMITTED` (no body), where the device has `CB_SUBMITTED`: the buffer is
   committed by `commitAndWaitUntilSubmitted`, or by a queue one of whose
   buffers has presented a drawable ("Present hold", below), and asks for its

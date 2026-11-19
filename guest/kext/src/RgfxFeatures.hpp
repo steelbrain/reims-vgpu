@@ -189,7 +189,11 @@
 //    (POOL_BASE_LO to POOL_LENGTH_HI) and maps the blocks the host gives a context's POOL_TAKE
 //    into its process (kRgfxAccelMethodPoolTake, RgfxPoolBlocks.hpp), and the bundle lays its
 //    buffers' slabs in them, a heap over each (HEAP_OVER_POOL), which the kext admits as any
-//    create of the client's own objects (RgfxSubmitGate.hpp). An arm64 host offers no pool.
+//    create of the client's own objects (RgfxSubmitGate.hpp); an arm64 host offers no pool;
+//  - SURFACE_REFILL (bit 58), both kexts: the bundle tracks a cached surface's unlock seed from a
+//    commit made while a CPU held it locked for writing (kRgfxAccelMethodSurfaceSeeds), and has
+//    the next commit after the unlock ask the host to fill the surface's device cache again
+//    (RGFX_SURFACE_USE_REFILL), an op of its command buffers', which needs nothing of the kext.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -232,7 +236,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_READ_ONLY_PAGES | RGFX_FEATURE_DOORBELL_PAGES | RGFX_FEATURE_PIPELINE_ANSWERS |
     RGFX_FEATURE_POINTER_MOTION | RGFX_FEATURE_MULTI_DISPLAY |
     RGFX_FEATURE_POINTER_OVER | RGFX_FEATURE_DISPLAY_BOUNDS | RGFX_FEATURE_UPLOADS_WRITTEN |
-    RGFX_FEATURE_BUFFER_ESCAPED |
+    RGFX_FEATURE_BUFFER_ESCAPED | RGFX_FEATURE_SURFACE_REFILL |
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K | RGFX_FEATURE_VT_MESSAGES | RGFX_FEATURE_VT_RING |
                             RGFX_FEATURE_CURSOR_COLOR
                       : RGFX_FEATURE_DISPLAY_POWER | RGFX_FEATURE_POOL);

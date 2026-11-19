@@ -1592,11 +1592,13 @@ impl<P: Platform> GraphicsDecoder<P> {
                     "IOSurface device caches: {} made; {} fills of {} MiB ({} first fills or as \
                      named again), {} first fills a decode wrote over instead, {} downloads of \
                      {} MiB, {} asked of a cache nothing wrote; {} fills or \
-                     downloads the host's devices' writes changed; {} written caches copied at a \
-                     release with no client left; {} released held by the kext alone, as the \
-                     kext counts them: {} of them written since their last copy, dropped \
-                     uncopied ({} MiB), {} copied as taken again; {} copies out not made, the CPU's \
-                     generation past the cache's; {} \
+                     downloads the host's devices' writes changed; {} fills again at the same \
+                     generation as the CPU's unlock came after it, {} kept as a command buffer \
+                     wrote the cache; {} written caches copied at a release with no client \
+                     left; {} released held by the kext alone, as the kext counts them: {} of \
+                     them written since their last copy, dropped uncopied ({} MiB), {} copied \
+                     as taken again; {} copies out not made, the CPU's generation past the \
+                     cache's; {} \
                      deferred ({} carrying pages), {} refused, {} refused as they might lie in \
                      place, {} named their pages ({} copied), {} released unnamed; {} early copies of {} MiB ({} on the read-back queue), {} \
                      downloads they answered, {} unread; {} copy by runs, {} copies by runs \
@@ -1612,7 +1614,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                      turns, {} ms in all, {} ms at most",
                     d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.decode_firsts,
                     d.downloads,
-                    d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread,
+                    d.downloaded_bytes >> 20, d.clean, d.host_writes, d.refills, d.refills_kept,
+                    d.unread,
                     d.unheld_released, d.unheld, d.unheld_bytes >> 20, d.retaken, d.behind,
                     d.deferred, d.carried, d.deferred_refused, d.deferred_in_place, d.attached,
                     d.attached_copied, d.unattached,

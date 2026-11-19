@@ -342,6 +342,10 @@ std::atomic<uint64_t> gCachedLive{0};
 /// The process names its command buffers' order over IOSurfaces (rgfxIOSurfaceSetOrder): every
 /// surface a buffer uses is noted, and its commit names the buffers of other queues it runs after.
 std::atomic<bool> gSurfaceOrder{false};
+/// The process has the host fill a cached surface's device cache again once a CPU that held the
+/// surface locked for writing as a commit named it has let go (rgfxIOSurfaceSetRefill): each
+/// commit's use of the surface reads the record in its block's header (RgfxSurfaceShadow::refillAt).
+std::atomic<bool> gRefill{false};
 /// The RgfxAskUncachedScopes alive on this thread.
 thread_local unsigned tAskUncached = 0;
 
@@ -426,6 +430,13 @@ std::atomic<uint64_t> gUploadsMidWrite{0};
 std::atomic<uint64_t> gSyncsAtUnlock{0};
 // The commits that asked the kext whether such a CPU had let go of its lock yet.
 std::atomic<uint64_t> gUnlockAsks{0};
+// For a cached surface (gRefill): the uses named at a new CPU generation while a CPU held the
+// surface locked for writing, whose device cache the host filled, or will fill, mid-write; the
+// uses that asked the host to fill it again because such a CPU had let go of its lock
+// (RGFX_SURFACE_USE_REFILL); and the uses that asked the kext for the surface's seeds for it.
+std::atomic<uint64_t> gNamedMidWrite{0};
+std::atomic<uint64_t> gRefillsAtUnlock{0};
+std::atomic<uint64_t> gRefillAsks{0};
 // Whether the kext answers surfaces' lock and unlock seeds to this process's device
 // (rgfxIOSurfaceNoteSurfaceSeeds): -1 where no device said yet.
 std::atomic<int> gSurfaceSeeds{-1};
@@ -445,7 +456,8 @@ void reportCopies(uint64_t now)
 	static std::mutex lock;
 	static uint64_t last = 0, upCount = 0, upBytes = 0, upNs = 0, upMidWrite = 0, syncsAtUnlock = 0,
 	                unlockAsks = 0, wbCount = 0, wbBytes = 0, wbNs = 0, inPlace = 0, cached = 0,
-	                forAlignment = 0, unsupported = 0, refused = 0, shared = 0, own = 0;
+	                forAlignment = 0, unsupported = 0, refused = 0, shared = 0, own = 0,
+	                namedMidWrite = 0, refills = 0, refillAsks = 0;
 	std::unique_lock<std::mutex> g(lock, std::try_to_lock);
 	if (!g.owns_lock()) {
 		return;
@@ -463,23 +475,27 @@ void reportCopies(uint64_t now)
 	uint64_t wc = gWriteBacks.count, wb = gWriteBacks.bytes, wn = gWriteBacks.ns;
 	uint64_t ip = gInPlace, cc = gCached, ca = gCopiedAlignment, cu = gCopiedUnsupported,
 	         cr = gCopiedRefused, cs = gCopyShared, co = gCopyOwn;
+	uint64_t nm = gNamedMidWrite, rf = gRefillsAtUnlock, ra = gRefillAsks;
 	// The process's id and name are the log's own.
 	os_log_info(rgfxLog(),
 	            "RGFX: surface copies, %.1f s, unlock seeds %{public}s: %llu uploads %.1f MiB "
 	            "%.2f ms (%llu mid-write, %llu synced again at the unlock, %llu asks for it), "
 	            "%llu write-backs %.1f MiB %.2f ms; views made: %llu in place (%llu cached), "
 	            "copies %llu for alignment, %llu unsupported, %llu refused by the kext; copy "
-	            "blocks: %llu shared, %llu own",
+	            "blocks: %llu shared, %llu own; cached surfaces: %llu named mid-write, %llu filled "
+	            "again at the unlock, %llu asks for it",
 	            (now - last) / 1e9, seeds > 0 ? "on" : seeds == 0 ? "off" : "unknown",
 	            uc - upCount, (ub - upBytes) / 1048576.0, (un - upNs) / 1e6, um - upMidWrite,
 	            ul - syncsAtUnlock, ua - unlockAsks, wc - wbCount, (wb - wbBytes) / 1048576.0,
 	            (wn - wbNs) / 1e6, ip - inPlace, cc - cached, ca - forAlignment, cu - unsupported,
-	            cr - refused, cs - shared, co - own);
+	            cr - refused, cs - shared, co - own, nm - namedMidWrite, rf - refills,
+	            ra - refillAsks);
 	last = now;
 	upCount = uc, upBytes = ub, upNs = un, upMidWrite = um, syncsAtUnlock = ul, unlockAsks = ua;
 	wbCount = wc, wbBytes = wb, wbNs = wn;
 	inPlace = ip, cached = cc, forAlignment = ca, unsupported = cu, refused = cr;
 	shared = cs, own = co;
+	namedMidWrite = nm, refills = rf, refillAsks = ra;
 }
 
 /// Counts a copy of `bytes` that started at `start`.
@@ -521,7 +537,10 @@ struct SyncedWrite {
 /// reads. And for a copy synced while a CPU held the surface locked for writing (its lock seed
 /// past its unlock seed, RgfxRegion::surfaceSeeds), `writeHeld` is 1 and `unlockSeed` the unlock
 /// seed then: the copy holds the pages as they were mid-write, and syncs again once the unlock
-/// seed moves (RgfxSurfaceShadow::changed).
+/// seed moves (RgfxSurfaceShadow::changed). A cached block in place, which holds no copy, keeps
+/// its refill record in the same fields (RgfxSurfaceShadow::refillAt): `serial` the block's own
+/// where the record is valid, `seed` the low 32 bits of the CPU generation a commit last named the
+/// surface at, `unlockSeed` the surface's unlock seed then and `writeHeld` a RefillState.
 struct RgfxSurfaceHeader {
 	uint64_t serial;
 	uint32_t seed;
@@ -862,6 +881,68 @@ struct RgfxSurfaceShadow {
 		           : Change::None;
 	}
 	bool changed() const { return change() != Change::None; }
+
+	/// A cached block's refill record (RgfxSurfaceHeader::writeHeld): `Settled`, the cache was
+	/// filled at the generation with no CPU write lock held, and nothing is asked again at it;
+	/// `Held`, a CPU held the surface locked for writing as a commit named the generation, so the
+	/// cache may hold the pages mid-write; `Unsure`, the first commit that named it saw no lock
+	/// held, which may yet be one being taken: the kext moves the generation inside the lock,
+	/// before IOSurface moves the lock seed, so the next commit asks once more.
+	enum RefillState : uint32_t { Settled = 0, Held = 1, Unsure = 2 };
+
+	/// At a commit that names the cached surface at CPU generation `gen` (rgfxIOSurfaceNameUses),
+	/// where the process has the host fill caches again (gRefill): whether the use asks the host to
+	/// fill the device cache again at the generation it holds (RGFX_SURFACE_USE_REFILL), as copy
+	/// mode syncs a copy again (change): a commit named it at `gen` while a CPU held the surface
+	/// locked for writing, or held it unsure, and the surface's unlock seed has moved since. The
+	/// record lives in the shared block's header, which every holder of the surface reads and
+	/// writes, so a commit of any process sees another's. The first commit that names a generation
+	/// asks the kext for the surface's seeds and records them; a later one asks again while the
+	/// record is not settled, and settles it once no lock is held. Without the kext's seeds the
+	/// record settles at once: a fill made mid-write stands until the next read-write lock.
+	bool refillAt(uint64_t gen)
+	{
+		const uint32_t low = static_cast<uint32_t>(gen);
+		const bool valid = __atomic_load_n(&header->serial, __ATOMIC_ACQUIRE) == serial;
+		const bool same = valid && __atomic_load_n(&header->seed, __ATOMIC_ACQUIRE) == low;
+		const uint32_t state = __atomic_load_n(&header->writeHeld, __ATOMIC_ACQUIRE);
+		if (same && state == Settled)
+			return false;
+		const uint32_t recorded = __atomic_load_n(&header->unlockSeed, __ATOMIC_ACQUIRE);
+		gRefillAsks.fetch_add(1, std::memory_order_relaxed);
+		uint32_t lockSeed = 0, unlockSeed = 0;
+		if (region == nullptr || !region->surfaceSeeds(surfaceId, &lockSeed, &unlockSeed)) {
+			noteRefill(low, Settled, 0);
+			return false;
+		}
+		const bool held = lockSeed != unlockSeed;
+		if (!same) {
+			noteRefill(low, held ? Held : Unsure, unlockSeed);
+			if (held) {
+				gNamedMidWrite.fetch_add(1, std::memory_order_relaxed);
+				reportCopies(nowNs());
+			}
+			return false;
+		}
+		const bool refill = unlockSeed != recorded;
+		noteRefill(low, held ? Held : Settled, unlockSeed);
+		if (refill) {
+			gRefillsAtUnlock.fetch_add(1, std::memory_order_relaxed);
+			reportCopies(nowNs());
+		}
+		return refill;
+	}
+
+	/// Records the refill record of generation `low` (refillAt): its state and the unlock seed,
+	/// then the generation and the block's serial, so a holder that reads the serial and the
+	/// generation reads the rest with them.
+	void noteRefill(uint32_t low, RefillState state, uint32_t unlockSeed)
+	{
+		__atomic_store_n(&header->unlockSeed, unlockSeed, __ATOMIC_RELEASE);
+		__atomic_store_n(&header->writeHeld, static_cast<uint32_t>(state), __ATOMIC_RELEASE);
+		__atomic_store_n(&header->seed, low, __ATOMIC_RELEASE);
+		__atomic_store_n(&header->serial, serial, __ATOMIC_RELEASE);
+	}
 
 	/// Pages -> copy, under a read lock of the surface taken before `lock` (the views' lock
 	/// order, ViewLock), where `always` or the seed moved (changed) as `lock` is taken; records
@@ -1863,6 +1944,11 @@ void rgfxIOSurfaceSetOrder(bool on)
 	gSurfaceOrder.store(on, std::memory_order_relaxed);
 }
 
+void rgfxIOSurfaceSetRefill(bool on)
+{
+	gRefill.store(on, std::memory_order_relaxed);
+}
+
 /// Each slot of `rec` that names a queue other than `own`, read as the host reads a writer (its
 /// queue, its seqno, then its queue again, a slot whose queue changed between reading as free),
 /// added to `waits`: once a queue, at its highest seqno.
@@ -1911,6 +1997,10 @@ std::vector<std::shared_ptr<void>> rgfxIOSurfaceNameUses(
 		// As the kext left it at the surface's last read-write CPU lock, in any process.
 		op.cpu_gen = __atomic_load_n(&s->header->cpuGen, __ATOMIC_ACQUIRE);
 		op.flags = writes ? RGFX_SURFACE_USE_WRITES : 0;
+		// A CPU that held the surface locked for writing as an earlier commit named this
+		// generation has let go: the host fills the cache again (refillAt).
+		if (gRefill.load(std::memory_order_relaxed) && s->refillAt(op.cpu_gen))
+			op.flags |= RGFX_SURFACE_USE_REFILL;
 		ops.push_back(op);
 	};
 	for (const auto &w : writes)

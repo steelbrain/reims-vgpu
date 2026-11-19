@@ -529,6 +529,18 @@ pub const RGFX_FEATURE_BUFFER_ESCAPED: u64 = 0x100_0000_0000_0000;
 /// where it reserved a pool, but on Windows; the x86-64 kext takes it, and a guest that did not
 /// take it is refused every one of those messages and keeps its slabs in the region.
 pub const RGFX_FEATURE_POOL: u64 = 0x200_0000_0000_0000;
+/// `FEATURES_HI` bit 26, feature bit 58, `SURFACE_REFILL`: an
+/// [`RGFX_OP_SURFACE_USE`](crate::ops::RGFX_OP_SURFACE_USE) may carry
+/// [`RGFX_SURFACE_USE_REFILL`](crate::ops::RGFX_SURFACE_USE_REFILL), the guest's word that a CPU
+/// wrote a cached surface's pages after the read-write lock that moved its generation, so the
+/// host fills the cache again at the generation it holds (docs/graphics-kext/design.md, Decided
+/// 14, "The device cache"). The guest's process tracks each cached surface's unlock seed while a
+/// buffer is committed during a CPU's write lock, and sets the flag at the next buffer that uses
+/// the surface once the unlock has come. Every host offers it, and carries the flag out wherever
+/// a use carries it (the host reads no feature for a command buffer's ops); the x86-64 and arm64e
+/// kexts take it, and the bundle sets the flag only where they did, so a guest that did not take
+/// it never sets it, and a host that does not offer it never sees it.
+pub const RGFX_FEATURE_SURFACE_REFILL: u64 = 0x400_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;

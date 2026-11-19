@@ -129,7 +129,9 @@ enum {
 	// GPU write (IOSurface::getUnlockSeed, which the Mac's GPU families read: the kext's
 	// RgfxIOSurfaceKPI.hpp), so the two differ while a CPU holds the surface locked for writing.
 	// The bundle reads them for a copy of the surface synced while such a lock was held, which it
-	// syncs again once the unlock seed moves. kIOReturnNotFound where the process holds no such
+	// syncs again once the unlock seed moves, and, where the host took RGFX_FEATURE_SURFACE_REFILL,
+	// for a cached surface a commit named at a new CPU generation, whose device cache it has the
+	// host fill again once the unlock seed moves. kIOReturnNotFound where the process holds no such
 	// surface; kIOReturnUnsupported where IOSurface has no unlock seed to read.
 	kRgfxAccelMethodSurfaceSeeds = 13,
 	// Every CPU's page attribute table, IA32_PAT, which the x86-64 kext reads on each online CPU

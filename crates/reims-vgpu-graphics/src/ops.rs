@@ -94,8 +94,8 @@ pub const RGFX_OP_WAIT_EVENT: u16 = 0x0006;
 /// committed. One for each such block the buffer uses (an attachment, a bound texture or buffer, a
 /// resource it declares it uses, a blit's source or destination), before its first encoder. The
 /// host fills the cache from the surface's pages before the buffer's work where the cache holds an
-/// older generation, and orders a later copy of the cache after the buffer. An op naming a block
-/// with no cache does nothing.
+/// older generation, or the op carries [`RGFX_SURFACE_USE_REFILL`], and orders a later copy of the
+/// cache after the buffer. An op naming a block with no cache does nothing.
 pub const RGFX_OP_SURFACE_USE: u16 = 0x0007;
 /// Op `SUBMITTED` (no body), where the device has
 /// [`RGFX_FEATURE_CB_SUBMITTED`](crate::wire::RGFX_FEATURE_CB_SUBMITTED): the command buffer is
@@ -164,6 +164,14 @@ pub const RGFX_OP_UPLOADS_WRITTEN: u16 = 0x000f;
 
 /// [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
 pub const RGFX_SURFACE_USE_WRITES: u32 = 1 << 0;
+/// [`RgfxOpSurfaceUse::flags`]: a CPU wrote the surface's pages after the read-write lock that
+/// moved it to `cpu_gen` (the lock was held while an earlier buffer was committed, and its unlock
+/// has come since), so the host fills the cache from the pages before the buffer's work even
+/// where the cache holds `cpu_gen` already. The host keeps the cache, as at an equal generation
+/// without the flag, where a command buffer that may write it was committed since it was last
+/// copied into the pages: a fill would lose that buffer's writes. Set only by a guest that took
+/// [`RGFX_FEATURE_SURFACE_REFILL`](crate::wire::RGFX_FEATURE_SURFACE_REFILL).
+pub const RGFX_SURFACE_USE_REFILL: u32 = 1 << 1;
 
 /// The body of [`RGFX_OP_SURFACE_USE`].
 #[repr(C)]
@@ -175,7 +183,8 @@ pub struct RgfxOpSurfaceUse {
     pub block_offset: u64,
     /// The kext's count of the surface's read-write CPU locks when the buffer was committed.
     pub cpu_gen: u64,
-    /// `RGFX_SURFACE_USE_*`: [`RGFX_SURFACE_USE_WRITES`].
+    /// `RGFX_SURFACE_USE_*`: [`RGFX_SURFACE_USE_WRITES`], [`RGFX_SURFACE_USE_REFILL`]. The host
+    /// ignores any other bit.
     pub flags: u32,
     /// Zero.
     pub reserved_14: u32,

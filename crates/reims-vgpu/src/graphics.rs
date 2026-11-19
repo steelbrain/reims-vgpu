@@ -84,19 +84,19 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED,
     RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_DEFERRED_ASK,
     RGFX_FEATURE_SURFACE_DEFERRED_CARRY, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
-    RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA, RGFX_FEATURE_UNSHARED_QUEUES,
-    RGFX_FEATURE_UPLOADS_WRITTEN, RGFX_FEATURE_VT_MESSAGES, RGFX_RESOURCE_ID_CHUNK,
-    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK,
-    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
-    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RGFX_VIDEO_CODEC_H264,
-    RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH,
-    RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RGFX_VT_STATUS_MALFORMED,
-    RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled,
-    RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
-    RgfxFunctionPointerState, RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader,
-    RgfxPageRun, RgfxPipelineAnswersQuery, RgfxPoolGive, RgfxPoolTake, RgfxRateMapAnswer,
-    RgfxRateMapState, RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName, RgfxSurfacePages,
-    RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RGFX_FEATURE_SURFACE_REFILL, RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA,
+    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_FEATURE_UPLOADS_WRITTEN, RGFX_FEATURE_VT_MESSAGES,
+    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT,
+    RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
+    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION,
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_H264_BASELINE,
+    RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10,
+    RGFX_VT_STATUS_MALFORMED, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages,
+    RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor,
+    RgfxEventSignalled, RgfxFunctionPointerState, RgfxHeapOverPages, RgfxIcbState,
+    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineAnswersQuery, RgfxPoolGive,
+    RgfxPoolTake, RgfxRateMapAnswer, RgfxRateMapState, RgfxSamplerState, RgfxScheduledAsk,
+    RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PoolAnswer,
@@ -648,6 +648,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // with no message naming the buffer (`BUFFER_ESCAPED`, `decode::escape`), which it
             // marks and counts. A host with the guest's Shared pool lets its processes take
             // blocks of it for their buffers' slabs (`POOL`), where the pool is offered (below).
+            // Every host fills a surface's device cache again at the generation it holds where a
+            // use asks it, the CPU having written the pages after the lock that moved it
+            // (`SURFACE_REFILL`, `decode::surface_cache`, "Refill").
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES)
@@ -679,6 +682,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | RGFX_FEATURE_UPLOADS_WRITTEN
                 | RGFX_FEATURE_CURSOR_COLOR
                 | RGFX_FEATURE_BUFFER_ESCAPED
+                | RGFX_FEATURE_SURFACE_REFILL
                 | if offers_doorbell_asks(&config.callbacks) {
                     RGFX_FEATURE_DOORBELL_ASKS
                 } else {

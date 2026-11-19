@@ -1089,6 +1089,9 @@ RGFX_LOG_UNRECOGNIZED
 	if (seeds)
 		_region->setSurfaceSeedsSource(&rgfxKextSurfaceSeeds, connContext);
 	rgfxIOSurfaceNoteSurfaceSeeds(seeds);
+	// So does a cached surface's device cache filled while such a lock was held, where the host
+	// fills one again when a command buffer's use asks it (RGFX_SURFACE_USE_REFILL).
+	rgfxIOSurfaceSetRefill(seeds && (_caps.features() & RGFX_FEATURE_SURFACE_REFILL) != 0);
 	// No-copy buffers over the process's own pages, where the kext makes pages blocks and the
 	// host took the feature that maps them.
 	if ((_caps.kextFeatures() & kRgfxKextFeaturePagesBlock) != 0 &&
