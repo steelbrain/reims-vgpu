@@ -4943,8 +4943,12 @@ buffers at their copies", below). Every host offers the bit, and both kexts take
 it (kext feature bit 1 << 17 `PrivateBlocks`); the bundle uses blocks where
 its kext sets that bit and the device took the feature.
 - **A take.** Where no block the context holds has room for a pick, the
-  bundle asks the kext for one (selector 18, `PrivateTake`): 256 MiB, or the
-  pick's span and alignment rounded up to 64 KiB where that is more. The kext
+  bundle asks the kext for one (selector 18, `PrivateTake`): 16 MiB
+  (`kPrivateBlockBytes`), metal2vulkan-rt's allocation unit, which its block
+  maker makes ahead of need, so the host answers it with no allocation of
+  the driver's in the take. Where the pick's span and alignment are more,
+  the block is the pick's own: their length rounded up to 64 KiB, holding
+  that pick alone, which rt allocates in the take. The kext
   posts the context's `PRIVATE_TAKE` on ring 0 and waits for its answer,
   `PRIVATE_BLOCK`, with no deadline, as it waits for a pool take: the block's
   GPU address and its length, at least the bytes asked for rounded up to
@@ -4971,7 +4975,8 @@ its kext sets that bit and the device took the feature.
   does, and logs the first refusal of the process.
 - **A give.** When a block's last object goes and the context holds another
   empty block, the bundle gives the block back (selector 22, `PrivateGive`);
-  the one empty block left is kept for the next picks. Every call into the
+  the one empty block left is kept for the next picks. A pick's own block
+  goes back with its pick. Every call into the
   kext first posts the destroys the control ring holds, so the last object's
   destroy goes first. The kext posts `PRIVATE_GIVE` and returns. The host
   refuses it while an object it holds still lies in the block, answers

@@ -217,14 +217,15 @@ bool inPrivateBlock(FakePrivate &f, uint64_t address, uint64_t span)
 }
 
 // Private objects' addresses (RGFX_FEATURE_PRIVATE_BLOCKS): picked as the context's are, but in
-// blocks the host gives the context, a block of 256 MiB taken where none held has room, and one
-// left empty given back past the one the space keeps.
+// blocks the host gives the context, a block of 16 MiB taken where none held has room, a pick past
+// that a block of its own given back at its free, and one left empty given back past the one the
+// space keeps.
 void test_private_address_picks()
 {
 	const uint64_t page = RgfxIdSpace::kAddressPage, granule = RgfxIdSpace::kAddressGranule;
 	const uint64_t base = RGFX_CONTEXT_VA_BASE + 3 * RGFX_CONTEXT_VA_UNIT;
 	const uint64_t blockBytes = RgfxIdSpace::kPrivateBlockBytes;
-	CHECK(blockBytes == uint64_t{256} << 20 && blockBytes % RGFX_PRIVATE_BLOCK_ALIGN == 0);
+	CHECK(blockBytes == uint64_t{16} << 20 && blockBytes % RGFX_PRIVATE_BLOCK_ALIGN == 0);
 
 	// No source: the context's range, as allocAddress picks.
 	{
@@ -237,8 +238,8 @@ void test_private_address_picks()
 		ids.freeAddress(at);
 	}
 
-	// The first pick takes a block of 256 MiB and lies at its start; the next, next fit after
-	// it; a larger alignment is honoured inside the block.
+	// The first pick takes a block of 16 MiB and lies at its start; the next, next fit after it;
+	// a larger alignment is honoured inside the block.
 	FakePrivate f;
 	f.extra = 0x1'0000; // the host may answer more than asked: the space uses all of it
 	RgfxIdSpace ids;
@@ -259,34 +260,44 @@ void test_private_address_picks()
 	CHECK(own == base);
 	ids.freeAddress(own);
 
-	// A pick past the block's room takes a block of its span and alignment, rounded up to the
-	// host's 64 KiB, and lies in it.
-	const uint64_t big = uint64_t{512} << 20;
+	// A pick whose span and alignment are past a block's length takes a block of their length,
+	// rounded up to the host's 64 KiB, which is the pick's own and lies at its first aligned byte.
+	const uint64_t big = uint64_t{32} << 20;
 	const uint64_t d = ids.allocPrivateAddress(big, 0x20'0000);
 	CHECK(f.taken.size() == 2);
 	CHECK(f.taken[1].second - f.extra ==
 	      ((RgfxIdSpace::addressSpan(big) + 0x20'0000 + RGFX_PRIVATE_BLOCK_ALIGN - 1) &
 	       ~(RGFX_PRIVATE_BLOCK_ALIGN - 1)));
-	CHECK(d % 0x20'0000 == 0 && inPrivateBlock(f, d, RgfxIdSpace::addressSpan(big)));
+	CHECK(d % 0x20'0000 == 0 && d - f.taken[1].first < 0x20'0000 &&
+	      inPrivateBlock(f, d, RgfxIdSpace::addressSpan(big)));
 	CHECK(ids.privateBlocksHeld() == 2 && ids.privatePicksLive() == 4);
 
-	// Freed: an address no pick starts at is ignored; the big block, empty, is kept, the only
-	// empty one; the first, emptied after it, is given back whole.
+	// Next fit: a freed span is picked again only once the picks have gone round, so the pick
+	// after b's free lies past c, not at b; and the big pick's block, the room past it among it,
+	// takes no other pick.
+	ids.freeAddress(b);
+	const uint64_t g = ids.allocPrivateAddress(0x4000, 1);
+	CHECK(g == c + RgfxIdSpace::addressSpan(1) && f.taken.size() == 2);
+
+	// Freed: an address no pick starts at is ignored; the big pick's block goes back with it, at
+	// once; the first block, emptied, is kept, the only empty one.
 	ids.freeAddress(0);
 	ids.freeAddress(a + page);
-	ids.freeAddress(d);
-	CHECK(f.given.empty() && ids.privateBlocksHeld() == 2);
-	ids.freeAddress(a);
-	ids.freeAddress(b);
 	CHECK(f.given.empty());
+	ids.freeAddress(d);
+	CHECK(f.given.size() == 1 && f.given[0] == f.taken[1]);
+	CHECK(ids.privateBlocksHeld() == 1 && ids.privatePicksLive() == 3);
+	ids.freeAddress(d); // given back already: ignored
+	ids.freeAddress(a);
+	ids.freeAddress(g);
 	ids.freeAddress(c);
-	CHECK(f.given.size() == 1 && f.given[0] == f.taken[0]);
+	CHECK(f.given.size() == 1);
 	CHECK(ids.privateBlocksHeld() == 1 && ids.privatePicksLive() == 0);
-	ids.freeAddress(c); // given back already: ignored
+	ids.freeAddress(c); // freed already: ignored
 	CHECK(f.given.size() == 1);
 	// The kept block takes the next pick: no new block.
 	const uint64_t e = ids.allocPrivateAddress(0x4000, 1);
-	CHECK(f.taken.size() == 2 && inPrivateBlock(f, e, granule) && e >= f.taken[1].first);
+	CHECK(f.taken.size() == 2 && e >= first && e - first < f.taken[0].second);
 	ids.freeAddress(e);
 
 	// Blocks side by side: their free ranges never join, so no pick spans two blocks. The first
@@ -403,6 +414,15 @@ void test_private_heaps_align_from_their_block()
 	const uint64_t after = ids.allocPrivateAddress(0x4000, 256);
 	CHECK(after == wide.gpu_address + RgfxIdSpace::addressSpan(0x10000));
 	CHECK(f.taken.size() == 1 && ids.privatePicksLive() == 4);
+	// A heap past a block's length lies at the first byte of a block of its own, which goes back
+	// at its free.
+	RgfxCreated large = ser.createHeap(uint64_t{32} << 20, 0, 1);
+	CHECK(f.taken.size() == 2 && f.taken[1].first % heapAlign != 0);
+	CHECK(large.posted && large.gpu_address == f.taken[1].first);
+	CHECK(expectMessage<RgfxHeapCreate>(ring, RGFX_CMD_HEAP_CREATE).gpu_address ==
+	      large.gpu_address);
+	ids.freeAddress(large.gpu_address);
+	CHECK(f.given.size() == 1 && f.given[0] == f.taken[1]);
 	for (uint64_t at : {buffer, heap.gpu_address, wide.gpu_address, after})
 		ids.freeAddress(at);
 	CHECK(ids.privatePicksLive() == 0);

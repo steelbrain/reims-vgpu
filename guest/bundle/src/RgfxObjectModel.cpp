@@ -238,19 +238,27 @@ void RgfxIdSpace::freeAddress(uint64_t address)
 		if (block == m_privateBlocks.end())
 			return;
 		const uint64_t lo = block->first, hi = block->first + block->second.length;
-		giveTo(m_privateFree, address, length, lo, hi);
-		if (--block->second.picks != 0)
-			return;
-		// Empty: kept where it is the only empty block, for the next picks; else given back,
-		// its one free range taken out first so no pick lands in it.
-		for (const auto &other : m_privateBlocks)
-			if (other.first != lo && other.second.picks == 0) {
-				m_privateFree.erase(lo);
-				m_privateBlocks.erase(block);
-				giveAt = lo;
-				giveLength = hi - lo;
-				break;
-			}
+		if (block->second.own) {
+			// One pick's own block, which holds no other pick and no free range: given back
+			// with its pick.
+			m_privateBlocks.erase(block);
+			giveAt = lo;
+			giveLength = hi - lo;
+		} else {
+			giveTo(m_privateFree, address, length, lo, hi);
+			if (--block->second.picks != 0)
+				return;
+			// Empty: kept where it is the only empty block, for the next picks; else given
+			// back, its one free range taken out first so no pick lands in it.
+			for (const auto &other : m_privateBlocks)
+				if (other.first != lo && other.second.picks == 0) {
+					m_privateFree.erase(lo);
+					m_privateBlocks.erase(block);
+					giveAt = lo;
+					giveLength = hi - lo;
+					break;
+				}
+		}
 	}
 	// With no lock held: a call into the kext, which first posts the destroys the process holds,
 	// the last object's in the block among them.
@@ -304,7 +312,8 @@ uint64_t RgfxIdSpace::allocPrivateAddress(uint64_t size, uint64_t asked, uint64_
 			return start;
 	}
 	// No block has room: a new one, taken with no lock held (a call into the kext, which waits for
-	// the host's answer), with room for the span at its alignment wherever the block starts.
+	// the host's answer), with room for the span at its alignment wherever the block starts:
+	// kPrivateBlockBytes, or where the span and its alignment are more, the pick's own block.
 	uint64_t at = 0, length = 0;
 	const bool sized = span <= RGFX_PRIVATE_TAKE_MAX && align <= RGFX_PRIVATE_TAKE_MAX - span;
 	const uint64_t want =
@@ -322,7 +331,16 @@ uint64_t RgfxIdSpace::allocPrivateAddress(uint64_t size, uint64_t asked, uint64_
 	}
 	{
 		std::lock_guard<std::mutex> hold(m_addressLock);
-		m_privateBlocks[at] = PrivateBlock{length, 0};
+		if (want > kPrivateBlockBytes) {
+			// The pick's own block: the pick at its first aligned byte, which the block's length
+			// leaves room for wherever it starts, and no free range for other picks.
+			const uint64_t base = blockAlign == 0 ? 0 : at;
+			const uint64_t start = base + alignUp(at - base, align);
+			m_privateBlocks[at] = PrivateBlock{length, 1, true};
+			m_privatePicks[start] = span;
+			return start;
+		}
+		m_privateBlocks[at] = PrivateBlock{length, 0, false};
 		m_privateFree[at] = length;
 		if (const uint64_t start = pick())
 			return start;

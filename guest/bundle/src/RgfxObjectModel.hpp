@@ -130,8 +130,9 @@ public:
 	/// that is not Shared, a Managed buffer's GPU copy), as allocAddress picks one,
 	/// but in a Private block the context holds where a block source is set: next
 	/// fit through the blocks held, in address order, then round from the first;
-	/// where none has room, a new block of kPrivateBlockBytes, or of the pick's span
-	/// and alignment where that is more. With a `blockAlign`, the pick in a block
+	/// where none has room, a new block of kPrivateBlockBytes. A pick whose span and
+	/// alignment are more than that takes a block of their own length, which holds
+	/// that pick alone and goes back at its free. With a `blockAlign`, the pick in a block
 	/// lies at a multiple of it and of `align` from the block's first byte, not from
 	/// 0: the host places it at that offset of the memory it gave the block, whose
 	/// own address is aligned only to the host's granule (a heap, whose textures the
@@ -140,11 +141,16 @@ public:
 	/// alone (the refusal logged once). 0 where no address is left.
 	uint64_t allocPrivateAddress(uint64_t size, uint64_t align, uint64_t blockAlign = 0);
 
-	/// The bytes of addresses the space asks a Private block for at least: 256 MiB,
-	/// metal2vulkan-rt's pooled block, so a pick wraps round its blocks only after
-	/// that many bytes of spans (the host lets an object's pin go only once the
-	/// command buffers that use it have finished).
-	static constexpr uint64_t kPrivateBlockBytes = uint64_t{256} << 20;
+	/// The bytes of addresses the space asks a Private block for: 16 MiB,
+	/// metal2vulkan-rt's unit (`MemoryClass::block_len`), which rt's block maker
+	/// makes ahead of need, so the host answers a take of it with no allocation of
+	/// the driver's in the take. A longer take is one pick's own block, which rt
+	/// allocates in the take. Picks wrap round the blocks held, so a freed span is
+	/// picked again once the picks have gone round the free bytes of the context's
+	/// blocks, as few as one block's. An object's span is freed only after its
+	/// destroy, which comes once every command buffer that names it has completed:
+	/// each keeps what it names until then.
+	static constexpr uint64_t kPrivateBlockBytes = uint64_t{16} << 20;
 
 	/// The Private blocks held, and the picks in them (for the tests).
 	size_t privateBlocksHeld() const;
@@ -187,12 +193,14 @@ private:
 	// Whether a pick found no room, which is logged once.
 	bool m_addressesFull = false;
 
-	// The Private blocks, under m_addressLock: each held block by address, its length and its
-	// live picks; their free ranges by start, never joined across two blocks; the live picks'
-	// spans by start; and where the next pick looks first.
+	// The Private blocks, under m_addressLock: each held block by address, its length, its
+	// live picks and whether it is one pick's own; their free ranges by start, never joined
+	// across two blocks, none in a block of one pick's own; the live picks' spans by start; and
+	// where the next pick looks first.
 	struct PrivateBlock {
 		uint64_t length = 0;
 		uint64_t picks = 0;
+		bool own = false;
 	};
 	// The block `address` lies in, or end. Caller holds m_addressLock.
 	std::map<uint64_t, PrivateBlock>::iterator privateBlockOf(uint64_t address);
