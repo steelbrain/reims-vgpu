@@ -86,7 +86,9 @@ impl Knowing for reims_vgpu_vulkan::rt_platform::KnownBlocks {
     }
 
     fn forget(&self, id: rt::BlockId) {
-        drop(reims_vgpu_vulkan::rt_platform::KnownBlocks::forget(self, id));
+        drop(reims_vgpu_vulkan::rt_platform::KnownBlocks::forget(
+            self, id,
+        ));
     }
 }
 
@@ -152,7 +154,9 @@ mod tests {
 
     impl Knowing for Known {
         fn know(&self, block: rt::Block) {
-            self.0.lock().insert(block.id.get(), (block.gpu_address, block.len));
+            self.0
+                .lock()
+                .insert(block.id.get(), (block.gpu_address, block.len));
         }
 
         fn forget(&self, id: rt::BlockId) {
@@ -188,8 +192,7 @@ mod tests {
             Some(BlockError::Length)
         );
 
-        let is_known =
-            |b: &BlockInfo| known.0.lock().get(&b.id.0) == Some(&(b.gpu_address, b.len));
+        let is_known = |b: &BlockInfo| known.0.lock().get(&b.id.0) == Some(&(b.gpu_address, b.len));
         assert!(is_known(&shared) && is_known(&private));
 
         assert_eq!(blocks.release_block(shared.id), Ok(()));
