@@ -162,7 +162,7 @@ fn c_harness_calls_every_function() {
     // A function with a form of each OS's (Windows's under `#if defined(_WIN32)`, the others'
     // under `#if !defined(_WIN32)`) is declared once per form, one after the other.
     declared.dedup();
-    assert_eq!(declared.len(), 17, "{declared:?}");
+    assert_eq!(declared.len(), 18, "{declared:?}");
     let missing: Vec<&str> = declared
         .iter()
         .copied()
