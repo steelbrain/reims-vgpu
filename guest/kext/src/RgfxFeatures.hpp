@@ -193,7 +193,14 @@
 //  - SURFACE_REFILL (bit 58), both kexts: the bundle tracks a cached surface's unlock seed from a
 //    commit made while a CPU held it locked for writing (kRgfxAccelMethodSurfaceSeeds), and has
 //    the next commit after the unlock ask the host to fill the surface's device cache again
-//    (RGFX_SURFACE_USE_REFILL), an op of its command buffers', which needs nothing of the kext.
+//    (RGFX_SURFACE_USE_REFILL), an op of its command buffers', which needs nothing of the kext;
+//  - POOL_ADDRESSES (bit 59), the x86-64 kext alone, with POOL: the kext answers the GPU address
+//    the host gives each pool block (kRgfxAccelMethodPoolTake's fourth output), where the bundle
+//    makes the block's heap;
+//  - PRIVATE_BLOCKS (bit 60), both kexts: the kext posts a context's PRIVATE_TAKE and PRIVATE_GIVE
+//    (kRgfxAccelMethodPrivateTake, kRgfxAccelMethodPrivateGive) and answers each block's GPU
+//    address and length, where the bundle places its Private buffers, its heaps that are not
+//    Shared and its Managed buffers' GPU copies.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -240,7 +247,8 @@ constexpr uint64_t kRgfxCarriedFeatures =
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K | RGFX_FEATURE_VT_MESSAGES | RGFX_FEATURE_VT_RING |
                             RGFX_FEATURE_CURSOR_COLOR
                       : RGFX_FEATURE_DISPLAY_POWER | RGFX_FEATURE_POOL |
-                            RGFX_FEATURE_POOL_ADDRESSES);
+                            RGFX_FEATURE_POOL_ADDRESSES) |
+    RGFX_FEATURE_PRIVATE_BLOCKS;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer and, on arm64, the
 // displays whose node the firmware placed under /arm-io, counted from display 0 (`mobileNodes`):

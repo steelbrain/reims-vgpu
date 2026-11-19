@@ -152,6 +152,10 @@ private:
 	IOReturn poolTakeMethod(IOExternalMethodArguments *arguments);
 	IOReturn poolGiveMethod(IOExternalMethodArguments *arguments);
 	void closePoolBlocks();
+	// The context's Private blocks (kRgfxAccelMethodPrivateTake, kRgfxAccelMethodPrivateGive):
+	// asks of the host alone, which knows each context's blocks and gives them back at its close.
+	IOReturn privateTakeMethod(IOExternalMethodArguments *arguments);
+	IOReturn privateGiveMethod(IOExternalMethodArguments *arguments);
 	// The surfaces a command buffer writes (kRgfxAccelMethodSurfaceWrites), and whether a queue is
 	// one of the client's open ones.
 	IOReturn surfaceWritesMethod(IOExternalMethodArguments *arguments);

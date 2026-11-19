@@ -102,6 +102,30 @@ inline bool rgfxPoolAnswerFits(uint64_t poolLength, uint64_t asked, uint64_t off
 	       offset <= poolLength && length <= poolLength - offset;
 }
 
+// A Private block (RGFX_FEATURE_PRIVATE_BLOCKS, design.md, "Private blocks") is a range of GPU
+// addresses the host gives a context for its Private objects, with no memory a process maps: the
+// kext posts the context's PRIVATE_TAKE and answers the block's address and length, and lists
+// nothing, as the host knows each context's blocks and gives them back at its close.
+//
+// The length the host answers a Private take of `asked` bytes with at least: `asked` rounded up to
+// RGFX_PRIVATE_BLOCK_ALIGN; 0 for 0 bytes or past RGFX_PRIVATE_TAKE_MAX, which the host refuses.
+inline uint64_t rgfxPrivateTakeLength(uint64_t asked)
+{
+	if (asked == 0 || asked > RGFX_PRIVATE_TAKE_MAX)
+		return 0;
+	return (asked + RGFX_PRIVATE_BLOCK_ALIGN - 1) & ~uint64_t(RGFX_PRIVATE_BLOCK_ALIGN - 1);
+}
+
+// Whether the host's OK answer to a Private take of `asked` bytes, a block of `length` bytes at
+// GPU address `gpuAddress`, is one the kext hands out: at least the take's rounded length, a
+// multiple of RGFX_PRIVATE_BLOCK_ALIGN, at an address other than 0 whose block does not wrap.
+inline bool rgfxPrivateAnswerFits(uint64_t asked, uint64_t gpuAddress, uint64_t length)
+{
+	const uint64_t want = rgfxPrivateTakeLength(asked);
+	return want != 0 && length >= want && length % RGFX_PRIVATE_BLOCK_ALIGN == 0 &&
+	       gpuAddress != 0 && gpuAddress <= UINT64_MAX - length;
+}
+
 // The capacity the list grows to where it is full: kRgfxPoolBlocksFirst at first, then twice as
 // many, up to kRgfxPoolBlocksMax; 0 where it holds that many already.
 inline uint32_t rgfxPoolBlocksGrowTo(const RgfxPoolBlockList &list)

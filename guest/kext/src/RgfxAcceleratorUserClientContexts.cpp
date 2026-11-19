@@ -379,6 +379,10 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		return poolTakeMethod(a);
 	case kRgfxAccelMethodPoolGive:
 		return poolGiveMethod(a);
+	case kRgfxAccelMethodPrivateTake:
+		return privateTakeMethod(a);
+	case kRgfxAccelMethodPrivateGive:
+		return privateGiveMethod(a);
 	case kRgfxAccelMethodFeatures: {
 		if (a->scalarInputCount != 0 || a->scalarOutputCount != 3)
 			return kIOReturnBadArgument;
@@ -1200,6 +1204,41 @@ IOReturn RgfxAcceleratorUserClient::poolGiveMethod(IOExternalMethodArguments *a)
 	map->unmap();
 	map->release();
 	return owner->givePoolBlock(ctx, block.offset, block.length);
+}
+
+// kRgfxAccelMethodPrivateTake (RgfxUserClientABI.hpp, RgfxPoolBlocks.hpp): a Private block's GPU
+// address and length. An ask, so the close never posts its CONTEXT_CLOSE before the take, whose
+// block the close then gives back.
+IOReturn RgfxAcceleratorUserClient::privateTakeMethod(IOExternalMethodArguments *a)
+{
+	if (a->scalarInputCount != 1 || a->scalarOutputCount != 2)
+		return kIOReturnBadArgument;
+	UInt32 ctx = 0;
+	Ask ask = {this, beginAsk(&ctx)};
+	if (!ask.begun)
+		return kIOReturnBadArgument;
+	UInt64 gpuAddress = 0;
+	UInt64 length = 0;
+	IOReturn r = owner->takePrivateBlock(ctx, a->scalarInput[0], &gpuAddress, &length);
+	if (r != kIOReturnSuccess)
+		return r;
+	a->scalarOutput[0] = gpuAddress;
+	a->scalarOutput[1] = length;
+	return kIOReturnSuccess;
+}
+
+// kRgfxAccelMethodPrivateGive (RgfxUserClientABI.hpp): the block's PRIVATE_GIVE, which the host
+// checks against the context's blocks. An ask, as a take is, so the close never posts its
+// CONTEXT_CLOSE between the process's last destroys and the give.
+IOReturn RgfxAcceleratorUserClient::privateGiveMethod(IOExternalMethodArguments *a)
+{
+	if (a->scalarInputCount != 2 || a->scalarOutputCount != 0)
+		return kIOReturnBadArgument;
+	UInt32 ctx = 0;
+	Ask ask = {this, beginAsk(&ctx)};
+	if (!ask.begun)
+		return kIOReturnBadArgument;
+	return owner->givePrivateBlock(ctx, a->scalarInput[0], a->scalarInput[1]);
 }
 
 void RgfxAcceleratorUserClient::closePoolBlocks()

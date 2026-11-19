@@ -137,6 +137,8 @@ static const Selector kSelectors[] = {
 	{"kRgfxAccelMethodCpuPats", kRgfxAccelMethodCpuPats, false},
 	{"kRgfxAccelMethodPoolTake", kRgfxAccelMethodPoolTake, false},
 	{"kRgfxAccelMethodPoolGive", kRgfxAccelMethodPoolGive, false},
+	{"kRgfxAccelMethodPrivateTake", kRgfxAccelMethodPrivateTake, false},
+	{"kRgfxAccelMethodPrivateGive", kRgfxAccelMethodPrivateGive, false},
 	{"kRgfxAccelMethodTakeAnswers", kRgfxAccelMethodTakeAnswers, false},
 	{"kRgfxAccelMethodSurfaceBlockRelease", kRgfxAccelMethodSurfaceBlockRelease, false},
 	{"kRgfxAccelMethodSurfaceRetire", kRgfxAccelMethodSurfaceRetire, false},
@@ -317,6 +319,7 @@ static void features()
 		kRgfxKextFeatureZeroedBlocks,
 		kRgfxKextFeaturePool,
 		kRgfxKextFeaturePoolAddresses,
+		kRgfxKextFeaturePrivateBlocks,
 	};
 	for (unsigned i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
 		CHECK(bits[i] == uint64_t(1) << i);
@@ -347,6 +350,10 @@ static void features()
 	// The Shared pool's take and give at the next two the sandbox allows.
 	CHECK(kRgfxAccelMethodPoolTake == 16);
 	CHECK(kRgfxAccelMethodPoolGive == 17);
+	// A Private block's take and give at the next two the sandbox allows: 19 to 21 are not.
+	CHECK(kRgfxAccelMethodPrivateTake == 18);
+	CHECK(kRgfxAccelMethodPrivateGive == 22);
+	CHECK(!sandboxAllows(19) && !sandboxAllows(20) && !sandboxAllows(21));
 }
 
 int main()

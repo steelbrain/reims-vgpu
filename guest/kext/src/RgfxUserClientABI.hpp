@@ -164,6 +164,25 @@ enum {
 	// object it holds (a heap) lies in it: the process destroys its objects over the block first.
 	// kIOReturnNotFound where the client holds no block at that offset.
 	kRgfxAccelMethodPoolGive = 17,
+	// A Private block for the client's context (kRgfxKextFeaturePrivateBlocks; the device's
+	// RGFX_FEATURE_PRIVATE_BLOCKS, design.md, "Private blocks"): in the bytes asked for; out the
+	// block's GPU address and its length, at least the bytes asked for rounded up to
+	// RGFX_PRIVATE_BLOCK_ALIGN. A block is a range of GPU addresses with no memory the process
+	// maps: the process places its Private buffers, its heaps that are not Shared and its Managed
+	// buffers' GPU copies in it, and gives it back through PrivateGive; the context's close gives
+	// back every block it still holds. The kext posts the context's PRIVATE_TAKE and waits for its
+	// answer however long the host takes, and lists no block: the host knows each context's.
+	// kIOReturnUnsupported where the device offers no Private blocks; kIOReturnBadArgument for 0
+	// bytes or past RGFX_PRIVATE_TAKE_MAX, or where the context is not open; kIOReturnNoMemory
+	// where the host had no block for it (RGFX_STATUS_REFUSED).
+	kRgfxAccelMethodPrivateTake = 18,
+	// Gives back the client's Private block at the GPU address scalarInput[0], of the length
+	// scalarInput[1] PrivateTake answered, and returns at once: its PRIVATE_GIVE is posted after
+	// every message the process posted before the call. The host takes the block back once the
+	// context's command buffers committed before have finished, and refuses it while an object it
+	// holds lies in it, and a block the context does not hold: the process destroys its objects in
+	// the block first. kIOReturnUnsupported where the device offers no Private blocks.
+	kRgfxAccelMethodPrivateGive = 22,
 	// A new selector takes the next number design.md's registry gives out.
 };
 
@@ -299,6 +318,8 @@ static inline int rgfxAccelContextSelector(unsigned selector)
 	case kRgfxAccelMethodCpuPats:
 	case kRgfxAccelMethodPoolTake:
 	case kRgfxAccelMethodPoolGive:
+	case kRgfxAccelMethodPrivateTake:
+	case kRgfxAccelMethodPrivateGive:
 	case kRgfxAccelMethodSubmitBatch:
 	case kRgfxAccelMethodTakeAnswers:
 	case kRgfxAccelMethodSurfaceBlockRelease:
@@ -415,6 +436,9 @@ enum {
 	// PoolTake's (16) fourth output, the block's GPU address, which the bundle asks for where the
 	// feature word holds RGFX_FEATURE_POOL_ADDRESSES too; the x86-64 kext alone.
 	kRgfxKextFeaturePoolAddresses = 1 << 16,
+	// PrivateTake, 18, and PrivateGive, 22, which the bundle uses where the feature word holds
+	// RGFX_FEATURE_PRIVATE_BLOCKS too; the x86-64 and arm64e kexts.
+	kRgfxKextFeaturePrivateBlocks = 1 << 17,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

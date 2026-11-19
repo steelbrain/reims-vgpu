@@ -115,6 +115,9 @@ constexpr uint64_t kPoolCarried = RGFX_GUEST_ARM64 ? 0 : kPool;
 // the host gave each block, and the arm64e kext does not.
 constexpr uint64_t kPoolAddresses = RGFX_FEATURE_POOL_ADDRESSES;
 constexpr uint64_t kPoolAddressesCarried = RGFX_GUEST_ARM64 ? 0 : kPoolAddresses;
+// PRIVATE_BLOCKS, which both kexts carry, handing their processes the Private blocks the host
+// gives their contexts.
+constexpr uint64_t kPrivateBlocks = RGFX_FEATURE_PRIVATE_BLOCKS;
 // A bit the wire does not name.
 constexpr uint64_t kUnnamed = 1ull << 63;
 // Every bit the wire names from bit 3 that the kext does not carry out yet.
@@ -210,7 +213,8 @@ constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kH
                               kMultiDisplayCarried | kPointerOverCarried | kDisplayBoundsCarried |
                               kPointerMotion | k16KCarried | kVtMessagesCarried | kUploadsWritten |
                               kVtRingCarried | kCursorColorCarried | kBufferEscaped |
-                              kPoolCarried | kSurfaceRefill | kPoolAddressesCarried;
+                              kPoolCarried | kSurfaceRefill | kPoolAddressesCarried |
+                              kPrivateBlocks;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -226,9 +230,9 @@ int main()
 	// TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, PIPELINE_KEYS,
 	// ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, DOORBELL_PAGES,
 	// PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, DISPLAY_BOUNDS,
-	// UPLOADS_WRITTEN, BUFFER_ESCAPED, SURFACE_REFILL and, the x86-64 kext, DISPLAY_POWER and POOL,
-	// or, the arm64e kext, PAGES_16K, VT_MESSAGES, VT_RING and CURSOR_COLOR, and writes each only
-	// where offered.
+	// UPLOADS_WRITTEN, BUFFER_ESCAPED, SURFACE_REFILL, PRIVATE_BLOCKS and, the x86-64 kext,
+	// DISPLAY_POWER, POOL and POOL_ADDRESSES, or, the arm64e kext, PAGES_16K, VT_MESSAGES, VT_RING
+	// and CURSOR_COLOR, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
 	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
@@ -238,8 +242,8 @@ int main()
 	      "DISPLAY_SCALE, TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, "
 	      "PIPELINE_KEYS, ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, "
 	      "DOORBELL_PAGES, PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, "
-	      "DISPLAY_BOUNDS, UPLOADS_WRITTEN, BUFFER_ESCAPED, SURFACE_REFILL and, on x86-64, "
-	      "DISPLAY_POWER and POOL, on arm64e PAGES_16K, "
+	      "DISPLAY_BOUNDS, UPLOADS_WRITTEN, BUFFER_ESCAPED, SURFACE_REFILL, PRIVATE_BLOCKS and, "
+	      "on x86-64, DISPLAY_POWER, POOL and POOL_ADDRESSES, on arm64e PAGES_16K, "
 	      "VT_MESSAGES, VT_RING and CURSOR_COLOR, from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");

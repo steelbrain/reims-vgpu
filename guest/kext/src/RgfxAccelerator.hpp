@@ -96,8 +96,8 @@ enum {
 // (RgfxRegionMapping.hpp), SurfaceSeeds, which Features leaves out where IOSurface exports no
 // unlock seed (rgfxSurfaceUnlockSeedExported), SubmitBatch's publish of a queue's ring,
 // OpenContext's doorbell page, on x86-64 CpuPats (RgfxPat.hpp), ZeroedBlocks (RgfxBlockZero.hpp),
-// and on x86-64 Pool, which Features leaves out where the device has no pool (poolMemory). Each
-// bit is set by the change that lands its call.
+// on x86-64 Pool and PoolAddresses, which Features leaves out where the device has no pool
+// (poolMemory), and PrivateBlocks. Each bit is set by the change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeaturePagesChunked |
                                           kRgfxKextFeatureSubmitBatch |
@@ -112,7 +112,8 @@ constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeatureCpuPatsRead |
                                           kRgfxKextFeatureZeroedBlocks |
                                           kRgfxKextFeaturePoolCarried |
-                                          kRgfxKextFeaturePoolAddressesCarried;
+                                          kRgfxKextFeaturePoolAddressesCarried |
+                                          kRgfxKextFeaturePrivateBlocks;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
@@ -378,6 +379,16 @@ public:
 	IOReturn takePoolBlock(UInt32 context, task_t task, UInt64 length, RgfxHeldPoolBlock *block,
 	                       UInt64 *gpuAddress);
 	IOReturn givePoolBlock(UInt32 context, UInt64 offset, UInt64 length);
+	// Context `context`'s Private blocks (kRgfxAccelMethodPrivateTake, design.md, "Private
+	// blocks"), where the kext took RGFX_FEATURE_PRIVATE_BLOCKS: takePrivateBlock posts its
+	// PRIVATE_TAKE of `length` bytes and waits for the host's answer however long it takes, the
+	// block's GPU address and length in *gpuAddress and *blockLength. kIOReturnUnsupported where
+	// the kext did not take the feature; kIOReturnBadArgument for 0 bytes or past
+	// RGFX_PRIVATE_TAKE_MAX; kIOReturnNoMemory where the host had no block for it.
+	// givePrivateBlock posts the block's PRIVATE_GIVE and returns.
+	IOReturn takePrivateBlock(UInt32 context, UInt64 length, UInt64 *gpuAddress,
+	                          UInt64 *blockLength);
+	IOReturn givePrivateBlock(UInt32 context, UInt64 gpuAddress, UInt64 length);
 	// The region's first `size` bytes from RGFX_DEVICE_INFO_OFFSET (the device info, and the
 	// video caps after it), mapped read-only into the kernel: the map, which the caller
 	// releases, with *info its first byte; null where it cannot be mapped.

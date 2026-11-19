@@ -145,6 +145,9 @@ int main()
 	check(!rgfxSubmitAdmitted(RGFX_CMD_POOL_TAKE) && !rgfxSubmitAdmitted(RGFX_CMD_POOL_GIVE),
 	      "a pool take and give are the kext's");
 	check(rgfxSubmitAdmitted(RGFX_CMD_HEAP_OVER_POOL), "a heap over a pool block is accepted");
+	// And so are a Private block's (kRgfxAccelMethodPrivateTake and PrivateGive).
+	check(!rgfxSubmitAdmitted(RGFX_CMD_PRIVATE_TAKE) && !rgfxSubmitAdmitted(RGFX_CMD_PRIVATE_GIVE),
+	      "a Private take and give are the kext's");
 
 	// The pipeline creates, which the device answers with a PIPELINE_REFLECTION and a client may
 	// post deferred: the render, mesh render and compute pipelines', and no other type.

@@ -85,6 +85,25 @@ int main()
 	check(!rgfxPoolAnswerFits(pool, 0, 0, 0), "a take of nothing");
 	check(!rgfxPoolAnswerFits(0, kAlign, 0, kAlign), "no pool");
 
+	// A Private take's length: rounded up to 64 KiB; none for 0 bytes or past 1 TiB.
+	check(rgfxPrivateTakeLength(0) == 0, "0 bytes take no Private block");
+	check(rgfxPrivateTakeLength(1) == RGFX_PRIVATE_BLOCK_ALIGN, "a byte takes a Private block");
+	check(rgfxPrivateTakeLength(RGFX_PRIVATE_BLOCK_ALIGN + 1) == 2 * RGFX_PRIVATE_BLOCK_ALIGN,
+	      "past a Private block takes two");
+	check(rgfxPrivateTakeLength(RGFX_PRIVATE_TAKE_MAX) == RGFX_PRIVATE_TAKE_MAX, "1 TiB at most");
+	check(rgfxPrivateTakeLength(RGFX_PRIVATE_TAKE_MAX + 1) == 0, "past 1 TiB takes nothing");
+	// The host's answer: at least the rounded length, a multiple of 64 KiB, at an address that
+	// is not 0 and does not wrap.
+	const uint64_t at = 1ull << 44;
+	const uint64_t p = RGFX_PRIVATE_BLOCK_ALIGN;
+	check(rgfxPrivateAnswerFits(1, at, p), "a Private block of the take's length");
+	check(rgfxPrivateAnswerFits(1, at + 0x8000, 256ull << 20), "a longer one, anywhere");
+	check(!rgfxPrivateAnswerFits(2 * p, at, p), "one short of the take");
+	check(!rgfxPrivateAnswerFits(p, at, p + 0x1000), "one not a multiple of 64 KiB");
+	check(!rgfxPrivateAnswerFits(p, 0, p), "one at address 0");
+	check(!rgfxPrivateAnswerFits(p, UINT64_MAX - p + 2, p), "one that wraps");
+	check(!rgfxPrivateAnswerFits(0, at, p), "a Private take of nothing");
+
 	// The list: empty, grown at its first block, each block listed once, taken by its offset.
 	std::vector<std::vector<RgfxHeldPoolBlock>> arrays;
 	RgfxPoolBlockList list = {nullptr, 0, 0};

@@ -1195,6 +1195,72 @@ IOReturn RgfxAccelerator::givePoolBlock(UInt32 context, UInt64 offset, UInt64 le
 	                     0);
 }
 
+IOReturn RgfxAccelerator::takePrivateBlock(UInt32 context, UInt64 length, UInt64 *gpuAddress,
+                                           UInt64 *blockLength)
+{
+	*gpuAddress = 0;
+	*blockLength = 0;
+	if (!(featureWord() & RGFX_FEATURE_PRIVATE_BLOCKS))
+		return kIOReturnUnsupported;
+	if (!rgfxPrivateTakeLength(length))
+		return kIOReturnBadArgument;
+	RgfxPrivateTake take = {};
+	take.context = context;
+	take.length = length;
+	RgfxPrivateBlock answer = {};
+	UInt32 answered = 0;
+	// The host answers each take of an open context, and the context's close waits for this ask
+	// (RgfxAskGate.hpp), as a pool take's: one whose block waits for device memory waits as long.
+	IOReturn r = postLifecycle(RGFX_CMD_PRIVATE_TAKE, &take, sizeof(take),
+	                           RGFX_EVT_PRIVATE_BLOCK, &answer, sizeof(answer), &answered,
+	                           nullptr, ReimsGraphics::kLifecycleNoDeadline);
+	if (r != kIOReturnSuccess)
+		return r;
+	if (answered < sizeof(answer)) {
+		IOLog("RgfxAccelerator: context %u's Private take of 0x%llx bytes: an answer of %u "
+		      "bytes\n",
+		      context, length, answered);
+		return kIOReturnInternalError;
+	}
+	switch (answer.status) {
+	case RGFX_STATUS_OK:
+		break;
+	case RGFX_STATUS_REFUSED:
+		return kIOReturnNoMemory;
+	case RGFX_STATUS_INVALID_ARGUMENT:
+		return kIOReturnBadArgument;
+	default:
+		IOLog("RgfxAccelerator: context %u's Private take of 0x%llx bytes: status %u\n", context,
+		      length, answer.status);
+		return kIOReturnError;
+	}
+	if (!rgfxPrivateAnswerFits(length, answer.gpu_address, answer.length)) {
+		IOLog("RgfxAccelerator: context %u's Private take of 0x%llx bytes: answered 0x%llx bytes "
+		      "at 0x%llx, which is no block for it: it is given back\n",
+		      context, length, answer.length, answer.gpu_address);
+		givePrivateBlock(context, answer.gpu_address, answer.length);
+		return kIOReturnInternalError;
+	}
+	*gpuAddress = answer.gpu_address;
+	*blockLength = answer.length;
+	return kIOReturnSuccess;
+}
+
+IOReturn RgfxAccelerator::givePrivateBlock(UInt32 context, UInt64 gpuAddress, UInt64 length)
+{
+	if (!(featureWord() & RGFX_FEATURE_PRIVATE_BLOCKS))
+		return kIOReturnUnsupported;
+	RgfxPrivateGive give = {};
+	give.context = context;
+	give.gpu_address = gpuAddress;
+	give.length = length;
+	// Its COMPLETE no thread waits for: the host takes the block back once the context's command
+	// buffers committed before it have finished, or refuses it, and the context's close gives
+	// back any block it kept.
+	return postLifecycle(RGFX_CMD_PRIVATE_GIVE, &give, sizeof(give), 0, nullptr, 0, nullptr,
+	                     nullptr, 0);
+}
+
 // MARK: - Doorbell pages
 
 UInt32 RgfxAccelerator::openDoorbellPage(UInt32 context, task_t task, IOMemoryMap **map)
