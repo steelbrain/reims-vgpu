@@ -1,5 +1,5 @@
 //! The rt platform's boot diagnostics, which a boot that checks it reads: lines
-//! `reims-vgpu: rt-diag ...` on stderr, written with the process's counts ([`write`], which
+//! `reims-vgpu: rt-diag ...` on stderr, written with the process's counts ([`write()`], which
 //! `crate::answer::write_counts` runs). They hold:
 //!
 //! - **Gaps by kind.** Each refusal of rt's `Gap`, by the gap's kind, a draw's by its draw kind
