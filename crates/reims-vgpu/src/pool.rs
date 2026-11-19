@@ -71,6 +71,7 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 use reims_vgpu_vulkan::answer::count_kind;
+use reims_vgpu_vulkan::core::memory::placed::Placed;
 use reims_vgpu_vulkan::core::num::ToU64 as _;
 use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
 use reims_vgpu_vulkan::core::platform::os::vm::HostVm as _;
@@ -98,6 +99,11 @@ pub const UNALIGNED_CODE: &str = "rt-pool-block-unaligned";
 /// The code of the bytes the take workers zeroed through their pieces' mappings (`takes`),
 /// counted by the byte.
 pub const TAKE_ZEROED_BYTES_CODE: &str = "pool-take-zeroed-bytes";
+
+/// The code of a carve's bytes the take workers did not zero, as the piece's source said its
+/// block read zero as it handed it out and no carve of the piece held them since
+/// ([`BlockInfo::zeroed`], `takes`). Counted by the byte.
+pub const TAKE_ZERO_SKIPPED_BYTES_CODE: &str = "pool-take-zero-skipped-bytes";
 
 /// A pooled block's length, metal2vulkan-rt's `BLOCK_LEN`: 256 MiB.
 pub const BLOCK_LEN: u64 = 256 << 20;
@@ -155,6 +161,11 @@ pub struct BlockInfo {
     pub gpu_address: u64,
     /// Its host mapping, for a Shared block; `None` for a Private one.
     pub contents: Option<NonNull<u8>>,
+    /// Whether every byte of it reads zero as the source hands it out (metal2vulkan-rt's
+    /// `BlockInfo::zeroed`: the driver made its allocation zeroed, and no block held a byte at or
+    /// past its first before): the take workers then zero only the bytes of a carve some carve of
+    /// the piece held before (`takes`, [`Placed`]).
+    pub zeroed: bool,
 }
 
 // SAFETY: plain data; `contents` is an address, and dereferencing it is the holder's unsafe.
@@ -283,6 +294,9 @@ struct Piece {
     holds: u64,
     /// The contexts' blocks in it (`takes`).
     carves: u64,
+    /// The mark of the bytes its carves ever held, from its block's take ([`Placed`]): those at
+    /// or past it are as the source handed them out.
+    placed: Placed,
 }
 
 impl Piece {
@@ -781,6 +795,7 @@ impl Shared {
                 empty_since: Some((self.now)()),
                 holds: 0,
                 carves: 0,
+                placed: Placed::default(),
             },
         );
         st.by_block.insert(block.id, at);

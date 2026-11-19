@@ -15,7 +15,15 @@
 //! are answered in its own order, one worker a context with a take in flight, so a take waits only
 //! behind its own context's earlier ones, never behind another's growth or zeroing. A worker goes
 //! after [`WORKER_IDLE`] with no take. Every block is zeroed once, at its take, off the thread
-//! that carried the take out, its bytes counted ([`super::TAKE_ZEROED_BYTES_CODE`]).
+//! that carried the take out, its bytes counted ([`super::TAKE_ZEROED_BYTES_CODE`]): but for those
+//! no carve of its piece held before, in a piece whose source said its block read zero as it
+//! handed it out (its `zeroed`), which stay as the source zeroed them, counted
+//! ([`super::TAKE_ZERO_SKIPPED_BYTES_CODE`]). The piece's mark ([`Placed`]) rises past each carve
+//! as it is carved. The guest writes only the blocks it was answered, through the mappings of
+//! their bytes alone, and the device only where the guest places objects in them, so a byte past
+//! the mark was never the guest's to write.
+//!
+//! [`Placed`]: reims_vgpu_vulkan::core::memory::placed::Placed
 //!
 //! A take ends only at its answer, its context's close or the device's reset: there is no
 //! timeout. A take whose context closed, or that the reset ended, before its answer is given back
@@ -51,7 +59,10 @@ use std::time::Duration;
 use parking_lot::MutexGuard;
 use reims_vgpu_vulkan::answer::count_kind_by;
 
-use super::{Ask, Error, Mapped, MonoTime, Shared, State, TAKE_ZEROED_BYTES_CODE};
+use super::{
+    Ask, Error, Mapped, MonoTime, Shared, State, TAKE_ZERO_SKIPPED_BYTES_CODE,
+    TAKE_ZEROED_BYTES_CODE,
+};
 
 /// A block's alignment and its length's granule: 64 KiB, the wire's `RGFX_POOL_BLOCK_ALIGN`.
 pub const TAKE_ALIGN: u64 = 64 << 10;
@@ -83,6 +94,10 @@ pub(super) struct Carve {
     state: Carving,
     /// The GPU address of its first byte (the module doc's "Its GPU address").
     gpu_address: GpuAddress,
+    /// How many of its bytes, from its first, an earlier carve of its piece may have written,
+    /// which its worker zeroes (`Placed::place` of its piece's mark as it was carved): all of
+    /// them unless the piece's source said its block read zero as it handed it out.
+    written: u64,
 }
 
 /// Where a carve's GPU address comes from.
@@ -509,7 +524,10 @@ impl State {
                 (at.checked_add(len)? <= end).then_some((start, at))
             });
         let (start, at) = at?;
-        let block = self.pieces.get(&start)?.block.gpu_address;
+        // The piece's mark rises past the carve as it is carved, before another can be.
+        let piece = self.pieces.get_mut(&start)?;
+        let block = piece.block.gpu_address;
+        let written = piece.placed.place(piece.block.zeroed, at.checked_sub(start)?, len);
         let gpu_address = if block != 0 {
             GpuAddress::OfBlock(block.checked_add(at.checked_sub(start)?)?)
         } else {
@@ -524,6 +542,7 @@ impl State {
                 serial,
                 state: Carving::Taking,
                 gpu_address,
+                written,
             },
         );
         let p = self.pieces.get_mut(&start)?;
@@ -617,14 +636,22 @@ impl Shared {
                 }
             };
             let host = st.host_of(at);
-            let len = usize::try_from(job.len).ok();
+            let carve = st.carves.get(&at).filter(|c| c.serial == serial);
+            let written = carve.map_or(job.len, |c| c.written.min(job.len));
+            let zeroes = usize::try_from(written).ok();
             MutexGuard::unlocked(&mut st, || {
-                if let (Some(host), Some(len)) = (host, len) {
+                if let (Some(host), Some(zeroes)) = (host, zeroes) {
                     // SAFETY: the carve lies in its live piece's mapping, and the piece's block
                     // stays the pool's while the carve does, which only this worker frees until
-                    // it is answered.
-                    unsafe { std::ptr::write_bytes(host.as_ptr(), 0, len) };
-                    count_kind_by(TAKE_ZEROED_BYTES_CODE, job.len);
+                    // it is answered; its first `written` bytes are the carve's.
+                    unsafe { std::ptr::write_bytes(host.as_ptr(), 0, zeroes) };
+                    if written > 0 {
+                        count_kind_by(TAKE_ZEROED_BYTES_CODE, written);
+                    }
+                    if written < job.len {
+                        let skipped = job.len.saturating_sub(written);
+                        count_kind_by(TAKE_ZERO_SKIPPED_BYTES_CODE, skipped);
+                    }
                 }
             });
             let stands = st.stands(context, job.life);

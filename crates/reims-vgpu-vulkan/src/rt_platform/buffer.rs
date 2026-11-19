@@ -13,7 +13,10 @@
 //! Metal's are: rt zeroes a Shared buffer's through the mapping and a Private one's by a GPU fill
 //! ahead of the next command buffer, the platform zeroes a Managed buffer's own bytes (counted by
 //! the byte, [`ZEROED_BYTES_CODE`], with a heap's it zeroes, `super::heap`), and rt its device
-//! copy. The buffer holds its blocks; the platform's handles of them go as it is made.
+//! copy; but none of a block rt said read zero as it was taken (its `BlockInfo::zeroed`), which
+//! the buffer's alone held no byte of before (counted by the byte, [`ZERO_SKIPPED_PRIVATE_CODE`]
+//! and [`ZERO_SKIPPED_SHARED_CODE`]). The buffer holds its blocks; the platform's handles of them
+//! go as it is made.
 //!
 //! **A pinned address.** The guest picks a buffer's GPU address (`setPinnedGPUAddress:`), and rt
 //! places no buffer at a chosen address: a buffer's address is Vulkan's device address. A pinned
@@ -21,7 +24,9 @@
 //! ([`KnownBlocks`], which the graphics lane fills with the blocks the guest sub-allocates) is that
 //! range of the block, at the pinned address. Its bytes are the block's as they are, Metal's zeros
 //! the block's owner's to give (at its take) and the guest's (in the ranges it takes again), but a
-//! Private buffer's, which the guest cannot reach, zeroed (rt's GPU fill). A no-copy buffer is such
+//! Private buffer's, which the guest cannot reach, zeroed (rt's GPU fill), unless rt said the block
+//! read zero as it was taken and no range looked up in it since reached the buffer's
+//! ([`KnownBlocks::at`]). A no-copy buffer is such
 //! a range only where its bytes are the block's own mapping there; its deallocator then runs as the
 //! buffer goes, the block's memory held by rt for the work that still uses it. A no-copy Managed
 //! buffer on a GPU with memory of its own, whose address is its device copy's, keeps that copy at
@@ -136,6 +141,7 @@ use std::sync::{Arc, OnceLock};
 use metal2vulkan_rt as rt;
 
 use crate::core::host::HostPtr;
+use crate::core::memory::placed::Placed;
 use crate::core::num::{ToU64 as _, ToUsize as _};
 use crate::core::platform::Handle as _;
 use crate::core::platform::device::NoCopyDeallocator;
@@ -240,6 +246,16 @@ pub const MANAGED_OVER_DMA_BUF: &str = "rt-managed-over-dma-buf";
 /// rt's metrics.
 pub const ZEROED_BYTES_CODE: &str = "rt-zeroed-bytes";
 
+/// The code of a Private buffer's or heap's bytes the platform did not have zeroed, as rt said
+/// their block read zero as it was taken and no placement in it reached them since (rt's
+/// `BlockInfo::zeroed`, [`KnownBlocks::at`]). Counted by the byte.
+pub const ZERO_SKIPPED_PRIVATE_CODE: &str = "rt-zero-skipped-private-bytes";
+
+/// The code of a Shared or Managed buffer's or a Shared heap's bytes the platform did not zero,
+/// or have zeroed, as rt said their block of its own read zero as it was taken. Counted by the
+/// byte.
+pub const ZERO_SKIPPED_SHARED_CODE: &str = "rt-zero-skipped-shared-bytes";
+
 /// A buffer descriptor's `resourceOptions` before any setter: `Shared`.
 const BUFFER_DESCRIPTOR_OPTIONS: u64 = 0;
 
@@ -296,18 +312,26 @@ impl Drop for RtBuffer {
 /// The blocks the device knows by their GPU address, which a pinned buffer or heap inside one is a
 /// range of (the module's docs, "A pinned address"): the graphics lane's, which knows a block as it
 /// hands its range to the guest and forgets it as it takes it back, just before it gives the block
-/// back to rt. Each held block is a handle of it, so it lives while known. A handle of the device's
-/// set: its clones are the same set (`RtDevice::known_blocks`). With them, the host's mappings of
-/// the device's dma-buf imports and the pages of its copies ([`HostMappings`]), known or not.
+/// back to rt. Each held block is a handle of it, so it lives while known, with its mark of the
+/// bytes placed in it since it was known ([`Placed`]), which every lookup of a range in it
+/// ([`Self::at`]) raises past the range. A handle of the device's set: its clones are the same set
+/// (`RtDevice::known_blocks`). With them, the host's mappings of the device's dma-buf imports and
+/// the pages of its copies ([`HostMappings`]), known or not.
 #[derive(Default, Clone)]
 pub struct KnownBlocks {
     /// The blocks known, by their GPU address.
-    known: Arc<Mutex<BTreeMap<u64, rt::Block>>>,
+    known: Arc<Mutex<BTreeMap<u64, Known>>>,
     /// The host's mapping of each live dma-buf import.
     mapped: HostMappings,
     /// The pages each live copy's import holds a copy of (the module's docs, "A copy at the
     /// refusal point"), the block's `contents` in place of rt's mapping of the copy.
     homes: HostMappings,
+}
+
+/// A known block, and its mark of the bytes placed in it since it was known.
+struct Known {
+    block: rt::Block,
+    placed: Placed,
 }
 
 /// Interim, until rt takes the mapping of a dma-buf it imports, which it answers no `contents`
@@ -327,9 +351,11 @@ impl HostMappings {
 }
 
 impl KnownBlocks {
-    /// Knows `block` by its GPU address, in place of a block known there before.
+    /// Knows `block` by its GPU address, in place of a block known there before, nothing placed
+    /// in it yet.
     pub fn know(&self, block: rt::Block) {
-        self.known.lock().insert(block.gpu_address, block);
+        let placed = Placed::default();
+        self.known.lock().insert(block.gpu_address, Known { block, placed });
     }
 
     /// Forgets the block `id`, giving back the handle it held; `None` where none is known.
@@ -337,21 +363,28 @@ impl KnownBlocks {
         let mut known = self.known.lock();
         let at = known
             .iter()
-            .find(|(_, block)| block.id == id)
+            .find(|(_, k)| k.block.id == id)
             .map(|(&at, _)| at)?;
-        known.remove(&at)
+        known.remove(&at).map(|k| k.block)
     }
 
-    /// The known block that holds the `length` bytes at GPU address `address`, and their offset
-    /// in it.
-    pub fn at(&self, address: u64, length: u64) -> Option<(rt::Block, u64)> {
-        let known = self.known.lock();
-        let (&start, block) = known.range(..=address).next_back()?;
+    /// The known block that holds the `length` bytes at GPU address `address`, their offset in
+    /// it, and how many of them, from the first, may hold what an earlier placement in the block
+    /// wrote ([`Placed::place`]): all of them unless rt said the block's bytes read zero as it
+    /// was taken (its `zeroed`). Every caller places the range, or may, so the block's mark rises
+    /// past it, refused or not: a mark too high only zeroes more.
+    pub fn at(&self, address: u64, length: u64) -> Option<(rt::Block, u64, u64)> {
+        let mut known = self.known.lock();
+        let (&start, k) = known.range_mut(..=address).next_back()?;
         let offset = address - start;
         let inside = offset
             .checked_add(length)
-            .is_some_and(|end| end <= block.len);
-        inside.then(|| (block.clone(), offset))
+            .is_some_and(|end| end <= k.block.len);
+        if !inside {
+            return None;
+        }
+        let written = k.placed.place(k.block.zeroed, offset, length);
+        Some((k.block.clone(), offset, written))
     }
 
     /// The known Shared block whose mapping holds the `length` bytes at `first`, and their offset
@@ -359,7 +392,7 @@ impl KnownBlocks {
     pub fn mapping(&self, first: HostPtr, length: u64) -> Option<(rt::Block, u64)> {
         let first = first.addr().to_u64();
         let known = self.known.lock();
-        known.values().find_map(|block| {
+        known.values().find_map(|Known { block, .. }| {
             let start = self.contents_of(block)?;
             let offset = first.checked_sub(start)?;
             let inside = offset
@@ -669,7 +702,8 @@ pub(super) fn private_options(raw: u64) -> Option<u64> {
 
 /// The known block of `class` that holds the `length` bytes at GPU address `pin`, and their
 /// offset in it; where `bytes` is given, only one whose mapping holds them at that offset (rt's,
-/// or the host's of a dma-buf import, `KnownBlocks::contents_of`).
+/// or the host's of a dma-buf import, `KnownBlocks::contents_of`). The block's mark rises past
+/// them ([`KnownBlocks::at`]).
 pub(super) fn known_at(
     device: &RtObj<RtDevice>,
     pin: u64,
@@ -677,19 +711,34 @@ pub(super) fn known_at(
     class: rt::MemoryClass,
     bytes: Option<HostPtr>,
 ) -> Option<(rt::Block, u64)> {
+    known_placed(device, pin, length, class, bytes).map(|(block, offset, _)| (block, offset))
+}
+
+/// [`known_at`], with how many of the bytes, from the first, may hold what an earlier placement
+/// in the block wrote ([`KnownBlocks::at`]).
+fn known_placed(
+    device: &RtObj<RtDevice>,
+    pin: u64,
+    length: u64,
+    class: rt::MemoryClass,
+    bytes: Option<HostPtr>,
+) -> Option<(rt::Block, u64, u64)> {
     let known = device.known_blocks();
-    let (block, offset) = known.at(pin, length)?;
+    let (block, offset, written) = known.at(pin, length)?;
     let mapped = |at: HostPtr| {
         let first = known.contents_of(&block);
         first.and_then(|first| first.checked_add(offset)) == Some(at.addr().to_u64())
     };
     let fits = block.class == class && bytes.is_none_or(mapped);
-    fits.then_some((block, offset))
+    fits.then_some((block, offset, written))
 }
 
 /// The buffer at `pin` of `length` bytes and options `o`, where the range lies in a known block
 /// of its class (Shared or Private), zeroed from `zero_from` alone: `Some(None)` where rt refuses
-/// it, counted; `None` where no such block holds it.
+/// it, counted; `None` where no such block holds it. A Private one's zeroing (`zero_from` of
+/// `Some(0)`, [`made`]) is skipped where none of its bytes may hold what an earlier placement in
+/// the block wrote ([`KnownBlocks::at`]): rt said the block read zero as it was taken, and no
+/// placement since reached them. Counted by the byte ([`ZERO_SKIPPED_PRIVATE_CODE`]).
 fn in_known(
     device: &RtObj<RtDevice>,
     sel: &'static str,
@@ -703,7 +752,14 @@ fn in_known(
         Storage::Private => rt::MemoryClass::Private,
         Storage::Managed => return None,
     };
-    let (block, offset) = known_at(device, pin, length, class, None)?;
+    let (block, offset, written) = known_placed(device, pin, length, class, None)?;
+    let zero_from = match (class, zero_from) {
+        (rt::MemoryClass::Private, Some(0)) if written == 0 => {
+            crate::answer::count_kind_by(ZERO_SKIPPED_PRIVATE_CODE, length);
+            None
+        }
+        _ => zero_from,
+    };
     match device.rt().new_buffer(block.id, offset, length, zero_from) {
         Ok(made) => Some(Some(buffer(device, made, o.answered))),
         Err(error) => {
@@ -711,6 +767,16 @@ fn in_known(
             Some(None)
         }
     }
+}
+
+/// `length` bytes of a block of `class` not zeroed, as rt said the block read zero as it was
+/// taken: counted by the byte, under [`ZERO_SKIPPED_PRIVATE_CODE`] or [`ZERO_SKIPPED_SHARED_CODE`].
+pub(super) fn zero_skipped(class: rt::MemoryClass, length: u64) {
+    let code = match class {
+        rt::MemoryClass::Private => ZERO_SKIPPED_PRIVATE_CODE,
+        rt::MemoryClass::Shared => ZERO_SKIPPED_SHARED_CODE,
+    };
+    crate::answer::count_kind_by(code, length);
 }
 
 /// A block of `class` for `length` bytes, for `sel`; `None` where rt refuses it, counted.
@@ -730,7 +796,9 @@ pub(super) fn take(
 }
 
 /// rt's buffer of zeros, of `length` bytes, in a block of `class` of its own, for `sel`; `None`
-/// where rt refuses it, counted.
+/// where rt refuses it, counted. rt zeroes it, unless rt said the block read zero as it was taken
+/// (its `zeroed`): the block is the buffer's alone, so none of its bytes was handed out before.
+/// Counted by the byte ([`zero_skipped`]).
 fn own(
     device: &RtObj<RtDevice>,
     sel: &'static str,
@@ -738,7 +806,14 @@ fn own(
     length: u64,
 ) -> Option<rt::Buffer> {
     let block = take(device, sel, class, length)?;
-    match device.rt().new_buffer(block.id, 0, length, Some(0)) {
+    let zero_from = match block.zeroed {
+        true => {
+            zero_skipped(class, length);
+            None
+        }
+        false => Some(0),
+    };
+    match device.rt().new_buffer(block.id, 0, length, zero_from) {
         Ok(made) => Some(made),
         Err(error) => {
             rt_refused_create(sel, &error);
@@ -751,11 +826,16 @@ fn own(
 /// keeps one) in blocks of their own, for `sel`; `None` where rt refuses it, counted.
 fn own_managed(device: &RtObj<RtDevice>, sel: &'static str, length: u64) -> Option<rt::Buffer> {
     let bytes = take(device, sel, rt::MemoryClass::Shared, length)?;
-    if let Some(at) = bytes.contents {
-        // SAFETY: the block is this call's alone, mapped for its life, and its `len`, the length
-        // rounded up, holds the `length` bytes.
-        unsafe { at.as_ptr().write_bytes(0, length.to_usize()) };
-        crate::answer::count_kind_by(ZEROED_BYTES_CODE, length);
+    match bytes.contents {
+        // The block is the buffer's alone: none of its bytes was handed out before.
+        Some(_) if bytes.zeroed => zero_skipped(rt::MemoryClass::Shared, length),
+        Some(at) => {
+            // SAFETY: the block is this call's alone, mapped for its life, and its `len`, the
+            // length rounded up, holds the `length` bytes.
+            unsafe { at.as_ptr().write_bytes(0, length.to_usize()) };
+            crate::answer::count_kind_by(ZEROED_BYTES_CODE, length);
+        }
+        None => {}
     }
     let copy = match device.rt().has_unified_memory() {
         true => None,
@@ -2108,6 +2188,89 @@ mod tests {
             .new_texture(on, &descriptor, 0, 256)
             .expect("never a raise");
         assert!(texture.is_some());
+    }
+
+    /// Runs `cmds` in a blit encoder of a new command buffer of `queue`, and waits for it.
+    fn blit_and_wait(
+        queue: &<RtPlatform as crate::core::platform::Platform>::CommandQueue,
+        cmds: Vec<BlitCmd<'_, RtPlatform>>,
+    ) {
+        let on = OnFault::Return;
+        let commands = queue.command_buffer(on).expect("never a raise");
+        let commands = commands.expect("a command buffer");
+        let encoder = commands.blit_encoder(on).expect("never a raise");
+        let encoder = encoder.expect("a blit encoder");
+        for cmd in cmds {
+            assert_eq!(encoder.encode(on, cmd), Ok(()));
+        }
+        assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+        assert_eq!(commands.commit(on), Ok(()));
+        assert_eq!(commands.wait_until_completed(on), Ok(()));
+    }
+
+    /// On the GPU the test holds: a Private buffer pinned in a known block is zeroed where an
+    /// earlier placement in the block reached its bytes, whatever rt said of the block; one past
+    /// every earlier placement is left as rt took the block where rt said it read zero, counted
+    /// by the byte, and zeroed where rt did not; either reads zero
+    #[test]
+    fn pinned_private_buffers_are_zeroed_where_a_placement_held_their_bytes_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let block = (device.rt()).take_block(rt::MemoryClass::Private, 0x10000);
+        let block = block.expect("a Private block");
+        let zeroed = block.zeroed;
+        let known = device.known_blocks().clone();
+        known.know(block.clone());
+        let queue = device.new_command_queue().expect("a command queue");
+        let out = device.new_buffer_of_length(on, 64, 0).expect("never a raise");
+        let out = out.expect("a Shared buffer");
+        let private = |at: u64| {
+            let made = device.new_buffer(pinned(block.gpu_address + at, 0x20, None));
+            let made = made.expect("never a raise").expect("a Private buffer in its block");
+            assert_eq!(made.gpu_address(), block.gpu_address + at);
+            made
+        };
+        let read_back = |buffer: &RtObj<RtBuffer>| {
+            let copy = BlitCmd::CopyBufferToBuffer {
+                source_buffer: Some(buffer),
+                source_offset: 0,
+                destination_buffer: Some(&out),
+                destination_offset: 0,
+                size: 64,
+            };
+            blit_and_wait(&queue, vec![copy]);
+            read(out.contents(), 64)
+        };
+        let skipped = || counted(ZERO_SKIPPED_PRIVATE_CODE);
+
+        // The block's first placement: zeroed only where rt did not say the block read zero.
+        let first = private(0x100);
+        assert_eq!(skipped(), if zeroed { 64 } else { 0 });
+        let fill = BlitCmd::FillBuffer {
+            buffer: &first,
+            range: NsRange::new(0, 64),
+            value: 0xab,
+        };
+        blit_and_wait(&queue, vec![fill]);
+        assert_eq!(read_back(&first), [0xab; 64]);
+        drop(first);
+
+        // Over the first one's bytes: zeroed, on every device.
+        let again = private(0x100);
+        assert_eq!(skipped(), if zeroed { 64 } else { 0 });
+        assert_eq!(read_back(&again), [0; 64]);
+        drop(again);
+        // Straddling the mark: some of its bytes were the first one's, so all are zeroed.
+        let straddling = private(0x120);
+        assert_eq!(skipped(), if zeroed { 64 } else { 0 });
+        assert_eq!(read_back(&straddling), [0; 64]);
+        // Past every placement: as rt took the block.
+        let past = private(0x1000);
+        assert_eq!(skipped(), if zeroed { 128 } else { 0 });
+        assert_eq!(read_back(&past), [0; 64]);
+        drop((straddling, past));
+        assert!(known.forget(block.id).is_some());
     }
 
     /// On the GPU the test holds: a scratch buffer is a Shared buffer of the length asked,

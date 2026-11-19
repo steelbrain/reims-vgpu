@@ -4841,7 +4841,9 @@ reads it once.
   carries the take out, neither allocating nor zeroing there; the context's
   own worker (`reims-vgpu.graphics-pool-take`) zeroes the block through the
   host's mapping and answers, first growing the pool by a piece of the take's
-  length where nothing fit. So a context's takes are answered in its order,
+  length where nothing fit. Bytes no block of the piece held before stay as
+  the piece came, where rt said its block read zero as it handed it out
+  (rt's `BlockInfo::zeroed`; `pool-take-zero-skipped-bytes`). So a context's takes are answered in its order,
   and never wait behind another context's growth or zeroing. The host keeps
   one empty piece ahead of the takes from the kext's take of `POOL` on
   (`Host::pool_taken`), so a take grows the pool only where that piece has no

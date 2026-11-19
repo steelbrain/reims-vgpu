@@ -4,6 +4,8 @@
 //! - [`map`]: [`MemoryMap`](map::MemoryMap), the guest's physical ranges sorted at init, and the
 //!   mappings it makes (`mach_vm_remap` of each piece into a fresh or given region).
 //! - [`mapping`]: [`Mapping`](mapping::Mapping), a host range over guest memory, and its teardown.
+//! - [`placed`]: [`Placed`](placed::Placed), a block's mark of the bytes ever handed out of it,
+//!   by which the device skips zeroing what the block's source zeroed.
 //!
 //! # Edges the host sees
 //!
@@ -29,6 +31,7 @@
 pub mod descriptor;
 pub mod map;
 pub mod mapping;
+pub mod placed;
 
 use std::fmt;
 
