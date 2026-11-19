@@ -15,7 +15,8 @@ use super::{PlaneDraw, PlaneTargets};
 /// The streams of the directories `RVG_VA_STREAMS` lists (as `PATH` lists them): each H.264
 /// (`.264`) and HEVC (`.265`) file, in name order.
 fn streams() -> Vec<PathBuf> {
-    let dirs = std::env::var_os("RVG_VA_STREAMS").expect("RVG_VA_STREAMS: the streams' directories");
+    let dirs =
+        std::env::var_os("RVG_VA_STREAMS").expect("RVG_VA_STREAMS: the streams' directories");
     let mut streams: Vec<PathBuf> = std::env::split_paths(&dirs)
         .flat_map(|dir| std::fs::read_dir(dir).expect("a streams directory"))
         .map(|entry| entry.expect("a directory entry").path())
@@ -34,11 +35,15 @@ fn streams() -> Vec<PathBuf> {
 fn got_image(frame: &Frame) -> [Vec<u8>; 2] {
     let sample = if frame.bit_depth() > 8 { 2 } else { 1 };
     let (width, height) = (frame.width() as usize, frame.height() as usize);
-    let rows = [(width * sample, height), (width.div_ceil(2) * 2 * sample, height.div_ceil(2))];
+    let rows = [
+        (width * sample, height),
+        (width.div_ceil(2) * 2 * sample, height.div_ceil(2)),
+    ];
     let mut planes = rows.map(|(row, rows)| vec![0u8; row * rows]);
     let [luma, chroma] = &mut planes;
     let back = frame.read_back().expect("a read back");
-    back.copy_into(plane(luma, rows[0]), plane(chroma, rows[1])).expect("its copy");
+    back.copy_into(plane(luma, rows[0]), plane(chroma, rows[1]))
+        .expect("its copy");
     planes
 }
 
@@ -93,7 +98,10 @@ fn each_picture_drawn_into_its_targets_is_what_get_image_reads_back() {
     );
     let (mut pictures, mut differ) = (0usize, Vec::new());
     for stream in streams() {
-        let name = stream.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = stream
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let file = std::fs::read(&stream).expect("a stream");
         let hevc = name.ends_with(".265");
         let units = if hevc {
@@ -114,7 +122,9 @@ fn each_picture_drawn_into_its_targets_is_what_get_image_reads_back() {
             let size = (frame.width(), frame.height());
             let to = targets.get_or_insert_with(|| {
                 let start = clock.now();
-                let made = draw.targets(size, texture.is_10_bit()).expect("the targets");
+                let made = draw
+                    .targets(size, texture.is_10_bit())
+                    .expect("the targets");
                 eprintln!(
                     "d3d11: {name}: {}x{} {}-bit targets made in {:.3} ms",
                     size.0,
@@ -126,7 +136,8 @@ fn each_picture_drawn_into_its_targets_is_what_get_image_reads_back() {
             });
             assert_eq!(to.size(), size, "one size a stream");
             let start = clock.now();
-            draw.draw(&texture, frame.crop_origin(), to, size).expect("the draw");
+            draw.draw(&texture, frame.crop_origin(), to, size)
+                .expect("the draw");
             draws.push(clock.elapsed_since(start));
             let drawn = draw.read_back(to).expect("the targets' read back");
             let want = got_image(frame);
@@ -159,7 +170,10 @@ fn each_picture_drawn_into_its_targets_is_what_get_image_reads_back() {
         drop(land);
         eprintln!("d3d11: {name}: {}", times(&draws));
     }
-    eprintln!("d3d11: {pictures} pictures drawn, {} differ: {differ:?}", differ.len());
+    eprintln!(
+        "d3d11: {pictures} pictures drawn, {} differ: {differ:?}",
+        differ.len()
+    );
     assert!(pictures > 0);
     assert!(differ.is_empty(), "{differ:?}");
 }

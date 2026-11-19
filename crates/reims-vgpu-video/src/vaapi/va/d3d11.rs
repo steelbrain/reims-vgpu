@@ -46,8 +46,8 @@ use std::sync::{Arc, Weak};
 use crate::core::sync::Mutex;
 
 use super::d3d12::{
-    CommandQueueDesc, Com, CreateEventW, DEVICE_CREATE_COMMAND_QUEUE, DEVICE_CREATE_FENCE,
-    Device, FENCE_GET_COMPLETED_VALUE, FENCE_SET_EVENT_ON_COMPLETION, Guid, Handle, Hresult,
+    Com, CommandQueueDesc, CreateEventW, DEVICE_CREATE_COMMAND_QUEUE, DEVICE_CREATE_FENCE, Device,
+    FENCE_GET_COMPLETED_VALUE, FENCE_SET_EVENT_ON_COMPLETION, Guid, Handle, Hresult,
     IID_ID3D12_COMMAND_QUEUE, IID_ID3D12_FENCE, IID_ID3D12_RESOURCE, QUEUE_SIGNAL, SharedTexture,
     WAIT_OBJECT_0, WaitForSingleObject, adapter_of, check, guid, system_function,
 };
@@ -387,7 +387,10 @@ impl PlaneDraw {
         let queue = direct_queue(&d3d12.device)?;
         let (device, context, on12) = on12_device(&d3d12.device, &queue)?;
         let (native, native_context) = native_device(luid)?;
-        for (name, device) in [("the D3D11On12 device", &device), ("the native one", &native)] {
+        for (name, device) in [
+            ("the D3D11On12 device", &device),
+            ("the native one", &native),
+        ] {
             if !extended_resource_sharing(device)? {
                 return Err(format!("{name} answers no ExtendedResourceSharing"));
             }
@@ -584,7 +587,8 @@ impl State {
     /// The index in `opened` of `texture`'s open, made where there is none; the entries of
     /// textures that no longer live are let go first.
     fn opened(&mut self, texture: &Arc<SharedTexture>, ten_bit: bool) -> Result<usize, String> {
-        self.opened.retain(|opened| opened.texture.strong_count() > 0);
+        self.opened
+            .retain(|opened| opened.texture.strong_count() > 0);
         let life = texture.alive();
         if let Some(at) = (self.opened.iter()).position(|o| Weak::ptr_eq(&o.texture, &life)) {
             return Ok(at);
@@ -713,9 +717,11 @@ impl State {
             let acquire: unsafe extern "system" fn(*mut c_void, *const *mut c_void, u32) =
                 self.on12.method(ON12_ACQUIRE_WRAPPED_RESOURCES);
             acquire(self.on12.raw(), resources.as_ptr(), 1);
-            self.encode_draws(draws.iter().map(|&(target, view, shader, extent)| {
-                (&target.view, Some(view), shader, extent)
-            }));
+            self.encode_draws(
+                draws.iter().map(|&(target, view, shader, extent)| {
+                    (&target.view, Some(view), shader, extent)
+                }),
+            );
             let release: unsafe extern "system" fn(*mut c_void, *const *mut c_void, u32) =
                 self.on12.method(ON12_RELEASE_WRAPPED_RESOURCES);
             release(self.on12.raw(), resources.as_ptr(), 1);
@@ -760,12 +766,8 @@ impl State {
             ) = self.context.method(CONTEXT_OM_SET_RENDER_TARGETS);
             let set_viewports: unsafe extern "system" fn(*mut c_void, u32, *const Viewport) =
                 self.context.method(CONTEXT_RS_SET_VIEWPORTS);
-            let set_views: unsafe extern "system" fn(
-                *mut c_void,
-                u32,
-                u32,
-                *const *mut c_void,
-            ) = self.context.method(CONTEXT_PS_SET_SHADER_RESOURCES);
+            let set_views: unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void) =
+                self.context.method(CONTEXT_PS_SET_SHADER_RESOURCES);
             let set_pixel: unsafe extern "system" fn(
                 *mut c_void,
                 *mut c_void,
@@ -812,8 +814,7 @@ impl State {
         // under the state's lock, the queue's signal of the state's fence, and the fence's
         // event, the state's.
         unsafe {
-            let flush: unsafe extern "system" fn(*mut c_void) =
-                self.context.method(CONTEXT_FLUSH);
+            let flush: unsafe extern "system" fn(*mut c_void) = self.context.method(CONTEXT_FLUSH);
             flush(self.context.raw());
             let signal: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> Hresult =
                 self.queue.method(QUEUE_SIGNAL);
@@ -866,7 +867,8 @@ impl State {
         let mut kept = Vec::new();
         for (depth, formats) in FORMATS.iter().enumerate() {
             for (plane, &format) in formats.targets.iter().enumerate() {
-                let texture = new_texture(&self.device, format, (2, 2), D3D11_BIND_RENDER_TARGET, 0)?;
+                let texture =
+                    new_texture(&self.device, format, (2, 2), D3D11_BIND_RENDER_TARGET, 0)?;
                 let mut out = null_mut();
                 // SAFETY: the method is ID3D11Device's `CreateRenderTargetView`, of a texture of
                 // the device's, in its own format.
@@ -884,9 +886,9 @@ impl State {
             }
         }
         self.set_origin([0; 4]);
-        let draws = kept.iter().map(|(_, view, depth, plane)| {
-            (view, None, &self.pixel[*depth][*plane], (2, 2))
-        });
+        let draws = kept
+            .iter()
+            .map(|(_, view, depth, plane)| (view, None, &self.pixel[*depth][*plane], (2, 2)));
         // SAFETY: the views and shaders are the device's, under the state's lock (`&mut self`).
         unsafe { self.encode_draws(draws) };
         self.flush_and_wait()
@@ -918,7 +920,11 @@ impl State {
         unsafe {
             let copy: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) =
                 self.native_context.method(CONTEXT_COPY_RESOURCE);
-            copy(self.native_context.raw(), staging.raw(), target.native.raw());
+            copy(
+                self.native_context.raw(),
+                staging.raw(),
+                target.native.raw(),
+            );
         }
         release_sync(&target.native_mutex)?;
         #[repr(C)]
@@ -945,7 +951,14 @@ impl State {
             ) -> Hresult = self.native_context.method(CONTEXT_MAP);
             check(
                 "ID3D11DeviceContext::Map",
-                map(self.native_context.raw(), staging.raw(), 0, 1, 0, &mut mapped),
+                map(
+                    self.native_context.raw(),
+                    staging.raw(),
+                    0,
+                    1,
+                    0,
+                    &mut mapped,
+                ),
             )?;
             let row = (width * texel) as usize;
             let mut bytes = Vec::with_capacity(row * height as usize);
@@ -1070,8 +1083,12 @@ fn extended_resource_sharing(device: &Com) -> Result<bool, String> {
     let mut options = [0i32; 14];
     // SAFETY: the method is ID3D11Device's `CheckFeatureSupport`, of the options' 56 bytes.
     let result = unsafe {
-        let check_support: unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32) -> Hresult =
-            device.method(DEVICE_CHECK_FEATURE_SUPPORT);
+        let check_support: unsafe extern "system" fn(
+            *mut c_void,
+            u32,
+            *mut c_void,
+            u32,
+        ) -> Hresult = device.method(DEVICE_CHECK_FEATURE_SUPPORT);
         check_support(
             device.raw(),
             D3D11_FEATURE_D3D11_OPTIONS,
@@ -1106,7 +1123,7 @@ fn compile(source: &str, target: &CStr) -> Result<Vec<u8>, String> {
             &mut errors,
         )
     };
-    let errors = NonNull::new(errors).map(Com);
+    let errors = Com::made("D3DCompile's errors", 0, errors).ok();
     if let Err(why) = check("D3DCompile", result) {
         let said = errors.as_ref().map(blob_bytes).unwrap_or_default();
         return Err(format!(
