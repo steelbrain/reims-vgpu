@@ -5146,7 +5146,11 @@ mod tests {
                     .expect("the buffer's make record");
                 let escaped = calls.get(made + 1).expect("a record after the make");
                 assert_eq!(
-                    (escaped.selector.as_str(), escaped.receiver, &escaped.args[..]),
+                    (
+                        escaped.selector.as_str(),
+                        escaped.receiver,
+                        &escaped.args[..]
+                    ),
                     (BUFFER_ESCAPED, id, &[Value::Uint(MADE_ESCAPE_KIND)][..]),
                     "{calls:?}"
                 );
