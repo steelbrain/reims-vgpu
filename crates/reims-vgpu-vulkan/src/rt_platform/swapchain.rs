@@ -971,7 +971,6 @@ impl Drop for RtSwapchain {
 mod tests {
     use super::*;
     use crate::core::host::HostPtr;
-    use crate::core::platform::Platform as _;
     use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
     use crate::core::platform::device::GpuDevice as _;
     use crate::core::platform::resource::Buffer as _;
