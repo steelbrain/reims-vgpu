@@ -148,6 +148,7 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | the `dsound` audiodev plays where Windows has no recording device: its capture object is optional, where realize failed without one and QEMU exited ("Could not initialize DirectSoundCapture"); an input voice then fails to initialize, and reims-ctl gives such a host's input device a `none` audiodev of its own ("Windows hosts: sound", below) | `e435673c` |
 | WHPX on a host that is not Intel's intercepts the #GP of an MSR access (`intercept-msr-gp`, on by default there): an Intel guest's write of a 64-bit IA32_SYSENTER_ESP or _EIP gives Hyper-V the low 32 bits (QEMU's CPU state keeps all 64 until the vCPU's next full register read, and a read Hyper-V answers itself gives the low 32), and QEMU answers MISC_ENABLE, FEATURE_CONTROL and PLATFORM_INFO, which Hyper-V on AMD answers with #GP: macOS panicked on the first two at boot ("Windows hosts", below) | `40257041` |
 | WHPX offers the guest no TSC deadline timer where Hyper-V refuses its register (`WHvX64RegisterTscDeadline`), asked of a vCPU made for the question at init: the CPU model's `tsc-deadline` is filtered out as a feature the host lacks, and a macOS guest arms the local APIC's timer ("Windows hosts", below) | `c3704402` |
+| `vmapple` asks HVF for 40 bits of guest physical address, or the host's most where that is fewer (the machine's `get_physical_address_range`), where HVF's default is 36, and refuses to start where its RAM ends past them; the guest reads the size as its `ID_AA64MMFR0_EL1.PARange` ("arm64 guests", below) | `dc1b6821` |
 
 The branch's other commits are the apple-gfx work `96e1b470` removes, and
 `cfaadbfa09`, an HVF workaround that `478c28ff70` reverts, upstream having
@@ -1999,7 +2000,12 @@ one ("arm64 guests: the boot check of our configuration", below), with:
 
 Its accelerator is the host's: `hvf,kernel-irqchip=on` on an arm64 Mac,
 `kvm` on arm64 Linux, and `tcg,thread=multi` on x86-64 Linux. On Linux the
-guest's RAM is a shared memfd. Windows runs no arm64 VM: its QEMU is built
+guest's RAM is a shared memfd. Under HVF the machine asks for 40 bits of
+guest physical address, which macOS's kernel maps (its `TCR_EL1.IPS` is 40
+bits, read from xnu's source), or for the host's most where that is fewer; HVF's default is 36, and
+the guest reads the size as its `ID_AA64MMFR0_EL1.PARange`. Under KVM the
+VM has KVM's largest IPA size, and under TCG the `max` CPU's `PARange` is 52
+bits. Windows runs no arm64 VM: its QEMU is built
 for x86-64 guests alone. `scripts/install-ctl.sh` builds that
 `qemu-system-aarch64` with `--enable-gnutls`, since vmapple's AES engine
 needs a crypto library, and on a Mac with `--enable-hvf`, signing it with
