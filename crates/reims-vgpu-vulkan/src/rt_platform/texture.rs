@@ -1047,11 +1047,18 @@ mod tests {
 
         // An image for views takes no index; a view of it at the guest's index reads its texels.
         let image = TextureDesc { usage: 0, ..small };
-        let image = device.new_texture_for_views(&image).expect("an image for views");
-        assert_eq!((index(&image), image.gpu_resource_id() & 0xffff_ffff), (0, 0));
+        let image = device
+            .new_texture_for_views(&image)
+            .expect("an image for views");
+        assert_eq!(
+            (index(&image), image.gpu_resource_id() & 0xffff_ffff),
+            (0, 0)
+        );
         assert_eq!(image.replace_region(region, 0, 0, pixels, 16, 0), Ok(()));
         let view = image.new_texture_view_at_index(70, 10);
-        let view = view.expect("never a raise").expect("a view at the guest's index");
+        let view = view
+            .expect("never a raise")
+            .expect("a view at the guest's index");
         assert_eq!(index(&view), 10);
         let mut texels = [0_u8; 64];
         view.read_pixels(&mut texels, 16);
