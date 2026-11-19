@@ -396,6 +396,10 @@ pub fn created_or_decided<T>(
 ///   clips, which stores a depth the bias takes past `[0, 1]` unclamped, where Metal stores 0
 ///   or 1. Announced at the draw, inside its call, which dies at its selector. MoltenVK does not
 ///   enable the extension, so no draw here reaches it;
+/// - the note `DeviceDepthBias`: a draw of triangles under a depth bias on metal2vulkan-rt's
+///   render encoder, whose biased depth is the device's. The runtime this platform runs on
+///   announces its own depth-bias kinds instead (`BiasedDepthPastUnitRange`, `UnormDepthBias`),
+///   so no draw here announces it until the device runs on rt;
 /// - `RestrictedDepthUpload` and the note `RestrictedDepthRange`: a `Depth32Float` value outside
 ///   `[0, 1]` on a device without `VK_EXT_depth_range_unrestricted`, MoltenVK included, which
 ///   stores it clamped where Metal keeps it. Announced inside the call that meets it (an upload;
@@ -1036,6 +1040,14 @@ pub fn created_or_decided<T>(
 ///   read and taken, so nothing in the hardware forces the difference, and each dies on every
 ///   device. Announced at each draw that binds the pipeline's variant, inside its call, which
 ///   dies at its selector;
+/// - the note `TessellationFractionalSpacing`: a tessellation pipeline of a fractional partition
+///   (`fractionalOdd` or `fractionalEven`) drawn through the device's tessellation stages, whose
+///   tessellator places the partition's vertices by the device's own rule, which no measurement
+///   here holds equal to Metal's. The runtime's emulated tessellator, on a device without
+///   `tessellationShader`, records none. Metal's placement is not read, so it dies on every
+///   device, as `TessellationFactorScale` does. Before the runtime named it, such draws went on
+///   unannounced. Announced at each draw that binds the pipeline's variant, inside its call,
+///   which dies at its selector;
 /// - the note `ComputedSampleDepth`: a fragment function that runs its draw's depth test itself
 ///   at more than one sample, on a device whose `FragCoord.z` is the pixel centre's there
 ///   (MoltenVK), computes each sample's depth from its vertex function's window depth, which
@@ -1309,7 +1321,7 @@ pub fn created_or_decided<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 147] = [
+pub const DIES: [rt::Degradation; 149] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1320,6 +1332,7 @@ pub const DIES: [rt::Degradation; 147] = [
     rt::Degradation::RateMapResetUnencoded,
     rt::Degradation::HeapTextureBlockCompressedLayout,
     rt::Degradation::BiasedDepthPastUnitRange,
+    rt::Degradation::DeviceDepthBias,
     rt::Degradation::UnormDepthBias,
     rt::Degradation::UnormDepthRounding,
     rt::Degradation::RestrictedDepthUpload,
@@ -1410,6 +1423,7 @@ pub const DIES: [rt::Degradation; 147] = [
     rt::Degradation::BicubicFilterArithmetic,
     rt::Degradation::TessellationWinding,
     rt::Degradation::TessellationFactorEdgeCases,
+    rt::Degradation::TessellationFractionalSpacing,
     rt::Degradation::ComputedSampleDepth,
     rt::Degradation::LoopedSampleOutputs,
     rt::Degradation::HelperBranchDropsSimdgroupStores,
@@ -3393,7 +3407,8 @@ mod tests {
         // These stay deaths on native devices too, as neither a fact of the device nor the
         // class of the device's own maths and sampling covers them: two precision notes
         // are other values, not other bits, the next two are where Apple's compiler places or
-        // speculates an operation, Metal's rule for tessellation factors is not read, blending,
+        // speculates an operation, Metal's rules for tessellation factors and for a fractional
+        // partition's vertices are not read, blending,
         // storage, an attachment's memory read in place and a pass's tile store are neither maths
         // nor sampling, the anisotropic emulation is a fitted model, and the band's corners are
         // the runtime's own, whose snap to Metal's grid the hardware allows
@@ -3410,6 +3425,7 @@ mod tests {
             D::AnisotropicFilter,
             D::TessellationWinding,
             D::TessellationFactorEdgeCases,
+            D::TessellationFractionalSpacing,
             D::SnormMinimumKept,
             D::SharedExponentKept,
             D::DeviceSubpixelSnap,

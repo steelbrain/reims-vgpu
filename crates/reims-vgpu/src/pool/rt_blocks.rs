@@ -6,13 +6,15 @@
 //! rt hands out a `Block` handle and takes a block back by its handle, and the pool names a block
 //! by its number ([`BlockId`]). The source keeps each handle it hands out by its number, the
 //! block's only handle (the pool holds plain data, [`BlockInfo`]), and a release takes the handle
-//! out of the map and gives it to rt, which keeps the block for a later take of its length, with
-//! its number, address and mapping, or frees it.
+//! out of the map and gives it to rt, which returns the block's range to the free ranges of the
+//! allocation it was taken from. A later take may land there, under a new number: rt numbers
+//! each take anew.
 //!
 //! A block's bytes are what rt makes them: undefined past its zero mark (rt's
 //! `BlockInfo::zeroed`), which the pool's [`BlockInfo`] does not carry, and nothing here zeroes
-//! them. Before rt frees a block it calls the `BlockMappings` hook its device was made with
-//! (`DeviceOptions::block_mappings`), not the pool's.
+//! them. rt maps and unmaps whole allocations through the `BlockMappings` hook its device was
+//! made with (`DeviceOptions::block_mappings`), not through the pool: `map` before any block of
+//! an allocation goes out, `unmap` before the allocation is freed.
 
 use std::collections::HashMap;
 
@@ -99,19 +101,13 @@ impl Drop for RtBlocks {
 
 #[cfg(test)]
 mod tests {
-    #![expect(
-        clippy::disallowed_methods,
-        reason = "test scaffolding: real time bounds the wait for rt's block-maker thread"
-    )]
-
-    use std::time::{Duration, Instant};
-
     use super::*;
 
     const MIB: u64 = 1 << 20;
 
     /// A block is taken from rt and given back by its number alone: the map hands rt its handle,
-    /// which rt then reuses, and a number not handed out, or given back already, is not held.
+    /// and a number not handed out, or given back already, is not held. A long block given back
+    /// is taken again by the next take of its length, under a new number.
     #[test]
     #[cfg_attr(
         target_os = "macos",
@@ -135,7 +131,6 @@ mod tests {
             Some(BlockError::Length)
         );
 
-        let reused = device.counters().metrics().blocks_reused;
         assert_eq!(blocks.release_block(shared.id), Ok(()));
         assert_eq!(blocks.release_block(shared.id), Err(BlockError::NotHeld));
         assert_eq!(
@@ -143,20 +138,24 @@ mod tests {
             Err(BlockError::NotHeld)
         );
         assert_eq!(blocks.release_block(private.id), Ok(()));
-        // rt keeps a block given back for a take of its length on its block-maker thread: a take
-        // of it is rt's count of blocks taken again.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let again = blocks.take_block(MemoryClass::Shared, MIB).unwrap();
-            if device.counters().metrics().blocks_reused > reused {
-                break;
-            }
-            assert_eq!(blocks.release_block(again.id), Ok(()));
-            assert!(
-                Instant::now() < deadline,
-                "rt took no block given back again"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        // A long block takes an allocation of its own. Given back, it is a free range of that
+        // allocation at once, which the next take of its length lands in, under a new number:
+        // rt counts one long reuse, and the take makes no allocation.
+        let long = blocks.take_block(MemoryClass::Shared, 64 * MIB).unwrap();
+        assert_eq!(blocks.release_block(long.id), Ok(()));
+        let before = device.counters().metrics();
+        let again = blocks.take_block(MemoryClass::Shared, 64 * MIB).unwrap();
+        let after = device.counters().metrics();
+        assert!(again.id > long.id, "{again:?} after {long:?}");
+        assert_eq!(again.gpu_address, long.gpu_address, "{again:?} after {long:?}");
+        assert_eq!(
+            (
+                after.shared_long_reuses - before.shared_long_reuses,
+                after.consumer_allocations - before.consumer_allocations
+            ),
+            (1, 0),
+            "long reuses, and allocations the take made"
+        );
+        assert_eq!(blocks.release_block(again.id), Ok(()));
     }
 }

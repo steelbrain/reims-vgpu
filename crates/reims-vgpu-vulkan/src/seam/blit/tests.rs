@@ -50,7 +50,7 @@ fn bytes(buffer: &Buffer) -> Vec<u8> {
 
 fn run(command_buffer: &CommandBuffer) {
     command_buffer.commit().unwrap();
-    command_buffer.wait_until_completed();
+    command_buffer.wait_until_completed().unwrap();
     assert_eq!(
         command_buffer.status(),
         CommandBufferStatus::Completed,
