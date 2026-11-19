@@ -525,11 +525,9 @@ pub const RGFX_FEATURE_BUFFER_ESCAPED: u64 = 0x100_0000_0000_0000;
 /// need it (`POOL_BASE_LO` to `POOL_LENGTH_HI` read its range). Ring 0 carries
 /// [`RGFX_CMD_POOL_TAKE`] and [`RGFX_CMD_POOL_GIVE`], a context's ask for a block of the pool and
 /// its giving one back, and a context's ring carries [`RGFX_CMD_HEAP_OVER_POOL`], a Shared heap
-/// over a block it holds, and, where the guest took [`RGFX_FEATURE_ICB_SLOTS`] too,
-/// [`RGFX_CMD_ICB_SLOTS_IN_POOL`], slots in one (docs/graphics-kext/design.md, "The Shared
-/// pool"). The host offers it where it reserved a pool, but on Windows; the x86-64 kext takes it,
-/// and a guest that did not take it is refused every one of those messages and keeps its slabs in
-/// the region.
+/// over a block it holds (docs/graphics-kext/design.md, "The Shared pool"). The host offers it
+/// where it reserved a pool, but on Windows; the x86-64 kext takes it, and a guest that did not
+/// take it is refused every one of those messages and keeps its slabs in the region.
 pub const RGFX_FEATURE_POOL: u64 = 0x200_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -1167,14 +1165,6 @@ pub const RGFX_CMD_BUFFER_ESCAPED: u32 = 0x23b;
 /// the block's `POOL_GIVE` is refused while the heap lives. A span that does not lie in one block
 /// of the sender's makes nothing, as an unknown id does. Not answered.
 pub const RGFX_CMD_HEAP_OVER_POOL: u32 = 0x23c;
-/// Command `ICB_SLOTS_IN_POOL` ([`RgfxIcbSlots`], then its runs, [`RgfxIcbSlotRun`], each run's
-/// `region_offset` its first slot's offset in the Shared pool), where the guest took
-/// [`RGFX_FEATURE_POOL`] and [`RGFX_FEATURE_ICB_SLOTS`]: as [`RGFX_CMD_ICB_SLOTS`], each run's
-/// slots in one pool block the sender's context holds ([`RGFX_CMD_POOL_TAKE`]), which the host
-/// reads in place. A run whose slots do not lie in one such block is skipped alone, as a run of
-/// `ICB_SLOTS` the host cannot read is. Ring 0 is carried out before any command buffer the
-/// process posts after it, as `ICB_WRITE` is. Not answered.
-pub const RGFX_CMD_ICB_SLOTS_IN_POOL: u32 = 0x23d;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -3348,14 +3338,14 @@ pub struct RgfxIcbWrite {
     pub obj_id: u64,
 }
 
-/// `ICB_SLOTS` and `ICB_SLOTS_IN_POOL`: `run_count` [`RgfxIcbSlotRun`]s follow, to the message's
-/// `size`; and `ICB_SLOTS_IN_PAGES`: `run_count` [`RgfxIcbSlotPagesRun`]s.
+/// `ICB_SLOTS`: `run_count` [`RgfxIcbSlotRun`]s follow, to the message's `size`; and
+/// `ICB_SLOTS_IN_PAGES`: `run_count` [`RgfxIcbSlotPagesRun`]s.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
 )]
 pub struct RgfxIcbSlots {
-    /// [`RGFX_CMD_ICB_SLOTS`], [`RGFX_CMD_ICB_SLOTS_IN_PAGES`] or [`RGFX_CMD_ICB_SLOTS_IN_POOL`].
+    /// [`RGFX_CMD_ICB_SLOTS`] or [`RGFX_CMD_ICB_SLOTS_IN_PAGES`].
     pub header: RgfxMsgHeader,
     /// The first run's indirect command buffer, which places the message in its context.
     pub obj_id: u64,
@@ -3381,8 +3371,7 @@ pub const RGFX_ICB_SLOTS_COMPUTE: u16 = 2;
 pub struct RgfxIcbSlotRun {
     /// The indirect command buffer.
     pub icb_obj_id: u64,
-    /// The first slot's place in the region, or of an `ICB_SLOTS_IN_POOL` in the Shared pool:
-    /// 8-aligned.
+    /// The first slot's place in the region: 8-aligned.
     pub region_offset: u64,
     /// The first slot's command.
     pub first_command: u32,

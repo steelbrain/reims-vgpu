@@ -93,7 +93,7 @@ CHECK(offsetof(RgfxPoolGive, pool_offset) == 24 && offsetof(RgfxPoolGive, length
 CHECK(RGFX_EVT_POOL_BLOCK == 0x410 && sizeof(RgfxPoolBlock) == 40);
 CHECK(offsetof(RgfxPoolBlock, status) == 16 && offsetof(RgfxPoolBlock, pool_offset) == 24);
 CHECK(RGFX_POOL_BLOCK_ALIGN == 0x10000 && RGFX_POOL_TAKE_MAX == 0x100000000ULL);
-CHECK(RGFX_CMD_HEAP_OVER_POOL == 0x23c && RGFX_CMD_ICB_SLOTS_IN_POOL == 0x23d);
+CHECK(RGFX_CMD_HEAP_OVER_POOL == 0x23c);
 CHECK(offsetof(RgfxCursorColor, on) == 20 && offsetof(RgfxCursorColor, source_curves) == 24);
 CHECK(offsetof(RgfxCursorColor, to_xyz) == 120 && offsetof(RgfxCursorColor, from_xyz) == 156);
 CHECK(offsetof(RgfxCursorColor, blend_curves) == 192);
