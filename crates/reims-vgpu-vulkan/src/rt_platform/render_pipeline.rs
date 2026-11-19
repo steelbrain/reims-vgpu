@@ -53,7 +53,6 @@ use crate::core::platform::values::{
 use crate::core::raise::RaiseResult;
 
 use super::device::RtDevice;
-use super::library::RtFunction;
 use super::pipeline::{Lease, Taking, linked_functions, next_identifier, specialized};
 use super::state::value;
 use super::unbuilt::{RtRefusal, Unbuilt, refuse, refused_error, refused_error_as};
@@ -175,10 +174,8 @@ fn fields(
     d.alpha_to_coverage = desc.alpha_to_coverage;
     d.alpha_to_one = desc.alpha_to_one;
     d.rasterization_enabled = desc.rasterization_enabled;
-    d.input_primitive_topology = value::<PrimitiveTopologyClass>(
-        "input primitive topology",
-        desc.input_primitive_topology,
-    )?;
+    d.input_primitive_topology =
+        value::<PrimitiveTopologyClass>("input primitive topology", desc.input_primitive_topology)?;
     d.max_vertex_amplification_count = count(
         "maximum vertex amplification count",
         desc.max_vertex_amplification_count,
@@ -397,6 +394,7 @@ mod tests {
     use crate::core::platform::resource::Library as _;
     use crate::core::platform::values::{AttributeDesc, BufferLayoutDesc, LinkedFunctionsDesc};
     use crate::core::raise::OnFault;
+    use crate::rt_platform::RtFunction;
 
     /// `numbered_samplers.metal`'s functions, compiled by build.rs.
     const NUMBERED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/numbered_samplers.metallib"));
@@ -482,7 +480,10 @@ mod tests {
         assert_eq!(a.pixel_format, PixelFormat::BGRA8Unorm);
         assert!(a.blending_enabled);
         assert_eq!(a.source_rgb_blend_factor, BlendFactor::SourceAlpha);
-        assert_eq!(a.destination_rgb_blend_factor, BlendFactor::OneMinusSourceAlpha);
+        assert_eq!(
+            a.destination_rgb_blend_factor,
+            BlendFactor::OneMinusSourceAlpha
+        );
         assert_eq!(a.alpha_blend_operation, BlendOperation::Add);
         assert_eq!(a.write_mask.as_raw(), 0x3);
         let unknown = ColorAttachmentDesc {
@@ -526,7 +527,10 @@ mod tests {
         assert_eq!(private.sample_mask, 0x5);
         assert_eq!(private.clip_distance_enable_mask, 0xff);
         let past = count("raster sample count", 1 << 32);
-        assert_eq!(past.err().as_deref(), Some("raster sample count 4294967296"));
+        assert_eq!(
+            past.err().as_deref(),
+            Some("raster sample count 4294967296")
+        );
     }
 
     /// On the GPU: the display's value and whole descriptors make rt's states, whose samplers take
@@ -592,10 +596,13 @@ mod tests {
             function(NUMBERED, "numbered_fragment_read"),
         );
         let mut desc = FullRenderPipelineDesc::new(&numbered, Some(&read));
-        desc.colors = vec![(0, ColorAttachmentDesc {
-            pixel_format: 70,
-            ..ColorAttachmentDesc::default()
-        })];
+        desc.colors = vec![(
+            0,
+            ColorAttachmentDesc {
+                pixel_format: 70,
+                ..ColorAttachmentDesc::default()
+            },
+        )];
         let held = device.numbering().held();
         let full = |desc: &FullRenderPipelineDesc<'_, RtPlatform>| {
             let made = device.new_render_pipeline_state_full(desc);
@@ -610,7 +617,10 @@ mod tests {
         assert_eq!(device.numbering().held(), held);
 
         // A vertex descriptor, a blended attachment, a depth format and the guest's private state.
-        let (vdesc, color) = (function(VDESC, "render_vdesc"), function(COLOR, "render_color"));
+        let (vdesc, color) = (
+            function(VDESC, "render_vdesc"),
+            function(COLOR, "render_color"),
+        );
         let layouts = vec![BufferLayoutDesc {
             buffer_index: 0,
             stride: 12,
@@ -636,13 +646,16 @@ mod tests {
             layouts: layouts.clone(),
             attributes: attributes.clone(),
         });
-        desc.colors = vec![(0, ColorAttachmentDesc {
-            pixel_format: 80,
-            blending_enabled: true,
-            source_rgb_blend_factor: 4,
-            destination_rgb_blend_factor: 5,
-            ..ColorAttachmentDesc::default()
-        })];
+        desc.colors = vec![(
+            0,
+            ColorAttachmentDesc {
+                pixel_format: 80,
+                blending_enabled: true,
+                source_rgb_blend_factor: 4,
+                destination_rgb_blend_factor: 5,
+                ..ColorAttachmentDesc::default()
+            },
+        )];
         desc.depth_pixel_format = 252;
         desc.private_state = Some(PrivateRenderDesc {
             open_gl_mode_enabled: true,
@@ -668,11 +681,14 @@ mod tests {
         let before = counted(metal);
         let mut refused = FullRenderPipelineDesc::new(&vdesc, Some(&color));
         refused.vertex_descriptor = desc.vertex_descriptor.clone();
-        refused.colors = vec![(0, ColorAttachmentDesc {
-            pixel_format: 80,
-            source_alpha_blend_factor: 99,
-            ..ColorAttachmentDesc::default()
-        })];
+        refused.colors = vec![(
+            0,
+            ColorAttachmentDesc {
+                pixel_format: 80,
+                source_alpha_blend_factor: 99,
+                ..ColorAttachmentDesc::default()
+            },
+        )];
         assert!(device.new_render_pipeline_state_full(&refused).is_err());
         refused.colors = vec![(8, ColorAttachmentDesc::default())];
         assert!(device.new_render_pipeline_state_full(&refused).is_err());

@@ -328,7 +328,8 @@ fn make(
     descriptor: &rt::ComputePipelineDescriptor,
 ) -> Result<RtObj<RtComputePipeline>, NsErrorText> {
     let mut taking = Taking::new(device);
-    let made = (device.rt()).new_compute_pipeline_state(descriptor, |samplers| taking.ids(samplers));
+    let made =
+        (device.rt()).new_compute_pipeline_state(descriptor, |samplers| taking.ids(samplers));
     let (rt, lease) = taking.made(sel, made)?;
     Ok(RtObj::new(RtComputePipeline {
         rt,
@@ -368,10 +369,7 @@ impl<'a> Taking<'a> {
     /// An index for each of `samplers`, in their order ([`Numbering`]): rt's sampler IDs. Where
     /// none is free for one, rt's refusal of its index, which [`made`](Self::made) answers as the
     /// limit.
-    pub(super) fn ids(
-        &mut self,
-        samplers: &[rt::NumberedSampler],
-    ) -> Result<Vec<u32>, rt::Error> {
+    pub(super) fn ids(&mut self, samplers: &[rt::NumberedSampler]) -> Result<Vec<u32>, rt::Error> {
         let device = self.device;
         let indices = (device.numbering()).take(device.sampler_indices(), device.rt(), samplers)?;
         let Some(indices) = indices else {
