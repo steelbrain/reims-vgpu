@@ -135,7 +135,7 @@ fn on_vulkan_the_let_go_waits_for_a_callback_blocked_on_the_releasers_lock_only_
     let let_go = |bound: Duration| {
         let (answer, answered) = mpsc::channel();
         let letting_go = std::thread::Builder::new().spawn(move || {
-            let _ = answer.send(GraphicsDevice::<crate::DefaultPlatform>::let_go_of_gpu(
+            let _ = answer.send(GraphicsDevice::<crate::VulkanPlatform>::let_go_of_gpu(
                 bound,
             ));
         });
