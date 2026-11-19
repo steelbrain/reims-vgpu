@@ -8,11 +8,12 @@
 //! answers, queues, buffers, textures, libraries and pipelines, command buffers and encoders,
 //! events, then the display. Built: the device ([`device`]) with its answers ([`answers`] and
 //! [`mod@format`]), its command queues ([`queue`]), events and fences, the reservation of resource
-//! indices, and textures made of a descriptor, with their views ([`texture`]). Until a piece is
-//! built, every call that reaches it is refused ([`unbuilt`]). The call answers as Metal's call
-//! answers where it fails: a nil object, an `NSError`, zeros. The refusal is counted under the
-//! piece's code, `rt-unbuilt-<piece>`, in the process's degradation counts, and the first of each
-//! kind writes a line on stderr. Never a death or a panic.
+//! indices, buffers and the textures over them ([`buffer`]), heaps but sparse ones ([`heap`]), and
+//! textures made of a descriptor, with their views ([`texture`]). Until a piece is built, every
+//! call that reaches it is refused ([`unbuilt`]). The call answers as Metal's call answers where it
+//! fails: a nil object, an `NSError`, zeros. The refusal is counted under the piece's code,
+//! `rt-unbuilt-<piece>`, in the process's degradation counts, and the first of each kind writes a
+//! line on stderr. Never a death or a panic.
 //!
 //! **An object of a kind no call makes yet is [`Unmade`]**: a type with no values, so its methods
 //! are never reached. The piece that makes the kind gives it a type of its own.
@@ -26,9 +27,11 @@
 //! GPUs. On a Mac it builds.
 
 pub mod answers;
+pub mod buffer;
 pub mod descriptor;
 pub mod device;
 pub mod format;
+pub mod heap;
 pub mod queue;
 pub mod texture;
 pub mod unbuilt;
@@ -45,8 +48,10 @@ use crate::core::platform::{Handle, ObjId, Platform};
 use crate::core::raise::{OnFault, RaiseResult};
 use crate::os::{OsClock, OsThreads, OsVm};
 
+pub use buffer::{KnownBlocks, RtBuffer};
 pub use descriptor::{PassFields, RateMapFields, TextureFields};
 pub use device::RtDevice;
+pub use heap::RtHeap;
 pub use queue::RtQueue;
 pub use texture::RtTexture;
 pub use unbuilt::Unbuilt;
@@ -154,9 +159,9 @@ impl Platform for RtPlatform {
     type BlitEncoder = Unmade<kinds::BlitEncoder>;
     type ComputeEncoder = Unmade<kinds::ComputeEncoder>;
     type RenderEncoder = Unmade<kinds::RenderEncoder>;
-    type Buffer = Unmade<kinds::Buffer>;
+    type Buffer = RtObj<RtBuffer>;
     type Texture = RtObj<RtTexture>;
-    type Heap = Unmade<kinds::Heap>;
+    type Heap = RtObj<RtHeap>;
     type SamplerState = Unmade<kinds::SamplerState>;
     type DepthStencilState = Unmade<kinds::DepthStencilState>;
     type Fence = RtObj<metal2vulkan_rt::Fence>;

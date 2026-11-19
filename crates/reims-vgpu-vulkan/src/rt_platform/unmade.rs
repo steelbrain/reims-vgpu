@@ -34,7 +34,6 @@ use crate::core::platform::types::NsErrorText;
 use crate::core::platform::types::NsRange;
 use crate::core::platform::types::SizeAndAlign;
 use crate::core::platform::values::ComputePassDesc;
-use crate::core::platform::values::SurfacePlane;
 use crate::core::platform::{Handle, ObjId, Platform};
 use crate::core::platform::{
     blit, command, compute, event, function_table, icb, rate_map, render, resource,
@@ -77,10 +76,6 @@ pub mod kinds {
     pub enum ComputeEncoder {}
     /// `id<MTLRenderCommandEncoder>`.
     pub enum RenderEncoder {}
-    /// `id<MTLBuffer>`.
-    pub enum Buffer {}
-    /// `id<MTLHeap>`.
-    pub enum Heap {}
     /// `id<MTLSamplerState>`.
     pub enum SamplerState {}
     /// `id<MTLDepthStencilState>`.
@@ -256,103 +251,6 @@ impl<P: Platform> render::RenderEncoder<P> for Unmade<kinds::RenderEncoder> {
         self.unreachable()
     }
     fn tile_width(&self) -> u64 {
-        self.unreachable()
-    }
-}
-
-impl<P: Platform> resource::GpuResource<P> for Unmade<kinds::Buffer> {
-    fn device(&self) -> Option<P::Device> {
-        self.unreachable()
-    }
-    fn resource_options(&self) -> u64 {
-        self.unreachable()
-    }
-    fn set_label(&self, _label: &str) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn set_purgeable_state(&self, _state: u64) -> RaiseResult<u64> {
-        self.unreachable()
-    }
-    fn storage_mode(&self) -> u64 {
-        self.unreachable()
-    }
-}
-
-impl<P: Platform> resource::Buffer<P> for Unmade<kinds::Buffer> {
-    fn contents(&self) -> HostPtr {
-        self.unreachable()
-    }
-    fn did_modify_range(&self, _on: OnFault, _range: NsRange) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn gpu_address(&self) -> u64 {
-        self.unreachable()
-    }
-    fn length(&self) -> u64 {
-        self.unreachable()
-    }
-    fn new_linear_texture(
-        &self,
-        _descriptor: &P::TextureDescriptor,
-        _offset: u64,
-        _bytes_per_row: u64,
-        _bytes_per_image: u64,
-    ) -> RaiseResult<Option<P::Texture>> {
-        self.unreachable()
-    }
-    fn new_texture(
-        &self,
-        _on: OnFault,
-        _descriptor: &P::TextureDescriptor,
-        _offset: u64,
-        _bytes_per_row: u64,
-    ) -> RaiseResult<Option<P::Texture>> {
-        self.unreachable()
-    }
-    fn new_tiled_texture(
-        &self,
-        _descriptor: &P::TextureDescriptor,
-        _offset: u64,
-        _bytes_per_row: u64,
-    ) -> RaiseResult<Option<P::Texture>> {
-        self.unreachable()
-    }
-    fn new_texture_over_surface_plane(
-        &self,
-        _on: OnFault,
-        _descriptor: &P::TextureDescriptor,
-        _plane: SurfacePlane,
-    ) -> RaiseResult<Option<P::Texture>> {
-        self.unreachable()
-    }
-}
-
-impl<P: Platform> resource::Heap<P> for Unmade<kinds::Heap> {
-    fn gpu_address(&self) -> u64 {
-        self.unreachable()
-    }
-    fn new_buffer_of_length(
-        &self,
-        _length: u64,
-        _options: u64,
-        _offset: u64,
-    ) -> RaiseResult<Option<P::Buffer>> {
-        self.unreachable()
-    }
-    fn new_texture(
-        &self,
-        _descriptor: &P::TextureDescriptor,
-        _offset: u64,
-    ) -> RaiseResult<Option<P::Texture>> {
-        self.unreachable()
-    }
-    fn resource_options(&self) -> u64 {
-        self.unreachable()
-    }
-    fn set_purgeable_state(&self, _state: u64) -> RaiseResult<u64> {
-        self.unreachable()
-    }
-    fn storage_mode(&self) -> u64 {
         self.unreachable()
     }
 }

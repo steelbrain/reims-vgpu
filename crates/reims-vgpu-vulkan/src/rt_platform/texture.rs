@@ -1,7 +1,9 @@
 //! The rt platform's textures ([`RtTexture`]): rt's textures, made by the device's
 //! `newTextureWithDescriptor:` ([`make`]) and by a texture's views, each an optimal image in
 //! device-local memory (or a view of one) that the guest's CPU reaches only through
-//! `replaceRegion:`. Textures over buffers, in heaps and over IOSurfaces are their pieces'.
+//! `replaceRegion:`; and textures over a buffer's bytes, made by the buffers' piece
+//! (`super::buffer`) through [`make_over`], of the buffer's storage mode. Textures in heaps and
+//! over IOSurfaces are their pieces'.
 //!
 //! **Indices.** rt places a texture that shaders reach (shader-read or shader-write usage, or
 //! `Unknown`, which Metal takes as both) at an index of a live texture grant, and no other. A
@@ -19,11 +21,13 @@
 //!
 //! **Answers.** A texture's descriptor values are rt's descriptor of it. Its usage is Metal's
 //! answer (measured on the M3 Max, `crate::gpu::desc`'s docs): the usage set without 0x8, which
-//! Metal's texture drops (a texture of 0x8 alone is rt's of `ShaderRead`, which answers 0, and Metal
-//! asserts at a swizzled view of it, refused as Metal's refusal), `Unknown` as `ShaderRead | ShaderWrite | RenderTarget | PixelFormatView`,
-//! and a view of a swizzle other than the default keeps `ShaderRead`, `PixelFormatView`, 0x4000 and
-//! 0x10000 of its texture's. Its resource options are the descriptor's with Metal's default hazard
-//! tracking resolved to tracked, as the Vulkan platform's runtime answers them.
+//! Metal's texture drops (a texture of 0x8 alone is rt's of `ShaderRead`, which answers 0, and
+//! Metal asserts at a swizzled view of it, refused as Metal's refusal), `Unknown` as
+//! `ShaderRead | ShaderWrite | RenderTarget | PixelFormatView`, and a view of a swizzle other than
+//! the default keeps `ShaderRead`, `PixelFormatView`, 0x4000 and 0x10000 of its texture's. Its
+//! resource options are the descriptor's (of a texture over a buffer, with the buffer's storage
+//! mode) with Metal's default hazard tracking resolved to tracked, as the Vulkan platform's
+//! runtime answers them.
 //!
 //! **Refusals.** A texture rt refuses is nil, counted under rt's kind
 //! ([`super::unbuilt::rt_refused_texture_create`]), a texture of a format rt makes none of under
@@ -93,11 +97,14 @@ const DEFAULT_SWIZZLE: Swizzle = Swizzle {
 /// `MTLResourceHazardTrackingModeTracked`, in the resource options' bits 8 and 9.
 const HAZARD_TRACKED: u64 = 0x200;
 
+/// The resource options' storage mode, bits 4 to 7.
+pub(super) const STORAGE_BITS: u64 = 0xf0;
+
 /// `MTLPurgeableStateKeepCurrent`.
 const KEEP_CURRENT: u64 = 1;
 
 /// `MTLPurgeableStateNonVolatile`, a new texture's state.
-const NON_VOLATILE: u64 = 2;
+pub(super) const NON_VOLATILE: u64 = 2;
 
 /// `MTLPurgeableStateEmpty`, the last state.
 const EMPTY: u64 = 4;
@@ -227,7 +234,7 @@ impl RtTexture {
             usage,
             protection_options: self.protection_options,
             own,
-            purgeable: AtomicU64::new(NON_VOLATILE),
+            purgeable: purgeable_state(),
         })
     }
 }
@@ -240,18 +247,44 @@ pub fn make(
     sel: &'static str,
     desc: &TextureDesc,
 ) -> Option<RtObj<RtTexture>> {
+    let options = desc.resource_options.unwrap_or(0);
+    let make = |d: &rt::TextureDescriptor, index: Option<u32>| device.rt().new_texture(d, index);
+    made_of(device, sel, desc, options, make)
+}
+
+/// A texture of `desc` over a buffer's or a heap's memory of the resource options `held`, for
+/// `sel`: the texture `over` makes of rt's descriptor at the index [`make`] would give it (rt's
+/// `Buffer::new_texture`, `Device::new_heap_texture`), answering the descriptor's options with
+/// `held`'s bits `taken` (a buffer's storage mode, as rt makes the texture of the buffer's whatever
+/// the descriptor's; a heap's modes, which its resources take). Nil where rt refuses it, counted.
+pub(super) fn make_over(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    desc: &TextureDesc,
+    (held, taken): (u64, u64),
+    over: impl FnOnce(&rt::TextureDescriptor, Option<u32>) -> Result<rt::Texture, rt::Error>,
+) -> Option<RtObj<RtTexture>> {
+    let options = desc.resource_options.unwrap_or(0);
+    let options = (options & !taken) | (held & taken);
+    made_of(device, sel, desc, options, over)
+}
+
+/// The texture `make` of `desc` makes for `sel` (the module's docs), of the resource options
+/// `options`, hazard tracking yet to resolve.
+fn made_of(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    desc: &TextureDesc,
+    options: u64,
+    make: impl FnOnce(&rt::TextureDescriptor, Option<u32>) -> Result<rt::Texture, rt::Error>,
+) -> Option<RtObj<RtTexture>> {
     let d = match rt_texture_descriptor(desc) {
         Ok(d) => d,
         Err(why) => return refused_metal(sel, &why),
     };
     let placed = desc.resource_index.map_or(0, |(index, _forced)| index);
     let (index, own) = device.index_for(sel, reaches(d.usage), placed)?;
-    let made = device.rt().new_texture(&d, index);
-    let options = desc.resource_options.unwrap_or(0);
-    let options = match (options >> 8) & 0x3 {
-        0 => options | HAZARD_TRACKED,
-        _ => options,
-    };
+    let made = make(&d, index);
     let usage = match desc.usage {
         0 => UNKNOWN_ANSWERS,
         usage => usage & !DROPPED,
@@ -259,12 +292,43 @@ pub fn make(
     device.made(sel, made, own, |texture| RtTexture {
         rt: texture,
         device: device.clone_ref(),
-        options,
+        options: tracked(options),
         usage,
         protection_options: desc.protection_options.unwrap_or(0),
         own,
-        purgeable: AtomicU64::new(NON_VOLATILE),
+        purgeable: purgeable_state(),
     })
+}
+
+/// `options` with Metal's default hazard tracking resolved to tracked, as Metal's resources
+/// answer it.
+pub(super) fn tracked(options: u64) -> u64 {
+    match (options >> 8) & 0x3 {
+        0 => options | HAZARD_TRACKED,
+        _ => options,
+    }
+}
+
+/// A new resource's purgeable state: `NonVolatile`.
+pub(super) fn purgeable_state() -> AtomicU64 {
+    AtomicU64::new(NON_VOLATILE)
+}
+
+/// `setPurgeableState:` of a resource whose state `held` holds: the state before the change, kept
+/// as Metal keeps it. `KeepCurrent` changes nothing, and `NonVolatile`, `Volatile` and `Empty`
+/// take its place. Nothing is discarded at `Empty`, whose contents Metal leaves undefined. A raw
+/// state no `MTLPurgeableState` is is refused, as Metal's validation refuses it
+/// (`rt-refused-metal`), changing nothing.
+pub(super) fn set_purgeable(held: &AtomicU64, state: u64) -> u64 {
+    match state {
+        KEEP_CURRENT => held.load(Ordering::Relaxed),
+        NON_VOLATILE..=EMPTY => held.swap(state, Ordering::Relaxed),
+        _ => {
+            let why = format!("purgeable state {state}");
+            refused_as("setPurgeableState:", RtRefusal::Refused, &why);
+            held.load(Ordering::Relaxed)
+        }
+    }
 }
 
 impl RtObj<RtDevice> {
@@ -361,7 +425,7 @@ fn rt_region(r: MtlRegion) -> Option<rt::Region> {
 
 /// A creator's refusal of a value rt has none of, as Metal's validation refuses it: noted as a gap
 /// of the platform's own and counted (`rt-refused-metal`). Nil.
-fn refused_metal<T>(sel: &'static str, why: &dyn std::fmt::Display) -> Option<T> {
+pub(super) fn refused_metal<T>(sel: &'static str, why: &dyn std::fmt::Display) -> Option<T> {
     crate::core::platform::device::note_relayed_gap();
     refused_as(sel, RtRefusal::Refused, why);
     None
@@ -497,20 +561,9 @@ impl GpuResource<RtPlatform> for RtObj<RtTexture> {
         Ok(())
     }
 
-    /// The state before the change, kept as Metal keeps it: `KeepCurrent` changes nothing, and
-    /// `NonVolatile`, `Volatile` and `Empty` take its place. Nothing is discarded at `Empty`,
-    /// whose contents Metal leaves undefined. A raw state no `MTLPurgeableState` is is refused, as
-    /// Metal's validation refuses it (`rt-refused-metal`), changing nothing.
+    /// [`set_purgeable`]'s.
     fn set_purgeable_state(&self, state: u64) -> RaiseResult<u64> {
-        match state {
-            KEEP_CURRENT => Ok(self.purgeable.load(Ordering::Relaxed)),
-            NON_VOLATILE..=EMPTY => Ok(self.purgeable.swap(state, Ordering::Relaxed)),
-            _ => {
-                let why = format!("purgeable state {state}");
-                refused_as("setPurgeableState:", RtRefusal::Refused, &why);
-                Ok(self.purgeable.load(Ordering::Relaxed))
-            }
-        }
+        Ok(set_purgeable(&self.purgeable, state))
     }
 
     /// Bits 4 to 7 of its resource options.
@@ -528,7 +581,9 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
         u64::from(self.rt.descriptor().depth)
     }
 
-    /// Nothing: the platform makes no texture over a buffer yet, the one kind this tells of.
+    /// Nothing: a texture over a buffer reads the buffer's bytes, whose changes a Managed buffer's
+    /// `didModifyRange:` names to rt; this SPI tells of a tiled texture's, which the platform does
+    /// not make ([`Unbuilt::Buffer`]).
     fn did_modify_data(&self) {}
 
     /// rt's: its index and the translator's word of its format and swizzle.

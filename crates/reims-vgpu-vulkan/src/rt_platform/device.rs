@@ -1,6 +1,7 @@
 //! The rt platform's device ([`RtDevice`]): one metal2vulkan-rt device for the process, made of
 //! the physical device the library's choice of device picks ([`open`]), with its answers
-//! (`super::answers`), its command queues (`super::queue`), its textures (`super::texture`),
+//! (`super::answers`), its command queues (`super::queue`), its buffers (`super::buffer`), heaps
+//! (`super::heap`) and the blocks it knows ([`KnownBlocks`]), its textures (`super::texture`),
 //! events and fences, and the reservation of resource indices as rt's index grants. Every other
 //! creator is refused while its piece is unbuilt (`super::unbuilt`), as Metal's creator answers
 //! where it fails.
@@ -40,6 +41,8 @@ use crate::gpu::device::{HEAP_DESCRIPTOR_OPTIONS, descriptor_options};
 use crate::gpu::identity;
 
 use super::answers::{self, Facts};
+use super::buffer::{self, KnownBlocks};
+use super::heap;
 use super::queue::RtQueue;
 use super::texture::OwnIndices;
 use super::unbuilt::{
@@ -74,6 +77,8 @@ pub struct RtDevice {
     caps: Arc<DeviceCaps>,
     /// The texture indices its textures the guest does not place take (`super::texture`).
     indices: OwnIndices,
+    /// The blocks it knows by address, which pinned buffers and heaps inside them are ranges of.
+    known: KnownBlocks,
 }
 
 impl RtDevice {
@@ -90,6 +95,12 @@ impl RtDevice {
     /// The texture indices of the platform's own.
     pub fn indices(&self) -> &OwnIndices {
         &self.indices
+    }
+
+    /// The blocks it knows by address (`super::buffer`'s docs, "A pinned address"): the graphics
+    /// lane keeps a clone, the same set, to know and forget its blocks in.
+    pub fn known_blocks(&self) -> &KnownBlocks {
+        &self.known
     }
 }
 
@@ -191,6 +202,7 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         facts,
         caps,
         indices: OwnIndices::new(),
+        known: KnownBlocks::default(),
     }))
 }
 
@@ -382,8 +394,9 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         }
     }
 
-    /// Unbuilt: nil ([`Unbuilt::HostImport`]); the deallocator is not run, as Metal runs none for
-    /// a buffer it does not make.
+    /// A buffer over rt's import of the pages that hold `bytes` ([`buffer::over_host_memory`]);
+    /// nil where Metal or rt refuses it, counted, the deallocator then never run, as Metal runs
+    /// none for a buffer it does not make.
     fn new_buffer_over_host_memory(
         &self,
         on: OnFault,
@@ -391,25 +404,25 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         options: u64,
         deallocator: Option<NoCopyDeallocator>,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
-        let _ = (on, bytes, options);
-        std::mem::forget(deallocator);
-        refuse_create(
-            Unbuilt::HostImport,
-            "newBufferWithBytesNoCopy:length:options:deallocator:",
-        );
-        Ok(None)
+        let _ = on;
+        let sel = "newBufferWithBytesNoCopy:length:options:deallocator:";
+        let length = bytes.len();
+        let made =
+            buffer::over_host_memory(self, sel, bytes, length, options, None, None, deallocator);
+        Ok(made)
     }
 
-    /// Unbuilt: nil ([`Unbuilt::Buffer`]).
+    /// A buffer of zeros in blocks of its own ([`buffer::of_length`]); nil where Metal or rt
+    /// refuses it, counted.
     fn new_buffer_of_length(
         &self,
         on: OnFault,
         length: u64,
         options: u64,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
-        let _ = (on, length, options);
-        refuse_create(Unbuilt::Buffer, "newBufferWithLength:options:");
-        Ok(None)
+        let _ = on;
+        let sel = "newBufferWithLength:options:";
+        Ok(buffer::of_length(self, sel, length, options))
     }
 
     /// rt's queue, of Metal's default `maxCommandBufferCount`; nil where rt refuses it.
@@ -628,37 +641,36 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         true
     }
 
-    /// Unbuilt: nil ([`Unbuilt::Buffer`]).
+    /// [`buffer::of_desc`]'s: nil where Metal or rt refuses it, counted, the deallocator then
+    /// never run.
     fn new_buffer(
         &self,
         desc: BufferDesc<'_>,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
-        std::mem::forget(desc.deallocator);
-        refuse_create(Unbuilt::Buffer, "newBufferWithDescriptor:");
-        Ok(None)
+        Ok(buffer::of_desc(self, desc))
     }
 
-    /// Unbuilt: nil ([`Unbuilt::Heap`]), with the descriptor's options as Metal's descriptor
-    /// holds them.
+    /// [`heap::of_desc`]'s, with the descriptor's options as Metal's descriptor holds them: nil
+    /// where Metal or rt refuses it, or a sparse heap ([`Unbuilt::Heap`]), counted.
     fn new_heap(&self, desc: &HeapDesc) -> RaiseResult<HeapMade<RtPlatform>> {
-        refuse_create(Unbuilt::Heap, "newHeapWithDescriptor:");
+        let held = descriptor_options(HEAP_DESCRIPTOR_OPTIONS, &desc.options);
         Ok(HeapMade {
-            heap: None,
-            descriptor_resource_options: descriptor_options(HEAP_DESCRIPTOR_OPTIONS, &desc.options),
+            heap: heap::of_desc(self, desc, held),
+            descriptor_resource_options: held,
         })
     }
 
-    /// Unbuilt: nil ([`Unbuilt::HostImport`]), with the descriptor's options.
+    /// [`heap::over_host_memory`]'s, with the descriptor's options: nil where Metal or rt refuses
+    /// it, counted.
     fn new_heap_over_host_memory(
         &self,
         bytes: HostRange<'_>,
         desc: &HeapDesc,
     ) -> RaiseResult<HeapMade<RtPlatform>> {
-        let _ = bytes;
-        refuse_create(Unbuilt::HostImport, "newHeapWithDescriptor:");
+        let held = descriptor_options(HEAP_DESCRIPTOR_OPTIONS, &desc.options);
         Ok(HeapMade {
-            heap: None,
-            descriptor_resource_options: descriptor_options(HEAP_DESCRIPTOR_OPTIONS, &desc.options),
+            heap: heap::over_host_memory(self, bytes, desc, held),
+            descriptor_resource_options: held,
         })
     }
 
@@ -893,15 +905,14 @@ mod tests {
         assert_eq!(device.reserve_resource_indices(0, &guests), Ok(()));
         assert_eq!(device.reserve_resource_indices(0, &guests[..64]), Ok(()));
         assert_eq!(crate::answer::degradation_counts(), before);
-        let (made, relayed) = relaying_gaps(|| device.new_buffer_of_length(OnFault::Return, 64, 0));
-        assert!(matches!(made, Ok(None)) && relayed);
-        let heap = device.new_heap(&HeapDesc {
+        let sparse = HeapDesc {
             size: 0x4000,
-            heap_type: 0,
-            options: vec![OptionSet::StorageMode(0)],
+            heap_type: 2,
+            options: vec![OptionSet::StorageMode(2)],
             pinned_gpu_address: None,
-        });
-        assert!(heap.as_ref().is_ok_and(|h| h.heap.is_none()));
+        };
+        let (made, relayed) = relaying_gaps(|| device.new_heap(&sparse));
+        assert!(made.is_ok_and(|made| made.heap.is_none()) && relayed);
         assert!(device.new_library(&[]).is_ok_and(|made| made.is_err()));
         let texture = platform.texture_descriptor(&TextureDesc {
             pixel_format: 80,

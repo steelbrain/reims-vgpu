@@ -33,19 +33,19 @@ pub const RT_DOMAIN: &str = "metal2vulkan-rt";
 /// A piece of the rt platform not built yet, which the calls that reach it refuse ([`refuse`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Unbuilt {
-    /// Buffers the device makes (`newBufferWithLength:options:` and the others but the host
-    /// memory's): over rt's blocks. Each answers nil.
+    /// What of buffers is not built yet (`super::buffer`): a Private buffer of bytes
+    /// (`newBufferWithDescriptor:` with contents), which a copy on the GPU fills, and a tiled
+    /// texture over a buffer (`newTiledTextureWithDescriptor:offset:bytesPerRow:`), a copy of its
+    /// bytes. Each answers nil.
     Buffer,
-    /// A buffer or a heap over the host's memory (`newBufferWithBytesNoCopy:…`, a heap over the
-    /// guest's pages): rt's import of host memory, which the pinned rt has not. Each answers nil.
-    HostImport,
     /// A texture over a plane of an IOSurface (`newTextureWithDescriptor:iosurface:plane:`), which
     /// rt makes none of yet. Each answers nil.
     IosurfaceTexture,
     /// Shared textures and their handles (`newSharedTextureWithDescriptor:`), which rt has none
     /// of. Each answers nil.
     SharedTexture,
-    /// Heaps (`newHeapWithDescriptor:`). Each answers nil.
+    /// What of heaps is not built yet (`super::heap`): a sparse heap, whose ranges rt maps no
+    /// tiles of. Each answers nil.
     Heap,
     /// Sampler states. Each answers nil.
     Sampler,
@@ -86,9 +86,8 @@ pub enum Unbuilt {
 
 impl Unbuilt {
     /// Every piece, once, in the order of their codes' places.
-    pub const ALL: [Unbuilt; 19] = [
+    pub const ALL: [Unbuilt; 18] = [
         Unbuilt::Buffer,
-        Unbuilt::HostImport,
         Unbuilt::IosurfaceTexture,
         Unbuilt::SharedTexture,
         Unbuilt::Heap,
@@ -112,7 +111,6 @@ impl Unbuilt {
     pub const fn code(self) -> &'static str {
         match self {
             Unbuilt::Buffer => "rt-unbuilt-buffer",
-            Unbuilt::HostImport => "rt-unbuilt-host-import",
             Unbuilt::IosurfaceTexture => "rt-unbuilt-iosurface-texture",
             Unbuilt::SharedTexture => "rt-unbuilt-shared-texture",
             Unbuilt::Heap => "rt-unbuilt-heap",
@@ -136,11 +134,10 @@ impl Unbuilt {
     /// What the piece is, for the first refusal's line.
     pub const fn what(self) -> &'static str {
         match self {
-            Unbuilt::Buffer => "a buffer the device makes",
-            Unbuilt::HostImport => "a buffer or heap over the host's memory (rt's import)",
+            Unbuilt::Buffer => "a Private buffer of bytes, or a tiled texture over a buffer",
             Unbuilt::IosurfaceTexture => "a texture over an IOSurface's plane",
             Unbuilt::SharedTexture => "a shared texture",
-            Unbuilt::Heap => "a heap",
+            Unbuilt::Heap => "a sparse heap",
             Unbuilt::Sampler => "a sampler state",
             Unbuilt::DepthStencil => "a depth-stencil state",
             Unbuilt::Library => "a library",
@@ -512,9 +509,10 @@ mod tests {
     #[test]
     fn the_first_refusal_s_line_names_the_call_and_the_code() {
         assert_eq!(
-            refusal_line(Unbuilt::Buffer, "newBufferWithLength:options:"),
-            "reims-vgpu: newBufferWithLength:options:: a buffer the device makes is not built on \
-             metal2vulkan-rt; refused (rt-unbuilt-buffer), the first of its kind\n"
+            refusal_line(Unbuilt::Buffer, "newBufferWithDescriptor:"),
+            "reims-vgpu: newBufferWithDescriptor:: a Private buffer of bytes, or a tiled texture \
+             over a buffer is not built on metal2vulkan-rt; refused (rt-unbuilt-buffer), the first \
+             of its kind\n"
         );
     }
 }
