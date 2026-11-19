@@ -40,6 +40,14 @@ const uint64_t kShadowRowAlign = 256;
 /// place.
 const uint64_t kSurfacePage = 0x1000;
 
+/// What a plane's offset and rows in place are a multiple of where the device caches every
+/// surface in place (gCacheEvery): no host texture lies over the pages then, each a view of an
+/// image the host fills from the plane's place and pitch in the cache, and writes back there, by
+/// copies that address them in texels of the view's format (design.md, "Every surface cached").
+/// 16 bytes, the largest texel of a format of texels (RGBA32Float's), so every view's copies
+/// address the plane whatever format of texels a view of it takes.
+const uint64_t kShapeCopyAlign = 16;
+
 uint64_t alignUp(uint64_t v, uint64_t a)
 {
 	return (v + a - 1) & ~(a - 1);
@@ -143,8 +151,9 @@ std::string format(const char *fmt, ...)
 /// The planes of `s` where its own memory holds them, for its GPU view in place: each at its
 /// offset from the surface's base (CoreVideo's planar buffers start plane 0 past a header), with
 /// its own rows. False, saying why in `*why`, where the host's textures cannot lie over them: the
-/// base is not a page's, a plane's offset or rows are not a multiple of `align` (0: none known),
-/// or a plane passes the allocation.
+/// base is not a page's, a plane's offset or rows are not a multiple of `align` (0: none known;
+/// the host's linear texture alignment, or kShapeCopyAlign where every surface is cached), or a
+/// plane passes the allocation.
 bool placeInPlace(IOSurfaceRef s, std::vector<ShadowPlane> *planes, uint64_t align,
                   std::string *why)
 {
@@ -1161,7 +1170,11 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 		if (!region->hasSurfacePages()) {
 			countCopy(kRgfxSurfaceCopiedUnsupported, surface);
 			notInPlace = "the device uses no surface in place";
-		} else if (!placeInPlace(surface, &own, region->surfacePagesAlignment(), &notInPlace)) {
+		} else if (!placeInPlace(surface, &own,
+		                         gCacheEvery.load(std::memory_order_relaxed)
+		                             ? kShapeCopyAlign
+		                             : region->surfacePagesAlignment(),
+		                         &notInPlace)) {
 			countCopy(kRgfxSurfaceCopiedAlignment, surface);
 		} else {
 			// The bundle asks a device cache for every surface, of any planes and format, as a

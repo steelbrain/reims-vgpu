@@ -5093,12 +5093,18 @@ guest keeps it only as the fallback, counted by why.
   the kext) in the minute's surface copies line, which is logged at the
   default level where a copy was made in that minute, and the first of each
   reason logged at the default level with the surface's format and shape
-  (`rgfxIOSurfaceSetCacheEvery`).
+  (`rgfxIOSurfaceSetCacheEvery`). A plane goes in place where its offset and
+  rows are multiples of 16 bytes rather than of the host's linear texture
+  alignment: the host's textures over it are views of images it fills from
+  the plane's place and pitch in the cache and writes back there, by copies
+  that address them in texels of the view's format, and 16 bytes is the
+  largest texel of a format of texels (`kShapeCopyAlign`).
 - **What the guest sees.** No Metal answer changes: a texture over a surface
   is in place or over a copy, as before. A process's surface whose block the
   kext refused uncacheable or uncached is a copy where it lay in place
   uncached before; on the host that offers the bit, the host refused such a
-  block's pages all the same.
+  block's pages all the same. A surface whose planes lie at multiples of 16
+  bytes but not of the host's alignment is in place where it was a copy.
 
 **A buffer's escaped identity.** The host reads a no-copy buffer's bytes in
 place: one over bytes in a block of the process's (`BUFFER_OVER_HOST_MEMORY`),

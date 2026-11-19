@@ -21104,6 +21104,187 @@ void test_iosurface_in_place_fallback()
 	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region
 }
 
+// Where the device caches every surface in place (SURFACE_CACHE_EVERY), no host texture lies over
+// a surface's pages: a plane's place and rows need only be multiples of 16 bytes, the largest
+// texel a view's copies address (kShapeCopyAlign), not of the host's linear texture alignment.
+// An 'x420' surface laid out as a 3840 x 2160 video output a guest boot met (plane 0 at 568256
+// bytes, its rows 8000 bytes apart, neither a multiple of 256) is a copy for alignment where the
+// device does not cache every surface, and in place, at its planes' own places and rows, where
+// it does; plane 0 at 8 bytes more is still a copy for alignment.
+void test_iosurface_cache_every_alignment()
+{
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	// Room for a copy of the whole surface, at 8192 bytes a row.
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x2000000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	struct Source {
+		uint64_t offset = RGFX_ALLOCATIONS_OFFSET + 0x20000;
+		uint64_t copyOffset = RGFX_ALLOCATIONS_OFFSET + 0x40000;
+		RgfxSurfacePagesLayout layout = {};
+		uint64_t length = 0;
+		int asked = 0, copies = 0;
+		std::vector<uint64_t> released;
+		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t length, uint64_t,
+		                                     uint32_t, bool, const RgfxSurfacePagesLayout *layout,
+		                                     uint64_t *offset, uint64_t *serial, bool *fresh,
+		                                     bool *cached)
+		{
+			Source *src = static_cast<Source *>(c);
+			src->asked++;
+			src->length = length;
+			src->layout = layout != nullptr ? *layout : RgfxSurfacePagesLayout{};
+			*offset = src->offset;
+			*serial = 9;
+			*fresh = true;
+			*cached = true;
+			return RgfxRegion::kPagesGiven;
+		}
+		static bool acquire(void *c, const void *, uint64_t, uint64_t, uint64_t *offset,
+		                    uint64_t *serial, bool *fresh)
+		{
+			Source *src = static_cast<Source *>(c);
+			src->copies++;
+			*offset = src->copyOffset;
+			*serial = 10;
+			*fresh = true;
+			return true;
+		}
+		static void release(void *c, uint64_t offset)
+		{
+			static_cast<Source *>(c)->released.push_back(offset);
+		}
+	} src;
+	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+	// The host's linear texture alignment: 256 bytes.
+	region.setSurfacePagesSource(&Source::pages, 256, &src);
+	const uint32_t kX420 = 0x78343230;
+	const uint64_t kRows = 8000, kLuma = 568256, kChroma = kLuma + kRows * 2160;
+	auto x420 = [&](uint64_t luma) {
+		const uint64_t chroma = luma + kRows * 2160;
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth : @3840,
+			(id)kIOSurfaceHeight : @2160,
+			(id)kIOSurfacePixelFormat : @(kX420),
+			(id)kIOSurfaceAllocSize : @(chroma + kRows * 1080),
+			(id)kIOSurfacePlaneInfo : @[
+				@{
+					(id)kIOSurfacePlaneWidth : @3840,
+					(id)kIOSurfacePlaneHeight : @2160,
+					(id)kIOSurfacePlaneBytesPerElement : @2,
+					(id)kIOSurfacePlaneBytesPerRow : @(kRows),
+					(id)kIOSurfacePlaneOffset : @(luma),
+					(id)kIOSurfacePlaneSize : @(kRows * 2160),
+				},
+				@{
+					(id)kIOSurfacePlaneWidth : @1920,
+					(id)kIOSurfacePlaneHeight : @1080,
+					(id)kIOSurfacePlaneBytesPerElement : @4,
+					(id)kIOSurfacePlaneBytesPerRow : @(kRows),
+					(id)kIOSurfacePlaneOffset : @(chroma),
+					(id)kIOSurfacePlaneSize : @(kRows * 1080),
+				},
+			],
+		};
+		IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		CHECK(s != nullptr && IOSurfaceGetPlaneCount(s) == 2);
+		if (s != nullptr) {
+			auto *base = static_cast<uint8_t *>(IOSurfaceGetBaseAddress(s));
+			CHECK(static_cast<uint8_t *>(IOSurfaceGetBaseAddressOfPlane(s, 0)) - base ==
+			          static_cast<ptrdiff_t>(luma) &&
+			      static_cast<uint8_t *>(IOSurfaceGetBaseAddressOfPlane(s, 1)) - base ==
+			          static_cast<ptrdiff_t>(chroma) &&
+			      IOSurfaceGetBytesPerRowOfPlane(s, 0) == kRows);
+		}
+		return s;
+	};
+	auto luma = [&](IOSurfaceRef s) {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Unorm
+		                                                       width:3840
+		                                                      height:2160
+		                                                   mipmapped:NO];
+		return [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                        iosurface:s
+		                                            plane:0
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&fx.ser];
+	};
+	auto copied = [] {
+		return rgfxIOSurfaceCopiedViews(kRgfxSurfaceCopiedAlignment);
+	};
+	// A copy of plane 0 at 8192 bytes a row, its buffer over the copy block, asked nothing in
+	// place, counted for alignment.
+	auto isCopy = [&](RgfxIOSurfaceTexture *t, int asked, int copies, uint64_t before) {
+		CHECK(t != nil && src.asked == asked && src.copies == copies && copied() == before + 1);
+		auto create =
+		    expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		CHECK(create.region_offset == src.copyOffset);
+		auto made =
+		    expectMessage<RgfxSurfaceTextureMessage>(fx.ring, RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+		CHECK(made.texture.buffer_obj_id == create.obj_id && made.texture.offset == 0 &&
+		      made.texture.bytes_per_row == 8192);
+	};
+
+	// The device does not cache every surface: a copy.
+	rgfxIOSurfaceSetCacheEvery(false);
+	IOSurfaceRef plain = x420(kLuma);
+	uint64_t before = copied();
+	@autoreleasepool {
+		isCopy(luma(plain), 0, 1, before);
+	}
+	rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
+	drainRing(fx.ring);
+	CHECK(src.released == std::vector<uint64_t>({src.copyOffset}));
+
+	// It does: in place, each plane's layout asked with its own place and rows, the texture at
+	// plane 0's.
+	rgfxIOSurfaceSetCacheEvery(true);
+	IOSurfaceRef cached = x420(kLuma);
+	before = copied();
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *t = luma(cached);
+		CHECK(t != nil && src.asked == 1 && src.copies == 1 && copied() == before);
+		const uint64_t alloc = (static_cast<uint64_t>(IOSurfaceGetAllocSize(cached)) + 0xfff) &
+		                       ~uint64_t(0xfff);
+		CHECK(src.length == alloc && src.layout.plane_count == 2);
+		const RgfxSurfacePlaneLayout &y = src.layout.planes[0], &c = src.layout.planes[1];
+		CHECK(y.offset == kLuma && y.bytes_per_row == kRows && y.row_bytes == 7680 &&
+		      y.rows == 2160);
+		CHECK(c.offset == kChroma && c.bytes_per_row == kRows && c.row_bytes == 7680 &&
+		      c.rows == 1080);
+		auto buffer =
+		    expectMessage<RgfxBufferOverSurfacePages>(fx.ring, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES);
+		CHECK(buffer.block_offset == src.offset && buffer.length == alloc);
+		auto made =
+		    expectMessage<RgfxSurfaceTextureMessage>(fx.ring, RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+		CHECK(made.texture.buffer_obj_id == buffer.obj_id && made.texture.offset == kLuma &&
+		      made.texture.bytes_per_row == kRows && made.texture.plane == 0);
+		CHECK(ringEmpty(fx.ring));
+	}
+	rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
+	drainRing(fx.ring);
+	CHECK(src.released == std::vector<uint64_t>({src.copyOffset, src.offset}));
+
+	// Plane 0 at 8 bytes more, no multiple of 16: a copy, though every surface is cached.
+	IOSurfaceRef odd = x420(kLuma + 8);
+	before = copied();
+	@autoreleasepool {
+		isCopy(luma(odd), 1, 2, before);
+	}
+	rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
+	drainRing(fx.ring);
+	for (IOSurfaceRef s : {plain, cached, odd})
+		if (s != nullptr)
+			CFRelease(s);
+	rgfxIOSurfaceSetCacheEvery(false);
+	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region
+}
+
 // Core Image's blur of a large image, as a guest boot met it (newTextureWithDescriptor:iosurface:
 // plane: answered nil, the region too small for their copies): fifteen one-plane RGhA surfaces of
 // 6094 x 1566 alive at once, a 6016 x 6016 '420f' source as IOSurfaceCreate lays it out and as
@@ -22230,6 +22411,7 @@ int main(int argc, char **argv)
 		test_iosurface_in_place();
 		test_iosurface_keep();
 		test_iosurface_in_place_fallback();
+		test_iosurface_cache_every_alignment();
 		test_iosurface_in_place_core_image_set();
 		test_iosurface_cached();
 		test_iosurface_nil_is_logged();
