@@ -46,7 +46,7 @@
 //! `release_block`, [`BlockInfo`]). On the Vulkan platform the source is [`HostBlocks`], blocks of
 //! the process's own memory, which hands blocks out, keeps them ready and frees them as the
 //! runtime does. On the rt platform it is the runtime's blocks
-//! ([`RtBlocks`](rt_blocks::RtBlocks), the platform's `ApiPlatform::block_source`), each known to
+//! ([`rt_blocks::RtBlocks`], the platform's `ApiPlatform::block_source`), each known to
 //! its device while handed out.
 //!
 //! The host maps a block into the guest whole host pages at a time: a block whose mapping does
