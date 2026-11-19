@@ -567,7 +567,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // its RAM and above 2^36, write-back, as the x86-64 kernel does: an arm64 26 boot
             // under TCG, which faults an unaligned load from Device memory, read each of its
             // first blocks unaligned through such a mapping.
-            let pool_ledger = (shared_pool.as_ref()).filter(|_| !cfg!(windows)).map(Pool::ledger);
+            let pool_ledger = (shared_pool.as_ref())
+                .filter(|_| !cfg!(windows))
+                .map(Pool::ledger);
             // `Managed` resources are one copy where the platform answers that the GPU shares the
             // CPU's memory, else two, which hold Metal's contract on any GPU: the guest's device
             // answers `hasUnifiedMemory` alike, from the blob.
