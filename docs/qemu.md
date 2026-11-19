@@ -236,7 +236,11 @@ is its transport:
   RTX 2080, 38.56 GiB on its RX 7900 XTX, and 16.58 GiB on its 780M,
   where RADV splits the APU's memory into a 5.53 GiB host heap and an
   11.05 GiB device-local one over the same memory (16.57 GiB on um870's);
-  17.61 GiB on gem10's RX 550.
+  17.61 GiB on gem10's RX 550. A boot on um870's 780M (11-18, 26.7.2)
+  logged 16972 MiB of heaps and took 16974 MiB at 0xac0000000, of a room
+  of 742400 MiB (725 GiB, to three quarters of the guest's 40 address
+  bits), and QEMU reserved to 0xf00000000: that room clamps none of these
+  GPUs' sums.
 - Measured 11-17 with the pool's measurement arm (the vCPUs' BQL waits from
   a piece's ask to 20 ms past its add or removal; a 4-thread spinner in the
   guest; macOS 26.7.2). On um790's 780M under KVM, adds of 256 MiB, 256 MiB
