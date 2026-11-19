@@ -2175,28 +2175,23 @@ mod tests {
         assert_eq!(count(), before + 1);
     }
 
-    /// The Vulkan crate's metallib of the kernel that reaches a buffer through an address it
-    /// loads from another (its `reach.metal`): it reads the word there, and writes the word after.
-    #[cfg(feature = "rt")]
-    const REACH: &[u8] = include_bytes!("../../../../reims-vgpu-vulkan/metallibs/reach.metallib");
-
     /// On metal2vulkan-rt's platform, a `Managed` buffer over a slab's CPU copy (a Shared buffer in
     /// a heap over a block of the guest's Shared pool, at the block's GPU address,
-    /// `POOL_ADDRESSES`) is reached by a kernel through the address the guest holds for it, which
-    /// the kernel loads from an argument buffer, with the buffer made resident. On a GPU that
-    /// shares the CPU's memory the device offers `MANAGED_AT_COPY`, the guest posts its copy's
-    /// address, and the buffer is the copy's bytes there: the kernel reads what the CPU wrote,
-    /// before and after a later CPU write with no `didModifyRange:`, and the CPU reads the kernel's
-    /// write. There a create over a copy the platform placed in no block it knows (a buffer over
-    /// the region, at an address of rt's own and not the guest's) is kept where rt made it,
-    /// counted, with the answers of the same create without the bit: made, bound, and at rt's
-    /// address rather than the one posted. On a GPU of its own memory no such bit is offered, and
-    /// the buffer keeps two copies: the kernel reads the GPU's, which holds the CPU's bytes as of
-    /// the first commit after the make, until a `didModifyRange:` brings a later write over; and
-    /// the CPU's bytes keep out the kernel's write.
+    /// `POOL_ADDRESSES`), which the GPU reads and writes by a blit. On a GPU that shares the CPU's
+    /// memory the device offers `MANAGED_AT_COPY`, the guest posts its copy's address, and the
+    /// buffer is the copy's bytes at that address: the GPU reads what the CPU wrote, before and
+    /// after a later CPU write with no `didModifyRange:`, and the CPU reads the GPU's write. There
+    /// a create over a copy the platform placed in no block it knows (a buffer over the region, at
+    /// an address of rt's own and not the guest's) is kept where rt made it, counted, with the
+    /// answers of the same create without the bit: made, bound, and at rt's address rather than
+    /// the one posted. On a GPU of its own memory no such bit is offered, and the buffer keeps two
+    /// copies: the GPU reads its own, which holds the CPU's bytes as of the first commit after the
+    /// make, until a `didModifyRange:` brings a later write over; and the CPU's bytes keep out the
+    /// GPU's write. (A blit, not a kernel that loads the address from an argument buffer: rt's
+    /// translator refuses that kernel, `reach.metal`: IdentityDomains, rt-refused-translation.)
     #[cfg(feature = "rt")]
     #[test]
-    fn on_vulkan_rt_s_managed_buffer_is_reached_at_the_address_the_guest_holds() {
+    fn on_vulkan_rt_s_managed_buffer_at_its_copy_is_the_copy_s_bytes_where_memory_is_shared() {
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -2205,10 +2200,7 @@ mod tests {
         };
         use reims_vgpu_vulkan::RtPlatform;
         use reims_vgpu_vulkan::answer::counted_kinds;
-        use reims_vgpu_vulkan::core::platform::blit::ResourceRef;
-        use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
         use reims_vgpu_vulkan::core::platform::os::Clock as _;
-        use reims_vgpu_vulkan::core::platform::resource::Library as _;
 
         use crate::platform::ApiPlatform;
         use crate::pool::{Pool as SharedPool, PoolConfig, PoolHost};
@@ -2348,7 +2340,7 @@ mod tests {
         const OLD: u32 = 0x1111_1111;
         const NEW: u32 = 0x2222_2222;
         const AFTER: u32 = 0x5a5a_5a5a;
-        const KERNEL: u32 = 0x3333_3333;
+        const GPU: u32 = 0x3333_3333;
         write(0, OLD);
         write(1, AFTER);
 
@@ -2368,67 +2360,50 @@ mod tests {
                 "at the address the guest posted"
             );
         }
-        let held = buffer.gpu_address();
 
-        let library = device.new_library(REACH).unwrap().unwrap().unwrap();
-        let f = library
-            .new_function(OnFault::Die, "reach")
-            .unwrap()
-            .unwrap();
-        let state = device
-            .new_compute_pipeline_state_for_function(Some(&f))
-            .unwrap()
-            .unwrap();
         let shared = |length: u64| {
             device
                 .new_buffer_of_length(OnFault::Die, length, 0)
                 .unwrap()
                 .unwrap()
         };
-        // The argument buffer holding the address, and the kernel's two words.
-        let (addresses, out) = (shared(8), shared(8));
-        // SAFETY: Shared buffers of 8 bytes, which no command uses yet.
-        unsafe {
-            addresses.contents().as_ptr::<u64>().write(held);
-            out.contents().as_ptr::<u32>().add(1).write(KERNEL);
-        }
+        // The word the GPU reads from the buffer, and the one it writes into the buffer's second.
+        let (out, from) = (shared(4), shared(4));
+        // SAFETY: a Shared buffer of 4 bytes, which no command uses yet.
+        unsafe { from.contents().as_ptr::<u32>().write(GPU) };
         let queue = device.new_command_queue().unwrap();
-        // What the kernel reads through the address alone.
+        // The GPU's read of the buffer's first word, and its write of the second.
         let reach = || {
             let cb = queue.command_buffer(OnFault::Die).unwrap().unwrap();
-            let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
-            let one = MtlSize::new(1, 1, 1);
+            let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
             for cmd in [
-                ComputeCmd::SetComputePipelineState {
-                    state: Some(&state),
+                BlitCmd::CopyBufferToBuffer {
+                    source_buffer: Some(&buffer),
+                    source_offset: 0,
+                    destination_buffer: Some(&out),
+                    destination_offset: 0,
+                    size: 4,
                 },
-                ComputeCmd::SetBuffers {
-                    buffers: &[Some(&addresses), Some(&out)],
-                    offsets: &[0, 0],
-                    range: NsRange::new(0, 2),
+                BlitCmd::CopyBufferToBuffer {
+                    source_buffer: Some(&from),
+                    source_offset: 0,
+                    destination_buffer: Some(&buffer),
+                    destination_offset: 4,
+                    size: 4,
                 },
-                // MTLResourceUsageRead | MTLResourceUsageWrite.
-                ComputeCmd::UseResources {
-                    resources: &[Some(ResourceRef::Buffer(&buffer))],
-                    usage: 3,
-                },
-                ComputeCmd::DispatchThreads {
-                    threads_per_grid: one,
-                    threads_per_threadgroup: one,
-                },
-                ComputeCmd::EndEncoding,
+                BlitCmd::EndEncoding,
             ] {
                 e.encode(OnFault::Die, cmd).unwrap();
             }
             cb.commit(OnFault::Die).unwrap();
             cb.wait_until_completed(OnFault::Die).unwrap();
             assert!(cb.error().is_none(), "{:?}", cb.error());
-            // SAFETY: a Shared buffer's first word, read after the command buffer completed.
+            // SAFETY: a Shared buffer's word, read after the command buffer completed.
             unsafe { out.contents().as_ptr::<u32>().read() }
         };
         if unified {
             assert_eq!(reach(), OLD, "the CPU's bytes");
-            assert_eq!(read(1), KERNEL, "the kernel's write, in the CPU's bytes");
+            assert_eq!(read(1), GPU, "the GPU's write, in the CPU's bytes");
             write(0, NEW);
             assert_eq!(
                 reach(),
@@ -2437,17 +2412,13 @@ mod tests {
             );
         } else {
             assert_eq!(reach(), OLD, "the GPU's copy, as of the first commit");
-            assert_eq!(
-                read(1),
-                AFTER,
-                "the kernel's write, in the GPU's copy alone"
-            );
+            assert_eq!(read(1), AFTER, "the GPU's write, in its own copy alone");
             write(0, NEW);
             assert_eq!(reach(), OLD, "the GPU's copy, before a didModifyRange");
             (buffer.did_modify_range(OnFault::Die, NsRange::new(0, 4))).unwrap();
             assert_eq!(reach(), NEW, "the GPU's copy, after a didModifyRange");
         }
-        drop((buffer, copy, addresses, out));
+        drop((buffer, copy, from, out));
         drop(dec);
         drop(ledger);
         drop(shared_pool);
