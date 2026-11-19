@@ -1226,7 +1226,11 @@ fn on_vulkan_an_external_write_done_lies_between_the_decodes_commit_and_its_sign
             panic!("one acquire record: {acquires:?}");
         };
         assert_eq!(record.receiver, id);
-        assert!(record.args.is_empty(), "an acquire's arguments: {:?}", record.args);
+        assert!(
+            record.args.is_empty(),
+            "an acquire's arguments: {:?}",
+            record.args
+        );
         let commits = [0, 1].map(|n| place(&records, "commit", n).expect("a commit's record"));
         let signalled = place(&records, "setSignaledValue:", 0).expect("the signal's record");
         assert!(
