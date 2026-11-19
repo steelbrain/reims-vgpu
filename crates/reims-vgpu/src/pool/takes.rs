@@ -527,9 +527,10 @@ impl State {
         // The piece's mark rises past the carve as it is carved, before another can be.
         let piece = self.pieces.get_mut(&start)?;
         let block = piece.block.gpu_address;
-        let written = piece.placed.place(piece.block.zeroed, at.checked_sub(start)?, len);
+        let offset = at.checked_sub(start)?;
+        let written = piece.placed.place(piece.block.zeroed, offset, len);
         let gpu_address = if block != 0 {
-            GpuAddress::OfBlock(block.checked_add(at.checked_sub(start)?)?)
+            GpuAddress::OfBlock(block.checked_add(offset)?)
         } else {
             GpuAddress::Picked(self.addresses.pick(len)?)
         };

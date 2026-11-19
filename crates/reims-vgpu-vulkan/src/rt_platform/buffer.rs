@@ -354,8 +354,8 @@ impl KnownBlocks {
     /// Knows `block` by its GPU address, in place of a block known there before, nothing placed
     /// in it yet.
     pub fn know(&self, block: rt::Block) {
-        let placed = Placed::default();
-        self.known.lock().insert(block.gpu_address, Known { block, placed });
+        let (at, placed) = (block.gpu_address, Placed::default());
+        self.known.lock().insert(at, Known { block, placed });
     }
 
     /// Forgets the block `id`, giving back the handle it held; `None` where none is known.
@@ -2223,11 +2223,15 @@ mod tests {
         let known = device.known_blocks().clone();
         known.know(block.clone());
         let queue = device.new_command_queue().expect("a command queue");
-        let out = device.new_buffer_of_length(on, 64, 0).expect("never a raise");
+        let out = device
+            .new_buffer_of_length(on, 64, 0)
+            .expect("never a raise");
         let out = out.expect("a Shared buffer");
         let private = |at: u64| {
             let made = device.new_buffer(pinned(block.gpu_address + at, 0x20, None));
-            let made = made.expect("never a raise").expect("a Private buffer in its block");
+            let made = made
+                .expect("never a raise")
+                .expect("a Private buffer in its block");
             assert_eq!(made.gpu_address(), block.gpu_address + at);
             made
         };
