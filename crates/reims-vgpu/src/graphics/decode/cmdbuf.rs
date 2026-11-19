@@ -1816,6 +1816,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(counts) = self.queue_counts(m.queue_obj_id) else {
             return Ok(Err(DecodeError::BadReference));
         };
+        // Counted where its process holds an escaped buffer over a copy of its pages, which the
+        // runtime brings up to date at its commit ([`super::escape`]).
+        self.escaped_copy_commit(context_of(m.queue_obj_id));
         // The bytes it wrote in its `Managed` chunks reach their GPU copies by its commit, before
         // its work, as a range message of each before it would bring them.
         self.uploads_written(&take.written);

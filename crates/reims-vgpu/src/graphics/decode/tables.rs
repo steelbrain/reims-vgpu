@@ -470,6 +470,9 @@ pub(crate) struct Context<P: Platform> {
     /// (`GraphicsDecoder::refill_managed`): a command buffer's begin past one refills those made
     /// before it, under this lock, so no command buffer of the context is begun between.
     pub(crate) managed_recoveries: Mutex<u64>,
+    /// The context's live buffers over a copy of their read-only pages whose identity escaped
+    /// ([`super::escape`]): each adds itself at its first note and leaves at its drop.
+    pub(crate) escaped_copies: Arc<AtomicUsize>,
 }
 
 impl<P: Platform> Context<P> {
@@ -489,6 +492,7 @@ impl<P: Platform> Context<P> {
             view_step: Mutex::new(None),
             drain: Mutex::new(Arc::default()),
             managed_recoveries: Mutex::new(0),
+            escaped_copies: Arc::default(),
         }
     }
 

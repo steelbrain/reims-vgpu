@@ -132,8 +132,10 @@ repeats the ones code cites.
     `buffer-escaped-gpu-address`, `-argument-encoder`, `-resource-id` and
     `-residency-set`, those whose identity the guest noted escaped, by the
     act, with `buffer-escaped-read-only-pages`, those of them over a copy of
-    their pages: no degradation, docs/graphics-kext/design.md, "A buffer's
-    escaped identity"), and the Vulkan platform's command predication's
+    their pages, and `escaped-copy-commits`, the command buffers begun of a
+    process that held such an escaped copy: no degradation,
+    docs/graphics-kext/design.md, "A buffer's escaped identity"), and the
+    Vulkan platform's command predication's
     (`predication-loop-overrun`, a command buffer whose loop ran past the
     iterations laid down for it, which fails); a boot's degradations are
     read from its last such line. `reims-vgpu INFO reims_vgpu_vulkan::core::logging: lines

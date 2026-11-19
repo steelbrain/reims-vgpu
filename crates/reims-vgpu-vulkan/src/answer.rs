@@ -2707,7 +2707,8 @@ pub fn out_of_host_memory_count() -> u64 {
 /// read-only (`read-only-pages-buffers`, and their bytes' KiB, `read-only-pages-kib`), and as it
 /// makes a no-copy buffer (`no-copy-buffers`) and the guest notes that one's identity escaped, by
 /// the act that noted it (`buffer-escaped-gpu-address`, `-argument-encoder`, `-resource-id`,
-/// `-residency-set`), one over a copy of its pages counted too (`buffer-escaped-read-only-pages`);
+/// `-residency-set`), one over a copy of its pages counted too (`buffer-escaped-read-only-pages`),
+/// with each command buffer begun of a process that holds such a copy (`escaped-copy-commits`);
 /// and this platform's command predication's, a command buffer a loop ran past its copies in
 /// (`predication-loop-overrun`, [`crate::gpu::predication::OVERRUN_CODE`]).
 static COUNTED: crate::core::sync::Mutex<Vec<(&'static str, u64)>> =

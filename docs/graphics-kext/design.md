@@ -4831,6 +4831,18 @@ before the act that reads memory the act writes: the app racing its own GPU
 work. An identity handed between the app's threads through the app's own
 synchronisation keeps the order through it.
 
+An escaped buffer over pages the process maps read-only lies over a copy of
+its pages on Linux and Windows, and the GPU may then read the copy through
+memory, with no binding naming it, after the CPU changed the pages. Metal
+requires such a reach to be made resident by the encoder (`useResource:usage:`),
+which names the buffer as a use, and the Vulkan platform's runtime brings every
+copy a command buffer's uses name up to date at its commit, and every copy where
+its work may reach memory no use names. So the host adds nothing to the commit:
+it keeps each process's count of its live escaped copies and counts each command
+buffer begun of a process that holds one (`escaped-copy-commits`). A test holds
+the runtime's copy in: a kernel that reads such a copy only through its address,
+made resident, reads the CPU's new bytes.
+
 **Group dma-bufs of the pages blocks' views.** The host imports each pages
 block's view once, as a buffer over the whole view that the block's
 `BUFFER_OVER_PAGES` buffers lie in. Where the Vulkan platform imports a view as
