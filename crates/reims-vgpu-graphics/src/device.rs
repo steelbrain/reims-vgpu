@@ -338,7 +338,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 58.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 59.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -394,7 +394,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_CURSOR_COLOR
     | RGFX_FEATURE_BUFFER_ESCAPED
     | RGFX_FEATURE_POOL
-    | RGFX_FEATURE_SURFACE_REFILL;
+    | RGFX_FEATURE_SURFACE_REFILL
+    | RGFX_FEATURE_POOL_ADDRESSES;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -497,15 +498,17 @@ pub trait Host: Send + Sync + 'static {
 
     /// `POOL_TAKE`, where the guest took [`RGFX_FEATURE_POOL`]: context `take.context` asks for a
     /// zeroed block of the pool of at least `take.length` bytes. The host gives `answer` from any
-    /// thread: the block's offset in the pool and its length, `take.length` rounded up to
-    /// [`RGFX_POOL_BLOCK_ALIGN`], every byte zero; [`RGFX_STATUS_INVALID_ARGUMENT`] for a length
+    /// thread: the block's offset in the pool, its length, `take.length` rounded up to
+    /// [`RGFX_POOL_BLOCK_ALIGN`], every byte zero, and the GPU address of its first byte, which the
+    /// answer gives the guest where it took [`RGFX_FEATURE_POOL_ADDRESSES`];
+    /// [`RGFX_STATUS_INVALID_ARGUMENT`] for a length
     /// of 0 or past [`RGFX_POOL_TAKE_MAX`]; or [`RGFX_STATUS_REFUSED`] where its pool has no room.
     /// It answers each context's takes in their order, and none of a context closed or a device
     /// reset since, whose block it gives back itself. Called on the context's lane, in ring
     /// order; it waits for nothing there. The default refuses at once, for a host with no pool.
     fn pool_take(&self, take: &RgfxPoolTake, answer: PoolAnswer) {
         let _ = take;
-        answer.answer(RGFX_STATUS_REFUSED, 0, 0);
+        answer.answer(RGFX_STATUS_REFUSED, 0, 0, 0);
     }
 
     /// `POOL_GIVE`, where the guest took [`RGFX_FEATURE_POOL`]: context `give.context` gives
@@ -1912,18 +1915,23 @@ impl std::fmt::Debug for PoolAnswer {
 
 impl PoolAnswer {
     /// Posts the `POOL_BLOCK` with `status`, and with the block's `pool_offset` and `length`
-    /// where `status` is [`RGFX_STATUS_OK`] (0 otherwise), onto the control completion ring,
+    /// where `status` is [`RGFX_STATUS_OK`] (0 otherwise), and its `gpu_address` where the guest
+    /// also took [`RGFX_FEATURE_POOL_ADDRESSES`] (0 otherwise), onto the control completion ring,
     /// waiting for nothing, as [`CompleteAnswer::answer`] posts.
-    pub fn answer(self, status: u32, pool_offset: u64, length: u64) {
-        let (pool_offset, length) = if status == RGFX_STATUS_OK {
-            (pool_offset, length)
-        } else {
-            (0, 0)
+    pub fn answer(self, status: u32, pool_offset: u64, length: u64, gpu_address: u64) {
+        let Some(shared) = self.shared.upgrade() else {
+            return;
         };
-        if let Some(shared) = self.shared.upgrade() {
-            let block = crate::control::pool_block(self.seqno, status, pool_offset, length);
-            shared.post_unwaiting(&block, self.epoch);
-        }
+        let (pool_offset, length, gpu_address) = if status != RGFX_STATUS_OK {
+            (0, 0, 0)
+        } else if !shared.driver_took(RGFX_FEATURE_POOL_ADDRESSES) {
+            (pool_offset, length, 0)
+        } else {
+            (pool_offset, length, gpu_address)
+        };
+        let block =
+            crate::control::pool_block(self.seqno, status, pool_offset, length, gpu_address);
+        shared.post_unwaiting(&block, self.epoch);
     }
 }
 

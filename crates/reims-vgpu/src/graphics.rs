@@ -79,6 +79,7 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
     RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_ANSWERS,
     RGFX_FEATURE_PIPELINE_KEYS, RGFX_FEATURE_POINTER_MOTION, RGFX_FEATURE_POOL,
+    RGFX_FEATURE_POOL_ADDRESSES,
     RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_RATE_MAPS, RGFX_FEATURE_READ_ONLY_PAGES,
     RGFX_FEATURE_SCHEDULED_ASK, RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS,
     RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED,
@@ -714,7 +715,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     u64::from(RGFX_FEATURE_MANAGED_AT_OFFSET)
                 }
                 | if pool_ledger.is_some() {
-                    RGFX_FEATURE_POOL
+                    RGFX_FEATURE_POOL | RGFX_FEATURE_POOL_ADDRESSES
                 } else {
                     0
                 }
@@ -1042,6 +1043,15 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             .decoders
             .sender(None, Sinks::default())
             .object_count()
+    }
+
+    /// The GPU address of the stage-3 decoder's buffer or heap `obj_id`, where it holds one.
+    #[cfg(all(test, not(windows)))]
+    pub(crate) fn decoder_gpu_address(&self, obj_id: u64) -> Option<u64> {
+        self.control
+            .decoders
+            .sender(None, Sinks::default())
+            .gpu_address_of(obj_id)
     }
 
     /// The ids that stand for a create the stage-3 decoder refused (`decode::refused`).
@@ -1869,11 +1879,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// ([`PoolLedger::take`]); refused where the pool has no room, or the device offers none.
     fn take_pool_block(&self, take: &RgfxPoolTake, answer: PoolAnswer) {
         let Some(ledger) = &self.shared_pool else {
-            answer.answer(RGFX_STATUS_REFUSED, 0, 0);
+            answer.answer(RGFX_STATUS_REFUSED, 0, 0, 0);
             return;
         };
         if take.length == 0 || take.length > TAKE_MAX {
-            answer.answer(RGFX_STATUS_INVALID_ARGUMENT, 0, 0);
+            answer.answer(RGFX_STATUS_INVALID_ARGUMENT, 0, 0, 0);
             return;
         }
         let (context, length) = (take.context, take.length);
@@ -1881,14 +1891,19 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             context,
             length,
             Box::new(move |block| match block {
-                Some((offset, length)) => answer.answer(RGFX_STATUS_OK, offset, length),
+                Some(block) => answer.answer(
+                    RGFX_STATUS_OK,
+                    block.offset,
+                    block.length,
+                    block.gpu_address,
+                ),
                 None => {
                     log::warn!(
                         target: "reims_vgpu::graphics",
                         "context {context} asked for {length:#x} bytes of the Shared pool, which \
                          has no room for them: refused"
                     );
-                    answer.answer(RGFX_STATUS_REFUSED, 0, 0);
+                    answer.answer(RGFX_STATUS_REFUSED, 0, 0, 0);
                 }
             }),
         );

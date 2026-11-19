@@ -49,6 +49,7 @@
 // Guest addresses flow through here: arithmetic is spelt out.
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+mod addresses;
 mod host_blocks;
 mod rt_blocks;
 mod takes;
@@ -65,7 +66,9 @@ use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
 pub(crate) use host_blocks::HostBlocks;
 pub(crate) use takes::{Give, PoolLedger, TAKE_MAX};
 #[cfg(test)]
-use takes::{TAKE_ALIGN, TakeAnswer};
+pub(crate) use addresses::{HOST_BASE, HOST_END};
+#[cfg(test)]
+use takes::{TAKE_ALIGN, TakeAnswer, Taken};
 
 use crate::Error;
 
@@ -278,6 +281,8 @@ struct State {
     carves: BTreeMap<u64, takes::Carve>,
     /// The contexts with a take in flight or a worker, by context (`takes`).
     takers: HashMap<u32, takes::Taker>,
+    /// The GPU addresses given to the carves of pieces whose blocks have none (`addresses`).
+    addresses: addresses::HostAddresses,
     /// The last number a carve, a context's takes or an ask took.
     serial: u64,
     /// The take workers running (`takes`).

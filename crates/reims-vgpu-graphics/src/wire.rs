@@ -541,6 +541,16 @@ pub const RGFX_FEATURE_POOL: u64 = 0x200_0000_0000_0000;
 /// kexts take it, and the bundle sets the flag only where they did, so a guest that did not take
 /// it never sets it, and a host that does not offer it never sees it.
 pub const RGFX_FEATURE_SURFACE_REFILL: u64 = 0x400_0000_0000_0000;
+/// `FEATURES_HI` bit 27, feature bit 59, `POOL_ADDRESSES`: the host gives each block of the Shared
+/// pool its GPU address. Where the guest took it beside [`RGFX_FEATURE_POOL`], a `POOL_TAKE`'s
+/// answer ([`RgfxPoolBlock`]) carries the GPU address of the block's first byte, and the guest
+/// places the heaps it makes over the block ([`RGFX_CMD_HEAP_OVER_POOL`]) at that address plus
+/// their spans' offsets, rather than at addresses it picks in its context's range
+/// ([`RGFX_CONTEXT_VA_BASE`]). On metal2vulkan-rt's device the address is the block's Vulkan
+/// device address; on the Vulkan platform before it, an address the host picks in
+/// `[2^45, 2^46)`, below every context's range, and pins the heaps there. Every host with a pool
+/// offers it; the x86-64 kext takes it.
+pub const RGFX_FEATURE_POOL_ADDRESSES: u64 = 0x800_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -653,7 +663,9 @@ pub const RGFX_CONTEXT_OBJ_ID_SHIFT: u32 = 40;
 /// model of Metal's layout places the host's unpinned buffers and textures lowest first from
 /// 2^40, each as far as its live ranges reach, which the host's memory bounds far below 2^46. A
 /// guest's pin meets only the guest's own ranges then. The host takes each range as given: it
-/// knows no context's range, only that the guest's lie here.
+/// knows no context's range, only that the guest's lie here. The addresses the host gives the
+/// Shared pool's blocks on that platform ([`RGFX_FEATURE_POOL_ADDRESSES`]) lie below them, in
+/// `[2^45, 2^46)`.
 pub const RGFX_CONTEXT_VA_BASE: u64 = 0x4000_0000_0000;
 /// Where the guest's GPU addresses end: 2^47, the Metal address space's end.
 pub const RGFX_CONTEXT_VA_END: u64 = 0x8000_0000_0000;
@@ -1175,7 +1187,9 @@ pub const RGFX_CMD_BUFFER_ESCAPED: u32 = 0x23b;
 /// of a pool block the sender's context holds ([`RGFX_CMD_POOL_TAKE`]), at that offset, as
 /// [`RGFX_CMD_HEAP_OVER_HOST_MEMORY`] makes one over a region block. The heap holds the block:
 /// the block's `POOL_GIVE` is refused while the heap lives. A span that does not lie in one block
-/// of the sender's makes nothing, as an unknown id does. Not answered.
+/// of the sender's makes nothing, as an unknown id does. Its `gpu_address` is where the heap lies:
+/// where the guest took [`RGFX_FEATURE_POOL_ADDRESSES`], the block's GPU address as its take's
+/// answer gave it plus the span's offset in the block, else the guest's own pick. Not answered.
 pub const RGFX_CMD_HEAP_OVER_POOL: u32 = 0x23c;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
@@ -1459,7 +1473,8 @@ pub const RGFX_VT_HOST_MESSAGE_BYTES_OFFSET: u32 = 24;
 pub const RGFX_EVT_VT_RING: u32 = 0x40f;
 /// Event `POOL_BLOCK` ([`RgfxPoolBlock`], on the control completion ring), with a
 /// [`RGFX_CMD_POOL_TAKE`]'s `seqno`: its answer. `status` [`RGFX_STATUS_OK`] with the block's
-/// `pool_offset` and `length`; otherwise both 0.
+/// `pool_offset` and `length`, and, where the guest took [`RGFX_FEATURE_POOL_ADDRESSES`], its
+/// `gpu_address`; otherwise each 0.
 pub const RGFX_EVT_POOL_BLOCK: u32 = 0x410;
 
 /// A command buffer's status in [`RgfxCbComplete`]: finished with no error.
@@ -1993,7 +2008,7 @@ const _: () = {
     assert!(size_of::<RgfxMsgHeader>() == 16);
     assert!(size_of::<RgfxPoolTake>() == 32);
     assert!(size_of::<RgfxPoolGive>() == 40);
-    assert!(size_of::<RgfxPoolBlock>() == 40);
+    assert!(size_of::<RgfxPoolBlock>() == 48);
     assert!(size_of::<RgfxVtMessage>() == RGFX_VT_MESSAGE_RUNS_OFFSET as usize);
     assert!(size_of::<RgfxVtSurface>() == 88);
     assert!(size_of::<RgfxVtSurfacePlane>() == 24);
@@ -2843,6 +2858,9 @@ pub struct RgfxPoolBlock {
     pub pool_offset: u64,
     /// The block's length; 0 unless OK.
     pub length: u64,
+    /// The GPU address of the block's first byte, never 0, where the guest took
+    /// [`RGFX_FEATURE_POOL_ADDRESSES`] and the status is OK; otherwise 0.
+    pub gpu_address: u64,
 }
 
 /// `HEAP_CREATE`: a device heap of `size_bytes` at the guest-picked

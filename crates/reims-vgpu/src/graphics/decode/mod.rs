@@ -2726,6 +2726,16 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.named(obj_id)
     }
 
+    /// The GPU address of the buffer or heap `obj_id` names (for the tests).
+    #[cfg(all(test, not(windows)))]
+    pub(crate) fn gpu_address_of(&self, obj_id: u64) -> Option<u64> {
+        match self.object(obj_id)? {
+            ObjHandle::Buffer(buffer) => Some(buffer.gpu_address()),
+            ObjHandle::Heap(heap) => Some(heap.gpu_address()),
+            _ => None,
+        }
+    }
+
     /// The ids of the objects the tables hold, by context, each in its table's order (for the
     /// tests).
     #[cfg(test)]

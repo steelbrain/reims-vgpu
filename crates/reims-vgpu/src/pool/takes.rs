@@ -34,6 +34,14 @@
 //! A piece holds its first carve from its use ([`State::use_piece`]) and is empty again once its
 //! last carve is freed ([`State::empty_piece`]): the pool's headroom and release rules (the
 //! module doc) then run on the takes alone.
+//!
+//! # Its GPU address
+//!
+//! Each carve has a GPU address from its carving, which its take's answer gives the guest
+//! (`POOL_ADDRESSES`): where its piece's block has one (metal2vulkan-rt's), the block's address
+//! at the carve's offset in it, so a heap the guest places there is a range of the block; where it
+//! has none (`HostBlocks`), the host's pick ([`super::addresses`]), freed with the carve. A carve
+//! with no room left for its pick is not carved, as one with no room in a piece.
 
 use std::collections::VecDeque;
 use std::ptr::NonNull;
@@ -72,6 +80,25 @@ pub(super) struct Carve {
     len: u64,
     serial: u64,
     state: Carving,
+    /// The GPU address of its first byte (the module doc's "Its GPU address").
+    gpu_address: GpuAddress,
+}
+
+/// Where a carve's GPU address comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuAddress {
+    /// Its piece's block's address, at the carve's offset in it.
+    OfBlock(u64),
+    /// The host's pick, freed with the carve ([`super::addresses`]).
+    Picked(u64),
+}
+
+impl GpuAddress {
+    fn get(self) -> u64 {
+        match self {
+            GpuAddress::OfBlock(a) | GpuAddress::Picked(a) => a,
+        }
+    }
 }
 
 /// What came of a give ([`PoolLedger::give`]).
@@ -92,10 +119,21 @@ pub(crate) struct CarveRef {
     serial: u64,
 }
 
-/// A take's answer: the block's offset in the pool and its length, or `None` where the pool has
-/// no room for it. Called once, from the take's worker, with no lock of the pool's held; never for
-/// a take that ended unanswered.
-pub(crate) type TakeAnswer = Box<dyn FnOnce(Option<(u64, u64)>) + Send>;
+/// A take's answer: the block ([`Taken`]), or `None` where the pool has no room for it. Called
+/// once, from the take's worker, with no lock of the pool's held; never for a take that ended
+/// unanswered.
+pub(crate) type TakeAnswer = Box<dyn FnOnce(Option<Taken>) + Send>;
+
+/// A block a take gave its context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Taken {
+    /// Its offset in the pool.
+    pub(crate) offset: u64,
+    /// Its length.
+    pub(crate) length: u64,
+    /// The GPU address of its first byte, never 0 (the module doc's "Its GPU address").
+    pub(crate) gpu_address: u64,
+}
 
 /// A take waiting for its context's worker.
 struct Job {
@@ -385,6 +423,12 @@ impl PoolLedger {
         let bytes = st.carves.values().map(|c| c.len).sum();
         (st.carves.len(), bytes)
     }
+
+    /// The GPU addresses the host picked and has not freed (for the tests).
+    #[cfg(test)]
+    pub(crate) fn picked(&self) -> usize {
+        self.shared.state.lock().addresses.held()
+    }
 }
 
 impl State {
@@ -408,7 +452,13 @@ impl State {
         if self.carves.get(&at).is_none_or(|c| c.serial != serial) {
             return;
         }
-        self.carves.remove(&at);
+        if let Some(Carve {
+            gpu_address: GpuAddress::Picked(address),
+            ..
+        }) = self.carves.remove(&at)
+        {
+            self.addresses.free(address);
+        }
         let Some((&start, p)) = self.pieces.range_mut(..=at).next_back() else {
             return;
         };
@@ -436,6 +486,12 @@ impl State {
                 (at.checked_add(len)? <= end).then_some((start, at))
             });
         let (start, at) = at?;
+        let block = self.pieces.get(&start)?.block.gpu_address;
+        let gpu_address = if block != 0 {
+            GpuAddress::OfBlock(block.checked_add(at.checked_sub(start)?)?)
+        } else {
+            GpuAddress::Picked(self.addresses.pick(len)?)
+        };
         let serial = self.next_serial();
         self.carves.insert(
             at,
@@ -444,6 +500,7 @@ impl State {
                 len,
                 serial,
                 state: Carving::Taking,
+                gpu_address,
             },
         );
         let p = self.pieces.get_mut(&start)?;
@@ -552,8 +609,12 @@ impl Shared {
                 && c.serial == serial
             {
                 c.state = Carving::Held;
-                let offset = at.saturating_sub(self.range.physical_address);
-                MutexGuard::unlocked(&mut st, || (job.answer)(Some((offset, job.len))));
+                let taken = Taken {
+                    offset: at.saturating_sub(self.range.physical_address),
+                    length: job.len,
+                    gpu_address: c.gpu_address.get(),
+                };
+                MutexGuard::unlocked(&mut st, || (job.answer)(Some(taken)));
             } else {
                 let now = (self.now)();
                 st.uncarve(at, serial, now);

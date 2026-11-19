@@ -1620,6 +1620,17 @@
 // it never sets it, and a host that does not offer it never sees it.
 #define RGFX_FEATURE_SURFACE_REFILL 288230376151711744
 
+// `FEATURES_HI` bit 27, feature bit 59, `POOL_ADDRESSES`: the host gives each block of the Shared
+// pool its GPU address. Where the guest took it beside [`RGFX_FEATURE_POOL`], a `POOL_TAKE`'s
+// answer ([`RgfxPoolBlock`]) carries the GPU address of the block's first byte, and the guest
+// places the heaps it makes over the block ([`RGFX_CMD_HEAP_OVER_POOL`]) at that address plus
+// their spans' offsets, rather than at addresses it picks in its context's range
+// ([`RGFX_CONTEXT_VA_BASE`]). On metal2vulkan-rt's device the address is the block's Vulkan
+// device address; on the Vulkan platform before it, an address the host picks in
+// `[2^45, 2^46)`, below every context's range, and pins the heaps there. Every host with a pool
+// offers it; the x86-64 kext takes it.
+#define RGFX_FEATURE_POOL_ADDRESSES 576460752303423488
+
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 #define RGFX_REG_STATUS 16
@@ -1761,7 +1772,9 @@
 // model of Metal's layout places the host's unpinned buffers and textures lowest first from
 // 2^40, each as far as its live ranges reach, which the host's memory bounds far below 2^46. A
 // guest's pin meets only the guest's own ranges then. The host takes each range as given: it
-// knows no context's range, only that the guest's lie here.
+// knows no context's range, only that the guest's lie here. The addresses the host gives the
+// Shared pool's blocks on that platform ([`RGFX_FEATURE_POOL_ADDRESSES`]) lie below them, in
+// `[2^45, 2^46)`.
 #define RGFX_CONTEXT_VA_BASE 70368744177664
 
 // Where the guest's GPU addresses end: 2^47, the Metal address space's end.
@@ -2306,7 +2319,9 @@
 // of a pool block the sender's context holds ([`RGFX_CMD_POOL_TAKE`]), at that offset, as
 // [`RGFX_CMD_HEAP_OVER_HOST_MEMORY`] makes one over a region block. The heap holds the block:
 // the block's `POOL_GIVE` is refused while the heap lives. A span that does not lie in one block
-// of the sender's makes nothing, as an unknown id does. Not answered.
+// of the sender's makes nothing, as an unknown id does. Its `gpu_address` is where the heap lies:
+// where the guest took [`RGFX_FEATURE_POOL_ADDRESSES`], the block's GPU address as its take's
+// answer gave it plus the span's offset in the block, else the guest's own pick. Not answered.
 #define RGFX_CMD_HEAP_OVER_POOL 572
 
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
@@ -2631,7 +2646,8 @@
 
 // Event `POOL_BLOCK` ([`RgfxPoolBlock`], on the control completion ring), with a
 // [`RGFX_CMD_POOL_TAKE`]'s `seqno`: its answer. `status` [`RGFX_STATUS_OK`] with the block's
-// `pool_offset` and `length`; otherwise both 0.
+// `pool_offset` and `length`, and, where the guest took [`RGFX_FEATURE_POOL_ADDRESSES`], its
+// `gpu_address`; otherwise each 0.
 #define RGFX_EVT_POOL_BLOCK 1040
 
 // A command buffer's status in [`RgfxCbComplete`]: finished with no error.
@@ -6988,6 +7004,9 @@ typedef struct {
   uint64_t pool_offset;
   // The block's length; 0 unless OK.
   uint64_t length;
+  // The GPU address of the block's first byte, never 0, where the guest took
+  // [`RGFX_FEATURE_POOL_ADDRESSES`] and the status is OK; otherwise 0.
+  uint64_t gpu_address;
 } RgfxPoolBlock;
 
 // `POOL_GIVE`: context `context` gives back its pool block of `length` bytes at `pool_offset`.

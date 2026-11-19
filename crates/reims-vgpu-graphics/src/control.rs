@@ -202,7 +202,7 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
                         .pool_take(&take, shared.pool_answer(seqno, epoch));
                     None
                 }
-                None => Some(pool_block(seqno, RGFX_STATUS_INVALID_ARGUMENT, 0, 0)),
+                None => Some(pool_block(seqno, RGFX_STATUS_INVALID_ARGUMENT, 0, 0, 0)),
             }
         }
         RGFX_CMD_POOL_GIVE if shared.driver_took(RGFX_FEATURE_POOL) => {
@@ -271,7 +271,13 @@ fn read_at<T: FromBytes>(message: &Message, offset: u32) -> Option<T> {
 }
 
 /// A `POOL_BLOCK` for `POOL_TAKE` `seqno`.
-pub(crate) fn pool_block(seqno: u64, status: u32, pool_offset: u64, length: u64) -> Vec<u8> {
+pub(crate) fn pool_block(
+    seqno: u64,
+    status: u32,
+    pool_offset: u64,
+    length: u64,
+    gpu_address: u64,
+) -> Vec<u8> {
     sized(&RgfxPoolBlock {
         header: RgfxMsgHeader {
             r#type: RGFX_EVT_POOL_BLOCK,
@@ -282,6 +288,7 @@ pub(crate) fn pool_block(seqno: u64, status: u32, pool_offset: u64, length: u64)
         reserved_14: 0,
         pool_offset,
         length,
+        gpu_address,
     })
 }
 

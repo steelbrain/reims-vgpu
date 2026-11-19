@@ -5359,14 +5359,19 @@ struct PoolHost {
 impl Host for PoolHost {
     fn raise_interrupt(&self, _vector: u32) {}
     fn features(&self) -> u64 {
-        RGFX_FEATURE_POOL
+        RGFX_FEATURE_POOL | RGFX_FEATURE_POOL_ADDRESSES
     }
     fn pool_range(&self) -> (u64, u64) {
         POOL_RANGE
     }
     fn pool_take(&self, take: &RgfxPoolTake, answer: PoolAnswer) {
         (self.seen.lock()).push((RGFX_CMD_POOL_TAKE, take.context, take.length));
-        answer.answer(RGFX_STATUS_OK, take.length, take.length);
+        answer.answer(
+            RGFX_STATUS_OK,
+            take.length,
+            take.length,
+            POOL_GPU_ADDRESS + take.length,
+        );
     }
     fn pool_give(&self, give: &RgfxPoolGive, answer: CompleteAnswer) {
         (self.seen.lock()).push((RGFX_CMD_POOL_GIVE, give.context, give.pool_offset));
@@ -5377,6 +5382,10 @@ impl Host for PoolHost {
         self.seen.lock().push((header.r#type, 0, 0));
     }
 }
+
+/// Where [`PoolHost`]'s blocks lie in the GPU's address space: a block of `n` bytes at this plus
+/// `n`.
+const POOL_GPU_ADDRESS: u64 = 1 << 45;
 
 /// A `POOL_TAKE` of `length` bytes for `context`.
 fn pool_take(context: u32, length: u64) -> Vec<u8> {
@@ -5441,9 +5450,27 @@ fn the_pool_s_range_reads_only_where_the_driver_took_the_pool() {
     assert_eq!(range(), (0, 0));
 }
 
+/// A `POOL_TAKE`'s `POOL_BLOCK` on `rig`: its status, offset, length and GPU address.
+fn pool_block(rig: &mut Rig, bytes: Vec<u8>) -> (u32, u64, u64, u64) {
+    let seqno = rig.send(bytes);
+    let event = rig.event().expect("a POOL_BLOCK");
+    let block = RgfxPoolBlock::read_from_bytes(&event).unwrap();
+    assert_eq!(
+        (block.header.r#type, block.header.size, block.header.seqno),
+        (RGFX_EVT_POOL_BLOCK, 48, seqno)
+    );
+    (
+        block.status,
+        block.pool_offset,
+        block.length,
+        block.gpu_address,
+    )
+}
+
 /// Where the driver took `POOL`, a `POOL_TAKE` goes to the host, which answers it with a
 /// `POOL_BLOCK` of its seqno, and a `POOL_GIVE` goes to the host, which answers it with a
-/// `COMPLETE`; a take too short to read is answered `INVALID_ARGUMENT` by the device.
+/// `COMPLETE`; a take too short to read is answered `INVALID_ARGUMENT` by the device. Where the
+/// driver did not take `POOL_ADDRESSES`, the block's GPU address reads 0.
 #[test]
 fn a_pool_take_and_give_go_to_the_host_where_the_driver_took_the_pool() {
     let host = PoolHost::default();
@@ -5453,31 +5480,52 @@ fn a_pool_take_and_give_go_to_the_host_where_the_driver_took_the_pool() {
         (RGFX_FEATURE_POOL >> 32) as u32,
     );
     rig.start();
-    let take = |rig: &mut Rig, bytes: Vec<u8>| {
-        let seqno = rig.send(bytes);
-        let event = rig.event().expect("a POOL_BLOCK");
-        let block = RgfxPoolBlock::read_from_bytes(&event).unwrap();
-        assert_eq!(
-            (block.header.r#type, block.header.size, block.header.seqno),
-            (RGFX_EVT_POOL_BLOCK, 40, seqno)
-        );
-        (block.status, block.pool_offset, block.length)
-    };
     assert_eq!(
-        take(&mut rig, pool_take(5, 0x3_0000)),
-        (RGFX_STATUS_OK, 0x3_0000, 0x3_0000)
+        pool_block(&mut rig, pool_take(5, 0x3_0000)),
+        (RGFX_STATUS_OK, 0x3_0000, 0x3_0000, 0)
     );
     let seqno = rig.send(pool_give(5, 0x3_0000, 0x3_0000));
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     let mut short = pool_take(6, 0x1_0000);
     short.truncate(24);
-    assert_eq!(take(&mut rig, short), (RGFX_STATUS_INVALID_ARGUMENT, 0, 0));
+    assert_eq!(
+        pool_block(&mut rig, short),
+        (RGFX_STATUS_INVALID_ARGUMENT, 0, 0, 0)
+    );
     assert_eq!(
         *host.seen.lock(),
         [
             (RGFX_CMD_POOL_TAKE, 5, 0x3_0000),
             (RGFX_CMD_POOL_GIVE, 5, 0x3_0000)
         ]
+    );
+}
+
+/// Where the driver took `POOL_ADDRESSES` beside `POOL`, a `POOL_BLOCK` carries the GPU address
+/// the host gave the block, and a refused take's reads 0, as its offset and length do.
+#[test]
+fn a_pool_block_carries_its_gpu_address_where_the_driver_took_pool_addresses() {
+    let host = PoolHost::default();
+    let mut rig = Rig::with_host(Box::new(host.clone()));
+    rig.device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_HI.into(),
+        ((RGFX_FEATURE_POOL | RGFX_FEATURE_POOL_ADDRESSES) >> 32) as u32,
+    );
+    rig.start();
+    assert_eq!(
+        pool_block(&mut rig, pool_take(5, 0x3_0000)),
+        (
+            RGFX_STATUS_OK,
+            0x3_0000,
+            0x3_0000,
+            POOL_GPU_ADDRESS + 0x3_0000
+        )
+    );
+    let mut short = pool_take(6, 0x1_0000);
+    short.truncate(24);
+    assert_eq!(
+        pool_block(&mut rig, short),
+        (RGFX_STATUS_INVALID_ARGUMENT, 0, 0, 0)
     );
 }
 

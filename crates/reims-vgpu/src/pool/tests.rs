@@ -516,7 +516,7 @@ fn live_pool(host: &Arc<Host>, delay: Duration) -> (Pool, Arc<HostBlocks>, PoolL
     (pool, blocks, ledger)
 }
 
-type Answers = std::sync::mpsc::Receiver<Option<(u64, u64)>>;
+type Answers = std::sync::mpsc::Receiver<Option<Taken>>;
 
 /// Context `context`'s take of `length` bytes, its answer sent to the receiver returned.
 fn take(ledger: &PoolLedger, context: u32, length: u64) -> Answers {
@@ -529,9 +529,14 @@ fn take(ledger: &PoolLedger, context: u32, length: u64) -> Answers {
 }
 
 /// A take's answer, or the test fails after 10 s.
-fn answer(rx: &Answers) -> Option<(u64, u64)> {
+fn taken(rx: &Answers) -> Option<Taken> {
     rx.recv_timeout(Duration::from_secs(10))
         .expect("the take is answered")
+}
+
+/// A take's answer's offset and length, or the test fails after 10 s.
+fn answer(rx: &Answers) -> Option<(u64, u64)> {
+    taken(rx).map(|t| (t.offset, t.length))
 }
 
 /// Fills the `len` bytes at pool offset `offset` with `byte`, through the piece's mapping.
@@ -586,8 +591,8 @@ fn a_contexts_takes_are_answered_in_its_order_and_share_a_piece_first_fit() {
         .enumerate()
     {
         let tx = tx.clone();
-        let answer: TakeAnswer = Box::new(move |block| {
-            let _ = tx.send((n, block));
+        let answer: TakeAnswer = Box::new(move |block: Option<Taken>| {
+            let _ = tx.send((n, block.map(|t| (t.offset, t.length))));
         });
         ledger.take(1, length, answer).unwrap();
     }
@@ -771,4 +776,82 @@ fn the_release_leaves_the_blocks_with_a_live_ledger_until_its_drop() {
     assert!(rx.recv_timeout(Duration::from_secs(1)).is_err());
     drop(ledger);
     assert_eq!(blocks.counts(), (0, 2));
+}
+
+/// A source whose blocks have GPU addresses, as metal2vulkan-rt's do: [`HostBlocks`]' blocks, the
+/// `n`th handed out at `ADDRESSED + n * BLOCK_LEN`.
+struct Addressed {
+    blocks: HostBlocks,
+    handed: Mutex<u64>,
+}
+
+const ADDRESSED: u64 = 0x7_0000_0000;
+
+impl BlockSource for Addressed {
+    fn take_block(&self, class: MemoryClass, len: u64) -> Result<BlockInfo, BlockError> {
+        let mut block = self.blocks.take_block(class, len)?;
+        let mut handed = self.handed.lock();
+        block.gpu_address = ADDRESSED + *handed * BLOCK_LEN;
+        *handed += 1;
+        Ok(block)
+    }
+
+    fn release_block(&self, block: BlockId) -> Result<(), BlockError> {
+        self.blocks.release_block(block)
+    }
+}
+
+/// On a source whose blocks have no GPU address, the host picks each block's from 2^45 up, next
+/// fit, each holding its pages and a guard page on the 32 KiB granule, and a freed block's
+/// address is not picked again before the picks wrap
+#[test]
+fn a_block_of_a_source_with_no_addresses_takes_the_hosts_next_pick() {
+    let host = Arc::new(Host::default());
+    let (_pool, _blocks, ledger) = live_pool(&host, LONG);
+    let first = taken(&take(&ledger, 1, 100 << 10)).unwrap();
+    assert_eq!((first.offset, first.gpu_address), (0, addresses::HOST_BASE));
+    let second = taken(&take(&ledger, 2, TAKE_ALIGN)).unwrap();
+    assert_eq!(second.offset, 2 * TAKE_ALIGN);
+    assert_eq!(second.gpu_address, addresses::HOST_BASE + 0x2_8000);
+    let Give::Given(carve) = ledger.give(1, 0, 2 * TAKE_ALIGN, |_, _| false) else {
+        panic!("not given");
+    };
+    ledger.free(&[carve]);
+    // The freed first block's bytes are carved again, at the next pick's address.
+    let third = taken(&take(&ledger, 3, TAKE_ALIGN)).unwrap();
+    assert_eq!(third.offset, 0);
+    assert_eq!(third.gpu_address, addresses::HOST_BASE + 0x2_8000 + 0x1_8000);
+    // A reset frees every pick with its carve.
+    ledger.reset();
+    assert_eq!(ledger.picked(), 0);
+}
+
+/// On a source whose blocks have GPU addresses, a block's address is its piece's block's at the
+/// block's offset in the piece, so the guest's heap over it is a range of the source's block
+#[test]
+fn a_block_of_a_source_with_addresses_lies_at_its_offset_in_its_piece_s_block() {
+    let host = Arc::new(Host::default());
+    let source = Arc::new(Addressed {
+        blocks: HostBlocks::new(),
+        handed: Mutex::new(0),
+    });
+    let pool = Pool::with_delay(range(64), host.pool_host(), LONG, now(), source).unwrap();
+    pool.grow(BLOCK_LEN);
+    host.wait_for(1);
+    pool.added(BASE).unwrap();
+    let ledger = pool.ledger();
+    let first = taken(&take(&ledger, 1, TAKE_ALIGN)).unwrap();
+    assert_eq!((first.offset, first.gpu_address), (0, ADDRESSED));
+    let second = taken(&take(&ledger, 1, 3 * TAKE_ALIGN)).unwrap();
+    assert_eq!(second.offset, TAKE_ALIGN);
+    assert_eq!(second.gpu_address, ADDRESSED + TAKE_ALIGN);
+    // The rest of the first piece, then the headroom piece, the second block handed out.
+    let rest = BLOCK_LEN - 4 * TAKE_ALIGN;
+    assert_eq!(answer(&take(&ledger, 1, rest)), Some((4 * TAKE_ALIGN, rest)));
+    host.wait_for(2);
+    pool.added(BASE + BLOCK_LEN).unwrap();
+    let next = taken(&take(&ledger, 2, TAKE_ALIGN)).unwrap();
+    assert_eq!(next.offset, BLOCK_LEN);
+    assert_eq!(next.gpu_address, ADDRESSED + BLOCK_LEN);
+    assert_eq!(ledger.picked(), 0);
 }

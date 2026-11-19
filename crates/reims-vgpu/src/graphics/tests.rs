@@ -14006,19 +14006,24 @@ fn heap_over_pool(obj_id: u64, offset: u64, size_bytes: u64) -> Vec<u8> {
     .to_vec()
 }
 
-/// A take's `POOL_BLOCK`: its status, offset and length.
+/// A take's `POOL_BLOCK`: its status, offset, length and GPU address.
 #[cfg(not(windows))]
-fn pool_block(guest: &mut Guest) -> (u32, u64, u64) {
+fn pool_block(guest: &mut Guest) -> (u32, u64, u64, u64) {
     let bytes = next_event(guest, RGFX_EVT_POOL_BLOCK);
     let block = RgfxPoolBlock::read_from_bytes(&bytes).unwrap();
     assert_eq!(block.header.seqno, guest.seqno);
-    (block.status, block.pool_offset, block.length)
+    (
+        block.status,
+        block.pool_offset,
+        block.length,
+        block.gpu_address,
+    )
 }
 
 /// An x86-64 guest that took `POOL` takes a zeroed block of the device's Shared pool once the host
 /// mapped its piece, makes a heap over it, and gives it back only once the heap is gone; a heap
 /// over bytes the context does not hold is made never; and the context's close gives its blocks
-/// back to the pool
+/// back to the pool. It did not take `POOL_ADDRESSES`: its blocks' GPU addresses read 0
 #[cfg(not(windows))]
 #[test]
 fn a_guest_s_pool_block_is_taken_held_by_its_heap_and_given_back() {
@@ -14065,7 +14070,7 @@ fn a_guest_s_pool_block_is_taken_held_by_its_heap_and_given_back() {
     let at = adds.recv_timeout(Duration::from_secs(10)).unwrap();
     assert_eq!(at, BASE);
     device.pool_added(at).unwrap();
-    assert_eq!(pool_block(&mut guest), (RGFX_STATUS_OK, 0, 0x2_0000));
+    assert_eq!(pool_block(&mut guest), (RGFX_STATUS_OK, 0, 0x2_0000, 0));
     // A heap over another's bytes, or past the block, is made never; one inside it is.
     guest.send(&device, heap_over_pool(obj(2, 1), 0, 0x1_0000));
     guest.send(&device, heap_over_pool(obj(1, 2), 0x1_0000, 0x2_0000));
@@ -14082,9 +14087,12 @@ fn a_guest_s_pool_block_is_taken_held_by_its_heap_and_given_back() {
     assert_eq!(status, RGFX_STATUS_NOT_FOUND);
     // The context's close gives back the blocks it held, its heaps' among them.
     guest.send(&device, pool_take(1, 0x1_0000));
-    assert_eq!(pool_block(&mut guest), (RGFX_STATUS_OK, 0, 0x1_0000));
+    assert_eq!(pool_block(&mut guest), (RGFX_STATUS_OK, 0, 0x1_0000, 0));
     guest.send(&device, pool_take(1, 0x1_0000));
-    assert_eq!(pool_block(&mut guest), (RGFX_STATUS_OK, 0x1_0000, 0x1_0000));
+    assert_eq!(
+        pool_block(&mut guest),
+        (RGFX_STATUS_OK, 0x1_0000, 0x1_0000, 0)
+    );
     guest.send(&device, heap_over_pool(obj(1, 3), 0x1_0000, 0x1_0000));
     assert_eq!(ledger.counts(), (2, 0x2_0000));
     let status = answered(&device, &mut guest, context_close(1));
@@ -14121,4 +14129,55 @@ fn an_arm64_guest_is_offered_no_pool() {
     assert_eq!(pool_of(GuestArch::X86_64), (!cfg!(windows), !cfg!(windows)));
     let raised = Arc::new(AtomicU32::new(0));
     assert!(headless(&raised).control.shared_pool.is_none());
+}
+
+/// An x86-64 guest that took `POOL_ADDRESSES` beside `POOL` is answered each block's GPU address:
+/// on a platform whose pool blocks have none, the host's picks from 2^45 up, each block's span
+/// its pages and a guard page on the 32 KiB granule; a heap over the block at that address is
+/// pinned there
+#[cfg(not(windows))]
+#[test]
+fn a_guest_that_took_pool_addresses_is_answered_each_block_s_gpu_address() {
+    const BASE: u64 = 52 << 30;
+    let (added, adds) = std::sync::mpsc::channel();
+    let added = Mutex::new(added);
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: Some(Arc::new(|_| {})),
+            pool_add: Some(Arc::new(move |at, _, _| {
+                let _ = added.lock().send(at);
+            })),
+            pool_remove: Some(Arc::new(|_, _| {})),
+            ..GraphicsCallbacks::default()
+        },
+        pool: Some(PoolConfig {
+            physical_address: BASE,
+            physical_length: 4 << 30,
+        }),
+        guest_arch: GuestArch::X86_64,
+        ..GraphicsConfig::default()
+    };
+    let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+    let offered = (u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32)
+        | u64::from(device.mmio_read(RGFX_REG_FEATURES_LO.into()));
+    let wanted = RGFX_FEATURE_POOL | RGFX_FEATURE_POOL_ADDRESSES;
+    assert_eq!(offered & wanted, wanted);
+    device.mmio_write(RGFX_REG_DRIVER_FEATURES_HI.into(), (wanted >> 32) as u32);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    guest.send(&device, pool_take(1, 0x1_8000));
+    let at = adds.recv_timeout(Duration::from_secs(10)).unwrap();
+    device.pool_added(at).unwrap();
+    let first = crate::pool::HOST_BASE;
+    assert_eq!(pool_block(&mut guest), (RGFX_STATUS_OK, 0, 0x2_0000, first));
+    guest.send(&device, pool_take(2, 0x1_0000));
+    assert_eq!(
+        pool_block(&mut guest),
+        (RGFX_STATUS_OK, 0x2_0000, 0x1_0000, first + 0x2_8000)
+    );
+    let mut heap = heap_over_pool(obj(1, 1), 0, 0x2_0000);
+    heap[24..32].copy_from_slice(&first.to_le_bytes());
+    guest.send(&device, heap);
+    assert_eq!(device.decoder_object_count(), 1);
+    assert_eq!(device.decoder_gpu_address(obj(1, 1)), Some(first));
 }
