@@ -5848,7 +5848,12 @@ committed in. The bundle names the order instead, as it posts each buffer:
   writers' end, as a bundle without readers did.
 - A slot names a buffer only while it runs: once the host has finished it, and
   its post has named it, its process empties the slot where no later buffer of
-  the queue raised it, as a buffer that named it would wait for nothing. Four
+  the queue raised it, as a buffer that named it would wait for nothing. A
+  buffer of a video decode alone into device caches, which the host completes
+  as the decode is done, ahead of its copy into the caches (docs/video/devices.md),
+  leaves its slot then, and the host itself has every later buffer of another
+  queue that uses the surface, every download and every present wait for its
+  end, as they would for a slot that named it. Four
   slots of each record are shared by every process's queues. A queue that finds
   none free takes one of its process's that names a buffer of another of its
   queues which its own buffer runs after, its post having named that buffer:

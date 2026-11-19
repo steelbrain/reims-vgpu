@@ -143,6 +143,15 @@ command buffer of the session's process (`graphics/decode/video.rs`):
 - **The command buffer's later work, and its completion, wait** for the session's event to
   reach the value the decode signals once its picture has landed. So a CPU lock of the output
   waits for the picture, as for any GPU write.
+- **A command buffer of a decode alone into device caches completes at the decode**, where the
+  VA-API arm copies the picture into the caches by its video processing on the GPU: its
+  `CB_COMPLETE` goes as the decode is done and that copy is issued, in its queue's order, with
+  GPU times of 0, so the guest's decoder hands the picture on while the copy runs. The rest stays
+  at the buffer's end, after the copy: its later work, its surface timeline and the caches' copy
+  into the pages. Every reader of the output that the guest's writer slots, emptied at the
+  `CB_COMPLETE`, no longer point at the decode waits for that end all the same: a command buffer
+  of another queue that uses the output, on the GPU, or on the CPU for a decode; a CPU lock's
+  download; and a present (reims-vgpu's `graphics/decode/video.rs`, "Completed at the decode").
 - **A picture that fails to land** still signals its value, and the command buffer completes
   failed, with Metal's internal error. The guest's video driver answers that as a decode error:
   an HEVC picture's schedule waits for its verdict and fails (`kVTVideoDecoderMalfunctionErr`,

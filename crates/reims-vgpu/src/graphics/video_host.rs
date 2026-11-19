@@ -286,6 +286,9 @@ pub(crate) struct Landing<'a, P: Platform> {
     cpu_from: Option<MonoTime>,
     /// How long [`Landing::copy_rows`]'s copy took.
     cpu_took: Option<Duration>,
+    /// Whether the picture landed, for the command buffer that waits for it, which its decode's
+    /// end may complete ([`Landing::decode_done`]).
+    landed: &'a Arc<Landed>,
 }
 
 /// Where the planes in a device cache are staged in the staging buffer: each one's first byte.
@@ -296,6 +299,17 @@ struct Staged {
 }
 
 impl<P: Platform> Landing<'_, P> {
+    /// Says that the picture's decode is done, and what is left of its landing is GPU work into
+    /// the output's device caches, which every reader of the output waits for: where both planes
+    /// lie in caches, the command buffer that waits for the picture may post its completion now
+    /// ([`Landed::decoded`]; `super::decode`'s video module docs, "Completed at the decode"). Said
+    /// by the VA-API arm's video processing into the caches (`super::vaapi`).
+    pub(crate) fn decode_done(&self) {
+        if self.luma.cached && self.chroma.cached {
+            self.landed.decoded();
+        }
+    }
+
     /// Says that the hardware decoded the picture straight into the output's planes, so that
     /// nothing was copied (`super::vaapi`).
     pub(crate) fn decoded_there(&mut self) {
@@ -1058,7 +1072,7 @@ fn land_pictures<P: Platform>(
             _bitstream,
             landed,
         } = job;
-        match picture.map(|picture| land(picture, &output, &mut stage, clock)) {
+        match picture.map(|picture| land(picture, &output, &mut stage, clock, &landed)) {
             None => counts.lock().skipped += 1,
             Some(Ok((way, hardware_failed, cpu))) => {
                 let mut counts = counts.lock();
@@ -1116,11 +1130,13 @@ fn land_pictures<P: Platform>(
 /// how, what the hardware answered where it failed the decode and the picture landed all the
 /// same ([`Landing::hardware_failed`]), and how long the CPU's copy took where the CPU copied it
 /// (from its start to the end of [`Landing::copy_rows`], or to the picture's landing's return).
+/// `landed` is told where the decode is done before the landing ends ([`Landing::decode_done`]).
 fn land<P: Platform>(
     picture: Box<dyn HostPicture<P>>,
     output: &DecodeOutput<P>,
     stage: &mut Stage<P>,
     clock: &dyn Runtime,
+    landed: &Arc<Landed>,
 ) -> Result<(Way, Option<String>, Option<Duration>), BackendError> {
     let mut landing = Landing {
         luma: &output.luma,
@@ -1133,6 +1149,7 @@ fn land<P: Platform>(
         hardware_failed: None,
         cpu_from: None,
         cpu_took: None,
+        landed,
     };
     picture.land(&mut landing)?;
     let cpu = match (landing.cpu_took, landing.cpu_from) {

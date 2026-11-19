@@ -161,6 +161,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use super::super::completion::{cb_complete, cb_failed, cb_unlanded};
 use super::commit_order::Until;
+use super::completions::{CompletionTurn, Completions, Post};
 use super::helpers::{Hand, Slots};
 use super::lane::{Lane, Turn};
 use super::sequencer::Ticket;
@@ -168,11 +169,12 @@ use super::shares::FanOut;
 use super::split::{Estimate, PACE_WAIT_MOST, Parts, Progress, QueueRate, SplitHold};
 use super::surface_cache::shapes::ShapeRef;
 use super::surface_cache::{Reach, Uses};
-use super::surface_order::{Marks, Signalled};
+use super::surface_order::{AheadEntry, Marks, Signalled};
 use super::tables::{FOUND_A_HOLD, QueueCounts};
 use super::{
-    DecodeError, Decoders, Drain, GraphicsDecoder, ObjHandle, ScheduledSink, SignalSink,
-    SubmittedSink, blit, compute, context_of, op_fault, read, refused, refusing, render, video,
+    DecodeError, Decoders, Drain, FinishedSink, GraphicsDecoder, ObjHandle, ScheduledSink,
+    SignalSink, SubmittedSink, Then, blit, compute, context_of, op_fault, read, refused, refusing,
+    render, video,
 };
 
 /// The op stream runs under a live raise handler (the ring loop's), so an encode's
@@ -893,6 +895,78 @@ pub(crate) struct Begun<P: Platform> {
     /// It holds a video encoder, so it is walked in its turn: its session's work starts as it is
     /// walked, and so in its queue's order.
     ordered: bool,
+    /// Its queue's turns of their completion posts ([`super::completions`]).
+    completions: Arc<Completions>,
+    /// The blocks of its decode's output, where it is a decode alone that may post its completion
+    /// at its decode ([`ahead_at_decode`]).
+    ahead: Option<Vec<u64>>,
+}
+
+/// A command buffer's turn of its completion post, taken by the first of its completion handler
+/// and its post at its decode ([`video::Landed`]), which posts its record.
+type TurnCell = Arc<Mutex<Option<CompletionTurn>>>;
+
+/// What a command buffer's completion handler ends besides its record: its turn of its completion
+/// post ([`TurnCell`]), and, where it may post its completion at its decode, its decode's place
+/// among those completed ahead of their ends ([`super::surface_order::CompletedAhead`]) and what
+/// its end tells once that post is on its ring ([`BothDone`], [`super::AheadSinks::finished`]).
+struct Ending<P: Platform> {
+    turn: TurnCell,
+    entry: Option<AheadEntry<P>>,
+    after: Option<(Arc<BothDone>, FinishedSink)>,
+}
+
+impl<P: Platform> Ending<P> {
+    /// The ending of a command buffer whose turn is `turn`, and that holds no decode completed
+    /// ahead.
+    fn of(turn: CompletionTurn) -> Self {
+        Ending {
+            turn: Arc::new(Mutex::new(Some(turn))),
+            entry: None,
+            after: None,
+        }
+    }
+}
+
+/// What runs once both a command buffer's completion posted at its decode is on its ring and its
+/// platform end has come, run by the later of the two ([`GraphicsDecoder::post_at_decode`]): the
+/// end's notice to what waits for the buffer, and the release of its context's drain, each after
+/// the record, as for a buffer whose handler posts it.
+#[derive(Default)]
+struct BothDone(Mutex<Option<Option<Then>>>);
+
+impl BothDone {
+    /// One of the two came, with what it runs (`None` for the post): runs it and the other's,
+    /// where the other came first.
+    fn came(&self, then: Option<Then>) {
+        let first = {
+            let mut state = self.0.lock();
+            match state.take() {
+                Some(first) => first,
+                None => {
+                    *state = Some(then);
+                    return;
+                }
+            }
+        };
+        for then in [first, then].into_iter().flatten() {
+            then();
+        }
+    }
+}
+
+/// Whether the op stream `take` read may post its completion at its decode, ahead of its platform
+/// end ([`video::Landed`]; the module docs of [`video`], "Completed at the decode"): a decode alone,
+/// no other video op, no render, compute or blit work, and no event's wait or signal, so nothing
+/// but the decode's picture is the guest's at its end.
+fn ahead_at_decode(take: &Take) -> Option<(u64, u64)> {
+    let alone = take.video
+        && !take.work
+        && !take.waits
+        && !take.signals
+        && take.video_ops == 1
+        && take.decodes.len() == 1;
+    alone.then(|| take.decodes[0])
 }
 
 impl<P: Platform> Begun<P> {
@@ -1107,6 +1181,8 @@ struct Take {
     uses: Vec<RgfxOpSurfaceUse>,
     /// The stream holds a `WAIT_EVENT`, of an event the host holds or not.
     waits: bool,
+    /// The stream holds a `SIGNAL_EVENT`.
+    signals: bool,
     /// The stream holds a `SUBMITTED`.
     asks: bool,
     /// The buffers of other queues its first `SURFACE_ORDER` names, where it holds one.
@@ -1124,6 +1200,8 @@ struct Take {
     predicates: bool,
     /// The luma and chroma textures of each of its decodes, in stream order.
     decodes: Vec<(u64, u64)>,
+    /// How many video ops (decodes and encodes) it holds.
+    video_ops: usize,
     /// The `Managed` buffers its first `UPLOADS_WRITTEN` names, with the bytes the buffer wrote
     /// in each, which its begin brings to their GPU copies ([`GraphicsDecoder::uploads_written`]);
     /// empty where it holds none.
@@ -1160,6 +1238,7 @@ fn take(mut ops: &[u8]) -> Take {
                 }
             }
             RGFX_OP_WAIT_EVENT => out.waits = true,
+            RGFX_OP_SIGNAL_EVENT => out.signals = true,
             RGFX_OP_SUBMITTED => out.asks = true,
             RGFX_OP_SURFACE_ORDER if out.order.is_none() => {
                 let body = &ops[RGFX_OP_BODY_OFFSET as usize..len];
@@ -1200,6 +1279,7 @@ fn take(mut ops: &[u8]) -> Take {
                 RGFX_OP_GROUP_VIDEO => {
                     let body = &ops[RGFX_OP_BODY_OFFSET as usize..len];
                     out.decodes.extend(video::decode_textures(tag, body));
+                    out.video_ops += 1;
                 }
                 _ => {}
             },
@@ -1885,25 +1965,38 @@ impl<P: Platform> GraphicsDecoder<P> {
         let (fill_waits, follows, uses) =
             (self.surface_caches).before_answering(device, &cb, &take.uses, &reach, answer)?;
         // The buffers of other queues it runs after, on the GPU, kept for the work the host starts
-        // off it (`surface_order`).
-        let order_waits = match &take.order {
-            Some(waits) => {
-                let now = self.shared.platform.clock().now_mono();
+        // off it (`surface_order`): those its op names, and the decodes completed ahead of their
+        // ends whose outputs it uses, which the guest's slots no longer name.
+        let kept = &self.shared.completed_ahead;
+        let order_waits = if take.order.is_some() || (kept.any() && !take.uses.is_empty()) {
+            let now = self.shared.platform.clock().now_mono();
+            let blocks = take.uses.iter().map(|u| u.block_offset);
+            let ahead = kept.waits_for(m.queue_obj_id, blocks, now);
+            if take.order.is_some() || !ahead.is_empty() {
                 (self.shared.surface_order.lock()).before(
                     device,
                     m.queue_obj_id,
                     &cb,
-                    waits,
+                    (take.order.as_deref(), &ahead),
+                    kept,
                     now,
                 )?
+            } else {
+                Vec::new()
             }
-            None => Vec::new(),
+        } else {
+            Vec::new()
         };
         let waits_for_order = !order_waits.is_empty();
         *self.order_waits.borrow_mut() = order_waits;
         // Those GPU waits hold back none of its records, nor its queue ([`Line`]), and nor do the
         // fills of caches made at its begin: only an event's wait, or a deferred copy's, does.
         let (behind, held) = hold(counts, follows || take.waits);
+        // A decode alone over device caches may post its completion at its decode.
+        let ahead = (ahead_at_decode(&take))
+            .filter(|_| uses.is_some() && self.sinks.ahead.is_some())
+            .map(|(luma, chroma)| self.decode_blocks(luma, chroma))
+            .filter(|blocks| !blocks.is_empty());
         let begun = Begun {
             queue_obj_id: m.queue_obj_id,
             queue: (take.video && uses.is_some()).then(|| queue.clone_ref()),
@@ -1925,6 +2018,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             behind,
             drain,
             ordered: take.video,
+            completions: Arc::clone(&counts.completions),
+            ahead,
         };
         // A thread of its process that waits for it to be scheduled may ask for its record from
         // now, where it would have got it here had it asked for its `CB_SUBMITTED`.
@@ -1974,6 +2069,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             behind,
             drain,
             ordered,
+            completions,
+            ahead,
             ..
         } = begun;
         let Some(ops) = read::<RgfxCommandBuffer>(message).and_then(|m| ops_of(message, &m)) else {
@@ -2056,10 +2153,41 @@ impl<P: Platform> GraphicsDecoder<P> {
         // completion makes the buffer's.
         let (parts, split_hold) = split.map_or((None, None), |s| (s.parts, s.hold));
         // After the buffers of its queue taken before it ([`super::lane`]): its signal of its
-        // queue's surface timeline is decided in its ring's order ([`Self::order_signal`]).
+        // queue's surface timeline is decided in its ring's order ([`Self::order_signal`]), and
+        // its turn of its completion post taken in its commit order.
         self.wait_turn();
-        let signalled = self.order_signal(device, queue_obj_id, &marks, seqno, order, &cb)?;
+        let turn = completions.turn();
+        // A decode alone over device caches posts its completion at its decode where it waits
+        // for nothing and is walked whole: it signals its queue's surface timeline, which the
+        // buffers of other queues that use its output then wait for, as they would for a buffer
+        // they named ([`super::surface_order`], "A decode completed ahead of its end").
+        let ahead = ahead.filter(|_| {
+            held.is_none()
+                && !behind
+                && parts.is_none()
+                && events.signals.0.is_none()
+                && events.waits.is_empty()
+                && events.landings.len() == 1
+        });
+        let names = order || ahead.is_some();
+        let signalled = self.order_signal(device, queue_obj_id, &marks, seqno, names, &cb)?;
         let signal_committed = signalled.as_ref().map(Signalled::committed);
+        let ahead = ahead.filter(|_| signalled.is_some());
+        let landed = ahead.as_ref().and_then(|_| events.landings.first().cloned());
+        let entry = ahead.map(|blocks| {
+            (self.shared.completed_ahead).enter(&self.shared.platform, blocks, queue_obj_id, seqno)
+        });
+        let after = (self.sinks.ahead.as_ref())
+            .filter(|_| landed.is_some())
+            .map(|sinks| (Arc::new(BothDone::default()), Arc::clone(&sinks.finished)));
+        let ending = Ending {
+            turn: Arc::new(Mutex::new(Some(turn))),
+            entry,
+            after,
+        };
+        let at_decode = (ending.after.as_ref()).map(|(both, _)| {
+            self.post_at_decode(cb_obj_id, seqno, (&ending.turn, both), &line, scheduled.clone())
+        });
         // Register the submission and completion paths and commit: no scheduled or completed
         // handler, so the platform posts the buffer's records from the threads that submit it
         // and see it complete, waking no handler thread; and none to submit where its records
@@ -2080,6 +2208,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             drain,
             false,
             (submitted, held.clone(), scheduled),
+            ending,
         );
         let handler = signalling(handler, signalled);
         let handler = completed_with(handler, order_hold.clone());
@@ -2151,9 +2280,55 @@ impl<P: Platform> GraphicsDecoder<P> {
                 line.post_through(&scheduled);
             }
         }
+        // Its completion goes at its decode from now, where it goes there: at once where the
+        // decode is done already.
+        if let (Some(landed), Some(at_decode)) = (landed, at_decode) {
+            landed.arm(at_decode);
+        }
         // cbwalked: queue, seqno: its walk and its last commit are done (`cenc`)
         reims_vgpu_vulkan::core::trace::event("cbwalked", &[queue_obj_id, seqno]);
         Ok(Ok(()))
+    }
+
+    /// The post of command buffer `cb_obj_id`'s completion, at `seqno`, at its decode
+    /// ([`video::Landed::arm`]), where it takes its `turn` before its completion handler: the
+    /// records of its queue's buffers committed up to it that are not yet posted go first, in
+    /// `line`'s order, its own `scheduled` among them, then its `CB_COMPLETE` in its turn, with no
+    /// GPU times (0 for each), and failed where its picture failed already, through the sink of
+    /// such posts ([`super::AheadSinks::post`]), telling `both` once it is on the ring. Its
+    /// completion handler then posts no record ([`Self::completed_handler`]).
+    fn post_at_decode(
+        &self,
+        cb_obj_id: u64,
+        seqno: u64,
+        (turn, both): (&TurnCell, &Arc<BothDone>),
+        line: &Arc<Line>,
+        scheduled: Option<Arc<Scheduled>>,
+    ) -> video::EarlyPost {
+        let turn = Arc::clone(turn);
+        let both = Arc::clone(both);
+        let line = Arc::clone(line);
+        let sink = self.sinks.ahead.as_ref().map(|a| Arc::clone(&a.post));
+        let kept = Arc::clone(&self.shared.completed_ahead);
+        Box::new(move |landed: Arc<video::Landed>| {
+            let Some(turn) = turn.lock().take() else {
+                return;
+            };
+            let failed = landed.post().unwrap_or(false);
+            if let Some(scheduled) = &scheduled {
+                line.post_through(scheduled);
+            }
+            let record = match failed {
+                true => cb_unlanded(cb_obj_id, seqno, 0, 0),
+                false => cb_complete(cb_obj_id, seqno, 0, 0, None),
+            };
+            kept.posted();
+            let post: Post = Box::new(move || match &sink {
+                Some(sink) => sink(record, Box::new(move || both.came(None))),
+                None => both.came(None),
+            });
+            turn.finish(Some(post));
+        })
     }
 
     /// The `CB_SUBMITTED` of command buffer `cb_obj_id`, at `seqno`, where it `asks` for one and
@@ -2258,8 +2433,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             let held = Arc::clone(held);
             cb.add_submission_handler(ON, Box::new(move || held.release()))?;
         }
-        // In its queue's order ([`super::lane`]): its signal, and its commit.
+        // In its queue's order ([`super::lane`]): its signal, its turn of its completion post,
+        // and its commit.
         self.wait_turn();
+        let turn = counts.completions.turn();
         let signalled =
             self.order_signal(device, queue_obj_id, &counts.order, seqno, names, &cb)?;
         let signal_committed = signalled.as_ref().map(Signalled::committed);
@@ -2270,6 +2447,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             drain,
             true,
             (None, held.clone(), None),
+            Ending::of(turn),
         );
         let handler = signalling(handler, signalled);
         cb.add_completion_seen_handler(ON, leaving(handler, in_flight.commits()))?;
@@ -2391,7 +2569,11 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// events to that no notification posted ([`Signals::finish`]), then its completion, which
     /// for a `stand_in` ([`Self::stand_in_for_failed`]) is its failure whatever the stand-in's
     /// outcome, and for a buffer one of whose decodes' pictures did not land is its failure too
-    /// ([`cb_unlanded`]), and lets `drain` (its context's) go.
+    /// ([`cb_unlanded`]), in its turn of its queue's completion posts ([`super::completions`]),
+    /// and lets `drain` (its context's) go. Where its post at its decode took its turn first
+    /// ([`Self::post_at_decode`]), it posts no record; and its decode leaves those completed ahead
+    /// of their ends as it ends (`ending`).
+    #[allow(clippy::too_many_arguments)]
     fn completed_handler(
         &self,
         cb_obj_id: u64,
@@ -2400,6 +2582,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         drain: Option<Arc<Drain>>,
         stand_in: bool,
         (submitted, held, scheduled): Unposted,
+        ending: Ending<P>,
     ) -> CompletedHandler {
         let sink = self.sinks.completion.clone();
         let context = self.context;
@@ -2439,12 +2622,34 @@ impl<P: Platform> GraphicsDecoder<P> {
             // buffer that failed may have signalled them before its fault, and a guest waiting
             // for one would wait for good: each is posted whatever the outcome.
             signals.finish();
+            let Ending { turn, entry, after } = ending;
+            // Posted at its decode: the record is the guest's, or is on its way there in its turn,
+            // and its buffer's work is done now. What waits for its end is told once both are.
+            let Some(turn) = turn.lock().take() else {
+                drop(entry);
+                let both = after.as_ref().map(|(both, _)| Arc::clone(both));
+                let end: Then = Box::new(move || {
+                    if let Some((_, finished)) = &after {
+                        finished(seqno);
+                    }
+                    drop(drain);
+                });
+                match both {
+                    Some(both) => both.came(Some(end)),
+                    None => end(),
+                }
+                return;
+            };
             // The GPU times on the device's clock, the one the guest's kext maps the device's
             // times by; none is 0 for each.
             let (start, end) = info.gpu_times_ns.map(runtime::gpu_times).unwrap_or((0, 0));
+            // Each decode's outcome is fixed as posted here ([`video::Landed::post`]).
+            let unlanded = (landings.iter()).fold(false, |any, landed| {
+                landed.post().unwrap_or_else(|| landed.failed()) | any
+            });
             let record = if stand_in {
                 cb_failed(cb_obj_id, seqno)
-            } else if info.error.is_none() && landings.iter().any(|landed| landed.failed()) {
+            } else if info.error.is_none() && unlanded {
                 cb_unlanded(cb_obj_id, seqno, start, end)
             } else {
                 cb_complete(cb_obj_id, seqno, start, end, info.error.as_ref())
@@ -2461,10 +2666,12 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             // The buffer's work and its completion are done: a drain of its context may end,
             // once the record is on the guest's ring.
-            match &sink {
+            let post: Post = Box::new(move || match &sink {
                 Some(sink) => sink(record, Box::new(move || drop(drain))),
                 None => drop(drain),
-            }
+            });
+            turn.finish(Some(post));
+            drop(entry);
         })
     }
 
@@ -4717,6 +4924,11 @@ mod tests {
         unlanded: std::sync::atomic::AtomicBool,
         /// Each decode answers no picture, as for one the stream's random access skips.
         skipped: std::sync::atomic::AtomicBool,
+        /// Each decode's [`Landed`], which a test tells of the decode done ([`Landed::decoded`]).
+        landings: Mutex<Vec<Arc<Landed>>>,
+        /// Each decode tells of itself done before it answers, as a session whose decode ended
+        /// before its command buffer's commit does.
+        decoded_at_once: std::sync::atomic::AtomicBool,
     }
 
     /// A fake host's video of H.264 and HEVC decode, recording into its [`VideoSeen`]; each of
@@ -4802,6 +5014,10 @@ mod tests {
             if self.seen.unlanded.load(Ordering::Relaxed) {
                 landed.fail();
             }
+            if self.seen.decoded_at_once.load(Ordering::Relaxed) {
+                landed.decoded();
+            }
+            self.seen.landings.lock().push(Arc::clone(&landed));
             Ok(Decoded {
                 value: self.decodes.fetch_add(1, Ordering::Relaxed) as u64 + 1,
                 skipped: self.seen.skipped.load(Ordering::Relaxed),
@@ -5520,6 +5736,312 @@ mod tests {
             .0
     }
 
+    /// The `CB_COMPLETE` records a sink took: each one's buffer, status and GPU times.
+    type Records = Arc<Mutex<Vec<RgfxCbComplete>>>;
+
+    /// Each record's buffer, status and GPU times.
+    fn posted(records: &Records) -> Vec<(u64, u32, u64, u64)> {
+        (records.lock().iter())
+            .map(|r| (r.cb_obj_id, r.status, r.gpu_start_ns, r.gpu_end_ns))
+            .collect()
+    }
+
+    /// [`cached_video_whole`]'s rig with queue 9 too, its `CB_COMPLETE` records taken, and the
+    /// seqnos of the ends told of buffers whose completions went at their decodes
+    /// ([`super::super::AheadSinks::finished`]).
+    fn video_posting() -> (
+        super::super::surface_pages::tests::Rig,
+        Arc<VideoSeen>,
+        Records,
+        Arc<Mutex<Vec<u64>>>,
+    ) {
+        let (mut r, seen) = cached_video_whole();
+        let records = Records::default();
+        let sink = Arc::clone(&records);
+        (r.dec).set_completion_sink(Arc::new(move |record| sink.lock().push(record)));
+        let ends = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&ends);
+        (r.dec).set_finished_sink(Arc::new(move |seqno| sink.lock().push(seqno)));
+        let queue = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 9,
+            ..RgfxQueueCreate::default()
+        };
+        assert_eq!(r.dec.decode(&r.device, queue.as_bytes()).unwrap(), Ok(()));
+        (r, seen, records, ends)
+    }
+
+    /// `message`, a `COMMAND_BUFFER`, on queue `queue`.
+    fn on_queue(mut message: Vec<u8>, queue: u64) -> Vec<u8> {
+        let at = std::mem::offset_of!(RgfxCommandBuffer, queue_obj_id);
+        message[at..at + 8].copy_from_slice(&queue.to_le_bytes());
+        message
+    }
+
+    /// The `COMMAND_BUFFER` `cb_obj_id` at `seqno` on queue 9 of [`video_posting`]'s rig that
+    /// reads its block and holds nothing else.
+    fn reads_cached_video(cb_obj_id: u64, seqno: u64) -> Vec<u8> {
+        use super::super::surface_pages::tests::BLOCK;
+        use reims_vgpu_graphics::ops::{RGFX_OP_SURFACE_USE, RgfxOpSurfaceUse};
+
+        let surface_use = RgfxOpSurfaceUse {
+            block_offset: BLOCK,
+            cpu_gen: 0,
+            flags: 0,
+            reserved_14: 0,
+        };
+        let ops = op(RGFX_OP_SURFACE_USE, surface_use.as_bytes());
+        on_queue(command_buffer_message(cb_obj_id, seqno, &ops), 9)
+    }
+
+    /// Each `encodeSignalEvent:value:` and `encodeWaitForEvent:value:` since `mark`: whether it
+    /// signals, its event's id and its value.
+    fn event_calls(r: &super::super::surface_pages::tests::Rig, mark: u64) -> Vec<(bool, u64, u64)> {
+        (r.p.call_log().since(mark).iter())
+            .filter_map(|c| {
+                let signals = if c.sel == "encodeSignalEvent:value:" {
+                    true
+                } else if c.sel == "encodeWaitForEvent:value:" {
+                    false
+                } else {
+                    return None;
+                };
+                let event = c.args.first().and_then(Arg::as_obj).map_or(0, |o| o.0);
+                Some((signals, event, c.args.get(1).and_then(Arg::as_u64).unwrap_or(0)))
+            })
+            .collect()
+    }
+
+    /// A command buffer of a decode alone into device caches posts its `CB_COMPLETE` as its
+    /// session tells of the decode done, with no GPU times, ahead of its platform end, and posts
+    /// no second record at that end. Everything else moves at the end: its context's drain, its
+    /// place among its queue's buffers in flight, its decode's place among those kept by their
+    /// blocks, and the notice of its end, which the host's presents waiting for it take
+    /// ([`super::super::AheadSinks::finished`]).
+    #[test]
+    fn a_decode_alone_into_caches_completes_at_its_decode_and_ends_at_its_end() {
+        use super::super::surface_pages::tests::BLOCK;
+
+        let (r, seen, records, ends) = video_posting();
+        let in_flight = |r: &super::super::surface_pages::tests::Rig| {
+            let counts = r.dec.queue_counts(1).unwrap();
+            counts.in_flight.load(Ordering::Acquire)
+        };
+        // Walked for context 0, whose drain then holds it.
+        let mut walker = r.dec.sender(Some(0), r.dec.sinks.clone());
+        assert_eq!(
+            walker
+                .decode(&r.device, &writes_cached_video(100, 1, true))
+                .unwrap(),
+            Ok(())
+        );
+        walker.end_message();
+        let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let set = Arc::clone(&drained);
+        drop(r.dec.drain_context(
+            0,
+            false,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+        ));
+        assert!(posted(&records).is_empty(), "the decode is not done");
+        let landed = Arc::clone(&seen.landings.lock()[0]);
+        landed.decoded();
+        assert_eq!(posted(&records), [(100, RGFX_CB_OK, 0, 0)]);
+        assert!(ends.lock().is_empty());
+        assert!(!drained.load(Ordering::SeqCst));
+        assert_eq!(in_flight(&r), 1);
+        assert!(r.dec.shared.completed_ahead.holds(BLOCK));
+        assert_eq!(r.dec.shared.completed_ahead.posts(), 1);
+
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(posted(&records).len(), 1, "no second record");
+        assert_eq!(*ends.lock(), [1]);
+        assert!(drained.load(Ordering::SeqCst));
+        assert_eq!(in_flight(&r), 0);
+        assert!(!r.dec.shared.completed_ahead.holds(BLOCK));
+    }
+
+    /// A completion posted at a decode keeps its queue's order: behind a buffer of the queue
+    /// committed before it whose record its platform end posts, and posted at the buffer's commit
+    /// where its decode was done before it. (The buffer before it holds no op: one that used the
+    /// decode's block would hold the decode's start, on the CPU, until its end.)
+    #[test]
+    fn a_completion_at_a_decode_goes_in_its_queues_order() {
+        let (mut r, seen, records, ends) = video_posting();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &command_buffer_message(100, 1, &[]))
+                .unwrap(),
+            Ok(())
+        );
+        let first = r.p.world().committed();
+        seen.decoded_at_once.store(true, Ordering::Relaxed);
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(101, 2, true))
+                .unwrap(),
+            Ok(())
+        );
+        assert!(posted(&records).is_empty(), "behind buffer 100");
+        assert_eq!(seen.landings.lock().len(), 1);
+        for id in first {
+            r.p.world().complete(id, CommandBufferStatus::COMPLETED, None, CompleteOn::Caller);
+        }
+        assert_eq!(
+            (posted(&records).iter())
+                .map(|&(cb, status, ..)| (cb, status))
+                .collect::<Vec<_>>(),
+            [(100, RGFX_CB_OK), (101, RGFX_CB_OK)]
+        );
+        assert_eq!(posted(&records)[1], (101, RGFX_CB_OK, 0, 0));
+        assert!(ends.lock().is_empty(), "buffer 101's end is to come");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(posted(&records).len(), 2);
+        assert_eq!(*ends.lock(), [2]);
+    }
+
+    /// A buffer of another queue that uses a decode's output, begun after the decode's
+    /// completion went at its decode, which the guest's slots then name no more, waits on the GPU
+    /// for the decode's buffer's end as for a buffer it named: for the value of the decode's
+    /// queue's timeline the decode's buffer signals. Counted as a buffer held; one begun after
+    /// that end waits for nothing.
+    #[test]
+    fn a_reader_of_a_decode_completed_ahead_waits_on_the_gpu_for_its_end() {
+        let (mut r, seen, records, _) = video_posting();
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, true))
+                .unwrap(),
+            Ok(())
+        );
+        let signals: Vec<_> = (event_calls(&r, mark).into_iter())
+            .filter(|&(signals, ..)| signals)
+            .collect();
+        Arc::clone(&seen.landings.lock()[0]).decoded();
+        assert_eq!(posted(&records).len(), 1);
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec.decode(&r.device, &reads_cached_video(200, 1)).unwrap(),
+            Ok(())
+        );
+        let waits = |r: &super::super::surface_pages::tests::Rig, mark| {
+            (event_calls(r, mark).into_iter())
+                .filter(|&(signals, ..)| !signals)
+                .collect::<Vec<_>>()
+        };
+        let waited = waits(&r, mark);
+        assert_eq!(waited.len(), 1, "{waited:?}");
+        let (_, event, value) = waited[0];
+        assert!(
+            signals.contains(&(true, event, value)),
+            "the decode's buffer signals {event} to {value} at its end: {signals:?}"
+        );
+        assert_eq!(r.dec.shared.surface_order.lock().counts().held, 1);
+
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec.decode(&r.device, &reads_cached_video(201, 2)).unwrap(),
+            Ok(())
+        );
+        assert!(waits(&r, mark).is_empty(), "its end has come");
+    }
+
+    /// A video decode of another queue into a decode's output, begun after the decode's
+    /// completion went at its decode, waits on the CPU for the decode's buffer's end before its
+    /// session's work starts, as it would for a buffer it named.
+    #[test]
+    fn a_decode_after_a_decode_completed_ahead_waits_on_the_cpu_for_its_end() {
+        let (mut r, seen, records, _) = video_posting();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, true))
+                .unwrap(),
+            Ok(())
+        );
+        Arc::clone(&seen.landings.lock()[0]).decoded();
+        assert_eq!(posted(&records).len(), 1);
+        let message = on_queue(writes_cached_video(200, 1, true), 9);
+        let mut walker = r.dec.sender(None, super::super::Sinks::default());
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| walker.decode(&r.p.device(), &message).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert_eq!(seen.decodes.lock().len(), 1, "it waits for buffer 100's end");
+            r.p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(walk.join().unwrap(), Ok(()));
+        });
+        assert_eq!(seen.decodes.lock().len(), 2);
+    }
+
+    /// A lock's download of a decode's output asked after the decode's completion went at its
+    /// decode copies the cache out once the decode's buffer has ended: its copy waits on the GPU
+    /// for the value the decode's buffer signals at its end, with no wait of its own added.
+    #[test]
+    fn a_download_after_a_decode_completed_ahead_copies_after_its_end() {
+        use super::super::surface_pages::tests::BLOCK;
+
+        let (mut r, seen, records, _) = video_posting();
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, true))
+                .unwrap(),
+            Ok(())
+        );
+        let signals: Vec<_> = (event_calls(&r, mark).into_iter())
+            .filter(|&(signals, ..)| signals)
+            .collect();
+        Arc::clone(&seen.landings.lock()[0]).decoded();
+        assert_eq!(posted(&records).len(), 1);
+        let mark = r.p.call_log().mark();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let set = Arc::clone(&done);
+        r.dec.surface_download(
+            &r.device,
+            BLOCK,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            super::super::no_raise(),
+        );
+        let waits = event_calls(&r, mark);
+        assert!(
+            (waits.iter()).any(|&(s, event, value)| !s && signals.contains(&(true, event, value))),
+            "the copy waits for the decode's buffer's end: {waits:?} {signals:?}"
+        );
+        assert!(!done.load(Ordering::SeqCst));
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+    }
+
+    /// A present of a decode's output asked after the decode's completion went at its decode,
+    /// whose writers the guest's slots no longer name, waits for the decode's buffer as for a
+    /// writer named: until its end. Counted. (The rig's guest names no writers at all.)
+    #[test]
+    fn a_present_after_a_decode_completed_ahead_waits_for_its_end() {
+        let (mut r, seen, records, _) = video_posting();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, true))
+                .unwrap(),
+            Ok(())
+        );
+        let writers = |r: &super::super::surface_pages::tests::Rig| {
+            (r.dec.surface_present(0x99).unwrap().writers.iter())
+                .map(|w| (w.queue_obj_id, w.seqno))
+                .collect::<Vec<_>>()
+        };
+        Arc::clone(&seen.landings.lock()[0]).decoded();
+        assert_eq!(posted(&records).len(), 1);
+        assert_eq!(writers(&r), [(1, 1)]);
+        assert_eq!(r.dec.shared.completed_ahead.presents_held(), 1);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(writers(&r).is_empty());
+    }
+
     /// A decoder's new output, a command buffer of a decode alone whose textures are the whole of
     /// the surface's two planes, takes no fill of its cache: the cache made as zeros, the decode
     /// waits for those, its picture lands over them, and nothing is copied in from the pages. The
@@ -6068,6 +6590,7 @@ mod tests {
                 None,
                 false,
                 (submitted, None, scheduled),
+                Ending::of(Arc::new(Completions::default()).turn()),
             );
             let submission = submission.unwrap();
             if ran {

@@ -136,8 +136,8 @@ use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::shares::ListenSink;
 use crate::graphics::decode::worker::{Job, Settle, Unsettled, Worker};
 use crate::graphics::decode::{
-    Begun, CompletionSink, DecodeError, Decoders, DrainAnswer, GraphicsDecoder, Joined, LibraryJob,
-    LibraryStart, MadeLibrary, PipelineJob, PipelineReply, ReflectionSink, ScheduledSink,
+    AheadSinks, Begun, CompletionSink, DecodeError, Decoders, DrainAnswer, FinishedSink,
+    GraphicsDecoder, Joined, LibraryJob, LibraryStart, MadeLibrary, PipelineJob, PipelineReply, ReflectionSink, ScheduledSink,
     SignalSink, Sinks, SubmittedSink, SurfacePresent, Then, compile_refusing, complete,
     make_library, refused_reply, refusing,
 };
@@ -2469,12 +2469,26 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let reflection: ReflectionSink = Arc::new(move |reply: PipelineReply| {
             reflection_poster.post(&reply.bytes());
         });
+        // A completion posted at its decode shows no present: one waiting for the buffer is shown
+        // at its end, once its decode's copy is done.
+        let ahead = queue.map(|queue| {
+            let ahead_poster = poster.clone();
+            let post: CompletionSink = Arc::new(move |record: RgfxCbComplete, then: Then| {
+                ahead_poster.post_unwaiting(record.as_bytes(), Some(then));
+            });
+            let (presents, finished_poster) = (Arc::clone(&self.presents), poster.clone());
+            let finished: FinishedSink = Arc::new(move |seqno| {
+                presents.finished(queue, seqno, &finished_poster);
+            });
+            AheadSinks { post, finished }
+        });
         Sinks {
             completion: Some(completion),
             signal: Some(signal),
             scheduled: Some(scheduled),
             submitted: Some(submitted),
             reflection: Some(reflection),
+            ahead,
         }
     }
 
@@ -2482,9 +2496,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// thread ([`Self::begin_command_buffer`]): made at the queue's first buffer, and shared by
     /// each buffer after it whose poster posts as theirs does ([`CompletionPoster::posts_as`]).
     /// What sinks post depends on their poster and the presents alone, so shared ones post what
-    /// new ones would. Made at each begin, they cost the begin five closures and six posters
-    /// (measured: 0.30 us of a buffer's 14.9 us from its take to its begin on an Iris Xe's queue
-    /// thread, in Geekbench 7's Super Resolution), and its lane their release after the walk.
+    /// new ones would. Made at each begin, they would cost the begin seven closures and eight
+    /// posters (measured with five and six: 0.30 us of a buffer's 14.9 us from its take to its
+    /// begin on an Iris Xe's queue thread, in Geekbench 7's Super Resolution), and its lane their
+    /// release after the walk.
     fn queue_sinks(&self, poster: &CompletionPoster) -> Sinks {
         let Some(queue) = poster.queue_obj_id() else {
             return self.sinks(poster);

@@ -128,9 +128,10 @@ const _: () = {
 /// (`reims-vgpu.icb-create-<i>`), a thread that lets go of a closed process's objects and answers
 /// its close (`reims-vgpu.graphics-closes-<i>`), a thread that moves a staged copy of a surface's
 /// device cache into its pages and answers what waited for it
-/// (`reims-vgpu.graphics-into-pages-<i>`), or the platform's thread that runs a command buffer's
-/// scheduled or completed handler; or the host's own, inside
-/// rvg_graphics_device_mmio_write_taking.
+/// (`reims-vgpu.graphics-into-pages-<i>`), a video session's picture landing thread, which posts
+/// a decode's completion as the decode is done (`reims-vgpu.graphics-video-land`), or the
+/// platform's thread that runs a command buffer's scheduled or completed handler; or the host's
+/// own, inside rvg_graphics_device_mmio_write_taking.
 /// Never inside another call of the host's into the library. The library may hold locks of its
 /// own around it (docs/api.md section 5 names them), but none that a function it may call waits
 /// for, directly or through a thread of the library's, so it may call them at once. It may wait

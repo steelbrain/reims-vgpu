@@ -368,6 +368,18 @@ impl Frame {
         target: &GuestTarget<'_>,
         writes: &GuestWrites,
     ) -> Result<DeviceWrite, Error> {
+        self.write_to_guest_telling(target, writes, &mut || {})
+    }
+
+    /// [`Self::write_to_guest`], calling `decoded` once the frame's decode is done and the runs
+    /// that write it are issued behind it, before they are waited for: from then on the write is
+    /// the GPU's work alone. Not called where the decode failed, or the runs were not issued.
+    pub fn write_to_guest_telling(
+        &self,
+        target: &GuestTarget<'_>,
+        writes: &GuestWrites,
+        decoded: &mut dyn FnMut(),
+    ) -> Result<DeviceWrite, Error> {
         let rect = self.rect;
         let (coded_width, coded_height) = self.surface.size();
         let size = (
@@ -375,7 +387,7 @@ impl Frame {
             target.height().min(coded_height.saturating_sub(rect.y)),
         );
         wait::by(&self.deadline, || {
-            super::zero_copy::write(self, target, &writes.0, size)
+            super::zero_copy::write(self, target, &writes.0, size, decoded)
         })
     }
 }

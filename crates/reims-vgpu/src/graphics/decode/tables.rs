@@ -73,6 +73,9 @@ pub(crate) struct QueueCounts {
     /// Its committed command buffers' records the host may post ahead of the platform's
     /// submission, in commit order ([`super::cmdbuf::Line`]).
     pub(crate) line: Arc<super::cmdbuf::Line>,
+    /// Its command buffers' turns of their `CB_COMPLETE` posts, in commit order
+    /// ([`super::completions`]).
+    pub(crate) completions: Arc<super::completions::Completions>,
     /// Where its command buffers' walks and commits run, each in its turn; `None` for a queue
     /// whose buffers are carried out whole where they are taken (the decoder's own tests).
     pub(crate) lane: Option<Arc<Lane>>,
@@ -94,6 +97,7 @@ impl QueueCounts {
             rate: Arc::default(),
             order,
             line: Arc::default(),
+            completions: Arc::default(),
             lane: Some(lane),
             answered: Mutex::default(),
         }

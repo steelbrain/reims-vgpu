@@ -184,12 +184,14 @@ fn declined(why: impl Into<String>) -> DeviceWrite {
 /// the frame did not decode, or the GPU did not finish the frame by its
 /// deadline. The runs are issued before the decode is waited for, so a frame
 /// that did not decode leaves the buffer holding what they copied from its
-/// decode surface.
+/// decode surface. `decoded` is called once the decode is done, the runs
+/// issued and not yet waited for (`Frame::write_to_guest_telling`).
 pub(crate) fn write(
     frame: &Frame,
     target: &GuestTarget<'_>,
     imports: &GuestImports,
     (width, height): (u32, u32),
+    decoded_now: &mut dyn FnMut(),
 ) -> Result<DeviceWrite, Error> {
     let format = frame.surface.format();
     let display = frame.surface.display();
@@ -268,6 +270,9 @@ pub(crate) fn write(
     let mut decoded = Ok(());
     let ran = import.run(frame.surface.id(), x, y, w, deadline, || {
         decoded = frame.surface.sync_by(deadline);
+        if decoded.is_ok() {
+            decoded_now();
+        }
     });
     if let Err(Error::Stalled(_)) = &ran {
         let works = import.works();

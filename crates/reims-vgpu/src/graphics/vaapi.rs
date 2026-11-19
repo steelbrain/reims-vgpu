@@ -1422,19 +1422,21 @@ type SessionCopier<P> = Result<Arc<Mutex<Box<dyn GpuCopier<P>>>>, String>;
 
 impl<P: Platform> VaPicture<P> {
     /// Writes the picture by the driver's video processing into `memory`, laid out as `layout`
-    /// (the VA crate's `Frame::write_to_guest`): `None` once it is there, or why it was not
+    /// (the VA crate's `Frame::write_to_guest_telling`), calling `decoded` once the decode is
+    /// done and the runs are issued behind it: `None` once it is there, or why it was not
     /// written, nothing written. `Err` where the decode or a run failed or ran past its deadline:
     /// no copy may race the GPU's write, so the picture fails.
     fn write_in_place(
         &self,
         layout: &SurfaceLayout,
         memory: &dyn DeviceMemory,
+        decoded: &mut dyn FnMut(),
     ) -> Result<Option<String>, BackendError> {
         let target = match GuestTarget::new(layout, memory) {
             Ok(target) => target,
             Err(why) => return Ok(Some(why)),
         };
-        match self.frame.write_to_guest(&target, &self.imports)? {
+        match (self.frame).write_to_guest_telling(&target, &self.imports, decoded)? {
             DeviceWrite::Written => Ok(None),
             DeviceWrite::Declined(why) => Ok(Some(why)),
         }
@@ -1480,11 +1482,14 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
         let declined = match &self.targets {
             // In its device cache, through the cache's memory as a dma-buf, where the video
             // decodes into caches: the driver's check refused the picture's codec and format, or
-            // its planes do not lie as a decode's target must.
+            // its planes do not lie as a decode's target must. Once its decode is done, what is
+            // left is the runs' GPU work into the caches, which the output's readers wait for.
             #[cfg(unix)]
             Some(targets) if to.luma.cached || to.chroma.cached => {
                 match targets.in_cache(to.luma, to.chroma, bit_depth) {
-                    Ok((layout, bytes)) => match self.write_in_place(&layout, &bytes)? {
+                    Ok((layout, bytes)) => match self.write_in_place(&layout, &bytes, &mut || {
+                        to.decode_done()
+                    })? {
                         None => {
                             to.luma.external_write_done()?;
                             return Ok(());
@@ -1495,7 +1500,7 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
                 }
             }
             _ => match in_place(to.luma, to.chroma, bit_depth) {
-                Ok((layout, pages)) => match self.write_in_place(&layout, &*pages.memory)? {
+                Ok((layout, pages)) => match self.write_in_place(&layout, &*pages.memory, &mut || {})? {
                     None => return Ok(()),
                     Some(why) => why,
                 },

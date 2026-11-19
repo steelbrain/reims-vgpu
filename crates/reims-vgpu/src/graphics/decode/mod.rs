@@ -71,6 +71,11 @@
 //! - `surface_order` ([`surface_order::SurfaceOrder`]), the queues' surface timelines: a leaf,
 //!   taken under no other lock and holding none, by a command buffer that holds `SURFACE_ORDER`
 //!   (or is waited for) while its waits and its signal are encoded, and at a queue's make and end.
+//! - `completed_ahead` ([`surface_order::CompletedAhead`]), the decodes completed ahead of their
+//!   ends, by block: a leaf, taken alone where a decode's command buffer enters it and leaves it,
+//!   and by a command buffer that uses a block, before its waits are encoded, where it holds any.
+//! - each queue's completion turns ([`completions::Completions`]): a leaf, never held across a
+//!   post.
 //!
 //! Where two are held at once, they are taken in this order: the Shared pool's ([`PoolLedger`],
 //! held while a heap over a block of it is made and stored, and while a `POOL_GIVE` asks whether
@@ -180,6 +185,7 @@ mod churn;
 mod close_cost;
 mod cmdbuf;
 mod commit_order;
+mod completions;
 #[cfg(test)]
 mod composite_cost;
 mod compute;
@@ -350,7 +356,24 @@ pub(crate) struct Sinks {
     pub(crate) scheduled: Option<ScheduledSink>,
     pub(crate) submitted: Option<SubmittedSink>,
     pub(crate) reflection: Option<ReflectionSink>,
+    /// Where a command buffer's completion may be posted at its decode ([`AheadSinks`]).
+    pub(crate) ahead: Option<AheadSinks>,
 }
+
+/// The sinks of a command buffer's `CB_COMPLETE` posted at its decode, ahead of its platform end
+/// ([`video::Landed`]; the module docs of [`video`], "Completed at the decode"): `post` writes
+/// the record to the queue's completion ring as [`CompletionSink`] does, telling nothing that
+/// waits for the buffer's end, and `finished` tells that, at its end, with its seqno, once the
+/// record is on the ring: the host's presents waiting for the buffer are shown then
+/// (`present::PresentQueue::finished`), after the decode's copy into its output's device caches.
+#[derive(Clone)]
+pub(crate) struct AheadSinks {
+    pub(crate) post: CompletionSink,
+    pub(crate) finished: FinishedSink,
+}
+
+/// [`AheadSinks::finished`].
+pub(crate) type FinishedSink = Arc<dyn Fn(u64) + Send + Sync>;
 
 /// An answer the host gives once a context's command buffers have finished (a `CONTEXT_CLOSE`'s,
 /// a `BLOCK_RELEASE`'s).
@@ -892,6 +915,9 @@ pub(crate) struct Shared<P: Platform> {
     /// The queues' surface timelines, which order command buffers of different queues over the
     /// IOSurfaces they share ([`surface_order`]).
     surface_order: Mutex<surface_order::SurfaceOrder<P>>,
+    /// The decodes completed ahead of their platform ends, by their outputs' blocks, which a
+    /// buffer of another queue that uses one waits for ([`surface_order::CompletedAhead`]).
+    completed_ahead: Arc<surface_order::CompletedAhead>,
     /// The device's resets, which end every wait for another queue's buffers
     /// ([`commit_order`]).
     commit_cancel: commit_order::Cancel,
@@ -1269,6 +1295,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             sequencer: Arc::default(),
             split_gate: Arc::default(),
             surface_order: Mutex::new(surface_order::SurfaceOrder::new()),
+            completed_ahead: Arc::default(),
             commit_cancel: commit_order::Cancel::default(),
             release_queue: OnceLock::new(),
             shares: Arc::default(),
@@ -2766,12 +2793,28 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// once its work finishes (the ring loop's, writing the queue's completion
     /// ring).
     /// What follows each record is run as soon as `sink` returns.
+    /// A completion posted at its decode goes to `sink` too, with no end told
+    /// ([`Self::set_finished_sink`]).
     #[cfg(test)]
     pub(crate) fn set_completion_sink(&mut self, sink: Arc<dyn Fn(RgfxCbComplete) + Send + Sync>) {
-        self.sinks.completion = Some(Arc::new(move |record, then: Then| {
+        let sink: CompletionSink = Arc::new(move |record, then: Then| {
             sink(record);
             then();
-        }));
+        });
+        self.sinks.completion = Some(Arc::clone(&sink));
+        self.sinks.ahead = Some(AheadSinks {
+            post: sink,
+            finished: Arc::new(|_| ()),
+        });
+    }
+
+    /// Sets the sink told of the end of each command buffer whose completion was posted at its
+    /// decode ([`AheadSinks::finished`]), after [`Self::set_completion_sink`].
+    #[cfg(test)]
+    pub(crate) fn set_finished_sink(&mut self, sink: FinishedSink) {
+        if let Some(ahead) = &mut self.sinks.ahead {
+            ahead.finished = sink;
+        }
     }
 
     /// Sets the sink the decoder hands each shared event a command buffer signalled to, once the
@@ -3328,7 +3371,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 _ => None,
             })
             .flatten()?;
-        let writers = writers_at
+        let mut writers: Vec<RgfxSurfaceWriter> = writers_at
             .and_then(|at| self.region.surface_writers(at))
             .map(|record| {
                 record
@@ -3338,6 +3381,16 @@ impl<P: Platform> GraphicsDecoder<P> {
                     .collect()
             })
             .unwrap_or_default();
+        // A decode into the surface whose completion went at its decode, which the guest's
+        // writers no longer name, is waited for to its end (`surface_order`, "A decode completed
+        // ahead of its end is still waited for").
+        let kept = &self.shared.completed_ahead;
+        if kept.any()
+            && let Some((block, _)) = span
+        {
+            let now = self.shared.platform.clock().now_mono();
+            writers.extend(kept.present_writers(block, &writers, now));
+        }
         Some(SurfacePresent {
             texture,
             span,

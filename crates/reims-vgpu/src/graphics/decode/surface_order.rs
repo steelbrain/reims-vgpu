@@ -41,6 +41,19 @@
 //!   a queue of its own as the host walks the buffer, so the buffer's GPU waits do not hold it:
 //!   the host waits for the same buffers on the CPU first ([`OrderWait`]), so a decode's output
 //!   lands after the reads of other queues committed before it, as any other write does.
+//! - **A decode completed ahead of its end is still waited for.** A command buffer of a decode
+//!   alone may post its `CB_COMPLETE` as its session's decode is done, before the picture's copy
+//!   into the output's device caches has run ([`super::video::Landed`], "Completed at the
+//!   decode" in its module docs). The guest's kext empties the output's slots of the buffer as it
+//!   takes that record, so a buffer posted after it names nothing of the output. The host keeps
+//!   each such decode by its output's blocks until its platform end ([`CompletedAhead`]), and a
+//!   buffer of another queue that uses one of those blocks waits for it as for a named buffer:
+//!   on the GPU at its begin, and on the CPU before work started off it; and a present of a
+//!   surface in one waits for it as for a writer the guest named ([`CompletedAhead::present_writers`]),
+//!   which the host's presents count done at the buffer's end, not at its record
+//!   ([`super::AheadSinks`]). The decode's buffer signals its queue's timeline whether it holds
+//!   the op or not. A lock's download needs no such wait: it waits for the caches' users' ends,
+//!   the decode's buffer among them ([`super::surface_cache`]).
 //!
 //! The order's state is the decoder's `surface_order` lock, a leaf: held while a buffer's waits
 //! and signal are encoded, never across a platform call that may wait. A command buffer made only
@@ -53,16 +66,18 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use reims_vgpu_graphics::ops::RgfxSurfaceOrderWait;
-use reims_vgpu_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
+use reims_vgpu_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxSurfaceWriter};
 use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue, CompletedInfo};
 use reims_vgpu_vulkan::core::platform::device::GpuDevice;
 use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent};
-use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
+use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, MonoTime};
 use reims_vgpu_vulkan::core::platform::{Handle, Platform};
 use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult, refusals};
+use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::commit_order;
 
@@ -245,6 +260,184 @@ pub(crate) struct OrderCounts {
     pub(crate) stale: u64,
     /// Signals for buffers that did not run: a command buffer of their own, or a CPU set.
     pub(crate) released: u64,
+    /// Waits for a decode completed ahead of its end that a buffer's named waits did not cover
+    /// ([`CompletedAhead`]): the buffers it held.
+    pub(crate) held: u64,
+}
+
+/// The decodes whose command buffers posted their `CB_COMPLETE` ahead of their platform end, by
+/// the blocks of their outputs, until that end (the module doc, "A decode completed ahead of its
+/// end is still waited for").
+#[derive(Default)]
+pub(crate) struct CompletedAhead {
+    /// Each block's decode.
+    blocks: Mutex<HashMap<u64, Ahead>>,
+    /// How many blocks it holds, read with no lock, so a buffer that uses a surface finds none
+    /// with an atomic load where no decode is out ahead ([`Self::waits_for`]).
+    live: AtomicUsize,
+    /// The longest a buffer of another queue that waited for one of them was begun before its
+    /// end, in nanoseconds (diagnostics only).
+    longest: AtomicU64,
+    /// How many decodes' command buffers posted their completion at their decodes (diagnostics
+    /// only).
+    posted: AtomicU64,
+    /// How many of the host's presents waited for one that the guest's writers named not
+    /// (diagnostics only).
+    presents: AtomicU64,
+}
+
+/// A decode in [`CompletedAhead`].
+struct Ahead {
+    /// Its command buffer's queue and seqno.
+    queue: u64,
+    seqno: u64,
+    /// When the first buffer of another queue that waits for it was begun.
+    since: Option<MonoTime>,
+}
+
+/// A decode's place in [`CompletedAhead`], from before its command buffer's commit until its
+/// completion handler has run, which drops it.
+pub(crate) struct AheadEntry<P: Platform> {
+    table: Arc<CompletedAhead>,
+    platform: Arc<P>,
+    blocks: Vec<u64>,
+    queue: u64,
+    seqno: u64,
+}
+
+impl CompletedAhead {
+    /// Keeps the decode of queue `queue`'s buffer at `seqno`, whose output lies in `blocks`, until
+    /// the entry answered is dropped, which reads the time on `platform`'s clock. A later decode
+    /// into a block takes its place there.
+    pub(crate) fn enter<P: Platform>(
+        self: &Arc<Self>,
+        platform: &Arc<P>,
+        blocks: Vec<u64>,
+        queue: u64,
+        seqno: u64,
+    ) -> AheadEntry<P> {
+        let mut map = self.blocks.lock();
+        for &block in &blocks {
+            let ahead = Ahead {
+                queue,
+                seqno,
+                since: None,
+            };
+            if map.insert(block, ahead).is_none() {
+                self.live.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        AheadEntry {
+            table: Arc::clone(self),
+            platform: Arc::clone(platform),
+            blocks,
+            queue,
+            seqno,
+        }
+    }
+
+    /// Whether it keeps any decode, read with no lock.
+    pub(crate) fn any(&self) -> bool {
+        self.live.load(Ordering::Acquire) > 0
+    }
+
+    /// A decode's command buffer posted its completion at its decode.
+    pub(crate) fn posted(&self) {
+        self.posted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many decodes' command buffers posted their completion at their decodes.
+    pub(crate) fn posts(&self) -> u64 {
+        self.posted.load(Ordering::Relaxed)
+    }
+
+    /// The writers a present of a surface in `block` waits for besides `named`, those the guest's
+    /// writers record names: the decode kept there, where one is and `named` holds nothing of its
+    /// queue at its seqno or past it, at `now`. Counted.
+    pub(crate) fn present_writers(
+        &self,
+        block: u64,
+        named: &[RgfxSurfaceWriter],
+        now: MonoTime,
+    ) -> Option<RgfxSurfaceWriter> {
+        let wait = self.waits_for(0, std::iter::once(block), now).pop()?;
+        let covered = (named.iter())
+            .any(|w| w.queue_obj_id == wait.queue_obj_id && w.seqno >= wait.seqno);
+        if covered {
+            return None;
+        }
+        self.presents.fetch_add(1, Ordering::Relaxed);
+        Some(RgfxSurfaceWriter {
+            queue_obj_id: wait.queue_obj_id,
+            seqno: wait.seqno,
+        })
+    }
+
+    /// How many presents waited for a decode the guest's writers named not.
+    pub(crate) fn presents_held(&self) -> u64 {
+        self.presents.load(Ordering::Relaxed)
+    }
+
+    /// The decodes of other queues than `queue` whose outputs lie in `blocks`, as the waits a
+    /// buffer of `queue` that uses those blocks makes for them, begun at `now`. No lock is taken,
+    /// and nothing allocated, where no decode is kept.
+    pub(crate) fn waits_for(
+        &self,
+        queue: u64,
+        blocks: impl Iterator<Item = u64>,
+        now: MonoTime,
+    ) -> Vec<RgfxSurfaceOrderWait> {
+        if self.live.load(Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
+        let mut map = self.blocks.lock();
+        let mut waits = Vec::new();
+        for block in blocks {
+            if let Some(ahead) = map.get_mut(&block)
+                && ahead.queue != queue
+            {
+                ahead.since.get_or_insert(now);
+                waits.push(RgfxSurfaceOrderWait {
+                    queue_obj_id: ahead.queue,
+                    seqno: ahead.seqno,
+                });
+            }
+        }
+        waits
+    }
+
+    /// Whether it keeps a decode (for the tests).
+    #[cfg(test)]
+    pub(crate) fn holds(&self, block: u64) -> bool {
+        self.blocks.lock().contains_key(&block)
+    }
+
+    /// The longest a buffer of another queue that waited for a decode kept here was begun before
+    /// the decode's end.
+    pub(crate) fn longest(&self) -> Duration {
+        Duration::from_nanos(self.longest.load(Ordering::Acquire))
+    }
+}
+
+impl<P: Platform> Drop for AheadEntry<P> {
+    fn drop(&mut self) {
+        let now = self.platform.clock().now_mono();
+        let table = &self.table;
+        let mut map = table.blocks.lock();
+        for block in &self.blocks {
+            let ours = map
+                .get(block)
+                .is_some_and(|a| a.queue == self.queue && a.seqno == self.seqno);
+            if ours && let Some(ahead) = map.remove(block) {
+                table.live.fetch_sub(1, Ordering::AcqRel);
+                if let Some(since) = ahead.since {
+                    let held = now.saturating_duration_since(since).as_nanos();
+                    let held = u64::try_from(held).unwrap_or(u64::MAX);
+                    table.longest.fetch_max(held, Ordering::AcqRel);
+                }
+            }
+        }
+    }
 }
 
 /// One queue the host holds, from its create to its end.
@@ -432,18 +625,24 @@ impl<P: Platform> SurfaceOrder<P> {
         })
     }
 
-    /// Makes `cb`, a command buffer of queue `queue` that holds the op, wait on the GPU for each
-    /// buffer of `waits` not yet finished (the module doc); the waits it made, one a queue. Logs
-    /// the counts where it comes [`LOGGED_AFTER`] or more after their last log, at `now`.
+    /// Makes `cb`, a command buffer of queue `queue`, wait on the GPU for each buffer not yet
+    /// finished of `waits`, those its op names where it holds one, and of `ahead`, the decodes
+    /// completed ahead of their ends whose outputs it uses ([`CompletedAhead::waits_for`]; the
+    /// module doc); the waits it made, one a queue. Logs the counts where it comes
+    /// [`LOGGED_AFTER`] or more after their last log, at `now`, with the longest wait `kept`
+    /// saw.
     pub(crate) fn before(
         &mut self,
         device: &P::Device,
         queue: u64,
         cb: &P::CommandBuffer,
-        waits: &[RgfxSurfaceOrderWait],
+        (waits, ahead): (Option<&[RgfxSurfaceOrderWait]>, &[RgfxSurfaceOrderWait]),
+        kept: &CompletedAhead,
         now: MonoTime,
     ) -> RaiseResult<Vec<OrderWait<P>>> {
-        self.counts.buffers += 1;
+        if waits.is_some() {
+            self.counts.buffers += 1;
+        }
         let last = *self.logged_at.get_or_insert(now);
         if now.saturating_duration_since(last) >= LOGGED_AFTER {
             self.logged_at = Some(now);
@@ -452,57 +651,56 @@ impl<P: Platform> SurfaceOrder<P> {
                 target: "reims_vgpu::graphics",
                 "surface order: {} command buffers named {} buffers of other queues: {} GPU \
                  waits ({} for buffers not yet taken), {} naming no buffer; {} signals for \
-                 buffers that did not run",
-                c.buffers, c.named, c.waits, c.ahead, c.stale, c.released
+                 buffers that did not run; {} decodes completed ahead of their ends, {} buffers \
+                 and {} presents held behind them (the longest begun {} us before one's end)",
+                c.buffers,
+                c.named,
+                c.waits,
+                c.ahead,
+                c.stale,
+                c.released,
+                kept.posts(),
+                c.held,
+                kept.presents_held(),
+                kept.longest().as_micros()
             );
         }
         // One wait a queue, for the highest value of it.
         let mut targets: Vec<(u64, u64)> = Vec::new();
-        for w in waits {
+        for w in waits.unwrap_or_default() {
             let (q, s) = (w.queue_obj_id, w.seqno);
             if q == queue || q == 0 || s == 0 {
                 continue;
             }
             self.counts.named += 1;
-            let Some(named) = self.queues.get_mut(&q) else {
-                self.counts.stale += 1;
+            let Some(target) = self.target(device, q, s) else {
                 continue;
             };
-            let marks = Arc::clone(&named.marks);
-            let done = marks.done.load(Ordering::Acquire);
-            if done >= s || named.event(device).is_none() {
-                continue;
-            }
-            let signalled = marks.signalled.load(Ordering::Acquire);
-            let target = if named.ended {
-                s.min(signalled)
-            } else if s <= signalled {
-                s
-            } else {
-                if let Some(published) = named.published.as_ref().and_then(|p| p())
-                    && s > published
-                {
-                    self.counts.stale += 1;
-                    continue;
-                }
-                // Not yet signalled. Raised before `taken` is read ([`Marks::quiet`]).
-                marks.waited.fetch_max(s, Ordering::SeqCst);
-                if marks.taken.load(Ordering::SeqCst) >= s {
-                    // Taken without a signal: it held no op, so it used no surface the bundle
-                    // named. What the queue signalled before it is what it can be ordered after.
-                    signalled
-                } else {
-                    // Not yet taken: it signals once taken, if its ring holds it.
-                    self.counts.ahead += 1;
-                    s
-                }
-            };
-            if target <= done {
-                continue;
-            }
             match targets.iter_mut().find(|(tq, _)| *tq == q) {
                 Some((_, v)) => *v = (*v).max(target),
                 None => targets.push((q, target)),
+            }
+        }
+        // A decode completed ahead of its end, past what the named waits wait for of its queue,
+        // holds the buffer.
+        for w in ahead {
+            let (q, s) = (w.queue_obj_id, w.seqno);
+            if q == queue || q == 0 || s == 0 {
+                continue;
+            }
+            let Some(target) = self.target(device, q, s) else {
+                continue;
+            };
+            match targets.iter_mut().find(|(tq, _)| *tq == q) {
+                Some((_, v)) if *v >= target => {}
+                Some((_, v)) => {
+                    self.counts.held += 1;
+                    *v = target;
+                }
+                None => {
+                    self.counts.held += 1;
+                    targets.push((q, target));
+                }
             }
         }
         let mut made = Vec::with_capacity(targets.len());
@@ -521,6 +719,47 @@ impl<P: Platform> SurfaceOrder<P> {
             }
         }
         Ok(made)
+    }
+
+    /// The value of queue `q`'s timeline a wait for its buffer at `s` waits for, where it waits:
+    /// `None` where the host does not hold the queue (counted stale), the buffer has finished,
+    /// the platform makes no shared event, or `s` lies past what the queue's ring has published
+    /// (counted stale).
+    fn target(&mut self, device: &P::Device, q: u64, s: u64) -> Option<u64> {
+        let Some(named) = self.queues.get_mut(&q) else {
+            self.counts.stale += 1;
+            return None;
+        };
+        let marks = Arc::clone(&named.marks);
+        let done = marks.done.load(Ordering::Acquire);
+        if done >= s || named.event(device).is_none() {
+            return None;
+        }
+        let signalled = marks.signalled.load(Ordering::Acquire);
+        let target = if named.ended {
+            s.min(signalled)
+        } else if s <= signalled {
+            s
+        } else {
+            if let Some(published) = named.published.as_ref().and_then(|p| p())
+                && s > published
+            {
+                self.counts.stale += 1;
+                return None;
+            }
+            // Not yet signalled. Raised before `taken` is read ([`Marks::quiet`]).
+            marks.waited.fetch_max(s, Ordering::SeqCst);
+            if marks.taken.load(Ordering::SeqCst) >= s {
+                // Taken without a signal: it held no op, so it used no surface the bundle
+                // named. What the queue signalled before it is what it can be ordered after.
+                signalled
+            } else {
+                // Not yet taken: it signals once taken, if its ring holds it.
+                self.counts.ahead += 1;
+                s
+            }
+        };
+        (target > done).then_some(target)
     }
 
     /// Notes queue `queue`'s buffer at `seqno` taken, and has `cb`, its command buffer or its

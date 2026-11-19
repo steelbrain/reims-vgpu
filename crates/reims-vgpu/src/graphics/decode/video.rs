@@ -18,11 +18,24 @@
 //! answers as a decode error: an HEVC picture's schedule, waiting for the buffer, fails
 //! (`kVTVideoDecoderMalfunctionErr`, docs/graphics-kext/design.md, "A decode the driver cannot
 //! complete is a decode error").
+//!
+//! **Completed at the decode.** A session whose picture lands in its output's device caches by
+//! GPU work of its own after the decode is done (the VA-API arm's video processing,
+//! `super::super::vaapi`) tells of the decode done as it issues that work ([`Landed::decoded`]).
+//! A command buffer of that decode alone, which waits for no event and signals none, then posts
+//! its `CB_COMPLETE` there, in its queue's order of records, ahead of its platform end
+//! ([`Landed::arm`], `super::cmdbuf`): the guest's decoder hands the picture on while the copy
+//! runs. Everything else stays at the platform end, after the copy: the session's signal, the
+//! buffer's surface timeline and its caches' copies into the pages, which every reader of the
+//! output waits for (a GPU reader on another queue, a lock's download, a present), the queue's
+//! later work, the drain of its context and its place among the queue's buffers in flight. Such
+//! a `CB_COMPLETE` carries no GPU times (0 for each), and is posted on the thread that tells of
+//! the decode done (the VA-API arm's picture landing thread, `reims-vgpu.graphics-video-land`),
+//! or on the buffer's lane where the decode was done before its commit.
 
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use reims_vgpu_graphics::ops::video::{
     RGFX_OP_VIDEO_DECODE_H264, RGFX_OP_VIDEO_DECODE_H265, RGFX_OP_VIDEO_ENCODE_H264,
@@ -53,6 +66,7 @@ use reims_vgpu_vulkan::core::platform::resource::SurfaceMemory;
 use reims_vgpu_vulkan::core::platform::types::PixelFormatInfo;
 use reims_vgpu_vulkan::core::platform::values::PagesPlane;
 use reims_vgpu_vulkan::core::raise::RaiseResult;
+use reims_vgpu_vulkan::core::sync::Mutex;
 use zerocopy::FromBytes;
 
 use super::worker::Worker;
@@ -347,19 +361,98 @@ pub struct Decoded {
 
 /// Whether a decode's picture landed: set by its session before it signals the decode's value,
 /// and read by the command buffer waiting for it as it completes, which completes failed, Metal's
-/// internal error, where the picture did not land (the module docs).
-#[derive(Debug, Default)]
-pub struct Landed(AtomicBool);
+/// internal error, where the picture did not land (the module docs). Where its session tells of
+/// the decode done before the picture lands ([`Self::decoded`]), a command buffer of the decode
+/// alone posts its completion then ([`Self::arm`]; the module docs, "Completed at the decode"),
+/// and its record says what was known then: a picture that fails to land after it was posted
+/// leaves the buffer completed ([`Self::fail`]'s answer).
+#[derive(Default)]
+pub struct Landed(Mutex<Outcome>);
+
+/// [`Landed`]'s state.
+#[derive(Default)]
+struct Outcome {
+    /// The picture did not land.
+    failed: bool,
+    /// Its session told of its decode done.
+    decoded: bool,
+    /// Its command buffer's post of its completion, armed at its commit until the decode is
+    /// done.
+    early: Option<EarlyPost>,
+    /// Its command buffer's completion was posted, answering the picture failed or not.
+    posted: Option<bool>,
+}
+
+/// A command buffer's post of its completion at its decode ([`Landed::arm`]), handed the decode's
+/// [`Landed`].
+pub(super) type EarlyPost = Box<dyn FnOnce(Arc<Landed>) + Send>;
 
 impl Landed {
-    /// The picture did not land.
-    pub fn fail(&self) {
-        self.0.store(true, Ordering::SeqCst);
+    /// The picture did not land. Answers whether its command buffer's completion was posted
+    /// already, answering that it landed: the guest has the picture as the landing left it, and
+    /// the session is to tell the guest of the failure otherwise.
+    pub fn fail(&self) -> bool {
+        let (posted, early) = {
+            let mut outcome = self.0.lock();
+            outcome.failed = true;
+            (outcome.posted == Some(false), outcome.early.take())
+        };
+        drop(early);
+        posted
     }
 
     /// Whether the picture did not land.
     pub fn failed(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.lock().failed
+    }
+
+    /// The session's decode of the picture is done, and its landing from here is work the
+    /// output's readers wait for (the module docs, "Completed at the decode"): the command
+    /// buffer's completion is posted now where its commit armed it, else at its arming.
+    pub fn decoded(self: &Arc<Self>) {
+        let early = {
+            let mut outcome = self.0.lock();
+            outcome.decoded = true;
+            outcome.early.take()
+        };
+        if let Some(early) = early {
+            early(Arc::clone(self));
+        }
+    }
+
+    /// Arms `early`, the command buffer's post of its completion, at its commit: run at once
+    /// where the decode is done already, else as it is ([`Self::decoded`]); dropped where the
+    /// completion was posted already, or the picture failed.
+    pub(super) fn arm(self: &Arc<Self>, early: EarlyPost) {
+        let now = {
+            let mut outcome = self.0.lock();
+            if outcome.posted.is_some() || outcome.failed {
+                Some(None)
+            } else if outcome.decoded {
+                Some(Some(early))
+            } else {
+                outcome.early = Some(early);
+                None
+            }
+        };
+        if let Some(Some(early)) = now {
+            early(Arc::clone(self));
+        }
+    }
+
+    /// Fixes what the command buffer's completion answers, once: whether the picture failed, to
+    /// the first that asks, which posts it; `None` once it is posted. The post armed goes.
+    pub(super) fn post(&self) -> Option<bool> {
+        let (failed, early) = {
+            let mut outcome = self.0.lock();
+            if outcome.posted.is_some() {
+                return None;
+            }
+            outcome.posted = Some(outcome.failed);
+            (outcome.failed, outcome.early.take())
+        };
+        drop(early);
+        Some(failed)
     }
 }
 
@@ -1100,7 +1193,7 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// The blocks of the surfaces the textures `luma_id` and `chroma_id` of a decode lie over,
     /// each once, in that order.
-    fn decode_blocks(&self, luma_id: u64, chroma_id: u64) -> Vec<u64> {
+    pub(super) fn decode_blocks(&self, luma_id: u64, chroma_id: u64) -> Vec<u64> {
         let block = |id| {
             let place = self.entry(id)?.place?;
             self.span_of(place.buffer_obj_id).map(|(block, _)| block)
