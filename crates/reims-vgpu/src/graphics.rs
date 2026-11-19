@@ -3721,7 +3721,7 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
     }
 
     fn driver_ready(&self, taken: u64) {
-        (self.decoder()).set_managed_at_copy(taken & RGFX_FEATURE_MANAGED_AT_COPY != 0);
+        (self.control.decoder()).set_managed_at_copy(taken & RGFX_FEATURE_MANAGED_AT_COPY != 0);
     }
 
     fn pool_take(&self, take: &RgfxPoolTake, answer: PoolAnswer) {
