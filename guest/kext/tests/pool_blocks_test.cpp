@@ -17,9 +17,15 @@ static_assert(RGFX_REG_POOL_LENGTH_LO == 0x4c && RGFX_REG_POOL_LENGTH_HI == 0x50
 static_assert(RGFX_CMD_POOL_TAKE == 763 && RGFX_CMD_POOL_GIVE == 764, "the pool's commands");
 static_assert(RGFX_EVT_POOL_BLOCK == 1040, "POOL_BLOCK");
 static_assert(sizeof(RgfxPoolTake) == 32 && sizeof(RgfxPoolGive) == 40, "the pool's messages");
-static_assert(sizeof(RgfxPoolBlock) == 40, "POOL_BLOCK's record");
+static_assert(sizeof(RgfxPoolBlock) == 48, "POOL_BLOCK's record");
+static_assert(offsetof(RgfxPoolBlock, gpu_address) == 40, "the block's GPU address");
+static_assert(RGFX_FEATURE_POOL_ADDRESSES == (1ull << 59), "POOL_ADDRESSES is bit 59");
 static_assert(kRgfxKextFeaturePool == (1 << 15), "the kext's pool bit");
 static_assert(kRgfxKextFeaturePoolCarried == (RGFX_GUEST_ARM64 ? 0 : kRgfxKextFeaturePool),
+              "the x86-64 kext's alone");
+static_assert(kRgfxKextFeaturePoolAddresses == (1 << 16), "the kext's pool addresses bit");
+static_assert(kRgfxKextFeaturePoolAddressesCarried ==
+                  (RGFX_GUEST_ARM64 ? 0 : kRgfxKextFeaturePoolAddresses),
               "the x86-64 kext's alone");
 
 namespace {
@@ -53,6 +59,11 @@ bool grow(RgfxPoolBlockList &list, std::vector<std::vector<RgfxHeldPoolBlock>> &
 
 int main()
 {
+	// An answer is whole from its length on: a host's before POOL_ADDRESSES (40 bytes) too.
+	check(!rgfxPoolAnswerWhole(32), "an answer cut before its length is not whole");
+	check(!rgfxPoolAnswerWhole(39), "an answer cut in its length is not whole");
+	check(rgfxPoolAnswerWhole(40), "an answer of a host before POOL_ADDRESSES is whole");
+	check(rgfxPoolAnswerWhole(sizeof(RgfxPoolBlock)), "an answer with its GPU address is whole");
 	// The take's length: rounded up to 64 KiB; none for 0 bytes or past 4 GiB.
 	check(rgfxPoolTakeLength(0) == 0, "0 bytes take nothing");
 	check(rgfxPoolTakeLength(1) == kAlign, "a byte takes a block");

@@ -1119,9 +1119,10 @@ IODeviceMemory *RgfxAccelerator::poolMemory()
 }
 
 IOReturn RgfxAccelerator::takePoolBlock(UInt32 context, task_t task, UInt64 length,
-                                        RgfxHeldPoolBlock *block)
+                                        RgfxHeldPoolBlock *block, UInt64 *gpuAddress)
 {
 	*block = {};
+	*gpuAddress = 0;
 	IODeviceMemory *pool = poolMemory();
 	if (!pool)
 		return kIOReturnUnsupported;
@@ -1139,7 +1140,7 @@ IOReturn RgfxAccelerator::takePoolBlock(UInt32 context, task_t task, UInt64 leng
 	                           ReimsGraphics::kLifecycleNoDeadline);
 	if (r != kIOReturnSuccess)
 		return r;
-	if (answered < sizeof(answer)) {
+	if (!rgfxPoolAnswerWhole(answered)) {
 		IOLog("RgfxAccelerator: context %u's pool take of 0x%llx bytes: an answer of %u bytes\n",
 		      context, length, answered);
 		return kIOReturnInternalError;
@@ -1175,6 +1176,10 @@ IOReturn RgfxAccelerator::takePoolBlock(UInt32 context, task_t task, UInt64 leng
 		return kIOReturnNoMemory;
 	}
 	*block = {answer.pool_offset, answer.length, map};
+	// The host's GPU address for it, where the kext took RGFX_FEATURE_POOL_ADDRESSES: 0 otherwise,
+	// as the host answers then.
+	if (featureWord() & RGFX_FEATURE_POOL_ADDRESSES)
+		*gpuAddress = answer.gpu_address;
 	return kIOReturnSuccess;
 }
 

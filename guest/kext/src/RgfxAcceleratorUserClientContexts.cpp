@@ -387,7 +387,8 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		if (!rgfxSurfaceUnlockSeedExported())
 			kext &= ~static_cast<uint64_t>(kRgfxKextFeatureSurfaceSeeds);
 		if (!owner->poolMemory())
-			kext &= ~static_cast<uint64_t>(kRgfxKextFeaturePool);
+			kext &= ~static_cast<uint64_t>(kRgfxKextFeaturePool |
+			                               kRgfxKextFeaturePoolAddresses);
 		out[1] = kext;
 		out[2] = kRgfxSelectorMap;
 		return kIOReturnSuccess;
@@ -1129,14 +1130,17 @@ void RgfxAcceleratorUserClient::releaseContext()
 // context releaseContext has closed: the close takes every listed block out of the process.
 IOReturn RgfxAcceleratorUserClient::poolTakeMethod(IOExternalMethodArguments *a)
 {
-	if (a->scalarInputCount != 1 || a->scalarOutputCount != 3)
+	// Four outputs from a bundle that asks for the block's GPU address too
+	// (kRgfxKextFeaturePoolAddresses), three from one before it.
+	if (a->scalarInputCount != 1 || (a->scalarOutputCount != 3 && a->scalarOutputCount != 4))
 		return kIOReturnBadArgument;
 	UInt32 ctx = 0;
 	Ask ask = {this, beginAsk(&ctx)};
 	if (!ask.begun)
 		return kIOReturnBadArgument;
 	RgfxHeldPoolBlock block = {};
-	IOReturn r = owner->takePoolBlock(ctx, task, a->scalarInput[0], &block);
+	UInt64 gpuAddress = 0;
+	IOReturn r = owner->takePoolBlock(ctx, task, a->scalarInput[0], &block, &gpuAddress);
 	if (r != kIOReturnSuccess)
 		return r;
 	IOMemoryMap *map = static_cast<IOMemoryMap *>(block.map);
@@ -1170,6 +1174,8 @@ IOReturn RgfxAcceleratorUserClient::poolTakeMethod(IOExternalMethodArguments *a)
 	a->scalarOutput[0] = address;
 	a->scalarOutput[1] = block.offset;
 	a->scalarOutput[2] = block.length;
+	if (a->scalarOutputCount == 4)
+		a->scalarOutput[3] = gpuAddress;
 	return kIOReturnSuccess;
 }
 

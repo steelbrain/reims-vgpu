@@ -145,11 +145,13 @@ enum {
 	// A block of the device's Shared pool for the client's context (kRgfxKextFeaturePool; the
 	// device's RGFX_FEATURE_POOL, design.md, "The Shared pool"): in the bytes asked for; out the
 	// block's address in the process, its offset in the pool and its length, the bytes asked for
-	// rounded up to RGFX_POOL_BLOCK_ALIGN. The kext posts the context's POOL_TAKE and waits for
-	// its answer however long the host takes, then maps the block into the process, read and
-	// write and write-back, as its own range: every byte of it reads zero, the host's zeroing at
-	// the take. The process names the block by its pool offset (HEAP_OVER_POOL) and gives it back
-	// through PoolGive; the context's close gives back every block it still holds.
+	// rounded up to RGFX_POOL_BLOCK_ALIGN, and, where four outputs are asked for
+	// (kRgfxKextFeaturePoolAddresses), the GPU address the host gave the block, 0 where the
+	// feature word lacks RGFX_FEATURE_POOL_ADDRESSES. The kext posts the context's POOL_TAKE and
+	// waits for its answer however long the host takes, then maps the block into the process,
+	// read and write and write-back, as its own range: every byte of it reads zero, the host's
+	// zeroing at the take. The process names the block by its pool offset (HEAP_OVER_POOL) and
+	// gives it back through PoolGive; the context's close gives back every block it still holds.
 	// kIOReturnUnsupported where the device has no pool; kIOReturnBadArgument for 0 bytes or
 	// past RGFX_POOL_TAKE_MAX, or where the context is not open; kIOReturnNoMemory where the
 	// pool has no room for the block (RGFX_STATUS_REFUSED) or the process got no mapping of it,
@@ -410,6 +412,9 @@ enum {
 	// PoolTake, 16, and PoolGive, 17, which the bundle uses where the feature word holds
 	// RGFX_FEATURE_POOL too; the x86-64 kext alone.
 	kRgfxKextFeaturePool = 1 << 15,
+	// PoolTake's (16) fourth output, the block's GPU address, which the bundle asks for where the
+	// feature word holds RGFX_FEATURE_POOL_ADDRESSES too; the x86-64 kext alone.
+	kRgfxKextFeaturePoolAddresses = 1 << 16,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

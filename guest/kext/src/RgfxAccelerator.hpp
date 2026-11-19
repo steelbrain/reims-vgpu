@@ -111,7 +111,8 @@ constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeatureRegionWriteCombined |
                                           kRgfxKextFeatureCpuPatsRead |
                                           kRgfxKextFeatureZeroedBlocks |
-                                          kRgfxKextFeaturePoolCarried;
+                                          kRgfxKextFeaturePoolCarried |
+                                          kRgfxKextFeaturePoolAddressesCarried;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
@@ -374,7 +375,8 @@ public:
 	// mapping, the block then given back. givePoolBlock posts the block's POOL_GIVE and returns,
 	// once no process maps it.
 	IODeviceMemory *poolMemory();
-	IOReturn takePoolBlock(UInt32 context, task_t task, UInt64 length, RgfxHeldPoolBlock *block);
+	IOReturn takePoolBlock(UInt32 context, task_t task, UInt64 length, RgfxHeldPoolBlock *block,
+	                       UInt64 *gpuAddress);
 	IOReturn givePoolBlock(UInt32 context, UInt64 offset, UInt64 length);
 	// The region's first `size` bytes from RGFX_DEVICE_INFO_OFFSET (the device info, and the
 	// video caps after it), mapped read-only into the kernel: the map, which the caller

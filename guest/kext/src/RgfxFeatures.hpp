@@ -239,7 +239,8 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_BUFFER_ESCAPED | RGFX_FEATURE_SURFACE_REFILL |
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K | RGFX_FEATURE_VT_MESSAGES | RGFX_FEATURE_VT_RING |
                             RGFX_FEATURE_CURSOR_COLOR
-                      : RGFX_FEATURE_DISPLAY_POWER | RGFX_FEATURE_POOL);
+                      : RGFX_FEATURE_DISPLAY_POWER | RGFX_FEATURE_POOL |
+                            RGFX_FEATURE_POOL_ADDRESSES);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer and, on arm64, the
 // displays whose node the firmware placed under /arm-io, counted from display 0 (`mobileNodes`):

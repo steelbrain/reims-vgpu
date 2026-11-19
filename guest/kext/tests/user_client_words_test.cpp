@@ -316,6 +316,7 @@ static void features()
 		kRgfxKextFeatureCpuPats,
 		kRgfxKextFeatureZeroedBlocks,
 		kRgfxKextFeaturePool,
+		kRgfxKextFeaturePoolAddresses,
 	};
 	for (unsigned i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
 		CHECK(bits[i] == uint64_t(1) << i);
