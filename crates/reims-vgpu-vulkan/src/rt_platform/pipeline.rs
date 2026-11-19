@@ -57,7 +57,7 @@ use super::library::RtFunction;
 use super::state::value;
 use super::texture::OwnIndices;
 use super::unbuilt::{
-    RtRefusal, Unbuilt, refuse_create, refused_error_as, rt_refused, rt_refused_error,
+    RtRefusal, Unbuilt, refuse_create, refused_error_as, rt_refused_error, rt_refused_imageblock,
 };
 use super::{RtObj, RtPlatform};
 
@@ -467,12 +467,12 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
         Ok(None)
     }
 
-    /// rt's answer; 0 where rt refuses it, counted under the refusal's kind.
+    /// rt's answer; 0 where rt refuses it, counted (`rt_refused_imageblock`).
     fn imageblock_memory_length(&self, imageblock_dimensions: MtlSize) -> RaiseResult<u64> {
         let asked = dimensions(imageblock_dimensions);
         let made = self.rt.imageblock_memory_length_for_dimensions(asked);
         Ok(made.unwrap_or_else(|error| {
-            rt_refused(IMAGEBLOCK_MEMORY_LENGTH, &error);
+            rt_refused_imageblock(IMAGEBLOCK_MEMORY_LENGTH, &error);
             0
         }))
     }

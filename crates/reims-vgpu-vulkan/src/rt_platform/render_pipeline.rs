@@ -64,7 +64,7 @@ use super::pipeline::{
     specialized, writes, written_slots,
 };
 use super::state::value;
-use super::unbuilt::{RtRefusal, Unbuilt, refused_error, refused_error_as, rt_refused};
+use super::unbuilt::{RtRefusal, Unbuilt, refused_error, refused_error_as, rt_refused_imageblock};
 use super::{RtObj, RtPlatform};
 
 /// `newRenderPipelineStateWithDescriptor:error:`.
@@ -358,17 +358,17 @@ impl RenderPipeline for RtObj<RtRenderPipeline> {
         0
     }
 
-    /// rt's answer; 0 where rt refuses it, counted under the refusal's kind.
+    /// rt's answer; 0 where rt refuses it, counted (`rt_refused_imageblock`).
     fn imageblock_memory_length(&self, imageblock_dimensions: MtlSize) -> RaiseResult<u64> {
         let asked = dimensions(imageblock_dimensions);
         let made = self.rt.imageblock_memory_length_for_dimensions(asked);
         Ok(made.unwrap_or_else(|error| {
-            rt_refused(IMAGEBLOCK_MEMORY_LENGTH, &error);
+            rt_refused_imageblock(IMAGEBLOCK_MEMORY_LENGTH, &error);
             0
         }))
     }
 
-    /// rt's answer; 0 where rt refuses it, counted under the refusal's kind. The ask is noted by
+    /// rt's answer; 0 where rt refuses it, counted (`rt_refused_imageblock`). The ask is noted by
     /// its colour formats and sample count, with the answer (`super::diag::imageblock`).
     fn imageblock_sample_length(&self) -> u64 {
         let made = self.rt.imageblock_sample_length();
@@ -376,7 +376,7 @@ impl RenderPipeline for RtObj<RtRenderPipeline> {
         super::diag::imageblock(formats, samples, made.as_ref().ok().copied());
         made.map_or_else(
             |error| {
-                rt_refused(IMAGEBLOCK_SAMPLE_LENGTH, &error);
+                rt_refused_imageblock(IMAGEBLOCK_SAMPLE_LENGTH, &error);
                 0
             },
             u64::from,
@@ -454,6 +454,7 @@ mod tests {
     use crate::core::platform::values::{AttributeDesc, BufferLayoutDesc, LinkedFunctionsDesc};
     use crate::core::raise::OnFault;
     use crate::rt_platform::RtFunction;
+    use crate::rt_platform::unbuilt::IMAGEBLOCK_LENGTH;
 
     /// `numbered_samplers.metal`'s functions, compiled by build.rs.
     const NUMBERED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/numbered_samplers.metallib"));
@@ -640,11 +641,11 @@ mod tests {
         assert_ne!(state.unique_identifier(), 0);
         // One BGRA8Unorm attachment, one sample: a texel of 4 bytes, as Metal packs it
         // (`metal2vulkan::metal::format::imageblock_sample_length`, measured on an M3 Max).
-        let gaps = counted(RtRefusal::Gap.code());
+        let refusals = counted(IMAGEBLOCK_LENGTH);
         assert_eq!(state.imageblock_sample_length(), 4);
         let length = state.imageblock_memory_length(MtlSize::new(8, 8, 1));
         assert_eq!(length.expect("never a raise"), 4 * 8 * 8);
-        assert_eq!(counted(RtRefusal::Gap.code()), gaps);
+        assert_eq!(counted(IMAGEBLOCK_LENGTH), refusals);
         let before = counted(metal);
         let unknown = RenderPipelineDesc {
             color0_pixel_format: 0xdead,

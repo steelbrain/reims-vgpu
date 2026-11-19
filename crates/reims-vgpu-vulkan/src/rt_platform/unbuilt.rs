@@ -14,7 +14,9 @@
 //! `rt-refused-<kind>` ([`RtRefusal::code`]), its first line naming the call and rt's error. A
 //! texture rt makes none of for its pixel format (`Gap::TextureFormat`) is counted under its
 //! format's own code instead, `rt-refused-texture-format-<n>` ([`rt_refused_texture`]), so a
-//! boot's counts line gives each format number with its count.
+//! boot's counts line gives each format number with its count. A pipeline state's imageblock
+//! length rt refuses (`Gap::ImageblockLength`) is counted apart from rt's other gaps too,
+//! `rt-refused-imageblock-length` ([`rt_refused_imageblock`]).
 //!
 //! [`Unbuilt::ALL`] is the list of what is still unbuilt. A piece leaves it when it is built.
 
@@ -385,6 +387,29 @@ pub fn rt_refused_texture(sel: &'static str, error: &rt::Error) -> RtRefusal {
     RtRefusal::Gap
 }
 
+/// The code a pipeline state's imageblock length rt refuses is counted under
+/// ([`rt_refused_imageblock`]).
+pub const IMAGEBLOCK_LENGTH: &str = "rt-refused-imageblock-length";
+
+/// [`rt_refused`] of a pipeline state's imageblock length: rt's refusal of the length
+/// (`Gap::ImageblockLength`) is counted under [`IMAGEBLOCK_LENGTH`], apart from rt's other gaps,
+/// and the process's first writes its line on stderr; any other under its kind's.
+pub fn rt_refused_imageblock(sel: &'static str, error: &rt::Error) {
+    static SAID_IMAGEBLOCK: AtomicBool = AtomicBool::new(false);
+    if !matches!(error, rt::Error::Unsupported(rt::Gap::ImageblockLength)) {
+        rt_refused(sel, error);
+        return;
+    }
+    crate::answer::count_kind(IMAGEBLOCK_LENGTH);
+    super::diag::gap(error);
+    if !SAID_IMAGEBLOCK.swap(true, Ordering::Relaxed) {
+        say(&format!(
+            "reims-vgpu: {sel}: metal2vulkan-rt refused it ({error}); refused \
+             ({IMAGEBLOCK_LENGTH}), the first of its kind\n"
+        ));
+    }
+}
+
 /// [`rt_refused_create`] of a creator with an `error:` out-parameter: the `NSError` it answers, in
 /// [`RT_DOMAIN`], code 0, naming rt's error and its kind's code.
 pub fn rt_refused_error(sel: &'static str, error: &rt::Error) -> NsErrorText {
@@ -534,6 +559,22 @@ mod tests {
             RtRefusal::Quiesced
         );
         assert!(counted(code) > before, "{code}");
+    }
+
+    /// rt's refusal of an imageblock length is counted under its own code, not with rt's other
+    /// gaps; any other refusal of the length under its kind's.
+    #[test]
+    fn an_imageblock_length_refusal_is_counted_apart() {
+        let gap = rt::Error::Unsupported(rt::Gap::ImageblockLength);
+        let (before, gaps) = (counted(IMAGEBLOCK_LENGTH), counted(RtRefusal::Gap.code()));
+        rt_refused_imageblock("imageblockSampleLength", &gap);
+        rt_refused_imageblock("imageblockSampleLength", &gap);
+        assert_eq!(counted(IMAGEBLOCK_LENGTH), before + 2);
+        assert_eq!(counted(RtRefusal::Gap.code()), gaps);
+        let code = RtRefusal::Quiesced.code();
+        let before = counted(code);
+        rt_refused_imageblock("imageblockSampleLength", &rt::Error::Quiesced);
+        assert_eq!(counted(code), before + 1);
     }
 
     /// A creator with an `error:` out-parameter answers an `NSError` naming the piece and its
