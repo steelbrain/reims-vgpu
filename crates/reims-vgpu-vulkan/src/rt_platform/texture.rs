@@ -707,7 +707,12 @@ impl GpuResource<RtPlatform> for RtObj<RtTexture> {
 
     /// [`set_purgeable`]'s.
     fn set_purgeable_state(&self, state: u64) -> RaiseResult<u64> {
-        Ok(set_purgeable(&self.purgeable, state))
+        let recorded_call = crate::recorder::rec_call!("setPurgeableState:", self, state);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<u64> {
+            Ok(set_purgeable(&self.purgeable, state))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Bits 4 to 7 of its resource options.
@@ -729,14 +734,18 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
     /// (`super::tiled`). Nothing for any other: a texture over a buffer reads the buffer's bytes,
     /// whose changes a Managed buffer's `didModifyRange:` names to rt.
     fn did_modify_data(&self) {
-        if let Some(tiled) = self.tiled() {
-            tiled.modified();
-        }
+        let recorded_call = crate::recorder::rec_call!("didModifyData", self);
+        crate::recorder::run(|| {
+            if let Some(tiled) = self.tiled() {
+                tiled.modified();
+            }
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     /// rt's: its index and the translator's word of its format and swizzle.
     fn gpu_resource_id(&self) -> u64 {
-        self.rt.gpu_resource_id().to_bits()
+        crate::recorder::plain_resource_id(self, || self.rt.gpu_resource_id().to_bits())
     }
 
     fn height(&self) -> u64 {
@@ -756,13 +765,25 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
     fn new_shared_texture_handle(
         &self,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::SharedTextureHandle>> {
-        refuse_create(Unbuilt::SharedTexture, "newSharedTextureHandle");
-        Ok(None)
+        let recorded_call = crate::recorder::rec_call!("newSharedTextureHandle", self);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::SharedTextureHandle>> {
+                refuse_create(Unbuilt::SharedTexture, "newSharedTextureHandle");
+                Ok(None)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn new_texture_view(&self, pixel_format: u64) -> RaiseResult<Option<RtObj<RtTexture>>> {
-        let sel = "newTextureViewWithPixelFormat:";
-        Ok(self.view(sel, pixel_format, None, None, None, None, 0))
+        let recorded_call =
+            crate::recorder::rec_call!("newTextureViewWithPixelFormat:", self, pixel_format);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtTexture>>> {
+            let sel = "newTextureViewWithPixelFormat:";
+            Ok(self.view(sel, pixel_format, None, None, None, None, 0))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn new_texture_view_at_index(
@@ -770,8 +791,18 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
         pixel_format: u64,
         resource_index: u64,
     ) -> RaiseResult<Option<RtObj<RtTexture>>> {
-        let sel = "newTextureViewWithPixelFormat:resourceIndex:";
-        Ok(self.view(sel, pixel_format, None, None, None, None, resource_index))
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureViewWithPixelFormat:resourceIndex:",
+            self,
+            pixel_format,
+            resource_index
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtTexture>>> {
+            let sel = "newTextureViewWithPixelFormat:resourceIndex:";
+            Ok(self.view(sel, pixel_format, None, None, None, None, resource_index))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn new_texture_subview(
@@ -781,17 +812,29 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
         level_range: NsRange,
         slice_range: NsRange,
     ) -> RaiseResult<Option<RtObj<RtTexture>>> {
-        let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:";
-        let (levels, slices) = (Some(level_range), Some(slice_range));
-        Ok(self.view(
-            sel,
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureViewWithPixelFormat:textureType:levels:slices:",
+            self,
             pixel_format,
-            Some(texture_type),
-            levels,
-            slices,
-            None,
-            0,
-        ))
+            texture_type,
+            level_range,
+            slice_range
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtTexture>>> {
+            let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:";
+            let (levels, slices) = (Some(level_range), Some(slice_range));
+            Ok(self.view(
+                sel,
+                pixel_format,
+                Some(texture_type),
+                levels,
+                slices,
+                None,
+                0,
+            ))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn new_swizzled_texture_subview(
@@ -802,18 +845,31 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
         slice_range: NsRange,
         swizzle: Swizzle,
     ) -> RaiseResult<Option<RtObj<RtTexture>>> {
-        let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:";
-        let (levels, slices) = (Some(level_range), Some(slice_range));
-        let texture_type = Some(texture_type);
-        Ok(self.view(
-            sel,
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:",
+            self,
             pixel_format,
             texture_type,
-            levels,
-            slices,
-            Some(swizzle),
-            0,
-        ))
+            level_range,
+            slice_range,
+            swizzle
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtTexture>>> {
+            let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:";
+            let (levels, slices) = (Some(level_range), Some(slice_range));
+            let texture_type = Some(texture_type);
+            Ok(self.view(
+                sel,
+                pixel_format,
+                texture_type,
+                levels,
+                slices,
+                Some(swizzle),
+                0,
+            ))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn new_swizzled_texture_subview_at_index(
@@ -825,18 +881,32 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
         swizzle: Swizzle,
         resource_index: u64,
     ) -> RaiseResult<Option<RtObj<RtTexture>>> {
-        let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:resourceIndex:";
-        let (levels, slices) = (Some(levels), Some(slices));
-        let (texture_type, swizzle) = (Some(texture_type), Some(swizzle));
-        Ok(self.view(
-            sel,
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:resourceIndex:",
+            self,
             pixel_format,
             texture_type,
             levels,
             slices,
             swizzle,
-            resource_index,
-        ))
+            resource_index
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtTexture>>> {
+            let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:resourceIndex:";
+            let (levels, slices) = (Some(levels), Some(slices));
+            let (texture_type, swizzle) = (Some(texture_type), Some(swizzle));
+            Ok(self.view(
+                sel,
+                pixel_format,
+                texture_type,
+                levels,
+                slices,
+                swizzle,
+                resource_index,
+            ))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn new_texture_subview_at_index(
@@ -847,18 +917,31 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
         slices: NsRange,
         resource_index: u64,
     ) -> RaiseResult<Option<RtObj<RtTexture>>> {
-        let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:resourceIndex:";
-        let (levels, slices) = (Some(levels), Some(slices));
-        let texture_type = Some(texture_type);
-        Ok(self.view(
-            sel,
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureViewWithPixelFormat:textureType:levels:slices:resourceIndex:",
+            self,
             pixel_format,
             texture_type,
             levels,
             slices,
-            None,
-            resource_index,
-        ))
+            resource_index
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtTexture>>> {
+            let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:resourceIndex:";
+            let (levels, slices) = (Some(levels), Some(slices));
+            let texture_type = Some(texture_type);
+            Ok(self.view(
+                sel,
+                pixel_format,
+                texture_type,
+                levels,
+                slices,
+                None,
+                resource_index,
+            ))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn pixel_format(&self) -> u64 {
@@ -884,37 +967,51 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
         bytes_per_row: u64,
         bytes_per_image: u64,
     ) -> RaiseResult<()> {
-        let (Some(r), Ok(level), Ok(slice)) = (
-            rt_region(region),
-            u32::try_from(level),
-            u32::try_from(slice),
-        ) else {
-            let why = format!("the region {region:?} of level {level} and slice {slice}");
-            refused_as(REPLACE, RtRefusal::Refused, &why);
-            return Ok(());
-        };
-        let bytes = crate::gpu::resource::first_bytes(REPLACE, pixel_bytes, usize::MAX);
-        counted_copy(bytes.len());
-        if level == 0
-            && let Some(tiled) = self.tiled()
-        {
-            if let Err((kind, why)) = tiled.replace(region, u64::from(slice), &bytes, bytes_per_row)
-            {
-                refused_as(REPLACE, kind, &why);
-            }
-            return Ok(());
-        }
-        if let Err(error) = (self.rt).replace_region(
-            r,
+        let recorded_call = crate::recorder::rec_call!(
+            "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:",
+            self,
+            region,
             level,
             slice,
-            rt::HostBytes::from(bytes.as_slice()),
+            pixel_bytes,
             bytes_per_row,
-            bytes_per_image,
-        ) {
-            rt_refused(REPLACE, &error);
-        }
-        Ok(())
+            bytes_per_image
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let (Some(r), Ok(level), Ok(slice)) = (
+                rt_region(region),
+                u32::try_from(level),
+                u32::try_from(slice),
+            ) else {
+                let why = format!("the region {region:?} of level {level} and slice {slice}");
+                refused_as(REPLACE, RtRefusal::Refused, &why);
+                return Ok(());
+            };
+            let bytes = crate::gpu::resource::first_bytes(REPLACE, pixel_bytes, usize::MAX);
+            counted_copy(bytes.len());
+            if level == 0
+                && let Some(tiled) = self.tiled()
+            {
+                if let Err((kind, why)) = tiled.replace(region, u64::from(slice), &bytes, bytes_per_row)
+                {
+                    refused_as(REPLACE, kind, &why);
+                }
+                return Ok(());
+            }
+            if let Err(error) = (self.rt).replace_region(
+                r,
+                level,
+                slice,
+                rt::HostBytes::from(bytes.as_slice()),
+                bytes_per_row,
+                bytes_per_image,
+            ) {
+                rt_refused(REPLACE, &error);
+            }
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Its index (the module's docs): 0 for a texture no shader reaches.

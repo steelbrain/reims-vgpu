@@ -605,12 +605,35 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         options: u64,
         deallocator: Option<NoCopyDeallocator>,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
-        let _ = on;
-        let sel = "newBufferWithBytesNoCopy:length:options:deallocator:";
-        let length = bytes.len();
-        let made =
-            buffer::over_host_memory(self, sel, bytes, length, options, None, None, deallocator);
-        Ok(made)
+        let mut recorded_call = crate::recorder::rec_call!(
+            "newBufferWithBytesNoCopy:length:options:deallocator:",
+            self,
+            bytes,
+            options,
+            deallocator
+        );
+        // The bytes the create copies into the device's own copy of a `Managed` buffer.
+        if recorded_call.is_some() {
+            let two_copies = !self.facts().unified_memory;
+            crate::recorder::no_copy_contents_with(
+                &mut recorded_call,
+                two_copies,
+                options,
+                bytes,
+                None,
+            );
+        }
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+                let _ = on;
+                let sel = "newBufferWithBytesNoCopy:length:options:deallocator:";
+                let length = bytes.len();
+                let made =
+                    buffer::over_host_memory(self, sel, bytes, length, options, None, None, deallocator);
+                Ok(made)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A buffer of zeros in blocks of its own ([`buffer::of_length`]); nil where Metal or rt
@@ -621,9 +644,16 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         length: u64,
         options: u64,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
-        let _ = on;
-        let sel = "newBufferWithLength:options:";
-        Ok(buffer::of_length(self, sel, length, options))
+        let recorded_call =
+            crate::recorder::rec_call!("newBufferWithLength:options:", self, length, options);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+                let _ = on;
+                let sel = "newBufferWithLength:options:";
+                Ok(buffer::of_length(self, sel, length, options))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// [`new_buffer_of_length`](GpuDevice::new_buffer_of_length)'s, a Shared one not zeroed
@@ -634,9 +664,16 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         length: u64,
         options: u64,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
-        let _ = on;
-        let sel = "newBufferWithLength:options:";
-        Ok(buffer::scratch_of_length(self, sel, length, options))
+        let recorded_call =
+            crate::recorder::rec_call!("newBufferWithLength:options:", self, length, options);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+                let _ = on;
+                let sel = "newBufferWithLength:options:";
+                Ok(buffer::scratch_of_length(self, sel, length, options))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A buffer of zeros of its own exported block, whose memory CUDA imports as an opaque fd
@@ -650,11 +687,23 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         options: u64,
         aligned_byte: Option<u64>,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
-        let _ = on;
-        let sel = "newBufferWithLength:options: (exportable)";
-        let handle = rt::ExportHandle::OpaqueFd;
-        let made = super::export::exportable(self, sel, handle, length, options, aligned_byte);
-        Ok(made)
+        let recorded_call = crate::recorder::rec_call!(
+            "m2v.newExportableBufferOfLength",
+            self,
+            length,
+            options,
+            aligned_byte
+        );
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+                let _ = on;
+                let sel = "newBufferWithLength:options: (exportable)";
+                let handle = rt::ExportHandle::OpaqueFd;
+                let made = super::export::exportable(self, sel, handle, length, options, aligned_byte);
+                Ok(made)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A buffer of zeros of its own exported block, whose memory VA-API imports as a dma-buf
@@ -669,11 +718,23 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         options: u64,
         aligned_byte: Option<u64>,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
-        let _ = on;
-        let sel = "newBufferWithLength:options: (dma-buf)";
-        let handle = rt::ExportHandle::DmaBuf;
-        let made = super::export::exportable(self, sel, handle, length, options, aligned_byte);
-        Ok(made)
+        let recorded_call = crate::recorder::rec_call!(
+            "m2v.newDmaBufBufferOfLengthPaddingUnobserved",
+            self,
+            length,
+            options,
+            aligned_byte
+        );
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+                let _ = on;
+                let sel = "newBufferWithLength:options: (dma-buf)";
+                let handle = rt::ExportHandle::DmaBuf;
+                let made = super::export::exportable(self, sel, handle, length, options, aligned_byte);
+                Ok(made)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's exported surface of `desc`'s planes (`super::surface`); `None` where rt makes none,
@@ -690,19 +751,29 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
 
     /// rt's queue, of Metal's default `maxCommandBufferCount`; nil where rt refuses it.
     fn new_command_queue(&self) -> Option<RtObj<RtQueue>> {
-        match self.rt.new_command_queue(METAL_MAX_COMMAND_BUFFER_COUNT) {
-            Ok(queue) => Some(RtObj::new(RtQueue::new(queue, self.clone_ref()))),
-            Err(error) => {
-                rt_refused_create("newCommandQueue", &error);
-                None
+        let recorded_call = crate::recorder::rec_call!("newCommandQueue", self);
+        let recorded_answer = crate::recorder::run(|| -> Option<RtObj<RtQueue>> {
+            match self.rt.new_command_queue(METAL_MAX_COMMAND_BUFFER_COUNT) {
+                Ok(queue) => Some(RtObj::new(RtQueue::new(queue, self.clone_ref()))),
+                Err(error) => {
+                    rt_refused_create("newCommandQueue", &error);
+                    None
+                }
             }
-        }
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// [`new_command_queue`](GpuDevice::new_command_queue)'s: rt submits every command queue's
     /// work to its one GPU queue.
     fn new_command_queue_unshared(&self) -> Option<RtObj<RtQueue>> {
-        self.new_command_queue()
+        let recorded_call = crate::recorder::rec_call!("m2v.newCommandQueueUnshared", self);
+        let recorded_answer = crate::recorder::run(|| -> Option<RtObj<RtQueue>> {
+            self.new_command_queue()
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// No: rt copies no guest RAM by its host addresses.
@@ -723,32 +794,58 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         &self,
         compute_function: Option<&<RtPlatform as Platform>::Function>,
     ) -> Result<Option<<RtPlatform as Platform>::ComputePipeline>, NsErrorText> {
-        let Some(function) = compute_function else {
-            return Ok(None);
-        };
-        pipeline::of_function(self, function).map(Some)
+        let recorded_call = crate::recorder::rec_call!(
+            "newComputePipelineStateWithFunction:error:",
+            self,
+            compute_function
+        );
+        let recorded_answer =
+            crate::recorder::run(|| -> Result<Option<<RtPlatform as Platform>::ComputePipeline>, NsErrorText> {
+                let Some(function) = compute_function else {
+                    return Ok(None);
+                };
+                pipeline::of_function(self, function).map(Some)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The platform's shaders, read once (`super::library`).
     fn new_shader_library(&self) -> Result<Option<<RtPlatform as Platform>::Library>, NsErrorText> {
-        library::shader_library(&self.shaders).map(Some)
+        let recorded_call = crate::recorder::rec_call!("newLibraryWithSource:options:error:", self);
+        let recorded_answer =
+            crate::recorder::run(|| -> Result<Option<<RtPlatform as Platform>::Library>, NsErrorText> {
+                library::shader_library(&self.shaders).map(Some)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's event; nil where rt refuses it.
     fn new_event(&self, on: OnFault) -> RaiseResult<Option<RtObj<rt::Event>>> {
-        let _ = on;
-        Ok(match self.rt.new_event() {
-            Ok(event) => Some(RtObj::new(event)),
-            Err(error) => {
-                rt_refused_create("newEvent", &error);
-                None
-            }
-        })
+        let recorded_call = crate::recorder::rec_call!("newEvent", self);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<rt::Event>>> {
+            let _ = on;
+            Ok(match self.rt.new_event() {
+                Ok(event) => Some(RtObj::new(event)),
+                Err(error) => {
+                    rt_refused_create("newEvent", &error);
+                    None
+                }
+            })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's fence.
     fn new_fence(&self) -> RaiseResult<Option<RtObj<rt::Fence>>> {
-        Ok(Some(RtObj::new(self.rt.new_fence())))
+        let recorded_call = crate::recorder::rec_call!("newFence", self);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<rt::Fence>>> {
+            Ok(Some(RtObj::new(self.rt.new_fence())))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The translator's library of a metallib (`super::library`).
@@ -756,7 +853,13 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         &self,
         data: &[u8],
     ) -> RaiseResult<Result<Option<<RtPlatform as Platform>::Library>, NsErrorText>> {
-        Ok(library::new_library(data).map(Some))
+        let recorded_call = crate::recorder::rec_call!("newLibraryWithData:error:", self, data);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Result<Option<<RtPlatform as Platform>::Library>, NsErrorText>> {
+                Ok(library::new_library(data).map(Some))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Unbuilt ([`Unbuilt::DynamicLibrary`]): the `NSError`.
@@ -764,11 +867,17 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         &self,
         library: &<RtPlatform as Platform>::Library,
     ) -> RaiseResult<Result<Option<<RtPlatform as Platform>::DynamicLibrary>, NsErrorText>> {
-        let _ = library;
-        Ok(Err(refused_error(
-            Unbuilt::DynamicLibrary,
-            "newDynamicLibrary:error:",
-        )))
+        let recorded_call = crate::recorder::rec_call!("newDynamicLibrary:error:", self, library);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Result<Option<<RtPlatform as Platform>::DynamicLibrary>, NsErrorText>> {
+                let _ = library;
+                Ok(Err(refused_error(
+                    Unbuilt::DynamicLibrary,
+                    "newDynamicLibrary:error:",
+                )))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Unbuilt: nil ([`Unbuilt::RateMap`]).
@@ -776,20 +885,33 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         &self,
         descriptor: &<RtPlatform as Platform>::RateMapDescriptor,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::RateMap>> {
-        let _ = descriptor;
-        refuse_create(Unbuilt::RateMap, "newRasterizationRateMapWithDescriptor:");
-        Ok(None)
+        let recorded_call =
+            crate::recorder::rec_call!("newRasterizationRateMapWithDescriptor:", self, descriptor);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::RateMap>> {
+                let _ = descriptor;
+                refuse_create(Unbuilt::RateMap, "newRasterizationRateMapWithDescriptor:");
+                Ok(None)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's shared event ([`super::event`]); nil where rt refuses it, counted.
     fn new_shared_event(&self) -> Option<<RtPlatform as Platform>::SharedEvent> {
-        match self.rt.new_shared_event() {
-            Ok(event) => Some(RtObj::new(event)),
-            Err(error) => {
-                rt_refused_create("newSharedEvent", &error);
-                None
-            }
-        }
+        let recorded_call = crate::recorder::rec_call!("newSharedEvent", self);
+        let recorded_answer =
+            crate::recorder::run(|| -> Option<<RtPlatform as Platform>::SharedEvent> {
+                match self.rt.new_shared_event() {
+                    Ok(event) => Some(RtObj::new(event)),
+                    Err(error) => {
+                        rt_refused_create("newSharedEvent", &error);
+                        None
+                    }
+                }
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Unbuilt: nil ([`Unbuilt::SharedTexture`]).
@@ -797,9 +919,16 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         &self,
         descriptor: &<RtPlatform as Platform>::TextureDescriptor,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
-        let _ = descriptor;
-        refuse_create(Unbuilt::SharedTexture, "newSharedTextureWithDescriptor:");
-        Ok(None)
+        let recorded_call =
+            crate::recorder::rec_call!("newSharedTextureWithDescriptor:", self, descriptor);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
+                let _ = descriptor;
+                refuse_create(Unbuilt::SharedTexture, "newSharedTextureWithDescriptor:");
+                Ok(None)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Unbuilt: nil ([`Unbuilt::SharedTexture`]).
@@ -808,15 +937,26 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         handle: Option<&<RtPlatform as Platform>::SharedTextureHandle>,
         resource_index: u64,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
-        if let Some(handle) = handle {
-            handle.unreachable()
-        }
-        let _ = resource_index;
-        refuse_create(
-            Unbuilt::SharedTexture,
+        let recorded_call = crate::recorder::rec_call!(
             "newSharedTextureWithHandle:withResourceIndex:",
+            self,
+            handle,
+            resource_index
         );
-        Ok(None)
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
+                if let Some(handle) = handle {
+                    handle.unreachable()
+                }
+                let _ = resource_index;
+                refuse_create(
+                    Unbuilt::SharedTexture,
+                    "newSharedTextureWithHandle:withResourceIndex:",
+                );
+                Ok(None)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's texture of the descriptor ([`super::texture::make`]); nil where rt refuses it,
@@ -826,9 +966,16 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         on: OnFault,
         descriptor: &<RtPlatform as Platform>::TextureDescriptor,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
-        let _ = on;
-        let sel = "newTextureWithDescriptor:";
-        Ok(super::texture::make(self, sel, &descriptor.desc()))
+        let recorded_call =
+            crate::recorder::rec_call!("newTextureWithDescriptor:", self, descriptor);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
+                let _ = on;
+                let sel = "newTextureWithDescriptor:";
+                Ok(super::texture::make(self, sel, &descriptor.desc()))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Textures' (type 0) and sampler states' (type 1) indices as rt's grants of their class
@@ -836,26 +983,36 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     /// indirect command buffers' (type 5) are unbuilt ([`Unbuilt::Icb`]), and those of another
     /// type ([`Unbuilt::ResourceType`]): each reserves nothing. Never a raise.
     fn reserve_resource_indices(&self, resource_type: u64, indices: &[u64]) -> RaiseResult<()> {
-        let class = match resource_type {
-            0 => {
-                self.indices.reserve(indices);
-                rt::IndexClass::Texture
-            }
-            1 => {
-                self.sampler_indices.reserve(indices);
-                rt::IndexClass::Sampler
-            }
-            5 => {
-                refuse(Unbuilt::Icb, RESERVE);
-                return Ok(());
-            }
-            _ => {
-                refuse(Unbuilt::ResourceType, RESERVE);
-                return Ok(());
-            }
-        };
-        grant(&self.rt, RESERVE, class, indices);
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!(
+            "reserveResourceIndicesForResourceType:indices:indexCount:",
+            self,
+            resource_type,
+            indices
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let class = match resource_type {
+                0 => {
+                    self.indices.reserve(indices);
+                    rt::IndexClass::Texture
+                }
+                1 => {
+                    self.sampler_indices.reserve(indices);
+                    rt::IndexClass::Sampler
+                }
+                5 => {
+                    refuse(Unbuilt::Icb, RESERVE);
+                    return Ok(());
+                }
+                _ => {
+                    refuse(Unbuilt::ResourceType, RESERVE);
+                    return Ok(());
+                }
+            };
+            grant(&self.rt, RESERVE, class, indices);
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's description ([`super::format::description`]): Metal's on an Apple GPU, on every
@@ -913,17 +1070,47 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         &self,
         desc: BufferDesc<'_>,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
-        Ok(buffer::of_desc(self, desc))
+        let mut recorded_call = crate::recorder::rec_call!("newBufferWithDescriptor:", self, desc);
+        // The bytes a copy starts with; a no-copy buffer's arrive as writes, but those the create
+        // copies into the device's own copy of a `Managed` one.
+        if recorded_call.is_some()
+            && let Some(bytes) = desc.contents
+        {
+            if desc.no_copy {
+                let options = descriptor_options(buffer::BUFFER_DESCRIPTOR_OPTIONS, &desc.options);
+                let two_copies = !self.facts().unified_memory;
+                crate::recorder::no_copy_contents_with(
+                    &mut recorded_call,
+                    two_copies,
+                    options,
+                    bytes,
+                    desc.zero_from,
+                );
+            } else {
+                crate::recorder::contents(&mut recorded_call, bytes);
+            }
+        }
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+                Ok(buffer::of_desc(self, desc))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// [`heap::of_desc`]'s, with the descriptor's options as Metal's descriptor holds them: nil
     /// where Metal or rt refuses it, or a sparse heap ([`Unbuilt::Heap`]), counted.
     fn new_heap(&self, desc: &HeapDesc) -> RaiseResult<HeapMade<RtPlatform>> {
-        let held = descriptor_options(HEAP_DESCRIPTOR_OPTIONS, &desc.options);
-        Ok(HeapMade {
-            heap: heap::of_desc(self, desc, held),
-            descriptor_resource_options: held,
-        })
+        let recorded_call = crate::recorder::rec_call!("newHeapWithDescriptor:", self, desc);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<HeapMade<RtPlatform>> {
+            let held = descriptor_options(HEAP_DESCRIPTOR_OPTIONS, &desc.options);
+            Ok(HeapMade {
+                heap: heap::of_desc(self, desc, held),
+                descriptor_resource_options: held,
+            })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// [`heap::over_host_memory`]'s, with the descriptor's options: nil where Metal or rt refuses
@@ -933,11 +1120,17 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         bytes: HostRange<'_>,
         desc: &HeapDesc,
     ) -> RaiseResult<HeapMade<RtPlatform>> {
-        let held = descriptor_options(HEAP_DESCRIPTOR_OPTIONS, &desc.options);
-        Ok(HeapMade {
-            heap: heap::over_host_memory(self, bytes, desc, held),
-            descriptor_resource_options: held,
-        })
+        let recorded_call =
+            crate::recorder::rec_call!("m2v.newBlockWithLength:storageMode:", self, bytes, desc);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<HeapMade<RtPlatform>> {
+            let held = descriptor_options(HEAP_DESCRIPTOR_OPTIONS, &desc.options);
+            Ok(HeapMade {
+                heap: heap::over_host_memory(self, bytes, desc, held),
+                descriptor_resource_options: held,
+            })
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's sampler state ([`super::state`]); nil, counted, where rt refuses it or a value is one
@@ -946,7 +1139,14 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         &self,
         desc: &SamplerDesc,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::SamplerState>> {
-        Ok(super::state::new_sampler_state(self, desc))
+        let recorded_call =
+            crate::recorder::rec_call!("newSamplerStateWithDescriptor:", self, desc);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::SamplerState>> {
+                Ok(super::state::new_sampler_state(self, desc))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's depth-stencil state ([`super::state`]); nil, counted, where a value is one rt has
@@ -955,7 +1155,14 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         &self,
         desc: &DepthStencilDesc,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::DepthStencilState>> {
-        Ok(super::state::new_depth_stencil_state(self, desc))
+        let recorded_call =
+            crate::recorder::rec_call!("newDepthStencilStateWithDescriptor:", self, desc);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::DepthStencilState>> {
+                Ok(super::state::new_depth_stencil_state(self, desc))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Unbuilt: nil ([`Unbuilt::Icb`]).
@@ -965,12 +1172,24 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         max_count: u64,
         options: u64,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Icb>> {
-        let _ = (desc, max_count, options);
-        refuse_create(
-            Unbuilt::Icb,
+        let recorded_call = crate::recorder::rec_call!(
             "newIndirectCommandBufferWithDescriptor:maxCommandCount:options:",
+            self,
+            desc,
+            max_count,
+            options
         );
-        Ok(None)
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Icb>> {
+                let _ = (desc, max_count, options);
+                refuse_create(
+                    Unbuilt::Icb,
+                    "newIndirectCommandBufferWithDescriptor:maxCommandCount:options:",
+                );
+                Ok(None)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The display's state (`super::render_pipeline`).
@@ -978,7 +1197,14 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         &self,
         desc: &RenderPipelineDesc<'_, RtPlatform>,
     ) -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
-        render_pipeline::of_value(self, desc).map(Some)
+        let recorded_call =
+            crate::recorder::rec_call!("newRenderPipelineStateWithDescriptor:error:", self, desc);
+        let recorded_answer =
+            crate::recorder::run(|| -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
+                render_pipeline::of_value(self, desc).map(Some)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The state of the whole descriptor (`super::render_pipeline`).
@@ -986,7 +1212,14 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         &self,
         desc: &FullRenderPipelineDesc<'_, RtPlatform>,
     ) -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
-        render_pipeline::of_descriptor(self, desc).map(Some)
+        let recorded_call =
+            crate::recorder::rec_call!("newRenderPipelineStateWithDescriptor:error:", self, desc);
+        let recorded_answer =
+            crate::recorder::run(|| -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
+                render_pipeline::of_descriptor(self, desc).map(Some)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Unbuilt ([`Unbuilt::MeshPipeline`]): the `NSError`.
@@ -994,7 +1227,17 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         &self,
         desc: &FullMeshRenderPipelineDesc<'_, RtPlatform>,
     ) -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
-        render_pipeline::of_mesh_descriptor(desc).map(Some)
+        let recorded_call = crate::recorder::rec_call!(
+            "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:",
+            self,
+            desc
+        );
+        let recorded_answer =
+            crate::recorder::run(|| -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
+                render_pipeline::of_mesh_descriptor(desc).map(Some)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's state of the whole descriptor (`super::pipeline`).
@@ -1002,7 +1245,17 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         &self,
         desc: &FullComputePipelineDesc<'_, RtPlatform>,
     ) -> Result<Option<<RtPlatform as Platform>::ComputePipeline>, NsErrorText> {
-        pipeline::of_descriptor(self, desc).map(Some)
+        let recorded_call = crate::recorder::rec_call!(
+            "newComputePipelineStateWithDescriptor:options:reflection:error:",
+            self,
+            desc
+        );
+        let recorded_answer =
+            crate::recorder::run(|| -> Result<Option<<RtPlatform as Platform>::ComputePipeline>, NsErrorText> {
+                pipeline::of_descriptor(self, desc).map(Some)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 }
 

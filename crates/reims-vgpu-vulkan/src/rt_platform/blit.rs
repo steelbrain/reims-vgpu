@@ -431,22 +431,27 @@ impl BlitEncoder<RtPlatform> for RtObj<RtBlitEncoder> {
     /// rt's command (the module's docs); `endEncoding` ends rt's encoder. A command after it is
     /// Metal's refusal, counted.
     fn encode(&self, on: OnFault, cmd: BlitCmd<'_, RtPlatform>) -> RaiseResult<()> {
-        let _ = on;
-        let sel = cmd.selector();
-        let mut open = self.rt.lock();
-        let ending = matches!(cmd, BlitCmd::EndEncoding);
-        self.note_uses(&cmd);
-        let stopped = match open.as_mut() {
-            Some(e) => encode(e, cmd).err(),
-            None => Some(Stop::Metal("a command after endEncoding")),
-        };
-        if ending && let Some(e) = open.take() {
-            e.end_encoding();
-            self.open.end();
-        }
-        drop(open);
-        report(sel, stopped);
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!(@cmd self, cmd);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let _ = on;
+            let sel = cmd.selector();
+            let mut open = self.rt.lock();
+            let ending = matches!(cmd, BlitCmd::EndEncoding);
+            self.note_uses(&cmd);
+            let stopped = match open.as_mut() {
+                Some(e) => encode(e, cmd).err(),
+                None => Some(Stop::Metal("a command after endEncoding")),
+            };
+            if ending && let Some(e) = open.take() {
+                e.end_encoding();
+                self.open.end();
+            }
+            drop(open);
+            report(sel, stopped);
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// False: the device copies none of the guest's RAM.

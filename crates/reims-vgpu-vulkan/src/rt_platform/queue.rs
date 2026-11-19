@@ -40,18 +40,24 @@ impl CommandQueue<RtPlatform> for RtObj<RtQueue> {
         &self,
         on: OnFault,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
-        let _ = on;
-        Ok(match self.rt.command_buffer() {
-            Ok(made) => Some(RtObj::new(RtCommandBuffer::new(
-                made,
-                self.rt.clone(),
-                self.device.clone_ref(),
-            ))),
-            Err(error) => {
-                rt_refused_create("commandBuffer", &error);
-                None
-            }
-        })
+        let recorded_call = crate::recorder::rec_call!("commandBuffer", self);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
+                let _ = on;
+                Ok(match self.rt.command_buffer() {
+                    Ok(made) => Some(RtObj::new(RtCommandBuffer::new(
+                        made,
+                        self.rt.clone(),
+                        self.device.clone_ref(),
+                    ))),
+                    Err(error) => {
+                        rt_refused_create("commandBuffer", &error);
+                        None
+                    }
+                })
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Nothing: a label is a diagnostic, and nothing reads it back.

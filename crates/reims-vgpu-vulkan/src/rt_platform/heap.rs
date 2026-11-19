@@ -316,32 +316,43 @@ impl Heap<RtPlatform> for RtObj<RtHeap> {
         options: u64,
         offset: u64,
     ) -> RaiseResult<Option<RtObj<RtBuffer>>> {
-        const SEL: &str = "newBufferWithLength:options:offset:";
-        if options & !(FIELDS | BIT_20 | READ_ONLY) != 0 {
-            return Ok(refused_metal(
-                SEL,
-                &format!("resource options {options:#x}"),
-            ));
-        }
-        let misplaced = match offset.is_multiple_of(PLACEMENT_ALIGNMENT) {
-            true => self.misplaced(Some(options), offset, Some(length)),
-            false => Some(format!("offset {offset:#x}")),
-        };
-        if let Some(why) = misplaced {
-            return Ok(refused_metal(SEL, &why));
-        }
-        if length > rt::MAX_BUFFER_LENGTH {
-            return Ok(refused_metal(SEL, &format!("a buffer of {length} bytes")));
-        }
-        let made = match (self.device.rt()).new_heap_buffer(self.range(), offset, length) {
-            Ok(made) => made,
-            Err(error) => {
-                rt_refused_create(SEL, &error);
-                return Ok(None);
+        let recorded_call = crate::recorder::rec_call!(
+            "newBufferWithLength:options:offset:",
+            self,
+            length,
+            options,
+            offset
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtBuffer>>> {
+            const SEL: &str = "newBufferWithLength:options:offset:";
+            if options & !(FIELDS | BIT_20 | READ_ONLY) != 0 {
+                return Ok(refused_metal(
+                    SEL,
+                    &format!("resource options {options:#x}"),
+                ));
             }
-        };
-        let buffer = buffer::buffer_of(&self.device, made, self.options, true, None);
-        Ok(Some(buffer))
+            let misplaced = match offset.is_multiple_of(PLACEMENT_ALIGNMENT) {
+                true => self.misplaced(Some(options), offset, Some(length)),
+                false => Some(format!("offset {offset:#x}")),
+            };
+            if let Some(why) = misplaced {
+                return Ok(refused_metal(SEL, &why));
+            }
+            if length > rt::MAX_BUFFER_LENGTH {
+                return Ok(refused_metal(SEL, &format!("a buffer of {length} bytes")));
+            }
+            let made = match (self.device.rt()).new_heap_buffer(self.range(), offset, length) {
+                Ok(made) => made,
+                Err(error) => {
+                    rt_refused_create(SEL, &error);
+                    return Ok(None);
+                }
+            };
+            let buffer = buffer::buffer_of(&self.device, made, self.options, true, None);
+            Ok(Some(buffer))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's texture of `descriptor` bound at `offset` in the heap (rt's `new_heap_texture`), at an
@@ -353,25 +364,35 @@ impl Heap<RtPlatform> for RtObj<RtHeap> {
         descriptor: &RtObj<TextureFields>,
         offset: u64,
     ) -> RaiseResult<Option<RtObj<RtTexture>>> {
-        const SEL: &str = "newTextureWithDescriptor:offset:";
-        let desc = descriptor.desc();
-        if let Some(why) = self.misplaced(desc.resource_options, offset, None) {
-            return Ok(refused_metal(SEL, &why));
-        }
-        let range = self.range();
-        let over = |d: &rt::TextureDescriptor, index: Option<u32>| {
-            (self.device.rt()).new_heap_texture(d, index, range, offset)
-        };
-        let held = (self.options, FIELDS);
-        let made = |shape: &diag::Shape| Made::new(Call::InHeap, shape);
-        Ok(texture::make_over(
-            &self.device,
-            SEL,
-            &desc,
-            held,
-            over,
-            made,
-        ))
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureWithDescriptor:offset:",
+            self,
+            descriptor,
+            offset
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtTexture>>> {
+            const SEL: &str = "newTextureWithDescriptor:offset:";
+            let desc = descriptor.desc();
+            if let Some(why) = self.misplaced(desc.resource_options, offset, None) {
+                return Ok(refused_metal(SEL, &why));
+            }
+            let range = self.range();
+            let over = |d: &rt::TextureDescriptor, index: Option<u32>| {
+                (self.device.rt()).new_heap_texture(d, index, range, offset)
+            };
+            let held = (self.options, FIELDS);
+            let made = |shape: &diag::Shape| Made::new(Call::InHeap, shape);
+            Ok(texture::make_over(
+                &self.device,
+                SEL,
+                &desc,
+                held,
+                over,
+                made,
+            ))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The asked ones without bits 20 and 24, a default hazard tracking resolved to untracked.
@@ -381,7 +402,12 @@ impl Heap<RtPlatform> for RtObj<RtHeap> {
 
     /// `super::texture::set_purgeable`'s.
     fn set_purgeable_state(&self, state: u64) -> RaiseResult<u64> {
-        Ok(texture::set_purgeable(&self.purgeable, state))
+        let recorded_call = crate::recorder::rec_call!("setPurgeableState:", self, state);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<u64> {
+            Ok(texture::set_purgeable(&self.purgeable, state))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Bits 4 to 7 of its resource options.

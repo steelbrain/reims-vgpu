@@ -5,7 +5,8 @@
 //! hooked method costs one relaxed load and a branch, and nothing else changes.
 //!
 //! - **What is recorded.** Each method of the platform's handles that core calls (the
-//!   `impl <Trait><VulkanPlatform>` methods of `gpu`) opens with [`rec_call!`] and ends with
+//!   `impl <Trait><VulkanPlatform>` methods of `gpu`, and with feature `rt` the
+//!   `impl <Trait><RtPlatform>` methods of `rt_platform`) opens with [`rec_call!`] and ends with
 //!   [`rec_done!`]: one call record per call core made, the outermost call alone where the
 //!   platform calls itself (a thread's depth, [`enter`]). Getters and queries are not hooked, but
 //!   for `gpuResourceID`, whose answer the program saw ([`resource_id`]).
@@ -700,10 +701,10 @@ pub mod spec {
     use crate::core::platform::event::EventRef;
     use crate::core::platform::host_range::HostRange;
     use crate::core::platform::types::NsRange;
+    use crate::core::platform::Platform;
     use crate::core::platform::values::{
         ColorAttachmentSet, DepthAttachmentSet, PassSet, StencilAttachmentSet,
     };
-    use crate::platform::VulkanPlatform;
 
     /// Integers, booleans and ranges, as their text reads.
     pub trait ViaScalar {
@@ -741,22 +742,22 @@ pub mod spec {
         /// The value.
         fn rec_value(&self) -> Value;
     }
-    impl ViaSet for &&V<'_, &PassSet<'_, VulkanPlatform>> {
+    impl<P: Platform> ViaSet for &&V<'_, &PassSet<'_, P>> {
         fn rec_value(&self) -> Value {
             with_cx(|cx| typed::pass_set(self.0, cx))
         }
     }
-    impl ViaSet for &&V<'_, &ColorAttachmentSet<'_, VulkanPlatform>> {
+    impl<P: Platform> ViaSet for &&V<'_, &ColorAttachmentSet<'_, P>> {
         fn rec_value(&self) -> Value {
             with_cx(|cx| typed::color_attachment(self.0, cx))
         }
     }
-    impl ViaSet for &&V<'_, &DepthAttachmentSet<'_, VulkanPlatform>> {
+    impl<P: Platform> ViaSet for &&V<'_, &DepthAttachmentSet<'_, P>> {
         fn rec_value(&self) -> Value {
             with_cx(|cx| typed::depth_attachment(self.0, cx))
         }
     }
-    impl ViaSet for &&V<'_, &StencilAttachmentSet<'_, VulkanPlatform>> {
+    impl<P: Platform> ViaSet for &&V<'_, &StencilAttachmentSet<'_, P>> {
         fn rec_value(&self) -> Value {
             with_cx(|cx| typed::stencil_attachment(self.0, cx))
         }
@@ -824,7 +825,11 @@ pub mod spec {
         /// The value.
         fn rec_value(&self) -> Value;
     }
-    impl ViaEvent for &&V<'_, Option<EventRef<'_, VulkanPlatform>>> {
+    impl<P: Platform> ViaEvent for &&V<'_, Option<EventRef<'_, P>>>
+    where
+        P::Event: super::RecObj,
+        P::SharedEvent: super::RecObj,
+    {
         fn rec_value(&self) -> Value {
             match self.0 {
                 Some(EventRef::Event(e)) => super::object_value(*e),
@@ -954,6 +959,46 @@ impl Made {
     }
 }
 
+/// An object handle of a platform's that the stream names: the Vulkan platform's [`Obj`], and with
+/// feature `rt` the rt platform's `RtObj`. Its pointer is its handle's id, the address of the
+/// object's allocation.
+pub trait RecObj {
+    /// The object's pointer.
+    fn rec_ptr(&self) -> u64;
+    /// The object, as a call made it.
+    fn rec_made(&self) -> Made;
+}
+
+impl<T: Send + Sync + 'static> RecObj for Obj<T> {
+    fn rec_ptr(&self) -> u64 {
+        self.id().0
+    }
+
+    fn rec_made(&self) -> Made {
+        Made::of(self)
+    }
+}
+
+#[cfg(feature = "rt")]
+impl<T: Send + Sync + 'static> RecObj for crate::rt_platform::RtObj<T> {
+    fn rec_ptr(&self) -> u64 {
+        self.id().0
+    }
+
+    fn rec_made(&self) -> Made {
+        use crate::rt_platform::{RtDevice, RtObj};
+        let weak: Weak<dyn Any + Send + Sync> = RtObj::downgrade(self);
+        Made {
+            ptr: self.id().0,
+            weak,
+            type_name: std::any::type_name::<T>(),
+            identity: (self as &dyn Any)
+                .downcast_ref::<RtObj<RtDevice>>()
+                .map(Identity::of_rt),
+        }
+    }
+}
+
 /// The selector of a device's identity record ([`Identity`]).
 pub const IDENTITY: &str = "m2v.deviceIdentity";
 
@@ -976,6 +1021,16 @@ impl Identity {
         Identity {
             name: props.name.clone(),
             unified: props.has_unified_memory,
+        }
+    }
+
+    /// The rt platform's device's: rt's `deviceName` and `hasUnifiedMemory`.
+    #[cfg(feature = "rt")]
+    fn of_rt(device: &crate::rt_platform::RtObj<crate::rt_platform::RtDevice>) -> Identity {
+        let facts = device.facts();
+        Identity {
+            name: facts.name.clone(),
+            unified: facts.unified_memory,
         }
     }
 
@@ -1005,6 +1060,13 @@ impl<T: Send + Sync + 'static> AsMade for Obj<T> {
     }
 }
 
+#[cfg(feature = "rt")]
+impl<T: Send + Sync + 'static> AsMade for crate::rt_platform::RtObj<T> {
+    fn as_made(&self) -> Option<Made> {
+        Some(self.rec_made())
+    }
+}
+
 impl<A: AsMade> AsMade for Option<A> {
     fn as_made(&self) -> Option<Made> {
         self.as_ref().and_then(AsMade::as_made)
@@ -1017,7 +1079,10 @@ impl<A: AsMade, E> AsMade for Result<A, E> {
     }
 }
 
-impl AsMade for crate::core::platform::values::HeapMade<crate::platform::VulkanPlatform> {
+impl<P: crate::core::platform::Platform> AsMade for crate::core::platform::values::HeapMade<P>
+where
+    P::Heap: AsMade,
+{
     fn as_made(&self) -> Option<Made> {
         self.heap.as_made()
     }
@@ -1036,6 +1101,20 @@ impl<T: Send + Sync + 'static> Receiver for Obj<T> {
 }
 
 impl Receiver for crate::platform::VulkanPlatform {
+    fn stream_id(&self) -> u64 {
+        0
+    }
+}
+
+#[cfg(feature = "rt")]
+impl<T: Send + Sync + 'static> Receiver for crate::rt_platform::RtObj<T> {
+    fn stream_id(&self) -> u64 {
+        receiver_id(self)
+    }
+}
+
+#[cfg(feature = "rt")]
+impl Receiver for crate::rt_platform::RtPlatform {
     fn stream_id(&self) -> u64 {
         0
     }
@@ -1084,8 +1163,8 @@ fn id_at(ptr: u64) -> Option<u64> {
     state()?.ptrs.lock().get(&ptr).copied()
 }
 
-fn object_value<T: Send + Sync + 'static>(o: &Obj<T>) -> Value {
-    match id_at(o.id().0) {
+fn object_value<O: RecObj>(o: &O) -> Value {
+    match id_at(o.rec_ptr()) {
         Some(id) => Value::Object(id),
         None => {
             if let Some(s) = state() {
@@ -1098,14 +1177,15 @@ fn object_value<T: Send + Sync + 'static>(o: &Obj<T>) -> Value {
 
 /// The receiver's id; a device the stream has not seen is adopted, with its
 /// `MTLCreateSystemDefaultDevice` record and its identity's.
-fn receiver_id<T: Send + Sync + 'static>(o: &Obj<T>) -> u64 {
+fn receiver_id<O: RecObj>(o: &O) -> u64 {
     let Some(state) = state() else { return 0 };
-    if let Some(id) = id_at(o.id().0) {
+    if let Some(id) = id_at(o.rec_ptr()) {
         return id;
     }
-    if std::any::type_name::<T>() == std::any::type_name::<crate::gpu::device::DeviceObject>() {
-        let mut made = Made::of(o);
-        let identity = made.identity.take();
+    let mut made = o.rec_made();
+    // A device's identity: only a device's made has one.
+    if let Some(identity) = made.identity.take() {
+        let identity = Some(identity);
         let id = state.register(made);
         let adopted = Item::Plain(Call {
             selector: "MTLCreateSystemDefaultDevice".to_owned(),
@@ -1125,11 +1205,20 @@ fn receiver_id<T: Send + Sync + 'static>(o: &Obj<T>) -> u64 {
 /// Gives a texture the stream never saw made (a window's drawable) a `newTextureWithDescriptor:`
 /// record of its shape, before its first use.
 pub fn adopt_texture(t: &VulkanTexture) {
+    adopt::<crate::platform::VulkanPlatform, _>(t);
+}
+
+/// [`adopt_texture`] of a texture of the platform `P`'s.
+fn adopt<P, T>(t: &T)
+where
+    P: crate::core::platform::Platform,
+    T: crate::core::platform::resource::Texture<P> + RecObj,
+{
     if !on() {
         return;
     }
     let Some(state) = state() else { return };
-    if id_at(t.id().0).is_some() {
+    if id_at(t.rec_ptr()).is_some() {
         return;
     }
     let _quiet = enter_recording();
@@ -1141,7 +1230,7 @@ pub fn adopt_texture(t: &VulkanTexture) {
         ("usage".to_owned(), Value::Uint(t.usage())),
         ("storageMode".to_owned(), Value::Uint(2)),
     ]);
-    let id = state.register(Made::of(t));
+    let id = state.register(t.rec_made());
     state.push_plain(Call {
         selector: "newTextureWithDescriptor:".to_owned(),
         result: id,
@@ -1179,23 +1268,50 @@ pub fn outside_descriptor(
 /// The guest's frame ends here, showing `t`: the texture over the surface a present names, as
 /// the device's display shows it (reims-vgpu's `Presented::show`), with a window or without one.
 /// A window's own draws of it into its drawables are ordinary command buffers in the stream.
-/// `t` is a texture of any platform; only the Vulkan platform's is recorded.
+/// `t` is a texture of any platform; the Vulkan platform's and the rt platform's are recorded.
 pub fn present(t: &dyn Any) {
     if !on() {
         return;
     }
-    let Some(t) = t.downcast_ref::<VulkanTexture>() else {
+    let Some(ptr) = adopt_shown(t) else {
         return;
     };
-    adopt_texture(t);
     let Some(state) = state() else { return };
-    let arg = id_at(t.id().0).map_or(Value::Nil, Value::Object);
+    let arg = id_at(ptr).map_or(Value::Nil, Value::Object);
     state.push_plain(Call {
         selector: "m2v.present".to_owned(),
         args: vec![arg],
         ..Call::default()
     });
     state.stats.presents.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The pointer of the texture `t` a present shows, adopted where the stream never saw it made
+/// ([`adopt_texture`]); `None` for a texture of a platform the recorder does not record.
+fn adopt_shown(t: &dyn Any) -> Option<u64> {
+    if let Some(t) = t.downcast_ref::<VulkanTexture>() {
+        adopt_texture(t);
+        return Some(t.rec_ptr());
+    }
+    #[cfg(feature = "rt")]
+    if let Some(t) = t.downcast_ref::<crate::rt_platform::RtObj<crate::rt_platform::RtTexture>>() {
+        adopt::<crate::rt_platform::RtPlatform, _>(t);
+        return Some(t.rec_ptr());
+    }
+    None
+}
+
+/// The pointer of the buffer `b`, a buffer of the Vulkan platform's or the rt platform's; `None`
+/// for one of a platform the recorder does not record.
+fn buffer_ptr(b: &dyn Any) -> Option<u64> {
+    if let Some(b) = b.downcast_ref::<VulkanBuffer>() {
+        return Some(b.rec_ptr());
+    }
+    #[cfg(feature = "rt")]
+    if let Some(b) = b.downcast_ref::<crate::rt_platform::RtObj<crate::rt_platform::RtBuffer>>() {
+        return Some(b.rec_ptr());
+    }
+    None
 }
 
 /// The selector of a no-copy buffer's escape record ([`buffer_escaped`]).
@@ -1215,19 +1331,19 @@ pub const BUFFER_ESCAPED: &str = "m2v.bufferEscaped";
 /// call returned ([`before_commit`]), and before those of each commit made after it. The guest's
 /// device carries a command buffer out only after the notes its process posted before it.
 ///
-/// `b` is a buffer of any platform; only the Vulkan platform's is recorded. The device makes each
-/// no-copy buffer by a recorded call (`newBufferWithDescriptor:`), so the buffer has its stream
-/// id: one with none is counted as an unrecorded receiver, with no record. The record is counted
-/// by its selector in `<pid>.stats.txt`.
+/// `b` is a buffer of any platform; the Vulkan platform's and the rt platform's are recorded. The
+/// device makes each no-copy buffer by a recorded call (`newBufferWithDescriptor:`), so the buffer
+/// has its stream id: one with none is counted as an unrecorded receiver, with no record. The
+/// record is counted by its selector in `<pid>.stats.txt`.
 pub fn buffer_escaped(b: &dyn Any, kind: u64) {
     if !on() {
         return;
     }
-    let Some(b) = b.downcast_ref::<VulkanBuffer>() else {
+    let Some(ptr) = buffer_ptr(b) else {
         return;
     };
     let Some(state) = state() else { return };
-    let Some(id) = id_at(b.id().0) else {
+    let Some(id) = id_at(ptr) else {
         (state.stats.unrecorded_receivers).fetch_add(1, Ordering::Relaxed);
         return;
     };
@@ -1519,8 +1635,8 @@ pub fn answer(active: &mut Option<Active>, key: &'static str, value: impl FnOnce
 /// `object`'s `gpuResourceID` as `read` answers it, recorded as a call of Metal's getter on it
 /// with its answer `gpuResourceID`: the ID the program saw, which a replay gives again where its
 /// runtime can. A getter that raises answers nothing.
-pub fn resource_id<T: Send + Sync + 'static, E>(
-    object: &Obj<T>,
+pub fn resource_id<O: Receiver + ?Sized, E>(
+    object: &O,
     read: impl FnOnce() -> Result<u64, E>,
 ) -> Result<u64, E> {
     let mut active = rec_call!("gpuResourceID", object);
@@ -1533,8 +1649,8 @@ pub fn resource_id<T: Send + Sync + 'static, E>(
 }
 
 /// [`resource_id`] of a getter that never raises.
-pub fn plain_resource_id<T: Send + Sync + 'static>(
-    object: &Obj<T>,
+pub fn plain_resource_id<O: Receiver + ?Sized>(
+    object: &O,
     read: impl FnOnce() -> u64,
 ) -> u64 {
     let Ok(id) = resource_id(object, || Ok::<u64, std::convert::Infallible>(read()));
@@ -1624,8 +1740,8 @@ pub fn no_copy_contents(
 }
 
 /// [`no_copy_contents`] on a device that keeps two copies of a `Managed` buffer where
-/// `two_copies`.
-fn no_copy_contents_with(
+/// `two_copies`: the rt platform's, whose device answers it by rt's `hasUnifiedMemory`.
+pub fn no_copy_contents_with(
     active: &mut Option<Active>,
     two_copies: bool,
     options: u64,

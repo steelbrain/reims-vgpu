@@ -434,17 +434,23 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         &self,
         on: OnFault,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::BlitEncoder>> {
-        let _ = on;
-        Ok(match self.rt.blit_command_encoder() {
-            Ok(encoder) => {
-                let kept = self.kept.clone();
-                Some(RtObj::new(RtBlitEncoder::new(encoder, self.opened(), kept)))
-            }
-            Err(error) => {
-                rt_refused_create("blitCommandEncoder", &error);
-                None
-            }
-        })
+        let recorded_call = crate::recorder::rec_call!("blitCommandEncoder", self);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::BlitEncoder>> {
+                let _ = on;
+                Ok(match self.rt.blit_command_encoder() {
+                    Ok(encoder) => {
+                        let kept = self.kept.clone();
+                        Some(RtObj::new(RtBlitEncoder::new(encoder, self.opened(), kept)))
+                    }
+                    Err(error) => {
+                        rt_refused_create("blitCommandEncoder", &error);
+                        None
+                    }
+                })
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Hands rt the held handlers (the module's docs), then commits, the copies of host pages
@@ -452,52 +458,57 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     /// bytes of the tiled textures it used taken (`super::tiled`). A second commit is Metal's
     /// refusal, counted; a commit rt refuses is counted, and its handlers never run.
     fn commit(&self, on: OnFault) -> RaiseResult<()> {
-        let _ = on;
-        let sel = "commit";
-        let (mut submission, scheduled, mut seen, completed) = {
-            let mut held = self.held.lock();
-            if held.committed {
-                drop(held);
-                rt_refused(sel, &rt::Error::Refused(rt::Refusal::Committed));
-                return Ok(());
+        let recorded_call = crate::recorder::rec_call!("commit", self);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let _ = on;
+            let sel = "commit";
+            let (mut submission, scheduled, mut seen, completed) = {
+                let mut held = self.held.lock();
+                if held.committed {
+                    drop(held);
+                    rt_refused(sel, &rt::Error::Refused(rt::Refusal::Committed));
+                    return Ok(());
+                }
+                held.committed = true;
+                let take = std::mem::take::<Vec<Handler>>;
+                (
+                    take(&mut held.submission),
+                    take(&mut held.scheduled),
+                    take(&mut held.seen),
+                    take(&mut held.completed),
+                )
+            };
+            submission.extend(scheduled);
+            seen.extend(completed);
+            if let Some(merge) = super::copied::merging() {
+                seen.insert(0, Box::new(merge));
             }
-            held.committed = true;
-            let take = std::mem::take::<Vec<Handler>>;
-            (
-                take(&mut held.submission),
-                take(&mut held.scheduled),
-                take(&mut held.seen),
-                take(&mut held.completed),
-            )
-        };
-        submission.extend(scheduled);
-        seen.extend(completed);
-        if let Some(merge) = super::copied::merging() {
-            seen.insert(0, Box::new(merge));
-        }
-        self.kept.uses().submitted();
-        let kept = self.kept.take();
-        if !kept.is_empty() {
-            seen.push(Box::new(move |_made: &rt::CommandBuffer| drop(kept)));
-        }
-        let run = |handlers: Vec<Handler>| {
-            move |made: &rt::CommandBuffer| handlers.into_iter().for_each(|handler| handler(made))
-        };
-        let committed = || -> Result<(), rt::Error> {
-            if !submission.is_empty() {
-                self.rt.add_scheduled_handler(run(submission))?;
+            self.kept.uses().submitted();
+            let kept = self.kept.take();
+            if !kept.is_empty() {
+                seen.push(Box::new(move |_made: &rt::CommandBuffer| drop(kept)));
             }
-            if !seen.is_empty() {
-                self.rt.add_completed_handler(run(seen))?;
+            let run = |handlers: Vec<Handler>| {
+                move |made: &rt::CommandBuffer| handlers.into_iter().for_each(|handler| handler(made))
+            };
+            let committed = || -> Result<(), rt::Error> {
+                if !submission.is_empty() {
+                    self.rt.add_scheduled_handler(run(submission))?;
+                }
+                if !seen.is_empty() {
+                    self.rt.add_completed_handler(run(seen))?;
+                }
+                super::copied::copy_in();
+                self.kept.takes().take(&self.device);
+                self.rt.commit()
+            };
+            if let Err(error) = committed() {
+                rt_refused(sel, &error);
             }
-            super::copied::copy_in();
-            self.kept.takes().take(&self.device);
-            self.rt.commit()
-        };
-        if let Err(error) = committed() {
-            rt_refused(sel, &error);
-        }
-        Ok(())
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A serial compute encoder: nil where rt refuses it, counted.
@@ -505,9 +516,15 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         &self,
         on: OnFault,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::ComputeEncoder>> {
-        let _ = on;
-        let serial = rt::DispatchType::Serial;
-        Ok(self.compute_encoder_of("computeCommandEncoder", serial))
+        let recorded_call = crate::recorder::rec_call!("computeCommandEncoder", self);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::ComputeEncoder>> {
+                let _ = on;
+                let serial = rt::DispatchType::Serial;
+                Ok(self.compute_encoder_of("computeCommandEncoder", serial))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn device(&self) -> Option<<RtPlatform as Platform>::Device> {
@@ -521,13 +538,19 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         event: Option<EventRef<'_, RtPlatform>>,
         value: u64,
     ) -> RaiseResult<()> {
-        let sel = "encodeSignalEvent:value:";
-        if let Some(event) = rt_event(sel, event)
-            && let Err(error) = self.rt.encode_signal_event(event, value)
-        {
-            rt_refused(sel, &error);
-        }
-        Ok(())
+        let recorded_call =
+            crate::recorder::rec_call!("encodeSignalEvent:value:", self, event, value);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let sel = "encodeSignalEvent:value:";
+            if let Some(event) = rt_event(sel, event)
+                && let Err(error) = self.rt.encode_signal_event(event, value)
+            {
+                rt_refused(sel, &error);
+            }
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The event's value set in the scheduled handler (the module's docs); nothing, counted, for
@@ -537,28 +560,44 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         signal_event_scheduled: Option<&<RtPlatform as Platform>::SharedEvent>,
         value: u64,
     ) -> RaiseResult<()> {
-        let sel = "encodeSignalEventScheduled:value:";
-        let Some(event) = signal_event_scheduled else {
-            refused_as(sel, RtRefusal::Refused, &"a nil event");
-            return Ok(());
-        };
-        let event = rt::SharedEvent::clone(event);
-        let signal = move |_made: &rt::CommandBuffer| event.set_signaled_value(value);
-        if self.hold(sel, |h| &mut h.scheduled, Box::new(signal)) {
-            self.held.lock().scheduled_signal = true;
-        }
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!(
+            "encodeSignalEventScheduled:value:",
+            self,
+            signal_event_scheduled,
+            value
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let sel = "encodeSignalEventScheduled:value:";
+            let Some(event) = signal_event_scheduled else {
+                refused_as(sel, RtRefusal::Refused, &"a nil event");
+                return Ok(());
+            };
+            let event = rt::SharedEvent::clone(event);
+            let signal = move |_made: &rt::CommandBuffer| event.set_signaled_value(value);
+            if self.hold(sel, |h| &mut h.scheduled, Box::new(signal)) {
+                self.held.lock().scheduled_signal = true;
+            }
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's wait; nothing, counted, for a nil event or one rt refuses.
     fn encode_wait(&self, event: Option<EventRef<'_, RtPlatform>>, value: u64) -> RaiseResult<()> {
-        let sel = "encodeWaitForEvent:value:";
-        if let Some(event) = rt_event(sel, event)
-            && let Err(error) = self.rt.encode_wait_for_event(event, value)
-        {
-            rt_refused(sel, &error);
-        }
-        Ok(())
+        let recorded_call =
+            crate::recorder::rec_call!("encodeWaitForEvent:value:", self, event, value);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let sel = "encodeWaitForEvent:value:";
+            if let Some(event) = rt_event(sel, event)
+                && let Err(error) = self.rt.encode_wait_for_event(event, value)
+            {
+                rt_refused(sel, &error);
+            }
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's error as Metal's (the module's docs).
@@ -574,42 +613,57 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         on: OnFault,
         render_pass_descriptor: &<RtPlatform as Platform>::RenderPassDescriptor,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::RenderEncoder>> {
-        let _ = on;
-        let sel = "renderCommandEncoderWithDescriptor:";
-        let pass = match render_pass_descriptor.rt_pass() {
-            Ok(pass) => pass,
-            Err(why) => return Ok(refused_metal(sel, &why)),
-        };
-        Ok(match self.rt.render_command_encoder(&pass) {
-            Ok(encoder) => {
-                let (mark, kept) = (self.opened(), self.kept.clone());
-                let targets = render_pass_descriptor.targets();
-                for target in &targets {
-                    kept.uses().add_made(&target.made, Use::Rendered);
-                }
-                for tiled in render_pass_descriptor.tiled() {
-                    kept.takes().used_tiled(&tiled);
-                }
-                Some(RtObj::new(RtRenderEncoder::new(
-                    encoder, mark, kept, targets,
-                )))
-            }
-            Err(error) => {
-                rt_refused_create(sel, &error);
-                None
-            }
-        })
+        let recorded_call = crate::recorder::rec_call!(
+            "renderCommandEncoderWithDescriptor:",
+            self,
+            render_pass_descriptor
+        );
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::RenderEncoder>> {
+                let _ = on;
+                let sel = "renderCommandEncoderWithDescriptor:";
+                let pass = match render_pass_descriptor.rt_pass() {
+                    Ok(pass) => pass,
+                    Err(why) => return Ok(refused_metal(sel, &why)),
+                };
+                Ok(match self.rt.render_command_encoder(&pass) {
+                    Ok(encoder) => {
+                        let (mark, kept) = (self.opened(), self.kept.clone());
+                        let targets = render_pass_descriptor.targets();
+                        for target in &targets {
+                            kept.uses().add_made(&target.made, Use::Rendered);
+                        }
+                        for tiled in render_pass_descriptor.tiled() {
+                            kept.takes().used_tiled(&tiled);
+                        }
+                        Some(RtObj::new(RtRenderEncoder::new(
+                            encoder, mark, kept, targets,
+                        )))
+                    }
+                    Err(error) => {
+                        rt_refused_create(sel, &error);
+                        None
+                    }
+                })
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Nothing for 0; other options are unbuilt ([`Unbuilt::Protection`]), counted, and change
     /// nothing the GPU runs. They keep the command buffer whole ([`KeptWhole::ProtectionOptions`]).
     fn set_protection_options(&self, on: OnFault, options: u64) -> RaiseResult<()> {
-        let _ = on;
-        if options != 0 {
-            refuse(Unbuilt::Protection, "setProtectionOptions:");
-        }
-        self.held.lock().protection = options;
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!("setProtectionOptions:", self, options);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let _ = on;
+            if options != 0 {
+                refuse(Unbuilt::Protection, "setProtectionOptions:");
+            }
+            self.held.lock().protection = options;
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn status(&self) -> CommandBufferStatus {
@@ -619,20 +673,30 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     /// rt's wait; none, counted, where rt refuses it (in a scheduled handler, or on rt's
     /// completion thread for a command buffer not yet completed, which it would never see).
     fn wait_until_completed(&self, on: OnFault) -> RaiseResult<()> {
-        let _ = on;
-        if let Err(error) = self.rt.wait_until_completed() {
-            rt_refused("waitUntilCompleted", &error);
-        }
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!("waitUntilCompleted", self);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let _ = on;
+            if let Err(error) = self.rt.wait_until_completed() {
+                rt_refused("waitUntilCompleted", &error);
+            }
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's wait; none, counted, where rt refuses it, as for
     /// [`wait_until_completed`](CommandBuffer::wait_until_completed).
     fn wait_until_scheduled(&self) -> RaiseResult<()> {
-        if let Err(error) = self.rt.wait_until_scheduled() {
-            rt_refused("waitUntilScheduled", &error);
-        }
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!("waitUntilScheduled", self);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            if let Err(error) = self.rt.wait_until_scheduled() {
+                rt_refused("waitUntilScheduled", &error);
+            }
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A compute encoder of the descriptor's dispatch type, serial where it sets none: nil for a
@@ -641,54 +705,88 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         &self,
         desc: &ComputePassDesc,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::ComputeEncoder>> {
-        let sel = "computeCommandEncoderWithDescriptor:";
-        let dispatch_type = match desc.dispatch_type {
-            None | Some(0) => rt::DispatchType::Serial,
-            Some(1) => rt::DispatchType::Concurrent,
-            Some(other) => return Ok(refused_metal(sel, &format!("MTLDispatchType {other}"))),
-        };
-        Ok(self.compute_encoder_of(sel, dispatch_type))
+        let recorded_call =
+            crate::recorder::rec_call!("computeCommandEncoderWithDescriptor:", self, desc);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::ComputeEncoder>> {
+                let sel = "computeCommandEncoderWithDescriptor:";
+                let dispatch_type = match desc.dispatch_type {
+                    None | Some(0) => rt::DispatchType::Serial,
+                    Some(1) => rt::DispatchType::Concurrent,
+                    Some(other) => return Ok(refused_metal(sel, &format!("MTLDispatchType {other}"))),
+                };
+                Ok(self.compute_encoder_of(sel, dispatch_type))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The work so far committed as a part, and the next part, where it may be cut (the
     /// module's docs); `None` otherwise, or where rt refuses the next part, counted, when it is
     /// kept whole.
     fn split(&self, on: OnFault) -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
-        if self.kept_whole_by().is_some() {
-            return Ok(None);
-        }
-        let Some(next) = self.next_part() else {
-            return Ok(None);
-        };
-        self.commit(on)?;
-        Ok(Some(next))
+        let recorded_call = crate::recorder::rec_call!("m2v.split", self);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
+                if self.kept_whole_by().is_some() {
+                    return Ok(None);
+                }
+                let Some(next) = self.next_part() else {
+                    return Ok(None);
+                };
+                self.commit(on)?;
+                Ok(Some(next))
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A part made now and not committed, where it may be cut (the module's docs); `None`
     /// otherwise, or where rt refuses it, counted.
     fn part(&self, on: OnFault) -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
-        let _ = on;
-        if self.kept_whole_by().is_some() {
-            return Ok(None);
-        }
-        Ok(self.next_part())
+        let recorded_call = crate::recorder::rec_call!("m2v.part", self);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
+                let _ = on;
+                if self.kept_whole_by().is_some() {
+                    return Ok(None);
+                }
+                Ok(self.next_part())
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Committed as a part where it may be cut ([`PartCut::Cut`]); else nothing, and why it is
     /// kept whole. Never [`PartCut::Fails`] (the module's docs).
     fn commit_part(&self, on: OnFault) -> RaiseResult<PartCut> {
-        if let Some(reason) = self.kept_whole_by() {
-            return Ok(PartCut::Whole(reason));
+        let mut recorded_call = crate::recorder::rec_call!("m2v.commitPart", self);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<PartCut> {
+            if let Some(reason) = self.kept_whole_by() {
+                return Ok(PartCut::Whole(reason));
+            }
+            self.commit(on)?;
+            Ok(PartCut::Cut)
+        });
+        // Whether it was cut, which a player follows: `"Cut"` alone commits.
+        if let Ok(cut) = &recorded_answer {
+            crate::recorder::answer(&mut recorded_call, "cut", || {
+                crate::recorder::text_value(cut)
+            });
         }
-        self.commit(on)?;
-        Ok(PartCut::Cut)
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The Vulkan platform's fold with nothing noted: rt notes no way Metal's GPU fails a command
     /// buffer from an encoder on, so `commit_part` never answers [`PartCut::Fails`] and no caller
     /// folds. Lets `later` go uncommitted.
     fn fold(&self, later: <RtPlatform as Platform>::CommandBuffer) {
-        drop(later);
+        let recorded_call = crate::recorder::rec_call!("m2v.fold", self, later);
+        crate::recorder::run(|| {
+            drop(later);
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 }
 

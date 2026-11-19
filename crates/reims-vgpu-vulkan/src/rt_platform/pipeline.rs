@@ -441,7 +441,7 @@ impl<'a> Taking<'a> {
 impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
     /// 0: rt makes no state for indirect command buffers.
     fn gpu_resource_id(&self) -> u64 {
-        0
+        crate::recorder::plain_resource_id(self, || 0)
     }
 
     /// Unbuilt: nil ([`Unbuilt::FunctionTable`]).
@@ -449,9 +449,16 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
         &self,
         function: &RtObj<RtFunction>,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::FunctionHandle>> {
-        let _ = function;
-        refuse_create(Unbuilt::FunctionTable, "functionHandleWithFunction:");
-        Ok(None)
+        let recorded_call =
+            crate::recorder::rec_call!("functionHandleWithFunction:", self, function);
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::FunctionHandle>> {
+                let _ = function;
+                refuse_create(Unbuilt::FunctionTable, "functionHandleWithFunction:");
+                Ok(None)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Unbuilt: nil ([`Unbuilt::FunctionTable`]).
@@ -459,12 +466,22 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
         &self,
         function_count: u64,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::VisibleFunctionTable>> {
-        let _ = function_count;
-        refuse_create(
-            Unbuilt::FunctionTable,
+        let recorded_call = crate::recorder::rec_call!(
             "newVisibleFunctionTableWithDescriptor:",
+            self,
+            function_count
         );
-        Ok(None)
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::VisibleFunctionTable>> {
+                let _ = function_count;
+                refuse_create(
+                    Unbuilt::FunctionTable,
+                    "newVisibleFunctionTableWithDescriptor:",
+                );
+                Ok(None)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's answer; 0 where rt refuses it, counted (`rt_refused_imageblock`).

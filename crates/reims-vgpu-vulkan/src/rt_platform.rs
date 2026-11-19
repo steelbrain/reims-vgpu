@@ -62,7 +62,8 @@ pub mod tiled;
 pub mod unbuilt;
 pub mod unmade;
 
-use std::sync::Arc;
+use std::mem::ManuallyDrop;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use metal2vulkan_rt as rt;
@@ -99,12 +100,36 @@ use unbuilt::{RtRefusal, refuse, refuse_create, refused_again};
 
 /// A reference to an object the rt platform made itself: `clone_ref` takes another, and the last
 /// one's drop frees the object. Its identity is its allocation's address.
-pub struct RtObj<T: Send + Sync + 'static>(Arc<T>);
+pub struct RtObj<T: Send + Sync + 'static>(ManuallyDrop<Arc<T>>);
 
 impl<T: Send + Sync + 'static> RtObj<T> {
     /// A new object holding `value`, with its one reference.
     pub fn new(value: T) -> RtObj<T> {
-        RtObj(Arc::new(value))
+        RtObj(ManuallyDrop::new(Arc::new(value)))
+    }
+
+    /// A reference that does not hold the object.
+    pub fn downgrade(&self) -> Weak<T> {
+        Arc::downgrade(&self.0)
+    }
+}
+
+impl<T: Send + Sync + 'static> Drop for RtObj<T> {
+    /// The release. While the process records its calls ([`crate::recorder`]), the last
+    /// reference's is the object's `release` record, written before the object goes.
+    fn drop(&mut self) {
+        if crate::recorder::on() {
+            // SAFETY: the reference is taken once, here, and never touched after.
+            let arc = unsafe { ManuallyDrop::take(&mut self.0) };
+            let ptr = Arc::as_ptr(&arc).addr().to_u64();
+            if let Some(inner) = Arc::into_inner(arc) {
+                crate::recorder::released(ptr);
+                drop(inner);
+            }
+            return;
+        }
+        // SAFETY: the reference is released once, here, and never touched after.
+        unsafe { ManuallyDrop::drop(&mut self.0) }
     }
 }
 
@@ -115,9 +140,21 @@ impl<T: Send + Sync + 'static> std::ops::Deref for RtObj<T> {
     }
 }
 
+impl<T: Send + Sync + 'static> std::fmt::Debug for RtObj<T> {
+    /// Its pointer and its type; while formatted for the recorder's stream, its stream id
+    /// ([`crate::recorder::fmt_obj`]).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let type_name = std::any::type_name::<T>();
+        if crate::recorder::on() && crate::recorder::is_formatting() {
+            return crate::recorder::fmt_obj(self.id().0, type_name, f);
+        }
+        write!(f, "<{:#x} {type_name}>", self.id().0)
+    }
+}
+
 impl<T: Send + Sync + 'static> Handle for RtObj<T> {
     fn clone_ref(&self) -> Self {
-        RtObj(Arc::clone(&self.0))
+        RtObj(ManuallyDrop::new(Arc::clone(&self.0)))
     }
     fn id(&self) -> ObjId {
         ObjId(Arc::as_ptr(&self.0).addr().to_u64())
@@ -221,6 +258,7 @@ impl RtPlatform {
     /// first ([`crate::os::install_process_services`]).
     pub fn new() -> RtPlatform {
         crate::os::install_process_services();
+        crate::recorder::start_from_env();
         RtPlatform {
             vm: OsVm::new(),
             clock: OsClock::new(),
@@ -394,7 +432,12 @@ impl Platform for RtPlatform {
     type Clock = OsClock;
 
     fn new_render_pass_descriptor(&self) -> RtObj<PassFields> {
-        RtObj::new(PassFields::default())
+        let recorded_call = crate::recorder::rec_call!("MTLRenderPassDescriptor.new", self);
+        let recorded_answer = crate::recorder::run(|| -> RtObj<PassFields> {
+            RtObj::new(PassFields::default())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn new_shared_event_listener(&self) -> RtObj<Listener> {
@@ -402,7 +445,13 @@ impl Platform for RtPlatform {
     }
 
     fn render_pass_descriptor(&self) -> RtObj<PassFields> {
-        RtObj::new(PassFields::default())
+        let recorded_call =
+            crate::recorder::rec_call!("MTLRenderPassDescriptor.renderPassDescriptor", self);
+        let recorded_answer = crate::recorder::run(|| -> RtObj<PassFields> {
+            RtObj::new(PassFields::default())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn texture_2d_descriptor(
@@ -413,9 +462,21 @@ impl Platform for RtPlatform {
         height: u64,
         mipmapped: bool,
     ) -> RaiseResult<RtObj<TextureFields>> {
-        let _ = on;
-        let desc = descriptor::texture_2d_desc(pixel_format, width, height, mipmapped);
-        Ok(RtObj::new(TextureFields::new(desc)))
+        let recorded_call = crate::recorder::rec_call!(
+            "MTLTextureDescriptor.texture2DDescriptorWithPixelFormat:width:height:mipmapped:",
+            self,
+            pixel_format,
+            width,
+            height,
+            mipmapped
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<RtObj<TextureFields>> {
+            let _ = on;
+            let desc = descriptor::texture_2d_desc(pixel_format, width, height, mipmapped);
+            Ok(RtObj::new(TextureFields::new(desc)))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Unbuilt: nil ([`Unbuilt::RateMap`]), as Metal answers for a count it refuses.
@@ -424,27 +485,53 @@ impl Platform for RtPlatform {
         on: OnFault,
         sample_count: MtlSize,
     ) -> RaiseResult<Option<Unmade<kinds::RateMapLayerDescriptor>>> {
-        let _ = (on, sample_count);
-        refuse_create(Unbuilt::RateMap, "initWithSampleCount:");
-        Ok(None)
+        let recorded_call = crate::recorder::rec_call!(
+            "MTLRasterizationRateLayerDescriptor.initWithSampleCount:",
+            self,
+            sample_count
+        );
+        let recorded_answer =
+            crate::recorder::run(|| -> RaiseResult<Option<Unmade<kinds::RateMapLayerDescriptor>>> {
+                let _ = (on, sample_count);
+                refuse_create(Unbuilt::RateMap, "initWithSampleCount:");
+                Ok(None)
+            });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn texture_descriptor(&self, desc: &TextureDesc) -> RtObj<TextureFields> {
-        RtObj::new(TextureFields::new(*desc))
+        let recorded_call = crate::recorder::rec_call!("m2v.textureDescriptor", self, desc);
+        let recorded_answer = crate::recorder::run(|| -> RtObj<TextureFields> {
+            RtObj::new(TextureFields::new(*desc))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Unbuilt ([`Unbuilt::RateMap`]): a descriptor that keeps nothing.
     fn rate_map_descriptor(&self, desc: &RateMapDesc) -> RtObj<RateMapFields> {
-        let _ = desc;
-        refuse(Unbuilt::RateMap, "MTLRasterizationRateMapDescriptor");
-        RtObj::new(RateMapFields)
+        let recorded_call = crate::recorder::rec_call!("m2v.rateMapDescriptor", self, desc);
+        let recorded_answer = crate::recorder::run(|| -> RtObj<RateMapFields> {
+            let _ = desc;
+            refuse(Unbuilt::RateMap, "MTLRasterizationRateMapDescriptor");
+            RtObj::new(RateMapFields)
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The process's one device ([`RtPlatform::system_default_device`]) where `registry_id` is
     /// its registry ID; `None` for any other, as Metal answers for an ID no device has.
     fn open_device(&self, registry_id: u64) -> Option<RtObj<RtDevice>> {
-        let device = self.device_at("MTLCopyAllDevices")?;
-        (device.facts().registry_id == registry_id).then_some(device)
+        let recorded_call =
+            crate::recorder::rec_call!("MTLCreateSystemDefaultDevice", self, registry_id);
+        let recorded_answer = crate::recorder::run(|| -> Option<RtObj<RtDevice>> {
+            let device = self.device_at("MTLCopyAllDevices")?;
+            (device.facts().registry_id == registry_id).then_some(device)
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn vm(&self) -> &dyn HostVm {

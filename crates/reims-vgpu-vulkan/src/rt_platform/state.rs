@@ -217,7 +217,7 @@ pub fn new_depth_stencil_state(
 /// rt's ID and its index (the module's docs).
 impl SamplerState for RtObj<RtSampler> {
     fn gpu_resource_id(&self) -> u64 {
-        self.rt.gpu_resource_id().to_bits()
+        crate::recorder::plain_resource_id(self, || self.rt.gpu_resource_id().to_bits())
     }
 
     fn resource_index(&self) -> u64 {
@@ -228,7 +228,7 @@ impl SamplerState for RtObj<RtSampler> {
 /// The host's stubs' answers (the module's docs).
 impl DepthStencilState for RtObj<rt::DepthStencilState> {
     fn gpu_resource_id(&self) -> RaiseResult<u64> {
-        Ok(0)
+        crate::recorder::resource_id(self, || Ok(0))
     }
 
     fn resource_index(&self) -> RaiseResult<u64> {

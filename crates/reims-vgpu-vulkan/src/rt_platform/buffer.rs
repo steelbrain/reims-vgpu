@@ -262,7 +262,7 @@ pub const ZERO_SKIPPED_PRIVATE_CODE: &str = "rt-zero-skipped-private-bytes";
 pub const ZERO_SKIPPED_SHARED_CODE: &str = "rt-zero-skipped-shared-bytes";
 
 /// A buffer descriptor's `resourceOptions` before any setter: `Shared`.
-const BUFFER_DESCRIPTOR_OPTIONS: u64 = 0;
+pub(super) const BUFFER_DESCRIPTOR_OPTIONS: u64 = 0;
 
 /// The resource options' CPU cache, storage and hazard tracking modes: bits 0 to 9.
 pub(super) const FIELDS: u64 = 0x3ff;
@@ -1703,10 +1703,15 @@ impl GpuResource<RtPlatform> for RtObj<RtBuffer> {
     /// changes nothing, as Metal answers where its validation stops each (the Vulkan platform's
     /// runtime's answer).
     fn set_purgeable_state(&self, state: u64) -> RaiseResult<u64> {
-        if self.in_heap {
-            return Ok(texture::NON_VOLATILE);
-        }
-        Ok(texture::set_purgeable(&self.purgeable, state))
+        let recorded_call = crate::recorder::rec_call!("setPurgeableState:", self, state);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<u64> {
+            if self.in_heap {
+                return Ok(texture::NON_VOLATILE);
+            }
+            Ok(texture::set_purgeable(&self.purgeable, state))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Bits 4 to 7 of its resource options.
@@ -1739,13 +1744,18 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
     /// a range past the buffer changes nothing, counted, where Metal's validation aborts. Of any
     /// other, nothing, as Metal.
     fn did_modify_range(&self, on: OnFault, range: NsRange) -> RaiseResult<()> {
-        let _ = on;
-        if self.storage_mode() == MANAGED
-            && let Err(error) = self.rt.did_modify_range(range.location, range.length)
-        {
-            rt_refused("didModifyRange:", &error);
-        }
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!("didModifyRange:", self, range);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let _ = on;
+            if self.storage_mode() == MANAGED
+                && let Err(error) = self.rt.did_modify_range(range.location, range.length)
+            {
+                rt_refused("didModifyRange:", &error);
+            }
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's: the Vulkan device address of its first byte (of a Managed buffer's device copy where
@@ -1767,9 +1777,21 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
         bytes_per_row: u64,
         bytes_per_image: u64,
     ) -> RaiseResult<Option<RtObj<RtTexture>>> {
-        let _ = bytes_per_image;
-        let sel = "newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:";
-        Ok(self.texture(sel, descriptor, offset, bytes_per_row))
+        let recorded_call = crate::recorder::rec_call!(
+            "newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:",
+            self,
+            descriptor,
+            offset,
+            bytes_per_row,
+            bytes_per_image
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtTexture>>> {
+            let _ = bytes_per_image;
+            let sel = "newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:";
+            Ok(self.texture(sel, descriptor, offset, bytes_per_row))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's texture over the buffer's bytes (rt's `Buffer::new_texture`), at an index as
@@ -1782,9 +1804,20 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
         offset: u64,
         bytes_per_row: u64,
     ) -> RaiseResult<Option<RtObj<RtTexture>>> {
-        let _ = on;
-        let sel = "newTextureWithDescriptor:offset:bytesPerRow:";
-        Ok(self.texture(sel, descriptor, offset, bytes_per_row))
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureWithDescriptor:offset:bytesPerRow:",
+            self,
+            descriptor,
+            offset,
+            bytes_per_row
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtTexture>>> {
+            let _ = on;
+            let sel = "newTextureWithDescriptor:offset:bytesPerRow:";
+            Ok(self.texture(sel, descriptor, offset, bytes_per_row))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A 2D texture of more than one level: rt's texture of the descriptor, at an index as
@@ -1799,24 +1832,35 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
         offset: u64,
         bytes_per_row: u64,
     ) -> RaiseResult<Option<RtObj<RtTexture>>> {
-        let sel = "newTiledTextureWithDescriptor:offset:bytesPerRow:";
-        let desc = descriptor.desc();
-        if desc.mipmap_level_count <= 1 || desc.texture_type != TEXTURE_TYPE_2D {
-            return Ok(self.texture(sel, descriptor, offset, bytes_per_row));
-        }
-        let (rt_device, length) = (self.device.rt(), self.rt.length());
-        if let Some(why) = tiled::bad_layout(rt_device, &desc, length, offset, bytes_per_row) {
-            return Ok(refused_metal(sel, &why));
-        }
-        let own = |d: &rt::TextureDescriptor, index: Option<u32>| rt_device.new_texture(d, index);
-        let held = (self.options, texture::STORAGE_BITS);
-        let diag = |shape: &Shape| Made::new(Call::Tiled, shape);
-        let made = texture::make_over(&self.device, sel, &desc, held, own, diag);
-        if let Some(texture) = &made {
-            let tiled = Tiled::new(rt_device, texture.rt(), self, offset, bytes_per_row);
-            texture.set_tiled(tiled);
-        }
-        Ok(made)
+        let recorded_call = crate::recorder::rec_call!(
+            "newTiledTextureWithDescriptor:offset:bytesPerRow:",
+            self,
+            descriptor,
+            offset,
+            bytes_per_row
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtTexture>>> {
+            let sel = "newTiledTextureWithDescriptor:offset:bytesPerRow:";
+            let desc = descriptor.desc();
+            if desc.mipmap_level_count <= 1 || desc.texture_type != TEXTURE_TYPE_2D {
+                return Ok(self.texture(sel, descriptor, offset, bytes_per_row));
+            }
+            let (rt_device, length) = (self.device.rt(), self.rt.length());
+            if let Some(why) = tiled::bad_layout(rt_device, &desc, length, offset, bytes_per_row) {
+                return Ok(refused_metal(sel, &why));
+            }
+            let own = |d: &rt::TextureDescriptor, index: Option<u32>| rt_device.new_texture(d, index);
+            let held = (self.options, texture::STORAGE_BITS);
+            let diag = |shape: &Shape| Made::new(Call::Tiled, shape);
+            let made = texture::make_over(&self.device, sel, &desc, held, own, diag);
+            if let Some(texture) = &made {
+                let tiled = Tiled::new(rt_device, texture.rt(), self, offset, bytes_per_row);
+                texture.set_tiled(tiled);
+            }
+            Ok(made)
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// An exportable buffer's memory as a new opaque fd (`super::export`); `Err` for any other.
@@ -1837,8 +1881,13 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
     /// (`super::export`, "The acquire"); `Err` for any other buffer, which no other API writes.
     #[cfg(unix)]
     fn external_write_done(&self) -> Result<(), String> {
-        let exported = (self.exported.as_ref()).ok_or("the buffer was not made exportable")?;
-        exported.acquire()
+        let recorded_call = crate::recorder::rec_call!(crate::recorder::EXTERNAL_WRITE_DONE, self);
+        let recorded_answer = crate::recorder::run(|| -> Result<(), String> {
+            let exported = (self.exported.as_ref()).ok_or("the buffer was not made exportable")?;
+            exported.acquire()
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// rt's texture over the buffer's bytes at the plane's offset, rows its bytes per row apart,
@@ -1855,25 +1904,35 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
         descriptor: &RtObj<TextureFields>,
         plane: SurfacePlane,
     ) -> RaiseResult<Option<RtObj<RtTexture>>> {
-        let _ = on;
-        let sel = "newTextureWithDescriptor:iosurface:plane:";
-        if let Some(facts) = plane.facts {
-            if plane.plane != 0 && facts.plane_count == 0 {
-                let what = format!("plane {} of a surface without planes", plane.plane);
-                return Ok(texture::refused_metal(sel, &what));
+        let recorded_call = crate::recorder::rec_call!(
+            "newTextureWithDescriptor:iosurface:plane:",
+            self,
+            descriptor,
+            plane
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtTexture>>> {
+            let _ = on;
+            let sel = "newTextureWithDescriptor:iosurface:plane:";
+            if let Some(facts) = plane.facts {
+                if plane.plane != 0 && facts.plane_count == 0 {
+                    let what = format!("plane {} of a surface without planes", plane.plane);
+                    return Ok(texture::refused_metal(sel, &what));
+                }
+                if facts.plane_count != 0 && plane.plane >= facts.plane_count {
+                    return Ok(None);
+                }
+                let raw = u32::try_from(descriptor.desc().pixel_format).ok();
+                let pf = raw.and_then(|raw| metal2vulkan::metal::PixelFormat::try_from(raw).ok());
+                let beside = pf.and_then(crate::gpu::device::plane_facts_taken);
+                if beside.is_some() && facts.plane_count >= 2 {
+                    refuse_create(Unbuilt::IosurfaceTexture, sel);
+                    return Ok(None);
+                }
             }
-            if facts.plane_count != 0 && plane.plane >= facts.plane_count {
-                return Ok(None);
-            }
-            let raw = u32::try_from(descriptor.desc().pixel_format).ok();
-            let pf = raw.and_then(|raw| metal2vulkan::metal::PixelFormat::try_from(raw).ok());
-            let beside = pf.and_then(crate::gpu::device::plane_facts_taken);
-            if beside.is_some() && facts.plane_count >= 2 {
-                refuse_create(Unbuilt::IosurfaceTexture, sel);
-                return Ok(None);
-            }
-        }
-        Ok(self.texture(sel, descriptor, plane.offset, plane.bytes_per_row))
+            Ok(self.texture(sel, descriptor, plane.offset, plane.bytes_per_row))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 }
 

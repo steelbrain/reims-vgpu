@@ -40,6 +40,14 @@ impl<K> Unmade<K> {
     }
 }
 
+/// Never reached: there is no such object. Here so that the commands and descriptors that name
+/// one print themselves, as the recorder reads them ([`crate::recorder`]).
+impl<K> std::fmt::Debug for Unmade<K> {
+    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.unreachable()
+    }
+}
+
 impl<K: 'static> Handle for Unmade<K> {
     fn clone_ref(&self) -> Self {
         self.unreachable()

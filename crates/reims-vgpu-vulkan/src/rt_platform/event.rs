@@ -22,8 +22,13 @@ use super::{RtObj, RtPlatform};
 impl SharedEvent<RtPlatform> for RtObj<rt::SharedEvent> {
     /// rt's: raises the host's value; a value not above it changes nothing.
     fn set_signaled_value(&self, signaled_value: u64) -> RaiseResult<()> {
-        rt::SharedEvent::set_signaled_value(self, signaled_value);
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!("setSignaledValue:", self, signaled_value);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            rt::SharedEvent::set_signaled_value(self, signaled_value);
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn signaled_value(&self) -> u64 {
@@ -34,14 +39,24 @@ impl SharedEvent<RtPlatform> for RtObj<rt::SharedEvent> {
     /// completion thread (a completed handler or a notification) for a value that thread has not
     /// yet seen, which a wait there would never see.
     fn wait_until_signaled_value(&self, value: u64, milliseconds: u64) -> bool {
-        let timeout = Duration::from_millis(milliseconds);
-        match rt::SharedEvent::wait_until_signaled_value(self, value, timeout) {
-            Ok(reached) => reached,
-            Err(error) => {
-                rt_refused("waitUntilSignaledValue:timeoutMS:", &error);
-                false
+        let recorded_call = crate::recorder::rec_call!(
+            "waitUntilSignaledValue:timeoutMS:",
+            self,
+            value,
+            milliseconds
+        );
+        let recorded_answer = crate::recorder::run(|| -> bool {
+            let timeout = Duration::from_millis(milliseconds);
+            match rt::SharedEvent::wait_until_signaled_value(self, value, timeout) {
+                Ok(reached) => reached,
+                Err(error) => {
+                    rt_refused("waitUntilSignaledValue:timeoutMS:", &error);
+                    false
+                }
             }
-        }
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// `block` runs once on rt's completion thread (the module's docs), once the value reaches

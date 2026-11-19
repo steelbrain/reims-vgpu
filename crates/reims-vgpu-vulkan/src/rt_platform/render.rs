@@ -608,24 +608,29 @@ fn scissor(r: MtlScissorRect) -> rt::ScissorRect {
 impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
     /// rt's command (the module's docs); `endEncoding` ends rt's encoder.
     fn encode(&self, on: OnFault, cmd: RenderCmd<'_, RtPlatform>) -> RaiseResult<()> {
-        let _ = on;
-        let sel = cmd.selector();
-        let ending = matches!(cmd, RenderCmd::EndEncoding);
-        let mut open = self.open.lock();
-        let stopped = self.command(&mut open, cmd).err();
-        if let Some(Stop::Rt(rt::Error::Unsupported(rt::Gap::Draw {
-            kind: rt::DrawKind::AttachmentRead,
-        }))) = &stopped
-        {
-            self.attachment_read(&open.seen);
-        }
-        if ending && let Some(e) = open.rt.take() {
-            e.end_encoding();
-            self.mark.end();
-        }
-        drop(open);
-        report(sel, stopped);
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!(@cmd self, cmd);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let _ = on;
+            let sel = cmd.selector();
+            let ending = matches!(cmd, RenderCmd::EndEncoding);
+            let mut open = self.open.lock();
+            let stopped = self.command(&mut open, cmd).err();
+            if let Some(Stop::Rt(rt::Error::Unsupported(rt::Gap::Draw {
+                kind: rt::DrawKind::AttachmentRead,
+            }))) = &stopped
+            {
+                self.attachment_read(&open.seen);
+            }
+            if ending && let Some(e) = open.rt.take() {
+                e.end_encoding();
+                self.mark.end();
+            }
+            drop(open);
+            report(sel, stopped);
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// 0, counted ([`Unbuilt::RenderPass`]): rt's pass has no tiles.

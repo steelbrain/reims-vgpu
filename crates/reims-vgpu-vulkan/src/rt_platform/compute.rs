@@ -327,18 +327,23 @@ fn resource_usage(usage: u64) -> Result<rt::ResourceUsage, Stop> {
 impl ComputeEncoder<RtPlatform> for RtObj<RtComputeEncoder> {
     /// rt's command (the module's docs); `endEncoding` ends rt's encoder.
     fn encode(&self, on: OnFault, cmd: ComputeCmd<'_, RtPlatform>) -> RaiseResult<()> {
-        let _ = on;
-        let sel = cmd.selector();
-        let ending = matches!(cmd, ComputeCmd::EndEncoding);
-        let mut open = self.open.lock();
-        let stopped = self.command(&mut open, cmd).err();
-        if ending && let Some(e) = open.rt.take() {
-            e.end_encoding();
-            self.mark.end();
-        }
-        drop(open);
-        report(sel, stopped);
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!(@cmd self, cmd);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let _ = on;
+            let sel = cmd.selector();
+            let ending = matches!(cmd, ComputeCmd::EndEncoding);
+            let mut open = self.open.lock();
+            let stopped = self.command(&mut open, cmd).err();
+            if ending && let Some(e) = open.rt.take() {
+                e.end_encoding();
+                self.mark.end();
+            }
+            drop(open);
+            report(sel, stopped);
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Unbuilt: NO, as with nothing open ([`Unbuilt::Predication`]).
@@ -349,22 +354,44 @@ impl ComputeEncoder<RtPlatform> for RtObj<RtComputeEncoder> {
         comparison: u64,
         reference_value: u32,
     ) -> RaiseResult<bool> {
-        let _ = (buffer, offset, comparison, reference_value);
-        let sel = "encodeEndDoWhile:offset:comparison:referenceValue:";
-        refuse(Unbuilt::Predication, sel);
-        Ok(false)
+        let recorded_call = crate::recorder::rec_call!(
+            "encodeEndDoWhile:offset:comparison:referenceValue:",
+            self,
+            buffer,
+            offset,
+            comparison,
+            reference_value
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<bool> {
+            let _ = (buffer, offset, comparison, reference_value);
+            let sel = "encodeEndDoWhile:offset:comparison:referenceValue:";
+            refuse(Unbuilt::Predication, sel);
+            Ok(false)
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Unbuilt: NO, as with nothing open ([`Unbuilt::Predication`]).
     fn encode_end_if(&self) -> RaiseResult<bool> {
-        refuse(Unbuilt::Predication, "encodeEndIf");
-        Ok(false)
+        let recorded_call = crate::recorder::rec_call!("encodeEndIf", self);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<bool> {
+            refuse(Unbuilt::Predication, "encodeEndIf");
+            Ok(false)
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// Unbuilt: NO, as with nothing open ([`Unbuilt::Predication`]).
     fn encode_end_while(&self) -> RaiseResult<bool> {
-        refuse(Unbuilt::Predication, "encodeEndWhile");
-        Ok(false)
+        let recorded_call = crate::recorder::rec_call!("encodeEndWhile", self);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<bool> {
+            refuse(Unbuilt::Predication, "encodeEndWhile");
+            Ok(false)
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 }
 

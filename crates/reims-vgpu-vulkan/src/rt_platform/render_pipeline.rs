@@ -355,7 +355,7 @@ fn make(
 impl RenderPipeline for RtObj<RtRenderPipeline> {
     /// 0: rt makes no state for indirect command buffers.
     fn gpu_resource_id(&self) -> u64 {
-        0
+        crate::recorder::plain_resource_id(self, || 0)
     }
 
     /// rt's answer; 0 where rt refuses it, counted (`rt_refused_imageblock`).

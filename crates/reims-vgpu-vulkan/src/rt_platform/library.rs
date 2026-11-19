@@ -145,8 +145,13 @@ impl Library<RtPlatform> for RtObj<RtLibrary> {
         on: OnFault,
         function_name: &str,
     ) -> RaiseResult<Option<RtObj<RtFunction>>> {
-        let _ = on;
-        Ok(self.made("newFunctionWithName:", function_name, |f| f))
+        let recorded_call = crate::recorder::rec_call!("newFunctionWithName:", self, function_name);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtFunction>>> {
+            let _ = on;
+            Ok(self.made("newFunctionWithName:", function_name, |f| f))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The function specialized with `constants` (the module's docs).
@@ -156,12 +161,22 @@ impl Library<RtPlatform> for RtObj<RtLibrary> {
         function_name: &str,
         constants: &[FunctionConstant],
     ) -> RaiseResult<Option<RtObj<RtFunction>>> {
-        let _ = on;
-        let sel = "newFunctionWithName:constantValues:error:";
-        let Some(values) = constant_values(sel, constants) else {
-            return Ok(None);
-        };
-        Ok(self.made(sel, function_name, |f| f.with_constants(values)))
+        let recorded_call = crate::recorder::rec_call!(
+            "newFunctionWithName:constantValues:error:",
+            self,
+            function_name,
+            constants
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtFunction>>> {
+            let _ = on;
+            let sel = "newFunctionWithName:constantValues:error:";
+            let Some(values) = constant_values(sel, constants) else {
+                return Ok(None);
+            };
+            Ok(self.made(sel, function_name, |f| f.with_constants(values)))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The function specialized, with `constants` where there are any, under `specialized_name`
@@ -174,24 +189,36 @@ impl Library<RtPlatform> for RtObj<RtLibrary> {
         options: u64,
         specialized_name: Option<&str>,
     ) -> RaiseResult<Option<RtObj<RtFunction>>> {
-        let _ = on;
-        let sel = "newFunctionWithDescriptor:error:";
-        let options = u32::try_from(options).ok().map(FunctionOptions::try_from);
-        let Some(Ok(options)) = options else {
-            return Ok(refused_metal(sel, &"function options Metal names none of"));
-        };
-        let Some(values) = constant_values(sel, constants) else {
-            return Ok(None);
-        };
-        Ok(self.made(sel, function_name, |f| {
-            let f = f
-                .with_constants(values)
-                .with_precompiled(options.contains(FunctionOptions::COMPILE_TO_BINARY));
-            match specialized_name {
-                Some(name) => f.with_specialized_name(name),
-                None => f.with_specialized(true),
-            }
-        }))
+        let recorded_call = crate::recorder::rec_call!(
+            "newFunctionWithDescriptor:error:",
+            self,
+            function_name,
+            constants,
+            options,
+            specialized_name
+        );
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtFunction>>> {
+            let _ = on;
+            let sel = "newFunctionWithDescriptor:error:";
+            let options = u32::try_from(options).ok().map(FunctionOptions::try_from);
+            let Some(Ok(options)) = options else {
+                return Ok(refused_metal(sel, &"function options Metal names none of"));
+            };
+            let Some(values) = constant_values(sel, constants) else {
+                return Ok(None);
+            };
+            Ok(self.made(sel, function_name, |f| {
+                let f = f
+                    .with_constants(values)
+                    .with_precompiled(options.contains(FunctionOptions::COMPILE_TO_BINARY));
+                match specialized_name {
+                    Some(name) => f.with_specialized_name(name),
+                    None => f.with_specialized(true),
+                }
+            }))
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 }
 

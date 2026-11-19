@@ -137,28 +137,61 @@ pub fn texture_2d_desc(pixel_format: u64, width: u64, height: u64, mipmapped: bo
 
 impl<P: Platform> TextureDescriptor<P> for RtObj<TextureFields> {
     fn set_resource_options(&self, resource_options: u64) {
-        self.lock().resource_options = Some(resource_options);
+        let recorded_call =
+            crate::recorder::rec_call!("setResourceOptions:", self, resource_options);
+        crate::recorder::run(|| {
+            self.lock().resource_options = Some(resource_options);
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
     fn set_rotation(&self, rotation: u64) {
-        self.lock().rotation = Some(rotation);
+        let recorded_call = crate::recorder::rec_call!("setRotation:", self, rotation);
+        crate::recorder::run(|| {
+            self.lock().rotation = Some(rotation);
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
     fn set_usage(&self, usage: u64) {
-        self.lock().usage = usage;
+        let recorded_call = crate::recorder::rec_call!("setUsage:", self, usage);
+        crate::recorder::run(|| {
+            self.lock().usage = usage;
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
     fn set_width(&self, width: u64) {
-        self.lock().width = width;
+        let recorded_call = crate::recorder::rec_call!("setWidth:", self, width);
+        crate::recorder::run(|| {
+            self.lock().width = width;
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
     fn set_height(&self, height: u64) {
-        self.lock().height = height;
+        let recorded_call = crate::recorder::rec_call!("setHeight:", self, height);
+        crate::recorder::run(|| {
+            self.lock().height = height;
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
     fn set_depth(&self, depth: u64) {
-        self.lock().depth = depth;
+        let recorded_call = crate::recorder::rec_call!("setDepth:", self, depth);
+        crate::recorder::run(|| {
+            self.lock().depth = depth;
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
     fn set_texture_type(&self, texture_type: u64) {
-        self.lock().texture_type = texture_type;
+        let recorded_call = crate::recorder::rec_call!("setTextureType:", self, texture_type);
+        crate::recorder::run(|| {
+            self.lock().texture_type = texture_type;
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
     fn set_pixel_format(&self, pixel_format: u64) {
-        self.lock().pixel_format = pixel_format;
+        let recorded_call = crate::recorder::rec_call!("setPixelFormat:", self, pixel_format);
+        crate::recorder::run(|| {
+            self.lock().pixel_format = pixel_format;
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
     /// As set, 0 before any set.
     fn rotation(&self) -> u64 {
@@ -410,44 +443,54 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
     /// Counted for any position ([`Unbuilt::RenderPass`]): rt renders one sample alone, at its
     /// centre, and keeps none.
     fn set_sample_positions(&self, positions: &[MtlSamplePosition]) -> RaiseResult<()> {
-        if !positions.is_empty() {
-            refuse(Unbuilt::RenderPass, "setSamplePositions:count:");
-        }
-        Ok(())
+        let recorded_call =
+            crate::recorder::rec_call!("setSamplePositions:count:", self, positions);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            if !positions.is_empty() {
+                refuse(Unbuilt::RenderPass, "setSamplePositions:count:");
+            }
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The render target's width and height, and the visibility result buffer; the rest as the
     /// module's docs say.
     fn set_pass(&self, set: &PassSet<'_, RtPlatform>) {
-        let unbuilt = [
-            (
-                set.render_target_array_length.is_some_and(|n| n > 1),
-                "setRenderTargetArrayLength:",
-            ),
-            (
-                set.imageblock_sample_length.is_some_and(|n| n != 0),
-                "setImageblockSampleLength:",
-            ),
-            (
-                set.threadgroup_memory_length.is_some_and(|n| n != 0),
-                "setThreadgroupMemoryLength:",
-            ),
-            (set.tile_width.is_some_and(|n| n != 0), "setTileWidth:"),
-            (set.tile_height.is_some_and(|n| n != 0), "setTileHeight:"),
-        ];
-        for (_, sel) in unbuilt.into_iter().filter(|&(sent, _)| sent) {
-            refuse(Unbuilt::RenderPass, sel);
-        }
-        let mut pass = self.lock();
-        if let Some(width) = set.render_target_width {
-            pass.render_target_width = width;
-        }
-        if let Some(height) = set.render_target_height {
-            pass.render_target_height = height;
-        }
-        if let Some(buffer) = set.visibility_result_buffer {
-            pass.visibility_result_buffer = buffer.map(Handle::clone_ref);
-        }
+        let recorded_call = crate::recorder::rec_call!("m2v.setPass", self, set);
+        crate::recorder::run(|| {
+            let unbuilt = [
+                (
+                    set.render_target_array_length.is_some_and(|n| n > 1),
+                    "setRenderTargetArrayLength:",
+                ),
+                (
+                    set.imageblock_sample_length.is_some_and(|n| n != 0),
+                    "setImageblockSampleLength:",
+                ),
+                (
+                    set.threadgroup_memory_length.is_some_and(|n| n != 0),
+                    "setThreadgroupMemoryLength:",
+                ),
+                (set.tile_width.is_some_and(|n| n != 0), "setTileWidth:"),
+                (set.tile_height.is_some_and(|n| n != 0), "setTileHeight:"),
+            ];
+            for (_, sel) in unbuilt.into_iter().filter(|&(sent, _)| sent) {
+                refuse(Unbuilt::RenderPass, sel);
+            }
+            let mut pass = self.lock();
+            if let Some(width) = set.render_target_width {
+                pass.render_target_width = width;
+            }
+            if let Some(height) = set.render_target_height {
+                pass.render_target_height = height;
+            }
+            if let Some(buffer) = set.visibility_result_buffer {
+                pass.visibility_result_buffer = buffer.map(Handle::clone_ref);
+            }
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     /// An index past the eight attachments raises before any set, as Metal's subscript does.
@@ -457,32 +500,45 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
         index: u64,
         set: &ColorAttachmentSet<'_, RtPlatform>,
     ) -> RaiseResult<()> {
-        let i = match color_index(index) {
-            Ok(i) => i,
-            Err(raise) => return on.throw(raise),
-        };
-        let mut pass = self.lock();
-        let actions = (set.load_action, set.store_action);
-        pass.colors[i].set(set.texture, (set.level, set.slice), actions);
-        if let Some(c) = set.clear_color {
-            pass.clear_colors[i] = c;
-        }
-        Ok(())
+        let recorded_call = crate::recorder::rec_call!("m2v.setColorAttachment", self, index, set);
+        let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
+            let i = match color_index(index) {
+                Ok(i) => i,
+                Err(raise) => return on.throw(raise),
+            };
+            let mut pass = self.lock();
+            let actions = (set.load_action, set.store_action);
+            pass.colors[i].set(set.texture, (set.level, set.slice), actions);
+            if let Some(c) = set.clear_color {
+                pass.clear_colors[i] = c;
+            }
+            Ok(())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     fn set_depth_attachment(&self, set: &DepthAttachmentSet<'_, RtPlatform>) {
-        let mut pass = self.lock();
-        let actions = (set.load_action, set.store_action);
-        pass.depth.set(set.texture, (set.level, set.slice), actions);
-        pass.clear_depth = set.clear_depth.unwrap_or(pass.clear_depth);
+        let recorded_call = crate::recorder::rec_call!("m2v.setDepthAttachment", self, set);
+        crate::recorder::run(|| {
+            let mut pass = self.lock();
+            let actions = (set.load_action, set.store_action);
+            pass.depth.set(set.texture, (set.level, set.slice), actions);
+            pass.clear_depth = set.clear_depth.unwrap_or(pass.clear_depth);
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     fn set_stencil_attachment(&self, set: &StencilAttachmentSet<'_, RtPlatform>) {
-        let mut pass = self.lock();
-        let actions = (set.load_action, set.store_action);
-        pass.stencil
-            .set(set.texture, (set.level, set.slice), actions);
-        pass.clear_stencil = set.clear_stencil.unwrap_or(pass.clear_stencil);
+        let recorded_call = crate::recorder::rec_call!("m2v.setStencilAttachment", self, set);
+        crate::recorder::run(|| {
+            let mut pass = self.lock();
+            let actions = (set.load_action, set.store_action);
+            pass.stencil
+                .set(set.texture, (set.level, set.slice), actions);
+            pass.clear_stencil = set.clear_stencil.unwrap_or(pass.clear_stencil);
+        });
+        crate::recorder::rec_done!(recorded_call, ());
     }
 
     /// An index past the eight attachments raises, the caller's to catch.
