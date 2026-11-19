@@ -7470,7 +7470,7 @@ fn copy<P: Platform>(
             (Some(CachePages::Copied(_)), _, _) if !nothing => {
                 match out.as_ref().and_then(|(_, gpu)| gpu.as_deref()) {
                     Some(spans) => Some(pack(spans.iter().cloned(), spares.piece)),
-                    None => Some(pack([0..cache.length], spares.piece)),
+                    None => Some(pack(std::iter::once(0..cache.length), spares.piece)),
                 }
             }
             (None, Way::In, Some(carried)) => Some(pack(
@@ -14311,7 +14311,7 @@ pub(super) mod tests {
         let g = PIECE_GRANULE;
         let piece = 4 * g;
         assert_eq!(
-            pack([100..300], piece),
+            pack(std::iter::once(100..300), piece),
             Packed {
                 lens: vec![g],
                 places: vec![place(100..300, 0, 0, 0)],
@@ -14338,16 +14338,16 @@ pub(super) mod tests {
             "the last piece its 101 bytes' granule"
         );
         assert_eq!(
-            pack([0..2 * piece], piece).lens,
+            pack(std::iter::once(0..2 * piece), piece).lens,
             [piece, piece],
             "a range of two pieces ends at the second's end, with no third"
         );
         assert_eq!(
-            pack([0..g + 5], g + 10).lens,
+            pack(std::iter::once(0..g + 5), g + 10).lens,
             [g + 10],
             "rounded up to the granule, cut to the piece"
         );
-        assert_eq!(pack([3..3], piece), pack([], piece));
+        assert_eq!(pack(std::iter::once(3..3), piece), pack([], piece));
         assert!(pack([], piece).lens.is_empty());
     }
 
@@ -14375,7 +14375,7 @@ pub(super) mod tests {
             ]
         );
         assert!(
-            placed(&[100..200], &places).is_empty(),
+            placed(std::slice::from_ref(&(100..200)), &places).is_empty(),
             "between the places"
         );
     }
