@@ -376,7 +376,10 @@ use super::surface_pages::{PagesRefusal, SurfaceView, Unmade, buffer_over};
 use super::worker::Worker;
 use crate::device_writes::{self, Watcher};
 
+mod exported;
 pub(crate) mod shapes;
+
+pub(crate) use exported::planes_line;
 
 use shapes::{Held, ShapeCounts, ShapeKey, ShapeTable};
 
@@ -517,6 +520,9 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// ([`SurfaceCaches::shadow_shape`]); none in the per-shape form, and none of a cache for the
     /// host's video.
     shadow: ShapeTable<()>,
+    /// Where the cache was made for the host's video, the surface its planes may take
+    /// ([`exported`]).
+    surface: exported::CacheSurface<P>,
 }
 
 /// A laid-out cache's wide home (the module doc, "Wider than the plane"): a buffer that keeps
@@ -1821,6 +1827,9 @@ struct Since {
     /// A video command buffer among them wrote the buffer: every shape owes a fill from it once
     /// the copy is made ([`SurfaceCaches::unseen_writes`]).
     owed: bool,
+    /// Its decodes landed in the cache's surface, not the buffer: the plane shapes hold the
+    /// picture, and the others owe the fill ([`exported::owe_video`]).
+    planes: bool,
 }
 
 /// What a use's [`RGFX_SURFACE_USE_REFILL`] asks of its block's cache
@@ -2096,6 +2105,7 @@ impl<P: Platform> SurfaceCaches<P> {
             return Ok(false);
         };
         let Made { cache, pages } = made?;
+        let video = cache.video_memory();
         let Some((cache, life, repitched)) = cache.take(&mut self.counts) else {
             return Ok(false);
         };
@@ -2126,6 +2136,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 repitched,
                 planes: layout.as_ref().map_or(0, Vec::len),
                 texels: layout.as_deref().map(texel_spans),
+                surface: exported::CacheSurface::new(video, layout.as_deref()),
                 generation: None,
                 host_read: 0,
                 written: false,
@@ -2262,6 +2273,7 @@ impl<P: Platform> SurfaceCaches<P> {
         let Some(cache) = self.by_block.get_mut(&block) else {
             return Ok(());
         };
+        exported::skipped(&mut cache.surface, picture);
         if !std::mem::take(&mut cache.zeros) || picture {
             return Ok(());
         }
@@ -2324,9 +2336,14 @@ impl<P: Platform> SurfaceCaches<P> {
             self.released(device, block, 0, None, None, Box::new(|| {}), None)?;
         }
         let room = self.deferred_room(block);
+        let mut video = None;
         let made =
             match made.take_if(|new| new.as_ref().map_or(length, |n| n.bytes_or(length)) <= room) {
-                Some(new) => new?.take(&mut self.counts),
+                Some(new) => {
+                    let new = new?;
+                    video = new.video_memory();
+                    new.take(&mut self.counts)
+                }
                 None => None,
             };
         let bytes = (made.as_ref())
@@ -2352,6 +2369,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 repitched,
                 planes: layout.as_ref().map_or(0, Vec::len),
                 texels: layout.as_deref().map(texel_spans),
+                surface: exported::CacheSurface::new(video, layout.as_deref()),
                 // A carrying block holds no generation until its first fill, as a new cache.
                 generation: (!carries).then_some(0),
                 host_read: 0,
@@ -2787,6 +2805,13 @@ impl<P: Platform> SurfaceCaches<P> {
             || !self.dirty_since(block).is_empty()
     }
 
+    /// Whether a command buffer whose decodes write the block at `block`'s surface whole
+    /// (`decoded`) writes it into its cache's surface ([`exported::decodes_into`]).
+    fn decodes_into_surface(&self, block: u64, decoded: Option<&[PagesPlane; 2]>) -> bool {
+        (self.by_block.get(&block))
+            .is_some_and(|cache| exported::decodes_into(&cache.surface, decoded.is_some()))
+    }
+
     /// Whether a shape of the block at `block`'s cache owes a fill from the buffer that no fill
     /// asked and not made will make ([`shapes::Shape::owed`]): a fill of the cache refills every
     /// shape, and one of the shapes fills those that owe one as it is made.
@@ -2872,7 +2897,9 @@ impl<P: Platform> SurfaceCaches<P> {
             } else {
                 filled = self.fill(device, block, u.cpu_gen).map(|_| ());
             }
-        } else if self.owes_shape_fill(block) || (video && self.writes_back_first(block)) {
+        } else if self.owes_shape_fill(block)
+            || (video && !self.decodes_into_surface(block, decoded) && self.writes_back_first(block))
+        {
             if waits {
                 self.defer_shapes_fill(device, block);
             } else {
@@ -2974,11 +3001,19 @@ impl<P: Platform> SurfaceCaches<P> {
                 self.counts.shapes.unseen += 1;
                 continue;
             }
+            // Where its decodes landed in the cache's surface, the plane shapes hold the picture
+            // ([`exported`]); where they answered none, nothing was written.
+            let landed = (self.by_block.get_mut(block))
+                .map_or(Some(false), |c| exported::take_landed(&mut c.surface));
+            let Some(landed) = landed else {
+                continue;
+            };
             let number = counts.iter().find(|c| c.block == *block).map(|c| c.number);
             if let Some(since) = number.and_then(|number| self.since_mut(*block, number)) {
                 since.owed = true;
+                since.planes = landed;
             } else if let Some(cache) = self.by_block.get_mut(block) {
-                cache.shapes.owe_all(&mut self.counts.shapes);
+                exported::owe_video(&mut cache.shapes, landed, &mut self.counts.shapes);
             }
         }
     }
@@ -3080,7 +3115,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 .filter(|s| s.id() != source && s.key.same_plane(&key))
                 .map(|s| {
                     let id = s.id();
-                    (id, s.referenced() || s.dirty || since.contains(&id))
+                    (id, s.plane || s.referenced() || s.dirty || since.contains(&id))
                 })
                 .collect();
             let into: Vec<u64> = (others.iter()).filter(|o| o.1).map(|o| o.0).collect();
@@ -3683,7 +3718,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 cache.shapes.mark_dirty(id);
             }
             if since.owed {
-                cache.shapes.owe_all(&mut self.counts.shapes);
+                exported::owe_video(&mut cache.shapes, since.planes, &mut self.counts.shapes);
             }
         }
         if let Some((event, number)) = self.signal_with.take() {
@@ -4962,6 +4997,14 @@ impl<P: Platform> NewCache<P> {
         }
     }
 
+    /// How the cache made shares its memory with the host's video, where it was made for it
+    /// ([`exported::VideoMemory`]).
+    fn video_memory(&self) -> Option<exported::VideoMemory> {
+        let made = self.made.as_ref().is_some_and(|(_, life)| life.is_some());
+        made.then(|| exported::VideoMemory::of(self.counts.exportable, self.counts.dma_buf))
+            .flatten()
+    }
+
     /// The bytes of the cache made, where its layout at the GPU's pitch gives them, else `surface`'s.
     fn bytes_or(&self, surface: u64) -> u64 {
         self.repitched.as_deref().map_or(surface, Repitched::length)
@@ -5167,6 +5210,11 @@ impl<P: Platform> Caches<P> {
             None => return None,
             Some(Some(found)) => return Some(found),
             Some(None) => {}
+        }
+        // A video cache's plane takes its surface's ([`exported`]).
+        #[cfg(unix)]
+        if let Some(found) = self.plane_shape(device, block, &key) {
+            return Some(found);
         }
         let Some(image) = maker(device, desc) else {
             self.state.lock().counts.shapes.images_refused += 1;

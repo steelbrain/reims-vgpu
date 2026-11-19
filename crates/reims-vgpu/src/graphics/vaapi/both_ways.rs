@@ -83,6 +83,8 @@ pub(super) fn land_both_ways(
         host: Some(at.wrapping_add(offset)),
         pages: None,
         cache: None,
+        #[cfg(unix)]
+        surface: None,
     };
     let luma = plane(luma_at, luma_bytes, width, height);
     let chroma = plane(chroma_at, chroma_bytes, width.div_ceil(2), chroma_rows);
@@ -187,6 +189,8 @@ fn land_in_a_cache(
         host: None,
         pages: None,
         cache: None,
+        #[cfg(unix)]
+        surface: None,
     };
     let luma = plane(luma_at, luma_bytes, width, height);
     let chroma = plane(chroma_at, chroma_bytes, width.div_ceil(2), chroma_rows);

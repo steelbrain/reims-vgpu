@@ -423,6 +423,21 @@ pub(super) fn set_purgeable(held: &AtomicU64, state: u64) -> u64 {
     }
 }
 
+/// The plane texture `plane` of an exported surface rt made (`super::surface`), of `desc`, for
+/// `sel`: a texture with no index of its own, the image under the textures made as its views, as
+/// [`RtObj::new_texture_for_views`]'s is.
+#[cfg(unix)]
+pub(super) fn surface_plane(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    desc: &TextureDesc,
+    plane: rt::Texture,
+) -> Option<RtObj<RtTexture>> {
+    let options = desc.resource_options.unwrap_or(0);
+    let diag = |shape: &Shape| Made::new(Call::SurfaceImage, shape);
+    answered(device, sel, desc, options, None, Ok(plane), diag)
+}
+
 impl RtObj<RtDevice> {
     /// A texture of `desc` with no index of its own, the image under the textures made as its
     /// views (the module's docs, "Images for views"), as `newTextureWithDescriptor:` would make

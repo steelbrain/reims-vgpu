@@ -87,6 +87,17 @@
 //! named again) refills every shape from the buffer, and the CPU's bytes win over the GPU's
 //! unwritten-back ones, as they win over the buffer's.
 //!
+//! **Plane shapes.** A cache of a two-plane surface the host's video writes keeps its planes in
+//! a surface the platform exports (`super::exported`): each plane's whole extent is a plane
+//! shape, its image the surface's plane, made with `PixelFormatView`, so a guest texture over the
+//! plane in another format of the texel's size (an `R8Uint` over an `R8Unorm` plane) is a view of
+//! it. The host's video writes its pictures into those images through the surface's memory: a
+//! video command buffer whose decodes land there leaves the plane shapes holding the picture and
+//! every other shape owing a fill ([`ShapeTable::owe_but_planes`]), and, while the cache's buffer
+//! is a copy of its own, the plane shapes dirty, so the copies out and the fills of the others
+//! take the picture from them (rule 3). The bound never drops a plane shape, referenced or not,
+//! and rule 1 copies a write through another shape of the plane into it.
+//!
 //! **References.** Each guest texture over a shape, and each guest view of one, holds a
 //! [`ShapeRef`] in its decoder entry; the count of those is the shape's reference count, so every
 //! way an entry goes (its destroy, its id made again, its context's close, the device's reset)
@@ -342,9 +353,22 @@ pub(crate) struct ShapeCounts {
     /// pipeline bound with them may write, so taken as read (`GraphicsDecoder`'s
     /// `note_slot_shape`).
     pub(crate) slot_reads: u64,
-    /// Shapes owed a fill after a video command buffer wrote their cache's buffer
-    /// ([`ShapeTable::owe_all`]).
+    /// Shapes owed a fill after a video command buffer wrote their cache's buffer, or a plane of
+    /// its surface ([`ShapeTable::owe_all`], [`ShapeTable::owe_but_planes`]).
     pub(crate) video_owed: u64,
+    /// Of `fills`, those of a shape a video write owed, and their bytes: the copies a picture
+    /// costs past the decode's own.
+    pub(crate) video_fills: u64,
+    pub(crate) video_filled_bytes: u64,
+    /// Plane shapes made over a surface's planes (the module doc, "Plane shapes"), and video
+    /// command buffers' writes that landed in them.
+    pub(crate) planes_made: u64,
+    pub(crate) planes_landed: u64,
+    /// Surfaces made for video caches' planes, those the platform made none of, and the most
+    /// caches that held one at once (`super::exported`).
+    pub(crate) surfaces: u64,
+    pub(crate) surfaces_refused: u64,
+    pub(crate) surfaces_live_most: u64,
     /// Shapes made over a plane that held a shape of the other kind, plain or storage (the module
     /// doc, "A storage shape serves every texture of its extent"); and of rule 1's copies, those
     /// between a plain and a storage shape, and their bytes.
@@ -371,6 +395,11 @@ pub(crate) struct Shape<T> {
     /// Owes a fill from the buffer before anything reads it (a new shape, rule 2; or the buffer
     /// took bytes no shape holds, a video op's picture).
     pub(crate) owed: bool,
+    /// The fill it owes is a video write's ([`ShapeCounts::video_fills`]).
+    video: bool,
+    /// A plane shape: its image is a plane of the cache's surface, which the bound never drops
+    /// (the module doc, "Plane shapes").
+    pub(crate) plane: bool,
     /// The caches' clock at its last use: its make, a texture made of it, or a use of its surface
     /// while a texture referenced it ([`ShapeTable::touch`]).
     used: u64,
@@ -459,9 +488,33 @@ impl<T> ShapeTable<T> {
             tag,
             dirty: false,
             owed,
+            video: false,
+            plane: false,
             used: now,
         });
         (reference, again)
+    }
+
+    /// Adds the plane shape of `key`, its image `image` a plane of the cache's surface, owing a
+    /// fill from the buffer where `owed`, used now (`now`), as [`Self::insert`] adds a shape: the
+    /// bound never drops it (the module doc, "Plane shapes").
+    pub(crate) fn insert_plane(
+        &mut self,
+        key: ShapeKey,
+        image: T,
+        owed: bool,
+        now: u64,
+    ) -> (ShapeRef, bool) {
+        let made = self.insert(key, image, owed, now);
+        if let Some(shape) = self.shapes.last_mut() {
+            shape.plane = true;
+        }
+        made
+    }
+
+    /// Whether the table holds a plane shape.
+    pub(crate) fn has_planes(&self) -> bool {
+        self.shapes.iter().any(|s| s.plane)
     }
 
     /// The shapes' bytes ([`ShapeKey::bytes`]).
@@ -503,6 +556,28 @@ impl<T> ShapeTable<T> {
     pub(crate) fn owe_all(&mut self, counts: &mut ShapeCounts) {
         for shape in &mut self.shapes {
             shape.owed = true;
+            shape.video = true;
+            shape.dirty = false;
+            counts.video_owed += 1;
+        }
+    }
+
+    /// A video command buffer wrote its decodes' pictures into the planes of the cache's surface,
+    /// which the plane shapes' images are (the module doc, "Plane shapes"): each plane shape holds
+    /// them, and is dirty where `buffer_apart`, the buffer a copy of its own that lacks them;
+    /// every other shape owes a fill from the buffer, its own write before the picture's lost, as
+    /// [`Self::owe_all`]'s does; counted in `counts`.
+    pub(crate) fn owe_but_planes(&mut self, buffer_apart: bool, counts: &mut ShapeCounts) {
+        counts.planes_landed += 1;
+        for shape in &mut self.shapes {
+            if shape.plane {
+                shape.owed = false;
+                shape.video = false;
+                shape.dirty = buffer_apart;
+                continue;
+            }
+            shape.owed = true;
+            shape.video = true;
             shape.dirty = false;
             counts.video_owed += 1;
         }
@@ -535,7 +610,7 @@ impl<T> ShapeTable<T> {
     pub(crate) fn sweep(&mut self, counts: &mut ShapeCounts) -> Vec<Shape<T>> {
         let mut past: Vec<(u64, u64, bool)> = Vec::new();
         let mut unreferenced: Vec<(u64, u64, bool)> = Vec::new();
-        for shape in self.shapes.iter().filter(|s| !s.referenced()) {
+        for shape in self.shapes.iter().filter(|s| !s.referenced() && !s.plane) {
             let one = (shape.used, shape.id(), shape.dirty);
             if self.superseded(&shape.key) {
                 past.push(one);
@@ -562,7 +637,7 @@ impl<T> ShapeTable<T> {
     /// held: the next the budget trims ([`Self::take_id`]).
     pub(crate) fn oldest_unreferenced(&self) -> Option<(u64, u64)> {
         (self.shapes.iter())
-            .filter(|s| !s.referenced() && !s.dirty)
+            .filter(|s| !s.referenced() && !s.dirty && !s.plane)
             .map(|s| (s.used, s.id()))
             .min()
     }
@@ -572,11 +647,12 @@ impl<T> ShapeTable<T> {
         self.take(|s| s.id() == id).pop()
     }
 
-    /// The shapes `going` picks, taken out, their keys remembered as dropped.
+    /// The shapes `going` picks, taken out, their keys remembered as dropped: never a plane shape
+    /// (the module doc, "Plane shapes").
     fn take(&mut self, going: impl Fn(&Shape<T>) -> bool) -> Vec<Shape<T>> {
         let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shapes)
             .into_iter()
-            .partition(|s| going(s));
+            .partition(|s| !s.plane && going(s));
         self.shapes = kept;
         for shape in &gone {
             if self.dropped.len() == DROPPED_REMEMBERED {
@@ -626,6 +702,10 @@ pub(crate) fn fill<P: Platform>(
         shape.dirty = false;
         counts.fills += 1;
         counts.filled_bytes += shape.bytes;
+        if std::mem::take(&mut shape.video) {
+            counts.video_fills += 1;
+            counts.video_filled_bytes += shape.bytes;
+        }
     }
     blit.encode(ON, BlitCmd::EndEncoding)?;
     Ok(())

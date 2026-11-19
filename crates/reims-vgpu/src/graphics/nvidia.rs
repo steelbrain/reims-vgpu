@@ -86,7 +86,7 @@ use reims_vgpu_video::paravirt::{Encoder, EncoderConfig};
 use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
-use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, ExportedMemory};
 use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::core::sync::Mutex;
 
@@ -376,7 +376,11 @@ fn imports_caches<P: Platform>(
 
 /// `buffer`'s memory imported on `gpu`; `Err` says why not.
 fn import<P: Platform>(buffer: &P::Buffer, gpu: &Arc<Gpu>) -> Result<ImportedBuffer, String> {
-    let exported = buffer.export_memory()?;
+    import_exported(buffer.export_memory()?, gpu)
+}
+
+/// The memory `exported` names imported on `gpu`; `Err` says why not.
+fn import_exported(exported: ExportedMemory, gpu: &Arc<Gpu>) -> Result<ImportedBuffer, String> {
     ImportedBuffer::import(
         gpu,
         exported.fd,
@@ -629,7 +633,7 @@ impl<P: Platform> NvdecPicture<P> {
             imports.get_or_make(
                 cache,
                 0,
-                || import::<P>(&plane.buffer, gpu),
+                || import_exported(plane.export(false)?, gpu),
                 || "the device cache went".to_owned(),
             )
         };
@@ -664,13 +668,14 @@ impl<P: Platform> NvdecPicture<P> {
             (self.picture).write_into_device(size, luma_plane, chroma_plane, Box::new(()))
         };
         match written? {
-            // The copies are done (the write waited for them): the device's reads of each cache
-            // see them once the platform acquired what CUDA wrote, said before the session's
-            // signal lets a command buffer read the picture.
+            // The copies are done (the write waited for them): the device's reads of each cache,
+            // or of its surface where the planes land there, see them once the platform acquired
+            // what CUDA wrote, said before the session's signal lets a command buffer read the
+            // picture.
             Ok(()) => {
-                luma.buffer.external_write_done()?;
+                luma.external_write_done()?;
                 if chroma_cache.key() != luma_cache.key() {
-                    chroma.buffer.external_write_done()?;
+                    chroma.external_write_done()?;
                 }
                 Ok(true)
             }

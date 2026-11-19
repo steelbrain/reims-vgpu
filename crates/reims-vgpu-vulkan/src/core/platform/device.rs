@@ -184,6 +184,22 @@ pub trait GpuDevice<P: Platform>: Handle {
         let _ = (on, length, options, aligned_byte);
         Ok(None)
     }
+    /// No Metal counterpart: a surface of `desc`'s planes, each a texture of the platform's,
+    /// whose memory another API imports through `desc.handle`
+    /// ([`ExportedSurface`](super::resource::ExportedSurface)): the host's video writes its
+    /// pictures into the IOSurface device caches' plane images so. The memory's bytes are
+    /// undefined. `Ok(None)` where the platform makes none (the default, and a device that
+    /// exports no such memory or makes no such plane), and the caller keeps the planes in images
+    /// of its own. Reached both under a handler and with none: `on` says which this call is.
+    #[cfg(unix)]
+    fn new_exported_surface(
+        &self,
+        on: OnFault,
+        desc: &super::resource::SurfaceDesc<'_>,
+    ) -> RaiseResult<Option<super::resource::ExportedSurface<P>>> {
+        let _ = (on, desc);
+        Ok(None)
+    }
     /// sel: newCommandQueue
     /// Never nil-checked. No path reaches it under a handler: a raise inside it dies at the send.
     fn new_command_queue(&self) -> Option<P::CommandQueue>;

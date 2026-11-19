@@ -224,6 +224,8 @@ pub use video::{
     Decoded, GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput,
     GuestSource, Landed, PlanePages, VideoDecode, VideoEncode, VideoPlane,
 };
+#[cfg(unix)]
+pub use video::SurfaceTarget;
 #[cfg(any(target_os = "linux", windows))]
 pub(crate) use video::{rate_past_first_frame, same_rate_mode};
 
@@ -1794,6 +1796,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                     sh.order_case, sh.order_copies, sh.order_bytes >> 20, sh.plain_views_refused,
                     sh.plain_format_views, sh.pages_copied
                 );
+            }
+            if let Some(line) = surface_cache::planes_line(&sh) {
+                log::info!(target: "reims_vgpu::graphics", "{line}");
             }
         }
         Some(status)

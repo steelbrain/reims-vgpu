@@ -377,6 +377,8 @@ mod tests {
             host: None,
             pages: None,
             cache: None,
+            #[cfg(unix)]
+            surface: None,
         }
     }
 

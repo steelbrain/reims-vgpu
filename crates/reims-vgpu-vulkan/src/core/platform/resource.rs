@@ -164,6 +164,99 @@ pub struct ExportedMemory {
     pub dedicated: bool,
 }
 
+/// No Metal counterpart: the kind of handle an exported surface's memory is shared through
+/// ([`GpuDevice::new_exported_surface`](super::device::GpuDevice::new_exported_surface)).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceHandle {
+    /// An opaque fd, which CUDA imports (NVDEC's landing).
+    OpaqueFd,
+    /// A dma-buf, which VA-API imports.
+    DmaBuf,
+}
+
+/// No Metal counterpart: one plane of an exported surface: a 2D texture of one level, slice and
+/// sample, of `pixel_format` (a colour format of one texel an element), `width` by `height`, of
+/// Metal's `usage`, with `rows_below` rows of room below its own before the next plane's start.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SurfacePlaneDesc {
+    /// The plane's `MTLPixelFormat`.
+    pub pixel_format: u64,
+    /// Its width in texels.
+    pub width: u64,
+    /// Its height in texels.
+    pub height: u64,
+    /// Its texture's `MTLTextureUsage`.
+    pub usage: u64,
+    /// Rows of room below its own, before the next plane's start.
+    pub rows_below: u32,
+}
+
+/// No Metal counterpart: what
+/// [`GpuDevice::new_exported_surface`](super::device::GpuDevice::new_exported_surface) makes: the
+/// planes, in their order in memory, shared through `handle`, their one pitch a multiple of
+/// `pitch_multiple` and each plane after the first starting on a multiple of `start_multiple`
+/// (the other API's rules).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+pub struct SurfaceDesc<'a> {
+    /// The handle the memory is shared through.
+    pub handle: SurfaceHandle,
+    /// What the planes' one pitch is a multiple of; at least 1.
+    pub pitch_multiple: u64,
+    /// What each plane's start after the first is a multiple of; at least 1.
+    pub start_multiple: u64,
+    /// The planes, in their order in memory.
+    pub planes: &'a [SurfacePlaneDesc],
+}
+
+/// No Metal counterpart: where a plane of an exported surface lies in its memory, as the other
+/// API imports it: its first byte, and the bytes from one of its rows to the next, the surface's
+/// one pitch. Plane 0 lies at 0.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SurfacePlaneLayout {
+    /// The plane's first byte in the memory.
+    pub offset: u64,
+    /// Bytes from one of its rows to the next.
+    pub row_pitch: u64,
+}
+
+/// No Metal counterpart: an exported surface's memory, which its planes' textures lie in
+/// ([`ExportedSurface`]), and what another API does with it.
+#[cfg(unix)]
+pub trait SurfaceMemory: Send + Sync {
+    /// The memory as a new descriptor of the surface's handle, with what an import names: the
+    /// whole allocation from its first byte ([`ExportedMemory::offset`] 0), and whether it is a
+    /// dedicated allocation. `Err` says why not.
+    fn export(&self) -> Result<ExportedMemory, String>;
+    /// Says that another API wrote the memory and that the caller waited for those writes, as
+    /// [`Buffer::external_write_done`] says of a buffer's: the device's later reads of the planes
+    /// see them. `Err` says why the device will not.
+    fn external_writes_done(&self) -> Result<(), String>;
+    /// The kind of handle the memory is shared through.
+    fn handle(&self) -> SurfaceHandle;
+    /// Whether the planes' textures lie in the shared memory itself; else each is the
+    /// platform's copy, which it moves the bytes into and back.
+    fn in_place(&self) -> bool;
+    /// Each plane's place in the memory, in the description's order.
+    fn layout(&self) -> &[SurfacePlaneLayout];
+}
+
+/// No Metal counterpart: an exported surface
+/// ([`GpuDevice::new_exported_surface`](super::device::GpuDevice::new_exported_surface)): each
+/// plane's texture, in the description's order, made with no resource index of the guest's, and
+/// the memory they lie in. The textures and the memory go together: a texture made as a view of
+/// a plane's holds the memory.
+#[cfg(unix)]
+pub struct ExportedSurface<P: Platform> {
+    /// Each plane's texture, in the description's order.
+    pub planes: Vec<P::Texture>,
+    /// The memory they lie in.
+    pub memory: std::sync::Arc<dyn SurfaceMemory>,
+}
+
 /// `MTLTexture` (with `MTLTextureSPI`).
 ///
 /// `didModifyData` (SPI) is not declared: only the tiled EFI path, which nothing reaches, would

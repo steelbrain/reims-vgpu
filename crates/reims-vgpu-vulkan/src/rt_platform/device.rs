@@ -663,6 +663,18 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         Ok(made)
     }
 
+    /// rt's exported surface of `desc`'s planes (`super::surface`); `None` where rt makes none,
+    /// counted, and the caller keeps the planes in images of its own.
+    #[cfg(unix)]
+    fn new_exported_surface(
+        &self,
+        on: OnFault,
+        desc: &crate::core::platform::resource::SurfaceDesc<'_>,
+    ) -> RaiseResult<Option<crate::core::platform::resource::ExportedSurface<RtPlatform>>> {
+        let _ = on;
+        Ok(super::surface::exported_surface(self, desc))
+    }
+
     /// rt's queue, of Metal's default `maxCommandBufferCount`; nil where rt refuses it.
     fn new_command_queue(&self) -> Option<RtObj<RtQueue>> {
         match self.rt.new_command_queue(METAL_MAX_COMMAND_BUFFER_COUNT) {

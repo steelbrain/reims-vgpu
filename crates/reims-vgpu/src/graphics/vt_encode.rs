@@ -158,6 +158,8 @@ pub(super) fn buffer_planes<P: Platform>(
         host: None,
         pages: None,
         cache: None,
+        #[cfg(unix)]
+        surface: None,
     };
     [
         plane(&planes[0], width, height, 1),

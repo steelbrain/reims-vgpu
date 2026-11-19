@@ -473,6 +473,8 @@ fn each_profile_encodes_through_a_session_and_decodes_back_on_nvdec() {
                 pages: None,
                 cache: None,
                 rows_room: None,
+                #[cfg(unix)]
+                surface: None,
             };
             let mut decoder = AnnexBDecoder::new(
                 &gpu,
@@ -696,6 +698,8 @@ fn frames_filled_by_the_gpu_encode_as_uploaded<P: Platform>(
                 pages: None,
                 cache: None,
                 rows_room: None,
+                #[cfg(unix)]
+                surface: None,
             };
             let mut streams = Vec::new();
             for filled in [false, true] {

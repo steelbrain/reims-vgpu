@@ -624,6 +624,8 @@ fn a_frame_filled_by_the_gpu_encodes_as_the_uploaded_frame_byte_for_byte() {
                             host: Some(at.wrapping_add(offset)),
                             pages: None,
                             cache: None,
+                            #[cfg(unix)]
+                            surface: None,
                         };
                         let luma_plane = plane(first, u64::from(height), u64::from(width));
                         let chroma_plane =

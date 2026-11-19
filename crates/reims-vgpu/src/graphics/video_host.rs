@@ -64,10 +64,16 @@ use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueu
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent as _};
 use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+#[cfg(unix)]
+use reims_vgpu_vulkan::core::platform::resource::{ExportedMemory, SurfaceMemory as _};
 use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
+#[cfg(unix)]
+use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlSize};
 use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_vulkan::core::sync::Mutex;
 
+#[cfg(unix)]
+use super::decode::SurfaceTarget;
 use super::decode::{
     Decoded, GraphicsVideoSession, Landed, PlanePages, VideoDecode, VideoPlane, op_fault,
 };
@@ -162,8 +168,47 @@ pub(crate) struct OutputPlane<P: Platform> {
     /// `None` in a device cache, and in memory of another kind.
     pub(crate) pages: Option<PlanePages>,
     /// The identity of the device cache the buffer is, where `cached` and the cache's memory was
-    /// made for the host's video ([`VideoPlane::cache`]).
+    /// made for the host's video ([`VideoPlane::cache`]); of the cache's surface, where the plane
+    /// lands there (`surface`).
     pub(crate) cache: Option<MemoryIdentity>,
+    /// Where the plane lands in its cache's surface ([`VideoPlane::surface`]): the plane there,
+    /// which `offset`, `bytes_per_row`, `rows_held` and `cache` then say of, in the surface's
+    /// memory rather than the buffer.
+    #[cfg(unix)]
+    pub(crate) surface: Option<SurfaceTarget<P>>,
+}
+
+impl<P: Platform> OutputPlane<P> {
+    /// Says that the host's video wrote the plane's memory, its cache's buffer or its surface,
+    /// and that the caller waited for those writes (`Buffer::external_write_done`); `Err` says
+    /// why the device will not read them.
+    #[cfg(unix)]
+    pub(crate) fn external_write_done(&self) -> Result<(), String> {
+        match &self.surface {
+            Some(target) => target.memory.external_writes_done(),
+            None => self.buffer.external_write_done(),
+        }
+    }
+
+    /// The plane's memory, its cache's buffer's (`Buffer::export_memory`, `dma_buf` for
+    /// `Buffer::export_dma_buf`) or its surface's (`SurfaceMemory::export`, whose handle its
+    /// cache's make chose), with what an import names; `Err` says why not.
+    #[cfg(unix)]
+    pub(crate) fn export(&self, dma_buf: bool) -> Result<ExportedMemory, String> {
+        match (&self.surface, dma_buf) {
+            (Some(target), _) => target.memory.export(),
+            (None, true) => self.buffer.export_dma_buf(),
+            (None, false) => self.buffer.export_memory(),
+        }
+    }
+
+    /// Whether the plane lands in its cache's surface (`surface`).
+    pub(crate) fn in_surface(&self) -> bool {
+        #[cfg(unix)]
+        return self.surface.is_some();
+        #[cfg(not(unix))]
+        false
+    }
 }
 
 /// One plane's host bytes, which a picture lands in ([`Landing::host`]).
@@ -445,6 +490,25 @@ impl<P: Platform> Stage<P> {
             .ok_or_else(|| format!("the copy {way} a device cache: no blit encoder"))?;
         for (plane, at) in [(luma, staged.luma), (chroma, staged.chroma)] {
             let Some(at) = at else { continue };
+            // A plane that lands in its cache's surface is copied into its image, staged at the
+            // surface's pitch.
+            #[cfg(unix)]
+            if let Some(target) = plane.surface.as_ref().filter(|_| into) {
+                let copy = BlitCmd::CopyBufferToTexture {
+                    source_buffer: buffer,
+                    source_offset: at,
+                    source_bytes_per_row: plane.bytes_per_row,
+                    source_bytes_per_image: plane.bytes_per_row.saturating_mul(plane.height),
+                    source_size: MtlSize::new(plane.width, plane.height, 1),
+                    destination_texture: &target.texture,
+                    destination_slice: 0,
+                    destination_level: 0,
+                    destination_origin: MtlOrigin::default(),
+                };
+                blit.encode(OnFault::Return, copy)
+                    .map_err(|r| fault("a copy into a surface's plane", r))?;
+                continue;
+            }
             for (staged_at, cache_at, size) in plane_copies(at, plane) {
                 let copy = if into {
                     BlitCmd::CopyBufferToBuffer {
@@ -546,6 +610,25 @@ fn output_plane<P: Platform>(plane: &VideoPlane<'_, P>, rows: u64) -> RaiseResul
         }
         Some(contents.wrapping_add(plane.offset))
     };
+    // In its cache's surface, the plane lies where the surface's memory holds it, with the rows
+    // of a coded picture below its own.
+    #[cfg(unix)]
+    if let Some(target) = &plane.surface {
+        return Ok(OutputPlane {
+            buffer: plane.buffer.clone_ref(),
+            offset: target.offset,
+            bytes_per_row: target.bytes_per_row,
+            row_bytes: plane.row_bytes,
+            width: plane.width,
+            height: plane.height,
+            rows_held: target.rows.max(plane.height),
+            cached: true,
+            host: None,
+            pages: None,
+            cache: Some(target.identity.clone()),
+            surface: Some(target.clone_ref()),
+        });
+    }
     Ok(OutputPlane {
         buffer: plane.buffer.clone_ref(),
         offset: plane.offset,
@@ -558,6 +641,8 @@ fn output_plane<P: Platform>(plane: &VideoPlane<'_, P>, rows: u64) -> RaiseResul
         host,
         pages: plane.pages.clone(),
         cache: plane.cache.clone(),
+        #[cfg(unix)]
+        surface: None,
     })
 }
 
@@ -600,6 +685,8 @@ fn output_plane_of<P: Platform>(
         host,
         pages: plane.pages.clone(),
         cache: plane.cache.clone(),
+        #[cfg(unix)]
+        surface: None,
     })
 }
 

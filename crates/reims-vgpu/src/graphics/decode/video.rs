@@ -38,6 +38,10 @@ use reims_vgpu_video::codec::encode::Coded;
 use reims_vgpu_video::codec::encode::RateControl;
 use reims_vgpu_video::core::backend::BackendError as VideoError;
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity};
+#[cfg(unix)]
+use reims_vgpu_vulkan::core::platform::Handle as _;
+#[cfg(unix)]
+use reims_vgpu_vulkan::core::platform::resource::SurfaceMemory;
 #[cfg(target_os = "linux")]
 use reims_vgpu_video::core::device_memory::{DmaBufError, SurfaceDmaBuf};
 use reims_vgpu_video::core::surfaces::{SurfaceError, SurfaceLayout};
@@ -466,6 +470,46 @@ pub struct VideoPlane<'a, P: Platform> {
     ///
     /// [`Repitched::rows_from`]: super::surface_cache::Repitched::rows_from
     pub rows_room: Option<u64>,
+    /// Where the plane's cache keeps its planes in a surface of the platform's
+    /// ([`super::surface_cache`]'s `exported`) and the op is a decode that shows them whole: the
+    /// plane there, which the picture lands in rather than the buffer.
+    #[cfg(unix)]
+    pub surface: Option<SurfaceTarget<P>>,
+}
+
+/// One plane of a video cache's surface, as a decode's picture lands in it
+/// ([`VideoPlane::surface`]): the surface's memory, which the host's video imports, the plane's
+/// image, and where the plane lies in the memory.
+#[cfg(unix)]
+pub struct SurfaceTarget<P: Platform> {
+    /// The memory the surface's planes lie in.
+    pub memory: Arc<dyn SurfaceMemory>,
+    /// The surface's identity, which lives as long as its cache: what a device of the host's
+    /// video makes of the memory (an import of it) is kept by it and let go of once it ends.
+    pub identity: MemoryIdentity,
+    /// The plane's image, the cache's plane shape's.
+    pub texture: P::Texture,
+    /// The plane's first byte in the memory.
+    pub offset: u64,
+    /// Bytes from one of its rows to the next, the surface's one pitch.
+    pub bytes_per_row: u64,
+    /// The rows it holds from its first: its own and the room below them, for a coded picture's.
+    pub rows: u64,
+}
+
+#[cfg(unix)]
+impl<P: Platform> SurfaceTarget<P> {
+    /// Another target of the same plane.
+    pub fn clone_ref(&self) -> Self {
+        SurfaceTarget {
+            memory: Arc::clone(&self.memory),
+            identity: self.identity.clone(),
+            texture: self.texture.clone_ref(),
+            offset: self.offset,
+            bytes_per_row: self.bytes_per_row,
+            rows: self.rows,
+        }
+    }
 }
 
 /// The memory a plane's buffer lies in, as the host's video devices take it
@@ -715,7 +759,8 @@ pub(super) fn decode_op<P: Platform>(
             m.bitstream_size, m.bitstream_offset
         )));
     }
-    let (luma, chroma) = objs.video_planes(tag, m.luma_texture_obj_id, m.chroma_texture_obj_id)?;
+    let (luma, chroma) =
+        objs.video_planes(tag, m.luma_texture_obj_id, m.chroma_texture_obj_id, true)?;
     let decode = VideoDecode {
         bitstream,
         offset: m.bitstream_offset,
@@ -800,6 +845,7 @@ fn encode_op<P: Platform>(
         tag,
         m.source_luma_texture_obj_id,
         m.source_chroma_texture_obj_id,
+        false,
     )?;
     let encode = VideoEncode {
         luma,
@@ -856,12 +902,15 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `tag`: each where it lies, in its surface's device cache where its block has one, else in
     /// its pages. A cache the host is filling, or copying a picture out of into the pages, is
     /// waited for first, so a picture never lands over a fill's older bytes and a copy never
-    /// reads a picture landing, and a read finds the cache whole.
+    /// reads a picture landing, and a read finds the cache whole. A `decode` whose textures show
+    /// their cache's planes whole, where it keeps them in a surface, is given the surface's planes
+    /// ([`VideoPlane::surface`]).
     fn video_planes(
         &self,
         tag: u16,
         luma_id: u64,
         chroma_id: u64,
+        decode: bool,
     ) -> RaiseResult<(VideoPlane<'_, P>, VideoPlane<'_, P>)> {
         let (luma_place, luma) = self.plane_of(luma_id)?;
         let (chroma_place, chroma) = self.plane_of(chroma_id)?;
@@ -884,6 +933,21 @@ impl<P: Platform> GraphicsDecoder<P> {
             let laid = self.surface_caches.repitched(cache?)?;
             Some((laid.rows_from(place.in_surface.0, place.in_surface.1)).unwrap_or(place.height))
         };
+        // A decode of both planes whole, in one cache, lands in the cache's surface where it
+        // has one.
+        #[cfg(unix)]
+        let whole = decode
+            && luma_place.whole == Some(0)
+            && chroma_place.whole == Some(1)
+            && luma_place.buffer_obj_id == chroma_place.buffer_obj_id;
+        #[cfg(unix)]
+        let [luma_surface, chroma_surface] = match luma_cache.filter(|_| whole) {
+            Some(block) => (self.surface_caches.surface_targets(block))
+                .map_or([None, None], |targets| targets.map(Some)),
+            None => [None, None],
+        };
+        #[cfg(not(unix))]
+        let _ = decode;
         let plane = |place: PlanePlace, buffer, cache: Option<u64>| VideoPlane {
             buffer,
             offset: place.offset,
@@ -897,7 +961,21 @@ impl<P: Platform> GraphicsDecoder<P> {
                 .flatten(),
             cache: cache.and_then(|block| self.surface_caches.identity(block)),
             rows_room: rows_room(&place, cache),
+            #[cfg(unix)]
+            surface: None,
         };
+        #[cfg(unix)]
+        return Ok((
+            VideoPlane {
+                surface: luma_surface,
+                ..plane(luma_place, luma, luma_cache)
+            },
+            VideoPlane {
+                surface: chroma_surface,
+                ..plane(chroma_place, chroma, chroma_cache)
+            },
+        ));
+        #[cfg(not(unix))]
         Ok((
             plane(luma_place, luma, luma_cache),
             plane(chroma_place, chroma, chroma_cache),

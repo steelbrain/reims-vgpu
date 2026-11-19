@@ -115,7 +115,7 @@ use reims_vgpu_vulkan::core::platform::Platform;
 #[cfg(unix)]
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 #[cfg(unix)]
-use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, ExportedMemory, SurfaceMemory};
 #[cfg(unix)]
 use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::core::sync::Mutex;
@@ -706,10 +706,46 @@ struct CacheMemory<P: Platform> {
     /// The allocation's bytes, and the cache's first byte in it.
     size: u64,
     offset: u64,
-    /// The cache's buffer, which every import of its memory holds.
-    buffer: P::Buffer,
+    /// The cache's buffer, or its surface's memory where its planes land there, which every
+    /// import of its memory holds.
+    cache: CacheOf<P>,
     /// The last target imported over it, at its planes, handed again while no decoder holds it.
     last: Mutex<Option<(Target, [TargetPlane; 2])>>,
+}
+
+/// The memory an output's planes lie in, in a device cache made a dma-buf for the video: the
+/// cache's buffer, or the cache's surface where they land there ([`OutputPlane::surface`]).
+#[cfg(unix)]
+enum CacheOf<P: Platform> {
+    Buffer(P::Buffer),
+    Surface(Arc<dyn SurfaceMemory>),
+}
+
+#[cfg(unix)]
+impl<P: Platform> CacheOf<P> {
+    /// The memory `plane` lies in.
+    fn of(plane: &OutputPlane<P>) -> Self {
+        match &plane.surface {
+            Some(target) => Self::Surface(Arc::clone(&target.memory)),
+            None => Self::Buffer(plane.buffer.clone_ref()),
+        }
+    }
+
+    /// Another hold of the same memory.
+    fn clone_ref(&self) -> Self {
+        match self {
+            Self::Buffer(buffer) => Self::Buffer(buffer.clone_ref()),
+            Self::Surface(memory) => Self::Surface(Arc::clone(memory)),
+        }
+    }
+
+    /// The memory as a new dma-buf; `Err` says why not.
+    fn export(&self) -> Result<ExportedMemory, String> {
+        match self {
+            Self::Buffer(buffer) => buffer.export_dma_buf(),
+            Self::Surface(memory) => memory.export(),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -801,7 +837,7 @@ impl<P: Platform> CacheTargets<P> {
         let (targets, cache, buffer, said, roles) = (
             Arc::clone(self),
             cache.clone(),
-            luma.buffer.clone_ref(),
+            CacheOf::of(luma),
             Arc::clone(said),
             Arc::clone(roles),
         );
@@ -814,15 +850,15 @@ impl<P: Platform> CacheTargets<P> {
         }))
     }
 
-    /// The target of a picture of `shape` and `codec` in the cache `cache` (`buffer`), whose
-    /// planes lie at `planes` (each its room, first byte and rows held); `Err` says why there is
-    /// none.
+    /// The target of a picture of `shape` and `codec` in the cache `cache` (its memory `buffer`,
+    /// the cache's buffer or its surface's), whose planes lie at `planes` (each its room, first
+    /// byte and rows held); `Err` says why there is none.
     fn target(
         &self,
         codec: TargetCodec,
         shape: TargetShape,
         cache: &MemoryIdentity,
-        buffer: &P::Buffer,
+        buffer: &CacheOf<P>,
         planes: [(Room, u64, u64); 2],
     ) -> Result<Target, String> {
         (self.checks.passed(codec, shape.format)).map_err(|why| {
@@ -870,30 +906,30 @@ impl<P: Platform> CacheTargets<P> {
             memory.size,
             shape,
             laid,
-            Box::new(memory.buffer.clone_ref()),
+            Box::new(memory.cache.clone_ref()),
         )
         .map_err(|e| format!("the import of the cache's memory: {e}"))?;
         *last = Some((target.clone(), laid));
         Ok(target)
     }
 
-    /// The memory of the cache `cache` (`buffer`), exported as a dma-buf once while the cache
-    /// lives; `Err` says why not.
+    /// The memory of the cache `cache` (`buffer`, the cache's buffer or its surface's), exported
+    /// as a dma-buf once while the cache lives; `Err` says why not.
     fn memory(
         &self,
         cache: &MemoryIdentity,
-        buffer: &P::Buffer,
+        buffer: &CacheOf<P>,
     ) -> Result<Arc<CacheMemory<P>>, String> {
         self.memories.get_or_make(
             cache,
             0,
             || {
-                let exported = buffer.export_dma_buf()?;
+                let exported = buffer.export()?;
                 Ok(CacheMemory {
                     dma_buf: exported.fd,
                     size: exported.allocation_size,
                     offset: exported.offset,
-                    buffer: buffer.clone_ref(),
+                    cache: buffer.clone_ref(),
                     last: Mutex::new(None),
                 })
             },
@@ -918,7 +954,7 @@ impl<P: Platform> CacheTargets<P> {
             return Err("an output whose planes lie in two device caches".to_owned());
         }
         let layout = in_place_layout(Place::of(luma), Place::of(chroma), bit_depth)?;
-        let memory = self.memory(cache, &luma.buffer)?;
+        let memory = self.memory(cache, &CacheOf::of(luma))?;
         Ok((
             layout,
             CacheBytes {
@@ -1382,7 +1418,7 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
         #[cfg(unix)]
         if self.frame.is_in_target() {
             self.frame.sync()?;
-            to.luma.buffer.external_write_done()?;
+            to.luma.external_write_done()?;
             to.decoded_there();
             return Ok(());
         }
@@ -1396,7 +1432,7 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
                 match targets.in_cache(to.luma, to.chroma, bit_depth) {
                     Ok((layout, bytes)) => match self.write_in_place(&layout, &bytes)? {
                         None => {
-                            to.luma.buffer.external_write_done()?;
+                            to.luma.external_write_done()?;
                             return Ok(());
                         }
                         Some(why) => format!("in its device cache: {why}"),
@@ -1413,6 +1449,11 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
             },
         };
         let declined = match &self.copier {
+            // The GPU's copy writes the planes' buffer, which a plane in its cache's surface does
+            // not lie in: the CPU's copy lands it there.
+            _ if to.luma.in_surface() || to.chroma.in_surface() => {
+                format!("{declined}; and no GPU copy into a cache's surface")
+            }
             Ok(copier) => match copier.lock().copy(&self.frame, to.luma, to.chroma)? {
                 DeviceWrite::Written => return Ok(()),
                 DeviceWrite::Declined(why) => format!("{declined}; and the GPU's copy: {why}"),

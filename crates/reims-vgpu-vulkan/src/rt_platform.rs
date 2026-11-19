@@ -53,6 +53,8 @@ pub mod queue;
 pub mod render;
 pub mod render_pipeline;
 pub mod state;
+#[cfg(unix)]
+pub mod surface;
 pub mod swapchain;
 pub mod texture;
 pub mod unbuilt;
