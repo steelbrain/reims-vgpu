@@ -28,11 +28,9 @@
 //!   size, rows, usage, storage mode, and where their block was imported (the selector, the
 //!   decoder's message the import was made under and the thread's name without its number,
 //!   [`imported`]). For each kind, the textures made, and their uses in submissions
-//!   ([`Uses::submitted`]): their bytes, how many found the bytes as the submission before that
-//!   used the texture left them (a hash of them at each commit, read while the guest may write
-//!   them; none where rt maps no host address for the buffer, as over a dma-buf import), how many
-//!   found them changed after a submission that rendered into the texture or blitted into it, and
-//!   how many sampled, rendered or blitted it.
+//!   ([`Uses::submitted`]): their bytes, and how many sampled, rendered or blitted it. Their bytes
+//!   are not read: the committing thread runs the guest's call, and a hash of them at each commit
+//!   held it in proportion to them.
 //! - **Imports by origin**, as the textures' kinds name it.
 //! - **Guest surface textures by declared usage.** Each texture the decoder made, or was refused,
 //!   over a surface's plane (`TEXTURE_FROM_IOSURFACE`), by the usage the guest declared, how it
@@ -592,16 +590,8 @@ fn context_now() -> Option<u32> {
 
 /// What rt copies of a texture over an imported block (the module's docs).
 struct Over {
-    /// The buffer, which holds its block, and so the bytes, mapped where rt maps them.
-    buffer: rt::Buffer,
-    /// The bytes it lies over, from their first's offset in the buffer.
-    offset: u64,
+    /// How many bytes it lies over.
     len: u64,
-    /// The hash of its bytes at the last submission that used it; 0 before any, and always where
-    /// rt maps no host address for the buffer (`rt::Buffer::contents`), whose bytes are not read.
-    last: AtomicU64,
-    /// The last submission that used it rendered or blitted into it.
-    written: AtomicBool,
     /// Its kind's totals.
     totals: Arc<OverTotals>,
 }
@@ -624,8 +614,6 @@ struct OverTotals {
     made: AtomicU64,
     submissions: AtomicU64,
     bytes: AtomicU64,
-    unchanged: AtomicU64,
-    changed_after_write: AtomicU64,
     sampled: AtomicU64,
     rendered: AtomicU64,
     blitted: AtomicU64,
@@ -653,35 +641,7 @@ impl Over {
         totals.made.fetch_add(1, Relaxed);
         let rows = bytes_per_row.saturating_mul(u64::from(shape.height));
         let len = rows.min(buffer.length().saturating_sub(offset));
-        Some(Over {
-            buffer: buffer.clone(),
-            offset,
-            len,
-            last: AtomicU64::new(0),
-            written: AtomicBool::new(false),
-            totals,
-        })
-    }
-
-    /// A hash of its bytes as they are now, never 0: FNV-1a of them, read one at a time through
-    /// volatile reads, as the guest may write them meanwhile; `None` where rt maps no host
-    /// address for the buffer.
-    fn hash(&self) -> Option<u64> {
-        let contents = self.buffer.contents()?;
-        let (Ok(offset), Ok(len)) = (usize::try_from(self.offset), usize::try_from(self.len))
-        else {
-            return Some(1);
-        };
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        // SAFETY: the bytes lie in the buffer (`len` is cut at its length), whose block the buffer
-        // holds mapped while it lives, and `self` holds it.
-        let first = unsafe { contents.as_ptr().add(offset) };
-        for i in 0..len {
-            // SAFETY: as above, `i` below `len`.
-            let byte = unsafe { first.add(i).read_volatile() };
-            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
-        }
-        Some(hash | 1)
+        Some(Over { len, totals })
     }
 
     /// A submission used it as `how` says: counts it under its kind.
@@ -689,15 +649,6 @@ impl Over {
         let t = &self.totals;
         t.submissions.fetch_add(1, Relaxed);
         t.bytes.fetch_add(self.len, Relaxed);
-        let wrote = self.written.swap(how.rendered || how.blitted_into, Relaxed);
-        if let Some(hash) = self.hash() {
-            let last = self.last.swap(hash, Relaxed);
-            if last == hash {
-                t.unchanged.fetch_add(1, Relaxed);
-            } else if last != 0 && wrote {
-                t.changed_after_write.fetch_add(1, Relaxed);
-            }
-        }
         for (used, count) in [
             (how.sampled, &t.sampled),
             (how.rendered, &t.rendered),
@@ -1158,8 +1109,7 @@ pub fn write() {
         let _ = writeln!(
             out,
             "reims-vgpu: rt-diag over-texture: format {} {}x{} rows {} usage {:#x} storage {} over \
-             {}: made {}, submissions {} ({} bytes), unchanged {}, changed after its GPU write {}, \
-             sampled {}, rendered {}, blitted {}",
+             {}: made {}, submissions {} ({} bytes), sampled {}, rendered {}, blitted {}",
             kind.format,
             kind.width,
             kind.height,
@@ -1170,8 +1120,6 @@ pub fn write() {
             n(&t.made),
             n(&t.submissions),
             n(&t.bytes),
-            n(&t.unchanged),
-            n(&t.changed_after_write),
             n(&t.sampled),
             n(&t.rendered),
             n(&t.blitted),
