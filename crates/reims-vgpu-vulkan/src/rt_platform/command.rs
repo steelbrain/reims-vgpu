@@ -227,11 +227,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     }
 
     /// Run first of the completed handlers, on rt's completion thread.
-    fn add_completion_seen_handler(
-        &self,
-        on: OnFault,
-        block: CompletedHandler,
-    ) -> RaiseResult<()> {
+    fn add_completion_seen_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
         let _ = on;
         let handler = completed(block);
         self.hold("addCompletionSeenHandler", |h| &mut h.seen, handler);
@@ -346,11 +342,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     }
 
     /// rt's wait; nothing, counted, for a nil event or one rt refuses.
-    fn encode_wait(
-        &self,
-        event: Option<EventRef<'_, RtPlatform>>,
-        value: u64,
-    ) -> RaiseResult<()> {
+    fn encode_wait(&self, event: Option<EventRef<'_, RtPlatform>>, value: u64) -> RaiseResult<()> {
         let sel = "encodeWaitForEvent:value:";
         if let Some(event) = rt_event(sel, event)
             && let Err(error) = self.rt.encode_wait_for_event(event, value)
@@ -420,10 +412,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     }
 
     /// Nil: each guest command buffer is one rt command buffer (the module's docs).
-    fn part(
-        &self,
-        on: OnFault,
-    ) -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
+    fn part(&self, on: OnFault) -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
         let _ = on;
         Ok(None)
     }
@@ -553,11 +542,20 @@ mod tests {
         let other = device.new_command_queue().expect("another command queue");
         let waits = made(&other);
         assert_eq!(waits.encode_wait(Some(EventRef::Event(&event)), 1), Ok(()));
-        assert_eq!(waits.encode_wait(Some(EventRef::Shared(&shared)), 7), Ok(()));
+        assert_eq!(
+            waits.encode_wait(Some(EventRef::Shared(&shared)), 7),
+            Ok(())
+        );
         assert_eq!(waits.commit(on), Ok(()));
         let signals = made(&queue);
-        assert_eq!(signals.encode_signal(Some(EventRef::Event(&event)), 1), Ok(()));
-        assert_eq!(signals.encode_signal(Some(EventRef::Shared(&shared)), 5), Ok(()));
+        assert_eq!(
+            signals.encode_signal(Some(EventRef::Event(&event)), 1),
+            Ok(())
+        );
+        assert_eq!(
+            signals.encode_signal(Some(EventRef::Shared(&shared)), 5),
+            Ok(())
+        );
         assert_eq!(signals.commit(on), Ok(()));
         assert_eq!(signals.wait_until_completed(on), Ok(()));
         assert_eq!(signals.status(), CommandBufferStatus::COMPLETED);
@@ -570,7 +568,10 @@ mod tests {
         // A signal as scheduled, before the scheduled handler added after it.
         let at_scheduled = device.new_shared_event().expect("a shared event");
         let scheduled = made(&queue);
-        assert_eq!(scheduled.encode_signal_when_scheduled(Some(&at_scheduled), 9), Ok(()));
+        assert_eq!(
+            scheduled.encode_signal_when_scheduled(Some(&at_scheduled), 9),
+            Ok(())
+        );
         let saw = Arc::new(AtomicU64::new(0));
         let (seen, read) = (Arc::clone(&saw), at_scheduled.clone_ref());
         let look = move || seen.store(read.signaled_value(), Ordering::Release);

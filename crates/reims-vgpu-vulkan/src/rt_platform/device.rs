@@ -23,7 +23,6 @@ use std::sync::Arc;
 use ash::vk;
 use metal2vulkan_rt as rt;
 
-use crate::core::platform::{Handle, Platform};
 use crate::core::platform::caps::{DeviceCaps, IdentityCaps, SAMPLE_COUNTS};
 use crate::core::platform::device::{GpuDevice, NoCopyDeallocator};
 use crate::core::platform::host_range::HostRange;
@@ -35,6 +34,7 @@ use crate::core::platform::values::{
     FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc,
     RenderPipelineDesc, SamplerDesc,
 };
+use crate::core::platform::{Handle, Platform};
 use crate::core::raise::{OnFault, Raise, RaiseResult};
 use crate::gpu::caps::METAL_LINEAR_ALIGNMENT;
 use crate::gpu::device::{HEAP_DESCRIPTOR_OPTIONS, descriptor_options};
@@ -774,7 +774,6 @@ fn identity_of(device: &RtObj<RtDevice>) -> IdentityCaps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::platform::Handle as _;
     use crate::core::platform::device::relaying_gaps;
     use crate::core::platform::values::{OptionSet, TextureDesc};
 

@@ -91,7 +91,11 @@ fn place(slice: u64, level: u64, origin: MtlOrigin) -> Result<rt::TexturePlace, 
 
 /// A region's size as rt's.
 fn size(size: MtlSize) -> Result<[u32; 3], Stop> {
-    Ok([narrow(size.width)?, narrow(size.height)?, narrow(size.depth)?])
+    Ok([
+        narrow(size.width)?,
+        narrow(size.height)?,
+        narrow(size.depth)?,
+    ])
 }
 
 /// A byte range as rt's; one past the end of 64 bits is Metal's refusal.
@@ -201,7 +205,10 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
             let (Some(source), Some(destination)) = (source_buffer, destination_buffer) else {
                 return Err(NIL);
             };
-            let (from, to) = ((source.rt(), source_offset), (destination.rt(), destination_offset));
+            let (from, to) = (
+                (source.rt(), source_offset),
+                (destination.rt(), destination_offset),
+            );
             e.copy_from_buffer_to_buffer(from.0, from.1, to.0, to.1, size)?;
         }
         BlitCmd::CopyTextureToBuffer {
@@ -780,8 +787,15 @@ mod tests {
             assert_eq!(encoder.encode(on, cmd), Ok(()));
             assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
             assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
-            assert_eq!(encoder.copy_from_guest_ram(on, &[0..64], &a, 0), Ok(false));
-            assert_eq!(encoder.copy_from_guest_ram_at(on, &[(0, 0..64)], &a), Ok(false));
+            let run = 0..64;
+            assert_eq!(
+                encoder.copy_from_guest_ram(on, std::slice::from_ref(&run), &a, 0),
+                Ok(false)
+            );
+            assert_eq!(
+                encoder.copy_from_guest_ram_at(on, &[(0, 0..64)], &a),
+                Ok(false)
+            );
             assert_eq!(encoder.copy_to_guest_ram(on, &a, &[(0, 0..64)]), Ok(false));
         }
         assert_eq!(counted(metal), before + 4);

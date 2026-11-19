@@ -110,7 +110,10 @@ mod tests {
                 let _ = tell.send(thread::current().id());
             })
         };
-        assert_eq!(event.notify_listener(&listener, 5, notify(tell.clone())), Ok(()));
+        assert_eq!(
+            event.notify_listener(&listener, 5, notify(tell.clone())),
+            Ok(())
+        );
         assert!(told.recv_timeout(Duration::from_millis(50)).is_err());
         assert_eq!(event.set_signaled_value(5), Ok(()));
         let ran = told.recv_timeout(Duration::from_secs(10));
