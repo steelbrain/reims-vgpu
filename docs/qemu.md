@@ -1191,6 +1191,70 @@ to itself, QMP screendumps every 15 s, then QEMU's CPU time and memory read
   the guest's RAM, and 5.03 GB without.
 - QEMU quit over QMP and exited 0 both ways.
 
+### Windows hosts: first touch and the working set
+
+What a guest page costs the host under WHPX the first time the guest touches
+it, and whether Windows keeps it. **Measured** on the mini (2026-11-18,
+development f55cab82f, a macOS 26.7.2 guest with 8 vCPUs and 16 GiB, on the
+reims-graphics device). A probe in the guest touched one byte in each 4 KiB
+page of the memory it took. A tool on the host counted QEMU's page faults
+and working set, and read with `QueryWorkingSetEx` which pages of QEMU's RAM
+view and of the device's 1 GiB region (`RegionMemory`, a section view of
+the library's own) were in the working set. QEMU ran at memory priority 5,
+as a user's shell starts it, except where this section says otherwise
+(Memory priority, below).
+
+The table gives what a touch cost the vCPU that made it, a page being
+4 KiB and a MiB 256 pages. The idle column is boots A and B (`m3-max-49843`,
+`m3-max-49859`), the only ones with the mini to themselves. QEMU ran at
+priority 4 in them, and their host faults per page show that no page they
+timed was one Windows had taken out. The loaded column is boot H
+(`m3-max-50047`), at priority 5 beside another job's build, which made
+each touch about 1.5 to 1.8 times as slow with the same fault counts, the
+guest-side work of a host-backed page included.
+
+| what the guest touched | idle | priority 5, loaded | host faults per page |
+|---|---|---|---|
+| fresh guest RAM | 21.4 us, 5.47 ms a MiB | 32.3 us, 8.26 ms a MiB | 1.0 to 1.3 |
+| guest RAM the host has backed (freed in the guest and taken again) | 1.48 us, 0.38 ms a MiB | 2.60 us, 0.67 ms a MiB | 0.00 to 0.01 |
+| the region, first touch | 20.1 us, 5.14 ms a MiB | 33.9 us, 8.67 ms a MiB | 1.0 to 1.2 |
+| the region, a freed block taken again at its offset | | 0.44 us, 0.11 ms a MiB | 0.01 |
+| a page in the working set | | region 0.01 us, RAM 0.02 to 0.15 us | 0 |
+| a page taken out of the working set (`EmptyWorkingSet` on QEMU), touched again | | 19 to 32 us, 5.0 to 8.1 ms a MiB | 1.0 to 1.7 |
+
+The last row comes from boots C, D, E and G2 (`m3-max-49913`, `49942`,
+`49964`, `50023`), touched at once or 15 s after the trim, while the
+guest's other vCPUs faulted the rest of the process back too.
+
+- **The region in use.** At the desktop the region held 10,414 (E,
+  `m3-max-49964`) and 9,212 (H) of its 262,144 pages: 41 and 36 MiB, 4.0
+  and 3.5%. The guest touched them all between QEMU's start and the
+  desktop, up to 1,878 pages (7.3 MiB) in one 332 ms window with no present
+  in it. A walk of app launches, and in H a 3D page drawing at 32.2 fps for
+  15 s, touched no further region page.
+- **The largest first-touch burst between two presents.** In E's walk,
+  51,103 page faults in one present interval of 1,636 ms, which grew the
+  working set by 50,695 pages (198 MiB) of guest RAM: about 1.1 s of fault
+  time at the idle rate, spread over the vCPUs that touched it. In H's
+  walk, 45,333 faults in 247 ms; in its 3D phase, 69,971 faults in a
+  9,411 ms interval, where the present interval was 38 ms at p50 and 4.97 s
+  at p99. Before the desktop, up to 232,921 faults in 3.1 s. At priority 5
+  each of these bursts was first touches, with no page re-faulted.
+- **Memory priority.** A process starts at its creator's memory priority,
+  and potluck's Windows jobs run at 4 where a user's shell runs at 5. At 4,
+  Windows took pages of QEMU's RAM and region out of its working set with
+  36 to 47 GB available: 703,604 RAM and 9,637 region pages in a 300 s walk
+  (`m3-max-49913`). A soft working-set minimum of 18 GiB, above the whole
+  working set, did not stop it (`m3-max-50023`: 971,197 and 8,515). At 5
+  from its start QEMU lost no page in 361 s of the same walk
+  (`m3-max-49964`), nor in H's 211 s (`m3-max-50047`). At 4 the guest
+  faulted the pages back in bursts: 14,234 RAM pages (56 MiB) in the worst
+  5 s window of `m3-max-50023`, about 0.3 to 0.45 s of fault time at the
+  last row's cost. QEMU's quota was Windows' default soft pair throughout
+  (200 KiB and 1.38 MiB), and potluck's job object sets no working-set
+  limit. A Windows job that boots a guest or times anything sets its shell
+  to memory priority 5 first ([lessons.md](lessons.md)).
+
 ### Windows hosts: sound
 
 Of the Windows build's audio backends (none, dbus, dsound, wav, as
