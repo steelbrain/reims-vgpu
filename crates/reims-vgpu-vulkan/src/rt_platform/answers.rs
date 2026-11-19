@@ -494,7 +494,10 @@ pub(crate) mod tests {
         assert_eq!(all, [256; 4]);
         assert_eq!(answered.min_linear_alignment_bgra8, Ok(128));
         facts.linear_alignment_bgra8 = None;
-        assert_eq!(caps(&facts).min_linear_alignment_bgra8, Err(bgra8_refused()));
+        assert_eq!(
+            caps(&facts).min_linear_alignment_bgra8,
+            Err(bgra8_refused())
+        );
     }
 
     /// The identity claims the families caps claims and those they contain, their feature sets,

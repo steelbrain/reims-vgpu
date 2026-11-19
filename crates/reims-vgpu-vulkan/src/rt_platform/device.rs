@@ -734,7 +734,9 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
 /// The identity of `device` ([`answers::identity`]): rt's linear alignment of each SDK format rt
 /// has a format of, none where it refuses one.
 fn identity_of(device: &RtObj<RtDevice>) -> IdentityCaps {
-    answers::identity(&device.facts, &device.caps, |format| linear_alignment(&device.rt, format))
+    answers::identity(&device.facts, &device.caps, |format| {
+        linear_alignment(&device.rt, format)
+    })
 }
 
 #[cfg(test)]
@@ -860,7 +862,10 @@ mod tests {
         assert_eq!(caps.limits.linear_texture_alignment_bytes, largest);
         assert_eq!(caps.limits.device_linear_texture_alignment_bytes, largest);
         assert_eq!(caps.limits.iosurface_texture_alignment_bytes, largest);
-        assert_eq!(caps.min_linear_alignment_bgra8(), Ok(device.linear_row_alignment()));
+        assert_eq!(
+            caps.min_linear_alignment_bgra8(),
+            Ok(device.linear_row_alignment())
+        );
         assert!(device.own_memory_budget() > 0);
         assert!(device.memory_heaps_total() >= device.own_memory_budget());
         assert!(device.linear_row_alignment() > 0);
