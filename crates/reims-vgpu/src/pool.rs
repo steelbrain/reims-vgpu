@@ -116,6 +116,10 @@ pub const TAKE_ZERO_PREZEROED_BYTES_CODE: &str = "pool-take-zero-skipped-prezero
 /// after a free"), counted by the byte.
 pub const ZEROED_AFTER_FREE_BYTES_CODE: &str = "pool-zeroed-after-free-bytes";
 
+/// The code of the longest the pool's zeroer held the pool's lock for one chunk (`takes`, "Zeros
+/// after a free"), in nanoseconds: its count rises to it.
+pub const ZERO_HOLD_MAX_NS_CODE: &str = "pool-zero-hold-max-ns";
+
 /// The code of the takes answered, whose waits [`TAKE_WAIT_CODES`] count (`takes`).
 pub const TAKE_WAITS_CODE: &str = "pool-take-waits";
 

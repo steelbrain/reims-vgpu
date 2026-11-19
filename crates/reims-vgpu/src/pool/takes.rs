@@ -38,7 +38,8 @@
 //! made at a free that finds none and gone after [`WORKER_IDLE`] with nothing to zero), which
 //! zeroes them through the piece's mapping off every take's path, [`ZERO_CHUNK`] at a time, each
 //! chunk with the pool's lock held, and records them in the piece as reading zero ([`Ranges`]),
-//! counted ([`super::ZEROED_AFTER_FREE_BYTES_CODE`]); it lets the lock go between chunks. A carve
+//! counted ([`super::ZEROED_AFTER_FREE_BYTES_CODE`]), the longest it held the lock for a chunk
+//! counted too ([`super::ZERO_HOLD_MAX_NS_CODE`]); it lets the lock go between chunks. A carve
 //! is made with the same lock held, so it never meets a chunk half zeroed: it takes its bytes out
 //! of the record, and its worker zeroes only those below the mark the record lacks; the rest it
 //! leaves, counted ([`super::TAKE_ZERO_PREZEROED_BYTES_CODE`]). A carve's bytes still waiting for
@@ -92,7 +93,7 @@ use reims_vgpu_vulkan::answer::count_kind_by;
 use super::{
     Ask, Error, Live, Mapped, MonoTime, Shared, State, TAKE_WAIT_CODES, TAKE_WAITS_CODE,
     TAKE_ZERO_PREZEROED_BYTES_CODE, TAKE_ZERO_SKIPPED_BYTES_CODE, TAKE_ZEROED_BYTES_CODE,
-    ZEROED_AFTER_FREE_BYTES_CODE,
+    ZERO_HOLD_MAX_NS_CODE, ZEROED_AFTER_FREE_BYTES_CODE,
 };
 
 /// A block's alignment and its length's granule: 64 KiB, the wire's `RGFX_POOL_BLOCK_ALIGN`.
@@ -205,6 +206,10 @@ struct Job {
     /// When it was carried out, before the pool's lock: its wait's start.
     asked: MonoTime,
 }
+
+/// The longest the zeroer held the pool's lock for a chunk so far, in nanoseconds, which
+/// [`ZERO_HOLD_MAX_NS_CODE`]'s count rises to.
+static ZERO_HOLD_MAX_NS: AtomicU64 = AtomicU64::new(0);
 
 /// The longest of each of [`TAKE_WAIT_CODES`]' waits so far, in nanoseconds, which their
 /// `-max-ns` codes' counts rise to.
@@ -977,6 +982,7 @@ impl Shared {
             if st.closed {
                 break;
             }
+            let held = (self.now)();
             let Some((piece, range, host)) = st.next_zero() else {
                 let idle = (self.now)().saturating_duration_since(idle_since);
                 match WORKER_IDLE.checked_sub(idle).filter(|left| !left.is_zero()) {
@@ -996,7 +1002,15 @@ impl Shared {
             // neither the guest nor the device reaches them meanwhile.
             unsafe { std::ptr::write_bytes(host.as_ptr(), 0, bytes) };
             st.zeroed(piece, range);
-            MutexGuard::unlocked(&mut st, || count_kind_by(ZEROED_AFTER_FREE_BYTES_CODE, len));
+            let held = (self.now)().saturating_duration_since(held);
+            MutexGuard::unlocked(&mut st, || {
+                count_kind_by(ZEROED_AFTER_FREE_BYTES_CODE, len);
+                let ns = u64::try_from(held.as_nanos()).unwrap_or(u64::MAX).max(1);
+                let was = ZERO_HOLD_MAX_NS.fetch_max(ns, Ordering::Relaxed);
+                if ns > was {
+                    count_kind_by(ZERO_HOLD_MAX_NS_CODE, ns.saturating_sub(was));
+                }
+            });
             idle_since = (self.now)();
         }
         st.zeroer = false;

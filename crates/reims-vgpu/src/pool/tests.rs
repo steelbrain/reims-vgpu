@@ -696,6 +696,7 @@ fn a_freed_blocks_bytes_are_zeroed_after_its_free_and_a_take_over_them_leaves_th
         assert!(start.elapsed() < Duration::from_secs(10), "counted");
         std::thread::sleep(Duration::from_millis(1));
     }
+    assert!(counted(ZERO_HOLD_MAX_NS_CODE) > 0, "the zeroer's hold counted");
     assert!(all(&pool, TAKE_ALIGN, TAKE_ALIGN, 0x5a));
     // A byte the pool's record says reads zero, made 0x77 here: the take leaves it.
     fill(&pool, 0, 1, 0x77);
