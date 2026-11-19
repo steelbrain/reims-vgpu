@@ -393,9 +393,10 @@ is its transport:
   the first piece's address space 0 once): too few to tell from chance. The
   boot, the desktop, a window's drag and a GPU benchmark took the same time
   with and without the populate, within the walks' spread, and KVM's master
-  clock stayed on across a guest reboot. Under WHPX on the mini's UHD 630
-  (m3-max-50016), 256, 548 and 1024 MiB populated in 37, 86 and 151 ms, and
-  an add or a removal held the BQL 131-169 us.
+  clock stayed on across a guest reboot. Under WHPX on the mini's UHD 630,
+  with QEMU at memory priority 5 (m3-max-50095), 256, 548 and 1024 MiB
+  populated in 40, 71 and 119 ms, and an add or a removal held the BQL
+  88-236 us.
 - **The guest's RAM**: on Linux the device gives the library the map of the
   RAM ranges that are a shared file in pages of the host's size (the memfd of
   `reims-ctl`'s VMs), with the files behind them, and the GPU uses an
