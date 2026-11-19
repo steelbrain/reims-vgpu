@@ -157,6 +157,16 @@ struct RgfxRenderPipelineParams {
 	/// The descriptor's private state, sent after the head with RGFX_RENDER_PIPELINE_PRIVATE_STATE;
 	/// null for none.
 	const RgfxRenderPipelinePrivateState *private_state;
+	/// The tessellation state, each Metal's raw value (tessellationFactorScaleEnabled is
+	/// RGFX_RENDER_PIPELINE_TESSELLATION_FACTOR_SCALE in `flags`).
+	uint32_t tessellation_partition_mode;
+	uint32_t max_tessellation_factor;
+	uint32_t tessellation_factor_format;
+	uint32_t tessellation_control_point_index_type;
+	uint32_t tessellation_factor_step_function;
+	uint32_t tessellation_output_winding_order;
+	uint32_t max_vertex_call_stack_depth;
+	uint32_t max_fragment_call_stack_depth;
 };
 
 /// A mesh render pipeline's descriptor, as MTLMeshRenderPipelineDescriptor gives it, in plain

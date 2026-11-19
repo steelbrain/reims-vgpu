@@ -112,27 +112,28 @@ use reims_vgpu_graphics::wire::{
     RGFX_PRIVATE_RENDER_OPENGL_MODE, RGFX_PRIVATE_RENDER_SAMPLE_COVERAGE_INVERT,
     RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE, RGFX_RENDER_PIPELINE_ALPHA_TO_ONE,
     RGFX_RENDER_PIPELINE_PRIVATE_STATE, RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
-    RGFX_RENDER_PIPELINE_SUPPORT_ICB, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_LIMIT,
-    RGFX_RESOURCE_ID_SMALL_CHUNK, RGFX_RESOURCE_ID_SMALL_CHUNKS, RGFX_SAMPLER_CREATE_EXT_OFFSET,
-    RGFX_STATUS_CACHE, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-    RGFX_SURFACE_FACTS_OFFSET, RGFX_SURFACE_NO_WRITERS, RGFX_SURFACE_PAGES_ASK_CACHE,
-    RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED,
-    RGFX_SURFACE_PAGES_PRIVATE, RGFX_SURFACE_PAGES_READ_ONLY, RGFX_YCBCR_MATRIX_DCI_P3,
-    RGFX_YCBCR_MATRIX_ITU_R_601_4, RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020,
-    RGFX_YCBCR_MATRIX_NONE, RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65,
-    RGFX_YCBCR_MATRIX_SMPTE_240M_1995, RgfxBufferAtOffset, RgfxBufferCreate,
-    RgfxBufferOverHostMemory, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled,
-    RgfxCbSubmitted, RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate,
-    RgfxEventSignalled, RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory,
-    RgfxHeapOverPages, RgfxHeapTextureSizeAndAlign, RgfxLinearTextureFromBuffer,
-    RgfxLinkedFunction, RgfxMeshPipelineReflection, RgfxMeshRenderPipelineCreate, RgfxMsgHeader,
-    RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun, RgfxPipelineReflection, RgfxQueueCreate,
-    RgfxRenderPipelineCreate, RgfxRenderPipelinePrivateState, RgfxResourceIdChunk,
-    RgfxSamplerCreate, RgfxSamplerCreateExt, RgfxSamplerState, RgfxSharedEventCreate,
-    RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxSurfaceFacts,
-    RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxSurfaceWriter, RgfxSurfaceWriters,
-    RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureDidModifyData, RgfxTextureFromBuffer,
-    RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout, RgfxVideoSessionCreate,
+    RGFX_RENDER_PIPELINE_SUPPORT_ICB, RGFX_RENDER_PIPELINE_TESSELLATION_FACTOR_SCALE,
+    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_LIMIT, RGFX_RESOURCE_ID_SMALL_CHUNK,
+    RGFX_RESOURCE_ID_SMALL_CHUNKS, RGFX_SAMPLER_CREATE_EXT_OFFSET, RGFX_STATUS_CACHE,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_FACTS_OFFSET,
+    RGFX_SURFACE_NO_WRITERS, RGFX_SURFACE_PAGES_ASK_CACHE, RGFX_SURFACE_PAGES_ATTACH,
+    RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED, RGFX_SURFACE_PAGES_PRIVATE,
+    RGFX_SURFACE_PAGES_READ_ONLY, RGFX_YCBCR_MATRIX_DCI_P3, RGFX_YCBCR_MATRIX_ITU_R_601_4,
+    RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020, RGFX_YCBCR_MATRIX_NONE,
+    RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65, RGFX_YCBCR_MATRIX_SMPTE_240M_1995,
+    RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxBufferOverPages,
+    RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorAttachmentDesc,
+    RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant,
+    RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapOverPages, RgfxHeapTextureSizeAndAlign,
+    RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMeshPipelineReflection,
+    RgfxMeshRenderPipelineCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun,
+    RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
+    RgfxRenderPipelinePrivateState, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerCreateExt,
+    RgfxSamplerState, RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign,
+    RgfxStencilDescriptor, RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfacePagesLayout,
+    RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor,
+    RgfxTextureDidModifyData, RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute,
+    RgfxVertexBufferLayout, RgfxVideoSessionCreate,
 };
 use reims_vgpu_video::core::device_memory::{DeviceMemory, MemoryLife};
 use reims_vgpu_vulkan::core::host::HostPtr;
@@ -151,7 +152,7 @@ use reims_vgpu_vulkan::core::platform::values::{
     DynamicLibrariesDesc, FullComputePipelineDesc, FullMeshRenderPipelineDesc,
     FullRenderPipelineDesc, HeapDesc, LinkedFunctionsDesc, OptionSet, PagesInPlace, PagesPlane,
     PrivateRenderDesc, SamplerDesc, StageInputDesc, StencilDesc, SurfaceFacts, SurfaceMatrix,
-    SurfacePlane, TextureDesc, VertexDesc,
+    SurfacePlane, TessellationDesc, TextureDesc, VertexDesc,
 };
 use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult, refusals};
@@ -4931,6 +4932,9 @@ struct RenderFields {
     max_vertex_amplification_count: u64,
     support_indirect_command_buffers: bool,
     private_state: Option<PrivateRenderDesc>,
+    tessellation: TessellationDesc,
+    max_vertex_call_stack_depth: u64,
+    max_fragment_call_stack_depth: u64,
 }
 
 /// A compute pipeline create's descriptor past its function and linked functions: the fields of
@@ -4974,7 +4978,8 @@ const LAST_VERTEX_INDEX: u32 = 30;
 /// A render create's descriptor fields ([`RenderFields`]): the colour attachments in use, the
 /// vertex descriptor's runs from the tail (none where it carries neither layouts nor
 /// attributes), the private state after the head where its flags carry
-/// [`RGFX_RENDER_PIPELINE_PRIVATE_STATE`], and the rest from the head.
+/// [`RGFX_RENDER_PIPELINE_PRIVATE_STATE`], and the rest from the head: the tessellation state
+/// and the vertex and fragment call stack depths each the guest's raw value.
 fn render_fields(
     message: &[u8],
     m: &RgfxRenderPipelineCreate,
@@ -5014,6 +5019,17 @@ fn render_fields(
         } else {
             None
         },
+        tessellation: TessellationDesc {
+            partition_mode: m.tessellation_partition_mode.into(),
+            max_factor: m.max_tessellation_factor.into(),
+            factor_scale_enabled: m.flags & RGFX_RENDER_PIPELINE_TESSELLATION_FACTOR_SCALE != 0,
+            factor_format: m.tessellation_factor_format.into(),
+            control_point_index_type: m.tessellation_control_point_index_type.into(),
+            factor_step_function: m.tessellation_factor_step_function.into(),
+            output_winding: m.tessellation_output_winding_order.into(),
+        },
+        max_vertex_call_stack_depth: m.max_vertex_call_stack_depth.into(),
+        max_fragment_call_stack_depth: m.max_fragment_call_stack_depth.into(),
     })
 }
 
@@ -5482,6 +5498,9 @@ pub(crate) fn compile_pipeline<P: Platform>(
                 vertex_linked,
                 fragment_linked,
                 private_state: fields.private_state,
+                tessellation: fields.tessellation,
+                max_vertex_call_stack_depth: fields.max_vertex_call_stack_depth,
+                max_fragment_call_stack_depth: fields.max_fragment_call_stack_depth,
             };
             // A nil state or an `NSError` refuses; a refusal Metal answers with none dies at the
             // send, inside the caller's refusal scope.
@@ -8968,7 +8987,8 @@ mod tests {
     /// A `RENDER_PIPELINE_CREATE` of pipeline `obj_id` from library 1's `vmain` and, with
     /// `fragment`, its `fmain`, carrying a descriptor that sets every field to a value of its own:
     /// three colour attachments, a vertex descriptor of two layouts and three attributes, depth
-    /// Depth32Float, stencil Stencil8, 4 samples, every flag, topology triangle, amplification 2.
+    /// Depth32Float, stencil Stencil8, 4 samples, every flag, topology triangle, amplification 2,
+    /// the tessellation state of [`whole_tessellation`] and call stack depths 3 and 5.
     pub(super) fn whole_render_create(obj_id: u64, fragment: bool) -> Vec<u8> {
         let head = size_of::<RgfxRenderPipelineCreate>();
         let layouts = [
@@ -9037,10 +9057,19 @@ mod tests {
             flags: RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE
                 | RGFX_RENDER_PIPELINE_ALPHA_TO_ONE
                 | RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED
-                | RGFX_RENDER_PIPELINE_SUPPORT_ICB,
+                | RGFX_RENDER_PIPELINE_SUPPORT_ICB
+                | RGFX_RENDER_PIPELINE_TESSELLATION_FACTOR_SCALE,
             input_primitive_topology: 3,
             max_vertex_amplification_count: 2,
             colors,
+            tessellation_partition_mode: 2,
+            max_tessellation_factor: 32,
+            tessellation_factor_format: 0,
+            tessellation_control_point_index_type: 2,
+            tessellation_factor_step_function: 3,
+            tessellation_output_winding_order: 1,
+            max_vertex_call_stack_depth: 3,
+            max_fragment_call_stack_depth: 5,
             ..RgfxRenderPipelineCreate::default()
         };
         let mut bytes = m.as_bytes().to_vec();
@@ -9050,6 +9079,22 @@ mod tests {
         bytes.extend_from_slice(fnm);
         bytes.resize(total, 0);
         bytes
+    }
+
+    /// The tessellation state [`whole_render_create`] carries, as the platform's value takes it:
+    /// each field but the factor format, whose one value is Metal's `Half`, other than Metal's
+    /// default: fractional-odd partitions of a maximum factor of 32, scaled, 32-bit control
+    /// point indices, factors stepped per patch and per instance, counter-clockwise.
+    fn whole_tessellation() -> TessellationDesc {
+        TessellationDesc {
+            partition_mode: 2,
+            max_factor: 32,
+            factor_scale_enabled: true,
+            factor_format: 0,
+            control_point_index_type: 2,
+            factor_step_function: 3,
+            output_winding: 1,
+        }
     }
 
     /// What [`whole_render_create`] carries, as the platform's value takes it.
@@ -9129,6 +9174,9 @@ mod tests {
             max_vertex_amplification_count: 2,
             support_indirect_command_buffers: true,
             private_state: None,
+            tessellation: whole_tessellation(),
+            max_vertex_call_stack_depth: 3,
+            max_fragment_call_stack_depth: 5,
         }
     }
 
@@ -9204,8 +9252,9 @@ mod tests {
     /// Every field of a render create reaches the platform's creator, read from the wire as the
     /// value holds it: the colour attachments in use with their blend state and write masks, the
     /// vertex descriptor's layouts and attributes, the depth and stencil formats, the sample
-    /// count, the four flags, the topology and the amplification count; a create naming library
-    /// 0 and no name for its fragment function has none
+    /// count, the five flags, the topology, the amplification count, the tessellation state and
+    /// the vertex and fragment call stack depths; a create naming library 0 and no name for its
+    /// fragment function has none
     #[test]
     fn a_render_create_carries_its_whole_descriptor() {
         let message = whole_render_create(100, true);
@@ -9230,6 +9279,11 @@ mod tests {
              input_primitive_topology: 3, max_vertex_amplification_count: 2, \
              support_indirect_command_buffers: true"
                 .to_owned(),
+            "private_state: None, tessellation: TessellationDesc { partition_mode: 2, \
+             max_factor: 32, factor_scale_enabled: true, factor_format: 0, \
+             control_point_index_type: 2, factor_step_function: 3, output_winding: 1 }, \
+             max_vertex_call_stack_depth: 3, max_fragment_call_stack_depth: 5 }"
+                .to_owned(),
         ] {
             assert!(logged.contains(&part), "{logged}\nlacks {part}");
         }
@@ -9248,6 +9302,78 @@ mod tests {
             panic!("{:?}", calls[1].args);
         };
         assert!(logged.contains("fragment: None"), "{logged}");
+    }
+
+    /// Each tessellation field and each call stack depth of a render create reaches the
+    /// platform's value from its own place on the wire: a create of Metal's defaults reads as
+    /// Metal's defaults, and one that differs from them in one of the nine, each in turn, reads
+    /// as they but that one, the guest's raw value
+    #[test]
+    fn a_render_create_carries_each_tessellation_field_and_call_stack_depth() {
+        type Set = fn(&mut RgfxRenderPipelineCreate);
+        type Want = fn(&mut RenderFields);
+        let base = RgfxRenderPipelineCreate {
+            raster_sample_count: 1,
+            flags: RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
+            max_tessellation_factor: 16,
+            max_vertex_call_stack_depth: 1,
+            max_fragment_call_stack_depth: 1,
+            ..RgfxRenderPipelineCreate::default()
+        };
+        let defaults = render_fields(base.as_bytes(), &base).unwrap();
+        assert_eq!(defaults.tessellation, TessellationDesc::default());
+        assert_eq!(
+            (
+                defaults.max_vertex_call_stack_depth,
+                defaults.max_fragment_call_stack_depth
+            ),
+            (1, 1)
+        );
+        let cases: [(Set, Want); 9] = [
+            (
+                |m| m.tessellation_partition_mode = 3,
+                |f| f.tessellation.partition_mode = 3,
+            ),
+            (
+                |m| m.max_tessellation_factor = 64,
+                |f| f.tessellation.max_factor = 64,
+            ),
+            (
+                |m| m.flags |= RGFX_RENDER_PIPELINE_TESSELLATION_FACTOR_SCALE,
+                |f| f.tessellation.factor_scale_enabled = true,
+            ),
+            (
+                |m| m.tessellation_factor_format = 1,
+                |f| f.tessellation.factor_format = 1,
+            ),
+            (
+                |m| m.tessellation_control_point_index_type = 1,
+                |f| f.tessellation.control_point_index_type = 1,
+            ),
+            (
+                |m| m.tessellation_factor_step_function = 2,
+                |f| f.tessellation.factor_step_function = 2,
+            ),
+            (
+                |m| m.tessellation_output_winding_order = 1,
+                |f| f.tessellation.output_winding = 1,
+            ),
+            (
+                |m| m.max_vertex_call_stack_depth = 4,
+                |f| f.max_vertex_call_stack_depth = 4,
+            ),
+            (
+                |m| m.max_fragment_call_stack_depth = 6,
+                |f| f.max_fragment_call_stack_depth = 6,
+            ),
+        ];
+        for (n, (set, want)) in cases.into_iter().enumerate() {
+            let mut m = base;
+            set(&mut m);
+            let mut expected = defaults.clone();
+            want(&mut expected);
+            assert_eq!(render_fields(m.as_bytes(), &m), Ok(expected), "case {n}");
+        }
     }
 
     /// A `MESH_RENDER_PIPELINE_CREATE` of pipeline `obj_id` from library 1's `mmain` and, with

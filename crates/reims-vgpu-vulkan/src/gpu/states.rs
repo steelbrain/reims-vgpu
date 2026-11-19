@@ -155,7 +155,7 @@ use crate::core::platform::types::{MtlSize, NsErrorText};
 use crate::core::platform::values::{
     ColorAttachmentDesc, DepthStencilDesc, FullComputePipelineDesc, FullMeshRenderPipelineDesc,
     FullRenderPipelineDesc, LinkedFunctionsDesc, PrivateRenderDesc, RenderPipelineDesc,
-    SamplerDesc, StageInputDesc, StencilDesc, VertexDesc,
+    SamplerDesc, StageInputDesc, StencilDesc, TessellationDesc, VertexDesc,
 };
 use crate::core::raise::RaiseResult;
 use crate::core::sync::Mutex;
@@ -165,7 +165,7 @@ use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::pipeline::{
     ColorAttachmentDescriptor, ComputePipelineDescriptor, LinkedFunctions, MeshPipelineDescriptor,
     RenderPipelineDescriptor, StageInputAttributeDescriptor, StageInputDescriptor,
-    StageInputLayoutDescriptor, StageSource, VertexAttributeDescriptor,
+    StageInputLayoutDescriptor, StageSource, TessellationDescriptor, VertexAttributeDescriptor,
     VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 use metal2vulkan_runtime as rt;
@@ -595,6 +595,17 @@ pub(crate) fn new_render_pipeline_state_full(
     if let Some(p) = &desc.private_state {
         private_state(&mut d.private, p);
     }
+    d.tessellation = tessellation(sel, &desc.tessellation);
+    d.max_vertex_call_stack_depth = count(
+        sel,
+        "maximum vertex call stack depth",
+        desc.max_vertex_call_stack_depth,
+    );
+    d.max_fragment_call_stack_depth = count(
+        sel,
+        "maximum fragment call stack depth",
+        desc.max_fragment_call_stack_depth,
+    );
     let mut options = rt::PipelineOptions::default();
     options.label = desc.label.map(str::to_owned);
     timing::creation(
@@ -898,6 +909,33 @@ fn private_state(private: &mut metal2vulkan::pipeline::PrivateRenderState, p: &P
     private.logic_operation_enabled = p.logic_operation_enabled;
     private.logic_operation = p.logic_operation;
     private.depth_stencil_write_disabled = p.depth_stencil_write_disabled;
+}
+
+/// The runtime's tessellation state of a whole value's: none for Metal's defaults, the runtime's
+/// `None`, so a state of the defaults is made as it was before the guest sent them; otherwise each
+/// field the raw value's enumerator, and a raw value the runtime has no enumerator of dies at the
+/// send ([`metal_value`]).
+fn tessellation(sel: &'static str, t: &TessellationDesc) -> Option<TessellationDescriptor> {
+    if *t == TessellationDesc::default() {
+        return None;
+    }
+    let mut d = TessellationDescriptor::default();
+    d.partition_mode = metal_value(sel, "tessellation partition mode", t.partition_mode);
+    d.max_tessellation_factor = count(sel, "maximum tessellation factor", t.max_factor);
+    d.factor_scale_enabled = t.factor_scale_enabled;
+    d.factor_format = metal_value(sel, "tessellation factor format", t.factor_format);
+    d.control_point_index_type = metal_value(
+        sel,
+        "tessellation control point index type",
+        t.control_point_index_type,
+    );
+    d.factor_step_function = metal_value(
+        sel,
+        "tessellation factor step function",
+        t.factor_step_function,
+    );
+    d.output_winding_order = metal_value(sel, "output winding order", t.output_winding);
+    Some(d)
 }
 
 /// The runtime's colour attachment of a whole value's: none for `MTLPixelFormatInvalid`.
@@ -1356,6 +1394,9 @@ mod tests {
             vertex_linked: LinkedFunctionsDesc::default(),
             fragment_linked: LinkedFunctionsDesc::default(),
             private_state: None,
+            tessellation: Default::default(),
+            max_vertex_call_stack_depth: 1,
+            max_fragment_call_stack_depth: 1,
         }
     }
 
@@ -1760,6 +1801,9 @@ mod tests {
                     ..LinkedFunctionsDesc::default()
                 },
                 private_state: None,
+                tessellation: Default::default(),
+                max_vertex_call_stack_depth: 1,
+                max_fragment_call_stack_depth: 1,
             })
             .ok()??;
         let out = d
@@ -2342,6 +2386,9 @@ mod tests {
                 vertex_linked: LinkedFunctionsDesc::default(),
                 fragment_linked: LinkedFunctionsDesc::default(),
                 private_state: private,
+                tessellation: Default::default(),
+                max_vertex_call_stack_depth: 1,
+                max_fragment_call_stack_depth: 1,
             })
             .map(|state| state.is_some())
             .map_err(|e| e.code)

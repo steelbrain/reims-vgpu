@@ -398,10 +398,30 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 		flags |= RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED;
 	if (descriptor.supportIndirectCommandBuffers)
 		flags |= RGFX_RENDER_PIPELINE_SUPPORT_ICB;
+	if (descriptor.isTessellationFactorScaleEnabled)
+		flags |= RGFX_RENDER_PIPELINE_TESSELLATION_FACTOR_SCALE;
 	p.flags = flags;
 	p.input_primitive_topology = static_cast<uint32_t>(descriptor.inputPrimitiveTopology);
 	p.max_vertex_amplification_count =
 	    static_cast<uint32_t>(descriptor.maxVertexAmplificationCount);
+	// The tessellation state a post-tessellation vertex function draws its patches with.
+	p.tessellation_partition_mode = static_cast<uint32_t>(descriptor.tessellationPartitionMode);
+	p.max_tessellation_factor = wire32(descriptor.maxTessellationFactor);
+	p.tessellation_factor_format = static_cast<uint32_t>(descriptor.tessellationFactorFormat);
+	p.tessellation_control_point_index_type =
+	    static_cast<uint32_t>(descriptor.tessellationControlPointIndexType);
+	p.tessellation_factor_step_function =
+	    static_cast<uint32_t>(descriptor.tessellationFactorStepFunction);
+	p.tessellation_output_winding_order =
+	    static_cast<uint32_t>(descriptor.tessellationOutputWindingOrder);
+	// The call stack depths reached MTLRenderPipelineDescriptor in macOS 12, asked by selector as
+	// compressionType is (RgfxTexture.mm); a descriptor without them has Metal's depth of 1.
+	p.max_vertex_call_stack_depth = 1;
+	p.max_fragment_call_stack_depth = 1;
+	if ([descriptor respondsToSelector:@selector(maxVertexCallStackDepth)])
+		p.max_vertex_call_stack_depth = wire32(descriptor.maxVertexCallStackDepth);
+	if ([descriptor respondsToSelector:@selector(maxFragmentCallStackDepth)])
+		p.max_fragment_call_stack_depth = wire32(descriptor.maxFragmentCallStackDepth);
 	RgfxRenderPipelinePrivateState privateState = {};
 	if (serializer->carriesPrivateRenderState()) {
 		privateState = privateStateOf(descriptor);

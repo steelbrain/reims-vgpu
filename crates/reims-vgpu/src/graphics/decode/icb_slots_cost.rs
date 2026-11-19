@@ -206,6 +206,9 @@ impl<P: ApiPlatform> Bench<P> {
                 vertex_linked: LinkedFunctionsDesc::default(),
                 fragment_linked: LinkedFunctionsDesc::default(),
                 private_state: None,
+                tessellation: Default::default(),
+                max_vertex_call_stack_depth: 1,
+                max_fragment_call_stack_depth: 1,
             })
             .unwrap()
             .unwrap();

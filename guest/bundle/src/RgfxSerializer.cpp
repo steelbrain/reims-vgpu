@@ -1269,6 +1269,14 @@ RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams 
 	            (m_sharesPipelines ? RGFX_RENDER_PIPELINE_ANSWER_KEY : 0);
 	msg.input_primitive_topology = p.input_primitive_topology;
 	msg.max_vertex_amplification_count = p.max_vertex_amplification_count;
+	msg.tessellation_partition_mode = p.tessellation_partition_mode;
+	msg.max_tessellation_factor = p.max_tessellation_factor;
+	msg.tessellation_factor_format = p.tessellation_factor_format;
+	msg.tessellation_control_point_index_type = p.tessellation_control_point_index_type;
+	msg.tessellation_factor_step_function = p.tessellation_factor_step_function;
+	msg.tessellation_output_winding_order = p.tessellation_output_winding_order;
+	msg.max_vertex_call_stack_depth = p.max_vertex_call_stack_depth;
+	msg.max_fragment_call_stack_depth = p.max_fragment_call_stack_depth;
 
 	uint64_t total = roundUp8(head + tail.size());
 	if (total > m_control.dataSize() || total > UINT32_MAX) {

@@ -3092,6 +3092,9 @@
 // ([`RGFX_PIPELINE_REFLECT_KEYED`]), where the guest took [`RGFX_FEATURE_PIPELINE_KEYS`].
 #define RGFX_RENDER_PIPELINE_ANSWER_KEY (1 << 7)
 
+// [`RgfxRenderPipelineCreate`] `flags`: `tessellationFactorScaleEnabled`.
+#define RGFX_RENDER_PIPELINE_TESSELLATION_FACTOR_SCALE (1 << 8)
+
 // [`RgfxRenderPipelinePrivateState`] `flags`: `openGLModeEnabled`.
 #define RGFX_PRIVATE_RENDER_OPENGL_MODE (1 << 0)
 
@@ -7248,6 +7251,22 @@ typedef struct {
   uint32_t fragment_linked_offset;
   // The number of [`RgfxLinkedFunction`] the fragment stage links.
   uint32_t fragment_linked_count;
+  // `tessellationPartitionMode` (`MTLTessellationPartitionMode`).
+  uint32_t tessellation_partition_mode;
+  // `maxTessellationFactor`.
+  uint32_t max_tessellation_factor;
+  // `tessellationFactorFormat` (`MTLTessellationFactorFormat`).
+  uint32_t tessellation_factor_format;
+  // `tessellationControlPointIndexType` (`MTLTessellationControlPointIndexType`).
+  uint32_t tessellation_control_point_index_type;
+  // `tessellationFactorStepFunction` (`MTLTessellationFactorStepFunction`).
+  uint32_t tessellation_factor_step_function;
+  // `tessellationOutputWindingOrder` (`MTLWinding`).
+  uint32_t tessellation_output_winding_order;
+  // `maxVertexCallStackDepth`.
+  uint32_t max_vertex_call_stack_depth;
+  // `maxFragmentCallStackDepth`.
+  uint32_t max_fragment_call_stack_depth;
 } RgfxRenderPipelineCreate;
 
 // A render pipeline descriptor's private state (Apple SPI), as Apple's OpenGL renderer sets it,

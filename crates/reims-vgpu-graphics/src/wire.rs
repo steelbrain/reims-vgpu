@@ -4704,6 +4704,8 @@ pub const RGFX_RENDER_PIPELINE_PRIVATE_STATE: u32 = 1 << 6;
 /// [`RgfxRenderPipelineCreate`] `flags`: answer the create with its pipeline key
 /// ([`RGFX_PIPELINE_REFLECT_KEYED`]), where the guest took [`RGFX_FEATURE_PIPELINE_KEYS`].
 pub const RGFX_RENDER_PIPELINE_ANSWER_KEY: u32 = 1 << 7;
+/// [`RgfxRenderPipelineCreate`] `flags`: `tessellationFactorScaleEnabled`.
+pub const RGFX_RENDER_PIPELINE_TESSELLATION_FACTOR_SCALE: u32 = 1 << 8;
 
 /// [`RgfxRenderPipelinePrivateState`] `flags`: `openGLModeEnabled`.
 pub const RGFX_PRIVATE_RENDER_OPENGL_MODE: u32 = 1 << 0;
@@ -4956,6 +4958,22 @@ pub struct RgfxRenderPipelineCreate {
     pub fragment_linked_offset: u32,
     /// The number of [`RgfxLinkedFunction`] the fragment stage links.
     pub fragment_linked_count: u32,
+    /// `tessellationPartitionMode` (`MTLTessellationPartitionMode`).
+    pub tessellation_partition_mode: u32,
+    /// `maxTessellationFactor`.
+    pub max_tessellation_factor: u32,
+    /// `tessellationFactorFormat` (`MTLTessellationFactorFormat`).
+    pub tessellation_factor_format: u32,
+    /// `tessellationControlPointIndexType` (`MTLTessellationControlPointIndexType`).
+    pub tessellation_control_point_index_type: u32,
+    /// `tessellationFactorStepFunction` (`MTLTessellationFactorStepFunction`).
+    pub tessellation_factor_step_function: u32,
+    /// `tessellationOutputWindingOrder` (`MTLWinding`).
+    pub tessellation_output_winding_order: u32,
+    /// `maxVertexCallStackDepth`.
+    pub max_vertex_call_stack_depth: u32,
+    /// `maxFragmentCallStackDepth`.
+    pub max_fragment_call_stack_depth: u32,
 }
 
 /// A render pipeline descriptor's private state (Apple SPI), as Apple's OpenGL renderer sets it,
@@ -5339,7 +5357,7 @@ const _: () = {
     assert!(size_of::<RgfxVertexBufferLayout>() == 16);
     assert!(size_of::<RgfxVertexAttribute>() == 16);
     assert!(size_of::<RgfxLinkedFunction>() == 48);
-    assert!(size_of::<RgfxRenderPipelineCreate>() == 464);
+    assert!(size_of::<RgfxRenderPipelineCreate>() == 496);
     assert!(core::mem::offset_of!(RgfxRenderPipelineCreate, colors) == 128);
     assert!(size_of::<RgfxComputePipelineCreate>() == 96);
     assert!(size_of::<RgfxPipelineLibrary>() == 16);

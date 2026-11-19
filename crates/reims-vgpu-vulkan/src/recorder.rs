@@ -5046,6 +5046,118 @@ mod tests {
         );
     }
 
+    /// A render pipeline's record carries its tessellation state and its call stack depths
+    /// through the stream and back, as its map's last three keys, after `privateState`:
+    /// `tessellation`, a map of `partitionMode`, `maxFactor`, `factorScaleEnabled`,
+    /// `factorFormat`, `controlPointIndexType`, `factorStepFunction` and `outputWinding`, then
+    /// `maxVertexCallStackDepth` and `maxFragmentCallStackDepth`, each Metal's raw value as given.
+    /// Every value but the factor format, whose one value is Metal's `Half`, is other than
+    /// Metal's default. The pipeline is of `render_tess`, a post-tessellation vertex function.
+    #[test]
+    fn on_vulkan_a_render_pipeline_record_carries_its_tessellation_state() {
+        in_recording_child(
+            "recorder::tests::on_vulkan_a_render_pipeline_record_carries_its_tessellation_state",
+            |streams| {
+                use crate::core::platform::device::GpuDevice as _;
+                use crate::core::platform::resource::Library as _;
+                use crate::core::platform::values::{
+                    ColorAttachmentDesc, FullRenderPipelineDesc, TessellationDesc,
+                };
+                use crate::core::raise::OnFault;
+                const MADE: &str = "newRenderPipelineStateWithDescriptor:error:";
+                const TESS: &[u8] = include_bytes!("../../../tests/shaders/render_tess.metallib");
+                const FRAG: &[u8] = include_bytes!("../../../tests/shaders/frag.metallib");
+                let (_platform, device) = recording_device();
+                let function = |bytes: &[u8], name: &str| {
+                    let library = (device.new_library(bytes)).unwrap().unwrap().unwrap();
+                    let function = (library.new_function(OnFault::Return, name))
+                        .unwrap()
+                        .unwrap();
+                    (library, function)
+                };
+                let (vertex_library, vertex) = function(TESS, "render_tess");
+                let (fragment_library, fragment) = function(FRAG, "tri_frag");
+                let color = ColorAttachmentDesc {
+                    pixel_format: 80,
+                    ..ColorAttachmentDesc::default()
+                };
+                let desc = FullRenderPipelineDesc {
+                    colors: vec![(0, color)],
+                    tessellation: TessellationDesc {
+                        partition_mode: 3,
+                        max_factor: 32,
+                        factor_scale_enabled: true,
+                        factor_format: 0,
+                        control_point_index_type: 2,
+                        factor_step_function: 1,
+                        output_winding: 1,
+                    },
+                    max_vertex_call_stack_depth: 2,
+                    max_fragment_call_stack_depth: 3,
+                    ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
+                };
+                let pipeline = (device.new_render_pipeline_state_full(&desc))
+                    .unwrap()
+                    .expect("a pipeline");
+                let (calls, _) =
+                    recorded(streams, |calls| calls.iter().any(|c| c.selector == MADE));
+                let made = (calls.iter())
+                    .find(|c| c.selector == MADE)
+                    .unwrap_or_else(|| panic!("no {MADE}: {calls:?}"));
+                let Some(Value::Map(fields)) = made.args.first() else {
+                    panic!("a descriptor's map: {made:?}");
+                };
+                let keys: Vec<&str> = (fields.iter()).map(|(k, _)| k.as_str()).collect();
+                let want = [
+                    "label",
+                    "vertex",
+                    "fragment",
+                    "vertexDescriptor",
+                    "colors",
+                    "depthPixelFormat",
+                    "stencilPixelFormat",
+                    "rasterSampleCount",
+                    "alphaToCoverage",
+                    "alphaToOne",
+                    "rasterizationEnabled",
+                    "inputPrimitiveTopology",
+                    "maxVertexAmplificationCount",
+                    "supportIndirectCommandBuffers",
+                    "vertexLinked",
+                    "fragmentLinked",
+                    "privateState",
+                    "tessellation",
+                    "maxVertexCallStackDepth",
+                    "maxFragmentCallStackDepth",
+                ];
+                assert_eq!(keys, want, "{made:?}");
+                let pairs = |pairs: &[(&str, Value)]| {
+                    let mut out = Vec::new();
+                    for (key, value) in pairs {
+                        out.push(((*key).to_owned(), value.clone()));
+                    }
+                    out
+                };
+                let tessellation = Value::Map(pairs(&[
+                    ("partitionMode", Value::Uint(3)),
+                    ("maxFactor", Value::Uint(32)),
+                    ("factorScaleEnabled", Value::Bool(true)),
+                    ("factorFormat", Value::Uint(0)),
+                    ("controlPointIndexType", Value::Uint(2)),
+                    ("factorStepFunction", Value::Uint(1)),
+                    ("outputWinding", Value::Uint(1)),
+                ]));
+                let expected = pairs(&[
+                    ("tessellation", tessellation),
+                    ("maxVertexCallStackDepth", Value::Uint(2)),
+                    ("maxFragmentCallStackDepth", Value::Uint(3)),
+                ]);
+                assert_eq!(fields[17..], expected, "{made:?}");
+                drop((pipeline, vertex, fragment, vertex_library, fragment_library));
+            },
+        );
+    }
+
     /// On a device that keeps two copies of a `Managed` buffer (the answer forced here), a
     /// no-copy `Managed` buffer's record carries the bytes its create copied into the device's
     /// copy, as a blob through the stream and back: a descriptor's `contents`, those before its

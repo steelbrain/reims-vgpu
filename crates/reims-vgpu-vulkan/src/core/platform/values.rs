@@ -436,7 +436,8 @@ impl<P: Platform> fmt::Debug for DynamicLibrariesDesc<P> {
 /// attachments at their indices, the depth and stencil formats, the raster sample count,
 /// alpha-to-coverage, alpha-to-one, rasterization, the input primitive topology, the maximum
 /// vertex amplification count, indirect command buffer support, the vertex and fragment stages'
-/// linked functions where they link any, then the private state where the guest gave it.
+/// linked functions where they link any, the private state where the guest gave it, then the
+/// tessellation state and the vertex and fragment call stack depths.
 pub struct FullRenderPipelineDesc<'a, P: Platform> {
     /// `setLabel:`, when set.
     pub label: Option<&'a str>,
@@ -475,6 +476,47 @@ pub struct FullRenderPipelineDesc<'a, P: Platform> {
     ///
     /// [`takes_private_render_state`]: super::device::GpuDevice::takes_private_render_state
     pub private_state: Option<PrivateRenderDesc>,
+    /// The tessellation state a post-tessellation vertex function draws its patches with.
+    pub tessellation: TessellationDesc,
+    /// `setMaxVertexCallStackDepth:`.
+    pub max_vertex_call_stack_depth: u64,
+    /// `setMaxFragmentCallStackDepth:`.
+    pub max_fragment_call_stack_depth: u64,
+}
+
+/// The tessellation state of an `MTLRenderPipelineDescriptor`, as a value: each field its
+/// setter's argument, Metal's raw value. Order: `setTessellationPartitionMode:`,
+/// `setMaxTessellationFactor:`, `setTessellationFactorScaleEnabled:`,
+/// `setTessellationFactorFormat:`, `setTessellationControlPointIndexType:`,
+/// `setTessellationFactorStepFunction:`, then `setTessellationOutputWindingOrder:`. [`Default`]
+/// gives Metal's defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // each field is its setter's argument, named after it
+pub struct TessellationDesc {
+    pub partition_mode: u64,
+    pub max_factor: u64,
+    pub factor_scale_enabled: bool,
+    pub factor_format: u64,
+    pub control_point_index_type: u64,
+    pub factor_step_function: u64,
+    pub output_winding: u64,
+}
+
+impl Default for TessellationDesc {
+    /// Metal's defaults: `MTLTessellationPartitionModePow2`, a maximum factor of 16, no factor
+    /// scale, `MTLTessellationFactorFormatHalf`, `MTLTessellationControlPointIndexTypeNone`,
+    /// `MTLTessellationFactorStepFunctionConstant` and `MTLWindingClockwise`.
+    fn default() -> Self {
+        TessellationDesc {
+            partition_mode: 0,
+            max_factor: 16,
+            factor_scale_enabled: false,
+            factor_format: 0,
+            control_point_index_type: 0,
+            factor_step_function: 0,
+            output_winding: 0,
+        }
+    }
 }
 
 /// The private state (Apple SPI) of an `MTLRenderPipelineDescriptor` that Apple's OpenGL renderer
@@ -512,7 +554,8 @@ impl<'a, P: Platform> FullRenderPipelineDesc<'a, P> {
     /// The value of `vertex` and `fragment` with Metal's defaults elsewhere: no label, no vertex
     /// descriptor, no colour attachment, no depth or stencil format, one sample, rasterization
     /// on, an unspecified topology class, an amplification count of one, no indirect command
-    /// buffer support, no linked functions and Metal's private state.
+    /// buffer support, no linked functions, Metal's private state, Metal's tessellation state and
+    /// call stack depths of one.
     pub fn new(vertex: &'a P::Function, fragment: Option<&'a P::Function>) -> Self {
         FullRenderPipelineDesc {
             label: None,
@@ -532,6 +575,9 @@ impl<'a, P: Platform> FullRenderPipelineDesc<'a, P> {
             vertex_linked: LinkedFunctionsDesc::default(),
             fragment_linked: LinkedFunctionsDesc::default(),
             private_state: None,
+            tessellation: TessellationDesc::default(),
+            max_vertex_call_stack_depth: 1,
+            max_fragment_call_stack_depth: 1,
         }
     }
 }
@@ -562,6 +608,15 @@ impl<P: Platform> fmt::Debug for FullRenderPipelineDesc<'_, P> {
             .field("vertex_linked", &self.vertex_linked)
             .field("fragment_linked", &self.fragment_linked)
             .field("private_state", &self.private_state)
+            .field("tessellation", &self.tessellation)
+            .field(
+                "max_vertex_call_stack_depth",
+                &self.max_vertex_call_stack_depth,
+            )
+            .field(
+                "max_fragment_call_stack_depth",
+                &self.max_fragment_call_stack_depth,
+            )
             .finish()
     }
 }

@@ -4798,6 +4798,14 @@ void test_render_pipeline_routing()
 	desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 	desc.alphaToCoverageEnabled = YES;
 	desc.supportIndirectCommandBuffers = YES;
+	desc.tessellationPartitionMode = MTLTessellationPartitionModeFractionalEven;
+	desc.maxTessellationFactor = 32;
+	desc.tessellationFactorScaleEnabled = YES;
+	desc.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeUInt32;
+	desc.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
+	desc.tessellationOutputWindingOrder = MTLWindingCounterClockwise;
+	desc.maxVertexCallStackDepth = 2;
+	desc.maxFragmentCallStackDepth = 3;
 	desc.vertexLinkedFunctions.functions = @[ [lib newFunctionWithName:@"vlink"] ];
 	desc.fragmentLinkedFunctions.privateFunctions = @[ [lib newFunctionWithName:@"flink"] ];
 
@@ -4839,6 +4847,19 @@ void test_render_pipeline_routing()
 	CHECK((head.flags & RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE) != 0);
 	CHECK((head.flags & RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED) != 0); // default on
 	CHECK((head.flags & RGFX_RENDER_PIPELINE_SUPPORT_ICB) != 0);
+	// The tessellation state and the call stack depths, each Metal's raw value.
+	CHECK((head.flags & RGFX_RENDER_PIPELINE_TESSELLATION_FACTOR_SCALE) != 0);
+	CHECK(head.tessellation_partition_mode ==
+	      static_cast<uint32_t>(MTLTessellationPartitionModeFractionalEven));
+	CHECK(head.max_tessellation_factor == 32);
+	CHECK(head.tessellation_factor_format == static_cast<uint32_t>(MTLTessellationFactorFormatHalf));
+	CHECK(head.tessellation_control_point_index_type ==
+	      static_cast<uint32_t>(MTLTessellationControlPointIndexTypeUInt32));
+	CHECK(head.tessellation_factor_step_function ==
+	      static_cast<uint32_t>(MTLTessellationFactorStepFunctionPerPatch));
+	CHECK(head.tessellation_output_winding_order ==
+	      static_cast<uint32_t>(MTLWindingCounterClockwise));
+	CHECK(head.max_vertex_call_stack_depth == 2 && head.max_fragment_call_stack_depth == 3);
 	// Each stage's linked functions, in their lists.
 	CHECK(head.vertex_linked_count == 1 && head.fragment_linked_count == 1);
 	RgfxLinkedFunction vlink, flink;
@@ -4927,6 +4948,15 @@ void test_render_pipeline_private_state()
 	std::memcpy(&head, bytes.data(), sizeof(head));
 	CHECK((head.flags & RGFX_RENDER_PIPELINE_PRIVATE_STATE) == 0);
 	CHECK(head.vertex_name_offset == sizeof(head));
+	// A new descriptor's tessellation state and call stack depths are Metal's defaults, and reach
+	// the device as they are: pow2 partitions of a maximum factor of 16, unscaled, half factors,
+	// no control-point indices, a constant step, clockwise, and depths of 1.
+	CHECK((head.flags & RGFX_RENDER_PIPELINE_TESSELLATION_FACTOR_SCALE) == 0);
+	CHECK(head.tessellation_partition_mode == 0 && head.max_tessellation_factor == 16);
+	CHECK(head.tessellation_factor_format == 0 && head.tessellation_control_point_index_type == 0);
+	CHECK(head.tessellation_factor_step_function == 0 &&
+	      head.tessellation_output_winding_order == 0);
+	CHECK(head.max_vertex_call_stack_depth == 1 && head.max_fragment_call_stack_depth == 1);
 
 	// Carried, at Metal's defaults.
 	fx.ser.setCarriesPrivateRenderState(true);

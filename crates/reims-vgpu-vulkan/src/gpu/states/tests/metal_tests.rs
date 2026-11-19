@@ -1450,6 +1450,9 @@ fn linked_answers<P: crate::core::platform::Platform>(
                 vertex_linked,
                 fragment_linked,
                 private_state: None,
+                tessellation: Default::default(),
+                max_vertex_call_stack_depth: 1,
+                max_fragment_call_stack_depth: 1,
             })
             .map(|state| state.map(drop))
         }))

@@ -1125,7 +1125,18 @@ void test_pipeline_messages()
 	attr.format = 29; // Float4
 	rp.vertex_attributes = &attr;
 	rp.vertex_attribute_count = 1;
-	rp.flags = RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED;
+	rp.flags = RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED |
+	           RGFX_RENDER_PIPELINE_TESSELLATION_FACTOR_SCALE;
+	// A tessellation state of no default but the factor format's (Half, Metal's only), and call
+	// stack depths of their own.
+	rp.tessellation_partition_mode = 3;           // FractionalEven
+	rp.max_tessellation_factor = 32;
+	rp.tessellation_factor_format = 0;            // Half
+	rp.tessellation_control_point_index_type = 2; // UInt32
+	rp.tessellation_factor_step_function = 1;     // PerPatch
+	rp.tessellation_output_winding_order = 1;     // CounterClockwise
+	rp.max_vertex_call_stack_depth = 2;
+	rp.max_fragment_call_stack_depth = 3;
 
 	RgfxCreated r = ser.createRenderPipeline(rp);
 	CHECK(r.posted);
@@ -1143,6 +1154,11 @@ void test_pipeline_messages()
 	CHECK(rc.color_attachment_count == 1 && rc.colors[0].pixel_format == 80);
 	CHECK(rc.colors[0].destination_rgb_blend_factor == 5);
 	CHECK(rc.depth_pixel_format == 252);
+	CHECK(rc.flags & RGFX_RENDER_PIPELINE_TESSELLATION_FACTOR_SCALE);
+	CHECK(rc.tessellation_partition_mode == 3 && rc.max_tessellation_factor == 32);
+	CHECK(rc.tessellation_factor_format == 0 && rc.tessellation_control_point_index_type == 2);
+	CHECK(rc.tessellation_factor_step_function == 1 && rc.tessellation_output_winding_order == 1);
+	CHECK(rc.max_vertex_call_stack_depth == 2 && rc.max_fragment_call_stack_depth == 3);
 	CHECK(rc.vertex_layout_count == 1 && rc.vertex_attribute_count == 1);
 	CHECK(rc.vertex_name_len == 5);
 	CHECK(std::memcmp(bytes.data() + rc.vertex_name_offset, "vmain", 5) == 0);
