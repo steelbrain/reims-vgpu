@@ -215,9 +215,12 @@ mod tests {
     use reims_vgpu_vulkan::core::platform::types::MtlSize;
 
     use super::super::surface_cache::tests::{
-        NO_REACH, blit_with, blits_with, cache_id, cached, copies, download, queues, reading,
-        release, surface_texture, surface_texture_as, surface_textures, use_surfaces,
+        NO_REACH, blit_with, blits_with, cache_id, cached, copies, download, encoder_with,
+        queues, reading, release, surface_texture, surface_texture_as, surface_textures,
+        use_surfaces,
     };
+    use reims_vgpu_vulkan::core::testkit::Step;
+    use reims_vgpu_vulkan::core::testkit::impls::resource::TEXTURE_SLOT_WRITES;
     use super::super::surface_pages::tests::{BLOCK, Rig, one_plane, rig};
     use super::*;
     use crate::platform::ApiPlatform as _;
@@ -854,6 +857,174 @@ mod tests {
         assert_eq!(back.len(), 2, "both written");
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(downloaded.load(Ordering::SeqCst));
+    }
+
+    /// Library 30 and compute pipeline `obj_id` of a function in it.
+    fn compute_pipeline(r: &mut Rig, obj_id: u64) {
+        use reims_vgpu_graphics::wire::{
+            RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_LIBRARY_CREATE, RGFX_LIBRARY_BYTES_OFFSET,
+            RgfxComputePipelineCreate, RgfxLibraryCreate, RgfxMsgHeader,
+        };
+        use zerocopy::IntoBytes as _;
+        let air = [1u8, 2, 3, 4];
+        let mut library = RgfxLibraryCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_LIBRARY_CREATE,
+                size: (RGFX_LIBRARY_BYTES_OFFSET as usize + air.len()).next_multiple_of(8) as u32,
+                seqno: 0,
+            },
+            obj_id: 30,
+            byte_length: air.len() as u64,
+            ..RgfxLibraryCreate::default()
+        }
+        .as_bytes()
+        .to_vec();
+        library.extend_from_slice(&air);
+        assert_eq!(r.dec.decode(&r.device, &library).unwrap(), Ok(()));
+        let head = size_of::<RgfxComputePipelineCreate>() as u32;
+        let name = b"cmain".as_slice();
+        let total = (head as usize + name.len()).next_multiple_of(8);
+        let mut pipeline = RgfxComputePipelineCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_COMPUTE_PIPELINE_CREATE,
+                size: total as u32,
+                seqno: 1,
+            },
+            obj_id,
+            function_library_obj_id: 30,
+            name_offset: head,
+            name_len: name.len() as u32,
+            ..RgfxComputePipelineCreate::default()
+        }
+        .as_bytes()
+        .to_vec();
+        pipeline.extend_from_slice(name);
+        pipeline.resize(total, 0);
+        assert_eq!(r.dec.decode(&r.device, &pipeline).unwrap(), Ok(()));
+    }
+
+    /// Texture `obj_id` over buffer 10, 32 by 8 BGRA8, whose usage lets a shader write it, and
+    /// the image of its shape.
+    fn writable_image(r: &mut Rig, obj_id: u64) -> u64 {
+        let mark = r.p.call_log().mark();
+        let message = surface_texture_as(obj_id, 10, 80, (32, 8), (0x2, 0));
+        assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+        views(&r.p.call_log().since(mark))[0].0
+    }
+
+    /// Command buffer `cb_obj_id` on queue 1, naming [`BLOCK`] written, of one compute encoder
+    /// of `ops`.
+    fn computes(r: &mut Rig, cb_obj_id: u64, ops: &[(u16, Vec<u8>)]) {
+        use reims_vgpu_graphics::ops::RGFX_OP_ENCODER_BEGIN_COMPUTE;
+        encoder_with(r, cb_obj_id, true, RGFX_OP_ENCODER_BEGIN_COMPUTE, ops);
+    }
+
+    /// A compute encoder's op that binds pipeline `obj_id`.
+    fn bind_pipeline(obj_id: u64) -> (u16, Vec<u8>) {
+        use reims_vgpu_graphics::ops::compute::{
+            RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
+        };
+        use zerocopy::IntoBytes as _;
+        let m = RgfxComputeOpSetComputePipelineState {
+            pipeline_obj_id: obj_id,
+        };
+        (RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, m.as_bytes().to_vec())
+    }
+
+    /// A compute encoder's op that binds texture `obj_id` (0 for nil) at slot `index`.
+    fn bind_texture(obj_id: u64, index: u64) -> (u16, Vec<u8>) {
+        use reims_vgpu_graphics::ops::compute::{
+            RGFX_OP_COMPUTE_SET_TEXTURE, RgfxComputeOpSetTexture,
+        };
+        use zerocopy::IntoBytes as _;
+        let m = RgfxComputeOpSetTexture {
+            texture_obj_id: obj_id,
+            index,
+        };
+        (RGFX_OP_COMPUTE_SET_TEXTURE, m.as_bytes().to_vec())
+    }
+
+    /// The slot each pipeline was asked whether its function may write in `calls`.
+    fn slots_asked(calls: &[Call]) -> Vec<u64> {
+        (calls.iter())
+            .filter(|c| c.sel == TEXTURE_SLOT_WRITES)
+            .map(|c| c.args[0].as_u64().unwrap_or(u64::MAX))
+            .collect()
+    }
+
+    /// Whether a download after `ops` in a compute encoder writes back texture 25, a shape's view
+    /// whose usage lets a shader write it, with the shapes' usage writes and slot reads counted;
+    /// and the slots pipeline 31 was asked of, its answer scripted as `answer` where given.
+    fn slot_run(
+        answer: Option<Option<bool>>,
+        ops: &[(u16, Vec<u8>)],
+    ) -> ((bool, u64, u64), Vec<u64>) {
+        let mut r = shaped();
+        let cache = cache_id(&r);
+        compute_pipeline(&mut r, 31);
+        if let Some(answer) = answer {
+            r.p.script().always(TEXTURE_SLOT_WRITES, Step::value(answer));
+        }
+        let image = writable_image(&mut r, 25);
+        let mark = r.p.call_log().mark();
+        computes(&mut r, 0x100, ops);
+        let asked = slots_asked(&r.p.call_log().since(mark));
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        let back = written_back(&r.p.call_log().since(mark));
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+        let written = match back.as_slice() {
+            [] => false,
+            [only] => {
+                assert_eq!(*only, (image, cache, 0));
+                true
+            }
+            _ => panic!("written back more than once: {back:?}"),
+        };
+        let counts = r.dec.caches().counts().shapes;
+        ((written, counts.usage_writes, counts.slot_reads), asked)
+    }
+
+    /// A texture whose usage lets a shader write it, bound at a slot that the encoder's pipeline
+    /// only reads, leaves its shape clean: a slot bound before the pipeline is asked of once it
+    /// is bound, one bound after as it is bound, and each is counted read as the encoder ends
+    #[test]
+    fn a_slot_its_pipeline_only_reads_leaves_its_shape_clean() {
+        let ops = [bind_texture(25, 0), bind_pipeline(31), bind_texture(25, 1)];
+        let (seen, asked) = slot_run(Some(Some(false)), &ops);
+        assert_eq!(seen, (false, 0, 2));
+        assert_eq!(asked, [0, 1]);
+    }
+
+    /// A slot that the encoder's pipeline may write writes its texture's shape, once the pipeline
+    /// is bound after it; a texture bound at a slot and replaced there before any pipeline is
+    /// counted read
+    #[test]
+    fn a_slot_its_pipeline_may_write_writes_its_shape() {
+        let ops = [
+            bind_texture(25, 1),
+            bind_texture(0, 1),
+            bind_texture(25, 0),
+            bind_pipeline(31),
+        ];
+        let (seen, asked) = slot_run(Some(Some(true)), &ops);
+        assert_eq!(seen, (true, 0, 1));
+        assert_eq!(asked, [0]);
+    }
+
+    /// A pipeline that knows no slot's access leaves the texture's usage to decide: one that lets
+    /// a shader write it writes its shape, counted; with no pipeline bound in the encoder, nothing
+    /// writes it
+    #[test]
+    fn a_pipeline_that_knows_no_slots_access_leaves_the_usage_to_decide() {
+        let (seen, asked) = slot_run(None, &[bind_pipeline(31), bind_texture(25, 0)]);
+        assert_eq!(seen, (true, 1, 0));
+        assert_eq!(asked, [0]);
+        let (seen, asked) = slot_run(None, &[bind_texture(25, 0)]);
+        assert_eq!(seen, (false, 0, 1));
+        assert!(asked.is_empty());
     }
 
     /// In the per-shape form every surface takes a device cache: a block that asks whether it

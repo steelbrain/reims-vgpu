@@ -11250,7 +11250,20 @@ pub(super) mod tests {
 
     /// [`blit_with`] of a blit encoder of the ops `ops`, in order.
     pub(crate) fn blits_with(r: &mut Rig, cb_obj_id: u64, writes: bool, ops: &[(u16, Vec<u8>)]) {
-        use reims_vgpu_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END};
+        use reims_vgpu_graphics::ops::RGFX_OP_ENCODER_BEGIN_BLIT;
+        encoder_with(r, cb_obj_id, writes, RGFX_OP_ENCODER_BEGIN_BLIT, ops);
+    }
+
+    /// [`blit_with`] of one encoder that the op `begin` opens, with no body, of the ops `ops`, in
+    /// order.
+    pub(crate) fn encoder_with(
+        r: &mut Rig,
+        cb_obj_id: u64,
+        writes: bool,
+        begin: u16,
+        ops: &[(u16, Vec<u8>)],
+    ) {
+        use reims_vgpu_graphics::ops::RGFX_OP_ENCODER_END;
         use zerocopy::FromBytes as _;
         let op_of = |tag: u16, body: &[u8]| {
             let mut v = RgfxOpHeader {
@@ -11264,7 +11277,7 @@ pub(super) mod tests {
             v
         };
         let mut message = surfaces_message(1, cb_obj_id, &[(BLOCK, 0, writes)], false);
-        let mut encoded = op_of(RGFX_OP_ENCODER_BEGIN_BLIT, &[]);
+        let mut encoded = op_of(begin, &[]);
         for (tag, body) in ops {
             encoded.extend(op_of(*tag, body.as_slice()));
         }
