@@ -221,7 +221,10 @@ pub(crate) fn adopted(raw: &rt::Device) -> bool {
 /// the GPUs the platform keeps a runtime device of ([`crate::let_go::gpus_kept`]).
 pub(crate) fn adopted_runtime_ids() -> Vec<u64> {
     let devices = DEVICES.lock();
-    devices.iter().map(|(_, device)| device.raw.registry_id()).collect()
+    devices
+        .iter()
+        .map(|(_, device)| device.raw.registry_id())
+        .collect()
 }
 
 /// The runtime device of the first device the process adopted, if it adopted one.
