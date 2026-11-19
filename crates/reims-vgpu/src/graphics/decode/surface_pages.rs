@@ -1839,7 +1839,13 @@ impl<P: Platform> SurfaceViews<P> {
                     return Ok(None);
                 }
             }
-            (mapped, runs, length, v.over_copies(read_only), v.known_imports.clone())
+            (
+                mapped,
+                runs,
+                length,
+                v.over_copies(read_only),
+                v.known_imports.clone(),
+            )
         };
         let clock = platform.clock();
         let (view, start) = match mapped {
@@ -2897,7 +2903,8 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         if !(self.shared.pins_in_blocks).load(Ordering::Relaxed) {
             return;
         }
-        let over = (self.entry(obj_id).and_then(|e| e.escape.as_ref())).map(|e| e.over());
+        let entry = self.entry(obj_id);
+        let over = entry.and_then(|e| e.escape.as_ref()).map(|e| e.over());
         if over != Some(super::escape::NoCopy::ReadOnlyPages) {
             return;
         }
@@ -4759,7 +4766,11 @@ pub(super) mod tests {
             "the same at each ask"
         );
         let read_only_at = r.dec.pages_address(&r.device, read_only);
-        assert_eq!(read_only_at, IMPORTS + 0x100_0000, "its own import's address");
+        assert_eq!(
+            read_only_at,
+            IMPORTS + 0x100_0000,
+            "its own import's address"
+        );
         assert!(r.has_private_view(read_only), "made at the answer");
         assert_eq!(
             r.dec.views_of_surfaces().view_addresses_held(),
@@ -5164,7 +5175,11 @@ pub(super) mod tests {
         assert_eq!(counted(), before + 2, "a fill of it and a copy into it");
         copy(10, 11);
         fill(11);
-        assert_eq!(counted(), before + 2, "a copy out of it, a writable block's buffer");
+        assert_eq!(
+            counted(),
+            before + 2,
+            "a copy out of it, a writable block's buffer"
+        );
     }
 
     /// A read-only pages block's view is mapped with no import: its buffers, of bit 24, lie over
