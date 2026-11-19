@@ -416,7 +416,8 @@ public:
 	// --- heaps ----------------------------------------------------------------
 
 	/// A device heap of `size_bytes`. `options` is MTLResourceOptions, `heap_type`
-	/// MTLHeapType. A GPU address of `size_bytes` aligned to `align` is picked. This and the
+	/// MTLHeapType. A GPU address of `size_bytes` aligned to `align` is picked, in a Private
+	/// block where the process takes them (RgfxIdSpace::allocPrivateAddress). This and the
 	/// three creates after it post nothing, and answer an obj_id and a gpu_address of 0, where
 	/// the context's range has no room left for the address.
 	RgfxCreated createHeap(uint64_t size_bytes, uint32_t options, int32_t heap_type,
@@ -447,7 +448,8 @@ public:
 
 	// --- buffers --------------------------------------------------------------
 
-	/// A device buffer of `length` bytes at a picked GPU address.
+	/// A device buffer of `length` bytes at a picked GPU address, in a Private block where the
+	/// process takes them (RgfxIdSpace::allocPrivateAddress).
 	RgfxCreated createBuffer(uint64_t length, uint32_t options,
 	                         uint64_t align = kDefaultAddressAlign);
 
@@ -477,15 +479,15 @@ public:
 	RgfxCreated createBufferAtOffset(RgfxObjId heap, uint64_t offset, uint64_t length,
 	                                 uint32_t options);
 
-	/// A Managed buffer of `length` bytes at a picked GPU address, its CPU copy the bytes at
-	/// `offset` in the heap over host memory `heap` (`BUFFER_MANAGED_AT_OFFSET`, where the
+	/// A Managed buffer of `length` bytes at a GPU address picked as createBuffer's, its CPU
+	/// copy the bytes at `offset` in the heap over host memory `heap` (`BUFFER_MANAGED_AT_OFFSET`, where the
 	/// device took RGFX_FEATURE_MANAGED_AT_OFFSET).
 	RgfxCreated createBufferManagedAtOffset(RgfxObjId heap, uint64_t offset, uint64_t length,
 	                                        uint32_t options,
 	                                        uint64_t align = kDefaultAddressAlign);
 
-	/// A Managed buffer of `length` bytes at a picked GPU address, its CPU copy the first `length`
-	/// bytes of the Shared buffer `cpu_buffer` over the process's memory (`MANAGED_BUFFER_CREATE`,
+	/// A Managed buffer of `length` bytes at a GPU address picked as createBuffer's, its CPU copy
+	/// the first `length` bytes of the Shared buffer `cpu_buffer` over the process's memory (`MANAGED_BUFFER_CREATE`,
 	/// where the device took RGFX_FEATURE_MANAGED_BUFFER_SLABS), whose bytes from `zeroFrom` to
 	/// the length read zero as it is posted (RgfxManagedBufferZero): the host's GPU copy, where
 	/// it keeps one, starts with zeros there rather than the CPU copy's bytes. A `zeroFrom` of

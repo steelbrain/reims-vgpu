@@ -373,6 +373,33 @@ bool rgfxKextResourceIds(void *context, uint64_t *first_id, uint64_t *ids)
 	return true;
 }
 
+// The kext's Private blocks, as RgfxIdSpace's Private block source
+// (RGFX_FEATURE_PRIVATE_BLOCKS); `context` is the kext link (rgfxKextConn). The take answers a
+// block of at least `size` bytes, its GPU address and length; false where the host refused it.
+static bool rgfxKextPrivateTake(void *context, uint64_t size, uint64_t *gpu_address,
+                                uint64_t *length)
+{
+	io_connect_t conn = rgfxKextConn(context);
+	uint64_t out[2] = {};
+	uint32_t outCount = 2;
+	if (IOConnectCallScalarMethod(conn, kRgfxAccelMethodPrivateTake, &size, 1, out, &outCount) !=
+	        KERN_SUCCESS ||
+	    outCount != 2 || out[0] == 0 || out[1] < size)
+		return false;
+	*gpu_address = out[0];
+	*length = out[1];
+	return true;
+}
+
+// The give of a Private block no object of the process's lies in any more; its held destroys
+// go first (rgfxKextConn), so the host sees the block empty.
+static void rgfxKextPrivateGive(void *context, uint64_t gpu_address, uint64_t length)
+{
+	io_connect_t conn = rgfxKextConn(context);
+	const uint64_t in[2] = {gpu_address, length};
+	IOConnectCallScalarMethod(conn, kRgfxAccelMethodPrivateGive, in, 2, nullptr, nullptr);
+}
+
 // The completion thread's wait: the kext returns once a completion ring of the process's holds
 // records its last pass did not see (the wake count differs from `last`), or at once where it
 // already does. `context` is the kext link (rgfxKextConn).
@@ -1086,6 +1113,11 @@ RGFX_LOG_UNRECOGNIZED
 	                         (_caps.features() & RGFX_FEATURE_SMALL_ID_CHUNKS) != 0
 	                             ? RGFX_RESOURCE_ID_SMALL_CHUNK
 	                             : RGFX_RESOURCE_ID_CHUNK);
+	// Private objects' addresses lie in blocks the host gives where the kext and the device both
+	// took them (RgfxObjectModel.hpp).
+	if ((_caps.kextFeatures() & kRgfxKextFeaturePrivateBlocks) != 0 &&
+	    (_caps.features() & RGFX_FEATURE_PRIVATE_BLOCKS) != 0)
+		_ids.setPrivateBlockSource(&rgfxKextPrivateTake, &rgfxKextPrivateGive, connContext);
 	_region = new RgfxRegion(base, mapSize);
 	_region->setBlockSource(&rgfxKextAlloc, &rgfxKextRelease, connContext);
 	// The bytes the process only writes in write-combined parts of their blocks, where the kext

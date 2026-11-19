@@ -17,7 +17,10 @@
  * a range comes back once its object's destroy has gone to the host, and is
  * picked again only once the picks have gone round the whole range (next fit),
  * so the host has long let the old pin go. Both start at the context's bases,
- * which the accelerator kext hands out. Texture resource ids are shared
+ * which the accelerator kext hands out. Where the device and the kext took
+ * RGFX_FEATURE_PRIVATE_BLOCKS, a Private object's address lies instead in a
+ * block of addresses the host gives the context (allocPrivateAddress): the
+ * same rules hold inside the blocks. Texture resource ids are shared
  * by every process on the host's one device, whose ids end below
  * RGFX_RESOURCE_ID_LIMIT, so they come in chunks the kext hands out on demand
  * from one pool for the guest (of RGFX_RESOURCE_ID_SMALL_CHUNK ids where it
@@ -100,10 +103,48 @@ public:
 	/// them. 0 where no free range is left.
 	uint64_t allocAddress(uint64_t size, uint64_t align);
 
-	/// Gives the range allocAddress picked at `address` back, once its object's
-	/// destroy has gone to the host. An address no live pick starts at, 0 included,
-	/// is ignored.
+	/// Gives the range allocAddress or allocPrivateAddress picked at `address` back,
+	/// once its object's destroy has gone to the host (posted, or held to go before
+	/// anything the process posts after it). An address no live pick starts at, 0
+	/// included, is ignored. A Private block left with no pick is given back to the
+	/// source, past the one empty block the space keeps for its next picks.
 	void freeAddress(uint64_t address);
+
+	/// A source of Private blocks (the accelerator kext's PrivateTake and
+	/// PrivateGive, RGFX_FEATURE_PRIVATE_BLOCKS): `take` hands a block of at least
+	/// `size` bytes, its GPU address and its length, or answers false where the
+	/// host has none; `give` hands one back, once no object lies in it. Called with
+	/// `context`, and never with the space's lock held.
+	typedef bool (*PrivateTakeFn)(void *context, uint64_t size, uint64_t *gpu_address,
+	                              uint64_t *length);
+	typedef void (*PrivateGiveFn)(void *context, uint64_t gpu_address, uint64_t length);
+
+	/// Where Private blocks come from from now on. Called once, before any
+	/// Private address is picked.
+	void setPrivateBlockSource(PrivateTakeFn take, PrivateGiveFn give, void *context);
+
+	/// Whether a Private block source is set.
+	bool privateBlocks() const { return m_privateTake != nullptr; }
+
+	/// The GPU address of a Private object of `size` bytes (a Private buffer, a heap
+	/// that is not Shared, a Managed buffer's GPU copy), as allocAddress picks one,
+	/// but in a Private block the context holds where a block source is set: next
+	/// fit through the blocks held, in address order, then round from the first;
+	/// where none has room, a new block of kPrivateBlockBytes, or of the pick's span
+	/// and alignment where that is more. Where no source is set, or the source has
+	/// no block, allocAddress's pick in the context's range (the refusal logged
+	/// once). 0 where no address is left.
+	uint64_t allocPrivateAddress(uint64_t size, uint64_t align);
+
+	/// The bytes of addresses the space asks a Private block for at least: 256 MiB,
+	/// metal2vulkan-rt's pooled block, so a pick wraps round its blocks only after
+	/// that many bytes of spans (the host lets an object's pin go only once the
+	/// command buffers that use it have finished).
+	static constexpr uint64_t kPrivateBlockBytes = uint64_t{256} << 20;
+
+	/// The Private blocks held, and the picks in them (for the tests).
+	size_t privateBlocksHeld() const;
+	size_t privatePicksLive() const;
 
 	/// The bytes a pick of `size` bytes holds from its first byte, a granule's start:
 	/// the pages it touches and one guard page, rounded up to a granule (1 page and
@@ -135,12 +176,31 @@ private:
 
 	// The GPU addresses, under m_addressLock: the free ranges by start (coalesced), the live
 	// picks' spans by start, and where the next pick looks first.
-	std::mutex m_addressLock;
+	mutable std::mutex m_addressLock;
 	std::map<uint64_t, uint64_t> m_freeRanges;
 	std::map<uint64_t, uint64_t> m_livePicks;
 	uint64_t m_addressCursor = 0;
 	// Whether a pick found no room, which is logged once.
 	bool m_addressesFull = false;
+
+	// The Private blocks, under m_addressLock: each held block by address, its length and its
+	// live picks; their free ranges by start, never joined across two blocks; the live picks'
+	// spans by start; and where the next pick looks first.
+	struct PrivateBlock {
+		uint64_t length = 0;
+		uint64_t picks = 0;
+	};
+	// The block `address` lies in, or end. Caller holds m_addressLock.
+	std::map<uint64_t, PrivateBlock>::iterator privateBlockOf(uint64_t address);
+	std::map<uint64_t, PrivateBlock> m_privateBlocks;
+	std::map<uint64_t, uint64_t> m_privateFree;
+	std::map<uint64_t, uint64_t> m_privatePicks;
+	uint64_t m_privateCursor = 0;
+	PrivateTakeFn m_privateTake = nullptr;
+	PrivateGiveFn m_privateGive = nullptr;
+	void *m_privateContext = nullptr;
+	// Whether a take found no block, which is logged once.
+	std::atomic<bool> m_privateRefused{false};
 
 	// The texture resource ids, under m_idsLock, by small chunk (small chunk k
 	// holds ids 1 + k * 16 to 16 + k * 16; a chunk of 64 is four): those the

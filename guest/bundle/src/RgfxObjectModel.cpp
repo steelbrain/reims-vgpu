@@ -15,6 +15,66 @@ uint64_t alignUp(uint64_t value, uint64_t align)
 {
 	return (value + (align - 1)) & ~(align - 1);
 }
+
+// A pick of `span` bytes at a multiple of `align` from the free ranges `free` (by start), next
+// fit: the range the cursor lies in, from the cursor, and those after it; then round from the
+// first. Its start, its span taken out of `free` and the cursor moved past it; 0 where none fits.
+uint64_t pickFrom(std::map<uint64_t, uint64_t> &free, uint64_t &cursor, uint64_t span,
+                  uint64_t align)
+{
+	// Where `span` bytes from `from` on fit the free range at `at` of `length` bytes.
+	auto fit = [&](uint64_t at, uint64_t length, uint64_t from, uint64_t *start) {
+		const uint64_t s = alignUp(std::max(at, from), align);
+		if (s < at || s - at >= length || length - (s - at) < span)
+			return false;
+		*start = s;
+		return true;
+	};
+	auto it = free.upper_bound(cursor);
+	if (it != free.begin()) {
+		auto before = std::prev(it);
+		if (before->first + before->second > cursor)
+			it = before;
+	}
+	for (int pass = 0; pass < 2; pass++) {
+		for (; it != free.end(); ++it) {
+			uint64_t start = 0;
+			if (!fit(it->first, it->second, pass == 0 ? cursor : 0, &start))
+				continue;
+			const uint64_t at = it->first, end = it->first + it->second;
+			free.erase(it);
+			if (start > at)
+				free[at] = start - at;
+			if (start + span < end)
+				free[start + span] = end - (start + span);
+			cursor = start + span;
+			return start;
+		}
+		it = free.begin();
+	}
+	return 0;
+}
+
+// Gives the `length` bytes at `start` back to the free ranges `free`, joined with those either
+// side of it that lie in [lo, hi).
+void giveTo(std::map<uint64_t, uint64_t> &free, uint64_t start, uint64_t length, uint64_t lo,
+            uint64_t hi)
+{
+	auto after = free.lower_bound(start);
+	if (after != free.begin()) {
+		auto before = std::prev(after);
+		if (before->first >= lo && before->first + before->second == start) {
+			start = before->first;
+			length += before->second;
+			free.erase(before);
+		}
+	}
+	if (after != free.end() && after->first == start + length && after->first < hi) {
+		length += after->second;
+		free.erase(after);
+	}
+	free[start] = length;
+}
 } // namespace
 
 RgfxIdSpace::RgfxIdSpace(uint64_t address_base, uint64_t address_span) : m_nextObjId(1)
@@ -135,38 +195,9 @@ uint64_t RgfxIdSpace::allocAddress(uint64_t size, uint64_t align)
 	align = std::max(align, kAddressGranule);
 	const uint64_t span = addressSpan(size);
 	std::lock_guard<std::mutex> hold(m_addressLock);
-	// Where `span` bytes from `from` on fit the free range at `at` of `length` bytes.
-	auto fit = [&](uint64_t at, uint64_t length, uint64_t from, uint64_t *start) {
-		const uint64_t s = alignUp(std::max(at, from), align);
-		if (s < at || s - at >= length || length - (s - at) < span)
-			return false;
-		*start = s;
-		return true;
-	};
-	// Next fit: the free range the cursor lies in, from the cursor, and those after it; then
-	// round from the range's first.
-	auto it = m_freeRanges.upper_bound(m_addressCursor);
-	if (it != m_freeRanges.begin()) {
-		auto before = std::prev(it);
-		if (before->first + before->second > m_addressCursor)
-			it = before;
-	}
-	for (int pass = 0; pass < 2; pass++) {
-		for (; it != m_freeRanges.end(); ++it) {
-			uint64_t start = 0;
-			if (!fit(it->first, it->second, pass == 0 ? m_addressCursor : 0, &start))
-				continue;
-			const uint64_t at = it->first, end = it->first + it->second;
-			m_freeRanges.erase(it);
-			if (start > at)
-				m_freeRanges[at] = start - at;
-			if (start + span < end)
-				m_freeRanges[start + span] = end - (start + span);
-			m_livePicks[start] = span;
-			m_addressCursor = start + span;
-			return start;
-		}
-		it = m_freeRanges.begin();
+	if (const uint64_t start = pickFrom(m_freeRanges, m_addressCursor, span, align)) {
+		m_livePicks[start] = span;
+		return start;
 	}
 	if (!m_addressesFull) {
 		m_addressesFull = true;
@@ -184,27 +215,120 @@ uint64_t RgfxIdSpace::allocAddress(uint64_t size, uint64_t align)
 
 void RgfxIdSpace::freeAddress(uint64_t address)
 {
-	std::lock_guard<std::mutex> hold(m_addressLock);
-	auto live = m_livePicks.find(address);
-	if (live == m_livePicks.end())
-		return;
-	uint64_t start = live->first, length = live->second;
-	m_livePicks.erase(live);
-	// Joined with the free ranges either side of it.
-	auto after = m_freeRanges.lower_bound(start);
-	if (after != m_freeRanges.begin()) {
-		auto before = std::prev(after);
-		if (before->first + before->second == start) {
-			start = before->first;
-			length += before->second;
-			m_freeRanges.erase(before);
+	uint64_t giveAt = 0, giveLength = 0;
+	{
+		std::lock_guard<std::mutex> hold(m_addressLock);
+		auto live = m_livePicks.find(address);
+		if (live != m_livePicks.end()) {
+			const uint64_t length = live->second;
+			m_livePicks.erase(live);
+			giveTo(m_freeRanges, address, length, 0, UINT64_MAX);
+			return;
 		}
+		auto pick = m_privatePicks.find(address);
+		if (pick == m_privatePicks.end())
+			return;
+		const uint64_t length = pick->second;
+		m_privatePicks.erase(pick);
+		auto block = privateBlockOf(address);
+		if (block == m_privateBlocks.end())
+			return;
+		const uint64_t lo = block->first, hi = block->first + block->second.length;
+		giveTo(m_privateFree, address, length, lo, hi);
+		if (--block->second.picks != 0)
+			return;
+		// Empty: kept where it is the only empty block, for the next picks; else given back,
+		// its one free range taken out first so no pick lands in it.
+		for (const auto &other : m_privateBlocks)
+			if (other.first != lo && other.second.picks == 0) {
+				m_privateFree.erase(lo);
+				m_privateBlocks.erase(block);
+				giveAt = lo;
+				giveLength = hi - lo;
+				break;
+			}
 	}
-	if (after != m_freeRanges.end() && after->first == start + length) {
-		length += after->second;
-		m_freeRanges.erase(after);
+	// With no lock held: a call into the kext, which first posts the destroys the process holds,
+	// the last object's in the block among them.
+	if (giveAt != 0)
+		m_privateGive(m_privateContext, giveAt, giveLength);
+}
+
+std::map<uint64_t, RgfxIdSpace::PrivateBlock>::iterator RgfxIdSpace::privateBlockOf(
+    uint64_t address)
+{
+	auto it = m_privateBlocks.upper_bound(address);
+	if (it == m_privateBlocks.begin())
+		return m_privateBlocks.end();
+	--it;
+	return address - it->first < it->second.length ? it : m_privateBlocks.end();
+}
+
+void RgfxIdSpace::setPrivateBlockSource(PrivateTakeFn take, PrivateGiveFn give, void *context)
+{
+	std::lock_guard<std::mutex> hold(m_addressLock);
+	m_privateTake = take;
+	m_privateGive = give;
+	m_privateContext = context;
+}
+
+uint64_t RgfxIdSpace::allocPrivateAddress(uint64_t size, uint64_t align)
+{
+	if (m_privateTake == nullptr)
+		return allocAddress(size, align);
+	align = std::max(align, kAddressGranule);
+	const uint64_t span = addressSpan(size);
+	auto pick = [&]() -> uint64_t {
+		const uint64_t start = pickFrom(m_privateFree, m_privateCursor, span, align);
+		if (start != 0) {
+			m_privatePicks[start] = span;
+			privateBlockOf(start)->second.picks++;
+		}
+		return start;
+	};
+	{
+		std::lock_guard<std::mutex> hold(m_addressLock);
+		if (const uint64_t start = pick())
+			return start;
 	}
-	m_freeRanges[start] = length;
+	// No block has room: a new one, taken with no lock held (a call into the kext, which waits for
+	// the host's answer), with room for the span at its alignment wherever the block starts.
+	uint64_t at = 0, length = 0;
+	const bool sized = span <= RGFX_PRIVATE_TAKE_MAX && align <= RGFX_PRIVATE_TAKE_MAX - span;
+	const uint64_t want =
+	    sized ? std::max(kPrivateBlockBytes, alignUp(span + align, RGFX_PRIVATE_BLOCK_ALIGN)) : 0;
+	if (!sized || want > RGFX_PRIVATE_TAKE_MAX ||
+	    !m_privateTake(m_privateContext, want, &at, &length) || at == 0 || length < want ||
+	    at > UINT64_MAX - length) {
+		if (!m_privateRefused.exchange(true))
+			os_log_error(rgfxLog(),
+			             "RGFX: no Private block of %llu bytes for a pick of %llu bytes: "
+			             "Private objects the context's blocks have no room for lie in its own "
+			             "range",
+			             (unsigned long long)want, (unsigned long long)size);
+		return allocAddress(size, align);
+	}
+	{
+		std::lock_guard<std::mutex> hold(m_addressLock);
+		m_privateBlocks[at] = PrivateBlock{length, 0};
+		m_privateFree[at] = length;
+		if (const uint64_t start = pick())
+			return start;
+	}
+	// Other threads' picks took the room first: the context's range, as for a refusal.
+	return allocAddress(size, align);
+}
+
+size_t RgfxIdSpace::privateBlocksHeld() const
+{
+	std::lock_guard<std::mutex> hold(m_addressLock);
+	return m_privateBlocks.size();
+}
+
+size_t RgfxIdSpace::privatePicksLive() const
+{
+	std::lock_guard<std::mutex> hold(m_addressLock);
+	return m_privatePicks.size();
 }
 
 void RgfxIdSpace::setBases(uint64_t obj_id_base, uint64_t address_base, uint64_t address_span)

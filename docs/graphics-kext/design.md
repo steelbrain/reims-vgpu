@@ -4903,6 +4903,60 @@ device's life, and the x86-64 kext reads it once at its start.
   too: blocks taken and given back, takes refused, and how long the takes
   waited for the host.
 
+**Private blocks.** Where the guest took `PRIVATE_BLOCKS` (feature bit 60),
+a context's Private objects lie in blocks of GPU addresses the host gives the
+context, rather than in the context's own range: its Private buffers
+(`BUFFER_CREATE`), its heaps that are not Shared (`HEAP_CREATE`) and its
+Managed buffers' GPU copies (`MANAGED_BUFFER_CREATE`,
+`BUFFER_MANAGED_AT_OFFSET`). Every host offers the bit, and both kexts take
+it (kext feature bit 1 << 17 `PrivateBlocks`); the bundle uses blocks where
+its kext sets that bit and the device took the feature.
+- **A take.** Where no block the context holds has room for a pick, the
+  bundle asks the kext for one (selector 18, `PrivateTake`): 256 MiB, or the
+  pick's span and alignment rounded up to 64 KiB where that is more. The kext
+  posts the context's `PRIVATE_TAKE` on ring 0 and waits for its answer,
+  `PRIVATE_BLOCK`, with no deadline, as it waits for a pool take: the block's
+  GPU address and its length, at least the bytes asked for rounded up to
+  64 KiB, or `REFUSED` where the host has no block for it. The kext maps
+  nothing and keeps no list of blocks: the host holds each against the
+  context. The take happens on the thread whose create found no room, and
+  only then.
+- **Picks.** The bundle picks an object's address in its blocks as it picks
+  one in its range: next fit through the blocks in address order, each pick
+  holding its span on the 32 KiB granule (its pages and a guard page), a
+  freed span picked again only once the picks wrap round. Free ranges never
+  join across blocks, so no pick spans two of them, side by side as the host
+  may give them.
+- **Refused.** Where the host refuses a take, the bundle picks the object's
+  address in the context's own range, as a guest that did not take the bit
+  does, and logs the first refusal of the process.
+- **A give.** When a block's last object goes and the context holds another
+  empty block, the bundle gives the block back (selector 22, `PrivateGive`);
+  the one empty block left is kept for the next picks. Every call into the
+  kext first posts the destroys the control ring holds, so the last object's
+  destroy goes first. The kext posts `PRIVATE_GIVE` and returns. The host
+  refuses it while an object it holds still lies in the block, answers
+  `NOT_FOUND` for a block the context does not hold, and otherwise lets the
+  block go once every command buffer the context committed has finished. A
+  context's `CONTEXT_CLOSE` lets go of every block it still holds, and the
+  device's reset of every block.
+- **Its addresses.** On metal2vulkan-rt's device a block is device memory no
+  process maps, its address the memory's Vulkan device address, and the host
+  answers the whole block it took. On the Vulkan platform before it, the
+  host picks a block's addresses in `[2^44, 2^45)`, below the Shared pool's
+  and every context's range, where the platform places none of its own
+  ranges: next fit, as it picks the pool's
+  (`crates/reims-vgpu/src/pool/addresses.rs`, `private_blocks.rs`), with no
+  memory behind them; the platform pins each object made there, as it pins
+  the guest's picks. A buffer made in a block reads zero from its create, as
+  one made in the context's range does.
+- **What the guest sees.** The `gpuAddress` of a Private buffer, a heap that
+  is not Shared and the buffers in it, and a Managed buffer lies in
+  `[2^44, 2^45)` on the Vulkan platform, and wherever the host's device
+  memory lies on metal2vulkan-rt's, rather than in the context's range in
+  `[2^46, 2^47)`. Shared buffers, the pool's heaps and no-copy buffers keep
+  theirs.
+
 **No-copy buffers.** `newBufferWithBytesNoCopy:` over bytes in a block of the
 process's lies over them in place (`BUFFER_OVER_HOST_MEMORY` at their offset).
 Metal makes one over any range the process maps readable, at any alignment:
@@ -6740,6 +6794,8 @@ Map 1:
 | 15 | `CpuPats` | 1 << 13 `CpuPats` | every online CPU's PAT, read on each CPU, for an administrator's process: the check that entry 2 is write-back everywhere ("The BAR is one host memory region"; the guest's `guest/bundle/tools/pat_probe.c`); x86-64 only |
 | 16 | `PoolTake` | 1 << 15 `Pool`, 1 << 16 `PoolAddresses` (its fourth output, the block's GPU address, 0 for none) | a block of the Shared pool for the process's context, mapped into the process write-back once the host answers its `POOL_TAKE`, however long that takes ("The Shared pool"); three outputs, or four with its GPU address; x86-64 only, `kIOReturnUnsupported` on arm64e |
 | 17 | `PoolGive` | 1 << 15 `Pool` | gives a pool block back: out of the process, then its `POOL_GIVE` |
+| 18 | `PrivateTake` | 1 << 17 `PrivateBlocks` | a block of GPU addresses for the Private objects of the process's context, once the host answers its `PRIVATE_TAKE`, however long that takes ("Private blocks"); one input, the bytes, and two outputs, the block's GPU address and length |
+| 22 | `PrivateGive` | 1 << 17 `PrivateBlocks` | gives a Private block back: its `PRIVATE_GIVE`, with the block's GPU address and length; 22 rather than 19, as macOS 12's web-content sandbox refuses 19 to 21 |
 | 0x100 | `OpenContext` | 1 << 5 `ContextSpan` (its sixth output), 1 << 12 `DoorbellPage` (its seventh) | the context and its window; five outputs, six with its GPU addresses' span, or seven with its doorbell page's address in the process, 0 for none ("BAR4: the doorbell pages") |
 | 0x101 | `Alloc` | 1 << 7 `WriteCombined` (its third input), 1 << 14 `ZeroedBlocks` (the block reads zero) | a region block; 2 inputs, or 3 with the byte its write-combined part starts at |
 | 0x102 | `Free` | | frees a block |
@@ -6758,7 +6814,7 @@ the accelerator, which the bundle opens for each event it hands out: 10 and 11
 are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish`, 1 << 12 `DoorbellPage`, 1 << 13 `CpuPats`, 1 << 14 `ZeroedBlocks`, 1 << 15 `Pool` and 1 << 16 `PoolAddresses`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed, `CpuPats` only on x86-64, and `Pool` and `PoolAddresses` only on x86-64 where the device has a pool; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish`, 1 << 12 `DoorbellPage`, 1 << 13 `CpuPats`, 1 << 14 `ZeroedBlocks`, 1 << 15 `Pool`, 1 << 16 `PoolAddresses` and 1 << 17 `PrivateBlocks`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed, `CpuPats` only on x86-64, and `Pool` and `PoolAddresses` only on x86-64 where the device has a pool; no other bit yet.
 
 The arm64e kext takes no `POOL` of the device's offer, which offers an arm64
 guest none until a boot shows its kernel maps a range past its RAM, above

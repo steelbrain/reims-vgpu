@@ -174,6 +174,191 @@ void test_address_picks()
 	CHECK(std::adjacent_find(all.begin(), all.end()) == all.end());
 }
 
+// A Private block source standing in for the kext: it hands blocks of the length asked for
+// plus `extra`, at addresses from `next` on, each `gap` bytes past the last one's end, or
+// refuses where `refuse` holds; and records what it took and was given back.
+struct FakePrivate {
+	uint64_t next = uint64_t{1} << 44; // the host's Private range on the Vulkan platform
+	uint64_t extra = 0;
+	uint64_t gap = uint64_t{1} << 30;
+	bool refuse = false;
+	std::vector<std::pair<uint64_t, uint64_t>> taken, given;
+	std::mutex lock;
+};
+
+bool fakePrivateTake(void *context, uint64_t size, uint64_t *gpu_address, uint64_t *length)
+{
+	FakePrivate *f = static_cast<FakePrivate *>(context);
+	std::lock_guard<std::mutex> hold(f->lock);
+	if (f->refuse)
+		return false;
+	*gpu_address = f->next;
+	*length = size + f->extra;
+	f->taken.emplace_back(*gpu_address, *length);
+	f->next += *length + f->gap;
+	return true;
+}
+
+void fakePrivateGive(void *context, uint64_t gpu_address, uint64_t length)
+{
+	FakePrivate *f = static_cast<FakePrivate *>(context);
+	std::lock_guard<std::mutex> hold(f->lock);
+	f->given.emplace_back(gpu_address, length);
+}
+
+// Where `address` lies in one of the blocks `f` handed.
+bool inPrivateBlock(FakePrivate &f, uint64_t address, uint64_t span)
+{
+	for (const auto &block : f.taken)
+		if (address >= block.first && address - block.first <= block.second &&
+		    span <= block.second - (address - block.first))
+			return true;
+	return false;
+}
+
+// Private objects' addresses (RGFX_FEATURE_PRIVATE_BLOCKS): picked as the context's are, but in
+// blocks the host gives the context, a block of 256 MiB taken where none held has room, and one
+// left empty given back past the one the space keeps.
+void test_private_address_picks()
+{
+	const uint64_t page = RgfxIdSpace::kAddressPage, granule = RgfxIdSpace::kAddressGranule;
+	const uint64_t base = RGFX_CONTEXT_VA_BASE + 3 * RGFX_CONTEXT_VA_UNIT;
+	const uint64_t blockBytes = RgfxIdSpace::kPrivateBlockBytes;
+	CHECK(blockBytes == uint64_t{256} << 20 && blockBytes % RGFX_PRIVATE_BLOCK_ALIGN == 0);
+
+	// No source: the context's range, as allocAddress picks.
+	{
+		RgfxIdSpace ids;
+		ids.setBases(uint64_t{4} << RGFX_CONTEXT_OBJ_ID_SHIFT, base, RGFX_CONTEXT_VA_UNIT);
+		CHECK(!ids.privateBlocks());
+		const uint64_t at = ids.allocPrivateAddress(0x4000, 256);
+		CHECK(at == base);
+		CHECK(ids.privateBlocksHeld() == 0 && ids.privatePicksLive() == 0);
+		ids.freeAddress(at);
+	}
+
+	// The first pick takes a block of 256 MiB and lies at its start; the next, next fit after
+	// it; a larger alignment is honoured inside the block.
+	FakePrivate f;
+	f.extra = 0x1'0000; // the host may answer more than asked: the space uses all of it
+	RgfxIdSpace ids;
+	ids.setBases(uint64_t{4} << RGFX_CONTEXT_OBJ_ID_SHIFT, base, RGFX_CONTEXT_VA_UNIT);
+	ids.setPrivateBlockSource(&fakePrivateTake, &fakePrivateGive, &f);
+	CHECK(ids.privateBlocks());
+	const uint64_t a = ids.allocPrivateAddress(1u << 20, 256);
+	CHECK(f.taken.size() == 1 && f.taken[0].second == blockBytes + f.extra);
+	const uint64_t first = f.taken[0].first;
+	CHECK(a == first);
+	const uint64_t b = ids.allocPrivateAddress(0x4000, 1);
+	CHECK(b == a + RgfxIdSpace::addressSpan(1u << 20));
+	const uint64_t c = ids.allocPrivateAddress(1, 0x10'0000);
+	CHECK(c % 0x10'0000 == 0 && c > b && inPrivateBlock(f, c, granule));
+	CHECK(ids.privateBlocksHeld() == 1 && ids.privatePicksLive() == 3);
+	// None of them is the context's own: its range's first pick is still its base.
+	const uint64_t own = ids.allocAddress(1, 1);
+	CHECK(own == base);
+	ids.freeAddress(own);
+
+	// A pick past the block's room takes a block of its span and alignment, rounded up to the
+	// host's 64 KiB, and lies in it.
+	const uint64_t big = uint64_t{512} << 20;
+	const uint64_t d = ids.allocPrivateAddress(big, 0x20'0000);
+	CHECK(f.taken.size() == 2);
+	CHECK(f.taken[1].second - f.extra ==
+	      ((RgfxIdSpace::addressSpan(big) + 0x20'0000 + RGFX_PRIVATE_BLOCK_ALIGN - 1) &
+	       ~(RGFX_PRIVATE_BLOCK_ALIGN - 1)));
+	CHECK(d % 0x20'0000 == 0 && inPrivateBlock(f, d, RgfxIdSpace::addressSpan(big)));
+	CHECK(ids.privateBlocksHeld() == 2 && ids.privatePicksLive() == 4);
+
+	// Freed: an address no pick starts at is ignored; the big block, empty, is kept, the only
+	// empty one; the first, emptied after it, is given back whole.
+	ids.freeAddress(0);
+	ids.freeAddress(a + page);
+	ids.freeAddress(d);
+	CHECK(f.given.empty() && ids.privateBlocksHeld() == 2);
+	ids.freeAddress(a);
+	ids.freeAddress(b);
+	CHECK(f.given.empty());
+	ids.freeAddress(c);
+	CHECK(f.given.size() == 1 && f.given[0] == f.taken[0]);
+	CHECK(ids.privateBlocksHeld() == 1 && ids.privatePicksLive() == 0);
+	ids.freeAddress(c); // given back already: ignored
+	CHECK(f.given.size() == 1);
+	// The kept block takes the next pick: no new block.
+	const uint64_t e = ids.allocPrivateAddress(0x4000, 1);
+	CHECK(f.taken.size() == 2 && inPrivateBlock(f, e, granule) && e >= f.taken[1].first);
+	ids.freeAddress(e);
+
+	// Blocks side by side: their free ranges never join, so no pick spans two blocks. The first
+	// block's last granule is left free and the second's whole; a pick of a block's length then
+	// lies at the second's start, not one granule before it.
+	{
+		FakePrivate g;
+		g.gap = 0;
+		RgfxIdSpace side;
+		side.setBases(uint64_t{5} << RGFX_CONTEXT_OBJ_ID_SHIFT, base, RGFX_CONTEXT_VA_UNIT);
+		side.setPrivateBlockSource(&fakePrivateTake, &fakePrivateGive, &g);
+		const uint64_t fill = side.allocPrivateAddress(blockBytes - 3 * page, 1);
+		CHECK(fill == g.next - blockBytes && RgfxIdSpace::addressSpan(blockBytes - 3 * page) ==
+		                                         blockBytes - granule);
+		const uint64_t second = side.allocPrivateAddress(2 * page, 1);
+		CHECK(g.taken.size() == 2 && second == g.taken[1].first &&
+		      second == g.taken[0].first + blockBytes);
+		side.freeAddress(second); // the second block, empty, kept
+		CHECK(g.given.empty());
+		const uint64_t whole = side.allocPrivateAddress(blockBytes - page, 1);
+		CHECK(RgfxIdSpace::addressSpan(blockBytes - page) == blockBytes);
+		CHECK(whole == g.taken[1].first && g.taken.size() == 2);
+		side.freeAddress(whole);
+		side.freeAddress(fill);
+		CHECK(g.given.size() == 1);
+	}
+
+	// Refused: the context's range, and no block held.
+	{
+		FakePrivate r;
+		r.refuse = true;
+		RgfxIdSpace refused;
+		refused.setBases(uint64_t{6} << RGFX_CONTEXT_OBJ_ID_SHIFT, base, RGFX_CONTEXT_VA_UNIT);
+		refused.setPrivateBlockSource(&fakePrivateTake, &fakePrivateGive, &r);
+		const uint64_t at = refused.allocPrivateAddress(0x4000, 1);
+		CHECK(at == base && refused.privateBlocksHeld() == 0);
+		const uint64_t next = refused.allocPrivateAddress(0x4000, 1);
+		CHECK(next == base + RgfxIdSpace::addressSpan(0x4000));
+		refused.freeAddress(at);
+		refused.freeAddress(next);
+		CHECK(r.given.empty());
+	}
+
+	// Picks from several threads at once never share a span, and each lies in a block taken.
+	{
+		FakePrivate t;
+		RgfxIdSpace shared;
+		shared.setBases(uint64_t{7} << RGFX_CONTEXT_OBJ_ID_SHIFT, base, RGFX_CONTEXT_VA_UNIT);
+		shared.setPrivateBlockSource(&fakePrivateTake, &fakePrivateGive, &t);
+		std::vector<uint64_t> got[4];
+		std::vector<std::thread> threads;
+		for (auto &g : got)
+			threads.emplace_back([&shared, &g] {
+				for (int i = 0; i < 500; i++) {
+					uint64_t at = shared.allocPrivateAddress(0x1000, 1);
+					g.push_back(at);
+					if (i % 3 == 0)
+						shared.freeAddress(at);
+				}
+			});
+		for (auto &th : threads)
+			th.join();
+		std::vector<uint64_t> all;
+		for (auto &g : got)
+			all.insert(all.end(), g.begin(), g.end());
+		std::sort(all.begin(), all.end());
+		CHECK(std::adjacent_find(all.begin(), all.end()) == all.end());
+		for (uint64_t at : all)
+			CHECK(inPrivateBlock(t, at, granule));
+	}
+}
+
 // A chunk source standing in for the kext: it hands each first id of `firsts` in turn, with
 // the grant's size from `sizes` where it holds one for it (else none, the space's own size),
 // then answers none left, and counts its calls (the user-client calls a create would make).
@@ -4364,6 +4549,7 @@ void test_region_write_combined_parts()
 int main()
 {
 	test_id_space();
+	test_private_address_picks();
 	test_obj_ids_are_given_once();
 	test_region_pages_blocks();
 	test_region_pages_joins();

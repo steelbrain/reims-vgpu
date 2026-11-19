@@ -242,8 +242,9 @@ RgfxCreated RgfxSerializer::createHeap(uint64_t size_bytes, uint32_t options, in
                                        uint64_t align)
 {
 	RgfxCreated out = {};
-	// No address left for it: no object, as Metal answers one it cannot place.
-	out.gpu_address = m_ids.allocAddress(size_bytes, align);
+	// In a Private block where the context takes them (a heap that is not Shared is the GPU's
+	// alone). No address left for it: no object, as Metal answers one it cannot place.
+	out.gpu_address = m_ids.allocPrivateAddress(size_bytes, align);
 	if (out.gpu_address == 0)
 		return out;
 	out.obj_id = m_ids.allocObjId();
@@ -339,8 +340,9 @@ RgfxCreated RgfxSerializer::createHeapOverPoolAt(uint64_t size_bytes, uint32_t o
 RgfxCreated RgfxSerializer::createBuffer(uint64_t length, uint32_t options, uint64_t align)
 {
 	RgfxCreated out = {};
-	// No address left for it: no object, as Metal answers one it cannot place.
-	out.gpu_address = m_ids.allocAddress(length, align);
+	// In a Private block where the context takes them (a buffer the device makes is the GPU's
+	// alone). No address left for it: no object, as Metal answers one it cannot place.
+	out.gpu_address = m_ids.allocPrivateAddress(length, align);
 	if (out.gpu_address == 0)
 		return out;
 	out.obj_id = m_ids.allocObjId();
@@ -398,9 +400,9 @@ RgfxCreated RgfxSerializer::createBufferManagedAtOffset(RgfxObjId heap, uint64_t
                                                         uint64_t align)
 {
 	RgfxCreated out = {};
-	// The GPU copy's address; no address left for it: no object, as for a buffer over host
-	// memory.
-	out.gpu_address = m_ids.allocAddress(length, align);
+	// The GPU copy's address, in a Private block where the context takes them; no address left
+	// for it: no object, as for a buffer over host memory.
+	out.gpu_address = m_ids.allocPrivateAddress(length, align);
 	if (out.gpu_address == 0)
 		return out;
 	out.obj_id = m_ids.allocObjId();
@@ -422,11 +424,12 @@ RgfxCreated RgfxSerializer::createManagedBuffer(RgfxObjId cpu_buffer, uint64_t l
                                                 uint64_t align, uint64_t offset)
 {
 	RgfxCreated out = {};
-	// The GPU copy's address, the pick holding the span from `offset` before it; no address left
-	// for it: no object, as for a buffer over host memory.
+	// The GPU copy's address, in a Private block where the context takes them, the pick holding
+	// the span from `offset` before it; no address left for it: no object, as for a buffer over
+	// host memory.
 	if (length > UINT64_MAX - offset)
 		return out;
-	out.gpu_address = m_ids.allocAddress(length + offset, align);
+	out.gpu_address = m_ids.allocPrivateAddress(length + offset, align);
 	if (out.gpu_address == 0)
 		return out;
 	out.obj_id = m_ids.allocObjId();
