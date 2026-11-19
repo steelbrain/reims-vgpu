@@ -207,6 +207,11 @@ to the end of the host's, and at realize, once the device is made, raises fw_cfg
 above it, maps each piece as a RAM region of its own (an add is a pure add), and under WHPX runs
 the hypervisor's map outside its BQL (`whpx_map_ahead`).
 
+On the arm64 guests' machine, `vmapple`, which has no fw_cfg and places nothing past its RAM, QEMU
+gives the device the addresses from the end of the RAM, rounded up to 1 GiB, to the end of the
+guest's physical address space (40 bits under HVF where the host gives 40), in whole GiB, and
+reserves nothing.
+
 ## 2. The C header
 
 The header has every function, type, callback typedef and constant, with the thread and

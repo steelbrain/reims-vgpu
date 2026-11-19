@@ -149,6 +149,7 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | WHPX on a host that is not Intel's intercepts the #GP of an MSR access (`intercept-msr-gp`, on by default there): an Intel guest's write of a 64-bit IA32_SYSENTER_ESP or _EIP gives Hyper-V the low 32 bits (QEMU's CPU state keeps all 64 until the vCPU's next full register read, and a read Hyper-V answers itself gives the low 32), and QEMU answers MISC_ENABLE, FEATURE_CONTROL and PLATFORM_INFO, which Hyper-V on AMD answers with #GP: macOS panicked on the first two at boot ("Windows hosts", below) | `40257041` |
 | WHPX offers the guest no TSC deadline timer where Hyper-V refuses its register (`WHvX64RegisterTscDeadline`), asked of a vCPU made for the question at init: the CPU model's `tsc-deadline` is filtered out as a feature the host lacks, and a macOS guest arms the local APIC's timer ("Windows hosts", below) | `c3704402` |
 | `vmapple` asks HVF for 40 bits of guest physical address, or the host's most where that is fewer (the machine's `get_physical_address_range`), where HVF's default is 36, and refuses to start where its RAM ends past them; the guest reads the size as its `ID_AA64MMFR0_EL1.PARange` ("arm64 guests", below) | `dc1b6821` |
+| `vmapple` answers the room past its RAM, from the end of RAM rounded up to 1 GiB to the end of the guest's physical addresses (the CPU's `PARange`, at most 40 bits, and under KVM at most KVM's largest IPA size), in whole GiB, as read-only machine properties, `x-pool-room-base` and `x-pool-room-size`, and places nothing there; `reims-graphics-pci` gives the library that room for the guest's Shared pool where no PC host bridge answers one, and reserves the range it took without fw_cfg where the machine has none ("The reims-graphics device", below) | `0590cfde` |
 
 The branch's other commits are the apple-gfx work `96e1b470` removes, and
 `cfaadbfa09`, an HVF workaround that `478c28ff70` reverts, upstream having
@@ -216,7 +217,12 @@ is its transport:
   PCI window above it; macOS lays the
   device's BARs out below 4 GiB anyway. It adds no e820 entry: QEMU's e820
   table is the i386 board's, which a device's common code cannot reach, and
-  OVMF leaves reserved entries above 4 GiB out of the EFI memory map. The
+  OVMF leaves reserved entries above 4 GiB out of the EFI memory map. On
+  `vmapple`, which has no fw_cfg and places nothing past its RAM, the
+  device offers the library the room the machine answers instead
+  (`x-pool-room-base`, `x-pool-room-size`): from the end of RAM rounded up
+  to 1 GiB to the end of the guest's physical addresses, in whole GiB
+  ("arm64 guests"), and reserves nothing. The
   library maps its blocks of host memory into the range as the guest's pool
   grows (`pool_add`, docs/api.md) and takes them out as it shrinks
   (`pool_remove`). Each block is a RAM region of its own, unmergeable, owned
@@ -2040,6 +2046,12 @@ library's window shut, and QMP's `screendump` shows the display:
 -device reims-graphics-pci
 -device loader,file=firmware/ambrosia/build/ReimsGraphics.cpio,addr=0x120000000,force-raw=on
 ```
+
+The device gives the library `vmapple`'s room past RAM for the guest's
+Shared pool: on an 8 GiB guest, from 0x300000000 to the end of the guest's
+physical addresses, 1 TiB at 40 bits (1012 GiB of room). Ambrosia's device
+tree lists RAM alone, so macOS places nothing there, and the library maps
+its blocks there as the pool grows.
 
 **Measured** on the M3 Max under HVF on 2026-11-08, with `vendor/qemu` at
 `aef8a7cf` configured as above on the library of `61b1aac9e`, Ambrosia's
