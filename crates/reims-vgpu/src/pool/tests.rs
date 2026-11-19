@@ -642,7 +642,10 @@ fn a_piece_asked_ahead_of_the_first_take_serves_it_with_no_wait() {
     let ledger = pool.ledger();
     assert!(ledger.keep_headroom());
     assert_eq!(host.wait_for(1), [Call::Add(BASE, BLOCK_LEN)]);
-    assert!(!ledger.keep_headroom(), "asked again while the host maps it");
+    assert!(
+        !ledger.keep_headroom(),
+        "asked again while the host maps it"
+    );
     pool.added(BASE).unwrap();
     assert!(!ledger.keep_headroom(), "asked again");
     assert_eq!(answer(&take(&ledger, 1, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
