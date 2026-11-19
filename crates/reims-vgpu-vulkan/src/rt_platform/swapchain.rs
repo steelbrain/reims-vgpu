@@ -63,11 +63,11 @@ use crate::swapchain::{
     refused, remake, take_image,
 };
 
+use super::RtObj;
 use super::command::RtCommandBuffer;
 use super::device::RtDevice;
 use super::texture::{self, RtTexture};
 use super::unbuilt::rt_refused;
-use super::RtObj;
 
 /// The log target.
 const TARGET: &str = "reims_vgpu_vulkan::rt_swapchain";
@@ -122,8 +122,6 @@ pub struct RtSwapchain {
     vk: ash::Device,
     /// The physical device.
     physical: vk::PhysicalDevice,
-    /// The queue family of rt's queues and of its presenting queue.
-    family: u32,
     /// `VK_KHR_surface`'s commands.
     surface_api: khr::surface::Instance,
     /// `VK_KHR_swapchain`'s commands.
@@ -268,7 +266,6 @@ impl RtSwapchain {
             device: device.clone_ref(),
             vk,
             physical,
-            family,
             surface_api,
             swapchain_api,
             surface,
@@ -482,9 +479,8 @@ impl RtSwapchain {
         // without running signalled nothing. It lives until the swapchain's end, after the command
         // buffer completes ([`RtSwapchain::retire`]), and only this swapchain's present waits on
         // it.
-        let made = unsafe {
-            (command_buffer.rt()).present_drawable(image.texture.rt(), image.ready)
-        };
+        let made =
+            unsafe { (command_buffer.rt()).present_drawable(image.texture.rt(), image.ready) };
         match made {
             Ok(()) => true,
             Err(e) => {
@@ -917,9 +913,8 @@ impl RtSwapchain {
             // command buffer that used the texture has completed, and the move home of its last
             // `drawable_acquired` has run, and its texture is gone ([`RtSwapchain::retire`],
             // [`RtSwapchain::destroy`]).
-            let made = unsafe {
-                (self.device.rt()).new_drawable_texture(&descriptor, None, raw, info)
-            };
+            let made =
+                unsafe { (self.device.rt()).new_drawable_texture(&descriptor, None, raw, info) };
             let made = match made {
                 Ok(made) => made,
                 Err(e) => {
@@ -975,11 +970,11 @@ impl Drop for RtSwapchain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::host::HostPtr;
     use crate::core::platform::Platform as _;
     use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
     use crate::core::platform::device::GpuDevice as _;
     use crate::core::platform::resource::Buffer as _;
-    use crate::core::host::HostPtr;
     use crate::core::platform::types::CommandBufferStatus;
     use crate::core::raise::OnFault;
     use crate::rt_platform::RtPlatform;
