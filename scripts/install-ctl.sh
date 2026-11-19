@@ -395,7 +395,9 @@ fi
 # x86-64 and arm64 VMs on arm64; arm64 VMs on x86-64 are emulated by TCG.
 if [[ $OS == Linux ]]; then
   if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
-    warn "/dev/kvm is not usable by you: enable virtualization in the firmware and add yourself to the kvm group (sudo usermod -aG kvm \$USER; log in again), or VMs will not start"
+    vms="VMs will not start"
+    [[ $ARCH == x86_64 ]] && vms="x86-64 VMs will not start (arm64 VMs, which TCG emulates here, start without it)"
+    warn "/dev/kvm is not usable by you: enable virtualization in the firmware and add yourself to the kvm group (sudo usermod -aG kvm \$USER; log in again), or $vms"
   fi
   # The guest's memory reaches the GPU through /dev/udmabuf, on every GPU: without
   # it the library's views of that memory take a kernel mapping per 4 KiB page,

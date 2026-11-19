@@ -1628,13 +1628,14 @@ fn doctor(host: Host) -> Result<i32> {
     }
     // KVM and the library's needs, for the x86-64 VMs Linux runs; KVM alone for the arm64 VMs
     // arm64 Linux runs.
+    let vms = registered_vms();
     match host.os {
         crate::host::Os::Linux if profile.accel(host) == "kvm" && profile != Profile::Q35X86_64 => {
-            let (ok, detail) = kvm_check();
+            let (ok, detail) = kvm_check(host, &vms);
             line(ok, "/dev/kvm", detail);
         }
         crate::host::Os::Linux if profile == Profile::Q35X86_64 => {
-            let (ok, detail) = kvm_check();
+            let (ok, detail) = kvm_check(host, &vms);
             line(ok, "/dev/kvm", detail);
             let udmabuf = runtime::udmabuf_problem();
             line(
@@ -1645,15 +1646,10 @@ fn doctor(host: Host) -> Result<i32> {
             if let Some(n) = runtime::host_max_map_count() {
                 // A speed-up only, on NVIDIA where udmabuf opens (runtime::max_map_count): for
                 // the largest VM, or a new one.
-                let memory_mib = Registry::load()
-                    .map(|reg| {
-                        reg.vms
-                            .iter()
-                            .filter_map(|e| Vm::load(&e.dir).ok())
-                            .map(|vm| vm.config.memory_mib)
-                            .max()
-                            .unwrap_or(0)
-                    })
+                let memory_mib = vms
+                    .iter()
+                    .map(|vm| vm.config.memory_mib)
+                    .max()
                     .unwrap_or(0)
                     .max(create::default_memory_mib());
                 let note = (udmabuf.is_none() && runtime::host_has_nvidia())
@@ -1746,7 +1742,7 @@ fn doctor(host: Host) -> Result<i32> {
                 crate::host::has_screen(&Default::default()),
                 "found",
                 "neither WAYLAND_DISPLAY nor DISPLAY is set",
-                &registered_vms(),
+                &vms,
             );
             line(ok, "desktop session", detail);
         }
@@ -1785,20 +1781,46 @@ fn doctor(host: Host) -> Result<i32> {
 }
 
 /// Whether this user can open /dev/kvm, and what doctor says of it.
-fn kvm_check() -> (bool, String) {
+fn kvm_check(host: Host, vms: &[Vm]) -> (bool, String) {
     let kvm = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/kvm");
-    match kvm {
-        Ok(_) => (true, "usable".into()),
-        Err(e) => (
-            false,
-            format!(
-                "{e}: add yourself to the kvm group (sudo usermod -aG kvm $USER) and log in again"
-            ),
-        ),
+    kvm_line(host, kvm.map(drop), vms)
+}
+
+/// doctor's /dev/kvm line, `opened` how its open went: a failure only where a VM this host runs
+/// needs KVM ([`needs_kvm`]). On x86-64 Linux arm64 VMs run on TCG, which needs none.
+fn kvm_line(host: Host, opened: std::io::Result<()>, vms: &[Vm]) -> (bool, String) {
+    const FIX: &str = "add yourself to the kvm group (sudo usermod -aG kvm $USER) and log in again";
+    match opened {
+        Ok(()) => (true, "usable".into()),
+        Err(e) if needs_kvm(host, vms) => (false, format!("{e}: {FIX}")),
+        Err(e) => {
+            let on_kvm: Vec<&str> = Profile::supported_on(host)
+                .iter()
+                .filter(|p| p.accel(host) == "kvm")
+                .map(|p| p.id())
+                .collect();
+            (
+                true,
+                format!(
+                    "{e}, and no VM here runs on KVM: {} VMs would, so for one, {FIX}",
+                    on_kvm.join(" and ")
+                ),
+            )
+        }
     }
+}
+
+/// Whether a VM this host runs needs KVM: one of `vms` whose profile runs on it here, or, with no
+/// VMs yet, the one a create makes, of the host's default profile.
+fn needs_kvm(host: Host, vms: &[Vm]) -> bool {
+    let kvm = |p: Profile| p.accel(host) == "kvm";
+    if vms.is_empty() {
+        return host.default_profile().is_some_and(kvm);
+    }
+    vms.iter().any(|vm| kvm(vm.config.profile))
 }
 
 /// doctor's checks of a Windows host, each a `line`.
@@ -2210,6 +2232,50 @@ mod tests {
         assert!(detail.contains("REIMS_VGPU_WINDOW=0"), "{detail}");
         let (ok, detail) = check(false, &[windowed, screenless_vm("x", "", &[])]);
         assert!(!ok && detail.contains("w, x open a window"), "{detail}");
+    }
+
+    /// doctor fails on /dev/kvm only where a VM this host runs needs KVM: on x86-64 Linux an
+    /// x86-64 VM, or the x86-64 VM a create makes where there are none yet; arm64 VMs run on TCG
+    /// there. On arm64 Linux every VM runs on KVM.
+    #[test]
+    fn doctor_wants_kvm_only_where_a_vm_runs_on_it() {
+        use crate::host::{Arch, Os};
+        let x86 = Host {
+            os: Os::Linux,
+            arch: Arch::X86_64,
+        };
+        let arm = Host {
+            os: Os::Linux,
+            arch: Arch::Aarch64,
+        };
+        let vm_of = |profile: Profile| {
+            let mut config: vm::VmConfig = toml::from_str(&config("")).unwrap();
+            config.profile = profile;
+            Vm {
+                dir: "/nonexistent/reims-ctl/t".into(),
+                config,
+            }
+        };
+        let (q35, arm64) = (vm_of(Profile::Q35X86_64), vm_of(Profile::VmappleArm64));
+        assert!(needs_kvm(x86, &[]) && needs_kvm(arm, &[]));
+        assert!(needs_kvm(x86, &[arm64.clone(), q35.clone()]));
+        assert!(!needs_kvm(x86, std::slice::from_ref(&arm64)));
+        assert!(needs_kvm(arm, std::slice::from_ref(&arm64)));
+
+        let denied = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(kvm_line(x86, Ok(()), &[]), (true, "usable".to_string()));
+        let (ok, detail) = kvm_line(x86, denied(), &[q35]);
+        assert!(
+            !ok && detail.ends_with("kvm $USER) and log in again"),
+            "{detail}"
+        );
+        let (ok, detail) = kvm_line(x86, denied(), std::slice::from_ref(&arm64));
+        assert!(ok, "{detail}");
+        assert!(
+            detail.contains("no VM here runs on KVM: q35-x86_64 VMs would, so for one, add"),
+            "{detail}"
+        );
+        assert!(!kvm_line(arm, denied(), &[arm64]).0);
     }
 
     #[test]
