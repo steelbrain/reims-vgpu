@@ -103,6 +103,9 @@ pub enum Call {
     View,
     /// Over a buffer's bytes (`newTextureWithDescriptor:offset:bytesPerRow:`).
     OverBuffer,
+    /// A tiled texture of more than one level, which takes a buffer's bytes
+    /// (`newTiledTextureWithDescriptor:offset:bytesPerRow:`, `super::tiled`).
+    Tiled,
     /// In a heap (`newTextureWithDescriptor:offset:`).
     InHeap,
     /// Over a window swapchain's image (`super::swapchain`).
@@ -116,6 +119,7 @@ impl Call {
             Call::SurfaceImage => "surface-image",
             Call::View => "view",
             Call::OverBuffer => "over-buffer",
+            Call::Tiled => "tiled",
             Call::InHeap => "in-heap",
             Call::Drawable => "drawable",
         }

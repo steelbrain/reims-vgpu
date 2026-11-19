@@ -130,8 +130,12 @@
 //! buffer, option bit 24 on a buffer the device makes, a Private no-copy buffer, a deallocator of a
 //! buffer that is not no-copy, a texture over a plane past 0 of a surface without planes. What rt
 //! refuses is nil, counted under rt's kind. A Private buffer of bytes, which a copy on the GPU
-//! fills, and a tiled texture over a buffer are unbuilt ([`Unbuilt::Buffer`]), and so is a texture
-//! over a surface's plane of a format that reads beside the plane ([`Unbuilt::IosurfaceTexture`]).
+//! fills, is unbuilt ([`Unbuilt::Buffer`]), and so is a texture over a surface's plane of a format
+//! that reads beside the plane ([`Unbuilt::IosurfaceTexture`]).
+//!
+//! **Tiled textures** (`newTiledTextureWithDescriptor:offset:bytesPerRow:`): of a 2D texture of
+//! more than one level, a copy of the bytes, taken at its first use (`super::tiled`); of any other,
+//! the texture over the bytes `newTextureWithDescriptor:offset:bytesPerRow:` makes.
 
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
@@ -156,8 +160,9 @@ use crate::core::sync::Mutex;
 use crate::gpu::device::descriptor_options;
 
 use super::device::RtDevice;
-use super::diag::{ImportPath, Made, Shape};
+use super::diag::{Call, ImportPath, Made, Shape};
 use super::texture::{self, RtTexture, refused_metal};
+use super::tiled::Tiled;
 use super::unbuilt::{Unbuilt, refuse_create, rt_refused, rt_refused_create};
 use super::{RtObj, RtPlatform, TextureFields};
 
@@ -273,6 +278,9 @@ pub(super) const READ_ONLY: u64 = 1 << 24;
 
 /// `MTLStorageModeManaged`, in the resource options' bits 4 to 7.
 const MANAGED: u64 = 1;
+
+/// `MTLTextureType2D`.
+const TEXTURE_TYPE_2D: u64 = 2;
 
 /// `id<MTLBuffer>` on metal2vulkan-rt: rt's buffer and what the platform answers of it.
 pub struct RtBuffer {
@@ -1779,18 +1787,31 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
         Ok(self.texture(sel, descriptor, offset, bytes_per_row))
     }
 
-    /// Unbuilt: nil ([`Unbuilt::Buffer`]): a tiled texture is a copy of the bytes, taken at its
-    /// first use, which rt's texture over a buffer is not.
+    /// A 2D texture of more than one level: rt's texture of the descriptor, at an index as
+    /// `newTextureWithDescriptor:`'s, of the buffer's storage mode, which takes the bytes from
+    /// `offset`, rows `bytes_per_row` apart, at its first use and every level from them
+    /// (`super::tiled`). Any other is the texture `newTextureWithDescriptor:offset:bytesPerRow:`
+    /// makes, which rt refuses for more than one level. Nil where rt refuses it, counted.
     fn new_tiled_texture(
         &self,
         descriptor: &RtObj<TextureFields>,
         offset: u64,
         bytes_per_row: u64,
     ) -> RaiseResult<Option<RtObj<RtTexture>>> {
-        let _ = (descriptor, offset, bytes_per_row);
         let sel = "newTiledTextureWithDescriptor:offset:bytesPerRow:";
-        refuse_create(Unbuilt::Buffer, sel);
-        Ok(None)
+        let desc = descriptor.desc();
+        if desc.mipmap_level_count <= 1 || desc.texture_type != TEXTURE_TYPE_2D {
+            return Ok(self.texture(sel, descriptor, offset, bytes_per_row));
+        }
+        let own =
+            |d: &rt::TextureDescriptor, index: Option<u32>| self.device.rt().new_texture(d, index);
+        let held = (self.options, texture::STORAGE_BITS);
+        let diag = |shape: &Shape| Made::new(Call::Tiled, shape);
+        let made = texture::make_over(&self.device, sel, &desc, held, own, diag);
+        if let Some(texture) = &made {
+            texture.set_tiled(Tiled::new(texture.rt(), self, offset, bytes_per_row));
+        }
+        Ok(made)
     }
 
     /// An exportable buffer's memory as a new opaque fd (`super::export`); `Err` for any other.

@@ -11,7 +11,8 @@
 //! the reservation of resource indices, buffers and the textures over them ([`buffer`]), with the
 //! copies of host pages rt imports no other way ([`copied`]), on Unix the buffers whose memory
 //! another API imports (`export`), heaps but sparse ones ([`heap`]),
-//! textures made of a descriptor, with their views ([`texture`]),
+//! textures made of a descriptor, with their views ([`texture`]), tiled textures, which take a
+//! buffer's bytes at their first use ([`tiled`]),
 //! command buffers ([`command`]) with their blit, compute and render encoders ([`blit`],
 //! [`compute`], [`mod@render`]), render pass descriptors ([`descriptor`]), sampler and
 //! depth-stencil states ([`state`]), libraries and their functions ([`library`]), compute
@@ -57,6 +58,7 @@ pub mod state;
 pub mod surface;
 pub mod swapchain;
 pub mod texture;
+pub mod tiled;
 pub mod unbuilt;
 pub mod unmade;
 

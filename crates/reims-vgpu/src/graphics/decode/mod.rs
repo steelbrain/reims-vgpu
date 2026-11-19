@@ -12953,7 +12953,20 @@ lacks {part}"
     /// first level reads the texels the CPU wrote into the buffer's rows after it was made
     #[test]
     fn on_vulkan_a_tiled_texture_s_first_level_reads_the_buffer_s_rows() {
-        let r = tiled_texture_levels::<reims_vgpu_vulkan::VulkanPlatform>();
+        tiled_first_level_reads_the_rows::<reims_vgpu_vulkan::VulkanPlatform>();
+    }
+
+    /// [`on_vulkan_a_tiled_texture_s_first_level_reads_the_buffer_s_rows`] on the rt platform
+    #[cfg(feature = "rt")]
+    #[test]
+    fn on_vulkan_rt_s_tiled_texture_s_first_level_reads_the_buffer_s_rows() {
+        tiled_first_level_reads_the_rows::<reims_vgpu_vulkan::RtPlatform>();
+    }
+
+    /// On `P`, a tiled texture of 6 levels over a buffer has 6 levels, and its first level reads
+    /// the texels the CPU wrote into the buffer's rows after it was made.
+    fn tiled_first_level_reads_the_rows<P: crate::platform::ApiPlatform>() {
+        let r = tiled_texture_levels::<P>();
         assert_eq!(r.levels, u64::from(TILED_LEVELS));
         for (i, texel) in r.first.chunks(4).enumerate() {
             let (x, y) = (i as u64 % TILED_SIZE, i as u64 / TILED_SIZE);
@@ -12967,7 +12980,21 @@ lacks {part}"
     /// dgpu-oracle.md, Q11: the texture is a copy of the bytes); nor does a write of its level 3
     #[test]
     fn on_vulkan_a_blit_write_of_a_tiled_texture_s_first_level_stays_in_the_texture() {
-        let r = tiled_texture_levels::<reims_vgpu_vulkan::VulkanPlatform>();
+        tiled_blit_writes_stay_in_the_texture::<reims_vgpu_vulkan::VulkanPlatform>();
+    }
+
+    /// [`on_vulkan_a_blit_write_of_a_tiled_texture_s_first_level_stays_in_the_texture`] on the rt
+    /// platform
+    #[cfg(feature = "rt")]
+    #[test]
+    fn on_vulkan_rt_s_blit_write_of_a_tiled_texture_s_first_level_stays_in_the_texture() {
+        tiled_blit_writes_stay_in_the_texture::<reims_vgpu_vulkan::RtPlatform>();
+    }
+
+    /// On `P`, a blit's write of a tiled texture's first level stays in the texture, which a blit
+    /// reads back, and reaches none of the buffer's bytes; nor does a write of its level 3.
+    fn tiled_blit_writes_stay_in_the_texture<P: crate::platform::ApiPlatform>() {
+        let r = tiled_texture_levels::<P>();
         for (i, texel) in r.first_written.chunks(4).enumerate() {
             assert_eq!(texel, TILED_COLOUR, "texel {i}");
         }
@@ -12980,7 +13007,20 @@ lacks {part}"
     /// mipmaps fills each with its first level's colour, and a blit's write of level 3 reads back
     #[test]
     fn on_vulkan_a_tiled_texture_s_other_levels_hold_what_blits_write() {
-        let r = tiled_texture_levels::<reims_vgpu_vulkan::VulkanPlatform>();
+        tiled_other_levels_hold_what_blits_write::<reims_vgpu_vulkan::VulkanPlatform>();
+    }
+
+    /// [`on_vulkan_a_tiled_texture_s_other_levels_hold_what_blits_write`] on the rt platform
+    #[cfg(feature = "rt")]
+    #[test]
+    fn on_vulkan_rt_s_tiled_texture_s_other_levels_hold_what_blits_write() {
+        tiled_other_levels_hold_what_blits_write::<reims_vgpu_vulkan::RtPlatform>();
+    }
+
+    /// On `P`, a tiled texture's levels 1 and up are its own: generating its mipmaps fills each
+    /// with its first level's colour, and a blit's write of level 3 reads back.
+    fn tiled_other_levels_hold_what_blits_write<P: crate::platform::ApiPlatform>() {
+        let r = tiled_texture_levels::<P>();
         for (k, level) in r.generated.iter().enumerate() {
             let side = (TILED_SIZE >> (k + 1)).max(1) as usize;
             assert_eq!(level.len(), side * side * 4);
@@ -13141,7 +13181,23 @@ lacks {part}"
     /// (docs/graphics-kext/dgpu-oracle.md, Q11)
     #[test]
     fn on_vulkan_a_tiled_texture_takes_the_rows_again_after_did_modify_data() {
-        let r = tiled_modified_levels::<reims_vgpu_vulkan::VulkanPlatform>();
+        tiled_takes_the_rows_again_after_did_modify_data::<reims_vgpu_vulkan::VulkanPlatform>();
+    }
+
+    /// [`on_vulkan_a_tiled_texture_takes_the_rows_again_after_did_modify_data`] on the rt
+    /// platform, whose take is at the commit of the first command buffer that uses the texture
+    #[cfg(feature = "rt")]
+    #[test]
+    fn on_vulkan_rt_s_tiled_texture_takes_the_rows_again_after_did_modify_data() {
+        tiled_takes_the_rows_again_after_did_modify_data::<reims_vgpu_vulkan::RtPlatform>();
+    }
+
+    /// On `P`, a tiled texture of more than one level is a copy of the buffer's rows taken at its
+    /// first use, every level made from them, which a later CPU write reaches not; a
+    /// `TEXTURE_DID_MODIFY_DATA` makes it take the rows again at its next use, the CPU's writes
+    /// after the message among them.
+    fn tiled_takes_the_rows_again_after_did_modify_data<P: crate::platform::ApiPlatform>() {
+        let r = tiled_modified_levels::<P>();
         let rows = |seed: u8| -> Vec<u8> {
             (0..TILED_SIZE * TILED_SIZE)
                 .flat_map(|i| tiled_texel(i % TILED_SIZE, i / TILED_SIZE, seed))

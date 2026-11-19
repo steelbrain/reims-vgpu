@@ -219,7 +219,7 @@ impl RtComputeEncoder {
             ComputeCmd::SetTexture { texture, index } => {
                 e.set_texture(texture.map(|t| t.rt()), small(index)?)?;
                 if let Some(texture) = texture {
-                    self.kept.uses().add(texture, Use::Sampled);
+                    self.kept.used(texture, Use::Sampled);
                 }
             }
             ComputeCmd::SetTextures { textures, range } => {
@@ -227,7 +227,7 @@ impl RtComputeEncoder {
                 for (texture, index) in textures.iter().zip(at) {
                     e.set_texture(texture.map(|t| t.rt()), index)?;
                     if let Some(texture) = texture {
-                        self.kept.uses().add(texture, Use::Sampled);
+                        self.kept.used(texture, Use::Sampled);
                     }
                 }
             }
@@ -263,7 +263,10 @@ impl RtComputeEncoder {
                 for resource in resources.iter().flatten() {
                     let resource = match resource {
                         ResourceRef::Buffer(b) => rt::Resource::Buffer(b.rt()),
-                        ResourceRef::Texture(t) => rt::Resource::Texture(t.rt()),
+                        ResourceRef::Texture(t) => {
+                            self.kept.takes().used(t);
+                            rt::Resource::Texture(t.rt())
+                        }
                         ResourceRef::Icb(icb) => icb.unreachable(),
                     };
                     e.use_resource(resource, usage)?;

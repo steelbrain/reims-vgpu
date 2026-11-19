@@ -14,7 +14,8 @@
 //!   made.
 //! - **Nothing to record**: `useResources:` and `useHeaps:` in each form (rt's pass orders every
 //!   earlier command before it and itself before every later one, and every resource is
-//!   resident); the store action options (rt renders one sample, and the one option is custom
+//!   resident), but that a tiled texture `useResources:` names is a use of it (`super::tiled`); the
+//!   store action options (rt renders one sample, and the one option is custom
 //!   sample positions); `setTessellationFactorScale:` (rt refuses a state that reads the scale);
 //!   the object, mesh and tile functions' buffers, textures, samplers and threadgroup memory, and
 //!   the tile threadgroup memory length (rt makes no state with such functions); and, each at
@@ -42,6 +43,7 @@ use metal2vulkan::metal::{
 };
 use metal2vulkan_rt as rt;
 
+use crate::core::platform::blit::ResourceRef;
 use crate::core::platform::render::{RenderCmd, RenderEncoder};
 use crate::core::platform::types::{MtlScissorRect, MtlViewport};
 use crate::core::platform::{Handle, ObjId};
@@ -117,11 +119,11 @@ impl RtRenderEncoder {
     }
 
     /// Notes `texture` bound to slot `slot` of stage `stage` (0 vertex, 1 fragment) for the boot
-    /// diagnostics.
+    /// diagnostics, and as a tiled texture's use (`super::tiled`).
     fn bound(&self, seen: &mut Seen, stage: usize, slot: u32, texture: Option<&RtObj<RtTexture>>) {
         seen.bound.set(stage, slot, texture);
         if let Some(t) = texture {
-            self.kept.uses().add(t, Use::Sampled);
+            self.kept.used(t, Use::Sampled);
         }
     }
 
@@ -280,11 +282,17 @@ impl RtRenderEncoder {
             RenderCmd::SetVertexAmplificationCount { view_mappings } => {
                 unbuilt_unless(view_mappings.len() <= 1)?;
             }
+            RenderCmd::UseResources { resources, .. }
+            | RenderCmd::UseResourcesStages { resources, .. } => {
+                for resource in resources.iter().flatten() {
+                    if let ResourceRef::Texture(texture) = resource {
+                        self.kept.takes().used(texture);
+                    }
+                }
+            }
             RenderCmd::EndEncoding
             | RenderCmd::UseHeaps { .. }
             | RenderCmd::UseHeapsStages { .. }
-            | RenderCmd::UseResources { .. }
-            | RenderCmd::UseResourcesStages { .. }
             | RenderCmd::SetColorStoreActionOptions { .. }
             | RenderCmd::SetDepthStoreActionOptions { .. }
             | RenderCmd::SetStencilStoreActionOptions { .. }

@@ -2,8 +2,9 @@
 //! `newTextureWithDescriptor:` ([`make`]) and by a texture's views, each an optimal image in
 //! device-local memory (or a view of one) that the guest's CPU reaches only through
 //! `replaceRegion:`; and textures over a buffer's bytes, made by the buffers' piece
-//! (`super::buffer`) through [`make_over`], of the buffer's storage mode. Textures in heaps and
-//! over IOSurfaces are their pieces'.
+//! (`super::buffer`) through [`make_over`], of the buffer's storage mode, a tiled one of more
+//! levels among them, an image of the platform's own that takes the bytes at its first use
+//! (`super::tiled`). Textures in heaps and over IOSurfaces are their pieces'.
 //!
 //! **Images for views.** A shape's image of an IOSurface plane (`reims_vgpu`'s
 //! `ApiPlatform::shape_image`) is rt's texture for views (the device's `new_texture_for_views`):
@@ -51,8 +52,8 @@
 
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use metal2vulkan_rt as rt;
 
@@ -69,6 +70,7 @@ use crate::core::sync::Mutex;
 use super::descriptor::rt_texture_descriptor;
 use super::device::RtDevice;
 use super::diag::{Call, Made, Shape};
+use super::tiled::{self, Tiled};
 use super::unbuilt::{
     RtRefusal, Unbuilt, refuse_create, refused_as, rt_refused, rt_refused_texture_create,
 };
@@ -139,6 +141,9 @@ pub struct RtTexture {
     purgeable: AtomicU64,
     /// What it is, for the boot diagnostics (`super::diag`).
     made: Arc<Made>,
+    /// What a tiled texture takes its bytes from, and a view's of one (`super::tiled`); unset
+    /// for any other.
+    tiled: OnceLock<Arc<Tiled>>,
 }
 
 impl Drop for RtTexture {
@@ -158,6 +163,18 @@ impl RtTexture {
     /// What it is, for the boot diagnostics (`super::diag`).
     pub(super) fn made(&self) -> &Arc<Made> {
         &self.made
+    }
+
+    /// What it takes its bytes from, where it is a tiled texture or a view of one
+    /// (`super::tiled`).
+    pub(super) fn tiled(&self) -> Option<&Arc<Tiled>> {
+        self.tiled.get()
+    }
+
+    /// Makes it a tiled texture, taking its bytes as `tiled` says (`super::tiled`): once, as
+    /// the buffers' piece makes it.
+    pub(super) fn set_tiled(&self, tiled: Arc<Tiled>) {
+        let _ = self.tiled.set(tiled);
     }
 
     /// The host's read-back (`reims_vgpu`'s `ApiPlatform::read_pixels`): the whole of level 0 and
@@ -256,6 +273,7 @@ impl RtTexture {
             own,
             purgeable: purgeable_state(),
             made: Made::view(&self.made, format_raw, first),
+            tiled: self.tiled.clone(),
         })
     }
 }
@@ -344,6 +362,7 @@ fn answered(
         own,
         purgeable: purgeable_state(),
         made: diag(&shape),
+        tiled: OnceLock::new(),
     })
 }
 
@@ -373,6 +392,7 @@ pub(super) fn drawable(device: &RtObj<RtDevice>, texture: rt::Texture) -> RtObj<
         own: None,
         purgeable: purgeable_state(),
         made: Made::new(Call::Drawable, &shape),
+        tiled: OnceLock::new(),
     })
 }
 
@@ -705,10 +725,14 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
         u64::from(self.rt.descriptor().depth)
     }
 
-    /// Nothing: a texture over a buffer reads the buffer's bytes, whose changes a Managed buffer's
-    /// `didModifyRange:` names to rt; this SPI tells of a tiled texture's, which the platform does
-    /// not make ([`Unbuilt::Buffer`]).
-    fn did_modify_data(&self) {}
+    /// A tiled texture's, or a view's of one, next use takes the buffer's bytes again
+    /// (`super::tiled`). Nothing for any other: a texture over a buffer reads the buffer's bytes,
+    /// whose changes a Managed buffer's `didModifyRange:` names to rt.
+    fn did_modify_data(&self) {
+        if let Some(tiled) = self.tiled() {
+            tiled.modified();
+        }
+    }
 
     /// rt's: its index and the translator's word of its format and swizzle.
     fn gpu_resource_id(&self) -> u64 {
@@ -849,7 +873,8 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
     /// rt's, of a copy of the bytes (the module's docs, "A copy"): a range at or near NULL dies, as
     /// Metal's read of it faults (`crate::gpu::resource::first_bytes`). What rt refuses (a Private
     /// texture, a region outside the level or off its format's block grid, rows that do not cover
-    /// it) changes nothing, counted, where Metal's validation aborts.
+    /// it) changes nothing, counted, where Metal's validation aborts. Of a tiled texture's level 0
+    /// the bytes go into its image, counted (`super::tiled`).
     fn replace_region(
         &self,
         region: MtlRegion,
@@ -868,6 +893,9 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
             refused_as(REPLACE, RtRefusal::Refused, &why);
             return Ok(());
         };
+        if level == 0 && self.tiled().is_some() {
+            tiled::replaced_first_level(REPLACE);
+        }
         let bytes = crate::gpu::resource::first_bytes(REPLACE, pixel_bytes, usize::MAX);
         counted_copy(bytes.len());
         if let Err(error) = (self.rt).replace_region(

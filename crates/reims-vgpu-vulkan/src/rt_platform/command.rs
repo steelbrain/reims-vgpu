@@ -25,6 +25,8 @@
 //!   merges the GPU's writes back into their pages, before core's completion-seen handlers.
 //! - **What it keeps**: the pipeline states its encoders set ([`Kept`]), from their set until it
 //!   completes, released after its completed handlers ran.
+//! - **Tiled textures** (`super::tiled`): its encoders note each tiled texture they use whose
+//!   bytes are to take, and its commit takes them first, in a command buffer committed ahead of it.
 //! - **A signal as it is scheduled** (`encodeSignalEventScheduled:value:`) sets the shared
 //!   event's value in the scheduled handler, as Metal signals it once the command buffer is
 //!   scheduled, in its order among the scheduled handlers.
@@ -69,7 +71,8 @@ use super::compute::RtComputeEncoder;
 use super::device::RtDevice;
 use super::diag::{Use, Uses};
 use super::render::RtRenderEncoder;
-use super::texture::refused_metal;
+use super::texture::{RtTexture, refused_metal};
+use super::tiled::Takes;
 use super::unbuilt::{RtRefusal, Unbuilt, refuse, refused_as, rt_refused, rt_refused_create};
 use super::{RtObj, RtPlatform};
 
@@ -240,14 +243,28 @@ impl RtCommandBuffer {
 /// while rt keeps its own state. The commit hands them to a completed handler, which drops them
 /// after core's; a command buffer never committed drops them with itself.
 /// It holds too its uses of textures over an imported block, for the boot diagnostics
-/// (`super::diag`), which its commit counts.
+/// (`super::diag`), which its commit counts, and the tiled textures it used whose bytes its commit
+/// takes (`super::tiled`).
 #[derive(Clone, Default)]
-pub struct Kept(Arc<Mutex<HashMap<ObjId, Box<dyn Send>>>>, Uses);
+pub struct Kept(Arc<Mutex<HashMap<ObjId, Box<dyn Send>>>>, Uses, Takes);
 
 impl Kept {
     /// Its uses of textures over an imported block (`super::diag`).
     pub fn uses(&self) -> &Uses {
         &self.1
+    }
+
+    /// The tiled textures it used whose bytes are to take (`super::tiled`).
+    pub fn takes(&self) -> &Takes {
+        &self.2
+    }
+
+    /// An encoder of it used `texture` as `how` says: a use for the boot diagnostics
+    /// ([`Uses::add`]), and of a tiled texture whose bytes are to take, a take at its commit
+    /// ([`Takes::used`]).
+    pub fn used(&self, texture: &RtObj<RtTexture>, how: Use) {
+        self.1.add(texture, how);
+        self.2.used(texture);
     }
 
     /// Keeps `object`, whose identity is `id`, unless an object of that identity is kept.
@@ -420,8 +437,8 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         let _ = on;
         Ok(match self.rt.blit_command_encoder() {
             Ok(encoder) => {
-                let uses = self.kept.uses().clone();
-                Some(RtObj::new(RtBlitEncoder::new(encoder, self.opened(), uses)))
+                let kept = self.kept.clone();
+                Some(RtObj::new(RtBlitEncoder::new(encoder, self.opened(), kept)))
             }
             Err(error) => {
                 rt_refused_create("blitCommandEncoder", &error);
@@ -431,9 +448,9 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     }
 
     /// Hands rt the held handlers (the module's docs), then commits, the copies of host pages
-    /// copied in first and merged back first of the completed handlers (`super::copied`). A
-    /// second commit is Metal's refusal, counted; a commit rt refuses is counted, and its handlers
-    /// never run.
+    /// copied in first and merged back first of the completed handlers (`super::copied`), then the
+    /// bytes of the tiled textures it used taken (`super::tiled`). A second commit is Metal's
+    /// refusal, counted; a commit rt refuses is counted, and its handlers never run.
     fn commit(&self, on: OnFault) -> RaiseResult<()> {
         let _ = on;
         let sel = "commit";
@@ -474,6 +491,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 self.rt.add_completed_handler(run(seen))?;
             }
             super::copied::copy_in();
+            self.kept.takes().take(&self.device);
             self.rt.commit()
         };
         if let Err(error) = committed() {
@@ -568,6 +586,9 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 let targets = render_pass_descriptor.targets();
                 for target in &targets {
                     kept.uses().add_made(&target.made, Use::Rendered);
+                }
+                for tiled in render_pass_descriptor.tiled() {
+                    kept.takes().used_tiled(&tiled);
                 }
                 Some(RtObj::new(RtRenderEncoder::new(
                     encoder, mark, kept, targets,

@@ -38,9 +38,7 @@ pub const RT_DOMAIN: &str = "metal2vulkan-rt";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Unbuilt {
     /// What of buffers is not built yet (`super::buffer`): a Private buffer of bytes
-    /// (`newBufferWithDescriptor:` with contents), which a copy on the GPU fills, and a tiled
-    /// texture over a buffer (`newTiledTextureWithDescriptor:offset:bytesPerRow:`), a copy of its
-    /// bytes. Each answers nil.
+    /// (`newBufferWithDescriptor:` with contents), which a copy on the GPU fills. It answers nil.
     Buffer,
     /// A texture over a plane of an IOSurface (`newTextureWithDescriptor:iosurface:plane:`) of a
     /// format that reads beside its plane (a two-plane YCbCr or XR10 format over a surface of two
@@ -152,7 +150,7 @@ impl Unbuilt {
     /// What the piece is, for the first refusal's line.
     pub const fn what(self) -> &'static str {
         match self {
-            Unbuilt::Buffer => "a Private buffer of bytes, or a tiled texture over a buffer",
+            Unbuilt::Buffer => "a Private buffer of bytes",
             Unbuilt::IosurfaceTexture => "a texture over an IOSurface's plane",
             Unbuilt::SharedTexture => "a shared texture",
             Unbuilt::Heap => "a sparse heap",
@@ -717,9 +715,8 @@ mod tests {
     fn the_first_refusal_s_line_names_the_call_and_the_code() {
         assert_eq!(
             refusal_line(Unbuilt::Buffer, "newBufferWithDescriptor:"),
-            "reims-vgpu: newBufferWithDescriptor:: a Private buffer of bytes, or a tiled texture \
-             over a buffer is not built on metal2vulkan-rt; refused (rt-unbuilt-buffer), the first \
-             of its kind\n"
+            "reims-vgpu: newBufferWithDescriptor:: a Private buffer of bytes is not built on \
+             metal2vulkan-rt; refused (rt-unbuilt-buffer), the first of its kind\n"
         );
     }
 }

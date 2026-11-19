@@ -44,6 +44,7 @@ use crate::core::sync::{Mutex, MutexGuard};
 use metal2vulkan_rt as rt;
 
 use super::diag::{Point, Target};
+use super::tiled::Tiled;
 use super::unbuilt::{Unbuilt, refuse};
 use super::{RtBuffer, RtObj, RtPlatform, RtTexture};
 
@@ -384,6 +385,13 @@ impl PassFields {
         (colors.chain(one(Point::Depth, &pass.depth)))
             .chain(one(Point::Stencil, &pass.stencil))
             .collect()
+    }
+
+    /// The tiled textures the pass's attachments render, each attachment's (`super::tiled`).
+    pub fn tiled(&self) -> Vec<std::sync::Arc<Tiled>> {
+        let pass = self.lock();
+        let attachments = (pass.colors.iter()).chain([&pass.depth, &pass.stencil]);
+        (attachments.filter_map(|a| a.texture.as_ref()?.tiled().cloned())).collect()
     }
 }
 

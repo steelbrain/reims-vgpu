@@ -32,8 +32,8 @@ use crate::core::platform::types::{MtlOrigin, MtlSize, NsRange};
 use crate::core::raise::{OnFault, RaiseResult};
 use crate::core::sync::Mutex;
 
-use super::command::OpenMark;
-use super::diag::{Use, Uses};
+use super::command::{Kept, OpenMark};
+use super::diag::Use;
 use super::unbuilt::{RtRefusal, Unbuilt, refuse, refused_as, rt_refused_texture};
 use super::{RtObj, RtPlatform};
 
@@ -43,22 +43,25 @@ pub struct RtBlitEncoder {
     rt: Mutex<Option<rt::BlitCommandEncoder>>,
     /// Its command buffer's mark of it open, until it ends.
     open: OpenMark,
-    /// Its command buffer's uses of textures, for the boot diagnostics (`super::diag`).
-    uses: Uses,
+    /// What its command buffer keeps: its uses of textures, for the boot diagnostics
+    /// (`super::diag`) and its tiled textures' takes (`super::tiled`).
+    kept: Kept,
 }
 
 impl RtBlitEncoder {
-    /// The encoder over rt's `encoder`, open as `open` marks it, its uses of textures noted in
-    /// `uses` (`super::diag`).
-    pub fn new(encoder: rt::BlitCommandEncoder, open: OpenMark, uses: Uses) -> RtBlitEncoder {
+    /// The encoder over rt's `encoder`, open as `open` marks it, its uses of textures noted in its
+    /// command buffer's `kept`.
+    pub fn new(encoder: rt::BlitCommandEncoder, open: OpenMark, kept: Kept) -> RtBlitEncoder {
         RtBlitEncoder {
             rt: Mutex::new(Some(encoder)),
             open,
-            uses,
+            kept,
         }
     }
 
-    /// Notes `cmd`'s copies' textures in its command buffer's uses (`super::diag`).
+    /// Notes `cmd`'s textures in its command buffer's `kept`: its copies' as uses
+    /// ([`Kept::used`]), and a mipmap generation's and a synchronize's as tiled textures' uses
+    /// alone (`super::tiled`).
     fn note_uses(&self, cmd: &BlitCmd<'_, RtPlatform>) {
         let (from, into) = match *cmd {
             BlitCmd::CopyBufferToTexture {
@@ -86,13 +89,23 @@ impl RtBlitEncoder {
                 destination_texture,
                 ..
             } => (Some(source_texture), Some(destination_texture)),
+            BlitCmd::GenerateMipmaps {
+                texture: Some(texture),
+            }
+            | BlitCmd::SynchronizeResource {
+                resource: Some(ResourceRef::Texture(texture)),
+            }
+            | BlitCmd::SynchronizeTexture { texture, .. } => {
+                self.kept.takes().used(texture);
+                (None, None)
+            }
             _ => (None, None),
         };
         if let Some(texture) = from {
-            self.uses.add(texture, Use::Blitted);
+            self.kept.used(texture, Use::Blitted);
         }
         if let Some(texture) = into {
-            self.uses.add(texture, Use::BlittedInto);
+            self.kept.used(texture, Use::BlittedInto);
         }
     }
 }
