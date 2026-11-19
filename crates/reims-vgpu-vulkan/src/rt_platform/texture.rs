@@ -242,6 +242,7 @@ impl RtTexture {
             Some(channels) => (self.rt)
                 .new_texture_view_with_swizzle(format, view_type, levels, slices, channels, index),
         };
+        super::diag::plane_view(&self.made, format_raw, made.is_ok());
         let usage = match swizzle {
             Some(s) if s != DEFAULT_SWIZZLE => self.usage & SWIZZLED_VIEW_KEEPS,
             _ => self.usage,
@@ -1160,5 +1161,55 @@ mod tests {
         let refused = alone.new_swizzled_texture_subview(70, 2, level, level, swizzle);
         assert!(refused.expect("never a raise").is_none());
         assert_eq!(counted(RtRefusal::Refused.code()), metal + 3);
+    }
+
+    /// On the GPU the test holds: a view of a guest surface texture, and a view of that view, is
+    /// counted by its pixel format, and a view of a texture no surface's is not; the surface
+    /// texture, declared with `PixelFormatView` usage, is counted for it.
+    #[test]
+    fn plane_views_count_on_vulkan() {
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::raise::OnFault;
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let counted = |code: &str| {
+            (crate::answer::degradation_counts().into_iter())
+                .find(|(c, _)| c == code)
+                .map_or(0, |(_, n)| n)
+        };
+        let make = |pixel_format| {
+            let desc = TextureDesc {
+                pixel_format,
+                width: 4,
+                height: 4,
+                usage: 0x11,
+                ..TextureDesc::default()
+            };
+            let made = device.new_texture(OnFault::Return, &platform.texture_descriptor(&desc));
+            made.expect("never a raise").expect("a texture")
+        };
+        let view = |of: &RtObj<RtTexture>, pixel_format| {
+            let made = of.new_texture_view(pixel_format).expect("never a raise");
+            made.expect("a view")
+        };
+        let (srgb, plain_srgb) = ("rt-plane-views-format-81", "rt-plane-views-format-71");
+        let pfv = super::super::diag::PLANE_PIXEL_FORMAT_VIEW_CODE;
+        let before = (counted(srgb), counted("rt-plane-views-format-80"));
+        let (pfv_before, plain_before) = (counted(pfv), counted(plain_srgb));
+
+        let surface = make(80);
+        let form = "over-buffer: no cache";
+        super::super::diag::surface_texture(Some(&surface), 7, (0x5d5d_0000, 0), (0x11, 64), form);
+        assert_eq!(counted(pfv), pfv_before + 1);
+        let of_surface = view(&surface, 81);
+        let _of_view = view(&of_surface, 80);
+        assert_eq!(
+            (counted(srgb), counted("rt-plane-views-format-80")),
+            (before.0 + 1, before.1 + 1)
+        );
+
+        let plain = make(70);
+        let _of_plain = view(&plain, 71);
+        assert_eq!(counted(plain_srgb), plain_before);
     }
 }

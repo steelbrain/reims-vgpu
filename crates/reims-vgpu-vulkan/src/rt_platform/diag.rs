@@ -57,7 +57,11 @@
 //! bytes in place, and its bytes ([`SURFACE_PLANE_COPIES_CODE`]). A texture over a device
 //! cache's buffer, in a block of rt's own, is not counted: rt copies one only where its rows or
 //! place are off the device's linear lines, which the cache lays its planes on
-//! (`crate::gpu::resource`).
+//! (`crate::gpu::resource`). Two more are degradation codes too, so a boot shows whether a view
+//! of a plane's texture ever asks a format the plane's image may not hold: each view made of a
+//! guest surface texture, or of a view of one, by the view's pixel format, and each one rt
+//! refused, by its format ([`plane_view`]); and each guest surface texture made whose declared
+//! usage has `PixelFormatView` (0x10) ([`PLANE_PIXEL_FORMAT_VIEW_CODE`]).
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -135,6 +139,8 @@ pub struct Made {
     over: Option<Over>,
     /// A guest surface texture's plane ([`surface_texture`]).
     on_plane: OnceLock<OnPlane>,
+    /// It is a view of a guest surface texture, or of a view of one ([`plane_view`]).
+    of_plane: AtomicBool,
 }
 
 /// The texture of a descriptor, before it is made: what [`Made`] takes of it.
@@ -179,7 +185,7 @@ impl Made {
             storage: of.storage,
             usage: of.usage,
         };
-        Made::of(
+        let made = Made::of(
             id,
             of.image,
             Call::View,
@@ -187,7 +193,16 @@ impl Made {
             &shape,
             (level, slice),
             None,
-        )
+        );
+        if of.of_a_plane() {
+            made.of_plane.store(true, Relaxed);
+        }
+        made
+    }
+
+    /// Whether it is a guest surface texture, or a view of one ([`plane_view`]).
+    fn of_a_plane(&self) -> bool {
+        self.on_plane.get().is_some() || self.of_plane.load(Relaxed)
     }
 
     /// A texture of `shape` over `buffer`'s bytes from `offset`, rows `bytes_per_row` apart:
@@ -228,6 +243,7 @@ impl Made {
             slice,
             over,
             on_plane: OnceLock::new(),
+            of_plane: AtomicBool::new(false),
         })
     }
 
@@ -384,7 +400,48 @@ pub fn surface_texture<T: 'static>(
         .or_insert(0) += 1;
     if let Some(Token(made)) = texture.and_then(token) {
         on_plane(&made, plane, usage, bytes);
+        if usage & PIXEL_FORMAT_VIEW != 0 {
+            crate::answer::count_kind(PLANE_PIXEL_FORMAT_VIEW_CODE);
+        }
     }
+}
+
+/// `MTLTextureUsagePixelFormatView`.
+const PIXEL_FORMAT_VIEW: u64 = 0x10;
+
+/// The code of the guest surface textures made whose declared usage has `PixelFormatView`.
+pub const PLANE_PIXEL_FORMAT_VIEW_CODE: &str = "rt-plane-textures-pixel-format-view";
+
+/// The family of the codes of the views made of a guest surface texture, or of a view of one,
+/// by the view's pixel format: `rt-plane-views-format-<raw>`.
+pub const PLANE_VIEWS_CODE: &str = "rt-plane-views-format";
+
+/// As [`PLANE_VIEWS_CODE`], of the views rt refused: `rt-plane-views-refused-format-<raw>`.
+pub const PLANE_VIEWS_REFUSED_CODE: &str = "rt-plane-views-refused-format";
+
+/// A view in pixel format `format` of `of` was made (`made`), or rt refused it: counted by the
+/// format where `of` is a guest surface texture or a view of one ([`PLANE_VIEWS_CODE`],
+/// [`PLANE_VIEWS_REFUSED_CODE`]).
+pub fn plane_view(of: &Made, format: u32, made: bool) {
+    if !of.of_a_plane() {
+        return;
+    }
+    let family = if made {
+        PLANE_VIEWS_CODE
+    } else {
+        PLANE_VIEWS_REFUSED_CODE
+    };
+    crate::answer::count_kind(format_code(family, format));
+}
+
+/// The code `<family>-<format>`, made once a pair and kept for the process (the counts keep
+/// codes as `&'static str`).
+fn format_code(family: &'static str, format: u32) -> &'static str {
+    static CODES: Mutex<BTreeMap<(&'static str, u32), &'static str>> = Mutex::new(BTreeMap::new());
+    let mut codes = CODES.lock();
+    *codes
+        .entry((family, format))
+        .or_insert_with(|| Box::leak(format!("{family}-{format}").into_boxed_str()))
 }
 
 /// Notes `made`'s plane `plane`, of declared `usage` and `bytes`, once.
@@ -1215,6 +1272,44 @@ mod tests {
         drop(pairs);
         let unplaned = Made::new(Call::Plain, &shape(80, 0x5));
         assert_eq!(plane_storage(&unplaned), "no-surface-plane");
+    }
+
+    /// A view of a guest surface texture, or of a view of one, is counted by its format, made or
+    /// refused; a view of any other texture is not. A surface texture made with `PixelFormatView`
+    /// usage is counted; one without, or refused, is not.
+    #[test]
+    fn plane_views_count_by_format() {
+        let counted = |code: &str| {
+            (crate::answer::degradation_counts().into_iter())
+                .find(|(c, _)| c == code)
+                .map_or(0, |(_, n)| n)
+        };
+        let shape = Shape {
+            format: 80,
+            width: 4,
+            height: 4,
+            storage: 2,
+            usage: 0x11,
+        };
+        let plane = Made::new(Call::View, &shape);
+        on_plane(&plane, (0x5b5b_0000, 0), 0x11, 64);
+        let view = Made::view(&plane, 81, (0, 0));
+        let plain = Made::new(Call::Plain, &shape);
+        let (made, refused) = ("rt-plane-views-format-81", "rt-plane-views-refused-format-71");
+        let before = (counted(made), counted(refused));
+        plane_view(&plane, 81, true);
+        plane_view(&view, 71, false);
+        plane_view(&plain, 81, true);
+        plane_view(&Made::view(&plain, 71, (0, 0)), 71, false);
+        assert_eq!(
+            (counted(made), counted(refused)),
+            (before.0 + 1, before.1 + 1)
+        );
+        assert_eq!(format_code(PLANE_VIEWS_CODE, 81), made);
+
+        let before = counted(PLANE_PIXEL_FORMAT_VIEW_CODE);
+        surface_texture::<()>(None, 7, (0x5c5c_0000, 0), (0x11, 64), "over-buffer: no cache");
+        assert_eq!(counted(PLANE_PIXEL_FORMAT_VIEW_CODE), before);
     }
 
     /// A gap is counted by its kind, a draw's by its draw kind; another error is not.
