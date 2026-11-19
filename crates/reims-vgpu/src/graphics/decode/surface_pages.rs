@@ -4556,7 +4556,11 @@ pub(super) mod tests {
         let at = r.dec.pages_address(&r.device, BLOCK);
         assert!((IMPORT_BASE..IMPORT_END).contains(&at), "{at:#x}");
         assert_eq!(at % 0x8000, 0, "on a granule");
-        assert_eq!(r.dec.pages_address(&r.device, BLOCK), at, "the same at each ask");
+        assert_eq!(
+            r.dec.pages_address(&r.device, BLOCK),
+            at,
+            "the same at each ask"
+        );
         assert_eq!(r.dec.pages_address(&r.device, read_only), 0);
         assert_eq!(r.dec.pages_address(&r.device, BLOCK + 0x1_0000), 0);
         assert_eq!(r.dec.views_of_surfaces().view_addresses_held(), 1);
@@ -4656,10 +4660,18 @@ pub(super) mod tests {
         let at = r.dec.pages_address(&r.device, BLOCK);
         assert_eq!(at, IMPORTS, "the import's address");
         assert!(r.has_private_view(BLOCK), "made at the answer");
-        assert_eq!(r.dec.pages_address(&r.device, BLOCK), at, "the same at each ask");
+        assert_eq!(
+            r.dec.pages_address(&r.device, BLOCK),
+            at,
+            "the same at each ask"
+        );
         assert_eq!(r.dec.pages_address(&r.device, read_only), 0);
         assert!(!r.has_private_view(read_only));
-        assert_eq!(r.dec.views_of_surfaces().view_addresses_held(), 0, "no pick");
+        assert_eq!(
+            r.dec.views_of_surfaces().view_addresses_held(),
+            0,
+            "no pick"
+        );
 
         // The app's bytes, 0x123 into page 5, the first of the block's: every buffer at the
         // view's address is pinned there, over the same pages.

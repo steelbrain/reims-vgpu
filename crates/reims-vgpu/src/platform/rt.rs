@@ -3,8 +3,8 @@
 //! typed refusal there. A graphics device's start makes the process's rt device and answers the
 //! guest's device info from it; the guest's work is refused at each unbuilt piece it reaches.
 
-use reims_vgpu_vulkan::{RtPlatform, rt_platform};
 use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::{RtPlatform, rt_platform};
 
 use super::*;
 
