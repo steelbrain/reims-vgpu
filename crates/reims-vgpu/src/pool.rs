@@ -43,12 +43,14 @@
 //! [`BlockSource`] is metal2vulkan-rt's block calls as its API names them (`Device::take_block`,
 //! `release_block`, [`BlockInfo`]). Until the device runs on that runtime, the source is
 //! [`HostBlocks`], blocks of the process's own memory, which hands blocks out, keeps them ready
-//! and frees them as the runtime does.
+//! and frees them as the runtime does. The source over the runtime's blocks is `rt_blocks`'s,
+//! which only its tests make until then.
 
 // Guest addresses flow through here: arithmetic is spelt out.
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 mod host_blocks;
+mod rt_blocks;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ptr::NonNull;

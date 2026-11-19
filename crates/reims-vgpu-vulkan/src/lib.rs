@@ -20,6 +20,8 @@
 //! - **A display window's swapchain** (`swapchain`), on the runtime's own device: the window's
 //!   render thread presents the display's frames through it, with no copy, on Linux, Windows
 //!   and macOS.
+//! - **metal2vulkan-rt's seam** ([`seam`]): our side of the runtime that replaces
+//!   metal2vulkan-runtime at the cutover, which no path of the library's reaches before it.
 
 // The proof that the runtime's types are `Send` and `Sync` nests deeper than rustc's default
 // limit of 128 (E0275): in the library itself, where a `Debug` derive asks it of an encoder's
@@ -43,6 +45,7 @@ pub mod platform;
 pub mod recorder;
 pub(crate) mod records;
 pub mod remap;
+pub mod seam;
 pub mod swapchain;
 pub(crate) mod work_log;
 

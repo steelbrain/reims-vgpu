@@ -42,6 +42,9 @@ parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
 # and over MoltenVK on macOS.
 reims-vgpu-vulkan.workspace = true
 metal2vulkan-runtime.workspace = true
+# The runtime that replaces metal2vulkan-runtime at the cutover: the pool's block source over it
+# (`pool::rt_blocks`), which only tests reach until then.
+metal2vulkan-rt.workspace = true
 
 # On Windows, a file's ID and times, which name the library's build (`graphics/answers/windows.rs`),
 # and the lines a fault writes (`faults.rs`): its exception handler, the loader's and the unwind's

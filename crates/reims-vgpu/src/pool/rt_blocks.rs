@@ -1,0 +1,145 @@
+//! [`RtBlocks`], the pool's [`BlockSource`] over metal2vulkan-rt's blocks (`Device::take_block`
+//! and `release_block`), the runtime the device runs on from the cutover. No path of the
+//! library's makes one before then; its tests run it on the GPU each test host holds.
+//!
+//! rt hands out a `Block` handle and takes a block back by its handle, and the pool names a block
+//! by its number ([`BlockId`]). The source keeps each handle it hands out by its number, the
+//! block's only handle (the pool holds plain data, [`BlockInfo`]), and a release takes the handle
+//! out of the map and gives it to rt, which keeps the block for a later take of its length, with
+//! its number, address and mapping, or frees it.
+//!
+//! A block's bytes are what rt makes them: undefined past its zero mark (rt's
+//! `BlockInfo::zeroed`), which the pool's [`BlockInfo`] does not carry, and nothing here zeroes
+//! them. Before rt frees a block it calls the `BlockMappings` hook its device was made with
+//! (`DeviceOptions::block_mappings`), not the pool's.
+
+use std::collections::HashMap;
+
+use metal2vulkan_rt as rt;
+use parking_lot::Mutex;
+
+use super::{BlockError, BlockId, BlockInfo, BlockSource, MemoryClass};
+
+/// The pool's blocks from an rt device, with the handle of each one handed out.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the pool's source over rt, which no device runs on yet")
+)]
+pub(crate) struct RtBlocks {
+    device: rt::Device,
+    /// The handle of each block handed out, by its number.
+    held: Mutex<HashMap<BlockId, rt::Block>>,
+}
+
+impl RtBlocks {
+    /// A source of `device`'s blocks, with none handed out.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the pool's source over rt, which no device runs on yet")
+    )]
+    pub(crate) fn new(device: rt::Device) -> RtBlocks {
+        RtBlocks {
+            device,
+            held: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl BlockSource for RtBlocks {
+    /// rt's block of `class` at least `len` long. Err: [`BlockError::Length`] past the device's
+    /// largest block (rt's `Limit::BlockLen`); [`BlockError::OutOfMemory`] for rt's every other
+    /// answer: its other limits, a device out of memory or lost, or one quiesced.
+    fn take_block(&self, class: MemoryClass, len: u64) -> Result<BlockInfo, BlockError> {
+        let rt_class = match class {
+            MemoryClass::Private => rt::MemoryClass::Private,
+            MemoryClass::Shared => rt::MemoryClass::Shared,
+        };
+        let block = (self.device.take_block(rt_class, len)).map_err(|error| match error {
+            rt::Error::Limit(rt::Limit::BlockLen { .. }) => BlockError::Length,
+            _ => BlockError::OutOfMemory,
+        })?;
+        let info = BlockInfo {
+            id: BlockId(block.id.get()),
+            class,
+            len: block.len,
+            gpu_address: block.gpu_address,
+            contents: block.contents,
+        };
+        self.held.lock().insert(info.id, block);
+        Ok(info)
+    }
+
+    /// Gives `block`'s handle back to rt, out of the map. Err: [`BlockError::NotHeld`] for a
+    /// number the source did not hand out, or gave back already.
+    fn release_block(&self, block: BlockId) -> Result<(), BlockError> {
+        let handle = self.held.lock().remove(&block);
+        let handle = handle.ok_or(BlockError::NotHeld)?;
+        // The source's own device made it, so rt's one refusal, another device's block, cannot
+        // be; rt drops the handle all the same.
+        (self.device.release_block(handle)).map_err(|_| BlockError::NotHeld)
+    }
+}
+
+impl Drop for RtBlocks {
+    /// Gives every block still handed out back to rt, then the device.
+    fn drop(&mut self) {
+        let held = std::mem::take(self.held.get_mut());
+        for block in held.into_values() {
+            let _ = self.device.release_block(block);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::disallowed_methods,
+        reason = "test scaffolding: real time bounds the wait for rt's block-maker thread"
+    )]
+
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    const MIB: u64 = 1 << 20;
+
+    /// A block is taken from rt and given back by its number alone: the map hands rt its handle,
+    /// which rt then reuses, and a number not handed out, or given back already, is not held.
+    #[test]
+    fn on_vulkan_rt_blocks_give_a_block_back_by_its_number() {
+        let (device, name) = reims_vgpu_vulkan::seam::test_device().unwrap();
+        println!("rt's device: {name}");
+        let blocks = RtBlocks::new(device.clone());
+        let shared = blocks.take_block(MemoryClass::Shared, MIB).unwrap();
+        assert_eq!(shared.class, MemoryClass::Shared);
+        assert!(shared.len >= MIB, "{shared:?}");
+        assert!(shared.contents.is_some(), "{shared:?}");
+        assert_ne!(shared.gpu_address, 0, "{shared:?}");
+        let private = blocks.take_block(MemoryClass::Private, MIB).unwrap();
+        assert_eq!(private.class, MemoryClass::Private);
+        assert!(private.contents.is_none(), "{private:?}");
+        assert_ne!(private.id, shared.id);
+        assert_eq!(
+            blocks.take_block(MemoryClass::Shared, u64::MAX).err(),
+            Some(BlockError::Length)
+        );
+
+        let reused = device.counters().metrics().blocks_reused;
+        assert_eq!(blocks.release_block(shared.id), Ok(()));
+        assert_eq!(blocks.release_block(shared.id), Err(BlockError::NotHeld));
+        assert_eq!(blocks.release_block(BlockId(u32::MAX)), Err(BlockError::NotHeld));
+        assert_eq!(blocks.release_block(private.id), Ok(()));
+        // rt keeps a block given back for a take of its length on its block-maker thread: a take
+        // of it is rt's count of blocks taken again.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let again = blocks.take_block(MemoryClass::Shared, MIB).unwrap();
+            if device.counters().metrics().blocks_reused > reused {
+                break;
+            }
+            assert_eq!(blocks.release_block(again.id), Ok(()));
+            assert!(Instant::now() < deadline, "rt took no block given back again");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}

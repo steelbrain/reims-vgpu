@@ -19,6 +19,9 @@ zerocopy.workspace = true
 lzma-rs = { workspace = true, optional = true }
 metal2vulkan-runtime.workspace = true
 metal2vulkan.workspace = true
+# The runtime that replaces metal2vulkan-runtime at the cutover: our side of its seam (`seam`),
+# which only tests reach until then.
+metal2vulkan-rt.workspace = true
 # The debug lines that time the runtime's compiles (gpu/timing.rs), through core's logger.
 log.workspace = true
 # The call recorder's blob hashes (`recorder::format`), SHA-256 as the replay format names them.

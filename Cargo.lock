@@ -261,6 +261,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "metal2vulkan-rt"
+version = "0.0.0"
+dependencies = [
+ "ash",
+ "libc",
+ "metal2vulkan",
+ "windows-sys",
+]
+
+[[package]]
 name = "metal2vulkan-runtime"
 version = "0.2.0"
 dependencies = [
@@ -444,6 +454,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "log",
+ "metal2vulkan-rt",
  "metal2vulkan-runtime",
  "objc2",
  "objc2-foundation",
@@ -513,6 +524,7 @@ dependencies = [
  "lzma-rs",
  "mach2",
  "metal2vulkan",
+ "metal2vulkan-rt",
  "metal2vulkan-runtime",
  "objc2",
  "objc2-foundation",
