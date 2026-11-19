@@ -2763,7 +2763,9 @@ mod tests {
     /// pages, where the host makes no dma-buf of them (`HOST_MAKES_NO_DMA_BUF`), and again where
     /// rt refuses the one it makes (`DMA_BUF_REFUSED`): where the view lay in a dma-buf's mapping,
     /// made by its pointer once it is mapped from its files, counted as from its files and as why
-    /// no dma-buf went, each once; else by its pointer. Its bytes are the pages the view shows.
+    /// no dma-buf went, each once; else by its pointer. Where rt refuses that pointer too (RADV's,
+    /// of a file's pages), made over a copy, counted as refused and copied. Its bytes are the
+    /// pages the view shows.
     #[cfg(target_os = "linux")]
     #[test]
     fn views_whose_dma_buf_went_nowhere_count_why_on_vulkan() {
@@ -2815,8 +2817,12 @@ mod tests {
             let mut from_files = [1, 0, 1, 0, 0, 0, 0, 0];
             from_files[why] = 1;
             let by_pointer = [1, 0, 0, 0, 0, 0, 0, 0];
-            let want = if through { from_files } else { by_pointer };
-            assert_eq!(delta, want, "the view through a dma-buf {through}");
+            let copied = [0, 0, 0, 0, 0, 0, 1, 1];
+            let taken = if through { from_files } else { by_pointer };
+            assert!(
+                delta == taken || delta == copied,
+                "imports {delta:?}, the view through a dma-buf {through}"
+            );
             assert!(!device.known_blocks().is_dma_buf(buffer.rt().block()));
             assert_eq!((buffer.contents(), buffer.length()), (view, 2 * page));
             assert_eq!(read(view, 16), [0x66; 16]);
@@ -2877,9 +2883,7 @@ mod tests {
             // SAFETY: the pages are the test's own, never freed.
             let bytes = unsafe { HostRange::new(at, length) };
             let made = device.new_buffer_over_host_memory(on, bytes, 0, None);
-            let buffer = made
-                .expect("never a raise")
-                .expect("a buffer over a copy");
+            let buffer = made.expect("never a raise").expect("a buffer over a copy");
             let after = counts();
             let delta: [u64; 6] = std::array::from_fn(|i| after[i] - before[i]);
             assert_eq!(delta, [0, 0, 0, 1, 1, 1], "{length} bytes");
