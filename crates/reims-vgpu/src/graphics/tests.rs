@@ -13950,6 +13950,7 @@ fn the_pool_s_range_is_the_gpu_s_memory_heaps_at_most_the_addresses_given() {
 }
 
 /// A `POOL_TAKE` by context `context` of `length` bytes, as the kext posts it.
+#[cfg(not(windows))]
 fn pool_take(context: u32, length: u64) -> Vec<u8> {
     RgfxPoolTake {
         header: RgfxMsgHeader {
@@ -13966,6 +13967,7 @@ fn pool_take(context: u32, length: u64) -> Vec<u8> {
 }
 
 /// A `POOL_GIVE` by context `context` of its block of `length` bytes at pool offset `offset`.
+#[cfg(not(windows))]
 fn pool_give(context: u32, offset: u64, length: u64) -> Vec<u8> {
     RgfxPoolGive {
         header: RgfxMsgHeader {
@@ -13983,6 +13985,7 @@ fn pool_give(context: u32, offset: u64, length: u64) -> Vec<u8> {
 }
 
 /// A `HEAP_OVER_POOL` of `size_bytes` at pool offset `offset`.
+#[cfg(not(windows))]
 fn heap_over_pool(obj_id: u64, offset: u64, size_bytes: u64) -> Vec<u8> {
     RgfxHeapOverHostMemory {
         header: RgfxMsgHeader {
@@ -14001,6 +14004,7 @@ fn heap_over_pool(obj_id: u64, offset: u64, size_bytes: u64) -> Vec<u8> {
 }
 
 /// A take's `POOL_BLOCK`: its status, offset and length.
+#[cfg(not(windows))]
 fn pool_block(guest: &mut Guest) -> (u32, u64, u64) {
     let bytes = next_event(guest, RGFX_EVT_POOL_BLOCK);
     let block = RgfxPoolBlock::read_from_bytes(&bytes).unwrap();
