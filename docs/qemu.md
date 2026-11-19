@@ -225,6 +225,13 @@ is its transport:
   of a removal run on the library's thread, outside the BQL
   (`whpx_map_ahead`, `whpx_unmap_before_del`), and the listener skips them.
   The teardown takes every piece out before the library's release.
+- The Shared heaps that size the pool's range, measured 11-18 (`vulkaninfo`,
+  the heap of the first memory type with `HOST_VISIBLE`, `HOST_COHERENT`
+  and `HOST_CACHED`): 23.24 GiB on ms01's RTX 3090 and on its Iris Xe, the
+  host heap beside the 3090's 24 GiB of its own; 21.87 GiB on um790's
+  RTX 2080, 14.58 GiB on its RX 7900 XTX, and 5.53 GiB on its 780M, where
+  RADV splits the APU's memory into that host heap and an 11.05 GiB
+  device-local one; 13.61 GiB on gem10's RX 550.
 - Measured 11-17 with the pool's measurement arm (the vCPUs' BQL waits from
   a piece's ask to 20 ms past its add or removal; a 4-thread spinner in the
   guest; macOS 26.7.2). On um790's 780M under KVM, adds of 256 MiB, 256 MiB
