@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use metal2vulkan_rt as rt;
 
-use crate::core::num::ToUsize as _;
+use crate::core::num::{ToU64 as _, ToUsize as _};
 use crate::core::platform::Handle as _;
 use crate::core::platform::Platform;
 use crate::core::platform::host_range::HostRange;
