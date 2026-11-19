@@ -7126,7 +7126,10 @@ fn placed(spans: &[Range<u64>], places: &[Place]) -> Vec<Place> {
             if span.start >= place.bytes.end {
                 break;
             }
-            let (from, to) = (span.start.max(place.bytes.start), span.end.min(place.bytes.end));
+            let (from, to) = (
+                span.start.max(place.bytes.start),
+                span.end.min(place.bytes.end),
+            );
             if from < to {
                 out.push(Place {
                     bytes: from..to,
@@ -7539,13 +7542,19 @@ fn copy<P: Platform>(
                 // them from the cache first.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        host.as_ptr::<u8>().add((place.bytes.start - run).to_usize()),
+                        host.as_ptr::<u8>()
+                            .add((place.bytes.start - run).to_usize()),
                         (pieces[place.piece].contents().as_ptr::<u8>()).add(place.at.to_usize()),
                         bytes.to_usize(),
                     );
                 }
                 let parts = cache.moves([(place.bytes.clone(), place.at)]);
-                between::<P>(&blit, (&cache.device, &pieces[place.piece]), &parts, Way::In)?;
+                between::<P>(
+                    &blit,
+                    (&cache.device, &pieces[place.piece]),
+                    &parts,
+                    Way::In,
+                )?;
                 from += bytes;
             }
             cache.staged = true;
@@ -14307,7 +14316,10 @@ pub(super) mod tests {
             },
             "under a piece: one place, its piece the granule"
         );
-        let packed = pack([0..g, 5 * g..5 * g, 8 * g..8 * g + 100, 10 * g..13 * g + 1], piece);
+        let packed = pack(
+            [0..g, 5 * g..5 * g, 8 * g..8 * g + 100, 10 * g..13 * g + 1],
+            piece,
+        );
         assert_eq!(
             packed.places,
             [
@@ -14318,7 +14330,11 @@ pub(super) mod tests {
             ],
             "the empty range takes no place; the last is split at the first piece's end"
         );
-        assert_eq!(packed.lens, [piece, g], "the last piece its 101 bytes' granule");
+        assert_eq!(
+            packed.lens,
+            [piece, g],
+            "the last piece its 101 bytes' granule"
+        );
         assert_eq!(
             pack([0..2 * piece], piece).lens,
             [piece, piece],
@@ -14356,7 +14372,10 @@ pub(super) mod tests {
                 place(300..310, 1, 50, 2),
             ]
         );
-        assert!(placed(&[100..200], &places).is_empty(), "between the places");
+        assert!(
+            placed(&[100..200], &places).is_empty(),
+            "between the places"
+        );
     }
 
     /// The rig's RAM from page `first`, its `length` bytes written with a pattern of period 251,
@@ -14519,7 +14538,11 @@ pub(super) mod tests {
                 pieces.push(id);
             }
         }
-        assert_eq!(pieces.len(), 3, "the rows lie in the first three pieces: {out:?}");
+        assert_eq!(
+            pieces.len(),
+            3,
+            "the rows lie in the first three pieces: {out:?}"
+        );
         let piece = |id| pieces.iter().position(|&p| p == id).unwrap();
         assert_eq!(
             (out.iter())
