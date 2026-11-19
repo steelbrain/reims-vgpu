@@ -44,6 +44,7 @@ impl CommandQueue<RtPlatform> for RtObj<RtQueue> {
         Ok(match self.rt.command_buffer() {
             Ok(made) => Some(RtObj::new(RtCommandBuffer::new(
                 made,
+                self.rt.clone(),
                 self.device.clone_ref(),
             ))),
             Err(error) => {

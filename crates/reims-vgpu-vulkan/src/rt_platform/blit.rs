@@ -32,6 +32,7 @@ use crate::core::platform::types::{MtlOrigin, MtlSize, NsRange};
 use crate::core::raise::{OnFault, RaiseResult};
 use crate::core::sync::Mutex;
 
+use super::command::OpenMark;
 use super::unbuilt::{RtRefusal, Unbuilt, refuse, refused_as, rt_refused_texture};
 use super::{RtObj, RtPlatform};
 
@@ -39,13 +40,16 @@ use super::{RtObj, RtPlatform};
 pub struct RtBlitEncoder {
     /// rt's encoder, until `endEncoding` ends it.
     rt: Mutex<Option<rt::BlitCommandEncoder>>,
+    /// Its command buffer's mark of it open, until it ends.
+    open: OpenMark,
 }
 
 impl RtBlitEncoder {
-    /// The encoder over rt's `encoder`.
-    pub fn new(encoder: rt::BlitCommandEncoder) -> RtBlitEncoder {
+    /// The encoder over rt's `encoder`, open as `open` marks it.
+    pub fn new(encoder: rt::BlitCommandEncoder, open: OpenMark) -> RtBlitEncoder {
         RtBlitEncoder {
             rt: Mutex::new(Some(encoder)),
+            open,
         }
     }
 }
@@ -368,6 +372,7 @@ impl BlitEncoder<RtPlatform> for RtObj<RtBlitEncoder> {
         };
         if ending && let Some(e) = open.take() {
             e.end_encoding();
+            self.open.end();
         }
         drop(open);
         match stopped {

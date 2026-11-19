@@ -21,15 +21,25 @@
 //! - **A signal as it is scheduled** (`encodeSignalEventScheduled:value:`) sets the shared
 //!   event's value in the scheduled handler, as Metal signals it once the command buffer is
 //!   scheduled, in its order among the scheduled handlers.
-//! - **Parts**: none. `split` keeps the trait's default and `part` answers nil, so each guest
-//!   command buffer is one rt command buffer, committed at the guest's commit; `commit_part`
-//!   answers the command buffer whole ([`PartCut::Whole`]), and `fold` is unreachable, since
-//!   nothing is cut. Neither is counted.
+//! - **Parts.** A part is an ordinary rt command buffer of the same queue, committed on it: `split`
+//!   commits the work so far and answers the next part, `part` makes one uncommitted, and
+//!   `commit_part` commits the command buffer as a part. rt's submit thread groups the queue's
+//!   submissions itself, so `set_completion_joins_next` keeps the trait's default: never marked.
+//!   A command buffer is kept whole ([`KeptWhole`], in its order) while an encoder is open, under
+//!   protection options or once an encoder was made under them, once it signals an event as it
+//!   is scheduled, and once committed. rt builds no indirect command buffer, rate map, residency
+//!   or command predication, so no other reason holds; and it notes no way Metal's GPU fails a
+//!   command buffer from an encoder on, so `commit_part` never answers [`PartCut::Fails`] and
+//!   `fold`, the Vulkan platform's with nothing noted, lets the later part go. The guest buffer's
+//!   status, error, GPU times and handlers are core's, from its parts.
 //! - **Protection options** other than 0 are unbuilt ([`Unbuilt::Protection`]): rt protects no
 //!   work, and the command buffer runs as one without them.
 //!
 //! Every call rt refuses answers as Metal's answers where it fails (nothing encoded, nil, no
 //! wait), counted under the refusal's kind ([`rt_refused`]); never a death.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use metal2vulkan_rt as rt;
 
@@ -69,17 +79,28 @@ type Handler = Box<dyn FnOnce(&rt::CommandBuffer) + Send>;
 pub struct RtCommandBuffer {
     /// rt's command buffer.
     rt: rt::CommandBuffer,
+    /// rt's queue, which makes its parts.
+    queue: rt::CommandQueue,
     /// The device, which `device` answers.
     device: RtObj<RtDevice>,
-    /// The handlers until the commit (the module's docs).
+    /// The handlers until the commit (the module's docs), and what keeps it whole.
     held: Mutex<Held>,
+    /// Its encoders made and not yet ended ([`OpenMark`]).
+    open: Arc<AtomicUsize>,
 }
 
-/// A command buffer's handlers until its commit hands them to rt, each kind in the order added.
+/// A command buffer's handlers until its commit hands them to rt, each kind in the order added,
+/// and what keeps it whole but an open encoder.
 #[derive(Default)]
 struct Held {
     /// Whether the command buffer was committed: a handler added since is refused.
     committed: bool,
+    /// Its protection options (`setProtectionOptions:`).
+    protection: u64,
+    /// Whether an encoder was made under protection options other than 0.
+    protected_encoder: bool,
+    /// Whether it signals an event as it is scheduled.
+    scheduled_signal: bool,
     /// Core's submission handlers.
     submission: Vec<Handler>,
     /// Core's scheduled handlers, and the scheduled signals.
@@ -91,12 +112,18 @@ struct Held {
 }
 
 impl RtCommandBuffer {
-    /// The command buffer over rt's `made`, of `device`.
-    pub fn new(made: rt::CommandBuffer, device: RtObj<RtDevice>) -> RtCommandBuffer {
+    /// The command buffer over rt's `made`, of `queue` and `device`.
+    pub fn new(
+        made: rt::CommandBuffer,
+        queue: rt::CommandQueue,
+        device: RtObj<RtDevice>,
+    ) -> RtCommandBuffer {
         RtCommandBuffer {
             rt: made,
+            queue,
             device,
             held: Mutex::new(Held::default()),
+            open: Arc::default(),
         }
     }
 
@@ -106,15 +133,104 @@ impl RtCommandBuffer {
     }
 
     /// Adds `handler` to the list `list` picks, or refuses it, counted, once the command buffer
-    /// was committed.
-    fn hold(&self, sel: &'static str, list: fn(&mut Held) -> &mut Vec<Handler>, handler: Handler) {
+    /// was committed. Whether it was added.
+    fn hold(
+        &self,
+        sel: &'static str,
+        list: fn(&mut Held) -> &mut Vec<Handler>,
+        handler: Handler,
+    ) -> bool {
         let mut held = self.held.lock();
         if held.committed {
             drop(held);
             rt_refused(sel, &rt::Error::Refused(rt::Refusal::Committed));
-            return;
+            return false;
         }
         list(&mut held).push(handler);
+        true
+    }
+
+    /// The mark of an encoder made now, open until it ends ([`OpenMark`]); and an encoder made
+    /// under protection options other than 0 keeps the command buffer whole.
+    fn opened(&self) -> OpenMark {
+        let mut held = self.held.lock();
+        if held.protection != 0 {
+            held.protected_encoder = true;
+        }
+        drop(held);
+        OpenMark::new(&self.open)
+    }
+
+    /// Why it may not be cut now: the first of [`KeptWhole::ALL`] that holds (the module's docs).
+    fn kept_whole_by(&self) -> Option<KeptWhole> {
+        let held = self.held.lock();
+        let (protection, scheduled_signal, committed) = (
+            held.protection != 0 || held.protected_encoder,
+            held.scheduled_signal,
+            held.committed,
+        );
+        drop(held);
+        let open = self.open.load(Ordering::SeqCst) != 0;
+        let holds = |reason: KeptWhole| match reason {
+            KeptWhole::OpenEncoder => open,
+            KeptWhole::ProtectionOptions => protection,
+            KeptWhole::ScheduledSignal => scheduled_signal,
+            KeptWhole::Committed => committed,
+            // rt builds no indirect command buffer, rate map, residency or command predication.
+            KeptWhole::Execution | KeptWhole::Progress | KeptWhole::Predication => false,
+        };
+        KeptWhole::ALL.into_iter().find(|&reason| holds(reason))
+    }
+
+    /// The next part, made on its queue: waits, as `commandBuffer` does, while the queue's most
+    /// command buffers are made and not yet completed. `None` where rt refuses it (a quiesced
+    /// device, a wait for room on rt's own handler thread), counted: then it is kept whole.
+    fn next_part(&self) -> Option<RtObj<RtCommandBuffer>> {
+        match self.queue.command_buffer() {
+            Ok(made) => Some(RtObj::new(RtCommandBuffer::new(
+                made,
+                self.queue.clone(),
+                self.device.clone_ref(),
+            ))),
+            Err(error) => {
+                rt_refused("commandBuffer", &error);
+                None
+            }
+        }
+    }
+}
+
+/// One encoder of a command buffer, open from its make until it ends or goes, rt ending an
+/// encoder let go of open: the command buffer counts its open encoders, which keep it whole
+/// ([`KeptWhole::OpenEncoder`]).
+pub struct OpenMark {
+    /// The command buffer's count of open encoders.
+    open: Arc<AtomicUsize>,
+    /// Whether this one ended.
+    ended: AtomicBool,
+}
+
+impl OpenMark {
+    /// One more open encoder of `open`.
+    fn new(open: &Arc<AtomicUsize>) -> OpenMark {
+        open.fetch_add(1, Ordering::SeqCst);
+        OpenMark {
+            open: Arc::clone(open),
+            ended: AtomicBool::new(false),
+        }
+    }
+
+    /// The encoder ended: once, however often it is called.
+    pub fn end(&self) {
+        if !self.ended.swap(true, Ordering::SeqCst) {
+            self.open.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for OpenMark {
+    fn drop(&mut self) {
+        self.end();
     }
 }
 
@@ -242,7 +358,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     ) -> RaiseResult<Option<<RtPlatform as Platform>::BlitEncoder>> {
         let _ = on;
         Ok(match self.rt.blit_command_encoder() {
-            Ok(encoder) => Some(RtObj::new(RtBlitEncoder::new(encoder))),
+            Ok(encoder) => Some(RtObj::new(RtBlitEncoder::new(encoder, self.opened()))),
             Err(error) => {
                 rt_refused_create("blitCommandEncoder", &error);
                 None
@@ -255,24 +371,22 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     fn commit(&self, on: OnFault) -> RaiseResult<()> {
         let _ = on;
         let sel = "commit";
-        let held = {
+        let (mut submission, scheduled, mut seen, completed) = {
             let mut held = self.held.lock();
             if held.committed {
                 drop(held);
                 rt_refused(sel, &rt::Error::Refused(rt::Refusal::Committed));
                 return Ok(());
             }
-            let taken = std::mem::take(&mut *held);
             held.committed = true;
-            taken
+            let take = std::mem::take::<Vec<Handler>>;
+            (
+                take(&mut held.submission),
+                take(&mut held.scheduled),
+                take(&mut held.seen),
+                take(&mut held.completed),
+            )
         };
-        let Held {
-            mut submission,
-            scheduled,
-            mut seen,
-            completed,
-            ..
-        } = held;
         submission.extend(scheduled);
         seen.extend(completed);
         let run = |handlers: Vec<Handler>| {
@@ -337,7 +451,9 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         };
         let event = rt::SharedEvent::clone(event);
         let signal = move |_made: &rt::CommandBuffer| event.set_signaled_value(value);
-        self.hold(sel, |h| &mut h.scheduled, Box::new(signal));
+        if self.hold(sel, |h| &mut h.scheduled, Box::new(signal)) {
+            self.held.lock().scheduled_signal = true;
+        }
         Ok(())
     }
 
@@ -369,12 +485,13 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     }
 
     /// Nothing for 0; other options are unbuilt ([`Unbuilt::Protection`]), counted, and change
-    /// nothing.
+    /// nothing the GPU runs. They keep the command buffer whole ([`KeptWhole::ProtectionOptions`]).
     fn set_protection_options(&self, on: OnFault, options: u64) -> RaiseResult<()> {
         let _ = on;
         if options != 0 {
             refuse(Unbuilt::Protection, "setProtectionOptions:");
         }
+        self.held.lock().protection = options;
         Ok(())
     }
 
@@ -411,27 +528,42 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         Ok(None)
     }
 
-    /// Nil: each guest command buffer is one rt command buffer (the module's docs).
+    /// The work so far committed as a part, and the next part, where it may be cut (the
+    /// module's docs); `None` otherwise, or where rt refuses the next part, counted, when it is
+    /// kept whole.
+    fn split(&self, on: OnFault) -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
+        if self.kept_whole_by().is_some() {
+            return Ok(None);
+        }
+        let Some(next) = self.next_part() else {
+            return Ok(None);
+        };
+        self.commit(on)?;
+        Ok(Some(next))
+    }
+
+    /// A part made now and not committed, where it may be cut (the module's docs); `None`
+    /// otherwise, or where rt refuses it, counted.
     fn part(&self, on: OnFault) -> RaiseResult<Option<<RtPlatform as Platform>::CommandBuffer>> {
         let _ = on;
-        Ok(None)
+        if self.kept_whole_by().is_some() {
+            return Ok(None);
+        }
+        Ok(self.next_part())
     }
 
-    /// Commits nothing, and answers the command buffer whole: rt keeps a command buffer's
-    /// progress to its completion ([`KeptWhole::Progress`]), or [`KeptWhole::Committed`] once
-    /// committed. No caller reaches it: [`part`](CommandBuffer::part) answers nil.
+    /// Committed as a part where it may be cut ([`PartCut::Cut`]); else nothing, and why it is
+    /// kept whole. Never [`PartCut::Fails`] (the module's docs).
     fn commit_part(&self, on: OnFault) -> RaiseResult<PartCut> {
-        let _ = on;
-        let committed = self.held.lock().committed;
-        let reason = if committed {
-            KeptWhole::Committed
-        } else {
-            KeptWhole::Progress
-        };
-        Ok(PartCut::Whole(reason))
+        if let Some(reason) = self.kept_whole_by() {
+            return Ok(PartCut::Whole(reason));
+        }
+        self.commit(on)?;
+        Ok(PartCut::Cut)
     }
 
-    /// Unreachable: [`part`](CommandBuffer::part) answers nil, so nothing is cut and no caller
+    /// The Vulkan platform's fold with nothing noted: rt notes no way Metal's GPU fails a command
+    /// buffer from an encoder on, so `commit_part` never answers [`PartCut::Fails`] and no caller
     /// folds. Lets `later` go uncommitted.
     fn fold(&self, later: <RtPlatform as Platform>::CommandBuffer) {
         drop(later);
@@ -440,13 +572,15 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
 
     use super::*;
+    use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
     use crate::core::platform::command::CommandQueue as _;
     use crate::core::platform::device::GpuDevice as _;
     use crate::core::platform::event::SharedEvent as _;
+    use crate::core::platform::resource::Buffer as _;
+    use crate::core::platform::types::NsRange;
     use crate::rt_platform::RtQueue;
 
     fn counted(code: &str) -> u64 {
@@ -476,7 +610,8 @@ mod tests {
 
     /// Command buffers on the GPU the test holds: handlers in core's order whatever the order
     /// added, each completed handler told the status and GPU times; a handler added after the
-    /// commit, and a second commit, refused and counted; kept whole; signals and waits on an
+    /// commit, and a second commit, refused and counted; kept whole once committed, and while it
+    /// signals as scheduled; signals and waits on an
     /// event and a shared event across queues; a signal as scheduled set before the scheduled
     /// handlers added after it; nil events refused and counted; compute and render encoders
     /// unbuilt, nil and counted; protection options other than 0 counted; a wait in a scheduled
@@ -510,9 +645,7 @@ mod tests {
         assert_eq!(first.add_scheduled_handler(on, note("scheduled")), Ok(()));
         assert_eq!(first.add_completion_seen_handler(on, see("seen")), Ok(()));
         assert_eq!(first.add_submission_handler(on, note("submission")), Ok(()));
-        assert!(matches!(first.part(on), Ok(None)));
         let whole = |why| -> RaiseResult<PartCut> { Ok(PartCut::Whole(why)) };
-        assert_eq!(first.commit_part(on), whole(KeptWhole::Progress));
         let before = counted(metal);
         assert_eq!(first.commit(on), Ok(()));
         assert_eq!(first.add_completed_handler(on, see("late")), Ok(()));
@@ -576,6 +709,10 @@ mod tests {
         let (seen, read) = (Arc::clone(&saw), at_scheduled.clone_ref());
         let look = move || seen.store(read.signaled_value(), Ordering::Release);
         assert_eq!(scheduled.add_scheduled_handler(on, Box::new(look)), Ok(()));
+        assert_eq!(
+            scheduled.commit_part(on),
+            whole(KeptWhole::ScheduledSignal)
+        );
         assert_eq!(scheduled.commit(on), Ok(()));
         assert_eq!(scheduled.wait_until_completed(on), Ok(()));
         assert_eq!(saw.load(Ordering::Acquire), 9);
@@ -619,5 +756,97 @@ mod tests {
         assert_eq!(waiter.wait_until_completed(on), Ok(()));
         assert!(returned.load(Ordering::Acquire));
         assert_eq!(counted(metal), before + 1);
+    }
+
+    /// Parts on the GPU the test holds: kept whole while an encoder is open; cut once it ended,
+    /// each part an rt command buffer of the same queue, run in their order (a fill, a copy of it
+    /// in the part made before the fill's commit, and a copy of that in the part `split`
+    /// answered); never marked to join the next; an encoder let go of unended no longer open;
+    /// kept whole under protection options, and once an encoder was made under them.
+    #[test]
+    fn parts_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let made = || {
+            let made = queue.command_buffer(on).expect("never a raise");
+            made.expect("a command buffer")
+        };
+        let buffer = device.new_buffer_of_length(on, 48, 0);
+        let buffer = buffer.expect("never a raise").expect("a buffer");
+        let whole = |why| -> RaiseResult<PartCut> { Ok(PartCut::Whole(why)) };
+        let encode = |made: &RtObj<RtCommandBuffer>, cmd: BlitCmd<'_, RtPlatform>| {
+            let encoder = made.blit_encoder(on).expect("never a raise");
+            let encoder = encoder.expect("a blit encoder");
+            assert_eq!(encoder.encode(on, cmd), Ok(()));
+            encoder
+        };
+        let fill = || BlitCmd::FillBuffer {
+            buffer: &buffer,
+            range: NsRange::new(0, 16),
+            value: 0x5a,
+        };
+        let copy = |from: u64, to: u64| BlitCmd::CopyBufferToBuffer {
+            source_buffer: Some(&buffer),
+            source_offset: from,
+            destination_buffer: Some(&buffer),
+            destination_offset: to,
+            size: 16,
+        };
+        let completed = CommandBufferStatus::COMPLETED;
+
+        // Three parts.
+        let first = made();
+        let encoder = encode(&first, fill());
+        assert!(matches!(first.part(on), Ok(None)));
+        assert!(matches!(first.split(on), Ok(None)));
+        assert_eq!(first.commit_part(on), whole(KeptWhole::OpenEncoder));
+        assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+        let second = first.part(on).expect("never a raise").expect("a part");
+        let encoder = encode(&second, copy(0, 16));
+        assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+        assert!(!first.set_completion_joins_next(true));
+        assert_eq!(first.commit_part(on), Ok(PartCut::Cut));
+        assert_eq!(first.commit_part(on), whole(KeptWhole::Committed));
+        let third = second.split(on).expect("never a raise").expect("the next part");
+        assert_eq!(second.commit_part(on), whole(KeptWhole::Committed));
+        let encoder = encode(&third, copy(16, 32));
+        assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+        assert_eq!(third.commit(on), Ok(()));
+        assert_eq!(third.wait_until_completed(on), Ok(()));
+        let statuses = [&first, &second, &third].map(|part| part.status());
+        assert_eq!(statuses, [completed; 3]);
+        // SAFETY: a Shared buffer's contents are mapped, 48 bytes long.
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.contents().as_ptr::<u8>(), 48) };
+        assert_eq!(bytes, [0x5a; 48]);
+
+        // An encoder let go of unended: rt ends it.
+        let let_go = made();
+        drop(encode(&let_go, fill()));
+        assert_eq!(let_go.commit_part(on), Ok(PartCut::Cut));
+        assert_eq!(let_go.wait_until_completed(on), Ok(()));
+        assert_eq!(let_go.status(), completed);
+
+        // Protection options.
+        let protected = made();
+        assert_eq!(protected.set_protection_options(on, 1), Ok(()));
+        assert_eq!(
+            protected.commit_part(on),
+            whole(KeptWhole::ProtectionOptions)
+        );
+        assert_eq!(protected.set_protection_options(on, 0), Ok(()));
+        assert!(matches!(protected.part(on), Ok(Some(_))));
+        assert_eq!(protected.set_protection_options(on, 1), Ok(()));
+        let encoder = encode(&protected, fill());
+        assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+        assert_eq!(protected.set_protection_options(on, 0), Ok(()));
+        assert_eq!(
+            protected.commit_part(on),
+            whole(KeptWhole::ProtectionOptions)
+        );
+        assert_eq!(protected.commit(on), Ok(()));
+        assert_eq!(protected.wait_until_completed(on), Ok(()));
+        assert_eq!(protected.status(), completed);
     }
 }
