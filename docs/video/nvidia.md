@@ -304,8 +304,12 @@ without `cuMemHostRegister_v2`.
 A picture lands in the GPU's own memory through `src/nvidia/external.rs`: a Vulkan
 buffer whose memory its device exported as an opaque file descriptor,
 imported with `cuImportExternalMemory` on the CUDA device of the same GPU
-(CUDA refuses another's) and mapped whole, so that the copy is within the
-GPU. The import is freed as the `ImportedBuffer` drops, and the exporter's
+(CUDA refuses another's) and mapped, so that the copy is within the GPU.
+The mapping starts at the allocation's first byte and the buffer's address
+is its offset into the mapping: CUDA maps a buffer of a dedicated
+allocation's import only from offset 0 (measured on an RTX 2080 and an
+RTX 3090, the module's docs), so a buffer at any offset of any allocation
+maps. The import is freed as the `ImportedBuffer` drops, and the exporter's
 buffer must outlive it.
 
 ## Waiting for the GPU

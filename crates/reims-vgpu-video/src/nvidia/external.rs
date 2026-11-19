@@ -4,8 +4,17 @@
 //! ([`crate::nvidia::NvencEncoder::encode_device`]):
 //! a Vulkan device's buffer whose memory it exported as an opaque file descriptor
 //! (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`), imported with `cuImportExternalMemory` and
-//! mapped whole with `cuExternalMemoryGetMappedBuffer`. The memory is the exporter's GPU's, so
+//! mapped with `cuExternalMemoryGetMappedBuffer`. The memory is the exporter's GPU's, so
 //! the import is made on the CUDA device of that GPU; CUDA refuses another's.
+//!
+//! **Mapped from the allocation's first byte.** The mapping spans the allocation from its first
+//! byte to the buffer's last, and the buffer's address is the mapping's plus its offset, so a
+//! buffer at any offset maps however its allocation was made. CUDA maps a buffer of an import
+//! made dedicated (`CUDA_EXTERNAL_MEMORY_DEDICATED`, which an exporter's dedicated allocation
+//! must be imported as) only from offset 0: a mapping from 224, 256, 4096 or 65536 bytes in is
+//! refused `CUDA_ERROR_INVALID_VALUE`, while one of any length from offset 0 maps, the
+//! allocation's whole length among them; a shared allocation's buffers map at any offset
+//! (**measured**, an RTX 2080, and at 224 an RTX 3090, 2026-11-19).
 //!
 //! The import takes the descriptor where it succeeds, as CUDA's reference says of an opaque
 //! file descriptor, and closes it where it fails. The mapping is freed (`cuMemFree`) and the
@@ -30,7 +39,9 @@ use crate::nvidia::error::Error;
 pub struct ImportedBuffer {
     gpu: Arc<Gpu>,
     memory: CUexternalMemory,
-    /// The buffer's first byte, in the GPU's address space.
+    /// The mapping, from the allocation's first byte (module docs).
+    mapped: CUdeviceptr,
+    /// The buffer's first byte, in the GPU's address space: `offset` bytes into the mapping.
     address: CUdeviceptr,
     /// Its bytes.
     length: usize,
@@ -49,6 +60,7 @@ impl std::fmt::Debug for ImportedBuffer {
         f.debug_struct("ImportedBuffer")
             .field("gpu", &self.gpu.info().pci_bus_id)
             .field("address", &format_args!("{:#x}", self.address))
+            .field("mapped", &format_args!("{:#x}", self.mapped))
             .field("length", &self.length)
             .finish()
     }
@@ -57,7 +69,8 @@ impl std::fmt::Debug for ImportedBuffer {
 impl ImportedBuffer {
     /// The memory `fd` describes, imported on `gpu`: an allocation of `allocation_size` bytes,
     /// the exporter's dedicated allocation where `dedicated`, of which the buffer is `length`
-    /// bytes from `offset`. The import takes `fd` where it succeeds, and closes it where it fails.
+    /// bytes from `offset`, mapped from the allocation's first byte (module docs). The import
+    /// takes `fd` where it succeeds, and closes it where it fails.
     pub fn import(
         gpu: &Arc<Gpu>,
         fd: OwnedFd,
@@ -72,7 +85,10 @@ impl ImportedBuffer {
         let fits = offset
             .checked_add(length)
             .is_some_and(|end| end <= allocation_size);
-        let Some(length) = fits.then(|| usize::try_from(length).ok()).flatten() else {
+        let Some((start, length)) = fits
+            .then(|| Some((usize::try_from(offset).ok()?, usize::try_from(length).ok()?)))
+            .flatten()
+        else {
             return Err(Error::Unsupported(format!(
                 "a buffer of {length} bytes at {offset} in an allocation of {allocation_size}"
             )));
@@ -102,16 +118,18 @@ impl ImportedBuffer {
             drop(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) });
             return Err(error);
         }
+        // From the allocation's first byte, which a dedicated import alone maps from (module
+        // docs), to the buffer's last.
         let buffer = CUDA_EXTERNAL_MEMORY_BUFFER_DESC {
-            offset,
-            size: length as u64,
+            offset: 0,
+            size: offset + length as u64,
             flags: 0,
             reserved: [0; 16],
         };
-        let mut address: CUdeviceptr = 0;
+        let mut mapped: CUdeviceptr = 0;
         // SAFETY: the import is live; the range lies inside its allocation (checked).
         let result = unsafe {
-            (external.cuExternalMemoryGetMappedBuffer)(&raw mut address, memory, &raw const buffer)
+            (external.cuExternalMemoryGetMappedBuffer)(&raw mut mapped, memory, &raw const buffer)
         };
         if let Err(error) = cuda.check("cuExternalMemoryGetMappedBuffer", result) {
             // SAFETY: imported above, mapped nowhere, destroyed once.
@@ -121,7 +139,8 @@ impl ImportedBuffer {
         Ok(Self {
             gpu: Arc::clone(gpu),
             memory,
-            address,
+            mapped,
+            address: mapped + start as CUdeviceptr,
             length,
             owner: None,
         })
@@ -165,7 +184,7 @@ impl Drop for ImportedBuffer {
         };
         // SAFETY: the mapping `cuExternalMemoryGetMappedBuffer` gave, freed once, as CUDA's
         // reference says a mapped buffer is.
-        let freed = unsafe { (cuda.f.cuMemFree_v2)(self.address) };
+        let freed = unsafe { (cuda.f.cuMemFree_v2)(self.mapped) };
         if let Err(error) = cuda.check("cuMemFree", freed) {
             log::warn!(kind:% = error; "{error}");
         }
@@ -176,3 +195,6 @@ impl Drop for ImportedBuffer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
