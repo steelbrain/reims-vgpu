@@ -27,7 +27,7 @@
 //! its pictures into (`graphics::drawn`), made at the ask and imported by the platform
 //! (`GpuDevice::import_d3d11_surface`), each plane the size of its plane shape with no rows of
 //! room below it: a decode's targets are then the planes' images and those textures
-//! ([`Caches::drawn_targets`]).
+//! (`Caches::drawn_targets`).
 
 use std::sync::Arc;
 

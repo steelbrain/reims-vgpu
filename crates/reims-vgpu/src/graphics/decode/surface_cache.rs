@@ -8341,6 +8341,8 @@ pub(super) mod tests {
         let maker = CacheMaker {
             exportable: false,
             dma_buf: false,
+            #[cfg(windows)]
+            drawn: false,
             shaped: false,
         };
         let desc = platform.texture_descriptor(&TextureDesc {

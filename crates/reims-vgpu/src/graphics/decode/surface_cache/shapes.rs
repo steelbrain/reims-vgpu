@@ -532,7 +532,6 @@ impl<T> ShapeTable<T> {
     /// Adds the plane shape of `key`, its image `image` a plane of the cache's surface, owing a
     /// fill from the buffer where `owed`, used now (`now`), as [`Self::insert`] adds a shape: the
     /// bound never drops it (the module doc, "Plane shapes").
-    #[cfg(unix)]
     pub(crate) fn insert_plane(
         &mut self,
         key: ShapeKey,

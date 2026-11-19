@@ -73,11 +73,11 @@ use reims_vgpu_vulkan::core::sync::Mutex;
 
 #[cfg(unix)]
 use super::decode::SurfaceTarget;
-#[cfg(windows)]
-use super::drawn::DrawnTarget;
 use super::decode::{
     Decoded, GraphicsVideoSession, Landed, PlanePages, VideoDecode, VideoPlane, op_fault,
 };
+#[cfg(windows)]
+use super::drawn::DrawnTarget;
 
 /// How long a session's end waits for its last picture to land.
 pub(crate) const TEARDOWN_WAIT: Duration = Duration::from_secs(10);
