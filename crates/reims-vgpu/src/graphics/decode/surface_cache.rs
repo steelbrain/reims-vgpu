@@ -3429,7 +3429,7 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// Takes the shape numbered `id` out of the block at `block`'s cache as though it was never
-    /// made ([`SurfaceCaches::placed_shape`]), its bytes out of the caches' and its make out of the
+    /// made ([`Caches::placed_shape`]), its bytes out of the caches' and its make out of the
     /// counts: its image, for the caller to let go of with the lock let go of.
     fn unmake_shape(&mut self, block: u64, id: u64) -> Option<P::Texture> {
         let shape = self.by_block.get_mut(&block)?.shapes.take_id(id)?;
@@ -5542,7 +5542,7 @@ impl<P: Platform> Caches<P> {
 
     /// The shape `key` of the block at `block`'s cache on `image`, an image the platform placed
     /// ([`shapes`]'s "Placed images"), added and filled at once from the cache's buffer
-    /// ([`SurfaceCachesState::fill_shapes`]), where no command buffer begun and not finished
+    /// ([`SurfaceCaches::fill_shapes`]), where no command buffer begun and not finished
     /// uses the cache and no copy of it waits: the shape, `None` within where the block has no
     /// cache. Where it is not filled so, as a command buffer was begun since
     /// ([`Self::fills_at_once`]) or the fill was not made or did not fill it, the shape goes and

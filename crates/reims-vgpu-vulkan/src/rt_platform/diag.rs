@@ -27,6 +27,10 @@
 //!   into it (any thread but rt's own block maker), by the site in rt that made them (rt's
 //!   `SiteAllocations`, eight sites): for each, the calls, the bytes they asked for and the
 //!   longest call since the device was made; the site of the longest call comes first.
+//! - **Memory.** The textures rt cleared at their make and the bytes it cleared, those it made
+//!   zeroed with no clear (rt's `texture_clears`, `texture_clear_bytes`, `zeroed_textures`), and
+//!   the Private memory it holds now, allocated and idle, with its blocks (rt's `Gauges`): what a
+//!   placed shape's image skips (`texture`, "Placed images for views") and what it holds.
 //! - **Textures over an imported block**, which rt keeps in an image of their own and copies the
 //!   bytes of into it at each submission that uses them (rt's `over` module), by kind: format,
 //!   size, rows, usage, storage mode, and where their block was imported (the selector, the
