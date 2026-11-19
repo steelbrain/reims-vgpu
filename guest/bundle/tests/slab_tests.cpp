@@ -1854,14 +1854,16 @@ void test_pool_slab_source_at_host_addresses()
 	                 {"destroy " + std::to_string(heap.obj_id), "give 131072"}));
 
 	// A host address where a pick of the process's starts: the heap's drop leaves the pick held.
+	// (The class's next slab may be larger than its first: the give names the take's size.)
 	kext.gpuBase = picked - Pool::kUnit;
 	RgfxSlabs::Range c;
-	CHECK(slabs.take(0x1000, kShared, 0, &c));
+	CHECK(slabs.take(0x1000, kShared, 0, &c) && log.back().rfind("take ", 0) == 0);
+	const std::string took = log.back().substr(5);
 	auto cheap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_POOL);
 	CHECK(cheap.region_offset == Pool::kUnit && cheap.gpu_address == picked);
 	drain();
 	slabs.give(c);
-	CHECK(endsWith(log, {"destroy " + std::to_string(cheap.obj_id), "give 131072"}));
+	CHECK(endsWith(log, {"destroy " + std::to_string(cheap.obj_id), "give " + took}));
 	CHECK(ids.allocAddress(0x1000, 1) == 0);
 	ids.freeAddress(picked);
 	CHECK(ids.allocAddress(0x1000, 1) == picked);
