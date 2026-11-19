@@ -20,28 +20,31 @@
 //! range of the block, at the pinned address. Its bytes are the block's as they are, Metal's zeros
 //! the block's owner's to give (at its take) and the guest's (in the ranges it takes again), but a
 //! Private buffer's, which the guest cannot reach, zeroed (rt's GPU fill). A no-copy buffer is such
-//! a range only where its bytes are the block's own mapping there; its deallocator then runs as
-//! the buffer goes, the block's memory held by rt for the work that still uses it. A no-copy
-//! Managed buffer on a GPU with memory of its own, whose address is its device copy's, keeps that
-//! copy at the pin where a known Private block holds it, its bytes the import of their pages
-//! ("Imports"); on a GPU that shares the CPU's memory it keeps no copy, so a pin lies at its bytes,
-//! as a Shared one's does. Any other pinned buffer is made as an unpinned one, at rt's address,
-//! which the guest observes as a `gpuAddress` other than the one it pinned: counted
-//! ([`UNPINNED_CODE`]), the process's first with a line.
+//! a range only where its bytes are the block's own mapping there; its deallocator then runs as the
+//! buffer goes, the block's memory held by rt for the work that still uses it. A no-copy Managed
+//! buffer on a GPU with memory of its own, whose address is its device copy's, keeps that copy at
+//! the pin where a known Private block holds it, its bytes where they lie (below); on a GPU that
+//! shares the CPU's memory it keeps no copy, so a pin lies at its bytes, as a Shared one's does.
+//! Any other pinned buffer is made as an unpinned one, at rt's address, which the guest observes as
+//! a `gpuAddress` other than the one it pinned: counted ([`UNPINNED_CODE`]), the process's first
+//! with a line. A no-copy buffer's bytes that a known Shared block maps are a range of that block,
+//! with no import of their own: a Managed buffer's in a slab of the pool or in a pages block's
+//! view, and those of a buffer whose pin no known block keeps, which then lies at the block's
+//! address plus their offset.
 //!
-//! **Imports.** A no-copy buffer is a range of rt's import of the host's pages that hold its bytes
-//! (rt's `import_host_memory`): the bytes rounded out to the host's pages, which are mapped as the
-//! bytes are, the buffer at the bytes' offset in them; Shared, or Managed over them, rt keeping
-//! the device copy where the GPU has memory of its own, whose bytes past `zero_from` start as
-//! zeros. Its deallocator runs once rt freed the import, after the buffer and every command buffer
-//! that used it are gone, as Metal runs it once the buffer is freed; one of a buffer never made
-//! never runs, and its captures are kept. Each import is one Vulkan allocation; each is counted
-//! ([`IMPORTS_CODE`]), and the most live at once as that code's highest value
-//! ([`IMPORTS_LIVE_MOST_CODE`]); each again, with the most live at once, under the kind of the
-//! make that asked for it on its thread (`crate::answer::making_as`), or [`IMPORTS_UNNAMED`]
-//! where no make named one, so the kinds' counts sum to the total. Option bit 24 (read-only) is
-//! taken and answered without, as Metal does, but the GPU's writes reach the bytes, where Metal
-//! drops them: counted ([`READ_ONLY_CODE`]), the process's first with a line.
+//! **Imports.** A no-copy buffer whose bytes no known block maps is a range of rt's import of the
+//! host's pages that hold its bytes (rt's `import_host_memory`): the bytes rounded out to the
+//! host's pages, which are mapped as the bytes are, the buffer at the bytes' offset in them;
+//! Shared, or Managed over them, rt keeping the device copy where the GPU has memory of its own,
+//! whose bytes past `zero_from` start as zeros. Its deallocator runs once rt freed the import,
+//! after the buffer and every command buffer that used it are gone, as Metal runs it once the
+//! buffer is freed; one of a buffer never made never runs, and its captures are kept. Each import
+//! is one Vulkan allocation; each is counted ([`IMPORTS_CODE`]), and the most live at once as that
+//! code's highest value ([`IMPORTS_LIVE_MOST_CODE`]); each again, with the most live at once,
+//! under the kind of the make that asked for it on its thread (`crate::answer::making_as`), or
+//! [`IMPORTS_UNNAMED`] where no make named one, so the kinds' counts sum to the total. Option bit
+//! 24 (read-only) is taken and answered without, as Metal does, but the GPU's writes reach the
+//! bytes, where Metal drops them: counted ([`READ_ONLY_CODE`]), the process's first with a line.
 //!
 //! **Answers.** A buffer's resource options are the asked ones without bits 20 and 24, Metal's
 //! default hazard tracking resolved to tracked, as the Vulkan platform's runtime answers them. A
@@ -189,6 +192,22 @@ impl KnownBlocks {
             .checked_add(length)
             .is_some_and(|end| end <= block.len);
         inside.then(|| (block.clone(), offset))
+    }
+
+    /// The known Shared block whose mapping holds the `length` bytes at `first`, and their offset
+    /// in it.
+    pub fn mapping(&self, first: HostPtr, length: u64) -> Option<(rt::Block, u64)> {
+        let first = first.addr().to_u64();
+        let known = self.0.lock();
+        known.values().find_map(|block| {
+            let start = block.contents?.as_ptr().addr().to_u64();
+            let offset = first.checked_sub(start)?;
+            let inside = offset
+                .checked_add(length)
+                .is_some_and(|end| end <= block.len);
+            let shared = block.class == rt::MemoryClass::Shared;
+            (shared && inside).then(|| (block.clone(), offset))
+        })
     }
 }
 
@@ -595,9 +614,15 @@ fn no_copy(
             {
                 unpinned(sel, pin);
             }
-            let held = Arc::clone(slot);
-            let (block, offset) = import_pages(device, sel, first, length, move || run(&held))?;
-            (block, offset, None)
+            match device.known_blocks().mapping(first, length) {
+                Some((block, offset)) => (block, offset, Some(Arc::clone(slot))),
+                None => {
+                    let held = Arc::clone(slot);
+                    let made = import_pages(device, sel, first, length, move || run(&held));
+                    let (block, offset) = made?;
+                    (block, offset, None)
+                }
+            }
         }
     };
     let copy = copy.map(|(block, offset)| (block.id, offset));
@@ -989,8 +1014,9 @@ mod tests {
     /// memory at its bytes, their deallocators run once rt freed the import, with the bytes and
     /// the length through a descriptor; a pin in no known block made at rt's address, counted;
     /// pins in known blocks at the pin, a Shared one keeping the bytes the CPU wrote there, a
-    /// no-copy one over the block's mapping its deallocator run as it goes, a Managed no-copy
-    /// one's device copy in a Private block where the GPU keeps one; a texture over a buffer.
+    /// no-copy one over the block's mapping its deallocator run as it goes, and one pinned
+    /// elsewhere a range of the block still, with no import; a Managed no-copy one's device copy
+    /// in a Private block where the GPU keeps one; a texture over a buffer.
     #[test]
     fn buffers_on_vulkan() {
         let platform = RtPlatform::new();
@@ -1154,10 +1180,26 @@ mod tests {
         assert!(ran.load(Ordering::Acquire));
         assert_eq!(counted(UNPINNED_CODE), unpinned + 2);
 
+        // Over the Shared block's mapping, pinned elsewhere: a range of the block with no import, a
+        // Shared one at the block's address, counted as not kept; a Managed one's device copy at
+        // the pin in the Private block where the GPU keeps one, else counted as not kept too.
+        let unified = device.rt().has_unified_memory();
+        let (unpinned, imports) = (counted(UNPINNED_CODE), counted(IMPORTS_CODE));
+        let pin = private.gpu_address + 0x800;
+        for (options, kept) in [(0, false), (0x10, !unified)] {
+            // SAFETY: the block's mapping lives while the test holds the block.
+            let bytes = unsafe { HostRange::new(written, 64) };
+            let made = device.new_buffer(pinned(pin, options, Some(bytes)));
+            let made = made.expect("never a raise").expect("a buffer over the block");
+            let at = if kept { pin } else { shared.gpu_address + 0x100 };
+            assert_eq!((made.gpu_address(), made.contents()), (at, written));
+        }
+        assert_eq!(counted(IMPORTS_CODE), imports);
+        assert_eq!(counted(UNPINNED_CODE), unpinned + 1 + u64::from(unified));
+
         // A Managed no-copy one over memory of the host's own, pinned in the Private block: its
         // device copy at the pin where the GPU keeps one; else lying at its bytes' import, the
         // pin not kept, counted.
-        let unified = device.rt().has_unified_memory();
         let unpinned = counted(UNPINNED_CODE);
         // SAFETY: the layout's size is not 0.
         let memory = unsafe { std::alloc::alloc_zeroed(layout) };
