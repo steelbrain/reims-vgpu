@@ -59,8 +59,8 @@ use std::time::Duration;
 use metal2vulkan_rt as rt;
 
 use crate::core::num::ToU64 as _;
-use crate::core::platform::os::clock::{Clock as _, MonoTime};
 use crate::core::platform::os::Threads;
+use crate::core::platform::os::clock::{Clock as _, MonoTime};
 use crate::core::platform::os::vm::HostVm;
 use crate::core::platform::types::MtlSize;
 use crate::core::platform::values::{RateMapDesc, TextureDesc};
@@ -584,8 +584,10 @@ mod tests {
         const TEST: &str = "rt_platform::tests::\
             on_vulkan_a_quiesce_with_the_device_live_stops_it_and_answers_false";
         unsafe extern "C" {
-            /// The C library's `_exit`, which ends the process with no exit handler run.
-            fn _exit(status: i32) -> !;
+            /// The C library's `_exit`, which ends the process with no exit handler run; `safe`,
+            /// as the testkit's death tests declare it on Linux and macOS, since a declaration of
+            /// another signature clashes with theirs.
+            safe fn _exit(status: i32) -> !;
         }
         let say = |line: &str| eprintln!("{line}");
         if std::env::var("RVG_QUIESCE_CHILD").as_deref() == Ok(TEST) {
@@ -620,8 +622,7 @@ mod tests {
                 "a command buffer after it refused {refused}, counted {}",
                 counted(code).saturating_sub(before)
             ));
-            // SAFETY: the C library's `_exit`, which never returns.
-            unsafe { _exit(0) }
+            _exit(0)
         }
         let (status, stderr) = run_child(TEST);
         assert_eq!(status, Some(0), "{stderr}");
