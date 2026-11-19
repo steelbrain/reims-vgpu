@@ -7,14 +7,14 @@
 #
 # The library runs on Vulkan everywhere (on a Mac through MoltenVK), and VMs
 # run on QEMU built on it:
-# - Linux on x86-64 (Ubuntu or Debian, Arch or CachyOS; other distributions
-#   get the list of what to install): x86-64 VMs on KVM, and arm64 VMs,
-#   emulated by TCG;
+# - Linux on x86-64 (Ubuntu or Debian, Fedora, Arch or CachyOS; other
+#   distributions get the list of what to install): x86-64 VMs on KVM, and
+#   arm64 VMs, emulated by TCG;
 # - Windows on x86-64, in MSYS2's CLANG64 shell, whose clang builds the
 #   library and QEMU (QEMU builds on Windows only with MinGW): x86-64 VMs on
 #   the Windows Hypervisor Platform;
 # - arm64 Macs: arm64 VMs on HVF;
-# - Linux on arm64 (Ubuntu or Debian, Arch): arm64 VMs on KVM.
+# - Linux on arm64 (Ubuntu or Debian, Fedora, Arch): arm64 VMs on KVM.
 # reims-ctl makes an arm64 VM by restoring macOS from an IPSW, and boots it
 # with Ambrosia. This script:
 #   1. checks the build's dependencies, and offers to install those missing
@@ -325,7 +325,14 @@ pacman_pkgs=(base-devel git curl python ninja pkgconf flex bison bzip2 cmake cla
   glib2 pixman libslirp zlib dtc pipewire libpulse alsa-lib libusb spice gnutls vulkan-icd-loader
   libx11 libxext libxrandr libxcursor libxi libxfixes libxss libxtst libxkbcommon
   wayland libdecor mesa libdrm dbus systemd-libs gtk3)
-dnf_pkgs=()
+# Fedora's names for the same, each checked as rpm -q --whatprovides finds it.
+dnf_pkgs=(gcc gcc-c++ make git curl ca-certificates pkgconf-pkg-config python3 ninja-build
+  flex bison bzip2 cmake binutils clang glib2-devel pixman-devel libslirp-devel
+  zlib-devel libfdt-devel pipewire-devel pulseaudio-libs-devel alsa-lib-devel libusb1-devel
+  spice-server-devel gnutls-devel vulkan-loader
+  libX11-devel libXext-devel libXrandr-devel libXcursor-devel libXi-devel libXfixes-devel
+  libXScrnSaver-devel libXtst-devel libxkbcommon-devel wayland-devel libdecor-devel
+  libglvnd-devel libdrm-devel mesa-libgbm-devel dbus-devel systemd-devel gtk3-devel)
 # Windows: MSYS2's own git and curl, make (the cmake crate, building SDL3, looks
 # for it to choose CMake's generator, and stops without it), and CLANG64's clang
 # and lld, which build the library (x86_64-pc-windows-gnullvm) and QEMU, QEMU's
@@ -357,17 +364,14 @@ case "$OS $distro_id $distro_like " in
     fi
     ;;
   *" fedora "*)
-    if ((${#dnf_pkgs[@]} == 0)); then
-      warn "$distro_id is neither Debian/Ubuntu nor Arch/CachyOS: install the equivalents of these Ubuntu packages yourself if the build stops: ${apt_pkgs[*]}"
-    else
-      for p in "${dnf_pkgs[@]}"; do
-        rpm -q "$p" >/dev/null 2>&1 || missing+=("$p")
-      done
-      if ((${#missing[@]})); then
-        say "Missing packages: ${missing[*]}"
-        ask "Install them with sudo dnf?" || die "install them (sudo dnf install ${missing[*]}), then run this again"
-        sudo dnf install -y "${missing[@]}"
-      fi
+    # --whatprovides: some are another package's (zlib-devel is zlib-ng-compat-devel's).
+    for p in "${dnf_pkgs[@]}"; do
+      rpm -q --whatprovides "$p" >/dev/null 2>&1 || missing+=("$p")
+    done
+    if ((${#missing[@]})); then
+      say "Missing packages: ${missing[*]}"
+      ask "Install them with sudo dnf?" || die "install them (sudo dnf install ${missing[*]}), then run this again"
+      sudo dnf install -y "${missing[@]}"
     fi
     ;;
   *" arch "* | *" cachyos "*)
@@ -381,7 +385,7 @@ case "$OS $distro_id $distro_like " in
     fi
     ;;
   *)
-    warn "$distro_id is neither Debian/Ubuntu nor Arch/CachyOS: install the equivalents of these Ubuntu packages yourself if the build stops: ${apt_pkgs[*]}"
+    warn "$distro_id is neither Debian/Ubuntu, Fedora nor Arch/CachyOS: install the equivalents of these Ubuntu packages yourself if the build stops: ${apt_pkgs[*]}"
     ;;
 esac
 # On Windows, VMs run on the Windows Hypervisor Platform, an optional feature of
