@@ -439,7 +439,7 @@ pub fn plane_view(of: &Made, format: u32, made: bool) {
 fn format_code(family: &'static str, format: u32) -> &'static str {
     static CODES: Mutex<BTreeMap<(&'static str, u32), &'static str>> = Mutex::new(BTreeMap::new());
     let mut codes = CODES.lock();
-    *codes
+    codes
         .entry((family, format))
         .or_insert_with(|| Box::leak(format!("{family}-{format}").into_boxed_str()))
 }
@@ -1295,7 +1295,10 @@ mod tests {
         on_plane(&plane, (0x5b5b_0000, 0), 0x11, 64);
         let view = Made::view(&plane, 81, (0, 0));
         let plain = Made::new(Call::Plain, &shape);
-        let (made, refused) = ("rt-plane-views-format-81", "rt-plane-views-refused-format-71");
+        let (made, refused) = (
+            "rt-plane-views-format-81",
+            "rt-plane-views-refused-format-71",
+        );
         let before = (counted(made), counted(refused));
         plane_view(&plane, 81, true);
         plane_view(&view, 71, false);
@@ -1308,7 +1311,13 @@ mod tests {
         assert_eq!(format_code(PLANE_VIEWS_CODE, 81), made);
 
         let before = counted(PLANE_PIXEL_FORMAT_VIEW_CODE);
-        surface_texture::<()>(None, 7, (0x5c5c_0000, 0), (0x11, 64), "over-buffer: no cache");
+        surface_texture::<()>(
+            None,
+            7,
+            (0x5c5c_0000, 0),
+            (0x11, 64),
+            "over-buffer: no cache",
+        );
         assert_eq!(counted(PLANE_PIXEL_FORMAT_VIEW_CODE), before);
     }
 
