@@ -77,6 +77,8 @@ pub struct RtDevice {
     caps: Arc<DeviceCaps>,
     /// The texture indices its textures the guest does not place take (`super::texture`).
     indices: OwnIndices,
+    /// The sampler indices its sampler states the guest does not place take (`super::state`).
+    sampler_indices: OwnIndices,
     /// The blocks it knows by address, which pinned buffers and heaps inside them are ranges of.
     known: KnownBlocks,
 }
@@ -95,6 +97,11 @@ impl RtDevice {
     /// The texture indices of the platform's own.
     pub fn indices(&self) -> &OwnIndices {
         &self.indices
+    }
+
+    /// The sampler indices of the platform's own.
+    pub fn sampler_indices(&self) -> &OwnIndices {
+        &self.sampler_indices
     }
 
     /// The blocks it knows by address (`super::buffer`'s docs, "A pinned address"): the graphics
@@ -201,7 +208,8 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         rt: device,
         facts,
         caps,
-        indices: OwnIndices::new(),
+        indices: OwnIndices::new(rt::IndexClass::Texture),
+        sampler_indices: OwnIndices::new(rt::IndexClass::Sampler),
         known: KnownBlocks::default(),
     }))
 }
@@ -574,7 +582,7 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     }
 
     /// Textures' (type 0) and sampler states' (type 1) indices as rt's grants of their class
-    /// ([`grant`]), textures' also kept from the platform's own ([`OwnIndices::reserve`]);
+    /// ([`grant`]), each also kept from the platform's own ([`OwnIndices::reserve`]);
     /// indirect command buffers' (type 5) are unbuilt ([`Unbuilt::Icb`]), and those of another
     /// type ([`Unbuilt::ResourceType`]): each reserves nothing. Never a raise.
     fn reserve_resource_indices(&self, resource_type: u64, indices: &[u64]) -> RaiseResult<()> {
@@ -583,7 +591,10 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
                 self.indices.reserve(indices);
                 rt::IndexClass::Texture
             }
-            1 => rt::IndexClass::Sampler,
+            1 => {
+                self.sampler_indices.reserve(indices);
+                rt::IndexClass::Sampler
+            }
             5 => {
                 refuse(Unbuilt::Icb, RESERVE);
                 return Ok(());
@@ -679,24 +690,22 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         })
     }
 
-    /// Unbuilt: nil ([`Unbuilt::Sampler`]).
+    /// rt's sampler state ([`super::state`]); nil, counted, where rt refuses it or a value is one
+    /// rt has none of.
     fn new_sampler_state(
         &self,
         desc: &SamplerDesc,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::SamplerState>> {
-        let _ = desc;
-        refuse_create(Unbuilt::Sampler, "newSamplerStateWithDescriptor:");
-        Ok(None)
+        Ok(super::state::new_sampler_state(self, desc))
     }
 
-    /// Unbuilt: nil ([`Unbuilt::DepthStencil`]).
+    /// rt's depth-stencil state ([`super::state`]); nil, counted, where a value is one rt has
+    /// none of.
     fn new_depth_stencil_state(
         &self,
         desc: &DepthStencilDesc,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::DepthStencilState>> {
-        let _ = desc;
-        refuse_create(Unbuilt::DepthStencil, "newDepthStencilStateWithDescriptor:");
-        Ok(None)
+        Ok(super::state::new_depth_stencil_state(self, desc))
     }
 
     /// Unbuilt: nil ([`Unbuilt::Icb`]).

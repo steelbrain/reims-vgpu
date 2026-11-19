@@ -9,8 +9,9 @@
 //! events, then the display. Built: the device ([`device`]) with its answers ([`answers`] and
 //! [`mod@format`]), its command queues ([`queue`]), events, fences and shared events ([`event`]),
 //! the reservation of resource indices, buffers and the textures over them ([`buffer`]), heaps but
-//! sparse ones ([`heap`]), textures made of a descriptor, with their views ([`texture`]), and
-//! command buffers ([`command`]) with their blit encoders ([`blit`]). Until a piece is built, every
+//! sparse ones ([`heap`]), textures made of a descriptor, with their views ([`texture`]),
+//! command buffers ([`command`]) with their blit encoders ([`blit`]), and sampler and
+//! depth-stencil states ([`state`]). Until a piece is built, every
 //! call that reaches it is refused ([`unbuilt`]). The call answers as Metal's call answers where it
 //! fails: a nil object, an `NSError`, zeros. The refusal is counted under the piece's code,
 //! `rt-unbuilt-<piece>`, in the process's degradation counts, and the first of each kind writes a
@@ -37,6 +38,7 @@ pub mod event;
 pub mod format;
 pub mod heap;
 pub mod queue;
+pub mod state;
 pub mod texture;
 pub mod unbuilt;
 pub mod unmade;
@@ -59,6 +61,7 @@ pub use descriptor::{PassFields, RateMapFields, TextureFields};
 pub use device::RtDevice;
 pub use heap::RtHeap;
 pub use queue::RtQueue;
+pub use state::RtSampler;
 pub use texture::RtTexture;
 pub use unbuilt::Unbuilt;
 pub use unmade::{Unmade, kinds};
@@ -168,8 +171,8 @@ impl Platform for RtPlatform {
     type Buffer = RtObj<RtBuffer>;
     type Texture = RtObj<RtTexture>;
     type Heap = RtObj<RtHeap>;
-    type SamplerState = Unmade<kinds::SamplerState>;
-    type DepthStencilState = Unmade<kinds::DepthStencilState>;
+    type SamplerState = RtObj<RtSampler>;
+    type DepthStencilState = RtObj<metal2vulkan_rt::DepthStencilState>;
     type Fence = RtObj<metal2vulkan_rt::Fence>;
     type Event = RtObj<metal2vulkan_rt::Event>;
     type SharedEvent = RtObj<metal2vulkan_rt::SharedEvent>;

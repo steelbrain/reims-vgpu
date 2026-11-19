@@ -47,10 +47,6 @@ pub enum Unbuilt {
     /// What of heaps is not built yet (`super::heap`): a sparse heap, whose ranges rt maps no
     /// tiles of. Each answers nil.
     Heap,
-    /// Sampler states. Each answers nil.
-    Sampler,
-    /// Depth-stencil states. Each answers nil.
-    DepthStencil,
     /// Libraries and their functions (`newLibraryWithData:error:`): over the translator's
     /// library. Each answers nil.
     Library,
@@ -93,13 +89,11 @@ pub enum Unbuilt {
 
 impl Unbuilt {
     /// Every piece, once, in the order of their codes' places.
-    pub const ALL: [Unbuilt; 18] = [
+    pub const ALL: [Unbuilt; 16] = [
         Unbuilt::Buffer,
         Unbuilt::IosurfaceTexture,
         Unbuilt::SharedTexture,
         Unbuilt::Heap,
-        Unbuilt::Sampler,
-        Unbuilt::DepthStencil,
         Unbuilt::Library,
         Unbuilt::Pipeline,
         Unbuilt::ArgumentLayout,
@@ -121,8 +115,6 @@ impl Unbuilt {
             Unbuilt::IosurfaceTexture => "rt-unbuilt-iosurface-texture",
             Unbuilt::SharedTexture => "rt-unbuilt-shared-texture",
             Unbuilt::Heap => "rt-unbuilt-heap",
-            Unbuilt::Sampler => "rt-unbuilt-sampler",
-            Unbuilt::DepthStencil => "rt-unbuilt-depth-stencil",
             Unbuilt::Library => "rt-unbuilt-library",
             Unbuilt::Pipeline => "rt-unbuilt-pipeline",
             Unbuilt::ArgumentLayout => "rt-unbuilt-argument-layout",
@@ -145,8 +137,6 @@ impl Unbuilt {
             Unbuilt::IosurfaceTexture => "a texture over an IOSurface's plane",
             Unbuilt::SharedTexture => "a shared texture",
             Unbuilt::Heap => "a sparse heap",
-            Unbuilt::Sampler => "a sampler state",
-            Unbuilt::DepthStencil => "a depth-stencil state",
             Unbuilt::Library => "a library",
             Unbuilt::Pipeline => "a pipeline state",
             Unbuilt::ArgumentLayout => "an argument buffer's layout",

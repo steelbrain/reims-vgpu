@@ -431,9 +431,14 @@ pub(super) fn refused_metal<T>(sel: &'static str, why: &dyn std::fmt::Display) -
     None
 }
 
-/// The platform's own indices of the texture class (the module's docs): those the guest's
-/// reservations hold are never taken.
-pub struct OwnIndices(Mutex<Own>);
+/// The platform's own indices of a class, textures' (the module's docs) or sampler states'
+/// (`super::state`): those the guest's reservations hold are never taken.
+pub struct OwnIndices {
+    /// Their class.
+    class: rt::IndexClass,
+    /// What was taken and reserved.
+    own: Mutex<Own>,
+}
 
 /// [`OwnIndices`]' state.
 struct Own {
@@ -447,22 +452,19 @@ struct Own {
     free: VecDeque<u32>,
 }
 
-impl Default for OwnIndices {
-    fn default() -> OwnIndices {
-        OwnIndices::new()
-    }
-}
-
 impl OwnIndices {
-    /// None taken, none reserved.
-    pub fn new() -> OwnIndices {
-        OwnIndices(Mutex::new(Own::new(rt::IndexClass::Texture.range())))
+    /// None of `class` taken, none reserved.
+    pub fn new(class: rt::IndexClass) -> OwnIndices {
+        OwnIndices {
+            class,
+            own: Mutex::new(Own::new(class.range())),
+        }
     }
 
     /// Notes `indices` as the guest's, never to be taken: those past the class's range are none of
     /// its.
     pub fn reserve(&self, indices: &[u64]) {
-        let mut own = self.0.lock();
+        let mut own = self.own.lock();
         for &index in indices {
             if let Ok(index) = u32::try_from(index) {
                 own.reserve(index);
@@ -470,15 +472,15 @@ impl OwnIndices {
         }
     }
 
-    /// An index for a texture of the platform's own, granted on `device` where it is new; `None`
+    /// An index for an object of the platform's own, granted on `device` where it is new; `None`
     /// where every index is reserved or held.
     pub fn take(&self, device: &rt::Device) -> Result<Option<u32>, rt::Error> {
-        let mut own = self.0.lock();
+        let mut own = self.own.lock();
         let Some((index, fresh)) = own.next() else {
             return Ok(None);
         };
         if fresh {
-            match device.grant_indices(rt::IndexClass::Texture, index, 1) {
+            match device.grant_indices(self.class, index, 1) {
                 Ok(_) => {}
                 Err(rt::Error::Refused(rt::Refusal::IndicesGranted { .. })) => {}
                 Err(error) => {
@@ -492,7 +494,7 @@ impl OwnIndices {
 
     /// Gives `index` back, to be taken again once those given back before it are.
     pub fn give_back(&self, index: u32) {
-        self.0.lock().give_back(index);
+        self.own.lock().give_back(index);
     }
 }
 
@@ -830,9 +832,9 @@ mod tests {
     /// The texture class's own indices start at its last, 65,535.
     #[test]
     fn own_indices_start_at_the_class_s_last() {
-        let own = OwnIndices::new();
+        let own = OwnIndices::new(rt::IndexClass::Texture);
         own.reserve(&[65535, 1 << 40]);
-        assert_eq!(own.0.lock().next(), Some((65534, true)));
+        assert_eq!(own.own.lock().next(), Some((65534, true)));
     }
 
     /// A texture reaches shaders by shader-read or shader-write usage, or `Unknown`.

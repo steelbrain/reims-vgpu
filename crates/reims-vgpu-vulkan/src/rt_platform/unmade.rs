@@ -60,10 +60,6 @@ pub mod kinds {
     pub enum ComputeEncoder {}
     /// `id<MTLRenderCommandEncoder>`.
     pub enum RenderEncoder {}
-    /// `id<MTLSamplerState>`.
-    pub enum SamplerState {}
-    /// `id<MTLDepthStencilState>`.
-    pub enum DepthStencilState {}
     /// `MTLSharedTextureHandle *`.
     pub enum SharedTextureHandle {}
     /// `id<MTLLibrary>`.
@@ -121,24 +117,6 @@ impl<P: Platform> render::RenderEncoder<P> for Unmade<kinds::RenderEncoder> {
         self.unreachable()
     }
     fn tile_width(&self) -> u64 {
-        self.unreachable()
-    }
-}
-
-impl resource::SamplerState for Unmade<kinds::SamplerState> {
-    fn gpu_resource_id(&self) -> u64 {
-        self.unreachable()
-    }
-    fn resource_index(&self) -> u64 {
-        self.unreachable()
-    }
-}
-
-impl resource::DepthStencilState for Unmade<kinds::DepthStencilState> {
-    fn gpu_resource_id(&self) -> RaiseResult<u64> {
-        self.unreachable()
-    }
-    fn resource_index(&self) -> RaiseResult<u64> {
         self.unreachable()
     }
 }
