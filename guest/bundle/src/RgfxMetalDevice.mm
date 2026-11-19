@@ -31,6 +31,7 @@
 #include <mach/mach_vm.h>
 #include <memory>
 #include <mutex>
+#include <time.h>
 #include <vector>
 
 #include "RgfxAllocationCount.hpp"
@@ -334,11 +335,15 @@ bool rgfxRegionReclaim(void *context)
 // cached slab kept.
 static void rgfxLogSlabChurn(void *, const RgfxSlabs::Churn &c)
 {
+	// The wall clock, so a run places each line in its own steps.
+	struct timespec now = {};
+	clock_gettime(CLOCK_REALTIME, &now);
 	os_log(rgfxLog(),
-	       "RGFX slab churn: small slabs made %llu (%llu KiB), emptied %llu, refilled while kept "
-	       "%llu (%llu KiB), empty let go %llu; large slabs made %llu, taken from the cache %llu "
-	       "(%llu KiB)",
-	       c.classMade, c.classMadeBytes >> 10, c.emptied, c.refilled, c.refilledBytes >> 10,
+	       "RGFX slab churn at %lld.%03ld s: small slabs made %llu (%llu KiB), emptied %llu, "
+	       "refilled while kept %llu (%llu KiB), empty let go %llu; large slabs made %llu, taken "
+	       "from the cache %llu (%llu KiB)",
+	       static_cast<long long>(now.tv_sec), now.tv_nsec / 1000000, c.classMade,
+	       c.classMadeBytes >> 10, c.emptied, c.refilled, c.refilledBytes >> 10,
 	       c.emptyLetGo, c.dedicatedMade, c.dedicatedReused, c.dedicatedReusedBytes >> 10);
 }
 
