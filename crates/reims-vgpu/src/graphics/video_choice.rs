@@ -6,7 +6,8 @@
 //! 1. NVDEC, where the device is an NVIDIA GPU that CUDA opens (Linux: `super::nvidia`).
 //! 2. VA-API, on the device's render node, whatever its vendor (Linux: `super::vaapi`), or on
 //!    Windows on its DXGI adapter, over Mesa's VA-on-D3D12 driver (`super::vaapi`). The rt
-//!    platform's is Linux's alone (`super::vaapi::open_on_rt`).
+//!    platform's opens on both (`super::vaapi::open_on_rt`), on Windows by the LUID Vulkan answers
+//!    for the device, where each picture lands by the CPU's copy.
 //!
 //! On the rt platform VA-API decodes alone: its encoders read a surface the GPU copied a frame
 //! into, which rt's platform does not release to the driver (`super::vaapi::PlatformRules`), and
@@ -71,7 +72,7 @@ pub(crate) fn rt_graphics_video(
     ) {
         return Some(video);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     if let Some(video) = super::vaapi::open_on_rt(device, Arc::clone(&runtime)) {
         return Some(video);
     }

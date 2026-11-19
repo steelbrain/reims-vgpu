@@ -188,7 +188,8 @@ pub struct RtDevice {
 }
 
 /// Where a device's GPU lies on the host, as Vulkan answers it, which the host's video opens its
-/// APIs at: CUDA by the PCI address, VA-API on the render node.
+/// APIs at: CUDA by the PCI address, VA-API on the render node, and on Windows on the DXGI adapter
+/// of the LUID.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HostGpu {
     /// Its PCI domain, bus, device and function (`VK_EXT_pci_bus_info`); `None` where the device
@@ -197,6 +198,9 @@ pub struct HostGpu {
     /// Its render node's major and minor numbers (`VK_EXT_physical_device_drm`); `None` where the
     /// device does not list the extension or has no render node.
     pub render: Option<(u32, u32)>,
+    /// Its DXGI adapter's LUID (`VkPhysicalDeviceIDProperties::deviceLUID`); `None` where the
+    /// device says it has no valid one, as off Windows.
+    pub luid: Option<[u8; vk::LUID_SIZE]>,
 }
 
 impl RtDevice {
@@ -326,9 +330,18 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         }));
     };
     let drm = seen.get(at).and_then(|s| s.drm);
+    let luid = candidates.get(at).and_then(|(physical, _)| {
+        let mut id = vk::PhysicalDeviceIDProperties::default();
+        let mut asked = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+        // SAFETY: the instance listed the device and is alive; rt's instance is at Vulkan 1.3,
+        // where the structure is core.
+        unsafe { raw.get_physical_device_properties2(physical.raw(), &mut asked) };
+        (id.device_luid_valid == vk::TRUE).then_some(id.device_luid)
+    });
     let host_gpu = seen.get(at).map_or_else(HostGpu::default, |seen| HostGpu {
         pci: seen.pci,
         render: seen.drm.and_then(|nodes| nodes.render),
+        luid,
     });
     let (Some((physical, floor)), Some(uuid)) =
         (candidates.get(at), seen.get(at).and_then(|s| s.uuid))

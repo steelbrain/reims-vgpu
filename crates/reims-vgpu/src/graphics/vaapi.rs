@@ -55,7 +55,8 @@
 //!      buffer, the guest's pages or the surface's device cache, at its own rows and offset, the
 //!      crop alone as the CPU's copy writes it ([`crop_extent`]). It is taken wherever the open
 //!      made a copier on the runtime device ([`open_on`]), the device imports the driver's
-//!      surfaces as images, and the planes' buffer is their memory.
+//!      surfaces as images, and the planes' buffer is their memory. The rt platform's copier on
+//!      Windows declines each picture, counted, so that each lands by the CPU (`rt_windows`).
 //!   3. **By the CPU**: the frame read back (staged, or `vaGetImage`, the VA crate's way back),
 //!      and copied into the planes' host bytes, or into the session's staging for a plane in a
 //!      device cache.
@@ -134,6 +135,8 @@ use super::video_host::{
 
 mod encode;
 mod gpu_copy;
+#[cfg(all(feature = "rt", windows))]
+mod rt_windows;
 
 /// The backend's name in the session's log lines.
 const NAME: &str = "VA-API";
@@ -186,7 +189,7 @@ pub(crate) enum CachedReferences {
     /// driver's to touch between its acquire and the driver's next write of a whole picture
     /// (the rt platform's `rt_platform::export`, "The acquire").
     #[cfg_attr(
-        not(all(feature = "rt", unix)),
+        not(feature = "rt"),
         allow(
             dead_code,
             reason = "the rt platform's arm alone keeps references apart ([`open_on_rt`]), and \
@@ -293,8 +296,38 @@ pub(crate) fn open_on_rt(
     )
 }
 
+/// The VA-API video of the rt platform's `device` on Windows: on the DXGI adapter of its GPU, by
+/// the LUID Vulkan answers for it (`rt_platform::HostGpu`), over Mesa's VA-on-D3D12 driver, as
+/// [`open`] opens it; `None`, logged, where its GPU names none. Its pictures land by the CPU's
+/// copy, at the GPU's copy's refusal of each, counted (`rt_windows`); a reference picture is not
+/// decoded into its cache ([`CachedReferences::Apart`]), and no encoder is answered, as on Linux.
+#[cfg(all(feature = "rt", windows))]
+pub(crate) fn open_on_rt(
+    device: &RtDevice,
+    runtime: Arc<dyn Runtime>,
+) -> Option<Arc<dyn GraphicsVideo<reims_vgpu_vulkan::RtPlatform>>> {
+    let Some(luid) = device.host_gpu().luid else {
+        log::info!("hardware video: no VA-API: the device's GPU names no DXGI adapter");
+        return None;
+    };
+    let copies: Arc<dyn GpuCopies<reims_vgpu_vulkan::RtPlatform>> = Arc::new(rt_windows::RtCopies);
+    let rules = PlatformRules {
+        references: CachedReferences::Apart,
+        encodes: false,
+    };
+    open::<reims_vgpu_vulkan::RtPlatform>(
+        device,
+        device.facts().registry_id,
+        DisplayAt::Adapter(luid, std::marker::PhantomData),
+        runtime,
+        Some(copies),
+        None,
+        rules,
+    )
+}
+
 /// The rt platform's device.
-#[cfg(all(feature = "rt", unix))]
+#[cfg(feature = "rt")]
 type RtDevice = reims_vgpu_vulkan::rt_platform::RtObj<reims_vgpu_vulkan::rt_platform::RtDevice>;
 
 /// The VA-API video of the runtime device `device` on Windows: on the DXGI adapter of its GPU, by

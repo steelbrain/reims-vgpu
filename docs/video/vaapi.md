@@ -429,7 +429,8 @@ where its GPU is not one NVDEC opens: the device's video chooser
 (reims-vgpu's `src/graphics/video_choice.rs`) tries NVDEC, then VA-API on
 the render node of the runtime device's own GPU, whatever its vendor
 (`host_gpus::render_node_of`), or on Windows on its DXGI adapter
-(`host_gpus::adapter_luid_of`). The arm
+(`host_gpus::adapter_luid_of`; on the rt platform by the LUID Vulkan
+answers for its device, `rt_platform::HostGpu`). The arm
 (`src/graphics/vaapi.rs`) runs the module's `H264Decoder` and
 `HevcDecoder` in a host video session of reims-vgpu's
 (`src/graphics/video_host.rs`), whose event the host signals.
@@ -474,7 +475,11 @@ the render node of the runtime device's own GPU, whatever its vendor
      device fails it. A device
      that lists none of the dma-buf image extensions, an export not of a
      layer a plane, or a plane in a buffer whose GPU writes do not reach
-     its memory, declines it;
+     its memory, declines it. The rt platform's copier on Windows declines
+     every picture, each counted as `rt-video-gpu-copy-declined`
+     (reims-vgpu's `src/graphics/vaapi/rt_windows.rs`): rt imports no
+     image of the shared texture yet, so each lands the third way
+     ([bugs.md](bugs.md), B94);
   3. by the CPU: the frame read back ("The copy back") and copied into the
      planes' host bytes, or into the session's staging where a plane lies
      in a device cache.

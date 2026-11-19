@@ -97,7 +97,8 @@ impl ApiPlatform for RtPlatform {
     }
 
     /// The first of the host's video arms that takes the device (`graphics::video_choice`): on
-    /// Linux, NVDEC's decodes on an NVIDIA GPU; none elsewhere yet.
+    /// Linux, NVDEC's decodes on an NVIDIA GPU, then VA-API's on the GPU's render node; on
+    /// Windows, VA-API's on the GPU's DXGI adapter; none on macOS.
     fn graphics_video(
         &self,
         device: &<Self as Platform>::Device,

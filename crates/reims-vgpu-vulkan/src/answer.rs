@@ -2708,9 +2708,11 @@ pub fn out_of_host_memory_count() -> u64 {
 /// makes a no-copy buffer (`no-copy-buffers`) and the guest notes that one's identity escaped, by
 /// the act that noted it (`buffer-escaped-gpu-address`, `-argument-encoder`, `-resource-id`,
 /// `-residency-set`), one over a copy of its pages counted too (`buffer-escaped-read-only-pages`),
-/// with each command buffer begun of a process that holds such a copy (`escaped-copy-commits`);
-/// and this platform's command predication's, a command buffer a loop ran past its copies in
-/// (`predication-loop-overrun`, [`crate::gpu::predication::OVERRUN_CODE`]); and the objects made,
+/// with each command buffer begun of a process that holds such a copy (`escaped-copy-commits`),
+/// and as its VA-API video on the rt platform on Windows lands a picture by the CPU's copy, the
+/// GPU's copy declined (`rt-video-gpu-copy-declined`); and this platform's command predication's,
+/// a command buffer a loop ran past its copies in (`predication-loop-overrun`,
+/// [`crate::gpu::predication::OVERRUN_CODE`]); and the objects made,
 /// live at once and imported by the kind of make ([`MadeCodes`], [`count_made`]), and, on a
 /// platform that keeps a pin only in its known blocks, the pins not kept by the kind of object
 /// (`rt-gpu-address-unpinned-<kind>`) and the textures placed at the guest's own pick
