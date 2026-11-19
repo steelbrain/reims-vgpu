@@ -1526,12 +1526,14 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Stages the IOSurface device caches' copies from now on (`surface_cache`, "Staged
     /// copies"): no surface's view takes an import of its pages, and every cache copies them
-    /// through the host's CPU, timed by the platform's clock. Set once, at the device's make,
-    /// before any surface is named.
-    pub(crate) fn set_staged_surface_copies(&self) {
+    /// through the host's CPU, timed by the platform's clock, the spare pieces' top-ups made
+    /// under the device's `reset_gate` held shared. Set once, at the device's make, before any
+    /// surface is named.
+    pub(crate) fn set_staged_surface_copies(&self, reset_gate: Arc<parking_lot::RwLock<()>>) {
         self.shared.surface_views.lock().set_staged();
         let platform = Arc::clone(&self.platform);
-        (self.surface_caches).set_staged(Arc::new(move || platform.clock().now_mono()));
+        let now = Arc::new(move || platform.clock().now_mono());
+        self.surface_caches.set_staged(now, reset_gate);
     }
 
     /// Where the caches' copies are staged, the platform's clock as a `SURFACE_PAGES` begins on

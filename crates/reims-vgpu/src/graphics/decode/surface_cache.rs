@@ -302,12 +302,20 @@
 //!   copy's command buffer has completed and its CPU copy is done, its pieces go back to the
 //!   caches' spares ([`Spares`]), up to [`SPARE_BYTES`] of them, two whole pieces, which the
 //!   next copies take in place of a make, the shortest spare that holds each piece; a copy in
-//!   flight never shares one. Each piece taken is counted (`rt-staging-pieces`, and
-//!   `rt-staging-pieces-spared` those a spare served), and each made, with the nanoseconds its
-//!   make took in all and the longest, for a cache's first staged copy
+//!   flight never shares one. A copy whose takes leave no whole piece among the spares hands a
+//!   top-up to a thread of theirs ([`SPARES_THREADS`]), which nothing waits for: it makes whole
+//!   pieces until the spares hold [`SPARE_BYTES`] of them, letting go of shorter ones to fit,
+//!   each make under the device's reset gate. A copy that finds no spare still makes its piece
+//!   on its own thread. Each piece taken is counted (`rt-staging-pieces`, and
+//!   `rt-staging-pieces-spared` those a spare served), and each a copy made, with the
+//!   nanoseconds its make took in all and the longest, for a cache's first staged copy
 //!   (`rt-staging-piece-makes-first`, `-first-ns`, `-first-max-ns`, `-first-kib`) apart from
 //!   the copies after it (`rt-staging-piece-makes-repeat`, `-repeat-ns`, `-repeat-max-ns`,
-//!   `-repeat-kib`).
+//!   `-repeat-kib`); each a top-up made the same way (`rt-staging-spares-made`, `-made-ns`,
+//!   `-made-max-ns`, `-made-kib`), the spares let go of (`rt-staging-spares-let-go`,
+//!   `-let-go-kib`) and of them those a top-up made and no copy took, with those still unused
+//!   as the spares go (`rt-staging-spares-unused`, `-unused-kib`), and the most KiB the spares
+//!   held at once (`rt-staging-spares-held-most-kib`).
 //!   A download's CPU copy, and the answers that wait for it, run on a thread of the caches' own
 //!   ([`INTO_PAGES_THREADS`]), not in its command buffer's completed handler: the platform sees
 //!   every queue's completions on one thread, which a large surface's copy, tens of milliseconds
@@ -386,6 +394,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use parking_lot::RwLock;
 use reims_vgpu_graphics::ops::{
     RGFX_SURFACE_USE_REFILL, RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse,
 };
@@ -2105,7 +2114,7 @@ impl<P: Platform> SurfaceCaches<P> {
             shaped: false,
             shape_clock: 0,
             staged: None,
-            spares: Arc::new(Spares::new(SPARE_BYTES, PIECE)),
+            spares: Arc::new(Spares::new(SPARE_BYTES, PIECE, Arc::default())),
             lands_out: Arc::new(Worker::new(INTO_PAGES_THREADS)),
         }
     }
@@ -5458,9 +5467,15 @@ impl<P: Platform> Caches<P> {
     }
 
     /// Stages every cache's copies from now on (the module doc, "Staged copies"), the host's
-    /// CPU's part of each timed by `now`: set once, at the device's make, before any cache.
-    pub(crate) fn set_staged(&self, now: Now) {
-        self.state.lock().staged = Some(now);
+    /// CPU's part of each timed by `now`, the spares' top-ups made under the device's reset
+    /// `gate` ([`Spares`]): set once, at the device's make, before any cache.
+    pub(crate) fn set_staged(&self, now: Now, gate: Arc<RwLock<()>>) {
+        let spares = Arc::new(Spares::new(SPARE_BYTES, PIECE, gate));
+        let mut state = self.state.lock();
+        state.staged = Some(now);
+        let was = std::mem::replace(&mut state.spares, spares);
+        drop(state);
+        drop(was);
         self.staged.store(true, Ordering::Release);
     }
 
@@ -5468,7 +5483,17 @@ impl<P: Platform> Caches<P> {
     /// spare, in place of rt's unit ([`PIECE`]): a test's surfaces are shorter than it.
     #[cfg(test)]
     pub(crate) fn set_staging_piece(&self, piece: u64) {
-        self.state.lock().spares = Arc::new(Spares::new(2 * piece, piece));
+        let mut state = self.state.lock();
+        let gate = Arc::clone(&state.spares.gate);
+        let was = std::mem::replace(&mut state.spares, Arc::new(Spares::new(2 * piece, piece, gate)));
+        drop(state);
+        drop(was);
+    }
+
+    /// The staged copies' spares, for the tests to let their top-ups run and wait for them.
+    #[cfg(test)]
+    fn spares(&self) -> Arc<Spares<P>> {
+        Arc::clone(&self.state.lock().spares)
     }
 
     /// Whether every cache's copies are staged ([`Self::set_staged`]).
@@ -7326,50 +7351,79 @@ impl<P: Platform> Staging<P> {
 /// hold takes the rest from the platform.
 const SPARE_BYTES: u64 = 2 * PIECE;
 
+/// The name of the threads, `<name>-<i>`, that top the staged copies' spares up ([`Spares`]),
+/// one at a time, as every top-up is under one key ([`Worker`]).
+pub(crate) const SPARES_THREADS: &str = "reims-vgpu.graphics-staging-spares";
+
 /// The staged copies' pieces no copy uses (the module doc, "Staged copies"), each given back
 /// once its copy's command buffer completed and its CPU copy was done, so a copy in flight never
 /// shares one; a copy takes the shortest one that holds a piece it needs in place of a make.
-/// Kept to `cap` bytes in all: a piece given past them is let go of.
+/// Kept to `cap` bytes in all: a piece given past them takes the place of the shortest kept
+/// where it is longer, else is let go of.
+///
+/// A copy whose takes leave no whole piece kept (`piece` bytes) hands a top-up over to a thread
+/// of the spares' own ([`SPARES_THREADS`]), which nothing waits for: it makes whole pieces until
+/// `cap` bytes of them are kept, letting go of shorter ones kept to fit, each make under the
+/// device's reset gate held shared, so none runs while the device resets. A copy that finds no
+/// spare makes its piece on its own thread, as the top-up is not ahead of it.
 struct Spares<P: Platform> {
-    idle: Mutex<Vec<P::Buffer>>,
+    kept: Arc<Kept<P>>,
     cap: u64,
     /// The longest piece a copy lays its bytes in ([`PIECE`]; shorter in the tests).
     piece: u64,
+    /// Runs the top-ups, under one key.
+    topper: Worker,
+    /// The device's reset gate, which each top-up's make holds shared.
+    gate: Arc<RwLock<()>>,
+}
+
+/// What [`Spares`] and their top-ups share: the pieces kept, whether a top-up is handed over and
+/// not yet begun, and whether the spares are gone.
+struct Kept<P: Platform> {
+    idle: Mutex<Vec<Spare<P>>>,
+    asked: AtomicBool,
+    closed: AtomicBool,
+}
+
+/// A kept piece, and whether a top-up made it and no copy has taken it.
+struct Spare<P: Platform> {
+    buffer: P::Buffer,
+    unused: bool,
 }
 
 impl<P: Platform> Spares<P> {
-    fn new(cap: u64, piece: u64) -> Self {
+    fn new(cap: u64, piece: u64, gate: Arc<RwLock<()>>) -> Self {
+        let topper = Worker::new(SPARES_THREADS);
+        // A test's copies see no top-up until it lets them ([`Self::release_top_ups`]): what a
+        // copy does where the top-up is not ahead of it, which a run meets as well.
+        #[cfg(test)]
+        topper.hold();
         Spares {
-            idle: Mutex::new(Vec::new()),
+            kept: Arc::new(Kept {
+                idle: Mutex::new(Vec::new()),
+                asked: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
+            }),
             cap,
             piece,
+            topper,
+            gate,
         }
     }
 
     /// The shortest kept piece of at least `length` bytes, no longer kept; `None` where none is.
     fn take(&self, length: u64) -> Option<P::Buffer> {
-        let mut idle = self.idle.lock();
+        let mut idle = self.kept.idle.lock();
         let (at, _) = (idle.iter().enumerate())
-            .filter(|(_, b)| b.length() >= length)
-            .min_by_key(|(_, b)| b.length())?;
-        Some(idle.swap_remove(at))
+            .filter(|(_, s)| s.buffer.length() >= length)
+            .min_by_key(|(_, s)| s.buffer.length())?;
+        Some(idle.swap_remove(at).buffer)
     }
 
-    /// `buffer`, whose copy is done, kept where it fits under the cap; else let go of, outside
-    /// the lock.
+    /// `buffer`, whose copy is done, kept under the cap ([`Kept::keep`]); what is let go of goes
+    /// outside the lock.
     fn give(&self, buffer: P::Buffer) {
-        let over = {
-            let mut idle = self.idle.lock();
-            let held: u64 = idle.iter().map(|b| b.length()).sum();
-            match held.saturating_add(buffer.length()) <= self.cap {
-                true => {
-                    idle.push(buffer);
-                    None
-                }
-                false => Some(buffer),
-            }
-        };
-        drop(over);
+        drop(self.kept.keep(buffer, false, self.cap));
     }
 
     /// A piece of each of `lens`' lengths, for a copy of a cache, its `first` staged copy where
@@ -7377,7 +7431,8 @@ impl<P: Platform> Spares<P> {
     /// unzeroed. Counted where the copies are `timed` ([`piece_taken`], [`piece_made`]): each
     /// taken, those spared, and those made with the nanoseconds each make took, apart for a
     /// cache's first staged copy and those after it. `None` where one is not made, the pieces
-    /// taken given back.
+    /// taken given back. Where the takes leave no whole piece kept, a top-up is handed over
+    /// ([`Self::top_up`]).
     fn pieces(
         &self,
         device: &P::Device,
@@ -7411,7 +7466,185 @@ impl<P: Platform> Spares<P> {
             }
             pieces.push(piece);
         }
+        self.top_up(device, timed);
         Ok(Some(pieces))
+    }
+
+    /// Hands a top-up over to the spares' thread ([`Kept::top_up`]) where no whole piece is
+    /// kept and none is handed over and not yet begun, its makes on `device`, timed by `timed`.
+    fn top_up(&self, device: &P::Device, timed: Option<&Now>) {
+        let kept = &self.kept;
+        if kept.wholes(self.piece) > 0 || kept.asked.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let kept = Arc::clone(kept);
+        let gate = Arc::clone(&self.gate);
+        let device = device.clone_ref();
+        let timed = timed.cloned();
+        let sizes = (self.cap, self.piece);
+        self.topper.submit(
+            0,
+            Box::new(move || {
+                kept.asked.store(false, Ordering::Release);
+                kept.top_up(&device, &gate, sizes, timed.as_ref());
+            }),
+        );
+    }
+
+    /// Lets the top-ups run, which a test's spares hold from their make ([`Self::new`]).
+    #[cfg(test)]
+    fn release_top_ups(&self) {
+        self.topper.release();
+    }
+
+    /// Waits until no top-up is handed over or runs (tests only).
+    #[cfg(test)]
+    fn settle(&self) {
+        self.topper.flush();
+    }
+
+    /// The lengths of the pieces kept, and how many of them a top-up made and no copy took
+    /// (tests only).
+    #[cfg(test)]
+    fn held(&self) -> (Vec<u64>, usize) {
+        let idle = self.kept.idle.lock();
+        let mut lengths: Vec<u64> = idle.iter().map(|s| s.buffer.length()).collect();
+        lengths.sort_unstable();
+        (lengths, idle.iter().filter(|s| s.unused).count())
+    }
+}
+
+impl<P: Platform> Drop for Spares<P> {
+    /// Ends the top-ups: one running stops before its next make, and the spares go once it has
+    /// returned, the pieces a top-up made and no copy took counted ([`SPARES_UNUSED`]).
+    fn drop(&mut self) {
+        self.kept.closed.store(true, Ordering::Release);
+        #[cfg(test)]
+        self.topper.release();
+        self.topper.flush();
+        let idle = std::mem::take(&mut *self.kept.idle.lock());
+        for spare in idle.iter().filter(|s| s.unused) {
+            spare_unused(spare.buffer.length());
+        }
+    }
+}
+
+impl<P: Platform> Kept<P> {
+    /// How many whole pieces, `piece` bytes or longer, are kept.
+    fn wholes(&self, piece: u64) -> usize {
+        let idle = self.idle.lock();
+        idle.iter().filter(|s| s.buffer.length() >= piece).count()
+    }
+
+    /// Keeps `buffer`, `unused` where a top-up made it, under `cap` bytes kept in all: where it
+    /// does not fit, it takes the place of the shortest kept if it is longer and then fits, else
+    /// it is let go of. The piece let go of, counted ([`spare_let_go`]), is returned for the
+    /// caller to drop outside the lock.
+    fn keep(&self, buffer: P::Buffer, unused: bool, cap: u64) -> Option<Spare<P>> {
+        let spare = Spare { buffer, unused };
+        let length = spare.buffer.length();
+        let mut idle = self.idle.lock();
+        let held: u64 = idle.iter().map(|s| s.buffer.length()).sum();
+        let gone = if held.saturating_add(length) <= cap {
+            idle.push(spare);
+            None
+        } else {
+            let shortest = (idle.iter().enumerate())
+                .map(|(at, s)| (at, s.buffer.length()))
+                .min_by_key(|&(_, short)| short);
+            match shortest {
+                Some((at, short)) if short < length && held - short + length <= cap => {
+                    Some(std::mem::replace(&mut idle[at], spare))
+                }
+                _ => Some(spare),
+            }
+        };
+        let held: u64 = idle.iter().map(|s| s.buffer.length()).sum();
+        drop(idle);
+        spares_held(held);
+        if let Some(gone) = &gone {
+            spare_let_go(gone.buffer.length(), gone.unused);
+        }
+        gone
+    }
+
+    /// A top-up, on the spares' thread: makes whole pieces of `piece` bytes on `device` until
+    /// `cap` bytes of them are kept, letting go of shorter pieces kept to fit, each make under
+    /// `gate` held shared and counted ([`SPARES_MADE`]), timed by `timed`. Stops once the spares
+    /// are gone, or where the platform makes no piece.
+    fn top_up(
+        &self,
+        device: &P::Device,
+        gate: &RwLock<()>,
+        (cap, piece): (u64, u64),
+        timed: Option<&Now>,
+    ) {
+        loop {
+            if self.closed.load(Ordering::Acquire) {
+                return;
+            }
+            let gone = {
+                let mut idle = self.idle.lock();
+                let wholes = idle.iter().filter(|s| s.buffer.length() >= piece).count();
+                if (wholes.to_u64() + 1).saturating_mul(piece) > cap {
+                    return;
+                }
+                let mut gone = Vec::new();
+                while idle.iter().map(|s| s.buffer.length()).sum::<u64>() + piece > cap {
+                    let shortest = (idle.iter().enumerate())
+                        .filter(|(_, s)| s.buffer.length() < piece)
+                        .min_by_key(|(_, s)| s.buffer.length())
+                        .map(|(at, _)| at);
+                    let Some(at) = shortest else {
+                        break;
+                    };
+                    gone.push(idle.swap_remove(at));
+                }
+                gone
+            };
+            for spare in &gone {
+                spare_let_go(spare.buffer.length(), spare.unused);
+            }
+            drop(gone);
+            let made = {
+                let _shared = gate.read();
+                if self.closed.load(Ordering::Acquire) {
+                    return;
+                }
+                let at = timed.map(|now| now());
+                let made =
+                    refusing(|| device.new_scratch_buffer_of_length(ON, piece, STORAGE_SHARED));
+                if let (Some(now), Some(at), Ok(Some(_))) = (timed, at, &made) {
+                    spare_made(now().saturating_duration_since(at), piece);
+                }
+                made
+            };
+            let buffer = match made {
+                Ok(Some(buffer)) => buffer,
+                Ok(None) => {
+                    top_up_ended("the platform made no piece");
+                    return;
+                }
+                Err(raise) => {
+                    top_up_ended(&format!("the platform raised ({raise:?})"));
+                    return;
+                }
+            };
+            drop(self.keep(buffer, true, cap));
+        }
+    }
+}
+
+/// A top-up that stopped short of the cap as its make failed, `why`: logged the first time
+/// alone (docs/conventions.md); the next copy that leaves no whole piece kept hands another over.
+fn top_up_ended(why: &str) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            target: "reims_vgpu::graphics",
+            "the staged copies' spares were not topped up: {why}; a copy that finds no spare \
+             makes its piece on its own thread"
+        );
     }
 }
 
@@ -7480,6 +7713,71 @@ const PIECE_MAKES_KIB: [&str; 2] = [
 
 /// The longest make of [`PIECE_MAKES`] so far, of each, which its code's count rises to.
 static PIECE_MAKE_MAX_NS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// The whole pieces the spares' top-ups made ([`Kept::top_up`]): how many, the nanoseconds their
+/// makes took, under the reset gate, and the longest of them; and their KiB
+/// ([`SPARES_MADE_KIB`]).
+const SPARES_MADE: (&str, &str, &str) = (
+    "rt-staging-spares-made",
+    "rt-staging-spares-made-ns",
+    "rt-staging-spares-made-max-ns",
+);
+const SPARES_MADE_KIB: &str = "rt-staging-spares-made-kib";
+
+/// The longest make of [`SPARES_MADE`] so far, which its code's count rises to.
+static SPARES_MADE_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The pieces the spares let go of ([`Kept::keep`], [`Kept::top_up`]): one given past the cap,
+/// or the shorter one a longer took the place of, or one a top-up let go of to fit a whole
+/// piece; how many, and their KiB.
+const SPARES_LET_GO: (&str, &str) = ("rt-staging-spares-let-go", "rt-staging-spares-let-go-kib");
+
+/// Of the pieces let go of, those a top-up made and no copy took, with those the spares held
+/// as they went ([`Spares`]'s drop): how many, and their KiB.
+const SPARES_UNUSED: (&str, &str) = ("rt-staging-spares-unused", "rt-staging-spares-unused-kib");
+
+/// The most KiB the spares held at once ([`SPARES_HELD_MOST`]), which its count rises to.
+const SPARES_HELD_KIB: &str = "rt-staging-spares-held-most-kib";
+
+/// The most bytes the spares held at once, of every device's.
+static SPARES_HELD_MOST: AtomicU64 = AtomicU64::new(0);
+
+/// One whole piece of `length` bytes a top-up made, in `took` ([`SPARES_MADE`]).
+fn spare_made(took: std::time::Duration, length: u64) {
+    let (made, ns, longest) = SPARES_MADE;
+    let took = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
+    reims_vgpu_vulkan::answer::count_kind(made);
+    reims_vgpu_vulkan::answer::count_kind_by(ns, took);
+    reims_vgpu_vulkan::answer::count_kind_by(SPARES_MADE_KIB, length.div_ceil(1024));
+    let was = SPARES_MADE_MAX_NS.fetch_max(took, Ordering::Relaxed);
+    reims_vgpu_vulkan::answer::count_kind_by(longest, took.saturating_sub(was));
+}
+
+/// One piece of `length` bytes the spares let go of, `unused` where a top-up made it and no copy
+/// took it ([`SPARES_LET_GO`]).
+fn spare_let_go(length: u64, unused: bool) {
+    reims_vgpu_vulkan::answer::count_kind(SPARES_LET_GO.0);
+    reims_vgpu_vulkan::answer::count_kind_by(SPARES_LET_GO.1, length.div_ceil(1024));
+    if unused {
+        spare_unused(length);
+    }
+}
+
+/// One piece of `length` bytes a top-up made that went with no copy taking it
+/// ([`SPARES_UNUSED`]).
+fn spare_unused(length: u64) {
+    reims_vgpu_vulkan::answer::count_kind(SPARES_UNUSED.0);
+    reims_vgpu_vulkan::answer::count_kind_by(SPARES_UNUSED.1, length.div_ceil(1024));
+}
+
+/// The spares hold `held` bytes now ([`SPARES_HELD_KIB`]).
+fn spares_held(held: u64) {
+    let was = SPARES_HELD_MOST.fetch_max(held, Ordering::Relaxed);
+    if held > was {
+        let rise = held.div_ceil(1024) - was.div_ceil(1024);
+        reims_vgpu_vulkan::answer::count_kind_by(SPARES_HELD_KIB, rise);
+    }
+}
 
 /// One piece taken for a staged copy, from the spares where `spared` ([`PIECES_TAKEN`]).
 fn piece_taken(spared: bool) {
@@ -14092,7 +14390,7 @@ pub(super) mod tests {
     #[test]
     fn a_staged_caches_copies_make_no_import() {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies();
+        r.dec.set_staged_surface_copies(Arc::default());
         queues(&mut r);
         let page = r.page;
         let length = 2 * page;
@@ -14169,7 +14467,7 @@ pub(super) mod tests {
     #[test]
     fn a_staged_deferred_blocks_pages_are_taken_copied_with_no_import() {
         let mut r = deferring(8);
-        r.dec.set_staged_surface_copies();
+        r.dec.set_staged_surface_copies(Arc::default());
         let page = r.page;
         let length = 2 * page;
         assert_eq!(defer(&mut r, BLOCK, length), RGFX_STATUS_OK);
@@ -14225,7 +14523,7 @@ pub(super) mod tests {
     #[test]
     fn a_staged_copy_in_flight_never_shares_its_buffer() {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies();
+        r.dec.set_staged_surface_copies(Arc::default());
         queues(&mut r);
         let page = r.page;
         let length = 2 * page;
@@ -14284,7 +14582,7 @@ pub(super) mod tests {
     #[test]
     fn a_staged_downloads_copy_into_its_pages_holds_up_no_other_completion() {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies();
+        r.dec.set_staged_surface_copies(Arc::default());
         queues(&mut r);
         let page = r.page;
         let length = 2 * page;
@@ -14346,7 +14644,7 @@ pub(super) mod tests {
     fn a_staged_download_moves_only_what_its_gpu_copy_wrote() {
         use super::super::surface_pages::tests::one_plane;
         let mut r = rig(16);
-        r.dec.set_staged_surface_copies();
+        r.dec.set_staged_surface_copies(Arc::default());
         r.p.world().lay_linear_rows(Some(256));
         queues(&mut r);
         let page = r.page;
@@ -14417,7 +14715,7 @@ pub(super) mod tests {
                 .unwrap()
                 .unwrap()
         };
-        let spares = Spares::<FakePlatform>::new(5 * page, 4 * page);
+        let spares = Spares::<FakePlatform>::new(5 * page, 4 * page, Arc::default());
         let (long, short) = (made(3 * page), made(2 * page));
         let (long_id, short_id) = (id_of(&long), id_of(&short));
         spares.give(long);
@@ -14434,6 +14732,146 @@ pub(super) mod tests {
         );
         spares.give(taken);
         assert!(spares.take(2 * page).is_some(), "given back, kept again");
+    }
+
+    /// A piece given back past the spares' cap takes the place of the shortest kept where it is
+    /// longer and then fits, that one let go of; else it is let go of itself; each counted
+    #[test]
+    fn a_piece_given_past_the_spares_cap_takes_a_shorter_ones_place() {
+        let r = rig(8);
+        let page = r.page;
+        let made = |length| {
+            (r.device.new_buffer_of_length(ON, length, 0))
+                .unwrap()
+                .unwrap()
+        };
+        let spares = Spares::<FakePlatform>::new(4 * page, 4 * page, Arc::default());
+        let codes = [SPARES_LET_GO.0, SPARES_LET_GO.1, SPARES_UNUSED.0];
+        let before = codes.map(counted);
+        spares.give(made(2 * page));
+        spares.give(made(page));
+        spares.give(made(2 * page));
+        assert_eq!(
+            spares.held(),
+            (vec![2 * page, 2 * page], 0),
+            "the longer took the shorter's place"
+        );
+        spares.give(made(page));
+        assert_eq!(
+            spares.held(),
+            (vec![2 * page, 2 * page], 0),
+            "one no longer than any kept is let go of"
+        );
+        let kib = page.div_ceil(1024);
+        let after = codes.map(counted);
+        assert_eq!(
+            [0, 1, 2].map(|i| after[i] - before[i]),
+            [2, 2 * kib, 0],
+            "two pieces of a page let go of, none a top-up's"
+        );
+    }
+
+    /// The lengths of the scratch buffers `calls` made: those the spares' top-ups made
+    /// ([`SPARES_THREADS`]), then the rest.
+    fn scratch_made(calls: &[Call]) -> (Vec<u64>, Vec<u64>) {
+        let (mut topped, mut rest) = (Vec::new(), Vec::new());
+        for call in calls.iter().filter(|c| c.sel == SCRATCH_BUFFER) {
+            let length = call.args[0].as_u64().expect("a length");
+            match (call.thread.as_deref()).is_some_and(|t| t.starts_with(SPARES_THREADS)) {
+                true => topped.push(length),
+                false => rest.push(length),
+            }
+        }
+        (topped, rest)
+    }
+
+    /// A copy whose takes leave no whole piece among the staged copies' spares hands a top-up to
+    /// the spares' own thread ([`SPARES_THREADS`]), which the copy does not wait for: the copy
+    /// makes the piece it found no spare for on its own thread, and the top-up makes whole
+    /// pieces until the spares hold their cap, letting go of a shorter one kept to fit, none
+    /// while the device's reset gate is held alone. A copy that takes both whole pieces hands
+    /// another over; the pieces given back past the cap are let go of, and those a top-up made
+    /// and no copy took are counted unused as the spares go
+    #[test]
+    fn the_staged_copies_spares_are_topped_up_to_their_cap_on_a_thread_of_their_own() {
+        let r = rig(8);
+        let page = r.page;
+        let piece = 2 * page;
+        let gate: Arc<RwLock<()>> = Arc::default();
+        let spares = Spares::<FakePlatform>::new(2 * piece, piece, Arc::clone(&gate));
+        let tick = Arc::new(AtomicU64::new(0));
+        let now: Now = Arc::new(move || {
+            MonoTime::from_nanos(tick.fetch_add(1000, Ordering::SeqCst))
+        });
+        let codes = [
+            PIECE_MAKES[0].0,
+            SPARES_MADE.0,
+            SPARES_MADE_KIB,
+            SPARES_LET_GO.0,
+            SPARES_UNUSED.0,
+        ];
+        let before = codes.map(counted);
+
+        // No spare: the copy makes its piece on its own thread; the top-up waits its turn.
+        let mark = r.p.call_log().mark();
+        let mut pieces = (spares.pieces(&r.device, &[page], true, Some(&now)))
+            .unwrap()
+            .expect("a piece");
+        assert_eq!(
+            scratch_made(&r.p.call_log().since(mark)),
+            (vec![], vec![page]),
+            "made on the copy's thread"
+        );
+        assert_eq!(spares.held(), (vec![], 0), "nothing kept yet");
+
+        // The top-up makes nothing while the reset gate is held alone.
+        let mark = r.p.call_log().mark();
+        let alone = gate.write();
+        spares.release_top_ups();
+        spares.give(pieces.pop().expect("the copy's piece"));
+        assert_eq!(
+            scratch_made(&r.p.call_log().since(mark)),
+            (vec![], vec![]),
+            "none made under the reset"
+        );
+        drop(alone);
+        spares.settle();
+        assert_eq!(
+            scratch_made(&r.p.call_log().since(mark)),
+            (vec![piece, piece], vec![]),
+            "two whole pieces, on the spares' thread"
+        );
+        assert_eq!(
+            spares.held(),
+            (vec![piece, piece], 2),
+            "the cap's worth, the copy's shorter piece let go of to fit"
+        );
+
+        // A copy that takes both hands another top-up over, and makes nothing itself.
+        let mark = r.p.call_log().mark();
+        let taken = (spares.pieces(&r.device, &[piece, piece], false, Some(&now)))
+            .unwrap()
+            .expect("two pieces");
+        spares.settle();
+        assert_eq!(
+            scratch_made(&r.p.call_log().since(mark)),
+            (vec![piece, piece], vec![]),
+            "the spares topped up again, the copy's pieces both spares"
+        );
+        assert_eq!(spares.held(), (vec![piece, piece], 2));
+        for buffer in taken {
+            spares.give(buffer);
+        }
+        assert_eq!(spares.held(), (vec![piece, piece], 2), "given back past the cap");
+        drop(spares);
+
+        let after = codes.map(counted);
+        assert_eq!(
+            [0, 1, 2, 3, 4].map(|i| after[i] - before[i]),
+            [1, 4, 4 * piece.div_ceil(1024), 3, 2],
+            "one made by a copy, four by top-ups; three let go of, and two a top-up made went \
+             unused"
+        );
     }
 
     /// One place of [`pack`]'s.
@@ -14549,7 +14987,7 @@ pub(super) mod tests {
     #[test]
     fn a_staged_copy_longer_than_a_piece_lays_its_bytes_in_pieces() {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies();
+        r.dec.set_staged_surface_copies(Arc::default());
         let page = r.page;
         let piece = 2 * page;
         r.dec.surface_caches.set_staging_piece(piece);
@@ -14653,7 +15091,7 @@ pub(super) mod tests {
     fn a_staged_download_whose_rows_cross_its_pieces_ends_lands_each_in_its_place() {
         use super::super::surface_pages::tests::one_plane;
         let mut r = rig(16);
-        r.dec.set_staged_surface_copies();
+        r.dec.set_staged_surface_copies(Arc::default());
         r.dec.surface_caches.set_staging_piece(1024);
         r.p.world().lay_linear_rows(Some(256));
         queues(&mut r);

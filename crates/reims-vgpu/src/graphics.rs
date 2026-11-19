@@ -817,10 +817,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     P::PLACED_SHAPE_IMAGES,
                 );
             }
+            // The reset gate ([`GraphicsControl::reset_gate`]), which the staged copies' spares'
+            // top-ups hold shared too.
+            let reset_gate: Arc<RwLock<()>> = Arc::default();
             // A platform whose imports of the host's memory cost each submission stages the
             // caches' copies through the host's CPU (`ApiPlatform::STAGED_SURFACE_COPIES`).
             if P::STAGED_SURFACE_COPIES {
-                decoder.set_staged_surface_copies();
+                decoder.set_staged_surface_copies(Arc::clone(&reset_gate));
             }
             if unified_memory {
                 let cache_budget = cache_budget(own_memory);
@@ -924,7 +927,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 icb_worker: Worker::new("reims-vgpu.icb-create"),
                 icbs: Arc::default(),
                 pages_buffers: Arc::default(),
-                reset_gate: Arc::default(),
+                reset_gate,
                 inline_walk_max: AtomicUsize::new(INLINE_WALK_MAX),
                 shared_pool: pool_ledger,
                 private_blocks: {
