@@ -700,7 +700,9 @@ mod tests {
         // it for this kernel on an M3 Max.
         let tgstatic = device.new_library(TGSTATIC).expect("never a raise");
         let tgstatic = tgstatic.expect("a metallib").expect("a library");
-        let kernel = tgstatic.new_function(on, "tg_static").expect("never a raise");
+        let kernel = tgstatic
+            .new_function(on, "tg_static")
+            .expect("never a raise");
         let kernel = state(&kernel.expect("a function of the table"));
         assert_eq!(kernel.static_threadgroup_memory_length(), 256);
         assert_eq!(kernel.thread_execution_width(), 32);
