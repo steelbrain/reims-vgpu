@@ -1713,7 +1713,7 @@ impl Texture<VulkanPlatform> for VulkanTexture {
 /// read: `HostRange` promises them mapped and readable for the call, never unchanged, so no
 /// shared slice is made over them. They are copied once, through the pointer, into memory this
 /// platform owns. A runtime call reads them in place instead ([`guest_bytes`]).
-fn first_bytes(sel: &'static str, range: HostRange<'_>, most: usize) -> Vec<u8> {
+pub(crate) fn first_bytes(sel: &'static str, range: HostRange<'_>, most: usize) -> Vec<u8> {
     let length =
         usize::try_from(range.len()).unwrap_or_else(|_| unrepresentable(sel, "that length"));
     if length == 0 {

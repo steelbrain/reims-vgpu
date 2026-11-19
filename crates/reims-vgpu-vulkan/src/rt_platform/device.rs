@@ -1,8 +1,9 @@
 //! The rt platform's device ([`RtDevice`]): one metal2vulkan-rt device for the process, made of
 //! the physical device the library's choice of device picks ([`open`]), with its answers
-//! (`super::answers`), its command queues (`super::queue`), events and fences, and the
-//! reservation of resource indices as rt's index grants. Every other creator is refused while
-//! its piece is unbuilt (`super::unbuilt`), as Metal's creator answers where it fails.
+//! (`super::answers`), its command queues (`super::queue`), its textures (`super::texture`),
+//! events and fences, and the reservation of resource indices as rt's index grants. Every other
+//! creator is refused while its piece is unbuilt (`super::unbuilt`), as Metal's creator answers
+//! where it fails.
 //!
 //! **One device.** The process makes one rt device, the first time a device is asked for, and
 //! every ask answers it (one `VkDevice` per VM, the host process). A failure to make it is
@@ -40,9 +41,10 @@ use crate::gpu::identity;
 
 use super::answers::{self, Facts};
 use super::queue::RtQueue;
+use super::texture::OwnIndices;
 use super::unbuilt::{
     RtRefusal, Unbuilt, refuse, refuse_create, refused_as, refused_error, rt_refused,
-    rt_refused_create,
+    rt_refused_create, rt_refused_texture,
 };
 use super::{RtObj, RtPlatform};
 
@@ -70,6 +72,8 @@ pub struct RtDevice {
     facts: Facts,
     /// Its capabilities, read as it was made.
     caps: Arc<DeviceCaps>,
+    /// The texture indices its textures the guest does not place take (`super::texture`).
+    indices: OwnIndices,
 }
 
 impl RtDevice {
@@ -81,6 +85,11 @@ impl RtDevice {
     /// What the platform read of it.
     pub fn facts(&self) -> &Facts {
         &self.facts
+    }
+
+    /// The texture indices of the platform's own.
+    pub fn indices(&self) -> &OwnIndices {
+        &self.indices
     }
 }
 
@@ -181,6 +190,7 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         rt: device,
         facts,
         caps,
+        indices: OwnIndices::new(),
     }))
 }
 
@@ -366,7 +376,7 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         match self.rt.heap_texture_size_and_align(&d) {
             Ok(rt::SizeAndAlign { size, align }) => Ok(SizeAndAlign { size, align }),
             Err(error) => {
-                let kind = rt_refused(SEL, &error);
+                let kind = rt_refused_texture(SEL, &error);
                 Err(refused_raise(SEL, kind, &error))
             }
         }
@@ -533,23 +543,28 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         Ok(None)
     }
 
-    /// Unbuilt: nil ([`Unbuilt::Texture`]).
+    /// rt's texture of the descriptor ([`super::texture::make`]); nil where rt refuses it,
+    /// counted, never a raise.
     fn new_texture(
         &self,
         on: OnFault,
         descriptor: &<RtPlatform as Platform>::TextureDescriptor,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
-        let _ = (on, descriptor);
-        refuse_create(Unbuilt::Texture, "newTextureWithDescriptor:");
-        Ok(None)
+        let _ = on;
+        let sel = "newTextureWithDescriptor:";
+        Ok(super::texture::make(self, sel, &descriptor.desc()))
     }
 
     /// Textures' (type 0) and sampler states' (type 1) indices as rt's grants of their class
-    /// ([`grant`]); indirect command buffers' (type 5) are unbuilt ([`Unbuilt::Icb`]), and those of
-    /// another type ([`Unbuilt::ResourceType`]): each reserves nothing. Never a raise.
+    /// ([`grant`]), textures' also kept from the platform's own ([`OwnIndices::reserve`]);
+    /// indirect command buffers' (type 5) are unbuilt ([`Unbuilt::Icb`]), and those of another
+    /// type ([`Unbuilt::ResourceType`]): each reserves nothing. Never a raise.
     fn reserve_resource_indices(&self, resource_type: u64, indices: &[u64]) -> RaiseResult<()> {
         let class = match resource_type {
-            0 => rt::IndexClass::Texture,
+            0 => {
+                self.indices.reserve(indices);
+                rt::IndexClass::Texture
+            }
             1 => rt::IndexClass::Sampler,
             5 => {
                 refuse(Unbuilt::Icb, RESERVE);

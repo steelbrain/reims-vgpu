@@ -11,15 +11,20 @@
 //!
 //! A call of a built piece that rt refuses (its `Error`: a limit, a refusal of Metal's, a known
 //! gap, a failed Vulkan call) answers the same way, counted under the error's kind,
-//! `rt-refused-<kind>` ([`RtRefusal::code`]), its first line naming the call and rt's error.
+//! `rt-refused-<kind>` ([`RtRefusal::code`]), its first line naming the call and rt's error. A
+//! texture rt makes none of for its pixel format (`Gap::TextureFormat`) is counted under its
+//! format's own code instead, `rt-refused-texture-format-<n>` ([`rt_refused_texture`]), so a
+//! boot's counts line gives each format number with its count.
 //!
 //! [`Unbuilt::ALL`] is the list of what is still unbuilt. A piece leaves it when it is built.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use metal2vulkan_rt as rt;
 
 use crate::core::platform::types::NsErrorText;
+use crate::core::sync::Mutex;
 
 /// The domain of the `NSError` a refused creator with an `error:` out-parameter answers
 /// ([`refused_error`]).
@@ -34,8 +39,6 @@ pub enum Unbuilt {
     /// A buffer or a heap over the host's memory (`newBufferWithBytesNoCopy:…`, a heap over the
     /// guest's pages): rt's import of host memory, which the pinned rt has not. Each answers nil.
     HostImport,
-    /// Textures the device makes, and their views. Each answers nil.
-    Texture,
     /// A texture over a plane of an IOSurface (`newTextureWithDescriptor:iosurface:plane:`), which
     /// rt makes none of yet. Each answers nil.
     IosurfaceTexture,
@@ -83,10 +86,9 @@ pub enum Unbuilt {
 
 impl Unbuilt {
     /// Every piece, once, in the order of their codes' places.
-    pub const ALL: [Unbuilt; 20] = [
+    pub const ALL: [Unbuilt; 19] = [
         Unbuilt::Buffer,
         Unbuilt::HostImport,
-        Unbuilt::Texture,
         Unbuilt::IosurfaceTexture,
         Unbuilt::SharedTexture,
         Unbuilt::Heap,
@@ -111,7 +113,6 @@ impl Unbuilt {
         match self {
             Unbuilt::Buffer => "rt-unbuilt-buffer",
             Unbuilt::HostImport => "rt-unbuilt-host-import",
-            Unbuilt::Texture => "rt-unbuilt-texture",
             Unbuilt::IosurfaceTexture => "rt-unbuilt-iosurface-texture",
             Unbuilt::SharedTexture => "rt-unbuilt-shared-texture",
             Unbuilt::Heap => "rt-unbuilt-heap",
@@ -137,7 +138,6 @@ impl Unbuilt {
         match self {
             Unbuilt::Buffer => "a buffer the device makes",
             Unbuilt::HostImport => "a buffer or heap over the host's memory (rt's import)",
-            Unbuilt::Texture => "a texture",
             Unbuilt::IosurfaceTexture => "a texture over an IOSurface's plane",
             Unbuilt::SharedTexture => "a shared texture",
             Unbuilt::Heap => "a heap",
@@ -347,6 +347,47 @@ pub fn rt_refused_create(sel: &'static str, error: &rt::Error) -> RtRefusal {
     rt_refused(sel, error)
 }
 
+/// [`rt_refused`] of a call that makes or sizes a texture: a refusal of the texture for its pixel
+/// format (`Gap::TextureFormat`) is counted under its format's code ([`format_code`]), and the
+/// process's first of each format writes its line on stderr; any other under its kind's. Returns
+/// the kind ([`RtRefusal::Gap`] for a format).
+pub fn rt_refused_texture(sel: &'static str, error: &rt::Error) -> RtRefusal {
+    let rt::Error::Unsupported(rt::Gap::TextureFormat { pixel_format }) = error else {
+        return rt_refused(sel, error);
+    };
+    let (code, first) = format_code(pixel_format.as_raw());
+    crate::answer::count_kind(code);
+    if first {
+        say(&format!(
+            "reims-vgpu: {sel}: metal2vulkan-rt refused it ({error}); refused ({code}), the first \
+             of its format\n"
+        ));
+    }
+    RtRefusal::Gap
+}
+
+/// [`rt_refused_texture`] of a creator, which answers nil where Metal makes the texture: noted
+/// for core as a gap of the platform's own, as [`refuse_create`] does.
+pub fn rt_refused_texture_create(sel: &'static str, error: &rt::Error) -> RtRefusal {
+    crate::core::platform::device::note_relayed_gap();
+    rt_refused_texture(sel, error)
+}
+
+/// The code of a texture refused for its pixel format `raw`, `rt-refused-texture-format-<raw>`,
+/// and whether this is the process's first ask of it. Each format's code is made once and kept
+/// for the process (the counts keep codes as `&'static str`): at most one per pixel format rt
+/// names.
+fn format_code(raw: u32) -> (&'static str, bool) {
+    static CODES: Mutex<BTreeMap<u32, &'static str>> = Mutex::new(BTreeMap::new());
+    let mut codes = CODES.lock();
+    if let Some(&code) = codes.get(&raw) {
+        return (code, false);
+    }
+    let code: &'static str = Box::leak(format!("rt-refused-texture-format-{raw}").into_boxed_str());
+    codes.insert(raw, code);
+    (code, true)
+}
+
 /// Whether this is the first time `said[at]` is asked: sets it.
 fn first(said: &[AtomicBool], at: usize) -> bool {
     said.get(at)
@@ -420,6 +461,32 @@ mod tests {
         assert_eq!(kind, RtRefusal::Quiesced);
         assert!(relayed);
         assert!(counted(code) >= before + 2, "{code}");
+    }
+
+    /// rt's refusal of a texture for its format is counted under the format's own code, each
+    /// format its own; any other texture refusal under its kind's.
+    #[test]
+    fn a_texture_s_format_refusal_is_counted_by_format() {
+        let gap = rt::Error::Unsupported(rt::Gap::TextureFormat {
+            pixel_format: rt::PixelFormat::GBGR422,
+        });
+        let code = "rt-refused-texture-format-240";
+        let (before, gaps) = (counted(code), counted(RtRefusal::Gap.code()));
+        assert_eq!(rt_refused_texture("test", &gap), RtRefusal::Gap);
+        let (kind, relayed) = relaying_gaps(|| rt_refused_texture_create("test", &gap));
+        assert_eq!(kind, RtRefusal::Gap);
+        assert!(relayed);
+        assert!(counted(code) >= before + 2, "{code}");
+        assert_eq!(format_code(240), (code, false));
+        assert_eq!(format_code(241).0, "rt-refused-texture-format-241");
+        assert_eq!(counted(RtRefusal::Gap.code()), gaps);
+        let code = RtRefusal::Quiesced.code();
+        let before = counted(code);
+        assert_eq!(
+            rt_refused_texture("test", &rt::Error::Quiesced),
+            RtRefusal::Quiesced
+        );
+        assert!(counted(code) > before, "{code}");
     }
 
     /// A creator with an `error:` out-parameter answers an `NSError` naming the piece and its

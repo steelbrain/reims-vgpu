@@ -7,12 +7,12 @@
 //! **Built piece by piece**, in the order a guest's boot reaches the pieces: the device and its
 //! answers, queues, buffers, textures, libraries and pipelines, command buffers and encoders,
 //! events, then the display. Built: the device ([`device`]) with its answers ([`answers`] and
-//! [`mod@format`]), its command queues ([`queue`]), events and fences, and the reservation of
-//! resource indices. Until a piece is built, every call that reaches it is refused
-//! ([`unbuilt`]). The call answers as Metal's call answers where it fails: a nil object, an
-//! `NSError`, zeros. The refusal is counted under the piece's code, `rt-unbuilt-<piece>`, in the
-//! process's degradation counts, and the first of each kind writes a line on stderr. Never a death
-//! or a panic.
+//! [`mod@format`]), its command queues ([`queue`]), events and fences, the reservation of resource
+//! indices, and textures made of a descriptor, with their views ([`texture`]). Until a piece is
+//! built, every call that reaches it is refused ([`unbuilt`]). The call answers as Metal's call
+//! answers where it fails: a nil object, an `NSError`, zeros. The refusal is counted under the
+//! piece's code, `rt-unbuilt-<piece>`, in the process's degradation counts, and the first of each
+//! kind writes a line on stderr. Never a death or a panic.
 //!
 //! **An object of a kind no call makes yet is [`Unmade`]**: a type with no values, so its methods
 //! are never reached. The piece that makes the kind gives it a type of its own.
@@ -30,6 +30,7 @@ pub mod descriptor;
 pub mod device;
 pub mod format;
 pub mod queue;
+pub mod texture;
 pub mod unbuilt;
 pub mod unmade;
 
@@ -47,6 +48,7 @@ use crate::os::{OsClock, OsThreads, OsVm};
 pub use descriptor::{PassFields, RateMapFields, TextureFields};
 pub use device::RtDevice;
 pub use queue::RtQueue;
+pub use texture::RtTexture;
 pub use unbuilt::Unbuilt;
 pub use unmade::{Unmade, kinds};
 
@@ -153,7 +155,7 @@ impl Platform for RtPlatform {
     type ComputeEncoder = Unmade<kinds::ComputeEncoder>;
     type RenderEncoder = Unmade<kinds::RenderEncoder>;
     type Buffer = Unmade<kinds::Buffer>;
-    type Texture = Unmade<kinds::Texture>;
+    type Texture = RtObj<RtTexture>;
     type Heap = Unmade<kinds::Heap>;
     type SamplerState = Unmade<kinds::SamplerState>;
     type DepthStencilState = Unmade<kinds::DepthStencilState>;

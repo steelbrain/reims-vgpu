@@ -14,7 +14,6 @@ use crate::core::platform::command::ScheduledHandler;
 use crate::core::platform::compute::ComputeCmd;
 use crate::core::platform::event::EventRef;
 use crate::core::platform::event::Notification;
-use crate::core::platform::host_range::HostRange;
 use crate::core::platform::icb::DispatchThreadgroupsArgs;
 use crate::core::platform::icb::DispatchThreadsArgs;
 use crate::core::platform::icb::DrawArgs;
@@ -34,7 +33,6 @@ use crate::core::platform::types::MtlSize;
 use crate::core::platform::types::NsErrorText;
 use crate::core::platform::types::NsRange;
 use crate::core::platform::types::SizeAndAlign;
-use crate::core::platform::types::Swizzle;
 use crate::core::platform::values::ComputePassDesc;
 use crate::core::platform::values::SurfacePlane;
 use crate::core::platform::{Handle, ObjId, Platform};
@@ -81,8 +79,6 @@ pub mod kinds {
     pub enum RenderEncoder {}
     /// `id<MTLBuffer>`.
     pub enum Buffer {}
-    /// `id<MTLTexture>`.
-    pub enum Texture {}
     /// `id<MTLHeap>`.
     pub enum Heap {}
     /// `id<MTLSamplerState>`.
@@ -282,24 +278,6 @@ impl<P: Platform> resource::GpuResource<P> for Unmade<kinds::Buffer> {
     }
 }
 
-impl<P: Platform> resource::GpuResource<P> for Unmade<kinds::Texture> {
-    fn device(&self) -> Option<P::Device> {
-        self.unreachable()
-    }
-    fn resource_options(&self) -> u64 {
-        self.unreachable()
-    }
-    fn set_label(&self, _label: &str) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn set_purgeable_state(&self, _state: u64) -> RaiseResult<u64> {
-        self.unreachable()
-    }
-    fn storage_mode(&self) -> u64 {
-        self.unreachable()
-    }
-}
-
 impl<P: Platform> resource::Buffer<P> for Unmade<kinds::Buffer> {
     fn contents(&self) -> HostPtr {
         self.unreachable()
@@ -345,118 +323,6 @@ impl<P: Platform> resource::Buffer<P> for Unmade<kinds::Buffer> {
         _descriptor: &P::TextureDescriptor,
         _plane: SurfacePlane,
     ) -> RaiseResult<Option<P::Texture>> {
-        self.unreachable()
-    }
-}
-
-impl<P: Platform> resource::Texture<P> for Unmade<kinds::Texture> {
-    fn array_length(&self) -> u64 {
-        self.unreachable()
-    }
-    fn depth(&self) -> u64 {
-        self.unreachable()
-    }
-    fn did_modify_data(&self) {
-        self.unreachable()
-    }
-    fn gpu_resource_id(&self) -> u64 {
-        self.unreachable()
-    }
-    fn height(&self) -> u64 {
-        self.unreachable()
-    }
-    fn is_shareable(&self) -> bool {
-        self.unreachable()
-    }
-    fn mipmap_level_count(&self) -> u64 {
-        self.unreachable()
-    }
-    fn new_shared_texture_handle(&self) -> RaiseResult<Option<P::SharedTextureHandle>> {
-        self.unreachable()
-    }
-    fn new_texture_view(&self, _pixel_format: u64) -> RaiseResult<Option<P::Texture>> {
-        self.unreachable()
-    }
-    fn new_texture_view_at_index(
-        &self,
-        _pixel_format: u64,
-        _resource_index: u64,
-    ) -> RaiseResult<Option<P::Texture>> {
-        self.unreachable()
-    }
-    fn new_texture_subview(
-        &self,
-        _pixel_format: u64,
-        _texture_type: u64,
-        _level_range: NsRange,
-        _slice_range: NsRange,
-    ) -> RaiseResult<Option<P::Texture>> {
-        self.unreachable()
-    }
-    fn new_swizzled_texture_subview(
-        &self,
-        _pixel_format: u64,
-        _texture_type: u64,
-        _level_range: NsRange,
-        _slice_range: NsRange,
-        _swizzle: Swizzle,
-    ) -> RaiseResult<Option<P::Texture>> {
-        self.unreachable()
-    }
-    fn new_swizzled_texture_subview_at_index(
-        &self,
-        _pixel_format: u64,
-        _texture_type: u64,
-        _levels: NsRange,
-        _slices: NsRange,
-        _swizzle: Swizzle,
-        _resource_index: u64,
-    ) -> RaiseResult<Option<P::Texture>> {
-        self.unreachable()
-    }
-    fn new_texture_subview_at_index(
-        &self,
-        _pixel_format: u64,
-        _texture_type: u64,
-        _levels: NsRange,
-        _slices: NsRange,
-        _resource_index: u64,
-    ) -> RaiseResult<Option<P::Texture>> {
-        self.unreachable()
-    }
-    fn pixel_format(&self) -> u64 {
-        self.unreachable()
-    }
-    fn protection_options(&self) -> u64 {
-        self.unreachable()
-    }
-    fn replace_region(
-        &self,
-        _region: MtlRegion,
-        _level: u64,
-        _slice: u64,
-        _pixel_bytes: HostRange<'_>,
-        _bytes_per_row: u64,
-        _bytes_per_image: u64,
-    ) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn resource_index(&self) -> u64 {
-        self.unreachable()
-    }
-    fn sample_count(&self) -> u64 {
-        self.unreachable()
-    }
-    fn texture_type(&self) -> u64 {
-        self.unreachable()
-    }
-    fn unique_identifier(&self) -> u64 {
-        self.unreachable()
-    }
-    fn usage(&self) -> u64 {
-        self.unreachable()
-    }
-    fn width(&self) -> u64 {
         self.unreachable()
     }
 }
