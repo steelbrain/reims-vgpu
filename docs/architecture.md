@@ -926,7 +926,10 @@ files, and dma-bufs of them, `reims-vgpu-vulkan/src/os/linux`), never through a 
 write-back.
 
 The guest's Shared pool (`pool.rs`, api.md "The guest's Shared pool") is a range of guest physical
-addresses with no RAM under it, which the host reserves and names in the config. The pool's thread
+addresses with no RAM under it. The host names the addresses it can give in the config, and the
+device takes as many as its GPU device's Shared memory heap holds (`pool_range` in `graphics.rs`,
+`PoolConfig::sized`, the heap from `GpuDevice::shared_heap_size`), which the host then reserves
+(`rvg_graphics_device_pool_range`). The pool's thread
 takes Shared blocks from its block source, places each at the range's lowest free 2 MiB-aligned
 address, and has the host map it there (`pool_add`); a piece is found only once the host says it is
 in (`pool_added`). The source is metal2vulkan-rt's block calls in shape (`take_block`,

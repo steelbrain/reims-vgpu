@@ -309,11 +309,14 @@ pub struct GraphicsConfig {
     /// `RGFX_FEATURE_DOORBELL_PAGES`, on which the kext maps each process's own page, which it
     /// rings its queues' doorbells on with no call into the kext.
     pub doorbell_pages: bool,
-    /// The guest physical range the host reserved for the guest's Shared pool, with no RAM under
-    /// it, which the device fills with blocks as the pool grows (`crate::pool`); `None` is no pool.
-    /// Given, it needs [`GraphicsCallbacks::pool_add`] and `pool_remove`, a range
-    /// [`PoolConfig::is_valid`] takes, and none of [`Self::memory_map`]'s ranges overlapping it:
-    /// otherwise [`Error::InvalidArgument`].
+    /// The guest physical addresses the host can give the guest's Shared pool, with no RAM
+    /// under them, which the device fills with blocks as the pool grows (`crate::pool`); `None`
+    /// is no pool. The device takes from their start as many as its GPU's Shared memory heap
+    /// holds ([`PoolConfig::sized`]), at most all of them, and none where the GPU has no such
+    /// heap: [`GraphicsDevice::pool_range`] answers the range it took, which the host keeps
+    /// free for the device's life. Given, it needs [`GraphicsCallbacks::pool_add`] and
+    /// `pool_remove`, a range [`PoolConfig::is_valid`] takes, and none of
+    /// [`Self::memory_map`]'s ranges overlapping it: otherwise [`Error::InvalidArgument`].
     pub pool: Option<PoolConfig>,
 }
 
@@ -420,6 +423,36 @@ fn pool_host(config: &GraphicsConfig) -> Result<Option<(PoolConfig, PoolHost)>, 
         remove: Arc::clone(remove),
     };
     Ok(Some((range, host)))
+}
+
+/// The range the device's pool takes of `room`, the addresses the host can give it, on a GPU
+/// whose Shared memory heap holds `heap` bytes ([`PoolConfig::sized`]), logged once a device:
+/// with a warning where the GPU has no such heap, and so no pool, or where the room holds less
+/// than the heap, and the range stops at the room's end.
+fn pool_range(room: PoolConfig, heap: u64) -> Option<PoolConfig> {
+    let Some(range) = room.sized(heap) else {
+        log::warn!(
+            "pool: the GPU has no host-visible, host-coherent and host-cached memory, which the \
+             pool's blocks come from: the guest has no Shared pool"
+        );
+        return None;
+    };
+    if range.physical_length < heap {
+        log::warn!(
+            "pool: the guest's {} MiB of addresses at {:#x} hold less than the GPU's Shared heap \
+             of {} MiB: the pool's range stops there",
+            room.physical_length >> 20,
+            room.physical_address,
+            heap >> 20
+        );
+    }
+    log::info!(
+        "pool: {} MiB of guest addresses at {:#x}, for the GPU's Shared heap of {} MiB",
+        range.physical_length >> 20,
+        range.physical_address,
+        heap >> 20
+    );
+    Some(range)
 }
 
 /// The reims-graphics device.
@@ -874,15 +907,19 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             #[cfg(not(test))]
             drop(first_shown);
             // The guest's Shared pool, its blocks the process's own memory until the device runs
-            // on metal2vulkan-rt, whose blocks then fill it through the same calls.
+            // on metal2vulkan-rt, whose blocks then fill it through the same calls. Its range is
+            // what the GPU's heap of those blocks holds, of the addresses the host can give.
             let pool = match pool_host {
-                Some((range, host)) => {
-                    let clock = Arc::clone(&platform);
-                    let now = Box::new(move || clock.clock().now_mono());
-                    Some(Pool::new(range, host, now, |mappings| {
-                        Arc::new(HostBlocks::new(mappings))
-                    })?)
-                }
+                Some((room, host)) => match pool_range(room, gpu_device.shared_heap_size()) {
+                    Some(range) => {
+                        let clock = Arc::clone(&platform);
+                        let now = Box::new(move || clock.clock().now_mono());
+                        Some(Pool::new(range, host, now, |mappings| {
+                            Arc::new(HostBlocks::new(mappings))
+                        })?)
+                    }
+                    None => None,
+                },
                 None => None,
             };
             let device = reims_vgpu_graphics::Device::with_screens(region, host, screens)
@@ -926,6 +963,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
         (self.pool.as_ref())
             .ok_or(Error::InvalidArgument)?
             .removed(physical_address)
+    }
+
+    /// The range of guest physical addresses the device's Shared pool took of the addresses its
+    /// config gave ([`GraphicsConfig::pool`]); `None` without a pool. Any thread; waits for
+    /// nothing and calls back never.
+    pub fn pool_range(&self) -> Option<PoolConfig> {
+        self.pool.as_ref().map(Pool::range)
     }
 
     /// Asks for at least `length` more bytes of the guest's Shared pool now, as the guest's own

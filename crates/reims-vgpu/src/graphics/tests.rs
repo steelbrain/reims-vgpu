@@ -7,7 +7,9 @@ use reims_vgpu_vulkan::core::platform::ObjId;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice;
 use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
 use reims_vgpu_vulkan::core::testkit::faults::Fault;
-use reims_vgpu_vulkan::core::testkit::impls::device::{FAKE_LINEAR_ROW_ALIGNMENT, FAKE_OWN_MEMORY};
+use reims_vgpu_vulkan::core::testkit::impls::device::{
+    FAKE_LINEAR_ROW_ALIGNMENT, FAKE_OWN_MEMORY, FAKE_SHARED_HEAP,
+};
 use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
 use reims_vgpu_vulkan::core::testkit::{Arg, FakePlatform, HeldCall};
 use zerocopy::{FromBytes, IntoBytes};
@@ -13900,4 +13902,46 @@ fn vt_decoders_are_the_caps_decode_entries() {
         ..caps
     };
     assert_eq!(vt_decoders(&main10)[0].profiles, vec![2]);
+}
+
+/// The pool takes as many of the addresses its config gives as the GPU's Shared heap holds,
+/// rounded up to 2 MiB, from their start, and stops at their end where they hold less; a device
+/// with no pool answers no range
+#[test]
+fn the_pool_s_range_is_the_gpu_s_shared_heap_at_most_the_addresses_given() {
+    const BASE: u64 = 52 << 30;
+    let range = |room: u64| {
+        let config = GraphicsConfig {
+            callbacks: GraphicsCallbacks {
+                pool_add: Some(Arc::new(|_, _, _| {})),
+                pool_remove: Some(Arc::new(|_, _| {})),
+                ..GraphicsCallbacks::default()
+            },
+            pool: Some(PoolConfig {
+                physical_address: BASE,
+                physical_length: room,
+            }),
+            ..GraphicsConfig::default()
+        };
+        let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+        device.pool_range()
+    };
+    assert_eq!(FAKE_SHARED_HEAP % (2 << 20), 1 << 20);
+    let heap = FAKE_SHARED_HEAP + (1 << 20);
+    assert_eq!(
+        range(43 << 30),
+        Some(PoolConfig {
+            physical_address: BASE,
+            physical_length: heap,
+        })
+    );
+    assert_eq!(
+        range(16 << 30),
+        Some(PoolConfig {
+            physical_address: BASE,
+            physical_length: 16 << 30,
+        })
+    );
+    let raised = Arc::new(AtomicU32::new(0));
+    assert_eq!(headless(&raised).pool_range(), None);
 }

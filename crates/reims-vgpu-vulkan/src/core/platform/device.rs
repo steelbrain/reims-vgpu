@@ -361,6 +361,12 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// size. The graphics lane's deferred surfaces take a quarter of it, read once at its device's
     /// start.
     fn own_memory_budget(&self) -> u64;
+    /// The bytes of the memory heap the guest's Shared pool's blocks come from, as the platform
+    /// answers: on the Vulkan platform the size of the heap of metal2vulkan-rt's Shared memory
+    /// type (host-visible, host-coherent and host-cached), not its budget; 0 where the GPU has no
+    /// such type. The graphics lane sizes the pool's range of guest physical addresses from it,
+    /// once at its device's start.
+    fn shared_heap_size(&self) -> u64;
     /// Whether the device makes compute pipelines of OpenCL mode
     /// ([`FullComputePipelineDesc::open_cl_mode`]): on the Vulkan platform, whose runtime links
     /// such a kernel as Metal does. The graphics lane offers `OPENCL_MODE` where it does.

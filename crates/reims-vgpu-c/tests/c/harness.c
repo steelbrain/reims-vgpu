@@ -169,6 +169,8 @@ static void check_graphics(void) {
     CHECK_STATUS(rvg_graphics_device_pool_grow(d, 256u << 20), RVG_ERR_INVALID_ARGUMENT);
     CHECK_STATUS(rvg_graphics_device_pool_added(d, 52ull << 30), RVG_ERR_INVALID_ARGUMENT);
     CHECK_STATUS(rvg_graphics_device_pool_removed(d, 52ull << 30), RVG_ERR_INVALID_ARGUMENT);
+    uint64_t pool_length = 1;
+    CHECK(rvg_graphics_device_pool_range(d, &pool_length) == 0 && pool_length == 0);
 
 #if defined(_WIN32)
     /* NULL names no handle; the device takes a copy of the event, and refuses a second. */

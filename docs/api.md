@@ -175,22 +175,34 @@ pauses it keeps its device to the exit, and so does a quit while a read of its d
 
 ### The guest's Shared pool
 
-A host that reserves a range of guest physical addresses for the guest's Shared pool
-(`pool_physical_address`, `pool_physical_length`) maps the device's blocks there as the pool grows
+A host names the guest physical addresses it can give the guest's Shared pool
+(`pool_physical_address`, `pool_physical_length`), 2 MiB-aligned and with no RAM under them, 0 and 0
+for none. The device takes from their start as many as the Shared memory heap of its GPU device
+holds, rounded up to 2 MiB: the heap of the first memory type with `HOST_VISIBLE`, `HOST_COHERENT`
+and `HOST_CACHED` that a buffer of the device's usage can use, which is where its Shared blocks come
+from. The bound is the heap's size, not `VK_EXT_memory_budget`'s budget: the range is address space
+the guest keeps for the VM's life, a budget moves with what other processes hold, and RAM is
+bounded at each block's take. Where the heap is larger than the addresses given, the range stops at
+their end and the device logs a warning once; where no memory type is host-cached, the guest has no
+pool, and the device logs that too. `rvg_graphics_device_pool_range` answers the range it took,
+0 and 0 for none, and the host reserves that before the guest's firmware runs. The host then maps
+the device's blocks there as the pool grows
 (`pool_add`, answered by `rvg_graphics_device_pool_added`) and unmaps them as the device frees them
 (`pool_remove`, answered by `rvg_graphics_device_pool_removed`). The device frees a block only once
 the host said its piece is out of the guest's address space and no thread of the host's touches it,
 and once no thread of its own holds it. Before the release the host takes out every piece it added
 and says so for each, as QEMU's teardown does; the release then frees every block before it
 returns, so none is freed by a driver's exit handler (on NVIDIA's driver, which unmaps its memory
-inside `exit()`, a thread still reading a block then faults). QEMU reserves the range at realize past
-the RAM and the PCI host bridge's default 64-bit window, raises fw_cfg `etc/reserved-memory-end`
-past it so OVMF's 64-bit window goes above it, maps each piece as a RAM region of its own (an add is
+inside `exit()`, a thread still reading a block then faults). QEMU gives the device the addresses
+past the RAM and the PCI host bridge's default 64-bit window, up to three quarters of the guest's
+physical address space, and at realize, once the device is made, raises fw_cfg
+`etc/reserved-memory-end` past the range it took, rounded up to 1 GiB, so OVMF's 64-bit window goes
+above it, maps each piece as a RAM region of its own (an add is
 a pure add), and under WHPX runs the hypervisor's map outside its BQL (`whpx_map_ahead`).
 
 ## 2. The C header
 
-The header has the twelve functions, every type, callback typedef and constant, with the thread and
+The header has every function, type, callback typedef and constant, with the thread and
 ordering rules on each callback and each function. Its preamble states the rules for handles,
 configs, callbacks and deaths. The C API's tests compile it as C11, as C++17 and, on macOS, as
 Objective-C.
@@ -199,7 +211,7 @@ Objective-C.
 |---|---|
 | constants | the status codes; the PCI facts (`RVG_GRAPHICS_PCI_VENDOR_ID` 0x1234, `_DEVICE_ID` 0x5247, `_CLASS` 0x380, `RVG_GRAPHICS_PCI_BAR_REGISTERS` 0, `RVG_GRAPHICS_REGISTERS_SIZE` 4096, `RVG_GRAPHICS_MSIX_OFFSET` 2048, `RVG_GRAPHICS_MSIX_VECTORS` 1, `RVG_GRAPHICS_PCI_BAR_REGION` 2, `RVG_GRAPHICS_PCI_BAR_DOORBELLS` 4, `RVG_GRAPHICS_DOORBELLS_SIZE` 4 MiB, `RVG_GRAPHICS_DOORBELL_PAGE_SIZE` 16 KiB, `RVG_GRAPHICS_DOORBELL_PAGES` 256); `RVG_GRAPHICS_DISPLAYS_MAX` 4; the doorbell (`RVG_GRAPHICS_REG_DOORBELL`, `RVG_GRAPHICS_DOORBELL_CONTROL`); `RVG_GRAPHICS_ALLOCATIONS_OFFSET`; `RVG_GUEST_ARCH_X86_64` 0 and `RVG_GUEST_ARCH_ARM64` 1; `RVG_WINDOW_BUTTON_*`, `RVG_WINDOW_SCROLL_PHASE_*`, `RVG_WINDOW_SCROLL_MOMENTUM_*` |
 | status | `rvg_status_message` |
-| the device | `RvgGraphicsDeviceConfig`, `RvgGuestArch`, `RvgGraphicsCallbacks` and its function types, `RvgCursorGlyph`, `RvgDisplayCoord`, `RvgMemoryMap`, `RvgMemoryRange`, `RvgMemoryRangeFile`; `rvg_graphics_device_create`, `_release`, `_region`, `_mmio_read`, `_mmio_write_taking`, `_doorbell_write`, `_set_doorbell`, `_reset`, `_read_display`, `_cursor_position`, `_read_display_at`, `_cursor_position_at` |
+| the device | `RvgGraphicsDeviceConfig`, `RvgGuestArch`, `RvgGraphicsCallbacks` and its function types, `RvgCursorGlyph`, `RvgDisplayCoord`, `RvgMemoryMap`, `RvgMemoryRange`, `RvgMemoryRangeFile`; `rvg_graphics_device_create`, `_release`, `_region`, `_mmio_read`, `_mmio_write_taking`, `_doorbell_write`, `_set_doorbell`, `_reset`, `_read_display`, `_cursor_position`, `_read_display_at`, `_cursor_position_at`, `_pool_added`, `_pool_removed`, `_pool_grow`, `_pool_range` |
 | its windows | `RvgWindowConfig`, `RvgWindowCallbacks`, `RvgWindowPointerFn`, `RvgWindowWheelFn`, `RvgWindowKeyFn`, `RvgWindowCloseFn`, `RvgWindowScrollFn`, `RvgWindowScroll`; no function of their own: `RvgGraphicsDeviceConfig.window` carries display 0's, and `display_windows` those of displays 1 and up |
 
 ### Windows forms
@@ -303,6 +315,7 @@ returns. The library logs through the `log` crate; a Rust host installs its own 
 | `rvg_graphics_device_pool_added` | never | nothing |
 | `rvg_graphics_device_pool_removed` | never | nothing |
 | `rvg_graphics_device_pool_grow` | never | nothing |
+| `rvg_graphics_device_pool_range` | never | nothing |
 
 ## 5. Callbacks and threads
 

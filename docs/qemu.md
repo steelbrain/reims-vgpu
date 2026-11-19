@@ -197,13 +197,18 @@ is its transport:
   allocations from there. It has no dirty log: the library's window draws
   the guest's scanout again at each of the display's refreshes while it
   shows no presented surface.
-- **The guest's Shared pool**: at realize the device reserves `x-pool-size`
-  bytes of guest physical addresses with no RAM under them (an internal
-  property, 64 GiB by default, whole GiB; 0 for none), from the host
-  bridge's `pci-hole64-end` rounded up to 1 GiB and below three quarters of
-  the guest's physical address space: 0xac0000000 (43 GiB) on `reims-ctl`'s
-  8 GiB q35 machine. It raises fw_cfg's `etc/reserved-memory-end` past the
-  range, so OVMF places its 64-bit PCI window above it; macOS lays the
+- **The guest's Shared pool**: at realize the device reserves guest
+  physical addresses with no RAM under them, as many as the host GPU's
+  Shared memory heap holds. It offers the library the room from the host
+  bridge's `pci-hole64-end` rounded up to 1 GiB (0xac0000000, 43 GiB, on
+  `reims-ctl`'s 8 GiB q35 machine) to three quarters of the guest's
+  physical address space, in whole GiB, and after the create reserves the
+  range the library took of it (`rvg_graphics_device_pool_range`,
+  docs/api.md "The guest's Shared pool"), its end rounded up to 1 GiB. The
+  `reims_graphics_pool_reserved` trace prints the range and that end. A
+  host GPU with no host-cached memory gives the guest no pool. It raises
+  fw_cfg's `etc/reserved-memory-end` to that end, so OVMF places its 64-bit
+  PCI window above it; macOS lays the
   device's BARs out below 4 GiB anyway. It adds no e820 entry: QEMU's e820
   table is the i386 board's, which a device's common code cannot reach, and
   OVMF leaves reserved entries above 4 GiB out of the EFI memory map. The

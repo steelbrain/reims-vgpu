@@ -182,6 +182,23 @@ impl PoolConfig {
         let end = self.physical_address.saturating_add(self.physical_length);
         address < end && self.physical_address < address.saturating_add(length)
     }
+
+    /// The range a pool takes of `self`, the guest physical addresses the host can give it, on a
+    /// GPU whose Shared memory heap holds `heap` bytes (`GpuDevice::shared_heap_size`): from
+    /// `self`'s start, `heap` rounded up to [`PIECE_ALIGN`], at most `self`'s length; `None` for a
+    /// heap of 0, where no block of the pool's could come from the GPU. The range is guest
+    /// physical addresses, which RAM fills only as the pool takes blocks: it bounds the pool by
+    /// what the heap can ever hold, and the heap's budget at a block's take bounds the RAM.
+    pub fn sized(self, heap: u64) -> Option<PoolConfig> {
+        if heap == 0 {
+            return None;
+        }
+        let want = heap.checked_next_multiple_of(PIECE_ALIGN).unwrap_or(u64::MAX);
+        Some(PoolConfig {
+            physical_address: self.physical_address,
+            physical_length: want.min(self.physical_length),
+        })
+    }
 }
 
 /// `(physical_address, host_address, length)`: map `length` bytes of host memory at
@@ -380,6 +397,11 @@ impl Pool {
             source: Some(source),
             thread: Some(thread),
         })
+    }
+
+    /// The range of guest physical addresses the pool takes.
+    pub fn range(&self) -> PoolConfig {
+        self.shared.range
     }
 
     /// Asks for at least `length` more bytes of pool: the pool's thread takes a block and has the

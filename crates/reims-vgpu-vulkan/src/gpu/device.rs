@@ -1704,6 +1704,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         crate::gpu::identity::device_local_budget(&self.raw)
     }
 
+    fn shared_heap_size(&self) -> u64 {
+        crate::gpu::identity::shared_heap_size(&self.raw)
+    }
+
     /// Always: the runtime links a kernel of OpenCL mode as Metal does, behind its three buffers
     /// (`states::full_compute_descriptor`).
     fn makes_opencl_mode_pipelines(&self) -> bool {

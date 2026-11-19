@@ -120,6 +120,26 @@ fn a_range_must_be_whole_large_pages_and_not_empty() {
     );
 }
 
+/// A pool's range is the GPU's Shared heap from the start of the addresses the host can give,
+/// rounded up to whole large pages, and stops at the end of those addresses where they hold less;
+/// a GPU with no Shared heap gives no range
+#[test]
+fn a_range_is_the_shared_heap_rounded_to_large_pages_at_most_the_room() {
+    let room = range(43);
+    let sized = |heap: u64| room.sized(heap).map(|r| (r.physical_address, r.physical_length));
+    assert_eq!(sized(24 << 30), Some((BASE, 24 << 30)));
+    assert_eq!(sized((24 << 30) - MIB), Some((BASE, 24 << 30)));
+    assert_eq!(sized((24 << 30) + 1), Some((BASE, (24 << 30) + (2 << 20))));
+    assert_eq!(sized(1), Some((BASE, 2 << 20)));
+    // Past the room: the room.
+    assert_eq!(sized(64 << 30), Some((BASE, 43 << 30)));
+    assert_eq!(sized(u64::MAX), Some((BASE, 43 << 30)));
+    assert_eq!(sized(0), None);
+    for heap in [1, (24 << 30) - MIB, 64 << 30, u64::MAX] {
+        assert!(room.sized(heap).unwrap().is_valid(), "{heap:#x}");
+    }
+}
+
 #[test]
 fn pieces_go_out_at_ascending_addresses_from_the_range_start() {
     let host = Arc::new(Host::default());

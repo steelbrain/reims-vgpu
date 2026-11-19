@@ -565,9 +565,11 @@ unsafe extern "C-unwind" fn pool_remove(_ctx: *mut c_void, physical_address: u64
 }
 
 /// A pool needs both of its callbacks and a range of whole 2 MiB; a device without one refuses
-/// the pool's calls; a device with one grows on the host's ask, on its pool thread, takes the
-/// host's word that it added the piece once, and its removal; a config of the fourth version,
-/// whose `struct_size` ends before the pool's fields, has no pool whatever lies past its size
+/// the pool's calls and answers no range; a device with one takes as much of the range as the
+/// GPU's Shared heap holds, in whole 2 MiB, at most all of it, grows on the host's ask, on its
+/// pool thread, takes the host's word that it added the piece once, and its removal; a config of
+/// the fourth version, whose `struct_size` ends before the pool's fields, has no pool whatever
+/// lies past its size
 #[test]
 fn a_pool_s_pieces_reach_the_host_and_back() {
     const BASE: u64 = 52 << 30;
@@ -617,14 +619,37 @@ fn a_pool_s_pieces_reach_the_host_and_back() {
             rvg_graphics_device_pool_added(device, BASE),
             RVG_ERR_INVALID_ARGUMENT
         );
+        let mut length = 1;
+        assert_eq!(rvg_graphics_device_pool_range(device, &mut length), 0);
+        assert_eq!(length, 0);
         rvg_graphics_device_release(device);
 
+        // 2 MiB, less than any GPU's Shared heap: all of it.
         let c = RvgGraphicsDeviceConfig {
             pool_physical_address: BASE,
-            pool_physical_length: 64 << 30,
+            pool_physical_length: 2 << 20,
             ..config(&with_pool)
         };
         assert_eq!(rvg_graphics_device_create(&c, &mut device), RVG_OK);
+        assert_eq!(rvg_graphics_device_pool_range(device, &mut length), BASE);
+        assert_eq!(length, 2 << 20);
+        rvg_graphics_device_release(device);
+
+        // 1 TiB, more than any GPU's Shared heap: the heap's, in whole 2 MiB.
+        const ROOM: u64 = 1 << 40;
+        let c = RvgGraphicsDeviceConfig {
+            pool_physical_address: BASE,
+            pool_physical_length: ROOM,
+            ..config(&with_pool)
+        };
+        assert_eq!(rvg_graphics_device_create(&c, &mut device), RVG_OK);
+        assert_eq!(
+            rvg_graphics_device_pool_range(device, std::ptr::null_mut()),
+            BASE
+        );
+        assert_eq!(rvg_graphics_device_pool_range(device, &mut length), BASE);
+        assert!(length > 0 && length < ROOM, "{length:#x}");
+        assert_eq!(length % (2 << 20), 0, "{length:#x}");
         assert_eq!(
             rvg_graphics_device_pool_grow(device, 0),
             RVG_ERR_INVALID_ARGUMENT
