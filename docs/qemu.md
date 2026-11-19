@@ -150,7 +150,7 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | WHPX offers the guest no TSC deadline timer where Hyper-V refuses its register (`WHvX64RegisterTscDeadline`), asked of a vCPU made for the question at init: the CPU model's `tsc-deadline` is filtered out as a feature the host lacks, and a macOS guest arms the local APIC's timer ("Windows hosts", below) | `c3704402` |
 | `vmapple` asks HVF for 40 bits of guest physical address, or the host's most where that is fewer (the machine's `get_physical_address_range`), where HVF's default is 36, and refuses to start where its RAM ends past them; the guest reads the size as its `ID_AA64MMFR0_EL1.PARange` ("arm64 guests", below) | `dc1b6821` |
 | `vmapple` answers the room past its RAM, from the end of RAM rounded up to 1 GiB to the end of the guest's physical addresses (the CPU's `PARange`, at most 40 bits, and under KVM at most KVM's largest IPA size), in whole GiB, as read-only machine properties, `x-pool-room-base` and `x-pool-room-size`, and places nothing there; `reims-graphics-pci` gives the library that room for the guest's Shared pool where no PC host bridge answers one, and reserves the range it took without fw_cfg where the machine has none ("The reims-graphics device", below) | `0590cfde` |
-| `reims-graphics-pci` populates each Shared pool piece once its add is answered, on a thread of its own in 2 MiB slices, so the guest's first touch of it takes no second-level fault: under KVM with `KVM_PRE_FAULT_MEMORY` on a vCPU of the thread's that never runs, under WHPX with `WHvAdviseGpaRange`'s populate. For that vCPU `KVM_CAP_MAX_VCPU_ID` is one past the guest's APIC ids, its TSC rejoins the guest vCPUs' generation after each of their reset-level puts, and a 20 ms timer ends a call left retrying ("The reims-graphics device", below) | `dd0e0d4a`, `9c95b677`, `a4dfdbf1`, `cfe57e55`, `b561d79c` |
+| `reims-graphics-pci` populates each Shared pool piece once its add is answered, on a thread of its own in 2 MiB slices, so the guest's first touch of it takes no second-level fault: under KVM with `KVM_PRE_FAULT_MEMORY` on a vCPU of the thread's that never runs, under WHPX with `WHvAdviseGpaRange`'s populate. For that vCPU `KVM_CAP_MAX_VCPU_ID` is one past the guest's APIC ids, its TSC rejoins the guest vCPUs' generation after each of their reset-level puts, and a 20 ms timer ends a call left retrying; under KVM a removed piece's slots are deleted on the library's thread before its removal, off the BQL (`kvm_unmap_before_del`) ("The reims-graphics device", below) | `dd0e0d4a`, `9c95b677`, `a4dfdbf1`, `cfe57e55`, `b561d79c`, `d2de4f94`, `7ad9c809` |
 
 The branch's other commits are the apple-gfx work `96e1b470` removes, and
 `cfaadbfa09`, an HVF workaround that `478c28ff70` reverts, upstream having
@@ -358,10 +358,15 @@ is its transport:
   that never runs, with vCPU 0's CPUID and TSC frequency, its id one past
   every APIC id the machine can give (`KVM_CAP_MAX_VCPU_ID` is one higher
   for it, fw_cfg's CPU count unchanged; an id past 254 makes none). A call
-  holds KVM's SRCU, which a slot change waits for under the BQL, so each
-  run of pool adds or removals pauses the populate first, signalling the
-  call in flight to end it, and a 20 ms timer ends a call that a slot change
-  from elsewhere left retrying on an obsolete root. The vCPU's TSC is
+  holds KVM's SRCU, which a slot change waits for, so each run of pool adds
+  or removals, and each removal's slot delete, pauses the populate first,
+  signalling the call in flight to end it, and a 20 ms timer ends a call
+  that a slot change from elsewhere left retrying on an obsolete root. A
+  removal deletes the piece's KVM slots on the library's thread before it
+  is queued (`kvm_unmap_before_del`), as WHPX unmaps it there: the delete
+  zaps what the populate mapped, 3-8 ms for a 256 MiB piece on the 780M and
+  the 3090, which the BQL would otherwise hold for, and the removal's
+  transaction then finds no slot. The vCPU's TSC is
   written to 0 after each reset-level put of a guest vCPU's, so it stays in
   their TSC generation and KVM's master clock stays on across a guest
   reboot. Under WHPX the call is `WHvAdviseGpaRange`'s populate, a
