@@ -31,6 +31,14 @@ impl ApiPlatform for RtPlatform {
         crate::singleton::rt_platform()
     }
 
+    /// The files behind the map's ranges, registered while the device lives
+    /// (`super::vulkan::lease_guest_ram`): on Linux the views of a pages block's guest pages, an
+    /// app's no-copy memory, are mapped from them, and where the GPU takes no pointer to those
+    /// pages, the device imports a dma-buf of them (`rt_platform::import_known`).
+    fn guest_memory(&self, map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
+        super::vulkan::lease_guest_ram(map)
+    }
+
     /// rt's blocks (`pool::RtBlocks`), each known to `device` from its take until just before it
     /// goes back (`KnownBlocks`): the buffers and heaps the guest pins inside its pool's blocks
     /// and its Private blocks are ranges of them, at the guest's addresses.

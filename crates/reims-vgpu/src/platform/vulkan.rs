@@ -130,24 +130,9 @@ impl ApiPlatform for VulkanPlatform {
         reims_vgpu_vulkan::api::read_pixels(texture, dst, bytes_per_row);
     }
 
-    /// The files behind the map's ranges, registered while the device lives
-    /// (`reims_vgpu_vulkan::os::lease_guest_memory`): on Linux the platform makes its views of the
-    /// guest's pages of them. A range without a file is not registered, and a view of its pages
-    /// is refused as a failed remap is. On macOS nothing is registered, since Mach makes a view
-    /// by remapping addresses.
+    /// The files behind the map's ranges, registered while the device lives ([`lease_guest_ram`]).
     fn guest_memory(&self, map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
-        let ranges = map.ranges().iter().zip(map.files());
-        let files = ranges.filter_map(|(range, file)| {
-            let file = file.as_ref()?;
-            Some(GuestRamFile {
-                host: range.host_address.addr().to_u64(),
-                guest: range.physical_address,
-                length: range.physical_length,
-                file: Arc::clone(&file.file),
-                offset: file.offset,
-            })
-        });
-        Box::new(reims_vgpu_vulkan::os::lease_guest_memory(files))
+        lease_guest_ram(map)
     }
 
     /// The first of the host's video arms that takes the device (`graphics::video_choice`): on
@@ -159,4 +144,24 @@ impl ApiPlatform for VulkanPlatform {
     ) -> Option<Arc<dyn crate::GraphicsVideo<Self>>> {
         crate::graphics::vulkan_graphics_video(device, runtime)
     }
+}
+
+/// The files behind `map`'s ranges, registered while what this returns lives
+/// (`reims_vgpu_vulkan::os::lease_guest_memory`): on Linux the platform makes its views of the
+/// guest's pages of them, and the dma-bufs of those pages. A range without a file is not
+/// registered, and a view of its pages is refused as a failed remap is. On macOS nothing is
+/// registered, since Mach makes a view by remapping addresses.
+pub(super) fn lease_guest_ram(map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
+    let ranges = map.ranges().iter().zip(map.files());
+    let files = ranges.filter_map(|(range, file)| {
+        let file = file.as_ref()?;
+        Some(GuestRamFile {
+            host: range.host_address.addr().to_u64(),
+            guest: range.physical_address,
+            length: range.physical_length,
+            file: Arc::clone(&file.file),
+            offset: file.offset,
+        })
+    });
+    Box::new(reims_vgpu_vulkan::os::lease_guest_memory(files))
 }
