@@ -103,6 +103,49 @@ pub fn map_for_pointer(first: NonNull<u8>, length: u64) -> bool {
     vm::unfold(start, end).is_ok()
 }
 
+/// Whether a page of the `length` bytes from `first` lies in a view mapped through a dma-buf
+/// (`super::vm`'s module docs, "Views through dma-bufs"): a `VM_PFNMAP` mapping, which no kernel
+/// pin takes, so no driver imports its pointer, and the rt platform hands rt none
+/// (`crate::rt_platform`'s `buffer::import_pages`). False where every page of them is mapped
+/// otherwise: from its file, or with no file behind it.
+#[cfg(any(test, feature = "rt"))]
+pub(crate) fn through_dma_bufs(first: NonNull<u8>, length: u64) -> bool {
+    let (start, end) = whole_pages(first, length);
+    !crate::os::files::through_pieces(start, end).is_empty()
+}
+
+/// The pages of a range kept as they are mapped while it lives: no fold of the views maps them
+/// through dma-bufs (`super::vm`'s module docs, "Folding back"), as for the pages of an import a
+/// device may pin (`super::import`'s `Pinned`). The rt platform holds one for each import it
+/// may hand rt by its pointer, from before it asks where the pages lie ([`through_dma_bufs`])
+/// until rt frees the import, so no pointer it hands rt comes to lie in a dma-buf's mapping.
+#[cfg(any(test, feature = "rt"))]
+#[derive(Debug)]
+pub(crate) struct MappingsHeld {
+    /// The record no fold maps through dma-bufs, until it drops.
+    _pinned: super::import::Pinned,
+}
+
+/// The whole pages of the `length` bytes from `first`, held as they are mapped while the answer
+/// lives ([`MappingsHeld`]).
+#[cfg(any(test, feature = "rt"))]
+pub(crate) fn hold_mappings(first: NonNull<u8>, length: u64) -> MappingsHeld {
+    let (start, end) = whole_pages(first, length);
+    MappingsHeld {
+        _pinned: super::import::Pinned::of(start, end),
+    }
+}
+
+/// The first byte of the first host page the `length` bytes from `first` lie in, and the end of
+/// the last.
+#[cfg(any(test, feature = "rt"))]
+fn whole_pages(first: NonNull<u8>, length: u64) -> (u64, u64) {
+    let page = vm::page_size();
+    let first = first.as_ptr().addr().to_u64();
+    let start = first & !(page - 1);
+    (start, first.saturating_add(length).next_multiple_of(page))
+}
+
 /// The pages of some ranges ([`pages_of`]): each run of them a first byte and a length, and where
 /// each range's first byte lies in the runs laid end to end.
 type RangesPages = (Vec<(u64, u64)>, Vec<u64>);
@@ -302,6 +345,77 @@ mod tests {
         unsafe { libc::munmap(anonymous, page.to_usize()) };
         free(view, 3 * page);
         free(at, 3 * page);
+    }
+
+    /// A view of a guest's pages lies in a dma-buf's mapping where the library maps views so
+    /// (udmabuf the process's), all of it or a byte of it; the pages' own mapping from their file
+    /// and memory no file is behind never do, nor does the view once mapped from its files for a
+    /// pointer ([`map_for_pointer`]), which then shows the same pages
+    #[test]
+    fn views_through_dma_bufs_are_told_from_pages_a_pin_takes() {
+        let page = vm::page_size();
+        let ptr = |at: u64| {
+            NonNull::new(std::ptr::with_exposed_provenance_mut::<u8>(at.to_usize())).unwrap()
+        };
+        let (at, runs) = scattered_pages(3);
+        let view = view_of(&runs);
+        let through = super::super::import::views_through_dma_bufs();
+        assert_eq!(through_dma_bufs(ptr(view), 3 * page), through);
+        assert_eq!(through_dma_bufs(ptr(view + page + 0x10), 1), through);
+        assert!(!through_dma_bufs(ptr(at), 3 * page), "the pages' own mapping");
+        // SAFETY: a fresh private anonymous mapping, unmapped below.
+        let anonymous = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page.to_usize(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(anonymous, libc::MAP_FAILED);
+        let plain = NonNull::new(anonymous.cast::<u8>()).unwrap();
+        assert!(!through_dma_bufs(plain, page), "memory no file is behind");
+        // SAFETY: the mapping made above, which nothing holds.
+        unsafe { libc::munmap(anonymous, page.to_usize()) };
+        if through {
+            assert!(map_for_pointer(ptr(view), 3 * page));
+            assert!(!through_dma_bufs(ptr(view), 3 * page), "mapped from its files");
+            // The view's pages are the file's last first, each byte its page's index.
+            assert_eq!([0, page, 2 * page].map(|i| read(view + i)), [2, 1, 0]);
+        } else {
+            eprintln!("views are mapped from their files here: the dma-bufs' side unchecked");
+        }
+        free(view, 3 * page);
+        free(at, 3 * page);
+    }
+
+    /// A view mapped from its files for a pointer stays so through a fold of the views while its
+    /// pages are held ([`hold_mappings`]), and is folded back into a dma-buf's mapping once they
+    /// are not, showing the same pages, where views are mapped through dma-bufs here
+    #[test]
+    fn held_pages_stay_mapped_from_their_files_through_a_fold() {
+        let page = vm::page_size();
+        if !super::super::import::views_through_dma_bufs() {
+            eprintln!("views are mapped from their files here: unchecked");
+            return;
+        }
+        let (at, runs) = scattered_pages(5);
+        let view = view_of(&runs);
+        let first =
+            NonNull::new(std::ptr::with_exposed_provenance_mut::<u8>(view.to_usize())).unwrap();
+        assert!(through_dma_bufs(first, 5 * page));
+        let held = hold_mappings(first, 5 * page);
+        assert!(map_for_pointer(first, 5 * page));
+        vm::fold_idle();
+        assert!(!through_dma_bufs(first, 5 * page), "held");
+        drop(held);
+        vm::fold_idle();
+        assert!(through_dma_bufs(first, 5 * page), "folded once let go");
+        assert_eq!([0, 4].map(|i| read(view + i * page)), [4, 0]);
+        free(view, 5 * page);
+        free(at, 5 * page);
     }
 
     /// The pages of ranges: merged where two share or meet a page, each range's offset in the

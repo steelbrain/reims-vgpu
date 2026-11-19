@@ -143,7 +143,8 @@
 //! change; every change the library makes to its views' mappings (a view, an unfold, a protect,
 //! an overwrite, an unmap) holds the views' lock to read ([`views`]), and a fold holds it to
 //! write, so none of them runs while a fold maps, and a fold never maps over a range another
-//! changes.
+//! changes. The rt platform's imports by a pointer hold their pages so for as long as the import
+//! lives (`super::device_lend`'s `MappingsHeld`).
 //!
 //! An import's pages are not mapped back through dma-bufs once the import goes: the guest's
 //! surfaces are imported again and again, the display's 32 MiB at 3840 × 2160 a frame, held about
