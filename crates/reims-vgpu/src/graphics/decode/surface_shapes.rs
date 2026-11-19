@@ -807,7 +807,10 @@ mod tests {
         assert!(calls.iter().all(|c| c.sel != "updateFence:"), "no fence");
         let (out, into) = overlaps(&calls, &[a, b]);
         assert!(into.is_empty());
-        assert!(out.iter().all(|(image, size)| (*image, size) == (a, &texels(32, 8))));
+        assert!(
+            out.iter()
+                .all(|(image, size)| (*image, size) == (a, &texels(32, 8)))
+        );
         assert_eq!(r.dec.caches().counts().shapes.overlap_dropped, 2, "B too");
     }
 
@@ -905,7 +908,11 @@ mod tests {
         let mark = r.p.call_log().mark();
         use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, false)]);
         let calls = r.p.call_log().since(mark);
-        assert_eq!(fills(&calls), [(cache, 0, image)], "the picture into the shape");
+        assert_eq!(
+            fills(&calls),
+            [(cache, 0, image)],
+            "the picture into the shape"
+        );
         assert!(written_back(&calls).is_empty());
         r.p.world().complete_all(CompleteOn::Caller);
 
@@ -919,7 +926,10 @@ mod tests {
         assert_eq!((counts.video_owed, counts.unseen), (1, 1));
         let mark = r.p.call_log().mark();
         use_surfaces(&mut r, 1, 0x102, &[(BLOCK, 0, false)]);
-        assert!(fills(&r.p.call_log().since(mark)).is_empty(), "nothing owed");
+        assert!(
+            fills(&r.p.call_log().since(mark)).is_empty(),
+            "nothing owed"
+        );
     }
 
     /// Library 30 and compute pipeline `obj_id` of a function in it.
