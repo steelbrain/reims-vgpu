@@ -11,6 +11,7 @@
 #include "RgfxControlRing.hpp"
 #include "RgfxDisplayPower.hpp"
 #include "RgfxFeatures.hpp"
+#include "RgfxLifecycleAnswers.hpp"
 #include "RgfxPat.hpp"
 #include "RgfxPipeColor.hpp"
 #include "RgfxPointerDevice.hpp"
@@ -459,6 +460,12 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 		*replyLength = 0;
 	if (!replyType)
 		return post(type, message, size, seqno);
+	// An answer the event handler would drop: no thread waits for it, as none would wake.
+	if (!rgfxLifecycleAnswer(replyType)) {
+		IOLog("ReimsGraphics: lifecycle %u: no event of type %u answers a waiter\n", type,
+		      replyType);
+		return kIOReturnUnsupported;
+	}
 
 	// Take a waiter, so the answer finds this thread once the message is on the ring.
 	uint64_t deadline = 0;
@@ -1088,16 +1095,6 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		// that drains this wakes the posts waiting for room (service). Counted for the room line.
 		__atomic_fetch_add(&roomRecords, 1, __ATOMIC_RELAXED);
 		return;
-	case RGFX_EVT_PIPELINE_REFLECTION:
-	case RGFX_EVT_SIZE_AND_ALIGN:
-	case RGFX_EVT_SAMPLER_STATE:
-	case RGFX_EVT_ICB_STATE:
-	case RGFX_EVT_SHARED_EVENT_VALUE:
-	case RGFX_EVT_RATE_MAP_STATE:
-	case RGFX_EVT_RATE_MAP_ANSWER:
-	case RGFX_EVT_FUNCTION_POINTER_STATE:
-		answerLifecycle(type, seqno, payload, size);
-		return;
 	case RGFX_EVT_VBLANK: {
 		// The refresh of the display it names (rgfxEventDisplay): its framebuffer's.
 		ReimsGraphics *fb = copyDisplay(drivenIndex(rgfxEventDisplay(payload, size)));
@@ -1157,10 +1154,6 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		pointerMotion(payload, size);
 		return;
 #if defined(__arm64e__)
-	case RGFX_EVT_VT_STATUS:
-		// A VT_MESSAGE's answer, for the thread that sent it (RgfxVtService.hpp).
-		answerLifecycle(type, seqno, payload, size);
-		return;
 	case RGFX_EVT_VT_MESSAGE:
 		// The host's side's message, for the guest's VideoToolbox (RgfxVtService.hpp).
 		vtMessage(payload, size);
@@ -1177,6 +1170,11 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		pointerOver(payload, size);
 		return;
 	default:
+		// The creates' and queries' answers, a POOL_TAKE's POOL_BLOCK, and on arm64e a
+		// VT_MESSAGE's VT_STATUS (RgfxVtService.hpp): each for the thread that waits for it
+		// (RgfxLifecycleAnswers.hpp).
+		if (rgfxLifecycleAnswer(type))
+			answerLifecycle(type, seqno, payload, size);
 		return;
 	}
 }

@@ -169,7 +169,8 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/pointer_motion_test $(BUILD)/tests/register_hold_test $(BUILD)/tests/vt_routes_test \
 	$(BUILD)/tests/vt_ring_test $(BUILD)/tests/pat_test \
 	$(BUILD)/tests/block_zero_test $(BUILD)/tests/block_zero_arm64_test $(BUILD)/tests/pool_blocks_test \
-	$(BUILD)/tests/pool_blocks_arm64_test
+	$(BUILD)/tests/pool_blocks_arm64_test $(BUILD)/tests/lifecycle_answers_test \
+	$(BUILD)/tests/lifecycle_answers_arm64_test
 
 $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
@@ -203,6 +204,11 @@ $(BUILD)/tests/video_codecs_arm64_test: tests/video_codecs_test.cpp $(HEADERS) .
 
 # The pool's blocks as the arm64e kext builds them (RgfxPoolBlocks.hpp): no pool bit.
 $(BUILD)/tests/pool_blocks_arm64_test: tests/pool_blocks_test.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
+	@mkdir -p $(@D)
+	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -DRGFX_GUEST_ARM64=1 -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
+
+# The answers the arm64e kext's waiters take (RgfxLifecycleAnswers.hpp): VT_STATUS too.
+$(BUILD)/tests/lifecycle_answers_arm64_test: tests/lifecycle_answers_test.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
 	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -DRGFX_GUEST_ARM64=1 -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
 
