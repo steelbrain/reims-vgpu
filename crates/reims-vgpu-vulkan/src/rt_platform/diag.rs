@@ -23,6 +23,10 @@
 //! - **Over-copies a presented frame.** rt's over-copies, their bytes and its submissions between
 //!   two of the display's presents ([`presented`]): mean, worst, and how many frames copied none,
 //!   1 to 9, 10 to 99 and 100 or more.
+//! - **Memory allocations by site.** rt's `vkAllocateMemory` calls inside the platform's calls
+//!   into it (any thread but rt's own block maker), by the site in rt that made them (rt's
+//!   `SiteAllocations`, eight sites): for each, the calls, the bytes they asked for and the
+//!   longest call since the device was made; the site of the longest call comes first.
 //! - **Textures over an imported block**, which rt keeps in an image of their own and copies the
 //!   bytes of into it at each submission that uses them (rt's `over` module), by kind: format,
 //!   size, rows, usage, storage mode, and where their block was imported (the selector, the
@@ -1182,6 +1186,35 @@ pub fn write() {
         );
     }
     drop(f);
+    if let Some(m) = super::device::metrics() {
+        let mut sites = [
+            ("texture", m.texture_allocations),
+            ("texture-block", m.texture_block_allocations),
+            ("ring-block", m.ring_block_allocations),
+            ("staging-region", m.staging_region_allocations),
+            ("staging-buffer", m.staging_buffer_allocations),
+            ("capture-ring", m.capture_ring_allocations),
+            ("zero-source", m.zero_source_allocations),
+            ("take", m.take_allocations),
+        ];
+        sites.sort_by_key(|(_, s)| std::cmp::Reverse(s.longest_nanos));
+        let all: Vec<String> = sites
+            .iter()
+            .map(|(site, s)| {
+                format!(
+                    "{site} {} calls {} bytes longest {:.3} ms",
+                    s.count,
+                    s.bytes,
+                    s.longest_nanos as f64 / 1e6
+                )
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "reims-vgpu: rt-diag allocation sites, longest call first: {}",
+            all.join(", ")
+        );
+    }
     for (kind, t) in OVERS.lock().iter() {
         let n = |a: &AtomicU64| a.load(Relaxed);
         let _ = writeln!(
