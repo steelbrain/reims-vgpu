@@ -14051,7 +14051,6 @@ fn the_pool_s_range_is_the_gpu_s_memory_heaps_at_most_the_addresses_given() {
 }
 
 /// A `POOL_TAKE` by context `context` of `length` bytes, as the kext posts it.
-#[cfg(not(windows))]
 fn pool_take(context: u32, length: u64) -> Vec<u8> {
     RgfxPoolTake {
         header: RgfxMsgHeader {
@@ -14068,7 +14067,6 @@ fn pool_take(context: u32, length: u64) -> Vec<u8> {
 }
 
 /// A `POOL_GIVE` by context `context` of its block of `length` bytes at pool offset `offset`.
-#[cfg(not(windows))]
 fn pool_give(context: u32, offset: u64, length: u64) -> Vec<u8> {
     RgfxPoolGive {
         header: RgfxMsgHeader {
@@ -14086,7 +14084,6 @@ fn pool_give(context: u32, offset: u64, length: u64) -> Vec<u8> {
 }
 
 /// A `HEAP_OVER_POOL` of `size_bytes` at pool offset `offset`.
-#[cfg(not(windows))]
 fn heap_over_pool(obj_id: u64, offset: u64, size_bytes: u64) -> Vec<u8> {
     RgfxHeapOverHostMemory {
         header: RgfxMsgHeader {
@@ -14105,7 +14102,6 @@ fn heap_over_pool(obj_id: u64, offset: u64, size_bytes: u64) -> Vec<u8> {
 }
 
 /// A take's `POOL_BLOCK`: its status, offset, length and GPU address.
-#[cfg(not(windows))]
 fn pool_block(guest: &mut Guest) -> (u32, u64, u64, u64) {
     let bytes = next_event(guest, RGFX_EVT_POOL_BLOCK);
     let block = RgfxPoolBlock::read_from_bytes(&bytes).unwrap();
@@ -14122,7 +14118,6 @@ fn pool_block(guest: &mut Guest) -> (u32, u64, u64, u64) {
 /// mapped its piece, makes a heap over it, and gives it back only once the heap is gone; a heap
 /// over bytes the context does not hold is made never; and the context's close gives its blocks
 /// back to the pool. It did not take `POOL_ADDRESSES`: its blocks' GPU addresses read 0
-#[cfg(not(windows))]
 #[test]
 fn a_guest_s_pool_block_is_taken_held_by_its_heap_and_given_back() {
     const BASE: u64 = 52 << 30;
@@ -14199,8 +14194,8 @@ fn a_guest_s_pool_block_is_taken_held_by_its_heap_and_given_back() {
     assert_eq!(device.decoder_object_count(), 0);
 }
 
-/// A guest of either architecture is offered the pool on a Linux or macOS host, and a guest of a
-/// device with none is offered none
+/// A guest of either architecture is offered the pool on a Linux or macOS host, an x86-64 guest on
+/// a Windows host too, and a guest of a device with none is offered none
 #[test]
 fn a_guest_of_either_architecture_is_offered_the_pool() {
     let pool_of = |guest_arch: GuestArch| {
@@ -14225,7 +14220,7 @@ fn a_guest_of_either_architecture_is_offered_the_pool() {
         )
     };
     assert_eq!(pool_of(GuestArch::Arm64), (!cfg!(windows), !cfg!(windows)));
-    assert_eq!(pool_of(GuestArch::X86_64), (!cfg!(windows), !cfg!(windows)));
+    assert_eq!(pool_of(GuestArch::X86_64), (true, true));
     let raised = Arc::new(AtomicU32::new(0));
     assert!(headless(&raised).control.shared_pool.is_none());
 }
@@ -14234,7 +14229,6 @@ fn a_guest_of_either_architecture_is_offered_the_pool() {
 /// on a platform whose pool blocks have none, the host's picks from 2^45 up, each block's span
 /// its pages and a guard page on the 32 KiB granule; a heap over the block at that address is
 /// pinned there
-#[cfg(not(windows))]
 #[test]
 fn a_guest_that_took_pool_addresses_is_answered_each_block_s_gpu_address() {
     const BASE: u64 = 52 << 30;

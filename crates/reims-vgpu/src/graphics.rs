@@ -561,13 +561,14 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 },
                 None => None,
             };
-            // The guest's processes take blocks of it for their buffers' slabs (`POOL`), on a
-            // Linux or macOS host: on Windows the pool waits for its cost under WHP to be measured
-            // within 5% of the region's. An arm64 guest's processes use the blocks write-back, as
-            // an x86-64 guest's do: arm64 boots under TCG and HVF ran on them with no fault
-            // (docs/graphics-kext/design.md, "The Shared pool").
+            // The guest's processes take blocks of it for their buffers' slabs (`POOL`). An
+            // arm64 guest's processes use the blocks write-back, as an x86-64 guest's do: arm64
+            // boots under TCG and HVF ran on them with no fault (docs/graphics-kext/design.md,
+            // "The Shared pool"). A Windows host offers it to an x86-64 guest alone, whose cost
+            // under WHP was measured beside the region's (docs/qemu.md, "Windows hosts: the
+            // Shared pool"): an arm64 guest runs under TCG there, where it was not measured.
             let pool_ledger = (shared_pool.as_ref())
-                .filter(|_| !cfg!(windows))
+                .filter(|_| !cfg!(windows) || config.guest_arch == GuestArch::X86_64)
                 .map(Pool::ledger);
             // `Managed` resources are one copy where the platform answers that the GPU shares the
             // CPU's memory, else two, which hold Metal's contract on any GPU: the guest's device
@@ -1057,7 +1058,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     }
 
     /// The GPU address of the stage-3 decoder's buffer or heap `obj_id`, where it holds one.
-    #[cfg(all(test, not(windows)))]
+    #[cfg(test)]
     pub(crate) fn decoder_gpu_address(&self, obj_id: u64) -> Option<u64> {
         self.control
             .decoders

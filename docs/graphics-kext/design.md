@@ -4818,11 +4818,13 @@ its own memory a piece at a time as the guest's buffers need it
 (`crates/reims-vgpu/src/pool.rs`; QEMU reserves the range at realize,
 docs/qemu.md "The reims-graphics device"). The device offers it (`POOL`,
 feature bit 57) to an x86-64 or arm64 guest on a Linux or macOS host where it
-has a pool, and both kexts take it. A Windows host offers none until the
-pool's cost under WHP measures within 5% of the region's: its guests keep the
-region's slabs and the process's own pages (`kIOReturnUnsupported` for
-selector 16). An arm64 guest's processes use their blocks write-back, as an
-x86-64 guest's do: the kext maps each into its process with
+has a pool, and to an x86-64 guest on a Windows host too, and both kexts take
+it; what a pool block costs under WHP beside a region block is in docs/qemu.md,
+"Windows hosts: the Shared pool". A Windows host offers none to an arm64 guest,
+which runs under TCG there and was not measured: such a guest keeps the
+region's slabs and the process's own pages (`kIOReturnUnsupported` for selector
+16). An arm64 guest's processes use their blocks write-back, as an x86-64
+guest's do: the kext maps each into its process with
 `kIOMapCopybackCache`, and an unaligned access to memory left Device faults
 under TCG and on the hardware alike. arm64 boots ran on pool blocks with no
 fault: under TCG, macOS 26 and 14 with the range just past an 8 GiB guest's
@@ -6873,7 +6875,7 @@ on a connection of another kind finds none of that number there.
 
 The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish`, 1 << 12 `DoorbellPage`, 1 << 13 `CpuPats`, 1 << 14 `ZeroedBlocks`, 1 << 15 `Pool`, 1 << 16 `PoolAddresses`, 1 << 17 `PrivateBlocks` and 1 << 18 `ImportAddresses`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed, `CpuPats` only on x86-64, and `Pool` and `PoolAddresses` only where the device has a pool; no other bit yet.
 
-Where the device offers no `POOL` (a Windows host), the kext sets no `Pool`
+Where the device offers no `POOL` (an arm64 guest on a Windows host), the kext sets no `Pool`
 bit, selector 16 answers `kIOReturnUnsupported`, and its processes keep the
 region's blocks and the kext's chunked pages. A take waits for the host's
 answer with no deadline, `THREAD_UNINT` like each of the kext's other asks of the host, whose
