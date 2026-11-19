@@ -111,10 +111,15 @@ pub struct Made {
 
 /// The texture of a descriptor, before it is made: what [`Made`] takes of it.
 pub struct Shape {
+    /// Its `MTLPixelFormat`.
     pub format: u32,
+    /// Its width in texels.
     pub width: u32,
+    /// Its height in texels.
     pub height: u32,
+    /// Its storage mode, the resource options' bits 4 to 7.
     pub storage: u64,
+    /// Its descriptor's `MTLTextureUsage`.
     pub usage: u64,
 }
 
@@ -446,10 +451,13 @@ struct How {
     blitted_into: bool,
 }
 
+/// A texture a command buffer used, and how.
+type Used = (Arc<Made>, Use);
+
 /// A command buffer's uses of textures over an imported block, until its commit
 /// ([`Uses::submitted`]).
 #[derive(Clone, Default)]
-pub struct Uses(Arc<Mutex<Vec<(Arc<Made>, Use)>>>);
+pub struct Uses(Arc<Mutex<Vec<Used>>>);
 
 impl Uses {
     /// The command buffer uses `texture` as `how` says: kept where it lies over an imported
@@ -518,16 +526,23 @@ pub fn gap(error: &rt::Error) {
 /// A pass's attachment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Point {
+    /// The colour attachment of this index.
     Color(usize),
+    /// The depth attachment.
     Depth,
+    /// The stencil attachment.
     Stencil,
 }
 
 /// A target of a pass: its attachment, level and slice, and its texture.
 pub struct Target {
+    /// Its attachment.
     pub point: Point,
+    /// The level it renders.
     pub level: u32,
+    /// The slice it renders.
     pub slice: u32,
+    /// Its texture.
     pub made: Arc<Made>,
 }
 
