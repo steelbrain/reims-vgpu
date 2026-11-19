@@ -600,7 +600,6 @@ impl Changed {
         };
         spans.splice(first..last, [joined]);
     }
-
 }
 
 /// Of `bytes`, the parts that lie in `spans`, sorted and apart: each of `bytes` cut to them, in
@@ -11243,7 +11242,10 @@ pub(super) mod tests {
         let spans = [100..200, 300..400];
         assert_eq!(clip(&spans, &[0..1000]), [100..200, 300..400]);
         assert_eq!(clip(&spans, &[150..350]), [150..200, 300..350]);
-        assert_eq!(clip(&spans, &[0..100, 200..300, 400..500]), Vec::<Range<u64>>::new());
+        assert_eq!(
+            clip(&spans, &[0..100, 200..300, 400..500]),
+            Vec::<Range<u64>>::new()
+        );
         assert_eq!(clip(&spans, &[120..130, 390..450]), [120..130, 390..400]);
         assert_eq!(clip(&[], &[0..1000]), Vec::<Range<u64>>::new());
     }

@@ -1531,8 +1531,15 @@ mod tests {
             "the first shape's KiB alone"
         );
         let pages = ram_bytes(&r, 1, length, None);
-        assert!(pages[..1024].iter().all(|&b| b == 0xc3), "the shape's bytes");
-        assert_eq!(pages[1024..], before[1024..], "the rest as the pages held them");
+        assert!(
+            pages[..1024].iter().all(|&b| b == 0xc3),
+            "the shape's bytes"
+        );
+        assert_eq!(
+            pages[1024..],
+            before[1024..],
+            "the rest as the pages held them"
+        );
         let counts = r.dec.caches().counts();
         assert_eq!(counts.narrowed, 1);
         assert_eq!(counts.unwritten_bytes, length - 1024);
@@ -1583,7 +1590,11 @@ mod tests {
         complete_staged(&r);
         let (back, out) = staged_download(&r, cache, 0x3c);
         assert_eq!(back, [(first, cache, 0)]);
-        assert_eq!((out[0].1, out[0].2, out[0].3), (0, 0, 1024), "the shape's alone");
+        assert_eq!(
+            (out[0].1, out[0].2, out[0].3),
+            (0, 0, 1024),
+            "the shape's alone"
+        );
     }
 
     /// A staged download after a writer that wrote nothing the host copied into the cache's
