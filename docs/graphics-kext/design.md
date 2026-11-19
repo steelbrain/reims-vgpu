@@ -4422,7 +4422,16 @@ the windows and the locks map it in (`RgfxScanoutOwner.hpp`). The display
 shows black, not the last owner's frame, until the new owner presents. The
 last owner opening again keeps its bytes, and the first owner finds the boot
 screen, which no process wrote and which the first present clears. A room the
-kernel will not map for the zeros fails the open.
+kernel will not map for the zeros fails the open. So the zeros are written only
+when a new WindowServer process opens the server connection: never at boot,
+and never when the same WindowServer opens it again. The new owner maps the
+whole room through the VRAM range, so the pass zeroes the display's whole share
+of the region (128 MiB in the boots measured here), and the host then backs all
+of it: up to 128 MiB of the host's RAM committed per VM from its first
+WindowServer replacement on, where the last owner's frames had touched only a
+frame or two of it. The stores took 103 ms on a Linux host under KVM (Radeon
+780M, job m3-max-49882) and 802 ms on a Windows host under WHP (UHD 630, job
+m3-max-50087), and the room's mapping 1.2 ms and 3.8 ms.
 
 Command buffers do not pass through the kext, so the host checks each
 object a message names: it must be
