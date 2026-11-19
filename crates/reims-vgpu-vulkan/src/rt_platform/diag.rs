@@ -890,9 +890,11 @@ pub fn attachment_read(
 
 // ----- Imageblock asks.
 
-/// The render states' imageblock asks by colour formats and sample count, with rt's answer.
-static IMAGEBLOCKS: Mutex<BTreeMap<([u32; 8], u32), (u64, Option<u32>)>> =
-    Mutex::new(BTreeMap::new());
+/// Imageblock asks by colour formats and sample count: how many, and rt's answer.
+type Asks = BTreeMap<([u32; 8], u32), (u64, Option<u32>)>;
+
+/// The render states' imageblock asks.
+static IMAGEBLOCKS: Mutex<Asks> = Mutex::new(BTreeMap::new());
 
 /// Counts an ask of `imageblockSampleLength` of a render state of colour formats `formats` and
 /// sample count `samples`, which rt answered `answer`, `None` where it refused; the first of the
