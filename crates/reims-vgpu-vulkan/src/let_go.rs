@@ -80,6 +80,21 @@ pub fn let_go_of_devices(bound: Duration) -> Result<usize, String> {
     Ok(let_go)
 }
 
+/// How many GPUs the platform keeps a runtime device of, each counted once by the runtime's
+/// registry ID: the devices adopted (`gpu::device`'s `DEVICES`) and the device whose answers
+/// describe formats (`crate::platform`'s `answering_device`), which is none of them where it was
+/// asked for before any device was adopted. The devices handed the guest's RAM and the one the
+/// sampler mempool follows are adopted ones. [`let_go_of_devices`] takes them all, so 0 once it
+/// let go of them, until a device is adopted again. What the platform's quiesce ahead of the
+/// exit answers by.
+pub fn gpus_kept() -> usize {
+    let mut ids = crate::gpu::device::adopted_runtime_ids();
+    ids.extend(crate::platform::answering_runtime_id());
+    ids.sort_unstable();
+    ids.dedup();
+    ids.len()
+}
+
 /// A stop the device's threads wait on between their steps ([`DeviceThreads`]).
 #[derive(Debug, Default)]
 pub(crate) struct Stop {

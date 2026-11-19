@@ -308,6 +308,12 @@ pub(crate) fn take_answering_device() -> Option<rt::Device> {
     ANSWERING.lock().take()
 }
 
+/// The runtime's registry ID of the device [`answering_device`] kept, where it kept one, for the
+/// count of the GPUs the platform keeps a runtime device of ([`crate::let_go::gpus_kept`]).
+pub(crate) fn answering_runtime_id() -> Option<u64> {
+    ANSWERING.lock().as_ref().map(rt::Device::registry_id)
+}
+
 /// The kinds the runtime announces at every occurrence (`DeviceOptions::announce_each`): those a
 /// call here hears ([`crate::answer::HEARD`]), `CopiedHostPages` and `ShadowedTexture`
 /// ([`crate::answer::PROBED`]), which the device's probe of its imports may meet unheard as it is
@@ -918,18 +924,47 @@ impl Platform for VulkanPlatform {
         &self.threads
     }
 
-    /// Nothing, and true: metal2vulkan's runtime offers no quiesce, and the process's exit stays
-    /// as it was. The release of the last graphics device lets go of the GPU devices
-    /// ([`crate::let_go`]), and the exit gate's hook waits for the library's steps in progress
-    /// ([`crate::exit_gate`]), as the runtime's guard waits for its own.
+    /// The library's threads: closes the exit gate ahead of the exit, so that a thread of the
+    /// library's parks at its next step, and waits for the steps in progress on other threads
+    /// until `bound` ([`crate::exit_gate::close_ahead`]). metal2vulkan's runtime offers no quiesce
+    /// of its own threads, and nothing is freed. True where the steps ended in time and the
+    /// platform keeps no GPU device ([`crate::let_go::gpus_kept`]): none was made, or the release
+    /// of the last graphics device let go of them ([`crate::let_go`]). False where it keeps one,
+    /// so that the process ends with `_exit` and no exit handler runs with a device live: the
+    /// runtime's exit hook waits for the runtime's work in progress only for a bound, and on
+    /// Linux, past it, ends the process with `_exit` itself, so the exit handlers registered
+    /// before it, the host's own exit work among them, never run (measured with a device kept to
+    /// a paused VM's quit: 5 of 9 quits on an RTX 3090 and 5 of 9 on an RTX 2080 left QEMU's
+    /// pidfile behind); and on NVIDIA's driver an exit with a device live can end in `SIGSEGV` in
+    /// the driver's exit handler ([`crate::let_go`]). False also where a step outlasted the wait,
+    /// which it warns of.
     fn quiesce(&self, bound: std::time::Duration) -> bool {
-        let _ = bound;
-        true
+        use crate::core::platform::os::clock::Clock as _;
+
+        let until = self.clock.now_mono().saturating_add(bound);
+        let parked = crate::exit_gate::close_ahead(until);
+        if !parked {
+            log::warn!(
+                target: "reims_vgpu_vulkan::exit_gate",
+                "the quiesce ahead of the exit ended after {bound:?} with a thread still in a \
+                 step of the library's"
+            );
+        }
+        let live = crate::let_go::gpus_kept();
+        if live > 0 {
+            log::debug!(
+                target: "reims_vgpu_vulkan::let_go",
+                "{live} GPU devices live at the exit: the process ends with _exit"
+            );
+        }
+        parked && live == 0
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::gpu::device::tests::dev;
 
@@ -1382,6 +1417,107 @@ pub(crate) mod tests {
             device_options().policy.pipeline_waits,
             metal2vulkan::device::PipelineWaitPolicy::Exact
         );
+    }
+
+    /// Runs the test named `test` again in a child process, with `RVG_QUIESCE_CHILD` naming it:
+    /// its exit status and its standard error.
+    fn run_quiesce_child(test: &str) -> (Option<i32>, String) {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env("RVG_QUIESCE_CHILD", test)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        println!("{stderr}");
+        (out.status.code(), stderr)
+    }
+
+    unsafe extern "C" {
+        /// The C library's `_exit`, which ends the process with no exit handler run; `safe`, as
+        /// the testkit's death tests declare it on Linux and macOS, since a declaration of
+        /// another signature clashes with theirs.
+        safe fn _exit(status: i32) -> !;
+        /// The C library's `exit`, which runs the exit handlers, as QEMU's exit does.
+        fn exit(status: i32) -> !;
+    }
+
+    /// A quiesce ahead of the exit with a device the platform keeps, in a child process: the
+    /// answer is false, since the process must then end with `_exit` (the platform's quiesce);
+    /// the exit gate is closed; a second call answers false again, at once; and the child then
+    /// ends with `_exit`, as the host does on false, with status 0
+    #[test]
+    fn a_quiesce_with_a_device_kept_answers_false() {
+        use crate::core::platform::os::clock::Clock as _;
+
+        const TEST: &str = "platform::tests::a_quiesce_with_a_device_kept_answers_false";
+        if std::env::var("RVG_QUIESCE_CHILD").as_deref() == Ok(TEST) {
+            let p = platform();
+            let device = dev();
+            eprintln!("GPUs kept {}", crate::let_go::gpus_kept());
+            eprintln!("quiesce answered {}", p.quiesce(Duration::from_secs(5)));
+            eprintln!("gate closed {}", crate::exit_gate::closed());
+            let start = p.clock.now_mono();
+            let second = p.quiesce(Duration::from_secs(5));
+            let took = p.clock.now_mono().saturating_duration_since(start);
+            eprintln!(
+                "a second quiesce answered {second}, at once {}",
+                took < Duration::from_millis(100)
+            );
+            drop(device);
+            _exit(0)
+        }
+        let (status, stderr) = run_quiesce_child(TEST);
+        assert_eq!(status, Some(0), "{stderr}");
+        for line in [
+            "GPUs kept 1",
+            "quiesce answered false",
+            "gate closed true",
+            "a second quiesce answered false, at once true",
+        ] {
+            assert!(stderr.contains(line), "no {line:?}: {stderr}");
+        }
+    }
+
+    /// The order the host's quit takes, in a child process: a device adopted and every handle of
+    /// it dropped but the platform's, then the let-go, which takes it; then the quiesce ahead of
+    /// the exit, which finds no device kept and answers true at once; then `exit()`, which runs
+    /// the exit handlers, the runtime's and the driver's among them, and ends with status 0
+    #[test]
+    fn the_let_go_takes_the_devices_so_the_quiesce_answers_true_and_the_exit_runs() {
+        use crate::core::platform::os::clock::Clock as _;
+
+        const TEST: &str = "platform::tests::\
+            the_let_go_takes_the_devices_so_the_quiesce_answers_true_and_the_exit_runs";
+        if std::env::var("RVG_QUIESCE_CHILD").as_deref() == Ok(TEST) {
+            let p = platform();
+            let (options, cache) = crate::gpu::device::tests::options_with_own_cache();
+            let raw = rt::Device::system_default_with(&options).expect("a Vulkan device");
+            drop(device::adopt(raw));
+            eprintln!("GPUs kept {}", crate::let_go::gpus_kept());
+            let let_go = crate::let_go::let_go_of_devices(Duration::from_secs(30));
+            eprintln!("let-go answered {let_go:?}");
+            eprintln!("GPUs kept after it {}", crate::let_go::gpus_kept());
+            drop(cache);
+            let start = p.clock.now_mono();
+            let quiesced = p.quiesce(Duration::from_secs(5));
+            let took = p.clock.now_mono().saturating_duration_since(start);
+            eprintln!(
+                "quiesce answered {quiesced}, at once {}",
+                took < Duration::from_millis(100)
+            );
+            // SAFETY: the C library's exit, which never returns.
+            unsafe { exit(0) }
+        }
+        let (status, stderr) = run_quiesce_child(TEST);
+        assert_eq!(status, Some(0), "{stderr}");
+        for line in [
+            "GPUs kept 1",
+            "let-go answered Ok(1)",
+            "GPUs kept after it 0",
+            "quiesce answered true, at once true",
+        ] {
+            assert!(stderr.contains(line), "no {line:?}: {stderr}");
+        }
     }
 
     /// The services are the ones the platform was made with
