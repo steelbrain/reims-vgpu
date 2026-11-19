@@ -7,9 +7,8 @@
 //! **Built piece by piece**, in the order a guest's boot reaches the pieces: the device and its
 //! answers, queues, buffers, textures, libraries and pipelines, command buffers and encoders,
 //! events, then the display. Built: the device ([`device`]) with its answers ([`answers`] and
-//! [`format`]), its command queues ([`queue`]), events and fences, and the reservation of
-//! resource indices. Until
-//! a piece is built, every call that reaches it is refused
+//! [`mod@format`]), its command queues ([`queue`]), events and fences, and the reservation of
+//! resource indices. Until a piece is built, every call that reaches it is refused
 //! ([`unbuilt`]). The call answers as Metal's call answers where it fails: a nil object, an
 //! `NSError`, zeros. The refusal is counted under the piece's code, `rt-unbuilt-<piece>`, in the
 //! process's degradation counts, and the first of each kind writes a line on stderr. Never a death
