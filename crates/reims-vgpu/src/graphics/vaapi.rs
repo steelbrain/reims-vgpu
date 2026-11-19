@@ -348,8 +348,8 @@ pub(crate) fn open<P: Platform>(
     if let Some(video) = kept {
         return Some(video);
     }
-    let made = VaapiVideo::<P>::new(device, &at, runtime, copies, checks.as_deref(), rules);
-    let video = match made {
+    let opened = VaapiVideo::<P>::new(device, &at, runtime, copies, checks.as_deref(), rules);
+    let video = match opened {
         Ok(video) => Arc::new(video),
         Err(why) => {
             log::info!("hardware video: no VA-API at {at}: {why}");
