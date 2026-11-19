@@ -135,7 +135,13 @@ impl RtRenderEncoder {
         let fragment = state.rt().texture_accesses(rt::Stage::Fragment);
         let pipeline = state.id().0;
         let accesses = [vertex.as_slice(), fragment.as_slice()];
-        diag::attachment_read(pipeline, accesses, &seen.bound, &self.targets, seen.depth_write);
+        diag::attachment_read(
+            pipeline,
+            accesses,
+            &seen.bound,
+            &self.targets,
+            seen.depth_write,
+        );
     }
 
     /// Encodes `cmd` but `endEncoding`, which the caller ends.

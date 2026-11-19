@@ -125,7 +125,15 @@ impl Made {
     /// A texture made by `call` (not a view nor over a buffer) of `shape`.
     pub fn new(call: Call, shape: &Shape) -> Arc<Made> {
         let id = NEXT.fetch_add(1, Relaxed);
-        Made::of(id, id, call, call == Call::SurfaceImage, shape, (0, 0), None)
+        Made::of(
+            id,
+            id,
+            call,
+            call == Call::SurfaceImage,
+            shape,
+            (0, 0),
+            None,
+        )
     }
 
     /// A view of `of`'s image, in `format`, from its level `level` and slice `slice`.
@@ -138,7 +146,15 @@ impl Made {
             storage: of.storage,
             usage: of.usage,
         };
-        Made::of(id, of.image, Call::View, of.surface, &shape, (level, slice), None)
+        Made::of(
+            id,
+            of.image,
+            Call::View,
+            of.surface,
+            &shape,
+            (level, slice),
+            None,
+        )
     }
 
     /// A texture of `shape` over `buffer`'s bytes from `offset`, rows `bytes_per_row` apart:
@@ -628,7 +644,10 @@ pub fn attachment_read(
         ));
     }
     let class = classes.join(" + ");
-    *READS.lock().entry(ReadClass { context, class }).or_insert(0) += 1;
+    *READS
+        .lock()
+        .entry(ReadClass { context, class })
+        .or_insert(0) += 1;
     let mut firsts = FIRSTS.lock();
     if firsts.1 < FIRST_LINES && firsts.0.insert(pipeline) {
         firsts.1 += 1;
@@ -740,7 +759,10 @@ pub fn write() {
         *reads.entry((key.class.clone(), process)).or_insert(0) += n;
     }
     for ((class, process), n) in &reads {
-        let _ = writeln!(out, "reims-vgpu: rt-diag attachment-read: {process}: {class}: {n}");
+        let _ = writeln!(
+            out,
+            "reims-vgpu: rt-diag attachment-read: {process}: {class}: {n}"
+        );
     }
     for ((formats, samples), n) in IMAGEBLOCKS.lock().iter() {
         let _ = writeln!(
@@ -794,10 +816,17 @@ pub fn write() {
         );
     }
     for (origin, n) in IMPORTS.lock().iter() {
-        let _ = writeln!(out, "reims-vgpu: rt-diag imports: {}: {n}", origin_name(origin));
+        let _ = writeln!(
+            out,
+            "reims-vgpu: rt-diag imports: {}: {n}",
+            origin_name(origin)
+        );
     }
     if !presenters.is_empty() {
-        let _ = writeln!(out, "reims-vgpu: rt-diag presenters: contexts {presenters:?}");
+        let _ = writeln!(
+            out,
+            "reims-vgpu: rt-diag presenters: contexts {presenters:?}"
+        );
     }
     if !out.is_empty() {
         say(&out);
@@ -833,9 +862,18 @@ mod tests {
                 .join()
                 .expect("it returns")
         };
-        assert_eq!(class("reims-vgpu.graphics-lane-0x10000000001"), "reims-vgpu.graphics-lane");
-        assert_eq!(class("reims-vgpu.graphics-compile-3"), "reims-vgpu.graphics-compile");
-        assert_eq!(class("reims-vgpu.graphics-surfaces"), "reims-vgpu.graphics-surfaces");
+        assert_eq!(
+            class("reims-vgpu.graphics-lane-0x10000000001"),
+            "reims-vgpu.graphics-lane"
+        );
+        assert_eq!(
+            class("reims-vgpu.graphics-compile-3"),
+            "reims-vgpu.graphics-compile"
+        );
+        assert_eq!(
+            class("reims-vgpu.graphics-surfaces"),
+            "reims-vgpu.graphics-surfaces"
+        );
     }
 
     /// A gap is counted by its kind, a draw's by its draw kind; another error is not.

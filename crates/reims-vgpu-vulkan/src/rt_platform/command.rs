@@ -560,7 +560,9 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 for target in &targets {
                     kept.uses().add_made(&target.made, Use::Rendered);
                 }
-                Some(RtObj::new(RtRenderEncoder::new(encoder, mark, kept, targets)))
+                Some(RtObj::new(RtRenderEncoder::new(
+                    encoder, mark, kept, targets,
+                )))
             }
             Err(error) => {
                 rt_refused_create(sel, &error);
