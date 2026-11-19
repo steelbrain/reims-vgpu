@@ -1094,7 +1094,7 @@ IODeviceMemory *RgfxAccelerator::copyWriteCombinedRegion() const
 IODeviceMemory *RgfxAccelerator::poolMemory()
 {
 	IODeviceMemory *pool = __atomic_load_n(&state.pool, __ATOMIC_ACQUIRE);
-	if (pool || !kRgfxKextFeaturePoolCarried || !(featureWord() & RGFX_FEATURE_POOL))
+	if (pool || !(featureWord() & RGFX_FEATURE_POOL))
 		return pool;
 	// The range reads the same for the device's life (POOL_BASE_LO).
 	const UInt64 base = (static_cast<UInt64>(readRegister(RGFX_REG_POOL_BASE_HI)) << 32) |

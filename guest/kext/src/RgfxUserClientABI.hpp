@@ -433,10 +433,10 @@ enum {
 	// left there (the kext's RgfxBlockZero.hpp).
 	kRgfxKextFeatureZeroedBlocks = 1 << 14,
 	// PoolTake, 16, and PoolGive, 17, which the bundle uses where the feature word holds
-	// RGFX_FEATURE_POOL too; the x86-64 kext alone.
+	// RGFX_FEATURE_POOL too; the x86-64 and arm64e kexts.
 	kRgfxKextFeaturePool = 1 << 15,
 	// PoolTake's (16) fourth output, the block's GPU address, which the bundle asks for where the
-	// feature word holds RGFX_FEATURE_POOL_ADDRESSES too; the x86-64 kext alone.
+	// feature word holds RGFX_FEATURE_POOL_ADDRESSES too; the x86-64 and arm64e kexts.
 	kRgfxKextFeaturePoolAddresses = 1 << 16,
 	// PrivateTake, 18, and PrivateGive, 22, which the bundle uses where the feature word holds
 	// RGFX_FEATURE_PRIVATE_BLOCKS too; the x86-64 and arm64e kexts.

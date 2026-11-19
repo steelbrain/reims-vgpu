@@ -39,22 +39,6 @@
 #include "RgfxUserClientABI.hpp"
 #include "reims_graphics_wire.h"
 
-#ifndef RGFX_GUEST_ARM64
-#define RGFX_GUEST_ARM64 0
-#endif
-
-// The kext's pool feature bit: the x86-64 kext's alone. The device offers an arm64 guest no pool
-// until a boot shows its kernel maps a range of the pool's kind (past the guest's RAM, above
-// 2^36) write-back, and the arm64e kext neither takes the device's POOL nor sets this bit:
-// kRgfxAccelMethodPoolTake and kRgfxAccelMethodPoolGive answer kIOReturnUnsupported there, and
-// its processes keep the region's blocks and the kext's chunked pages, as before the pool.
-constexpr uint64_t kRgfxKextFeaturePoolCarried = RGFX_GUEST_ARM64 ? 0 : kRgfxKextFeaturePool;
-
-// The kext's bit for the GPU addresses the host gives the pool's blocks (PoolTake's fourth
-// output), carried with the pool's: the x86-64 kext's alone.
-constexpr uint64_t kRgfxKextFeaturePoolAddressesCarried =
-    RGFX_GUEST_ARM64 ? 0 : kRgfxKextFeaturePoolAddresses;
-
 // Whether a POOL_BLOCK of `answered` bytes holds a whole answer: every field up to its length,
 // an answer of a host before RGFX_FEATURE_POOL_ADDRESSES' included, whose GPU address then reads
 // 0 (the answer's buffer zeroed); 0 where the feature word lacks the feature, as the host answers.

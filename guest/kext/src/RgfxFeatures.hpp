@@ -185,16 +185,16 @@
 //    the host reads in place handed its identity out with no message naming it
 //    (RGFX_CMD_BUFFER_ESCAPED), whose message the kext admits, and takes in a batch, as it does a
 //    Managed range's (RgfxSubmitGate.hpp);
-//  - POOL (bit 57), the x86-64 kext alone: the accelerator reads the Shared pool's range
+//  - POOL (bit 57), both kexts: the accelerator reads the Shared pool's range
 //    (POOL_BASE_LO to POOL_LENGTH_HI) and maps the blocks the host gives a context's POOL_TAKE
 //    into its process (kRgfxAccelMethodPoolTake, RgfxPoolBlocks.hpp), and the bundle lays its
 //    buffers' slabs in them, a heap over each (HEAP_OVER_POOL), which the kext admits as any
-//    create of the client's own objects (RgfxSubmitGate.hpp); an arm64 host offers no pool;
+//    create of the client's own objects (RgfxSubmitGate.hpp);
 //  - SURFACE_REFILL (bit 58), both kexts: the bundle tracks a cached surface's unlock seed from a
 //    commit made while a CPU held it locked for writing (kRgfxAccelMethodSurfaceSeeds), and has
 //    the next commit after the unlock ask the host to fill the surface's device cache again
 //    (RGFX_SURFACE_USE_REFILL), an op of its command buffers', which needs nothing of the kext;
-//  - POOL_ADDRESSES (bit 59), the x86-64 kext alone, with POOL: the kext answers the GPU address
+//  - POOL_ADDRESSES (bit 59), both kexts, with POOL: the kext answers the GPU address
 //    the host gives each pool block (kRgfxAccelMethodPoolTake's fourth output), where the bundle
 //    makes the block's heap;
 //  - PRIVATE_BLOCKS (bit 60), both kexts: the kext posts a context's PRIVATE_TAKE and PRIVATE_GIVE
@@ -246,9 +246,9 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_BUFFER_ESCAPED | RGFX_FEATURE_SURFACE_REFILL |
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K | RGFX_FEATURE_VT_MESSAGES | RGFX_FEATURE_VT_RING |
                             RGFX_FEATURE_CURSOR_COLOR
-                      : RGFX_FEATURE_DISPLAY_POWER | RGFX_FEATURE_POOL |
-                            RGFX_FEATURE_POOL_ADDRESSES) |
-    RGFX_FEATURE_PRIVATE_BLOCKS | RGFX_FEATURE_IMPORT_ADDRESSES;
+                      : RGFX_FEATURE_DISPLAY_POWER) |
+    RGFX_FEATURE_POOL | RGFX_FEATURE_POOL_ADDRESSES | RGFX_FEATURE_PRIVATE_BLOCKS |
+    RGFX_FEATURE_IMPORT_ADDRESSES;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer and, on arm64, the
 // displays whose node the firmware placed under /arm-io, counted from display 0 (`mobileNodes`):

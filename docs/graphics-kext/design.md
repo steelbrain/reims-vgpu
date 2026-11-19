@@ -4815,14 +4815,17 @@ addresses past the guest's RAM with no RAM under it, which the host fills with
 its own memory a piece at a time as the guest's buffers need it
 (`crates/reims-vgpu/src/pool.rs`; QEMU reserves the range at realize,
 docs/qemu.md "The reims-graphics device"). The device offers it (`POOL`,
-feature bit 57) to an x86-64 guest on a Linux or macOS host where it has a
-pool. A Windows host offers none until the pool's cost under WHP measures
-within 5% of the region's, and an arm64 guest gets none until a boot shows its
-kernel maps such a range, above 2^36, write-back: those guests keep the
-region's slabs and the process's own pages, as the arm64e kext does
-(`kIOReturnUnsupported` for selectors 16 and 17). Where the guest took the
-bit, `POOL_BASE_LO` to `POOL_LENGTH_HI` read the range, the same for the
-device's life, and the x86-64 kext reads it once at its start.
+feature bit 57) to an x86-64 or arm64 guest on a Linux or macOS host where it
+has a pool, and both kexts take it. A Windows host offers none until the
+pool's cost under WHP measures within 5% of the region's: its guests keep the
+region's slabs and the process's own pages (`kIOReturnUnsupported` for
+selector 16). An arm64 guest's kernel maps the range write-back, past its RAM
+and above 2^36 alike, as an x86-64 guest's does: an arm64 26 boot under TCG,
+which faults an unaligned load from Device memory, read its first blocks
+unaligned through the kext's own write-back mapping and ran on
+(m3-max-51279). Where the guest took the bit, `POOL_BASE_LO` to
+`POOL_LENGTH_HI` read the range, the same for the device's life, and the kext
+reads it once.
 - **A take.** A slab asks the kext for a block of the bytes it needs
   (selector 16, `PoolTake`): the kext posts its context's `POOL_TAKE` on ring
   0 and waits for the answer, `POOL_BLOCK`. The host carves the block from a
@@ -4860,7 +4863,7 @@ device's life, and the x86-64 kext reads it once at its start.
   one over a region block; a span outside the blocks the sender's context
   holds is a bad reference. The heap holds the block.
 - **Its GPU address.** The device offers `POOL_ADDRESSES` (feature bit 59)
-  wherever it offers `POOL`, and the x86-64 kext takes it (kext feature bit
+  wherever it offers `POOL`, and both kexts take it (kext feature bit
   1 << 16 `PoolAddresses`, `PoolTake`'s fourth output). Where the guest took
   it, each `POOL_BLOCK` that answers `OK` carries the block's GPU address
   (`RgfxPoolBlock.gpu_address`, at byte 40 of 48; a kext that reads 40 bytes
@@ -6835,7 +6838,7 @@ Map 1:
 | 12 | `PagesChunked` | 1 << 8 `PagesChunked` | a block of the runs of 64 KiB chunks of the kext's own, mapped into the process, for its slabs |
 | 13 | `SurfaceSeeds` | 1 << 10 `SurfaceSeeds` | an IOSurface's lock and unlock seeds, for a copy synced while a CPU held the surface locked for writing |
 | 15 | `CpuPats` | 1 << 13 `CpuPats` | every online CPU's PAT, read on each CPU, for an administrator's process: the check that entry 2 is write-back everywhere ("The BAR is one host memory region"; the guest's `guest/bundle/tools/pat_probe.c`); x86-64 only |
-| 16 | `PoolTake` | 1 << 15 `Pool`, 1 << 16 `PoolAddresses` (its fourth output, the block's GPU address, 0 for none) | a block of the Shared pool for the process's context, mapped into the process write-back once the host answers its `POOL_TAKE`, however long that takes ("The Shared pool"); three outputs, or four with its GPU address; x86-64 only, `kIOReturnUnsupported` on arm64e |
+| 16 | `PoolTake` | 1 << 15 `Pool`, 1 << 16 `PoolAddresses` (its fourth output, the block's GPU address, 0 for none) | a block of the Shared pool for the process's context, mapped into the process write-back once the host answers its `POOL_TAKE`, however long that takes ("The Shared pool"); three outputs, or four with its GPU address; `kIOReturnUnsupported` where the device offers no pool |
 | 17 | `PoolGive` | 1 << 15 `Pool` | gives a pool block back: out of the process, then its `POOL_GIVE` |
 | 18 | `PrivateTake` | 1 << 17 `PrivateBlocks` | a block of GPU addresses for the Private objects of the process's context, once the host answers its `PRIVATE_TAKE`, however long that takes ("Private blocks"); one input, the bytes, and two outputs, the block's GPU address and length |
 | 22 | `PrivateGive` | 1 << 17 `PrivateBlocks` | gives a Private block back: its `PRIVATE_GIVE`, with the block's GPU address and length; 22 rather than 19, as macOS 12's web-content sandbox refuses 19 to 21 |
@@ -6857,14 +6860,12 @@ the accelerator, which the bundle opens for each event it hands out: 10 and 11
 are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish`, 1 << 12 `DoorbellPage`, 1 << 13 `CpuPats`, 1 << 14 `ZeroedBlocks`, 1 << 15 `Pool`, 1 << 16 `PoolAddresses`, 1 << 17 `PrivateBlocks` and 1 << 18 `ImportAddresses`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed, `CpuPats` only on x86-64, and `Pool` and `PoolAddresses` only on x86-64 where the device has a pool; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish`, 1 << 12 `DoorbellPage`, 1 << 13 `CpuPats`, 1 << 14 `ZeroedBlocks`, 1 << 15 `Pool`, 1 << 16 `PoolAddresses`, 1 << 17 `PrivateBlocks` and 1 << 18 `ImportAddresses`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed, `CpuPats` only on x86-64, and `Pool` and `PoolAddresses` only where the device has a pool; no other bit yet.
 
-The arm64e kext takes no `POOL` of the device's offer, which offers an arm64
-guest none until a boot shows its kernel maps a range past its RAM, above
-2^36, write-back; it sets no `Pool` bit, selectors 16 and 17 answer
-`kIOReturnUnsupported` there, and its processes keep the region's blocks and
-the kext's chunked pages as before. A take waits for the host's answer with no
-deadline, `THREAD_UNINT` like each of the kext's other asks of the host, whose
+Where the device offers no `POOL` (a Windows host), the kext sets no `Pool`
+bit, selector 16 answers `kIOReturnUnsupported`, and its processes keep the
+region's blocks and the kext's chunked pages. A take waits for the host's
+answer with no deadline, `THREAD_UNINT` like each of the kext's other asks of the host, whose
 deadlines run 5 to 60 s: the host answers each take of an open context, and the
 context's close waits for its takes in flight. Where the host stops answering,
 each taking thread waits until it answers, holding one of the kext's 32 waiters

@@ -96,8 +96,8 @@ enum {
 // (RgfxRegionMapping.hpp), SurfaceSeeds, which Features leaves out where IOSurface exports no
 // unlock seed (rgfxSurfaceUnlockSeedExported), SubmitBatch's publish of a queue's ring,
 // OpenContext's doorbell page, on x86-64 CpuPats (RgfxPat.hpp), ZeroedBlocks (RgfxBlockZero.hpp),
-// on x86-64 Pool and PoolAddresses, which Features leaves out where the device has no pool
-// (poolMemory), and PrivateBlocks. Each bit is set by the change that lands its call.
+// Pool and PoolAddresses, which Features leaves out where the device has no pool (poolMemory),
+// and PrivateBlocks. Each bit is set by the change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeaturePagesChunked |
                                           kRgfxKextFeatureSubmitBatch |
@@ -111,8 +111,8 @@ constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeatureRegionWriteCombined |
                                           kRgfxKextFeatureCpuPatsRead |
                                           kRgfxKextFeatureZeroedBlocks |
-                                          kRgfxKextFeaturePoolCarried |
-                                          kRgfxKextFeaturePoolAddressesCarried |
+                                          kRgfxKextFeaturePool |
+                                          kRgfxKextFeaturePoolAddresses |
                                           kRgfxKextFeaturePrivateBlocks |
                                           kRgfxKextFeatureImportAddresses;
 

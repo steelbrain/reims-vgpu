@@ -1,5 +1,4 @@
-// The native test of RgfxPoolBlocks.hpp (pool_blocks_test, and pool_blocks_arm64_test with
-// RGFX_GUEST_ARM64=1, whose kext sets no pool bit): the take's rounded length, the check of the
+// The native test of RgfxPoolBlocks.hpp: the take's rounded length, the check of the
 // host's answer, and a client's list of its pool blocks growing to its most, each block taken off
 // by its offset or at the close, and none listed twice.
 #include "RgfxPoolBlocks.hpp"
@@ -21,12 +20,7 @@ static_assert(sizeof(RgfxPoolBlock) == 48, "POOL_BLOCK's record");
 static_assert(offsetof(RgfxPoolBlock, gpu_address) == 40, "the block's GPU address");
 static_assert(RGFX_FEATURE_POOL_ADDRESSES == (1ull << 59), "POOL_ADDRESSES is bit 59");
 static_assert(kRgfxKextFeaturePool == (1 << 15), "the kext's pool bit");
-static_assert(kRgfxKextFeaturePoolCarried == (RGFX_GUEST_ARM64 ? 0 : kRgfxKextFeaturePool),
-              "the x86-64 kext's alone");
 static_assert(kRgfxKextFeaturePoolAddresses == (1 << 16), "the kext's pool addresses bit");
-static_assert(kRgfxKextFeaturePoolAddressesCarried ==
-                  (RGFX_GUEST_ARM64 ? 0 : kRgfxKextFeaturePoolAddresses),
-              "the x86-64 kext's alone");
 
 namespace {
 int checks = 0;
