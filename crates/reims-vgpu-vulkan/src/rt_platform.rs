@@ -59,7 +59,7 @@ use std::time::Duration;
 use metal2vulkan_rt as rt;
 
 use crate::core::num::ToU64 as _;
-use crate::core::platform::os::clock::Clock as _;
+use crate::core::platform::os::clock::{Clock as _, MonoTime};
 use crate::core::platform::os::Threads;
 use crate::core::platform::os::vm::HostVm;
 use crate::core::platform::types::MtlSize;
@@ -154,6 +154,10 @@ struct Unended {
     device: Option<RtObj<RtDevice>>,
     /// rt's counters of it, whose gauges all read zero once it is torn down.
     counters: rt::Counters,
+    /// The let-go's handle of the instance it was made on, where the let-go's wait for its
+    /// teardown ran out: kept to the exit, since rt's README (Teardown) has the consumer wait for
+    /// the teardown before it drops its instance.
+    _instance: Option<rt::Instance>,
 }
 
 impl Unended {
@@ -179,11 +183,12 @@ const DROP_LET_GO: Duration = Duration::from_secs(5);
 /// device's last handle goes in a shared event's notification or a command buffer's handler, on
 /// rt's thread, rt tears the device down on its reaper once that returns, and a process ending
 /// meanwhile races the teardown. The let-go holds the platform's handle until rt's threads ended
-/// and drops it on the dropping thread, then waits for the gauges. The process's platform lives
-/// to the exit, so this serves the platforms tests make. A let-go past its bound is logged with
-/// what was left (handles beyond the platform's, rt's threads or GPU work, or gauges not at
-/// zero), and the devices kept to the exit are left undropped, since their drops would wait with
-/// no deadline.
+/// and drops it on the dropping thread, then waits, bounded, for the teardown, and drops its
+/// handle of the instance last. The process's platform lives to the exit, so this serves the
+/// platforms tests make. A let-go past its bound is logged with what was left (handles beyond
+/// the platform's, rt's threads or GPU work, or gauges not at zero), and the devices and
+/// instances kept to the exit are left undropped, since their drops would wait with no deadline
+/// or come ahead of the teardown.
 impl Drop for RtPlatform {
     fn drop(&mut self) {
         if let Err(held) = self.let_go_of_device(DROP_LET_GO) {
@@ -253,8 +258,10 @@ impl RtPlatform {
     ///   has no deadline, finds them ended. Where it answers false, the device is kept to the
     ///   exit, and `Err` says so;
     /// - the drop of the platform's handle, on this thread, which tears the device down where it
-    ///   was rt's last; then the wait for rt's gauges of the device to read zero, as they do once
-    ///   it is torn down. Where rt's objects of it outlive the wait, `Err` names them.
+    ///   was rt's last; then the wait for the teardown, rt's gauges of the device reading zero, as
+    ///   they do once it is torn down; then the drop of the let-go's handle of the instance the
+    ///   device was made on, which rt's README (Teardown) puts after that wait. Where rt's objects
+    ///   of it outlive the wait, `Err` names them, and the instance's handle is kept to the exit.
     ///
     /// A device taken and not torn down makes the exit's quiesce answer false while it lives.
     /// The next ask makes a new device, whose IDs start from new pools. `Ok`, with nothing let
@@ -290,30 +297,53 @@ impl RtPlatform {
         let counters = device.rt().counters();
         let left = until.saturating_duration_since(self.clock.now_mono());
         if !device.rt().quiesce(left) {
-            let device = Some(device);
-            self.unended.lock().push(Unended { device, counters });
+            self.unended.lock().push(Unended {
+                device: Some(device),
+                counters,
+                _instance: None,
+            });
             return Err(format!(
                 "rt's threads or GPU work on {named}, which its quiesce did not see end,"
             ));
         }
+        let instance = device.instance().clone();
         drop(device);
-        loop {
-            let gauges = counters.gauges();
-            if gauges == rt::Gauges::default() {
+        match self.wait_for_teardown(&counters, until) {
+            Ok(()) => {
+                drop(instance);
                 log::debug!(
                     target: "reims_vgpu_vulkan::let_go",
                     "let go of 1 GPU devices: rt's {named}"
                 );
-                return Ok(());
+                Ok(())
             }
-            if self.clock.now_mono() >= until {
+            Err(gauges) => {
                 self.unended.lock().push(Unended {
                     device: None,
                     counters,
+                    _instance: Some(instance),
                 });
-                return Err(format!(
+                Err(format!(
                     "rt's objects of {named}, its gauges not at zero ({gauges:?}),"
-                ));
+                ))
+            }
+        }
+    }
+
+    /// Waits, until `until`, for rt's teardown of the device whose counters are `counters`, all
+    /// of whose handles are gone: `Err` with the gauges where they did not all read zero by then.
+    fn wait_for_teardown(
+        &self,
+        counters: &rt::Counters,
+        until: MonoTime,
+    ) -> Result<(), Box<rt::Gauges>> {
+        loop {
+            let gauges = counters.gauges();
+            if gauges == rt::Gauges::default() {
+                return Ok(());
+            }
+            if self.clock.now_mono() >= until {
+                return Err(Box::new(gauges));
             }
             std::thread::sleep(crate::let_go::POLL);
         }
