@@ -17,6 +17,13 @@
 //!
 //! **Its registry ID** folds its `deviceUUID` (`super::answers::registry_id`), so it differs from
 //! the Vulkan platform's for the same GPU, which metal2vulkan-runtime gives.
+//!
+//! **Its over-copies.** Where the device's linear image cannot hold a texture over a buffer in
+//! place, rt keeps the texels in an image of its own and copies the bytes between the two,
+//! counting each copy and its bytes (rt's `Metrics`). The process's counts line carries them as
+//! amounts ([`fold_metrics`], which `crate::answer::write_counts` runs first):
+//! [`OVER_COPIES_CODE`] and [`OVER_COPY_BYTES_CODE`], and of those over an imported block,
+//! [`OVER_COPIES_IMPORTED_CODE`] and [`OVER_COPY_BYTES_IMPORTED_CODE`].
 
 use std::sync::{Arc, OnceLock};
 
@@ -56,6 +63,57 @@ use super::{RtObj, RtPlatform};
 
 /// The log target of the device's lines.
 const TARGET: &str = "reims_vgpu_vulkan::rt_platform";
+
+/// The code of rt's copies between a texture over a buffer and its image of its own (rt's
+/// `Metrics::over_copies`), an amount on the counts line ([`fold_metrics`]).
+pub const OVER_COPIES_CODE: &str = "rt-over-copies";
+
+/// The code of those copies' bytes (`Metrics::over_copy_bytes`).
+pub const OVER_COPY_BYTES_CODE: &str = "rt-over-copy-bytes";
+
+/// The code of those copies over a buffer in an imported block (`Metrics::over_copies_imported`).
+pub const OVER_COPIES_IMPORTED_CODE: &str = "rt-over-copies-imported";
+
+/// The code of their bytes (`Metrics::over_copy_bytes_imported`).
+pub const OVER_COPY_BYTES_IMPORTED_CODE: &str = "rt-over-copy-bytes-imported";
+
+/// The process's device's counters, once it is made ([`open`]), which [`fold_metrics`] reads.
+static COUNTERS: OnceLock<rt::Counters> = OnceLock::new();
+
+/// What [`fold_metrics`] folded so far of each of its metrics, in [`fold`]'s order.
+static FOLDED: crate::core::sync::Mutex<[u64; 4]> = crate::core::sync::Mutex::new([0; 4]);
+
+/// Counts by code (`crate::answer::count_kind_by`) what rt's over-copy metrics of the process's
+/// device rose by since the last fold, so the counts line carries their totals (the module's
+/// docs). Nothing before the device is made.
+pub fn fold_metrics() {
+    let Some(counters) = COUNTERS.get() else {
+        return;
+    };
+    let m = counters.metrics();
+    let now = [
+        m.over_copies,
+        m.over_copy_bytes,
+        m.over_copies_imported,
+        m.over_copy_bytes_imported,
+    ];
+    fold(&mut FOLDED.lock(), now);
+}
+
+/// Counts the rise of each of `now` over `folded`, the over-copies, their bytes, and those of an
+/// imported block, under its code, and keeps `now` as folded.
+fn fold(folded: &mut [u64; 4], now: [u64; 4]) {
+    let codes = [
+        OVER_COPIES_CODE,
+        OVER_COPY_BYTES_CODE,
+        OVER_COPIES_IMPORTED_CODE,
+        OVER_COPY_BYTES_IMPORTED_CODE,
+    ];
+    for ((code, now), was) in codes.into_iter().zip(now).zip(folded.iter_mut()) {
+        crate::answer::count_kind_by(code, now.saturating_sub(*was));
+        *was = now;
+    }
+}
 
 /// Metal's `maxCommandBufferCount` of a queue made by `newCommandQueue`.
 pub const METAL_MAX_COMMAND_BUFFER_COUNT: u32 = 64;
@@ -207,6 +265,8 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
     options.pipeline_cache_dir = crate::os::user_cache_directory().map(|dir| dir.join(CACHE));
     options.pipeline_cache_cap = Some(crate::platform::SHADER_CACHE_CAPACITY);
     let device = rt::Device::new(physical, options)?;
+    // The process's one device (the module's docs); where a test makes another, the first's fold.
+    let _ = COUNTERS.set(device.counters());
     let facts = facts(&device, floor, &uuid, page_size);
     log::info!(
         target: TARGET,
@@ -839,6 +899,30 @@ mod tests {
             }
         }
         lines
+    }
+
+    /// Each fold counts what each over-copy metric rose by since the last, under its code, so the
+    /// counts line carries the metrics' totals.
+    #[test]
+    fn over_copies_fold_into_the_counts_by_their_rise() {
+        let codes = [
+            OVER_COPIES_CODE,
+            OVER_COPY_BYTES_CODE,
+            OVER_COPIES_IMPORTED_CODE,
+            OVER_COPY_BYTES_IMPORTED_CODE,
+        ];
+        let counts = || {
+            let all = crate::answer::degradation_counts();
+            codes.map(|code| (all.iter()).find(|(c, _)| c == code).map_or(0, |&(_, n)| n))
+        };
+        let before = counts();
+        let mut folded = [0; 4];
+        fold(&mut folded, [2, 8192, 1, 4096]);
+        fold(&mut folded, [3, 12288, 1, 4096]);
+        assert_eq!(folded, [3, 12288, 1, 4096]);
+        let after = counts();
+        let rose: Vec<u64> = (after.iter().zip(before)).map(|(a, b)| a - b).collect();
+        assert_eq!(rose, [3, 12288, 1, 4096]);
     }
 
     /// The flat fields of a struct's `Debug` text name each field once.

@@ -2808,9 +2808,12 @@ static COUNTS_WRITTEN: crate::core::sync::Mutex<String> =
 /// <n>, …` ([`counts_line`]), the line the codes of a boot's degradations are read from; and the
 /// log's count of the lines it wrote at debug after their kind's first
 /// ([`crate::core::logging::write_repeats`]). A device's reset and the process's exit write them
-/// (`reims-vgpu`'s reset, [`crate::exit_gate`]).
+/// (`reims-vgpu`'s reset, [`crate::exit_gate`]). The rt platform's over-copy amounts are folded
+/// into the counts first (`rt_platform::device::fold_metrics`).
 pub fn write_counts() {
     crate::core::logging::write_repeats();
+    #[cfg(feature = "rt")]
+    crate::rt_platform::device::fold_metrics();
     let Some(line) = counts_line(&degradation_counts()) else {
         return;
     };
