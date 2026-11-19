@@ -243,8 +243,10 @@ RgfxCreated RgfxSerializer::createHeap(uint64_t size_bytes, uint32_t options, in
 {
 	RgfxCreated out = {};
 	// In a Private block where the context takes them (a heap that is not Shared is the GPU's
-	// alone). No address left for it: no object, as Metal answers one it cannot place.
-	out.gpu_address = m_ids.allocPrivateAddress(size_bytes, align);
+	// alone), at a multiple of kHeapAddressAlign from the block's first byte. No address left
+	// for it: no object, as Metal answers one it cannot place.
+	const uint64_t heap_align = std::max(align, kHeapAddressAlign);
+	out.gpu_address = m_ids.allocPrivateAddress(size_bytes, heap_align, /*fromBlock*/ true);
 	if (out.gpu_address == 0)
 		return out;
 	out.obj_id = m_ids.allocObjId();

@@ -4945,7 +4945,15 @@ its kext sets that bit and the device took the feature.
   holding its span on the 32 KiB granule (its pages and a guard page), a
   freed span picked again only once the picks wrap round. Free ranges never
   join across blocks, so no pick spans two of them, side by side as the host
-  may give them.
+  may give them. A heap's address lies at a multiple of 256 KiB from its
+  block's first byte (`kHeapAddressAlign`), not from 0: on metal2vulkan-rt
+  the host binds a heap's texture at the heap's offset in the block's memory
+  plus the texture's offset, and rt refuses a texture whose place there is
+  off its image's alignment (counted as `rt-refused-heap-texture-place`).
+  256 KiB is the largest image alignment measured on the hosts' GPUs (a
+  multisample target on an RX 7900 XTX; 64 KiB on a Radeon 780M and an Iris
+  Xe), and the block's memory starts at a multiple of 2 MiB there, which its
+  address need not be.
 - **Refused.** Where the host refuses a take, the bundle picks the object's
   address in the context's own range, as a guest that did not take the bit
   does, and logs the first refusal of the process.

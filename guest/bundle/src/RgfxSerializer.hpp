@@ -416,8 +416,9 @@ public:
 	// --- heaps ----------------------------------------------------------------
 
 	/// A device heap of `size_bytes`. `options` is MTLResourceOptions, `heap_type`
-	/// MTLHeapType. A GPU address of `size_bytes` aligned to `align` is picked, in a Private
-	/// block where the process takes them (RgfxIdSpace::allocPrivateAddress). This and the
+	/// MTLHeapType. A GPU address of `size_bytes` aligned to `align` and to kHeapAddressAlign
+	/// is picked, in a Private block where the process takes them, aligned from the block's
+	/// first byte (RgfxIdSpace::allocPrivateAddress, fromBlock). This and the
 	/// three creates after it post nothing, and answer an obj_id and a gpu_address of 0, where
 	/// the context's range has no room left for the address.
 	RgfxCreated createHeap(uint64_t size_bytes, uint32_t options, int32_t heap_type,
@@ -827,6 +828,15 @@ public:
 	/// The caller passes a caps-derived alignment where Metal demands one; this
 	/// is a safe floor for the first slice.
 	static constexpr uint64_t kDefaultAddressAlign = 256;
+
+	/// What a device heap's GPU address is a multiple of, from its Private block's first
+	/// byte (createHeap): 256 KiB, the largest image alignment measured on the hosts' GPUs (a
+	/// multisample target on an RX 7900 XTX; 64 KiB on a Radeon 780M and an Iris Xe, 1 KiB on
+	/// an RTX 3090). The host binds a heap's texture at the heap's offset in the block's memory
+	/// plus the texture's offset, which Metal's rule aligns, and metal2vulkan-rt refuses one
+	/// whose place there is off the image's alignment; the block's memory starts at a multiple
+	/// of 2 MiB there.
+	static constexpr uint64_t kHeapAddressAlign = 0x40000;
 
 private:
 	RgfxRingWriter &m_control;

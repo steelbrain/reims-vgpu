@@ -16,15 +16,18 @@ uint64_t alignUp(uint64_t value, uint64_t align)
 	return (value + (align - 1)) & ~(align - 1);
 }
 
-// A pick of `span` bytes at a multiple of `align` from the free ranges `free` (by start), next
-// fit: the range the cursor lies in, from the cursor, and those after it; then round from the
-// first. Its start, its span taken out of `free` and the cursor moved past it; 0 where none fits.
+// A pick of `span` bytes at a multiple of `align` from `origin(at)`, the address a free range at
+// `at` is aligned from (at or below it), from the free ranges `free` (by start), next fit: the
+// range the cursor lies in, from the cursor, and those after it; then round from the first. Its
+// start, its span taken out of `free` and the cursor moved past it; 0 where none fits.
+template <typename Origin>
 uint64_t pickFrom(std::map<uint64_t, uint64_t> &free, uint64_t &cursor, uint64_t span,
-                  uint64_t align)
+                  uint64_t align, Origin origin)
 {
 	// Where `span` bytes from `from` on fit the free range at `at` of `length` bytes.
 	auto fit = [&](uint64_t at, uint64_t length, uint64_t from, uint64_t *start) {
-		const uint64_t s = alignUp(std::max(at, from), align);
+		const uint64_t base = origin(at);
+		const uint64_t s = base + alignUp(std::max(at, from) - base, align);
 		if (s < at || s - at >= length || length - (s - at) < span)
 			return false;
 		*start = s;
@@ -195,7 +198,8 @@ uint64_t RgfxIdSpace::allocAddress(uint64_t size, uint64_t align)
 	align = std::max(align, kAddressGranule);
 	const uint64_t span = addressSpan(size);
 	std::lock_guard<std::mutex> hold(m_addressLock);
-	if (const uint64_t start = pickFrom(m_freeRanges, m_addressCursor, span, align)) {
+	auto absolute = [](uint64_t) -> uint64_t { return 0; };
+	if (const uint64_t start = pickFrom(m_freeRanges, m_addressCursor, span, align, absolute)) {
 		m_livePicks[start] = span;
 		return start;
 	}
@@ -272,14 +276,22 @@ void RgfxIdSpace::setPrivateBlockSource(PrivateTakeFn take, PrivateGiveFn give, 
 	m_privateContext = context;
 }
 
-uint64_t RgfxIdSpace::allocPrivateAddress(uint64_t size, uint64_t align)
+uint64_t RgfxIdSpace::allocPrivateAddress(uint64_t size, uint64_t align, bool fromBlock)
 {
 	if (m_privateTake == nullptr)
 		return allocAddress(size, align);
 	align = std::max(align, kAddressGranule);
 	const uint64_t span = addressSpan(size);
+	// The address a free range is aligned from: 0, or with `fromBlock` its block's first byte.
+	// Caller holds m_addressLock.
+	auto origin = [&](uint64_t at) -> uint64_t {
+		if (!fromBlock)
+			return 0;
+		const auto block = privateBlockOf(at);
+		return block == m_privateBlocks.end() ? 0 : block->first;
+	};
 	auto pick = [&]() -> uint64_t {
-		const uint64_t start = pickFrom(m_privateFree, m_privateCursor, span, align);
+		const uint64_t start = pickFrom(m_privateFree, m_privateCursor, span, align, origin);
 		if (start != 0) {
 			m_privatePicks[start] = span;
 			privateBlockOf(start)->second.picks++;

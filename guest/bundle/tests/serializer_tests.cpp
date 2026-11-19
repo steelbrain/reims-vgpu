@@ -359,6 +359,66 @@ void test_private_address_picks()
 	}
 }
 
+// A device heap in a Private block lies at a multiple of kHeapAddressAlign (256 KiB) from the
+// block's first byte, which the host's 64 KiB need not make a multiple of it: the host binds the
+// heap's textures at that offset in the block's memory, at their alignment. Here the block starts
+// on an odd 64 KiB and a buffer's pick lies at its start: the heap lies 256 KiB into the block,
+// not at the granule past the buffer (block + 32 KiB) nor at the next absolute 256 KiB
+// (block + 192 KiB); HEAP_CREATE carries that address; a larger alignment asked counts from the
+// block too; a buffer picked after it keeps its granule. With no source, the heap lies at a
+// multiple of 256 KiB in the context's range.
+void test_private_heaps_align_from_their_block()
+{
+	const uint64_t heapAlign = RgfxSerializer::kHeapAddressAlign;
+	const uint64_t granule = RgfxIdSpace::kAddressGranule;
+	CHECK(heapAlign == 0x40000 && heapAlign % granule == 0);
+	const uint64_t base = RGFX_CONTEXT_VA_BASE + 3 * RGFX_CONTEXT_VA_UNIT;
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+
+	FakePrivate f;
+	f.next += RGFX_PRIVATE_BLOCK_ALIGN; // the block's first byte on an odd 64 KiB
+	RgfxIdSpace ids;
+	ids.setBases(uint64_t{4} << RGFX_CONTEXT_OBJ_ID_SHIFT, base, RGFX_CONTEXT_VA_UNIT);
+	ids.setPrivateBlockSource(&fakePrivateTake, &fakePrivateGive, &f);
+	RgfxSerializer ser(writer, ids);
+	const uint64_t buffer = ids.allocPrivateAddress(0x4000, 256);
+	CHECK(f.taken.size() == 1);
+	const uint64_t block = f.taken[0].first;
+	CHECK(buffer == block && block % heapAlign == RGFX_PRIVATE_BLOCK_ALIGN);
+	CHECK(RgfxIdSpace::addressSpan(0x4000) == granule);
+
+	RgfxCreated heap = ser.createHeap(0x10000, 0, 1 /*Placement*/);
+	CHECK(heap.posted && heap.gpu_address == block + heapAlign);
+	CHECK((heap.gpu_address - block) % heapAlign == 0 && heap.gpu_address % heapAlign != 0);
+	auto hm = expectMessage<RgfxHeapCreate>(ring, RGFX_CMD_HEAP_CREATE);
+	CHECK(hm.obj_id == heap.obj_id && hm.gpu_address == heap.gpu_address);
+
+	RgfxCreated wide = ser.createHeap(0x10000, 0, 1, 0x10'0000);
+	CHECK(wide.posted && wide.gpu_address == block + 0x10'0000);
+	CHECK(expectMessage<RgfxHeapCreate>(ring, RGFX_CMD_HEAP_CREATE).gpu_address ==
+	      wide.gpu_address);
+	const uint64_t after = ids.allocPrivateAddress(0x4000, 256);
+	CHECK(after == wide.gpu_address + RgfxIdSpace::addressSpan(0x10000));
+	CHECK(f.taken.size() == 1 && ids.privatePicksLive() == 4);
+	for (uint64_t at : {buffer, heap.gpu_address, wide.gpu_address, after})
+		ids.freeAddress(at);
+	CHECK(ids.privatePicksLive() == 0);
+
+	// No source: the context's range, at an absolute multiple of 256 KiB past a buffer's pick.
+	RgfxIdSpace own;
+	own.setBases(uint64_t{5} << RGFX_CONTEXT_OBJ_ID_SHIFT, base, RGFX_CONTEXT_VA_UNIT);
+	RgfxSerializer ownSer(writer, own);
+	const uint64_t first = own.allocPrivateAddress(0x4000, 256);
+	CHECK(first == base);
+	RgfxCreated ownHeap = ownSer.createHeap(0x10000, 0, 1);
+	CHECK(ownHeap.posted && ownHeap.gpu_address == base + heapAlign);
+	CHECK(expectMessage<RgfxHeapCreate>(ring, RGFX_CMD_HEAP_CREATE).gpu_address ==
+	      ownHeap.gpu_address);
+}
+
 // A chunk source standing in for the kext: it hands each first id of `firsts` in turn, with
 // the grant's size from `sizes` where it holds one for it (else none, the space's own size),
 // then answers none left, and counts its calls (the user-client calls a create would make).
@@ -4591,6 +4651,7 @@ int main()
 {
 	test_id_space();
 	test_private_address_picks();
+	test_private_heaps_align_from_their_block();
 	test_obj_ids_are_given_once();
 	test_region_pages_blocks();
 	test_region_pages_joins();
