@@ -141,7 +141,7 @@ repeats the ones code cites.
     process that held such an escaped copy: no degradation,
     docs/graphics-kext/design.md, "A buffer's escaped identity"), its VA-API
     video's on the rt platform on Windows (`rt-video-gpu-copy-declined`, a
-    picture the CPU copied, the GPU's copy declined), and the Vulkan
+    picture the CPU copied, the GPU's copy declined), the Vulkan
     platform's command predication's
     (`predication-loop-overrun`, a command buffer whose loop ran past the
     iterations laid down for it, which fails), and the contexts' Private
