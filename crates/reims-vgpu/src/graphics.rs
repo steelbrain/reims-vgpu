@@ -813,7 +813,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let mut vt = paravirt::Host::default();
             let video_runtime = crate::video::runtime::PlatformRuntime::of(&platform);
             if let Some(video) = platform.graphics_video(&gpu_device, video_runtime) {
-                let caps = video_caps(features, &*video);
+                let caps = video_caps(features, P::SURFACE_SHAPES, &*video);
                 let cached = caps.flags & RGFX_VIDEO_CAPS_OUTPUT_CACHED != 0;
                 debug_assert!(caps.codec_count as usize <= RGFX_VIDEO_CAPS_CODECS);
                 region.write(RGFX_VIDEO_CAPS_OFFSET, caps.as_bytes());
@@ -4534,11 +4534,17 @@ fn scanout_sink<P: ApiPlatform>(
 /// asks one for (`SURFACE_CACHE`), or of those whose textures would not lie in place in their
 /// pages, where the GPU shares the CPU's memory (`SURFACE_CACHE_REFUSED`), and where `video` lands
 /// pictures in them. The guest's decoder then asks a cache for its outputs with their layout, as
-/// for any other surface, and a picture lands in place only in a surface's pages.
-fn video_caps<P: Platform>(features: u64, video: &dyn GraphicsVideo<P>) -> RgfxVideoCaps {
+/// for any other surface, and a picture lands in place only in a surface's pages. A platform of
+/// the per-shape form (`shapes`, [`ApiPlatform::SURFACE_SHAPES`]) caches every surface and lays
+/// no texture over its pages, so the guest asks its outputs cached wherever it offers video.
+fn video_caps<P: Platform>(
+    features: u64,
+    shapes: bool,
+    video: &dyn GraphicsVideo<P>,
+) -> RgfxVideoCaps {
     let caches =
         u64::from(RGFX_FEATURE_SURFACE_CACHE) | u64::from(RGFX_FEATURE_SURFACE_CACHE_REFUSED);
-    let cached = features & caches != 0 && video.lands_in_device_caches();
+    let cached = shapes || (features & caches != 0 && video.lands_in_device_caches());
     let mut caps = RgfxVideoCaps {
         version: RGFX_VIDEO_CAPS_VERSION,
         flags: if cached {
