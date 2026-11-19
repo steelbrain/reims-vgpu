@@ -245,7 +245,10 @@
 //!   way for its own to reach the GPU. Such caches hold at most the device's budget of them
 //!   (`DEFERRED_BUDGET_LO`), from their make to their release, named or not; a block past it, or
 //!   one whose cache the platform does not make, is refused with no cache, and the kext names its
-//!   pages instead.
+//!   pages instead. In the per-shape form a block named cached whose pages the host makes no view
+//!   of, or no buffer over, takes its cache with its pages copied the same way
+//!   ([`Caches::make_copied`], `super::surface_shapes`), where it was refused, and the kext gave
+//!   the surface a copy block whose textures are no shape's.
 //!
 //!   On a GPU that shares the CPU's memory, where the guest took
 //!   `RGFX_FEATURE_SURFACE_DEFERRED_ASK`, a deferral asks with the surface's layout
@@ -1099,8 +1102,9 @@ enum CachePages<P: Platform> {
         runs: Vec<Range<u64>>,
         unmade: Arc<Unmade<P>>,
     },
-    /// A deferred block's pages the host made no view of, or no buffer over, at their naming:
-    /// copied through a Shared buffer of each copy's own (the module doc).
+    /// Pages the host made no view of, or no buffer over, at their naming, a deferred block's or,
+    /// in the per-shape form, a block's named cached ([`Caches::make_copied`]): copied through a
+    /// Shared buffer of each copy's own (the module doc).
     Copied(Arc<CopiedPages>),
 }
 
@@ -1129,12 +1133,17 @@ struct CopiedPages {
     /// What holds the mapping the runs lie in, where they lie in a view's, or in the guest's RAM
     /// through what makes a view of them ([`Self::of_view`], [`Self::of_runs`]).
     _hold: Option<Arc<dyn Any + Send + Sync>>,
+    /// Where the cache was made with its pages copied ([`Caches::make_copied`]), not deferred,
+    /// the block's size its `SURFACE_PAGES` gave, which a `BUFFER_OVER_SURFACE_PAGES` is checked
+    /// against, as the block has no view ([`SurfaceCaches::unviewed_buffer`]).
+    block_size: Option<u64>,
 }
 
 impl CopiedPages {
     /// The pages of `runs` (host address, bytes), merged where one ends where the next starts,
-    /// where they hold at least `length` bytes; `None` otherwise.
-    fn new(runs: &[(HostPtr, u64)], length: u64) -> Option<Self> {
+    /// where they hold at least `length` bytes, of a block of `block_size` bytes where the cache
+    /// is made with them ([`CopiedPages::block_size`]); `None` otherwise.
+    fn new(runs: &[(HostPtr, u64)], length: u64, block_size: Option<u64>) -> Option<Self> {
         let mut merged: Vec<(HostPtr, u64)> = Vec::new();
         let mut total = 0u64;
         for &(at, bytes) in runs {
@@ -1150,13 +1159,14 @@ impl CopiedPages {
         (total >= length && length != 0).then_some(CopiedPages {
             runs: merged,
             _hold: None,
+            block_size,
         })
     }
 
     /// The pages `view` maps, `length` bytes of them, held by the view while the cache copies
     /// them (the module doc, "Staged copies"); `None` where it holds fewer.
     fn of_view<P: Platform>(view: &Arc<SurfaceView<P>>, length: u64) -> Option<Self> {
-        let mut pages = CopiedPages::new(&[(view.base(), view.length())], length)?;
+        let mut pages = CopiedPages::new(&[(view.base(), view.length())], length, None)?;
         pages._hold = Some(Arc::clone(view) as Arc<dyn Any + Send + Sync>);
         Some(pages)
     }
@@ -1177,7 +1187,7 @@ impl CopiedPages {
                 )
             })
             .collect();
-        let mut pages = CopiedPages::new(&runs, length)?;
+        let mut pages = CopiedPages::new(&runs, length, None)?;
         pages._hold = Some(unmade as Arc<dyn Any + Send + Sync>);
         Some(pages)
     }
@@ -2485,7 +2495,7 @@ impl<P: Platform> SurfaceCaches<P> {
         host_pages: Vec<Range<u64>>,
     ) -> Option<bool> {
         let length = self.unattached(block)?;
-        let Some(copied) = CopiedPages::new(copied, length) else {
+        let Some(copied) = CopiedPages::new(copied, length, None) else {
             return Some(false);
         };
         if let Some(cache) = self.by_block.get_mut(&block) {
@@ -2509,15 +2519,20 @@ impl<P: Platform> SurfaceCaches<P> {
             .map(|c| c.length)
     }
 
-    /// The cache of the deferred block `m` names, which has no view while its pages are not
-    /// named, nor where they are copied, where the block's size holds the `m.block_size` bytes `m`
-    /// names and the cache at least `m.length` bytes, as a view's are checked
+    /// The cache of the block `m` names where the block has no view: a deferred block's while its
+    /// pages are not named, or where they are copied, and a cache made with its pages copied
+    /// ([`Caches::make_copied`]); where the block's size holds the `m.block_size` bytes `m` names
+    /// and the cache at least `m.length` bytes, as a view's are checked
     /// ([`super::surface_pages::SurfaceViews::view_for`]).
-    pub(crate) fn deferred_buffer(&self, m: &RgfxBufferOverSurfacePages) -> Option<&P::Buffer> {
+    pub(crate) fn unviewed_buffer(&self, m: &RgfxBufferOverSurfacePages) -> Option<&P::Buffer> {
         (self.by_block.get(&m.block_offset))
             .filter(|c| {
-                !matches!(c.pages, Some(CachePages::View(_)))
-                    && c.deferred.is_some_and(|size| m.block_size <= size)
+                let size = match &c.pages {
+                    Some(CachePages::View(_)) => None,
+                    Some(CachePages::Copied(copied)) => copied.block_size.or(c.deferred),
+                    Some(CachePages::Runs { .. }) | None => c.deferred,
+                };
+                size.is_some_and(|size| m.block_size <= size)
                     && m.length != 0
                     && m.length <= c.length
             })
@@ -6065,6 +6080,33 @@ impl<P: Platform> Caches<P> {
         host_pages: Vec<Range<u64>>,
     ) -> RaiseResult<Option<bool>> {
         self.state.lock().attach(device, block, named, host_pages)
+    }
+
+    /// A cache of `length` bytes for the block of `block_size` bytes at `block`, named cached,
+    /// whose pages the host made no view of, or no buffer over (`super::surface_shapes`): its
+    /// pages `copied` from the guest's RAM, each run's host address and bytes in the surface's
+    /// order, as a deferred block's are taken ([`CachePages::Copied`], the module doc, "Deferred
+    /// blocks"), each fill and download going through a Shared buffer the host's CPU fills from
+    /// them or empties into them; and the buffers over the block, which has no view, are the
+    /// cache ([`SurfaceCaches::unviewed_buffer`]). Else as [`Self::make`]; `Ok(false)` too where
+    /// the pages hold fewer than `length` bytes.
+    #[allow(clippy::too_many_arguments)] // make's, and the block's size
+    pub(crate) fn make_copied(
+        &self,
+        device: &P::Device,
+        block: u64,
+        length: u64,
+        block_size: u64,
+        copied: &[(HostPtr, u64)],
+        host_pages: Vec<Range<u64>>,
+        generation: u64,
+        layout: CacheLayout,
+    ) -> RaiseResult<bool> {
+        let Some(copied) = CopiedPages::new(copied, length, Some(block_size)) else {
+            return Ok(false);
+        };
+        let pages = || Ok(Some(CachePages::Copied(Arc::new(copied))));
+        self.make_with(device, block, length, host_pages, generation, layout, pages)
     }
 
     /// A cache for the block at `block`, named by its pages' runs with no view

@@ -319,6 +319,9 @@ pub(crate) struct ShapeCounts {
     pub(crate) past_budget: u64,
     /// Uncached blocks refused, the per-shape form taking none (`rt-surface-uncached-copied`).
     pub(crate) uncached_refused: u64,
+    /// Blocks named cached whose pages the host made no view of, or no buffer over, given their
+    /// caches with the pages copied by the host's CPU (`rt-surface-pages-copied`).
+    pub(crate) pages_copied: u64,
     /// Shapes that took another shape's write at the end of the encoder that wrote it, and the
     /// bytes they took (rule 1, [`copy_overlaps`]).
     pub(crate) overlap_copies: u64,

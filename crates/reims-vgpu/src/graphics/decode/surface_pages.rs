@@ -2870,13 +2870,14 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         };
         // A block with a device cache: the buffer is the cache, over the surface's bytes in the
         // pages' layout (`surface_cache`); a block named by its runs has one, or took its view. A
-        // deferred block whose pages are not named has its cache, and neither.
+        // deferred block whose pages are not named, or a block whose cache copies its pages, has
+        // its cache, and neither.
         // The buffer keeps the cache's layout, by which the textures over it are placed.
         let cache = {
             let caches = self.surface_caches.lock();
             match names {
                 true => caches.buffer(m.block_offset),
-                false => caches.deferred_buffer(&m),
+                false => caches.unviewed_buffer(&m),
             }
             .map(|c| (c.clone_ref(), caches.repitched(m.block_offset)))
         };

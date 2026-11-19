@@ -5105,6 +5105,18 @@ guest keeps it only as the fallback, counted by why.
   uncached before; on the host that offers the bit, the host refused such a
   block's pages all the same. A surface whose planes lie at multiples of 16
   bytes but not of the host's alignment is in place where it was a copy.
+- **The host.** A block in place named cached whose pages the host makes no
+  view of, or no buffer over (on metal2vulkan-rt, whose platform holds no
+  lease of the guest's RAM to map views by, every block), still takes its
+  device cache, answered `OK`: each fill and download
+  of the cache goes through a Shared buffer of its own that the host's CPU
+  fills from the pages, or empties into them once the GPU's copy is done,
+  through its mapping of the guest's RAM, as a deferred block's copied pages
+  do. It was refused, and the kext gave the surface a copy block, whose
+  textures the host lays over no shape. The host counts it
+  (`rt-surface-pages-copied`) and logs the first. Runs that are not the
+  surface's bytes in whole guest pages, or that the host maps no part of, are
+  refused as before.
 
 **A buffer's escaped identity.** The host reads a no-copy buffer's bytes in
 place: one over bytes in a block of the process's (`BUFFER_OVER_HOST_MEMORY`),

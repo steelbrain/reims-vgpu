@@ -25,11 +25,19 @@
 //! Every surface takes a device cache in the per-shape form: no texture lies in place over a
 //! surface's pages. A `SURFACE_PAGES` that asks whether its block needs one is answered that it
 //! does, and one that names its block uncached, or cached where the platform made no cache, is
-//! refused ([`UNCACHED_COPIED`]), so the kext gives the surface a copy block.
+//! refused ([`UNCACHED_COPIED`]), so the kext gives the surface a copy block. A block named
+//! cached whose pages the host makes no view of, or no buffer over (no mapping of them, or none
+//! the platform imports), takes its cache all the same, its pages copied by the host's CPU
+//! through its mapping of the guest's RAM ([`surface_cache::Caches::make_copied`]), counted
+//! ([`PAGES_COPIED`], logged once): a copy block's textures would be no shape's, and the platform
+//! makes no texture over a surface's buffer that is not one. Runs that are not the surface's
+//! bytes in whole guest pages, or that the host maps no part of, are refused still.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use reims_vgpu_graphics::wire::{RGFX_STATUS_REFUSED, RgfxTextureFromIOSurface};
+use reims_vgpu_graphics::wire::{
+    RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxPageRun, RgfxSurfacePages, RgfxTextureFromIOSurface,
+};
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, Texture as _};
 use reims_vgpu_vulkan::core::platform::types::{NsRange, PixelFormatInfo};
@@ -37,8 +45,7 @@ use reims_vgpu_vulkan::core::platform::values::TextureDesc;
 use reims_vgpu_vulkan::core::raise::RaiseResult;
 use reims_vgpu_vulkan::gpu::no_texture::views_without_usage;
 
-use super::surface_cache::STORAGE_PRIVATE;
-use super::surface_cache::ShapeMaker;
+use super::surface_cache::{self, CacheLayout, STORAGE_PRIVATE, ShapeMaker};
 use super::surface_cache::shapes::{self, PLAIN_VIEW_REFUSED, ShapeCounts, ShapeKey, ShapeUse};
 use super::{GraphicsDecoder, ObjHandle, TEXTURE_USAGE_WRITES, texture_desc};
 
@@ -67,6 +74,15 @@ pub(super) const UNCACHED_COPIED: &str = "rt-surface-uncached-copied";
 /// time alone, the rest counted (docs/conventions.md).
 static UNCACHED_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// The degradation code of a block named cached in the per-shape form whose pages the host made
+/// no view of, or no buffer over, which takes its cache with its pages copied by the host's CPU
+/// (module doc).
+pub(super) const PAGES_COPIED: &str = "rt-surface-pages-copied";
+
+/// Whether a block took its cache copied ([`PAGES_COPIED`]): its line is logged the first time
+/// alone, the rest counted (docs/conventions.md).
+static COPIED_LOGGED: AtomicBool = AtomicBool::new(false);
+
 impl<P: Platform> GraphicsDecoder<P> {
     /// Takes the per-shape form from now on (module doc), each shape's image made by `maker`:
     /// set once, at the device's make, before any surface is named.
@@ -94,6 +110,66 @@ impl<P: Platform> GraphicsDecoder<P> {
             );
         }
         RGFX_STATUS_REFUSED
+    }
+
+    /// The block `pages` names cached in the per-shape form, whose view of its `runs` the host
+    /// refused (`why`), given its device cache with its pages copied by the host's CPU (module
+    /// doc), laid out as the kext's ask gave its surface, else as `carried` (`decode`'s
+    /// `cache_surface`): [`RGFX_STATUS_OK`], counted ([`PAGES_COPIED`]) and logged the first time.
+    /// `None` where the host's mapping of the guest's RAM does not hold the pages, or no cache was
+    /// made, for the caller's refusal.
+    pub(super) fn cache_copied(
+        &self,
+        device: &P::Device,
+        pages: &RgfxSurfacePages,
+        runs: &[RgfxPageRun],
+        carried: CacheLayout,
+        why: &str,
+    ) -> Option<u32> {
+        let block = pages.block_offset;
+        let (copied, host_pages, laid_out) = {
+            let mut views = self.shared.surface_views.lock();
+            let copied = views.host_pages_in_order(runs);
+            (copied, views.host_runs(runs), views.take_layout(block))
+        };
+        let copied = copied?;
+        let layout = laid_out.map_or(carried, CacheLayout::Asked);
+        // The CPU's generation the kext wrote into the block's header as it cached the block.
+        let generation = surface_cache::cpu_generation(&self.shared.region, block).unwrap_or(0);
+        let made = self.surface_caches.make_copied(
+            device,
+            block,
+            pages.length,
+            pages.block_size,
+            &copied,
+            host_pages,
+            generation,
+            layout,
+        );
+        match made {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(raise) => {
+                log::warn!(
+                    target: "reims_vgpu::graphics", kind:% = raise;
+                    "the IOSurface block at {block:#x}: the platform raised at its device cache \
+                     with its pages copied ({raise:?})"
+                );
+                return None;
+            }
+        }
+        self.surface_caches.count_shapes(|c| c.pages_copied += 1);
+        reims_vgpu_vulkan::answer::count_kind(PAGES_COPIED);
+        if !COPIED_LOGGED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = PAGES_COPIED;
+                "the IOSurface block of {:#x} bytes at {block:#x}: no view of its {:#x} bytes in \
+                 {} runs ({why}); its device cache takes them copied, the host's CPU moving \
+                 their bytes ({PAGES_COPIED}; the rest are counted)",
+                pages.block_size, pages.length, runs.len()
+            );
+        }
+        Some(RGFX_STATUS_OK)
     }
 
     /// The texture `m` asks, of the format `info` describes, as a view of its shape's image over
@@ -1294,5 +1370,60 @@ mod tests {
         assert!(r.dec.views_of_surfaces().view(second).is_none());
         assert!(!r.dec.caches().has(second));
         assert_eq!(r.dec.caches().counts().shapes.uncached_refused, 1);
+    }
+
+    /// In the per-shape form a block named cached whose pages the host makes no buffer over takes
+    /// its device cache all the same, answered OK where it was refused, counted, with no view:
+    /// the block's buffers are its cache, a texture over them a view of a shape's image, and the
+    /// cache's first fill copies the pages into a staging buffer of its own, which the GPU copies
+    /// into the cache before the shape's fill. In the default form the block is refused still,
+    /// and the kext gives the surface a copy block
+    #[test]
+    fn a_cached_block_with_no_view_takes_its_cache_copied() {
+        let mut r = rig(8);
+        let page = r.page;
+        take_shapes(&r);
+        r.dec.hold_resource_ids(0, 1);
+        // The platform makes no buffer over the pages' view (`buffer_over`).
+        r.p.script().push("newBufferWithDescriptor:", Step::Nil);
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        assert!(r.dec.caches().has(BLOCK));
+        assert!(r.dec.views_of_surfaces().view(BLOCK).is_none());
+        assert_eq!(r.dec.caches().counts().shapes.pages_copied, 1);
+        let cache = cache_id(&r);
+        queues(&mut r);
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
+        let sels = r.p.call_log().sels_since(mark);
+        assert!(
+            !sels.iter().any(|s| s.starts_with("newBuffer")),
+            "no buffer made: its buffers are the cache"
+        );
+        let mark = r.p.call_log().mark();
+        texture(&mut r, 21, 80, (32, 8));
+        let calls = r.p.call_log().since(mark);
+        assert!(surface_textures(&calls).is_empty(), "none over the buffer");
+        assert_eq!(views(&calls).len(), 1, "a view of its shape's image");
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 2, false)]);
+        let calls = r.p.call_log().since(mark);
+        let filled = copies(&calls);
+        assert_eq!(filled.len(), 1, "the cache's first fill");
+        assert_eq!(filled[0].1, cache, "into the cache");
+        assert_ne!(filled[0].0, cache, "from a staging buffer of its own");
+        let shapes = fills(&calls);
+        assert_eq!(shapes.len(), 1);
+        assert_eq!(shapes[0].0, cache, "the shape from the cache");
+
+        let mut r = rig(8);
+        r.p.script().push("newBufferWithDescriptor:", Step::Nil);
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+            RGFX_STATUS_REFUSED
+        );
+        assert!(!r.dec.caches().has(BLOCK));
     }
 }

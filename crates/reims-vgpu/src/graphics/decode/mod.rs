@@ -1748,7 +1748,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                      images and {} views refused); {} caches kept past the budget; {} blocks \
                      refused uncached; {} made beside a shape of the other kind, {} copies \
                      between the kinds ({} MiB); {} views of a plain shape in another format, {} \
-                     textures over a plain shape asking PixelFormatView",
+                     textures over a plain shape asking PixelFormatView; {} blocks with no view \
+                     of their pages cached with them copied",
                     sh.made, sh.made_bytes >> 20, sh.found, sh.again, sh.fills,
                     sh.filled_bytes >> 20, sh.fills_made, sh.fills_deferred, sh.written_back,
                     sh.written_back_bytes >> 20, sh.kept_dirty, sh.overlap_copies,
@@ -1757,7 +1758,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     sh.usage_writes, sh.slot_reads, sh.unshaped,
                     sh.images_refused, sh.views_refused, sh.past_budget, sh.uncached_refused,
                     sh.order_case, sh.order_copies, sh.order_bytes >> 20, sh.plain_views_refused,
-                    sh.plain_format_views
+                    sh.plain_format_views, sh.pages_copied
                 );
             }
         }
@@ -1935,6 +1936,26 @@ impl<P: Platform> GraphicsDecoder<P> {
                 }
             },
             Ok(Some(Err(why))) => {
+                // In the per-shape form a block named cached takes its cache with its pages
+                // copied where the host has them mapped, rather than a copy block whose textures
+                // would be no shape's (`surface_shapes`); runs that are not the surface's bytes
+                // in whole guest pages, or with no guest RAM to map, are refused still.
+                let copyable = !matches!(
+                    why,
+                    surface_pages::PagesRefusal::NoMemoryMap
+                        | surface_pages::PagesRefusal::PageSize
+                        | surface_pages::PagesRefusal::Unaligned
+                        | surface_pages::PagesRefusal::Length
+                );
+                if self.surface_caches.shaped()
+                    && cached
+                    && !private
+                    && copyable
+                    && let Some(status) =
+                        self.cache_copied(device, pages, runs, carried, &format!("{why:?}"))
+                {
+                    return Some(status);
+                }
                 self.uncache_surface(device, pages.block_offset);
                 log::warn!(
                     target: "reims_vgpu::graphics", kind:? = why;
@@ -1945,6 +1966,19 @@ impl<P: Platform> GraphicsDecoder<P> {
                 RGFX_STATUS_REFUSED
             }
             Err(raise) => {
+                if self.surface_caches.shaped()
+                    && cached
+                    && !private
+                    && let Some(status) = self.cache_copied(
+                        device,
+                        pages,
+                        runs,
+                        carried,
+                        &format!("the platform raised at the buffer over its view: {raise:?}"),
+                    )
+                {
+                    return Some(status);
+                }
                 self.uncache_surface(device, pages.block_offset);
                 log::warn!(
                     target: "reims_vgpu::graphics", kind:% = raise;
