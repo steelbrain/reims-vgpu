@@ -1562,7 +1562,10 @@ pub(crate) mod tests {
         }
         let (status, stderr) = run_quiesce_child(TEST);
         assert_eq!(status, Some(0), "{stderr}");
-        for line in ["devices asked for false", "quiesce answered true, at once true"] {
+        for line in [
+            "devices asked for false",
+            "quiesce answered true, at once true",
+        ] {
             assert!(stderr.contains(line), "no {line:?}: {stderr}");
         }
     }

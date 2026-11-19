@@ -106,7 +106,11 @@ fn c_harness_passes() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(stdout.contains("harness: ok"), "{stdout}");
-    let answer = if cfg!(feature = "rt") { "true" } else { "false" };
+    let answer = if cfg!(feature = "rt") {
+        "true"
+    } else {
+        "false"
+    };
     assert!(
         stdout.contains(&format!("harness: quiesce answered {answer}\n")),
         "{stdout}"
