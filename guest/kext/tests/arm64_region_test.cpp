@@ -42,12 +42,19 @@ std::string readFile(const char *path)
 // The length each mapSpan and unmapSpan call of `path` passes, its text from the call's first
 // comma to its closing parenthesis, is a span's: rounded by rgfxWindowSpanLength, or one of the
 // lengths that are whole window pages already, a block's as allocated (`bytes`, `bytes -
-// combined` and `combined`, split by rgfxWindowWriteBackPart) and a grant's of the scanout
-// (`scanout->length`, `g.length`), which currentScanout rounds.
+// combined` and `combined`, split by rgfxWindowWriteBackPart), a new block's zeroed spans
+// (`spans[i].length`, rgfxBlockZeroSpans's split of its bytes by rgfxWindowWriteBackPart, and
+// `span.length`, rgfxSurfaceZeroSpan's rgfxWindowSpanLength; block_zero_test checks both), and a
+// grant's of the scanout (`scanout->length`, `g.length`), which currentScanout rounds.
 void spansRounded(const char *path)
 {
 	const std::string source = readFile(path);
-	const char *const whole[] = {"bytes", "bytes - combined", "combined", "scanout->length",
+	const char *const whole[] = {"bytes",
+	                             "bytes - combined",
+	                             "combined",
+	                             "spans[i].length, spans[i].writeCombined",
+	                             "span.length",
+	                             "scanout->length",
 	                             "g.length"};
 	for (const char *call : {"mapSpan(", "unmapSpan("}) {
 		for (size_t at = source.find(call); at != std::string::npos;

@@ -150,6 +150,8 @@ int main()
 					uint64_t at = kStart;
 					for (uint32_t i = 0; i < n; i++) {
 						check(s[i].offset == at && s[i].length > 0, "the spans in order, none empty");
+						check(s[i].offset % kRgfxWindowPage == 0 && s[i].length % kRgfxWindowPage == 0,
+						      "each span whole window pages");
 						at += s[i].length;
 					}
 					check(at == kStart + bytes, "to the block's end, its rounding too");
@@ -213,6 +215,7 @@ int main()
 		const uint64_t size = 1920ull * 1080 * 4 + 100;
 		const Grant mine = surfaceBlock(k, entryA, 1, size, size, false);
 		check(mapped(mine) == rgfxWindowSpanLength(size), "a copy's holders map the whole copy");
+		check(mine.spans[0].length % kRgfxWindowPage == 0, "whole window pages");
 		fill(k, mine, 0xa5);
 		freeAnswered(k, entryA, mine.offset);
 		const Grant theirs = surfaceBlock(k, entryB, 2, size, size, false);
