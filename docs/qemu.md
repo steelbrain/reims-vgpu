@@ -2053,6 +2053,34 @@ physical addresses, 1 TiB at 40 bits (1012 GiB of room). Ambrosia's device
 tree lists RAM alone, so macOS places nothing there, and the library maps
 its blocks there as the pool grows.
 
+**Measured** 2026-11-18 with `vendor/qemu` at `66e66267` on the library of
+`818dd28e6`, the guest with 8 GiB:
+- Under HVF on the M3 Max (macOS 27.0.1), Hypervisor.framework's default IPA
+  size is 36 bits and its largest 40 (`hv_vm_config_get_max_ipa_size`),
+  where the host's `kern.hv.ipa_size_16k` reads 2^42 and
+  `kern.hv.ipa_size_4k` 2^40. Paused (`-S`), the machine answered a room of
+  1012 GiB at 0x300000000, to 2^40, and the library took 65536 MiB of it at
+  0x300000000 for the GPU's 65536 MiB of heaps, reserved to 0x1300000000:
+  past 2^36, which a 36-bit IPA could not hold (job m3-max-49279).
+- A cold boot of macOS 27.0.1 under HVF passed check-boot's 16 checks with
+  no fatal line, with the pool grown over QMP (`x-pool-grow`) once the
+  desktop was drawn: a 256 MiB piece at 0x300000000 was mapped 0.5 s after
+  the ask, and a 1 GiB piece at 0x310000000, which the library gave back once
+  it was empty. The checks after it, metal-app's 600 frames among them, ran
+  with the 256 MiB piece in (m3-max-49311).
+- A 40-bit IPA costs the guest nothing measurable against 36 bits. A program
+  on Hypervisor.framework alone (one vCPU, 4 GiB of guest RAM the host had
+  touched, 12 rounds alternating the sizes) measured a guest's first touch
+  of each 16 KiB page, where HVF fills its stage-2 tables, at 1320.8 ns at
+  36 bits and 1328.2 ns at 40 (medians; rounds 1296-1376 and 1272-1358), a
+  sweep over the warm pages at 9.8 ns a page at both, and a dependent load
+  from each page in a random cycle at 153.9 and 153.3 ns (147-156 and
+  146-163). RAM at 256 GiB, past 2^36, measured the same (m3-max-49295).
+- Other Macs' largest IPA size: on an M2 it is at most 36 bits (read: Linux
+  KVM on an M2 MacBook Air found a host IPA limit below 40, in a public
+  qemu-devel thread), so the machine asks for 36 there and an 8 GiB guest's
+  room ends at 64 GiB, 52 GiB of it. The M1's and the M4's are not known.
+
 **Measured** on the M3 Max under HVF on 2026-11-08, with `vendor/qemu` at
 `aef8a7cf` configured as above on the library of `61b1aac9e`, Ambrosia's
 `44f0dac` and APFS clones of a macOS 26.6.2 (25G83) guest's disks:
