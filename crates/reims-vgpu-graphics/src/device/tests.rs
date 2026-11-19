@@ -5472,10 +5472,11 @@ const POOL_RANGE: (u64, u64) = (52 << 30, 4 << 30);
 
 /// A host with a Shared pool, which records the takes and gives it is handed, `(type, context,
 /// length or offset)`, and the messages its decoder is: it answers each take with a block at the
-/// pool offset its length is, and each give OK.
+/// pool offset its length is, and each give OK. It counts the driver's takes of the pool.
 #[derive(Clone, Default)]
 struct PoolHost {
     seen: Arc<Mutex<Vec<(u32, u32, u64)>>>,
+    taken: Arc<AtomicU32>,
 }
 
 impl Host for PoolHost {
@@ -5485,6 +5486,9 @@ impl Host for PoolHost {
     }
     fn pool_range(&self) -> (u64, u64) {
         POOL_RANGE
+    }
+    fn pool_taken(&self) {
+        self.taken.fetch_add(1, Ordering::SeqCst);
     }
     fn pool_take(&self, take: &RgfxPoolTake, answer: PoolAnswer) {
         (self.seen.lock()).push((RGFX_CMD_POOL_TAKE, take.context, take.length));
@@ -5570,6 +5574,31 @@ fn the_pool_s_range_reads_only_where_the_driver_took_the_pool() {
     rig.device
         .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
     assert_eq!(range(), (0, 0));
+}
+
+/// The host is told each time the guest's driver takes `POOL` ([`Host::pool_taken`]), so its
+/// pool makes room ahead of the first take: at the write that takes it, not at a later write that
+/// keeps it, and again after a reset; never at a write that takes other features
+#[test]
+fn the_host_is_told_each_time_the_driver_takes_the_pool() {
+    let host = PoolHost::default();
+    let rig = Rig::with_host(Box::new(host.clone()));
+    let taken = || host.taken.load(Ordering::SeqCst);
+    let write_hi = |bits: u64| {
+        rig.device
+            .mmio_write(RGFX_REG_DRIVER_FEATURES_HI.into(), (bits >> 32) as u32);
+    };
+    write_hi(RGFX_FEATURE_POOL_ADDRESSES);
+    assert_eq!(taken(), 0);
+    write_hi(RGFX_FEATURE_POOL | RGFX_FEATURE_POOL_ADDRESSES);
+    assert_eq!(taken(), 1);
+    write_hi(RGFX_FEATURE_POOL);
+    assert_eq!(taken(), 1, "kept, not taken anew");
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    assert_eq!(taken(), 1);
+    write_hi(RGFX_FEATURE_POOL);
+    assert_eq!(taken(), 2);
 }
 
 /// A `POOL_TAKE`'s `POOL_BLOCK` on `rig`: its status, offset, length and GPU address.

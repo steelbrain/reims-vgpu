@@ -498,6 +498,13 @@ pub trait Host: Send + Sync + 'static {
         (0, 0)
     }
 
+    /// The guest's driver took [`RGFX_FEATURE_POOL`] (a `DRIVER_FEATURES` write): its processes'
+    /// `POOL_TAKE`s may come from now on, and a host with a pool makes room ahead of the first.
+    /// Called on the writing thread, inside the write, each time the bit goes from not taken to
+    /// taken: once a boot, and again after a reset. It waits for nothing. The default does
+    /// nothing, for a host with no pool.
+    fn pool_taken(&self) {}
+
     /// `POOL_TAKE`, where the guest took [`RGFX_FEATURE_POOL`]: context `take.context` asks for a
     /// zeroed block of the pool of at least `take.length` bytes. The host gives `answer` from any
     /// thread: the block's offset in the pool, its length, `take.length` rounded up to
@@ -2853,20 +2860,27 @@ impl Shared {
     /// becomes the bits of `value` the device offers and the host knows ([`KNOWN_FEATURES`]), the
     /// other half kept, where the offer is the one to the bits taken after the write
     /// ([`Self::offered_to`]): a write that takes [`RGFX_FEATURE_PAGES_16K`] may take what it
-    /// offers in the same write, and one that lets it go lets those go too. Ignored once the
-    /// driver is ready: the features are fixed from `STATUS` 1 to the next reset.
+    /// offers in the same write, and one that lets it go lets those go too. A write that takes
+    /// [`RGFX_FEATURE_POOL`] tells the host ([`Host::pool_taken`]). Ignored once the driver is
+    /// ready: the features are fixed from `STATUS` 1 to the next reset.
     fn take_driver_features(&self, shift: u32, value: u32) {
         if self.status.load(Ordering::Acquire) == RGFX_STATUS_DRIVER_READY {
             return;
         }
         let half = 0xffff_ffff_u64 << shift;
         let written = u64::from(value) << shift;
-        let _ = self
+        let before = self
             .driver_features
             .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
                 let asked = ((old & !half) | written) & KNOWN_FEATURES;
                 Some(asked & self.offered_to(asked))
             });
+        if let Ok(old) = before
+            && old & RGFX_FEATURE_POOL == 0
+            && self.driver_took(RGFX_FEATURE_POOL)
+        {
+            self.host.pool_taken();
+        }
     }
 
     /// The `RGFX_QUEUE_*` flags a `QUEUE_CREATE` may ask for: those the host carries out

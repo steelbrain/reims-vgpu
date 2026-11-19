@@ -632,6 +632,24 @@ fn a_take_that_fits_no_piece_grows_the_pool_and_waits_for_the_hosts_map() {
     assert_eq!(host.wait_for(2)[1], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
 }
 
+/// The guest's driver's take of the pool asks for a piece ahead of the first take, which that
+/// take then finds, answered with no piece of its own asked or mapped; taken again with the piece
+/// still empty, as after a reset, it asks none
+#[test]
+fn a_piece_asked_ahead_of_the_first_take_serves_it_with_no_wait() {
+    let host = Arc::new(Host::default());
+    let (pool, _blocks) = pool(range(64), &host, LONG);
+    let ledger = pool.ledger();
+    assert!(ledger.keep_headroom());
+    assert_eq!(host.wait_for(1), [Call::Add(BASE, BLOCK_LEN)]);
+    assert!(!ledger.keep_headroom(), "asked again while the host maps it");
+    pool.added(BASE).unwrap();
+    assert!(!ledger.keep_headroom(), "asked again");
+    assert_eq!(answer(&take(&ledger, 1, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
+    // Its piece used, the pool asks for the next as headroom, which the take did not wait for.
+    assert_eq!(host.wait_for(2)[1], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
+}
+
 /// A source whose takes wait until the test opens its gate.
 struct Gated {
     blocks: HostBlocks,

@@ -215,6 +215,25 @@ impl PoolLedger {
         }
     }
 
+    /// The guest's driver took the pool: its processes' takes may come from now on, so the pool
+    /// keeps one empty piece ahead of them, as it does once a piece is used (the module doc's
+    /// "Headroom and giving blocks back"). It asks for a block where no piece the guest may use
+    /// is empty and no ask waits: at a boot's take, not after a reset that left an empty piece.
+    /// Whether it asked; waits for nothing.
+    pub(crate) fn keep_headroom(&self) -> bool {
+        let asked = self.shared.state.lock().keep_headroom();
+        self.shared.changed.notify_all();
+        log::info!(
+            "pool: the guest's driver took the pool: {}",
+            if asked {
+                "a piece is asked ahead of its first take"
+            } else {
+                "a piece is empty or asked ahead of its first take"
+            }
+        );
+        asked
+    }
+
     /// The pool's first guest physical address, which a block's offset counts from.
     fn base(&self) -> u64 {
         self.shared.range.physical_address

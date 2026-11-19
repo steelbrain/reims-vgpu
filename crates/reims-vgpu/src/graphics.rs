@@ -3619,6 +3619,12 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         (self.control.shared_pool.as_ref()).map_or((0, 0), PoolLedger::range)
     }
 
+    fn pool_taken(&self) {
+        if let Some(ledger) = &self.control.shared_pool {
+            let _ = ledger.keep_headroom();
+        }
+    }
+
     fn pool_take(&self, take: &RgfxPoolTake, answer: PoolAnswer) {
         stepped(|| self.control.take_pool_block(take, answer));
     }

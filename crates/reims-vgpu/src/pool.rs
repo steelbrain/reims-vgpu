@@ -19,7 +19,9 @@
 //! A new piece is empty: nothing of the guest's lies in it. The guest's processes take blocks of
 //! the pool and give them back (`takes`): a piece is used from its first block's take and empty
 //! again once its last block went back. The pool keeps one empty piece as headroom: when the guest
-//! uses the last empty one, the pool asks for a block more. A piece that stays empty for [`RELEASE_DELAY`] while a lower one is empty too goes
+//! uses the last empty one, the pool asks for a block more. It keeps one from the moment the
+//! guest's driver takes the pool (`PoolLedger::keep_headroom`), before any take, so the guest's
+//! first take finds a piece made and mapped. A piece that stays empty for [`RELEASE_DELAY`] while a lower one is empty too goes
 //! back to the source ([`BlockSource::release_block`]), as the release below says, and the source
 //! keeps the block ready or frees it; the lowest empty piece stays as the headroom. The delay
 //! rides out churn, where a guest empties and fills a piece again within seconds.
@@ -324,13 +326,21 @@ impl State {
             return;
         };
         p.empty_since = None;
+        self.keep_headroom();
+    }
+
+    /// Where no piece the guest may use is empty and no ask waits, asks for a block more, so one
+    /// stays as headroom: whether it asked.
+    fn keep_headroom(&mut self) -> bool {
         let headroom = (self.pieces.values()).any(|p| p.usable() && p.empty_since.is_some());
-        if !headroom && self.asks.is_empty() {
+        let ask = !headroom && self.asks.is_empty();
+        if ask {
             self.asks.push_back(Ask {
                 length: BLOCK_LEN,
                 wait: None,
             });
         }
+        ask
     }
 
     /// The guest emptied the piece at `at`, at `now`: nothing of the guest's lies in it, and no

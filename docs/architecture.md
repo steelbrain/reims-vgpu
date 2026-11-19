@@ -934,7 +934,8 @@ takes Shared blocks from its block source, places each at the range's lowest fre
 address, and has the host map it there (`pool_add`); a piece is found only once the host says it is
 in (`pool_added`). The source is metal2vulkan-rt's block calls in shape (`take_block`,
 `release_block`); until the device runs on that runtime it is `HostBlocks`, the process's own
-memory. The pool keeps one empty piece as headroom and gives a piece that stays empty past
+memory. The pool keeps one empty piece as headroom, from the guest driver's take of `POOL` on
+(`Host::pool_taken`), so the guest's first take finds one, and gives a piece that stays empty past
 `RELEASE_DELAY` back to the source, which keeps it ready or frees it. Before a block goes back the
 pool takes its piece out of the lookups, waits for the device's holds on it, asks the host to remove
 it (`pool_remove`), and gives the block back once the host says it is out (`pool_removed`), so the
