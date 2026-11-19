@@ -121,9 +121,13 @@
 //!   so do the bytes of `m2v.privateBytes`.
 //!   `<pid>.stats.txt` says what was written, every few seconds.
 //! - **Its build.** `<pid>.stats.txt` names the commit the library was built from
-//!   (`recorder_commit`, [`COMMIT`]) and each change to what a stream holds that the recorder
-//!   carries (a `recorder_fix` line for each of [`FIXES`]), so a recording says which recorder
-//!   made it. A change to what the recorder writes adds its name to [`FIXES`] in its own commit.
+//!   (`recorder_commit`, [`COMMIT`]), the device's own display library by the hex of its SHA-256
+//!   and its length (`display_library`, [`METALLIB`]), and each change to what a stream holds
+//!   that the recorder carries (a `recorder_fix` line for each of [`FIXES`]), so a recording says
+//!   which recorder made it. The stream records the display library's make as
+//!   `newLibraryWithSource:options:error:` with no arguments ([`crate::gpu::shaders`]), and a
+//!   player makes it from a copy of those bytes kept beside the stream. A change to what the
+//!   recorder writes adds its name to [`FIXES`] in its own commit.
 //!
 //! Recordings hold the guest's data: they stay on the host that made them and are never
 //! committed.
@@ -154,6 +158,7 @@ use crate::core::platform::types::{CommandBufferStatus, NsRange};
 use crate::core::sync::Mutex;
 use crate::gpu::command::{CommandBufferObject, VulkanCommandBuffer};
 use crate::gpu::resource::{BufferObject, TextureObject, Under, VulkanBuffer, VulkanTexture};
+use crate::gpu::shaders::METALLIB;
 use crate::platform::Obj;
 use format::{Call, Hash, Stream, Value};
 
@@ -220,10 +225,17 @@ pub const FIXES: &[&str] = &[
     "completion-before-guest-learns",
 ];
 
-/// The stats file's lines that name the recorder's build: its commit ([`COMMIT`]), then one for
-/// each of [`FIXES`].
+/// The stats file's lines that name the recorder's build: its commit ([`COMMIT`]), the display
+/// library the device makes ([`METALLIB`], by the hex of its SHA-256, as the `blobs` directory
+/// names a library, and its length), then one for each of [`FIXES`].
 fn write_build(out: &mut String) {
     let _ = writeln!(out, "recorder_commit {COMMIT}");
+    let _ = writeln!(
+        out,
+        "display_library {} {}",
+        hex(&format::sha256(METALLIB)),
+        METALLIB.len()
+    );
     for fix in FIXES {
         let _ = writeln!(out, "recorder_fix {fix}");
     }
@@ -3430,8 +3442,10 @@ fn hash64(data: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
-    /// The stats file names the recorder's build first: one `recorder_commit` line, then a
-    /// `recorder_fix` line for each fix, in their order, each name a single word given once.
+    /// The stats file names the recorder's build first: one `recorder_commit` line, the
+    /// display library's `display_library` line (the SHA-256 of the bytes the device makes its
+    /// library from, and their length), then a `recorder_fix` line for each fix, in their order,
+    /// each name a single word given once.
     #[test]
     fn the_stats_name_the_recorders_build() {
         let mut out = String::new();
@@ -3441,12 +3455,26 @@ mod tests {
             lines.first().copied(),
             Some(format!("recorder_commit {COMMIT}").as_str())
         );
-        let fixes: Vec<&str> = lines[1..]
+        let display: Vec<&str> = lines[1]
+            .strip_prefix("display_library ")
+            .expect(&out)
+            .split(' ')
+            .collect();
+        assert_eq!(
+            display,
+            [
+                hex(&format::sha256(METALLIB)).as_str(),
+                METALLIB.len().to_string().as_str()
+            ],
+            "{out}"
+        );
+        assert_eq!(display[0].len(), 64, "{out}");
+        let fixes: Vec<&str> = lines[2..]
             .iter()
             .filter_map(|l| l.strip_prefix("recorder_fix "))
             .collect();
         assert_eq!(fixes, FIXES, "{out}");
-        assert_eq!(lines.len(), 1 + FIXES.len(), "{out}");
+        assert_eq!(lines.len(), 2 + FIXES.len(), "{out}");
         let names: HashSet<&str> = FIXES.iter().copied().collect();
         assert_eq!(names.len(), FIXES.len(), "a name given twice: {FIXES:?}");
         assert!(
