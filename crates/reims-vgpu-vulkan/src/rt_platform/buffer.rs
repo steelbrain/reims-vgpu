@@ -104,7 +104,10 @@
 //! completion, before the command buffer's completed handlers run or a waiter returns, the bytes
 //! the GPU changed in the copy are written into the pages where the CPU did not change them since,
 //! a byte both changed keeping the CPU's. Counted ([`IMPORTS_COPIED`]), the process's first with a
-//! line; a copy rt refuses too is rt's refusal of the pages, counted, and nil. Where it differs
+//! line; a copy rt refuses too is rt's refusal of the pages, counted, and nil. Pages copied as rt
+//! refused both a dma-buf of theirs and their pointer, in either order, are counted as such too
+//! ([`IMPORTS_DMA_BUF_AND_POINTER_REFUSED`]), the process's first with a line naming both
+//! refusals. Where it differs
 //! from Metal's GPU, which reads and writes the pages in place: the GPU sees a CPU write made after
 //! a commit only at the next commit, of any queue; a command buffer rt holds at its commit for a
 //! shared event's value reads the bytes as they were at its commit; an event value the GPU signals
@@ -221,6 +224,11 @@ pub const IMPORTS_REFUSED: &str = "rt-imports-refused";
 /// copy at the refusal point"), counted per import, each counted as [`IMPORTS_TOO_LARGE`] or
 /// [`IMPORTS_REFUSED`] too.
 pub const IMPORTS_COPIED: &str = "rt-imports-copied";
+
+/// The code of an import of the host's memory whose pages rt refused both as a dma-buf of the
+/// files behind them and by their pointer, in either order (on Linux; the module's docs, "A copy
+/// at the refusal point"), counted per import asked, each counted as [`IMPORTS_REFUSED`] too.
+pub const IMPORTS_DMA_BUF_AND_POINTER_REFUSED: &str = "rt-imports-dma-buf-and-pointer-refused";
 
 /// The code of a Managed no-copy buffer asked over a dma-buf's block, which rt refuses as over a
 /// block it does not map (the module's docs, "Dma-bufs of the pages"), counted per buffer.
@@ -1083,7 +1091,12 @@ fn unpinnable(
             }
             Some((block, 0))
         }
-        Err(error) => refused(device, sel, codes, (at, len), then, &no, Some(&error)),
+        Err(error) => {
+            if let DmaBufNo::Rt(refusal) = &no {
+                both_refused(sel, refusal, &error);
+            }
+            refused(device, sel, codes, (at, len), then, &no, Some(&error))
+        }
     }
 }
 
@@ -1174,7 +1187,10 @@ fn by_dma_buf(
         }
         Err(no) => {
             let last = match &no {
-                DmaBufNo::Rt(refusal) => refusal,
+                DmaBufNo::Rt(refusal) => {
+                    both_refused(sel, refusal, error);
+                    refusal
+                }
                 DmaBufNo::TooLarge { .. } | DmaBufNo::Refused => error,
             };
             refused(device, sel, codes, (at, len), then, &no, Some(last))
@@ -1309,6 +1325,30 @@ fn dma_buf_made(sel: &'static str, kind: &'static str, len: u64, why: &dyn std::
         );
     }
 }
+
+/// Counts an import for `sel` whose pages rt refused both as a dma-buf, with `dma_buf`, and by
+/// their pointer, with `pointer`, in either order ([`IMPORTS_DMA_BUF_AND_POINTER_REFUSED`]); the
+/// process's first logged, naming both. Nothing where either is rt's quiescing.
+#[cfg(target_os = "linux")]
+fn both_refused(sel: &'static str, dma_buf: &rt::Error, pointer: &rt::Error) {
+    if matches!(dma_buf, rt::Error::Quiesced) || matches!(pointer, rt::Error::Quiesced) {
+        return;
+    }
+    crate::answer::count_kind(IMPORTS_DMA_BUF_AND_POINTER_REFUSED);
+    if !BOTH_REFUSED_SAID.swap(true, Ordering::Relaxed) {
+        log::info!(
+            target: TARGET,
+            "{sel}: metal2vulkan-rt refused both a dma-buf of the pages of a no-copy buffer or \
+             heap ({dma_buf}) and their pointer ({pointer}); each such import is counted from \
+             here ({IMPORTS_DMA_BUF_AND_POINTER_REFUSED})"
+        );
+    }
+}
+
+/// Whether the process logged its first import whose dma-buf and pointer rt both refused
+/// ([`both_refused`]).
+#[cfg(target_os = "linux")]
+static BOTH_REFUSED_SAID: AtomicBool = AtomicBool::new(false);
 
 /// The import of `pages`, the `len` bytes of whole pages at their address, for `sel`, for a make
 /// of `codes`, whose dma-buf was refused as `no`, rt's release of it running `then`: counted as
@@ -2782,6 +2822,72 @@ mod tests {
             assert_eq!(read(view, 16), [0x66; 16]);
             assert_eq!(read(view.wrapping_add(page), 16), [0x55; 16]);
         }
+    }
+
+    /// On Linux, on the GPU the test holds, where rt refuses both pages' pointer
+    /// (`POINTER_REFUSED`) and the dma-buf the host makes of them (`DMA_BUF_REFUSED`): a no-copy
+    /// buffer over a view of two runs of a file's pages, whose dma-buf goes first where the view
+    /// lies in a dma-buf's mapping, and one over a run of a file's pages, whose pointer goes
+    /// first, are each made over a copy, counted as refused, copied, and as both refused once.
+    /// Their `contents` are the pages. Where the host makes no dma-buf, unchecked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn imports_whose_dma_buf_and_pointer_rt_refuses_count_so_on_vulkan() {
+        use crate::core::num::ToUsize as _;
+        use crate::core::platform::os::vm::HostVm as _;
+
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let page = device.facts().page_size;
+        let codes = [
+            IMPORTS_POINTER,
+            IMPORTS_DMA_BUF,
+            IMPORTS_FROM_FILES,
+            IMPORTS_REFUSED,
+            IMPORTS_COPIED,
+            IMPORTS_DMA_BUF_AND_POINTER_REFUSED,
+        ];
+        let counts = || codes.map(counted);
+
+        // Two pages of a file, 0x55s then 0x66s, a view of them, the second first, and a run.
+        let ram = crate::os::allocate_aliasable(2 * page).expect("pages of a file");
+        // SAFETY: fresh pages of the test's own, which nothing uses yet.
+        unsafe {
+            ram.as_ptr::<u8>().write_bytes(0x55, page.to_usize());
+            (ram.wrapping_add(page).as_ptr::<u8>()).write_bytes(0x66, page.to_usize());
+        }
+        let vm = crate::os::OsVm::new();
+        let view = vm.allocate_anywhere(2 * page).expect("a range for a view");
+        let runs = [(ram.wrapping_add(page), page), (ram, page)];
+        assert!(vm.remap_runs_shared_overwrite(view, &runs).is_ok());
+        let run = crate::os::allocate_aliasable(page).expect("a page of a file");
+        // SAFETY: a fresh page of the test's own, which nothing uses yet.
+        unsafe { run.as_ptr::<u8>().write_bytes(0x77, page.to_usize()) };
+        let one = NonNull::new(run.as_ptr::<u8>()).expect("a mapped page");
+        if crate::os::dma_buf_of_host(one, page, &[(0, page)]).is_err() {
+            eprintln!("no dma-buf made here: unchecked");
+            return;
+        }
+
+        POINTER_REFUSED.set(true);
+        DMA_BUF_REFUSED.set(true);
+        for (at, length, first) in [(view, 2 * page, 0x66), (run, page, 0x77)] {
+            let before = counts();
+            // SAFETY: the pages are the test's own, never freed.
+            let bytes = unsafe { HostRange::new(at, length) };
+            let made = device.new_buffer_over_host_memory(on, bytes, 0, None);
+            let buffer = made
+                .expect("never a raise")
+                .expect("a buffer over a copy");
+            let after = counts();
+            let delta: [u64; 6] = std::array::from_fn(|i| after[i] - before[i]);
+            assert_eq!(delta, [0, 0, 0, 1, 1, 1], "{length} bytes");
+            assert_eq!((buffer.contents(), buffer.length()), (at, length));
+            assert_eq!(read(at, 16), [first; 16]);
+        }
+        POINTER_REFUSED.set(false);
+        DMA_BUF_REFUSED.set(false);
     }
 
     /// On the GPU the test holds, where the GPU takes no pointer to pages with no file behind them
