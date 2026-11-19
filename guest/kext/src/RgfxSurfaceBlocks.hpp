@@ -163,6 +163,8 @@ struct RgfxSurfaceEntries {
 		const uint32_t at = i - moreFrom;
 		return more[at / kRgfxSurfaceChunkEntries][at % kRgfxSurfaceChunkEntries];
 	}
+	// An index the table's searches answer (int32_t, -1 for none), once checked.
+	RgfxSurfaceEntry &operator[](int32_t i) const { return (*this)[static_cast<uint32_t>(i)]; }
 	explicit operator bool() const { return first != nullptr; }
 };
 
