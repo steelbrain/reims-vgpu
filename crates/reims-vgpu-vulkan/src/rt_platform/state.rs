@@ -24,10 +24,10 @@ use crate::core::platform::resource::{DepthStencilState, SamplerState};
 use crate::core::platform::values::{DepthStencilDesc, SamplerDesc, StencilDesc};
 use crate::core::raise::{Raise, RaiseResult};
 
+use super::RtObj;
 use super::device::RtDevice;
 use super::texture::refused_metal;
 use super::unbuilt::{RtRefusal, refused_as, rt_refused_create};
-use super::RtObj;
 
 /// `newSamplerStateWithDescriptor:`.
 const SAMPLER: &str = "newSamplerStateWithDescriptor:";
@@ -128,8 +128,10 @@ fn rt_stencil(s: &StencilDesc) -> Result<rt::StencilDescriptor, String> {
     out.stencil_failure_operation =
         value("stencil failure operation", s.stencil_failure_operation)?;
     out.depth_failure_operation = value("depth failure operation", s.depth_failure_operation)?;
-    out.depth_stencil_pass_operation =
-        value("depth-stencil pass operation", s.depth_stencil_pass_operation)?;
+    out.depth_stencil_pass_operation = value(
+        "depth-stencil pass operation",
+        s.depth_stencil_pass_operation,
+    )?;
     out.read_mask = s.read_mask;
     out.write_mask = s.write_mask;
     Ok(out)
@@ -273,7 +275,10 @@ mod tests {
         assert_eq!(s.t_address_mode.as_raw(), 3);
         assert_eq!(s.border_color, rt::SamplerBorderColor::OpaqueWhite);
         assert_eq!(s.compare_function.as_raw(), 3);
-        assert_eq!((s.max_anisotropy, s.lod_max_clamp, s.lod_bias), (8, 4.0, -0.5));
+        assert_eq!(
+            (s.max_anisotropy, s.lod_max_clamp, s.lod_bias),
+            (8, 4.0, -0.5)
+        );
         let bad = SamplerDesc {
             mip_filter: Some(7),
             ..SamplerDesc::default()
@@ -314,7 +319,10 @@ mod tests {
         assert_eq!(out.front_face_stencil, rt::StencilDescriptor::default());
         let back = out.back_face_stencil;
         assert_eq!(back.stencil_compare_function, rt::CompareFunction::Equal);
-        assert_eq!(back.depth_stencil_pass_operation, rt::StencilOperation::DecrementWrap);
+        assert_eq!(
+            back.depth_stencil_pass_operation,
+            rt::StencilOperation::DecrementWrap
+        );
         assert_eq!((back.read_mask, back.write_mask), (0xf0, 0x0f));
         let bad = DepthStencilDesc {
             front: Some(StencilDesc {
@@ -354,7 +362,10 @@ mod tests {
         let placed = sampler(&placed).expect("a placed sampler state");
         assert_eq!(placed.resource_index(), 5);
         assert_eq!(placed.gpu_resource_id() & 0xffff_ffff, 5);
-        assert_ne!(placed.gpu_resource_id() >> 32, first.gpu_resource_id() >> 32);
+        assert_ne!(
+            placed.gpu_resource_id() >> 32,
+            first.gpu_resource_id() >> 32
+        );
 
         let metal = Kind::Refused.code();
         let before = counted(metal);
@@ -379,7 +390,9 @@ mod tests {
         assert_eq!(counted(gap), before + 1);
 
         let depth = device.new_depth_stencil_state(&DepthStencilDesc::default());
-        let depth = depth.expect("never a raise").expect("a depth-stencil state");
+        let depth = depth
+            .expect("never a raise")
+            .expect("a depth-stencil state");
         assert_eq!(depth.gpu_resource_id(), Ok(0));
         assert!(depth.resource_index().is_err());
         let before = counted(metal);
