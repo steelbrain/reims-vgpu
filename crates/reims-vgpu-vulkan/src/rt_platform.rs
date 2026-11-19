@@ -10,11 +10,11 @@
 //! [`mod@format`]), its command queues ([`queue`]), events, fences and shared events ([`event`]),
 //! the reservation of resource indices, buffers and the textures over them ([`buffer`]), heaps but
 //! sparse ones ([`heap`]), textures made of a descriptor, with their views ([`texture`]),
-//! command buffers ([`command`]) with their blit and compute encoders ([`blit`], [`compute`]),
-//! sampler and depth-stencil
-//! states ([`state`]), libraries and their functions ([`library`]), compute pipeline states
-//! ([`pipeline`]) and render pipeline states ([`render_pipeline`]). Until a piece is built, every
-//! call that reaches it is refused ([`unbuilt`]). The call answers as Metal's call answers where it
+//! command buffers ([`command`]) with their blit, compute and render encoders ([`blit`],
+//! [`compute`], [`mod@render`]), render pass descriptors ([`descriptor`]), sampler and
+//! depth-stencil states ([`state`]), libraries and their functions ([`library`]), compute
+//! pipeline states ([`pipeline`]) and render pipeline states ([`render_pipeline`]). Until a piece
+//! is built, every call that reaches it is refused ([`unbuilt`]). The call answers as Metal's call answers where it
 //! fails: a nil object, an `NSError`, zeros. The refusal is counted under the piece's code,
 //! `rt-unbuilt-<piece>`, in the process's degradation counts, and the first of each kind writes a
 //! line on stderr. Never a death or a panic.
@@ -43,6 +43,7 @@ pub mod heap;
 pub mod library;
 pub mod pipeline;
 pub mod queue;
+pub mod render;
 pub mod render_pipeline;
 pub mod state;
 pub mod texture;
@@ -70,6 +71,7 @@ pub use heap::RtHeap;
 pub use library::{RtFunction, RtLibrary};
 pub use pipeline::RtComputePipeline;
 pub use queue::RtQueue;
+pub use render::RtRenderEncoder;
 pub use render_pipeline::RtRenderPipeline;
 pub use state::RtSampler;
 pub use texture::RtTexture;
@@ -177,7 +179,7 @@ impl Platform for RtPlatform {
     type CommandBuffer = RtObj<RtCommandBuffer>;
     type BlitEncoder = RtObj<RtBlitEncoder>;
     type ComputeEncoder = RtObj<RtComputeEncoder>;
-    type RenderEncoder = Unmade<kinds::RenderEncoder>;
+    type RenderEncoder = RtObj<RtRenderEncoder>;
     type Buffer = RtObj<RtBuffer>;
     type Texture = RtObj<RtTexture>;
     type Heap = RtObj<RtHeap>;

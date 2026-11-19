@@ -62,9 +62,10 @@ pub enum Unbuilt {
     /// Argument buffers' layouts (`newArgumentEncoderWithArguments:` and a function's). Each
     /// answers nil.
     ArgumentLayout,
-    /// Render command encoders (`renderCommandEncoderWithDescriptor:`), which take render pass
-    /// descriptors, unbuilt. Each answers nil.
-    Encoder,
+    /// Render commands rt has no form of: indirect draws, indexed patch draws, mesh draws, tile
+    /// dispatches, resolve textures, visibility results, and the private settings of other than
+    /// Metal's default rt has none of (`super::render`). Each encodes nothing.
+    RenderCommand,
     /// Compute commands rt has no form of: an indirect `dispatchThreads` and an indirect stage-in
     /// region. Each encodes nothing.
     ComputeCommand,
@@ -112,7 +113,7 @@ impl Unbuilt {
         Unbuilt::FunctionTable,
         Unbuilt::PipelineQuery,
         Unbuilt::ArgumentLayout,
-        Unbuilt::Encoder,
+        Unbuilt::RenderCommand,
         Unbuilt::ComputeCommand,
         Unbuilt::Predication,
         Unbuilt::Protection,
@@ -136,7 +137,7 @@ impl Unbuilt {
             Unbuilt::FunctionTable => "rt-unbuilt-function-table",
             Unbuilt::PipelineQuery => "rt-unbuilt-pipeline-query",
             Unbuilt::ArgumentLayout => "rt-unbuilt-argument-layout",
-            Unbuilt::Encoder => "rt-unbuilt-encoder",
+            Unbuilt::RenderCommand => "rt-unbuilt-render-command",
             Unbuilt::ComputeCommand => "rt-unbuilt-compute-command",
             Unbuilt::Predication => "rt-unbuilt-predication",
             Unbuilt::Protection => "rt-unbuilt-protection",
@@ -161,7 +162,7 @@ impl Unbuilt {
             Unbuilt::FunctionTable => "a function handle or a visible function table",
             Unbuilt::PipelineQuery => "a pipeline state's threadgroup memory or imageblock length",
             Unbuilt::ArgumentLayout => "an argument buffer's layout",
-            Unbuilt::Encoder => "a render command encoder",
+            Unbuilt::RenderCommand => "an indirect, mesh or tile draw, a resolve or a GL setting",
             Unbuilt::ComputeCommand => "an indirect dispatchThreads or stage-in region",
             Unbuilt::Predication => "command predication",
             Unbuilt::Protection => "a command buffer's protection options",

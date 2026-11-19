@@ -277,7 +277,7 @@ fn set(pipeline: Option<ObjId>) -> Result<(), Stop> {
 }
 
 /// `value` as rt's 32 bits.
-fn small(value: u64) -> Result<u32, Stop> {
+pub(super) fn small(value: u64) -> Result<u32, Stop> {
     u32::try_from(value).map_err(|_| WIDE)
 }
 
@@ -288,7 +288,7 @@ fn size(size: MtlSize) -> Result<[u32; 3], Stop> {
 
 /// The argument table indices of `range`, whose length each of the lists bound with it has
 /// (`lengths`); another length, or an index past rt's 32 bits, is Metal's refusal.
-fn slots(range: NsRange, lengths: &[usize]) -> Result<Range<u32>, Stop> {
+pub(super) fn slots(range: NsRange, lengths: &[usize]) -> Result<Range<u32>, Stop> {
     let length = |n: usize| u64::try_from(n).ok();
     if lengths.iter().any(|&n| length(n) != Some(range.length)) {
         return Err(Stop::Metal("a list of another length than its range"));

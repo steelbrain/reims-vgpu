@@ -17,15 +17,13 @@ use crate::core::platform::icb::IcbComputeCmd;
 use crate::core::platform::icb::IcbRenderCmd;
 use crate::core::platform::icb::ImageBlockArgs;
 use crate::core::platform::icb::TessellationFactorArgs;
-use crate::core::platform::render::RenderCmd;
 use crate::core::platform::types::MtlCoordinate2D;
 use crate::core::platform::types::MtlRegion;
 use crate::core::platform::types::MtlSize;
 use crate::core::platform::types::NsRange;
 use crate::core::platform::types::SizeAndAlign;
 use crate::core::platform::{Handle, ObjId, Platform};
-use crate::core::platform::{function_table, icb, rate_map, render};
-use crate::core::raise::OnFault;
+use crate::core::platform::{function_table, icb, rate_map};
 use crate::core::raise::RaiseResult;
 
 /// No value: the field that makes [`Unmade`] a type without values.
@@ -54,8 +52,6 @@ impl<K: 'static> Handle for Unmade<K> {
 /// The kinds of object [`Unmade`] stands for, one type each, so each associated type of the
 /// platform is a type of its own.
 pub mod kinds {
-    /// `id<MTLRenderCommandEncoder>`.
-    pub enum RenderEncoder {}
     /// `MTLSharedTextureHandle *`.
     pub enum SharedTextureHandle {}
     /// `id<MTLFunctionHandle>`.
@@ -74,18 +70,6 @@ pub mod kinds {
     pub enum IndirectComputeCommand {}
     /// `MTLRasterizationRateLayerDescriptor *`.
     pub enum RateMapLayerDescriptor {}
-}
-
-impl<P: Platform> render::RenderEncoder<P> for Unmade<kinds::RenderEncoder> {
-    fn encode(&self, _on: OnFault, _cmd: RenderCmd<'_, P>) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn tile_height(&self) -> u64 {
-        self.unreachable()
-    }
-    fn tile_width(&self) -> u64 {
-        self.unreachable()
-    }
 }
 
 impl<P: Platform> function_table::VisibleFunctionTable<P> for Unmade<kinds::VisibleFunctionTable> {

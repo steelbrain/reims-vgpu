@@ -16,9 +16,10 @@
 //!   as for a command buffer that ended with an error. rt's errors are Metal's
 //!   `MTLCommandBufferErrorDomain` codes: a lost device `DeviceRemoved` (11), and a command
 //!   buffer rt ended without running (its device quiesced, its queue abandoned) `Internal` (1).
-//! - **Encoders**: blit encoders ([`super::blit`]) and compute encoders ([`super::compute`]), of
-//!   the serial dispatch type or the descriptor's (another value is Metal's refusal, nil). Render
-//!   encoders are unbuilt ([`Unbuilt::Encoder`]): nil.
+//! - **Encoders**: blit encoders ([`super::blit`]), compute encoders ([`super::compute`]), of
+//!   the serial dispatch type or the descriptor's (another value is Metal's refusal, nil), and
+//!   render encoders ([`super::render`]) of the pass the descriptor keeps
+//!   ([`super::descriptor`]): a pass Metal refuses, or rt does, is nil, counted.
 //! - **What it keeps**: the pipeline states its encoders set ([`Kept`]), from their set until it
 //!   completes, released after its completed handlers ran.
 //! - **A signal as it is scheduled** (`encodeSignalEventScheduled:value:`) sets the shared
@@ -62,10 +63,11 @@ use crate::core::sync::Mutex;
 
 use super::blit::RtBlitEncoder;
 use super::compute::RtComputeEncoder;
+use super::render::RtRenderEncoder;
 use super::device::RtDevice;
 use super::texture::refused_metal;
 use super::unbuilt::{
-    RtRefusal, Unbuilt, refuse, refuse_create, refused_as, rt_refused, rt_refused_create,
+    RtRefusal, Unbuilt, refuse, refused_as, rt_refused, rt_refused_create,
 };
 use super::{RtObj, RtPlatform};
 
@@ -527,15 +529,30 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         self.rt.error().map(ns_error)
     }
 
-    /// Unbuilt: nil ([`Unbuilt::Encoder`]), which core faults on.
+    /// rt's render encoder of the pass the descriptor keeps: nil where Metal refuses the pass (an
+    /// action Metal has none of, a level or slice past 32 bits) or rt refuses it (another encoder
+    /// open, the command buffer committed, an attachment rt renders into none of), counted.
     fn render_encoder(
         &self,
         on: OnFault,
         render_pass_descriptor: &<RtPlatform as Platform>::RenderPassDescriptor,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::RenderEncoder>> {
-        let _ = (on, render_pass_descriptor);
-        refuse_create(Unbuilt::Encoder, "renderCommandEncoderWithDescriptor:");
-        Ok(None)
+        let _ = on;
+        let sel = "renderCommandEncoderWithDescriptor:";
+        let pass = match render_pass_descriptor.rt_pass() {
+            Ok(pass) => pass,
+            Err(why) => return Ok(refused_metal(sel, &why)),
+        };
+        Ok(match self.rt.render_command_encoder(&pass) {
+            Ok(encoder) => {
+                let (mark, kept) = (self.opened(), self.kept.clone());
+                Some(RtObj::new(RtRenderEncoder::new(encoder, mark, kept)))
+            }
+            Err(error) => {
+                rt_refused_create(sel, &error);
+                None
+            }
+        })
     }
 
     /// Nothing for 0; other options are unbuilt ([`Unbuilt::Protection`]), counted, and change
@@ -781,12 +798,13 @@ mod tests {
         assert_eq!(nil.encode_signal_when_scheduled(None, 1), Ok(()));
         assert_eq!(counted(metal), before + 3);
 
-        // Unbuilt render encoders and protection options; the command buffer still runs.
-        let encoders = counted(Unbuilt::Encoder.code());
+        // A pass of no attachment, which rt renders none of, and unbuilt protection options; the
+        // command buffer still runs.
+        let gaps = counted(RtRefusal::Gap.code());
         let protection = counted(Unbuilt::Protection.code());
         let pass = platform.new_render_pass_descriptor();
         assert!(matches!(nil.render_encoder(on, &pass), Ok(None)));
-        assert_eq!(counted(Unbuilt::Encoder.code()), encoders + 1);
+        assert_eq!(counted(RtRefusal::Gap.code()), gaps + 1);
         assert_eq!(nil.set_protection_options(on, 0), Ok(()));
         assert_eq!(counted(Unbuilt::Protection.code()), protection);
         assert_eq!(nil.set_protection_options(on, 1), Ok(()));
