@@ -78,6 +78,8 @@ use crate::core::num::{ToU64 as _, ToUsize as _};
 use crate::core::platform::Handle as _;
 use crate::core::platform::device::NoCopyDeallocator;
 use crate::core::platform::host_range::HostRange;
+#[cfg(unix)]
+use crate::core::platform::resource::ExportedMemory;
 use crate::core::platform::resource::{Buffer, GpuResource};
 use crate::core::platform::types::NsRange;
 use crate::core::platform::values::{BufferDeallocator, BufferDesc, SurfacePlane};
@@ -149,6 +151,9 @@ pub struct RtBuffer {
     /// A no-copy buffer's deallocator that runs as the buffer goes: one over a known block's
     /// mapping (the module's docs, "A pinned address").
     deallocator: Option<Slot>,
+    /// An exportable buffer's export (`super::export`).
+    #[cfg(unix)]
+    exported: Option<super::export::Exported>,
 }
 
 impl RtBuffer {
@@ -458,7 +463,37 @@ pub(super) fn buffer_of(
         purgeable: texture::purgeable_state(),
         in_heap,
         deallocator,
+        #[cfg(unix)]
+        exported: None,
     })
+}
+
+/// The handle of an exportable buffer (`super::export`), of rt's buffer `rt` answering `options`,
+/// keeping `exported`.
+#[cfg(unix)]
+pub(super) fn with_export(
+    device: &RtObj<RtDevice>,
+    rt: rt::Buffer,
+    options: u64,
+    exported: super::export::Exported,
+) -> RtObj<RtBuffer> {
+    RtObj::new(RtBuffer {
+        rt,
+        device: device.clone_ref(),
+        options,
+        purgeable: texture::purgeable_state(),
+        in_heap: false,
+        deallocator: None,
+        exported: Some(exported),
+    })
+}
+
+/// The options a buffer of the raw options `raw` answers, where they are Private ones Metal takes
+/// for a buffer the device makes; `None` otherwise.
+#[cfg(unix)]
+pub(super) fn private_options(raw: u64) -> Option<u64> {
+    let o = options(raw, false).ok()?;
+    (o.storage == Storage::Private).then_some(o.answered)
 }
 
 /// The known block of `class` that holds the `length` bytes at GPU address `pin`, and their
@@ -951,6 +986,21 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
         let sel = "newTiledTextureWithDescriptor:offset:bytesPerRow:";
         refuse_create(Unbuilt::Buffer, sel);
         Ok(None)
+    }
+
+    /// An exportable buffer's memory as a new opaque fd (`super::export`); `Err` for any other.
+    #[cfg(unix)]
+    fn export_memory(&self) -> Result<ExportedMemory, String> {
+        let exported = (self.exported.as_ref()).ok_or("the buffer was not made exportable")?;
+        exported.export(rt::ExportHandle::OpaqueFd, self.rt.length())
+    }
+
+    /// rt's acquire of what another API wrote into an exportable buffer's block
+    /// (`super::export`, "The acquire"); `Err` for any other buffer, which no other API writes.
+    #[cfg(unix)]
+    fn external_write_done(&self) -> Result<(), String> {
+        let exported = (self.exported.as_ref()).ok_or("the buffer was not made exportable")?;
+        exported.acquire()
     }
 
     /// rt's texture over the buffer's bytes at the plane's offset, rows its bytes per row apart,

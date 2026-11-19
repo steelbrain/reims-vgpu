@@ -183,6 +183,20 @@ pub struct RtDevice {
     drm: Option<crate::device_choice::DrmNodes>,
     /// Whether it enabled present fences' extension (the module's docs).
     present_fences: bool,
+    /// Where its GPU lies on the host.
+    host_gpu: HostGpu,
+}
+
+/// Where a device's GPU lies on the host, as Vulkan answers it, which the host's video opens its
+/// APIs at: CUDA by the PCI address, VA-API on the render node.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostGpu {
+    /// Its PCI domain, bus, device and function (`VK_EXT_pci_bus_info`); `None` where the device
+    /// does not list the extension.
+    pub pci: Option<(u32, u32, u32, u32)>,
+    /// Its render node's major and minor numbers (`VK_EXT_physical_device_drm`); `None` where the
+    /// device does not list the extension or has no render node.
+    pub render: Option<(u32, u32)>,
 }
 
 impl RtDevice {
@@ -231,6 +245,11 @@ impl RtDevice {
     /// Whether each present can signal a fence of its own (`swapchainMaintenance1`).
     pub fn has_present_fences(&self) -> bool {
         self.present_fences
+    }
+
+    /// Where its GPU lies on the host.
+    pub fn host_gpu(&self) -> HostGpu {
+        self.host_gpu
     }
 }
 
@@ -307,6 +326,10 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         }));
     };
     let drm = seen.get(at).and_then(|s| s.drm);
+    let host_gpu = seen.get(at).map_or_else(HostGpu::default, |seen| HostGpu {
+        pci: seen.pci,
+        render: seen.drm.and_then(|nodes| nodes.render),
+    });
     let (Some((physical, floor)), Some(uuid)) =
         (candidates.get(at), seen.get(at).and_then(|s| s.uuid))
     else {
@@ -362,6 +385,7 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         instance,
         drm,
         present_fences,
+        host_gpu,
     }))
 }
 
@@ -600,6 +624,24 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         let _ = on;
         let sel = "newBufferWithLength:options:";
         Ok(buffer::scratch_of_length(self, sel, length, options))
+    }
+
+    /// A buffer of zeros of its own exported block, whose memory CUDA imports as an opaque fd
+    /// (`super::export`); `None` where rt makes none, counted, and the caller makes the buffer as
+    /// any other.
+    #[cfg(unix)]
+    fn new_exportable_buffer_of_length(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+        aligned_byte: Option<u64>,
+    ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+        let _ = on;
+        let sel = "newBufferWithLength:options: (exportable)";
+        let handle = rt::ExportHandle::OpaqueFd;
+        let made = super::export::exportable(self, sel, handle, length, options, aligned_byte);
+        Ok(made)
     }
 
     /// rt's queue, of Metal's default `maxCommandBufferCount`; nil where rt refuses it.

@@ -1,0 +1,239 @@
+//! The rt platform's buffers whose memory another API imports
+//! (`GpuDevice::new_exportable_buffer_of_length`): IOSurface device caches that the host's video
+//! writes its pictures into on its own GPU work, through CUDA's import ([`exportable`]).
+//!
+//! **One block a buffer.** Each is a buffer of its own exported block (rt's
+//! `Device::new_exported_block`): one dedicated allocation of Private memory, exported as an
+//! opaque fd, which CUDA imports with the allocation's size, as dedicated, and the buffer's place
+//! in it ([`ExportedMemory`]). Its bytes are zeros, as `newBufferWithLength:options:`'s are (rt's
+//! GPU fill ahead of the next command buffer). Where the caller names a byte of it to lie on a
+//! multiple of 256 bytes of its memory (`aligned_byte`), the buffer starts that far into the block
+//! that the byte does.
+//!
+//! **Each export a new fd.** rt gives one fd of the memory as it makes the block, which the
+//! buffer keeps; each `Buffer::export_memory` answers a duplicate of it (`dup`), the caller's
+//! own, as an import takes it.
+//!
+//! **The acquire.** `Buffer::external_write_done` is rt's `Block::external_writes_done`: the
+//! block's acquire from the other API's queue family, recorded in rt's upload ahead of every
+//! command buffer committed after it, which then reads what that API wrote. No release goes back
+//! to the other API: it reads nothing of the block but what it wrote itself (rt's contract,
+//! which NVDEC's landing meets: it writes each picture's rows whole).
+//!
+//! **Refusals.** Where rt makes no exported block (a device that exports no opaque fd, a dma-buf
+//! without the foreign queue family, a limit) or no buffer in it, the call answers `None` and the
+//! caller makes the buffer as any other: counted ([`EXPORT_REFUSED_CODE`]), the process's first
+//! with a line naming rt's error. rt copies no frame for it. Options of a storage mode other than
+//! Private are declined uncounted (rt exports Private memory alone), the caller's make counting
+//! what Metal refuses of them.
+
+use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use metal2vulkan_rt as rt;
+
+use crate::core::platform::resource::ExportedMemory;
+
+use super::buffer::{self, RtBuffer};
+use super::device::RtDevice;
+use super::RtObj;
+
+/// The log target of the exports' lines.
+const TARGET: &str = "reims_vgpu_vulkan::rt_platform";
+
+/// The code of an exportable buffer rt makes none of (the module's docs, "Refusals"), counted per
+/// refusal.
+pub const EXPORT_REFUSED_CODE: &str = "rt-refused-export";
+
+/// The bytes a byte the caller names lies on a multiple of in the exported memory.
+const ALIGNED_TO: u64 = 256;
+
+/// What an exportable buffer keeps of its export (the module's docs).
+pub(super) struct Exported {
+    /// The exported block, whose acquire the buffer records.
+    block: rt::Block,
+    /// rt's fd of the block's memory, which each export duplicates.
+    fd: OwnedFd,
+    /// The kind of `fd`.
+    handle: rt::ExportHandle,
+    /// The allocation's bytes, which an import names.
+    size: u64,
+    /// The buffer's first byte in the allocation.
+    offset: u64,
+}
+
+/// Whether the process refused an exportable buffer yet.
+static REFUSED_SAID: AtomicBool = AtomicBool::new(false);
+
+/// Counts rt's refusal `why` of an exportable buffer for `sel` ([`EXPORT_REFUSED_CODE`]); the
+/// process's first writes its line.
+fn refused(sel: &'static str, why: &dyn std::fmt::Display) {
+    crate::answer::count_kind(EXPORT_REFUSED_CODE);
+    if !REFUSED_SAID.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            target: TARGET,
+            kind:% = EXPORT_REFUSED_CODE;
+            "{sel}: metal2vulkan-rt makes no exportable buffer ({why}); the buffer is made as any \
+             other, and the host's video lands its pictures another way ({EXPORT_REFUSED_CODE}), \
+             counted from here"
+        );
+    }
+}
+
+/// The offset in a block at which a buffer starts whose byte `aligned_byte` lies on a multiple
+/// of [`ALIGNED_TO`] bytes of the block; 0 where none is named.
+fn start_for(aligned_byte: Option<u64>) -> u64 {
+    aligned_byte.map_or(0, |byte| (ALIGNED_TO - byte % ALIGNED_TO) % ALIGNED_TO)
+}
+
+/// A buffer of zeros of `length` bytes and options `raw`, for `sel`, whose memory another API
+/// imports through `handle`'s kind of handle (the module's docs), `aligned_byte` of it, where
+/// given, on a multiple of 256 bytes of its memory. `None` where rt makes none, counted, or the
+/// options are not Private ones, and the caller makes the buffer as any other.
+pub(super) fn exportable(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    handle: rt::ExportHandle,
+    length: u64,
+    raw: u64,
+    aligned_byte: Option<u64>,
+) -> Option<RtObj<RtBuffer>> {
+    let answered = buffer::private_options(raw)?;
+    let offset = start_for(aligned_byte);
+    let Some(span) = offset.checked_add(length) else {
+        refused(sel, &format!("a buffer of {length} bytes at {offset}"));
+        return None;
+    };
+    let (block, export) = match device.rt().new_exported_block(handle, span) {
+        Ok(made) => made,
+        Err(error) => {
+            refused(sel, &error);
+            return None;
+        }
+    };
+    let made = match device.rt().new_buffer(block.id, offset, length, Some(0)) {
+        Ok(made) => made,
+        Err(error) => {
+            refused(sel, &error);
+            return None;
+        }
+    };
+    let exported = Exported {
+        block,
+        fd: export.handle,
+        handle,
+        size: export.size,
+        offset,
+    };
+    Some(buffer::with_export(device, made, answered, exported))
+}
+
+impl Exported {
+    /// The memory as a new fd of `handle`'s kind, with what an import names, for a buffer of
+    /// `length` bytes; `Err` says why not: an export of another kind, or a failed `dup`.
+    pub(super) fn export(
+        &self,
+        handle: rt::ExportHandle,
+        length: u64,
+    ) -> Result<ExportedMemory, String> {
+        if self.handle != handle {
+            return Err(format!(
+                "the buffer's memory is exported as {:?}, not {handle:?}",
+                self.handle
+            ));
+        }
+        let fd = (self.fd.try_clone()).map_err(|error| format!("a new fd of the export: {error}"))?;
+        Ok(ExportedMemory {
+            fd,
+            allocation_size: self.size,
+            offset: self.offset,
+            length,
+            dedicated: true,
+        })
+    }
+
+    /// rt's acquire of what the other API wrote into the block (the module's docs, "The
+    /// acquire"); `Err` says why rt refused it.
+    pub(super) fn acquire(&self) -> Result<(), String> {
+        (self.block.external_writes_done()).map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::platform::Handle as _;
+    use crate::core::platform::device::GpuDevice as _;
+    use crate::core::platform::resource::{Buffer as _, GpuResource as _};
+    use crate::core::raise::OnFault;
+    use crate::rt_platform::RtPlatform;
+
+    /// A byte the caller names lies on a multiple of 256 bytes: the buffer starts as far before
+    /// the next as the byte lies past the last.
+    #[test]
+    fn an_aligned_byte_starts_the_buffer_before_a_multiple_of_256() {
+        assert_eq!(start_for(None), 0);
+        assert_eq!(start_for(Some(0)), 0);
+        assert_eq!(start_for(Some(32)), 224);
+        assert_eq!(start_for(Some(256)), 0);
+        assert_eq!(start_for(Some(0x2d0)), 0x30);
+    }
+
+    fn counted(code: &str) -> u64 {
+        (crate::answer::degradation_counts().into_iter())
+            .find(|(c, _)| c == code)
+            .map_or(0, |(_, n)| n)
+    }
+
+    /// Exportable buffers on the GPU the test holds, where its device exports an opaque fd: a
+    /// Private buffer of the asked length at a GPU address, its byte 32 on a multiple of 256
+    /// bytes of its memory where asked; each export a new fd of the dedicated allocation, which
+    /// holds the buffer, none as a dma-buf; the acquire taken. A plain buffer exports nothing and
+    /// takes no acquire, and options of other storage are declined uncounted. Where the device
+    /// exports no opaque fd, the refusal is counted and the make answers `None`.
+    #[test]
+    fn exportable_buffers_on_vulkan() {
+        use std::os::fd::AsRawFd as _;
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let length = 3840 * 2160 * 3 / 2 + 32;
+        let refusals = counted(EXPORT_REFUSED_CODE);
+        let made = device.new_exportable_buffer_of_length(on, length, 0x20, Some(32));
+        let Some(buffer) = made.expect("never a raise") else {
+            assert_eq!(counted(EXPORT_REFUSED_CODE), refusals + 1);
+            println!("the device exports no opaque fd: refused, counted");
+            return;
+        };
+        assert_eq!(counted(EXPORT_REFUSED_CODE), refusals);
+        assert_eq!((buffer.length(), buffer.storage_mode()), (length, 2));
+        assert_eq!(buffer.resource_options(), 0x220);
+        assert_ne!(buffer.gpu_address(), 0);
+        let first = buffer.export_memory().expect("an export");
+        let second = buffer.export_memory().expect("another");
+        assert_ne!(first.fd.as_raw_fd(), second.fd.as_raw_fd());
+        assert_eq!((first.offset + 32) % 256, 0);
+        assert_eq!(first.offset, 224);
+        assert!(first.dedicated && first.length == length);
+        assert!(first.allocation_size >= first.offset + length);
+        assert_eq!(
+            (second.offset, second.allocation_size),
+            (first.offset, first.allocation_size)
+        );
+        assert!(buffer.export_dma_buf().is_err());
+        assert_eq!(buffer.external_write_done(), Ok(()));
+        let unaligned = device.new_exportable_buffer_of_length(on, 4096, 0x20, None);
+        let unaligned = unaligned.expect("never a raise").expect("an exportable buffer");
+        assert_eq!(unaligned.export_memory().expect("an export").offset, 0);
+
+        let plain = (device.new_buffer_of_length(on, 4096, 0x20))
+            .expect("never a raise")
+            .expect("a Private buffer");
+        assert!(plain.export_memory().is_err());
+        assert!(plain.external_write_done().is_err());
+        let shared = device.new_exportable_buffer_of_length(on, 4096, 0, None);
+        assert!(shared.expect("never a raise").is_none());
+        assert_eq!(counted(EXPORT_REFUSED_CODE), refusals);
+        assert_ne!(buffer.id(), unaligned.id());
+    }
+}
