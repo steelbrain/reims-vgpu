@@ -497,7 +497,10 @@ the render node of the runtime device's own GPU, whatever its vendor
   copies at its end, as `a session's pictures copied by the GPU into their
   outputs: 300, 0.812 ms of GPU time each, 1.204 ms at most (300 timed)`,
   and its counts, as `a session ended after 300 decodes: landed 300 in the
-  surface's pages, by the hardware; 0 skipped, 0 failed`. A picture that
+  surface's pages, by the hardware; 0 skipped, 0 failed`, followed by how
+  many surfaces' memory its outputs lay in and the most of it live at once
+  (`video_host`'s `Outputs`), and, where the CPU copied pictures, the
+  copies' mean and longest time. A picture that
   does not land fails its decode's command buffer ([devices.md](devices.md),
   "A decode").
 - **Surfaces.** A picture holds its decode surface until it lands, and

@@ -44,12 +44,15 @@
 //!   alive what it lands from, so a decoder may go before its last pictures land.
 //!
 //! The session logs the first picture of each way it lands at `info` ("hardware video: ..."),
-//! and its counts at its end.
+//! and its counts at its end: its pictures by the way each landed, the outputs they landed in
+//! ([`Outputs`]: how many surfaces' memory, and the most of it live at once), and the time the
+//! CPU's copies of them took.
 
 #![allow(dead_code, reason = "each of the host's video arms uses a part of it")]
 
+use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reims_vgpu_video::core::device_memory::MemoryIdentity;
 use reims_vgpu_vulkan::core::host::HostPtr;
@@ -225,6 +228,10 @@ pub(crate) struct Landing<'a, P: Platform> {
     /// What the hardware answered of a decode it failed whose picture lands all the same
     /// ([`Landing::hardware_failed`]).
     hardware_failed: Option<String>,
+    /// When the CPU's copy of the picture started, once [`Landing::host_for_cpu`] answered.
+    cpu_from: Option<Instant>,
+    /// How long [`Landing::copy_rows`]'s copy took.
+    cpu_took: Option<Duration>,
 }
 
 /// Where the planes in a device cache are staged in the staging buffer: each one's first byte.
@@ -308,10 +315,11 @@ impl<P: Platform> Landing<'_, P> {
     }
 
     /// [`Self::host`], for a backend whose CPU copies the picture into them itself: the landing is
-    /// counted as the CPU's.
+    /// counted as the CPU's, and its copy timed from here to the landing's return.
     pub(crate) fn host_for_cpu(&mut self) -> Result<HostPlanes<P>, BackendError> {
         let planes = self.host()?;
         self.by_cpu = true;
+        self.cpu_from = Some(Instant::now());
         Ok(planes)
     }
 
@@ -330,6 +338,7 @@ impl<P: Platform> Landing<'_, P> {
         chroma: SourcePlane,
     ) -> Result<(), BackendError> {
         let planes = self.host()?;
+        let started = Instant::now();
         for (from, to) in [(luma, &planes.luma), (chroma, &planes.chroma)] {
             let rows = u64::try_from(from.rows).map_or(to.rows, |rows| rows.min(to.rows));
             let bytes = u64::try_from(from.row_bytes).map_or(to.row_bytes, |b| b.min(to.row_bytes));
@@ -354,6 +363,7 @@ impl<P: Platform> Landing<'_, P> {
                 }
             }
         }
+        self.cpu_took = Some(started.elapsed());
         self.by_cpu = true;
         Ok(())
     }
@@ -683,6 +693,48 @@ struct Counts {
     failed: u64,
     /// Pictures the hardware answered failed that landed as it left them.
     landed_failed: u64,
+    /// Pictures the CPU copied ([`Landing::copy_rows`], [`Landing::host_for_cpu`]) that landed.
+    cpu_copies: u64,
+    /// The time their copies took, all told.
+    cpu_total: Duration,
+    /// The longest of them.
+    cpu_most: Duration,
+}
+
+/// The outputs a session's decodes landed in, told apart by their memory: the luma plane's
+/// device cache's identity ([`OutputPlane::cache`]), else the identity of the mapping its pages
+/// lie in ([`OutputPlane::pages`]). An output's memory is live until its mapping goes (the
+/// surface's view of its pages, its block of the region until its `BLOCK_RELEASE`, or the device
+/// cache), and an identity is never another mapping's, so the outputs live at a decode are the
+/// surfaces whose memory the session's decodes have landed in and that the guest still holds.
+#[derive(Debug, Default)]
+struct Outputs {
+    /// Those whose memory lived at the last decode, by their identity's key.
+    live: HashMap<u64, MemoryIdentity>,
+    /// The distinct outputs the decodes landed in.
+    distinct: u64,
+    /// The most live at once, at a decode.
+    most_live: usize,
+    /// Decodes into memory of no identity: a buffer over memory of another kind.
+    unknown: u64,
+}
+
+impl Outputs {
+    /// Counts `output`, a decode's, and the outputs live at it.
+    fn saw<P: Platform>(&mut self, output: &DecodeOutput<P>) {
+        let plane = &output.luma;
+        let identity = (plane.cache.clone())
+            .or_else(|| plane.pages.as_ref().map(|pages| pages.memory.identity()));
+        let Some(identity) = identity else {
+            self.unknown += 1;
+            return;
+        };
+        self.live.retain(|_, live| live.is_live());
+        if self.live.insert(identity.key(), identity).is_none() {
+            self.distinct += 1;
+        }
+        self.most_live = self.most_live.max(self.live.len());
+    }
 }
 
 /// A video session on a host API ([`HostDecoder`]): its decodes' pictures landed by its landing
@@ -702,6 +754,8 @@ struct State<P: Platform> {
     decoder: Box<dyn HostDecoder<P>>,
     jobs: Option<mpsc::SyncSender<Job<P>>>,
     value: u64,
+    /// The outputs its decodes landed in, logged at its end.
+    outputs: Outputs,
 }
 
 impl<P: Platform> HostVideoSession<P> {
@@ -746,6 +800,7 @@ impl<P: Platform> HostVideoSession<P> {
                 decoder,
                 jobs: Some(jobs),
                 value: 0,
+                outputs: Outputs::default(),
             }),
             event,
             counts,
@@ -772,6 +827,7 @@ impl<P: Platform> GraphicsVideoSession<P> for HostVideoSession<P> {
                 .map_err(|error| decode_fault(format_args!("its parameter sets: {error}")))?;
         }
         let picture = state.decoder.decode(au, &output).map_err(decode_fault)?;
+        state.outputs.saw(&output);
         let skipped = picture.is_none();
         let value = state.value + 1;
         let landed = Arc::new(Landed::default());
@@ -797,10 +853,10 @@ impl<P: Platform> GraphicsVideoSession<P> for HostVideoSession<P> {
 
 impl<P: Platform> Drop for HostVideoSession<P> {
     fn drop(&mut self) {
-        let last = {
+        let (last, outputs) = {
             let mut state = self.state.lock();
             drop(state.jobs.take());
-            state.value
+            (state.value, std::mem::take(&mut state.outputs))
         };
         let millis = u64::try_from(TEARDOWN_WAIT.as_millis()).unwrap_or(u64::MAX);
         let landed = last == 0 || self.event.wait_until_signaled_value(last, millis);
@@ -822,9 +878,28 @@ impl<P: Platform> Drop for HostVideoSession<P> {
             .filter(|(_, n)| *n > 0)
             .map(|(way, n)| format!("{n} {}", way.says()))
             .collect::<Vec<_>>();
+        let mut outputs_said = format!(
+            "; its outputs lay in {} surfaces' memory, {} live at once at most",
+            outputs.distinct, outputs.most_live
+        );
+        if outputs.unknown > 0 {
+            outputs_said += &format!(", and {} in memory of no identity", outputs.unknown);
+        }
+        let cpu_said = if counts.cpu_copies > 0 {
+            let ms = |d: Duration| d.as_secs_f64() * 1e3;
+            let mean = counts.cpu_total / u32::try_from(counts.cpu_copies).unwrap_or(u32::MAX);
+            format!(
+                "; the CPU copied {}, {:.3} ms each, {:.3} ms at most",
+                counts.cpu_copies,
+                ms(mean),
+                ms(counts.cpu_most)
+            )
+        } else {
+            String::new()
+        };
         log::info!(
             "hardware video: {name}: a session ended after {last} decodes: landed {}; {} skipped, \
-             {} failed, {} landed as the hardware failed them",
+             {} failed, {} landed as the hardware failed them{outputs_said}{cpu_said}",
             if landed.is_empty() {
                 "none".to_owned()
             } else {
@@ -861,8 +936,13 @@ fn land_pictures<P: Platform>(
         } = job;
         match picture.map(|picture| land(picture, &output, &mut stage)) {
             None => counts.lock().skipped += 1,
-            Some(Ok((way, hardware_failed))) => {
+            Some(Ok((way, hardware_failed, cpu))) => {
                 let mut counts = counts.lock();
+                if let Some(took) = cpu {
+                    counts.cpu_copies += 1;
+                    counts.cpu_total += took;
+                    counts.cpu_most = counts.cpu_most.max(took);
+                }
                 if let Some(why) = hardware_failed {
                     counts.landed_failed += 1;
                     if counts.landed_failed <= FAILURES_LOGGED {
@@ -909,13 +989,14 @@ fn land_pictures<P: Platform>(
 }
 
 /// Lands `picture` in `output`, copying its staged planes into their device caches, and answers
-/// how, and what the hardware answered where it failed the decode and the picture landed all the
-/// same ([`Landing::hardware_failed`]).
+/// how, what the hardware answered where it failed the decode and the picture landed all the
+/// same ([`Landing::hardware_failed`]), and how long the CPU's copy took where the CPU copied it
+/// (from its start to the end of [`Landing::copy_rows`], or to the picture's landing's return).
 fn land<P: Platform>(
     picture: Box<dyn HostPicture<P>>,
     output: &DecodeOutput<P>,
     stage: &mut Stage<P>,
-) -> Result<(Way, Option<String>), BackendError> {
+) -> Result<(Way, Option<String>, Option<Duration>), BackendError> {
     let mut landing = Landing {
         luma: &output.luma,
         chroma: &output.chroma,
@@ -924,8 +1005,11 @@ fn land<P: Platform>(
         by_cpu: false,
         decoded: false,
         hardware_failed: None,
+        cpu_from: None,
+        cpu_took: None,
     };
     picture.land(&mut landing)?;
+    let cpu = (landing.cpu_took).or_else(|| landing.cpu_from.map(|from| from.elapsed()));
     let Landing {
         staged,
         by_cpu,
@@ -940,9 +1024,9 @@ fn land<P: Platform>(
     }
     let cached = output.luma.cached || output.chroma.cached;
     if decoded && cached && !is_staged && !by_cpu {
-        return Ok((Way::Decoded, hardware_failed));
+        return Ok((Way::Decoded, hardware_failed, cpu));
     }
-    Ok((Way::of(is_staged, cached, by_cpu), hardware_failed))
+    Ok((Way::of(is_staged, cached, by_cpu), hardware_failed, cpu))
 }
 
 mod encode;

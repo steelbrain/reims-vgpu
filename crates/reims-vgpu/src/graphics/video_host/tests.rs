@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use reims_vgpu_graphics::wire::RGFX_VIDEO_CODEC_H264;
+use reims_vgpu_video::core::device_memory::MemoryLife;
 use reims_vgpu_vulkan::core::testkit::FakePlatform;
 use reims_vgpu_vulkan::core::testkit::calllog::Arg;
 use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
@@ -501,6 +502,60 @@ fn a_picture_the_hardware_failed_lands_as_any_and_is_counted() {
     assert!(decoded.landed.as_deref().is_some_and(|l| !l.failed()));
     let counts = s.counts.lock();
     assert_eq!((counts.failed, counts.landed_failed), (0, 1));
+}
+
+/// A session counts the outputs its decodes landed in by their memory's identity, once each,
+/// and the most whose memory lived at once at a decode: an output whose memory went is no longer
+/// live. A decode into memory of no identity is counted apart.
+#[test]
+fn a_session_counts_its_outputs_by_their_memory_and_the_most_live_at_once() {
+    let p = FakePlatform::new();
+    let log = Log::default();
+    let s = session(&p, Vec::new(), &log);
+    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
+    let pages = buffer(&p, 16384, STORAGE_SHARED);
+    let (a, b, c) = (MemoryLife::new(), MemoryLife::new(), MemoryLife::new());
+    let into = |life: Option<&MemoryLife>| {
+        let (mut luma, chroma) = planes(&pages, &pages, 96);
+        luma.cache = life.map(MemoryLife::identity);
+        s.decode(&decode(&bitstream, &[], (luma, chroma))).unwrap();
+    };
+    into(Some(&a));
+    into(Some(&b));
+    into(Some(&a));
+    drop(a);
+    into(Some(&c));
+    into(Some(&b));
+    into(None);
+    let state = s.state.lock();
+    let outputs = &state.outputs;
+    assert_eq!(
+        (outputs.distinct, outputs.most_live, outputs.live.len()),
+        (3, 2, 2)
+    );
+    assert_eq!(outputs.unknown, 1);
+}
+
+/// A picture the CPU copied is counted with its copy's time; one the hardware wrote is not.
+#[test]
+fn a_session_times_the_cpu_s_copies() {
+    let p = FakePlatform::new();
+    let log = Log::default();
+    let answers = vec![
+        Ok(Some(Picture::Cpu(9, Arc::clone(&log)))),
+        Ok(Some(Picture::Fill(4, Arc::clone(&log)))),
+    ];
+    let s = session(&p, answers, &log);
+    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
+    let pages = buffer(&p, 16384, STORAGE_SHARED);
+    for _ in 0..2 {
+        s.decode(&decode(&bitstream, &[], planes(&pages, &pages, 96)))
+            .unwrap();
+    }
+    assert!(event_of(&s).wait_until_signaled_value(2, 10_000));
+    let counts = s.counts.lock();
+    assert_eq!(counts.cpu_copies, 1);
+    assert!(counts.cpu_most <= counts.cpu_total);
 }
 
 /// A session's end waits for its last picture to land.
