@@ -13068,7 +13068,10 @@ lacks {part}"
 
     /// The CPU's write of `texel(x, y)` at each texel of [`tiled_made`]'s level 0 into its buffer's
     /// rows, [`TILED_ROW`] bytes apart from its first byte.
-    fn tiled_write_rows<P: Platform>(dec: &GraphicsDecoder<P>, texel: impl Fn(u64, u64) -> [u8; 4]) {
+    fn tiled_write_rows<P: Platform>(
+        dec: &GraphicsDecoder<P>,
+        texel: impl Fn(u64, u64) -> [u8; 4],
+    ) {
         use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
         let Some(ObjHandle::Buffer(buffer)) = dec.object(context_obj(10)) else {
             panic!("no buffer");
@@ -13138,8 +13141,10 @@ lacks {part}"
             cb.wait_until_completed(OnFault::Return).unwrap();
             assert!(cb.error().is_none(), "{:?}", cb.error());
             // SAFETY: a Shared buffer's bytes, read after the blit completed.
-            unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), (s * s * 4) as usize) }
-                .to_vec()
+            unsafe {
+                std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), (s * s * 4) as usize)
+            }
+            .to_vec()
         })
     }
 
@@ -13164,8 +13169,9 @@ lacks {part}"
         let (mut dec, device, made) = tiled_made::<P>(0, TILED_ROW);
         assert_eq!(made, Ok(()));
         let queue = device.new_command_queue().unwrap();
-        let write_rows =
-            |dec: &GraphicsDecoder<P>, seed: u8| tiled_write_rows(dec, |x, y| tiled_texel(x, y, seed));
+        let write_rows = |dec: &GraphicsDecoder<P>, seed: u8| {
+            tiled_write_rows(dec, |x, y| tiled_texel(x, y, seed))
+        };
         let read = |dec: &GraphicsDecoder<P>| tiled_read_two(dec, &device, &queue);
         write_rows(&dec, 0x5a);
         let first = read(&dec);

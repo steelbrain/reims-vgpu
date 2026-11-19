@@ -898,7 +898,8 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
         if level == 0
             && let Some(tiled) = self.tiled()
         {
-            if let Err((kind, why)) = tiled.replace(region, u64::from(slice), &bytes, bytes_per_row) {
+            if let Err((kind, why)) = tiled.replace(region, u64::from(slice), &bytes, bytes_per_row)
+            {
                 refused_as(REPLACE, kind, &why);
             }
             return Ok(());

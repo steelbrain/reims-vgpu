@@ -46,9 +46,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use metal2vulkan_rt as rt;
 
 use crate::core::num::{ToU64 as _, ToUsize as _};
+use crate::core::platform::Handle as _;
 use crate::core::platform::resource::Buffer as _;
 use crate::core::platform::types::{MtlRegion, NsRange};
-use crate::core::platform::Handle as _;
 use crate::core::platform::values::TextureDesc;
 use crate::core::raise::OnFault;
 use crate::core::sync::Mutex;
@@ -132,7 +132,7 @@ impl Tiled {
         let MtlRegion { origin, size } = region;
         let fits = |at: u64, of: u64, side: u64, unit: u64| {
             at.checked_add(of).is_some_and(|end| {
-                end <= side && at % unit == 0 && (of % unit == 0 || end == side)
+                end <= side && at.is_multiple_of(unit) && (of.is_multiple_of(unit) || end == side)
             })
         };
         if slice != 0
@@ -232,12 +232,12 @@ pub(super) fn bad_layout(
         return None;
     }
     let row = desc.width.div_ceil(bw).saturating_mul(bytes);
-    if bytes_per_row < row || bytes_per_row % bytes != 0 {
+    if bytes_per_row < row || !bytes_per_row.is_multiple_of(bytes) {
         return Some(format!(
             "rows {bytes_per_row} bytes apart, for rows of {row} bytes in blocks of {bytes}"
         ));
     }
-    if offset % bytes != 0 {
+    if !offset.is_multiple_of(bytes) {
         return Some(format!("an offset of {offset} bytes, in blocks of {bytes}"));
     }
     let rows = desc.height.div_ceil(bh).max(1);
