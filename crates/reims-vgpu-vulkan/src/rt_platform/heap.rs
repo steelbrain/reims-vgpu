@@ -13,11 +13,16 @@
 //! (`rt-gpu-address-unpinned`, `super::buffer`'s docs): the heap lies at rt's address. The heap's
 //! size is the descriptor's rounded up to 16 KiB, as Metal's is; the heap holds its block.
 //!
-//! **What is placed in it.** A buffer is the heap's range at its offset (rt's `new_buffer` in the
-//! block, its bytes as they are, as Metal's heap buffers are); a texture is rt's image bound there
-//! (rt's `new_heap_texture`, which places textures in Private heaps alone: a Shared heap's
-//! texture is rt's refusal, counted). Each takes the heap's storage, CPU cache and hazard tracking
-//! modes and answers them; a heap's buffer answers `NonVolatile` to every purgeable state.
+//! **What is placed in it.** A buffer is the heap's range at its offset (rt's `new_heap_buffer`,
+//! its bytes as they are, as Metal's heap buffers are); a texture is rt's image bound there (rt's
+//! `new_heap_texture`, which places textures in Private heaps alone: a Shared heap's texture is
+//! rt's refusal, counted). Each takes the heap's storage, CPU cache and hazard tracking modes and
+//! answers them; a heap's buffer answers `NonVolatile` to every purgeable state.
+//!
+//! **Hazards.** A heap's buffers and textures are one resource to rt's compute encoders' hazard
+//! sets, the heap, whatever bytes each reaches: Metal tracks a heap's resources as one ("tracking
+//! is done at the granularity of the heap", `MTLHeap.h`), so within a command buffer a write
+//! through one orders every later use of another.
 //!
 //! **Answers.** A heap's resource options are the asked ones without bits 20 and 24 (bit 24
 //! counted, `rt-no-copy-read-only`), a heap's default hazard tracking resolved to untracked, as
@@ -257,6 +262,15 @@ fn heap(
 }
 
 impl RtObj<RtHeap> {
+    /// Its range of its block, which rt's heap resources are placed in and tracked by.
+    fn range(&self) -> rt::HeapRange {
+        rt::HeapRange {
+            block: self.block.id,
+            offset: self.offset,
+            len: self.size,
+        }
+    }
+
     /// Why Metal answers nil for a resource of `length` bytes (`None`: unknown, a texture's) at
     /// `offset` in the heap, whose own options are `asked`; `None` where it places one there.
     fn misplaced(&self, asked: Option<u64>, offset: u64, length: Option<u64>) -> Option<String> {
@@ -281,8 +295,8 @@ impl Heap<RtPlatform> for RtObj<RtHeap> {
         self.block.gpu_address + self.offset
     }
 
-    /// rt's buffer of the heap's range at `offset`, its bytes as they are, answering the heap's
-    /// options (the module's docs). Nil where Metal or rt refuses it, counted.
+    /// rt's buffer of the heap's range at `offset`, its bytes as they are, tracked as the heap and
+    /// answering the heap's options (the module's docs). Nil where Metal or rt refuses it, counted.
     fn new_buffer_of_length(
         &self,
         length: u64,
@@ -306,8 +320,7 @@ impl Heap<RtPlatform> for RtObj<RtHeap> {
         if length > rt::MAX_BUFFER_LENGTH {
             return Ok(refused_metal(SEL, &format!("a buffer of {length} bytes")));
         }
-        let at = self.offset + offset;
-        let made = match (self.device.rt()).new_buffer(self.block.id, at, length, None) {
+        let made = match (self.device.rt()).new_heap_buffer(self.range(), offset, length) {
             Ok(made) => made,
             Err(error) => {
                 rt_refused_create(SEL, &error);
@@ -332,11 +345,7 @@ impl Heap<RtPlatform> for RtObj<RtHeap> {
         if let Some(why) = self.misplaced(desc.resource_options, offset, None) {
             return Ok(refused_metal(SEL, &why));
         }
-        let range = rt::HeapRange {
-            block: self.block.id,
-            offset: self.offset,
-            len: self.size,
-        };
+        let range = self.range();
         let over = |d: &rt::TextureDescriptor, index: Option<u32>| {
             (self.device.rt()).new_heap_texture(d, index, range, offset)
         };

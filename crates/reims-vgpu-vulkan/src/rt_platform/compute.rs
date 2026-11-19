@@ -373,7 +373,7 @@ mod tests {
     use crate::core::num::ToU64 as _;
     use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
     use crate::core::platform::device::GpuDevice as _;
-    use crate::core::platform::resource::{Buffer as _, Library as _};
+    use crate::core::platform::resource::{Buffer as _, Heap as _, Library as _};
     use crate::core::platform::types::{CommandBufferStatus, MtlOrigin, MtlRegion};
     use crate::core::platform::values::{
         ComputePassDesc, HeapDesc, OptionSet, SamplerDesc, TextureDesc,
@@ -732,5 +732,63 @@ mod tests {
         assert!(matches!(made.compute_encoder_for_pass(&unknown), Ok(None)));
         assert_eq!(counted(metal), before + 2);
         drop(made);
+    }
+
+    /// A placement heap's buffers are one resource to a serial encoder's hazards, as Metal tracks a
+    /// heap's resources as one: a dispatch that reads one of its buffers after a dispatch wrote
+    /// another, at other bytes, waits for it behind a barrier, where two buffers of no heap take
+    /// none.
+    #[test]
+    fn a_heap_s_buffers_are_one_resource_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let buffer = || {
+            let made = device.new_buffer_of_length(on, 16, 0);
+            made.expect("never a raise").expect("a buffer")
+        };
+        let library = device.new_library(ADD).expect("never a raise");
+        let library = library.expect("a metallib").expect("a library");
+        let function = library.new_function(on, "add_one").expect("never a raise");
+        let function = function.expect("a function of the table");
+        let add = device.new_compute_pipeline_state_for_function(Some(&function));
+        let add = add.expect("a compute state").expect("a compute state");
+        // Tracked, so that Metal itself orders the heap's buffers.
+        let heap = device.new_heap(&HeapDesc {
+            size: 0x10000,
+            heap_type: 1,
+            options: vec![OptionSet::ResourceOptions(0x200)],
+            pinned_gpu_address: None,
+        });
+        let heap = heap.expect("never a raise").heap.expect("a placement heap");
+        let placed = |offset| {
+            let made = heap.new_buffer_of_length(16, 0, offset);
+            made.expect("never a raise").expect("a buffer in the heap")
+        };
+        let input = buffer();
+        let barriers = || crate::rt_platform::device::metrics().expect("rt's metrics").barriers;
+        // The barriers of one encoder that writes `written`, then reads `read` into a buffer of
+        // its own.
+        let barriers_between = |written: &RtObj<RtBuffer>, read: &RtObj<RtBuffer>| {
+            let out = buffer();
+            let before = barriers();
+            let status = run(
+                &queue,
+                None,
+                vec![
+                    ComputeCmd::SetComputePipelineState { state: Some(&add) },
+                    bind(&[Some(written), Some(&input)]),
+                    threads(4),
+                    bind(&[Some(&out), Some(read)]),
+                    threads(4),
+                ],
+            );
+            assert_eq!(status, CommandBufferStatus::COMPLETED);
+            barriers() - before
+        };
+        let apart = barriers_between(&buffer(), &buffer());
+        let in_heap = barriers_between(&placed(0), &placed(0x100));
+        assert_eq!(in_heap, apart + 1);
     }
 }
