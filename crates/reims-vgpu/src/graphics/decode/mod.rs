@@ -1061,6 +1061,10 @@ pub struct GraphicsDecoder<P: Platform> {
     /// far ([`Self::reconcile_laid`]).
     laid_uses: RefCell<Vec<LaidUse>>,
     laid_written: RefCell<Vec<u64>>,
+    /// In the per-shape form, the shapes the command buffer's walk saw written so far, each by
+    /// its block and once, each held until the buffer's finish marks it dirty
+    /// ([`Self::note_shape`]).
+    shapes_written: RefCell<Vec<(u64, surface_cache::shapes::ShapeRef)>>,
     /// The encoder being walked is a blit encoder, which writes only the destinations its ops
     /// name ([`Self::texture_written`]), whatever its textures' usage.
     laid_blit: Cell<bool>,
@@ -1226,6 +1230,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             recent: Recent::new(),
             laid_uses: RefCell::new(Vec::new()),
             laid_written: RefCell::new(Vec::new()),
+            shapes_written: RefCell::new(Vec::new()),
             laid_blit: Cell::new(false),
         }
     }
@@ -6237,16 +6242,21 @@ macro_rules! resolvers {
 impl<P: Platform> GraphicsDecoder<P> {
     /// The texture `id` names; an exec fault when `id` is 0 or names no texture. A texture over
     /// a plane of a laid-out device cache, or over its wide home, is noted among the uses of the
-    /// encoder being walked ([`Self::note_laid`]).
+    /// encoder being walked ([`Self::note_laid`]), and a view of a shape's image that the use
+    /// may write among the shapes the walk saw written ([`Self::note_shape`]).
     pub(crate) fn require_texture(&self, id: u64) -> RaiseResult<&P::Texture> {
         match self.entry(id) {
             Some(Entry {
                 handle: ObjHandle::Texture(h),
                 laid_use,
+                shape,
                 ..
             }) => {
                 if let Some(used) = laid_use {
                     self.note_laid(*used, false);
+                }
+                if let Some(used) = shape {
+                    self.note_shape(used, false);
                 }
                 Ok(h)
             }
@@ -6268,10 +6278,33 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// The texture `id` names is a blit's destination or a render pass's attachment: noted as
-    /// written, whatever its usage ([`Self::note_laid`]). Nothing for 0.
+    /// written, whatever its usage ([`Self::note_laid`], [`Self::note_shape`]). Nothing for 0.
     pub(crate) fn texture_written(&self, id: u64) {
-        if let Some(used) = self.entry(id).and_then(|e| e.laid_use) {
+        let Some(entry) = self.entry(id) else {
+            return;
+        };
+        if let Some(used) = entry.laid_use {
             self.note_laid(used, true);
+        }
+        if let Some(used) = &entry.shape {
+            self.note_shape(used, true);
+        }
+    }
+
+    /// In the per-shape form, notes the use `used` of a view of a shape's image by the encoder
+    /// being walked where it may write the shape: `written` (a blit's destination, a render
+    /// pass's attachment) or, outside a blit encoder, where the texture's usage lets a shader
+    /// write it. The shape is held, once, until the command buffer's finish marks it dirty
+    /// ([`surface_cache::Caches::finish`]). In the default form the use's shape is the shadow's,
+    /// which holds no image: nothing is noted.
+    fn note_shape(&self, used: &surface_cache::shapes::ShapeUse, written: bool) {
+        if !(written || (used.writes && !self.laid_blit.get())) || !self.surface_caches.shaped() {
+            return;
+        }
+        let mut noted = self.shapes_written.borrow_mut();
+        let id = used.reference.id();
+        if !noted.iter().any(|(block, s)| *block == used.block && s.id() == id) {
+            noted.push((used.block, used.reference.clone_ref()));
         }
     }
 

@@ -1671,6 +1671,9 @@ enum Asked<P: Platform> {
         generation: u64,
         host: u64,
         filled: Arc<DeferredFill>,
+        /// Of the shapes alone ([`SurfaceCaches::fill_shapes`]): the generation and the host's
+        /// writes are those the cache holds when it is asked.
+        shapes: bool,
     },
     /// A copy out of the cache.
     Out(CopyOut<P>),
@@ -1678,12 +1681,16 @@ enum Asked<P: Platform> {
 
 /// The uses of a cache counted after a deferred copy was asked, while it waits: the queues whose
 /// command buffers used it, each with the end value of the latest; whether one that may write it
-/// was committed; and how many such were counted (the cache's [`ReadBack::writes`]).
+/// was committed; how many such were counted (the cache's [`ReadBack::writes`]); and the shapes
+/// they wrote.
 #[derive(Default)]
 struct Since {
     users: HashMap<u64, u64>,
     written: bool,
     writes: u32,
+    /// The shapes their walks saw written ([`SurfaceCaches::shapes_written`]), marked dirty once
+    /// the copy is made.
+    dirty: Vec<u64>,
 }
 
 /// What a use's [`RGFX_SURFACE_USE_REFILL`] asks of its block's cache
@@ -1831,7 +1838,7 @@ impl<P: Platform> SurfaceCaches<P> {
         self.recoveries = now;
         self.unlocked.recoveries.store(now, Ordering::Release);
         // Each shape's image lost what it held: it is filled from its buffer again, by the fill
-        // below where the buffer is, else before what reads it next ([`Self::owed_shapes_in`]).
+        // below where the buffer is, else before what uses it next ([`Self::fill_shapes`]).
         for shape in self.by_block.values_mut().flat_map(|c| c.shapes.iter_mut()) {
             shape.owed = true;
             shape.dirty = false;
@@ -2491,7 +2498,7 @@ impl<P: Platform> SurfaceCaches<P> {
             return Some(reference);
         }
         let (reference, _) = cache.shadow.insert(*key, (), false, self.shape_clock);
-        drop(cache.shadow.sweep());
+        drop(cache.shadow.sweep(&mut ShapeCounts::default()));
         self.note_shape_bound();
         Some(reference)
     }
@@ -2619,11 +2626,20 @@ impl<P: Platform> SurfaceCaches<P> {
     /// Whether a use or a present of the block at `block` at CPU generation `generation` needs
     /// a fill of its cache first: the cache holds, or will hold once the fills asked of it are
     /// made ([`Self::will_hold`]), an older generation than that, or none, or a device of the
-    /// host wrote its pages since. False for a block with no cache.
+    /// host wrote its pages since; or one of its shapes ([`Self::owes_shape_fill`]). False for a
+    /// block with no cache.
     fn needs_fill_at(&self, block: u64, generation: u64) -> bool {
         self.will_hold(block).is_some_and(|(held, host)| {
             held.is_none_or(|held| generation > held) || self.watched.writes(block) > host
-        })
+        }) || self.owes_shape_fill(block)
+    }
+
+    /// Whether a shape of the block at `block`'s cache owes a fill from the buffer that no fill
+    /// asked and not made will make ([`shapes::Shape::owed`]): a fill of the cache refills every
+    /// shape, and one of the shapes fills those that owe one as it is made.
+    fn owes_shape_fill(&self, block: u64) -> bool {
+        (self.by_block.get(&block)).is_some_and(|cache| cache.shapes.owes())
+            && self.last_deferred_fill(block).is_none()
     }
 
     /// Whether the use `u` needs a fill of its block's cache first: [`Self::needs_fill_at`] of its
@@ -2688,6 +2704,7 @@ impl<P: Platform> SurfaceCaches<P> {
         if refill == Refill::Kept {
             self.counts.refills_kept += 1;
         }
+        let waits = self.pending(block, false) > 0 || self.deferring(block);
         let mut filled = Ok(());
         if older || host_wrote || refill == Refill::Fill {
             if !older && host_wrote {
@@ -2695,18 +2712,23 @@ impl<P: Platform> SurfaceCaches<P> {
             } else if !older {
                 self.counts.refills += 1;
             }
-            if self.pending(block, false) > 0 || self.deferring(block) {
+            if waits {
                 self.defer_fill(device, block, u.cpu_gen);
             } else {
                 filled = self.fill(device, block, u.cpu_gen).map(|_| ());
+            }
+        } else if self.owes_shape_fill(block) {
+            if waits {
+                self.defer_shapes_fill(device, block);
+            } else {
+                filled = self.fill_shapes(device, block).map(|_| ());
             }
         }
         let count = self.hold(block, u.flags & RGFX_SURFACE_USE_WRITES != 0);
         self.touch_shapes(block);
         let follows = filled
             .and_then(|()| self.follow(cb, count))
-            .and_then(|follows| self.home_in(cb, block).map(|()| follows))
-            .and_then(|follows| self.owed_shapes_in(cb, block).map(|()| follows));
+            .and_then(|follows| self.home_in(cb, block).map(|()| follows));
         (Some(count), follows)
     }
 
@@ -2785,23 +2807,27 @@ impl<P: Platform> SurfaceCaches<P> {
             if let Some(home) = (self.by_block.get_mut(block)).and_then(|c| c.wide.as_mut()) {
                 home.stale = true;
             }
+            if (self.by_block.get(block)).is_some_and(|c| c.shapes.iter().next().is_some()) {
+                self.counts.shapes.unseen += 1;
+            }
         }
     }
 
-    /// The block at `block`'s shapes that owe a fill ([`shapes::Shape::owed`]) take the buffer's bytes
-    /// first in command buffer `cb`, after what `cb` waits for ([`shapes`]).
-    fn owed_shapes_in(&mut self, cb: &P::CommandBuffer, block: u64) -> RaiseResult<()> {
-        let Some(cache) = self.by_block.get_mut(&block) else {
-            return Ok(());
-        };
-        let (buffer, table) = (&cache.device, &mut cache.shapes);
-        shapes::fill::<P>(
-            cb,
-            buffer,
-            table,
-            |shape| shape.owed,
-            &mut self.counts.shapes,
-        )
+    /// The command buffer whose counts among the caches' users are `counts` wrote the shapes
+    /// `written` its walk saw, each by its block: each is dirty from now, or, where the buffer was
+    /// counted after a deferred copy of the cache was asked, once that copy is made ([`Since`]),
+    /// as the buffer's write follows it. A shape of a block it named no use of is dirty from now.
+    /// The cache is written as a shape is, whatever its use named, so a download copies it out.
+    fn shapes_written(&mut self, counts: &[Count], written: &[(u64, shapes::ShapeRef)]) {
+        for (block, shape) in written {
+            let number = counts.iter().find(|c| c.block == *block).map(|c| c.number);
+            if let Some(since) = number.and_then(|number| self.since_mut(*block, number)) {
+                since.dirty.push(shape.id());
+                since.written = true;
+            } else if let Some(cache) = self.by_block.get_mut(block) {
+                cache.written |= cache.shapes.mark_dirty(shape.id());
+            }
+        }
     }
 
     /// The shape `key` of the block at `block`'s cache, where the cache holds it: a reference to
@@ -2819,7 +2845,7 @@ impl<P: Platform> SurfaceCaches<P> {
 
     /// Adds the shape `key` of the block at `block`'s cache, its image `image` made with the lock
     /// let go of, where the cache holds no such shape yet: it owes its fill from the buffer, made
-    /// in the next command buffer that uses the block ([`Self::owed_shapes_in`]). Then the
+    /// before the next command buffer that uses the block runs ([`Self::fill_shapes`]). Then the
     /// shapes past the bound and the caches' budget go ([`Self::sweep_shapes`]). A reference to
     /// the shape and its image, `None` where the block has no cache; and what goes, `image`
     /// among it where the cache held the shape already, for the caller to let go of with the
@@ -2855,10 +2881,12 @@ impl<P: Platform> SurfaceCaches<P> {
     /// The shapes that go: the block at `block`'s unreferenced ones past the bound
     /// ([`ShapeTable::sweep`]), then, past the caches' budget, the unreferenced ones of any block
     /// least recently used first, until the caches hold no more than the budget or no
-    /// unreferenced shape is left. Their images, for the caller to let go of with the lock let go
-    /// of.
+    /// unreferenced shape is left. A dirty one stays until a copy out of its cache writes it back
+    /// (rule 3). Their images, for the caller to let go of with the lock let go of.
     fn sweep_shapes(&mut self, block: u64) -> Vec<P::Texture> {
-        let mut gone = (self.by_block.get_mut(&block)).map_or_else(Vec::new, |c| c.shapes.sweep());
+        let counts = &mut self.counts.shapes;
+        let mut gone =
+            (self.by_block.get_mut(&block)).map_or_else(Vec::new, |c| c.shapes.sweep(counts));
         while let Some(budget) = self.cache_budget
             && self.cache_bytes > budget
         {
@@ -3094,7 +3122,8 @@ impl<P: Platform> SurfaceCaches<P> {
         let host_writes = self.watched.try_writes(block)?;
         let fills = held.is_none_or(|held| u.cpu_gen > held)
             || host_writes > host
-            || self.refill(u) == Refill::Fill;
+            || self.refill(u) == Refill::Fill
+            || self.owes_shape_fill(block);
         let writes = u.flags & RGFX_SURFACE_USE_WRITES != 0;
         let follows = (self.deferred.get(&block))
             .is_some_and(|q| writes || q.iter().any(|d| matches!(d.copy, Asked::Fill { .. })));
@@ -3231,10 +3260,30 @@ impl<P: Platform> SurfaceCaches<P> {
             generation,
             host: self.watched.writes(block),
             filled: Arc::clone(&filled),
+            shapes: false,
         };
         self.defer(device, block, false, fill);
         self.owes_none(block);
         self.counts.fills_deferred += 1;
+        filled
+    }
+
+    /// Asks a fill of the block at `block`'s shapes that owe one ([`Self::fill_shapes`]) of
+    /// command buffers begun and not finished that use it, or behind a copy of it that waits for
+    /// such, as [`Self::defer_fill`] asks one of the cache: made in the finish of the last of
+    /// them, once their walks marked the shapes they wrote dirty, and waited for on the GPU by
+    /// the uses counted after it. What it made, once it is.
+    fn defer_shapes_fill(&mut self, device: &P::Device, block: u64) -> Arc<DeferredFill> {
+        let (held, host) = self.will_hold(block).unwrap_or((None, 0));
+        let filled = DeferredFill::new();
+        let fill = Asked::Fill {
+            generation: held.unwrap_or(0),
+            host,
+            filled: Arc::clone(&filled),
+            shapes: true,
+        };
+        self.defer(device, block, false, fill);
+        self.counts.shapes.fills_deferred += 1;
         filled
     }
 
@@ -3301,9 +3350,15 @@ impl<P: Platform> SurfaceCaches<P> {
         match copy {
             Asked::Out(op) => op(self),
             Asked::Fill {
-                generation, filled, ..
+                generation,
+                filled,
+                shapes,
+                ..
             } => {
-                let made = match refusing(|| self.fill(&device, block, generation)) {
+                let made = match refusing(|| match shapes {
+                    true => self.fill_shapes(&device, block),
+                    false => self.fill(&device, block, generation),
+                }) {
                     Ok(made) => made,
                     Err(raise) => {
                         log::warn!(
@@ -3330,6 +3385,9 @@ impl<P: Platform> SurfaceCaches<P> {
             cache.written |= since.written;
             let read_back = &mut cache.read_back;
             read_back.writes = read_back.writes.saturating_add(since.writes);
+            for id in since.dirty {
+                cache.shapes.mark_dirty(id);
+            }
         }
         if let Some((event, number)) = self.signal_with.take() {
             self.signal_alone(&device, block, &event, number);
@@ -3567,6 +3625,9 @@ impl<P: Platform> SurfaceCaches<P> {
             if let Some((writer, end)) = after {
                 cb.encode_wait(Some(EventRef::Event(writer)), end)?;
             }
+            // The dirty shapes first, the writer's (rule 3); made clean once the copy is
+            // committed, so one not committed leaves them dirty.
+            let back = shapes::write_back::<P>(&cb, &cache.device, &cache.shapes, |s| s.dirty)?;
             let Some(blit) = cb.blit_encoder(ON)? else {
                 continue;
             };
@@ -3605,6 +3666,7 @@ impl<P: Platform> SurfaceCaches<P> {
             }
             if let Some(cache) = self.by_block.get_mut(&block) {
                 cache.written = false;
+                cache.shapes.written_back(&back, &mut self.counts.shapes);
                 cache.users.insert(signals, next);
                 let read_back = &mut cache.read_back;
                 read_back.writes = 0;
@@ -3701,13 +3763,65 @@ impl<P: Platform> SurfaceCaches<P> {
         Ok(Some(value))
     }
 
+    /// Fills the block at `block`'s shapes that owe a fill from its cache's buffer on the transfer
+    /// queue, after every command buffer that used the cache before, each dirty shape copied into
+    /// the buffer first, so the new ones take its writes (rule 2; the module doc of `shapes`);
+    /// signalled as [`Self::fill`] signals, so the uses counted after it wait for it on the GPU
+    /// ([`Self::wait_last_fill`]). The transfer event's value at which it is done; `None` where it
+    /// made none.
+    fn fill_shapes(&mut self, device: &P::Device, block: u64) -> RaiseResult<Option<u64>> {
+        self.touch_shapes(block);
+        if !self.make_transfer(device)? {
+            return Ok(None);
+        }
+        let signal =
+            (self.signal_with.as_ref()).map(|(event, number)| (event.clone_ref(), *number));
+        let (Some(transfer), Some(cache)) = (self.transfer.as_mut(), self.by_block.get_mut(&block))
+        else {
+            return Ok(None);
+        };
+        let Some(cb) = transfer.queue.command_buffer(ON)? else {
+            return Ok(None);
+        };
+        wait_before::<P>(&cb, signal.as_ref())?;
+        wait_for_users::<P>(&cb, &self.ends, cache)?;
+        let (buffer, table) = (&cache.device, &mut cache.shapes);
+        let back = shapes::write_back::<P>(&cb, buffer, table, |s| s.dirty && !s.owed)?;
+        shapes::fill::<P>(&cb, buffer, table, |s| s.owed, &mut self.counts.shapes)?;
+        transfer.signalled += 1;
+        let value = transfer.signalled;
+        cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
+        signal_after::<P>(&cb, signal.as_ref())?;
+        let fills = Arc::clone(&transfer.fills);
+        let gpu = Arc::clone(&self.copy_gpu);
+        cb.add_completion_seen_handler(
+            ON,
+            Box::new(move |info: CompletedInfo| {
+                CopyGpu::add(&gpu.fills, info.gpu_times_ns);
+                fills.finished(value)
+            }),
+        )?;
+        cb.commit(ON)?;
+        if signal.is_some() {
+            self.signal_with = None;
+        }
+        if let Some(cache) = self.by_block.get_mut(&block) {
+            cache.filled_at = value;
+            cache.users.clear();
+            cache.shapes.written_back(&back, &mut self.counts.shapes);
+        }
+        self.counts.shapes.fills_made += 1;
+        Ok(Some(value))
+    }
+
     /// Fills the cache of the block at `block` where it holds, or will hold once the fills asked
     /// of it are made, an older generation than `generation`, or a device of the host wrote its
     /// pages since ([`Self::needs_fill_at`]): a present of the surface shows the pages as of that
-    /// generation. Filled at once where no command buffer begun and not finished uses the cache
-    /// and no copy of it waits, else in the finish of the last of them ([`Self::defer_fill`]).
-    /// The wait for the cache's last fill, which the present makes in the present queue; `None`
-    /// where nothing was filled.
+    /// generation; else its shapes that owe a fill, the present's texture's among them
+    /// ([`Self::fill_shapes`]). Filled at once where no command buffer begun and not finished uses
+    /// the cache and no copy of it waits, else in the finish of the last of them
+    /// ([`Self::defer_fill`], [`Self::defer_shapes_fill`]). The wait for the cache's last fill,
+    /// which the present makes in the present queue; `None` where nothing was filled.
     fn fill_now(
         &mut self,
         device: &P::Device,
@@ -3719,13 +3833,23 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         let older = held.is_none_or(|held| generation > held);
         let host_wrote = self.watched.writes(block) > host;
+        let waits = self.pending(block, false) > 0 || self.deferring(block);
         if !older && !host_wrote {
-            return Ok(None);
+            // A shape that owes its fill, the present's texture's among them, takes it.
+            if !self.owes_shape_fill(block) {
+                return Ok(None);
+            }
+            if waits {
+                let filled = self.defer_shapes_fill(device, block);
+                return Ok(Some(FillWait::Deferred(filled)));
+            }
+            self.fill_shapes(device, block)?;
+            return Ok(self.last_fill(block));
         }
         if !older {
             self.counts.host_writes += 1;
         }
-        if self.pending(block, false) > 0 || self.deferring(block) {
+        if waits {
             let filled = self.defer_fill(device, block, generation);
             return Ok(Some(FillWait::Deferred(filled)));
         }
@@ -4022,6 +4146,8 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         wait_before::<P>(&cb, signal.as_ref())?;
         let users = wait_for_users::<P>(&cb, &self.ends, cache)?;
+        // The dirty shapes go into the buffer first, which takes them on to the pages (rule 3).
+        let back = shapes::write_back::<P>(&cb, &cache.device, &cache.shapes, |s| s.dirty)?;
         let staged = copy::<P>(device, &cb, cache, Way::Out, block, &mut self.counts)?;
         signal_after::<P>(&cb, signal.as_ref())?;
         // The buffers live until the copy is done, past the cache's own end at a release.
@@ -4080,6 +4206,7 @@ impl<P: Platform> SurfaceCaches<P> {
         if let Some(cache) = self.by_block.get_mut(&block) {
             cache.written = false;
             cache.users.clear();
+            cache.shapes.written_back(&back, &mut self.counts.shapes);
             // A home over the pages takes the cache's texels with them.
             if let Some(home) = cache.wide.as_mut().filter(|home| home.pages) {
                 home.stale = false;
@@ -4577,9 +4704,13 @@ pub(crate) struct Uses<P: Platform> {
     /// The deferred copies it waits for on the GPU, each by block and number.
     follows: Vec<(u64, u64)>,
     /// The blocks its walk saw written through textures over a laid-out cache or its wide home
-    /// ([`Self::saw_written`]); a use that may write another block's cache wrote it unseen
+    /// ([`Self::saw_written`]), or through a shape's views ([`Self::saw_shapes_written`]); a use
+    /// that may write another block's cache wrote it unseen
     /// ([`SurfaceCaches::unseen_writes`]).
     seen: Vec<u64>,
+    /// The shapes its walk saw written, each by its block, held until its finish marks them
+    /// dirty ([`SurfaceCaches::shapes_written`]): a shape held so stays past the bound.
+    shapes: Vec<(u64, shapes::ShapeRef)>,
 }
 
 impl<P: Platform> Uses<P> {
@@ -4587,6 +4718,18 @@ impl<P: Platform> Uses<P> {
     /// their wide homes, and copied each write into the other side ([`Caches::reconcile`]).
     pub(crate) fn saw_written(&mut self, blocks: impl IntoIterator<Item = u64>) {
         self.seen.extend(blocks);
+    }
+
+    /// The command buffer's walk saw the shapes `written` written, each by its block, through
+    /// views of their images ([`shapes`]).
+    pub(crate) fn saw_shapes_written(
+        &mut self,
+        written: impl IntoIterator<Item = (u64, shapes::ShapeRef)>,
+    ) {
+        for (block, shape) in written {
+            self.seen.push(block);
+            self.shapes.push((block, shape));
+        }
     }
 }
 
@@ -5080,6 +5223,7 @@ impl<P: Platform> Caches<P> {
             blocks: Vec::new(),
             follows: Vec::new(),
             seen: Vec::new(),
+            shapes: Vec::new(),
         };
         let mut waits = reached;
         let mut raised = None;
@@ -5198,6 +5342,7 @@ impl<P: Platform> Caches<P> {
                 .map(|c| c.block)
                 .collect();
             state.unseen_writes(&unseen);
+            state.shapes_written(&uses.blocks, &uses.shapes);
             state.after(device, queue, cb, &uses.blocks)
         };
         let done = signalled.and_then(|()| commit());
@@ -6325,7 +6470,7 @@ pub(super) mod tests {
     const WAIT: &str = "encodeWaitForEvent:value:";
     const SIGNAL: &str = "encodeSignalEvent:value:";
     /// A command buffer's begin that reaches nothing beyond the uses it names.
-    const NO_REACH: Reach = Reach {
+    pub(crate) const NO_REACH: Reach = Reach {
         context: None,
         work: false,
         decoded: Vec::new(),
@@ -8279,7 +8424,7 @@ pub(super) mod tests {
     }
 
     /// A use of `block` at generation `cpu_gen` that only reads it.
-    fn reading(block_offset: u64, cpu_gen: u64) -> [RgfxOpSurfaceUse; 1] {
+    pub(crate) fn reading(block_offset: u64, cpu_gen: u64) -> [RgfxOpSurfaceUse; 1] {
         [RgfxOpSurfaceUse {
             block_offset,
             cpu_gen,
@@ -10944,7 +11089,7 @@ pub(super) mod tests {
 
     /// Command buffer `cb_obj_id` on queue 1 that uses [`BLOCK`] at generation 0, writing where
     /// `writes`, and holds one blit encoder of `op`'s.
-    fn blit_with(r: &mut Rig, cb_obj_id: u64, writes: bool, op: (u16, Vec<u8>)) {
+    pub(crate) fn blit_with(r: &mut Rig, cb_obj_id: u64, writes: bool, op: (u16, Vec<u8>)) {
         use reims_vgpu_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END};
         use zerocopy::FromBytes as _;
         let op_of = |tag: u16, body: &[u8]| {
@@ -11586,7 +11731,7 @@ pub(super) mod tests {
     }
 
     /// `SURFACE_DOWNLOAD` of the block at `block`, and whether it was answered.
-    fn download(r: &Rig, block: u64) -> Arc<AtomicBool> {
+    pub(crate) fn download(r: &Rig, block: u64) -> Arc<AtomicBool> {
         let done = Arc::new(AtomicBool::new(false));
         let set = Arc::clone(&done);
         r.dec.surface_download(
@@ -11599,7 +11744,7 @@ pub(super) mod tests {
     }
 
     /// `BLOCK_RELEASE` of the block at `block`, and whether it was answered.
-    fn release(r: &Rig, block: u64) -> Arc<AtomicBool> {
+    pub(crate) fn release(r: &Rig, block: u64) -> Arc<AtomicBool> {
         let done = Arc::new(AtomicBool::new(false));
         let set = Arc::clone(&done);
         r.dec.block_released(

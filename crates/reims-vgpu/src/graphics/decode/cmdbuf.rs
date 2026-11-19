@@ -166,6 +166,7 @@ use super::lane::{Lane, Turn};
 use super::sequencer::Ticket;
 use super::shares::FanOut;
 use super::split::{Estimate, PACE_WAIT_MOST, Parts, Progress, QueueRate, SplitHold};
+use super::surface_cache::shapes::ShapeRef;
 use super::surface_cache::{Reach, Uses};
 use super::surface_order::{Marks, Signalled};
 use super::tables::{FOUND_A_HOLD, QueueCounts};
@@ -740,6 +741,8 @@ struct Walked<P: Platform> {
     /// The blocks the walk saw written through textures over laid-out device caches or their
     /// wide homes ([`GraphicsDecoder::reconcile_laid`]).
     written: Vec<u64>,
+    /// The shapes the walk saw written ([`GraphicsDecoder::note_shape`]).
+    shapes: Vec<(u64, ShapeRef)>,
     /// From the hand-over to its walk's start.
     began: Duration,
     /// Its walk.
@@ -2116,6 +2119,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             // through textures over laid-out caches or their wide homes told first.
             Some(mut uses) => {
                 uses.saw_written(self.laid_written.borrow_mut().drain(..));
+                uses.saw_shapes_written(self.shapes_written.borrow_mut().drain(..));
                 self.surface_caches.finish(
                     device,
                     queue_obj_id,
@@ -2692,6 +2696,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.find_named(ops);
         self.laid_uses.borrow_mut().clear();
         self.laid_written.borrow_mut().clear();
+        self.shapes_written.borrow_mut().clear();
     }
 
     /// [`Self::walk_ops`]' walk of `ops`, the whole of a command buffer's op stream or a range
@@ -2897,6 +2902,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 cb: None,
                 outcome,
                 written: std::mem::take(&mut *self.laid_written.borrow_mut()),
+                shapes: std::mem::take(&mut *self.shapes_written.borrow_mut()),
                 began: began.saturating_duration_since(deal.handed),
                 walk,
             };
@@ -2946,6 +2952,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 cb: Some((cb, Some(place))),
                 outcome,
                 written: std::mem::take(&mut *self.laid_written.borrow_mut()),
+                shapes: std::mem::take(&mut *self.shapes_written.borrow_mut()),
                 began: began.saturating_duration_since(handed),
                 walk: clock.now_mono().saturating_duration_since(began),
             };
@@ -3026,6 +3033,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 cb: walked_into,
                 outcome,
                 written,
+                shapes,
                 began,
                 walk,
             } = chunk;
@@ -3034,6 +3042,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             deal.next = j + 1;
             self.laid_written.borrow_mut().extend(written);
+            self.shapes_written.borrow_mut().extend(shapes);
             // cbdeal: queue, seqno, the chunk, 1 where the helper walked it (else 0), its op
             // bytes, the hand to its walk's start, its walk, this thread's wait for it, and the
             // hand to now, each in ns

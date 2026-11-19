@@ -206,13 +206,21 @@ mod tests {
     use reims_vgpu_vulkan::core::testkit::FakePlatform;
     use reims_vgpu_vulkan::core::testkit::calllog::{Arg, Call};
 
+    use reims_vgpu_graphics::ops::{RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
+    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+    use reims_vgpu_vulkan::core::raise::OnFault;
+    use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
+
     use super::super::surface_cache::tests::{
-        cache_id, cached, copies, queues, surface_texture, surface_texture_as, surface_textures,
-        use_surfaces,
+        NO_REACH, blit_with, cache_id, cached, copies, download, queues, reading, release,
+        surface_texture, surface_texture_as, surface_textures, use_surfaces,
     };
     use super::super::surface_pages::tests::{BLOCK, Rig, one_plane, rig};
     use super::*;
     use crate::platform::ApiPlatform as _;
+
+    const ON: OnFault = OnFault::Return;
 
     /// A shape's image (`ApiPlatform::own_texture`).
     const IMAGE: &str = "newTextureWithDescriptor:";
@@ -221,6 +229,11 @@ mod tests {
     /// A shape's fill from its cache's buffer ([`shapes::fill`]).
     const FILL: &str = "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:\
                         sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:";
+
+    /// A shape written back into its cache's buffer ([`shapes::write_back`]).
+    const TO_BUFFER: &str = "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:\
+                             toBuffer:destinationOffset:destinationBytesPerRow:\
+                             destinationBytesPerImage:";
 
     /// The rig's decoder takes the per-shape form, each image the platform's own texture.
     fn take_shapes(r: &Rig) {
@@ -252,6 +265,55 @@ mod tests {
     fn texture(r: &mut Rig, obj_id: u64, format: u32, size: (u32, u32)) {
         let message = surface_texture(obj_id, 10, format, size);
         assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+    }
+
+    /// [`texture`], and the image of its shape, which its view is of.
+    fn texture_image(r: &mut Rig, obj_id: u64, format: u32, size: (u32, u32)) -> u64 {
+        let mark = r.p.call_log().mark();
+        texture(r, obj_id, format, size);
+        views(&r.p.call_log().since(mark))[0].0
+    }
+
+    /// Command buffer `cb_obj_id` on queue 1, naming [`BLOCK`] written, that writes texture
+    /// `obj_id` of `size` by a blit from buffer 10.
+    fn write(r: &mut Rig, cb_obj_id: u64, obj_id: u64, size: (u32, u32)) {
+        use reims_vgpu_graphics::ops::blit::{
+            RGFX_OP_BLIT_COPY_BUFFER_TO_TEXTURE, RgfxBlitOpCopyBufferToTexture,
+        };
+        use zerocopy::IntoBytes as _;
+        let (width, height) = (u64::from(size.0), u64::from(size.1));
+        let m = RgfxBlitOpCopyBufferToTexture {
+            source_buffer_obj_id: 10,
+            destination_texture_obj_id: obj_id,
+            source_bytes_per_row: width * 4,
+            source_bytes_per_image: width * height * 4,
+            source_size_width: width,
+            source_size_height: height,
+            source_size_depth: 1,
+            ..RgfxBlitOpCopyBufferToTexture::default()
+        };
+        let op = (RGFX_OP_BLIT_COPY_BUFFER_TO_TEXTURE, m.as_bytes().to_vec());
+        blit_with(r, cb_obj_id, true, op);
+    }
+
+    /// The (image, buffer, offset) of each shape written back in `calls`.
+    fn written_back(calls: &[Call]) -> Vec<(u64, u64, u64)> {
+        let id = |a: &Arg| a.as_obj().map_or(0, |o| o.0);
+        (calls.iter())
+            .filter(|c| c.sel == TO_BUFFER)
+            .map(|c| {
+                (
+                    id(&c.args[0]),
+                    id(&c.args[5]),
+                    c.args[6].as_u64().unwrap_or(0),
+                )
+            })
+            .collect()
+    }
+
+    /// Where the first call to `sel` is in `calls`.
+    fn first(calls: &[Call], sel: &str) -> usize {
+        calls.iter().position(|c| c.sel == sel).unwrap()
     }
 
     /// The guest destroys object `obj_id`.
@@ -443,6 +505,157 @@ mod tests {
         assert_eq!(counts.dropped, 2, "the referenced one kept");
         assert_eq!(counts.dropped_bytes, (1 + 2) * 8 * 4);
         assert!(r.dec.entry(20).unwrap().shape.is_some());
+    }
+
+    /// A shape a command buffer writes is dirty from its finish: a download copies it into the
+    /// cache's buffer, at its place there, before it copies the buffer into the pages (rule 3),
+    /// and once: the next download, nothing written since, writes nothing back. A release after
+    /// another write writes it back again before its copy
+    #[test]
+    fn a_download_or_release_writes_a_dirty_shape_back_before_its_copy() {
+        let mut r = shaped();
+        let cache = cache_id(&r);
+        let image = texture_image(&mut r, 21, 80, (32, 8));
+        write(&mut r, 0x100, 21, (32, 8));
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(written_back(&calls), [(image, cache, 0)]);
+        let back = first(&calls, TO_BUFFER);
+        assert!(copies(&calls[..back]).is_empty(), "written back first");
+        assert_eq!(copies(&calls[back..]).len(), 1, "then the buffer into the pages");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.written_back, counts.written_back_bytes), (1, 32 * 8 * 4));
+
+        let mark = r.p.call_log().mark();
+        let again = download(&r, BLOCK);
+        let calls = r.p.call_log().since(mark);
+        assert!(written_back(&calls).is_empty(), "clean");
+        assert!(copies(&calls).is_empty(), "nothing written");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(again.load(Ordering::SeqCst));
+
+        write(&mut r, 0x101, 21, (32, 8));
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let released = release(&r, BLOCK);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(written_back(&calls), [(image, cache, 0)]);
+        let back = first(&calls, TO_BUFFER);
+        assert!(copies(&calls[..back]).is_empty(), "written back first");
+        assert_eq!(copies(&calls[back..]).len(), 1);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(released.load(Ordering::SeqCst));
+        assert_eq!(r.dec.caches().counts().shapes.written_back, 2);
+    }
+
+    /// A new shape is filled from the buffer after the dirty shapes are written back into it, in
+    /// one command buffer of the transfer queue, so it takes their writes (rule 2), with no copy
+    /// from the pages; the shape written back is clean, so a download then copies the buffer,
+    /// the write in it, into the pages alone
+    #[test]
+    fn a_new_shape_takes_a_dirty_shapes_writes() {
+        let mut r = shaped();
+        let cache = cache_id(&r);
+        let written = texture_image(&mut r, 21, 80, (32, 8));
+        write(&mut r, 0x100, 21, (32, 8));
+        r.p.world().complete_all(CompleteOn::Caller);
+        let new = texture_image(&mut r, 22, 80, (16, 4));
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, false)]);
+        let calls = r.p.call_log().since(mark);
+        assert!(copies(&calls).is_empty(), "no copy from the pages");
+        assert_eq!(written_back(&calls), [(written, cache, 0)]);
+        assert_eq!(fills(&calls), [(cache, 0, new)]);
+        assert!(first(&calls, TO_BUFFER) < first(&calls, FILL), "written back first");
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.fills_made, counts.written_back), (1, 1));
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        let calls = r.p.call_log().since(mark);
+        assert!(written_back(&calls).is_empty(), "clean");
+        assert_eq!(copies(&calls).len(), 1, "the buffer into the pages");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+    }
+
+    /// A new shape's fill asked while a command buffer that uses the cache is begun and not
+    /// finished is made at that buffer's finish, behind it, and writes back what it wrote first
+    /// (rule 2), a reader asked meanwhile waiting for it on the GPU. A writer counted after the
+    /// fill was asked, whose write follows the fill on the GPU, leaves its shape dirty past the
+    /// fill, though it finished first: a download writes it back
+    #[test]
+    fn a_shapes_fill_behind_a_writer_takes_its_write_alone() {
+        let mut r = shaped();
+        let cache = cache_id(&r);
+        let written = texture_image(&mut r, 21, 80, (32, 8));
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let writes = [RgfxOpSurfaceUse {
+            flags: RGFX_SURFACE_USE_WRITES,
+            ..reading(BLOCK, 0)[0]
+        }];
+        let shape = |r: &Rig| {
+            let entry = r.dec.entry(21).unwrap();
+            (BLOCK, entry.shape.as_ref().unwrap().reference.clone_ref())
+        };
+        let (queue, other) = (
+            r.device.new_command_queue().unwrap(),
+            r.device.new_command_queue().unwrap(),
+        );
+        let writer = queue.command_buffer(ON).unwrap().unwrap();
+        let (_, writer_uses) = (r.dec.surface_caches)
+            .before(&r.device, &writer, &writes, &NO_REACH)
+            .unwrap();
+        let mut writer_uses = writer_uses.unwrap();
+        writer_uses.saw_shapes_written([shape(&r)]);
+
+        let new = texture_image(&mut r, 22, 80, (16, 4));
+        let mark = r.p.call_log().mark();
+        let reader = queue.command_buffer(ON).unwrap().unwrap();
+        let (waits, reader_uses) = (r.dec.surface_caches)
+            .before(&r.device, &reader, &reading(BLOCK, 0), &NO_REACH)
+            .unwrap();
+        assert!(waits, "the reader waits for the fill on the GPU");
+        let calls = r.p.call_log().since(mark);
+        assert!(written_back(&calls).is_empty() && fills(&calls).is_empty(), "deferred");
+        assert_eq!(r.dec.caches().counts().shapes.fills_deferred, 1);
+
+        let later = other.command_buffer(ON).unwrap().unwrap();
+        let (_, later_uses) = (r.dec.surface_caches)
+            .before(&r.device, &later, &writes, &NO_REACH)
+            .unwrap();
+        let mut later_uses = later_uses.unwrap();
+        later_uses.saw_shapes_written([shape(&r)]);
+        (r.dec.surface_caches)
+            .finish(&r.device, 2, None, &later, later_uses, || later.commit(ON))
+            .unwrap();
+        let mark = r.p.call_log().mark();
+        (r.dec.surface_caches)
+            .finish(&r.device, 1, None, &writer, writer_uses, || writer.commit(ON))
+            .unwrap();
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(written_back(&calls), [(written, cache, 0)], "the first's write");
+        assert_eq!(fills(&calls), [(cache, 0, new)]);
+        assert!(first(&calls, TO_BUFFER) < first(&calls, FILL), "written back first");
+        drop(reader_uses);
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(written_back(&calls), [(written, cache, 0)], "the later's write");
+        assert_eq!(copies(&calls).len(), 1);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+        let counts = r.dec.caches().counts().shapes;
+        let made = (counts.fills_deferred, counts.fills_made, counts.written_back);
+        assert_eq!(made, (1, 1, 2));
     }
 
     /// In the per-shape form every surface takes a device cache: a block that asks whether it

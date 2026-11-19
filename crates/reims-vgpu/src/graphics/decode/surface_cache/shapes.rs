@@ -21,15 +21,33 @@
 //! - a new shape takes the buffer's bytes before anything reads it, once the dirty shapes are
 //!   copied into the buffer (rule 2);
 //! - a shape is dirty once written since it was last copied into the buffer, and a copy of the
-//!   buffer into the pages first copies every dirty shape's whole extent into the buffer, as does
-//!   a dirty shape's drop (rule 3; dirty shapes agree where they overlap, so their order is free);
+//!   buffer into the pages first copies every dirty shape's whole extent into the buffer; a dirty
+//!   shape is not dropped until such a copy (rule 3; dirty shapes agree where they overlap, so
+//!   their order is free);
 //! - a write through one shape is copied, at the end of the encoder that wrote it, into each
 //!   other shape of the plane that a live guest texture references, and the unreferenced shapes it
 //!   overlaps are dropped (rule 1).
 //!
-//! A fill of the buffer from the pages (a newer CPU generation, a recovery, a block named again)
-//! refills every shape from the buffer, and the CPU's bytes win over the GPU's unwritten-back
-//! ones, as they win over the buffer's.
+//! **Dirty.** A command buffer's walk notes each shape a use may write: a blit's destination, a
+//! render pass's attachment, and, outside a blit encoder, a texture whose usage lets a shader
+//! write it. It holds each, so the bound keeps it, until the buffer's finish marks it dirty; where
+//! the buffer was counted behind a deferred copy of the cache, once that copy is made, as the
+//! buffer's write follows it (`SurfaceCaches::shapes_written`). Every copy of the buffer into the
+//! pages (a download, a release, a block named again, an early copy) copies the dirty shapes into
+//! the buffer first, in its own command buffer, after the same command buffers; they are clean
+//! once it is committed ([`write_back`], [`ShapeTable::written_back`]). A write the walk does not
+//! see (through an argument buffer with no use named, or a video op's) is no shape's: counted
+//! ([`ShapeCounts::unseen`]), and no shape is marked for it.
+//!
+//! **Fills.** A new shape owes its fill from the buffer. The first use of the surface, or present
+//! of it, that finds a shape owing one makes a fill of the shapes alone on the transfer queue,
+//! after the command buffers that used the cache, which copies the dirty shapes into the buffer
+//! and then the buffer into the shapes that owe it (`SurfaceCaches::fill_shapes`). Behind command
+//! buffers not finished it is asked of them as a fill of the cache is, and made in the last one's
+//! finish, once their walks' shapes are marked; the uses counted after it wait for it on the GPU
+//! either way. A fill of the buffer from the pages (a newer CPU generation, a recovery, a block
+//! named again) refills every shape from the buffer, and the CPU's bytes win over the GPU's
+//! unwritten-back ones, as they win over the buffer's.
 //!
 //! **References.** Each guest texture over a shape, and each guest view of one, holds a
 //! [`ShapeRef`] in its decoder entry; the count of those is the shape's reference count, so every
@@ -183,13 +201,28 @@ pub(crate) struct ShapeCounts {
     /// Shapes whose image the platform did not make, and views of one it did not make.
     pub(crate) images_refused: u64,
     pub(crate) views_refused: u64,
-    /// Shapes filled from the buffer, and the bytes: owed ones at a command buffer's begin, and
+    /// Shapes filled from the buffer, and the bytes: owed ones in a fill of the shapes alone, and
     /// all of an entry's at a fill of its buffer.
     pub(crate) fills: u64,
     pub(crate) filled_bytes: u64,
+    /// Fills of the shapes alone, made on the transfer queue
+    /// (`SurfaceCaches::fill_shapes`), and of those, ones asked behind command buffers not
+    /// finished.
+    pub(crate) fills_made: u64,
+    pub(crate) fills_deferred: u64,
     /// Unreferenced shapes dropped, past the bound or the caches' budget.
     pub(crate) dropped: u64,
     pub(crate) dropped_bytes: u64,
+    /// Dirty unreferenced shapes the bound kept past it, at each sweep, until a copy out of the
+    /// cache writes them back ([`ShapeTable::sweep`]).
+    pub(crate) kept_dirty: u64,
+    /// Dirty shapes copied into their cache's buffer, and their bytes ([`write_back`]).
+    pub(crate) written_back: u64,
+    pub(crate) written_back_bytes: u64,
+    /// Command buffers' uses that may write a cache with shapes and wrote none of them that the
+    /// walk saw (through an argument buffer with no use named, or a video op): the write is not
+    /// known to be any shape's, and no shape is marked dirty for it.
+    pub(crate) unseen: u64,
     /// Caches made past the caches' budget, which the per-shape form keeps all the same.
     pub(crate) past_budget: u64,
     /// Uncached blocks refused, the per-shape form taking none (`rt-surface-uncached-copied`).
@@ -308,6 +341,28 @@ impl<T> ShapeTable<T> {
         }
     }
 
+    /// Whether a shape owes a fill from the buffer ([`Shape::owed`]).
+    pub(crate) fn owes(&self) -> bool {
+        self.shapes.iter().any(|s| s.owed)
+    }
+
+    /// The shape `id` was written: dirty until it is copied into the buffer (rule 3). Whether the
+    /// table holds it.
+    pub(crate) fn mark_dirty(&mut self, id: u64) -> bool {
+        let shape = self.shapes.iter_mut().find(|s| s.id() == id);
+        shape.map(|s| s.dirty = true).is_some()
+    }
+
+    /// The shapes `ids` were copied into the buffer ([`write_back`]), by a command buffer now
+    /// committed: they hold no write the buffer lacks; counted in `counts`.
+    pub(crate) fn written_back(&mut self, ids: &[u64], counts: &mut ShapeCounts) {
+        for shape in (self.shapes.iter_mut()).filter(|s| s.dirty && ids.contains(&s.id())) {
+            shape.dirty = false;
+            counts.written_back += 1;
+            counts.written_back_bytes += shape.bytes;
+        }
+    }
+
     /// The shapes.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Shape<T>> {
         self.shapes.iter()
@@ -319,26 +374,31 @@ impl<T> ShapeTable<T> {
     }
 
     /// The unreferenced shapes past the bound, taken out: all but the [`UNREFERENCED_KEPT`] most
-    /// recently used. The caller writes a dirty one back before it lets go of it (rule 3).
-    pub(crate) fn sweep(&mut self) -> Vec<Shape<T>> {
-        let mut unreferenced: Vec<(u64, u64)> = (self.shapes.iter())
+    /// recently used, and of those a dirty one is kept until a copy out of the cache writes it
+    /// back (rule 3), counted in `counts`.
+    pub(crate) fn sweep(&mut self, counts: &mut ShapeCounts) -> Vec<Shape<T>> {
+        let mut unreferenced: Vec<(u64, u64, bool)> = (self.shapes.iter())
             .filter(|s| !s.referenced())
-            .map(|s| (s.used, s.id()))
+            .map(|s| (s.used, s.id(), s.dirty))
             .collect();
         if unreferenced.len() <= UNREFERENCED_KEPT {
             return Vec::new();
         }
         unreferenced.sort_unstable();
-        let past = unreferenced.len() - UNREFERENCED_KEPT;
-        let going: Vec<u64> = unreferenced[..past].iter().map(|&(_, id)| id).collect();
+        let past = &unreferenced[..unreferenced.len() - UNREFERENCED_KEPT];
+        counts.kept_dirty += past.iter().filter(|&&(_, _, dirty)| dirty).count() as u64;
+        let going: Vec<u64> = (past.iter())
+            .filter(|&&(_, _, dirty)| !dirty)
+            .map(|&(_, id, _)| id)
+            .collect();
         self.take(|s| going.contains(&s.id()))
     }
 
-    /// The least recently used unreferenced shape, with its clock, where one is held: the next
-    /// the budget trims ([`Self::take_id`]).
+    /// The least recently used unreferenced shape that is not dirty, with its clock, where one is
+    /// held: the next the budget trims ([`Self::take_id`]).
     pub(crate) fn oldest_unreferenced(&self) -> Option<(u64, u64)> {
         (self.shapes.iter())
-            .filter(|s| !s.referenced())
+            .filter(|s| !s.referenced() && !s.dirty)
             .map(|s| (s.used, s.id()))
             .min()
     }
@@ -405,6 +465,47 @@ pub(crate) fn fill<P: Platform>(
     }
     blit.encode(ON, BlitCmd::EndEncoding)?;
     Ok(())
+}
+
+/// Encodes in `cb`, in a blit encoder of its own, a copy of each shape of `table` that `pick`
+/// picks into `buffer`, a cache's, its whole extent at its place ([`ShapeKey::span`]): the ids of
+/// the shapes copied, for [`ShapeTable::written_back`] once `cb` is committed. Shapes agree where
+/// they overlap (rule 1), so their order is free. None where it picks none, or the platform made
+/// no encoder.
+pub(crate) fn write_back<P: Platform>(
+    cb: &P::CommandBuffer,
+    buffer: &P::Buffer,
+    table: &ShapeTable<P::Texture>,
+    pick: impl Fn(&Shape<P::Texture>) -> bool,
+) -> RaiseResult<Vec<u64>> {
+    const ON: OnFault = OnFault::Return;
+    if !table.iter().any(&pick) {
+        return Ok(Vec::new());
+    }
+    let Some(blit) = cb.blit_encoder(ON)? else {
+        return Ok(Vec::new());
+    };
+    let mut ids = Vec::new();
+    for shape in table.iter().filter(|s| pick(s)) {
+        let key = shape.key;
+        blit.encode(
+            ON,
+            BlitCmd::CopyTextureToBuffer {
+                source_texture: &shape.image,
+                source_slice: 0,
+                source_level: 0,
+                source_origin: MtlOrigin::default(),
+                source_size: MtlSize::new(key.width, key.height, 1),
+                destination_buffer: buffer,
+                destination_offset: key.offset,
+                destination_bytes_per_row: key.bytes_per_row,
+                destination_bytes_per_image: key.bytes_per_row.saturating_mul(key.height),
+            },
+        )?;
+        ids.push(shape.id());
+    }
+    blit.encode(ON, BlitCmd::EndEncoding)?;
+    Ok(ids)
 }
 
 #[cfg(test)]
@@ -496,12 +597,12 @@ mod tests {
             drop(table.insert(key(10 + w, 4), w, false, w));
         }
         assert_eq!(table.iter().count(), 9);
-        let gone = table.sweep();
+        let gone = table.sweep(&mut ShapeCounts::default());
         let mut gone: Vec<u64> = gone.iter().map(|s| s.image).collect();
         gone.sort_unstable();
         assert_eq!(gone, vec![3, 4], "the two least recently used unreferenced");
         assert_eq!(table.iter().count(), 7);
-        assert!(table.sweep().is_empty(), "within the bound");
+        assert!(table.sweep(&mut ShapeCounts::default()).is_empty(), "within the bound");
         let (_, again) = table.insert(key(13, 4), 3, true, 20);
         assert!(again, "made again after its drop");
         let (_, again) = table.insert(key(50, 4), 50, true, 21);
@@ -523,7 +624,9 @@ mod tests {
         drop(held);
         assert!(!table.any_referenced());
         drop(table.insert(key(15, 4), 15, false, 31));
-        let gone: Vec<u64> = table.sweep().iter().map(|s| s.image).collect();
+        let gone: Vec<u64> = (table.sweep(&mut ShapeCounts::default()).iter())
+            .map(|s| s.image)
+            .collect();
         assert_eq!(
             gone,
             vec![11],
@@ -550,6 +653,33 @@ mod tests {
         assert!(table.oldest_unreferenced().is_none());
         assert_eq!(table.iter().count(), 1);
         drop(kept);
+    }
+
+    /// A dirty shape is kept past the bound and the budget, counted, until it is written back
+    /// (rule 3); then the next sweep lets it go. Only the shapes written back are made clean.
+    #[test]
+    fn a_dirty_shape_stays_until_it_is_written_back() {
+        let mut table = ShapeTable::<u64>::default();
+        let ids: Vec<u64> = (0..6)
+            .map(|w| {
+                let (reference, _) = table.insert(key(10 + w, 4), w, false, w);
+                reference.id()
+            })
+            .collect();
+        assert!(table.mark_dirty(ids[0]));
+        assert!(table.mark_dirty(ids[2]));
+        assert!(!table.mark_dirty(u64::MAX), "not the table's");
+        let mut counts = ShapeCounts::default();
+        let gone: Vec<u64> = table.sweep(&mut counts).iter().map(|s| s.image).collect();
+        assert_eq!(gone, vec![1], "the oldest clean one");
+        assert_eq!(counts.kept_dirty, 1);
+        assert_eq!(table.oldest_unreferenced().map(|(used, _)| used), Some(3));
+        table.written_back(&[ids[0], ids[3]], &mut counts);
+        assert_eq!((counts.written_back, counts.written_back_bytes), (1, 10 * 64 * 4));
+        assert!(table.iter().any(|s| s.dirty), "the one not written back");
+        let gone: Vec<u64> = table.sweep(&mut counts).iter().map(|s| s.image).collect();
+        assert_eq!(gone, vec![0]);
+        assert_eq!(counts.kept_dirty, 1);
     }
 
     /// On the Vulkan platform, shapes over one cache's buffer, of three formats, sizes and places,
