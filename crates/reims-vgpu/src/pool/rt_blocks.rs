@@ -10,11 +10,10 @@
 //! allocation it was taken from. A later take may land there, under a new number: rt numbers
 //! each take anew.
 //!
-//! A block's bytes are what rt makes them: undefined past its zero mark (rt's
-//! `BlockInfo::zeroed`), which the pool's [`BlockInfo`] does not carry, and nothing here zeroes
-//! them. rt maps and unmaps whole allocations through the `BlockMappings` hook its device was
-//! made with (`DeviceOptions::block_mappings`), not through the pool: `map` before any block of
-//! an allocation goes out, `unmap` before the allocation is freed.
+//! A block's bytes are undefined, new or taken again: rt zeroes nothing ahead of need, and
+//! nothing here zeroes them. rt maps and unmaps whole allocations through the `BlockMappings`
+//! hook its device was made with (`DeviceOptions::block_mappings`), not through the pool: `map`
+//! before any block of an allocation goes out, `unmap` before the allocation is freed.
 
 use std::collections::HashMap;
 
