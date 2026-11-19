@@ -353,6 +353,13 @@ pub trait CommandBuffer<P: Platform>: Handle {
         let _ = joins;
         false
     }
+    /// The platform's own, no Metal call, before the commit: the command buffer ends with
+    /// Metal's `MTLCommandBufferErrorOutOfMemory` (8) in `MTLCommandBufferErrorDomain`, its status
+    /// an error, whatever its work does, unless it ends with an error of its own: a command of it
+    /// named a buffer made deferred whose memory the platform refused at that use
+    /// ([`Buffer::make_memory`](super::resource::Buffer::make_memory)), and was dropped. Nothing
+    /// by default, for a platform that defers no buffer's memory.
+    fn fail_out_of_memory(&self) {}
     /// The platform's own, no Metal call: asked before the commit, the buffer's completion is
     /// exported as a sync file once it is committed ([`Self::export_completion_sync_file`]).
     /// `false` where the platform exports none, the default: the caller waits for the buffer on

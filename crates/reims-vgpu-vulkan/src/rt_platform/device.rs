@@ -711,6 +711,19 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         recorded_answer
     }
 
+    /// [`new_buffer_of_length`](GpuDevice::new_buffer_of_length)'s, a Private one's memory made
+    /// at its first use ([`buffer::deferred_of_length`]).
+    fn new_deferred_buffer_of_length(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+    ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+        let _ = on;
+        let sel = "newBufferWithLength:options:";
+        Ok(buffer::deferred_of_length(self, sel, length, options))
+    }
+
     /// A buffer of zeros of its own exported block, whose memory CUDA imports as an opaque fd
     /// (`super::export`); `None` where rt makes none, counted, and the caller makes the buffer as
     /// any other.

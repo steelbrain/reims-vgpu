@@ -17,6 +17,10 @@ use crate::core::platform::{HostRange, Platform};
 use crate::core::raise::{OnFault, RaiseResult};
 use crate::core::testkit::script::Policy;
 
+/// The name the fake logs and scripts [`Buffer::make_memory`] of a deferred buffer whose memory
+/// is not made under: no selector of Metal's names it.
+pub const MAKE_MEMORY: &str = "makeMemory (deferred buffer)";
+
 impl Fk<kind::Buffer> {
     /// `f` of the buffer's model; the default of `T` for a buffer a test made with no model.
     fn buffer<T: Default>(&self, f: impl FnOnce(&super::super::objects::BufferModel) -> T) -> T {
@@ -126,6 +130,24 @@ impl Buffer<FakePlatform> for Fk<kind::Buffer> {
 
     fn length(&self) -> u64 {
         self.buffer(|m| m.length)
+    }
+
+    /// A deferred buffer whose memory is not made logs [`MAKE_MEMORY`] and answers its scripted
+    /// value, else `true`, its memory then made; any other answers `true`, unlogged.
+    fn make_memory(&self, _made_for: MemoryFor) -> bool {
+        if self.buffer(|m| m.deferred) != Some(false) {
+            return true;
+        }
+        let made = self.get_logged(MAKE_MEMORY, vec![], || true);
+        if made && let Model::Buffer(m) = &mut self.state().model {
+            m.deferred = Some(true);
+        }
+        made
+    }
+
+    /// `false` for a deferred buffer whose memory is not made ([`Self::make_memory`]).
+    fn memory_made(&self) -> bool {
+        self.buffer(|m| m.deferred) != Some(false)
     }
 
     fn new_linear_texture(

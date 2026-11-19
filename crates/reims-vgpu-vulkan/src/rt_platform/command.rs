@@ -32,6 +32,10 @@
 //!   buffers were committed and not complete then, the one failing among them ([`DeviceLoss`]).
 //!   Each command buffer that fails with the device lost is counted, `rt-device-lost`, in the
 //!   process's degradation counts (docs/conventions.md).
+//!   One its caller failed for a deferred buffer's memory rt refused
+//!   (`CommandBuffer::fail_out_of_memory`, `super::buffer`'s "Deferred memory") ends with
+//!   `OutOfMemory` (8) where rt gave it no error of its own: its status, once rt's is completed,
+//!   is an error, and its error, then, that one.
 //! - **Encoders**: blit encoders ([`super::blit`]), compute encoders ([`super::compute`]), of
 //!   the serial dispatch type or the descriptor's (another value is Metal's refusal, nil), and
 //!   render encoders ([`super::render`]) of the pass the descriptor keeps
@@ -104,6 +108,9 @@ const ERROR_TIMEOUT: i64 = 2;
 /// The degradation code of a command buffer that fails with its device lost (the module's docs,
 /// "A lost device's line").
 const DEVICE_LOST: &str = "rt-device-lost";
+
+/// `MTLCommandBufferErrorOutOfMemory`.
+const ERROR_OUT_OF_MEMORY: i64 = 8;
 
 /// A handler as rt runs it.
 type Handler = Box<dyn FnOnce(&rt::CommandBuffer) + Send>;
@@ -356,10 +363,28 @@ impl RtCommandBuffer {
 /// while rt keeps its own state. The commit hands them to a completed handler, which drops them
 /// after core's; a command buffer never committed drops them with itself.
 /// It holds too its uses of textures over an imported block, for the boot diagnostics
-/// (`super::diag`), which its commit counts, and the tiled textures it used whose bytes its commit
-/// takes (`super::tiled`).
+/// (`super::diag`), which its commit counts, the tiled textures it used whose bytes its commit
+/// takes (`super::tiled`), and whether its caller failed it for a deferred buffer's memory
+/// ([`Failed`]).
 #[derive(Clone, Default)]
-pub struct Kept(Arc<Mutex<HashMap<ObjId, Box<dyn Send>>>>, Uses, Takes);
+pub struct Kept(
+    Arc<Mutex<HashMap<ObjId, Box<dyn Send>>>>,
+    Uses,
+    Takes,
+    Failed,
+);
+
+/// Whether a command buffer's caller failed it for a deferred buffer's memory rt refused
+/// (`CommandBuffer::fail_out_of_memory`; the module's docs, "What a completed handler learns").
+#[derive(Clone, Default)]
+struct Failed(Arc<AtomicBool>);
+
+impl Failed {
+    /// Whether the command buffer was failed so.
+    fn holds(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
 
 impl Kept {
     /// Its uses of textures over an imported block (`super::diag`).
@@ -440,17 +465,17 @@ fn scheduled(block: ScheduledHandler) -> Handler {
 }
 
 /// rt's handler that runs core's completed or completion-seen handler `block` with what the
-/// command buffer answers then ([`completed_info`]), its error `failure`'s. Added inside a refusal
-/// scope (the graphics lane's), the read and `block` run in one on rt's thread too
-/// ([`run_completed`]).
-fn completed(block: CompletedHandler, failure: Arc<Failure>) -> Handler {
+/// command buffer answers then ([`completed_info`]), its error `failure`'s, failed as `failed`
+/// says. Added inside a refusal scope (the graphics lane's), the read and `block` run in one on
+/// rt's thread too ([`run_completed`]).
+fn completed(block: CompletedHandler, failure: Arc<Failure>, failed: Failed) -> Handler {
     #[cfg(test)]
     let slot = crate::core::testkit::capture::current_slot();
     let carried = refusals::carry();
     Box::new(move |made: &rt::CommandBuffer| {
         // A callout on rt's thread: marked ours, so a panic here aborts.
         let _env = BlockEnv::foreign();
-        let run = || run_completed(carried, || completed_info(made, &failure), block);
+        let run = || run_completed(carried, || completed_info(made, &failure, &failed), block);
         #[cfg(test)]
         crate::core::testkit::capture::with_slot(slot, run);
         #[cfg(not(test))]
@@ -458,14 +483,39 @@ fn completed(block: CompletedHandler, failure: Arc<Failure>) -> Handler {
     })
 }
 
-/// What a completed handler learns of `made`, its error `failure`'s (the module's docs).
-fn completed_info(made: &rt::CommandBuffer, failure: &Failure) -> CompletedInfo {
+/// What a completed handler learns of `made`, its error `failure`'s, failed as `failed` says (the
+/// module's docs).
+fn completed_info(made: &rt::CommandBuffer, failure: &Failure, failed: &Failed) -> CompletedInfo {
     let (start, end) = (made.gpu_start_time(), made.gpu_end_time());
     CompletedInfo {
-        status: status(made.status()),
-        error: failure.read(made.error()),
+        status: status_of(made, failed),
+        error: error_of(made, failure, failed),
         gpu_times_ns: (start != 0 && end >= start).then_some((start, end)),
     }
+}
+
+/// `made`'s status as Metal's, an error once completed where `failed` holds (the module's docs,
+/// "What a completed handler learns").
+fn status_of(made: &rt::CommandBuffer, failed: &Failed) -> CommandBufferStatus {
+    match made.status() {
+        rt::CommandBufferStatus::Completed if failed.holds() => CommandBufferStatus::ERROR,
+        other => status(other),
+    }
+}
+
+/// `made`'s error as Metal's: rt's, as `failure` answers it, else `OutOfMemory` once completed
+/// where `failed` holds (the module's docs, "What a completed handler learns").
+fn error_of(made: &rt::CommandBuffer, failure: &Failure, failed: &Failed) -> Option<NsErrorText> {
+    if let Some(error) = failure.read(made.error()) {
+        return Some(error);
+    }
+    let completed = matches!(made.status(), rt::CommandBufferStatus::Completed);
+    (completed && failed.holds()).then(|| NsErrorText {
+        domain: ERROR_DOMAIN.to_owned(),
+        code: ERROR_OUT_OF_MEMORY,
+        description: "a buffer the command buffer used was refused its memory at that use"
+            .to_owned(),
+    })
 }
 
 /// rt's status as Metal's raw `MTLCommandBufferStatus`.
@@ -521,7 +571,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     /// Held until the commit, behind the completion-seen handlers (the module's docs).
     fn add_completed_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
         let _ = on;
-        let handler = completed(block, Arc::clone(&self.failure));
+        let handler = completed(block, Arc::clone(&self.failure), self.kept.3.clone());
         self.hold("addCompletedHandler:", |h| &mut h.completed, handler);
         Ok(())
     }
@@ -546,7 +596,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     /// Run first of the completed handlers, on rt's completion thread.
     fn add_completion_seen_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
         let _ = on;
-        let handler = completed(block, Arc::clone(&self.failure));
+        let handler = completed(block, Arc::clone(&self.failure), self.kept.3.clone());
         self.hold("addCompletionSeenHandler", |h| &mut h.seen, handler);
         Ok(())
     }
@@ -739,9 +789,10 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         recorded_answer
     }
 
-    /// rt's error as Metal's, the one its completed handlers learn (the module's docs).
+    /// rt's error as Metal's, the one its completed handlers learn, or the caller's failure of it
+    /// (the module's docs).
     fn error(&self) -> Option<NsErrorText> {
-        self.failure.read(self.rt.error())
+        error_of(&self.rt, &self.failure, &self.kept.3)
     }
 
     /// rt's render encoder of the pass the descriptor keeps: nil where Metal refuses the pass (an
@@ -808,8 +859,15 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         recorded_answer
     }
 
+    /// rt's status as Metal's, or the caller's failure of it (the module's docs).
     fn status(&self) -> CommandBufferStatus {
-        status(self.rt.status())
+        status_of(&self.rt, &self.kept.3)
+    }
+
+    /// Ends the command buffer with `OutOfMemory` (the module's docs, "What a completed handler
+    /// learns").
+    fn fail_out_of_memory(&self) {
+        self.kept.3.0.store(true, Ordering::Release);
     }
 
     /// rt's wait; none, counted, where rt refuses it (in a scheduled handler, or on rt's
@@ -1036,6 +1094,46 @@ mod tests {
         );
         assert_eq!(counted(DEVICE_LOST), before + 2);
         assert_eq!(loss.open.load(Ordering::SeqCst), 0);
+    }
+
+    /// On the GPU the test holds: a command buffer its caller failed for a deferred buffer's
+    /// memory ends with Metal's `MTLCommandBufferErrorOutOfMemory` (8) once rt completes it, its
+    /// status an error, as its completed handlers are told; one not failed completes with none
+    #[test]
+    fn a_command_buffer_failed_out_of_memory_ends_with_metal_s_error_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        for failed in [false, true] {
+            let made = queue.command_buffer(on).expect("never a raise");
+            let made = made.expect("a command buffer");
+            let told = Arc::new(Mutex::new(None));
+            let tell = Arc::clone(&told);
+            let see: CompletedHandler = Box::new(move |info: CompletedInfo| {
+                *tell.lock() = Some((info.status, info.error));
+            });
+            assert_eq!(made.add_completed_handler(on, see), Ok(()));
+            if failed {
+                made.fail_out_of_memory();
+            }
+            assert_eq!(made.commit(on), Ok(()));
+            assert_eq!(made.wait_until_completed(on), Ok(()));
+            let (status, error) = match failed {
+                true => (
+                    CommandBufferStatus::ERROR,
+                    Some((ERROR_DOMAIN.to_owned(), ERROR_OUT_OF_MEMORY)),
+                ),
+                false => (CommandBufferStatus::COMPLETED, None),
+            };
+            let answered = |e: Option<NsErrorText>| e.map(|e| (e.domain, e.code));
+            assert_eq!(
+                (made.status(), answered(made.error())),
+                (status, error.clone())
+            );
+            let told = told.lock().take().expect("the completed handler ran");
+            assert_eq!((told.0, answered(told.1)), (status, error));
+        }
     }
 
     /// Command buffers on the GPU the test holds: handlers in core's order whatever the order

@@ -118,6 +118,23 @@ pub trait GpuDevice<P: Platform>: Handle {
     ) -> RaiseResult<Option<P::Buffer>> {
         self.new_buffer_of_length(on, length, options)
     }
+    /// No Metal counterpart: a Private buffer as [`new_buffer_of_length`](GpuDevice::new_buffer_of_length)'s,
+    /// the host's own, whose memory the platform may make only at its first use, as zeros
+    /// ([`Buffer::make_memory`](super::resource::Buffer::make_memory)): the graphics lane's
+    /// device caches in the per-shape form, whose bytes the guest's textures hold in images of
+    /// their own, so that a cache no copy reaches holds no memory of it (`decode::surface_cache`,
+    /// "Deferred memory"). Until then its length and options are its own, its contents NULL and
+    /// its GPU address 0; nothing the guest names lies at that address. The default makes the
+    /// buffer as `new_buffer_of_length` does. Reached both under a handler and with none: `on`
+    /// says which this call is.
+    fn new_deferred_buffer_of_length(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+    ) -> RaiseResult<Option<P::Buffer>> {
+        self.new_buffer_of_length(on, length, options)
+    }
     /// No Metal counterpart: a buffer as [`new_buffer_of_length`](GpuDevice::new_buffer_of_length)'s,
     /// in an allocation of its own whose memory another API imports
     /// ([`Buffer::export_memory`](super::resource::Buffer::export_memory)): the host's video

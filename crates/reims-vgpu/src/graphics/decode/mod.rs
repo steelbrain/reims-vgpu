@@ -1172,6 +1172,12 @@ pub struct GraphicsDecoder<P: Platform> {
     /// The blocks whose device caches' buffers the command buffer's walk named an object over
     /// itself so far, each once ([`Self::note_over_cache`]).
     over_caches: RefCell<Vec<u64>>,
+    /// Whether the platform refused a device cache's buffer its memory at a use the command
+    /// buffer's walk made so far ([`Self::require_buffer`], [`Self::reconcile_shapes`]; the
+    /// cache's module doc, "Deferred memory"): the op that used it is dropped, and the buffer
+    /// fails at its commit with `MTLCommandBufferErrorOutOfMemory`, as Metal's fails where a
+    /// resource it uses could not be made resident.
+    out_of_memory: Cell<bool>,
     /// In the per-shape form, the shapes the encoder being walked may write, each by its block
     /// and once, in the order the walk last noted them ([`Self::note_shape`]): at the encoder's
     /// end each other shape of their planes takes their write ([`Self::reconcile_shapes`]).
@@ -1352,6 +1358,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             laid_written: RefCell::new(Vec::new()),
             shapes_written: RefCell::new(Vec::new()),
             over_caches: RefCell::new(Vec::new()),
+            out_of_memory: Cell::new(false),
             encoder_shapes: RefCell::new(Vec::new()),
             slot_shapes: RefCell::new(Vec::new()),
             slot_pipeline: Cell::new(0),
@@ -6838,7 +6845,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// The buffer `id` names; an exec fault when `id` is 0 or names no buffer. One over a device
-    /// cache's buffer itself is noted ([`Self::note_over_cache`]).
+    /// cache's buffer itself is noted ([`Self::note_over_cache`]), and has its memory made, which
+    /// the cache's buffer gets at its first use (the cache's module doc, "Deferred memory"):
+    /// where the platform refuses it, the raise is [`refused::out_of_memory`]'s, which drops the
+    /// op, and the command buffer fails ([`Self::out_of_memory`]).
     pub(crate) fn require_buffer(&self, id: u64) -> RaiseResult<&P::Buffer> {
         match self.entry(id) {
             Some(
@@ -6848,6 +6858,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 },
             ) => {
                 self.note_over_cache(entry);
+                if entry.over_cache && !self.surface_caches.memory_of(h) {
+                    self.out_of_memory.set(true);
+                    return Err(refused::out_of_memory(id));
+                }
                 Ok(h)
             }
             Some(Entry {

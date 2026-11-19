@@ -1214,6 +1214,131 @@ mod tests {
         assert_eq!(r.dec.caches().counts().shapes.written_back, 1);
     }
 
+    /// A buffer-to-buffer copy (`copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:`).
+    const BUFFER_COPY: &str = "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:";
+
+    /// In the per-shape form a cache's buffer is made deferred, its memory made at the first use
+    /// that copies through it, once, before that copy: a texture over the cache, a view of its
+    /// shape's image, makes none; the first command buffer that names the buffer makes it, and
+    /// nothing after makes it again
+    #[test]
+    fn a_shaped_cache_s_buffer_holds_its_memory_from_its_first_copy() {
+        use reims_vgpu_vulkan::core::testkit::impls::command::FAIL_OUT_OF_MEMORY;
+        use reims_vgpu_vulkan::core::testkit::impls::device::DEFERRED_BUFFER;
+        use reims_vgpu_vulkan::core::testkit::impls::resource::MAKE_MEMORY;
+        let mut r = shaped();
+        let deferred = r.p.call_log().count(DEFERRED_BUFFER);
+        assert_eq!(deferred, 1, "the cache's buffer, deferred");
+        texture_image(&mut r, 21, 80, (32, 8));
+        assert_eq!(
+            r.p.call_log().count(MAKE_MEMORY),
+            0,
+            "no copy through it yet"
+        );
+
+        let mark = r.p.call_log().mark();
+        write(&mut r, 0x100, 21, (32, 8));
+        r.p.world().complete_all(CompleteOn::Caller);
+        let calls = r.p.call_log().since(mark);
+        let made = first(&calls, MAKE_MEMORY);
+        assert!(
+            !(calls[..made].iter()).any(|c| [BUFFER_COPY, FILL, TO_BUFFER].contains(&c.sel)),
+            "made before the first copy"
+        );
+        assert!(!calls.iter().any(|c| c.sel == FAIL_OUT_OF_MEMORY));
+        let downloaded = download(&r, BLOCK);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+        assert_eq!(r.p.call_log().count(MAKE_MEMORY), 1, "made once");
+    }
+
+    /// Where the platform refuses a shaped cache's buffer its memory, nothing is copied through
+    /// the buffer, and the command buffer whose begin's fill or whose op found it refused fails
+    /// with Metal's `MTLCommandBufferErrorOutOfMemory`, once, the op that names the buffer
+    /// dropped
+    #[test]
+    fn a_shaped_cache_s_refused_memory_fails_its_command_buffer_out_of_memory() {
+        use reims_vgpu_vulkan::core::testkit::impls::command::FAIL_OUT_OF_MEMORY;
+        use reims_vgpu_vulkan::core::testkit::impls::resource::MAKE_MEMORY;
+        let mut r = shaped();
+        let cache = cache_id(&r);
+        texture_image(&mut r, 21, 80, (32, 8));
+        r.p.script().always(MAKE_MEMORY, Step::value(false));
+        let mark = r.p.call_log().mark();
+        write(&mut r, 0x100, 21, (32, 8));
+        r.p.world().complete_all(CompleteOn::Caller);
+        let calls = r.p.call_log().since(mark);
+        assert!(calls.iter().any(|c| c.sel == MAKE_MEMORY), "asked");
+        assert_eq!(
+            calls.iter().filter(|c| c.sel == FAIL_OUT_OF_MEMORY).count(),
+            1
+        );
+        let id = |a: &Arg| a.as_obj().map_or(0, |o| o.0);
+        let through = |c: &&Call| {
+            [BUFFER_COPY, FILL, TO_BUFFER].contains(&c.sel) && c.args.iter().any(|a| id(a) == cache)
+        };
+        assert_eq!(
+            calls.iter().find(through),
+            None,
+            "nothing through the buffer"
+        );
+    }
+
+    /// Where the platform refuses a shaped cache's buffer its memory, a guest's command that names
+    /// the buffer (a blit's fill of buffer 10, over the cache) is dropped, and its command buffer
+    /// fails with Metal's `MTLCommandBufferErrorOutOfMemory`, once; a download of the cache then
+    /// copies nothing through the buffer and is done, as where the platform makes no command
+    /// buffer for it, and nothing ends the process
+    #[test]
+    fn a_refused_cache_buffer_drops_the_command_naming_it_and_copies_nothing() {
+        use reims_vgpu_graphics::ops::blit::{RGFX_OP_BLIT_FILL_BUFFER, RgfxBlitOpFillBuffer};
+        use reims_vgpu_vulkan::core::testkit::impls::command::FAIL_OUT_OF_MEMORY;
+        use reims_vgpu_vulkan::core::testkit::impls::resource::MAKE_MEMORY;
+        use zerocopy::IntoBytes as _;
+        let mut r = shaped();
+        let cache = cache_id(&r);
+        r.p.script().always(MAKE_MEMORY, Step::value(false));
+        let fill = RgfxBlitOpFillBuffer {
+            buffer_obj_id: 10,
+            range_location: 0,
+            range_length: 64,
+            value: 7,
+            ..RgfxBlitOpFillBuffer::default()
+        };
+        let mark = r.p.call_log().mark();
+        blit_with(
+            &mut r,
+            0x100,
+            true,
+            (RGFX_OP_BLIT_FILL_BUFFER, fill.as_bytes().to_vec()),
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let calls = r.p.call_log().since(mark);
+        assert!(calls.iter().any(|c| c.sel == MAKE_MEMORY), "asked");
+        let failed = calls.iter().filter(|c| c.sel == FAIL_OUT_OF_MEMORY).count();
+        assert_eq!(failed, 1);
+        assert!(
+            !calls.iter().any(|c| c.sel.starts_with("fillBuffer:")),
+            "dropped"
+        );
+
+        let id = |a: &Arg| a.as_obj().map_or(0, |o| o.0);
+        let through = |c: &&Call| {
+            [BUFFER_COPY, FILL, TO_BUFFER].contains(&c.sel) && c.args.iter().any(|a| id(a) == cache)
+        };
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst), "done");
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(
+            calls.iter().find(through),
+            None,
+            "nothing through the buffer"
+        );
+        assert!(!calls.iter().any(|c| c.sel == FAIL_OUT_OF_MEMORY));
+    }
+
     /// A new shape is filled from the buffer after the dirty shapes are written back into it, in
     /// one command buffer of the transfer queue, so it takes their writes (rule 2), with no copy
     /// from the pages; the shape written back is clean, so a download then copies the buffer,

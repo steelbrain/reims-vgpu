@@ -139,6 +139,47 @@ pub trait Buffer<P: Platform>: GpuResource<P> {
         let _ = (bytes, deallocator);
         Err("the platform rebinds no buffer".to_owned())
     }
+    /// No Metal counterpart: makes the memory of a buffer made deferred
+    /// ([`GpuDevice::new_deferred_buffer_of_length`](super::device::GpuDevice::new_deferred_buffer_of_length))
+    /// where it is not made yet, once, as zeros: whether the buffer holds its memory, `false`
+    /// where the platform refused it. The caller makes it so ahead of each use of the buffer that
+    /// can answer a refusal: a copy it does not make, a command that names the buffer dropped and
+    /// its command buffer failed ([`CommandBuffer::fail_out_of_memory`](super::command::CommandBuffer::fail_out_of_memory)).
+    /// `true` by default, for every buffer of a platform that defers none. `made_for` is the use
+    /// it is made for, which the platform's counts may name.
+    fn make_memory(&self, made_for: MemoryFor) -> bool {
+        let _ = made_for;
+        true
+    }
+    /// No Metal counterpart: whether the buffer holds its memory: any but one made deferred whose
+    /// memory is not made yet ([`Self::make_memory`]). `true` by default.
+    fn memory_made(&self) -> bool {
+        true
+    }
+}
+
+/// No Metal counterpart: the use a deferred buffer's memory is made ahead of
+/// ([`Buffer::make_memory`]), which the platform's counts may name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryFor {
+    /// A write one shape of a surface took, reconciled into the others through the buffer.
+    Reconcile,
+    /// An early copy of the buffer into a surface's pages, behind its writer.
+    EarlyCopy,
+    /// A fill of the buffer from a surface's pages.
+    Fill,
+    /// A fill of a surface's shapes from the buffer.
+    FillShapes,
+    /// A copy of the buffer into a surface's pages.
+    WriteBack,
+    /// A surface's download.
+    Download,
+    /// A surface's release.
+    Release,
+    /// A command of the guest's that names the buffer itself.
+    Command,
+    /// A texture made over the buffer's bytes.
+    Texture,
 }
 
 /// A buffer's memory, exported for another API to import: from [`Buffer::export_memory`], an

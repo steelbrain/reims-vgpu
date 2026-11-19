@@ -55,6 +55,10 @@ pub const DMA_BUF_BUFFER: &str = "newBufferWithLength:options: (dma-buf, padding
 /// selector of Metal's names it.
 pub const EXPORTABLE_BUFFER: &str = "newBufferWithLength:options: (exportable)";
 
+/// The name the fake logs and scripts [`GpuDevice::new_deferred_buffer_of_length`] under: no
+/// selector of Metal's names it.
+pub const DEFERRED_BUFFER: &str = "newBufferWithLength:options: (deferred)";
+
 /// The name the fake logs and scripts [`GpuDevice::new_scratch_buffer_of_length`] under: no
 /// selector of Metal's names it.
 pub const SCRATCH_BUFFER: &str = "newBufferWithLength:options: (scratch)";
@@ -198,6 +202,30 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                 Arg::U64(aligned_byte.unwrap_or(0)),
             ],
             |w| new_buffer(w, length, options, Backing::Fresh, None),
+        )
+    }
+
+    /// Logged and scripted under [`DEFERRED_BUFFER`], as no selector of Metal's names it; its
+    /// buffer is `newBufferWithLength:options:`'s, its memory not made until
+    /// [`Buffer::make_memory`](crate::core::platform::resource::Buffer::make_memory) makes it
+    /// ([`BufferModel::deferred`](crate::core::testkit::objects::BufferModel::deferred)).
+    fn new_deferred_buffer_of_length(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::Buffer>> {
+        self.make(
+            Policy::On(on),
+            DEFERRED_BUFFER,
+            vec![Arg::U64(length), Arg::U64(options)],
+            |w| {
+                let b = new_buffer(w, length, options, Backing::Fresh, None)?;
+                if let Model::Buffer(m) = &mut b.state().model {
+                    m.deferred = Some(false);
+                }
+                Some(b)
+            },
         )
     }
 

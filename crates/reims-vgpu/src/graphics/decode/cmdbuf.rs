@@ -748,6 +748,9 @@ struct Walked<P: Platform> {
     /// The blocks whose caches' buffers the walk named an object over
     /// ([`GraphicsDecoder::note_over_cache`]).
     over: Vec<u64>,
+    /// Whether the platform refused a cache's buffer its memory at a use the walk made
+    /// ([`GraphicsDecoder::out_of_memory`]).
+    out_of_memory: bool,
     /// From the hand-over to its walk's start.
     began: Duration,
     /// Its walk.
@@ -866,6 +869,10 @@ pub(crate) struct Begun<P: Platform> {
     in_flight: InFlight,
     /// Its count among the users of the device caches it uses, until its commit.
     uses: Option<Uses<P>>,
+    /// A fill of a device cache its begin made found the platform refused the cache's buffer its
+    /// memory: it fails with Metal's `MTLCommandBufferErrorOutOfMemory`
+    /// ([`GraphicsDecoder::out_of_memory`]).
+    out_of_memory: bool,
     /// It holds `SURFACE_ORDER`: it signals its queue's surface timeline as it ends.
     order: bool,
     /// Its queue's marks in the surface order.
@@ -1962,8 +1969,12 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
         };
         let answer = early.then_some(&mut answer as &mut dyn FnMut());
-        let (fill_waits, follows, uses) =
-            (self.surface_caches).before_answering(device, &cb, &take.uses, &reach, answer)?;
+        let super::surface_cache::Begin {
+            waits: fill_waits,
+            follows,
+            out_of_memory,
+            uses,
+        } = (self.surface_caches).before_answering(device, &cb, &take.uses, &reach, answer)?;
         // The buffers of other queues it runs after, on the GPU, kept for the work the host starts
         // off it (`surface_order`): those its op names, and the decodes completed ahead of their
         // ends whose outputs it uses, which the guest's slots no longer name.
@@ -2005,6 +2016,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             cb,
             in_flight,
             uses,
+            out_of_memory,
             order: take.order.is_some(),
             marks: Arc::clone(&counts.order),
             waits_for_order,
@@ -2057,6 +2069,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             cb,
             in_flight,
             uses,
+            out_of_memory,
             order,
             marks,
             waits_for_order,
@@ -2224,6 +2237,12 @@ impl<P: Platform> GraphicsDecoder<P> {
             Some(parts) => parts.merged(handler),
             None => handler,
         };
+        // A cache's buffer the platform refused its memory at a use the walk made, or at a fill
+        // its begin made, fails the buffer, its last part's error its own, as Metal's fails with
+        // `MTLCommandBufferErrorOutOfMemory` ([`GraphicsDecoder::out_of_memory`]).
+        if self.out_of_memory.take() | out_of_memory {
+            cb.fail_out_of_memory();
+        }
         let commit = || {
             if let Some(submission) = submission {
                 cb.add_submission_handler(ON, submission)?;
@@ -2919,6 +2938,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.laid_written.borrow_mut().clear();
         self.shapes_written.borrow_mut().clear();
         self.over_caches.borrow_mut().clear();
+        self.out_of_memory.set(false);
         self.encoder_shapes.borrow_mut().clear();
         self.slot_shapes.borrow_mut().clear();
         self.slot_pipeline.set(0);
@@ -3132,6 +3152,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 written: std::mem::take(&mut *self.laid_written.borrow_mut()),
                 shapes: std::mem::take(&mut *self.shapes_written.borrow_mut()),
                 over: std::mem::take(&mut *self.over_caches.borrow_mut()),
+                out_of_memory: self.out_of_memory.take(),
                 began: began.saturating_duration_since(deal.handed),
                 walk,
             };
@@ -3183,6 +3204,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 written: std::mem::take(&mut *self.laid_written.borrow_mut()),
                 shapes: std::mem::take(&mut *self.shapes_written.borrow_mut()),
                 over: std::mem::take(&mut *self.over_caches.borrow_mut()),
+                out_of_memory: self.out_of_memory.take(),
                 began: began.saturating_duration_since(handed),
                 walk: clock.now_mono().saturating_duration_since(began),
             };
@@ -3265,6 +3287,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 written,
                 shapes,
                 over,
+                out_of_memory,
                 began,
                 walk,
             } = chunk;
@@ -3272,6 +3295,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 return Ok(Err(e));
             }
             deal.next = j + 1;
+            if out_of_memory {
+                self.out_of_memory.set(true);
+            }
             self.laid_written.borrow_mut().extend(written);
             self.shapes_written.borrow_mut().extend(shapes);
             let mut noted = self.over_caches.borrow_mut();
@@ -3501,7 +3527,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         if written.is_empty() {
             return Ok(());
         }
-        self.surface_caches.reconcile_shapes(cb, &written)
+        if self.surface_caches.reconcile_shapes(cb, &written)? {
+            self.out_of_memory.set(true);
+        }
+        Ok(())
     }
 
     /// [`Self::walk_ops`]'s walk, `encoder` the one it holds open, `split` where it may commit

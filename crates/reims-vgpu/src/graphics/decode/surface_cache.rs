@@ -376,6 +376,29 @@
 //!   counted (`rt-downloads-cache-view-unwritten-kib`), and so are the downloads that moved
 //!   nothing (`rt-downloads-cache-view-unwritten`).
 //!
+//! - **Deferred memory.** In the per-shape form the guest's textures over a cache are views of its
+//!   shapes' images, so the cache's buffer holds the device's copy of the pages only for the
+//!   copies that go through it: a fill from the pages or into a new shape, a write-back, a
+//!   download, an early copy, a release's copy, a write's copy into another shape of its plane,
+//!   and a command buffer that names an object over the buffer itself, the host's video's among
+//!   them. A cache whose memory is not made for the host's video (exportable, or a dma-buf) is
+//!   made so that the platform makes the buffer's memory at its first use alone
+//!   ([`GpuDevice::new_deferred_buffer_of_length`]), as zeros, as a new cache's are: a cache no
+//!   such copy reaches holds none. Each copy makes it first ([`Buffer::make_memory`]), a
+//!   download's, a release's, an early copy's and a write's copy into another shape's with the
+//!   caches' lock let go of ([`Caches::make_memory`]), as a cache's buffer is made
+//!   ([`CacheMaker`]); the others' on the thread of their use. Where the platform refuses the
+//!   memory, a copy of the caches' own is not made, as where the platform makes no command buffer
+//!   for it; a command of a guest's command buffer that names the buffer is dropped, and the command
+//!   buffer ends with Metal's `MTLCommandBufferErrorOutOfMemory`
+//!   ([`CommandBuffer::fail_out_of_memory`], `super::GraphicsDecoder::require_buffer`); a write's
+//!   copy into the other shapes of its plane, at the end of its encoder, fails its command buffer
+//!   so, and leaves those shapes as they were. A create of a texture over the buffer is refused
+//!   (nil) where the platform refuses its memory.
+//!
+//! [`GpuDevice::new_deferred_buffer_of_length`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::new_deferred_buffer_of_length
+//! [`Buffer::make_memory`]: reims_vgpu_vulkan::core::platform::resource::Buffer::make_memory
+//! [`CommandBuffer::fail_out_of_memory`]: reims_vgpu_vulkan::core::platform::command::CommandBuffer::fail_out_of_memory
 //! [`GpuDevice::own_memory_budget`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::own_memory_budget
 //! [`GpuDevice::copies_guest_ram`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::copies_guest_ram
 //! [`GpuDevice::recoveries`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::recoveries
@@ -431,7 +454,7 @@ use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue, Co
 use reims_vgpu_vulkan::core::platform::device::GpuDevice;
 use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent as _};
 use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
-use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, MemoryFor};
 use reims_vgpu_vulkan::core::platform::types::NsRange;
 use reims_vgpu_vulkan::core::platform::values::{PagesPlane, TextureDesc};
 use reims_vgpu_vulkan::core::platform::{Handle, Platform};
@@ -2032,6 +2055,10 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// The threads that move a staged download's bytes into its pages and land it
     /// ([`INTO_PAGES_THREADS`]), a block's in the order their command buffers completed.
     lands_out: Arc<Worker>,
+    /// A fill since it was last taken found the platform refused a cache's buffer its memory
+    /// ([`Self::fill`], [`Self::fill_shapes`]): a begin's fails its command buffer
+    /// ([`Begin::out_of_memory`]).
+    memory_refused: bool,
 }
 
 /// The name of the threads, `<name>-<i>`, that carry out a staged copy out of a cache once its
@@ -2039,6 +2066,13 @@ pub(crate) struct SurfaceCaches<P: Platform> {
 /// staging buffer into the pages, then the copy's landing and the answers waiting for it, which
 /// raise the guest's interrupt there. A block's are its key ([`Worker`]).
 pub(crate) const INTO_PAGES_THREADS: &str = "reims-vgpu.graphics-into-pages";
+
+/// Makes the memory of `buffer`, a cache's, for `made_for`, where it was made deferred and its
+/// memory is not made yet (the module doc, "Deferred memory"): whether it holds its memory, `false`
+/// where the platform refused it.
+fn memory_of<P: Platform>(buffer: &P::Buffer, made_for: MemoryFor) -> bool {
+    buffer.memory_made() || buffer.make_memory(made_for)
+}
 
 /// The command buffers begun and not finished that use one block's cache, by the number each was
 /// counted under, oldest first.
@@ -2250,7 +2284,20 @@ impl<P: Platform> SurfaceCaches<P> {
             reserved: HashMap::new(),
             left_over: HashMap::new(),
             lands_out: Arc::new(Worker::new(INTO_PAGES_THREADS)),
+            memory_refused: false,
         }
+    }
+
+    /// Another reference to the buffer of the block's cache where `copies` holds of it and the
+    /// caches take the per-shape form, whose buffers' memory is made at their first copy (the
+    /// module doc, "Deferred memory"): for [`Caches::make_memory`], with the lock let go of.
+    fn deferred_buffer(
+        &self,
+        block: u64,
+        copies: impl FnOnce(&SurfaceCache<P>) -> bool,
+    ) -> Option<P::Buffer> {
+        let cache = self.by_block.get(&block).filter(|_| self.shaped)?;
+        copies(cache).then(|| cache.device.clone_ref())
     }
 
     /// Where the device recovered since the caches last looked ([`GpuDevice::recoveries`]): the
@@ -3450,6 +3497,26 @@ impl<P: Platform> SurfaceCaches<P> {
             .collect()
     }
 
+    /// Whether [`Self::reconcile_shapes`] of the shapes `written` of the block at `block`'s cache
+    /// copies a write through the cache's buffer: another shape of a written one's plane takes
+    /// it.
+    fn reconciles_through_buffer(&self, block: u64, written: &[u64]) -> bool {
+        let Some(cache) = self.by_block.get(&block) else {
+            return false;
+        };
+        let since = self.dirty_since(block);
+        written.iter().any(|&id| {
+            let Some(key) = cache.shapes.iter().find(|s| s.id() == id).map(|s| s.key) else {
+                return false;
+            };
+            (cache.shapes.iter()).any(|s| {
+                s.id() != id
+                    && s.key.same_plane(&key)
+                    && (s.plane || s.referenced() || s.dirty || since.contains(&s.id()))
+            })
+        })
+    }
+
     /// Whether a shape of `written`, each by its block, shares its plane with another shape of
     /// its cache that takes its write at the end of the encoder (rule 1,
     /// [`Self::reconcile_shapes`]): one a guest texture references or that holds a write of its
@@ -3487,6 +3554,7 @@ impl<P: Platform> SurfaceCaches<P> {
         cb: &P::CommandBuffer,
         block: u64,
         written: &[u64],
+        refused: &mut bool,
     ) -> RaiseResult<Vec<P::Texture>> {
         let since = self.dirty_since(block);
         let Some(cache) = self.by_block.get_mut(&block) else {
@@ -3529,18 +3597,24 @@ impl<P: Platform> SurfaceCaches<P> {
                 })
                 .collect();
             let into: Vec<u64> = (others.iter()).filter(|o| o.1).map(|o| o.0).collect();
-            // The source's overlap goes into the buffer on the way: within its extent.
-            if !into.is_empty() {
-                cache.changed.add(key.span());
+            // The source's overlap goes into the buffer on the way: within its extent. Where the
+            // platform refuses the buffer's memory, no copy is made, and `refused` fails the
+            // command buffer (the module doc, "Deferred memory").
+            if !into.is_empty() && !memory_of::<P>(&cache.device, MemoryFor::Reconcile) {
+                *refused = true;
+            } else {
+                if !into.is_empty() {
+                    cache.changed.add(key.span());
+                }
+                shapes::copy_overlaps::<P>(
+                    cb,
+                    &cache.device,
+                    &cache.shapes,
+                    (source, &into),
+                    self.fence.as_ref(),
+                    &mut self.counts.shapes,
+                )?;
             }
-            shapes::copy_overlaps::<P>(
-                cb,
-                &cache.device,
-                &cache.shapes,
-                (source, &into),
-                self.fence.as_ref(),
-                &mut self.counts.shapes,
-            )?;
             for (id, _) in others.iter().filter(|o| !o.1) {
                 let Some(shape) = cache.shapes.take_id(*id) else {
                     continue;
@@ -4417,7 +4491,10 @@ impl<P: Platform> SurfaceCaches<P> {
                 Some(CachePages::Runs { .. }) => None,
                 Some(CachePages::Copied(_)) | None => continue,
             };
-            let Some(cb) = copies_on.command_buffer(ON)? else {
+            // The buffer's memory first, as for every copy through it ("Deferred memory").
+            let Some(cb) = (copies_on.command_buffer(ON)?)
+                .filter(|_| memory_of::<P>(&cache.device, MemoryFor::EarlyCopy))
+            else {
                 continue;
             };
             if let Some((writer, end)) = after {
@@ -4513,7 +4590,12 @@ impl<P: Platform> SurfaceCaches<P> {
         if cache.pages.is_none() && cache.carried.is_none() {
             return Ok(None);
         }
-        let Some(cb) = transfer.queue.command_buffer(ON)? else {
+        // The buffer's memory first, as for every copy through it ("Deferred memory").
+        let Some(cb) = (transfer.queue.command_buffer(ON)?).filter(|_| {
+            let made = memory_of::<P>(&cache.device, MemoryFor::Fill);
+            self.memory_refused |= !made;
+            made
+        }) else {
             return Ok(None);
         };
         wait_before::<P>(&cb, signal.as_ref())?;
@@ -4594,7 +4676,12 @@ impl<P: Platform> SurfaceCaches<P> {
         else {
             return Ok(None);
         };
-        let Some(cb) = transfer.queue.command_buffer(ON)? else {
+        // The buffer's memory first, as for every copy through it ("Deferred memory").
+        let Some(cb) = (transfer.queue.command_buffer(ON)?).filter(|_| {
+            let made = memory_of::<P>(&cache.device, MemoryFor::FillShapes);
+            self.memory_refused |= !made;
+            made
+        }) else {
             return Ok(None);
         };
         wait_before::<P>(&cb, signal.as_ref())?;
@@ -5088,11 +5175,10 @@ impl<P: Platform> SurfaceCaches<P> {
             done();
             return Ok(());
         };
-        let Some(cb) = transfer
-            .queue
-            .command_buffer(ON)?
-            .filter(|_| cache.pages.is_some())
-        else {
+        // The buffer's memory first, as for every copy through it ("Deferred memory").
+        let Some(cb) = transfer.queue.command_buffer(ON)?.filter(|_| {
+            cache.pages.is_some() && memory_of::<P>(&cache.device, MemoryFor::WriteBack)
+        }) else {
             done();
             return Ok(());
         };
@@ -5544,7 +5630,9 @@ impl CacheMaker {
     /// and change in place, with its first plane's first byte placed where the platform's
     /// textures over its memory may start in place where that is past the surface's first
     /// ([`aligned_byte`]), so that textures over its surface's planes lie in it rather than in
-    /// copies of their own ([`GpuDevice::new_buffer_of_length_padding_unobserved`]); else as any
+    /// copies of their own ([`GpuDevice::new_buffer_of_length_padding_unobserved`]), but in the
+    /// per-shape form, where no texture lies over it, one whose memory the platform makes at its
+    /// first use ([`GpuDevice::new_deferred_buffer_of_length`], "Deferred memory"); else as any
     /// other buffer. An exportable cache places that byte alike
     /// (`GpuDevice::new_exportable_buffer_of_length`). With the buffer, the cache's life where
     /// its memory was made for the host's video, exportable or a dma-buf
@@ -5616,7 +5704,12 @@ impl CacheMaker {
             }
             counts.no_dma_buf = true;
         }
+        // In the per-shape form no texture lies over the buffer, which holds its memory from its
+        // first use alone ("Deferred memory").
         let made = match layout {
+            _ if self.shaped => {
+                device.new_deferred_buffer_of_length(ON, length, STORAGE_PRIVATE)?
+            }
             Some(_) => {
                 let made = device.new_buffer_of_length_padding_unobserved(
                     ON,
@@ -5759,6 +5852,20 @@ pub(crate) struct Reach {
     /// with the two planes they write, its luma's and its chroma's, as laid out in the surface's
     /// bytes.
     pub(crate) decoded: Vec<(u64, [PagesPlane; 2])>,
+}
+
+/// What a command buffer's begin readied of the caches ([`Caches::before_answering`]).
+pub(crate) struct Begin<P: Platform> {
+    /// It waits on the GPU for a copy of a cache.
+    pub(crate) waits: bool,
+    /// It follows a deferred copy of a cache ([`Uses`]'s `follows`).
+    pub(crate) follows: bool,
+    /// A fill the begin made found the platform refused a cache's buffer its memory (the module
+    /// doc, "Deferred memory"): the command buffer fails with Metal's
+    /// `MTLCommandBufferErrorOutOfMemory`.
+    pub(crate) out_of_memory: bool,
+    /// Its count among the users of the blocks it uses.
+    pub(crate) uses: Option<Uses<P>>,
 }
 
 /// A command buffer's count among the users of the blocks it uses ([`Caches`]), until its finish
@@ -6577,24 +6684,42 @@ impl<P: Platform> Caches<P> {
     /// An encoder just ended in command buffer `cb` that may have written the shapes `written`,
     /// each by its block, in the order its walk last noted them: each other shape of their planes
     /// takes the write in `cb` ([`SurfaceCaches::reconcile_shapes`]). What goes is let go of with
-    /// no lock held, a refusal logged.
+    /// no lock held, a refusal logged. A cache's buffer the copy goes through has its memory made
+    /// with the lock let go of first ([`Self::make_memory`]); whether the platform refused one
+    /// its memory, which fails the command buffer (the module doc, "Deferred memory").
     pub(crate) fn reconcile_shapes(
         &self,
         cb: &P::CommandBuffer,
         written: &[(u64, shapes::ShapeRef)],
-    ) -> RaiseResult<()> {
+    ) -> RaiseResult<bool> {
         let mut blocks: Vec<u64> = written.iter().map(|(block, _)| *block).collect();
         blocks.sort_unstable();
         blocks.dedup();
-        let mut gone = Vec::new();
-        {
-            let mut state = self.lock();
-            for block in blocks {
-                let ids: Vec<u64> = (written.iter())
+        let by_block: Vec<(u64, Vec<u64>)> = (blocks.into_iter())
+            .map(|block| {
+                let ids = (written.iter())
                     .filter(|(b, _)| *b == block)
                     .map(|(_, s)| s.id())
                     .collect();
-                gone.extend(state.reconcile_shapes(cb, block, &ids)?);
+                (block, ids)
+            })
+            .collect();
+        let mut gone = Vec::new();
+        let mut refused = false;
+        {
+            let mut state = self.lock();
+            // A write another shape takes goes through the cache's buffer.
+            let buffers: Vec<P::Buffer> = (by_block.iter())
+                .filter(|(block, ids)| state.reconciles_through_buffer(*block, ids))
+                .filter_map(|(block, _)| state.deferred_buffer(*block, |_| true))
+                .collect();
+            if !buffers.is_empty() {
+                drop(state);
+                self.make_memory(buffers, MemoryFor::Reconcile);
+                state = self.lock();
+            }
+            for (block, ids) in &by_block {
+                gone.extend(state.reconcile_shapes(cb, *block, ids, &mut refused)?);
             }
         }
         if !gone.is_empty()
@@ -6606,7 +6731,7 @@ impl<P: Platform> Caches<P> {
                  release was refused: {refusal}"
             );
         }
-        Ok(())
+        Ok(refused)
     }
 
     /// The device's reset ([`SurfaceCaches::reset`]), which no command buffer is begun across:
@@ -6715,8 +6840,8 @@ impl<P: Platform> Caches<P> {
         uses: &[RgfxOpSurfaceUse],
         reach: &Reach,
     ) -> RaiseResult<(bool, Option<Uses<P>>)> {
-        let (waits, _, uses) = self.before_answering(device, cb, uses, reach, None)?;
-        Ok((waits, uses))
+        let begin = self.before_answering(device, cb, uses, reach, None)?;
+        Ok((begin.waits, begin.uses))
     }
 
     /// The blocks `uses` names that have caches, before command buffer `cb` runs, and its count
@@ -6757,12 +6882,18 @@ impl<P: Platform> Caches<P> {
         uses: &[RgfxOpSurfaceUse],
         reach: &Reach,
         answer: Option<&mut dyn FnMut()>,
-    ) -> RaiseResult<(bool, bool, Option<Uses<P>>)> {
+    ) -> RaiseResult<Begin<P>> {
         if uses.is_empty() && (!reach.work || self.unlocked.nothing_to_do(device.recoveries())) {
             if let Some(answer) = answer {
                 answer();
             }
-            return Ok((false, false, None));
+            let (waits, follows, out_of_memory) = (false, false, false);
+            return Ok(Begin {
+                waits,
+                follows,
+                out_of_memory,
+                uses: None,
+            });
         }
         let mut state = self.lock();
         while (uses.iter()).any(|u| state.answering.contains(&u.block_offset)) {
@@ -6786,12 +6917,19 @@ impl<P: Platform> Caches<P> {
         }
         let before = self.before_locked(state, device, cb, uses, reach);
         drop(answered);
-        let (waits, uses) = before?;
+        let (waits, out_of_memory, uses) = before?;
         let follows = uses.as_ref().is_some_and(|u| !u.follows.is_empty());
-        Ok((waits, follows, uses))
+        Ok(Begin {
+            waits,
+            follows,
+            out_of_memory,
+            uses,
+        })
     }
 
-    /// [`Self::before_answering`] from its lock on, `state`, which it lets go of.
+    /// [`Self::before_answering`] from its lock on, `state`, which it lets go of: whether `cb`
+    /// waits on the GPU for a copy of a cache, whether a fill it made found the platform refused a
+    /// cache's buffer its memory, and its uses.
     fn before_locked<'a>(
         self: &'a Arc<Self>,
         mut state: Locked<'a, P>,
@@ -6799,7 +6937,7 @@ impl<P: Platform> Caches<P> {
         cb: &P::CommandBuffer,
         uses: &[RgfxOpSurfaceUse],
         reach: &Reach,
-    ) -> RaiseResult<(bool, Option<Uses<P>>)> {
+    ) -> RaiseResult<(bool, bool, Option<Uses<P>>)> {
         // The pieces the first fills the buffer's work reaches, and a recovery's refills, would
         // make for want of a spare are made with the lock let go of, and reserved for their
         // blocks (the module doc, "Staged copies").
@@ -6811,12 +6949,15 @@ impl<P: Platform> Caches<P> {
         };
         reserve_ahead(&mut state, device, &reached);
         state.after_recovery(device);
+        // What this begin's fills find refused of a cache's buffer's memory, alone.
+        state.memory_refused = false;
         let reached = match reach.work {
             true => state.fill_reached(device, cb, reach.context)?,
             false => false,
         };
+        let mut memory_refused = std::mem::take(&mut state.memory_refused);
         if uses.is_empty() {
-            return Ok((reached, None));
+            return Ok((reached, memory_refused, None));
         }
         let picked: Vec<RgfxOpSurfaceUse> = by_block(&state, uses).into_iter().copied().collect();
         // The pieces the uses' staged fills would make for want of a spare are made with the
@@ -6876,6 +7017,7 @@ impl<P: Platform> Caches<P> {
         };
         let mut waits = reached;
         let mut raised = None;
+        state.memory_refused = false;
         for u in &picked {
             let decoded = (reach.decoded.iter())
                 .find(|(block, _)| *block == u.block_offset)
@@ -6896,6 +7038,7 @@ impl<P: Platform> Caches<P> {
                 }
             }
         }
+        memory_refused |= std::mem::take(&mut state.memory_refused);
         drop(state);
         if !spare.is_empty()
             && let Err(refusal) = refusals::refusing(move || drop(spare))
@@ -6909,7 +7052,11 @@ impl<P: Platform> Caches<P> {
         if let Some(raise) = raised {
             return Err(raise);
         }
-        Ok((waits, (!held.blocks.is_empty()).then_some(held)))
+        Ok((
+            waits,
+            memory_refused,
+            (!held.blocks.is_empty()).then_some(held),
+        ))
     }
 
     /// Whether a command buffer whose `SURFACE_USE` ops are `uses` waits for no copy of a cache
@@ -6994,9 +7141,18 @@ impl<P: Platform> Caches<P> {
             state.unseen_writes(&uses.blocks, &unseen, uses.video);
             state.shapes_written(&uses.blocks, &uses.shapes);
             state.over_written(&uses.blocks, &uses.over);
-            state.after(device, queue, cb, &uses.blocks)
+            // An early copy goes through the cache's buffer: one whose CPU reads its writes back.
+            let buffers = (uses.blocks.iter())
+                .filter(|c| c.writes)
+                .filter_map(|c| state.deferred_buffer(c.block, |cache| cache.read_back.on))
+                .collect();
+            (state.after(device, queue, cb, &uses.blocks), buffers)
         };
+        let (signalled, buffers) = signalled;
         let done = signalled.and_then(|()| commit());
+        if done.is_ok() {
+            self.make_memory(buffers, MemoryFor::EarlyCopy);
+        }
         let mut state = self.lock();
         // The pieces the copies its finish makes (those deferred behind it), and a recovery's
         // refills, would make for want of a spare are made with the lock let go of, and reserved
@@ -7078,6 +7234,9 @@ impl<P: Platform> Caches<P> {
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
+        // A written cache's copy goes through its buffer.
+        let buffer = self.lock().deferred_buffer(block, |c| c.written);
+        self.make_memory(buffer.into_iter().collect(), MemoryFor::Download);
         let mut state = self.lock();
         // The pieces a staged copy of its cache, and a recovery's refills, would make for want of
         // a spare are made with the lock let go of, and reserved for their blocks (the module
@@ -7170,9 +7329,10 @@ impl<P: Platform> Caches<P> {
         // Its copy into the pages lands with its answer, which a `SURFACE_PAGES` over the same
         // pages waits for from here, while the copy waits for the buffers that write the cache,
         // and for its turn.
-        let (done, failed, may_copy, reserve) = {
+        let (done, failed, may_copy, reserve, buffer) = {
             let mut state = self.lock();
             let may_copy = state.release_may_copy(block, unheld);
+            let buffer = state.deferred_buffer(block, |_| may_copy);
             let lacking = may_copy.then(|| state.lacking(block, Way::Out)).flatten();
             let reserve = lacking.map(|(lens, first)| Reserve {
                 spares: Arc::clone(&state.spares),
@@ -7196,11 +7356,12 @@ impl<P: Platform> Caches<P> {
                         landing.land();
                         failed(raise);
                     });
-                    (done, failed, may_copy, reserve)
+                    (done, failed, may_copy, reserve, buffer)
                 }
-                None => (done, failed, may_copy, reserve),
+                None => (done, failed, may_copy, reserve, buffer),
             }
         };
+        self.make_memory(buffer.into_iter().collect(), MemoryFor::Release);
         let op: PacedOp<P> = Box::new(move |state, turn| {
             ran();
             let device = on;
@@ -7247,6 +7408,34 @@ impl<P: Platform> Caches<P> {
         state.after_writers(device, block, op);
         drop(state);
         self.moved.notify_all();
+    }
+
+    /// Makes the memory of `buffer`, a cache's buffer itself that a command buffer's walk names
+    /// (`super::GraphicsDecoder::require_buffer`), where it is not made yet (the module doc,
+    /// "Deferred memory"): whether it holds its memory, `false` where the platform refused it.
+    pub(crate) fn memory_of(&self, buffer: &P::Buffer) -> bool {
+        memory_of::<P>(buffer, MemoryFor::Command)
+    }
+
+    /// Makes the memory of `buffers`, caches' buffers in the per-shape form
+    /// ([`SurfaceCaches::deferred_buffer`]), with the caches' lock let go of, as [`CacheMaker`]'s
+    /// makes are: the copy through each that follows then makes none under it (the module doc,
+    /// "Deferred memory"), for `made_for`. Each reference is let go of here. One the platform
+    /// refuses is asked again at the copy, which then copies nothing.
+    fn make_memory(&self, buffers: Vec<P::Buffer>, made_for: MemoryFor) {
+        if buffers.is_empty() {
+            return;
+        }
+        for buffer in &buffers {
+            memory_of::<P>(buffer, made_for);
+        }
+        if let Err(refusal) = refusals::refusing(move || drop(buffers)) {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = refusal;
+                "a reference to a device cache's buffer was let go of, and its release was \
+                 refused: {refusal}"
+            );
+        }
     }
 
     /// The block at `block` named again without a cache, or over other pages, loses it
@@ -10049,7 +10238,12 @@ pub(super) mod tests {
                     "a begin counted a use of a block answered before its fill"
                 );
             };
-            let (waits, follows, uses) = (caches)
+            let Begin {
+                waits,
+                follows,
+                uses,
+                ..
+            } = (caches)
                 .before_answering(
                     &r.device,
                     &answered,

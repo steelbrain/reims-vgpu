@@ -159,6 +159,25 @@
 //! **Tiled textures** (`newTiledTextureWithDescriptor:offset:bytesPerRow:`): of a 2D texture of
 //! more than one level, a copy of the bytes, taken at its first use (`super::tiled`); of any other,
 //! the texture over the bytes `newTextureWithDescriptor:offset:bytesPerRow:` makes.
+//!
+//! **Deferred memory** ([`deferred_of_length`],
+//! `GpuDevice::new_deferred_buffer_of_length`). A deferred buffer is a Private one of the host's
+//! own whose rt buffer, in a block of its own as any Private buffer's, is made at its first use
+//! (`Buffer::make_memory`), once, as zeros: rt zeroes it ahead of the next command buffer, as any
+//! Private buffer's. Until then it answers its length and options, NULL contents and GPU address 0.
+//! Its callers make it ahead of each use that can answer a refusal; a texture over its bytes makes
+//! it first, and is nil where rt refuses it. Any other use makes it there, and where rt refuses its
+//! memory then, the process ends: that use has no refusal to answer ([`deferred_refused`]). Each
+//! make is rt's take of a Private block on the thread of the use, which allocates there where no
+//! free range of rt's pool fits the length.
+//!
+//! Each deferred buffer is counted as it is made and gone, with the most live at once
+//! ([`DEFERRED`]); each whose memory is made ([`DEFERRED_MADE`]), and of those each made by the use
+//! itself, which answers no refusal ([`DEFERRED_ON_USE_CODE`]), with the nanoseconds the makes took
+//! on their threads ([`DEFERRED_MADE_NS_CODE`]) and the longest ([`DEFERRED_MADE_NS_MOST_CODE`]),
+//! and the makes and the longest by what each was made for ([`DEFERRED_FOR_CODES`]);
+//! each that goes unmade ([`DEFERRED_GONE_UNMADE_CODE`]); and each refusal of the memory
+//! ([`DEFERRED_REFUSED_CODE`]).
 
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
@@ -175,9 +194,10 @@ use crate::core::platform::host_range::HostRange;
 use crate::core::platform::os::Clock as _;
 #[cfg(unix)]
 use crate::core::platform::resource::ExportedMemory;
-use crate::core::platform::resource::{Buffer, GpuResource};
+use crate::core::platform::resource::{Buffer, GpuResource, MemoryFor};
 use crate::core::platform::types::NsRange;
 use crate::core::platform::values::{BufferDeallocator, BufferDesc, SurfacePlane};
+use crate::core::raise::death::{DeathId, DeathKind, fatal_with_detail};
 use crate::core::raise::{OnFault, RaiseResult};
 use crate::core::sync::Mutex;
 use crate::gpu::device::descriptor_options;
@@ -208,6 +228,83 @@ pub const IMPORTS_UNNAMED: crate::answer::MadeCodes = crate::answer::MadeCodes {
     made: "rt-imports-unnamed",
     live_most: "rt-imports-unnamed-live-most",
 };
+
+/// The codes of a deferred buffer (the module's docs, "Deferred memory"), counted as it is made and
+/// as it goes, and the most live at once.
+pub const DEFERRED: crate::answer::MadeCodes = crate::answer::MadeCodes {
+    made: "rt-deferred-buffers",
+    live_most: "rt-deferred-buffers-live-most",
+};
+
+/// The codes of a deferred buffer whose memory was made, counted as it is made and as the buffer
+/// goes, and the most live at once.
+pub const DEFERRED_MADE: crate::answer::MadeCodes = crate::answer::MadeCodes {
+    made: "rt-deferred-buffers-made",
+    live_most: "rt-deferred-buffers-made-live-most",
+};
+
+/// The code whose count is the nanoseconds a deferred buffer's memory took to make, on the thread
+/// of its first use, summed.
+pub const DEFERRED_MADE_NS_CODE: &str = "rt-deferred-buffers-made-ns";
+
+/// The code whose count is the longest a deferred buffer's memory took to make, in nanoseconds.
+pub const DEFERRED_MADE_NS_MOST_CODE: &str = "rt-deferred-buffers-made-ns-most";
+
+/// The code of a deferred buffer's memory rt refused, counted per refusal.
+pub const DEFERRED_REFUSED_CODE: &str = "rt-deferred-buffers-refused";
+
+/// The code of a deferred buffer whose memory was made by the use itself, which answers no
+/// refusal ([`RtBuffer::rt`]), not ahead of it, counted per buffer.
+pub const DEFERRED_ON_USE_CODE: &str = "rt-deferred-buffers-made-on-use";
+
+/// The code of a deferred buffer that went with its memory never made, counted per buffer.
+pub const DEFERRED_GONE_UNMADE_CODE: &str = "rt-deferred-buffers-released-unmade";
+
+/// The codes of the deferred buffers' makes by what they were made for: each [`MemoryFor`]'s, by
+/// its discriminant, then the use's own ([`DEFERRED_ON_USE_CODE`]): the count of makes, and the
+/// longest one, in nanoseconds.
+pub const DEFERRED_FOR_CODES: [(&str, &str); 10] = [
+    (
+        "rt-deferred-buffers-made-for-reconcile",
+        "rt-deferred-buffers-made-for-reconcile-ns-most",
+    ),
+    (
+        "rt-deferred-buffers-made-for-early-copy",
+        "rt-deferred-buffers-made-for-early-copy-ns-most",
+    ),
+    (
+        "rt-deferred-buffers-made-for-fill",
+        "rt-deferred-buffers-made-for-fill-ns-most",
+    ),
+    (
+        "rt-deferred-buffers-made-for-fill-shapes",
+        "rt-deferred-buffers-made-for-fill-shapes-ns-most",
+    ),
+    (
+        "rt-deferred-buffers-made-for-write-back",
+        "rt-deferred-buffers-made-for-write-back-ns-most",
+    ),
+    (
+        "rt-deferred-buffers-made-for-download",
+        "rt-deferred-buffers-made-for-download-ns-most",
+    ),
+    (
+        "rt-deferred-buffers-made-for-release",
+        "rt-deferred-buffers-made-for-release-ns-most",
+    ),
+    (
+        "rt-deferred-buffers-made-for-command",
+        "rt-deferred-buffers-made-for-command-ns-most",
+    ),
+    (
+        "rt-deferred-buffers-made-for-texture",
+        "rt-deferred-buffers-made-for-texture-ns-most",
+    ),
+    (
+        DEFERRED_ON_USE_CODE,
+        "rt-deferred-buffers-made-on-use-ns-most",
+    ),
+];
 
 /// The code of a no-copy buffer or a heap of option bit 24 pinned in a known block that is no copy
 /// whose writes are dropped (the module's docs, "Read-only memory"): the GPU's writes reach its
@@ -318,8 +415,10 @@ const TEXTURE_TYPE_2D: u64 = 2;
 
 /// `id<MTLBuffer>` on metal2vulkan-rt: rt's buffer and what the platform answers of it.
 pub struct RtBuffer {
-    /// rt's buffer.
-    rt: rt::Buffer,
+    /// rt's buffer: a deferred one's from its first use (the module's docs, "Deferred memory").
+    rt: OnceLock<rt::Buffer>,
+    /// A deferred buffer's make, `None` for any other.
+    deferred: Option<Deferred>,
     /// The device that made it.
     device: RtObj<RtDevice>,
     /// The resource options it answers (the module's docs).
@@ -336,17 +435,103 @@ pub struct RtBuffer {
     exported: Option<super::export::Exported>,
 }
 
+/// What a deferred buffer's memory is made of at its first use (the module's docs, "Deferred
+/// memory").
+struct Deferred {
+    /// Its length.
+    length: u64,
+    /// Held while its memory is made, so that one make is made.
+    making: Mutex<()>,
+}
+
 impl RtBuffer {
-    /// rt's buffer.
+    /// rt's buffer; a deferred one's made now where it is not yet, and where rt refuses its
+    /// memory the process ends ([`deferred_refused`]): the caller's use answers no refusal.
     pub fn rt(&self) -> &rt::Buffer {
-        &self.rt
+        match self.made(None) {
+            Some(made) => made,
+            None => deferred_refused(self.deferred.as_ref().map_or(0, |d| d.length)),
+        }
     }
+
+    /// rt's buffer; a deferred one's made now where it is not yet, `None` where rt refuses its
+    /// memory, counted (the module's docs, "Deferred memory") under what it is made for, `None`
+    /// where the caller is the use itself, which answers no refusal.
+    fn made(&self, made_for: Option<MemoryFor>) -> Option<&rt::Buffer> {
+        if let Some(made) = self.rt.get() {
+            return Some(made);
+        }
+        let deferred = self.deferred.as_ref()?;
+        let _making = deferred.making.lock();
+        if let Some(made) = self.rt.get() {
+            return Some(made);
+        }
+        let start = rt::host_time();
+        let made = own(
+            &self.device,
+            DEFERRED_SEL,
+            rt::MemoryClass::Private,
+            deferred.length,
+        );
+        let took = rt::host_time().saturating_sub(start);
+        let Some(made) = made else {
+            crate::answer::count_kind(DEFERRED_REFUSED_CODE);
+            return None;
+        };
+        crate::answer::count_made(DEFERRED_MADE);
+        crate::answer::count_kind_by(DEFERRED_MADE_NS_CODE, took);
+        let most = DEFERRED_MOST_NS.fetch_max(took, Ordering::Relaxed);
+        crate::answer::count_kind_by(DEFERRED_MADE_NS_MOST_CODE, took.saturating_sub(most));
+        let made_for = made_for.map_or(DEFERRED_FOR_CODES.len() - 1, |made_for| made_for as usize);
+        let (count, most_code) = DEFERRED_FOR_CODES[made_for];
+        crate::answer::count_kind(count);
+        let most = DEFERRED_FOR_MOST_NS[made_for].fetch_max(took, Ordering::Relaxed);
+        crate::answer::count_kind_by(most_code, took.saturating_sub(most));
+        Some(self.rt.get_or_init(|| made))
+    }
+}
+
+/// The longest a deferred buffer's memory took to make, in nanoseconds
+/// ([`DEFERRED_MADE_NS_MOST_CODE`]).
+static DEFERRED_MOST_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The longest a deferred buffer's memory took to make for each use, in nanoseconds, by the index
+/// of its codes in [`DEFERRED_FOR_CODES`].
+static DEFERRED_FOR_MOST_NS: [AtomicU64; DEFERRED_FOR_CODES.len()] =
+    [const { AtomicU64::new(0) }; DEFERRED_FOR_CODES.len()];
+
+/// The selector a deferred buffer's memory is made for, as its buffer stands for one
+/// `newBufferWithLength:options:` makes.
+const DEFERRED_SEL: &str = "newBufferWithLength:options:";
+
+/// The death at a use of a deferred buffer of `length` bytes that answers no refusal, where rt
+/// refused its memory (the module's docs, "Deferred memory").
+#[cold]
+#[inline(never)]
+fn deferred_refused(length: u64) -> ! {
+    fatal_with_detail(
+        DeathId::Platform {
+            kind: DeathKind::Abort,
+            call: DEFERRED_SEL,
+        },
+        &format!(
+            "metal2vulkan-rt refused the memory of a deferred buffer of {length} bytes at a use \
+             that answers no refusal ({DEFERRED_REFUSED_CODE})"
+        ),
+    )
 }
 
 impl Drop for RtBuffer {
     fn drop(&mut self) {
         if let Some(slot) = self.deallocator.take() {
             run(&slot);
+        }
+        if self.deferred.is_some() {
+            crate::answer::count_gone(DEFERRED);
+            match self.rt.get() {
+                Some(_) => crate::answer::count_gone(DEFERRED_MADE),
+                None => crate::answer::count_kind(DEFERRED_GONE_UNMADE_CODE),
+            }
         }
     }
 }
@@ -639,6 +824,40 @@ impl ScratchSplit {
     }
 }
 
+/// [`of_length`]'s buffer whose memory is made at its first use
+/// ([`GpuDevice::new_deferred_buffer_of_length`](crate::core::platform::device::GpuDevice::new_deferred_buffer_of_length),
+/// the module's docs, "Deferred memory"): a Private one; any other as `of_length`'s. Nil where Metal
+/// refuses it, counted.
+pub fn deferred_of_length(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    length: u64,
+    raw: u64,
+) -> Option<RtObj<RtBuffer>> {
+    let o = match options(raw, false) {
+        Ok(o) => o,
+        Err(why) => return refused_metal(sel, &why),
+    };
+    if o.storage != Storage::Private || length == 0 || length > rt::MAX_BUFFER_LENGTH {
+        return made(device, sel, length, o, None, None);
+    }
+    crate::answer::count_made(DEFERRED);
+    Some(RtObj::new(RtBuffer {
+        rt: OnceLock::new(),
+        deferred: Some(Deferred {
+            length,
+            making: Mutex::new(()),
+        }),
+        device: device.clone_ref(),
+        options: o.answered,
+        purgeable: texture::purgeable_state(),
+        in_heap: false,
+        deallocator: None,
+        #[cfg(unix)]
+        exported: None,
+    }))
+}
+
 /// `newBufferWithDescriptor:` of `desc` on `device`: a no-copy one as [`over_host_memory`]'s, its
 /// deallocator given the bytes' address and the length; another as [`of_length`]'s, at the
 /// pinned address where it lies in a known block, and holding a copy of the contents where given.
@@ -713,7 +932,7 @@ fn copy_in(sel: &'static str, buffer: &RtObj<RtBuffer>, bytes: HostRange<'_>) {
     if first < crate::core::host::ZERO_REGION_END || first.checked_add(length).is_none() {
         crate::answer::metal_reads_near_null(sel, &format!("{length} bytes at {first:#x}"));
     }
-    let Some(contents) = buffer.rt.contents() else {
+    let Some(contents) = buffer.rt().contents() else {
         return;
     };
     // SAFETY: `HostRange::new`'s contract keeps the `length` bytes at `first` mapped and readable
@@ -724,7 +943,7 @@ fn copy_in(sel: &'static str, buffer: &RtObj<RtBuffer>, bytes: HostRange<'_>) {
         std::ptr::copy_nonoverlapping(bytes.ptr().as_ptr::<u8>(), contents.as_ptr(), length);
     }
     if buffer.storage_mode() == MANAGED
-        && let Err(error) = buffer.rt.did_modify_range(0, bytes.len())
+        && let Err(error) = buffer.rt().did_modify_range(0, bytes.len())
     {
         rt_refused(sel, &error);
     }
@@ -778,7 +997,8 @@ pub(super) fn buffer_of(
     deallocator: Option<Slot>,
 ) -> RtObj<RtBuffer> {
     RtObj::new(RtBuffer {
-        rt,
+        rt: OnceLock::from(rt),
+        deferred: None,
         device: device.clone_ref(),
         options,
         purgeable: texture::purgeable_state(),
@@ -799,7 +1019,8 @@ pub(super) fn with_export(
     exported: super::export::Exported,
 ) -> RtObj<RtBuffer> {
     RtObj::new(RtBuffer {
-        rt,
+        rt: OnceLock::from(rt),
+        deferred: None,
         device: device.clone_ref(),
         options,
         purgeable: texture::purgeable_state(),
@@ -1899,11 +2120,13 @@ impl RtObj<RtBuffer> {
         offset: u64,
         bytes_per_row: u64,
     ) -> Option<RtObj<RtTexture>> {
+        // A deferred buffer's memory first: nil where rt refuses it, counted.
+        let made = self.made(Some(MemoryFor::Texture))?;
         let over = |d: &rt::TextureDescriptor, index: Option<u32>| {
-            self.rt.new_texture(d, index, offset, bytes_per_row)
+            made.new_texture(d, index, offset, bytes_per_row)
         };
         let held = (self.options, texture::STORAGE_BITS);
-        let diag = |shape: &Shape| Made::over_buffer(&self.rt, shape, offset, bytes_per_row);
+        let diag = |shape: &Shape| Made::over_buffer(made, shape, offset, bytes_per_row);
         texture::make_over(&self.device, sel, &descriptor.desc(), held, over, diag)
     }
 }
@@ -1950,16 +2173,20 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
     /// no bytes of, answers the host's mapping of its pages (`KnownBlocks::contents_of`, interim
     /// until rt takes that mapping), and one in a copy's block the pages it copies.
     fn contents(&self) -> HostPtr {
+        // A deferred buffer, Private, whose memory is not made: none to answer.
+        let Some(made) = self.rt.get() else {
+            return HostPtr::NULL;
+        };
         let known = self.device.known_blocks();
-        let home = known.home_of(self.rt.block());
-        if let Some(at) = home.and_then(|first| first.checked_add(self.rt.offset())) {
+        let home = known.home_of(made.block());
+        if let Some(at) = home.and_then(|first| first.checked_add(made.offset())) {
             return HostPtr::from_addr(at.to_usize());
         }
-        if let Some(at) = self.rt.contents() {
+        if let Some(at) = made.contents() {
             return HostPtr::from_ptr(at.as_ptr());
         }
-        let mapped = known.mapped.of(self.rt.block());
-        match mapped.and_then(|first| first.checked_add(self.rt.offset())) {
+        let mapped = known.mapped.of(made.block());
+        match mapped.and_then(|first| first.checked_add(made.offset())) {
             Some(at) => HostPtr::from_addr(at.to_usize()),
             None => HostPtr::NULL,
         }
@@ -1973,7 +2200,7 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
             let _ = on;
             if self.storage_mode() == MANAGED
-                && let Err(error) = self.rt.did_modify_range(range.location, range.length)
+                && let Err(error) = self.rt().did_modify_range(range.location, range.length)
             {
                 rt_refused("didModifyRange:", &error);
             }
@@ -1984,13 +2211,31 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
     }
 
     /// rt's: the Vulkan device address of its first byte (of a Managed buffer's device copy where
-    /// it has one).
+    /// it has one); 0 for a deferred buffer whose memory is not made (the module's docs,
+    /// "Deferred memory").
     fn gpu_address(&self) -> u64 {
-        self.rt.gpu_address()
+        self.rt.get().map_or(0, rt::Buffer::gpu_address)
     }
 
+    /// rt's; a deferred buffer's own, whose memory is not made.
     fn length(&self) -> u64 {
-        self.rt.length()
+        match (self.rt.get(), &self.deferred) {
+            (Some(made), _) => made.length(),
+            (None, Some(deferred)) => deferred.length,
+            (None, None) => 0,
+        }
+    }
+
+    /// A deferred buffer's memory, made now where it is not yet: `false` where rt refuses it,
+    /// counted (the module's docs, "Deferred memory"). Any other buffer holds its memory.
+    fn make_memory(&self, made_for: MemoryFor) -> bool {
+        self.made(Some(made_for)).is_some()
+    }
+
+    /// Whether it holds its memory: a deferred buffer's once made (the module's docs, "Deferred
+    /// memory").
+    fn memory_made(&self) -> bool {
+        self.deferred.is_none() || self.rt.get().is_some()
     }
 
     /// As `newTextureWithDescriptor:offset:bytesPerRow:`: rt makes a texture over a buffer of one
@@ -2070,9 +2315,14 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
             if desc.mipmap_level_count <= 1 || desc.texture_type != TEXTURE_TYPE_2D {
                 return Ok(self.texture(sel, descriptor, offset, bytes_per_row));
             }
-            let (rt_device, length) = (self.device.rt(), self.rt.length());
+            let (rt_device, length) = (self.device.rt(), self.length());
             if let Some(why) = tiled::bad_layout(rt_device, &desc, length, offset, bytes_per_row) {
                 return Ok(refused_metal(sel, &why));
+            }
+            // A deferred buffer's memory first, which the take reads: nil where rt refuses it,
+            // counted.
+            if self.made(Some(MemoryFor::Texture)).is_none() {
+                return Ok(None);
             }
             let own =
                 |d: &rt::TextureDescriptor, index: Option<u32>| rt_device.new_texture(d, index);
@@ -2093,14 +2343,14 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
     #[cfg(unix)]
     fn export_memory(&self) -> Result<ExportedMemory, String> {
         let exported = (self.exported.as_ref()).ok_or("the buffer was not made exportable")?;
-        exported.export(rt::ExportHandle::OpaqueFd, self.rt.length())
+        exported.export(rt::ExportHandle::OpaqueFd, self.rt().length())
     }
 
     /// A dma-buf buffer's memory as a new dma-buf (`super::export`); `Err` for any other.
     #[cfg(unix)]
     fn export_dma_buf(&self) -> Result<ExportedMemory, String> {
         let exported = (self.exported.as_ref()).ok_or("the buffer was not made exportable")?;
-        exported.export(rt::ExportHandle::DmaBuf, self.rt.length())
+        exported.export(rt::ExportHandle::DmaBuf, self.rt().length())
     }
 
     /// rt's acquire of what another API wrote into an exportable buffer's block
@@ -2521,6 +2771,144 @@ mod tests {
         assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
         assert_eq!(commands.commit(on), Ok(()));
         assert_eq!(commands.wait_until_completed(on), Ok(()));
+    }
+
+    /// The length of the deferred buffers the tests make: 128 KiB.
+    const DEFERRED_LENGTH: u64 = 0x2_0000;
+
+    /// The counts of deferred buffers made, made with their memory, made by a use itself, and
+    /// gone unmade (the module's docs, "Deferred memory").
+    fn deferred_counts() -> [u64; 4] {
+        let codes = [
+            DEFERRED.made,
+            DEFERRED_MADE.made,
+            DEFERRED_ON_USE_CODE,
+            DEFERRED_GONE_UNMADE_CODE,
+        ];
+        codes.map(counted)
+    }
+
+    /// `device`'s deferred buffer of [`DEFERRED_LENGTH`] bytes.
+    fn deferred(device: &RtObj<RtDevice>) -> RtObj<RtBuffer> {
+        let made = device.new_deferred_buffer_of_length(OnFault::Return, DEFERRED_LENGTH, 0x20);
+        made.expect("never a raise").expect("a deferred buffer")
+    }
+
+    /// On the GPU the test holds: a deferred buffer holds no memory until it is made, answering
+    /// its length, NULL contents and GPU address 0; made, once, ahead of its first use, a read,
+    /// it reads zeros, though a Private buffer of its length held other bytes just before it;
+    /// counted as made ahead of its use, and one gone unmade counted so
+    #[test]
+    fn a_deferred_buffer_reads_zeros_before_any_write_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let shared = |options| {
+            let made = device.new_buffer_of_length(on, DEFERRED_LENGTH, options);
+            made.expect("never a raise").expect("a buffer")
+        };
+        let out = shared(0);
+        let earlier = shared(0x20);
+        let fill = BlitCmd::FillBuffer {
+            buffer: &earlier,
+            range: NsRange::new(0, DEFERRED_LENGTH),
+            value: 0xab,
+        };
+        blit_and_wait(&queue, vec![fill]);
+        drop(earlier);
+        let before = deferred_counts();
+
+        let buffer = deferred(&device);
+        assert!(!buffer.memory_made());
+        assert_eq!(
+            (buffer.length(), buffer.gpu_address()),
+            (DEFERRED_LENGTH, 0)
+        );
+        assert!(buffer.contents().is_null());
+        assert!(buffer.make_memory(MemoryFor::Fill));
+        assert!(buffer.memory_made());
+        assert!(buffer.make_memory(MemoryFor::Fill), "made already");
+        assert_ne!(buffer.gpu_address(), 0);
+        let copy = BlitCmd::CopyBufferToBuffer {
+            source_buffer: Some(&buffer),
+            source_offset: 0,
+            destination_buffer: Some(&out),
+            destination_offset: 0,
+            size: DEFERRED_LENGTH,
+        };
+        blit_and_wait(&queue, vec![copy]);
+        let read_out = read(out.contents(), DEFERRED_LENGTH.to_usize());
+        assert!(read_out.iter().all(|&b| b == 0), "zeros");
+        drop(deferred(&device));
+        let after = deferred_counts();
+        let counts: Vec<u64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
+        assert_eq!(
+            counts,
+            [2, 1, 0, 1],
+            "made, with memory, on a use, gone unmade"
+        );
+    }
+
+    /// On the GPU the test holds: a deferred buffer whose first use writes it, a copy of two
+    /// planes' bytes into it that makes its memory there, reads those bytes after, its zeroing
+    /// ahead of that write; counted as made by the use itself
+    #[test]
+    fn a_deferred_buffer_holds_the_planes_bytes_after_a_write_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let shared = || {
+            let made = device.new_buffer_of_length(on, DEFERRED_LENGTH, 0);
+            made.expect("never a raise").expect("a Shared buffer")
+        };
+        let (from, out) = (shared(), shared());
+        let length = DEFERRED_LENGTH.to_usize();
+        // A luma plane of two thirds of the bytes, then a chroma plane, each of its own bytes.
+        let luma = DEFERRED_LENGTH / 3 * 2;
+        let bytes: Vec<u8> = (0..length)
+            .map(|i| match i < luma.to_usize() {
+                true => u8::try_from(i % 251).expect("a byte"),
+                false => u8::try_from(i % 239).expect("a byte") ^ 0x5a,
+            })
+            .collect();
+        // SAFETY: a Shared buffer's contents are mapped, `length` bytes long.
+        unsafe {
+            (from.contents().as_ptr::<u8>()).copy_from_nonoverlapping(bytes.as_ptr(), length)
+        };
+        let before = deferred_counts();
+
+        let buffer = deferred(&device);
+        assert!(!buffer.memory_made());
+        let plane = |at: u64, size: u64| BlitCmd::CopyBufferToBuffer {
+            source_buffer: Some(&from),
+            source_offset: at,
+            destination_buffer: Some(&buffer),
+            destination_offset: at,
+            size,
+        };
+        blit_and_wait(
+            &queue,
+            vec![plane(0, luma), plane(luma, DEFERRED_LENGTH - luma)],
+        );
+        assert!(buffer.memory_made(), "made by the write");
+        let copy = BlitCmd::CopyBufferToBuffer {
+            source_buffer: Some(&buffer),
+            source_offset: 0,
+            destination_buffer: Some(&out),
+            destination_offset: 0,
+            size: DEFERRED_LENGTH,
+        };
+        blit_and_wait(&queue, vec![copy]);
+        assert!(read(out.contents(), length) == bytes, "the planes' bytes");
+        let after = deferred_counts();
+        let counts: Vec<u64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
+        assert_eq!(
+            counts,
+            [1, 1, 1, 0],
+            "made, with memory, on a use, gone unmade"
+        );
     }
 
     /// On the GPU the test holds: a Private buffer pinned in a known block is zeroed at each

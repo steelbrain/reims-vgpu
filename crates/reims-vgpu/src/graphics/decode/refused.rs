@@ -115,7 +115,22 @@ pub(crate) fn reference(obj_id: u64) -> Raise {
     ))
 }
 
-/// Whether `raise` is a resolver's of an object whose create the host refused ([`reference()`]).
+/// The raise of a resolver that met `obj_id`, a buffer over a device cache's buffer itself whose
+/// memory, made at its first use, the platform refused (the cache's module doc, "Deferred
+/// memory"): the op that named it is dropped as for a refused object's ([`is_refused`]), and the
+/// command buffer fails with Metal's out-of-memory error at its commit
+/// ([`super::GraphicsDecoder::require_buffer`]); elsewhere it is refused as any other raise is.
+#[cold]
+#[inline(never)]
+pub(crate) fn out_of_memory(obj_id: u64) -> Raise {
+    Raise::foreign(SITE).with_detail(format_args!(
+        "an op named object {obj_id:#x}, over a device cache's buffer whose memory the platform \
+         refused"
+    ))
+}
+
+/// Whether `raise` is a resolver's of an object whose create the host refused ([`reference()`]),
+/// or of a cache's buffer refused its memory ([`out_of_memory()`]).
 pub(crate) fn is_refused(raise: &Raise) -> bool {
     raise.origin() == Origin::Boundary(SITE)
 }

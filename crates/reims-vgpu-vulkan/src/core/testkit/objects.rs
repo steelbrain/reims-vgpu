@@ -195,6 +195,12 @@ pub struct BufferModel {
     pub deallocator: Option<NoCopyDeallocator>,
     /// A descriptor-made buffer's deallocator `(contents, length)`, run when the buffer dies.
     pub desc_deallocator: Option<DescDeallocator>,
+    /// A deferred buffer's ([`GpuDevice::new_deferred_buffer_of_length`]): whether its memory was
+    /// made ([`Buffer::make_memory`]); `None` for any other buffer.
+    ///
+    /// [`GpuDevice::new_deferred_buffer_of_length`]: crate::core::platform::device::GpuDevice::new_deferred_buffer_of_length
+    /// [`Buffer::make_memory`]: crate::core::platform::resource::Buffer::make_memory
+    pub deferred: Option<bool>,
     /// Common resource state.
     pub common: ResourceCommon,
 }

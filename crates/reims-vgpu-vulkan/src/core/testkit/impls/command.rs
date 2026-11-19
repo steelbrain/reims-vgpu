@@ -31,6 +31,10 @@ impl CommandQueue<FakePlatform> for Fk<kind::CommandQueue> {
     }
 }
 
+/// The name the fake logs [`CommandBuffer::fail_out_of_memory`] under: no selector of Metal's
+/// names it.
+pub const FAIL_OUT_OF_MEMORY: &str = "failOutOfMemory";
+
 impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
     /// As the Vulkan platform does: the read of the buffer and `block` run in the refusal scope the
     /// handler was added in, where it was added in one (`run_completed`), so a read that dies
@@ -212,6 +216,12 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
             }
             _ => false,
         }
+    }
+
+    /// Logged under [`FAIL_OUT_OF_MEMORY`], as no selector of Metal's names it; the test completes
+    /// the buffer as it scripts.
+    fn fail_out_of_memory(&self) {
+        self.set_logged(FAIL_OUT_OF_MEMORY, vec![]);
     }
 
     fn encode_signal(
