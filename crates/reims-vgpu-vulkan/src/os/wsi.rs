@@ -368,7 +368,7 @@ fn probe(entry: &ash::Entry, listed: &[&CStr]) -> Probed {
 /// # Safety
 ///
 /// `device` is a physical device `instance` lists, and `instance` is live.
-unsafe fn seen(
+pub(crate) unsafe fn seen(
     instance: &ash::Instance,
     device: vk::PhysicalDevice,
     properties2: bool,

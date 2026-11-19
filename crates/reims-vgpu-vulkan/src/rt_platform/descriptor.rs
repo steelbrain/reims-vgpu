@@ -18,6 +18,7 @@ use crate::core::platform::values::{
 };
 use crate::core::raise::{OnFault, RaiseResult};
 use crate::core::sync::{Mutex, MutexGuard};
+use metal2vulkan_rt as rt;
 
 use super::RtObj;
 use super::unbuilt::{Unbuilt, refuse};
@@ -40,6 +41,46 @@ impl TextureFields {
     fn lock(&self) -> MutexGuard<'_, TextureDesc> {
         self.0.lock()
     }
+}
+
+/// rt's descriptor of a texture descriptor's values `d`: each raw value as rt's type of it, the
+/// storage mode of bits 4 to 7 of the resource options (Shared before any set), and each channel
+/// from itself before a swizzle is set. The private values (`resourceIndex`, `protectionOptions`,
+/// `framebufferOnly`, `isDrawable`, `writeSwizzleEnabled`, `allowGPUOptimizedContents` and
+/// `rotation`) have no field in rt's descriptor and are not sent.
+///
+/// Err: the first value rt's descriptor has no value of, named.
+pub fn rt_texture_descriptor(d: &TextureDesc) -> Result<rt::TextureDescriptor, String> {
+    let word = |what: &str, raw: u64| u32::try_from(raw).map_err(|_| format!("{what} {raw}"));
+    let texture_type = word("texture type", d.texture_type)?;
+    let texture_type = rt::TextureType::try_from(texture_type)
+        .map_err(|_| format!("texture type {texture_type}"))?;
+    let pixel_format = word("pixel format", d.pixel_format)?;
+    let pixel_format = rt::PixelFormat::try_from(pixel_format)
+        .map_err(|_| format!("pixel format {pixel_format}"))?;
+    let (width, height) = (word("width", d.width)?, word("height", d.height)?);
+    let mut out = rt::TextureDescriptor::new(texture_type, pixel_format, width, height);
+    out.depth = word("depth", d.depth)?;
+    out.mipmap_level_count = word("mipmap level count", d.mipmap_level_count)?;
+    out.sample_count = word("sample count", d.sample_count)?;
+    out.array_length = word("array length", d.array_length)?;
+    let usage = word("texture usage", d.usage)?;
+    out.usage =
+        rt::TextureUsage::try_from(usage).map_err(|_| format!("texture usage {usage:#x}"))?;
+    out.storage_mode = match (d.resource_options.unwrap_or(0) >> 4) & 0xf {
+        0 => rt::StorageMode::Shared,
+        1 => rt::StorageMode::Managed,
+        2 => rt::StorageMode::Private,
+        3 => rt::StorageMode::Memoryless,
+        mode => return Err(format!("storage mode {mode}")),
+    };
+    if let Some(s) = d.swizzle {
+        out.swizzle = crate::gpu::runtime_swizzle(s).ok_or_else(|| {
+            let channels = [s.red, s.green, s.blue, s.alpha];
+            format!("texture swizzle {channels:?}")
+        })?;
+    }
+    Ok(out)
 }
 
 /// The values of `texture2DDescriptorWithPixelFormat:width:height:mipmapped:`: a 2D texture of
@@ -193,5 +234,42 @@ mod tests {
         let d = texture_2d_desc(80, 16, 8, false);
         assert_eq!((d.pixel_format, d.width, d.height), (80, 16, 8));
         assert_eq!(d.texture_type, TextureDesc::default().texture_type);
+    }
+
+    /// rt's descriptor takes each value as rt's type of it, the storage mode from the resource
+    /// options, and names the first value it has no type of.
+    #[test]
+    fn rt_s_descriptor_takes_each_raw_value() {
+        let d = rt_texture_descriptor(&TextureDesc::default()).unwrap();
+        assert_eq!(d.texture_type, rt::TextureType::Type2D);
+        assert_eq!(d.pixel_format, rt::PixelFormat::RGBA8Unorm);
+        assert_eq!((d.width, d.height, d.depth), (1, 1, 1));
+        assert_eq!(d.usage, rt::TextureUsage::SHADER_READ);
+        assert_eq!(d.storage_mode, rt::StorageMode::Shared);
+        let private = TextureDesc {
+            pixel_format: 80,
+            width: 64,
+            height: 32,
+            resource_options: Some(0x20),
+            ..TextureDesc::default()
+        };
+        let d = rt_texture_descriptor(&private).unwrap();
+        assert_eq!(d.pixel_format, rt::PixelFormat::BGRA8Unorm);
+        assert_eq!(d.storage_mode, rt::StorageMode::Private);
+        let wide = TextureDesc {
+            width: 1 << 32,
+            ..TextureDesc::default()
+        };
+        assert_eq!(rt_texture_descriptor(&wide), Err(format!("width {}", 1u64 << 32)));
+        let typed = TextureDesc {
+            texture_type: 99,
+            ..TextureDesc::default()
+        };
+        assert_eq!(rt_texture_descriptor(&typed), Err("texture type 99".to_owned()));
+        let stored = TextureDesc {
+            resource_options: Some(0x70),
+            ..TextureDesc::default()
+        };
+        assert_eq!(rt_texture_descriptor(&stored), Err("storage mode 7".to_owned()));
     }
 }

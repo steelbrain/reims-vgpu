@@ -84,7 +84,7 @@ fn rows_exact(device: &rt::Device) -> [Option<bool>; 9] {
 }
 
 /// The index in [`SDK_FAMILIES`] of `family`.
-fn at(family: i64) -> usize {
+pub(crate) fn at(family: i64) -> usize {
     SDK_FAMILIES
         .iter()
         .position(|&f| f == family)
@@ -110,7 +110,7 @@ fn implied(family: i64) -> &'static [i64] {
 }
 
 /// `families` with every family a claimed one contains claimed too.
-fn closed(mut families: [bool; 20]) -> [bool; 20] {
+pub(crate) fn closed(mut families: [bool; 20]) -> [bool; 20] {
     loop {
         let before = families;
         for (i, &family) in SDK_FAMILIES.iter().enumerate() {
@@ -142,7 +142,7 @@ fn families(device: &rt::Device, caps: &DeviceCaps) -> [bool; 20] {
 /// `supportsFeatureSet:` of `set` on a device of `families`, as Metal answers on the M3 Max (the
 /// module docs): the iOS feature sets of each Apple family, macOS' two families, and none of the
 /// others ([`feature_set_family`]).
-fn feature_set(set: u64, families: &[bool; 20]) -> bool {
+pub(crate) fn feature_set(set: u64, families: &[bool; 20]) -> bool {
     feature_set_family(set).is_some_and(|family| families[at(family)])
 }
 
@@ -212,13 +212,24 @@ fn format_answers(device: &rt::Device, format: u64) -> FormatAnswers {
 
 /// The sum of `device`'s device-local memory heaps.
 fn device_local_bytes(device: &rt::Device) -> u64 {
+    let raw = device.raw();
     // SAFETY: the instance and physical device are the runtime's, read only, while `device`
     // lives.
-    let memory = unsafe {
-        let raw = device.raw();
-        raw.instance
-            .get_physical_device_memory_properties(raw.physical_device)
-    };
+    unsafe { device_local_bytes_of(raw.instance, raw.physical_device) }
+}
+
+/// [`device_local_bytes`] of the physical device `physical` of `instance`, as any platform reads
+/// it (the rt platform's too).
+///
+/// # Safety
+///
+/// `physical` is a physical device `instance` lists, and `instance` is live.
+pub(crate) unsafe fn device_local_bytes_of(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+) -> u64 {
+    // SAFETY: the caller's.
+    let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
     memory
         .memory_heaps_as_slice()
         .iter()
@@ -236,27 +247,38 @@ fn device_local_bytes(device: &rt::Device) -> u64 {
 ///
 /// [`GpuDevice::own_memory_budget`]: crate::core::platform::device::GpuDevice::own_memory_budget
 pub(crate) fn device_local_budget(device: &rt::Device) -> u64 {
+    let raw = device.raw();
     // SAFETY: the instance and physical device are the runtime's, read only, while `device`
     // lives.
+    unsafe { device_local_budget_of(raw.instance, raw.physical_device) }
+}
+
+/// [`device_local_budget`] of the physical device `physical` of `instance`, as any platform reads
+/// it (the rt platform's too).
+///
+/// # Safety
+///
+/// `physical` is a physical device `instance` lists, and `instance` is live.
+pub(crate) unsafe fn device_local_budget_of(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+) -> u64 {
+    // SAFETY: the caller's.
     let lists = unsafe {
-        let raw = device.raw();
-        raw.instance
-            .enumerate_device_extension_properties(raw.physical_device)
+        instance
+            .enumerate_device_extension_properties(physical)
             .unwrap_or_default()
             .iter()
             .any(|p| p.extension_name_as_c_str() == Ok(ash::ext::memory_budget::NAME))
     };
     if !lists {
-        return device_local_bytes(device);
+        // SAFETY: the caller's.
+        return unsafe { device_local_bytes_of(instance, physical) };
     }
     let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
     let mut memory = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
-    // SAFETY: as above; the one structure chained is of an extension the device lists.
-    unsafe {
-        let raw = device.raw();
-        raw.instance
-            .get_physical_device_memory_properties2(raw.physical_device, &mut memory);
-    }
+    // SAFETY: the caller's; the one structure chained is of an extension the device lists.
+    unsafe { instance.get_physical_device_memory_properties2(physical, &mut memory) };
     let properties = memory.memory_properties;
     (properties.memory_heaps_as_slice().iter())
         .zip(budget.heap_budget)
@@ -267,7 +289,7 @@ pub(crate) fn device_local_budget(device: &rt::Device) -> u64 {
 }
 
 /// The bytes of `memory`'s heaps, every one of them, summed ([`memory_heaps_total`]).
-fn memory_heaps_total_of(memory: &vk::PhysicalDeviceMemoryProperties) -> u64 {
+pub(crate) fn memory_heaps_total_of(memory: &vk::PhysicalDeviceMemoryProperties) -> u64 {
     memory
         .memory_heaps_as_slice()
         .iter()
@@ -315,7 +337,11 @@ fn argument_buffer_sampler_count(device: &rt::Device) -> u64 {
 /// or driver builds, which Vulkan's `pipelineCacheUUID` tells apart (a pipeline cache of another
 /// UUID is one the driver does not take). The name claims no Apple GPU (Metal's are
 /// `applegpu_gNN`); the device's families say what it supports.
-fn architecture_name(vendor: u32, device: u32, pipeline_cache: [u8; vk::UUID_SIZE]) -> String {
+pub(crate) fn architecture_name(
+    vendor: u32,
+    device: u32,
+    pipeline_cache: [u8; vk::UUID_SIZE],
+) -> String {
     let key: String = pipeline_cache.iter().map(|b| format!("{b:02x}")).collect();
     format!("vulkan_{vendor:04x}_{device:04x}_{key}")
 }
@@ -371,7 +397,7 @@ const M3_MAX_DRIVER_SIZES: [u64; 4] = [10, 0xe, 0x54, 0];
 /// - else the M3 Max's ([`M3_MAX_DRIVER_SIZES`]). No Vulkan query reports them, and what Metal
 ///   answers for a family other than the M3 Max's is not measured, so every other device answers
 ///   the one measured device's values (a gap, in the graphics lane's selector sweep).
-fn driver_sizes(registry_id: u64) -> [Option<u64>; 4] {
+pub(crate) fn driver_sizes(registry_id: u64) -> [Option<u64>; 4] {
     let metals = if crate::os::default_registry_id() == Some(registry_id) {
         crate::os::default_driver_sizes()
     } else {

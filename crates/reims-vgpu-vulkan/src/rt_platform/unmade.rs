@@ -8,13 +8,10 @@ use std::marker::PhantomData;
 
 use crate::core::host::HostPtr;
 use crate::core::platform::blit::BlitCmd;
-use crate::core::platform::caps::DeviceCaps;
-use crate::core::platform::caps::IdentityCaps;
 use crate::core::platform::command::CompletedHandler;
 use crate::core::platform::command::PartCut;
 use crate::core::platform::command::ScheduledHandler;
 use crate::core::platform::compute::ComputeCmd;
-use crate::core::platform::device::NoCopyDeallocator;
 use crate::core::platform::event::EventRef;
 use crate::core::platform::event::Notification;
 use crate::core::platform::host_range::HostRange;
@@ -30,39 +27,23 @@ use crate::core::platform::icb::ImageBlockArgs;
 use crate::core::platform::icb::TessellationFactorArgs;
 use crate::core::platform::render::RenderCmd;
 use crate::core::platform::resource::FunctionConstant;
-use crate::core::platform::types::ArgumentLayout;
 use crate::core::platform::types::CommandBufferStatus;
 use crate::core::platform::types::MtlCoordinate2D;
 use crate::core::platform::types::MtlRegion;
 use crate::core::platform::types::MtlSize;
 use crate::core::platform::types::NsErrorText;
 use crate::core::platform::types::NsRange;
-use crate::core::platform::types::PixelFormatInfo;
 use crate::core::platform::types::SizeAndAlign;
 use crate::core::platform::types::Swizzle;
-use crate::core::platform::types::TextureLevelInfo;
-use crate::core::platform::types::TextureLevelQuery;
-use crate::core::platform::values::ArgumentDesc;
-use crate::core::platform::values::BufferDesc;
 use crate::core::platform::values::ComputePassDesc;
-use crate::core::platform::values::DepthStencilDesc;
-use crate::core::platform::values::FullComputePipelineDesc;
-use crate::core::platform::values::FullMeshRenderPipelineDesc;
-use crate::core::platform::values::FullRenderPipelineDesc;
-use crate::core::platform::values::HeapDesc;
-use crate::core::platform::values::HeapMade;
-use crate::core::platform::values::IcbDesc;
-use crate::core::platform::values::RenderPipelineDesc;
-use crate::core::platform::values::SamplerDesc;
 use crate::core::platform::values::SurfacePlane;
 use crate::core::platform::{Handle, ObjId, Platform};
 use crate::core::platform::{
-    blit, command, compute, device, event, function_table, icb, rate_map, render, resource,
+    blit, command, compute, event, function_table, icb, rate_map, render, resource,
 };
 use crate::core::raise::OnFault;
 use crate::core::raise::RaiseResult;
 use std::ops::Range;
-use std::sync::Arc;
 
 /// No value: the field that makes [`Unmade`] a type without values.
 enum Never {}
@@ -90,10 +71,6 @@ impl<K: 'static> Handle for Unmade<K> {
 /// The kinds of object [`Unmade`] stands for, one type each, so each associated type of the
 /// platform is a type of its own.
 pub mod kinds {
-    /// `id<MTLDevice>`.
-    pub enum Device {}
-    /// `id<MTLCommandQueue>`.
-    pub enum CommandQueue {}
     /// `id<MTLCommandBuffer>`.
     pub enum CommandBuffer {}
     /// `id<MTLBlitCommandEncoder>`.
@@ -112,10 +89,6 @@ pub mod kinds {
     pub enum SamplerState {}
     /// `id<MTLDepthStencilState>`.
     pub enum DepthStencilState {}
-    /// `id<MTLFence>`.
-    pub enum Fence {}
-    /// `id<MTLEvent>`.
-    pub enum Event {}
     /// `id<MTLSharedEvent>`.
     pub enum SharedEvent {}
     /// `MTLSharedTextureHandle *`.
@@ -144,194 +117,6 @@ pub mod kinds {
     pub enum IndirectComputeCommand {}
     /// `MTLRasterizationRateLayerDescriptor *`.
     pub enum RateMapLayerDescriptor {}
-}
-
-impl<P: Platform> device::GpuDevice<P> for Unmade<kinds::Device> {
-    fn allow_foreign_libraries(&self) {
-        self.unreachable()
-    }
-    fn argument_layout(&self, _arguments: &[ArgumentDesc]) -> RaiseResult<Option<ArgumentLayout>> {
-        self.unreachable()
-    }
-    fn function_argument_layout(
-        &self,
-        _function: &P::Function,
-        _buffer_index: u64,
-    ) -> RaiseResult<Option<ArgumentLayout>> {
-        self.unreachable()
-    }
-    fn heap_texture_size_and_align(
-        &self,
-        _desc: &P::TextureDescriptor,
-    ) -> RaiseResult<SizeAndAlign> {
-        self.unreachable()
-    }
-    fn new_buffer_over_host_memory(
-        &self,
-        _on: OnFault,
-        _bytes: HostRange<'_>,
-        _options: u64,
-        _deallocator: Option<NoCopyDeallocator>,
-    ) -> RaiseResult<Option<P::Buffer>> {
-        self.unreachable()
-    }
-    fn new_buffer_of_length(
-        &self,
-        _on: OnFault,
-        _length: u64,
-        _options: u64,
-    ) -> RaiseResult<Option<P::Buffer>> {
-        self.unreachable()
-    }
-    fn new_command_queue(&self) -> Option<P::CommandQueue> {
-        self.unreachable()
-    }
-    fn new_command_queue_unshared(&self) -> Option<P::CommandQueue> {
-        self.unreachable()
-    }
-    fn copies_guest_ram(&self) -> bool {
-        self.unreachable()
-    }
-    fn new_compute_pipeline_state_for_function(
-        &self,
-        _compute_function: Option<&P::Function>,
-    ) -> Result<Option<P::ComputePipeline>, NsErrorText> {
-        self.unreachable()
-    }
-    fn new_shader_library(&self) -> Result<Option<P::Library>, NsErrorText> {
-        self.unreachable()
-    }
-    fn new_event(&self, _on: OnFault) -> RaiseResult<Option<P::Event>> {
-        self.unreachable()
-    }
-    fn new_fence(&self) -> RaiseResult<Option<P::Fence>> {
-        self.unreachable()
-    }
-    fn new_library(&self, _data: &[u8]) -> RaiseResult<Result<Option<P::Library>, NsErrorText>> {
-        self.unreachable()
-    }
-    fn new_dynamic_library(
-        &self,
-        _library: &P::Library,
-    ) -> RaiseResult<Result<Option<P::DynamicLibrary>, NsErrorText>> {
-        self.unreachable()
-    }
-    fn new_rate_map(&self, _descriptor: &P::RateMapDescriptor) -> RaiseResult<Option<P::RateMap>> {
-        self.unreachable()
-    }
-    fn new_shared_event(&self) -> Option<P::SharedEvent> {
-        self.unreachable()
-    }
-    fn new_shared_texture(
-        &self,
-        _descriptor: &P::TextureDescriptor,
-    ) -> RaiseResult<Option<P::Texture>> {
-        self.unreachable()
-    }
-    fn open_shared_texture(
-        &self,
-        _handle: Option<&P::SharedTextureHandle>,
-        _resource_index: u64,
-    ) -> RaiseResult<Option<P::Texture>> {
-        self.unreachable()
-    }
-    fn new_texture(
-        &self,
-        _on: OnFault,
-        _descriptor: &P::TextureDescriptor,
-    ) -> RaiseResult<Option<P::Texture>> {
-        self.unreachable()
-    }
-    fn reserve_resource_indices(&self, _resource_type: u64, _indices: &[u64]) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn pixel_format_info(&self, _format: u64) -> PixelFormatInfo {
-        self.unreachable()
-    }
-    fn texture_level_info(&self, _q: &TextureLevelQuery) -> TextureLevelInfo {
-        self.unreachable()
-    }
-    fn caps(&self) -> Arc<DeviceCaps> {
-        self.unreachable()
-    }
-    fn identity_caps(&self) -> IdentityCaps {
-        self.unreachable()
-    }
-    fn takes_private_render_state(&self) -> bool {
-        self.unreachable()
-    }
-    fn own_memory_budget(&self) -> u64 {
-        self.unreachable()
-    }
-    fn memory_heaps_total(&self) -> u64 {
-        self.unreachable()
-    }
-    fn makes_opencl_mode_pipelines(&self) -> bool {
-        self.unreachable()
-    }
-    fn new_buffer(&self, _desc: BufferDesc<'_>) -> RaiseResult<Option<P::Buffer>> {
-        self.unreachable()
-    }
-    fn new_heap(&self, _desc: &HeapDesc) -> RaiseResult<HeapMade<P>> {
-        self.unreachable()
-    }
-    fn new_heap_over_host_memory(
-        &self,
-        _bytes: HostRange<'_>,
-        _desc: &HeapDesc,
-    ) -> RaiseResult<HeapMade<P>> {
-        self.unreachable()
-    }
-    fn new_sampler_state(&self, _desc: &SamplerDesc) -> RaiseResult<Option<P::SamplerState>> {
-        self.unreachable()
-    }
-    fn new_depth_stencil_state(
-        &self,
-        _desc: &DepthStencilDesc,
-    ) -> RaiseResult<Option<P::DepthStencilState>> {
-        self.unreachable()
-    }
-    fn new_indirect_command_buffer(
-        &self,
-        _desc: &IcbDesc,
-        _max_count: u64,
-        _options: u64,
-    ) -> RaiseResult<Option<P::Icb>> {
-        self.unreachable()
-    }
-    fn new_render_pipeline_state(
-        &self,
-        _desc: &RenderPipelineDesc<'_, P>,
-    ) -> Result<Option<P::RenderPipeline>, NsErrorText> {
-        self.unreachable()
-    }
-    fn new_render_pipeline_state_full(
-        &self,
-        _desc: &FullRenderPipelineDesc<'_, P>,
-    ) -> Result<Option<P::RenderPipeline>, NsErrorText> {
-        self.unreachable()
-    }
-    fn new_mesh_render_pipeline_state_full(
-        &self,
-        _desc: &FullMeshRenderPipelineDesc<'_, P>,
-    ) -> Result<Option<P::RenderPipeline>, NsErrorText> {
-        self.unreachable()
-    }
-    fn new_compute_pipeline_state_full(
-        &self,
-        _desc: &FullComputePipelineDesc<'_, P>,
-    ) -> Result<Option<P::ComputePipeline>, NsErrorText> {
-        self.unreachable()
-    }
-}
-
-impl<P: Platform> command::CommandQueue<P> for Unmade<kinds::CommandQueue> {
-    fn command_buffer(&self, _on: OnFault) -> RaiseResult<Option<P::CommandBuffer>> {
-        self.unreachable()
-    }
-    fn set_label(&self, _label: &str) {
-        self.unreachable()
-    }
 }
 
 impl<P: Platform> command::CommandBuffer<P> for Unmade<kinds::CommandBuffer> {

@@ -529,6 +529,26 @@ pub(crate) fn chosen() -> Option<u64> {
     *CHOSEN
 }
 
+/// The device of `seen` (an instance's physical devices that meet metal2vulkan-rt's floor, in the
+/// loader's order) the rt platform opens (`crate::rt_platform`), logged as [`chosen`] logs its
+/// pick: the device the host's user's selection variables name, else the one GPU, else the first
+/// of the runtime's own order (discrete, integrated, virtual, CPU). No GPU is timed, as the
+/// workload runs on metal2vulkan-runtime (`timing.rs`), which the rt platform does not use, and
+/// no verdict is read or kept. `None` where no device is a candidate.
+#[cfg(feature = "rt")]
+pub(crate) fn chosen_untimed(seen: &[Seen]) -> Option<usize> {
+    for (at, device) in seen.iter().enumerate() {
+        log::info!(target: TARGET, "Vulkan device {at}: {}", device.describe());
+    }
+    let picked = choose(
+        seen,
+        &user_selection(|name| std::env::var_os(name)),
+        |_| None,
+    );
+    log_choice(seen, picked);
+    picked.map(|(at, _)| at)
+}
+
 /// Logs the device of `seen` `picked`, with why, at info.
 fn log_choice(seen: &[Seen], picked: Option<(usize, Why)>) {
     match picked.and_then(|(at, why)| Some((at, seen.get(at)?, why))) {

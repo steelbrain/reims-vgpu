@@ -576,7 +576,7 @@ fn pointer(sel: &'static str, bytes: HostPtr) -> NonNull<u8> {
 const BUFFER_DESCRIPTOR_OPTIONS: u64 = 0;
 
 /// A heap descriptor's `resourceOptions` before any setter: `Private` (measured).
-const HEAP_DESCRIPTOR_OPTIONS: u64 = 0x20;
+pub(crate) const HEAP_DESCRIPTOR_OPTIONS: u64 = 0x20;
 
 /// `MTLResourceOptions` bit 24, which makes a buffer or heap read-only, and which the runtime
 /// takes and drops ([`crate::gpu::backing`] keeps it).
@@ -586,7 +586,7 @@ const READ_ONLY_OPTION: u64 = 0x100_0000;
 /// `initial`: a storage mode replaces bits 4 to 7 and a hazard tracking mode bits 8 and 9, as
 /// their setters do (measured on a heap descriptor: storage 2 then tracking 2 holds 0x220). A
 /// buffer descriptor's value sends no hazard tracking mode.
-fn descriptor_options(initial: u64, options: &[OptionSet]) -> u64 {
+pub(crate) fn descriptor_options(initial: u64, options: &[OptionSet]) -> u64 {
     options.iter().fold(initial, |held, option| match *option {
         OptionSet::ResourceOptions(options) => options,
         OptionSet::ResourceOptionsOr(bits) => held | bits,

@@ -6,7 +6,9 @@
 //!
 //! **Built piece by piece**, in the order a guest's boot reaches the pieces: the device and its
 //! answers, queues, buffers, textures, libraries and pipelines, command buffers and encoders,
-//! events, then the display. Until a piece is built, every call that reaches it is refused
+//! events, then the display. Built: the device ([`device`]) with its answers ([`answers`]), its
+//! command queues ([`queue`]), events and fences, and the reservation of resource indices. Until
+//! a piece is built, every call that reaches it is refused
 //! ([`unbuilt`]). The call answers as Metal's call answers where it fails: a nil object, an
 //! `NSError`, zeros. The refusal is counted under the piece's code, `rt-unbuilt-<piece>`, in the
 //! process's degradation counts, and the first of each kind writes a line on stderr. Never a death
@@ -23,11 +25,14 @@
 //! rt's floor refuses MoltenVK (it lacks `nullDescriptor`), so the platform is tested on Linux
 //! GPUs. On a Mac it builds.
 
+pub mod answers;
 pub mod descriptor;
+pub mod device;
+pub mod queue;
 pub mod unbuilt;
 pub mod unmade;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::core::num::ToU64 as _;
 use crate::core::platform::os::Threads;
@@ -39,10 +44,12 @@ use crate::core::raise::{OnFault, RaiseResult};
 use crate::os::{OsClock, OsThreads, OsVm};
 
 pub use descriptor::{PassFields, RateMapFields, TextureFields};
+pub use device::RtDevice;
+pub use queue::RtQueue;
 pub use unbuilt::Unbuilt;
 pub use unmade::{Unmade, kinds};
 
-use unbuilt::{refuse, refuse_create};
+use unbuilt::{RtRefusal, refuse, refuse_create, refused_again};
 
 /// A reference to an object the rt platform made itself: `clone_ref` takes another, and the last
 /// one's drop frees the object. Its identity is its allocation's address.
@@ -76,11 +83,14 @@ impl<T: Send + Sync + 'static> Handle for RtObj<T> {
 pub struct Listener;
 
 /// The process's platform over metal2vulkan-rt (the module's docs): the OS's VM, clocks and
-/// threads, and rt's objects as its pieces are built.
+/// threads, the process's one rt device once asked for, and rt's objects as its pieces are built.
 pub struct RtPlatform {
     vm: OsVm,
     clock: OsClock,
     threads: OsThreads,
+    /// The device, made at the first ask ([`device::open`]), or the kind of rt's refusal to make
+    /// it, which every ask answers.
+    device: OnceLock<Result<RtObj<RtDevice>, RtRefusal>>,
 }
 
 impl Default for RtPlatform {
@@ -104,20 +114,39 @@ impl RtPlatform {
             vm: OsVm::new(),
             clock: OsClock::new(),
             threads: OsThreads::new(),
+            device: OnceLock::new(),
         }
     }
 
-    /// `MTLCreateSystemDefaultDevice()`: the process's default device, or `None`. Unbuilt: refused
-    /// ([`Unbuilt::Device`]).
-    pub fn system_default_device(&self) -> Option<Unmade<kinds::Device>> {
-        refuse_create(Unbuilt::Device, "MTLCreateSystemDefaultDevice");
-        None
+    /// `MTLCreateSystemDefaultDevice()`: the process's one device ([`device`]'s docs), made at the
+    /// first ask; `None` where rt refuses to make it, counted at each ask under the kind of its
+    /// refusal, and logged at the first.
+    pub fn system_default_device(&self) -> Option<RtObj<RtDevice>> {
+        self.device_at("MTLCreateSystemDefaultDevice")
+    }
+
+    /// The device, made at the first ask, from `sel` (the type's docs).
+    fn device_at(&self, sel: &'static str) -> Option<RtObj<RtDevice>> {
+        let mut made_now = false;
+        let device = self.device.get_or_init(|| {
+            made_now = true;
+            device::open(self.vm.page_size()).map_err(|unopened| unopened.refuse(sel))
+        });
+        match device {
+            Ok(device) => Some(device.clone_ref()),
+            Err(kind) => {
+                if !made_now {
+                    refused_again(*kind);
+                }
+                None
+            }
+        }
     }
 }
 
 impl Platform for RtPlatform {
-    type Device = Unmade<kinds::Device>;
-    type CommandQueue = Unmade<kinds::CommandQueue>;
+    type Device = RtObj<RtDevice>;
+    type CommandQueue = RtObj<RtQueue>;
     type CommandBuffer = Unmade<kinds::CommandBuffer>;
     type BlitEncoder = Unmade<kinds::BlitEncoder>;
     type ComputeEncoder = Unmade<kinds::ComputeEncoder>;
@@ -127,8 +156,8 @@ impl Platform for RtPlatform {
     type Heap = Unmade<kinds::Heap>;
     type SamplerState = Unmade<kinds::SamplerState>;
     type DepthStencilState = Unmade<kinds::DepthStencilState>;
-    type Fence = Unmade<kinds::Fence>;
-    type Event = Unmade<kinds::Event>;
+    type Fence = RtObj<metal2vulkan_rt::Fence>;
+    type Event = RtObj<metal2vulkan_rt::Event>;
     type SharedEvent = Unmade<kinds::SharedEvent>;
     type SharedEventListener = RtObj<Listener>;
     type SharedTextureHandle = Unmade<kinds::SharedTextureHandle>;
@@ -196,11 +225,11 @@ impl Platform for RtPlatform {
         RtObj::new(RateMapFields)
     }
 
-    /// Unbuilt: nil ([`Unbuilt::Device`]).
-    fn open_device(&self, registry_id: u64) -> Option<Unmade<kinds::Device>> {
-        let _ = registry_id;
-        refuse_create(Unbuilt::Device, "MTLCreateSystemDefaultDevice");
-        None
+    /// The process's one device ([`RtPlatform::system_default_device`]) where `registry_id` is
+    /// its registry ID; `None` for any other, as Metal answers for an ID no device has.
+    fn open_device(&self, registry_id: u64) -> Option<RtObj<RtDevice>> {
+        let device = self.device_at("MTLCopyAllDevices")?;
+        (device.facts().registry_id == registry_id).then_some(device)
     }
 
     fn vm(&self) -> &dyn HostVm {
@@ -220,27 +249,12 @@ impl Platform for RtPlatform {
 mod tests {
     use super::*;
     use crate::core::platform::descriptor::TextureDescriptor;
-    use crate::core::platform::device::relaying_gaps;
 
     /// The count of `code` in the process's degradation counts.
     fn counted(code: &str) -> u64 {
         (crate::answer::degradation_counts().into_iter())
             .find(|(c, _)| c == code)
             .map_or(0, |(_, n)| n)
-    }
-
-    /// A device is refused while its piece is unbuilt: nil, counted under `rt-unbuilt-device` in
-    /// the degradation counts, and noted for core as a gap of the platform's; never a death.
-    #[test]
-    fn an_unbuilt_device_is_a_counted_typed_refusal() {
-        let platform = RtPlatform::new();
-        let code = Unbuilt::Device.code();
-        let before = counted(code);
-        let (device, relayed) = relaying_gaps(|| platform.open_device(0));
-        assert!(device.is_none());
-        assert!(relayed);
-        assert!(platform.system_default_device().is_none());
-        assert!(counted(code) >= before + 2, "{code}");
     }
 
     /// A rate map's layer is refused as nil and counted; its descriptor keeps nothing and reads as

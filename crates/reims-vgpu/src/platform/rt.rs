@@ -1,7 +1,7 @@
 //! `RtPlatform` as an `ApiPlatform`, under the `rt` feature: the platform over metal2vulkan-rt
 //! (`reims_vgpu_vulkan::rt_platform`), built piece by piece. A piece not built yet is a counted,
-//! typed refusal there. Until the device is built, a graphics device's start is refused, since its
-//! Metal device is nil.
+//! typed refusal there. A graphics device's start makes the process's rt device and answers the
+//! guest's device info from it; the guest's work is refused at each unbuilt piece it reaches.
 
 use reims_vgpu_vulkan::RtPlatform;
 use reims_vgpu_vulkan::core::platform::Platform;
