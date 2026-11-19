@@ -16,6 +16,7 @@ use reims_vgpu_video::core::sync::{Condvar, MutexGuard};
 use reims_vgpu_video::nvidia::{
     EncodeParams, EncodeProfile, EncodeRateControl, NvencEncoder, RawFrame, Tuning,
 };
+use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
 use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
@@ -64,12 +65,7 @@ fn params(profile: EncodeProfile, width: u32, height: u32) -> EncodeParams {
 }
 
 /// Copies `length` bytes of `from` into `to` on `queue`, and waits for the copy.
-fn copy(
-    queue: &<VulkanPlatform as Platform>::CommandQueue,
-    from: &VulkanBuffer,
-    to: &VulkanBuffer,
-    length: u64,
-) {
+fn copy<P: Platform>(queue: &P::CommandQueue, from: &P::Buffer, to: &P::Buffer, length: u64) {
     let cb = (queue.command_buffer(OnFault::Return))
         .expect("no raise")
         .expect("a command buffer");
@@ -105,115 +101,203 @@ fn a_picture_lands_in_an_imported_device_cache_as_it_reads_back() {
     crate::entry::run(|_| {
         let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
-        let video = NvidiaVideo::new(&device, &runtime).expect("NVDEC on the device's GPU");
-        let imports = (video.imports.as_ref()).expect("CUDA's imports of exportable buffers");
-        let (width, height, pitch) = (1920u32, 1080u32, 2048usize);
-        let rows = usize::try_from(height).expect("rows");
-        let luma_at = 0x20;
-        let chroma_at = luma_at + pitch * rows;
-        let len = u64::try_from(chroma_at + pitch * rows / 2).expect("a length");
-        let aligned = Some(u64::try_from(luma_at).expect("a byte"));
-        let made =
-            device.new_exportable_buffer_of_length(OnFault::Return, len, STORAGE_PRIVATE, aligned);
-        let cache = made.expect("no raise").expect("an exportable buffer");
-        let life = MemoryLife::new();
-        let imported = (imports.get_or_make(
-            &life.identity(),
-            0,
-            || import(&cache, &video.gpu),
-            || "gone".to_owned(),
-        ))
-        .expect("the cache's import");
-        let read_back = (device.new_buffer_of_length(OnFault::Return, len, 0))
-            .expect("no raise")
-            .expect("a Shared buffer");
-        let fill = (device.new_buffer_of_length(OnFault::Return, len, 0))
-            .expect("no raise")
-            .expect("a Shared buffer");
-        let length = usize::try_from(len).expect("a length");
-        // SAFETY: the Shared buffer's `len` bytes, which no GPU work reaches yet.
-        unsafe { std::ptr::write_bytes(fill.contents().as_ptr::<u8>(), UNTOUCHED, length) };
-        let queue = device.new_command_queue().expect("a command queue");
-        for (profile, codec) in [
-            (EncodeProfile::H264High, AnnexBCodec::H264),
-            (EncodeProfile::HevcMain, AnnexBCodec::Hevc),
-        ] {
-            let params = params(profile, width, height);
-            let mut encoder =
-                NvencEncoder::new(Arc::clone(&video.gpu), &params).expect("an NVENC session");
-            let mut decoder = AnnexBDecoder::new(&video.gpu, codec, &runtime);
-            decoder
-                .parameter_sets(encoder.sequence_parameters())
-                .expect("the parameter sets");
-            let mut pictures = 0;
-            for n in 0..6 {
-                let (luma, chroma) = frame(1920, 1080, n);
-                let packets = (encoder.encode(&RawFrame {
-                    luma: (&luma, 1920),
-                    chroma: (&chroma, 1920),
-                    index: n,
-                    force_idr: n == 0,
-                }))
-                .expect("a frame NVENC takes");
-                for packet in packets {
-                    let packet = packet.expect("a packet");
-                    let picture = (decoder.decode(&packet.data))
-                        .expect("a decode")
-                        .expect("a picture");
-                    copy(&queue, &fill, &cache, len);
-                    let plane = |offset, rows| DevicePlane {
-                        buffer: &imported,
-                        offset,
-                        bytes_per_row: pitch,
-                        row_bytes: 1920,
-                        rows,
-                    };
-                    // SAFETY: the planes lie apart in the cache, which no GPU work of the
-                    // runtime's reaches until the call returns.
-                    let written = unsafe {
-                        picture.write_into_device(
-                            (width, height),
-                            plane(luma_at, height),
-                            plane(chroma_at, height / 2),
-                            Box::new(()),
-                        )
-                    };
-                    written.expect("the decode").expect("the GPU's copy");
-                    cache.external_write_done().expect("the acquire");
-                    copy(&queue, &cache, &read_back, len);
-                    let read = picture.read_back((width, height)).expect("a read back");
-                    // SAFETY: the Shared buffer's `len` bytes, which the copy above finished
-                    // writing.
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(read_back.contents().as_ptr::<u8>(), length)
-                    };
-                    assert!(
-                        bytes[..luma_at].iter().all(|&b| b == UNTOUCHED),
-                        "{codec:?} picture {n}: the bytes before the planes"
-                    );
-                    for (read, at) in read.planes().iter().zip([luma_at, chroma_at]) {
-                        assert_eq!(read.bytes_per_row, 1920);
-                        for row in 0..usize::try_from(read.rows).expect("rows") {
-                            let landed = &bytes[at + row * pitch..][..pitch];
-                            assert_eq!(
-                                &landed[..1920],
-                                &read.bytes[row * 1920..][..1920],
-                                "{codec:?} picture {n}, row {row} of the plane at {at}"
-                            );
-                            assert!(
-                                landed[1920..].iter().all(|&b| b == UNTOUCHED),
-                                "{codec:?} picture {n}: bytes past row {row} of the plane at {at}"
-                            );
-                        }
-                    }
-                    pictures += 1;
-                }
-            }
-            assert_eq!(pictures, 6, "{codec:?}");
-        }
-        drop(imported);
-        drop(life);
+        let gpu = super::super::video_choice::nvidia_gpu(&device);
+        let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime, true)
+            .expect("NVDEC on the device's GPU");
+        lands_in_an_imported_device_cache(&device, &video, &runtime);
     });
+}
+
+/// As [`a_picture_lands_in_an_imported_device_cache_as_it_reads_back`], on the rt platform: its
+/// exportable buffers are blocks of their own, exported as opaque fds, which CUDA imports, and
+/// the acquire is rt's (`rt_platform::export`).
+#[cfg(feature = "rt")]
+#[test]
+#[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
+fn a_picture_lands_in_an_imported_rt_cache_as_it_reads_back() {
+    use reims_vgpu_vulkan::RtPlatform;
+    let platform = Arc::new(RtPlatform::new());
+    crate::entry::run(|_| {
+        let device = platform.system_default_device().expect("an rt device");
+        let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
+        let gpu = super::super::video_choice::rt_nvidia_gpu(&device);
+        let video = NvidiaVideo::<RtPlatform>::new(&device, gpu, &runtime, false)
+            .expect("NVDEC on the device's GPU");
+        lands_in_an_imported_device_cache(&device, &video, &runtime);
+    });
+}
+
+/// On the rt platform the guest's caps name each codec NVDEC decodes on the GPU, with the
+/// profiles it decodes, and no other, and decodes alone: no NVENC, whose reads of a buffer rt
+/// releases to CUDA in no command buffer yet, and no encoder for VideoToolbox. They say each
+/// picture lands in the device's caches, as every cache on rt is a shape's (`video_caps`), and
+/// the arm imports the device's exportable caches, rt's exported blocks, to write them in.
+#[cfg(feature = "rt")]
+#[test]
+#[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
+fn the_rt_platforms_caps_name_only_what_nvdec_decodes() {
+    use reims_vgpu_graphics::wire::RGFX_VIDEO_CAPS_OUTPUT_CACHED;
+    use reims_vgpu_vulkan::RtPlatform;
+    let platform = Arc::new(RtPlatform::new());
+    crate::entry::run(|_| {
+        let device = platform.system_default_device().expect("an rt device");
+        let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
+        let gpu = super::super::video_choice::rt_nvidia_gpu(&device);
+        let nvdec = NvidiaVideo::<RtPlatform>::new(&device, gpu, &runtime, false)
+            .expect("NVDEC on the device's GPU");
+        let decodes = |codec, bit_depth| supported(&nvdec.gpu, codec, bit_depth).is_some();
+        let mut expected = Vec::new();
+        if decodes(NvdecCodec::H264, 8) {
+            expected.push((RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_H264_HIGH));
+        }
+        let hevc_profiles = (if decodes(NvdecCodec::Hevc, 8) {
+            RGFX_VIDEO_HEVC_MAIN
+        } else {
+            0
+        }) | (if decodes(NvdecCodec::Hevc, 10) {
+            RGFX_VIDEO_HEVC_MAIN_10
+        } else {
+            0
+        });
+        if hevc_profiles != 0 {
+            expected.push((RGFX_VIDEO_CODEC_HEVC, hevc_profiles));
+        }
+        assert!(!expected.is_empty(), "NVDEC decodes neither codec");
+        drop(nvdec);
+
+        let video = (crate::graphics::rt_graphics_video(&device, Arc::clone(&runtime)))
+            .expect("the rt platform's video on the NVIDIA GPU");
+        let shapes = <RtPlatform as crate::platform::ApiPlatform>::SURFACE_SHAPES;
+        let caps = super::super::video_caps(0, shapes, &*video);
+        assert_ne!(caps.flags & RGFX_VIDEO_CAPS_OUTPUT_CACHED, 0);
+        assert!(video.imports_device_caches(), "CUDA imports no rt export");
+        let named = &caps.codecs[..usize::try_from(caps.codec_count).expect("a count")];
+        assert_eq!(named.len(), expected.len(), "{named:?}");
+        for (caps, (codec, profiles)) in named.iter().zip(&expected) {
+            assert_eq!((caps.codec, caps.direction), (*codec, RGFX_VIDEO_DECODE));
+            assert_eq!(caps.profiles & profiles, *profiles, "codec {codec:#x}");
+            if *codec == RGFX_VIDEO_CODEC_HEVC {
+                assert_eq!(caps.profiles, *profiles, "HEVC's profiles");
+            }
+        }
+        assert!(video.guest_encoders().is_empty());
+        assert!(video.guest_decodes());
+    });
+}
+
+/// The body of the imported cache's tests, on `P`'s `device`, NVDEC's arm on it `video`.
+fn lands_in_an_imported_device_cache<P: Platform>(
+    device: &P::Device,
+    video: &NvidiaVideo<P>,
+    runtime: &Arc<dyn Runtime>,
+) {
+    let imports = (video.imports.as_ref()).expect("CUDA's imports of exportable buffers");
+    let (width, height, pitch) = (1920u32, 1080u32, 2048usize);
+    let rows = usize::try_from(height).expect("rows");
+    let luma_at = 0x20;
+    let chroma_at = luma_at + pitch * rows;
+    let len = u64::try_from(chroma_at + pitch * rows / 2).expect("a length");
+    let aligned = Some(u64::try_from(luma_at).expect("a byte"));
+    let made =
+        device.new_exportable_buffer_of_length(OnFault::Return, len, STORAGE_PRIVATE, aligned);
+    let cache = made.expect("no raise").expect("an exportable buffer");
+    let life = MemoryLife::new();
+    let imported = (imports.get_or_make(
+        &life.identity(),
+        0,
+        || import::<P>(&cache, &video.gpu),
+        || "gone".to_owned(),
+    ))
+    .expect("the cache's import");
+    let read_back = (device.new_buffer_of_length(OnFault::Return, len, 0))
+        .expect("no raise")
+        .expect("a Shared buffer");
+    let fill = (device.new_buffer_of_length(OnFault::Return, len, 0))
+        .expect("no raise")
+        .expect("a Shared buffer");
+    let length = usize::try_from(len).expect("a length");
+    // SAFETY: the Shared buffer's `len` bytes, which no GPU work reaches yet.
+    unsafe { std::ptr::write_bytes(fill.contents().as_ptr::<u8>(), UNTOUCHED, length) };
+    let queue = device.new_command_queue().expect("a command queue");
+    for (profile, codec) in [
+        (EncodeProfile::H264High, AnnexBCodec::H264),
+        (EncodeProfile::HevcMain, AnnexBCodec::Hevc),
+    ] {
+        let params = params(profile, width, height);
+        let mut encoder =
+            NvencEncoder::new(Arc::clone(&video.gpu), &params).expect("an NVENC session");
+        let mut decoder = AnnexBDecoder::new(&video.gpu, codec, runtime);
+        decoder
+            .parameter_sets(encoder.sequence_parameters())
+            .expect("the parameter sets");
+        let mut pictures = 0;
+        for n in 0..6 {
+            let (luma, chroma) = frame(1920, 1080, n);
+            let packets = (encoder.encode(&RawFrame {
+                luma: (&luma, 1920),
+                chroma: (&chroma, 1920),
+                index: n,
+                force_idr: n == 0,
+            }))
+            .expect("a frame NVENC takes");
+            for packet in packets {
+                let packet = packet.expect("a packet");
+                let picture = (decoder.decode(&packet.data))
+                    .expect("a decode")
+                    .expect("a picture");
+                copy::<P>(&queue, &fill, &cache, len);
+                let plane = |offset, rows| DevicePlane {
+                    buffer: &imported,
+                    offset,
+                    bytes_per_row: pitch,
+                    row_bytes: 1920,
+                    rows,
+                };
+                // SAFETY: the planes lie apart in the cache, which no GPU work of the
+                // runtime's reaches until the call returns.
+                let written = unsafe {
+                    picture.write_into_device(
+                        (width, height),
+                        plane(luma_at, height),
+                        plane(chroma_at, height / 2),
+                        Box::new(()),
+                    )
+                };
+                written.expect("the decode").expect("the GPU's copy");
+                cache.external_write_done().expect("the acquire");
+                copy::<P>(&queue, &cache, &read_back, len);
+                let read = picture.read_back((width, height)).expect("a read back");
+                // SAFETY: the Shared buffer's `len` bytes, which the copy above finished
+                // writing.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(read_back.contents().as_ptr::<u8>(), length)
+                };
+                assert!(
+                    bytes[..luma_at].iter().all(|&b| b == UNTOUCHED),
+                    "{codec:?} picture {n}: the bytes before the planes"
+                );
+                for (read, at) in read.planes().iter().zip([luma_at, chroma_at]) {
+                    assert_eq!(read.bytes_per_row, 1920);
+                    for row in 0..usize::try_from(read.rows).expect("rows") {
+                        let landed = &bytes[at + row * pitch..][..pitch];
+                        assert_eq!(
+                            &landed[..1920],
+                            &read.bytes[row * 1920..][..1920],
+                            "{codec:?} picture {n}, row {row} of the plane at {at}"
+                        );
+                        assert!(
+                            landed[1920..].iter().all(|&b| b == UNTOUCHED),
+                            "{codec:?} picture {n}: bytes past row {row} of the plane at {at}"
+                        );
+                    }
+                }
+                pictures += 1;
+            }
+        }
+        assert_eq!(pictures, 6, "{codec:?}");
+    }
+    drop(imported);
+    drop(life);
 }
 
 /// A runtime that records the name of each thread it starts, over the platform's.
@@ -270,7 +354,9 @@ fn an_encode_first_processs_waits_run_on_the_arms_runtime() {
                 started: Mutex::new(Vec::new()),
             });
             let runtime: Arc<dyn Runtime> = Arc::<Naming>::clone(&naming);
-            let video = NvidiaVideo::new(&device, &runtime).expect("NVDEC on the device's GPU");
+            let gpu = super::super::video_choice::nvidia_gpu(&device);
+            let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime, true)
+                .expect("NVDEC on the device's GPU");
             let params = params(EncodeProfile::H264High, 1920, 1080);
             let mut encoder =
                 NvencEncoder::new(Arc::clone(&video.gpu), &params).expect("an NVENC session");
@@ -434,8 +520,9 @@ fn a_videotoolbox_picture_lands_in_the_lent_surfaces_pages_as_it_reads_back() {
     crate::entry::run(|_| {
         let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
-        let video =
-            Arc::new(NvidiaVideo::new(&device, &runtime).expect("NVDEC on the device's GPU"));
+        let gpu = super::super::video_choice::nvidia_gpu(&device);
+        let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime, true);
+        let video = Arc::new(video.expect("NVDEC on the device's GPU"));
         let shared = Shared(Arc::clone(&video));
         assert!(shared.guest_decodes());
         assert!(shared.guest_decoder(RGFX_VIDEO_CODEC_H264).is_some());

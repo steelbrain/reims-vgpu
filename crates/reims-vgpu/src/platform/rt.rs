@@ -82,6 +82,16 @@ impl ApiPlatform for RtPlatform {
     ) -> Option<<Self as Platform>::Texture> {
         device.new_texture_for_views(desc)
     }
+
+    /// The first of the host's video arms that takes the device (`graphics::video_choice`): on
+    /// Linux, NVDEC's decodes on an NVIDIA GPU; none elsewhere yet.
+    fn graphics_video(
+        &self,
+        device: &<Self as Platform>::Device,
+        runtime: Arc<dyn reims_vgpu_video::core::runtime::Runtime>,
+    ) -> Option<Arc<dyn crate::GraphicsVideo<Self>>> {
+        crate::graphics::rt_graphics_video(device, runtime)
+    }
 }
 
 /// rt's import of the `length` bytes of a pages block's view at `first`, as a no-copy buffer's is

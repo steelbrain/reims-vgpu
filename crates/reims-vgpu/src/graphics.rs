@@ -175,6 +175,8 @@ mod vt;
 mod vt_encode;
 mod vulkan;
 
+#[cfg(feature = "rt")]
+pub(crate) use video_choice::rt_graphics_video;
 pub(crate) use video_choice::graphics_video as vulkan_graphics_video;
 
 pub use decode::{GraphicsVideo, GraphicsVideoSession, PlanePages, VideoDecode, VideoPlane};

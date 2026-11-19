@@ -3,10 +3,13 @@
 //! the host's video sessions (`super::video_host`), whose event the host signals once a picture
 //! has landed; and NVENC, in the host's encode sessions (`encode`'s module doc).
 //!
-//! - **Which GPU.** The runtime device's own, by its PCI address, where the device is NVIDIA's
-//!   and CUDA opens the GPU there. Anywhere else the arm declines, with one line at info, and the
-//!   device's video goes to the next arm (`super::video_choice`). One video a runtime device,
-//!   shared by its sessions while one lives.
+//! - **Which GPU.** The platform device's own, by its PCI address ([`NvidiaGpu`]), where the
+//!   device is NVIDIA's and CUDA opens the GPU there. Anywhere else the arm declines, with one
+//!   line at info, and the device's video goes to the next arm (`super::video_choice`). One video
+//!   a platform device, shared by its sessions while one lives. The arm is the same on either
+//!   platform (`VulkanPlatform`'s, and under the `rt` feature `RtPlatform`'s), but for NVENC,
+//!   which a platform takes only where it releases a buffer to CUDA before NVENC reads it
+//!   ([`open`]'s `encodes`).
 //! - **The decode caps** are NVDEC's own answers (`cuvidGetDecoderCaps`): H.264's Baseline, Main and
 //!   High where NVDEC decodes H.264 at 8 bits, and HEVC's Main where it decodes HEVC at 8 bits
 //!   and Main 10 where it does at 10, each into its format (NV12, P010), at the least of their
@@ -60,6 +63,7 @@
 //!   from the IOSurface its kext lent: copied by the GPU into memory NVENC reads, as an x86
 //!   guest's frame is, else read by the CPU.
 
+use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 
@@ -80,14 +84,12 @@ use reims_vgpu_video::nvidia::{
     decode_capabilities, encode_profiles,
 };
 use reims_vgpu_video::paravirt::{Encoder, EncoderConfig};
-use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::core::platform::Handle as _;
+use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::core::sync::Mutex;
-use reims_vgpu_vulkan::gpu::device::VulkanDevice;
-use reims_vgpu_vulkan::gpu::resource::VulkanBuffer;
 
 use super::decode::{
     GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput, PlanePages,
@@ -124,42 +126,59 @@ const PROBE_BYTES: u64 = 3840 * 2160 * 3 / 2;
 /// The most imports of device caches kept at once: a few decoders' output pools.
 const MOST_IMPORTS: usize = 64;
 
-/// The video of each runtime device, by its registry ID, while one lives.
-type MadeVideos = Vec<(u64, Weak<NvidiaVideo>)>;
+/// The video of each platform device, by its registry ID, while one lives: an `NvidiaVideo` of
+/// the device's platform.
+type MadeVideos = Vec<(u64, Weak<dyn Any + Send + Sync>)>;
 
-/// NVDEC's video for `device`'s sessions: the one they share, made on first use, the NVIDIA
-/// crate's threads and waits `runtime`'s, every session kind's, unless a video opened before
-/// handed it another; `None`, with a line at info, where the device is not an NVIDIA GPU CUDA
-/// opens, or NVDEC decodes and NVENC encodes neither H.264 nor HEVC there.
-pub(crate) fn open(
-    device: &VulkanDevice,
+/// What the arm reads of a platform device's GPU ([`open`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NvidiaGpu {
+    /// The device's registry ID, which keys its one video.
+    pub(crate) registry_id: u64,
+    /// The GPU's PCI vendor ID.
+    pub(crate) vendor_id: u32,
+    /// The GPU's PCI domain, bus, device and function; `None` where the device lists none.
+    pub(crate) pci: Option<(u32, u32, u32, u32)>,
+}
+
+/// NVDEC's video for `device`'s sessions, whose GPU is `gpu`: the one they share, made on first
+/// use, the NVIDIA crate's threads and waits `runtime`'s, every session kind's, unless a video
+/// opened before handed it another; NVENC's encodes with it where `encodes`, which a platform
+/// asks only where its buffers' GPU copies reach what CUDA reads of them (`encode`'s module doc).
+/// `None`, with a line at info, where the device is not an NVIDIA GPU CUDA opens, or NVDEC
+/// decodes and NVENC encodes neither H.264 nor HEVC there (decodes alone where not `encodes`).
+pub(crate) fn open<P: Platform>(
+    device: &P::Device,
+    gpu: NvidiaGpu,
     runtime: &Arc<dyn Runtime>,
-) -> Option<Arc<dyn GraphicsVideo<VulkanPlatform>>> {
+    encodes: bool,
+) -> Option<Arc<dyn GraphicsVideo<P>>> {
     static MADE: LazyLock<Mutex<MadeVideos>> = LazyLock::new(|| Mutex::new(Vec::new()));
     let mut made = MADE.lock();
     made.retain(|(_, video)| video.strong_count() > 0);
     let kept = (made.iter())
-        .find(|(id, _)| *id == device.registry_id)
-        .and_then(|(_, video)| video.upgrade());
+        .filter(|(id, _)| *id == gpu.registry_id)
+        .find_map(|(_, video)| video.upgrade()?.downcast::<NvidiaVideo<P>>().ok());
     let video = match kept {
         Some(video) => video,
         None => {
-            let video = Arc::new(NvidiaVideo::new(device, runtime)?);
-            made.push((device.registry_id, Arc::downgrade(&video)));
+            let video = Arc::new(NvidiaVideo::<P>::new(device, gpu, runtime, encodes)?);
+            let any: Arc<dyn Any + Send + Sync> = Arc::<NvidiaVideo<P>>::clone(&video);
+            made.push((gpu.registry_id, Arc::downgrade(&any)));
             video
         }
     };
     Some(Arc::new(Shared(video)))
 }
 
-/// A runtime device's NVDEC, as the graphics device sees it.
-struct Shared(Arc<NvidiaVideo>);
+/// A platform device's NVDEC, as the graphics device sees it.
+struct Shared<P: Platform>(Arc<NvidiaVideo<P>>);
 
-/// NVDEC on a runtime device's GPU, and what it answers.
-struct NvidiaVideo {
+/// NVDEC on a platform device's GPU, and what it answers.
+struct NvidiaVideo<P: Platform> {
     gpu: Arc<Gpu>,
-    /// The runtime device, whose queues copy staged planes into device caches.
-    device: VulkanDevice,
+    /// The platform device, whose queues copy staged planes into device caches.
+    device: P::Device,
     /// The caps of H.264's decode; `None` where NVDEC has none.
     h264: Option<RgfxVideoCodecCaps>,
     /// The caps of HEVC's decode; `None` where NVDEC has none.
@@ -175,17 +194,21 @@ struct NvidiaVideo {
     imports: Option<DeviceImports<ImportedBuffer>>,
 }
 
-impl NvidiaVideo {
-    fn new(device: &VulkanDevice, runtime: &Arc<dyn Runtime>) -> Option<Self> {
-        let properties = device.raw.properties();
-        if properties.vendor_id != NVIDIA_VENDOR {
+impl<P: Platform> NvidiaVideo<P> {
+    fn new(
+        device: &P::Device,
+        facts: NvidiaGpu,
+        runtime: &Arc<dyn Runtime>,
+        encodes: bool,
+    ) -> Option<Self> {
+        if facts.vendor_id != NVIDIA_VENDOR {
             log::info!(
                 "hardware video: not on {NAME}: the GPU ({:#06x}) is not NVIDIA's",
-                properties.vendor_id
+                facts.vendor_id
             );
             return None;
         }
-        let Some((domain, bus, slot, function)) = properties.pci_bus else {
+        let Some((domain, bus, slot, function)) = facts.pci else {
             log::info!("hardware video: not on {NAME}: the GPU lists no PCI address");
             return None;
         };
@@ -245,6 +268,13 @@ impl NvidiaVideo {
             })
         };
         let encoders = match encode_profiles(Arc::clone(&gpu)) {
+            Ok(_) if !encodes => {
+                log::info!(
+                    "hardware video: no {ENCODE_NAME} at {address}: the platform releases no \
+                     buffer to CUDA before NVENC reads it"
+                );
+                Vec::new()
+            }
             Ok(encoders) => encoders,
             Err(error) => {
                 log::info!("hardware video: no {ENCODE_NAME} at {address}: {error}");
@@ -285,7 +315,7 @@ impl NvidiaVideo {
             encodes(RGFX_VIDEO_CODEC_H264),
             encodes(RGFX_VIDEO_CODEC_HEVC),
         );
-        let imports = imports_caches(device, &gpu, runtime);
+        let imports = imports_caches::<P>(device, &gpu, runtime);
         Some(Self {
             gpu,
             device: device.clone_ref(),
@@ -299,10 +329,10 @@ impl NvidiaVideo {
     }
 }
 
-impl NvidiaVideo {
+impl<P: Platform> NvidiaVideo<P> {
     /// A new encode session's GPU filler, where CUDA imports the device's exportable buffers
     /// (`encode`'s module doc), or why it has none.
-    fn filler(&self) -> Result<encode::Filler<VulkanPlatform>, String> {
+    fn filler(&self) -> Result<encode::Filler<P>, String> {
         match self.imports {
             Some(_) => Ok(encode::Filler::new(&self.device, &self.gpu, &self.runtime)),
             None => Err("CUDA imports no exportable buffer of the device".to_owned()),
@@ -314,8 +344,8 @@ impl NvidiaVideo {
 /// bytes made exportable, its memory exported and imported on `gpu`, once, as the video opens.
 /// The line at info says which way pictures land, with the make's and the import's times, the
 /// make's against a buffer made as any other; `None` where any step is refused.
-fn imports_caches(
-    device: &VulkanDevice,
+fn imports_caches<P: Platform>(
+    device: &P::Device,
     gpu: &Arc<Gpu>,
     runtime: &Arc<dyn Runtime>,
 ) -> Option<DeviceImports<ImportedBuffer>> {
@@ -339,7 +369,7 @@ fn imports_caches(
     let plain_make = runtime.elapsed_since(start);
     drop(plain);
     let start = runtime.now();
-    let imported = import(&buffer, gpu);
+    let imported = import::<P>(&buffer, gpu);
     let import_time = runtime.elapsed_since(start);
     if let Err(why) = imported {
         return declined(&why);
@@ -360,7 +390,7 @@ fn imports_caches(
 }
 
 /// `buffer`'s memory imported on `gpu`; `Err` says why not.
-fn import(buffer: &VulkanBuffer, gpu: &Arc<Gpu>) -> Result<ImportedBuffer, String> {
+fn import<P: Platform>(buffer: &P::Buffer, gpu: &Arc<Gpu>) -> Result<ImportedBuffer, String> {
     let exported = buffer.export_memory()?;
     ImportedBuffer::import(
         gpu,
@@ -404,7 +434,7 @@ fn decode_caps(codec: u32, answered: &[DecodeCapabilities]) -> RgfxVideoCodecCap
     }
 }
 
-impl GraphicsVideo<VulkanPlatform> for Shared {
+impl<P: Platform> GraphicsVideo<P> for Shared<P> {
     fn caps(&self) -> Vec<RgfxVideoCodecCaps> {
         let decode = self.0.h264.into_iter().chain(self.0.hevc);
         decode.chain(self.0.encode.iter().copied()).collect()
@@ -414,11 +444,7 @@ impl GraphicsVideo<VulkanPlatform> for Shared {
         encode::encode_caps(codec, &self.0.encoders)
     }
 
-    fn session(
-        &self,
-        codec: u32,
-        direction: u32,
-    ) -> Option<Arc<dyn GraphicsVideoSession<VulkanPlatform>>> {
+    fn session(&self, codec: u32, direction: u32) -> Option<Arc<dyn GraphicsVideoSession<P>>> {
         let video = &self.0;
         if direction == RGFX_VIDEO_ENCODE {
             let entry = (video.encode.iter()).find(|c| c.codec == codec)?;
@@ -474,10 +500,7 @@ impl GraphicsVideo<VulkanPlatform> for Shared {
         encode::guest_encoders(&self.0.encoders)
     }
 
-    fn guest_encoder(
-        &self,
-        config: &EncoderConfig,
-    ) -> Result<Box<dyn GuestEncoder<VulkanPlatform>>, VideoError> {
+    fn guest_encoder(&self, config: &EncoderConfig) -> Result<Box<dyn GuestEncoder<P>>, VideoError> {
         let video = &self.0;
         let encoder = encode::NvGuestEncoder::new(&video.gpu, config, video.filler())?;
         Ok(Box::new(encoder))
@@ -498,16 +521,16 @@ impl GraphicsVideo<VulkanPlatform> for Shared {
 }
 
 /// One session's decoder.
-struct NvdecDecoder {
+struct NvdecDecoder<P: Platform> {
     decoder: AnnexBDecoder,
     /// The video it decodes on, whose imports of device caches its pictures land in.
-    video: Arc<NvidiaVideo>,
+    video: Arc<NvidiaVideo<P>>,
     /// Whether a picture of the session found its pages or its caches out of CUDA's reach, which
     /// is logged once.
     declined: Arc<AtomicBool>,
 }
 
-impl HostDecoder<VulkanPlatform> for NvdecDecoder {
+impl<P: Platform> HostDecoder<P> for NvdecDecoder<P> {
     fn parameter_sets(&mut self, sets: &[u8]) -> Result<(), BackendError> {
         Ok(self.decoder.parameter_sets(sets)?)
     }
@@ -515,15 +538,15 @@ impl HostDecoder<VulkanPlatform> for NvdecDecoder {
     fn decode(
         &mut self,
         au: &[u8],
-        _output: &DecodeOutput<VulkanPlatform>,
-    ) -> Result<Option<Box<dyn HostPicture<VulkanPlatform>>>, BackendError> {
+        _output: &DecodeOutput<P>,
+    ) -> Result<Option<Box<dyn HostPicture<P>>>, BackendError> {
         let picture = self.decoder.decode(au)?;
         Ok(picture.map(|picture| {
             Box::new(NvdecPicture {
                 picture,
                 video: Arc::clone(&self.video),
                 declined: Arc::clone(&self.declined),
-            }) as Box<dyn HostPicture<VulkanPlatform>>
+            }) as Box<dyn HostPicture<P>>
         }))
     }
 
@@ -532,7 +555,7 @@ impl HostDecoder<VulkanPlatform> for NvdecDecoder {
     }
 }
 
-impl Drop for NvdecDecoder {
+impl<P: Platform> Drop for NvdecDecoder<P> {
     fn drop(&mut self) {
         let sent = self.decoder.bitstreams();
         log::info!(
@@ -544,13 +567,13 @@ impl Drop for NvdecDecoder {
 }
 
 /// A picture NVDEC decoded, as the session lands it.
-struct NvdecPicture {
+struct NvdecPicture<P: Platform> {
     picture: AnnexBPicture,
-    video: Arc<NvidiaVideo>,
+    video: Arc<NvidiaVideo<P>>,
     declined: Arc<AtomicBool>,
 }
 
-impl NvdecPicture {
+impl<P: Platform> NvdecPicture<P> {
     /// Logs, once a session, and at info once per process (`kind`), why its pictures are copied
     /// by the CPU.
     fn decline(&self, why: &str) {
@@ -564,7 +587,7 @@ impl NvdecPicture {
 
     /// Writes the picture into the output's planes: in their device caches, in their pages by
     /// the GPU, or read back and copied by the CPU.
-    fn land_planes(&self, to: &mut Landing<'_, VulkanPlatform>) -> Result<(), BackendError> {
+    fn land_planes(&self, to: &mut Landing<'_, P>) -> Result<(), BackendError> {
         let (luma, chroma) = (to.luma, to.chroma);
         let sample = u64::try_from(self.picture.bytes_per_sample()).unwrap_or(u64::MAX);
         if luma.width.checked_mul(sample) != Some(luma.row_bytes) {
@@ -603,8 +626,8 @@ impl NvdecPicture {
     fn write_in_cache(
         &self,
         size: (u32, u32),
-        luma: &OutputPlane<VulkanPlatform>,
-        chroma: &OutputPlane<VulkanPlatform>,
+        luma: &OutputPlane<P>,
+        chroma: &OutputPlane<P>,
     ) -> Result<bool, BackendError> {
         let Some(imports) = &self.video.imports else {
             return Ok(false);
@@ -613,11 +636,11 @@ impl NvdecPicture {
             return Ok(false);
         };
         let gpu = &self.video.gpu;
-        let imported = |plane: &OutputPlane<VulkanPlatform>, cache: &MemoryIdentity| {
+        let imported = |plane: &OutputPlane<P>, cache: &MemoryIdentity| {
             imports.get_or_make(
                 cache,
                 0,
-                || import(&plane.buffer, gpu),
+                || import::<P>(&plane.buffer, gpu),
                 || "the device cache went".to_owned(),
             )
         };
@@ -674,8 +697,8 @@ impl NvdecPicture {
     fn write_in_place(
         &self,
         size: (u32, u32),
-        luma: &OutputPlane<VulkanPlatform>,
-        chroma: &OutputPlane<VulkanPlatform>,
+        luma: &OutputPlane<P>,
+        chroma: &OutputPlane<P>,
     ) -> Result<bool, BackendError> {
         let (Some(luma_pages), Some(chroma_pages)) = (&luma.pages, &chroma.pages) else {
             return Ok(false);
@@ -704,8 +727,8 @@ impl NvdecPicture {
 
 /// `plane`, its crop's rows, where it lies in its device cache's import; `None` past the host's
 /// address space.
-fn device_plane<'a>(
-    plane: &OutputPlane<VulkanPlatform>,
+fn device_plane<'a, P: Platform>(
+    plane: &OutputPlane<P>,
     import: &'a Arc<ImportedBuffer>,
 ) -> Option<DevicePlane<'a>> {
     Some(DevicePlane {
@@ -718,8 +741,8 @@ fn device_plane<'a>(
 }
 
 /// `plane`, its crop's rows, where it lies in `pages`; `None` past the host's address space.
-fn memory_plane<'a>(
-    plane: &OutputPlane<VulkanPlatform>,
+fn memory_plane<'a, P: Platform>(
+    plane: &OutputPlane<P>,
     pages: &'a PlanePages,
 ) -> Option<MemoryPlane<'a>> {
     let offset = (pages.buffer_offset.checked_add(plane.offset))
@@ -733,8 +756,8 @@ fn memory_plane<'a>(
     })
 }
 
-impl HostPicture<VulkanPlatform> for NvdecPicture {
-    fn land(self: Box<Self>, to: &mut Landing<'_, VulkanPlatform>) -> Result<(), BackendError> {
+impl<P: Platform> HostPicture<P> for NvdecPicture<P> {
+    fn land(self: Box<Self>, to: &mut Landing<'_, P>) -> Result<(), BackendError> {
         let landed = self.land_planes(to);
         if landed.is_ok()
             && let Some(status) = self.picture.copied_failed()
