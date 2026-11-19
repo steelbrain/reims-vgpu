@@ -7,7 +7,6 @@
 use std::marker::PhantomData;
 
 use crate::core::host::HostPtr;
-use crate::core::platform::compute::ComputeCmd;
 use crate::core::platform::icb::DispatchThreadgroupsArgs;
 use crate::core::platform::icb::DispatchThreadsArgs;
 use crate::core::platform::icb::DrawArgs;
@@ -25,7 +24,7 @@ use crate::core::platform::types::MtlSize;
 use crate::core::platform::types::NsRange;
 use crate::core::platform::types::SizeAndAlign;
 use crate::core::platform::{Handle, ObjId, Platform};
-use crate::core::platform::{compute, function_table, icb, rate_map, render, resource};
+use crate::core::platform::{function_table, icb, rate_map, render, resource};
 use crate::core::raise::OnFault;
 use crate::core::raise::RaiseResult;
 
@@ -55,8 +54,6 @@ impl<K: 'static> Handle for Unmade<K> {
 /// The kinds of object [`Unmade`] stands for, one type each, so each associated type of the
 /// platform is a type of its own.
 pub mod kinds {
-    /// `id<MTLComputeCommandEncoder>`.
-    pub enum ComputeEncoder {}
     /// `id<MTLRenderCommandEncoder>`.
     pub enum RenderEncoder {}
     /// `MTLSharedTextureHandle *`.
@@ -79,27 +76,6 @@ pub mod kinds {
     pub enum IndirectComputeCommand {}
     /// `MTLRasterizationRateLayerDescriptor *`.
     pub enum RateMapLayerDescriptor {}
-}
-
-impl<P: Platform> compute::ComputeEncoder<P> for Unmade<kinds::ComputeEncoder> {
-    fn encode(&self, _on: OnFault, _cmd: ComputeCmd<'_, P>) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn encode_end_do_while(
-        &self,
-        _buffer: Option<&P::Buffer>,
-        _offset: u64,
-        _comparison: u64,
-        _reference_value: u32,
-    ) -> RaiseResult<bool> {
-        self.unreachable()
-    }
-    fn encode_end_if(&self) -> RaiseResult<bool> {
-        self.unreachable()
-    }
-    fn encode_end_while(&self) -> RaiseResult<bool> {
-        self.unreachable()
-    }
 }
 
 impl<P: Platform> render::RenderEncoder<P> for Unmade<kinds::RenderEncoder> {

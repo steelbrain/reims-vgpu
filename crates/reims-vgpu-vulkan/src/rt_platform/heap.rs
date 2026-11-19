@@ -87,6 +87,13 @@ pub struct RtHeap {
     purgeable: AtomicU64,
 }
 
+impl RtHeap {
+    /// The number of the block it is a range of, which `useHeap:` keeps.
+    pub fn block_id(&self) -> rt::BlockId {
+        self.block.id
+    }
+}
+
 /// What a heap's descriptor makes of it: its storage mode's block class, its size, whether it is
 /// a placement heap, the options it answers and whether option bit 24 is set.
 type Shape = (rt::MemoryClass, u64, bool, u64, bool);

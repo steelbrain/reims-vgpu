@@ -60,9 +60,15 @@ pub enum Unbuilt {
     /// Argument buffers' layouts (`newArgumentEncoderWithArguments:` and a function's). Each
     /// answers nil.
     ArgumentLayout,
-    /// Compute and render command encoders, whose pipelines are unbuilt
-    /// (`computeCommandEncoder`, `renderCommandEncoderWithDescriptor:`). Each answers nil.
+    /// Render command encoders, whose pipelines are unbuilt
+    /// (`renderCommandEncoderWithDescriptor:`). Each answers nil.
     Encoder,
+    /// Compute commands rt has no form of: an indirect `dispatchThreads` and an indirect stage-in
+    /// region. Each encodes nothing.
+    ComputeCommand,
+    /// Command predication (`encodeStart*`, `encodeEnd*`): rt has none. A start encodes nothing,
+    /// and an end answers NO.
+    Predication,
     /// Protection options other than 0 (`setProtectionOptions:`): rt protects no work. The
     /// command buffer runs as one with none.
     Protection,
@@ -93,7 +99,7 @@ pub enum Unbuilt {
 
 impl Unbuilt {
     /// Every piece, once, in the order of their codes' places.
-    pub const ALL: [Unbuilt; 17] = [
+    pub const ALL: [Unbuilt; 19] = [
         Unbuilt::Buffer,
         Unbuilt::IosurfaceTexture,
         Unbuilt::SharedTexture,
@@ -103,6 +109,8 @@ impl Unbuilt {
         Unbuilt::PipelineQuery,
         Unbuilt::ArgumentLayout,
         Unbuilt::Encoder,
+        Unbuilt::ComputeCommand,
+        Unbuilt::Predication,
         Unbuilt::Protection,
         Unbuilt::FillTexture,
         Unbuilt::Blit,
@@ -125,6 +133,8 @@ impl Unbuilt {
             Unbuilt::PipelineQuery => "rt-unbuilt-pipeline-query",
             Unbuilt::ArgumentLayout => "rt-unbuilt-argument-layout",
             Unbuilt::Encoder => "rt-unbuilt-encoder",
+            Unbuilt::ComputeCommand => "rt-unbuilt-compute-command",
+            Unbuilt::Predication => "rt-unbuilt-predication",
             Unbuilt::Protection => "rt-unbuilt-protection",
             Unbuilt::FillTexture => "rt-unbuilt-fill-texture",
             Unbuilt::Blit => "rt-unbuilt-blit",
@@ -147,7 +157,9 @@ impl Unbuilt {
             Unbuilt::FunctionTable => "a function handle or a visible function table",
             Unbuilt::PipelineQuery => "a pipeline state's threadgroup memory or imageblock length",
             Unbuilt::ArgumentLayout => "an argument buffer's layout",
-            Unbuilt::Encoder => "a compute or render command encoder",
+            Unbuilt::Encoder => "a render command encoder",
+            Unbuilt::ComputeCommand => "an indirect dispatchThreads or stage-in region",
+            Unbuilt::Predication => "command predication",
             Unbuilt::Protection => "a command buffer's protection options",
             Unbuilt::FillTexture => "a fill of a texture with bytes",
             Unbuilt::Blit => "a colour fill, a pattern fill or a copy with blit options",

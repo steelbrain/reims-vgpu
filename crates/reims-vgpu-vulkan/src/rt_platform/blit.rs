@@ -54,8 +54,8 @@ impl RtBlitEncoder {
     }
 }
 
-/// Why a command encodes nothing before rt sees it.
-enum Stop {
+/// Why a command encodes nothing before rt sees it, or after: an encoder's ([`report`]).
+pub(super) enum Stop {
     /// Metal's validation stops it: counted as Metal's refusal, with what it was.
     Metal(&'static str),
     /// An unbuilt piece.
@@ -71,7 +71,7 @@ impl From<rt::Error> for Stop {
 }
 
 /// A nil argument Metal's validation stops.
-const NIL: Stop = Stop::Metal("a nil argument");
+pub(super) const NIL: Stop = Stop::Metal("a nil argument");
 
 /// A value past rt's 32 bits, which no texture holds.
 const WIDE: Stop = Stop::Metal("a slice, level, origin or size past 32 bits");
@@ -358,6 +358,19 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
     Ok(())
 }
 
+/// Counts the command `sel` that `stopped` stopped, if any, under its kind: Metal's refusal, the
+/// unbuilt piece's code, or rt's refusal's kind (a texture's pixel format's own).
+pub(super) fn report(sel: &'static str, stopped: Option<Stop>) {
+    match stopped {
+        None => {}
+        Some(Stop::Metal(what)) => refused_as(sel, RtRefusal::Refused, &what),
+        Some(Stop::Unbuilt(piece)) => refuse(piece, sel),
+        Some(Stop::Rt(error)) => {
+            rt_refused_texture(sel, &error);
+        }
+    }
+}
+
 impl BlitEncoder<RtPlatform> for RtObj<RtBlitEncoder> {
     /// rt's command (the module's docs); `endEncoding` ends rt's encoder. A command after it is
     /// Metal's refusal, counted.
@@ -375,14 +388,7 @@ impl BlitEncoder<RtPlatform> for RtObj<RtBlitEncoder> {
             self.open.end();
         }
         drop(open);
-        match stopped {
-            None => {}
-            Some(Stop::Metal(what)) => refused_as(sel, RtRefusal::Refused, &what),
-            Some(Stop::Unbuilt(piece)) => refuse(piece, sel),
-            Some(Stop::Rt(error)) => {
-                rt_refused_texture(sel, &error);
-            }
-        }
+        report(sel, stopped);
         Ok(())
     }
 

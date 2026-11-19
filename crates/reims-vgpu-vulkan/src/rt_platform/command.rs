@@ -16,8 +16,11 @@
 //!   as for a command buffer that ended with an error. rt's errors are Metal's
 //!   `MTLCommandBufferErrorDomain` codes: a lost device `DeviceRemoved` (11), and a command
 //!   buffer rt ended without running (its device quiesced, its queue abandoned) `Internal` (1).
-//! - **Encoders**: blit encoders ([`super::blit`]). Compute and render encoders are unbuilt
-//!   ([`Unbuilt::Encoder`]): nil.
+//! - **Encoders**: blit encoders ([`super::blit`]) and compute encoders ([`super::compute`]), of
+//!   the serial dispatch type or the descriptor's (another value is Metal's refusal, nil). Render
+//!   encoders are unbuilt ([`Unbuilt::Encoder`]): nil.
+//! - **What it keeps**: the pipeline states its encoders set ([`Kept`]), from their set until it
+//!   completes, released after its completed handlers ran.
 //! - **A signal as it is scheduled** (`encodeSignalEventScheduled:value:`) sets the shared
 //!   event's value in the scheduled handler, as Metal signals it once the command buffer is
 //!   scheduled, in its order among the scheduled handlers.
@@ -38,6 +41,7 @@
 //! Every call rt refuses answers as Metal's answers where it fails (nothing encoded, nil, no
 //! wait), counted under the refusal's kind ([`rt_refused`]); never a death.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -50,14 +54,16 @@ use crate::core::platform::command::{
 use crate::core::platform::event::EventRef;
 use crate::core::platform::types::{CommandBufferStatus, NsErrorText};
 use crate::core::platform::values::ComputePassDesc;
-use crate::core::platform::{Handle, Platform};
+use crate::core::platform::{Handle, ObjId, Platform};
 use crate::core::raise::refusals;
 use crate::core::raise::{OnFault, RaiseResult};
 use crate::core::rt::BlockEnv;
 use crate::core::sync::Mutex;
 
 use super::blit::RtBlitEncoder;
+use super::compute::RtComputeEncoder;
 use super::device::RtDevice;
+use super::texture::refused_metal;
 use super::unbuilt::{
     RtRefusal, Unbuilt, refuse, refuse_create, refused_as, rt_refused, rt_refused_create,
 };
@@ -87,6 +93,8 @@ pub struct RtCommandBuffer {
     held: Mutex<Held>,
     /// Its encoders made and not yet ended ([`OpenMark`]).
     open: Arc<AtomicUsize>,
+    /// What it keeps until it completes.
+    kept: Kept,
 }
 
 /// A command buffer's handlers until its commit hands them to rt, each kind in the order added,
@@ -124,6 +132,7 @@ impl RtCommandBuffer {
             device,
             held: Mutex::new(Held::default()),
             open: Arc::default(),
+            kept: Kept::default(),
         }
     }
 
@@ -159,6 +168,25 @@ impl RtCommandBuffer {
         }
         drop(held);
         OpenMark::new(&self.open)
+    }
+
+    /// A compute encoder of `dispatch_type`, made by `sel`: nil where rt refuses it, counted.
+    fn compute_encoder_of(
+        &self,
+        sel: &'static str,
+        dispatch_type: rt::DispatchType,
+    ) -> Option<RtObj<RtComputeEncoder>> {
+        match self.rt.compute_command_encoder(dispatch_type) {
+            Ok(encoder) => {
+                let concurrent = dispatch_type == rt::DispatchType::Concurrent;
+                let (mark, kept) = (self.opened(), self.kept.clone());
+                Some(RtObj::new(RtComputeEncoder::new(encoder, mark, kept, concurrent)))
+            }
+            Err(error) => {
+                rt_refused_create(sel, &error);
+                None
+            }
+        }
     }
 
     /// Why it may not be cut now: the first of [`KeptWhole::ALL`] that holds (the module's docs).
@@ -197,6 +225,26 @@ impl RtCommandBuffer {
                 None
             }
         }
+    }
+}
+
+/// What a command buffer keeps from its encoders' sets until it completes: the objects whose drop
+/// gives back what the work recorded with them reads, by their identity, each once. A pipeline
+/// state's drop gives back its sampler indices (`super::pipeline`), which rt's recorded work reads
+/// while rt keeps its own state. The commit hands them to a completed handler, which drops them
+/// after core's; a command buffer never committed drops them with itself.
+#[derive(Clone, Default)]
+pub struct Kept(Arc<Mutex<HashMap<ObjId, Box<dyn Send>>>>);
+
+impl Kept {
+    /// Keeps `object`, whose identity is `id`, unless an object of that identity is kept.
+    pub fn keep(&self, id: ObjId, object: Box<dyn Send>) {
+        self.0.lock().entry(id).or_insert(object);
+    }
+
+    /// What is kept, taken: none is kept since.
+    fn take(&self) -> HashMap<ObjId, Box<dyn Send>> {
+        std::mem::take(&mut *self.0.lock())
     }
 }
 
@@ -389,6 +437,10 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         };
         submission.extend(scheduled);
         seen.extend(completed);
+        let kept = self.kept.take();
+        if !kept.is_empty() {
+            seen.push(Box::new(move |_made: &rt::CommandBuffer| drop(kept)));
+        }
         let run = |handlers: Vec<Handler>| {
             move |made: &rt::CommandBuffer| handlers.into_iter().for_each(|handler| handler(made))
         };
@@ -407,14 +459,14 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         Ok(())
     }
 
-    /// Unbuilt: nil ([`Unbuilt::Encoder`]).
+    /// A serial compute encoder: nil where rt refuses it, counted.
     fn compute_encoder(
         &self,
         on: OnFault,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::ComputeEncoder>> {
         let _ = on;
-        refuse_create(Unbuilt::Encoder, "computeCommandEncoder");
-        Ok(None)
+        let serial = rt::DispatchType::Serial;
+        Ok(self.compute_encoder_of("computeCommandEncoder", serial))
     }
 
     fn device(&self) -> Option<<RtPlatform as Platform>::Device> {
@@ -518,14 +570,19 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         Ok(())
     }
 
-    /// Unbuilt: nil ([`Unbuilt::Encoder`]).
+    /// A compute encoder of the descriptor's dispatch type, serial where it sets none: nil for a
+    /// value no `MTLDispatchType` is, Metal's refusal, and where rt refuses it, counted.
     fn compute_encoder_for_pass(
         &self,
         desc: &ComputePassDesc,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::ComputeEncoder>> {
-        let _ = desc;
-        refuse_create(Unbuilt::Encoder, "computeCommandEncoderWithDescriptor:");
-        Ok(None)
+        let sel = "computeCommandEncoderWithDescriptor:";
+        let dispatch_type = match desc.dispatch_type {
+            None | Some(0) => rt::DispatchType::Serial,
+            Some(1) => rt::DispatchType::Concurrent,
+            Some(other) => return Ok(refused_metal(sel, &format!("MTLDispatchType {other}"))),
+        };
+        Ok(self.compute_encoder_of(sel, dispatch_type))
     }
 
     /// The work so far committed as a part, and the next part, where it may be cut (the
@@ -722,15 +779,12 @@ mod tests {
         assert_eq!(nil.encode_signal_when_scheduled(None, 1), Ok(()));
         assert_eq!(counted(metal), before + 3);
 
-        // Unbuilt encoders and protection options; the command buffer still runs.
+        // Unbuilt render encoders and protection options; the command buffer still runs.
         let encoders = counted(Unbuilt::Encoder.code());
         let protection = counted(Unbuilt::Protection.code());
-        assert!(matches!(nil.compute_encoder(on), Ok(None)));
         let pass = platform.new_render_pass_descriptor();
         assert!(matches!(nil.render_encoder(on, &pass), Ok(None)));
-        let desc = ComputePassDesc::default();
-        assert!(matches!(nil.compute_encoder_for_pass(&desc), Ok(None)));
-        assert_eq!(counted(Unbuilt::Encoder.code()), encoders + 3);
+        assert_eq!(counted(Unbuilt::Encoder.code()), encoders + 1);
         assert_eq!(nil.set_protection_options(on, 0), Ok(()));
         assert_eq!(counted(Unbuilt::Protection.code()), protection);
         assert_eq!(nil.set_protection_options(on, 1), Ok(()));

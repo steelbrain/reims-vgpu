@@ -10,7 +10,8 @@
 //! [`mod@format`]), its command queues ([`queue`]), events, fences and shared events ([`event`]),
 //! the reservation of resource indices, buffers and the textures over them ([`buffer`]), heaps but
 //! sparse ones ([`heap`]), textures made of a descriptor, with their views ([`texture`]),
-//! command buffers ([`command`]) with their blit encoders ([`blit`]), sampler and depth-stencil
+//! command buffers ([`command`]) with their blit and compute encoders ([`blit`], [`compute`]),
+//! sampler and depth-stencil
 //! states ([`state`]), libraries and their functions ([`library`]), and compute pipeline states
 //! ([`pipeline`]). Until a piece is built, every
 //! call that reaches it is refused ([`unbuilt`]). The call answers as Metal's call answers where it
@@ -33,6 +34,7 @@ pub mod answers;
 pub mod blit;
 pub mod buffer;
 pub mod command;
+pub mod compute;
 pub mod descriptor;
 pub mod device;
 pub mod event;
@@ -60,6 +62,7 @@ use crate::os::{OsClock, OsThreads, OsVm};
 pub use blit::RtBlitEncoder;
 pub use buffer::{KnownBlocks, RtBuffer};
 pub use command::RtCommandBuffer;
+pub use compute::RtComputeEncoder;
 pub use descriptor::{PassFields, RateMapFields, TextureFields};
 pub use device::RtDevice;
 pub use heap::RtHeap;
@@ -171,7 +174,7 @@ impl Platform for RtPlatform {
     type CommandQueue = RtObj<RtQueue>;
     type CommandBuffer = RtObj<RtCommandBuffer>;
     type BlitEncoder = RtObj<RtBlitEncoder>;
-    type ComputeEncoder = Unmade<kinds::ComputeEncoder>;
+    type ComputeEncoder = RtObj<RtComputeEncoder>;
     type RenderEncoder = Unmade<kinds::RenderEncoder>;
     type Buffer = RtObj<RtBuffer>;
     type Texture = RtObj<RtTexture>;
