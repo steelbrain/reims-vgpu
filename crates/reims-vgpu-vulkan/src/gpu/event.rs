@@ -37,12 +37,20 @@ impl SharedEvent<VulkanPlatform> for VulkanSharedEvent {
         recorded_answer
     }
 
-    /// The runtime's value: the event's timeline as the GPU and the CPU have raised it.
+    /// The runtime's value: the event's timeline as the GPU and the CPU have raised it. In a
+    /// process that records, it is answered once the recorder compared what the command buffers
+    /// that signal it to that value could have written ([`crate::recorder::event_reached`]).
     fn signaled_value(&self) -> u64 {
-        plain(|| rt::SharedEvent::signaled_value(self))
+        let value = plain(|| rt::SharedEvent::signaled_value(self));
+        if let Some(id) = crate::recorder::event_key(self) {
+            crate::recorder::event_reached(id, value);
+        }
+        value
     }
 
-    /// Blocks up to `milliseconds`.
+    /// Blocks up to `milliseconds`. In a process that records, a wait that saw the value reached
+    /// returns once the recorder compared what the command buffers that signal it could have
+    /// written ([`crate::recorder::event_reached`]).
     fn wait_until_signaled_value(&self, value: u64, milliseconds: u64) -> bool {
         let recorded_call = crate::recorder::rec_call!(
             "waitUntilSignaledValue:timeoutMS:",
@@ -51,13 +59,17 @@ impl SharedEvent<VulkanPlatform> for VulkanSharedEvent {
             milliseconds
         );
         let recorded_answer = crate::recorder::run(|| -> bool {
-            plain(|| {
+            let reached = plain(|| {
                 rt::SharedEvent::wait_until_signaled_value(
                     self,
                     value,
                     Duration::from_millis(milliseconds),
                 )
-            })
+            });
+            if reached && let Some(id) = crate::recorder::event_key(self) {
+                crate::recorder::event_reached(id, value);
+            }
+            reached
         });
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
@@ -67,7 +79,9 @@ impl SharedEvent<VulkanPlatform> for VulkanSharedEvent {
     /// reaches `value`. The runtime sees a command buffer's signal rise as its completion turn
     /// sees the batch that ends at it finish, so a signal encoded before more of the buffer's work
     /// is seen there, before the buffer completes (the runtime's `command_buffer/batches.rs` and
-    /// `event.rs`, read from code).
+    /// `event.rs`, read from code). In a process that records, `block` runs once the recorder
+    /// compared what the command buffers that signal the event to `value` could have written
+    /// ([`crate::recorder::event_reached`]).
     fn notify_listener(
         &self,
         listener: &VulkanSharedEventListener,
@@ -76,10 +90,14 @@ impl SharedEvent<VulkanPlatform> for VulkanSharedEvent {
     ) -> RaiseResult<()> {
         #[cfg(test)]
         let slot = crate::core::testkit::capture::current_slot();
+        let recorded = crate::recorder::event_key(self);
         let notification: rt::SharedEventNotification =
             Box::new(move |_event: &rt::SharedEvent, _value: u64| {
                 // A callout on the runtime's thread: marked ours, so a panic here aborts.
                 let _env = BlockEnv::foreign();
+                if let Some(id) = recorded {
+                    crate::recorder::event_reached(id, value);
+                }
                 #[cfg(test)]
                 crate::core::testkit::capture::with_slot(slot, block);
                 #[cfg(not(test))]

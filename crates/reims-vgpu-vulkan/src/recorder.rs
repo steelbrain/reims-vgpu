@@ -69,22 +69,32 @@
 //!   the counters its kernels add to). Such a write follows the record of the call that
 //!   committed the command buffer, held while that call runs ([`release_completions`]), so a
 //!   player, which waits before each write for the command buffers that can complete, puts it in
-//!   after its own run of the command buffer. Both are done when the platform first sees the
-//!   command buffer complete, in the first of its completion-seen handlers to run, before any of
-//!   them or its completed handlers tell the guest, and before `waitUntilCompleted` returns
-//!   ([`completion_seen`]); for one whose status read final first, when the next commit reaps it
-//!   ([`State::absorb_reaped`]).
+//!   after its own run of the command buffer. Both are done before the guest can learn of the
+//!   completion, on every route by which it does ([`completion_seen`]): in the first of the
+//!   command buffer's completion-seen handlers to run, before any of them or its completed
+//!   handlers tell the guest, and before `waitUntilCompleted` returns; and where the platform
+//!   answers its status final, runs one of its completed handlers or returns from a wait for it
+//!   first (the runtime sets the status before it runs the handlers, and refuses a handler once
+//!   the command buffer is enqueued). One whose status read final first is taken when the next
+//!   commit reaps it ([`State::absorb_reaped`]). Until it is taken, the recorder holds the
+//!   runtime's command buffer ([`Completion::raw`]), and reads its status and waits for it there:
+//!   core lets go of the guest's at its commit (its release record follows the commit's) while
+//!   the GPU still runs it. The work before a shared event signal a command buffer encodes is
+//!   done once the event reaches the signal's value, which the guest can learn before the
+//!   command buffer completes: where the platform learns an event's value (a listener's
+//!   notification, a CPU wait that saw it reached, a read of it), before it can tell the guest,
+//!   each command buffer to complete that signals the event to that value or below has what it
+//!   could have written compared as at a completion, and its completion compares all of it
+//!   ([`event_reached`]); so has each that signals an event a command buffer that completed
+//!   waited for. The header says so ([`format::FLAG_COMPLETION_BYTES_RECORDED`]).
 //!
-//!   Two cases still lose a CPU write from the writes before a commit (an announce, below, still
-//!   writes it). One is a write made while the command buffer runs, into the very bytes a blit
-//!   or a pass of it writes: it is taken with the GPU's bytes (the guest raced its own GPU work);
-//!   one into what its kernels could store to is in the completion's write. The other is a write
-//!   the guest makes once it learns of the completion before those handlers run: from an event
-//!   the command buffer signals (the runtime signals its events and sets its status before it
-//!   runs the handlers), or from its status read in that gap, which lasts microseconds. The
-//!   hashing runs on the runtime's thread that saw the completion, and holds back other
-//!   completions while it runs: `<pid>.stats.txt` counts its time and chunks
-//!   (`completion_*`).
+//!   One case still loses a CPU write from the writes before a commit (an announce, below, still
+//!   writes it): a write made while the command buffer runs, into the very bytes a blit or a
+//!   pass of it writes, is taken with the GPU's bytes (the guest raced its own GPU work); one into
+//!   what its kernels could store to is in the completion's write. The hashing runs on the thread
+//!   that saw the completion, the runtime's for a handler, and holds back other completions while
+//!   it runs: `<pid>.stats.txt` counts its time and chunks (`completion_*`), and the signals seen
+//!   reached before their command buffer's completion (`signals_heard`).
 //!
 //!   An announce, a `didModifyRange:` of a `Managed` buffer, also writes each chunk of its range
 //!   whose bytes differ from those the stream's last write of it recorded, or that no write
@@ -206,6 +216,8 @@ pub const FIXES: &[&str] = &[
     "announce-bytes",
     // e3898c754: what kernels changed, at their completion
     "kernel-writes-at-completion",
+    // the commit that adds this name: each completion before the guest can learn of it
+    "completion-before-guest-learns",
 ];
 
 /// The stats file's lines that name the recorder's build: its commit ([`COMMIT`]), then one for
@@ -1240,7 +1252,10 @@ pub fn draws<T: Send + Sync + 'static>(
 /// kernels and render stages could store to, are kept for its completion ([`completion_seen`]),
 /// which a completion-seen handler of the recorder's added now runs: the first taken as the
 /// stream's, the second written where it changed, after the record of the call that committed it
-/// ([`release_completions`]).
+/// ([`release_completions`]). So are the shared event signals it encodes, for the guest's
+/// learning of one before it completes ([`event_reached`]), and the events it waits for, which its
+/// completion tells reached; and the runtime's command buffer, held until the completion is taken
+/// ([`Completion::raw`]).
 pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
     if active.is_none() {
         return;
@@ -1255,7 +1270,7 @@ pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
     let t1 = now_ns();
     state.absorb_reaped(&reaped);
     state.stats.wait_ns.fetch_add(t1 - t0, Ordering::Relaxed);
-    let (reach, writes, stores): (Vec<u64>, _, Vec<u64>) = {
+    let (reach, writes, stores, signals, waits): (Vec<u64>, _, Vec<u64>, Vec<_>, Vec<_>) = {
         let sync = state.sync.lock();
         (sync.cbs.get(&id))
             .map(|c| {
@@ -1264,17 +1279,25 @@ pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
                     reach,
                     c.gpu_writes.clone(),
                     c.stores.iter().copied().collect(),
+                    c.signals.clone(),
+                    c.waits.clone(),
                 )
             })
             .unwrap_or_default()
     };
     let ranges = state.ranges_of(&reach);
     state.capture(&ranges);
-    let completion = Completion {
-        written: state.written_spans(&writes),
-        stored: state.stored_spans(&stores),
-    };
-    if !completion.written.is_empty() || !completion.stored.is_empty() {
+    let written = state.written_spans(&writes);
+    let stored = state.stored_spans(&stores);
+    if !written.is_empty() || !stored.is_empty() || !waits.is_empty() {
+        let completion = Completion {
+            written,
+            stored,
+            signals: signals.into_iter().map(|(e, v)| (e, v, false)).collect(),
+            waits,
+            heard: false,
+            raw: cb.raw.clone(),
+        };
         {
             let mut sync = state.sync.lock();
             sync.absorbs.insert(id, completion);
@@ -1283,7 +1306,8 @@ pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
         COMMITTED.with(|c| c.borrow_mut().push(id));
         // Run where the runtime sees the command buffer complete, after any of core's added
         // before (whose hook takes the bytes first), before its completed handlers and before
-        // `waitUntilCompleted` returns. Refused, the bytes are taken once it is reaped.
+        // `waitUntilCompleted` returns. Refused, the bytes are taken where the platform first
+        // tells of the completion, or once it is reaped.
         let seen: metal2vulkan_runtime::Handler =
             Box::new(move |_: &metal2vulkan_runtime::CommandBuffer| completion_seen(id));
         let _ = cb.raw.add_completion_seen_handler(seen);
@@ -1314,21 +1338,52 @@ pub fn completion_key(cb: &VulkanCommandBuffer) -> Option<u64> {
     id_at(cb.id().0)
 }
 
-/// The command buffer of stream id `id` seen complete, by the first of its completion-seen
-/// handlers to run, before it or any later handler tells the guest ([`State::complete`]): the
-/// bytes its blits and passes wrote that fill whole chunks become the stream's, and each chunk
-/// its kernels and render stages could store to, or its blits wrote part of, is written where it
-/// differs from the stream's, so a CPU write the guest makes once told reaches the stream, one
-/// that puts back the bytes the stream held before the command buffer ran included. Called
-/// again, or for a command buffer whose writes were taken already ([`State::absorb_reaped`]),
-/// it does nothing. Runs on the runtime's thread, which it holds while it hashes; it takes the
-/// recorder's locks, which no thread holds while it waits for the device, and holds no object.
+/// The command buffer of stream id `id` seen complete, before the platform can tell the guest
+/// ([`State::complete`]): by the first of its completion-seen handlers to run, before it or any
+/// later handler tells the guest; and by the platform's answer of its status final, a completed
+/// handler of it and a return from a wait for it, before each tells the guest, for a command
+/// buffer whose status reads final before its handlers run or whose hook the runtime refused.
+/// The bytes its blits and passes wrote that fill whole chunks become the stream's, and each
+/// chunk its kernels and render stages could store to, or its blits wrote part of, is written
+/// where it differs from the stream's, so a CPU write the guest makes once told reaches the
+/// stream, one that puts back the bytes the stream held before the command buffer ran included.
+/// Called again, for a command buffer whose writes were taken already
+/// ([`State::absorb_reaped`]), or for one with none to take, it does nothing. A handler runs it
+/// on the runtime's thread, which it holds while it hashes; it takes the recorder's locks, which
+/// no thread holds while it waits for the device, and lets go of the runtime's command buffer
+/// once it holds none ([`Completion::raw`]).
 pub fn completion_seen(id: u64) {
     let Some(state) = state() else { return };
     let mut sync = state.sync.lock();
-    if let Some(completion) = sync.absorbs.remove(&id) {
+    let taken = sync.absorbs.remove(&id);
+    if let Some(completion) = &taken {
         state.complete(&mut sync, id, completion);
     }
+    drop(sync);
+    drop(taken);
+}
+
+/// The stream id of the shared event `event` while the process records, which the platform
+/// passes to [`event_reached`] where it learns the event's value; `None`, at the cost of one
+/// relaxed load, where it does not.
+pub fn event_key(event: &crate::gpu::event::VulkanSharedEvent) -> Option<u64> {
+    if !on() {
+        return None;
+    }
+    id_at(event.id().0)
+}
+
+/// The shared event of stream id `event` seen at `value` or above, where the platform learns
+/// it (a listener's notification as it runs, a CPU wait that saw it reached, a read of the
+/// value), before the guest can: each command buffer whose completion is still to be taken and
+/// that signals the event to `value` or below, a signal not seen reached yet, ran its work
+/// before that signal, so what it could have written is compared with the stream's as at a
+/// completion ([`State::hear`]). So a CPU write the guest makes once told reaches the stream, one
+/// that puts back the bytes the stream held before the command buffer ran included.
+pub fn event_reached(event: u64, value: u64) {
+    let Some(state) = state() else { return };
+    let mut sync = state.sync.lock();
+    state.reached(&mut sync, event, value);
 }
 
 /// After the record of a thread's outermost call is queued: the writes at the completions of
@@ -1709,8 +1764,8 @@ struct SyncState {
     pending: Vec<Pending>,
     /// The highest value the CPU, or a completed command buffer, signalled each event to.
     signalled: KeyMap<u64>,
-    /// The host memory each committed command buffer's GPU work writes or could store to, by
-    /// its stream id, until its completion ([`completion_seen`]).
+    /// What each committed command buffer's completion takes ([`Completion`]), by its stream
+    /// id, until it is taken ([`completion_seen`]).
     absorbs: KeyMap<Completion>,
     /// The committed command buffers whose commit's record is not queued yet: the call that
     /// committed each is still running ([`release_completions`]).
@@ -1719,8 +1774,8 @@ struct SyncState {
     held: KeyMap<Vec<Call>>,
 }
 
-/// What a committed command buffer's completion does with host memory ([`State::complete`]).
-#[derive(Default)]
+/// What a committed command buffer's completion does with host memory ([`State::complete`]),
+/// and what the guest can learn of it before it completes.
 struct Completion {
     /// What its blits and passes write, bytes only the GPU writes ([`Cb::gpu_writes`]): each
     /// chunk wholly inside taken as the stream's, each it writes part of compared.
@@ -1728,6 +1783,21 @@ struct Completion {
     /// What its kernels and render stages could store to ([`Cb::stores`]), in CPU-visible
     /// memory the GPU's work writes in place: compared.
     stored: Vec<Span>,
+    /// The events its encoders signal, each with the value and whether the recorder saw the
+    /// event reach it ([`event_reached`]).
+    signals: Vec<(u64, u64, bool)>,
+    /// The events its encoders wait for, each with the value: reached once it completes.
+    waits: Vec<(u64, u64)>,
+    /// Whether a signal of it was seen reached ([`State::hear`]): what its blits and passes
+    /// write was taken there, while its work after the signal may still write it, so its
+    /// completion compares all of it.
+    heard: bool,
+    /// The runtime's command buffer, held until the completion is taken: core lets go of the
+    /// guest's at its commit (its release record follows the commit's), and the recorder reads
+    /// the status and waits here. It is no object of the stream's, and holding it changes nothing
+    /// the guest observes: its object, its id and its release are core's, as before. It is
+    /// dropped with no recorder lock held.
+    raw: metal2vulkan_runtime::CommandBuffer,
 }
 
 /// One span of host memory to compare: `start..end` of the target's bytes, the target's first
@@ -1809,6 +1879,9 @@ struct Stats {
     completion_chunks_written: AtomicU64,
     completion_write_bytes: AtomicU64,
     completion_writes_held: AtomicU64,
+    /// The signals of command buffers seen reached before their completion, each a comparison
+    /// ([`State::hear`]), whose time and writes the completions' counts hold.
+    signals_heard: AtomicU64,
     waits: AtomicU64,
     held: AtomicU64,
     wait_timeouts: AtomicU64,
@@ -2198,6 +2271,7 @@ impl State {
             "completion_writes_held",
             &s.completion_writes_held,
         );
+        line(&mut out, "signals_heard", &s.signals_heard);
         line(&mut out, "waits", &s.waits);
         line(&mut out, "held", &s.held);
         line(&mut out, "wait_timeouts", &s.wait_timeouts);
@@ -2521,32 +2595,43 @@ impl State {
     }
 
     /// Drops the committed command buffers that completed, their signals folded in, and those
-    /// released: each one's stream id, and whether it was seen complete.
-    fn reap(&self) -> Vec<(u64, bool)> {
+    /// released with no completion to take: the stream ids of those dropped. One whose
+    /// completion is to be taken is read through the runtime's command buffer the recorder holds
+    /// for it ([`Completion::raw`]), so one the guest released stays until it completes.
+    fn reap(&self) -> Vec<u64> {
         let mut held = Vec::new();
         let mut reaped = Vec::new();
         {
             let mut sync = self.sync.lock();
+            let SyncState {
+                pending,
+                absorbs,
+                signalled,
+                ..
+            } = &mut *sync;
             // The command buffers looked at are let go once the lock is (`let_go_cb` may record a
             // release).
             let mut done = Vec::new();
-            sync.pending.retain(|p| {
-                let (finished, seen) = match upgrade_cb(&p.weak) {
-                    None => (true, false),
-                    Some(cb) => {
-                        let finished = finished(&cb);
-                        held.push(cb);
-                        (finished, finished)
-                    }
+            pending.retain(|p| {
+                let finished = match absorbs.get(&p.id) {
+                    Some(completion) => raw_finished(&completion.raw),
+                    None => match upgrade_cb(&p.weak) {
+                        None => true,
+                        Some(cb) => {
+                            let finished = finished(&cb);
+                            held.push(cb);
+                            finished
+                        }
+                    },
                 };
                 if finished {
                     done.extend(p.signals.iter().copied());
-                    reaped.push((p.id, seen));
+                    reaped.push(p.id);
                 }
                 !finished
             });
             for (e, v) in done {
-                let s = sync.signalled.entry(e).or_insert(0);
+                let s = signalled.entry(e).or_insert(0);
                 *s = (*s).max(v);
             }
         }
@@ -2554,24 +2639,26 @@ impl State {
         reaped
     }
 
-    /// Does the completion of each reaped command buffer ([`State::complete`]) where its
-    /// completion hook has not ([`completion_seen`]): one whose status read final before the hook
-    /// ran (a wait for earlier work returns there), or whose hook the runtime refused. A released
-    /// one's is dropped, its chunks written again where they changed. The sync lock is held
-    /// throughout, so a hook that runs meanwhile, and what its command buffer's handlers tell the
-    /// guest after it, wait for the bytes to be taken.
-    fn absorb_reaped(&self, reaped: &[(u64, bool)]) {
+    /// Does the completion of each reaped command buffer ([`State::complete`]) where nothing
+    /// took it yet ([`completion_seen`]): one whose status read final before its hook ran (a
+    /// wait for earlier work returns there), one the guest released, or one whose hook the
+    /// runtime refused. The sync lock is held throughout, so a hook that runs meanwhile, and
+    /// what its command buffer's handlers tell the guest after it, wait for the bytes to be
+    /// taken; the runtime's command buffers are dropped once it is let go.
+    fn absorb_reaped(&self, reaped: &[u64]) {
         if reaped.is_empty() {
             return;
         }
         let mut sync = self.sync.lock();
-        for &(id, seen) in reaped {
-            if let Some(completion) = sync.absorbs.remove(&id)
-                && seen
-            {
-                self.complete(&mut sync, id, completion);
+        let mut taken = Vec::new();
+        for &id in reaped {
+            if let Some(completion) = sync.absorbs.remove(&id) {
+                self.complete(&mut sync, id, &completion);
+                taken.push(completion);
             }
         }
+        drop(sync);
+        drop(taken);
     }
 
     /// The completion of the command buffer of stream id `id`, the sync lock held (`sync`): what
@@ -2580,23 +2667,92 @@ impl State {
     /// to, and of what its blits wrote part of, is written where its bytes differ from the
     /// stream's ([`Compare::Complete`]), so the stream's bytes there are the GPU's from here on
     /// and a CPU write after it, one that puts back the bytes before included, differs from
-    /// them. Its writes are queued now, or, while the call that committed the command buffer has
-    /// not queued its record, held until it does ([`release_completions`]).
-    fn complete(&self, sync: &mut SyncState, id: u64, completion: Completion) {
+    /// them. Where a signal of it was seen reached first ([`State::hear`]), what its blits and
+    /// passes wrote is compared too, since its work after the signal may have written it after
+    /// the bytes were taken. Its writes are queued now, or, while the call that committed the
+    /// command buffer has not queued its record, held until it does ([`release_completions`]).
+    /// Each event it waited for reached its value, so the command buffers that signal it are
+    /// heard ([`State::reached`]).
+    fn complete(&self, sync: &mut SyncState, id: u64, completion: &Completion) {
         let t0 = now_ns();
-        let mut spans = self.absorb(&completion.written);
-        spans.extend(completion.stored);
+        let mut spans = if completion.heard {
+            completion.written.clone()
+        } else {
+            self.absorb(&completion.written)
+        };
+        spans.extend_from_slice(&completion.stored);
         let writes = self.compare(&spans, Compare::Complete);
+        self.queue_completion(sync, id, writes);
+        (self.stats.completion_ns).fetch_add(now_ns() - t0, Ordering::Relaxed);
+        for &(event, value) in &completion.waits {
+            self.reached(sync, event, value);
+        }
+    }
+
+    /// The writes of the completion of the command buffer of stream id `id`, or of a signal of
+    /// it heard, the sync lock held (`sync`): queued now, or, while the call that committed it has
+    /// not queued its record, held until it does ([`release_completions`]).
+    fn queue_completion(&self, sync: &mut SyncState, id: u64, writes: Vec<Call>) {
         let n = writes.len() as u64;
-        if n > 0 {
-            self.stats.completion_writes.fetch_add(n, Ordering::Relaxed);
-            if sync.unqueued.contains(&id) {
-                (self.stats.completion_writes_held).fetch_add(n, Ordering::Relaxed);
-                sync.held.entry(id).or_default().extend(writes);
-            } else {
-                writes.into_iter().for_each(|w| self.push(Item::Write(w)));
+        if n == 0 {
+            return;
+        }
+        self.stats.completion_writes.fetch_add(n, Ordering::Relaxed);
+        if sync.unqueued.contains(&id) {
+            (self.stats.completion_writes_held).fetch_add(n, Ordering::Relaxed);
+            sync.held.entry(id).or_default().extend(writes);
+        } else {
+            writes.into_iter().for_each(|w| self.push(Item::Write(w)));
+        }
+    }
+
+    /// The shared event of stream id `event` seen at `value`, the sync lock held (`sync`): each
+    /// command buffer whose completion is still to be taken with a signal of it to `value` or
+    /// below not seen reached yet has those signals marked reached and is heard
+    /// ([`State::hear`]), in the order of their stream ids.
+    fn reached(&self, sync: &mut SyncState, event: u64, value: u64) {
+        let mut heard = Vec::new();
+        for (&id, completion) in &mut sync.absorbs {
+            let mut any = false;
+            for signal in &mut completion.signals {
+                if signal.0 == event && signal.1 <= value && !signal.2 {
+                    signal.2 = true;
+                    any = true;
+                }
+            }
+            if any {
+                heard.push(id);
             }
         }
+        heard.sort_unstable();
+        for id in heard {
+            self.hear(sync, id);
+        }
+    }
+
+    /// A signal of the command buffer of stream id `id` seen reached before its completion, the
+    /// sync lock held (`sync`): its work before the signal ran, and the guest may learn so now.
+    /// What it could have written is compared as at a completion ([`State::complete`]). Only the
+    /// first time are the whole chunks its blits and passes write taken as the stream's
+    /// ([`State::absorb`]): its work after the signal may still write them, so later signals and
+    /// the completion compare all of it. So a CPU write the guest makes once told is in the
+    /// stream, one that puts back the bytes the stream held before the command buffer ran
+    /// included.
+    fn hear(&self, sync: &mut SyncState, id: u64) {
+        let t0 = now_ns();
+        let Some(completion) = sync.absorbs.get_mut(&id) else {
+            return;
+        };
+        let mut spans = if completion.heard {
+            completion.written.clone()
+        } else {
+            self.absorb(&completion.written)
+        };
+        completion.heard = true;
+        spans.extend_from_slice(&completion.stored);
+        let writes = self.compare(&spans, Compare::Complete);
+        self.stats.signals_heard.fetch_add(1, Ordering::Relaxed);
+        self.queue_completion(sync, id, writes);
         (self.stats.completion_ns).fetch_add(now_ns() - t0, Ordering::Relaxed);
     }
 
@@ -2664,9 +2820,11 @@ impl State {
 
     /// Waits, at most [`WAIT_BOUND`], for each committed command buffer that can run: one whose
     /// event waits a CPU signal, a completed command buffer or another that can run satisfies,
-    /// and whose queue's earlier one can run.
+    /// and whose queue's earlier one can run. One whose completion is to be taken is waited for
+    /// through the runtime's command buffer the recorder holds ([`Completion::raw`]), whether
+    /// the guest released its own or not; a wait past the bound is counted (`wait_timeouts`).
     fn wait_for_earlier(&self) {
-        let runnable: Vec<Weak<dyn Any + Send + Sync>> = {
+        let runnable: Vec<Watched> = {
             let sync = self.sync.lock();
             let n = sync.pending.len();
             let mut can = vec![false; n];
@@ -2705,17 +2863,26 @@ impl State {
                 .iter()
                 .zip(can)
                 .filter(|(_, c)| *c)
-                .map(|(p, _)| p.weak.clone())
+                .map(|(p, _)| match sync.absorbs.get(&p.id) {
+                    Some(completion) => Watched::Raw(completion.raw.clone()),
+                    None => Watched::Weak(p.weak.clone()),
+                })
                 .collect()
         };
         let start = now_ns();
         let bound = u64::try_from(WAIT_BOUND.as_nanos()).unwrap_or(u64::MAX);
-        for weak in runnable {
+        for watched in &runnable {
             self.stats.waits.fetch_add(1, Ordering::Relaxed);
             loop {
-                let Some(cb) = upgrade_cb(&weak) else { break };
-                let done = finished(&cb);
-                let_go_cb(cb);
+                let done = match watched {
+                    Watched::Raw(raw) => raw_finished(raw),
+                    Watched::Weak(weak) => {
+                        let Some(cb) = upgrade_cb(weak) else { break };
+                        let done = finished(&cb);
+                        let_go_cb(cb);
+                        done
+                    }
+                };
                 if done {
                     break;
                 }
@@ -3131,8 +3298,21 @@ fn gpu_copy_apart(b: &BufferObject) -> bool {
 
 /// Whether the command buffer completed or failed.
 fn finished(cb: &CommandBufferObject) -> bool {
-    let status = cb.raw.status().raw();
+    raw_finished(&cb.raw)
+}
+
+/// Whether the runtime's command buffer completed or failed.
+fn raw_finished(raw: &metal2vulkan_runtime::CommandBuffer) -> bool {
+    let status = raw.status().raw();
     status == CommandBufferStatus::COMPLETED.raw() || status == CommandBufferStatus::ERROR.raw()
+}
+
+/// A committed command buffer a capture waits for ([`State::wait_for_earlier`]).
+enum Watched {
+    /// The runtime's, of one whose completion is to be taken ([`Completion::raw`]).
+    Raw(metal2vulkan_runtime::CommandBuffer),
+    /// The guest's, while it lives ([`upgrade_cb`]).
+    Weak(Weak<dyn Any + Send + Sync>),
 }
 
 /// Drops a command buffer the recorder held for a moment: where that was its last reference, as

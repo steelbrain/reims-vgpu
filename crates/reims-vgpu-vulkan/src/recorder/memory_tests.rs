@@ -13,18 +13,19 @@ use super::format::{self, Record, Value};
 use super::{ENV_VAR, id_at, on, start_from_env, state};
 use crate::core::host::HostPtr;
 use crate::core::platform::Handle as _;
+use crate::core::platform::Platform as _;
 use crate::core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
 use crate::core::platform::command::{
     CommandBuffer as _, CommandQueue as _, CompletedHandler, PartCut,
 };
 use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
 use crate::core::platform::device::GpuDevice as _;
-use crate::core::platform::event::{EventRef, SharedEvent as _};
+use crate::core::platform::event::{EventRef, Notification, SharedEvent};
 use crate::core::platform::icb::{
     IcbComputeCmd, IndirectCommandBuffer as _, IndirectComputeCommand as _,
 };
 use crate::core::platform::resource::{Buffer as _, Heap as _, Library as _};
-use crate::core::platform::types::{MtlSize, NsRange};
+use crate::core::platform::types::{CommandBufferStatus, MtlSize, NsRange};
 use crate::core::platform::values::IcbDesc;
 use crate::core::raise::OnFault;
 use crate::gpu::command::{VulkanCommandBuffer, VulkanCommandQueue};
@@ -142,6 +143,15 @@ fn held_committed(cb: &VulkanCommandBuffer) -> bool {
     let id = id_at(cb.id().0).expect("the command buffer is recorded");
     let sync = state.sync.lock();
     !sync.cbs.contains_key(&id) && sync.pending.iter().any(|p| p.id == id)
+}
+
+/// Whether the recorder holds the command buffer of stream id `id` committed once the guest let
+/// go of it, as core lets go of each at its commit, while the GPU still runs it.
+fn held_released(id: u64) -> bool {
+    let state = state().expect("the child records");
+    state.drain(true);
+    let sync = state.sync.lock();
+    (sync.pending.iter()).any(|p| p.id == id && p.weak.strong_count() == 0)
 }
 
 /// A recording test's objects: a queue; a buffer of the [`BLOCK`]'s bytes at the start of a
@@ -875,5 +885,170 @@ fn on_vulkan_a_cpu_write_that_restores_what_a_fill_wrote_part_of_is_written() {
         let commits = [0, 1].map(|n| place(&records, "commit", n).expect("a commit's record"));
         let between = writes_at(&records, r.block(), commits[0]..commits[1], 0);
         assert_eq!(between, vec![chunk(&[(0x01, 256)]), bytes(0, 4096)]);
+    });
+}
+
+/// The completion of a command buffer the guest let go of once it committed it, as core does,
+/// is taken though a commit reaps the command buffer before it completes: a counter its kernel
+/// added to while the commit after it ran, zeroed again by the CPU, is written with the kernel's
+/// bytes at the completion and with the zeros before the next commit that reaches it.
+#[test]
+fn on_vulkan_a_released_command_buffers_completion_is_written() {
+    let test = "recorder::memory_tests::on_vulkan_a_released_command_buffers_completion_is_written";
+    in_recording_child(test, |streams| {
+        let (r, inc) = (Rig::new(), inc_pipeline());
+        write_at(base_of(&r.z), 0..4096, 0);
+        let gate = crate::gpu::device::tests::dev().new_shared_event().unwrap();
+        let released = r.command_buffer();
+        released
+            .encode_wait(Some(EventRef::Shared(&gate)), 1)
+            .unwrap();
+        r.count(&released, &inc, &r.z, None);
+        released.commit(OnFault::Return).unwrap();
+        let id = id_at(released.id().0).expect("the command buffer is recorded");
+        let raw = released.raw.clone();
+        drop(released);
+        assert!(held_released(id), "held committed, and let go of");
+        let reaps = r.command_buffer();
+        reaps.commit(OnFault::Return).unwrap();
+        gate.set_signaled_value(1).unwrap();
+        raw.wait_until_completed().unwrap();
+        write_at(base_of(&r.z), 0..8, 0);
+        let next = r.command_buffer();
+        r.count(&next, &inc, &r.z, None);
+        run(&next);
+        let z = id_at(r.z.id().0).expect("the buffer is recorded");
+        let records = records_once(streams, |rs| place(rs, "commit", 2).is_some());
+        let commits = [0, 2].map(|n| place(&records, "commit", n).expect("a commit's record"));
+        let between = writes_at(&records, z, commits[0]..commits[1], 0);
+        assert_eq!(between, vec![counted_once(), bytes(0, 4096)]);
+    });
+}
+
+/// The command buffer `cb`, made of `r`'s queue, adds to the `Shared` buffer's counter with
+/// `inc`, then signals `signal` to 1, then waits for `gate` to reach 1 before a fill of the
+/// block buffer: its completion waits for the gate, its signal does not.
+fn count_signal_then_wait(
+    r: &Rig,
+    inc: &VulkanComputePipeline,
+    signal: &crate::gpu::event::VulkanSharedEvent,
+    gate: &crate::gpu::event::VulkanSharedEvent,
+) -> VulkanCommandBuffer {
+    let cb = r.command_buffer();
+    r.count(&cb, inc, &r.z, None);
+    cb.encode_signal(Some(EventRef::Shared(signal)), 1).unwrap();
+    cb.encode_wait(Some(EventRef::Shared(gate)), 1).unwrap();
+    r.fill(&cb, 0..16, 0x01);
+    cb
+}
+
+/// A CPU write the guest makes once an event a command buffer signals reached the signal's
+/// value, before the command buffer completes, is written: a counter its kernel added to
+/// before the signal, zeroed again by a listener's notification of it while the command buffer
+/// waits for a gate, is written with the kernel's bytes before the notification runs and with
+/// the zeros at the completion.
+#[test]
+fn on_vulkan_a_cpu_write_once_a_signal_is_reached_is_written() {
+    let test = "recorder::memory_tests::on_vulkan_a_cpu_write_once_a_signal_is_reached_is_written";
+    in_recording_child(test, |streams| {
+        let (r, inc) = (Rig::new(), inc_pipeline());
+        write_at(base_of(&r.z), 0..4096, 0);
+        let d = crate::gpu::device::tests::dev();
+        let (signal, gate) = (d.new_shared_event().unwrap(), d.new_shared_event().unwrap());
+        let cb = count_signal_then_wait(&r, &inc, &signal, &gate);
+        let listener = crate::platform::tests::platform().new_shared_event_listener();
+        let (told, notified) = std::sync::mpsc::channel();
+        let base = base_of(&r.z);
+        let zero: Notification = Box::new(move || {
+            write_at(base, 0..8, 0);
+            told.send(()).unwrap();
+        });
+        SharedEvent::notify_listener(&signal, &listener, 1, zero).unwrap();
+        cb.commit(OnFault::Return).unwrap();
+        (notified.recv_timeout(Duration::from_secs(10))).expect("the notification");
+        gate.set_signaled_value(1).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        let next = r.command_buffer();
+        r.count(&next, &inc, &r.z, None);
+        run(&next);
+        let z = id_at(r.z.id().0).expect("the buffer is recorded");
+        let records = records_once(streams, |rs| place(rs, "commit", 1).is_some());
+        let commits = [0, 1].map(|n| place(&records, "commit", n).expect("a commit's record"));
+        let between = writes_at(&records, z, commits[0]..commits[1], 0);
+        assert_eq!(between, vec![counted_once(), bytes(0, 4096)]);
+    });
+}
+
+/// A CPU write the guest makes once a command buffer that waited for another's signal
+/// completed, before that other completes, is written: a counter the other's kernel added to
+/// before the signal, zeroed again by the CPU while the other waits for a gate, is written with
+/// the kernel's bytes as the waiter completes and with the zeros at the other's completion.
+#[test]
+fn on_vulkan_a_cpu_write_once_a_waiter_on_a_signal_completes_is_written() {
+    let test = "recorder::memory_tests::on_vulkan_a_cpu_write_once_a_waiter_on_a_signal_completes_is_written";
+    in_recording_child(test, |streams| {
+        let (r, inc) = (Rig::new(), inc_pipeline());
+        write_at(base_of(&r.z), 0..4096, 0);
+        let d = crate::gpu::device::tests::dev();
+        let (signal, gate) = (d.new_shared_event().unwrap(), d.new_shared_event().unwrap());
+        let cb = count_signal_then_wait(&r, &inc, &signal, &gate);
+        let other = d.new_command_queue().unwrap();
+        let waiter = other.command_buffer(OnFault::Return).unwrap().unwrap();
+        waiter
+            .encode_wait(Some(EventRef::Shared(&signal)), 1)
+            .unwrap();
+        cb.commit(OnFault::Return).unwrap();
+        run(&waiter);
+        write_at(base_of(&r.z), 0..8, 0);
+        gate.set_signaled_value(1).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        let next = r.command_buffer();
+        r.count(&next, &inc, &r.z, None);
+        run(&next);
+        let z = id_at(r.z.id().0).expect("the buffer is recorded");
+        let records = records_once(streams, |rs| place(rs, "commit", 2).is_some());
+        let commits = [0, 2].map(|n| place(&records, "commit", n).expect("a commit's record"));
+        let between = writes_at(&records, z, commits[0]..commits[1], 0);
+        assert_eq!(between, vec![counted_once(), bytes(0, 4096)]);
+    });
+}
+
+/// A CPU write the guest makes once it read a command buffer's status final, before the
+/// runtime ran the recorder's hook, is written: a counter its kernel added to, zeroed again by
+/// the CPU while a runtime handler added ahead of the hook holds it back, is written with the
+/// kernel's bytes as the status reads final and with the zeros before the next commit.
+#[test]
+fn on_vulkan_a_cpu_write_once_a_status_reads_final_is_written() {
+    let test = "recorder::memory_tests::on_vulkan_a_cpu_write_once_a_status_reads_final_is_written";
+    in_recording_child(test, |streams| {
+        let (r, inc) = (Rig::new(), inc_pipeline());
+        write_at(base_of(&r.z), 0..4096, 0);
+        let counted = r.command_buffer();
+        r.count(&counted, &inc, &r.z, None);
+        let (go, held) = std::sync::mpsc::channel::<()>();
+        let hold: metal2vulkan_runtime::Handler =
+            Box::new(move |_: &metal2vulkan_runtime::CommandBuffer| {
+                let _ = held.recv_timeout(Duration::from_secs(10));
+            });
+        counted.raw.add_completion_seen_handler(hold).unwrap();
+        counted.commit(OnFault::Return).unwrap();
+        for polls in 0.. {
+            if counted.status() == CommandBufferStatus::COMPLETED {
+                break;
+            }
+            assert!(polls < 10_000, "the command buffer completes");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        write_at(base_of(&r.z), 0..8, 0);
+        go.send(()).unwrap();
+        counted.wait_until_completed(OnFault::Return).unwrap();
+        let next = r.command_buffer();
+        r.count(&next, &inc, &r.z, None);
+        run(&next);
+        let z = id_at(r.z.id().0).expect("the buffer is recorded");
+        let records = records_once(streams, |rs| place(rs, "commit", 1).is_some());
+        let commits = [0, 1].map(|n| place(&records, "commit", n).expect("a commit's record"));
+        let between = writes_at(&records, z, commits[0]..commits[1], 0);
+        assert_eq!(between, vec![counted_once(), bytes(0, 4096)]);
     });
 }

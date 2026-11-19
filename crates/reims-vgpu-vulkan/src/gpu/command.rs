@@ -1505,10 +1505,18 @@ fn event<'a>(sel: &'static str, event: Option<EventRef<'a, VulkanPlatform>>) -> 
 
 impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// Refused once the buffer is committed, as Metal's validation refuses it. A failure that is
-    /// none of Metal's dies as the handler reads it ([`completed_handler`]).
+    /// none of Metal's dies as the handler reads it ([`completed_handler`]). In a process that
+    /// records, the recorder takes what the buffer's GPU work wrote first, where no
+    /// completion-seen handler took it ([`crate::recorder::completion_seen`]).
     fn add_completed_handler(&self, _on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
         let overruns = self.predication.overruns();
-        let handler = completed_handler(block, move |cb| read(cb, &overruns));
+        let recorded = crate::recorder::completion_key(self);
+        let handler = completed_handler(block, move |cb| {
+            if let Some(id) = recorded {
+                crate::recorder::completion_seen(id);
+            }
+            read(cb, &overruns);
+        });
         send("addCompletedHandler:", Policy::Dies, || {
             self.raw.add_completed_handler(handler)
         })
@@ -1938,7 +1946,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
 
     /// Scheduled or completed once its submission handler ran ([`tiler_handler`]). A loop of its
     /// command predication that ran past its copies dies here once it completed
-    /// ([`CommandBufferObject::overran`]).
+    /// ([`CommandBufferObject::overran`]). In a process that records, a final status, which the
+    /// runtime sets before it runs the buffer's handlers, is answered once the recorder took what
+    /// the buffer's GPU work wrote ([`crate::recorder::completion_seen`]).
     fn status(&self) -> CommandBufferStatus {
         let status = plain(|| {
             let status = self.raw.status();
@@ -1946,7 +1956,13 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
             self.overran();
             status
         });
-        CommandBufferStatus(status.raw())
+        let status = CommandBufferStatus(status.raw());
+        if (status == CommandBufferStatus::COMPLETED || status == CommandBufferStatus::ERROR)
+            && let Some(id) = crate::recorder::completion_key(self)
+        {
+            crate::recorder::completion_seen(id);
+        }
+        status
     }
 
     /// Blocks. A wait the runtime knows would never return (a handler's for its own buffer)
@@ -1955,12 +1971,16 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// that is none of Metal's, dies as the wait returns ([`failed_pipeline`],
     /// [`refused_step`], [`answered`]), where no completed handler read its failure first; so
     /// does one a loop of its command predication ran past its copies in
-    /// ([`CommandBufferObject::overran`]).
+    /// ([`CommandBufferObject::overran`]). In a process that records, it returns once the
+    /// recorder took what the buffer's GPU work wrote ([`crate::recorder::completion_seen`]).
     fn wait_until_completed(&self, _on: OnFault) -> RaiseResult<()> {
         let recorded_call = crate::recorder::rec_call!("waitUntilCompleted", self);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
             const SEL: &str = "waitUntilCompleted";
             waiting(SEL, || self.raw.wait_until_completed())?;
+            if let Some(id) = crate::recorder::completion_key(self) {
+                crate::recorder::completion_seen(id);
+            }
             match plain(|| self.raw.error()) {
                 Some(rt::CommandBufferError::PipelineCreation(_)) => {
                     failed_pipeline(SEL, &self.raw)

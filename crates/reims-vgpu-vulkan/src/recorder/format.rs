@@ -8,8 +8,11 @@
 //! - **Flags** say what a stream promises beyond the version's records. Bit 0,
 //!   [`FLAG_ANNOUNCED_BYTES_RECORDED`]: at each `didModifyRange:`, the stream's last
 //!   `m2v.write` of each 4 KiB chunk of the range holds the guest's bytes, so a player pushes the
-//!   recorded bytes there; one reading a stream without it pushes its own read-back. A reader
-//!   checks the magic and the version alone ([`read`]), so a stream with the bit reads as before.
+//!   recorded bytes there; one reading a stream without it pushes its own read-back. Bit 1,
+//!   [`FLAG_COMPLETION_BYTES_RECORDED`]: at each command buffer's completion, the stream holds
+//!   what its GPU work could store to as the GPU left it, before any CPU write the guest made
+//!   once it learned of the completion, on every route by which it learns. A reader checks the
+//!   magic and the version alone ([`read`]), so a stream with either bit reads as before.
 //! - **Names** are interned: the n-th name record defines name id n, from 1, before the first
 //!   record that uses it. A selector and a map key are name ids.
 //! - **Blobs** are named by the SHA-256 of their bytes, each written once per stream before its
@@ -59,8 +62,25 @@ pub const VERSION: u32 = 2;
 /// recorded bytes at an announce, never its own read-back of a buffer the GPU wrote.
 pub const FLAG_ANNOUNCED_BYTES_RECORDED: u32 = 1;
 
+/// Header flag bit 1: at each command buffer's completion, for each 4 KiB chunk its GPU work
+/// could store to (what its blits and passes write, and what its kernels and render stages
+/// could store to, in host memory the GPU's work writes in place), the stream holds the bytes
+/// the GPU left there, as a `m2v.write` after the record of the call that committed it or as
+/// what the player's own run of it writes, before any `m2v.write` of a CPU write the guest made
+/// once it could learn of the completion. That holds on every route by which the guest learns of
+/// it: an event the command buffer signals reaching the signal's value (a listener's
+/// notification, a CPU wait, a read of the value), the work before the signal done, and so a
+/// later command buffer that waited for that signal completing; its status read final; a
+/// completion hook of the recorder's that the runtime refused, the completion taken where the
+/// guest learns of it; and a command buffer the guest released once it committed it, read
+/// through the runtime's command buffer, which the recorder holds until it completes. So a CPU
+/// write that puts back the bytes the stream held before the command buffer ran is written. A
+/// write the guest makes into the very bytes the command buffer's work writes while that work
+/// runs (it raced its own GPU work) is not.
+pub const FLAG_COMPLETION_BYTES_RECORDED: u32 = 2;
+
 /// The flags every stream the recorder writes carries in its header.
-pub const FLAGS: u32 = FLAG_ANNOUNCED_BYTES_RECORDED;
+pub const FLAGS: u32 = FLAG_ANNOUNCED_BYTES_RECORDED | FLAG_COMPLETION_BYTES_RECORDED;
 
 /// The file's first 16 bytes: the magic, the version and the flags.
 pub const HEADER: [u8; 16] = {
@@ -669,14 +689,16 @@ mod tests {
         ]
     }
 
-    /// The header is the magic, version 2 and the flags, bit 0 set: the stream holds the guest's
-    /// bytes at each announce
+    /// The header is the magic, version 2 and the flags, bits 0 and 1 set: the stream holds the
+    /// guest's bytes at each announce, and the GPU's at each completion before any CPU write
+    /// after it
     #[test]
     fn the_header_is_the_magic_version_and_flags() {
         assert_eq!(&HEADER[..8], b"M2VRSTRM");
         assert_eq!(HEADER[8..12], 2u32.to_le_bytes());
-        assert_eq!(HEADER[12..], 1u32.to_le_bytes());
+        assert_eq!(HEADER[12..], 3u32.to_le_bytes());
         assert_eq!(FLAG_ANNOUNCED_BYTES_RECORDED, 1, "bit 0");
+        assert_eq!(FLAG_COMPLETION_BYTES_RECORDED, 1 << 1, "bit 1");
     }
 
     /// Varints and zigzag round-trip at their edges
