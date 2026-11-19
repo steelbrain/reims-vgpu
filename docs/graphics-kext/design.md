@@ -5160,10 +5160,11 @@ features.
   known Shared block its CPU copy lies in: a pool block's, or a pages block's
   view's import. Where it does not make the buffer at the guest's address (a
   copy in no block the platform knows, a pin that is not the copy's bytes),
-  the host refuses the create ("Guest input the host refuses"), counted as
-  `managed-at-copy-refused` with its first logged, and never makes the buffer
-  at an address of the platform's own, which the guest's pointers to it would
-  not hold. A guest that did not take the bit is answered as before.
+  the host keeps the buffer where the platform made it, as the same create
+  makes it from a guest that did not take the bit: Metal makes the buffer,
+  so the create is not refused, and the guest's pointers to it hold the
+  address it posted. Each is counted as `managed-at-copy-unkept`, the first
+  logged. A guest that did not take the bit is answered as before.
 - **Why not on the Vulkan platform.** There the guest's own pick of a Managed
   buffer's address is pinned, as every pin is, and a pin inside the range the
   CPU copy holds would be refused. On a GPU of its own memory a Managed buffer

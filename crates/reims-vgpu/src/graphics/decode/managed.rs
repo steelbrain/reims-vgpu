@@ -69,9 +69,10 @@
 //! memory and the platform keeps pins only in its known blocks, a `MANAGED_BUFFER_CREATE`'s
 //! address is its CPU copy's first byte's: a `Managed` buffer there is its bytes, a range of the
 //! block its copy lies in. A buffer the platform makes at any other address, its copy's bytes in no
-//! block it knows, is refused rather than kept there, so no pointer of the guest's to the buffer
-//! holds an address it is not at: the id stands for a refused object, whose bindings are nil and
-//! whose uses are dropped (`refused`), counted ([`MANAGED_AT_COPY_REFUSED`]), the first logged.
+//! block it knows, is kept where the platform made it, as the same create makes it where the guest
+//! did not take the bit: Metal makes the buffer, so the create is not refused, and the guest's
+//! pointers to it hold the address the guest posted. Each is counted ([`MANAGED_AT_COPY_UNKEPT`]),
+//! the first logged.
 //!
 //! **After a recovery of the device** (the platform made its lost GPU again,
 //! [`GpuDevice::recoveries`]), a texture of two copies keeps its CPU copy, the guest's bytes, but
@@ -109,10 +110,10 @@ use super::{
 
 /// The degradation code of a `MANAGED_BUFFER_CREATE` at its CPU copy's address, where the guest
 /// took `MANAGED_AT_COPY`, that the platform made at another (the module doc, "At the copy's
-/// address"): refused, counted per create.
-pub(crate) const MANAGED_AT_COPY_REFUSED: &str = "managed-at-copy-refused";
+/// address"): kept there, as the create makes it without the bit, and counted per create.
+pub(crate) const MANAGED_AT_COPY_UNKEPT: &str = "managed-at-copy-unkept";
 
-/// Whether a create refused as [`MANAGED_AT_COPY_REFUSED`] was logged: its line is logged the
+/// Whether a create counted as [`MANAGED_AT_COPY_UNKEPT`] was logged: its line is logged the
 /// first time alone, the rest counted (docs/conventions.md).
 static AT_COPY_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -484,18 +485,19 @@ impl<P: Platform> GraphicsDecoder<P> {
             return Ok(Err(DecodeError::Refused));
         };
         let made = buffer.gpu_address();
+        // The at-copy create the platform made elsewhere: kept there, as the create without the
+        // bit makes it, since Metal makes the buffer (the module doc, "At the copy's address").
         if (self.shared.managed_at_copy).load(Ordering::Acquire) && pin != Some(made) {
-            reims_vgpu_vulkan::answer::count_kind(MANAGED_AT_COPY_REFUSED);
+            reims_vgpu_vulkan::answer::count_kind(MANAGED_AT_COPY_UNKEPT);
             if !AT_COPY_LOGGED.swap(true, Ordering::Relaxed) {
                 log::warn!(
-                    target: "reims_vgpu::graphics", kind:% = MANAGED_AT_COPY_REFUSED;
+                    target: "reims_vgpu::graphics", kind:% = MANAGED_AT_COPY_UNKEPT;
                     "the Managed buffer {:#x} at its CPU copy {:#x}'s address {:#x}: the \
-                     platform made it at {made:#x}, so its create is refused \
-                     ({MANAGED_AT_COPY_REFUSED}; the rest are counted)",
+                     platform made it at {made:#x}, where it is kept, as without \
+                     MANAGED_AT_COPY ({MANAGED_AT_COPY_UNKEPT}; the rest are counted)",
                     m.obj_id, m.cpu_buffer_obj_id, m.gpu_address
                 );
             }
-            return Ok(Err(DecodeError::Refused));
         }
         let live = self.made_as(kind, pin, made);
         let copy = ManagedCopy {
@@ -2090,21 +2092,27 @@ mod tests {
     }
 
     /// Where the guest's driver took `MANAGED_AT_COPY`, a `MANAGED_BUFFER_CREATE` at its CPU
-    /// copy's address is the buffer there where the platform keeps the pin, and is refused,
-    /// counted ([`MANAGED_AT_COPY_REFUSED`]), where the platform makes the buffer at another
-    /// address (a copy in no block it knows): no buffer stands for the id, at the platform's own
-    /// address or any other. Where the driver did not take it, the buffer is made wherever the
-    /// platform places it, as before.
+    /// copy's address is the buffer there where the platform keeps the pin. Where the platform
+    /// makes the buffer at another address (a copy in no block it knows), the buffer is kept
+    /// there, counted ([`MANAGED_AT_COPY_UNKEPT`]), with every answer of the same create where the
+    /// driver did not take the bit: the create's result, the platform's calls, the binding of the
+    /// id, the buffer's GPU address (the platform's, not the one posted), the pins counted unkept,
+    /// and a `didModifyRange:` and a synchronize of it. Where the driver did not take the bit,
+    /// nothing is counted as it.
     #[test]
-    fn a_managed_buffer_at_its_copy_is_refused_where_the_platform_does_not_keep_the_address() {
+    fn a_managed_buffer_at_its_copy_made_elsewhere_is_kept_as_without_the_bit() {
+        use super::super::unkept::Kind;
         use reims_vgpu_vulkan::answer::counted_kinds;
-        let count = || {
+        let counted = |code: &str| {
             (counted_kinds().into_iter())
-                .find(|&(c, _)| c == MANAGED_AT_COPY_REFUSED)
+                .find(|&(c, _)| c == code)
                 .map_or(0, |(_, n)| n)
         };
+        let count = || counted(MANAGED_AT_COPY_UNKEPT);
+        let unpinned = || counted(Kind::ManagedUnified.codes().unpinned);
         let (mut r, ram, page) = pages_rig();
         r.dec.set_unified_memory(true);
+        r.dec.set_pins_in_blocks();
         let _ = shared_copies(&mut r, &ram, page);
         let address = |r: &Rig, obj_id: u64| match r.dec.named(obj_id) {
             Some(ObjHandle::Buffer(b)) => b.gpu_address(),
@@ -2126,20 +2134,30 @@ mod tests {
         assert_eq!(address(&r, 60), at);
         assert_eq!(count(), before);
 
-        // Taken, the pin dropped: refused, counted, and no buffer stands for the id.
+        // The pin dropped, taken (61) and not (62): the same create, with the same answers.
         r.p.world().drop_pins(true);
         let at = address(&r, 41);
-        assert_eq!(
-            decode(&mut r, at_copy(61, 41, at)),
-            Err(DecodeError::Refused)
-        );
-        assert_eq!(count(), before + 1);
-        assert!(!matches!(r.dec.named(61), Some(ObjHandle::Buffer(_))));
-
-        // Not taken: made where the platform places it, as before, and not counted.
-        r.dec.set_managed_at_copy(false);
-        assert_eq!(decode(&mut r, at_copy(62, 41, at)), Ok(()));
-        assert_ne!(address(&r, 62), at);
+        let mut answers = Vec::new();
+        for (obj_id, taken) in [(61, true), (62, false)] {
+            r.dec.set_managed_at_copy(taken);
+            let (counted_before, unpinned_before) = (count(), unpinned());
+            let mark = r.p.call_log().mark();
+            let made = decode(&mut r, at_copy(obj_id, 41, at));
+            let calls: Vec<_> = (r.p.call_log().since(mark).into_iter())
+                .map(|c| (c.class, c.sel, c.args))
+                .collect();
+            assert_eq!(count() - counted_before, u64::from(taken), "counted where taken");
+            let placed = address(&r, obj_id);
+            assert_ne!(placed, at, "where the platform placed it");
+            let bound = r.dec.require_buffer(obj_id).ok().map(|b| b.gpu_address());
+            let unkept = unpinned() - unpinned_before;
+            let modified = r.modified(obj_id, 0, 4);
+            let synchronized = r.synchronize(obj_id, RGFX_BLIT_RESOURCE_BUFFER).unwrap();
+            answers.push((made, calls, bound == Some(placed), unkept, modified, synchronized));
+        }
+        assert_eq!(answers[0].0, Ok(()));
+        assert_eq!(answers[0].3, 1, "its pin counted unkept");
+        assert_eq!(answers[0], answers[1], "the bit's answers are the create's without it");
         assert_eq!(count(), before + 1);
     }
 
@@ -2148,20 +2166,20 @@ mod tests {
     #[cfg(feature = "rt")]
     const REACH: &[u8] = include_bytes!("../../../../reims-vgpu-vulkan/metallibs/reach.metallib");
 
-    /// On metal2vulkan-rt's platform, a `Managed` buffer over a slab's CPU copy (a Shared buffer
-    /// in a heap over a block of the guest's Shared pool, at the block's GPU address,
+    /// On metal2vulkan-rt's platform, a `Managed` buffer over a slab's CPU copy (a Shared buffer in
+    /// a heap over a block of the guest's Shared pool, at the block's GPU address,
     /// `POOL_ADDRESSES`) is reached by a kernel through the address the guest holds for it, which
     /// the kernel loads from an argument buffer, with the buffer made resident. On a GPU that
     /// shares the CPU's memory the device offers `MANAGED_AT_COPY`, the guest posts its copy's
     /// address, and the buffer is the copy's bytes there: the kernel reads what the CPU wrote,
-    /// before and after a later CPU write with no `didModifyRange:`, and the CPU reads the
-    /// kernel's write. There a create over a copy the platform placed in no block it knows (a
-    /// buffer over the region, at an address of rt's own and not the guest's) is refused at the
-    /// address the guest posted, counted, with no buffer made at rt's address. On a GPU of its own
-    /// memory no such bit is offered, and the buffer keeps two copies: the kernel reads the GPU's,
-    /// which holds the CPU's bytes as of the first commit after the make, until a
-    /// `didModifyRange:` brings a later write over; and the CPU's bytes keep out the kernel's
-    /// write.
+    /// before and after a later CPU write with no `didModifyRange:`, and the CPU reads the kernel's
+    /// write. There a create over a copy the platform placed in no block it knows (a buffer over
+    /// the region, at an address of rt's own and not the guest's) is kept where rt made it,
+    /// counted, with the answers of the same create without the bit: made, bound, and at rt's
+    /// address rather than the one posted. On a GPU of its own memory no such bit is offered, and
+    /// the buffer keeps two copies: the kernel reads the GPU's, which holds the CPU's bytes as of
+    /// the first commit after the make, until a `didModifyRange:` brings a later write over; and
+    /// the CPU's bytes keep out the kernel's write.
     #[cfg(feature = "rt")]
     #[test]
     fn on_vulkan_rt_s_managed_buffer_is_reached_at_the_address_the_guest_holds() {
@@ -2188,9 +2206,9 @@ mod tests {
         let pins = <RtPlatform as ApiPlatform>::PINS_IN_BLOCKS;
         let offered = crate::graphics::managed_at_copy(unified, pins, true);
         assert_eq!(offered == RGFX_FEATURE_MANAGED_AT_COPY, unified, "offered on unified alone");
-        let refused = || {
+        let unkept = || {
             (counted_kinds().into_iter())
-                .find(|&(c, _)| c == MANAGED_AT_COPY_REFUSED)
+                .find(|&(c, _)| c == MANAGED_AT_COPY_UNKEPT)
                 .map_or(0, |(_, n)| n)
         };
 
@@ -2234,7 +2252,8 @@ mod tests {
         };
 
         // A copy over the region, which rt places at an address of its own, not the guest's: on
-        // unified memory the guest posts the address it holds, and the create is refused.
+        // unified memory the guest posts the address it holds, and rt makes the buffer at its own,
+        // where it is kept, as the same create without the bit is.
         if unified {
             const GUEST_ADDRESS: u64 = 0x3_0000_0000;
             let over = RgfxBufferOverHostMemory {
@@ -2249,15 +2268,22 @@ mod tests {
             assert_eq!(dec.decode(&device, over.as_bytes()).unwrap(), Ok(()));
             let placed = buffer_of(&dec, 30).gpu_address();
             assert_ne!(placed, GUEST_ADDRESS, "rt keeps no pin outside its blocks");
-            let before = refused();
-            let managed = RgfxManagedBufferCreate {
-                gpu_address: GUEST_ADDRESS,
-                ..managed_over(31, 30, 0x100, MANAGED)
-            };
-            let made = dec.decode_refusing(&device, managed.as_bytes()).unwrap();
-            assert_eq!(made, Err(DecodeError::Refused));
-            assert_eq!(refused(), before + 1);
-            assert!(!matches!(dec.named(31), Some(ObjHandle::Buffer(_))));
+            let mut answers = Vec::new();
+            for (obj_id, taken) in [(31, true), (32, false)] {
+                dec.set_managed_at_copy(taken);
+                let before = unkept();
+                let managed = RgfxManagedBufferCreate {
+                    gpu_address: GUEST_ADDRESS,
+                    ..managed_over(obj_id, 30, 0x100, MANAGED)
+                };
+                let made = dec.decode_refusing(&device, managed.as_bytes()).unwrap();
+                assert_eq!(unkept() - before, u64::from(taken), "counted where taken");
+                let bound = dec.require_buffer(obj_id).ok().map(|b| b.gpu_address());
+                answers.push((made, bound.is_some_and(|at| at != GUEST_ADDRESS)));
+            }
+            dec.set_managed_at_copy(true);
+            assert_eq!(answers[0], (Ok(()), true), "made, bound, at rt's own address");
+            assert_eq!(answers[0], answers[1], "the bit's answers are the create's without it");
         }
 
         // The slab's copy, at the pool block's address plus its offset.

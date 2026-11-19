@@ -2721,8 +2721,7 @@ pub fn out_of_host_memory_count() -> u64 {
 /// took from the source (`private-take-sourced`, with the source's time in microseconds,
 /// `private-take-sourced-us`), with the longest a take held the thread that carried it out
 /// (`private-take-lane-us-most`); and the `Managed` buffers' creates at their CPU copies'
-/// addresses that it refused, the platform having made them at others
-/// (`managed-at-copy-refused`).
+/// addresses that the platform made at others, where they are kept (`managed-at-copy-unkept`).
 static COUNTED: crate::core::sync::Mutex<Vec<(&'static str, u64)>> =
     crate::core::sync::Mutex::new(Vec::new());
 

@@ -811,7 +811,7 @@ pub(crate) struct Shared<P: Platform> {
     /// [`GraphicsDecoder::set_pins_in_blocks`]).
     pins_in_blocks: AtomicBool,
     /// Whether the guest's driver took `MANAGED_AT_COPY`, where a `Managed` buffer's pin is its
-    /// CPU copy's address, which the platform keeps or the create is refused
+    /// CPU copy's address, which the platform keeps, or the buffer is kept where it made it
     /// ([`GraphicsDecoder::set_managed_at_copy`]).
     managed_at_copy: AtomicBool,
     /// The views of the IOSurfaces whose blocks name their own guest pages ([`surface_pages`]).
@@ -1403,8 +1403,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Tells the decoder whether the guest's driver took `MANAGED_AT_COPY`
     /// (`RGFX_FEATURE_MANAGED_AT_COPY`): set as the driver becomes ready, before its first
     /// message (`device::Host::driver_ready`). Where it did, a `MANAGED_BUFFER_CREATE`'s address
-    /// is its CPU copy's, and a create the platform does not make there is refused
-    /// (`managed::MANAGED_AT_COPY_REFUSED`).
+    /// is its CPU copy's, and a buffer the platform does not make there is kept where it made it,
+    /// as without the bit, and counted (`managed::MANAGED_AT_COPY_UNKEPT`).
     pub(crate) fn set_managed_at_copy(&self, taken: bool) {
         (self.shared.managed_at_copy).store(taken, Ordering::Release);
     }

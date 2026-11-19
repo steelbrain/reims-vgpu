@@ -1681,14 +1681,14 @@
 // [`RGFX_CMD_MANAGED_BUFFER_CREATE`]'s `gpu_address` is the address of the first byte of its CPU
 // copy, the `Shared` buffer `cpu_buffer_obj_id`, as that buffer's create gave it, and the guest
 // takes no address of its own for it, in a Private block ([`RGFX_FEATURE_PRIVATE_BLOCKS`]) or in
-// its context's range. The host makes the buffer there, a range of the block the CPU copy lies
-// in, and refuses the create where its platform does not make it at that address ("Guest input
-// the host refuses"), so the guest's pointers to the buffer never hold another address. A host
-// offers it where its GPU shares the CPU's memory, its platform keeps a pin only inside a block
-// it knows (metal2vulkan-rt's), whose Shared blocks the CPU copies lie in, and it offers
-// [`RGFX_FEATURE_POOL`], whose blocks the slabs' copies lie in: on the Vulkan platform before it
-// the guest's own pick is pinned, and a pin inside the CPU copy's range would be refused. The
-// x86-64 and arm64e kexts take it.
+// its context's range. The host makes the buffer there, a range of the block the CPU copy lies in;
+// where its platform makes it at another address (a CPU copy in no block it knows), the host keeps
+// the buffer there, as it makes it for a guest that did not take the bit, and counts it, and the
+// create is not refused. A host offers it where its GPU shares the CPU's memory, its platform
+// keeps a pin only inside a block it knows (metal2vulkan-rt's), whose Shared blocks the CPU copies
+// lie in, and it offers [`RGFX_FEATURE_POOL`], whose blocks the slabs' copies lie in: on the
+// Vulkan platform before it the guest's own pick is pinned, and a pin inside the CPU copy's range
+// would be refused. The x86-64 and arm64e kexts take it.
 #define RGFX_FEATURE_MANAGED_AT_COPY 9223372036854775808ull
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
