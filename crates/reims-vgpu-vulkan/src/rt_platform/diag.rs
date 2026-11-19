@@ -18,8 +18,8 @@
 //!   attachment's being one texture or twin views of one surface's image. The first refused draw
 //!   of each pipeline state, ten at most, writes its line as it is refused.
 //! - **Imageblock asks.** Each distinct combination of colour attachment formats (every index)
-//!   and sample count of the render states asked `imageblockSampleLength`, with its asks
-//!   ([`imageblock`]); its first ask writes its line.
+//!   and sample count of the render states asked `imageblockSampleLength`, with its asks and rt's
+//!   answer, or its refusal ([`imageblock`]); its first ask writes its line.
 //! - **Over-copies a presented frame.** rt's over-copies, their bytes and its submissions between
 //!   two of the display's presents ([`presented`]): mean, worst, and how many frames copied none,
 //!   1 to 9, 10 to 99 and 100 or more.
@@ -890,21 +890,29 @@ pub fn attachment_read(
 
 // ----- Imageblock asks.
 
-/// The render states' imageblock asks by colour formats and sample count.
-static IMAGEBLOCKS: Mutex<BTreeMap<([u32; 8], u32), u64>> = Mutex::new(BTreeMap::new());
+/// The render states' imageblock asks by colour formats and sample count, with rt's answer.
+static IMAGEBLOCKS: Mutex<BTreeMap<([u32; 8], u32), (u64, Option<u32>)>> =
+    Mutex::new(BTreeMap::new());
 
 /// Counts an ask of `imageblockSampleLength` of a render state of colour formats `formats` and
-/// sample count `samples`; the first of the combination writes its line.
-pub fn imageblock(formats: [u32; 8], samples: u32) {
+/// sample count `samples`, which rt answered `answer`, `None` where it refused; the first of the
+/// combination writes its line.
+pub fn imageblock(formats: [u32; 8], samples: u32, answer: Option<u32>) {
     let mut asks = IMAGEBLOCKS.lock();
-    let n = asks.entry((formats, samples)).or_insert(0);
+    let (n, _) = asks.entry((formats, samples)).or_insert((0, answer));
     *n += 1;
     if *n == 1 {
         drop(asks);
         say(&format!(
-            "reims-vgpu: rt-diag imageblock first: formats {formats:?} samples {samples}\n"
+            "reims-vgpu: rt-diag imageblock first: formats {formats:?} samples {samples}: {}\n",
+            answered(answer)
         ));
     }
+}
+
+/// rt's imageblock answer `answer` as a line gives it.
+fn answered(answer: Option<u32>) -> String {
+    answer.map_or_else(|| "refused".to_owned(), |n| format!("{n} bytes"))
 }
 
 // ----- Frames.
@@ -1029,10 +1037,11 @@ pub fn write() {
             "reims-vgpu: rt-diag plain-view-refused: shape format {shape}, view format {view}: {n}"
         );
     }
-    for ((formats, samples), n) in IMAGEBLOCKS.lock().iter() {
+    for ((formats, samples), (n, answer)) in IMAGEBLOCKS.lock().iter() {
         let _ = writeln!(
             out,
-            "reims-vgpu: rt-diag imageblock: formats {formats:?} samples {samples}: {n} asks"
+            "reims-vgpu: rt-diag imageblock: formats {formats:?} samples {samples}: {n} asks, {}",
+            answered(*answer)
         );
     }
     let f = FRAMES.lock();

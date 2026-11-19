@@ -19,14 +19,16 @@
 //!   the read and write samplers take nothing there. A state gives its indices back as it goes,
 //!   after rt's state: an index whose last holder goes is the platform's again. Where none is
 //!   free, the creation is refused (`rt-refused-limit`).
-//! - **Its answers.** `maxTotalThreadsPerThreadgroup` is rt's; `threadExecutionWidth` is 32, the
-//!   SIMD-group width rt runs every kernel's SIMD groups at; `gpuResourceID` and `resourceIndex`
-//!   are 0, as Metal's are for a state without indirect command buffer support; and
-//!   `uniqueIdentifier` is one of a process-wide count from 1, where Metal's is an address that
-//!   differs from run to run. rt's state answers no static threadgroup memory length and no
-//!   imageblock length: each is 0, counted (`rt-unbuilt-pipeline-query`). Function handles and
-//!   visible function tables are nil, counted (`rt-unbuilt-function-table`): rt's kernels take
-//!   no function table.
+//! - **Its answers.** `maxTotalThreadsPerThreadgroup`, `staticThreadgroupMemoryLength`,
+//!   `threadExecutionWidth` (32, the SIMD-group width rt runs every kernel's SIMD groups at),
+//!   `supportIndirectCommandBuffers` (NO: rt makes no state for indirect command buffers) and
+//!   `imageblockMemoryLengthForDimensions:` are rt's. rt answers the last 0 for a kernel that
+//!   declares no imageblock; for one that does, it refuses (`Gap::ImageblockLength`), and the
+//!   answer is 0, counted (`rt-refused-gap`). `gpuResourceID` and `resourceIndex` are 0, as
+//!   Metal's are for a state without indirect command buffer support; and `uniqueIdentifier` is
+//!   one of a process-wide count from 1, where Metal's is an address that differs from run to
+//!   run. Function handles and visible function tables are nil, counted
+//!   (`rt-unbuilt-function-table`): rt's kernels take no function table.
 //! - **Its slots' writes.** Whether the kernel may write the texture bound at a slot is rt's
 //!   interface of it (`texture_accesses`): a slot it writes, or reads and writes, as its
 //!   operations do, not as its argument's `access::` qualifier says. Every other slot it only
@@ -55,7 +57,7 @@ use super::library::RtFunction;
 use super::state::value;
 use super::texture::OwnIndices;
 use super::unbuilt::{
-    RtRefusal, Unbuilt, refuse, refuse_create, refused_error_as, rt_refused_error,
+    RtRefusal, Unbuilt, refuse_create, refused_error_as, rt_refused, rt_refused_error,
 };
 use super::{RtObj, RtPlatform};
 
@@ -65,8 +67,13 @@ pub const WITH_FUNCTION: &str = "newComputePipelineStateWithFunction:error:";
 /// `newComputePipelineStateWithDescriptor:options:reflection:error:`.
 pub const WITH_DESCRIPTOR: &str = "newComputePipelineStateWithDescriptor:options:reflection:error:";
 
-/// `threadExecutionWidth`: the SIMD-group width rt runs every kernel's SIMD groups at.
-pub const THREAD_EXECUTION_WIDTH: u64 = 32;
+/// `imageblockMemoryLengthForDimensions:`, a compute or render state's.
+pub(super) const IMAGEBLOCK_MEMORY_LENGTH: &str = "imageblockMemoryLengthForDimensions:";
+
+/// The dimensions `size` as rt takes them, each past 32 bits held at the word's maximum.
+pub(super) fn dimensions(size: MtlSize) -> [u32; 3] {
+    [size.width, size.height, size.depth].map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+}
 
 /// `MTLBufferLayoutStrideDynamic`: a layout whose stride the encoder binds the buffer with.
 const STRIDE_DYNAMIC: u64 = u64::MAX;
@@ -460,14 +467,14 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
         Ok(None)
     }
 
-    /// Unbuilt: 0 ([`Unbuilt::PipelineQuery`]).
+    /// rt's answer; 0 where rt refuses it, counted under the refusal's kind.
     fn imageblock_memory_length(&self, imageblock_dimensions: MtlSize) -> RaiseResult<u64> {
-        let _ = imageblock_dimensions;
-        refuse(
-            Unbuilt::PipelineQuery,
-            "imageblockMemoryLengthForDimensions:",
-        );
-        Ok(0)
+        let asked = dimensions(imageblock_dimensions);
+        let made = self.rt.imageblock_memory_length_for_dimensions(asked);
+        Ok(made.unwrap_or_else(|error| {
+            rt_refused(IMAGEBLOCK_MEMORY_LENGTH, &error);
+            0
+        }))
     }
 
     fn max_total_threads_per_threadgroup(&self) -> u64 {
@@ -479,18 +486,16 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
         0
     }
 
-    /// Unbuilt: 0 ([`Unbuilt::PipelineQuery`]).
     fn static_threadgroup_memory_length(&self) -> u64 {
-        refuse(Unbuilt::PipelineQuery, "staticThreadgroupMemoryLength");
-        0
+        u64::from(self.rt.static_threadgroup_memory_length())
     }
 
     fn support_indirect_command_buffers(&self) -> bool {
-        false
+        self.rt.support_indirect_command_buffers()
     }
 
     fn thread_execution_width(&self) -> u64 {
-        THREAD_EXECUTION_WIDTH
+        u64::from(self.rt.thread_execution_width())
     }
 
     fn unique_identifier(&self) -> u64 {
@@ -517,6 +522,9 @@ mod tests {
 
     /// `optional_constant.metal`'s kernel, compiled by build.rs.
     const OPTIONAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/optional_constant.metallib"));
+
+    /// `tests/shaders/compute_tgstatic.metal`'s kernel, of 64 words of static threadgroup memory.
+    const TGSTATIC: &[u8] = include_bytes!("../../../../tests/shaders/compute_tgstatic.metallib");
 
     fn counted(code: &str) -> u64 {
         (crate::answer::degradation_counts().into_iter())
@@ -675,9 +683,9 @@ mod tests {
                 .is_none()
         );
         assert_eq!(counted(Unbuilt::FunctionTable.code()), tables + 2);
-        let queries = counted(Unbuilt::PipelineQuery.code());
         assert_eq!(first.static_threadgroup_memory_length(), 0);
-        assert_eq!(counted(Unbuilt::PipelineQuery.code()), queries + 1);
+        let length = first.imageblock_memory_length(MtlSize::new(8, 8, 1));
+        assert_eq!(length.expect("never a raise"), 0);
 
         drop((first, second, read));
         assert_eq!(device.numbering().held(), held);
@@ -687,6 +695,16 @@ mod tests {
         let limited = device.new_compute_pipeline_state_full(&desc);
         let limited = limited.expect("a compute state").expect("a compute state");
         assert_eq!(limited.max_total_threads_per_threadgroup(), 64);
+
+        // A kernel's static threadgroup memory is rt's answer: Metal's, as `metal_answers` records
+        // it for this kernel on an M3 Max.
+        let tgstatic = device.new_library(TGSTATIC).expect("never a raise");
+        let tgstatic = tgstatic.expect("a metallib").expect("a library");
+        let kernel = tgstatic.new_function(on, "tg_static").expect("never a raise");
+        let kernel = state(&kernel.expect("a function of the table"));
+        assert_eq!(kernel.static_threadgroup_memory_length(), 256);
+        assert_eq!(kernel.thread_execution_width(), 32);
+        assert!(!kernel.support_indirect_command_buffers());
 
         let optional = device.new_library(OPTIONAL).expect("never a raise");
         let optional = optional.expect("a metallib").expect("a library");

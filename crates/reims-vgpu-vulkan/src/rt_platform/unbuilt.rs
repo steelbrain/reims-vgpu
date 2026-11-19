@@ -55,10 +55,6 @@ pub enum Unbuilt {
     /// `newVisibleFunctionTableWithDescriptor:`): rt's kernels take no function table. Each
     /// answers nil.
     FunctionTable,
-    /// What a pipeline state answers that rt's state does not: a compute state's static
-    /// threadgroup memory length and imageblock length, and a render state's imageblock lengths.
-    /// Each answers 0.
-    PipelineQuery,
     /// Argument buffers' layouts (`newArgumentEncoderWithArguments:` and a function's). Each
     /// answers nil.
     ArgumentLayout,
@@ -107,14 +103,13 @@ pub enum Unbuilt {
 
 impl Unbuilt {
     /// Every piece, once, in the order of their codes' places.
-    pub const ALL: [Unbuilt; 20] = [
+    pub const ALL: [Unbuilt; 19] = [
         Unbuilt::Buffer,
         Unbuilt::IosurfaceTexture,
         Unbuilt::SharedTexture,
         Unbuilt::Heap,
         Unbuilt::MeshPipeline,
         Unbuilt::FunctionTable,
-        Unbuilt::PipelineQuery,
         Unbuilt::ArgumentLayout,
         Unbuilt::RenderCommand,
         Unbuilt::ComputeCommand,
@@ -139,7 +134,6 @@ impl Unbuilt {
             Unbuilt::Heap => "rt-unbuilt-heap",
             Unbuilt::MeshPipeline => "rt-unbuilt-mesh-pipeline",
             Unbuilt::FunctionTable => "rt-unbuilt-function-table",
-            Unbuilt::PipelineQuery => "rt-unbuilt-pipeline-query",
             Unbuilt::ArgumentLayout => "rt-unbuilt-argument-layout",
             Unbuilt::RenderCommand => "rt-unbuilt-render-command",
             Unbuilt::ComputeCommand => "rt-unbuilt-compute-command",
@@ -165,7 +159,6 @@ impl Unbuilt {
             Unbuilt::Heap => "a sparse heap",
             Unbuilt::MeshPipeline => "a mesh render pipeline state",
             Unbuilt::FunctionTable => "a function handle or a visible function table",
-            Unbuilt::PipelineQuery => "a pipeline state's threadgroup memory or imageblock length",
             Unbuilt::ArgumentLayout => "an argument buffer's layout",
             Unbuilt::RenderCommand => "an indirect, mesh or tile draw, a resolve or a GL setting",
             Unbuilt::ComputeCommand => "an indirect dispatchThreads or stage-in region",

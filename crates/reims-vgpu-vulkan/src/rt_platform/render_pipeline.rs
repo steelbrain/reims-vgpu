@@ -27,9 +27,12 @@
 //!   `threadgroupSizeMatchesTileSize` NO, as Metal's drawing state answers (metal2vulkan's
 //!   measurement on an M3 Max and an M4). The object and mesh stages' answers are 0, as Metal's
 //!   for a state with neither stage. `gpuResourceID` and `resourceIndex` are 0 and
-//!   `supportIndirectCommandBuffers` NO, as a compute state's. `uniqueIdentifier` is one of the
-//!   compute states' count. rt's state answers no imageblock length: `imageblockSampleLength` and
-//!   `imageblockMemoryLengthForDimensions:` are 0, counted (`rt-unbuilt-pipeline-query`).
+//!   `supportIndirectCommandBuffers` NO, rt's, as a compute state's. `uniqueIdentifier` is one of
+//!   the compute states' count. `imageblockSampleLength` and
+//!   `imageblockMemoryLengthForDimensions:` are rt's: the colour attachments' texels as Metal
+//!   packs them, and that times the dimensions' width and height and the sample count. Where rt
+//!   refuses one (`Gap::ImageblockLength`: a colour format with no measured place in Metal's
+//!   record), the answer is 0, counted (`rt-refused-gap`).
 //! - **Its slots' writes** are the vertex and fragment functions' own, as a compute state's are
 //!   its kernel's (rt's interface of each, `texture_accesses`). A drawing state has no tile,
 //!   object or mesh function, so it writes no slot of theirs.
@@ -57,10 +60,11 @@ use crate::core::raise::RaiseResult;
 
 use super::device::RtDevice;
 use super::pipeline::{
-    Lease, Taking, linked_functions, next_identifier, specialized, writes, written_slots,
+    IMAGEBLOCK_MEMORY_LENGTH, Lease, Taking, dimensions, linked_functions, next_identifier,
+    specialized, writes, written_slots,
 };
 use super::state::value;
-use super::unbuilt::{RtRefusal, Unbuilt, refuse, refused_error, refused_error_as};
+use super::unbuilt::{RtRefusal, Unbuilt, refused_error, refused_error_as, rt_refused};
 use super::{RtObj, RtPlatform};
 
 /// `newRenderPipelineStateWithDescriptor:error:`.
@@ -69,6 +73,9 @@ pub const WITH_DESCRIPTOR: &str = "newRenderPipelineStateWithDescriptor:error:";
 /// `newRenderPipelineStateWithMeshDescriptor:options:reflection:error:`.
 pub const WITH_MESH_DESCRIPTOR: &str =
     "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:";
+
+/// `imageblockSampleLength`.
+const IMAGEBLOCK_SAMPLE_LENGTH: &str = "imageblockSampleLength";
 
 /// `MTLBufferLayoutStrideDynamic`: a layout whose stride the encoder binds the buffer with.
 const STRIDE_DYNAMIC: u64 = u64::MAX;
@@ -351,23 +358,29 @@ impl RenderPipeline for RtObj<RtRenderPipeline> {
         0
     }
 
-    /// Unbuilt: 0 ([`Unbuilt::PipelineQuery`]).
+    /// rt's answer; 0 where rt refuses it, counted under the refusal's kind.
     fn imageblock_memory_length(&self, imageblock_dimensions: MtlSize) -> RaiseResult<u64> {
-        let _ = imageblock_dimensions;
-        refuse(
-            Unbuilt::PipelineQuery,
-            "imageblockMemoryLengthForDimensions:",
-        );
-        Ok(0)
+        let asked = dimensions(imageblock_dimensions);
+        let made = self.rt.imageblock_memory_length_for_dimensions(asked);
+        Ok(made.unwrap_or_else(|error| {
+            rt_refused(IMAGEBLOCK_MEMORY_LENGTH, &error);
+            0
+        }))
     }
 
-    /// Unbuilt: 0 ([`Unbuilt::PipelineQuery`]), the ask noted by its colour formats and sample
-    /// count (`super::diag::imageblock`).
+    /// rt's answer; 0 where rt refuses it, counted under the refusal's kind. The ask is noted by
+    /// its colour formats and sample count, with the answer (`super::diag::imageblock`).
     fn imageblock_sample_length(&self) -> u64 {
+        let made = self.rt.imageblock_sample_length();
         let (formats, samples) = self.colors;
-        super::diag::imageblock(formats, samples);
-        refuse(Unbuilt::PipelineQuery, "imageblockSampleLength");
-        0
+        super::diag::imageblock(formats, samples, made.as_ref().ok().copied());
+        made.map_or_else(
+            |error| {
+                rt_refused(IMAGEBLOCK_SAMPLE_LENGTH, &error);
+                0
+            },
+            u64::from,
+        )
     }
 
     /// 0, a drawing state's.
@@ -406,7 +419,7 @@ impl RenderPipeline for RtObj<RtRenderPipeline> {
     }
 
     fn support_indirect_command_buffers(&self) -> bool {
-        false
+        self.rt.support_indirect_command_buffers()
     }
 
     /// NO, a drawing state's.
@@ -625,11 +638,13 @@ mod tests {
         assert_eq!(state.max_total_threads_per_object_threadgroup(), 0);
         assert_eq!(state.max_total_threadgroups_per_mesh_grid(), 0);
         assert_ne!(state.unique_identifier(), 0);
-        let queries = counted(Unbuilt::PipelineQuery.code());
-        assert_eq!(state.imageblock_sample_length(), 0);
+        // One BGRA8Unorm attachment, one sample: a texel of 4 bytes, as Metal packs it
+        // (`metal2vulkan::metal::format::imageblock_sample_length`, measured on an M3 Max).
+        let gaps = counted(RtRefusal::Gap.code());
+        assert_eq!(state.imageblock_sample_length(), 4);
         let length = state.imageblock_memory_length(MtlSize::new(8, 8, 1));
-        assert_eq!(length.expect("never a raise"), 0);
-        assert_eq!(counted(Unbuilt::PipelineQuery.code()), queries + 2);
+        assert_eq!(length.expect("never a raise"), 4 * 8 * 8);
+        assert_eq!(counted(RtRefusal::Gap.code()), gaps);
         let before = counted(metal);
         let unknown = RenderPipelineDesc {
             color0_pixel_format: 0xdead,
