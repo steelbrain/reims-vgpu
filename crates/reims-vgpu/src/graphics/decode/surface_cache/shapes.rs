@@ -602,7 +602,10 @@ mod tests {
         gone.sort_unstable();
         assert_eq!(gone, vec![3, 4], "the two least recently used unreferenced");
         assert_eq!(table.iter().count(), 7);
-        assert!(table.sweep(&mut ShapeCounts::default()).is_empty(), "within the bound");
+        assert!(
+            table.sweep(&mut ShapeCounts::default()).is_empty(),
+            "within the bound"
+        );
         let (_, again) = table.insert(key(13, 4), 3, true, 20);
         assert!(again, "made again after its drop");
         let (_, again) = table.insert(key(50, 4), 50, true, 21);
@@ -675,7 +678,10 @@ mod tests {
         assert_eq!(counts.kept_dirty, 1);
         assert_eq!(table.oldest_unreferenced().map(|(used, _)| used), Some(3));
         table.written_back(&[ids[0], ids[3]], &mut counts);
-        assert_eq!((counts.written_back, counts.written_back_bytes), (1, 10 * 64 * 4));
+        assert_eq!(
+            (counts.written_back, counts.written_back_bytes),
+            (1, 10 * 64 * 4)
+        );
         assert!(table.iter().any(|s| s.dirty), "the one not written back");
         let gone: Vec<u64> = table.sweep(&mut counts).iter().map(|s| s.image).collect();
         assert_eq!(gone, vec![0]);
@@ -835,9 +841,13 @@ mod tests {
             }
         }
         // SAFETY: the Shared buffer's bytes, which no command writes any more.
-        let read =
-            unsafe { std::slice::from_raw_parts(back.contents().as_ptr::<u8>(), length.to_usize()) };
-        assert!(read == want.as_slice(), "the inner shapes alone, at their places");
+        let read = unsafe {
+            std::slice::from_raw_parts(back.contents().as_ptr::<u8>(), length.to_usize())
+        };
+        assert!(
+            read == want.as_slice(),
+            "the inner shapes alone, at their places"
+        );
         // Nothing owes a fill now: nothing is encoded, nothing counted.
         let cb = queue.command_buffer(ON).unwrap().unwrap();
         fill::<V>(&cb, &buffer, &mut table, |s| s.owed, &mut counts).unwrap();

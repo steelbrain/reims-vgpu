@@ -6303,7 +6303,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         let mut noted = self.shapes_written.borrow_mut();
         let id = used.reference.id();
-        if !noted.iter().any(|(block, s)| *block == used.block && s.id() == id) {
+        if !noted
+            .iter()
+            .any(|(block, s)| *block == used.block && s.id() == id)
+        {
             noted.push((used.block, used.reference.clone_ref()));
         }
     }

@@ -524,11 +524,18 @@ mod tests {
         assert_eq!(written_back(&calls), [(image, cache, 0)]);
         let back = first(&calls, TO_BUFFER);
         assert!(copies(&calls[..back]).is_empty(), "written back first");
-        assert_eq!(copies(&calls[back..]).len(), 1, "then the buffer into the pages");
+        assert_eq!(
+            copies(&calls[back..]).len(),
+            1,
+            "then the buffer into the pages"
+        );
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(downloaded.load(Ordering::SeqCst));
         let counts = r.dec.caches().counts().shapes;
-        assert_eq!((counts.written_back, counts.written_back_bytes), (1, 32 * 8 * 4));
+        assert_eq!(
+            (counts.written_back, counts.written_back_bytes),
+            (1, 32 * 8 * 4)
+        );
 
         let mark = r.p.call_log().mark();
         let again = download(&r, BLOCK);
@@ -570,7 +577,10 @@ mod tests {
         assert!(copies(&calls).is_empty(), "no copy from the pages");
         assert_eq!(written_back(&calls), [(written, cache, 0)]);
         assert_eq!(fills(&calls), [(cache, 0, new)]);
-        assert!(first(&calls, TO_BUFFER) < first(&calls, FILL), "written back first");
+        assert!(
+            first(&calls, TO_BUFFER) < first(&calls, FILL),
+            "written back first"
+        );
         let counts = r.dec.caches().counts().shapes;
         assert_eq!((counts.fills_made, counts.written_back), (1, 1));
         r.p.world().complete_all(CompleteOn::Caller);
@@ -623,7 +633,10 @@ mod tests {
             .unwrap();
         assert!(waits, "the reader waits for the fill on the GPU");
         let calls = r.p.call_log().since(mark);
-        assert!(written_back(&calls).is_empty() && fills(&calls).is_empty(), "deferred");
+        assert!(
+            written_back(&calls).is_empty() && fills(&calls).is_empty(),
+            "deferred"
+        );
         assert_eq!(r.dec.caches().counts().shapes.fills_deferred, 1);
 
         let later = other.command_buffer(ON).unwrap().unwrap();
@@ -637,24 +650,41 @@ mod tests {
             .unwrap();
         let mark = r.p.call_log().mark();
         (r.dec.surface_caches)
-            .finish(&r.device, 1, None, &writer, writer_uses, || writer.commit(ON))
+            .finish(&r.device, 1, None, &writer, writer_uses, || {
+                writer.commit(ON)
+            })
             .unwrap();
         let calls = r.p.call_log().since(mark);
-        assert_eq!(written_back(&calls), [(written, cache, 0)], "the first's write");
+        assert_eq!(
+            written_back(&calls),
+            [(written, cache, 0)],
+            "the first's write"
+        );
         assert_eq!(fills(&calls), [(cache, 0, new)]);
-        assert!(first(&calls, TO_BUFFER) < first(&calls, FILL), "written back first");
+        assert!(
+            first(&calls, TO_BUFFER) < first(&calls, FILL),
+            "written back first"
+        );
         drop(reader_uses);
         r.p.world().complete_all(CompleteOn::Caller);
 
         let mark = r.p.call_log().mark();
         let downloaded = download(&r, BLOCK);
         let calls = r.p.call_log().since(mark);
-        assert_eq!(written_back(&calls), [(written, cache, 0)], "the later's write");
+        assert_eq!(
+            written_back(&calls),
+            [(written, cache, 0)],
+            "the later's write"
+        );
         assert_eq!(copies(&calls).len(), 1);
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(downloaded.load(Ordering::SeqCst));
         let counts = r.dec.caches().counts().shapes;
-        let made = (counts.fills_deferred, counts.fills_made, counts.written_back);
+        let made = (
+            counts.fills_deferred,
+            counts.fills_made,
+            counts.written_back,
+        );
         assert_eq!(made, (1, 1, 2));
     }
 
