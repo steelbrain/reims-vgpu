@@ -30,6 +30,9 @@
 //!   `supportIndirectCommandBuffers` NO, as a compute state's. `uniqueIdentifier` is one of the
 //!   compute states' count. rt's state answers no imageblock length: `imageblockSampleLength` and
 //!   `imageblockMemoryLengthForDimensions:` are 0, counted (`rt-unbuilt-pipeline-query`).
+//! - **Its slots' writes** are the vertex and fragment functions' own, as a compute state's are
+//!   its kernel's (rt's interface of each, `texture_accesses`). A drawing state has no tile,
+//!   object or mesh function, so it writes no slot of theirs.
 //! - **Mesh render pipeline states** are unbuilt: rt has none. The creator answers its `NSError`,
 //!   counted (`rt-unbuilt-mesh-pipeline`).
 
@@ -44,7 +47,7 @@ use metal2vulkan::pipeline::{
 };
 use metal2vulkan_rt as rt;
 
-use crate::core::platform::resource::RenderPipeline;
+use crate::core::platform::resource::{RenderFunction, RenderPipeline};
 use crate::core::platform::types::{MtlSize, NsErrorText};
 use crate::core::platform::values::{
     ColorAttachmentDesc, FullMeshRenderPipelineDesc, FullRenderPipelineDesc, PrivateRenderDesc,
@@ -53,7 +56,9 @@ use crate::core::platform::values::{
 use crate::core::raise::RaiseResult;
 
 use super::device::RtDevice;
-use super::pipeline::{Lease, Taking, linked_functions, next_identifier, specialized};
+use super::pipeline::{
+    Lease, Taking, linked_functions, next_identifier, specialized, writes, written_slots,
+};
 use super::state::value;
 use super::unbuilt::{RtRefusal, Unbuilt, refuse, refused_error, refused_error_as};
 use super::{RtObj, RtPlatform};
@@ -76,6 +81,10 @@ pub struct RtRenderPipeline {
     lease: Lease,
     /// Its `uniqueIdentifier`.
     unique_identifier: u64,
+    /// The texture slots the vertex function may write (`written_slots`).
+    vertex_written: Box<[u32]>,
+    /// The texture slots the fragment function may write.
+    fragment_written: Box<[u32]>,
 }
 
 impl RtRenderPipeline {
@@ -309,10 +318,14 @@ fn make(
     let mut taking = Taking::new(device);
     let made = (device.rt()).new_render_pipeline_state(descriptor, |samplers| taking.ids(samplers));
     let (rt, lease) = taking.made(WITH_DESCRIPTOR, made)?;
+    let vertex_written = written_slots(rt.texture_accesses(rt::Stage::Vertex));
+    let fragment_written = written_slots(rt.texture_accesses(rt::Stage::Fragment));
     Ok(RtObj::new(RtRenderPipeline {
         rt,
         lease,
         unique_identifier: next_identifier(),
+        vertex_written,
+        fragment_written,
     }))
 }
 
@@ -385,6 +398,20 @@ impl RenderPipeline for RtObj<RtRenderPipeline> {
     fn unique_identifier(&self) -> u64 {
         self.unique_identifier
     }
+
+    /// As a compute state answers of its kernel, of the vertex or fragment function's slot
+    /// `index`; `Some(false)` for a tile, object or mesh function's slot: a drawing state has
+    /// none of them.
+    fn texture_slot_writes(&self, function: RenderFunction, index: u64) -> Option<bool> {
+        let written = match function {
+            RenderFunction::Vertex => &self.vertex_written,
+            RenderFunction::Fragment => &self.fragment_written,
+            RenderFunction::Tile | RenderFunction::Object | RenderFunction::Mesh => {
+                return Some(false);
+            }
+        };
+        Some(writes(written, index))
+    }
 }
 
 #[cfg(test)]
@@ -398,6 +425,9 @@ mod tests {
 
     /// `numbered_samplers.metal`'s functions, compiled by build.rs.
     const NUMBERED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/numbered_samplers.metallib"));
+
+    /// `rounding.metal`'s functions, compiled by build.rs: `write_fragment` writes texture 0.
+    const ROUNDING: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rounding.metallib"));
 
     /// A vertex function fed through a vertex descriptor: attribute 0 a `float2` position, 1 a
     /// normalized `uchar4` colour.
@@ -610,11 +640,41 @@ mod tests {
         };
         let (first, second) = (full(&desc), full(&desc));
         assert_eq!(first.samplers(), [rt::NumberedSampler::Read]);
+        // The fragment function reads its slot 0, the vertex function uses none.
+        for function in [
+            RenderFunction::Vertex,
+            RenderFunction::Fragment,
+            RenderFunction::Tile,
+            RenderFunction::Object,
+            RenderFunction::Mesh,
+        ] {
+            assert_eq!(first.texture_slot_writes(function, 0), Some(false));
+        }
         assert_eq!(first.sampler_indices(), second.sampler_indices());
         assert_eq!(device.numbering().held(), held + 1);
         assert_ne!(first.unique_identifier(), second.unique_identifier());
         drop((first, second));
         assert_eq!(device.numbering().held(), held);
+
+        // A fragment function that writes its slot 0 may write it.
+        let (sweep, write) = (
+            function(ROUNDING, "sweep_vertex"),
+            function(ROUNDING, "write_fragment"),
+        );
+        let writer = RenderPipelineDesc {
+            label: None,
+            vertex: &sweep,
+            fragment: &write,
+            color0_pixel_format: 80,
+            resource_index: None,
+        };
+        let writer = device.new_render_pipeline_state(&writer);
+        let writer = writer.expect("a render state").expect("a render state");
+        let slot = |function, index| writer.texture_slot_writes(function, index);
+        assert_eq!(slot(RenderFunction::Fragment, 0), Some(true));
+        assert_eq!(slot(RenderFunction::Fragment, 1), Some(false));
+        assert_eq!(slot(RenderFunction::Vertex, 0), Some(false));
+        drop(writer);
 
         // A vertex descriptor, a blended attachment, a depth format and the guest's private state.
         let (vdesc, color) = (

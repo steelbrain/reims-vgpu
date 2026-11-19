@@ -27,6 +27,10 @@
 //!   imageblock length: each is 0, counted (`rt-unbuilt-pipeline-query`). Function handles and
 //!   visible function tables are nil, counted (`rt-unbuilt-function-table`): rt's kernels take
 //!   no function table.
+//! - **Its slots' writes.** Whether the kernel may write the texture bound at a slot is rt's
+//!   interface of it (`texture_accesses`): a slot it writes, or reads and writes, as its
+//!   operations do, not as its argument's `access::` qualifier says. Every other slot it only
+//!   samples, reads or queries, or does not use. The state keeps the written slots as it is made.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -179,6 +183,8 @@ pub struct RtComputePipeline {
     lease: Lease,
     /// Its `uniqueIdentifier`.
     unique_identifier: u64,
+    /// The texture slots the kernel may write ([`written_slots`]).
+    written: Box<[u32]>,
 }
 
 impl RtComputePipeline {
@@ -331,11 +337,28 @@ fn make(
     let made =
         (device.rt()).new_compute_pipeline_state(descriptor, |samplers| taking.ids(samplers));
     let (rt, lease) = taking.made(sel, made)?;
+    let written = written_slots(rt.texture_accesses());
     Ok(RtObj::new(RtComputePipeline {
         rt,
         lease,
         unique_identifier: next_identifier(),
+        written,
     }))
+}
+
+/// The texture slots of `accesses`, a function's slots and their access as rt's interface of it
+/// answers (`texture_accesses`), that the function may write: those it writes, or reads and
+/// writes.
+pub(super) fn written_slots(accesses: Vec<(u32, rt::BindingAccess)>) -> Box<[u32]> {
+    (accesses.into_iter())
+        .filter(|&(_, access)| access != rt::BindingAccess::ReadOnly)
+        .map(|(slot, _)| slot)
+        .collect()
+}
+
+/// Whether slot `index` is one of `written` ([`written_slots`]).
+pub(super) fn writes(written: &[u32], index: u64) -> bool {
+    u32::try_from(index).is_ok_and(|index| written.contains(&index))
 }
 
 /// The next `uniqueIdentifier` of a pipeline state, compute or render: one of a process-wide count
@@ -472,6 +495,12 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
 
     fn unique_identifier(&self) -> u64 {
         self.unique_identifier
+    }
+
+    /// `Some(true)` where the kernel writes the texture bound at slot `index`, or reads and
+    /// writes it, as rt's interface of the kernel says; `Some(false)` for every other slot.
+    fn texture_slot_writes(&self, index: u64) -> Option<bool> {
+        Some(writes(&self.written, index))
     }
 }
 
@@ -613,6 +642,15 @@ mod tests {
         assert_eq!(read.samplers(), [rt::NumberedSampler::Read]);
         assert_eq!(read.sampler_indices(), [last - 1]);
         assert_eq!(device.numbering().held(), held + 2);
+
+        // A slot the kernel writes is written; one it reads or samples, or does not use, is not.
+        let write = state(&function("numbered_write"));
+        let slots = |s: &RtObj<RtComputePipeline>| (0..2).map(|i| s.texture_slot_writes(i));
+        assert_eq!(slots(&write).collect::<Vec<_>>(), [Some(true), Some(false)]);
+        assert_eq!(slots(&read).collect::<Vec<_>>(), [Some(false); 2]);
+        assert_eq!(slots(&first).collect::<Vec<_>>(), [Some(false); 2]);
+        assert_eq!(write.texture_slot_writes(u64::MAX), Some(false));
+        drop(write);
 
         assert!(first.max_total_threads_per_threadgroup() > 0);
         assert_eq!(first.thread_execution_width(), 32);
