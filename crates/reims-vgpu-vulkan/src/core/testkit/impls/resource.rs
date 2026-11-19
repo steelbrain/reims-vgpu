@@ -675,7 +675,18 @@ impl ComputePipeline<FakePlatform> for Fk<kind::ComputePipeline> {
     fn unique_identifier(&self) -> u64 {
         self.unique_id_value()
     }
+
+    /// Logged as [`TEXTURE_SLOT_WRITES`]; the script's answer, else none known.
+    fn texture_slot_writes(&self, index: u64) -> Option<bool> {
+        self.get_logged(TEXTURE_SLOT_WRITES, vec![Arg::U64(index)], || None)
+    }
 }
+
+/// The fake's name for [`ComputePipeline::texture_slot_writes`] and
+/// [`RenderPipeline::texture_slot_writes`] in the call log and the script, which no selector of
+/// Metal's is: a render pipeline's call takes its function's [`RenderFunction`] as its index in
+/// the enum's order, then the slot.
+pub const TEXTURE_SLOT_WRITES: &str = "textureSlotWrites";
 
 impl RenderPipeline for Fk<kind::RenderPipeline> {
     fn gpu_resource_id(&self) -> u64 {
@@ -733,6 +744,12 @@ impl RenderPipeline for Fk<kind::RenderPipeline> {
 
     fn unique_identifier(&self) -> u64 {
         self.unique_id_value()
+    }
+
+    /// Logged as [`TEXTURE_SLOT_WRITES`]; the script's answer, else none known.
+    fn texture_slot_writes(&self, function: RenderFunction, index: u64) -> Option<bool> {
+        let args = vec![Arg::U64(function as u64), Arg::U64(index)];
+        self.get_logged(TEXTURE_SLOT_WRITES, args, || None)
     }
 }
 

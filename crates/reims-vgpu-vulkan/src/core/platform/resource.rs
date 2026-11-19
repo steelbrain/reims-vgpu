@@ -349,6 +349,27 @@ pub trait ComputePipeline<P: Platform>: Handle {
     fn guest_unique_identifier(&self) -> u64 {
         self.unique_identifier()
     }
+    /// No Metal counterpart: whether the kernel may write the texture bound at texture slot
+    /// `index` (`setTexture:atIndex:`), from the access its compiled interface states for the
+    /// slot (it writes it, or reads and writes it), not the argument's `access::` qualifier:
+    /// `Some(false)` where it only samples, reads or queries the slot's texture, or uses no such
+    /// slot. `None` where the platform knows no slot's access, the default: the caller then goes
+    /// by the texture's usage.
+    fn texture_slot_writes(&self, _index: u64) -> Option<bool> {
+        None
+    }
+}
+
+/// The function of a render pipeline a texture slot is bound for, as the render encoder's
+/// `set{Vertex,Fragment,Tile,Object,Mesh}Texture:atIndex:` names it
+/// ([`RenderPipeline::texture_slot_writes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RenderFunction {
+    Vertex,
+    Fragment,
+    Tile,
+    Object,
+    Mesh,
 }
 
 /// `MTLRenderPipelineState` (with `MTLRenderPipelineStateSPI`).
@@ -386,6 +407,14 @@ pub trait RenderPipeline: Handle {
     /// cannot answer Metal's identifier of a state dies here, where the guest reads it.
     fn guest_unique_identifier(&self) -> u64 {
         self.unique_identifier()
+    }
+    /// No Metal counterpart: whether `function`'s stage of the pipeline may write the texture
+    /// bound at its texture slot `index`, as
+    /// [`ComputePipeline::texture_slot_writes`] answers a kernel's: `Some(false)` where it only
+    /// samples, reads or queries the slot's texture, or uses no such slot; `None` where the
+    /// platform knows no slot's access, the default.
+    fn texture_slot_writes(&self, _function: RenderFunction, _index: u64) -> Option<bool> {
+        None
     }
 }
 
