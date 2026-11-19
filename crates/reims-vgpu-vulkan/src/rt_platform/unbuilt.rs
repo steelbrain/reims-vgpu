@@ -47,12 +47,16 @@ pub enum Unbuilt {
     /// What of heaps is not built yet (`super::heap`): a sparse heap, whose ranges rt maps no
     /// tiles of. Each answers nil.
     Heap,
-    /// Libraries and their functions (`newLibraryWithData:error:`): over the translator's
-    /// library. Each answers nil.
-    Library,
-    /// Compute and render pipeline states. Each answers nil, with an `NSError` where Metal's
+    /// Render and mesh render pipeline states. Each answers nil, with an `NSError` where Metal's
     /// creation fills one.
     Pipeline,
+    /// Function handles and visible function tables (`functionHandleWithFunction:`,
+    /// `newVisibleFunctionTableWithDescriptor:`): rt's kernels take no function table. Each
+    /// answers nil.
+    FunctionTable,
+    /// What a pipeline state answers that rt's state does not: its static threadgroup memory
+    /// length and its imageblock lengths. Each answers 0.
+    PipelineQuery,
     /// Argument buffers' layouts (`newArgumentEncoderWithArguments:` and a function's). Each
     /// answers nil.
     ArgumentLayout,
@@ -89,13 +93,14 @@ pub enum Unbuilt {
 
 impl Unbuilt {
     /// Every piece, once, in the order of their codes' places.
-    pub const ALL: [Unbuilt; 16] = [
+    pub const ALL: [Unbuilt; 17] = [
         Unbuilt::Buffer,
         Unbuilt::IosurfaceTexture,
         Unbuilt::SharedTexture,
         Unbuilt::Heap,
-        Unbuilt::Library,
         Unbuilt::Pipeline,
+        Unbuilt::FunctionTable,
+        Unbuilt::PipelineQuery,
         Unbuilt::ArgumentLayout,
         Unbuilt::Encoder,
         Unbuilt::Protection,
@@ -115,8 +120,9 @@ impl Unbuilt {
             Unbuilt::IosurfaceTexture => "rt-unbuilt-iosurface-texture",
             Unbuilt::SharedTexture => "rt-unbuilt-shared-texture",
             Unbuilt::Heap => "rt-unbuilt-heap",
-            Unbuilt::Library => "rt-unbuilt-library",
             Unbuilt::Pipeline => "rt-unbuilt-pipeline",
+            Unbuilt::FunctionTable => "rt-unbuilt-function-table",
+            Unbuilt::PipelineQuery => "rt-unbuilt-pipeline-query",
             Unbuilt::ArgumentLayout => "rt-unbuilt-argument-layout",
             Unbuilt::Encoder => "rt-unbuilt-encoder",
             Unbuilt::Protection => "rt-unbuilt-protection",
@@ -137,8 +143,9 @@ impl Unbuilt {
             Unbuilt::IosurfaceTexture => "a texture over an IOSurface's plane",
             Unbuilt::SharedTexture => "a shared texture",
             Unbuilt::Heap => "a sparse heap",
-            Unbuilt::Library => "a library",
-            Unbuilt::Pipeline => "a pipeline state",
+            Unbuilt::Pipeline => "a render pipeline state",
+            Unbuilt::FunctionTable => "a function handle or a visible function table",
+            Unbuilt::PipelineQuery => "a pipeline state's threadgroup memory or imageblock length",
             Unbuilt::ArgumentLayout => "an argument buffer's layout",
             Unbuilt::Encoder => "a compute or render command encoder",
             Unbuilt::Protection => "a command buffer's protection options",
@@ -360,6 +367,34 @@ pub fn rt_refused_texture(sel: &'static str, error: &rt::Error) -> RtRefusal {
     RtRefusal::Gap
 }
 
+/// [`rt_refused_create`] of a creator with an `error:` out-parameter: the `NSError` it answers, in
+/// [`RT_DOMAIN`], code 0, naming rt's error and its kind's code.
+pub fn rt_refused_error(sel: &'static str, error: &rt::Error) -> NsErrorText {
+    let kind = rt_refused_create(sel, error);
+    rt_error(kind, error)
+}
+
+/// [`refused_as`] of a creator with an `error:` out-parameter, noted for core as a gap of the
+/// platform's own as [`refuse_create`] does: the `NSError` it answers, as [`rt_refused_error`]'s.
+pub fn refused_error_as(
+    sel: &'static str,
+    kind: RtRefusal,
+    why: &dyn std::fmt::Display,
+) -> NsErrorText {
+    crate::core::platform::device::note_relayed_gap();
+    refused_as(sel, kind, why);
+    rt_error(kind, why)
+}
+
+/// The `NSError` of a refusal of the kind `kind` for `why`.
+fn rt_error(kind: RtRefusal, why: &dyn std::fmt::Display) -> NsErrorText {
+    NsErrorText {
+        domain: RT_DOMAIN.to_owned(),
+        code: 0,
+        description: format!("metal2vulkan-rt refused it: {why} ({})", kind.code()),
+    }
+}
+
 /// [`rt_refused_texture`] of a creator, which answers nil where Metal makes the texture: noted
 /// for core as a gap of the platform's own, as [`refuse_create`] does.
 pub fn rt_refused_texture_create(sel: &'static str, error: &rt::Error) -> RtRefusal {
@@ -488,12 +523,22 @@ mod tests {
     #[test]
     fn a_refused_creator_answers_an_nserror() {
         let (error, relayed) =
-            relaying_gaps(|| refused_error(Unbuilt::Library, "newLibraryWithData:error:"));
+            relaying_gaps(|| refused_error(Unbuilt::DynamicLibrary, "newDynamicLibrary:error:"));
         assert!(relayed);
         assert_eq!((error.domain.as_str(), error.code), (RT_DOMAIN, 0));
         assert_eq!(
             error.description,
-            "a library is not built on metal2vulkan-rt (rt-unbuilt-library)"
+            "a dynamic library is not built on metal2vulkan-rt (rt-unbuilt-dynamic-library)"
+        );
+        let (error, relayed) = relaying_gaps(|| rt_refused_error("test", &rt::Error::Quiesced));
+        assert!(relayed);
+        assert_eq!(error.domain, RT_DOMAIN);
+        assert!(error.description.ends_with("(rt-refused-quiesced)"), "{error}");
+        let (error, relayed) = relaying_gaps(|| refused_error_as("test", RtRefusal::Limit, &"full"));
+        assert!(relayed);
+        assert_eq!(
+            error.description,
+            "metal2vulkan-rt refused it: full (rt-refused-limit)"
         );
         let code = RtRefusal::NoDevice.code();
         let before = counted(code);

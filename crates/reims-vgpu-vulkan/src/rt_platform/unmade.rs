@@ -19,7 +19,6 @@ use crate::core::platform::icb::IcbRenderCmd;
 use crate::core::platform::icb::ImageBlockArgs;
 use crate::core::platform::icb::TessellationFactorArgs;
 use crate::core::platform::render::RenderCmd;
-use crate::core::platform::resource::FunctionConstant;
 use crate::core::platform::types::MtlCoordinate2D;
 use crate::core::platform::types::MtlRegion;
 use crate::core::platform::types::MtlSize;
@@ -62,12 +61,6 @@ pub mod kinds {
     pub enum RenderEncoder {}
     /// `MTLSharedTextureHandle *`.
     pub enum SharedTextureHandle {}
-    /// `id<MTLLibrary>`.
-    pub enum Library {}
-    /// `id<MTLFunction>`.
-    pub enum Function {}
-    /// `id<MTLComputePipelineState>`.
-    pub enum ComputePipeline {}
     /// `id<MTLFunctionHandle>`.
     pub enum FunctionHandle {}
     /// `id<MTLVisibleFunctionTable>`.
@@ -121,42 +114,6 @@ impl<P: Platform> render::RenderEncoder<P> for Unmade<kinds::RenderEncoder> {
     }
 }
 
-impl<P: Platform> resource::ComputePipeline<P> for Unmade<kinds::ComputePipeline> {
-    fn gpu_resource_id(&self) -> u64 {
-        self.unreachable()
-    }
-    fn function_handle(&self, _function: &P::Function) -> RaiseResult<Option<P::FunctionHandle>> {
-        self.unreachable()
-    }
-    fn new_visible_function_table(
-        &self,
-        _function_count: u64,
-    ) -> RaiseResult<Option<P::VisibleFunctionTable>> {
-        self.unreachable()
-    }
-    fn imageblock_memory_length(&self, _imageblock_dimensions: MtlSize) -> RaiseResult<u64> {
-        self.unreachable()
-    }
-    fn max_total_threads_per_threadgroup(&self) -> u64 {
-        self.unreachable()
-    }
-    fn resource_index(&self) -> u64 {
-        self.unreachable()
-    }
-    fn static_threadgroup_memory_length(&self) -> u64 {
-        self.unreachable()
-    }
-    fn support_indirect_command_buffers(&self) -> bool {
-        self.unreachable()
-    }
-    fn thread_execution_width(&self) -> u64 {
-        self.unreachable()
-    }
-    fn unique_identifier(&self) -> u64 {
-        self.unreachable()
-    }
-}
-
 impl resource::RenderPipeline for Unmade<kinds::RenderPipeline> {
     fn gpu_resource_id(&self) -> u64 {
         self.unreachable()
@@ -195,33 +152,6 @@ impl resource::RenderPipeline for Unmade<kinds::RenderPipeline> {
         self.unreachable()
     }
     fn unique_identifier(&self) -> u64 {
-        self.unreachable()
-    }
-}
-
-impl<P: Platform> resource::Library<P> for Unmade<kinds::Library> {
-    fn function_names(&self) -> Vec<String> {
-        self.unreachable()
-    }
-    fn new_function(&self, _on: OnFault, _function_name: &str) -> RaiseResult<Option<P::Function>> {
-        self.unreachable()
-    }
-    fn new_function_with_constants(
-        &self,
-        _on: OnFault,
-        _function_name: &str,
-        _constants: &[FunctionConstant],
-    ) -> RaiseResult<Option<P::Function>> {
-        self.unreachable()
-    }
-    fn new_function_with_options(
-        &self,
-        _on: OnFault,
-        _function_name: &str,
-        _constants: &[FunctionConstant],
-        _options: u64,
-        _specialized_name: Option<&str>,
-    ) -> RaiseResult<Option<P::Function>> {
         self.unreachable()
     }
 }

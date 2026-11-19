@@ -1,0 +1,586 @@
+//! The rt platform's compute pipeline states ([`RtComputePipeline`]): rt's, made of a function
+//! (`newComputePipelineStateWithFunction:error:`) or of core's whole descriptor
+//! (`newComputePipelineStateWithDescriptor:options:reflection:error:`), with the sampler indices
+//! their samplers take ([`Numbering`]).
+//!
+//! - **The descriptor** is rt's of core's values: the kernel as its function was made
+//!   (`super::library`), the linked functions as theirs were, the stage-input descriptor, and the
+//!   descriptor's numbers, a value past rt's word held at the word's maximum, which rt refuses as
+//!   Metal refuses a value past its limit. rt refuses a state for indirect command buffers
+//!   (`rt-refused-gap`). Every refusal is the creator's `NSError`, counted under its kind. A
+//!   kernel made unspecialized (`newFunctionWithName:`) that declares function constants is
+//!   refused before rt compiles it (`rt-refused-metal`): Metal's creation ends the process at it.
+//! - **Its samplers' indices.** rt numbers the samplers a state samples through as Metal's
+//!   creation does: its constexpr samplers, then one for a texture read and one for a texture
+//!   write, and takes an index of a live sampler grant for each. A sampler equal to one a live
+//!   state holds takes its index, as Metal's numbering does, and any other an index of the
+//!   platform's own (`super::texture`'s `OwnIndices`, the sampler states' own, which never takes
+//!   an index the guest reserved). rt places a constexpr sampler's device samplers at its index;
+//!   the read and write samplers take nothing there. A state gives its indices back as it goes,
+//!   after rt's state: an index whose last holder goes is the platform's again. Where none is
+//!   free, the creation is refused (`rt-refused-limit`).
+//! - **Its answers.** `maxTotalThreadsPerThreadgroup` is rt's; `threadExecutionWidth` is 32, the
+//!   SIMD-group width rt runs every kernel's SIMD groups at; `gpuResourceID` and `resourceIndex`
+//!   are 0, as Metal's are for a state without indirect command buffer support; and
+//!   `uniqueIdentifier` is one of a process-wide count from 1, where Metal's is an address that
+//!   differs from run to run. rt's state answers no static threadgroup memory length and no
+//!   imageblock length: each is 0, counted (`rt-unbuilt-pipeline-query`). Function handles and
+//!   visible function tables are nil, counted (`rt-unbuilt-function-table`): rt's kernels take
+//!   no function table.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use metal2vulkan::Budget;
+use metal2vulkan::metal::{AttributeFormat, IndexType, StepFunction};
+use metal2vulkan::pipeline::{
+    LinkedFunction, LinkedFunctions, StageEntries, StageInputAttributeDescriptor, StageInputDescriptor,
+    StageInputLayoutDescriptor,
+};
+use metal2vulkan_rt as rt;
+
+use crate::core::platform::resource::ComputePipeline;
+use crate::core::platform::{Handle, Platform};
+use crate::core::platform::types::{MtlSize, NsErrorText};
+use crate::core::platform::values::{FullComputePipelineDesc, LinkedFunctionsDesc, StageInputDesc};
+use crate::core::raise::RaiseResult;
+use crate::core::sync::Mutex;
+
+use super::device::RtDevice;
+use super::library::RtFunction;
+use super::state::value;
+use super::texture::OwnIndices;
+use super::unbuilt::{RtRefusal, Unbuilt, refuse, refuse_create, refused_error_as, rt_refused_error};
+use super::{RtObj, RtPlatform};
+
+/// `newComputePipelineStateWithFunction:error:`.
+pub const WITH_FUNCTION: &str = "newComputePipelineStateWithFunction:error:";
+
+/// `newComputePipelineStateWithDescriptor:options:reflection:error:`.
+pub const WITH_DESCRIPTOR: &str = "newComputePipelineStateWithDescriptor:options:reflection:error:";
+
+/// `threadExecutionWidth`: the SIMD-group width rt runs every kernel's SIMD groups at.
+pub const THREAD_EXECUTION_WIDTH: u64 = 32;
+
+/// `MTLBufferLayoutStrideDynamic`: a layout whose stride the encoder binds the buffer with.
+const STRIDE_DYNAMIC: u64 = u64::MAX;
+
+/// The next `uniqueIdentifier` a state takes.
+static NEXT_IDENTIFIER: AtomicU64 = AtomicU64::new(1);
+
+/// The sampler indices the live pipeline states' samplers hold (the module's docs): each sampler
+/// a live state numbers, with its index and how many of the live states' samplers hold it.
+#[derive(Default)]
+pub struct Numbering {
+    held: Mutex<HashMap<rt::NumberedSampler, Held>>,
+}
+
+/// A numbered sampler's index and its holders.
+struct Held {
+    index: u32,
+    holders: usize,
+}
+
+impl Numbering {
+    /// How many indices live states' samplers hold.
+    pub fn held(&self) -> usize {
+        self.held.lock().len()
+    }
+
+    /// An index for each of `samplers`, in their order, held until [`give_back`](Self::give_back)
+    /// of the same samplers: a sampler equal to one held takes its index, and any other one of
+    /// `own`, granted on `device` where it is new. `Ok(None)` where none of `own` is free for one;
+    /// on `None` or `Err` it holds nothing.
+    fn take(
+        &self,
+        own: &OwnIndices,
+        device: &rt::Device,
+        samplers: &[rt::NumberedSampler],
+    ) -> Result<Option<Vec<u32>>, rt::Error> {
+        let mut held = self.held.lock();
+        let mut indices = Vec::with_capacity(samplers.len());
+        for (at, sampler) in samplers.iter().enumerate() {
+            if let Some(h) = held.get_mut(sampler) {
+                h.holders = h.holders.saturating_add(1);
+                indices.push(h.index);
+                continue;
+            }
+            let taken = own.take(device);
+            let Ok(Some(index)) = taken else {
+                give_back(&mut held, own, samplers.get(..at).unwrap_or_default());
+                return taken.map(|_| None);
+            };
+            held.insert(*sampler, Held { index, holders: 1 });
+            indices.push(index);
+        }
+        Ok(Some(indices))
+    }
+
+    /// Gives back one hold of each of `samplers`: an index whose last holder goes is `own`'s.
+    fn give_back(&self, own: &OwnIndices, samplers: &[rt::NumberedSampler]) {
+        give_back(&mut self.held.lock(), own, samplers);
+    }
+}
+
+/// [`Numbering::give_back`] under its lock.
+fn give_back(
+    held: &mut HashMap<rt::NumberedSampler, Held>,
+    own: &OwnIndices,
+    samplers: &[rt::NumberedSampler],
+) {
+    for sampler in samplers {
+        let Some(h) = held.get_mut(sampler) else {
+            continue;
+        };
+        h.holders = h.holders.saturating_sub(1);
+        if h.holders == 0 {
+            own.give_back(h.index);
+            held.remove(sampler);
+        }
+    }
+}
+
+/// The samplers a state holds indices for, given back at its drop.
+struct Lease {
+    device: RtObj<RtDevice>,
+    samplers: Vec<rt::NumberedSampler>,
+    /// Each one's index.
+    indices: Vec<u32>,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let device = &self.device;
+        (device.numbering()).give_back(device.sampler_indices(), &self.samplers);
+    }
+}
+
+/// `id<MTLComputePipelineState>` on metal2vulkan-rt.
+pub struct RtComputePipeline {
+    /// rt's state. Declared before `lease`, so it goes first: rt gives up a constexpr sampler's
+    /// device samplers before its index is the platform's again.
+    rt: rt::ComputePipelineState,
+    /// Its samplers' indices.
+    lease: Lease,
+    /// Its `uniqueIdentifier`.
+    unique_identifier: u64,
+}
+
+impl RtComputePipeline {
+    /// rt's state.
+    pub fn rt(&self) -> &rt::ComputePipelineState {
+        &self.rt
+    }
+
+    /// The samplers it numbers, in rt's order.
+    pub fn samplers(&self) -> &[rt::NumberedSampler] {
+        &self.lease.samplers
+    }
+
+    /// The index each of [`samplers`](Self::samplers) holds.
+    pub fn sampler_indices(&self) -> &[u32] {
+        &self.lease.indices
+    }
+}
+
+/// The state of `function` alone, as `newComputePipelineStateWithFunction:error:` makes it, with
+/// Metal's defaults elsewhere.
+pub fn of_function(
+    device: &RtObj<RtDevice>,
+    function: &RtObj<RtFunction>,
+) -> Result<RtObj<RtComputePipeline>, NsErrorText> {
+    let stage = function.stage();
+    specialized(WITH_FUNCTION, &stage)?;
+    let descriptor = rt::ComputePipelineDescriptor::new(rt::StageSource::Function(stage));
+    make(device, WITH_FUNCTION, &descriptor)
+}
+
+/// The state of core's whole descriptor `desc` (the module's docs).
+pub fn of_descriptor(
+    device: &RtObj<RtDevice>,
+    desc: &FullComputePipelineDesc<'_, RtPlatform>,
+) -> Result<RtObj<RtComputePipeline>, NsErrorText> {
+    if let Some(library) = desc.libraries.preloaded.first() {
+        library.unreachable()
+    }
+    if let Some((_, library)) = desc.libraries.loaded.first() {
+        library.unreachable()
+    }
+    let mut stage = desc.function.stage();
+    specialized(WITH_DESCRIPTOR, &stage)?;
+    stage.linked = linked_functions(&desc.linked);
+    let mut d = rt::ComputePipelineDescriptor::new(rt::StageSource::Function(stage));
+    if let Some(input) = &desc.stage_input {
+        match stage_input(input) {
+            Ok(input) => d.stage_input = Some(input),
+            Err(why) => return Err(refused_error_as(WITH_DESCRIPTOR, RtRefusal::Refused, &why)),
+        }
+    }
+    d.max_total_threads_per_threadgroup = (desc.max_total_threads_per_threadgroup != 0)
+        .then(|| word(desc.max_total_threads_per_threadgroup));
+    d.threadgroup_size_is_multiple_of_execution_width =
+        desc.threadgroup_size_is_multiple_of_execution_width;
+    d.support_indirect_command_buffers = desc.support_indirect_command_buffers;
+    d.max_call_stack_depth = word(desc.max_call_stack_depth);
+    d.open_cl_mode_enabled = desc.open_cl_mode;
+    make(device, WITH_DESCRIPTOR, &d)
+}
+
+/// Whether Metal makes a state of `stage` by the creator `sel`: none of a function made
+/// unspecialized that declares function constants (`FunctionDescriptor::needs_specialization`),
+/// whose creation ends the process on Metal. `Err` is the creator's `NSError`, counted: Metal's
+/// refusal, or the translator's of the function's constants.
+fn specialized(sel: &'static str, stage: &rt::FunctionDescriptor) -> Result<(), NsErrorText> {
+    match stage.needs_specialization(&Budget::standard(), &StageEntries::default()) {
+        Ok(false) => Ok(()),
+        Ok(true) => {
+            let why = format!(
+                "function {} declares function constants and was made unspecialized",
+                stage.function.info().name
+            );
+            Err(refused_error_as(sel, RtRefusal::Refused, &why))
+        }
+        Err(error) => Err(rt_refused_error(sel, &rt::Error::Translation(error))),
+    }
+}
+
+/// `v` as rt's word, held at the word's maximum.
+fn word(v: u64) -> u32 {
+    u32::try_from(v).unwrap_or(u32::MAX)
+}
+
+/// The translator's linked functions of `linked`, each as it was made.
+fn linked_functions(linked: &LinkedFunctionsDesc<RtPlatform>) -> LinkedFunctions {
+    fn each(functions: &[RtObj<RtFunction>]) -> Vec<LinkedFunction> {
+        (functions.iter())
+            .map(|function| function.linked().clone())
+            .collect()
+    }
+    let mut out = LinkedFunctions::new();
+    out.functions = each(&linked.functions);
+    out.binary_functions = each(&linked.binary_functions);
+    out.private_functions = each(&linked.private_functions);
+    out.groups = (linked.groups.iter())
+        .map(|(name, functions)| (name.clone(), each(functions)))
+        .collect();
+    out
+}
+
+/// The translator's stage-input descriptor of `input`.
+///
+/// Err: the first value it has no value of, named.
+fn stage_input(input: &StageInputDesc) -> Result<StageInputDescriptor, String> {
+    let mut out = StageInputDescriptor::new();
+    out.index_type = value::<IndexType>("index type", input.index_type)?;
+    out.index_buffer_index = u32::try_from(input.index_buffer_index)
+        .map_err(|_| format!("index buffer index {}", input.index_buffer_index))?;
+    let mut layouts = BTreeMap::new();
+    for l in &input.layouts {
+        let index =
+            u32::try_from(l.buffer_index).map_err(|_| format!("layout {}", l.buffer_index))?;
+        let stride = match l.stride {
+            STRIDE_DYNAMIC => None,
+            stride => Some(u32::try_from(stride).map_err(|_| format!("stride {stride}"))?),
+        };
+        let mut layout = StageInputLayoutDescriptor::new(stride);
+        layout.step_function = value::<StepFunction>("step function", l.step_function)?;
+        layout.step_rate =
+            u32::try_from(l.step_rate).map_err(|_| format!("step rate {}", l.step_rate))?;
+        layouts.insert(index, layout);
+    }
+    out.layouts = layouts;
+    for a in &input.attributes {
+        let index = (u32::try_from(a.attribute_index))
+            .map_err(|_| format!("attribute {}", a.attribute_index))?;
+        let format = value::<AttributeFormat>("attribute format", a.format)?;
+        let offset = u32::try_from(a.offset).map_err(|_| format!("offset {}", a.offset))?;
+        let buffer = (u32::try_from(a.buffer_index))
+            .map_err(|_| format!("attribute buffer {}", a.buffer_index))?;
+        let attribute = StageInputAttributeDescriptor::new(format, offset, buffer);
+        out.attributes.insert(index, attribute);
+    }
+    Ok(out)
+}
+
+/// rt's state of `descriptor`, by the creator `sel`, its samplers' indices taken (the module's
+/// docs). `Err` is the creator's `NSError`, counted under the refusal's kind.
+fn make(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    descriptor: &rt::ComputePipelineDescriptor,
+) -> Result<RtObj<RtComputePipeline>, NsErrorText> {
+    let mut taken = (Vec::new(), Vec::new());
+    let mut exhausted = false;
+    let made = device.rt().new_compute_pipeline_state(descriptor, |samplers| {
+        let indices = (device.numbering()).take(device.sampler_indices(), device.rt(), samplers)?;
+        let Some(indices) = indices else {
+            exhausted = true;
+            return Err(rt::Error::Refused(rt::Refusal::IndicesNotGranted {
+                class: rt::IndexClass::Sampler,
+                index: 0,
+            }));
+        };
+        taken = (samplers.to_vec(), indices.clone());
+        Ok(indices)
+    });
+    let lease = Lease {
+        device: device.clone_ref(),
+        samplers: taken.0,
+        indices: taken.1,
+    };
+    match made {
+        Ok(rt) => Ok(RtObj::new(RtComputePipeline {
+            rt,
+            lease,
+            unique_identifier: NEXT_IDENTIFIER.fetch_add(1, Ordering::Relaxed),
+        })),
+        Err(_) if exhausted => Err(refused_error_as(
+            sel,
+            RtRefusal::Limit,
+            &"live states and sampler states hold every sampler index",
+        )),
+        Err(error) => Err(rt_refused_error(sel, &error)),
+    }
+}
+
+impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
+    /// 0: rt makes no state for indirect command buffers.
+    fn gpu_resource_id(&self) -> u64 {
+        0
+    }
+
+    /// Unbuilt: nil ([`Unbuilt::FunctionTable`]).
+    fn function_handle(
+        &self,
+        function: &RtObj<RtFunction>,
+    ) -> RaiseResult<Option<<RtPlatform as Platform>::FunctionHandle>> {
+        let _ = function;
+        refuse_create(Unbuilt::FunctionTable, "functionHandleWithFunction:");
+        Ok(None)
+    }
+
+    /// Unbuilt: nil ([`Unbuilt::FunctionTable`]).
+    fn new_visible_function_table(
+        &self,
+        function_count: u64,
+    ) -> RaiseResult<Option<<RtPlatform as Platform>::VisibleFunctionTable>> {
+        let _ = function_count;
+        refuse_create(
+            Unbuilt::FunctionTable,
+            "newVisibleFunctionTableWithDescriptor:",
+        );
+        Ok(None)
+    }
+
+    /// Unbuilt: 0 ([`Unbuilt::PipelineQuery`]).
+    fn imageblock_memory_length(&self, imageblock_dimensions: MtlSize) -> RaiseResult<u64> {
+        let _ = imageblock_dimensions;
+        refuse(
+            Unbuilt::PipelineQuery,
+            "imageblockMemoryLengthForDimensions:",
+        );
+        Ok(0)
+    }
+
+    fn max_total_threads_per_threadgroup(&self) -> u64 {
+        u64::from(self.rt.max_total_threads_per_threadgroup())
+    }
+
+    /// 0, as [`gpu_resource_id`](Self::gpu_resource_id).
+    fn resource_index(&self) -> u64 {
+        0
+    }
+
+    /// Unbuilt: 0 ([`Unbuilt::PipelineQuery`]).
+    fn static_threadgroup_memory_length(&self) -> u64 {
+        refuse(Unbuilt::PipelineQuery, "staticThreadgroupMemoryLength");
+        0
+    }
+
+    fn support_indirect_command_buffers(&self) -> bool {
+        false
+    }
+
+    fn thread_execution_width(&self) -> u64 {
+        THREAD_EXECUTION_WIDTH
+    }
+
+    fn unique_identifier(&self) -> u64 {
+        self.unique_identifier
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::platform::device::GpuDevice as _;
+    use crate::core::platform::resource::{FunctionConstant, Library as _};
+    use crate::core::platform::values::{AttributeDesc, BufferLayoutDesc};
+    use crate::core::raise::OnFault;
+
+    /// `numbered_samplers.metal`'s functions, compiled by build.rs.
+    const NUMBERED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/numbered_samplers.metallib"));
+
+    /// `optional_constant.metal`'s kernel, compiled by build.rs.
+    const OPTIONAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/optional_constant.metallib"));
+
+    fn counted(code: &str) -> u64 {
+        (crate::answer::degradation_counts().into_iter())
+            .find(|(c, _)| c == code)
+            .map_or(0, |(_, n)| n)
+    }
+
+    /// Each value of a stage-input descriptor is the translator's, a dynamic stride none; a value
+    /// it has none of is named.
+    #[test]
+    fn stage_input_values_are_the_translator_s() {
+        let input = StageInputDesc {
+            layouts: vec![
+                BufferLayoutDesc {
+                    buffer_index: 1,
+                    stride: 16,
+                    step_function: 5,
+                    step_rate: 1,
+                },
+                BufferLayoutDesc {
+                    buffer_index: 2,
+                    stride: u64::MAX,
+                    step_function: 0,
+                    step_rate: 0,
+                },
+            ],
+            attributes: vec![AttributeDesc {
+                attribute_index: 3,
+                format: 31,
+                offset: 4,
+                buffer_index: 1,
+            }],
+            index_type: 1,
+            index_buffer_index: 7,
+        };
+        let out = stage_input(&input).expect("the translator's values");
+        assert_eq!(
+            (out.index_type, out.index_buffer_index),
+            (IndexType::UInt32, 7)
+        );
+        let one = out.layouts.get(&1).expect("layout 1");
+        assert_eq!(one.stride, Some(16));
+        assert_eq!(one.step_function, StepFunction::ThreadPositionInGridX);
+        let two = out.layouts.get(&2).expect("layout 2");
+        assert_eq!((two.stride, two.step_function), (None, StepFunction::Constant));
+        let attribute = StageInputAttributeDescriptor::new(AttributeFormat::Float4, 4, 1);
+        assert_eq!(out.attributes.get(&3), Some(&attribute));
+
+        let mut bad = input.clone();
+        bad.layouts[0].step_function = 99;
+        assert_eq!(stage_input(&bad).err(), Some("step function 99".to_owned()));
+    }
+
+    /// Libraries of metallibs and the platform's shaders, functions as they were made, and compute
+    /// states of them: samplers equal to a live state's take its index and give it back with the
+    /// last; every refusal is counted.
+    #[test]
+    fn libraries_and_compute_pipelines_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let translation = RtRefusal::Translation.code();
+        let metal = RtRefusal::Refused.code();
+
+        let before = counted(translation);
+        let junk = device.new_library(b"no metallib").expect("never a raise");
+        assert!(junk.is_err());
+        assert_eq!(counted(translation), before + 1);
+
+        let shaders = device.new_shader_library().expect("our shaders").expect("a library");
+        let again = device.new_shader_library().expect("our shaders").expect("a library");
+        assert_eq!(shaders.id(), again.id());
+        assert!(shaders.function_names().iter().any(|n| n == "displayMirrorTile"));
+
+        let library = device.new_library(NUMBERED).expect("never a raise");
+        let library = library.expect("a metallib").expect("a library");
+        let names = library.function_names();
+        for name in ["numbered_read", "numbered_sample", "numbered_write"] {
+            assert!(names.iter().any(|n| n == name), "{names:?}");
+        }
+        assert!(library.new_function(on, "absent").expect("never a raise").is_none());
+        let function = |name: &str| {
+            let made = library.new_function(on, name).expect("never a raise");
+            made.expect("a function of the table")
+        };
+        let state = |f: &RtObj<RtFunction>| {
+            let made = device.new_compute_pipeline_state_for_function(Some(f));
+            made.expect("a compute state").expect("a compute state")
+        };
+
+        let last = rt::IndexClass::Sampler.range().end - 1;
+        let held = device.numbering().held();
+        let sample = function("numbered_sample");
+        let first = state(&sample);
+        let second = state(&sample);
+        assert!(matches!(first.samplers(), [rt::NumberedSampler::Constexpr(_)]));
+        assert_eq!(first.sampler_indices(), [last]);
+        assert_eq!(second.sampler_indices(), [last]);
+        assert_eq!(device.numbering().held(), held + 1);
+        let read = state(&function("numbered_read"));
+        assert_eq!(read.samplers(), [rt::NumberedSampler::Read]);
+        assert_eq!(read.sampler_indices(), [last - 1]);
+        assert_eq!(device.numbering().held(), held + 2);
+
+        assert!(first.max_total_threads_per_threadgroup() > 0);
+        assert_eq!(first.thread_execution_width(), 32);
+        assert_eq!((first.gpu_resource_id(), first.resource_index()), (0, 0));
+        assert!(!first.support_indirect_command_buffers());
+        assert_ne!(first.unique_identifier(), 0);
+        assert_ne!(first.unique_identifier(), second.unique_identifier());
+
+        let tables = counted(Unbuilt::FunctionTable.code());
+        assert!(first.function_handle(&sample).expect("never a raise").is_none());
+        assert!(first.new_visible_function_table(2).expect("never a raise").is_none());
+        assert_eq!(counted(Unbuilt::FunctionTable.code()), tables + 2);
+        let queries = counted(Unbuilt::PipelineQuery.code());
+        assert_eq!(first.static_threadgroup_memory_length(), 0);
+        assert_eq!(counted(Unbuilt::PipelineQuery.code()), queries + 1);
+
+        drop((first, second, read));
+        assert_eq!(device.numbering().held(), held);
+
+        let mut desc = FullComputePipelineDesc::new(&sample);
+        desc.max_total_threads_per_threadgroup = 64;
+        let limited = device.new_compute_pipeline_state_full(&desc);
+        let limited = limited.expect("a compute state").expect("a compute state");
+        assert_eq!(limited.max_total_threads_per_threadgroup(), 64);
+
+        let optional = device.new_library(OPTIONAL).expect("never a raise");
+        let optional = optional.expect("a metallib").expect("a library");
+        let plain = optional.new_function(on, "optional_constant").expect("never a raise");
+        let plain = plain.expect("a function of the table");
+        let before = counted(metal);
+        let refused = device.new_compute_pipeline_state_for_function(Some(&plain));
+        assert!(refused.is_err());
+        assert_eq!(counted(metal), before + 1);
+        let five = FunctionConstant {
+            index: 0,
+            data_type: 29,
+            value: [5; FunctionConstant::MAX_BYTES],
+        };
+        let made = optional.new_function_with_constants(on, "optional_constant", &[five]);
+        let specialized = made.expect("never a raise").expect("a specialized function");
+        assert!(state(&specialized).max_total_threads_per_threadgroup() > 0);
+        let made = optional.new_function_with_options(on, "optional_constant", &[], 0, Some("o"));
+        let named = made.expect("never a raise").expect("a function made by a descriptor");
+        assert_eq!(named.name(), "o");
+        assert!(state(&named).max_total_threads_per_threadgroup() > 0);
+
+        let before = counted(metal);
+        let unknown = FunctionConstant {
+            data_type: 7,
+            ..five
+        };
+        let made = optional.new_function_with_constants(on, "optional_constant", &[unknown]);
+        assert!(made.expect("never a raise").is_none());
+        let made = optional.new_function_with_options(on, "optional_constant", &[], 0x100, None);
+        assert!(made.expect("never a raise").is_none());
+        assert_eq!(counted(metal), before + 2);
+    }
+}

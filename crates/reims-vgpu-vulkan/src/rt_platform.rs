@@ -10,8 +10,9 @@
 //! [`mod@format`]), its command queues ([`queue`]), events, fences and shared events ([`event`]),
 //! the reservation of resource indices, buffers and the textures over them ([`buffer`]), heaps but
 //! sparse ones ([`heap`]), textures made of a descriptor, with their views ([`texture`]),
-//! command buffers ([`command`]) with their blit encoders ([`blit`]), and sampler and
-//! depth-stencil states ([`state`]). Until a piece is built, every
+//! command buffers ([`command`]) with their blit encoders ([`blit`]), sampler and depth-stencil
+//! states ([`state`]), libraries and their functions ([`library`]), and compute pipeline states
+//! ([`pipeline`]). Until a piece is built, every
 //! call that reaches it is refused ([`unbuilt`]). The call answers as Metal's call answers where it
 //! fails: a nil object, an `NSError`, zeros. The refusal is counted under the piece's code,
 //! `rt-unbuilt-<piece>`, in the process's degradation counts, and the first of each kind writes a
@@ -37,6 +38,8 @@ pub mod device;
 pub mod event;
 pub mod format;
 pub mod heap;
+pub mod library;
+pub mod pipeline;
 pub mod queue;
 pub mod state;
 pub mod texture;
@@ -60,6 +63,8 @@ pub use command::RtCommandBuffer;
 pub use descriptor::{PassFields, RateMapFields, TextureFields};
 pub use device::RtDevice;
 pub use heap::RtHeap;
+pub use library::{RtFunction, RtLibrary};
+pub use pipeline::RtComputePipeline;
 pub use queue::RtQueue;
 pub use state::RtSampler;
 pub use texture::RtTexture;
@@ -178,9 +183,9 @@ impl Platform for RtPlatform {
     type SharedEvent = RtObj<metal2vulkan_rt::SharedEvent>;
     type SharedEventListener = RtObj<Listener>;
     type SharedTextureHandle = Unmade<kinds::SharedTextureHandle>;
-    type Library = Unmade<kinds::Library>;
-    type Function = Unmade<kinds::Function>;
-    type ComputePipeline = Unmade<kinds::ComputePipeline>;
+    type Library = RtObj<RtLibrary>;
+    type Function = RtObj<RtFunction>;
+    type ComputePipeline = RtObj<RtComputePipeline>;
     type FunctionHandle = Unmade<kinds::FunctionHandle>;
     type VisibleFunctionTable = Unmade<kinds::VisibleFunctionTable>;
     type DynamicLibrary = Unmade<kinds::DynamicLibrary>;

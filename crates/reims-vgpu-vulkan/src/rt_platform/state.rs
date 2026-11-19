@@ -61,7 +61,7 @@ impl RtSampler {
 }
 
 /// The raw value `raw` as rt's `T`, or the error naming it as `what`.
-fn value<T: TryFrom<u32>>(what: &str, raw: u64) -> Result<T, String> {
+pub(super) fn value<T: TryFrom<u32>>(what: &str, raw: u64) -> Result<T, String> {
     let named = || format!("{what} {raw}");
     let raw = u32::try_from(raw).map_err(|_| named())?;
     T::try_from(raw).map_err(|_| named())

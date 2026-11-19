@@ -18,7 +18,7 @@
 //! **Its registry ID** folds its `deviceUUID` (`super::answers::registry_id`), so it differs from
 //! the Vulkan platform's for the same GPU, which metal2vulkan-runtime gives.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ash::vk;
 use metal2vulkan_rt as rt;
@@ -43,6 +43,8 @@ use crate::gpu::identity;
 use super::answers::{self, Facts};
 use super::buffer::{self, KnownBlocks};
 use super::heap;
+use super::library::{self, RtLibrary};
+use super::pipeline::{self, Numbering};
 use super::queue::RtQueue;
 use super::texture::OwnIndices;
 use super::unbuilt::{
@@ -77,8 +79,13 @@ pub struct RtDevice {
     caps: Arc<DeviceCaps>,
     /// The texture indices its textures the guest does not place take (`super::texture`).
     indices: OwnIndices,
-    /// The sampler indices its sampler states the guest does not place take (`super::state`).
+    /// The sampler indices its sampler states the guest does not place take (`super::state`), and
+    /// its pipeline states' samplers (`super::pipeline`).
     sampler_indices: OwnIndices,
+    /// The sampler indices its pipeline states' samplers hold.
+    numbering: Numbering,
+    /// The platform's shaders as its library, read at the first ask (`super::library`).
+    shaders: OnceLock<RtObj<RtLibrary>>,
     /// The blocks it knows by address, which pinned buffers and heaps inside them are ranges of.
     known: KnownBlocks,
 }
@@ -102,6 +109,11 @@ impl RtDevice {
     /// The sampler indices of the platform's own.
     pub fn sampler_indices(&self) -> &OwnIndices {
         &self.sampler_indices
+    }
+
+    /// The sampler indices its pipeline states' samplers hold.
+    pub fn numbering(&self) -> &Numbering {
+        &self.numbering
     }
 
     /// The blocks it knows by address (`super::buffer`'s docs, "A pinned address"): the graphics
@@ -210,6 +222,8 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         caps,
         indices: OwnIndices::new(rt::IndexClass::Texture),
         sampler_indices: OwnIndices::new(rt::IndexClass::Sampler),
+        numbering: Numbering::default(),
+        shaders: OnceLock::new(),
         known: KnownBlocks::default(),
     }))
 }
@@ -364,13 +378,18 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         Ok(None)
     }
 
+    /// Unbuilt: no encoder ([`Unbuilt::ArgumentLayout`]).
     fn function_argument_layout(
         &self,
         function: &<RtPlatform as Platform>::Function,
         buffer_index: u64,
     ) -> RaiseResult<Option<ArgumentLayout>> {
-        let _ = buffer_index;
-        function.unreachable()
+        let _ = (function, buffer_index);
+        refuse_create(
+            Unbuilt::ArgumentLayout,
+            "newArgumentEncoderWithBufferIndex:",
+        );
+        Ok(None)
     }
 
     /// rt's answer: the device's image's own memory requirements, rounded to its buffer-image
@@ -463,26 +482,20 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
             .unwrap_or(0)
     }
 
-    /// Unbuilt ([`Unbuilt::Pipeline`]): the `NSError`.
+    /// rt's state of the function alone (`super::pipeline`); nil for no function.
     fn new_compute_pipeline_state_for_function(
         &self,
         compute_function: Option<&<RtPlatform as Platform>::Function>,
     ) -> Result<Option<<RtPlatform as Platform>::ComputePipeline>, NsErrorText> {
-        if let Some(function) = compute_function {
-            function.unreachable()
-        }
-        Err(refused_error(
-            Unbuilt::Pipeline,
-            "newComputePipelineStateWithFunction:error:",
-        ))
+        let Some(function) = compute_function else {
+            return Ok(None);
+        };
+        pipeline::of_function(self, function).map(Some)
     }
 
-    /// Unbuilt ([`Unbuilt::Library`]): the `NSError`.
+    /// The platform's shaders, read once (`super::library`).
     fn new_shader_library(&self) -> Result<Option<<RtPlatform as Platform>::Library>, NsErrorText> {
-        Err(refused_error(
-            Unbuilt::Library,
-            "newLibraryWithSource:options:error:",
-        ))
+        library::shader_library(&self.shaders).map(Some)
     }
 
     /// rt's event; nil where rt refuses it.
@@ -502,23 +515,24 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         Ok(Some(RtObj::new(self.rt.new_fence())))
     }
 
-    /// Unbuilt ([`Unbuilt::Library`]): the `NSError`.
+    /// The translator's library of a metallib (`super::library`).
     fn new_library(
         &self,
         data: &[u8],
     ) -> RaiseResult<Result<Option<<RtPlatform as Platform>::Library>, NsErrorText>> {
-        let _ = data;
-        Ok(Err(refused_error(
-            Unbuilt::Library,
-            "newLibraryWithData:error:",
-        )))
+        Ok(library::new_library(data).map(Some))
     }
 
+    /// Unbuilt ([`Unbuilt::DynamicLibrary`]): the `NSError`.
     fn new_dynamic_library(
         &self,
         library: &<RtPlatform as Platform>::Library,
     ) -> RaiseResult<Result<Option<<RtPlatform as Platform>::DynamicLibrary>, NsErrorText>> {
-        library.unreachable()
+        let _ = library;
+        Ok(Err(refused_error(
+            Unbuilt::DynamicLibrary,
+            "newDynamicLibrary:error:",
+        )))
     }
 
     /// Unbuilt: nil ([`Unbuilt::RateMap`]).
@@ -759,16 +773,12 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         ))
     }
 
-    /// Unbuilt ([`Unbuilt::Pipeline`]): the `NSError`.
+    /// rt's state of the whole descriptor (`super::pipeline`).
     fn new_compute_pipeline_state_full(
         &self,
         desc: &FullComputePipelineDesc<'_, RtPlatform>,
     ) -> Result<Option<<RtPlatform as Platform>::ComputePipeline>, NsErrorText> {
-        let _ = desc;
-        Err(refused_error(
-            Unbuilt::Pipeline,
-            "newComputePipelineStateWithDescriptor:options:reflection:error:",
-        ))
+        pipeline::of_descriptor(self, desc).map(Some)
     }
 }
 
