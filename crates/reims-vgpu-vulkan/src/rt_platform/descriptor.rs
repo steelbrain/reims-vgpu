@@ -236,9 +236,8 @@ impl Attachment {
     /// rt's texture, level, slice and actions of it, which `what` names; `Err` names a level or
     /// slice past 32 bits, or an action Metal has none of.
     fn rt(&self, what: &str) -> Result<RtAttachment, String> {
-        let word = |name: &str, raw: u64| {
-            u32::try_from(raw).map_err(|_| format!("{what}'s {name} {raw}"))
-        };
+        let word =
+            |name: &str, raw: u64| u32::try_from(raw).map_err(|_| format!("{what}'s {name} {raw}"));
         let load = match self.load_action {
             0 => rt::LoadAction::DontCare,
             1 => rt::LoadAction::Load,
@@ -308,10 +307,15 @@ impl Default for Pass {
 }
 
 impl PassFields {
+    /// The pass's values, to set or read.
+    fn lock(&self) -> MutexGuard<'_, Pass> {
+        self.0.lock()
+    }
+
     /// rt's descriptor of what is set (the module's docs). `Err` names the first value Metal
     /// takes no pass of: an action Metal has none of, or a level or slice past 32 bits.
     pub fn rt_pass(&self) -> Result<rt::RenderPassDescriptor, String> {
-        let pass = self.0.lock();
+        let pass = self.lock();
         let mut out = rt::RenderPassDescriptor::default();
         let colors = (out.color_attachments.iter_mut())
             .zip(&pass.colors)
@@ -398,7 +402,7 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
         for (_, sel) in unbuilt.into_iter().filter(|&(sent, _)| sent) {
             refuse(Unbuilt::RenderPass, sel);
         }
-        let mut pass = self.0.lock();
+        let mut pass = self.lock();
         if let Some(width) = set.render_target_width {
             pass.render_target_width = width;
         }
@@ -418,7 +422,7 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
             Ok(i) => i,
             Err(raise) => return on.throw(raise),
         };
-        let mut pass = self.0.lock();
+        let mut pass = self.lock();
         let actions = (set.load_action, set.store_action);
         pass.colors[i].set(set.texture, (set.level, set.slice), actions);
         if let Some(c) = set.clear_color {
@@ -428,31 +432,32 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
     }
 
     fn set_depth_attachment(&self, set: &DepthAttachmentSet<'_, RtPlatform>) {
-        let mut pass = self.0.lock();
+        let mut pass = self.lock();
         let actions = (set.load_action, set.store_action);
         pass.depth.set(set.texture, (set.level, set.slice), actions);
         pass.clear_depth = set.clear_depth.unwrap_or(pass.clear_depth);
     }
 
     fn set_stencil_attachment(&self, set: &StencilAttachmentSet<'_, RtPlatform>) {
-        let mut pass = self.0.lock();
+        let mut pass = self.lock();
         let actions = (set.load_action, set.store_action);
-        pass.stencil.set(set.texture, (set.level, set.slice), actions);
+        pass.stencil
+            .set(set.texture, (set.level, set.slice), actions);
         pass.clear_stencil = set.clear_stencil.unwrap_or(pass.clear_stencil);
     }
 
     /// An index past the eight attachments raises, the caller's to catch.
     fn color_attachment_state(&self, index: u64) -> RaiseResult<AttachmentState> {
         let i = color_index(index)?;
-        Ok(self.0.lock().colors[i].state())
+        Ok(self.lock().colors[i].state())
     }
 
     fn depth_attachment_state(&self) -> AttachmentState {
-        self.0.lock().depth.state()
+        self.lock().depth.state()
     }
 
     fn stencil_attachment_state(&self) -> AttachmentState {
-        self.0.lock().stencil.state()
+        self.lock().stencil.state()
     }
 }
 
@@ -622,7 +627,10 @@ mod tests {
         assert_eq!(d.depth_attachment.clear_depth, 0.5);
         let s = &d.stencil_attachment;
         assert_eq!((s.level, s.clear_stencil), (1, 0x1ff));
-        assert_eq!((d.render_target_width, d.render_target_height), (64, u32::MAX));
+        assert_eq!(
+            (d.render_target_width, d.render_target_height),
+            (64, u32::MAX)
+        );
 
         // Metal's refusals, named at the encoder's creation.
         let unknown = ColorAttachmentSet {
@@ -632,7 +640,10 @@ mod tests {
         assert_eq!(pass.set_color_attachment(on, 3, &unknown), Ok(()));
         assert_eq!(pass.color_attachment_state(3), Ok(state(7, 0)));
         let named = pass.rt_pass().err();
-        assert_eq!(named.as_deref(), Some("colour attachment 3's load action 7"));
+        assert_eq!(
+            named.as_deref(),
+            Some("colour attachment 3's load action 7")
+        );
         let known = ColorAttachmentSet {
             load_action: Some(0),
             ..ColorAttachmentSet::default()
@@ -643,7 +654,10 @@ mod tests {
             ..DepthAttachmentSet::default()
         });
         let named = pass.rt_pass().err();
-        assert_eq!(named.as_deref(), Some("the depth attachment's level 4294967296"));
+        assert_eq!(
+            named.as_deref(),
+            Some("the depth attachment's level 4294967296")
+        );
 
         // The ninth colour attachment raises at Metal's subscript, setting nothing.
         let raised = pass.set_color_attachment(on, 8, &red).err();
