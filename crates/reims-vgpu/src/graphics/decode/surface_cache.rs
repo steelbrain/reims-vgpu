@@ -2350,7 +2350,8 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         let ends = match named {
             Named::View(view) if view.length() >= length => {
-                match buffer_over(device, &view, 0, length, 0, None)? {
+                let over = || buffer_over(device, &view, 0, length, 0, None);
+                match super::unkept::Kind::CacheView.making(over)? {
                     Some(pages) => CachePages::View(pages),
                     None => return Ok(Some(false)),
                 }
@@ -5825,8 +5826,10 @@ impl<P: Platform> Caches<P> {
         layout: CacheLayout,
     ) -> RaiseResult<bool> {
         let length = view.length();
-        let pages =
-            || buffer_over(device, view, 0, length, 0, None).map(|b| b.map(CachePages::View));
+        let pages = || {
+            let over = || buffer_over(device, view, 0, length, 0, None);
+            (super::unkept::Kind::CacheView.making(over)).map(|b| b.map(CachePages::View))
+        };
         self.make_with(device, block, length, host_pages, generation, layout, pages)
     }
 

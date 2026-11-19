@@ -13,6 +13,10 @@ impl ApiPlatform for RtPlatform {
     /// (`graphics::decode::surface_shapes`), and every surface is cached.
     const SURFACE_SHAPES: bool = true;
 
+    /// rt places a pinned buffer or heap at its pin only inside a block it knows, and counts
+    /// each other one (`rt-gpu-address-unpinned`), which the decoder counts again by kind.
+    const PINS_IN_BLOCKS: bool = true;
+
     fn process() -> Arc<RtPlatform> {
         crate::singleton::rt_platform()
     }

@@ -563,7 +563,7 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         } = desc;
         self.make(Policy::Caught, "newBufferWithDescriptor:", vec![arg], |w| {
             let backing = contents.map_or(Backing::Fresh, |c| Backing::At(c.ptr()));
-            let b = new_buffer(w, length, opts, backing, pinned_gpu_address)?;
+            let b = new_buffer(w, length, opts, backing, w.kept_pin(pinned_gpu_address))?;
             if let Model::Buffer(m) = &mut b.state().model {
                 m.desc_deallocator = deallocator.map(DescDeallocator);
             }
@@ -590,7 +590,7 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                 Some(w.new_obj::<kind::Heap>(Model::Heap(HeapModel {
                     size,
                     options: opts,
-                    gpu_address: pinned.unwrap_or_else(|| w.alloc_gpu_va(size)),
+                    gpu_address: (w.kept_pin(pinned)).unwrap_or_else(|| w.alloc_gpu_va(size)),
                     mem,
                     common: common(w, None),
                 })))
@@ -623,7 +623,7 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                 Some(w.new_obj::<kind::Heap>(Model::Heap(HeapModel {
                     size,
                     options: opts,
-                    gpu_address: pinned.unwrap_or_else(|| w.alloc_gpu_va(size)),
+                    gpu_address: (w.kept_pin(pinned)).unwrap_or_else(|| w.alloc_gpu_va(size)),
                     mem: None,
                     common: common(w, None),
                 })))

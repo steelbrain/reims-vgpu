@@ -175,6 +175,9 @@ pub(crate) struct Entry<P: Platform> {
     /// The first clock of a view that names it: its make's, or the making message's view's where
     /// that was taken before ([`Context::insert`]'s `seen_from`).
     seen: u64,
+    /// An object counted as made by its kind, live while its entry is ([`super::unkept`]); `None`
+    /// where none is counted. It drops after the object.
+    live: Option<super::unkept::Live>,
 }
 
 impl<P: Platform> Entry<P> {
@@ -196,6 +199,7 @@ impl<P: Platform> Entry<P> {
             escape: None,
             made: 0,
             seen: 0,
+            live: None,
         }
     }
 
@@ -221,6 +225,13 @@ impl<P: Platform> Entry<P> {
     /// The entry, a buffer whose contents are the guest's `bytes` (the field `bytes`).
     pub(crate) fn with_bytes(mut self, bytes: Option<GuestBytes>) -> Self {
         self.bytes = bytes;
+        self
+    }
+
+    /// The entry, of an object counted as made while it lives, where `live` is given (the field
+    /// `live`).
+    pub(crate) fn counted(mut self, live: Option<super::unkept::Live>) -> Self {
+        self.live = live;
         self
     }
 

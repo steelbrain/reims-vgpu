@@ -320,12 +320,15 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) -> RaiseResult<Result<(), DecodeError>> {
         let options = u64::from(m.options);
         let pin = (m.gpu_address != 0).then_some(m.gpu_address);
-        let Some(buffer) =
-            self.buffer_over_block(device, m.region_offset, m.length, options, pin)?
+        let kind = super::unkept::Kind::managed(self.unified());
+        let Some(buffer) = kind.making(|| {
+            self.buffer_over_block(device, m.region_offset, m.length, options, pin)
+        })?
         else {
             return Ok(Err(DecodeError::Refused));
         };
-        self.store_managed_buffer(m.obj_id, buffer, m.region_offset, m.length);
+        let live = self.made_as(kind, pin, buffer.gpu_address());
+        self.store_managed_buffer(m.obj_id, buffer, (m.region_offset, m.length), live);
         Ok(Ok(()))
     }
 
@@ -386,11 +389,14 @@ impl<P: Platform> GraphicsDecoder<P> {
             at,
             length: m.length,
         };
-        let Some(buffer) =
-            self.buffer_over_bytes(device, bytes, m.length, options, pin, None, None)?
+        let kind = super::unkept::Kind::managed(self.unified());
+        let Some(buffer) = kind.making(|| {
+            self.buffer_over_bytes(device, bytes, m.length, options, pin, None, None)
+        })?
         else {
             return Ok(Err(DecodeError::Refused));
         };
+        let live = self.made_as(kind, pin, buffer.gpu_address());
         let copy = ManagedCopy {
             at,
             length: m.length,
@@ -399,7 +405,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             ram,
             gpu_as_of: AtomicU64::new(0),
         };
-        self.store_managed(m.obj_id, buffer, span, copy);
+        self.store_managed(m.obj_id, buffer, span, copy, live);
         Ok(Ok(()))
     }
 
@@ -454,11 +460,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         let cpu = cpu.clone_ref();
         let pin = (m.gpu_address != 0).then_some(m.gpu_address);
-        let Some(buffer) =
-            self.buffer_over_bytes(device, bytes, m.length, options, pin, Some(cpu), zero_from)?
+        let kind = super::unkept::Kind::managed(self.unified());
+        let Some(buffer) = kind.making(|| {
+            self.buffer_over_bytes(device, bytes, m.length, options, pin, Some(cpu), zero_from)
+        })?
         else {
             return Ok(Err(DecodeError::Refused));
         };
+        let live = self.made_as(kind, pin, buffer.gpu_address());
         let copy = ManagedCopy {
             at: bytes.at,
             length: m.length,
@@ -467,7 +476,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             ram: bytes.ram,
             gpu_as_of: AtomicU64::new(0),
         };
-        let mut entry = Entry::of(ObjHandle::Buffer(buffer)).over(span);
+        let mut entry = Entry::of(ObjHandle::Buffer(buffer)).over(span).counted(live);
         entry.managed = Some(copy);
         self.store(m.obj_id, entry);
         Ok(Ok(()))
@@ -514,8 +523,14 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Stores the `Managed` buffer `obj_id`, whose CPU copy is the `length` bytes at `at` in the
-    /// region.
-    fn store_managed_buffer(&self, obj_id: u64, buffer: P::Buffer, at: u64, length: u64) {
+    /// region, counted as made while it lives where `live` is given.
+    fn store_managed_buffer(
+        &self,
+        obj_id: u64,
+        buffer: P::Buffer,
+        (at, length): (u64, u64),
+        live: Option<super::unkept::Live>,
+    ) {
         let copy = ManagedCopy {
             at,
             length,
@@ -524,18 +539,20 @@ impl<P: Platform> GraphicsDecoder<P> {
             ram: None,
             gpu_as_of: AtomicU64::new(0),
         };
-        self.store_managed(obj_id, buffer, (at, length), copy);
+        self.store_managed(obj_id, buffer, (at, length), copy, live);
     }
 
-    /// Stores the `Managed` buffer `obj_id`, lying over the region's `span`, and its CPU copy.
+    /// Stores the `Managed` buffer `obj_id`, lying over the region's `span`, and its CPU copy,
+    /// counted as made while it lives where `live` is given.
     fn store_managed(
         &self,
         obj_id: u64,
         buffer: P::Buffer,
         span: (u64, u64),
         copy: ManagedCopy<P>,
+        live: Option<super::unkept::Live>,
     ) {
-        let mut entry = Entry::of(ObjHandle::Buffer(buffer)).over(Some(span));
+        let mut entry = Entry::of(ObjHandle::Buffer(buffer)).over(Some(span)).counted(live);
         entry.managed = Some(copy);
         self.store(obj_id, entry);
     }
@@ -693,6 +710,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         if self.unified() && in_place_shape(&m) {
             if let Some(texture) = in_place(self)? {
+                self.count_texture_pick(m.gpu_address);
                 let copy = (bytes, None, layout, made_at);
                 return self.store_managed_texture(m.obj_id, texture, span, copy);
             }
@@ -701,6 +719,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let descriptor = self.platform.texture_descriptor(&desc);
         match device.new_texture(OnFault::Return, &descriptor)? {
             Some(texture) => {
+                self.count_texture_pick(m.gpu_address);
                 let copy = (bytes, Some(cpu), layout, made_at);
                 self.store_managed_texture(m.obj_id, texture, span, copy)
             }
@@ -1270,6 +1289,133 @@ mod tests {
             assert!(r.dec.managed_copy(10).is_none() && r.dec.object_count() == 1);
             assert!(!r.dec.span_in_use(at, 0x100));
         }
+    }
+
+    /// On a platform that keeps a pin only inside a block it knows, each buffer and heap a guest's
+    /// create makes is counted by its kind, made and live at once, and each pin the platform
+    /// dropped once under the object's kind, so the kinds' counts sum to the pins dropped; a
+    /// `Managed` buffer is its own kind where the GPU shares the CPU's memory. A texture at the
+    /// guest's pick is counted apart. Where the platform keeps pins anywhere, nothing is counted.
+    #[test]
+    fn each_pin_not_kept_is_counted_under_its_kind() {
+        use super::super::unkept::{KINDS, Kind, TEXTURE_PICKS};
+        use reims_vgpu_graphics::wire::{
+            RGFX_CMD_BUFFER_CREATE, RGFX_CMD_HEAP_CREATE, RgfxBufferCreate, RgfxHeapCreate,
+        };
+        use reims_vgpu_vulkan::answer::{counted_kinds, live_now};
+        let count = |code: &str| {
+            (counted_kinds().into_iter())
+                .find(|&(c, _)| c == code)
+                .map_or(0, |(_, n)| n)
+        };
+        let unpinned = || KINDS.map(|k| count(k.codes().unpinned));
+        let made = || KINDS.map(|k| count(k.codes().made.made));
+        let rise = |after: [u64; 13], before: [u64; 13], kind: Kind| {
+            let at = KINDS.iter().position(|&k| k == kind).unwrap();
+            after[at] - before[at]
+        };
+
+        // Pins dropped where the decoder was not told: nothing counted.
+        let mut r = rig(false);
+        r.p.world().drop_pins(true);
+        let (u, m) = (unpinned(), made());
+        assert_eq!(r.buffer(10, BLOCKS, 0x100, 0), Ok(()));
+        assert_eq!(r.p.world().dropped_pins(), 1);
+        assert_eq!((unpinned(), made()), (u, m));
+
+        let mut r = rig(false);
+        r.dec.set_pins_in_blocks();
+        r.p.world().drop_pins(true);
+        let (u, m, picks) = (unpinned(), made(), count(TEXTURE_PICKS));
+        let buffers = live_now(Kind::Buffer.codes().made);
+        // Over the region: a Shared buffer and a heap; a `Managed` buffer over its block.
+        assert_eq!(r.buffer(10, BLOCKS, 0x100, 0), Ok(()));
+        assert_eq!(r.buffer(11, BLOCKS + 0x1000, 0x100, MANAGED), Ok(()));
+        assert_eq!(
+            r.send(&RgfxHeapOverHostMemory {
+                header: header(RGFX_CMD_HEAP_OVER_HOST_MEMORY),
+                obj_id: 17,
+                gpu_address: 0x4_0000_0000,
+                region_offset: BLOCKS + 0x1_0000,
+                size_bytes: 0x1_0000,
+                options: 0,
+                heap_type: 1,
+            }),
+            Ok(())
+        );
+        // Placed by the device: Shared, Private and unpinned buffers, Shared and Private heaps.
+        let create = |obj_id, gpu_address, options| RgfxBufferCreate {
+            header: header(RGFX_CMD_BUFFER_CREATE),
+            obj_id,
+            gpu_address,
+            length: 0x100,
+            options,
+            reserved_2c: 0,
+        };
+        assert_eq!(r.send(&create(12, 0x2_0000_0000, 0)), Ok(()));
+        assert_eq!(r.send(&create(13, 0x2_0010_0000, 2 << 4)), Ok(()));
+        assert_eq!(r.send(&create(14, 0, 0)), Ok(()));
+        let heap = |obj_id, gpu_address, options| RgfxHeapCreate {
+            header: header(RGFX_CMD_HEAP_CREATE),
+            obj_id,
+            gpu_address,
+            size_bytes: 0x1_0000,
+            options,
+            heap_type: 1,
+        };
+        assert_eq!(r.send(&heap(15, 0x3_0000_0000, 0)), Ok(()));
+        assert_eq!(r.send(&heap(16, 0x3_0010_0000, 2 << 4)), Ok(()));
+        // A `Managed` texture over buffer 10 at the guest's pick.
+        assert_eq!(
+            r.send(&RgfxManagedTextureCreate {
+                header: header(RGFX_CMD_MANAGED_TEXTURE_CREATE),
+                obj_id: 18,
+                gpu_address: 0x5_0000_0000,
+                resource_id: 18,
+                cpu_buffer_obj_id: 10,
+                bytes_per_block: 4,
+                block_width: 1,
+                block_height: 1,
+                flags: RGFX_MANAGED_TEXTURE_LINEAR,
+                desc: rgba(4, 4, 1),
+            }),
+            Ok(())
+        );
+        let (u2, m2) = (unpinned(), made());
+        let unpinned_by = |kind| rise(u2, u, kind);
+        let made_by = |kind| rise(m2, m, kind);
+        assert_eq!(
+            [Kind::Region, Kind::Managed, Kind::Buffer, Kind::Private, Kind::Heap].map(unpinned_by),
+            [2, 1, 1, 2, 1]
+        );
+        assert_eq!(
+            [Kind::Region, Kind::Managed, Kind::Buffer, Kind::Private, Kind::Heap].map(made_by),
+            [2, 1, 2, 2, 1]
+        );
+        let total: u64 = KINDS.iter().map(|&k| unpinned_by(k)).sum();
+        assert_eq!(total, r.p.world().dropped_pins());
+        assert_eq!(total, 7);
+        assert_eq!(count(TEXTURE_PICKS) - picks, 1);
+        // Live while the guest holds them.
+        assert_eq!(live_now(Kind::Buffer.codes().made), buffers + 2);
+        assert_eq!(
+            r.send(&RgfxObjectDestroy {
+                header: header(RGFX_CMD_OBJECT_DESTROY),
+                obj_id: 12,
+            }),
+            Ok(())
+        );
+        assert_eq!(live_now(Kind::Buffer.codes().made), buffers + 1);
+
+        // On a GPU that shares the CPU's memory, a `Managed` buffer is a kind of its own.
+        let mut r = rig(true);
+        r.dec.set_pins_in_blocks();
+        r.p.world().drop_pins(true);
+        let u = unpinned();
+        assert_eq!(r.buffer(10, BLOCKS, 0x100, MANAGED), Ok(()));
+        let u2 = unpinned();
+        assert_eq!(rise(u2, u, Kind::ManagedUnified), 1);
+        assert_eq!(KINDS.iter().map(|&k| rise(u2, u, k)).sum::<u64>(), 1);
     }
 
     /// `BUFFER_MANAGED_AT_OFFSET` on a GPU of its own memory: a no-copy `Managed` buffer at the

@@ -33,7 +33,9 @@
 //! that used it are gone, as Metal runs it once the buffer is freed; one of a buffer never made
 //! never runs, and its captures are kept. Each import is one Vulkan allocation; each is counted
 //! ([`IMPORTS_CODE`]), and the most live at once as that code's highest value
-//! ([`IMPORTS_LIVE_MOST_CODE`]). Option bit 24 (read-only) is taken and answered without, as Metal
+//! ([`IMPORTS_LIVE_MOST_CODE`]); each again, with the most live at once, under the kind of the
+//! make that asked for it on its thread (`crate::answer::making_as`), or [`IMPORTS_UNNAMED`]
+//! where no make named one, so the kinds' counts sum to the total. Option bit 24 (read-only) is taken and answered without, as Metal
 //! does, but the GPU's writes reach the bytes, where Metal drops them: counted
 //! ([`READ_ONLY_CODE`]), the process's first with a line.
 //!
@@ -86,6 +88,13 @@ pub const IMPORTS_CODE: &str = "rt-imports";
 
 /// The code whose count is the most imports of the host's memory live at once.
 pub const IMPORTS_LIVE_MOST_CODE: &str = "rt-imports-live-most";
+
+/// The codes of the imports of the host's memory made where no make named its kind
+/// (`crate::answer::making_as`), counted per import, and the most live at once.
+pub const IMPORTS_UNNAMED: crate::answer::MadeCodes = crate::answer::MadeCodes {
+    made: "rt-imports-unnamed",
+    live_most: "rt-imports-unnamed-live-most",
+};
 
 /// The code of a no-copy buffer or a heap of option bit 24, which is taken and answered without:
 /// the GPU's writes reach a no-copy buffer's bytes, where Metal drops them. Counted per buffer or
@@ -627,7 +636,8 @@ fn range_of(
 }
 
 /// rt's import of the host's pages that hold the `length` bytes at `first`, for `sel` (the module's
-/// docs, "Imports"): the block, and the bytes' offset in it. rt's release of the import runs
+/// docs, "Imports"), counted under the kind of the make running on the thread: the block, and the
+/// bytes' offset in it. rt's release of the import runs
 /// `then`, after the import is freed. `None` where Metal or rt refuses it, counted, `then` dropped
 /// unrun.
 pub(super) fn import_pages(
@@ -645,8 +655,10 @@ pub(super) fn import_pages(
     let (Some(end), Some(at)) = (end, at) else {
         return refused_metal(sel, &format!("{length} bytes at {first:#x}"));
     };
+    let codes = crate::answer::making().unwrap_or(IMPORTS_UNNAMED);
     let release: NoCopyDeallocator = Box::new(move || {
         LIVE_IMPORTS.fetch_sub(1, Ordering::Relaxed);
+        crate::answer::count_gone(codes);
         then();
     });
     // SAFETY: the creators' `HostRange` contracts keep the bytes mapped and readable until their
@@ -660,6 +672,7 @@ pub(super) fn import_pages(
         Ok((block, _)) => {
             imports_rise();
             super::diag::imported(block.id, sel);
+            crate::answer::count_made(codes);
             Some((block, first - start))
         }
         Err(error) => {
@@ -986,6 +999,7 @@ mod tests {
         assert!(!memory.is_null());
         let at = HostPtr::from_ptr(memory.wrapping_add(16));
         let imports = (counted(IMPORTS_CODE), counted(IMPORTS_LIVE_MOST_CODE));
+        let unnamed = counted(IMPORTS_UNNAMED.made);
         let freed = Arc::new(AtomicBool::new(false));
         let done = Arc::clone(&freed);
         let deallocator: NoCopyDeallocator = Box::new(move || done.store(true, Ordering::Release));
@@ -996,18 +1010,27 @@ mod tests {
         assert_eq!((buffer.contents(), buffer.length()), (at, 1000));
         assert_eq!(counted(IMPORTS_CODE), imports.0 + 1);
         assert!(counted(IMPORTS_LIVE_MOST_CODE) >= imports.1.max(1));
+        assert_eq!(counted(IMPORTS_UNNAMED.made), unnamed + 1);
+        assert_eq!(crate::answer::live_now(IMPORTS_UNNAMED), 1);
         assert!(!freed.load(Ordering::Acquire));
         drop(buffer);
         let ran = || freed.load(Ordering::Acquire);
         assert!(waits_for(ran), "the deallocator ran");
+        assert_eq!(crate::answer::live_now(IMPORTS_UNNAMED), 0);
 
         // Through a descriptor, read-only: the deallocator takes the bytes and the length.
         let given = Arc::new(Mutex::new(None));
         let take = Arc::clone(&given);
         let read_only_before = counted(READ_ONLY_CODE);
+        // Made as a kind of make of the test's, which its import counts under.
+        const MADE: crate::answer::MadeCodes = crate::answer::MadeCodes {
+            made: "rt-imports-test",
+            live_most: "rt-imports-test-live-most",
+        };
+        let (imports, unnamed) = (counted(IMPORTS_CODE), counted(IMPORTS_UNNAMED.made));
         // SAFETY: as above.
         let bytes = unsafe { HostRange::new(at, 1000) };
-        let made = device.new_buffer(BufferDesc {
+        let made = crate::answer::making_as(MADE, || device.new_buffer(BufferDesc {
             length: 1000,
             options: vec![OptionSet::ResourceOptions(READ_ONLY)],
             pinned_gpu_address: None,
@@ -1017,11 +1040,14 @@ mod tests {
                 *take.lock() = Some((at.addr(), length));
             })),
             zero_from: None,
-        });
+        }));
         let buffer = made
             .expect("never a raise")
             .expect("a read-only no-copy buffer");
         assert_eq!(buffer.resource_options(), 0x200);
+        assert_eq!(counted(IMPORTS_CODE), imports + 1);
+        assert_eq!(counted(MADE.made), 1);
+        assert_eq!(counted(IMPORTS_UNNAMED.made), unnamed);
         assert_eq!(counted(READ_ONLY_CODE), read_only_before + 1);
         drop(buffer);
         assert!(waits_for(|| given.lock().is_some()));

@@ -109,6 +109,7 @@ use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult};
 use reims_vgpu_vulkan::core::sync::Mutex;
 use reims_vgpu_vulkan::os::{OsVm, PrivateMemory, RegionMemory};
 
+use super::decode::unkept::Kind;
 use super::sink::{Open, end_blit};
 use crate::entry::no_catch;
 use crate::platform::ApiPlatform;
@@ -748,12 +749,14 @@ impl<P: ApiPlatform> Mirror<P> {
             // until the deallocator, which owns them, drops them once the buffer has gone, and
             // past that until the runtime freed the buffer's import.
             let range = unsafe { HostRange::new(HostPtr::from_ptr(base), span) };
-            let mirror = no_catch(self.device.new_buffer_over_host_memory(
-                OnFault::Die,
-                range,
-                0,
-                Some(pages),
-            ))?;
+            let mirror = Kind::Mirror.making(|| {
+                no_catch(self.device.new_buffer_over_host_memory(
+                    OnFault::Die,
+                    range,
+                    0,
+                    Some(pages),
+                ))
+            })?;
             let private = |length| {
                 no_catch(
                     self.device

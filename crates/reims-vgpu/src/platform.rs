@@ -33,6 +33,12 @@ pub trait ApiPlatform: Platform {
     /// and every surface cached. False by default.
     const SURFACE_SHAPES: bool = false;
 
+    /// Whether the platform keeps a pinned buffer's or heap's GPU address only inside a block it
+    /// knows, and places it at an address of its own elsewhere (metal2vulkan-rt's): a graphics
+    /// device on it counts each pin not kept by the kind of object
+    /// (`graphics::decode::unkept`). False by default: the platform keeps every pin.
+    const PINS_IN_BLOCKS: bool = false;
+
     /// The process's platform, made on first use.
     fn process() -> Arc<Self>;
 

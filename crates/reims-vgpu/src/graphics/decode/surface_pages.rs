@@ -328,6 +328,7 @@ use reims_vgpu_vulkan::core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, Deadline, MonoTime};
 use reims_vgpu_vulkan::core::platform::os::vm::{GroupHold, GroupLimits, HostAddr};
+use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, Heap as _};
 use reims_vgpu_vulkan::core::platform::values::{BufferDesc, HeapDesc, OptionSet, PagesPlane};
 use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{RaiseResult, refusals};
@@ -2532,7 +2533,8 @@ fn count_read_only_pages_buffer(length: u64) {
 }
 
 /// A Shared buffer of `options` over the `length` bytes at `offset` in `view`, at GPU address
-/// `pin` where given, which holds the view until the platform frees it.
+/// `pin` where given, which holds the view until the platform frees it. A make of the view's
+/// ([`super::unkept::Kind::PagesView`]) where the caller names no other kind.
 pub(crate) fn buffer_over<P: Platform>(
     device: &P::Device,
     view: &Arc<SurfaceView<P>>,
@@ -2550,14 +2552,16 @@ pub(crate) fn buffer_over<P: Platform>(
     // the buffer; the `length` bytes at `offset` lie in the view.
     let bytes = unsafe { HostRange::new(view.base().wrapping_add(offset), length) };
     let keep = Arc::clone(view);
-    device.new_buffer(BufferDesc {
-        length,
-        options: vec![OptionSet::ResourceOptions(options)],
-        pinned_gpu_address: pin,
-        contents: Some(bytes),
-        no_copy: true,
-        deallocator: Some(Box::new(move |_, _| drop(keep))),
-        zero_from: None,
+    super::unkept::Kind::PagesView.making(|| {
+        device.new_buffer(BufferDesc {
+            length,
+            options: vec![OptionSet::ResourceOptions(options)],
+            pinned_gpu_address: pin,
+            contents: Some(bytes),
+            no_copy: true,
+            deallocator: Some(Box::new(move |_, _| drop(keep))),
+            zero_from: None,
+        })
     })
 }
 
@@ -2746,10 +2750,16 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             .then(|| views.lock().at_view_address(m.block_offset, m.gpu_address))
             .flatten();
         let pin = (m.gpu_address != 0 && at_view != Some(true)).then_some(m.gpu_address);
-        let Some(buffer) = buffer_over(device, &view, m.offset, m.length, m.options.into(), pin)?
-        else {
+        let kind = match at_view {
+            Some(_) => super::unkept::Kind::Import,
+            None => super::unkept::Kind::Pages,
+        };
+        let options = m.options.into();
+        let made = kind.making(|| buffer_over(device, &view, m.offset, m.length, options, pin))?;
+        let Some(buffer) = made else {
             return Ok(Err(super::DecodeError::Refused));
         };
+        let live = self.made_as(kind, pin, buffer.gpu_address());
         if at_view == Some(false) {
             views.lock().keep_at_view_address(m.block_offset, &buffer);
         }
@@ -2781,7 +2791,8 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         let entry = super::tables::Entry::of(super::ObjHandle::Buffer(buffer))
             .over(Some((m.block_offset, m.block_size)))
             .with_bytes(Some(bytes))
-            .escapes(super::escape::Escape::made(over));
+            .escapes(super::escape::Escape::made(over))
+            .counted(live);
         self.store(m.obj_id, entry);
         (self.shared.surface_views.lock()).buffer_made(m.block_offset, m.obj_id);
         if read_only {
@@ -2945,8 +2956,10 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             options: vec![OptionSet::ResourceOptions(m.options.into())],
             pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
         };
-        match device.new_heap_over_host_memory(bytes, &desc)?.heap {
+        let kind = super::unkept::Kind::Pages;
+        match kind.making(|| device.new_heap_over_host_memory(bytes, &desc))?.heap {
             Some(heap) => {
+                let live = self.made_as(kind, desc.pinned_gpu_address, heap.gpu_address());
                 log::trace!(
                     target: "reims_vgpu::graphics::surface_pages",
                     "HEAP_OVER_PAGES of the block at {:#x}: object {:#x}, {:#x} bytes at {:#x}, \
@@ -2962,7 +2975,8 @@ impl<P: Platform> super::GraphicsDecoder<P> {
                     }
                 );
                 let mut entry = super::tables::Entry::of(super::ObjHandle::Heap(heap))
-                    .over(Some((m.block_offset, m.block_size)));
+                    .over(Some((m.block_offset, m.block_size)))
+                    .counted(live);
                 entry.ram = Some((at, length));
                 self.store(m.obj_id, entry);
                 Ok(Ok(()))

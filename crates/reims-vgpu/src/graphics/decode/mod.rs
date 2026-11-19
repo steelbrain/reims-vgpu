@@ -213,6 +213,7 @@ mod surface_order;
 mod surface_pages;
 mod surface_shapes;
 mod tables;
+pub(crate) mod unkept;
 mod video;
 mod view;
 mod waits;
@@ -776,6 +777,10 @@ pub(crate) struct Shared<P: Platform> {
     /// process's own pages is refused ([`GraphicsDecoder::set_max_buffer_length`]); 0 where none
     /// is set.
     max_buffer_length: AtomicU64,
+    /// Whether the platform places a pinned buffer or heap only inside a block it knows, where
+    /// the decoder counts each pin it did not keep by the kind of object ([`unkept`],
+    /// [`GraphicsDecoder::set_pins_in_blocks`]).
+    pins_in_blocks: AtomicBool,
     /// The views of the IOSurfaces whose blocks name their own guest pages ([`surface_pages`]).
     surface_views: Mutex<surface_pages::SurfaceViews<P>>,
     /// Held while a context's lane moves buffers into regroups' views, so that one context's
@@ -1172,6 +1177,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             closed: ClosedContexts::default(),
             unified_memory: AtomicBool::new(false),
             max_buffer_length: AtomicU64::new(0),
+            pins_in_blocks: AtomicBool::new(false),
             surface_views: Mutex::new(surface_pages::SurfaceViews::new(None, None)),
             regroup_moves: Mutex::new(()),
             block_lives: Mutex::new(HashMap::new()),
@@ -1346,6 +1352,34 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// ([`Self::past_max_buffer_length`]); without it no length is refused for that.
     pub(crate) fn set_max_buffer_length(&self, length: u64) {
         (self.shared.max_buffer_length).store(length, Ordering::Release);
+    }
+
+    /// Tells the decoder that its platform places a pinned buffer or heap only inside a block it
+    /// knows (`ApiPlatform::PINS_IN_BLOCKS`): set once, at the device's make. From then each pin
+    /// the platform did not keep is counted by the kind of object, and so is each texture the
+    /// device places at the guest's own pick ([`unkept`]).
+    pub(crate) fn set_pins_in_blocks(&self) {
+        (self.shared.pins_in_blocks).store(true, Ordering::Release);
+    }
+
+    /// Counts an object of `kind` the guest pinned at `pin`, made at `made` ([`unkept::made`]):
+    /// one more made of the kind, and a pin the platform did not keep. Its [`unkept::Live`], which
+    /// its entry holds, where the platform places pins only in its blocks.
+    pub(super) fn made_as(
+        &self,
+        kind: unkept::Kind,
+        pin: Option<u64>,
+        made: u64,
+    ) -> Option<unkept::Live> {
+        let on = (self.shared.pins_in_blocks).load(Ordering::Acquire);
+        unkept::made(on, kind, pin, made)
+    }
+
+    /// Counts a texture the device placed at the guest's pick `gpu_address`
+    /// ([`unkept::count_texture`]).
+    pub(super) fn count_texture_pick(&self, gpu_address: u64) {
+        let on = (self.shared.pins_in_blocks).load(Ordering::Acquire);
+        unkept::count_texture(on, gpu_address);
     }
 
     /// The device's `maxBufferLength` as set ([`Self::set_max_buffer_length`]; for the tests).
@@ -3696,17 +3730,23 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // A device-placed (Private/Shared-on-UMA) buffer. The guest picks
                 // the GPU address and the host pins it; a 0 address lets the host
                 // choose. `options` carries the whole MTLResourceOptions.
+                let pin = (m.gpu_address != 0).then_some(m.gpu_address);
                 let desc = BufferDesc {
                     length: m.length,
                     options: vec![OptionSet::ResourceOptions(m.options.into())],
-                    pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
+                    pinned_gpu_address: pin,
                     contents: None,
                     no_copy: false,
                     deallocator: None,
                     zero_from: None,
                 };
-                match device.new_buffer(desc)? {
-                    Some(buffer) => self.insert(m.obj_id, ObjHandle::Buffer(buffer)),
+                let kind = unkept::Kind::of_buffer(m.options.into());
+                match kind.making(|| device.new_buffer(desc))? {
+                    Some(buffer) => {
+                        let live = self.made_as(kind, pin, buffer.gpu_address());
+                        self.store(m.obj_id, Entry::of(ObjHandle::Buffer(buffer)).counted(live));
+                        Ok(Ok(()))
+                    }
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
@@ -3729,16 +3769,14 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // At the guest's address, which its pointers to the buffer hold, as a
                 // BUFFER_CREATE's is.
                 let pin = (m.gpu_address != 0).then_some(m.gpu_address);
-                let made = self.buffer_over_block(
-                    device,
-                    m.region_offset,
-                    m.length,
-                    m.options.into(),
-                    pin,
-                )?;
+                let made = unkept::Kind::Region.making(|| {
+                    let options = m.options.into();
+                    self.buffer_over_block(device, m.region_offset, m.length, options, pin)
+                })?;
                 let Some(buffer) = made else {
                     return Ok(Err(DecodeError::Refused));
                 };
+                let live = self.made_as(unkept::Kind::Region, pin, buffer.gpu_address());
                 // Its contents are its block's bytes.
                 let bytes = GuestBytes {
                     ram: None,
@@ -3749,7 +3787,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let entry = Entry::of(ObjHandle::Buffer(buffer))
                     .over(Some((m.region_offset, m.length)))
                     .with_bytes(Some(bytes))
-                    .escapes(escape::Escape::made(escape::NoCopy::HostMemory));
+                    .escapes(escape::Escape::made(escape::NoCopy::HostMemory))
+                    .counted(live);
                 self.store(m.obj_id, entry);
                 Ok(Ok(()))
             }
@@ -3779,14 +3818,20 @@ impl<P: Platform> GraphicsDecoder<P> {
                 };
                 // A device-placed heap at a guest-picked GPU address (0 lets the
                 // host choose). Heaps over host memory land with that region's decode.
+                let pin = (m.gpu_address != 0).then_some(m.gpu_address);
                 let desc = HeapDesc {
                     size: m.size_bytes,
                     heap_type: host_heap_type(m.heap_type),
                     options: vec![OptionSet::ResourceOptions(m.options.into())],
-                    pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
+                    pinned_gpu_address: pin,
                 };
-                match device.new_heap(&desc)?.heap {
-                    Some(heap) => self.insert(m.obj_id, ObjHandle::Heap(heap)),
+                let kind = unkept::Kind::of_heap(m.options.into());
+                match kind.making(|| device.new_heap(&desc))?.heap {
+                    Some(heap) => {
+                        let live = self.made_as(kind, pin, heap.gpu_address());
+                        self.store(m.obj_id, Entry::of(ObjHandle::Heap(heap)).counted(live));
+                        Ok(Ok(()))
+                    }
                     None => {
                         heap_refused(
                             m.obj_id,
@@ -3824,18 +3869,25 @@ impl<P: Platform> GraphicsDecoder<P> {
                         length,
                     )
                 };
+                let pin = (m.gpu_address != 0).then_some(m.gpu_address);
                 let desc = HeapDesc {
                     size: m.size_bytes,
                     heap_type: host_heap_type(m.heap_type),
                     options: vec![OptionSet::ResourceOptions(m.options.into())],
-                    pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
+                    pinned_gpu_address: pin,
                 };
-                match device.new_heap_over_host_memory(bytes, &desc)?.heap {
-                    Some(heap) => self.insert_over(
-                        m.obj_id,
-                        ObjHandle::Heap(heap),
-                        Some((m.region_offset, length)),
-                    ),
+                let made = unkept::Kind::Region.making(|| {
+                    device.new_heap_over_host_memory(bytes, &desc)
+                })?;
+                match made.heap {
+                    Some(heap) => {
+                        let live = self.made_as(unkept::Kind::Region, pin, heap.gpu_address());
+                        let entry = Entry::of(ObjHandle::Heap(heap))
+                            .over(Some((m.region_offset, length)))
+                            .counted(live);
+                        self.store(m.obj_id, entry);
+                        Ok(Ok(()))
+                    }
                     None => {
                         heap_refused(
                             m.obj_id,
@@ -3882,9 +3934,15 @@ impl<P: Platform> GraphicsDecoder<P> {
                     // SAFETY: the bytes lie in one block the context holds (checked under the
                     // pool's lock), whose piece stays mapped while the decoder holds the ledger.
                     let bytes = unsafe { HostRange::new(at, length) };
-                    let heap = device.new_heap_over_host_memory(bytes, &desc)?.heap;
-                    Ok(heap.map(|heap| {
-                        let mut entry = Entry::of(ObjHandle::Heap(heap)).over(Some((span, length)));
+                    let made = unkept::Kind::Pool.making(|| {
+                        device.new_heap_over_host_memory(bytes, &desc)
+                    })?;
+                    Ok(made.heap.map(|heap| {
+                        let pin = desc.pinned_gpu_address;
+                        let live = self.made_as(unkept::Kind::Pool, pin, heap.gpu_address());
+                        let mut entry = Entry::of(ObjHandle::Heap(heap))
+                            .over(Some((span, length)))
+                            .counted(live);
                         entry.ram = Some((at, length));
                         self.store(m.obj_id, entry);
                     }))
@@ -3937,8 +3995,13 @@ impl<P: Platform> GraphicsDecoder<P> {
                     }
                     made
                 } else {
-                    // Device-placed at the guest-picked GPU address.
-                    device.new_texture(OnFault::Return, &descriptor)?
+                    // Device-placed at the guest-picked GPU address, which the platform takes
+                    // no pin of: the guest answers it.
+                    let made = device.new_texture(OnFault::Return, &descriptor)?;
+                    if made.is_some() {
+                        self.count_texture_pick(m.gpu_address);
+                    }
+                    made
                 };
                 match made {
                     Some(texture) => self.insert_over(m.obj_id, ObjHandle::Texture(texture), span),

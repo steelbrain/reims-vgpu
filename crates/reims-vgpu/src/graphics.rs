@@ -771,6 +771,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let own_memory = gpu_device.own_memory_budget();
             let deferred_budget = deferred_budget(offerable, own_memory);
             decoder.set_deferred_budget(deferred_budget);
+            // A platform that keeps pins only in its known blocks has the decoder count the
+            // others by kind (`decode::unkept`).
+            if P::PINS_IN_BLOCKS {
+                decoder.set_pins_in_blocks();
+            }
             // A GPU that shares the CPU's memory holds every device cache in the host's RAM
             // beside the guest's pages: they all fit one budget together, past which a surface
             // lies in place, so the copies stay bounded on a small host.

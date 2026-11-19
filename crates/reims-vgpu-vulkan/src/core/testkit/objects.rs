@@ -906,6 +906,10 @@ pub struct World {
     ///
     /// [`GpuDevice::fresh_surface_never_in_place`]: crate::core::platform::device::GpuDevice::fresh_surface_never_in_place
     fresh_never_in_place: Mutex<(Option<String>, Vec<FreshAsked>)>,
+    /// Whether the devices keep no pin of a buffer or heap they make ([`World::drop_pins`]).
+    pins_drop: AtomicBool,
+    /// How many pins the devices dropped ([`World::dropped_pins`]).
+    pins_dropped: AtomicU64,
 }
 
 /// A surface's pages as host addresses, as runs, in its order.
@@ -956,7 +960,32 @@ impl World {
             surface_pages: Mutex::new((PagesInPlace::Yes, Vec::new())),
             never_in_place: Mutex::new((None, Vec::new())),
             fresh_never_in_place: Mutex::new((None, Vec::new())),
+            pins_drop: AtomicBool::new(false),
+            pins_dropped: AtomicU64::new(0),
         })
+    }
+
+    /// Has the devices keep no pin of a buffer or heap they make from now on, where `on`: each
+    /// such object lies at an address of the fake's own, and each pin dropped is counted
+    /// ([`World::dropped_pins`]), as a platform that keeps a pin only inside a block it knows
+    /// places one outside them. Every pin kept at first.
+    pub fn drop_pins(&self, on: bool) {
+        self.pins_drop.store(on, Ordering::SeqCst);
+    }
+
+    /// The pin a device keeps of `pin` for a buffer or heap it makes ([`World::drop_pins`]):
+    /// `pin`, or none, counted, while pins are dropped.
+    pub fn kept_pin(&self, pin: Option<u64>) -> Option<u64> {
+        if pin.is_some() && self.pins_drop.load(Ordering::SeqCst) {
+            self.pins_dropped.fetch_add(1, Ordering::SeqCst);
+            return None;
+        }
+        pin
+    }
+
+    /// How many pins the devices dropped ([`World::drop_pins`]).
+    pub fn dropped_pins(&self) -> u64 {
+        self.pins_dropped.load(Ordering::SeqCst)
     }
 
     /// Has the devices answer `answer` to [`GpuDevice::surface_pages_in_place`] from now on;

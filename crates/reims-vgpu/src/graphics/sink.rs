@@ -153,6 +153,7 @@ use reims_vgpu_vulkan::core::platform::types::MtlViewport;
 
 use self::cursor::CursorPass;
 use super::color::DisplayColor;
+use super::decode::unkept::Kind;
 use super::mirror::{Completion, Mirror, Synced};
 use super::{DisplayHold, Drawable, DrawnPresents, Presented, Shown};
 use crate::entry::no_catch;
@@ -769,12 +770,14 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                 length,
             )
         };
-        let buffer = no_catch(self.device.new_buffer_over_host_memory(
-            OnFault::Die,
-            bytes,
-            0,
-            Some(Box::new(move || drop(keep))),
-        ));
+        let buffer = Kind::Scanout.making(|| {
+            no_catch(self.device.new_buffer_over_host_memory(
+                OnFault::Die,
+                bytes,
+                0,
+                Some(Box::new(move || drop(keep))),
+            ))
+        });
         if buffer.is_none() {
             log::warn!(
                 target: "reims_vgpu::graphics",
@@ -1095,12 +1098,14 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             // lives (`mirror`), a whole number of pages from a page, and the deallocator holds
             // that buffer until the platform runs it, once the import has gone.
             let bytes = unsafe { HostRange::new(base, length) };
-            let buffer = no_catch(self.device.new_buffer_over_host_memory(
-                OnFault::Die,
-                bytes,
-                0,
-                Some(Box::new(move || drop(keep))),
-            ))?;
+            let buffer = Kind::Mirror.making(|| {
+                no_catch(self.device.new_buffer_over_host_memory(
+                    OnFault::Die,
+                    bytes,
+                    0,
+                    Some(Box::new(move || drop(keep))),
+                ))
+            })?;
             *import = Some(ForeignImport {
                 base: base.addr(),
                 length,

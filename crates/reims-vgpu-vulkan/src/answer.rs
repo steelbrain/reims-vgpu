@@ -2710,7 +2710,11 @@ pub fn out_of_host_memory_count() -> u64 {
 /// `-residency-set`), one over a copy of its pages counted too (`buffer-escaped-read-only-pages`),
 /// with each command buffer begun of a process that holds such a copy (`escaped-copy-commits`);
 /// and this platform's command predication's, a command buffer a loop ran past its copies in
-/// (`predication-loop-overrun`, [`crate::gpu::predication::OVERRUN_CODE`]).
+/// (`predication-loop-overrun`, [`crate::gpu::predication::OVERRUN_CODE`]); and the objects made,
+/// live at once and imported by the kind of make ([`MadeCodes`], [`count_made`]), and, on a
+/// platform that keeps a pin only in its known blocks, the pins not kept by the kind of object
+/// (`rt-gpu-address-unpinned-<kind>`) and the textures placed at the guest's own pick
+/// (`rt-texture-address-guest-pick`).
 static COUNTED: crate::core::sync::Mutex<Vec<(&'static str, u64)>> =
     crate::core::sync::Mutex::new(Vec::new());
 
@@ -2732,6 +2736,88 @@ pub fn count_kind_by(code: &'static str, n: u64) {
         Some((_, k)) => *k = k.saturating_add(n),
         None => counted.push((code, n)),
     }
+}
+
+/// The codes of a kind of thing made, counted by [`count_made`]: how many were made, and the most
+/// live at once, which [`count_gone`] lowers the live count of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MadeCodes {
+    /// The code counted once per thing made.
+    pub made: &'static str,
+    /// The code whose count is the most of them live at once.
+    pub live_most: &'static str,
+}
+
+/// How many of each kind of thing ([`MadeCodes`]) are live, and the most at once, by its `made`
+/// code.
+static LIVE: crate::core::sync::Mutex<Vec<(&'static str, u64, u64)>> =
+    crate::core::sync::Mutex::new(Vec::new());
+
+/// Counts one more made of the kind of `codes` (its `made` code), and one more live, a new most
+/// counted as its `live_most` code's rise to it ([`count_kind_by`]), so the counts line carries
+/// the most at once; [`count_gone`] counts it gone.
+pub fn count_made(codes: MadeCodes) {
+    count_kind(codes.made);
+    let rise = {
+        let mut live = LIVE.lock();
+        let at = match live.iter().position(|&(code, _, _)| code == codes.made) {
+            Some(at) => at,
+            None => {
+                live.push((codes.made, 0, 0));
+                live.len() - 1
+            }
+        };
+        let (_, now, most) = &mut live[at];
+        *now += 1;
+        let rise = now.saturating_sub(*most);
+        *most = (*most).max(*now);
+        rise
+    };
+    count_kind_by(codes.live_most, rise);
+}
+
+/// Counts one made of the kind of `codes` ([`count_made`]) gone: one fewer live.
+pub fn count_gone(codes: MadeCodes) {
+    let mut live = LIVE.lock();
+    if let Some((_, now, _)) = live.iter_mut().find(|(code, _, _)| *code == codes.made) {
+        *now = now.saturating_sub(1);
+    }
+}
+
+/// How many of the kind of `codes` are live now ([`count_made`], [`count_gone`]).
+pub fn live_now(codes: MadeCodes) -> u64 {
+    let live = LIVE.lock();
+    (live.iter()).find(|(code, _, _)| *code == codes.made).map_or(0, |&(_, now, _)| now)
+}
+
+thread_local! {
+    /// The kind of the make running on the thread ([`making_as`]).
+    static MAKING: Cell<Option<MadeCodes>> = const { Cell::new(None) };
+}
+
+/// Runs `make` as a make of the kind of `codes` on this thread: what the platform imports of the
+/// host's memory for it there is counted under those codes ([`making`]), so the counts say which
+/// of the caller's makes imported memory. Where a make of another kind runs already on the thread,
+/// that one names it: the outermost caller knows best what it makes.
+pub fn making_as<T>(codes: MadeCodes, make: impl FnOnce() -> T) -> T {
+    /// Puts back the kind that ran before, however `make` returns.
+    struct Restore(Option<MadeCodes>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MAKING.with(|m| m.set(self.0));
+        }
+    }
+    let was = MAKING.with(Cell::get);
+    let _restore = Restore(was);
+    if was.is_none() {
+        MAKING.with(|m| m.set(Some(codes)));
+    }
+    make()
+}
+
+/// The kind of the make running on this thread ([`making_as`]), where one runs.
+pub fn making() -> Option<MadeCodes> {
+    MAKING.with(Cell::get)
 }
 
 /// The kinds counted by code ([`count_kind`], [`count_kind_by`]), each with how many times, in
@@ -4087,5 +4173,37 @@ mod tests {
         let t = error_text(&Error::DeviceLost);
         assert_eq!(t.description, "the Vulkan device was lost");
         assert_eq!(t.to_string(), t.description);
+    }
+
+    /// A make's kind names what the platform makes for it on its thread, the outermost where two
+    /// nest, and none outside one; each kind's things made are counted, and the most live at once.
+    #[test]
+    fn a_make_s_kind_counts_what_it_makes_and_the_most_live() {
+        const OUTER: MadeCodes = MadeCodes {
+            made: "test-made-outer",
+            live_most: "test-made-outer-live-most",
+        };
+        const INNER: MadeCodes = MadeCodes {
+            made: "test-made-inner",
+            live_most: "test-made-inner-live-most",
+        };
+        assert_eq!(making(), None);
+        let seen = making_as(OUTER, || (making(), making_as(INNER, making)));
+        assert_eq!(seen, (Some(OUTER), Some(OUTER)));
+        assert_eq!(making_as(INNER, making), Some(INNER));
+        assert_eq!(making(), None);
+        let counted = |code: &str| {
+            (counted_kinds().into_iter())
+                .find(|&(c, _)| c == code)
+                .map_or(0, |(_, n)| n)
+        };
+        count_made(INNER);
+        count_made(INNER);
+        count_gone(INNER);
+        count_made(INNER);
+        assert_eq!(counted(INNER.made), 3);
+        assert_eq!(counted(INNER.live_most), 2);
+        assert_eq!(live_now(INNER), 2);
+        assert_eq!(counted(OUTER.made), 0);
     }
 }
