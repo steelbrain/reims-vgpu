@@ -1645,6 +1645,22 @@
 // it; the x86-64 and arm64e kexts take it.
 #define RGFX_FEATURE_PRIVATE_BLOCKS 1152921504606846976
 
+// `FEATURES_HI` bit 29, feature bit 61, `IMPORT_ADDRESSES`: the host gives each pages block of a
+// process's own memory ([`RGFX_SURFACE_PAGES_PRIVATE`]) its GPU address. Where the guest took it
+// beside [`RGFX_FEATURE_PAGES_BUFFERS`], such a block's `SURFACE_PAGES` is answered
+// [`RgfxPagesAnswer`], which carries the GPU address of the block's view's first byte, and the
+// guest places the `BUFFER_OVER_PAGES` buffers it makes over the block at that address plus
+// their offsets in the view, rather than at addresses it picks in its context's range
+// ([`RGFX_CONTEXT_VA_BASE`]); buffers over the same bytes, which share a block, share their
+// address. On metal2vulkan-rt's device the address is the Vulkan device address of the import of
+// the block's pages; on the Vulkan platform before it, an address the host picks in
+// `[2^43, 2^44)`, holding Metal's span of the view's length, where the platform pins the first
+// buffer made over the block, which then reaches the block's pages for the buffers made over the
+// same bytes after it until the block's release. A block of pages its process maps read-only
+// ([`RGFX_SURFACE_PAGES_READ_ONLY`]) is given none there: its buffers lie over copies of the
+// pages. Every host offers it; the x86-64 and arm64e kexts take it.
+#define RGFX_FEATURE_IMPORT_ADDRESSES 2305843009213693952
+
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 #define RGFX_REG_STATUS 16
@@ -2504,6 +2520,13 @@
 // host maps the pages, and answers [`RGFX_STATUS_OK`], the block in place as any, or
 // [`RGFX_STATUS_CACHE`], with no view kept for the block, where its textures over the pages
 // would not lie in place: the kext then posts the block's `SURFACE_PAGES` again, cached.
+//
+// Where the guest took [`RGFX_FEATURE_IMPORT_ADDRESSES`], a pages block's `SURFACE_PAGES`
+// ([`RGFX_SURFACE_PAGES_PRIVATE`]) is answered [`RgfxPagesAnswer`], an [`RGFX_EVT_COMPLETE`] of 32
+// bytes, whose `gpu_address` is the GPU address of the first byte of the block's view where the
+// status is [`RGFX_STATUS_OK`], and 0 otherwise or where the host has no address for it; the
+// address holds until the block's `BLOCK_RELEASE` is carried out, or its context's
+// `CONTEXT_CLOSE`. A reader of the 24 bytes of an [`RgfxComplete`] reads the answer as before.
 #define RGFX_CMD_SURFACE_PAGES 758
 
 // `SURFACE_DOWNLOAD` ([`RgfxSurfaceDownload`]), on ring 0 from the accelerator kext, where the
@@ -4078,7 +4101,9 @@ typedef struct {
   uint64_t block_offset;
   // The pages block's size in bytes.
   uint64_t block_size;
-  // Where the buffer starts in the block's view, in bytes.
+  // Where the buffer starts in the block's view, in bytes. Where the guest took
+  // [`RGFX_FEATURE_IMPORT_ADDRESSES`] and the block's `SURFACE_PAGES` answered a GPU address
+  // ([`RgfxPagesAnswer`]), `gpu_address` is that address plus this.
   uint64_t offset;
   // The buffer's length in bytes.
   uint64_t length;
@@ -6937,6 +6962,21 @@ typedef struct {
   // The run's bytes.
   uint64_t length;
 } RgfxPageRun;
+
+// A pages block's `SURFACE_PAGES` answer where the guest took
+// [`RGFX_FEATURE_IMPORT_ADDRESSES`]: an [`RgfxComplete`] and the GPU address of the block's
+// view's first byte.
+typedef struct {
+  // [`RGFX_EVT_COMPLETE`], with the `SURFACE_PAGES`' `seqno`.
+  RgfxMsgHeader header;
+  // An `RGFX_STATUS_*`, as an [`RgfxComplete`]'s.
+  uint32_t status;
+  // Zero.
+  uint32_t reserved_14;
+  // The GPU address of the first byte of the block's view, never 0 where given; 0 unless
+  // the status is [`RGFX_STATUS_OK`], or where the host gives the block none.
+  uint64_t gpu_address;
+} RgfxPagesAnswer;
 
 // `PIPELINE_ANSWERS`: the kept answers the kext asks for, from the `first`th, at most `most`
 // ([`RGFX_CMD_PIPELINE_ANSWERS`]).

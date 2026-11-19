@@ -165,7 +165,17 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
                     shared.surface_pages(&pages, flags, layout, seqno, epoch)
                 }
             };
-            status.map(|status| complete(seqno, status))
+            // A pages block's answer carries its address where the guest took them, a refusal's
+            // too, so every answer to such a block reads alike.
+            let pages = flags & RGFX_SURFACE_PAGES_PRIVATE != 0
+                && shared.driver_took(RGFX_FEATURE_IMPORT_ADDRESSES);
+            status.map(|status| {
+                if pages {
+                    pages_answer(seqno, status, 0)
+                } else {
+                    complete(seqno, status)
+                }
+            })
         }
         RGFX_CMD_VT_MESSAGE => {
             // A guest that took no VT_MESSAGES sends none; one it sends anyway is answered as
@@ -327,6 +337,26 @@ pub(crate) fn private_block(seqno: u64, status: u32, gpu_address: u64, length: u
         reserved_14: 0,
         gpu_address,
         length,
+    })
+}
+
+/// A pages block's `SURFACE_PAGES` answer for command `seqno` where the guest took
+/// `IMPORT_ADDRESSES`: a `COMPLETE` of 32 bytes, with `gpu_address` where `status` is
+/// [`RGFX_STATUS_OK`] (0 otherwise).
+pub(crate) fn pages_answer(seqno: u64, status: u32, gpu_address: u64) -> Vec<u8> {
+    sized(&RgfxPagesAnswer {
+        header: RgfxMsgHeader {
+            r#type: RGFX_EVT_COMPLETE,
+            size: 0,
+            seqno,
+        },
+        status,
+        reserved_14: 0,
+        gpu_address: if status == RGFX_STATUS_OK {
+            gpu_address
+        } else {
+            0
+        },
     })
 }
 

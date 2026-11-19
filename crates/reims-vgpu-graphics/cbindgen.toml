@@ -280,6 +280,7 @@ include = [
     "RgfxOpVideoPass",
     "RgfxOpWaitForFence",
     "RgfxPageRun",
+    "RgfxPagesAnswer",
     "RgfxPipelineAnswersQuery",
     "RgfxPipelineLibrary",
     "RgfxPipelineReflection",

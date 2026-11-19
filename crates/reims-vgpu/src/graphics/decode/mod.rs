@@ -1506,6 +1506,13 @@ impl<P: Platform> GraphicsDecoder<P> {
         );
     }
 
+    /// The GPU address of the view of the pages block at `block`, for its `SURFACE_PAGES`
+    /// answer where the guest took `IMPORT_ADDRESSES` ([`surface_pages::SurfaceViews::pages_address`]); 0 where
+    /// it has none.
+    pub(crate) fn pages_address(&self, block: u64) -> u64 {
+        self.shared.surface_views.lock().pages_address(block)
+    }
+
     /// Carries out the `SURFACE_PAGES` `settle` began: the view of `runs` for the block `pages`
     /// names, which its `BUFFER_OVER_SURFACE_PAGES` buffers lie over, with a buffer over it on
     /// `device` that holds its import: [`RGFX_STATUS_OK`], else [`RGFX_STATUS_REFUSED`] with

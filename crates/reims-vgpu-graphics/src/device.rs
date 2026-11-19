@@ -396,7 +396,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_POOL
     | RGFX_FEATURE_SURFACE_REFILL
     | RGFX_FEATURE_POOL_ADDRESSES
-    | RGFX_FEATURE_PRIVATE_BLOCKS;
+    | RGFX_FEATURE_PRIVATE_BLOCKS
+    | RGFX_FEATURE_IMPORT_ADDRESSES;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -1907,7 +1908,9 @@ impl Device {
 /// they wait for have finished ([`Host::context_closed`], [`Host::block_released`]), a
 /// `SURFACE_PAGES` once its view is made ([`Host::surface_pages`]). It holds a
 /// weak reference to the device; an answer after the device has ended, or for a command taken
-/// before a reset, is dropped, and so is one never given.
+/// before a reset, is dropped, and so is one never given. A pages block's `SURFACE_PAGES`
+/// ([`RGFX_SURFACE_PAGES_PRIVATE`]), where the guest took [`RGFX_FEATURE_IMPORT_ADDRESSES`], is
+/// answered with the block's GPU address ([`Self::wants_address`], [`Self::answer_at`]).
 pub struct CompleteAnswer {
     /// The device's shared state, weakly.
     shared: Weak<Shared>,
@@ -1915,6 +1918,9 @@ pub struct CompleteAnswer {
     seqno: u64,
     /// The reset count the command was taken at.
     epoch: u64,
+    /// A pages block's `SURFACE_PAGES` of a guest that took `IMPORT_ADDRESSES`: answered as an
+    /// [`RgfxPagesAnswer`].
+    pages: bool,
 }
 
 /// A `PRESENT_SURFACE`'s answer.
@@ -2072,8 +2078,27 @@ impl CompleteAnswer {
     /// the control thread, which posts the answers in their order before its own posts, waiting
     /// for room, and every post onto the ring that waits goes behind them.
     pub fn answer(self, status: u32) {
+        self.answer_at(status, 0);
+    }
+
+    /// Whether the answer carries a GPU address: a pages block's `SURFACE_PAGES` of a guest that
+    /// took [`RGFX_FEATURE_IMPORT_ADDRESSES`].
+    pub fn wants_address(&self) -> bool {
+        self.pages
+    }
+
+    /// Posts the answer as [`Self::answer`] does, with `gpu_address`, the GPU address of the
+    /// first byte of the block's view, where it [wants one](Self::wants_address) and `status`
+    /// is [`RGFX_STATUS_OK`] (an [`RgfxPagesAnswer`], whose address is 0 otherwise, or where
+    /// `gpu_address` is 0: the block has none); else the `COMPLETE` alone.
+    pub fn answer_at(self, status: u32, gpu_address: u64) {
         if let Some(shared) = self.shared.upgrade() {
-            shared.post_unwaiting(&crate::control::complete(self.seqno, status), self.epoch);
+            let message = if self.pages {
+                crate::control::pages_answer(self.seqno, status, gpu_address)
+            } else {
+                crate::control::complete(self.seqno, status)
+            };
+            shared.post_unwaiting(&message, self.epoch);
         }
     }
 }
@@ -3332,7 +3357,9 @@ impl Shared {
             );
             return Some(RGFX_STATUS_INVALID_ARGUMENT);
         };
-        let answer = self.complete_answer(seqno, epoch);
+        let mut answer = self.complete_answer(seqno, epoch);
+        answer.pages = flags & RGFX_SURFACE_PAGES_PRIVATE != 0
+            && self.driver_took(RGFX_FEATURE_IMPORT_ADDRESSES);
         (self.host).surface_pages(pages, runs, flags, layout, answer);
         None
     }
@@ -3976,6 +4003,7 @@ impl Shared {
             shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
             seqno,
             epoch,
+            pages: false,
         }
     }
 

@@ -3222,6 +3222,128 @@ fn surface_pages_hand_the_host_their_runs() {
     assert_eq!((seen[5].0.block_offset, seen[5].1.len()), (BLOCK, 0));
 }
 
+/// Where the driver took `IMPORT_ADDRESSES`, a pages block's `SURFACE_PAGES` hands the host an
+/// answer that wants an address, and is answered as an `RgfxPagesAnswer` of 32 bytes: the host's
+/// address where it answers OK, 0 where it refuses, and 0 where the device refuses the message
+/// itself (runs past the block); any other block's is answered a `COMPLETE` of 24 bytes. Where
+/// the driver did not take it, a pages block's is answered a `COMPLETE` of 24 bytes too, and its
+/// answer wants no address.
+#[test]
+fn a_pages_block_s_answer_carries_its_address_where_the_driver_took_import_addresses() {
+    const AT: u64 = 1 << 43;
+    #[derive(Clone, Default)]
+    struct Pages(Arc<Mutex<Vec<bool>>>);
+    impl Host for Pages {
+        fn raise_interrupt(&self, _vector: u32) {}
+        fn features(&self) -> u64 {
+            u64::from(RGFX_FEATURE_SURFACE_PAGES) | RGFX_FEATURE_IMPORT_ADDRESSES
+        }
+        fn surface_pages(
+            &self,
+            pages: &RgfxSurfacePages,
+            _runs: Vec<RgfxPageRun>,
+            _flags: u32,
+            _layout: Option<RgfxSurfacePagesLayout>,
+            answer: CompleteAnswer,
+        ) {
+            self.0.lock().push(answer.wants_address());
+            // A context of 9 is refused, with an address the answer drops.
+            let status = if pages.context == 9 {
+                RGFX_STATUS_REFUSED
+            } else {
+                RGFX_STATUS_OK
+            };
+            answer.answer_at(status, AT);
+        }
+    }
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4000;
+    let runs = [RgfxPageRun {
+        address: 0x9000,
+        length: 0x1000,
+    }];
+    let message = |context: u32, runs_offset: u64, flags: Option<u32>| {
+        let mut bytes = RgfxSurfacePages {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SURFACE_PAGES,
+                ..Default::default()
+            },
+            context,
+            run_count: 1,
+            block_offset: BLOCK,
+            block_size: 0x2000,
+            runs_offset,
+            length: 0x1000,
+        }
+        .as_bytes()
+        .to_vec();
+        if let Some(flags) = flags {
+            bytes.extend_from_slice(
+                RgfxSurfacePagesCache {
+                    flags,
+                    reserved_04: 0,
+                }
+                .as_bytes(),
+            );
+        }
+        bytes
+    };
+    let answer = |rig: &mut Rig| {
+        let bytes = rig.event().expect("an answer");
+        let header = RgfxMsgHeader::read_from_prefix(&bytes).unwrap().0;
+        assert_eq!(header.r#type, RGFX_EVT_COMPLETE);
+        match header.size {
+            24 => {
+                let c = RgfxComplete::read_from_bytes(&bytes).unwrap();
+                (c.header.seqno, c.status, None)
+            }
+            32 => {
+                let a = RgfxPagesAnswer::read_from_bytes(&bytes).unwrap();
+                assert_eq!(a.reserved_14, 0);
+                (a.header.seqno, a.status, Some(a.gpu_address))
+            }
+            size => panic!("an answer of {size} bytes"),
+        }
+    };
+    let private = Some(RGFX_SURFACE_PAGES_PRIVATE);
+
+    let host = Pages::default();
+    let mut rig = Rig::with_host(Box::new(host.clone()));
+    assert_eq!(
+        u64::from(rig.device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
+        RGFX_FEATURE_IMPORT_ADDRESSES
+    );
+    rig.device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_HI.into(),
+        (RGFX_FEATURE_IMPORT_ADDRESSES >> 32) as u32,
+    );
+    rig.start();
+    rig.region().write(BLOCK + 0x1000, runs.as_bytes());
+    let seqno = rig.send(message(3, BLOCK + 0x1000, private));
+    assert_eq!(answer(&mut rig), (seqno, RGFX_STATUS_OK, Some(AT)));
+    let seqno = rig.send(message(9, BLOCK + 0x1000, private));
+    assert_eq!(answer(&mut rig), (seqno, RGFX_STATUS_REFUSED, Some(0)));
+    // Runs past the block: the device's own refusal, as a pages answer still.
+    let seqno = rig.send(message(3, BLOCK + 0x1ff8, private));
+    assert_eq!(
+        answer(&mut rig),
+        (seqno, RGFX_STATUS_INVALID_ARGUMENT, Some(0))
+    );
+    // A block that is no pages block, with flags and without.
+    let seqno = rig.send(message(3, BLOCK + 0x1000, Some(RGFX_SURFACE_PAGES_CACHED)));
+    assert_eq!(answer(&mut rig), (seqno, RGFX_STATUS_OK, None));
+    let seqno = rig.send(message(3, BLOCK + 0x1000, None));
+    assert_eq!(answer(&mut rig), (seqno, RGFX_STATUS_OK, None));
+    assert_eq!(*host.0.lock(), [true, true, false, false]);
+
+    let host = Pages::default();
+    let mut rig = Rig::with_host(Box::new(host.clone()));
+    rig.start();
+    rig.region().write(BLOCK + 0x1000, runs.as_bytes());
+    let seqno = rig.send(message(3, BLOCK + 0x1000, private));
+    assert_eq!(answer(&mut rig), (seqno, RGFX_STATUS_OK, None));
+    assert_eq!(*host.0.lock(), [false]);
+}
+
 /// What a [`TakingHost`] records, and what it is set to do.
 #[derive(Default)]
 struct Taking {

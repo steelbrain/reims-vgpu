@@ -1,12 +1,14 @@
 //! The GPU addresses the host gives the contexts' blocks on a source whose blocks have none
 //! (`HostBlocks`, the Vulkan platform's): the Shared pool's (`POOL_ADDRESSES`,
-//! docs/graphics-kext/design.md, "The Shared pool") and the Private blocks
-//! (`PRIVATE_BLOCKS`, "Private blocks"). A guest that took the feature places its objects at
-//! the address its take's answer names, and the platform pins them there, as it pins every
-//! address the guest picks.
+//! docs/graphics-kext/design.md, "The Shared pool"), the Private blocks
+//! (`PRIVATE_BLOCKS`, "Private blocks") and the pages blocks' views (`IMPORT_ADDRESSES`,
+//! "No-copy buffers"). A guest that took the feature places its objects at the address its
+//! take's answer names, and the platform pins them there, as it pins every address the guest
+//! picks.
 //!
-//! The pool's addresses lie in `[HOST_BASE, HOST_END)`, `[2^45, 2^46)`, and the Private blocks'
-//! in `[PRIVATE_BASE, PRIVATE_END)`, `[2^44, 2^45)`, each picked by its own [`HostAddresses`]:
+//! The pool's addresses lie in `[HOST_BASE, HOST_END)`, `[2^45, 2^46)`, the Private blocks' in
+//! `[PRIVATE_BASE, PRIVATE_END)`, `[2^44, 2^45)`, and the pages blocks' views' in
+//! `[IMPORT_BASE, IMPORT_END)`, `[2^43, 2^44)`, each picked by its own [`HostAddresses`]:
 //! below `RGFX_CONTEXT_VA_BASE`, where the guest's own picks start, and far above where the
 //! Vulkan platform's model of Metal's layout places the host's unpinned ranges (lowest first from
 //! 2^40, as far as its live ranges reach), so a pin of one meets only another of these. A
@@ -15,8 +17,9 @@
 //!
 //! The picks go next fit: each from the end of the last, wrapping to the start at the end. A
 //! block's address is free again at its free, but a pick reaches it only once the picks wrap,
-//! 32 TiB of spans later in the pool's range and 16 TiB in the Private one, so a platform that
-//! lets go of a pin a while after the object over it went never meets it.
+//! 32 TiB of spans later in the pool's range, 16 TiB in the Private one and 8 TiB in the pages
+//! blocks' views', so a platform that lets go of a pin a while after the object over it went
+//! never meets it.
 
 /// The first address the host gives: 2^45.
 pub(crate) const HOST_BASE: u64 = 1 << 45;
@@ -31,6 +34,13 @@ pub(crate) const PRIVATE_BASE: u64 = 1 << 44;
 /// The end of the addresses the host gives the Private blocks: 2^45, [`HOST_BASE`], where the
 /// pool's start.
 pub(crate) const PRIVATE_END: u64 = HOST_BASE;
+
+/// The first address the host gives a pages block's view: 2^43.
+pub(crate) const IMPORT_BASE: u64 = 1 << 43;
+
+/// The end of the addresses the host gives the pages blocks' views: 2^44, [`PRIVATE_BASE`], where
+/// the Private blocks' start.
+pub(crate) const IMPORT_END: u64 = PRIVATE_BASE;
 
 /// Metal's page on Apple silicon: a range holds whole pages, and one more as its guard.
 const PAGE: u64 = 0x4000;
@@ -81,6 +91,11 @@ impl HostAddresses {
     /// The Private blocks': `[PRIVATE_BASE, PRIVATE_END)`.
     pub(crate) fn private() -> HostAddresses {
         HostAddresses::over(PRIVATE_BASE, PRIVATE_END)
+    }
+
+    /// The pages blocks' views': `[IMPORT_BASE, IMPORT_END)`.
+    pub(crate) fn imports() -> HostAddresses {
+        HostAddresses::over(IMPORT_BASE, IMPORT_END)
     }
 
     /// The address of a block of `len` bytes, its span now held: the first start from where the
@@ -196,5 +211,22 @@ mod tests {
         let mut full = HostAddresses::private();
         full.held.insert(PRIVATE_BASE, PRIVATE_END);
         assert_eq!(full.pick(0x1_0000), None);
+    }
+
+    /// The pages blocks' views' range is `[2^43, 2^44)`, below the Private blocks', and its picks
+    /// stay in it.
+    #[test]
+    fn the_views_range_lies_below_the_private_one_and_its_picks_stay_in_it() {
+        assert_eq!((IMPORT_BASE, IMPORT_END), (1 << 43, 1 << 44));
+        let mut a = HostAddresses::imports();
+        assert_eq!(a.pick(0x3000), Some(IMPORT_BASE));
+        assert_eq!(a.pick(0x1_0000), Some(IMPORT_BASE + 0x8000));
+        a.free(IMPORT_BASE);
+        a.next = IMPORT_END - 0x1_8000;
+        assert_eq!(a.pick(0x1_0000), Some(IMPORT_END - 0x1_8000));
+        assert_eq!(a.pick(0x3000), Some(IMPORT_BASE));
+        let mut full = HostAddresses::imports();
+        full.held.insert(IMPORT_BASE, IMPORT_END);
+        assert_eq!(full.pick(0x1000), None);
     }
 }

@@ -121,6 +121,19 @@
 //! 38743 against 38553 and 38555), and 106 on the RX 7900 XTX, against 136 (38742 against
 //! 38554); during Launchpad's opens and closes as many as before.
 //!
+//! **Addresses the host gives** (`RGFX_FEATURE_IMPORT_ADDRESSES`). Where the guest took it, a
+//! pages block's `SURFACE_PAGES` is answered with a GPU address for the first byte of its view
+//! ([`SurfaceViews::pages_address`]), and the guest places each `BUFFER_OVER_PAGES` over the
+//! block there, plus the buffer's offset in the view: buffers over the same bytes, which share
+//! a block, share their address, as they share the import of its pages on metal2vulkan-rt. Here
+//! the address is the host's pick in `[2^43, 2^44)` (`pool::addresses`), holding Metal's span
+//! of the view's length until the block goes. The first buffer made there is pinned there, as a
+//! buffer at the guest's own pick is, and the block keeps it until it goes, so the address
+//! reaches the view's pages for as long as any buffer over the block lives; a buffer made there
+//! after it, over the same bytes, is made where the platform places it, and the guest's pointers
+//! to it reach the same pages through the first. A block of pages its process maps read-only
+//! gets no address: each of its buffers lies over a copy of its own.
+//!
 //! **Heaps over pages** (`RGFX_FEATURE_HEAP_OVER_PAGES`). A pages block, a slab of the guest's, can
 //! hold a `HEAP_OVER_PAGES`, the buffers placed in it costing what a heap over host memory's do. A
 //! block of one run holds it over that run where the guest's RAM is mapped for the host (the memory
@@ -319,6 +332,8 @@ use reims_vgpu_vulkan::core::platform::values::{BufferDesc, HeapDesc, OptionSet,
 use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{RaiseResult, refusals};
 use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
+
+use crate::pool::HostAddresses;
 
 use super::worker::{Job, Settle, Worker};
 
@@ -892,6 +907,29 @@ pub(crate) struct Private<P: Platform> {
     /// Its runs in the coverage of the live blocks' imports, from its import's making or taking
     /// until it goes ([`overlaps`]): none for a block with no import.
     covered: Option<overlaps::Covered>,
+    /// The first buffer its `BUFFER_OVER_PAGES` made at its view's address, pinned there, kept
+    /// until the block goes ("Addresses the host gives"); before [`Self::address`], which it is
+    /// let go of before.
+    kept: Option<P::Buffer>,
+    /// The GPU address the host gave its view (`IMPORT_ADDRESSES`), picked at its
+    /// `SURFACE_PAGES` answer ([`SurfaceViews::pages_address`]); none for a block whose answer
+    /// asked for none.
+    address: Option<ViewAddress>,
+}
+
+/// The GPU address the host gave a pages block's view (`IMPORT_ADDRESSES`), held in the views'
+/// picks ([`HostAddresses::imports`]) until the block goes.
+pub(crate) struct ViewAddress {
+    at: u64,
+    /// The view's length: a buffer over the block whose address lies in it lies at the view's.
+    length: u64,
+    picks: Arc<Mutex<HostAddresses>>,
+}
+
+impl Drop for ViewAddress {
+    fn drop(&mut self) {
+        self.picks.lock().free(self.at);
+    }
 }
 
 /// What makes the view of a block named by its runs (the module doc): its runs, checked, the
@@ -986,6 +1024,8 @@ pub(crate) struct SurfaceViews<P: Platform> {
     regroups: regroup::Regroups<P>,
     /// The guest RAM the live pages blocks' imports cover ([`overlaps`]).
     coverage: Arc<Mutex<overlaps::Coverage>>,
+    /// The addresses the host gives the pages blocks' views ([`Self::pages_address`]).
+    view_addresses: Arc<Mutex<HostAddresses>>,
 }
 
 /// What a `SURFACE_PAGES` found under the views' lock ([`SurfaceViews::surface_pages`]).
@@ -1034,6 +1074,57 @@ impl<P: Platform> SurfaceViews<P> {
             waiting: HashMap::new(),
             regroups: regroup::Regroups::default(),
             coverage: Arc::default(),
+            view_addresses: Arc::new(Mutex::new(HostAddresses::imports())),
+        }
+    }
+
+    /// The GPU address of the view of the pages block at `block`, for its `SURFACE_PAGES`
+    /// answer (`IMPORT_ADDRESSES`, "Addresses the host gives"): the one picked for it, else one
+    /// picked now in `[2^43, 2^44)`, holding Metal's span of the view's length, until the block
+    /// goes; 0 where no pages block lies there, for one of pages its process maps read-only,
+    /// whose buffers lie over copies of the pages, and where no room is left.
+    pub(crate) fn pages_address(&mut self, block: u64) -> u64 {
+        let picks = Arc::clone(&self.view_addresses);
+        let Some(p) = self.private.get_mut(&block) else {
+            return 0;
+        };
+        if p.read_only {
+            return 0;
+        }
+        if let Some(address) = &p.address {
+            return address.at;
+        }
+        let Some(at) = picks.lock().pick(p.length) else {
+            return 0;
+        };
+        p.address = Some(ViewAddress {
+            at,
+            length: p.length,
+            picks,
+        });
+        at
+    }
+
+    /// Whether a buffer at `gpu_address` over the pages block at `block` lies at the address
+    /// its view was given ([`Self::pages_address`]): `Some(true)` where the block keeps a buffer
+    /// made there before it, over the same bytes (a join), `Some(false)` for the first; `None`
+    /// for a block given no address, or a buffer not in its view's.
+    pub(crate) fn at_view_address(&self, block: u64, gpu_address: u64) -> Option<bool> {
+        let p = self.private.get(&block)?;
+        let address = p.address.as_ref()?;
+        let end = address.at.checked_add(address.length)?;
+        (address.at..end)
+            .contains(&gpu_address)
+            .then_some(p.kept.is_some())
+    }
+
+    /// The pages block at `block` keeps `buffer`, the first made at its view's address, until it
+    /// goes; nothing where it keeps one already.
+    pub(crate) fn keep_at_view_address(&mut self, block: u64, buffer: &P::Buffer) {
+        if let Some(p) = self.private.get_mut(&block)
+            && p.kept.is_none()
+        {
+            p.kept = Some(buffer.clone_ref());
         }
     }
 
@@ -1277,6 +1368,8 @@ impl<P: Platform> SurfaceViews<P> {
                         regrouped: None,
                         retired: Vec::new(),
                         covered: None,
+                        kept: None,
+                        address: None,
                     },
                 );
                 Ok(())
@@ -2093,6 +2186,12 @@ impl<P: Platform> SurfaceViews<P> {
         made.or_else(|| p.mapped.as_ref().map(|v| v.base()))
     }
 
+    /// How many addresses the pages blocks' views hold ([`Self::pages_address`]; for the tests).
+    #[cfg(test)]
+    pub(crate) fn view_addresses_held(&self) -> usize {
+        self.view_addresses.lock().held()
+    }
+
     /// How many groups are being formed, and how many members they have (for the tests).
     #[cfg(test)]
     pub(crate) fn forming(&self) -> (usize, usize) {
@@ -2637,12 +2736,23 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             return Ok(Err(super::DecodeError::Refused));
         };
         // At the guest's address, which its pointers to the buffer hold, as a
-        // BUFFER_OVER_HOST_MEMORY's is.
-        let pin = (m.gpu_address != 0).then_some(m.gpu_address);
+        // BUFFER_OVER_HOST_MEMORY's is. At the address the host gave the block's view
+        // ("Addresses the host gives"): the first buffer there pinned, and kept by the block;
+        // one over the same bytes after it, which the guest's pointers reach through the first,
+        // where the platform places it. A block is its context's, whose messages are carried out
+        // in order, so no other buffer over it is made between the two.
+        let views = &self.shared.surface_views;
+        let at_view = (m.gpu_address != 0)
+            .then(|| views.lock().at_view_address(m.block_offset, m.gpu_address))
+            .flatten();
+        let pin = (m.gpu_address != 0 && at_view != Some(true)).then_some(m.gpu_address);
         let Some(buffer) = buffer_over(device, &view, m.offset, m.length, m.options.into(), pin)?
         else {
             return Ok(Err(super::DecodeError::Refused));
         };
+        if at_view == Some(false) {
+            views.lock().keep_at_view_address(m.block_offset, &buffer);
+        }
         log::trace!(
             target: "reims_vgpu::graphics::surface_pages",
             "BUFFER_OVER_PAGES of the block at {:#x} ({:#x} bytes of view): object {:#x}, {:#x} \
@@ -4268,6 +4378,99 @@ pub(super) mod tests {
             3,
             "the test, the cache and the import the cache keeps hold the view"
         );
+    }
+
+    /// A pages block's view is given an address where the guest took `IMPORT_ADDRESSES`
+    /// ("Addresses the host gives"): the host's pick in `[2^43, 2^44)`, on a granule, the same
+    /// at each ask; none for a read-only block, whose buffers lie over copies, nor where no
+    /// pages block lies. The first `BUFFER_OVER_PAGES` at it plus its offset is pinned there, and
+    /// the block keeps it; one over the same bytes after it, and after the first is destroyed,
+    /// is made where the platform places it, over the same pages. The block's release gives the
+    /// address back, and so does the device's reset
+    #[test]
+    fn a_pages_block_s_view_is_given_an_address_and_its_first_buffer_is_pinned_there() {
+        use crate::pool::{IMPORT_BASE, IMPORT_END};
+        let mut r = rig(16);
+        let page = r.page;
+        let read_only = BLOCK + 0x8000;
+        assert_eq!(
+            r.pages_flagged(
+                BLOCK,
+                0,
+                &[(5, 2), (1, 1)],
+                3 * page,
+                RGFX_SURFACE_PAGES_PRIVATE
+            ),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(
+            r.pages_flagged(
+                read_only,
+                0,
+                &[(8, 4)],
+                4 * page,
+                RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_READ_ONLY
+            ),
+            RGFX_STATUS_OK
+        );
+        let at = r.dec.pages_address(BLOCK);
+        assert!((IMPORT_BASE..IMPORT_END).contains(&at), "{at:#x}");
+        assert_eq!(at % 0x8000, 0, "on a granule");
+        assert_eq!(r.dec.pages_address(BLOCK), at, "the same at each ask");
+        assert_eq!(r.dec.pages_address(read_only), 0);
+        assert_eq!(r.dec.pages_address(BLOCK + 0x1_0000), 0);
+        assert_eq!(r.dec.views_of_surfaces().view_addresses_held(), 1);
+
+        // The app's bytes, 0x123 into page 5, the first of the block's.
+        assert!(r.ram.write(RAM + 5 * page + 0x123, b"app"));
+        let destroy = |r: &mut Rig, obj_id| {
+            let destroy = RgfxObjectDestroy {
+                header: header(RGFX_CMD_OBJECT_DESTROY),
+                obj_id,
+            };
+            assert_eq!(r.dec.decode(&r.device, destroy.as_bytes()).unwrap(), Ok(()));
+        };
+        let gpu_address = at + 0x123;
+        assert_eq!(
+            r.pages_buffer(10, gpu_address, BLOCK, 0x123, 2 * page),
+            Ok(())
+        );
+        let (first, contents) = r.buffer_at(10);
+        assert_eq!(first, gpu_address, "pinned there");
+        assert_eq!(r.p.fake_vm().read(contents, 3).unwrap(), b"app");
+        // The first destroyed after the second is made, the block keeps it for the third.
+        for obj_id in [11, 12] {
+            assert_eq!(
+                r.pages_buffer(obj_id, gpu_address, BLOCK, 0x123, 2 * page),
+                Ok(())
+            );
+            let (placed, over) = r.buffer_at(obj_id);
+            assert_ne!(placed, gpu_address, "where the platform places it");
+            assert_eq!(over, contents, "over the same pages");
+            if obj_id == 11 {
+                destroy(&mut r, 10);
+            }
+        }
+        destroy(&mut r, 11);
+        destroy(&mut r, 12);
+        r.dec
+            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+        // The block's entry goes on the surface worker.
+        r.dec.surface_worker().flush();
+        assert_eq!(r.dec.views_of_surfaces().view_addresses_held(), 0);
+
+        // The device's reset gives back the addresses of the blocks it drops.
+        assert_eq!(
+            r.pages_flagged(BLOCK, 0, &[(5, 2)], 2 * page, RGFX_SURFACE_PAGES_PRIVATE),
+            RGFX_STATUS_OK
+        );
+        let again = r.dec.pages_address(BLOCK);
+        assert!((IMPORT_BASE..IMPORT_END).contains(&again), "{again:#x}");
+        assert_eq!(r.pages_buffer(13, again, BLOCK, 0, page), Ok(()));
+        assert_eq!(r.buffer_at(13).0, again);
+        assert_eq!(r.dec.views_of_surfaces().view_addresses_held(), 1);
+        r.dec.reset(&r.device);
+        assert_eq!(r.dec.views_of_surfaces().view_addresses_held(), 0);
     }
 
     /// A `BUFFER_OVER_PAGES` longer than the device's `maxBufferLength`, as the bundle's

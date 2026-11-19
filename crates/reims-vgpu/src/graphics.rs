@@ -74,7 +74,7 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_DOORBELL_ASKS, RGFX_FEATURE_DOORBELL_PAGES,
     RGFX_FEATURE_DYNAMIC_LIBRARIES, RGFX_FEATURE_FUNCTION_POINTERS, RGFX_FEATURE_GUEST_TIMES,
     RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS,
-    RGFX_FEATURE_ICB_SLOTS_IN_PAGES, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
+    RGFX_FEATURE_ICB_SLOTS_IN_PAGES, RGFX_FEATURE_IMPORT_ADDRESSES, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
     RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
     RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_ANSWERS,
@@ -723,6 +723,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 // The contexts' Private blocks, ranges of addresses the host picks, which need
                 // no memory: on every host and for every guest.
                 | RGFX_FEATURE_PRIVATE_BLOCKS
+                // The pages blocks' views' addresses, the host's picks too
+                // (`decode::surface_pages`, "Addresses the host gives").
+                | RGFX_FEATURE_IMPORT_ADDRESSES
                 // A window's captured pointer drives the guest's own mouse while a game hides
                 // the cursor ([`crate::window`]); a device with no window has no pointer to.
                 | if config.window.is_some() {
@@ -2059,14 +2062,22 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         (self.decoder()).wait_copies_into(pages.block_offset, &runs);
         let me = Arc::clone(self);
         let job = move |settle| {
-            let status = {
+            let (status, at) = {
                 let _carried = me.reset_gate.read_recursive();
-                (me.decoder())
-                    .carry_out_surface_pages(&me.device, &pages, &runs, flags, layout, &settle)
+                let status = (me.decoder())
+                    .carry_out_surface_pages(&me.device, &pages, &runs, flags, layout, &settle);
+                // A pages block's view's address, where the guest took IMPORT_ADDRESSES.
+                let at = match status {
+                    Some(RGFX_STATUS_OK) if answer.wants_address() => {
+                        (me.decoder()).pages_address(pages.block_offset)
+                    }
+                    _ => 0,
+                };
+                (status, at)
             };
             // Nothing is owed where the device was reset since.
             if let Some(status) = status {
-                answer.answer(status);
+                answer.answer_at(status, at);
             }
             drop(settle);
         };

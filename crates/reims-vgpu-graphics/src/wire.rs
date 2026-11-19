@@ -564,6 +564,21 @@ pub const RGFX_FEATURE_POOL_ADDRESSES: u64 = 0x800_0000_0000_0000;
 /// own: the platform pins each object made there, as it pins the guest's picks. Every host offers
 /// it; the x86-64 and arm64e kexts take it.
 pub const RGFX_FEATURE_PRIVATE_BLOCKS: u64 = 0x1000_0000_0000_0000;
+/// `FEATURES_HI` bit 29, feature bit 61, `IMPORT_ADDRESSES`: the host gives each pages block of a
+/// process's own memory ([`RGFX_SURFACE_PAGES_PRIVATE`]) its GPU address. Where the guest took it
+/// beside [`RGFX_FEATURE_PAGES_BUFFERS`], such a block's `SURFACE_PAGES` is answered
+/// [`RgfxPagesAnswer`], which carries the GPU address of the block's view's first byte, and the
+/// guest places the `BUFFER_OVER_PAGES` buffers it makes over the block at that address plus
+/// their offsets in the view, rather than at addresses it picks in its context's range
+/// ([`RGFX_CONTEXT_VA_BASE`]); buffers over the same bytes, which share a block, share their
+/// address. On metal2vulkan-rt's device the address is the Vulkan device address of the import of
+/// the block's pages; on the Vulkan platform before it, an address the host picks in
+/// `[2^43, 2^44)`, holding Metal's span of the view's length, where the platform pins the first
+/// buffer made over the block, which then reaches the block's pages for the buffers made over the
+/// same bytes after it until the block's release. A block of pages its process maps read-only
+/// ([`RGFX_SURFACE_PAGES_READ_ONLY`]) is given none there: its buffers lie over copies of the
+/// pages. Every host offers it; the x86-64 and arm64e kexts take it.
+pub const RGFX_FEATURE_IMPORT_ADDRESSES: u64 = 0x2000_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -1355,6 +1370,13 @@ pub const RGFX_PRIVATE_TAKE_MAX: u64 = 0x100_0000_0000;
 /// host maps the pages, and answers [`RGFX_STATUS_OK`], the block in place as any, or
 /// [`RGFX_STATUS_CACHE`], with no view kept for the block, where its textures over the pages
 /// would not lie in place: the kext then posts the block's `SURFACE_PAGES` again, cached.
+///
+/// Where the guest took [`RGFX_FEATURE_IMPORT_ADDRESSES`], a pages block's `SURFACE_PAGES`
+/// ([`RGFX_SURFACE_PAGES_PRIVATE`]) is answered [`RgfxPagesAnswer`], an [`RGFX_EVT_COMPLETE`] of 32
+/// bytes, whose `gpu_address` is the GPU address of the first byte of the block's view where the
+/// status is [`RGFX_STATUS_OK`], and 0 otherwise or where the host has no address for it; the
+/// address holds until the block's `BLOCK_RELEASE` is carried out, or its context's
+/// `CONTEXT_CLOSE`. A reader of the 24 bytes of an [`RgfxComplete`] reads the answer as before.
 pub const RGFX_CMD_SURFACE_PAGES: u32 = 0x2f6;
 /// `SURFACE_DOWNLOAD` ([`RgfxSurfaceDownload`]), on ring 0 from the accelerator kext, where the
 /// device has [`RGFX_FEATURE_SURFACE_CACHE`]: a CPU lock of the IOSurface whose cached block is at
@@ -1876,6 +1898,25 @@ pub struct RgfxComplete {
     pub status: u32,
     /// Pads the message to a multiple of 8; 0.
     pub reserved_14: u32,
+}
+
+/// A pages block's `SURFACE_PAGES` answer where the guest took
+/// [`RGFX_FEATURE_IMPORT_ADDRESSES`]: an [`RgfxComplete`] and the GPU address of the block's
+/// view's first byte.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxPagesAnswer {
+    /// [`RGFX_EVT_COMPLETE`], with the `SURFACE_PAGES`' `seqno`.
+    pub header: RgfxMsgHeader,
+    /// An `RGFX_STATUS_*`, as an [`RgfxComplete`]'s.
+    pub status: u32,
+    /// Zero.
+    pub reserved_14: u32,
+    /// The GPU address of the first byte of the block's view, never 0 where given; 0 unless
+    /// the status is [`RGFX_STATUS_OK`], or where the host gives the block none.
+    pub gpu_address: u64,
 }
 
 /// `DISPLAYS`: `GET_DISPLAYS`'s answer. `count` [`RgfxDisplayEntry`] records follow it, at
@@ -2817,7 +2858,9 @@ pub struct RgfxBufferOverPages {
     pub block_offset: u64,
     /// The pages block's size in bytes.
     pub block_size: u64,
-    /// Where the buffer starts in the block's view, in bytes.
+    /// Where the buffer starts in the block's view, in bytes. Where the guest took
+    /// [`RGFX_FEATURE_IMPORT_ADDRESSES`] and the block's `SURFACE_PAGES` answered a GPU address
+    /// ([`RgfxPagesAnswer`]), `gpu_address` is that address plus this.
     pub offset: u64,
     /// The buffer's length in bytes.
     pub length: u64,

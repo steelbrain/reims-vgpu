@@ -9777,6 +9777,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_BUFFER_ESCAPED
             | RGFX_FEATURE_SURFACE_REFILL
             | RGFX_FEATURE_PRIVATE_BLOCKS
+            | RGFX_FEATURE_IMPORT_ADDRESSES
             | slots_in_pages
             | sixteen_bit
             | if carries {
@@ -9838,6 +9839,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
                 | RGFX_FEATURE_BUFFER_ESCAPED
                 | RGFX_FEATURE_SURFACE_REFILL
                 | RGFX_FEATURE_PRIVATE_BLOCKS
+                | RGFX_FEATURE_IMPORT_ADDRESSES
                 | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
                 | RGFX_FEATURE_READ_ONLY_PAGES
                 | RGFX_FEATURE_PAGES_16K
@@ -9887,6 +9889,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_BUFFER_ESCAPED
             | RGFX_FEATURE_SURFACE_REFILL
             | RGFX_FEATURE_PRIVATE_BLOCKS
+            | RGFX_FEATURE_IMPORT_ADDRESSES
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);
@@ -11012,6 +11015,19 @@ fn surface_device(
     reims_vgpu_vulkan::core::testkit::GuestRam,
     u64,
 ) {
+    surface_device_taking(pages, 0)
+}
+
+/// [`surface_device`], started by a driver that took `features`.
+fn surface_device_taking(
+    pages: u64,
+    features: u64,
+) -> (
+    GraphicsDevice<FakePlatform>,
+    Arc<FakePlatform>,
+    reims_vgpu_vulkan::core::testkit::GuestRam,
+    u64,
+) {
     let platform = Arc::new(FakePlatform::new());
     let page = platform.vm().page_size();
     let ram =
@@ -11037,6 +11053,8 @@ fn surface_device(
         ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    device.mmio_write(RGFX_REG_DRIVER_FEATURES_LO.into(), features as u32);
+    device.mmio_write(RGFX_REG_DRIVER_FEATURES_HI.into(), (features >> 32) as u32);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     (device, platform, ram, page)
 }
@@ -11273,6 +11291,67 @@ fn two_buffers_over_one_pages_block_lie_in_its_one_view() {
     );
     guest.send(&device, object_destroy(obj(1, 12)));
     assert_eq!(answered(&device, &mut guest, release()), RGFX_STATUS_OK);
+}
+
+/// Where the guest took `IMPORT_ADDRESSES`, a pages block's `SURFACE_PAGES` is answered with the
+/// address the host gave its view, a `COMPLETE` of 32 bytes (`RgfxPagesAnswer`), and a
+/// `BUFFER_OVER_PAGES` at it lies there; the block's release, once its buffer is destroyed, gives
+/// the address back, and the next block's answer carries another. A guest that did not take it
+/// reads the 24 bytes of a `COMPLETE`
+#[test]
+fn a_pages_block_s_answer_carries_its_view_s_address_where_the_guest_took_import_addresses() {
+    use crate::pool::{IMPORT_BASE, IMPORT_END};
+    let pages_answer = |bytes: &[u8]| {
+        let answer = RgfxPagesAnswer::read_from_bytes(bytes).unwrap();
+        assert_eq!(answer.header.r#type, RGFX_EVT_COMPLETE);
+        (answer.header.seqno, answer.status, answer.gpu_address)
+    };
+    let send_pages = |device: &GraphicsDevice<FakePlatform>, guest: &mut Guest, page| {
+        guest.send(device, block_grant(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
+        let mut pages = surface_pages(device, page, &[(5, 2), (1, 1)]);
+        pages.extend_from_slice(
+            RgfxSurfacePagesCache {
+                flags: RGFX_SURFACE_PAGES_PRIVATE,
+                reserved_04: 0,
+            }
+            .as_bytes(),
+        );
+        guest.send(device, pages);
+        (guest.seqno, guest.event().expect("the SURFACE_PAGES' answer"))
+    };
+    let (device, _platform, _ram, page) =
+        surface_device_taking(8, RGFX_FEATURE_IMPORT_ADDRESSES);
+    let mut guest = Guest::new(&device);
+    let (seqno, answer) = send_pages(&device, &mut guest, page);
+    let (answered_seqno, status, at) = pages_answer(&answer);
+    assert_eq!((answered_seqno, status), (seqno, RGFX_STATUS_OK));
+    assert!((IMPORT_BASE..IMPORT_END).contains(&at), "{at:#x}");
+    let mut over = RgfxBufferOverPages::read_from_bytes(&buffer_over_pages(obj(1, 11), 2 * page))
+        .unwrap();
+    over.gpu_address = at + 0x123;
+    over.offset = 0x123;
+    guest.send(&device, over.as_bytes().to_vec());
+    assert!(objects_become(&device, 1));
+    assert_eq!(device.decoder_gpu_address(obj(1, 11)), Some(at + 0x123));
+    guest.send(&device, object_destroy(obj(1, 11)));
+    let release = block_release(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE);
+    assert_eq!(answered(&device, &mut guest, release), RGFX_STATUS_OK);
+    let decoder = device.control.decoder();
+    decoder.surface_worker().flush();
+    assert_eq!(decoder.views_of_surfaces().view_addresses_held(), 0);
+    let (_, answer) = send_pages(&device, &mut guest, page);
+    let (_, status, next) = pages_answer(&answer);
+    assert_eq!(status, RGFX_STATUS_OK);
+    assert!((IMPORT_BASE..IMPORT_END).contains(&next) && next != at, "{next:#x}");
+
+    let (device, _platform, _ram, page) = surface_device(8);
+    let mut guest = Guest::new(&device);
+    let (seqno, answer) = send_pages(&device, &mut guest, page);
+    assert_eq!(complete_of(&answer), (seqno, RGFX_STATUS_OK));
+    assert_eq!(
+        device.control.decoder().views_of_surfaces().view_addresses_held(),
+        0
+    );
 }
 
 /// A pages block's view, which its first `BUFFER_OVER_PAGES` makes, is made off ring 0's threads:
