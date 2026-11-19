@@ -54,8 +54,16 @@ fn a_buffer_past_a_dedicated_allocations_first_byte_lands_at_its_offset() {
         download(&gpu, &stream, whole.address_at(0), &mut host, bytes);
         let read = host.bytes();
         let stray = |range: std::ops::Range<usize>| range.clone().find(|&at| read[at] != 0);
-        assert_eq!(stray(0..start), None, "a byte before the buffer at {offset} was written");
-        assert_eq!(stray(end..bytes), None, "a byte past the buffer at {offset} was written");
+        assert_eq!(
+            stray(0..start),
+            None,
+            "a byte before the buffer at {offset} was written"
+        );
+        assert_eq!(
+            stray(end..bytes),
+            None,
+            "a byte past the buffer at {offset} was written"
+        );
         let wrong = (start..end).find(|&at| read[at] != pattern[at - start]);
         assert_eq!(wrong, None, "the buffer at {offset} landed elsewhere");
     }
@@ -183,13 +191,12 @@ impl Exporter {
 
 impl Drop for Exporter {
     fn drop(&mut self) {
-        // SAFETY: the device's own objects, unused by any GPU work, each destroyed once, the
-        // device last.
-        unsafe {
-            self.device.destroy_buffer(self.buffer, None);
-            self.device.free_memory(self.memory, None);
-            self.device.destroy_device(None);
-        }
+        // SAFETY: the device's buffer, unused by any GPU work, destroyed once.
+        unsafe { self.device.destroy_buffer(self.buffer, None) };
+        // SAFETY: the buffer's memory, its buffer destroyed and its imports gone, freed once.
+        unsafe { self.device.free_memory(self.memory, None) };
+        // SAFETY: the device, each object of it destroyed above, destroyed once.
+        unsafe { self.device.destroy_device(None) };
     }
 }
 
@@ -249,10 +256,15 @@ fn run(gpu: &Arc<Gpu>, stream: &Stream, copy: &CUDA_MEMCPY2D) {
         // waited for below, and its device side a mapping of an import the caller holds, each
         // as long as the copy; the stream is live, on the context current here.
         let result = unsafe { (cuda.f.cuMemcpy2DAsync_v2)(copy, stream.raw()) };
-        cuda.check("cuMemcpy2DAsync", result).expect("a copy queued");
+        cuda.check("cuMemcpy2DAsync", result)
+            .expect("a copy queued");
     }
     let done = wait::poll(wait::deadline(), || {
         stream.is_done().expect("the copy").then_some(())
     });
-    assert!(done.is_some(), "a copy of {} bytes outlasted the GPU's wait", copy.WidthInBytes);
+    assert!(
+        done.is_some(),
+        "a copy of {} bytes outlasted the GPU's wait",
+        copy.WidthInBytes
+    );
 }
