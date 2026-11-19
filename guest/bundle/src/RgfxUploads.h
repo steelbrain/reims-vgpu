@@ -3,10 +3,12 @@
  * reads them as a buffer bound at an offset (the wire carries no inline constant data).
  *
  * A queue holds one RgfxUploadPool: chunks, each a buffer of the device's slabs
- * (RgfxSlabs.hpp), which lie in the process's own pages where the device maps them, or, where
- * the pool has no slabs, a buffer over a block of the device region (one
- * BUFFER_OVER_HOST_MEMORY on ring 0 when the chunk is made, none after); Shared, or Managed on a
- * GPU of its own memory (below). The host sees a Shared chunk in place, so the bytes are copied
+ * (RgfxSlabs.hpp), which lie in the Shared pool's blocks or the process's own pages where the
+ * device maps them, or, where the pool has no slabs or the slabs, the region's, had none for it,
+ * a buffer over a block of the device region (one BUFFER_OVER_HOST_MEMORY on ring 0 when the
+ * chunk is made, none after); Shared, or Managed on a GPU of its own memory (below). Where the
+ * slabs are the Shared pool's, no chunk is the region's: one the pool has no block for is none,
+ * and its command buffer fails as out of memory. The host sees a Shared chunk in place, so the bytes are copied
  * once, into the chunk, and never again. The pages first: the
  * region is mapped uncached in the guest under xnu's PAT, which an AMD host applies, until the
  * x86-64 kext sets the PAT's entry 2 to write-back (RgfxRegion.hpp). A command
@@ -91,8 +93,9 @@ public:
 	RgfxUploadPool(RgfxRegion *region, RgfxSerializer *serializer, id<MTLDevice> device,
 	               RgfxSlabs *slabs = nullptr, bool managed = false);
 
-	/// A free chunk of at least `size` bytes, made where none is free. `ok` false (no chunk)
-	/// where the region has no room or the pool has no region or route.
+	/// A free chunk of at least `size` bytes, made where none is free. False (no chunk) where
+	/// the slabs and the region have no room, or the pool has no region or route; where the
+	/// slabs are the Shared pool's (RgfxSlabs::inRegion), where the pool has no block for it.
 	bool take(uint64_t size, RgfxUploadChunk *chunk);
 
 	/// Takes back chunks a command buffer is done with.

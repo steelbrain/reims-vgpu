@@ -12,6 +12,7 @@
 
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
+#include "RgfxSlabs.hpp"
 
 namespace {
 
@@ -70,7 +71,10 @@ bool RgfxUploadPool::take(uint64_t size, RgfxUploadChunk *chunk)
 			return true;
 		}
 	}
-	if (m_region == nullptr) {
+	// Where the slabs are the Shared pool's, a chunk is the pool's or none: the region is behind
+	// none of the process's buffers (RgfxSlabs.hpp, THE SOURCES), and the command buffer fails as
+	// Metal's does where its memory runs out.
+	if (m_region == nullptr || (m_slabs != nullptr && !m_slabs->inRegion())) {
 		return false;
 	}
 	RgfxRegion::Block block = m_region->allocate(bytes);

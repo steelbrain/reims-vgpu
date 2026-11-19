@@ -684,6 +684,88 @@ void test_device_buffers_answer_as_metal()
 	}
 }
 
+// Where the slabs are the Shared pool's alone (RgfxSlabs.hpp, THE SOURCES), a queue's upload chunk
+// is a buffer of a pool block's heap, or none: where the kext has no block for it, the region,
+// with room, gives none either, nothing is posted, and the chunk's command buffer fails as out of
+// memory (RgfxUploads.h). Over the region's slabs a chunk lies in the region, as before.
+void test_upload_chunks_of_the_pool_alone()
+{
+	struct Kext {
+		bool refuse = true;
+		std::map<uint64_t, std::vector<uint8_t>> blocks; // by offset in the pool
+		uint64_t next = RgfxPoolSlabSource::kUnit;
+		static int take(void *context, uint64_t size, uint8_t **bytes, uint64_t *offset,
+		                uint64_t *gpu_address)
+		{
+			Kext *k = static_cast<Kext *>(context);
+			if (k->refuse)
+				return KERN_NO_SPACE;
+			*offset = k->next;
+			k->next += size;
+			k->blocks[*offset].assign(size, 0);
+			*bytes = k->blocks[*offset].data();
+			*gpu_address = 0;
+			return KERN_SUCCESS;
+		}
+		static void give(void *context, uint64_t offset)
+		{
+			static_cast<Kext *>(context)->blocks.erase(offset);
+		}
+	};
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x80000, 0xee);
+	RgfxRegion region(mem.data(), mem.size());
+	Kext kext;
+	RgfxPoolMemory calls;
+	calls.context = &kext;
+	calls.take = &Kext::take;
+	calls.give = &Kext::give;
+	RgfxPoolSlabSource pool(region, fx.ser, calls, false, true);
+	RgfxSlabs slabs(pool);
+	CHECK(!slabs.inRegion());
+	auto nothingPosted = [&]() {
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		return !fx.ring.next(&h, &bytes);
+	};
+	@autoreleasepool {
+		RgfxUploadPool uploads(&region, &fx.ser, nil, &slabs, false);
+		RgfxUploadChunk chunk = {};
+		CHECK(!uploads.take(0x100, &chunk) && chunk.buffer == nil && uploads.made() == 0);
+		CHECK(pool.takes().refused != 0 && kext.blocks.empty() && nothingPosted());
+
+		kext.refuse = false;
+		CHECK(uploads.take(0x100, &chunk) && uploads.made() == 1);
+		CHECK(chunk.size == RgfxUploadArena::kUploadChunkSize && kext.blocks.size() == 1);
+		const std::vector<uint8_t> &block = kext.blocks.begin()->second;
+		CHECK(chunk.bytes >= block.data() && chunk.bytes + chunk.size <= block.data() + block.size());
+		auto heap = expectMessage<RgfxHeapOverHostMemory>(fx.ring, RGFX_CMD_HEAP_OVER_POOL);
+		auto placed = expectMessage<RgfxBufferAtOffset>(fx.ring, RGFX_CMD_BUFFER_AT_OFFSET);
+		CHECK(heap.region_offset == kext.blocks.begin()->first);
+		CHECK(placed.heap_obj_id == heap.obj_id && placed.length == chunk.size);
+		CHECK(placed.obj_id == ((RgfxBuffer *)chunk.buffer).rgfxObjId && nothingPosted());
+		chunk = {};
+	} // the chunk's buffer goes, and its block with it
+	CHECK(kext.blocks.empty());
+
+	// Over the region's slabs: the region's.
+	RgfxRegionSlabSource source(region, fx.ser);
+	RgfxSlabs regionSlabs(source);
+	CHECK(regionSlabs.inRegion());
+	@autoreleasepool {
+		RgfxUploadPool uploads(&region, &fx.ser, nil, &regionSlabs, false);
+		RgfxUploadChunk chunk = {};
+		CHECK(uploads.take(0x100, &chunk) && uploads.made() == 1);
+		CHECK(chunk.bytes >= mem.data() + RGFX_ALLOCATIONS_OFFSET &&
+		      chunk.bytes < mem.data() + mem.size());
+		chunk = {};
+	}
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
+	while (fx.ring.next(&h, &drain)) {
+	}
+}
+
 // A Managed device buffer over a Shared copy in a slab (MANAGED_BUFFER_SLABS) says in its create
 // which bytes of its CPU copy read zero (RgfxManagedBufferZero), so the host's GPU copy takes
 // them as zeros: one made with no bytes, from its first byte, over a slab whose memory held other
@@ -21878,6 +21960,7 @@ int main(int argc, char **argv)
 		test_buffer_routing();
 		test_private_buffer_has_no_contents();
 		test_device_buffers_answer_as_metal();
+		test_upload_chunks_of_the_pool_alone();
 		test_managed_device_buffers_say_their_zero_bytes();
 		test_device_buffers_take_pages_of_slabs();
 		test_managed_buffers_place_their_cpu_copies_in_heaps();

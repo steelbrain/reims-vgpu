@@ -175,6 +175,10 @@ public:
 	/// false, each goes as its last buffer does.
 	virtual bool keepsFreed() const { return true; }
 
+	/// Whether this source's slabs are blocks of the device region, which every process
+	/// shares: the region's are; the Shared pool's and the process's own pages' are not.
+	virtual bool inRegion() const { return true; }
+
 	/// What smallMax() and slabMax() answer unless a source says otherwise: 1 MiB and 2 MiB.
 	static constexpr uint64_t kSmallMax = 1ull << 20;
 	static constexpr uint64_t kSlabMax = 2ull << 20;
@@ -338,6 +342,7 @@ public:
 	uint64_t slabMax() const override;
 	bool heapedSlab(uint64_t size, uint32_t options, bool dedicated) const override;
 	uint64_t capacity() const override { return m_capacity; }
+	bool inRegion() const override { return false; }
 	bool take(uint64_t size, bool heap, Memory *out) override;
 	void give(const Memory &memory) override;
 	bool makeHeap(const Memory &memory, uint32_t options, Heap *out) override;
@@ -408,6 +413,7 @@ public:
 	uint64_t smallMax() const override { return kSmallMax; }
 	uint64_t slabMax() const override { return kSlabMax; }
 	bool keepsFreed() const override { return false; }
+	bool inRegion() const override { return false; }
 	/// Whatever the pool holds: the host's. Sizes no cache, as the allocator keeps none of this
 	/// source's slabs.
 	uint64_t capacity() const override { return UINT64_MAX; }
@@ -527,6 +533,11 @@ public:
 	/// Whether a Managed buffer of `options` lies over a Shared copy (MANAGED OVER A COPY): the
 	/// device took RGFX_FEATURE_MANAGED_BUFFER_SLABS, and makes one over any Shared buffer.
 	bool overCopy(uint32_t options) const { return m_source.overCopy(options); }
+
+	/// Whether the own source is the region's (THE SOURCES): where it is not (the Shared
+	/// pool's), the region is behind no buffer of the process's, an upload chunk's included
+	/// (RgfxUploadPool).
+	bool inRegion() const { return m_source.inRegion(); }
 
 	/// The clock the idle times are read from, in ms: `now(context)`, for the tests; the steady
 	/// clock where none is set. Set before any take.

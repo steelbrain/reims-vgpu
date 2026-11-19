@@ -4900,9 +4900,11 @@ reads it once.
   at once.
 - **What moves.** Only buffers' slabs: a class's and a large buffer's own,
   and so every buffer that lies in one, upload chunks and Managed buffers'
-  copies among them. The rings, command buffers' bodies, surface copy
-  blocks, the scanout and the cursor stay in the region, and the ICB slots
-  where they were (the kext's chunks, else the region).
+  copies among them. None of them falls back to the region: a buffer the
+  pool has no block for is nil, and an upload chunk none, which fails its
+  command buffer as out of memory. The rings, command buffers' bodies,
+  surface copy blocks, the scanout and the cursor stay in the region, and
+  the ICB slots where they were (the kext's chunks, else the region).
 - **No empty slab kept.** On the Radeon 780M host (an x86-64 macOS guest's
   boot to its desktop, a window dragged for 31 s, and a GPU benchmark's run,
   counted by the bundle's slab churn lines), the empty slabs a class kept
