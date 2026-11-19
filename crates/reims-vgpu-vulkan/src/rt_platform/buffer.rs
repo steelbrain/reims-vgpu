@@ -1486,6 +1486,84 @@ mod tests {
         let texels = fill(101);
         assert_eq!(gpu_texels(), texels);
 
+        // Surface textures over a Shared buffer of rt's own are in place: no copy is counted.
+        let diag = crate::rt_platform::diag::surface_texture::<RtObj<RtTexture>>;
+        let (copies, copy_bytes) = (
+            crate::rt_platform::diag::SURFACE_PLANE_COPIES_CODE,
+            crate::rt_platform::diag::SURFACE_PLANE_COPY_BYTES_CODE,
+        );
+        diag(Some(&luma), 0, (0x5a00_0001, 0), (0x1, 128), "over-buffer");
+        diag(Some(&chroma), 0, (0x5a00_0001, 1), (0x1, 64), "over-buffer");
+        let before = (counted(copies), counted(copy_bytes));
+        assert_eq!(gpu_texels(), texels);
+        assert_eq!((counted(copies), counted(copy_bytes)), before);
+
+        // Over a buffer in an imported block, rt copies a texture into an image of its own at each
+        // submission that uses it: counted once a committed command buffer where it is a surface
+        // texture, with its rows' bytes, 32 apart times 4; not before the decoder noted it as one.
+        let layout = Layout::from_size_align(0x10000, 0x10000).expect("a layout");
+        // SAFETY: the layout's size is not 0.
+        let memory = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!memory.is_null());
+        for i in 0..4096 {
+            // SAFETY: within the allocation.
+            unsafe { memory.add(i).write(u8::try_from(i % 239).expect("a byte")) };
+        }
+        let at = memory.expose_provenance();
+        let free: NoCopyDeallocator = Box::new(move || {
+            // SAFETY: allocated above with `layout`, and freed once, as rt lets the import go.
+            unsafe { std::alloc::dealloc(std::ptr::with_exposed_provenance_mut(at), layout) }
+        });
+        // SAFETY: the memory stays allocated until the deallocator runs.
+        let bytes = unsafe { HostRange::new(HostPtr::from_ptr(memory), 4096) };
+        let made = device.new_buffer_over_host_memory(on, bytes, 0, Some(free));
+        let imported = made.expect("never a raise").expect("a no-copy buffer");
+        let made = imported.new_texture_over_surface_plane(
+            on,
+            &descriptor(20, 8, 4),
+            plane(0, 32, Some(facts)),
+        );
+        let luma = made.expect("never a raise").expect("a texture over an import's plane 0");
+        let copied = || {
+            let made = queue.command_buffer(on).expect("never a raise");
+            let made = made.expect("a command buffer");
+            let encoder = made.blit_encoder(on).expect("never a raise");
+            let encoder = encoder.expect("a blit encoder");
+            // Twice, which counts once.
+            for _ in 0..2 {
+                let cmd = BlitCmd::CopyTextureToBuffer {
+                    source_texture: &luma,
+                    source_slice: 0,
+                    source_level: 0,
+                    source_origin: MtlOrigin::default(),
+                    source_size: MtlSize::new(8, 4, 1),
+                    destination_buffer: &out,
+                    destination_offset: 0,
+                    destination_bytes_per_row: 16,
+                    destination_bytes_per_image: 64,
+                };
+                assert_eq!(encoder.encode(on, cmd), Ok(()));
+            }
+            assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+            assert_eq!(made.commit(on), Ok(()));
+            assert_eq!(made.wait_until_completed(on), Ok(()));
+            assert_eq!(made.status(), CommandBufferStatus::COMPLETED);
+            read(out.contents(), 64)
+        };
+        let rows: Vec<u8> = (0..4_usize)
+            .flat_map(|row| {
+                (32 + 32 * row..48 + 32 * row).map(|i| u8::try_from(i % 239).expect("a byte"))
+            })
+            .collect();
+        assert_eq!(copied(), rows);
+        assert_eq!((counted(copies), counted(copy_bytes)), before);
+        diag(Some(&luma), 0, (0x5a00_0002, 0), (0x1, 128), "over-buffer");
+        assert_eq!(copied(), rows);
+        assert_eq!(
+            (counted(copies), counted(copy_bytes)),
+            (before.0 + 1, before.1 + 128)
+        );
+
         let (metal, unbuilt) = (RtRefusal::Refused.code(), Unbuilt::IosurfaceTexture.code());
         let before = (counted(metal), counted(unbuilt));
         let lone = SurfaceFacts {

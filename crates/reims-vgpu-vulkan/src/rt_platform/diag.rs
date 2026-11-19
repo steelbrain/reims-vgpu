@@ -49,6 +49,14 @@
 //! Totals, numbers, formats, sizes and usages only: no name, label or byte of the guest's leaves
 //! the process. A diagnostic, which the contract leaves free: nothing the guest observes changes,
 //! and a texture's bytes are only read.
+//!
+//! One count is not a diagnostic but a degradation code on the counts line: each use, by a
+//! committed command buffer, of a guest surface texture over a buffer in an imported block,
+//! which rt copies into an image of its own at each submission where Metal reads the surface's
+//! bytes in place, and its bytes ([`SURFACE_PLANE_COPIES_CODE`]). A texture over a device
+//! cache's buffer, in a block of rt's own, is not counted: rt copies one only where its rows or
+//! place are off the device's linear lines, which the cache lays its planes on
+//! (`crate::gpu::resource`).
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -706,13 +714,29 @@ impl Uses {
                 Use::BlittedInto => how.blitted_into = true,
             }
         }
+        let (mut plane_copies, mut plane_bytes) = (0, 0);
         for (made, how) in by_texture.into_values() {
             if let Some(over) = &made.over {
                 over.submitted(how);
+                if made.on_plane.get().is_some() {
+                    plane_copies += 1;
+                    plane_bytes += over.len;
+                }
             }
         }
+        crate::answer::count_kind_by(SURFACE_PLANE_COPIES_CODE, plane_copies);
+        crate::answer::count_kind_by(SURFACE_PLANE_COPY_BYTES_CODE, plane_bytes);
     }
 }
+
+/// The code of the command buffers' uses of a guest surface texture over a buffer in an imported
+/// block, which rt copies the bytes of into the texture's image of its own at each submission
+/// that uses it: one for each texture a committed command buffer used ([`Uses::submitted`]).
+pub const SURFACE_PLANE_COPIES_CODE: &str = "rt-surface-plane-copies";
+
+/// The code of those uses' bytes: the texture's rows in the buffer, its rows apart times its
+/// height, as far as the buffer goes.
+pub const SURFACE_PLANE_COPY_BYTES_CODE: &str = "rt-surface-plane-copy-bytes";
 
 // ----- Gaps.
 
