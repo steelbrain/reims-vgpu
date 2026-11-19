@@ -698,10 +698,12 @@ impl Shared {
     }
 
     /// Places `block` at the lowest free address that holds it and asks the host to map it: the
-    /// address, or `None` where the block went back, the range full.
+    /// address, or `None` where the block went back, the range full or the pool closed.
     fn place(&self, source: &dyn BlockSource, block: BlockInfo) -> Option<u64> {
         let mut st = self.state.lock();
-        let Some(contents) = block.contents else {
+        // A block made while the device was released goes back with no word to the host, which
+        // removed its pieces before the release.
+        let Some(contents) = block.contents.filter(|_| !st.closed) else {
             drop(st);
             let _ = source.release_block(block.id);
             return None;

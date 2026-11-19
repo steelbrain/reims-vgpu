@@ -632,6 +632,60 @@ fn a_take_that_fits_no_piece_grows_the_pool_and_waits_for_the_hosts_map() {
     assert_eq!(host.wait_for(2)[1], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
 }
 
+/// A source whose takes wait until the test opens its gate.
+struct Gated {
+    blocks: HostBlocks,
+    open: Mutex<bool>,
+    opened: Condvar,
+}
+
+impl BlockSource for Gated {
+    fn take_block(&self, class: MemoryClass, len: u64) -> Result<BlockInfo, BlockError> {
+        let mut open = self.open.lock();
+        while !*open {
+            self.opened.wait(&mut open);
+        }
+        drop(open);
+        self.blocks.take_block(class, len)
+    }
+
+    fn release_block(&self, block: BlockId) -> Result<(), BlockError> {
+        self.blocks.release_block(block)
+    }
+}
+
+/// A block the source hands out once the device's release began goes back to it, and the host
+/// is asked to map nothing: it removed its pieces before the release
+#[test]
+fn a_block_made_during_the_release_goes_back_with_no_add() {
+    let host = Arc::new(Host::default());
+    let gated = Arc::new(Gated {
+        blocks: HostBlocks::new(),
+        open: Mutex::new(false),
+        opened: Condvar::new(),
+    });
+    let source: Arc<dyn BlockSource> = Arc::clone(&gated) as _;
+    let pool = Pool::with_delay(range(64), host.pool_host(), LONG, now(), source).unwrap();
+    pool.grow(BLOCK_LEN);
+    // The pool's thread waits in the source's take.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !pool.shared.state.lock().asks.is_empty() {
+        assert!(Instant::now() < deadline, "the ask was not taken up");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let shared = Arc::clone(&pool.shared);
+    let release = std::thread::spawn(move || drop(pool));
+    while !shared.state.lock().closed {
+        assert!(Instant::now() < deadline, "the release did not begin");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    *gated.open.lock() = true;
+    gated.opened.notify_all();
+    release.join().unwrap();
+    assert!(host.calls().is_empty(), "the pool asked {:?}", host.calls());
+    assert_eq!(gated.blocks.counts().0, 0, "the block went back");
+}
+
 #[test]
 fn a_take_whose_context_closed_before_its_answer_is_given_back_unanswered() {
     let host = Arc::new(Host::default());
