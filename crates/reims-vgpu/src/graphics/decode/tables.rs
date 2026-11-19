@@ -163,8 +163,9 @@ pub(crate) struct Entry<P: Platform> {
     /// other object.
     pub(crate) laid_use: Option<LaidUse>,
     /// A texture, or a view of one, that is a view of a shape's image over a device cache in the
-    /// per-shape form, and the reference it holds to the shape ([`ShapeUse`]); `None` for any
-    /// other object.
+    /// per-shape form, and the reference it holds to the shape ([`ShapeUse`]); in the default
+    /// form, one over a cache's buffer, and its reference to the shape the per-shape form would
+    /// give it, in the cache's shadow, for the counts alone. `None` for any other object.
     pub(crate) shape: Option<ShapeUse>,
     /// A no-copy buffer whose identity the guest may hand on with no message naming it, and
     /// whether it did ([`super::escape`]); `None` for any other object.

@@ -209,7 +209,8 @@ pub(crate) struct Shape<T> {
     /// Owes a fill from the buffer before anything reads it (a new shape, rule 2; or the buffer
     /// took bytes no shape holds, a video op's picture).
     pub(crate) owed: bool,
-    /// The caches' clock at its last use: its make or a texture made of it.
+    /// The caches' clock at its last use: its make, a texture made of it, or a use of its surface
+    /// while a texture referenced it ([`ShapeTable::touch`]).
     used: u64,
 }
 
@@ -290,6 +291,21 @@ impl<T> ShapeTable<T> {
     /// The shapes' bytes ([`ShapeKey::bytes`]).
     pub(crate) fn bytes(&self) -> u64 {
         self.shapes.iter().map(|s| s.bytes).sum()
+    }
+
+    /// Whether a live guest texture references one of the shapes.
+    pub(crate) fn any_referenced(&self) -> bool {
+        self.shapes.iter().any(Shape::referenced)
+    }
+
+    /// The entry's surface was used now (`now`, the caches' clock): named by a command buffer,
+    /// presented or filled. Each referenced shape counts as used then, so a shape whose last
+    /// texture goes keeps the last use of the surface while it was referenced as its own
+    /// ([`Self::sweep`]).
+    pub(crate) fn touch(&mut self, now: u64) {
+        for shape in self.shapes.iter_mut().filter(|s| s.referenced()) {
+            shape.used = now;
+        }
     }
 
     /// The shapes.
@@ -491,6 +507,24 @@ mod tests {
         let (_, again) = table.insert(key(50, 4), 50, true, 21);
         assert!(!again);
         drop(held);
+    }
+
+    /// A use of the surface counts as a use of each shape a texture references then, and of
+    /// no other: a shape whose texture goes ranks by the surface's last use while it was held.
+    #[test]
+    fn a_use_of_the_surface_touches_its_referenced_shapes() {
+        let mut table = ShapeTable::<u64>::default();
+        let (held, _) = table.insert(key(10, 4), 10, false, 0);
+        for w in 11..15 {
+            drop(table.insert(key(w, 4), w, false, w));
+        }
+        assert!(table.any_referenced());
+        table.touch(30);
+        drop(held);
+        assert!(!table.any_referenced());
+        drop(table.insert(key(15, 4), 15, false, 31));
+        let gone: Vec<u64> = table.sweep().iter().map(|s| s.image).collect();
+        assert_eq!(gone, vec![11], "the oldest untouched, not the one held until 30");
     }
 
     /// The budget trims the least recently used unreferenced shape first, never a referenced one;

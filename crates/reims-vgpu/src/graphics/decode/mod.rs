@@ -1610,9 +1610,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                      host's video, {} not; {} made a dma-buf for the host's video to decode \
                      into, {} not; {} made with their surface's first plane on 256 bytes of \
                      their memory; {} laid out at the GPU's pitch; the GPU's time in the \
-                     fills {} ms, in the copies out {} ms; {} MiB held at most, {} blocks of {} \
-                     MiB in place past the caches' budget; {} releases' copies waited for their \
-                     turns, {} ms in all, {} ms at most",
+                     fills {} ms, in the copies out {} ms; {} MiB held at most ({} MiB of \
+                     surfaces a texture's shape referenced, {} MiB of surfaces none did, {} MiB \
+                     for the host's video), the per-shape form's bound {} MiB at most (its \
+                     referenced shapes and 4 unreferenced a cache, the host's video's left out); \
+                     {} blocks of {} MiB in place past the caches' budget; {} releases' copies \
+                     waited for their turns, {} ms in all, {} ms at most",
                     d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.decode_firsts,
                     d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.refills, d.refills_kept,
@@ -1626,7 +1629,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                     d.fills_deferred, d.cpu_waits, d.doorbell_free, d.doorbell_waits,
                     d.exportable, d.unexportable, d.dma_buf, d.no_dma_buf, d.aligned,
                     d.repitched, d.fill_gpu_ns / 1_000_000, d.out_gpu_ns / 1_000_000,
-                    d.held_most >> 20, d.past_budget, d.past_budget_bytes >> 20, d.paced,
+                    d.held_most >> 20, d.held_referenced >> 20, d.held_kept >> 20,
+                    d.held_video >> 20, d.shape_bound_most >> 20, d.past_budget,
+                    d.past_budget_bytes >> 20, d.paced,
                     d.paced_us / 1000, d.paced_most_us / 1000
                 );
             }
@@ -4180,7 +4185,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                                 surface: Some((m.iosurface_id, m.plane, facts)),
                             });
                         }
-                        (made, None)
+                        // Over a cache in the default form, the shape the per-shape form would
+                        // make, for its counts alone (`surface_shapes`).
+                        let shadow = made.as_ref().and_then(|_| {
+                            self.shadow_surface_shape(&m, span.map(|(at, _)| at), &info)
+                        });
+                        (made, shadow)
                     }
                 };
                 match made {

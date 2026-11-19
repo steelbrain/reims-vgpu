@@ -469,6 +469,11 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// The images of the shapes of texture made over the surface, in the per-shape form
     /// ([`shapes`]); none in the default form.
     shapes: ShapeTable<P::Texture>,
+    /// In the default form, the shapes the per-shape form would make over the surface, with no
+    /// images and no bytes held: what the counts of the per-shape form's bound read
+    /// ([`SurfaceCaches::shadow_shape`]); none in the per-shape form, and none of a cache for the
+    /// host's video.
+    shadow: ShapeTable<()>,
 }
 
 /// A laid-out cache's wide home (the module doc, "Wider than the plane"): a buffer that keeps
@@ -1436,6 +1441,18 @@ pub(crate) struct CacheCounts {
     pub(crate) past_budget: u64,
     pub(crate) past_budget_bytes: u64,
     pub(crate) held_most: u64,
+    /// The bytes held when they were the most held ([`SurfaceCaches::hold_bytes`]): in caches of
+    /// surfaces a live guest texture's shape references, in those of surfaces none does, and in
+    /// caches for the host's video ([`SurfaceCache::life`]), whose decoders' pictures bound them.
+    pub(crate) held_referenced: u64,
+    pub(crate) held_kept: u64,
+    pub(crate) held_video: u64,
+    /// The most bytes the per-shape form's bound held at once over the caches not for the
+    /// host's video: each referenced shape, and the [`shapes::UNREFERENCED_KEPT`] unreferenced
+    /// ones of each cache used last, by their texels ([`shapes::ShapeKey::bytes`]); the shadow
+    /// shapes' in the default form ([`SurfaceCaches::shadow_shape`]), the images' in the
+    /// per-shape form.
+    pub(crate) shape_bound_most: u64,
     /// Releases whose copy into the pages waited for its turn behind another release's
     /// ([`ReleasePace`]), the microseconds they waited in all, and the most one waited.
     pub(crate) paced: u64,
@@ -1986,6 +2003,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 life,
                 wide: None,
                 shapes: ShapeTable::default(),
+                shadow: ShapeTable::default(),
             },
         );
         let pages = Pages {
@@ -2212,6 +2230,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 life,
                 wide: None,
                 shapes: ShapeTable::default(),
+                shadow: ShapeTable::default(),
             },
         );
         if carries {
@@ -2411,10 +2430,70 @@ impl<P: Platform> SurfaceCaches<P> {
         budget.saturating_sub(self.cache_bytes.saturating_sub(going))
     }
 
-    /// A cache of `bytes` taken: the bytes every cache holds, and the most they held.
+    /// A cache of `bytes` taken: the bytes every cache holds, and the most they held, split at
+    /// each new most by what holds them ([`CacheCounts::held_referenced`]).
     fn hold_bytes(&mut self, bytes: u64) {
         self.cache_bytes += bytes;
-        self.cache_bytes_most = self.cache_bytes_most.max(self.cache_bytes);
+        if self.cache_bytes <= self.cache_bytes_most {
+            return;
+        }
+        self.cache_bytes_most = self.cache_bytes;
+        let (mut referenced, mut kept, mut video) = (0, 0, 0);
+        for cache in self.by_block.values() {
+            let into = if cache.life.is_some() {
+                &mut video
+            } else if cache.shapes.any_referenced() || cache.shadow.any_referenced() {
+                &mut referenced
+            } else {
+                &mut kept
+            };
+            *into += cache.held();
+        }
+        self.counts.held_referenced = referenced;
+        self.counts.held_kept = kept;
+        self.counts.held_video = video;
+    }
+
+    /// The bytes the per-shape form's bound holds now over the caches not for the host's video,
+    /// kept as the most it held where more ([`CacheCounts::shape_bound_most`]).
+    fn note_shape_bound(&mut self) {
+        let bound: u64 = (self.by_block.values())
+            .filter(|cache| cache.life.is_none())
+            .map(|cache| cache.shapes.bytes() + cache.shadow.bytes())
+            .sum();
+        let most = &mut self.counts.shape_bound_most;
+        *most = (*most).max(bound);
+    }
+
+    /// The block at `block`'s surface was used: its cache's referenced shapes, and in the default
+    /// form its shadow's, count as used now ([`ShapeTable::touch`]).
+    fn touch_shapes(&mut self, block: u64) {
+        let Some(cache) = self.by_block.get_mut(&block) else {
+            return;
+        };
+        self.shape_clock += 1;
+        cache.shapes.touch(self.shape_clock);
+        cache.shadow.touch(self.shape_clock);
+    }
+
+    /// In the default form, a reference to the shape `key` the per-shape form would make over
+    /// the block at `block`'s cache for a texture made over its buffer, kept in the cache's
+    /// shadow ([`SurfaceCache::shadow`]) under the per-shape form's bound, for the counts of the
+    /// bytes that bound would hold ([`Self::note_shape_bound`]). `None` in the per-shape form, and
+    /// where the block has no cache or its cache is for the host's video.
+    fn shadow_shape(&mut self, block: u64, key: &ShapeKey) -> Option<shapes::ShapeRef> {
+        if self.shaped {
+            return None;
+        }
+        let cache = self.by_block.get_mut(&block).filter(|c| c.life.is_none())?;
+        self.shape_clock += 1;
+        if let Some((reference, _)) = cache.shadow.find(key, self.shape_clock) {
+            return Some(reference);
+        }
+        let (reference, _) = cache.shadow.insert(*key, (), false, self.shape_clock);
+        drop(cache.shadow.sweep());
+        self.note_shape_bound();
+        Some(reference)
     }
 
     /// Has a deferred block ask with its surface's layout from now on, as the device offers
@@ -2623,6 +2702,7 @@ impl<P: Platform> SurfaceCaches<P> {
             }
         }
         let count = self.hold(block, u.flags & RGFX_SURFACE_USE_WRITES != 0);
+        self.touch_shapes(block);
         let follows = filled
             .and_then(|()| self.follow(cb, count))
             .and_then(|follows| self.home_in(cb, block).map(|()| follows))
@@ -2767,7 +2847,9 @@ impl<P: Platform> SurfaceCaches<P> {
             self.counts.shapes.again += 1;
         }
         self.hold_bytes(bytes);
-        (Some((reference, made)), self.sweep_shapes(block))
+        let gone = self.sweep_shapes(block);
+        self.note_shape_bound();
+        (Some((reference, made)), gone)
     }
 
     /// The shapes that go: the block at `block`'s unreferenced ones past the bound
@@ -3553,6 +3635,7 @@ impl<P: Platform> SurfaceCaches<P> {
         block: u64,
         generation: u64,
     ) -> RaiseResult<Option<u64>> {
+        self.touch_shapes(block);
         if !self.make_transfer(device)? {
             return Ok(None);
         }
@@ -4605,6 +4688,12 @@ impl<P: Platform> Caches<P> {
         count(&mut self.state.lock().counts.shapes);
     }
 
+    /// In the default form, a reference to the shape `key` the per-shape form would make over the
+    /// block at `block`'s cache ([`SurfaceCaches::shadow_shape`]), for the counts alone.
+    pub(crate) fn shadow_shape(&self, block: u64, key: &ShapeKey) -> Option<shapes::ShapeRef> {
+        self.state.lock().shadow_shape(block, key)
+    }
+
     /// Whether the transfer queue and the end events are made with the command queues
     /// ([`Self::queue_made`]): not where the host's GPU shares the CPU's memory, whose first copy
     /// makes them.
@@ -5155,6 +5244,7 @@ impl<P: Platform> Caches<P> {
     ) -> RaiseResult<Option<FillWait>> {
         let mut state = self.state.lock();
         state.after_recovery(device);
+        state.touch_shapes(block);
         if !state.needs_fill_at(block, generation) {
             return Ok(None);
         }
