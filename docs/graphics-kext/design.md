@@ -4308,7 +4308,12 @@ or its holder's close, to any process, and the region keeps its bytes across
 the device's reset and the guest's reboot; so before a new block is in the
 process's window the kext writes zeros over every span the window maps of it,
 each through a kernel mapping of the cache mode the window maps it with, and a
-surface's new block over the part its holders map (`RgfxBlockZero.hpp`; the
+surface's new block over the part its holders map. Those mappings are two,
+one a mode, of the whole blocks' range, made once at the kext's start and kept:
+they hold the kernel's address space and page tables only, and no memory of
+the host's, since no page of the region is touched until it is zeroed or used.
+On a Windows host (WHP), the kext's zeros are the first touch of a region page
+that was never touched before (`RgfxBlockZero.hpp`; the
 kext's feature bit 1 << 14 `ZeroedBlocks`, after which the bundle zeroes no
 region slab it takes; the guest's `guest/bundle/tools/block_zero_probe.c`
 checks it across processes). The host keeps the grant until the block's `BLOCK_RELEASE` or the context's

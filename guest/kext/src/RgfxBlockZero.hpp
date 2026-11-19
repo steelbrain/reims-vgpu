@@ -5,11 +5,13 @@
 // guest's reboot. So each new block, before any process's window maps it, has zeros written over
 // exactly the spans that window maps (rgfxBlockZeroSpans, which allocBlock maps from too), each
 // through a kernel mapping of the cache mode the window maps it with: the zeros and the process's
-// stores never meet through mappings of two modes. A surface's new block is zeroed over the part
-// its holders map (rgfxSurfaceZeroSpan): the whole copy for a copy block, the header for one in
-// place; the runs past that part are the kext's own, never mapped into a process. A block held
-// again (a surface's, by a process that shares it, or revived) holds its own surface's bytes, and
-// a pages block is never in a window: neither is zeroed.
+// stores never meet through mappings of two modes. Those kernel mappings are of the whole blocks'
+// range, one a mode, made at the kext's start and kept, so a block's zeros cost only their stores;
+// a span is mapped alone only where the kernel would not make them. A surface's new block is
+// zeroed over the part its holders map (rgfxSurfaceZeroSpan): the whole copy for a copy block, the
+// header for one in place; the runs past that part are the kext's own, never mapped into a
+// process. A block held again (a surface's, by a process that shares it, or revived) holds its own
+// surface's bytes, and a pages block is never in a window: neither is zeroed.
 //
 // Header-only and free of the kernel's headers, so its native test (tests/block_zero_test.cpp)
 // builds it as the kext does.
@@ -83,9 +85,9 @@ inline RgfxZeroSpan rgfxSurfaceZeroSpan(uint64_t offset, uint64_t size)
 }
 
 // What the zeroing took, for the kext's log line: by kind, each block's time from its first
-// kernel mapping made to its last taken down, and its bytes; of every kind, the time in making and
-// taking down the mappings and the time in the stores; and the grants the kernel would not map a
-// span for, which failed.
+// span's zeros begun to its last's done, and its bytes; of every kind, the time in making and
+// taking down a span's own mappings (none where the kept ones hold it) and the time in the
+// stores; and the grants the kernel would not map a span for, which failed.
 struct RgfxZeroStats {
 	RgfxLatency took[kRgfxZeroKinds];
 	uint64_t ns[kRgfxZeroKinds];

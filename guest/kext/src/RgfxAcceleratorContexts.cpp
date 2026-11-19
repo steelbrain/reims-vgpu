@@ -230,6 +230,10 @@ struct ContextState {
 	IOMemoryMap *doorbellMap;
 	volatile UInt8 *doorbellBase;
 	RgfxDoorbellPages doorbellPages;
+	// The kernel's own mappings of the blocks' range, one a cache mode (kZeroMapWriteBack,
+	// kZeroMapWriteCombined), which zeroSpan writes a new block's zeros through: set at the
+	// state's start and kept for the kernel's life, null where the kernel would not make one.
+	IOMemoryMap *zeroMaps[2];
 };
 ContextState state = {nullptr,
                       kRgfxContextSlotsEmpty,
@@ -246,7 +250,8 @@ ContextState state = {nullptr,
                       nullptr,
                       nullptr,
                       nullptr,
-                      {}};
+                      {},
+                      {nullptr, nullptr}};
 IOLock *&contextLock = state.contextLock;
 RgfxContextSlots &slots = state.slots;
 UInt32 &contextUnits = state.contextUnits;
@@ -431,18 +436,67 @@ UInt64 nanosSince(UInt64 then, UInt64 now)
 	return ns;
 }
 
+// The kept mappings' cache modes (ContextState::zeroMaps).
+enum : UInt32 { kZeroMapWriteBack, kZeroMapWriteCombined, kZeroMapModes };
+
+// The blocks' range mapped into the kernel once a cache mode, write-back from `region` and
+// write-combined from its write-combined descriptor, for zeroSpan, at the state's start. A
+// mapping made once costs a new block no mapping of its own: made and taken down for each span,
+// the mappings took 93% of the zeroing's time over a boot, and its longest waits, 114 ms for a
+// staging chunk and 19 ms for a surface header (rzboot2, a macOS 26.7.2 guest on a 780M host).
+// It holds the kernel's address space and page tables, and no memory of the host's: no page of
+// the region is touched until it is zeroed or used. Where the kernel will not make one, each
+// span is mapped alone for its zeros, as before.
+void keepZeroMaps(IODeviceMemory *region)
+{
+	const UInt64 length = blocksEnd > blocksStart ? blocksEnd - blocksStart : 0;
+	for (UInt32 mode = 0; mode < kZeroMapModes; mode++) {
+		const bool combined = mode == kZeroMapWriteCombined;
+		IODeviceMemory *from = combined ? state.combinedRegion : region;
+		if (!from || !length)
+			continue;
+		const IOOptionBits cache = combined ? kIOMapWriteCombineCache : kIOMapCopybackCache;
+		const UInt64 made = mach_absolute_time();
+		state.zeroMaps[mode] =
+		    from->createMappingInTask(kernel_task, 0, kIOMapAnywhere | cache, blocksStart, length);
+		const UInt64 ns = nanosSince(made, mach_absolute_time());
+		if (state.zeroMaps[mode])
+			IOLog("RgfxAccelerator: the blocks' range is kept mapped %s for their zeros: %llu MiB, "
+			      "made in %llu us\n",
+			      combined ? "write-combined" : "write-back", length >> 20, ns / 1000);
+		else
+			IOLog("RgfxAccelerator: the blocks' range was not kept mapped %s: each span is mapped "
+			      "alone for its zeros\n",
+			      combined ? "write-combined" : "write-back");
+	}
+}
+
 // Zeros the span `s` of `region` (RgfxBlockZero.hpp) through a kernel mapping of the cache mode a
 // window maps it with, as RgfxAcceleratorUserClient::mapSpan maps it: a write-combined span from
 // the region's write-combined descriptor where there is one, else write-back from the region's
-// own. The write-combined stores are fenced (SFENCE), so they are in the region before any window
-// maps the span. Adds the time its mapping took, made and taken down, to `*mapNs`, and its stores'
-// to `*storeNs`. False where the kernel would not map the span.
+// own; through the mode's kept mapping (keepZeroMaps), else one made for the span. The
+// write-combined stores are fenced (SFENCE), so they are in the region before any window maps the
+// span. Adds the time a mapping of its own took, made and taken down, to `*mapNs`, and its
+// stores' to `*storeNs`. False where the kernel would not map the span.
 bool zeroSpan(IODeviceMemory *region, const RgfxZeroSpan &s, UInt64 *mapNs, UInt64 *storeNs)
 {
 	IODeviceMemory *combined = s.writeCombined ? state.combinedRegion : nullptr;
 	IODeviceMemory *from = combined ? combined : region;
 	if (!from)
 		return false;
+	IOMemoryMap *kept = state.zeroMaps[combined ? kZeroMapWriteCombined : kZeroMapWriteBack];
+	if (kept && s.offset >= blocksStart && s.offset - blocksStart <= kept->getLength() &&
+	    s.length <= kept->getLength() - (s.offset - blocksStart)) {
+		const UInt64 start = mach_absolute_time();
+		bzero(reinterpret_cast<void *>(kept->getVirtualAddress() + (s.offset - blocksStart)),
+		      static_cast<size_t>(s.length));
+#if defined(__x86_64__)
+		if (combined)
+			__builtin_ia32_sfence();
+#endif
+		*storeNs += nanosSince(start, mach_absolute_time());
+		return true;
+	}
 	const IOOptionBits cache = combined ? kIOMapWriteCombineCache : kIOMapCopybackCache;
 	const UInt64 made = mach_absolute_time();
 	IOMemoryMap *map =
@@ -982,6 +1036,7 @@ bool RgfxAccelerator::startContexts()
 				      !bar ? "not there" : bar->getLength() < RGFX_DOORBELLS_SIZE ? "too small"
 				                                                                 : "not mapped");
 		}
+		keepZeroMaps(region);
 		__atomic_store_n(&contextLock, lock, __ATOMIC_RELEASE);
 		IOLog("RgfxAccelerator: blocks 0x%llx-0x%llx, %u contexts of %u GiB of GPU addresses "
 		      "(maxBufferLength %llu MiB), surfaces %s, deferred blocks' budget %llu MiB; "
