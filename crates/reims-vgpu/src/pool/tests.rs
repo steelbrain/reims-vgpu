@@ -653,6 +653,24 @@ fn a_piece_asked_ahead_of_the_first_take_serves_it_with_no_wait() {
     assert_eq!(host.wait_for(2)[1], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
 }
 
+/// A take carved from the headroom piece has the pool's thread make the next at once, not once
+/// the take's worker went idle: on a clock that stands still, as a test platform's does, the
+/// worker never goes
+#[test]
+fn a_take_that_uses_the_headroom_piece_has_the_next_made_at_once() {
+    let host = Arc::new(Host::default());
+    let still = (now())();
+    let clock: PoolNow = Box::new(move || still);
+    let source: Arc<dyn BlockSource> = Arc::new(HostBlocks::new());
+    let pool = Pool::with_delay(range(64), host.pool_host(), LONG, clock, source).unwrap();
+    let ledger = pool.ledger();
+    assert!(ledger.keep_headroom());
+    assert_eq!(host.wait_for(1), [Call::Add(BASE, BLOCK_LEN)]);
+    pool.added(BASE).unwrap();
+    assert_eq!(answer(&take(&ledger, 1, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
+    assert_eq!(host.wait_for(2)[1], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
+}
+
 /// A source whose takes wait until the test opens its gate.
 struct Gated {
     blocks: HostBlocks,

@@ -284,6 +284,8 @@ impl PoolLedger {
         taker.working = true;
         st.workers = st.workers.saturating_add(1);
         drop(st);
+        // The carve may have asked the pool's thread for a block, as headroom.
+        self.shared.changed.notify_all();
         let shared = Arc::clone(&self.shared);
         let spawned = std::thread::Builder::new()
             .name("reims-vgpu.graphics-pool-take".into())
@@ -686,6 +688,8 @@ impl Shared {
                 return Grown::Stale;
             }
             if let Some((at, serial)) = st.carve(context, len) {
+                // The carve may have asked the pool's thread for a block, as headroom.
+                self.changed.notify_all();
                 let waited = asked.map(|since| (self.now)().saturating_duration_since(since));
                 return Grown::At(at, serial, waited);
             }
