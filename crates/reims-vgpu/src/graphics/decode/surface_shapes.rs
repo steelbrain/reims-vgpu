@@ -764,7 +764,11 @@ mod tests {
         assert!(update < wait && wait < first(&calls, TO_BUFFER));
         assert_eq!(written_back(&calls)[0].1, cache);
         let counts = r.dec.caches().counts().shapes;
-        let rule_1 = (counts.overlap_copies, counts.overlap_bytes, counts.overlap_dropped);
+        let rule_1 = (
+            counts.overlap_copies,
+            counts.overlap_bytes,
+            counts.overlap_dropped,
+        );
         assert_eq!(rule_1, (1, 16 * 4 * 4, 1));
         assert_eq!((counts.dropped, counts.unordered), (1, 0));
         r.p.world().complete_all(CompleteOn::Caller);
@@ -780,7 +784,10 @@ mod tests {
         let mark = r.p.call_log().mark();
         write(&mut r, 0x102, 22, (16, 4));
         let (out, into) = overlaps(&r.p.call_log().since(mark), &[a, b]);
-        assert_eq!((out, into), (vec![(b, texels(16, 4))], vec![(a, texels(16, 4))]));
+        assert_eq!(
+            (out, into),
+            (vec![(b, texels(16, 4))], vec![(a, texels(16, 4))])
+        );
         r.p.world().complete_all(CompleteOn::Caller);
         let mark = r.p.call_log().mark();
         let downloaded = download(&r, BLOCK);
@@ -814,7 +821,10 @@ mod tests {
         let mark = r.p.call_log().mark();
         write(&mut r, 0x102, 21, (32, 8));
         let (out, into) = overlaps(&r.p.call_log().since(mark), &[a, b]);
-        assert_eq!((out, into), (vec![(a, texels(16, 4))], vec![(b, texels(16, 4))]));
+        assert_eq!(
+            (out, into),
+            (vec![(a, texels(16, 4))], vec![(b, texels(16, 4))])
+        );
         let counts = r.dec.caches().counts().shapes;
         assert_eq!((counts.overlap_dropped, counts.dropped), (0, 0));
     }
@@ -832,7 +842,10 @@ mod tests {
         let ops = [write_op(22, (16, 4)), write_op(21, (32, 8))];
         blits_with(&mut r, 0x101, true, &ops);
         let (out, into) = overlaps(&r.p.call_log().since(mark), &[a, b]);
-        assert_eq!((out, into), (vec![(a, texels(16, 4))], vec![(b, texels(16, 4))]));
+        assert_eq!(
+            (out, into),
+            (vec![(a, texels(16, 4))], vec![(b, texels(16, 4))])
+        );
         assert_eq!(r.dec.caches().counts().shapes.unordered, 1);
         r.p.world().complete_all(CompleteOn::Caller);
         let mark = r.p.call_log().mark();

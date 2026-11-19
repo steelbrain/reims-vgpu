@@ -748,7 +748,14 @@ impl RenderPipeline for Fk<kind::RenderPipeline> {
 
     /// Logged as [`TEXTURE_SLOT_WRITES`]; the script's answer, else none known.
     fn texture_slot_writes(&self, function: RenderFunction, index: u64) -> Option<bool> {
-        let args = vec![Arg::U64(function as u64), Arg::U64(index)];
+        let function = match function {
+            RenderFunction::Vertex => 0,
+            RenderFunction::Fragment => 1,
+            RenderFunction::Tile => 2,
+            RenderFunction::Object => 3,
+            RenderFunction::Mesh => 4,
+        };
+        let args = vec![Arg::U64(function), Arg::U64(index)];
         self.get_logged(TEXTURE_SLOT_WRITES, args, || None)
     }
 }

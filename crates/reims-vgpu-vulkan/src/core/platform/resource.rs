@@ -365,10 +365,15 @@ pub trait ComputePipeline<P: Platform>: Handle {
 /// ([`RenderPipeline::texture_slot_writes`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RenderFunction {
+    /// The vertex function: `setVertexTexture:atIndex:`.
     Vertex,
+    /// The fragment function: `setFragmentTexture:atIndex:`.
     Fragment,
+    /// The tile function: `setTileTexture:atIndex:`.
     Tile,
+    /// The object function: `setObjectTexture:atIndex:`.
     Object,
+    /// The mesh function: `setMeshTexture:atIndex:`.
     Mesh,
 }
 
