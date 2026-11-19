@@ -9776,6 +9776,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_CURSOR_COLOR
             | RGFX_FEATURE_BUFFER_ESCAPED
             | RGFX_FEATURE_SURFACE_REFILL
+            | RGFX_FEATURE_PRIVATE_BLOCKS
             | slots_in_pages
             | sixteen_bit
             | if carries {
@@ -9836,6 +9837,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
                 | RGFX_FEATURE_CURSOR_COLOR
                 | RGFX_FEATURE_BUFFER_ESCAPED
                 | RGFX_FEATURE_SURFACE_REFILL
+                | RGFX_FEATURE_PRIVATE_BLOCKS
                 | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
                 | RGFX_FEATURE_READ_ONLY_PAGES
                 | RGFX_FEATURE_PAGES_16K
@@ -9884,6 +9886,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_CURSOR_COLOR
             | RGFX_FEATURE_BUFFER_ESCAPED
             | RGFX_FEATURE_SURFACE_REFILL
+            | RGFX_FEATURE_PRIVATE_BLOCKS
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);
@@ -14295,14 +14298,20 @@ fn a_guest_s_private_block_is_taken_held_by_its_objects_and_given_back() {
     );
     let second = PRIVATE_BASE + 0x2_8000;
     guest.send(&device, private_take(2, 0x1_0000));
-    assert_eq!(private_block(&mut guest), (RGFX_STATUS_OK, second, 0x1_0000));
+    assert_eq!(
+        private_block(&mut guest),
+        (RGFX_STATUS_OK, second, 0x1_0000)
+    );
     guest.send(&device, private_take(1, 0));
     assert_eq!(
         private_block(&mut guest),
         (RGFX_STATUS_INVALID_ARGUMENT, 0, 0)
     );
     // A buffer in the block is pinned at its address, and holds the block.
-    guest.send(&device, private_buffer_at(obj(1, 1), PRIVATE_BASE + 0x1000, 0x1000));
+    guest.send(
+        &device,
+        private_buffer_at(obj(1, 1), PRIVATE_BASE + 0x1000, 0x1000),
+    );
     assert!(eventually(|| device.decoder_object_count() == 1));
     assert_eq!(
         device.decoder_gpu_address(obj(1, 1)),

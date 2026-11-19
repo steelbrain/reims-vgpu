@@ -80,10 +80,9 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_ANSWERS,
     RGFX_FEATURE_PIPELINE_KEYS, RGFX_FEATURE_POINTER_MOTION, RGFX_FEATURE_POOL,
     RGFX_FEATURE_POOL_ADDRESSES, RGFX_FEATURE_PRIVATE_BLOCKS, RGFX_FEATURE_PRIVATE_RENDER_STATE,
-    RGFX_FEATURE_RATE_MAPS,
-    RGFX_FEATURE_READ_ONLY_PAGES, RGFX_FEATURE_SCHEDULED_ASK, RGFX_FEATURE_SHARED_EVENT_NAMES,
-    RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
-    RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
+    RGFX_FEATURE_RATE_MAPS, RGFX_FEATURE_READ_ONLY_PAGES, RGFX_FEATURE_SCHEDULED_ASK,
+    RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM,
+    RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
     RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
     RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_SURFACE_REFILL,
     RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA, RGFX_FEATURE_UNSHARED_QUEUES,
@@ -97,14 +96,13 @@ use reims_vgpu_graphics::wire::{
     RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
     RgfxFunctionPointerState, RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader,
     RgfxPageRun, RgfxPipelineAnswersQuery, RgfxPoolGive, RgfxPoolTake, RgfxPrivateGive,
-    RgfxPrivateTake, RgfxRateMapAnswer,
-    RgfxRateMapState, RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName, RgfxSurfacePages,
-    RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RgfxPrivateTake, RgfxRateMapAnswer, RgfxRateMapState, RgfxSamplerState, RgfxScheduledAsk,
+    RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
-    CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PoolAnswer, PrivateAnswer,
-    PresentAnswer, QueueClaim, RawDoorbell, RingDegradation, Scanout, Screen, VtAnswer, VtLink,
-    VtMessage, VtSurface,
+    CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PoolAnswer,
+    PresentAnswer, PrivateAnswer, QueueClaim, RawDoorbell, RingDegradation, Scanout, Screen,
+    VtAnswer, VtLink, VtMessage, VtSurface,
 };
 use reims_vgpu_video::paravirt;
 use reims_vgpu_vulkan::core::host::HostQueue;

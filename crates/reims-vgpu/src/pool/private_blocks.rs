@@ -342,7 +342,10 @@ mod tests {
             blocks.give(3, at + 0x8000, len, |_, _| false),
             PrivateGive::NotFound
         );
-        assert_eq!(blocks.give(3, at, 0x2_0000, |_, _| false), PrivateGive::NotFound);
+        assert_eq!(
+            blocks.give(3, at, 0x2_0000, |_, _| false),
+            PrivateGive::NotFound
+        );
         let mut asked = None;
         assert_eq!(
             blocks.give(3, at, len, |a, l| {
@@ -381,7 +384,11 @@ mod tests {
         assert_eq!(closed.len(), 1, "only the block not going already");
         assert_eq!(
             blocks.held(),
-            [(a, 3, 0x1_0000, true), (b, 3, 0x2_0000, true), (c, 4, 0x1_0000, false)]
+            [
+                (a, 3, 0x1_0000, true),
+                (b, 3, 0x2_0000, true),
+                (c, 4, 0x1_0000, false)
+            ]
         );
         blocks.free(&closed);
         blocks.free(&[given]);
