@@ -275,7 +275,10 @@ fn a_held_piece_goes_back_only_once_its_hold_ends() {
     // the hold lives.
     let deadline = Instant::now() + Duration::from_secs(10);
     while pool.find(BASE + BLOCK_LEN, 1).is_some() {
-        assert!(Instant::now() < deadline, "still in the lookups past the delay");
+        assert!(
+            Instant::now() < deadline,
+            "still in the lookups past the delay"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(host.calls().len(), 2, "no remove while a hold lives");
