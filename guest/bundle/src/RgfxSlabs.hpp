@@ -129,6 +129,7 @@ public:
 		bool zeroed = false;
 		uint64_t blockSize = 0; // a pages block's size, for a source of the process's own pages
 		bool chunked = false;   // the kext's chunks, which go with the pages block's release
+		uint64_t gpuAddress = 0; // the GPU address the host gave a pool block; 0 where none
 	};
 
 	/// The host's object over a slab of a class whose buffers are placed in it (heaped): its
@@ -136,6 +137,7 @@ public:
 	struct Heap {
 		uint64_t objId = 0;
 		uint64_t gpuAddress = 0;
+		bool ownsAddress = true; // the process picked its address, which goes back at its drop
 	};
 
 	/// A buffer made in a slab: its object id, GPU address, and whether its create picked that
@@ -352,9 +354,12 @@ private:
 struct RgfxPoolMemory {
 	void *context = nullptr;
 	/// A block of the pool of `size` bytes, a multiple of 64 KiB, mapped into the process, its
-	/// bytes zero: 0 (KERN_SUCCESS) with its address in the process at `*bytes` and its offset
-	/// in the pool at `*offset`, or the kext's refusal. Waits for the host's answer.
-	int (*take)(void *context, uint64_t size, uint8_t **bytes, uint64_t *offset) = nullptr;
+	/// bytes zero: 0 (KERN_SUCCESS) with its address in the process at `*bytes`, its offset in
+	/// the pool at `*offset` and the GPU address the host gave it at `*gpu_address`, 0 where it
+	/// gave none (RGFX_FEATURE_POOL_ADDRESSES not taken), or the kext's refusal. Waits for the
+	/// host's answer.
+	int (*take)(void *context, uint64_t size, uint8_t **bytes, uint64_t *offset,
+	            uint64_t *gpu_address) = nullptr;
 	/// Gives back the block at pool offset `offset`: the kext takes it out of the process, then
 	/// gives it to the host, without waiting.
 	void (*give)(void *context, uint64_t offset) = nullptr;
@@ -379,6 +384,11 @@ struct RgfxPoolMemory {
 ///
 /// The take waits for the host on the thread whose buffer found no room, as Metal's newBuffer
 /// waits for the kernel's pages: takes() counts them and the time they took.
+///
+/// Where the host gives a block its GPU address (RGFX_FEATURE_POOL_ADDRESSES), the block's heap
+/// lies there, picked by no one in the process's range of addresses, and its buffers at their
+/// offsets from it; where it gives none, the heap's address is the process's pick, as a region
+/// slab's is.
 class RgfxPoolSlabSource : public RgfxRegionSlabSource {
 public:
 	RgfxPoolSlabSource(RgfxRegion &region, RgfxSerializer &serializer,
@@ -406,6 +416,7 @@ public:
 		uint64_t waitUs = 0;     // the time every take waited, refused ones among them, in us
 		uint64_t longestUs = 0;  // the longest
 		uint64_t given = 0;      // blocks given back
+		uint64_t addressed = 0;  // blocks whose heap lies at the GPU address the host gave
 	};
 	Takes takes() const;
 
@@ -426,6 +437,7 @@ private:
 	std::atomic<uint64_t> m_waitUs{0};
 	std::atomic<uint64_t> m_longestUs{0};
 	std::atomic<uint64_t> m_given{0};
+	std::atomic<uint64_t> m_addressed{0};
 };
 
 class RgfxSlabs {

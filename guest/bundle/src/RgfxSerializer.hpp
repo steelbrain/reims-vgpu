@@ -439,6 +439,12 @@ public:
 	RgfxCreated createHeapOverPool(uint64_t size_bytes, uint32_t options, int32_t heap_type,
 	                               uint64_t pool_offset, uint64_t align = kDefaultAddressAlign);
 
+	/// As createHeapOverPool, at `gpu_address`, the GPU address the host gave the block (where
+	/// the device took RGFX_FEATURE_POOL_ADDRESSES): no pick of the process's, so its release
+	/// at the heap's drop gives nothing back.
+	RgfxCreated createHeapOverPoolAt(uint64_t size_bytes, uint32_t options, int32_t heap_type,
+	                                 uint64_t pool_offset, uint64_t gpu_address);
+
 	// --- buffers --------------------------------------------------------------
 
 	/// A device buffer of `length` bytes at a picked GPU address.

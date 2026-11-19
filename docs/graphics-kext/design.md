@@ -4833,9 +4833,11 @@ device's life, and the x86-64 kext reads it once at its start.
   length where nothing fit. So a context's takes are answered in its order,
   and never wait behind another context's growth or zeroing. The answer is
   the block's offset in the pool and its length, the bytes asked for rounded
-  up to 64 KiB, every byte zero, or `REFUSED` where the pool has no room. The
+  up to 64 KiB, every byte zero, or `REFUSED` where the pool has no room;
+  where the guest took `POOL_ADDRESSES` (below), also its GPU address. The
   kext maps the block into the process, read and write and write-back, as a
-  range of its own, and answers its address, offset and length. The bundle
+  range of its own, and answers its address, offset and length, and its GPU
+  address where the process asks for a fourth output. The bundle
   writes none of its zeros again; the slab's buffers are zeroed only where
   one reuses a range another freed in it. The take happens on the thread
   whose buffer found no room, and only then: nothing is taken ahead.
@@ -4852,11 +4854,30 @@ device's life, and the x86-64 kext reads it once at its start.
   and at its stop, once every process closed it.
 - **A heap.** The bundle makes each block one Shared Placement heap,
   `HEAP_OVER_POOL` (an `RgfxHeapOverHostMemory` whose `region_offset` is the
-  block's offset in the pool) at a GPU address it picks, and places the
-  slab's buffers in it. The host makes it over the block's bytes in place, as
-  `HEAP_OVER_HOST_MEMORY` makes one over a region block; a span outside the
-  blocks the sender's context holds is a bad reference. The heap holds the
-  block.
+  block's offset in the pool) at the block's GPU address where the host gave
+  one, else at one it picks, and places the slab's buffers in it. The host
+  makes it over the block's bytes in place, as `HEAP_OVER_HOST_MEMORY` makes
+  one over a region block; a span outside the blocks the sender's context
+  holds is a bad reference. The heap holds the block.
+- **Its GPU address.** The device offers `POOL_ADDRESSES` (feature bit 59)
+  wherever it offers `POOL`, and the x86-64 kext takes it (kext feature bit
+  1 << 16 `PoolAddresses`, `PoolTake`'s fourth output). Where the guest took
+  it, each `POOL_BLOCK` that answers `OK` carries the block's GPU address
+  (`RgfxPoolBlock.gpu_address`, at byte 40 of 48; a kext that reads 40 bytes
+  reads the rest of the answer as before), and the bundle, where its kext
+  answers the fourth output, makes the block's heap there, picking no address
+  of the context's and giving none back at the heap's destroy; its buffers
+  lie at their offsets from it. On metal2vulkan-rt's device the address is
+  the block's Vulkan device address. On the Vulkan platform before it, whose
+  blocks have none, the host picks it in `[2^45, 2^46)`, below the context's
+  range, where the platform places none of its own ranges: next fit, each
+  address holding the span a guest pick of the block's length holds (its
+  pages and a guard page, on the 32 KiB granule), a freed one picked again
+  only once the picks wrap (`crates/reims-vgpu/src/pool/addresses.rs`); the
+  platform pins the heap there, as it pins the guest's picks. A take that
+  finds no address left there is refused, as one that finds no room. A guest
+  that did not take the bit reads 0 there and picks its heaps' addresses
+  itself, as before.
 - **A give.** When the slab's last buffer goes, the bundle destroys its heap
   and gives the block back (selector 17, `PoolGive`); every call into the
   kext first posts the destroys the control ring holds, so the heap's
@@ -6717,7 +6738,7 @@ Map 1:
 | 12 | `PagesChunked` | 1 << 8 `PagesChunked` | a block of the runs of 64 KiB chunks of the kext's own, mapped into the process, for its slabs |
 | 13 | `SurfaceSeeds` | 1 << 10 `SurfaceSeeds` | an IOSurface's lock and unlock seeds, for a copy synced while a CPU held the surface locked for writing |
 | 15 | `CpuPats` | 1 << 13 `CpuPats` | every online CPU's PAT, read on each CPU, for an administrator's process: the check that entry 2 is write-back everywhere ("The BAR is one host memory region"; the guest's `guest/bundle/tools/pat_probe.c`); x86-64 only |
-| 16 | `PoolTake` | 1 << 15 `Pool` | a block of the Shared pool for the process's context, mapped into the process write-back once the host answers its `POOL_TAKE`, however long that takes ("The Shared pool"); x86-64 only, `kIOReturnUnsupported` on arm64e |
+| 16 | `PoolTake` | 1 << 15 `Pool`, 1 << 16 `PoolAddresses` (its fourth output, the block's GPU address, 0 for none) | a block of the Shared pool for the process's context, mapped into the process write-back once the host answers its `POOL_TAKE`, however long that takes ("The Shared pool"); three outputs, or four with its GPU address; x86-64 only, `kIOReturnUnsupported` on arm64e |
 | 17 | `PoolGive` | 1 << 15 `Pool` | gives a pool block back: out of the process, then its `POOL_GIVE` |
 | 0x100 | `OpenContext` | 1 << 5 `ContextSpan` (its sixth output), 1 << 12 `DoorbellPage` (its seventh) | the context and its window; five outputs, six with its GPU addresses' span, or seven with its doorbell page's address in the process, 0 for none ("BAR4: the doorbell pages") |
 | 0x101 | `Alloc` | 1 << 7 `WriteCombined` (its third input), 1 << 14 `ZeroedBlocks` (the block reads zero) | a region block; 2 inputs, or 3 with the byte its write-combined part starts at |
@@ -6737,7 +6758,7 @@ the accelerator, which the bundle opens for each event it hands out: 10 and 11
 are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish`, 1 << 12 `DoorbellPage`, 1 << 13 `CpuPats`, 1 << 14 `ZeroedBlocks` and 1 << 15 `Pool`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed, `CpuPats` only on x86-64, and `Pool` only on x86-64 where the device has a pool; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish`, 1 << 12 `DoorbellPage`, 1 << 13 `CpuPats`, 1 << 14 `ZeroedBlocks`, 1 << 15 `Pool` and 1 << 16 `PoolAddresses`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed, `CpuPats` only on x86-64, and `Pool` and `PoolAddresses` only on x86-64 where the device has a pool; no other bit yet.
 
 The arm64e kext takes no `POOL` of the device's offer, which offers an arm64
 guest none until a boot shows its kernel maps a range past its RAM, above

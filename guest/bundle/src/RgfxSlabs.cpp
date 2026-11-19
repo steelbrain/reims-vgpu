@@ -130,7 +130,12 @@ bool RgfxRegionSlabSource::makeHeap(const Memory &memory, uint32_t options, Heap
 
 void RgfxRegionSlabSource::dropHeap(const Heap &heap)
 {
-	// Its address goes back once the destroy is on the ring (RgfxSerializer::destroy).
+	// Its address goes back once the destroy is on the ring (RgfxSerializer::destroy), where the
+	// process picked it.
+	if (!heap.ownsAddress) {
+		m_serializer.destroy(heap.objId);
+		return;
+	}
 	RgfxSerializer &serializer = m_serializer;
 	const uint64_t address = heap.gpuAddress;
 	m_serializer.destroy(heap.objId, [&serializer, address] { serializer.releaseAddress(address); });
@@ -317,8 +322,9 @@ bool RgfxPoolSlabSource::take(uint64_t size, bool heap, Memory *out)
 		return false;
 	uint8_t *bytes = nullptr;
 	uint64_t offset = 0;
+	uint64_t gpuAddress = 0;
 	const auto from = std::chrono::steady_clock::now();
-	const int kr = m_memory.take(m_memory.context, size, &bytes, &offset);
+	const int kr = m_memory.take(m_memory.context, size, &bytes, &offset, &gpuAddress);
 	const uint64_t us = static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
 	                                                          from)
@@ -338,6 +344,7 @@ bool RgfxPoolSlabSource::take(uint64_t size, bool heap, Memory *out)
 	out->size = size;
 	out->regionOffset = offset; // its offset in the pool, which HEAP_OVER_POOL names
 	out->zeroed = true;         // the host zeroes a block as it gives it
+	out->gpuAddress = gpuAddress;
 	return true;
 }
 
@@ -353,14 +360,23 @@ void RgfxPoolSlabSource::give(const Memory &memory)
 
 bool RgfxPoolSlabSource::makeHeap(const Memory &memory, uint32_t options, Heap *out)
 {
-	// As a region slab's: Shared, of the class's cache mode and hazard tracking.
-	RgfxCreated created = m_serializer.createHeapOverPool(memory.size, options & ~kStorageMask,
-	                                                      kHeapTypePlacement,
-	                                                      memory.regionOffset);
+	// As a region slab's: Shared, of the class's cache mode and hazard tracking; at the block's
+	// GPU address where the host gave one, whose release at the heap's drop gives nothing back
+	// (no pick of the process's starts there), else at the process's pick.
+	const uint32_t heapOptions = options & ~kStorageMask;
+	RgfxCreated created =
+	    memory.gpuAddress != 0
+	        ? m_serializer.createHeapOverPoolAt(memory.size, heapOptions, kHeapTypePlacement,
+	                                            memory.regionOffset, memory.gpuAddress)
+	        : m_serializer.createHeapOverPool(memory.size, heapOptions, kHeapTypePlacement,
+	                                          memory.regionOffset);
 	if (created.obj_id == 0 || m_serializer.refused(created))
 		return false; // no address left, or the device never got it
+	if (memory.gpuAddress != 0)
+		m_addressed.fetch_add(1, std::memory_order_relaxed);
 	out->objId = created.obj_id;
 	out->gpuAddress = created.gpu_address;
+	out->ownsAddress = memory.gpuAddress == 0;
 	return true;
 }
 
@@ -373,6 +389,7 @@ RgfxPoolSlabSource::Takes RgfxPoolSlabSource::takes() const
 	t.waitUs = m_waitUs.load(std::memory_order_relaxed);
 	t.longestUs = m_longestUs.load(std::memory_order_relaxed);
 	t.given = m_given.load(std::memory_order_relaxed);
+	t.addressed = m_addressed.load(std::memory_order_relaxed);
 	return t;
 }
 

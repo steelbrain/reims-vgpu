@@ -352,9 +352,9 @@ static void rgfxLogSlabChurn(void *pool, const RgfxSlabs::Churn &c)
 	const RgfxPoolSlabSource::Takes t = static_cast<RgfxPoolSlabSource *>(pool)->takes();
 	os_log(rgfxLog(),
 	       "RGFX pool takes at %lld.%03ld s: %llu taken (%llu KiB), %llu refused, %llu us waited, "
-	       "longest %llu us; %llu given back",
+	       "longest %llu us; %llu given back; %llu heaps at the host's addresses",
 	       static_cast<long long>(now.tv_sec), now.tv_nsec / 1000000, t.taken, t.takenBytes >> 10,
-	       t.refused, t.waitUs, t.longestUs, t.given);
+	       t.refused, t.waitUs, t.longestUs, t.given, t.addressed);
 }
 
 // The kext's chunks of texture resource ids, as RgfxIdSpace's chunk source; `context` is the
@@ -592,17 +592,20 @@ void rgfxUnmapPages(void *, uint8_t *bytes, uint64_t size)
 
 // The pool source's memory (RgfxPoolMemory): a block of the Shared pool the kext maps into the
 // process once the host answers its take, and its give; `context` is the kext link
-// (rgfxKextConn, whose held destroys, a slab's heap's among them, go before the give).
-int rgfxKextPoolTake(void *context, uint64_t size, uint8_t **bytes, uint64_t *offset)
+// (rgfxKextConn, whose held destroys, a slab's heap's among them, go before the give). The take
+// asks the kext for `outputs` answers: 3 (the block's address here, its pool offset and its
+// length), or 4, its GPU address too, where the kext answers it (kRgfxKextFeaturePoolAddresses).
+static int rgfxKextPoolTakeOf(void *context, uint64_t size, uint8_t **bytes, uint64_t *offset,
+                              uint64_t *gpu_address, uint32_t outputs)
 {
 	io_connect_t conn = rgfxKextConn(context);
-	uint64_t out[3] = {};
-	uint32_t outCount = 3;
+	uint64_t out[4] = {};
+	uint32_t outCount = outputs;
 	const kern_return_t kr =
 	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodPoolTake, &size, 1, out, &outCount);
 	if (kr != KERN_SUCCESS)
 		return kr;
-	if (outCount != 3 || out[0] == 0)
+	if (outCount != outputs || out[0] == 0)
 		return KERN_FAILURE;
 	if (out[2] != size) {
 		// Not the block asked for (the kext answers the take's length): back at once.
@@ -611,7 +614,20 @@ int rgfxKextPoolTake(void *context, uint64_t size, uint8_t **bytes, uint64_t *of
 	}
 	*bytes = reinterpret_cast<uint8_t *>(out[0]);
 	*offset = out[1];
+	*gpu_address = out[3]; // 0 where the device gave none, or the kext was not asked
 	return KERN_SUCCESS;
+}
+
+int rgfxKextPoolTake(void *context, uint64_t size, uint8_t **bytes, uint64_t *offset,
+                     uint64_t *gpu_address)
+{
+	return rgfxKextPoolTakeOf(context, size, bytes, offset, gpu_address, 3);
+}
+
+int rgfxKextPoolTakeAddressed(void *context, uint64_t size, uint8_t **bytes, uint64_t *offset,
+                              uint64_t *gpu_address)
+{
+	return rgfxKextPoolTakeOf(context, size, bytes, offset, gpu_address, 4);
 }
 
 void rgfxKextPoolGive(void *context, uint64_t offset)
@@ -1176,9 +1192,13 @@ RGFX_LOG_UNRECOGNIZED
 	// the region's.
 	if ((_caps.kextFeatures() & kRgfxKextFeaturePool) != 0 &&
 	    (_caps.features() & RGFX_FEATURE_POOL) != 0) {
+		// Its blocks' heaps lie at the GPU addresses the host gives them, where the device and
+		// the kext both took POOL_ADDRESSES; else at the process's picks.
+		const bool addressed = (_caps.kextFeatures() & kRgfxKextFeaturePoolAddresses) != 0 &&
+		                       (_caps.features() & RGFX_FEATURE_POOL_ADDRESSES) != 0;
 		RgfxPoolMemory memory;
 		memory.context = connContext;
-		memory.take = &rgfxKextPoolTake;
+		memory.take = addressed ? &rgfxKextPoolTakeAddressed : &rgfxKextPoolTake;
 		memory.give = &rgfxKextPoolGive;
 		_poolSource = std::make_unique<RgfxPoolSlabSource>(*_region, *_serializer, memory,
 		                                                   managedAtOffset, managedOverCopy);

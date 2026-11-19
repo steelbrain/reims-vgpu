@@ -1590,6 +1590,9 @@ struct PoolKext {
 	TestRing *ring;
 	bool refuse = false;
 	uint8_t fill = 0;
+	// The GPU address of the pool's start where the host gives blocks theirs
+	// (RGFX_FEATURE_POOL_ADDRESSES): a block's is it plus the block's offset; 0 for none.
+	uint64_t gpuBase = 0;
 
 	PoolKext(uint64_t size, std::vector<std::string> *events, TestRing *posted)
 	    : free(size), log(events), ring(posted)
@@ -1597,7 +1600,8 @@ struct PoolKext {
 		uint64_t held = 0;
 		free.take(RgfxPoolSlabSource::kUnit, RgfxPoolSlabSource::kUnit, &held);
 	}
-	static int take(void *context, uint64_t size, uint8_t **bytes, uint64_t *offset)
+	static int take(void *context, uint64_t size, uint8_t **bytes, uint64_t *offset,
+	                uint64_t *gpu_address)
 	{
 		PoolKext *k = static_cast<PoolKext *>(context);
 		const std::string what = "take " + std::to_string(size);
@@ -1608,6 +1612,7 @@ struct PoolKext {
 		k->log->push_back(what);
 		std::vector<uint8_t> memory(size, k->fill);
 		*bytes = memory.data();
+		*gpu_address = k->gpuBase != 0 ? k->gpuBase + *offset : 0;
 		k->blocks[*offset] = std::move(memory);
 		return KERN_SUCCESS;
 	}
@@ -1736,7 +1741,7 @@ void test_pool_slab_source()
 	CHECK(slabs.stats().slabs == 5 && slabs.stats().firstSlabs == 3);
 	Pool::Takes t = pool.takes();
 	CHECK(t.taken == 3 && t.takenBytes == 131072 + 8388608 + 5308416 && t.refused == 1);
-	CHECK(t.given == 0 && t.longestUs <= t.waitUs);
+	CHECK(t.given == 0 && t.longestUs <= t.waitUs && t.addressed == 0);
 
 	// Each slab of the pool goes with its last buffer, its heap destroyed before its block is
 	// given back: none is kept for a later buffer.
@@ -1793,6 +1798,77 @@ void test_pool_slab_source()
 	drain();
 }
 
+// Where the host gives a block of the pool its GPU address (RGFX_FEATURE_POOL_ADDRESSES), the
+// block's heap lies there, picked by no one in the process's range of addresses, its buffers at
+// their offsets from it; the heap's drop gives no address of the process's back, though one of
+// its picks starts there. A Managed buffer's own address is still the process's pick.
+void test_pool_slab_source_at_host_addresses()
+{
+	using Pool = RgfxPoolSlabSource;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
+	TestRing ring(0x10000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	// Room for one pick of a page, which the process holds: the slabs pick nothing more.
+	RgfxIdSpace ids(RGFX_CONTEXT_VA_BASE, RgfxIdSpace::addressSpan(0x1000));
+	const uint64_t picked = ids.allocAddress(0x1000, 1);
+	CHECK(picked == RGFX_CONTEXT_VA_BASE && ids.allocAddress(0x1000, 1) == 0);
+	RgfxSerializer ser(writer, ids);
+	RgfxRegion region(mem.data(), mem.size());
+	std::vector<std::string> log;
+	PoolKext kext(64 * kMiB, &log, &ring);
+	RgfxPoolMemory calls;
+	calls.context = &kext;
+	calls.take = &PoolKext::take;
+	calls.give = &PoolKext::give;
+	RgfxRegionSlabSource regionSource(region, ser);
+	Pool pool(region, ser, calls);
+	RgfxSlabs slabs(regionSource);
+	slabs.setFirst(&pool);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	auto drain = [&] {
+		while (ring.next(&h, &bytes)) {
+		}
+	};
+
+	// A block at the host's address 2^45 plus its offset in the pool.
+	kext.gpuBase = 1ull << 45;
+	RgfxSlabs::Range a, b;
+	CHECK(slabs.take(256, kShared, 0, &a) && log == std::vector<std::string>({"take 131072"}));
+	auto heap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_POOL);
+	CHECK(heap.region_offset == Pool::kUnit && heap.size_bytes == 128 * 1024);
+	CHECK(heap.gpu_address == (1ull << 45) + Pool::kUnit);
+	CHECK(slabs.take(0x3000, kShared, 0, &b) && b.slab == a.slab && b.offset == 0x1000);
+	RgfxSlabSource::Made made;
+	CHECK(slabs.makeBuffer(b, 0x2800, kShared, &made));
+	auto at = expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET);
+	CHECK(at.heap_obj_id == heap.obj_id && at.offset == 0x1000);
+	CHECK(made.gpuAddress == heap.gpu_address + 0x1000 && !made.ownsAddress);
+	CHECK(pool.takes().taken == 1 && pool.takes().addressed == 1);
+	drain();
+	log.clear();
+	slabs.give(a);
+	slabs.give(b);
+	CHECK(log == std::vector<std::string>(
+	                 {"destroy " + std::to_string(heap.obj_id), "give 131072"}));
+
+	// A host address where a pick of the process's starts: the heap's drop leaves the pick held.
+	kext.gpuBase = picked - Pool::kUnit;
+	RgfxSlabs::Range c;
+	CHECK(slabs.take(0x1000, kShared, 0, &c));
+	auto cheap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_POOL);
+	CHECK(cheap.region_offset == Pool::kUnit && cheap.gpu_address == picked);
+	drain();
+	slabs.give(c);
+	CHECK(endsWith(log, {"destroy " + std::to_string(cheap.obj_id), "give 131072"}));
+	CHECK(ids.allocAddress(0x1000, 1) == 0);
+	ids.freeAddress(picked);
+	CHECK(ids.allocAddress(0x1000, 1) == picked);
+	CHECK(pool.takes().addressed == 2 && pool.takes().given == 2 && kext.blocks.empty());
+	drain();
+}
+
 } // namespace
 
 void rgfxSlabTests()
@@ -1818,4 +1894,5 @@ void rgfxSlabTests()
 	test_chunked_slabs_grow();
 	test_managed_buffers_over_shared_copies();
 	test_pool_slab_source();
+	test_pool_slab_source_at_host_addresses();
 }
