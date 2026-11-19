@@ -11,8 +11,9 @@
 //! its device copy. A take is 64 KiB at least, whatever the buffer's length: placing small buffers
 //! in shared blocks is the guest's, by address ("A pinned address"). Its bytes are zeros, as
 //! Metal's are: rt zeroes a Shared buffer's through the mapping and a Private one's by a GPU fill
-//! ahead of the next command buffer, the platform zeroes a Managed buffer's own bytes, and rt its
-//! device copy. The buffer holds its blocks; the platform's handles of them go as it is made.
+//! ahead of the next command buffer, the platform zeroes a Managed buffer's own bytes (counted by
+//! the byte, [`ZEROED_BYTES_CODE`], with a heap's it zeroes, `super::heap`), and rt its device
+//! copy. The buffer holds its blocks; the platform's handles of them go as it is made.
 //!
 //! **A pinned address.** The guest picks a buffer's GPU address (`setPinnedGPUAddress:`), and rt
 //! places no buffer at a chosen address: a buffer's address is Vulkan's device address. A pinned
@@ -233,6 +234,11 @@ pub const IMPORTS_DMA_BUF_AND_POINTER_REFUSED: &str = "rt-imports-dma-buf-and-po
 /// The code of a Managed no-copy buffer asked over a dma-buf's block, which rt refuses as over a
 /// block it does not map (the module's docs, "Dma-bufs of the pages"), counted per buffer.
 pub const MANAGED_OVER_DMA_BUF: &str = "rt-managed-over-dma-buf";
+
+/// The code of the bytes the platform zeroed through a block's mapping: a Managed buffer's own
+/// bytes, and a Shared heap's of its own (`super::heap`). Counted by the byte; rt's zeroing is in
+/// rt's metrics.
+pub const ZEROED_BYTES_CODE: &str = "rt-zeroed-bytes";
 
 /// A buffer descriptor's `resourceOptions` before any setter: `Shared`.
 const BUFFER_DESCRIPTOR_OPTIONS: u64 = 0;
@@ -749,6 +755,7 @@ fn own_managed(device: &RtObj<RtDevice>, sel: &'static str, length: u64) -> Opti
         // SAFETY: the block is this call's alone, mapped for its life, and its `len`, the length
         // rounded up, holds the `length` bytes.
         unsafe { at.as_ptr().write_bytes(0, length.to_usize()) };
+        crate::answer::count_kind_by(ZEROED_BYTES_CODE, length);
     }
     let copy = match device.rt().has_unified_memory() {
         true => None,

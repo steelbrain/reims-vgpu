@@ -15,7 +15,7 @@
 //! are answered in its own order, one worker a context with a take in flight, so a take waits only
 //! behind its own context's earlier ones, never behind another's growth or zeroing. A worker goes
 //! after [`WORKER_IDLE`] with no take. Every block is zeroed once, at its take, off the thread
-//! that carried the take out.
+//! that carried the take out, its bytes counted ([`super::TAKE_ZEROED_BYTES_CODE`]).
 //!
 //! A take ends only at its answer, its context's close or the device's reset: there is no
 //! timeout. A take whose context closed, or that the reset ended, before its answer is given back
@@ -49,8 +49,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::MutexGuard;
+use reims_vgpu_vulkan::answer::count_kind_by;
 
-use super::{Ask, Error, Mapped, MonoTime, Shared, State};
+use super::{Ask, Error, Mapped, MonoTime, Shared, State, TAKE_ZEROED_BYTES_CODE};
 
 /// A block's alignment and its length's granule: 64 KiB, the wire's `RGFX_POOL_BLOCK_ALIGN`.
 pub const TAKE_ALIGN: u64 = 64 << 10;
@@ -623,6 +624,7 @@ impl Shared {
                     // stays the pool's while the carve does, which only this worker frees until
                     // it is answered.
                     unsafe { std::ptr::write_bytes(host.as_ptr(), 0, len) };
+                    count_kind_by(TAKE_ZEROED_BYTES_CODE, job.len);
                 }
             });
             let stands = st.stands(context, job.life);

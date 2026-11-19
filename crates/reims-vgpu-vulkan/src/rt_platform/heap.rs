@@ -7,9 +7,10 @@
 //! the pinned address, its bytes the block's as they are (the block's owner and the guest zero
 //! them); one over the host's memory only where the memory is the block's own mapping there. Any
 //! other heap of the device's takes a block of its own (rt's `take_block`), its bytes zeroed as
-//! the Vulkan platform's runtime zeroes a new heap's, and any other heap over the host's memory is
-//! a range of rt's import of its pages (`super::buffer::import_pages`, counted as the no-copy
-//! buffers' imports are), its bytes as they are. A pin neither keeps is counted
+//! the Vulkan platform's runtime zeroes a new heap's (a Shared one's counted by the byte,
+//! [`buffer::ZEROED_BYTES_CODE`]), and any other heap over the host's memory is a range of rt's
+//! import of its pages (`super::buffer::import_pages`, counted as the no-copy buffers' imports
+//! are), its bytes as they are. A pin neither keeps is counted
 //! (`rt-gpu-address-unpinned`, `super::buffer`'s docs): the heap lies at rt's address. The heap's
 //! size is the descriptor's rounded up to 16 KiB, as Metal's is; the heap holds its block.
 //!
@@ -193,6 +194,7 @@ fn zeroed(
             // SAFETY: the block is this call's alone, mapped for its life, and its `len`, the size
             // rounded up, holds the `size` bytes.
             unsafe { at.as_ptr().write_bytes(0, size.to_usize()) };
+            crate::answer::count_kind_by(buffer::ZEROED_BYTES_CODE, size);
         }
         None => {
             if let Err(error) = device.rt().zero_block_range(block.id, 0, size) {

@@ -95,6 +95,10 @@ use crate::Error;
 /// page, which goes back unmapped (the module doc's "The block source").
 pub const UNALIGNED_CODE: &str = "rt-pool-block-unaligned";
 
+/// The code of the bytes the take workers zeroed through their pieces' mappings (`takes`),
+/// counted by the byte.
+pub const TAKE_ZEROED_BYTES_CODE: &str = "pool-take-zeroed-bytes";
+
 /// A pooled block's length, metal2vulkan-rt's `BLOCK_LEN`: 256 MiB.
 pub const BLOCK_LEN: u64 = 256 << 20;
 
