@@ -2803,7 +2803,9 @@ mod tests {
         // SAFETY: as above.
         let bytes = unsafe { HostRange::new(at, 64) };
         let over = device.new_buffer(pinned(pin, 0x10, Some(bytes)));
-        let over = over.expect("never a raise").expect("a Managed buffer in the block");
+        let over = over
+            .expect("never a raise")
+            .expect("a Managed buffer in the block");
         assert_eq!(over.contents(), at);
         assert_eq!(counted(MANAGED_OVER_DMA_BUF), managed + 1);
         assert_eq!(counted(IMPORTS_CODE), imports);
