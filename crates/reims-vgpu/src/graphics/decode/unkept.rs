@@ -29,6 +29,8 @@
 //! On a platform that places a pinned object anywhere (the Vulkan platform's) no pin or object is
 //! counted here, and none of its makes imports through a counted path.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use reims_vgpu_vulkan::answer::{MadeCodes, count_gone, count_kind, count_made};
 
 /// The kind of a make, which names its counts.
@@ -212,11 +214,29 @@ pub(crate) fn made(on: bool, kind: Kind, pin: Option<u64>, made: u64) -> Option<
         return None;
     }
     let codes = kind.codes();
-    if pin.is_some_and(|pin| pin != made) {
+    if let Some(pin) = pin.filter(|&pin| pin != made) {
         count_kind(codes.unpinned);
+        unkept_said(kind, pin, made);
     }
     count_made(codes.made);
     Some(Live(codes.made))
+}
+
+/// The kinds whose first pin not kept was said ([`unkept_said`]), a bit each.
+static UNKEPT_SAID: AtomicU32 = AtomicU32::new(0);
+
+/// Says the process's first pin of `kind` the platform did not keep: where the guest pinned it
+/// and where it lies.
+fn unkept_said(kind: Kind, pin: u64, made: u64) {
+    let bit = 1u32 << (kind as u32);
+    if UNKEPT_SAID.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        let code = kind.codes().unpinned;
+        log::warn!(
+            target: "reims_vgpu::graphics",
+            "an object the guest pinned at {pin:#x} lies at {made:#x}, the platform's address: \
+             the first pin of its kind not kept ({code}), counted from here"
+        );
+    }
 }
 
 /// Counts a texture the device placed at the guest's pick `gpu_address` ([`TEXTURE_PICKS`]),

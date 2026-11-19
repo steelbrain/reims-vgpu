@@ -2001,7 +2001,18 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// longest, refused where no address is left for it.
     fn take_private_block(&self, take: &RgfxPrivateTake, answer: PrivateAnswer) {
         match self.private_blocks.take(take.context, take.length) {
-            Ok((gpu_address, length)) => answer.answer(RGFX_STATUS_OK, gpu_address, length),
+            Ok((gpu_address, length)) => {
+                static TOLD: AtomicBool = AtomicBool::new(false);
+                if !TOLD.swap(true, Ordering::Relaxed) {
+                    log::info!(
+                        target: "reims_vgpu::graphics",
+                        "the first Private block: context {}'s, {length:#x} bytes at \
+                         {gpu_address:#x}",
+                        take.context
+                    );
+                }
+                answer.answer(RGFX_STATUS_OK, gpu_address, length);
+            }
             Err(PrivateTakeError::Invalid) => answer.answer(RGFX_STATUS_INVALID_ARGUMENT, 0, 0),
             Err(PrivateTakeError::Refused) => {
                 log::warn!(
