@@ -21,9 +21,13 @@
 //! the block's owner's to give (at its take) and the guest's (in the ranges it takes again), but a
 //! Private buffer's, which the guest cannot reach, zeroed (rt's GPU fill). A no-copy buffer is such
 //! a range only where its bytes are the block's own mapping there; its deallocator then runs as
-//! the buffer goes, the block's memory held by rt for the work that still uses it. Any other pinned
-//! buffer is made as an unpinned one, at rt's address, which the guest observes as a `gpuAddress`
-//! other than the one it pinned: counted ([`UNPINNED_CODE`]), the process's first with a line.
+//! the buffer goes, the block's memory held by rt for the work that still uses it. A no-copy
+//! Managed buffer on a GPU with memory of its own, whose address is its device copy's, keeps that
+//! copy at the pin where a known Private block holds it, its bytes the import of their pages
+//! ("Imports"); on a GPU that shares the CPU's memory it keeps no copy, so a pin lies at its bytes,
+//! as a Shared one's does. Any other pinned buffer is made as an unpinned one, at rt's address,
+//! which the guest observes as a `gpuAddress` other than the one it pinned: counted
+//! ([`UNPINNED_CODE`]), the process's first with a line.
 //!
 //! **Imports.** A no-copy buffer is a range of rt's import of the host's pages that hold its bytes
 //! (rt's `import_host_memory`): the bytes rounded out to the host's pages, which are mapped as the
@@ -35,9 +39,9 @@
 //! ([`IMPORTS_CODE`]), and the most live at once as that code's highest value
 //! ([`IMPORTS_LIVE_MOST_CODE`]); each again, with the most live at once, under the kind of the
 //! make that asked for it on its thread (`crate::answer::making_as`), or [`IMPORTS_UNNAMED`]
-//! where no make named one, so the kinds' counts sum to the total. Option bit 24 (read-only) is taken and answered without, as Metal
-//! does, but the GPU's writes reach the bytes, where Metal drops them: counted
-//! ([`READ_ONLY_CODE`]), the process's first with a line.
+//! where no make named one, so the kinds' counts sum to the total. Option bit 24 (read-only) is
+//! taken and answered without, as Metal does, but the GPU's writes reach the bytes, where Metal
+//! drops them: counted ([`READ_ONLY_CODE`]), the process's first with a line.
 //!
 //! **Answers.** A buffer's resource options are the asked ones without bits 20 and 24, Metal's
 //! default hazard tracking resolved to tracked, as the Vulkan platform's runtime answers them. A
@@ -576,12 +580,19 @@ fn no_copy(
     if length == 0 || length > rt::MAX_BUFFER_LENGTH {
         return refused_metal(sel, &format!("a buffer of {length} bytes"));
     }
-    let shared = rt::MemoryClass::Shared;
+    // A Managed buffer's GPU copy, where the GPU keeps one, is what its address is of: at the pin
+    // where a known Private block holds it, its bytes then the import of their pages.
+    let two_copies = o.storage == Storage::Managed && !device.rt().has_unified_memory();
+    let (shared, private) = (rt::MemoryClass::Shared, rt::MemoryClass::Private);
+    let copy = pin.filter(|_| two_copies);
+    let copy = copy.and_then(|pin| known_at(device, pin, length, private, None));
     let at = |pin| known_at(device, pin, length, shared, Some(first));
-    let (block, offset, deallocator) = match pin.and_then(at) {
+    let (block, offset, deallocator) = match pin.filter(|_| !two_copies).and_then(at) {
         Some((block, offset)) => (block, offset, Some(Arc::clone(slot))),
         None => {
-            if let Some(pin) = pin {
+            if let Some(pin) = pin
+                && copy.is_none()
+            {
                 unpinned(sel, pin);
             }
             let held = Arc::clone(slot);
@@ -589,8 +600,10 @@ fn no_copy(
             (block, offset, None)
         }
     };
+    let copy = copy.map(|(block, offset)| (block.id, offset));
+    let (bytes, storage) = ((&block, offset), o.storage);
     // The deallocator is kept unrun before the import goes, whose release would run it.
-    let Some(made) = range_of(device, sel, &block, offset, length, o.storage, zero_from) else {
+    let Some(made) = range_of(device, sel, bytes, length, storage, zero_from, copy) else {
         keep_unrun(slot);
         return None;
     };
@@ -600,26 +613,28 @@ fn no_copy(
     Some(buffer_of(device, made, o.answered, false, deallocator))
 }
 
-/// rt's no-copy buffer of `length` bytes at `offset` in `block`, of `storage`, for `sel`: Shared
-/// over the bytes, or Managed over them with a device copy where the GPU keeps one, whose bytes
-/// from `zero_from` start as zeros. `None` where rt refuses it, counted.
+/// rt's no-copy buffer of `length` bytes at `bytes`, an offset in a block, of `storage`, for `sel`:
+/// Shared over the bytes, or Managed over them with a device copy where the GPU keeps one, at
+/// `copy` (an offset in a known Private block) where given, else in a block of its own, whose
+/// bytes from `zero_from` start as zeros. `None` where rt refuses it, counted.
 fn range_of(
     device: &RtObj<RtDevice>,
     sel: &'static str,
-    block: &rt::Block,
-    offset: u64,
+    bytes: (&rt::Block, u64),
     length: u64,
     storage: Storage,
     zero_from: Option<u64>,
+    copy: Option<(rt::BlockId, u64)>,
 ) -> Option<rt::Buffer> {
+    let (block, offset) = bytes;
     let made = match storage {
         Storage::Managed => {
-            let copy = match device.rt().has_unified_memory() {
+            let own = match device.rt().has_unified_memory() || copy.is_some() {
                 true => None,
                 false => Some(take(device, sel, rt::MemoryClass::Private, length)?),
             };
             let copied = zero_from.map_or(length, |from| from.min(length));
-            let at = copy.as_ref().map(|copy| (copy.id, 0));
+            let at = copy.or(own.as_ref().map(|own| (own.id, 0)));
             (device.rt()).new_managed_buffer((block.id, offset), at, length, copied)
         }
         Storage::Shared | Storage::Private => {
@@ -974,8 +989,8 @@ mod tests {
     /// memory at its bytes, their deallocators run once rt freed the import, with the bytes and
     /// the length through a descriptor; a pin in no known block made at rt's address, counted;
     /// pins in known blocks at the pin, a Shared one keeping the bytes the CPU wrote there, a
-    /// no-copy one over the block's mapping its deallocator run as it goes; a texture over a
-    /// buffer.
+    /// no-copy one over the block's mapping its deallocator run as it goes, a Managed no-copy
+    /// one's device copy in a Private block where the GPU keeps one; a texture over a buffer.
     #[test]
     fn buffers_on_vulkan() {
         let platform = RtPlatform::new();
@@ -1138,6 +1153,35 @@ mod tests {
         drop(made);
         assert!(ran.load(Ordering::Acquire));
         assert_eq!(counted(UNPINNED_CODE), unpinned + 2);
+
+        // A Managed no-copy one over memory of the host's own, pinned in the Private block: its
+        // device copy at the pin where the GPU keeps one; else lying at its bytes' import, the
+        // pin not kept, counted.
+        let unified = device.rt().has_unified_memory();
+        let unpinned = counted(UNPINNED_CODE);
+        // SAFETY: the layout's size is not 0.
+        let memory = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!memory.is_null());
+        let at = HostPtr::from_ptr(memory.wrapping_add(16));
+        let freed = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&freed);
+        let pin = private.gpu_address + 0x400;
+        // SAFETY: the memory stays allocated until the deallocator ran (below).
+        let bytes = unsafe { HostRange::new(at, 64) };
+        let desc = BufferDesc {
+            deallocator: Some(Box::new(move |_, _| done.store(true, Ordering::Release))),
+            ..pinned(pin, 0x10, Some(bytes))
+        };
+        let made = device.new_buffer(desc).expect("never a raise");
+        let made = made.expect("a Managed no-copy buffer");
+        assert_eq!(made.contents(), at);
+        assert_eq!(made.gpu_address() == pin, !unified);
+        assert_eq!(counted(UNPINNED_CODE), unpinned + u64::from(unified));
+        drop(made);
+        let ran = || freed.load(Ordering::Acquire);
+        assert!(waits_for(ran), "the deallocator ran");
+        // SAFETY: the deallocator ran: rt holds no import of the memory.
+        unsafe { std::alloc::dealloc(memory, layout) };
         assert!(known.forget(shared.id).is_some() && known.forget(private.id).is_some());
         assert!(known.forget(shared.id).is_none());
 
