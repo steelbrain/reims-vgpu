@@ -13367,10 +13367,13 @@ lacks {part}"
         tiled_second_level_from(&r.replaced[1], tiled_replaced_texel).unwrap();
     }
 
-    /// The offsets and rows [`tiled_over_rows_metal_stops_is_refused`] makes a texture of, and
+    /// The offsets and rows
+    /// [`on_vulkan_rt_s_tiled_texture_over_rows_metal_stops_is_refused_and_counted`] makes a
+    /// texture of, and
     /// whether each is made: rows 4 bytes short of a row of texels; rows 258 bytes apart, no whole
     /// number of texels; an offset 2 bytes into a texel; rows from 4096 bytes in, whose last ends
     /// past the 16384-byte buffer; and, made, rows from 1024 bytes in, all within it.
+    #[cfg(feature = "rt")]
     const TILED_LAYOUTS: [(u64, u64, bool); 5] = [
         (0, TILED_SIZE * 4 - 4, false),
         (0, TILED_ROW + 2, false),
@@ -13379,17 +13382,12 @@ lacks {part}"
         (0x400, TILED_ROW, true),
     ];
 
-    /// On the Vulkan platform, a tiled texture over rows Metal's validation stops is not made,
-    /// which the decoder answers as a refusal: rows closer than a row of texels or apart by no
-    /// whole number of texels, an offset into a texel, and rows past the buffer; a texture over
-    /// rows within the buffer at an offset is made
-    #[test]
-    fn on_vulkan_a_tiled_texture_over_rows_metal_stops_is_refused() {
-        tiled_over_rows_metal_stops_is_refused::<reims_vgpu_vulkan::VulkanPlatform>();
-    }
-
-    /// [`on_vulkan_a_tiled_texture_over_rows_metal_stops_is_refused`] on the rt platform, which
-    /// counts each refusal as Metal's (`rt-refused-metal`)
+    /// On the rt platform, a tiled texture over rows Metal's validation stops is not made, which
+    /// the decoder answers as a refusal, counted as Metal's (`rt-refused-metal`): rows closer than
+    /// a row of texels or apart by no whole number of texels, an offset into a texel, and rows
+    /// past the buffer; a texture over rows within the buffer at an offset is made. (The Vulkan
+    /// platform ends the process on the first: its runtime refuses such a texture as an invalid
+    /// use.)
     #[cfg(feature = "rt")]
     #[test]
     fn on_vulkan_rt_s_tiled_texture_over_rows_metal_stops_is_refused_and_counted() {
@@ -13406,6 +13404,7 @@ lacks {part}"
 
     /// On `P`, each of [`TILED_LAYOUTS`]'s textures through the decoder: refused where it is not
     /// made, and holding [`TILED_LEVELS`] levels where it is.
+    #[cfg(feature = "rt")]
     fn tiled_over_rows_metal_stops_is_refused<P: crate::platform::ApiPlatform>() {
         use reims_vgpu_vulkan::core::platform::resource::Texture as _;
         for (offset, bytes_per_row, made) in TILED_LAYOUTS {
