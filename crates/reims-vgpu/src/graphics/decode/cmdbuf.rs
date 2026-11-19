@@ -2173,7 +2173,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let signalled = self.order_signal(device, queue_obj_id, &marks, seqno, names, &cb)?;
         let signal_committed = signalled.as_ref().map(Signalled::committed);
         let ahead = ahead.filter(|_| signalled.is_some());
-        let landed = ahead.as_ref().and_then(|_| events.landings.first().cloned());
+        let landed = ahead
+            .as_ref()
+            .and_then(|_| events.landings.first().cloned());
         let entry = ahead.map(|blocks| {
             (self.shared.completed_ahead).enter(&self.shared.platform, blocks, queue_obj_id, seqno)
         });
@@ -2186,7 +2188,13 @@ impl<P: Platform> GraphicsDecoder<P> {
             after,
         };
         let at_decode = (ending.after.as_ref()).map(|(both, _)| {
-            self.post_at_decode(cb_obj_id, seqno, (&ending.turn, both), &line, scheduled.clone())
+            self.post_at_decode(
+                cb_obj_id,
+                seqno,
+                (&ending.turn, both),
+                &line,
+                scheduled.clone(),
+            )
         });
         // Register the submission and completion paths and commit: no scheduled or completed
         // handler, so the platform posts the buffer's records from the threads that submit it
@@ -5800,7 +5808,10 @@ mod tests {
 
     /// Each `encodeSignalEvent:value:` and `encodeWaitForEvent:value:` since `mark`: whether it
     /// signals, its event's id and its value.
-    fn event_calls(r: &super::super::surface_pages::tests::Rig, mark: u64) -> Vec<(bool, u64, u64)> {
+    fn event_calls(
+        r: &super::super::surface_pages::tests::Rig,
+        mark: u64,
+    ) -> Vec<(bool, u64, u64)> {
         (r.p.call_log().since(mark).iter())
             .filter_map(|c| {
                 let signals = if c.sel == "encodeSignalEvent:value:" {
@@ -5811,7 +5822,11 @@ mod tests {
                     return None;
                 };
                 let event = c.args.first().and_then(Arg::as_obj).map_or(0, |o| o.0);
-                Some((signals, event, c.args.get(1).and_then(Arg::as_u64).unwrap_or(0)))
+                Some((
+                    signals,
+                    event,
+                    c.args.get(1).and_then(Arg::as_u64).unwrap_or(0),
+                ))
             })
             .collect()
     }
@@ -5889,7 +5904,8 @@ mod tests {
         assert!(posted(&records).is_empty(), "behind buffer 100");
         assert_eq!(seen.landings.lock().len(), 1);
         for id in first {
-            r.p.world().complete(id, CommandBufferStatus::COMPLETED, None, CompleteOn::Caller);
+            r.p.world()
+                .complete(id, CommandBufferStatus::COMPLETED, None, CompleteOn::Caller);
         }
         assert_eq!(
             (posted(&records).iter())
@@ -5926,7 +5942,9 @@ mod tests {
         assert_eq!(posted(&records).len(), 1);
         let mark = r.p.call_log().mark();
         assert_eq!(
-            r.dec.decode(&r.device, &reads_cached_video(200, 1)).unwrap(),
+            r.dec
+                .decode(&r.device, &reads_cached_video(200, 1))
+                .unwrap(),
             Ok(())
         );
         let waits = |r: &super::super::surface_pages::tests::Rig, mark| {
@@ -5946,7 +5964,9 @@ mod tests {
         r.p.world().complete_all(CompleteOn::Caller);
         let mark = r.p.call_log().mark();
         assert_eq!(
-            r.dec.decode(&r.device, &reads_cached_video(201, 2)).unwrap(),
+            r.dec
+                .decode(&r.device, &reads_cached_video(201, 2))
+                .unwrap(),
             Ok(())
         );
         assert!(waits(&r, mark).is_empty(), "its end has come");
@@ -5971,7 +5991,11 @@ mod tests {
         std::thread::scope(|scope| {
             let walk = scope.spawn(|| walker.decode(&r.p.device(), &message).unwrap());
             std::thread::sleep(std::time::Duration::from_millis(100));
-            assert_eq!(seen.decodes.lock().len(), 1, "it waits for buffer 100's end");
+            assert_eq!(
+                seen.decodes.lock().len(),
+                1,
+                "it waits for buffer 100's end"
+            );
             r.p.world().complete_all(CompleteOn::Caller);
             assert_eq!(walk.join().unwrap(), Ok(()));
         });

@@ -361,8 +361,8 @@ impl CompletedAhead {
         now: MonoTime,
     ) -> Option<RgfxSurfaceWriter> {
         let wait = self.waits_for(0, std::iter::once(block), now).pop()?;
-        let covered = (named.iter())
-            .any(|w| w.queue_obj_id == wait.queue_obj_id && w.seqno >= wait.seqno);
+        let covered =
+            (named.iter()).any(|w| w.queue_obj_id == wait.queue_obj_id && w.seqno >= wait.seqno);
         if covered {
             return None;
         }

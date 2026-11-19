@@ -134,7 +134,11 @@ mod tests {
         assert_eq!(*log.lock(), [1, 2, 3]);
         assert_eq!(line.waiting(), 0);
         line.turn().finish(noting(&log, 4));
-        assert_eq!(*log.lock(), [1, 2, 3, 4], "a turn at the front posts at once");
+        assert_eq!(
+            *log.lock(),
+            [1, 2, 3, 4],
+            "a turn at the front posts at once"
+        );
     }
 
     #[test]

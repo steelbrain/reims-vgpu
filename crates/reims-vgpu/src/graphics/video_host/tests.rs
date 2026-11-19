@@ -521,7 +521,11 @@ fn a_failure_after_a_completion_at_the_decode_fails_the_next_decode_alone() {
     go.send(()).unwrap();
     assert!(event_of(&s).wait_until_signaled_value(3, 10_000));
     assert!(first.failed());
-    assert_eq!(counted(), before + 1, "its completion was posted at its decode");
+    assert_eq!(
+        counted(),
+        before + 1,
+        "its completion was posted at its decode"
+    );
     assert!(
         next.landed.as_deref().is_some_and(Landed::failed),
         "the next decode's command buffer completes failed"

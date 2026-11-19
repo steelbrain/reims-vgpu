@@ -1487,23 +1487,25 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
             #[cfg(unix)]
             Some(targets) if to.luma.cached || to.chroma.cached => {
                 match targets.in_cache(to.luma, to.chroma, bit_depth) {
-                    Ok((layout, bytes)) => match self.write_in_place(&layout, &bytes, &mut || {
-                        to.decode_done()
-                    })? {
-                        None => {
-                            to.luma.external_write_done()?;
-                            return Ok(());
+                    Ok((layout, bytes)) => {
+                        match self.write_in_place(&layout, &bytes, &mut || to.decode_done())? {
+                            None => {
+                                to.luma.external_write_done()?;
+                                return Ok(());
+                            }
+                            Some(why) => format!("in its device cache: {why}"),
                         }
-                        Some(why) => format!("in its device cache: {why}"),
-                    },
+                    }
                     Err(why) => why,
                 }
             }
             _ => match in_place(to.luma, to.chroma, bit_depth) {
-                Ok((layout, pages)) => match self.write_in_place(&layout, &*pages.memory, &mut || {})? {
-                    None => return Ok(()),
-                    Some(why) => why,
-                },
+                Ok((layout, pages)) => {
+                    match self.write_in_place(&layout, &*pages.memory, &mut || {})? {
+                        None => return Ok(()),
+                        Some(why) => why,
+                    }
+                }
                 Err(why) => why,
             },
         };
