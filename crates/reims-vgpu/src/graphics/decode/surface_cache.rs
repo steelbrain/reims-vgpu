@@ -13578,7 +13578,10 @@ pub(super) mod tests {
 
         into_pages.release();
         into_pages.flush();
-        assert!(done.load(Ordering::SeqCst), "answered once the pages hold it");
+        assert!(
+            done.load(Ordering::SeqCst),
+            "answered once the pages hold it"
+        );
         assert!(
             ram_bytes(&r, 1, length, None).iter().all(|&b| b == 0xc3),
             "the pages hold what the GPU copied out of the cache"
