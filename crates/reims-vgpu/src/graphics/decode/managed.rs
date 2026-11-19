@@ -2206,7 +2206,8 @@ mod tests {
         use crate::pool::{Pool as SharedPool, PoolConfig, PoolHost};
 
         let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
-        let platform = RtPlatform::process();
+        // A platform of the test's own, whose drop lets go of its device before the process exits.
+        let platform = Arc::new(RtPlatform::new());
         let device = platform.metal_device(None).unwrap();
         let unified = (device.identity_caps().flags.has_unified_memory).unwrap_or(false);
         let pins = <RtPlatform as ApiPlatform>::PINS_IN_BLOCKS;
