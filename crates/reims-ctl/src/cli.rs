@@ -1742,17 +1742,13 @@ fn doctor(host: Host) -> Result<i32> {
                 )
             };
             line(ok, "usb", detail);
-            let session = std::env::var_os("WAYLAND_DISPLAY").is_some()
-                || std::env::var_os("DISPLAY").is_some();
-            line(
-                session,
-                "desktop session",
-                if session {
-                    "found".into()
-                } else {
-                    "neither WAYLAND_DISPLAY nor DISPLAY is set: a VM's window needs a desktop session".into()
-                },
+            let (ok, detail) = desktop_check(
+                crate::host::has_screen(&Default::default()),
+                "found",
+                "neither WAYLAND_DISPLAY nor DISPLAY is set",
+                &registered_vms(),
             );
+            line(ok, "desktop session", detail);
         }
         // The Windows Hypervisor Platform, the GPUs, the sound devices and the desktop, for the
         // x86-64 VMs Windows runs.
@@ -1845,18 +1841,70 @@ fn windows_checks(line: &mut dyn FnMut(bool, &str, String)) {
             (false, _) => "no output device: VMs run without sound".into(),
         },
     );
-    let desktop = crate::host::has_screen(&Default::default());
-    line(
-        desktop,
-        "desktop",
-        if desktop {
-            "a signed-in desktop, where a VM's window opens".into()
-        } else {
-            "this is no signed-in desktop's session (a service's or an SSH login's): a VM's \
-             window opens only on one"
-                .into()
-        },
+    let (ok, detail) = desktop_check(
+        crate::host::has_screen(&Default::default()),
+        "a signed-in desktop, where a VM's window opens",
+        "this is no signed-in desktop's session (a service's or an SSH login's)",
+        &registered_vms(),
     );
+    line(ok, "desktop", detail);
+}
+
+/// The VMs this user has whose settings read.
+fn registered_vms() -> Vec<Vm> {
+    Registry::load()
+        .map(|reg| {
+            reg.vms
+                .iter()
+                .filter_map(|e| Vm::load(&e.dir).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the VM's start opens the library's window: on reims-vgpu's own device, unless its
+/// variables give `REIMS_VGPU_WINDOW=0`, which keeps QEMU's device headless.
+fn opens_window(vm: &Vm) -> bool {
+    let env = &vm.config.extra_env;
+    let headless = env.get("REIMS_VGPU_WINDOW").is_some_and(|v| v == "0");
+    vm.config.graphics().library() && !headless
+}
+
+/// doctor's line on the desktop a VM's window opens on, `session` whether this process has one:
+/// a failure only where a VM of `vms` would open a window and finds no screen (its own
+/// variables can name one). A host whose VMs run headless, or that has none yet, needs none.
+fn desktop_check(session: bool, found: &str, missing: &str, vms: &[Vm]) -> (bool, String) {
+    if session {
+        return (true, found.into());
+    }
+    let blind: Vec<&str> = vms
+        .iter()
+        .filter(|vm| opens_window(vm) && !crate::host::has_screen(&vm.config.extra_env))
+        .map(|vm| vm.name())
+        .collect();
+    match blind.as_slice() {
+        [] if vms.is_empty() => (
+            true,
+            format!("{missing}: a VM's window needs a desktop session, and there are no VMs yet"),
+        ),
+        [] => (
+            true,
+            format!(
+                "{missing}, and no VM here needs one: each runs headless or names a screen in its \
+                 variables"
+            ),
+        ),
+        _ => (
+            false,
+            format!(
+                "{missing}, and {} open{} a window, which needs a desktop session: start {} from \
+                 one, or headless (reims-ctl set NAME --env REIMS_VGPU_WINDOW=0)",
+                blind.join(", "),
+                if blind.len() == 1 { "s" } else { "" },
+                if blind.len() == 1 { "it" } else { "them" },
+            ),
+        ),
+    }
 }
 
 /// `n` of `what`: 1 device, 2 devices.
@@ -2113,6 +2161,55 @@ mod tests {
                 .any(|(k, _)| k.starts_with("display"))
         );
         assert!(!script_comment(&vm).contains("windows"));
+    }
+
+    /// A VM, `name`, of `graphics` (a settings line, or empty), whose variables name no screen
+    /// whatever this process's are, with `env` over that.
+    #[cfg(unix)]
+    fn screenless_vm(name: &str, graphics: &str, env: &[(&str, &str)]) -> Vm {
+        let mut config: vm::VmConfig = toml::from_str(&config(graphics)).unwrap();
+        config.name = name.into();
+        config.extra_env = [("WAYLAND_DISPLAY", ""), ("DISPLAY", "")]
+            .iter()
+            .chain(env)
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Vm {
+            dir: format!("/nonexistent/reims-ctl/{name}").into(),
+            config,
+        }
+    }
+
+    /// doctor fails on the desktop only where a VM would open a window and finds no screen: one
+    /// on reims-vgpu's own device without REIMS_VGPU_WINDOW=0. VMs started headless, VMware
+    /// SVGA's (QEMU's window, left out without a screen), one whose own variables name a screen,
+    /// and no VMs at all need no session of this process's.
+    #[cfg(unix)]
+    #[test]
+    fn doctor_wants_a_desktop_only_for_a_vms_window() {
+        let check = |session, vms: &[Vm]| desktop_check(session, "found", "no session", vms);
+        let windowed = screenless_vm("w", "", &[]);
+        let headless = screenless_vm("h", "", &[("REIMS_VGPU_WINDOW", "0")]);
+        let svga = screenless_vm("s", "graphics = \"vmware-svga\"", &[]);
+        let shown = screenless_vm("d", "", &[("DISPLAY", ":1")]);
+        assert!(opens_window(&windowed) && opens_window(&shown));
+        assert!(!opens_window(&headless) && !opens_window(&svga));
+
+        let found = check(true, std::slice::from_ref(&windowed));
+        assert_eq!(found, (true, "found".to_string()));
+        let (ok, detail) = check(false, &[]);
+        assert!(ok && detail.contains("there are no VMs yet"), "{detail}");
+        let (ok, detail) = check(false, &[headless.clone(), svga.clone(), shown.clone()]);
+        assert!(ok && detail.contains("no VM here needs one"), "{detail}");
+        let (ok, detail) = check(false, &[headless.clone(), windowed.clone()]);
+        assert!(!ok, "{detail}");
+        assert!(
+            detail.starts_with("no session, and w opens a window, which needs a desktop session"),
+            "{detail}"
+        );
+        assert!(detail.contains("REIMS_VGPU_WINDOW=0"), "{detail}");
+        let (ok, detail) = check(false, &[windowed, screenless_vm("x", "", &[])]);
+        assert!(!ok && detail.contains("w, x open a window"), "{detail}");
     }
 
     #[test]
