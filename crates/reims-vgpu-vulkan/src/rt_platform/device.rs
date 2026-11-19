@@ -87,32 +87,47 @@ pub const OVER_COPIES_IMPORTED_CODE: &str = "rt-over-copies-imported";
 /// The code of their bytes (`Metrics::over_copy_bytes_imported`).
 pub const OVER_COPY_BYTES_IMPORTED_CODE: &str = "rt-over-copy-bytes-imported";
 
-/// The process's device's counters, once it is made ([`open`]), which [`fold_metrics`] reads.
-static COUNTERS: OnceLock<rt::Counters> = OnceLock::new();
+/// The counters of the device the process made last ([`open`]), which [`fold_metrics`] reads,
+/// with what it folded so far of each of their metrics, in [`fold`]'s order.
+type Folding = Option<(rt::Counters, [u64; 4])>;
 
-/// What [`fold_metrics`] folded so far of each of its metrics, in [`fold`]'s order.
-static FOLDED: crate::core::sync::Mutex<[u64; 4]> = crate::core::sync::Mutex::new([0; 4]);
+/// The process's [`Folding`], once a device is made.
+static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::new(None);
 
 /// Counts by code (`crate::answer::count_kind_by`) what rt's over-copy metrics of the process's
 /// device rose by since the last fold, so the counts line carries their totals (the module's
 /// docs). Nothing before the device is made.
 pub fn fold_metrics() {
-    let Some(counters) = COUNTERS.get() else {
-        return;
-    };
+    if let Some((counters, folded)) = COUNTERS.lock().as_mut() {
+        fold(folded, over_copies(counters));
+    }
+}
+
+/// Makes `counters`, those of a device just made, the ones [`fold_metrics`] reads. What the
+/// device before it rose by since the last fold is folded first, so that the counts line keeps
+/// its totals after a let-go (`RtPlatform::let_go_of_device`) and adds the new device's.
+fn follow(counters: rt::Counters) {
+    let mut latest = COUNTERS.lock();
+    if let Some((before, folded)) = latest.as_mut() {
+        fold(folded, over_copies(before));
+    }
+    *latest = Some((counters, [0; 4]));
+}
+
+/// The over-copy metrics of `counters` now, in [`fold`]'s order.
+fn over_copies(counters: &rt::Counters) -> [u64; 4] {
     let m = counters.metrics();
-    let now = [
+    [
         m.over_copies,
         m.over_copy_bytes,
         m.over_copies_imported,
         m.over_copy_bytes_imported,
-    ];
-    fold(&mut FOLDED.lock(), now);
+    ]
 }
 
 /// rt's metrics of the process's device now (`super::diag`); `None` before it is made.
 pub(super) fn metrics() -> Option<rt::Metrics> {
-    COUNTERS.get().map(rt::Counters::metrics)
+    (COUNTERS.lock().as_ref()).map(|(counters, _)| counters.metrics())
 }
 
 /// Counts the rise of each of `now` over `folded`, the over-copies, their bytes, and those of an
@@ -321,8 +336,8 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
     let device = rt::Device::new(physical, options)?;
     let present_fences =
         fences.is_some_and(|name| (device.extensions().iter()).any(|n| n.as_c_str() == name));
-    // The process's one device (the module's docs); where a test makes another, the first's fold.
-    let _ = COUNTERS.set(device.counters());
+    // The process's latest device (the module's docs), the one before it folded first.
+    follow(device.counters());
     let facts = facts(&device, floor, &uuid, page_size);
     log::info!(
         target: TARGET,
