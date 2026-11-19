@@ -22,14 +22,14 @@ impl ApiPlatform for RtPlatform {
         }
     }
 
-    /// Never reached: no texture exists until the textures' piece is built.
+    /// The whole texture, through rt's `getBytes:` (`RtTexture::read_pixels`); `dst` is left as
+    /// it was where rt refuses it, counted.
     fn read_pixels(
         &self,
         texture: &<Self as Platform>::Texture,
         dst: &mut [u8],
         bytes_per_row: usize,
     ) {
-        let _ = (dst, bytes_per_row);
-        texture.unreachable()
+        texture.read_pixels(dst, bytes_per_row);
     }
 }

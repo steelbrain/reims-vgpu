@@ -135,6 +135,22 @@ impl RtTexture {
         &self.rt
     }
 
+    /// The host's read-back (`reims_vgpu`'s `ApiPlatform::read_pixels`): the whole of level 0 and
+    /// slice 0 into `dst`, rows `bytes_per_row` apart, through rt's `getBytes:`. Where rt refuses
+    /// it (a Private texture among them), `dst` is left as it was, counted under rt's kind.
+    pub fn read_pixels(&self, dst: &mut [u8], bytes_per_row: usize) {
+        const SEL: &str = "getBytes:bytesPerRow:fromRegion:mipmapLevel:";
+        let d = self.rt.descriptor();
+        let region = rt::Region {
+            origin: [0; 3],
+            size: [d.width, d.height, 1],
+        };
+        let row = bytes_per_row.to_u64();
+        if let Err(error) = self.rt.get_bytes(dst, row, 0, region, 0, 0) {
+            rt_refused(SEL, &error);
+        }
+    }
+
     /// The view `sel` makes of this texture: in `pixel_format`, of `texture_type` (this texture's
     /// where `None`), over `levels` and `slices` (every one where `None`), read through `swizzle`
     /// where given, at the guest's `resource_index` (0: none placed). Nil, counted, where rt

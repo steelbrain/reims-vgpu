@@ -146,7 +146,11 @@ impl Coverage {
     /// Joins the ranges from the one before `start` to the one at `end` that touch a neighbour of
     /// as many runs, so that ranges split by runs gone do not pile up.
     fn merge(&mut self, start: u64, end: u64) {
-        let first = self.ranges.range(..start).next_back().map_or(start, |(&s, _)| s);
+        let first = self
+            .ranges
+            .range(..start)
+            .next_back()
+            .map_or(start, |(&s, _)| s);
         let keys: Vec<u64> = self.ranges.range(first..=end).map(|(&s, _)| s).collect();
         let mut kept: Option<(u64, u64, u32)> = None;
         for s in keys {
@@ -182,7 +186,11 @@ mod tests {
         c.add(0x2000, 0x5000);
         assert_eq!(
             ranges(&c),
-            [(0x1000, 0x2000, 1), (0x2000, 0x3000, 2), (0x3000, 0x5000, 1)]
+            [
+                (0x1000, 0x2000, 1),
+                (0x2000, 0x3000, 2),
+                (0x3000, 0x5000, 1)
+            ]
         );
         assert!(c.meets(0x2fff, 0x3001) && c.meets(0x4fff, 0x9000));
         assert!(!c.meets(0x5000, 0x6000) && !c.meets(0, 0x1000) && !c.meets(0x1800, 0x1800));
