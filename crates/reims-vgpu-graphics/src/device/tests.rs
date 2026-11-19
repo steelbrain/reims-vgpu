@@ -5471,10 +5471,7 @@ fn a_pool_take_and_give_go_to_the_host_where_the_driver_took_the_pool() {
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     let mut short = pool_take(6, 0x1_0000);
     short.truncate(24);
-    assert_eq!(
-        take(&mut rig, short),
-        (RGFX_STATUS_INVALID_ARGUMENT, 0, 0)
-    );
+    assert_eq!(take(&mut rig, short), (RGFX_STATUS_INVALID_ARGUMENT, 0, 0));
     assert_eq!(
         *host.seen.lock(),
         [

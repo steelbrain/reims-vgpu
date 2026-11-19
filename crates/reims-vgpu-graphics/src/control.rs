@@ -197,7 +197,9 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
         RGFX_CMD_POOL_TAKE if shared.driver_took(RGFX_FEATURE_POOL) => {
             match read::<RgfxPoolTake>(message) {
                 Some(take) => {
-                    shared.host.pool_take(&take, shared.pool_answer(seqno, epoch));
+                    shared
+                        .host
+                        .pool_take(&take, shared.pool_answer(seqno, epoch));
                     None
                 }
                 None => Some(pool_block(seqno, RGFX_STATUS_INVALID_ARGUMENT, 0, 0)),

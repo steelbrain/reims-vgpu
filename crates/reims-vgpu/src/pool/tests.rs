@@ -555,7 +555,10 @@ fn a_take_is_carved_zeroed_and_answered_with_its_length_rounded_up() {
     let host = Arc::new(Host::default());
     let (pool, _blocks, ledger) = live_pool(&host, LONG);
     fill(&pool, 0, 3 * TAKE_ALIGN, 0xa5);
-    assert_eq!(answer(&take(&ledger, 1, 100 << 10)), Some((0, 2 * TAKE_ALIGN)));
+    assert_eq!(
+        answer(&take(&ledger, 1, 100 << 10)),
+        Some((0, 2 * TAKE_ALIGN))
+    );
     // The block's bytes are zero, and those past it as they were.
     assert!(all(&pool, 0, 2 * TAKE_ALIGN, 0));
     assert!(all(&pool, 2 * TAKE_ALIGN, TAKE_ALIGN, 0xa5));
@@ -578,7 +581,10 @@ fn a_contexts_takes_are_answered_in_its_order_and_share_a_piece_first_fit() {
     let host = Arc::new(Host::default());
     let (_pool, _blocks, ledger) = live_pool(&host, LONG);
     let (tx, rx) = std::sync::mpsc::channel();
-    for (n, length) in [TAKE_ALIGN, 2 * TAKE_ALIGN, TAKE_ALIGN].into_iter().enumerate() {
+    for (n, length) in [TAKE_ALIGN, 2 * TAKE_ALIGN, TAKE_ALIGN]
+        .into_iter()
+        .enumerate()
+    {
         let tx = tx.clone();
         let answer: TakeAnswer = Box::new(move |block| {
             let _ = tx.send((n, block));
@@ -611,7 +617,10 @@ fn a_take_that_fits_no_piece_grows_the_pool_and_waits_for_the_hosts_map() {
     let rx = take(&ledger, 1, TAKE_ALIGN);
     assert_eq!(host.wait_for(1)[0], Call::Add(BASE, BLOCK_LEN));
     std::thread::sleep(Duration::from_millis(50));
-    assert!(rx.try_recv().is_err(), "answered before the host mapped the piece");
+    assert!(
+        rx.try_recv().is_err(),
+        "answered before the host mapped the piece"
+    );
     pool.added(BASE).unwrap();
     assert_eq!(answer(&rx), Some((0, TAKE_ALIGN)));
     // Its piece used, the pool asks for another as headroom.
@@ -672,7 +681,10 @@ fn a_heap_is_made_only_over_bytes_in_one_block_the_context_holds() {
     let len = 2 * TAKE_ALIGN;
     assert_eq!(answer(&take(&ledger, 1, len)), Some((0, len)));
     let first = pool.find(BASE + TAKE_ALIGN, 1).unwrap().host;
-    assert_eq!(ledger.over_held(1, TAKE_ALIGN, TAKE_ALIGN, |p| p), Some(first));
+    assert_eq!(
+        ledger.over_held(1, TAKE_ALIGN, TAKE_ALIGN, |p| p),
+        Some(first)
+    );
     assert_eq!(ledger.over_held(1, TAKE_ALIGN, len, |p| p), None);
     assert_eq!(ledger.over_held(2, 0, TAKE_ALIGN, |p| p), None);
     assert_eq!(ledger.over_held(1, len, TAKE_ALIGN, |p| p), None);
@@ -691,7 +703,11 @@ fn a_close_lets_go_of_every_block_of_its_context_and_no_other() {
     assert_eq!(ledger.counts(), (3, 3 * TAKE_ALIGN));
     ledger.free(&gone);
     assert_eq!(ledger.counts(), (1, TAKE_ALIGN));
-    assert!(ledger.over_held(2, TAKE_ALIGN, TAKE_ALIGN, |_| ()).is_some());
+    assert!(
+        ledger
+            .over_held(2, TAKE_ALIGN, TAKE_ALIGN, |_| ())
+            .is_some()
+    );
 }
 
 #[test]

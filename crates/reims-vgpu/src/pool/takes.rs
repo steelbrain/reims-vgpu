@@ -153,7 +153,11 @@ impl Drop for PoolLedger {
     fn drop(&mut self) {
         let mut st = self.shared.state.lock();
         st.keepers = st.keepers.saturating_sub(1);
-        let left = if st.keepers == 0 { st.left.take() } else { None };
+        let left = if st.keepers == 0 {
+            st.left.take()
+        } else {
+            None
+        };
         drop(st);
         if let Some(source) = left {
             self.shared.give_all_back(source);
@@ -266,9 +270,10 @@ impl PoolLedger {
             return Give::NotFound;
         };
         let mut st = self.shared.state.lock();
-        let held = st.carves.get(&at).is_some_and(|c| {
-            c.context == context && c.len == length && c.state == Carving::Held
-        });
+        let held = st
+            .carves
+            .get(&at)
+            .is_some_and(|c| c.context == context && c.len == length && c.state == Carving::Held);
         if !held {
             return Give::NotFound;
         }
@@ -367,7 +372,10 @@ impl PoolLedger {
 
     /// The pool's guest physical range: its first address and its length.
     pub(crate) fn range(&self) -> (u64, u64) {
-        (self.shared.range.physical_address, self.shared.range.physical_length)
+        (
+            self.shared.range.physical_address,
+            self.shared.range.physical_length,
+        )
     }
 
     /// The blocks the contexts hold, taken or being taken, and their bytes (for the tests).
@@ -609,7 +617,11 @@ impl Shared {
                 return Grown::NoRoom;
             };
             // Once the host mapped it, or it went: a carve looks at live pieces alone.
-            while st.pieces.get(&piece).is_some_and(|p| p.mapped == Mapped::Adding) {
+            while st
+                .pieces
+                .get(&piece)
+                .is_some_and(|p| p.mapped == Mapped::Adding)
+            {
                 if !st.stands(context, life) {
                     return Grown::Stale;
                 }

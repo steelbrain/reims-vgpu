@@ -14048,7 +14048,11 @@ fn a_guest_s_pool_block_is_taken_held_by_its_heap_and_given_back() {
     );
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     let mut guest = Guest::new(&device);
-    let ledger = device.control.shared_pool.clone().expect("the pool is offered");
+    let ledger = device
+        .control
+        .shared_pool
+        .clone()
+        .expect("the pool is offered");
     // The first take grows the pool, and is answered once the host mapped the piece.
     guest.send(&device, pool_take(1, 0x1_8000));
     let at = adds.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -14101,7 +14105,10 @@ fn an_arm64_guest_is_offered_no_pool() {
         };
         let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
         let offered = u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32;
-        (offered & RGFX_FEATURE_POOL != 0, device.control.shared_pool.is_some())
+        (
+            offered & RGFX_FEATURE_POOL != 0,
+            device.control.shared_pool.is_some(),
+        )
     };
     assert_eq!(pool_of(GuestArch::Arm64), (false, false));
     assert_eq!(pool_of(GuestArch::X86_64), (!cfg!(windows), !cfg!(windows)));
