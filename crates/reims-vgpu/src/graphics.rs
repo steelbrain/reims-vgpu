@@ -311,10 +311,10 @@ pub struct GraphicsConfig {
     pub doorbell_pages: bool,
     /// The guest physical addresses the host can give the guest's Shared pool, with no RAM
     /// under them, which the device fills with blocks as the pool grows (`crate::pool`); `None`
-    /// is no pool. The device takes from their start as many as its GPU's Shared memory heap
-    /// holds ([`PoolConfig::sized`]), at most all of them, and none where the GPU has no such
-    /// heap: [`GraphicsDevice::pool_range`] answers the range it took, which the host keeps
-    /// free for the device's life. Given, it needs [`GraphicsCallbacks::pool_add`] and
+    /// is no pool. The device takes from their start as many as its GPU's memory heaps hold,
+    /// every heap summed ([`PoolConfig::sized`]), at most all of them, and none where the GPU
+    /// answers no heap: [`GraphicsDevice::pool_range`] answers the range it took, which the host
+    /// keeps free for the device's life. Given, it needs [`GraphicsCallbacks::pool_add`] and
     /// `pool_remove`, a range [`PoolConfig::is_valid`] takes, and none of
     /// [`Self::memory_map`]'s ranges overlapping it: otherwise [`Error::InvalidArgument`].
     pub pool: Option<PoolConfig>,
@@ -426,31 +426,30 @@ fn pool_host(config: &GraphicsConfig) -> Result<Option<(PoolConfig, PoolHost)>, 
 }
 
 /// The range the device's pool takes of `room`, the addresses the host can give it, on a GPU
-/// whose Shared memory heap holds `heap` bytes ([`PoolConfig::sized`]), logged once a device:
-/// with a warning where the GPU has no such heap, and so no pool, or where the room holds less
-/// than the heap, and the range stops at the room's end.
-fn pool_range(room: PoolConfig, heap: u64) -> Option<PoolConfig> {
-    let Some(range) = room.sized(heap) else {
-        log::warn!(
-            "pool: the GPU has no host-visible, host-coherent and host-cached memory, which the \
-             pool's blocks come from: the guest has no Shared pool"
-        );
+/// whose memory heaps hold `heaps` bytes, every heap summed ([`PoolConfig::sized`]), logged once
+/// a device, with the room's size: with a warning where the GPU answers no heap, and so no pool,
+/// or where the room holds less than the heaps, and the range stops at the room's end.
+fn pool_range(room: PoolConfig, heaps: u64) -> Option<PoolConfig> {
+    let Some(range) = room.sized(heaps) else {
+        log::warn!("pool: the GPU answers no memory heap: the guest has no Shared pool");
         return None;
     };
-    if range.physical_length < heap {
+    if range.physical_length < heaps {
         log::warn!(
-            "pool: the guest's {} MiB of addresses at {:#x} hold less than the GPU's Shared heap \
-             of {} MiB: the pool's range stops there",
+            "pool: the guest's {} MiB of addresses at {:#x} hold less than the GPU's {} MiB of \
+             memory heaps: the pool's range stops there",
             room.physical_length >> 20,
             room.physical_address,
-            heap >> 20
+            heaps >> 20
         );
     }
     log::info!(
-        "pool: {} MiB of guest addresses at {:#x}, for the GPU's Shared heap of {} MiB",
+        "pool: {} MiB of guest addresses at {:#x}, of {} MiB the host can give, for the GPU's {} \
+         MiB of memory heaps",
         range.physical_length >> 20,
         range.physical_address,
-        heap >> 20
+        room.physical_length >> 20,
+        heaps >> 20
     );
     Some(range)
 }
@@ -540,8 +539,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let clock = Arc::clone(&platform);
             let pool = CompilePool::new(Box::new(move || clock.clock().now_mono()));
             let identity = gpu_device.identity_caps();
-            // The heap the guest's Shared pool's blocks come from, which sizes its range below.
-            let shared_heap = gpu_device.shared_heap_size();
+            // The GPU's memory heaps, summed, which size the guest's Shared pool's range below.
+            let memory_heaps = gpu_device.memory_heaps_total();
             // `Managed` resources are one copy where the platform answers that the GPU shares the
             // CPU's memory, else two, which hold Metal's contract on any GPU: the guest's device
             // answers `hasUnifiedMemory` alike, from the blob.
@@ -910,9 +909,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             drop(first_shown);
             // The guest's Shared pool, its blocks the process's own memory until the device runs
             // on metal2vulkan-rt, whose blocks then fill it through the same calls. Its range is
-            // what the GPU's heap of those blocks holds, of the addresses the host can give.
+            // what the GPU's memory heaps hold, of the addresses the host can give.
             let pool = match pool_host {
-                Some((room, host)) => match pool_range(room, shared_heap) {
+                Some((room, host)) => match pool_range(room, memory_heaps) {
                     Some(range) => {
                         let clock = Arc::clone(&platform);
                         let now = Box::new(move || clock.clock().now_mono());

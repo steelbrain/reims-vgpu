@@ -266,72 +266,36 @@ pub(crate) fn device_local_budget(device: &rt::Device) -> u64 {
         })
 }
 
-/// The flags of the memory type metal2vulkan-rt's Shared blocks come from, the blocks the guest's
-/// Shared pool maps into the guest: host-visible, host-coherent and host-cached (its README,
-/// "Queue family and memory types"), the first type with them that a buffer can use.
-const SHARED_MEMORY: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::from_raw(
-    vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw()
-        | vk::MemoryPropertyFlags::HOST_COHERENT.as_raw()
-        | vk::MemoryPropertyFlags::HOST_CACHED.as_raw(),
-);
-
-/// The size of the heap of `memory`'s Shared memory type: the first type with
-/// [`SHARED_MEMORY`]'s flags whose bit `usable` sets, as metal2vulkan-rt chooses it; 0 where no
-/// type has them.
-fn shared_heap_size_of(memory: &vk::PhysicalDeviceMemoryProperties, usable: u32) -> u64 {
-    use crate::core::num::ToUsize as _;
-    let heaps = memory.memory_heaps_as_slice();
-    (0u32..)
-        .zip(memory.memory_types_as_slice())
-        .find(|(index, kind)| {
-            usable.checked_shr(*index).unwrap_or(0) & 1 != 0
-                && kind.property_flags.contains(SHARED_MEMORY)
-        })
-        .and_then(|(_, kind)| heaps.get(kind.heap_index.to_usize()))
-        .map_or(0, |heap| heap.size)
+/// The bytes of `memory`'s heaps, every one of them, summed ([`memory_heaps_total`]).
+fn memory_heaps_total_of(memory: &vk::PhysicalDeviceMemoryProperties) -> u64 {
+    memory
+        .memory_heaps_as_slice()
+        .iter()
+        .fold(0u64, |sum, heap| sum.saturating_add(heap.size))
 }
 
-/// The bytes of the memory heap the guest's Shared pool's blocks come from on `device`
-/// ([`GpuDevice::shared_heap_size`]): the size of the heap of metal2vulkan-rt's Shared memory
-/// type ([`shared_heap_size_of`]), the memory types a buffer can use asked of a 64 KiB buffer of
-/// every usage but device addresses, which need a feature enabled; 0 where the GPU has no such
-/// type. The size, not `VK_EXT_memory_budget`'s budget: the pool's range is guest physical
-/// addresses held for the device's life, which RAM fills only as the pool takes blocks, while a
-/// budget is what the process may allocate at the moment it is read, which other processes move,
-/// and which a driver may answer past its heap's size ([`device_local_budget`]).
+/// The bytes of `device`'s memory heaps, every one of them, summed
+/// ([`GpuDevice::memory_heaps_total`]), which bound the guest's Shared pool's range. Every heap,
+/// not only the heap of metal2vulkan-rt's Shared memory type (host-visible, host-coherent and
+/// host-cached), whose blocks fill the pool: a heap's size is how the driver accounts for its
+/// memory, not what it will allocate (on a 780M, RADV gives that type a 5.52 GiB heap beside an
+/// 11.05 GiB device-local one, measured with `vulkaninfo` on 2026-11-18, both from the same system
+/// memory), and the runtime takes Shared blocks until the driver refuses one. The sizes, not
+/// `VK_EXT_memory_budget`'s budgets: the pool's range is guest physical addresses held for the
+/// device's life, which RAM fills only as the pool takes blocks, while a budget is what the
+/// process may allocate at the moment it is read, which other processes move, and which a driver
+/// may answer past its heap's size ([`device_local_budget`]).
 ///
-/// [`GpuDevice::shared_heap_size`]: crate::core::platform::device::GpuDevice::shared_heap_size
-pub(crate) fn shared_heap_size(device: &rt::Device) -> u64 {
-    let usage = vk::BufferUsageFlags::TRANSFER_SRC
-        | vk::BufferUsageFlags::TRANSFER_DST
-        | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
-        | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER
-        | vk::BufferUsageFlags::UNIFORM_BUFFER
-        | vk::BufferUsageFlags::STORAGE_BUFFER
-        | vk::BufferUsageFlags::INDEX_BUFFER
-        | vk::BufferUsageFlags::VERTEX_BUFFER
-        | vk::BufferUsageFlags::INDIRECT_BUFFER;
-    let info = vk::BufferCreateInfo::default()
-        .size(65_536)
-        .usage(usage)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    // SAFETY: the instance, physical device and device are the runtime's, while `device` lives;
-    // the buffer is the call's own, bound to nothing and destroyed before it returns.
-    let (memory, usable) = unsafe {
+/// [`GpuDevice::memory_heaps_total`]: crate::core::platform::device::GpuDevice::memory_heaps_total
+pub(crate) fn memory_heaps_total(device: &rt::Device) -> u64 {
+    // SAFETY: the instance and physical device are the runtime's, read only, while `device`
+    // lives.
+    let memory = unsafe {
         let raw = device.raw();
-        let memory = (raw.instance).get_physical_device_memory_properties(raw.physical_device);
-        let usable = match raw.device.create_buffer(&info, None) {
-            Ok(buffer) => {
-                let needs = raw.device.get_buffer_memory_requirements(buffer);
-                raw.device.destroy_buffer(buffer, None);
-                needs.memory_type_bits
-            }
-            // No buffer to ask: every type, as most drivers answer for one.
-            Err(_) => u32::MAX,
-        };
-        (memory, usable)
+        raw.instance
+            .get_physical_device_memory_properties(raw.physical_device)
     };
-    shared_heap_size_of(&memory, usable)
+    memory_heaps_total_of(&memory)
 }
 
 /// `maxArgumentBufferSamplerCount` of `device`: how many sampler states an argument buffer can
@@ -667,66 +631,38 @@ mod tests {
         assert!(budget <= device_local_bytes(&d.raw));
     }
 
-    /// Memory properties of `heaps` and of `types`, each `(flags, heap)`.
-    fn memory(
-        heaps: &[u64],
-        types: &[(vk::MemoryPropertyFlags, u32)],
-    ) -> vk::PhysicalDeviceMemoryProperties {
+    /// Memory properties of heaps of `sizes`, with no memory types.
+    fn memory(sizes: &[u64]) -> vk::PhysicalDeviceMemoryProperties {
         let mut m = vk::PhysicalDeviceMemoryProperties {
-            memory_heap_count: u32::try_from(heaps.len()).unwrap(),
-            memory_type_count: u32::try_from(types.len()).unwrap(),
+            memory_heap_count: u32::try_from(sizes.len()).unwrap(),
             ..Default::default()
         };
-        for (slot, &size) in m.memory_heaps.iter_mut().zip(heaps) {
+        for (slot, &size) in m.memory_heaps.iter_mut().zip(sizes) {
             slot.size = size;
-        }
-        for (slot, &(property_flags, heap_index)) in m.memory_types.iter_mut().zip(types) {
-            *slot = vk::MemoryType {
-                property_flags,
-                heap_index,
-            };
         }
         m
     }
 
-    /// The Shared pool's heap is that of the first memory type a buffer can use that is
-    /// host-visible, host-coherent and host-cached, as metal2vulkan-rt picks its Shared type: on a
-    /// discrete GPU's layout the system heap, not the device-local heaps nor the small one the
-    /// host sees of the GPU's memory; another heap where the buffer cannot use the first such
-    /// type; 0 where no type has the flags
+    /// The memory heaps' total is every heap's size summed, whatever lies over it: a discrete
+    /// GPU's own memory, the host's and the window the host sees of the GPU's, and an APU's two
+    /// heaps over the same memory; 0 for no heaps, and no wrap past the most a `u64` holds
     #[test]
-    fn the_shared_heap_is_that_of_the_first_cached_coherent_type_a_buffer_can_use() {
-        let (local, visible, coherent, cached) = (
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            vk::MemoryPropertyFlags::HOST_VISIBLE,
-            vk::MemoryPropertyFlags::HOST_COHERENT,
-            vk::MemoryPropertyFlags::HOST_CACHED,
-        );
+    fn the_memory_heaps_total_is_every_heap_summed() {
         // An RTX 3090's layout: 24 GiB of its own, the host's 31 GiB, and its 246 MiB window.
-        let discrete = memory(
-            &[24 << 30, 31 << 30, 246 << 20],
-            &[
-                (vk::MemoryPropertyFlags::empty(), 1),
-                (local, 0),
-                (visible | coherent, 1),
-                (visible | coherent | cached, 1),
-                (local | visible | coherent, 2),
-                (local | visible | coherent | cached, 2),
-            ],
-        );
-        assert_eq!(shared_heap_size_of(&discrete, u32::MAX), 31 << 30);
-        assert_eq!(shared_heap_size_of(&discrete, !(1 << 3)), 246 << 20);
-        assert_eq!(shared_heap_size_of(&discrete, 0b10111), 0);
-        let uncached = memory(&[8 << 30], &[(local, 0), (local | visible | coherent, 0)]);
-        assert_eq!(shared_heap_size_of(&uncached, u32::MAX), 0);
+        let discrete = memory(&[24 << 30, 31 << 30, 246 << 20]);
+        assert_eq!(memory_heaps_total_of(&discrete), (55 << 30) + (246 << 20));
+        // A 780M's under RADV: the host-cached types' heap and the device-local one.
+        let apu = memory(&[5_932_310_528, 11 << 30]);
+        assert_eq!(memory_heaps_total_of(&apu), 5_932_310_528 + (11 << 30));
+        assert_eq!(memory_heaps_total_of(&memory(&[])), 0);
+        assert_eq!(memory_heaps_total_of(&memory(&[u64::MAX, 1])), u64::MAX);
     }
 
-    /// The GPU's Shared heap is one of its heaps, or 0 where none of its memory types is
-    /// host-visible, host-coherent and host-cached
+    /// The device's memory heaps' total is its heaps' sizes summed, none of them past it
     #[test]
-    fn the_shared_heap_is_one_of_the_device_s_heaps() {
+    fn the_memory_heaps_total_is_the_device_s_heaps_summed() {
         let d = dev();
-        let size = d.shared_heap_size();
+        let total = d.memory_heaps_total();
         // SAFETY: the runtime's instance and physical device, read only, while `d` lives.
         let memory = unsafe {
             let raw = d.raw.raw();
@@ -737,17 +673,13 @@ mod tests {
             .iter()
             .map(|h| h.size)
             .collect();
-        let shared = |t: &vk::MemoryType| t.property_flags.contains(SHARED_MEMORY);
-        let cached = memory.memory_types_as_slice().iter().any(shared);
         eprintln!(
-            "shared heap: {size} bytes ({} MiB) of heaps {heaps:?} on {}",
-            size >> 20,
+            "memory heaps: {total} bytes ({} MiB) of heaps {heaps:?} on {}",
+            total >> 20,
             d.raw.name()
         );
-        if cached {
-            assert!(heaps.contains(&size), "{size} not among {heaps:?}");
-        } else {
-            assert_eq!(size, 0);
-        }
+        assert!(total > 0);
+        assert_eq!(total, heaps.iter().fold(0u64, |s, h| s.saturating_add(*h)));
+        assert!(heaps.iter().all(|h| *h <= total), "{heaps:?}");
     }
 }

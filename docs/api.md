@@ -177,15 +177,20 @@ pauses it keeps its device to the exit, and so does a quit while a read of its d
 
 A host names the guest physical addresses it can give the guest's Shared pool
 (`pool_physical_address`, `pool_physical_length`), 2 MiB-aligned and with no RAM under them, 0 and 0
-for none. The device takes from their start as many as the Shared memory heap of its GPU device
-holds, rounded up to 2 MiB: the heap of the first memory type with `HOST_VISIBLE`, `HOST_COHERENT`
-and `HOST_CACHED` that a buffer of the device's usage can use, which is where its Shared blocks come
-from. The bound is the heap's size, not `VK_EXT_memory_budget`'s budget: the range is address space
-the guest keeps for the VM's life, a budget moves with what other processes hold, and RAM is
-bounded at each block's take. Where the heap is larger than the addresses given, the range stops at
-their end and the device logs a warning once; where no memory type is host-cached, the guest has no
-pool, and the device logs that too. `rvg_graphics_device_pool_range` answers the range it took,
-0 and 0 for none, and the host reserves that before the guest's firmware runs. The host then maps
+for none. The device takes from their start as many as the memory heaps of its GPU device hold,
+every heap summed, rounded up to 2 MiB. Its Shared blocks come from the heap of the first memory
+type with `HOST_VISIBLE`, `HOST_COHERENT` and `HOST_CACHED` that a buffer of the device's usage can
+use, but a heap's size is how the driver accounts for memory, not the most it allocates: on an AMD
+APU, RADV splits the memory the GPU can use into that type's heap, a third of it (5.52 of 16.57 GiB
+on a 780M, measured 11-18 with `vulkaninfo`), and a device-local heap over the same memory, and the
+runtime takes Shared blocks until the driver refuses one. The bound is the heaps' sizes, not
+`VK_EXT_memory_budget`'s budgets: the range is address space the guest keeps for the VM's life, a
+budget moves with what other processes hold, and RAM is bounded at each block's take. Where the
+heaps hold more than the addresses given, the range stops at their end and the device logs a warning
+once; where the GPU answers no heap, the guest has no pool, and the device logs that too. The device
+logs the range it took, the addresses it was given and the heaps' total once, at its creation.
+`rvg_graphics_device_pool_range` answers the range it took, 0 and 0 for none, and the host reserves
+that before the guest's firmware runs. The host then maps
 the device's blocks there as the pool grows
 (`pool_add`, answered by `rvg_graphics_device_pool_added`) and unmaps them as the device frees them
 (`pool_remove`, answered by `rvg_graphics_device_pool_removed`). The device frees a block only once

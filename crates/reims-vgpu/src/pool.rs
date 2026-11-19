@@ -184,16 +184,17 @@ impl PoolConfig {
     }
 
     /// The range a pool takes of `self`, the guest physical addresses the host can give it, on a
-    /// GPU whose Shared memory heap holds `heap` bytes (`GpuDevice::shared_heap_size`): from
-    /// `self`'s start, `heap` rounded up to [`PIECE_ALIGN`], at most `self`'s length; `None` for a
-    /// heap of 0, where no block of the pool's could come from the GPU. The range is guest
-    /// physical addresses, which RAM fills only as the pool takes blocks: it bounds the pool by
-    /// what the heap can ever hold, and the heap's budget at a block's take bounds the RAM.
-    pub fn sized(self, heap: u64) -> Option<PoolConfig> {
-        if heap == 0 {
+    /// GPU whose memory heaps hold `heaps` bytes, every heap summed
+    /// (`GpuDevice::memory_heaps_total`): from `self`'s start, `heaps` rounded up to
+    /// [`PIECE_ALIGN`], at most `self`'s length; `None` for heaps of 0, where no block of the
+    /// pool's could come from the GPU. The range is guest physical addresses, which RAM fills only
+    /// as the pool takes blocks: it bounds the pool by what the GPU's memory can ever hold, and
+    /// the driver, which refuses a block it cannot give, bounds the RAM.
+    pub fn sized(self, heaps: u64) -> Option<PoolConfig> {
+        if heaps == 0 {
             return None;
         }
-        let want = heap
+        let want = heaps
             .checked_next_multiple_of(PIECE_ALIGN)
             .unwrap_or(u64::MAX);
         Some(PoolConfig {

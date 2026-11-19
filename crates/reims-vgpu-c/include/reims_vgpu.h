@@ -641,11 +641,11 @@ typedef struct {
   const RvgWindowConfig *const *display_windows;
   // The first guest physical address of the range the host can give the guest's Shared pool,
   // with no RAM or device under it, which the device fills with blocks of host memory as the
-  // pool grows (pool_add). The device takes from its start as many bytes as its GPU's Shared
-  // memory heap holds, rounded up to 2 MiB, at most `pool_physical_length`, and none where the
-  // GPU has no such heap; rvg_graphics_device_pool_range answers what it took, which the host
-  // keeps free while the device lives. 0, with `pool_physical_length` 0, for none, as a host
-  // built before this field, whose `struct_size` ends before it, has. Refused
+  // pool grows (pool_add). The device takes from its start as many bytes as its GPU's memory
+  // heaps hold, every heap summed, rounded up to 2 MiB, at most `pool_physical_length`, and none
+  // where the GPU answers no heap; rvg_graphics_device_pool_range answers what it took, which
+  // the host keeps free while the device lives. 0, with `pool_physical_length` 0, for none, as a
+  // host built before this field, whose `struct_size` ends before it, has. Refused
   // (RVG_ERR_INVALID_ARGUMENT): a range not in whole multiples of 2 MiB, one past the address
   // space, one a range of `memory_map` overlaps, and one given without both pool_add and
   // pool_remove.
@@ -707,13 +707,12 @@ RvgStatus rvg_graphics_device_pool_grow(RvgGraphicsDevice *device, uint64_t leng
 
 // The range of guest physical addresses the device's Shared pool took, of those its config gave
 // (`pool_physical_address`, `pool_physical_length`): its first address, and, through `length`
-// where it is not NULL, its length, a multiple of 2 MiB; 0 and 0 for a device without a pool.
-// The device takes it at its creation: from the config's address, as many bytes as the memory
-// heap its pool's blocks come from holds (on the Vulkan platform, the heap of the GPU's
-// host-visible, host-coherent and host-cached memory type, by its size in
-// VkPhysicalDeviceMemoryProperties), rounded up to 2 MiB, at most the config's length, and logs
-// a warning where the config's length holds less; none, with a warning, where the GPU has no
-// such memory. QEMU reserves it at realize, after the create, and gives the firmware its end.
+// where it is not NULL, its length, a multiple of 2 MiB; 0 and 0 for a device without a pool. The
+// device takes it at its creation: from the config's address, as many bytes as the GPU's memory
+// heaps hold, every heap summed, whatever memory lies under each (on the Vulkan platform, their
+// sizes in VkPhysicalDeviceMemoryProperties), rounded up to 2 MiB, at most the config's length,
+// and logs a warning where the config's length holds less; none, with a warning, where the GPU
+// answers no heap. QEMU reserves it at realize, after the create, and gives the firmware its end.
 // Calls back: never.
 //
 // # Safety

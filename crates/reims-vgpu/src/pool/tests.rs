@@ -120,14 +120,14 @@ fn a_range_must_be_whole_large_pages_and_not_empty() {
     );
 }
 
-/// A pool's range is the GPU's Shared heap from the start of the addresses the host can give,
-/// rounded up to whole large pages, and stops at the end of those addresses where they hold less;
-/// a GPU with no Shared heap gives no range
+/// A pool's range is the GPU's memory heaps, summed, from the start of the addresses the host can
+/// give, rounded up to whole large pages, and stops at the end of those addresses where they hold
+/// less; a GPU with no memory heaps gives no range
 #[test]
-fn a_range_is_the_shared_heap_rounded_to_large_pages_at_most_the_room() {
+fn a_range_is_the_memory_heaps_rounded_to_large_pages_at_most_the_room() {
     let room = range(43);
-    let sized = |heap: u64| {
-        room.sized(heap)
+    let sized = |heaps: u64| {
+        room.sized(heaps)
             .map(|r| (r.physical_address, r.physical_length))
     };
     assert_eq!(sized(24 << 30), Some((BASE, 24 << 30)));
@@ -138,8 +138,8 @@ fn a_range_is_the_shared_heap_rounded_to_large_pages_at_most_the_room() {
     assert_eq!(sized(64 << 30), Some((BASE, 43 << 30)));
     assert_eq!(sized(u64::MAX), Some((BASE, 43 << 30)));
     assert_eq!(sized(0), None);
-    for heap in [1, (24 << 30) - MIB, 64 << 30, u64::MAX] {
-        assert!(room.sized(heap).unwrap().is_valid(), "{heap:#x}");
+    for heaps in [1, (24 << 30) - MIB, 64 << 30, u64::MAX] {
+        assert!(room.sized(heaps).unwrap().is_valid(), "{heaps:#x}");
     }
 }
 

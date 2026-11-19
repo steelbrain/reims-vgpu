@@ -523,9 +523,9 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         FAKE_OWN_MEMORY
     }
 
-    /// [`FAKE_SHARED_HEAP`], unlogged.
-    fn shared_heap_size(&self) -> u64 {
-        FAKE_SHARED_HEAP
+    /// [`FAKE_MEMORY_HEAPS`], unlogged.
+    fn memory_heaps_total(&self) -> u64 {
+        FAKE_MEMORY_HEAPS
     }
 
     /// [`FAKE_LINEAR_ROW_ALIGNMENT`], unlogged.
@@ -905,9 +905,9 @@ pub fn fake_caps() -> DeviceCaps {
 /// too ([`GpuDevice::own_memory_budget`]).
 pub const FAKE_OWN_MEMORY: u64 = 0xcf5c_2c000;
 
-/// The fake device's Shared memory heap ([`GpuDevice::shared_heap_size`]): 24 GiB less 1 MiB, off
-/// the pool's 2 MiB granule, so the pool's range is seen rounded up.
-pub const FAKE_SHARED_HEAP: u64 = (24 << 30) - (1 << 20);
+/// The fake device's memory heaps, summed ([`GpuDevice::memory_heaps_total`]): 24 GiB less
+/// 1 MiB, off the pool's 2 MiB granule, so the pool's range is seen rounded up.
+pub const FAKE_MEMORY_HEAPS: u64 = (24 << 30) - (1 << 20);
 
 /// The fake device's alignment of a linear BGRA8 image's rows ([`GpuDevice::linear_row_alignment`]):
 /// 256 bytes, as the Vulkan platform's runtime answers on Mesa's RADV, apart from Metal's 16.

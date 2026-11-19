@@ -566,7 +566,7 @@ unsafe extern "C-unwind" fn pool_remove(_ctx: *mut c_void, physical_address: u64
 
 /// A pool needs both of its callbacks and a range of whole 2 MiB; a device without one refuses
 /// the pool's calls and answers no range; a device with one takes as much of the range as the
-/// GPU's Shared heap holds, in whole 2 MiB, at most all of it, grows on the host's ask, on its
+/// GPU's memory heaps hold, in whole 2 MiB, at most all of it, grows on the host's ask, on its
 /// pool thread, takes the host's word that it added the piece once, and its removal; a config of
 /// the fourth version, whose `struct_size` ends before the pool's fields, has no pool whatever
 /// lies past its size
@@ -624,7 +624,7 @@ fn a_pool_s_pieces_reach_the_host_and_back() {
         assert_eq!(length, 0);
         rvg_graphics_device_release(device);
 
-        // 2 MiB, less than any GPU's Shared heap: all of it.
+        // 2 MiB, less than any GPU's memory heaps: all of it.
         let c = RvgGraphicsDeviceConfig {
             pool_physical_address: BASE,
             pool_physical_length: 2 << 20,
@@ -635,7 +635,7 @@ fn a_pool_s_pieces_reach_the_host_and_back() {
         assert_eq!(length, 2 << 20);
         rvg_graphics_device_release(device);
 
-        // 1 TiB, more than any GPU's Shared heap: the heap's, in whole 2 MiB.
+        // 1 TiB, more than any GPU's memory heaps: the heaps', in whole 2 MiB.
         const ROOM: u64 = 1 << 40;
         let c = RvgGraphicsDeviceConfig {
             pool_physical_address: BASE,

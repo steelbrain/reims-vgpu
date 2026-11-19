@@ -199,14 +199,15 @@ is its transport:
   shows no presented surface.
 - **The guest's Shared pool**: at realize the device reserves guest
   physical addresses with no RAM under them, as many as the host GPU's
-  Shared memory heap holds. It offers the library the room from the host
-  bridge's `pci-hole64-end` rounded up to 1 GiB (0xac0000000, 43 GiB, on
-  `reims-ctl`'s 8 GiB q35 machine) to three quarters of the guest's
+  memory heaps hold, every heap summed. It offers the library the room from
+  the host bridge's `pci-hole64-end` rounded up to 1 GiB (0xac0000000, 43
+  GiB, on `reims-ctl`'s 8 GiB q35 machine) to three quarters of the guest's
   physical address space, in whole GiB, and after the create reserves the
   range the library took of it (`rvg_graphics_device_pool_range`,
   docs/api.md "The guest's Shared pool"), its end rounded up to 1 GiB. The
-  `reims_graphics_pool_reserved` trace prints the range and that end. A
-  host GPU with no host-cached memory gives the guest no pool. It raises
+  `reims_graphics_pool_reserved` trace prints the range and that end, and
+  the library's `pool:` log line the range, the room and the heaps' total.
+  A host GPU that answers no memory heap gives the guest no pool. It raises
   fw_cfg's `etc/reserved-memory-end` to that end, so OVMF places its 64-bit
   PCI window above it; macOS lays the
   device's BARs out below 4 GiB anyway. It adds no e820 entry: QEMU's e820
@@ -228,13 +229,14 @@ is its transport:
   of a removal run on the library's thread, outside the BQL
   (`whpx_map_ahead`, `whpx_unmap_before_del`), and the listener skips them.
   The teardown takes every piece out before the library's release.
-- The Shared heaps that size the pool's range, measured 11-18 (`vulkaninfo`,
-  the heap of the first memory type with `HOST_VISIBLE`, `HOST_COHERENT`
-  and `HOST_CACHED`): 23.24 GiB on ms01's RTX 3090 and on its Iris Xe, the
-  host heap beside the 3090's 24 GiB of its own; 21.87 GiB on um790's
-  RTX 2080, 14.58 GiB on its RX 7900 XTX, and 5.53 GiB on its 780M, where
-  RADV splits the APU's memory into that host heap and an 11.05 GiB
-  device-local one; 13.61 GiB on gem10's RX 550.
+- The memory heaps that size the pool's range, measured 11-18 with
+  `vulkaninfo`, summed: 47.48 GiB on ms01's RTX 3090 (24 GiB of its own,
+  a 23.24 GiB host heap and a 0.24 GiB window) and 46.10 GiB on um870's;
+  23.24 GiB on ms01's Iris Xe, its one heap; 30.11 GiB on um790's
+  RTX 2080, 38.56 GiB on its RX 7900 XTX, and 16.58 GiB on its 780M,
+  where RADV splits the APU's memory into a 5.53 GiB host heap and an
+  11.05 GiB device-local one over the same memory (16.57 GiB on um870's);
+  17.61 GiB on gem10's RX 550.
 - Measured 11-17 with the pool's measurement arm (the vCPUs' BQL waits from
   a piece's ask to 20 ms past its add or removal; a 4-thread spinner in the
   guest; macOS 26.7.2). On um790's 780M under KVM, adds of 256 MiB, 256 MiB
