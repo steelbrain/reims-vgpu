@@ -709,10 +709,7 @@ mod tests {
         let (seen, read) = (Arc::clone(&saw), at_scheduled.clone_ref());
         let look = move || seen.store(read.signaled_value(), Ordering::Release);
         assert_eq!(scheduled.add_scheduled_handler(on, Box::new(look)), Ok(()));
-        assert_eq!(
-            scheduled.commit_part(on),
-            whole(KeptWhole::ScheduledSignal)
-        );
+        assert_eq!(scheduled.commit_part(on), whole(KeptWhole::ScheduledSignal));
         assert_eq!(scheduled.commit(on), Ok(()));
         assert_eq!(scheduled.wait_until_completed(on), Ok(()));
         assert_eq!(saw.load(Ordering::Acquire), 9);
@@ -809,7 +806,10 @@ mod tests {
         assert!(!first.set_completion_joins_next(true));
         assert_eq!(first.commit_part(on), Ok(PartCut::Cut));
         assert_eq!(first.commit_part(on), whole(KeptWhole::Committed));
-        let third = second.split(on).expect("never a raise").expect("the next part");
+        let third = second
+            .split(on)
+            .expect("never a raise")
+            .expect("the next part");
         assert_eq!(second.commit_part(on), whole(KeptWhole::Committed));
         let encoder = encode(&third, copy(16, 32));
         assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
