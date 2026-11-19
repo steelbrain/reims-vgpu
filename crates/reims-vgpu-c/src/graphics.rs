@@ -804,18 +804,19 @@ pub unsafe extern "C" fn rvg_graphics_device_release(device: *mut RvgGraphicsDev
 }
 
 /// Quiesces the library ahead of the process's exit: the host's last call before it exits, made
-/// on the thread that then calls `exit`, whether its graphics devices were released or kept to the
-/// exit. It takes no handle: the GPU devices the library keeps are the process's. On the platform
-/// over metal2vulkan-rt, the library's threads park for good at their next call into it, its
-/// calls in progress on other threads are waited for, then the runtime's threads end and the GPU
-/// completes what was submitted, so that no thread is in the GPU's driver, nor touches its memory,
-/// as the driver's exit-time teardown runs; nothing is freed, a call on another thread after it
-/// never returns, and GPU work asked for on this thread is refused. On the Vulkan platform it does
-/// nothing. Every wait ends within `timeout_ms`. True once everything stopped in time, and where
-/// there was nothing to stop; false where a thread may still be in the driver (a GPU that did not
-/// go idle, a call that outlasted the wait), and the host then ends with `_exit` rather than
-/// `exit`: on NVIDIA's driver an exit with a thread inside it can end in SIGSEGV inside the
-/// driver's exit handler. A second call on the same thread answers at once, with the first
+/// on the thread that then exits, whether its graphics devices were released or kept to the exit.
+/// It takes no handle: the GPU devices the library keeps are the process's. Its answer is whether
+/// the host may then call `exit`. On the platform over metal2vulkan-rt, the library's threads park
+/// for good at their next call into it and its calls in progress on other threads are waited for;
+/// then, where a GPU device is still live, the runtime's threads end and the GPU completes what was
+/// submitted. Nothing is freed, a call on another thread after it never returns, and GPU work asked
+/// for on this thread is refused. Every wait ends within `timeout_ms`. True where no GPU device of
+/// the runtime's is live (the release of the last graphics device let go of it) and the calls
+/// ended in time. False where one is live, stopped or not, or a call outlasted the wait: the
+/// library then writes its degradation counts, and the host runs its own exit work and ends with
+/// `_exit` rather than `exit`, since the runtime supports no `exit` with a device live (on NVIDIA's
+/// driver one can end in SIGSEGV inside the driver's exit handler). On the Vulkan platform it does
+/// nothing, and answers true. A second call on the same thread answers at once, with the first
 /// answer. Calls back: never.
 #[unsafe(no_mangle)]
 pub extern "C" fn rvg_quiesce_for_exit(timeout_ms: u64) -> bool {

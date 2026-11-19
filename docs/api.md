@@ -178,32 +178,41 @@ false is kept to the exit, since its drop would wait with no deadline. QEMU rele
 pauses it keeps its device to the exit, and so does a quit while a read of its display
 (`rvg_graphics_device_read_display`) still waits for its draw on the GPU 5 s into the teardown.
 
-A host that can exit with a GPU device alive quiesces the library first: `rvg_quiesce_for_exit`,
-its last call, on the thread that then calls `exit`. It takes no handle, since the GPU devices are
-the process's, and serves a device kept to the exit. On the platform over metal2vulkan-rt it
-closes the
-exit gate ahead of the exit, as the handler would, so that each thread of the library's parks for
-good at its next step, and waits for the steps in progress on other threads; then the runtime's
+A host quiesces the library as its last call before it exits: `rvg_quiesce_for_exit`, on the
+thread that then exits. It takes no handle, since the GPU devices are the process's. Its answer is
+whether the host may then call `exit`. On the platform over metal2vulkan-rt it closes the exit gate
+ahead of the exit, as the handler would, so that each thread of the library's parks for good at
+its next step, and waits for the steps in progress on other threads; then, where a GPU device is
+still live (a device kept to the exit, or one a let-go could not tear down), the runtime's
 `Device::quiesce` stops its threads: what is ready is submitted and the rest ends unrun, the GPU
 completes what was submitted, and the runtime's threads end. Every wait ends within the call's
-bound, and nothing is freed. It answers true once everything stopped in time; false where a thread
-may still be in the driver (a GPU that did not go idle, a step that outlasted the wait), and the
-host then ends with `_exit`, running no exit handler, the driver's included. On the Vulkan platform
-it does nothing and answers true: the release's let-go and the exit gate's handler stay that
-platform's exit. A second call on the same thread answers at once, with the first answer; after
-it, a call on any other thread parks that thread for good, and the runtime refuses GPU work asked
-for on this one (`rt-refused-quiesced` in the degradation counts). The exit gate's handler still
-runs at the exit, and writes the counts.
+bound, and nothing is freed. It answers true where no GPU device of the runtime's is live (none
+was opened, or the release of the last graphics device let go of it) and the steps ended in time.
+It answers false where one is live, quiesced or not, and where a step outlasted the wait: the
+runtime supports an `exit` with a device live on no device (its README, "Quiesce and exit"). On an
+RTX 3090 (620.70.06), 3 of 9 power-offs that called `exit` after the quiesce stopped everything in
+time ended with `SIGSEGV` in a thread of the driver's own while its exit handler waited on a lock.
+On false the library writes its degradation counts then, as the exit gate's handler would, and the
+host runs its own exit work and ends with `_exit`, running no exit handler, the driver's included.
+On the Vulkan platform it does nothing and answers true: the release's let-go and the exit gate's
+handler stay that platform's exit. A second call on the same thread answers at once, with the first
+answer; after it, a call on any other thread parks that thread for good, and the runtime refuses
+GPU work asked for on this one (`rt-refused-quiesced` in the degradation counts). After a true
+answer the exit gate's handler still runs at the exit, and writes the counts.
 
 QEMU calls it, with a bound of 5 s, at the end of its cleanup (`qemu_cleanup`, through a notifier of
 its own run there, `qemu_add_cleanup_notifier`), on every quit that reaches it: a released device,
 a device kept by a shutdown action that pauses, a quit of a stopped VM, and a read of a display
-that kept it. That runs before `exit` itself, so before every exit handler: QEMU's own exit
-notifiers run from a handler registered at its start, before the driver loaded, so they run after
-the driver's own. It lets the BQL go around the call, as around the release. An `exit` that skips
-the cleanup (a refused realize of a later device, a failed incoming migration) reaches a handler
-registered as the device is made, after the driver loaded, which quiesces with the same bound and
-ends with `_exit(EXIT_FAILURE)` on a false answer.
+that kept it. That runs before `exit` itself, so before every exit handler. It lets the BQL go
+around the call, as around the release. On a false answer it runs what `exit` would run of QEMU's
+own: its exit notifiers (usb-host's return of host devices to their drivers, a tap's down script,
+the pidfile's removal), the terminal's restore where a chardev took stdio, and the flush of the C
+library's streams; then it ends with `_exit` and the cleanup's status. It does not run the simple
+trace backend's flush, record and replay's finish or the plugins' exit callbacks, which QEMU as
+reims-ctl runs it does not use. An `exit` that skips the cleanup (a refused realize of a later
+device, a failed incoming migration) reaches a handler registered as the device is made, after the
+driver loaded, which quiesces with the same bound and on a false answer does the same, ending with
+`_exit(EXIT_FAILURE)`.
 
 ### The guest's Shared pool
 

@@ -1266,27 +1266,28 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
 
     /// Quiesces the process's platform ahead of its exit (core's `Platform::quiesce`), whether a
     /// graphics device lives or was released: what the C API's `rvg_quiesce_for_exit` does, as
-    /// the last call of the host's before its exit, on the thread that then exits. On the
-    /// platform over metal2vulkan-rt, the library's threads park at their next step, the steps in
-    /// progress on other threads are waited for, and then rt's threads end and its GPU work
-    /// completes, so that none is in the GPU's driver, nor touches its memory, as the driver's
-    /// exit-time teardown runs; nothing is freed, and the process's GPU work after it is refused.
-    /// On the Vulkan platform, nothing: its exit stays as it was. Every wait ends by `bound`. True
-    /// once everything stopped in time; false, with a warning, where a thread may still be in the
-    /// driver, so the host ends without its exit handlers (`_exit`). A later call on the same
-    /// thread answers at once, with the first answer.
+    /// the last call of the host's before its exit, on the thread that then exits. Its answer is
+    /// whether the host may then call `exit`. On the platform over metal2vulkan-rt, the library's
+    /// threads park at their next step, the steps in progress on other threads are waited for,
+    /// and then, where a GPU device is still live, rt's threads end and its GPU work completes;
+    /// nothing is freed, and the process's GPU work after it is refused. True where no GPU device
+    /// of rt's is live (the release of the last graphics device let go of it,
+    /// [`Self::let_go_of_gpu`]) and the steps ended in time; false where one is live, stopped or
+    /// not, since rt supports no `exit` with a device live, or where a step outlasted the wait,
+    /// with a warning. On false the process's counts are written then
+    /// (`reims_vgpu_vulkan::exit_gate::write_counts_ahead`), since the host ends with `_exit`,
+    /// which runs no exit handler. On the Vulkan platform, nothing, and true: its exit stays as it
+    /// was. Every wait ends by `bound`. A later call on the same thread answers at once, with the
+    /// first answer.
     pub fn quiesce_for_exit(bound: std::time::Duration) -> bool {
         static ANSWER: OnceLock<bool> = OnceLock::new();
         entry::run(|_| {
             *ANSWER.get_or_init(|| {
-                let quiesced = P::process().quiesce(bound);
-                if !quiesced {
-                    log::warn!(
-                        "the quiesce ahead of the exit ended after {bound:?} with a thread still \
-                         in the GPU's work: the process should end without its exit handlers"
-                    );
+                let may_exit = P::process().quiesce(bound);
+                if !may_exit {
+                    reims_vgpu_vulkan::exit_gate::write_counts_ahead();
                 }
-                quiesced
+                may_exit
             })
         })
     }

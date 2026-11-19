@@ -186,14 +186,14 @@ pub trait Platform: Sized + Send + Sync + 'static {
 
     // The process's exit.
     /// No Metal counterpart: stops what the platform runs on its GPU devices, its threads and
-    /// their GPU work, for a process about to exit with a device alive, so that none of them is
-    /// in a GPU's driver, or touches its memory, as the driver's exit-time teardown runs (on
-    /// NVIDIA's driver an exit with a thread inside it can end in `SIGSEGV` in the driver's exit
-    /// handler). Every wait is bounded by `bound`, and nothing is freed. Called on the thread that
-    /// then exits the process, as the last of the platform's calls but those of that exit. True
-    /// once everything stopped in time, and where there is nothing to stop; false where a thread
-    /// may still be in a driver, so the process ends without running its exit handlers. The
-    /// caller keeps the first answer, and makes no later call.
+    /// their GPU work, for a process about to exit, and answers whether it may then call `exit`.
+    /// Every wait is bounded by `bound`, and nothing is freed. Called on the thread that then
+    /// exits the process, as the last of the platform's calls but those of that exit. True where
+    /// the exit's handlers may run: everything stopped in time, and no GPU device of a runtime
+    /// that supports no `exit` with a device live is live. False otherwise, so the process ends
+    /// with `_exit`, running no exit handler, the driver's included (on NVIDIA's driver an exit
+    /// with a device live can end in `SIGSEGV` in the driver's exit handler). The caller keeps
+    /// the first answer, and makes no later call.
     fn quiesce(&self, bound: std::time::Duration) -> bool;
 }
 

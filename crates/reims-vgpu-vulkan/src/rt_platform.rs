@@ -119,6 +119,9 @@ impl<T: Send + Sync + 'static> Handle for RtObj<T> {
 /// rt runs them on its completion thread ([`event`]), so it names no thread of its own.
 pub struct Listener;
 
+/// The log target of the platform's lines.
+const TARGET: &str = "reims_vgpu_vulkan::rt_platform";
+
 /// The process's platform over metal2vulkan-rt (the module's docs): the OS's VM, clocks and
 /// threads, the process's one rt device once asked for, and rt's objects as its pieces are built.
 ///
@@ -127,7 +130,8 @@ pub struct Listener;
 /// contract asks of a process that exits: it drops the device's last handle first, and a process
 /// that cannot quiesces and ends with `_exit` (its README, "Quiesce and exit"; on NVIDIA's driver
 /// an exit with a device live that ran work can end in `SIGSEGV` inside the driver's exit
-/// handler).
+/// handler). The quiesce ahead of the exit ([`Platform::quiesce`]) answers false while a device
+/// lives, so that the host ends with `_exit`.
 pub struct RtPlatform {
     vm: OsVm,
     clock: OsClock,
@@ -391,12 +395,14 @@ impl Platform for RtPlatform {
 
     /// The library's threads first, then rt's: closes the exit gate ahead of the exit, so that a
     /// thread of the library's parks at its next step, and waits for the steps in progress on
-    /// other threads ([`crate::exit_gate::close_ahead`]); then rt's `Device::quiesce` of the
-    /// process's device, where one lives, with what is left of `bound`: rt's submit thread
-    /// submits what is ready and ends the rest unrun, the GPU completes what was submitted, and
-    /// rt's threads end. Nothing is freed. False where a step outlasted the wait, where rt
-    /// answered false (a thread of rt's may still be in the driver, metal2vulkan-rt's README,
-    /// "Quiesce and exit"), and while a device a let-go could not tear down lives.
+    /// other threads ([`crate::exit_gate::close_ahead`]); then, where the process's device lives,
+    /// rt's `Device::quiesce` of it with what is left of `bound`: rt's submit thread submits what
+    /// is ready and ends the rest unrun, the GPU completes what was submitted, and rt's threads
+    /// end. Nothing is freed. True where the steps ended in time and no device of rt's lives:
+    /// none was made, or the release of the last graphics device let go of it
+    /// ([`RtPlatform::let_go_of_device`]). False where one lives, quiesced or not, since rt
+    /// supports no `exit()` with a device live (metal2vulkan-rt's README, "Quiesce and exit"),
+    /// and where a step outlasted the wait, which it warns of.
     fn quiesce(&self, bound: Duration) -> bool {
         let until = self.clock.now_mono().saturating_add(bound);
         let parked = crate::exit_gate::close_ahead(until);
@@ -404,12 +410,28 @@ impl Platform for RtPlatform {
             Some(Ok(device)) => Some(device.clone_ref()),
             Some(Err(_)) | None => None,
         };
-        let quiesced = live.is_none_or(|device| {
+        let stopped = live.as_ref().is_none_or(|device| {
             let left = until.saturating_duration_since(self.clock.now_mono());
             device.rt().quiesce(left)
         });
-        let ended = (self.unended.lock().iter()).all(Unended::ended);
-        parked && quiesced && ended
+        if !(parked && stopped) {
+            log::warn!(
+                target: TARGET,
+                "the quiesce ahead of the exit ended after {bound:?} with a thread still in the \
+                 GPU's work"
+            );
+        }
+        let unended = (self.unended.lock().iter())
+            .filter(|unended| !unended.ended())
+            .count();
+        let live = usize::from(live.is_some()).saturating_add(unended);
+        if live > 0 {
+            log::debug!(
+                target: "reims_vgpu_vulkan::let_go",
+                "{live} GPU devices live at the exit: the process ends with _exit"
+            );
+        }
+        parked && live == 0
     }
 }
 
@@ -490,19 +512,21 @@ mod tests {
         (out.status.code(), stderr)
     }
 
-    /// A quiesce ahead of the exit on the GPU the test holds, in a child process: work committed
-    /// just before it ends, completed or unrun, with its handler run; it answers true in time,
-    /// and a second call at once; the exit gate is closed; a command buffer made after it is
-    /// refused and counted; and the child's exit with rt's device alive ends with status 0.
+    /// A quiesce ahead of the exit with the device live, on the GPU the test holds, in a child
+    /// process: work committed just before it ends, completed or unrun, with its handler run;
+    /// rt's quiesce stopped in time, and the answer is false all the same, since rt supports no
+    /// `exit()` with a device live; a second call answers false at once; the exit gate is
+    /// closed; a command buffer made after it is refused and counted; and the child then ends
+    /// with `_exit`, as the host does on false, with status 0.
     #[test]
-    fn on_vulkan_a_quiesce_stops_the_device_before_the_exit() {
+    fn on_vulkan_a_quiesce_with_the_device_live_stops_it_and_answers_false() {
         use std::sync::atomic::Ordering;
 
-        const TEST: &str =
-            "rt_platform::tests::on_vulkan_a_quiesce_stops_the_device_before_the_exit";
+        const TEST: &str = "rt_platform::tests::\
+            on_vulkan_a_quiesce_with_the_device_live_stops_it_and_answers_false";
         unsafe extern "C" {
-            /// The C library's `exit`, which runs the exit handlers, as QEMU's exit does.
-            fn exit(status: i32) -> !;
+            /// The C library's `_exit`, which ends the process with no exit handler run.
+            fn _exit(status: i32) -> !;
         }
         let say = |line: &str| eprintln!("{line}");
         if std::env::var("RVG_QUIESCE_CHILD").as_deref() == Ok(TEST) {
@@ -516,6 +540,10 @@ mod tests {
             say(&format!(
                 "quiesce answered {first} in {} ms",
                 took.as_millis()
+            ));
+            say(&format!(
+                "rt's quiesce answered {}",
+                device.rt().quiesce(Duration::ZERO)
             ));
             say(&format!("handlers run {}", ended.load(Ordering::SeqCst)));
             let start = clock.now_mono();
@@ -533,15 +561,16 @@ mod tests {
                 "a command buffer after it refused {refused}, counted {}",
                 counted(code).saturating_sub(before)
             ));
-            // SAFETY: the C library's exit, which never returns.
-            unsafe { exit(0) }
+            // SAFETY: the C library's `_exit`, which never returns.
+            unsafe { _exit(0) }
         }
         let (status, stderr) = run_child(TEST);
         assert_eq!(status, Some(0), "{stderr}");
         for line in [
-            "quiesce answered true",
+            "quiesce answered false",
+            "rt's quiesce answered true",
             "handlers run 8",
-            "a second quiesce answered true, at once true",
+            "a second quiesce answered false, at once true",
             "gate closed true",
             "a command buffer after it refused true, counted 1",
         ] {

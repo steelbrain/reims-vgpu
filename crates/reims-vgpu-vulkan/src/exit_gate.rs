@@ -35,7 +35,9 @@
 //!   (`reims-vgpu`'s `GraphicsDevice::quiesce_for_exit`, the C API's `rvg_quiesce_for_exit`)
 //!   closes the gate then ([`close_ahead`]), on the thread that then exits, and waits for the
 //!   steps in progress until its own deadline. The hook still runs at the exit: it finds no step
-//!   in progress where the wait ended in time, and writes the counts.
+//!   in progress where the wait ended in time, and writes the counts. Where the quiesce answers
+//!   false, the host ends with `_exit`, which runs no exit handler, so the counts are written then
+//!   ([`write_counts_ahead`]).
 //! - **Its order.** The C library runs exit handlers in the reverse order of their registration,
 //!   so the hook runs before every destructor registered before it. It is registered as a device
 //!   is adopted (`crate::gpu::device`) and as a compile pool starts, after the driver was loaded;
@@ -199,6 +201,18 @@ impl Drop for Step {
 unsafe extern "C" {
     /// The C library's `atexit`.
     fn atexit(f: extern "C" fn()) -> i32;
+}
+
+/// Writes the process's degradation counts and the log's count of its repeated lines now, as the
+/// hook would at the exit (`crate::answer::write_counts`), for a process that then ends with
+/// `_exit`, which runs no exit handler: what the quiesce ahead of the exit does where it answers
+/// false (`reims-vgpu`'s `GraphicsDevice::quiesce_for_exit`), after it closed the gate
+/// ([`close_ahead`]). The hook then finds it ran, and so does a later call.
+pub fn write_counts_ahead() {
+    if HOOK_RAN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    crate::answer::write_counts();
 }
 
 /// The hook (the module docs): closes the gate, then waits for the steps in progress on other
