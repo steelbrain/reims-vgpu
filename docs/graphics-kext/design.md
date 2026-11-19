@@ -4848,9 +4848,11 @@ reads it once.
   free by the pool's zeroer (`reims-vgpu.graphics-pool-zero`), off every
   take's path, and a take over them leaves them as zeroed
   (`pool-zeroed-after-free-bytes`, `pool-take-zero-skipped-prezeroed-bytes`);
-  a take over bytes still waiting for the zeroer zeroes them itself, and one
-  over the zeroer's current 64 KiB answers once those are done. An emptied
-  piece is not zeroed: it may go back whole. So a context's takes are answered in its order,
+  a take over bytes still waiting for the zeroer zeroes them itself. The
+  zeroer zeroes 16 KiB at a time with the pool's lock held, so no take waits
+  for it beyond that lock, and it waits for no take; the device's release
+  waits for it and the take workers to let go of the pool. An emptied piece
+  is not zeroed: it may go back whole. So a context's takes are answered in its order,
   and never wait behind another context's growth or zeroing. The host keeps
   one empty piece ahead of the takes from the kext's take of `POOL` on
   (`Host::pool_taken`), so a take grows the pool only where that piece has no

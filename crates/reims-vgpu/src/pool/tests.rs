@@ -706,6 +706,34 @@ fn a_freed_blocks_bytes_are_zeroed_after_its_free_and_a_take_over_them_leaves_th
     assert!(counted(TAKE_ZERO_PREZEROED_BYTES_CODE) >= prezeroed + TAKE_ALIGN);
 }
 
+/// The device's release returns once neither a take worker nor the zeroer holds the pool: their
+/// threads hold its clock, which holds the platform, so none of them drops it past the release
+#[test]
+fn the_release_returns_once_no_pool_thread_holds_the_pool() {
+    for _ in 0..50 {
+        let host = Arc::new(Host::default());
+        let (mut pool, _blocks, ledger) = live_pool(&host, LONG);
+        let takes: Vec<Answers> = (1..=4)
+            .map(|context| take(&ledger, context, TAKE_ALIGN))
+            .collect();
+        for rx in &takes {
+            assert!(taken(rx).is_some());
+        }
+        // One of the piece's four blocks freed: the zeroer runs.
+        let Give::Given(carve) = ledger.give(1, 0, TAKE_ALIGN, |_, _| false) else {
+            panic!("not given");
+        };
+        ledger.free(&[carve]);
+        drop(ledger);
+        pool.close();
+        assert_eq!(
+            Arc::strong_count(&pool.shared),
+            1,
+            "a pool thread still holds the pool"
+        );
+    }
+}
+
 #[test]
 fn a_take_of_no_bytes_or_past_the_longest_is_an_invalid_argument() {
     let host = Arc::new(Host::default());

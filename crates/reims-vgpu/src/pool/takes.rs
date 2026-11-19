@@ -37,21 +37,21 @@
 //! A freed carve's bytes go to the pool's zeroer (`reims-vgpu.graphics-pool-zero`, one a pool,
 //! made at a free that finds none and gone after [`WORKER_IDLE`] with nothing to zero), which
 //! zeroes them through the piece's mapping off every take's path, [`ZERO_CHUNK`] at a time, each
-//! chunk with the pool's lock let go of and a hold on its piece ([`super::PieceHold`]'s count),
-//! and records them in the piece as reading zero ([`Ranges`]), counted
-//! ([`super::ZEROED_AFTER_FREE_BYTES_CODE`]). A carve takes its bytes out of the record, and its
-//! worker zeroes only those below the mark the record lacks; the rest it leaves, counted
-//! ([`super::TAKE_ZERO_PREZEROED_BYTES_CODE`]). A carve's bytes still waiting for the zeroer are
-//! no longer free, so the zeroer passes them over, and its worker zeroes them as before. A carve
-//! over the chunk the zeroer zeroes now leaves that chunk's bytes to it, since the zeroer's writes
-//! to them may still land: its worker zeroes the rest first, then answers once that chunk is done,
-//! a wait of at most one chunk's zeroing, which the worker would otherwise spend zeroing those
-//! bytes itself. The zeroer zeroes nothing in a piece the guest emptied, which may go back whole,
-//! nor in one going out: an empty piece's bytes are zeroed at its next take, as before, and a
-//! piece emptied while the zeroer zeroes a chunk of it goes out once that chunk is done. The
-//! device's release ends the zeroer at its next chunk. The guest writes no freed carve's bytes:
-//! the kext takes a block's mapping out of the process before its give, and the device frees it
-//! once the context's command buffers have finished.
+//! chunk with the pool's lock held, and records them in the piece as reading zero ([`Ranges`]),
+//! counted ([`super::ZEROED_AFTER_FREE_BYTES_CODE`]); it lets the lock go between chunks. A carve
+//! is made with the same lock held, so it never meets a chunk half zeroed: it takes its bytes out
+//! of the record, and its worker zeroes only those below the mark the record lacks; the rest it
+//! leaves, counted ([`super::TAKE_ZERO_PREZEROED_BYTES_CODE`]). A carve's bytes still waiting for
+//! the zeroer are no longer free, so the zeroer passes them over, and its worker zeroes them as
+//! before. So the zeroer waits for no take worker and none waits for it, the pool's nor the
+//! Private blocks' ([`super::private_blocks`], whose ledger, lock and workers it shares nothing
+//! with): a holder of the pool's lock waits at most one chunk's zeroing for it, as for any other
+//! holder. The zeroer zeroes nothing in a piece the guest emptied, which may go back whole, nor
+//! in one going out: an empty piece's bytes are zeroed at its next take, as before. The device's
+//! release ends the zeroer at its next chunk, and waits for it and for the take workers to let go
+//! of the pool ([`super::Threads`]). The guest writes no freed carve's bytes: the kext takes a
+//! block's mapping out of the process before its give, and the device frees it once the
+//! context's command buffers have finished.
 //!
 //! A take ends only at its answer, its context's close or the device's reset: there is no
 //! timeout. A take whose context closed, or that the reset ended, before its answer is given back
@@ -90,7 +90,7 @@ use parking_lot::MutexGuard;
 use reims_vgpu_vulkan::answer::count_kind_by;
 
 use super::{
-    Ask, Error, Mapped, MonoTime, Shared, State, TAKE_WAIT_CODES, TAKE_WAITS_CODE,
+    Ask, Error, Live, Mapped, MonoTime, Shared, State, TAKE_WAIT_CODES, TAKE_WAITS_CODE,
     TAKE_ZERO_PREZEROED_BYTES_CODE, TAKE_ZERO_SKIPPED_BYTES_CODE, TAKE_ZEROED_BYTES_CODE,
     ZEROED_AFTER_FREE_BYTES_CODE,
 };
@@ -105,23 +105,13 @@ pub const TAKE_MAX: u64 = 1 << 32;
 /// its next bytes.
 const WORKER_IDLE: Duration = Duration::from_secs(2);
 
-/// The most bytes the zeroer zeroes at once, with the pool's lock let go of (the module doc's
-/// "Zeros after a free"): 256 KiB, so a carve over them waits for little.
-pub(super) const ZERO_CHUNK: u64 = TAKE_ALIGN;
+/// The most bytes the zeroer zeroes at once, with the pool's lock held (the module doc's "Zeros
+/// after a free"): 16 KiB, so a holder of the lock waits for little.
+pub(super) const ZERO_CHUNK: u64 = 16 << 10;
 
 /// Byte ranges of a piece's block, by offset: each range's first byte to its end, none touching
 /// another.
 pub(super) type Ranges = BTreeMap<u64, u64>;
-
-/// The bytes the zeroer zeroes now ([`State::claim_zero`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Claim {
-    serial: u64,
-    /// Its piece's address.
-    piece: u64,
-    /// The bytes' offsets in the piece's block.
-    range: Range<u64>,
-}
 
 /// Where a carve is in its life.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -394,10 +384,10 @@ impl PoolLedger {
         drop(st);
         // The carve may have asked the pool's thread for a block, as headroom.
         self.shared.changed.notify_all();
-        let shared = Arc::clone(&self.shared);
+        let hold = ThreadHold::of(&self.shared);
         let spawned = std::thread::Builder::new()
             .name("reims-vgpu.graphics-pool-take".into())
-            .spawn(move || shared.work(context));
+            .spawn(move || hold.work(context));
         if spawned.is_err() {
             log::warn!("pool: no thread for context {context}'s takes: they are refused");
             let mut st = self.shared.state.lock();
@@ -695,11 +685,11 @@ impl State {
         start
     }
 
-    /// The zeroer's next bytes, claimed ([`State::zeroing`]) with a hold on their piece, and
-    /// their host address: at most [`ZERO_CHUNK`] of the first bytes waiting that lie below their
-    /// piece's mark, in a live piece that holds a carve, carved by none and not zero already.
-    /// `None` where none wait.
-    pub(super) fn claim_zero(&mut self) -> Option<(Claim, NonNull<u8>)> {
+    /// The zeroer's next bytes, its piece's address, their offsets in its block and their host
+    /// address: at most [`ZERO_CHUNK`] of the first bytes waiting that lie below their piece's
+    /// mark, in a live piece that holds a carve, carved by none and not zero already. `None` where
+    /// none wait. They stay so while the pool's lock is held.
+    pub(super) fn next_zero(&mut self) -> Option<(u64, Range<u64>, NonNull<u8>)> {
         while let Some((piece, range)) = self.to_zero.pop_front() {
             let Some(p) = self.pieces.get(&piece) else {
                 continue;
@@ -722,31 +712,17 @@ impl State {
             if chunk.end < range.end {
                 self.to_zero.push_front((piece, chunk.end..range.end));
             }
-            let claim = Claim {
-                serial: self.next_serial(),
-                piece,
-                range: chunk,
-            };
-            let p = self.pieces.get_mut(&piece)?;
-            p.holds = p.holds.saturating_add(1);
-            self.zeroing = Some(claim.clone());
             // SAFETY: the chunk lies below the block's length, inside its mapping.
             let host = unsafe { NonNull::new_unchecked(contents.as_ptr().add(offset)) };
-            return Some((claim, host));
+            return Some((piece, chunk, host));
         }
         None
     }
 
-    /// The zeroer zeroed `claim`'s bytes: its hold on their piece ends, and those no carve took
-    /// meanwhile are recorded as reading zero.
-    pub(super) fn unclaim(&mut self, claim: &Claim) {
-        self.zeroing = None;
-        let free = self.uncarved(claim.piece, vec![claim.range.clone()]);
-        let Some(p) = self.pieces.get_mut(&claim.piece) else {
-            return;
-        };
-        p.holds = p.holds.saturating_sub(1);
-        for range in free {
+    /// The zeroer zeroed `range` of the block of the piece at `piece`, with the pool's lock held
+    /// since [`Self::next_zero`]: its bytes read zero.
+    pub(super) fn zeroed(&mut self, piece: u64, range: Range<u64>) {
+        if let Some(p) = self.pieces.get_mut(&piece) {
             insert(&mut p.zeros, range);
         }
     }
@@ -762,27 +738,6 @@ impl State {
             parts = cut(parts, first..first.saturating_add(c.len));
         }
         parts
-    }
-
-    /// `zero`, the bytes the worker of the carve at `at` zeroes by offset from its first byte,
-    /// less those the zeroer zeroes now, which it leaves to the zeroer: the rest, and the
-    /// claim's number where it leaves any.
-    fn leave_claimed(&self, at: u64, zero: Vec<Range<u64>>) -> (Vec<Range<u64>>, Option<u64>) {
-        let Some(claim) = &self.zeroing else {
-            return (zero, None);
-        };
-        let in_piece = (self.pieces.get(&claim.piece))
-            .is_some_and(|p| at >= claim.piece && at < claim.piece.saturating_add(p.block.len));
-        let offset = at.saturating_sub(claim.piece);
-        if !in_piece || claim.range.end <= offset {
-            return (zero, None);
-        }
-        let claimed =
-            claim.range.start.saturating_sub(offset)..claim.range.end.saturating_sub(offset);
-        let all = total(&zero);
-        let rest = cut(zero, claimed);
-        let left = total(&rest) < all;
-        (rest, left.then_some(claim.serial))
     }
 
     /// Whether the takes of `context` numbered `life` still stand: neither its close nor the
@@ -874,9 +829,6 @@ impl Shared {
             let written = carve.map_or(job.len, |c| c.written.min(job.len));
             let zero =
                 carve.map_or_else(|| std::iter::once(0..written).collect(), |c| c.zero.clone());
-            // The bytes the zeroer zeroes now are left to it: the rest first, then its chunk's
-            // end (the module doc's "Zeros after a free").
-            let (zero, claimed) = st.leave_claimed(at, zero);
             let zeroing = (self.now)();
             MutexGuard::unlocked(&mut st, || {
                 let Some(host) = host else {
@@ -907,9 +859,6 @@ impl Shared {
                     count_kind_by(TAKE_ZERO_SKIPPED_BYTES_CODE, skipped);
                 }
             });
-            while claimed.is_some() && st.zeroing.as_ref().map(|z| z.serial) == claimed {
-                self.changed.wait(&mut st);
-            }
             let zeroed = (self.now)().saturating_duration_since(zeroing);
             let stands = st.stands(context, job.life);
             if stands
@@ -1019,8 +968,8 @@ impl Shared {
     }
 
     /// The pool's zeroer (the module doc's "Zeros after a free"): zeroes the freed carves' bytes
-    /// waiting, a chunk at a time with the pool's lock let go of, until none wait for
-    /// [`WORKER_IDLE`] or the device is released.
+    /// waiting, a chunk at a time with the pool's lock held, letting it go between chunks, until
+    /// none wait for [`WORKER_IDLE`] or the device is released.
     fn zero_work(&self) {
         let mut st = self.state.lock();
         let mut idle_since = (self.now)();
@@ -1028,7 +977,7 @@ impl Shared {
             if st.closed {
                 break;
             }
-            let Some((claim, host)) = st.claim_zero() else {
+            let Some((piece, range, host)) = st.next_zero() else {
                 let idle = (self.now)().saturating_duration_since(idle_since);
                 match WORKER_IDLE.checked_sub(idle).filter(|left| !left.is_zero()) {
                     Some(left) => {
@@ -1038,19 +987,16 @@ impl Shared {
                     None => break,
                 }
             };
-            let len = claim.range.end.saturating_sub(claim.range.start);
-            MutexGuard::unlocked(&mut st, || {
-                if let Ok(bytes) = usize::try_from(len) {
-                    // SAFETY: the bytes lie in their live piece's mapping, which the claim's hold
-                    // keeps; no carve held them at the claim, and a carve taken over them since
-                    // has its worker leave them to this until the claim ends, so neither the
-                    // guest nor the device reaches them meanwhile.
-                    unsafe { std::ptr::write_bytes(host.as_ptr(), 0, bytes) };
-                    count_kind_by(ZEROED_AFTER_FREE_BYTES_CODE, len);
-                }
-            });
-            st.unclaim(&claim);
-            self.changed.notify_all();
+            let len = range.end.saturating_sub(range.start);
+            let Ok(bytes) = usize::try_from(len) else {
+                continue;
+            };
+            // SAFETY: the bytes lie in their live piece's mapping, and no carve holds them; the
+            // pool's lock, held since `next_zero`, keeps the piece live and any carve off them, so
+            // neither the guest nor the device reaches them meanwhile.
+            unsafe { std::ptr::write_bytes(host.as_ptr(), 0, bytes) };
+            st.zeroed(piece, range);
+            MutexGuard::unlocked(&mut st, || count_kind_by(ZEROED_AFTER_FREE_BYTES_CODE, len));
             idle_since = (self.now)();
         }
         st.zeroer = false;
@@ -1071,13 +1017,43 @@ impl Shared {
     }
 }
 
+/// What a pool thread holds, a take worker's or the zeroer's: the pool, then its count among the
+/// [`super::Threads`], which a struct's fields' order drops in that order, at the thread's return or
+/// unwind, so the device's release returns only once the thread let go of the pool.
+struct ThreadHold {
+    shared: Arc<Shared>,
+    _live: Live,
+}
+
+impl ThreadHold {
+    /// A hold on `shared`, counted among its threads.
+    fn of(shared: &Arc<Shared>) -> ThreadHold {
+        ThreadHold {
+            shared: Arc::clone(shared),
+            _live: Live::new(&shared.threads),
+        }
+    }
+
+    /// Runs context `context`'s take worker ([`Shared::work`]), then lets go of the pool, then of
+    /// the thread's count.
+    fn work(self, context: u32) {
+        self.shared.work(context);
+    }
+
+    /// Runs the zeroer ([`Shared::zero_work`]), then lets go of the pool, then of the thread's
+    /// count.
+    fn zero(self) {
+        self.shared.zero_work();
+    }
+}
+
 /// Makes the pool's zeroer ([`Shared::zero_work`]), which [`State::start_zeroer`] counted; where
 /// no thread is made, the bytes waiting are let go of, and their takes zero them as before.
 fn spawn_zeroer(shared: &Arc<Shared>) {
-    let zeroer = Arc::clone(shared);
+    let hold = ThreadHold::of(shared);
     let spawned = std::thread::Builder::new()
         .name("reims-vgpu.graphics-pool-zero".into())
-        .spawn(move || zeroer.zero_work());
+        .spawn(move || hold.zero());
     if spawned.is_err() {
         log::warn!("pool: no thread to zero freed blocks: their next takes zero them");
         let mut st = shared.state.lock();

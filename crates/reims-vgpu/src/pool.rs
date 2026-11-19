@@ -362,8 +362,6 @@ struct State {
     /// Freed carves' bytes the zeroer zeroes, oldest first: each its piece's address and the
     /// bytes' offsets in the piece's block (`takes`, "Zeros after a free").
     to_zero: VecDeque<(u64, std::ops::Range<u64>)>,
-    /// The bytes the zeroer zeroes now, with the pool's lock let go of.
-    zeroing: Option<takes::Claim>,
     /// The zeroer runs.
     zeroer: bool,
     /// The ledgers given out and not dropped ([`PoolLedger`]).
@@ -436,6 +434,59 @@ struct Shared {
     now: PoolNow,
     state: Mutex<State>,
     changed: Condvar,
+    /// The take workers' and the zeroer's threads, which the device's release waits for.
+    threads: Arc<Threads>,
+}
+
+/// Worker threads, the pool's ([`takes`]: its take workers and its zeroer) or the Private blocks'
+/// ([`private_blocks`]), each counted from its spawn until it holds what it works on no more. A
+/// worker's handle may be the last of it, whose drop drops what that holds: the block source of
+/// the Private blocks, or the pool's clock, which holds the platform; rt's device's drop calls
+/// the driver. The device's release waits for every one ([`Pool::close`],
+/// [`private_blocks::PrivateBlocks::close`]), so that neither is dropped on a worker's thread past
+/// the release, where the process may be exiting.
+#[derive(Default)]
+struct Threads {
+    /// The threads counted.
+    live: Mutex<usize>,
+    /// Told when one goes.
+    gone: Condvar,
+}
+
+impl Threads {
+    /// One thread goes.
+    fn go(&self) {
+        let mut live = self.live.lock();
+        *live = live.saturating_sub(1);
+        drop(live);
+        self.gone.notify_all();
+    }
+
+    /// Waits for every thread counted to go.
+    fn wait(&self) {
+        let mut live = self.live.lock();
+        while *live > 0 {
+            self.gone.wait(&mut live);
+        }
+    }
+}
+
+/// A worker's count among the [`Threads`]: it goes at this one's drop.
+struct Live(Arc<Threads>);
+
+impl Live {
+    /// One thread more among `threads`.
+    fn new(threads: &Arc<Threads>) -> Live {
+        let mut live = threads.live.lock();
+        *live = live.saturating_add(1);
+        Live(Arc::clone(threads))
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.go();
+    }
 }
 
 /// A hold on a live piece: while it lives, its block does not go back.
@@ -522,6 +573,7 @@ impl Pool {
             now,
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
+            threads: Arc::default(),
         });
         let thread = {
             let shared = Arc::clone(&shared);
@@ -675,8 +727,9 @@ impl Pool {
     }
 
     /// The device's release: the host removed every piece it added. Ends the pool's thread (a
-    /// piece it is giving back waits only for its holds from now on) and its take workers (a take
-    /// in flight is answered never), then, where no ledger lives, waits for every hold on the
+    /// piece it is giving back waits only for its holds from now on), its take workers (a take
+    /// in flight is answered never) and its zeroer, and waits until their threads let go of the
+    /// pool ([`Threads`]), then, where no ledger lives, waits for every hold on the
     /// pieces left, gives each one's block back and lets go of the source. Where a ledger lives
     /// (the decoder's, whose heaps over the contexts' blocks may outlive the device), the last
     /// one's drop does that.
@@ -687,6 +740,7 @@ impl Pool {
             let _ = t.join();
         }
         self.shared.wait_for_workers();
+        self.shared.threads.wait();
         let Some(source) = self.source.take() else {
             return;
         };

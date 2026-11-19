@@ -61,7 +61,7 @@ use reims_vgpu_vulkan::answer::{count_kind, count_kind_by};
 use reims_vgpu_vulkan::exit_gate;
 
 use super::addresses::HostAddresses;
-use super::{BlockId, BlockSource, MemoryClass, PoolNow};
+use super::{BlockId, BlockSource, Live, MemoryClass, PoolNow, Threads};
 
 /// A block's length is a multiple of this: 64 KiB, the wire's `RGFX_PRIVATE_BLOCK_ALIGN`.
 pub const TAKE_ALIGN: u64 = 64 << 10;
@@ -177,47 +177,6 @@ struct Inner {
     changed: Condvar,
     /// The take workers' threads.
     threads: Arc<Threads>,
-}
-
-/// The take workers' threads, each counted from its spawn until it holds the ledger no more. A
-/// worker's handle may be the ledger's last, whose drop drops the source, and rt's device's drop
-/// calls the driver: the device's release waits for every one ([`PrivateBlocks::close`]), so that
-/// the source is never dropped on a worker's thread past the release, where the process may be
-/// exiting.
-#[derive(Default)]
-struct Threads {
-    /// The threads counted.
-    live: Mutex<usize>,
-    /// Told when one goes.
-    gone: Condvar,
-}
-
-impl Threads {
-    /// One thread goes.
-    fn go(&self) {
-        let mut live = self.live.lock();
-        *live = live.saturating_sub(1);
-        drop(live);
-        self.gone.notify_all();
-    }
-}
-
-/// A take worker's count among the [`Threads`]: it goes at this one's drop.
-struct Live(Arc<Threads>);
-
-impl Live {
-    /// One thread more among `threads`.
-    fn new(threads: &Arc<Threads>) -> Live {
-        let mut live = threads.live.lock();
-        *live = live.saturating_add(1);
-        Live(Arc::clone(threads))
-    }
-}
-
-impl Drop for Live {
-    fn drop(&mut self) {
-        self.0.go();
-    }
 }
 
 /// What a take worker's thread holds: the ledger, then its count, which a struct's fields' order
