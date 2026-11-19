@@ -1304,6 +1304,86 @@ guest's other vCPUs faulted the rest of the process back too.
   limit. A Windows job that boots a guest or times anything sets its shell
   to memory priority 5 first ([lessons.md](lessons.md)).
 
+### Windows hosts: the Shared pool
+
+An x86-64 guest on a Windows host takes its buffers' slabs from the device's
+Shared pool, as on Linux and macOS
+([graphics-kext/design.md](graphics-kext/design.md), "The Shared pool").
+What a pool block costs it under WHPX beside a region block was
+**measured** on the mini (2026-11-19). The guest was macOS 26.7.2 with 8
+vCPUs and 16 GiB on the reims-graphics device, under QEMU at memory
+priority 5, each boot with the mini to itself. The build was development
+2b61416c7 with the pool offered (on) and as it was (off), both with timing
+logs added.
+
+What backs each range: the page census is `QueryWorkingSetEx` over QEMU's
+allocations of 64 MiB or more (`m3-max-51834`), and the flags come from
+the code.
+- Guest RAM is QEMU's view of a section (`CreateFileMapping` with
+  SEC_COMMIT, then `MapViewOfFile`).
+- The region is the library's own SEC_COMMIT section, viewed into QEMU.
+- A pool piece is the library's memory (`HostBlocks`, through the process
+  heap, which takes it from VirtualAlloc): 270,536,704 bytes committed for
+  a 256 MiB piece, every 4 KiB page of it touched before the piece goes
+  out.
+- All three are PAGE_READWRITE in 4 KiB pages, none large, and WHPX maps
+  all three Read, Write and Execute (`WHvMapGpaRange`). RAM and the region
+  go through QEMU's memory listener, a piece through `whpx_map_ahead`.
+
+Frames, in four boots that rotate on and off (`m3-max-51864`, `51888`,
+`51908`, `51928`): presents a second and the frame time's p95, over the
+desktop at idle, the Apps view opened and closed three times, and a WebGL
+page in Safari.
+
+| boot | desktop | apps | 3D page |
+|---|---|---|---|
+| on 1 | 47.2/s, 17.9 ms | 48.0/s, 17.8 ms | 49.5/s, 18.0 ms |
+| off 1 | 47.2/s, 17.8 ms | 48.8/s, 18.2 ms | 47.0/s, 17.9 ms |
+| on 2 | 47.1/s, 17.8 ms | 49.4/s, 18.0 ms | 47.7/s, 17.8 ms |
+| off 2 | 49.5/s, 18.1 ms | 48.3/s, 18.0 ms | 47.0/s, 17.9 ms |
+
+The means with the pool on, against off:
+- the desktop drew 2.5% fewer presents a second, the apps 0.3% more and
+  the 3D page 3.4% more;
+- each p95 was within 1.1% of off's.
+
+The p99 was about 233 ms in every window of both arms: on the mini, 1.6 to
+2.3% of present intervals ran past 41.7 ms, up to about 235 ms, pool or no
+pool.
+
+Bandwidth: a probe in the guest stored into and loaded from each kind of
+memory, from one thread over 64 MiB and from 8 threads over 32 MiB each at
+once, in 5 rounds that rotate the kinds. The table gives each rate's median in MB/s.
+
+| boot | memory | one thread's store | one thread's load | 8 threads' stores | 8 threads' loads |
+|---|---|---|---|---|---|
+| on 1 | pool | 8,073 | 13,113 | 15,863 | 25,075 |
+| on 1 | region | 9,469 | 12,458 | 13,878 | 23,926 |
+| on 2 | pool | 9,963 | 14,789 | 11,945 | 23,983 |
+| on 2 | region | 11,574 | 13,585 | 13,465 | 32,050 |
+
+- One thread's stores into a pool block ran 14% under a region block's in
+  both boots that had the pool.
+- Every other rate differed by less than its spread from boot to boot. The
+  region's alone ran 6,795 to 11,574 MB/s for one thread's store across the
+  four boots, and 22,846 to 32,050 for 8 threads' loads.
+- On Linux the same probe put the pool within 5% of the region
+  (homelab-um790-xtx-1 under KVM, `m3-max-51954`). One thread stored 28,531
+  MB/s into the pool and 29,991 into the region, and 8 threads loaded 77,731
+  and 78,000. There, QEMU madvises each piece HUGEPAGE, and none to all of
+  a piece was in huge pages, against 202 of the region's 268 MiB resident.
+
+Making a piece: the pool starts with no piece, so the guest's first take
+waited for one to be made and mapped. That take, 128 KiB, waited:
+- 58.7, 54.1 and 47.7 ms (`m3-max-51768`, `51864`, `51908`);
+- of that, 39.9 to 49.3 ms making the block (its allocation, and a touch of
+  every page) and 6.5 to 7.2 ms QEMU's add of it, its map ahead.
+
+Every later take of the guest's found room: 64 to 73 of them a boot, which
+waited 0.68 to 0.81 ms at p50 and 5.9 ms at most. Each piece's populate
+(`WHvAdviseGpaRange`) took 38 to 59 ms at p50 and 121 ms at most, behind its
+add's answer.
+
 ### Windows hosts: sound
 
 Of the Windows build's audio backends (none, dbus, dsound, wav, as
