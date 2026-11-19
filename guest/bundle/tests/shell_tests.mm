@@ -4079,7 +4079,7 @@ void test_shared_heaps_of_the_pool_on_an_apple_gpu()
 		auto over = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_POOL);
 		CHECK(over.obj_id == heap.rgfxObjId && over.region_offset == RgfxPoolSlabSource::kUnit);
 		CHECK(over.size_bytes == 0x1000 && over.gpu_address == picked &&
-		      heap.gpuAddress == picked);
+		      [(id<RgfxMetalHeapInternals>)heap gpuAddress] == picked);
 		id<MTLBuffer> b = [heap newBufferWithLength:100 options:MTLResourceStorageModeShared];
 		CHECK(b != nil);
 		uint8_t *contents = static_cast<uint8_t *>([b contents]);
