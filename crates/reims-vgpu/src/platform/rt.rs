@@ -28,7 +28,7 @@ impl ApiPlatform for RtPlatform {
         &self,
         device: &<Self as Platform>::Device,
     ) -> Option<Arc<dyn crate::pool::BlockSource>> {
-        let known = device.known_blocks().clone();
+        let known = Box::new(device.known_blocks().clone());
         Some(Arc::new(crate::pool::RtBlocks::new(device.rt().clone(), known)))
     }
 

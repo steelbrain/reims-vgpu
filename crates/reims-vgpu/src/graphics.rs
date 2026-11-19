@@ -560,8 +560,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     Some(range) => {
                         let clock = Arc::clone(&platform);
                         let now = Box::new(move || clock.clock().now_mono());
-                        let source = (block_source.clone())
-                            .unwrap_or_else(|| Arc::new(HostBlocks::new()));
+                        let source =
+                            (block_source.clone()).unwrap_or_else(|| Arc::new(HostBlocks::new()));
                         Some(Pool::new(range, host, now, source)?)
                     }
                     None => None,
