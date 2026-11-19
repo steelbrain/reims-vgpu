@@ -16,7 +16,7 @@
 //! called through its object's vtable at the index the Windows SDK's headers give it (MSYS2
 //! CLANG64's `d3d12.h` and `dxgi1_4.h`, read 2026-11-16). Only methods that return nothing, a
 //! scalar or an `HRESULT` are called: one that returns a structure has another calling
-//! convention.
+//! convention. `super::d3d11`'s draws of a picture's planes call through the same binding.
 
 use std::ffi::{CStr, c_void};
 use std::ptr::{NonNull, null, null_mut};
@@ -27,17 +27,17 @@ use crate::core::sync::Mutex;
 
 use super::surface::SurfaceFormat;
 
-type Hresult = i32;
+pub(super) type Hresult = i32;
 
 #[repr(C)]
-struct Guid {
+pub(super) struct Guid {
     data1: u32,
     data2: u16,
     data3: u16,
     data4: [u8; 8],
 }
 
-const fn guid(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> Guid {
+pub(super) const fn guid(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> Guid {
     Guid {
         data1,
         data2,
@@ -58,19 +58,19 @@ const IID_IDXGI_ADAPTER: Guid = guid(
     0x4ccf,
     [0xbd, 0x14, 0x97, 0x98, 0xe8, 0x53, 0x4d, 0xc0],
 );
-const IID_ID3D12_DEVICE: Guid = guid(
+pub(super) const IID_ID3D12_DEVICE: Guid = guid(
     0x1898_19f1,
     0x1db6,
     0x4b57,
     [0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7],
 );
-const IID_ID3D12_RESOURCE: Guid = guid(
+pub(super) const IID_ID3D12_RESOURCE: Guid = guid(
     0x6964_42be,
     0xa72e,
     0x4059,
     [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
 );
-const IID_ID3D12_COMMAND_QUEUE: Guid = guid(
+pub(super) const IID_ID3D12_COMMAND_QUEUE: Guid = guid(
     0x0ec8_70a6,
     0x5d7e,
     0x4c22,
@@ -88,7 +88,7 @@ const IID_ID3D12_GRAPHICS_COMMAND_LIST: Guid = guid(
     0x4185,
     [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
 );
-const IID_ID3D12_FENCE: Guid = guid(
+pub(super) const IID_ID3D12_FENCE: Guid = guid(
     0x0a75_3dcf,
     0xc4d8,
     0x4b91,
@@ -96,22 +96,23 @@ const IID_ID3D12_FENCE: Guid = guid(
 );
 
 // The vtable indices of the methods called (the SDK's `<interface>Vtbl` structures).
+const QUERY_INTERFACE: usize = 0;
 const RELEASE: usize = 2;
 const FACTORY4_ENUM_ADAPTER_BY_LUID: usize = 26;
-const DEVICE_CREATE_COMMAND_QUEUE: usize = 8;
+pub(super) const DEVICE_CREATE_COMMAND_QUEUE: usize = 8;
 const DEVICE_CREATE_COMMAND_ALLOCATOR: usize = 9;
 const DEVICE_CREATE_COMMAND_LIST: usize = 12;
 const DEVICE_CREATE_COMMITTED_RESOURCE: usize = 27;
 const DEVICE_CREATE_SHARED_HANDLE: usize = 31;
-const DEVICE_CREATE_FENCE: usize = 36;
+pub(super) const DEVICE_CREATE_FENCE: usize = 36;
 const QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
-const QUEUE_SIGNAL: usize = 14;
+pub(super) const QUEUE_SIGNAL: usize = 14;
 const ALLOCATOR_RESET: usize = 8;
 const LIST_CLOSE: usize = 9;
 const LIST_RESET: usize = 10;
 const LIST_COPY_RESOURCE: usize = 17;
-const FENCE_GET_COMPLETED_VALUE: usize = 8;
-const FENCE_SET_EVENT_ON_COMPLETION: usize = 9;
+pub(super) const FENCE_GET_COMPLETED_VALUE: usize = 8;
+pub(super) const FENCE_SET_EVENT_ON_COMPLETION: usize = 9;
 
 const DXGI_FORMAT_NV12: u32 = 103;
 const DXGI_FORMAT_P010: u32 = 104;
@@ -123,7 +124,7 @@ const D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET: u32 = 0x1;
 const D3D12_RESOURCE_STATE_COMMON: u32 = 0;
 const D3D12_COMMAND_LIST_TYPE_COPY: u32 = 3;
 const GENERIC_ALL: u32 = 0x1000_0000;
-const WAIT_OBJECT_0: u32 = 0;
+pub(super) const WAIT_OBJECT_0: u32 = 0;
 
 /// `D3D12_HEAP_PROPERTIES`.
 #[repr(C)]
@@ -153,11 +154,11 @@ struct ResourceDesc {
 
 /// `D3D12_COMMAND_QUEUE_DESC`.
 #[repr(C)]
-struct CommandQueueDesc {
-    type_: u32,
-    priority: i32,
-    flags: u32,
-    node_mask: u32,
+pub(super) struct CommandQueueDesc {
+    pub(super) type_: u32,
+    pub(super) priority: i32,
+    pub(super) flags: u32,
+    pub(super) node_mask: u32,
 }
 
 /// `LUID`, passed by value.
@@ -173,13 +174,13 @@ unsafe extern "system" {
     fn LoadLibraryW(name: *const u16) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const std::ffi::c_char) -> *mut c_void;
     fn CloseHandle(handle: *mut c_void) -> i32;
-    fn CreateEventW(
+    pub(super) fn CreateEventW(
         attributes: *const c_void,
         manual_reset: i32,
         initial_state: i32,
         name: *const u16,
     ) -> *mut c_void;
-    fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+    pub(super) fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
 }
 
 type CreateDxgiFactory1 = unsafe extern "system" fn(*const Guid, *mut *mut c_void) -> Hresult;
@@ -187,7 +188,7 @@ type D3d12CreateDevice =
     unsafe extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> Hresult;
 
 /// The address of `symbol` in the system library `library`, loaded once and never unloaded.
-fn system_function(library: &str, symbol: &CStr) -> Result<NonNull<c_void>, String> {
+pub(super) fn system_function(library: &str, symbol: &CStr) -> Result<NonNull<c_void>, String> {
     let wide: Vec<u16> = library.encode_utf16().chain([0]).collect();
     // SAFETY: `wide` is NUL-terminated UTF-16 naming a system library.
     let module = unsafe { LoadLibraryW(wide.as_ptr()) };
@@ -208,7 +209,7 @@ fn system_function(library: &str, symbol: &CStr) -> Result<NonNull<c_void>, Stri
 }
 
 /// `call`'s `HRESULT` as a result: `Err` naming `what` where it failed.
-fn check(what: &str, result: Hresult) -> Result<(), String> {
+pub(super) fn check(what: &str, result: Hresult) -> Result<(), String> {
     if result < 0 {
         // The HRESULT's bits, as Windows writes them.
         Err(format!("{what} failed: {:#010x}", result.cast_unsigned()))
@@ -219,24 +220,26 @@ fn check(what: &str, result: Hresult) -> Result<(), String> {
 
 /// A COM object we hold one reference of, released when dropped.
 #[derive(Debug)]
-struct Com(NonNull<c_void>);
+pub(super) struct Com(NonNull<c_void>);
 
-// SAFETY: the objects held are Direct3D 12's and DXGI's, which are free-threaded: their methods
-// may be called from any thread.
+// SAFETY: the objects held are Direct3D 12's, Direct3D 11's and DXGI's. Direct3D 12's and DXGI's,
+// and Direct3D 11's devices, are free-threaded: their methods may be called from any thread. A
+// Direct3D 11 device context is not, and `super::d3d11` calls one only under the lock of its
+// state, from one thread at a time.
 unsafe impl Send for Com {}
 // SAFETY: as above.
 unsafe impl Sync for Com {}
 
 impl Com {
     /// The object `out` names, made by a call that returned `result`.
-    fn made(what: &str, result: Hresult, out: *mut c_void) -> Result<Com, String> {
+    pub(super) fn made(what: &str, result: Hresult, out: *mut c_void) -> Result<Com, String> {
         check(what, result)?;
         NonNull::new(out)
             .map(Com)
             .ok_or_else(|| format!("{what} made nothing"))
     }
 
-    fn raw(&self) -> *mut c_void {
+    pub(super) fn raw(&self) -> *mut c_void {
         self.0.as_ptr()
     }
 
@@ -245,13 +248,30 @@ impl Com {
     /// # Safety
     ///
     /// `F` must be the method's signature, with the object as its first argument.
-    unsafe fn method<F: Copy>(&self, index: usize) -> F {
+    pub(super) unsafe fn method<F: Copy>(&self, index: usize) -> F {
         // SAFETY: a COM object's first field is its vtable, an array of function pointers, of
         // which the caller names one of the object's interface by its index and signature.
         unsafe {
             let vtable = *self.0.as_ptr().cast::<*const *const c_void>();
             std::mem::transmute_copy::<*const c_void, F>(&*vtable.add(index))
         }
+    }
+
+    /// The object's interface of `iid` (`QueryInterface`, every COM object's method 0), named
+    /// `what` where it has none.
+    pub(super) fn query(&self, iid: &Guid, what: &str) -> Result<Com, String> {
+        let mut out = null_mut();
+        // SAFETY: `QueryInterface` is every COM object's method 0, given an IID and where to
+        // write the interface.
+        let result = unsafe {
+            let query: unsafe extern "system" fn(
+                *mut c_void,
+                *const Guid,
+                *mut *mut c_void,
+            ) -> Hresult = self.method(QUERY_INTERFACE);
+            query(self.raw(), iid, &mut out)
+        };
+        Com::made(what, result, out)
     }
 }
 
@@ -267,7 +287,7 @@ impl Drop for Com {
 
 /// A Direct3D 12 device on the display's adapter, and its copy queue.
 pub(crate) struct Device {
-    device: Com,
+    pub(super) device: Com,
     copies: Mutex<Option<Copies>>,
 }
 
@@ -335,7 +355,7 @@ pub(crate) enum CopyError {
 
 /// An NT handle, closed when dropped.
 #[derive(Debug)]
-struct Handle(NonNull<c_void>);
+pub(super) struct Handle(pub(super) NonNull<c_void>);
 
 // SAFETY: a handle is the process's, usable from any thread.
 unsafe impl Send for Handle {}
@@ -691,7 +711,7 @@ impl Device {
 }
 
 /// The DXGI adapter of `luid`.
-fn adapter_of(luid: [u8; 8]) -> Result<Com, String> {
+pub(super) fn adapter_of(luid: [u8; 8]) -> Result<Com, String> {
     let create_factory = system_function("dxgi.dll", c"CreateDXGIFactory1")?;
     // SAFETY: the function is `CreateDXGIFactory1` (dxgi.h).
     let create_factory =

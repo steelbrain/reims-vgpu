@@ -16,6 +16,8 @@ mod buffer;
 mod calls;
 mod caps;
 #[cfg(windows)]
+mod d3d11;
+#[cfg(windows)]
 mod d3d12;
 mod display;
 mod encoder;
@@ -54,6 +56,8 @@ pub use caps::{
     Capabilities, ConfigCapabilities, Entrypoint, Fourcc, Profile, SurfaceCapabilities,
     proc_filter_name, rt_format_names,
 };
+#[cfg(windows)]
+pub use d3d11::{PlaneDraw, PlaneTargets};
 #[cfg(windows)]
 pub use d3d12::SharedTexture;
 pub use display::{Display, Error};

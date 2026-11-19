@@ -20,6 +20,11 @@ pub use va::{
 #[cfg(windows)]
 pub use va::SharedTexture;
 
+/// On Windows, a picture's planes drawn from its shared texture into two textures of one plane
+/// each, which another device imports (`PlaneDraw::draw`).
+#[cfg(windows)]
+pub use va::{PlaneDraw, PlaneTargets};
+
 pub use va::{
     TARGET_ALIGNMENT, Target, TargetChecks, TargetCodec, TargetFor, TargetFormat, TargetPlane,
     TargetShape,
