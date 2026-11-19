@@ -359,20 +359,28 @@ mod tests {
             let queue = device.new_command_queue().expect("a command queue");
             let ended = Arc::new(AtomicU32::new(0));
             for _ in 0..8 {
-                let buffer = (queue.command_buffer(OnFault::Return).expect("never a raise"))
-                    .expect("a command buffer");
+                let buffer = (queue
+                    .command_buffer(OnFault::Return)
+                    .expect("never a raise"))
+                .expect("a command buffer");
                 let ended = Arc::clone(&ended);
                 let handler = Box::new(move |_: crate::core::platform::command::CompletedInfo| {
                     ended.fetch_add(1, Ordering::SeqCst);
                 });
-                assert_eq!(buffer.add_completed_handler(OnFault::Return, handler), Ok(()));
+                assert_eq!(
+                    buffer.add_completed_handler(OnFault::Return, handler),
+                    Ok(())
+                );
                 assert_eq!(buffer.commit(OnFault::Return), Ok(()));
             }
             let clock = crate::os::OsClock::new();
             let start = clock.now_mono();
             let first = platform.quiesce(Duration::from_secs(5));
             let took = clock.now_mono().saturating_duration_since(start);
-            say(&format!("quiesce answered {first} in {} ms", took.as_millis()));
+            say(&format!(
+                "quiesce answered {first} in {} ms",
+                took.as_millis()
+            ));
             say(&format!("handlers run {}", ended.load(Ordering::SeqCst)));
             let start = clock.now_mono();
             let second = platform.quiesce(Duration::from_secs(5));

@@ -476,8 +476,13 @@ mod tests {
         at("closed true");
         at("the closing thread's step passed");
         at("the step after the close was refused");
-        let counts = stderr.lines().find(|l| l.starts_with("reims-vgpu: degradation counts:"));
-        assert!(counts.is_some_and(|l| l.contains(&format!("{CODE} 1"))), "{stderr}");
+        let counts = stderr
+            .lines()
+            .find(|l| l.starts_with("reims-vgpu: degradation counts:"));
+        assert!(
+            counts.is_some_and(|l| l.contains(&format!("{CODE} 1"))),
+            "{stderr}"
+        );
     }
 
     /// A step inside a step is part of it: both count until they end, and a making counts among
