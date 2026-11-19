@@ -31,6 +31,11 @@
 //!   standard error once the wait passes half its bound, and past the bound the exit goes on.
 //!   The gate also counts as closed once the runtime's guard closed (`rt::process_exiting`): no
 //!   step starts after either hook ran.
+//! - **Ahead of the exit.** A host that quiesces the platform before it exits
+//!   (`reims-vgpu`'s `GraphicsDevice::quiesce_for_exit`, the C API's `rvg_quiesce_for_exit`)
+//!   closes the gate then ([`close_ahead`]), on the thread that then exits, and waits for the
+//!   steps in progress until its own deadline. The hook still runs at the exit: it finds no step
+//!   in progress where the wait ended in time, and writes the counts.
 //! - **Its order.** The C library runs exit handlers in the reverse order of their registration,
 //!   so the hook runs before every destructor registered before it. It is registered as a device
 //!   is adopted (`crate::gpu::device`) and as a compile pool starts, after the driver was loaded;
@@ -39,7 +44,7 @@
 //!   as the runtime's guard does for its own makings; and again as each thread's count of its
 //!   steps ended reaches each power of two, for what a later call registered, at most 64 times a
 //!   thread. A run of an
-//!   earlier registration finds the gate closed and does nothing. Left open: a destructor
+//!   earlier registration finds the hook ran and does nothing. Left open: a destructor
 //!   registered by a call still in progress as the exit begins, or by a call after the hook's last
 //!   registration, which runs before the hook.
 
@@ -51,7 +56,7 @@ use std::time::Duration;
 
 use metal2vulkan_runtime as rt;
 
-use crate::core::platform::os::clock::{Clock as _, Deadline};
+use crate::core::platform::os::clock::{Clock as _, Deadline, MonoTime};
 
 /// The longest the hook waits for the steps in progress, while none is a making.
 pub const BOUND: Duration = Duration::from_secs(2);
@@ -63,8 +68,11 @@ pub const MAKING_BOUND: Duration = Duration::from_secs(60);
 /// How often the hook looks at the steps in progress.
 const POLL: Duration = Duration::from_millis(1);
 
-/// Whether the hook ran.
+/// Whether the gate closed: the hook ran, or a host closed it ahead of the exit ([`close_ahead`]).
 static CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the hook ran.
+static HOOK_RAN: AtomicBool = AtomicBool::new(false);
 
 /// The steps in progress, on every thread, those inside others included.
 static IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
@@ -102,7 +110,8 @@ pub fn making() -> Option<Step> {
     enter(true)
 }
 
-/// Whether the process's exit closed the gate: the hook ran, or the runtime's guard closed.
+/// Whether the process's exit closed the gate: the hook ran, a host closed it ahead of the exit
+/// ([`close_ahead`]), or the runtime's guard closed.
 pub fn closed() -> bool {
     CLOSED.load(Ordering::SeqCst) || rt::process_exiting()
 }
@@ -112,6 +121,27 @@ pub fn stay() -> ! {
     loop {
         std::thread::park();
     }
+}
+
+/// Closes the gate ahead of the process's exit (the module docs), on the thread that then exits
+/// the process, which counts as the exiting one from here on: its own steps pass. The hook is
+/// registered once more first, so that the exit writes the counts. Then waits for the steps in
+/// progress on other threads until `until`, a making's included. True once none is in progress;
+/// false where one still is at `until`, whose thread may still be in a GPU's driver. A later call
+/// closes nothing more and waits again.
+pub fn close_ahead(until: MonoTime) -> bool {
+    arm();
+    let _ = EXITING_HERE.try_with(|e| e.set(true));
+    CLOSED.store(true, Ordering::SeqCst);
+    let clock = crate::os::OsClock::new();
+    while others_in_progress() > 0 {
+        let now = clock.now_mono();
+        if now >= until {
+            return false;
+        }
+        clock.sleep_until(Deadline::Mono(now.saturating_add(POLL).min(until)));
+    }
+    true
 }
 
 /// Registers the hook (the module docs), after every exit handler registered so far. Once the
@@ -173,9 +203,11 @@ unsafe extern "C" {
 
 /// The hook (the module docs): closes the gate, then waits for the steps in progress on other
 /// threads, then writes the process's degradation counts and the log's count of its repeated
-/// lines (`crate::answer::write_counts`). A later run finds it closed and returns.
+/// lines (`crate::answer::write_counts`). A later run finds it ran and returns; a gate closed
+/// ahead of the exit ([`close_ahead`]) leaves it its wait, which finds no step where that one
+/// ended in time, and its counts.
 extern "C" fn at_exit() {
-    if CLOSED.load(Ordering::SeqCst) {
+    if HOOK_RAN.swap(true, Ordering::SeqCst) {
         return;
     }
     let _ = EXITING_HERE.try_with(|e| e.set(true));
@@ -187,8 +219,7 @@ extern "C" fn at_exit() {
 /// The hook's wait for the steps in progress on threads other than the exiting one (the module
 /// docs).
 fn wait_for_others() {
-    let own = DEPTH.try_with(Cell::get).unwrap_or(0);
-    let others = || IN_PROGRESS.load(Ordering::SeqCst).saturating_sub(own);
+    let others = others_in_progress;
     if others() == 0 {
         return;
     }
@@ -225,6 +256,12 @@ fn wait_for_others() {
         }
         clock.sleep_until(Deadline::Mono(clock.now_mono().saturating_add(POLL)));
     }
+}
+
+/// The steps in progress on threads other than this one.
+fn others_in_progress() -> u64 {
+    let own = DEPTH.try_with(Cell::get).unwrap_or(0);
+    IN_PROGRESS.load(Ordering::SeqCst).saturating_sub(own)
 }
 
 #[cfg(test)]
@@ -370,6 +407,77 @@ mod tests {
                 "inside a step {inside}: {stderr}"
             );
         }
+    }
+
+    /// A gate closed ahead of the exit waits for a step in progress on another thread until its
+    /// deadline, answering false where the step outlasts it and true once it ended; it refuses a
+    /// later step of another thread, passes the closing thread's own, and leaves the hook its
+    /// counts at the exit: the child closes it while one thread is 300 ms into a step, first with
+    /// a 50 ms deadline, then with a 5 s one, then exits
+    #[test]
+    fn a_gate_closed_ahead_waits_until_its_deadline_and_the_exit_still_counts() {
+        const TEST: &str = "exit_gate::tests::\
+                            a_gate_closed_ahead_waits_until_its_deadline_and_the_exit_still_counts";
+        const CODE: &str = "exit-gate-test-closed-ahead";
+        if is_child(TEST) {
+            arm();
+            crate::answer::count_kind(CODE);
+            let (began, at_begin) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("in a step".into())
+                .spawn(move || {
+                    let held = step().unwrap();
+                    began.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(300));
+                    say("the step in progress ended");
+                    drop(held);
+                })
+                .unwrap();
+            at_begin.recv().unwrap();
+            let clock = crate::os::OsClock::new();
+            let short = close_ahead(clock.now_mono().saturating_add(Duration::from_millis(50)));
+            say(&format!("a 50 ms deadline answered {short}"));
+            let long = close_ahead(clock.now_mono().saturating_add(Duration::from_secs(5)));
+            say(&format!("a 5 s deadline answered {long}"));
+            say(&format!("closed {}", closed()));
+            match step() {
+                Some(_) => say("the closing thread's step passed"),
+                None => say("the closing thread's step was refused"),
+            }
+            let (refused, at_refusal) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("after the close".into())
+                .spawn(move || match step() {
+                    Some(_) => {
+                        say("a step began after the close");
+                        refused.send(()).unwrap();
+                    }
+                    None => {
+                        say("the step after the close was refused");
+                        refused.send(()).unwrap();
+                        stay();
+                    }
+                })
+                .unwrap();
+            at_refusal.recv().unwrap();
+            // SAFETY: the C library's exit, which never returns.
+            unsafe { exit(0) }
+        }
+        let out = child(TEST);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let at = |line: &str| {
+            stderr
+                .find(line)
+                .unwrap_or_else(|| panic!("no {line:?}: {stderr}"))
+        };
+        assert!(at("a 50 ms deadline answered false") < at("the step in progress ended"));
+        assert!(at("the step in progress ended") < at("a 5 s deadline answered true"));
+        at("closed true");
+        at("the closing thread's step passed");
+        at("the step after the close was refused");
+        let counts = stderr.lines().find(|l| l.starts_with("reims-vgpu: degradation counts:"));
+        assert!(counts.is_some_and(|l| l.contains(&format!("{CODE} 1"))), "{stderr}");
     }
 
     /// A step inside a step is part of it: both count until they end, and a making counts among

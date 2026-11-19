@@ -292,6 +292,12 @@ impl Platform for FakePlatform {
     fn threads(&self) -> &dyn Threads {
         &self.threads
     }
+
+    /// Nothing runs on a GPU: nothing to stop, and true.
+    fn quiesce(&self, bound: std::time::Duration) -> bool {
+        let _ = bound;
+        true
+    }
 }
 
 #[cfg(test)]

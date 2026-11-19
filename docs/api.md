@@ -113,8 +113,9 @@ refusal logs a line saying which, and no file is duplicated until every entry ha
   another context (section 5). A refused create runs its
   tables' destroys; no other function calls back.
 - **Waiting.** No function waits for the display thread or the main thread, and none but the
-  release of the process's last graphics device waits for the device's threads: that one waits
-  for them at most 5 s ("The process's exit"). A STATUS write of 0 and `rvg_graphics_device_reset` wait only for the command the device's control
+  release of the process's last graphics device and `rvg_quiesce_for_exit` waits for the device's
+  threads: the release waits for them at most 5 s, and the quiesce at most its bound ("The
+  process's exit"). A STATUS write of 0 and `rvg_graphics_device_reset` wait only for the command the device's control
   thread is taking, and for a take of a queue's ring or a post onto one under way, none of which
   waits for anything of the host's. `rvg_graphics_device_read_display` and `_read_display_at`
   wait for their own draw on the GPU, on a queue of its own, and one read of each display runs at
@@ -169,9 +170,36 @@ that waits for a lock the host holds around the release, for the whole 5 s. Past
 keeps its GPU devices for the process, as it does while a device lives, and logs a warning saying
 what still held them. A device created after the let-go runs on a new GPU device, whose numbering
 starts again. QEMU releases its device as it quits, once the VM stopped for good (its
-`vm_shutdown`), with the BQL held, which none of its callbacks takes; a VM whose shutdown action
+`vm_shutdown`), with the BQL let go for the release alone; a VM whose shutdown action
 pauses it keeps its device to the exit, and so does a quit while a read of its display
 (`rvg_graphics_device_read_display`) still waits for its draw on the GPU 5 s into the teardown.
+
+A host that can exit with a GPU device alive quiesces the library first: `rvg_quiesce_for_exit`,
+its last call, on the thread that then calls `exit`. It takes no handle, since the GPU devices are
+the process's, and serves a device kept to the exit as it serves the GPU device the platform over
+metal2vulkan-rt keeps past the release of the last graphics device. On that platform it closes the
+exit gate ahead of the exit, as the handler would, so that each thread of the library's parks for
+good at its next step, and waits for the steps in progress on other threads; then the runtime's
+`Device::quiesce` stops its threads: what is ready is submitted and the rest ends unrun, the GPU
+completes what was submitted, and the runtime's threads end. Every wait ends within the call's
+bound, and nothing is freed. It answers true once everything stopped in time; false where a thread
+may still be in the driver (a GPU that did not go idle, a step that outlasted the wait), and the
+host then ends with `_exit`, running no exit handler, the driver's included. On the Vulkan platform
+it does nothing and answers true: the release's let-go and the exit gate's handler stay that
+platform's exit. A second call on the same thread answers at once, with the first answer; after
+it, a call on any other thread parks that thread for good, and the runtime refuses GPU work asked
+for on this one (`rt-refused-quiesced` in the degradation counts). The exit gate's handler still
+runs at the exit, and writes the counts.
+
+QEMU calls it, with a bound of 5 s, at the end of its cleanup (`qemu_cleanup`, through a notifier of
+its own run there, `qemu_add_cleanup_notifier`), on every quit that reaches it: a released device,
+a device kept by a shutdown action that pauses, a quit of a stopped VM, and a read of a display
+that kept it. That runs before `exit` itself, so before every exit handler: QEMU's own exit
+notifiers run from a handler registered at its start, before the driver loaded, so they run after
+the driver's own. It lets the BQL go around the call, as around the release. An `exit` that skips
+the cleanup (a refused realize of a later device, a failed incoming migration) reaches a handler
+registered as the device is made, after the driver loaded, which quiesces with the same bound and
+ends with `_exit(EXIT_FAILURE)` on a false answer.
 
 ### The guest's Shared pool
 
@@ -223,6 +251,7 @@ Objective-C.
 |---|---|
 | constants | the status codes; the PCI facts (`RVG_GRAPHICS_PCI_VENDOR_ID` 0x1234, `_DEVICE_ID` 0x5247, `_CLASS` 0x380, `RVG_GRAPHICS_PCI_BAR_REGISTERS` 0, `RVG_GRAPHICS_REGISTERS_SIZE` 4096, `RVG_GRAPHICS_MSIX_OFFSET` 2048, `RVG_GRAPHICS_MSIX_VECTORS` 1, `RVG_GRAPHICS_PCI_BAR_REGION` 2, `RVG_GRAPHICS_PCI_BAR_DOORBELLS` 4, `RVG_GRAPHICS_DOORBELLS_SIZE` 4 MiB, `RVG_GRAPHICS_DOORBELL_PAGE_SIZE` 16 KiB, `RVG_GRAPHICS_DOORBELL_PAGES` 256); `RVG_GRAPHICS_DISPLAYS_MAX` 4; the doorbell (`RVG_GRAPHICS_REG_DOORBELL`, `RVG_GRAPHICS_DOORBELL_CONTROL`); `RVG_GRAPHICS_ALLOCATIONS_OFFSET`; `RVG_GUEST_ARCH_X86_64` 0 and `RVG_GUEST_ARCH_ARM64` 1; `RVG_WINDOW_BUTTON_*`, `RVG_WINDOW_SCROLL_PHASE_*`, `RVG_WINDOW_SCROLL_MOMENTUM_*` |
 | status | `rvg_status_message` |
+| the process's exit | `rvg_quiesce_for_exit` |
 | the device | `RvgGraphicsDeviceConfig`, `RvgGuestArch`, `RvgGraphicsCallbacks` and its function types, `RvgCursorGlyph`, `RvgDisplayCoord`, `RvgMemoryMap`, `RvgMemoryRange`, `RvgMemoryRangeFile`; `rvg_graphics_device_create`, `_release`, `_region`, `_mmio_read`, `_mmio_write_taking`, `_doorbell_write`, `_set_doorbell`, `_reset`, `_read_display`, `_cursor_position`, `_read_display_at`, `_cursor_position_at`, `_pool_added`, `_pool_removed`, `_pool_grow`, `_pool_range` |
 | its windows | `RvgWindowConfig`, `RvgWindowCallbacks`, `RvgWindowPointerFn`, `RvgWindowWheelFn`, `RvgWindowKeyFn`, `RvgWindowCloseFn`, `RvgWindowScrollFn`, `RvgWindowScroll`; no function of their own: `RvgGraphicsDeviceConfig.window` carries display 0's, and `display_windows` those of displays 1 and up |
 
@@ -314,6 +343,7 @@ returns. The library logs through the `log` crate; a Rust host installs its own 
 | `rvg_status_message` | never | nothing |
 | `rvg_graphics_device_create` | a refusal's destroys | nothing of the host's |
 | `rvg_graphics_device_release` | never | nothing: the threads end and the destroy runs afterwards |
+| `rvg_quiesce_for_exit` | never | the library's calls in progress on other threads, and the GPU's work, until its bound |
 | `rvg_graphics_device_region` | never | nothing |
 | `rvg_graphics_device_mmio_read` | never | nothing |
 | `rvg_graphics_device_mmio_write_taking` | `raise_interrupt`, for a doorbell answered on the calling thread; `route_doorbell` and `route_doorbell_page`, dropping routes, for a STATUS write of 0, and `route_doorbell_page`, dropping a page's routes, for a `DOORBELL_PAGE_BIND` write that binds the page to another context | a STATUS write of 0: the command the control thread is taking; a `DOORBELL_PAGE_BIND` write: the queues' table, held elsewhere |

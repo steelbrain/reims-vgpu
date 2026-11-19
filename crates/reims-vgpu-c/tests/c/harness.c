@@ -452,6 +452,10 @@ int main(int argc, char **argv) {
     check_graphics();
     check_memory_files();
     check_displays();
+    /* As QEMU does at its quit, the last call before the exit: the exit then runs with no thread
+     * of the library's in the GPU's driver, and a second call answers at once. */
+    CHECK(rvg_quiesce_for_exit(5000));
+    CHECK(rvg_quiesce_for_exit(0));
     if (failures) {
         fprintf(stderr, "harness: %d failures\n", failures);
         return 1;

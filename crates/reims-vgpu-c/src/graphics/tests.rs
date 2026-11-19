@@ -677,3 +677,11 @@ fn a_pool_s_pieces_reach_the_host_and_back() {
     }
     assert_eq!(POOL_ASKS.lock().len(), 1);
 }
+
+/// The quiesce ahead of the exit takes no handle: on a platform with nothing on a GPU it answers
+/// true, whatever its bound, and again at a second call
+#[test]
+fn a_quiesce_ahead_of_the_exit_with_nothing_to_stop_answers_true() {
+    assert!(rvg_quiesce_for_exit(0));
+    assert!(rvg_quiesce_for_exit(5_000));
+}

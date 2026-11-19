@@ -803,6 +803,27 @@ pub unsafe extern "C" fn rvg_graphics_device_release(device: *mut RvgGraphicsDev
     })
 }
 
+/// Quiesces the library ahead of the process's exit: the host's last call before it exits, made
+/// on the thread that then calls `exit`, whether its graphics devices were released or kept to the
+/// exit. It takes no handle: the GPU devices the library keeps are the process's. On the platform
+/// over metal2vulkan-rt, the library's threads park for good at their next call into it, its
+/// calls in progress on other threads are waited for, then the runtime's threads end and the GPU
+/// completes what was submitted, so that no thread is in the GPU's driver, nor touches its memory,
+/// as the driver's exit-time teardown runs; nothing is freed, a call on another thread after it
+/// never returns, and GPU work asked for on this thread is refused. On the Vulkan platform it does
+/// nothing. Every wait ends within `timeout_ms`. True once everything stopped in time, and where
+/// there was nothing to stop; false where a thread may still be in the driver (a GPU that did not
+/// go idle, a call that outlasted the wait), and the host then ends with `_exit` rather than
+/// `exit`: on NVIDIA's driver an exit with a thread inside it can end in SIGSEGV inside the
+/// driver's exit handler. A second call on the same thread answers at once, with the first
+/// answer. Calls back: never.
+#[unsafe(no_mangle)]
+pub extern "C" fn rvg_quiesce_for_exit(timeout_ms: u64) -> bool {
+    ffi::export(|| {
+        GraphicsDevice::<Plat>::quiesce_for_exit(std::time::Duration::from_millis(timeout_ms))
+    })
+}
+
 /// The device's region: its first byte, page-aligned, and, through `size` where it is not NULL,
 /// its size, a power of two. The host maps it into the guest as BAR 2, once; it is memory of the
 /// host's process (on Linux a shared mapping of a memfd of the library's, on macOS private

@@ -275,6 +275,28 @@ impl Platform for RtPlatform {
     fn threads(&self) -> &dyn Threads {
         &self.threads
     }
+
+    /// The library's threads first, then rt's: closes the exit gate ahead of the exit, so that a
+    /// thread of the library's parks at its next step, and waits for the steps in progress on
+    /// other threads ([`crate::exit_gate::close_ahead`]); then rt's `Device::quiesce` of the
+    /// process's device, where it was made, with what is left of `bound`: rt's submit thread
+    /// submits what is ready and ends the rest unrun, the GPU completes what was submitted, and
+    /// rt's threads end. Nothing is freed. False where a step outlasted the wait, or rt answered
+    /// false (a thread of rt's may still be in the driver, metal2vulkan-rt's README, "Quiesce and
+    /// exit").
+    fn quiesce(&self, bound: std::time::Duration) -> bool {
+        use crate::core::platform::os::clock::Clock as _;
+        let until = self.clock.now_mono().saturating_add(bound);
+        let parked = crate::exit_gate::close_ahead(until);
+        let quiesced = match self.device.get() {
+            Some(Ok(device)) => {
+                let left = until.saturating_duration_since(self.clock.now_mono());
+                device.rt().quiesce(left)
+            }
+            Some(Err(_)) | None => true,
+        };
+        parked && quiesced
+    }
 }
 
 #[cfg(test)]
@@ -309,6 +331,84 @@ mod tests {
         let descriptor = platform.rate_map_descriptor(&RateMapDesc::default());
         assert_eq!(RateMapDescriptor::<RtPlatform>::layer_count(&descriptor), 0);
         assert!(counted(code) >= before + 3, "{code}");
+    }
+
+    /// A quiesce ahead of the exit on the GPU the test holds, in a child process: work committed
+    /// just before it ends, completed or unrun, with its handler run; it answers true in time,
+    /// and a second call at once; the exit gate is closed; a command buffer made after it is
+    /// refused and counted; and the child's exit with rt's device alive ends with status 0.
+    #[test]
+    fn on_vulkan_a_quiesce_stops_the_device_before_the_exit() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::os::clock::Clock as _;
+
+        const TEST: &str =
+            "rt_platform::tests::on_vulkan_a_quiesce_stops_the_device_before_the_exit";
+        unsafe extern "C" {
+            /// The C library's `exit`, which runs the exit handlers, as QEMU's exit does.
+            fn exit(status: i32) -> !;
+        }
+        let say = |line: &str| eprintln!("{line}");
+        if std::env::var("RVG_QUIESCE_CHILD").as_deref() == Ok(TEST) {
+            let platform = RtPlatform::new();
+            let device = (platform.system_default_device()).expect("an rt device on the GPU");
+            let queue = device.new_command_queue().expect("a command queue");
+            let ended = Arc::new(AtomicU32::new(0));
+            for _ in 0..8 {
+                let buffer = (queue.command_buffer(OnFault::Return).expect("never a raise"))
+                    .expect("a command buffer");
+                let ended = Arc::clone(&ended);
+                let handler = Box::new(move |_: crate::core::platform::command::CompletedInfo| {
+                    ended.fetch_add(1, Ordering::SeqCst);
+                });
+                assert_eq!(buffer.add_completed_handler(OnFault::Return, handler), Ok(()));
+                assert_eq!(buffer.commit(OnFault::Return), Ok(()));
+            }
+            let clock = crate::os::OsClock::new();
+            let start = clock.now_mono();
+            let first = platform.quiesce(Duration::from_secs(5));
+            let took = clock.now_mono().saturating_duration_since(start);
+            say(&format!("quiesce answered {first} in {} ms", took.as_millis()));
+            say(&format!("handlers run {}", ended.load(Ordering::SeqCst)));
+            let start = clock.now_mono();
+            let second = platform.quiesce(Duration::from_secs(5));
+            let took = clock.now_mono().saturating_duration_since(start);
+            say(&format!(
+                "a second quiesce answered {second}, at once {}",
+                took < Duration::from_millis(100)
+            ));
+            say(&format!("gate closed {}", crate::exit_gate::closed()));
+            let code = RtRefusal::Quiesced.code();
+            let before = counted(code);
+            let refused = matches!(queue.command_buffer(OnFault::Return), Ok(None));
+            say(&format!(
+                "a command buffer after it refused {refused}, counted {}",
+                counted(code).saturating_sub(before)
+            ));
+            // SAFETY: the C library's exit, which never returns.
+            unsafe { exit(0) }
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env("RVG_QUIESCE_CHILD", TEST)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        println!("{stderr}");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        for line in [
+            "quiesce answered true",
+            "handlers run 8",
+            "a second quiesce answered true, at once true",
+            "gate closed true",
+            "a command buffer after it refused true, counted 1",
+        ] {
+            assert!(stderr.contains(line), "no {line:?}: {stderr}");
+        }
     }
 
     /// A texture descriptor reads back what was set, as Metal's does; each made one is an object

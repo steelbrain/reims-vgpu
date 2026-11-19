@@ -917,6 +917,15 @@ impl Platform for VulkanPlatform {
     fn threads(&self) -> &dyn Threads {
         &self.threads
     }
+
+    /// Nothing, and true: metal2vulkan's runtime offers no quiesce, and the process's exit stays
+    /// as it was. The release of the last graphics device lets go of the GPU devices
+    /// ([`crate::let_go`]), and the exit gate's hook waits for the library's steps in progress
+    /// ([`crate::exit_gate`]), as the runtime's guard waits for its own.
+    fn quiesce(&self, bound: std::time::Duration) -> bool {
+        let _ = bound;
+        true
+    }
 }
 
 #[cfg(test)]

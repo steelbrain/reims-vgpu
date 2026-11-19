@@ -183,6 +183,18 @@ pub trait Platform: Sized + Send + Sync + 'static {
     fn clock(&self) -> &Self::Clock;
     /// Every OS thread core creates (D35).
     fn threads(&self) -> &dyn Threads;
+
+    // The process's exit.
+    /// No Metal counterpart: stops what the platform runs on its GPU devices, its threads and
+    /// their GPU work, for a process about to exit with a device alive, so that none of them is
+    /// in a GPU's driver, or touches its memory, as the driver's exit-time teardown runs (on
+    /// NVIDIA's driver an exit with a thread inside it can end in `SIGSEGV` in the driver's exit
+    /// handler). Every wait is bounded by `bound`, and nothing is freed. Called on the thread that
+    /// then exits the process, as the last of the platform's calls but those of that exit. True
+    /// once everything stopped in time, and where there is nothing to stop; false where a thread
+    /// may still be in a driver, so the process ends without running its exit handlers. The
+    /// caller keeps the first answer, and makes no later call.
+    fn quiesce(&self, bound: std::time::Duration) -> bool;
 }
 
 /// A send to nil does nothing and returns zero (Objective-C). Used exactly where core sends to a
