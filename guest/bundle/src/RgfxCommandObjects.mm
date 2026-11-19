@@ -2189,6 +2189,12 @@ enum RgfxStage : unsigned {
 
 - (void)commit
 {
+	// A no-copy buffer's escape note that an act on this thread found gone (RgfxEscapes, a
+	// relaxed load) goes before this buffer: the fence pairs with the release store that cleared
+	// the buffer's flag after the note was posted on the control ring or held in the serialiser,
+	// so whichever thread posts this buffer (rgfxPost, after _readyToPost's release) posts the
+	// held first (RgfxSerializer::postHeldCreates, publishVia).
+	std::atomic_thread_fence(std::memory_order_acquire);
 	// Its commit's time, where its stream carries the guest's times: on entry.
 	if (_encoder->stampsGuestTimes())
 		_encoder->noteCommitted(rgfxGuestClockNs());

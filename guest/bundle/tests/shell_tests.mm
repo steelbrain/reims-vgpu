@@ -58,6 +58,7 @@
 #import "RgfxIOSurface.h"
 #import "RgfxIndirectCommandBuffer.h"
 #import "RgfxMetalPrivate.h"
+#import "RgfxResidencySet.h"
 #import "RgfxUnsupported.h"
 #import "RgfxUploads.h"
 
@@ -100,6 +101,7 @@
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "reims_graphics_wire.h"
+#include "rgfx_argument_reply.hpp"
 #include "rgfx_test_ring.hpp" // CHECK, g_checks, TestRing, expectMessage
 
 
@@ -15328,6 +15330,321 @@ void test_no_copy_buffer_over_remapped_memory_takes_its_own_block()
 }
 
 
+// A no-copy buffer the escape note covers (RgfxEscapes): one over the app's own pages, writable
+// or read-only (Metal's private bit 24), or over bytes already in a block of the process's,
+// Managed neither. Its note (BUFFER_ESCAPED) goes once for its life, at the first act that hands
+// its identity on with no message, and names that act: the app's read of its gpuAddress, an
+// argument encoder's setBuffer: of it or setTexture: of a texture over it, the app's read of such
+// a texture's or view's gpuResourceID, or it or such a texture joining a residency set. A
+// texture's or view's act names the buffer, and threads racing to the first act post one note.
+// No act of a buffer the note does not cover posts one (a device buffer, a no-copy one over
+// Managed bytes, whether over the region or in a slab's copy), nor of one made where the device
+// takes no note (RGFX_FEATURE_BUFFER_ESCAPED).
+void test_no_copy_buffer_escape_notes()
+{
+	@autoreleasepool {
+	Fixture fx;
+	fx.ser.setCarriesBufferEscaped(true);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0xff);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	RgfxRegionSlabSource slabSource(region, fx.ser);
+	RgfxSlabs slabs(slabSource);
+	// A pages block for each buffer's bytes, one after another.
+	struct Pages {
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x100000;
+		static bool block(void *c, const void *address, uint64_t length, bool, uint64_t *offset,
+		                  uint64_t *size)
+		{
+			Pages *p = static_cast<Pages *>(c);
+			const uint64_t start = reinterpret_cast<uintptr_t>(address) & 0xfff;
+			*offset = p->next;
+			*size = (start + length + 0xfff) & ~uint64_t{0xfff};
+			p->next += *size;
+			return true;
+		}
+	} pages;
+	region.setPagesBlockSource(&Pages::block, &pages);
+	vm_address_t app = 0;
+	CHECK(vm_allocate(mach_task_self(), &app, 0x40000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	uint8_t *bytes = reinterpret_cast<uint8_t *>(app);
+	uint8_t *readOnly = bytes + 0x30000;
+	CHECK(vm_protect(mach_task_self(), reinterpret_cast<vm_address_t>(readOnly), 0x4000, false,
+	                 VM_PROT_READ) == KERN_SUCCESS);
+	@autoreleasepool {
+	const MTLResourceOptions shared = MTLResourceStorageModeShared;
+	const MTLResourceOptions managedOptions = MTLResourceStorageModeManaged;
+	auto noCopy = [&](void *ptr, NSUInteger length, MTLResourceOptions options) {
+		RgfxBuffer *b = [RgfxBuffer bufferWithBytesNoCopy:ptr
+		                                           length:length
+		                                          options:options
+		                                      deallocator:nil
+		                                           region:&region
+		                                            slabs:&slabs
+		                                           device:nil
+		                                       serializer:&fx.ser];
+		CHECK(b != nil);
+		drainRing(fx.ring);
+		return b;
+	};
+	// The note of `buffer`'s escape, by an act of `kind`, alone on the ring.
+	auto noted = [&](RgfxBuffer *buffer, uint32_t kind) {
+		auto note = expectMessage<RgfxBufferEscaped>(fx.ring, RGFX_CMD_BUFFER_ESCAPED);
+		CHECK(note.obj_id == buffer.rgfxObjId && note.kind == kind && note.reserved_1c == 0);
+		CHECK(ringEmpty(fx.ring));
+	};
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:16
+	                                                      height:16
+	                                                   mipmapped:NO];
+	td.storageMode = MTLStorageModeShared;
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+	auto textureOver = [&](RgfxBuffer *buffer) {
+		id<MTLTexture> t = [buffer newTextureWithDescriptor:td offset:0 bytesPerRow:256];
+		CHECK(t != nil);
+		drainRing(fx.ring);
+		return t;
+	};
+	// An encoder of a buffer at index 0 and a texture at index 1, into a buffer of its own.
+	ArgReply reply;
+	reply.layout(16, 8)
+	    .member(0, RGFX_ARGUMENT_BUFFER, 0, 8)
+	    .member(1, RGFX_ARGUMENT_TEXTURE, 8, 8);
+	auto replyBytes = reply.bytes();
+	RgfxArgumentEncoder *enc =
+	    [[RgfxArgumentEncoder alloc] initWithLayout:RgfxArgLayout::parse(replyBytes.data(),
+	                                                                     replyBytes.size())
+	                                         device:nil
+	                                     serializer:nullptr];
+	RgfxBuffer *args = [RgfxBuffer bufferWithLength:64 options:shared device:nil serializer:&fx.ser];
+	CHECK(enc != nil && args != nil);
+	drainRing(fx.ring);
+	[enc setArgumentBuffer:args offset:0];
+	RgfxResidencySet *set = [[RgfxResidencySet alloc] initWithDevice:nil descriptor:nil];
+	CHECK(ringEmpty(fx.ring));
+
+	// The app reads its gpuAddress: the note, once, then nothing for any act.
+	RgfxBuffer *read = noCopy(bytes, 0x2000, shared);
+	const uint64_t address = read.gpuAddress;
+	noted(read, RGFX_BUFFER_ESCAPED_GPU_ADDRESS);
+	CHECK(read.gpuAddress == address);
+	[enc setBuffer:read offset:0 atIndex:0];
+	[set addAllocation:read];
+	CHECK(ringEmpty(fx.ring));
+	uint64_t word = 0;
+	std::memcpy(&word, args.contents, sizeof(word));
+	CHECK(word == address);
+
+	// An argument encoder writes it first: the note, before the word, once.
+	RgfxBuffer *encoded = noCopy(bytes + 0x4000, 0x2000, shared);
+	[enc setBuffer:encoded offset:16 atIndex:0];
+	noted(encoded, RGFX_BUFFER_ESCAPED_ARGUMENT_ENCODER);
+	std::memcpy(&word, args.contents, sizeof(word));
+	CHECK(word == encoded.gpuAddress + 16);
+	id<MTLBuffer> two[2] = {encoded, encoded};
+	NSUInteger offsets[2] = {0, 0};
+	[enc setBuffers:two offsets:offsets withRange:NSMakeRange(0, 1)];
+	CHECK(ringEmpty(fx.ring));
+
+	// Read-only memory's buffer, of bit 24, joins a residency set first: the note, once.
+	RgfxBuffer *resident = noCopy(readOnly, 0x2000, shared);
+	[set addAllocation:resident];
+	noted(resident, RGFX_BUFFER_ESCAPED_RESIDENCY_SET);
+	[set addAllocation:resident];
+	(void)resident.gpuAddress;
+	CHECK(ringEmpty(fx.ring));
+
+	// Over bytes in a block of the process's: a view of a texture over it names the buffer, and
+	// neither the texture, nor the view, nor the buffer posts again.
+	RgfxRegion::Block inRegion = region.allocate(0x2000);
+	RgfxBuffer *placed = noCopy(const_cast<uint8_t *>(inRegion.ptr), 0x2000, shared);
+	id<MTLTexture> placedTexture = textureOver(placed);
+	id<MTLTexture> view = [placedTexture newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+	CHECK(view != nil);
+	drainRing(fx.ring);
+	(void)view.gpuResourceID;
+	noted(placed, RGFX_BUFFER_ESCAPED_RESOURCE_ID);
+	(void)view.gpuResourceID;
+	(void)placedTexture.gpuResourceID;
+	(void)placed.gpuAddress;
+	[enc setTexture:placedTexture atIndex:1];
+	[set addAllocation:view];
+	CHECK(ringEmpty(fx.ring));
+
+	// A texture over one set by an argument encoder: the buffer's note, by the encoder.
+	RgfxBuffer *underSet = noCopy(bytes + 0x8000, 0x2000, shared);
+	id<MTLTexture> setTexture = textureOver(underSet);
+	[enc setTexture:setTexture atIndex:1];
+	noted(underSet, RGFX_BUFFER_ESCAPED_ARGUMENT_ENCODER);
+	std::memcpy(&word, static_cast<uint8_t *>(args.contents) + 8, sizeof(word));
+	CHECK(word == setTexture.gpuResourceID._impl);
+	[set addAllocation:underSet];
+	CHECK(ringEmpty(fx.ring));
+
+	// A texture over one joins a residency set among others: the buffer's note.
+	RgfxBuffer *underJoin = noCopy(bytes + 0xc000, 0x2000, shared);
+	id<MTLTexture> joinTexture = textureOver(underJoin);
+	id<MTLAllocation> joining[2] = {args, joinTexture};
+	[set addAllocations:joining count:2];
+	noted(underJoin, RGFX_BUFFER_ESCAPED_RESIDENCY_SET);
+	(void)joinTexture.gpuResourceID;
+	CHECK(ringEmpty(fx.ring));
+
+	// Threads that read its gpuAddress at once post one note between them, and each returns
+	// once it has gone.
+	RgfxBuffer *raced = noCopy(bytes + 0x10000, 0x2000, shared);
+	std::atomic<int> sawAddress{0};
+	std::atomic<int> *saw = &sawAddress;
+	dispatch_apply(8, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t) {
+		if (raced.gpuAddress != 0)
+			saw->fetch_add(1);
+	});
+	CHECK(sawAddress.load() == 8);
+	noted(raced, RGFX_BUFFER_ESCAPED_GPU_ADDRESS);
+
+	// Buffers the note does not cover post none: a device buffer, a no-copy one over Managed
+	// bytes in a block of the process's, and one over Managed app memory, whose copy lies in a
+	// slab.
+	RgfxRegion::Block managedBlock = region.allocate(0x1000);
+	RgfxBuffer *uncovered[3] = {
+	    [RgfxBuffer bufferWithLength:0x100 options:shared device:nil serializer:&fx.ser],
+	    noCopy(const_cast<uint8_t *>(managedBlock.ptr), 0x1000, managedOptions),
+	    noCopy(bytes + 0x14000, 0x2000, managedOptions),
+	};
+	CHECK([uncovered[2] rgfxShadow] != nullptr);
+	drainRing(fx.ring);
+	for (RgfxBuffer *b : uncovered) {
+		CHECK(b != nil);
+		(void)b.gpuAddress;
+		[enc setBuffer:b offset:0 atIndex:0];
+		[set addAllocation:b];
+		id<MTLTexture> over = [b newTextureWithDescriptor:td offset:0 bytesPerRow:256];
+		drainRing(fx.ring);
+		[enc setTexture:over atIndex:1];
+		(void)over.gpuResourceID;
+		CHECK(ringEmpty(fx.ring));
+	}
+
+	// Made where the device takes no note: none, ever.
+	fx.ser.setCarriesBufferEscaped(false);
+	RgfxBuffer *quiet = noCopy(bytes + 0x18000, 0x2000, shared);
+	(void)quiet.gpuAddress;
+	CHECK(ringEmpty(fx.ring));
+	fx.ser.setCarriesBufferEscaped(true);
+	(void)quiet.gpuAddress;
+	[enc setBuffer:quiet offset:0 atIndex:0];
+	CHECK(ringEmpty(fx.ring));
+	drainRing(fx.ring);
+	}
+	vm_deallocate(mach_task_self(), app, 0x40000);
+	}
+	CHECK(!RgfxMemoryShadow::anyLive());
+}
+
+// A slab's buffer made over pages of its own (BUFFER_OVER_PAGES, a Shared one past 2 MiB over a slab
+// of the process's own pages), whose message the host takes as any no-copy buffer's, is one the
+// escape note covers: a device buffer's, and a no-copy one's shadow over memory the kext makes no
+// block of. The app's read of its gpuAddress posts the note, once. A buffer placed in a slab's heap
+// (BUFFER_AT_OFFSET) posts none, nor does a Managed one past 2 MiB (the region's slab).
+void test_slab_buffers_over_pages_escape_notes()
+{
+	@autoreleasepool {
+	Fixture fx;
+	fx.ser.setCarriesBufferEscaped(true);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x1000000, 0xff);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	// The kernel's plain pages, and the kext's pages blocks of writable memory alone.
+	struct Vm {
+		std::map<uint8_t *, std::unique_ptr<uint8_t[]>> held;
+		BlockLog *blocks = nullptr;
+		static int pages(void *c, uint64_t size, uint8_t **bytes)
+		{
+			std::unique_ptr<uint8_t[]> memory(new uint8_t[size]());
+			*bytes = memory.get();
+			static_cast<Vm *>(c)->held[*bytes] = std::move(memory);
+			return KERN_SUCCESS;
+		}
+		static void unmap(void *c, uint8_t *bytes, uint64_t) { static_cast<Vm *>(c)->held.erase(bytes); }
+		static bool block(void *c, const void *, uint64_t, bool writable, uint64_t *offset,
+		                  uint64_t *size)
+		{
+			if (!writable)
+				return false;
+			*size = 0x1000;
+			return BlockLog::alloc(static_cast<Vm *>(c)->blocks, 0x1000, 0x1000, offset);
+		}
+	} vm;
+	vm.blocks = &blocks;
+	region.setPagesBlockSource(&Vm::block, &vm);
+	RgfxPagesMemory calls;
+	calls.context = &vm;
+	calls.pages = &Vm::pages;
+	calls.unmap = &Vm::unmap;
+	RgfxRegionSlabSource regionSource(region, fx.ser);
+	RgfxPagesSlabSource pagesSource(region, fx.ser, calls, 16ull << 30);
+	RgfxSlabs slabs(regionSource);
+	slabs.setFirst(&pagesSource);
+	const NSUInteger big = 3ull << 20;
+	vm_address_t app = 0;
+	CHECK(vm_allocate(mach_task_self(), &app, big, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	CHECK(vm_protect(mach_task_self(), app, big, false, VM_PROT_READ) == KERN_SUCCESS);
+	@autoreleasepool {
+	auto device = [&](NSUInteger length, MTLResourceOptions options) {
+		RgfxBuffer *b = [RgfxBuffer bufferForDeviceWithLength:length
+		                                              options:options
+		                                                bytes:nullptr
+		                                            maxLength:0
+		                                                slabs:&slabs
+		                                               device:nil
+		                                           serializer:&fx.ser];
+		CHECK(b != nil);
+		return b;
+	};
+	auto readOnce = [&](RgfxBuffer *buffer) {
+		const uint64_t address = buffer.gpuAddress;
+		auto note = expectMessage<RgfxBufferEscaped>(fx.ring, RGFX_CMD_BUFFER_ESCAPED);
+		CHECK(note.obj_id == buffer.rgfxObjId && note.kind == RGFX_BUFFER_ESCAPED_GPU_ADDRESS);
+		CHECK(ringEmpty(fx.ring));
+		CHECK(buffer.gpuAddress == address);
+		CHECK(ringEmpty(fx.ring));
+	};
+	RgfxBuffer *large = device(big, MTLResourceStorageModeShared);
+	auto over = expectMessage<RgfxBufferOverPages>(fx.ring, RGFX_CMD_BUFFER_OVER_PAGES);
+	CHECK(over.obj_id == large.rgfxObjId && over.length == big);
+	drainRing(fx.ring);
+	readOnce(large);
+
+	RgfxBuffer *shadowed = [RgfxBuffer bufferWithBytesNoCopy:reinterpret_cast<void *>(app)
+	                                                  length:big
+	                                                 options:MTLResourceStorageModeShared
+	                                             deallocator:nil
+	                                                  region:&region
+	                                                   slabs:&slabs
+	                                                  device:nil
+	                                              serializer:&fx.ser];
+	CHECK(shadowed != nil && [shadowed rgfxShadow] != nullptr);
+	over = expectMessage<RgfxBufferOverPages>(fx.ring, RGFX_CMD_BUFFER_OVER_PAGES);
+	CHECK(over.obj_id == shadowed.rgfxObjId);
+	drainRing(fx.ring);
+	readOnce(shadowed);
+
+	RgfxBuffer *placed = device(0x1000, MTLResourceStorageModeShared);
+	RgfxBuffer *managed = device(big, MTLResourceStorageModeManaged);
+	drainRing(fx.ring);
+	(void)placed.gpuAddress;
+	(void)managed.gpuAddress;
+	CHECK(ringEmpty(fx.ring));
+	}
+	drainRing(fx.ring);
+	vm_deallocate(mach_task_self(), app, big);
+	}
+	CHECK(!RgfxMemoryShadow::anyLive());
+}
+
 // A no-copy buffer's GPU copy (its shadow) is a range of a slab of its options, as a device
 // buffer's is (RgfxBuffer.h): with the process's own pages as the slabs' first source, the
 // copies of read-only memory, Shared and Managed, where the kext makes no block of it (a host
@@ -21521,6 +21838,8 @@ int main(int argc, char **argv)
 		test_no_copy_buffers_in_place();
 		test_no_copy_buffers_over_the_same_bytes_share_a_block();
 		test_no_copy_buffer_over_remapped_memory_takes_its_own_block();
+		test_no_copy_buffer_escape_notes();
+		test_slab_buffers_over_pages_escape_notes();
 		test_no_copy_shadows_lie_in_slabs();
 		test_binds_note_shadow_writes();
 		test_block_call();

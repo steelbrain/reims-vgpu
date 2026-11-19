@@ -60,8 +60,8 @@ int main()
 	check(!rgfxSubmitRoutesQueueDestroy(RGFX_CMD_QUEUE_CREATE), "QUEUE_CREATE does not route");
 	check(!rgfxSubmitRoutesQueueDestroy(RGFX_CMD_BLOCK_RELEASE), "BLOCK_RELEASE does not route");
 
-	// SubmitBatch takes destroys, the creates no one waits for that name no block, and a Managed
-	// buffer's modified range, each of its one size: messages no one waits for, which name no
+	// SubmitBatch takes destroys, the creates no one waits for that name no block, a Managed
+	// buffer's modified range and a buffer's escape note, each of its one size: messages no one waits for, which name no
 	// block (spans_test), so the batch needs neither answers nor pins; a create is followed by
 	// its destroy where a close came since the check. A texture over an IOSurface, which a
 	// present waits for, and every other type, accepted by Submit or not, go one call at a time.
@@ -79,6 +79,7 @@ int main()
 		{RGFX_CMD_MANAGED_BUFFER_CREATE,
 		 sizeof(RgfxManagedBufferCreate) + sizeof(RgfxManagedBufferZero), true},
 		{RGFX_CMD_BUFFER_DID_MODIFY_RANGE, sizeof(RgfxBufferDidModifyRange), false},
+		{RGFX_CMD_BUFFER_ESCAPED, sizeof(RgfxBufferEscaped), false},
 	};
 	for (const Taken &t : taken) {
 		check(rgfxSubmitBatchSize(t.type) == t.size, "SubmitBatch takes the type, of its size");
@@ -117,7 +118,7 @@ int main()
 	    RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ARGUMENT_LAYOUT,
 	    RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_ICB_WRITE, RGFX_CMD_TEXTURE_DID_MODIFY_DATA,
 	    RGFX_CMD_RATE_MAP_RESET, RGFX_CMD_RATE_MAP_QUERY, RGFX_CMD_FUNCTION_TABLE_SET,
-	    RGFX_CMD_ICB_SLOTS_IN_PAGES,
+	    RGFX_CMD_ICB_SLOTS_IN_PAGES, RGFX_CMD_BUFFER_ESCAPED,
 	};
 	for (uint32_t t : makes)
 		check(rgfxSubmitAdmitted(t) && rgfxSubmitMakes(t), "a create makes an object");
@@ -133,7 +134,7 @@ int main()
 		if (type <= RGFX_CMD_BUFFER_OVER_PAGES || type == RGFX_CMD_BUFFER_MANAGED_AT_OFFSET ||
 		    type == RGFX_CMD_HEAP_OVER_PAGES || type == RGFX_CMD_MANAGED_BUFFER_CREATE ||
 		    type == RGFX_CMD_MESH_RENDER_PIPELINE_CREATE || type == RGFX_CMD_TEXTURE_DID_MODIFY_DATA ||
-		    (type >= RGFX_CMD_RATE_MAP_CREATE && type <= RGFX_CMD_ICB_SLOTS_IN_PAGES))
+		    (type >= RGFX_CMD_RATE_MAP_CREATE && type <= RGFX_CMD_BUFFER_ESCAPED))
 			check(listed, "every wire type of the accepted range is placed");
 		else if (!listed)
 			check(!rgfxSubmitMakes(type), "a type the wire does not name makes none");

@@ -10,6 +10,7 @@
 
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <os/lock.h>
 
 #include <algorithm>
 #include <atomic>
@@ -171,6 +172,22 @@ bool rgfxTexelsPastAllocation(uint64_t length, uint64_t offset, uint64_t bytesPe
 		return false;
 	return end > hostAllocation;
 }
+
+// Marks `buffer`, a no-copy buffer the escape note covers, as owing its note (RgfxEscapes), where
+// the device takes notes (RGFX_FEATURE_BUFFER_ESCAPED): one over the app's own pages
+// (BUFFER_OVER_PAGES), writable or of bit 24, and one over bytes already in a block of the
+// process's (BUFFER_OVER_HOST_MEMORY), Managed neither. A slab's buffer made the same way, with
+// an address of its own (RgfxSlabSource::Made's ownsAddress: a Shared one past 2 MiB over a slab
+// of the process's own pages, a device buffer or a no-copy one's shadow), is one too, as the host
+// takes every such message alike; one placed in a slab's heap (BUFFER_AT_OFFSET) is not. Before
+// any other thread sees the buffer.
+void rgfxOwesEscapeNote(RgfxBuffer *buffer, MTLResourceOptions options, RgfxSerializer *serializer)
+{
+	if (buffer != nil &&
+	    (options & MTLResourceStorageModeMask) != MTLResourceStorageModeManaged &&
+	    serializer->carriesBufferEscaped())
+		__atomic_store_n(&buffer->_rgfxEscape, 1, __ATOMIC_RELAXED);
+}
 } // namespace
 
 @interface RgfxBuffer () <RgfxMetalBufferInternals>
@@ -213,6 +230,9 @@ bool rgfxTexelsPastAllocation(uint64_t length, uint64_t offset, uint64_t bytesPe
 	// YES for the buffer newBufferWithBytesNoCopy: makes (bufferWithBytesNoCopy), over the
 	// caller's bytes, which stays NonVolatile (setPurgeableState:).
 	BOOL _noCopy;
+	// Held while the buffer's escape note is posted (rgfxNoteEscape:), so a thread whose act
+	// comes while another's posts it returns only once it has gone. No post path takes it.
+	os_unfair_lock _escapeLock;
 }
 
 + (instancetype)bufferWithLength:(NSUInteger)length
@@ -347,6 +367,8 @@ bool rgfxTexelsPastAllocation(uint64_t length, uint64_t offset, uint64_t bytesPe
 	if (buffer != nil) {
 		buffer->_ownsAddress = made.ownsAddress;
 		buffer->_allocatedSize = range.size;
+		if (made.ownsAddress)
+			rgfxOwesEscapeNote(buffer, options, serializer);
 	}
 	return buffer;
 }
@@ -394,13 +416,15 @@ bool rgfxTexelsPastAllocation(uint64_t length, uint64_t offset, uint64_t bytesPe
 		void (^done)(void) = nil;
 		if (appDeallocator != nil)
 			done = ^{ appDeallocator(pointer, length); };
-		return [RgfxBuffer bufferOverHostMemoryWithContents:pointer
-		                                      regionOffset:region->offsetOf(pointer)
-		                                            length:length
-		                                           options:options
-		                                       deallocator:done
-		                                            device:device
-		                                        serializer:serializer];
+		RgfxBuffer *placed = [RgfxBuffer bufferOverHostMemoryWithContents:pointer
+		                                                     regionOffset:region->offsetOf(pointer)
+		                                                           length:length
+		                                                          options:options
+		                                                      deallocator:done
+		                                                           device:device
+		                                                       serializer:serializer];
+		rgfxOwesEscapeNote(placed, options, serializer);
+		return placed;
 	}
 	bool writable = true;
 	if (pointer != nullptr && !rgfxMappedReadable(pointer, length, &writable))
@@ -480,6 +504,8 @@ bool rgfxTexelsPastAllocation(uint64_t length, uint64_t offset, uint64_t bytesPe
 		return nil;
 	buffer->_ownsAddress = made.ownsAddress;
 	buffer->_shadow = std::move(shadow);
+	if (made.ownsAddress)
+		rgfxOwesEscapeNote(buffer, options, serializer);
 	return buffer;
 }
 
@@ -596,6 +622,7 @@ bool rgfxTexelsPastAllocation(uint64_t length, uint64_t offset, uint64_t bytesPe
 	buffer->_addressPick = created.gpu_address;
 	buffer->_pagesRegion = region;
 	buffer->_pagesBlock = at;
+	rgfxOwesEscapeNote(buffer, options, serializer);
 	return buffer;
 }
 
@@ -698,7 +725,29 @@ bool rgfxTexelsPastAllocation(uint64_t length, uint64_t offset, uint64_t bytesPe
 
 - (uint64_t)gpuAddress
 {
+	RgfxEscapes(self, RGFX_BUFFER_ESCAPED_GPU_ADDRESS);
 	return _gpuAddress;
+}
+
+// The note goes once for the buffer's life: the first act posts it under the buffer's lock, and
+// clears the flag with a release store only once it is posted or held to go before the next
+// command buffer (RgfxSerializer::bufferEscaped), so an act on another thread meanwhile waits on
+// the lock and returns after it. A post the route refuses leaves the note owed, for the next act.
+- (BOOL)rgfxNoteEscape:(uint32_t)kind
+{
+	os_unfair_lock_lock(&_escapeLock);
+	bool gone = __atomic_load_n(&_rgfxEscape, __ATOMIC_RELAXED) == 0;
+	if (!gone && _serializer != nullptr && _serializer->bufferEscaped(_objId, kind)) {
+		__atomic_store_n(&_rgfxEscape, 0, __ATOMIC_RELEASE);
+		gone = true;
+	}
+	os_unfair_lock_unlock(&_escapeLock);
+	if (!gone) {
+		static std::atomic<bool> logged{false};
+		if (!logged.exchange(true))
+			rgfxLogLine(@"RGFX: a no-copy buffer's escape note was refused; it goes at its next act");
+	}
+	return gone ? YES : NO;
 }
 
 // The buffer's options as Metal answers them (measured on the M3 Max under macOS 27): those it was

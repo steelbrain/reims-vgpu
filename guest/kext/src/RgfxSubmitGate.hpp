@@ -59,8 +59,10 @@ inline bool rgfxSubmitRoutesQueueDestroy(uint32_t type)
 // The size of a message of `type` kRgfxAccelMethodSubmitBatch takes, 0 for a type it does not
 // take: an OBJECT_DESTROY; the creates no one waits for that name no block, a BUFFER_AT_OFFSET
 // (the buffer a heap places at an offset), a TEXTURE_CREATE, a TEXTURE_VIEW, a
-// MANAGED_TEXTURE_CREATE and a MANAGED_BUFFER_CREATE; and a BUFFER_DID_MODIFY_RANGE, a write into
-// a Managed buffer the host carries out before any command buffer after it. None is waited for
+// MANAGED_TEXTURE_CREATE and a MANAGED_BUFFER_CREATE; a BUFFER_DID_MODIFY_RANGE, a write into
+// a Managed buffer the host carries out before any command buffer after it; and a
+// BUFFER_ESCAPED, the note that a no-copy buffer's identity left with no message, which the host
+// carries out before any command buffer after it too. None is waited for
 // nor names a block (rgfxRegionSpans), and each is of one size, which its header must name: a
 // MANAGED_BUFFER_CREATE's is the create with its zero bytes (RgfxManagedBufferZero at
 // RGFX_MANAGED_BUFFER_ZERO_OFFSET), as the bundle sends every one. A
@@ -85,6 +87,8 @@ inline uint32_t rgfxSubmitBatchSize(uint32_t type)
 		return RGFX_MANAGED_BUFFER_ZERO_OFFSET + sizeof(RgfxManagedBufferZero);
 	case RGFX_CMD_BUFFER_DID_MODIFY_RANGE:
 		return sizeof(RgfxBufferDidModifyRange);
+	case RGFX_CMD_BUFFER_ESCAPED:
+		return sizeof(RgfxBufferEscaped);
 	default:
 		return 0;
 	}
@@ -103,7 +107,7 @@ inline bool rgfxSubmitIsPipelineCreate(uint32_t type)
 // OBJECT_DESTROY of that id drops. The destroy, the queries (a heap texture's size, an argument
 // layout) and the writes into an object already made (a Managed range or region, a texture's
 // didModifyData, a shared event's value, an indirect command buffer's commands, a visible
-// function table's entries) make none. A
+// function table's entries, a buffer's escape note) make none. A
 // type the wire does not name makes none: the device refuses it.
 inline bool rgfxSubmitMakes(uint32_t type)
 {

@@ -65,6 +65,11 @@ NS_ASSUME_NONNULL_BEGIN
 	// The texture over an IOSurface the object is, or views through any views (a view holds
 	// its texture, so this outlives it); nil for every other.
 	__unsafe_unretained id _Nullable _rgfxSurfaceRoot;
+	// Whether the note that the object's identity left the process with no wire message is yet
+	// to go (RgfxEscapes): set as it is made for a no-copy buffer the note covers (RgfxBuffer.mm)
+	// and for a texture or view over one whose note is yet to go, cleared once the buffer's note
+	// is posted, and never set again. Read and written by atomic builtins.
+	uint8_t _rgfxEscape;
 	// The command buffers in flight that name the object's memory: submitted and not yet
 	// complete (RgfxInFlightBegin, RgfxInFlightEnd), counted where `_rgfxInFlightAt` points: at
 	// `_rgfxInFlight`, or at the count of the object whose memory it lies over (a view's texture,
@@ -144,6 +149,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// The resource SPI's content protection (RgfxMetalPrivate.h): none.
 - (uint64_t)protectionOptions;
 
+/// The slow path of RgfxEscapes: posts the note that the identity of the buffer the object is,
+/// or lies over, left the process by an act of `kind` (an RGFX_BUFFER_ESCAPED_* value), where it
+/// is yet to go, and answers whether it has gone, by this call or an earlier one. YES for an
+/// object that owes none.
+- (BOOL)rgfxNoteEscape:(uint32_t)kind;
+
 /// What the resource SPI members a buffer and a texture share answer (RGFX_RESOURCE_SPI):
 /// the id of the allocation the resource lies in, its heap's, else one of its own;
 @property(nonatomic, readonly) uint64_t rgfxAllocationId;
@@ -190,6 +201,21 @@ inline uint64_t RgfxResourceId(__unsafe_unretained id _Nullable obj)
 		return 0;
 	__unsafe_unretained RgfxResource *r = (RgfxResource *)obj;
 	return r->_objId;
+}
+
+/// An act of `kind` (an RGFX_BUFFER_ESCAPED_* value) that hands the app, or writes where its GPU
+/// reads, an identity of `r` with no wire message: a covered no-copy buffer's GPU address, or a
+/// texture's resource id over one, read by the app or written by an argument encoder, or the
+/// object joining a residency set. The first such act of the buffer's life posts its note
+/// (RGFX_CMD_BUFFER_ESCAPED), before the act returns, and every later act of it or of a texture
+/// over it is one relaxed load. The note goes ahead of every command buffer committed after a
+/// load that finds it gone: the post comes before the release store that clears the flag, and a
+/// commit takes an acquire fence before it posts what the serialiser holds (RgfxCommandBuffer's
+/// commit).
+inline void RgfxEscapes(__unsafe_unretained RgfxResource *_Nonnull r, uint32_t kind)
+{
+	if (__atomic_load_n(&r->_rgfxEscape, __ATOMIC_RELAXED) != 0)
+		[r rgfxNoteEscape:kind];
 }
 
 /// Whether `a`'s memory meets `b`'s: both lie in one heap over byte ranges that meet.

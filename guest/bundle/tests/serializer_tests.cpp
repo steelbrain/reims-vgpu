@@ -2929,8 +2929,9 @@ void test_held_buffers()
 	CHECK(pser.postHeldCreates());
 }
 
-// The other creates no one waits for that name no block, and a Managed buffer's modified range,
-// held as a heap-placed buffer is (RgfxSerializer::postUnwaited): each answered as made and held,
+// The other creates no one waits for that name no block, a Managed buffer's modified range, and
+// a no-copy buffer's escape note (posted only where the device takes it), held as a heap-placed
+// buffer is (RgfxSerializer::postUnwaited): each answered as made and held,
 // in their order with the destroys, before anything posted after them; a commit's
 // postHeldCreates() answers false while any of them stays held, each on its own; a texture over
 // an IOSurface, which a present waits for, goes at once, behind the held; a writer that does not
@@ -2997,6 +2998,15 @@ void test_held_creates()
 		CHECK(ser.bufferDidModifyRange(0x7a, 16, 32));
 		return RgfxObjId{0x7a};
 	});
+	log.calls.clear();
+	CHECK(!ser.carriesBufferEscaped() &&
+	      !ser.bufferEscaped(0x7c, RGFX_BUFFER_ESCAPED_GPU_ADDRESS));
+	CHECK(log.calls.empty() && ser.postHeldCreates() && log.calls.empty());
+	ser.setCarriesBufferEscaped(true);
+	heldAlone("escape note", RGFX_CMD_BUFFER_ESCAPED, [&] {
+		CHECK(ser.bufferEscaped(0x7c, RGFX_BUFFER_ESCAPED_RESIDENCY_SET));
+		return RgfxObjId{0x7c};
+	});
 
 	// Together with destroys and heap-placed buffers, in the order made, in one call.
 	log.calls.clear();
@@ -3006,18 +3016,20 @@ void test_held_creates()
 	RgfxCreated v = ser.createTextureView(view);
 	CHECK(ser.bufferDidModifyRange(0x7a, 0, 16));
 	RgfxCreated m = ser.createManagedBuffer(a.obj_id, 256, 0x10, 0);
+	CHECK(ser.bufferEscaped(0x7d, RGFX_BUFFER_ESCAPED_ARGUMENT_ENCODER));
 	CHECK(t.posted && t.gpu_address == 0 && a.posted && v.posted && m.posted);
 	CHECK(log.calls.empty());
 	CHECK(ser.postHeldCreates());
 	CHECK(log.calls.size() == 1 && log.calls[0].batch);
 	CHECK(log.calls[0].objs ==
-	      std::vector<RgfxObjId>({0x101, t.obj_id, a.obj_id, v.obj_id, 0x7a, m.obj_id}));
+	      std::vector<RgfxObjId>({0x101, t.obj_id, a.obj_id, v.obj_id, 0x7a, m.obj_id, 0x7d}));
 	CHECK(log.calls[0].types == std::vector<uint32_t>({RGFX_CMD_OBJECT_DESTROY,
 	                                                   RGFX_CMD_TEXTURE_CREATE,
 	                                                   RGFX_CMD_BUFFER_AT_OFFSET,
 	                                                   RGFX_CMD_TEXTURE_VIEW,
 	                                                   RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
-	                                                   RGFX_CMD_MANAGED_BUFFER_CREATE}));
+	                                                   RGFX_CMD_MANAGED_BUFFER_CREATE,
+	                                                   RGFX_CMD_BUFFER_ESCAPED}));
 
 	// A texture over an IOSurface goes at once, behind what is held.
 	log.calls.clear();
@@ -3037,8 +3049,11 @@ void test_held_creates()
 	RgfxCreated pv = pser.createTextureView(view);
 	CHECK(pt.posted && pt.seqno != 0 && pv.posted && pv.seqno != 0);
 	CHECK(pser.bufferDidModifyRange(0x7a, 0, 16));
-	CHECK(plain.calls.size() == 3 && !plain.calls[0].batch && !plain.calls[1].batch &&
-	      !plain.calls[2].batch);
+	pser.setCarriesBufferEscaped(true);
+	CHECK(pser.bufferEscaped(0x7c, RGFX_BUFFER_ESCAPED_GPU_ADDRESS));
+	CHECK(plain.calls.size() == 4 && !plain.calls[0].batch && !plain.calls[1].batch &&
+	      !plain.calls[2].batch && !plain.calls[3].batch);
+	CHECK(plain.calls[3].types == std::vector<uint32_t>({RGFX_CMD_BUFFER_ESCAPED}));
 	CHECK(pser.postHeldCreates());
 }
 

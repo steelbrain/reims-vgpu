@@ -352,6 +352,11 @@ public:
 	/// RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA. Set once, before the first texture; off by default.
 	void setCarriesTextureDidModifyData(bool carries) { m_textureDidModifyData = carries; }
 	bool carriesTextureDidModifyData() const { return m_textureDidModifyData; }
+	/// Whether the host hears of a no-copy buffer's identity leaving with no message
+	/// (bufferEscaped): the host took RGFX_FEATURE_BUFFER_ESCAPED. Set once, before the first
+	/// buffer; off by default, and then no buffer notes its escape (RgfxBuffer.h, RgfxNoteEscape).
+	void setCarriesBufferEscaped(bool carries) { m_bufferEscaped = carries; }
+	bool carriesBufferEscaped() const { return m_bufferEscaped; }
 	/// Whether the host makes rasterization rate maps (createRateMap, resetRateMap and
 	/// queryRateMap): it took RGFX_FEATURE_RATE_MAPS. Set once, before the first map; off by
 	/// default.
@@ -493,6 +498,14 @@ public:
 	/// committed after it. False where the message was not posted, and where the host does not
 	/// carry it (carriesTextureDidModifyData), which posts nothing.
 	bool textureDidModifyData(RgfxObjId texture);
+
+	/// The identity of buffer `buffer`, a no-copy buffer the host reads in place, leaves the
+	/// process's Metal with no message, by the act `kind` (RGFX_BUFFER_ESCAPED_*): a message no one
+	/// waits for (postUnwaited), held or posted before anything posted after it and before any
+	/// command buffer committed after it, so the host has it before any command buffer that could
+	/// use the identity. False where it was neither held nor posted, and where the host does not
+	/// carry it (carriesBufferEscaped), which posts nothing.
+	bool bufferEscaped(RgfxObjId buffer, uint32_t kind);
 
 	// --- textures -------------------------------------------------------------
 
@@ -806,6 +819,7 @@ private:
 	EventTakeFn m_eventTake = nullptr;
 	bool m_privateRenderState = false;
 	bool m_textureDidModifyData = false;
+	bool m_bufferEscaped = false;
 	bool m_rateMaps = false;
 	bool m_functionPointers = false;
 	bool m_dynamicLibraries = false;

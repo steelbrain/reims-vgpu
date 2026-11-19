@@ -1578,6 +1578,16 @@
 // its cursor shown as its pixels are.
 #define RGFX_FEATURE_CURSOR_COLOR 36028797018963968
 
+// `FEATURES_HI` bit 24, feature bit 56, `BUFFER_ESCAPED`: ring 0 carries
+// [`RGFX_CMD_BUFFER_ESCAPED`], the guest's note that a no-copy buffer the host reads in place
+// handed its identity out with no message of the device's naming it: its `gpuAddress` read, an
+// argument encoder's write of it, the `gpuResourceID` of a texture over it read, or the buffer,
+// or such a texture, added to a residency set (docs/graphics-kext/design.md, "A buffer's escaped
+// identity"). The guest posts it once for each such buffer, before the identity leaves it, and
+// waits for no answer. Every host offers it; the x86-64 and arm64e kexts take it, and the bundle
+// posts it only where they did.
+#define RGFX_FEATURE_BUFFER_ESCAPED 72057594037927936
+
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 #define RGFX_REG_STATUS 16
@@ -2232,6 +2242,18 @@
 // answered.
 #define RGFX_CMD_ICB_SLOTS_IN_PAGES 570
 
+// Command `BUFFER_ESCAPED` ([`RgfxBufferEscaped`]), where the guest took
+// [`RGFX_FEATURE_BUFFER_ESCAPED`]: the identity of buffer `obj_id`, a no-copy buffer the host
+// reads in place (one `BUFFER_OVER_PAGES` or `BUFFER_OVER_HOST_MEMORY` made, not `Managed`), left
+// the guest's Metal with no message naming the buffer, by the act `kind` names
+// (`RGFX_BUFFER_ESCAPED_*`): from now on the GPU may reach the buffer through memory alone. Sent
+// once in the buffer's life, before the identity leaves, so ring 0 carries it out before any
+// command buffer of the process that could use the identity. Not answered, and it changes nothing
+// the guest observes: the host marks the buffer and counts it. A note for an object that is no
+// such buffer is refused as a bad reference. A host without the feature refuses the message as one
+// it does not know.
+#define RGFX_CMD_BUFFER_ESCAPED 571
+
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
 // and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
@@ -2801,6 +2823,23 @@
 
 // [`RgfxIcbSlotRun`] `kind`: compute slots ([`crate::icb::RgfxIcbComputeSlot`]).
 #define RGFX_ICB_SLOTS_COMPUTE 2
+
+// [`RgfxBufferEscaped::kind`]: the app read the buffer's `gpuAddress`, or that of a texture over
+// it (SPI), which answers the buffer's address.
+#define RGFX_BUFFER_ESCAPED_GPU_ADDRESS 0
+
+// [`RgfxBufferEscaped::kind`]: an argument encoder wrote the buffer's address
+// (`setBuffer:offset:atIndex:`, `setBuffers:offsets:withRange:`), or the `gpuResourceID` of a
+// texture over it (`setTexture:atIndex:`, `setTextures:withRange:`), into an argument buffer.
+#define RGFX_BUFFER_ESCAPED_ARGUMENT_ENCODER 1
+
+// [`RgfxBufferEscaped::kind`]: the app read the `gpuResourceID` of a texture, or texture view,
+// that lies over the buffer.
+#define RGFX_BUFFER_ESCAPED_RESOURCE_ID 2
+
+// [`RgfxBufferEscaped::kind`]: the buffer, or a texture over it, joined a residency set
+// (`addAllocation:`, `addAllocations:count:`).
+#define RGFX_BUFFER_ESCAPED_RESIDENCY_SET 3
 
 // [`RgfxRateMapCreate::flags`]: the descriptor's `mutability` (SPI) was set, and
 // [`RgfxRateMapCreate::mutability`] holds it; without the flag the map is of Metal's default
@@ -3818,6 +3857,18 @@ typedef struct {
   // How many.
   uint64_t length;
 } RgfxBufferDidModifyRange;
+
+// `BUFFER_ESCAPED`: buffer `obj_id`'s identity left the guest's Metal by the act `kind`.
+typedef struct {
+  // [`RGFX_CMD_BUFFER_ESCAPED`].
+  RgfxMsgHeader header;
+  // The buffer.
+  uint64_t obj_id;
+  // The act that handed its identity out: `RGFX_BUFFER_ESCAPED_*`.
+  uint32_t kind;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_1c;
+} RgfxBufferEscaped;
 
 // `BUFFER_MANAGED_AT_OFFSET`: a `Managed` buffer of `length` bytes at the guest-picked
 // `gpu_address`, its CPU copy the `length` bytes at `offset` in the heap `heap_obj_id`, a heap

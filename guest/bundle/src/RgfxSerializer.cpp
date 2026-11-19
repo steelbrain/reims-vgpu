@@ -531,6 +531,17 @@ bool RgfxSerializer::textureDidModifyData(RgfxObjId texture)
 	return m_control.tryPost(RGFX_CMD_TEXTURE_DID_MODIFY_DATA, &msg, sizeof(msg), &seqno);
 }
 
+bool RgfxSerializer::bufferEscaped(RgfxObjId buffer, uint32_t kind)
+{
+	if (!m_bufferEscaped)
+		return false;
+	RgfxBufferEscaped msg = {};
+	msg.obj_id = buffer;
+	msg.kind = kind;
+	uint64_t seqno = 0;
+	return postUnwaited(RGFX_CMD_BUFFER_ESCAPED, &msg, sizeof(msg), &seqno);
+}
+
 RgfxCreated RgfxSerializer::createManagedTexture(const RgfxTextureDescriptor &desc,
                                                  RgfxObjId cpu_buffer, uint32_t bytes_per_block,
                                                  uint32_t block_width, uint32_t block_height,

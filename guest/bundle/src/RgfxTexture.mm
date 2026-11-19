@@ -1389,9 +1389,14 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	if (t != nil) {
 		t->_buffer = buffer;
 		// Its texels are the buffer's bytes: the buffers in flight that name either count for
-		// both (RGFX_RESOURCE_SPI's isComplete and waitUntilComplete).
-		if (RgfxIsResource(buffer))
-			t->_rgfxInFlightAt = ((RgfxResource *)buffer)->_rgfxInFlightAt;
+		// both (RGFX_RESOURCE_SPI's isComplete and waitUntilComplete). Its resource id leaves
+		// with the buffer's identity: it owes the buffer's escape note while the buffer does
+		// (RgfxEscapes).
+		if (RgfxIsResource(buffer)) {
+			RgfxResource *under = (RgfxResource *)buffer;
+			t->_rgfxInFlightAt = under->_rgfxInFlightAt;
+			t->_rgfxEscape = __atomic_load_n(&under->_rgfxEscape, __ATOMIC_RELAXED);
+		}
 		t->_bufferOffset = offset;
 		t->_bufferBytesPerRow = bytesPerRow;
 		[t rgfxTakeDescriptor:descriptor];
@@ -1583,9 +1588,24 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 
 - (MTLResourceID)gpuResourceID
 {
+	RgfxEscapes(self, RGFX_BUFFER_ESCAPED_RESOURCE_ID);
 	MTLResourceID rid;
 	rid._impl = _resourceId;
 	return rid;
+}
+
+// A texture or view over a no-copy buffer the note covers: the buffer's note, which its own
+// texture's (a view's) or its buffer's lock serialises; the texture's flag clears, by a release
+// store, only once the buffer's note has gone.
+- (BOOL)rgfxNoteEscape:(uint32_t)kind
+{
+	RgfxResource *under = _parent;
+	if (under == nil && RgfxIsResource(_buffer))
+		under = (RgfxResource *)_buffer;
+	if (under != nil && ![under rgfxNoteEscape:kind])
+		return NO;
+	__atomic_store_n(&_rgfxEscape, 0, __ATOMIC_RELEASE);
+	return YES;
 }
 
 // --- MTLResource (decoded from the descriptor's resource options) -------------
@@ -1770,6 +1790,8 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 		// Its texels are its texture's: the buffers in flight that name either count for both
 		// (RGFX_RESOURCE_SPI's isComplete and waitUntilComplete).
 		view->_rgfxInFlightAt = _rgfxInFlightAt;
+		// A view of a texture over a buffer owes the buffer's escape note while it does.
+		view->_rgfxEscape = __atomic_load_n(&_rgfxEscape, __ATOMIC_RELAXED);
 		// A view of a texture over an IOSurface writes and reads the surface's texels.
 		view->_rgfxSurfaceRoot = _rgfxSurfaceRoot;
 		view->_parentLevel = static_cast<NSUInteger>(base);

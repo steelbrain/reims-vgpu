@@ -2703,9 +2703,12 @@ pub fn out_of_host_memory_count() -> u64 {
 /// `reims-vgpu`'s, as its reims-graphics device tells it of its completion rings
 /// (`control-ring-full`, `control-ring-post-waited`, `vblank-dropped`, `queue-ring-full`,
 /// `queue-ring-post-waited`), as its decoder keeps a buffer dealt to two threads whole
-/// (`two-ranges-kept-whole`), and as it makes a no-copy buffer over pages their process maps
-/// read-only (`read-only-pages-buffers`, and their bytes' KiB, `read-only-pages-kib`); and this
-/// platform's command predication's, a command buffer a loop ran past its copies in
+/// (`two-ranges-kept-whole`), as it makes a no-copy buffer over pages their process maps
+/// read-only (`read-only-pages-buffers`, and their bytes' KiB, `read-only-pages-kib`), and as it
+/// makes a no-copy buffer (`no-copy-buffers`) and the guest notes that one's identity escaped, by
+/// the act that noted it (`buffer-escaped-gpu-address`, `-argument-encoder`, `-resource-id`,
+/// `-residency-set`), one over a copy of its pages counted too (`buffer-escaped-read-only-pages`);
+/// and this platform's command predication's, a command buffer a loop ran past its copies in
 /// (`predication-loop-overrun`, [`crate::gpu::predication::OVERRUN_CODE`]).
 static COUNTED: crate::core::sync::Mutex<Vec<(&'static str, u64)>> =
     crate::core::sync::Mutex::new(Vec::new());
@@ -2728,6 +2731,12 @@ pub fn count_kind_by(code: &'static str, n: u64) {
         Some((_, k)) => *k = k.saturating_add(n),
         None => counted.push((code, n)),
     }
+}
+
+/// The kinds counted by code ([`count_kind`], [`count_kind_by`]), each with how many times, in
+/// the order each was first counted: the recorder's stats file writes them.
+pub fn counted_kinds() -> Vec<(&'static str, u64)> {
+    COUNTED.lock().clone()
 }
 
 /// Each kind of [`Inexact`] this process relayed, with how many times.
@@ -2989,6 +2998,16 @@ mod tests {
         count_kind(code);
         count_kind(code);
         assert_eq!(counted(), Some((code.to_owned(), 2)));
+    }
+
+    /// A kind counted by code is among the kinds counted ([`counted_kinds`]) with how many times
+    /// it was counted, as in the degradation counts
+    #[test]
+    fn a_kind_counted_by_code_is_among_the_counted_kinds() {
+        let code = "test-counted-kinds";
+        count_kind_by(code, 4);
+        count_kind(code);
+        assert!(counted_kinds().contains(&(code, 5)));
     }
 
     /// A kind counted by an amount ([`count_kind_by`]) is in the degradation counts with the sum

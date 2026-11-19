@@ -85,7 +85,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
-    RGFX_CMD_BUFFER_MANAGED_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
+    RGFX_CMD_BUFFER_ESCAPED, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
     RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_COMMAND_BUFFER,
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
     RGFX_CMD_FENCE_CREATE, RGFX_CMD_FUNCTION_TABLE_SET, RGFX_CMD_HEAP_CREATE,
@@ -180,6 +180,7 @@ mod dispatch_cost;
 #[cfg(test)]
 pub(super) mod draw_cost;
 mod dynamic_library;
+mod escape;
 mod function_table;
 #[cfg(test)]
 mod fuzz;
@@ -3625,9 +3626,11 @@ impl<P: Platform> GraphicsDecoder<P> {
                     at: m.region_offset,
                     length: m.length,
                 };
+                // A no-copy buffer, whose identity the guest notes as it escapes.
                 let entry = Entry::of(ObjHandle::Buffer(buffer))
                     .over(Some((m.region_offset, m.length)))
-                    .with_bytes(Some(bytes));
+                    .with_bytes(Some(bytes))
+                    .escapes(escape::Escape::made(escape::NoCopy::HostMemory));
                 self.store(m.obj_id, entry);
                 Ok(Ok(()))
             }
@@ -3650,6 +3653,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let drain = self.command_buffer_drain();
                 self.texture_did_modify_data(message, drain)
             }
+            RGFX_CMD_BUFFER_ESCAPED => Ok(self.buffer_escaped(message)),
             RGFX_CMD_HEAP_CREATE => {
                 let Some(m) = read::<RgfxHeapCreate>(message) else {
                     return Ok(Err(DecodeError::Malformed));

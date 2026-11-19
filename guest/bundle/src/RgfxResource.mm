@@ -335,6 +335,13 @@ bool RgfxIsResourceClassSlow(__unsafe_unretained id obj, uintptr_t cls)
 	return 0;
 }
 
+// An object no note covers owes none (RgfxBuffer and RgfxTexture answer for those that do).
+- (BOOL)rgfxNoteEscape:(uint32_t)kind
+{
+	(void)kind;
+	return YES;
+}
+
 - (void)rgfxSetHeapOffset:(NSUInteger)offset
 {
 	_heapOffset = offset;

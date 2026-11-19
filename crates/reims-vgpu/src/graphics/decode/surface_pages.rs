@@ -2631,15 +2631,20 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             at: m.offset,
             length: m.length,
         };
+        // A no-copy buffer, whose identity the guest notes as it escapes: over a copy of the
+        // block's pages where its process maps them read-only.
+        let read_only = (self.shared.surface_views.lock()).private_read_only(m.block_offset);
+        let over = if read_only {
+            super::escape::NoCopy::ReadOnlyPages
+        } else {
+            super::escape::NoCopy::Pages
+        };
         let entry = super::tables::Entry::of(super::ObjHandle::Buffer(buffer))
             .over(Some((m.block_offset, m.block_size)))
-            .with_bytes(Some(bytes));
+            .with_bytes(Some(bytes))
+            .escapes(super::escape::Escape::made(over));
         self.store(m.obj_id, entry);
-        let read_only = {
-            let mut views = self.shared.surface_views.lock();
-            views.buffer_made(m.block_offset, m.obj_id);
-            views.private_read_only(m.block_offset)
-        };
+        (self.shared.surface_views.lock()).buffer_made(m.block_offset, m.obj_id);
         if read_only {
             count_read_only_pages_buffer(m.length);
         }
@@ -3127,7 +3132,7 @@ pub(super) mod tests {
         }
 
         /// [`Self::pages_buffer`] of `options`.
-        fn pages_buffer_of(
+        pub(crate) fn pages_buffer_of(
             &mut self,
             obj_id: u64,
             gpu_address: u64,

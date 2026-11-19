@@ -180,7 +180,11 @@
 //  - CURSOR_COLOR (bit 55), the arm64e kext alone: set_block takes the cursor layer's ICC chain
 //    and the display's swaps post it to the host (CURSOR_COLOR, RgfxMobileICC.hpp), which converts
 //    the cursor's image through it, which needs nothing of the bundle; an x86-64 guest gives its
-//    cursor no chain.
+//    cursor no chain;
+//  - BUFFER_ESCAPED (bit 56), both kexts: the bundle tells the host, once, that a no-copy buffer
+//    the host reads in place handed its identity out with no message naming it
+//    (RGFX_CMD_BUFFER_ESCAPED), whose message the kext admits, and takes in a batch, as it does a
+//    Managed range's (RgfxSubmitGate.hpp).
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -223,6 +227,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_READ_ONLY_PAGES | RGFX_FEATURE_DOORBELL_PAGES | RGFX_FEATURE_PIPELINE_ANSWERS |
     RGFX_FEATURE_POINTER_MOTION | RGFX_FEATURE_MULTI_DISPLAY |
     RGFX_FEATURE_POINTER_OVER | RGFX_FEATURE_DISPLAY_BOUNDS | RGFX_FEATURE_UPLOADS_WRITTEN |
+    RGFX_FEATURE_BUFFER_ESCAPED |
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K | RGFX_FEATURE_VT_MESSAGES | RGFX_FEATURE_VT_RING |
                             RGFX_FEATURE_CURSOR_COLOR
                       : RGFX_FEATURE_DISPLAY_POWER);

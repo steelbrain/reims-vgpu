@@ -136,10 +136,14 @@ id memoryOf(id allocation)
 		[_removed addObject:allocation];
 }
 
+// An allocation's identity leaves through the set, so a no-copy buffer, or a texture over one,
+// posts its escape note as it joins (RgfxEscapes), before the set's lock.
 - (void)addAllocation:(id<MTLAllocation>)allocation
 {
 	if (allocation == nil)
 		endsTheProcess("addAllocation:");
+	if (RgfxIsResource(allocation))
+		RgfxEscapes((RgfxResource *)allocation, RGFX_BUFFER_ESCAPED_RESIDENCY_SET);
 	os_unfair_lock_lock(&_lock);
 	[self rgfxAdd:allocation];
 	os_unfair_lock_unlock(&_lock);
@@ -150,6 +154,10 @@ id memoryOf(id allocation)
 	for (NSUInteger i = 0; i < count; i++) {
 		if (allocations[i] == nil)
 			endsTheProcess("addAllocations:count:");
+	}
+	for (NSUInteger i = 0; i < count; i++) {
+		if (RgfxIsResource(allocations[i]))
+			RgfxEscapes((RgfxResource *)allocations[i], RGFX_BUFFER_ESCAPED_RESIDENCY_SET);
 	}
 	os_unfair_lock_lock(&_lock);
 	for (NSUInteger i = 0; i < count; i++)

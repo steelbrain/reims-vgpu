@@ -4786,6 +4786,51 @@ its command buffer's completion, not as it runs, and memory mapped read-only is
 never written back, though the GPU's writes stay in the range for later command
 buffers to read, where Metal's are dropped.
 
+**A buffer's escaped identity.** The host reads a no-copy buffer's bytes in
+place: one over bytes in a block of the process's (`BUFFER_OVER_HOST_MEMORY`),
+or over pages the process maps, writable or read-only (`BUFFER_OVER_PAGES`),
+Managed neither. A slab's buffer made by the same messages with an address of
+its own (a Shared buffer past 2 MiB over a slab of the process's own pages, a
+device buffer or a no-copy buffer's shadow) is one too, since the host cannot
+tell it apart; one placed in a slab's heap (`BUFFER_AT_OFFSET`) is not. Where
+the device took `BUFFER_ESCAPED`, the bundle posts `RGFX_CMD_BUFFER_ESCAPED`
+(the buffer's id and the act) the first time in the buffer's life that its
+identity leaves the guest's Metal with no message naming the buffer:
+- the app reads its `gpuAddress`;
+- an argument encoder's `setBuffer:` or `setBuffers:` writes it, or
+  `setTexture:` or `setTextures:` writes a texture over it;
+- the app reads the `gpuResourceID` of a texture or view over it (`gpuHandle`
+  and `resourceIndex` answer through it);
+- the buffer, or such a texture, joins a residency set.
+
+A texture's or view's act names the buffer. From then on the GPU may reach the
+buffer through memory alone, and the host takes it as named for its life
+(`decode::escape`). The note is unwaited and changes nothing the guest
+observes: the host marks the buffer and counts the escape by its act in the
+degradation counts (`buffer-escaped-*`, beside `no-copy-buffers`, the no-copy
+buffers made).
+
+The note goes ahead of any command buffer that could use the identity:
+- the bundle marks the buffer as it makes it, and each act reads the mark with
+  one relaxed load, all an act costs after the first;
+- the first act takes the buffer's lock, which no post path takes, posts the
+  note on ring 0 (or holds it to go before the next commit's messages, where
+  the bundle batches them), and clears the mark with a release store. A
+  concurrent act waits on the lock, and a texture's mark clears only after its
+  buffer's note has gone;
+- a command buffer's `commit` begins with an acquire fence, which pairs with
+  that release store where the committing thread's act found the mark clear,
+  so the note is on ring 0, or held, before the command buffer is published;
+  the post of a command buffer sends the held messages first;
+- the host carries out a command buffer only after every ring-0 message its
+  process published before its queue's thread took it.
+
+A note the ring refuses leaves the mark set, so the buffer's next act posts it,
+and is logged once. What the order cannot cover is a command buffer committed
+before the act that reads memory the act writes: the app racing its own GPU
+work. An identity handed between the app's threads through the app's own
+synchronisation keeps the order through it.
+
 **Group dma-bufs of the pages blocks' views.** The host imports each pages
 block's view once, as a buffer over the whole view that the block's
 `BUFFER_OVER_PAGES` buffers lie in. Where the Vulkan platform imports a view as

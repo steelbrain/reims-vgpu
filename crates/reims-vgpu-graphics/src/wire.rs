@@ -511,6 +511,15 @@ pub const RGFX_FEATURE_VT_RING: u64 = 0x40_0000_0000_0000;
 /// took it. A guest that did not take it (the x86-64 kext, the option ROM, Ambrosia's module) has
 /// its cursor shown as its pixels are.
 pub const RGFX_FEATURE_CURSOR_COLOR: u64 = 0x80_0000_0000_0000;
+/// `FEATURES_HI` bit 24, feature bit 56, `BUFFER_ESCAPED`: ring 0 carries
+/// [`RGFX_CMD_BUFFER_ESCAPED`], the guest's note that a no-copy buffer the host reads in place
+/// handed its identity out with no message of the device's naming it: its `gpuAddress` read, an
+/// argument encoder's write of it, the `gpuResourceID` of a texture over it read, or the buffer,
+/// or such a texture, added to a residency set (docs/graphics-kext/design.md, "A buffer's escaped
+/// identity"). The guest posts it once for each such buffer, before the identity leaves it, and
+/// waits for no answer. Every host offers it; the x86-64 and arm64e kexts take it, and the bundle
+/// posts it only where they did.
+pub const RGFX_FEATURE_BUFFER_ESCAPED: u64 = 0x100_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -1118,6 +1127,17 @@ pub const RGFX_CMD_DYNAMIC_LIBRARY_CREATE: u32 = 0x239;
 /// is carried out before any command buffer the process posts after it, as `ICB_WRITE` is. Not
 /// answered.
 pub const RGFX_CMD_ICB_SLOTS_IN_PAGES: u32 = 0x23a;
+/// Command `BUFFER_ESCAPED` ([`RgfxBufferEscaped`]), where the guest took
+/// [`RGFX_FEATURE_BUFFER_ESCAPED`]: the identity of buffer `obj_id`, a no-copy buffer the host
+/// reads in place (one `BUFFER_OVER_PAGES` or `BUFFER_OVER_HOST_MEMORY` made, not `Managed`), left
+/// the guest's Metal with no message naming the buffer, by the act `kind` names
+/// (`RGFX_BUFFER_ESCAPED_*`): from now on the GPU may reach the buffer through memory alone. Sent
+/// once in the buffer's life, before the identity leaves, so ring 0 carries it out before any
+/// command buffer of the process that could use the identity. Not answered, and it changes nothing
+/// the guest observes: the host marks the buffer and counts it. A note for an object that is no
+/// such buffer is refused as a bad reference. A host without the feature refuses the message as one
+/// it does not know.
+pub const RGFX_CMD_BUFFER_ESCAPED: u32 = 0x23b;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -3318,6 +3338,36 @@ pub struct RgfxTextureDidModifyData {
     pub obj_id: u64,
 }
 
+/// `BUFFER_ESCAPED`: buffer `obj_id`'s identity left the guest's Metal by the act `kind`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxBufferEscaped {
+    /// [`RGFX_CMD_BUFFER_ESCAPED`].
+    pub header: RgfxMsgHeader,
+    /// The buffer.
+    pub obj_id: u64,
+    /// The act that handed its identity out: `RGFX_BUFFER_ESCAPED_*`.
+    pub kind: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_1c: u32,
+}
+
+/// [`RgfxBufferEscaped::kind`]: the app read the buffer's `gpuAddress`, or that of a texture over
+/// it (SPI), which answers the buffer's address.
+pub const RGFX_BUFFER_ESCAPED_GPU_ADDRESS: u32 = 0;
+/// [`RgfxBufferEscaped::kind`]: an argument encoder wrote the buffer's address
+/// (`setBuffer:offset:atIndex:`, `setBuffers:offsets:withRange:`), or the `gpuResourceID` of a
+/// texture over it (`setTexture:atIndex:`, `setTextures:withRange:`), into an argument buffer.
+pub const RGFX_BUFFER_ESCAPED_ARGUMENT_ENCODER: u32 = 1;
+/// [`RgfxBufferEscaped::kind`]: the app read the `gpuResourceID` of a texture, or texture view,
+/// that lies over the buffer.
+pub const RGFX_BUFFER_ESCAPED_RESOURCE_ID: u32 = 2;
+/// [`RgfxBufferEscaped::kind`]: the buffer, or a texture over it, joined a residency set
+/// (`addAllocation:`, `addAllocations:count:`).
+pub const RGFX_BUFFER_ESCAPED_RESIDENCY_SET: u32 = 3;
+
 /// [`RgfxRateMapCreate::flags`]: the descriptor's `mutability` (SPI) was set, and
 /// [`RgfxRateMapCreate::mutability`] holds it; without the flag the map is of Metal's default
 /// mutability, immutable.
@@ -5288,6 +5338,7 @@ const _: () = {
     assert!(size_of::<RgfxLibraryLookup>() == 64);
     assert!(size_of::<RgfxBufferDidModifyRange>() == 40);
     assert!(size_of::<RgfxTextureDidModifyData>() == 24);
+    assert!(size_of::<RgfxBufferEscaped>() == 32);
     assert!(size_of::<RgfxRateMapCreate>() == 64);
     assert!(size_of::<RgfxRateMapLayer>() == 16);
     assert!(size_of::<RgfxRateMapState>() == 104);

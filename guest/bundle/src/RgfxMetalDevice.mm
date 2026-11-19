@@ -1077,6 +1077,7 @@ RGFX_LOG_UNRECOGNIZED
 	                                          0);
 	_serializer->setCarriesTextureDidModifyData(
 	    (_caps.features() & RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA) != 0);
+	_serializer->setCarriesBufferEscaped((_caps.features() & RGFX_FEATURE_BUFFER_ESCAPED) != 0);
 	_serializer->setCarriesRateMaps((_caps.features() & RGFX_FEATURE_RATE_MAPS) != 0);
 	_serializer->setSharesPipelines(_controlRing->shares());
 	_serializer->setCarriesFunctionPointers((_caps.features() & RGFX_FEATURE_FUNCTION_POINTERS) !=

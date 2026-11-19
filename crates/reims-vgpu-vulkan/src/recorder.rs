@@ -119,7 +119,8 @@
 //!   with the devices' identities after it ([`State::write_out`]). Libraries go
 //!   once each into the `blobs` directory beside the stream's, by the hex of their SHA-256, and
 //!   so do the bytes of `m2v.privateBytes`.
-//!   `<pid>.stats.txt` says what was written, every few seconds.
+//!   `<pid>.stats.txt` says what was written, every few seconds, and what the process counted by
+//!   code (a `counted <code> <n>` line for each kind, [`crate::answer::counted_kinds`]).
 //! - **Its build.** `<pid>.stats.txt` names the commit the library was built from
 //!   (`recorder_commit`, [`COMMIT`]), the device's own display library by the hex of its SHA-256
 //!   and its length (`display_library`, [`METALLIB`]), and each change to what a stream holds
@@ -238,6 +239,16 @@ fn write_build(out: &mut String) {
     );
     for fix in FIXES {
         let _ = writeln!(out, "recorder_fix {fix}");
+    }
+}
+
+/// The stats file's lines of the kinds counted by code
+/// ([`crate::answer::counted_kinds`]): `counted <code> <n>` for each, as the degradation counts'
+/// line counts it since the process began, the reims-graphics device's escapes of no-copy buffers
+/// among them.
+fn write_counted(out: &mut String) {
+    for (code, n) in crate::answer::counted_kinds() {
+        let _ = writeln!(out, "counted {code} {n}");
     }
 }
 
@@ -2304,6 +2315,7 @@ impl State {
         line(&mut out, "private_bytes", &s.private_bytes);
         line(&mut out, "private_skipped", &s.private_skipped);
         let _ = writeln!(out, "live_objects {}", self.objects.lock().info.len());
+        write_counted(&mut out);
         for (sel, n) in self.selectors.lock().iter() {
             let _ = writeln!(out, "selector {n} {sel}");
         }
@@ -3441,6 +3453,19 @@ fn hash64(data: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stats file writes a `counted <code> <n>` line for each kind counted by code, with how
+    /// many times it was counted.
+    #[test]
+    fn the_stats_write_the_kinds_counted_by_code() {
+        crate::answer::count_kind_by("test-recorder-counted", 3);
+        let mut out = String::new();
+        write_counted(&mut out);
+        assert!(
+            out.lines().any(|l| l == "counted test-recorder-counted 3"),
+            "{out}"
+        );
+    }
 
     /// The stats file names the recorder's build first: one `recorder_commit` line, the
     /// display library's `display_library` line (the SHA-256 of the bytes the device makes its

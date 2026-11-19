@@ -9774,6 +9774,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_GUEST_TIMES
             | RGFX_FEATURE_UPLOADS_WRITTEN
             | RGFX_FEATURE_CURSOR_COLOR
+            | RGFX_FEATURE_BUFFER_ESCAPED
             | slots_in_pages
             | sixteen_bit
             | if carries {
@@ -9832,6 +9833,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
                 | RGFX_FEATURE_GUEST_TIMES
                 | RGFX_FEATURE_UPLOADS_WRITTEN
                 | RGFX_FEATURE_CURSOR_COLOR
+                | RGFX_FEATURE_BUFFER_ESCAPED
                 | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
                 | RGFX_FEATURE_READ_ONLY_PAGES
                 | RGFX_FEATURE_PAGES_16K
@@ -9878,6 +9880,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_GUEST_TIMES
             | RGFX_FEATURE_UPLOADS_WRITTEN
             | RGFX_FEATURE_CURSOR_COLOR
+            | RGFX_FEATURE_BUFFER_ESCAPED
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);

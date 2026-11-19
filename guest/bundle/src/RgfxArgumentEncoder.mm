@@ -364,8 +364,12 @@ NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type
 
 // --- the arguments -------------------------------------------------------------------
 
+// The words a buffer and a texture leave are their identities, which a no-copy buffer's escape
+// note covers (RgfxEscapes): the note goes, by this act, before the word is written.
 - (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
+	if (RgfxIsResource(buffer))
+		RgfxEscapes((RgfxResource *)buffer, RGFX_BUFFER_ESCAPED_ARGUMENT_ENCODER);
 	[self rgfxWord:buffer != nil ? buffer.gpuAddress + offset : 0 atIndex:index cmd:_cmd];
 }
 
@@ -379,6 +383,8 @@ NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type
 
 - (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
+	if (RgfxIsResource(texture))
+		RgfxEscapes((RgfxResource *)texture, RGFX_BUFFER_ESCAPED_ARGUMENT_ENCODER);
 	[self rgfxWord:texture != nil ? resourceId(texture.gpuResourceID) : 0 atIndex:index cmd:_cmd];
 }
 

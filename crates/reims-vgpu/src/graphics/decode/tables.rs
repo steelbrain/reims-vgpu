@@ -161,6 +161,9 @@ pub(crate) struct Entry<P: Platform> {
     /// whether it lies in the cache or in the block's wide home ([`LaidUse`]); `None` for any
     /// other object.
     pub(crate) laid_use: Option<LaidUse>,
+    /// A no-copy buffer whose identity the guest may hand on with no message naming it, and
+    /// whether it did ([`super::escape`]); `None` for any other object.
+    pub(crate) escape: Option<super::escape::Escape>,
     /// The table's clock at its make.
     made: u64,
     /// The first clock of a view that names it: its make's, or the making message's view's where
@@ -183,6 +186,7 @@ impl<P: Platform> Entry<P> {
             icb_dropped: None,
             laid_out: None,
             laid_use: None,
+            escape: None,
             made: 0,
             seen: 0,
         }
@@ -210,6 +214,13 @@ impl<P: Platform> Entry<P> {
     /// The entry, a buffer whose contents are the guest's `bytes` (the field `bytes`).
     pub(crate) fn with_bytes(mut self, bytes: Option<GuestBytes>) -> Self {
         self.bytes = bytes;
+        self
+    }
+
+    /// The entry, a no-copy buffer whose identity the guest notes as it escapes (the field
+    /// `escape`).
+    pub(crate) fn escapes(mut self, escape: super::escape::Escape) -> Self {
+        self.escape = Some(escape);
         self
     }
 }
