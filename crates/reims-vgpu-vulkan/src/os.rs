@@ -130,7 +130,7 @@ pub(crate) use wsi::{rt_instance_extensions, rt_present_fences};
 /// `HOME` on Linux and macOS (`os/home.rs`), and none where `HOME` is not set; on Windows
 /// `reims-vgpu` in the user's local application data folder (`os/windows/app_data.rs`), which a
 /// process has whatever its environment, as a QEMU started outside MSYS2's shell has no `HOME`.
-/// In a test build, the directory [`TESTS_CACHE_DIRECTORY`] names where it is set.
+/// In a test build, the directory `TESTS_CACHE_DIRECTORY` names where it is set.
 pub fn user_cache_directory() -> Option<PathBuf> {
     #[cfg(any(test, feature = "testkit"))]
     if let Some(dir) = std::env::var_os(TESTS_CACHE_DIRECTORY) {
