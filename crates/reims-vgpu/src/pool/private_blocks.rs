@@ -161,8 +161,6 @@ struct State {
     serial: u64,
     /// The contexts with a take in flight, by context.
     takers: HashMap<u32, Taker>,
-    /// The take workers running.
-    workers: usize,
     /// The device's release came ([`PrivateBlocks::close`]): no take is carried out from now on.
     closed: bool,
 }
@@ -176,6 +174,64 @@ struct Inner {
     state: Mutex<State>,
     /// Told when a take is handed to a worker, and when the takes end.
     changed: Condvar,
+    /// The take workers' threads.
+    threads: Arc<Threads>,
+}
+
+/// The take workers' threads, each counted from its spawn until it holds the ledger no more. A
+/// worker's handle may be the ledger's last, whose drop drops the source, and rt's device's drop
+/// calls the driver: the device's release waits for every one ([`PrivateBlocks::close`]), so that
+/// the source is never dropped on a worker's thread past the release, where the process may be
+/// exiting.
+#[derive(Default)]
+struct Threads {
+    /// The threads counted.
+    live: Mutex<usize>,
+    /// Told when one goes.
+    gone: Condvar,
+}
+
+impl Threads {
+    /// One thread goes.
+    fn go(&self) {
+        let mut live = self.live.lock();
+        *live = live.saturating_sub(1);
+        drop(live);
+        self.gone.notify_all();
+    }
+}
+
+/// A take worker's count among the [`Threads`]: it goes at this one's drop.
+struct Live(Arc<Threads>);
+
+impl Live {
+    /// One thread more among `threads`.
+    fn new(threads: &Arc<Threads>) -> Live {
+        let mut live = threads.live.lock();
+        *live = live.saturating_add(1);
+        Live(Arc::clone(threads))
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.go();
+    }
+}
+
+/// What a take worker's thread holds: the ledger, then its count, which a struct's fields' order
+/// drops in that order, at the worker's return or unwind.
+struct WorkerHold {
+    inner: Arc<Inner>,
+    _live: Live,
+}
+
+impl WorkerHold {
+    /// Runs context `context`'s worker ([`Inner::work`]), then lets go of the ledger, then of
+    /// the worker's count.
+    fn run(self, context: u32) {
+        self.inner.work(context);
+    }
 }
 
 /// The contexts' Private blocks ([module doc](self)): a handle, which clones share.
@@ -197,10 +253,10 @@ impl PrivateBlocks {
                     held: BTreeMap::new(),
                     serial: 0,
                     takers: HashMap::new(),
-                    workers: 0,
                     closed: false,
                 }),
                 changed: Condvar::new(),
+                threads: Arc::default(),
             }),
         }
     }
@@ -263,16 +319,19 @@ impl PrivateBlocks {
             return;
         }
         taker.working = true;
-        st.workers = st.workers.saturating_add(1);
+        // Counted under the lock, so that a release after the unlock waits for the thread.
+        let hold = WorkerHold {
+            inner: Arc::clone(&self.inner),
+            _live: Live::new(&self.inner.threads),
+        };
         drop(st);
-        let inner = Arc::clone(&self.inner);
         let spawned = std::thread::Builder::new()
             .name("reims-vgpu.graphics-private-take".into())
-            .spawn(move || inner.work(context));
+            .spawn(move || hold.run(context));
         if spawned.is_err() {
+            // The hold went with the thread's closure.
             log::warn!("private blocks: no thread for context {context}'s takes: they are refused");
             let mut st = self.inner.state.lock();
-            st.workers = st.workers.saturating_sub(1);
             let jobs = match st.takers.remove(&context) {
                 Some(taker) => taker.jobs,
                 None => VecDeque::new(),
@@ -383,6 +442,8 @@ impl PrivateBlocks {
     /// The device's release: every take not yet answered ends unanswered, and none is carried
     /// out from now on. Waits for the take workers to go, each giving back the block it was
     /// taking, so that none calls the source past the release: at most one source's take each.
+    /// Each worker's thread has let go of the ledger once this returns, so the source is
+    /// dropped where the ledger's last handle goes, never on a worker's thread ([`Threads`]).
     /// The blocks the contexts hold stay held, and go back with the source.
     pub(crate) fn close(&self) {
         let ended = {
@@ -392,12 +453,10 @@ impl PrivateBlocks {
         };
         self.inner.changed.notify_all();
         drop(ended);
-        let mut state = self.inner.state.lock();
-        while state.workers > 0 {
-            let _ = self
-                .inner
-                .changed
-                .wait_for(&mut state, Duration::from_millis(250));
+        let threads = &self.inner.threads;
+        let mut live = threads.live.lock();
+        while *live > 0 {
+            threads.gone.wait(&mut live);
         }
     }
 
@@ -411,10 +470,10 @@ impl PrivateBlocks {
             .collect()
     }
 
-    /// The take workers running (for the tests).
+    /// The take workers' threads that hold the ledger (for the tests).
     #[cfg(test)]
     pub(crate) fn workers(&self) -> usize {
-        self.inner.state.lock().workers
+        *self.inner.threads.live.lock()
     }
 }
 
@@ -545,9 +604,6 @@ impl Inner {
                 st.takers.remove(&context);
             }
         }
-        st.workers = st.workers.saturating_sub(1);
-        drop(st);
-        self.changed.notify_all();
     }
 
     /// The source's block of at least `len` bytes, as a step of the library's (it may call the
@@ -556,11 +612,9 @@ impl Inner {
     /// hold, which goes back.
     fn take_block(&self, len: u64) -> (Result<(BlockId, u64, u64), TakeError>, Duration) {
         let Some(_step) = exit_gate::step() else {
-            // The process is exiting: the worker parks for good, gone for the release's wait.
-            let mut st = self.state.lock();
-            st.workers = st.workers.saturating_sub(1);
-            drop(st);
-            self.changed.notify_all();
+            // The process is exiting: the worker parks for good, its hold kept, gone for the
+            // release's wait.
+            self.threads.go();
             exit_gate::stay()
         };
         let Some(source) = &self.source else {
@@ -1023,6 +1077,32 @@ mod tests {
         assert_eq!(blocks.workers(), 0);
         assert_eq!(blocks.held(), [(held, 4, len, false)]);
         opener.join().unwrap();
+    }
+
+    /// The device's release returns only once every worker's thread has let go of the ledger:
+    /// the ledger's last handle is then the caller's, and the source drops with it on the
+    /// caller's thread, never on a worker's past the release.
+    #[test]
+    fn the_release_returns_once_no_worker_holds_the_ledger() {
+        for _ in 0..50 {
+            let source = Arc::new(Source::default());
+            let weak = Arc::downgrade(&source);
+            let blocks = ledger(Some(source));
+            let takes: Vec<Got> = (1..=4)
+                .map(|context| take(&blocks, context, 0x1_0000))
+                .collect();
+            for got in &takes {
+                answered(got).unwrap();
+            }
+            blocks.close();
+            assert_eq!(
+                Arc::strong_count(&blocks.inner),
+                1,
+                "a worker's thread still holds the ledger"
+            );
+            drop(blocks);
+            assert!(weak.upgrade().is_none(), "the source outlived the ledger");
+        }
     }
 
     /// A set of known blocks that keeps none.
