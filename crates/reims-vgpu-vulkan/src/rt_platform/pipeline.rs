@@ -645,10 +645,12 @@ mod tests {
 
         // A slot the kernel writes is written; one it reads or samples, or does not use, is not.
         let write = state(&function("numbered_write"));
-        let slots = |s: &RtObj<RtComputePipeline>| (0..2).map(|i| s.texture_slot_writes(i));
-        assert_eq!(slots(&write).collect::<Vec<_>>(), [Some(true), Some(false)]);
-        assert_eq!(slots(&read).collect::<Vec<_>>(), [Some(false); 2]);
-        assert_eq!(slots(&first).collect::<Vec<_>>(), [Some(false); 2]);
+        let slots = |s: &RtObj<RtComputePipeline>| -> Vec<Option<bool>> {
+            (0..2).map(|i| s.texture_slot_writes(i)).collect()
+        };
+        assert_eq!(slots(&write), [Some(true), Some(false)]);
+        assert_eq!(slots(&read), [Some(false); 2]);
+        assert_eq!(slots(&first), [Some(false); 2]);
         assert_eq!(write.texture_slot_writes(u64::MAX), Some(false));
         drop(write);
 
