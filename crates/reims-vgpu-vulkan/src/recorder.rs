@@ -107,6 +107,12 @@
 //!   buffer of the recorder's own, before the dispatch and after it, and at the command buffer's
 //!   completion an `m2v.privateBytes` record names the dispatch and holds both bytes as blobs
 //!   ([`private`]).
+//! - **A no-copy buffer's escape.** Where the guest notes that a no-copy buffer's identity left
+//!   its Metal with no message naming the buffer (the reims-graphics device's `BUFFER_ESCAPED`,
+//!   once in the buffer's life), a [`BUFFER_ESCAPED`] record on the buffer, `[kind]`, the act
+//!   that noted it, is queued at the note ([`buffer_escaped`]): after the `m2v.write` records of
+//!   each commit before it, and before those of each commit after. From there on the GPU may reach
+//!   the buffer by an address in memory the stream writes, where a player stops, typed.
 //! - **The calling thread captures; the writer shapes.** Each call's record is queued, owned,
 //!   under one lock as the call returns, so the stream's order keeps each thread's, with what
 //!   only the call's moment has: its objects' ids, the bytes it consumes and the memory a commit
@@ -222,8 +228,10 @@ pub const FIXES: &[&str] = &[
     "announce-bytes",
     // e3898c754: what kernels changed, at their completion
     "kernel-writes-at-completion",
-    // the commit that adds this name: each completion before the guest can learn of it
+    // 38af6b525: each completion before the guest can learn of it
     "completion-before-guest-learns",
+    // the commit that adds this name: each no-copy buffer's escape, at the guest's first note
+    "buffer-escaped",
 ];
 
 /// The stats file's lines that name the recorder's build: its commit ([`COMMIT`]), the display
@@ -1181,6 +1189,48 @@ pub fn present(t: &dyn Any) {
         ..Call::default()
     });
     state.stats.presents.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The selector of a no-copy buffer's escape record ([`buffer_escaped`]).
+pub const BUFFER_ESCAPED: &str = "m2v.bufferEscaped";
+
+/// The guest noted that the identity of the no-copy buffer `b` left its Metal with no message
+/// naming the buffer, by the act `kind`, an `RGFX_BUFFER_ESCAPED_*` value (0 the app's read of its
+/// `gpuAddress`, 1 an argument encoder's write, 2 the app's read of a `gpuResourceID`, 3 a
+/// residency set's add): from here on the GPU may reach the buffer through memory alone, by an
+/// address in bytes the stream writes. Its record is a [`BUFFER_ESCAPED`] call on the buffer,
+/// `[kind]`, of all of the buffer, which a player stops at, typed, where a later write holds an
+/// address in the buffer. The reims-graphics device calls it once in the buffer's life, at the
+/// guest's first note (reims-vgpu's `decode::escape`).
+///
+/// The record is queued here, on the calling thread, so it lies in the stream's order: after the
+/// `m2v.write` records of each commit made before the note, which the commit queued before its
+/// call returned ([`before_commit`]), and before those of each commit made after it. The guest's
+/// device carries a command buffer out only after the notes its process posted before it.
+///
+/// `b` is a buffer of any platform; only the Vulkan platform's is recorded. The device makes each
+/// no-copy buffer by a recorded call (`newBufferWithDescriptor:`), so the buffer has its stream
+/// id: one with none is counted as an unrecorded receiver, with no record. The record is counted
+/// by its selector in `<pid>.stats.txt`.
+pub fn buffer_escaped(b: &dyn Any, kind: u64) {
+    if !on() {
+        return;
+    }
+    let Some(b) = b.downcast_ref::<VulkanBuffer>() else {
+        return;
+    };
+    let Some(state) = state() else { return };
+    let Some(id) = id_at(b.id().0) else {
+        (state.stats.unrecorded_receivers).fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    state.push_plain(Call {
+        selector: BUFFER_ESCAPED.to_owned(),
+        receiver: id,
+        args: vec![Value::Uint(kind)],
+        ..Call::default()
+    });
+    state.count_selector(BUFFER_ESCAPED);
 }
 
 /// An object's last reference went, at `ptr`: its `release` record, after every record queued

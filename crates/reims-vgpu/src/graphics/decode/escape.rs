@@ -19,6 +19,13 @@
 //! reference, and one for an object whose create the host refused is dropped, as any naming of
 //! one is ([`super::refused`]).
 //!
+//! Where the process records its platform's calls (`REIMS_VGPU_RECORD`), the first note is also
+//! a record on the buffer, `m2v.bufferEscaped` `[act]`, queued at the note
+//! ([`recorder::buffer_escaped`]): the stream holds it after the memory writes of each command
+//! buffer committed before it and before those of each committed after. A replay player stops
+//! there, typed, where a later write holds an address in the buffer. A later note, a note for a
+//! refused create and a bad reference write none.
+//!
 //! An escaped buffer over a copy of its pages is one the GPU may read through memory, with no
 //! binding naming it, after the guest's CPU changed its pages. Metal requires a function's reach
 //! of a buffer through memory to be made resident by its encoder (`useResource:usage:`), which
@@ -32,12 +39,15 @@
 //!
 //! [`Context::escaped_copies`]: super::tables::Context::escaped_copies
 
+use std::any::Any;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use reims_vgpu_graphics::wire::RgfxBufferEscaped;
 use reims_vgpu_vulkan::answer::count_kind;
+use reims_vgpu_vulkan::core::num::ToU64 as _;
 use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::recorder;
 
 use super::tables::Entry;
 use super::{DecodeError, GraphicsDecoder, ObjHandle, context_of, read};
@@ -121,13 +131,15 @@ impl Escape {
     }
 
     /// The guest's note that buffer `obj_id`'s identity escaped by the act at `act` of
-    /// [`ESCAPED_BY`]: the first marks it and counts it, a buffer over a copy of its pages added
-    /// to `copies`, its context's count of its escaped copies, and the first of its act in this
-    /// process is logged; a later one changes nothing.
-    fn note(&self, act: usize, obj_id: u64, copies: Option<Arc<AtomicUsize>>) {
+    /// [`ESCAPED_BY`]: the first marks it, records it where the process records, on `buffer`,
+    /// the platform's (`m2v.bufferEscaped`, [`recorder::buffer_escaped`]), and counts it, a
+    /// buffer over a copy of its pages added to `copies`, its context's count of its escaped
+    /// copies, and the first of its act in this process is logged; a later one changes nothing.
+    fn note(&self, act: usize, obj_id: u64, buffer: &dyn Any, copies: Option<Arc<AtomicUsize>>) {
         if self.escaped.swap(true, Ordering::Relaxed) {
             return;
         }
+        recorder::buffer_escaped(buffer, act.to_u64());
         count_kind(ESCAPED_BY[act]);
         if self.over == NoCopy::ReadOnlyPages {
             count_kind(ESCAPED_COPIES);
@@ -183,11 +195,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                 Ok(())
             }
             Some(Entry {
+                handle: ObjHandle::Buffer(buffer),
                 escape: Some(escape),
                 ..
             }) => {
                 let copies = self.escaped_copies(context_of(m.obj_id), Arc::clone);
-                escape.note(act, m.obj_id, copies);
+                escape.note(act, m.obj_id, buffer, copies);
                 Ok(())
             }
             _ => Err(DecodeError::BadReference),
@@ -679,5 +692,168 @@ mod tests {
         assert_eq!(reach(), OLD, "before the CPU's write");
         write(0, NEW);
         assert_eq!(reach(), NEW, "after the CPU's write");
+    }
+
+    /// The marker that makes a run of [`on_vulkan_a_recording_holds_each_buffers_first_escape`]
+    /// the child, which records.
+    const RECORD_CHILD: &str = "REIMS_VGPU_ESCAPE_RECORD_CHILD";
+
+    /// With the process recording, each no-copy buffer's first note is one `m2v.bufferEscaped`
+    /// record on the buffer, `[act]`, its act's `RGFX_BUFFER_ESCAPED_*` value; a later note for
+    /// it, by any act, a note for a buffer whose create the host refused, and a bad reference (a
+    /// device buffer, an id the sender holds no object under) write none. The recorder is the
+    /// process's, so the test runs in a child of its own, recording into a scratch directory.
+    #[test]
+    fn on_vulkan_a_recording_holds_each_buffers_first_escape() {
+        use reims_vgpu_vulkan::recorder::ENV_VAR;
+        if std::env::var_os(RECORD_CHILD).is_some() {
+            let streams = std::env::var_os(ENV_VAR).expect("the child records");
+            recorded_escapes(std::path::Path::new(&streams));
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("rvg-recorder-escape-{}", std::process::id()));
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "graphics::decode::escape::tests::on_vulkan_a_recording_holds_each_buffers_first_escape",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(RECORD_CHILD, "1")
+            .env(ENV_VAR, dir.join("streams"))
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "{out:?}");
+        let ran = String::from_utf8_lossy(&out.stdout).contains("1 passed");
+        assert!(ran, "the child ran no test: {out:?}");
+    }
+
+    /// [`on_vulkan_a_recording_holds_each_buffers_first_escape`]'s child, recording into
+    /// `streams`.
+    fn recorded_escapes(streams: &std::path::Path) {
+        use reims_vgpu_graphics::wire::RGFX_CURSOR_SPAN;
+        use reims_vgpu_vulkan::VulkanPlatform as V;
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::recorder::BUFFER_ESCAPED;
+        use reims_vgpu_vulkan::recorder::format::{self, Call, Value};
+
+        use crate::platform::ApiPlatform as _;
+
+        let platform = V::process();
+        assert!(
+            reims_vgpu_vulkan::recorder::on(),
+            "the child does not record"
+        );
+        let device = platform.metal_device(None).unwrap();
+        let page = platform.vm().page_size().max(4096);
+        let size = BLOCK + 0x10_0000 + RGFX_CURSOR_SPAN;
+        let region = Arc::new(crate::platform::test_region(&*platform, size as usize));
+        let mut dec = GraphicsDecoder::<V>::new(Arc::clone(&platform), region);
+        let over = |obj_id, region_offset, length| RgfxBufferOverHostMemory {
+            header: header(RGFX_CMD_BUFFER_OVER_HOST_MEMORY),
+            obj_id,
+            region_offset,
+            length,
+            ..RgfxBufferOverHostMemory::default()
+        };
+        // Two no-copy buffers, of three pages and of five: their creates' records tell them
+        // apart.
+        for (obj_id, at, pages) in [(10, BLOCK + 0x20000, 3), (11, BLOCK + 0x40000, 5)] {
+            let m = over(obj_id, at, pages * page);
+            assert_eq!(dec.decode(&device, m.as_bytes()).unwrap(), Ok(()));
+        }
+        let device_buffer = RgfxBufferCreate {
+            header: header(RGFX_CMD_BUFFER_CREATE),
+            obj_id: 20,
+            length: 0x1000,
+            ..RgfxBufferCreate::default()
+        };
+        assert_eq!(
+            dec.decode(&device, device_buffer.as_bytes()).unwrap(),
+            Ok(())
+        );
+        // Of no bytes: refused, and its id stands for the refused buffer.
+        let refused = over(30, BLOCK + 0x60000, 0);
+        assert_eq!(
+            dec.decode_refusing(&device, refused.as_bytes()).unwrap(),
+            Err(DecodeError::Refused)
+        );
+        let mut note = |obj_id, kind| {
+            let m = RgfxBufferEscaped {
+                header: header(RGFX_CMD_BUFFER_ESCAPED),
+                obj_id,
+                kind,
+                reserved_1c: 0,
+            };
+            dec.decode(&device, m.as_bytes()).unwrap()
+        };
+        assert_eq!(note(10, RGFX_BUFFER_ESCAPED_RESOURCE_ID), Ok(()));
+        for kind in 0..4 {
+            assert_eq!(note(10, kind), Ok(()));
+        }
+        assert_eq!(note(11, RGFX_BUFFER_ESCAPED_RESIDENCY_SET), Ok(()));
+        assert_eq!(note(11, RGFX_BUFFER_ESCAPED_GPU_ADDRESS), Ok(()));
+        assert_eq!(note(30, RGFX_BUFFER_ESCAPED_GPU_ADDRESS), Ok(()));
+        for obj_id in [20, 0x99] {
+            assert_eq!(
+                note(obj_id, RGFX_BUFFER_ESCAPED_ARGUMENT_ENCODER),
+                Err(DecodeError::BadReference)
+            );
+        }
+        // A call after the notes: the stream holds their records once it holds its.
+        let _queue = device.new_command_queue().unwrap();
+
+        let segment = streams.join(format!("{}.0000.m2vr", std::process::id()));
+        let mut calls = Vec::new();
+        for _ in 0..200 {
+            let read = std::fs::read(&segment)
+                .ok()
+                .and_then(|b| format::read(&b, &mut Vec::new()).ok());
+            calls = (read.into_iter().flat_map(|r| r.records))
+                .filter_map(|r| match r {
+                    format::Record::Call(c) => Some(c),
+                    _ => None,
+                })
+                .collect::<Vec<Call>>();
+            if calls.iter().any(|c| c.selector == "newCommandQueue") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // Each no-copy buffer's stream id, by its create's length.
+        let made = |length: u64| {
+            let length_of = |c: &Call| match c.args.first() {
+                Some(Value::Map(fields)) => (fields.iter())
+                    .find(|(k, _)| k == "length")
+                    .map(|(_, v)| v.clone()),
+                _ => None,
+            };
+            let create = calls.iter().find(|c| {
+                c.selector == "newBufferWithDescriptor:"
+                    && c.result != 0
+                    && length_of(c) == Some(Value::Uint(length))
+            });
+            create
+                .unwrap_or_else(|| panic!("no create of {length:#x} bytes: {calls:?}"))
+                .result
+        };
+        let (ten, eleven) = (made(3 * page), made(5 * page));
+        let escape = |receiver, kind: u32| Call {
+            selector: BUFFER_ESCAPED.to_owned(),
+            receiver,
+            args: vec![Value::Uint(kind.into())],
+            ..Call::default()
+        };
+        let escapes: Vec<&Call> = (calls.iter())
+            .filter(|c| c.selector == BUFFER_ESCAPED)
+            .collect();
+        assert_eq!(
+            escapes,
+            [
+                &escape(ten, RGFX_BUFFER_ESCAPED_RESOURCE_ID),
+                &escape(eleven, RGFX_BUFFER_ESCAPED_RESIDENCY_SET)
+            ]
+        );
     }
 }

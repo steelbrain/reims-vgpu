@@ -4838,7 +4838,9 @@ buffer through memory alone, and the host takes it as named for its life
 (`decode::escape`). The note is unwaited and changes nothing the guest
 observes: the host marks the buffer and counts the escape by its act in the
 degradation counts (`buffer-escaped-*`, beside `no-copy-buffers`, the no-copy
-buffers made).
+buffers made), and a host that records its platform's calls
+(`REIMS_VGPU_RECORD`, docs/api.md) writes it into the stream as
+`m2v.bufferEscaped` on the buffer, for a replay player's typed stop.
 
 The note goes ahead of any command buffer that could use the identity:
 - the bundle marks the buffer as it makes it, and each act reads the mark with

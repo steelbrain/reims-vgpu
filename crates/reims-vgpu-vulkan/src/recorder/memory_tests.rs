@@ -1052,3 +1052,91 @@ fn on_vulkan_a_cpu_write_once_a_status_reads_final_is_written() {
         assert_eq!(between, vec![counted_once(), bytes(0, 4096)]);
     });
 }
+
+/// A no-copy buffer's escape ([`super::buffer_escaped`]) is one [`super::BUFFER_ESCAPED`]
+/// record on the buffer, `[kind]`, where the note came in the stream's order: after the buffer's
+/// create and after the `m2v.write` of its bytes that a commit made before the note wrote, and
+/// before the one of a commit made after it, so a player meets the record before any write the
+/// GPU may read the buffer's address from. An object that is no buffer of the Vulkan platform's
+/// writes none, and the record is counted by its selector.
+#[test]
+fn on_vulkan_a_buffers_escape_lies_between_the_commits_around_its_note() {
+    let test = "recorder::memory_tests::on_vulkan_a_buffers_escape_lies_between_the_commits_around_its_note";
+    in_recording_child(test, |streams| {
+        use crate::core::platform::HostRange;
+        use crate::core::platform::values::{BufferDesc, OptionSet};
+        use crate::gpu::resource::tests::{guest_pages_of, shared};
+        let d = crate::gpu::device::tests::dev();
+        let pages = guest_pages_of(BLOCK);
+        // SAFETY: pages of the test's own, left mapped until the process ends.
+        let over = unsafe { HostRange::new(HostPtr::from_addr(pages as usize), BLOCK) };
+        let b = d
+            .new_buffer(BufferDesc {
+                length: BLOCK,
+                options: vec![OptionSet::ResourceOptions(0)],
+                pinned_gpu_address: None,
+                contents: Some(over),
+                no_copy: true,
+                deallocator: None,
+                zero_from: None,
+            })
+            .unwrap()
+            .expect("a no-copy buffer over the pages");
+        let (z, q) = (shared(4096), d.new_command_queue().unwrap());
+        // A command buffer that reads the buffer's first 16 bytes, committed and waited for.
+        let read_back = || {
+            let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+            let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+            let copy = BlitCmd::CopyBufferToBuffer {
+                source_buffer: Some(&b),
+                source_offset: 0,
+                destination_buffer: Some(&z),
+                destination_offset: 0,
+                size: 16,
+            };
+            for cmd in [copy, BlitCmd::EndEncoding] {
+                e.encode(OnFault::Return, cmd).unwrap();
+            }
+            run(&cb);
+        };
+        let pages = usize::try_from(pages).unwrap();
+        write_at(pages, 0..4096, 0x11);
+        read_back();
+        // The guest's note that its `gpuResourceID` was read (`RGFX_BUFFER_ESCAPED_RESOURCE_ID`).
+        super::buffer_escaped(&b, 2);
+        super::buffer_escaped(&(), 0);
+        write_at(pages, 0..4096, 0x22);
+        read_back();
+
+        let id = id_at(b.id().0).expect("the buffer is recorded");
+        let records = records_once(streams, |rs| place(rs, "commit", 1).is_some());
+        let made = (records.iter())
+            .position(|r| matches!(r, Record::Call(c) if c.result == id))
+            .expect("the buffer's create");
+        let escaped: Vec<(usize, &format::Call)> = (records.iter().enumerate())
+            .filter_map(|(i, r)| match r {
+                Record::Call(c) if c.selector == super::BUFFER_ESCAPED => Some((i, c)),
+                _ => None,
+            })
+            .collect();
+        let [(at, record)] = escaped[..] else {
+            panic!("one escape record: {escaped:?}");
+        };
+        assert_eq!(
+            (record.receiver, &record.args[..]),
+            (id, &[Value::Uint(2)][..])
+        );
+        let commits = [0, 1].map(|n| place(&records, "commit", n).expect("a commit's record"));
+        assert!(
+            made < commits[0] && commits[0] < at && at < commits[1],
+            "the create at {made}, the escape at {at}, the commits at {commits:?}"
+        );
+        let before = writes_of(&records, id, made..commits[0]);
+        assert_eq!(before.get(&0), Some(&bytes(0x11, 4096)));
+        assert!(writes_of(&records, id, commits[0]..at).is_empty());
+        let after = writes_of(&records, id, at..commits[1]);
+        assert_eq!(after.get(&0), Some(&bytes(0x22, 4096)));
+        let counted = state().expect("the child records").selectors.lock();
+        assert_eq!(counted.get(super::BUFFER_ESCAPED), Some(&1));
+    });
+}
