@@ -30,8 +30,9 @@
 //!   [`imported`]). For each kind, the textures made, and their uses in submissions
 //!   ([`Uses::submitted`]): their bytes, how many found the bytes as the submission before that
 //!   used the texture left them (a hash of them at each commit, read while the guest may write
-//!   them), how many found them changed after a submission that rendered into the texture or
-//!   blitted into it, and how many sampled, rendered or blitted it.
+//!   them; none where rt maps no host address for the buffer, as over a dma-buf import), how many
+//!   found them changed after a submission that rendered into the texture or blitted into it, and
+//!   how many sampled, rendered or blitted it.
 //! - **Imports by origin**, as the textures' kinds name it.
 //! - **Guest surface textures by declared usage.** Each texture the decoder made, or was refused,
 //!   over a surface's plane (`TEXTURE_FROM_IOSURFACE`), by the usage the guest declared, how it
@@ -534,12 +535,13 @@ fn context_now() -> Option<u32> {
 
 /// What rt copies of a texture over an imported block (the module's docs).
 struct Over {
-    /// The buffer, which holds its block, and so the bytes, mapped.
+    /// The buffer, which holds its block, and so the bytes, mapped where rt maps them.
     buffer: rt::Buffer,
     /// The bytes it lies over, from their first's offset in the buffer.
     offset: u64,
     len: u64,
-    /// The hash of its bytes at the last submission that used it; 0 before any.
+    /// The hash of its bytes at the last submission that used it; 0 before any, and always where
+    /// rt maps no host address for the buffer (`rt::Buffer::contents`), whose bytes are not read.
     last: AtomicU64,
     /// The last submission that used it rendered or blitted into it.
     written: AtomicBool,
@@ -577,10 +579,10 @@ static OVERS: Mutex<BTreeMap<OverKind, Arc<OverTotals>>> = Mutex::new(BTreeMap::
 
 impl Over {
     /// What rt copies of a texture of `shape` over `buffer` from `offset`, rows `bytes_per_row`
-    /// apart: `None` where the buffer's block was not imported, or the buffer has no contents.
+    /// apart: `None` where the buffer's block was not imported. rt copies one whether or not it
+    /// maps the block for the host: a buffer without contents (a dma-buf import) is counted too.
     fn of(buffer: &rt::Buffer, shape: &Shape, offset: u64, bytes_per_row: u64) -> Option<Over> {
         let origin = *IMPORTED.lock().get(&buffer.block())?;
-        buffer.contents()?;
         let kind = OverKind {
             format: shape.format,
             width: shape.width,
@@ -605,14 +607,13 @@ impl Over {
     }
 
     /// A hash of its bytes as they are now, never 0: FNV-1a of them, read one at a time through
-    /// volatile reads, as the guest may write them meanwhile.
-    fn hash(&self) -> u64 {
-        let Some(contents) = self.buffer.contents() else {
-            return 1;
-        };
+    /// volatile reads, as the guest may write them meanwhile; `None` where rt maps no host
+    /// address for the buffer.
+    fn hash(&self) -> Option<u64> {
+        let contents = self.buffer.contents()?;
         let (Ok(offset), Ok(len)) = (usize::try_from(self.offset), usize::try_from(self.len))
         else {
-            return 1;
+            return Some(1);
         };
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         // SAFETY: the bytes lie in the buffer (`len` is cut at its length), whose block the buffer
@@ -623,7 +624,7 @@ impl Over {
             let byte = unsafe { first.add(i).read_volatile() };
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
         }
-        hash | 1
+        Some(hash | 1)
     }
 
     /// A submission used it as `how` says: counts it under its kind.
@@ -631,13 +632,14 @@ impl Over {
         let t = &self.totals;
         t.submissions.fetch_add(1, Relaxed);
         t.bytes.fetch_add(self.len, Relaxed);
-        let hash = self.hash();
-        let last = self.last.swap(hash, Relaxed);
         let wrote = self.written.swap(how.rendered || how.blitted_into, Relaxed);
-        if last == hash {
-            t.unchanged.fetch_add(1, Relaxed);
-        } else if last != 0 && wrote {
-            t.changed_after_write.fetch_add(1, Relaxed);
+        if let Some(hash) = self.hash() {
+            let last = self.last.swap(hash, Relaxed);
+            if last == hash {
+                t.unchanged.fetch_add(1, Relaxed);
+            } else if last != 0 && wrote {
+                t.changed_after_write.fetch_add(1, Relaxed);
+            }
         }
         for (used, count) in [
             (how.sampled, &t.sampled),
