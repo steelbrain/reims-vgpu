@@ -282,6 +282,33 @@ pub fn of_length(
     }
 }
 
+/// [`of_length`]'s buffer whose bytes its maker writes before anything reads them
+/// ([`GpuDevice::new_scratch_buffer_of_length`](crate::core::platform::device::GpuDevice::new_scratch_buffer_of_length)):
+/// a Shared one in a block of its own, as [`own`]'s, with its bytes as the block held them, not
+/// zeroed; any other as `of_length`'s.
+pub fn scratch_of_length(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    length: u64,
+    raw: u64,
+) -> Option<RtObj<RtBuffer>> {
+    let o = match options(raw, false) {
+        Ok(o) => o,
+        Err(why) => return refused_metal(sel, &why),
+    };
+    if o.storage != Storage::Shared || length == 0 || length > rt::MAX_BUFFER_LENGTH {
+        return made(device, sel, length, o, None, None);
+    }
+    let block = take(device, sel, rt::MemoryClass::Shared, length)?;
+    match device.rt().new_buffer(block.id, 0, length, None) {
+        Ok(made) => Some(buffer(device, made, o.answered)),
+        Err(error) => {
+            rt_refused_create(sel, &error);
+            None
+        }
+    }
+}
+
 /// `newBufferWithDescriptor:` of `desc` on `device`: a no-copy one as [`over_host_memory`]'s, its
 /// deallocator given the bytes' address and the length; another as [`of_length`]'s, at the
 /// pinned address where it lies in a known block, and holding a copy of the contents where given.
@@ -1274,5 +1301,42 @@ mod tests {
             .new_texture(on, &descriptor, 0, 256)
             .expect("never a raise");
         assert!(texture.is_some());
+    }
+
+    /// On the GPU the test holds: a scratch buffer is a Shared buffer of the length asked,
+    /// answering its options, its bytes mapped and none of them zeroed, where
+    /// `new_buffer_of_length`'s are all zeroed; a Private one is made as `new_buffer_of_length`
+    /// makes it, zeroed; Metal's refusals nil.
+    #[test]
+    fn scratch_buffers_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let zeroed = || device.rt().counters().metrics().bytes_zeroed;
+        let scratch = |length, options| {
+            (device.new_scratch_buffer_of_length(on, length, options)).expect("never a raise")
+        };
+
+        let before = zeroed();
+        let buffer = scratch(100_000, 0).expect("a Shared scratch buffer");
+        assert_eq!(
+            (buffer.length(), buffer.storage_mode(), buffer.resource_options()),
+            (100_000, 0, 0x200)
+        );
+        assert_ne!(buffer.contents(), HostPtr::NULL);
+        assert_ne!(buffer.gpu_address(), 0);
+        assert_eq!(zeroed(), before, "a scratch buffer's bytes are not zeroed");
+
+        let before = zeroed();
+        let plain = (device.new_buffer_of_length(on, 100_000, 0)).expect("never a raise");
+        assert!(plain.is_some());
+        assert!(zeroed() >= before + 100_000, "a new buffer's bytes are zeroed");
+
+        let before = zeroed();
+        let private = scratch(4096, 0x20).expect("a Private scratch buffer");
+        assert_eq!((private.storage_mode(), private.contents()), (2, HostPtr::NULL));
+        assert!(zeroed() >= before + 4096, "a Private one is made as any, zeroed");
+
+        assert!(scratch(0, 0).is_none() && scratch(64, 0x30).is_none());
     }
 }

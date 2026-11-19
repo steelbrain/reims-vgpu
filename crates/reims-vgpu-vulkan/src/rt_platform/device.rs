@@ -572,6 +572,19 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         Ok(buffer::of_length(self, sel, length, options))
     }
 
+    /// [`new_buffer_of_length`](GpuDevice::new_buffer_of_length)'s, a Shared one not zeroed
+    /// ([`buffer::scratch_of_length`]).
+    fn new_scratch_buffer_of_length(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+    ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+        let _ = on;
+        let sel = "newBufferWithLength:options:";
+        Ok(buffer::scratch_of_length(self, sel, length, options))
+    }
+
     /// rt's queue, of Metal's default `maxCommandBufferCount`; nil where rt refuses it.
     fn new_command_queue(&self) -> Option<RtObj<RtQueue>> {
         match self.rt.new_command_queue(METAL_MAX_COMMAND_BUFFER_COUNT) {

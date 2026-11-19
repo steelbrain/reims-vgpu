@@ -105,6 +105,20 @@ pub trait GpuDevice<P: Platform>: Handle {
         options: u64,
     ) -> RaiseResult<Option<P::Buffer>>;
     /// No Metal counterpart: a buffer as [`new_buffer_of_length`](GpuDevice::new_buffer_of_length)'s,
+    /// the host's own, whose bytes its maker writes before anything reads them: the platform need
+    /// not zero them. The graphics lane's staged copies of the IOSurface device caches stage
+    /// through one (`decode::surface_cache`, "Staged copies"); nothing the guest names is made
+    /// so. The default makes the buffer as `new_buffer_of_length` does. Reached both under a
+    /// handler and with none: `on` says which this call is.
+    fn new_scratch_buffer_of_length(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+    ) -> RaiseResult<Option<P::Buffer>> {
+        self.new_buffer_of_length(on, length, options)
+    }
+    /// No Metal counterpart: a buffer as [`new_buffer_of_length`](GpuDevice::new_buffer_of_length)'s,
     /// in an allocation of its own whose memory another API imports
     /// ([`Buffer::export_memory`](super::resource::Buffer::export_memory)): the host's video
     /// writes its pictures into the IOSurface device caches so, on its own GPU work. `Ok(None)`
