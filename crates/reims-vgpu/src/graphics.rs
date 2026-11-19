@@ -805,12 +805,15 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // `decode::surface_shapes`).
             if P::SURFACE_SHAPES {
                 let platform = Arc::clone(&platform);
-                decoder.set_surface_shapes(Arc::new(
-                    move |device: &P::Device, desc: &TextureDesc, placed: bool| match placed {
-                        true => platform.placed_shape_image(device, desc),
-                        false => platform.shape_image(device, desc),
-                    },
-                ), P::PLACED_SHAPE_IMAGES);
+                decoder.set_surface_shapes(
+                    Arc::new(
+                        move |device: &P::Device, desc: &TextureDesc, placed: bool| match placed {
+                            true => platform.placed_shape_image(device, desc),
+                            false => platform.shape_image(device, desc),
+                        },
+                    ),
+                    P::PLACED_SHAPE_IMAGES,
+                );
             }
             // A platform whose imports of the host's memory cost each submission stages the
             // caches' copies through the host's CPU (`ApiPlatform::STAGED_SURFACE_COPIES`).

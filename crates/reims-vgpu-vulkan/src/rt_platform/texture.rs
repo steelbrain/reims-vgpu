@@ -509,7 +509,9 @@ impl RtObj<RtDevice> {
         let d = rt_texture_descriptor(desc).ok()?;
         let placed = (|| {
             let rt::SizeAndAlign { size, align } = self.rt().heap_texture_size_and_align(&d)?;
-            let block = self.rt().take_block(rt::MemoryClass::Private, size.max(align))?;
+            let block = self
+                .rt()
+                .take_block(rt::MemoryClass::Private, size.max(align))?;
             let heap = rt::HeapRange {
                 block: block.id,
                 offset: 0,

@@ -699,7 +699,11 @@ mod tests {
         texture(&mut r, 21, 80, (32, 8));
         assert_eq!(made.lock().len(), 1);
         let counts = r.dec.caches().counts().shapes;
-        assert_eq!((counts.placed, counts.unplaced_busy), (0, 0), "asked for none");
+        assert_eq!(
+            (counts.placed, counts.unplaced_busy),
+            (0, 0),
+            "asked for none"
+        );
     }
 
     /// The usage a texture declares picks its shape's kind: one that declares Metal's Unknown
