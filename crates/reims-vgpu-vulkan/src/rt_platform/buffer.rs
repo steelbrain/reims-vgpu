@@ -2279,14 +2279,20 @@ mod tests {
 
     /// On the GPU the test holds: a scratch buffer is a Shared buffer of the length asked,
     /// answering its options, its bytes mapped and none of them zeroed, where
-    /// `new_buffer_of_length`'s are all zeroed; a Private one is made as `new_buffer_of_length`
-    /// makes it, zeroed; Metal's refusals nil.
+    /// `new_buffer_of_length`'s all read zero, zeroed or left as rt took a block it said read zero
+    /// (counted, [`own`]); a Private one is made as `new_buffer_of_length` makes it, so; Metal's
+    /// refusals nil.
     #[test]
     fn scratch_buffers_on_vulkan() {
         let platform = RtPlatform::new();
         let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
         let on = OnFault::Return;
         let zeroed = || device.rt().counters().metrics().bytes_zeroed;
+        // A new buffer's zeros: those rt wrote, and those of a block rt said read zero, left so.
+        let zeros = || {
+            let skipped = counted(ZERO_SKIPPED_SHARED_CODE) + counted(ZERO_SKIPPED_PRIVATE_CODE);
+            zeroed() + skipped
+        };
         let scratch = |length, options| {
             (device.new_scratch_buffer_of_length(on, length, options)).expect("never a raise")
         };
@@ -2305,23 +2311,21 @@ mod tests {
         assert_ne!(buffer.gpu_address(), 0);
         assert_eq!(zeroed(), before, "a scratch buffer's bytes are not zeroed");
 
-        let before = zeroed();
+        let before = zeros();
         let plain = (device.new_buffer_of_length(on, 100_000, 0)).expect("never a raise");
-        assert!(plain.is_some());
-        assert!(
-            zeroed() >= before + 100_000,
-            "a new buffer's bytes are zeroed"
-        );
+        let plain = plain.expect("a Shared buffer");
+        assert!(zeros() >= before + 100_000, "a new buffer's bytes are zeros");
+        assert!(read(plain.contents(), 100_000).iter().all(|&b| b == 0));
 
-        let before = zeroed();
+        let before = zeros();
         let private = scratch(4096, 0x20).expect("a Private scratch buffer");
         assert_eq!(
             (private.storage_mode(), private.contents()),
             (2, HostPtr::NULL)
         );
         assert!(
-            zeroed() >= before + 4096,
-            "a Private one is made as any, zeroed"
+            zeros() >= before + 4096,
+            "a Private one is made as any, its bytes zeros"
         );
 
         assert!(scratch(0, 0).is_none() && scratch(64, 0x30).is_none());
