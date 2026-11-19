@@ -765,7 +765,6 @@ mod tests {
                 len: len.next_multiple_of(1 << 20) + 0x400,
                 gpu_address: (1 << 40) + u64::from(n) * (1 << 30),
                 contents: None,
-                zeroed: false,
             })
         }
         fn release_block(&self, block: BlockId) -> Result<(), BlockError> {

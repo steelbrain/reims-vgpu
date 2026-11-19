@@ -4841,10 +4841,9 @@ reads it once.
   carries the take out, neither allocating nor zeroing there; the context's
   own worker (`reims-vgpu.graphics-pool-take`) zeroes the block through the
   host's mapping and answers, first growing the pool by a piece of the take's
-  length where nothing fit. Bytes no block of the piece held before stay as
-  the piece came, where rt said its block read zero as it handed it out
-  (rt's `BlockInfo::zeroed`; `pool-take-zero-skipped-bytes`). The bytes of a
-  freed block, in a piece another block still holds, are zeroed after its
+  length where nothing fit; rt says nothing of a block's bytes as it hands
+  it out, so bytes no block of the piece held before are zeroed too. The
+  bytes of a freed block, in a piece another block still holds, are zeroed after its
   free by the pool's zeroer (`reims-vgpu.graphics-pool-zero`), off every
   take's path, and a take over them leaves them as zeroed
   (`pool-zeroed-after-free-bytes`, `pool-take-zero-skipped-prezeroed-bytes`);

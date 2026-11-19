@@ -618,46 +618,24 @@ fn a_take_is_carved_zeroed_and_answered_with_its_length_rounded_up() {
     assert_eq!(ledger.counts(), (1, 2 * TAKE_ALIGN));
 }
 
-/// A source of host blocks it says read zero as it hands them out (metal2vulkan-rt's
-/// `BlockInfo::zeroed`).
-struct Zeroed(HostBlocks);
-
-impl BlockSource for Zeroed {
-    fn take_block(&self, class: MemoryClass, len: u64) -> Result<BlockInfo, BlockError> {
-        let mut info = self.0.take_block(class, len)?;
-        info.zeroed = true;
-        Ok(info)
-    }
-
-    fn release_block(&self, block: BlockId) -> Result<(), BlockError> {
-        self.0.release_block(block)
-    }
-}
-
-/// In a piece whose source said its block read zero, a take zeroes only the bytes a carve of the
-/// piece held before: a first carve is left as the source gave it, and one over a given-back
-/// carve's bytes and past them is zeroed up to the piece's mark alone
+/// A take zeroes every byte of its carve no zeroer zeroed: over a given-back carve's bytes and
+/// past them, bytes no carve held before, which the source's block says nothing of, are zeroed
+/// as well; the bytes past the take are left as they are
 #[test]
-fn a_take_in_a_zeroed_piece_zeroes_only_what_an_earlier_carve_held() {
+fn a_take_over_a_given_back_carve_and_past_it_zeroes_all_of_it() {
     let host = Arc::new(Host::default());
-    let source: Arc<dyn BlockSource> = Arc::new(Zeroed(HostBlocks::new()));
-    let pool = Pool::with_delay(range(64), host.pool_host(), LONG, now(), source).unwrap();
-    pool.grow(BLOCK_LEN);
-    host.wait_for(1);
-    pool.added(BASE).unwrap();
-    let ledger = pool.ledger();
-    // Bytes the source said were zero, made 0xa5 here: a byte the take zeroes reads 0.
-    fill(&pool, 0, 3 * TAKE_ALIGN, 0xa5);
+    let (pool, _blocks, ledger) = live_pool(&host, LONG);
     assert_eq!(answer(&take(&ledger, 1, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
-    assert!(all(&pool, 0, 3 * TAKE_ALIGN, 0xa5));
+    // The carve's bytes as the guest wrote them, and past them as the source's block holds them.
+    fill(&pool, 0, 3 * TAKE_ALIGN, 0xa5);
     let Give::Given(carve) = ledger.give(1, 0, TAKE_ALIGN, |_, _| false) else {
         panic!("not given");
     };
     ledger.free(&[carve]);
     let len = 2 * TAKE_ALIGN;
     assert_eq!(answer(&take(&ledger, 2, len)), Some((0, len)));
-    assert!(all(&pool, 0, TAKE_ALIGN, 0));
-    assert!(all(&pool, TAKE_ALIGN, 2 * TAKE_ALIGN, 0xa5));
+    assert!(all(&pool, 0, len, 0));
+    assert!(all(&pool, len, TAKE_ALIGN, 0xa5));
 }
 
 /// A freed block's bytes, in a piece another block still holds, are zeroed by the pool's zeroer

@@ -8,14 +8,13 @@
 //! them); one over the host's memory only where the memory is the block's own mapping there. Any
 //! other heap of the device's takes a block of its own (rt's `take_block`), its bytes zeroed as
 //! the Vulkan platform's runtime zeroes a new heap's (a Shared one's counted by the byte,
-//! [`buffer::ZEROED_BYTES_CODE`]), unless rt said the block read zero as it was taken (its
-//! `zeroed`, counted as `buffer::zero_skipped` counts), and any other heap over the host's
-//! memory is a range of rt's import of its pages (`super::buffer::import_pages`, counted as the
-//! no-copy buffers' imports are), its bytes as they are; of option bit 24 (read-only), of a copy
-//! of them whose GPU writes are dropped (`super::buffer`'s docs, "Read-only memory"). A pin
-//! neither keeps is counted (`rt-gpu-address-unpinned`, `super::buffer`'s docs): the heap lies at
-//! rt's address. The heap's size is the descriptor's rounded up to 16 KiB, as Metal's is; the heap
-//! holds its block.
+//! [`buffer::ZEROED_BYTES_CODE`]): rt says nothing of a block's bytes as it is taken. Any other
+//! heap over the host's memory is a range of rt's import of its pages
+//! (`super::buffer::import_pages`, counted as the no-copy buffers' imports are), its bytes as they
+//! are; of option bit 24 (read-only), of a copy of them whose GPU writes are dropped
+//! (`super::buffer`'s docs, "Read-only memory"). A pin neither keeps is counted
+//! (`rt-gpu-address-unpinned`, `super::buffer`'s docs): the heap lies at rt's address. The heap's
+//! size is the descriptor's rounded up to 16 KiB, as Metal's is; the heap holds its block.
 //!
 //! **What is placed in it.** A buffer is the heap's range at its offset (rt's `new_heap_buffer`,
 //! its bytes as they are, as Metal's heap buffers are); a texture is rt's image bound there (rt's
@@ -185,9 +184,8 @@ pub fn of_desc(device: &RtObj<RtDevice>, desc: &HeapDesc, held: u64) -> Option<R
 }
 
 /// A block of `class` of the `size` bytes of a heap of its own, for `sel`, zeroed: a Shared one
-/// through its mapping, a Private one by rt's GPU fill; neither where rt said the block read zero
-/// as it was taken (its `zeroed`), the block the heap's alone, counted by the byte
-/// (`buffer::zero_skipped`). `None` where rt refuses it, counted.
+/// through its mapping, counted by the byte, a Private one by rt's GPU fill. `None` where rt
+/// refuses it, counted.
 fn zeroed(
     device: &RtObj<RtDevice>,
     sel: &'static str,
@@ -195,10 +193,6 @@ fn zeroed(
     size: u64,
 ) -> Option<rt::Block> {
     let block = take(device, sel, class, size)?;
-    if block.zeroed {
-        buffer::zero_skipped(class, size);
-        return Some(block);
-    }
     match block.contents {
         Some(at) => {
             // SAFETY: the block is this call's alone, mapped for its life, and its `len`, the size

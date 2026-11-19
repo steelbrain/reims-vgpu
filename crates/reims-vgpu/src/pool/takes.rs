@@ -16,15 +16,9 @@
 //! behind its own context's earlier ones, never behind another's growth or zeroing. A worker goes
 //! after [`WORKER_IDLE`] with no take. Every block reads zero at its answer: its worker zeroes
 //! it at its take, off the thread that carried the take out, its bytes counted
-//! ([`super::TAKE_ZEROED_BYTES_CODE`]), but for those no carve of its piece held before, in a
-//! piece whose source said its block read zero as it handed it out (its `zeroed`), which stay as
-//! the source zeroed them, counted ([`super::TAKE_ZERO_SKIPPED_BYTES_CODE`]), and those the
-//! pool's zeroer zeroed after an earlier carve's free (below, "Zeros after a free"). The piece's
-//! mark ([`Placed`]) rises past each carve as it is carved. The guest writes only the blocks it
-//! was answered, through the mappings of their bytes alone, and the device only where the guest
-//! places objects in them, so a byte past the mark was never the guest's to write.
-//!
-//! [`Placed`]: reims_vgpu_vulkan::core::memory::placed::Placed
+//! ([`super::TAKE_ZEROED_BYTES_CODE`]), but for those the pool's zeroer zeroed after an earlier
+//! carve's free (below, "Zeros after a free"). A piece's source says nothing of its block's
+//! bytes as it hands it out, so every other byte of a carve is zeroed at its take.
 //!
 //! Each answered take's wait, from its carry-out to its answer, is counted by its cause
 //! ([`super::TAKE_WAIT_CODES`]): behind its context's earlier takes (its worker's start among
@@ -44,8 +38,7 @@
 //! counted with its parts' time ([`super::ZERO_HOLDS_LONG_CODE`]); it lets the lock go between
 //! chunks. A carve
 //! is made with the same lock held, so it never meets a chunk half zeroed: it takes its bytes out
-//! of the record, and its worker zeroes only those below the mark the record lacks; the rest it
-//! leaves, counted ([`super::TAKE_ZERO_PREZEROED_BYTES_CODE`]). A carve's bytes still waiting for
+//! of the record, and its worker zeroes only those the record lacks; the rest it leaves, counted ([`super::TAKE_ZERO_PREZEROED_BYTES_CODE`]). A carve's bytes still waiting for
 //! the zeroer are no longer free, so the zeroer passes them over, and its worker zeroes them as
 //! before. So the zeroer waits for no take worker and none waits for it, the pool's nor the
 //! Private blocks' ([`super::private_blocks`], whose ledger, lock and workers it shares nothing
@@ -95,9 +88,9 @@ use reims_vgpu_vulkan::answer::count_kind_by;
 
 use super::{
     Ask, Error, Live, Mapped, MonoTime, Shared, State, TAKE_WAIT_CODES, TAKE_WAITS_CODE,
-    TAKE_ZERO_PREZEROED_BYTES_CODE, TAKE_ZERO_SKIPPED_BYTES_CODE, TAKE_ZEROED_BYTES_CODE,
-    ZERO_HOLD_LONG, ZERO_HOLD_MAX_NS_CODE, ZERO_HOLD_PART_MAX_NS_CODES, ZERO_HOLDS_LONG_CODE,
-    ZERO_LONG_HOLD_PART_NS_CODES, ZEROED_AFTER_FREE_BYTES_CODE,
+    TAKE_ZERO_PREZEROED_BYTES_CODE, TAKE_ZEROED_BYTES_CODE, ZERO_HOLD_LONG, ZERO_HOLD_MAX_NS_CODE,
+    ZERO_HOLD_PART_MAX_NS_CODES, ZERO_HOLDS_LONG_CODE, ZERO_LONG_HOLD_PART_NS_CODES,
+    ZEROED_AFTER_FREE_BYTES_CODE,
 };
 
 /// A block's alignment and its length's granule: 64 KiB, the wire's `RGFX_POOL_BLOCK_ALIGN`.
@@ -139,12 +132,8 @@ pub(super) struct Carve {
     state: Carving,
     /// The GPU address of its first byte (the module doc's "Its GPU address").
     gpu_address: GpuAddress,
-    /// How many of its bytes, from its first, an earlier carve of its piece may have written
-    /// (`Placed::place` of its piece's mark as it was carved): all of them unless the piece's
-    /// source said its block read zero as it handed it out.
-    written: u64,
-    /// Of those, the bytes its worker zeroes, by offset from its first byte: those the zeroer did
-    /// not zero after an earlier carve's free (the module doc's "Zeros after a free").
+    /// The bytes its worker zeroes, by offset from its first byte: those the zeroer did not zero
+    /// after an earlier carve's free (the module doc's "Zeros after a free").
     zero: Vec<Range<u64>>,
 }
 
@@ -654,18 +643,17 @@ impl State {
                 (at.checked_add(len)? <= end).then_some((start, at))
             });
         let (start, at) = at?;
-        // The piece's mark rises past the carve as it is carved, before another can be.
         let piece = self.pieces.get_mut(&start)?;
         let block = piece.block.gpu_address;
         let offset = at.checked_sub(start)?;
-        let written = piece.placed.place(piece.block.zeroed, offset, len);
-        // Of the bytes an earlier carve may have written, those the zeroer zeroed since are
-        // zero; the rest its worker zeroes. They are the carve's now, out of the record.
-        let zero = missing(&piece.zeros, offset..offset.checked_add(written)?)
+        let end = offset.checked_add(len)?;
+        // Of the carve's bytes, those the zeroer zeroed since an earlier carve's free are zero;
+        // the rest its worker zeroes. They are the carve's now, out of the record.
+        let zero = missing(&piece.zeros, offset..end)
             .into_iter()
             .map(|r| r.start.saturating_sub(offset)..r.end.saturating_sub(offset))
             .collect();
-        remove(&mut piece.zeros, offset..offset.checked_add(len)?);
+        remove(&mut piece.zeros, offset..end);
         let gpu_address = if block != 0 {
             GpuAddress::OfBlock(block.checked_add(offset)?)
         } else {
@@ -680,7 +668,6 @@ impl State {
                 serial,
                 state: Carving::Taking,
                 gpu_address,
-                written,
                 zero,
             },
         );
@@ -728,8 +715,8 @@ impl State {
     }
 
     /// The zeroer's next bytes, its piece's address, their offsets in its block and their host
-    /// address: at most [`ZERO_CHUNK`] of the first bytes waiting that lie below their piece's
-    /// mark, in a live piece that holds a carve, carved by none and not zero already. `None` where
+    /// address: at most [`ZERO_CHUNK`] of the first bytes waiting, in a live piece that holds a
+    /// carve, carved by none and not zero already. `None` where
     /// none wait. They stay so while the pool's lock is held.
     pub(super) fn next_zero(&mut self) -> Option<(u64, Range<u64>, NonNull<u8>)> {
         while let Some((piece, range)) = self.to_zero.pop_front() {
@@ -742,7 +729,7 @@ impl State {
             if p.carves == 0 {
                 continue;
             }
-            let range = range.start..range.end.min(p.placed.to()).min(p.block.len);
+            let range = range.start..range.end.min(p.block.len);
             let free = self.uncarved(piece, missing(&p.zeros, range.clone()));
             let Some(first) = free.first() else {
                 continue;
@@ -868,9 +855,8 @@ impl Shared {
             };
             let host = st.host_of(at);
             let carve = st.carves.get(&at).filter(|c| c.serial == serial);
-            let written = carve.map_or(job.len, |c| c.written.min(job.len));
             let zero =
-                carve.map_or_else(|| std::iter::once(0..written).collect(), |c| c.zero.clone());
+                carve.map_or_else(|| std::iter::once(0..job.len).collect(), |c| c.zero.clone());
             let zeroing = (self.now)();
             MutexGuard::unlocked(&mut st, || {
                 let Some(host) = host else {
@@ -882,7 +868,7 @@ impl Shared {
                     if let (Ok(first), Ok(bytes)) = (first, bytes) {
                         // SAFETY: the carve lies in its live piece's mapping, and the piece's
                         // block stays the pool's while the carve does, which only this worker
-                        // frees until it is answered; `r` lies in its first `written` bytes.
+                        // frees until it is answered; `r` lies in its `job.len` bytes.
                         unsafe { std::ptr::write_bytes(host.as_ptr().add(first), 0, bytes) };
                     }
                 }
@@ -890,15 +876,11 @@ impl Shared {
                 if zeroes > 0 {
                     count_kind_by(TAKE_ZEROED_BYTES_CODE, zeroes);
                 }
-                if written > zeroes {
+                if job.len > zeroes {
                     count_kind_by(
                         TAKE_ZERO_PREZEROED_BYTES_CODE,
-                        written.saturating_sub(zeroes),
+                        job.len.saturating_sub(zeroes),
                     );
-                }
-                if written < job.len {
-                    let skipped = job.len.saturating_sub(written);
-                    count_kind_by(TAKE_ZERO_SKIPPED_BYTES_CODE, skipped);
                 }
             });
             let zeroed = (self.now)().saturating_duration_since(zeroing);

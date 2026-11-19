@@ -111,7 +111,6 @@ impl BlockSource for RtBlocks {
             len: block.len,
             gpu_address: block.gpu_address,
             contents: block.contents,
-            zeroed: block.zeroed,
         };
         self.known.know(block.clone());
         self.held.lock().insert(info.id, block);

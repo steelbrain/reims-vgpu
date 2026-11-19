@@ -48,9 +48,6 @@ impl Block {
                 len,
                 gpu_address: 0,
                 contents: Some(ptr),
-                // Zeroed here at each take (`Block::zero`), but not said so: the take workers
-                // zero every carve on this source, as before the zeroed fact.
-                zeroed: false,
             },
             layout,
         })
