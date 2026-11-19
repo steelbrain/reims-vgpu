@@ -119,7 +119,6 @@ impl Escape {
     }
 
     /// What the buffer lies over.
-    #[cfg(test)]
     pub(crate) fn over(&self) -> NoCopy {
         self.over
     }

@@ -2616,6 +2616,57 @@ pub(crate) const READ_ONLY_PAGES_KIB: &str = "read-only-pages-kib";
 /// [`READ_ONLY_PAGES_KIB`] counts.
 static READ_ONLY_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// The kind a blit command that writes a buffer made over a block of pages its process maps
+/// read-only is counted as, where the platform places pinned objects only in its known blocks
+/// (metal2vulkan-rt's), which makes such a buffer over the pages themselves and drops none of
+/// its GPU writes, so the write reaches pages Metal leaves as they are: a copy into the buffer
+/// (from a buffer or a texture) or a fill of it ([`GraphicsDecoder::count_read_only_pages_write`]).
+/// A shader's write through a slot the buffer is bound at is not counted: no platform tells a
+/// buffer slot's access. A diagnostic: the guest sees nothing of it.
+///
+/// [`GraphicsDecoder::count_read_only_pages_write`]: super::GraphicsDecoder::count_read_only_pages_write
+pub(crate) const READ_ONLY_PAGES_WRITES: &str = "read-only-pages-writes";
+
+/// A blit command [`READ_ONLY_PAGES_WRITES`] counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadOnlyWriter {
+    /// A copy into the buffer from another.
+    CopyBuffer,
+    /// A copy into the buffer from a texture.
+    CopyTexture,
+    /// A copy into the buffer from a texture, with options.
+    CopyTextureOptions,
+    /// A fill of the buffer by a byte.
+    Fill,
+    /// A fill of the buffer by a 4-byte pattern.
+    FillPattern4,
+}
+
+impl ReadOnlyWriter {
+    /// Its selector, which its first write logs.
+    fn selector(self) -> &'static str {
+        match self {
+            ReadOnlyWriter::CopyBuffer => {
+                "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:"
+            }
+            ReadOnlyWriter::CopyTexture => {
+                "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:\
+                 destinationOffset:destinationBytesPerRow:destinationBytesPerImage:"
+            }
+            ReadOnlyWriter::CopyTextureOptions => {
+                "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:\
+                 destinationOffset:destinationBytesPerRow:destinationBytesPerImage:options:"
+            }
+            ReadOnlyWriter::Fill => "fillBuffer:range:value:",
+            ReadOnlyWriter::FillPattern4 => "fillBuffer:range:pattern4:",
+        }
+    }
+}
+
+/// Whether this process logged a write of [`READ_ONLY_PAGES_WRITES`] by each [`ReadOnlyWriter`],
+/// at its discriminant: the first is logged, the rest counted.
+static READ_ONLY_WRITE_LOGGED: [AtomicBool; 5] = [const { AtomicBool::new(false) }; 5];
+
 /// Counts a buffer of `length` bytes made over a block of pages its process maps read-only
 /// ([`READ_ONLY_PAGES_BUFFERS`], [`READ_ONLY_PAGES_KIB`]): the KiB counted grow to the KiB of
 /// the bytes' new sum, rounded up. A diagnostic: the guest sees nothing of it.
@@ -2837,6 +2888,30 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             );
         }
         admitted
+    }
+
+    /// Counts the blit command `writer` writing buffer `obj_id`, where the buffer lies over a
+    /// block of pages its process maps read-only and the platform places pinned objects only in
+    /// its known blocks ([`READ_ONLY_PAGES_WRITES`]); the first by each command is logged.
+    pub(super) fn count_read_only_pages_write(&self, obj_id: u64, writer: ReadOnlyWriter) {
+        if !(self.shared.pins_in_blocks).load(Ordering::Relaxed) {
+            return;
+        }
+        let over = (self.entry(obj_id).and_then(|e| e.escape.as_ref())).map(|e| e.over());
+        if over != Some(super::escape::NoCopy::ReadOnlyPages) {
+            return;
+        }
+        reims_vgpu_vulkan::answer::count_kind(READ_ONLY_PAGES_WRITES);
+        let logged = READ_ONLY_WRITE_LOGGED.get(writer as usize);
+        if logged.is_some_and(|logged| !logged.swap(true, Ordering::Relaxed)) {
+            log::info!(
+                target: "reims_vgpu::graphics",
+                "{}: writes no-copy buffer {obj_id:#x}, over pages its process maps read-only, \
+                 where the GPU's write reaches the pages and Metal drops it (logged once per \
+                 command, counted as {READ_ONLY_PAGES_WRITES})",
+                writer.selector()
+            );
+        }
     }
 
     /// `BUFFER_OVER_PAGES`: a Shared buffer over the `length` bytes at `offset` in the view of a
@@ -5000,6 +5075,96 @@ pub(super) mod tests {
         assert_eq!(counts().0, buffers + 1);
         assert_eq!(r.pages_buffer_of(14, 0, BLOCK, 0, 0x3ff, bit), Ok(()));
         assert_eq!(counts(), (buffers + 2, kib + 5));
+    }
+
+    /// Where the platform places pinned objects only in its known blocks (metal2vulkan-rt's),
+    /// which makes a buffer over a block of pages its process maps read-only over the pages and
+    /// drops none of its GPU writes, a blit command that writes such a buffer is counted
+    /// ([`READ_ONLY_PAGES_WRITES`]): a copy into it or a fill of it, not a copy out of it, nor a
+    /// write of a buffer over writable pages. On a platform that places them anywhere none is
+    #[test]
+    fn a_blit_write_of_a_read_only_pages_buffer_is_counted_where_pins_lie_in_known_blocks() {
+        use reims_vgpu_graphics::ops::blit::{
+            RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, RGFX_OP_BLIT_FILL_BUFFER,
+            RgfxBlitOpCopyBufferToBuffer, RgfxBlitOpFillBuffer,
+        };
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::raise::OnFault;
+
+        let mut r = rig(16);
+        let page = r.page;
+        let read_only = RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_READ_ONLY;
+        let writable = BLOCK + 0x8000;
+        assert_eq!(
+            r.pages_flagged(BLOCK, 0, &[(0, 4)], 4 * page, read_only),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(
+            r.pages_flagged(writable, 0, &[(8, 4)], 4 * page, RGFX_SURFACE_PAGES_PRIVATE),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(
+            r.pages_buffer_of(10, 0, BLOCK, 0, page, READ_ONLY_OPTION),
+            Ok(())
+        );
+        assert_eq!(r.pages_buffer_of(11, 0, writable, 0, page, 0), Ok(()));
+        // The process's count, which another test in it may have counted before.
+        let counted = || {
+            (reims_vgpu_vulkan::answer::degradation_counts().into_iter())
+                .find(|(c, _)| c == READ_ONLY_PAGES_WRITES)
+                .map_or(0, |(_, n)| n)
+        };
+        let queue = r.device.new_command_queue().unwrap();
+        let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+        let enc = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        let fill = |obj_id: u64| {
+            let m = RgfxBlitOpFillBuffer {
+                buffer_obj_id: obj_id,
+                range_location: 0,
+                range_length: 16,
+                value: 0xab,
+                reserved_19: [0; 7],
+            };
+            let body = m.as_bytes().to_vec();
+            let op = super::super::blit::decode_op(
+                RGFX_OP_BLIT_FILL_BUFFER,
+                &body,
+                &r.dec,
+                &enc,
+                OnFault::Return,
+            );
+            assert!(op.unwrap());
+        };
+        let copy = |source: u64, destination: u64| {
+            let m = RgfxBlitOpCopyBufferToBuffer {
+                source_buffer_obj_id: source,
+                destination_buffer_obj_id: destination,
+                source_offset: 0,
+                destination_offset: 0,
+                size: 16,
+            };
+            let body = m.as_bytes().to_vec();
+            let op = super::super::blit::decode_op(
+                RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER,
+                &body,
+                &r.dec,
+                &enc,
+                OnFault::Return,
+            );
+            assert!(op.unwrap());
+        };
+        let before = counted();
+        fill(10);
+        copy(11, 10);
+        assert_eq!(counted(), before, "its buffers lie over copies");
+        r.dec.set_pins_in_blocks();
+        fill(10);
+        copy(11, 10);
+        assert_eq!(counted(), before + 2, "a fill of it and a copy into it");
+        copy(10, 11);
+        fill(11);
+        assert_eq!(counted(), before + 2, "a copy out of it, a writable block's buffer");
     }
 
     /// A read-only pages block's view is mapped with no import: its buffers, of bit 24, lie over

@@ -26,6 +26,7 @@ use reims_vgpu_vulkan::core::platform::types::{
 use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult};
 use zerocopy::FromBytes;
 
+use super::surface_pages::ReadOnlyWriter;
 use super::{GraphicsDecoder, op_fault};
 
 /// Reads op body `T` from `payload`, or an exec fault when it is too short.
@@ -62,6 +63,10 @@ pub(crate) fn decode_op<P: Platform>(
             let m: RgfxBlitOpCopyBufferToBuffer = body(tag, payload)?;
             let source = objs.get_buffer(m.source_buffer_obj_id)?;
             let destination = objs.get_buffer(m.destination_buffer_obj_id)?;
+            objs.count_read_only_pages_write(
+                m.destination_buffer_obj_id,
+                ReadOnlyWriter::CopyBuffer,
+            );
             enc.encode(
                 on,
                 BlitCmd::CopyBufferToBuffer {
@@ -134,6 +139,10 @@ pub(crate) fn decode_op<P: Platform>(
             let m: RgfxBlitOpCopyTextureToBuffer = body(tag, payload)?;
             let source = objs.require_texture(m.source_texture_obj_id)?;
             let destination = objs.require_buffer(m.destination_buffer_obj_id)?;
+            objs.count_read_only_pages_write(
+                m.destination_buffer_obj_id,
+                ReadOnlyWriter::CopyTexture,
+            );
             enc.encode(
                 on,
                 BlitCmd::CopyTextureToBuffer {
@@ -161,6 +170,10 @@ pub(crate) fn decode_op<P: Platform>(
             let m: RgfxBlitOpCopyTextureToBufferOptions = body(tag, payload)?;
             let source = objs.get_texture(m.source_texture_obj_id)?;
             let destination = objs.get_buffer(m.destination_buffer_obj_id)?;
+            objs.count_read_only_pages_write(
+                m.destination_buffer_obj_id,
+                ReadOnlyWriter::CopyTextureOptions,
+            );
             enc.encode(
                 on,
                 BlitCmd::CopyTextureToBufferOptions {
@@ -291,6 +304,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_BLIT_FILL_BUFFER => {
             let m: RgfxBlitOpFillBuffer = body(tag, payload)?;
             let buffer = objs.require_buffer(m.buffer_obj_id)?;
+            objs.count_read_only_pages_write(m.buffer_obj_id, ReadOnlyWriter::Fill);
             enc.encode(
                 on,
                 BlitCmd::FillBuffer {
@@ -303,6 +317,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_BLIT_FILL_BUFFER_PATTERN4 => {
             let m: RgfxBlitOpFillBufferPattern4 = body(tag, payload)?;
             let buffer = objs.require_buffer(m.buffer_obj_id)?;
+            objs.count_read_only_pages_write(m.buffer_obj_id, ReadOnlyWriter::FillPattern4);
             enc.encode(
                 on,
                 BlitCmd::FillBufferPattern4 {
