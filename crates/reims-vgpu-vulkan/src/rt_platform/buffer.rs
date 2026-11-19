@@ -49,7 +49,9 @@
 //! under the kind of the make that asked for it on its thread (`crate::answer::making_as`), or
 //! [`IMPORTS_UNNAMED`] where no make named one, so the kinds' counts sum to the total. Option bit
 //! 24 (read-only) is taken and answered without, as Metal does, but the GPU's writes reach the
-//! bytes, where Metal drops them: counted ([`READ_ONLY_CODE`]), the process's first with a line.
+//! bytes, where Metal's GPU drops a kernel's and a blit's writes and faults a render pass's store
+//! (measured on the M3 Max, `crate::gpu::command`'s docs): counted ([`READ_ONLY_CODE`]), the
+//! process's first with a line.
 //!
 //! **Answers.** A buffer's resource options are the asked ones without bits 20 and 24, Metal's
 //! default hazard tracking resolved to tracked, as the Vulkan platform's runtime answers them. A
@@ -110,8 +112,8 @@ pub const IMPORTS_UNNAMED: crate::answer::MadeCodes = crate::answer::MadeCodes {
 };
 
 /// The code of a no-copy buffer or a heap of option bit 24, which is taken and answered without:
-/// the GPU's writes reach a no-copy buffer's bytes, where Metal drops them. Counted per buffer or
-/// heap.
+/// the GPU's writes reach a no-copy buffer's bytes, where Metal's GPU drops a kernel's and a
+/// blit's writes and faults a render pass's store. Counted per buffer or heap.
 pub const READ_ONLY_CODE: &str = "rt-no-copy-read-only";
 
 /// A buffer descriptor's `resourceOptions` before any setter: `Shared`.
@@ -819,8 +821,8 @@ pub(super) fn read_only(sel: &'static str) {
         log::warn!(
             target: TARGET,
             "{sel}: option bit 24 (read-only) is taken and answered without, but the GPU's writes \
-             reach a no-copy buffer's bytes, where Metal drops them ({READ_ONLY_CODE}), counted \
-             from here"
+             reach a no-copy buffer's bytes, where Metal's GPU drops a kernel's and a blit's \
+             writes and faults a render pass's store ({READ_ONLY_CODE}), counted from here"
         );
     }
 }
