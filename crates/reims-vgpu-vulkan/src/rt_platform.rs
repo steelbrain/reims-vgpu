@@ -8,8 +8,9 @@
 //! answers, queues, buffers, textures, libraries and pipelines, command buffers and encoders,
 //! events, then the display. Built: the device ([`device`]) with its answers ([`answers`] and
 //! [`mod@format`]), its command queues ([`queue`]), events, fences and shared events ([`event`]),
-//! the reservation of resource indices, buffers and the textures over them ([`buffer`]), on Unix
-//! the buffers whose memory another API imports (`export`), heaps but sparse ones ([`heap`]),
+//! the reservation of resource indices, buffers and the textures over them ([`buffer`]), with the
+//! copies of host pages rt imports no other way ([`copied`]), on Unix the buffers whose memory
+//! another API imports (`export`), heaps but sparse ones ([`heap`]),
 //! textures made of a descriptor, with their views ([`texture`]),
 //! command buffers ([`command`]) with their blit, compute and render encoders ([`blit`],
 //! [`compute`], [`mod@render`]), render pass descriptors ([`descriptor`]), sampler and
@@ -37,6 +38,7 @@ pub mod blit;
 pub mod buffer;
 pub mod command;
 pub mod compute;
+pub mod copied;
 pub mod descriptor;
 pub mod device;
 pub mod diag;

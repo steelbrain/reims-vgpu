@@ -60,15 +60,15 @@
 //! the bytes are the same pages the CPU's mapping reaches. One holds as many runs of file pages as
 //! udmabuf's `list_limit` takes, and as many bytes as its `size_limit_mb`: at the stock limit of
 //! 1,024 runs about 4 MiB of a guest buffer, whose pages are nearly each a run of their own
-//! (`crate::os::linux::device_lend`'s measured note). Pages past either are refused as rt's
-//! refusal of the pointer is, counted as too large with their runs and bytes
+//! (`crate::os::linux::device_lend`'s measured note). Pages past either are imported as a copy
+//! ("A copy at the refusal point"), counted as too large with their runs and bytes
 //! ([`IMPORTS_TOO_LARGE`], `super::diag::import_path`); so are pages with no file behind them. rt
 //! answers no `contents` for a dma-buf's block: until it takes the mapping, the device keeps the
 //! host address of the pages the dma-buf holds for it ([`KnownBlocks`]), which a buffer in the
 //! block answers as its `contents` and a pinned buffer over those bytes is a range of, as over a
 //! block rt maps. A Managed buffer over such a block is refused by rt (its block is not one rt
 //! maps), counted ([`MANAGED_OVER_DMA_BUF`]). Each import is counted by the way it was made or
-//! refused ([`IMPORTS_POINTER`], [`IMPORTS_DMA_BUF`], [`IMPORTS_REFUSED`]).
+//! refused ([`IMPORTS_POINTER`], [`IMPORTS_DMA_BUF`], [`IMPORTS_COPIED`], [`IMPORTS_REFUSED`]).
 //!
 //! **Pages no pin takes** (Linux). A view of a guest's pages of more than one run may be mapped
 //! through udmabuf's dma-bufs (`crate::os::linux`'s `vm` docs, "Views through dma-bufs"): a
@@ -81,12 +81,31 @@
 //! (`crate::os`'s `through_dma_bufs`) are imported as a dma-buf of the files behind them first,
 //! as above; where the host makes none (past udmabuf's limits) or rt refuses it, they are mapped
 //! from their files (`crate::os`'s `map_for_pointer`) and imported by their pointer, counted
-//! ([`IMPORTS_FROM_FILES`]); where they cannot all be mapped so (near the views' budget) they are
-//! refused, counted as the dma-buf's refusal, with no pointer asked of rt. Pages in no dma-buf's
-//! mapping go by their pointer first. From before an import asks where its pages lie until rt
+//! ([`IMPORTS_FROM_FILES`]); where they cannot all be mapped so (near the views' budget), or rt
+//! refuses that pointer, they are imported as a copy, with no pointer of theirs asked of rt
+//! while a page of them lies in a dma-buf's mapping. Pages in no dma-buf's mapping go by their
+//! pointer first. From before an import asks where its pages lie until rt
 //! frees an import of their pointer, the platform holds their mappings as they are (`crate::os`'s
 //! `MappingsHeld`), so no fold of the views maps them through dma-bufs under it (`vm`'s docs,
 //! "Folding back").
+//!
+//! **A copy at the refusal point.** Pages that rt imports neither by their pointer nor as a
+//! dma-buf of their files (on Linux past one dma-buf's limits, with no file behind them, near the
+//! views' budget, or refused by the driver; elsewhere wherever rt refuses their pointer) are
+//! imported as a copy (`super::copied`), as rt refused nothing: memory of the platform's own that
+//! holds their bytes, which rt imports by its pointer. A buffer in the copy's block answers the
+//! pages as its `contents`, and a pinned buffer over the pages is a range of the block, as over a
+//! dma-buf's ([`KnownBlocks`]). The copy is synced byte by byte: at each commit the bytes the CPU
+//! changed in the pages since they and the copy last agreed are written into the copy, and at each
+//! completion, before the command buffer's completed handlers run or a waiter returns, the bytes
+//! the GPU changed in the copy are written into the pages where the CPU did not change them since,
+//! a byte both changed keeping the CPU's. Counted ([`IMPORTS_COPIED`]), the process's first with a
+//! line; a copy rt refuses too is rt's refusal of the pages, counted, and nil. Where it differs
+//! from Metal's GPU, which reads and writes the pages in place: the GPU sees a CPU write made after
+//! a commit only at the next commit, of any queue; a command buffer rt holds at its commit for a
+//! shared event's value reads the bytes as they were at its commit; an event value the GPU signals
+//! may be seen before its command buffer's writes are merged back; and rt's own reads and writes
+//! of the block's bytes (a texture's over the buffer, on the CPU) are of the copy.
 //!
 //! **Answers.** A buffer's resource options are the asked ones without bits 20 and 24, Metal's
 //! default hazard tracking resolved to tracked, as the Vulkan platform's runtime answers them. A
@@ -166,13 +185,20 @@ pub const IMPORTS_DMA_BUF: &str = "rt-imports-dma-buf";
 /// docs, "Pages no pin takes"), counted per import, each counted as [`IMPORTS_POINTER`] too.
 pub const IMPORTS_FROM_FILES: &str = "rt-imports-from-files";
 
-/// The code of an import of the host's memory refused as more runs of file pages, or more bytes,
-/// than one dma-buf holds, the GPU taking no pointer to them (the module's docs, "Dma-bufs of the
-/// pages"), counted per import asked.
+/// The code of an import of the host's memory whose pages are more runs of file pages, or more
+/// bytes, than one dma-buf holds, the GPU taking no pointer to them (the module's docs, "Dma-bufs
+/// of the pages"), made as a copy where one is ([`IMPORTS_COPIED`]), counted per import asked.
 pub const IMPORTS_TOO_LARGE: &str = "rt-imports-too-large";
 
-/// The code of an import of the host's memory refused otherwise, counted per import asked.
+/// The code of an import of the host's memory that neither the pages' pointer nor a dma-buf of
+/// theirs took otherwise, made as a copy where one is ([`IMPORTS_COPIED`]), or refused, counted
+/// per import asked.
 pub const IMPORTS_REFUSED: &str = "rt-imports-refused";
+
+/// The code of an import of the host's memory made as a copy of its pages (the module's docs, "A
+/// copy at the refusal point"), counted per import, each counted as [`IMPORTS_TOO_LARGE`] or
+/// [`IMPORTS_REFUSED`] too.
+pub const IMPORTS_COPIED: &str = "rt-imports-copied";
 
 /// The code of a Managed no-copy buffer asked over a dma-buf's block, which rt refuses as over a
 /// block it does not map (the module's docs, "Dma-bufs of the pages"), counted per buffer.
@@ -236,13 +262,16 @@ impl Drop for RtBuffer {
 /// hands its range to the guest and forgets it as it takes it back, just before it gives the block
 /// back to rt. Each held block is a handle of it, so it lives while known. A handle of the device's
 /// set: its clones are the same set (`RtDevice::known_blocks`). With them, the host's mappings of
-/// the device's dma-buf imports ([`HostMappings`]), known or not.
+/// the device's dma-buf imports and the pages of its copies ([`HostMappings`]), known or not.
 #[derive(Default, Clone)]
 pub struct KnownBlocks {
     /// The blocks known, by their GPU address.
     known: Arc<Mutex<BTreeMap<u64, rt::Block>>>,
     /// The host's mapping of each live dma-buf import.
     mapped: HostMappings,
+    /// The pages each live copy's import holds a copy of (the module's docs, "A copy at the
+    /// refusal point"), the block's `contents` in place of rt's mapping of the copy.
+    homes: HostMappings,
 }
 
 /// Interim, until rt takes the mapping of a dma-buf it imports, which it answers no `contents`
@@ -305,14 +334,23 @@ impl KnownBlocks {
         })
     }
 
-    /// The host address of `block`'s first byte: rt's mapping of it, else the host's mapping of
-    /// the pages a dma-buf import of the device's holds ([`HostMappings`]); `None` for a block
-    /// with neither.
+    /// The host address of `block`'s first byte: for a copy's block the pages it copies
+    /// ([`Self::home_of`]), else rt's mapping of it, else the host's mapping of the pages a dma-buf
+    /// import of the device's holds ([`HostMappings`]); `None` for a block with none.
     pub(super) fn contents_of(&self, block: &rt::Block) -> Option<u64> {
+        if let Some(home) = self.home_of(block.id) {
+            return Some(home);
+        }
         match block.contents {
             Some(at) => Some(at.as_ptr().addr().to_u64()),
             None => self.mapped.of(block.id),
         }
+    }
+
+    /// The host address of the first byte of the pages the copy's import `id` holds a copy of,
+    /// where it is one (the module's docs, "A copy at the refusal point").
+    fn home_of(&self, id: rt::BlockId) -> Option<u64> {
+        super::copied::any().then(|| self.homes.of(id)).flatten()
     }
 
     /// Whether `id` is a live dma-buf import of the device's ([`HostMappings`]).
@@ -933,7 +971,7 @@ fn holding(release: NoCopyDeallocator, held: Held) -> NoCopyDeallocator {
 
 /// [`import_pages`]'s import of pages that lie in no dma-buf's mapping, the `len` bytes of whole
 /// pages at their address, by their pointer, `held` until rt frees it; where rt refuses that, as a
-/// dma-buf of the files behind them ([`by_dma_buf`]).
+/// dma-buf of the files behind them, and else as a copy ([`by_dma_buf`]).
 fn by_pointer(
     device: &RtObj<RtDevice>,
     sel: &'static str,
@@ -959,10 +997,7 @@ fn by_pointer(
             super::diag::import_path(codes.made, ImportPath::Pointer, len);
             Some((block, 0))
         }
-        Err(error) => {
-            let release = released_into(codes, then);
-            by_dma_buf(device, sel, codes.made, (at, len), release, &error)
-        }
+        Err(error) => by_dma_buf(device, sel, codes, (at, len), then, &error),
     }
 }
 
@@ -970,9 +1005,9 @@ fn by_pointer(
 /// no kernel pin takes, the `len` bytes of whole pages at their address (the module's docs,
 /// "Pages no pin takes"): as a dma-buf of the files behind them, and where none is made or rt
 /// refuses it, by their pointer once they are mapped from their files (`crate::os`'s
-/// `map_for_pointer`), `held` until rt frees that import. `None` where the pages are refused,
-/// counted: their pointer is never handed to rt while a page of them lies in a dma-buf's
-/// mapping.
+/// `map_for_pointer`), `held` until rt frees that import; where they cannot be, or rt refuses
+/// that, as a copy ([`refused`]). `None` where the pages are refused, counted: their pointer is
+/// never handed to rt while a page of them lies in a dma-buf's mapping.
 #[cfg(target_os = "linux")]
 fn unpinnable(
     device: &RtObj<RtDevice>,
@@ -994,7 +1029,7 @@ fn unpinnable(
         Err(no) => no,
     };
     if !crate::os::map_for_pointer(at, len) || crate::os::through_dma_bufs(at, len) {
-        return refused(sel, kind, len, &no, None);
+        return refused(device, sel, codes, (at, len), then, &no, None);
     }
     let release = holding(released(codes, then, None), held);
     let imported = match pointer_refused() {
@@ -1018,7 +1053,7 @@ fn unpinnable(
             }
             Some((block, 0))
         }
-        Err(error) => refused(sel, kind, len, &no, Some(&error)),
+        Err(error) => refused(device, sel, codes, (at, len), then, &no, Some(&error)),
     }
 }
 
@@ -1045,8 +1080,9 @@ static FROM_FILES_SAID: AtomicBool = AtomicBool::new(false);
 type Then = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
 /// The release of an import for a make of `codes`, which runs `then`: one fewer import live, and,
-/// for a dma-buf's, whose block `forget` names once it is made, the host's mapping of it forgotten
-/// first ([`HostMappings`]). It makes no call into rt and drops no handle of rt's.
+/// for a dma-buf's or a copy's, whose block `forget` names once it is made, the host's mapping of
+/// it, or the pages it copies, forgotten first ([`HostMappings`]). It makes no call into rt and
+/// drops no handle of rt's.
 fn released(
     codes: crate::answer::MadeCodes,
     then: &Then,
@@ -1070,9 +1106,11 @@ fn released(
 
 /// [`released`] for a dma-buf's import, given the host's mappings it forgets its block from and
 /// the slot its block's number goes into once it is made.
+#[cfg(target_os = "linux")]
 type Released = Box<dyn FnOnce(HostMappings, Arc<OnceLock<rt::BlockId>>) -> NoCopyDeallocator>;
 
 /// The release of a dma-buf's import for a make of `codes` that runs `then` ([`released`]).
+#[cfg(target_os = "linux")]
 fn released_into(codes: crate::answer::MadeCodes, then: &Then) -> Released {
     let then = Arc::clone(then);
     Box::new(move |mapped, id| released(codes, &then, Some((mapped, id))))
@@ -1080,24 +1118,25 @@ fn released_into(codes: crate::answer::MadeCodes, then: &Then) -> Released {
 
 /// [`by_pointer`]'s import of `pages`, the `len` bytes of whole pages at their address, as a
 /// dma-buf of the files behind them, where rt refused their pointer with `error` (the module's
-/// docs, "Dma-bufs of the pages"), for a make whose imports are counted as `kind`, rt's release of
-/// it from `release`: the block, and the offset of the pages' first byte in it, whose host address
-/// the device keeps for the block ([`HostMappings`]) until rt frees it. `None` where the pages are
-/// refused too, counted: past what one dma-buf holds or with no file behind them, as rt's refusal
-/// of their pointer, and as rt's of the dma-buf where it refuses that.
+/// docs, "Dma-bufs of the pages"), for a make of `codes`, rt's release of it running `then`: the
+/// block, and the offset of the pages' first byte in it, whose host address the device keeps for
+/// the block ([`HostMappings`]) until rt frees it. Past what one dma-buf holds, with no file behind
+/// them, or where rt refuses the dma-buf, as a copy ([`refused`]). `None` where the pages are
+/// refused, counted: as rt's last refusal of them.
 #[cfg(target_os = "linux")]
 fn by_dma_buf(
     device: &RtObj<RtDevice>,
     sel: &'static str,
-    kind: &'static str,
+    codes: crate::answer::MadeCodes,
     (at, len): (NonNull<u8>, u64),
-    release: Released,
+    then: &Then,
     error: &rt::Error,
 ) -> Option<(rt::Block, u64)> {
+    let kind = codes.made;
     if matches!(error, rt::Error::Quiesced) {
         return import_refused(sel, kind, len, error);
     }
-    match dma_buf(device, (at, len), release) {
+    match dma_buf(device, (at, len), released_into(codes, then)) {
         Ok(made) => {
             dma_buf_made(sel, kind, len, error);
             Some(made)
@@ -1107,24 +1146,32 @@ fn by_dma_buf(
                 DmaBufNo::Rt(refusal) => refusal,
                 DmaBufNo::TooLarge { .. } | DmaBufNo::Refused => error,
             };
-            refused(sel, kind, len, &no, Some(last))
+            refused(device, sel, codes, (at, len), then, &no, Some(last))
         }
     }
 }
 
-/// [`import_pages`]'s import of `pages` where rt refused their pointer with `error`, off Linux:
-/// refused, counted as rt's refusal of the pointer.
+/// [`import_pages`]'s import of `pages` where rt refused their pointer with `error`, off Linux: as
+/// a copy ([`copied`]), counted as refused ([`IMPORTS_REFUSED`]); `None` where rt refuses that too,
+/// counted as rt's refusal of the pointer.
 #[cfg(not(target_os = "linux"))]
 fn by_dma_buf(
     device: &RtObj<RtDevice>,
     sel: &'static str,
-    kind: &'static str,
+    codes: crate::answer::MadeCodes,
     (at, len): (NonNull<u8>, u64),
-    release: Released,
+    then: &Then,
     error: &rt::Error,
 ) -> Option<(rt::Block, u64)> {
-    let _ = (device, at, release);
-    import_refused(sel, kind, len, error)
+    let kind = codes.made;
+    if matches!(error, rt::Error::Quiesced) {
+        return import_refused(sel, kind, len, error);
+    }
+    count_refused(kind, len);
+    let why = format!("metal2vulkan-rt refused their pointer: {error}");
+    copied(device, sel, codes, (at, len), then, &why, || {
+        rt_refused_create(sel, error);
+    })
 }
 
 /// Why a dma-buf of an import's pages was not imported ([`dma_buf`]).
@@ -1221,30 +1268,31 @@ fn dma_buf_made(sel: &'static str, kind: &'static str, len: u64, why: &dyn std::
     }
 }
 
-/// Counts the refusal of an import of `len` bytes for `sel`, for a make whose imports are counted
-/// as `kind`, whose dma-buf was refused as `no`: as too large, with its runs, or as refused; and
-/// as rt's last refusal of it, `last`, or where rt was asked for nothing past the dma-buf (the
-/// pages left in a dma-buf's mapping, [`UNMAPPED`]), as rt's limit, a gap of the platform's own.
-/// `None`.
+/// The import of `pages`, the `len` bytes of whole pages at their address, for `sel`, for a make
+/// of `codes`, whose dma-buf was refused as `no`, rt's release of it running `then`: counted as
+/// too large, with its runs, or as refused, and made as a copy ([`copied`]). `None` where rt
+/// refuses the copy too, or `last` is rt's quiescing, counted as rt's last refusal of the pages,
+/// `last`, or where rt was asked for nothing past the dma-buf (the pages left in a dma-buf's
+/// mapping, [`UNMAPPED`]), as rt's limit, a gap of the platform's own.
 #[cfg(target_os = "linux")]
-fn refused<T>(
+fn refused(
+    device: &RtObj<RtDevice>,
     sel: &'static str,
-    kind: &'static str,
-    len: u64,
+    codes: crate::answer::MadeCodes,
+    (at, len): (NonNull<u8>, u64),
+    then: &Then,
     no: &DmaBufNo,
     last: Option<&rt::Error>,
-) -> Option<T> {
+) -> Option<(rt::Block, u64)> {
+    let kind = codes.made;
     match *no {
         DmaBufNo::TooLarge { path, bytes } => {
             crate::answer::count_kind(IMPORTS_TOO_LARGE);
             super::diag::import_path(kind, path, bytes);
         }
-        DmaBufNo::Refused | DmaBufNo::Rt(_) => {
-            crate::answer::count_kind(IMPORTS_REFUSED);
-            super::diag::import_path(kind, ImportPath::Refused, len);
-        }
+        DmaBufNo::Refused | DmaBufNo::Rt(_) => count_refused(kind, len),
     }
-    match last {
+    let refuse = || match last {
         Some(error) => {
             rt_refused_create(sel, error);
         }
@@ -1252,9 +1300,69 @@ fn refused<T>(
             crate::core::platform::device::note_relayed_gap();
             super::unbuilt::refused_as(sel, super::unbuilt::RtRefusal::Limit, &UNMAPPED);
         }
+    };
+    if matches!(last, Some(rt::Error::Quiesced)) {
+        refuse();
+        return None;
     }
-    None
+    copied(device, sel, codes, (at, len), then, &no.why(), refuse)
 }
+
+/// [`import_pages`]'s import of `pages`, the `len` bytes of whole pages at their address, for
+/// `sel`, for a make of `codes`, that rt took neither by their pointer nor as a dma-buf, `why` in
+/// words: as a copy (the module's docs, "A copy at the refusal point"), whose pages the device
+/// keeps for the block ([`KnownBlocks`]) until rt frees it, rt's release of it running `then`;
+/// counted ([`IMPORTS_COPIED`]), the process's first with a line. The block, and the offset of the
+/// pages' first byte in it. `None` where rt refuses the copy too, counted by `refuse`.
+fn copied(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    codes: crate::answer::MadeCodes,
+    (at, len): (NonNull<u8>, u64),
+    then: &Then,
+    why: &dyn std::fmt::Display,
+    refuse: impl FnOnce(),
+) -> Option<(rt::Block, u64)> {
+    let homes = device.known_blocks().homes.clone();
+    let id = Arc::new(OnceLock::new());
+    let release = released(codes, then, Some((homes.clone(), Arc::clone(&id))));
+    // SAFETY: the creators' `HostRange` contracts keep the bytes mapped until their deallocator
+    // runs, which runs only from `then`, after the copy's release, once rt freed it; the pages
+    // they lie in are mapped readable and writable, as `by_pointer`'s are.
+    match unsafe { super::copied::import(device.rt(), (at, len), release) } {
+        Ok(block) => {
+            let _ = id.set(block.id);
+            (homes.0.lock()).insert(block.id, at.as_ptr().addr().to_u64());
+            crate::answer::count_kind(IMPORTS_COPIED);
+            if !COPIED_SAID.swap(true, Ordering::Relaxed) {
+                log::info!(
+                    target: TARGET,
+                    "{sel}: the pages of a no-copy buffer or heap were imported as a copy ({why}), \
+                     synced at each commit and completion; each such import is counted from here \
+                     ({IMPORTS_COPIED})"
+                );
+            }
+            Some((block, 0))
+        }
+        Err(uncopied) => {
+            if !UNCOPIED_SAID.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    target: TARGET,
+                    "{sel}: the pages of a no-copy buffer or heap were imported neither by their \
+                     pointer nor as a dma-buf ({why}), nor as a copy ({uncopied}): refused"
+                );
+            }
+            refuse();
+            None
+        }
+    }
+}
+
+/// Whether the process logged its first import made as a copy ([`copied`]).
+static COPIED_SAID: AtomicBool = AtomicBool::new(false);
+
+/// Whether the process logged its first copy refused ([`copied`]).
+static UNCOPIED_SAID: AtomicBool = AtomicBool::new(false);
 
 /// Whether the process logged its first import made as a dma-buf.
 #[cfg(target_os = "linux")]
@@ -1268,10 +1376,16 @@ fn import_refused<T>(
     len: u64,
     error: &rt::Error,
 ) -> Option<T> {
-    crate::answer::count_kind(IMPORTS_REFUSED);
-    super::diag::import_path(kind, ImportPath::Refused, len);
+    count_refused(kind, len);
     rt_refused_create(sel, error);
     None
+}
+
+/// Counts an import of `len` bytes, for a make whose imports are counted as `kind`, that neither
+/// the pages' pointer nor a dma-buf of theirs took ([`IMPORTS_REFUSED`]).
+fn count_refused(kind: &'static str, len: u64) {
+    crate::answer::count_kind(IMPORTS_REFUSED);
+    super::diag::import_path(kind, ImportPath::Refused, len);
 }
 
 #[cfg(test)]
@@ -1418,12 +1532,17 @@ impl GpuResource<RtPlatform> for RtObj<RtBuffer> {
 impl Buffer<RtPlatform> for RtObj<RtBuffer> {
     /// rt's: NULL for a Private buffer, as Metal's. A buffer in a dma-buf's block, which rt maps
     /// no bytes of, answers the host's mapping of its pages (`KnownBlocks::contents_of`, interim
-    /// until rt takes that mapping).
+    /// until rt takes that mapping), and one in a copy's block the pages it copies.
     fn contents(&self) -> HostPtr {
+        let known = self.device.known_blocks();
+        let home = known.home_of(self.rt.block());
+        if let Some(at) = home.and_then(|first| first.checked_add(self.rt.offset())) {
+            return HostPtr::from_addr(at.to_usize());
+        }
         if let Some(at) = self.rt.contents() {
             return HostPtr::from_ptr(at.as_ptr());
         }
-        let mapped = self.device.known_blocks().mapped.of(self.rt.block());
+        let mapped = known.mapped.of(self.rt.block());
         match mapped.and_then(|first| first.checked_add(self.rt.offset())) {
             Some(at) => HostPtr::from_addr(at.to_usize()),
             None => HostPtr::NULL,
@@ -2158,14 +2277,16 @@ mod tests {
     }
 
     /// On Linux, on the GPU the test holds, where the GPU takes no pointer to a no-copy buffer's
-    /// pages (`POINTER_REFUSED`, as RADV refuses a memfd's): pages with no file behind them, and
-    /// pages in more runs of file pages than one dma-buf takes, are refused, counted, a
-    /// deallocator never run. Over pages with a file behind them, the buffer is a range of rt's
-    /// import of a dma-buf of them, counted, its `contents` its bytes, which the CPU's writes and a
-    /// blit's reach both ways; a known import's block holds a no-copy buffer pinned over its bytes,
-    /// with no import of its own, and a Managed one over them is rt's refusal, counted; each
-    /// release runs once rt freed its import, and the device then forgets its mapping. Where the
-    /// device imports no dma-buf, the buffer is refused, counted, and the test says so.
+    /// pages (`POINTER_REFUSED`, as RADV refuses a memfd's): over pages with no file behind them,
+    /// and over pages in more runs of file pages than one dma-buf takes, the buffer is made over a
+    /// copy of them, counted as refused or too large and as copied, its `contents` the pages, a
+    /// deallocator run once rt freed the copy. Over pages with a file behind them, the buffer is a
+    /// range of rt's import of a dma-buf of them, counted, its `contents` its bytes, which the
+    /// CPU's writes and a blit's reach both ways; a known import's block holds a no-copy buffer
+    /// pinned over its bytes, with no import of its own, and a Managed one over them is rt's
+    /// refusal, counted; each release runs once rt freed its import, and the device then forgets
+    /// its mapping. Where the device imports no dma-buf, the buffer is made over a copy, counted,
+    /// and the test says so.
     #[cfg(target_os = "linux")]
     #[test]
     fn dma_bufs_of_pages_on_vulkan() {
@@ -2187,11 +2308,12 @@ mod tests {
             IMPORTS_DMA_BUF,
             IMPORTS_REFUSED,
             IMPORTS_TOO_LARGE,
+            IMPORTS_COPIED,
         ];
         let counts = || codes.map(counted);
-        let plus = |before: [u64; 4], i: usize| {
+        let plus = |before: [u64; 5], counted: &[usize]| {
             let mut after = before;
-            after[i] += 1;
+            counted.iter().for_each(|&i| after[i] += 1);
             after
         };
 
@@ -2205,9 +2327,11 @@ mod tests {
         // SAFETY: the memory is never freed.
         let bytes = unsafe { HostRange::new(HostPtr::from_ptr(memory), 0x1000) };
         let made = device.new_buffer_over_host_memory(on, bytes, 0, Some(Box::new(deallocator)));
-        assert!(made.expect("never a raise").is_none());
-        assert_eq!(counts(), plus(before, 2));
-        assert!(!freed.load(Ordering::Acquire));
+        let copy = made.expect("never a raise").expect("a buffer over a copy");
+        assert_eq!(counts(), plus(before, &[2, 4]));
+        assert_eq!(copy.contents(), HostPtr::from_ptr(memory));
+        drop(copy);
+        assert!(waits_for(|| freed.load(Ordering::Acquire)), "its deallocator ran");
 
         // Pages with a file behind them, the test's own, which the process ends with: 0x11s, 16
         // bytes in. Whether the host makes a dma-buf of them (udmabuf).
@@ -2239,8 +2363,9 @@ mod tests {
                 // SAFETY: the view and its pages are the test's own, never freed.
                 let bytes = unsafe { HostRange::new(view, n * page) };
                 let made = device.new_buffer_over_host_memory(on, bytes, 0, None);
-                assert!(made.expect("never a raise").is_none());
-                assert_eq!(counts(), plus(before, 3));
+                let copy = made.expect("never a raise").expect("a buffer over a copy");
+                assert_eq!(counts(), plus(before, &[3, 4]));
+                assert_eq!(copy.contents(), view);
             }
             None => eprintln!("udmabuf takes {limit:?} runs, dma-bufs {lent}: unchecked past it"),
         }
@@ -2251,12 +2376,13 @@ mod tests {
         // SAFETY: the pages are the test's own, never freed.
         let bytes = unsafe { HostRange::new(at, 1000) };
         let made = device.new_buffer_over_host_memory(on, bytes, 0, Some(Box::new(deallocator)));
-        let Some(buffer) = made.expect("never a raise") else {
-            assert_eq!(counts(), plus(before, 2));
-            eprintln!("no dma-buf imported here: refused, counted; the rest unchecked");
+        let buffer = made.expect("never a raise").expect("a buffer over the pages");
+        if !device.known_blocks().is_dma_buf(buffer.rt().block()) {
+            assert_eq!(counts(), plus(before, &[2, 4]));
+            eprintln!("no dma-buf imported here: made over a copy, counted; the rest unchecked");
             return;
-        };
-        assert_eq!(counts(), plus(before, 1));
+        }
+        assert_eq!(counts(), plus(before, &[1]));
         assert_eq!((buffer.contents(), buffer.length()), (at, 1000));
         let id = buffer.rt().block();
         assert!(device.known_blocks().is_dma_buf(id));
@@ -2448,5 +2574,122 @@ mod tests {
         let ran = || freed.load(Ordering::Acquire);
         assert!(waits_for(ran), "the deallocator ran");
         assert!(!device.known_blocks().is_dma_buf(id));
+    }
+
+    /// On the GPU the test holds, where the GPU takes no pointer to pages with no file behind them
+    /// (`POINTER_REFUSED`, as RADV refuses a memfd's) and no dma-buf of them is made: a no-copy
+    /// buffer over them is made over a copy ("A copy at the refusal point"), counted, its
+    /// `contents` the pages and rt's mapping the copy. The CPU's writes before a commit reach a
+    /// blit's read; the blit's writes reach the pages once its command buffer completed, held for a
+    /// shared event's value meanwhile, and the bytes beside them that the CPU wrote while it was
+    /// held keep the CPU's. A known import made over a copy holds a no-copy buffer pinned over its
+    /// bytes, with no import of its own. Each deallocator runs once rt freed its copy, whose pages
+    /// the device then forgets.
+    #[test]
+    fn copies_of_pages_on_vulkan() {
+        use crate::core::num::{ToU64 as _, ToUsize as _};
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
+
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        POINTER_REFUSED.set(true);
+        let page = device.facts().page_size;
+        let flag = || {
+            let ran = Arc::new(AtomicBool::new(false));
+            let run = Arc::clone(&ran);
+            (ran, move || run.store(true, Ordering::Release))
+        };
+
+        // Pages of the process's own, with no file behind them: 0x11s.
+        let layout = Layout::from_size_align((4 * page).to_usize(), page.to_usize());
+        let layout = layout.expect("a layout");
+        // SAFETY: the layout's size is not 0.
+        let memory = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!memory.is_null());
+        let at = HostPtr::from_ptr(memory);
+        // SAFETY: the memory is the test's own, never freed.
+        unsafe { memory.write_bytes(0x11, (4 * page).to_usize()) };
+        let copied = counted(IMPORTS_COPIED);
+        let (freed, deallocator) = flag();
+        // SAFETY: the memory is never freed.
+        let bytes = unsafe { HostRange::new(at, 2 * page) };
+        let made = device.new_buffer_over_host_memory(on, bytes, 0, Some(Box::new(deallocator)));
+        let buffer = made.expect("never a raise").expect("a buffer over a copy");
+        assert_eq!(counted(IMPORTS_COPIED), copied + 1);
+        assert_eq!((buffer.contents(), buffer.length()), (at, 2 * page));
+        let mapping = buffer.rt().contents().expect("rt's mapping of the copy");
+        let mapping = HostPtr::from_ptr(mapping.as_ptr());
+        assert_ne!(mapping, at);
+        assert_eq!(read(mapping, 64), [0x11; 64]);
+        let id = buffer.rt().block();
+
+        // The CPU writes 0x22s at 128 after the make, before the commit.
+        let page_at = |offset: u64| at.wrapping_add(offset).as_ptr::<u8>();
+        // SAFETY: inside the test's memory.
+        unsafe { page_at(128).write_bytes(0x22, 64) };
+        let of = |length, options| device.new_buffer_of_length(on, length, options);
+        let of = |length| of(length, 0).expect("never a raise").expect("a buffer");
+        let (out, source) = (of(64), of(64));
+        // SAFETY: the Shared buffer's 64 bytes, mapped while it lives.
+        unsafe { source.contents().as_ptr::<u8>().write_bytes(0x77, 64) };
+
+        // A blit reads them, and writes 0x77s at the second page, held for a shared event's value;
+        // meanwhile the CPU writes 0x99s beside the blit's bytes.
+        let shared = device.new_shared_event().expect("a shared event");
+        let queue = device.new_command_queue().expect("a command queue");
+        let commands = queue.command_buffer(on).expect("never a raise");
+        let commands = commands.expect("a command buffer");
+        let wait = commands.encode_wait(Some(EventRef::Shared(&shared)), 1);
+        assert_eq!(wait, Ok(()));
+        let encoder = commands.blit_encoder(on).expect("never a raise");
+        let encoder = encoder.expect("a blit encoder");
+        let copies = [(&buffer, 128, &out, 0), (&source, 0, &buffer, page)];
+        for (from, source_offset, to, destination_offset) in copies {
+            let copy = BlitCmd::CopyBufferToBuffer {
+                source_buffer: Some(from),
+                source_offset,
+                destination_buffer: Some(to),
+                destination_offset,
+                size: 64,
+            };
+            assert_eq!(encoder.encode(on, copy), Ok(()));
+        }
+        assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+        assert_eq!(commands.commit(on), Ok(()));
+        // SAFETY: inside the test's memory.
+        unsafe { page_at(page + 64).write_bytes(0x99, 8) };
+        assert_eq!(shared.set_signaled_value(1), Ok(()));
+        assert_eq!(commands.wait_until_completed(on), Ok(()));
+        assert_eq!(read(out.contents(), 64), [0x22; 64]);
+        assert_eq!(read(at.wrapping_add(page), 64), [0x77; 64]);
+        let beside = read(at.wrapping_add(page + 64), 16);
+        assert_eq!(beside, [[0x99; 8], [0x11; 8]].concat());
+
+        // A known import of the pages, made over a copy: a no-copy buffer pinned over its bytes
+        // is a range of its block, with no import of its own.
+        let first = at.wrapping_add(2 * page + 32);
+        let (released, then) = flag();
+        let known = import_known(&device, "a test's import", first, 256, then);
+        let (block, offset) = known.expect("a known import over a copy");
+        let home = device.known_blocks().contents_of(&block);
+        assert_eq!(home.map(|home| home + offset), Some(first.addr().to_u64()));
+        let (pin, imports) = (block.gpu_address + offset, counted(IMPORTS_CODE));
+        // SAFETY: the memory is never freed.
+        let bytes = unsafe { HostRange::new(first, 64) };
+        let made = device.new_buffer(pinned(pin, 0, Some(bytes)));
+        let made = made.expect("never a raise").expect("a buffer in the block");
+        assert_eq!((made.gpu_address(), made.contents()), (pin, first));
+        assert_eq!(counted(IMPORTS_CODE), imports);
+        drop(made);
+        let known = block.id;
+        assert!(device.known_blocks().forget(known).is_some());
+        drop(block);
+        assert!(waits_for(|| released.load(Ordering::Acquire)), "the release ran");
+        assert_eq!(device.known_blocks().homes.of(known), None);
+
+        drop((encoder, commands, buffer));
+        assert!(waits_for(|| freed.load(Ordering::Acquire)), "the deallocator ran");
+        assert_eq!(device.known_blocks().homes.of(id), None);
     }
 }

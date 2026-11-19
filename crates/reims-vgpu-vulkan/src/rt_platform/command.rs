@@ -20,6 +20,9 @@
 //!   the serial dispatch type or the descriptor's (another value is Metal's refusal, nil), and
 //!   render encoders ([`super::render`]) of the pass the descriptor keeps
 //!   ([`super::descriptor`]): a pass Metal refuses, or rt does, is nil, counted.
+//! - **Copies of host pages** (`super::copied`): each commit copies the CPU's writes into them
+//!   before rt is handed the command buffer, and while one is live its first completed handler
+//!   merges the GPU's writes back into their pages, before core's completion-seen handlers.
 //! - **What it keeps**: the pipeline states its encoders set ([`Kept`]), from their set until it
 //!   completes, released after its completed handlers ran.
 //! - **A signal as it is scheduled** (`encodeSignalEventScheduled:value:`) sets the shared
@@ -427,8 +430,10 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         })
     }
 
-    /// Hands rt the held handlers (the module's docs), then commits. A second commit is Metal's
-    /// refusal, counted; a commit rt refuses is counted, and its handlers never run.
+    /// Hands rt the held handlers (the module's docs), then commits, the copies of host pages
+    /// copied in first and merged back first of the completed handlers (`super::copied`). A
+    /// second commit is Metal's refusal, counted; a commit rt refuses is counted, and its handlers
+    /// never run.
     fn commit(&self, on: OnFault) -> RaiseResult<()> {
         let _ = on;
         let sel = "commit";
@@ -450,6 +455,9 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         };
         submission.extend(scheduled);
         seen.extend(completed);
+        if let Some(merge) = super::copied::merging() {
+            seen.insert(0, Box::new(merge));
+        }
         self.kept.uses().submitted();
         let kept = self.kept.take();
         if !kept.is_empty() {
@@ -465,6 +473,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
             if !seen.is_empty() {
                 self.rt.add_completed_handler(run(seen))?;
             }
+            super::copied::copy_in();
             self.rt.commit()
         };
         if let Err(error) = committed() {
