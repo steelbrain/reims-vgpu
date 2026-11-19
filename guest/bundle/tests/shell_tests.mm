@@ -20978,6 +20978,9 @@ void test_iosurface_keep()
 	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region
 }
 
+// A surface whose ask in place the device or the kext refuses gets a copy in its shared block,
+// counted by why; where the device caches every surface in place (SURFACE_CACHE_EVERY) the copy
+// is the fallback, still made and counted.
 void test_iosurface_in_place_fallback()
 {
 	Fixture fx;
@@ -21028,9 +21031,26 @@ void test_iosurface_in_place_fallback()
 		return true;
 	};
 	int asked = 0, copies = 0;
-	for (RgfxRegion::PagesAnswer answer :
-	     {RgfxRegion::kPagesUnsupported, RgfxRegion::kPagesRefused}) {
+	// Where the device caches every surface the kext gives in place, a refused ask is still a
+	// copy, counted by its reason: never nil.
+	struct Case {
+		bool cacheEvery;
+		RgfxRegion::PagesAnswer answer;
+		RgfxSurfaceCopyReason reason;
+	};
+	for (const Case &c : {
+	         Case{false, RgfxRegion::kPagesUnsupported, kRgfxSurfaceCopiedUnsupported},
+	         Case{false, RgfxRegion::kPagesRefused, kRgfxSurfaceCopiedRefused},
+	         Case{true, RgfxRegion::kPagesUnsupported, kRgfxSurfaceCopiedUnsupported},
+	         Case{true, RgfxRegion::kPagesRefused, kRgfxSurfaceCopiedRefused},
+	         Case{true, RgfxRegion::kPagesNoRoom, kRgfxSurfaceCopiedNoRoom},
+	     }) {
+		const RgfxRegion::PagesAnswer answer = c.answer;
 		src.answer = answer;
+		rgfxIOSurfaceSetCacheEvery(c.cacheEvery);
+		uint64_t before[kRgfxSurfaceCopyReasons];
+		for (uint32_t k = 0; k < kRgfxSurfaceCopyReasons; k++)
+			before[k] = rgfxIOSurfaceCopiedViews(static_cast<RgfxSurfaceCopyReason>(k));
 		NSDictionary *props = @{
 			(id)kIOSurfaceWidth : @16,
 			(id)kIOSurfaceHeight : @16,
@@ -21070,6 +21090,9 @@ void test_iosurface_in_place_fallback()
 			      made.texture.writers_offset == 4096 + kSurfaceHeader);
 			CHECK(blockIs(0x2468ace0 + answer) && ringEmpty(fx.ring));
 			CHECK([(id<RgfxMetalTextureInternals>)t gpuAddress] != 0 && t.allocatedSize == 8192);
+			for (uint32_t k = 0; k < kRgfxSurfaceCopyReasons; k++)
+				CHECK(rgfxIOSurfaceCopiedViews(static_cast<RgfxSurfaceCopyReason>(k)) ==
+				      before[k] + (k == c.reason ? 1 : 0));
 		}
 		rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 		drainRing(fx.ring);
@@ -21077,6 +21100,7 @@ void test_iosurface_in_place_fallback()
 		      src.released.back() == src.offset);
 		CFRelease(s);
 	}
+	rgfxIOSurfaceSetCacheEvery(false);
 	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region
 }
 

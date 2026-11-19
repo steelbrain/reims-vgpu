@@ -305,6 +305,25 @@ void rgfxIOSurfaceSetOrder(bool on);
 /// the kext answers surfaces' seeds (kRgfxKextFeatureSurfaceSeeds), as the device is made.
 void rgfxIOSurfaceSetRefill(bool on);
 
+/// Why a GPU view of a surface is a copy of its planes in a block, not its pages in place.
+enum RgfxSurfaceCopyReason : uint32_t {
+	kRgfxSurfaceCopiedAlignment,   // a plane where no host texture lies over it in place
+	kRgfxSurfaceCopiedUnsupported, // no view in place on the device, or of the surface's pages
+	kRgfxSurfaceCopiedRefused,     // the kext gave no block in place
+	kRgfxSurfaceCopiedNoRoom,      // the kext had no room for its block in place
+	kRgfxSurfaceCopyReasons
+};
+
+/// Whether the device caches every surface the kext gives in place: where the device's feature
+/// word holds RGFX_FEATURE_SURFACE_CACHE_EVERY, as the device is made. A view that is a copy is
+/// then the fallback: still made, counted by its reason (rgfxIOSurfaceCopiedViews), the first of
+/// each reason in the process logged at the default level with the surface's format and shape,
+/// and the minute's summary of copies at the default level where any was made in it.
+void rgfxIOSurfaceSetCacheEvery(bool on);
+
+/// How many GPU views of surfaces the process made as copies for `reason` (for the tests).
+uint64_t rgfxIOSurfaceCopiedViews(RgfxSurfaceCopyReason reason);
+
 /// The textures over IOSurfaces, or views of them, bound at the indexes of one stage of an
 /// encoder, so that each draw or dispatch names as written those its function writes there. A
 /// binding of any other texture, or of nil, drops the index's.

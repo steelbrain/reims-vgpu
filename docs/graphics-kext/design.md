@@ -5066,6 +5066,40 @@ device took the feature.
   Buffers over read-only memory (on the Vulkan platform), over memory the
   bundle copies, and Managed ones keep theirs.
 
+**Every surface cached.** Where the guest took `SURFACE_CACHE_EVERY` (feature
+bit 62), the host's GPU form of every IOSurface is its device cache: it keeps
+one for every block in place named cached, lays no texture over a surface's
+pages, and refuses a block in place named uncached. A host offers it where its
+platform caches every surface (metal2vulkan-rt's per-shape form) and it offers
+`POOL`; both kexts take it, read with `SURFACE_CACHE`. A surface's copy block
+is then a second copy beside the device cache its other holders use, so the
+guest keeps it only as the fallback, counted by why.
+- **The kext.** A block in place is cached or not made. An ask in place that
+  names no surface, or asks no cache (the bundle's video outputs where the
+  host lands no picture in one), is refused before anything is posted
+  (`uncacheable`); one whose IOSurface device cache the kext cannot make, or
+  whose deferral comes back uncached, goes back as if never made, nothing
+  posted (`no device cache`). The kext asks the device nothing
+  (`RGFX_SURFACE_PAGES_ASK_CACHE` is not sent). Its tables grow rather than
+  refuse: a block's holders past 16 into an array of its own, doubled each
+  time; the table of the surfaces' blocks by chunks of 512 entries, up to 32,
+  which never move, before a dormant block gives its entry; and the table of
+  the cached surfaces into a larger array. It counts the asks in place it
+  refuses by why, and the copy blocks made and held again, logging the first
+  of each, with all of them and the growths on a line beside the dormancy
+  line ("every surface cached").
+- **The bundle.** A view not in place is still a copy, made as before, never
+  nil: counted by why (alignment, unsupported, refused by the kext, no room in
+  the kext) in the minute's surface copies line, which is logged at the
+  default level where a copy was made in that minute, and the first of each
+  reason logged at the default level with the surface's format and shape
+  (`rgfxIOSurfaceSetCacheEvery`).
+- **What the guest sees.** No Metal answer changes: a texture over a surface
+  is in place or over a copy, as before. A process's surface whose block the
+  kext refused uncacheable or uncached is a copy where it lay in place
+  uncached before; on the host that offers the bit, the host refused such a
+  block's pages all the same.
+
 **A buffer's escaped identity.** The host reads a no-copy buffer's bytes in
 place: one over bytes in a block of the process's (`BUFFER_OVER_HOST_MEMORY`),
 or over pages the process maps, writable or read-only (`BUFFER_OVER_PAGES`),

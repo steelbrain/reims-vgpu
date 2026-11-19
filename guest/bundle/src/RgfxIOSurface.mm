@@ -416,9 +416,11 @@ private:
 	IOSurfaceRef m_surface;
 	uint32_t m_seed = 0;
 };
-std::atomic<uint64_t> gCopiedAlignment{0};   // a plane where no host texture lies over it
-std::atomic<uint64_t> gCopiedUnsupported{0}; // no view in place on the device, or of its pages
-std::atomic<uint64_t> gCopiedRefused{0};     // the kext gave no block in place
+std::atomic<uint64_t> gCopied[kRgfxSurfaceCopyReasons] = {};
+/// The device caches every surface the kext gives in place (rgfxIOSurfaceSetCacheEvery): a view
+/// that is a copy is then a fallback, the first of each reason logged at the default level, and
+/// the copies' summary too where any was made since the last.
+std::atomic<bool> gCacheEvery{false};
 // The copies made: in the surface's shared block, or, where the kext gave none, in a block of
 // the process's own, which no other holder shares (its GPU sees theirs only through the pages).
 std::atomic<uint64_t> gCopyShared{0};
@@ -456,7 +458,7 @@ void reportCopies(uint64_t now)
 	static std::mutex lock;
 	static uint64_t last = 0, upCount = 0, upBytes = 0, upNs = 0, upMidWrite = 0, syncsAtUnlock = 0,
 	                unlockAsks = 0, wbCount = 0, wbBytes = 0, wbNs = 0, inPlace = 0, cached = 0,
-	                forAlignment = 0, unsupported = 0, refused = 0, shared = 0, own = 0,
+	                forAlignment = 0, unsupported = 0, refused = 0, noRoom = 0, shared = 0, own = 0,
 	                namedMidWrite = 0, refills = 0, refillAsks = 0;
 	std::unique_lock<std::mutex> g(lock, std::try_to_lock);
 	if (!g.owns_lock()) {
@@ -473,27 +475,33 @@ void reportCopies(uint64_t now)
 	         ul = gSyncsAtUnlock, ua = gUnlockAsks;
 	const int seeds = gSurfaceSeeds.load(std::memory_order_relaxed);
 	uint64_t wc = gWriteBacks.count, wb = gWriteBacks.bytes, wn = gWriteBacks.ns;
-	uint64_t ip = gInPlace, cc = gCached, ca = gCopiedAlignment, cu = gCopiedUnsupported,
-	         cr = gCopiedRefused, cs = gCopyShared, co = gCopyOwn;
+	uint64_t ip = gInPlace, cc = gCached, ca = gCopied[kRgfxSurfaceCopiedAlignment],
+	         cu = gCopied[kRgfxSurfaceCopiedUnsupported], cr = gCopied[kRgfxSurfaceCopiedRefused],
+	         cn = gCopied[kRgfxSurfaceCopiedNoRoom], cs = gCopyShared, co = gCopyOwn;
 	uint64_t nm = gNamedMidWrite, rf = gRefillsAtUnlock, ra = gRefillAsks;
+	// Where every surface the kext gives in place is cached, a copy is a fallback: the line
+	// reaches the default level once copies were made since the last.
+	const bool fallback = gCacheEvery.load(std::memory_order_relaxed) &&
+	                      ca + cu + cr + cn != forAlignment + unsupported + refused + noRoom;
 	// The process's id and name are the log's own.
-	os_log_info(rgfxLog(),
-	            "RGFX: surface copies, %.1f s, unlock seeds %{public}s: %llu uploads %.1f MiB "
-	            "%.2f ms (%llu mid-write, %llu synced again at the unlock, %llu asks for it), "
-	            "%llu write-backs %.1f MiB %.2f ms; views made: %llu in place (%llu cached), "
-	            "copies %llu for alignment, %llu unsupported, %llu refused by the kext; copy "
-	            "blocks: %llu shared, %llu own; cached surfaces: %llu named mid-write, %llu filled "
-	            "again at the unlock, %llu asks for it",
-	            (now - last) / 1e9, seeds > 0 ? "on" : seeds == 0 ? "off" : "unknown",
-	            uc - upCount, (ub - upBytes) / 1048576.0, (un - upNs) / 1e6, um - upMidWrite,
-	            ul - syncsAtUnlock, ua - unlockAsks, wc - wbCount, (wb - wbBytes) / 1048576.0,
-	            (wn - wbNs) / 1e6, ip - inPlace, cc - cached, ca - forAlignment, cu - unsupported,
-	            cr - refused, cs - shared, co - own, nm - namedMidWrite, rf - refills,
-	            ra - refillAsks);
+	os_log_with_type(rgfxLog(), fallback ? OS_LOG_TYPE_DEFAULT : OS_LOG_TYPE_INFO,
+	                 "RGFX: surface copies, %.1f s, unlock seeds %{public}s: %llu uploads %.1f MiB "
+	                 "%.2f ms (%llu mid-write, %llu synced again at the unlock, %llu asks for it), "
+	                 "%llu write-backs %.1f MiB %.2f ms; views made: %llu in place (%llu cached), "
+	                 "copies %llu for alignment, %llu unsupported, %llu refused by the kext, %llu "
+	                 "with no room in the kext; copy blocks: %llu shared, %llu own; cached "
+	                 "surfaces: %llu named mid-write, %llu filled again at the unlock, %llu asks "
+	                 "for it",
+	                 (now - last) / 1e9, seeds > 0 ? "on" : seeds == 0 ? "off" : "unknown",
+	                 uc - upCount, (ub - upBytes) / 1048576.0, (un - upNs) / 1e6, um - upMidWrite,
+	                 ul - syncsAtUnlock, ua - unlockAsks, wc - wbCount, (wb - wbBytes) / 1048576.0,
+	                 (wn - wbNs) / 1e6, ip - inPlace, cc - cached, ca - forAlignment,
+	                 cu - unsupported, cr - refused, cn - noRoom, cs - shared, co - own,
+	                 nm - namedMidWrite, rf - refills, ra - refillAsks);
 	last = now;
 	upCount = uc, upBytes = ub, upNs = un, upMidWrite = um, syncsAtUnlock = ul, unlockAsks = ua;
 	wbCount = wc, wbBytes = wb, wbNs = wn;
-	inPlace = ip, cached = cc, forAlignment = ca, unsupported = cu, refused = cr;
+	inPlace = ip, cached = cc, forAlignment = ca, unsupported = cu, refused = cr, noRoom = cn;
 	shared = cs, own = co;
 	namedMidWrite = nm, refills = rf, refillAsks = ra;
 }
@@ -513,6 +521,22 @@ void countView(std::atomic<uint64_t> &c)
 {
 	c.fetch_add(1, std::memory_order_relaxed);
 	reportCopies(nowNs());
+}
+
+const char *const kCopyReasonNames[kRgfxSurfaceCopyReasons] = {
+    "alignment", "unsupported", "refused by the kext", "no room in the kext"};
+
+/// Counts a view of `surface` made as a copy for `reason`. Where every surface the kext gives in
+/// place is cached (gCacheEvery), the copy is a fallback: the first of each reason in the process
+/// is logged at the default level, with the surface's format and shape.
+void countCopy(RgfxSurfaceCopyReason reason, IOSurfaceRef surface)
+{
+	countView(gCopied[reason]);
+	static char site;
+	if (gCacheEvery.load(std::memory_order_relaxed) && rgfxLogFirst(&site, reason + 1))
+		rgfxLogLine(@"RGFX: every surface in place is cached, but a view of %s is a copy (%s): "
+		            @"its reason's count is in the surface copies line",
+		            describe(surface).c_str(), kCopyReasonNames[reason]);
 }
 
 } // namespace
@@ -1135,10 +1159,10 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 		RgfxRegion::SurfaceBlock sharedBlock = {};
 		std::string notInPlace; // why the view is a copy
 		if (!region->hasSurfacePages()) {
-			countView(gCopiedUnsupported);
+			countCopy(kRgfxSurfaceCopiedUnsupported, surface);
 			notInPlace = "the device uses no surface in place";
 		} else if (!placeInPlace(surface, &own, region->surfacePagesAlignment(), &notInPlace)) {
-			countView(gCopiedAlignment);
+			countCopy(kRgfxSurfaceCopiedAlignment, surface);
 		} else {
 			// The bundle asks a device cache for every surface, of any planes and format, as a
 			// GPU of its own memory keeps a copy of each surface it uses: a video frame the GPU
@@ -1165,13 +1189,13 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 				}
 				countView(gInPlace);
 			} else if (answer == RgfxRegion::kPagesUnsupported) {
-				countView(gCopiedUnsupported);
+				countCopy(kRgfxSurfaceCopiedUnsupported, surface);
 				notInPlace = "the device uses no surface in place, or refused its pages";
 			} else if (answer == RgfxRegion::kPagesNoRoom) {
-				countView(gCopiedRefused);
+				countCopy(kRgfxSurfaceCopiedNoRoom, surface);
 				notInPlace = "the kext had no room for its block in place";
 			} else {
-				countView(gCopiedRefused);
+				countCopy(kRgfxSurfaceCopiedRefused, surface);
 				notInPlace = "the kext gave no block in place";
 			}
 		}
@@ -1947,6 +1971,16 @@ void rgfxIOSurfaceSetOrder(bool on)
 void rgfxIOSurfaceSetRefill(bool on)
 {
 	gRefill.store(on, std::memory_order_relaxed);
+}
+
+void rgfxIOSurfaceSetCacheEvery(bool on)
+{
+	gCacheEvery.store(on, std::memory_order_relaxed);
+}
+
+uint64_t rgfxIOSurfaceCopiedViews(RgfxSurfaceCopyReason reason)
+{
+	return reason < kRgfxSurfaceCopyReasons ? gCopied[reason].load(std::memory_order_relaxed) : 0;
 }
 
 /// Each slot of `rec` that names a queue other than `own`, read as the host reads a writer (its
