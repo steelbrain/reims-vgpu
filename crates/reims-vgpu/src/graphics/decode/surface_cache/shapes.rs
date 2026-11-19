@@ -685,7 +685,9 @@ mod tests {
     /// On the Vulkan platform, shapes over one cache's buffer, of three formats, sizes and places,
     /// each an image of Metal's Unknown usage made as the per-shape form makes it, take the
     /// buffer's bytes at their place and the buffer's pitch ([`fill`]), and a view of each at a
-    /// guest's resource index reads them; a fill of the shapes that owe one then encodes nothing
+    /// guest's resource index reads them; dirty, the two inside the whole go back into a buffer of
+    /// zeros at their place and the buffer's pitch ([`write_back`]), and nothing else does; a fill
+    /// of the shapes that owe one then encodes nothing
     #[test]
     fn on_vulkan_each_shape_takes_the_buffers_bytes_at_its_place() {
         use reims_vgpu_vulkan::core::num::ToUsize as _;
@@ -805,6 +807,37 @@ mod tests {
                 assert_eq!(got, want, "format {pixel_format}, row {y}");
             }
         }
+        // The two inside the whole, dirty, written back into a buffer of zeros.
+        let back = device.new_buffer_of_length(ON, length, 0).unwrap().unwrap();
+        // SAFETY: a Shared buffer of `length` bytes, which no command uses yet.
+        unsafe { std::ptr::write_bytes(back.contents().as_ptr::<u8>(), 0, length.to_usize()) };
+        let inner: Vec<u64> = (table.iter())
+            .filter(|s| s.key.width < 64)
+            .map(|s| s.id())
+            .collect();
+        for &id in &inner {
+            assert!(table.mark_dirty(id));
+        }
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        let written = write_back::<V>(&cb, &back, &table, |s| s.dirty).unwrap();
+        cb.commit(ON).unwrap();
+        cb.wait_until_completed(ON).unwrap();
+        assert_eq!(written, inner);
+        table.written_back(&written, &mut counts);
+        assert_eq!(counts.written_back_bytes, 16 * 8 * 2 + 8 * 4 * 4);
+        assert!(table.iter().all(|s| !s.dirty));
+        let mut want = vec![0u8; length.to_usize()];
+        for &(_, texel_bytes, width, height, offset) in &cases[1..] {
+            let row = (width * texel_bytes).to_usize();
+            for y in 0..height {
+                let at = (offset + y * ROW).to_usize();
+                want[at..at + row].copy_from_slice(&bytes[at..at + row]);
+            }
+        }
+        // SAFETY: the Shared buffer's bytes, which no command writes any more.
+        let read =
+            unsafe { std::slice::from_raw_parts(back.contents().as_ptr::<u8>(), length.to_usize()) };
+        assert!(read == want.as_slice(), "the inner shapes alone, at their places");
         // Nothing owes a fill now: nothing is encoded, nothing counted.
         let cb = queue.command_buffer(ON).unwrap().unwrap();
         fill::<V>(&cb, &buffer, &mut table, |s| s.owed, &mut counts).unwrap();
