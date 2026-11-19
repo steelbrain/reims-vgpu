@@ -9,6 +9,10 @@ use reims_vgpu_vulkan::core::platform::Platform;
 use super::*;
 
 impl ApiPlatform for RtPlatform {
+    /// rt keeps no texture over a device cache's buffer: each is a view of its shape's image
+    /// (`graphics::decode::surface_shapes`), and every surface is cached.
+    const SURFACE_SHAPES: bool = true;
+
     fn process() -> Arc<RtPlatform> {
         crate::singleton::rt_platform()
     }
