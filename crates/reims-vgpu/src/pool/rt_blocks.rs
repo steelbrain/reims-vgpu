@@ -147,7 +147,10 @@ mod tests {
         let again = blocks.take_block(MemoryClass::Shared, 64 * MIB).unwrap();
         let after = device.counters().metrics();
         assert!(again.id > long.id, "{again:?} after {long:?}");
-        assert_eq!(again.gpu_address, long.gpu_address, "{again:?} after {long:?}");
+        assert_eq!(
+            again.gpu_address, long.gpu_address,
+            "{again:?} after {long:?}"
+        );
         assert_eq!(
             (
                 after.shared_long_reuses - before.shared_long_reuses,
