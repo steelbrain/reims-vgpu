@@ -247,106 +247,138 @@ mod tests {
             .map_or(0, |(_, n)| n)
     }
 
-    /// An NV12 picture's two planes, R8Unorm and RG8Unorm of half its size each way, sampled,
-    /// rendered and viewed in another format, as the IOSurface device caches ask them.
-    fn nv12(width: u64, height: u64) -> [SurfacePlaneDesc; 2] {
+    /// A 4:2:0 picture's two planes of `formats` (luma's, then chroma's at half its size each
+    /// way), sampled, rendered and viewed in another format, each with the room below its rows
+    /// the IOSurface device caches ask (a multiple of 64 luma rows, 32 chroma).
+    fn planes(formats: [u64; 2], width: u64, height: u64) -> [SurfacePlaneDesc; 2] {
         let usage = 0x1 | 0x4 | 0x10;
+        let plane = |format: u64, width: u64, height: u64, coded: u64| SurfacePlaneDesc {
+            pixel_format: format,
+            width,
+            height,
+            usage,
+            rows_below: u32::try_from(height.next_multiple_of(coded) - height).expect("rows"),
+        };
         [
-            SurfacePlaneDesc {
-                pixel_format: 10,
-                width,
-                height,
-                usage,
-                rows_below: 0,
-            },
-            SurfacePlaneDesc {
-                pixel_format: 30,
-                width: width.div_ceil(2),
-                height: height.div_ceil(2),
-                usage,
-                rows_below: 0,
-            },
+            plane(formats[0], width, height, 64),
+            plane(formats[1], width.div_ceil(2), height.div_ceil(2), 32),
         ]
     }
 
-    /// Exported surfaces of a 1080p NV12 picture's planes on the GPU the test holds, of each
-    /// handle its device exports: two plane textures of the planes' formats and sizes, the layout
-    /// plane 0 at 0 and plane 1 past its rows at one pitch on the multiples; each export a new fd
-    /// of the whole allocation, dedicated but for an opaque fd in place; the acquire taken; each
-    /// make counted by its form. An R8Uint view of plane 0 and an RG8Uint view of plane 1 are
-    /// made where the surface is in place. A handle the device does not export is refused,
-    /// counted, and answers `None`.
+    /// Whether the device the test holds exports a buffer's memory as `handle`: rt's copy form
+    /// of a surface is such an export, so a device that exports one makes every surface.
+    fn exports(device: &RtObj<RtDevice>, handle: SurfaceHandle) -> bool {
+        let on = OnFault::Return;
+        let made = match handle {
+            SurfaceHandle::OpaqueFd => device.new_exportable_buffer_of_length(on, 4096, 0x20, None),
+            SurfaceHandle::DmaBuf => {
+                device.new_dma_buf_buffer_of_length_padding_unobserved(on, 4096, 0x20, None)
+            }
+        };
+        made.expect("never a raise").is_some()
+    }
+
+    /// Exported surfaces of a 1080p NV12 picture's planes and a 2160p P010 picture's on the GPU
+    /// the test holds, of each handle its device exports a buffer's memory as, which rt makes in
+    /// place or in the copy form, never refusing: two plane textures of the planes' formats and
+    /// sizes, sampled at no index of their own; the layout plane 0 at 0 and plane 1 past its rows
+    /// and the room below them, at one pitch, on the multiples; each export a new fd of the whole
+    /// allocation, dedicated but for an opaque fd in place; the acquire taken; each make counted
+    /// by its form. Views of the planes in the unsigned format of the texel's size (R8Uint and
+    /// RG8Uint, R16Uint and RG16Uint) are made where the surface is in place. A handle the device
+    /// exports no buffer as is refused, counted, and answers `None`.
     #[test]
     fn exported_surfaces_on_vulkan() {
         use std::os::fd::AsRawFd as _;
         let platform = RtPlatform::new();
         let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
-        let planes = nv12(1920, 1080);
+        // NV12 (R8Unorm, RG8Unorm; views R8Uint, RG8Uint) and P010 (R16Unorm, RG16Unorm; views
+        // R16Uint, RG16Uint), each with its luma texel's bytes.
+        let shapes = [
+            ([10, 30], [13, 33], 1920, 1080, 1),
+            ([20, 60], [23, 63], 3840, 2160, 2),
+        ];
         for handle in [SurfaceHandle::OpaqueFd, SurfaceHandle::DmaBuf] {
-            let desc = SurfaceDesc {
-                handle,
-                pitch_multiple: 256,
-                start_multiple: 256,
-                planes: &planes,
-            };
-            let counts = [
-                SURFACES_IN_PLACE_CODE,
-                SURFACES_COPIED_CODE,
-                SURFACE_REFUSED_CODE,
-            ]
-            .map(counted);
-            let made = device.new_exported_surface(OnFault::Return, &desc);
-            let Some(surface) = made.expect("never a raise") else {
-                assert_eq!(counted(SURFACE_REFUSED_CODE), counts[2] + 1);
-                println!("{handle:?}: refused, counted");
-                continue;
-            };
-            let memory = &surface.memory;
-            let form = if memory.in_place() { 0 } else { 1 };
-            assert_eq!(
-                counted([SURFACES_IN_PLACE_CODE, SURFACES_COPIED_CODE][form]),
-                counts[form] + 1
-            );
-            assert_eq!(memory.handle(), handle);
-            let [luma, chroma] = surface.planes.as_slice() else {
-                panic!("two planes");
-            };
-            assert_eq!(
-                (luma.pixel_format(), luma.width(), luma.height()),
-                (10, 1920, 1080)
-            );
-            assert_eq!(
-                (chroma.pixel_format(), chroma.width(), chroma.height()),
-                (30, 960, 540)
-            );
-            let layout = memory.layout();
-            assert_eq!(layout.len(), 2);
-            let pitch = layout[0].row_pitch;
-            assert_eq!(layout[0].offset, 0);
-            assert_eq!(layout[1].row_pitch, pitch);
-            assert!(pitch >= 1920 && pitch % 256 == 0, "pitch {pitch}");
-            assert!(layout[1].offset >= 1080 * pitch && layout[1].offset % 256 == 0);
-            let first = memory.export().expect("an export");
-            let second = memory.export().expect("another");
-            assert_ne!(first.fd.as_raw_fd(), second.fd.as_raw_fd());
-            assert_eq!((first.offset, first.length), (0, first.allocation_size));
-            assert!(first.allocation_size >= layout[1].offset + 540 * pitch);
-            let opaque_in_place = memory.in_place() && handle == SurfaceHandle::OpaqueFd;
-            assert_eq!(first.dedicated, !opaque_in_place);
-            assert_eq!(memory.external_writes_done(), Ok(()));
-            if memory.in_place() {
-                let luma_view = luma.new_texture_view_at_index(13, 0);
-                let chroma_view = chroma.new_texture_view_at_index(33, 0);
-                assert!(
-                    luma_view.expect("never a raise").is_some(),
-                    "an R8Uint view"
+            let exported = exports(&device, handle);
+            for (formats, views, width, height, texel) in shapes {
+                let planes = planes(formats, width, height);
+                let desc = SurfaceDesc {
+                    handle,
+                    pitch_multiple: 256,
+                    start_multiple: 256,
+                    planes: &planes,
+                };
+                let counts = [
+                    SURFACES_IN_PLACE_CODE,
+                    SURFACES_COPIED_CODE,
+                    SURFACE_REFUSED_CODE,
+                ]
+                .map(counted);
+                let made =
+                    (device.new_exported_surface(OnFault::Return, &desc)).expect("never a raise");
+                let Some(surface) = made else {
+                    assert!(
+                        !exported,
+                        "{handle:?}, {width}x{height}: refused where the device exports the handle"
+                    );
+                    assert_eq!(counted(SURFACE_REFUSED_CODE), counts[2] + 1);
+                    println!("{handle:?}: the device exports none: refused, counted");
+                    continue;
+                };
+                let memory = &surface.memory;
+                let form = if memory.in_place() { 0 } else { 1 };
+                assert_eq!(
+                    counted([SURFACES_IN_PLACE_CODE, SURFACES_COPIED_CODE][form]),
+                    counts[form] + 1
                 );
-                assert!(
-                    chroma_view.expect("never a raise").is_some(),
-                    "an RG8Uint view"
+                assert_eq!(counted(SURFACE_REFUSED_CODE), counts[2]);
+                assert_eq!(memory.handle(), handle);
+                let [luma, chroma] = surface.planes.as_slice() else {
+                    panic!("two planes");
+                };
+                assert_eq!(
+                    (luma.pixel_format(), luma.width(), luma.height()),
+                    (formats[0], width, height)
+                );
+                assert_eq!(
+                    (chroma.pixel_format(), chroma.width(), chroma.height()),
+                    (formats[1], width / 2, height / 2)
+                );
+                let layout = memory.layout();
+                assert_eq!(layout.len(), 2);
+                let pitch = layout[0].row_pitch;
+                let rows = planes.map(|p| p.height + u64::from(p.rows_below));
+                assert_eq!(layout[0].offset, 0);
+                assert_eq!(layout[1].row_pitch, pitch);
+                assert!(pitch >= width * texel && pitch % 256 == 0, "pitch {pitch}");
+                assert!(layout[1].offset >= rows[0] * pitch && layout[1].offset % 256 == 0);
+                let first = memory.export().expect("an export");
+                let second = memory.export().expect("another");
+                assert_ne!(first.fd.as_raw_fd(), second.fd.as_raw_fd());
+                assert_eq!((first.offset, first.length), (0, first.allocation_size));
+                assert!(first.allocation_size >= layout[1].offset + rows[1] * pitch);
+                let opaque_in_place = memory.in_place() && handle == SurfaceHandle::OpaqueFd;
+                assert_eq!(first.dedicated, !opaque_in_place);
+                assert_eq!(memory.external_writes_done(), Ok(()));
+                if memory.in_place() {
+                    let luma_view = luma.new_texture_view_at_index(views[0], 0);
+                    let chroma_view = chroma.new_texture_view_at_index(views[1], 0);
+                    assert!(
+                        luma_view.expect("never a raise").is_some(),
+                        "a luma view in {}",
+                        views[0]
+                    );
+                    assert!(
+                        chroma_view.expect("never a raise").is_some(),
+                        "a chroma view in {}",
+                        views[1]
+                    );
+                }
+                println!(
+                    "{handle:?}, {width}x{height}: in place {}, pitch {pitch}",
+                    memory.in_place()
                 );
             }
-            println!("{handle:?}: in place {}, pitch {pitch}", memory.in_place());
         }
     }
 }
