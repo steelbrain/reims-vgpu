@@ -562,7 +562,11 @@ mod tests {
         };
         // 4-sample Depth32Float and RGBA16Float targets, the shapes a GPU aligns most, and a
         // single-sample RGBA8Unorm one.
-        let shapes = [shape(4, 252, 256, 4), shape(4, 115, 256, 4), shape(2, 70, 512, 1)];
+        let shapes = [
+            shape(4, 252, 256, 4),
+            shape(4, 115, 256, 4),
+            shape(2, 70, 512, 1),
+        ];
         let (texture, sized) = (shapes.iter())
             .filter_map(|desc| {
                 let texture = platform.texture_descriptor(desc);

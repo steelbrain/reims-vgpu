@@ -652,7 +652,10 @@ mod tests {
         let metal = RtRefusal::Refused.code();
         let (before, metals) = (counted(HEAP_TEXTURE_PLACE), counted(metal));
         let sel = "newTextureWithDescriptor:offset:";
-        assert_eq!(rt_refused_texture(sel, &place(0, 0xc_0000)), RtRefusal::Refused);
+        assert_eq!(
+            rt_refused_texture(sel, &place(0, 0xc_0000)),
+            RtRefusal::Refused
+        );
         let (kind, relayed) =
             relaying_gaps(|| rt_refused_texture_create(sel, &place(0x14_0000, 0xc_0000)));
         assert_eq!(kind, RtRefusal::Refused);
@@ -664,8 +667,14 @@ mod tests {
         assert_eq!(counted(HEAP_TEXTURE_PLACE), before + 3);
         assert_eq!(counted(metal), metals);
         // Metal's own refusals: off the alignment, past the heap's end.
-        assert_eq!(rt_refused_texture(sel, &place(0x8000, 0x1000)), RtRefusal::Refused);
-        assert_eq!(rt_refused_texture(sel, &place(0x18_0000, 0xc_0000)), RtRefusal::Refused);
+        assert_eq!(
+            rt_refused_texture(sel, &place(0x8000, 0x1000)),
+            RtRefusal::Refused
+        );
+        assert_eq!(
+            rt_refused_texture(sel, &place(0x18_0000, 0xc_0000)),
+            RtRefusal::Refused
+        );
         assert_eq!(counted(HEAP_TEXTURE_PLACE), before + 3);
         assert!(counted(metal) >= metals + 2, "{metal}");
     }
