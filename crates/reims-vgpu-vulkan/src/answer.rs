@@ -4227,7 +4227,9 @@ mod tests {
         assert_eq!(making_as(INNER, making), Some(INNER));
         assert_eq!(making(), None);
         assert_eq!(refusing(), None);
-        let seen = refusing_as("test-outer", || (refusing(), refusing_as("test-inner", refusing)));
+        let seen = refusing_as("test-outer", || {
+            (refusing(), refusing_as("test-inner", refusing))
+        });
         assert_eq!(seen, (Some("test-outer"), Some("test-outer")));
         assert_eq!(refusing_as("test-inner", refusing), Some("test-inner"));
         assert_eq!(refusing(), None);

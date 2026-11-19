@@ -1190,8 +1190,14 @@ mod tests {
             // SAFETY: the block's mapping lives while the test holds the block.
             let bytes = unsafe { HostRange::new(written, 64) };
             let made = device.new_buffer(pinned(pin, options, Some(bytes)));
-            let made = made.expect("never a raise").expect("a buffer over the block");
-            let at = if kept { pin } else { shared.gpu_address + 0x100 };
+            let made = made
+                .expect("never a raise")
+                .expect("a buffer over the block");
+            let at = if kept {
+                pin
+            } else {
+                shared.gpu_address + 0x100
+            };
             assert_eq!((made.gpu_address(), made.contents()), (at, written));
         }
         assert_eq!(counted(IMPORTS_CODE), imports);
