@@ -240,6 +240,10 @@
 //! no import. What would make its view is kept with it ([`Unmade`]): the cache makes the view
 //! where the platform refuses a copy, or where it makes no cache, and the block then lies over
 //! the view as any other. A block whose runs leave the RAM's mapping takes its view as before.
+//! Where the device caches' copies are staged ([`SurfaceViews::set_staged`]), every cached block
+//! is named by its runs too, and its cache copies their pages through the host's CPU
+//! (`super::surface_cache`, "Staged copies"); a surface's view, where one is made, takes no
+//! import of its pages.
 //!
 //! [`GpuDevice::copies_guest_ram`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::copies_guest_ram
 //!
@@ -977,6 +981,9 @@ pub(crate) struct Unmade<P: Platform> {
     teardown: Option<Arc<Worker>>,
     key: Vec<(u64, u64)>,
     length: u64,
+    /// Whether the view takes a buffer over the whole of it, which holds the runtime's import of
+    /// its pages: none where the device caches' copies are staged ([`SurfaceViews::set_staged`]).
+    import: bool,
 }
 
 impl<P: Platform> Unmade<P> {
@@ -986,7 +993,8 @@ impl<P: Platform> Unmade<P> {
     }
 
     /// The view, mapped now, and a Shared buffer over the whole of it on `device`, which holds
-    /// the view and the runtime's import of its pages; the refusal where either is not made.
+    /// the view and the runtime's import of its pages, where the view takes one; the refusal
+    /// where either is not made.
     pub(crate) fn make(&self, device: &P::Device) -> RaiseResult<Result<Made<P>, PagesRefusal>> {
         let view = match map_view(
             &self.memory,
@@ -998,9 +1006,12 @@ impl<P: Platform> Unmade<P> {
             Ok(view) => view,
             Err(why) => return Ok(Err(why)),
         };
+        if !self.import {
+            return Ok(Ok((view, None)));
+        }
         Ok(
             match buffer_over(device, &view, 0, view.length(), 0, None)? {
-                Some(import) => Ok((view, import)),
+                Some(import) => Ok((view, Some(import))),
                 None => Err(PagesRefusal::NoBuffer),
             },
         )
@@ -1066,18 +1077,23 @@ pub(crate) struct SurfaceViews<P: Platform> {
     /// such block's view is made at its `SURFACE_PAGES`, and its address is its import's
     /// ([`Self::pages_address`]).
     known_imports: Option<ViewImports<P>>,
+    /// The device caches' copies are staged ([`Self::set_staged`]): a surface's view takes no
+    /// import of its pages.
+    staged: bool,
 }
 
 /// What a `SURFACE_PAGES` found under the views' lock ([`SurfaceViews::surface_pages`]).
 enum Found<P: Platform> {
     /// The block's view, the cache's, or the refusal.
     Done(Result<Arc<SurfaceView<P>>, PagesRefusal>),
-    /// A view to make of the runs `key` outside the lock, through `memory`.
+    /// A view to make of the runs `key` outside the lock, through `memory`, with a buffer over
+    /// it that holds the runtime's import of its pages where `import`.
     Make {
         memory: Arc<MemoryMap<P>>,
         lease: Lease,
         teardown: Option<Arc<Worker>>,
         key: Vec<(u64, u64)>,
+        import: bool,
     },
 }
 
@@ -1116,6 +1132,7 @@ impl<P: Platform> SurfaceViews<P> {
             coverage: Arc::default(),
             view_addresses: Arc::new(Mutex::new(HostAddresses::imports())),
             known_imports: None,
+            staged: false,
         }
     }
 
@@ -1135,6 +1152,16 @@ impl<P: Platform> SurfaceViews<P> {
     /// (the module doc, "Read-only pages blocks").
     fn over_copies(&self, read_only: bool) -> bool {
         read_only && self.known_imports.is_none()
+    }
+
+    /// Has the views of the surfaces' blocks take no import of their pages from now on, where
+    /// the device caches' copies are staged, through the host's CPU and a Shared buffer of each
+    /// copy's own ([`super::surface_cache`], "Staged copies"): a surface's buffers then lie over
+    /// its cache alone, and its cache copies by the pages' host bytes, so an import of them would
+    /// serve nothing and might cost each of the platform's submissions while it lived. A pages
+    /// block's view is made as before. Set once, at the device's make.
+    pub(crate) fn set_staged(&mut self) {
+        self.staged = true;
     }
 
     /// The GPU address of the view of the pages block at `block`, for its `SURFACE_PAGES`
@@ -1283,14 +1310,14 @@ impl<P: Platform> SurfaceViews<P> {
                 lease,
                 teardown,
                 key,
+                import,
             } => {
                 Self::make_room_for(views, platform, key.len());
                 if ask && !Self::room_for(platform, key.len()) {
                     return Ok(Some(Err(PagesRefusal::NoRoom)));
                 }
-                match make_view(
-                    platform, device, pages, runs, &memory, lease, teardown, &key,
-                )? {
+                let on = (&*memory, lease, teardown);
+                match make_view(platform, device, pages, runs, on, &key, import)? {
                     Ok((view, import)) => {
                         let idle_mappings = platform.vm().idle_view_mappings();
                         let evicted = views.lock().keep(key, &view, import, idle_mappings);
@@ -1517,6 +1544,7 @@ impl<P: Platform> SurfaceViews<P> {
             teardown: self.teardown.clone(),
             key,
             length: pages.length,
+            import: !self.staged,
         };
         let block = ByRuns {
             runs: host,
@@ -1566,8 +1594,10 @@ impl<P: Platform> SurfaceViews<P> {
             Ok(key) => key,
             Err(why) => return Found::Done(Err(why)),
         };
-        // A read-only pages block's view, which has no import, serves no surface's block.
-        let hit = (self.cache.iter()).position(|c| c.runs == key && c.import.is_some());
+        // A read-only pages block's view, which has no import, serves no surface's block, but
+        // where the caches' copies are staged, whose surfaces' views take none.
+        let staged = self.staged;
+        let hit = (self.cache.iter()).position(|c| c.runs == key && (c.import.is_some() || staged));
         if let Some(cached) = hit.and_then(|at| self.cache.remove(at)) {
             let view = Arc::clone(&cached.view);
             self.cache.push_back(cached);
@@ -1582,20 +1612,21 @@ impl<P: Platform> SurfaceViews<P> {
             lease: Arc::clone(lease),
             teardown: self.teardown.clone(),
             key,
+            import: !staged,
         }
     }
 
-    /// Caches `view`, just made of the runs `key` with `import` over it, at the back
-    /// ([`Self::cache_view`]), counted as made.
+    /// Caches `view`, just made of the runs `key` with `import` over it where it took one, at
+    /// the back ([`Self::cache_view`]), counted as made.
     fn keep(
         &mut self,
         key: Vec<(u64, u64)>,
         view: &Arc<SurfaceView<P>>,
-        import: P::Buffer,
+        import: Option<P::Buffer>,
         idle_mappings: Option<u64>,
     ) -> Vec<Cached<P>> {
         self.counts.made += 1;
-        self.cache_view(key, Arc::clone(view), Some(import), false, idle_mappings)
+        self.cache_view(key, Arc::clone(view), import, false, idle_mappings)
     }
 
     /// Caches `view` of the runs `key`, with `import` over it where it has one, a block the
@@ -2514,8 +2545,9 @@ impl<P: Platform> SurfaceViews<P> {
     }
 }
 
-/// A view just made, and the buffer over the whole of it that holds its import.
-pub(crate) type Made<P> = (Arc<SurfaceView<P>>, <P as Platform>::Buffer);
+/// A view just made, and the buffer over the whole of it that holds its import, where it took
+/// one.
+pub(crate) type Made<P> = (Arc<SurfaceView<P>>, Option<<P as Platform>::Buffer>);
 
 /// The host addresses of the guest pages of `key` in `memory`'s mapping of the guest's RAM, in
 /// their order, as runs, each page that follows the last one's end in the same run; `None` where
@@ -2562,19 +2594,18 @@ fn map_view<P: Platform>(
     Ok(Arc::new(SurfaceView::new(mapping, lease, teardown)))
 }
 
-/// The view of the runs `key` of the block `pages` names, through `memory`, which holds `lease`,
-/// let go of on `teardown`, with a buffer over the whole of it on `device`, which holds the
-/// runtime's import of its pages; logs what each cost.
-#[allow(clippy::too_many_arguments)] // the block, its runs, and what the view is made through
+/// The view of the runs `key` of the block `pages` names, through `on`'s memory, which holds its
+/// lease, let go of on its teardown, with a buffer over the whole of it on `device`, which holds
+/// the runtime's import of its pages, where `import` (none where the caches' copies are staged,
+/// [`SurfaceViews::set_staged`]); logs what each cost.
 fn make_view<P: Platform>(
     platform: &P,
     device: &P::Device,
     pages: &RgfxSurfacePages,
     runs: &[RgfxPageRun],
-    memory: &MemoryMap<P>,
-    lease: Lease,
-    teardown: Option<Arc<Worker>>,
+    (memory, lease, teardown): (&MemoryMap<P>, Lease, Option<Arc<Worker>>),
     key: &[(u64, u64)],
+    import: bool,
 ) -> RaiseResult<Result<Made<P>, PagesRefusal>> {
     let clock = platform.clock();
     let start = clock.now_mono();
@@ -2583,8 +2614,12 @@ fn make_view<P: Platform>(
         Err(why) => return Ok(Err(why)),
     };
     let mapped = clock.now_mono();
-    let Some(import) = buffer_over(device, &view, 0, view.length(), 0, None)? else {
-        return Ok(Err(PagesRefusal::NoBuffer));
+    let import = match import {
+        true => match buffer_over(device, &view, 0, view.length(), 0, None)? {
+            Some(import) => Some(import),
+            None => return Ok(Err(PagesRefusal::NoBuffer)),
+        },
+        false => None,
     };
     let imported = clock.now_mono();
     log::debug!(

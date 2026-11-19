@@ -800,6 +800,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     },
                 ));
             }
+            // A platform whose imports of the host's memory cost each submission stages the
+            // caches' copies through the host's CPU (`ApiPlatform::STAGED_SURFACE_COPIES`).
+            if P::STAGED_SURFACE_COPIES {
+                decoder.set_staged_surface_copies();
+            }
             if unified_memory {
                 let cache_budget = cache_budget(own_memory);
                 decoder.set_cache_budget(cache_budget);

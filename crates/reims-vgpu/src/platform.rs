@@ -56,6 +56,12 @@ pub trait ApiPlatform: Platform {
     /// (`graphics::decode::unkept`). False by default: the platform keeps every pin.
     const PINS_IN_BLOCKS: bool = false;
 
+    /// Whether a graphics device on the platform stages its IOSurface device caches' copies
+    /// (`graphics::decode::surface_cache`, "Staged copies"): through the host's CPU and a Shared
+    /// buffer of each copy's own, with no import of a surface's pages, where an import of the
+    /// host's memory may cost each of the platform's submissions while it lives. False by default.
+    const STAGED_SURFACE_COPIES: bool = false;
+
     /// The process's platform, made on first use.
     fn process() -> Arc<Self>;
 

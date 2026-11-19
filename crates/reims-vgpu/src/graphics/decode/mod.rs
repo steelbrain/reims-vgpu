@@ -1431,9 +1431,20 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Whether a cached block on `device` is named by its runs, with no view: the device copies
-    /// the guest's RAM by them (`surface_pages`, "By runs").
+    /// the guest's RAM by them (`surface_pages`, "By runs"), or the caches' copies are staged
+    /// ([`Self::set_staged_surface_copies`]).
     fn copies_by_runs(&self, device: &P::Device) -> bool {
-        device.copies_guest_ram()
+        device.copies_guest_ram() || self.surface_caches.staged()
+    }
+
+    /// Stages the IOSurface device caches' copies from now on (`surface_cache`, "Staged
+    /// copies"): no surface's view takes an import of its pages, and every cache copies them
+    /// through the host's CPU, timed by the platform's clock. Set once, at the device's make,
+    /// before any surface is named.
+    pub(crate) fn set_staged_surface_copies(&self) {
+        self.shared.surface_views.lock().set_staged();
+        let platform = Arc::clone(&self.platform);
+        (self.surface_caches).set_staged(Arc::new(move || platform.clock().now_mono()));
     }
 
     /// Whether `SURFACE_PAGES` makes views ([`RGFX_FEATURE_SURFACE_PAGES`]).
@@ -2367,8 +2378,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             Ok(Ok((view, import))) => {
                 self.shared.surface_views.lock().viewed(block, view);
                 // The view's buffers hold it; the import's buffer goes on the worker, where it
-                // may be the last hold of the import.
-                self.shared.surface_worker.drop_later(block, block, import);
+                // may be the last hold of the import (none where the caches' copies are staged).
+                if let Some(import) = import {
+                    self.shared.surface_worker.drop_later(block, block, import);
+                }
             }
             Ok(Err(why)) => log::warn!(
                 target: "reims_vgpu::graphics", kind:? = why;
@@ -3135,8 +3148,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// What a present of IOSurface `iosurface_id` shows ([`SurfacePresent`]). The caller holds its
-    /// own reference to the texture: a destroy of it after this leaves it drawable.
+    /// own reference to the texture: a destroy of it after this leaves it drawable. Counted where
+    /// the device caches' copies are staged ([`surface_cache::Caches::count_present`]).
     pub(crate) fn surface_present(&self, iosurface_id: u32) -> Option<SurfacePresent<P>> {
+        self.surface_caches.count_present();
         let (obj_id, writers_at) = {
             let names = self.shared.surfaces.lock();
             let obj_id = *names.by_surface.get(&iosurface_id)?.last()?;

@@ -17,6 +17,11 @@ impl ApiPlatform for RtPlatform {
     /// each other one (`rt-gpu-address-unpinned`), which the decoder counts again by kind.
     const PINS_IN_BLOCKS: bool = true;
 
+    /// Each of rt's imports of the host's memory is a Vulkan allocation of its own while it lives
+    /// (`reims_vgpu_vulkan::rt_platform::buffer`, "Imports"), which a driver may charge each
+    /// submission for: a surface's cache copies its pages through the host's CPU instead.
+    const STAGED_SURFACE_COPIES: bool = true;
+
     fn process() -> Arc<RtPlatform> {
         crate::singleton::rt_platform()
     }
