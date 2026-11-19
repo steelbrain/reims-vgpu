@@ -4457,7 +4457,15 @@ of it: up to 128 MiB of the host's RAM committed per VM from its first
 WindowServer replacement on, where the last owner's frames had touched only a
 frame or two of it. The stores took 103 ms on a Linux host under KVM (Radeon
 780M, job m3-max-49882) and 802 ms on a Windows host under WHP (UHD 630, job
-m3-max-50087), and the room's mapping 1.2 ms and 3.8 ms.
+m3-max-50087), and the room's mapping 1.2 ms and 3.8 ms. How often the pass
+comes was measured on a Linux host under KVM (RTX 3090, job m3-max-50552),
+with the guest's kernel buffer read before and after each step and each read
+found to continue the one before it. A logout, with autologin turned off,
+replaced WindowServer, and the new one made one pass over display 0's room and
+was given the VRAM range once. The login typed at the login window kept that
+WindowServer and made no pass. So a session costs one pass per logout, and a
+login none. The boot's own count was not read: its lines had left the guest's
+128 KiB buffer before the first read.
 
 Command buffers do not pass through the kext, so the host checks each
 object a message names: it must be
