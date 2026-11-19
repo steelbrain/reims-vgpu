@@ -119,25 +119,21 @@ fn ask_displays<P: ApiPlatform>(device: &GraphicsDevice<P>) {
     device.mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
 }
 
-/// On the Vulkan platform, the let-go of the GPU device after the process's last graphics device
-/// ([`GraphicsDevice::let_go_of_gpu`], the C API's release) waits for a device callback blocked
-/// on a lock the releasing thread holds only its bound: the callback holds the device's control
-/// thread, and so its decoder and the GPU device, so the let-go names the ended decoder and lets
-/// go of nothing, and returns, never in a deadlock. Once the lock goes, the callback returns, the
-/// device's threads end, and the next let-go lets go of the GPU device. Each runs on a thread of
-/// its own, whose answer the test waits for at most 30 s, so a let-go that never returned fails
-/// the test at that wait. Not under `rt`: there the platform keeps the process's one device until
-/// the exit (`RtPlatform`'s device), so a let-go has nothing to wait for
-#[cfg(not(feature = "rt"))]
+/// The let-go of the GPU device after the process's last graphics device
+/// ([`GraphicsDevice::let_go_of_gpu`], the C API's release), on the default platform, waits for a
+/// device callback blocked on a lock the releasing thread holds only its bound: the callback holds
+/// the device's control thread, and so its decoder and the GPU device, so the let-go names the
+/// ended decoder and lets go of nothing, and returns, never in a deadlock. Once the lock goes, the
+/// callback returns, the device's threads end, and the next let-go lets go of the GPU device. Each
+/// runs on a thread of its own, whose answer the test waits for at most 30 s, so a let-go that
+/// never returned fails the test at that wait.
 #[test]
 fn on_vulkan_the_let_go_waits_for_a_callback_blocked_on_the_releasers_lock_only_its_bound() {
     use std::sync::mpsc;
     let let_go = |bound: Duration| {
         let (answer, answered) = mpsc::channel();
         let letting_go = std::thread::Builder::new().spawn(move || {
-            let _ = answer.send(GraphicsDevice::<crate::VulkanPlatform>::let_go_of_gpu(
-                bound,
-            ));
+            let _ = answer.send(GraphicsDevice::<DefaultPlatform>::let_go_of_gpu(bound));
         });
         letting_go.unwrap();
         answered.recv_timeout(Duration::from_secs(30))
@@ -159,7 +155,8 @@ fn on_vulkan_the_let_go_waits_for_a_callback_blocked_on_the_releasers_lock_only_
         doorbell_pages: false,
         ..GraphicsConfig::default()
     };
-    let device = GraphicsDevice::with_platform(crate::singleton::platform(), config).unwrap();
+    let platform = <DefaultPlatform as ApiPlatform>::process();
+    let device = GraphicsDevice::with_platform(platform, config).unwrap();
     let held = lock.lock();
     ask_displays(&device);
     blocked.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -172,44 +169,6 @@ fn on_vulkan_the_let_go_waits_for_a_callback_blocked_on_the_releasers_lock_only_
     );
     drop(held);
     assert_eq!(let_go(Duration::from_secs(20)), Ok(Ok(true)));
-}
-
-/// On the rt platform, which keeps the process's one device until the exit (`RtPlatform`'s
-/// device), the let-go after the process's last graphics device lets go of nothing and answers
-/// true at once, with no wait: here with a bound of nothing, while the ended device's callback is
-/// still blocked on a lock the test holds
-#[cfg(feature = "rt")]
-#[test]
-fn on_vulkan_rt_s_let_go_keeps_the_device_and_answers_true_at_once() {
-    use reims_vgpu_vulkan::RtPlatform;
-    use std::sync::mpsc;
-    let lock = Arc::new(Mutex::new(()));
-    let (entered, blocked) = mpsc::channel();
-    let in_callback = Arc::clone(&lock);
-    let config = GraphicsConfig {
-        callbacks: GraphicsCallbacks {
-            raise_interrupt: Some(Arc::new(move |_| {
-                let _ = entered.send(());
-                drop(in_callback.lock());
-            })),
-            ..GraphicsCallbacks::default()
-        },
-        window: None,
-        memory_map: None,
-        guest_arch: GuestArch::X86_64,
-        doorbell_pages: false,
-        ..GraphicsConfig::default()
-    };
-    let device = GraphicsDevice::with_platform(crate::singleton::rt_platform(), config).unwrap();
-    let held = lock.lock();
-    ask_displays(&device);
-    blocked.recv_timeout(Duration::from_secs(10)).unwrap();
-    drop(device);
-    assert_eq!(
-        GraphicsDevice::<RtPlatform>::let_go_of_gpu(Duration::ZERO),
-        Ok(true)
-    );
-    drop(held);
 }
 
 /// The host screen's rate in thousandths of a hertz, rounded; 60 Hz for a rate that is none

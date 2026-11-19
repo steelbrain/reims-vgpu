@@ -7,8 +7,10 @@
 //! where it fails.
 //!
 //! **One device.** The process makes one rt device, the first time a device is asked for, and
-//! every ask answers it (one `VkDevice` per VM, the host process). A failure to make it is
-//! counted once as rt's refusal and again at each later ask, which answers nil.
+//! every ask answers it (one `VkDevice` per VM, the host process), until the release of the last
+//! graphics device lets go of it (`RtPlatform::let_go_of_device`); the next ask makes a new one.
+//! A failure to make it is counted once as rt's refusal and again at each later ask, which
+//! answers nil.
 //!
 //! **The choice.** The candidates are the physical devices that meet rt's floor; the pick among
 //! them is the library's (`crate::device_choice::chosen_untimed`): the device the host's user's

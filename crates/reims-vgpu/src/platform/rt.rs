@@ -54,6 +54,13 @@ impl ApiPlatform for RtPlatform {
         }
     }
 
+    /// The platform's let-go of the process's rt device (`RtPlatform::let_go_of_device`): where
+    /// nothing beyond the platform held it, rt tears it down on the calling thread before this
+    /// returns, so that no device of rt's is live as the process exits.
+    fn let_go_of_devices(&self, bound: std::time::Duration) -> Result<(), String> {
+        self.let_go_of_device(bound)
+    }
+
     /// The whole texture, through rt's `getBytes:` (`RtTexture::read_pixels`); `dst` is left as
     /// it was where rt refuses it, counted.
     fn read_pixels(

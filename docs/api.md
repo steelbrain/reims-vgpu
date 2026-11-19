@@ -169,15 +169,19 @@ none with the device let go of first). A device callback still running holds tha
 that waits for a lock the host holds around the release, for the whole 5 s. Past them the library
 keeps its GPU devices for the process, as it does while a device lives, and logs a warning saying
 what still held them. A device created after the let-go runs on a new GPU device, whose numbering
-starts again. QEMU releases its device as it quits, once the VM stopped for good (its
+starts again. On the platform over metal2vulkan-rt the let-go lets go of its one GPU device the
+same way, once nothing beyond the platform holds it: the runtime's `Device::quiesce` first, with
+what is left of the 5 s, then the drop of its last handle, which tears it down on the releasing
+thread, and a wait for the runtime's gauges of it to read zero. A device whose quiesce answered
+false is kept to the exit, since its drop would wait with no deadline. QEMU releases its device as it quits, once the VM stopped for good (its
 `vm_shutdown`), with the BQL let go for the release alone; a VM whose shutdown action
 pauses it keeps its device to the exit, and so does a quit while a read of its display
 (`rvg_graphics_device_read_display`) still waits for its draw on the GPU 5 s into the teardown.
 
 A host that can exit with a GPU device alive quiesces the library first: `rvg_quiesce_for_exit`,
 its last call, on the thread that then calls `exit`. It takes no handle, since the GPU devices are
-the process's, and serves a device kept to the exit as it serves the GPU device the platform over
-metal2vulkan-rt keeps past the release of the last graphics device. On that platform it closes the
+the process's, and serves a device kept to the exit. On the platform over metal2vulkan-rt it
+closes the
 exit gate ahead of the exit, as the handler would, so that each thread of the library's parks for
 good at its next step, and waits for the steps in progress on other threads; then the runtime's
 `Device::quiesce` stops its threads: what is ready is submitted and the rest ends unrun, the GPU

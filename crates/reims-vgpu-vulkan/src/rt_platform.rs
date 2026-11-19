@@ -53,15 +53,20 @@ pub mod texture;
 pub mod unbuilt;
 pub mod unmade;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::time::Duration;
+
+use metal2vulkan_rt as rt;
 
 use crate::core::num::ToU64 as _;
+use crate::core::platform::os::clock::Clock as _;
 use crate::core::platform::os::Threads;
 use crate::core::platform::os::vm::HostVm;
 use crate::core::platform::types::MtlSize;
 use crate::core::platform::values::{RateMapDesc, TextureDesc};
 use crate::core::platform::{Handle, ObjId, Platform};
 use crate::core::raise::{OnFault, RaiseResult};
+use crate::core::sync::Mutex;
 use crate::os::{OsClock, OsThreads, OsVm};
 
 pub use blit::RtBlitEncoder;
@@ -116,13 +121,42 @@ pub struct Listener;
 
 /// The process's platform over metal2vulkan-rt (the module's docs): the OS's VM, clocks and
 /// threads, the process's one rt device once asked for, and rt's objects as its pieces are built.
+///
+/// **Its device goes before the exit.** The release of the last graphics device lets go of the
+/// device ([`RtPlatform::let_go_of_device`]), which rt then tears down, as metal2vulkan-rt's
+/// contract asks of a process that exits: it drops the device's last handle first, and a process
+/// that cannot quiesces and ends with `_exit` (its README, "Quiesce and exit"; on NVIDIA's driver
+/// an exit with a device live that ran work can end in `SIGSEGV` inside the driver's exit
+/// handler).
 pub struct RtPlatform {
     vm: OsVm,
     clock: OsClock,
     threads: OsThreads,
     /// The device, made at the first ask ([`device::open`]), or the kind of rt's refusal to make
-    /// it, which every ask answers.
-    device: OnceLock<Result<RtObj<RtDevice>, RtRefusal>>,
+    /// it, which every ask answers; empty until the first ask, and again once the device was let
+    /// go of ([`RtPlatform::let_go_of_device`]), for the next ask to make a new one.
+    device: Mutex<Option<Result<RtObj<RtDevice>, RtRefusal>>>,
+    /// The devices a let-go took and did not see torn down within its bound
+    /// ([`RtPlatform::let_go_of_device`]), for the exit's quiesce, which answers false while one
+    /// lives.
+    unended: Mutex<Vec<Unended>>,
+}
+
+/// A device a let-go took and did not see torn down within its bound
+/// ([`RtPlatform::let_go_of_device`]).
+struct Unended {
+    /// The device, where rt's quiesce of it answered false: kept to the exit, since its drop
+    /// would wait with no deadline for the threads and the GPU work the quiesce did not see end.
+    device: Option<RtObj<RtDevice>>,
+    /// rt's counters of it, whose gauges all read zero once it is torn down.
+    counters: rt::Counters,
+}
+
+impl Unended {
+    /// Whether the device is torn down.
+    fn ended(&self) -> bool {
+        self.device.is_none() && self.counters.gauges() == rt::Gauges::default()
+    }
 }
 
 impl Default for RtPlatform {
@@ -146,7 +180,8 @@ impl RtPlatform {
             vm: OsVm::new(),
             clock: OsClock::new(),
             threads: OsThreads::new(),
-            device: OnceLock::new(),
+            device: Mutex::new(None),
+            unended: Mutex::new(Vec::new()),
         }
     }
 
@@ -157,10 +192,12 @@ impl RtPlatform {
         self.device_at("MTLCreateSystemDefaultDevice")
     }
 
-    /// The device, made at the first ask, from `sel` (the type's docs).
+    /// The device, made at the first ask after the platform's start or a let-go, from `sel`
+    /// (the type's docs).
     fn device_at(&self, sel: &'static str) -> Option<RtObj<RtDevice>> {
         let mut made_now = false;
-        let device = self.device.get_or_init(|| {
+        let mut slot = self.device.lock();
+        let device = slot.get_or_insert_with(|| {
             made_now = true;
             device::open(self.vm.page_size()).map_err(|unopened| unopened.refuse(sel))
         });
@@ -172,6 +209,82 @@ impl RtPlatform {
                 }
                 None
             }
+        }
+    }
+
+    /// Lets go of the process's device: what the release of the last graphics device does
+    /// (reims-vgpu's `ApiPlatform::let_go_of_devices`), so that no device of rt's is live as the
+    /// process exits (the type's docs). In order, each wait ending by `bound`:
+    /// - it waits for every handle beyond the platform's own to go (an object, a command buffer
+    ///   still running, a thread that holds one), looking every [`crate::let_go::POLL`]. Where
+    ///   one outlives the wait, nothing goes, and `Err` says how many still held it;
+    /// - rt's `Device::quiesce`, so that the drop's wait for rt's threads and GPU work, which
+    ///   has no deadline, finds them ended. Where it answers false, the device is kept to the
+    ///   exit, and `Err` says so;
+    /// - the drop of the platform's handle, on this thread, which tears the device down where it
+    ///   was rt's last; then the wait for rt's gauges of the device to read zero, as they do once
+    ///   it is torn down. Where rt's objects of it outlive the wait, `Err` names them.
+    ///
+    /// A device taken and not torn down makes the exit's quiesce answer false while it lives.
+    /// The next ask makes a new device, whose IDs start from new pools. `Ok`, with nothing let
+    /// go of, where no device was made, where rt refused to make it (every ask still answers
+    /// the refusal), and once the process's exit began (the exit gate closed): a thread the drop
+    /// would join may be parked for good then.
+    pub fn let_go_of_device(&self, bound: Duration) -> Result<(), String> {
+        if crate::exit_gate::closed() {
+            return Ok(());
+        }
+        let until = self.clock.now_mono().saturating_add(bound);
+        let device = loop {
+            let mut slot = self.device.lock();
+            let beyond = match slot.as_ref() {
+                Some(Ok(device)) => Arc::strong_count(&device.0).saturating_sub(1),
+                Some(Err(_)) | None => return Ok(()),
+            };
+            if beyond == 0
+                && let Some(Ok(device)) = slot.take()
+            {
+                break device;
+            }
+            drop(slot);
+            if self.clock.now_mono() >= until {
+                return Err(format!(
+                    "the rt device by {beyond} handles beyond the platform's"
+                ));
+            }
+            std::thread::sleep(crate::let_go::POLL);
+        };
+        let facts = device.facts();
+        let named = format!("{} (registry ID {:#x})", facts.name, facts.registry_id);
+        let counters = device.rt().counters();
+        let left = until.saturating_duration_since(self.clock.now_mono());
+        if !device.rt().quiesce(left) {
+            let device = Some(device);
+            self.unended.lock().push(Unended { device, counters });
+            return Err(format!(
+                "rt's threads or GPU work on {named}, which its quiesce did not see end,"
+            ));
+        }
+        drop(device);
+        loop {
+            let gauges = counters.gauges();
+            if gauges == rt::Gauges::default() {
+                log::debug!(
+                    target: "reims_vgpu_vulkan::let_go",
+                    "let go of 1 GPU devices: rt's {named}"
+                );
+                return Ok(());
+            }
+            if self.clock.now_mono() >= until {
+                self.unended.lock().push(Unended {
+                    device: None,
+                    counters,
+                });
+                return Err(format!(
+                    "rt's objects of {named}, which outlived the platform's handle ({gauges:?}),"
+                ));
+            }
+            std::thread::sleep(crate::let_go::POLL);
         }
     }
 }
@@ -279,23 +392,24 @@ impl Platform for RtPlatform {
     /// The library's threads first, then rt's: closes the exit gate ahead of the exit, so that a
     /// thread of the library's parks at its next step, and waits for the steps in progress on
     /// other threads ([`crate::exit_gate::close_ahead`]); then rt's `Device::quiesce` of the
-    /// process's device, where it was made, with what is left of `bound`: rt's submit thread
+    /// process's device, where one lives, with what is left of `bound`: rt's submit thread
     /// submits what is ready and ends the rest unrun, the GPU completes what was submitted, and
-    /// rt's threads end. Nothing is freed. False where a step outlasted the wait, or rt answered
-    /// false (a thread of rt's may still be in the driver, metal2vulkan-rt's README, "Quiesce and
-    /// exit").
-    fn quiesce(&self, bound: std::time::Duration) -> bool {
-        use crate::core::platform::os::clock::Clock as _;
+    /// rt's threads end. Nothing is freed. False where a step outlasted the wait, where rt
+    /// answered false (a thread of rt's may still be in the driver, metal2vulkan-rt's README,
+    /// "Quiesce and exit"), and while a device a let-go could not tear down lives.
+    fn quiesce(&self, bound: Duration) -> bool {
         let until = self.clock.now_mono().saturating_add(bound);
         let parked = crate::exit_gate::close_ahead(until);
-        let quiesced = match self.device.get() {
-            Some(Ok(device)) => {
-                let left = until.saturating_duration_since(self.clock.now_mono());
-                device.rt().quiesce(left)
-            }
-            Some(Err(_)) | None => true,
+        let live = match self.device.lock().as_ref() {
+            Some(Ok(device)) => Some(device.clone_ref()),
+            Some(Err(_)) | None => None,
         };
-        parked && quiesced
+        let quiesced = live.is_none_or(|device| {
+            let left = until.saturating_duration_since(self.clock.now_mono());
+            device.rt().quiesce(left)
+        });
+        let ended = (self.unended.lock().iter()).all(Unended::ended);
+        parked && quiesced && ended
     }
 }
 
@@ -333,18 +447,56 @@ mod tests {
         assert!(counted(code) >= before + 3, "{code}");
     }
 
+    /// Commits 8 empty command buffers on a queue of `device`'s, each with a completed handler
+    /// that counts its run in the answer.
+    fn commit_work(
+        device: &RtObj<RtDevice>,
+    ) -> (RtObj<RtQueue>, Arc<std::sync::atomic::AtomicU32>) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::device::GpuDevice as _;
+
+        let queue = device.new_command_queue().expect("a command queue");
+        let ended = Arc::new(AtomicU32::new(0));
+        for _ in 0..8 {
+            let buffer = (queue
+                .command_buffer(OnFault::Return)
+                .expect("never a raise"))
+            .expect("a command buffer");
+            let ended = Arc::clone(&ended);
+            let handler = Box::new(move |_: crate::core::platform::command::CompletedInfo| {
+                ended.fetch_add(1, Ordering::SeqCst);
+            });
+            assert_eq!(
+                buffer.add_completed_handler(OnFault::Return, handler),
+                Ok(())
+            );
+            assert_eq!(buffer.commit(OnFault::Return), Ok(()));
+        }
+        (queue, ended)
+    }
+
+    /// Runs the test named `test` again in a child process, with `RVG_QUIESCE_CHILD` naming it:
+    /// its exit status and its standard error.
+    fn run_child(test: &str) -> (Option<i32>, String) {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env("RVG_QUIESCE_CHILD", test)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        println!("{stderr}");
+        (out.status.code(), stderr)
+    }
+
     /// A quiesce ahead of the exit on the GPU the test holds, in a child process: work committed
     /// just before it ends, completed or unrun, with its handler run; it answers true in time,
     /// and a second call at once; the exit gate is closed; a command buffer made after it is
     /// refused and counted; and the child's exit with rt's device alive ends with status 0.
     #[test]
     fn on_vulkan_a_quiesce_stops_the_device_before_the_exit() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::time::Duration;
-
-        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use crate::core::platform::device::GpuDevice as _;
-        use crate::core::platform::os::clock::Clock as _;
+        use std::sync::atomic::Ordering;
 
         const TEST: &str =
             "rt_platform::tests::on_vulkan_a_quiesce_stops_the_device_before_the_exit";
@@ -356,23 +508,7 @@ mod tests {
         if std::env::var("RVG_QUIESCE_CHILD").as_deref() == Ok(TEST) {
             let platform = RtPlatform::new();
             let device = (platform.system_default_device()).expect("an rt device on the GPU");
-            let queue = device.new_command_queue().expect("a command queue");
-            let ended = Arc::new(AtomicU32::new(0));
-            for _ in 0..8 {
-                let buffer = (queue
-                    .command_buffer(OnFault::Return)
-                    .expect("never a raise"))
-                .expect("a command buffer");
-                let ended = Arc::clone(&ended);
-                let handler = Box::new(move |_: crate::core::platform::command::CompletedInfo| {
-                    ended.fetch_add(1, Ordering::SeqCst);
-                });
-                assert_eq!(
-                    buffer.add_completed_handler(OnFault::Return, handler),
-                    Ok(())
-                );
-                assert_eq!(buffer.commit(OnFault::Return), Ok(()));
-            }
+            let (queue, ended) = commit_work(&device);
             let clock = crate::os::OsClock::new();
             let start = clock.now_mono();
             let first = platform.quiesce(Duration::from_secs(5));
@@ -400,20 +536,66 @@ mod tests {
             // SAFETY: the C library's exit, which never returns.
             unsafe { exit(0) }
         }
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
-            .env("RVG_QUIESCE_CHILD", TEST)
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        println!("{stderr}");
-        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let (status, stderr) = run_child(TEST);
+        assert_eq!(status, Some(0), "{stderr}");
         for line in [
             "quiesce answered true",
             "handlers run 8",
             "a second quiesce answered true, at once true",
             "gate closed true",
             "a command buffer after it refused true, counted 1",
+        ] {
+            assert!(stderr.contains(line), "no {line:?}: {stderr}");
+        }
+    }
+
+    /// The order the host's quit takes, on the GPU the test holds, in a child process: work
+    /// committed, every handle of the device dropped but the platform's, then the let-go, which
+    /// waits for the work and tears the device down on this thread (rt's gauges of it all read
+    /// zero); then the quiesce ahead of the exit, which finds no device and answers true; then
+    /// `exit()`, which runs the exit handlers, the driver's among them, and ends with status 0.
+    #[test]
+    fn on_vulkan_the_let_go_drops_the_device_so_the_quiesce_answers_true_and_the_exit_runs() {
+        use std::sync::atomic::Ordering;
+
+        const TEST: &str = "rt_platform::tests::\
+            on_vulkan_the_let_go_drops_the_device_so_the_quiesce_answers_true_and_the_exit_runs";
+        unsafe extern "C" {
+            /// The C library's `exit`, which runs the exit handlers, as QEMU's exit does.
+            fn exit(status: i32) -> !;
+        }
+        let say = |line: &str| eprintln!("{line}");
+        if std::env::var("RVG_QUIESCE_CHILD").as_deref() == Ok(TEST) {
+            let platform = RtPlatform::new();
+            let device = (platform.system_default_device()).expect("an rt device on the GPU");
+            let counters = device.rt().counters();
+            let (queue, ended) = commit_work(&device);
+            drop((queue, device));
+            let let_go = platform.let_go_of_device(Duration::from_secs(5));
+            say(&format!("let-go answered {let_go:?}"));
+            say(&format!("handlers run {}", ended.load(Ordering::SeqCst)));
+            say(&format!(
+                "gauges zero {}",
+                counters.gauges() == rt::Gauges::default()
+            ));
+            let clock = crate::os::OsClock::new();
+            let start = clock.now_mono();
+            let quiesced = platform.quiesce(Duration::from_secs(5));
+            let took = clock.now_mono().saturating_duration_since(start);
+            say(&format!(
+                "quiesce answered {quiesced}, at once {}",
+                took < Duration::from_millis(100)
+            ));
+            // SAFETY: the C library's exit, which never returns.
+            unsafe { exit(0) }
+        }
+        let (status, stderr) = run_child(TEST);
+        assert_eq!(status, Some(0), "{stderr}");
+        for line in [
+            "let-go answered Ok(())",
+            "handlers run 8",
+            "gauges zero true",
+            "quiesce answered true, at once true",
         ] {
             assert!(stderr.contains(line), "no {line:?}: {stderr}");
         }
