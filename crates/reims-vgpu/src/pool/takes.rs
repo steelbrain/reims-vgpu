@@ -260,7 +260,10 @@ fn count_wait(context: u32, len: u64, waits: [Duration; 4]) {
 /// with its parts' nanoseconds ([`ZERO_HOLDS_LONG_CODE`]).
 pub(super) fn zero_held(parts: [Duration; 3]) {
     let ns = parts.map(|part| u64::try_from(part.as_nanos()).unwrap_or(u64::MAX));
-    let held = ns.iter().fold(0, |all: u64, &part| all.saturating_add(part)).max(1);
+    let held = ns
+        .iter()
+        .fold(0, |all: u64, &part| all.saturating_add(part))
+        .max(1);
     let was = ZERO_HOLD_MAX_NS.fetch_max(held, Ordering::Relaxed);
     if held > was {
         count_kind_by(ZERO_HOLD_MAX_NS_CODE, held.saturating_sub(was));

@@ -696,7 +696,10 @@ fn a_freed_blocks_bytes_are_zeroed_after_its_free_and_a_take_over_them_leaves_th
         assert!(start.elapsed() < Duration::from_secs(10), "counted");
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(counted(ZERO_HOLD_MAX_NS_CODE) > 0, "the zeroer's hold counted");
+    assert!(
+        counted(ZERO_HOLD_MAX_NS_CODE) > 0,
+        "the zeroer's hold counted"
+    );
     assert!(all(&pool, TAKE_ALIGN, TAKE_ALIGN, 0x5a));
     // A byte the pool's record says reads zero, made 0x77 here: the take leaves it.
     fill(&pool, 0, 1, 0x77);
@@ -818,9 +821,16 @@ fn a_zeroers_long_hold_is_counted_with_its_parts() {
     assert!(after[0] > before[0], "the long hold counted");
     for (i, ns) in parts.into_iter().enumerate() {
         assert!(after[i + 1] - before[i + 1] >= ns, "{}", codes[i + 1]);
-        assert!(counted(ZERO_HOLD_PART_MAX_NS_CODES[i]) >= ns, "{}", ZERO_HOLD_PART_MAX_NS_CODES[i]);
+        assert!(
+            counted(ZERO_HOLD_PART_MAX_NS_CODES[i]) >= ns,
+            "{}",
+            ZERO_HOLD_PART_MAX_NS_CODES[i]
+        );
     }
-    assert!(counted(ZERO_HOLD_MAX_NS_CODE) >= 56_000, "the hold's longest");
+    assert!(
+        counted(ZERO_HOLD_MAX_NS_CODE) >= 56_000,
+        "the hold's longest"
+    );
 }
 
 /// An answered take's wait is counted by its cause ([`TAKE_WAIT_CODES`]), the take counted once
