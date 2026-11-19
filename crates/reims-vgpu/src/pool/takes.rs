@@ -186,7 +186,7 @@ fn count_wait(context: u32, len: u64, waits: [Duration; 4]) {
         count_kind_by(all, ns);
         let was = TAKE_WAIT_MAX_NS[i].fetch_max(ns, Ordering::Relaxed);
         if ns > was {
-            count_kind_by(max, ns - was);
+            count_kind_by(max, ns.saturating_sub(was));
             longest |= i == 0;
         }
     }
