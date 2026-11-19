@@ -91,18 +91,26 @@ fn run(h: &Harness, args: &[&str]) -> Output {
     command.output().unwrap()
 }
 
-/// The C API from C, end to end on the library's platform — every check of tests/c/harness.c passes
+/// The C API from C, end to end on the library's platform — every check of tests/c/harness.c
+/// passes, and its quiesce ahead of the exit, after its graphics devices were released, answers
+/// false on the Vulkan platform, which made a GPU device in the process, and true on the platform
+/// over metal2vulkan-rt, whose release let go of it
 #[test]
 fn c_harness_passes() {
     let h = harness("run");
     let out = run(&h, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
+        "{stdout}\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("harness: ok"));
+    assert!(stdout.contains("harness: ok"), "{stdout}");
+    let answer = if cfg!(feature = "rt") { "true" } else { "false" };
+    assert!(
+        stdout.contains(&format!("harness: quiesce answered {answer}\n")),
+        "{stdout}"
+    );
 }
 
 /// On macOS the dylib's install name is `@rpath/libreims_vgpu_c.dylib`, and the harness links it

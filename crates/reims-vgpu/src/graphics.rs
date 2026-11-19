@@ -1277,14 +1277,19 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     /// whether the host may then call `exit`. The library's threads park at their next step and
     /// the steps in progress on other threads are waited for; on the platform over
     /// metal2vulkan-rt, then, where a GPU device is still live, rt's threads end and its GPU work
-    /// completes, and the process's GPU work after it is refused. Nothing is freed. True where
-    /// the platform keeps no GPU device (the release of the last graphics device let go of it,
-    /// [`Self::let_go_of_gpu`]) and the steps ended in time; false where it keeps one, stopped or
-    /// not, since neither platform's runtime supports an `exit` with a device live, or where a
-    /// step outlasted the wait, with a warning. On false the process's counts are written then
-    /// (`reims_vgpu_vulkan::exit_gate::write_counts_ahead`), since the host ends with `_exit`,
-    /// which runs no exit handler. Every wait ends by `bound`. A later call on the same thread
-    /// answers at once, with the first answer.
+    /// completes, and the process's GPU work after it is refused. Nothing is freed. On the
+    /// platform over metal2vulkan-rt, true where it keeps no GPU device (the release of the last
+    /// graphics device let go of it, [`Self::let_go_of_gpu`]) and the steps ended in time; false
+    /// where it keeps one, stopped or not, since its runtime supports no `exit` with a device
+    /// live. On the Vulkan platform, true only where it never asked its runtime for a GPU device
+    /// in the process and the steps ended in time; false once it did, let go of since or not,
+    /// since that runtime's exit hook, registered as the device was made, waits for the runtime's
+    /// work still in progress (a pipeline's making can outlast the device's let-go) only for a
+    /// bound, and on Linux past it ends the process at once, before the host's exit work ran.
+    /// False also where a step outlasted the wait, with a warning. On false the process's counts
+    /// are written then (`reims_vgpu_vulkan::exit_gate::write_counts_ahead`), since the host ends
+    /// with `_exit`, which runs no exit handler. Every wait ends by `bound`. A later call on the
+    /// same thread answers at once, with the first answer.
     pub fn quiesce_for_exit(bound: std::time::Duration) -> bool {
         static ANSWER: OnceLock<bool> = OnceLock::new();
         entry::run(|_| {

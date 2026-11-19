@@ -175,6 +175,7 @@ impl VulkanPlatform {
     /// `None` where the runtime refuses it, logged: the window then presents from the default
     /// device.
     pub fn window_device(registry_id: u64) -> Option<VulkanDevice> {
+        crate::let_go::asks_the_runtime_for_devices();
         match rt::Device::with_registry_id(registry_id, device_options()) {
             Ok(raw) => Some(device::window_device(raw)),
             Err(e) => {
@@ -733,8 +734,10 @@ pub(crate) fn default_device_registry_id() -> Option<u64> {
 /// where that is not the runtime's system default device; else, or where the runtime refuses the
 /// one chosen, the runtime's system default device (`Device::system_default_with`), as on a host
 /// of one GPU. Both with [`device_options`], so a device of the physical device that lives is the
-/// one answered.
+/// one answered. Marked first as a make the platform asked the runtime for
+/// ([`crate::let_go::asks_the_runtime_for_devices`]).
 pub(crate) fn default_device() -> Result<rt::Device, rt::Error> {
+    crate::let_go::asks_the_runtime_for_devices();
     let options = device_options();
     if let Some(id) = crate::device_choice::chosen() {
         match rt::Device::with_registry_id(id, options) {
@@ -905,7 +908,12 @@ impl Platform for VulkanPlatform {
                         Ok(default_device().ok().into_iter().collect())
                     })
                 },
-                || made_devices(OPEN_DEVICE, || rt::Device::all_with(device_options())),
+                || {
+                    made_devices(OPEN_DEVICE, || {
+                        crate::let_go::asks_the_runtime_for_devices();
+                        rt::Device::all_with(device_options())
+                    })
+                },
             )
         });
         crate::recorder::rec_done!(recorded_call, recorded_answer);
@@ -928,16 +936,21 @@ impl Platform for VulkanPlatform {
     /// library's parks at its next step, and waits for the steps in progress on other threads
     /// until `bound` ([`crate::exit_gate::close_ahead`]). metal2vulkan's runtime offers no quiesce
     /// of its own threads, and nothing is freed. True where the steps ended in time and the
-    /// platform keeps no GPU device ([`crate::let_go::gpus_kept`]): none was made, or the release
-    /// of the last graphics device let go of them ([`crate::let_go`]). False where it keeps one,
-    /// so that the process ends with `_exit` and no exit handler runs with a device live: the
-    /// runtime's exit hook waits for the runtime's work in progress only for a bound, and on
-    /// Linux, past it, ends the process with `_exit` itself, so the exit handlers registered
-    /// before it, the host's own exit work among them, never run (measured with a device kept to
-    /// a paused VM's quit: 5 of 9 quits on an RTX 3090 and 5 of 9 on an RTX 2080 left QEMU's
-    /// pidfile behind); and on NVIDIA's driver an exit with a device live can end in `SIGSEGV` in
-    /// the driver's exit handler ([`crate::let_go`]). False also where a step outlasted the wait,
-    /// which it warns of.
+    /// platform never asked the runtime for a device in the process
+    /// ([`crate::let_go::asked_the_runtime_for_devices`]). False once it did, whether it keeps
+    /// the device ([`crate::let_go::gpus_kept`]) or the release of the last graphics device let
+    /// go of it ([`crate::let_go`]), so that the process ends with `_exit` and the runtime's exit
+    /// hook never runs: that hook, registered as the device was made, waits for the
+    /// runtime's work in progress only for a bound, and on Linux, past it, ends the process with
+    /// `_exit` itself, so the exit handlers registered before it, the host's own exit work among
+    /// them, never run. The let-go does not end that work: a pipeline making of the runtime's
+    /// can still be in the driver after the device's last drop. Measured on NVIDIA's driver
+    /// (620.70.06): with a device kept to a paused VM's quit, 5 of 9 quits on an RTX 3090 and 5
+    /// of 9 on an RTX 2080 left QEMU's pidfile behind; and a quit 24 s into a boot on the RTX
+    /// 2080, whose release let go of the device 315 ms after it, met the hook waiting for one
+    /// making in the driver, ended 9.6 s after the quit and left the pidfile. On that driver an
+    /// exit with a device live can also end in `SIGSEGV` in the driver's exit handler
+    /// ([`crate::let_go`]). False also where a step outlasted the wait, which it warns of.
     fn quiesce(&self, bound: std::time::Duration) -> bool {
         use crate::core::platform::os::clock::Clock as _;
 
@@ -950,14 +963,16 @@ impl Platform for VulkanPlatform {
                  step of the library's"
             );
         }
-        let live = crate::let_go::gpus_kept();
-        if live > 0 {
+        let asked = crate::let_go::asked_the_runtime_for_devices();
+        if asked {
+            let live = crate::let_go::gpus_kept();
             log::debug!(
                 target: "reims_vgpu_vulkan::let_go",
-                "{live} GPU devices live at the exit: the process ends with _exit"
+                "the platform asked the runtime for devices in the process, {live} of them \
+                 live at the exit: the process ends with _exit"
             );
         }
-        parked && live == 0
+        parked && !asked
     }
 }
 
@@ -1480,14 +1495,15 @@ pub(crate) mod tests {
 
     /// The order the host's quit takes, in a child process: a device adopted and every handle of
     /// it dropped but the platform's, then the let-go, which takes it; then the quiesce ahead of
-    /// the exit, which finds no device kept and answers true at once; then `exit()`, which runs
-    /// the exit handlers, the runtime's and the driver's among them, and ends with status 0
+    /// the exit, which finds no device kept and still answers false, at once, since the runtime
+    /// made a device in the process, whose exit hook it registered; then the child ends with
+    /// `_exit`, as the host does on false, with status 0
     #[test]
-    fn the_let_go_takes_the_devices_so_the_quiesce_answers_true_and_the_exit_runs() {
+    fn the_quiesce_answers_false_after_the_let_go_took_the_devices() {
         use crate::core::platform::os::clock::Clock as _;
 
-        const TEST: &str = "platform::tests::\
-            the_let_go_takes_the_devices_so_the_quiesce_answers_true_and_the_exit_runs";
+        const TEST: &str =
+            "platform::tests::the_quiesce_answers_false_after_the_let_go_took_the_devices";
         if std::env::var("RVG_QUIESCE_CHILD").as_deref() == Ok(TEST) {
             let p = platform();
             let (options, cache) = crate::gpu::device::tests::options_with_own_cache();
@@ -1505,8 +1521,7 @@ pub(crate) mod tests {
                 "quiesce answered {quiesced}, at once {}",
                 took < Duration::from_millis(100)
             );
-            // SAFETY: the C library's exit, which never returns.
-            unsafe { exit(0) }
+            _exit(0)
         }
         let (status, stderr) = run_quiesce_child(TEST);
         assert_eq!(status, Some(0), "{stderr}");
@@ -1514,8 +1529,40 @@ pub(crate) mod tests {
             "GPUs kept 1",
             "let-go answered Ok(1)",
             "GPUs kept after it 0",
-            "quiesce answered true, at once true",
+            "quiesce answered false, at once true",
         ] {
+            assert!(stderr.contains(line), "no {line:?}: {stderr}");
+        }
+    }
+
+    /// A process that never asked the runtime for a device, in a child process: the quiesce
+    /// ahead of the exit answers true at once, and `exit()`, which runs the exit handlers, ends
+    /// it with status 0
+    #[test]
+    fn a_quiesce_with_no_device_asked_for_answers_true_and_the_exit_runs() {
+        use crate::core::platform::os::clock::Clock as _;
+
+        const TEST: &str =
+            "platform::tests::a_quiesce_with_no_device_asked_for_answers_true_and_the_exit_runs";
+        if std::env::var("RVG_QUIESCE_CHILD").as_deref() == Ok(TEST) {
+            let p = platform();
+            eprintln!(
+                "devices asked for {}",
+                crate::let_go::asked_the_runtime_for_devices()
+            );
+            let start = p.clock.now_mono();
+            let quiesced = p.quiesce(Duration::from_secs(5));
+            let took = p.clock.now_mono().saturating_duration_since(start);
+            eprintln!(
+                "quiesce answered {quiesced}, at once {}",
+                took < Duration::from_millis(100)
+            );
+            // SAFETY: the C library's exit, which never returns.
+            unsafe { exit(0) }
+        }
+        let (status, stderr) = run_quiesce_child(TEST);
+        assert_eq!(status, Some(0), "{stderr}");
+        for line in ["devices asked for false", "quiesce answered true, at once true"] {
             assert!(stderr.contains(line), "no {line:?}: {stderr}");
         }
     }

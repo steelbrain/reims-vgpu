@@ -114,6 +114,7 @@ fn options() -> &'static rt::DeviceOptions {
 /// The workload on a device of registry ID `id` of its own ([`options`]), made for it and dropped
 /// at the end: the timed frames' wall time on `clock`.
 fn run(id: u64, clock: &crate::os::OsClock) -> Result<Duration, rt::Error> {
+    crate::let_go::asks_the_runtime_for_devices();
     let device = rt::Device::with_registry_id(id, options())?;
     let library = device.new_library_with_data(crate::gpu::shaders::METALLIB)?;
     let vertex = library.new_function_with_name("displayPresentVertex")?;

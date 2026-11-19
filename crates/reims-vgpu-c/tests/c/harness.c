@@ -452,14 +452,22 @@ int main(int argc, char **argv) {
     check_graphics();
     check_memory_files();
     check_displays();
-    /* As QEMU does at its quit, the last call before the exit: the exit then runs with no thread
-     * of the library's in the GPU's driver, and a second call answers at once. */
-    CHECK(rvg_quiesce_for_exit(5000));
-    CHECK(rvg_quiesce_for_exit(0));
+    /* As QEMU does at its quit, the last call before the exit, whose answer is whether the exit
+     * may run; a second call answers at once, with the first answer. On false the harness ends as
+     * QEMU then does: its streams flushed, then _Exit, which runs no exit handler. */
+    bool may_exit = rvg_quiesce_for_exit(5000);
+    CHECK(rvg_quiesce_for_exit(0) == may_exit);
+    printf("harness: quiesce answered %s\n", may_exit ? "true" : "false");
+    int status = 0;
     if (failures) {
         fprintf(stderr, "harness: %d failures\n", failures);
-        return 1;
+        status = 1;
+    } else {
+        puts("harness: ok");
     }
-    puts("harness: ok");
-    return 0;
+    if (!may_exit) {
+        fflush(NULL);
+        _Exit(status);
+    }
+    return status;
 }

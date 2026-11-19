@@ -186,23 +186,28 @@ steps in progress on other threads. On the platform over metal2vulkan-rt, then, 
 is still live (a device kept to the exit, or one a let-go could not tear down), the runtime's
 `Device::quiesce` stops its threads: what is ready is submitted and the rest ends unrun, the GPU
 completes what was submitted, and the runtime's threads end. Every wait ends within the call's
-bound, and nothing is freed. It answers true where the library keeps no GPU device (none was
-opened, or the release of the last graphics device let go of them) and the steps ended in time.
-It answers false where it keeps one, quiesced or not, and where a step outlasted the wait, since
-neither platform's runtime supports an `exit` with a device live. metal2vulkan-rt supports it on
-no device (its README, "Quiesce and exit"): on an RTX 3090 (620.70.06), 3 of 9 power-offs that
-called `exit` after the quiesce stopped everything in time ended with `SIGSEGV` in a thread of the
-driver's own while its exit handler waited on a lock. On the Vulkan platform the runtime's own
-exit handler waits for the runtime's work in progress for a bound only, and on Linux past it ends
-the process with `_exit` there, so the exit handlers registered before it never run, QEMU's exit
-notifiers among them: with a device kept to a paused VM's quit, 5 of 9 quits on an RTX 3090 and 5
-of 9 on an RTX 2080 left QEMU's pidfile behind. On false the library writes its degradation counts
-then, as the exit gate's handler would, and the host runs its own exit work and ends with `_exit`,
-running no exit handler, the runtime's and the driver's included. A second call on the same thread
-answers at once, with the first answer; after it, a call on any other thread parks that thread for
-good, and on the platform over metal2vulkan-rt the runtime refuses GPU work asked for on this one
-(`rt-refused-quiesced` in the degradation counts). After a true answer the exit gate's handler
-still runs at the exit, and writes the counts.
+bound, and nothing is freed. It answers true where the steps ended in time and the library
+holds no GPU device the exit could meet: on the Vulkan platform, where none was opened in the
+process; on the platform over metal2vulkan-rt, also where the release of the last graphics
+device let go of them. It answers false otherwise, quiesced or not, and where a step outlasted
+the wait, since neither platform's runtime supports an `exit` with a device live.
+metal2vulkan-rt supports it on no device (its README, "Quiesce and exit"): on an RTX 3090
+(620.70.06), 3 of 9 power-offs that called `exit` after the quiesce stopped everything in time
+ended with `SIGSEGV` in a thread of the driver's own while its exit handler waited on a lock. On
+the Vulkan platform the runtime's own exit handler, registered as its first device was made,
+waits for the runtime's work in progress for a bound only, and on Linux past it ends the process
+with `_exit` there, so the exit handlers registered before it never run, QEMU's exit notifiers
+among them: with a device kept to a paused VM's quit, 5 of 9 quits on an RTX 3090 and 5 of 9 on an
+RTX 2080 left QEMU's pidfile behind. The let-go of the device does not end that work: a quit 24 s
+into a boot on the RTX 2080, whose release let go of the device 315 ms after the quit, met the
+handler waiting for a pipeline's making still in the driver, and ended 9.6 s after the quit with
+the pidfile left. So once that platform opened a device it answers false, let go of since or not.
+On false the library writes its degradation counts then, as the exit gate's handler would, and the
+host runs its own exit work and ends with `_exit`, running no exit handler, the runtime's and the
+driver's included. A second call on the same thread answers at once, with the first answer; after
+it, a call on any other thread parks that thread for good, and on the platform over metal2vulkan-rt
+the runtime refuses GPU work asked for on this one (`rt-refused-quiesced` in the degradation
+counts). After a true answer the exit gate's handler still runs at the exit, and writes the counts.
 
 QEMU calls it, with a bound of 5 s, at the end of its cleanup (`qemu_cleanup`, through a notifier of
 its own run there, `qemu_add_cleanup_notifier`), on every quit that reaches it: a released device,

@@ -86,13 +86,39 @@ pub fn let_go_of_devices(bound: Duration) -> Result<usize, String> {
 /// asked for before any device was adopted. The devices handed the guest's RAM and the one the
 /// sampler mempool follows are adopted ones. [`let_go_of_devices`] takes them all, so 0 once it
 /// let go of them, until a device is adopted again. What the platform's quiesce ahead of the
-/// exit answers by.
+/// exit logs.
 pub fn gpus_kept() -> usize {
     let mut ids = crate::gpu::device::adopted_runtime_ids();
     ids.extend(crate::platform::answering_runtime_id());
     ids.sort_unstable();
     ids.dedup();
     ids.len()
+}
+
+/// Whether the platform asked metal2vulkan's runtime for a device in this process
+/// ([`asks_the_runtime_for_devices`]).
+static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The platform is about to ask metal2vulkan's runtime for devices, or adopts one the runtime
+/// made: each of its makes calls this first (the process's default device, a window's own
+/// device, `MTLCopyAllDevices`'s devices, the device choice's timed devices), and so does the
+/// adoption of a device (`gpu::device::adopt`). Marked before the make, whatever it answers: a
+/// device made registers the runtime's exit hook for the rest of the process, its let-go
+/// notwithstanding, and so can a make that is refused, as `Device::all_with` is when a physical
+/// device after the first refuses its device, once it made the devices before it
+/// (metal2vulkan-runtime's `device/create.rs`, read from code).
+pub(crate) fn asks_the_runtime_for_devices() {
+    ASKED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether the platform asked metal2vulkan's runtime for a device in this process
+/// (`asks_the_runtime_for_devices`), let go of since or not: what the platform's quiesce ahead
+/// of the exit answers by. The let-go of the devices does not end the runtime's work: one of
+/// its pipeline makings can still be in the driver after the device's last drop, and the
+/// runtime's exit hook, registered at the device's making, then waits for it at the exit and,
+/// on Linux, ends the process with `_exit` itself (`crate::platform`'s quiesce).
+pub fn asked_the_runtime_for_devices() -> bool {
+    ASKED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// A stop the device's threads wait on between their steps ([`DeviceThreads`]).

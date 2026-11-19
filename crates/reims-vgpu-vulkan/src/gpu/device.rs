@@ -278,8 +278,10 @@ pub(crate) fn take_if_only_kept()
 /// report logged with what is known then ([`crate::in_place_log`]). The exit gate's hook is
 /// registered, after the device's driver was loaded ([`crate::exit_gate`]): every process that
 /// holds a device of the process's, a test's or a host's, waits at its exit for the library's GPU
-/// work in progress.
+/// work in progress. The process then counts as one the runtime made a device in, for the quiesce
+/// ahead of its exit ([`crate::let_go::asked_the_runtime_for_devices`]).
 pub fn adopt(raw: rt::Device) -> VulkanDevice {
+    crate::let_go::asks_the_runtime_for_devices();
     let id = registry_id(&raw);
     let mut devices = DEVICES.lock();
     if let Some((_, kept)) = devices.iter().find(|(at, _)| *at == id) {
