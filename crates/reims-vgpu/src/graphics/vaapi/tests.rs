@@ -338,7 +338,7 @@ fn the_rt_platforms_va_api_arm_decodes_alone() {
         let gpu = device.host_gpu();
         let node = reims_vgpu_vulkan::host_gpus::render_node_at(gpu.render, gpu.pci);
         let display = Display::open(
-            &node.expect("a render node"),
+            node.expect("a render node"),
             crate::video::runtime::PlatformRuntime::of(&platform),
         )
         .expect("a VA display");
