@@ -65,7 +65,7 @@ use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent as _};
 use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 #[cfg(unix)]
-use reims_vgpu_vulkan::core::platform::resource::{ExportedMemory, SurfaceMemory as _};
+use reims_vgpu_vulkan::core::platform::resource::ExportedMemory;
 use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
 #[cfg(unix)]
 use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlSize};

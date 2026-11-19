@@ -1114,7 +1114,7 @@ fn a_picture_written_into_a_dma_buf_cache_by_video_processing_is_the_cpus_copy()
                             dma_buf: exported.fd,
                             size: exported.allocation_size,
                             offset: exported.offset,
-                            buffer: cache.clone_ref(),
+                            cache: CacheOf::Buffer(cache.clone_ref()),
                             last: Mutex::new(None),
                         }),
                         identity: life.identity(),

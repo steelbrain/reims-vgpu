@@ -7,7 +7,7 @@
 //! or `R16Unorm` and `RG16Unorm` (16-bit), of `ShaderRead | RenderTarget | PixelFormatView`, so a
 //! guest texture over the plane in another format of the texel's size (an `R8Uint`) is a view of
 //! it, in the memory the host's video imports through the surface's handle
-//! ([`GpuDevice::new_exported_surface`]). The planes are the cache's plane shapes, which the
+//! ([`new_exported_surface`]). The planes are the cache's plane shapes, which the
 //! bound never drops. Each plane holds room for a coded picture's rows below its own (a
 //! multiple of 64 luma rows, 32 chroma), for VA-API's decodes into it; the pitch and each plane's
 //! start are multiples of 256, as VA-API's imports and CUDA's copies take them.
@@ -22,7 +22,10 @@
 //!
 //! A platform that makes no such surface (the default, and one that exports no such memory)
 //! answers `None`, counted, and the cache's shapes are made as any other's.
+//!
+//! [`new_exported_surface`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::new_exported_surface
 
+#[cfg(unix)]
 use std::sync::Arc;
 
 #[cfg(unix)]
@@ -44,7 +47,9 @@ use reims_vgpu_vulkan::core::raise::refusals;
 use super::super::video::SurfaceTarget;
 #[cfg(unix)]
 use super::shapes::Held;
-use super::shapes::{ShapeCounts, ShapeKey, ShapeTable};
+#[cfg(unix)]
+use super::shapes::ShapeKey;
+use super::shapes::{ShapeCounts, ShapeTable};
 #[cfg(unix)]
 use super::{Caches, ON, SurfaceCaches};
 
@@ -54,16 +59,20 @@ const BUFFER_APART: bool = true;
 
 /// `MTLPixelFormatR8Unorm`, `RG8Unorm`, `R16Unorm` and `RG16Unorm`: a plane image's format, by
 /// the bytes of a luma sample.
+#[cfg(unix)]
 const PLANE_FORMATS: [(u64, [u64; 2]); 2] = [(1, [10, 30]), (2, [20, 60])];
 
 /// A plane image's usage: `ShaderRead | RenderTarget | PixelFormatView`.
+#[cfg(unix)]
 const PLANE_USAGE: u64 = 0x1 | 0x4 | 0x10;
 
 /// The pitch, and each plane's start after the first, a multiple of this many bytes: VA-API's
 /// imports of a surface's planes take them on 256, CUDA's copies on any.
+#[cfg(unix)]
 const PLANE_ALIGNMENT: u64 = 256;
 
 /// The coded rows a plane holds: its rows rounded up to these, luma's and chroma's.
+#[cfg(unix)]
 const CODED_ROWS: [u64; 2] = [64, 32];
 
 /// How a cache made for the host's video shares its memory, as its make made it.
@@ -90,8 +99,10 @@ impl VideoMemory {
 pub(super) struct CacheSurface<P: Platform> {
     /// Where the cache was made for the host's video with a surface of two planes: its memory's
     /// kind and the planes' layout in the surface's bytes.
+    #[cfg(unix)]
     video: Option<(VideoMemory, [PagesPlane; 2])>,
     /// A surface was asked of the platform ([`Self::ask`]), once a cache.
+    #[cfg(unix)]
     asked: bool,
     /// The surface made.
     #[cfg(unix)]
@@ -110,9 +121,14 @@ impl<P: Platform> CacheSurface<P> {
     /// A cache's, made for the host's video as `video` says (`None` for any other cache), its
     /// surface laid out as `layout` where its ask gave it.
     pub(super) fn new(video: Option<VideoMemory>, layout: Option<&[PagesPlane]>) -> Self {
+        #[cfg(unix)]
         let planes = layout.and_then(|planes| <[PagesPlane; 2]>::try_from(planes).ok());
+        #[cfg(not(unix))]
+        let _ = (video, layout);
         CacheSurface {
+            #[cfg(unix)]
             video: video.zip(planes),
+            #[cfg(unix)]
             asked: false,
             #[cfg(unix)]
             made: None,
@@ -135,6 +151,7 @@ impl<P: Platform> CacheSurface<P> {
 /// The plane shapes of the planes `layout` lays out, of `luma_texel`-byte luma samples: each
 /// plane's whole extent at its place and pitch, plain; `None` where a plane's rows are no whole
 /// texels, or the chroma plane is not half the luma's each way, rounded up.
+#[cfg(unix)]
 fn plane_keys(layout: &[PagesPlane; 2], luma_texel: u64) -> Option<[ShapeKey; 2]> {
     let key = |plane: u64| {
         let laid = layout[usize::try_from(plane).ok()?];
@@ -441,7 +458,7 @@ impl<P: Platform> Caches<P> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
