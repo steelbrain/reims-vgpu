@@ -500,7 +500,10 @@ impl<P: Platform> GraphicsVideo<P> for Shared<P> {
         encode::guest_encoders(&self.0.encoders)
     }
 
-    fn guest_encoder(&self, config: &EncoderConfig) -> Result<Box<dyn GuestEncoder<P>>, VideoError> {
+    fn guest_encoder(
+        &self,
+        config: &EncoderConfig,
+    ) -> Result<Box<dyn GuestEncoder<P>>, VideoError> {
         let video = &self.0;
         let encoder = encode::NvGuestEncoder::new(&video.gpu, config, video.filler())?;
         Ok(Box::new(encoder))

@@ -34,9 +34,9 @@ use metal2vulkan_rt as rt;
 
 use crate::core::platform::resource::ExportedMemory;
 
+use super::RtObj;
 use super::buffer::{self, RtBuffer};
 use super::device::RtDevice;
-use super::RtObj;
 
 /// The log target of the exports' lines.
 const TARGET: &str = "reims_vgpu_vulkan::rt_platform";
@@ -142,7 +142,8 @@ impl Exported {
                 self.handle
             ));
         }
-        let fd = (self.fd.try_clone()).map_err(|error| format!("a new fd of the export: {error}"))?;
+        let fd =
+            (self.fd.try_clone()).map_err(|error| format!("a new fd of the export: {error}"))?;
         Ok(ExportedMemory {
             fd,
             allocation_size: self.size,
@@ -223,7 +224,9 @@ mod tests {
         assert!(buffer.export_dma_buf().is_err());
         assert_eq!(buffer.external_write_done(), Ok(()));
         let unaligned = device.new_exportable_buffer_of_length(on, 4096, 0x20, None);
-        let unaligned = unaligned.expect("never a raise").expect("an exportable buffer");
+        let unaligned = unaligned
+            .expect("never a raise")
+            .expect("an exportable buffer");
         assert_eq!(unaligned.export_memory().expect("an export").offset, 0);
 
         let plain = (device.new_buffer_of_length(on, 4096, 0x20))

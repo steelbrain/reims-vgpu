@@ -614,7 +614,9 @@ fn each_frame_filled_by_the_gpu_encodes_as_uploaded() {
     crate::entry::run(|_| {
         let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
-        let video = super::super::NvidiaVideo::new(&device, &runtime).expect("NVENC on the GPU");
+        let gpu = crate::graphics::video_choice::nvidia_gpu(&device);
+        let video = super::super::NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime, true)
+            .expect("NVENC on the GPU");
         assert!(video.imports.is_some(), "CUDA imports no exportable buffer");
         let queue = device.new_command_queue().expect("a command queue");
         let (width, height) = (1920u32, 1080u32);

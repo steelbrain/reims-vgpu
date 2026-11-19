@@ -401,7 +401,9 @@ fn a_guest_encoders_frames_code_alike_from_the_cpu_and_the_gpu_and_decode_back()
     crate::entry::run(|_| {
         let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
-        let video = Arc::new(NvidiaVideo::new(&device, &runtime).expect("NVENC on the GPU"));
+        let gpu = crate::graphics::video_choice::nvidia_gpu(&device);
+        let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime, true);
+        let video = Arc::new(video.expect("NVENC on the GPU"));
         assert!(video.imports.is_some(), "CUDA imports no exportable buffer");
         let encoders = Shared(Arc::clone(&video)).guest_encoders();
         assert!(

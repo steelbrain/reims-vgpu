@@ -1,5 +1,5 @@
 //! Which of the host's video arms the reims-graphics device's video runs on ([`graphics_video`]
-//! on the Vulkan platform, [`rt_graphics_video`] on the rt platform): the first that takes the
+//! on the Vulkan platform, `rt_graphics_video` on the rt platform): the first that takes the
 //! platform device, in this order. Each that declines says why in one line at info, and costs no
 //! more than asking: a GPU that is not NVIDIA's loads no CUDA.
 //!
@@ -26,12 +26,9 @@ pub(crate) fn graphics_video(
     runtime: Arc<dyn Runtime>,
 ) -> Option<Arc<dyn GraphicsVideo<VulkanPlatform>>> {
     #[cfg(target_os = "linux")]
-    if let Some(video) = super::nvidia::open::<VulkanPlatform>(
-        device,
-        nvidia_gpu(device),
-        &runtime,
-        true,
-    ) {
+    if let Some(video) =
+        super::nvidia::open::<VulkanPlatform>(device, nvidia_gpu(device), &runtime, true)
+    {
         return Some(video);
     }
     #[cfg(any(target_os = "linux", windows))]
