@@ -767,7 +767,11 @@ mod tests {
             made.expect("never a raise").expect("a buffer in the heap")
         };
         let input = buffer();
-        let barriers = || crate::rt_platform::device::metrics().expect("rt's metrics").barriers;
+        let barriers = || {
+            crate::rt_platform::device::metrics()
+                .expect("rt's metrics")
+                .barriers
+        };
         // The barriers of one encoder that writes `written`, then reads `read` into a buffer of
         // its own.
         let barriers_between = |written: &RtObj<RtBuffer>, read: &RtObj<RtBuffer>| {
