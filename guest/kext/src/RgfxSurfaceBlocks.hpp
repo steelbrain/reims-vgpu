@@ -55,7 +55,8 @@
 // A block's BLOCK_UNSHAREs not yet posted (rgfxBlockUnsharing).
 #include "RgfxBlockTable.hpp"
 
-// The most clients that hold one plane's block.
+// The clients that hold one plane's block in its entry itself: the most, but where the kext grows
+// a block's holds past them (rgfxSurfaceGrowHolds, RGFX_FEATURE_SURFACE_CACHE_EVERY taken).
 constexpr uint32_t kRgfxSurfaceHolders = 16;
 
 // One client's hold of a plane's block.
@@ -69,6 +70,25 @@ struct RgfxSurfaceHold {
 	void *pages;
 	// The hold is new and its BLOCK_SHARE not yet posted (rgfxSurfaceSharing).
 	bool sharing;
+};
+
+// A block's holds: the first kRgfxSurfaceHolders in the entry, and past them, where the kext grew
+// them, `moreCapacity` more in `more`, the caller's memory, which stays with the table's entry
+// for its next block (rgfxSurfaceClear) and is never given back while the table lasts.
+struct RgfxSurfaceHolds {
+	RgfxSurfaceHold first[kRgfxSurfaceHolders];
+	RgfxSurfaceHold *more;
+	uint32_t moreCapacity;
+
+	RgfxSurfaceHold &operator[](uint32_t i)
+	{
+		return i < kRgfxSurfaceHolders ? first[i] : more[i - kRgfxSurfaceHolders];
+	}
+	const RgfxSurfaceHold &operator[](uint32_t i) const
+	{
+		return i < kRgfxSurfaceHolders ? first[i] : more[i - kRgfxSurfaceHolders];
+	}
+	uint32_t capacity() const { return kRgfxSurfaceHolders + moreCapacity; }
 };
 
 // A plane's shared block, where `used`.
@@ -88,7 +108,7 @@ struct RgfxSurfaceEntry {
 	uint64_t length;
 	RgfxPageRun *runs;
 	uint32_t runCount;
-	RgfxSurfaceHold holds[kRgfxSurfaceHolders];
+	RgfxSurfaceHolds holds;
 	uint32_t holdCount;
 	// The surface's IOSurface and its device cache (RgfxAcceleratorLocks.cpp), opaque here, made
 	// at the first write a holder names and kept with the entry (the surface retained); null
@@ -118,8 +138,36 @@ struct RgfxSurfaceEntry {
 	bool surfaceStart;
 };
 
+// The entries past a table's first array grow in chunks of this many (rgfxSurfaceGrow).
+constexpr uint32_t kRgfxSurfaceChunkEntries = 512;
+// The most chunks: with the first array (kRgfxSurfaceMaxBlocks), more entries than the region's
+// block table holds blocks (kRgfxMaxBlocks), so a table that grows never refuses a block for want
+// of an entry before the block table does.
+constexpr uint32_t kRgfxSurfaceChunks = 32;
+
+// A table's entries: the first array, the caller's, and the chunks the table grew by, each the
+// caller's too, from entry `moreFrom` on. No entry ever moves, as a caller holds one across the
+// lock's drops (RgfxAcceleratorContexts.cpp), and no chunk is given back while the table lasts.
+struct RgfxSurfaceEntries {
+	RgfxSurfaceEntry *first = nullptr;
+	uint32_t moreFrom = 0;
+	uint32_t chunks = 0;
+	RgfxSurfaceEntry *more[kRgfxSurfaceChunks] = {};
+
+	constexpr RgfxSurfaceEntries() = default;
+	constexpr RgfxSurfaceEntries(RgfxSurfaceEntry *entries) : first(entries) {}
+	RgfxSurfaceEntry &operator[](uint32_t i) const
+	{
+		if (!chunks || i < moreFrom)
+			return first[i];
+		const uint32_t at = i - moreFrom;
+		return more[at / kRgfxSurfaceChunkEntries][at % kRgfxSurfaceChunkEntries];
+	}
+	explicit operator bool() const { return first != nullptr; }
+};
+
 struct RgfxSurfaceTable {
-	RgfxSurfaceEntry *entries;
+	RgfxSurfaceEntries entries;
 	uint32_t capacity;
 	// The dormant entries: how many, the bytes of their surfaces' pages, all wired, and the last
 	// `dormantSeq` given.
@@ -136,6 +184,26 @@ struct RgfxSurfaceTable {
 constexpr uint32_t kRgfxDormantMaxBlocks = 1024;
 // The most planes with a shared block at once, held or dormant: 512 held past the dormant ones.
 constexpr uint32_t kRgfxSurfaceMaxBlocks = 512 + kRgfxDormantMaxBlocks;
+
+// Whether the table may grow by one more chunk.
+inline bool rgfxSurfaceMayGrow(const RgfxSurfaceTable &t)
+{
+	return t.entries && t.entries.chunks < kRgfxSurfaceChunks;
+}
+
+// The table grows by `chunk`, kRgfxSurfaceChunkEntries entries of the caller's memory, zeroed,
+// which it keeps for its life. Where it may not grow (rgfxSurfaceMayGrow): false, the chunk still
+// the caller's.
+inline bool rgfxSurfaceGrow(RgfxSurfaceTable &t, RgfxSurfaceEntry *chunk)
+{
+	if (!chunk || !rgfxSurfaceMayGrow(t))
+		return false;
+	if (!t.entries.chunks)
+		t.entries.moreFrom = t.capacity;
+	t.entries.more[t.entries.chunks++] = chunk;
+	t.capacity += kRgfxSurfaceChunkEntries;
+	return true;
+}
 // The most cached surfaces at once (RgfxSurfaceCaches.hpp): one for every block the table holds,
 // any of them cached, and as many again whose release is posted and not yet answered, as a
 // surface stays cached from its block's let-go until then. Fewer, and dormant blocks, which are
@@ -288,7 +356,8 @@ enum RgfxSurfaceHoldResult {
 	kRgfxSurfaceHoldNew = 0,
 	// The client holds it already, one ask more: the caller unwires `pages`.
 	kRgfxSurfaceHoldAgain,
-	// kRgfxSurfaceHolders clients hold it: no hold; the caller unwires `pages`.
+	// As many clients hold it as its holds have room for: no hold; the caller unwires `pages`, or
+	// grows the holds (rgfxSurfaceGrowHolds) and asks again.
 	kRgfxSurfaceHoldFull,
 };
 
@@ -302,10 +371,32 @@ inline RgfxSurfaceHoldResult rgfxSurfaceHold(RgfxSurfaceEntry &e, const void *cl
 			return kRgfxSurfaceHoldAgain;
 		}
 	}
-	if (e.holdCount == kRgfxSurfaceHolders)
+	if (e.holdCount == e.holds.capacity())
 		return kRgfxSurfaceHoldFull;
 	e.holds[e.holdCount++] = {client, context, 1, pages, true};
 	return kRgfxSurfaceHoldNew;
+}
+
+// The entry's holds grow to `capacity` past the first kRgfxSurfaceHolders, in `more`, the caller's
+// memory, which the entry keeps (RgfxSurfaceHolds), the holds past the first kept in it. Answers
+// the array it held before, `*oldCapacity` holds, for the caller to free (null, 0, where none),
+// or `more` itself, where it is no bigger, the holds unchanged.
+inline RgfxSurfaceHold *rgfxSurfaceGrowHolds(RgfxSurfaceEntry &e, RgfxSurfaceHold *more,
+                                             uint32_t capacity, uint32_t *oldCapacity)
+{
+	if (!more || capacity <= e.holds.moreCapacity) {
+		*oldCapacity = capacity;
+		return more;
+	}
+	for (uint32_t i = 0; i < e.holds.moreCapacity; i++)
+		more[i] = e.holds.more[i];
+	for (uint32_t i = e.holds.moreCapacity; i < capacity; i++)
+		more[i] = RgfxSurfaceHold{};
+	RgfxSurfaceHold *old = e.holds.more;
+	*oldCapacity = e.holds.moreCapacity;
+	e.holds.more = more;
+	e.holds.moreCapacity = capacity;
+	return old;
 }
 
 // Whether `client`'s hold of the entry's block is new, its BLOCK_SHARE not yet posted: the
@@ -623,7 +714,11 @@ inline void rgfxSurfaceClear(RgfxSurfaceTable &t, RgfxSurfaceEntry &e)
 	rgfxSurfaceWake(t, e);
 	if (e.deferred)
 		t.deferredBytes -= e.length;
+	RgfxSurfaceHold *more = e.holds.more;
+	const uint32_t moreCapacity = e.holds.moreCapacity;
 	e = RgfxSurfaceEntry{};
+	e.holds.more = more;
+	e.holds.moreCapacity = moreCapacity;
 }
 
 // Appends the physical segment of `length` bytes at `addr`, the next of a plane's in its order,
@@ -688,7 +783,9 @@ inline bool rgfxSurfaceRunsSame(const RgfxRunsWalk &w)
 
 // Why the kext gives a process no shared copy block of a plane (an ask not in place): the
 // process then copies the surface in a block of its own, which no other holder shares, so
-// another process's GPU writes reach it only through the surface's pages.
+// another process's GPU writes reach it only through the surface's pages. And where the device
+// caches every surface (RGFX_FEATURE_SURFACE_CACHE_EVERY), why it gives no block in place, the
+// last three for that alone: the process then copies the surface, in a copy block.
 enum RgfxCopyRefusal : uint32_t {
 	kRgfxCopyRefusedShape = 0, // a plane length or block size the kext does not take
 	kRgfxCopyRefusedPages,     // the plane's range is not mapped in the task, or not wired
@@ -698,6 +795,9 @@ enum RgfxCopyRefusal : uint32_t {
 	kRgfxCopyRefusedRoom,      // the region has no room
 	kRgfxCopyRefusedMap,       // the block does not map into the process's window
 	kRgfxCopyRefusedShare,     // the device was not told of the hold
+	kRgfxCopyRefusedUncacheable, // in place: the ask names no surface, layout or cache to make
+	kRgfxCopyRefusedNoCache,     // in place: the surface's device cache was not made
+	kRgfxCopyRefusedHost,        // in place: the device refused the surface's pages
 	kRgfxCopyRefusals,
 };
 
@@ -720,6 +820,12 @@ inline const char *rgfxCopyRefusalName(uint32_t why)
 		return "the block does not map into the process's window";
 	case kRgfxCopyRefusedShare:
 		return "the device was not told of the hold";
+	case kRgfxCopyRefusedUncacheable:
+		return "the ask names no surface, layout or device cache to make";
+	case kRgfxCopyRefusedNoCache:
+		return "the surface's device cache was not made";
+	case kRgfxCopyRefusedHost:
+		return "the device refused the surface's pages";
 	default:
 		return "unknown";
 	}

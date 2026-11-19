@@ -148,9 +148,33 @@ struct LockState {
 	uint64_t wakes;
 	// Under `lock`: how the deferrals whose asks listed resident pages ended (RgfxCarryOutcome).
 	uint64_t carries[kRgfxCarryOutcomes];
+	// Set once, at the first context's open (rgfxSurfaceCacheSetGrows): where the device caches
+	// every surface, `caches` grows, twice as large each time it is full (growCaches), rather than
+	// leave a surface uncached; under `lock`, how many times it grew.
+	bool grows;
+	uint64_t grown;
 };
 LockState state = {nullptr, {nullptr, 0, kMaxUses, nullptr, 0, kMaxQueues}, nullptr, 0, 0, 0,
-                   kWaitMs, 0, {nullptr, 0, kMaxCached}, 0, 0, 0, {}};
+                   kWaitMs, 0, {nullptr, 0, kMaxCached}, 0, 0, 0, {}, false, 0};
+
+// Under state.lock: where the table of cached surfaces grows and is full, it doubles
+// (rgfxCacheGrow). Where the memory is not there, it stays as it is, and the add finds no room,
+// as before.
+void growCaches()
+{
+	RgfxCacheTable &t = state.caches;
+	if (!__atomic_load_n(&state.grows, __ATOMIC_RELAXED) || t.count < t.capacity || !t.entries)
+		return;
+	const uint32_t was = t.capacity, capacity = 2 * t.capacity;
+	auto *grown = static_cast<RgfxCachedSurface *>(IOMalloc(sizeof(RgfxCachedSurface) * capacity));
+	RgfxCachedSurface *old = rgfxCacheGrow(t, grown, capacity);
+	if (old && old != grown) {
+		IOFree(old, sizeof(RgfxCachedSurface) * was);
+		state.grown++;
+	} else if (grown) {
+		IOFree(grown, sizeof(RgfxCachedSurface) * capacity);
+	}
+}
 
 bool startLocks()
 {
@@ -896,6 +920,8 @@ RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
 	     mach_absolute_time() < deadline;)
 		IOLockSleepDeadline(state.lock, &state.table, deadline, THREAD_UNINT);
 	const bool previous = rgfxCacheFind(state.caches, key) != nullptr;
+	if (!previous)
+		growCaches();
 	RgfxCachedSurface *c = previous ? nullptr : rgfxCacheAdd(state.caches, key, offset, surfaceId);
 	if (c) {
 		c->genAt = reinterpret_cast<volatile uint64_t *>(header->getVirtualAddress() +
@@ -1206,7 +1232,7 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 	if (rgfxCacheFind(state.caches, key)) {
 		why = "its previous block is cached still, its release unanswered";
 		logged = rgfxFirstCalls(&previousCached, 0, 1);
-	} else if (!(c = rgfxCacheAdd(state.caches, key, offset, surfaceId))) {
+	} else if (growCaches(), !(c = rgfxCacheAdd(state.caches, key, offset, surfaceId))) {
 		why = "no room for its device cache's state";
 		logged = ++state.noRoom <= kNoRoomLogged;
 	}
@@ -1277,6 +1303,21 @@ UInt64 rgfxSurfaceCacheNoRoom()
 		return 0;
 	IOLockLock(state.lock);
 	const UInt64 n = state.noRoom;
+	IOLockUnlock(state.lock);
+	return n;
+}
+
+void rgfxSurfaceCacheSetGrows(bool grows)
+{
+	__atomic_store_n(&state.grows, grows, __ATOMIC_RELAXED);
+}
+
+UInt64 rgfxSurfaceCacheGrown()
+{
+	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return 0;
+	IOLockLock(state.lock);
+	const UInt64 n = state.grown;
 	IOLockUnlock(state.lock);
 	return n;
 }

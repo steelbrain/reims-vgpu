@@ -180,6 +180,11 @@ uint32_t rgfxSurfaceCacheLetGoOf(UInt64 offset, bool *written, bool *purgeable);
 // How many surfaces' blocks went uncached as the table of cached surfaces had no room
 // (kRgfxCachedMaxSurfaces). Takes the locks' lock alone.
 UInt64 rgfxSurfaceCacheNoRoom();
+// Whether the table of cached surfaces grows where it is full rather than leave a surface
+// uncached: where the device caches every surface (RGFX_FEATURE_SURFACE_CACHE_EVERY), set at the
+// first context's open. And how many times it grew. The second takes the locks' lock alone.
+void rgfxSurfaceCacheSetGrows(bool grows);
+UInt64 rgfxSurfaceCacheGrown();
 // How many releases posted unheld (RGFX_BLOCK_RELEASE_UNHELD) and answered OK had their surface
 // taken again by a process before the answer (rgfxCacheRetaken). Takes the locks' lock alone.
 UInt64 rgfxSurfaceCacheRetaken();

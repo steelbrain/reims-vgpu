@@ -200,7 +200,14 @@
 //  - PRIVATE_BLOCKS (bit 60), both kexts: the kext posts a context's PRIVATE_TAKE and PRIVATE_GIVE
 //    (kRgfxAccelMethodPrivateTake, kRgfxAccelMethodPrivateGive) and answers each block's GPU
 //    address and length, where the bundle places its Private buffers, its heaps that are not
-//    Shared and its Managed buffers' GPU copies.
+//    Shared and its Managed buffers' GPU copies;
+//  - SURFACE_CACHE_EVERY (bit 62), both kexts, read with SURFACE_CACHE: the host's GPU form of
+//    every IOSurface is its device cache, so the accelerator names every block in place cached and
+//    refuses, before it posts anything, an ask in place it cannot cache; its tables of the
+//    surfaces' blocks, of a block's holders and of the cached surfaces grow rather than refuse;
+//    and it counts each copy block it makes, a surface's second copy beside its device cache, and
+//    each ask in place it refuses, by why, as the bundle counts each copy view by why it is not in
+//    place (RgfxIOSurface.mm).
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -248,7 +255,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
                             RGFX_FEATURE_CURSOR_COLOR
                       : RGFX_FEATURE_DISPLAY_POWER) |
     RGFX_FEATURE_POOL | RGFX_FEATURE_POOL_ADDRESSES | RGFX_FEATURE_PRIVATE_BLOCKS |
-    RGFX_FEATURE_IMPORT_ADDRESSES;
+    RGFX_FEATURE_IMPORT_ADDRESSES | RGFX_FEATURE_SURFACE_CACHE_EVERY;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer and, on arm64, the
 // displays whose node the firmware placed under /arm-io, counted from display 0 (`mobileNodes`):

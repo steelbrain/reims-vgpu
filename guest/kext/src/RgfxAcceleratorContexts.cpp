@@ -290,6 +290,13 @@ bool surfaceCache = false;
 // cacheable block in place asks it (RGFX_SURFACE_PAGES_ASK_CACHE), and is cached only where it
 // answers RGFX_STATUS_CACHE. Read with surfaceCache.
 bool askCache = false;
+// Whether the device's GPU form of every IOSurface is its device cache
+// (RGFX_FEATURE_SURFACE_CACHE_EVERY, taken), read with surfaceCache, which it needs: every block in
+// place is cached, and an ask in place that cannot be is refused before anything is posted
+// (refuseInPlace); the tables of the surfaces' blocks, of a block's holders and of the cached
+// surfaces grow rather than refuse; and each copy block made or held again, a surface's second
+// copy beside its device cache, is counted (noteFallbackCopy).
+bool cacheEvery = false;
 // The bytes of the host GPU's memory deferred blocks' device caches may hold
 // (RGFX_FEATURE_SURFACE_DEFERRED, or RGFX_FEATURE_SURFACE_DEFERRED_ASK where the device answers
 // which surfaces need a cache, and their DEFERRED_BUDGET registers), read at the first context's
@@ -348,6 +355,12 @@ struct DormantStats {
 	// The surfaces left uncached for want of room (rgfxSurfaceCacheNoRoom) at the last line.
 	UInt64 loggedNoRoom;
 	UInt64 loggedAt;
+	// Where the device caches every surface: the chunks the surface table grew by and the
+	// blocks whose holds grew, under contextLock, and the sum of the fallback counts
+	// (fallbackSum) at the last line.
+	UInt64 tableChunks;
+	UInt64 holdsGrown;
+	UInt64 loggedFallback;
 };
 DormantStats dormantStats = {};
 
@@ -982,6 +995,8 @@ bool RgfxAccelerator::startContexts()
 		askCache = surfacePages && (features & RGFX_FEATURE_SURFACE_CACHE) == 0 &&
 		           (featureWord() & RGFX_FEATURE_SURFACE_CACHE_REFUSED) != 0;
 		surfaceCache = surfacePages && ((features & RGFX_FEATURE_SURFACE_CACHE) != 0 || askCache);
+		cacheEvery = surfaceCache && (featureWord() & RGFX_FEATURE_SURFACE_CACHE_EVERY) != 0;
+		rgfxSurfaceCacheSetGrows(cacheEvery);
 		// Deferred blocks where the kext took the feature, its asking form where the device
 		// answers which surfaces need a cache, and no mapper device maps the surfaces' pages.
 		const uint64_t defers =
@@ -1805,6 +1820,61 @@ IOReturn refuseCopy(RgfxCopyRefusal why, UInt64 length, UInt64 size, IOReturn r)
 	return r;
 }
 
+// Where the device caches every surface (cacheEvery): the asks in place refused, by why, and the
+// copy blocks made and held again, each a surface's second copy beside its device cache, which
+// its other holders' GPU work does not see but through the surface's pages. Atomic; the first of
+// each reason, and the first copy block made, logged, and all on the dormancy line.
+UInt64 inPlaceRefused[kRgfxCopyRefusals];
+uint32_t inPlaceRefusalsLogged;
+UInt64 fallbackCopiesMade;
+UInt64 fallbackCopiesHeld;
+uint32_t fallbackCopyLogged;
+
+// The sum of the fallback counts, which moves wherever one does.
+UInt64 fallbackSum()
+{
+	UInt64 sum = __atomic_load_n(&fallbackCopiesMade, __ATOMIC_RELAXED) +
+	             __atomic_load_n(&fallbackCopiesHeld, __ATOMIC_RELAXED);
+	for (UInt32 i = 0; i < kRgfxCopyRefusals; i++)
+		sum += __atomic_load_n(&inPlaceRefused[i], __ATOMIC_RELAXED);
+	return sum;
+}
+
+// The asking process gets no block in place of a surface of `length` bytes, block `size`, for
+// `why`, where the device caches every surface: counted, logged the first time a reason refuses
+// one, out of the contexts' lock. Its process then copies the surface. Answers `r`.
+IOReturn refuseInPlace(RgfxCopyRefusal why, UInt64 length, UInt64 size, IOReturn r)
+{
+	__atomic_fetch_add(&inPlaceRefused[why], 1, __ATOMIC_RELAXED);
+	if (rgfxCopyRefusalFirst(&inPlaceRefusalsLogged, why)) {
+		char name[32] = {};
+		proc_name(proc_selfpid(), name, sizeof(name));
+		IOLog("RgfxAccelerator: %s[%d] gets no block in place of a surface of %llu bytes (block "
+		      "%llu bytes, 0x%x): %s; the device caches every surface, and the process copies "
+		      "this one in a copy block (the first refusal of this kind)\n",
+		      name, proc_selfpid(), length, size, r, rgfxCopyRefusalName(why));
+	}
+	noteDormant();
+	return r;
+}
+
+// A copy block of a plane of `length` bytes, block `size`, was made for the asking process, or
+// held again (`made` false), where the device caches every surface: counted, the first made
+// logged, out of the contexts' lock.
+void noteFallbackCopy(bool made, UInt64 length, UInt64 size)
+{
+	__atomic_fetch_add(made ? &fallbackCopiesMade : &fallbackCopiesHeld, 1, __ATOMIC_RELAXED);
+	if (made && rgfxCopyRefusalFirst(&fallbackCopyLogged, 0)) {
+		char name[32] = {};
+		proc_name(proc_selfpid(), name, sizeof(name));
+		IOLog("RgfxAccelerator: fallback copy: %s[%d] takes a copy block of a plane of %llu "
+		      "bytes (block %llu bytes), a second copy beside the surface's device cache, as "
+		      "the device caches every surface (the first; the dormancy line counts them)\n",
+		      name, proc_selfpid(), length, size);
+	}
+	noteDormant();
+}
+
 // A chunked pages block refused for `why`, with `made` of `count` chunks taken: logged the first
 // time, the process then taking plain pages. Answers kIOReturnNoMemory.
 IOReturn refuseChunks(const char *why, UInt32 made, UInt32 count)
@@ -2121,19 +2191,44 @@ void noteDormant()
 	UInt64 carries[kRgfxCarryOutcomes] = {};
 	if (deferCarries)
 		rgfxSurfaceCacheCarries(carries);
+	const UInt64 fallback = cacheEvery ? fallbackSum() : 0;
+	const UInt64 cacheTables = cacheEvery ? rgfxSurfaceCacheGrown() : 0;
 	IOLockLock(contextLock);
 	const bool log = (dormantStats.changes != dormantStats.loggedChanges ||
-	                  noRoom != dormantStats.loggedNoRoom) &&
+	                  noRoom != dormantStats.loggedNoRoom ||
+	                  fallback != dormantStats.loggedFallback) &&
 	                 now - dormantStats.loggedAt >= interval;
 	const DormantStats d = dormantStats;
 	const UInt32 count = surfaceTable.dormantCount;
 	const UInt64 bytes = surfaceTable.dormantBytes;
+	const UInt32 entries = surfaceTable.capacity;
 	if (log) {
 		dormantStats.loggedChanges = dormantStats.changes;
 		dormantStats.loggedNoRoom = noRoom;
+		dormantStats.loggedFallback = fallback;
 		dormantStats.loggedAt = now;
 	}
 	IOLockUnlock(contextLock);
+	// Where the device caches every surface: the copy blocks beside the surfaces' device caches,
+	// the asks in place refused by why, and how far the tables grew.
+	if (log && cacheEvery) {
+		UInt64 r[kRgfxCopyRefusals] = {};
+		for (UInt32 i = 0; i < kRgfxCopyRefusals; i++)
+			r[i] = __atomic_load_n(&inPlaceRefused[i], __ATOMIC_RELAXED);
+		IOLog("RgfxAccelerator: every surface cached: fallback copy blocks %llu made, %llu held "
+		      "again; asks in place refused: %llu uncacheable, %llu no device cache, %llu by the "
+		      "device, %llu no room, %llu table full, %llu not mapped, %llu share not posted, "
+		      "%llu pages not wired, %llu of another shape or mode, %llu holders; grown: %llu "
+		      "chunks of the surface table (%u entries), %llu blocks' holds, %llu cached-surface "
+		      "tables\n",
+		      __atomic_load_n(&fallbackCopiesMade, __ATOMIC_RELAXED),
+		      __atomic_load_n(&fallbackCopiesHeld, __ATOMIC_RELAXED),
+		      r[kRgfxCopyRefusedUncacheable], r[kRgfxCopyRefusedNoCache], r[kRgfxCopyRefusedHost],
+		      r[kRgfxCopyRefusedRoom], r[kRgfxCopyRefusedTable], r[kRgfxCopyRefusedMap],
+		      r[kRgfxCopyRefusedShare], r[kRgfxCopyRefusedPages],
+		      r[kRgfxCopyRefusedShape] + r[kRgfxCopyRefusedDiffers], r[kRgfxCopyRefusedHolders],
+		      d.tableChunks, entries, d.holdsGrown, cacheTables);
+	}
 	if (log)
 		IOLog("RgfxAccelerator: dormant surface blocks: %u held (%llu of %llu MiB); %llu slept, "
 		      "%llu revived; let go: %llu purged (%llu with a cache written), %llu made "
@@ -2222,9 +2317,12 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	if (inPlace && (!surfacePages || !region))
 		return kIOReturnUnsupported;
 	// A refused copy block says why, once a reason (refuseCopy); the bundle counts the refusals
-	// of blocks in place.
+	// of blocks in place, and so does the kext, by why, where the device caches every surface
+	// (refuseInPlace).
 	auto refused = [&](RgfxCopyRefusal why, IOReturn r) {
-		return inPlace ? r : refuseCopy(why, length, size, r);
+		if (inPlace)
+			return cacheEvery ? refuseInPlace(why, length, size, r) : r;
+		return refuseCopy(why, length, size, r);
 	};
 	if (!length || length > kMaxPlaneBytes || !size || size % kPage || size > 2 * kMaxPlaneBytes)
 		return refused(kRgfxCopyRefusedShape, kIOReturnBadArgument);
@@ -2232,6 +2330,11 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	// pages, which the device maps as they are.
 	if (inPlace ? address % kPage || length % kPage : size < length)
 		return refused(kRgfxCopyRefusedShape, kIOReturnBadArgument);
+	// Where the device caches every surface, a block in place is cached or not made: an ask that
+	// names no surface, or asks no cache (the bundle's video decoder's outputs where the host
+	// lands no picture in a cache), is refused before anything is posted.
+	if (inPlace && cacheEvery && (!surfaceId || !cacheable))
+		return refused(kRgfxCopyRefusedUncacheable, kIOReturnUnsupported);
 	RgfxSurfaceTable &table = surfaceTable;
 	// The asker's IOSurface, where the device caches surfaces: a new block of it waits for its
 	// pages' write-back (rgfxSurfaceCacheWritingBack), and a cached block in place of it, held or
@@ -2462,6 +2565,21 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 			// A new block: a dormant one gives its entry where the table is full, and the
 			// region's room where it has none, its release waited for a while, once.
 			slot = rgfxSurfaceFreeEntry(table);
+			// Where the device caches every surface, a full table grows by a chunk, its
+			// entries never moving, before a dormant block gives its entry.
+			if (slot < 0 && cacheEvery && rgfxSurfaceMayGrow(table)) {
+				const size_t bytes = sizeof(RgfxSurfaceEntry) * kRgfxSurfaceChunkEntries;
+				auto *chunk = static_cast<RgfxSurfaceEntry *>(IOMalloc(bytes));
+				if (chunk)
+					bzero(chunk, bytes);
+				if (rgfxSurfaceGrow(table, chunk)) {
+					dormantStats.tableChunks++;
+					dormantStats.changes++;
+					slot = rgfxSurfaceFreeEntry(table);
+				} else if (chunk) {
+					IOFree(chunk, bytes);
+				}
+			}
 			if (slot < 0) {
 				const int32_t oldest = rgfxSurfaceOldestDormant(table);
 				if (oldest >= 0) {
@@ -2517,6 +2635,22 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		if (own)
 			pages = nullptr;
 		RgfxSurfaceHoldResult held = rgfxSurfaceHold(e, client, context, pages);
+		// Where the device caches every surface, a block whose holds are full takes more, twice
+		// as many past the entry's own each time, rather than refuse the holder.
+		if (held == kRgfxSurfaceHoldFull && cacheEvery) {
+			const uint32_t more =
+			    e.holds.moreCapacity ? 2 * e.holds.moreCapacity : kRgfxSurfaceHolders;
+			auto *grown = static_cast<RgfxSurfaceHold *>(IOMalloc(sizeof(RgfxSurfaceHold) * more));
+			uint32_t oldCapacity = 0;
+			RgfxSurfaceHold *old = rgfxSurfaceGrowHolds(e, grown, more, &oldCapacity);
+			if (grown && old != grown) {
+				dormantStats.holdsGrown++;
+				dormantStats.changes++;
+				held = rgfxSurfaceHold(e, client, context, pages);
+			}
+			if (old)
+				IOFree(old, sizeof(RgfxSurfaceHold) * oldCapacity);
+		}
 		*block = {e.offset, e.size, e.serial, revived, e.cached};
 		IOReturn mapped = kIOReturnSuccess;
 		bool keptWire = false;
@@ -2544,6 +2678,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 				return refused(kRgfxCopyRefusedMap, mapped);
 			if (held != kRgfxSurfaceHoldAgain)
 				return refused(kRgfxCopyRefusedHolders, kIOReturnNoResources);
+			// Another ask of the client's: its copy block is counted at its first.
 			return kIOReturnSuccess;
 		}
 		RgfxBlockGrant share = {};
@@ -2584,6 +2719,8 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		// The asker holds the surface: the processes see its clients counted anew.
 		if (posted == kIOReturnSuccess && block->cached)
 			rgfxSurfaceCacheNoteClients(block->offset);
+		if (posted == kIOReturnSuccess && !inPlace && cacheEvery)
+			noteFallbackCopy(false, length, size);
 		return posted == kIOReturnSuccess ? posted : refused(kRgfxCopyRefusedShare, posted);
 	}
 	if (made != kRgfxBlockOk) {
@@ -2659,18 +2796,41 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	// older bundle's) stays in place, as every block of such a device did. Where the device asks
 	// nothing, a cached block's message carries the layout, which places its cache on the host
 	// (rgfxPagesCarryLayout).
+	// Where the device caches every surface, a block in place asks nothing: it is cached, or
+	// goes back as if never made, as one not mapped does, with nothing posted, and its asker
+	// copies the surface (unmade).
+	const bool asks = askCache && !cacheEvery;
+	auto unmade = [&] {
+		IOLockLock(contextLock);
+		client->unmapSpan(offset, rgfxWindowSpanLength(size));
+		rgfxBlockDrop(blockTable, pin);
+		rgfxSurfaceClear(table, e);
+		IOLockWakeup(contextLock, &surfaceTable, false);
+		IOLockUnlock(contextLock);
+		freeRuns(runs, count);
+		unwire(pages);
+		return refused(kRgfxCopyRefusedNoCache, kIOReturnNotReady);
+	};
+	// Why a block in place the device refused was not made, where it caches every surface.
+	RgfxCopyRefusal why = kRgfxCopyRefusedShare;
 	bool cached = false;
 	IOReturn posted = kIOReturnSuccess;
 	if (deferring) {
 		if (!deferSurfaceBlock(e, context, surfaceId, total, layout, task, address, resident,
-		                       &cached))
+		                       &cached)) {
+			if (cacheEvery && !cached)
+				return unmade();
 			posted = kIOReturnUnsupported;
+			why = kRgfxCopyRefusedHost;
+		}
 	} else {
-		const bool ask = inPlace && askCache && cacheable && surfaceId && layout;
-		cached = inPlace && !askCache && surfaceCache && cacheable && surfaceId &&
+		const bool ask = inPlace && asks && cacheable && surfaceId && layout;
+		cached = inPlace && !asks && surfaceCache && cacheable && surfaceId &&
 		         cacheSurface(e, task, surfaceId, offset);
+		if (inPlace && cacheEvery && !cached)
+			return unmade();
 		UInt32 status = RGFX_STATUS_OK;
-		const bool carried = rgfxPagesCarryLayout(layout != nullptr, ask, cached, askCache);
+		const bool carried = rgfxPagesCarryLayout(layout != nullptr, ask, cached, asks);
 		if (inPlace && !postSurfacePages(context, offset, total, size, length, runs, count,
 		                                 cached, carried ? layout : nullptr, &status)) {
 			if (ask && status == RGFX_STATUS_CACHE) {
@@ -2681,6 +2841,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 					posted = kIOReturnUnsupported;
 			} else {
 				posted = kIOReturnUnsupported;
+				why = kRgfxCopyRefusedHost;
 			}
 		}
 	}
@@ -2721,7 +2882,9 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		thread_call_enter(releaseCall);
 	if (client->isWindowServer())
 		noteReserve();
-	return posted == kIOReturnSuccess ? posted : refused(kRgfxCopyRefusedShare, posted);
+	if (posted == kIOReturnSuccess && !inPlace && cacheEvery)
+		noteFallbackCopy(true, length, size);
+	return posted == kIOReturnSuccess ? posted : refused(why, posted);
 }
 
 void RgfxAccelerator::wakeReleases()
@@ -2858,14 +3021,22 @@ bool RgfxAccelerator::deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uin
 	if (uncached)
 		OSSafeReleaseNULL(header);
 	*cached = !uncached;
-	// Where the device answers which surfaces need a cache, the block asks with its surface's
-	// layout, at its deferral and at its naming: the host defers only a block that would need a
-	// cache whatever its pages, and a block whose pages it then takes in place is not cached.
-	const RgfxSurfacePagesLayout *asking = askCache ? layout : nullptr;
+	// Where the device caches every surface, a block not cached names no pages: the caller lets
+	// it go as if never made, nothing posted.
+	if (uncached && cacheEvery) {
+		OSSafeReleaseNULL(uncached);
+		return false;
+	}
+	// Where the device answers which surfaces need a cache, and does not cache every surface,
+	// the block asks with its surface's layout, at its deferral and at its naming: the host
+	// defers only a block that would need a cache whatever its pages, and a block whose pages it
+	// then takes in place is not cached.
+	const bool asks = askCache && !cacheEvery;
+	const RgfxSurfacePagesLayout *asking = asks ? layout : nullptr;
 	// Where the device asks nothing, a cached block's messages carry the surface's layout, which
 	// places its cache on the host (rgfxPagesCarryLayout).
 	const RgfxSurfacePagesLayout *carriedLayout =
-	    rgfxPagesCarryLayout(layout != nullptr, false, *cached, askCache) ? layout : nullptr;
+	    rgfxPagesCarryLayout(layout != nullptr, false, *cached, asks) ? layout : nullptr;
 	// A deferral that carries pages names them in its runs, past the part the processes map, in
 	// the room the block keeps for one run a page: one whose runs could not be written names its
 	// pages now, as a refused one does, nothing read of the carried pages.

@@ -701,6 +701,105 @@ int main()
 	          kRgfxSurfaceHoldFull,
 	      "past the most holders");
 
+	// Where the kext grows a block's holds (RGFX_FEATURE_SURFACE_CACHE_EVERY), the holders past
+	// the entry's own lie in the caller's memory, kept as they grow again, and stay with the
+	// entry's slot once it is cleared.
+	{
+		RgfxSurfaceTable gt = {&full, 1};
+		full.used = true;
+		static_assert(sizeof(full.holds.first) / sizeof(full.holds.first[0]) ==
+		                  kRgfxSurfaceHolders,
+		              "the entry holds kRgfxSurfaceHolders itself");
+		static RgfxSurfaceHold more1[kRgfxSurfaceHolders], more2[2 * kRgfxSurfaceHolders];
+		static char extra[3 * kRgfxSurfaceHolders];
+		uint32_t oldCapacity = 99;
+		check(rgfxSurfaceGrowHolds(full, more1, kRgfxSurfaceHolders, &oldCapacity) == nullptr &&
+		          oldCapacity == 0 && full.holds.capacity() == 2 * kRgfxSurfaceHolders,
+		      "the first growth holds twice as many, with nothing to free");
+		check(rgfxSurfaceHold(full, &clients[kRgfxSurfaceHolders], 99, nullptr) ==
+		          kRgfxSurfaceHoldNew,
+		      "a holder past the entry's own");
+		for (uint32_t i = kRgfxSurfaceHolders + 1; i < 2 * kRgfxSurfaceHolders; i++)
+			check(rgfxSurfaceHold(full, &extra[i], i, nullptr) == kRgfxSurfaceHoldNew,
+			      "holders up to the grown room");
+		check(rgfxSurfaceHold(full, &extra[0], 1, nullptr) == kRgfxSurfaceHoldFull,
+		      "past the grown room: full again");
+		check(rgfxSurfaceGrowHolds(full, more1, kRgfxSurfaceHolders, &oldCapacity) == more1 &&
+		          oldCapacity == kRgfxSurfaceHolders,
+		      "no smaller growth: the offered array goes back");
+		check(rgfxSurfaceGrowHolds(full, more2, 2 * kRgfxSurfaceHolders, &oldCapacity) == more1 &&
+		          oldCapacity == kRgfxSurfaceHolders && full.holds.capacity() == 3 * kRgfxSurfaceHolders,
+		      "a second growth answers the old array to free");
+		check(full.holds[kRgfxSurfaceHolders].client == &clients[kRgfxSurfaceHolders] &&
+		          full.holds[kRgfxSurfaceHolders].context == 99,
+		      "the grown holders kept");
+		check(rgfxSurfaceHold(full, &extra[0], 1, nullptr) == kRgfxSurfaceHoldNew,
+		      "a holder in the new room");
+		check(rgfxSurfaceHold(full, &clients[kRgfxSurfaceHolders], 99, nullptr) ==
+		          kRgfxSurfaceHoldAgain,
+		      "a grown holder found again");
+		void *p = nullptr;
+		uint32_t ctx = 0;
+		check(rgfxSurfaceLetGo(full, &clients[0], true, &p, &ctx) == kRgfxSurfaceLetGoHold &&
+		          ctx == 0,
+		      "a let-go of one of the entry's own");
+		full.offset = 0x40000;
+		full.size = 0x2000;
+		check(rgfxSurfaceHeldBy(gt, &extra[0], 0x40000, 0x1000) &&
+		          !rgfxSurfaceHeldBy(gt, &extra[1], 0x40000, 0x1000),
+		      "held by a grown holder, and by no one else");
+		for (uint32_t n = full.holdCount; n > 1; n--)
+			check(rgfxSurfaceLetGo(full, full.holds[n - 1].client, true, &p, &ctx) ==
+			          kRgfxSurfaceLetGoHold,
+			      "holders let go, from the grown ones");
+		check(rgfxSurfaceLetGo(full, full.holds[0].client, true, &p, &ctx) ==
+		          kRgfxSurfaceLetGoLast,
+		      "the last holder");
+		rgfxSurfaceClear(gt, full);
+		check(!full.used && full.holdCount == 0 && full.holds.more == more2 &&
+		          full.holds.capacity() == 3 * kRgfxSurfaceHolders,
+		      "a cleared entry keeps its grown holds for its slot's next block");
+	}
+
+	// Where the kext grows the table, it grows in chunks that never move its entries, past
+	// as many as the region's block table holds.
+	{
+		static RgfxSurfaceEntry first[2];
+		static RgfxSurfaceEntry chunks[kRgfxSurfaceChunks][kRgfxSurfaceChunkEntries];
+		RgfxSurfaceTable gt = {first, 2};
+		first[0].used = first[1].used = true;
+		first[0].offset = 0x10000;
+		first[1].offset = 0x20000;
+		check(rgfxSurfaceFreeEntry(gt) == -1 && rgfxSurfaceMayGrow(gt), "full, and may grow");
+		check(!rgfxSurfaceGrow(gt, nullptr), "no chunk, no growth");
+		RgfxSurfaceEntry *const at1 = &gt.entries[1];
+		check(rgfxSurfaceGrow(gt, chunks[0]) && gt.capacity == 2 + kRgfxSurfaceChunkEntries &&
+		          gt.entries.moreFrom == 2,
+		      "grown by a chunk past the first array");
+		check(&gt.entries[1] == at1 && &gt.entries[2] == &chunks[0][0] &&
+		          &gt.entries[1 + kRgfxSurfaceChunkEntries] ==
+		              &chunks[0][kRgfxSurfaceChunkEntries - 1],
+		      "the first array's entries stay where they were, the chunk's follow");
+		check(rgfxSurfaceFreeEntry(gt) == 2, "the chunk's first entry is free");
+		gt.entries[2].used = true;
+		gt.entries[2].offset = 0x30000;
+		check(rgfxSurfaceAt(gt, 0x30000) == 2 && rgfxSurfaceAt(gt, 0x20000) == 1,
+		      "found by offset across the arrays");
+		for (uint32_t i = 1; i < kRgfxSurfaceChunks; i++)
+			check(rgfxSurfaceGrow(gt, chunks[i]), "a chunk more");
+		check(&gt.entries[2 + kRgfxSurfaceChunkEntries] == &chunks[1][0] &&
+		          &gt.entries[gt.capacity - 1] ==
+		              &chunks[kRgfxSurfaceChunks - 1][kRgfxSurfaceChunkEntries - 1],
+		      "each chunk follows the last");
+		check(!rgfxSurfaceMayGrow(gt) && !rgfxSurfaceGrow(gt, chunks[0]),
+		      "no more than kRgfxSurfaceChunks chunks");
+		check(kRgfxSurfaceMaxBlocks + kRgfxSurfaceChunks * kRgfxSurfaceChunkEntries >=
+		          kRgfxMaxBlocks,
+		      "a grown table holds as many blocks as the block table");
+		RgfxSurfaceTable none = {};
+		check(!rgfxSurfaceMayGrow(none), "a table not yet made does not grow");
+	}
+
 	// Runs: adjacent segments merge, gaps start a run, and too many runs do not fit.
 	RgfxPageRun runs[2];
 	uint32_t count = 0;

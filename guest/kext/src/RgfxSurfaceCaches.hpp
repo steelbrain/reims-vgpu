@@ -196,6 +196,26 @@ inline RgfxCachedSurface *rgfxCacheOfSurface(RgfxCacheTable &t, uint32_t surface
 	return nullptr;
 }
 
+// The table moves into `entries`, `capacity` of them, the caller's memory, its entries copied in
+// order, where that is more than it holds: the array it held before is answered, for the caller
+// to free. Else `entries` is, the table unchanged. No caller holds an entry across the lock's
+// drops (a remove moves the last entry into its place, rgfxCacheRemove), so none is left over
+// the old array.
+inline RgfxCachedSurface *rgfxCacheGrow(RgfxCacheTable &t, RgfxCachedSurface *entries,
+                                        uint32_t capacity)
+{
+	if (!entries || capacity <= t.capacity)
+		return entries;
+	for (uint32_t i = 0; i < t.count; i++)
+		entries[i] = t.entries[i];
+	for (uint32_t i = t.count; i < capacity; i++)
+		entries[i] = RgfxCachedSurface{};
+	RgfxCachedSurface *old = t.entries;
+	t.entries = entries;
+	t.capacity = capacity;
+	return old;
+}
+
 // Adds the surface `key` (IOSurfaceID `surfaceId`), whose block at `offset` is cached, at CPU
 // generation 0 and no write. Null where the table has no room or the key is there already.
 inline RgfxCachedSurface *rgfxCacheAdd(RgfxCacheTable &t, uint64_t key, uint64_t offset,

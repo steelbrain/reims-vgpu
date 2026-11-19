@@ -217,6 +217,28 @@ void room()
 	check(rgfxCacheAdd(t, key, key << 12, static_cast<uint32_t>(key)) == nullptr,
 	      "past them, none");
 }
+
+// Where the kext grows the table (RGFX_FEATURE_SURFACE_CACHE_EVERY), it moves into a larger array
+// the caller gives, every state kept in order, and the old one goes back to the caller.
+void growth()
+{
+	RgfxCachedSurface first[2] = {}, larger[4] = {}, same[2] = {};
+	RgfxCacheTable t = {first, 0, 2};
+	check(rgfxCacheAdd(t, kSurface, kBlock, kId) != nullptr &&
+	          rgfxCacheAdd(t, kOther, kOtherBlock, kOtherId) != nullptr &&
+	          rgfxCacheAdd(t, 0x777, 0x7000, 7) == nullptr,
+	      "full at two");
+	check(rgfxCacheGrow(t, nullptr, 4) == nullptr && t.entries == first, "no memory, no growth");
+	check(rgfxCacheGrow(t, same, 2) == same && t.entries == first && t.capacity == 2,
+	      "no larger, no growth: the offered array goes back");
+	check(rgfxCacheGrow(t, larger, 4) == first && t.entries == larger && t.capacity == 4 &&
+	          t.count == 2,
+	      "grown: the old array goes back");
+	check(rgfxCacheFind(t, kSurface) == &larger[0] && rgfxCacheFind(t, kOther) == &larger[1] &&
+	          rgfxCacheAtBlock(t, kOtherBlock) == &larger[1],
+	      "every state kept, in order");
+	check(rgfxCacheAdd(t, 0x777, 0x7000, 7) == &larger[2], "room past the old capacity");
+}
 // A deferred block: gating, deferring, deferred, attached.
 void deferral()
 {
@@ -1071,6 +1093,7 @@ int main()
 	layoutCarried();
 	askNaming();
 	unheldReleases();
+	growth();
 	RgfxCachedSurface entries[2] = {};
 	RgfxCacheTable t = {entries, 0, 2};
 	uint64_t offset = 0, mark = 0;

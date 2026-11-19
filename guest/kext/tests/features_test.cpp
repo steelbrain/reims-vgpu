@@ -118,6 +118,8 @@ constexpr uint64_t kPrivateBlocks = RGFX_FEATURE_PRIVATE_BLOCKS;
 // IMPORT_ADDRESSES, which both kexts carry, handing their processes the GPU address the host gave
 // each pages block's view.
 constexpr uint64_t kImportAddresses = RGFX_FEATURE_IMPORT_ADDRESSES;
+// SURFACE_CACHE_EVERY, which both kexts carry, naming every block in place cached.
+constexpr uint64_t kCacheEvery = RGFX_FEATURE_SURFACE_CACHE_EVERY;
 // A bit the wire does not name.
 constexpr uint64_t kUnnamed = 1ull << 63;
 // Every bit the wire names from bit 3 that the kext does not carry out yet.
@@ -212,7 +214,7 @@ constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kH
                               kPointerMotion | k16KCarried | kVtMessagesCarried | kUploadsWritten |
                               kVtRingCarried | kCursorColorCarried | kBufferEscaped |
                               kPool | kSurfaceRefill | kPoolAddresses | kPrivateBlocks |
-                              kImportAddresses;
+                              kImportAddresses | kCacheEvery;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -229,8 +231,8 @@ int main()
 	// ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, DOORBELL_PAGES,
 	// PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, DISPLAY_BOUNDS,
 	// UPLOADS_WRITTEN, BUFFER_ESCAPED, SURFACE_REFILL, POOL, POOL_ADDRESSES, PRIVATE_BLOCKS,
-	// IMPORT_ADDRESSES and, the x86-64 kext, DISPLAY_POWER, or, the arm64e kext, PAGES_16K,
-	// VT_MESSAGES, VT_RING and CURSOR_COLOR, and writes each only where offered.
+	// IMPORT_ADDRESSES, SURFACE_CACHE_EVERY and, the x86-64 kext, DISPLAY_POWER, or, the arm64e
+	// kext, PAGES_16K, VT_MESSAGES, VT_RING and CURSOR_COLOR, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
 	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
@@ -241,7 +243,8 @@ int main()
 	      "PIPELINE_KEYS, ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, "
 	      "DOORBELL_PAGES, PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, "
 	      "DISPLAY_BOUNDS, UPLOADS_WRITTEN, BUFFER_ESCAPED, SURFACE_REFILL, POOL, POOL_ADDRESSES, "
-	      "PRIVATE_BLOCKS, IMPORT_ADDRESSES and, on x86-64, DISPLAY_POWER, on arm64e PAGES_16K, "
+	      "PRIVATE_BLOCKS, IMPORT_ADDRESSES, SURFACE_CACHE_EVERY and, on x86-64, DISPLAY_POWER, "
+	      "on arm64e PAGES_16K, "
 	      "VT_MESSAGES, VT_RING and CURSOR_COLOR, from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
@@ -551,6 +554,14 @@ int main()
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kImportAddresses, kImportAddresses) ==
 	          (kRgfxOfferedFeatures | kImportAddresses),
 	      "IMPORT_ADDRESSES taken is in the word");
+	check(RGFX_FEATURE_SURFACE_CACHE_EVERY == (1ull << 62), "SURFACE_CACHE_EVERY is bit 62");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kCacheEvery) == kCacheEvery,
+	      "SURFACE_CACHE_EVERY offered, written by both kexts");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kCacheEvery, 0) == kRgfxOfferedFeatures,
+	      "SURFACE_CACHE_EVERY offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kCacheEvery, kCacheEvery) ==
+	          (kRgfxOfferedFeatures | kCacheEvery),
+	      "SURFACE_CACHE_EVERY taken is in the word");
 	// PAGES_16K: the arm64e kext writes it first where offered, and then with the rest; the
 	// x86-64 kext never writes it, and writes nothing first.
 	check(rgfxDriverFeaturesFirst(~0ull) == k16KCarried, "PAGES_16K first where carried");
