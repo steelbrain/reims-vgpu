@@ -38,18 +38,18 @@ use reims_vgpu_video::codec::encode::Coded;
 use reims_vgpu_video::codec::encode::RateControl;
 use reims_vgpu_video::core::backend::BackendError as VideoError;
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity};
-#[cfg(unix)]
-use reims_vgpu_vulkan::core::platform::Handle as _;
-#[cfg(unix)]
-use reims_vgpu_vulkan::core::platform::resource::SurfaceMemory;
 #[cfg(target_os = "linux")]
 use reims_vgpu_video::core::device_memory::{DmaBufError, SurfaceDmaBuf};
 use reims_vgpu_video::core::surfaces::{SurfaceError, SurfaceLayout};
 use reims_vgpu_video::paravirt::{Encoder, EncoderConfig, SourceFrame};
+#[cfg(unix)]
+use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
 use reims_vgpu_vulkan::core::platform::event::EventRef;
 use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+#[cfg(unix)]
+use reims_vgpu_vulkan::core::platform::resource::SurfaceMemory;
 use reims_vgpu_vulkan::core::platform::types::PixelFormatInfo;
 use reims_vgpu_vulkan::core::platform::values::PagesPlane;
 use reims_vgpu_vulkan::core::raise::RaiseResult;

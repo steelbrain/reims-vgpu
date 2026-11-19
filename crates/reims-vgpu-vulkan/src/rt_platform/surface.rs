@@ -303,13 +303,22 @@ mod tests {
             };
             let memory = &surface.memory;
             let form = if memory.in_place() { 0 } else { 1 };
-            assert_eq!(counted([SURFACES_IN_PLACE_CODE, SURFACES_COPIED_CODE][form]), counts[form] + 1);
+            assert_eq!(
+                counted([SURFACES_IN_PLACE_CODE, SURFACES_COPIED_CODE][form]),
+                counts[form] + 1
+            );
             assert_eq!(memory.handle(), handle);
             let [luma, chroma] = surface.planes.as_slice() else {
                 panic!("two planes");
             };
-            assert_eq!((luma.pixel_format(), luma.width(), luma.height()), (10, 1920, 1080));
-            assert_eq!((chroma.pixel_format(), chroma.width(), chroma.height()), (30, 960, 540));
+            assert_eq!(
+                (luma.pixel_format(), luma.width(), luma.height()),
+                (10, 1920, 1080)
+            );
+            assert_eq!(
+                (chroma.pixel_format(), chroma.width(), chroma.height()),
+                (30, 960, 540)
+            );
             let layout = memory.layout();
             assert_eq!(layout.len(), 2);
             let pitch = layout[0].row_pitch;
@@ -328,8 +337,14 @@ mod tests {
             if memory.in_place() {
                 let luma_view = luma.new_texture_view_at_index(13, 0);
                 let chroma_view = chroma.new_texture_view_at_index(33, 0);
-                assert!(luma_view.expect("never a raise").is_some(), "an R8Uint view");
-                assert!(chroma_view.expect("never a raise").is_some(), "an RG8Uint view");
+                assert!(
+                    luma_view.expect("never a raise").is_some(),
+                    "an R8Uint view"
+                );
+                assert!(
+                    chroma_view.expect("never a raise").is_some(),
+                    "an RG8Uint view"
+                );
             }
             println!("{handle:?}: in place {}, pitch {pitch}", memory.in_place());
         }

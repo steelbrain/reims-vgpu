@@ -30,6 +30,8 @@ use std::sync::Arc;
 
 #[cfg(unix)]
 use reims_vgpu_video::core::device_memory::MemoryLife;
+#[cfg(unix)]
+use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::Platform;
 #[cfg(unix)]
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
@@ -37,8 +39,6 @@ use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 use reims_vgpu_vulkan::core::platform::resource::{
     ExportedSurface, SurfaceDesc, SurfaceHandle, SurfaceMemory, SurfacePlaneDesc,
 };
-#[cfg(unix)]
-use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::values::PagesPlane;
 #[cfg(unix)]
 use reims_vgpu_vulkan::core::raise::refusals;
@@ -377,7 +377,9 @@ impl<P: Platform> SurfaceCaches<P> {
         let mut found = None;
         let mut bytes = 0;
         for (plane, image) in ask.keys.iter().zip(&images) {
-            let (reference, _) = cache.shapes.insert_plane(*plane, image.clone_ref(), true, now);
+            let (reference, _) = cache
+                .shapes
+                .insert_plane(*plane, image.clone_ref(), true, now);
             if plane == key {
                 found = Some((reference, image.clone_ref()));
             }
@@ -395,7 +397,9 @@ impl<P: Platform> SurfaceCaches<P> {
         counts.made_bytes += bytes;
         counts.planes_made += 2;
         counts.surfaces += 1;
-        let live = (self.by_block.values()).filter(|c| c.surface.is_made()).count();
+        let live = (self.by_block.values())
+            .filter(|c| c.surface.is_made())
+            .count();
         let counts = &mut self.counts.shapes;
         counts.surfaces_live_most = counts.surfaces_live_most.max(live.try_into().unwrap_or(0));
         self.hold_bytes(bytes);
@@ -407,7 +411,10 @@ impl<P: Platform> SurfaceCaches<P> {
 
 /// What [`SurfaceCaches::add_planes`] lets go of: images, and a surface's memory not taken.
 #[cfg(unix)]
-type Gone<P> = (Vec<<P as Platform>::Texture>, Option<Arc<dyn SurfaceMemory>>);
+type Gone<P> = (
+    Vec<<P as Platform>::Texture>,
+    Option<Arc<dyn SurfaceMemory>>,
+);
 
 #[cfg(unix)]
 impl<P: Platform> Caches<P> {
@@ -483,8 +490,14 @@ mod tests {
     #[test]
     fn a_video_cache_s_plane_keys_are_its_planes_whole() {
         let keys = plane_keys(&nv12(), 1).expect("NV12's planes");
-        assert_eq!((keys[0].width, keys[0].height, keys[0].texel_bytes), (1920, 1080, 1));
-        assert_eq!((keys[1].width, keys[1].height, keys[1].texel_bytes), (960, 540, 2));
+        assert_eq!(
+            (keys[0].width, keys[0].height, keys[0].texel_bytes),
+            (1920, 1080, 1)
+        );
+        assert_eq!(
+            (keys[1].width, keys[1].height, keys[1].texel_bytes),
+            (960, 540, 2)
+        );
         assert_eq!((keys[1].offset, keys[1].bytes_per_row), (0x22_0000, 2048));
         assert!(!keys[0].storage && !keys[1].storage);
         // 16-bit samples: P010's planes of the same bytes are 960 pixels wide.

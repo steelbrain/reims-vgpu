@@ -2898,7 +2898,9 @@ impl<P: Platform> SurfaceCaches<P> {
                 filled = self.fill(device, block, u.cpu_gen).map(|_| ());
             }
         } else if self.owes_shape_fill(block)
-            || (video && !self.decodes_into_surface(block, decoded) && self.writes_back_first(block))
+            || (video
+                && !self.decodes_into_surface(block, decoded)
+                && self.writes_back_first(block))
         {
             if waits {
                 self.defer_shapes_fill(device, block);
@@ -3115,7 +3117,10 @@ impl<P: Platform> SurfaceCaches<P> {
                 .filter(|s| s.id() != source && s.key.same_plane(&key))
                 .map(|s| {
                     let id = s.id();
-                    (id, s.plane || s.referenced() || s.dirty || since.contains(&id))
+                    (
+                        id,
+                        s.plane || s.referenced() || s.dirty || since.contains(&id),
+                    )
                 })
                 .collect();
             let into: Vec<u64> = (others.iter()).filter(|o| o.1).map(|o| o.0).collect();

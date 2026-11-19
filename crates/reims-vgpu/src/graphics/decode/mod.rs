@@ -220,12 +220,12 @@ mod waits;
 mod work;
 pub(crate) mod worker;
 
+#[cfg(unix)]
+pub use video::SurfaceTarget;
 pub use video::{
     Decoded, GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput,
     GuestSource, Landed, PlanePages, VideoDecode, VideoEncode, VideoPlane,
 };
-#[cfg(unix)]
-pub use video::SurfaceTarget;
 #[cfg(any(target_os = "linux", windows))]
 pub(crate) use video::{rate_past_first_frame, same_rate_mode};
 
