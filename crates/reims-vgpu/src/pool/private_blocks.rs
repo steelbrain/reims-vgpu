@@ -544,10 +544,11 @@ impl Inner {
             };
             match answer {
                 Some(answer) => MutexGuard::unlocked(&mut st, || {
-                    (job.answer)(answer);
+                    // Counted before the answer, so whoever has the answer reads the count.
                     if answer.is_ok() {
                         sourced(context, job.len, took);
                     }
+                    (job.answer)(answer);
                 }),
                 None => MutexGuard::unlocked(&mut st, || drop(job.answer)),
             }
