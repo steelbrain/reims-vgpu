@@ -1024,4 +1024,183 @@ mod tests {
         assert_eq!(counts.fills, 3);
         drop(held);
     }
+
+    /// On the Vulkan platform, a shape's write reaches the other shapes of its plane through the
+    /// cache's buffer whatever their formats ([`copy_overlaps`]): a BGRA8Unorm shape over the
+    /// whole gives two RG8Unorm shapes at its first texel, which hold other bytes, the rows and
+    /// bytes they overlap; then the narrower RG8Unorm one gives the whole its two rows of 18
+    /// bytes, of which the whole's 4-byte texels take 16, the texel it covers in part keeping
+    /// its bytes, counted. The buffer holds the source's overlap at its place, the rest untouched
+    #[test]
+    fn on_vulkan_each_shape_takes_its_planes_write_through_the_buffer() {
+        use reims_vgpu_vulkan::core::num::ToUsize as _;
+        use reims_vgpu_vulkan::core::platform::blit::BlitEncoder as _;
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+
+        use crate::platform::ApiPlatform as _;
+        type V = reims_vgpu_vulkan::VulkanPlatform;
+        const ON: OnFault = OnFault::Die;
+        const ROW: u64 = 256;
+        const LENGTH: u64 = ROW * 16;
+        let platform = V::process();
+        let device = platform.metal_device(None).unwrap();
+        let queue = device.new_command_queue().unwrap();
+        let buffer = device.new_buffer_of_length(ON, LENGTH, 0).unwrap().unwrap();
+        let pattern = |seed: u64| -> Vec<u8> {
+            (0..LENGTH)
+                .map(|i| ((i ^ ((i >> 8) * 37)) + seed) as u8)
+                .collect()
+        };
+        let (p, q) = (pattern(0), pattern(101));
+        // The buffer's bytes become `bytes`, while no command uses it.
+        let store = |bytes: &[u8]| {
+            // SAFETY: a Shared buffer of LENGTH bytes, which no command uses now.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    buffer.contents().as_ptr::<u8>(),
+                    bytes.len(),
+                );
+            }
+        };
+        let run = |encode: &dyn Fn(&<V as Platform>::CommandBuffer)| {
+            let cb = queue.command_buffer(ON).unwrap().unwrap();
+            encode(&cb);
+            cb.commit(ON).unwrap();
+            cb.wait_until_completed(ON).unwrap();
+        };
+        // (pixel format, texel bytes, width, height): the whole, and two inside it, all at the
+        // plane's first texel.
+        let cases: [(u64, u64, u64, u64); 3] =
+            [(80, 4, 64, 16), (30, 2, 16, 8), (30, 2, 9, 2)];
+        let mut table = ShapeTable::default();
+        let mut held = Vec::new();
+        for (n, &(pixel_format, texel_bytes, width, height)) in cases.iter().enumerate() {
+            let key = ShapeKey {
+                plane: 0,
+                offset: 0,
+                bytes_per_row: ROW,
+                width,
+                height,
+                texel_bytes,
+            };
+            let image = platform
+                .own_texture(
+                    &device,
+                    &TextureDesc {
+                        texture_type: 2,
+                        pixel_format,
+                        width,
+                        height,
+                        usage: 0,
+                        resource_options: Some(super::super::STORAGE_PRIVATE),
+                        ..TextureDesc::default()
+                    },
+                )
+                .unwrap();
+            held.push(table.insert(key, image, true, n as u64).0);
+        }
+        let ids: Vec<u64> = held.iter().map(|h| h.id()).collect();
+        let (whole, wide, narrow) = (ids[0], ids[1], ids[2]);
+        // Each shape's rows, as its image holds them.
+        let rows_of = |table: &ShapeTable<<V as Platform>::Texture>, id: u64| -> Vec<Vec<u8>> {
+            let shape = table.iter().find(|s| s.id() == id).unwrap();
+            let key = shape.key;
+            let row = key.width * key.texel_bytes;
+            let out = device
+                .new_buffer_of_length(ON, row * key.height, 0)
+                .unwrap()
+                .unwrap();
+            run(&|cb| {
+                let blit = cb.blit_encoder(ON).unwrap().unwrap();
+                blit.encode(
+                    ON,
+                    BlitCmd::CopyTextureToBuffer {
+                        source_texture: &shape.image,
+                        source_slice: 0,
+                        source_level: 0,
+                        source_origin: MtlOrigin::default(),
+                        source_size: MtlSize::new(key.width, key.height, 1),
+                        destination_buffer: &out,
+                        destination_offset: 0,
+                        destination_bytes_per_row: row,
+                        destination_bytes_per_image: row * key.height,
+                    },
+                )
+                .unwrap();
+                blit.encode(ON, BlitCmd::EndEncoding).unwrap();
+            });
+            // SAFETY: the Shared buffer's bytes, which no command writes any more.
+            let read = unsafe {
+                std::slice::from_raw_parts(
+                    out.contents().as_ptr::<u8>(),
+                    (row * key.height).to_usize(),
+                )
+            };
+            read.chunks(row.to_usize()).map(<[u8]>::to_vec).collect()
+        };
+        // `bytes`' first `width` bytes of each of its first `height` rows.
+        let corner = |bytes: &[u8], width: u64, height: u64| -> Vec<Vec<u8>> {
+            (0..height)
+                .map(|y| bytes[(y * ROW).to_usize()..(y * ROW + width).to_usize()].to_vec())
+                .collect()
+        };
+        let commit = |cb: <V as Platform>::CommandBuffer| {
+            cb.commit(ON).unwrap();
+            cb.wait_until_completed(ON).unwrap();
+        };
+        // The whole takes `p`; the two inside it take zeros.
+        let mut counts = ShapeCounts::default();
+        store(&p);
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        fill::<V>(&cb, &buffer, &mut table, |s| s.id() == whole, &mut counts).unwrap();
+        commit(cb);
+        store(&vec![0; LENGTH.to_usize()]);
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        fill::<V>(&cb, &buffer, &mut table, |s| s.id() != whole, &mut counts).unwrap();
+        commit(cb);
+        assert_eq!(rows_of(&table, wide), corner(&vec![0; LENGTH.to_usize()], 32, 8));
+
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        copy_overlaps::<V>(&cb, &buffer, &table, (whole, &[wide, narrow]), None, &mut counts)
+            .unwrap();
+        commit(cb);
+        assert_eq!(rows_of(&table, wide), corner(&p, 32, 8));
+        assert_eq!(rows_of(&table, narrow), corner(&p, 18, 2));
+        assert_eq!(
+            (counts.overlap_copies, counts.overlap_bytes, counts.straddled),
+            (2, 32 * 8 + 18 * 2, 0)
+        );
+        let mut want = vec![0u8; LENGTH.to_usize()];
+        for y in 0..8 {
+            let at = (y * ROW).to_usize();
+            want[at..at + 32].copy_from_slice(&p[at..at + 32]);
+        }
+        // SAFETY: the Shared buffer's bytes, which no command writes any more.
+        let read = unsafe {
+            std::slice::from_raw_parts(buffer.contents().as_ptr::<u8>(), LENGTH.to_usize())
+        };
+        assert!(read == want.as_slice(), "the whole's overlap alone, at its place");
+
+        // The narrow one takes `q`, then gives the whole its two rows.
+        store(&q);
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        fill::<V>(&cb, &buffer, &mut table, |s| s.id() == narrow, &mut counts).unwrap();
+        commit(cb);
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        copy_overlaps::<V>(&cb, &buffer, &table, (narrow, &[whole]), None, &mut counts).unwrap();
+        commit(cb);
+        let mut want = corner(&p, ROW, 16);
+        for (y, row) in want.iter_mut().enumerate().take(2) {
+            let at = y * ROW.to_usize();
+            row[..16].copy_from_slice(&q[at..at + 16]);
+        }
+        assert_eq!(rows_of(&table, whole), want, "16 bytes of 18; the straddled texel kept");
+        assert_eq!(counts.straddled, 1);
+        assert_eq!(counts.overlap_copies, 3);
+        drop(held);
+    }
 }
