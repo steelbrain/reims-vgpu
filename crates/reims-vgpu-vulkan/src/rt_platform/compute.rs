@@ -93,7 +93,10 @@ impl RtComputeEncoder {
 
     /// Encodes `cmd` but `endEncoding`, which the caller ends.
     fn command(&self, open: &mut Open, cmd: ComputeCmd<'_, RtPlatform>) -> Result<(), Stop> {
-        let Open { rt: encoder, pipeline } = open;
+        let Open {
+            rt: encoder,
+            pipeline,
+        } = open;
         let Some(e) = encoder.as_mut() else {
             return Err(Stop::Metal("a command after endEncoding"));
         };
@@ -280,11 +283,7 @@ fn small(value: u64) -> Result<u32, Stop> {
 
 /// A grid's or a threadgroup's size as rt's.
 fn size(size: MtlSize) -> Result<[u32; 3], Stop> {
-    Ok([
-        small(size.width)?,
-        small(size.height)?,
-        small(size.depth)?,
-    ])
+    Ok([small(size.width)?, small(size.height)?, small(size.depth)?])
 }
 
 /// The argument table indices of `range`, whose length each of the lists bound with it has
@@ -482,19 +481,23 @@ mod tests {
         });
         let heap = heap.expect("never a raise").heap.expect("a heap");
         let (input, once, twice) = (holding(&[7, 8, 9, 10]), buffer(16), buffer(16));
-        let status = run(&queue, None, vec![
-            ComputeCmd::UseHeaps {
-                heaps: &[Some(&heap), None],
-            },
-            ComputeCmd::SetComputePipelineState { state: Some(&add) },
-            bind(&[Some(&once), Some(&input)]),
-            threads(4),
-            bind(&[Some(&twice), Some(&once)]),
-            ComputeCmd::DispatchThreadgroups {
-                threadgroups_per_grid: MtlSize::new(2, 1, 1),
-                threads_per_threadgroup: MtlSize::new(2, 1, 1),
-            },
-        ]);
+        let status = run(
+            &queue,
+            None,
+            vec![
+                ComputeCmd::UseHeaps {
+                    heaps: &[Some(&heap), None],
+                },
+                ComputeCmd::SetComputePipelineState { state: Some(&add) },
+                bind(&[Some(&once), Some(&input)]),
+                threads(4),
+                bind(&[Some(&twice), Some(&once)]),
+                ComputeCmd::DispatchThreadgroups {
+                    threadgroups_per_grid: MtlSize::new(2, 1, 1),
+                    threads_per_threadgroup: MtlSize::new(2, 1, 1),
+                },
+            ],
+        );
         assert_eq!(status, done);
         assert_eq!(words(&once, 4), [8, 9, 10, 11]);
         assert_eq!(words(&twice, 4), [9, 10, 11, 12]);
@@ -504,30 +507,38 @@ mod tests {
             dispatch_type: Some(1),
         };
         let (first, second) = (buffer(16), buffer(16));
-        let status = run(&queue, Some(&concurrent), vec![
-            ComputeCmd::SetComputePipelineState { state: Some(&add) },
-            bind(&[Some(&first), Some(&input)]),
-            threads(4),
-            ComputeCmd::MemoryBarrierWithScope { scope: 1 },
-            bind(&[Some(&second), Some(&first)]),
-            threads(4),
-        ]);
+        let status = run(
+            &queue,
+            Some(&concurrent),
+            vec![
+                ComputeCmd::SetComputePipelineState { state: Some(&add) },
+                bind(&[Some(&first), Some(&input)]),
+                threads(4),
+                ComputeCmd::MemoryBarrierWithScope { scope: 1 },
+                bind(&[Some(&second), Some(&first)]),
+                threads(4),
+            ],
+        );
         assert_eq!(status, done);
         assert_eq!(words(&second, 4), [9, 10, 11, 12]);
 
         // Threadgroup memory of the encoder's length.
         let reversed = buffer(16);
-        let status = run(&queue, None, vec![
-            ComputeCmd::SetComputePipelineState {
-                state: Some(&state(TGMEM, "tg_reverse")),
-            },
-            ComputeCmd::SetThreadgroupMemoryLength {
-                length: 16,
-                index: 0,
-            },
-            bind(&[Some(&reversed)]),
-            threads(4),
-        ]);
+        let status = run(
+            &queue,
+            None,
+            vec![
+                ComputeCmd::SetComputePipelineState {
+                    state: Some(&state(TGMEM, "tg_reverse")),
+                },
+                ComputeCmd::SetThreadgroupMemoryLength {
+                    length: 16,
+                    index: 0,
+                },
+                bind(&[Some(&reversed)]),
+                threads(4),
+            ],
+        );
         assert_eq!(status, done);
         assert_eq!(words(&reversed, 4), [9, 6, 3, 0]);
 
@@ -544,33 +555,42 @@ mod tests {
         let sampler = device.new_sampler_state(&SamplerDesc::default());
         let sampler = sampler.expect("never a raise").expect("a sampler state");
         let sampled = buffer(16);
-        let status = run(&queue, None, vec![
-            ComputeCmd::SetComputePipelineState {
-                state: Some(&state(TEXWRITE, "tex_write")),
-            },
-            ComputeCmd::SetTexture {
-                texture: Some(&texture),
-                index: 0,
-            },
-            threads(4),
-            ComputeCmd::SetComputePipelineState {
-                state: Some(&state(SAMPLE, "sample_k")),
-            },
-            ComputeCmd::SetTextures {
-                textures: &[Some(&texture)],
-                range: NsRange::new(0, 1),
-            },
-            ComputeCmd::SetSamplerStates {
-                samplers: &[Some(&sampler)],
-                range: NsRange::new(0, 1),
-            },
-            bind(&[Some(&sampled)]),
-            threads(4),
-        ]);
+        let status = run(
+            &queue,
+            None,
+            vec![
+                ComputeCmd::SetComputePipelineState {
+                    state: Some(&state(TEXWRITE, "tex_write")),
+                },
+                ComputeCmd::SetTexture {
+                    texture: Some(&texture),
+                    index: 0,
+                },
+                threads(4),
+                ComputeCmd::SetComputePipelineState {
+                    state: Some(&state(SAMPLE, "sample_k")),
+                },
+                ComputeCmd::SetTextures {
+                    textures: &[Some(&texture)],
+                    range: NsRange::new(0, 1),
+                },
+                ComputeCmd::SetSamplerStates {
+                    samplers: &[Some(&sampler)],
+                    range: NsRange::new(0, 1),
+                },
+                bind(&[Some(&sampled)]),
+                threads(4),
+            ],
+        );
         assert_eq!(status, done);
         let mut texels = [0; 16];
         texture.read_pixels(&mut texels, 16);
-        assert_eq!(texels, [0, 0, 128, 255, 1, 0, 128, 255, 2, 0, 128, 255, 3, 0, 128, 255]);
+        assert_eq!(
+            texels,
+            [
+                0, 0, 128, 255, 1, 0, 128, 255, 2, 0, 128, 255, 3, 0, 128, 255
+            ]
+        );
         assert_eq!(words(&sampled, 4), [0xff80_0000; 4]);
 
         // A command buffer keeps the state it set, and its sampler index, until it completes.
@@ -599,10 +619,7 @@ mod tests {
         assert_eq!(device.numbering().held(), held);
 
         // What rt has no form of, what Metal's validation stops, and what records nothing.
-        let (unbuilt, predication) = (
-            Unbuilt::ComputeCommand.code(),
-            Unbuilt::Predication.code(),
-        );
+        let (unbuilt, predication) = (Unbuilt::ComputeCommand.code(), Unbuilt::Predication.code());
         let (before, unbuilt_before, predication_before) =
             (counted(metal), counted(unbuilt), counted(predication));
         let made = queue.command_buffer(on).expect("never a raise");

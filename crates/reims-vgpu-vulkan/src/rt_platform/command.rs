@@ -180,7 +180,9 @@ impl RtCommandBuffer {
             Ok(encoder) => {
                 let concurrent = dispatch_type == rt::DispatchType::Concurrent;
                 let (mark, kept) = (self.opened(), self.kept.clone());
-                Some(RtObj::new(RtComputeEncoder::new(encoder, mark, kept, concurrent)))
+                Some(RtObj::new(RtComputeEncoder::new(
+                    encoder, mark, kept, concurrent,
+                )))
             }
             Err(error) => {
                 rt_refused_create(sel, &error);
