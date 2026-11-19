@@ -111,10 +111,9 @@ fn c_harness_passes() {
     } else {
         "false"
     };
-    assert!(
-        stdout.contains(&format!("harness: quiesce answered {answer}\n")),
-        "{stdout}"
-    );
+    // By lines, which end in "\r\n" where the harness, a C program, writes its stdout on Windows.
+    let answered = format!("harness: quiesce answered {answer}");
+    assert!(stdout.lines().any(|line| line == answered), "{stdout}");
 }
 
 /// On macOS the dylib's install name is `@rpath/libreims_vgpu_c.dylib`, and the harness links it
