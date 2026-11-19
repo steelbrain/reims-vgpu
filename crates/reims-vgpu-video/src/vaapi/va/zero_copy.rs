@@ -851,7 +851,10 @@ mod tests {
         let target = GuestTarget::new(&layout, &memory).expect("a target");
         let (mut written, mut running) = (0, 0);
         let mut check = |id: usize, frame: &Frame| {
-            if Work::Surface(frame.surface.id()).ask_now(&display).is_none() {
+            if Work::Surface(frame.surface.id())
+                .ask_now(&display)
+                .is_none()
+            {
                 running += 1;
             }
             match frame.write_to_guest(&target, &writes).expect("the write") {
@@ -884,7 +887,10 @@ mod tests {
                     ((0..chroma.len()).find(|&i| bytes[chroma_at + i] != chroma[i]))
                         .map(|i| ("chroma", i))
                 });
-            assert_eq!(first, None, "picture {id}: the run's byte differs from the read back's");
+            assert_eq!(
+                first, None,
+                "picture {id}: the run's byte differs from the read back's"
+            );
             written += 1;
         };
         for (id, sample) in stream.samples.iter().enumerate() {
@@ -900,7 +906,10 @@ mod tests {
             check(stream.samples.len(), frame);
         }
         assert_eq!(written, stream.samples.len(), "every picture written");
-        assert!(running > 0, "no decode was still running as its runs were issued");
+        assert!(
+            running > 0,
+            "no decode was still running as its runs were issued"
+        );
         eprintln!("{written} pictures written, {running} of them behind a decode still running");
     }
 }
