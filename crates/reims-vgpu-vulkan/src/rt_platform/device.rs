@@ -953,7 +953,8 @@ mod tests {
         }
         let bgra8 = device.pixel_format_info(80);
         assert_eq!(bgra8.name.as_deref(), Some("MTLPixelFormatBGRA8Unorm"));
-        for (pixel_format, width, height) in [(80, 64, 32), (70, 17, 3), (130, 33, 9), (252, 5, 5)] {
+        let shapes = [(80, 64, 32), (70, 17, 3), (130, 33, 9), (252, 5, 5)];
+        for (pixel_format, width, height) in shapes {
             for (options, flags) in [(0, 0), (2, 0), (0, 1), (0, 2)] {
                 let q = TextureLevelQuery {
                     pixel_format,
