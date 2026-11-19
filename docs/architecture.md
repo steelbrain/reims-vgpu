@@ -481,7 +481,8 @@ so a block that takes a recursive lock its caller holds would re-enter it.
   `reims-vgpu.graphics-lane-<id>`), and its pools: pipeline compiles
   (`reims-vgpu.graphics-compile-<n>`), surface and pages-block views
   (`reims-vgpu.graphics-surfaces-<i>`), ICB creation (`reims-vgpu.icb-create-<i>`), a closed
-  process's releases (`reims-vgpu.graphics-closes-<i>`), video (`reims-vgpu.graphics-video-<i>`)
+  process's releases (`reims-vgpu.graphics-closes-<i>`), staged copies of surfaces' caches into
+  their pages (`reims-vgpu.graphics-into-pages-<i>`), video (`reims-vgpu.graphics-video-<i>`)
   and event waits (`reims-vgpu.graphics-event-waits`). How long a pool keeps an idle thread is
   `reims-vgpu-graphics`'s `keep`. The guest's Shared pool has a thread of its own
   (`reims-vgpu.graphics-pool`, 15.1), which takes blocks and gives them back.

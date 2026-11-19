@@ -4063,8 +4063,8 @@ fn foreign_committer() -> bool {
 /// The names, or their prefixes, of the library's threads `RvgGraphicsRaiseFn` names: the
 /// control thread, a context's, the presents' and a block's lanes, the refresh thread, a queue's
 /// service thread and its lane's, a compile's thread, the surfaces', ICB makes' and closes'
-/// workers' threads.
-const RAISE_THREADS: [&str; 11] = [
+/// workers' threads, and the threads that move a staged copy of a cache into its pages.
+const RAISE_THREADS: [&str; 12] = [
     "reims-vgpu.graphics-control",
     "reims-vgpu.graphics-context-",
     "reims-vgpu.graphics-presents",
@@ -4076,6 +4076,7 @@ const RAISE_THREADS: [&str; 11] = [
     "reims-vgpu.graphics-surfaces-",
     "reims-vgpu.icb-create-",
     "reims-vgpu.graphics-closes-",
+    "reims-vgpu.graphics-into-pages-",
 ];
 
 /// What the window and its sink share: the scanout the guest set, whether the display's panel is

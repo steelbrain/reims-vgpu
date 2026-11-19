@@ -38,6 +38,10 @@
 //! - The closes' worker's (`reims-vgpu.graphics-closes-<i>`) key is the closed context: a
 //!   `CONTEXT_CLOSE` lets go of its objects there, and is answered after them, other processes'
 //!   closes beside it.
+//! - The into-pages worker's (`reims-vgpu.graphics-into-pages-<i>`) key is a block's offset: a
+//!   staged copy out of its cache, its command buffer completed, moves into its pages there and
+//!   lands, answering what waited for it (`surface_cache`, "Staged copies"), in the order its
+//!   block's copies completed, other blocks' beside it. It waits for nothing.
 //!
 //! **No job waits for another key's.** A job waits only for jobs of its own key, which were handed
 //! over before it and are done when it runs: a `BUFFER_OVER_PAGES` waits for its block's

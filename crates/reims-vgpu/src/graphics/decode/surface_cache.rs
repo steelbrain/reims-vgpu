@@ -299,6 +299,13 @@
 //!   copy's command buffer has completed and its CPU copy is done, its buffer goes back to the
 //!   caches' spares ([`Spares`]), up to [`SPARE_BYTES`] of them, which the next copy of its
 //!   length takes in place of a make; a copy in flight never shares one.
+//!   A download's CPU copy, and the answers that wait for it, run on a thread of the caches' own
+//!   ([`INTO_PAGES_THREADS`]), not in its command buffer's completed handler: the platform sees
+//!   every queue's completions on one thread, which a large surface's copy, tens of milliseconds
+//!   (144 MiB at 3 GB/s is 48 ms), would hold, and every completion behind it with it. Only what
+//!   waits for the copy to land waits for that thread: the download's or release's answer, and
+//!   the threads that wait for the pages ([`Caches::wait_copied_out`],
+//!   [`Caches::wait_copies_into`]).
 //!   Each is counted on the counts line by its kind's name (`cache-view`): how many and their
 //!   KiB, and the nanoseconds the host's CPU spent on them (`rt-fills-cache-view`,
 //!   `rt-fills-cache-view-kib`, `rt-fills-cache-view-cpu-ns`, and the same of `rt-downloads-`),
@@ -366,6 +373,7 @@ use reims_vgpu_vulkan::core::sync::{Condvar, Mutex, MutexGuard};
 
 use super::refusing;
 use super::surface_pages::{PagesRefusal, SurfaceView, Unmade, buffer_over};
+use super::worker::Worker;
 use crate::device_writes::{self, Watcher};
 
 pub(crate) mod shapes;
@@ -1719,7 +1727,16 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     staged: Option<Now>,
     /// The staged copies' buffers no copy uses (the module doc, "Staged copies").
     spares: Arc<Spares<P>>,
+    /// The threads that move a staged download's bytes into its pages and land it
+    /// ([`INTO_PAGES_THREADS`]), a block's in the order their command buffers completed.
+    into_pages: Arc<Worker>,
 }
+
+/// The name of the threads, `<name>-<i>`, that carry out a staged copy out of a cache once its
+/// command buffer has completed (the module doc, "Staged copies"): the host's CPU's copy of the
+/// staging buffer into the pages, then the copy's landing and the answers waiting for it, which
+/// raise the guest's interrupt there. A block's are its key ([`Worker`]).
+pub(crate) const INTO_PAGES_THREADS: &str = "reims-vgpu.graphics-into-pages";
 
 /// The command buffers begun and not finished that use one block's cache, by the number each was
 /// counted under, oldest first.
@@ -1918,6 +1935,7 @@ impl<P: Platform> SurfaceCaches<P> {
             shape_clock: 0,
             staged: None,
             spares: Arc::new(Spares::new(SPARE_BYTES)),
+            into_pages: Arc::new(Worker::new(INTO_PAGES_THREADS)),
         }
     }
 
@@ -4460,22 +4478,30 @@ impl<P: Platform> SurfaceCaches<P> {
         let gpu = Arc::clone(&self.copy_gpu);
         match staged {
             // A copied cache's pages take the staging buffer's bytes on the host's CPU, before
-            // `done`: a copy too long for the platform's thread that sees the completion.
-            Some(staged) => cb.add_completed_handler(
-                ON,
-                Box::new(move |info: CompletedInfo| {
-                    CopyGpu::add(&gpu.out, info.gpu_times_ns);
-                    let at = now.as_ref().map(|now| now());
-                    staged.done();
-                    drop(held);
-                    let took = (now.as_ref().zip(at))
-                        .map_or(std::time::Duration::ZERO, |(now, at)| {
-                            now().saturating_duration_since(at)
-                        });
-                    lands.land_timed(info.gpu_times_ns, took);
-                    done();
-                }),
-            )?,
+            // `done`: on the caches' own threads, as the copy would hold the platform's thread
+            // that sees every queue's completions (the module doc, "Staged copies").
+            Some(staged) => {
+                let into_pages = Arc::clone(&self.into_pages);
+                cb.add_completed_handler(
+                    ON,
+                    Box::new(move |info: CompletedInfo| {
+                        let gpu_times = info.gpu_times_ns;
+                        CopyGpu::add(&gpu.out, gpu_times);
+                        let lands_now = move || {
+                            let at = now.as_ref().map(|now| now());
+                            staged.done();
+                            drop(held);
+                            let took = (now.as_ref().zip(at))
+                                .map_or(std::time::Duration::ZERO, |(now, at)| {
+                                    now().saturating_duration_since(at)
+                                });
+                            lands.land_timed(gpu_times, took);
+                            done();
+                        };
+                        into_pages.submit_waitless(block, Box::new(lands_now));
+                    }),
+                )?;
+            }
             // Else answered as the platform sees the copy done, with no handler thread woken
             // between, as an early copy's landing is; the buffers go in the completed handler.
             None => {
@@ -4616,6 +4642,13 @@ impl<P: Platform> SurfaceCaches<P> {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.by_block.len()
+    }
+
+    /// The threads that carry out staged copies out of the caches ([`INTO_PAGES_THREADS`]), for
+    /// the tests to hold and wait for.
+    #[cfg(test)]
+    pub(crate) fn into_pages(&self) -> Arc<Worker> {
+        Arc::clone(&self.into_pages)
     }
 }
 
@@ -12318,6 +12351,14 @@ pub(super) mod tests {
         done
     }
 
+    /// Completes every command buffer in flight, then waits until the staged copies out of the
+    /// caches they completed have landed in their pages ([`INTO_PAGES_THREADS`]).
+    fn complete_staged(r: &Rig) {
+        r.p.world().complete_all(CompleteOn::Caller);
+        let into_pages = r.dec.caches().into_pages();
+        into_pages.flush();
+    }
+
     /// `BLOCK_RELEASE` of the block at `block`, and whether it was answered.
     pub(crate) fn release(r: &Rig, block: u64) -> Arc<AtomicBool> {
         let done = Arc::new(AtomicBool::new(false));
@@ -13189,7 +13230,7 @@ pub(super) mod tests {
             buffer_bytes(&r, out[0].1, Some(0xc3)).len(),
             length.to_usize()
         );
-        r.p.world().complete_all(CompleteOn::Caller);
+        complete_staged(&r);
         assert!(
             done.load(Ordering::SeqCst),
             "answered once the pages hold it"
@@ -13272,7 +13313,7 @@ pub(super) mod tests {
             buffer_bytes(&r, out[0].1, Some(0xc3)).len(),
             length.to_usize()
         );
-        r.p.world().complete_all(CompleteOn::Caller);
+        complete_staged(&r);
         assert!(done.load(Ordering::SeqCst));
         let after = ram_bytes(&r, 1, length, None);
         for (at, (&now, &was)) in after.iter().zip(&before).enumerate() {
@@ -13349,7 +13390,7 @@ pub(super) mod tests {
         );
         buffer_bytes(&r, out[0].1, Some(0xc3));
         assert!(!done.load(Ordering::SeqCst), "not before the copy is done");
-        r.p.world().complete_all(CompleteOn::Caller);
+        complete_staged(&r);
         assert!(done.load(Ordering::SeqCst));
         assert!(
             ram_bytes(&r, 1, length, None).iter().all(|&b| b == 0xc3),
@@ -13397,7 +13438,7 @@ pub(super) mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, cache, "out of the cache");
         buffer_bytes(&r, out[0].1, Some(0xc3));
-        r.p.world().complete_all(CompleteOn::Caller);
+        complete_staged(&r);
         assert!(done.load(Ordering::SeqCst));
         assert!(
             ram_bytes(&r, 1, length, None).iter().all(|&b| b == 0xc3),
@@ -13461,7 +13502,7 @@ pub(super) mod tests {
             "the download's buffer is not the fill's, whose copy is in flight"
         );
         buffer_bytes(&r, made[1].1, Some(0xc3));
-        r.p.world().complete_all(CompleteOn::Caller);
+        complete_staged(&r);
         assert!(done.load(Ordering::SeqCst));
 
         // Both completed: the next download takes one of their buffers and makes none.
@@ -13480,8 +13521,68 @@ pub(super) mod tests {
             !(r.p.call_log().sels_since(mark)).contains(&SCRATCH_BUFFER),
             "no buffer made"
         );
-        r.p.world().complete_all(CompleteOn::Caller);
+        complete_staged(&r);
         assert!(done.load(Ordering::SeqCst));
+    }
+
+    /// Where the caches' copies are staged, a download's command buffer completes with the host's
+    /// CPU copy of its staging buffer into the pages left to the caches' own threads
+    /// ([`INTO_PAGES_THREADS`]), not run on the platform's thread that sees the completions:
+    /// while that copy waits, another queue's command buffer that completes after the download's
+    /// has its completed handler run, and the download is answered only once the pages hold the
+    /// cache
+    #[test]
+    fn a_staged_downloads_copy_into_its_pages_holds_up_no_other_completion() {
+        let mut r = rig(8);
+        r.dec.set_staged_surface_copies();
+        queues(&mut r);
+        let page = r.page;
+        let length = 2 * page;
+        let before = ram_bytes(&r, 1, length, Some(0x11));
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], length, true),
+            RGFX_STATUS_OK
+        );
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        complete_staged(&r);
+
+        let into_pages = r.dec.caches().into_pages();
+        into_pages.hold();
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        let out = copies(&r.p.call_log().since(mark));
+        assert_eq!(out.len(), 1, "{out:?}");
+        buffer_bytes(&r, out[0].1, Some(0xc3));
+        // Another queue's command buffer, committed after the download's.
+        let queue = r.device.new_command_queue().expect("a queue");
+        let cb = queue.command_buffer(ON).unwrap().expect("a command buffer");
+        let other = Arc::new(AtomicBool::new(false));
+        let set = Arc::clone(&other);
+        cb.add_completed_handler(
+            ON,
+            Box::new(move |_: CompletedInfo| set.store(true, Ordering::SeqCst)),
+        )
+        .unwrap();
+        cb.commit(ON).unwrap();
+        r.p.world().complete_all(CompleteOn::Thread);
+        assert!(
+            other.load(Ordering::SeqCst),
+            "the other queue's completion went through while the copy into the pages waits"
+        );
+        assert!(!done.load(Ordering::SeqCst), "not before the pages hold it");
+        assert_eq!(
+            ram_bytes(&r, 1, length, None),
+            before,
+            "the pages wait for the copy"
+        );
+
+        into_pages.release();
+        into_pages.flush();
+        assert!(done.load(Ordering::SeqCst), "answered once the pages hold it");
+        assert!(
+            ram_bytes(&r, 1, length, None).iter().all(|&b| b == 0xc3),
+            "the pages hold what the GPU copied out of the cache"
+        );
     }
 
     /// Where the caches' copies are staged, a download of a cache laid out at the GPU's pitch
@@ -13536,7 +13637,7 @@ pub(super) mod tests {
         for &(_, at, bytes) in &parts {
             fill_buffer(&r, staging, at..at + bytes, 0xc3);
         }
-        r.p.world().complete_all(CompleteOn::Caller);
+        complete_staged(&r);
         assert!(done.load(Ordering::SeqCst));
         let after = ram_bytes(&r, 1, page, None);
         for (at, (&now, &was)) in after.iter().zip(&before).enumerate() {
