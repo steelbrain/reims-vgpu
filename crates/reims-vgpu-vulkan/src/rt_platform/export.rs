@@ -262,7 +262,8 @@ mod tests {
         let on = OnFault::Return;
         let length = 3840 * 2160 * 3 / 2 + 32;
         let refusals = counted(EXPORT_REFUSED_CODE);
-        let made = device.new_dma_buf_buffer_of_length_padding_unobserved(on, length, 0x20, Some(32));
+        let made =
+            device.new_dma_buf_buffer_of_length_padding_unobserved(on, length, 0x20, Some(32));
         let Some(buffer) = made.expect("never a raise") else {
             assert_eq!(counted(EXPORT_REFUSED_CODE), refusals + 1);
             println!("the device exports no dma-buf: refused, counted");
@@ -284,10 +285,9 @@ mod tests {
         );
         assert!(buffer.export_memory().is_err());
         assert_eq!(buffer.external_write_done(), Ok(()));
-        let unaligned = device.new_dma_buf_buffer_of_length_padding_unobserved(on, 4096, 0x20, None);
-        let unaligned = unaligned
-            .expect("never a raise")
-            .expect("a dma-buf buffer");
+        let unaligned =
+            device.new_dma_buf_buffer_of_length_padding_unobserved(on, 4096, 0x20, None);
+        let unaligned = unaligned.expect("never a raise").expect("a dma-buf buffer");
         assert_eq!(unaligned.export_dma_buf().expect("an export").offset, 0);
         let shared = device.new_dma_buf_buffer_of_length_padding_unobserved(on, 4096, 0, None);
         assert!(shared.expect("never a raise").is_none());

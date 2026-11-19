@@ -40,9 +40,9 @@ use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};
 use std::sync::Arc;
 
 use super::display::{Display, Error, check};
-use crate::codec::PictureRole;
 use super::ffi;
 use super::surface::SurfaceFormat;
+use crate::codec::PictureRole;
 
 /// The format of a decode's picture, which its target is imported as: 8-bit 4:2:0 in NV12, 10-bit
 /// in P010 (the samples in the high bits of each 16-bit word).

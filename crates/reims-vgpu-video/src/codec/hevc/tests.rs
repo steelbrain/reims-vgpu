@@ -789,7 +789,12 @@ fn each_picture_is_asked_for_as_a_reference_or_not_as_its_unit_type_and_sub_laye
         assert_eq!(role_of(unit_type, 2, 2), NonReference);
         assert_eq!(role_of(unit_type, 1, 2), Reference);
     }
-    for unit_type in [nal_type::TRAIL_R, nal_type::CRA_NUT, nal_type::IDR_W_RADL, nal_type::BLA_N_LP] {
+    for unit_type in [
+        nal_type::TRAIL_R,
+        nal_type::CRA_NUT,
+        nal_type::IDR_W_RADL,
+        nal_type::BLA_N_LP,
+    ] {
         assert_eq!(role_of(unit_type, 0, 0), Reference);
     }
     Ok(())

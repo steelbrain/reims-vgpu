@@ -18,9 +18,9 @@ use super::scaling::ScalingLists;
 use super::slice::{SliceHeader, SliceType};
 use super::sps::Sps;
 use super::{Error, NalFormat, OutputOrder};
+use crate::codec::PictureRole;
 use crate::codec::h264::ParameterSets;
 use crate::codec::h264::nal::sample_units;
-use crate::codec::PictureRole;
 
 pub use super::dpb::RpsMembership;
 
