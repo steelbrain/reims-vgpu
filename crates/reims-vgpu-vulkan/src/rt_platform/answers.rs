@@ -1,4 +1,4 @@
-//! The rt device's answers: its capabilities ([`caps`]) and its identity ([`identity`]), from
+//! The rt device's answers: its capabilities ([`caps`]) and its identity ([`identity()`]), from
 //! what Vulkan answers for its physical device ([`Facts`]) and rt's own device answers. Its
 //! memory's are the Vulkan platform's (`crate::gpu::identity`'s), read at the call.
 //!
@@ -8,7 +8,7 @@
 //! consumer's. So each is the Vulkan platform's answer where that answer is the platform's own
 //! (its stand-ins, `crate::gpu::caps::stand_in`, and its fixed answers), and otherwise Metal's
 //! answer on an Apple M3 Max, recorded in
-//! `gpu/caps/tests/metal_answers/metal_tests.every_cap_is_metals.txt` ([`METAL`]), held to the
+//! `gpu/caps/tests/metal_answers/metal_tests.every_cap_is_metals.txt` ([`metal`]), held to the
 //! device's Vulkan limits where one bounds it ([`caps`]). The guest's device info is made from
 //! them as from the Vulkan platform's (reims-vgpu's `graphics::device_info`), which caps the
 //! families and the features the graphics lane does not offer.
@@ -129,8 +129,9 @@ pub mod metal {
 }
 
 /// What the rt platform reads of its device's physical device from Vulkan and rt, once, as the
-/// device is made: what its answers depend on beyond Metal's.
-#[derive(Debug, Clone)]
+/// device is made: what its answers depend on beyond Metal's. Not `Debug`: Vulkan's limits are
+/// not.
+#[derive(Clone)]
 pub struct Facts {
     /// `deviceName`.
     pub name: String,
@@ -212,7 +213,10 @@ pub fn caps(facts: &Facts) -> Arc<DeviceCaps> {
         .max_compute_work_group_size
         .map(|bound| held(metal::MAX_THREADS_PER_THREADGROUP, bound).min(total));
     let limits = Limits {
-        max_texture_height_2d: held(metal::LIMITS.max_texture_height_2d, v.max_image_dimension2_d),
+        max_texture_height_2d: held(
+            metal::LIMITS.max_texture_height_2d,
+            v.max_image_dimension2_d,
+        ),
         max_texture_width_2d: held(metal::LIMITS.max_texture_width_2d, v.max_image_dimension2_d),
         max_texture_layers: held(metal::LIMITS.max_texture_layers, v.max_image_array_layers),
         max_threadgroup_memory_length: held(
@@ -283,8 +287,12 @@ pub fn identity(
         }
     }
     let families = identity::closed(claimed);
-    let [feature_profile, half_fp_config, single_fp_config, double_fp_config] =
-        identity::driver_sizes(facts.registry_id);
+    let [
+        feature_profile,
+        half_fp_config,
+        single_fp_config,
+        double_fp_config,
+    ] = identity::driver_sizes(facts.registry_id);
     IdentityCaps {
         families: families.map(Some),
         feature_sets: FEATURE_SETS.map(|set| Some(identity::feature_set(set, &families))),

@@ -34,7 +34,7 @@ use crate::core::platform::values::{
     RenderPipelineDesc, SamplerDesc,
 };
 use crate::core::platform::Platform;
-use crate::core::raise::{OnFault, RaiseResult};
+use crate::core::raise::{OnFault, Raise, RaiseResult};
 use crate::gpu::device::{HEAP_DESCRIPTOR_OPTIONS, descriptor_options};
 use crate::gpu::identity;
 
@@ -245,6 +245,12 @@ fn facts(
     }
 }
 
+/// The raise of a query rt refused at `sel`, counted already under `kind`: Metal's exception at
+/// the send, its detail the kind's code and why.
+fn refused_raise(sel: &'static str, kind: RtRefusal, why: &dyn std::fmt::Display) -> Raise {
+    Raise::platform(sel).with_detail(format!("{}: {why}", kind.code()))
+}
+
 /// Grants `indices` of `class` as runs of consecutive indices, each one grant; an index granted
 /// already stays granted, as a second reservation of Metal's of an ID reserved changes nothing.
 /// One rt refuses otherwise (past the class's range) is counted at `sel`.
@@ -309,28 +315,30 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     /// rt's answer: the device's image's own memory requirements, rounded to its buffer-image
     /// granularity, which the guest lays its heaps out by, not Metal's. Where rt refuses (a
     /// texture it makes none of, or `Gap::HeapTexture`, an image that takes an allocation of its
-    /// own), the refusal is counted under its kind and the answer is 0 bytes at 0. A value rt's
-    /// descriptor has no value of ([`super::descriptor::rt_texture_descriptor`]) is counted as
-    /// Metal's refusal (`rt-refused-metal`) and answered alike.
+    /// own), the refusal is counted under its kind and raised ([`refused_raise`]), which the
+    /// decoder answers the guest as refused, and the guest then lays the texture out by a bound
+    /// of its own: never 0 bytes at 0, which places the texture at its neighbours' offset. A
+    /// value rt's descriptor has no value of ([`super::descriptor::rt_texture_descriptor`]) is
+    /// counted as Metal's refusal (`rt-refused-metal`) and raised alike.
     fn heap_texture_size_and_align(
         &self,
         desc: &<RtPlatform as Platform>::TextureDescriptor,
     ) -> RaiseResult<SizeAndAlign> {
         const SEL: &str = "heapTextureSizeAndAlignWithDescriptor:";
-        let answer = match super::descriptor::rt_texture_descriptor(&desc.desc()) {
+        let d = match super::descriptor::rt_texture_descriptor(&desc.desc()) {
+            Ok(d) => d,
             Err(why) => {
                 refused_as(SEL, RtRefusal::Refused, &why);
-                return Ok(SizeAndAlign::default());
+                return Err(refused_raise(SEL, RtRefusal::Refused, &why));
             }
-            Ok(d) => self.rt.heap_texture_size_and_align(&d),
         };
-        Ok(match answer {
-            Ok(rt::SizeAndAlign { size, align }) => SizeAndAlign { size, align },
+        match self.rt.heap_texture_size_and_align(&d) {
+            Ok(rt::SizeAndAlign { size, align }) => Ok(SizeAndAlign { size, align }),
             Err(error) => {
-                rt_refused(SEL, &error);
-                SizeAndAlign::default()
+                let kind = rt_refused(SEL, &error);
+                Err(refused_raise(SEL, kind, &error))
             }
-        })
+        }
     }
 
     /// Unbuilt: nil ([`Unbuilt::HostImport`]); the deallocator is not run, as Metal runs none for
@@ -798,9 +806,10 @@ mod tests {
 
     /// The rt platform's device on the GPU the test holds: made once and answered at every ask,
     /// its registry ID opening it again; its answers bounded by its GPU; its queues, events and
-    /// fences made; the guest's texture indices granted, twice without a refusal; every creator
-    /// of an unbuilt piece nil and counted. The answers that differ from the Vulkan platform's on
-    /// the same GPU are printed, for RESULT.md: run it with `--no-capture`.
+    /// fences made; the guest's texture indices granted, twice without a refusal; a heap texture's
+    /// size rt's, and a shape rt or Metal refuses a counted raise, never 0 bytes at 0; every
+    /// creator of an unbuilt piece nil and counted. The answers that differ from the Vulkan
+    /// platform's on the same GPU are printed, for RESULT.md: run it with `--no-capture`.
     #[test]
     fn the_device_and_its_answers_on_vulkan() {
         use crate::core::platform::device::GpuDevice as _;
@@ -855,6 +864,29 @@ mod tests {
             panic!("no size: {sized:?}");
         };
         assert!(size >= 64 * 64 * 4 && align.is_power_of_two(), "{size} at {align}");
+        let counted = |code: &str| {
+            (crate::answer::degradation_counts().into_iter())
+                .find(|(c, _)| c == code)
+                .map_or(0, |(_, n)| n)
+        };
+        let metal = RtRefusal::Refused.code();
+        let before = counted(metal);
+        let refused = [
+            TextureDesc {
+                texture_type: 99,
+                ..TextureDesc::default()
+            },
+            TextureDesc {
+                width: 0,
+                ..TextureDesc::default()
+            },
+        ];
+        for shape in refused {
+            let descriptor = platform.texture_descriptor(&shape);
+            let asked = device.heap_texture_size_and_align(&descriptor);
+            assert!(asked.is_err(), "{shape:?}: {asked:?}");
+        }
+        assert_eq!(counted(metal), before + 2);
 
         let old = crate::gpu::device::tests::dev();
         let mut lines = differences(

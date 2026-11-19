@@ -110,13 +110,13 @@ pub use macos::msg;
 /// (`os/macos.rs`).
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::refusing_imports;
-/// Every physical device the host's loader lists, as the window's probe read it, which the
-/// library's choice of device reads (`crate::device_choice`).
-pub(crate) use wsi::seen_devices;
 /// What the library's choice of device reads of one physical device, from an instance of the
 /// caller's (the rt platform's, `crate::rt_platform`).
 #[cfg(feature = "rt")]
 pub(crate) use wsi::seen;
+/// Every physical device the host's loader lists, as the window's probe read it, which the
+/// library's choice of device reads (`crate::device_choice`).
+pub(crate) use wsi::seen_devices;
 pub use wsi::{add_window_extensions, present_fences};
 
 /// The user's cache directory, where the library keeps for the host's later processes what they

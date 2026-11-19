@@ -212,10 +212,12 @@ fn format_answers(device: &rt::Device, format: u64) -> FormatAnswers {
 
 /// The sum of `device`'s device-local memory heaps.
 fn device_local_bytes(device: &rt::Device) -> u64 {
-    let raw = device.raw();
     // SAFETY: the instance and physical device are the runtime's, read only, while `device`
     // lives.
-    unsafe { device_local_bytes_of(raw.instance, raw.physical_device) }
+    unsafe {
+        let raw = device.raw();
+        device_local_bytes_of(raw.instance, raw.physical_device)
+    }
 }
 
 /// [`device_local_bytes`] of the physical device `physical` of `instance`, as any platform reads
@@ -247,10 +249,12 @@ pub(crate) unsafe fn device_local_bytes_of(
 ///
 /// [`GpuDevice::own_memory_budget`]: crate::core::platform::device::GpuDevice::own_memory_budget
 pub(crate) fn device_local_budget(device: &rt::Device) -> u64 {
-    let raw = device.raw();
     // SAFETY: the instance and physical device are the runtime's, read only, while `device`
     // lives.
-    unsafe { device_local_budget_of(raw.instance, raw.physical_device) }
+    unsafe {
+        let raw = device.raw();
+        device_local_budget_of(raw.instance, raw.physical_device)
+    }
 }
 
 /// [`device_local_budget`] of the physical device `physical` of `instance`, as any platform reads

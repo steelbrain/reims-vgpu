@@ -540,11 +540,9 @@ pub(crate) fn chosen_untimed(seen: &[Seen]) -> Option<usize> {
     for (at, device) in seen.iter().enumerate() {
         log::info!(target: TARGET, "Vulkan device {at}: {}", device.describe());
     }
-    let picked = choose(
-        seen,
-        &user_selection(|name| std::env::var_os(name)),
-        |_| None,
-    );
+    let picked = choose(seen, &user_selection(|name| std::env::var_os(name)), |_| {
+        None
+    });
     log_choice(seen, picked);
     picked.map(|(at, _)| at)
 }
