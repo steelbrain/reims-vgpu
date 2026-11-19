@@ -2719,9 +2719,11 @@ pub fn out_of_host_memory_count() -> u64 {
 /// (`rt-texture-address-guest-pick`); and its contexts' Private takes by cause, those that
 /// waited behind their context's earlier take (`private-take-queued`) and those their worker
 /// took from the source (`private-take-sourced`, with the source's time in microseconds,
-/// `private-take-sourced-us`), with the longest a take held the thread that carried it out
-/// (`private-take-lane-us-most`); and the `Managed` buffers' creates at their CPU copies'
-/// addresses that the platform made at others, where they are kept (`managed-at-copy-unkept`).
+/// `private-take-sourced-us`), those of them longer than the guest's 16 MiB block, an object's
+/// own span (`private-take-span`, with the source's time, `private-take-span-us`), with the
+/// longest a take held the thread that carried it out (`private-take-lane-us-most`); and the
+/// `Managed` buffers' creates at their CPU copies' addresses that the platform made at others,
+/// where they are kept (`managed-at-copy-unkept`).
 static COUNTED: crate::core::sync::Mutex<Vec<(&'static str, u64)>> =
     crate::core::sync::Mutex::new(Vec::new());
 

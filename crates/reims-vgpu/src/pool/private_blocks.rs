@@ -9,12 +9,14 @@
 //! source's ([`BlockSource::take_block`] of [`MemoryClass::Private`]): device memory no one maps,
 //! at the block's own GPU address, the whole of it the context's (the take's length rounded up to
 //! rt's 64 KiB, carved from one of its 16 MiB allocations where it fits, else the start of an
-//! allocation of its own: [`super::BLOCK_LEN`]). On a source with none (`HostBlocks`, the Vulkan
-//! platform's), a block is a range of addresses the host picks ([`HostAddresses::private`],
-//! `[2^44, 2^45)`) with no memory of its own, the take's length rounded up to [`TAKE_ALIGN`]: the
-//! platform makes each object the guest places there as it makes one at the guest's own picks,
-//! and pins it at its address. Nothing here zeroes anything: the decoder makes each Private
-//! buffer zeroed at its create.
+//! allocation of its own: [`super::BLOCK_LEN`]). The guest asks for blocks of [`UNIT_LEN`], rt's
+//! allocation unit, each a range of an allocation rt's block maker may have made ahead of need; an
+//! object whose span is longer takes a block of its own length, which rt allocates in the take
+//! ([`SPAN_CODE`]). On a source with none (`HostBlocks`, the Vulkan platform's), a block is a
+//! range of addresses the host picks ([`HostAddresses::private`], `[2^44, 2^45)`) with no memory
+//! of its own, the take's length rounded up to [`TAKE_ALIGN`]: the platform makes each object the
+//! guest places there as it makes one at the guest's own picks, and pins it at its address.
+//! Nothing here zeroes anything: the decoder makes each Private buffer zeroed at its create.
 //!
 //! # A take
 //!
@@ -23,8 +25,9 @@
 //! the context's lane. A source's block may be an allocation of the driver's, which waits for the
 //! memory and, on NVIDIA's driver, holds the device's other calls while it allocates (about
 //! 0.08 ms a MiB of Private memory, metal2vulkan-rt's `memory.rs`, `ALLOCATION_LEN`): on an RTX
-//! 3090 a boot took 7 blocks of 256 MiB, 52.7 ms in all and 11.5 ms at most, each on the control
-//! ring's lane, which held every context's next messages behind it (**measured**). So a take of
+//! 3090 a boot whose guest asked for blocks of 256 MiB took 7, 52.7 ms in all and 11.5 ms at
+//! most, each on the control ring's lane, which held every context's next messages behind it
+//! (**measured**). So a take of
 //! the source's goes to its context's worker (`reims-vgpu.graphics-private-take`), which takes
 //! the block and answers: only the guest thread whose create asked for the block waits for it, as
 //! Metal's create of that length allocates in its call. A context's takes are answered in its own
@@ -39,7 +42,9 @@
 //! The device's degradation counts (docs/conventions.md) carry the takes by cause: those that
 //! waited behind their context's earlier take ([`QUEUED_CODE`]), those taken from the source on
 //! their worker ([`SOURCED_CODE`], and [`SOURCED_US_CODE`], the source's time for them, summed),
-//! and the longest a take held the thread that carried it out ([`LANE_US_MOST_CODE`]).
+//! those of them longer than [`UNIT_LEN`] ([`SPAN_CODE`], and [`SPAN_US_CODE`], the source's
+//! time for them, summed), and the longest a take held the thread that carried it out
+//! ([`LANE_US_MOST_CODE`]).
 //!
 //! # A give, a close and a reset
 //!
@@ -81,6 +86,20 @@ pub const SOURCED_CODE: &str = "private-take-sourced";
 /// The code whose count is the source's time for the takes of [`SOURCED_CODE`], in
 /// microseconds, summed.
 pub const SOURCED_US_CODE: &str = "private-take-sourced-us";
+
+/// The length of the guest's Private blocks, `kPrivateBlockBytes` in its Metal bundle: 16 MiB,
+/// metal2vulkan-rt's allocation unit ([`metal2vulkan_rt::MemoryClass::block_len`]), which rt's
+/// block maker makes ahead of need while the class's free bytes are fewer than half of one. A
+/// longer take is an object's own span, which rt makes an allocation for in the take.
+pub const UNIT_LEN: u64 = metal2vulkan_rt::MemoryClass::Private.block_len();
+
+/// The code of a take longer than [`UNIT_LEN`] its worker took from the source, counted once
+/// each, among [`SOURCED_CODE`]'s.
+pub const SPAN_CODE: &str = "private-take-span";
+
+/// The code whose count is the source's time for the takes of [`SPAN_CODE`], in microseconds,
+/// summed.
+pub const SPAN_US_CODE: &str = "private-take-span-us";
 
 /// The code whose count is the longest a take held the thread that carried it out, in
 /// microseconds ([`PrivateBlocks::take`]'s own time, its answer's post among it where it answers
@@ -602,8 +621,9 @@ impl Inner {
     }
 }
 
-/// Counts a take of `len` bytes for `context` its worker took from the source in `took`, with
-/// the first such take's line in every boot's log.
+/// Counts a take of `len` bytes for `context` its worker took from the source in `took`, as a
+/// span where it is longer than [`UNIT_LEN`], with the first such take's line of each kind in
+/// every boot's log.
 fn sourced(context: u32, len: u64, took: Duration) {
     count_kind(SOURCED_CODE);
     count_kind_by(SOURCED_US_CODE, micros(took));
@@ -614,6 +634,18 @@ fn sourced(context: u32, len: u64, took: Duration) {
         len >> 20,
         took.as_secs_f64() * 1000.0
     );
+    if len > UNIT_LEN {
+        count_kind(SPAN_CODE);
+        count_kind_by(SPAN_US_CODE, micros(took));
+        log::info!(
+            kind:% = SPAN_CODE;
+            "private blocks: context {context}'s span take of {} KiB, longer than the {} MiB \
+             unit, took {:.1} ms from the source, on its worker",
+            len >> 10,
+            UNIT_LEN >> 20,
+            took.as_secs_f64() * 1000.0
+        );
+    }
 }
 
 /// The longest a take held the thread that carried it out, in microseconds, counted as
@@ -929,6 +961,20 @@ mod tests {
             2,
             "the takes the source gave a block"
         );
+        assert_eq!(counted(SPAN_CODE), 0, "none longer than the unit");
+    }
+
+    /// A take longer than the unit, an object's own span, is counted apart, among the sourced
+    /// takes; a take of the unit is not.
+    #[test]
+    fn a_take_longer_than_the_unit_is_counted_as_a_span() {
+        assert_eq!(UNIT_LEN, 16 << 20, "the guest's kPrivateBlockBytes");
+        let blocks = ledger(Some(Arc::new(Source::default())));
+        answered(&take(&blocks, 3, UNIT_LEN)).unwrap();
+        assert_eq!(counted(SPAN_CODE), 0);
+        answered(&take(&blocks, 3, UNIT_LEN + TAKE_ALIGN)).unwrap();
+        assert_eq!(counted(SPAN_CODE), 1);
+        assert_eq!(counted(SOURCED_CODE), 2);
     }
 
     /// A take of the source's holds the thread that carried it out for none of the source's
@@ -1110,9 +1156,11 @@ mod tests {
         blocks.close();
         assert_eq!(blocks.workers(), 0);
         assert_eq!(counted(SOURCED_CODE), 3);
+        assert_eq!(counted(SPAN_CODE), 1, "the 64 MiB take");
         println!(
-            "the source's time for the takes: {} us",
-            counted(SOURCED_US_CODE)
+            "the source's time for the takes: {} us, {} us of it the span's",
+            counted(SOURCED_US_CODE),
+            counted(SPAN_US_CODE)
         );
     }
 
