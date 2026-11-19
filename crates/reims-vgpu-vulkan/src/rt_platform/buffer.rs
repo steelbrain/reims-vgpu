@@ -38,7 +38,11 @@
 //! Shared, or Managed over them, rt keeping the device copy where the GPU has memory of its own,
 //! whose bytes past `zero_from` start as zeros. Its deallocator runs once rt freed the import,
 //! after the buffer and every command buffer that used it are gone, as Metal runs it once the
-//! buffer is freed; one of a buffer never made never runs, and its captures are kept. Each import
+//! buffer is freed; one of a buffer never made never runs, and its captures are kept. Where the
+//! GPU keeps a device copy, a Managed one's bytes that its making names for that copy (all but
+//! those past `zero_from`) hold the import too, until the next commit of a command buffer with
+//! commands has copied them and its copy has completed (rt's `didModifyRange:` capture), so its
+//! deallocator runs no sooner, though the buffer went before. Each import
 //! is one Vulkan allocation; each is counted ([`IMPORTS_CODE`]), and the most live at once as that
 //! code's highest value ([`IMPORTS_LIVE_MOST_CODE`]); each again, with the most live at once,
 //! under the kind of the make that asked for it on its thread (`crate::answer::making_as`), or
@@ -940,6 +944,8 @@ mod tests {
 
     use super::*;
     use crate::core::platform::Platform as _;
+    use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
     use crate::core::platform::device::GpuDevice as _;
     use crate::core::platform::values::{OptionSet, TextureDesc};
     use crate::rt_platform::RtRefusal;
@@ -1016,7 +1022,8 @@ mod tests {
     /// pins in known blocks at the pin, a Shared one keeping the bytes the CPU wrote there, a
     /// no-copy one over the block's mapping its deallocator run as it goes, and one pinned
     /// elsewhere a range of the block still, with no import; a Managed no-copy one's device copy
-    /// in a Private block where the GPU keeps one; a texture over a buffer.
+    /// in a Private block where the GPU keeps one, which a blit reads, its deallocator run once
+    /// the commit captured its bytes and the buffer went; a texture over a buffer.
     #[test]
     fn buffers_on_vulkan() {
         let platform = RtPlatform::new();
@@ -1205,12 +1212,16 @@ mod tests {
 
         // A Managed no-copy one over memory of the host's own, pinned in the Private block: its
         // device copy at the pin where the GPU keeps one; else lying at its bytes' import, the
-        // pin not kept, counted.
+        // pin not kept, counted. A blit reads the bytes the CPU wrote. Its deallocator runs once
+        // rt freed the import: where the GPU keeps a copy, after the commit that captured the
+        // bytes its making named (the module's docs, "Imports").
         let unpinned = counted(UNPINNED_CODE);
         // SAFETY: the layout's size is not 0.
         let memory = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!memory.is_null());
         let at = HostPtr::from_ptr(memory.wrapping_add(16));
+        // SAFETY: the 64 bytes at `at` lie in the memory, which nothing else uses yet.
+        unsafe { at.as_ptr::<u8>().write_bytes(0xcd, 64) };
         let freed = Arc::new(AtomicBool::new(false));
         let done = Arc::clone(&freed);
         let pin = private.gpu_address + 0x400;
@@ -1225,7 +1236,25 @@ mod tests {
         assert_eq!(made.contents(), at);
         assert_eq!(made.gpu_address() == pin, !unified);
         assert_eq!(counted(UNPINNED_CODE), unpinned + u64::from(unified));
-        drop(made);
+        let out = of(64, 0).expect("a buffer");
+        let queue = device.new_command_queue().expect("a command queue");
+        let commands = queue.command_buffer(on).expect("never a raise");
+        let commands = commands.expect("a command buffer");
+        let encoder = commands.blit_encoder(on).expect("never a raise");
+        let encoder = encoder.expect("a blit encoder");
+        let copy = BlitCmd::CopyBufferToBuffer {
+            source_buffer: Some(&made),
+            source_offset: 0,
+            destination_buffer: Some(&out),
+            destination_offset: 0,
+            size: 64,
+        };
+        assert_eq!(encoder.encode(on, copy), Ok(()));
+        assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+        assert_eq!(commands.commit(on), Ok(()));
+        assert_eq!(commands.wait_until_completed(on), Ok(()));
+        assert_eq!(read(out.contents(), 64), [0xcd; 64]);
+        drop((encoder, commands, made));
         let ran = || freed.load(Ordering::Acquire);
         assert!(waits_for(ran), "the deallocator ran");
         // SAFETY: the deallocator ran: rt holds no import of the memory.
