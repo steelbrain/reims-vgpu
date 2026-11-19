@@ -217,17 +217,9 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
             |w| {
                 let b = new_buffer(w, length, options, Backing::Fresh, None)?;
                 if let Model::Buffer(m) = &b.state().model
-                    && !m.contents.is_null()
+                    && let Some(mem) = &m.mem
                 {
-                    // SAFETY: the fresh region of `length` bytes the buffer owns, which nothing
-                    // else uses yet.
-                    unsafe {
-                        std::ptr::write_bytes(
-                            m.contents.as_ptr::<u8>(),
-                            SCRATCH_MARKER,
-                            num::ToUsize::to_usize(length),
-                        )
-                    };
+                    mem.write(0, &vec![SCRATCH_MARKER; num::ToUsize::to_usize(mem.len())]);
                 }
                 Some(b)
             },
