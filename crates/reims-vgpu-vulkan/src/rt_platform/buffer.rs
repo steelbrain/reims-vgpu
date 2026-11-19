@@ -2314,7 +2314,10 @@ mod tests {
         let before = zeros();
         let plain = (device.new_buffer_of_length(on, 100_000, 0)).expect("never a raise");
         let plain = plain.expect("a Shared buffer");
-        assert!(zeros() >= before + 100_000, "a new buffer's bytes are zeros");
+        assert!(
+            zeros() >= before + 100_000,
+            "a new buffer's bytes are zeros"
+        );
         assert!(read(plain.contents(), 100_000).iter().all(|&b| b == 0));
 
         let before = zeros();
