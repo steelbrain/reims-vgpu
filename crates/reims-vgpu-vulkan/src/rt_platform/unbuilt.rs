@@ -16,7 +16,9 @@
 //! format's own code instead, `rt-refused-texture-format-<n>` ([`rt_refused_texture`]), so a
 //! boot's counts line gives each format number with its count. A pipeline state's imageblock
 //! length rt refuses (`Gap::ImageblockLength`) is counted apart from rt's other gaps too,
-//! `rt-refused-imageblock-length` ([`rt_refused_imageblock`]).
+//! `rt-refused-imageblock-length` ([`rt_refused_imageblock`]). So is a heap texture rt refuses on
+//! its place in its block where Metal places it in its heap, `rt-refused-heap-texture-place`
+//! ([`HEAP_TEXTURE_PLACE`]).
 //!
 //! [`Unbuilt::ALL`] is the list of what is still unbuilt. A piece leaves it when it is built.
 
@@ -373,9 +375,13 @@ pub fn rt_refused_create(sel: &'static str, error: &rt::Error) -> RtRefusal {
 
 /// [`rt_refused`] of a call that makes or sizes a texture: a refusal of the texture for its pixel
 /// format (`Gap::TextureFormat`) is counted under its format's code ([`format_code`]), and the
-/// process's first of each format writes its line on stderr; any other under its kind's. Returns
-/// the kind ([`RtRefusal::Gap`] for a format).
+/// process's first of each format writes its line on stderr; a heap texture's place that Metal
+/// places under [`HEAP_TEXTURE_PLACE`]; any other under its kind's. Returns the kind
+/// ([`RtRefusal::Gap`] for a format).
 pub fn rt_refused_texture(sel: &'static str, error: &rt::Error) -> RtRefusal {
+    if let Some(kind) = heap_texture_place(sel, error) {
+        return kind;
+    }
     let rt::Error::Unsupported(rt::Gap::TextureFormat { pixel_format }) = error else {
         return rt_refused(sel, error);
     };
@@ -412,6 +418,47 @@ pub fn rt_refused_imageblock(sel: &'static str, error: &rt::Error) {
              ({IMAGEBLOCK_LENGTH}), the first of its kind\n"
         ));
     }
+}
+
+/// The code a heap texture rt refuses on its place in its block, where Metal places it in its heap,
+/// is counted under ([`heap_texture_place`]).
+pub const HEAP_TEXTURE_PLACE: &str = "rt-refused-heap-texture-place";
+
+/// [`rt_refused_texture`] of rt's `HeapTexturePlace` where Metal's own rule places the texture:
+/// its offset a multiple of the alignment rt answers for it (as
+/// `heapTextureSizeAndAlignWithDescriptor:` answers it), and its bytes inside the heap. rt binds
+/// the image at its offset in the heap's block, the heap's offset there added, and refuses one
+/// whose place there is off the image's alignment: a heap pinned in a block at an offset that is
+/// not a multiple of it. Counted under
+/// [`HEAP_TEXTURE_PLACE`] and under the code of the make that runs on the thread where one names
+/// one, apart from Metal's refusals, and the process's first writes its line on stderr. `None` for
+/// any other error, which the caller counts.
+fn heap_texture_place(sel: &'static str, error: &rt::Error) -> Option<RtRefusal> {
+    static SAID_HEAP_PLACE: AtomicBool = AtomicBool::new(false);
+    let rt::Error::Refused(rt::Refusal::HeapTexturePlace {
+        offset,
+        size,
+        align,
+        heap_len,
+    }) = *error
+    else {
+        return None;
+    };
+    let aligned = align != 0 && offset.is_multiple_of(align);
+    if !aligned || offset.checked_add(size).is_none_or(|end| end > heap_len) {
+        return None;
+    }
+    crate::answer::count_kind(HEAP_TEXTURE_PLACE);
+    if let Some(code) = crate::answer::refusing() {
+        crate::answer::count_kind(code);
+    }
+    if !SAID_HEAP_PLACE.swap(true, Ordering::Relaxed) {
+        say(&format!(
+            "reims-vgpu: {sel}: metal2vulkan-rt refused it ({error}), where Metal places it; \
+             refused ({HEAP_TEXTURE_PLACE}), the first of its kind\n"
+        ));
+    }
+    Some(RtRefusal::Refused)
 }
 
 /// [`rt_refused_create`] of a creator with an `error:` out-parameter: the `NSError` it answers, in
@@ -586,6 +633,41 @@ mod tests {
         let before = counted(code);
         rt_refused_imageblock("imageblockSampleLength", &rt::Error::Quiesced);
         assert_eq!(counted(code), before + 1);
+    }
+
+    /// rt's refusal of a heap texture's place that Metal's own rule places (its offset a multiple
+    /// of the image's alignment, its bytes inside the heap) is counted under its own code, not as
+    /// Metal's refusal, and under the code of a make running on the thread; one off the alignment
+    /// or past the heap's end is Metal's refusal.
+    #[test]
+    fn a_heap_texture_s_place_is_counted_apart_where_metal_places_it() {
+        let place = |offset, size| {
+            rt::Error::Refused(rt::Refusal::HeapTexturePlace {
+                offset,
+                size,
+                align: 0x10000,
+                heap_len: 0x20_0000,
+            })
+        };
+        let metal = RtRefusal::Refused.code();
+        let (before, metals) = (counted(HEAP_TEXTURE_PLACE), counted(metal));
+        let sel = "newTextureWithDescriptor:offset:";
+        assert_eq!(rt_refused_texture(sel, &place(0, 0xc_0000)), RtRefusal::Refused);
+        let (kind, relayed) =
+            relaying_gaps(|| rt_refused_texture_create(sel, &place(0x14_0000, 0xc_0000)));
+        assert_eq!(kind, RtRefusal::Refused);
+        assert!(relayed);
+        let making = "test-refused-heap-place";
+        let ours = counted(making);
+        crate::answer::refusing_as(making, || rt_refused_texture(sel, &place(0x10000, 0x1000)));
+        assert_eq!(counted(making), ours + 1);
+        assert_eq!(counted(HEAP_TEXTURE_PLACE), before + 3);
+        assert_eq!(counted(metal), metals);
+        // Metal's own refusals: off the alignment, past the heap's end.
+        assert_eq!(rt_refused_texture(sel, &place(0x8000, 0x1000)), RtRefusal::Refused);
+        assert_eq!(rt_refused_texture(sel, &place(0x18_0000, 0xc_0000)), RtRefusal::Refused);
+        assert_eq!(counted(HEAP_TEXTURE_PLACE), before + 3);
+        assert!(counted(metal) >= metals + 2, "{metal}");
     }
 
     /// A creator with an `error:` out-parameter answers an `NSError` naming the piece and its

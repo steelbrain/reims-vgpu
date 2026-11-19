@@ -33,8 +33,12 @@
 //! host's memory that is not Shared or that its bytes do not cover, a heap type Metal has none of;
 //! a buffer or texture of a mode other than its heap's, in an automatic heap, at an offset off
 //! 256 bytes (a buffer) or past the heap's end. What rt refuses is nil, counted under rt's kind; a
-//! buffer of no bytes, which Metal places, is rt's refusal. A sparse heap is unbuilt
-//! ([`Unbuilt::Heap`]).
+//! buffer of no bytes, which Metal places, is rt's refusal. A texture Metal places that rt refuses
+//! on its place in the heap's block (a heap pinned at an offset of its block off the image's
+//! alignment, which rt binds the image at) is counted apart from Metal's refusals
+//! (`rt-refused-heap-texture-place`, [`super::unbuilt::HEAP_TEXTURE_PLACE`]): the guest pins its
+//! Private heaps at 256 KiB from their block's first byte, the largest image alignment measured. A
+//! sparse heap is unbuilt ([`Unbuilt::Heap`]).
 
 use std::sync::atomic::AtomicU64;
 
@@ -386,9 +390,11 @@ mod tests {
     use crate::core::platform::Platform as _;
     use crate::core::platform::device::GpuDevice as _;
     use crate::core::platform::resource::{Buffer as _, GpuResource as _, Texture as _};
+    use crate::core::platform::types::SizeAndAlign;
     use crate::core::platform::values::{OptionSet, TextureDesc};
     use crate::rt_platform::RtRefusal;
     use crate::rt_platform::buffer::{IMPORTS_CODE, UNPINNED_CODE};
+    use crate::rt_platform::unbuilt::HEAP_TEXTURE_PLACE;
 
     fn desc(size: u64, heap_type: i64) -> HeapDesc {
         HeapDesc {
@@ -528,6 +534,75 @@ mod tests {
         assert!(device.known_blocks().forget(block.id).is_some());
         // The memory is left allocated: rt's import of it goes with the device, at the process's
         // end.
+    }
+
+    /// How far from its Private block's first byte the guest pins a Private heap, a multiple of
+    /// it (`kHeapAddressAlign`, `guest/bundle/src/RgfxSerializer.hpp`).
+    const GUEST_HEAP_ALIGN: u64 = 0x40000;
+
+    /// Private heaps pinned in a known Private block, a texture at offset 0 of each, of the most
+    /// aligned of a few shapes on the GPU the test holds: in a heap pinned 32 KiB into the block,
+    /// where the guest pinned its heaps before, Metal places it and rt refuses it where the image's
+    /// alignment is more than 32 KiB, counted apart from Metal's refusals; in one pinned at a
+    /// multiple of the guest's heap alignment from the block's first byte it is made.
+    #[test]
+    fn a_heap_pinned_in_a_block_places_textures_at_the_guest_s_alignment_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let heap = |desc: &HeapDesc| device.new_heap(desc).expect("never a raise").heap;
+        let shape = |texture_type, pixel_format, side, sample_count| TextureDesc {
+            texture_type,
+            pixel_format,
+            width: side,
+            height: side,
+            sample_count,
+            usage: 4,
+            resource_options: Some(0x20),
+            ..TextureDesc::default()
+        };
+        // 4-sample Depth32Float and RGBA16Float targets, the shapes a GPU aligns most, and a
+        // single-sample RGBA8Unorm one.
+        let shapes = [shape(4, 252, 256, 4), shape(4, 115, 256, 4), shape(2, 70, 512, 1)];
+        let (texture, sized) = (shapes.iter())
+            .filter_map(|desc| {
+                let texture = platform.texture_descriptor(desc);
+                let sized = device.heap_texture_size_and_align(&texture).ok()?;
+                Some((texture, sized))
+            })
+            .max_by_key(|(_, sized)| (sized.align, std::cmp::Reverse(sized.size)))
+            .expect("rt sizes a shape");
+        let SizeAndAlign { size, align } = sized;
+        assert!(
+            align <= GUEST_HEAP_ALIGN,
+            "the GPU aligns a texture to {align:#x} bytes: the guest's heap alignment is too small"
+        );
+        let size = size.next_multiple_of(HEAP_PAGE);
+        let block = (device.rt()).take_block(rt::MemoryClass::Private, 0x80_0000);
+        let block = block.expect("a Private block");
+        device.known_blocks().know(block.clone());
+
+        let metal = RtRefusal::Refused.code();
+        let (places, metals) = (counted(HEAP_TEXTURE_PLACE), counted(metal));
+        let pin = block.gpu_address + 0x8000;
+        let off = heap(&placement(size, 0x20, Some(pin))).expect("a heap in the block");
+        assert_eq!(off.gpu_address(), pin);
+        let placed = off.new_texture(&texture, 0).expect("never a raise");
+        if align > 0x8000 {
+            assert!(placed.is_none(), "a {size:#x}-byte texture at {align:#x}");
+            assert_eq!(counted(HEAP_TEXTURE_PLACE), places + 1);
+        } else {
+            assert!(placed.is_some(), "a {size:#x}-byte texture at {align:#x}");
+            assert_eq!(counted(HEAP_TEXTURE_PLACE), places);
+        }
+        assert_eq!(counted(metal), metals);
+
+        let pin = block.gpu_address + 11 * GUEST_HEAP_ALIGN;
+        let at = heap(&placement(size, 0x20, Some(pin))).expect("a heap in the block");
+        assert_eq!(at.gpu_address(), pin);
+        let placed = at.new_texture(&texture, 0).expect("never a raise");
+        let placed = placed.expect("a texture in the heap at the guest's alignment");
+        assert_eq!(placed.resource_options(), 0x120);
+        assert!(device.known_blocks().forget(block.id).is_some());
     }
 
     /// A heap's descriptor: its size rounded up to 16 KiB, Shared or Private, a default hazard
