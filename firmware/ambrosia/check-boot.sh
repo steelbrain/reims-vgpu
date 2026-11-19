@@ -414,7 +414,16 @@ if [[ -n $ssh_s ]]; then
   # The guest's release, from a command that answered: the login probe's success can come before
   # sshd takes the password every time, and G's output is its last try's alone.
   gver=$(G 20 'sw_vers -productVersion; sw_vers -buildVersion') || gver=
+  # The session's uuid at the login, read again every 5 s until it reads as one, for 30 s: at an
+  # arm64 26 login under TCG the first two commands answered nothing and the next ones answered
+  # (m3-max-51279), which left page-count and amfi-refuse unable to tell a boot again.
   boot0=$(G 20 'sysctl -n kern.bootsessionuuid') || boot0=
+  uuid_t0=$SECONDS
+  while ! [[ $boot0 =~ ^[0-9A-Fa-f-]{36}$ ]] && ((SECONDS - uuid_t0 < 30)); do
+    sleep 5
+    boot0=$(G 20 'sysctl -n kern.bootsessionuuid') || boot0=
+  done
+  [[ $boot0 =~ ^[0-9A-Fa-f-]{36}$ ]] || boot0=
 
   csr=$(G 30 csrutil status)
   case $csr in
