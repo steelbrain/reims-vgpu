@@ -169,6 +169,33 @@ impl Default for RtPlatform {
     }
 }
 
+/// The bound of the let-go of a platform's drop: the release's (reims-vgpu's `LET_GO_BOUND`).
+const DROP_LET_GO: Duration = Duration::from_secs(5);
+
+/// A platform that drops lets go of its device first ([`RtPlatform::let_go_of_device`]), so that
+/// rt's teardown of it has ended when the drop returns. metal2vulkan-rt's README (Teardown):
+/// "Every gauge reads zero only once the `VkDevice` is destroyed, so a consumer whose last handle
+/// dropped in a handler waits for that before it drops its instance or exits." Where the
+/// device's last handle goes in a shared event's notification or a command buffer's handler, on
+/// rt's thread, rt tears the device down on its reaper once that returns, and a process ending
+/// meanwhile races the teardown. The let-go holds the platform's handle until rt's threads ended
+/// and drops it on the dropping thread, then waits for the gauges. The process's platform lives
+/// to the exit, so this serves the platforms tests make. A let-go past its bound is logged with
+/// what was left (handles beyond the platform's, rt's threads or GPU work, or gauges not at
+/// zero), and the devices kept to the exit are left undropped, since their drops would wait with
+/// no deadline.
+impl Drop for RtPlatform {
+    fn drop(&mut self) {
+        if let Err(held) = self.let_go_of_device(DROP_LET_GO) {
+            log::warn!(
+                target: TARGET,
+                "the platform's drop left its device: after {DROP_LET_GO:?}, {held} still held it"
+            );
+        }
+        std::mem::forget(std::mem::take(&mut *self.unended.lock()));
+    }
+}
+
 impl std::fmt::Debug for RtPlatform {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RtPlatform").finish_non_exhaustive()
@@ -285,7 +312,7 @@ impl RtPlatform {
                     counters,
                 });
                 return Err(format!(
-                    "rt's objects of {named}, which outlived the platform's handle ({gauges:?}),"
+                    "rt's objects of {named}, its gauges not at zero ({gauges:?}),"
                 ));
             }
             std::thread::sleep(crate::let_go::POLL);
@@ -628,6 +655,38 @@ mod tests {
         ] {
             assert!(stderr.contains(line), "no {line:?}: {stderr}");
         }
+    }
+
+    /// A platform dropped while a shared event's notification, running on rt's thread, still
+    /// holds a handle of its device returns once rt tore the device down: rt's gauges of it read
+    /// zero right after the drop. Without the let-go of the platform's drop, the notification's
+    /// handle is the device's last, and rt tears the device down on its reaper after the drop
+    /// returned.
+    #[test]
+    fn on_vulkan_a_platform_dropped_while_a_listener_holds_a_handle_waits_for_the_teardown() {
+        use std::sync::mpsc;
+
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::event::{Notification, SharedEvent as _};
+
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let counters = device.rt().counters();
+        let event = device.new_shared_event().expect("a shared event");
+        let listener = platform.new_shared_event_listener();
+        let (running, runs) = mpsc::channel::<()>();
+        let held = event.clone_ref();
+        let notification: Notification = Box::new(move || {
+            let _ = running.send(());
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        assert_eq!(event.notify_listener(&listener, 1, notification), Ok(()));
+        assert_eq!(event.set_signaled_value(1), Ok(()));
+        (runs.recv_timeout(Duration::from_secs(10))).expect("the notification runs");
+        drop((event, listener, device));
+        drop(platform);
+        assert_eq!(counters.gauges(), rt::Gauges::default());
     }
 
     /// A texture descriptor reads back what was set, as Metal's does; each made one is an object
