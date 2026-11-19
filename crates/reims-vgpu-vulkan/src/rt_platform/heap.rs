@@ -123,7 +123,13 @@ fn shape(desc: &HeapDesc, held: u64) -> Result<Option<Shape>, String> {
         0 => (held & !(BIT_20 | READ_ONLY)) | UNTRACKED,
         _ => held & !(BIT_20 | READ_ONLY),
     };
-    Ok(Some((class, size, placement, answered, held & READ_ONLY != 0)))
+    Ok(Some((
+        class,
+        size,
+        placement,
+        answered,
+        held & READ_ONLY != 0,
+    )))
 }
 
 /// `newHeapWithDescriptor:` of `desc` on `device`, its descriptor's options `held`: at the pin
@@ -277,7 +283,10 @@ impl Heap<RtPlatform> for RtObj<RtHeap> {
     ) -> RaiseResult<Option<RtObj<RtBuffer>>> {
         const SEL: &str = "newBufferWithLength:options:offset:";
         if options & !(FIELDS | BIT_20 | READ_ONLY) != 0 {
-            return Ok(refused_metal(SEL, &format!("resource options {options:#x}")));
+            return Ok(refused_metal(
+                SEL,
+                &format!("resource options {options:#x}"),
+            ));
         }
         let misplaced = match offset.is_multiple_of(PLACEMENT_ALIGNMENT) {
             true => self.misplaced(Some(options), offset, Some(length)),
@@ -394,7 +403,10 @@ mod tests {
         let size = 0x40000;
 
         let private = heap(&placement(size, 0x20, None)).expect("a Private heap");
-        assert_eq!((private.resource_options(), private.storage_mode()), (0x120, 2));
+        assert_eq!(
+            (private.resource_options(), private.storage_mode()),
+            (0x120, 2)
+        );
         assert_ne!(private.gpu_address(), 0);
         let place = |length, options, offset| {
             let made = private.new_buffer_of_length(length, options, offset);
@@ -456,22 +468,38 @@ mod tests {
         // import's, which the device's teardown frees.
         let bytes = unsafe { HostRange::new(HostPtr::from_ptr(memory), 0x10000) };
         let made = device.new_heap_over_host_memory(bytes, &placement(0x10000, 0, None));
-        let over = made.expect("never a raise").heap.expect("a heap over the host's memory");
+        let over = made
+            .expect("never a raise")
+            .heap
+            .expect("a heap over the host's memory");
         assert_eq!(counted(IMPORTS_CODE), imports + 1);
-        let buffer = over.new_buffer_of_length(64, 0, 0x200).expect("never a raise");
+        let buffer = over
+            .new_buffer_of_length(64, 0, 0x200)
+            .expect("never a raise");
         let buffer = buffer.expect("a buffer in it");
-        assert_eq!(buffer.contents(), HostPtr::from_ptr(memory.wrapping_add(0x200)));
+        assert_eq!(
+            buffer.contents(),
+            HostPtr::from_ptr(memory.wrapping_add(0x200))
+        );
         let mapping = block.contents.expect("a Shared block's mapping").as_ptr();
         let first = HostPtr::from_ptr(mapping.wrapping_add(0x8000));
         // SAFETY: the block's mapping lives while the test holds the block.
         let bytes = unsafe { HostRange::new(first, 0x4000) };
         let pin = block.gpu_address + 0x8000;
         let made = device.new_heap_over_host_memory(bytes, &placement(0x4000, 0, Some(pin)));
-        let over_block = made.expect("never a raise").heap.expect("a heap over the block");
+        let over_block = made
+            .expect("never a raise")
+            .heap
+            .expect("a heap over the block");
         assert_eq!(over_block.gpu_address(), pin);
         assert_eq!(counted(IMPORTS_CODE), imports + 1);
-        let buffer = over_block.new_buffer_of_length(64, 0, 0x100).expect("never a raise");
-        assert_eq!(buffer.map(|b| b.contents()), Some(first.wrapping_add(0x100)));
+        let buffer = over_block
+            .new_buffer_of_length(64, 0, 0x100)
+            .expect("never a raise");
+        assert_eq!(
+            buffer.map(|b| b.contents()),
+            Some(first.wrapping_add(0x100))
+        );
         assert!(device.known_blocks().forget(block.id).is_some());
         // The memory is left allocated: rt's import of it goes with the device, at the process's
         // end.
@@ -487,7 +515,10 @@ mod tests {
         assert_eq!(shape(&placement, 0), Ok(Some(shared)));
         let private = (rt::MemoryClass::Private, 2 * HEAP_PAGE, false, 0x220, true);
         let automatic = desc(HEAP_PAGE + 1, AUTOMATIC);
-        assert_eq!(shape(&automatic, 0x220 | BIT_20 | READ_ONLY), Ok(Some(private)));
+        assert_eq!(
+            shape(&automatic, 0x220 | BIT_20 | READ_ONLY),
+            Ok(Some(private))
+        );
         assert_eq!(shape(&desc(HEAP_PAGE, SPARSE), 0x20), Ok(None));
         for (d, held) in [
             (desc(0, PLACEMENT), 0),

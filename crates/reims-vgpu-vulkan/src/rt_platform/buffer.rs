@@ -861,7 +861,7 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
 #[cfg(test)]
 mod tests {
     use std::alloc::Layout;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::*;
     use crate::core::platform::Platform as _;
@@ -879,7 +879,10 @@ mod tests {
         assert_eq!(made(0x10, true), Ok((Storage::Managed, 0x210)));
         assert_eq!(made(0x101 | BIT_20, false), Ok((Storage::Shared, 0x101)));
         let read_only = options(READ_ONLY | 0x200, true);
-        assert_eq!(read_only.map(|o| (o.answered, o.read_only)), Ok((0x200, true)));
+        assert_eq!(
+            read_only.map(|o| (o.answered, o.read_only)),
+            Ok((0x200, true))
+        );
         for (raw, no_copy) in [
             (READ_ONLY, false),
             (0x20, true),
@@ -919,13 +922,15 @@ mod tests {
         }
     }
 
-    /// Waits up to 10 s for `done`.
-    fn waits_for(done: &AtomicBool) -> bool {
-        let start = Instant::now();
-        while !done.load(Ordering::Acquire) && start.elapsed() < Duration::from_secs(10) {
+    /// Asks `done` every 10 ms, up to 1000 times (about 10 s).
+    fn waits_for(done: impl Fn() -> bool) -> bool {
+        for _ in 0..1000 {
+            if done() {
+                return true;
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
-        done.load(Ordering::Acquire)
+        done()
     }
 
     /// Buffers on the GPU the test holds: Shared, Private and Managed ones of zeros, answering
@@ -948,7 +953,10 @@ mod tests {
             let buffer = of(100, options).expect("a buffer");
             let mode = (options >> 4) & 0xf;
             assert_eq!(buffer.length(), 100);
-            assert_eq!((buffer.resource_options(), buffer.storage_mode()), (answered, mode));
+            assert_eq!(
+                (buffer.resource_options(), buffer.storage_mode()),
+                (answered, mode)
+            );
             assert_ne!(buffer.gpu_address(), 0);
             match options {
                 0x20 => assert_eq!(buffer.contents(), HostPtr::NULL),
@@ -987,7 +995,8 @@ mod tests {
         assert!(counted(IMPORTS_LIVE_MOST_CODE) >= imports.1.max(1));
         assert!(!freed.load(Ordering::Acquire));
         drop(buffer);
-        assert!(waits_for(&freed), "the deallocator ran");
+        let ran = || freed.load(Ordering::Acquire);
+        assert!(waits_for(ran), "the deallocator ran");
 
         // Through a descriptor, read-only: the deallocator takes the bytes and the length.
         let given = Arc::new(Mutex::new(None));
@@ -1006,14 +1015,13 @@ mod tests {
             })),
             zero_from: None,
         });
-        let buffer = made.expect("never a raise").expect("a read-only no-copy buffer");
+        let buffer = made
+            .expect("never a raise")
+            .expect("a read-only no-copy buffer");
         assert_eq!(buffer.resource_options(), 0x200);
         assert_eq!(counted(READ_ONLY_CODE), read_only_before + 1);
         drop(buffer);
-        let start = Instant::now();
-        while given.lock().is_none() && start.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(waits_for(|| given.lock().is_some()));
         assert_eq!(*given.lock(), Some((at.addr(), 1000)));
         // SAFETY: both deallocators ran: rt holds no import of the memory.
         unsafe { std::alloc::dealloc(memory, layout) };
@@ -1021,14 +1029,19 @@ mod tests {
         // A pin in no known block.
         let unpinned = counted(UNPINNED_CODE);
         let pin = 1 << 46;
-        let made = device.new_buffer(pinned(pin, 0, None)).expect("never a raise");
+        let made = device
+            .new_buffer(pinned(pin, 0, None))
+            .expect("never a raise");
         assert_ne!(made.expect("a buffer at rt's address").gpu_address(), pin);
         assert_eq!(counted(UNPINNED_CODE), unpinned + 1);
 
         // Pins in known blocks.
         let shared = (device.rt()).take_block(rt::MemoryClass::Shared, 0x10000);
         let private = (device.rt()).take_block(rt::MemoryClass::Private, 0x10000);
-        let (shared, private) = (shared.expect("a Shared block"), private.expect("a Private one"));
+        let (shared, private) = (
+            shared.expect("a Shared block"),
+            private.expect("a Private one"),
+        );
         let known = device.known_blocks().clone();
         known.know(shared.clone());
         known.know(private.clone());
@@ -1037,15 +1050,24 @@ mod tests {
         // SAFETY: the block is mapped while it lives, and 0x100 + 64 bytes lie in it.
         unsafe { written.as_ptr::<u8>().write_bytes(0xab, 64) };
         let pin = shared.gpu_address + 0x100;
-        let made = device.new_buffer(pinned(pin, 0, None)).expect("never a raise");
+        let made = device
+            .new_buffer(pinned(pin, 0, None))
+            .expect("never a raise");
         let made = made.expect("a buffer in the known block");
         assert_eq!((made.gpu_address(), made.contents()), (pin, written));
         assert_eq!(read(made.contents(), 64), [0xab; 64]);
         let pin = private.gpu_address + 0x200;
-        let made = device.new_buffer(pinned(pin, 0x20, None)).expect("never a raise");
-        assert_eq!(made.expect("a Private buffer in its block").gpu_address(), pin);
+        let made = device
+            .new_buffer(pinned(pin, 0x20, None))
+            .expect("never a raise");
+        assert_eq!(
+            made.expect("a Private buffer in its block").gpu_address(),
+            pin
+        );
         let pin = shared.gpu_address + 0x100;
-        let made = device.new_buffer(pinned(pin, 0x20, None)).expect("never a raise");
+        let made = device
+            .new_buffer(pinned(pin, 0x20, None))
+            .expect("never a raise");
         assert_ne!(made.expect("a Private buffer, unpinned").gpu_address(), pin);
 
         // A no-copy one over the known block's mapping.
@@ -1077,7 +1099,9 @@ mod tests {
             usage: 0x1,
             ..TextureDesc::default()
         });
-        let texture = buffer.new_texture(on, &descriptor, 0, 256).expect("never a raise");
+        let texture = buffer
+            .new_texture(on, &descriptor, 0, 256)
+            .expect("never a raise");
         assert!(texture.is_some());
     }
 }
