@@ -341,32 +341,40 @@ void test_private_address_picks()
 		CHECK(r.given.empty());
 	}
 
-	// Picks from several threads at once never share a span, and each lies in a block taken.
+	// Picks from several threads at once never share a span, and each lies in a block taken. The
+	// picks, 62.5 MiB of spans, go round several 16 MiB blocks, so a freed span is picked again:
+	// the live picks are the ones that never meet.
 	{
 		FakePrivate t;
 		RgfxIdSpace shared;
 		shared.setBases(uint64_t{7} << RGFX_CONTEXT_OBJ_ID_SHIFT, base, RGFX_CONTEXT_VA_UNIT);
 		shared.setPrivateBlockSource(&fakePrivateTake, &fakePrivateGive, &t);
-		std::vector<uint64_t> got[4];
+		std::vector<uint64_t> got[4], kept[4];
 		std::vector<std::thread> threads;
-		for (auto &g : got)
-			threads.emplace_back([&shared, &g] {
+		for (int k = 0; k < 4; k++)
+			threads.emplace_back([&shared, &g = got[k], &live = kept[k]] {
 				for (int i = 0; i < 500; i++) {
 					uint64_t at = shared.allocPrivateAddress(0x1000, 1);
 					g.push_back(at);
 					if (i % 3 == 0)
 						shared.freeAddress(at);
+					else
+						live.push_back(at);
 				}
 			});
 		for (auto &th : threads)
 			th.join();
-		std::vector<uint64_t> all;
-		for (auto &g : got)
-			all.insert(all.end(), g.begin(), g.end());
-		std::sort(all.begin(), all.end());
-		CHECK(std::adjacent_find(all.begin(), all.end()) == all.end());
-		for (uint64_t at : all)
-			CHECK(inPrivateBlock(t, at, granule));
+		std::vector<uint64_t> live;
+		for (int k = 0; k < 4; k++) {
+			for (uint64_t at : got[k])
+				CHECK(inPrivateBlock(t, at, granule));
+			live.insert(live.end(), kept[k].begin(), kept[k].end());
+		}
+		std::sort(live.begin(), live.end());
+		CHECK(live.size() == 4 * 333);
+		for (size_t i = 1; i < live.size(); i++)
+			CHECK(live[i] - live[i - 1] >= RgfxIdSpace::addressSpan(0x1000));
+		CHECK(t.taken.size() > 1);
 	}
 }
 
