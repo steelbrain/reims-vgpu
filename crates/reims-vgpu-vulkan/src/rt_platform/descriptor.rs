@@ -260,16 +260,25 @@ mod tests {
             width: 1 << 32,
             ..TextureDesc::default()
         };
-        assert_eq!(rt_texture_descriptor(&wide), Err(format!("width {}", 1u64 << 32)));
+        assert_eq!(
+            rt_texture_descriptor(&wide),
+            Err(format!("width {}", 1u64 << 32))
+        );
         let typed = TextureDesc {
             texture_type: 99,
             ..TextureDesc::default()
         };
-        assert_eq!(rt_texture_descriptor(&typed), Err("texture type 99".to_owned()));
+        assert_eq!(
+            rt_texture_descriptor(&typed),
+            Err("texture type 99".to_owned())
+        );
         let stored = TextureDesc {
             resource_options: Some(0x70),
             ..TextureDesc::default()
         };
-        assert_eq!(rt_texture_descriptor(&stored), Err("storage mode 7".to_owned()));
+        assert_eq!(
+            rt_texture_descriptor(&stored),
+            Err("storage mode 7".to_owned())
+        );
     }
 }

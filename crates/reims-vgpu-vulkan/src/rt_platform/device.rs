@@ -21,19 +21,18 @@ use std::sync::Arc;
 use ash::vk;
 use metal2vulkan_rt as rt;
 
+use crate::core::platform::Platform;
 use crate::core::platform::caps::{DeviceCaps, IdentityCaps, SAMPLE_COUNTS};
 use crate::core::platform::device::{GpuDevice, NoCopyDeallocator};
 use crate::core::platform::host_range::HostRange;
 use crate::core::platform::types::{
-    ArgumentLayout, NsErrorText, PixelFormatInfo, SizeAndAlign, TextureLevelInfo,
-    TextureLevelQuery,
+    ArgumentLayout, NsErrorText, PixelFormatInfo, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
 };
 use crate::core::platform::values::{
     ArgumentDesc, BufferDesc, DepthStencilDesc, FullComputePipelineDesc,
     FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc,
     RenderPipelineDesc, SamplerDesc,
 };
-use crate::core::platform::Platform;
 use crate::core::raise::{OnFault, Raise, RaiseResult};
 use crate::gpu::device::{HEAP_DESCRIPTOR_OPTIONS, descriptor_options};
 use crate::gpu::identity;
@@ -267,26 +266,34 @@ fn grant(device: &rt::Device, sel: &'static str, class: rt::IndexClass, indices:
     }
     for (first, count) in runs {
         let (Ok(first), Ok(count)) = (u32::try_from(first), u32::try_from(count)) else {
-            refused_as(sel, RtRefusal::Limit, &format!("index {first} is past 32 bits"));
+            let why = format!("index {first} is past 32 bits");
+            refused_as(sel, RtRefusal::Limit, &why);
             continue;
         };
-        match device.grant_indices(class, first, count) {
-            Ok(_) => {}
-            Err(rt::Error::Refused(rt::Refusal::IndicesGranted { .. })) => {
-                for index in first..first.saturating_add(count) {
-                    match device.grant_indices(class, index, 1) {
-                        Ok(_) | Err(rt::Error::Refused(rt::Refusal::IndicesGranted { .. })) => {}
-                        Err(error) => {
-                            rt_refused(sel, &error);
-                        }
-                    }
+        let Err(error) = device.grant_indices(class, first, count) else {
+            continue;
+        };
+        if !granted_already(&error) {
+            rt_refused(sel, &error);
+            continue;
+        }
+        for index in first..first.saturating_add(count) {
+            match device.grant_indices(class, index, 1) {
+                Err(error) if !granted_already(&error) => {
+                    rt_refused(sel, &error);
                 }
-            }
-            Err(error) => {
-                rt_refused(sel, &error);
+                _ => {}
             }
         }
     }
+}
+
+/// Whether rt refused a grant because an index of it is granted already.
+fn granted_already(error: &rt::Error) -> bool {
+    matches!(
+        error,
+        rt::Error::Refused(rt::Refusal::IndicesGranted { .. })
+    )
 }
 
 /// The selector of the resource indices' reservation.
