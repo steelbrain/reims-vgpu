@@ -7,9 +7,10 @@
 //! **Built piece by piece**, in the order a guest's boot reaches the pieces: the device and its
 //! answers, queues, buffers, textures, libraries and pipelines, command buffers and encoders,
 //! events, then the display. Built: the device ([`device`]) with its answers ([`answers`] and
-//! [`mod@format`]), its command queues ([`queue`]), events and fences, the reservation of resource
-//! indices, buffers and the textures over them ([`buffer`]), heaps but sparse ones ([`heap`]), and
-//! textures made of a descriptor, with their views ([`texture`]). Until a piece is built, every
+//! [`mod@format`]), its command queues ([`queue`]), events, fences and shared events ([`event`]),
+//! the reservation of resource indices, buffers and the textures over them ([`buffer`]), heaps but
+//! sparse ones ([`heap`]), textures made of a descriptor, with their views ([`texture`]), and
+//! command buffers ([`command`]) with their blit encoders ([`blit`]). Until a piece is built, every
 //! call that reaches it is refused ([`unbuilt`]). The call answers as Metal's call answers where it
 //! fails: a nil object, an `NSError`, zeros. The refusal is counted under the piece's code,
 //! `rt-unbuilt-<piece>`, in the process's degradation counts, and the first of each kind writes a
@@ -27,9 +28,12 @@
 //! GPUs. On a Mac it builds.
 
 pub mod answers;
+pub mod blit;
 pub mod buffer;
+pub mod command;
 pub mod descriptor;
 pub mod device;
+pub mod event;
 pub mod format;
 pub mod heap;
 pub mod queue;
@@ -48,7 +52,9 @@ use crate::core::platform::{Handle, ObjId, Platform};
 use crate::core::raise::{OnFault, RaiseResult};
 use crate::os::{OsClock, OsThreads, OsVm};
 
+pub use blit::RtBlitEncoder;
 pub use buffer::{KnownBlocks, RtBuffer};
+pub use command::RtCommandBuffer;
 pub use descriptor::{PassFields, RateMapFields, TextureFields};
 pub use device::RtDevice;
 pub use heap::RtHeap;
@@ -87,7 +93,7 @@ impl<T: Send + Sync + 'static> Handle for RtObj<T> {
 }
 
 /// `MTLSharedEventListener`: the graphics lane's, which a shared event's notifications run on.
-/// The shared events' piece runs them.
+/// rt runs them on its completion thread ([`event`]), so it names no thread of its own.
 pub struct Listener;
 
 /// The process's platform over metal2vulkan-rt (the module's docs): the OS's VM, clocks and
@@ -155,8 +161,8 @@ impl RtPlatform {
 impl Platform for RtPlatform {
     type Device = RtObj<RtDevice>;
     type CommandQueue = RtObj<RtQueue>;
-    type CommandBuffer = Unmade<kinds::CommandBuffer>;
-    type BlitEncoder = Unmade<kinds::BlitEncoder>;
+    type CommandBuffer = RtObj<RtCommandBuffer>;
+    type BlitEncoder = RtObj<RtBlitEncoder>;
     type ComputeEncoder = Unmade<kinds::ComputeEncoder>;
     type RenderEncoder = Unmade<kinds::RenderEncoder>;
     type Buffer = RtObj<RtBuffer>;
@@ -166,7 +172,7 @@ impl Platform for RtPlatform {
     type DepthStencilState = Unmade<kinds::DepthStencilState>;
     type Fence = RtObj<metal2vulkan_rt::Fence>;
     type Event = RtObj<metal2vulkan_rt::Event>;
-    type SharedEvent = Unmade<kinds::SharedEvent>;
+    type SharedEvent = RtObj<metal2vulkan_rt::SharedEvent>;
     type SharedEventListener = RtObj<Listener>;
     type SharedTextureHandle = Unmade<kinds::SharedTextureHandle>;
     type Library = Unmade<kinds::Library>;

@@ -7,13 +7,7 @@
 use std::marker::PhantomData;
 
 use crate::core::host::HostPtr;
-use crate::core::platform::blit::BlitCmd;
-use crate::core::platform::command::CompletedHandler;
-use crate::core::platform::command::PartCut;
-use crate::core::platform::command::ScheduledHandler;
 use crate::core::platform::compute::ComputeCmd;
-use crate::core::platform::event::EventRef;
-use crate::core::platform::event::Notification;
 use crate::core::platform::icb::DispatchThreadgroupsArgs;
 use crate::core::platform::icb::DispatchThreadsArgs;
 use crate::core::platform::icb::DrawArgs;
@@ -26,21 +20,15 @@ use crate::core::platform::icb::ImageBlockArgs;
 use crate::core::platform::icb::TessellationFactorArgs;
 use crate::core::platform::render::RenderCmd;
 use crate::core::platform::resource::FunctionConstant;
-use crate::core::platform::types::CommandBufferStatus;
 use crate::core::platform::types::MtlCoordinate2D;
 use crate::core::platform::types::MtlRegion;
 use crate::core::platform::types::MtlSize;
-use crate::core::platform::types::NsErrorText;
 use crate::core::platform::types::NsRange;
 use crate::core::platform::types::SizeAndAlign;
-use crate::core::platform::values::ComputePassDesc;
 use crate::core::platform::{Handle, ObjId, Platform};
-use crate::core::platform::{
-    blit, command, compute, event, function_table, icb, rate_map, render, resource,
-};
+use crate::core::platform::{compute, function_table, icb, rate_map, render, resource};
 use crate::core::raise::OnFault;
 use crate::core::raise::RaiseResult;
-use std::ops::Range;
 
 /// No value: the field that makes [`Unmade`] a type without values.
 enum Never {}
@@ -68,10 +56,6 @@ impl<K: 'static> Handle for Unmade<K> {
 /// The kinds of object [`Unmade`] stands for, one type each, so each associated type of the
 /// platform is a type of its own.
 pub mod kinds {
-    /// `id<MTLCommandBuffer>`.
-    pub enum CommandBuffer {}
-    /// `id<MTLBlitCommandEncoder>`.
-    pub enum BlitEncoder {}
     /// `id<MTLComputeCommandEncoder>`.
     pub enum ComputeEncoder {}
     /// `id<MTLRenderCommandEncoder>`.
@@ -80,8 +64,6 @@ pub mod kinds {
     pub enum SamplerState {}
     /// `id<MTLDepthStencilState>`.
     pub enum DepthStencilState {}
-    /// `id<MTLSharedEvent>`.
-    pub enum SharedEvent {}
     /// `MTLSharedTextureHandle *`.
     pub enum SharedTextureHandle {}
     /// `id<MTLLibrary>`.
@@ -108,118 +90,6 @@ pub mod kinds {
     pub enum IndirectComputeCommand {}
     /// `MTLRasterizationRateLayerDescriptor *`.
     pub enum RateMapLayerDescriptor {}
-}
-
-impl<P: Platform> command::CommandBuffer<P> for Unmade<kinds::CommandBuffer> {
-    fn add_completed_handler(&self, _on: OnFault, _block: CompletedHandler) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn add_scheduled_handler(&self, _on: OnFault, _block: ScheduledHandler) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn add_submission_handler(&self, _on: OnFault, _block: ScheduledHandler) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn add_completion_seen_handler(
-        &self,
-        _on: OnFault,
-        _block: CompletedHandler,
-    ) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn blit_encoder(&self, _on: OnFault) -> RaiseResult<Option<P::BlitEncoder>> {
-        self.unreachable()
-    }
-    fn commit(&self, _on: OnFault) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn compute_encoder(&self, _on: OnFault) -> RaiseResult<Option<P::ComputeEncoder>> {
-        self.unreachable()
-    }
-    fn device(&self) -> Option<P::Device> {
-        self.unreachable()
-    }
-    fn encode_signal(&self, _event: Option<EventRef<'_, P>>, _value: u64) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn encode_signal_when_scheduled(
-        &self,
-        _signal_event_scheduled: Option<&P::SharedEvent>,
-        _value: u64,
-    ) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn encode_wait(&self, _event: Option<EventRef<'_, P>>, _value: u64) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn error(&self) -> Option<NsErrorText> {
-        self.unreachable()
-    }
-    fn render_encoder(
-        &self,
-        _on: OnFault,
-        _render_pass_descriptor: &P::RenderPassDescriptor,
-    ) -> RaiseResult<Option<P::RenderEncoder>> {
-        self.unreachable()
-    }
-    fn set_protection_options(&self, _on: OnFault, _options: u64) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn status(&self) -> CommandBufferStatus {
-        self.unreachable()
-    }
-    fn wait_until_completed(&self, _on: OnFault) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn wait_until_scheduled(&self) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn compute_encoder_for_pass(
-        &self,
-        _desc: &ComputePassDesc,
-    ) -> RaiseResult<Option<P::ComputeEncoder>> {
-        self.unreachable()
-    }
-    fn part(&self, _on: OnFault) -> RaiseResult<Option<P::CommandBuffer>> {
-        self.unreachable()
-    }
-    fn commit_part(&self, _on: OnFault) -> RaiseResult<PartCut> {
-        self.unreachable()
-    }
-    fn fold(&self, _later: P::CommandBuffer) {
-        self.unreachable()
-    }
-}
-
-impl<P: Platform> blit::BlitEncoder<P> for Unmade<kinds::BlitEncoder> {
-    fn encode(&self, _on: OnFault, _cmd: BlitCmd<'_, P>) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn copy_from_guest_ram(
-        &self,
-        _on: OnFault,
-        _runs: &[Range<u64>],
-        _destination: &P::Buffer,
-        _destination_offset: u64,
-    ) -> RaiseResult<bool> {
-        self.unreachable()
-    }
-    fn copy_from_guest_ram_at(
-        &self,
-        _on: OnFault,
-        _runs: &[(u64, Range<u64>)],
-        _destination: &P::Buffer,
-    ) -> RaiseResult<bool> {
-        self.unreachable()
-    }
-    fn copy_to_guest_ram(
-        &self,
-        _on: OnFault,
-        _source: &P::Buffer,
-        _runs: &[(u64, Range<u64>)],
-    ) -> RaiseResult<bool> {
-        self.unreachable()
-    }
 }
 
 impl<P: Platform> compute::ComputeEncoder<P> for Unmade<kinds::ComputeEncoder> {
@@ -374,26 +244,6 @@ impl<P: Platform> resource::Library<P> for Unmade<kinds::Library> {
         _options: u64,
         _specialized_name: Option<&str>,
     ) -> RaiseResult<Option<P::Function>> {
-        self.unreachable()
-    }
-}
-
-impl<P: Platform> event::SharedEvent<P> for Unmade<kinds::SharedEvent> {
-    fn set_signaled_value(&self, _signaled_value: u64) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn signaled_value(&self) -> u64 {
-        self.unreachable()
-    }
-    fn wait_until_signaled_value(&self, _value: u64, _milliseconds: u64) -> bool {
-        self.unreachable()
-    }
-    fn notify_listener(
-        &self,
-        _listener: &P::SharedEventListener,
-        _value: u64,
-        _block: Notification,
-    ) -> RaiseResult<()> {
         self.unreachable()
     }
 }

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use ash::vk;
 use metal2vulkan_rt as rt;
 
-use crate::core::platform::Platform;
+use crate::core::platform::{Handle, Platform};
 use crate::core::platform::caps::{DeviceCaps, IdentityCaps, SAMPLE_COUNTS};
 use crate::core::platform::device::{GpuDevice, NoCopyDeallocator};
 use crate::core::platform::host_range::HostRange;
@@ -428,7 +428,7 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     /// rt's queue, of Metal's default `maxCommandBufferCount`; nil where rt refuses it.
     fn new_command_queue(&self) -> Option<RtObj<RtQueue>> {
         match self.rt.new_command_queue(METAL_MAX_COMMAND_BUFFER_COUNT) {
-            Ok(queue) => Some(RtObj::new(RtQueue::new(queue))),
+            Ok(queue) => Some(RtObj::new(RtQueue::new(queue, self.clone_ref()))),
             Err(error) => {
                 rt_refused_create("newCommandQueue", &error);
                 None
@@ -523,10 +523,15 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         Ok(None)
     }
 
-    /// Unbuilt: nil ([`Unbuilt::SharedEvent`]).
+    /// rt's shared event ([`super::event`]); nil where rt refuses it, counted.
     fn new_shared_event(&self) -> Option<<RtPlatform as Platform>::SharedEvent> {
-        refuse_create(Unbuilt::SharedEvent, "newSharedEvent");
-        None
+        match self.rt.new_shared_event() {
+            Ok(event) => Some(RtObj::new(event)),
+            Err(error) => {
+                rt_refused_create("newSharedEvent", &error);
+                None
+            }
+        }
     }
 
     /// Unbuilt: nil ([`Unbuilt::SharedTexture`]).

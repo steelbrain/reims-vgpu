@@ -60,14 +60,21 @@ pub enum Unbuilt {
     /// Argument buffers' layouts (`newArgumentEncoderWithArguments:` and a function's). Each
     /// answers nil.
     ArgumentLayout,
-    /// Command buffers, and so their encoders. `commandBuffer` answers nil.
-    CommandBuffer,
-    /// Events (`newEvent`). Each answers nil.
-    Event,
-    /// Fences (`newFence`). Each answers nil.
-    Fence,
-    /// Shared events (`newSharedEvent`). Each answers nil.
-    SharedEvent,
+    /// Compute and render command encoders, whose pipelines are unbuilt
+    /// (`computeCommandEncoder`, `renderCommandEncoderWithDescriptor:`). Each answers nil.
+    Encoder,
+    /// Protection options other than 0 (`setProtectionOptions:`): rt protects no work. The
+    /// command buffer runs as one with none.
+    Protection,
+    /// `fillTexture:level:slice:region:bytes:length:`, which rt has no form of. It encodes
+    /// nothing.
+    FillTexture,
+    /// What of blits rt has no form of but [`Unbuilt::FillTexture`]: a fill of a texture's region
+    /// with a colour (`fillTexture:level:slice:region:color:pixelFormat:`), a fill of a buffer with
+    /// a 4-byte pattern of more than one byte value (`fillBuffer:range:pattern4:`), and a copy with
+    /// blit options (`MTLBlitOption`: a depth or stencil plane of a combined format, PVRTC rows).
+    /// Each encodes nothing.
+    Blit,
     /// A render pass descriptor's attachments and properties (`RenderPassDescriptor`): its sets
     /// keep nothing, and its reads answer Metal's reading of a nil attachment.
     RenderPass,
@@ -96,10 +103,10 @@ impl Unbuilt {
         Unbuilt::Library,
         Unbuilt::Pipeline,
         Unbuilt::ArgumentLayout,
-        Unbuilt::CommandBuffer,
-        Unbuilt::Event,
-        Unbuilt::Fence,
-        Unbuilt::SharedEvent,
+        Unbuilt::Encoder,
+        Unbuilt::Protection,
+        Unbuilt::FillTexture,
+        Unbuilt::Blit,
         Unbuilt::RenderPass,
         Unbuilt::RateMap,
         Unbuilt::Icb,
@@ -119,10 +126,10 @@ impl Unbuilt {
             Unbuilt::Library => "rt-unbuilt-library",
             Unbuilt::Pipeline => "rt-unbuilt-pipeline",
             Unbuilt::ArgumentLayout => "rt-unbuilt-argument-layout",
-            Unbuilt::CommandBuffer => "rt-unbuilt-command-buffer",
-            Unbuilt::Event => "rt-unbuilt-event",
-            Unbuilt::Fence => "rt-unbuilt-fence",
-            Unbuilt::SharedEvent => "rt-unbuilt-shared-event",
+            Unbuilt::Encoder => "rt-unbuilt-encoder",
+            Unbuilt::Protection => "rt-unbuilt-protection",
+            Unbuilt::FillTexture => "rt-unbuilt-fill-texture",
+            Unbuilt::Blit => "rt-unbuilt-blit",
             Unbuilt::RenderPass => "rt-unbuilt-render-pass",
             Unbuilt::RateMap => "rt-unbuilt-rate-map",
             Unbuilt::Icb => "rt-unbuilt-icb",
@@ -143,10 +150,10 @@ impl Unbuilt {
             Unbuilt::Library => "a library",
             Unbuilt::Pipeline => "a pipeline state",
             Unbuilt::ArgumentLayout => "an argument buffer's layout",
-            Unbuilt::CommandBuffer => "a command buffer",
-            Unbuilt::Event => "an event",
-            Unbuilt::Fence => "a fence",
-            Unbuilt::SharedEvent => "a shared event",
+            Unbuilt::Encoder => "a compute or render command encoder",
+            Unbuilt::Protection => "a command buffer's protection options",
+            Unbuilt::FillTexture => "a fill of a texture with bytes",
+            Unbuilt::Blit => "a colour fill, a pattern fill or a copy with blit options",
             Unbuilt::RenderPass => "a render pass descriptor's attachments",
             Unbuilt::RateMap => "a rasterization rate map",
             Unbuilt::Icb => "an indirect command buffer",
