@@ -1477,25 +1477,25 @@ void ReimsGraphics::clearBootScreen()
 // time, the mapping's (made and taken down) apart from the stores'.
 bool ReimsGraphics::zeroScanoutRoom()
 {
-	const RgfxRoom room = scanoutRoom();
-	if (!region || !room.length)
+	const RgfxRoom own = scanoutRoom();
+	if (!region || !own.length)
 		return true;
 	const UInt64 made = mach_absolute_time();
 	IOMemoryMap *map = region->createMappingInTask(
-	    kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache, room.offset, room.length);
+	    kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache, own.offset, own.length);
 	if (!map) {
 		IOLog("ReimsGraphics: display %u: the scanout's room was not zeroed: no mapping of it\n",
 		      displayId);
 		return false;
 	}
 	const UInt64 mapped = mach_absolute_time();
-	bzero(reinterpret_cast<void *>(map->getVirtualAddress()), static_cast<size_t>(room.length));
+	bzero(reinterpret_cast<void *>(map->getVirtualAddress()), static_cast<size_t>(own.length));
 	const UInt64 stored = mach_absolute_time();
 	map->release();
 	const UInt64 mapNs = clockNs(mapped - made) + clockNs(mach_absolute_time() - stored);
 	IOLog("ReimsGraphics: display %u: the scanout's room zeroed for its new owner: %llu KiB, "
 	      "%llu us mapping, %llu us stores\n",
-	      displayId, room.length >> 10, mapNs / 1000, clockNs(stored - mapped) / 1000);
+	      displayId, own.length >> 10, mapNs / 1000, clockNs(stored - mapped) / 1000);
 	return true;
 }
 
