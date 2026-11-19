@@ -1543,14 +1543,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// The GPU address of the view of the pages block at `block`, for its `SURFACE_PAGES`
     /// answer where the guest took `IMPORT_ADDRESSES` ([`surface_pages::SurfaceViews::pages_address`]); 0 where
     /// it has none. Where the platform knows a view's import as a block
-    /// ([`crate::platform::ViewImports`]), a writable block's view is made now, on `device`, as
-    /// its first `BUFFER_OVER_PAGES` makes it elsewhere, and the address is its import's.
+    /// ([`crate::platform::ViewImports`]), the block's view is made now, on `device`, as its
+    /// first `BUFFER_OVER_PAGES` makes it elsewhere, and the address is its import's: a block of
+    /// pages its process maps read-only too.
     pub(crate) fn pages_address(&self, device: &P::Device, block: u64) -> u64 {
         let views = &self.shared.surface_views;
-        let make = {
-            let v = views.lock();
-            v.imports_known() && !v.private_read_only(block)
-        };
+        let make = views.lock().imports_known();
         if make
             && let Err(raise) = surface_pages::SurfaceViews::private_view(
                 views,
@@ -1571,7 +1569,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// The platform knows a pages block's view's import as a block, which `imports` makes
-    /// ([`crate::platform::ViewImports`]): each writable pages block's view is made at its
+    /// ([`crate::platform::ViewImports`]): each pages block's view is made at its
     /// `SURFACE_PAGES` answer, and its address is its import's ([`Self::pages_address`]).
     pub(crate) fn set_view_imports(&self, imports: crate::platform::ViewImports<P>) {
         self.shared.surface_views.lock().set_view_imports(imports);

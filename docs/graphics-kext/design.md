@@ -5054,15 +5054,17 @@ device took the feature.
   pick is, and the block keeps it until the block goes. A buffer over the
   same bytes made after it is made where the platform places it, and the
   guest's pointers to it reach the same pages through the first. A block of
-  memory the process maps read-only is given no address: each buffer over it
-  lies over a copy of its own.
+  memory the process maps read-only is given no address there: each buffer
+  over it lies over a copy of its own. On metal2vulkan-rt's device it is given
+  its import's address as any block is, and its buffers lie in the import,
+  where a GPU write through one reaches the pages (Metal drops it).
 - **What the guest sees.** The `gpuAddress` of a no-copy Shared buffer over
   writable memory the kext wires lies in `[2^43, 2^44)` on the Vulkan
   platform, and at its pages' import on metal2vulkan-rt's, rather than in the
   context's range in `[2^46, 2^47)`. Two no-copy buffers over the same bytes
   answer the same `gpuAddress`, where each had a pick of its own before.
-  Buffers over read-only memory, over memory the bundle copies, and Managed
-  ones keep theirs.
+  Buffers over read-only memory (on the Vulkan platform), over memory the
+  bundle copies, and Managed ones keep theirs.
 
 **A buffer's escaped identity.** The host reads a no-copy buffer's bytes in
 place: one over bytes in a block of the process's (`BUFFER_OVER_HOST_MEMORY`),
