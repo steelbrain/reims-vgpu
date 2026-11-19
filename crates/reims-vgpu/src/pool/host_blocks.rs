@@ -5,19 +5,18 @@
 //! Each block is zeroed memory of the process's, aligned to 2 MiB and touched a byte a page before
 //! it goes out, as the runtime touches a Shared block. A block given back goes to the ready set
 //! with its id and mapping, and reads zero again when it goes out anew, as a new Metal buffer
-//! does; past two ready blocks, the oldest is freed after the pool's
-//! [`BlockMappings::unmap`], on the thread that gave the block back. At the source's end, once
-//! nothing holds it, every block it handed out or keeps ready is unmapped, then freed. Its blocks
-//! have no GPU: `gpu_address` is 0.
+//! does; past two ready blocks, the oldest is freed, on the thread that gave the block back. The
+//! pool gives a block back only once the guest's mapping of it is gone, so a block is freed with
+//! no word to anyone. At the source's end, once nothing holds it, every block it handed out or
+//! keeps ready is freed. Its blocks have no GPU: `gpu_address` is 0.
 
 use std::alloc::Layout;
 use std::collections::{HashMap, VecDeque};
 use std::ptr::NonNull;
-use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::{BLOCK_LEN, BlockError, BlockId, BlockInfo, BlockMappings, BlockSource, MemoryClass};
+use super::{BLOCK_LEN, BlockError, BlockId, BlockInfo, BlockSource, MemoryClass};
 
 /// The alignment of a block's memory: 2 MiB, a large page.
 const ALIGN: usize = 2 << 20;
@@ -87,15 +86,13 @@ struct Blocks {
 
 /// Blocks of the process's own memory ([module doc](self)).
 pub(crate) struct HostBlocks {
-    mappings: Arc<dyn BlockMappings>,
     blocks: Mutex<Blocks>,
 }
 
 impl HostBlocks {
-    /// A source whose blocks are unmapped through `mappings` before they are freed.
-    pub(crate) fn new(mappings: Arc<dyn BlockMappings>) -> HostBlocks {
+    /// A source with no block yet.
+    pub(crate) fn new() -> HostBlocks {
         HostBlocks {
-            mappings,
             blocks: Mutex::new(Blocks {
                 next: 1,
                 ..Blocks::default()
@@ -146,7 +143,6 @@ impl BlockSource for HostBlocks {
         let given = b.out.remove(&block).ok_or(BlockError::NotHeld)?;
         if given.info.len > BLOCK_LEN {
             drop(b);
-            self.mappings.unmap(block);
             drop(given);
             return Ok(());
         }
@@ -155,21 +151,7 @@ impl BlockSource for HostBlocks {
             .then(|| b.ready.pop_front())
             .flatten();
         drop(b);
-        if let Some(old) = surplus {
-            self.mappings.unmap(old.info.id);
-            drop(old);
-        }
+        drop(surplus);
         Ok(())
-    }
-}
-
-impl Drop for HostBlocks {
-    /// Every block, handed out or ready, is unmapped, then freed.
-    fn drop(&mut self) {
-        let b = std::mem::take(&mut *self.blocks.lock());
-        for block in b.out.into_values().chain(b.ready) {
-            self.mappings.unmap(block.info.id);
-            drop(block);
-        }
     }
 }

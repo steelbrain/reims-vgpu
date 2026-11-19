@@ -933,15 +933,16 @@ then reserves (`rvg_graphics_device_pool_range`). The pool's thread
 takes Shared blocks from its block source, places each at the range's lowest free 2 MiB-aligned
 address, and has the host map it there (`pool_add`); a piece is found only once the host says it is
 in (`pool_added`). The source is metal2vulkan-rt's block calls in shape (`take_block`,
-`release_block`, and the `BlockMappings::unmap` hook it calls before it frees any block); until the
-device runs on that runtime it is `HostBlocks`, the process's own memory. The pool keeps one empty
-piece as headroom and gives a piece that stays empty past `RELEASE_DELAY` back to the source, which
-keeps it ready, mapped, or frees it; a block taken again keeps its piece. The unmap hook takes the
-piece out of the lookups, waits for the device's holds on it, asks the host to remove it
-(`pool_remove`), and returns once the host says it is out (`pool_removed`), so no guest access and no
-thread touches a block after its free. The device's drop closes the pool after its windows: the
-pool's thread ends, then the source unmaps and frees every block; the host has removed every piece
-before the release (QEMU at its teardown), so those unmaps ask it nothing.
+`release_block`); until the device runs on that runtime it is `HostBlocks`, the process's own
+memory. The pool keeps one empty piece as headroom and gives a piece that stays empty past
+`RELEASE_DELAY` back to the source, which keeps it ready or frees it. Before a block goes back the
+pool takes its piece out of the lookups, waits for the device's holds on it, asks the host to remove
+it (`pool_remove`), and gives the block back once the host says it is out (`pool_removed`), so the
+source may free any block it gets back at once: no guest access and no thread touches it. A block
+taken again is placed and mapped anew. The device's drop closes the pool after its windows: the
+pool's thread ends, the pool waits for every hold, gives every block back and lets go of the source,
+which frees them; the host has removed every piece before the release (QEMU at its teardown), so the
+pool asks it nothing then.
 
 ### 15.3 Drop order is explicit
 

@@ -11,8 +11,8 @@
 //! out in ascending addresses, and asks the host to map it there ([`PoolHost::add`]) with no lock
 //! of the pool's held. The host maps it (QEMU: a RAM region of its own over the block, added on
 //! its main loop) and says so ([`Pool::added`], the C API's "range added"); only then does
-//! [`Pool::find`] find it. A block the source hands out again after the pool gave it back keeps
-//! its id, so its piece keeps its address and mapping, and the host is asked nothing.
+//! [`Pool::find`] find it. A block the source hands out again after the pool gave it back is
+//! placed and mapped anew, as any block is: its piece went before it went back.
 //!
 //! # Headroom and giving blocks back
 //!
@@ -20,29 +20,30 @@
 //! in a piece ([`Pool::piece_used`]) and when it has emptied one ([`Pool::piece_empty`]). The pool
 //! keeps one empty piece as headroom: when the guest uses the last empty one, the pool asks for a
 //! block more. A piece that stays empty for [`RELEASE_DELAY`] while a lower one is empty too goes
-//! back to the source ([`BlockSource::release_block`]), which keeps it ready, mapped, or frees it
-//! through the unmap below; the lowest empty piece stays as the headroom. The delay rides out
-//! churn, where a guest empties and fills a piece again within seconds.
+//! back to the source ([`BlockSource::release_block`]), as the release below says, and the source
+//! keeps the block ready or frees it; the lowest empty piece stays as the headroom. The delay
+//! rides out churn, where a guest empties and fills a piece again within seconds.
 //!
 //! # Release
 //!
-//! The source calls [`BlockMappings::unmap`] before it frees any block it handed out, teardown
-//! included. For a block of the pool's, unmap takes the piece out of the lookups, waits for every
-//! hold on it ([`PieceHold`]) to go, asks the host to unmap it ([`PoolHost::remove`]), and returns
-//! once the host says it is out of the guest's address space and no host thread of its own touches
-//! it ([`Pool::removed`]). So no guest access, no thread of the host's and no thread of the
-//! library's touches a block once the source frees it.
+//! The pool gives a block back to the source only once the guest's mapping of its piece is gone.
+//! It takes the piece out of the lookups, waits for every hold on it ([`PieceHold`]) to go, asks
+//! the host to unmap it ([`PoolHost::remove`]), and gives the block back once the host says it is
+//! out of the guest's address space and no host thread of its own touches it ([`Pool::removed`]).
+//! So the source may free a block the moment it gets it back: no guest access, no thread of the
+//! host's and no thread of the library's touches it.
 //!
 //! At the device's release the host has removed every piece it added (QEMU does so as it tears
-//! the device down, before the release): from then on ([`Pool::close`]) an unmap waits only for
-//! the holds, and asks the host nothing.
+//! the device down, before the release): from then on ([`Pool::close`]) the pool waits only for
+//! the holds and asks the host nothing, and it gives every block back before it lets go of the
+//! source.
 //!
 //! # The block source
 //!
-//! [`BlockSource`] and [`BlockMappings`] are metal2vulkan-rt's block calls and hook as its API
-//! names them (`Device::take_block`, `release_block`, `BlockMappings::unmap`, [`BlockInfo`]).
-//! Until the device runs on that runtime, the source is [`HostBlocks`], blocks of the process's
-//! own memory, which hands blocks out, keeps them ready and frees them as the runtime does.
+//! [`BlockSource`] is metal2vulkan-rt's block calls as its API names them (`Device::take_block`,
+//! `release_block`, [`BlockInfo`]). Until the device runs on that runtime, the source is
+//! [`HostBlocks`], blocks of the process's own memory, which hands blocks out, keeps them ready
+//! and frees them as the runtime does.
 
 // Guest addresses flow through here: arithmetic is spelt out.
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
@@ -51,7 +52,7 @@ mod host_blocks;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ptr::NonNull;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -142,17 +143,10 @@ pub trait BlockSource: Send + Sync {
     /// A block of `class` at least `len` long: a pooled one up to [`BLOCK_LEN`], a dedicated one
     /// past it. Waits only when no block is ready.
     fn take_block(&self, class: MemoryClass, len: u64) -> Result<BlockInfo, BlockError>;
-    /// Gives a block back: it goes back to the ready set, with its id, address and mapping, or is
-    /// freed after [`BlockMappings::unmap`].
+    /// Gives a block back, which no mapping of the guest's and no thread of the caller's touches
+    /// any more: it goes back to the ready set, with its id, address and host mapping, or is
+    /// freed.
     fn release_block(&self, block: BlockId) -> Result<(), BlockError>;
-}
-
-/// The hook a source calls before it frees any block it handed out, teardown included
-/// (metal2vulkan-rt's `BlockMappings`).
-pub trait BlockMappings: Send + Sync {
-    /// Returns once every mapping of `block` made of it is gone and no thread touches it. Calls
-    /// nothing of the source's.
-    fn unmap(&self, block: BlockId);
 }
 
 /// The guest physical range the host reserved for the pool, with no RAM under it.
@@ -211,9 +205,9 @@ impl PoolConfig {
 pub type PoolAddFn = Arc<dyn Fn(u64, *mut u8, u64) + Send + Sync>;
 
 /// `(physical_address, length)`: unmap the piece at `physical_address`, then say so once no
-/// thread of the host's touches it ([`Pool::removed`]). Called inside [`BlockMappings::unmap`],
-/// on the source's thread, with no lock of the device's held; it must not wait for a lock the host
-/// holds while it calls the device.
+/// thread of the host's touches it ([`Pool::removed`]). Called on the pool's thread before it
+/// gives the piece's block back, with no lock of the device's held; it must not wait for a lock
+/// the host holds while it calls the device.
 pub type PoolRemoveFn = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 /// The platform's monotonic clock, which times an empty piece's delay.
@@ -235,20 +229,18 @@ enum Mapped {
     Adding,
     /// In the guest's address space.
     Live,
-    /// Being unmapped, out of the lookups; `asked` once the host was asked to remove it.
+    /// Being unmapped before its block goes back, out of the lookups; `asked` once the host was
+    /// asked to remove it.
     Removing { asked: bool },
     /// Out of the guest's address space, and no thread of the host's touches it.
     Removed,
 }
 
-/// One block in the range.
+/// One block in the range, which the pool holds until its piece is out of the guest.
 #[derive(Debug)]
 struct Piece {
     block: BlockInfo,
     mapped: Mapped,
-    /// The pool holds the block: taken, not given back. A piece given back stays mapped until the
-    /// source unmaps it, and nothing finds it.
-    held: bool,
     /// Since when nothing of the guest's lies in it; `None` while something does.
     empty_since: Option<MonoTime>,
     /// Holds on it ([`PieceHold`]).
@@ -256,9 +248,9 @@ struct Piece {
 }
 
 impl Piece {
-    /// Whether the guest may put something in it: held and not being unmapped.
+    /// Whether the guest may put something in it: not being unmapped.
     fn usable(&self) -> bool {
-        self.held && matches!(self.mapped, Mapped::Adding | Mapped::Live)
+        matches!(self.mapped, Mapped::Adding | Mapped::Live)
     }
 }
 
@@ -277,7 +269,7 @@ struct State {
     full_logged: bool,
 }
 
-/// The pool's shared part: what the thread, the device and the source's hook hold.
+/// The pool's shared part: what the thread, the device and the holds hold.
 struct Shared {
     range: PoolConfig,
     host: PoolHost,
@@ -289,7 +281,7 @@ struct Shared {
     changed: Condvar,
 }
 
-/// A hold on a live piece: while it lives, an unmap of its block waits.
+/// A hold on a live piece: while it lives, its block does not go back.
 #[allow(
     dead_code,
     reason = "the guest's side of the pool (its ring messages) calls it once it lands"
@@ -325,23 +317,11 @@ impl Drop for PieceHold {
     }
 }
 
-/// The pool's [`BlockMappings`], which the source holds: weak, so the source, which the pool
-/// holds, makes no cycle.
-struct Mappings(Weak<Shared>);
-
-impl BlockMappings for Mappings {
-    fn unmap(&self, block: BlockId) {
-        if let Some(shared) = self.0.upgrade() {
-            shared.unmap(block);
-        }
-    }
-}
-
 /// The guest's Shared pool of one device.
 pub struct Pool {
     shared: Arc<Shared>,
-    /// The source. Dropped after the thread that takes from it ends ([`Pool::close`]); it frees
-    /// its blocks once nothing else holds it, after unmapping each.
+    /// The source. Let go of once the thread that takes from it has ended and every block went
+    /// back to it ([`Pool::close`]); it frees its blocks once nothing else holds it.
     source: Option<Arc<dyn BlockSource>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -355,14 +335,14 @@ impl std::fmt::Debug for Pool {
 }
 
 impl Pool {
-    /// A pool over `range`, timed by `now`, its blocks from what `source` makes with the pool's
-    /// hook, and its thread started. [`Error::InvalidArgument`] for a range
-    /// [`PoolConfig::is_valid`] refuses, [`Error::HostResources`] where the thread is refused.
+    /// A pool over `range`, timed by `now`, its blocks from `source`, and its thread started.
+    /// [`Error::InvalidArgument`] for a range [`PoolConfig::is_valid`] refuses,
+    /// [`Error::HostResources`] where the thread is refused.
     pub(crate) fn new(
         range: PoolConfig,
         host: PoolHost,
         now: PoolNow,
-        source: impl FnOnce(Arc<dyn BlockMappings>) -> Arc<dyn BlockSource>,
+        source: Arc<dyn BlockSource>,
     ) -> Result<Pool, Error> {
         Pool::with_delay(range, host, RELEASE_DELAY, now, source)
     }
@@ -373,7 +353,7 @@ impl Pool {
         host: PoolHost,
         release_delay: Duration,
         now: PoolNow,
-        source: impl FnOnce(Arc<dyn BlockMappings>) -> Arc<dyn BlockSource>,
+        source: Arc<dyn BlockSource>,
     ) -> Result<Pool, Error> {
         if !range.is_valid() {
             return Err(Error::InvalidArgument);
@@ -386,7 +366,6 @@ impl Pool {
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
         });
-        let source = source(Arc::new(Mappings(Arc::downgrade(&shared))));
         let thread = {
             let shared = Arc::clone(&shared);
             let source = Arc::clone(&source);
@@ -422,7 +401,7 @@ impl Pool {
         let p = (st.pieces.get_mut(&physical_address)).ok_or(Error::InvalidArgument)?;
         match p.mapped {
             Mapped::Adding => p.mapped = Mapped::Live,
-            // An unmap came first: the host's remove follows its add.
+            // Its give-back came first: the host's remove follows its add.
             Mapped::Removing { .. } => {}
             Mapped::Live | Mapped::Removed => return Err(Error::InvalidArgument),
         }
@@ -505,7 +484,7 @@ impl Pool {
         let (&start, p) = st.pieces.range_mut(..=physical_address).next_back()?;
         let offset = physical_address.checked_sub(start)?;
         let end = offset.checked_add(length)?;
-        if p.mapped != Mapped::Live || !p.held || end > p.block.len {
+        if p.mapped != Mapped::Live || end > p.block.len {
             return None;
         }
         let contents = p.block.contents?;
@@ -533,20 +512,29 @@ impl Pool {
     pub fn live(&self) -> Vec<(u64, u64)> {
         let st = self.shared.state.lock();
         (st.pieces.iter())
-            .filter(|(_, p)| p.mapped == Mapped::Live && p.held)
+            .filter(|(_, p)| p.mapped == Mapped::Live)
             .map(|(&a, p)| (a, p.block.len))
             .collect()
     }
 
-    /// The device's release: the host removed every piece it added. Ends the pool's thread, then
-    /// lets go of the source; from now on an unmap waits only for the holds on its piece.
+    /// The device's release: the host removed every piece it added. Ends the pool's thread (a
+    /// piece it is giving back waits only for its holds from now on), waits for every hold on the
+    /// pieces left, gives each one's block back, then lets go of the source.
     pub(crate) fn close(&mut self) {
         self.shared.state.lock().closed = true;
         self.shared.changed.notify_all();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-        self.source = None;
+        let Some(source) = self.source.take() else {
+            return;
+        };
+        for block in self.shared.take_all_out() {
+            if let Err(e) = source.release_block(block) {
+                log::warn!(kind:? = e; "pool: the source refused a block back: {e:?}");
+            }
+        }
+        drop(source);
     }
 
     /// The block source, for the tests.
@@ -582,12 +570,9 @@ impl Shared {
             let now = (self.now)();
             let (due, next) = self.due(&st, now);
             if let Some((at, block)) = due {
-                if let Some(p) = st.pieces.get_mut(&at) {
-                    p.held = false;
-                    p.empty_since = None;
-                }
                 drop(st);
                 log::info!("pool: the empty piece at {at:#x} goes back to the source");
+                self.take_out(block);
                 if let Err(e) = source.release_block(block) {
                     log::warn!(kind:? = e; "pool: the source refused a block back: {e:?}");
                 }
@@ -622,17 +607,9 @@ impl Shared {
         (None, next)
     }
 
-    /// Places `block` at the lowest free address that holds it and asks the host to map it; a
-    /// block the pool placed before (given back, then taken again) keeps its piece, mapped.
+    /// Places `block` at the lowest free address that holds it and asks the host to map it.
     fn place(&self, source: &dyn BlockSource, block: BlockInfo) {
         let mut st = self.state.lock();
-        if let Some(&at) = st.by_block.get(&block.id) {
-            if let Some(p) = st.pieces.get_mut(&at) {
-                p.held = true;
-                p.empty_since = Some((self.now)());
-            }
-            return;
-        }
         let Some(contents) = block.contents else {
             drop(st);
             let _ = source.release_block(block.id);
@@ -656,7 +633,6 @@ impl Shared {
             Piece {
                 block,
                 mapped: Mapped::Adding,
-                held: true,
                 empty_since: Some((self.now)()),
                 holds: 0,
             },
@@ -666,8 +642,10 @@ impl Shared {
         (self.host.add)(at, contents.as_ptr(), block.len);
     }
 
-    /// [`BlockMappings::unmap`] of the pool's: the module doc's "Release".
-    fn unmap(&self, block: BlockId) {
+    /// Takes `block`'s piece out before the block goes back: out of the lookups, then, once no
+    /// hold is left, out of the guest (the module doc's "Release"). Returns once the host said it
+    /// is out, or, after the device's release, once no hold is left.
+    fn take_out(&self, block: BlockId) {
         let mut st = self.state.lock();
         if !st.by_block.contains_key(&block) {
             return;
@@ -683,10 +661,7 @@ impl Shared {
                 return;
             };
             match p.mapped {
-                Mapped::Adding | Mapped::Live => {
-                    p.mapped = Mapped::Removing { asked: false };
-                    p.held = false;
-                }
+                Mapped::Adding | Mapped::Live => p.mapped = Mapped::Removing { asked: false },
                 Mapped::Removing { asked: false } if p.holds == 0 && !closed => {
                     p.mapped = Mapped::Removing { asked: true };
                     let len = p.block.len;
@@ -705,7 +680,7 @@ impl Shared {
                     if !warned && waited > Duration::from_secs(1) {
                         warned = true;
                         log::warn!(
-                            "pool: the unmap of the piece at {at:#x} still waits after 1 s: {}",
+                            "pool: the piece at {at:#x} still waits to go back after 1 s: {}",
                             if p.holds > 0 {
                                 "a thread of the device's holds it"
                             } else {
@@ -717,6 +692,30 @@ impl Shared {
                 }
             }
         }
+    }
+
+    /// [`Pool::close`]'s part, once the pool's thread has ended: waits for every hold on the
+    /// pieces left to go, then takes them all out of the pool and answers their blocks. The host
+    /// removed every piece before the release, so it is asked nothing.
+    fn take_all_out(&self) -> Vec<BlockId> {
+        let mut st = self.state.lock();
+        let mut warned = false;
+        let started = (self.now)();
+        while let Some(&at) = (st.pieces.iter()).find_map(|(at, p)| (p.holds > 0).then_some(at)) {
+            let waited = (self.now)().saturating_duration_since(started);
+            if !warned && waited > Duration::from_secs(1) {
+                warned = true;
+                log::warn!(
+                    "pool: the release still waits after 1 s for a thread of the device's that \
+                     holds the piece at {at:#x}"
+                );
+            }
+            let _ = self.changed.wait_for(&mut st, Duration::from_millis(250));
+        }
+        st.by_block.clear();
+        let pieces = std::mem::take(&mut st.pieces);
+        drop(st);
+        pieces.into_values().map(|p| p.block.id).collect()
     }
 }
 

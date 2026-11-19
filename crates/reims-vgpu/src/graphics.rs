@@ -915,9 +915,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     Some(range) => {
                         let clock = Arc::clone(&platform);
                         let now = Box::new(move || clock.clock().now_mono());
-                        Some(Pool::new(range, host, now, |mappings| {
-                            Arc::new(HostBlocks::new(mappings))
-                        })?)
+                        Some(Pool::new(range, host, now, Arc::new(HostBlocks::new()))?)
                     }
                     None => None,
                 },
@@ -1146,8 +1144,9 @@ impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
         entry::run(|_| {
             drop(std::mem::take(&mut self.windows));
         });
-        // The host removed every piece of the pool before the release: the pool's thread ends
-        // and its source goes, unmapping each block it handed out before it frees it.
+        // The host removed every piece of the pool before the release: the pool's thread ends,
+        // each block goes back to the source once no thread of the device's holds it, and the
+        // source frees them.
         drop(self.pool.take());
         let ending: Weak<dyn std::any::Any + Send + Sync> = self.ending.clone();
         let mut ended = ENDING.lock();

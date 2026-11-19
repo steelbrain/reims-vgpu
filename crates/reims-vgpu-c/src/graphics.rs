@@ -227,9 +227,9 @@ pub type RvgGraphicsPoolAddFn = Option<
 /// The device frees the memory only after that. A remove of a piece whose add the host has not
 /// carried out yet follows that add: the host carries out the add, then the remove.
 ///
-/// Thread: the one that frees the piece's block (the device's pool thread, or the block source's
-/// own), never inside a call of the host's, with no lock of the library's held. It must not wait
-/// for a lock the host holds while it calls the device (QEMU queues the remove for its main
+/// Thread: the device's pool thread (`reims-vgpu.graphics-pool`), before it gives the piece's
+/// block back, never inside a call of the host's, with no lock of the library's held. It must not
+/// wait for a lock the host holds while it calls the device (QEMU queues the remove for its main
 /// loop). Once a piece, after its pool_add. Not called once rvg_graphics_device_release has
 /// begun: the host removes every piece it added before it releases the device. May call: nothing
 /// of the library's. Needed with a pool.

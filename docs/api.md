@@ -192,18 +192,20 @@ logs the range it took, the addresses it was given and the heaps' total once, at
 `rvg_graphics_device_pool_range` answers the range it took, 0 and 0 for none, and the host reserves
 that before the guest's firmware runs. The host then maps
 the device's blocks there as the pool grows
-(`pool_add`, answered by `rvg_graphics_device_pool_added`) and unmaps them as the device frees them
-(`pool_remove`, answered by `rvg_graphics_device_pool_removed`). The device frees a block only once
-the host said its piece is out of the guest's address space and no thread of the host's touches it,
-and once no thread of its own holds it. Before the release the host takes out every piece it added
-and says so for each, as QEMU's teardown does; the release then frees every block before it
-returns, so none is freed by a driver's exit handler (on NVIDIA's driver, which unmaps its memory
-inside `exit()`, a thread still reading a block then faults). QEMU gives the device the addresses
-past the RAM and the PCI host bridge's default 64-bit window, up to three quarters of the guest's
-physical address space, and at realize, once the device is made, raises fw_cfg
+(`pool_add`, answered by `rvg_graphics_device_pool_added`) and unmaps them as the device gives them
+back to its block source (`pool_remove`, answered by `rvg_graphics_device_pool_removed`). The device
+gives a block back, and the source may then free it, only once no thread of its own holds it and the
+host said its piece is out of the guest's address space and no thread of the host's touches it; a
+block the source hands out again is mapped anew. Before the release the host takes out every piece
+it added and says so for each, as QEMU's teardown does; the release then waits for the device's own
+holds and frees every block before it returns, so none is freed by a driver's exit handler (on
+NVIDIA's driver, which unmaps its memory inside `exit()`, a thread still reading a block then
+faults). QEMU gives the device the addresses past the RAM and the PCI host bridge's default 64-bit
+window, up to three quarters of the guest's physical address space, and at realize, once the device
+is made, raises fw_cfg
 `etc/reserved-memory-end` past the range it took, rounded up to 1 GiB, so OVMF's 64-bit window goes
-above it, maps each piece as a RAM region of its own (an add is
-a pure add), and under WHPX runs the hypervisor's map outside its BQL (`whpx_map_ahead`).
+above it, maps each piece as a RAM region of its own (an add is a pure add), and under WHPX runs
+the hypervisor's map outside its BQL (`whpx_map_ahead`).
 
 ## 2. The C header
 
@@ -332,7 +334,7 @@ returns. The library logs through the `log` crate; a Rust host installs its own 
 | `route_doorbell`, `route_doorbell_page` (the route of a queue whose process has a doorbell page, at that page's doorbell in BAR 4) | one of ring 0's threads, `reims-vgpu.graphics-ring0-<i>`, or the control thread, `reims-vgpu.graphics-control`, as a command queue is made, destroyed or its process closed, with no lock of the library's held, where it may wait for a lock the host holds while it calls the device (QEMU's BQL), since no function the host calls under it waits for a thread inside the callback but the release of the process's last device, at most 5 s; dropping a route, also the host's own inside `rvg_graphics_device_mmio_write_taking` (a STATUS write of 0, or a `DOORBELL_PAGE_BIND` write that binds a page to another context) or `rvg_graphics_device_reset`, where it must not wait for a lock the host holds around that call | nothing: they may call at once | a queue's route before its create is answered, and its drop once its queue has ended and before its destroy, its process's close or the reset is answered; a dropped route takes no write once the call returns |
 | `cursor_glyph`, `cursor_show`, `cursor_move` (display 0's), and `cursor_glyph_at`, `cursor_show_at`, `cursor_move_at` (each display's from 1, named) | the display thread: one serial worker for the whole process (after 5 s idle it exits, and the next callback starts a new one) | every display callback of the process: one at a time | the order the device's control thread took the guest's cursor and display power commands, of every display, and its resets |
 | `pool_add` | the device's pool thread, `reims-vgpu.graphics-pool`, with no lock of the library's held; never inside a call of the host's; it must not wait for a lock the host holds while it calls the device (QEMU queues the add for its main loop) | one at a time | the order the device places the pieces, each before its `pool_remove`; the host answers each with `rvg_graphics_device_pool_added` once the guest's address space has it |
-| `pool_remove` | the thread that frees the piece's block: the pool thread, or the block source's own (metal2vulkan-rt's block-maker thread), inside its unmap hook, with no lock of the library's held; never inside a call of the host's; it must not wait for a lock the host holds while it calls the device | nothing | once a piece, after its `pool_add`, never once the release has begun; the host answers with `rvg_graphics_device_pool_removed` once the piece is out of the guest's address space and no thread of its own touches it, and the device frees the block only then |
+| `pool_remove` | the device's pool thread, `reims-vgpu.graphics-pool`, before it gives the piece's block back to its block source, with no lock of the library's held; never inside a call of the host's; it must not wait for a lock the host holds while it calls the device | nothing | once a piece, after its `pool_add`, never once the release has begun; the host answers with `rvg_graphics_device_pool_removed` once the piece is out of the guest's address space and no thread of its own touches it, and the device gives the block back, which the source may free, only then |
 | a window's `pointer`, `wheel`, `key`, `close`, `scroll` | on macOS the process's main thread, where AppKit runs; on Linux and Windows the library's thread `reims-vgpu.ui`; never inside a call of the host's | every window callback of the process: one at a time | the order the events arrived |
 | `destroy` (each table) | the device's: once its threads have ended, after their last callback, possibly on one of them after the release has returned; the window's: once the release has closed the window, on the releasing thread or, while a window callback runs, the window's thread once it returns; either, on the caller's thread, in a refused create | nothing | once, after every call of its table |
 
