@@ -1170,9 +1170,9 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		pointerOver(payload, size);
 		return;
 	default:
-		// The creates' and queries' answers, a POOL_TAKE's POOL_BLOCK, and on arm64e a
-		// VT_MESSAGE's VT_STATUS (RgfxVtService.hpp): each for the thread that waits for it
-		// (RgfxLifecycleAnswers.hpp).
+		// The creates' and queries' answers, a POOL_TAKE's POOL_BLOCK, a PRIVATE_TAKE's
+		// PRIVATE_BLOCK, and on arm64e a VT_MESSAGE's VT_STATUS (RgfxVtService.hpp): each for the
+		// thread that waits for it (RgfxLifecycleAnswers.hpp).
 		if (rgfxLifecycleAnswer(type))
 			answerLifecycle(type, seqno, payload, size);
 		return;

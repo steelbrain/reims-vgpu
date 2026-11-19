@@ -201,10 +201,16 @@ $(BUILD)/tests/video_codecs_arm64_test: tests/video_codecs_test.cpp $(HEADERS) .
 	@mkdir -p $(@D)
 	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -DRGFX_GUEST_ARM64=1 -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
 
-# The answers the arm64e kext's waiters take (RgfxLifecycleAnswers.hpp): VT_STATUS too.
+# The answers the kext's waiters take (RgfxLifecycleAnswers.hpp), checked against the reply types
+# the postLifecycle calls in src/ wait for, which the test reads from RGFX_KEXT_SRC as it runs.
+$(BUILD)/tests/lifecycle_answers_test: tests/lifecycle_answers_test.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
+	@mkdir -p $(@D)
+	xcrun clang++ -std=c++17 -Wall -Wextra -Werror '-DRGFX_KEXT_SRC="$(CURDIR)/src"' -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
+
+# The answers the arm64e kext's waiters take: VT_STATUS too.
 $(BUILD)/tests/lifecycle_answers_arm64_test: tests/lifecycle_answers_test.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
-	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -DRGFX_GUEST_ARM64=1 -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
+	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -DRGFX_GUEST_ARM64=1 '-DRGFX_KEXT_SRC="$(CURDIR)/src"' -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
 
 test: $(TESTS)
 	@for t in $(TESTS); do $$t || exit 1; done

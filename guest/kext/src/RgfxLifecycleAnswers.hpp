@@ -22,7 +22,8 @@
 #endif
 
 // Whether an event of `type` answers a lifecycle waiter: COMPLETE, the creates' and queries'
-// answers, POOL_TAKE's POOL_BLOCK, and on an arm64 guest a VT_MESSAGE's VT_STATUS.
+// answers, POOL_TAKE's POOL_BLOCK, PRIVATE_TAKE's PRIVATE_BLOCK, and on an arm64 guest a
+// VT_MESSAGE's VT_STATUS.
 constexpr bool rgfxLifecycleAnswer(uint32_t type)
 {
 	switch (type) {
@@ -36,6 +37,7 @@ constexpr bool rgfxLifecycleAnswer(uint32_t type)
 	case RGFX_EVT_RATE_MAP_ANSWER:
 	case RGFX_EVT_FUNCTION_POINTER_STATE:
 	case RGFX_EVT_POOL_BLOCK:
+	case RGFX_EVT_PRIVATE_BLOCK:
 		return true;
 	case RGFX_EVT_VT_STATUS:
 		return RGFX_GUEST_ARM64 != 0;
