@@ -13,7 +13,7 @@
 use std::any::Any;
 use std::sync::{Arc, OnceLock, Weak};
 
-use reims_vgpu_vulkan::core::host::HostQueue;
+use reims_vgpu_vulkan::core::host::{HostPtr, HostQueue};
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 use reims_vgpu_vulkan::core::platform::values::TextureDesc;
@@ -23,6 +23,23 @@ use reims_vgpu_vulkan::core::sync::Mutex;
 
 use crate::GuestArch;
 use crate::memory::MemoryMap;
+
+/// A platform's import of a pages block's view as a block it knows
+/// ([`ApiPlatform::view_imports`]): given the device, the view's first byte, on a host page, and
+/// its length, and what runs once the platform freed the import (which holds the view's mapping
+/// until then), the import's GPU address, at the view's first byte, and what forgets the block,
+/// which runs as the last buffer over the view at that address goes. `None` where the platform
+/// refuses it, counted.
+pub type ViewImports<P> = Arc<
+    dyn Fn(
+            &<P as Platform>::Device,
+            HostPtr,
+            u64,
+            Box<dyn FnOnce() + Send>,
+        ) -> Option<(u64, Box<dyn FnOnce() + Send>)>
+        + Send
+        + Sync,
+>;
 
 /// What the API asks of a platform beyond core's: the process's instance, its GPU device, a
 /// texture's pixels, what it holds of the guest's RAM, a graphics device's region and its video.
@@ -98,6 +115,18 @@ pub trait ApiPlatform: Platform {
     /// Private block is a range of addresses the host picks.
     fn block_source(&self, device: &Self::Device) -> Option<Arc<dyn crate::pool::BlockSource>> {
         let _ = device;
+        None
+    }
+
+    /// What imports a pages block's view as a block the platform knows, on a platform that keeps
+    /// a pin only inside a block it knows ([`ApiPlatform::PINS_IN_BLOCKS`]): a graphics device on
+    /// it answers a pages block's `SURFACE_PAGES` with its view's import's own GPU address
+    /// (`graphics::decode::surface_pages`, "Addresses the host gives"). `None` by default, where
+    /// the host picks the address and the platform keeps a pin anywhere.
+    fn view_imports(&self) -> Option<ViewImports<Self>>
+    where
+        Self: Sized,
+    {
         None
     }
 

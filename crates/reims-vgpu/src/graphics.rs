@@ -781,6 +781,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             if P::PINS_IN_BLOCKS {
                 decoder.set_pins_in_blocks();
             }
+            // One that knows a pages block's view's import as a block answers the view's address
+            // with the import's (`decode::surface_pages`, "Addresses the host gives").
+            if let Some(imports) = platform.view_imports() {
+                decoder.set_view_imports(imports);
+            }
             // A GPU that shares the CPU's memory holds every device cache in the host's RAM
             // beside the guest's pages: they all fit one budget together, past which a surface
             // lies in place, so the copies stay bounded on a small host.
@@ -2085,7 +2090,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 // A pages block's view's address, where the guest took IMPORT_ADDRESSES.
                 let at = match status {
                     Some(RGFX_STATUS_OK) if answer.wants_address() => {
-                        (me.decoder()).pages_address(pages.block_offset)
+                        (me.decoder()).pages_address(&me.device, pages.block_offset)
                     }
                     _ => 0,
                 };

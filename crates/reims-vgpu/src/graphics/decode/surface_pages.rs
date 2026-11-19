@@ -134,6 +134,23 @@
 //! to it reach the same pages through the first. A block of pages its process maps read-only
 //! gets no address: each of its buffers lies over a copy of its own.
 //!
+//! Where the platform keeps a pin only inside a block it knows and knows a view's import as one
+//! (metal2vulkan-rt's, [`ViewImports`]), the address is the import's own: a writable block's view
+//! and its import are made at its `SURFACE_PAGES`, before the answer, rather than at its first
+//! `BUFFER_OVER_PAGES`, so the view joins no group, and every buffer over the block at the
+//! address plus its offset is pinned there, a range of the import with no import of its own; no
+//! buffer is kept. The import is known while the view's import buffer lives: in the block's entry,
+//! then in the cache after the block's release, until the cache lets the view go, the block's
+//! context closes or the device resets. A later block over the same runs takes the cached view at
+//! the same address, and a writable block takes no cached view whose import is not known. Each
+//! buffer pinned in the import holds the platform's block of its own, so one that outlives the
+//! forget stays where it is, and the platform frees the import once the last of them and the
+//! command buffers that used it are gone; the import holds the view's mapping until then. The
+//! block's release is refused while a buffer over it lives, so once the kext unwires its pages at
+//! the release's answer, or as its context's close is answered, none of the guest's buffers lies
+//! in the import; a cached one stays over the guest's RAM the guest reuses, with nothing over it,
+//! until the cache lets it go.
+//!
 //! **Heaps over pages** (`RGFX_FEATURE_HEAP_OVER_PAGES`). A pages block, a slab of the guest's, can
 //! hold a `HEAP_OVER_PAGES`, the buffers placed in it costing what a heap over host memory's do. A
 //! block of one run holds it over that run where the guest's RAM is mapped for the host (the memory
@@ -334,6 +351,7 @@ use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{RaiseResult, refusals};
 use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 
+use crate::platform::ViewImports;
 use crate::pool::HostAddresses;
 
 use super::worker::{Job, Settle, Worker};
@@ -828,14 +846,19 @@ struct Cached<P: Platform> {
     runs: Vec<(u64, u64)>,
     view: Arc<SurfaceView<P>>,
     import: Option<P::Buffer>,
+    /// The import is a block the platform knows ([`ViewImports`]).
+    known: bool,
 }
 
 impl<P: Platform> Cached<P> {
     /// Whether the cache alone holds the view: its own hold and its import's, whose deallocator
-    /// holds the view (`buffer_over`), where it has one. Under the views' lock, which every new
-    /// hold of a cached view takes, such a view stays so until the lock is let go.
+    /// holds the view (`buffer_over`), where it has one, and the platform's known import's,
+    /// which holds it until the platform frees the import ([`known_import_over`]). Under the
+    /// views' lock, which every new hold of a cached view takes, such a view stays so until the
+    /// lock is let go.
     fn idle(&self) -> bool {
-        Arc::strong_count(&self.view) <= 1 + usize::from(self.import.is_some())
+        let holds = 1 + usize::from(self.import.is_some()) + usize::from(self.known);
+        Arc::strong_count(&self.view) <= holds
     }
 
     /// Lets go of the view and its import, to make room ([`SurfaceViews::make_room_for`]), with
@@ -916,20 +939,26 @@ pub(crate) struct Private<P: Platform> {
     /// `SURFACE_PAGES` answer ([`SurfaceViews::pages_address`]); none for a block whose answer
     /// asked for none.
     address: Option<ViewAddress>,
+    /// Its view's import is a block the platform knows, at the import buffer's address
+    /// ([`ViewImports`]): every buffer over the block at the view's address is pinned there.
+    known: bool,
 }
 
 /// The GPU address the host gave a pages block's view (`IMPORT_ADDRESSES`), held in the views'
-/// picks ([`HostAddresses::imports`]) until the block goes.
+/// picks ([`HostAddresses::imports`]) until the block goes; or its import's own, where the
+/// platform knows the import as a block ([`ViewImports`]), which holds no pick.
 pub(crate) struct ViewAddress {
     at: u64,
     /// The view's length: a buffer over the block whose address lies in it lies at the view's.
     length: u64,
-    picks: Arc<Mutex<HostAddresses>>,
+    picks: Option<Arc<Mutex<HostAddresses>>>,
 }
 
 impl Drop for ViewAddress {
     fn drop(&mut self) {
-        self.picks.lock().free(self.at);
+        if let Some(picks) = &self.picks {
+            picks.lock().free(self.at);
+        }
     }
 }
 
@@ -1027,6 +1056,10 @@ pub(crate) struct SurfaceViews<P: Platform> {
     coverage: Arc<Mutex<overlaps::Coverage>>,
     /// The addresses the host gives the pages blocks' views ([`Self::pages_address`]).
     view_addresses: Arc<Mutex<HostAddresses>>,
+    /// Where the platform knows a pages block's view's import as a block, what imports it: each
+    /// such block's view is made at its `SURFACE_PAGES`, and its address is its import's
+    /// ([`Self::pages_address`]).
+    known_imports: Option<ViewImports<P>>,
 }
 
 /// What a `SURFACE_PAGES` found under the views' lock ([`SurfaceViews::surface_pages`]).
@@ -1076,16 +1109,31 @@ impl<P: Platform> SurfaceViews<P> {
             regroups: regroup::Regroups::default(),
             coverage: Arc::default(),
             view_addresses: Arc::new(Mutex::new(HostAddresses::imports())),
+            known_imports: None,
         }
     }
 
+    /// The platform knows a pages block's view's import as a block, which `imports` makes
+    /// ([`ViewImports`]).
+    pub(crate) fn set_view_imports(&mut self, imports: ViewImports<P>) {
+        self.known_imports = Some(imports);
+    }
+
+    /// Whether the platform knows a pages block's view's import as a block ([`ViewImports`]).
+    pub(crate) fn imports_known(&self) -> bool {
+        self.known_imports.is_some()
+    }
+
     /// The GPU address of the view of the pages block at `block`, for its `SURFACE_PAGES`
-    /// answer (`IMPORT_ADDRESSES`, "Addresses the host gives"): the one picked for it, else one
-    /// picked now in `[2^43, 2^44)`, holding Metal's span of the view's length, until the block
-    /// goes; 0 where no pages block lies there, for one of pages its process maps read-only,
-    /// whose buffers lie over copies of the pages, and where no room is left.
+    /// answer (`IMPORT_ADDRESSES`, "Addresses the host gives"): the one given it before, else
+    /// where the platform knows the view's import as a block ([`ViewImports`]), the import's,
+    /// where its view is made with one, else one picked now in `[2^43, 2^44)`, holding Metal's
+    /// span of the view's length, until the block goes; 0 where no pages block lies there, for
+    /// one of pages its process maps read-only, whose buffers lie over copies of the pages, where
+    /// the platform's known import is not made, and where no room is left.
     pub(crate) fn pages_address(&mut self, block: u64) -> u64 {
         let picks = Arc::clone(&self.view_addresses);
+        let known_imports = self.known_imports.is_some();
         let Some(p) = self.private.get_mut(&block) else {
             return 0;
         };
@@ -1095,35 +1143,50 @@ impl<P: Platform> SurfaceViews<P> {
         if let Some(address) = &p.address {
             return address.at;
         }
+        if known_imports {
+            let at = match &p.view {
+                Some((_, Some(import))) if p.known => import.gpu_address(),
+                _ => return 0,
+            };
+            p.address = Some(ViewAddress {
+                at,
+                length: p.length,
+                picks: None,
+            });
+            return at;
+        }
         let Some(at) = picks.lock().pick(p.length) else {
             return 0;
         };
         p.address = Some(ViewAddress {
             at,
             length: p.length,
-            picks,
+            picks: Some(picks),
         });
         at
     }
 
     /// Whether a buffer at `gpu_address` over the pages block at `block` lies at the address
     /// its view was given ([`Self::pages_address`]): `Some(true)` where the block keeps a buffer
-    /// made there before it, over the same bytes (a join), `Some(false)` for the first; `None`
-    /// for a block given no address, or a buffer not in its view's.
+    /// made there before it, over the same bytes (a join), `Some(false)` for the first, and for
+    /// each where the view's import is a block the platform knows, in which each is pinned;
+    /// `None` for a block given no address, or a buffer not in its view's.
     pub(crate) fn at_view_address(&self, block: u64, gpu_address: u64) -> Option<bool> {
         let p = self.private.get(&block)?;
         let address = p.address.as_ref()?;
         let end = address.at.checked_add(address.length)?;
         (address.at..end)
             .contains(&gpu_address)
-            .then_some(p.kept.is_some())
+            .then_some(p.kept.is_some() && !p.known)
     }
 
     /// The pages block at `block` keeps `buffer`, the first made at its view's address, until it
-    /// goes; nothing where it keeps one already.
+    /// goes; nothing where it keeps one already, or where its view's import is a block the
+    /// platform knows, which its view's import buffer keeps known.
     pub(crate) fn keep_at_view_address(&mut self, block: u64, buffer: &P::Buffer) {
         if let Some(p) = self.private.get_mut(&block)
             && p.kept.is_none()
+            && !p.known
         {
             p.kept = Some(buffer.clone_ref());
         }
@@ -1371,6 +1434,7 @@ impl<P: Platform> SurfaceViews<P> {
                         covered: None,
                         kept: None,
                         address: None,
+                        known: false,
                     },
                 );
                 Ok(())
@@ -1517,10 +1581,11 @@ impl<P: Platform> SurfaceViews<P> {
         idle_mappings: Option<u64>,
     ) -> Vec<Cached<P>> {
         self.counts.made += 1;
-        self.cache_view(key, Arc::clone(view), Some(import), idle_mappings)
+        self.cache_view(key, Arc::clone(view), Some(import), false, idle_mappings)
     }
 
-    /// Caches `view` of the runs `key`, with `import` over it where it has one, at the back; what
+    /// Caches `view` of the runs `key`, with `import` over it where it has one, a block the
+    /// platform knows where `known` ([`ViewImports`]), at the back; what
     /// leaves the cache
     /// past [`CACHED_VIEWS`] views or [`CACHED_BYTES`], the oldest first, and the oldest views no
     /// block holds past `idle_mappings` mappings, a mapping a run (the module doc), is returned,
@@ -1530,12 +1595,14 @@ impl<P: Platform> SurfaceViews<P> {
         key: Vec<(u64, u64)>,
         view: Arc<SurfaceView<P>>,
         import: Option<P::Buffer>,
+        known: bool,
         idle_mappings: Option<u64>,
     ) -> Vec<Cached<P>> {
         self.cache.push_back(Cached {
             runs: key,
             view,
             import,
+            known,
         });
         let mut evicted = Vec::new();
         let mut bytes: u64 = self.cache.iter().map(|c| c.view.length()).sum();
@@ -1736,7 +1803,7 @@ impl<P: Platform> SurfaceViews<P> {
         block_size: u64,
         context: Option<u32>,
     ) -> RaiseResult<Option<Arc<SurfaceView<P>>>> {
-        let (mapped, runs, length, read_only) = {
+        let (mapped, runs, length, read_only, imports) = {
             let mut v = views.lock();
             let Some(p) = (v.private.get_mut(&block))
                 .filter(|p| block_size <= p.block_size && context.is_none_or(|c| c == p.context))
@@ -1757,7 +1824,7 @@ impl<P: Platform> SurfaceViews<P> {
                     return Ok(None);
                 }
             }
-            (mapped, runs, length, read_only)
+            (mapped, runs, length, read_only, v.known_imports.clone())
         };
         let clock = platform.clock();
         let (view, start) = match mapped {
@@ -1773,7 +1840,11 @@ impl<P: Platform> SurfaceViews<P> {
             Ok(view) if read_only => Ok((view, None)),
             Ok(view) => {
                 let mapped = clock.now_mono();
-                match buffer_over(device, &view, 0, view.length(), 0, None)? {
+                let import = match &imports {
+                    Some(imports) => known_import_over(imports, device, &view)?,
+                    None => buffer_over(device, &view, 0, view.length(), 0, None)?,
+                };
+                match import {
                     Some(import) => {
                         log::trace!(
                             target: "reims_vgpu::graphics::surface_pages",
@@ -1810,6 +1881,7 @@ impl<P: Platform> SurfaceViews<P> {
         };
         let imported = import.is_some();
         p.view = Some((Arc::clone(&view), import));
+        p.known = imported && imports.is_some();
         p.made = Some(clock.now_mono());
         v.counts.private += 1;
         if imported {
@@ -1827,16 +1899,22 @@ impl<P: Platform> SurfaceViews<P> {
         runs: &[(u64, u64)],
         read_only: bool,
     ) -> Option<Arc<SurfaceView<P>>> {
-        let at = (self.cache.iter())
-            .position(|c| c.runs == runs && (read_only || c.import.is_some()))?;
+        // Where the platform knows views' imports as blocks, a writable block takes only a view
+        // whose import is one.
+        let known_only = self.known_imports.is_some() && !read_only;
+        let at = (self.cache.iter()).position(|c| {
+            c.runs == runs && (read_only || c.import.is_some()) && (c.known || !known_only)
+        })?;
         let cached = self.cache.remove(at)?;
         let view = Arc::clone(&cached.view);
         let import = cached.import.as_ref().map(|import| import.clone_ref());
+        let known = cached.known && !read_only;
         self.cache.push_back(cached);
         // A read-only block's buffers lie over copies of its pages, never in the import.
         let imported = import.is_some() && !read_only;
         if let Some(p) = self.private.get_mut(&block) {
             p.view = Some((Arc::clone(&view), import));
+            p.known = known;
         }
         self.counts.private_reused += 1;
         if imported {
@@ -2348,7 +2426,8 @@ impl<P: Platform> SurfaceViews<P> {
             if cached || made.length() > CACHED_PAGES_BYTES || p.regrouped.is_some() {
                 p.view = Some((made, import));
             } else {
-                evicted = self.cache_view(p.runs.clone(), made, import, idle_mappings);
+                let known = p.known;
+                evicted = self.cache_view(p.runs.clone(), made, import, known, idle_mappings);
             }
         }
         (view.is_some() || private.is_some() || by_runs.is_some()).then_some(Released {
@@ -2562,6 +2641,51 @@ pub(crate) fn buffer_over<P: Platform>(
             deallocator: Some(Box::new(move |_, _| drop(keep))),
             zero_from: None,
         })
+    })
+}
+
+/// The platform's import of the whole of `view` as a block it knows (`imports`, [`ViewImports`]),
+/// and the Shared buffer over the whole of it at the import's address, the view's import buffer:
+/// a range of that block, which the buffer's deallocator forgets as the buffer goes (each buffer
+/// pinned in the block holds the block of its own, at rt), the import holding the view until the
+/// platform frees it. The block is forgotten at once where the buffer is not made. A make of the
+/// view's ([`super::unkept::Kind::PagesView`]).
+fn known_import_over<P: Platform>(
+    imports: &ViewImports<P>,
+    device: &P::Device,
+    view: &Arc<SurfaceView<P>>,
+) -> RaiseResult<Option<P::Buffer>> {
+    let (first, length) = (view.base(), view.length());
+    let keep = Arc::clone(view);
+    super::unkept::Kind::PagesView.making(|| {
+        let Some((at, forget)) = imports(device, first, length, Box::new(move || drop(keep)))
+        else {
+            return Ok(None);
+        };
+        let forget = Arc::new(Mutex::new(Some(forget)));
+        let on_free = Arc::clone(&forget);
+        // SAFETY: the import holds the view, so its pages stay mapped until the platform frees
+        // the import, after the buffer; the buffer is the whole view.
+        let bytes = unsafe { HostRange::new(first, length) };
+        let made = device.new_buffer(BufferDesc {
+            length,
+            options: vec![OptionSet::ResourceOptions(0)],
+            pinned_gpu_address: Some(at),
+            contents: Some(bytes),
+            no_copy: true,
+            deallocator: Some(Box::new(move |_, _| {
+                if let Some(forget) = on_free.lock().take() {
+                    forget();
+                }
+            })),
+            zero_from: None,
+        });
+        if !matches!(made, Ok(Some(_)))
+            && let Some(forget) = forget.lock().take()
+        {
+            forget();
+        }
+        made
     })
 }
 
@@ -4429,12 +4553,12 @@ pub(super) mod tests {
             ),
             RGFX_STATUS_OK
         );
-        let at = r.dec.pages_address(BLOCK);
+        let at = r.dec.pages_address(&r.device, BLOCK);
         assert!((IMPORT_BASE..IMPORT_END).contains(&at), "{at:#x}");
         assert_eq!(at % 0x8000, 0, "on a granule");
-        assert_eq!(r.dec.pages_address(BLOCK), at, "the same at each ask");
-        assert_eq!(r.dec.pages_address(read_only), 0);
-        assert_eq!(r.dec.pages_address(BLOCK + 0x1_0000), 0);
+        assert_eq!(r.dec.pages_address(&r.device, BLOCK), at, "the same at each ask");
+        assert_eq!(r.dec.pages_address(&r.device, read_only), 0);
+        assert_eq!(r.dec.pages_address(&r.device, BLOCK + 0x1_0000), 0);
         assert_eq!(r.dec.views_of_surfaces().view_addresses_held(), 1);
 
         // The app's bytes, 0x123 into page 5, the first of the block's.
@@ -4480,13 +4604,103 @@ pub(super) mod tests {
             r.pages_flagged(BLOCK, 0, &[(5, 2)], 2 * page, RGFX_SURFACE_PAGES_PRIVATE),
             RGFX_STATUS_OK
         );
-        let again = r.dec.pages_address(BLOCK);
+        let again = r.dec.pages_address(&r.device, BLOCK);
         assert!((IMPORT_BASE..IMPORT_END).contains(&again), "{again:#x}");
         assert_eq!(r.pages_buffer(13, again, BLOCK, 0, page), Ok(()));
         assert_eq!(r.buffer_at(13).0, again);
         assert_eq!(r.dec.views_of_surfaces().view_addresses_held(), 1);
         r.dec.reset(&r.device);
         assert_eq!(r.dec.views_of_surfaces().view_addresses_held(), 0);
+    }
+
+    /// Where the platform knows a view's import as a block (metal2vulkan-rt's,
+    /// [`ViewImports`]), a writable pages block's view is made with that import at its
+    /// `SURFACE_PAGES` answer, and the address the guest is told is the import's; every
+    /// `BUFFER_OVER_PAGES` at it plus its offset is pinned there, the first and those over the
+    /// same bytes after it alike, with no import of its own. A read-only block gets no address
+    /// and no import. The block's release keeps the view in the cache with its import, still
+    /// known, which a later block over the same runs takes at the same address; the import is
+    /// forgotten once the last buffer over the view at its address goes, here at the device's
+    /// reset
+    #[test]
+    fn a_pages_block_s_address_is_its_view_s_known_import_s_where_the_platform_knows_one() {
+        const IMPORTS: u64 = 0x6_0000_0000;
+        let mut r = rig(16);
+        let page = r.page;
+        // The imports made, by address, and those forgotten.
+        let log: Arc<Mutex<(Vec<u64>, Vec<u64>)>> = Arc::default();
+        let made = Arc::clone(&log);
+        let imports: ViewImports<FakePlatform> = Arc::new(move |_, _, _, then| {
+            let at = IMPORTS + made.lock().0.len().to_u64() * 0x100_0000;
+            made.lock().0.push(at);
+            let gone = Arc::clone(&made);
+            let forget: Box<dyn FnOnce() + Send> = Box::new(move || {
+                gone.lock().1.push(at);
+                then();
+            });
+            Some((at, forget))
+        });
+        r.dec.set_view_imports(imports);
+        let read_only = BLOCK + 0x8000;
+        let private = RGFX_SURFACE_PAGES_PRIVATE;
+        assert_eq!(
+            r.pages_flagged(BLOCK, 0, &[(5, 2), (1, 1)], 3 * page, private),
+            RGFX_STATUS_OK
+        );
+        let flags = private | RGFX_SURFACE_PAGES_READ_ONLY;
+        assert_eq!(
+            r.pages_flagged(read_only, 0, &[(8, 4)], 4 * page, flags),
+            RGFX_STATUS_OK
+        );
+        assert!(!r.has_private_view(BLOCK));
+        let at = r.dec.pages_address(&r.device, BLOCK);
+        assert_eq!(at, IMPORTS, "the import's address");
+        assert!(r.has_private_view(BLOCK), "made at the answer");
+        assert_eq!(r.dec.pages_address(&r.device, BLOCK), at, "the same at each ask");
+        assert_eq!(r.dec.pages_address(&r.device, read_only), 0);
+        assert!(!r.has_private_view(read_only));
+        assert_eq!(r.dec.views_of_surfaces().view_addresses_held(), 0, "no pick");
+
+        // The app's bytes, 0x123 into page 5, the first of the block's: every buffer at the
+        // view's address is pinned there, over the same pages.
+        assert!(r.ram.write(RAM + 5 * page + 0x123, b"app"));
+        let gpu_address = at + 0x123;
+        let mut contents = None;
+        for obj_id in [10, 11] {
+            assert_eq!(
+                r.pages_buffer(obj_id, gpu_address, BLOCK, 0x123, 2 * page),
+                Ok(())
+            );
+            let (placed, over) = r.buffer_at(obj_id);
+            assert_eq!(placed, gpu_address, "pinned there");
+            assert_eq!(*contents.get_or_insert(over), over, "over the same pages");
+        }
+        let over = contents.unwrap();
+        assert_eq!(r.p.fake_vm().read(over, 3).unwrap(), b"app");
+        assert_eq!(log.lock().0, [IMPORTS], "one import, the view's");
+        for obj_id in [10, 11] {
+            let destroy = RgfxObjectDestroy {
+                header: header(RGFX_CMD_OBJECT_DESTROY),
+                obj_id,
+            };
+            assert_eq!(r.dec.decode(&r.device, destroy.as_bytes()).unwrap(), Ok(()));
+        }
+        r.dec
+            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+        r.dec.surface_worker().flush();
+        assert!(log.lock().1.is_empty(), "the cache keeps it known");
+
+        // A block over the same runs takes the cached view, at the same address.
+        assert_eq!(
+            r.pages_flagged(BLOCK, 0, &[(5, 2), (1, 1)], 3 * page, private),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(r.dec.pages_address(&r.device, BLOCK), at);
+        assert_eq!(r.pages_buffer(12, at, BLOCK, 0, page), Ok(()));
+        assert_eq!(r.buffer_at(12).0, at);
+        assert_eq!(log.lock().0, [IMPORTS], "no import more");
+        r.dec.reset(&r.device);
+        assert_eq!(*log.lock(), (vec![IMPORTS], vec![IMPORTS]), "forgotten");
     }
 
     /// A `BUFFER_OVER_PAGES` longer than the device's `maxBufferLength`, as the bundle's

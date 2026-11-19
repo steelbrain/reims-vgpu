@@ -682,6 +682,25 @@ pub(super) fn import_pages(
     }
 }
 
+/// rt's import of the host's pages that hold the `length` bytes at `first`, as a no-copy buffer's
+/// is made and counted ([`import_pages`]), known to `device` from now (`KnownBlocks::know`): the
+/// block and the bytes' offset in it. A no-copy buffer over the bytes pinned at the block's
+/// address plus their offset is then that range of the block ("A pinned address"), with no import
+/// of its own. The caller forgets the block (`KnownBlocks::forget`) as the last such buffer goes;
+/// rt frees the import once no buffer over it and no command buffer that used it lives, then
+/// runs `then`. `None` where Metal or rt refuses it, counted, `then` dropped unrun.
+pub fn import_known(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    first: HostPtr,
+    length: u64,
+    then: impl FnOnce() + Send + 'static,
+) -> Option<(rt::Block, u64)> {
+    let (block, offset) = import_pages(device, sel, first, length, then)?;
+    device.known_blocks().know(block.clone());
+    Some((block, offset))
+}
+
 /// The imports of the host's memory live now.
 static LIVE_IMPORTS: AtomicU64 = AtomicU64::new(0);
 

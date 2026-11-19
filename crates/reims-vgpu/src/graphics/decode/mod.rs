@@ -1542,9 +1542,39 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// The GPU address of the view of the pages block at `block`, for its `SURFACE_PAGES`
     /// answer where the guest took `IMPORT_ADDRESSES` ([`surface_pages::SurfaceViews::pages_address`]); 0 where
-    /// it has none.
-    pub(crate) fn pages_address(&self, block: u64) -> u64 {
-        self.shared.surface_views.lock().pages_address(block)
+    /// it has none. Where the platform knows a view's import as a block
+    /// ([`crate::platform::ViewImports`]), a writable block's view is made now, on `device`, as
+    /// its first `BUFFER_OVER_PAGES` makes it elsewhere, and the address is its import's.
+    pub(crate) fn pages_address(&self, device: &P::Device, block: u64) -> u64 {
+        let views = &self.shared.surface_views;
+        let make = {
+            let v = views.lock();
+            v.imports_known() && !v.private_read_only(block)
+        };
+        if make
+            && let Err(raise) = surface_pages::SurfaceViews::private_view(
+                views,
+                &*self.platform,
+                device,
+                block,
+                0,
+                None,
+            )
+        {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = raise;
+                "the pages block at {block:#x}: the platform raised at its view's import \
+                 ({raise:?}); its view has no address"
+            );
+        }
+        views.lock().pages_address(block)
+    }
+
+    /// The platform knows a pages block's view's import as a block, which `imports` makes
+    /// ([`crate::platform::ViewImports`]): each writable pages block's view is made at its
+    /// `SURFACE_PAGES` answer, and its address is its import's ([`Self::pages_address`]).
+    pub(crate) fn set_view_imports(&self, imports: crate::platform::ViewImports<P>) {
+        self.shared.surface_views.lock().set_view_imports(imports);
     }
 
     /// Carries out the `SURFACE_PAGES` `settle` began: the view of `runs` for the block `pages`

@@ -65,7 +65,7 @@ use crate::core::raise::{OnFault, RaiseResult};
 use crate::os::{OsClock, OsThreads, OsVm};
 
 pub use blit::RtBlitEncoder;
-pub use buffer::{KnownBlocks, RtBuffer};
+pub use buffer::{KnownBlocks, RtBuffer, import_known};
 pub use command::RtCommandBuffer;
 pub use compute::RtComputeEncoder;
 pub use descriptor::{PassFields, RateMapFields, TextureFields};

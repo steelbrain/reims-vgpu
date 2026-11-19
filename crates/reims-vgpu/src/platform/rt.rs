@@ -3,7 +3,7 @@
 //! typed refusal there. A graphics device's start makes the process's rt device and answers the
 //! guest's device info from it; the guest's work is refused at each unbuilt piece it reaches.
 
-use reims_vgpu_vulkan::RtPlatform;
+use reims_vgpu_vulkan::{RtPlatform, rt_platform};
 use reims_vgpu_vulkan::core::platform::Platform;
 
 use super::*;
@@ -29,7 +29,15 @@ impl ApiPlatform for RtPlatform {
         device: &<Self as Platform>::Device,
     ) -> Option<Arc<dyn crate::pool::BlockSource>> {
         let known = Box::new(device.known_blocks().clone());
-        Some(Arc::new(crate::pool::RtBlocks::new(device.rt().clone(), known)))
+        Some(Arc::new(crate::pool::RtBlocks::new(
+            device.rt().clone(),
+            known,
+        )))
+    }
+
+    /// rt's import of a pages block's view ([`import_view`]).
+    fn view_imports(&self) -> Option<ViewImports<RtPlatform>> {
+        Some(Arc::new(import_view))
     }
 
     /// The process's default device, or the device whose registry ID is `id`
@@ -62,4 +70,21 @@ impl ApiPlatform for RtPlatform {
     ) -> Option<<Self as Platform>::Texture> {
         device.new_texture_for_views(desc)
     }
+}
+
+/// rt's import of the `length` bytes of a pages block's view at `first`, as a no-copy buffer's is
+/// made and counted, known to `device` from now (`rt_platform::import_known`): its GPU address,
+/// and what forgets it. A buffer over the view pinned at the address plus its offset is that range
+/// of it, at the guest's address. rt runs `then` once it freed the import.
+fn import_view(
+    device: &<RtPlatform as Platform>::Device,
+    first: HostPtr,
+    length: u64,
+    then: Box<dyn FnOnce() + Send>,
+) -> Option<(u64, Box<dyn FnOnce() + Send>)> {
+    let sel = "newBufferWithBytesNoCopy:length:options:deallocator:";
+    let (block, offset) = rt_platform::import_known(device, sel, first, length, then)?;
+    let (known, id) = (device.known_blocks().clone(), block.id);
+    let forget: Box<dyn FnOnce() + Send> = Box::new(move || drop(known.forget(id)));
+    Some((block.gpu_address.saturating_add(offset), forget))
 }
