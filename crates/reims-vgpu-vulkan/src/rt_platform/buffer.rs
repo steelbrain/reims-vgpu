@@ -162,7 +162,7 @@ use crate::gpu::device::descriptor_options;
 use super::device::RtDevice;
 use super::diag::{Call, ImportPath, Made, Shape};
 use super::texture::{self, RtTexture, refused_metal};
-use super::tiled::Tiled;
+use super::tiled::{self, Tiled};
 use super::unbuilt::{Unbuilt, refuse_create, rt_refused, rt_refused_create};
 use super::{RtObj, RtPlatform, TextureFields};
 
@@ -1790,8 +1790,9 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
     /// A 2D texture of more than one level: rt's texture of the descriptor, at an index as
     /// `newTextureWithDescriptor:`'s, of the buffer's storage mode, which takes the bytes from
     /// `offset`, rows `bytes_per_row` apart, at its first use and every level from them
-    /// (`super::tiled`). Any other is the texture `newTextureWithDescriptor:offset:bytesPerRow:`
-    /// makes, which rt refuses for more than one level. Nil where rt refuses it, counted.
+    /// (`super::tiled`); nil, counted, for rows Metal's validation stops (`tiled::bad_layout`).
+    /// Any other is the texture `newTextureWithDescriptor:offset:bytesPerRow:` makes, which rt
+    /// refuses for more than one level. Nil where rt refuses it, counted.
     fn new_tiled_texture(
         &self,
         descriptor: &RtObj<TextureFields>,
@@ -1803,13 +1804,17 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
         if desc.mipmap_level_count <= 1 || desc.texture_type != TEXTURE_TYPE_2D {
             return Ok(self.texture(sel, descriptor, offset, bytes_per_row));
         }
-        let own =
-            |d: &rt::TextureDescriptor, index: Option<u32>| self.device.rt().new_texture(d, index);
+        let (rt_device, length) = (self.device.rt(), self.rt.length());
+        if let Some(why) = tiled::bad_layout(rt_device, &desc, length, offset, bytes_per_row) {
+            return Ok(refused_metal(sel, &why));
+        }
+        let own = |d: &rt::TextureDescriptor, index: Option<u32>| rt_device.new_texture(d, index);
         let held = (self.options, texture::STORAGE_BITS);
         let diag = |shape: &Shape| Made::new(Call::Tiled, shape);
         let made = texture::make_over(&self.device, sel, &desc, held, own, diag);
         if let Some(texture) = &made {
-            texture.set_tiled(Tiled::new(texture.rt(), self, offset, bytes_per_row));
+            let tiled = Tiled::new(rt_device, texture.rt(), self, offset, bytes_per_row);
+            texture.set_tiled(tiled);
         }
         Ok(made)
     }

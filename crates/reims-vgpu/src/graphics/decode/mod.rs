@@ -13035,6 +13035,114 @@ lacks {part}"
         }
     }
 
+    /// [`TILED_SIZE`]'s texture of [`TILED_LEVELS`] levels through the decoder on `P`, object 11
+    /// (`TEXTURE_FROM_BUFFER`, as the bundle sends it from
+    /// `newTiledTextureWithDescriptor:offset:bytesPerRow:`), over object 10, a 16384-byte Shared
+    /// buffer of [`TILED_PAD`]'s bytes, from `offset`, rows `bytes_per_row` apart: the decoder, its
+    /// device and what the decoder answered.
+    fn tiled_made<P: crate::platform::ApiPlatform>(
+        offset: u64,
+        bytes_per_row: u64,
+    ) -> (GraphicsDecoder<P>, P::Device, Result<(), DecodeError>) {
+        let (mut dec, device) = surface_decoder::<P>();
+        buffer_holding(&mut dec, &device, 10, &vec![TILED_PAD; 0x4000]);
+        let m = RgfxTextureFromBuffer {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_FROM_BUFFER,
+                size: size_of::<RgfxTextureFromBuffer>() as u32,
+                seqno: 0,
+            },
+            obj_id: context_obj(11),
+            resource_id: 11,
+            buffer_obj_id: context_obj(10),
+            offset,
+            bytes_per_row,
+            desc: RgfxTextureDescriptor {
+                mipmap_level_count: TILED_LEVELS,
+                ..surface_desc(80, (TILED_SIZE, TILED_SIZE))
+            },
+        };
+        let made = dec.decode(&device, m.as_bytes()).unwrap();
+        (dec, device, made)
+    }
+
+    /// The CPU's write of `texel(x, y)` at each texel of [`tiled_made`]'s level 0 into its buffer's
+    /// rows, [`TILED_ROW`] bytes apart from its first byte.
+    fn tiled_write_rows<P: Platform>(dec: &GraphicsDecoder<P>, texel: impl Fn(u64, u64) -> [u8; 4]) {
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        let Some(ObjHandle::Buffer(buffer)) = dec.object(context_obj(10)) else {
+            panic!("no buffer");
+        };
+        let contents = buffer.contents().as_ptr::<u8>();
+        for y in 0..TILED_SIZE {
+            for x in 0..TILED_SIZE {
+                let texel = texel(x, y);
+                // SAFETY: inside the buffer's 0x4000 bytes, which no command uses meanwhile.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        texel.as_ptr(),
+                        contents.add((y * TILED_ROW + x * 4) as usize),
+                        4,
+                    )
+                };
+            }
+        }
+    }
+
+    /// The buffer's bytes under [`tiled_made`]'s texture, read by the CPU.
+    fn tiled_buffer_bytes<P: Platform>(dec: &GraphicsDecoder<P>) -> Vec<u8> {
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        let Some(ObjHandle::Buffer(buffer)) = dec.object(context_obj(10)) else {
+            panic!("no buffer");
+        };
+        // SAFETY: the buffer's 0x4000 bytes, which no command uses while they are read.
+        unsafe { std::slice::from_raw_parts(buffer.contents().as_ptr::<u8>(), 0x4000) }.to_vec()
+    }
+
+    /// [`tiled_made`]'s texture's levels 0 and 1, each read by a blit of a command buffer of
+    /// `queue`'s: packed rows.
+    fn tiled_read_two<P: Platform>(
+        dec: &GraphicsDecoder<P>,
+        device: &P::Device,
+        queue: &P::CommandQueue,
+    ) -> [Vec<u8>; 2] {
+        use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlSize};
+        let Some(ObjHandle::Texture(t)) = dec.object(context_obj(11)) else {
+            panic!("no texture");
+        };
+        [0u64, 1].map(|level| {
+            let s = (TILED_SIZE >> level).max(1);
+            let out = device
+                .new_buffer_of_length(OnFault::Return, s * s * 4, 0)
+                .unwrap()
+                .unwrap();
+            let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+            let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+            let copy = BlitCmd::CopyTextureToBuffer {
+                source_texture: t,
+                source_slice: 0,
+                source_level: level,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: MtlSize::new(s, s, 1),
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: s * 4,
+                destination_bytes_per_image: s * s * 4,
+            };
+            e.encode(OnFault::Return, copy).unwrap();
+            e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+            cb.commit(OnFault::Return).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            assert!(cb.error().is_none(), "{:?}", cb.error());
+            // SAFETY: a Shared buffer's bytes, read after the blit completed.
+            unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), (s * s * 4) as usize) }
+                .to_vec()
+        })
+    }
+
     /// What [`tiled_modified_levels`] read of the texture's levels 0 and 1 at each step: packed
     /// rows.
     struct TiledModified {
@@ -13053,87 +13161,15 @@ lacks {part}"
     /// takes a `TEXTURE_DID_MODIFY_DATA` of the texture, the CPU writes the rows of seed 0x3c, and
     /// blits read them once more.
     fn tiled_modified_levels<P: crate::platform::ApiPlatform>() -> TiledModified {
-        use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
-        use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlSize};
-        let (mut dec, device) = surface_decoder::<P>();
-        buffer_holding(&mut dec, &device, 10, &vec![TILED_PAD; 0x4000]);
-        let m = RgfxTextureFromBuffer {
-            header: RgfxMsgHeader {
-                r#type: RGFX_CMD_TEXTURE_FROM_BUFFER,
-                size: size_of::<RgfxTextureFromBuffer>() as u32,
-                seqno: 0,
-            },
-            obj_id: context_obj(11),
-            resource_id: 11,
-            buffer_obj_id: context_obj(10),
-            offset: 0,
-            bytes_per_row: TILED_ROW,
-            desc: RgfxTextureDescriptor {
-                mipmap_level_count: TILED_LEVELS,
-                ..surface_desc(80, (TILED_SIZE, TILED_SIZE))
-            },
-        };
-        assert_eq!(dec.decode(&device, m.as_bytes()).unwrap(), Ok(()));
-        let Some(ObjHandle::Buffer(buffer)) = dec.object(context_obj(10)) else {
-            panic!("no buffer");
-        };
-        let contents = buffer.contents().as_ptr::<u8>();
-        let write_rows = |seed: u8| {
-            for y in 0..TILED_SIZE {
-                for x in 0..TILED_SIZE {
-                    let texel = tiled_texel(x, y, seed);
-                    // SAFETY: inside the buffer's 0x4000 bytes, which no command uses meanwhile.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            texel.as_ptr(),
-                            contents.add((y * TILED_ROW + x * 4) as usize),
-                            4,
-                        )
-                    };
-                }
-            }
-        };
+        let (mut dec, device, made) = tiled_made::<P>(0, TILED_ROW);
+        assert_eq!(made, Ok(()));
         let queue = device.new_command_queue().unwrap();
-        let read = |dec: &GraphicsDecoder<P>| {
-            let Some(ObjHandle::Texture(t)) = dec.object(context_obj(11)) else {
-                panic!("no texture");
-            };
-            [0u64, 1].map(|level| {
-                let s = (TILED_SIZE >> level).max(1);
-                let out = device
-                    .new_buffer_of_length(OnFault::Return, s * s * 4, 0)
-                    .unwrap()
-                    .unwrap();
-                let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
-                let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
-                let copy = BlitCmd::CopyTextureToBuffer {
-                    source_texture: t,
-                    source_slice: 0,
-                    source_level: level,
-                    source_origin: MtlOrigin::new(0, 0, 0),
-                    source_size: MtlSize::new(s, s, 1),
-                    destination_buffer: &out,
-                    destination_offset: 0,
-                    destination_bytes_per_row: s * 4,
-                    destination_bytes_per_image: s * s * 4,
-                };
-                e.encode(OnFault::Return, copy).unwrap();
-                e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
-                cb.commit(OnFault::Return).unwrap();
-                cb.wait_until_completed(OnFault::Return).unwrap();
-                assert!(cb.error().is_none(), "{:?}", cb.error());
-                // SAFETY: a Shared buffer's bytes, read after the blit completed.
-                unsafe {
-                    std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), (s * s * 4) as usize)
-                }
-                .to_vec()
-            })
-        };
-        write_rows(0x5a);
+        let write_rows =
+            |dec: &GraphicsDecoder<P>, seed: u8| tiled_write_rows(dec, |x, y| tiled_texel(x, y, seed));
+        let read = |dec: &GraphicsDecoder<P>| tiled_read_two(dec, &device, &queue);
+        write_rows(&dec, 0x5a);
         let first = read(&dec);
-        write_rows(0xa5);
+        write_rows(&dec, 0xa5);
         let unmarked = read(&dec);
         let modified = RgfxTextureDidModifyData {
             header: RgfxMsgHeader {
@@ -13144,7 +13180,7 @@ lacks {part}"
             obj_id: context_obj(11),
         };
         assert_eq!(dec.decode(&device, modified.as_bytes()).unwrap(), Ok(()));
-        write_rows(0x3c);
+        write_rows(&dec, 0x3c);
         let marked = read(&dec);
         TiledModified {
             first,
@@ -13157,13 +13193,23 @@ lacks {part}"
     /// average of each 2 x 2 texels of level 0 of [`tiled_texel`]'s `seed`, within 1 of each
     /// channel; the first difference otherwise.
     fn tiled_second_level_of(level: &[u8], seed: u8) -> Result<(), String> {
+        tiled_second_level_from(level, |x, y| tiled_texel(x, y, seed))
+    }
+
+    /// Whether `level`, level 1 of [`TILED_SIZE`]'s texture read as packed rows, holds the
+    /// average of each 2 x 2 texels of a level 0 of `texel(x, y)`'s, within 1 of each channel; the
+    /// first difference otherwise.
+    fn tiled_second_level_from(
+        level: &[u8],
+        texel: impl Fn(u64, u64) -> [u8; 4],
+    ) -> Result<(), String> {
         let side = TILED_SIZE / 2;
-        for (i, texel) in level.chunks(4).enumerate() {
+        for (i, got) in level.chunks(4).enumerate() {
             let (x, y) = (i as u64 % side, i as u64 / side);
-            for (c, &got) in texel.iter().enumerate() {
+            for (c, &got) in got.iter().enumerate() {
                 let sum: u32 = [(0, 0), (1, 0), (0, 1), (1, 1)]
                     .iter()
-                    .map(|&(dx, dy)| u32::from(tiled_texel(2 * x + dx, 2 * y + dy, seed)[c]))
+                    .map(|&(dx, dy)| u32::from(texel(2 * x + dx, 2 * y + dy)[c]))
                     .sum();
                 let want = sum as f64 / 4.0;
                 if (f64::from(got) - want).abs() > 1.0 {
@@ -13216,6 +13262,163 @@ lacks {part}"
         );
         assert_eq!(r.marked[0], rows(0x3c), "level 0 after the message");
         tiled_second_level_of(&r.marked[1], 0x3c).unwrap();
+    }
+
+    /// The region of level 0 [`tiled_replaced_levels`] replaces: 20 x 10 texels from (6, 3).
+    const TILED_REPLACED: ([u64; 2], [u64; 2]) = ([6, 3], [20, 10]);
+
+    /// Level 0's texel at (`x`, `y`) after [`tiled_replaced_levels`]'s `replaceRegion:`: of
+    /// [`tiled_texel`]'s seed 0x3c inside [`TILED_REPLACED`], of seed 0x5a outside it.
+    fn tiled_replaced_texel(x: u64, y: u64) -> [u8; 4] {
+        let ([ox, oy], [w, h]) = TILED_REPLACED;
+        let inside = (ox..ox + w).contains(&x) && (oy..oy + h).contains(&y);
+        tiled_texel(x, y, if inside { 0x3c } else { 0x5a })
+    }
+
+    /// What [`tiled_replaced_levels`] read: the texture's levels 0 and 1 as packed rows, and the
+    /// buffer's bytes.
+    struct TiledReplaced {
+        /// Levels 0 and 1 at the first use, after the CPU wrote the rows of seed 0x5a.
+        first: [Vec<u8>; 2],
+        /// The buffer's bytes after the `replaceRegion:`.
+        buffer: Vec<u8>,
+        /// Levels 0 and 1 at the next use.
+        replaced: [Vec<u8>; 2],
+    }
+
+    /// Makes [`tiled_made`]'s texture on `P`, then, in order: the CPU writes the rows of
+    /// [`tiled_texel`]'s seed 0x5a, and blits read levels 0 and 1; the platform's
+    /// `replaceRegion:` of level 0 writes seed 0x3c's texels of [`TILED_REPLACED`], from packed
+    /// rows; the CPU reads the buffer, and blits read the levels again.
+    fn tiled_replaced_levels<P: crate::platform::ApiPlatform>() -> TiledReplaced {
+        use reims_vgpu_vulkan::core::platform::resource::Texture as _;
+        use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+        let (dec, device, made) = tiled_made::<P>(0, TILED_ROW);
+        assert_eq!(made, Ok(()));
+        let queue = device.new_command_queue().unwrap();
+        tiled_write_rows(&dec, |x, y| tiled_texel(x, y, 0x5a));
+        let first = tiled_read_two(&dec, &device, &queue);
+        let ([ox, oy], [w, h]) = TILED_REPLACED;
+        let texels: Vec<u8> = (0..w * h)
+            .flat_map(|i| tiled_texel(ox + i % w, oy + i / w, 0x3c))
+            .collect();
+        let Some(ObjHandle::Texture(t)) = dec.object(context_obj(11)) else {
+            panic!("no texture");
+        };
+        let region = MtlRegion {
+            origin: MtlOrigin::new(ox, oy, 0),
+            size: MtlSize::new(w, h, 1),
+        };
+        (t.replace_region(region, 0, 0, HostRange::of_slice(&texels), w * 4, 0)).unwrap();
+        let buffer = tiled_buffer_bytes(&dec);
+        let replaced = tiled_read_two(&dec, &device, &queue);
+        TiledReplaced {
+            first,
+            buffer,
+            replaced,
+        }
+    }
+
+    /// On the Vulkan platform, `replaceRegion:` of a tiled texture's level 0 writes the buffer's
+    /// bytes at the texture's rows, every other byte kept, and the next use takes them into every
+    /// level, as the x86 Macs' does (docs/graphics-kext/dgpu-oracle.md, Q11)
+    #[test]
+    fn on_vulkan_a_tiled_texture_s_replaced_first_level_is_the_buffer_s_and_taken_again() {
+        tiled_replaced_first_level_is_the_buffer_s_and_taken_again::<
+            reims_vgpu_vulkan::VulkanPlatform,
+        >();
+    }
+
+    /// [`on_vulkan_a_tiled_texture_s_replaced_first_level_is_the_buffer_s_and_taken_again`] on
+    /// the rt platform
+    #[cfg(feature = "rt")]
+    #[test]
+    fn on_vulkan_rt_s_tiled_texture_s_replaced_first_level_is_the_buffer_s_and_taken_again() {
+        tiled_replaced_first_level_is_the_buffer_s_and_taken_again::<reims_vgpu_vulkan::RtPlatform>(
+        );
+    }
+
+    /// On `P`, `replaceRegion:` of a tiled texture's level 0 writes the buffer's bytes at the
+    /// texture's rows, every other byte kept, and the next use takes them into every level.
+    fn tiled_replaced_first_level_is_the_buffer_s_and_taken_again<
+        P: crate::platform::ApiPlatform,
+    >() {
+        let r = tiled_replaced_levels::<P>();
+        let packed = |texel: &dyn Fn(u64, u64) -> [u8; 4]| -> Vec<u8> {
+            (0..TILED_SIZE * TILED_SIZE)
+                .flat_map(|i| texel(i % TILED_SIZE, i / TILED_SIZE))
+                .collect()
+        };
+        let before = |x, y| tiled_texel(x, y, 0x5a);
+        assert_eq!(r.first[0], packed(&before), "level 0 at the first use");
+        tiled_second_level_from(&r.first[1], before).unwrap();
+        tiled_buffer_holds(&r.buffer, tiled_replaced_texel).unwrap();
+        assert_eq!(
+            r.replaced[0],
+            packed(&tiled_replaced_texel),
+            "level 0 at the next use"
+        );
+        tiled_second_level_from(&r.replaced[1], tiled_replaced_texel).unwrap();
+    }
+
+    /// The offsets and rows [`tiled_over_rows_metal_stops_is_refused`] makes a texture of, and
+    /// whether each is made: rows 4 bytes short of a row of texels; rows 258 bytes apart, no whole
+    /// number of texels; an offset 2 bytes into a texel; rows from 4096 bytes in, whose last ends
+    /// past the 16384-byte buffer; and, made, rows from 1024 bytes in, all within it.
+    const TILED_LAYOUTS: [(u64, u64, bool); 5] = [
+        (0, TILED_SIZE * 4 - 4, false),
+        (0, TILED_ROW + 2, false),
+        (2, TILED_ROW, false),
+        (0x1000, TILED_ROW, false),
+        (0x400, TILED_ROW, true),
+    ];
+
+    /// On the Vulkan platform, a tiled texture over rows Metal's validation stops is not made,
+    /// which the decoder answers as a refusal: rows closer than a row of texels or apart by no
+    /// whole number of texels, an offset into a texel, and rows past the buffer; a texture over
+    /// rows within the buffer at an offset is made
+    #[test]
+    fn on_vulkan_a_tiled_texture_over_rows_metal_stops_is_refused() {
+        tiled_over_rows_metal_stops_is_refused::<reims_vgpu_vulkan::VulkanPlatform>();
+    }
+
+    /// [`on_vulkan_a_tiled_texture_over_rows_metal_stops_is_refused`] on the rt platform, which
+    /// counts each refusal as Metal's (`rt-refused-metal`)
+    #[cfg(feature = "rt")]
+    #[test]
+    fn on_vulkan_rt_s_tiled_texture_over_rows_metal_stops_is_refused_and_counted() {
+        let refused = || {
+            (reims_vgpu_vulkan::answer::degradation_counts().into_iter())
+                .find(|(code, _)| code == "rt-refused-metal")
+                .map_or(0, |(_, n)| n)
+        };
+        let before = refused();
+        tiled_over_rows_metal_stops_is_refused::<reims_vgpu_vulkan::RtPlatform>();
+        let stopped = TILED_LAYOUTS.iter().filter(|&&(_, _, made)| !made).count();
+        assert_eq!(refused() - before, stopped as u64);
+    }
+
+    /// On `P`, each of [`TILED_LAYOUTS`]'s textures through the decoder: refused where it is not
+    /// made, and holding [`TILED_LEVELS`] levels where it is.
+    fn tiled_over_rows_metal_stops_is_refused<P: crate::platform::ApiPlatform>() {
+        use reims_vgpu_vulkan::core::platform::resource::Texture as _;
+        for (offset, bytes_per_row, made) in TILED_LAYOUTS {
+            let (dec, _device, answer) = tiled_made::<P>(offset, bytes_per_row);
+            let what = format!("offset {offset}, rows {bytes_per_row} apart");
+            match made {
+                true => {
+                    assert_eq!(answer, Ok(()), "{what}");
+                    let Some(ObjHandle::Texture(t)) = dec.object(context_obj(11)) else {
+                        panic!("no texture at {what}");
+                    };
+                    assert_eq!(t.mipmap_level_count(), u64::from(TILED_LEVELS), "{what}");
+                }
+                false => {
+                    assert_eq!(answer, Err(DecodeError::Refused), "{what}");
+                    assert!(dec.object(context_obj(11)).is_none(), "{what}");
+                }
+            }
+        }
     }
 
     /// What a `SAMPLER_CREATE` costs the host, through the decoder as the guest's waited create

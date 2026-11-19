@@ -70,7 +70,7 @@ use crate::core::sync::Mutex;
 use super::descriptor::rt_texture_descriptor;
 use super::device::RtDevice;
 use super::diag::{Call, Made, Shape};
-use super::tiled::{self, Tiled};
+use super::tiled::Tiled;
 use super::unbuilt::{
     RtRefusal, Unbuilt, refuse_create, refused_as, rt_refused, rt_refused_texture_create,
 };
@@ -874,7 +874,7 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
     /// Metal's read of it faults (`crate::gpu::resource::first_bytes`). What rt refuses (a Private
     /// texture, a region outside the level or off its format's block grid, rows that do not cover
     /// it) changes nothing, counted, where Metal's validation aborts. Of a tiled texture's level 0
-    /// the bytes go into its image, counted (`super::tiled`).
+    /// the bytes go into its buffer's bytes, which its next use takes (`super::tiled`).
     fn replace_region(
         &self,
         region: MtlRegion,
@@ -893,11 +893,16 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
             refused_as(REPLACE, RtRefusal::Refused, &why);
             return Ok(());
         };
-        if level == 0 && self.tiled().is_some() {
-            tiled::replaced_first_level(REPLACE);
-        }
         let bytes = crate::gpu::resource::first_bytes(REPLACE, pixel_bytes, usize::MAX);
         counted_copy(bytes.len());
+        if level == 0
+            && let Some(tiled) = self.tiled()
+        {
+            if let Err((kind, why)) = tiled.replace(region, u64::from(slice), &bytes, bytes_per_row) {
+                refused_as(REPLACE, kind, &why);
+            }
+            return Ok(());
+        }
         if let Err(error) = (self.rt).replace_region(
             r,
             level,
