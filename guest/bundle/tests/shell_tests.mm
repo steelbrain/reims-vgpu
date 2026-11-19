@@ -15153,6 +15153,38 @@ void test_no_copy_buffers_in_place()
 		CHECK(expectMessage<RgfxObjectDestroy>(f.control, RGFX_CMD_OBJECT_DESTROY).obj_id == buffer);
 		CHECK(expectMessage<RgfxObjectDestroy>(f.control, RGFX_CMD_OBJECT_DESTROY).obj_id == copy);
 		drainRing(f.control);
+		// Where the host makes Managed buffers at their copies (MANAGED_AT_COPY): in place too,
+		// the Managed buffer at its Shared copy's address, the pointer's offset in its page kept,
+		// with no pick of its own; its destroy first, then its copy's, as before.
+		f.ser.setManagedAtCopy(true);
+		pages.asked.clear();
+		const size_t picksBefore = f.ids.privatePicksLive();
+		const size_t releasedAtCopy = blocks.released.size();
+		@autoreleasepool {
+			RgfxBuffer *m = [RgfxBuffer bufferWithBytesNoCopy:p
+			                                           length:0x1000
+			                                          options:MTLResourceStorageModeManaged
+			                                      deallocator:nil
+			                                           region:&region
+			                                            slabs:&slabs
+			                                           device:nil
+			                                       serializer:&f.ser];
+			CHECK(m != nil && [m rgfxShadow] == nullptr && pages.asked.size() == 1);
+			auto over = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+			auto mm = expectMessage<RgfxManagedBufferCreateWhole>(f.control,
+			                                                      RGFX_CMD_MANAGED_BUFFER_CREATE);
+			CHECK(mm.create.obj_id == m.rgfxObjId && mm.create.cpu_buffer_obj_id == over.obj_id);
+			CHECK(mm.create.gpu_address == over.gpu_address && m.gpuAddress == over.gpu_address &&
+			      m.gpuAddress % 0x1000 == 0x123);
+			CHECK(f.ids.privatePicksLive() == picksBefore);
+			buffer = m.rgfxObjId;
+			copy = over.obj_id;
+		}
+		CHECK(eventually([&] { return blocks.released.size() == releasedAtCopy + 1; }));
+		CHECK(expectMessage<RgfxObjectDestroy>(f.control, RGFX_CMD_OBJECT_DESTROY).obj_id == buffer);
+		CHECK(expectMessage<RgfxObjectDestroy>(f.control, RGFX_CMD_OBJECT_DESTROY).obj_id == copy);
+		drainRing(f.control);
+		f.ser.setManagedAtCopy(false);
 		// Where the device makes no Managed buffer over a Shared one: the shadow, no block asked.
 		@autoreleasepool {
 			RgfxBuffer *shadowed = [RgfxBuffer bufferWithBytesNoCopy:p

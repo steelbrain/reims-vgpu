@@ -422,17 +422,26 @@ RgfxCreated RgfxSerializer::createBufferManagedAtOffset(RgfxObjId heap, uint64_t
 
 RgfxCreated RgfxSerializer::createManagedBuffer(RgfxObjId cpu_buffer, uint64_t length,
                                                 uint32_t options, uint64_t zeroFrom,
-                                                uint64_t align, uint64_t offset)
+                                                uint64_t align, uint64_t offset,
+                                                uint64_t copy_address)
 {
 	RgfxCreated out = {};
-	// The GPU copy's address, in a Private block where the context takes them, the pick holding
-	// the span from `offset` before it; no address left for it: no object, as for a buffer over
-	// host memory.
 	if (length > UINT64_MAX - offset)
 		return out;
-	out.gpu_address = m_ids.allocPrivateAddress(length + offset, align);
-	if (out.gpu_address == 0)
-		return out;
+	if (m_managedAtCopy) {
+		// Its bytes are its CPU copy's, at the copy's address: no pick of its own.
+		if (copy_address == 0 || copy_address < offset)
+			return out;
+		out.gpu_address = copy_address - offset;
+		out.sharesAddress = true;
+	} else {
+		// The GPU copy's address, in a Private block where the context takes them, the pick
+		// holding the span from `offset` before it; no address left for it: no object, as for
+		// a buffer over host memory.
+		out.gpu_address = m_ids.allocPrivateAddress(length + offset, align);
+		if (out.gpu_address == 0)
+			return out;
+	}
 	out.obj_id = m_ids.allocObjId();
 
 	RgfxManagedBufferCreateWhole msg = {};
@@ -531,7 +540,8 @@ bool RgfxSerializer::refused(const RgfxCreated &created)
 {
 	if (created.posted)
 		return false;
-	m_ids.freeAddress(created.gpu_address);
+	if (!created.sharesAddress)
+		m_ids.freeAddress(created.gpu_address);
 	m_ids.freeResourceId(created.resource_id);
 	return true;
 }

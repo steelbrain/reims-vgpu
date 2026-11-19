@@ -207,7 +207,10 @@
 //    surfaces' blocks, of a block's holders and of the cached surfaces grow rather than refuse;
 //    and it counts each copy block it makes, a surface's second copy beside its device cache, and
 //    each ask in place it refuses, by why, as the bundle counts each copy view by why it is not in
-//    place (RgfxIOSurface.mm).
+//    place (RgfxIOSurface.mm);
+//  - MANAGED_AT_COPY (bit 63), both kexts: on a GPU that shares the CPU's memory the bundle makes
+//    each Managed buffer at its CPU copy's address, with no Private block pick of its own
+//    (RgfxSerializer::createManagedBuffer), which needs nothing of the kext.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -255,7 +258,8 @@ constexpr uint64_t kRgfxCarriedFeatures =
                             RGFX_FEATURE_CURSOR_COLOR
                       : RGFX_FEATURE_DISPLAY_POWER) |
     RGFX_FEATURE_POOL | RGFX_FEATURE_POOL_ADDRESSES | RGFX_FEATURE_PRIVATE_BLOCKS |
-    RGFX_FEATURE_IMPORT_ADDRESSES | RGFX_FEATURE_SURFACE_CACHE_EVERY;
+    RGFX_FEATURE_IMPORT_ADDRESSES | RGFX_FEATURE_SURFACE_CACHE_EVERY |
+    RGFX_FEATURE_MANAGED_AT_COPY;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer and, on arm64, the
 // displays whose node the firmware placed under /arm-io, counted from display 0 (`mobileNodes`):

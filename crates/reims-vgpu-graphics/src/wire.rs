@@ -592,6 +592,21 @@ pub const RGFX_FEATURE_IMPORT_ADDRESSES: u64 = 0x2000_0000_0000_0000;
 /// host offers it where its platform caches every surface (metal2vulkan-rt's per-shape form) and
 /// it offers [`RGFX_FEATURE_POOL`]; the x86-64 and arm64e kexts take it.
 pub const RGFX_FEATURE_SURFACE_CACHE_EVERY: u64 = 0x4000_0000_0000_0000;
+/// `FEATURES_HI` bit 31, feature bit 63, `MANAGED_AT_COPY`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_HI`]: on a GPU that shares the CPU's memory, a `Managed` buffer is
+/// its bytes, so its GPU address is its CPU copy's. Where the guest took it, a
+/// [`RGFX_CMD_MANAGED_BUFFER_CREATE`]'s `gpu_address` is the address of the first byte of its CPU
+/// copy, the `Shared` buffer `cpu_buffer_obj_id`, as that buffer's create gave it, and the guest
+/// takes no address of its own for it, in a Private block ([`RGFX_FEATURE_PRIVATE_BLOCKS`]) or in
+/// its context's range. The host makes the buffer there, a range of the block the CPU copy lies
+/// in, and refuses the create where its platform does not make it at that address ("Guest input
+/// the host refuses"), so the guest's pointers to the buffer never hold another address. A host
+/// offers it where its GPU shares the CPU's memory, its platform keeps a pin only inside a block
+/// it knows (metal2vulkan-rt's), whose Shared blocks the CPU copies lie in, and it offers
+/// [`RGFX_FEATURE_POOL`], whose blocks the slabs' copies lie in: on the Vulkan platform before it
+/// the guest's own pick is pinned, and a pin inside the CPU copy's range would be refused. The
+/// x86-64 and arm64e kexts take it.
+pub const RGFX_FEATURE_MANAGED_AT_COPY: u64 = 0x8000_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;

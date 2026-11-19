@@ -1915,6 +1915,84 @@ void test_pool_slab_source_at_host_addresses()
 	drain();
 }
 
+// Where the host makes Managed buffers at their copies (RGFX_FEATURE_MANAGED_AT_COPY, a GPU that
+// shares the CPU's memory), a Managed buffer over a Shared copy in a pool block at the host's
+// address lies at the copy's address, with no pick of the process's: one is made with no room
+// left for a pick, where without the feature none is. Its address goes back with its copy, so
+// its give leaves the process's own pick held.
+void test_pool_managed_buffers_at_their_copies()
+{
+	using Pool = RgfxPoolSlabSource;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
+	TestRing ring(0x10000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	// Room for one pick of a page, which the process holds: no pick is left for anything else.
+	RgfxIdSpace ids(RGFX_CONTEXT_VA_BASE, RgfxIdSpace::addressSpan(0x1000));
+	const uint64_t picked = ids.allocAddress(0x1000, 1);
+	CHECK(picked == RGFX_CONTEXT_VA_BASE && ids.allocAddress(0x1000, 1) == 0);
+	RgfxSerializer ser(writer, ids);
+	RgfxRegion region(mem.data(), mem.size());
+	std::vector<std::string> log;
+	PoolKext kext(64 * kMiB, &log, &ring);
+	kext.gpuBase = 1ull << 45;
+	RgfxPoolMemory calls;
+	calls.context = &kext;
+	calls.take = &PoolKext::take;
+	calls.give = &PoolKext::give;
+	Pool pool(region, ser, calls, false, true);
+	RgfxSlabs slabs(pool);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	auto drain = [&] {
+		while (ring.next(&h, &bytes)) {
+		}
+	};
+
+	// Without the feature: the Managed buffer's address is a pick, and none is left.
+	RgfxSlabs::Range m;
+	RgfxSlabSource::Made made;
+	CHECK(!ser.managedAtCopy());
+	CHECK(slabs.take(0x1000, kManaged, 0, &m));
+	CHECK(!slabs.makeBuffer(m, 0x800, kManaged, &made));
+	drain();
+	slabs.give(m);
+	drain();
+
+	// With it: at the copy's address, the heap's at the host's address plus its offset.
+	ser.setManagedAtCopy(true);
+	log.clear();
+	RgfxSlabs::Range a, b;
+	CHECK(slabs.take(0x1000, kShared, 0, &a) && slabs.take(0x1000, kManaged, 0, &b));
+	CHECK(b.slab == a.slab && b.offset == 0x1000);
+	CHECK(log.size() == 1 && log[0].rfind("take ", 0) == 0);
+	const std::string took = log[0].substr(5);
+	auto heap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_POOL);
+	CHECK(heap.gpu_address >= (1ull << 45) && heap.options == kShared);
+	CHECK(slabs.makeBuffer(b, 0x800, kManaged, &made));
+	auto copy = expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET);
+	CHECK(copy.heap_obj_id == heap.obj_id && copy.offset == 0x1000 && copy.options == kShared);
+	auto overWhole =
+	    expectMessage<RgfxManagedBufferCreateWhole>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+	CHECK(overWhole.create.cpu_buffer_obj_id == copy.obj_id && overWhole.create.length == 0x800 &&
+	      overWhole.create.options == kManaged);
+	CHECK(overWhole.create.gpu_address == heap.gpu_address + 0x1000);
+	CHECK(made.objId == overWhole.create.obj_id && made.gpuAddress == heap.gpu_address + 0x1000 &&
+	      !made.ownsAddress);
+	CHECK(ids.privatePicksLive() == 0 && ids.privateBlocksHeld() == 0);
+	drain();
+	slabs.give(b);
+	slabs.give(a);
+	CHECK(endsWith(log, {"destroy " + std::to_string(copy.obj_id),
+	                     "destroy " + std::to_string(heap.obj_id), "give " + took}));
+	// Nothing of the process's went back: its own pick is still held.
+	CHECK(ids.allocAddress(0x1000, 1) == 0);
+	ids.freeAddress(picked);
+	CHECK(ids.allocAddress(0x1000, 1) == picked);
+	CHECK(kext.blocks.empty());
+	drain();
+}
+
 } // namespace
 
 void rgfxSlabTests()
@@ -1941,4 +2019,5 @@ void rgfxSlabTests()
 	test_managed_buffers_over_shared_copies();
 	test_pool_slab_source();
 	test_pool_slab_source_at_host_addresses();
+	test_pool_managed_buffers_at_their_copies();
 }

@@ -584,10 +584,11 @@ void rgfxOwesEscapeNote(RgfxBuffer *buffer, MTLResourceOptions options, RgfxSeri
 	const RgfxObjId copy = managed ? created.obj_id : 0;
 	const uint64_t copyPick = hostAddress ? 0 : created.gpu_address;
 	if (managed) {
-		// The app's own bytes, which its program wrote: nothing is said of them.
+		// The app's own bytes, which its program wrote: nothing is said of them. At the copy's
+		// address where the host makes Managed buffers there (managedAtCopy).
 		created = serializer->createManagedBuffer(copy, length, static_cast<uint32_t>(options),
 		                                          length, RgfxSerializer::kDefaultAddressAlign,
-		                                          offset);
+		                                          offset, created.gpu_address + offset);
 		if (created.obj_id == 0 || serializer->refused(created)) {
 			region->leavePages(at);
 			serializer->destroy(copy, [serializer, copyPick, region, at] {
@@ -632,8 +633,9 @@ void rgfxOwesEscapeNote(RgfxBuffer *buffer, MTLResourceOptions options, RgfxSeri
 		return nil;
 	}
 	// The host's address of the block's view is the block's, not the process's to give back; a
-	// Managed buffer's is its own pick.
-	buffer->_ownsAddress = managed || !hostAddress;
+	// Managed buffer's is its own pick, but where it shares its copy's, which goes back with the
+	// copy.
+	buffer->_ownsAddress = managed ? !created.sharesAddress : !hostAddress;
 	buffer->_addressPick = created.gpu_address;
 	buffer->_pagesRegion = region;
 	buffer->_pagesBlock = at;

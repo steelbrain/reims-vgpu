@@ -64,12 +64,16 @@ bool RgfxRegionSlabSource::overCopy(uint32_t options) const
 bool RgfxRegionSlabSource::makeOverCopy(const Made &copy, uint64_t length, uint32_t options,
                                         uint64_t zeroFrom, Made *out)
 {
-	RgfxCreated created = m_serializer.createManagedBuffer(copy.objId, length, options, zeroFrom);
+	// At the copy's address where the host makes Managed buffers there (managedAtCopy).
+	RgfxCreated created = m_serializer.createManagedBuffer(
+	    copy.objId, length, options, zeroFrom, RgfxSerializer::kDefaultAddressAlign, 0,
+	    copy.gpuAddress);
 	if (created.obj_id == 0 || m_serializer.refused(created))
 		return false; // no address left, or the device never got it
 	out->objId = created.obj_id;
 	out->gpuAddress = created.gpu_address;
-	out->ownsAddress = true;
+	// An address shared with the copy goes back with the copy (dropCopy).
+	out->ownsAddress = !created.sharesAddress;
 	return true;
 }
 

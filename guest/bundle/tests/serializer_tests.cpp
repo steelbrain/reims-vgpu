@@ -1068,6 +1068,68 @@ void test_buffer_over_pages_at_the_host_s_address()
 	CHECK(none.obj_id == 0 && !none.posted && wraps.obj_id == 0 && !wraps.posted);
 }
 
+// Where the host makes Managed buffers at their copies (MANAGED_AT_COPY), a Managed buffer's
+// create posts its CPU copy's address, with no pick of the process's: the answer's address less
+// the offset its caller gives, so the buffer's is still the answer's plus the offset, and it
+// shares the copy's address, so a refusal gives nothing of it back. No copy address, or one below
+// the offset, is no object.
+void test_managed_buffers_at_their_copies()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	FakePrivate f;
+	// Room for the copy's pick alone.
+	RgfxIdSpace ids(RGFX_CONTEXT_VA_BASE, RgfxIdSpace::addressSpan(0x3123));
+	ids.setPrivateBlockSource(&fakePrivateTake, &fakePrivateGive, &f);
+	RgfxSerializer ser(writer, ids);
+	CHECK(!ser.managedAtCopy());
+	ser.setManagedAtCopy(true);
+	CHECK(ser.managedAtCopy());
+
+	// Over a no-copy buffer's pages, 0x123 into its page: at the copy's own address.
+	RgfxCreated copy = ser.createBufferOverPages(0x3000, 0, 0x60000, 0x1000, 0x123);
+	CHECK(copy.posted && !copy.sharesAddress && ids.allocAddress(1, 1) == 0);
+	(void)expectMessage<RgfxBufferOverPages>(ring, RGFX_CMD_BUFFER_OVER_PAGES);
+	RgfxCreated m = ser.createManagedBuffer(copy.obj_id, 0x3000, 0x10, 0x3000,
+	                                        RgfxSerializer::kDefaultAddressAlign, 0x123,
+	                                        copy.gpu_address + 0x123);
+	CHECK(m.posted && m.obj_id != 0 && m.sharesAddress && m.gpu_address == copy.gpu_address);
+	auto mm = expectMessage<RgfxManagedBufferCreateWhole>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+	CHECK(mm.create.obj_id == m.obj_id && mm.create.cpu_buffer_obj_id == copy.obj_id);
+	CHECK(mm.create.gpu_address == copy.gpu_address + 0x123 && mm.create.length == 0x3000 &&
+	      mm.zero.zero_from == 0x3000);
+	CHECK(f.taken.empty() && ids.privateBlocksHeld() == 0 && ids.privatePicksLive() == 0);
+
+	// A slab's copy, at its offset in a heap at the host's address.
+	const uint64_t at = (1ull << 45) + 0x1000;
+	RgfxCreated s = ser.createManagedBuffer(0x79, 0x800, 0x10, 0,
+	                                        RgfxSerializer::kDefaultAddressAlign, 0, at);
+	CHECK(s.posted && s.sharesAddress && s.gpu_address == at);
+	CHECK(expectMessage<RgfxManagedBufferCreateWhole>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE)
+	          .create.gpu_address == at);
+	CHECK(f.taken.empty() && ids.privatePicksLive() == 0);
+
+	// No copy address, or one below the offset: no object, nothing posted.
+	RgfxCreated none = ser.createManagedBuffer(0x79, 0x800, 0x10, 0);
+	RgfxCreated below = ser.createManagedBuffer(0x79, 0x800, 0x10, 0,
+	                                            RgfxSerializer::kDefaultAddressAlign, 0x123, 0x100);
+	CHECK(none.obj_id == 0 && !none.posted && below.obj_id == 0 && !below.posted);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!ring.next(&h, &bytes));
+
+	// A refused one gives nothing back: the copy's pick stays held, and the range full. Given
+	// back, the range has room again, so the check sees a release.
+	RgfxCreated refused = m;
+	refused.posted = false;
+	CHECK(ser.refused(refused));
+	CHECK(ids.allocAddress(1, 1) == 0);
+	ser.releaseAddress(copy.gpu_address);
+	CHECK(ids.allocAddress(1, 1) == copy.gpu_address);
+}
+
 // A heap, buffer or device-placed texture (Managed or not) whose GPU address finds no room in the
 // context's range is no object: the create posts nothing and answers ids of 0, so the caller
 // answers nil, as Metal does for one it cannot place, and a texture's resource id goes back; a
@@ -4672,6 +4734,7 @@ int main()
 	test_feature_profile_for_guest();
 	test_archive_file();
 	test_lifecycle_messages();
+	test_managed_buffers_at_their_copies();
 	test_creates_with_no_address_post_nothing();
 	test_library_message();
 	test_pipeline_messages();

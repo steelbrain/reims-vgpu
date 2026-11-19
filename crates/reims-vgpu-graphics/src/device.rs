@@ -338,7 +338,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 62.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 63.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -398,7 +398,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_POOL_ADDRESSES
     | RGFX_FEATURE_PRIVATE_BLOCKS
     | RGFX_FEATURE_IMPORT_ADDRESSES
-    | RGFX_FEATURE_SURFACE_CACHE_EVERY;
+    | RGFX_FEATURE_SURFACE_CACHE_EVERY
+    | RGFX_FEATURE_MANAGED_AT_COPY;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -505,6 +506,16 @@ pub trait Host: Send + Sync + 'static {
     /// taken: once a boot, and again after a reset. It waits for nothing. The default does
     /// nothing, for a host with no pool.
     fn pool_taken(&self) {}
+
+    /// The guest's driver wrote `STATUS` `DRIVER_READY`: `taken` is the feature bits it took
+    /// (`DRIVER_FEATURES`), which hold from now to the next reset, for the host's decoder to
+    /// carry out those whose messages it reads differently where they are taken
+    /// ([`RGFX_FEATURE_MANAGED_AT_COPY`]). Called on the writing thread, inside the write, before
+    /// the device takes any message after it, at each write that makes the driver ready: once a
+    /// boot, and again after a reset. It waits for nothing. The default does nothing.
+    fn driver_ready(&self, taken: u64) {
+        let _ = taken;
+    }
 
     /// `POOL_TAKE`, where the guest took [`RGFX_FEATURE_POOL`]: context `take.context` asks for a
     /// zeroed block of the pool of at least `take.length` bytes. The host gives `answer` from any
@@ -1838,6 +1849,12 @@ impl Device {
             RGFX_REG_DRIVER_FEATURES_LO => self.shared.take_driver_features(0, value),
             RGFX_REG_DRIVER_FEATURES_HI => self.shared.take_driver_features(32, value),
             RGFX_REG_STATUS if value == RGFX_STATUS_DRIVER_READY => {
+                // The features are fixed from here (`take_driver_features`): the host has them
+                // before the first message the device takes.
+                if !self.shared.started() {
+                    let taken = self.shared.driver_features.load(Ordering::Acquire);
+                    self.shared.host.driver_ready(taken);
+                }
                 self.shared
                     .status
                     .store(RGFX_STATUS_DRIVER_READY, Ordering::Release);

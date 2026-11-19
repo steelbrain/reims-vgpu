@@ -29,8 +29,10 @@
  * BUFFER_OVER_PAGES over a larger slab of plain pages), and the Managed buffer a
  * MANAGED_BUFFER_CREATE over it, its CPU copy. So a Managed buffer of any size lies where a Shared
  * one of its size does, the process's own pages first, on every host. Its range goes back
- * once the copy's destroy follows the buffer's. Without the feature a Managed buffer has a class
- * of its own (below, the region's source).
+ * once the copy's destroy follows the buffer's. Where the device also took
+ * RGFX_FEATURE_MANAGED_AT_COPY (RgfxSerializer::managedAtCopy), the Managed buffer lies at its
+ * copy's GPU address, which goes back with the copy. Without the feature a Managed buffer has a
+ * class of its own (below, the region's source).
  *
  * THE SIZES. A buffer of up to kSmallMax bytes takes a range of one of its class's slabs, first
  * fit over the slabs in the order they were made, so older slabs fill first and newer ones empty.

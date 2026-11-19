@@ -258,6 +258,10 @@ struct RgfxCreated {
 	uint64_t seqno;
 	bool posted;
 	uint32_t status;
+	/// Whether `gpu_address` is another object's, not a pick of the process's: a Managed buffer's
+	/// at its CPU copy's (createManagedBuffer, managedAtCopy), which goes back with the copy, never
+	/// through this answer (refused, releaseAddress).
+	bool sharesAddress = false;
 };
 
 /// A rasterization rate map's descriptor (MTLRasterizationRateMapDescriptor) as RATE_MAP_CREATE
@@ -381,6 +385,11 @@ public:
 	/// RGFX_FEATURE_DYNAMIC_LIBRARIES. Set once, before the first library; off by default.
 	void setCarriesDynamicLibraries(bool carries) { m_dynamicLibraries = carries; }
 	bool carriesDynamicLibraries() const { return m_dynamicLibraries; }
+	/// Whether a Managed buffer lies at its CPU copy's GPU address (createManagedBuffer): the
+	/// host took RGFX_FEATURE_MANAGED_AT_COPY, on a GPU that shares the CPU's memory, where a
+	/// Managed buffer is its bytes. Set once, before the first buffer; off by default.
+	void setManagedAtCopy(bool atCopy) { m_managedAtCopy = atCopy; }
+	bool managedAtCopy() const { return m_managedAtCopy; }
 	/// Names shared event `event` for other processes: its port, 0 where none was given.
 	uint32_t shareEvent(RgfxObjId event);
 	/// The process's new shared event made of the one `port` names: its id in `obj_id` and the
@@ -506,9 +515,15 @@ public:
 	/// app's pages keeps its pointer's offset in its page (createBufferOverPages). The answer's
 	/// `gpu_address` is the address picked, given back through releaseAddress. No one waits for
 	/// it: held where the control ring batches, as createBufferAtOffset's buffer is.
+	///
+	/// Where the host makes Managed buffers at their copies (managedAtCopy), there is no pick:
+	/// the buffer's address is `copy_address`, the GPU address of `cpu_buffer`'s first byte, as
+	/// its create gave it, and the answer's `gpu_address` that less `offset`, so the buffer's is
+	/// still the answer's plus `offset`. The answer `sharesAddress`: the address goes back with
+	/// the copy. No object where `copy_address` is 0 or less than `offset`.
 	RgfxCreated createManagedBuffer(RgfxObjId cpu_buffer, uint64_t length, uint32_t options,
 	                                uint64_t zeroFrom, uint64_t align = kDefaultAddressAlign,
-	                                uint64_t offset = 0);
+	                                uint64_t offset = 0, uint64_t copy_address = 0);
 
 	/// The process wrote `length` bytes at `location` of Managed buffer `buffer`'s CPU copy
 	/// (`didModifyRange:`): every command buffer committed after it sees them. Held where the
@@ -542,7 +557,8 @@ public:
 	/// Whether the device never got the create `created` describes (its message went nowhere:
 	/// the kext refused it, or the ring had no room), so no object of that id exists there: the
 	/// caller makes none, as Metal answers nil for an object it cannot make. Gives back the GPU
-	/// address and resource id it picked then, as no destroy will follow.
+	/// address and resource id it picked then, as no destroy will follow; an address it
+	/// `sharesAddress` with another object stays that object's.
 	bool refused(const RgfxCreated &created);
 
 	/// A texture of shape `desc`. When `heap` is RGFX_OBJ_NONE the texture is
@@ -855,6 +871,7 @@ private:
 	bool m_rateMaps = false;
 	bool m_functionPointers = false;
 	bool m_dynamicLibraries = false;
+	bool m_managedAtCopy = false;
 	bool m_sharesPipelines = false;
 	void *m_eventContext = nullptr;
 

@@ -5601,6 +5601,49 @@ fn the_host_is_told_each_time_the_driver_takes_the_pool() {
     assert_eq!(taken(), 2);
 }
 
+/// A host that offers `MANAGED_AT_COPY` and records the features it is told the driver took
+/// as it became ready ([`Host::driver_ready`]).
+#[derive(Clone, Default)]
+struct ReadyHost {
+    ready: Arc<Mutex<Vec<u64>>>,
+}
+
+impl Host for ReadyHost {
+    fn raise_interrupt(&self, _vector: u32) {}
+    fn features(&self) -> u64 {
+        RGFX_FEATURE_MANAGED_AT_COPY | RGFX_FEATURE_POOL
+    }
+    fn driver_ready(&self, taken: u64) {
+        self.ready.lock().push(taken);
+    }
+}
+
+/// The host is told the features the guest's driver took as it becomes ready
+/// ([`Host::driver_ready`]): at the `STATUS` write that makes it ready, not at a write of
+/// `DRIVER_FEATURES` nor at another such write while it is ready, and again after a reset, with
+/// the features taken since.
+#[test]
+fn the_host_is_told_the_driver_s_features_as_it_becomes_ready() {
+    let host = ReadyHost::default();
+    let rig = Rig::with_host(Box::new(host.clone()));
+    let ready = || host.ready.lock().clone();
+    let write_hi = |bits: u64| {
+        rig.device
+            .mmio_write(RGFX_REG_DRIVER_FEATURES_HI.into(), (bits >> 32) as u32);
+    };
+    write_hi(RGFX_FEATURE_MANAGED_AT_COPY);
+    assert_eq!(ready(), Vec::<u64>::new());
+    rig.start();
+    assert_eq!(ready(), vec![RGFX_FEATURE_MANAGED_AT_COPY]);
+    rig.start();
+    assert_eq!(ready(), vec![RGFX_FEATURE_MANAGED_AT_COPY], "once while ready");
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    write_hi(RGFX_FEATURE_POOL);
+    rig.start();
+    assert_eq!(ready(), vec![RGFX_FEATURE_MANAGED_AT_COPY, RGFX_FEATURE_POOL]);
+}
+
 /// A `POOL_TAKE`'s `POOL_BLOCK` on `rig`: its status, offset, length and GPU address.
 fn pool_block(rig: &mut Rig, bytes: Vec<u8>) -> (u32, u64, u64, u64) {
     let seqno = rig.send(bytes);

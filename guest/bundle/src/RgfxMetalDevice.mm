@@ -1222,6 +1222,7 @@ RGFX_LOG_UNRECOGNIZED
 	                                        0);
 	_serializer->setCarriesDynamicLibraries((_caps.features() & RGFX_FEATURE_DYNAMIC_LIBRARIES) !=
 	                                        0);
+	_serializer->setManagedAtCopy((_caps.features() & RGFX_FEATURE_MANAGED_AT_COPY) != 0);
 	// Shared events cross processes through the kext's ports where the kext makes them and the
 	// host took the feature that names their events (RgfxUserClientABI.hpp,
 	// kRgfxSharedEventUserClientType).
