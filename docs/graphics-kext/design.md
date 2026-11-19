@@ -4681,6 +4681,19 @@ the host's import, and the kext's block table holds one entry per slab:
   holds only the slabs its buffers lie in. A slab let go destroys its heap,
   then frees its block on the background thread, so no buffer's free waits
   for a `BLOCK_RELEASE`.
+- Where the device has a Shared pool and the kext maps its blocks (`POOL`,
+  the kext's `Pool`; "The Shared pool", below), the pool is every heaped
+  slab's source, ahead of the region and in place of the process's own pages
+  below: each slab is one block of the pool, made one Shared Placement
+  `HEAP_OVER_POOL`, its buffers placed in it as in a region slab's heap. A
+  class's slabs grow to 16 MiB and hold buffers of up to 4 MiB, as chunked
+  slabs do, and a larger buffer takes a block of its own of its length
+  rounded up to 64 KiB, with its heap, up to 4 GiB. No slab of the pool is
+  kept once empty, a class's or a large buffer's: it goes with its last
+  buffer, its heap's destroy and then its block's give. A take the kext
+  refuses, a buffer past 4 GiB and a class with no heap (a Managed class
+  without `MANAGED_AT_OFFSET` or `MANAGED_BUFFER_SLABS`) take the region's
+  slabs.
 - Where the host maps a process's own pages (`PAGES_BUFFERS`, and the kext's
   `PagesBlock`) and makes heaps over them (`HEAP_OVER_PAGES`), a heaped slab
   of 2 MiB is the process's own memory instead: the kext's chunks where it
@@ -4770,6 +4783,78 @@ at the resource's alignment; `guest/bundle/src/RgfxHeapRanges.hpp`), a buffer
 at its length and a texture at the size `HEAP_TEXTURE_SIZE_AND_ALIGN` answers,
 and sends each as a placement at that offset. The heap's `usedSize` and
 `maxAvailableSizeWithAlignment:` answer from those placements.
+
+**The Shared pool.** The device's Shared pool is a range of guest physical
+addresses past the guest's RAM with no RAM under it, which the host fills with
+its own memory a piece at a time as the guest's buffers need it
+(`crates/reims-vgpu/src/pool.rs`; QEMU reserves the range at realize,
+docs/qemu.md "The reims-graphics device"). The device offers it (`POOL`,
+feature bit 57) to an x86-64 guest on a Linux or macOS host where it has a
+pool. A Windows host offers none until the pool's cost under WHP measures
+within 5% of the region's, and an arm64 guest gets none until a boot shows its
+kernel maps such a range, above 2^36, write-back: those guests keep the
+region's slabs and the process's own pages, as the arm64e kext does
+(`kIOReturnUnsupported` for selectors 16 and 17). Where the guest took the
+bit, `POOL_BASE_LO` to `POOL_LENGTH_HI` read the range, the same for the
+device's life, and the x86-64 kext reads it once at its start.
+- **A take.** A slab asks the kext for a block of the bytes it needs
+  (selector 16, `PoolTake`): the kext posts its context's `POOL_TAKE` on ring
+  0 and waits for the answer, `POOL_BLOCK`. The host carves the block from a
+  piece with room, first fit at a multiple of 64 KiB, on the thread that
+  carries the take out, neither allocating nor zeroing there; the context's
+  own worker (`reims-vgpu.graphics-pool-take`) zeroes the block through the
+  host's mapping and answers, first growing the pool by a piece of the take's
+  length where nothing fit. So a context's takes are answered in its order,
+  and never wait behind another context's growth or zeroing. The answer is
+  the block's offset in the pool and its length, the bytes asked for rounded
+  up to 64 KiB, every byte zero, or `REFUSED` where the pool has no room. The
+  kext maps the block into the process, read and write and write-back, as a
+  range of its own, and answers its address, offset and length. The bundle
+  writes none of its zeros again; the slab's buffers are zeroed only where
+  one reuses a range another freed in it. The take happens on the thread
+  whose buffer found no room, and only then: nothing is taken ahead.
+- **No deadline.** The kext waits for a take's answer with no deadline,
+  `THREAD_UNINT`, as it waits for its other asks of the host, whose
+  deadlines are 5 to 60 s. A take ends at its answer, its context's close or
+  the device's reset; the host gives back the block of a take whose context
+  closed first and sends no answer. Where the host stops answering (the
+  library stalled), each taking thread waits holding one of the kext's 32
+  waiters for answers, and a kill of its process completes only once the
+  host answers; the process's other threads, and other processes, go on,
+  their asks ending at their deadlines. A paused VM runs no guest thread. The
+  kext resets the device only at its start, before a process can open it,
+  and at its stop, once every process closed it.
+- **A heap.** The bundle makes each block one Shared Placement heap,
+  `HEAP_OVER_POOL` (an `RgfxHeapOverHostMemory` whose `region_offset` is the
+  block's offset in the pool) at a GPU address it picks, and places the
+  slab's buffers in it. The host makes it over the block's bytes in place, as
+  `HEAP_OVER_HOST_MEMORY` makes one over a region block; a span outside the
+  blocks the sender's context holds is a bad reference. The heap holds the
+  block.
+- **A give.** When the slab's last buffer goes, the bundle destroys its heap
+  and gives the block back (selector 17, `PoolGive`); every call into the
+  kext first posts the destroys the control ring holds, so the heap's
+  destroy goes first. The kext takes the block's mapping out of the process,
+  then posts `POOL_GIVE`, after every message the process posted before. The
+  host refuses it while an object lies in the block, and otherwise answers
+  once every command buffer the context committed has finished, and only then
+  does the block go back to the pool. A context's close takes every mapping
+  out of the process before its `CONTEXT_CLOSE`, which gives back every block
+  the context still holds the same way. The device's reset frees every block
+  at once.
+- **What moves.** Only buffers' slabs: a class's and a large buffer's own,
+  and so every buffer that lies in one, upload chunks and Managed buffers'
+  copies among them. The rings, command buffers' bodies, surface copy
+  blocks, the scanout and the cursor stay in the region, and the ICB slots
+  where they were (the kext's chunks, else the region).
+- **No empty slab kept.** On the Radeon 780M host (an x86-64 macOS guest's
+  boot to its desktop, a window dragged for 31 s, and a GPU benchmark's run,
+  counted by the bundle's slab churn lines), the empty slabs a class kept
+  were taken from again 5 times before the desktop and never in the drag or
+  the benchmark, and no large buffer took a cached slab: keeping them would
+  have saved no take there. The bundle's churn line carries the pool's takes
+  too: blocks taken and given back, takes refused, and how long the takes
+  waited for the host.
 
 **No-copy buffers.** `newBufferWithBytesNoCopy:` over bytes in a block of the
 process's lies over them in place (`BUFFER_OVER_HOST_MEMORY` at their offset).
