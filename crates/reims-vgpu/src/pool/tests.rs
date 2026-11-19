@@ -820,7 +820,10 @@ fn a_block_of_a_source_with_no_addresses_takes_the_hosts_next_pick() {
     // The freed first block's bytes are carved again, at the next pick's address.
     let third = taken(&take(&ledger, 3, TAKE_ALIGN)).unwrap();
     assert_eq!(third.offset, 0);
-    assert_eq!(third.gpu_address, addresses::HOST_BASE + 0x2_8000 + 0x1_8000);
+    assert_eq!(
+        third.gpu_address,
+        addresses::HOST_BASE + 0x2_8000 + 0x1_8000
+    );
     // A reset frees every pick with its carve.
     ledger.reset();
     assert_eq!(ledger.picked(), 0);
@@ -847,7 +850,10 @@ fn a_block_of_a_source_with_addresses_lies_at_its_offset_in_its_piece_s_block() 
     assert_eq!(second.gpu_address, ADDRESSED + TAKE_ALIGN);
     // The rest of the first piece, then the headroom piece, the second block handed out.
     let rest = BLOCK_LEN - 4 * TAKE_ALIGN;
-    assert_eq!(answer(&take(&ledger, 1, rest)), Some((4 * TAKE_ALIGN, rest)));
+    assert_eq!(
+        answer(&take(&ledger, 1, rest)),
+        Some((4 * TAKE_ALIGN, rest))
+    );
     host.wait_for(2);
     pool.added(BASE + BLOCK_LEN).unwrap();
     let next = taken(&take(&ledger, 2, TAKE_ALIGN)).unwrap();
