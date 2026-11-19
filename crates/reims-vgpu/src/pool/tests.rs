@@ -954,3 +954,63 @@ fn a_block_of_a_source_with_addresses_lies_at_its_offset_in_its_piece_s_block() 
     assert_eq!(next.gpu_address, ADDRESSED + BLOCK_LEN);
     assert_eq!(ledger.picked(), 0);
 }
+
+/// A source whose blocks' mappings start `skew` bytes into the host blocks', with the blocks given
+/// back.
+struct Skewed {
+    blocks: HostBlocks,
+    skew: usize,
+    back: Mutex<Vec<BlockId>>,
+}
+
+impl BlockSource for Skewed {
+    fn take_block(&self, class: MemoryClass, len: u64) -> Result<BlockInfo, BlockError> {
+        let mut block = self.blocks.take_block(class, len)?;
+        if let Some(c) = block.contents {
+            // SAFETY: inside the block, which is longer than the skew.
+            block.contents = Some(unsafe { NonNull::new_unchecked(c.as_ptr().add(self.skew)) });
+        }
+        Ok(block)
+    }
+
+    fn release_block(&self, block: BlockId) -> Result<(), BlockError> {
+        self.back.lock().push(block);
+        self.blocks.release_block(block)
+    }
+}
+
+/// A block whose mapping does not start at a host page goes back to the source unmapped, counted
+/// (`rt-pool-block-unaligned`), and the host is asked nothing; one at a page is mapped.
+#[test]
+fn a_block_off_the_host_s_pages_goes_back_unmapped() {
+    let counted = || {
+        (reims_vgpu_vulkan::answer::counted_kinds().into_iter())
+            .find(|&(code, _)| code == UNALIGNED_CODE)
+            .map_or(0, |(_, n)| n)
+    };
+    for (skew, mapped) in [(64, false), (0, true)] {
+        let host = Arc::new(Host::default());
+        let source = Arc::new(Skewed {
+            blocks: HostBlocks::new(),
+            skew,
+            back: Mutex::default(),
+        });
+        let before = counted();
+        let given: Arc<dyn BlockSource> = Arc::clone(&source) as _;
+        let pool = Pool::with_delay(range(4), host.pool_host(), LONG, now(), given).unwrap();
+        pool.grow(BLOCK_LEN);
+        if mapped {
+            assert_eq!(host.wait_for(1), [Call::Add(BASE, BLOCK_LEN)]);
+            assert!(source.back.lock().is_empty());
+            continue;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while source.back.lock().is_empty() {
+            assert!(Instant::now() < deadline, "no block went back");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(source.back.lock().len(), 1);
+        assert!(counted() > before);
+        assert!(host.calls().is_empty());
+    }
+}

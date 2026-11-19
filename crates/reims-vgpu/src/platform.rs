@@ -92,6 +92,15 @@ pub trait ApiPlatform: Platform {
         Box::new(())
     }
 
+    /// The source of the blocks of a graphics device on `device`: the guest's Shared pool's
+    /// (`crate::pool`) and its contexts' Private blocks (`pool::PrivateBlocks`). `None` by
+    /// default, where the pool's blocks are the process's own memory (`pool::HostBlocks`) and a
+    /// Private block is a range of addresses the host picks.
+    fn block_source(&self, device: &Self::Device) -> Option<Arc<dyn crate::pool::BlockSource>> {
+        let _ = device;
+        None
+    }
+
     /// A graphics device's region of `len` bytes (BAR 2, `reims_vgpu_graphics::region::Region`) in
     /// memory of the platform's own: where its GPUs import that better than private anonymous
     /// memory, or where its runtime frees an import of the region's pages after the region's last

@@ -1,6 +1,7 @@
 //! [`RtBlocks`], the pool's [`BlockSource`] over metal2vulkan-rt's blocks (`Device::take_block`
-//! and `release_block`), the runtime the device runs on from the cutover. No path of the
-//! library's makes one before then; its tests run it on the GPU each test host holds, but on the
+//! and `release_block`), the runtime the device runs on from the cutover: the source of the
+//! guest's Shared pool and of its contexts' Private blocks on the rt platform
+//! (`ApiPlatform::block_source`). Its tests run it on the GPU each test host holds, but on the
 //! Mac, whose Vulkan, MoltenVK, rt's floor refuses.
 //!
 //! rt hands out a `Block` handle and takes a block back by its handle, and the pool names a block
@@ -9,6 +10,11 @@
 //! out of the map and gives it to rt, which returns the block's range to the free ranges of the
 //! allocation it was taken from. A later take may land there, under a new number: rt numbers
 //! each take anew.
+//!
+//! **Known blocks.** The source tells the rt platform's device of each block it hands out
+//! ([`KnownBlocks`], the device's set): a pinned buffer or heap the guest places inside one is
+//! that range of the block, at its pin, where it would be made elsewhere at rt's address. A block
+//! is known from its take until just before its handle goes back to rt.
 //!
 //! A block's bytes are undefined, new or taken again: rt zeroes nothing ahead of need, and
 //! nothing here zeroes them. rt maps and unmaps whole allocations through the `BlockMappings`
@@ -19,44 +25,49 @@ use std::collections::HashMap;
 
 use metal2vulkan_rt as rt;
 use parking_lot::Mutex;
+use reims_vgpu_vulkan::rt_platform::KnownBlocks;
 
 use super::{BlockError, BlockId, BlockInfo, BlockSource, MemoryClass};
 
 /// The pool's blocks from an rt device, with the handle of each one handed out.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "rt")),
     expect(
         dead_code,
-        reason = "the pool's source over rt, which no device runs on yet"
+        reason = "the pool's source over rt, which only the rt platform's devices take"
     )
 )]
 pub(crate) struct RtBlocks {
     device: rt::Device,
+    /// The blocks the platform's device knows, where each block handed out is known.
+    known: KnownBlocks,
     /// The handle of each block handed out, by its number.
     held: Mutex<HashMap<BlockId, rt::Block>>,
 }
 
 impl RtBlocks {
-    /// A source of `device`'s blocks, with none handed out.
+    /// A source of `device`'s blocks, with none handed out, each known in `known` (the rt
+    /// platform's device's set) while it is.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "rt")),
         expect(
             dead_code,
-            reason = "the pool's source over rt, which no device runs on yet"
+            reason = "the pool's source over rt, which only the rt platform's devices take"
         )
     )]
-    pub(crate) fn new(device: rt::Device) -> RtBlocks {
+    pub(crate) fn new(device: rt::Device, known: KnownBlocks) -> RtBlocks {
         RtBlocks {
             device,
+            known,
             held: Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl BlockSource for RtBlocks {
-    /// rt's block of `class` at least `len` long. Err: [`BlockError::Length`] past the device's
-    /// largest block (rt's `Limit::BlockLen`); [`BlockError::OutOfMemory`] for rt's every other
-    /// answer: its other limits, a device out of memory or lost, or one quiesced.
+    /// rt's block of `class` at least `len` long, known from now. Err: [`BlockError::Length`] past
+    /// the device's largest block (rt's `Limit::BlockLen`); [`BlockError::OutOfMemory`] for rt's
+    /// every other answer: its other limits, a device out of memory or lost, or one quiesced.
     fn take_block(&self, class: MemoryClass, len: u64) -> Result<BlockInfo, BlockError> {
         let rt_class = match class {
             MemoryClass::Private => rt::MemoryClass::Private,
@@ -73,15 +84,17 @@ impl BlockSource for RtBlocks {
             gpu_address: block.gpu_address,
             contents: block.contents,
         };
+        self.known.know(block.clone());
         self.held.lock().insert(info.id, block);
         Ok(info)
     }
 
-    /// Gives `block`'s handle back to rt, out of the map. Err: [`BlockError::NotHeld`] for a
-    /// number the source did not hand out, or gave back already.
+    /// Gives `block`'s handle back to rt, out of the map, forgotten first. Err:
+    /// [`BlockError::NotHeld`] for a number the source did not hand out, or gave back already.
     fn release_block(&self, block: BlockId) -> Result<(), BlockError> {
         let handle = self.held.lock().remove(&block);
         let handle = handle.ok_or(BlockError::NotHeld)?;
+        drop(self.known.forget(handle.id));
         // The source's own device made it, so rt's one refusal, another device's block, cannot
         // be; rt drops the handle all the same.
         (self.device.release_block(handle)).map_err(|_| BlockError::NotHeld)
@@ -89,10 +102,11 @@ impl BlockSource for RtBlocks {
 }
 
 impl Drop for RtBlocks {
-    /// Gives every block still handed out back to rt, then the device.
+    /// Gives every block still handed out back to rt, each forgotten first, then the device.
     fn drop(&mut self) {
         let held = std::mem::take(self.held.get_mut());
         for block in held.into_values() {
+            drop(self.known.forget(block.id));
             let _ = self.device.release_block(block);
         }
     }
@@ -105,8 +119,9 @@ mod tests {
     const MIB: u64 = 1 << 20;
 
     /// A block is taken from rt and given back by its number alone: the map hands rt its handle,
-    /// and a number not handed out, or given back already, is not held. A long block given back
-    /// is taken again by the next take of its length, under a new number.
+    /// and a number not handed out, or given back already, is not held. A block is known from its
+    /// take until its release, Shared and Private alike. A long block given back is taken again
+    /// by the next take of its length, under a new number.
     #[test]
     #[cfg_attr(
         target_os = "macos",
@@ -115,7 +130,8 @@ mod tests {
     fn on_vulkan_rt_blocks_give_a_block_back_by_its_number() {
         let (device, name) = reims_vgpu_vulkan::seam::test_device().unwrap();
         println!("rt's device: {name}");
-        let blocks = RtBlocks::new(device.clone());
+        let known = KnownBlocks::default();
+        let blocks = RtBlocks::new(device.clone(), known.clone());
         let shared = blocks.take_block(MemoryClass::Shared, MIB).unwrap();
         assert_eq!(shared.class, MemoryClass::Shared);
         assert!(shared.len >= MIB, "{shared:?}");
@@ -130,13 +146,20 @@ mod tests {
             Some(BlockError::Length)
         );
 
+        let is_known = |b: &BlockInfo| {
+            (known.at(b.gpu_address, b.len)).is_some_and(|(k, at)| k.id.get() == b.id.0 && at == 0)
+        };
+        assert!(is_known(&shared) && is_known(&private));
+
         assert_eq!(blocks.release_block(shared.id), Ok(()));
+        assert!(!is_known(&shared) && is_known(&private));
         assert_eq!(blocks.release_block(shared.id), Err(BlockError::NotHeld));
         assert_eq!(
             blocks.release_block(BlockId(u32::MAX)),
             Err(BlockError::NotHeld)
         );
         assert_eq!(blocks.release_block(private.id), Ok(()));
+        assert!(!is_known(&private));
         // A long block takes an allocation of its own. Given back, it is a free range of that
         // allocation at once, which the next take of its length lands in, under a new number:
         // rt counts one long reuse, and the take makes no allocation.

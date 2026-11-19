@@ -43,10 +43,14 @@
 //! # The block source
 //!
 //! [`BlockSource`] is metal2vulkan-rt's block calls as its API names them (`Device::take_block`,
-//! `release_block`, [`BlockInfo`]). Until the device runs on that runtime, the source is
-//! [`HostBlocks`], blocks of the process's own memory, which hands blocks out, keeps them ready
-//! and frees them as the runtime does. The source over the runtime's blocks is `rt_blocks`'s,
-//! which only its tests make until then.
+//! `release_block`, [`BlockInfo`]). On the Vulkan platform the source is [`HostBlocks`], blocks of
+//! the process's own memory, which hands blocks out, keeps them ready and frees them as the
+//! runtime does. On the rt platform it is the runtime's blocks ([`RtBlocks`], the platform's
+//! `ApiPlatform::block_source`), each known to its device while handed out.
+//!
+//! The host maps a block into the guest whole host pages at a time: a block whose mapping does
+//! not start at a host page, or whose length is no whole number of them, goes back to the source
+//! unmapped, counted ([`UNALIGNED_CODE`]), and no piece comes of the ask.
 
 // Guest addresses flow through here: arithmetic is spelt out.
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
@@ -60,11 +64,16 @@ mod takes;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
+use reims_vgpu_vulkan::answer::count_kind;
+use reims_vgpu_vulkan::core::num::ToU64 as _;
 use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
+use reims_vgpu_vulkan::core::platform::os::vm::HostVm as _;
+use reims_vgpu_vulkan::os::OsVm;
 
 pub(crate) use addresses::HostAddresses;
 #[cfg(test)]
@@ -73,11 +82,17 @@ pub(crate) use addresses::{
 };
 pub(crate) use host_blocks::HostBlocks;
 pub(crate) use private_blocks::{PrivateBlocks, PrivateGive, TakeError as PrivateTakeError};
+#[cfg(feature = "rt")]
+pub(crate) use rt_blocks::RtBlocks;
 pub(crate) use takes::{Give, PoolLedger, TAKE_MAX};
 #[cfg(test)]
 use takes::{TAKE_ALIGN, TakeAnswer, Taken};
 
 use crate::Error;
+
+/// The code of a block the source handed out whose mapping is not whole host pages from a host
+/// page, which goes back unmapped (the module doc's "The block source").
+pub const UNALIGNED_CODE: &str = "rt-pool-block-unaligned";
 
 /// A pooled block's length, metal2vulkan-rt's `BLOCK_LEN`: 256 MiB.
 pub const BLOCK_LEN: u64 = 256 << 20;
@@ -708,16 +723,38 @@ impl Shared {
     }
 
     /// Places `block` at the lowest free address that holds it and asks the host to map it: the
-    /// address, or `None` where the block went back, the range full or the pool closed.
+    /// address, or `None` where the block went back, the range full, the pool closed or the
+    /// block not whole host pages ([`UNALIGNED_CODE`]).
     fn place(&self, source: &dyn BlockSource, block: BlockInfo) -> Option<u64> {
-        let mut st = self.state.lock();
-        // A block made while the device was released goes back with no word to the host, which
-        // removed its pieces before the release.
-        let Some(contents) = block.contents.filter(|_| !st.closed) else {
-            drop(st);
+        let Some(contents) = block.contents else {
             let _ = source.release_block(block.id);
             return None;
         };
+        let page = OsVm::new().page_size().max(1);
+        let at = contents.as_ptr().addr();
+        if !(at.to_u64().is_multiple_of(page) && block.len.is_multiple_of(page)) {
+            // The process's first with a line, each counted.
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "pool: block {} of {:#x} bytes at host address {at:#x} is not whole host \
+                     pages of {page:#x} bytes: it goes back unmapped ({UNALIGNED_CODE})",
+                    block.id.0,
+                    block.len,
+                );
+            }
+            count_kind(UNALIGNED_CODE);
+            let _ = source.release_block(block.id);
+            return None;
+        }
+        let mut st = self.state.lock();
+        // A block made while the device was released goes back with no word to the host, which
+        // removed its pieces before the release.
+        if st.closed {
+            drop(st);
+            let _ = source.release_block(block.id);
+            return None;
+        }
         let Some(at) = first_fit(self.range, &st.pieces, block.len) else {
             if !std::mem::replace(&mut st.full_logged, true) {
                 log::warn!(

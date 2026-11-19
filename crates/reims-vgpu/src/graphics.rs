@@ -549,15 +549,20 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let identity = gpu_device.identity_caps();
             // The GPU's memory heaps, summed, which size the guest's Shared pool's range below.
             let memory_heaps = gpu_device.memory_heaps_total();
-            // The guest's Shared pool, its blocks the process's own memory until the device runs
-            // on metal2vulkan-rt, whose blocks then fill it through the same calls. Its range is
-            // what the GPU's memory heaps hold, of the addresses the host can give.
+            // The source of the guest's pool's blocks and of its contexts' Private blocks: the
+            // platform's where it gives blocks (metal2vulkan-rt's), else the process's own memory
+            // for the pool and the host's picks of Private addresses.
+            let block_source = platform.block_source(&gpu_device);
+            // The guest's Shared pool, its blocks the source's. Its range is what the GPU's
+            // memory heaps hold, of the addresses the host can give.
             let shared_pool = match pool_host {
                 Some((room, host)) => match pool_range(room, memory_heaps) {
                     Some(range) => {
                         let clock = Arc::clone(&platform);
                         let now = Box::new(move || clock.clock().now_mono());
-                        Some(Pool::new(range, host, now, Arc::new(HostBlocks::new()))?)
+                        let source = (block_source.clone())
+                            .unwrap_or_else(|| Arc::new(HostBlocks::new()));
+                        Some(Pool::new(range, host, now, source)?)
                     }
                     None => None,
                 },
@@ -895,7 +900,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 reset_gate: Arc::default(),
                 inline_walk_max: AtomicUsize::new(INLINE_WALK_MAX),
                 shared_pool: pool_ledger,
-                private_blocks: PrivateBlocks::new(None),
+                private_blocks: PrivateBlocks::new(block_source),
             });
             let cursors: Vec<Arc<HostCursor>> = (0..count)
                 .map(|display| {

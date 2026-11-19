@@ -21,6 +21,17 @@ impl ApiPlatform for RtPlatform {
         crate::singleton::rt_platform()
     }
 
+    /// rt's blocks (`pool::RtBlocks`), each known to `device` from its take until just before it
+    /// goes back (`KnownBlocks`): the buffers and heaps the guest pins inside its pool's blocks
+    /// and its Private blocks are ranges of them, at the guest's addresses.
+    fn block_source(
+        &self,
+        device: &<Self as Platform>::Device,
+    ) -> Option<Arc<dyn crate::pool::BlockSource>> {
+        let known = device.known_blocks().clone();
+        Some(Arc::new(crate::pool::RtBlocks::new(device.rt().clone(), known)))
+    }
+
     /// The process's default device, or the device whose registry ID is `id`
     /// (`Platform::open_device`).
     fn metal_device(&self, registry_id: Option<u64>) -> Option<<Self as Platform>::Device> {
