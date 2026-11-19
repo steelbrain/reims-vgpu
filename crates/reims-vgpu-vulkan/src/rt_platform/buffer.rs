@@ -72,9 +72,11 @@
 //! answers no `contents` for a dma-buf's block: until it takes the mapping, the device keeps the
 //! host address of the pages the dma-buf holds for it ([`KnownBlocks`]), which a buffer in the
 //! block answers as its `contents` and a pinned buffer over those bytes is a range of, as over a
-//! block rt maps. A Managed buffer over such a block is refused by rt (its block is not one rt
-//! maps), counted ([`MANAGED_OVER_DMA_BUF`]). Each import is counted by the way it was made or
-//! refused ([`IMPORTS_POINTER`], [`IMPORTS_DMA_BUF`], [`IMPORTS_COPIED`], [`IMPORTS_REFUSED`]).
+//! block rt maps. A Managed buffer over such a block is a range of it too, counted
+//! ([`MANAGED_OVER_DMA_BUF`]): where the GPU keeps a device copy, rt fills it by a GPU copy from
+//! the block at the commit that takes the ranges named since, as over any Shared block. Each
+//! import is counted by the way it was made or refused ([`IMPORTS_POINTER`], [`IMPORTS_DMA_BUF`],
+//! [`IMPORTS_COPIED`], [`IMPORTS_REFUSED`]).
 //!
 //! **Pages no pin takes** (Linux). A view of a guest's pages of more than one run may be mapped
 //! through udmabuf's dma-bufs (`crate::os::linux`'s `vm` docs, "Views through dma-bufs"): a
@@ -242,8 +244,8 @@ pub const IMPORTS_COPIED: &str = "rt-imports-copied";
 /// at the refusal point"), counted per import asked, each counted as [`IMPORTS_REFUSED`] too.
 pub const IMPORTS_DMA_BUF_AND_POINTER_REFUSED: &str = "rt-imports-dma-buf-and-pointer-refused";
 
-/// The code of a Managed no-copy buffer asked over a dma-buf's block, which rt refuses as over a
-/// block it does not map (the module's docs, "Dma-bufs of the pages"), counted per buffer.
+/// The code of a Managed no-copy buffer asked over a dma-buf's block, a block rt does not map (the
+/// module's docs, "Dma-bufs of the pages"), counted per buffer.
 pub const MANAGED_OVER_DMA_BUF: &str = "rt-managed-over-dma-buf";
 
 /// The code of the bytes the platform zeroed through a block's mapping: a Managed buffer's own
@@ -2641,10 +2643,10 @@ mod tests {
     /// deallocator run once rt freed the copy. Over pages with a file behind them, the buffer is a
     /// range of rt's import of a dma-buf of them, counted, its `contents` its bytes, which the
     /// CPU's writes and a blit's reach both ways; a known import's block holds a no-copy buffer
-    /// pinned over its bytes, with no import of its own, and a Managed one over them is rt's
-    /// refusal, counted; each release runs once rt freed its import, and the device then forgets
-    /// its mapping. Where the device imports no dma-buf, the buffer is made over a copy, counted,
-    /// and the test says so.
+    /// pinned over its bytes, with no import of its own, and a Managed one over them too, counted,
+    /// its `contents` the bytes; each release runs once rt freed its import, and the device then
+    /// forgets its mapping. Where the device imports no dma-buf, the buffer is made over a copy,
+    /// counted, and the test says so.
     #[cfg(target_os = "linux")]
     #[test]
     fn dma_bufs_of_pages_on_vulkan() {
@@ -2783,7 +2785,7 @@ mod tests {
         assert!(!device.known_blocks().is_dma_buf(id));
 
         // A known import of the pages: a no-copy buffer pinned over its bytes is a range of its
-        // block, with no import of its own; a Managed one is rt's refusal, counted.
+        // block, with no import of its own; so is a Managed one, counted.
         let at = pages.wrapping_add(2 * page + 32);
         let (released, then) = flag();
         let known = import_known(&device, "a test's import", at, 256, then);
@@ -2800,11 +2802,12 @@ mod tests {
         let managed = counted(MANAGED_OVER_DMA_BUF);
         // SAFETY: as above.
         let bytes = unsafe { HostRange::new(at, 64) };
-        let refused = device.new_buffer(pinned(pin, 0x10, Some(bytes)));
-        assert!(refused.expect("never a raise").is_none());
+        let over = device.new_buffer(pinned(pin, 0x10, Some(bytes)));
+        let over = over.expect("never a raise").expect("a Managed buffer in the block");
+        assert_eq!(over.contents(), at);
         assert_eq!(counted(MANAGED_OVER_DMA_BUF), managed + 1);
         assert_eq!(counted(IMPORTS_CODE), imports);
-        drop(made);
+        drop((over, made));
         let id = block.id;
         assert!(device.known_blocks().forget(id).is_some());
         drop(block);
