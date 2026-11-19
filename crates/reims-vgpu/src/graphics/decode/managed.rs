@@ -64,6 +64,15 @@
 //! past a full device-local heap), and lays a buffer whose GPU copy has no room in its bytes, so
 //! its refusal comes only where that memory is gone too.
 //!
+//! **At the copy's address.** Where the guest's driver took `RGFX_FEATURE_MANAGED_AT_COPY`
+//! ([`GraphicsDecoder::set_managed_at_copy`]), which a host offers where the GPU shares the CPU's
+//! memory and the platform keeps pins only in its known blocks, a `MANAGED_BUFFER_CREATE`'s
+//! address is its CPU copy's first byte's: a `Managed` buffer there is its bytes, a range of the
+//! block its copy lies in. A buffer the platform makes at any other address, its copy's bytes in no
+//! block it knows, is refused rather than kept there, so no pointer of the guest's to the buffer
+//! holds an address it is not at: the id stands for a refused object, whose bindings are nil and
+//! whose uses are dropped (`refused`), counted ([`MANAGED_AT_COPY_REFUSED`]), the first logged.
+//!
 //! **After a recovery of the device** (the platform made its lost GPU again,
 //! [`GpuDevice::recoveries`]), a texture of two copies keeps its CPU copy, the guest's bytes, but
 //! the platform carries its GPU copy with its contents lost. Metal documents no loss of a
@@ -74,7 +83,7 @@
 //! are the platform's, and its runtime carries them with the host copy's bytes.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use reims_vgpu_graphics::managed::LinearLayout;
 use reims_vgpu_graphics::ops::RgfxUploadWritten;
@@ -97,6 +106,15 @@ use super::tables::{Entry, GuestBytes};
 use super::{
     DecodeError, Drain, GraphicsDecoder, ObjHandle, op_fault, read, read_at, refusing, texture_desc,
 };
+
+/// The degradation code of a `MANAGED_BUFFER_CREATE` at its CPU copy's address, where the guest
+/// took `MANAGED_AT_COPY`, that the platform made at another (the module doc, "At the copy's
+/// address"): refused, counted per create.
+pub(crate) const MANAGED_AT_COPY_REFUSED: &str = "managed-at-copy-refused";
+
+/// Whether a create refused as [`MANAGED_AT_COPY_REFUSED`] was logged: its line is logged the
+/// first time alone, the rest counted (docs/conventions.md).
+static AT_COPY_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// `MTLStorageModeManaged`.
 pub(super) const STORAGE_MODE_MANAGED: u64 = 1;
@@ -465,7 +483,21 @@ impl<P: Platform> GraphicsDecoder<P> {
         else {
             return Ok(Err(DecodeError::Refused));
         };
-        let live = self.made_as(kind, pin, buffer.gpu_address());
+        let made = buffer.gpu_address();
+        if (self.shared.managed_at_copy).load(Ordering::Acquire) && pin != Some(made) {
+            reims_vgpu_vulkan::answer::count_kind(MANAGED_AT_COPY_REFUSED);
+            if !AT_COPY_LOGGED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    target: "reims_vgpu::graphics", kind:% = MANAGED_AT_COPY_REFUSED;
+                    "the Managed buffer {:#x} at its CPU copy {:#x}'s address {:#x}: the \
+                     platform made it at {made:#x}, so its create is refused \
+                     ({MANAGED_AT_COPY_REFUSED}; the rest are counted)",
+                    m.obj_id, m.cpu_buffer_obj_id, m.gpu_address
+                );
+            }
+            return Ok(Err(DecodeError::Refused));
+        }
+        let live = self.made_as(kind, pin, made);
         let copy = ManagedCopy {
             at: bytes.at,
             length: m.length,
@@ -2055,6 +2087,307 @@ mod tests {
             assert_eq!(r.modified(61, 32, 4), Ok(()));
             assert!(r.synchronize(61, RGFX_BLIT_RESOURCE_BUFFER).unwrap());
         }
+    }
+
+    /// Where the guest's driver took `MANAGED_AT_COPY`, a `MANAGED_BUFFER_CREATE` at its CPU
+    /// copy's address is the buffer there where the platform keeps the pin, and is refused,
+    /// counted ([`MANAGED_AT_COPY_REFUSED`]), where the platform makes the buffer at another
+    /// address (a copy in no block it knows): no buffer stands for the id, at the platform's own
+    /// address or any other. Where the driver did not take it, the buffer is made wherever the
+    /// platform places it, as before.
+    #[test]
+    fn a_managed_buffer_at_its_copy_is_refused_where_the_platform_does_not_keep_the_address() {
+        use reims_vgpu_vulkan::answer::counted_kinds;
+        let count = || {
+            (counted_kinds().into_iter())
+                .find(|&(c, _)| c == MANAGED_AT_COPY_REFUSED)
+                .map_or(0, |(_, n)| n)
+        };
+        let (mut r, ram, page) = pages_rig();
+        r.dec.set_unified_memory(true);
+        let _ = shared_copies(&mut r, &ram, page);
+        let address = |r: &Rig, obj_id: u64| match r.dec.named(obj_id) {
+            Some(ObjHandle::Buffer(b)) => b.gpu_address(),
+            _ => panic!("no buffer {obj_id:#x}"),
+        };
+        let at_copy = |obj_id, cpu, gpu_address| RgfxManagedBufferCreate {
+            gpu_address,
+            ..managed_over(obj_id, cpu, 0x300, MANAGED)
+        };
+        let decode = |r: &mut Rig, m: RgfxManagedBufferCreate| {
+            r.dec.decode_refusing(&r.device, m.as_bytes()).unwrap()
+        };
+
+        // Taken, the pin kept: the buffer at its copy's address, over the pages block's view.
+        r.dec.set_managed_at_copy(true);
+        let before = count();
+        let at = address(&r, 50);
+        assert_eq!(decode(&mut r, at_copy(60, 50, at)), Ok(()));
+        assert_eq!(address(&r, 60), at);
+        assert_eq!(count(), before);
+
+        // Taken, the pin dropped: refused, counted, and no buffer stands for the id.
+        r.p.world().drop_pins(true);
+        let at = address(&r, 41);
+        assert_eq!(
+            decode(&mut r, at_copy(61, 41, at)),
+            Err(DecodeError::Refused)
+        );
+        assert_eq!(count(), before + 1);
+        assert!(!matches!(r.dec.named(61), Some(ObjHandle::Buffer(_))));
+
+        // Not taken: made where the platform places it, as before, and not counted.
+        r.dec.set_managed_at_copy(false);
+        assert_eq!(decode(&mut r, at_copy(62, 41, at)), Ok(()));
+        assert_ne!(address(&r, 62), at);
+        assert_eq!(count(), before + 1);
+    }
+
+    /// The Vulkan crate's metallib of the kernel that reaches a buffer through an address it
+    /// loads from another (its `reach.metal`): it reads the word there, and writes the word after.
+    #[cfg(feature = "rt")]
+    const REACH: &[u8] = include_bytes!("../../../../reims-vgpu-vulkan/metallibs/reach.metallib");
+
+    /// On metal2vulkan-rt's platform, a `Managed` buffer over a slab's CPU copy (a Shared buffer
+    /// in a heap over a block of the guest's Shared pool, at the block's GPU address,
+    /// `POOL_ADDRESSES`) is reached by a kernel through the address the guest holds for it, which
+    /// the kernel loads from an argument buffer, with the buffer made resident. On a GPU that
+    /// shares the CPU's memory the device offers `MANAGED_AT_COPY`, the guest posts its copy's
+    /// address, and the buffer is the copy's bytes there: the kernel reads what the CPU wrote,
+    /// before and after a later CPU write with no `didModifyRange:`, and the CPU reads the
+    /// kernel's write. There a create over a copy the platform placed in no block it knows (a
+    /// buffer over the region, at an address of rt's own and not the guest's) is refused at the
+    /// address the guest posted, counted, with no buffer made at rt's address. On a GPU of its own
+    /// memory no such bit is offered, and the buffer keeps two copies: the kernel reads the GPU's,
+    /// which holds the CPU's bytes as of the first commit after the make, until a
+    /// `didModifyRange:` brings a later write over; and the CPU's bytes keep out the kernel's
+    /// write.
+    #[cfg(feature = "rt")]
+    #[test]
+    fn on_vulkan_rt_s_managed_buffer_is_reached_at_the_address_the_guest_holds() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use reims_vgpu_graphics::wire::{
+            RGFX_CMD_HEAP_OVER_POOL, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_FEATURE_MANAGED_AT_COPY,
+        };
+        use reims_vgpu_vulkan::RtPlatform;
+        use reims_vgpu_vulkan::answer::counted_kinds;
+        use reims_vgpu_vulkan::core::platform::blit::ResourceRef;
+        use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use reims_vgpu_vulkan::core::platform::os::Clock as _;
+        use reims_vgpu_vulkan::core::platform::resource::Library as _;
+
+        use crate::platform::ApiPlatform;
+        use crate::pool::{Pool as SharedPool, PoolConfig, PoolHost};
+
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
+        let platform = RtPlatform::process();
+        let device = platform.metal_device(None).unwrap();
+        let unified = (device.identity_caps().flags.has_unified_memory).unwrap_or(false);
+        let pins = <RtPlatform as ApiPlatform>::PINS_IN_BLOCKS;
+        let offered = crate::graphics::managed_at_copy(unified, pins, true);
+        assert_eq!(offered == RGFX_FEATURE_MANAGED_AT_COPY, unified, "offered on unified alone");
+        let refused = || {
+            (counted_kinds().into_iter())
+                .find(|&(c, _)| c == MANAGED_AT_COPY_REFUSED)
+                .map_or(0, |(_, n)| n)
+        };
+
+        // The guest's Shared pool, its blocks rt's, and one block of context 1's.
+        let source = platform.block_source(&device).expect("rt's blocks");
+        let (added, adds) = mpsc::channel();
+        let host = PoolHost {
+            add: Arc::new(move |at, _, _| {
+                let _ = added.send(at);
+            }),
+            remove: Arc::new(|_, _| {}),
+        };
+        let clock = Arc::clone(&platform);
+        let now = Box::new(move || clock.clock().now_mono());
+        let range = PoolConfig {
+            physical_address: 52 << 30,
+            physical_length: 4 << 30,
+        };
+        let shared_pool = SharedPool::new(range, host, now, source).expect("a pool");
+        let ledger = shared_pool.ledger();
+        assert!(ledger.keep_headroom());
+        let at = adds.recv_timeout(Duration::from_secs(60)).expect("a piece");
+        shared_pool.added(at).unwrap();
+        let (taken, takes) = mpsc::channel();
+        let answer = move |block| {
+            let _ = taken.send(block);
+        };
+        ledger.take(1, 0x1_0000, Box::new(answer)).unwrap();
+        let block = (takes.recv_timeout(Duration::from_secs(60)).unwrap()).expect("a block");
+
+        let size = BLOCKS + 0x10_0000 + RGFX_CURSOR_SPAN;
+        let region = Arc::new(crate::platform::test_region(&*platform, size as usize));
+        let mut dec = GraphicsDecoder::<RtPlatform>::new(Arc::clone(&platform), region);
+        dec.set_unified_memory(unified);
+        dec.set_pins_in_blocks();
+        dec.set_pool(ledger.clone());
+        dec.set_managed_at_copy(offered != 0);
+        let buffer_of = |dec: &GraphicsDecoder<RtPlatform>, obj_id: u64| match dec.named(obj_id) {
+            Some(ObjHandle::Buffer(b)) => b.clone_ref(),
+            _ => panic!("no buffer {obj_id:#x}"),
+        };
+
+        // A copy over the region, which rt places at an address of its own, not the guest's: on
+        // unified memory the guest posts the address it holds, and the create is refused.
+        if unified {
+            const GUEST_ADDRESS: u64 = 0x3_0000_0000;
+            let over = RgfxBufferOverHostMemory {
+                header: header(RGFX_CMD_BUFFER_OVER_HOST_MEMORY),
+                obj_id: 30,
+                gpu_address: GUEST_ADDRESS,
+                region_offset: BLOCKS + 0x8_0000,
+                length: 0x400,
+                options: 0,
+                ..RgfxBufferOverHostMemory::default()
+            };
+            assert_eq!(dec.decode(&device, over.as_bytes()).unwrap(), Ok(()));
+            let placed = buffer_of(&dec, 30).gpu_address();
+            assert_ne!(placed, GUEST_ADDRESS, "rt keeps no pin outside its blocks");
+            let before = refused();
+            let managed = RgfxManagedBufferCreate {
+                gpu_address: GUEST_ADDRESS,
+                ..managed_over(31, 30, 0x100, MANAGED)
+            };
+            let made = dec.decode_refusing(&device, managed.as_bytes()).unwrap();
+            assert_eq!(made, Err(DecodeError::Refused));
+            assert_eq!(refused(), before + 1);
+            assert!(!matches!(dec.named(31), Some(ObjHandle::Buffer(_))));
+        }
+
+        // The slab's copy, at the pool block's address plus its offset.
+        dec.set_context(Some(1));
+        let of_1 = |n: u64| (1 << RGFX_CONTEXT_OBJ_ID_SHIFT) | n;
+        let heap = RgfxHeapOverHostMemory {
+            header: header(RGFX_CMD_HEAP_OVER_POOL),
+            obj_id: of_1(20),
+            gpu_address: block.gpu_address,
+            region_offset: block.offset,
+            size_bytes: 0x1_0000,
+            options: 0,
+            // MTLHeapTypePlacement.
+            heap_type: 1,
+        };
+        assert_eq!(dec.decode(&device, heap.as_bytes()).unwrap(), Ok(()));
+        let copy = RgfxBufferAtOffset {
+            header: header(RGFX_CMD_BUFFER_AT_OFFSET),
+            obj_id: of_1(21),
+            heap_obj_id: of_1(20),
+            offset: 0x1000,
+            length: 0x400,
+            options: 0,
+            reserved_34: 0,
+        };
+        assert_eq!(dec.decode(&device, copy.as_bytes()).unwrap(), Ok(()));
+        let copy = buffer_of(&dec, of_1(21));
+        let copy_at = block.gpu_address + 0x1000;
+        assert_eq!(copy.gpu_address(), copy_at);
+        let words = copy.contents().as_ptr::<u32>();
+        let write = |at: usize, value: u32| {
+            // SAFETY: a word of the copy's 0x400 bytes, written while no command runs.
+            unsafe { words.add(at).write_volatile(value) }
+        };
+        // SAFETY: a word of the copy's 0x400 bytes, read while no command runs.
+        let read = |at: usize| unsafe { words.add(at).read_volatile() };
+        const OLD: u32 = 0x1111_1111;
+        const NEW: u32 = 0x2222_2222;
+        const AFTER: u32 = 0x5a5a_5a5a;
+        const KERNEL: u32 = 0x3333_3333;
+        write(0, OLD);
+        write(1, AFTER);
+
+        // The Managed buffer, at the copy's address where the guest posts it (unified memory),
+        // else where rt places its GPU copy.
+        let posted = if unified { copy_at } else { 0 };
+        let managed = RgfxManagedBufferCreate {
+            gpu_address: posted,
+            ..managed_over(of_1(22), of_1(21), 0x100, MANAGED)
+        };
+        assert_eq!(dec.decode(&device, managed.as_bytes()).unwrap(), Ok(()));
+        let buffer = buffer_of(&dec, of_1(22));
+        if unified {
+            assert_eq!(buffer.gpu_address(), posted, "at the address the guest posted");
+        }
+        let held = buffer.gpu_address();
+
+        let library = device.new_library(REACH).unwrap().unwrap().unwrap();
+        let f = library
+            .new_function(OnFault::Die, "reach")
+            .unwrap()
+            .unwrap();
+        let state = device
+            .new_compute_pipeline_state_for_function(Some(&f))
+            .unwrap()
+            .unwrap();
+        let shared = |length: u64| {
+            device
+                .new_buffer_of_length(OnFault::Die, length, 0)
+                .unwrap()
+                .unwrap()
+        };
+        // The argument buffer holding the address, and the kernel's two words.
+        let (addresses, out) = (shared(8), shared(8));
+        // SAFETY: Shared buffers of 8 bytes, which no command uses yet.
+        unsafe {
+            addresses.contents().as_ptr::<u64>().write(held);
+            out.contents().as_ptr::<u32>().add(1).write(KERNEL);
+        }
+        let queue = device.new_command_queue().unwrap();
+        // What the kernel reads through the address alone.
+        let reach = || {
+            let cb = queue.command_buffer(OnFault::Die).unwrap().unwrap();
+            let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
+            let one = MtlSize::new(1, 1, 1);
+            for cmd in [
+                ComputeCmd::SetComputePipelineState {
+                    state: Some(&state),
+                },
+                ComputeCmd::SetBuffers {
+                    buffers: &[Some(&addresses), Some(&out)],
+                    offsets: &[0, 0],
+                    range: NsRange::new(0, 2),
+                },
+                // MTLResourceUsageRead | MTLResourceUsageWrite.
+                ComputeCmd::UseResources {
+                    resources: &[Some(ResourceRef::Buffer(&buffer))],
+                    usage: 3,
+                },
+                ComputeCmd::DispatchThreads {
+                    threads_per_grid: one,
+                    threads_per_threadgroup: one,
+                },
+                ComputeCmd::EndEncoding,
+            ] {
+                e.encode(OnFault::Die, cmd).unwrap();
+            }
+            cb.commit(OnFault::Die).unwrap();
+            cb.wait_until_completed(OnFault::Die).unwrap();
+            assert!(cb.error().is_none(), "{:?}", cb.error());
+            // SAFETY: a Shared buffer's first word, read after the command buffer completed.
+            unsafe { out.contents().as_ptr::<u32>().read() }
+        };
+        if unified {
+            assert_eq!(reach(), OLD, "the CPU's bytes");
+            assert_eq!(read(1), KERNEL, "the kernel's write, in the CPU's bytes");
+            write(0, NEW);
+            assert_eq!(reach(), NEW, "the CPU's later write, with no didModifyRange");
+        } else {
+            assert_eq!(reach(), OLD, "the GPU's copy, as of the first commit");
+            assert_eq!(read(1), AFTER, "the kernel's write, in the GPU's copy alone");
+            write(0, NEW);
+            assert_eq!(reach(), OLD, "the GPU's copy, before a didModifyRange");
+            (buffer.did_modify_range(OnFault::Die, NsRange::new(0, 4))).unwrap();
+            assert_eq!(reach(), NEW, "the GPU's copy, after a didModifyRange");
+        }
+        drop((buffer, copy, addresses, out));
+        drop(dec);
+        drop(ledger);
+        drop(shared_pool);
     }
 
     /// A `MANAGED_BUFFER_CREATE` that says its CPU copy reads zero from a byte before its length

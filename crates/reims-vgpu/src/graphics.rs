@@ -75,31 +75,31 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_DYNAMIC_LIBRARIES, RGFX_FEATURE_FUNCTION_POINTERS, RGFX_FEATURE_GUEST_TIMES,
     RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS,
     RGFX_FEATURE_ICB_SLOTS_IN_PAGES, RGFX_FEATURE_IMPORT_ADDRESSES,
-    RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
-    RGFX_FEATURE_MANAGED_BUFFER_SLABS, RGFX_FEATURE_MANAGED_TEXTURE_SLABS,
-    RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE, RGFX_FEATURE_PAGES_16K,
-    RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_ANSWERS, RGFX_FEATURE_PIPELINE_KEYS,
-    RGFX_FEATURE_POINTER_MOTION, RGFX_FEATURE_POOL, RGFX_FEATURE_POOL_ADDRESSES,
-    RGFX_FEATURE_PRIVATE_BLOCKS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_RATE_MAPS,
-    RGFX_FEATURE_READ_ONLY_PAGES, RGFX_FEATURE_SCHEDULED_ASK, RGFX_FEATURE_SHARED_EVENT_NAMES,
-    RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
-    RGFX_FEATURE_SURFACE_CACHE_EVERY, RGFX_FEATURE_SURFACE_CACHE_REFUSED,
-    RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_DEFERRED_ASK,
-    RGFX_FEATURE_SURFACE_DEFERRED_CARRY, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
-    RGFX_FEATURE_SURFACE_REFILL, RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA,
-    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_FEATURE_UPLOADS_WRITTEN, RGFX_FEATURE_VT_MESSAGES,
-    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT,
-    RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
-    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION,
-    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_H264_BASELINE,
-    RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10,
-    RGFX_VT_STATUS_MALFORMED, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages,
-    RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor,
-    RgfxEventSignalled, RgfxFunctionPointerState, RgfxHeapOverPages, RgfxIcbState,
-    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineAnswersQuery, RgfxPoolGive,
-    RgfxPoolTake, RgfxPrivateGive, RgfxPrivateTake, RgfxRateMapAnswer, RgfxRateMapState,
-    RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName, RgfxSurfacePages,
-    RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_COPY,
+    RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
+    RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
+    RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_ANSWERS,
+    RGFX_FEATURE_PIPELINE_KEYS, RGFX_FEATURE_POINTER_MOTION, RGFX_FEATURE_POOL,
+    RGFX_FEATURE_POOL_ADDRESSES, RGFX_FEATURE_PRIVATE_BLOCKS, RGFX_FEATURE_PRIVATE_RENDER_STATE,
+    RGFX_FEATURE_RATE_MAPS, RGFX_FEATURE_READ_ONLY_PAGES, RGFX_FEATURE_SCHEDULED_ASK,
+    RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM,
+    RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_EVERY,
+    RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
+    RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
+    RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_SURFACE_REFILL,
+    RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA, RGFX_FEATURE_UNSHARED_QUEUES,
+    RGFX_FEATURE_UPLOADS_WRITTEN, RGFX_FEATURE_VT_MESSAGES, RGFX_RESOURCE_ID_CHUNK,
+    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK,
+    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
+    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RGFX_VIDEO_CODEC_H264,
+    RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH,
+    RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RGFX_VT_STATUS_MALFORMED,
+    RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled,
+    RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
+    RgfxFunctionPointerState, RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader,
+    RgfxPageRun, RgfxPipelineAnswersQuery, RgfxPoolGive, RgfxPoolTake, RgfxPrivateGive,
+    RgfxPrivateTake, RgfxRateMapAnswer, RgfxRateMapState, RgfxSamplerState, RgfxScheduledAsk,
+    RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PoolAnswer,
@@ -728,6 +728,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 } else {
                     u64::from(RGFX_FEATURE_MANAGED_AT_OFFSET)
                 }
+                // A `Managed` buffer at its CPU copy's address ([`managed_at_copy`]).
+                | managed_at_copy(unified_memory, P::PINS_IN_BLOCKS, pool_ledger.is_some())
                 | if pool_ledger.is_some() {
                     RGFX_FEATURE_POOL | RGFX_FEATURE_POOL_ADDRESSES
                 } else {
@@ -3718,6 +3720,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         }
     }
 
+    fn driver_ready(&self, taken: u64) {
+        (self.decoder()).set_managed_at_copy(taken & RGFX_FEATURE_MANAGED_AT_COPY != 0);
+    }
+
     fn pool_take(&self, take: &RgfxPoolTake, answer: PoolAnswer) {
         stepped(|| self.control.take_pool_block(take, answer));
     }
@@ -4662,6 +4668,24 @@ fn scanout_sink<P: ApiPlatform>(
 fn cache_every(shapes: bool, pool: bool) -> u64 {
     if shapes && pool {
         RGFX_FEATURE_SURFACE_CACHE_EVERY
+    } else {
+        0
+    }
+}
+
+/// `MANAGED_AT_COPY` where the GPU shares the CPU's memory (`unified`), the platform keeps a pin
+/// only inside a block it knows (`pins_in_blocks`, [`ApiPlatform::PINS_IN_BLOCKS`]) and the device
+/// offers the Shared pool (`pool`): a `Managed` buffer is then its bytes, at its CPU copy's
+/// address, and every CPU copy lies in a block the platform knows, a slab's in a pool block at the
+/// address the host gave it (`POOL_ADDRESSES`), a no-copy one's in a pages block's view at its
+/// import's (`IMPORT_ADDRESSES`), so the platform keeps the pin. A GPU of its own memory keeps a
+/// `Managed` buffer's GPU copy elsewhere; the Vulkan platform before metal2vulkan-rt pins each
+/// buffer at the guest's pick and refuses a pin inside another buffer's range; and with no pool the
+/// slabs' copies lie in heaps over the region, which no block the platform knows holds: none offers
+/// it, and their guests pick each buffer an address of its own.
+fn managed_at_copy(unified: bool, pins_in_blocks: bool, pool: bool) -> u64 {
+    if unified && pins_in_blocks && pool {
+        RGFX_FEATURE_MANAGED_AT_COPY
     } else {
         0
     }

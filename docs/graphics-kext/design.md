@@ -4938,7 +4938,8 @@ a context's Private objects lie in blocks of GPU addresses the host gives the
 context, rather than in the context's own range: its Private buffers
 (`BUFFER_CREATE`), its heaps that are not Shared (`HEAP_CREATE`) and its
 Managed buffers' GPU copies (`MANAGED_BUFFER_CREATE`,
-`BUFFER_MANAGED_AT_OFFSET`). Every host offers the bit, and both kexts take
+`BUFFER_MANAGED_AT_OFFSET`), but where it took `MANAGED_AT_COPY` ("Managed
+buffers at their copies", below). Every host offers the bit, and both kexts take
 it (kext feature bit 1 << 17 `PrivateBlocks`); the bundle uses blocks where
 its kext sets that bit and the device took the feature.
 - **A take.** Where no block the context holds has room for a pick, the
@@ -4989,9 +4990,9 @@ its kext sets that bit and the device took the feature.
   the guest's picks. A buffer made in a block reads zero from its create, as
   one made in the context's range does.
 - **What the guest sees.** The `gpuAddress` of a Private buffer, a heap that
-  is not Shared and the buffers in it, and a Managed buffer lies in
-  `[2^44, 2^45)` on the Vulkan platform, and wherever the host's device
-  memory lies on metal2vulkan-rt's, rather than in the context's range in
+  is not Shared and the buffers in it, and a Managed buffer (but at its copy,
+  below) lies in `[2^44, 2^45)` on the Vulkan platform, and wherever the
+  host's device memory lies on metal2vulkan-rt's, rather than in the context's range in
   `[2^46, 2^47)`. Shared buffers, the pool's heaps and no-copy buffers keep
   theirs.
 
@@ -5059,7 +5060,8 @@ device took the feature.
   range for it and gives none back at its destroy. A no-copy buffer over the
   same bytes as a live one joins its block, and so lies at the same address.
   A Managed no-copy buffer's CPU copy, the Shared buffer over the pages, lies
-  there; the Managed buffer's own address is its GPU copy's, as before. Where
+  there; the Managed buffer's own address is its GPU copy's, as before, or
+  its CPU copy's where the guest took `MANAGED_AT_COPY`. Where
   the address is 0, the bundle picks one in the context's range, as a guest
   that did not take the bit does. Slabs over the process's own pages keep
   their picks.
@@ -5136,6 +5138,44 @@ guest keeps it only as the fallback, counted by why.
   (`rt-surface-pages-copied`) and logs the first. Runs that are not the
   surface's bytes in whole guest pages, or that the host maps no part of, are
   refused as before.
+
+**Managed buffers at their copies.** Where the guest took `MANAGED_AT_COPY`
+(feature bit 63), a Managed buffer's `gpuAddress` is its CPU copy's: on a GPU
+that shares the CPU's memory a Managed buffer is its bytes, one copy, so the
+address the guest's pointers hold is the address of those bytes. A host offers
+it where its GPU shares the CPU's memory, its platform keeps a pin only inside
+a block it knows (metal2vulkan-rt's), and it offers the Shared pool, whose
+blocks the slabs' copies lie in; both kexts take it (it is carried, with no
+kext feature bit of its own), and the bundle reads it from the device's
+features.
+- **The bundle.** A `MANAGED_BUFFER_CREATE` (a slab's Managed buffer over its
+  Shared copy, and a Managed no-copy buffer over its Shared buffer over the
+  pages) carries the CPU copy's address as its `gpu_address`, the copy's
+  first byte as the copy's create gave it, and the buffer answers that
+  `gpuAddress`. The bundle takes no Private block pick and no pick in the
+  context's range for it, and gives none back at its destroy: the copy's own
+  address goes back with the copy, as before. `BUFFER_MANAGED_AT_OFFSET` is
+  not offered on such a GPU, and stays as it is.
+- **The host.** The platform makes the buffer at that address, a range of the
+  known Shared block its CPU copy lies in: a pool block's, or a pages block's
+  view's import. Where it does not make the buffer at the guest's address (a
+  copy in no block the platform knows, a pin that is not the copy's bytes),
+  the host refuses the create ("Guest input the host refuses"), counted as
+  `managed-at-copy-refused` with its first logged, and never makes the buffer
+  at an address of the platform's own, which the guest's pointers to it would
+  not hold. A guest that did not take the bit is answered as before.
+- **Why not on the Vulkan platform.** There the guest's own pick of a Managed
+  buffer's address is pinned, as every pin is, and a pin inside the range the
+  CPU copy holds would be refused. On a GPU of its own memory a Managed buffer
+  is two copies, and its address its GPU copy's, in a Private block, as
+  before. With no pool the slabs' copies lie in heaps over the region, in no
+  block the platform knows.
+- **What the guest sees.** A Managed buffer's `gpuAddress` equals its CPU
+  copy's: the pool block's address plus the copy's offset, or the pages
+  block's view's import's address plus the pointer's offset in its page,
+  where it lay in a Private block before, at an address the platform did not
+  keep. An argument buffer or a `set*Bytes` word holding it reaches the
+  buffer's bytes.
 
 **A buffer's escaped identity.** The host reads a no-copy buffer's bytes in
 place: one over bytes in a block of the process's (`BUFFER_OVER_HOST_MEMORY`),

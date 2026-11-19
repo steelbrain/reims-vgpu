@@ -810,6 +810,10 @@ pub(crate) struct Shared<P: Platform> {
     /// the decoder counts each pin it did not keep by the kind of object ([`unkept`],
     /// [`GraphicsDecoder::set_pins_in_blocks`]).
     pins_in_blocks: AtomicBool,
+    /// Whether the guest's driver took `MANAGED_AT_COPY`, where a `Managed` buffer's pin is its
+    /// CPU copy's address, which the platform keeps or the create is refused
+    /// ([`GraphicsDecoder::set_managed_at_copy`]).
+    managed_at_copy: AtomicBool,
     /// The views of the IOSurfaces whose blocks name their own guest pages ([`surface_pages`]).
     surface_views: Mutex<surface_pages::SurfaceViews<P>>,
     /// Held while a context's lane moves buffers into regroups' views, so that one context's
@@ -1210,6 +1214,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             unified_memory: AtomicBool::new(false),
             max_buffer_length: AtomicU64::new(0),
             pins_in_blocks: AtomicBool::new(false),
+            managed_at_copy: AtomicBool::new(false),
             surface_views: Mutex::new(surface_pages::SurfaceViews::new(None, None)),
             regroup_moves: Mutex::new(()),
             block_lives: Mutex::new(HashMap::new()),
@@ -1393,6 +1398,15 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// device places at the guest's own pick ([`unkept`]).
     pub(crate) fn set_pins_in_blocks(&self) {
         (self.shared.pins_in_blocks).store(true, Ordering::Release);
+    }
+
+    /// Tells the decoder whether the guest's driver took `MANAGED_AT_COPY`
+    /// (`RGFX_FEATURE_MANAGED_AT_COPY`): set as the driver becomes ready, before its first
+    /// message (`device::Host::driver_ready`). Where it did, a `MANAGED_BUFFER_CREATE`'s address
+    /// is its CPU copy's, and a create the platform does not make there is refused
+    /// (`managed::MANAGED_AT_COPY_REFUSED`).
+    pub(crate) fn set_managed_at_copy(&self, taken: bool) {
+        (self.shared.managed_at_copy).store(taken, Ordering::Release);
     }
 
     /// Counts an object of `kind` the guest pinned at `pin`, made at `made` ([`unkept::made`]):

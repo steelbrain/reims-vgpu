@@ -14355,6 +14355,48 @@ fn surface_cache_every_is_offered_only_with_the_per_shape_form_and_the_pool() {
     assert_eq!(offered & RGFX_FEATURE_SURFACE_CACHE_EVERY, 0);
 }
 
+/// `MANAGED_AT_COPY` is offered only where the GPU shares the CPU's memory, the platform keeps a
+/// pin only in a block it knows and the device offers the Shared pool: metal2vulkan-rt's platform
+/// on such a GPU, with the pool. Never on the Vulkan platform before it, which pins each buffer
+/// at the guest's pick, with the pool or without, on any GPU; never on a GPU of its own memory,
+/// whose `Managed` buffers keep two copies; never without the pool; and never by the fake
+/// platform, which keeps every pin.
+#[test]
+fn managed_at_copy_is_offered_only_on_a_unified_gpu_of_rt_with_the_pool() {
+    let old = <reims_vgpu_vulkan::VulkanPlatform as ApiPlatform>::PINS_IN_BLOCKS;
+    assert!(!old);
+    for (unified, pool) in [(false, false), (false, true), (true, false), (true, true)] {
+        assert_eq!(managed_at_copy(unified, old, pool), 0, "{unified} {pool}");
+    }
+    #[cfg(feature = "rt")]
+    {
+        let rt = <reims_vgpu_vulkan::RtPlatform as ApiPlatform>::PINS_IN_BLOCKS;
+        assert!(rt);
+        assert_eq!(managed_at_copy(true, rt, true), RGFX_FEATURE_MANAGED_AT_COPY);
+        assert_eq!(managed_at_copy(false, rt, true), 0, "two copies");
+        assert_eq!(managed_at_copy(false, rt, false), 0, "two copies, no pool");
+        assert_eq!(managed_at_copy(true, rt, false), 0, "no pool");
+    }
+    assert_eq!(managed_at_copy(true, true, true), RGFX_FEATURE_MANAGED_AT_COPY);
+    // The fake platform answers a GPU that shares the CPU's memory: with the pool, no such bit.
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            pool_add: Some(Arc::new(|_, _, _| {})),
+            pool_remove: Some(Arc::new(|_, _| {})),
+            ..GraphicsCallbacks::default()
+        },
+        pool: Some(PoolConfig {
+            physical_address: 52 << 30,
+            physical_length: 4 << 30,
+        }),
+        guest_arch: GuestArch::X86_64,
+        ..GraphicsConfig::default()
+    };
+    let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+    let offered = u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32;
+    assert_eq!(offered & RGFX_FEATURE_MANAGED_AT_COPY, 0);
+}
+
 /// An x86-64 guest that took `POOL_ADDRESSES` beside `POOL` is answered each block's GPU address:
 /// on a platform whose pool blocks have none, the host's picks from 2^45 up, each block's span
 /// its pages and a guard page on the 32 KiB granule; a heap over the block at that address is
