@@ -511,10 +511,10 @@ if [[ -n $ssh_s ]]; then
     # The host logs each display flip (reims_vgpu::graphics::shown, which this run names at
     # debug); those during the probe's call are WindowServer's own
     # presents, the rate the probe's frames can reach the display at.
-    p0=$(host_pressure) q0=$(wc -l < "$out/qemu.log") t0=$SECONDS
+    p0=$(host_pressure) q0=$(wc -l < "$out/qemu.log") probe_t0=$SECONDS
     probe=$(G 90 "echo '$GUEST_PASS' | sudo -S -p '' launchctl asuser \$(id -u) sudo -u \$(id -un) perl -e 'alarm shift @ARGV; exec @ARGV' $((80 * slow)) \$HOME/ambrosia-check/present_probe -t 10 -v 60" |
       grep '^present_probe:' | head -1)
-    flips=$(tail -n +"$((q0 + 1))" "$out/qemu.log" | grep -c -E 'the display shows IOSurface [1-9]') secs=$((SECONDS - t0))
+    flips=$(tail -n +"$((q0 + 1))" "$out/qemu.log" | grep -c -E 'the display shows IOSurface [1-9]') secs=$((SECONDS - probe_t0))
     ws_say="WindowServer: $flips display flips in the probe's ${secs} s call ($(perl -e 'printf "%.1f", $ARGV[0] / ($ARGV[1] || 1)' "$flips" "$secs")/s)"
     [[ -n $p0 ]] && ws_say="$ws_say; host over it: $(host_pressure_say "$p0" "$(host_pressure)" "$secs")"
     # report.py's bar for the correctness boot: frames presented, and at most a tenth lost, a
