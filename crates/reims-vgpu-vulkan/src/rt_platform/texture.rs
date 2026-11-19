@@ -43,6 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use metal2vulkan_rt as rt;
 
 use crate::core::num::ToUsize as _;
+use crate::core::platform::Handle as _;
 use crate::core::platform::Platform;
 use crate::core::platform::host_range::HostRange;
 use crate::core::platform::resource::{GpuResource, Texture};
@@ -157,8 +158,8 @@ impl RtTexture {
             return refused_metal(sel, &format!("pixel format {pixel_format}"));
         };
         let raw_type = texture_type.unwrap_or(u64::from(d.texture_type.as_raw()));
-        let Some(view_type) = (u32::try_from(raw_type).ok())
-            .and_then(|raw| rt::TextureType::try_from(raw).ok())
+        let Some(view_type) =
+            (u32::try_from(raw_type).ok()).and_then(|raw| rt::TextureType::try_from(raw).ok())
         else {
             return refused_metal(sel, &format!("texture type {raw_type}"));
         };
@@ -183,14 +184,15 @@ impl RtTexture {
                 None => return refused_metal(sel, &format!("the swizzle {s:?}")),
             },
         };
-        let (index, own) = self.device.index_for(sel, reaches(d.usage), resource_index)?;
+        let (index, own) = self
+            .device
+            .index_for(sel, reaches(d.usage), resource_index)?;
         let made = match channels {
-            None => self.rt.new_texture_view(format, view_type, levels, slices, index),
-            Some(channels) => {
-                (self.rt).new_texture_view_with_swizzle(
-                    format, view_type, levels, slices, channels, index,
-                )
-            }
+            None => self
+                .rt
+                .new_texture_view(format, view_type, levels, slices, index),
+            Some(channels) => (self.rt)
+                .new_texture_view_with_swizzle(format, view_type, levels, slices, channels, index),
         };
         let usage = match swizzle {
             Some(s) if s != DEFAULT_SWIZZLE => self.usage & SWIZZLED_VIEW_KEEPS,
@@ -556,7 +558,15 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
     ) -> RaiseResult<Option<RtObj<RtTexture>>> {
         let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:";
         let (levels, slices) = (Some(level_range), Some(slice_range));
-        Ok(self.view(sel, pixel_format, Some(texture_type), levels, slices, None, 0))
+        Ok(self.view(
+            sel,
+            pixel_format,
+            Some(texture_type),
+            levels,
+            slices,
+            None,
+            0,
+        ))
     }
 
     fn new_swizzled_texture_subview(
@@ -570,7 +580,15 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
         let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:";
         let (levels, slices) = (Some(level_range), Some(slice_range));
         let texture_type = Some(texture_type);
-        Ok(self.view(sel, pixel_format, texture_type, levels, slices, Some(swizzle), 0))
+        Ok(self.view(
+            sel,
+            pixel_format,
+            texture_type,
+            levels,
+            slices,
+            Some(swizzle),
+            0,
+        ))
     }
 
     fn new_swizzled_texture_subview_at_index(
@@ -585,7 +603,15 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
         let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:resourceIndex:";
         let (levels, slices) = (Some(levels), Some(slices));
         let (texture_type, swizzle) = (Some(texture_type), Some(swizzle));
-        Ok(self.view(sel, pixel_format, texture_type, levels, slices, swizzle, resource_index))
+        Ok(self.view(
+            sel,
+            pixel_format,
+            texture_type,
+            levels,
+            slices,
+            swizzle,
+            resource_index,
+        ))
     }
 
     fn new_texture_subview_at_index(
@@ -599,7 +625,15 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
         let sel = "newTextureViewWithPixelFormat:textureType:levels:slices:resourceIndex:";
         let (levels, slices) = (Some(levels), Some(slices));
         let texture_type = Some(texture_type);
-        Ok(self.view(sel, pixel_format, texture_type, levels, slices, None, resource_index))
+        Ok(self.view(
+            sel,
+            pixel_format,
+            texture_type,
+            levels,
+            slices,
+            None,
+            resource_index,
+        ))
     }
 
     fn pixel_format(&self) -> u64 {
@@ -624,9 +658,11 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
         bytes_per_row: u64,
         bytes_per_image: u64,
     ) -> RaiseResult<()> {
-        let (Some(r), Ok(level), Ok(slice)) =
-            (rt_region(region), u32::try_from(level), u32::try_from(slice))
-        else {
+        let (Some(r), Ok(level), Ok(slice)) = (
+            rt_region(region),
+            u32::try_from(level),
+            u32::try_from(slice),
+        ) else {
             let why = format!("the region {region:?} of level {level} and slice {slice}");
             refused_as(REPLACE, RtRefusal::Refused, &why);
             return Ok(());
@@ -804,11 +840,18 @@ mod tests {
             ..small
         };
         let target = make(&target).expect("a render target");
-        assert_eq!((index(&target), target.gpu_resource_id() & 0xffff_ffff), (0, 0));
+        assert_eq!(
+            (index(&target), target.gpu_resource_id() & 0xffff_ffff),
+            (0, 0)
+        );
         let unknown = make(&TextureDesc { usage: 0, ..small }).expect("a texture");
         assert_eq!(unknown.usage(), UNKNOWN_ANSWERS);
         assert_ne!(index(&unknown), 0);
-        let dropped = make(&TextureDesc { usage: 0x9, ..small }).expect("a texture");
+        let dropped = make(&TextureDesc {
+            usage: 0x9,
+            ..small
+        })
+        .expect("a texture");
         assert_eq!(dropped.usage(), 0x1);
 
         let array = TextureDesc {
@@ -820,11 +863,18 @@ mod tests {
         let array = make(&array).expect("a 2D array");
         let srgb = array.new_texture_view(71).expect("never a raise");
         let srgb = srgb.expect("an sRGB view");
-        assert_eq!((srgb.pixel_format(), srgb.array_length(), srgb.usage()), (71, 4, 0x15));
-        let at = array.new_texture_view_at_index(70, 8).expect("never a raise");
+        assert_eq!(
+            (srgb.pixel_format(), srgb.array_length(), srgb.usage()),
+            (71, 4, 0x15)
+        );
+        let at = array
+            .new_texture_view_at_index(70, 8)
+            .expect("never a raise");
         assert_eq!(at.as_ref().map(index), Some(8));
         let (level, slice) = (NsRange::new(0, 1), NsRange::new(2, 1));
-        let one = array.new_texture_subview(70, 2, level, slice).expect("never a raise");
+        let one = array
+            .new_texture_subview(70, 2, level, slice)
+            .expect("never a raise");
         let one = one.expect("a slice's 2D view");
         assert_eq!((one.texture_type(), one.array_length()), (2, 1));
         let swizzle = Swizzle {
@@ -859,7 +909,13 @@ mod tests {
         assert_eq!(private.storage_mode(), 2);
         assert_eq!(private.replace_region(region, 0, 0, pixels, 16, 0), Ok(()));
         assert_eq!(counted(RtRefusal::Refused.code()), metal + 1);
-        assert!(make(&TextureDesc { texture_type: 99, ..small }).is_none());
+        assert!(
+            make(&TextureDesc {
+                texture_type: 99,
+                ..small
+            })
+            .is_none()
+        );
         assert_eq!(counted(RtRefusal::Refused.code()), metal + 2);
     }
 }
