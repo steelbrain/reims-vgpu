@@ -6676,8 +6676,8 @@ struct Staging<P: Platform> {
     /// Where the caches' copies are staged, the clock that times the copy into the pages
     /// ([`DOWNLOADS`]).
     timed: Option<Now>,
-    /// Where the buffer goes once the copy is done.
-    spares: Arc<Spares<P>>,
+    /// Where the buffer goes once the copy is done; `None` lets go of it.
+    spares: Option<Arc<Spares<P>>>,
 }
 
 impl<P: Platform> Staging<P> {
@@ -6695,7 +6695,9 @@ impl<P: Platform> Staging<P> {
             }
         }
         let Staging { buffer, spares, .. } = self;
-        spares.give(buffer);
+        if let Some(spares) = spares {
+            spares.give(buffer);
+        }
     }
 }
 
@@ -6899,7 +6901,7 @@ fn copy<P: Platform>(
                 buffer,
                 into,
                 timed,
-                spares: Arc::clone(spares),
+                spares: Some(Arc::clone(spares)),
             });
         }
         if cache.pages.is_none()
@@ -6928,10 +6930,13 @@ fn copy<P: Platform>(
                 FILLS.copied(from);
                 FILLS.took(now, at);
             }
+            // A buffer of the carried pages' length, which no take of the cache's length
+            // would match: let go of once done.
             staged = Some(Staging {
                 buffer,
                 into: None,
                 timed: None,
+                spares: None,
             });
         }
     }
