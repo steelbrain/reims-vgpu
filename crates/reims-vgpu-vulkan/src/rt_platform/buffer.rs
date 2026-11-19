@@ -1523,7 +1523,9 @@ mod tests {
             &descriptor(20, 8, 4),
             plane(0, 32, Some(facts)),
         );
-        let luma = made.expect("never a raise").expect("a texture over an import's plane 0");
+        let luma = made
+            .expect("never a raise")
+            .expect("a texture over an import's plane 0");
         let copied = || {
             let made = queue.command_buffer(on).expect("never a raise");
             let made = made.expect("a command buffer");
