@@ -802,3 +802,51 @@ mod tests {
         }
     }
 }
+
+/// The rt platform's surfaces over the Direct3D 11 textures that reims-vgpu-video's plane draws
+/// make, on the Windows host.
+#[cfg(all(test, windows, feature = "rt"))]
+mod rt_windows_tests {
+    use reims_vgpu_vulkan::RtPlatform;
+    use reims_vgpu_vulkan::core::platform::resource::Texture as _;
+
+    use super::*;
+
+    /// A video cache's planes over the plane draws' textures, of 8-bit and of 16-bit samples, are
+    /// a surface the rt platform makes: two planes of the cache's plane formats, the luma's size
+    /// and the chroma's half of it (the module doc).
+    #[test]
+    #[ignore = "needs Direct3D 11 on the rt device's GPU: run on the Windows host"]
+    fn the_rt_platform_makes_a_surface_over_the_plane_draws_textures() {
+        let platform = Arc::new(RtPlatform::new());
+        crate::entry::run(|_| {
+            let device = platform.system_default_device().expect("an rt device");
+            let draw = reims_vgpu_video::vaapi::PlaneDraw::new(device.host_gpu().luid)
+                .expect("the plane draws on the device's adapter");
+            let draw = Arc::new(draw);
+            let sizes: [(u64, u64); 2] = [(64, 48), (32, 24)];
+            for ((texel, views), (_, elements)) in PLANE_FORMATS.iter().zip(&DRAWN_FORMATS) {
+                let drawn = DrawnPlanes::new(&draw, (64, 48), *texel == 2).expect("the textures");
+                let targets = drawn.targets();
+                let handles = [targets.luma_handle(), targets.chroma_handle()];
+                let planes: [D3d11PlaneDesc<'_>; 2] = std::array::from_fn(|n| D3d11PlaneDesc {
+                    handle: handles[n],
+                    image_format: elements[n],
+                    pixel_format: views[n],
+                    width: sizes[n].0,
+                    height: sizes[n].1,
+                    usage: PLANE_USAGE,
+                });
+                let made = (device.import_d3d11_surface(ON, &planes))
+                    .expect("no raise")
+                    .expect("a surface over the textures");
+                assert_eq!(made.planes.len(), 2, "{texel}-byte samples");
+                for (n, plane) in made.planes.iter().enumerate() {
+                    let made_as = (plane.width(), plane.height(), plane.pixel_format());
+                    let asked = (sizes[n].0, sizes[n].1, views[n]);
+                    assert_eq!(made_as, asked, "plane {n} of {texel}-byte samples");
+                }
+            }
+        });
+    }
+}

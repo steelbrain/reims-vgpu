@@ -4,11 +4,10 @@
 //! keep a two-plane surface's planes in such textures, so a picture lands in the images that the
 //! guest's textures are views of (reims-vgpu's `surface_cache::exported`).
 //!
-//! **The call is a stub.** rt's `Device::import_d3d11_surface` is not in the pinned runtime yet.
-//! [`import_d3d11_surface`] stands in for it with the provisional signature and refuses every
-//! surface. Swapping in the real call is that one function and [`D3d11Plane`], which becomes
-//! rt's own type. Until then every surface is refused and counted, and the caller keeps the
-//! planes in images of its own, where the host's video lands its pictures by the CPU's copy.
+//! **The call** is rt's `Device::import_d3d11_surface`, one `rt::D3d11Plane` a plane. Where rt
+//! refuses it (a device that imports no Direct3D 11 texture, a plane whose formats or usage its
+//! import does not take), the surface is refused and counted, and the caller keeps the planes in
+//! images of its own, where the host's video lands its pictures by the CPU's copy.
 //!
 //! **The planes.** Each plane is a 2D texture of the plane's format and size, at no resource
 //! index, over the Direct3D texture its handle names. rt imports each one as a dedicated
@@ -25,7 +24,6 @@
 //! ([`D3D11_SURFACE_REFUSED_CODE`]). The process's first refusal also writes a line naming rt's
 //! error and the planes.
 
-use std::os::windows::io::BorrowedHandle;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -56,45 +54,6 @@ const STORAGE_PRIVATE: u64 = 2 << 4;
 
 /// Whether the process has refused a surface yet.
 static REFUSED_SAID: AtomicBool = AtomicBool::new(false);
-
-/// One plane of a surface over Direct3D 11 textures, as rt's provisional `D3d11Plane` takes it
-/// (the module doc's stub).
-struct D3d11Plane<'a> {
-    /// The shared texture's NT handle, borrowed for the call.
-    handle: BorrowedHandle<'a>,
-    /// The texture's element format: `R8Unorm` or `R16Unorm` for luma, `R16Uint` or `R32Uint`
-    /// for chroma.
-    image_format: rt::PixelFormat,
-    /// The plane's texture: its view format (`R8Unorm`, `RG8Unorm`, `R16Unorm`, `RG16Unorm`),
-    /// width, height and usage.
-    descriptor: rt::TextureDescriptor,
-    /// The texture's index, as `PlaneSpec::index`.
-    index: Option<u32>,
-}
-
-/// Why the stub refuses every surface.
-const NO_IMPORT: &str = "the pinned metal2vulkan-rt has no Device::import_d3d11_surface yet";
-
-/// rt's `Device::import_d3d11_surface` of `planes` on `device`, stubbed (the module doc): it
-/// refuses every surface, saying what it was asked.
-fn import_d3d11_surface(
-    device: &rt::Device,
-    planes: &[D3d11Plane<'_>],
-) -> Result<rt::Surface, String> {
-    let _ = device;
-    let asked: Vec<String> = (planes.iter())
-        .map(|plane| {
-            let D3d11Plane {
-                handle,
-                image_format,
-                descriptor,
-                index,
-            } = plane;
-            format!("{handle:?} of {image_format:?} as {descriptor:?} at {index:?}")
-        })
-        .collect();
-    Err(format!("{NO_IMPORT} ({})", asked.join("; ")))
-}
 
 /// What a surface over Direct3D 11 textures keeps: rt's surface, which holds the planes'
 /// images.
@@ -132,8 +91,8 @@ fn rt_format(what: &str, format: u64) -> Result<rt::PixelFormat, String> {
 fn plane_spec<'a>(
     plane: &D3d11PlaneDesc<'a>,
     texture: &TextureDesc,
-) -> Result<D3d11Plane<'a>, String> {
-    Ok(D3d11Plane {
+) -> Result<rt::D3d11Plane<'a>, String> {
+    Ok(rt::D3d11Plane {
         handle: plane.handle,
         image_format: rt_format("element format", plane.image_format)?,
         descriptor: rt_texture_descriptor(texture)?,
@@ -176,7 +135,7 @@ pub(super) fn imported_surface(
         }
         textures.push(texture);
     }
-    let surface = match import_d3d11_surface(device.rt(), &specs) {
+    let surface = match device.rt().import_d3d11_surface(&specs) {
         Ok(surface) => surface,
         Err(error) => {
             refused(planes, &error);
@@ -195,6 +154,8 @@ pub(super) fn imported_surface(
 
 #[cfg(test)]
 mod tests {
+    use std::os::windows::io::BorrowedHandle;
+
     use super::*;
     use crate::core::platform::device::GpuDevice as _;
     use crate::core::raise::OnFault;
@@ -205,15 +166,16 @@ mod tests {
             .map_or(0, |(_, n)| n)
     }
 
-    /// Until the pinned rt imports Direct3D 11 textures, a surface over two of them is refused
-    /// and counted, for the host's video to land its pictures another way (the module doc's
-    /// stub).
+    /// A surface rt refuses is counted, for the host's video to land its pictures another way
+    /// (the module doc): here a luma plane of 2-byte elements viewed as `R8Unorm`, whose texel
+    /// is 1 byte, which rt refuses before it reads the plane's handle.
     #[test]
-    fn a_surface_over_direct3d_11_textures_is_refused_until_rt_imports_one_on_vulkan() {
+    fn a_surface_rt_refuses_is_counted_for_another_landing_on_vulkan() {
         let platform = RtPlatform::new();
         let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
-        // SAFETY: -1 is the current process's pseudo-handle, which is never closed; the stub
-        // opens no handle.
+        // SAFETY: -1 is the current process's pseudo-handle, which is never closed; rt refuses
+        // the luma plane's formats, or a device that imports no Direct3D 11 texture, before it
+        // reads a handle.
         let handle =
             unsafe { BorrowedHandle::borrow_raw(std::ptr::without_provenance_mut(usize::MAX)) };
         let plane = |image_format, pixel_format, width, height| D3d11PlaneDesc {
@@ -224,7 +186,7 @@ mod tests {
             height,
             usage: 0x1 | 0x4 | 0x10,
         };
-        let planes = [plane(10, 10, 64, 64), plane(23, 30, 32, 32)];
+        let planes = [plane(20, 10, 64, 64), plane(23, 30, 32, 32)];
         let before = counted(D3D11_SURFACE_REFUSED_CODE);
         let made = device.import_d3d11_surface(OnFault::Return, &planes);
         assert!(matches!(made, Ok(None)));
