@@ -889,6 +889,9 @@ pub(crate) struct Private<P: Platform> {
     /// bytes.
     regrouped: Option<regroup::Member>,
     retired: Vec<Arc<SurfaceView<P>>>,
+    /// Its runs in the coverage of the live blocks' imports, from its import's making or taking
+    /// until it goes ([`overlaps`]): none for a block with no import.
+    covered: Option<overlaps::Covered>,
 }
 
 /// What makes the view of a block named by its runs (the module doc): its runs, checked, the
@@ -981,6 +984,8 @@ pub(crate) struct SurfaceViews<P: Platform> {
     waiting: HashMap<u32, u64>,
     /// The regroups of lone views ("Regroups", [`regroup`]).
     regroups: regroup::Regroups<P>,
+    /// The guest RAM the live pages blocks' imports cover ([`overlaps`]).
+    coverage: Arc<Mutex<overlaps::Coverage>>,
 }
 
 /// What a `SURFACE_PAGES` found under the views' lock ([`SurfaceViews::surface_pages`]).
@@ -1028,6 +1033,7 @@ impl<P: Platform> SurfaceViews<P> {
             handed: HashMap::new(),
             waiting: HashMap::new(),
             regroups: regroup::Regroups::default(),
+            coverage: Arc::default(),
         }
     }
 
@@ -1270,6 +1276,7 @@ impl<P: Platform> SurfaceViews<P> {
                         queued: false,
                         regrouped: None,
                         retired: Vec::new(),
+                        covered: None,
                     },
                 );
                 Ok(())
@@ -1707,9 +1714,13 @@ impl<P: Platform> SurfaceViews<P> {
             drop((view, import));
             return Ok(None);
         };
+        let imported = import.is_some();
         p.view = Some((Arc::clone(&view), import));
         p.made = Some(clock.now_mono());
         v.counts.private += 1;
+        if imported {
+            v.cover(block);
+        }
         Ok(Some(view))
     }
 
@@ -1728,11 +1739,28 @@ impl<P: Platform> SurfaceViews<P> {
         let view = Arc::clone(&cached.view);
         let import = cached.import.as_ref().map(|import| import.clone_ref());
         self.cache.push_back(cached);
+        // A read-only block's buffers lie over copies of its pages, never in the import.
+        let imported = import.is_some() && !read_only;
         if let Some(p) = self.private.get_mut(&block) {
             p.view = Some((Arc::clone(&view), import));
         }
         self.counts.private_reused += 1;
+        if imported {
+            self.cover(block);
+        }
         Some(view)
+    }
+
+    /// The pages block at `block`, whose view's import was just made or taken, counted where its
+    /// runs meet another live block's ([`overlaps`]); its runs then cover their pages until it
+    /// goes. Once a block.
+    fn cover(&mut self, block: u64) {
+        let coverage = &self.coverage;
+        if let Some(p) = self.private.get_mut(&block)
+            && p.covered.is_none()
+        {
+            p.covered = Some(overlaps::cover(coverage, &p.runs));
+        }
     }
 
     /// A view of `runs`, `length` bytes, through the views' memory map, mapped with `views`
@@ -1967,6 +1995,7 @@ impl<P: Platform> SurfaceViews<P> {
                 (Some(p), Some(import)) => {
                     p.view = Some((view, Some(import)));
                     grouped += 1;
+                    v.cover(block);
                 }
                 (Some(p), None) => p.mapped = Some(view),
                 (None, import) => gone.push((view, import)),
@@ -2917,6 +2946,7 @@ impl<P: Platform> OwnPages<P> {
 
 #[cfg(test)]
 pub(super) mod costs;
+pub(crate) mod overlaps;
 pub(crate) mod regroup;
 
 #[cfg(test)]
