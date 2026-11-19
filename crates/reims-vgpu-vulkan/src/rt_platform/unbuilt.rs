@@ -76,10 +76,6 @@ pub enum Unbuilt {
     Icb,
     /// Dynamic libraries (`newDynamicLibrary:error:`): rt has none. A creation answers nil.
     DynamicLibrary,
-    /// Apple's private description of a pixel format (`MTLPixelFormatGetInfoForDevice`) and
-    /// layout of a texture level (`MTLGetTextureLevelInfoForDeviceWithOptions`), which rt answers
-    /// none of: each answers as Metal does for a value it describes no format for, every word 0.
-    FormatInfo,
     /// A reservation of resource indices of a type core never reserves (other than 0, 1 and 5).
     /// It reserves nothing.
     ResourceType,
@@ -87,7 +83,7 @@ pub enum Unbuilt {
 
 impl Unbuilt {
     /// Every piece, once, in the order of their codes' places.
-    pub const ALL: [Unbuilt; 21] = [
+    pub const ALL: [Unbuilt; 20] = [
         Unbuilt::Buffer,
         Unbuilt::HostImport,
         Unbuilt::Texture,
@@ -107,7 +103,6 @@ impl Unbuilt {
         Unbuilt::RateMap,
         Unbuilt::Icb,
         Unbuilt::DynamicLibrary,
-        Unbuilt::FormatInfo,
         Unbuilt::ResourceType,
     ];
 
@@ -133,7 +128,6 @@ impl Unbuilt {
             Unbuilt::RateMap => "rt-unbuilt-rate-map",
             Unbuilt::Icb => "rt-unbuilt-icb",
             Unbuilt::DynamicLibrary => "rt-unbuilt-dynamic-library",
-            Unbuilt::FormatInfo => "rt-unbuilt-format-info",
             Unbuilt::ResourceType => "rt-unbuilt-resource-type",
         }
     }
@@ -160,7 +154,6 @@ impl Unbuilt {
             Unbuilt::RateMap => "a rasterization rate map",
             Unbuilt::Icb => "an indirect command buffer",
             Unbuilt::DynamicLibrary => "a dynamic library",
-            Unbuilt::FormatInfo => "a pixel format's description or a texture level's layout",
             Unbuilt::ResourceType => "a reservation of resource indices of another type",
         }
     }

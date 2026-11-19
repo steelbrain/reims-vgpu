@@ -164,6 +164,8 @@ pub struct Facts {
     pub device_local: u64,
     /// The host's page size.
     pub page_size: u64,
+    /// rt's `heapBufferSizeAndAlignWithLength:options:` of a page of Private storage.
+    pub heap_buffer_page_private: SizeAndAlign,
 }
 
 /// The registry ID the rt platform gives the device of `uuid`, its `deviceUUID`: its two halves'
@@ -196,13 +198,12 @@ fn held(x: u64, bound: u32) -> u64 {
 ///   `maxComputeWorkGroupSize` and `maxComputeWorkGroupInvocations`, viewports to `maxViewports`.
 /// - The Vulkan platform's own: no buffer or heap over address ranges and no detach of a
 ///   resource's backing, which it does not build; the stand-ins; `supportsNativeHardwareFP16` as
-///   the device's `shaderFloat16`; the heap buffer query's answer as metal2vulkan's: the length
-///   asked at a multiple of 256 bytes. rt has no heap buffer query (a heap is the consumer's, as
-///   its README says), and 256 bytes holds every buffer offset alignment Vulkan lets a device ask
-///   (`minStorageBufferOffsetAlignment`, `minUniformBufferOffsetAlignment` and
-///   `minTexelBufferOffsetAlignment` are at most 256);
-///   `minimumLinearTextureAlignmentForPixelFormat:` of BGRA8 as Metal's 16
+///   the device's `shaderFloat16`; `minimumLinearTextureAlignmentForPixelFormat:` of BGRA8 as
+///   Metal's 16
 ///   ([`METAL_LINEAR_ALIGNMENT`]).
+/// - rt's: the heap buffer query of a page of Private storage
+///   ([`Facts::heap_buffer_page_private`]), Metal's answer on every device: the length unrounded,
+///   at a multiple of 256 bytes.
 pub fn caps(facts: &Facts) -> Arc<DeviceCaps> {
     let v = &facts.limits;
     let total = held(
@@ -262,10 +263,7 @@ pub fn caps(facts: &Facts) -> Arc<DeviceCaps> {
         }),
         families: stand_in::FAMILIES.map(Ok),
         write_rounding_modes: metal::WRITE_ROUNDING_MODES.map(Ok),
-        heap_buffer_page_private: Ok(SizeAndAlign {
-            size: facts.page_size,
-            align: 256,
-        }),
+        heap_buffer_page_private: Ok(facts.heap_buffer_page_private),
         min_linear_alignment_bgra8: Ok(METAL_LINEAR_ALIGNMENT),
     })
 }
@@ -382,11 +380,15 @@ pub(crate) mod tests {
             float32_msaa: true,
             device_local: 8 << 30,
             page_size: 4096,
+            heap_buffer_page_private: SizeAndAlign {
+                size: 4096,
+                align: 256,
+            },
         }
     }
 
     /// On a device of Metal's limits or more, the counts are Metal's, the flags Metal's but the
-    /// Vulkan platform's own, and the heap buffer query answers the page at 256 bytes.
+    /// Vulkan platform's own, and the heap buffer query answers rt's of the page.
     #[test]
     fn a_roomy_device_answers_metal_s_counts() {
         let caps = caps(&roomy());

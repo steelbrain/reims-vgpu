@@ -241,8 +241,18 @@ fn facts(
         // SAFETY: as above.
         device_local: unsafe { identity::device_local_bytes_of(instance, physical) },
         page_size,
+        heap_buffer_page_private: {
+            let sized = device.heap_buffer_size_and_align(page_size, STORAGE_PRIVATE);
+            SizeAndAlign {
+                size: sized.size,
+                align: sized.align,
+            }
+        },
     }
 }
+
+/// `MTLResourceStorageModePrivate`, as resource options.
+const STORAGE_PRIVATE: u64 = 0x20;
 
 /// The raise of a query rt refused at `sel`, counted already under `kind`: Metal's exception at
 /// the send, its detail the kind's code and why.
@@ -540,25 +550,15 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         Ok(())
     }
 
-    /// Unbuilt ([`Unbuilt::FormatInfo`]): Metal's answer for a value it describes no format for,
-    /// `MTLPixelFormatInvalid` with every word 0.
+    /// rt's description ([`super::format::description`]): Metal's on an Apple GPU, on every
+    /// device.
     fn pixel_format_info(&self, format: u64) -> PixelFormatInfo {
-        let _ = format;
-        refuse(Unbuilt::FormatInfo, "MTLPixelFormatGetInfoForDevice");
-        PixelFormatInfo {
-            name: Some("MTLPixelFormatInvalid".to_owned()),
-            ..PixelFormatInfo::default()
-        }
+        super::format::description(&self.rt, format)
     }
 
-    /// Unbuilt ([`Unbuilt::FormatInfo`]): every word 0.
+    /// rt's layout of the level ([`super::format::level_layout`]).
     fn texture_level_info(&self, q: &TextureLevelQuery) -> TextureLevelInfo {
-        let _ = q;
-        refuse(
-            Unbuilt::FormatInfo,
-            "MTLGetTextureLevelInfoForDeviceWithOptions",
-        );
-        TextureLevelInfo::default()
+        super::format::level_layout(&self.rt, q)
     }
 
     /// Read as the device was made ([`answers::caps`]).
@@ -830,6 +830,12 @@ mod tests {
         let limits = device.facts().limits;
         assert!(caps.limits.max_texture_width_2d <= u64::from(limits.max_image_dimension2_d));
         assert!(caps.sample_counts[0] == Ok(true));
+        let page = SizeAndAlign {
+            size: device.facts().page_size,
+            align: 256,
+        };
+        let on = OnFault::Die;
+        assert_eq!(caps.heap_buffer_page_private(on), Ok(page));
         let identity = device.identity_caps();
         assert_eq!(
             identity.formats.len(),
@@ -941,6 +947,36 @@ mod tests {
             device.linear_row_alignment(),
             old.linear_row_alignment()
         ));
+        // Format descriptions and level layouts are Metal's on both, from one table.
+        for raw in 0..2048 {
+            assert_eq!(device.pixel_format_info(raw), old.pixel_format_info(raw));
+        }
+        let bgra8 = device.pixel_format_info(80);
+        assert_eq!(bgra8.name.as_deref(), Some("MTLPixelFormatBGRA8Unorm"));
+        for (pixel_format, width, height) in [(80, 64, 32), (70, 17, 3), (130, 33, 9), (252, 5, 5)] {
+            for (options, flags) in [(0, 0), (2, 0), (0, 1), (0, 2)] {
+                let q = TextureLevelQuery {
+                    pixel_format,
+                    width,
+                    height,
+                    depth: 1,
+                    array_length: 1,
+                    options,
+                    flags,
+                };
+                assert_eq!(device.texture_level_info(&q), old.texture_level_info(&q));
+            }
+        }
+        let q = TextureLevelQuery {
+            pixel_format: 80,
+            width: 64,
+            height: 32,
+            depth: 1,
+            array_length: 1,
+            ..TextureLevelQuery::default()
+        };
+        let level = device.texture_level_info(&q);
+        assert_eq!((level.bytes_per_row, level.aligned_height), (256, 32));
         println!(
             "rt platform's answers on {} that differ from the Vulkan platform's:",
             device.facts().name
