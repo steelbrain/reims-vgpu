@@ -4854,7 +4854,11 @@ pub(super) mod tests {
         r.dec.set_staged_surface_copies();
         let named = BLOCK + 0x10000;
         r.pages_cached(named, &[(9, 2)], 2 * page, true);
-        let unmade = r.dec.views_of_surfaces().by_runs(named).map(|(_, unmade)| unmade);
+        let unmade = r
+            .dec
+            .views_of_surfaces()
+            .by_runs(named)
+            .map(|(_, unmade)| unmade);
         let made = unmade.expect("named by its runs").make(&r.device);
         assert!(matches!(made, Ok(Err(PagesRefusal::Unviewed))));
         assert!(r.dec.views_of_surfaces().view(named).is_none());

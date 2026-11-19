@@ -961,7 +961,10 @@ fn by_dma_buf(
     let mapped = device.known_blocks().mapped.clone();
     let id = Arc::new(OnceLock::new());
     let release = release(mapped.clone(), Arc::clone(&id));
-    match device.rt().import_dma_buf(lent.fd, lent.size, Some(release)) {
+    match device
+        .rt()
+        .import_dma_buf(lent.fd, lent.size, Some(release))
+    {
         Ok((block, _)) => {
             let _ = id.set(block.id);
             let first = at.as_ptr().addr().to_u64().wrapping_sub(skip);
@@ -1963,7 +1966,9 @@ mod tests {
         // a view of every other page of a file. Where it takes more runs than the test makes, or
         // the host makes no dma-buf, unchecked.
         let limit = std::fs::read_to_string("/sys/module/udmabuf/parameters/list_limit");
-        let limit = limit.ok().and_then(|limit| limit.trim().parse::<u64>().ok());
+        let limit = limit
+            .ok()
+            .and_then(|limit| limit.trim().parse::<u64>().ok());
         match limit.filter(|&limit| lent && limit < 4096) {
             Some(limit) => {
                 let n = limit + 1;
