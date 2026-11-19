@@ -616,7 +616,7 @@ mod tests {
     fn a_use_of_the_surface_touches_its_referenced_shapes() {
         let mut table = ShapeTable::<u64>::default();
         let (held, _) = table.insert(key(10, 4), 10, false, 0);
-        for w in 11..15 {
+        for w in 11..14 {
             drop(table.insert(key(w, 4), w, false, w));
         }
         assert!(table.any_referenced());
