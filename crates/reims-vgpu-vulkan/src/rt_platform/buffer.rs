@@ -81,13 +81,14 @@
 //! (`crate::os`'s `through_dma_bufs`) are imported as a dma-buf of the files behind them first,
 //! as above; where the host makes none (past udmabuf's limits) or rt refuses it, they are mapped
 //! from their files (`crate::os`'s `map_for_pointer`) and imported by their pointer, counted
-//! ([`IMPORTS_FROM_FILES`]); where they cannot all be mapped so (near the views' budget), or rt
-//! refuses that pointer, they are imported as a copy, with no pointer of theirs asked of rt
-//! while a page of them lies in a dma-buf's mapping. Pages in no dma-buf's mapping go by their
-//! pointer first. From before an import asks where its pages lie until rt
-//! frees an import of their pointer, the platform holds their mappings as they are (`crate::os`'s
-//! `MappingsHeld`), so no fold of the views maps them through dma-bufs under it (`vm`'s docs,
-//! "Folding back").
+//! ([`IMPORTS_FROM_FILES`]), and those too large for one dma-buf as such too, with their runs
+//! ([`IMPORTS_FROM_FILES_TOO_LARGE`], `super::diag`'s import paths); where they cannot all be
+//! mapped so (near the views' budget), or rt refuses that pointer, they are imported as a copy,
+//! with no pointer of theirs asked of rt while a page of them lies in a dma-buf's mapping. Pages
+//! in no dma-buf's mapping go by their pointer first. From before an import asks where its pages
+//! lie until rt frees an import of their pointer, the platform holds their mappings as they are
+//! (`crate::os`'s `MappingsHeld`), so no fold of the views maps them through dma-bufs under it
+//! (`vm`'s docs, "Folding back").
 //!
 //! **A copy at the refusal point.** Pages that rt imports neither by their pointer nor as a
 //! dma-buf of their files (on Linux past one dma-buf's limits, with no file behind them, near the
@@ -184,6 +185,12 @@ pub const IMPORTS_DMA_BUF: &str = "rt-imports-dma-buf";
 /// through dma-bufs, of which no dma-buf was imported, were mapped from their files (the module's
 /// docs, "Pages no pin takes"), counted per import, each counted as [`IMPORTS_POINTER`] too.
 pub const IMPORTS_FROM_FILES: &str = "rt-imports-from-files";
+
+/// The code of an import of the host's memory made by its pointer once the pages of a view mapped
+/// through dma-bufs were mapped from their files, as more runs of file pages, or more bytes, than
+/// one dma-buf holds (the module's docs, "Pages no pin takes"), counted per import, each counted
+/// as [`IMPORTS_FROM_FILES`] too.
+pub const IMPORTS_FROM_FILES_TOO_LARGE: &str = "rt-imports-from-files-too-large";
 
 /// The code of an import of the host's memory whose pages are more runs of file pages, or more
 /// bytes, than one dma-buf holds, the GPU taking no pointer to them (the module's docs, "Dma-bufs
@@ -1041,7 +1048,14 @@ fn unpinnable(
         Ok((block, _)) => {
             crate::answer::count_kind(IMPORTS_POINTER);
             crate::answer::count_kind(IMPORTS_FROM_FILES);
-            super::diag::import_path(kind, ImportPath::Pointer, len);
+            let path = match &no {
+                DmaBufNo::TooLarge { path, .. } => path.from_files(),
+                DmaBufNo::Refused | DmaBufNo::Rt(_) => ImportPath::Pointer,
+            };
+            if let ImportPath::FromFilesTooLarge { .. } = path {
+                crate::answer::count_kind(IMPORTS_FROM_FILES_TOO_LARGE);
+            }
+            super::diag::import_path(kind, path, len);
             if !FROM_FILES_SAID.swap(true, Ordering::Relaxed) {
                 log::info!(
                     target: TARGET,
@@ -2460,9 +2474,9 @@ mod tests {
     /// process's ("Pages no pin takes"): its pointer never goes to rt while a page of it lies in
     /// that mapping. It is a range of rt's import of a dma-buf of the pages where the GPU takes
     /// that (RADV's), and else of rt's import of its pointer once the view is mapped from its
-    /// files (NVIDIA's driver, which refused the dma-buf), counted; its bytes are the pages the
-    /// view shows, which a blit reads and writes. The device then makes buffers, and imports a
-    /// run of pages, as before.
+    /// files (NVIDIA's driver, which refused the dma-buf), counted, and not as too large for one
+    /// dma-buf; its bytes are the pages the view shows, which a blit reads and writes. The device
+    /// then makes buffers, and imports a run of pages, as before.
     #[cfg(target_os = "linux")]
     #[test]
     fn views_of_two_runs_on_vulkan() {
@@ -2479,6 +2493,7 @@ mod tests {
             IMPORTS_REFUSED,
             IMPORTS_TOO_LARGE,
             IMPORTS_FROM_FILES,
+            IMPORTS_FROM_FILES_TOO_LARGE,
         ];
         let counts = || codes.map(counted);
 
@@ -2507,10 +2522,10 @@ mod tests {
             .expect("never a raise")
             .expect("a buffer over the view");
         let after = counts();
-        let delta: [u64; 5] = std::array::from_fn(|i| after[i] - before[i]);
-        let as_dma_buf = delta == [0, 1, 0, 0, 0];
-        let from_files = delta == [1, 0, 0, 0, 1];
-        let by_pointer = delta == [1, 0, 0, 0, 0];
+        let delta: [u64; 6] = std::array::from_fn(|i| after[i] - before[i]);
+        let as_dma_buf = delta == [0, 1, 0, 0, 0, 0];
+        let from_files = delta == [1, 0, 0, 0, 1, 0];
+        let by_pointer = delta == [1, 0, 0, 0, 0, 0];
         assert!(
             as_dma_buf || (through && from_files) || (!through && by_pointer),
             "imports {delta:?}, the view through a dma-buf {through}"
@@ -2579,6 +2594,86 @@ mod tests {
         let ran = || freed.load(Ordering::Acquire);
         assert!(waits_for(ran), "the deallocator ran");
         assert!(!device.known_blocks().is_dma_buf(id));
+    }
+
+    /// On Linux, on the GPU the test holds, a no-copy buffer over a view of more runs of a file's
+    /// pages than one dma-buf takes (udmabuf's `list_limit` as the host has it), every other page
+    /// of the file ("Pages no pin takes"): made by the view's pointer, once the view is mapped
+    /// from its files where it lay in dma-bufs' mappings, counted as from its files and too large
+    /// for one dma-buf; else made over a copy, counted as too large and copied. Its `contents` are
+    /// the view, whose last page is the file's last run. Where the host makes no dma-buf, or
+    /// udmabuf takes more runs than the test makes, unchecked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn views_past_one_dma_buf_on_vulkan() {
+        use crate::core::num::ToUsize as _;
+        use crate::core::platform::os::vm::HostVm as _;
+
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let page = device.facts().page_size;
+        let codes = [
+            IMPORTS_POINTER,
+            IMPORTS_FROM_FILES,
+            IMPORTS_FROM_FILES_TOO_LARGE,
+            IMPORTS_TOO_LARGE,
+            IMPORTS_REFUSED,
+            IMPORTS_COPIED,
+        ];
+        let counts = || codes.map(counted);
+        let one = crate::os::allocate_aliasable(page).expect("a page of a file");
+        let first = NonNull::new(one.as_ptr::<u8>()).expect("a mapped page");
+        let lent = crate::os::dma_buf_of_host(first, page, &[(0, page)]).is_ok();
+        let limit = std::fs::read_to_string("/sys/module/udmabuf/parameters/list_limit");
+        let limit = limit
+            .ok()
+            .and_then(|limit| limit.trim().parse::<u64>().ok());
+        let Some(n) = limit.filter(|&limit| lent && limit < 4096).map(|l| l + 1) else {
+            eprintln!("udmabuf takes {limit:?} runs, dma-bufs {lent}: unchecked");
+            return;
+        };
+
+        // A view of every other page of a file, the last of them 0x44s.
+        let ram = crate::os::allocate_aliasable(2 * n * page).expect("pages of a file");
+        let last = ram.wrapping_add(2 * (n - 1) * page);
+        // SAFETY: a fresh page of the test's own, which nothing uses yet.
+        unsafe { last.as_ptr::<u8>().write_bytes(0x44, page.to_usize()) };
+        let runs: Vec<_> = (0..n)
+            .map(|i| (ram.wrapping_add(2 * i * page), page))
+            .collect();
+        let vm = crate::os::OsVm::new();
+        let view = vm.allocate_anywhere(n * page).expect("a range for a view");
+        assert!(vm.remap_runs_shared_overwrite(view, &runs).is_ok());
+        let at = NonNull::new(view.as_ptr::<u8>()).expect("a mapped view");
+        let through = crate::os::through_dma_bufs(at, n * page);
+
+        let before = counts();
+        // SAFETY: the view and its pages are the test's own, never freed.
+        let bytes = unsafe { HostRange::new(view, n * page) };
+        let made = device.new_buffer_over_host_memory(on, bytes, 0, None);
+        let buffer = made
+            .expect("never a raise")
+            .expect("a buffer over the view");
+        let after = counts();
+        let delta: [u64; 6] = std::array::from_fn(|i| after[i] - before[i]);
+        let from_files = delta == [1, 1, 1, 0, 0, 0];
+        let by_pointer = delta == [1, 0, 0, 0, 0, 0];
+        let copied = delta == [0, 0, 0, 1, 0, 1];
+        assert!(
+            (through && from_files) || (!through && by_pointer) || copied,
+            "imports {delta:?}, the view through dma-bufs {through}"
+        );
+        eprintln!(
+            "a view of {n} runs, through dma-bufs {through}: imported as {}",
+            match (from_files, by_pointer) {
+                (true, _) => "its pointer, mapped from its files",
+                (_, true) => "its pointer",
+                _ => "a copy",
+            }
+        );
+        assert_eq!((buffer.contents(), buffer.length()), (view, n * page));
+        assert_eq!(read(view.wrapping_add((n - 1) * page), 16), [0x44; 16]);
     }
 
     /// On the GPU the test holds, where the GPU takes no pointer to pages with no file behind them

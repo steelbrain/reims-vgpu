@@ -40,8 +40,10 @@
 //!   (`super::buffer::import_pages`), by the kind of the make that asked it
 //!   (`crate::answer::making_as`): how many were made by their pointer and as a dma-buf of the
 //!   files behind them, and how many were refused as too large for one dma-buf or otherwise, with
-//!   their bytes; the most runs and bytes of one refused as too large, and the limits of one
-//!   dma-buf; and every import asked, by size ([`import_path`]).
+//!   their bytes; of those made by their pointer, how many were mapped from their files as too
+//!   large for one dma-buf, with their bytes and the most runs of one; the most runs and bytes of
+//!   one refused as too large, and the limits of one dma-buf; and every import asked, by size
+//!   ([`import_path`]).
 //! - **Guest surface textures by declared usage.** Each texture the decoder made, or was refused,
 //!   over a surface's plane (`TEXTURE_FROM_IOSURFACE`), by the usage the guest declared, how it
 //!   was made (a view of a shape's image, or over the cache's buffer and why) and whether its
@@ -986,6 +988,37 @@ pub enum ImportPath {
     },
     /// Refused otherwise.
     Refused,
+    /// Made by the pages' pointer once they were mapped from their files, as more runs of file
+    /// pages, or more bytes, than one dma-buf takes (`super::buffer`'s `unpinnable`): `pieces`
+    /// runs, where one takes `most_pieces` runs and `most_bytes` bytes. Counted as made by their
+    /// pointer too.
+    FromFilesTooLarge {
+        /// The pages' runs of file pages.
+        pieces: u64,
+        /// One dma-buf's most runs.
+        most_pieces: u64,
+        /// One dma-buf's most bytes.
+        most_bytes: u64,
+    },
+}
+
+impl ImportPath {
+    /// The path of an import made by the pages' pointer once they were mapped from their files,
+    /// where one dma-buf of them was refused as `self` gives.
+    pub fn from_files(self) -> ImportPath {
+        match self {
+            ImportPath::TooLarge {
+                pieces,
+                most_pieces,
+                most_bytes,
+            } => ImportPath::FromFilesTooLarge {
+                pieces,
+                most_pieces,
+                most_bytes,
+            },
+            _ => ImportPath::Pointer,
+        }
+    }
 }
 
 /// The most bytes of each size bucket of the imports asked but the last, which takes the rest.
@@ -1000,7 +1033,10 @@ struct PathTotals {
     /// The most runs and the most bytes of an import refused as too large.
     most_pieces: u64,
     most_bytes: u64,
-    /// One dma-buf's most runs and bytes, as the last refusal as too large gave them.
+    /// Of the imports made by their pointer, those mapped from their files as too large for one
+    /// dma-buf: how many, their bytes, and the most runs of one.
+    from_files: (u64, u64, u64),
+    /// One dma-buf's most runs and bytes, as the last import too large for one gave them.
     limits: (u64, u64),
     /// The imports asked, on every path, by size ([`SIZES`]).
     sizes: [u64; 6],
@@ -1013,7 +1049,7 @@ static PATHS: Mutex<BTreeMap<&'static str, PathTotals>> = Mutex::new(BTreeMap::n
 /// as `path` (`super::buffer::import_pages`).
 pub fn import_path(kind: &'static str, path: ImportPath, bytes: u64) {
     let i = match path {
-        ImportPath::Pointer => 0,
+        ImportPath::Pointer | ImportPath::FromFilesTooLarge { .. } => 0,
         ImportPath::DmaBuf => 1,
         ImportPath::TooLarge { .. } => 2,
         ImportPath::Refused => 3,
@@ -1022,15 +1058,26 @@ pub fn import_path(kind: &'static str, path: ImportPath, bytes: u64) {
     let t = paths.entry(kind).or_default();
     t.counts[i] += 1;
     t.bytes[i] += bytes;
-    if let ImportPath::TooLarge {
-        pieces,
-        most_pieces,
-        most_bytes,
-    } = path
-    {
-        t.most_pieces = t.most_pieces.max(pieces);
-        t.most_bytes = t.most_bytes.max(bytes);
-        t.limits = (most_pieces, most_bytes);
+    match path {
+        ImportPath::TooLarge {
+            pieces,
+            most_pieces,
+            most_bytes,
+        } => {
+            t.most_pieces = t.most_pieces.max(pieces);
+            t.most_bytes = t.most_bytes.max(bytes);
+            t.limits = (most_pieces, most_bytes);
+        }
+        ImportPath::FromFilesTooLarge {
+            pieces,
+            most_pieces,
+            most_bytes,
+        } => {
+            let (n, b, most) = t.from_files;
+            t.from_files = (n + 1, b + bytes, most.max(pieces));
+            t.limits = (most_pieces, most_bytes);
+        }
+        ImportPath::Pointer | ImportPath::DmaBuf | ImportPath::Refused => {}
     }
     let size = SIZES.iter().position(|&most| bytes <= most);
     t.sizes[size.unwrap_or(SIZES.len())] += 1;
@@ -1244,26 +1291,7 @@ pub fn write() {
         );
     }
     for (kind, t) in PATHS.lock().iter() {
-        let (c, kib) = (&t.counts, t.bytes.map(|b| b >> 10));
-        let _ = writeln!(
-            out,
-            "reims-vgpu: rt-diag import-paths: {kind}: pointer {} ({} KiB), dma-buf {} ({} KiB), \
-             too large {} ({} KiB; most {} runs, {} KiB; one dma-buf takes {} runs, {} KiB), \
-             refused {} ({} KiB); asked up to 64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, more: {:?}",
-            c[0],
-            kib[0],
-            c[1],
-            kib[1],
-            c[2],
-            kib[2],
-            t.most_pieces,
-            t.most_bytes >> 10,
-            t.limits.0,
-            t.limits.1 >> 10,
-            c[3],
-            kib[3],
-            t.sizes,
-        );
+        let _ = writeln!(out, "{}", paths_line(kind, t));
     }
     if !presenters.is_empty() {
         let _ = writeln!(
@@ -1274,6 +1302,35 @@ pub fn write() {
     if !out.is_empty() {
         say(&out);
     }
+}
+
+/// The import-paths line of the imports a make of kind `kind` asked (the module's docs, "Imports
+/// by path").
+fn paths_line(kind: &str, t: &PathTotals) -> String {
+    let (c, kib) = (&t.counts, t.bytes.map(|b| b >> 10));
+    let (files, files_bytes, files_most) = t.from_files;
+    format!(
+        "reims-vgpu: rt-diag import-paths: {kind}: pointer {} ({} KiB; from files as too large {} \
+         ({} KiB; most {} runs)), dma-buf {} ({} KiB), too large {} ({} KiB; most {} runs, {} \
+         KiB; one dma-buf takes {} runs, {} KiB), refused {} ({} KiB); asked up to 64 KiB, 256 \
+         KiB, 1 MiB, 4 MiB, 16 MiB, more: {:?}",
+        c[0],
+        kib[0],
+        files,
+        files_bytes >> 10,
+        files_most,
+        c[1],
+        kib[1],
+        c[2],
+        kib[2],
+        t.most_pieces,
+        t.most_bytes >> 10,
+        t.limits.0,
+        t.limits.1 >> 10,
+        c[3],
+        kib[3],
+        t.sizes,
+    )
 }
 
 /// `origin` as a line names it: the selector, the message's type in hex, and the thread.
@@ -1400,6 +1457,37 @@ mod tests {
             "over-buffer: no cache",
         );
         assert_eq!(counted(PLANE_PIXEL_FORMAT_VIEW_CODE), before);
+    }
+
+    /// An import made by its pointer once its pages were mapped from their files, as too large for
+    /// one dma-buf, counts as made by its pointer, once on every count, and its bytes and runs as
+    /// such, which its line shows; an import refused as too large counts apart.
+    #[test]
+    fn imports_from_files_as_too_large_count_by_pointer() {
+        let kind = "test-from-files";
+        let too_large = |pieces| ImportPath::TooLarge {
+            pieces,
+            most_pieces: 1024,
+            most_bytes: 64 << 20,
+        };
+        import_path(kind, ImportPath::Pointer, 0x1000);
+        import_path(kind, too_large(2025).from_files(), 8100 << 10);
+        import_path(kind, too_large(1500).from_files(), 6000 << 10);
+        import_path(kind, ImportPath::Refused.from_files(), 0x2000);
+        import_path(kind, too_large(3000), 12 << 20);
+        let paths = PATHS.lock();
+        let t = paths.get(kind).expect("the kind's totals");
+        assert_eq!(t.counts, [4, 0, 1, 0]);
+        assert_eq!(t.bytes[0], 0x3000 + (14100 << 10));
+        assert_eq!(t.from_files, (2, 14100 << 10, 2025));
+        assert_eq!((t.most_pieces, t.most_bytes), (3000, 12 << 20));
+        assert_eq!(t.limits, (1024, 64 << 20));
+        assert_eq!(t.sizes, [2, 0, 0, 0, 3, 0]);
+        let line = paths_line(kind, t);
+        let shown = ": pointer 4 (14112 KiB; from files as too large 2 (14100 KiB; most 2025 \
+                     runs)), dma-buf 0 (0 KiB), too large 1 (12288 KiB; most 3000 runs, 12288 \
+                     KiB; one dma-buf takes 1024 runs, 65536 KiB), refused 0 (0 KiB);";
+        assert!(line.contains(shown), "{line}");
     }
 
     /// A gap is counted by its kind, a draw's by its draw kind; another error is not.
