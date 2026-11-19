@@ -4249,7 +4249,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 reims_vgpu_vulkan::rt_platform::diag::surface_texture(
                     made.as_ref(),
                     context_of(m.obj_id),
-                    (span.map_or(m.buffer_obj_id | (1 << 63), |(at, _)| at), m.plane),
+                    (
+                        span.map_or(m.buffer_obj_id | (1 << 63), |(at, _)| at),
+                        m.plane,
+                    ),
                     (
                         u64::from(m.desc.usage),
                         row_bytes.saturating_mul(u64::from(m.desc.height)),

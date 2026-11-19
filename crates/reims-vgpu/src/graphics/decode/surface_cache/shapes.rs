@@ -907,7 +907,10 @@ mod tests {
         let mut table = ShapeTable::<u32>::default();
         let (held_plain, _) = table.insert(plain, 1, true, 1);
         assert_eq!(table.find(&plain, 2).map(|(_, s)| s.image), Some(1));
-        assert!(table.find(&storage, 3).is_none(), "a plain shape takes no storage");
+        assert!(
+            table.find(&storage, 3).is_none(),
+            "a plain shape takes no storage"
+        );
         assert!(table.holds_other_kind(&storage));
         assert!(!table.holds_other_kind(&plain));
         let (held_storage, _) = table.insert(storage, 2, true, 4);
@@ -935,16 +938,26 @@ mod tests {
         drop(table.insert(plain(50), 2, false, 2));
         let (storage, _) = table.insert(key(100, 4), 3, false, 3);
         let mut counts = ShapeCounts::default();
-        assert!(table.sweep(&mut counts).is_empty(), "the plain shape is referenced");
+        assert!(
+            table.sweep(&mut counts).is_empty(),
+            "the plain shape is referenced"
+        );
         assert!(table.mark_dirty(held.id()));
         let id = held.id();
         drop(held);
-        assert!(table.sweep(&mut counts).is_empty(), "dirty, kept until written back");
+        assert!(
+            table.sweep(&mut counts).is_empty(),
+            "dirty, kept until written back"
+        );
         assert_eq!(counts.kept_dirty, 1);
         table.written_back(&[id], &mut counts);
         let gone: Vec<u64> = table.sweep(&mut counts).iter().map(|s| s.image).collect();
         assert_eq!(gone, vec![1]);
-        assert_eq!(table.iter().count(), 2, "the storage shape and the other extent's");
+        assert_eq!(
+            table.iter().count(),
+            2,
+            "the storage shape and the other extent's"
+        );
         drop(storage);
     }
 

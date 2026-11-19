@@ -267,7 +267,7 @@ fn takes_storage(m: &RgfxTextureFromIOSurface) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use reims_vgpu_graphics::wire::{RGFX_STATUS_CACHE, RGFX_STATUS_OK};
     use reims_vgpu_vulkan::core::testkit::FakePlatform;
@@ -280,6 +280,7 @@ mod tests {
     use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
 
     use reims_vgpu_vulkan::core::platform::types::MtlSize;
+    use reims_vgpu_vulkan::core::sync::Mutex;
 
     use super::super::surface_cache::tests::{
         NO_REACH, blit_with, blits_with, cache_id, cached, copies, download, encoder_with, queues,
@@ -317,7 +318,7 @@ mod tests {
         let kept = Arc::clone(&made);
         r.dec.set_surface_shapes(Arc::new(
             move |device: &<FakePlatform as Platform>::Device, desc: &TextureDesc| {
-                kept.lock().unwrap().push((desc.pixel_format, desc.usage));
+                kept.lock().push((desc.pixel_format, desc.usage));
                 p.own_texture(device, desc)
             },
         ));
@@ -552,10 +553,7 @@ mod tests {
             storage.push(texture_as_image(&mut r, obj_id, 80, (width, 8), usage));
         }
         assert!(!storage.contains(&plain));
-        assert_eq!(
-            *made.lock().unwrap(),
-            [(80, 0x5), (80, 0), (80, 0), (80, 0)]
-        );
+        assert_eq!(*made.lock(), [(80, 0x5), (80, 0), (80, 0), (80, 0)]);
         let writes = |r: &Rig, n: u64| r.dec.entry(n).unwrap().shape.as_ref().map(|s| s.writes);
         let seen = [21, 22, 23, 24].map(|n| writes(&r, n));
         assert_eq!(seen, [Some(false), Some(true), Some(true), Some(true)]);
@@ -564,7 +562,7 @@ mod tests {
         let format_view = texture_as_image(&mut r, 26, 80, (32, 8), 0x11);
         let refused = texture_as_image(&mut r, 27, 70, (32, 8), 0x5);
         assert_eq!([sibling, format_view, refused], [plain; 3]);
-        assert_eq!(made.lock().unwrap().len(), 4);
+        assert_eq!(made.lock().len(), 4);
         let counts = r.dec.caches().counts().shapes;
         assert_eq!((counts.made, counts.found, counts.order_case), (4, 3, 0));
         let plain_counts = (counts.plain_views_refused, counts.plain_format_views);
@@ -581,7 +579,7 @@ mod tests {
         let plain = texture_as_image(&mut r, 21, 80, (32, 8), 0x5);
         let storage = texture_as_image(&mut r, 25, 80, (32, 8), 0x2);
         assert_ne!(storage, plain);
-        assert_eq!(*made.lock().unwrap(), [(80, 0x5), (80, 0)]);
+        assert_eq!(*made.lock(), [(80, 0x5), (80, 0)]);
         assert_eq!(r.dec.caches().counts().shapes.order_case, 1);
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
         r.p.world().complete_all(CompleteOn::Caller);

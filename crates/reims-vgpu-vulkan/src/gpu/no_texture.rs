@@ -125,7 +125,11 @@ pub fn no_view(raw: u64) -> bool {
 /// depth and stencil one (`metal2vulkan::metal::format::views_without_usage`). False for a value
 /// the runtime has no format of.
 pub fn views_without_usage(raw: u64, view: u64) -> bool {
-    let format = |raw: u64| u32::try_from(raw).ok().and_then(|r| PixelFormat::try_from(r).ok());
+    let format = |raw: u64| {
+        u32::try_from(raw)
+            .ok()
+            .and_then(|r| PixelFormat::try_from(r).ok())
+    };
     match (format(raw), format(view)) {
         (Some(pf), Some(view)) => metal2vulkan::metal::format::views_without_usage(pf, view),
         _ => false,

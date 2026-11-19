@@ -281,12 +281,11 @@ const STORAGE_USAGES: u64 = 0x2 | 0x20;
 /// bit set; and the plane's index.
 type Plane = (u64, u32);
 
-/// A guest surface texture's plane, whether it takes storage, and its bytes.
+/// A guest surface texture's plane, and whether it takes storage.
 #[derive(Clone, Copy)]
 struct OnPlane {
     plane: Plane,
     storage: bool,
-    bytes: u64,
 }
 
 /// A plane's live guest textures: how many take storage, and how many there are of each format.
@@ -379,7 +378,7 @@ pub fn surface_texture<T: 'static>(
 /// Notes `made`'s plane `plane`, of declared `usage` and `bytes`, once.
 fn on_plane(made: &Made, plane: Plane, usage: u64, bytes: u64) {
     let storage = takes_storage(usage);
-    if made.on_plane.set(OnPlane { plane, storage, bytes }).is_err() {
+    if made.on_plane.set(OnPlane { plane, storage }).is_err() {
         return;
     }
     let mut planes = PLANES.lock();
