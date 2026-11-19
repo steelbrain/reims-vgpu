@@ -45,8 +45,8 @@ use reims_vgpu_vulkan::core::platform::values::TextureDesc;
 use reims_vgpu_vulkan::core::raise::RaiseResult;
 use reims_vgpu_vulkan::gpu::no_texture::views_without_usage;
 
-use super::surface_cache::{self, CacheLayout, STORAGE_PRIVATE, ShapeMaker};
 use super::surface_cache::shapes::{self, PLAIN_VIEW_REFUSED, ShapeCounts, ShapeKey, ShapeUse};
+use super::surface_cache::{self, CacheLayout, STORAGE_PRIVATE, ShapeMaker};
 use super::{GraphicsDecoder, ObjHandle, TEXTURE_USAGE_WRITES, texture_desc};
 
 /// `MTLTextureType2D`.
