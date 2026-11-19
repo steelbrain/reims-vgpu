@@ -2149,6 +2149,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         layout: Option<RgfxSurfacePagesLayout>,
         answer: CompleteAnswer,
     ) {
+        let begun = self.decoder().surface_pages_begun();
         // After the no-copy buffers being made over the block it describes again, which see it as
         // before, and whose make on the surface worker would else wait for it, behind them there.
         self.pages_buffers.wait(pages.block_offset);
@@ -2172,6 +2173,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             };
             // Nothing is owed where the device was reset since.
             if let Some(status) = status {
+                me.decoder().surface_pages_answered(begun);
                 answer.answer_at(status, at);
             }
             drop(settle);

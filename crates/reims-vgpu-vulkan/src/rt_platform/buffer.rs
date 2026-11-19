@@ -150,6 +150,7 @@ use crate::core::host::HostPtr;
 use crate::core::memory::placed::Placed;
 use crate::core::num::{ToU64 as _, ToUsize as _};
 use crate::core::platform::Handle as _;
+use crate::core::platform::os::Clock as _;
 use crate::core::platform::device::NoCopyDeallocator;
 use crate::core::platform::host_range::HostRange;
 #[cfg(unix)]
@@ -522,12 +523,95 @@ pub fn scratch_of_length(
     if o.storage != Storage::Shared || length == 0 || length > rt::MAX_BUFFER_LENGTH {
         return made(device, sel, length, o, None, None);
     }
+    let clock = crate::os::OsClock::new();
+    let allocated = allocations_now();
+    let began = clock.now_mono();
     let block = take(device, sel, rt::MemoryClass::Shared, length)?;
-    match device.rt().new_buffer(block.id, 0, length, None) {
+    let taken = clock.now_mono();
+    let made = device.rt().new_buffer(block.id, 0, length, None);
+    let split = ScratchSplit {
+        length,
+        take: nanos(taken.saturating_duration_since(began)),
+        buffer: nanos(clock.now_mono().saturating_duration_since(taken)),
+        allocations: (allocations_now().zip(allocated))
+            .map(|(a, b)| (a.0.saturating_sub(b.0), a.1.saturating_sub(b.1))),
+    };
+    split.count();
+    match made {
         Ok(made) => Some(buffer(device, made, o.answered)),
         Err(error) => {
             rt_refused_create(sel, &error);
             None
+        }
+    }
+}
+
+/// The Shared scratch buffers made ([`scratch_of_length`]); the nanoseconds their makes' two
+/// calls of rt's took in all, and the longest of each: the block's take (`Device::take_block`,
+/// which allocates where no free range fits) and the buffer's make over it
+/// (`Device::new_buffer`); and the nanoseconds of rt's allocations on the consumer's threads
+/// while the takes ran (`Metrics::consumer_allocation_nanos`, every thread's: an allocation of
+/// another thread's beside a take counts too). Each new longest make is logged with its split.
+pub const SCRATCH_MAKES_CODE: &str = "rt-scratch-makes";
+pub const SCRATCH_TAKE_NS_CODE: &str = "rt-scratch-take-ns";
+pub const SCRATCH_TAKE_MAX_NS_CODE: &str = "rt-scratch-take-max-ns";
+pub const SCRATCH_TAKE_ALLOCATION_NS_CODE: &str = "rt-scratch-take-allocation-ns";
+pub const SCRATCH_BUFFER_NS_CODE: &str = "rt-scratch-buffer-ns";
+pub const SCRATCH_BUFFER_MAX_NS_CODE: &str = "rt-scratch-buffer-max-ns";
+
+/// The longest take, buffer's make and whole make of [`scratch_of_length`]'s so far, which
+/// [`SCRATCH_TAKE_MAX_NS_CODE`] and [`SCRATCH_BUFFER_MAX_NS_CODE`] rise to, and past which a make
+/// is logged.
+static SCRATCH_MOST: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// rt's allocations on the consumer's threads so far, and their nanoseconds
+/// (`Metrics::consumer_allocations`, `consumer_allocation_nanos`); `None` before the device is
+/// made.
+fn allocations_now() -> Option<(u64, u64)> {
+    super::device::metrics().map(|m| (m.consumer_allocations, m.consumer_allocation_nanos))
+}
+
+/// `took` in nanoseconds.
+fn nanos(took: std::time::Duration) -> u64 {
+    u64::try_from(took.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// One scratch buffer's make of `length` bytes: its take's and its buffer's nanoseconds, and rt's
+/// allocations on the consumer's threads while the take ran, how many and their nanoseconds
+/// ([`SCRATCH_MAKES_CODE`]).
+struct ScratchSplit {
+    length: u64,
+    take: u64,
+    buffer: u64,
+    allocations: Option<(u64, u64)>,
+}
+
+impl ScratchSplit {
+    /// Counted, and logged where the make is the longest so far.
+    fn count(&self) {
+        let rise = |at: usize, value: u64| {
+            let was = SCRATCH_MOST[at].fetch_max(value, Ordering::Relaxed);
+            value.saturating_sub(was)
+        };
+        let (allocations, allocation_ns) = self.allocations.unwrap_or((0, 0));
+        crate::answer::count_kind(SCRATCH_MAKES_CODE);
+        crate::answer::count_kind_by(SCRATCH_TAKE_NS_CODE, self.take);
+        crate::answer::count_kind_by(SCRATCH_TAKE_MAX_NS_CODE, rise(0, self.take));
+        crate::answer::count_kind_by(SCRATCH_TAKE_ALLOCATION_NS_CODE, allocation_ns);
+        crate::answer::count_kind_by(SCRATCH_BUFFER_NS_CODE, self.buffer);
+        crate::answer::count_kind_by(SCRATCH_BUFFER_MAX_NS_CODE, rise(1, self.buffer));
+        let whole = self.take.saturating_add(self.buffer);
+        if rise(2, whole) > 0 {
+            let ms = |ns: u64| ns as f64 / 1e6;
+            log::info!(
+                target: TARGET,
+                "a scratch buffer of {} KiB took {:.3} ms, the longest yet: its block's take                  {:.3} ms ({allocations} allocations of rt's on the consumer's threads,                  {:.3} ms, while it ran), the buffer over it {:.3} ms",
+                self.length.div_ceil(1024),
+                ms(whole),
+                ms(self.take),
+                ms(allocation_ns),
+                ms(self.buffer)
+            );
         }
     }
 }

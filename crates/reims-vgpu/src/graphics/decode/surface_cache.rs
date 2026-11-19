@@ -305,8 +305,9 @@
 //!   flight never shares one. Each piece taken is counted (`rt-staging-pieces`, and
 //!   `rt-staging-pieces-spared` those a spare served), and each made, with the nanoseconds its
 //!   make took in all and the longest, for a cache's first staged copy
-//!   (`rt-staging-piece-makes-first`, `-first-ns`, `-first-max-ns`) apart from the copies after
-//!   it (`rt-staging-piece-makes-repeat`, `-repeat-ns`, `-repeat-max-ns`).
+//!   (`rt-staging-piece-makes-first`, `-first-ns`, `-first-max-ns`, `-first-kib`) apart from
+//!   the copies after it (`rt-staging-piece-makes-repeat`, `-repeat-ns`, `-repeat-max-ns`,
+//!   `-repeat-kib`).
 //!   A download's CPU copy, and the answers that wait for it, run on a thread of the caches' own
 //!   ([`INTO_PAGES_THREADS`]), not in its command buffer's completed handler: the platform sees
 //!   every queue's completions on one thread, which a large surface's copy, tens of milliseconds
@@ -7394,7 +7395,7 @@ impl<P: Platform> Spares<P> {
                     let at = timed.map(|now| now());
                     let made = device.new_scratch_buffer_of_length(ON, length, STORAGE_SHARED)?;
                     if let (Some(now), Some(at), Some(_)) = (timed, at, &made) {
-                        piece_made(first, now().saturating_duration_since(at));
+                        piece_made(first, now().saturating_duration_since(at), length);
                     }
                     made
                 }
@@ -7457,7 +7458,7 @@ const PIECES_SPARED: &str = "rt-staging-pieces-spared";
 
 /// The staged copies' pieces made on the copy's thread ([`Spares::pieces`]), for a cache's
 /// first staged copy and for the copies after it: how many, the nanoseconds their makes took,
-/// and the longest of them.
+/// and the longest of them; and their KiB ([`PIECE_MAKES_KIB`]).
 const PIECE_MAKES: [(&str, &str, &str); 2] = [
     (
         "rt-staging-piece-makes-first",
@@ -7471,6 +7472,12 @@ const PIECE_MAKES: [(&str, &str, &str); 2] = [
     ),
 ];
 
+/// The KiB of [`PIECE_MAKES`]' pieces, of each.
+const PIECE_MAKES_KIB: [&str; 2] = [
+    "rt-staging-piece-makes-first-kib",
+    "rt-staging-piece-makes-repeat-kib",
+];
+
 /// The longest make of [`PIECE_MAKES`] so far, of each, which its code's count rises to.
 static PIECE_MAKE_MAX_NS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
@@ -7482,13 +7489,15 @@ fn piece_taken(spared: bool) {
     }
 }
 
-/// One piece made for a staged copy, a cache's `first`, in `took` ([`PIECE_MAKES`]).
-fn piece_made(first: bool, took: std::time::Duration) {
+/// One piece of `length` bytes made for a staged copy, a cache's `first`, in `took`
+/// ([`PIECE_MAKES`]).
+fn piece_made(first: bool, took: std::time::Duration, length: u64) {
     let kind = usize::from(!first);
     let (made, ns, longest) = PIECE_MAKES[kind];
     let took = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
     reims_vgpu_vulkan::answer::count_kind(made);
     reims_vgpu_vulkan::answer::count_kind_by(ns, took);
+    reims_vgpu_vulkan::answer::count_kind_by(PIECE_MAKES_KIB[kind], length.div_ceil(1024));
     let was = PIECE_MAKE_MAX_NS[kind].fetch_max(took, Ordering::Relaxed);
     reims_vgpu_vulkan::answer::count_kind_by(longest, took.saturating_sub(was));
 }

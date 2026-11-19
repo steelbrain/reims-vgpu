@@ -655,6 +655,46 @@ impl DecodeError {
     }
 }
 
+/// Where the caches' copies are staged, the `SURFACE_PAGES` answered, the nanoseconds from
+/// each's begin on ring 0 to its answer in all, the longest, and how many took longer than each
+/// of [`SURFACE_PAGES_OVER`]'s bounds ([`GraphicsDecoder::surface_pages_answered`]): the
+/// guest's wait for its surface's pages, as a distribution.
+const SURFACE_PAGES_ANSWERS: &str = "rt-surface-pages-answers";
+const SURFACE_PAGES_ANSWER_NS: &str = "rt-surface-pages-answer-ns";
+const SURFACE_PAGES_ANSWER_MAX_NS: &str = "rt-surface-pages-answer-max-ns";
+
+/// The bounds a `SURFACE_PAGES`' time to its answer is counted past, in microseconds, each with
+/// its code ([`SURFACE_PAGES_ANSWERS`]).
+const SURFACE_PAGES_OVER: [(u64, &str); 9] = [
+    (100, "rt-surface-pages-answers-over-100us"),
+    (250, "rt-surface-pages-answers-over-250us"),
+    (500, "rt-surface-pages-answers-over-500us"),
+    (1_000, "rt-surface-pages-answers-over-1ms"),
+    (2_000, "rt-surface-pages-answers-over-2ms"),
+    (5_000, "rt-surface-pages-answers-over-5ms"),
+    (10_000, "rt-surface-pages-answers-over-10ms"),
+    (20_000, "rt-surface-pages-answers-over-20ms"),
+    (50_000, "rt-surface-pages-answers-over-50ms"),
+];
+
+/// The longest `SURFACE_PAGES`' time to its answer so far, which
+/// [`SURFACE_PAGES_ANSWER_MAX_NS`]'s count rises to.
+static SURFACE_PAGES_ANSWER_MOST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// One `SURFACE_PAGES` answered `took` nanoseconds after its begin ([`SURFACE_PAGES_ANSWERS`]).
+fn surface_pages_answer_took(took: u64) {
+    reims_vgpu_vulkan::answer::count_kind(SURFACE_PAGES_ANSWERS);
+    reims_vgpu_vulkan::answer::count_kind_by(SURFACE_PAGES_ANSWER_NS, took);
+    let was = SURFACE_PAGES_ANSWER_MOST.fetch_max(took, std::sync::atomic::Ordering::Relaxed);
+    reims_vgpu_vulkan::answer::count_kind_by(SURFACE_PAGES_ANSWER_MAX_NS, took.saturating_sub(was));
+    for (us, code) in SURFACE_PAGES_OVER {
+        if took > us.saturating_mul(1_000) {
+            reims_vgpu_vulkan::answer::count_kind(code);
+        }
+    }
+}
+
 /// How long the logs of what the surface views did wait after the last: the first
 /// `SURFACE_PAGES` after it logs them ([`views_log_due`]). A summary at info comes at most once a
 /// minute, however many `SURFACE_PAGES` a desktop's churn sends (docs/conventions.md); a run
@@ -1492,6 +1532,24 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.shared.surface_views.lock().set_staged();
         let platform = Arc::clone(&self.platform);
         (self.surface_caches).set_staged(Arc::new(move || platform.clock().now_mono()));
+    }
+
+    /// Where the caches' copies are staged, the platform's clock as a `SURFACE_PAGES` begins on
+    /// ring 0, which the time to its answer is counted from ([`Self::surface_pages_answered`]);
+    /// `None` elsewhere.
+    pub(crate) fn surface_pages_begun(&self) -> Option<MonoTime> {
+        (self.surface_caches.staged()).then(|| self.platform.clock().now_mono())
+    }
+
+    /// The `SURFACE_PAGES` begun at `begun` ([`Self::surface_pages_begun`]) is answered now:
+    /// the time from its begin on ring 0 to its answer, what the guest's thread that sent it
+    /// waited, counted ([`SURFACE_PAGES_ANSWERS`]).
+    pub(crate) fn surface_pages_answered(&self, begun: Option<MonoTime>) {
+        let Some(begun) = begun else {
+            return;
+        };
+        let took = self.platform.clock().now_mono().saturating_duration_since(begun);
+        surface_pages_answer_took(u64::try_from(took.as_nanos()).unwrap_or(u64::MAX));
     }
 
     /// Whether `SURFACE_PAGES` makes views ([`RGFX_FEATURE_SURFACE_PAGES`]).
