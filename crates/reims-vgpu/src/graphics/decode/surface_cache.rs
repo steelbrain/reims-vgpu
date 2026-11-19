@@ -1729,7 +1729,7 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     spares: Arc<Spares<P>>,
     /// The threads that move a staged download's bytes into its pages and land it
     /// ([`INTO_PAGES_THREADS`]), a block's in the order their command buffers completed.
-    into_pages: Arc<Worker>,
+    lands_out: Arc<Worker>,
 }
 
 /// The name of the threads, `<name>-<i>`, that carry out a staged copy out of a cache once its
@@ -1935,7 +1935,7 @@ impl<P: Platform> SurfaceCaches<P> {
             shape_clock: 0,
             staged: None,
             spares: Arc::new(Spares::new(SPARE_BYTES)),
-            into_pages: Arc::new(Worker::new(INTO_PAGES_THREADS)),
+            lands_out: Arc::new(Worker::new(INTO_PAGES_THREADS)),
         }
     }
 
@@ -4481,7 +4481,7 @@ impl<P: Platform> SurfaceCaches<P> {
             // `done`: on the caches' own threads, as the copy would hold the platform's thread
             // that sees every queue's completions (the module doc, "Staged copies").
             Some(staged) => {
-                let into_pages = Arc::clone(&self.into_pages);
+                let lands_out = Arc::clone(&self.lands_out);
                 cb.add_completed_handler(
                     ON,
                     Box::new(move |info: CompletedInfo| {
@@ -4498,7 +4498,7 @@ impl<P: Platform> SurfaceCaches<P> {
                             lands.land_timed(gpu_times, took);
                             done();
                         };
-                        into_pages.submit_waitless(block, Box::new(lands_now));
+                        lands_out.submit_waitless(block, Box::new(lands_now));
                     }),
                 )?;
             }
@@ -4647,8 +4647,8 @@ impl<P: Platform> SurfaceCaches<P> {
     /// The threads that carry out staged copies out of the caches ([`INTO_PAGES_THREADS`]), for
     /// the tests to hold and wait for.
     #[cfg(test)]
-    pub(crate) fn into_pages(&self) -> Arc<Worker> {
-        Arc::clone(&self.into_pages)
+    pub(crate) fn lands_out(&self) -> Arc<Worker> {
+        Arc::clone(&self.lands_out)
     }
 }
 
@@ -12355,8 +12355,8 @@ pub(super) mod tests {
     /// caches they completed have landed in their pages ([`INTO_PAGES_THREADS`]).
     fn complete_staged(r: &Rig) {
         r.p.world().complete_all(CompleteOn::Caller);
-        let into_pages = r.dec.caches().into_pages();
-        into_pages.flush();
+        let lands_out = r.dec.caches().lands_out();
+        lands_out.flush();
     }
 
     /// `BLOCK_RELEASE` of the block at `block`, and whether it was answered.
@@ -13546,8 +13546,8 @@ pub(super) mod tests {
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
         complete_staged(&r);
 
-        let into_pages = r.dec.caches().into_pages();
-        into_pages.hold();
+        let lands_out = r.dec.caches().lands_out();
+        lands_out.hold();
         let mark = r.p.call_log().mark();
         let done = download(&r, BLOCK);
         let out = copies(&r.p.call_log().since(mark));
@@ -13576,8 +13576,8 @@ pub(super) mod tests {
             "the pages wait for the copy"
         );
 
-        into_pages.release();
-        into_pages.flush();
+        lands_out.release();
+        lands_out.flush();
         assert!(
             done.load(Ordering::SeqCst),
             "answered once the pages hold it"
