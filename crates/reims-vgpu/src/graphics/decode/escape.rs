@@ -260,6 +260,7 @@ mod tests {
     use super::super::surface_pages::READ_ONLY_OPTION;
     use super::super::surface_pages::tests::{BLOCK, Rig, rig};
     use super::*;
+    use crate::platform::ApiPlatform;
 
     fn header(r#type: u32) -> RgfxMsgHeader {
         RgfxMsgHeader {
@@ -691,6 +692,273 @@ mod tests {
         assert_eq!(reach(), OLD, "before the CPU's write");
         write(0, NEW);
         assert_eq!(reach(), NEW, "after the CPU's write");
+    }
+
+    /// The pages blocks [`no_copy_memory_over_pages_lies_over_the_guests_bytes`] makes its no-copy
+    /// memory over.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Runs {
+        /// Blocks of one run: a buffer's (`BUFFER_OVER_PAGES`, an app's
+        /// `newBufferWithBytesNoCopy`), in the block's view, and a heap's (`HEAP_OVER_PAGES`), in
+        /// the guest's RAM itself.
+        One,
+        /// Blocks of two runs, in their views: a heap's, and an indirect command buffer's slots
+        /// (`ICB_SLOTS_IN_PAGES`).
+        Two,
+    }
+
+    /// On `P`, under the lease of the guest's RAM the platform gives a graphics device
+    /// (`ApiPlatform::guest_memory`), the no-copy memory an app makes over its own pages, which
+    /// its process maps writable, in pages blocks of `runs` ([`Runs`]), is made and lies over the
+    /// guest's pages in place, as on a Mac, where it is the app's own memory. For each buffer (a
+    /// buffer over a block, a buffer in a heap over one), a blit out of it reads what the guest's
+    /// CPU wrote there, before and after a later CPU write, and the guest's CPU reads what a blit
+    /// wrote into it. An indirect command buffer's slots lie in their block's view, over the
+    /// guest's pages, both ways.
+    fn no_copy_memory_over_pages_lies_over_the_guests_bytes<P: ApiPlatform>(runs: Runs) {
+        use reims_vgpu_graphics::wire::{
+            RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_SURFACE_PAGES,
+            RGFX_CURSOR_SPAN, RgfxBufferAtOffset, RgfxHeapOverPages, RgfxPageRun, RgfxSurfacePages,
+        };
+        use reims_vgpu_vulkan::core::memory::map::MemoryMap as CoreMemoryMap;
+        use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::raise::OnFault;
+
+        use super::super::HEAP_PAGE;
+        use super::super::surface_pages::Lease;
+        use super::super::surface_pages::costs::{RAM, guest_ram};
+
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
+        let platform = P::process();
+        let device = platform.metal_device(None).unwrap();
+        let page = platform.vm().page_size().max(4096);
+        // The guest's RAM, which outlives the decoder and its views.
+        let ram = guest_ram(64 * page, true);
+        let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
+        let core =
+            CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
+        let size = BLOCK + 0x10_0000 + RGFX_CURSOR_SPAN;
+        let region = Arc::new(crate::platform::test_region(&*platform, size as usize));
+        let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), region);
+        dec.set_guest_memory(core, lease);
+        assert!(
+            dec.surface_pages_available(),
+            "no views of guest RAM on a host page of {page:#x}"
+        );
+        // The pages block at `block` of `runs`, given as (page, pages) of the RAM.
+        let pages = |block: u64, runs: &[(u64, u64)]| {
+            let runs: Vec<RgfxPageRun> = (runs.iter())
+                .map(|&(first, count)| RgfxPageRun {
+                    address: RAM + first * page,
+                    length: count * page,
+                })
+                .collect();
+            let blocks = RgfxSurfacePages {
+                header: header(RGFX_CMD_SURFACE_PAGES),
+                context: 0,
+                run_count: runs.len() as u32,
+                block_offset: block,
+                block_size: 0x2000,
+                runs_offset: block + 0x1000,
+                length: runs.iter().map(|r| r.length).sum(),
+            };
+            let flags = RGFX_SURFACE_PAGES_PRIVATE;
+            assert_eq!(
+                dec.surface_pages(&device, &blocks, &runs, flags),
+                RGFX_STATUS_OK
+            );
+        };
+        // A heap's 16 KiB page, in host pages.
+        let heap_pages = (HEAP_PAGE / page).max(1);
+        let (over, one_run, two_runs) = (BLOCK, BLOCK + 0x2000, BLOCK + 0x4000);
+        // An indirect command buffer's slots.
+        let slots = BLOCK + 0x6000;
+        // Each heap, and its block.
+        let heaps = match runs {
+            Runs::One => {
+                pages(over, &[(3, 1)]);
+                pages(one_run, &[(8, heap_pages)]);
+                [(20, one_run)]
+            }
+            Runs::Two => {
+                pages(two_runs, &[(16, heap_pages), (24, heap_pages)]);
+                pages(slots, &[(32, 1), (40, 1)]);
+                [(30, two_runs)]
+            }
+        };
+
+        if runs == Runs::One {
+            let buffer_over = RgfxBufferOverPages {
+                header: header(RGFX_CMD_BUFFER_OVER_PAGES),
+                obj_id: 10,
+                block_offset: over,
+                block_size: 0x2000,
+                length: page,
+                ..RgfxBufferOverPages::default()
+            };
+            assert_eq!(
+                dec.decode(&device, buffer_over.as_bytes()).unwrap(),
+                Ok(()),
+                "the no-copy buffer over the guest's pages is made"
+            );
+            assert_eq!(
+                dec.escape_of(10).map(|e| e.over()),
+                Some(NoCopy::Pages),
+                "in place"
+            );
+        }
+        for (heap, block) in heaps {
+            let heap_over = RgfxHeapOverPages {
+                header: header(RGFX_CMD_HEAP_OVER_PAGES),
+                obj_id: heap,
+                gpu_address: 0,
+                block_offset: block,
+                block_size: 0x2000,
+                size_bytes: HEAP_PAGE,
+                options: 0,
+                // MTLHeapTypePlacement.
+                heap_type: 1,
+            };
+            assert_eq!(
+                dec.decode(&device, heap_over.as_bytes()).unwrap(),
+                Ok(()),
+                "the heap {heap} over the guest's pages is made"
+            );
+            let at = RgfxBufferAtOffset {
+                header: header(RGFX_CMD_BUFFER_AT_OFFSET),
+                obj_id: heap + 1,
+                heap_obj_id: heap,
+                offset: 0,
+                length: 0x100,
+                options: 0,
+                reserved_34: 0,
+            };
+            assert_eq!(dec.decode(&device, at.as_bytes()).unwrap(), Ok(()));
+        }
+        if runs == Runs::Two {
+            // The indirect command buffer's slots in their pages block of two runs, which the
+            // host reads and writes in place (`ICB_SLOTS_IN_PAGES`), in the block's view.
+            let own = (dec.own_pages(&device, slots, 0x2000).unwrap()).expect("the slots' pages");
+            let view = own.at().as_ptr::<u32>();
+            // SAFETY: the first words of pages 32 and 40 of the RAM's 64, which `ram` keeps
+            // mapped, and of the view's two pages, which `own` keeps mapped, used while no command
+            // runs.
+            unsafe {
+                let (first, second) = (
+                    ram.at.add((32 * page) as usize),
+                    ram.at.add((40 * page) as usize),
+                );
+                first.cast::<u32>().write_volatile(0x4444_4444);
+                assert_eq!(
+                    view.read_volatile(),
+                    0x4444_4444,
+                    "the guest's write, in the slots"
+                );
+                view.add((page / 4) as usize).write_volatile(0x5555_5555);
+                assert_eq!(
+                    second.cast::<u32>().read_volatile(),
+                    0x5555_5555,
+                    "the host's write, in the guest's second run"
+                );
+            }
+        }
+
+        let shared = |length: u64| {
+            device
+                .new_buffer_of_length(OnFault::Die, length, 0)
+                .unwrap()
+                .unwrap()
+        };
+        let queue = device.new_command_queue().unwrap();
+        // A blit of `size` bytes from `from` at `from_at` into `to` at `to_at`, waited for.
+        let copy = |from: &P::Buffer, from_at: u64, to: &P::Buffer, to_at: u64, size: u64| {
+            let cb = queue.command_buffer(OnFault::Die).unwrap().unwrap();
+            let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+            let cmd = BlitCmd::CopyBufferToBuffer {
+                source_buffer: Some(from),
+                source_offset: from_at,
+                destination_buffer: Some(to),
+                destination_offset: to_at,
+                size,
+            };
+            blit.encode(OnFault::Die, cmd).unwrap();
+            blit.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+            cb.commit(OnFault::Die).unwrap();
+            cb.wait_until_completed(OnFault::Die).unwrap();
+            assert!(cb.error().is_none(), "{:?}", cb.error());
+        };
+        let (out, input) = (shared(4), shared(4));
+        const OLD: u32 = 0x1111_1111;
+        const NEW: u32 = 0x2222_2222;
+        const GPU: u32 = 0x3333_3333;
+        // SAFETY: a Shared buffer of 4 bytes, which no command uses yet.
+        unsafe { input.contents().as_ptr::<u32>().write(GPU) };
+        // Each buffer, and the page of the RAM its bytes begin at.
+        let buffers: &[(u64, u64)] = match runs {
+            Runs::One => &[(10, 3), (21, 8)],
+            Runs::Two => &[(31, 16)],
+        };
+        for &(obj_id, first) in buffers {
+            let Some(ObjHandle::Buffer(buffer)) = dec.object(obj_id) else {
+                panic!("no buffer {obj_id}");
+            };
+            // SAFETY: `first` pages into the RAM's `64 * page` bytes, which `ram` keeps mapped.
+            let words = unsafe { ram.at.add((first * page) as usize).cast::<u32>() };
+            let write = |at: usize, value: u32| {
+                // SAFETY: a word of the buffer's pages, written while no command runs.
+                unsafe { words.add(at).write_volatile(value) }
+            };
+            // SAFETY: a word of the buffer's pages, read while no command runs.
+            let read = |at: usize| unsafe { words.add(at).read_volatile() };
+            write(0, OLD);
+            write(2, 0);
+            // The buffer's first word, as a blit out of it reads it.
+            let gpu_read = || {
+                copy(buffer, 0, &out, 0, 4);
+                // SAFETY: a Shared buffer's first word, read after the blit completed.
+                unsafe { out.contents().as_ptr::<u32>().read() }
+            };
+            assert_eq!(gpu_read(), OLD, "buffer {obj_id}: before the CPU's write");
+            write(0, NEW);
+            assert_eq!(gpu_read(), NEW, "buffer {obj_id}: after the CPU's write");
+            copy(&input, 0, buffer, 8, 4);
+            assert_eq!(
+                read(2),
+                GPU,
+                "buffer {obj_id}: the GPU's write, in the guest's pages"
+            );
+        }
+    }
+
+    /// [`no_copy_memory_over_pages_lies_over_the_guests_bytes`] on the Vulkan platform, in blocks
+    /// of one run.
+    #[test]
+    fn on_vulkan_no_copy_memory_over_one_run_lies_over_the_guests_bytes() {
+        use reims_vgpu_vulkan::VulkanPlatform;
+        no_copy_memory_over_pages_lies_over_the_guests_bytes::<VulkanPlatform>(Runs::One);
+    }
+
+    /// [`no_copy_memory_over_pages_lies_over_the_guests_bytes`] on the Vulkan platform, in blocks
+    /// of two runs.
+    #[test]
+    fn on_vulkan_no_copy_memory_over_two_runs_lies_over_the_guests_bytes() {
+        use reims_vgpu_vulkan::VulkanPlatform;
+        no_copy_memory_over_pages_lies_over_the_guests_bytes::<VulkanPlatform>(Runs::Two);
+    }
+
+    /// [`no_copy_memory_over_pages_lies_over_the_guests_bytes`] on the rt platform, in blocks of
+    /// one run. Its views of the guest's pages, and its imports of them where the GPU takes no
+    /// pointer to them, need the lease of its RAM as the Vulkan platform's do: without it the
+    /// buffers and heaps are refused, and an app's CPU-drawn content in its own memory (images,
+    /// glyphs) never reaches the GPU.
+    #[cfg(feature = "rt")]
+    #[test]
+    fn on_vulkan_rt_s_no_copy_memory_over_one_run_lies_over_the_guests_bytes() {
+        use reims_vgpu_vulkan::RtPlatform;
+        no_copy_memory_over_pages_lies_over_the_guests_bytes::<RtPlatform>(Runs::One);
     }
 
     /// The marker that makes a run of [`on_vulkan_a_recording_holds_each_buffers_first_escape`]
