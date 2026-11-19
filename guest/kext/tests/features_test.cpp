@@ -118,6 +118,9 @@ constexpr uint64_t kPoolAddressesCarried = RGFX_GUEST_ARM64 ? 0 : kPoolAddresses
 // PRIVATE_BLOCKS, which both kexts carry, handing their processes the Private blocks the host
 // gives their contexts.
 constexpr uint64_t kPrivateBlocks = RGFX_FEATURE_PRIVATE_BLOCKS;
+// IMPORT_ADDRESSES, which both kexts carry, handing their processes the GPU address the host gave
+// each pages block's view.
+constexpr uint64_t kImportAddresses = RGFX_FEATURE_IMPORT_ADDRESSES;
 // A bit the wire does not name.
 constexpr uint64_t kUnnamed = 1ull << 63;
 // Every bit the wire names from bit 3 that the kext does not carry out yet.
@@ -214,7 +217,7 @@ constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kH
                               kPointerMotion | k16KCarried | kVtMessagesCarried | kUploadsWritten |
                               kVtRingCarried | kCursorColorCarried | kBufferEscaped |
                               kPoolCarried | kSurfaceRefill | kPoolAddressesCarried |
-                              kPrivateBlocks;
+                              kPrivateBlocks | kImportAddresses;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -230,7 +233,8 @@ int main()
 	// TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, PIPELINE_KEYS,
 	// ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, DOORBELL_PAGES,
 	// PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, DISPLAY_BOUNDS,
-	// UPLOADS_WRITTEN, BUFFER_ESCAPED, SURFACE_REFILL, PRIVATE_BLOCKS and, the x86-64 kext,
+	// UPLOADS_WRITTEN, BUFFER_ESCAPED, SURFACE_REFILL, PRIVATE_BLOCKS, IMPORT_ADDRESSES and, the
+	// x86-64 kext,
 	// DISPLAY_POWER, POOL and POOL_ADDRESSES, or, the arm64e kext, PAGES_16K, VT_MESSAGES, VT_RING
 	// and CURSOR_COLOR, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
@@ -242,7 +246,8 @@ int main()
 	      "DISPLAY_SCALE, TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, "
 	      "PIPELINE_KEYS, ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, "
 	      "DOORBELL_PAGES, PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, "
-	      "DISPLAY_BOUNDS, UPLOADS_WRITTEN, BUFFER_ESCAPED, SURFACE_REFILL, PRIVATE_BLOCKS and, "
+	      "DISPLAY_BOUNDS, UPLOADS_WRITTEN, BUFFER_ESCAPED, SURFACE_REFILL, PRIVATE_BLOCKS, "
+	      "IMPORT_ADDRESSES and, "
 	      "on x86-64, DISPLAY_POWER, POOL and POOL_ADDRESSES, on arm64e PAGES_16K, "
 	      "VT_MESSAGES, VT_RING and CURSOR_COLOR, from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
@@ -545,6 +550,15 @@ int main()
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kPoolAddresses, kPoolAddresses) ==
 	          (kRgfxOfferedFeatures | kPoolAddressesCarried),
 	      "POOL_ADDRESSES taken is in the word where carried");
+	check(RGFX_FEATURE_IMPORT_ADDRESSES == (1ull << 61), "IMPORT_ADDRESSES is bit 61");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kImportAddresses) ==
+	          kImportAddresses,
+	      "IMPORT_ADDRESSES offered, written by both kexts");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kImportAddresses, 0) == kRgfxOfferedFeatures,
+	      "IMPORT_ADDRESSES offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kImportAddresses, kImportAddresses) ==
+	          (kRgfxOfferedFeatures | kImportAddresses),
+	      "IMPORT_ADDRESSES taken is in the word");
 	// PAGES_16K: the arm64e kext writes it first where offered, and then with the rest; the
 	// x86-64 kext never writes it, and writes nothing first.
 	check(rgfxDriverFeaturesFirst(~0ull) == k16KCarried, "PAGES_16K first where carried");

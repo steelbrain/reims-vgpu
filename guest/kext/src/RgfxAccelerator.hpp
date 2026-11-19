@@ -113,7 +113,8 @@ constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeatureZeroedBlocks |
                                           kRgfxKextFeaturePoolCarried |
                                           kRgfxKextFeaturePoolAddressesCarried |
-                                          kRgfxKextFeaturePrivateBlocks;
+                                          kRgfxKextFeaturePrivateBlocks |
+                                          kRgfxKextFeatureImportAddresses;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
@@ -496,12 +497,13 @@ public:
 	IOReturn freeBlock(RgfxAcceleratorUserClient *owner, UInt64 offset);
 	// A pages block (kRgfxAccelMethodPagesBlock) of `owner` of context `context` over the
 	// `length` bytes at `address` in `task`, `writable` there or not (rgfxPagesWiring): the
-	// block's offset and size. The
+	// block's offset and size, and the GPU address the device gave its view, 0 where none
+	// (RGFX_FEATURE_IMPORT_ADDRESSES, rgfxPagesAnswer). The
 	// block is never in the owner's window; freeBlock frees it, and its pages are unwired once
 	// its release is answered OK, or once freeBlocks frees it after the owner's close.
 	IOReturn pagesBlock(RgfxAcceleratorUserClient *owner, UInt32 context, task_t task,
 	                    UInt64 address, UInt64 length, bool writable, UInt64 *offset,
-	                    UInt64 *size);
+	                    UInt64 *size, UInt64 *gpuAddress);
 	// A chunked pages block (kRgfxAccelMethodPagesChunked) of `owner` of context `context`: the
 	// `length` bytes of the kext's own chunks, mapped into `task` at `*address`, and the block of
 	// their runs, its offset and size. The block holds the chunks and their mapping: freeBlock
@@ -748,18 +750,21 @@ private:
 	// `flags` (RGFX_SURFACE_PAGES_*, none sent where 0) and `layout` after them where given
 	// (rgfxPagesCarryLayout). kIOReturnSuccess where the device answered OK,
 	// kIOReturnUnsupported where it answered otherwise, its status in `*status` where asked for,
-	// else why it did not answer.
+	// and the GPU address it gave the block's view in `*gpuAddress` where asked for, 0 where
+	// none (rgfxPagesAnswer); else why it did not answer.
 	IOReturn postPages(UInt32 context, UInt64 offset, UInt64 total, UInt64 runsOffset,
 	                   UInt64 length, UInt32 count, UInt32 flags, UInt32 *status = nullptr,
-	                   const RgfxSurfacePagesLayout *layout = nullptr);
+	                   const RgfxSurfacePagesLayout *layout = nullptr,
+	                   UInt64 *gpuAddress = nullptr);
 	// A pages block's making past its memory's (pagesBlock, pagesChunked): the runs of the
 	// `length` bytes `md` describes, wired, in a block of `owner`'s that holds `wired` from here
 	// on (unwire), the device told of them (SURFACE_PAGES, of `flags`: RGFX_SURFACE_PAGES_PRIVATE,
 	// and RGFX_SURFACE_PAGES_READ_ONLY for read-only memory) and the block granted: its offset
-	// and size. `wired` is unwired where no block is made.
+	// and size, and in `*gpuAddress` where asked for, the GPU address the device gave its view,
+	// 0 where none. `wired` is unwired where no block is made.
 	IOReturn pagesBlockOver(RgfxAcceleratorUserClient *owner, UInt32 context,
 	                        IOMemoryDescriptor *md, UInt64 length, void *wired, UInt64 *offset,
-	                        UInt64 *size, UInt32 flags);
+	                        UInt64 *size, UInt32 flags, UInt64 *gpuAddress);
 	// The new deferred block of entry `e`, pending, held by its asker of context `context` alone,
 	// `total` bytes with its runs' room, its surface laid out as `layout`: makes its surface's
 	// device cache and reads the surface (rgfxSurfaceLocksDefer); fresh, asks the host to defer

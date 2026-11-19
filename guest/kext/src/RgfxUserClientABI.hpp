@@ -56,7 +56,9 @@ enum {
 	kRgfxAccelMethodFeatures = 3,
 	// A pages block over the process's own memory (kRgfxKextFeaturePagesBlock;
 	// RgfxPagesBlock.hpp): in the memory's address in the process, its bytes, and 1 for memory the
-	// process may write; out the block's region offset and its size. The kext wires the pages that
+	// process may write; out the block's region offset and its size, and where asked for
+	// (kRgfxKextFeatureImportAddresses), a third: the GPU address the device gave the block's
+	// view, 0 where it gave none. The kext wires the pages that
 	// hold the range, rounded out to whole pages, in the process for as long as the block lives,
 	// lists their guest RAM runs in the block, and hands them to the device (SURFACE_PAGES, marked
 	// RGFX_SURFACE_PAGES_PRIVATE) before its grant (BLOCK_GRANT): the device's view of them starts
@@ -439,6 +441,10 @@ enum {
 	// PrivateTake, 18, and PrivateGive, 22, which the bundle uses where the feature word holds
 	// RGFX_FEATURE_PRIVATE_BLOCKS too; the x86-64 and arm64e kexts.
 	kRgfxKextFeaturePrivateBlocks = 1 << 17,
+	// PagesBlock's (4) third output, the GPU address the device gave the block's view, which the
+	// bundle asks for where the feature word holds RGFX_FEATURE_IMPORT_ADDRESSES too; the x86-64
+	// and arm64e kexts.
+	kRgfxKextFeatureImportAddresses = 1 << 18,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

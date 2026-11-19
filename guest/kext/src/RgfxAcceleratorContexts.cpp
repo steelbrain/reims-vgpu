@@ -3083,7 +3083,8 @@ bool RgfxAccelerator::postSurfacePages(UInt32 context, UInt64 offset, UInt64 tot
 
 IOReturn RgfxAccelerator::postPages(UInt32 context, UInt64 offset, UInt64 total,
                                     UInt64 runsOffset, UInt64 length, UInt32 count, UInt32 flags,
-                                    UInt32 *status, const RgfxSurfacePagesLayout *layout)
+                                    UInt32 *status, const RgfxSurfacePagesLayout *layout,
+                                    UInt64 *gpuAddress)
 {
 	// The message, then where it has flags, the part that holds them, and where it has a layout,
 	// the layout.
@@ -3114,22 +3115,28 @@ IOReturn RgfxAccelerator::postPages(UInt32 context, UInt64 offset, UInt64 total,
 	const UInt32 bytes = layout  ? sizeof(message)
 	                     : flags ? RGFX_SURFACE_PAGES_LAYOUT_OFFSET
 	                             : sizeof(message.pages);
-	RgfxComplete answer = {};
+	// A COMPLETE, or for a pages block where the kext took IMPORT_ADDRESSES, an RgfxPagesAnswer,
+	// which carries the GPU address of the block's view (rgfxPagesAnswer).
+	RgfxPagesAnswer answer = {};
 	UInt32 answered = 0;
 	IOReturn r = postLifecycle(RGFX_CMD_SURFACE_PAGES, &message, bytes, RGFX_EVT_COMPLETE,
 	                           &answer, sizeof(answer), &answered, nullptr, kQueueAnswerMs);
-	if (r == kIOReturnSuccess && answered < sizeof(answer))
+	UInt32 answeredStatus = 0;
+	UInt64 at = 0;
+	if (r == kIOReturnSuccess && !rgfxPagesAnswer(answer, answered, &answeredStatus, &at))
 		r = kIOReturnTimeout;
 	if (r != kIOReturnSuccess)
 		return r;
 	if (status)
-		*status = answer.status;
-	return answer.status == RGFX_STATUS_OK ? kIOReturnSuccess : kIOReturnUnsupported;
+		*status = answeredStatus;
+	if (gpuAddress)
+		*gpuAddress = at;
+	return answeredStatus == RGFX_STATUS_OK ? kIOReturnSuccess : kIOReturnUnsupported;
 }
 
 IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 context,
                                      task_t task, UInt64 address, UInt64 length, bool writable,
-                                     UInt64 *offset, UInt64 *size)
+                                     UInt64 *offset, UInt64 *size, UInt64 *gpuAddress)
 {
 	if (!contextLock)
 		return kIOReturnNotReady;
@@ -3169,7 +3176,8 @@ IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 c
 		md->release();
 		return kIOReturnBadArgument;
 	}
-	return pagesBlockOver(client, context, md, range.length, md, offset, size, wiring.flags);
+	return pagesBlockOver(client, context, md, range.length, md, offset, size, wiring.flags,
+	                      gpuAddress);
 }
 
 IOReturn RgfxAccelerator::pagesChunked(RgfxAcceleratorUserClient *client, UInt32 context,
@@ -3225,8 +3233,8 @@ IOReturn RgfxAccelerator::pagesChunked(RgfxAcceleratorUserClient *client, UInt32
 	}
 	md->release();
 	const UInt64 at = map->getAddress();
-	const IOReturn r =
-	    pagesBlockOver(client, context, md, length, map, offset, size, RGFX_SURFACE_PAGES_PRIVATE);
+	const IOReturn r = pagesBlockOver(client, context, md, length, map, offset, size,
+	                                  RGFX_SURFACE_PAGES_PRIVATE, nullptr);
 	if (r == kIOReturnSuccess)
 		*address = at;
 	return r;
@@ -3234,7 +3242,8 @@ IOReturn RgfxAccelerator::pagesChunked(RgfxAcceleratorUserClient *client, UInt32
 
 IOReturn RgfxAccelerator::pagesBlockOver(RgfxAcceleratorUserClient *client, UInt32 context,
                                          IOMemoryDescriptor *md, UInt64 length, void *wired,
-                                         UInt64 *offset, UInt64 *size, UInt32 flags)
+                                         UInt64 *offset, UInt64 *size, UInt32 flags,
+                                         UInt64 *gpuAddress)
 {
 	auto segment = [md](uint64_t at, uint64_t *bytes) -> uint64_t {
 		IOByteCount n = 0;
@@ -3274,7 +3283,9 @@ IOReturn RgfxAccelerator::pagesBlockOver(RgfxAcceleratorUserClient *client, UInt
 		written = rgfxPagesRuns(length, segment, runs, count) == count;
 		map->release();
 	}
-	IOReturn r = written ? postPages(context, at, bytes, at, length, count, flags)
+	UInt64 viewAddress = 0;
+	IOReturn r = written ? postPages(context, at, bytes, at, length, count, flags, nullptr,
+	                                 nullptr, &viewAddress)
 	                     : kIOReturnUnsupported;
 	// The device has no view of a block it never heard of, or refused: the block goes back as if
 	// never made, and its pages are unwired.
@@ -3316,6 +3327,8 @@ IOReturn RgfxAccelerator::pagesBlockOver(RgfxAcceleratorUserClient *client, UInt
 	}
 	*offset = at;
 	*size = bytes;
+	if (gpuAddress)
+		*gpuAddress = viewAddress;
 	return kIOReturnSuccess;
 }
 

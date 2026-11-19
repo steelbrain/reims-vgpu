@@ -3,7 +3,7 @@
 // contiguous segments, and its size in whole pages; and a span's runs and length taken to the
 // end of its last 16 KiB page, as PAGES_16K names them; and how a block's pages are wired, and
 // marked, for memory the process maps writable or read-only; and the physical alignment of the
-// kext's chunks.
+// kext's chunks; and what a pages block's SURFACE_PAGES answer gives.
 #include "RgfxPagesBlock.hpp"
 
 #include <cstdio>
@@ -158,6 +158,30 @@ int main()
 		check(run.address % kRgfxPagesChunk == 0 && run.length % kRgfxPagesChunk == 0,
 		      "each run of chunks starts and ends at a multiple of 64 KiB");
 	check(chunkRuns[0].length == 2 * kRgfxPagesChunk, "the two chunks that meet are one run");
+
+	// A pages block's SURFACE_PAGES answer: the address an RgfxPagesAnswer carries where OK, none
+	// where it refuses or is a COMPLETE alone, and no answer where shorter than a COMPLETE.
+	RgfxPagesAnswer answer = {};
+	answer.status = RGFX_STATUS_OK;
+	answer.gpu_address = 1ull << 43;
+	uint32_t status = 0;
+	uint64_t gpuAddress = 1;
+	check(rgfxPagesAnswer(answer, sizeof(RgfxPagesAnswer), &status, &gpuAddress) &&
+	          status == RGFX_STATUS_OK && gpuAddress == 1ull << 43,
+	      "an answer of 32 bytes, OK: its address");
+	gpuAddress = 1;
+	check(rgfxPagesAnswer(answer, sizeof(RgfxComplete), &status, &gpuAddress) &&
+	          status == RGFX_STATUS_OK && gpuAddress == 0,
+	      "a COMPLETE alone, OK: no address");
+	answer.status = RGFX_STATUS_REFUSED;
+	gpuAddress = 1;
+	check(rgfxPagesAnswer(answer, sizeof(RgfxPagesAnswer), &status, &gpuAddress) &&
+	          status == RGFX_STATUS_REFUSED && gpuAddress == 0,
+	      "an answer of 32 bytes refused: no address");
+	check(!rgfxPagesAnswer(answer, sizeof(RgfxComplete) - 1, &status, &gpuAddress),
+	      "fewer bytes than a COMPLETE: no answer");
+	check(sizeof(RgfxComplete) == 24 && sizeof(RgfxPagesAnswer) == 32,
+	      "a COMPLETE of 24 bytes, a pages answer of 32");
 
 	std::printf("pages_block_test: OK (%d checks)\n", checks);
 	return 0;

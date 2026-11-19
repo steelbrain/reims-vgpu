@@ -11,6 +11,10 @@
 // RGFX_SURFACE_PAGES_READ_ONLY, for the host to keep every object over it from writing them
 // (rgfxPagesWiring).
 //
+// Where the guest took RGFX_FEATURE_IMPORT_ADDRESSES, the device answers a pages block's
+// SURFACE_PAGES with the GPU address of the block's view, at which the bundle places its buffers
+// over the block (rgfxPagesAnswer).
+//
 // The range a call names is rounded out to whole pages, as the wiring takes them; the device's
 // view starts at the first page, so a buffer over the call's first byte lies at its offset in that
 // page (rgfxPagesRange). Its runs are counted in one pass over the wired range's physical
@@ -177,6 +181,23 @@ inline void rgfxRunsToPageEnd(RgfxPageRun *runs, uint32_t count, uint64_t page)
 		return;
 	RgfxPageRun &last = runs[count - 1];
 	last.length = rgfxToPageEnd(last.address + last.length, page) - last.address;
+}
+
+// What the `answered` bytes of a pages block's SURFACE_PAGES answer copied into `answer` say:
+// false where they are fewer than a COMPLETE's, an answer not given; else its status, and the GPU
+// address the host gave the block's view (RGFX_FEATURE_IMPORT_ADDRESSES) where the answer is an
+// RgfxPagesAnswer and its status is OK, and 0 where it is a COMPLETE alone, as the device answers
+// a guest that did not take the feature, or the host gave the block none.
+inline bool rgfxPagesAnswer(const RgfxPagesAnswer &answer, uint32_t answered, uint32_t *status,
+                            uint64_t *gpuAddress)
+{
+	if (answered < sizeof(RgfxComplete))
+		return false;
+	*status = answer.status;
+	*gpuAddress = answered >= sizeof(RgfxPagesAnswer) && answer.status == RGFX_STATUS_OK
+	                  ? answer.gpu_address
+	                  : 0;
+	return true;
 }
 
 #endif // RGFX_PAGES_BLOCK_HPP_
