@@ -5636,12 +5636,19 @@ fn the_host_is_told_the_driver_s_features_as_it_becomes_ready() {
     rig.start();
     assert_eq!(ready(), vec![RGFX_FEATURE_MANAGED_AT_COPY]);
     rig.start();
-    assert_eq!(ready(), vec![RGFX_FEATURE_MANAGED_AT_COPY], "once while ready");
+    assert_eq!(
+        ready(),
+        vec![RGFX_FEATURE_MANAGED_AT_COPY],
+        "once while ready"
+    );
     rig.device
         .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
     write_hi(RGFX_FEATURE_POOL);
     rig.start();
-    assert_eq!(ready(), vec![RGFX_FEATURE_MANAGED_AT_COPY, RGFX_FEATURE_POOL]);
+    assert_eq!(
+        ready(),
+        vec![RGFX_FEATURE_MANAGED_AT_COPY, RGFX_FEATURE_POOL]
+    );
 }
 
 /// A `POOL_TAKE`'s `POOL_BLOCK` on `rig`: its status, offset, length and GPU address.

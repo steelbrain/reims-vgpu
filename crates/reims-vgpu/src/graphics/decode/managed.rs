@@ -2146,18 +2146,32 @@ mod tests {
             let calls: Vec<_> = (r.p.call_log().since(mark).into_iter())
                 .map(|c| (c.class, c.sel, c.args))
                 .collect();
-            assert_eq!(count() - counted_before, u64::from(taken), "counted where taken");
+            assert_eq!(
+                count() - counted_before,
+                u64::from(taken),
+                "counted where taken"
+            );
             let placed = address(&r, obj_id);
             assert_ne!(placed, at, "where the platform placed it");
             let bound = r.dec.require_buffer(obj_id).ok().map(|b| b.gpu_address());
             let unkept = unpinned() - unpinned_before;
             let modified = r.modified(obj_id, 0, 4);
             let synchronized = r.synchronize(obj_id, RGFX_BLIT_RESOURCE_BUFFER).unwrap();
-            answers.push((made, calls, bound == Some(placed), unkept, modified, synchronized));
+            answers.push((
+                made,
+                calls,
+                bound == Some(placed),
+                unkept,
+                modified,
+                synchronized,
+            ));
         }
         assert_eq!(answers[0].0, Ok(()));
         assert_eq!(answers[0].3, 1, "its pin counted unkept");
-        assert_eq!(answers[0], answers[1], "the bit's answers are the create's without it");
+        assert_eq!(
+            answers[0], answers[1],
+            "the bit's answers are the create's without it"
+        );
         assert_eq!(count(), before + 1);
     }
 
@@ -2205,7 +2219,11 @@ mod tests {
         let unified = (device.identity_caps().flags.has_unified_memory).unwrap_or(false);
         let pins = <RtPlatform as ApiPlatform>::PINS_IN_BLOCKS;
         let offered = crate::graphics::managed_at_copy(unified, pins, true);
-        assert_eq!(offered == RGFX_FEATURE_MANAGED_AT_COPY, unified, "offered on unified alone");
+        assert_eq!(
+            offered == RGFX_FEATURE_MANAGED_AT_COPY,
+            unified,
+            "offered on unified alone"
+        );
         let unkept = || {
             (counted_kinds().into_iter())
                 .find(|&(c, _)| c == MANAGED_AT_COPY_UNKEPT)
@@ -2282,8 +2300,15 @@ mod tests {
                 answers.push((made, bound.is_some_and(|at| at != GUEST_ADDRESS)));
             }
             dec.set_managed_at_copy(true);
-            assert_eq!(answers[0], (Ok(()), true), "made, bound, at rt's own address");
-            assert_eq!(answers[0], answers[1], "the bit's answers are the create's without it");
+            assert_eq!(
+                answers[0],
+                (Ok(()), true),
+                "made, bound, at rt's own address"
+            );
+            assert_eq!(
+                answers[0], answers[1],
+                "the bit's answers are the create's without it"
+            );
         }
 
         // The slab's copy, at the pool block's address plus its offset.
@@ -2337,7 +2362,11 @@ mod tests {
         assert_eq!(dec.decode(&device, managed.as_bytes()).unwrap(), Ok(()));
         let buffer = buffer_of(&dec, of_1(22));
         if unified {
-            assert_eq!(buffer.gpu_address(), posted, "at the address the guest posted");
+            assert_eq!(
+                buffer.gpu_address(),
+                posted,
+                "at the address the guest posted"
+            );
         }
         let held = buffer.gpu_address();
 
@@ -2401,10 +2430,18 @@ mod tests {
             assert_eq!(reach(), OLD, "the CPU's bytes");
             assert_eq!(read(1), KERNEL, "the kernel's write, in the CPU's bytes");
             write(0, NEW);
-            assert_eq!(reach(), NEW, "the CPU's later write, with no didModifyRange");
+            assert_eq!(
+                reach(),
+                NEW,
+                "the CPU's later write, with no didModifyRange"
+            );
         } else {
             assert_eq!(reach(), OLD, "the GPU's copy, as of the first commit");
-            assert_eq!(read(1), AFTER, "the kernel's write, in the GPU's copy alone");
+            assert_eq!(
+                read(1),
+                AFTER,
+                "the kernel's write, in the GPU's copy alone"
+            );
             write(0, NEW);
             assert_eq!(reach(), OLD, "the GPU's copy, before a didModifyRange");
             (buffer.did_modify_range(OnFault::Die, NsRange::new(0, 4))).unwrap();

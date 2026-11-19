@@ -14372,12 +14372,18 @@ fn managed_at_copy_is_offered_only_on_a_unified_gpu_of_rt_with_the_pool() {
     {
         let rt = <reims_vgpu_vulkan::RtPlatform as ApiPlatform>::PINS_IN_BLOCKS;
         assert!(rt);
-        assert_eq!(managed_at_copy(true, rt, true), RGFX_FEATURE_MANAGED_AT_COPY);
+        assert_eq!(
+            managed_at_copy(true, rt, true),
+            RGFX_FEATURE_MANAGED_AT_COPY
+        );
         assert_eq!(managed_at_copy(false, rt, true), 0, "two copies");
         assert_eq!(managed_at_copy(false, rt, false), 0, "two copies, no pool");
         assert_eq!(managed_at_copy(true, rt, false), 0, "no pool");
     }
-    assert_eq!(managed_at_copy(true, true, true), RGFX_FEATURE_MANAGED_AT_COPY);
+    assert_eq!(
+        managed_at_copy(true, true, true),
+        RGFX_FEATURE_MANAGED_AT_COPY
+    );
     // The fake platform answers a GPU that shares the CPU's memory: with the pool, no such bit.
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
