@@ -509,8 +509,9 @@ mod tests {
 
     /// A shape a command buffer writes is dirty from its finish: a download copies it into the
     /// cache's buffer, at its place there, before it copies the buffer into the pages (rule 3),
-    /// and once: the next download, nothing written since, writes nothing back. A release after
-    /// another write writes it back again before its copy
+    /// and once: the next download, nothing written since, writes nothing back. The surface reads
+    /// back then, and the next writer's early copy into the pages writes the shape back first
+    /// too. A release after a write writes it back before its copy
     #[test]
     fn a_download_or_release_writes_a_dirty_shape_back_before_its_copy() {
         let mut r = shaped();
@@ -545,7 +546,21 @@ mod tests {
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(again.load(Ordering::SeqCst));
 
+        let mark = r.p.call_log().mark();
         write(&mut r, 0x101, 21, (32, 8));
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(written_back(&calls), [(image, cache, 0)], "the early copy's");
+        let back = first(&calls, TO_BUFFER);
+        assert!(copies(&calls[..back]).is_empty(), "written back first");
+        assert_eq!(copies(&calls[back..]).len(), 1);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let counts = r.dec.caches().counts();
+        assert_eq!((counts.early, counts.shapes.written_back), (1, 2));
+
+        let mut r = shaped();
+        let cache = cache_id(&r);
+        let image = texture_image(&mut r, 21, 80, (32, 8));
+        write(&mut r, 0x100, 21, (32, 8));
         r.p.world().complete_all(CompleteOn::Caller);
         let mark = r.p.call_log().mark();
         let released = release(&r, BLOCK);
@@ -556,7 +571,7 @@ mod tests {
         assert_eq!(copies(&calls[back..]).len(), 1);
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(released.load(Ordering::SeqCst));
-        assert_eq!(r.dec.caches().counts().shapes.written_back, 2);
+        assert_eq!(r.dec.caches().counts().shapes.written_back, 1);
     }
 
     /// A new shape is filled from the buffer after the dirty shapes are written back into it, in
