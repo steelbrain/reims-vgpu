@@ -641,7 +641,7 @@ mod tests {
     use crate::core::platform::types::{ClearColor, CommandBufferStatus, NsRange};
     use crate::core::platform::values::{
         AttributeDesc, BufferLayoutDesc, ColorAttachmentDesc, ColorAttachmentSet,
-        FullRenderPipelineDesc, TextureDesc, VertexDesc,
+        FullRenderPipelineDesc, PassSet, TextureDesc, VertexDesc,
     };
     use crate::rt_platform::unbuilt::RtRefusal;
     use crate::rt_platform::{PassFields, RtCommandBuffer, RtTexture};
@@ -818,6 +818,43 @@ mod tests {
         // A loaded pass with no draw keeps what was stored.
         assert_eq!(run(&made(), &pass(&target, 1), Vec::new()), done);
         assert_eq!(texels(), every(green));
+
+        // A pass with a visibility result buffer, its set counted nowhere, draws over its cleared
+        // target with no mode enabled, and the buffer's bytes stay as they were.
+        let results = device.new_buffer_of_length(on, 16, 0);
+        let results = results.expect("never a raise").expect("a buffer");
+        // SAFETY: the Shared buffer's contents are mapped, 16 bytes long.
+        unsafe { results.contents().as_ptr::<u8>().write_bytes(0xa5, 16) };
+        let passes = counted(Unbuilt::RenderPass.code());
+        let kept = pass(&target, 2);
+        kept.set_pass(&PassSet {
+            visibility_result_buffer: Some(Some(&results)),
+            ..PassSet::default()
+        });
+        assert_eq!(counted(Unbuilt::RenderPass.code()), passes);
+        let d = kept.rt_pass().expect("rt's descriptor");
+        assert!(d.visibility_result_buffer.is_some());
+        let draw = vec![
+            RenderCmd::SetVisibilityResultMode { mode: 0, offset: 8 },
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            },
+            RenderCmd::SetVertexBuffer {
+                buffer: Some(&buffer),
+                offset: 0,
+                index: 0,
+            },
+            RenderCmd::DrawPrimitives {
+                primitive_type: TRIANGLE,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+        ];
+        assert_eq!(run(&made(), &kept, draw), done);
+        assert_eq!(texels(), every(green));
+        // SAFETY: as above; the command buffer has completed.
+        let bytes = unsafe { std::slice::from_raw_parts(results.contents().as_ptr::<u8>(), 16) };
+        assert_eq!(bytes, [0xa5; 16]);
 
         // A pass Metal refuses, and one rt refuses: nil, counted.
         let before = counted(metal);

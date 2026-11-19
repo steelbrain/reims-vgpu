@@ -8,7 +8,10 @@
 //! - **The render pass descriptor** keeps what rt's pass has a field of, as it is set
 //!   ([`PassFields`]), from Metal's defaults: each attachment's texture, held as Metal's
 //!   descriptor retains it, its level and slice, its load and store actions as Metal's raw values,
-//!   which its reads answer, and its clear value; and the render target's width and height. A
+//!   which its reads answer, and its clear value; the render target's width and height; and the
+//!   visibility result buffer, held as Metal's descriptor retains it. rt's command buffer keeps
+//!   that buffer until it retires, and its bytes stay as they were: rt's pass writes no result,
+//!   and a visibility result mode but `Disabled` is unbuilt at the encoder (`super::render`). A
 //!   render encoder's creation turns them into rt's descriptor ([`PassFields::rt_pass`]): an
 //!   action Metal has none of, or a level or slice past 32 bits, is Metal's refusal there, as
 //!   Metal asserts at the encoder's creation, and a width or height past 32 bits renders the
@@ -18,11 +21,14 @@
 //!     plane, and the resolve filters (a resolving store action is rt's refusal at the encoder); a
 //!     depth plane (rt renders into no 3D texture); store action options (rt renders one sample);
 //!     `defaultRasterSampleCount` (rt renders no pass without an attachment);
-//!     `defaultColorSampleCount` (SPI); and `visibilityResultType` (no visibility buffer is built).
+//!     `defaultColorSampleCount` (SPI); and `visibilityResultType`, which decides only what an
+//!     enabled visibility result mode writes: Metal's pass leaves the buffer's bytes as they were
+//!     under either type where its encoder enables no mode (rt's docs: an Apple M3 Max, macOS
+//!     27.0.1).
 //!   - **Unbuilt** ([`Unbuilt::RenderPass`]), counted at a set of other than Metal's default, and
-//!     kept nowhere, so the pass renders without them: a visibility result buffer, a render target
-//!     array length past 1, an imageblock sample length, a threadgroup memory length, a tile width
-//!     or height, and sample positions. No rasterization rate map is ever made to set.
+//!     kept nowhere, so the pass renders without them: a render target array length past 1, an
+//!     imageblock sample length, a threadgroup memory length, a tile width or height, and sample
+//!     positions. No rasterization rate map is ever made to set.
 //! - **The rate map descriptor** is unbuilt ([`Unbuilt::RateMap`]): rt has no rate maps.
 
 use crate::core::platform::descriptor::{RenderPassDescriptor, TextureDescriptor};
@@ -39,7 +45,7 @@ use metal2vulkan_rt as rt;
 
 use super::diag::{Point, Target};
 use super::unbuilt::{Unbuilt, refuse};
-use super::{RtObj, RtPlatform, RtTexture};
+use super::{RtBuffer, RtObj, RtPlatform, RtTexture};
 
 /// `MTLTextureDescriptor`: the values set, as Metal's descriptor keeps them.
 pub struct TextureFields(Mutex<TextureDesc>);
@@ -283,12 +289,13 @@ struct Pass {
     clear_stencil: u32,
     render_target_width: u64,
     render_target_height: u64,
+    visibility_result_buffer: Option<RtObj<RtBuffer>>,
 }
 
 impl Default for Pass {
     /// Metal's: colour attachments of `DontCare` loads and `Store` stores, cleared to opaque
     /// black; depth and stencil of `Clear` loads and `DontCare` stores, cleared to 1 and 0; no
-    /// texture, level and slice 0; no render target size.
+    /// texture, level and slice 0; no render target size and no visibility result buffer.
     fn default() -> Pass {
         let black = ClearColor {
             alpha: 1.0,
@@ -303,6 +310,7 @@ impl Default for Pass {
             clear_stencil: 0,
             render_target_width: 0,
             render_target_height: 0,
+            visibility_result_buffer: None,
         }
     }
 }
@@ -353,6 +361,8 @@ impl PassFields {
         // A size past 32 bits renders the area a size of the most 32 bits do: the attachments'.
         out.render_target_width = u32::try_from(pass.render_target_width).unwrap_or(u32::MAX);
         out.render_target_height = u32::try_from(pass.render_target_height).unwrap_or(u32::MAX);
+        let kept = pass.visibility_result_buffer.as_ref();
+        out.visibility_result_buffer = kept.map(|b| b.rt().clone());
         Ok(out)
     }
 
@@ -398,13 +408,10 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
         Ok(())
     }
 
-    /// The render target's width and height; the rest as the module's docs say.
+    /// The render target's width and height, and the visibility result buffer; the rest as the
+    /// module's docs say.
     fn set_pass(&self, set: &PassSet<'_, RtPlatform>) {
         let unbuilt = [
-            (
-                matches!(set.visibility_result_buffer, Some(Some(_))),
-                "setVisibilityResultBuffer:",
-            ),
             (
                 set.render_target_array_length.is_some_and(|n| n > 1),
                 "setRenderTargetArrayLength:",
@@ -429,6 +436,9 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
         }
         if let Some(height) = set.render_target_height {
             pass.render_target_height = height;
+        }
+        if let Some(buffer) = set.visibility_result_buffer {
+            pass.visibility_result_buffer = buffer.map(Handle::clone_ref);
         }
     }
 
