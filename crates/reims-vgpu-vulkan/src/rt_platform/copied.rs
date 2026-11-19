@@ -36,12 +36,13 @@ use std::alloc::Layout;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
 
 use metal2vulkan_rt as rt;
 
 use crate::core::num::{ToU64 as _, ToUsize as _};
 use crate::core::platform::device::NoCopyDeallocator;
+use crate::core::platform::os::Clock as _;
+use crate::core::platform::os::clock::MonoTime;
 use crate::core::sync::Mutex;
 
 /// The code whose count is the bytes the CPU changed in copied pages that commits wrote into their
@@ -134,10 +135,11 @@ pub(super) fn copy_in() {
     if !any() {
         return;
     }
-    let started = Instant::now();
+    let clock = crate::os::OsClock::new();
+    let began = clock.now_mono();
     let copies = COPIES.lock().clone();
     let written: u64 = copies.iter().map(|copied| copied.copy_in()).sum();
-    synced(IN_BYTES_CODE, written, started);
+    synced(IN_BYTES_CODE, written, &clock, began);
 }
 
 /// The completed handler that writes back into every live copy's pages the bytes the GPU changed
@@ -152,17 +154,18 @@ fn merge_back() {
     if !any() {
         return;
     }
-    let started = Instant::now();
+    let clock = crate::os::OsClock::new();
+    let began = clock.now_mono();
     let copies = COPIES.lock().clone();
     let written: u64 = copies.iter().map(|copied| copied.merge_back()).sum();
-    synced(BACK_BYTES_CODE, written, started);
+    synced(BACK_BYTES_CODE, written, &clock, began);
 }
 
-/// Counts a sync's `written` bytes as `code`, and its time since `started`.
-fn synced(code: &'static str, written: u64, started: Instant) {
+/// Counts a sync's `written` bytes as `code`, and its time since `began` on `clock`.
+fn synced(code: &'static str, written: u64, clock: &crate::os::OsClock, began: MonoTime) {
     crate::answer::count_kind_by(code, written);
-    let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    crate::answer::count_kind_by(SYNC_NS_CODE, took);
+    let took = clock.now_mono().saturating_duration_since(began).as_nanos();
+    crate::answer::count_kind_by(SYNC_NS_CODE, u64::try_from(took).unwrap_or(u64::MAX));
 }
 
 /// `copied` released: no longer live, and once a sync of it in progress ends, never synced again.
@@ -246,7 +249,7 @@ impl Copied {
         };
         let mut now = [0_u64; WORDS];
         let mut written = 0;
-        for (chunk, was) in base.chunks_exact_mut(WORDS).enumerate() {
+        for (chunk, was) in base.as_chunks_mut::<WORDS>().0.iter_mut().enumerate() {
             let at = chunk * CHUNK;
             // SAFETY: the chunk lies in the pages, mapped until the copy is released (`new`'s
             // contract).
@@ -277,7 +280,7 @@ impl Copied {
         };
         let (mut gpu, mut cpu) = ([0_u64; WORDS], [0_u64; WORDS]);
         let mut written = 0;
-        for (chunk, was) in base.chunks_exact_mut(WORDS).enumerate() {
+        for (chunk, was) in base.as_chunks_mut::<WORDS>().0.iter_mut().enumerate() {
             let at = chunk * CHUNK;
             // SAFETY: the chunk lies in the copy's first bytes, the length of the pages.
             unsafe { read_chunk(self.copy.as_ptr().add(at), &mut gpu) };

@@ -2331,7 +2331,10 @@ mod tests {
         assert_eq!(counts(), plus(before, &[2, 4]));
         assert_eq!(copy.contents(), HostPtr::from_ptr(memory));
         drop(copy);
-        assert!(waits_for(|| freed.load(Ordering::Acquire)), "its deallocator ran");
+        assert!(
+            waits_for(|| freed.load(Ordering::Acquire)),
+            "its deallocator ran"
+        );
 
         // Pages with a file behind them, the test's own, which the process ends with: 0x11s, 16
         // bytes in. Whether the host makes a dma-buf of them (udmabuf).
@@ -2376,7 +2379,9 @@ mod tests {
         // SAFETY: the pages are the test's own, never freed.
         let bytes = unsafe { HostRange::new(at, 1000) };
         let made = device.new_buffer_over_host_memory(on, bytes, 0, Some(Box::new(deallocator)));
-        let buffer = made.expect("never a raise").expect("a buffer over the pages");
+        let buffer = made
+            .expect("never a raise")
+            .expect("a buffer over the pages");
         if !device.known_blocks().is_dma_buf(buffer.rt().block()) {
             assert_eq!(counts(), plus(before, &[2, 4]));
             eprintln!("no dma-buf imported here: made over a copy, counted; the rest unchecked");
@@ -2685,11 +2690,17 @@ mod tests {
         let known = block.id;
         assert!(device.known_blocks().forget(known).is_some());
         drop(block);
-        assert!(waits_for(|| released.load(Ordering::Acquire)), "the release ran");
+        assert!(
+            waits_for(|| released.load(Ordering::Acquire)),
+            "the release ran"
+        );
         assert_eq!(device.known_blocks().homes.of(known), None);
 
         drop((encoder, commands, buffer));
-        assert!(waits_for(|| freed.load(Ordering::Acquire)), "the deallocator ran");
+        assert!(
+            waits_for(|| freed.load(Ordering::Acquire)),
+            "the deallocator ran"
+        );
         assert_eq!(device.known_blocks().homes.of(id), None);
     }
 }
