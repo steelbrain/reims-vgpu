@@ -96,6 +96,13 @@
 //! counted by cause ([`UNPLACED_BUSY`], [`UNPLACED_UNFILLED`]). Nothing reads a placed image's
 //! bytes before the fill wrote them: every use of the cache waits for its last fill.
 //!
+//! Placing trades the platform's clears for takes of blocks. Measured on rt on a Radeon 780M
+//! (RADV), a desktop and 3D-scene boot (11-19), against the same boot with the platform's own
+//! images: 397 new shapes were placed (1164 MiB), none fell back; rt cleared 1408 textures
+//! (652 MiB) where it had cleared 1993 (1721 MiB), 1069 MiB less; and rt's takes of blocks rose
+//! from 45 calls (3.64 GiB) to 76 (4.39 GiB), 31 more and 0.75 GiB more taken, the longest call
+//! 45.7 ms where it had been 27.5 ms (rt's allocation, `rt-diag allocation sites`).
+//!
 //! **Plane shapes.** A cache of a two-plane surface the host's video writes keeps its planes in
 //! a surface the platform exports (`super::exported`): each plane's whole extent is a plane
 //! shape, its image the surface's plane, made with `PixelFormatView`, so a guest texture over the
