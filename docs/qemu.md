@@ -215,10 +215,13 @@ is its transport:
   library maps its blocks of host memory into the range as the guest's pool
   grows (`pool_add`, docs/api.md) and takes them out as it shrinks
   (`pool_remove`). Each block is a RAM region of its own, unmergeable, owned
-  by an object of its own, added or removed in a transaction of its own on
-  the main loop: an add removes nothing, and a removal touches no other
-  piece. A piece's end, which tells the library the memory may go, waits for
-  the flat views and DMA maps that hold it. KVM's
+  by an object of its own. The main loop takes the asks at the head of its
+  queue that are of one kind, adds or removals, and carries them out in one
+  transaction, which sets each new block's flag too; an add is answered
+  once its run has committed. An add removes nothing, and a removal touches
+  no other piece. The device keeps its pieces sorted by address and finds
+  one by binary search. A piece's end, which tells the library the memory
+  may go, waits for the flat views and DMA maps that hold it. KVM's
   `KVM_X86_QUIRK_SLOT_ZAP_ALL` is turned off at realize
   (`KVM_CAP_DISABLE_QUIRKS2`), so a piece's removal zaps only its own slot's
   second-level maps. Under WHPX the hypervisor's map of an add and its unmap
@@ -272,7 +275,63 @@ is its transport:
   58 ns with them idle. Neither call stalled a vCPU, and no unmap dropped
   the other mappings: the vCPUs' longest gaps, and their next sweep over the
   standing RAM, matched a control with no call. A Metal Shared buffer's
-  contents mapped and behaved as anonymous memory does.
+  contents mapped and behaved as anonymous memory does. With 500 or 2,000
+  touched 16 MiB blocks resident (a 40-bit IPA), one more block's map took
+  3.8-4.1 us and its unmap 66-93 us at the median, as with none, and the
+  vCPUs' gaps and sweeps matched the control. HVF refused no map up to
+  262,144 separate 16 KiB maps (8 GiB of IPA) and 65,216 separate 16 MiB
+  maps (the 40-bit IPA's end): a map took 0.5-0.8 us at any count, and an
+  unmap about 0.5 ns more for each live map. The task's `phys_footprint`
+  counts each page the guest touched a second time, beside its host
+  backing; the host's page counts do not move.
+- QEMU's own cost of a piece, measured 11-18 with a probe device doing a
+  pool add's and removal's calls on a paused (`-S`) q35 or virt machine with
+  N 16 MiB pieces in, 50 asks at each N in address order, the median of 3
+  runs' p50, in us of BQL, add / removal (jobs m3-max-48767 under KVM,
+  m3-max-48775 under HVF, m3-max-48805 under WHPX). "Before" is aa1643a40,
+  "after" the cuts above; runs of 8 are per ask.
+
+  | host, accelerator | | N = 0 | N = 500 | N = 2,000 |
+  |---|---|---|---|---|
+  | um790 (Ryzen 7 7840HS), KVM | before | 137 / 89 | 2,686 / 813 | 21,034 / 2,799 |
+  | | after, one ask | 80 / 88 | 217 / 227 | 745 / 779 |
+  | | after, runs of 8 | 26 / 34 | 47 / 55 | 119 / 121 |
+  | M3 Max, HVF | before | 49 / 24 | 2,773 / 409 | 13,527 / 1,759 |
+  | | after, one ask | 32 / 26 | 184 / 173 | 584 / 565 |
+  | | after, runs of 8 | 6 / 4 | 29 / 22 | 81 / 70 |
+  | Mac mini 2018, WHPX | before | 92 / 47 | 1,521 / 260 | 43,361 / 2,680 |
+  | | after, one ask | 69 / 53 | 158 / 144 | 376 / 370 |
+  | | after, runs of 8 | 22 / 8 | 33 / 19 | 63 / 47 |
+
+  Under WHPX the map ahead (about 450 us) and the unmap ahead (about 390 us)
+  run outside the BQL and are not in these. Pieces added in no address
+  order cost more after the cuts: one ask at N = 2,000 took 1.28 / 1.16 ms
+  under KVM, 1.28 / 1.26 ms under HVF and 0.77 / 0.75 ms under WHPX. What
+  still grows with N is that each commit renders every flat view whole,
+  its dispatch included; what a lone ask pays at any N is the commit's
+  fixed part, the renders (about 52 us under KVM at N = 0) and, under KVM,
+  the two slot calls (22 us for an add, 37 us for a removal). The longest
+  BQL hold seen was 2.0 ms for one ask (a removal at N = 2,000 under KVM,
+  in no address order) and 6.8 ms for a run of 8, 5.2 ms of it one
+  `KVM_SET_USER_MEMORY_REGION`; under HVF and WHPX, 1.4 and 0.9 ms.
+
+  At N = 131, the most live runtime blocks a recorded session held (a 3D
+  benchmark on a 3090), one ask holds the BQL 116 / 124 us under KVM,
+  72 / 64 us under HVF and 92 / 77 us under WHPX, interpolated between the
+  rows, and an ask in a run of 8 31 / 40, 12 / 9 and 25 / 11 us. Most of a
+  lone ask there is the commit's fixed part: the three flat views' renders
+  and, under KVM, the two slot ioctls. For scale, the runtime's own 16 MiB
+  Shared block costs 1,495 us to allocate, map and first touch on um790's
+  780M (RADV, m3-max-48804) and 719 us on the M3 Max (MoltenVK 1.4.2,
+  m3-max-48803), the median of 20, and 1,160 us on the mini's UHD 630
+  (m3-max-48865), the median of the 7 of 20 that its driver did not hand
+  back from a block freed just before.
+- A piece the runtime holds for reuse keeps its region in the guest's
+  range, and the region goes only at the runtime's real free of the
+  allocation: never remove a piece and add it again. Measured 11-18 under
+  KVM, a piece used again with its slot kept took no EPT fault in 20 reps,
+  where removing it and adding it again cost a full first touch, 140,289
+  faults for 548 MiB, 184 ms on the 3090 and 262 ms on the 780M.
 - **The guest's RAM**: on Linux the device gives the library the map of the
   RAM ranges that are a shared file in pages of the host's size (the memfd of
   `reims-ctl`'s VMs), with the files behind them, and the GPU uses an
