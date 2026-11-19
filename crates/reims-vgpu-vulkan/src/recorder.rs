@@ -1313,8 +1313,17 @@ fn buffer_ptr(b: &dyn Any) -> Option<u64> {
     None
 }
 
-/// The selector of a no-copy buffer's escape record ([`buffer_escaped`]).
+/// The selector of a buffer's escape record ([`buffer_escaped`], and the rt platform's at each
+/// buffer's make, [`finish`]).
 pub const BUFFER_ESCAPED: &str = "m2v.bufferEscaped";
+
+/// The kind of the escape record the rt platform's buffers take at their make ([`finish`]): 0, a
+/// read of the buffer's `gpuAddress`. rt's device answers every buffer's `gpuAddress` with its
+/// make (the Vulkan device address), which the guest's Metal hands the program with no message
+/// naming the buffer, and a play on rt places no buffer at its recorded address (metal2vulkan's
+/// `docs/REPLAY-STREAM.md`, section 5): so every buffer may be held in memory from its make on,
+/// where the guest notes only a no-copy buffer's escape.
+const MADE_ESCAPE_KIND: u64 = 0;
 
 /// The guest noted that the identity of the no-copy buffer `b` left its Metal with no message
 /// naming the buffer, by the act `kind`, an `RGFX_BUFFER_ESCAPED_*` value (0 the app's read of its
@@ -1323,7 +1332,9 @@ pub const BUFFER_ESCAPED: &str = "m2v.bufferEscaped";
 /// address in bytes the stream writes. Its record is a [`BUFFER_ESCAPED`] call on the buffer,
 /// `[kind]`, of all of the buffer, which a player stops at, typed, where a later write holds an
 /// address in the buffer. The reims-graphics device calls it once in the buffer's life, at the
-/// guest's first note (reims-vgpu's `decode::escape`).
+/// guest's first note (reims-vgpu's `decode::escape`). The record is written once in the buffer's
+/// life: a buffer of the rt platform's took its record at its make ([`MADE_ESCAPE_KIND`]), and a
+/// note for it writes none.
 ///
 /// The record is queued here, on the calling thread, so it lies in the stream's order: after the
 /// `m2v.write` records of each commit made before the note, which the commit queued before its
@@ -1346,13 +1357,7 @@ pub fn buffer_escaped(b: &dyn Any, kind: u64) {
         (state.stats.unrecorded_receivers).fetch_add(1, Ordering::Relaxed);
         return;
     };
-    state.push_plain(Call {
-        selector: BUFFER_ESCAPED.to_owned(),
-        receiver: id,
-        args: vec![Value::Uint(kind)],
-        ..Call::default()
-    });
-    state.count_selector(BUFFER_ESCAPED);
+    state.escape_once(id, kind);
 }
 
 /// The selector of the acquire of what another API wrote into a buffer's exported memory, the
@@ -1401,8 +1406,10 @@ pub fn finish(active: Active, made: Option<Made>) {
     };
     let t0 = now_ns();
     let mut identity = None;
+    let mut escapes = false;
     if let Some(mut made) = made {
         identity = made.identity.take();
+        escapes = made_escapes(&made);
         call.result = state.register(made);
     }
     state.capture_now(&mut call);
@@ -1414,9 +1421,23 @@ pub fn finish(active: Active, made: Option<Made>) {
         snap,
     };
     state.push_made(item, result, identity);
+    if escapes && result != 0 {
+        state.escape_once(result, MADE_ESCAPE_KIND);
+    }
     release_completions(state);
     add_times(state, 0, now_ns() - t0, true);
     drop(token);
+}
+
+/// Whether `made` takes its escape record at its make ([`MADE_ESCAPE_KIND`]): a buffer of the rt
+/// platform's.
+fn made_escapes(made: &Made) -> bool {
+    #[cfg(feature = "rt")]
+    if made.type_name == std::any::type_name::<crate::rt_platform::RtBuffer>() {
+        return true;
+    }
+    let _ = made;
+    false
 }
 
 /// Records each of `draws` as its two commands, where the encoder's run of draws is the outermost
@@ -1888,6 +1909,8 @@ struct Info {
     refs: KeySet,
     /// Whether its last reference went: its release is queued, and its memory no longer read.
     dead: bool,
+    /// Whether its escape record ([`BUFFER_ESCAPED`]) is queued: once in a buffer's life.
+    escaped: bool,
 }
 
 /// What a calling thread hands the writer, in the stream's order.
@@ -2310,6 +2333,27 @@ impl State {
     /// Queues a record written as it is.
     fn push_plain(&self, call: Call) {
         self.push(Item::Plain(call));
+    }
+
+    /// Queues the buffer `id`'s escape record ([`BUFFER_ESCAPED`]) of `kind`, counted by its
+    /// selector, where it has none yet: once in the buffer's life.
+    fn escape_once(&self, id: u64, kind: u64) {
+        {
+            let mut objects = self.objects.lock();
+            let Some(info) = objects.info.get_mut(&id) else {
+                return;
+            };
+            if std::mem::replace(&mut info.escaped, true) {
+                return;
+            }
+        }
+        self.push_plain(Call {
+            selector: BUFFER_ESCAPED.to_owned(),
+            receiver: id,
+            args: vec![Value::Uint(kind)],
+            ..Call::default()
+        });
+        self.count_selector(BUFFER_ESCAPED);
     }
 
     /// Shapes and writes every queued record, in order: on the writer's thread, or on a calling
@@ -5062,6 +5106,55 @@ mod tests {
                 );
                 drop(queue);
                 drop(device);
+            },
+        );
+    }
+
+    /// An rt buffer's make record is followed at once by its escape record, of kind 0
+    /// ([`MADE_ESCAPE_KIND`]), and the guest's later note of its escape writes none: a buffer
+    /// takes one escape record in its life.
+    #[cfg(feature = "rt")]
+    #[test]
+    fn on_vulkan_an_rt_buffer_takes_its_escape_record_at_its_make() {
+        in_recording_child(
+            "recorder::tests::on_vulkan_an_rt_buffer_takes_its_escape_record_at_its_make",
+            |streams| {
+                use crate::core::platform::Platform as _;
+                use crate::core::platform::device::GpuDevice as _;
+                use crate::core::raise::OnFault;
+                let platform = crate::rt_platform::RtPlatform::new();
+                assert!(on(), "the child does not record");
+                let registry_id = platform
+                    .system_default_device()
+                    .expect("an rt device on the GPU the test holds")
+                    .facts()
+                    .registry_id;
+                let device = platform
+                    .open_device(registry_id)
+                    .expect("the default device");
+                let buffer = (device.new_buffer_of_length(OnFault::Die, crate::os::PAGE, 0))
+                    .unwrap()
+                    .expect("a buffer");
+                let id = id_at(buffer.rec_ptr()).expect("the buffer's stream id");
+                buffer_escaped(&buffer, 1);
+                let queue = device.new_command_queue().expect("a queue");
+                let (calls, _) = recorded(streams, |calls| {
+                    calls.iter().any(|c| c.selector == "newCommandQueue")
+                });
+                let made = (calls.iter())
+                    .position(|c| c.selector == "newBufferWithLength:options:" && c.result == id)
+                    .expect("the buffer's make record");
+                let escaped = calls.get(made + 1).expect("a record after the make");
+                assert_eq!(
+                    (escaped.selector.as_str(), escaped.receiver, &escaped.args[..]),
+                    (BUFFER_ESCAPED, id, &[Value::Uint(MADE_ESCAPE_KIND)][..]),
+                    "{calls:?}"
+                );
+                let all = (calls.iter())
+                    .filter(|c| c.selector == BUFFER_ESCAPED && c.receiver == id)
+                    .count();
+                assert_eq!(all, 1, "{calls:?}");
+                drop((queue, buffer, device));
             },
         );
     }
