@@ -1244,7 +1244,6 @@ pub fn write() {
             ("ring-block", m.ring_block_allocations),
             ("staging-region", m.staging_region_allocations),
             ("staging-buffer", m.staging_buffer_allocations),
-            ("capture-ring", m.capture_ring_allocations),
             ("zero-source", m.zero_source_allocations),
             ("take", m.take_allocations),
         ];
