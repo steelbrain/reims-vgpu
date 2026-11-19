@@ -540,6 +540,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let clock = Arc::clone(&platform);
             let pool = CompilePool::new(Box::new(move || clock.clock().now_mono()));
             let identity = gpu_device.identity_caps();
+            // The heap the guest's Shared pool's blocks come from, which sizes its range below.
+            let shared_heap = gpu_device.shared_heap_size();
             // `Managed` resources are one copy where the platform answers that the GPU shares the
             // CPU's memory, else two, which hold Metal's contract on any GPU: the guest's device
             // answers `hasUnifiedMemory` alike, from the blob.
@@ -910,7 +912,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // on metal2vulkan-rt, whose blocks then fill it through the same calls. Its range is
             // what the GPU's heap of those blocks holds, of the addresses the host can give.
             let pool = match pool_host {
-                Some((room, host)) => match pool_range(room, gpu_device.shared_heap_size()) {
+                Some((room, host)) => match pool_range(room, shared_heap) {
                     Some(range) => {
                         let clock = Arc::clone(&platform);
                         let now = Box::new(move || clock.clock().now_mono());

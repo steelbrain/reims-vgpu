@@ -126,7 +126,10 @@ fn a_range_must_be_whole_large_pages_and_not_empty() {
 #[test]
 fn a_range_is_the_shared_heap_rounded_to_large_pages_at_most_the_room() {
     let room = range(43);
-    let sized = |heap: u64| room.sized(heap).map(|r| (r.physical_address, r.physical_length));
+    let sized = |heap: u64| {
+        room.sized(heap)
+            .map(|r| (r.physical_address, r.physical_length))
+    };
     assert_eq!(sized(24 << 30), Some((BASE, 24 << 30)));
     assert_eq!(sized((24 << 30) - MIB), Some((BASE, 24 << 30)));
     assert_eq!(sized((24 << 30) + 1), Some((BASE, (24 << 30) + (2 << 20))));

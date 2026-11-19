@@ -732,9 +732,13 @@ mod tests {
             let raw = d.raw.raw();
             (raw.instance).get_physical_device_memory_properties(raw.physical_device)
         };
-        let heaps: Vec<u64> = memory.memory_heaps_as_slice().iter().map(|h| h.size).collect();
-        let cached = (memory.memory_types_as_slice().iter())
-            .any(|t| t.property_flags.contains(SHARED_MEMORY));
+        let heaps: Vec<u64> = memory
+            .memory_heaps_as_slice()
+            .iter()
+            .map(|h| h.size)
+            .collect();
+        let shared = |t: &vk::MemoryType| t.property_flags.contains(SHARED_MEMORY);
+        let cached = memory.memory_types_as_slice().iter().any(shared);
         eprintln!(
             "shared heap: {size} bytes ({} MiB) of heaps {heaps:?} on {}",
             size >> 20,

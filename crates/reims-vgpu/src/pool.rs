@@ -193,7 +193,9 @@ impl PoolConfig {
         if heap == 0 {
             return None;
         }
-        let want = heap.checked_next_multiple_of(PIECE_ALIGN).unwrap_or(u64::MAX);
+        let want = heap
+            .checked_next_multiple_of(PIECE_ALIGN)
+            .unwrap_or(u64::MAX);
         Some(PoolConfig {
             physical_address: self.physical_address,
             physical_length: want.min(self.physical_length),
