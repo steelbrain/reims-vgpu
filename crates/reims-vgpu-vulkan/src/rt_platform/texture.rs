@@ -782,9 +782,14 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
         };
         let bytes = crate::gpu::resource::first_bytes(REPLACE, pixel_bytes, usize::MAX);
         counted_copy(bytes.len());
-        if let Err(error) =
-            (self.rt).replace_region(r, level, slice, &bytes, bytes_per_row, bytes_per_image)
-        {
+        if let Err(error) = (self.rt).replace_region(
+            r,
+            level,
+            slice,
+            rt::HostBytes::from(bytes.as_slice()),
+            bytes_per_row,
+            bytes_per_image,
+        ) {
             rt_refused(REPLACE, &error);
         }
         Ok(())
