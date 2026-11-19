@@ -152,8 +152,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             && one(d.array_length)
             && one(d.sample_count)
             && one(d.depth);
-        let texel_bytes =
-            shapes::texel_bytes(u64::from(d.pixel_format), info).filter(|_| plain)?;
+        let texel_bytes = shapes::texel_bytes(u64::from(d.pixel_format), info).filter(|_| plain)?;
         let key = ShapeKey {
             plane: u64::from(m.plane),
             offset: m.offset,
@@ -257,7 +256,9 @@ mod tests {
 
     /// The guest destroys object `obj_id`.
     fn destroy(r: &mut Rig, obj_id: u64) {
-        use reims_vgpu_graphics::wire::{RGFX_CMD_OBJECT_DESTROY, RgfxMsgHeader, RgfxObjectDestroy};
+        use reims_vgpu_graphics::wire::{
+            RGFX_CMD_OBJECT_DESTROY, RgfxMsgHeader, RgfxObjectDestroy,
+        };
         use zerocopy::IntoBytes as _;
         let destroy = RgfxObjectDestroy {
             header: RgfxMsgHeader {
@@ -359,10 +360,7 @@ mod tests {
         assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
         texture(&mut r, 21, 80, (32, 8));
         let other = BLOCK + 0x10000;
-        assert_eq!(
-            r.pages_cached(other, &[(4, 1)], page, true),
-            RGFX_STATUS_OK
-        );
+        assert_eq!(r.pages_cached(other, &[(4, 1)], page, true), RGFX_STATUS_OK);
         let counts = r.dec.caches().counts();
         assert_eq!(counts.held_most, 3 * page);
         let split = (counts.held_referenced, counts.held_kept, counts.held_video);

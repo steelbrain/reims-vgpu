@@ -524,7 +524,11 @@ mod tests {
         assert!(!table.any_referenced());
         drop(table.insert(key(15, 4), 15, false, 31));
         let gone: Vec<u64> = table.sweep().iter().map(|s| s.image).collect();
-        assert_eq!(gone, vec![11], "the oldest untouched, not the one held until 30");
+        assert_eq!(
+            gone,
+            vec![11],
+            "the oldest untouched, not the one held until 30"
+        );
     }
 
     /// The budget trims the least recently used unreferenced shape first, never a referenced one;
