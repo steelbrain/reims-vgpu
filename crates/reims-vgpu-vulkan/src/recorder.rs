@@ -4927,6 +4927,97 @@ mod tests {
         }
     }
 
+    /// A compute pipeline's record carries the stage-input descriptor it was made with, through
+    /// the stream and back: its map's `stageInput` holds each layout (`bufferIndex`, `stride`,
+    /// `stepFunction`, `stepRate`), each attribute (`attributeIndex`, `format`, `offset`,
+    /// `bufferIndex`), the `indexType` and the `indexBufferIndex`, each as given, none of them
+    /// Metal's default but the attribute's index, which the kernel names.
+    #[test]
+    fn on_vulkan_a_compute_pipeline_record_carries_its_stage_input() {
+        in_recording_child(
+            "recorder::tests::on_vulkan_a_compute_pipeline_record_carries_its_stage_input",
+            |streams| {
+                use crate::core::platform::device::GpuDevice as _;
+                use crate::core::platform::resource::Library as _;
+                use crate::core::platform::values::{
+                    AttributeDesc, BufferLayoutDesc, FullComputePipelineDesc, StageInputDesc,
+                };
+                use crate::core::raise::OnFault;
+                const MADE: &str =
+                    "newComputePipelineStateWithDescriptor:options:reflection:error:";
+                let (_platform, device) = recording_device();
+                let library = (device.new_library(crate::gpu::device::tests::STAGEIN))
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let name = library.function_names().remove(0);
+                let function = (library.new_function(OnFault::Return, &name))
+                    .unwrap()
+                    .unwrap();
+                let desc = FullComputePipelineDesc {
+                    stage_input: Some(StageInputDesc {
+                        layouts: vec![BufferLayoutDesc {
+                            buffer_index: 1,
+                            stride: 8,
+                            step_function: 5,
+                            step_rate: 2,
+                        }],
+                        attributes: vec![AttributeDesc {
+                            attribute_index: 0,
+                            format: 36,
+                            offset: 4,
+                            buffer_index: 1,
+                        }],
+                        index_type: 1,
+                        index_buffer_index: 2,
+                    }),
+                    ..FullComputePipelineDesc::new(&function)
+                };
+                let pipeline = (device.new_compute_pipeline_state_full(&desc))
+                    .unwrap()
+                    .expect("a pipeline");
+                let (calls, _) =
+                    recorded(streams, |calls| calls.iter().any(|c| c.selector == MADE));
+                let made = (calls.iter())
+                    .find(|c| c.selector == MADE)
+                    .unwrap_or_else(|| panic!("no {MADE}: {calls:?}"));
+                let Some(Value::Map(fields)) = made.args.first() else {
+                    panic!("a descriptor's map: {made:?}");
+                };
+                let stage_input = (fields.iter())
+                    .find(|(k, _)| k == "stageInput")
+                    .map(|(_, v)| v.clone());
+                let map = |pairs: &[(&str, Value)]| {
+                    let mut out = Vec::new();
+                    for (key, value) in pairs {
+                        out.push(((*key).to_owned(), value.clone()));
+                    }
+                    Value::Map(out)
+                };
+                let layout = map(&[
+                    ("bufferIndex", Value::Uint(1)),
+                    ("stride", Value::Uint(8)),
+                    ("stepFunction", Value::Uint(5)),
+                    ("stepRate", Value::Uint(2)),
+                ]);
+                let attribute = map(&[
+                    ("attributeIndex", Value::Uint(0)),
+                    ("format", Value::Uint(36)),
+                    ("offset", Value::Uint(4)),
+                    ("bufferIndex", Value::Uint(1)),
+                ]);
+                let expected = map(&[
+                    ("layouts", Value::List(vec![layout])),
+                    ("attributes", Value::List(vec![attribute])),
+                    ("indexType", Value::Uint(1)),
+                    ("indexBufferIndex", Value::Uint(2)),
+                ]);
+                assert_eq!(stage_input, Some(expected), "{made:?}");
+                drop((pipeline, function, library));
+            },
+        );
+    }
+
     /// On a device that keeps two copies of a `Managed` buffer (the answer forced here), a
     /// no-copy `Managed` buffer's record carries the bytes its create copied into the device's
     /// copy, as a blob through the stream and back: a descriptor's `contents`, those before its
