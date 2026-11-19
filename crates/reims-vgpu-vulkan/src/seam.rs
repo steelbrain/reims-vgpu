@@ -56,10 +56,23 @@ mod testkit {
         let (chosen, vendor, id, name) = (listed.iter())
             .find(|(_, vendor, id, _)| named == Some((*vendor, *id)))
             .or_else(|| listed.iter().find(|(device, ..)| device.check().is_ok()))
-            .ok_or_else(|| "no physical device meets rt's floor".to_owned())?;
+            .ok_or_else(|| below_floor(&listed))?;
         let device = (Device::new(chosen, DeviceOptions::default()))
             .map_err(|error| format!("rt's device on {name}: {error}"))?;
         Ok((device, format!("{name} {vendor:04x}:{id:04x}")))
+    }
+
+    /// The error where no listed physical device meets rt's floor: each one's name and IDs, with
+    /// what rt says it lacks.
+    fn below_floor(listed: &[(PhysicalDevice, u32, u32, String)]) -> String {
+        let each: Vec<String> = (listed.iter())
+            .filter_map(|(device, vendor, id, name)| {
+                let below = device.check().err()?;
+                Some(format!("{name} {vendor:04x}:{id:04x}: {below}"))
+            })
+            .collect();
+        let count = listed.len();
+        format!("none of {count} physical devices meets rt's floor: {}", each.join("; "))
     }
 
     /// The `vendor:device` IDs a selection variable's value names.
