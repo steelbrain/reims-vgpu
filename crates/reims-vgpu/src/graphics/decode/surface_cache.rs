@@ -5485,15 +5485,12 @@ impl<P: Platform> Caches<P> {
     pub(crate) fn set_staging_piece(&self, piece: u64) {
         let mut state = self.state.lock();
         let gate = Arc::clone(&state.spares.gate);
-        let was = std::mem::replace(&mut state.spares, Arc::new(Spares::new(2 * piece, piece, gate)));
+        let was = std::mem::replace(
+            &mut state.spares,
+            Arc::new(Spares::new(2 * piece, piece, gate)),
+        );
         drop(state);
         drop(was);
-    }
-
-    /// The staged copies' spares, for the tests to let their top-ups run and wait for them.
-    #[cfg(test)]
-    fn spares(&self) -> Arc<Spares<P>> {
-        Arc::clone(&self.state.lock().spares)
     }
 
     /// Whether every cache's copies are staged ([`Self::set_staged`]).
@@ -14800,9 +14797,8 @@ pub(super) mod tests {
         let gate: Arc<RwLock<()>> = Arc::default();
         let spares = Spares::<FakePlatform>::new(2 * piece, piece, Arc::clone(&gate));
         let tick = Arc::new(AtomicU64::new(0));
-        let now: Now = Arc::new(move || {
-            MonoTime::from_nanos(tick.fetch_add(1000, Ordering::SeqCst))
-        });
+        let now: Now =
+            Arc::new(move || MonoTime::from_nanos(tick.fetch_add(1000, Ordering::SeqCst)));
         let codes = [
             PIECE_MAKES[0].0,
             SPARES_MADE.0,
@@ -14862,7 +14858,11 @@ pub(super) mod tests {
         for buffer in taken {
             spares.give(buffer);
         }
-        assert_eq!(spares.held(), (vec![piece, piece], 2), "given back past the cap");
+        assert_eq!(
+            spares.held(),
+            (vec![piece, piece], 2),
+            "given back past the cap"
+        );
         drop(spares);
 
         let after = codes.map(counted);

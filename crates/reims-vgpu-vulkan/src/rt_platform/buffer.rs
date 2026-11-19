@@ -150,9 +150,9 @@ use crate::core::host::HostPtr;
 use crate::core::memory::placed::Placed;
 use crate::core::num::{ToU64 as _, ToUsize as _};
 use crate::core::platform::Handle as _;
-use crate::core::platform::os::Clock as _;
 use crate::core::platform::device::NoCopyDeallocator;
 use crate::core::platform::host_range::HostRange;
+use crate::core::platform::os::Clock as _;
 #[cfg(unix)]
 use crate::core::platform::resource::ExportedMemory;
 use crate::core::platform::resource::{Buffer, GpuResource};

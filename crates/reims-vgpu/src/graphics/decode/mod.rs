@@ -1550,7 +1550,11 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(begun) = begun else {
             return;
         };
-        let took = self.platform.clock().now_mono().saturating_duration_since(begun);
+        let took = self
+            .platform
+            .clock()
+            .now_mono()
+            .saturating_duration_since(begun);
         surface_pages_answer_took(u64::try_from(took.as_nanos()).unwrap_or(u64::MAX));
     }
 
