@@ -362,7 +362,10 @@ mod tests {
         let through = super::super::import::views_through_dma_bufs();
         assert_eq!(through_dma_bufs(ptr(view), 3 * page), through);
         assert_eq!(through_dma_bufs(ptr(view + page + 0x10), 1), through);
-        assert!(!through_dma_bufs(ptr(at), 3 * page), "the pages' own mapping");
+        assert!(
+            !through_dma_bufs(ptr(at), 3 * page),
+            "the pages' own mapping"
+        );
         // SAFETY: a fresh private anonymous mapping, unmapped below.
         let anonymous = unsafe {
             libc::mmap(
@@ -381,7 +384,10 @@ mod tests {
         unsafe { libc::munmap(anonymous, page.to_usize()) };
         if through {
             assert!(map_for_pointer(ptr(view), 3 * page));
-            assert!(!through_dma_bufs(ptr(view), 3 * page), "mapped from its files");
+            assert!(
+                !through_dma_bufs(ptr(view), 3 * page),
+                "mapped from its files"
+            );
             // The view's pages are the file's last first, each byte its page's index.
             assert_eq!([0, page, 2 * page].map(|i| read(view + i)), [2, 1, 0]);
         } else {

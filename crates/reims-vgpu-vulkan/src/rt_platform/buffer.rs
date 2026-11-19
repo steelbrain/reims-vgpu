@@ -2372,7 +2372,9 @@ mod tests {
         // SAFETY: the view and its pages are the test's own, never freed.
         let bytes = unsafe { HostRange::new(view, 2 * page) };
         let made = device.new_buffer_over_host_memory(on, bytes, 0, Some(Box::new(deallocator)));
-        let buffer = made.expect("never a raise").expect("a buffer over the view");
+        let buffer = made
+            .expect("never a raise")
+            .expect("a buffer over the view");
         let after = counts();
         let delta: [u64; 5] = std::array::from_fn(|i| after[i] - before[i]);
         let as_dma_buf = delta == [0, 1, 0, 0, 0];
@@ -2385,7 +2387,10 @@ mod tests {
         let id = buffer.rt().block();
         assert_eq!(device.known_blocks().is_dma_buf(id), as_dma_buf);
         if through && !as_dma_buf {
-            assert!(!crate::os::through_dma_bufs(first, 2 * page), "mapped from its files");
+            assert!(
+                !crate::os::through_dma_bufs(first, 2 * page),
+                "mapped from its files"
+            );
         }
         eprintln!(
             "the view through a dma-buf {through}: imported as {}",
