@@ -1099,6 +1099,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// its block and once, each held until the buffer's finish marks it dirty
     /// ([`Self::note_shape`]).
     shapes_written: RefCell<Vec<(u64, surface_cache::shapes::ShapeRef)>>,
+    /// The blocks whose device caches' buffers the command buffer's walk named an object over
+    /// itself so far, each once ([`Self::note_over_cache`]).
+    over_caches: RefCell<Vec<u64>>,
     /// In the per-shape form, the shapes the encoder being walked may write, each by its block
     /// and once, in the order the walk last noted them ([`Self::note_shape`]): at the encoder's
     /// end each other shape of their planes takes their write ([`Self::reconcile_shapes`]).
@@ -1276,6 +1279,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             laid_uses: RefCell::new(Vec::new()),
             laid_written: RefCell::new(Vec::new()),
             shapes_written: RefCell::new(Vec::new()),
+            over_caches: RefCell::new(Vec::new()),
             encoder_shapes: RefCell::new(Vec::new()),
             slot_shapes: RefCell::new(Vec::new()),
             slot_pipeline: Cell::new(0),
@@ -4218,8 +4222,14 @@ impl<P: Platform> GraphicsDecoder<P> {
                     made
                 };
                 let span = self.span_of(m.buffer_obj_id);
+                // Over a cache's buffer, the texture writes the buffer itself.
+                let over_cache = self.over_cache_of(m.buffer_obj_id);
                 match made {
-                    Some(texture) => self.insert_over(m.obj_id, ObjHandle::Texture(texture), span),
+                    Some(texture) => {
+                        let entry = Entry::of(ObjHandle::Texture(texture)).over(span);
+                        self.store(m.obj_id, entry.over_cache(over_cache));
+                        Ok(Ok(()))
+                    }
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
@@ -4262,8 +4272,14 @@ impl<P: Platform> GraphicsDecoder<P> {
                     made
                 };
                 let span = self.span_of(m.buffer_obj_id);
+                // Over a cache's buffer, the texture writes the buffer itself.
+                let over_cache = self.over_cache_of(m.buffer_obj_id);
                 match made {
-                    Some(texture) => self.insert_over(m.obj_id, ObjHandle::Texture(texture), span),
+                    Some(texture) => {
+                        let entry = Entry::of(ObjHandle::Texture(texture)).over(span);
+                        self.store(m.obj_id, entry.over_cache(over_cache));
+                        Ok(Ok(()))
+                    }
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
@@ -4459,6 +4475,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                                 m.desc.height,
                             ),
                         });
+                        // One that is no view of a shape's image lies over the buffer, or the
+                        // wide home its writes are copied into the buffer from.
+                        entry.over_cache = shape.is_none() && self.over_cache_of(m.buffer_obj_id);
                         entry.laid_use = laid_use;
                         entry.shape = shape;
                         entry.over_view = matches!(wide, Some((_, true)));
@@ -4767,6 +4786,12 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     fn span_of(&self, obj_id: u64) -> Option<(u64, u64)> {
         self.entry(obj_id).and_then(|e| e.span)
+    }
+
+    /// Whether the object `obj_id` names lies over a device cache's buffer itself
+    /// ([`Entry::over_cache`]).
+    pub(super) fn over_cache_of(&self, obj_id: u64) -> bool {
+        self.entry(obj_id).is_some_and(|e| e.over_cache)
     }
 
     /// The host bytes of the heap over a pages block's guest RAM `obj_id` names
@@ -6485,18 +6510,21 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// may write among the shapes the walk saw written ([`Self::note_shape`]).
     pub(crate) fn require_texture(&self, id: u64) -> RaiseResult<&P::Texture> {
         match self.entry(id) {
-            Some(Entry {
-                handle: ObjHandle::Texture(h),
-                laid_use,
-                shape,
-                ..
-            }) => {
+            Some(
+                entry @ Entry {
+                    handle: ObjHandle::Texture(h),
+                    laid_use,
+                    shape,
+                    ..
+                },
+            ) => {
                 if let Some(used) = laid_use {
                     self.note_laid(*used, false);
                 }
                 if let Some(used) = shape {
                     self.note_shape(used, false);
                 }
+                self.note_over_cache(entry);
                 Ok(h)
             }
             Some(Entry {
@@ -6530,16 +6558,19 @@ impl<P: Platform> GraphicsDecoder<P> {
             return Ok(None);
         }
         match self.entry(id) {
-            Some(Entry {
-                handle: ObjHandle::Texture(h),
-                laid_use,
-                shape,
-                ..
-            }) => {
+            Some(
+                entry @ Entry {
+                    handle: ObjHandle::Texture(h),
+                    laid_use,
+                    shape,
+                    ..
+                },
+            ) => {
                 if let Some(used) = laid_use {
                     self.note_laid(*used, false);
                 }
                 self.note_slot_shape((stage, index), shape.as_ref());
+                self.note_over_cache(entry);
                 Ok(Some(h))
             }
             Some(Entry {
@@ -6665,6 +6696,52 @@ impl<P: Platform> GraphicsDecoder<P> {
         if let Some(used) = &entry.shape {
             self.note_shape(used, true);
         }
+        self.note_over_cache(entry);
+    }
+
+    /// The buffer `id` names; an exec fault when `id` is 0 or names no buffer. One over a device
+    /// cache's buffer itself is noted ([`Self::note_over_cache`]).
+    pub(crate) fn require_buffer(&self, id: u64) -> RaiseResult<&P::Buffer> {
+        match self.entry(id) {
+            Some(
+                entry @ Entry {
+                    handle: ObjHandle::Buffer(h),
+                    ..
+                },
+            ) => {
+                self.note_over_cache(entry);
+                Ok(h)
+            }
+            Some(Entry {
+                handle: ObjHandle::Refused(r),
+                ..
+            }) => Err(r.reference(id)),
+            _ => Err(bad_reference()),
+        }
+    }
+
+    /// The buffer `id` names, `None` for 0; an exec fault when a non-zero `id` names no buffer.
+    /// Noted as [`Self::require_buffer`] notes it.
+    pub(crate) fn get_buffer(&self, id: u64) -> RaiseResult<Option<&P::Buffer>> {
+        if id == 0 {
+            return Ok(None);
+        }
+        self.require_buffer(id).map(Some)
+    }
+
+    /// An object the command buffer being walked names, `entry`, lies over a device cache's
+    /// buffer itself ([`Entry::over_cache`]): its block is noted, once, and the buffer's finish
+    /// makes the cache's record of its written bytes whole where the buffer may write the block
+    /// ([`surface_cache::Uses::saw_over_cache`]). The walk cannot tell the bytes a shader or a
+    /// blit writes through it, so any use is noted.
+    fn note_over_cache(&self, entry: &Entry<P>) {
+        let (true, Some((block, _))) = (entry.over_cache, entry.span) else {
+            return;
+        };
+        let mut noted = self.over_caches.borrow_mut();
+        if !noted.contains(&block) {
+            noted.push(block);
+        }
     }
 
     /// In the per-shape form, notes the use `used` of a view of a shape's image by the encoder
@@ -6724,7 +6801,6 @@ impl<P: Platform> GraphicsDecoder<P> {
 }
 
 resolvers! {
-    (require_buffer, get_buffer, Buffer, Buffer, "buffer"),
     (require_sampler, get_sampler, Sampler, SamplerState, "sampler"),
     (require_depth_stencil, get_depth_stencil, DepthStencil, DepthStencilState, "depth/stencil state"),
     (require_render_pipeline, get_render_pipeline, RenderPipeline, RenderPipeline, "render pipeline"),

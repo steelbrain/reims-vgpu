@@ -2927,16 +2927,16 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             }
             .map(|c| (c.clone_ref(), caches.repitched(m.block_offset)))
         };
-        let (buffer, laid_out) = match (cache, view) {
+        let (buffer, laid_out, over_cache) = match (cache, view) {
             (Some((cache, laid_out)), _) => {
                 // The first buffer over a new cache names the context that owns its first fill;
                 // another context's makes it (`SurfaceCaches::buffer_made`).
                 (self.surface_caches).buffer_made(device, m.block_offset, self.context)?;
-                (cache, laid_out)
+                (cache, laid_out, true)
             }
             (None, Some(view)) => {
                 match buffer_over(device, &view, 0, m.length, m.options.into(), None)? {
-                    Some(buffer) => (buffer, None),
+                    Some(buffer) => (buffer, None, false),
                     None => return Ok(Err(super::DecodeError::Refused)),
                 }
             }
@@ -2945,7 +2945,8 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         let span = Some((m.block_offset, m.block_size));
         let entry = (super::tables::Entry::of(super::ObjHandle::Buffer(buffer)))
             .over(span)
-            .laid_out(laid_out);
+            .laid_out(laid_out)
+            .over_cache(over_cache);
         self.store(m.obj_id, entry.over_view());
         Ok(Ok(()))
     }

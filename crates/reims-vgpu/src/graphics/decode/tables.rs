@@ -167,6 +167,15 @@ pub(crate) struct Entry<P: Platform> {
     /// form, one over a cache's buffer, and its reference to the shape the per-shape form would
     /// give it, in the cache's shadow, for the counts alone. `None` for any other object.
     pub(crate) shape: Option<ShapeUse>,
+    /// An object over a device cache's buffer itself, in the per-shape form not through a
+    /// shape's image: the buffer over a block's surface pages that is its cache, and each
+    /// texture or view over it that is no view of a shape's image. The GPU's work through it
+    /// writes the cache's buffer, which the cache's record of its written bytes holds none of: a
+    /// command buffer whose walk names it and that may write its block makes the record whole
+    /// ([`GraphicsDecoder::note_over_cache`]).
+    ///
+    /// [`GraphicsDecoder::note_over_cache`]: super::GraphicsDecoder::note_over_cache
+    pub(crate) over_cache: bool,
     /// A no-copy buffer whose identity the guest may hand on with no message naming it, and
     /// whether it did ([`super::escape`]); `None` for any other object.
     pub(crate) escape: Option<super::escape::Escape>,
@@ -196,6 +205,7 @@ impl<P: Platform> Entry<P> {
             laid_out: None,
             laid_use: None,
             shape: None,
+            over_cache: false,
             escape: None,
             made: 0,
             seen: 0,
@@ -206,6 +216,13 @@ impl<P: Platform> Entry<P> {
     /// The entry, lying over `span`.
     pub(crate) fn over(mut self, span: Option<(u64, u64)>) -> Self {
         self.span = span;
+        self
+    }
+
+    /// The entry, an object over a device cache's buffer itself where `over` (the field
+    /// `over_cache`).
+    pub(crate) fn over_cache(mut self, over: bool) -> Self {
+        self.over_cache = over;
         self
     }
 

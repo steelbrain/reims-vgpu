@@ -359,8 +359,9 @@ mod tests {
     use reims_vgpu_vulkan::core::sync::Mutex;
 
     use super::super::surface_cache::tests::{
-        NO_REACH, blit_with, blits_with, cache_id, cached, copies, download, encoder_with, queues,
-        reading, release, surface_texture, surface_texture_as, surface_textures, use_surfaces,
+        NO_REACH, blit_with, blits_with, buffer_bytes, cache_id, cached, complete_staged, copies,
+        download, encoder_with, queues, ram_bytes, reading, release, surface_texture,
+        surface_texture_as, surface_textures, use_surfaces,
     };
     use super::super::surface_pages::tests::{BLOCK, Rig, one_plane, rig};
     use super::*;
@@ -1425,5 +1426,188 @@ mod tests {
             RGFX_STATUS_REFUSED
         );
         assert!(!r.dec.caches().has(BLOCK));
+    }
+
+    /// A copy of one buffer into another ([`super::super::surface_cache::Way`]'s parts).
+    const COPY: &str = "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:";
+
+    /// The (destination, source offset, destination offset, size) of each copy out of `cache`
+    /// into another buffer in `calls`.
+    fn copies_out(calls: &[Call], cache: u64) -> Vec<(u64, u64, u64, u64)> {
+        let id = |a: &Arg| a.as_obj().map_or(0, |o| o.0);
+        (calls.iter())
+            .filter(|c| c.sel == COPY && id(&c.args[0]) == cache)
+            .map(|c| {
+                let at = |i: usize| c.args[i].as_u64().unwrap_or(u64::MAX);
+                (id(&c.args[2]), at(1), at(3), at(4))
+            })
+            .collect()
+    }
+
+    /// [`shaped`]'s rig with the caches' copies staged, its pages' bytes set first (from page 1,
+    /// [`ram_bytes`]); pipeline 31's function writes every texture slot it is asked of.
+    fn shaped_staged() -> Rig {
+        let mut r = rig(8);
+        r.dec.set_staged_surface_copies();
+        let page = r.page;
+        take_shapes(&r);
+        r.dec.hold_resource_ids(0, 1);
+        ram_bytes(&r, 1, 2 * page, Some(0x11));
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        queues(&mut r);
+        assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
+        compute_pipeline(&mut r, 31);
+        r.p.script()
+            .always(TEXTURE_SLOT_WRITES, Step::value(Some(true)));
+        r
+    }
+
+    /// Texture `obj_id` over buffer 10 at byte `offset` of the surface, 32 by 8 BGRA8 at a pitch
+    /// of 128 (1 KiB from `offset`), whose usage lets a shader write it, and the image of its
+    /// shape.
+    fn writable_at(r: &mut Rig, obj_id: u64, offset: u64) -> u64 {
+        use reims_vgpu_graphics::wire::RgfxTextureFromIOSurface;
+        use zerocopy::{FromBytes as _, IntoBytes as _};
+        let message = surface_texture_as(obj_id, 10, 80, (32, 8), (0x2, 0));
+        let mut m = RgfxTextureFromIOSurface::read_from_bytes(&message).unwrap();
+        m.offset = offset;
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.dec.decode(&r.device, m.as_bytes()).unwrap(), Ok(()));
+        views(&r.p.call_log().since(mark))[0].0
+    }
+
+    /// Command buffer `cb_obj_id`, naming [`BLOCK`] written, whose compute encoder writes texture
+    /// `obj_id` through a slot pipeline 31 writes.
+    fn shader_writes(r: &mut Rig, cb_obj_id: u64, obj_id: u64) {
+        computes(r, cb_obj_id, &[bind_pipeline(31), bind_texture(obj_id, 0)]);
+    }
+
+    /// A download of [`BLOCK`] in `r`, its staging buffer's bytes set to `value` before the
+    /// GPU's copy is done, answered once the pages hold them: the shapes it wrote back, each by
+    /// (image, buffer, offset), and its copies out of `cache` ([`copies_out`]).
+    #[allow(clippy::type_complexity)] // the two lists the tests read
+    fn staged_download(
+        r: &Rig,
+        cache: u64,
+        value: u8,
+    ) -> (Vec<(u64, u64, u64)>, Vec<(u64, u64, u64, u64)>) {
+        let mark = r.p.call_log().mark();
+        let done = download(r, BLOCK);
+        let calls = r.p.call_log().since(mark);
+        let out = copies_out(&calls, cache);
+        if let Some(&(staging, ..)) = out.first() {
+            buffer_bytes(r, staging, Some(value));
+        }
+        complete_staged(r);
+        assert!(done.load(Ordering::SeqCst), "answered");
+        (written_back(&calls), out)
+    }
+
+    /// In the per-shape form a staged download moves only the bytes the host's copies wrote
+    /// into the cache's buffer since its last copy out (the module doc of `surface_cache`,
+    /// "Written ranges"): the shape written back, at its place, on the GPU and on the host's
+    /// CPU. A shape written next outside the earlier one's bytes moves its own alone, so the
+    /// bytes the guest's CPU wrote into the pages since, the earlier shape's among them, stay
+    #[test]
+    fn a_staged_download_moves_only_the_shapes_written_back() {
+        let mut r = shaped_staged();
+        let cache = cache_id(&r);
+        let length = 2 * r.page;
+        let first = writable_at(&mut r, 25, 0);
+        let second = writable_at(&mut r, 26, 2048);
+        let before = ram_bytes(&r, 1, length, None);
+
+        shader_writes(&mut r, 0x100, 25);
+        complete_staged(&r);
+        let (back, out) = staged_download(&r, cache, 0xc3);
+        assert_eq!(back, [(first, cache, 0)]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            (out[0].1, out[0].2, out[0].3),
+            (0, 0, 1024),
+            "the first shape's KiB alone"
+        );
+        let pages = ram_bytes(&r, 1, length, None);
+        assert!(pages[..1024].iter().all(|&b| b == 0xc3), "the shape's bytes");
+        assert_eq!(pages[1024..], before[1024..], "the rest as the pages held them");
+        let counts = r.dec.caches().counts();
+        assert_eq!(counts.narrowed, 1);
+        assert_eq!(counts.unwritten_bytes, length - 1024);
+
+        // The guest's CPU writes the pages, then the GPU the second shape alone.
+        let poked = ram_bytes(&r, 1, length, Some(0x55));
+        shader_writes(&mut r, 0x101, 26);
+        complete_staged(&r);
+        let (back, out) = staged_download(&r, cache, 0x3c);
+        assert_eq!(back, [(second, cache, 2048)]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!((out[0].1, out[0].2, out[0].3), (2048, 2048, 1024));
+        let pages = ram_bytes(&r, 1, length, None);
+        assert!(
+            pages[2048..3072].iter().all(|&b| b == 0x3c),
+            "the second shape's bytes"
+        );
+        assert_eq!(
+            pages[..2048],
+            poked[..2048],
+            "the CPU's bytes over the first shape stay"
+        );
+        assert_eq!(pages[3072..], poked[3072..], "and past the second");
+    }
+
+    /// A command buffer that may write the block and names an object over the cache's buffer
+    /// itself (here a blit from buffer 10, the buffer over the surface's pages) makes the next
+    /// staged download move all of the surface's bytes, as the walk cannot tell what it wrote
+    /// there; the one after, nothing but a shape written since, moves that shape's alone
+    #[test]
+    fn a_writer_over_the_caches_buffer_makes_the_download_whole() {
+        let mut r = shaped_staged();
+        let cache = cache_id(&r);
+        let length = 2 * r.page;
+        let first = writable_at(&mut r, 25, 0);
+
+        write(&mut r, 0x100, 25, (32, 8));
+        complete_staged(&r);
+        let (back, out) = staged_download(&r, cache, 0xc3);
+        assert_eq!(back, [(first, cache, 0)]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!((out[0].1, out[0].2, out[0].3), (0, 0, length), "whole");
+        let pages = ram_bytes(&r, 1, length, None);
+        assert!(pages.iter().all(|&b| b == 0xc3), "every byte");
+        assert_eq!(r.dec.caches().counts().narrowed, 0);
+
+        shader_writes(&mut r, 0x101, 25);
+        complete_staged(&r);
+        let (back, out) = staged_download(&r, cache, 0x3c);
+        assert_eq!(back, [(first, cache, 0)]);
+        assert_eq!((out[0].1, out[0].2, out[0].3), (0, 0, 1024), "the shape's alone");
+    }
+
+    /// A staged download after a writer that wrote nothing the host copied into the cache's
+    /// buffer moves nothing and makes no staging buffer, counted, and is answered
+    #[test]
+    fn a_staged_download_with_nothing_written_moves_nothing() {
+        let mut r = shaped_staged();
+        let cache = cache_id(&r);
+        let length = 2 * r.page;
+        writable_at(&mut r, 25, 0);
+        let before = ram_bytes(&r, 1, length, None);
+        // A writer of the block whose encoder binds no texture.
+        computes(&mut r, 0x100, &[bind_pipeline(31)]);
+        complete_staged(&r);
+        let mark = r.p.call_log().mark();
+        let (back, out) = staged_download(&r, cache, 0xc3);
+        assert!(back.is_empty() && out.is_empty(), "{back:?} {out:?}");
+        let sels = r.p.call_log().sels_since(mark);
+        assert!(
+            !sels.contains(&reims_vgpu_vulkan::core::testkit::impls::device::SCRATCH_BUFFER),
+            "no staging buffer made"
+        );
+        assert_eq!(ram_bytes(&r, 1, length, None), before);
+        let counts = r.dec.caches().counts();
+        assert_eq!((counts.narrowed, counts.narrowed_none), (1, 1));
     }
 }

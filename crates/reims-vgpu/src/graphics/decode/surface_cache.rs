@@ -311,6 +311,34 @@
 //!   `rt-fills-cache-view-kib`, `rt-fills-cache-view-cpu-ns`, and the same of `rt-downloads-`),
 //!   beside the surfaces the guest presented (`rt-presents`), which a frame's share falls out of.
 //!
+//! - **Written ranges.** In the per-shape form the GPU's work writes the shapes' images, not the
+//!   cache's buffer, so the buffer differs from its pages only where the host's own copies wrote
+//!   it since the two last held the same bytes. Each cache keeps a record of those bytes
+//!   ([`SurfaceCache::changed`]), and a staged download moves only them, on the GPU into its
+//!   buffer and on the host's CPU into the pages, so every other byte of the pages stays as the
+//!   guest's CPU last wrote it. A download whose record is empty copies nothing and makes no
+//!   buffer. A range is marked written as the copy that writes it into the cache's buffer is
+//!   encoded: a shape's write-back before a download or a fill ([`shapes::write_back`]), the
+//!   shape's whole extent at its place, and a copy of a shape's overlap into the shapes that share
+//!   it, which goes through the buffer ([`shapes::copy_overlaps`]), its source's extent. A copy
+//!   encoded between the cache and its named pages, either way, empties the record. The record is
+//!   whole, and the copy moves every texel as before, wherever the host cannot name the bytes:
+//!   from the cache's make to its first copy with its pages named (its make's zeros, or what it
+//!   carried); after a lost device's recovery, a refill kept from the CPU's write, the host's
+//!   video decodes into the buffer, and a fill that copied nothing; and after a command buffer
+//!   that may write the block and whose walk named an object over the buffer itself, not
+//!   through a shape's image (the buffer over the surface's pages, a texture or view made over
+//!   it, or one that took no shape), as the walk cannot tell what a shader or a blit writes
+//!   through it ([`SurfaceCaches::over_written`]). No other GPU work writes the buffer: Metal
+//!   makes a resource that the GPU reaches through an argument buffer or an indirect command
+//!   buffer resident only by a `useResource` call, which the walk resolves as it does a binding.
+//!   A write it sees through a shape's view marks the shape dirty, and the write-back marks the
+//!   range. In the default form, and for a cache made for the host's video, textures lie over
+//!   the buffer itself as a rule, and the copy is always whole ([`SurfaceCache::raw`]). Fills
+//!   stay whole. The texels' bytes a narrowed download leaves as the pages hold them are
+//!   counted (`rt-downloads-cache-view-unwritten-kib`), and so are the downloads that moved
+//!   nothing (`rt-downloads-cache-view-unwritten`).
+//!
 //! [`GpuDevice::own_memory_budget`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::own_memory_budget
 //! [`GpuDevice::copies_guest_ram`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::copies_guest_ram
 //! [`GpuDevice::recoveries`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::recoveries
@@ -467,6 +495,17 @@ pub(crate) struct SurfaceCache<P: Platform> {
     host_read: u64,
     /// A command buffer that may write the cache was committed since the cache was last copied.
     written: bool,
+    /// Where the cache may differ from its pages ([`Changed`]): the bytes the host's copies into
+    /// the cache's buffer wrote since its last copy out or fill, which a staged copy out moves
+    /// alone (the module doc, "Written ranges").
+    changed: Changed,
+    /// The GPU's work writes the cache's buffer itself as a rule, with no copy of the host's
+    /// seen: in the default form, where every texture over the surface lies over the buffer,
+    /// and for a cache made for the host's video, whose decodes write it. A copy out of such a
+    /// cache moves all of its texels, whatever [`Self::changed`] holds. In the per-shape form an
+    /// object over the buffer itself is the exception, which a command buffer that may write the
+    /// cache makes the record whole by ([`SurfaceCaches::over_written`]).
+    raw: bool,
     /// The transfer event's value at which the cache's last fill is done; 0 for none.
     filled_at: u64,
     /// The CPU's generation of the surface the cache's first fill is of, owed from the cache's
@@ -525,6 +564,58 @@ pub(crate) struct SurfaceCache<P: Platform> {
     surface: exported::CacheSurface<P>,
 }
 
+/// Where a cache's buffer may differ from its pages ([`SurfaceCache::changed`]), as bytes of the
+/// surface: in the per-shape form the GPU's work writes the shapes' images, and the buffer
+/// changes only by the host's copies into it, each of which adds its bytes here as it is
+/// encoded; a copy out or a fill of the named pages, once encoded, leaves it empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Changed {
+    /// These bytes, sorted and apart: none but them differ.
+    Spans(Vec<Range<u64>>),
+    /// Any byte may differ.
+    All,
+}
+
+impl Changed {
+    /// None differ: the buffer holds its pages' bytes.
+    fn none() -> Self {
+        Changed::Spans(Vec::new())
+    }
+
+    /// The bytes `span` may differ too.
+    fn add(&mut self, span: Range<u64>) {
+        let Changed::Spans(spans) = self else {
+            return;
+        };
+        if span.is_empty() {
+            return;
+        }
+        // The spans that touch or overlap `span` join it; the rest keep their places.
+        let first = spans.partition_point(|s| s.end < span.start);
+        let last = spans.partition_point(|s| s.start <= span.end);
+        let joined = match spans.get(first..last) {
+            Some([one, .., end]) => one.start.min(span.start)..end.end.max(span.end),
+            Some([one]) => one.start.min(span.start)..one.end.max(span.end),
+            _ => span,
+        };
+        spans.splice(first..last, [joined]);
+    }
+
+}
+
+/// Of `bytes`, the parts that lie in `spans`, sorted and apart: each of `bytes` cut to them, in
+/// `bytes`' order.
+fn clip(spans: &[Range<u64>], bytes: &[Range<u64>]) -> Vec<Range<u64>> {
+    let mut out = Vec::new();
+    for b in bytes {
+        let first = spans.partition_point(|s| s.end <= b.start);
+        for s in spans[first..].iter().take_while(|s| s.start < b.end) {
+            out.push(s.start.max(b.start)..s.end.min(b.end));
+        }
+    }
+    out
+}
+
 /// A laid-out cache's wide home (the module doc, "Wider than the plane"): a buffer that keeps
 /// the surface's own layout, which the textures over the surface that pass their plane's texels
 /// at the cache's pitch lie over, at the surface's place and pitch.
@@ -567,6 +658,59 @@ impl<P: Platform> SurfaceCache<P> {
                 .filter(|(bytes, _)| !bytes.is_empty())
                 .map(|(bytes, other)| (other, bytes.start, bytes.end - bytes.start))
                 .collect(),
+        }
+    }
+
+    /// The bytes of the surface the cache's record holds may differ from its pages
+    /// ([`Self::changed`]), each within the surface; `None` where any may: the record is whole,
+    /// or textures lie over the buffer ([`Self::raw`]).
+    fn written_spans(&self) -> Option<Vec<Range<u64>>> {
+        match &self.changed {
+            Changed::Spans(spans) if !self.raw => Some(
+                (spans.iter())
+                    .map(|s| s.start.min(self.length)..s.end.min(self.length))
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            ),
+            Changed::Spans(_) | Changed::All => None,
+        }
+    }
+
+    /// A staged copy out's bytes: those its CPU copy moves into the pages, the surface's texels
+    /// where its layout is known, else all of its bytes, cut to those the record holds may
+    /// differ ([`Self::written_spans`]); and the record's own, which its GPU copy moves into the
+    /// staging buffer, `None` for all of the cache's. A copy the record narrows is counted in
+    /// `counts`, with the texels' bytes it leaves as the pages hold them, and on the counts line
+    /// where the copies are `timed` ([`UNWRITTEN_KIB`], [`UNWRITTEN_NONE`]).
+    fn out_bytes(
+        &self,
+        counts: &mut CacheCounts,
+        timed: Option<&Now>,
+    ) -> (Vec<Range<u64>>, Option<Vec<Range<u64>>>) {
+        let texels = (self.texels.clone()).unwrap_or_else(|| vec![0..self.length]);
+        let Some(written) = self.written_spans() else {
+            return (texels, None);
+        };
+        let cpu = clip(&written, &texels);
+        let bytes = |spans: &[Range<u64>]| spans.iter().map(|s| s.end - s.start).sum::<u64>();
+        let left = bytes(&texels).saturating_sub(bytes(&cpu));
+        counts.narrowed += 1;
+        counts.unwritten_bytes += left;
+        counts.narrowed_none += u64::from(cpu.is_empty());
+        if timed.is_some() {
+            reims_vgpu_vulkan::answer::count_kind_by(UNWRITTEN_KIB, left.div_ceil(1024));
+            if cpu.is_empty() {
+                reims_vgpu_vulkan::answer::count_kind(UNWRITTEN_NONE);
+            }
+        }
+        (cpu, Some(written))
+    }
+
+    /// The host's copies of the shapes `ids` into the cache's buffer are encoded, each its whole
+    /// extent at its place ([`shapes::write_back`]): their bytes may differ from the pages'.
+    fn wrote_shapes(&mut self, ids: &[u64]) {
+        for shape in self.shapes.iter().filter(|s| ids.contains(&s.id())) {
+            self.changed.add(shape.key.span());
         }
     }
 }
@@ -1464,6 +1608,11 @@ pub(crate) struct CacheCounts {
     /// Downloads, and the bytes they moved.
     pub(crate) downloads: u64,
     pub(crate) downloaded_bytes: u64,
+    /// Staged copies out the cache's record narrowed ([`SurfaceCache::changed`]), those of them
+    /// that moved nothing, and the texels' bytes they left as the pages hold them.
+    pub(crate) narrowed: u64,
+    pub(crate) narrowed_none: u64,
+    pub(crate) unwritten_bytes: u64,
     /// Downloads answered at once: of a cache nothing wrote since its last copy, or one whose
     /// pages a device of the host wrote since.
     pub(crate) clean: u64,
@@ -1830,6 +1979,10 @@ struct Since {
     /// Its decodes landed in the cache's surface, not the buffer: the plane shapes hold the
     /// picture, and the others owe the fill ([`exported::owe_video`]).
     planes: bool,
+    /// One that may write the cache holds video work, whose decodes write the buffer itself, or
+    /// named an object over the buffer itself ([`SurfaceCaches::over_written`]): any of its bytes
+    /// may differ from the pages once the copy is made ([`SurfaceCache::changed`]).
+    all: bool,
 }
 
 /// What a use's [`RGFX_SURFACE_USE_REFILL`] asks of its block's cache
@@ -1984,6 +2137,10 @@ impl<P: Platform> SurfaceCaches<P> {
         for shape in self.by_block.values_mut().flat_map(|c| c.shapes.iter_mut()) {
             shape.owed = true;
             shape.dirty = false;
+        }
+        // The lost device's buffers hold nothing known; a fill made again empties a record.
+        for cache in self.by_block.values_mut() {
+            cache.changed = Changed::All;
         }
         // A cache made for the host's video keeps its bytes over its own memory: only its users,
         // whose work went with the lost device, go.
@@ -2140,6 +2297,9 @@ impl<P: Platform> SurfaceCaches<P> {
                 generation: None,
                 host_read: 0,
                 written: false,
+                // Its make's zeros, not its pages' bytes, until its first fill.
+                changed: Changed::All,
+                raw: !self.shaped || life.is_some(),
                 filled_at,
                 first_fill: Some(generation),
                 owner: None,
@@ -2274,6 +2434,9 @@ impl<P: Platform> SurfaceCaches<P> {
             return Ok(());
         };
         exported::skipped(&mut cache.surface, picture);
+        // The decode wrote the buffer itself ([`Self::follow`] marks it so at the begin of a
+        // buffer that names the block written).
+        cache.changed = Changed::All;
         if !std::mem::take(&mut cache.zeros) || picture {
             return Ok(());
         }
@@ -2374,6 +2537,10 @@ impl<P: Platform> SurfaceCaches<P> {
                 generation: (!carries).then_some(0),
                 host_read: 0,
                 written: false,
+                // Its make's zeros, and what it carried, until its first copy with its pages
+                // named.
+                changed: Changed::All,
+                raw: !self.shaped || life.is_some(),
                 filled_at,
                 first_fill: carries.then_some(0),
                 owner: None,
@@ -2509,6 +2676,7 @@ impl<P: Platform> SurfaceCaches<P> {
         if let Some(cache) = self.by_block.get_mut(&block) {
             cache.pages = Some(ends);
             cache.carried = None;
+            cache.changed = Changed::All;
         }
         let pages = Pages {
             runs: host_pages,
@@ -2537,6 +2705,7 @@ impl<P: Platform> SurfaceCaches<P> {
         if let Some(cache) = self.by_block.get_mut(&block) {
             cache.pages = Some(CachePages::Copied(Arc::new(copied)));
             cache.carried = None;
+            cache.changed = Changed::All;
         }
         let pages = Pages {
             runs: host_pages,
@@ -2869,7 +3038,7 @@ impl<P: Platform> SurfaceCaches<P> {
         device: &P::Device,
         cb: &P::CommandBuffer,
         u: &RgfxOpSurfaceUse,
-        (decoded, video): (Option<&[PagesPlane; 2]>, bool),
+        (decoded, video, decodes): (Option<&[PagesPlane; 2]>, bool, bool),
     ) -> (Option<Count>, RaiseResult<(bool, Option<u64>)>) {
         let block = u.block_offset;
         if let Some(planes) = decoded {
@@ -2883,6 +3052,11 @@ impl<P: Platform> SurfaceCaches<P> {
         let refill = self.refill(u);
         if refill == Refill::Kept {
             self.counts.refills_kept += 1;
+            // The CPU wrote the pages under the cache: a copy out moves all of its texels, as
+            // before the record.
+            if let Some(cache) = self.by_block.get_mut(&block) {
+                cache.changed = Changed::All;
+            }
         }
         let waits = self.pending(block, false) > 0 || self.deferring(block);
         let mut filled = Ok(());
@@ -2911,7 +3085,7 @@ impl<P: Platform> SurfaceCaches<P> {
         let count = self.hold(block, u.flags & RGFX_SURFACE_USE_WRITES != 0);
         self.touch_shapes(block);
         let follows = filled
-            .and_then(|()| self.follow(cb, count))
+            .and_then(|()| self.follow(cb, count, decodes))
             .and_then(|follows| self.home_in(cb, block).map(|()| follows));
         (Some(count), follows)
     }
@@ -3037,6 +3211,27 @@ impl<P: Platform> SurfaceCaches<P> {
         }
     }
 
+    /// The command buffer whose counts among the caches' users are `counts` named objects over
+    /// the caches' buffers of the blocks `over` themselves ([`Uses::saw_over_cache`]): its work
+    /// through them may have written any byte of a cache's buffer it may write, so the cache's
+    /// record of its written bytes is whole from now, or, where the buffer was counted after a
+    /// deferred copy of the cache was asked, once that copy is made ([`Since`]). A block it named
+    /// no use of takes the same, as nothing says what its work did there; one it named only
+    /// reads of keeps its record.
+    fn over_written(&mut self, counts: &[Count], over: &[u64]) {
+        for block in over {
+            let count = counts.iter().find(|c| c.block == *block);
+            if count.is_some_and(|c| !c.writes) {
+                continue;
+            }
+            if let Some(since) = count.and_then(|c| self.since_mut(*block, c.number)) {
+                since.all = true;
+            } else if let Some(cache) = self.by_block.get_mut(block) {
+                cache.changed = Changed::All;
+            }
+        }
+    }
+
     /// The shapes of the block at `block`'s cache that command buffers counted behind a deferred
     /// copy of it wrote, marked dirty once the copy is made ([`Since`]).
     fn dirty_since(&self, block: u64) -> Vec<u64> {
@@ -3124,6 +3319,10 @@ impl<P: Platform> SurfaceCaches<P> {
                 })
                 .collect();
             let into: Vec<u64> = (others.iter()).filter(|o| o.1).map(|o| o.0).collect();
+            // The source's overlap goes into the buffer on the way: within its extent.
+            if !into.is_empty() {
+                cache.changed.add(key.span());
+            }
             shapes::copy_overlaps::<P>(
                 cb,
                 &cache.device,
@@ -3356,20 +3555,31 @@ impl<P: Platform> SurfaceCaches<P> {
     /// and, where it may write the cache, the last copy out too, which must not copy its write.
     /// It waits for that copy on the cache's event, which [`Caches::before_answering`] gave the cache
     /// before counting the use, or, where the platform made none, waited for the copy instead.
-    /// Whether `cb` waits on the GPU for a copy of the cache; and the number of the deferred copy
-    /// it follows ([`SurfaceCache::asked`]).
-    fn follow(&mut self, cb: &P::CommandBuffer, count: Count) -> RaiseResult<(bool, Option<u64>)> {
+    /// Where `cb` holds `video` work, a use that may write the cache makes any of its bytes differ
+    /// from the pages from then on ([`SurfaceCache::changed`]): a decode writes the buffer
+    /// itself, not a shape's image. Whether `cb` waits on the GPU for a copy of the cache; and
+    /// the number of the deferred copy it follows ([`SurfaceCache::asked`]).
+    fn follow(
+        &mut self,
+        cb: &P::CommandBuffer,
+        count: Count,
+        video: bool,
+    ) -> RaiseResult<(bool, Option<u64>)> {
         let block = count.block;
         if count.writes {
             match self.since_mut(block, count.number) {
                 Some(since) => {
                     since.written = true;
                     since.writes = since.writes.saturating_add(1);
+                    since.all |= video;
                 }
                 None => {
                     if let Some(cache) = self.by_block.get_mut(&block) {
                         cache.written = true;
                         cache.read_back.writes = cache.read_back.writes.saturating_add(1);
+                        if video {
+                            cache.changed = Changed::All;
+                        }
                     }
                 }
             }
@@ -3725,6 +3935,9 @@ impl<P: Platform> SurfaceCaches<P> {
             if since.owed {
                 exported::owe_video(&mut cache.shapes, since.planes, &mut self.counts.shapes);
             }
+            if since.all {
+                cache.changed = Changed::All;
+            }
         }
         if let Some((event, number)) = self.signal_with.take() {
             self.signal_alone(&device, block, &event, number);
@@ -4003,6 +4216,8 @@ impl<P: Platform> SurfaceCaches<P> {
             }
             if let Some(cache) = self.by_block.get_mut(&block) {
                 cache.written = false;
+                // Its texels all went out, the shapes' written back among them.
+                cache.changed = Changed::none();
                 cache.shapes.written_back(&back, &mut self.counts.shapes);
                 cache.users.insert(signals, next);
                 let read_back = &mut cache.read_back;
@@ -4153,6 +4368,8 @@ impl<P: Platform> SurfaceCaches<P> {
         if let Some(cache) = self.by_block.get_mut(&block) {
             cache.filled_at = value;
             cache.users.clear();
+            // The dirty shapes went into the buffer, with no copy out behind them.
+            cache.wrote_shapes(&back);
             cache.shapes.written_back(&back, &mut self.counts.shapes);
         }
         self.counts.shapes.fills_made += 1;
@@ -4493,6 +4710,7 @@ impl<P: Platform> SurfaceCaches<P> {
         let users = wait_for_users::<P>(&cb, &self.ends, cache)?;
         // The dirty shapes go into the buffer first, which takes them on to the pages (rule 3).
         let back = shapes::write_back::<P>(&cb, &cache.device, &cache.shapes, |s| s.dirty)?;
+        cache.wrote_shapes(&back);
         let timed = self.staged.as_ref();
         let staged = copy::<P>(
             device,
@@ -5092,6 +5310,8 @@ pub(crate) struct Uses<P: Platform> {
     /// The shapes its walk saw written, each by its block, held until its finish marks them
     /// dirty ([`SurfaceCaches::shapes_written`]): a shape held so stays past the bound.
     shapes: Vec<(u64, shapes::ShapeRef)>,
+    /// The blocks whose caches' buffers its walk named an object over ([`Self::saw_over_cache`]).
+    over: Vec<u64>,
     /// Its work is video alone ([`Reach::video`]): its uses' writes are its decodes', into the
     /// caches' buffers ([`SurfaceCaches::unseen_writes`]).
     video: bool,
@@ -5114,6 +5334,13 @@ impl<P: Platform> Uses<P> {
             self.seen.push(block);
             self.shapes.push((block, shape));
         }
+    }
+
+    /// The command buffer's walk named objects over the caches' buffers of `blocks` themselves,
+    /// not through a shape's image: where it may write such a block, its work may have written
+    /// any byte of the cache's buffer ([`SurfaceCaches::over_written`]).
+    pub(crate) fn saw_over_cache(&mut self, blocks: impl IntoIterator<Item = u64>) {
+        self.over.extend(blocks);
     }
 }
 
@@ -5677,6 +5904,7 @@ impl<P: Platform> Caches<P> {
             follows: Vec::new(),
             seen: Vec::new(),
             shapes: Vec::new(),
+            over: Vec::new(),
             video: reach.video && !reach.work,
         };
         let mut waits = reached;
@@ -5686,7 +5914,7 @@ impl<P: Platform> Caches<P> {
                 .find(|(block, _)| *block == u.block_offset)
                 .map(|(_, planes)| planes);
             let video = reach.video && !reach.work;
-            let (count, follows) = state.before_one(device, cb, u, (decoded, video));
+            let (count, follows) = state.before_one(device, cb, u, (decoded, video, reach.video));
             // Counted at once, so a later copy of the block follows this buffer.
             held.blocks.extend(count);
             match follows {
@@ -5798,6 +6026,7 @@ impl<P: Platform> Caches<P> {
                 .collect();
             state.unseen_writes(&uses.blocks, &unseen, uses.video);
             state.shapes_written(&uses.blocks, &uses.shapes);
+            state.over_written(&uses.blocks, &uses.over);
             state.after(device, queue, cb, &uses.blocks)
         };
         let done = signalled.and_then(|()| commit());
@@ -6905,6 +7134,14 @@ const DOWNLOADS: StagedCodes = StagedCodes {
 /// copies' per-frame share falls out of ([`Caches::count_present`]).
 const PRESENTS: &str = "rt-presents";
 
+/// The KiB of texels the staged downloads left as the pages hold them, as no copy of the host's
+/// into the cache wrote them since its last copy out or fill (the module doc, "Written
+/// ranges").
+const UNWRITTEN_KIB: &str = "rt-downloads-cache-view-unwritten-kib";
+
+/// The staged downloads that moved nothing: no copy of the host's wrote the cache since.
+const UNWRITTEN_NONE: &str = "rt-downloads-cache-view-unwritten";
+
 impl StagedCodes {
     /// One copy of `bytes` bytes.
     fn copied(&self, bytes: u64) {
@@ -6929,6 +7166,12 @@ impl StagedCodes {
 /// block's carried pages, its pages not named, are copied in the same way, each run to its own
 /// bytes of the cache, the rest left as it is; nothing is copied out of such a cache. Where no
 /// view or buffer can be made, nothing is copied, as where no encoder is.
+///
+/// A staged copy out moves only the bytes the cache's record holds may differ from the pages
+/// ([`SurfaceCache::changed`], the module doc, "Written ranges"), and none, with no buffer
+/// made, where it holds none. A copy encoded between the cache and its named pages leaves the
+/// record empty: the two then hold the same bytes. A fill of them that copies nothing leaves it
+/// whole, the cache's bytes unknown against the pages'.
 fn copy<P: Platform>(
     device: &P::Device,
     cb: &P::CommandBuffer,
@@ -6937,6 +7180,9 @@ fn copy<P: Platform>(
     counts: &mut CacheCounts,
     (timed, spares): (Option<&Now>, &Arc<Spares<P>>),
 ) -> RaiseResult<Option<Staging<P>>> {
+    if way == Way::In && cache.pages.is_some() {
+        cache.changed = Changed::All;
+    }
     let Some(blit) = cb.blit_encoder(ON)? else {
         return Ok(None);
     };
@@ -6948,6 +7194,7 @@ fn copy<P: Platform>(
         (Some(CachePages::Runs { .. }), Way::Out) => encode_out::<P>(&blit, cache, None)?,
         (Some(CachePages::View(_) | CachePages::Copied(_)) | None, _) => false,
     };
+    let mut moved = by_runs;
     let mut staged = None;
     if !by_runs {
         if let Some(CachePages::Runs { unmade, .. }) = &cache.pages {
@@ -6980,11 +7227,22 @@ fn copy<P: Platform>(
                     encode_out::<P>(&blit, cache, Some(pages))?;
                 }
             }
+            moved = true;
         }
         let at = timed.map(|now| now());
+        // A staged copy out's bytes, the CPU's and the GPU's ([`SurfaceCache::out_bytes`]).
+        let out = match (&cache.pages, way) {
+            (Some(CachePages::Copied(_)), Way::Out) => Some(cache.out_bytes(counts, timed)),
+            _ => None,
+        };
+        // Nothing of the cache differs from its pages: the copy is made with nothing to move,
+        // and no buffer.
+        let nothing = out.as_ref().is_some_and(|(cpu, _)| cpu.is_empty());
+        moved |= nothing;
         // A spare of the length, else a buffer of the copy's own, unzeroed: what its CPU copy
         // reads of it, its GPU copy writes first, and the other way round.
         if let Some(CachePages::Copied(copied)) = &cache.pages
+            && !nothing
             && let Some(buffer) = match spares.take(cache.length) {
                 Some(buffer) => Some(buffer),
                 None => device.new_scratch_buffer_of_length(ON, cache.length, STORAGE_SHARED)?,
@@ -7003,14 +7261,16 @@ fn copy<P: Platform>(
                 };
             }
             // The buffer keeps the surface's layout: the GPU's copy moves the bytes the cache
-            // holds between it and the cache, the CPU's the surface's between it and the pages.
-            let parts = cache.moves([(0..cache.length, 0)]);
+            // holds between it and the cache, the CPU's the surface's between it and the pages;
+            // a copy out the record narrows, the record's bytes alone, a part each, where the
+            // CPU's copy takes their texels.
+            let parts = match out.as_ref().and_then(|(_, gpu)| gpu.as_deref()) {
+                Some(spans) => cache.moves(spans.iter().map(|s| (s.clone(), s.start))),
+                None => cache.moves([(0..cache.length, 0)]),
+            };
             between::<P>(&blit, (&cache.device, &buffer), &parts, way)?;
-            let into = (way == Way::Out).then(|| {
-                let whole = 0..cache.length;
-                let spans = cache.texels.clone().unwrap_or_else(|| vec![whole]);
-                (Arc::clone(copied), spans)
-            });
+            let into = out.map(|(cpu, _)| (Arc::clone(copied), cpu));
+            moved = true;
             if let (Some(now), Some(at)) = (timed, at) {
                 let codes = match &into {
                     Some((_, spans)) => {
@@ -7071,6 +7331,9 @@ fn copy<P: Platform>(
         }
     }
     blit.encode(ON, BlitCmd::EndEncoding)?;
+    if moved && cache.pages.is_some() {
+        cache.changed = Changed::none();
+    }
     Ok(staged)
 }
 
@@ -10944,6 +11207,47 @@ pub(super) mod tests {
             .collect()
     }
 
+    /// A cache's record of its written bytes keeps them sorted and apart: a span that overlaps
+    /// or touches others joins them into one, one between others takes its place among them,
+    /// and an empty span adds nothing; a whole record takes no span
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // records of one span
+    fn a_written_record_joins_the_spans_it_is_given() {
+        let spans = |c: &Changed| match c {
+            Changed::Spans(spans) => spans.clone(),
+            Changed::All => panic!("whole"),
+        };
+        let mut c = Changed::none();
+        c.add(100..200);
+        c.add(400..500);
+        assert_eq!(spans(&c), [100..200, 400..500]);
+        c.add(250..300);
+        assert_eq!(spans(&c), [100..200, 250..300, 400..500], "between, apart");
+        c.add(200..250);
+        assert_eq!(spans(&c), [100..300, 400..500], "touching both sides");
+        c.add(50..450);
+        assert_eq!(spans(&c), [50..500], "over all of them");
+        c.add(600..600);
+        assert_eq!(spans(&c), [50..500], "an empty span");
+        c.add(0..10);
+        assert_eq!(spans(&c), [0..10, 50..500], "before all");
+        let mut all = Changed::All;
+        all.add(0..10);
+        assert_eq!(all, Changed::All);
+    }
+
+    /// Bytes are cut to a record's spans: each range keeps only what lies in them, in its order
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // lists of one range
+    fn bytes_are_clipped_to_the_written_spans() {
+        let spans = [100..200, 300..400];
+        assert_eq!(clip(&spans, &[0..1000]), [100..200, 300..400]);
+        assert_eq!(clip(&spans, &[150..350]), [150..200, 300..350]);
+        assert_eq!(clip(&spans, &[0..100, 200..300, 400..500]), Vec::<Range<u64>>::new());
+        assert_eq!(clip(&spans, &[120..130, 390..450]), [120..130, 390..400]);
+        assert_eq!(clip(&[], &[0..1000]), Vec::<Range<u64>>::new());
+    }
+
     /// The bytes of each plane's rows' texels, merged where rows follow on, in the surface's
     /// order: two planes of rows with bytes between, one whose rows follow on, and rows of no
     /// texels
@@ -12406,7 +12710,7 @@ pub(super) mod tests {
 
     /// Completes every command buffer in flight, then waits until the staged copies out of the
     /// caches they completed have landed in their pages ([`INTO_PAGES_THREADS`]).
-    fn complete_staged(r: &Rig) {
+    pub(crate) fn complete_staged(r: &Rig) {
         r.p.world().complete_all(CompleteOn::Caller);
         let lands_out = r.dec.caches().lands_out();
         lands_out.flush();
@@ -13179,7 +13483,7 @@ pub(super) mod tests {
     }
 
     /// The live Shared buffer `id`'s bytes, each set to `with` first where given.
-    fn buffer_bytes(r: &Rig, id: u64, with: Option<u8>) -> Vec<u8> {
+    pub(crate) fn buffer_bytes(r: &Rig, id: u64, with: Option<u8>) -> Vec<u8> {
         use reims_vgpu_vulkan::core::platform::ObjId;
         use reims_vgpu_vulkan::core::testkit::objects::kind;
         let buffer = (r.p.world().find(ObjId(id)))
@@ -13197,7 +13501,7 @@ pub(super) mod tests {
     }
 
     /// The `length` bytes of guest RAM from page `first`, read, or written with `with`.
-    fn ram_bytes(r: &Rig, first: u64, length: u64, with: Option<u8>) -> Vec<u8> {
+    pub(crate) fn ram_bytes(r: &Rig, first: u64, length: u64, with: Option<u8>) -> Vec<u8> {
         let at = r
             .ram
             .host_addr(RAM + first * r.page)
