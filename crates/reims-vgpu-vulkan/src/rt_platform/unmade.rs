@@ -24,7 +24,7 @@ use crate::core::platform::types::MtlSize;
 use crate::core::platform::types::NsRange;
 use crate::core::platform::types::SizeAndAlign;
 use crate::core::platform::{Handle, ObjId, Platform};
-use crate::core::platform::{function_table, icb, rate_map, render, resource};
+use crate::core::platform::{function_table, icb, rate_map, render};
 use crate::core::raise::OnFault;
 use crate::core::raise::RaiseResult;
 
@@ -64,8 +64,6 @@ pub mod kinds {
     pub enum VisibleFunctionTable {}
     /// `id<MTLDynamicLibrary>`.
     pub enum DynamicLibrary {}
-    /// `id<MTLRenderPipelineState>`.
-    pub enum RenderPipeline {}
     /// `id<MTLRasterizationRateMap>`.
     pub enum RateMap {}
     /// `id<MTLIndirectCommandBuffer>`.
@@ -86,48 +84,6 @@ impl<P: Platform> render::RenderEncoder<P> for Unmade<kinds::RenderEncoder> {
         self.unreachable()
     }
     fn tile_width(&self) -> u64 {
-        self.unreachable()
-    }
-}
-
-impl resource::RenderPipeline for Unmade<kinds::RenderPipeline> {
-    fn gpu_resource_id(&self) -> u64 {
-        self.unreachable()
-    }
-    fn imageblock_memory_length(&self, _imageblock_dimensions: MtlSize) -> RaiseResult<u64> {
-        self.unreachable()
-    }
-    fn imageblock_sample_length(&self) -> u64 {
-        self.unreachable()
-    }
-    fn max_total_threads_per_threadgroup(&self) -> u64 {
-        self.unreachable()
-    }
-    fn max_total_threads_per_object_threadgroup(&self) -> u64 {
-        self.unreachable()
-    }
-    fn max_total_threads_per_mesh_threadgroup(&self) -> u64 {
-        self.unreachable()
-    }
-    fn object_thread_execution_width(&self) -> u64 {
-        self.unreachable()
-    }
-    fn mesh_thread_execution_width(&self) -> u64 {
-        self.unreachable()
-    }
-    fn max_total_threadgroups_per_mesh_grid(&self) -> u64 {
-        self.unreachable()
-    }
-    fn resource_index(&self) -> u64 {
-        self.unreachable()
-    }
-    fn support_indirect_command_buffers(&self) -> bool {
-        self.unreachable()
-    }
-    fn threadgroup_size_matches_tile_size(&self) -> bool {
-        self.unreachable()
-    }
-    fn unique_identifier(&self) -> u64 {
         self.unreachable()
     }
 }

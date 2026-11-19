@@ -142,12 +142,25 @@ fn give_back(
     }
 }
 
-/// The samplers a state holds indices for, given back at its drop.
-struct Lease {
+/// The samplers a state holds indices for, given back at its drop: held after rt's state, which
+/// gives up a constexpr sampler's device samplers before its index is the platform's again.
+pub(super) struct Lease {
     device: RtObj<RtDevice>,
     samplers: Vec<rt::NumberedSampler>,
     /// Each one's index.
     indices: Vec<u32>,
+}
+
+impl Lease {
+    /// The samplers, in rt's order.
+    pub(super) fn samplers(&self) -> &[rt::NumberedSampler] {
+        &self.samplers
+    }
+
+    /// The index each of [`samplers`](Self::samplers) holds.
+    pub(super) fn indices(&self) -> &[u32] {
+        &self.indices
+    }
 }
 
 impl Drop for Lease {
@@ -176,12 +189,12 @@ impl RtComputePipeline {
 
     /// The samplers it numbers, in rt's order.
     pub fn samplers(&self) -> &[rt::NumberedSampler] {
-        &self.lease.samplers
+        self.lease.samplers()
     }
 
     /// The index each of [`samplers`](Self::samplers) holds.
     pub fn sampler_indices(&self) -> &[u32] {
-        &self.lease.indices
+        self.lease.indices()
     }
 }
 
@@ -232,7 +245,10 @@ pub fn of_descriptor(
 /// unspecialized that declares function constants (`FunctionDescriptor::needs_specialization`),
 /// whose creation ends the process on Metal. `Err` is the creator's `NSError`, counted: Metal's
 /// refusal, or the translator's of the function's constants.
-fn specialized(sel: &'static str, stage: &rt::FunctionDescriptor) -> Result<(), NsErrorText> {
+pub(super) fn specialized(
+    sel: &'static str,
+    stage: &rt::FunctionDescriptor,
+) -> Result<(), NsErrorText> {
     match stage.needs_specialization(&Budget::standard(), &StageEntries::default()) {
         Ok(false) => Ok(()),
         Ok(true) => {
@@ -252,7 +268,7 @@ fn word(v: u64) -> u32 {
 }
 
 /// The translator's linked functions of `linked`, each as it was made.
-fn linked_functions(linked: &LinkedFunctionsDesc<RtPlatform>) -> LinkedFunctions {
+pub(super) fn linked_functions(linked: &LinkedFunctionsDesc<RtPlatform>) -> LinkedFunctions {
     fn each(functions: &[RtObj<RtFunction>]) -> Vec<LinkedFunction> {
         (functions.iter())
             .map(|function| function.linked().clone())
@@ -311,40 +327,86 @@ fn make(
     sel: &'static str,
     descriptor: &rt::ComputePipelineDescriptor,
 ) -> Result<RtObj<RtComputePipeline>, NsErrorText> {
-    let mut taken = (Vec::new(), Vec::new());
-    let mut exhausted = false;
-    let made = device
-        .rt()
-        .new_compute_pipeline_state(descriptor, |samplers| {
-            let indices =
-                (device.numbering()).take(device.sampler_indices(), device.rt(), samplers)?;
-            let Some(indices) = indices else {
-                exhausted = true;
-                return Err(rt::Error::Refused(rt::Refusal::IndicesNotGranted {
-                    class: rt::IndexClass::Sampler,
-                    index: 0,
-                }));
-            };
-            taken = (samplers.to_vec(), indices.clone());
-            Ok(indices)
-        });
-    let lease = Lease {
-        device: device.clone_ref(),
-        samplers: taken.0,
-        indices: taken.1,
-    };
-    match made {
-        Ok(rt) => Ok(RtObj::new(RtComputePipeline {
-            rt,
-            lease,
-            unique_identifier: NEXT_IDENTIFIER.fetch_add(1, Ordering::Relaxed),
-        })),
-        Err(_) if exhausted => Err(refused_error_as(
-            sel,
-            RtRefusal::Limit,
-            &"live states and sampler states hold every sampler index",
-        )),
-        Err(error) => Err(rt_refused_error(sel, &error)),
+    let mut taking = Taking::new(device);
+    let made = (device.rt()).new_compute_pipeline_state(descriptor, |samplers| taking.ids(samplers));
+    let (rt, lease) = taking.made(sel, made)?;
+    Ok(RtObj::new(RtComputePipeline {
+        rt,
+        lease,
+        unique_identifier: next_identifier(),
+    }))
+}
+
+/// The next `uniqueIdentifier` of a pipeline state, compute or render: one of a process-wide count
+/// from 1.
+pub(super) fn next_identifier() -> u64 {
+    NEXT_IDENTIFIER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The sampler indices one creation of a state takes (the module's docs): the answer rt's
+/// pipeline creators ask the state's samplers' IDs by ([`ids`](Self::ids)), and what it took,
+/// which [`made`](Self::made) leases to the state.
+pub(super) struct Taking<'a> {
+    device: &'a RtObj<RtDevice>,
+    samplers: Vec<rt::NumberedSampler>,
+    indices: Vec<u32>,
+    /// Whether no index was free for a sampler.
+    exhausted: bool,
+}
+
+impl<'a> Taking<'a> {
+    /// Nothing taken yet, of `device`'s indices.
+    pub(super) fn new(device: &'a RtObj<RtDevice>) -> Self {
+        Taking {
+            device,
+            samplers: Vec::new(),
+            indices: Vec::new(),
+            exhausted: false,
+        }
+    }
+
+    /// An index for each of `samplers`, in their order ([`Numbering`]): rt's sampler IDs. Where
+    /// none is free for one, rt's refusal of its index, which [`made`](Self::made) answers as the
+    /// limit.
+    pub(super) fn ids(
+        &mut self,
+        samplers: &[rt::NumberedSampler],
+    ) -> Result<Vec<u32>, rt::Error> {
+        let device = self.device;
+        let indices = (device.numbering()).take(device.sampler_indices(), device.rt(), samplers)?;
+        let Some(indices) = indices else {
+            self.exhausted = true;
+            return Err(rt::Error::Refused(rt::Refusal::IndicesNotGranted {
+                class: rt::IndexClass::Sampler,
+                index: 0,
+            }));
+        };
+        self.samplers = samplers.to_vec();
+        self.indices = indices.clone();
+        Ok(indices)
+    }
+
+    /// rt's answer `made` of the creator `sel`, with the lease of the indices it took. `Err` is the
+    /// creator's `NSError`, counted under the refusal's kind; the indices go back.
+    pub(super) fn made<S>(
+        self,
+        sel: &'static str,
+        made: Result<S, rt::Error>,
+    ) -> Result<(S, Lease), NsErrorText> {
+        let lease = Lease {
+            device: self.device.clone_ref(),
+            samplers: self.samplers,
+            indices: self.indices,
+        };
+        match made {
+            Ok(state) => Ok((state, lease)),
+            Err(_) if self.exhausted => Err(refused_error_as(
+                sel,
+                RtRefusal::Limit,
+                &"live states and sampler states hold every sampler index",
+            )),
+            Err(error) => Err(rt_refused_error(sel, &error)),
+        }
     }
 }
 

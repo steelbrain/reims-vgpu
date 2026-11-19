@@ -47,21 +47,23 @@ pub enum Unbuilt {
     /// What of heaps is not built yet (`super::heap`): a sparse heap, whose ranges rt maps no
     /// tiles of. Each answers nil.
     Heap,
-    /// Render and mesh render pipeline states. Each answers nil, with an `NSError` where Metal's
-    /// creation fills one.
-    Pipeline,
+    /// Mesh render pipeline states
+    /// (`newRenderPipelineStateWithMeshDescriptor:options:reflection:error:`): rt has none. Each
+    /// answers nil and an `NSError`.
+    MeshPipeline,
     /// Function handles and visible function tables (`functionHandleWithFunction:`,
     /// `newVisibleFunctionTableWithDescriptor:`): rt's kernels take no function table. Each
     /// answers nil.
     FunctionTable,
-    /// What a pipeline state answers that rt's state does not: its static threadgroup memory
-    /// length and its imageblock lengths. Each answers 0.
+    /// What a pipeline state answers that rt's state does not: a compute state's static
+    /// threadgroup memory length and imageblock length, and a render state's imageblock lengths.
+    /// Each answers 0.
     PipelineQuery,
     /// Argument buffers' layouts (`newArgumentEncoderWithArguments:` and a function's). Each
     /// answers nil.
     ArgumentLayout,
-    /// Render command encoders, whose pipelines are unbuilt
-    /// (`renderCommandEncoderWithDescriptor:`). Each answers nil.
+    /// Render command encoders (`renderCommandEncoderWithDescriptor:`), which take render pass
+    /// descriptors, unbuilt. Each answers nil.
     Encoder,
     /// Compute commands rt has no form of: an indirect `dispatchThreads` and an indirect stage-in
     /// region. Each encodes nothing.
@@ -104,7 +106,7 @@ impl Unbuilt {
         Unbuilt::IosurfaceTexture,
         Unbuilt::SharedTexture,
         Unbuilt::Heap,
-        Unbuilt::Pipeline,
+        Unbuilt::MeshPipeline,
         Unbuilt::FunctionTable,
         Unbuilt::PipelineQuery,
         Unbuilt::ArgumentLayout,
@@ -128,7 +130,7 @@ impl Unbuilt {
             Unbuilt::IosurfaceTexture => "rt-unbuilt-iosurface-texture",
             Unbuilt::SharedTexture => "rt-unbuilt-shared-texture",
             Unbuilt::Heap => "rt-unbuilt-heap",
-            Unbuilt::Pipeline => "rt-unbuilt-pipeline",
+            Unbuilt::MeshPipeline => "rt-unbuilt-mesh-pipeline",
             Unbuilt::FunctionTable => "rt-unbuilt-function-table",
             Unbuilt::PipelineQuery => "rt-unbuilt-pipeline-query",
             Unbuilt::ArgumentLayout => "rt-unbuilt-argument-layout",
@@ -153,7 +155,7 @@ impl Unbuilt {
             Unbuilt::IosurfaceTexture => "a texture over an IOSurface's plane",
             Unbuilt::SharedTexture => "a shared texture",
             Unbuilt::Heap => "a sparse heap",
-            Unbuilt::Pipeline => "a render pipeline state",
+            Unbuilt::MeshPipeline => "a mesh render pipeline state",
             Unbuilt::FunctionTable => "a function handle or a visible function table",
             Unbuilt::PipelineQuery => "a pipeline state's threadgroup memory or imageblock length",
             Unbuilt::ArgumentLayout => "an argument buffer's layout",

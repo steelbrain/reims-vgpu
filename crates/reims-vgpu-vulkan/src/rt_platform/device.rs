@@ -46,6 +46,7 @@ use super::heap;
 use super::library::{self, RtLibrary};
 use super::pipeline::{self, Numbering};
 use super::queue::RtQueue;
+use super::render_pipeline;
 use super::texture::OwnIndices;
 use super::unbuilt::{
     RtRefusal, Unbuilt, refuse, refuse_create, refused_as, refused_error, rt_refused,
@@ -737,40 +738,28 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         Ok(None)
     }
 
-    /// Unbuilt ([`Unbuilt::Pipeline`]): the `NSError`.
+    /// The display's state (`super::render_pipeline`).
     fn new_render_pipeline_state(
         &self,
         desc: &RenderPipelineDesc<'_, RtPlatform>,
     ) -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
-        let _ = desc;
-        Err(refused_error(
-            Unbuilt::Pipeline,
-            "newRenderPipelineStateWithDescriptor:error:",
-        ))
+        render_pipeline::of_value(self, desc).map(Some)
     }
 
-    /// Unbuilt ([`Unbuilt::Pipeline`]): the `NSError`.
+    /// The state of the whole descriptor (`super::render_pipeline`).
     fn new_render_pipeline_state_full(
         &self,
         desc: &FullRenderPipelineDesc<'_, RtPlatform>,
     ) -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
-        let _ = desc;
-        Err(refused_error(
-            Unbuilt::Pipeline,
-            "newRenderPipelineStateWithDescriptor:error:",
-        ))
+        render_pipeline::of_descriptor(self, desc).map(Some)
     }
 
-    /// Unbuilt ([`Unbuilt::Pipeline`]): the `NSError`.
+    /// Unbuilt ([`Unbuilt::MeshPipeline`]): the `NSError`.
     fn new_mesh_render_pipeline_state_full(
         &self,
         desc: &FullMeshRenderPipelineDesc<'_, RtPlatform>,
     ) -> Result<Option<<RtPlatform as Platform>::RenderPipeline>, NsErrorText> {
-        let _ = desc;
-        Err(refused_error(
-            Unbuilt::Pipeline,
-            "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:",
-        ))
+        render_pipeline::of_mesh_descriptor(desc).map(Some)
     }
 
     /// rt's state of the whole descriptor (`super::pipeline`).
