@@ -55,6 +55,15 @@ pub const DMA_BUF_BUFFER: &str = "newBufferWithLength:options: (dma-buf, padding
 /// selector of Metal's names it.
 pub const EXPORTABLE_BUFFER: &str = "newBufferWithLength:options: (exportable)";
 
+/// The name the fake logs and scripts [`GpuDevice::new_scratch_buffer_of_length`] under: no
+/// selector of Metal's names it.
+pub const SCRATCH_BUFFER: &str = "newBufferWithLength:options: (scratch)";
+
+/// Each byte of a scratch buffer the fake makes ([`SCRATCH_BUFFER`]) before its maker writes it,
+/// as a platform that zeroes none leaves them: a byte the maker did not write reads as this, not
+/// as zero.
+pub const SCRATCH_MARKER: u8 = 0xa5;
+
 /// A device's model: its capabilities.
 #[derive(Debug)]
 pub struct DeviceModel {
@@ -189,6 +198,39 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                 Arg::U64(aligned_byte.unwrap_or(0)),
             ],
             |w| new_buffer(w, length, options, Backing::Fresh, None),
+        )
+    }
+
+    /// Logged and scripted under [`SCRATCH_BUFFER`], as no selector of Metal's names it; its
+    /// buffer is `newBufferWithLength:options:`'s, each of its bytes [`SCRATCH_MARKER`] where it
+    /// has any, not zero.
+    fn new_scratch_buffer_of_length(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::Buffer>> {
+        self.make(
+            Policy::On(on),
+            SCRATCH_BUFFER,
+            vec![Arg::U64(length), Arg::U64(options)],
+            |w| {
+                let b = new_buffer(w, length, options, Backing::Fresh, None)?;
+                if let Model::Buffer(m) = &b.state().model
+                    && !m.contents.is_null()
+                {
+                    // SAFETY: the fresh region of `length` bytes the buffer owns, which nothing
+                    // else uses yet.
+                    unsafe {
+                        std::ptr::write_bytes(
+                            m.contents.as_ptr::<u8>(),
+                            SCRATCH_MARKER,
+                            num::ToUsize::to_usize(length),
+                        )
+                    };
+                }
+                Some(b)
+            },
         )
     }
 

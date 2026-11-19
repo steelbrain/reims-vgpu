@@ -6946,11 +6946,13 @@ fn copy<P: Platform>(
                 spares: Some(Arc::clone(spares)),
             });
         }
+        // A buffer of the copy's own, unzeroed: the CPU copy writes each of its bytes, the
+        // carried runs end to end, before the GPU's copy reads them.
         if cache.pages.is_none()
             && way == Way::In
             && let Some(carried) = &cache.carried
             && let Some(buffer) =
-                device.new_buffer_of_length(ON, carried.bytes(), STORAGE_SHARED)?
+                device.new_scratch_buffer_of_length(ON, carried.bytes(), STORAGE_SHARED)?
         {
             let mut from = 0u64;
             for &(at, host, bytes) in &carried.runs {
@@ -7008,6 +7010,7 @@ pub(super) mod tests {
     use reims_vgpu_vulkan::core::testkit::FakePlatform;
     use reims_vgpu_vulkan::core::testkit::calllog::{Arg, Call};
     use reims_vgpu_vulkan::core::testkit::faults::Fault;
+    use reims_vgpu_vulkan::core::testkit::impls::device::{SCRATCH_BUFFER, SCRATCH_MARKER};
     use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
     use reims_vgpu_vulkan::core::testkit::script::HeldCall;
     use zerocopy::IntoBytes;
@@ -12754,9 +12757,10 @@ pub(super) mod tests {
     /// A deferral that carries its surface's resident pages is a cache of zeros, with no view,
     /// that owes a first fill of those pages alone: nothing is copied at the deferral, and the
     /// first use that reads the cache, at the CPU's generation 0, copies each carried page in at
-    /// its own bytes of the cache, through a Shared buffer the host's CPU filled from the page as
-    /// the fill was made, the rest of the cache left as the platform made it, zeros. The cache
-    /// then holds generation 0, so a use after it fills nothing
+    /// its own bytes of the cache, through a Shared buffer of the fill's own, made unzeroed,
+    /// which the host's CPU filled from the page as the fill was made, the rest of the cache left
+    /// as the platform made it, zeros. The cache then holds generation 0, so a use after it
+    /// fills nothing
     #[test]
     fn a_carrying_deferral_fills_its_pages_in_before_a_read() {
         let mut r = deferring_carrying(8);
@@ -12782,7 +12786,8 @@ pub(super) mod tests {
         let ram = ram_bytes(&r, 4, page, Some(0x3c));
         let mark = r.p.call_log().mark();
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
-        let filled = copies_at(&r.p.call_log().since(mark));
+        let calls = r.p.call_log().since(mark);
+        let filled = copies_at(&calls);
         assert_eq!(filled.len(), 1, "the carried page alone: {filled:?}");
         let (staging, from, into, at, size) = filled[0];
         assert_ne!(staging, cache);
@@ -12791,7 +12796,15 @@ pub(super) mod tests {
             (0, cache, page, page),
             "at its own bytes"
         );
-        assert_eq!(buffer_bytes(&r, staging, None), ram, "the page's bytes");
+        let made: Vec<_> = (calls.iter())
+            .filter(|c| c.sel == SCRATCH_BUFFER)
+            .map(|c| c.args[0].as_u64())
+            .collect();
+        assert_eq!(made, [Some(page)], "unzeroed, the carried page's length");
+        // The fake made each byte of it its marker, not zero: the CPU's copy wrote them all.
+        let staged = buffer_bytes(&r, staging, None);
+        assert_eq!(staged, ram, "the page's bytes");
+        assert!(ram.iter().any(|&b| b != SCRATCH_MARKER));
         r.p.world().complete_all(CompleteOn::Caller);
         let counts = r.dec.caches().counts();
         assert_eq!((counts.fills, counts.made_fills), (1, 1));
@@ -13331,7 +13344,7 @@ pub(super) mod tests {
             "the fill's staging buffer, a spare once its command buffer completed"
         );
         assert!(
-            !(r.p.call_log().sels_since(out_mark)).contains(&"newBufferWithLength:options:"),
+            !(r.p.call_log().sels_since(out_mark)).contains(&SCRATCH_BUFFER),
             "no buffer made"
         );
         buffer_bytes(&r, out[0].1, Some(0xc3));
@@ -13464,7 +13477,7 @@ pub(super) mod tests {
             "a spare: {again:?} of {made:?}"
         );
         assert!(
-            !(r.p.call_log().sels_since(mark)).contains(&"newBufferWithLength:options:"),
+            !(r.p.call_log().sels_since(mark)).contains(&SCRATCH_BUFFER),
             "no buffer made"
         );
         r.p.world().complete_all(CompleteOn::Caller);
