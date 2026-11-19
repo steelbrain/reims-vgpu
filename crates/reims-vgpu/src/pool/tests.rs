@@ -797,6 +797,32 @@ fn a_take_that_fits_no_piece_grows_the_pool_and_waits_for_the_hosts_map() {
     assert_eq!(host.wait_for(2)[1], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
 }
 
+/// A zeroer's hold of the pool's lock longer than [`ZERO_HOLD_LONG`] is counted with the
+/// nanoseconds of each of its parts, the chunk's pick, its write and its mark, and each part's
+/// longest rises to that part at least
+#[test]
+fn a_zeroers_long_hold_is_counted_with_its_parts() {
+    let counted = |code: &str| {
+        (reims_vgpu_vulkan::answer::counted_kinds().into_iter())
+            .find(|(c, _)| *c == code)
+            .map_or(0, |(_, n)| n)
+    };
+    let [pick, write, mark] = ZERO_LONG_HOLD_PART_NS_CODES;
+    let codes = [ZERO_HOLDS_LONG_CODE, pick, write, mark];
+    let before = codes.map(counted);
+    let parts = [10_000, 45_000, 1_000];
+    takes::zero_held(parts.map(Duration::from_nanos));
+    let after = codes.map(counted);
+    // Another test's zeroer may count a long hold meanwhile, so the counts rise at least by this
+    // hold's.
+    assert!(after[0] > before[0], "the long hold counted");
+    for (i, ns) in parts.into_iter().enumerate() {
+        assert!(after[i + 1] - before[i + 1] >= ns, "{}", codes[i + 1]);
+        assert!(counted(ZERO_HOLD_PART_MAX_NS_CODES[i]) >= ns, "{}", ZERO_HOLD_PART_MAX_NS_CODES[i]);
+    }
+    assert!(counted(ZERO_HOLD_MAX_NS_CODE) >= 56_000, "the hold's longest");
+}
+
 /// An answered take's wait is counted by its cause ([`TAKE_WAIT_CODES`]), the take counted once
 /// its waits are: a take that fits no piece waits for one of its own, which the host maps 50 ms
 /// after its ask, and that wait is its growth part's and at most the longest's; its parts lie

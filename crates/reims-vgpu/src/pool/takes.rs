@@ -39,7 +39,10 @@
 //! zeroes them through the piece's mapping off every take's path, [`ZERO_CHUNK`] at a time, each
 //! chunk with the pool's lock held, and records them in the piece as reading zero ([`Ranges`]),
 //! counted ([`super::ZEROED_AFTER_FREE_BYTES_CODE`]), the longest it held the lock for a chunk
-//! counted too ([`super::ZERO_HOLD_MAX_NS_CODE`]); it lets the lock go between chunks. A carve
+//! counted too ([`super::ZERO_HOLD_MAX_NS_CODE`]) with the longest of each of its parts, the
+//! chunk's pick, its write and its mark, and each hold longer than [`super::ZERO_HOLD_LONG`]
+//! counted with its parts' time ([`super::ZERO_HOLDS_LONG_CODE`]); it lets the lock go between
+//! chunks. A carve
 //! is made with the same lock held, so it never meets a chunk half zeroed: it takes its bytes out
 //! of the record, and its worker zeroes only those below the mark the record lacks; the rest it
 //! leaves, counted ([`super::TAKE_ZERO_PREZEROED_BYTES_CODE`]). A carve's bytes still waiting for
@@ -93,7 +96,8 @@ use reims_vgpu_vulkan::answer::count_kind_by;
 use super::{
     Ask, Error, Live, Mapped, MonoTime, Shared, State, TAKE_WAIT_CODES, TAKE_WAITS_CODE,
     TAKE_ZERO_PREZEROED_BYTES_CODE, TAKE_ZERO_SKIPPED_BYTES_CODE, TAKE_ZEROED_BYTES_CODE,
-    ZERO_HOLD_MAX_NS_CODE, ZEROED_AFTER_FREE_BYTES_CODE,
+    ZERO_HOLD_LONG, ZERO_HOLD_MAX_NS_CODE, ZERO_HOLD_PART_MAX_NS_CODES, ZERO_HOLDS_LONG_CODE,
+    ZERO_LONG_HOLD_PART_NS_CODES, ZEROED_AFTER_FREE_BYTES_CODE,
 };
 
 /// A block's alignment and its length's granule: 64 KiB, the wire's `RGFX_POOL_BLOCK_ALIGN`.
@@ -211,6 +215,10 @@ struct Job {
 /// [`ZERO_HOLD_MAX_NS_CODE`]'s count rises to.
 static ZERO_HOLD_MAX_NS: AtomicU64 = AtomicU64::new(0);
 
+/// The longest of each part of the zeroer's hold so far, in nanoseconds, which
+/// [`ZERO_HOLD_PART_MAX_NS_CODES`]' counts rise to.
+static ZERO_HOLD_PART_MAX_NS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// The longest of each of [`TAKE_WAIT_CODES`]' waits so far, in nanoseconds, which their
 /// `-max-ns` codes' counts rise to.
 static TAKE_WAIT_MAX_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
@@ -244,6 +252,32 @@ fn count_wait(context: u32, len: u64, waits: [Duration; 4]) {
         );
     }
     count_kind_by(TAKE_WAITS_CODE, 1);
+}
+
+/// One hold of the pool's lock by the zeroer for a chunk, in its `parts`: the chunk's pick
+/// (`State::next_zero`), its write and its mark (`State::zeroed`). Counted: the longest hold and
+/// the longest of each part, and, where the hold is longer than [`ZERO_HOLD_LONG`], the hold
+/// with its parts' nanoseconds ([`ZERO_HOLDS_LONG_CODE`]).
+pub(super) fn zero_held(parts: [Duration; 3]) {
+    let ns = parts.map(|part| u64::try_from(part.as_nanos()).unwrap_or(u64::MAX));
+    let held = ns.iter().fold(0, |all: u64, &part| all.saturating_add(part)).max(1);
+    let was = ZERO_HOLD_MAX_NS.fetch_max(held, Ordering::Relaxed);
+    if held > was {
+        count_kind_by(ZERO_HOLD_MAX_NS_CODE, held.saturating_sub(was));
+    }
+    let mosts = ns.iter().zip(&ZERO_HOLD_PART_MAX_NS);
+    for ((&part, most), code) in mosts.zip(ZERO_HOLD_PART_MAX_NS_CODES) {
+        let was = most.fetch_max(part, Ordering::Relaxed);
+        if part > was {
+            count_kind_by(code, part.saturating_sub(was));
+        }
+    }
+    if u128::from(held) > ZERO_HOLD_LONG.as_nanos() {
+        count_kind_by(ZERO_HOLDS_LONG_CODE, 1);
+        for (&part, code) in ns.iter().zip(ZERO_LONG_HOLD_PART_NS_CODES) {
+            count_kind_by(code, part);
+        }
+    }
 }
 
 /// A context's takes.
@@ -982,7 +1016,7 @@ impl Shared {
             if st.closed {
                 break;
             }
-            let held = (self.now)();
+            let picking = (self.now)();
             let Some((piece, range, host)) = st.next_zero() else {
                 let idle = (self.now)().saturating_duration_since(idle_since);
                 match WORKER_IDLE.checked_sub(idle).filter(|left| !left.is_zero()) {
@@ -993,6 +1027,7 @@ impl Shared {
                     None => break,
                 }
             };
+            let picked = (self.now)();
             let len = range.end.saturating_sub(range.start);
             let Ok(bytes) = usize::try_from(len) else {
                 continue;
@@ -1001,15 +1036,17 @@ impl Shared {
             // pool's lock, held since `next_zero`, keeps the piece live and any carve off them, so
             // neither the guest nor the device reaches them meanwhile.
             unsafe { std::ptr::write_bytes(host.as_ptr(), 0, bytes) };
+            let written = (self.now)();
             st.zeroed(piece, range);
-            let held = (self.now)().saturating_duration_since(held);
+            let marked = (self.now)();
+            let parts = [
+                picked.saturating_duration_since(picking),
+                written.saturating_duration_since(picked),
+                marked.saturating_duration_since(written),
+            ];
             MutexGuard::unlocked(&mut st, || {
                 count_kind_by(ZEROED_AFTER_FREE_BYTES_CODE, len);
-                let ns = u64::try_from(held.as_nanos()).unwrap_or(u64::MAX).max(1);
-                let was = ZERO_HOLD_MAX_NS.fetch_max(ns, Ordering::Relaxed);
-                if ns > was {
-                    count_kind_by(ZERO_HOLD_MAX_NS_CODE, ns.saturating_sub(was));
-                }
+                zero_held(parts);
             });
             idle_since = (self.now)();
         }

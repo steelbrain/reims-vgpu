@@ -120,6 +120,31 @@ pub const ZEROED_AFTER_FREE_BYTES_CODE: &str = "pool-zeroed-after-free-bytes";
 /// after a free"), in nanoseconds: its count rises to it.
 pub const ZERO_HOLD_MAX_NS_CODE: &str = "pool-zero-hold-max-ns";
 
+/// The codes of the longest each part of the zeroer's hold of the pool's lock for one chunk took
+/// so far (`takes`, "Zeros after a free"), in nanoseconds, their counts rising to it: the chunk's
+/// pick (`State::next_zero`), its write, and its mark as reading zero (`State::zeroed`).
+pub const ZERO_HOLD_PART_MAX_NS_CODES: [&str; 3] = [
+    "pool-zero-hold-pick-max-ns",
+    "pool-zero-hold-write-max-ns",
+    "pool-zero-hold-mark-max-ns",
+];
+
+/// The code of the zeroer's holds of the pool's lock for one chunk longer than 50 µs (`takes`,
+/// [`ZERO_HOLD_LONG`]), counted by the hold.
+pub const ZERO_HOLDS_LONG_CODE: &str = "pool-zero-holds-over-50us";
+
+/// The codes of the nanoseconds the holds [`ZERO_HOLDS_LONG_CODE`] counts spent in each part, in
+/// the order of [`ZERO_HOLD_PART_MAX_NS_CODES`].
+pub const ZERO_LONG_HOLD_PART_NS_CODES: [&str; 3] = [
+    "pool-zero-long-hold-pick-ns",
+    "pool-zero-long-hold-write-ns",
+    "pool-zero-long-hold-mark-ns",
+];
+
+/// A zeroer's hold longer than this is counted with its parts ([`ZERO_HOLDS_LONG_CODE`]): the
+/// longest the walks of 11-19 saw at 16 KiB a chunk was 64 µs.
+pub const ZERO_HOLD_LONG: std::time::Duration = std::time::Duration::from_micros(50);
+
 /// The code of the takes answered, whose waits [`TAKE_WAIT_CODES`] count (`takes`).
 pub const TAKE_WAITS_CODE: &str = "pool-take-waits";
 
