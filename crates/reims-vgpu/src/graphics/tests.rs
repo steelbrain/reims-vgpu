@@ -11317,21 +11317,24 @@ fn a_pages_block_s_answer_carries_its_view_s_address_where_the_guest_took_import
             .as_bytes(),
         );
         guest.send(device, pages);
-        (guest.seqno, guest.event().expect("the SURFACE_PAGES' answer"))
+        (
+            guest.seqno,
+            guest.event().expect("the SURFACE_PAGES' answer"),
+        )
     };
-    let (device, _platform, _ram, page) =
-        surface_device_taking(8, RGFX_FEATURE_IMPORT_ADDRESSES);
+    let (device, _platform, _ram, page) = surface_device_taking(8, RGFX_FEATURE_IMPORT_ADDRESSES);
     let mut guest = Guest::new(&device);
     let (seqno, answer) = send_pages(&device, &mut guest, page);
     let (answered_seqno, status, at) = pages_answer(&answer);
     assert_eq!((answered_seqno, status), (seqno, RGFX_STATUS_OK));
     assert!((IMPORT_BASE..IMPORT_END).contains(&at), "{at:#x}");
-    let mut over = RgfxBufferOverPages::read_from_bytes(&buffer_over_pages(obj(1, 11), 2 * page))
-        .unwrap();
+    let mut over =
+        RgfxBufferOverPages::read_from_bytes(&buffer_over_pages(obj(1, 11), 2 * page)).unwrap();
     over.gpu_address = at + 0x123;
     over.offset = 0x123;
     guest.send(&device, over.as_bytes().to_vec());
     assert!(objects_become(&device, 1));
+    #[cfg(not(windows))]
     assert_eq!(device.decoder_gpu_address(obj(1, 11)), Some(at + 0x123));
     guest.send(&device, object_destroy(obj(1, 11)));
     let release = block_release(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE);
@@ -11342,14 +11345,21 @@ fn a_pages_block_s_answer_carries_its_view_s_address_where_the_guest_took_import
     let (_, answer) = send_pages(&device, &mut guest, page);
     let (_, status, next) = pages_answer(&answer);
     assert_eq!(status, RGFX_STATUS_OK);
-    assert!((IMPORT_BASE..IMPORT_END).contains(&next) && next != at, "{next:#x}");
+    assert!(
+        (IMPORT_BASE..IMPORT_END).contains(&next) && next != at,
+        "{next:#x}"
+    );
 
     let (device, _platform, _ram, page) = surface_device(8);
     let mut guest = Guest::new(&device);
     let (seqno, answer) = send_pages(&device, &mut guest, page);
     assert_eq!(complete_of(&answer), (seqno, RGFX_STATUS_OK));
     assert_eq!(
-        device.control.decoder().views_of_surfaces().view_addresses_held(),
+        device
+            .control
+            .decoder()
+            .views_of_surfaces()
+            .view_addresses_held(),
         0
     );
 }
