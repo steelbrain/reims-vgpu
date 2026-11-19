@@ -379,6 +379,10 @@ enum {
 	kRgfxKextFeatureDoorbellPage = 1 << 12,
 	// CpuPats, 15.
 	kRgfxKextFeatureCpuPats = 1 << 13,
+	// Every block Alloc (0x101) gives, and every new block SurfaceBlock (0x109) makes, reads zero
+	// over every byte the process's window maps of it, whatever its last holder, of any context,
+	// left there (the kext's RgfxBlockZero.hpp).
+	kRgfxKextFeatureZeroedBlocks = 1 << 14,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

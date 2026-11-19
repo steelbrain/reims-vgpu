@@ -836,6 +836,31 @@ struct Kext {
 // Where the kext has no room for a block, the region lets the slabs the process keeps go (the
 // cached and the empty ones) and asks once more: a block is refused only where nothing the
 // process holds could make room.
+// A region slab source over a kext that zeroes the blocks it gives (kRgfxKextFeatureZeroedBlocks):
+// its slabs come clean and are not zeroed again, so a buffer reads what the block held as the
+// kext gave it (the test region's 0xee standing for the kext's zeros). Without the kext's word,
+// the bytes a buffer takes are zeroed here.
+void test_region_slab_source_zeroed_blocks()
+{
+	for (int kextZeroes = 0; kextZeroes < 2; kextZeroes++) {
+		std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x800000, 0xee);
+		TestRing ring(0x8000);
+		RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+		                      nullptr);
+		RgfxIdSpace ids;
+		RgfxSerializer ser(writer, ids);
+		RgfxRegion region(mem.data(), mem.size());
+		RgfxRegionSlabSource source(region, ser);
+		source.setZeroedBlocks(kextZeroes != 0);
+		RgfxSlabs slabs(source);
+		RgfxSlabs::Range r;
+		CHECK(slabs.take(0x3000, kShared, 0, &r));
+		CHECK(allBytes(r.contents, 0x3000, kextZeroes ? 0xee : 0));
+		CHECK(slabs.stats().dirtyBytes == (kextZeroes ? 0 : 0x20000 - 0x3000));
+		slabs.give(r);
+	}
+}
+
 void test_region_reclaims_slabs()
 {
 	constexpr uint64_t kRoom = 80 * kMiB; // a cache of 5 MiB
@@ -1506,6 +1531,7 @@ void rgfxSlabTests()
 	test_slab_thread();
 	test_slab_take_waits_for_slabs_given_back();
 	test_region_slab_source();
+	test_region_slab_source_zeroed_blocks();
 	test_region_reclaims_slabs();
 	test_region_reclaim_waits_for_slabs_given_back();
 	test_pages_slab_source();

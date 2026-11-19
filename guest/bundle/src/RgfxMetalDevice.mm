@@ -1104,6 +1104,7 @@ RGFX_LOG_UNRECOGNIZED
 	const bool managedOverCopy = (_caps.features() & RGFX_FEATURE_MANAGED_BUFFER_SLABS) != 0;
 	_slabSource = std::make_unique<RgfxRegionSlabSource>(*_region, *_serializer, managedAtOffset,
 	                                                     managedOverCopy);
+	_slabSource->setZeroedBlocks((_caps.kextFeatures() & kRgfxKextFeatureZeroedBlocks) != 0);
 	_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
 	// The slabs whose buffers lie in heaps, and large Shared buffers, are the kext's chunks, or
 	// the process's own plain pages, wired into pages blocks the host makes heaps or buffers over,

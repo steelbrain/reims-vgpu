@@ -59,6 +59,7 @@
 #include "RgfxSurfaceBlocks.hpp"
 #include "RgfxSurfaceCaches.hpp"
 #include "RgfxLatency.hpp"
+#include "RgfxBlockZero.hpp"
 #include "RgfxPagesBlock.hpp"
 #include "RgfxTopDown.hpp"
 #include "RgfxIdChunks.hpp"
@@ -112,6 +113,8 @@ constexpr UInt32 kDormantRoomMs = 100;
 constexpr UInt32 kDormantRoomBlocks = 16;
 // How often the releases' line is logged at most: a summary, once a minute.
 constexpr UInt32 kReleaseLogMs = 60000;
+// How often the zeroed blocks' line is logged at most (noteZeroing).
+constexpr UInt32 kZeroLogMs = 30000;
 // The most BLOCK_RELEASEs in flight at once (RgfxReleaseTable.hpp): 40 bytes each on ring 0,
 // under a third of its 32 KiB.
 constexpr UInt32 kMaxReleases = 256;
@@ -363,6 +366,10 @@ struct ReleaseStats {
 };
 ReleaseStats releaseStats = {};
 
+// What zeroing new blocks took (RgfxBlockZero.hpp), under contextLock, logged once more were zeroed
+// and kZeroLogMs passed since the last line (noteZeroing).
+RgfxZeroStats zeroStats = {};
+
 // Under contextLock: the references of device caches and surfaces let go of under it (letGo),
 // which the release worker releases out of every lock of the kext's (releaseLetGo), in the order
 // let go. The list holds them as they were given, retaining none; null and empty while none waits.
@@ -424,6 +431,37 @@ UInt64 nanosSince(UInt64 then, UInt64 now)
 	return ns;
 }
 
+// Zeros the span `s` of `region` (RgfxBlockZero.hpp) through a kernel mapping of the cache mode a
+// window maps it with, as RgfxAcceleratorUserClient::mapSpan maps it: a write-combined span from
+// the region's write-combined descriptor where there is one, else write-back from the region's
+// own. The write-combined stores are fenced (SFENCE), so they are in the region before any window
+// maps the span. Adds the time its mapping took, made and taken down, to `*mapNs`, and its stores'
+// to `*storeNs`. False where the kernel would not map the span.
+bool zeroSpan(IODeviceMemory *region, const RgfxZeroSpan &s, UInt64 *mapNs, UInt64 *storeNs)
+{
+	IODeviceMemory *combined = s.writeCombined ? state.combinedRegion : nullptr;
+	IODeviceMemory *from = combined ? combined : region;
+	if (!from)
+		return false;
+	const IOOptionBits cache = combined ? kIOMapWriteCombineCache : kIOMapCopybackCache;
+	const UInt64 made = mach_absolute_time();
+	IOMemoryMap *map =
+	    from->createMappingInTask(kernel_task, 0, kIOMapAnywhere | cache, s.offset, s.length);
+	if (!map)
+		return false;
+	const UInt64 mapped = mach_absolute_time();
+	bzero(reinterpret_cast<void *>(map->getVirtualAddress()), static_cast<size_t>(s.length));
+#if defined(__x86_64__)
+	if (combined)
+		__builtin_ia32_sfence();
+#endif
+	const UInt64 stored = mach_absolute_time();
+	map->release();
+	*mapNs += nanosSince(made, mapped) + nanosSince(stored, mach_absolute_time());
+	*storeNs += nanosSince(mapped, stored);
+	return true;
+}
+
 UInt64 loadHeader64(const volatile UInt8 *header, UInt32 field)
 {
 	return __atomic_load_n(reinterpret_cast<const volatile UInt64 *>(header + field),
@@ -440,6 +478,7 @@ bool reapDormant();
 void noteDormant();
 void noteReserve();
 void noteReleases();
+void noteZeroing();
 void unwire(void *pages);
 bool releaseAnswered(OSObject *, UInt64 seqno, UInt32 status);
 
@@ -814,6 +853,7 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 		thread_call_enter_delayed(releaseTimer, oldest + timeout);
 	}
 	noteReleases();
+	noteZeroing();
 }
 } // namespace
 
@@ -1283,10 +1323,21 @@ IOReturn RgfxAccelerator::allocBlock(RgfxAcceleratorUserClient *owner, UInt32 co
 		// xnu's pmap gives every page it does not manage (PCD) for any other ask, and which the
 		// kext sets to write-back (RgfxPat.hpp). The process fences its stores before it
 		// publishes them.
-		const UInt64 combined = rgfxWindowWriteBackPart(size, bytes, writeCombinedFrom);
-		IOReturn posted = combined ? owner->mapSpan(pin.offset, combined) : kIOReturnSuccess;
-		if (posted == kIOReturnSuccess && combined < bytes)
-			posted = owner->mapSpan(pin.offset + combined, bytes - combined, true);
+		// Each span is zeroed before the window maps it, in the mode the window maps it with:
+		// the block's bytes are whatever its last holder, of any context, left in them
+		// (RgfxBlockZero.hpp). A span the kernel would not map for the zeros fails the grant.
+		RgfxZeroSpan spans[2];
+		const uint32_t n = rgfxBlockZeroSpans(pin.offset, size, bytes, writeCombinedFrom,
+		                                      state.combinedRegion != nullptr, spans);
+		UInt64 mapNs = 0, storeNs = 0;
+		const UInt64 zeroFrom = mach_absolute_time();
+		bool zeroed = true;
+		for (uint32_t i = 0; i < n && zeroed; i++)
+			zeroed = zeroSpan(region, spans[i], &mapNs, &storeNs);
+		const UInt64 zeroNs = nanosSince(zeroFrom, mach_absolute_time());
+		IOReturn posted = zeroed ? kIOReturnSuccess : kIOReturnNoMemory;
+		for (uint32_t i = 0; i < n && posted == kIOReturnSuccess; i++)
+			posted = owner->mapSpan(spans[i].offset, spans[i].length, spans[i].writeCombined);
 		if (posted == kIOReturnSuccess) {
 			RgfxBlockGrant grant = {};
 			grant.context = context;
@@ -1296,6 +1347,8 @@ IOReturn RgfxAccelerator::allocBlock(RgfxAcceleratorUserClient *owner, UInt32 co
 			                       nullptr, nullptr, 0);
 		}
 		IOLockLock(contextLock);
+		rgfxZeroNote(zeroStats, rgfxBlockZeroKind(size, writeCombinedFrom), bytes, zeroNs, mapNs,
+		             storeNs, zeroed);
 		if (posted == kIOReturnSuccess) {
 			rgfxBlockUnpin(blockTable, pin);
 		} else {
@@ -1304,6 +1357,7 @@ IOReturn RgfxAccelerator::allocBlock(RgfxAcceleratorUserClient *owner, UInt32 co
 			rgfxBlockDrop(blockTable, pin);
 		}
 		IOLockUnlock(contextLock);
+		noteZeroing();
 		return posted;
 	}
 	case kRgfxBlockNoSpace:
@@ -1729,6 +1783,55 @@ void noteReleases()
 		      "write-back waits %llu (%llu late)\n",
 		      count, kept, late, inFlight, p50 / 1000, p99 / 1000, most / 1000, reaps,
 		      r50 / 1000, r99 / 1000, rmost / 1000, waits, failed, writeBacks, writeBacksLate);
+}
+
+// Logs what zeroing new blocks took (zeroStats), by kind: how many, their KiB, and the time each
+// took, mean, p50, p99 and the most; then of every kind the time in the kernel mappings and in the
+// stores, and the grants that failed for a span not mapped. Where more were zeroed and kZeroLogMs
+// passed since the last line. Not under contextLock.
+void noteZeroing()
+{
+	if (!contextLock)
+		return;
+	const uint64_t now = mach_absolute_time();
+	uint64_t interval = 0;
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(kZeroLogMs) * 1000000ull, &interval);
+	struct Kind {
+		UInt64 count, kib, mean, p50, p99, most;
+	} k[kRgfxZeroKinds] = {};
+	UInt64 mapUs = 0, storeUs = 0, failed = 0;
+	IOLockLock(contextLock);
+	const UInt64 count = rgfxZeroCount(zeroStats);
+	const bool log = count != zeroStats.loggedCount && now - zeroStats.loggedAt >= interval;
+	if (log) {
+		for (UInt32 i = 0; i < kRgfxZeroKinds; i++) {
+			const RgfxLatency &l = zeroStats.took[i];
+			k[i] = {l.count,
+			        zeroStats.bytes[i] >> 10,
+			        l.count ? zeroStats.ns[i] / l.count : 0,
+			        rgfxLatencyPercentile(l, 500),
+			        rgfxLatencyPercentile(l, 990),
+			        l.maxNs};
+		}
+		mapUs = zeroStats.mapNs / 1000;
+		storeUs = zeroStats.storeNs / 1000;
+		failed = zeroStats.failed;
+		zeroStats.loggedCount = count;
+		zeroStats.loggedAt = now;
+	}
+	IOLockUnlock(contextLock);
+	if (!log)
+		return;
+	static const char *const names[kRgfxZeroKinds] = {"bodies", "split", "write-back",
+	                                                  "surface copies", "surface headers"};
+	for (UInt32 i = 0; i < kRgfxZeroKinds; i++)
+		if (k[i].count)
+			IOLog("RgfxAccelerator: zeroed blocks, %s: %llu (%llu KiB), each mean %llu ns, p50 "
+			      "%llu ns, p99 %llu ns, max %llu ns\n",
+			      names[i], k[i].count, k[i].kib, k[i].mean, k[i].p50, k[i].p99, k[i].most);
+	IOLog("RgfxAccelerator: zeroed blocks: %llu in all, %llu us in mappings, %llu us in stores, %llu "
+	      "not mapped\n",
+	      count, mapUs, storeUs, failed);
 }
 
 // The most WindowServer's blocks came to at the last line of noteReserve. Under contextLock.
@@ -2280,8 +2383,16 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	*block = {offset, size, pin.serial, true, false};
 	// In the client's window, under the lock, so no let-go of the hold comes between: the part
 	// the processes map, never the runs. A block that is not goes back as if never made: the
-	// device was not told of it.
-	IOReturn mapped = client->mapSpan(offset, rgfxWindowSpanLength(size));
+	// device was not told of it. That part is zeroed first, as allocBlock's spans are: whatever
+	// the region's last holder of it left there, the surface's bytes reach it only from its
+	// holders' copies and from the device (RgfxBlockZero.hpp).
+	const RgfxZeroSpan span = rgfxSurfaceZeroSpan(offset, size);
+	UInt64 mapNs = 0, storeNs = 0;
+	const UInt64 zeroFrom = mach_absolute_time();
+	const bool zeroed = zeroSpan(region, span, &mapNs, &storeNs);
+	rgfxZeroNote(zeroStats, inPlace ? kRgfxZeroSurfaceHeader : kRgfxZeroSurfaceCopy,
+	             span.length, nanosSince(zeroFrom, mach_absolute_time()), mapNs, storeNs, zeroed);
+	IOReturn mapped = zeroed ? client->mapSpan(span.offset, span.length) : kIOReturnNoMemory;
 	if (mapped != kIOReturnSuccess) {
 		OSObject *deferredSurface = deferring ? static_cast<OSObject *>(e.surface) : nullptr;
 		client->unmapSpan(offset, rgfxWindowSpanLength(size));

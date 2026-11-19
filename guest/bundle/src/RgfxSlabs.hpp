@@ -238,6 +238,10 @@ public:
 	bool makeOverCopy(const Made &copy, uint64_t length, uint32_t options, uint64_t zeroFrom,
 	                  Made *out) override;
 	void dropCopy(const Made &copy, std::function<void()> then) override;
+	/// Whether the kext zeroes each block it gives (its kRgfxKextFeatureZeroedBlocks): a slab
+	/// taken from it then reads zero as it comes, and is not zeroed again here. False until set:
+	/// a block holds whatever its last holder left in it.
+	void setZeroedBlocks(bool zeroed) { m_zeroedBlocks = zeroed; }
 
 	/// Metal's page, which a heap over host memory is made of.
 	static constexpr uint64_t kUnit = 0x4000;
@@ -247,6 +251,7 @@ protected:
 	RgfxSerializer &m_serializer;
 	bool m_managedAtOffset;
 	bool m_managedOverCopy;
+	bool m_zeroedBlocks = false;
 };
 
 /// The process's own memory a source of pages slabs takes from the kernel: calls the device wires

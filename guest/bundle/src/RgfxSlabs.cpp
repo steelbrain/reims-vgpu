@@ -105,7 +105,8 @@ bool RgfxRegionSlabSource::take(uint64_t size, bool heap, Memory *out)
 	out->bytes = const_cast<uint8_t *>(block.ptr);
 	out->size = size;
 	out->regionOffset = block.offset;
-	out->zeroed = false; // whatever the block's last holder left in it
+	// Zeros where the kext zeroes the blocks it gives, else whatever the block's last holder left.
+	out->zeroed = m_zeroedBlocks;
 	return true;
 }
 

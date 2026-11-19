@@ -4303,7 +4303,15 @@ the span a `COMMAND_BUFFER_IN_REGION` on a queue's ring names, which never
 passes the kext. Each span must lie in one block the sender holds. The kext
 posts a block's `BLOCK_GRANT` (context, offset, size) on ring 0 before its
 allocation returns, keeping the block pinned until then so no free overtakes
-it. The host keeps the grant until the block's `BLOCK_RELEASE` or the context's
+it. A block's offset is given out again once the device answers its release
+or its holder's close, to any process, and the region keeps its bytes across
+the device's reset and the guest's reboot; so before a new block is in the
+process's window the kext writes zeros over every span the window maps of it,
+each through a kernel mapping of the cache mode the window maps it with, and a
+surface's new block over the part its holders map (`RgfxBlockZero.hpp`; the
+kext's feature bit 1 << 14 `ZeroedBlocks`, after which the bundle zeroes no
+region slab it takes; the guest's `guest/bundle/tools/block_zero_probe.c`
+checks it across processes). The host keeps the grant until the block's `BLOCK_RELEASE` or the context's
 `CONTEXT_CLOSE`, and copies a buffer out of a block only while the grant
 stands. An IOSurface's shared block (§14) is held by every process that
 holds the surface: the kext finds it by the physical pages of the surface's
@@ -6572,7 +6580,7 @@ Map 1:
 | 13 | `SurfaceSeeds` | 1 << 10 `SurfaceSeeds` | an IOSurface's lock and unlock seeds, for a copy synced while a CPU held the surface locked for writing |
 | 15 | `CpuPats` | 1 << 13 `CpuPats` | every online CPU's PAT, read on each CPU, for an administrator's process: the check that entry 2 is write-back everywhere ("The BAR is one host memory region"; the guest's `guest/bundle/tools/pat_probe.c`); x86-64 only |
 | 0x100 | `OpenContext` | 1 << 5 `ContextSpan` (its sixth output), 1 << 12 `DoorbellPage` (its seventh) | the context and its window; five outputs, six with its GPU addresses' span, or seven with its doorbell page's address in the process, 0 for none ("BAR4: the doorbell pages") |
-| 0x101 | `Alloc` | 1 << 7 `WriteCombined` (its third input) | a region block; 2 inputs, or 3 with the byte its write-combined part starts at |
+| 0x101 | `Alloc` | 1 << 7 `WriteCombined` (its third input), 1 << 14 `ZeroedBlocks` (the block reads zero) | a region block; 2 inputs, or 3 with the byte its write-combined part starts at |
 | 0x102 | `Free` | | frees a block |
 | 0x103 | `QueueCreate` | | a command queue; 6 inputs, or 7 with the flags wanted |
 | 0x104 | `QueueDestroy` | | closes a queue |
@@ -6589,7 +6597,7 @@ the accelerator, which the bundle opens for each event it hands out: 10 and 11
 are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish`, 1 << 12 `DoorbellPage` and 1 << 13 `CpuPats`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed and `CpuPats` only on x86-64; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish`, 1 << 12 `DoorbellPage`, 1 << 13 `CpuPats` and 1 << 14 `ZeroedBlocks`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed and `CpuPats` only on x86-64; no other bit yet.
 
 **A GL window: the drawable (type 7) and the window surface (type 0x20).**
 These are IOGPU's types, not ours. The bundle leaves `newGLDrawable` to its

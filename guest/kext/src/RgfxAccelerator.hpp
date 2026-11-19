@@ -94,8 +94,8 @@ enum {
 // write-combined part, where the region's write-combined mappings are ordinary memory
 // (RgfxRegionMapping.hpp), SurfaceSeeds, which Features leaves out where IOSurface exports no
 // unlock seed (rgfxSurfaceUnlockSeedExported), SubmitBatch's publish of a queue's ring,
-// OpenContext's doorbell page, and on x86-64 CpuPats (RgfxPat.hpp). Each bit is set by the change
-// that lands its call.
+// OpenContext's doorbell page, on x86-64 CpuPats (RgfxPat.hpp), and ZeroedBlocks
+// (RgfxBlockZero.hpp). Each bit is set by the change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeaturePagesChunked |
                                           kRgfxKextFeatureSubmitBatch |
@@ -107,7 +107,8 @@ constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeatureSharedEvents |
                                           kRgfxKextFeatureSurfaceSeeds |
                                           kRgfxKextFeatureRegionWriteCombined |
-                                          kRgfxKextFeatureCpuPatsRead;
+                                          kRgfxKextFeatureCpuPatsRead |
+                                          kRgfxKextFeatureZeroedBlocks;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
