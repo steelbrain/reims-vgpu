@@ -1539,7 +1539,7 @@ mod tests {
     /// [`ram_bytes`]); pipeline 31's function writes every texture slot it is asked of.
     fn shaped_staged() -> Rig {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies();
+        r.dec.set_staged_surface_copies(Arc::default());
         let page = r.page;
         take_shapes(&r);
         r.dec.hold_resource_ids(0, 1);

@@ -553,10 +553,16 @@ pub fn scratch_of_length(
 /// while the takes ran (`Metrics::consumer_allocation_nanos`, every thread's: an allocation of
 /// another thread's beside a take counts too). Each new longest make is logged with its split.
 pub const SCRATCH_MAKES_CODE: &str = "rt-scratch-makes";
+/// The nanoseconds the block takes of [`SCRATCH_MAKES_CODE`] took in all.
 pub const SCRATCH_TAKE_NS_CODE: &str = "rt-scratch-take-ns";
+/// The longest block take of [`SCRATCH_MAKES_CODE`], which its count rises to.
 pub const SCRATCH_TAKE_MAX_NS_CODE: &str = "rt-scratch-take-max-ns";
+/// The nanoseconds of rt's allocations on the consumer's threads while the takes of
+/// [`SCRATCH_MAKES_CODE`] ran.
 pub const SCRATCH_TAKE_ALLOCATION_NS_CODE: &str = "rt-scratch-take-allocation-ns";
+/// The nanoseconds the buffers' makes over their blocks of [`SCRATCH_MAKES_CODE`] took in all.
 pub const SCRATCH_BUFFER_NS_CODE: &str = "rt-scratch-buffer-ns";
+/// The longest buffer's make of [`SCRATCH_MAKES_CODE`], which its count rises to.
 pub const SCRATCH_BUFFER_MAX_NS_CODE: &str = "rt-scratch-buffer-max-ns";
 
 /// The longest take, buffer's make and whole make of [`scratch_of_length`]'s so far, which
@@ -605,7 +611,9 @@ impl ScratchSplit {
             let ms = |ns: u64| ns as f64 / 1e6;
             log::info!(
                 target: TARGET,
-                "a scratch buffer of {} KiB took {:.3} ms, the longest yet: its block's take                  {:.3} ms ({allocations} allocations of rt's on the consumer's threads,                  {:.3} ms, while it ran), the buffer over it {:.3} ms",
+                "a scratch buffer of {} KiB took {:.3} ms, the longest yet: its block's take \
+                 {:.3} ms ({allocations} allocations of rt's on the consumer's threads, \
+                 {:.3} ms, while it ran), the buffer over it {:.3} ms",
                 self.length.div_ceil(1024),
                 ms(whole),
                 ms(self.take),

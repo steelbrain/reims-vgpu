@@ -7541,7 +7541,7 @@ impl<P: Platform> Kept<P> {
     /// it is let go of. The piece let go of, counted ([`spare_let_go`]), is returned for the
     /// caller to drop outside the lock.
     fn keep(&self, buffer: P::Buffer, unused: bool, cap: u64) -> Option<Spare<P>> {
-        let spare = Spare { buffer, unused };
+        let spare = Spare::<P> { buffer, unused };
         let length = spare.buffer.length();
         let mut idle = self.idle.lock();
         let held: u64 = idle.iter().map(|s| s.buffer.length()).sum();

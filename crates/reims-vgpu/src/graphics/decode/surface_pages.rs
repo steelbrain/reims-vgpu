@@ -4852,7 +4852,7 @@ pub(super) mod tests {
         assert_eq!(r.dec.views_of_surfaces().counts().unviewed, 1);
         // Where the caches' copies are staged, a cached block is named by its runs, and what
         // would make its view, where it got no device cache, makes none.
-        r.dec.set_staged_surface_copies();
+        r.dec.set_staged_surface_copies(Arc::default());
         let named = BLOCK + 0x10000;
         r.pages_cached(named, &[(9, 2)], 2 * page, true);
         let unmade = r
