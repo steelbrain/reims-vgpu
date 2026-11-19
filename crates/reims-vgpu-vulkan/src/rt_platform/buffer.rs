@@ -1030,17 +1030,19 @@ mod tests {
         let (imports, unnamed) = (counted(IMPORTS_CODE), counted(IMPORTS_UNNAMED.made));
         // SAFETY: as above.
         let bytes = unsafe { HostRange::new(at, 1000) };
-        let made = crate::answer::making_as(MADE, || device.new_buffer(BufferDesc {
-            length: 1000,
-            options: vec![OptionSet::ResourceOptions(READ_ONLY)],
-            pinned_gpu_address: None,
-            contents: Some(bytes),
-            no_copy: true,
-            deallocator: Some(Box::new(move |at, length| {
-                *take.lock() = Some((at.addr(), length));
-            })),
-            zero_from: None,
-        }));
+        let made = crate::answer::making_as(MADE, || {
+            device.new_buffer(BufferDesc {
+                length: 1000,
+                options: vec![OptionSet::ResourceOptions(READ_ONLY)],
+                pinned_gpu_address: None,
+                contents: Some(bytes),
+                no_copy: true,
+                deallocator: Some(Box::new(move |at, length| {
+                    *take.lock() = Some((at.addr(), length));
+                })),
+                zero_from: None,
+            })
+        });
         let buffer = made
             .expect("never a raise")
             .expect("a read-only no-copy buffer");

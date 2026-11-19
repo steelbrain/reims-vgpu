@@ -321,9 +321,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         let options = u64::from(m.options);
         let pin = (m.gpu_address != 0).then_some(m.gpu_address);
         let kind = super::unkept::Kind::managed(self.unified());
-        let Some(buffer) = kind.making(|| {
-            self.buffer_over_block(device, m.region_offset, m.length, options, pin)
-        })?
+        let Some(buffer) = kind
+            .making(|| self.buffer_over_block(device, m.region_offset, m.length, options, pin))?
         else {
             return Ok(Err(DecodeError::Refused));
         };
@@ -390,9 +389,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             length: m.length,
         };
         let kind = super::unkept::Kind::managed(self.unified());
-        let Some(buffer) = kind.making(|| {
-            self.buffer_over_bytes(device, bytes, m.length, options, pin, None, None)
-        })?
+        let Some(buffer) = kind
+            .making(|| self.buffer_over_bytes(device, bytes, m.length, options, pin, None, None))?
         else {
             return Ok(Err(DecodeError::Refused));
         };
@@ -476,7 +474,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             ram: bytes.ram,
             gpu_as_of: AtomicU64::new(0),
         };
-        let mut entry = Entry::of(ObjHandle::Buffer(buffer)).over(span).counted(live);
+        let mut entry = Entry::of(ObjHandle::Buffer(buffer))
+            .over(span)
+            .counted(live);
         entry.managed = Some(copy);
         self.store(m.obj_id, entry);
         Ok(Ok(()))
@@ -552,7 +552,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         copy: ManagedCopy<P>,
         live: Option<super::unkept::Live>,
     ) {
-        let mut entry = Entry::of(ObjHandle::Buffer(buffer)).over(Some(span)).counted(live);
+        let mut entry = Entry::of(ObjHandle::Buffer(buffer))
+            .over(Some(span))
+            .counted(live);
         entry.managed = Some(copy);
         self.store(obj_id, entry);
     }
@@ -1385,11 +1387,25 @@ mod tests {
         let unpinned_by = |kind| rise(u2, u, kind);
         let made_by = |kind| rise(m2, m, kind);
         assert_eq!(
-            [Kind::Region, Kind::Managed, Kind::Buffer, Kind::Private, Kind::Heap].map(unpinned_by),
+            [
+                Kind::Region,
+                Kind::Managed,
+                Kind::Buffer,
+                Kind::Private,
+                Kind::Heap
+            ]
+            .map(unpinned_by),
             [2, 1, 1, 2, 1]
         );
         assert_eq!(
-            [Kind::Region, Kind::Managed, Kind::Buffer, Kind::Private, Kind::Heap].map(made_by),
+            [
+                Kind::Region,
+                Kind::Managed,
+                Kind::Buffer,
+                Kind::Private,
+                Kind::Heap
+            ]
+            .map(made_by),
             [2, 1, 2, 2, 1]
         );
         let total: u64 = KINDS.iter().map(|&k| unpinned_by(k)).sum();

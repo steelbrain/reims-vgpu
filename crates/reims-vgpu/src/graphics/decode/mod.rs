@@ -3876,9 +3876,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     options: vec![OptionSet::ResourceOptions(m.options.into())],
                     pinned_gpu_address: pin,
                 };
-                let made = unkept::Kind::Region.making(|| {
-                    device.new_heap_over_host_memory(bytes, &desc)
-                })?;
+                let made = unkept::Kind::Region
+                    .making(|| device.new_heap_over_host_memory(bytes, &desc))?;
                 match made.heap {
                     Some(heap) => {
                         let live = self.made_as(unkept::Kind::Region, pin, heap.gpu_address());
@@ -3934,9 +3933,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     // SAFETY: the bytes lie in one block the context holds (checked under the
                     // pool's lock), whose piece stays mapped while the decoder holds the ledger.
                     let bytes = unsafe { HostRange::new(at, length) };
-                    let made = unkept::Kind::Pool.making(|| {
-                        device.new_heap_over_host_memory(bytes, &desc)
-                    })?;
+                    let made = unkept::Kind::Pool
+                        .making(|| device.new_heap_over_host_memory(bytes, &desc))?;
                     Ok(made.heap.map(|heap| {
                         let pin = desc.pinned_gpu_address;
                         let live = self.made_as(unkept::Kind::Pool, pin, heap.gpu_address());

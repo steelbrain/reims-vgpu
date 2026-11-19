@@ -2787,7 +2787,9 @@ pub fn count_gone(codes: MadeCodes) {
 /// How many of the kind of `codes` are live now ([`count_made`], [`count_gone`]).
 pub fn live_now(codes: MadeCodes) -> u64 {
     let live = LIVE.lock();
-    (live.iter()).find(|(code, _, _)| *code == codes.made).map_or(0, |&(_, now, _)| now)
+    (live.iter())
+        .find(|(code, _, _)| *code == codes.made)
+        .map_or(0, |&(_, now, _)| now)
 }
 
 thread_local! {

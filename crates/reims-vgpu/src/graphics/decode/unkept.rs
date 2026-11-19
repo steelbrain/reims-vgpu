@@ -241,7 +241,10 @@ mod tests {
             })
             .collect();
         for (kind, c) in KINDS.iter().map(|k| (k, k.codes())) {
-            assert!(c.unpinned.starts_with("rt-gpu-address-unpinned-"), "{kind:?}");
+            assert!(
+                c.unpinned.starts_with("rt-gpu-address-unpinned-"),
+                "{kind:?}"
+            );
             assert!(c.made.made.starts_with("rt-made-"), "{kind:?}");
             assert!(c.imports.made.starts_with("rt-imports-"), "{kind:?}");
             assert_eq!(c.imports.live_most, format!("{}-live-most", c.imports.made));

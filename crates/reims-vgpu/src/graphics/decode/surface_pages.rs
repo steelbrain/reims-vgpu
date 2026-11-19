@@ -2957,7 +2957,10 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
         };
         let kind = super::unkept::Kind::Pages;
-        match kind.making(|| device.new_heap_over_host_memory(bytes, &desc))?.heap {
+        match kind
+            .making(|| device.new_heap_over_host_memory(bytes, &desc))?
+            .heap
+        {
             Some(heap) => {
                 let live = self.made_as(kind, desc.pinned_gpu_address, heap.gpu_address());
                 log::trace!(
@@ -3089,7 +3092,6 @@ pub(super) mod tests {
         RgfxTextureFromBuffer,
     };
     use reims_vgpu_vulkan::core::memory::descriptor::{GuestPhysicalRange, MemoryMapDescriptor};
-    use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
     use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
     use reims_vgpu_vulkan::core::testkit::{Arg, FakePlatform, GuestRam};
     use zerocopy::IntoBytes;
