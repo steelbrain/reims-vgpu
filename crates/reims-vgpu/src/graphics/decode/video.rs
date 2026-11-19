@@ -486,7 +486,7 @@ pub struct VideoPlane<'a, P: Platform> {
     /// (`graphics::drawn`) and the op is a decode that shows them whole: the plane there, which
     /// the picture is drawn into rather than landing in the buffer.
     #[cfg(windows)]
-    pub drawn: Option<crate::graphics::drawn::DrawnTarget<P>>,
+    pub(crate) drawn: Option<crate::graphics::drawn::DrawnTarget<P>>,
 }
 
 /// One plane of a video cache's surface, as a decode's picture lands in it
