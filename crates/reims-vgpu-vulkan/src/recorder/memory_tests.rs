@@ -1140,3 +1140,101 @@ fn on_vulkan_a_buffers_escape_lies_between_the_commits_around_its_note() {
         assert_eq!(counted.get(super::BUFFER_ESCAPED), Some(&1));
     });
 }
+
+/// The acquire of what another API wrote into a buffer's exported memory (`external_write_done`,
+/// the host's video landing a picture in a surface's device cache) is one
+/// [`super::EXTERNAL_WRITE_DONE`] record on the buffer, with no arguments, where the call
+/// returned in the stream's order, on the thread that made it: as the host's video lands a
+/// picture, on a thread of its own after the decode's command buffer was committed, its later
+/// work waiting for the session's signal, and before that signal. So the record lies after the
+/// commit, before the `setSignaledValue:` that lets the command buffer read the cache past its
+/// wait, and before the commit of a command buffer that reads it once that one completed. The
+/// cache is exportable where the runtime makes one so (on Linux), whose acquire is taken; on
+/// MoltenVK, which exports no buffer's memory, it is `Private` as any other, whose acquire the
+/// runtime refuses, recorded all the same. The record is counted by its selector.
+#[cfg(unix)]
+#[test]
+fn on_vulkan_an_external_write_done_lies_between_the_decodes_commit_and_its_signal() {
+    let test = "recorder::memory_tests::on_vulkan_an_external_write_done_lies_between_the_decodes_commit_and_its_signal";
+    in_recording_child(test, |streams| {
+        use crate::gpu::resource::tests::shared;
+        /// `MTLResourceStorageModePrivate`.
+        const PRIVATE: u64 = 2 << 4;
+        let d = crate::gpu::device::tests::dev();
+        let exportable = (d.new_exportable_buffer_of_length(OnFault::Return, BLOCK, PRIVATE, None))
+            .expect("no raise");
+        let made_exportable = exportable.is_some();
+        let cache = exportable.unwrap_or_else(|| {
+            (d.new_buffer_of_length_padding_unobserved(OnFault::Return, BLOCK, PRIVATE, None))
+                .expect("no raise")
+                .expect("a Private buffer")
+        });
+        let (z, q) = (shared(4096), d.new_command_queue().unwrap());
+        let signal = d.new_shared_event().unwrap();
+        // Encodes in `cb` a copy of the cache's first 16 bytes into the `Shared` buffer.
+        let read = |cb: &VulkanCommandBuffer| {
+            let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+            let copy = BlitCmd::CopyBufferToBuffer {
+                source_buffer: Some(&cache),
+                source_offset: 0,
+                destination_buffer: Some(&z),
+                destination_offset: 0,
+                size: 16,
+            };
+            for cmd in [copy, BlitCmd::EndEncoding] {
+                e.encode(OnFault::Return, cmd).unwrap();
+            }
+        };
+        // The decode's command buffer: its read of the picture waits for the session's signal.
+        let decode = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        decode
+            .encode_wait(Some(EventRef::Shared(&signal)), 1)
+            .unwrap();
+        read(&decode);
+        decode.commit(OnFault::Return).unwrap();
+        // The landing thread's acquire, then its signal.
+        let acquired = std::thread::scope(|s| {
+            let landing = s.spawn(|| {
+                let acquired = cache.external_write_done();
+                signal.set_signaled_value(1).unwrap();
+                acquired
+            });
+            landing.join().unwrap()
+        });
+        if made_exportable {
+            acquired.expect("the acquire");
+        } else {
+            assert!(acquired.is_err(), "a Private buffer's acquire taken");
+        }
+        decode.wait_until_completed(OnFault::Return).unwrap();
+        let next = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        read(&next);
+        run(&next);
+
+        let id = id_at(cache.id().0).expect("the cache is recorded");
+        let records = records_once(streams, |rs| place(rs, "commit", 1).is_some());
+        let made = (records.iter())
+            .position(|r| matches!(r, Record::Call(c) if c.result == id))
+            .expect("the cache's create");
+        let acquires: Vec<(usize, &format::Call)> = (records.iter().enumerate())
+            .filter_map(|(i, r)| match r {
+                Record::Call(c) if c.selector == super::EXTERNAL_WRITE_DONE => Some((i, c)),
+                _ => None,
+            })
+            .collect();
+        let [(at, record)] = acquires[..] else {
+            panic!("one acquire record: {acquires:?}");
+        };
+        assert_eq!(record.receiver, id);
+        assert!(record.args.is_empty(), "an acquire's arguments: {:?}", record.args);
+        let commits = [0, 1].map(|n| place(&records, "commit", n).expect("a commit's record"));
+        let signalled = place(&records, "setSignaledValue:", 0).expect("the signal's record");
+        assert!(
+            made < commits[0] && commits[0] < at && at < signalled && signalled < commits[1],
+            "the create at {made}, the acquire at {at}, the signal at {signalled}, the commits at \
+             {commits:?}"
+        );
+        let counted = state().expect("the child records").selectors.lock();
+        assert_eq!(counted.get(super::EXTERNAL_WRITE_DONE), Some(&1));
+    });
+}

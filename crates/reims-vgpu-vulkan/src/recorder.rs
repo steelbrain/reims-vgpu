@@ -113,6 +113,11 @@
 //!   that noted it, is queued at the note ([`buffer_escaped`]): after the `m2v.write` records of
 //!   each commit before it, and before those of each commit after. From there on the GPU may reach
 //!   the buffer by an address in memory the stream writes, where a player stops, typed.
+//! - **Another API's writes.** The acquire of what another API wrote into a buffer's exported
+//!   memory (`external_write_done`: the host's video landing a picture in a surface's device
+//!   cache) is an [`EXTERNAL_WRITE_DONE`] record on the buffer, with no arguments, queued as the
+//!   call returns, as any call's: the point from which the device's reads of the buffer see those
+//!   writes, which the stream does not hold.
 //! - **The calling thread captures; the writer shapes.** Each call's record is queued, owned,
 //!   under one lock as the call returns, so the stream's order keeps each thread's, with what
 //!   only the call's moment has: its objects' ids, the bytes it consumes and the memory a commit
@@ -230,8 +235,10 @@ pub const FIXES: &[&str] = &[
     "kernel-writes-at-completion",
     // 38af6b525: each completion before the guest can learn of it
     "completion-before-guest-learns",
-    // the commit that adds this name: each no-copy buffer's escape, at the guest's first note
+    // c6ab041d6: each no-copy buffer's escape, at the guest's first note
     "buffer-escaped",
+    // the commit that adds this name: each acquire of another API's writes into a buffer
+    "external-write-done",
 ];
 
 /// The stats file's lines that name the recorder's build: its commit ([`COMMIT`]), the display
@@ -1232,6 +1239,18 @@ pub fn buffer_escaped(b: &dyn Any, kind: u64) {
     });
     state.count_selector(BUFFER_ESCAPED);
 }
+
+/// The selector of the acquire of what another API wrote into a buffer's exported memory, the
+/// Vulkan platform's `external_write_done`: a call on the buffer, with no arguments, of all of the
+/// buffer, recorded as the call returns, as any call core makes. The host's video makes it once a
+/// picture is in a surface's device cache (the hardware's decode into the cache's memory, or its
+/// copy or video processing there, waited for), on the session's landing thread, right before the
+/// session's signal (`setSignaledValue:`) that lets the decode's command buffer read the picture
+/// past its wait, and while no command buffer that uses the buffer is in flight. So the record
+/// follows the hardware's writes, which the stream does not hold, and precedes every command that
+/// reads them: a player refills what lies over the buffer there. A refused acquire (a buffer not
+/// made exportable) is recorded all the same, as any call's refusal.
+pub const EXTERNAL_WRITE_DONE: &str = "m2v.externalWriteDone";
 
 /// An object's last reference went, at `ptr`: its `release` record, after every record queued
 /// before it. Its pointer is no longer the object's at once, and memory reached through it is

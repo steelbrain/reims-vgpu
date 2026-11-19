@@ -1101,10 +1101,17 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
     /// The runtime's acquire of what another API wrote into the buffer's exported memory
     /// (`external_write_done`), which the device's next submission records before its commands,
     /// and after which a shadow of a texture over the buffer's bytes copies them in again at its
-    /// next use in a command buffer committed after the call.
+    /// next use in a command buffer committed after the call. Recorded as
+    /// [`crate::recorder::EXTERNAL_WRITE_DONE`] on the buffer, with no arguments, as the call
+    /// returns.
     #[cfg(unix)]
     fn external_write_done(&self) -> Result<(), String> {
-        plain(|| self.raw.external_write_done()).map_err(|error| error.to_string())
+        let recorded_call = crate::recorder::rec_call!(crate::recorder::EXTERNAL_WRITE_DONE, self);
+        let recorded_answer = crate::recorder::run(|| -> Result<(), String> {
+            plain(|| self.raw.external_write_done()).map_err(|error| error.to_string())
+        });
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// The runtime's `rebind_bytes_no_copy`, given the new bytes as a no-copy buffer's are at
