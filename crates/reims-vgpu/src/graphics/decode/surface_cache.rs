@@ -4596,7 +4596,7 @@ pub(crate) struct Caches<P: Platform> {
 }
 
 /// What makes a shape's image ([`shapes`]): a texture of the descriptor on the device, of the
-/// platform's own, at no resource index the guest names (`ApiPlatform::own_texture`); `None`
+/// platform's own, at no resource index the guest names (`ApiPlatform::shape_image`); `None`
 /// where the platform makes none.
 pub(crate) type ShapeMaker<P> = Arc<
     dyn Fn(&<P as Platform>::Device, &TextureDesc) -> Option<<P as Platform>::Texture>
