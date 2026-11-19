@@ -1447,11 +1447,6 @@ impl CarriedPages {
         }
         (!runs.is_empty()).then_some(CarriedPages { runs })
     }
-
-    /// Their bytes.
-    fn bytes(&self) -> u64 {
-        self.runs.iter().map(|&(_, _, bytes)| bytes).sum()
-    }
 }
 
 /// The host's transfer queue, on which every copy runs, and the event its fills signal.
@@ -14392,7 +14387,7 @@ pub(super) mod tests {
         r.dec.set_staged_surface_copies();
         let page = r.page;
         let piece = 2 * page;
-        r.dec.caches().set_staging_piece(piece);
+        r.dec.surface_caches.set_staging_piece(piece);
         queues(&mut r);
         let length = 5 * page;
         let written = ram_pattern(&r, 1, length);
@@ -14494,7 +14489,7 @@ pub(super) mod tests {
         use super::super::surface_pages::tests::one_plane;
         let mut r = rig(16);
         r.dec.set_staged_surface_copies();
-        r.dec.caches().set_staging_piece(1024);
+        r.dec.surface_caches.set_staging_piece(1024);
         r.p.world().lay_linear_rows(Some(256));
         queues(&mut r);
         let page = r.page;
