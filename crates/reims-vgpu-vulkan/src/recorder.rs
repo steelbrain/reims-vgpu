@@ -5252,6 +5252,84 @@ mod tests {
         );
     }
 
+    /// A render pipeline that sets none of them still carries its tessellation state and its
+    /// call stack depths in its record, each Metal's default, as its map's last three keys:
+    /// `tessellation`, a map of `partitionMode` 0 (`Pow2`), `maxFactor` 16,
+    /// `factorScaleEnabled` false, `factorFormat` 0 (`Half`), `controlPointIndexType` 0
+    /// (`None`), `factorStepFunction` 0 (`Constant`) and `outputWinding` 0 (`Clockwise`), then
+    /// `maxVertexCallStackDepth` and `maxFragmentCallStackDepth`, 1 each. The record is the
+    /// descriptor the platform was given, where the runtime is given no tessellation state for
+    /// Metal's defaults (`gpu::states`). The pipeline is of `tri_vert`, a vertex function of no
+    /// tessellation.
+    #[test]
+    fn on_vulkan_a_render_pipeline_record_carries_metal_s_default_tessellation_state() {
+        in_recording_child(
+            "recorder::tests::on_vulkan_a_render_pipeline_record_carries_metal_s_default_tessellation_state",
+            |streams| {
+                use crate::core::platform::device::GpuDevice as _;
+                use crate::core::platform::resource::Library as _;
+                use crate::core::platform::values::{ColorAttachmentDesc, FullRenderPipelineDesc};
+                use crate::core::raise::OnFault;
+                const MADE: &str = "newRenderPipelineStateWithDescriptor:error:";
+                const VERT: &[u8] = include_bytes!("../../../tests/shaders/vert.metallib");
+                const FRAG: &[u8] = include_bytes!("../../../tests/shaders/frag.metallib");
+                let (_platform, device) = recording_device();
+                let function = |bytes: &[u8], name: &str| {
+                    let library = (device.new_library(bytes)).unwrap().unwrap().unwrap();
+                    let function = (library.new_function(OnFault::Return, name))
+                        .unwrap()
+                        .unwrap();
+                    (library, function)
+                };
+                let (vertex_library, vertex) = function(VERT, "tri_vert");
+                let (fragment_library, fragment) = function(FRAG, "tri_frag");
+                let color = ColorAttachmentDesc {
+                    pixel_format: 80,
+                    ..ColorAttachmentDesc::default()
+                };
+                let desc = FullRenderPipelineDesc {
+                    colors: vec![(0, color)],
+                    ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
+                };
+                let pipeline = (device.new_render_pipeline_state_full(&desc))
+                    .unwrap()
+                    .expect("a pipeline");
+                let (calls, _) =
+                    recorded(streams, |calls| calls.iter().any(|c| c.selector == MADE));
+                let made = (calls.iter())
+                    .find(|c| c.selector == MADE)
+                    .unwrap_or_else(|| panic!("no {MADE}: {calls:?}"));
+                let Some(Value::Map(fields)) = made.args.first() else {
+                    panic!("a descriptor's map: {made:?}");
+                };
+                let pairs = |pairs: &[(&str, Value)]| {
+                    let mut out = Vec::new();
+                    for (key, value) in pairs {
+                        out.push(((*key).to_owned(), value.clone()));
+                    }
+                    out
+                };
+                let tessellation = Value::Map(pairs(&[
+                    ("partitionMode", Value::Uint(0)),
+                    ("maxFactor", Value::Uint(16)),
+                    ("factorScaleEnabled", Value::Bool(false)),
+                    ("factorFormat", Value::Uint(0)),
+                    ("controlPointIndexType", Value::Uint(0)),
+                    ("factorStepFunction", Value::Uint(0)),
+                    ("outputWinding", Value::Uint(0)),
+                ]));
+                let expected = pairs(&[
+                    ("tessellation", tessellation),
+                    ("maxVertexCallStackDepth", Value::Uint(1)),
+                    ("maxFragmentCallStackDepth", Value::Uint(1)),
+                ]);
+                assert_eq!(fields.len(), 20, "{made:?}");
+                assert_eq!(fields[17..], expected, "{made:?}");
+                drop((pipeline, vertex, fragment, vertex_library, fragment_library));
+            },
+        );
+    }
+
     /// On a device that keeps two copies of a `Managed` buffer (the answer forced here), a
     /// no-copy `Managed` buffer's record carries the bytes its create copied into the device's
     /// copy, as a blob through the stream and back: a descriptor's `contents`, those before its
