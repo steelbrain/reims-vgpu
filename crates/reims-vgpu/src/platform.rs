@@ -29,7 +29,7 @@ use crate::memory::MemoryMap;
 pub trait ApiPlatform: Platform {
     /// Whether a graphics device on the platform keeps the per-shape form of the textures over
     /// its IOSurface device caches (`graphics::decode::surface_shapes`): each a view of its
-    /// shape's image ([`ApiPlatform::own_texture`]) rather than a texture over the cache's buffer,
+    /// shape's image ([`ApiPlatform::shape_image`]) rather than a texture over the cache's buffer,
     /// and every surface cached. False by default.
     const SURFACE_SHAPES: bool = false;
 
@@ -68,6 +68,15 @@ pub trait ApiPlatform: Platform {
     fn own_texture(&self, device: &Self::Device, desc: &TextureDesc) -> Option<Self::Texture> {
         let descriptor = self.texture_descriptor(desc);
         crate::entry::no_catch(device.new_texture(OnFault::Die, &descriptor))
+    }
+
+    /// A shape's image of `desc` on `device`, in the per-shape form
+    /// ([`ApiPlatform::SURFACE_SHAPES`]): the texture that the guest's textures over one shape of
+    /// an IOSurface plane are views of, each at its own resource index, so that no address or ID
+    /// the guest reads depends on the image. The platform's own texture by default
+    /// ([`ApiPlatform::own_texture`]). `None` where the platform refuses it.
+    fn shape_image(&self, device: &Self::Device, desc: &TextureDesc) -> Option<Self::Texture> {
+        self.own_texture(device, desc)
     }
 
     /// What the platform holds of the guest's RAM while a graphics device made over `map` lives:

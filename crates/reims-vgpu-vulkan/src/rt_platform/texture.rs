@@ -5,6 +5,14 @@
 //! (`super::buffer`) through [`make_over`], of the buffer's storage mode. Textures in heaps and
 //! over IOSurfaces are their pieces'.
 //!
+//! **Images for views.** A shape's image of an IOSurface plane (`reims_vgpu`'s
+//! `ApiPlatform::shape_image`) is rt's texture for views (the device's `new_texture_for_views`):
+//! made as a texture of its descriptor, of any usage, with no index of its own, so it takes none
+//! of the platform's own indices. The guest's textures over the plane are its views, each at the
+//! guest's index (`newTextureViewWithPixelFormat:resourceIndex:`). Copies, uploads and readbacks
+//! reach the image as any texture. Its `resourceIndex`, `uniqueIdentifier` and the index in its
+//! `gpuResourceID` are 0, and a slot that binds it reads Metal's nil texture.
+//!
 //! **Indices.** rt places a texture that shaders reach (shader-read or shader-write usage, or
 //! `Unknown`, which Metal takes as both) at an index of a live texture grant, and no other. A
 //! texture the guest places (the descriptor's `resourceIndex`, a view's `resourceIndex:`) takes the
@@ -284,7 +292,19 @@ fn made_of(
     };
     let placed = desc.resource_index.map_or(0, |(index, _forced)| index);
     let (index, own) = device.index_for(sel, reaches(d.usage), placed)?;
-    let made = make(&d, index);
+    answered(device, sel, desc, options, own, make(&d, index))
+}
+
+/// The texture of rt's answer `made` to `sel`, of `desc`, the resource options `options` and the
+/// platform's own index `own`: nil where rt refused it, counted, `own` given back.
+fn answered(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    desc: &TextureDesc,
+    options: u64,
+    own: Option<u32>,
+    made: Result<rt::Texture, rt::Error>,
+) -> Option<RtObj<RtTexture>> {
     let usage = match desc.usage {
         0 => UNKNOWN_ANSWERS,
         usage => usage & !DROPPED,
@@ -332,6 +352,20 @@ pub(super) fn set_purgeable(held: &AtomicU64, state: u64) -> u64 {
 }
 
 impl RtObj<RtDevice> {
+    /// A texture of `desc` with no index of its own, the image under the textures made as its
+    /// views (the module's docs, "Images for views"), as `newTextureWithDescriptor:` would make
+    /// it otherwise. Nil where rt refuses it, counted.
+    pub fn new_texture_for_views(&self, desc: &TextureDesc) -> Option<RtObj<RtTexture>> {
+        let sel = "newTextureWithDescriptor:";
+        let d = match rt_texture_descriptor(desc) {
+            Ok(d) => d,
+            Err(why) => return refused_metal(sel, &why),
+        };
+        let options = desc.resource_options.unwrap_or(0);
+        let made = self.rt().new_texture_for_views(&d);
+        answered(self, sel, desc, options, None, made)
+    }
+
     /// The index a texture `sel` makes takes, as rt takes it, and whether it is one of the
     /// platform's own: none where shaders do not reach it (`reached`), the guest's `placed` where
     /// it places one (0: none), else one of the platform's own. `None` where none can be had,
@@ -1009,6 +1043,19 @@ mod tests {
         let pixels = HostRange::of_slice(&bytes);
         assert_eq!(shared.replace_region(region, 0, 0, pixels, 16, 0), Ok(()));
         assert_eq!(counted(COPY_CODE), copies + 1);
+        assert_eq!(counted(RtRefusal::Refused.code()), metal);
+
+        // An image for views takes no index; a view of it at the guest's index reads its texels.
+        let image = TextureDesc { usage: 0, ..small };
+        let image = device.new_texture_for_views(&image).expect("an image for views");
+        assert_eq!((index(&image), image.gpu_resource_id() & 0xffff_ffff), (0, 0));
+        assert_eq!(image.replace_region(region, 0, 0, pixels, 16, 0), Ok(()));
+        let view = image.new_texture_view_at_index(70, 10);
+        let view = view.expect("never a raise").expect("a view at the guest's index");
+        assert_eq!(index(&view), 10);
+        let mut texels = [0_u8; 64];
+        view.read_pixels(&mut texels, 16);
+        assert_eq!(texels, bytes);
         assert_eq!(counted(RtRefusal::Refused.code()), metal);
         let private = TextureDesc {
             resource_options: Some(0x20),

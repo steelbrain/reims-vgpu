@@ -36,4 +36,15 @@ impl ApiPlatform for RtPlatform {
     ) {
         texture.read_pixels(dst, bytes_per_row);
     }
+
+    /// rt's image for views (`RtObj::<RtDevice>::new_texture_for_views`, metal2vulkan-rt's
+    /// `Device::new_texture_for_views`): it takes no index, and the guest's textures over the
+    /// shape are its views at their own. Nil where rt refuses it, counted.
+    fn shape_image(
+        &self,
+        device: &<Self as Platform>::Device,
+        desc: &TextureDesc,
+    ) -> Option<<Self as Platform>::Texture> {
+        device.new_texture_for_views(desc)
+    }
 }

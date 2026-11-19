@@ -771,12 +771,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // beside the guest's pages: they all fit one budget together, past which a surface
             // lies in place, so the copies stay bounded on a small host.
             // A platform of the per-shape form has each texture over a device cache be a view of
-            // its shape's image, an own texture of the platform's (`decode::surface_shapes`).
+            // its shape's image, the platform's (`ApiPlatform::shape_image`,
+            // `decode::surface_shapes`).
             if P::SURFACE_SHAPES {
                 let platform = Arc::clone(&platform);
                 decoder.set_surface_shapes(Arc::new(
                     move |device: &P::Device, desc: &TextureDesc| {
-                        platform.own_texture(device, desc)
+                        platform.shape_image(device, desc)
                     },
                 ));
             }
