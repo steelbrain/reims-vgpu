@@ -26,6 +26,11 @@
 // shaders.metallib as committed with its kernel `displayMirrorTileList`), it printed each of the
 // file's 200 answers and one more, that kernel's, which was then added to the file from its
 // output.
+// On 2026-11-18, on the same Mac and macOS, given the 53 metallibs the test then read (the 52 and
+// the test shaders' render_tess_bump.metallib), it printed each of the file's 201 answers and
+// three more, `None` for that library's two vertex functions `render_tess_bump` and
+// `render_tess_bump_cp` and its fragment function `render_tess_facing`, which were then added
+// to the file from its output.
 //
 // Build and run on a Mac, from the repository's root, with Xcode's tools, giving each metallib
 // as `<key>=<path>`, the key the test names it by: a fixture of tests/shaders by its file name

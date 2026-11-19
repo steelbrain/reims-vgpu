@@ -7401,6 +7401,274 @@ pub(crate) mod tests {
         }
     }
 
+    /// The bytes of a 32 by 16 BGRA8 target, cleared to black, after a pass that draws two
+    /// patches of `render_tess_bump.metal` through `render_tess_facing`, under the pipeline of
+    /// the platform's whole render value whose tessellation state is `tessellation`: those of
+    /// `render_tess_bump`, three control points each from buffer 0, by `drawPatches`; or, where
+    /// `tessellation` has a control-point index type, those of `render_tess_bump_cp`, which reads
+    /// them through `[[stage_in]]`, by `drawIndexedPatches` over 16-bit indices into the points
+    /// stored in reverse order, the first patch's control points 0 and 1 swapped. The factor
+    /// buffer holds two entries, every factor 2.5 in the first and 1 in the second; `scale`,
+    /// where given, is set on the encoder. As
+    /// `metal_answers/encode_render.tessellation_states_tessellate_as_metals.m` draws them
+    fn bump_texels(
+        tessellation: crate::core::platform::values::TessellationDesc,
+        scale: Option<f32>,
+    ) -> Vec<u8> {
+        use crate::core::platform::resource::Library as _;
+        use crate::core::platform::values::{
+            AttributeDesc, BufferLayoutDesc, ColorAttachmentDesc, FullRenderPipelineDesc,
+            VertexDesc,
+        };
+
+        const BUMP: &[u8] = include_bytes!("../../../../tests/shaders/render_tess_bump.metallib");
+        /// The two patches' control points, float2 each, the second patch the first's mirror.
+        const POINTS: [f32; 12] = [
+            -0.96, 0.07, -0.04, 0.07, -0.48, 0.95, 0.96, 0.07, 0.04, 0.07, 0.48, 0.95,
+        ];
+        let p = platform();
+        let d = dev();
+        let by_index = tessellation.control_point_index_type != 0;
+        let library = d.new_library(BUMP).unwrap().unwrap().unwrap();
+        let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
+        let vertex = function(if by_index {
+            "render_tess_bump_cp"
+        } else {
+            "render_tess_bump"
+        });
+        let fragment = function("render_tess_facing");
+        // float2 attribute 0 of buffer 0, stepping per patch control point.
+        let vertex_descriptor = by_index.then(|| VertexDesc {
+            layouts: vec![BufferLayoutDesc {
+                buffer_index: 0,
+                stride: 8,
+                step_function: 4,
+                step_rate: 1,
+            }],
+            attributes: vec![AttributeDesc {
+                attribute_index: 0,
+                format: 29,
+                offset: 0,
+                buffer_index: 0,
+            }],
+        });
+        let pipeline = d
+            .new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                vertex_descriptor,
+                colors: vec![(
+                    0,
+                    ColorAttachmentDesc {
+                        pixel_format: 80,
+                        ..ColorAttachmentDesc::default()
+                    },
+                )],
+                tessellation,
+                ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
+            })
+            .unwrap()
+            .unwrap();
+        let reversed: Vec<f32> = POINTS.chunks(2).rev().flatten().copied().collect();
+        let points: &[f32] = if by_index { &reversed } else { &POINTS };
+        let points = buffer::<VulkanPlatform>(&d, 48, 0, &bytes(points));
+        let indices: Vec<u8> = [4u16, 5, 3, 2, 1, 0]
+            .iter()
+            .flat_map(|i| i.to_ne_bytes())
+            .collect();
+        let indices = buffer::<VulkanPlatform>(&d, 12, 0, &indices);
+        let factors: Vec<u8> = ([0x4100u16; 4].iter().chain(&[0x3c00; 4]))
+            .flat_map(|f| f.to_ne_bytes())
+            .collect();
+        let factors = buffer::<VulkanPlatform>(&d, 16, 0, &factors);
+        let (dst, pass) = pass_of(&p, &d, (32, 16));
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        let mut cmds = vec![
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&pipeline),
+            },
+            RenderCmd::SetVertexBuffer {
+                buffer: Some(&points),
+                offset: 0,
+                index: 0,
+            },
+            RenderCmd::SetTessellationFactorBuffer {
+                buffer: Some(&factors),
+                offset: 0,
+                instance_stride: 0,
+            },
+        ];
+        cmds.extend(scale.map(|scale| RenderCmd::SetTessellationFactorScale { scale }));
+        cmds.push(if by_index {
+            RenderCmd::DrawIndexedPatches {
+                number_of_patch_control_points: 3,
+                patch_start: 0,
+                patch_count: 2,
+                patch_index_buffer: None,
+                patch_index_buffer_offset: 0,
+                control_point_index_buffer: &indices,
+                control_point_index_buffer_offset: 0,
+                instance_count: 1,
+                base_instance: 0,
+            }
+        } else {
+            RenderCmd::DrawPatches {
+                number_of_patch_control_points: 3,
+                patch_start: 0,
+                patch_count: 2,
+                patch_index_buffer: None,
+                patch_index_buffer_offset: 0,
+                instance_count: 1,
+                base_instance: 0,
+            }
+        });
+        cmds.push(RenderCmd::EndEncoding);
+        for cmd in cmds {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
+        let out = buffer::<VulkanPlatform>(&d, 2048, 0, &[]);
+        let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        for cmd in [
+            BlitCmd::CopyTextureToBuffer {
+                source_texture: &dst,
+                source_slice: 0,
+                source_level: 0,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: MtlSize::new(32, 16, 1),
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: 128,
+                destination_bytes_per_image: 2048,
+            },
+            BlitCmd::EndEncoding,
+        ] {
+            blit.encode(OnFault::Die, cmd).unwrap();
+        }
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert_eq!(cb.error(), None);
+        // SAFETY: the Shared buffer's 2048 bytes, read after the blit completed.
+        unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), 2048) }.to_vec()
+    }
+
+    /// `texels`, a 32 by 16 BGRA8 target's, as the recorder of
+    /// [`tessellation_states_tessellate_as_metals`] prints a target: a row a line, '.' black, 'F'
+    /// blue (a triangle that faces front), 'B' red (one that faces back), '?' any other.
+    fn facing_rows(texels: &[u8]) -> String {
+        (texels.chunks(128))
+            .map(|row| {
+                (row.chunks(4))
+                    .map(|t| match t {
+                        [0, 0, 0, 0xff] => '.',
+                        [0xff, 0, 0, 0xff] => 'F',
+                        [0, 0, 0xff, 0xff] => 'B',
+                        _ => '?',
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Two mirrored triangle patches whose edge from control point 0 to 1 bends down the target
+    /// by where the tessellator put its vertices, coloured by the way they face, drawn under
+    /// Metal's default tessellation state and under each state that changes one field of it: the
+    /// integer and both fractional partitions, a maximum factor of 2, the counter-clockwise
+    /// output winding, the per-patch factor step function, the factor scale (2, set on the
+    /// encoder) and the 16-bit control-point index type ([`bump_texels`]). Each draws Metal's
+    /// target, byte for byte.
+    ///
+    /// Metal's targets are measured: the program beside the test's answers
+    /// (`metal_answers/encode_render.tessellation_states_tessellate_as_metals.m`) drew them on
+    /// the M3 Max under macOS 27.0.1 on 2026-11-18, and no two of them are the same, so each
+    /// field shows. The draws run under the default, not strict: a patch draw dies in strict
+    /// mode ([`patch_draw_death`])
+    #[test]
+    fn tessellation_states_tessellate_as_metals() {
+        use crate::core::platform::values::TessellationDesc;
+        let metals = TessellationDesc::default();
+        let cases = [
+            ("Metal's defaults", metals, None),
+            (
+                "partition Integer",
+                TessellationDesc {
+                    partition_mode: 1,
+                    ..metals
+                },
+                None,
+            ),
+            (
+                "partition FractionalOdd",
+                TessellationDesc {
+                    partition_mode: 2,
+                    ..metals
+                },
+                None,
+            ),
+            (
+                "partition FractionalEven",
+                TessellationDesc {
+                    partition_mode: 3,
+                    ..metals
+                },
+                None,
+            ),
+            (
+                "max factor 2",
+                TessellationDesc {
+                    max_factor: 2,
+                    ..metals
+                },
+                None,
+            ),
+            (
+                "winding CounterClockwise",
+                TessellationDesc {
+                    output_winding: 1,
+                    ..metals
+                },
+                None,
+            ),
+            (
+                "step PerPatch",
+                TessellationDesc {
+                    factor_step_function: 1,
+                    ..metals
+                },
+                None,
+            ),
+            (
+                "factor scale 2",
+                TessellationDesc {
+                    factor_scale_enabled: true,
+                    ..metals
+                },
+                Some(2.0),
+            ),
+            (
+                "control point indices UInt16",
+                TessellationDesc {
+                    control_point_index_type: 1,
+                    ..metals
+                },
+                None,
+            ),
+        ];
+        let mut differ = Vec::new();
+        for (key, tessellation, scale) in cases {
+            let texels = crate::answer::relaxed(|| bump_texels(tessellation, scale));
+            if !crate::metal_matches_bytes!(key, &texels) {
+                differ.push(format!("{key}:\n{}", facing_rows(&texels)));
+            }
+        }
+        assert!(
+            differ.is_empty(),
+            "{} differ from Metal's:\n{}",
+            differ.len(),
+            differ.join("\n")
+        );
+    }
+
     /// A render pass executes an indirect command buffer's draws: the triangle of a command's
     /// pipeline state covers the target in its fragment's colour, the codes a plain draw of the
     /// state stores; an execution past the buffer's size dies at its selector, naming the

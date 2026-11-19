@@ -31,6 +31,9 @@ render_flat.metallib render_flat	None
 render_ftex.metallib render_ftex	None
 render_small.metallib render_small	None
 render_tess.metallib render_tess	None
+render_tess_bump.metallib render_tess_bump	None
+render_tess_bump.metallib render_tess_bump_cp	None
+render_tess_bump.metallib render_tess_facing	None
 render_tilebuf.metallib render_tilebuf	None
 render_vbuf.metallib render_vbuf	None
 render_vdesc.metallib render_vdesc	None
