@@ -872,10 +872,8 @@ impl Shared {
             let host = st.host_of(at);
             let carve = st.carves.get(&at).filter(|c| c.serial == serial);
             let written = carve.map_or(job.len, |c| c.written.min(job.len));
-            let zero = carve.map_or_else(
-                || std::iter::once(0..written).collect(),
-                |c| c.zero.clone(),
-            );
+            let zero =
+                carve.map_or_else(|| std::iter::once(0..written).collect(), |c| c.zero.clone());
             // The bytes the zeroer zeroes now are left to it: the rest first, then its chunk's
             // end (the module doc's "Zeros after a free").
             let (zero, claimed) = st.leave_claimed(at, zero);
