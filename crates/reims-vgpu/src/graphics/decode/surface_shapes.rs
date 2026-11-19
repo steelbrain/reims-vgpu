@@ -541,9 +541,10 @@ mod tests {
     /// The usage a texture declares picks its shape's kind: one that declares Metal's Unknown
     /// usage (0), `ShaderWrite` or `ShaderAtomic` takes storage, its image made of the Unknown
     /// usage, and writes its shape where it is bound; any other takes a plain shape, its image
-    /// made of `ShaderRead | RenderTarget` alone, and leaves it clean. Over a plain shape a
-    /// texture in the shape's format's sRGB sibling is a view of it; one in another format is a
-    /// view rt refuses, counted, and one that declares `PixelFormatView` is counted
+    /// made of `ShaderRead | RenderTarget` alone, and leaves it clean; each storage shape made
+    /// over the plane while it holds the plain one is counted, whatever its extent. Over a plain
+    /// shape a texture in the shape's format's sRGB sibling is a view of it; one in another
+    /// format is a view rt refuses, counted, and one that declares `PixelFormatView` is counted
     #[test]
     fn a_textures_declared_usage_picks_its_shapes_kind() {
         let (mut r, made) = shaped_made();
@@ -564,7 +565,8 @@ mod tests {
         assert_eq!([sibling, format_view, refused], [plain; 3]);
         assert_eq!(made.lock().len(), 4);
         let counts = r.dec.caches().counts().shapes;
-        assert_eq!((counts.made, counts.found, counts.order_case), (4, 3, 0));
+        assert_eq!((counts.made, counts.found), (4, 3));
+        assert_eq!(counts.order_case, 3, "beside the plain one");
         let plain_counts = (counts.plain_views_refused, counts.plain_format_views);
         assert_eq!(plain_counts, (1, 1));
     }
