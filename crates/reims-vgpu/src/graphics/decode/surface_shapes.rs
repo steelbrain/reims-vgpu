@@ -1551,7 +1551,11 @@ mod tests {
         let (back, out) = staged_download(&r, cache, 0x3c);
         assert_eq!(back, [(second, cache, 2048)]);
         assert_eq!(out.len(), 1, "{out:?}");
-        assert_eq!((out[0].1, out[0].2, out[0].3), (2048, 2048, 1024));
+        assert_eq!(
+            (out[0].1, out[0].2, out[0].3),
+            (2048, 0, 1024),
+            "the second shape's KiB alone, at its piece's first byte"
+        );
         let pages = ram_bytes(&r, 1, length, None);
         assert!(
             pages[2048..3072].iter().all(|&b| b == 0x3c),

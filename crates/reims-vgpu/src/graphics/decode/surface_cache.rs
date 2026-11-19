@@ -288,17 +288,25 @@
 //!   [`Caches::set_staged`]), no cache's copies go through an import of its pages: every cache
 //!   copies as a copied one does (`CachePages::Copied`, "Deferred blocks", above), its block
 //!   named by its runs with no view ([`super::surface_pages`], "By runs"), and a deferred block's
-//!   pages taken so at their naming. A fill is the host's CPU reading the pages' bytes into a
-//!   Shared buffer of its own, which the GPU then copies into the cache; a download is the GPU's
-//!   copy of the cache into such a buffer, which the CPU empties into the pages once it is done.
-//!   The buffers are the host's own, made unzeroed
-//!   ([`GpuDevice::new_scratch_buffer_of_length`]): a fill's CPU copy writes all of the
-//!   surface's bytes into its buffer ([`CopiedPages`] hold them all), and a download's CPU copy
+//!   pages taken so at their naming. A fill is the host's CPU reading the pages' bytes into
+//!   Shared pieces of its own, which the GPU then copies into the cache; a download is the GPU's
+//!   copy of the cache into such pieces, which the CPU empties into the pages once it is done.
+//!   A copy lays the bytes it moves back to back in pieces of at most metal2vulkan-rt's unit
+//!   ([`PIECE`], 16 MiB), a range that crosses a piece's end split there ([`pack`]), so no
+//!   piece takes an allocation of a surface's length: rt carves each from its pool's free
+//!   ranges, or makes one unit for it where none fits. The pieces are the host's own, made
+//!   unzeroed ([`GpuDevice::new_scratch_buffer_of_length`]): a fill's CPU copy writes all of
+//!   the surface's bytes into them ([`CopiedPages`] hold them all), and a download's CPU copy
 //!   reads only the bytes its GPU copy wrote, the surface's texels where its layout is known
 //!   (rows alone, with no padding between them or bytes past the last), else all of them. Once a
-//!   copy's command buffer has completed and its CPU copy is done, its buffer goes back to the
-//!   caches' spares ([`Spares`]), up to [`SPARE_BYTES`] of them, which the next copy of its
-//!   length takes in place of a make; a copy in flight never shares one.
+//!   copy's command buffer has completed and its CPU copy is done, its pieces go back to the
+//!   caches' spares ([`Spares`]), up to [`SPARE_BYTES`] of them, two whole pieces, which the
+//!   next copies take in place of a make, the shortest spare that holds each piece; a copy in
+//!   flight never shares one. Each piece taken is counted (`rt-staging-pieces`, and
+//!   `rt-staging-pieces-spared` those a spare served), and each made, with the nanoseconds its
+//!   make took in all and the longest, for a cache's first staged copy
+//!   (`rt-staging-piece-makes-first`, `-first-ns`, `-first-max-ns`) apart from the copies after
+//!   it (`rt-staging-piece-makes-repeat`, `-repeat-ns`, `-repeat-max-ns`).
 //!   A download's CPU copy, and the answers that wait for it, run on a thread of the caches' own
 //!   ([`INTO_PAGES_THREADS`]), not in its command buffer's completed handler: the platform sees
 //!   every queue's completions on one thread, which a large surface's copy, tens of milliseconds
@@ -315,9 +323,9 @@
 //!   cache's buffer, so the buffer differs from its pages only where the host's own copies wrote
 //!   it since the two last held the same bytes. Each cache keeps a record of those bytes
 //!   ([`SurfaceCache::changed`]), and a staged download moves only them, on the GPU into its
-//!   buffer and on the host's CPU into the pages, so every other byte of the pages stays as the
-//!   guest's CPU last wrote it. A download whose record is empty copies nothing and makes no
-//!   buffer. A range is marked written as the copy that writes it into the cache's buffer is
+//!   pieces and on the host's CPU into the pages, so every other byte of the pages stays as the
+//!   guest's CPU last wrote it. A download whose record is empty copies nothing and takes no
+//!   piece. A range is marked written as the copy that writes it into the cache's buffer is
 //!   encoded: a shape's write-back before a download or a fill ([`shapes::write_back`]), the
 //!   shape's whole extent at its place, and a copy of a shape's overlap into the shapes that share
 //!   it, which goes through the buffer ([`shapes::copy_overlaps`]), its source's extent. A copy
@@ -506,6 +514,9 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// object over the buffer itself is the exception, which a command buffer that may write the
     /// cache makes the record whole by ([`SurfaceCaches::over_written`]).
     raw: bool,
+    /// A staged copy of the cache was made ([`copy`]): the pieces the copies after it make are
+    /// counted apart from its first's ([`piece_made`]).
+    staged: bool,
     /// The transfer event's value at which the cache's last fill is done; 0 for none.
     filled_at: u64,
     /// The CPU's generation of the surface the cache's first fill is of, owed from the cache's
@@ -678,7 +689,7 @@ impl<P: Platform> SurfaceCache<P> {
     /// A staged copy out's bytes: those its CPU copy moves into the pages, the surface's texels
     /// where its layout is known, else all of its bytes, cut to those the record holds may
     /// differ ([`Self::written_spans`]); and the record's own, which its GPU copy moves into the
-    /// staging buffer, `None` for all of the cache's. A copy the record narrows is counted in
+    /// staging pieces, `None` for all of the cache's. A copy the record narrows is counted in
     /// `counts`, with the texels' bytes it leaves as the pages hold them, and on the counts line
     /// where the copies are `timed` ([`UNWRITTEN_KIB`], [`UNWRITTEN_NONE`]).
     fn out_bytes(
@@ -1350,27 +1361,29 @@ impl CopiedPages {
         Some(pages)
     }
 
-    /// Copies the surface's bytes `spans` of the pages into `buffer`, each to its own byte of
-    /// it, or the other way where `into`; `spans` ascending and apart, as [`texel_spans`] makes
-    /// them, and the bytes of the pages beside them left as they are.
+    /// Copies the surface's bytes `spans` of the pages each to the bytes from its address, its
+    /// first byte at the address, or the other way where `into`; `spans` ascending and apart, as
+    /// [`texel_spans`] and [`placed`] make them, and the bytes of the pages beside them left as
+    /// they are.
     ///
     /// # Safety
-    /// `buffer` holds the bytes of each span, which the caller may read and write and no GPU
-    /// work uses now; each run is the host's mapping of guest RAM pages the kext holds wired
-    /// while their block is named, which the guest's CPU may write meanwhile, as on a GPU of its
-    /// own memory.
-    unsafe fn copy(&self, buffer: *mut u8, spans: &[Range<u64>], into: bool) {
+    /// Each address holds its span's bytes, which the caller may read and write and no GPU work
+    /// uses now; each run is the host's mapping of guest RAM pages the kext holds wired while
+    /// their block is named, which the guest's CPU may write meanwhile, as on a GPU of its own
+    /// memory.
+    unsafe fn copy(&self, spans: &[(Range<u64>, *mut u8)], into: bool) {
         let mut spans = spans.iter().peekable();
         let mut at = 0u64;
         for &(host, bytes) in &self.runs {
             let end = at.saturating_add(bytes);
-            while let Some(span) = spans.peek() {
+            while let Some((span, buffer)) = spans.peek() {
                 let (from, to) = (span.start.max(at), span.end.min(end));
                 if from < to {
                     // SAFETY: the caller's; the run holds the bytes from `from - at` to
-                    // `to - at`, and the buffer those from `from` to `to`, of the span.
+                    // `to - at`, and the span's address those from `from - span.start` to
+                    // `to - span.start`.
                     unsafe {
-                        let here = buffer.add(from.to_usize());
+                        let here = buffer.add((from - span.start).to_usize());
                         let page = host.as_ptr::<u8>().add((from - at).to_usize());
                         let n = (to - from).to_usize();
                         if into {
@@ -2096,7 +2109,7 @@ impl<P: Platform> SurfaceCaches<P> {
             shaped: false,
             shape_clock: 0,
             staged: None,
-            spares: Arc::new(Spares::new(SPARE_BYTES)),
+            spares: Arc::new(Spares::new(SPARE_BYTES, PIECE)),
             lands_out: Arc::new(Worker::new(INTO_PAGES_THREADS)),
         }
     }
@@ -2300,6 +2313,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 // Its make's zeros, not its pages' bytes, until its first fill.
                 changed: Changed::All,
                 raw: !self.shaped || life.is_some(),
+                staged: false,
                 filled_at,
                 first_fill: Some(generation),
                 owner: None,
@@ -2541,6 +2555,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 // named.
                 changed: Changed::All,
                 raw: !self.shaped || life.is_some(),
+                staged: false,
                 filled_at,
                 first_fill: carries.then_some(0),
                 owner: None,
@@ -4735,7 +4750,7 @@ impl<P: Platform> SurfaceCaches<P> {
         let lands = Arc::clone(&landing);
         let gpu = Arc::clone(&self.copy_gpu);
         match staged {
-            // A copied cache's pages take the staging buffer's bytes on the host's CPU, before
+            // A copied cache's pages take the staging pieces' bytes on the host's CPU, before
             // `done`: on the caches' own threads, as the copy would hold the platform's thread
             // that sees every queue's completions (the module doc, "Staged copies").
             Some(staged) => {
@@ -5410,6 +5425,13 @@ impl<P: Platform> Caches<P> {
     pub(crate) fn set_staged(&self, now: Now) {
         self.state.lock().staged = Some(now);
         self.staged.store(true, Ordering::Release);
+    }
+
+    /// Lays the staged copies' bytes in pieces of `piece` bytes from now on, two of them kept
+    /// spare, in place of rt's unit ([`PIECE`]): a test's surfaces are shorter than it.
+    #[cfg(test)]
+    pub(crate) fn set_staging_piece(&self, piece: u64) {
+        self.state.lock().spares = Arc::new(Spares::new(2 * piece, piece));
     }
 
     /// Whether every cache's copies are staged ([`Self::set_staged`]).
@@ -7023,67 +7045,184 @@ fn encode_home<P: Platform>(
     Ok(true)
 }
 
-/// A copied cache's Shared buffer for one copy ([`CachePages::Copied`]), which lives until the
-/// copy's command buffer completes; for a copy out of the cache, with the pages its bytes go
-/// into then and the surface's bytes it moves into them: its texels alone where its layout is
-/// known ([`SurfaceCache::texels`]), as every copy out of the cache does, else all its bytes.
+/// The longest piece of a staged copy (the module doc, "Staged copies"): metal2vulkan-rt's unit,
+/// the length of each allocation its pool makes ([`MemoryClass::block_len`]), so a piece is
+/// carved from the pool's free ranges, or is the start of one unit's allocation where none fits,
+/// and never takes an allocation of a surface's length.
+///
+/// [`MemoryClass::block_len`]: metal2vulkan_rt::MemoryClass::block_len
+const PIECE: u64 = metal2vulkan_rt::MemoryClass::Shared.block_len();
+
+/// A staged copy's last piece's length is a multiple of this, up to a whole piece: the granule
+/// metal2vulkan-rt rounds a block's length up to (`Device::take_block`), so the rounding takes
+/// no byte the pool would not hold anyway, and a spare piece serves more of the copies after.
+const PIECE_GRANULE: u64 = 64 << 10;
+
+/// A staged copy's bytes as it lays them in its pieces ([`pack`]): its ranges of the surface's
+/// bytes back to back, a range that crosses a piece's end split at it.
+#[derive(Debug, PartialEq, Eq)]
+struct Packed {
+    /// The pieces' lengths: each a whole piece but the last, which is the bytes it holds rounded
+    /// up to [`PIECE_GRANULE`], no longer than a piece.
+    lens: Vec<u64>,
+    /// Each range, or each part of one split at a piece's end, in the ranges' order.
+    places: Vec<Place>,
+}
+
+/// Where some of a staged copy's bytes lie in its pieces ([`Packed`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Place {
+    /// The surface's bytes.
+    bytes: Range<u64>,
+    /// The piece they lie in.
+    piece: usize,
+    /// The offset of their first byte in it.
+    at: u64,
+    /// The index of the range of [`pack`]'s they are of.
+    of: usize,
+}
+
+/// `ranges` of a surface's bytes, laid in pieces of at most `piece` bytes ([`Packed`]): the
+/// first range's first byte at the first piece's, each range's after the one before it, and a
+/// range that crosses a piece's end split there, its rest at the next piece's first byte. Empty
+/// ranges take no place.
+fn pack(ranges: impl IntoIterator<Item = Range<u64>>, piece: u64) -> Packed {
+    let mut places = Vec::new();
+    let (mut index, mut at) = (0usize, 0u64);
+    for (of, range) in ranges.into_iter().enumerate() {
+        let mut start = range.start;
+        while start < range.end {
+            if at == piece {
+                (index, at) = (index + 1, 0);
+            }
+            let bytes = (range.end - start).min(piece - at);
+            places.push(Place {
+                bytes: start..start + bytes,
+                piece: index,
+                at,
+                of,
+            });
+            (start, at) = (start + bytes, at + bytes);
+        }
+    }
+    let lens = match places.last() {
+        None => Vec::new(),
+        Some(last) => (0..=last.piece)
+            .map(|i| match i == last.piece {
+                true => at.next_multiple_of(PIECE_GRANULE).min(piece),
+                false => piece,
+            })
+            .collect(),
+    };
+    Packed { lens, places }
+}
+
+/// Of `spans`, ascending and apart, the parts that lie in each of `places`, in their order, as
+/// [`pack`] made them: each with the place's piece and the offset there of its first byte, and
+/// the index in `spans` of the span it is of.
+fn placed(spans: &[Range<u64>], places: &[Place]) -> Vec<Place> {
+    let mut out = Vec::new();
+    let mut first = 0;
+    for place in places {
+        while spans.get(first).is_some_and(|s| s.end <= place.bytes.start) {
+            first += 1;
+        }
+        for (of, span) in spans.iter().enumerate().skip(first) {
+            if span.start >= place.bytes.end {
+                break;
+            }
+            let (from, to) = (span.start.max(place.bytes.start), span.end.min(place.bytes.end));
+            if from < to {
+                out.push(Place {
+                    bytes: from..to,
+                    piece: place.piece,
+                    at: place.at + (from - place.bytes.start),
+                    of,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// `places` each with the address in `pieces` of its first byte, for [`CopiedPages::copy`].
+fn addresses<P: Platform>(places: &[Place], pieces: &[P::Buffer]) -> Vec<(Range<u64>, *mut u8)> {
+    (places.iter())
+        .map(|place| {
+            let base = pieces[place.piece].contents().as_ptr::<u8>();
+            (place.bytes.clone(), base.wrapping_add(place.at.to_usize()))
+        })
+        .collect()
+}
+
+/// A copied cache's Shared pieces for one copy ([`CachePages::Copied`], [`pack`]), which live
+/// until the copy's command buffer completes; for a copy out of the cache, with the pages its
+/// bytes go into then and the surface's bytes it moves into them, each at its place in the
+/// pieces: its texels alone where its layout is known ([`SurfaceCache::texels`]), as every copy
+/// out of the cache does, else all its bytes, of those the copy moved.
 struct Staging<P: Platform> {
-    buffer: P::Buffer,
-    into: Option<(Arc<CopiedPages>, Vec<Range<u64>>)>,
+    pieces: Vec<P::Buffer>,
+    into: Option<(Arc<CopiedPages>, Vec<Place>)>,
     /// Where the caches' copies are staged, the clock that times the copy into the pages
     /// ([`DOWNLOADS`]).
     timed: Option<Now>,
-    /// Where the buffer goes once the copy is done; `None` lets go of it.
-    spares: Option<Arc<Spares<P>>>,
+    /// Where the pieces go once the copy is done.
+    spares: Arc<Spares<P>>,
 }
 
 impl<P: Platform> Staging<P> {
     /// The copy's command buffer has completed: a copy out of the cache moves the bytes its GPU
-    /// copy wrote into the pages, the spans alone; then the buffer goes back to the spares.
+    /// copy wrote into the pages, the spans alone; then the pieces go back to the spares.
     fn done(self) {
         if let Some((pages, spans)) = &self.into {
             let at = self.timed.as_ref().map(|now| now());
-            // SAFETY: the buffer's Shared bytes, the cache's length, which hold every span and
-            // which the copy into it, now done, was the last GPU work to use; the pages are
-            // named, so wired.
-            unsafe { pages.copy(self.buffer.contents().as_ptr::<u8>(), spans, true) };
+            let spans = addresses::<P>(spans, &self.pieces);
+            // SAFETY: each span's bytes of its piece's Shared bytes, which hold them and which
+            // the copy into them, now done, was the last GPU work to use; the pages are named,
+            // so wired.
+            unsafe { pages.copy(&spans, true) };
             if let (Some(now), Some(at)) = (&self.timed, at) {
                 DOWNLOADS.took(now, at);
             }
         }
-        let Staging { buffer, spares, .. } = self;
-        if let Some(spares) = spares {
-            spares.give(buffer);
+        let Staging { pieces, spares, .. } = self;
+        for piece in pieces {
+            spares.give(piece);
         }
     }
 }
 
-/// The idle bytes the caches keep in their staged copies' spare buffers ([`Spares`]): what the
-/// steady state's repeated small copies take, where a copy of a whole large surface makes its
-/// own.
-const SPARE_BYTES: u64 = 16 << 20;
+/// The idle bytes the caches keep in their staged copies' spare pieces ([`Spares`]): two whole
+/// pieces, what the steady state's repeated copies take of them, where a copy longer than they
+/// hold takes the rest from the platform.
+const SPARE_BYTES: u64 = 2 * PIECE;
 
-/// The staged copies' buffers no copy uses (the module doc, "Staged copies"), each given back
+/// The staged copies' pieces no copy uses (the module doc, "Staged copies"), each given back
 /// once its copy's command buffer completed and its CPU copy was done, so a copy in flight never
-/// shares one; a copy of a length one is kept for takes it in place of a make. Kept to `cap`
-/// bytes in all: a buffer given past them is let go of.
+/// shares one; a copy takes the shortest one that holds a piece it needs in place of a make.
+/// Kept to `cap` bytes in all: a piece given past them is let go of.
 struct Spares<P: Platform> {
     idle: Mutex<Vec<P::Buffer>>,
     cap: u64,
+    /// The longest piece a copy lays its bytes in ([`PIECE`]; shorter in the tests).
+    piece: u64,
 }
 
 impl<P: Platform> Spares<P> {
-    fn new(cap: u64) -> Self {
+    fn new(cap: u64, piece: u64) -> Self {
         Spares {
             idle: Mutex::new(Vec::new()),
             cap,
+            piece,
         }
     }
 
-    /// A kept buffer of `length` bytes, no longer kept; `None` where none is.
+    /// The shortest kept piece of at least `length` bytes, no longer kept; `None` where none is.
     fn take(&self, length: u64) -> Option<P::Buffer> {
         let mut idle = self.idle.lock();
-        let at = idle.iter().position(|b| b.length() == length)?;
+        let (at, _) = (idle.iter().enumerate())
+            .filter(|(_, b)| b.length() >= length)
+            .min_by_key(|(_, b)| b.length())?;
         Some(idle.swap_remove(at))
     }
 
@@ -7102,6 +7241,48 @@ impl<P: Platform> Spares<P> {
             }
         };
         drop(over);
+    }
+
+    /// A piece of each of `lens`' lengths, for a copy of a cache, its `first` staged copy where
+    /// so: the shortest spare that holds it, else one made on `device`, the host's own,
+    /// unzeroed. Counted where the copies are `timed` ([`piece_taken`], [`piece_made`]): each
+    /// taken, those spared, and those made with the nanoseconds each make took, apart for a
+    /// cache's first staged copy and those after it. `None` where one is not made, the pieces
+    /// taken given back.
+    fn pieces(
+        &self,
+        device: &P::Device,
+        lens: &[u64],
+        first: bool,
+        timed: Option<&Now>,
+    ) -> RaiseResult<Option<Vec<P::Buffer>>> {
+        let mut pieces = Vec::with_capacity(lens.len());
+        for &length in lens {
+            let spared = self.take(length);
+            let from_spares = spared.is_some();
+            let piece = match spared {
+                Some(piece) => Some(piece),
+                None => {
+                    let at = timed.map(|now| now());
+                    let made = device.new_scratch_buffer_of_length(ON, length, STORAGE_SHARED)?;
+                    if let (Some(now), Some(at), Some(_)) = (timed, at, &made) {
+                        piece_made(first, now().saturating_duration_since(at));
+                    }
+                    made
+                }
+            };
+            let Some(piece) = piece else {
+                for piece in pieces {
+                    self.give(piece);
+                }
+                return Ok(None);
+            };
+            if timed.is_some() {
+                piece_taken(from_spares);
+            }
+            pieces.push(piece);
+        }
+        Ok(Some(pieces))
     }
 }
 
@@ -7142,6 +7323,48 @@ const UNWRITTEN_KIB: &str = "rt-downloads-cache-view-unwritten-kib";
 /// The staged downloads that moved nothing: no copy of the host's wrote the cache since.
 const UNWRITTEN_NONE: &str = "rt-downloads-cache-view-unwritten";
 
+/// The staged copies' pieces taken ([`Spares::pieces`]), and of them those a spare served.
+const PIECES_TAKEN: &str = "rt-staging-pieces";
+const PIECES_SPARED: &str = "rt-staging-pieces-spared";
+
+/// The staged copies' pieces made on the copy's thread ([`Spares::pieces`]), for a cache's
+/// first staged copy and for the copies after it: how many, the nanoseconds their makes took,
+/// and the longest of them.
+const PIECE_MAKES: [(&str, &str, &str); 2] = [
+    (
+        "rt-staging-piece-makes-first",
+        "rt-staging-piece-makes-first-ns",
+        "rt-staging-piece-makes-first-max-ns",
+    ),
+    (
+        "rt-staging-piece-makes-repeat",
+        "rt-staging-piece-makes-repeat-ns",
+        "rt-staging-piece-makes-repeat-max-ns",
+    ),
+];
+
+/// The longest make of [`PIECE_MAKES`] so far, of each, which its code's count rises to.
+static PIECE_MAKE_MAX_NS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// One piece taken for a staged copy, from the spares where `spared` ([`PIECES_TAKEN`]).
+fn piece_taken(spared: bool) {
+    reims_vgpu_vulkan::answer::count_kind(PIECES_TAKEN);
+    if spared {
+        reims_vgpu_vulkan::answer::count_kind(PIECES_SPARED);
+    }
+}
+
+/// One piece made for a staged copy, a cache's `first`, in `took` ([`PIECE_MAKES`]).
+fn piece_made(first: bool, took: std::time::Duration) {
+    let kind = usize::from(!first);
+    let (made, ns, longest) = PIECE_MAKES[kind];
+    let took = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
+    reims_vgpu_vulkan::answer::count_kind(made);
+    reims_vgpu_vulkan::answer::count_kind_by(ns, took);
+    let was = PIECE_MAKE_MAX_NS[kind].fetch_max(took, Ordering::Relaxed);
+    reims_vgpu_vulkan::answer::count_kind_by(longest, took.saturating_sub(was));
+}
+
 impl StagedCodes {
     /// One copy of `bytes` bytes.
     fn copied(&self, bytes: u64) {
@@ -7160,16 +7383,16 @@ impl StagedCodes {
 /// Encodes on `cb` a copy of `cache`'s bytes `way`, between the cache and its pages, of the block
 /// at `block`: by the pages' runs where the cache has them and the platform copies by them, else
 /// through the view, which a refused copy by runs makes now (the module doc; counted in
-/// `counts`); or, for copied pages, through a Shared buffer of the copy's own, which the host's
-/// CPU fills from the pages now for a copy in, and which the caller keeps until the command
-/// buffer completes, then empties into the pages for a copy out ([`Staging::done`]). A deferred
-/// block's carried pages, its pages not named, are copied in the same way, each run to its own
-/// bytes of the cache, the rest left as it is; nothing is copied out of such a cache. Where no
-/// view or buffer can be made, nothing is copied, as where no encoder is.
+/// `counts`); or, for copied pages, through Shared pieces of the copy's own ([`pack`]), which the
+/// host's CPU fills from the pages now for a copy in, and which the caller keeps until the
+/// command buffer completes, then empties into the pages for a copy out ([`Staging::done`]). A
+/// deferred block's carried pages, its pages not named, are copied in the same way, each run to
+/// its own bytes of the cache, the rest left as it is; nothing is copied out of such a cache.
+/// Where no view or piece can be made, nothing is copied, as where no encoder is.
 ///
 /// A staged copy out moves only the bytes the cache's record holds may differ from the pages
-/// ([`SurfaceCache::changed`], the module doc, "Written ranges"), and none, with no buffer
-/// made, where it holds none. A copy encoded between the cache and its named pages leaves the
+/// ([`SurfaceCache::changed`], the module doc, "Written ranges"), and none, with no piece
+/// taken, where it holds none. A copy encoded between the cache and its named pages leaves the
 /// record empty: the two then hold the same bytes. A fill of them that copies nothing leaves it
 /// whole, the cache's bytes unknown against the pages'.
 fn copy<P: Platform>(
@@ -7239,42 +7462,53 @@ fn copy<P: Platform>(
         // and no buffer.
         let nothing = out.as_ref().is_some_and(|(cpu, _)| cpu.is_empty());
         moved |= nothing;
-        // A spare of the length, else a buffer of the copy's own, unzeroed: what its CPU copy
-        // reads of it, its GPU copy writes first, and the other way round.
-        if let Some(CachePages::Copied(copied)) = &cache.pages
-            && !nothing
-            && let Some(buffer) = match spares.take(cache.length) {
-                Some(buffer) => Some(buffer),
-                None => device.new_scratch_buffer_of_length(ON, cache.length, STORAGE_SHARED)?,
+        // The bytes the copy moves, laid back to back in pieces of at most rt's unit ([`pack`]):
+        // a fill's, all of the surface's; a copy out's the record narrows, the record's alone,
+        // else all of them. Each piece is the shortest spare that holds it, else one of the
+        // copy's own, unzeroed: what its CPU copy reads of it, its GPU copy writes first, and the
+        // other way round.
+        let first = !cache.staged;
+        let packed = match (&cache.pages, way, &cache.carried) {
+            (Some(CachePages::Copied(_)), _, _) if !nothing => {
+                match out.as_ref().and_then(|(_, gpu)| gpu.as_deref()) {
+                    Some(spans) => Some(pack(spans.iter().cloned(), spares.piece)),
+                    None => Some(pack([0..cache.length], spares.piece)),
+                }
             }
+            (None, Way::In, Some(carried)) => Some(pack(
+                (carried.runs.iter()).map(|&(at, _, bytes)| at..at + bytes),
+                spares.piece,
+            )),
+            _ => None,
+        };
+        let mut pieces = match &packed {
+            Some(packed) => spares.pieces(device, &packed.lens, first, timed)?,
+            None => None,
+        };
+        if let Some(CachePages::Copied(copied)) = &cache.pages
+            && let Some(packed) = &packed
+            && let Some(pieces) = pieces.take()
         {
             if way == Way::In {
-                let all = 0..cache.length;
-                // SAFETY: the new buffer's `length` Shared bytes, which no GPU work uses yet;
-                // the pages are named, so wired.
-                unsafe {
-                    copied.copy(
-                        buffer.contents().as_ptr::<u8>(),
-                        std::slice::from_ref(&all),
-                        false,
-                    )
-                };
+                let spans = addresses::<P>(&packed.places, &pieces);
+                // SAFETY: each place's bytes of its new piece's Shared bytes, which no GPU work
+                // uses yet; the pages are named, so wired.
+                unsafe { copied.copy(&spans, false) };
             }
-            // The buffer keeps the surface's layout: the GPU's copy moves the bytes the cache
-            // holds between it and the cache, the CPU's the surface's between it and the pages;
-            // a copy out the record narrows, the record's bytes alone, a part each, where the
-            // CPU's copy takes their texels.
-            let parts = match out.as_ref().and_then(|(_, gpu)| gpu.as_deref()) {
-                Some(spans) => cache.moves(spans.iter().map(|s| (s.clone(), s.start))),
-                None => cache.moves([(0..cache.length, 0)]),
-            };
-            between::<P>(&blit, (&cache.device, &buffer), &parts, way)?;
-            let into = out.map(|(cpu, _)| (Arc::clone(copied), cpu));
+            // The GPU's copy moves each place's bytes the cache holds between its piece and the
+            // cache, the CPU's the surface's between it and the pages; a copy out's CPU copy
+            // takes the texels of those bytes.
+            for place in &packed.places {
+                let parts = cache.moves([(place.bytes.clone(), place.at)]);
+                between::<P>(&blit, (&cache.device, &pieces[place.piece]), &parts, way)?;
+            }
+            let into = out.map(|(cpu, _)| (Arc::clone(copied), placed(&cpu, &packed.places)));
             moved = true;
+            cache.staged = true;
             if let (Some(now), Some(at)) = (timed, at) {
                 let codes = match &into {
                     Some((_, spans)) => {
-                        DOWNLOADS.copied(spans.iter().map(|s| s.end - s.start).sum());
+                        DOWNLOADS.copied(spans.iter().map(|s| s.bytes.end - s.bytes.start).sum());
                         &DOWNLOADS
                     }
                     None => {
@@ -7286,47 +7520,49 @@ fn copy<P: Platform>(
             }
             let timed = timed.cloned();
             staged = Some(Staging {
-                buffer,
+                pieces,
                 into,
                 timed,
-                spares: Some(Arc::clone(spares)),
+                spares: Arc::clone(spares),
             });
         }
-        // A buffer of the copy's own, unzeroed: the CPU copy writes each of its bytes, the
-        // carried runs end to end, before the GPU's copy reads them.
+        // Pieces as a staged copy's, unzeroed: the CPU copy writes each of their bytes, the
+        // carried runs back to back, before the GPU's copy reads them.
         if cache.pages.is_none()
             && way == Way::In
             && let Some(carried) = &cache.carried
-            && let Some(buffer) =
-                device.new_scratch_buffer_of_length(ON, carried.bytes(), STORAGE_SHARED)?
+            && let Some(packed) = &packed
+            && let Some(pieces) = pieces.take()
         {
             let mut from = 0u64;
-            for &(at, host, bytes) in &carried.runs {
-                // SAFETY: `bytes` of the new buffer's Shared bytes from `from`, which no GPU work
-                // uses yet; the carried pages are the kext's, wired until their block's pages are
-                // named, which drops them from the cache first.
+            for place in &packed.places {
+                let (run, host, _) = carried.runs[place.of];
+                let bytes = place.bytes.end - place.bytes.start;
+                // SAFETY: `bytes` of the new piece's Shared bytes from the place's offset, which
+                // no GPU work uses yet, and of the run's from the place's first byte; the carried
+                // pages are the kext's, wired until their block's pages are named, which drops
+                // them from the cache first.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        host.as_ptr::<u8>(),
-                        buffer.contents().as_ptr::<u8>().add(from.to_usize()),
+                        host.as_ptr::<u8>().add((place.bytes.start - run).to_usize()),
+                        (pieces[place.piece].contents().as_ptr::<u8>()).add(place.at.to_usize()),
                         bytes.to_usize(),
                     );
                 }
-                let parts = cache.moves([(at..at + bytes, from)]);
-                between::<P>(&blit, (&cache.device, &buffer), &parts, Way::In)?;
+                let parts = cache.moves([(place.bytes.clone(), place.at)]);
+                between::<P>(&blit, (&cache.device, &pieces[place.piece]), &parts, Way::In)?;
                 from += bytes;
             }
+            cache.staged = true;
             if let (Some(now), Some(at)) = (timed, at) {
                 FILLS.copied(from);
                 FILLS.took(now, at);
             }
-            // A buffer of the carried pages' length, which no take of the cache's length
-            // would match: let go of once done.
             staged = Some(Staging {
-                buffer,
+                pieces,
                 into: None,
                 timed: None,
-                spares: None,
+                spares: Arc::clone(spares),
             });
         }
     }
@@ -13201,10 +13437,14 @@ pub(super) mod tests {
             .filter(|c| c.sel == SCRATCH_BUFFER)
             .map(|c| c.args[0].as_u64())
             .collect();
-        assert_eq!(made, [Some(page)], "unzeroed, the carried page's length");
+        assert_eq!(
+            made,
+            [Some(page.next_multiple_of(PIECE_GRANULE))],
+            "unzeroed, the carried page's length rounded up to rt's granule"
+        );
         // The fake made each byte of it its marker, not zero: the CPU's copy wrote them all.
         let staged = buffer_bytes(&r, staging, None);
-        assert_eq!(staged, ram, "the page's bytes");
+        assert_eq!(staged[..ram.len()], ram, "the page's bytes");
         assert!(ram.iter().any(|&b| b != SCRATCH_MARKER));
         r.p.world().complete_all(CompleteOn::Caller);
         let counts = r.dec.caches().counts();
@@ -13727,9 +13967,9 @@ pub(super) mod tests {
         assert_eq!(filled.len(), 1);
         assert_eq!(filled[0].1, cache, "into the cache");
         assert_eq!(
-            buffer_bytes(&r, filled[0].0, None),
+            buffer_bytes(&r, filled[0].0, None)[..written.len()],
             written,
-            "the CPU's bytes, in the fill's staging buffer before the GPU copies it"
+            "the CPU's bytes, in the fill's staging piece before the GPU copies it"
         );
         r.p.world().complete_all(CompleteOn::Caller);
 
@@ -14015,10 +14255,11 @@ pub(super) mod tests {
         }
     }
 
-    /// The staged copies' spares keep a buffer given back for a take of its length, to their
-    /// cap: one given past it is let go of, and a take of another length finds none
+    /// The staged copies' spares give a take the shortest piece kept that holds it, to their
+    /// cap: a piece given past it is let go of, and a take longer than every piece kept finds
+    /// none
     #[test]
-    fn the_staged_copies_spares_keep_buffers_to_their_cap() {
+    fn the_staged_copies_spares_give_the_shortest_that_holds_a_take() {
         let r = rig(8);
         let page = r.page;
         let made = |length| {
@@ -14026,20 +14267,301 @@ pub(super) mod tests {
                 .unwrap()
                 .unwrap()
         };
-        let spares = Spares::<FakePlatform>::new(3 * page);
-        let (a, b) = (made(2 * page), made(2 * page));
-        let kept = id_of(&a);
-        spares.give(a);
-        spares.give(b);
-        assert!(spares.take(page).is_none(), "none of another length");
-        let taken = spares.take(2 * page).expect("the one kept");
-        assert_eq!(id_of(&taken), kept);
+        let spares = Spares::<FakePlatform>::new(5 * page, 4 * page);
+        let (long, short) = (made(3 * page), made(2 * page));
+        let (long_id, short_id) = (id_of(&long), id_of(&short));
+        spares.give(long);
+        spares.give(short);
+        spares.give(made(page));
+        assert!(spares.take(4 * page).is_none(), "none holds four pages");
+        let taken = spares.take(page).expect("the shortest that holds a page");
+        assert_eq!(id_of(&taken), short_id);
+        let next = spares.take(page).expect("the longer, the shorter taken");
+        assert_eq!(id_of(&next), long_id);
         assert!(
-            spares.take(2 * page).is_none(),
+            spares.take(page).is_none(),
             "the one given past the cap was let go of"
         );
         spares.give(taken);
         assert!(spares.take(2 * page).is_some(), "given back, kept again");
+    }
+
+    /// One place of [`pack`]'s.
+    fn place(bytes: Range<u64>, piece: usize, at: u64, of: usize) -> Place {
+        Place {
+            bytes,
+            piece,
+            at,
+            of,
+        }
+    }
+
+    /// A staged copy's ranges lie back to back in its pieces ([`pack`]): a range that crosses a
+    /// piece's end is split there, its rest at the next piece's first byte; every piece is whole
+    /// but the last, its bytes rounded up to rt's granule and no longer than a piece; an empty
+    /// range takes no place, and no range no piece
+    #[test]
+    fn a_staged_copys_ranges_lie_back_to_back_split_at_each_pieces_end() {
+        let g = PIECE_GRANULE;
+        let piece = 4 * g;
+        assert_eq!(
+            pack([100..300], piece),
+            Packed {
+                lens: vec![g],
+                places: vec![place(100..300, 0, 0, 0)],
+            },
+            "under a piece: one place, its piece the granule"
+        );
+        let packed = pack([0..g, 5 * g..5 * g, 8 * g..8 * g + 100, 10 * g..13 * g + 1], piece);
+        assert_eq!(
+            packed.places,
+            [
+                place(0..g, 0, 0, 0),
+                place(8 * g..8 * g + 100, 0, g, 2),
+                place(10 * g..13 * g - 100, 0, g + 100, 3),
+                place(13 * g - 100..13 * g + 1, 1, 0, 3),
+            ],
+            "the empty range takes no place; the last is split at the first piece's end"
+        );
+        assert_eq!(packed.lens, [piece, g], "the last piece its 101 bytes' granule");
+        assert_eq!(
+            pack([0..2 * piece], piece).lens,
+            [piece, piece],
+            "a range of two pieces ends at the second's end, with no third"
+        );
+        assert_eq!(
+            pack([0..g + 5], g + 10).lens,
+            [g + 10],
+            "rounded up to the granule, cut to the piece"
+        );
+        assert_eq!(pack([3..3], piece), pack([], piece));
+        assert!(pack([], piece).lens.is_empty());
+    }
+
+    /// The bytes of spans a staged copy out moves into its pages lie where [`pack`] laid the
+    /// bytes that hold them ([`placed`]): each span cut at the places it crosses, each part at
+    /// its place's piece, from its place's offset there on
+    #[test]
+    fn a_staged_copy_outs_spans_lie_where_their_bytes_were_packed() {
+        let places = pack([0..100, 200..400], 150).places;
+        assert_eq!(
+            places,
+            [
+                place(0..100, 0, 0, 0),
+                place(200..250, 0, 100, 1),
+                place(250..400, 1, 0, 1),
+            ]
+        );
+        assert_eq!(
+            placed(&[50..60, 90..230, 300..310], &places),
+            [
+                place(50..60, 0, 50, 0),
+                place(90..100, 0, 90, 1),
+                place(200..230, 0, 100, 1),
+                place(300..310, 1, 50, 2),
+            ]
+        );
+        assert!(placed(&[100..200], &places).is_empty(), "between the places");
+    }
+
+    /// The rig's RAM from page `first`, its `length` bytes written with a pattern of period 251,
+    /// which no shift by whole pages keeps, so a byte moved to another's place shows.
+    fn ram_pattern(r: &Rig, first: u64, length: u64) -> Vec<u8> {
+        let at = r
+            .ram
+            .host_addr(RAM + first * r.page)
+            .unwrap()
+            .as_ptr::<u8>();
+        // SAFETY: the rig's RAM, `length` bytes from page `first` in it, which no work uses now.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(at, length.to_usize()) };
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        bytes.to_vec()
+    }
+
+    /// Where the caches' copies are staged, a copy longer than a piece lays its bytes in pieces
+    /// of a piece's length at most ([`pack`]), none of the surface's: a fill's CPU copy writes
+    /// each piece's share of the pages, and its GPU copy moves each piece into its own bytes of
+    /// the cache; a download moves each piece's share back into its own bytes of the pages. The
+    /// spares keep two pieces of the fill's three for the download, which makes the third; each
+    /// piece is counted, and each make, the fill's as the cache's first staged copy's
+    #[test]
+    fn a_staged_copy_longer_than_a_piece_lays_its_bytes_in_pieces() {
+        let mut r = rig(8);
+        r.dec.set_staged_surface_copies();
+        let page = r.page;
+        let piece = 2 * page;
+        r.dec.caches().set_staging_piece(piece);
+        queues(&mut r);
+        let length = 5 * page;
+        let written = ram_pattern(&r, 1, length);
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 5)], length, true),
+            RGFX_STATUS_OK
+        );
+        let cache = cache_id(&r);
+        let codes = [
+            PIECES_TAKEN,
+            PIECES_SPARED,
+            PIECE_MAKES[0].0,
+            PIECE_MAKES[1].0,
+        ];
+        let before = codes.map(counted);
+
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        let calls = r.p.call_log().since(mark);
+        let made: Vec<_> = (calls.iter())
+            .filter(|c| c.sel == SCRATCH_BUFFER)
+            .map(|c| c.args[0].as_u64())
+            .collect();
+        let last = page.next_multiple_of(PIECE_GRANULE).min(piece);
+        assert_eq!(
+            made,
+            [Some(piece), Some(piece), Some(last)],
+            "pieces, none of the surface's length"
+        );
+        let filled = copies_at(&calls);
+        assert_eq!(
+            (filled.iter())
+                .map(|&(_, from, into, at, size)| (from, into, at, size))
+                .collect::<Vec<_>>(),
+            [
+                (0, cache, 0, piece),
+                (0, cache, piece, piece),
+                (0, cache, 2 * piece, page)
+            ],
+            "each piece into its own bytes of the cache"
+        );
+        let staging: Vec<u64> = filled.iter().map(|c| c.0).collect();
+        for (k, &id) in staging.iter().enumerate() {
+            let from = (k as u64 * piece).to_usize();
+            let share = &written[from..((k as u64 + 1) * piece).min(length).to_usize()];
+            assert_eq!(
+                buffer_bytes(&r, id, None)[..share.len()],
+                *share,
+                "piece {k}: the CPU's bytes of its share of the pages"
+            );
+        }
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        let calls = r.p.call_log().since(mark);
+        let out = copies_at(&calls);
+        assert_eq!(
+            (out.iter())
+                .map(|&(from, at, _, into, size)| (from, at, into, size))
+                .collect::<Vec<_>>(),
+            [
+                (cache, 0, 0, piece),
+                (cache, piece, 0, piece),
+                (cache, 2 * piece, 0, page)
+            ],
+            "each of the cache's shares into its own piece"
+        );
+        assert_eq!(
+            (calls.iter()).filter(|c| c.sel == SCRATCH_BUFFER).count(),
+            1,
+            "two spares of the fill's, and one made"
+        );
+        for (k, &(_, _, id, ..)) in out.iter().enumerate() {
+            buffer_bytes(&r, id, Some(0xa0 + k as u8));
+        }
+        complete_staged(&r);
+        assert!(done.load(Ordering::SeqCst));
+        let pages = ram_bytes(&r, 1, length, None);
+        for (at, &b) in pages.iter().enumerate() {
+            let k = (at as u64 / piece) as u8;
+            assert_eq!(b, 0xa0 + k, "byte {at:#x}: piece {k}'s");
+        }
+        let after = codes.map(counted);
+        assert_eq!(
+            [0, 1, 2, 3].map(|i| after[i] - before[i]),
+            [6, 2, 3, 1],
+            "six pieces taken, two of them spares; three made for the first copy, one after"
+        );
+    }
+
+    /// Where the caches' copies are staged, a download of a cache laid out at the GPU's pitch
+    /// whose rows cross its pieces' ends moves each part of a row its piece holds into that
+    /// row's own bytes of the pages: each row's texels, cut at the pieces' ends, land in the
+    /// pages from the piece that holds them, and no padding between the rows nor byte past the
+    /// last moves
+    #[test]
+    fn a_staged_download_whose_rows_cross_its_pieces_ends_lands_each_in_its_place() {
+        use super::super::surface_pages::tests::one_plane;
+        let mut r = rig(16);
+        r.dec.set_staged_surface_copies();
+        r.dec.caches().set_staging_piece(1024);
+        r.p.world().lay_linear_rows(Some(256));
+        queues(&mut r);
+        let page = r.page;
+        // Three rows 800 apart of 704 texel bytes, which the GPU lays 768 apart; pieces of 1 KiB.
+        let (pitch, texels, rows) = (800u64, 704u64, 3u64);
+        assert_eq!(
+            r.pages_laid_out(
+                BLOCK,
+                0,
+                &[(1, 1)],
+                page,
+                RGFX_SURFACE_PAGES_CACHED,
+                Some(one_plane(pitch, texels, rows))
+            ),
+            RGFX_STATUS_OK
+        );
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let before = ram_bytes(&r, 1, page, Some(0x5a));
+
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        let out = copies_at(&r.p.call_log().since(mark));
+        let mut pieces: Vec<u64> = Vec::new();
+        for &(_, _, id, ..) in &out {
+            if !pieces.contains(&id) {
+                pieces.push(id);
+            }
+        }
+        assert_eq!(pieces.len(), 3, "the rows lie in the first three pieces: {out:?}");
+        let piece = |id| pieces.iter().position(|&p| p == id).unwrap();
+        assert_eq!(
+            (out.iter())
+                .map(|&(_, from, id, at, size)| (piece(id), from, at, size))
+                .collect::<Vec<_>>(),
+            [
+                (0, 0, 0, 704),
+                (0, 768, 800, 224),
+                (1, 992, 0, 480),
+                (1, 1536, 576, 448),
+                (2, 1984, 0, 256),
+            ],
+            "each row from the GPU's pitch to its bytes of the piece that holds them"
+        );
+        for &id in &pieces {
+            buffer_bytes(&r, id, Some(0xee));
+        }
+        for &(_, _, id, at, size) in &out {
+            fill_buffer(&r, id, at..at + size, 0xc0 + piece(id) as u8);
+        }
+        complete_staged(&r);
+        assert!(done.load(Ordering::SeqCst));
+        let after = ram_bytes(&r, 1, page, None);
+        for (at, (&now, &was)) in after.iter().zip(&before).enumerate() {
+            let at = at as u64;
+            match at / pitch < rows && at % pitch < texels {
+                true => assert_eq!(
+                    now,
+                    0xc0 + (at / 1024) as u8,
+                    "byte {at:#x}, a texel: its piece's"
+                ),
+                false => assert_eq!(
+                    now, was,
+                    "byte {at:#x}, padding or past the rows: the CPU's"
+                ),
+            }
+        }
     }
 
     /// The platform's command queue.
