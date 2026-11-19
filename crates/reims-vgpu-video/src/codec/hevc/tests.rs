@@ -10,6 +10,7 @@ use super::bits::BitReader;
 use super::nal::nal_type;
 use super::slice::SliceHeader;
 use super::*;
+use crate::codec::PictureRole;
 
 /// Writes syntax elements, then raw bytes or an escaped NAL unit.
 #[derive(Default)]
@@ -644,6 +645,8 @@ struct Recorder {
     configured: Vec<(u32, u32, u8, usize)>,
     decoded: Vec<Decoded>,
     next: u32,
+    /// Each picture's role, as it was asked for.
+    roles: Vec<PictureRole>,
 }
 
 impl Accelerator for Recorder {
@@ -660,7 +663,8 @@ impl Accelerator for Recorder {
         Ok(())
     }
 
-    fn new_picture(&mut self) -> Result<u32, Error> {
+    fn new_picture(&mut self, role: PictureRole) -> Result<u32, Error> {
+        self.roles.push(role);
         self.next += 1;
         Ok(self.next)
     }
@@ -764,6 +768,31 @@ fn gop_stream(order: OutputOrder) -> Result<(Decoder<Recorder>, Vec<i32>), Error
     decoder.set_output_order(order);
     let out = run(&mut decoder, &samples)?;
     Ok((decoder, out))
+}
+
+#[test]
+fn each_picture_is_asked_for_as_a_reference_or_not_as_its_unit_type_and_sub_layer_say()
+-> Result<(), Error> {
+    // IDR0, TRAIL_R 4, TRAIL_R 2, then TRAIL_N 1 and 3, in a stream of one sub-layer.
+    let (decoder, _) = gop_stream(OutputOrder::Decode)?;
+    use PictureRole::{NonReference, Reference};
+    assert_eq!(
+        decoder.accelerator().roles,
+        [Reference, Reference, Reference, NonReference, NonReference]
+    );
+    // A sub-layer non-reference picture below the highest sub-layer may be predicted from by
+    // a picture of a higher one; any other kind may be predicted from on its own sub-layer.
+    let role_of = super::decoder::role_of;
+    // TRAIL_N, TSA_N (2), RADL_N and RASL_N.
+    for unit_type in [nal_type::TRAIL_N, 2, nal_type::RADL_N, nal_type::RASL_N] {
+        assert_eq!(role_of(unit_type, 0, 0), NonReference);
+        assert_eq!(role_of(unit_type, 2, 2), NonReference);
+        assert_eq!(role_of(unit_type, 1, 2), Reference);
+    }
+    for unit_type in [nal_type::TRAIL_R, nal_type::CRA_NUT, nal_type::IDR_W_RADL, nal_type::BLA_N_LP] {
+        assert_eq!(role_of(unit_type, 0, 0), Reference);
+    }
+    Ok(())
 }
 
 #[test]

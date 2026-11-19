@@ -15,6 +15,7 @@ use super::pps::Pps;
 use super::scaling::ScalingLists;
 use super::slice::{SliceHeader, SliceType};
 use super::sps::Sps;
+use crate::codec::PictureRole;
 
 /// The order frames come out in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,8 +106,11 @@ pub trait Accelerator {
     /// what the frames need.
     fn configure(&mut self, sps: &Sps, dpb_frames: usize) -> Result<(), Self::Error>;
 
-    /// Storage for a new picture.
-    fn new_picture(&mut self) -> Result<Self::Picture, Self::Error>;
+    /// Storage for a new picture, which a later picture may predict from
+    /// as `role` says: a reference picture where its `nal_ref_idc` is not
+    /// 0 (fields, which alone could pair a reference with a non-reference
+    /// picture, are refused at their SPS).
+    fn new_picture(&mut self, role: PictureRole) -> Result<Self::Picture, Self::Error>;
 
     /// Decodes one picture from all its slices into `picture`.
     fn decode_picture(
@@ -469,7 +473,12 @@ impl<A: Accelerator> Decoder<A> {
             lists.push(pair);
         }
 
-        let picture = self.accelerator.new_picture()?;
+        let role = if first.nal_ref_idc == 0 {
+            PictureRole::NonReference
+        } else {
+            PictureRole::Reference
+        };
+        let picture = self.accelerator.new_picture(role)?;
         {
             let entries = &self.dpb.entries;
             let reference = reference_frame::<A::Picture, Output<A::Picture>>;

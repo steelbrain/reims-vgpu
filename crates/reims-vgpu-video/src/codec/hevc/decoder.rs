@@ -20,6 +20,7 @@ use super::sps::Sps;
 use super::{Error, NalFormat, OutputOrder};
 use crate::codec::h264::ParameterSets;
 use crate::codec::h264::nal::sample_units;
+use crate::codec::PictureRole;
 
 pub use super::dpb::RpsMembership;
 
@@ -113,8 +114,10 @@ pub trait Accelerator {
     /// sequence's SPS changes what the pictures need.
     fn configure(&mut self, sps: &Sps, dpb_size: usize) -> Result<(), Self::Error>;
 
-    /// Storage for a new picture.
-    fn new_picture(&mut self) -> Result<Self::Picture, Self::Error>;
+    /// Storage for a new picture, which a later picture may predict from
+    /// as `role` says: all but a sub-layer non-reference picture of the
+    /// SPS's highest sub-layer may be a reference.
+    fn new_picture(&mut self, role: PictureRole) -> Result<Self::Picture, Self::Error>;
 
     /// Decodes one picture from all its slice segments into `picture`.
     fn decode_picture(
@@ -501,7 +504,8 @@ impl<A: Accelerator> Decoder<A> {
 
         // The pictures the accelerator sees, and each slice's lists
         // (8.3.4) as indices into them.
-        let picture = self.accelerator.new_picture()?;
+        let role = role_of(unit_type, first.temporal_id, sps.sps_max_sub_layers_minus1);
+        let picture = self.accelerator.new_picture(role)?;
         {
             let references: Vec<&Entry<_, _>> = self
                 .dpb
@@ -648,6 +652,18 @@ impl<A: Accelerator> Decoder<A> {
             self.damaged = false;
         }
         Ok(())
+    }
+}
+
+/// The role of a picture of NAL unit type `unit_type` and `TemporalId` `temporal_id`, in a stream
+/// whose SPS has `max_sub_layers_minus1`: no later picture predicts from a sub-layer
+/// non-reference picture (7.4.2.2) of the highest sub-layer, since only pictures of higher
+/// sub-layers may predict from one; any other picture may be a reference.
+pub(crate) fn role_of(unit_type: u8, temporal_id: u8, max_sub_layers_minus1: u8) -> PictureRole {
+    if is_sub_layer_non_reference(unit_type) && temporal_id == max_sub_layers_minus1 {
+        PictureRole::NonReference
+    } else {
+        PictureRole::Reference
     }
 }
 

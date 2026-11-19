@@ -84,6 +84,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
+use reims_vgpu_video::codec::PictureRole;
 use reims_vgpu_video::codec::h264::nal::AnnexB;
 use reims_vgpu_video::codec::hevc::nal::{self, NalUnit, is_idr, nal_type};
 use reims_vgpu_video::codec::hevc::pps::Pps;
@@ -975,7 +976,7 @@ impl Accelerator for Recorder {
         Ok(())
     }
 
-    fn new_picture(&mut self) -> Result<usize, hevc::Error> {
+    fn new_picture(&mut self, _role: PictureRole) -> Result<usize, hevc::Error> {
         self.next += 1;
         Ok(self.next)
     }

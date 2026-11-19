@@ -278,6 +278,87 @@ fn the_gpu_copy_takes_the_crop_the_cpu_copy_writes() {
     );
 }
 
+/// Where references are kept apart (the rt platform's rules) a reference picture is given no
+/// cache to be decoded into, and a picture no later one predicts from is; where they are not (the
+/// Vulkan platform's), every picture is. A session counts each picture by its role, and the
+/// references it kept apart, in the line it logs at its end, and logs none where it asked a cache
+/// for no picture.
+#[test]
+fn references_are_kept_apart_from_their_caches_where_the_rules_say_and_counted() {
+    use PictureRole::{NonReference, Reference};
+
+    let apart = RoleCounts::default();
+    assert_eq!(apart.line(), None);
+    assert!(!apart.count(Reference, CachedReferences::Apart));
+    assert!(apart.count(NonReference, CachedReferences::Apart));
+    assert!(!apart.count(Reference, CachedReferences::Apart));
+    let line = apart.line().expect("a line");
+    assert!(
+        line.ends_with(
+            "2 references (2 kept apart, decoded in the decoder's own surfaces), 1 non-references"
+        ),
+        "{line}"
+    );
+
+    let in_caches = RoleCounts::default();
+    assert!(in_caches.count(Reference, CachedReferences::InCaches));
+    assert!(in_caches.count(NonReference, CachedReferences::InCaches));
+    let line = in_caches.line().expect("a line");
+    assert!(
+        line.ends_with(
+            "1 references (0 kept apart, decoded in the decoder's own surfaces), 1 non-references"
+        ),
+        "{line}"
+    );
+}
+
+/// On the rt platform the VA-API arm answers what the driver decodes and no encoder (the platform
+/// releases no encoder's sources to the driver yet), and decodes into the device's caches where
+/// the driver's check passed a codec: rt's exported blocks, as dma-bufs, take the pictures no
+/// later one predicts from.
+#[cfg(feature = "rt")]
+#[test]
+#[ignore = "needs a VA-API GPU: run on the VA-API host"]
+fn the_rt_platforms_va_api_arm_decodes_alone() {
+    use reims_vgpu_vulkan::RtPlatform;
+    let platform = Arc::new(RtPlatform::new());
+    crate::entry::run(|_| {
+        let device = platform.system_default_device().expect("an rt device");
+        let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
+        let video = open_on_rt(&device, runtime).expect("VA-API on the rt device's GPU");
+        let caps = video.caps();
+        assert!(!caps.is_empty());
+        assert!(
+            caps.iter().all(|c| c.direction == RGFX_VIDEO_DECODE),
+            "{caps:?}"
+        );
+        assert!(video.guest_encoders().is_empty());
+        assert!(video.guest_decodes());
+        assert!(video.lands_in_device_caches());
+        let gpu = device.host_gpu();
+        let node = reims_vgpu_vulkan::host_gpus::render_node_at(gpu.render, gpu.pci);
+        let display = Display::open(
+            &node.expect("a render node"),
+            crate::video::runtime::PlatformRuntime::of(&platform),
+        )
+        .expect("a VA display");
+        let checks = TargetChecks::of(&display, None);
+        let passed = [
+            (TargetCodec::H264, TargetFormat::Nv12),
+            (TargetCodec::Hevc, TargetFormat::Nv12),
+            (TargetCodec::Hevc, TargetFormat::P010),
+        ]
+        .into_iter()
+        .any(|(codec, format)| checks.passed(codec, format).is_ok());
+        assert_eq!(
+            video.decodes_into_device_caches(),
+            passed,
+            "{}",
+            checks.summary()
+        );
+    });
+}
+
 /// The conformance suite's streams, through the arm's decoders, each picture landed by the GPU's
 /// copy into planes laid out as CoreVideo lays a frame's (32 bytes into their pages), and by the
 /// CPU's copy into the same layout: every byte of the two must be equal, the bytes before, between
@@ -611,7 +692,7 @@ fn cache_target(
         Arc::clone(reader),
         display.clone_ref(),
     );
-    Box::new(move |shape: TargetShape| {
+    Box::new(move |shape: TargetShape, _role| {
         let (width, height) = shape.coded;
         let sample = shape.format.bytes_per_sample();
         let row = u64::from(width) * sample;

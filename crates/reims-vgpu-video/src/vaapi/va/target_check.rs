@@ -374,8 +374,9 @@ impl Decoder {
     /// Decodes `unit` into `target`, and answers its one frame, decoded, which must be in it.
     fn decode(&mut self, unit: &[u8], id: u64, target: Target) -> Result<Frame, String> {
         let shape = target.shape();
+        // Every picture, a reference too: the check is of how the driver reads references.
         let target_for: super::target::TargetFor =
-            Box::new(move |asked| (asked == shape).then_some(target));
+            Box::new(move |asked, _role| (asked == shape).then_some(target));
         let decoded = match self {
             Decoder::H264(decoder) => decoder.decode_into(unit, id, Some(target_for)),
             Decoder::Hevc(decoder) => decoder.decode_into(unit, id, Some(target_for)),

@@ -58,6 +58,18 @@ pub mod h264;
 pub mod hevc;
 mod num;
 
+/// Whether a later picture of its stream may predict from a picture, as its first slice says:
+/// what each codec's decoder tells its accelerator as it asks for the picture's storage
+/// (`h264::Accelerator::new_picture`, `hevc::Accelerator::new_picture`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PictureRole {
+    /// A later picture may predict from it.
+    Reference,
+    /// No later picture predicts from it: H.264's `nal_ref_idc` 0; HEVC's sub-layer
+    /// non-reference picture of the highest sub-layer the SPS has.
+    NonReference,
+}
+
 /// The fuzzers' harness: each codec's tests have a `fuzz` module of their
 /// own.
 #[cfg(test)]

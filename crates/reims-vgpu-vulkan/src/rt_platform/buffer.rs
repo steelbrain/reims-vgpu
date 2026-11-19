@@ -995,6 +995,13 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
         exported.export(rt::ExportHandle::OpaqueFd, self.rt.length())
     }
 
+    /// A dma-buf buffer's memory as a new dma-buf (`super::export`); `Err` for any other.
+    #[cfg(unix)]
+    fn export_dma_buf(&self) -> Result<ExportedMemory, String> {
+        let exported = (self.exported.as_ref()).ok_or("the buffer was not made exportable")?;
+        exported.export(rt::ExportHandle::DmaBuf, self.rt.length())
+    }
+
     /// rt's acquire of what another API wrote into an exportable buffer's block
     /// (`super::export`, "The acquire"); `Err` for any other buffer, which no other API writes.
     #[cfg(unix)]

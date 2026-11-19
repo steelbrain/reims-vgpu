@@ -7,6 +7,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
+use crate::codec::PictureRole;
 use crate::codec::fuzz_support::{Rng, Target, long, maybe_mutate, mutate_rounds, quick};
 
 const STREAMS: Target = Target::new("h264-streams");
@@ -84,7 +85,7 @@ impl Accelerator for Checking {
         }
     }
 
-    fn new_picture(&mut self) -> Result<u32, Error> {
+    fn new_picture(&mut self, _role: PictureRole) -> Result<u32, Error> {
         if self.fails() {
             return Err(Error::Unsupported("the stand-in's picture failure"));
         }
@@ -442,7 +443,7 @@ impl Accelerator for RefusingHigh {
         Ok(())
     }
 
-    fn new_picture(&mut self) -> Result<u32, Error> {
+    fn new_picture(&mut self, _role: PictureRole) -> Result<u32, Error> {
         if self.configured {
             Ok(0)
         } else {

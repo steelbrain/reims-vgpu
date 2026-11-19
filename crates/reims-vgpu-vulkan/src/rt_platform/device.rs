@@ -644,6 +644,25 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         Ok(made)
     }
 
+    /// A buffer of zeros of its own exported block, whose memory VA-API imports as a dma-buf
+    /// (`super::export`), its byte `aligned_byte`, where given, on a multiple of 256 bytes of the
+    /// memory; `None` where rt makes none, counted, and the caller makes the buffer as any other.
+    /// The bytes between a texture's rows are no matter: rt makes no texture over a buffer.
+    #[cfg(unix)]
+    fn new_dma_buf_buffer_of_length_padding_unobserved(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+        aligned_byte: Option<u64>,
+    ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+        let _ = on;
+        let sel = "newBufferWithLength:options: (dma-buf)";
+        let handle = rt::ExportHandle::DmaBuf;
+        let made = super::export::exportable(self, sel, handle, length, options, aligned_byte);
+        Ok(made)
+    }
+
     /// rt's queue, of Metal's default `maxCommandBufferCount`; nil where rt refuses it.
     fn new_command_queue(&self) -> Option<RtObj<RtQueue>> {
         match self.rt.new_command_queue(METAL_MAX_COMMAND_BUFFER_COUNT) {

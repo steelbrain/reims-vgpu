@@ -51,6 +51,7 @@
 
 use std::sync::Arc;
 
+use reims_vgpu_video::codec::PictureRole;
 use reims_vgpu_video::codec::h264::nal::{AnnexB, NalUnit, access_units, nal_type};
 use reims_vgpu_video::codec::h264::pps::Pps;
 use reims_vgpu_video::codec::h264::sps::Sps;
@@ -770,7 +771,7 @@ impl Accelerator for Recorder {
         Ok(())
     }
 
-    fn new_picture(&mut self) -> Result<usize, h264::Error> {
+    fn new_picture(&mut self, _role: PictureRole) -> Result<usize, h264::Error> {
         self.next += 1;
         Ok(self.next)
     }
@@ -811,7 +812,7 @@ impl Accelerator for Recorder {
 
     fn conceal(&mut self, from: &usize) -> Result<Option<usize>, h264::Error> {
         self.concealed.borrow_mut().push(*from);
-        self.new_picture().map(Some)
+        self.new_picture(PictureRole::Reference).map(Some)
     }
 }
 

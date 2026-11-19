@@ -6,10 +6,13 @@
 //! 1. NVDEC, where the device is an NVIDIA GPU that CUDA opens (Linux: `super::nvidia`).
 //! 2. VA-API, on the device's render node, whatever its vendor (Linux: `super::vaapi`), or on
 //!    Windows on its DXGI adapter, over Mesa's VA-on-D3D12 driver (`super::vaapi`). The rt
-//!    platform has no VA-API arm yet.
+//!    platform's is Linux's alone (`super::vaapi::open_on_rt`).
 //!
-//! On the rt platform NVDEC decodes alone: NVENC reads a buffer the GPU copied a frame into,
-//! which rt's platform does not release to CUDA yet (`super::nvidia::open`'s `encodes`).
+//! On the rt platform the arms decode alone: NVENC reads a buffer the GPU copied a frame into,
+//! and VA-API's encoders a surface likewise, which rt's platform does not release to them yet
+//! (`super::nvidia::open`'s `encodes`, `super::vaapi::PlatformRules`). VA-API decodes a reference
+//! picture into a surface of its own there, not into its output's cache
+//! (`super::vaapi::CachedReferences`).
 
 use std::sync::Arc;
 
@@ -68,6 +71,10 @@ pub(crate) fn rt_graphics_video(
         &runtime,
         false,
     ) {
+        return Some(video);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(video) = super::vaapi::open_on_rt(device, Arc::clone(&runtime)) {
         return Some(video);
     }
     let _ = (device, runtime);

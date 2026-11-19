@@ -10,6 +10,7 @@ use super::frame::Frame;
 use super::surface::{Rect, Surface, SurfaceFormat, SurfacePool, end_context};
 use super::target::TargetFor;
 use super::wait::{self, Deadline};
+use crate::codec::PictureRole;
 use crate::codec::h264::{
     self, Accelerator, Decoder, NalFormat, Output, OutputOrder, PictureParams, ReferenceFrame,
     SliceParams, slice::SliceType, sps::Sps,
@@ -287,13 +288,13 @@ impl Accelerator for VaH264 {
         Ok(())
     }
 
-    /// The decode's target where it was handed one of the picture's shape, else a surface of the
-    /// pool.
-    fn new_picture(&mut self) -> Result<Surface, Error> {
+    /// The decode's target where it was handed one of the picture's shape for a picture of
+    /// `role`, else a surface of the pool.
+    fn new_picture(&mut self, role: PictureRole) -> Result<Surface, Error> {
         let target_for = self.target_for.take();
         let pool = &self.session()?.pool;
         let lent = target_for
-            .and_then(|target_for| target_for(pool.shape()))
+            .and_then(|target_for| target_for(pool.shape(), role))
             .and_then(|target| pool.lend_target(target));
         match lent {
             Some(surface) => Ok(surface),

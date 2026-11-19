@@ -40,6 +40,7 @@ use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};
 use std::sync::Arc;
 
 use super::display::{Display, Error, check};
+use crate::codec::PictureRole;
 use super::ffi;
 use super::surface::SurfaceFormat;
 
@@ -98,10 +99,13 @@ pub struct TargetShape {
 }
 
 /// A target for a decode's picture, made as the picture's storage is: asked once, with the
-/// picture's shape, as the decoder makes the decode's picture; `None` where the caller has none
-/// for it, and the picture is decoded into a surface of the decoder's own. A target of another
-/// shape is not used, as if `None` were answered.
-pub type TargetFor = Box<dyn FnOnce(TargetShape) -> Option<Target> + Send>;
+/// picture's shape and whether a later picture may predict from it (its [`PictureRole`]), as the
+/// decoder makes the decode's picture; `None` where the caller has none for it, and the picture
+/// is decoded into a surface of the decoder's own. A target of another shape is not used, as if
+/// `None` were answered. A caller that keeps every picture it may read again apart from the
+/// driver answers `None` for a reference picture: the decoder then reads it as a reference from
+/// its own surface alone.
+pub type TargetFor = Box<dyn FnOnce(TargetShape, PictureRole) -> Option<Target> + Send>;
 
 /// The height a target of a picture `height` rows tall, its planes at `luma` and `chroma`, is
 /// imported as (module docs): the least even height, from the picture's, at which the planes as

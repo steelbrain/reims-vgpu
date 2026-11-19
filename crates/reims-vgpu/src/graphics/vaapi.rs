@@ -26,7 +26,13 @@
 //!   last (a reference's). The picture is then there once its decode is done and the platform
 //!   acquired what the driver wrote (`Buffer::external_write_done`, which the device's next
 //!   submission records before its commands), and nothing is copied. Each reason a session's
-//!   pictures are not, of a cache made so, is logged once.
+//!   pictures are not, of a cache made so, is logged once. Where the platform's exported memory
+//!   is not the driver's to read once it is acquired ([`CachedReferences::Apart`], the rt
+//!   platform's), only a picture no later picture predicts from is decoded into its cache: a
+//!   reference picture is decoded into a surface of the decoder's own, which the decoder reads it
+//!   from as a reference, and lands in its cache by the first way below. Each session counts the
+//!   pictures of each role it asked a cache for, and the references it kept apart, and logs them
+//!   at its end.
 //! - **Otherwise a picture lands** in the output's planes one of three ways, each the fallback at
 //!   the last's refusal, the session counting each:
 //!   1. **In the surface's pages or its device cache, by the driver's video processing** (the VA
@@ -72,6 +78,7 @@
 #[cfg(unix)]
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 
 use reims_vgpu_graphics::wire::{
@@ -80,6 +87,8 @@ use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps,
     RgfxVideoEncodeCaps, RgfxVideoOutputLayout,
 };
+#[cfg(unix)]
+use reims_vgpu_video::codec::PictureRole;
 use reims_vgpu_video::core::backend::{BackendError as VideoError, DeviceWrite};
 #[cfg(unix)]
 use reims_vgpu_video::core::device_memory::{
@@ -147,6 +156,46 @@ const H264_TOP_LEVEL: u32 = 62;
 const H264_WIDEST: u32 = 4096;
 const HEVC_TOP_LEVEL: u32 = 186;
 
+/// What the platform's device lets the VA-API arm do ([`open`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlatformRules {
+    /// Whether a picture a later one predicts from may be decoded into its device cache.
+    pub(crate) references: CachedReferences,
+    /// Whether the arm answers the driver's encoders: where the platform reads their sources for
+    /// them as the Vulkan platform does (`encode`'s module doc).
+    pub(crate) encodes: bool,
+}
+
+impl PlatformRules {
+    /// The Vulkan platform's: every picture may be decoded into its cache, and the driver's
+    /// encoders are answered.
+    pub(crate) const VULKAN: PlatformRules = PlatformRules {
+        references: CachedReferences::InCaches,
+        encodes: true,
+    };
+}
+
+/// Whether a reference picture is decoded into its output's device cache (module doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CachedReferences {
+    /// Every picture, a reference too: the platform's exported memory stays the driver's to read
+    /// after its acquire, and the driver's check keeps a driver that would read a reference from
+    /// its target from decoding into one at all (the VA crate's `TargetChecks`).
+    InCaches,
+    /// Only a picture no later picture predicts from: the platform's exported memory is not the
+    /// driver's to touch between its acquire and the driver's next write of a whole picture
+    /// (the rt platform's `rt_platform::export`, "The acquire").
+    #[cfg_attr(
+        not(all(feature = "rt", unix)),
+        allow(
+            dead_code,
+            reason = "the rt platform's arm alone keeps references apart ([`open_on_rt`]), and \
+                      the tests"
+        )
+    )]
+    Apart,
+}
+
 /// Where a VA display is opened ([`open`]): a render node, or on Windows a DXGI adapter by its
 /// LUID.
 pub(crate) enum DisplayAt<'a> {
@@ -208,8 +257,45 @@ pub(crate) fn open_on(
         runtime,
         Some(copies),
         checks,
+        PlatformRules::VULKAN,
     )
 }
+
+/// The VA-API video of the rt platform's `device`, on its GPU's render node
+/// (`host_gpus::render_node_at`), as [`open`] opens it; `None`, logged, where its GPU has none.
+/// Its pictures land by the driver's video processing or the CPU's copy, as no GPU copier is
+/// given; a reference picture is not decoded into its cache ([`CachedReferences::Apart`]), and no
+/// encoder is answered: the platform does not yet release an encoder's sources to the driver.
+#[cfg(all(feature = "rt", unix))]
+pub(crate) fn open_on_rt(
+    device: &RtDevice,
+    runtime: Arc<dyn Runtime>,
+) -> Option<Arc<dyn GraphicsVideo<reims_vgpu_vulkan::RtPlatform>>> {
+    let gpu = device.host_gpu();
+    let Some(node) = reims_vgpu_vulkan::host_gpus::render_node_at(gpu.render, gpu.pci) else {
+        log::info!("hardware video: no VA-API: the device's GPU has no render node");
+        return None;
+    };
+    let checks = reims_vgpu_vulkan::platform::cache_directory()
+        .map(|dir| dir.join("device-checks").join("va-targets"));
+    let rules = PlatformRules {
+        references: CachedReferences::Apart,
+        encodes: false,
+    };
+    open::<reims_vgpu_vulkan::RtPlatform>(
+        device,
+        device.facts().registry_id,
+        DisplayAt::Node(&node),
+        runtime,
+        None,
+        checks,
+        rules,
+    )
+}
+
+/// The rt platform's device.
+#[cfg(all(feature = "rt", unix))]
+type RtDevice = reims_vgpu_vulkan::rt_platform::RtObj<reims_vgpu_vulkan::rt_platform::RtDevice>;
 
 /// The VA-API video of the runtime device `device` on Windows: on the DXGI adapter of its GPU, by
 /// the LUID Vulkan answers for it (`host_gpus::adapter_luid_of`), over Mesa's VA-on-D3D12 driver;
@@ -233,14 +319,16 @@ pub(crate) fn open_on(
         runtime,
         Some(copies),
         None,
+        PlatformRules::VULKAN,
     )
 }
 
 /// The VA-API video of `device`'s GPU, on its render node `at` (on Windows its adapter), its decoders' threads and waits
 /// on `runtime`, its pictures copied by the GPU through `copies` where given, the driver's check
-/// of decodes into device caches kept in `checks` where given; one per device while it lives, by
-/// `registry_id`. `None`, logged at `info` with why, where libva does not load, the node opens no
-/// display, or the driver decodes neither H.264 nor HEVC.
+/// of decodes into device caches kept in `checks` where given, as the platform's `rules` let it;
+/// one per device while it lives, by `registry_id`. `None`, logged at `info` with why, where
+/// libva does not load, the node opens no display, or the driver decodes neither H.264 nor HEVC
+/// (and, where the rules let it, encodes neither).
 pub(crate) fn open<P: Platform>(
     device: &P::Device,
     registry_id: u64,
@@ -248,6 +336,7 @@ pub(crate) fn open<P: Platform>(
     runtime: Arc<dyn Runtime>,
     copies: Option<Arc<dyn GpuCopies<P>>>,
     checks: Option<PathBuf>,
+    rules: PlatformRules,
 ) -> Option<Arc<dyn GraphicsVideo<P>>> {
     type Made = Vec<(u64, Weak<dyn std::any::Any + Send + Sync>)>;
     static MADE: LazyLock<Mutex<Made>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -259,7 +348,8 @@ pub(crate) fn open<P: Platform>(
     if let Some(video) = kept {
         return Some(video);
     }
-    let video = match VaapiVideo::<P>::new(device, &at, runtime, copies, checks.as_deref()) {
+    let made = VaapiVideo::<P>::new(device, &at, runtime, copies, checks.as_deref(), rules);
+    let video = match made {
         Ok(video) => Arc::new(video),
         Err(why) => {
             log::info!("hardware video: no VA-API at {at}: {why}");
@@ -297,11 +387,20 @@ impl<P: Platform> VaapiVideo<P> {
         runtime: Arc<dyn Runtime>,
         copies: Option<Arc<dyn GpuCopies<P>>>,
         checks: Option<&Path>,
+        rules: PlatformRules,
     ) -> Result<Self, String> {
         let started = runtime.now();
         let display = at.open(Arc::clone(&runtime)).map_err(|e| e.to_string())?;
         let capabilities = display.capabilities().map_err(|e| e.to_string())?;
-        let encoders: Arc<[EncoderSupport]> = encoder_support(&display).into();
+        let encoders: Arc<[EncoderSupport]> = if rules.encodes {
+            encoder_support(&display).into()
+        } else {
+            log::info!(
+                "hardware video: {NAME} at {at}: no encoder answered: the platform reads no \
+                 encoder's sources for it"
+            );
+            Arc::new([])
+        };
         let mut caps = caps_of(&capabilities);
         caps.extend(encode::encode_caps_of(&encoders, &capabilities));
         if caps.is_empty() {
@@ -318,7 +417,8 @@ impl<P: Platform> VaapiVideo<P> {
             writes_imports.p010(),
         );
         let imports = Arc::new(GuestWrites::new(&display));
-        let targets = CacheTargets::new(device, &display, &runtime, checks).map(Arc::new);
+        let targets =
+            CacheTargets::new(device, &display, &runtime, checks, rules.references).map(Arc::new);
         Ok(Self {
             display,
             device: device.clone_ref(),
@@ -399,6 +499,7 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
             copier: self.copier(),
             said: Arc::new(Mutex::new(Vec::new())),
             targets: self.targets.clone(),
+            roles: Arc::new(RoleCounts::default()),
         };
         let session = HostVideoSession::new(&self.device, codec, NAME, Box::new(decoder))?;
         Some(Arc::new(session))
@@ -593,6 +694,8 @@ struct CacheTargets<P: Platform> {
     display: Display,
     checks: TargetChecks,
     memories: DeviceImports<CacheMemory<P>>,
+    /// Whether a reference picture is decoded into its cache.
+    references: CachedReferences,
 }
 
 /// A device cache's memory, exported as a dma-buf, and the last target imported over it.
@@ -618,6 +721,7 @@ impl<P: Platform> CacheTargets<P> {
         display: &Display,
         runtime: &Arc<dyn Runtime>,
         checks: Option<&Path>,
+        references: CachedReferences,
     ) -> Option<Self> {
         let declined = |why: &str| {
             log::info!("hardware video: {NAME}: no picture is decoded into a device cache: {why}");
@@ -649,27 +753,34 @@ impl<P: Platform> CacheTargets<P> {
         if !passed {
             return declined(&format!("the driver's check: {}", checks.summary()));
         }
+        let which = match references {
+            CachedReferences::InCaches => "pictures are",
+            CachedReferences::Apart => "pictures no later picture predicts from are",
+        };
         log::info!(
-            "hardware video: {NAME}: pictures are decoded into device caches where the driver's \
-             check passed: {}",
+            "hardware video: {NAME}: {which} decoded into device caches where the driver's check \
+             passed: {}",
             checks.summary()
         );
         Some(Self {
             display: display.clone_ref(),
             checks,
             memories: DeviceImports::new(runtime, "VA-API's device caches", MOST_CACHES),
+            references,
         })
     }
 
     /// What gives a decode of `codec` into `output` its picture's target: `None` where the
     /// output's planes do not both lie in one device cache made for the host's video
-    /// ([`OutputPlane::cache`]). Each reason a picture's target is not
-    /// given then is logged once a session, in `said`.
+    /// ([`OutputPlane::cache`]), and for a reference picture where references are kept apart
+    /// (module doc). Each reason a picture's target is not given then is logged once a session,
+    /// in `said`, and the picture's role is counted in `roles`.
     fn target_for(
         self: &Arc<Self>,
         codec: TargetCodec,
         output: &DecodeOutput<P>,
         said: &Arc<Mutex<Vec<String>>>,
+        roles: &Arc<RoleCounts>,
     ) -> Option<TargetFor> {
         let (luma, chroma) = (&output.luma, &output.chroma);
         let (Some(cache), Some(other)) = (&luma.cache, &chroma.cache) else {
@@ -686,13 +797,17 @@ impl<P: Platform> CacheTargets<P> {
             (Room::of(luma), luma.offset, luma.rows_held),
             (Room::of(chroma), chroma.offset, chroma.rows_held),
         ];
-        let (targets, cache, buffer, said) = (
+        let (targets, cache, buffer, said, roles) = (
             Arc::clone(self),
             cache.clone(),
             luma.buffer.clone_ref(),
             Arc::clone(said),
+            Arc::clone(roles),
         );
-        Some(Box::new(move |shape| {
+        Some(Box::new(move |shape, role| {
+            if !roles.count(role, targets.references) {
+                return None;
+            }
             let made = targets.target(codec, shape, &cache, &buffer, planes);
             made.map_err(|why| say(&said, why)).ok()
         }))
@@ -864,6 +979,7 @@ impl<P: Platform> CacheTargets<P> {
         _display: &Display,
         _runtime: &Arc<dyn Runtime>,
         _checks: Option<&Path>,
+        _references: CachedReferences,
     ) -> Option<Self> {
         log::info!(
             "hardware video: {NAME}: no picture is decoded into a device cache: this host makes \
@@ -877,8 +993,50 @@ impl<P: Platform> CacheTargets<P> {
         _codec: TargetCodec,
         _output: &DecodeOutput<P>,
         _said: &Arc<Mutex<Vec<String>>>,
+        _roles: &Arc<RoleCounts>,
     ) -> Option<TargetFor> {
         match self.never {}
+    }
+}
+
+/// A decode session's counts of the pictures it asked a device cache for, by role, and of the
+/// references it kept apart from their caches (module doc), logged at its end where it asked any.
+#[derive(Debug, Default)]
+struct RoleCounts {
+    references: AtomicU64,
+    non_references: AtomicU64,
+    kept_apart: AtomicU64,
+}
+
+impl RoleCounts {
+    /// Counts a picture of `role` asked a cache for; whether it may be decoded into its cache,
+    /// as `references` says of a reference picture.
+    #[cfg(unix)]
+    fn count(&self, role: PictureRole, references: CachedReferences) -> bool {
+        let (counter, taken) = match (role, references) {
+            (PictureRole::NonReference, _) => (&self.non_references, true),
+            (PictureRole::Reference, CachedReferences::InCaches) => (&self.references, true),
+            (PictureRole::Reference, CachedReferences::Apart) => {
+                self.kept_apart.fetch_add(1, Ordering::Relaxed);
+                (&self.references, false)
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        taken
+    }
+
+    /// The line a session logs at its end, where it asked a cache for any picture.
+    fn line(&self) -> Option<String> {
+        let references = self.references.load(Ordering::Relaxed);
+        let non_references = self.non_references.load(Ordering::Relaxed);
+        let kept_apart = self.kept_apart.load(Ordering::Relaxed);
+        (references > 0 || non_references > 0).then(|| {
+            format!(
+                "hardware video: {NAME}: a session's pictures for device caches: {references} \
+                 references ({kept_apart} kept apart, decoded in the decoder's own surfaces), \
+                 {non_references} non-references"
+            )
+        })
     }
 }
 
@@ -915,6 +1073,16 @@ struct VaDecoder<P: Platform> {
     said: Arc<Mutex<Vec<String>>>,
     /// What decodes its pictures straight into their caches, where the video does.
     targets: Option<Arc<CacheTargets<P>>>,
+    /// The roles of the pictures it asked a cache for.
+    roles: Arc<RoleCounts>,
+}
+
+impl<P: Platform> Drop for VaDecoder<P> {
+    fn drop(&mut self) {
+        if let Some(line) = self.roles.line() {
+            log::info!("{line}");
+        }
+    }
 }
 
 impl<P: Platform> VaDecoder<P> {
@@ -952,7 +1120,7 @@ impl<P: Platform> HostDecoder<P> for VaDecoder<P> {
             Codec::Hevc(_) => TargetCodec::Hevc,
         };
         let target_for = (self.targets.as_ref())
-            .and_then(|targets| targets.target_for(codec, output, &self.said));
+            .and_then(|targets| targets.target_for(codec, output, &self.said, &self.roles));
         let mut frames = self.frames(au, target_for)?;
         let frame = match (frames.pop(), frames.len()) {
             (None, _) => return Ok(None),

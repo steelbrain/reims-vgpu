@@ -15,6 +15,7 @@
 use std::ffi::{c_int, c_ushort};
 use std::sync::Arc;
 
+use crate::codec::PictureRole;
 use crate::codec::hevc::nal::{is_idr, is_irap};
 use crate::codec::hevc::sps::Sps;
 use crate::codec::hevc::{Accelerator, PictureParams, SliceParams};
@@ -71,7 +72,7 @@ impl Accelerator for NvdecHevc {
         Ok(())
     }
 
-    fn new_picture(&mut self) -> Result<Picture, Error> {
+    fn new_picture(&mut self, _role: PictureRole) -> Result<Picture, Error> {
         self.decoder()?.picture()
     }
 

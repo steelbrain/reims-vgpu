@@ -1,7 +1,8 @@
 //! The render node of the GPU a runtime device runs on, which a host video API opens the GPU by:
 //! the reims-graphics device's VA-API arm (reims-vgpu's `graphics::vaapi`) opens the runtime
 //! device's. It is the node the device's `VK_EXT_physical_device_drm` names, else the one sysfs
-//! lists for the PCI address its `VK_EXT_pci_bus_info` names; none where neither does.
+//! lists for the PCI address its `VK_EXT_pci_bus_info` names; none where neither does. The rt
+//! platform's device answers the same two, which `render_node_at` takes.
 //! On Windows the GPU is opened by its DXGI adapter's LUID instead (`adapter_luid_of`, built for
 //! Windows alone): the one Vulkan answers for the physical device of the runtime device's UUID.
 
@@ -19,6 +20,19 @@ pub fn render_node_of(device: &rt::Device) -> Option<PathBuf> {
     (properties.drm_render)
         .and_then(|(major, minor)| node_of(major, minor))
         .or_else(|| pci_address.as_deref().and_then(node_at_pci))
+}
+
+/// The render node of the GPU whose render node's numbers (`VK_EXT_physical_device_drm`) and PCI
+/// address (`VK_EXT_pci_bus_info`) are `render` and `pci`, found as [`render_node_of`] finds a
+/// runtime device's: the rt platform's device answers them (`rt_platform::HostGpu`).
+#[cfg(target_os = "linux")]
+pub fn render_node_at(
+    render: Option<(u32, u32)>,
+    pci: Option<(u32, u32, u32, u32)>,
+) -> Option<PathBuf> {
+    render
+        .and_then(|(major, minor)| node_of(major.into(), minor.into()))
+        .or_else(|| pci.map(pci_address_of).as_deref().and_then(node_at_pci))
 }
 
 /// The LUID of the DXGI adapter `device`'s GPU is, as Vulkan answers it for the physical device

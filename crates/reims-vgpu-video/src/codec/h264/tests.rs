@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use super::*;
+use crate::codec::PictureRole;
 
 /// Writes syntax elements, then an escaped NAL unit.
 #[derive(Default)]
@@ -313,6 +314,8 @@ struct Recorder {
     conceals: bool,
     /// Each copy: the picture copied, and the copy.
     concealed: Vec<(u32, u32)>,
+    /// Each picture's role, as it was asked for.
+    roles: Vec<PictureRole>,
 }
 
 impl Accelerator for Recorder {
@@ -324,7 +327,8 @@ impl Accelerator for Recorder {
         Ok(())
     }
 
-    fn new_picture(&mut self) -> Result<u32, Error> {
+    fn new_picture(&mut self, role: PictureRole) -> Result<u32, Error> {
+        self.roles.push(role);
         self.next += 1;
         Ok(self.next - 1)
     }
@@ -355,7 +359,8 @@ impl Accelerator for Recorder {
         if !self.conceals {
             return Ok(None);
         }
-        let copy = self.new_picture()?;
+        let copy = self.next;
+        self.next += 1;
         self.concealed.push((*from, copy));
         Ok(Some(copy))
     }
@@ -441,6 +446,24 @@ fn b_frames_come_out_in_display_order_and_predict_from_both_sides() -> Result<()
     // B2, the third picture: list 0 is I0, list 1 is P6.
     assert_eq!(rec[2].picture, 2);
     assert_eq!(rec[2].lists, [vec![Some(0)], vec![Some(1)]]);
+    Ok(())
+}
+
+#[test]
+fn each_picture_is_asked_for_as_a_reference_or_not_as_its_nal_ref_idc_says() -> Result<(), Error> {
+    let spec = SpsSpec::default();
+    let mut d = decoder(OutputOrder::Display);
+    // I0 P6 B2 (a reference) B4 (none), then P8.
+    run(
+        &mut d,
+        &spec,
+        &[idr(), p(1, 6), b(2, 2, true), b(3, 4, false), p(3, 8)],
+    )?;
+    use PictureRole::{NonReference, Reference};
+    assert_eq!(
+        d.accelerator().roles,
+        [Reference, Reference, Reference, NonReference, Reference]
+    );
     Ok(())
 }
 

@@ -11,6 +11,7 @@
 use std::ffi::c_int;
 use std::sync::Arc;
 
+use crate::codec::PictureRole;
 use crate::codec::h264::{
     Accelerator, PictureParams, ReferenceFrame, SliceParams, slice::SliceType, sps::Sps,
 };
@@ -67,7 +68,7 @@ impl Accelerator for NvdecH264 {
         Ok(())
     }
 
-    fn new_picture(&mut self) -> Result<Picture, Error> {
+    fn new_picture(&mut self, _role: PictureRole) -> Result<Picture, Error> {
         self.decoder()?.picture()
     }
 

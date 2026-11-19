@@ -1,24 +1,32 @@
-//! The rt platform's buffers whose memory another API imports
-//! (`GpuDevice::new_exportable_buffer_of_length`): IOSurface device caches that the host's video
-//! writes its pictures into on its own GPU work, through CUDA's import ([`exportable`]).
+//! The rt platform's buffers whose memory another API imports: IOSurface device caches that the
+//! host's video writes its pictures into on its own GPU work ([`exportable`]), through CUDA's
+//! import of an opaque fd (`GpuDevice::new_exportable_buffer_of_length`, NVDEC's) or VA-API's of
+//! a dma-buf (`GpuDevice::new_dma_buf_buffer_of_length_padding_unobserved`).
 //!
 //! **One block a buffer.** Each is a buffer of its own exported block (rt's
-//! `Device::new_exported_block`): one dedicated allocation of Private memory, exported as an
-//! opaque fd, which CUDA imports with the allocation's size, as dedicated, and the buffer's place
-//! in it ([`ExportedMemory`]). Its bytes are zeros, as `newBufferWithLength:options:`'s are (rt's
-//! GPU fill ahead of the next command buffer). Where the caller names a byte of it to lie on a
-//! multiple of 256 bytes of its memory (`aligned_byte`), the buffer starts that far into the block
-//! that the byte does.
+//! `Device::new_exported_block`): one dedicated allocation of Private memory, exported as the
+//! kind of handle its make names, which the other API imports with the allocation's size, as
+//! dedicated, and the buffer's place in it ([`ExportedMemory`]). Its bytes are zeros, as
+//! `newBufferWithLength:options:`'s are (rt's GPU fill ahead of the next command buffer). Its
+//! memory is linear: VA-API imports it as `DRM_FORMAT_MOD_LINEAR`. Where the caller names a byte
+//! of it to lie on a multiple of 256 bytes of its memory (`aligned_byte`, which the IOSurface
+//! device caches name for their first plane), the buffer starts that far into the block that the
+//! byte does: VA-API imports a cache's planes with each plane's first byte and rows on such
+//! multiples, and CUDA maps its import from the allocation's first byte and finds the buffer at
+//! its place in the mapping (reims-vgpu-video's `ImportedBuffer::import`).
 //!
 //! **Each export a new fd.** rt gives one fd of the memory as it makes the block, which the
-//! buffer keeps; each `Buffer::export_memory` answers a duplicate of it (`dup`), the caller's
-//! own, as an import takes it.
+//! buffer keeps; each `Buffer::export_memory` (an opaque fd's) or `Buffer::export_dma_buf` (a
+//! dma-buf's) answers a duplicate of it (`dup`), the caller's own, as an import takes it.
 //!
 //! **The acquire.** `Buffer::external_write_done` is rt's `Block::external_writes_done`: the
 //! block's acquire from the other API's queue family, recorded in rt's upload ahead of every
 //! command buffer committed after it, which then reads what that API wrote. No release goes back
-//! to the other API: it reads nothing of the block but what it wrote itself (rt's contract,
-//! which NVDEC's landing meets: it writes each picture's rows whole).
+//! to the other API: it touches nothing of the block between the acquire and its next write of
+//! a whole picture (rt's contract). NVDEC's landing meets it, writing each picture's rows whole;
+//! so does VA-API's, which decodes into a cache only a picture no later picture predicts from,
+//! and writes every other one there by its video processing (reims-vgpu's `graphics::vaapi`), so
+//! that no decode reads a reference from the block.
 //!
 //! **Refusals.** Where rt makes no exported block (a device that exports no opaque fd, a dma-buf
 //! without the foreign queue family, a limit) or no buffer in it, the call answers `None` and the
@@ -238,5 +246,51 @@ mod tests {
         assert!(shared.expect("never a raise").is_none());
         assert_eq!(counted(EXPORT_REFUSED_CODE), refusals);
         assert_ne!(buffer.id(), unaligned.id());
+    }
+
+    /// Dma-buf buffers on the GPU the test holds, where its device exports a dma-buf: a Private
+    /// buffer of the asked length at a GPU address, as far into its block as puts its byte 32 on
+    /// a multiple of 256 bytes of the memory; each export a new dma-buf of the dedicated
+    /// allocation, none as an opaque fd; the acquire taken. With no byte named, the buffer lies
+    /// at its block's first byte. Options of other storage are declined uncounted. Where the
+    /// device exports no dma-buf, the refusal is counted and the make answers `None`.
+    #[test]
+    fn dma_buf_buffers_on_vulkan() {
+        use std::os::fd::AsRawFd as _;
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let length = 3840 * 2160 * 3 / 2 + 32;
+        let refusals = counted(EXPORT_REFUSED_CODE);
+        let made = device.new_dma_buf_buffer_of_length_padding_unobserved(on, length, 0x20, Some(32));
+        let Some(buffer) = made.expect("never a raise") else {
+            assert_eq!(counted(EXPORT_REFUSED_CODE), refusals + 1);
+            println!("the device exports no dma-buf: refused, counted");
+            return;
+        };
+        assert_eq!(counted(EXPORT_REFUSED_CODE), refusals);
+        assert_eq!((buffer.length(), buffer.storage_mode()), (length, 2));
+        assert_ne!(buffer.gpu_address(), 0);
+        let first = buffer.export_dma_buf().expect("an export");
+        let second = buffer.export_dma_buf().expect("another");
+        assert_ne!(first.fd.as_raw_fd(), second.fd.as_raw_fd());
+        assert_eq!(first.offset, 224);
+        assert_eq!((first.offset + 32) % 256, 0);
+        assert!(first.dedicated && first.length == length);
+        assert!(first.allocation_size >= first.offset + length);
+        assert_eq!(
+            (second.offset, second.allocation_size),
+            (first.offset, first.allocation_size)
+        );
+        assert!(buffer.export_memory().is_err());
+        assert_eq!(buffer.external_write_done(), Ok(()));
+        let unaligned = device.new_dma_buf_buffer_of_length_padding_unobserved(on, 4096, 0x20, None);
+        let unaligned = unaligned
+            .expect("never a raise")
+            .expect("a dma-buf buffer");
+        assert_eq!(unaligned.export_dma_buf().expect("an export").offset, 0);
+        let shared = device.new_dma_buf_buffer_of_length_padding_unobserved(on, 4096, 0, None);
+        assert!(shared.expect("never a raise").is_none());
+        assert_eq!(counted(EXPORT_REFUSED_CODE), refusals);
     }
 }
