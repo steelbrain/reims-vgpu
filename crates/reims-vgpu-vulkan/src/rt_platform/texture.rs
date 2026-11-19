@@ -19,7 +19,8 @@
 //!
 //! **Answers.** A texture's descriptor values are rt's descriptor of it. Its usage is Metal's
 //! answer (measured on the M3 Max, `crate::gpu::desc`'s docs): the usage set without 0x8, which
-//! Metal's texture drops, `Unknown` as `ShaderRead | ShaderWrite | RenderTarget | PixelFormatView`,
+//! Metal's texture drops (a texture of 0x8 alone is rt's of `ShaderRead`, which answers 0, and Metal
+//! asserts at a swizzled view of it, refused as Metal's refusal), `Unknown` as `ShaderRead | ShaderWrite | RenderTarget | PixelFormatView`,
 //! and a view of a swizzle other than the default keeps `ShaderRead`, `PixelFormatView`, 0x4000 and
 //! 0x10000 of its texture's. Its resource options are the descriptor's with Metal's default hazard
 //! tracking resolved to tracked, as the Vulkan platform's runtime answers them.
@@ -200,6 +201,11 @@ impl RtTexture {
                 None => return refused_metal(sel, &format!("the swizzle {s:?}")),
             },
         };
+        if swizzle.is_some_and(|s| s != DEFAULT_SWIZZLE) && self.usage == 0 {
+            // Metal asserts `_usage != MTLTextureUsageUnknown` here: a texture of 0x8 alone, which
+            // rt makes as one of `ShaderRead`, answers no usage (`crate::gpu::desc`'s docs).
+            return refused_metal(sel, &"a swizzled view of a texture of no usage");
+        }
         let (index, own) = self
             .device
             .index_for(sel, reaches(d.usage), resource_index)?;
@@ -783,6 +789,24 @@ mod tests {
         assert!(!reaches(usage(4)) && !reaches(usage(0x10)) && !reaches(usage(0x8)));
     }
 
+    /// A texture of 0x8 alone goes to rt as one of `ShaderRead` alone, and so reaches shaders,
+    /// takes an index and samples as that one does; 0x8 beside other bits goes as it is.
+    #[test]
+    fn a_texture_of_0x8_alone_is_rt_s_of_shader_read() {
+        let rt_usage = |usage| {
+            let desc = TextureDesc {
+                usage,
+                ..TextureDesc::default()
+            };
+            rt_texture_descriptor(&desc).map(|d| d.usage)
+        };
+        assert_eq!(rt_usage(0x8), rt_usage(0x1));
+        assert_eq!(rt_usage(0x8), Ok(rt::TextureUsage::SHADER_READ));
+        assert!(rt_usage(0x8).is_ok_and(reaches));
+        assert_eq!(rt_usage(0), Ok(rt::TextureUsage::UNKNOWN));
+        assert_eq!(rt_usage(0xc).map(|u| u.as_raw()), Ok(0xc));
+    }
+
     /// A view's default slices: a cube's six faces each, a 3D texture's one, else the array's.
     #[test]
     fn a_view_takes_every_slice_of_its_texture() {
@@ -804,7 +828,9 @@ mod tests {
     /// indices, distinct and from the top down past the guest's reservation, a released one's
     /// index not taken again before the fresh ones; one the guest places answers its index; one
     /// no shader reaches has none, the guest's placement dropped; `Unknown` usage answers Metal's
-    /// 0x17 and 0x8 is dropped; views of another format, at a placed index, of one slice of a 2D
+    /// 0x17 and 0x8 is dropped; a texture of 0x8 alone answers no usage and is rt's of
+    /// `ShaderRead`, with an index, a format view of it answering no usage and a swizzled one
+    /// refused and counted; views of another format, at a placed index, of one slice of a 2D
     /// array as a 2D texture and through a swizzle; `replaceRegion:` of a Shared texture copied and
     /// counted, of a Private one refused and counted; a texture type rt has none of refused and
     /// counted, never a raise.
@@ -869,6 +895,16 @@ mod tests {
         })
         .expect("a texture");
         assert_eq!(dropped.usage(), 0x1);
+        let alone = make(&TextureDesc {
+            usage: 0x8,
+            ..small
+        })
+        .expect("a texture of 0x8 alone");
+        assert_eq!(alone.usage(), 0);
+        assert_ne!(index(&alone), 0);
+        assert_eq!(alone.rt().descriptor().usage, rt::TextureUsage::SHADER_READ);
+        let view = alone.new_texture_view(71).expect("never a raise");
+        assert_eq!(view.expect("a format view").usage(), 0);
 
         let array = TextureDesc {
             texture_type: 3,
@@ -933,5 +969,8 @@ mod tests {
             .is_none()
         );
         assert_eq!(counted(RtRefusal::Refused.code()), metal + 2);
+        let refused = alone.new_swizzled_texture_subview(70, 2, level, level, swizzle);
+        assert!(refused.expect("never a raise").is_none());
+        assert_eq!(counted(RtRefusal::Refused.code()), metal + 3);
     }
 }

@@ -43,9 +43,15 @@ impl TextureFields {
     }
 }
 
+/// Apple's private texture usage 0x8, which Metal's texture drops.
+const USAGE_0X8: u32 = 0x8;
+
 /// rt's descriptor of a texture descriptor's values `d`: each raw value as rt's type of it, the
 /// storage mode of bits 4 to 7 of the resource options (Shared before any set), and each channel
-/// from itself before a swizzle is set. The private values (`resourceIndex`, `protectionOptions`,
+/// from itself before a swizzle is set. A usage of 0x8 alone is `ShaderRead`: Metal makes a texture
+/// of 0x8 alone as one of `ShaderRead` alone in every respect it shows, its heap size included,
+/// and not as one of `Unknown` usage, which rt takes as every usage (measured, `crate::gpu::desc`'s
+/// docs); the texture answers the guest a usage of 0 all the same. The private values (`resourceIndex`, `protectionOptions`,
 /// `framebufferOnly`, `isDrawable`, `writeSwizzleEnabled`, `allowGPUOptimizedContents` and
 /// `rotation`) have no field in rt's descriptor and are not sent.
 ///
@@ -64,7 +70,10 @@ pub fn rt_texture_descriptor(d: &TextureDesc) -> Result<rt::TextureDescriptor, S
     out.mipmap_level_count = word("mipmap level count", d.mipmap_level_count)?;
     out.sample_count = word("sample count", d.sample_count)?;
     out.array_length = word("array length", d.array_length)?;
-    let usage = word("texture usage", d.usage)?;
+    let usage = match word("texture usage", d.usage)? {
+        USAGE_0X8 => rt::TextureUsage::SHADER_READ.as_raw(),
+        usage => usage,
+    };
     out.usage =
         rt::TextureUsage::try_from(usage).map_err(|_| format!("texture usage {usage:#x}"))?;
     out.storage_mode = match (d.resource_options.unwrap_or(0) >> 4) & 0xf {
