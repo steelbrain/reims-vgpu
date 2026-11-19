@@ -1065,6 +1065,10 @@ pub struct GraphicsDecoder<P: Platform> {
     /// its block and once, each held until the buffer's finish marks it dirty
     /// ([`Self::note_shape`]).
     shapes_written: RefCell<Vec<(u64, surface_cache::shapes::ShapeRef)>>,
+    /// In the per-shape form, the shapes the encoder being walked may write, each by its block
+    /// and once, in the order the walk last noted them ([`Self::note_shape`]): at the encoder's
+    /// end each other shape of their planes takes their write ([`Self::reconcile_shapes`]).
+    encoder_shapes: RefCell<Vec<(u64, surface_cache::shapes::ShapeRef)>>,
     /// The encoder being walked is a blit encoder, which writes only the destinations its ops
     /// name ([`Self::texture_written`]), whatever its textures' usage.
     laid_blit: Cell<bool>,
@@ -1231,6 +1235,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             laid_uses: RefCell::new(Vec::new()),
             laid_written: RefCell::new(Vec::new()),
             shapes_written: RefCell::new(Vec::new()),
+            encoder_shapes: RefCell::new(Vec::new()),
             laid_blit: Cell::new(false),
         }
     }
@@ -1645,12 +1650,18 @@ impl<P: Platform> GraphicsDecoder<P> {
                 log::info!(
                     target: "reims_vgpu::graphics",
                     "IOSurface device caches' shapes: {} made of {} MiB, {} textures of a shape \
-                     held, {} made again after their drop; {} filled from their buffers ({} MiB); \
-                     {} unreferenced dropped ({} MiB); {} textures over the buffer instead ({} \
-                     images and {} views refused); {} caches kept past the budget; {} blocks \
-                     refused uncached",
+                     held, {} made again after their drop; {} filled from their buffers ({} MiB), \
+                     in {} fills of the shapes alone ({} behind command buffers); {} written \
+                     back ({} MiB), {} kept dirty past the bound; {} took another shape's write \
+                     ({} MiB), {} texels in part, {} dropped at one; {} encoders wrote two \
+                     shapes of a plane; {} writes no shape's; {} unreferenced dropped ({} MiB); \
+                     {} textures over the buffer instead ({} images and {} views refused); {} \
+                     caches kept past the budget; {} blocks refused uncached",
                     sh.made, sh.made_bytes >> 20, sh.found, sh.again, sh.fills,
-                    sh.filled_bytes >> 20, sh.dropped, sh.dropped_bytes >> 20, sh.unshaped,
+                    sh.filled_bytes >> 20, sh.fills_made, sh.fills_deferred, sh.written_back,
+                    sh.written_back_bytes >> 20, sh.kept_dirty, sh.overlap_copies,
+                    sh.overlap_bytes >> 20, sh.straddled, sh.overlap_dropped, sh.unordered,
+                    sh.unseen, sh.dropped, sh.dropped_bytes >> 20, sh.unshaped,
                     sh.images_refused, sh.views_refused, sh.past_budget, sh.uncached_refused
                 );
             }
@@ -6295,19 +6306,27 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// being walked where it may write the shape: `written` (a blit's destination, a render
     /// pass's attachment) or, outside a blit encoder, where the texture's usage lets a shader
     /// write it. The shape is held, once, until the command buffer's finish marks it dirty
-    /// ([`surface_cache::Caches::finish`]). In the default form the use's shape is the shadow's,
-    /// which holds no image: nothing is noted.
+    /// ([`surface_cache::Caches::finish`]), and noted among the encoder's, last
+    /// ([`Self::reconcile_shapes`]). In the default form the use's shape is the shadow's, which
+    /// holds no image: nothing is noted.
     fn note_shape(&self, used: &surface_cache::shapes::ShapeUse, written: bool) {
         if !(written || (used.writes && !self.laid_blit.get())) || !self.surface_caches.shaped() {
             return;
         }
-        let mut noted = self.shapes_written.borrow_mut();
         let id = used.reference.id();
+        let mut noted = self.shapes_written.borrow_mut();
         if !noted
             .iter()
             .any(|(block, s)| *block == used.block && s.id() == id)
         {
             noted.push((used.block, used.reference.clone_ref()));
+        }
+        let mut encoder = self.encoder_shapes.borrow_mut();
+        if let Some(at) = encoder.iter().position(|(_, s)| s.id() == id) {
+            let again = encoder.remove(at);
+            encoder.push(again);
+        } else {
+            encoder.push((used.block, used.reference.clone_ref()));
         }
     }
 

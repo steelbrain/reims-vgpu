@@ -346,6 +346,11 @@ pub(crate) mod shapes;
 
 use shapes::{Held, ShapeCounts, ShapeKey, ShapeTable};
 
+/// Whether an encoder was refused for writing two shapes of one plane
+/// ([`shapes::UNORDERED_WRITES`]): its line is logged the first time alone, the rest counted
+/// (docs/conventions.md).
+static UNORDERED_LOGGED: AtomicBool = AtomicBool::new(false);
+
 /// The copies run under a live raise handler (the ring loop's, or the entry of the ring-0 thread
 /// that asks for them).
 const ON: OnFault = OnFault::Return;
@@ -2830,6 +2835,113 @@ impl<P: Platform> SurfaceCaches<P> {
         }
     }
 
+    /// The shapes of the block at `block`'s cache that command buffers counted behind a deferred
+    /// copy of it wrote, marked dirty once the copy is made ([`Since`]).
+    fn dirty_since(&self, block: u64) -> Vec<u64> {
+        (self.deferred.get(&block).into_iter().flatten())
+            .flat_map(|d| d.since.dirty.iter().copied())
+            .collect()
+    }
+
+    /// Whether a shape of `written`, each by its block, shares its plane with another shape of
+    /// its cache that takes its write at the end of the encoder (rule 1,
+    /// [`Self::reconcile_shapes`]): one a guest texture references or that holds a write of its
+    /// own, as `dirty_since` names one too.
+    fn shares_plane(&self, written: &[(u64, shapes::ShapeRef)]) -> bool {
+        written.iter().any(|(block, shape)| {
+            let Some(cache) = self.by_block.get(block) else {
+                return false;
+            };
+            let id = shape.id();
+            let Some(key) = cache.shapes.iter().find(|s| s.id() == id).map(|s| s.key) else {
+                return false;
+            };
+            let since = self.dirty_since(*block);
+            (cache.shapes.iter()).any(|s| {
+                s.id() != id
+                    && s.key.same_plane(&key)
+                    && (s.referenced() || s.dirty || since.contains(&s.id()))
+            })
+        })
+    }
+
+    /// The encoder just ended in `cb` may have written the shapes `written` of the block at
+    /// `block`'s cache, in the order its walk last noted them (rule 1, [`shapes`]): each other
+    /// shape of a written shape's plane takes the write in `cb`, after the writers' fence
+    /// ([`Self::writes_fence`]), so the encoders after it read the write through any texture over
+    /// the plane, as the Macs' next encoders read one made through another texture over the same
+    /// memory (docs/graphics-kext/dgpu-oracle.md, Q37); an unreferenced one that holds no write
+    /// of its own (not dirty, and marked dirty by no command buffer behind a deferred copy) is
+    /// dropped instead. An encoder that may have written two shapes of one plane is refused
+    /// ([`shapes::UNORDERED_WRITES`]), and the one noted last is taken as the plane's write. What
+    /// goes, for the caller to let go of with the lock let go of.
+    fn reconcile_shapes(
+        &mut self,
+        cb: &P::CommandBuffer,
+        block: u64,
+        written: &[u64],
+    ) -> RaiseResult<Vec<P::Texture>> {
+        let since = self.dirty_since(block);
+        let Some(cache) = self.by_block.get_mut(&block) else {
+            return Ok(Vec::new());
+        };
+        let keys: Vec<(u64, ShapeKey)> = (written.iter())
+            .filter_map(|&id| Some((id, cache.shapes.iter().find(|s| s.id() == id)?.key)))
+            .collect();
+        let mut gone = Vec::new();
+        let mut done: Vec<ShapeKey> = Vec::new();
+        // Each plane once, from its shape noted last.
+        for (at, &(source, key)) in keys.iter().enumerate().rev() {
+            if done.iter().any(|k| k.same_plane(&key)) {
+                continue;
+            }
+            done.push(key);
+            if keys[..at].iter().any(|(_, k)| k.same_plane(&key)) {
+                self.counts.shapes.unordered += 1;
+                reims_vgpu_vulkan::answer::count_kind(shapes::UNORDERED_WRITES);
+                if !UNORDERED_LOGGED.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        target: "reims_vgpu::graphics", kind:% = shapes::UNORDERED_WRITES;
+                        "the IOSurface block at {block:#x}: an encoder may have written two \
+                         textures of different shapes over its plane {}, whose writes the \
+                         per-shape form cannot order; the one bound last is taken as the \
+                         plane's write ({}; the rest are counted)",
+                        key.plane,
+                        shapes::UNORDERED_WRITES
+                    );
+                }
+            }
+            let others: Vec<(u64, bool)> = (cache.shapes.iter())
+                .filter(|s| s.id() != source && s.key.same_plane(&key))
+                .map(|s| {
+                    let id = s.id();
+                    (id, s.referenced() || s.dirty || since.contains(&id))
+                })
+                .collect();
+            let into: Vec<u64> = (others.iter()).filter(|o| o.1).map(|o| o.0).collect();
+            shapes::copy_overlaps::<P>(
+                cb,
+                &cache.device,
+                &cache.shapes,
+                (source, &into),
+                self.fence.as_ref(),
+                &mut self.counts.shapes,
+            )?;
+            for (id, _) in others.iter().filter(|o| !o.1) {
+                let Some(shape) = cache.shapes.take_id(*id) else {
+                    continue;
+                };
+                self.cache_bytes = self.cache_bytes.saturating_sub(shape.bytes);
+                let counts = &mut self.counts.shapes;
+                counts.dropped += 1;
+                counts.dropped_bytes += shape.bytes;
+                counts.overlap_dropped += 1;
+                gone.push(shape.image);
+            }
+        }
+        Ok(gone)
+    }
+
     /// The shape `key` of the block at `block`'s cache, where the cache holds it: a reference to
     /// it and its image. `None` where the block has no cache; `Some(None)` where it holds no such
     /// shape.
@@ -4993,6 +5105,49 @@ impl<P: Platform> Caches<P> {
         let mut state = self.state.lock();
         for &(block, from_home) in written {
             state.reconcile(cb, block, from_home)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the encoder being walked, which may have written the shapes `written`, each by its
+    /// block, wrote one whose plane has another shape ([`SurfaceCaches::shares_plane`]): it then
+    /// updates the writers' fence as it ends, which rule 1's copies wait for
+    /// ([`Self::reconcile_shapes`]).
+    pub(crate) fn shares_plane(&self, written: &[(u64, shapes::ShapeRef)]) -> bool {
+        !written.is_empty() && self.state.lock().shares_plane(written)
+    }
+
+    /// An encoder just ended in command buffer `cb` that may have written the shapes `written`,
+    /// each by its block, in the order its walk last noted them: each other shape of their planes
+    /// takes the write in `cb` ([`SurfaceCaches::reconcile_shapes`]). What goes is let go of with
+    /// no lock held, a refusal logged.
+    pub(crate) fn reconcile_shapes(
+        &self,
+        cb: &P::CommandBuffer,
+        written: &[(u64, shapes::ShapeRef)],
+    ) -> RaiseResult<()> {
+        let mut blocks: Vec<u64> = written.iter().map(|(block, _)| *block).collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        let mut gone = Vec::new();
+        {
+            let mut state = self.state.lock();
+            for block in blocks {
+                let ids: Vec<u64> = (written.iter())
+                    .filter(|(b, _)| *b == block)
+                    .map(|(_, s)| s.id())
+                    .collect();
+                gone.extend(state.reconcile_shapes(cb, block, &ids)?);
+            }
+        }
+        if !gone.is_empty()
+            && let Err(refusal) = refusals::refusing(move || drop(gone))
+        {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = refusal;
+                "IOSurface shapes another shape's write left behind were let go of, and a \
+                 release was refused: {refusal}"
+            );
         }
         Ok(())
     }
@@ -11090,6 +11245,11 @@ pub(super) mod tests {
     /// Command buffer `cb_obj_id` on queue 1 that uses [`BLOCK`] at generation 0, writing where
     /// `writes`, and holds one blit encoder of `op`'s.
     pub(crate) fn blit_with(r: &mut Rig, cb_obj_id: u64, writes: bool, op: (u16, Vec<u8>)) {
+        blits_with(r, cb_obj_id, writes, &[op]);
+    }
+
+    /// [`blit_with`] of a blit encoder of the ops `ops`, in order.
+    pub(crate) fn blits_with(r: &mut Rig, cb_obj_id: u64, writes: bool, ops: &[(u16, Vec<u8>)]) {
         use reims_vgpu_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END};
         use zerocopy::FromBytes as _;
         let op_of = |tag: u16, body: &[u8]| {
@@ -11104,9 +11264,12 @@ pub(super) mod tests {
             v
         };
         let mut message = surfaces_message(1, cb_obj_id, &[(BLOCK, 0, writes)], false);
-        let mut ops = op_of(RGFX_OP_ENCODER_BEGIN_BLIT, &[]);
-        ops.extend(op_of(op.0, &op.1));
-        ops.extend(op_of(RGFX_OP_ENCODER_END, &[]));
+        let mut encoded = op_of(RGFX_OP_ENCODER_BEGIN_BLIT, &[]);
+        for (tag, body) in ops {
+            encoded.extend(op_of(*tag, body.as_slice()));
+        }
+        encoded.extend(op_of(RGFX_OP_ENCODER_END, &[]));
+        let ops = encoded;
         let op_bytes = message.len() - RGFX_COMMAND_BUFFER_OPS_OFFSET as usize + ops.len();
         message.extend_from_slice(&ops);
         let mut m = RgfxCommandBuffer::read_from_prefix(&message).unwrap().0;

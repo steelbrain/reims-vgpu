@@ -24,9 +24,18 @@
 //!   buffer into the pages first copies every dirty shape's whole extent into the buffer; a dirty
 //!   shape is not dropped until such a copy (rule 3; dirty shapes agree where they overlap, so
 //!   their order is free);
-//! - a write through one shape is copied, at the end of the encoder that wrote it, into each
-//!   other shape of the plane that a live guest texture references, and the unreferenced shapes it
-//!   overlaps are dropped (rule 1).
+//! - a write through one shape is copied, at the end of the encoder that may have written it,
+//!   into each other shape of its plane that a live guest texture references or that holds a
+//!   write of its own, and the plane's other shapes are dropped (rule 1, [`copy_overlaps`]): the
+//!   next encoder reads the write through any texture over the plane, as the Macs' next encoders
+//!   read a write made through another texture over the same memory
+//!   (docs/graphics-kext/dgpu-oracle.md, Q37). Every two shapes of a plane overlap from its first
+//!   texel ([`ShapeKey::overlap`]).
+//!
+//! **Two shapes of one plane written in one encoder** cannot be ordered: Metal writes the plane's
+//! one memory through both in the order the GPU runs the writes, and the per-shape form holds
+//! them apart until the encoder ends. Such an encoder is refused ([`UNORDERED_WRITES`], counted
+//! and logged once), and the shape the walk noted last is taken as the plane's write.
 //!
 //! **Dirty.** A command buffer's walk notes each shape a use may write: a blit's destination, a
 //! render pass's attachment, and, outside a blit encoder, a texture whose usage lets a shader
@@ -80,6 +89,12 @@ use reims_vgpu_vulkan::gpu::no_texture::no_view;
 /// 2026-11-19: referenced shapes and 4 more).
 pub(crate) const UNREFERENCED_KEPT: usize = 4;
 
+/// The degradation code of an encoder that may have written two shapes of one plane: Metal
+/// would write the plane's one texture memory through both in the order the GPU ran them, which
+/// the per-shape form cannot know; the shape the walk noted last is taken as the plane's write
+/// (rule 1, `SurfaceCaches::reconcile_shapes`).
+pub(crate) const UNORDERED_WRITES: &str = "rt-refused-surface-unordered-writes";
+
 /// How many keys of dropped shapes an entry remembers, for the count of shapes made again after
 /// their image was dropped ([`ShapeTable::insert`]).
 const DROPPED_REMEMBERED: usize = 16;
@@ -118,6 +133,23 @@ pub(crate) struct ShapeKey {
 }
 
 impl ShapeKey {
+    /// Whether `other` is a shape of the same plane, at the same place and pitch in the buffer.
+    /// Every two shapes of a plane are, as a texture's place and pitch are its plane's, so the
+    /// two overlap from the plane's first texel ([`Self::overlap`]).
+    pub(crate) fn same_plane(&self, other: &ShapeKey) -> bool {
+        self.plane == other.plane
+            && self.offset == other.offset
+            && self.bytes_per_row == other.bytes_per_row
+    }
+
+    /// The bytes of each row, and the rows, of the buffer that the shape and `other`, of the same
+    /// plane ([`Self::same_plane`]), both cover: the rectangle from the plane's first texel as
+    /// wide as the narrower one's rows and as high as the lower one.
+    pub(crate) fn overlap(&self, other: &ShapeKey) -> (u64, u64) {
+        let row = |k: &ShapeKey| k.width.saturating_mul(k.texel_bytes);
+        (row(self).min(row(other)), self.height.min(other.height))
+    }
+
     /// The bytes an image of the shape holds: its texels.
     pub(crate) fn bytes(&self) -> u64 {
         (self.width.max(1))
@@ -227,6 +259,18 @@ pub(crate) struct ShapeCounts {
     pub(crate) past_budget: u64,
     /// Uncached blocks refused, the per-shape form taking none (`rt-surface-uncached-copied`).
     pub(crate) uncached_refused: u64,
+    /// Shapes that took another shape's write at the end of the encoder that wrote it, and the
+    /// bytes they took (rule 1, [`copy_overlaps`]).
+    pub(crate) overlap_copies: u64,
+    pub(crate) overlap_bytes: u64,
+    /// Unreferenced shapes dropped at the end of an encoder that wrote another shape of their
+    /// plane (rule 1), counted in `dropped` too.
+    pub(crate) overlap_dropped: u64,
+    /// Texels of a shape that another shape's write covered only in part, which kept their bytes
+    /// ([`copy_overlaps`]).
+    pub(crate) straddled: u64,
+    /// Encoders that may have written two shapes of one plane ([`UNORDERED_WRITES`]).
+    pub(crate) unordered: u64,
 }
 
 /// One shape's image and its state.
@@ -508,6 +552,93 @@ pub(crate) fn write_back<P: Platform>(
     Ok(ids)
 }
 
+/// Encodes in `cb` rule 1's copy of the shape `source` of `table`, which the encoder just ended
+/// may have written, into each of its plane's shapes `into` ([`ShapeKey::overlap`]): in a blit
+/// encoder of its own, which first waits for `fence`, the writers'
+/// (`SurfaceCaches::writes_fence`), the source's texels that the others overlap go into
+/// `buffer`, the cache's, at their place; in a second, each of the others takes its overlap from
+/// there. Through the buffer, the copy moves bytes whatever the shapes' formats, as a fill does,
+/// and the buffer only takes a write early that the source, dirty, copies into it again. A
+/// texel of another shape that the source's rows cover only in part (one wider than the
+/// source's, at the end of its rows) keeps its bytes, counted in `counts`
+/// ([`ShapeCounts::straddled`]). Nothing where `into` names no shape, the table holds no
+/// `source`, or the platform made no encoder.
+pub(crate) fn copy_overlaps<P: Platform>(
+    cb: &P::CommandBuffer,
+    buffer: &P::Buffer,
+    table: &ShapeTable<P::Texture>,
+    (source, into): (u64, &[u64]),
+    fence: Option<&P::Fence>,
+    counts: &mut ShapeCounts,
+) -> RaiseResult<()> {
+    const ON: OnFault = OnFault::Return;
+    let Some(from) = table.iter().find(|s| s.id() == source) else {
+        return Ok(());
+    };
+    let targets: Vec<&Shape<P::Texture>> = (table.iter())
+        .filter(|s| s.id() != source && into.contains(&s.id()))
+        .collect();
+    let Some((bytes, rows)) = (targets.iter().map(|t| from.key.overlap(&t.key)))
+        .reduce(|(b, r), (bytes, rows)| (b.max(bytes), r.max(rows)))
+    else {
+        return Ok(());
+    };
+    let key = from.key;
+    let Some(blit) = cb.blit_encoder(ON)? else {
+        return Ok(());
+    };
+    if let Some(fence) = fence {
+        blit.encode(ON, BlitCmd::WaitForFence { fence })?;
+    }
+    blit.encode(
+        ON,
+        BlitCmd::CopyTextureToBuffer {
+            source_texture: &from.image,
+            source_slice: 0,
+            source_level: 0,
+            source_origin: MtlOrigin::default(),
+            source_size: MtlSize::new(bytes.div_ceil(key.texel_bytes), rows, 1),
+            destination_buffer: buffer,
+            destination_offset: key.offset,
+            destination_bytes_per_row: key.bytes_per_row,
+            destination_bytes_per_image: key.bytes_per_row.saturating_mul(rows),
+        },
+    )?;
+    blit.encode(ON, BlitCmd::EndEncoding)?;
+    let Some(blit) = cb.blit_encoder(ON)? else {
+        return Ok(());
+    };
+    for target in targets {
+        let (bytes, rows) = key.overlap(&target.key);
+        let texel = target.key.texel_bytes;
+        let width = bytes / texel;
+        if width * texel < bytes {
+            counts.straddled += 1;
+        }
+        if width == 0 || rows == 0 {
+            continue;
+        }
+        blit.encode(
+            ON,
+            BlitCmd::CopyBufferToTexture {
+                source_buffer: buffer,
+                source_offset: key.offset,
+                source_bytes_per_row: key.bytes_per_row,
+                source_bytes_per_image: key.bytes_per_row.saturating_mul(rows),
+                source_size: MtlSize::new(width, rows, 1),
+                destination_texture: &target.image,
+                destination_slice: 0,
+                destination_level: 0,
+                destination_origin: MtlOrigin::default(),
+            },
+        )?;
+        counts.overlap_copies += 1;
+        counts.overlap_bytes += width * rows * texel;
+    }
+    blit.encode(ON, BlitCmd::EndEncoding)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +687,32 @@ mod tests {
         assert_eq!(k.span(), 0..63 * 4096 + 400);
         k.offset = 8192;
         assert_eq!(k.span(), 8192..8192 + 63 * 4096 + 400);
+    }
+
+    /// Every two shapes of a plane overlap from its first texel: as wide as the narrower one's
+    /// rows, by their bytes whatever each texel's, and as high as the lower one; a shape of
+    /// another plane, place or pitch is not of the plane
+    #[test]
+    fn two_shapes_of_a_plane_overlap_from_its_first_texel() {
+        let wide = key(32, 4);
+        let narrow = ShapeKey {
+            height: 100,
+            ..key(12, 8)
+        };
+        assert!(wide.same_plane(&narrow));
+        assert_eq!(wide.overlap(&narrow), (12 * 8, 64));
+        assert_eq!(narrow.overlap(&wide), (12 * 8, 64));
+        assert_eq!(wide.overlap(&key(64, 1)), (64, 64));
+        for other in [
+            ShapeKey { plane: 1, ..wide },
+            ShapeKey { offset: 64, ..wide },
+            ShapeKey {
+                bytes_per_row: 8192,
+                ..wide
+            },
+        ] {
+            assert!(!wide.same_plane(&other));
+        }
     }
 
     /// The same shape made again is found, with another reference; references count as long as

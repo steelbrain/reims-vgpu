@@ -212,9 +212,11 @@ mod tests {
     use reims_vgpu_vulkan::core::raise::OnFault;
     use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
 
+    use reims_vgpu_vulkan::core::platform::types::MtlSize;
+
     use super::super::surface_cache::tests::{
-        NO_REACH, blit_with, cache_id, cached, copies, download, queues, reading, release,
-        surface_texture, surface_texture_as, surface_textures, use_surfaces,
+        NO_REACH, blit_with, blits_with, cache_id, cached, copies, download, queues, reading,
+        release, surface_texture, surface_texture_as, surface_textures, use_surfaces,
     };
     use super::super::surface_pages::tests::{BLOCK, Rig, one_plane, rig};
     use super::*;
@@ -277,6 +279,11 @@ mod tests {
     /// Command buffer `cb_obj_id` on queue 1, naming [`BLOCK`] written, that writes texture
     /// `obj_id` of `size` by a blit from buffer 10.
     fn write(r: &mut Rig, cb_obj_id: u64, obj_id: u64, size: (u32, u32)) {
+        blit_with(r, cb_obj_id, true, write_op(obj_id, size));
+    }
+
+    /// A blit op that writes texture `obj_id` of `size` from buffer 10.
+    fn write_op(obj_id: u64, size: (u32, u32)) -> (u16, Vec<u8>) {
         use reims_vgpu_graphics::ops::blit::{
             RGFX_OP_BLIT_COPY_BUFFER_TO_TEXTURE, RgfxBlitOpCopyBufferToTexture,
         };
@@ -292,8 +299,29 @@ mod tests {
             source_size_depth: 1,
             ..RgfxBlitOpCopyBufferToTexture::default()
         };
-        let op = (RGFX_OP_BLIT_COPY_BUFFER_TO_TEXTURE, m.as_bytes().to_vec());
-        blit_with(r, cb_obj_id, true, op);
+        (RGFX_OP_BLIT_COPY_BUFFER_TO_TEXTURE, m.as_bytes().to_vec())
+    }
+
+    /// The (source image, size) of each copy of a shape's write into its cache's buffer at an
+    /// encoder's end in `calls`, and the (image, size) of each shape that took it from there, the
+    /// guest's own copies into views left out ([`shapes::copy_overlaps`]).
+    #[allow(clippy::type_complexity)] // the two lists the test reads
+    fn overlaps(calls: &[Call], images: &[u64]) -> (Vec<(u64, Arg)>, Vec<(u64, Arg)>) {
+        let id = |a: &Arg| a.as_obj().map_or(0, |o| o.0);
+        let out = (calls.iter())
+            .filter(|c| c.sel == TO_BUFFER)
+            .map(|c| (id(&c.args[0]), c.args[4].clone()))
+            .collect();
+        let into = (calls.iter())
+            .filter(|c| c.sel == FILL && images.contains(&id(&c.args[5])))
+            .map(|c| (id(&c.args[5]), c.args[4].clone()))
+            .collect();
+        (out, into)
+    }
+
+    /// `width` by `height` texels, as the call log holds a copy's size.
+    fn texels(width: u64, height: u64) -> Arg {
+        Arg::val(&MtlSize::new(width, height, 1))
     }
 
     /// The (image, buffer, offset) of each shape written back in `calls`.
@@ -705,6 +733,114 @@ mod tests {
             counts.written_back,
         );
         assert_eq!(made, (1, 1, 2));
+    }
+
+    /// A write through one shape reaches the other shapes of its plane at the end of the encoder
+    /// that wrote it, in the same command buffer (rule 1): the writer's encoder updates the
+    /// writers' fence, and an encoder that waits for it copies the texels the other shapes share
+    /// with the written one into the cache's buffer, then each other shape takes its share from
+    /// there; the written shape alone is dirty, so a download writes it alone back. An unreferenced
+    /// shape that holds no write of its own is dropped instead, and a plane with one shape copies
+    /// nothing
+    #[test]
+    fn a_write_through_one_shape_reaches_its_planes_other_shapes() {
+        let mut r = shaped();
+        let cache = cache_id(&r);
+        let a = texture_image(&mut r, 21, 80, (32, 8));
+        let b = texture_image(&mut r, 22, 80, (16, 4));
+        let gone = texture_image(&mut r, 23, 80, (8, 2));
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        destroy(&mut r, 23);
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let mark = r.p.call_log().mark();
+        write(&mut r, 0x101, 21, (32, 8));
+        let calls = r.p.call_log().since(mark);
+        let (out, into) = overlaps(&calls, &[a, b, gone]);
+        assert_eq!(out, [(a, texels(16, 4))], "what B shares with A");
+        assert_eq!(into, [(b, texels(16, 4))], "the dropped one takes nothing");
+        let update = first(&calls, "updateFence:");
+        let wait = first(&calls, "waitForFence:");
+        assert!(update < wait && wait < first(&calls, TO_BUFFER));
+        assert_eq!(written_back(&calls)[0].1, cache);
+        let counts = r.dec.caches().counts().shapes;
+        let rule_1 = (counts.overlap_copies, counts.overlap_bytes, counts.overlap_dropped);
+        assert_eq!(rule_1, (1, 16 * 4 * 4, 1));
+        assert_eq!((counts.dropped, counts.unordered), (1, 0));
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(written_back(&calls), [(a, cache, 0)], "A alone is dirty");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+
+        // B's write reaches A, its texels at its own size; B alone is dirty then.
+        let mark = r.p.call_log().mark();
+        write(&mut r, 0x102, 22, (16, 4));
+        let (out, into) = overlaps(&r.p.call_log().since(mark), &[a, b]);
+        assert_eq!((out, into), (vec![(b, texels(16, 4))], vec![(a, texels(16, 4))]));
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        assert_eq!(written_back(&r.p.call_log().since(mark)), [(b, cache, 0)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+
+        // B unreferenced and clean: A's next write drops it, with no fence and no copy.
+        destroy(&mut r, 22);
+        let mark = r.p.call_log().mark();
+        write(&mut r, 0x103, 21, (32, 8));
+        let calls = r.p.call_log().since(mark);
+        assert!(calls.iter().all(|c| c.sel != "updateFence:"), "no fence");
+        assert_eq!(overlaps(&calls, &[a, b]), (vec![], vec![]));
+        assert_eq!(r.dec.caches().counts().shapes.overlap_dropped, 2, "B too");
+    }
+
+    /// An unreferenced shape that holds a write of its own is not dropped at another shape's
+    /// write: it takes the write, so the two agree where they overlap whichever is written back
+    /// first
+    #[test]
+    fn an_unreferenced_dirty_shape_takes_another_shapes_write() {
+        let mut r = shaped();
+        let a = texture_image(&mut r, 21, 80, (32, 8));
+        let b = texture_image(&mut r, 22, 80, (16, 4));
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        write(&mut r, 0x101, 22, (16, 4));
+        r.p.world().complete_all(CompleteOn::Caller);
+        destroy(&mut r, 22);
+        let mark = r.p.call_log().mark();
+        write(&mut r, 0x102, 21, (32, 8));
+        let (out, into) = overlaps(&r.p.call_log().since(mark), &[a, b]);
+        assert_eq!((out, into), (vec![(a, texels(16, 4))], vec![(b, texels(16, 4))]));
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.overlap_dropped, counts.dropped), (0, 0));
+    }
+
+    /// An encoder that may write two shapes of one plane is refused, counted: the shape the walk
+    /// noted last is taken as the plane's write, and the other takes its texels
+    #[test]
+    fn two_shapes_of_one_plane_written_in_one_encoder_are_refused() {
+        let mut r = shaped();
+        let a = texture_image(&mut r, 21, 80, (32, 8));
+        let b = texture_image(&mut r, 22, 80, (16, 4));
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let ops = [write_op(22, (16, 4)), write_op(21, (32, 8))];
+        blits_with(&mut r, 0x101, true, &ops);
+        let (out, into) = overlaps(&r.p.call_log().since(mark), &[a, b]);
+        assert_eq!((out, into), (vec![(a, texels(16, 4))], vec![(b, texels(16, 4))]));
+        assert_eq!(r.dec.caches().counts().shapes.unordered, 1);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        let back = written_back(&r.p.call_log().since(mark));
+        assert_eq!(back.len(), 2, "both written");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
     }
 
     /// In the per-shape form every surface takes a device cache: a block that asks whether it

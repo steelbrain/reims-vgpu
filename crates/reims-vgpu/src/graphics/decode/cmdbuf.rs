@@ -2697,6 +2697,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.laid_uses.borrow_mut().clear();
         self.laid_written.borrow_mut().clear();
         self.shapes_written.borrow_mut().clear();
+        self.encoder_shapes.borrow_mut().clear();
     }
 
     /// [`Self::walk_ops`]' walk of `ops`, the whole of a command buffer's op stream or a range
@@ -3203,9 +3204,12 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// The writers' fence ([`super::surface_cache::Caches::writes_fence`]) where the encoder being
     /// walked noted a use that may write a laid-out cache or its wide home ([`Self::note_laid`]),
-    /// for it to update as it ends; `None` where it noted none.
+    /// or a shape whose plane has another ([`Self::note_shape`]), for it to update as it ends;
+    /// `None` where it noted none.
     fn laid_writes_fence(&self, cb: &P::CommandBuffer) -> RaiseResult<Option<P::Fence>> {
-        if !self.laid_uses.borrow().iter().any(|u| u.writes) {
+        if !self.laid_uses.borrow().iter().any(|u| u.writes)
+            && !(self.surface_caches).shares_plane(&self.encoder_shapes.borrow())
+        {
             return Ok(None);
         }
         let Some(device) = cb.device() else {
@@ -3249,6 +3253,19 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.surface_caches.reconcile(cb, &written)
     }
 
+    /// In the per-shape form, the encoder just ended in `cb` may have written the shapes its uses
+    /// noted ([`Self::note_shape`]): each other shape of their planes takes the write in `cb`
+    /// before the next encoder ([`super::surface_cache::Caches::reconcile_shapes`]), so it reads
+    /// the write through any texture over the plane, as the Macs' next encoders read it
+    /// (docs/graphics-kext/dgpu-oracle.md, Q37).
+    fn reconcile_shapes(&self, cb: &P::CommandBuffer) -> RaiseResult<()> {
+        let written = std::mem::take(&mut *self.encoder_shapes.borrow_mut());
+        if written.is_empty() {
+            return Ok(());
+        }
+        self.surface_caches.reconcile_shapes(cb, &written)
+    }
+
     /// [`Self::walk_ops`]'s walk, `encoder` the one it holds open, `split` where it may commit
     /// the buffer in parts ([`Self::split_here`]), each next part then `cb`.
     fn walk(
@@ -3277,6 +3294,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     self.framing_op((tag, body, &ops[len..]), cb, encoder, events)?;
                     if tag == RGFX_OP_ENCODER_END {
                         self.reconcile_laid(cb)?;
+                        self.reconcile_shapes(cb)?;
                     }
                     if tag == RGFX_OP_ENCODER_END && len < ops.len() {
                         self.split_here(cb, split, &ops[len..])?;
