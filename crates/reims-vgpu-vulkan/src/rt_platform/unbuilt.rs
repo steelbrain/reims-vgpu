@@ -332,10 +332,11 @@ pub fn rt_refused(sel: &'static str, error: &rt::Error) -> RtRefusal {
     kind
 }
 
-/// Counts a refusal of the call `sel` of the kind `kind` under its code, and the process's first
-/// of the kind writes its line on stderr, naming the call and `why`.
+/// Counts a refusal of the call `sel` of the kind `kind` under its code, and under the code of the
+/// make that runs on the thread where one names one (`crate::answer::refusing_as`), and the
+/// process's first of the kind writes its line on stderr, naming the call and `why`.
 pub fn refused_as(sel: &'static str, kind: RtRefusal, why: &dyn std::fmt::Display) {
-    crate::answer::count_kind(kind.code());
+    count_refusal(kind);
     if first(&SAID_RT, kind.at()) {
         say(&format!(
             "reims-vgpu: {sel}: metal2vulkan-rt refused it ({why}); refused ({}), the first of \
@@ -350,7 +351,16 @@ pub fn refused_as(sel: &'static str, kind: RtRefusal, why: &dyn std::fmt::Displa
 /// of the platform's own as [`refuse_create`] does.
 pub fn refused_again(kind: RtRefusal) {
     crate::core::platform::device::note_relayed_gap();
+    count_refusal(kind);
+}
+
+/// Counts a refusal of the kind `kind` under its code, and under the code of the make that runs on
+/// the thread where one names one (`crate::answer::refusing_as`).
+fn count_refusal(kind: RtRefusal) {
     crate::answer::count_kind(kind.code());
+    if let Some(code) = crate::answer::refusing() {
+        crate::answer::count_kind(code);
+    }
 }
 
 /// [`rt_refused`] of a creator, which answers nil where Metal makes the object: noted for core as
@@ -515,7 +525,8 @@ mod tests {
         assert!(!relayed);
     }
 
-    /// rt's refusal is counted under its kind's code; a creator's is noted for core as a gap.
+    /// rt's refusal is counted under its kind's code, and under the code of a make running on the
+    /// thread that names one; a creator's is noted for core as a gap.
     #[test]
     fn rt_s_refusal_is_counted_under_its_kind() {
         let error = rt::Error::Quiesced;
@@ -526,6 +537,12 @@ mod tests {
         assert_eq!(kind, RtRefusal::Quiesced);
         assert!(relayed);
         assert!(counted(code) >= before + 2, "{code}");
+        let making = "test-refused-making";
+        let (made, ours) = (counted(code), counted(making));
+        crate::answer::refusing_as(making, || rt_refused("test", &error));
+        crate::answer::refusing_as(making, || refused_again(RtRefusal::Quiesced));
+        assert_eq!(counted(making), ours + 2);
+        assert!(counted(code) >= made + 2, "{code}");
     }
 
     /// rt's refusal of a texture for its format is counted under the format's own code, each

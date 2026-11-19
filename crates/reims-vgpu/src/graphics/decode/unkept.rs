@@ -19,10 +19,12 @@
 //! **Imports.** Each make the decoder or the device asks of the platform runs as a make of its
 //! kind on its thread (`reims_vgpu_vulkan::answer::making_as`, [`Codes::imports`]): metal2vulkan-rt
 //! counts each import of the host's memory it makes there under that kind, with the most live at
-//! once, and under its total (`rt-imports`), so the kinds' counts sum to it. The device's own makes
-//! that import are kinds of their own: the views of pages blocks ([`Kind::PagesView`]), the views a
-//! device cache's copies use ([`Kind::CacheView`]), the display's scanout ([`Kind::Scanout`]) and a
-//! window's mirror ([`Kind::Mirror`]).
+//! once, and under its total (`rt-imports`), so the kinds' counts sum to it. Each refusal of rt's
+//! there is counted under the kind too (`reims_vgpu_vulkan::answer::refusing_as`,
+//! [`Codes::refused`]), beside its own code (`rt-refused-vulkan` and the others). The device's
+//! own makes that import are kinds of their own: the views of pages blocks ([`Kind::PagesView`]),
+//! the views a device cache's copies use ([`Kind::CacheView`]), the display's scanout
+//! ([`Kind::Scanout`]) and a window's mirror ([`Kind::Mirror`]).
 //!
 //! On a platform that places a pinned object anywhere (the Vulkan platform's) no pin or object is
 //! counted here, and none of its makes imports through a counted path.
@@ -100,6 +102,8 @@ pub(crate) struct Codes {
     /// The platform's imports of the host's memory for the kind's makes, `rt-imports-<kind>`, and
     /// the most live at once.
     pub(crate) imports: MadeCodes,
+    /// rt's refusals of the kind's makes, `rt-refused-making-<kind>`.
+    pub(crate) refused: &'static str,
 }
 
 /// The codes of the kind named `$kind`.
@@ -115,6 +119,7 @@ macro_rules! codes {
                 made: concat!("rt-imports-", $kind),
                 live_most: concat!("rt-imports-", $kind, "-live-most"),
             },
+            refused: concat!("rt-refused-making-", $kind),
         }
     };
 }
@@ -165,10 +170,13 @@ impl Kind {
         }
     }
 
-    /// Runs `make` as a make of the kind (`reims_vgpu_vulkan::answer::making_as`): the
-    /// platform's imports for it are counted under the kind's codes.
+    /// Runs `make` as a make of the kind (`reims_vgpu_vulkan::answer::making_as`,
+    /// `refusing_as`): the platform's imports and refusals for it are counted under the kind's
+    /// codes.
     pub(crate) fn making<T>(self, make: impl FnOnce() -> T) -> T {
-        reims_vgpu_vulkan::answer::making_as(self.codes().imports, make)
+        let codes = self.codes();
+        let refusing = || reims_vgpu_vulkan::answer::refusing_as(codes.refused, make);
+        reims_vgpu_vulkan::answer::making_as(codes.imports, refusing)
     }
 }
 
@@ -237,6 +245,7 @@ mod tests {
                     c.made.live_most,
                     c.imports.made,
                     c.imports.live_most,
+                    c.refused,
                 ]
             })
             .collect();
@@ -247,6 +256,7 @@ mod tests {
             );
             assert!(c.made.made.starts_with("rt-made-"), "{kind:?}");
             assert!(c.imports.made.starts_with("rt-imports-"), "{kind:?}");
+            assert!(c.refused.starts_with("rt-refused-making-"), "{kind:?}");
             assert_eq!(c.imports.live_most, format!("{}-live-most", c.imports.made));
             assert_eq!(c.made.live_most, format!("{}-live-most", c.made.made));
         }

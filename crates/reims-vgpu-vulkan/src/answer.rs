@@ -2822,6 +2822,38 @@ pub fn making() -> Option<MadeCodes> {
     MAKING.with(Cell::get)
 }
 
+thread_local! {
+    /// The code a refusal of the platform's on the thread is counted under too, while a make
+    /// runs that names one ([`refusing_as`]).
+    static REFUSING: Cell<Option<&'static str>> = const { Cell::new(None) };
+}
+
+/// Runs `make` with each refusal of the platform's on this thread counted under `code` too
+/// ([`refusing`]), so the counts say which of the caller's makes the platform refused. Where a
+/// make that names another code runs already on the thread, that one names it, as in
+/// [`making_as`].
+pub fn refusing_as<T>(code: &'static str, make: impl FnOnce() -> T) -> T {
+    /// Puts back the code of the make that ran before, however `make` returns.
+    struct Restore(Option<&'static str>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REFUSING.with(|r| r.set(self.0));
+        }
+    }
+    let was = REFUSING.with(Cell::get);
+    let _restore = Restore(was);
+    if was.is_none() {
+        REFUSING.with(|r| r.set(Some(code)));
+    }
+    make()
+}
+
+/// The code a refusal of the platform's on this thread is counted under too ([`refusing_as`]),
+/// where a make that names one runs.
+pub fn refusing() -> Option<&'static str> {
+    REFUSING.with(Cell::get)
+}
+
 /// The kinds counted by code ([`count_kind`], [`count_kind_by`]), each with how many times, in
 /// the order each was first counted: the recorder's stats file writes them.
 pub fn counted_kinds() -> Vec<(&'static str, u64)> {
@@ -4194,6 +4226,11 @@ mod tests {
         assert_eq!(seen, (Some(OUTER), Some(OUTER)));
         assert_eq!(making_as(INNER, making), Some(INNER));
         assert_eq!(making(), None);
+        assert_eq!(refusing(), None);
+        let seen = refusing_as("test-outer", || (refusing(), refusing_as("test-inner", refusing)));
+        assert_eq!(seen, (Some("test-outer"), Some("test-outer")));
+        assert_eq!(refusing_as("test-inner", refusing), Some("test-inner"));
+        assert_eq!(refusing(), None);
         let counted = |code: &str| {
             (counted_kinds().into_iter())
                 .find(|&(c, _)| c == code)
