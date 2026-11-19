@@ -31,7 +31,10 @@
 //! later work, the drain of its context and its place among the queue's buffers in flight. Such
 //! a `CB_COMPLETE` carries no GPU times (0 for each), and is posted on the thread that tells of
 //! the decode done (the VA-API arm's picture landing thread, `reims-vgpu.graphics-video-land`),
-//! or on the buffer's lane where the decode was done before its commit.
+//! or on the buffer's lane where the decode was done before its commit. A picture whose copy then
+//! fails, its buffer completed already as landed, fails the session's next decode in its stead,
+//! whose buffer completes failed at its platform end: the guest is told of the failure one
+//! picture late (`super::super::video_host::CARRIED_CODE`, counted as a degradation).
 
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
@@ -438,6 +441,16 @@ impl Landed {
         if let Some(Some(early)) = now {
             early(Arc::clone(self));
         }
+    }
+
+    /// Arms a post that fixes what its completion answers, as a command buffer's commit arms its
+    /// post at the decode ([`Self::arm`]), for the tests of the sessions that land pictures,
+    /// which commit no command buffer.
+    #[cfg(test)]
+    pub(crate) fn arm_answering(self: &Arc<Self>) {
+        self.arm(Box::new(|landed| {
+            landed.post();
+        }));
     }
 
     /// Fixes what the command buffer's completion answers, once: whether the picture failed, to

@@ -157,7 +157,11 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   an HEVC picture's schedule waits for its verdict and fails (`kVTVideoDecoderMalfunctionErr`,
   design.md, "A decode the driver cannot complete is a decode error"); an H.264 picture reaches
   the guest as decoded, as AppleGVA's H.264 decoder reports no failure, so the driver refuses what
-  it can tell before a picture, its size, at the create ([bugs.md](bugs.md), D25).
+  it can tell before a picture, its size, at the create ([bugs.md](bugs.md), D25). A picture
+  whose copy into its output's caches fails after its command buffer completed at the decode
+  (above) fails the session's next decode in its stead, whose command buffer completes failed at
+  its end: the guest is told of the failure one picture late, counted as a degradation
+  (`video-landing-failure-carried`).
 - **A failed picture's output holds what the driver wrote** where the driver writes the output
   itself: a picture decoded into its output's cache, and one the driver's video processing
   copies there or into the pages, which on VA-API is issued right behind its decode and copies

@@ -92,6 +92,13 @@ const STAGING_ALIGNMENT: u64 = 256;
 /// The failures to land a session logs, one line each; the rest are counted.
 const FAILURES_LOGGED: u64 = 8;
 
+/// The code of a picture that did not land after its command buffer completed at its decode
+/// (`super::decode`'s video module docs, "Completed at the decode"): the session's next decode
+/// fails in its stead, its command buffer completing as one whose picture did not land, so that
+/// the guest is told of the failure one decode late (docs/conventions.md, "Each degradation is
+/// logged once per boot, then counted").
+pub(crate) const CARRIED_CODE: &str = "video-landing-failure-carried";
+
 /// A backend's error: what it could not do, which the session logs or faults the command buffer
 /// with.
 pub(crate) type BackendError = Box<dyn std::error::Error + Send + Sync>;
@@ -1059,6 +1066,9 @@ fn land_pictures<P: Platform>(
     counts: &Mutex<Counts>,
     name: &'static str,
 ) {
+    // A picture did not land after its command buffer completed at its decode: the next decode
+    // fails in its stead ([`CARRIED_CODE`]).
+    let mut carried = false;
     for job in jobs {
         // A step of the exit gate's: the process's exit waits for the picture landing, and one
         // after the exit began parks the thread before the hardware's calls.
@@ -1072,6 +1082,11 @@ fn land_pictures<P: Platform>(
             _bitstream,
             landed,
         } = job;
+        if std::mem::take(&mut carried) {
+            // Before its landing, which then posts no completion at its decode: its command
+            // buffer completes failed, at its end.
+            landed.fail();
+        }
         match picture.map(|picture| land(picture, &output, &mut stage, clock, &landed)) {
             None => counts.lock().skipped += 1,
             Some(Ok((way, hardware_failed, cpu))) => {
@@ -1103,8 +1118,18 @@ fn land_pictures<P: Platform>(
                 }
             }
             Some(Err(error)) => {
-                // Before the signal: the command buffer waiting for it completes failed.
-                landed.fail();
+                // Before the signal: the command buffer waiting for it completes failed, or,
+                // where it completed at the decode already, the next decode's does.
+                carried = landed.fail();
+                if carried {
+                    reims_vgpu_vulkan::answer::count_kind(CARRIED_CODE);
+                    // Once per process, at its level; the rest at debug, counted.
+                    log::warn!(
+                        "hardware video: {name}: a picture did not land after its command buffer \
+                         completed at its decode: the session's next decode fails in its stead \
+                         (counted as {CARRIED_CODE})"
+                    );
+                }
                 let mut counts = counts.lock();
                 counts.failed += 1;
                 if counts.failed <= FAILURES_LOGGED {

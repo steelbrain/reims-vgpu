@@ -63,6 +63,8 @@ enum Picture {
     Gated(u8, Log, mpsc::Receiver<()>),
     /// A failure to land.
     Fail,
+    /// A failure to land once `go` is sent, after its decode was said done.
+    FailDone(mpsc::Receiver<()>),
     /// As `Fill`, of a decode the hardware answered failed.
     FailedFill(u8, Log),
 }
@@ -111,6 +113,11 @@ impl HostPicture<P> for Picture {
                 Ok(())
             }
             Picture::Fail => Err("the hardware failed".into()),
+            Picture::FailDone(go) => {
+                go.recv().unwrap();
+                to.decode_done();
+                Err("the GPU failed the copy".into())
+            }
             Picture::FailedFill(n, log) => {
                 to.hardware_failed("status 8".to_owned());
                 fill(to, n, &log)
@@ -483,6 +490,48 @@ fn a_failed_landing_is_signalled_and_a_refusal_spends_no_value() {
     assert_eq!(next.value, 2);
     assert!(event_of(&s).wait_until_signaled_value(2, 10_000));
     assert!(next.landed.as_deref().is_some_and(|l| !l.failed()));
+}
+
+/// A picture that does not land after its command buffer completed at its decode, its copy
+/// into the output's caches failed, fails the session's next decode in its stead, counted
+/// ([`CARRIED_CODE`]); the decode after that one lands as any.
+#[test]
+fn a_failure_after_a_completion_at_the_decode_fails_the_next_decode_alone() {
+    let counted = || {
+        (reims_vgpu_vulkan::answer::counted_kinds().into_iter())
+            .find(|&(code, _)| code == CARRIED_CODE)
+            .map_or(0, |(_, n)| n)
+    };
+    let before = counted();
+    let p = FakePlatform::new();
+    let log = Log::default();
+    let (go, gate) = mpsc::channel();
+    let s = session(&p, vec![Ok(Some(Picture::FailDone(gate)))], &log);
+    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
+    let cache = buffer(&p, 16384, PRIVATE);
+    let pages = buffer(&p, 16384, STORAGE_SHARED);
+    let first = (s.decode(&decode(&bitstream, &[], planes(&cache, &cache, 128))))
+        .unwrap()
+        .landed
+        .unwrap();
+    // Its command buffer's commit arms its completion's post at the decode.
+    first.arm_answering();
+    let d = || decode(&bitstream, &[], planes(&pages, &pages, 96));
+    let (next, after) = (s.decode(&d()).unwrap(), s.decode(&d()).unwrap());
+    go.send(()).unwrap();
+    assert!(event_of(&s).wait_until_signaled_value(3, 10_000));
+    assert!(first.failed());
+    assert_eq!(counted(), before + 1, "its completion was posted at its decode");
+    assert!(
+        next.landed.as_deref().is_some_and(Landed::failed),
+        "the next decode's command buffer completes failed"
+    );
+    assert!(
+        after.landed.as_deref().is_some_and(|l| !l.failed()),
+        "the decode after it is not affected"
+    );
+    assert!(holds(&bytes(&pages), 0, 64, 96, 3));
+    assert_eq!(s.counts.lock().failed, 1);
 }
 
 /// A picture the hardware answered failed that its backend lands all the same lands as any, its
