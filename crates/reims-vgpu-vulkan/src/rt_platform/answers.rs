@@ -485,7 +485,7 @@ pub(crate) mod tests {
         assert_eq!(id.flags.supports_dynamic_libraries, Some(false));
         assert_eq!(id.flags.has_unified_memory, Some(true));
         assert_eq!(id.sizes.max_buffer_length, Some(1 << 31));
-        assert_eq!(id.sizes.max_argument_buffer_sampler_count, Some(3998));
+        assert_eq!(id.sizes.max_argument_buffer_sampler_count, Some(3999));
         assert_eq!(
             id.architecture_name.as_deref(),
             Some("vulkan_1002_15bf_abababababababababababababababab")

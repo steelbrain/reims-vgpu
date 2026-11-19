@@ -831,7 +831,10 @@ mod tests {
         assert!(caps.limits.max_texture_width_2d <= u64::from(limits.max_image_dimension2_d));
         assert!(caps.sample_counts[0] == Ok(true));
         let identity = device.identity_caps();
-        assert_eq!(identity.formats.len(), crate::core::platform::caps::SDK_PIXEL_FORMATS.len());
+        assert_eq!(
+            identity.formats.len(),
+            crate::core::platform::caps::SDK_PIXEL_FORMATS.len()
+        );
         assert!(device.own_memory_budget() > 0);
         assert!(device.memory_heaps_total() >= device.own_memory_budget());
         assert!(device.linear_row_alignment() > 0);
@@ -865,7 +868,10 @@ mod tests {
         let Ok(SizeAndAlign { size, align }) = sized else {
             panic!("no size: {sized:?}");
         };
-        assert!(size >= 64 * 64 * 4 && align.is_power_of_two(), "{size} at {align}");
+        assert!(
+            size >= 64 * 64 * 4 && align.is_power_of_two(),
+            "{size} at {align}"
+        );
         let counted = |code: &str| {
             (crate::answer::degradation_counts().into_iter())
                 .find(|(c, _)| c == code)
