@@ -215,15 +215,14 @@ mod tests {
     use reims_vgpu_vulkan::core::platform::types::MtlSize;
 
     use super::super::surface_cache::tests::{
-        NO_REACH, blit_with, blits_with, cache_id, cached, copies, download, encoder_with,
-        queues, reading, release, surface_texture, surface_texture_as, surface_textures,
-        use_surfaces,
+        NO_REACH, blit_with, blits_with, cache_id, cached, copies, download, encoder_with, queues,
+        reading, release, surface_texture, surface_texture_as, surface_textures, use_surfaces,
     };
-    use reims_vgpu_vulkan::core::testkit::Step;
-    use reims_vgpu_vulkan::core::testkit::impls::resource::TEXTURE_SLOT_WRITES;
     use super::super::surface_pages::tests::{BLOCK, Rig, one_plane, rig};
     use super::*;
     use crate::platform::ApiPlatform as _;
+    use reims_vgpu_vulkan::core::testkit::Step;
+    use reims_vgpu_vulkan::core::testkit::impls::resource::TEXTURE_SLOT_WRITES;
 
     const ON: OnFault = OnFault::Return;
 
@@ -783,28 +782,32 @@ mod tests {
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(downloaded.load(Ordering::SeqCst));
 
-        // B's write reaches A, its texels at its own size; B alone is dirty then.
+        // B's write reaches A, its texels at its own size; B alone is dirty then, so the early
+        // copy that follows the download's write writes B alone back.
         let mark = r.p.call_log().mark();
         write(&mut r, 0x102, 22, (16, 4));
-        let (out, into) = overlaps(&r.p.call_log().since(mark), &[a, b]);
+        let calls = r.p.call_log().since(mark);
+        let (out, into) = overlaps(&calls, &[a, b]);
+        assert_eq!(into, [(a, texels(16, 4))]);
         assert_eq!(
-            (out, into),
-            (vec![(b, texels(16, 4))], vec![(a, texels(16, 4))])
+            out,
+            [(b, texels(16, 4)), (b, texels(16, 4))],
+            "rule 1's, then the early copy's"
         );
+        assert_eq!(written_back(&calls), [(b, cache, 0), (b, cache, 0)]);
         r.p.world().complete_all(CompleteOn::Caller);
-        let mark = r.p.call_log().mark();
-        let downloaded = download(&r, BLOCK);
-        assert_eq!(written_back(&r.p.call_log().since(mark)), [(b, cache, 0)]);
-        r.p.world().complete_all(CompleteOn::Caller);
-        assert!(downloaded.load(Ordering::SeqCst));
+        assert_eq!(r.dec.caches().counts().early, 1);
 
-        // B unreferenced and clean: A's next write drops it, with no fence and no copy.
+        // B unreferenced and clean: A's next write drops it, with no fence and no copy into a
+        // shape; the early copy writes A back.
         destroy(&mut r, 22);
         let mark = r.p.call_log().mark();
         write(&mut r, 0x103, 21, (32, 8));
         let calls = r.p.call_log().since(mark);
         assert!(calls.iter().all(|c| c.sel != "updateFence:"), "no fence");
-        assert_eq!(overlaps(&calls, &[a, b]), (vec![], vec![]));
+        let (out, into) = overlaps(&calls, &[a, b]);
+        assert!(into.is_empty());
+        assert!(out.iter().all(|(image, size)| (*image, size) == (a, &texels(32, 8))));
         assert_eq!(r.dec.caches().counts().shapes.overlap_dropped, 2, "B too");
     }
 
@@ -928,7 +931,10 @@ mod tests {
         let m = RgfxComputeOpSetComputePipelineState {
             pipeline_obj_id: obj_id,
         };
-        (RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, m.as_bytes().to_vec())
+        (
+            RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE,
+            m.as_bytes().to_vec(),
+        )
     }
 
     /// A compute encoder's op that binds texture `obj_id` (0 for nil) at slot `index`.
@@ -963,7 +969,8 @@ mod tests {
         let cache = cache_id(&r);
         compute_pipeline(&mut r, 31);
         if let Some(answer) = answer {
-            r.p.script().always(TEXTURE_SLOT_WRITES, Step::value(answer));
+            r.p.script()
+                .always(TEXTURE_SLOT_WRITES, Step::value(answer));
         }
         let image = writable_image(&mut r, 25);
         let mark = r.p.call_log().mark();

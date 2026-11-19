@@ -1074,8 +1074,7 @@ mod tests {
         };
         // (pixel format, texel bytes, width, height): the whole, and two inside it, all at the
         // plane's first texel.
-        let cases: [(u64, u64, u64, u64); 3] =
-            [(80, 4, 64, 16), (30, 2, 16, 8), (30, 2, 9, 2)];
+        let cases: [(u64, u64, u64, u64); 3] = [(80, 4, 64, 16), (30, 2, 16, 8), (30, 2, 9, 2)];
         let mut table = ShapeTable::default();
         let mut held = Vec::new();
         for (n, &(pixel_format, texel_bytes, width, height)) in cases.iter().enumerate() {
@@ -1162,16 +1161,30 @@ mod tests {
         let cb = queue.command_buffer(ON).unwrap().unwrap();
         fill::<V>(&cb, &buffer, &mut table, |s| s.id() != whole, &mut counts).unwrap();
         commit(cb);
-        assert_eq!(rows_of(&table, wide), corner(&vec![0; LENGTH.to_usize()], 32, 8));
+        assert_eq!(
+            rows_of(&table, wide),
+            corner(&vec![0; LENGTH.to_usize()], 32, 8)
+        );
 
         let cb = queue.command_buffer(ON).unwrap().unwrap();
-        copy_overlaps::<V>(&cb, &buffer, &table, (whole, &[wide, narrow]), None, &mut counts)
-            .unwrap();
+        copy_overlaps::<V>(
+            &cb,
+            &buffer,
+            &table,
+            (whole, &[wide, narrow]),
+            None,
+            &mut counts,
+        )
+        .unwrap();
         commit(cb);
         assert_eq!(rows_of(&table, wide), corner(&p, 32, 8));
         assert_eq!(rows_of(&table, narrow), corner(&p, 18, 2));
         assert_eq!(
-            (counts.overlap_copies, counts.overlap_bytes, counts.straddled),
+            (
+                counts.overlap_copies,
+                counts.overlap_bytes,
+                counts.straddled
+            ),
             (2, 32 * 8 + 18 * 2, 0)
         );
         let mut want = vec![0u8; LENGTH.to_usize()];
@@ -1183,7 +1196,10 @@ mod tests {
         let read = unsafe {
             std::slice::from_raw_parts(buffer.contents().as_ptr::<u8>(), LENGTH.to_usize())
         };
-        assert!(read == want.as_slice(), "the whole's overlap alone, at its place");
+        assert!(
+            read == want.as_slice(),
+            "the whole's overlap alone, at its place"
+        );
 
         // The narrow one takes `q`, then gives the whole its two rows.
         store(&q);
@@ -1198,7 +1214,11 @@ mod tests {
             let at = y * ROW.to_usize();
             row[..16].copy_from_slice(&q[at..at + 16]);
         }
-        assert_eq!(rows_of(&table, whole), want, "16 bytes of 18; the straddled texel kept");
+        assert_eq!(
+            rows_of(&table, whole),
+            want,
+            "16 bytes of 18; the straddled texel kept"
+        );
         assert_eq!(counts.straddled, 1);
         assert_eq!(counts.overlap_copies, 3);
         drop(held);
