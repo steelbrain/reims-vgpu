@@ -563,10 +563,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             };
             // The guest's processes take blocks of it for their buffers' slabs (`POOL`), on a
             // Linux or macOS host: on Windows the pool waits for its cost under WHP to be measured
-            // within 5% of the region's. An arm64 guest's kernel maps the pool's addresses, past
-            // its RAM and above 2^36, write-back, as the x86-64 kernel does: an arm64 26 boot
-            // under TCG, which faults an unaligned load from Device memory, read each of its
-            // first blocks unaligned through such a mapping.
+            // within 5% of the region's. An arm64 guest's processes use the blocks write-back, as
+            // an x86-64 guest's do: arm64 boots under TCG and HVF ran on them with no fault
+            // (docs/graphics-kext/design.md, "The Shared pool").
             let pool_ledger = (shared_pool.as_ref())
                 .filter(|_| !cfg!(windows))
                 .map(Pool::ledger);

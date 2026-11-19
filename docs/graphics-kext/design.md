@@ -4819,11 +4819,15 @@ feature bit 57) to an x86-64 or arm64 guest on a Linux or macOS host where it
 has a pool, and both kexts take it. A Windows host offers none until the
 pool's cost under WHP measures within 5% of the region's: its guests keep the
 region's slabs and the process's own pages (`kIOReturnUnsupported` for
-selector 16). An arm64 guest's kernel maps the range write-back, past its RAM
-and above 2^36 alike, as an x86-64 guest's does: an arm64 26 boot under TCG,
-which faults an unaligned load from Device memory, read its first blocks
-unaligned through the kext's own write-back mapping and ran on
-(m3-max-51279). Where the guest took the bit, `POOL_BASE_LO` to
+selector 16). An arm64 guest's processes use their blocks write-back, as an
+x86-64 guest's do: the kext maps each into its process with
+`kIOMapCopybackCache`, and an unaligned access to memory left Device faults
+under TCG and on the hardware alike. arm64 boots ran on pool blocks with no
+fault: under TCG, macOS 26 and 14 with the range just past an 8 GiB guest's
+RAM, at 0x300000000 (m3-max-51507, m3-max-51493), and macOS 26 with it moved
+to 2^36 (m3-max-51364); under HVF on an M3 Max, macOS 27.0.1 at 0x300000000
+(m3-max-51499), where each 256 MiB piece maps into the VM as RAM, 16 KiB
+aligned (`hv_vm_map`). Where the guest took the bit, `POOL_BASE_LO` to
 `POOL_LENGTH_HI` read the range, the same for the device's life, and the kext
 reads it once.
 - **A take.** A slab asks the kext for a block of the bytes it needs
