@@ -7,8 +7,9 @@
 //!
 //! On a source that gives Private blocks (metal2vulkan-rt's device), a take is one block of the
 //! source's ([`BlockSource::take_block`] of [`MemoryClass::Private`]): device memory no one maps,
-//! at the block's own GPU address, the whole of it the context's (a pooled block is the source's
-//! `BLOCK_LEN` long whatever the take's length). On a source with none (`HostBlocks`, the Vulkan
+//! at the block's own GPU address, the whole of it the context's (the take's length rounded up to
+//! rt's 64 KiB, carved from one of its 16 MiB allocations where it fits, else the start of an
+//! allocation of its own: [`super::BLOCK_LEN`]). On a source with none (`HostBlocks`, the Vulkan
 //! platform's), a block is a range of addresses the host picks ([`HostAddresses::private`],
 //! `[2^44, 2^45)`) with no memory of its own, the take's length rounded up to [`TAKE_ALIGN`]: the
 //! platform makes each object the guest places there as it makes one at the guest's own picks,

@@ -120,7 +120,11 @@ pub const TAKE_WAIT_CODES: [(&str, &str); 4] = [
     ("pool-take-wait-zero-ns", "pool-take-wait-zero-max-ns"),
 ];
 
-/// A pooled block's length, metal2vulkan-rt's `BLOCK_LEN`: 256 MiB.
+/// The length of the piece the pool keeps ahead of the guest's takes, its headroom (the module
+/// doc's "Headroom and giving blocks back"), and of every block [`HostBlocks`] hands out for an
+/// ask no longer: 256 MiB. It is the pool's own: metal2vulkan-rt hands out a block of the length
+/// asked, rounded up to 64 KiB, carved from its 16 MiB allocations (its
+/// `MemoryClass::block_len`) where it fits one, else at the start of an allocation of its own.
 pub const BLOCK_LEN: u64 = 256 << 20;
 
 /// The alignment of a piece's guest physical address and of a pool's range: 2 MiB, a large page
@@ -170,7 +174,7 @@ pub struct BlockInfo {
     pub id: BlockId,
     /// Its class.
     pub class: MemoryClass,
-    /// Its length: [`BLOCK_LEN`] for a pooled block, more for a dedicated one.
+    /// Its length: at least the length asked ([`HostBlocks`]' [`BLOCK_LEN`] for a shorter ask).
     pub len: u64,
     /// The GPU address of its first byte; 0 from a source with no GPU ([`HostBlocks`]).
     pub gpu_address: u64,
@@ -202,8 +206,8 @@ pub enum BlockError {
 /// Where the pool's blocks come from (metal2vulkan-rt's `Device::take_block` and
 /// `release_block`).
 pub trait BlockSource: Send + Sync {
-    /// A block of `class` at least `len` long: a pooled one up to [`BLOCK_LEN`], a dedicated one
-    /// past it. Waits only when no block is ready.
+    /// A block of `class` at least `len` long ([`BlockInfo::len`]). Waits only when no block is
+    /// ready.
     fn take_block(&self, class: MemoryClass, len: u64) -> Result<BlockInfo, BlockError>;
     /// Gives a block back, which no mapping of the guest's and no thread of the caller's touches
     /// any more: it goes back to the ready set, with its id, address and host mapping, or is
