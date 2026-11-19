@@ -90,9 +90,6 @@ pub enum Unbuilt {
     /// Rasterization rate maps, their descriptors and layers: rt has none. A layer's creation
     /// answers nil, and a descriptor keeps no layer.
     RateMap,
-    /// A display's present into its host window: rt has no swapchain yet. The window never
-    /// opens, and the guest's frames reach the host only through its reads of the display.
-    Present,
     /// Indirect command buffers, and the reservation of their resource indices (type 5): rt has
     /// none. A creation answers nil.
     Icb,
@@ -105,7 +102,7 @@ pub enum Unbuilt {
 
 impl Unbuilt {
     /// Every piece, once, in the order of their codes' places.
-    pub const ALL: [Unbuilt; 19] = [
+    pub const ALL: [Unbuilt; 18] = [
         Unbuilt::Buffer,
         Unbuilt::IosurfaceTexture,
         Unbuilt::SharedTexture,
@@ -121,7 +118,6 @@ impl Unbuilt {
         Unbuilt::Blit,
         Unbuilt::RenderPass,
         Unbuilt::RateMap,
-        Unbuilt::Present,
         Unbuilt::Icb,
         Unbuilt::DynamicLibrary,
         Unbuilt::ResourceType,
@@ -145,7 +141,6 @@ impl Unbuilt {
             Unbuilt::Blit => "rt-unbuilt-blit",
             Unbuilt::RenderPass => "rt-unbuilt-render-pass",
             Unbuilt::RateMap => "rt-unbuilt-rate-map",
-            Unbuilt::Present => "rt-unbuilt-present",
             Unbuilt::Icb => "rt-unbuilt-icb",
             Unbuilt::DynamicLibrary => "rt-unbuilt-dynamic-library",
             Unbuilt::ResourceType => "rt-unbuilt-resource-type",
@@ -170,7 +165,6 @@ impl Unbuilt {
             Unbuilt::Blit => "a colour fill, a pattern fill or a copy with blit options",
             Unbuilt::RenderPass => "a render pass's visibility buffer, layers, tiles or samples",
             Unbuilt::RateMap => "a rasterization rate map",
-            Unbuilt::Present => "a display's present into its host window",
             Unbuilt::Icb => "an indirect command buffer",
             Unbuilt::DynamicLibrary => "a dynamic library",
             Unbuilt::ResourceType => "a reservation of resource indices of another type",
