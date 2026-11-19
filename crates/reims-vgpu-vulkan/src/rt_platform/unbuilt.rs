@@ -40,8 +40,9 @@ pub enum Unbuilt {
     /// texture over a buffer (`newTiledTextureWithDescriptor:offset:bytesPerRow:`), a copy of its
     /// bytes. Each answers nil.
     Buffer,
-    /// A texture over a plane of an IOSurface (`newTextureWithDescriptor:iosurface:plane:`), which
-    /// rt makes none of yet. Each answers nil.
+    /// A texture over a plane of an IOSurface (`newTextureWithDescriptor:iosurface:plane:`) of a
+    /// format that reads beside its plane (a two-plane YCbCr or XR10 format over a surface of two
+    /// planes or more), which rt makes none of yet. Each answers nil.
     IosurfaceTexture,
     /// Shared textures and their handles (`newSharedTextureWithDescriptor:`), which rt has none
     /// of. Each answers nil.

@@ -2,7 +2,8 @@
 //! device's `newBufferWithLength:options:` ([`of_length`]), `newBufferWithDescriptor:`
 //! ([`of_desc`]) and `newBufferWithBytesNoCopy:length:options:deallocator:`
 //! ([`over_host_memory`]), and by heaps (`super::heap`), and the textures over their bytes
-//! (`super::texture::make_over`).
+//! (`super::texture::make_over`), over a plane of an IOSurface the buffer stands for among them
+//! (`newTextureWithDescriptor:iosurface:plane:`, at the plane's offset and rows).
 //!
 //! **Blocks of its own.** A buffer the device makes takes blocks of its own (rt's `take_block`):
 //! a Shared or Private one of its storage mode, and for a Managed buffer a Shared one of its
@@ -58,9 +59,10 @@
 //! **Refusals.** What Metal refuses is nil, counted as Metal's refusal (`rt-refused-metal`): a
 //! length of 0 or past rt's longest buffer, an option value Metal has none of, a Memoryless
 //! buffer, option bit 24 on a buffer the device makes, a Private no-copy buffer, a deallocator of a
-//! buffer that is not no-copy. What rt refuses is nil, counted under rt's kind. A Private buffer of
-//! bytes, which a copy on the GPU fills, and a tiled texture over a buffer are unbuilt
-//! ([`Unbuilt::Buffer`]).
+//! buffer that is not no-copy, a texture over a plane past 0 of a surface without planes. What rt
+//! refuses is nil, counted under rt's kind. A Private buffer of bytes, which a copy on the GPU
+//! fills, and a tiled texture over a buffer are unbuilt ([`Unbuilt::Buffer`]), and so is a texture
+//! over a surface's plane of a format that reads beside the plane ([`Unbuilt::IosurfaceTexture`]).
 
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
@@ -949,18 +951,39 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
         Ok(None)
     }
 
-    /// Unbuilt: nil ([`Unbuilt::IosurfaceTexture`]), as `newTextureWithDescriptor:iosurface:plane:`
-    /// answers on the platform.
+    /// rt's texture over the buffer's bytes at the plane's offset, rows its bytes per row apart,
+    /// as [`Self::new_texture`] makes one: the buffer stands for the surface. Of the surface's
+    /// facts, Metal's answers: a plane past 0 of a surface without planes is Metal's refusal
+    /// (`rt-refused-metal`), where Metal asserts, and a plane past a planar surface's last is nil,
+    /// as Metal's. A format that reads beside its plane over a surface of two planes or more (a
+    /// two-plane YCbCr format the Vulkan platform's runtime reads, a two-plane XR10 one:
+    /// `crate::gpu::device::plane_facts_taken`) is unbuilt: nil ([`Unbuilt::IosurfaceTexture`]),
+    /// as rt's texture over a buffer reads one plane. Without facts the texture is the buffer's.
     fn new_texture_over_surface_plane(
         &self,
         on: OnFault,
         descriptor: &RtObj<TextureFields>,
         plane: SurfacePlane,
     ) -> RaiseResult<Option<RtObj<RtTexture>>> {
-        let _ = (on, descriptor, plane);
+        let _ = on;
         let sel = "newTextureWithDescriptor:iosurface:plane:";
-        refuse_create(Unbuilt::IosurfaceTexture, sel);
-        Ok(None)
+        if let Some(facts) = plane.facts {
+            if plane.plane != 0 && facts.plane_count == 0 {
+                let what = format!("plane {} of a surface without planes", plane.plane);
+                return Ok(texture::refused_metal(sel, &what));
+            }
+            if facts.plane_count != 0 && plane.plane >= facts.plane_count {
+                return Ok(None);
+            }
+            let raw = u32::try_from(descriptor.desc().pixel_format).ok();
+            let pf = raw.and_then(|raw| metal2vulkan::metal::PixelFormat::try_from(raw).ok());
+            let beside = pf.and_then(crate::gpu::device::plane_facts_taken);
+            if beside.is_some() && facts.plane_count >= 2 {
+                refuse_create(Unbuilt::IosurfaceTexture, sel);
+                return Ok(None);
+            }
+        }
+        Ok(self.texture(sel, descriptor, plane.offset, plane.bytes_per_row))
     }
 }
 
@@ -1351,5 +1374,139 @@ mod tests {
         );
 
         assert!(scratch(0, 0).is_none() && scratch(64, 0x30).is_none());
+    }
+
+    /// Textures over the planes of a two-plane surface a Shared buffer stands for, on the GPU the
+    /// test holds: each reads its plane's texels at the plane's offset and rows, the CPU's writes
+    /// after it was made among them. Of the surface's facts, Metal's answers: a plane past 0 of a
+    /// surface without planes is Metal's refusal, counted, and a plane past the last nil; a
+    /// two-plane YCbCr format over plane 0 is unbuilt, counted; without facts the texture is the
+    /// buffer's.
+    #[test]
+    fn textures_over_surface_planes_on_vulkan() {
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::types::{CommandBufferStatus, MtlOrigin, MtlSize};
+        use crate::core::platform::values::SurfaceFacts;
+
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let of = |length| {
+            let made = device.new_buffer_of_length(on, length, 0);
+            made.expect("never a raise").expect("a Shared buffer")
+        };
+        // An 8 x 4 'x420' surface: plane 0, of 16-bit luma, 32 bytes in, and plane 1, of 2 x
+        // 16-bit chroma, after it, rows 32 bytes apart.
+        let surface = of(4096);
+        let facts = SurfaceFacts {
+            pixel_format: 0x7834_3230,
+            plane_count: 2,
+            width: 8,
+            height: 4,
+            chroma_offset: 160,
+            chroma_bytes_per_row: 32,
+            ycbcr_matrix: None,
+        };
+        let plane = |plane, offset, facts| SurfacePlane {
+            plane,
+            offset,
+            bytes_per_row: 32,
+            planar: true,
+            facts,
+        };
+        let descriptor = |pixel_format, width, height| {
+            platform.texture_descriptor(&TextureDesc {
+                pixel_format,
+                width,
+                height,
+                usage: 0x1,
+                ..TextureDesc::default()
+            })
+        };
+        let over = |desc: RtObj<TextureFields>, at: SurfacePlane| {
+            let made = surface.new_texture_over_surface_plane(on, &desc, at);
+            made.expect("never a raise")
+        };
+        // R16Unorm and RG16Unorm.
+        let luma = over(descriptor(20, 8, 4), plane(0, 32, Some(facts)));
+        let chroma = over(descriptor(60, 4, 2), plane(1, 160, Some(facts)));
+        let (luma, chroma) = (
+            luma.expect("a texture over plane 0"),
+            chroma.expect("a texture over plane 1"),
+        );
+
+        // The planes' texels as the GPU reads them, each row's 16 bytes packed.
+        let out = of(96);
+        let gpu_texels = || {
+            let made = queue.command_buffer(on).expect("never a raise");
+            let made = made.expect("a command buffer");
+            let encoder = made.blit_encoder(on).expect("never a raise");
+            let encoder = encoder.expect("a blit encoder");
+            for (texture, (width, height), at) in [(&luma, (8, 4), 0), (&chroma, (4, 2), 64)] {
+                let cmd = BlitCmd::CopyTextureToBuffer {
+                    source_texture: texture,
+                    source_slice: 0,
+                    source_level: 0,
+                    source_origin: MtlOrigin::default(),
+                    source_size: MtlSize::new(width, height, 1),
+                    destination_buffer: &out,
+                    destination_offset: at,
+                    destination_bytes_per_row: 16,
+                    destination_bytes_per_image: 16 * height,
+                };
+                assert_eq!(encoder.encode(on, cmd), Ok(()));
+            }
+            assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+            assert_eq!(made.commit(on), Ok(()));
+            assert_eq!(made.wait_until_completed(on), Ok(()));
+            assert_eq!(made.status(), CommandBufferStatus::COMPLETED);
+            read(out.contents(), 96)
+        };
+        // Writes the surface's bytes from `seed`: its planes' texels, each row's packed.
+        let fill = |seed: u8| {
+            let bytes: Vec<u8> = (0..4096_usize)
+                .map(|i| u8::try_from(i % 251).expect("a byte").wrapping_add(seed))
+                .collect();
+            // SAFETY: a Shared buffer's contents are mapped, 4096 bytes long.
+            unsafe {
+                let at = surface.contents().as_ptr::<u8>();
+                at.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len());
+            }
+            let rows = |offset: usize, count: usize| -> Vec<u8> {
+                (0..count)
+                    .flat_map(|row| bytes[offset + 32 * row..][..16].to_vec())
+                    .collect()
+            };
+            [rows(32, 4), rows(160, 2)].concat()
+        };
+        let texels = fill(3);
+        assert_eq!(gpu_texels(), texels);
+        let texels = fill(101);
+        assert_eq!(gpu_texels(), texels);
+
+        let (metal, unbuilt) = (RtRefusal::Refused.code(), Unbuilt::IosurfaceTexture.code());
+        let before = (counted(metal), counted(unbuilt));
+        let lone = SurfaceFacts {
+            plane_count: 0,
+            chroma_offset: 0,
+            chroma_bytes_per_row: 0,
+            ..facts
+        };
+        let lone = SurfacePlane {
+            planar: false,
+            ..plane(1, 0, Some(lone))
+        };
+        assert!(over(descriptor(20, 8, 4), lone).is_none());
+        assert_eq!(counted(metal), before.0 + 1);
+        assert!(over(descriptor(20, 8, 4), plane(2, 160, Some(facts))).is_none());
+        // YCbCr8_420_2P.
+        assert!(over(descriptor(500, 8, 4), plane(0, 32, Some(facts))).is_none());
+        assert_eq!(
+            (counted(metal), counted(unbuilt)),
+            (before.0 + 1, before.1 + 1)
+        );
+        assert!(over(descriptor(20, 8, 4), plane(0, 32, None)).is_some());
     }
 }
