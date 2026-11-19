@@ -660,6 +660,52 @@ fn a_take_in_a_zeroed_piece_zeroes_only_what_an_earlier_carve_held() {
     assert!(all(&pool, TAKE_ALIGN, 2 * TAKE_ALIGN, 0xa5));
 }
 
+/// A freed block's bytes, in a piece another block still holds, are zeroed by the pool's zeroer
+/// with no take, and the carved block beside them is left as it is; a take over them then finds
+/// them zero and leaves them, counted as zeroed ahead
+#[test]
+fn a_freed_blocks_bytes_are_zeroed_after_its_free_and_a_take_over_them_leaves_them() {
+    let counted = |code: &str| {
+        (reims_vgpu_vulkan::answer::counted_kinds().into_iter())
+            .find(|(c, _)| *c == code)
+            .map_or(0, |(_, n)| n)
+    };
+    let host = Arc::new(Host::default());
+    let (pool, _blocks, ledger) = live_pool(&host, LONG);
+    assert_eq!(answer(&take(&ledger, 1, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
+    assert_eq!(
+        answer(&take(&ledger, 1, TAKE_ALIGN)),
+        Some((TAKE_ALIGN, TAKE_ALIGN))
+    );
+    fill(&pool, 0, TAKE_ALIGN, 0xa5);
+    fill(&pool, TAKE_ALIGN, TAKE_ALIGN, 0x5a);
+    let zeroed = counted(ZEROED_AFTER_FREE_BYTES_CODE);
+    let Give::Given(carve) = ledger.give(1, 0, TAKE_ALIGN, |_, _| false) else {
+        panic!("not given");
+    };
+    ledger.free(&[carve]);
+    let start = Instant::now();
+    while !all(&pool, 0, TAKE_ALIGN, 0) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the freed block's bytes are zeroed"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    while counted(ZEROED_AFTER_FREE_BYTES_CODE) < zeroed + TAKE_ALIGN {
+        assert!(start.elapsed() < Duration::from_secs(10), "counted");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(all(&pool, TAKE_ALIGN, TAKE_ALIGN, 0x5a));
+    // A byte the pool's record says reads zero, made 0x77 here: the take leaves it.
+    fill(&pool, 0, 1, 0x77);
+    let prezeroed = counted(TAKE_ZERO_PREZEROED_BYTES_CODE);
+    assert_eq!(answer(&take(&ledger, 2, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
+    assert!(all(&pool, 0, 1, 0x77));
+    assert!(all(&pool, 1, TAKE_ALIGN - 1, 0));
+    assert!(counted(TAKE_ZERO_PREZEROED_BYTES_CODE) >= prezeroed + TAKE_ALIGN);
+}
+
 #[test]
 fn a_take_of_no_bytes_or_past_the_longest_is_an_invalid_argument() {
     let host = Arc::new(Host::default());

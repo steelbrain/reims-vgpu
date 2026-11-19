@@ -107,6 +107,15 @@ pub const TAKE_ZEROED_BYTES_CODE: &str = "pool-take-zeroed-bytes";
 /// ([`BlockInfo::zeroed`], `takes`). Counted by the byte.
 pub const TAKE_ZERO_SKIPPED_BYTES_CODE: &str = "pool-take-zero-skipped-bytes";
 
+/// The code of a carve's bytes the take workers did not zero, as the pool's zeroer zeroed them
+/// after an earlier carve of them was freed and no carve held them since (`takes`, "Zeros after
+/// a free"). Counted by the byte.
+pub const TAKE_ZERO_PREZEROED_BYTES_CODE: &str = "pool-take-zero-skipped-prezeroed-bytes";
+
+/// The code of the bytes the pool's zeroer zeroed after their carves' frees (`takes`, "Zeros
+/// after a free"), counted by the byte.
+pub const ZEROED_AFTER_FREE_BYTES_CODE: &str = "pool-zeroed-after-free-bytes";
+
 /// The code of the takes answered, whose waits [`TAKE_WAIT_CODES`] count (`takes`).
 pub const TAKE_WAITS_CODE: &str = "pool-take-waits";
 
@@ -316,6 +325,9 @@ struct Piece {
     /// The mark of the bytes its carves ever held, from its block's take ([`Placed`]): those at
     /// or past it are as the source handed them out.
     placed: Placed,
+    /// The bytes below the mark that read zero, as the zeroer zeroed them after their carve's
+    /// free, by offset in the block; none of them is carved (`takes`, "Zeros after a free").
+    zeros: takes::Ranges,
 }
 
 impl Piece {
@@ -345,8 +357,15 @@ struct State {
     addresses: addresses::HostAddresses,
     /// The last number a carve, a context's takes or an ask took.
     serial: u64,
-    /// The take workers running (`takes`).
+    /// The take workers running, and the zeroer (`takes`).
     workers: usize,
+    /// Freed carves' bytes the zeroer zeroes, oldest first: each its piece's address and the
+    /// bytes' offsets in the piece's block (`takes`, "Zeros after a free").
+    to_zero: VecDeque<(u64, std::ops::Range<u64>)>,
+    /// The bytes the zeroer zeroes now, with the pool's lock let go of.
+    zeroing: Option<takes::Claim>,
+    /// The zeroer runs.
+    zeroer: bool,
     /// The ledgers given out and not dropped ([`PoolLedger`]).
     keepers: usize,
     /// The source, handed over by the device's release while a ledger lived: the last ledger's
@@ -815,6 +834,7 @@ impl Shared {
                 holds: 0,
                 carves: 0,
                 placed: Placed::default(),
+                zeros: takes::Ranges::new(),
             },
         );
         st.by_block.insert(block.id, at);
