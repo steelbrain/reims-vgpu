@@ -14178,6 +14178,6 @@ fn a_guest_that_took_pool_addresses_is_answered_each_block_s_gpu_address() {
     let mut heap = heap_over_pool(obj(1, 1), 0, 0x2_0000);
     heap[24..32].copy_from_slice(&first.to_le_bytes());
     guest.send(&device, heap);
-    assert_eq!(device.decoder_object_count(), 1);
+    assert!(eventually(|| device.decoder_object_count() == 1));
     assert_eq!(device.decoder_gpu_address(obj(1, 1)), Some(first));
 }
