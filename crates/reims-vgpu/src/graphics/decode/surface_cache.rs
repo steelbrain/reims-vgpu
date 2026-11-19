@@ -686,7 +686,8 @@ impl<P: Platform> SurfaceCache<P> {
         counts: &mut CacheCounts,
         timed: Option<&Now>,
     ) -> (Vec<Range<u64>>, Option<Vec<Range<u64>>>) {
-        let texels = (self.texels.clone()).unwrap_or_else(|| vec![0..self.length]);
+        let whole = 0..self.length;
+        let texels = (self.texels.clone()).unwrap_or_else(|| vec![whole]);
         let Some(written) = self.written_spans() else {
             return (texels, None);
         };
