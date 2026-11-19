@@ -195,23 +195,23 @@ const TAKE_NS: u64 = 1_000_000;
 /// How long a swapchain's end waits for an image the compositor has yet to give, in
 /// nanoseconds, before it leaves the fence behind rather than destroy it in use; and how long it
 /// waits for presents' fences before it waits for the queue to idle (the module doc).
-const END_WAIT_NS: u64 = 1_000_000_000;
+pub(crate) const END_WAIT_NS: u64 = 1_000_000_000;
 
 /// How many retired swapchains are kept for their last presents to be known complete before the
 /// queue is waited idle (the module doc): each keeps its images until it is destroyed.
-const RETIRED: usize = 4;
+pub(crate) const RETIRED: usize = 4;
 
 /// The images a swapchain asks for at least, by present mode.
-const MAILBOX_IMAGES: u32 = 4;
+pub(crate) const MAILBOX_IMAGES: u32 = 4;
 /// With FIFO.
-const FIFO_IMAGES: u32 = 3;
+pub(crate) const FIFO_IMAGES: u32 = 3;
 
 /// The format the display draws into, and its colour space.
-const FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
+pub(crate) const FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 /// The colour space the compositor reads it in.
-const COLOR_SPACE: vk::ColorSpaceKHR = vk::ColorSpaceKHR::SRGB_NONLINEAR;
+pub(crate) const COLOR_SPACE: vk::ColorSpaceKHR = vk::ColorSpaceKHR::SRGB_NONLINEAR;
 /// The usages a swapchain asks its images for, of those the surface supports.
-const USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+pub(crate) const USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
     vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw()
         | vk::ImageUsageFlags::TRANSFER_SRC.as_raw()
         | vk::ImageUsageFlags::TRANSFER_DST.as_raw()
@@ -219,7 +219,7 @@ const USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
 );
 
 /// The lock every call into the window system runs under (the module doc).
-static WSI: Mutex<()> = Mutex::new(());
+pub(crate) static WSI: Mutex<()> = Mutex::new(());
 
 /// `VK_KHR_swapchain`'s commands on a device, looked up as a swapchain is made, through the
 /// runtime's guarded look-up (`rt::Device::device_proc_addr`, the module doc).
@@ -391,6 +391,20 @@ pub struct Frame {
     index: u32,
 }
 
+#[cfg(feature = "rt")]
+impl Frame {
+    /// The frame of image `index`, for the rt platform's swapchain
+    /// (`crate::rt_platform::swapchain`).
+    pub(crate) fn at(index: u32) -> Frame {
+        Frame { index }
+    }
+
+    /// Its image's index in the swapchain.
+    pub(crate) fn index(self) -> u32 {
+        self.index
+    }
+}
+
 /// One image of the swapchain.
 struct Image {
     /// The image.
@@ -426,18 +440,18 @@ impl Chain {
 
 /// The fences of a swapchain's presents, where the device has present fences (the module doc).
 #[derive(Debug, Default)]
-struct Fences {
+pub(crate) struct Fences {
     /// Fences unsignalled, with no present pending on them.
-    free: Vec<vk::Fence>,
+    pub(crate) free: Vec<vk::Fence>,
     /// The fences of the presents not yet seen signalled, each with its present's number, in the
     /// order the presents were made.
-    pending: VecDeque<(u64, vk::Fence)>,
+    pub(crate) pending: VecDeque<(u64, vk::Fence)>,
 }
 
 impl Fences {
     /// A fence for a present: a free one, else a new one; none where the device makes none, and
     /// the present goes without.
-    fn take(&mut self, vk: &ash::Device) -> Option<vk::Fence> {
+    pub(crate) fn take(&mut self, vk: &ash::Device) -> Option<vk::Fence> {
         if let Some(fence) = self.free.pop() {
             return Some(fence);
         }
@@ -458,7 +472,12 @@ impl Fences {
     /// the present's operations were enqueued (it was taken, or rejected as out of date or for a
     /// lost surface, which still waits on its semaphores), else free again, as a present that
     /// enqueues nothing leaves its fence as it was.
-    fn presented(&mut self, number: u64, fence: vk::Fence, result: Result<bool, vk::Result>) {
+    pub(crate) fn presented(
+        &mut self,
+        number: u64,
+        fence: vk::Fence,
+        result: Result<bool, vk::Result>,
+    ) {
         match result {
             Ok(_)
             | Err(
@@ -471,7 +490,7 @@ impl Fences {
     }
 
     /// Every fence, free or pending.
-    fn all(&self) -> impl Iterator<Item = vk::Fence> + '_ {
+    pub(crate) fn all(&self) -> impl Iterator<Item = vk::Fence> + '_ {
         (self.free.iter().copied()).chain(self.pending.iter().map(|&(_, fence)| fence))
     }
 }
@@ -480,38 +499,38 @@ impl Fences {
 /// they are made, all on one queue, and the newest known complete, its semaphore wait included,
 /// tells that every one before it is too.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct Presents {
+pub(crate) struct Presents {
     /// The presents made.
-    made: u64,
+    pub(crate) made: u64,
     /// The newest present known complete; 0 for none.
-    complete: u64,
+    pub(crate) complete: u64,
 }
 
 impl Presents {
     /// A present made: its number.
-    fn make(&mut self) -> u64 {
+    pub(crate) fn make(&mut self) -> u64 {
         self.made += 1;
         self.made
     }
 
     /// An image taken again, its fence waited for, whose last present was number `last` (0 for
     /// none): that present is complete, and every one made before it.
-    fn taken_again(&mut self, last: u64) {
+    pub(crate) fn taken_again(&mut self, last: u64) {
         self.complete = self.complete.max(last);
     }
 
     /// Whether present number `last`, and so every one before it, is known complete.
-    fn done(&self, last: u64) -> bool {
+    pub(crate) fn done(&self, last: u64) -> bool {
         last <= self.complete
     }
 
     /// Present number `number`'s fence signalled: it is complete, and every one made before it.
-    fn signalled(&mut self, number: u64) {
+    pub(crate) fn signalled(&mut self, number: u64) {
         self.complete = self.complete.max(number);
     }
 
     /// The queue was waited idle: every present made is taken as complete (the module doc).
-    fn idle(&mut self) {
+    pub(crate) fn idle(&mut self) {
         self.complete = self.made;
     }
 }
@@ -609,7 +628,7 @@ pub fn report_gpu_time(
 /// Why `Swapchain::make` made no swapchain, by whether Vulkan was asked for one with the old
 /// swapchain as its `oldSwapchain`, which retires the old one whatever the answer.
 #[derive(Debug)]
-enum Unmade {
+pub(crate) enum Unmade {
     /// Refused before the create: the old swapchain is still the window's.
     Unasked(Refused),
     /// The create, or the wrap of its images, refused: the old swapchain is retired.
@@ -618,7 +637,7 @@ enum Unmade {
 
 /// The steps of a remake ([`remake`]), apart from the swapchain, so that their order is tested
 /// without a window system.
-trait Remaking {
+pub(crate) trait Remaking {
     /// A swapchain.
     type Chain;
     /// Takes the current swapchain out, once its frames have completed.
@@ -641,7 +660,7 @@ trait Remaking {
 /// swapchain current, stale, since Vulkan was never handed it: retired there, it would live on
 /// as the window's, and every later create, with none to hand over, would be refused. One the
 /// create refused, or the wrap of its images, retired the old one all the same.
-fn remake<R: Remaking>(r: &mut R) -> Result<(), Refused> {
+pub(crate) fn remake<R: Remaking>(r: &mut R) -> Result<(), Refused> {
     let old = r.take_current();
     if old.is_none() && r.has_retired() {
         r.end_retired();
@@ -708,7 +727,7 @@ impl Remaking for Remake<'_> {
 }
 
 /// A refusal naming `what` failed with `result`.
-fn refused(what: &str, result: vk::Result) -> Refused {
+pub(crate) fn refused(what: &str, result: vk::Result) -> Refused {
     Refused(format!("{what}: {result}"))
 }
 
@@ -721,7 +740,7 @@ fn refused(what: &str, result: vk::Result) -> Refused {
 /// and [`WAIT_NS`] passed since the take began, as `elapsed` reads it in nanoseconds, so one that
 /// returns later than asked (NVIDIA's, [`TAKE_NS`]) is asked no longer. What the last call
 /// answered: a timeout, or `NOT_READY`, where none came in that time.
-fn take_image(
+pub(crate) fn take_image(
     mut take: impl FnMut(u64) -> Result<(u32, bool), vk::Result>,
     mut elapsed: impl FnMut() -> u64,
 ) -> Result<(u32, bool), vk::Result> {
@@ -739,7 +758,7 @@ fn take_image(
 
 /// The present mode of a swapchain over a surface offering `modes` (the module doc): MAILBOX
 /// where offered, else FIFO, which every surface offers.
-fn present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+pub(crate) fn present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
     if modes.contains(&vk::PresentModeKHR::MAILBOX) {
         vk::PresentModeKHR::MAILBOX
     } else {
@@ -750,7 +769,10 @@ fn present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
 /// The size in pixels of the images of a swapchain for a window of `size` pixels on a surface
 /// of `caps`: the surface's own size where it has one, else `size` within the surface's limits.
 /// `None` where that has no pixel (a minimized window's surface may allow none).
-fn extent_for(size: (u64, u64), caps: &vk::SurfaceCapabilitiesKHR) -> Option<vk::Extent2D> {
+pub(crate) fn extent_for(
+    size: (u64, u64),
+    caps: &vk::SurfaceCapabilitiesKHR,
+) -> Option<vk::Extent2D> {
     let extent = if caps.current_extent.width == u32::MAX {
         let within = |wanted: u64, min: u32, max: u32| {
             u32::try_from(wanted)

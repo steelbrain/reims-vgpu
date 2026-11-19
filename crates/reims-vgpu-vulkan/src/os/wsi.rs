@@ -72,6 +72,40 @@ const PRESENT_FENCES: [(&CStr, &CStr); 2] = [
     ),
 ];
 
+/// The instance extensions the rt platform's instance names (`crate::rt_platform::device`), which
+/// rt's `Instance::new` enables where the loader lists them: the OS's surface extensions
+/// (`WINDOW_SURFACE_EXTENSIONS`), and the instance extensions of present fences
+/// (`VK_KHR_get_surface_capabilities2` and each of [`PRESENT_FENCES`]' surface counterparts). rt's
+/// floor takes `VK_KHR_surface` itself. A test build adds `VK_EXT_headless_surface`, which the
+/// tests' swapchains present to.
+#[cfg(feature = "rt")]
+pub(crate) fn rt_instance_extensions() -> Vec<&'static CStr> {
+    let mut names: Vec<&'static CStr> = WINDOW_SURFACE_EXTENSIONS.to_vec();
+    names.push(ash::khr::get_surface_capabilities2::NAME);
+    names.extend(PRESENT_FENCES.iter().map(|&(_, surface)| surface));
+    #[cfg(any(test, feature = "testkit"))]
+    names.push(ash::ext::headless_surface::NAME);
+    names
+}
+
+/// The device extension that gives the rt platform's device present fences: the first of
+/// [`PRESENT_FENCES`] the device lists (`lists`) whose instance extensions the instance enabled
+/// (`enabled`, rt's `Instance::extensions`); `None` where there is none. rt enables it with its
+/// feature where the device has the feature, and passes over it otherwise.
+#[cfg(feature = "rt")]
+pub(crate) fn rt_present_fences(
+    enabled: &[CString],
+    lists: impl Fn(&CStr) -> bool,
+) -> Option<&'static CStr> {
+    let on = |name: &CStr| enabled.iter().any(|n| n.as_c_str() == name);
+    if !on(ash::khr::get_surface_capabilities2::NAME) {
+        return None;
+    }
+    (PRESENT_FENCES.iter())
+        .find(|&&(device, surface)| on(surface) && lists(device))
+        .map(|&(device, _)| device)
+}
+
 /// Adds to `options` the window system's extensions this host's loader and devices list (the
 /// module doc). Where the loader does not open, or lists no `VK_KHR_surface`, it adds nothing,
 /// and says why once.

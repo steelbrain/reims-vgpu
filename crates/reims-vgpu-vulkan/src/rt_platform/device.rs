@@ -15,6 +15,14 @@
 //! selection variables name, else the one GPU, else the first of the runtime's order. Unlike the
 //! Vulkan platform's, it times no GPU (the module's docs there).
 //!
+//! **Its window system.** The instance enables the OS's surface extensions and present fences'
+//! where the loader lists them, and the device the extension of present fences where it lists
+//! it and its instance extensions are on (`crate::os`'s `rt_instance_extensions` and
+//! `rt_present_fences`); `VK_KHR_surface` and `VK_KHR_swapchain` are rt's floor's. A display's
+//! window presents through a swapchain on the device (`super::swapchain`), which keeps the
+//! instance, and the device's DRM nodes tell its window whether the compositor composites on
+//! this GPU ([`RtDevice::composited_here`]).
+//!
 //! **Its registry ID** folds its `deviceUUID` (`super::answers::registry_id`), so it differs from
 //! the Vulkan platform's for the same GPU, which metal2vulkan-runtime gives.
 //!
@@ -152,6 +160,12 @@ pub struct RtDevice {
     shaders: OnceLock<RtObj<RtLibrary>>,
     /// The blocks it knows by address, which pinned buffers and heaps inside them are ranges of.
     known: KnownBlocks,
+    /// The instance it was made on, whose surfaces its windows' swapchains present to.
+    instance: rt::Instance,
+    /// Its DRM nodes, where it lists `VK_EXT_physical_device_drm`.
+    drm: Option<crate::device_choice::DrmNodes>,
+    /// Whether it enabled present fences' extension (the module's docs).
+    present_fences: bool,
 }
 
 impl RtDevice {
@@ -184,6 +198,22 @@ impl RtDevice {
     /// lane keeps a clone, the same set, to know and forget its blocks in.
     pub fn known_blocks(&self) -> &KnownBlocks {
         &self.known
+    }
+
+    /// The instance it was made on.
+    pub fn instance(&self) -> &rt::Instance {
+        &self.instance
+    }
+
+    /// Whether DRM node `node` (major, minor) is one of this GPU's: `None` where the device lists
+    /// no DRM nodes.
+    pub fn composited_here(&self, node: (u32, u32)) -> Option<bool> {
+        self.drm.map(|drm| drm.names(node))
+    }
+
+    /// Whether each present can signal a fence of its own (`swapchainMaintenance1`).
+    pub fn has_present_fences(&self) -> bool {
+        self.present_fences
     }
 }
 
@@ -219,7 +249,7 @@ impl From<rt::Error> for Unopened {
 /// Makes the process's rt device (the module's docs), on a host of pages of `page_size` bytes,
 /// and logs it.
 pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
-    let instance = rt::Instance::new(&[])?;
+    let instance = rt::Instance::new(&crate::os::rt_instance_extensions())?;
     let listed = instance.physical_devices()?;
     let (_, raw) = instance.raw();
     let mut below = Vec::new();
@@ -259,6 +289,7 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
             below.join("; ")
         }));
     };
+    let drm = seen.get(at).and_then(|s| s.drm);
     let (Some((physical, floor)), Some(uuid)) =
         (candidates.get(at), seen.get(at).and_then(|s| s.uuid))
     else {
@@ -269,17 +300,37 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
     let mut options = rt::DeviceOptions::default();
     options.pipeline_cache_dir = crate::os::user_cache_directory().map(|dir| dir.join(CACHE));
     options.pipeline_cache_cap = Some(crate::platform::SHADER_CACHE_CAPACITY);
+    let fences = {
+        // SAFETY: the instance listed the device and is alive.
+        let names = unsafe { raw.enumerate_device_extension_properties(physical.raw()) }
+            .unwrap_or_default();
+        let lists =
+            |name: &std::ffi::CStr| (names.iter()).any(|p| p.extension_name_as_c_str() == Ok(name));
+        crate::os::rt_present_fences(instance.extensions(), lists)
+    };
+    if let Some(name) = fences {
+        let wanted = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default()
+            .swapchain_maintenance1(true);
+        let needs = |f: &vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT<'static>| {
+            f.swapchain_maintenance1 == vk::TRUE
+        };
+        (options.extensions).push(rt::DeviceExtension::with_features(name, wanted, needs));
+    }
     let device = rt::Device::new(physical, options)?;
+    let present_fences =
+        fences.is_some_and(|name| (device.extensions().iter()).any(|n| n.as_c_str() == name));
     // The process's one device (the module's docs); where a test makes another, the first's fold.
     let _ = COUNTERS.set(device.counters());
     let facts = facts(&device, floor, &uuid, page_size);
     log::info!(
         target: TARGET,
-        "the rt platform's device: {} ({:04x}:{:04x}), registry ID {:#x}",
+        "the rt platform's device: {} ({:04x}:{:04x}), registry ID {:#x}; instance extensions \
+         {:?}; present fences: {present_fences}",
         facts.name,
         facts.vendor_id,
         facts.device_id,
-        facts.registry_id
+        facts.registry_id,
+        instance.extensions()
     );
     let caps = answers::caps(&facts);
     Ok(RtObj::new(RtDevice {
@@ -291,6 +342,9 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         numbering: Numbering::default(),
         shaders: OnceLock::new(),
         known: KnownBlocks::default(),
+        instance,
+        drm,
+        present_fences,
     }))
 }
 

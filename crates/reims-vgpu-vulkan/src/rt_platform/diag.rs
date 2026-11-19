@@ -82,6 +82,8 @@ pub enum Call {
     OverBuffer,
     /// In a heap (`newTextureWithDescriptor:offset:`).
     InHeap,
+    /// Over a window swapchain's image (`super::swapchain`).
+    Drawable,
 }
 
 impl Call {
@@ -92,6 +94,7 @@ impl Call {
             Call::View => "view",
             Call::OverBuffer => "over-buffer",
             Call::InHeap => "in-heap",
+            Call::Drawable => "drawable",
         }
     }
 }

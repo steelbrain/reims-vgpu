@@ -346,6 +346,51 @@ fn answered(
     })
 }
 
+/// `MTLResourceStorageModePrivate` in a resource's options.
+const STORAGE_PRIVATE: u64 = 0x20;
+
+/// `MTLTextureUsageRenderTarget`.
+const USAGE_RENDER_TARGET: u64 = 0x4;
+
+/// The texture over a window swapchain's image (`super::swapchain`): rt's drawable `texture`, made
+/// of [`drawable_descriptor`]'s descriptor, at no index, as the display's own textures are.
+pub(super) fn drawable(device: &RtObj<RtDevice>, texture: rt::Texture) -> RtObj<RtTexture> {
+    let d = texture.descriptor();
+    let shape = Shape {
+        format: d.pixel_format.as_raw(),
+        width: d.width,
+        height: d.height,
+        storage: STORAGE_PRIVATE >> 4,
+        usage: USAGE_RENDER_TARGET,
+    };
+    RtObj::new(RtTexture {
+        rt: texture,
+        device: device.clone_ref(),
+        options: tracked(STORAGE_PRIVATE),
+        usage: USAGE_RENDER_TARGET,
+        protection_options: 0,
+        own: None,
+        purgeable: purgeable_state(),
+        made: Made::new(Call::Drawable, &shape),
+    })
+}
+
+/// The descriptor of a drawable's texture over a swapchain's image of `width` x `height` pixels:
+/// a `Private` `BGRA8Unorm` render target of one level, which rt holds in `B8G8R8A8_UNORM`, the
+/// swapchain's format. Shaders do not reach it, so it takes no index, and the guest's textures'
+/// `gpuResourceID`s are the same whether or not a window is open.
+pub(super) fn drawable_descriptor(width: u32, height: u32) -> rt::TextureDescriptor {
+    let mut d = rt::TextureDescriptor::new(
+        rt::TextureType::Type2D,
+        rt::PixelFormat::BGRA8Unorm,
+        width,
+        height,
+    );
+    d.usage = rt::TextureUsage::RENDER_TARGET;
+    d.storage_mode = rt::StorageMode::Private;
+    d
+}
+
 /// `options` with Metal's default hazard tracking resolved to tracked, as Metal's resources
 /// answer it.
 pub(super) fn tracked(options: u64) -> u64 {

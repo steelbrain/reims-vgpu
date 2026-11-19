@@ -118,6 +118,10 @@ pub(crate) use wsi::seen;
 /// library's choice of device reads (`crate::device_choice`).
 pub(crate) use wsi::seen_devices;
 pub use wsi::{add_window_extensions, present_fences};
+/// The window system's extensions of the rt platform's instance and device
+/// (`crate::rt_platform::device`).
+#[cfg(feature = "rt")]
+pub(crate) use wsi::{rt_instance_extensions, rt_present_fences};
 
 /// The user's cache directory, where the library keeps for the host's later processes what they
 /// would otherwise work out again: the shader cache and its device checks

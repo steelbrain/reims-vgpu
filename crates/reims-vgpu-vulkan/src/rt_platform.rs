@@ -13,7 +13,8 @@
 //! command buffers ([`command`]) with their blit, compute and render encoders ([`blit`],
 //! [`compute`], [`mod@render`]), render pass descriptors ([`descriptor`]), sampler and
 //! depth-stencil states ([`state`]), libraries and their functions ([`library`]), compute
-//! pipeline states ([`pipeline`]) and render pipeline states ([`render_pipeline`]). Until a piece
+//! pipeline states ([`pipeline`]), render pipeline states ([`render_pipeline`]), and the swapchain
+//! a display's window presents through ([`swapchain`]), its images rt's drawables. Until a piece
 //! is built, every call that reaches it is refused ([`unbuilt`]). The call answers as Metal's call answers where it
 //! fails: a nil object, an `NSError`, zeros. The refusal is counted under the piece's code,
 //! `rt-unbuilt-<piece>`, in the process's degradation counts, and the first of each kind writes a
@@ -47,6 +48,7 @@ pub mod queue;
 pub mod render;
 pub mod render_pipeline;
 pub mod state;
+pub mod swapchain;
 pub mod texture;
 pub mod unbuilt;
 pub mod unmade;

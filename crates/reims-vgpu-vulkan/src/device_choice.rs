@@ -191,7 +191,7 @@ pub(crate) struct DrmNodes {
 
 impl DrmNodes {
     /// Whether `node` is one of these.
-    fn names(&self, node: (u32, u32)) -> bool {
+    pub(crate) fn names(&self, node: (u32, u32)) -> bool {
         self.primary == Some(node) || self.render == Some(node)
     }
 }
