@@ -34,6 +34,7 @@ use crate::core::platform::values::{
     RenderPipelineDesc, SamplerDesc,
 };
 use crate::core::raise::{OnFault, Raise, RaiseResult};
+use crate::gpu::caps::METAL_LINEAR_ALIGNMENT;
 use crate::gpu::device::{HEAP_DESCRIPTOR_OPTIONS, descriptor_options};
 use crate::gpu::identity;
 
@@ -248,7 +249,20 @@ fn facts(
                 align: sized.align,
             }
         },
+        linear_alignment_largest: (crate::core::platform::caps::SDK_PIXEL_FORMATS.iter())
+            .filter_map(|&format| linear_alignment(device, format))
+            .fold(METAL_LINEAR_ALIGNMENT, u64::max),
+        linear_alignment_bgra8: device
+            .minimum_linear_texture_alignment(rt::PixelFormat::BGRA8Unorm)
+            .ok(),
     }
+}
+
+/// rt's `minimumLinearTextureAlignmentForPixelFormat:` of the raw pixel format `format`; none
+/// where rt has no format of it or refuses it.
+fn linear_alignment(device: &rt::Device, format: u64) -> Option<u64> {
+    let pf = crate::gpu::runtime_pixel_format(format)?;
+    device.minimum_linear_texture_alignment(pf).ok()
 }
 
 /// `MTLResourceStorageModePrivate`, as resource options.
@@ -720,10 +734,7 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
 /// The identity of `device` ([`answers::identity`]): rt's linear alignment of each SDK format rt
 /// has a format of, none where it refuses one.
 fn identity_of(device: &RtObj<RtDevice>) -> IdentityCaps {
-    answers::identity(&device.facts, &device.caps, |format| {
-        let pf = crate::gpu::runtime_pixel_format(format)?;
-        device.rt.minimum_linear_texture_alignment(pf).ok()
-    })
+    answers::identity(&device.facts, &device.caps, |format| linear_alignment(&device.rt, format))
 }
 
 #[cfg(test)]
@@ -841,6 +852,15 @@ mod tests {
             identity.formats.len(),
             crate::core::platform::caps::SDK_PIXEL_FORMATS.len()
         );
+        // The linear texture alignments are the largest format's, and BGRA8's is the device's
+        // linear row rounding.
+        let largest = (identity.formats.iter())
+            .filter_map(|f| f.linear_alignment)
+            .fold(16, u64::max);
+        assert_eq!(caps.limits.linear_texture_alignment_bytes, largest);
+        assert_eq!(caps.limits.device_linear_texture_alignment_bytes, largest);
+        assert_eq!(caps.limits.iosurface_texture_alignment_bytes, largest);
+        assert_eq!(caps.min_linear_alignment_bgra8(), Ok(device.linear_row_alignment()));
         assert!(device.own_memory_budget() > 0);
         assert!(device.memory_heaps_total() >= device.own_memory_budget());
         assert!(device.linear_row_alignment() > 0);

@@ -29,7 +29,10 @@
 //!   pointers, ray tracing);
 //! - no sparse tile answers: rt has no sparse textures;
 //! - `maxBufferLength` is rt's [`MAX_BUFFER_LENGTH`](metal2vulkan_rt::MAX_BUFFER_LENGTH), and
-//!   `maxArgumentBufferSamplerCount` the indices of rt's sampler class.
+//!   `maxArgumentBufferSamplerCount` the indices of rt's sampler class;
+//! - the linear texture alignments (the device's, an IOSurface's, a linear texture's) are the
+//!   largest of rt's `minimumLinearTextureAlignmentForPixelFormat:` answers, as the runtime's were
+//!   the largest of its, and BGRA8's is rt's.
 //!
 //! A feature answered here that rt does not build yet is refused where the guest uses it (a
 //! pipeline of it is rt's `Gap`), counted (`super::unbuilt`).
@@ -43,6 +46,7 @@ use crate::core::platform::caps::{
     IdentitySizes, Limits, SDK_FAMILIES, SDK_PIXEL_FORMATS, TEXTURE_BUFFER_FORMATS,
 };
 use crate::core::platform::types::{MtlSize, SizeAndAlign};
+use crate::core::raise::Raise;
 use crate::gpu::caps::{METAL_LINEAR_ALIGNMENT, stand_in};
 use crate::gpu::identity;
 
@@ -166,6 +170,11 @@ pub struct Facts {
     pub page_size: u64,
     /// rt's `heapBufferSizeAndAlignWithLength:options:` of a page of Private storage.
     pub heap_buffer_page_private: SizeAndAlign,
+    /// The largest of rt's `minimumLinearTextureAlignmentForPixelFormat:` answers of the SDK's
+    /// pixel formats, and Metal's 16 where every one is smaller.
+    pub linear_alignment_largest: u64,
+    /// rt's `minimumLinearTextureAlignmentForPixelFormat:` of BGRA8; none where rt refuses it.
+    pub linear_alignment_bgra8: Option<u64>,
 }
 
 /// The registry ID the rt platform gives the device of `uuid`, its `deviceUUID`: its two halves'
@@ -189,6 +198,14 @@ fn held(x: u64, bound: u32) -> u64 {
     x.min(u64::from(bound))
 }
 
+/// The selector of a linear alignment's query.
+const LINEAR_ALIGNMENT: &str = "minimumLinearTextureAlignmentForPixelFormat:";
+
+/// The raise of `minimumLinearTextureAlignmentForPixelFormat:` of BGRA8 where rt refuses it.
+fn bgra8_refused() -> Raise {
+    Raise::platform(LINEAR_ALIGNMENT).with_detail("metal2vulkan-rt refused BGRA8Unorm")
+}
+
 /// The device's capabilities: Metal's answers ([`metal`]), held to `facts`' Vulkan limits where
 /// one bounds them, with the Vulkan platform's own answers where they are its own (the module
 /// docs).
@@ -198,9 +215,12 @@ fn held(x: u64, bound: u32) -> u64 {
 ///   `maxComputeWorkGroupSize` and `maxComputeWorkGroupInvocations`, viewports to `maxViewports`.
 /// - The Vulkan platform's own: no buffer or heap over address ranges and no detach of a
 ///   resource's backing, which it does not build; the stand-ins; `supportsNativeHardwareFP16` as
-///   the device's `shaderFloat16`; `minimumLinearTextureAlignmentForPixelFormat:` of BGRA8 as
-///   Metal's 16
-///   ([`METAL_LINEAR_ALIGNMENT`]).
+///   the device's `shaderFloat16`.
+/// - rt's linear alignments: the device's, an IOSurface's and a linear texture's alignment are the
+///   largest of every format's ([`Facts::linear_alignment_largest`]), and
+///   `minimumLinearTextureAlignmentForPixelFormat:` of BGRA8 rt's
+///   ([`Facts::linear_alignment_bgra8`]), raised where rt refuses it. So a guest that lays a
+///   linear texture out by the device's alignment lays it as the device rounds rows.
 /// - rt's: the heap buffer query of a page of Private storage
 ///   ([`Facts::heap_buffer_page_private`]), Metal's answer on every device: the length unrounded,
 ///   at a multiple of 256 bytes.
@@ -226,6 +246,10 @@ pub fn caps(facts: &Facts) -> Arc<DeviceCaps> {
         ),
         max_total_compute_threads_per_threadgroup: total,
         max_viewport_count: held(metal::LIMITS.max_viewport_count, v.max_viewports),
+        device_linear_texture_alignment_bytes: facts.linear_alignment_largest,
+        iosurface_read_only_texture_alignment_bytes: facts.linear_alignment_largest,
+        iosurface_texture_alignment_bytes: facts.linear_alignment_largest,
+        linear_texture_alignment_bytes: facts.linear_alignment_largest,
         ..metal::LIMITS
     };
     let flags = Flags {
@@ -264,7 +288,7 @@ pub fn caps(facts: &Facts) -> Arc<DeviceCaps> {
         families: stand_in::FAMILIES.map(Ok),
         write_rounding_modes: metal::WRITE_ROUNDING_MODES.map(Ok),
         heap_buffer_page_private: Ok(facts.heap_buffer_page_private),
-        min_linear_alignment_bgra8: Ok(METAL_LINEAR_ALIGNMENT),
+        min_linear_alignment_bgra8: facts.linear_alignment_bgra8.ok_or_else(bgra8_refused),
     })
 }
 
@@ -384,6 +408,8 @@ pub(crate) mod tests {
                 size: 4096,
                 align: 256,
             },
+            linear_alignment_largest: 16,
+            linear_alignment_bgra8: Some(16),
         }
     }
 
@@ -448,6 +474,27 @@ pub(crate) mod tests {
         assert_eq!(l.max_viewport_count, 1);
         assert_eq!(l.max_fragment_textures, metal::LIMITS.max_fragment_textures);
         assert!(!caps.flags.supports_native_hardware_fp16);
+    }
+
+    /// The linear texture alignments are the largest of rt's per-format answers, and BGRA8's is
+    /// rt's: a refused one raises.
+    #[test]
+    fn the_linear_alignments_are_rt_s() {
+        let mut facts = roomy();
+        facts.linear_alignment_largest = 256;
+        facts.linear_alignment_bgra8 = Some(128);
+        let answered = caps(&facts);
+        let l = answered.limits;
+        let all = [
+            l.device_linear_texture_alignment_bytes,
+            l.iosurface_read_only_texture_alignment_bytes,
+            l.iosurface_texture_alignment_bytes,
+            l.linear_texture_alignment_bytes,
+        ];
+        assert_eq!(all, [256; 4]);
+        assert_eq!(answered.min_linear_alignment_bgra8, Ok(128));
+        facts.linear_alignment_bgra8 = None;
+        assert_eq!(caps(&facts).min_linear_alignment_bgra8, Err(bgra8_refused()));
     }
 
     /// The identity claims the families caps claims and those they contain, their feature sets,
