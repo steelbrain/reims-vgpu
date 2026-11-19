@@ -205,6 +205,8 @@ fn planes<'a>(
         rows_room: None,
         #[cfg(unix)]
         surface: None,
+        #[cfg(windows)]
+        drawn: None,
     };
     (plane(luma, 0, 96, 64), plane(chroma, 8192, 48, 32))
 }
@@ -672,6 +674,8 @@ fn a_staged_plane_copies_whole_or_by_rows() {
         cache: None,
         #[cfg(unix)]
         surface: None,
+        #[cfg(windows)]
+        drawn: None,
     };
     assert_eq!(plane_copies(256, &plane(128, 4)), [(256, 4096, 512)]);
     assert_eq!(

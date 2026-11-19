@@ -2710,7 +2710,11 @@ pub fn out_of_host_memory_count() -> u64 {
 /// `-residency-set`), one over a copy of its pages counted too (`buffer-escaped-read-only-pages`),
 /// with each command buffer begun of a process that holds such a copy (`escaped-copy-commits`),
 /// and as its VA-API video on the rt platform on Windows lands a picture by the CPU's copy, the
-/// GPU's copy declined (`rt-video-gpu-copy-declined`); and this platform's command predication's,
+/// GPU's copy declined (`rt-video-gpu-copy-declined`), and draws a picture into a cache's planes
+/// over Direct3D 11 textures there (`video-pictures-drawn`, and their crops' KiB,
+/// `video-drawn-kib`); the rt platform's surfaces over Direct3D 11 textures on Windows, made
+/// (`rt-d3d11-surfaces`) and refused (`rt-refused-d3d11-surface`); and this platform's command
+/// predication's,
 /// a command buffer a loop ran past its copies in (`predication-loop-overrun`,
 /// [`crate::gpu::predication::OVERRUN_CODE`]); and the objects made,
 /// live at once and imported by the kind of make ([`MadeCodes`], [`count_made`]), and, on a

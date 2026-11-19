@@ -158,6 +158,8 @@ mod compile;
 mod completion;
 mod decode;
 mod device_info;
+#[cfg(windows)]
+mod drawn;
 mod mirror;
 #[cfg(target_os = "linux")]
 mod nvidia;
@@ -894,6 +896,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     decoder.set_exportable_caches();
                 } else if cached && video.decodes_into_device_caches() {
                     decoder.set_dma_buf_caches();
+                }
+                #[cfg(windows)]
+                if cached && let Some(draw) = video.plane_draws() {
+                    decoder.set_drawn_caches(draw);
                 }
                 decoder.set_video(video);
             }

@@ -67,13 +67,14 @@ use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 #[cfg(unix)]
 use reims_vgpu_vulkan::core::platform::resource::ExportedMemory;
 use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
-#[cfg(unix)]
 use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlSize};
 use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_vulkan::core::sync::Mutex;
 
 #[cfg(unix)]
 use super::decode::SurfaceTarget;
+#[cfg(windows)]
+use super::drawn::DrawnTarget;
 use super::decode::{
     Decoded, GraphicsVideoSession, Landed, PlanePages, VideoDecode, VideoPlane, op_fault,
 };
@@ -176,6 +177,11 @@ pub(crate) struct OutputPlane<P: Platform> {
     /// memory rather than the buffer.
     #[cfg(unix)]
     pub(crate) surface: Option<SurfaceTarget<P>>,
+    /// Where the plane lands in its cache's surface over Direct3D 11 textures
+    /// ([`VideoPlane::drawn`]): the plane there, whose picture is drawn into the texture under it,
+    /// or else copied into its image by the CPU's copy.
+    #[cfg(windows)]
+    pub(crate) drawn: Option<DrawnTarget<P>>,
 }
 
 impl<P: Platform> OutputPlane<P> {
@@ -202,12 +208,12 @@ impl<P: Platform> OutputPlane<P> {
         }
     }
 
-    /// Whether the plane lands in its cache's surface (`surface`).
+    /// Whether the plane lands in its cache's surface (`surface`, on Windows `drawn`).
     pub(crate) fn in_surface(&self) -> bool {
         #[cfg(unix)]
         return self.surface.is_some();
-        #[cfg(not(unix))]
-        false
+        #[cfg(windows)]
+        self.drawn.is_some()
     }
 }
 
@@ -491,16 +497,19 @@ impl<P: Platform> Stage<P> {
         for (plane, at) in [(luma, staged.luma), (chroma, staged.chroma)] {
             let Some(at) = at else { continue };
             // A plane that lands in its cache's surface is copied into its image, staged at the
-            // surface's pitch.
+            // surface's pitch (on Windows, at the plane's own).
             #[cfg(unix)]
-            if let Some(target) = plane.surface.as_ref().filter(|_| into) {
+            let image = plane.surface.as_ref().map(|target| &target.texture);
+            #[cfg(windows)]
+            let image = plane.drawn.as_ref().map(|target| &target.texture);
+            if let Some(texture) = image.filter(|_| into) {
                 let copy = BlitCmd::CopyBufferToTexture {
                     source_buffer: buffer,
                     source_offset: at,
                     source_bytes_per_row: plane.bytes_per_row,
                     source_bytes_per_image: plane.bytes_per_row.saturating_mul(plane.height),
                     source_size: MtlSize::new(plane.width, plane.height, 1),
-                    destination_texture: &target.texture,
+                    destination_texture: texture,
                     destination_slice: 0,
                     destination_level: 0,
                     destination_origin: MtlOrigin::default(),
@@ -629,6 +638,25 @@ fn output_plane<P: Platform>(plane: &VideoPlane<'_, P>, rows: u64) -> RaiseResul
             surface: Some(target.clone_ref()),
         });
     }
+    // In its cache's surface over Direct3D 11 textures, the plane lies in its image at the
+    // plane's own pitch, staged for the CPU's copy where its draw is not made.
+    #[cfg(windows)]
+    if let Some(target) = &plane.drawn {
+        return Ok(OutputPlane {
+            buffer: plane.buffer.clone_ref(),
+            offset: plane.offset,
+            bytes_per_row: plane.bytes_per_row,
+            row_bytes: plane.row_bytes,
+            width: plane.width,
+            height: plane.height,
+            rows_held: plane.height,
+            cached: true,
+            host: None,
+            pages: None,
+            cache: Some(target.identity.clone()),
+            drawn: Some(target.clone_ref()),
+        });
+    }
     Ok(OutputPlane {
         buffer: plane.buffer.clone_ref(),
         offset: plane.offset,
@@ -643,6 +671,8 @@ fn output_plane<P: Platform>(plane: &VideoPlane<'_, P>, rows: u64) -> RaiseResul
         cache: plane.cache.clone(),
         #[cfg(unix)]
         surface: None,
+        #[cfg(windows)]
+        drawn: None,
     })
 }
 
@@ -687,6 +717,8 @@ fn output_plane_of<P: Platform>(
         cache: plane.cache.clone(),
         #[cfg(unix)]
         surface: None,
+        #[cfg(windows)]
+        drawn: None,
     })
 }
 

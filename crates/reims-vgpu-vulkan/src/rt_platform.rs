@@ -40,6 +40,8 @@ pub mod buffer;
 pub mod command;
 pub mod compute;
 pub mod copied;
+#[cfg(windows)]
+pub mod d3d11_surface;
 pub mod descriptor;
 pub mod device;
 pub mod diag;

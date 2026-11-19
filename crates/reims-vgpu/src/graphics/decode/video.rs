@@ -135,6 +135,13 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     fn decodes_into_device_caches(&self) -> bool {
         false
     }
+    /// The draws that write its pictures into Direct3D 11 textures, where it lands pictures so
+    /// (`graphics::drawn`): the device's laid-out caches of two planes, the decodes' output, then
+    /// take their planes over such textures. `None` where it lands none so.
+    #[cfg(windows)]
+    fn plane_draws(&self) -> Option<Arc<reims_vgpu_video::vaapi::PlaneDraw>> {
+        None
+    }
 }
 
 /// A decoder of one codec's Annex-B access units, in decode order, whose pictures land in
@@ -475,6 +482,11 @@ pub struct VideoPlane<'a, P: Platform> {
     /// plane there, which the picture lands in rather than the buffer.
     #[cfg(unix)]
     pub surface: Option<SurfaceTarget<P>>,
+    /// Where the plane's cache keeps its planes over Direct3D 11 textures
+    /// (`graphics::drawn`) and the op is a decode that shows them whole: the plane there, which
+    /// the picture is drawn into rather than landing in the buffer.
+    #[cfg(windows)]
+    pub drawn: Option<crate::graphics::drawn::DrawnTarget<P>>,
 }
 
 /// One plane of a video cache's surface, as a decode's picture lands in it
@@ -888,6 +900,15 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.shared.surface_caches.set_dma_buf();
     }
 
+    /// Makes each laid-out cache of two planes from now on one whose planes may lie over
+    /// Direct3D 11 textures that `draw` writes the host's video's pictures into
+    /// (`graphics::drawn`): set once, at the device's make, before any cache, where the device's
+    /// video lands pictures so.
+    #[cfg(windows)]
+    pub(crate) fn set_drawn_caches(&self, draw: Arc<reims_vgpu_video::vaapi::PlaneDraw>) {
+        self.shared.surface_caches.set_drawn(draw);
+    }
+
     /// A hold of the session `id` names; an exec fault where it names none, and a refused
     /// reference where its create was refused ([`super::refused`]).
     pub(super) fn require_video_session(&self, id: u64) -> RaiseResult<SessionHold<P>> {
@@ -935,7 +956,6 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         // A decode of both planes whole, in one cache, lands in the cache's surface where it
         // has one.
-        #[cfg(unix)]
         let whole = decode
             && luma_place.whole == Some(0)
             && chroma_place.whole == Some(1)
@@ -946,8 +966,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                 .map_or([None, None], |targets| targets.map(Some)),
             None => [None, None],
         };
-        #[cfg(not(unix))]
-        let _ = decode;
+        #[cfg(windows)]
+        let [luma_drawn, chroma_drawn] = match luma_cache.filter(|_| whole) {
+            Some(block) => (self.surface_caches.drawn_targets(block))
+                .map_or([None, None], |targets| targets.map(Some)),
+            None => [None, None],
+        };
         let plane = |place: PlanePlace, buffer, cache: Option<u64>| VideoPlane {
             buffer,
             offset: place.offset,
@@ -963,6 +987,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             rows_room: rows_room(&place, cache),
             #[cfg(unix)]
             surface: None,
+            #[cfg(windows)]
+            drawn: None,
         };
         #[cfg(unix)]
         return Ok((
@@ -975,10 +1001,16 @@ impl<P: Platform> GraphicsDecoder<P> {
                 ..plane(chroma_place, chroma, chroma_cache)
             },
         ));
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         Ok((
-            plane(luma_place, luma, luma_cache),
-            plane(chroma_place, chroma, chroma_cache),
+            VideoPlane {
+                drawn: luma_drawn,
+                ..plane(luma_place, luma, luma_cache)
+            },
+            VideoPlane {
+                drawn: chroma_drawn,
+                ..plane(chroma_place, chroma, chroma_cache)
+            },
         ))
     }
 

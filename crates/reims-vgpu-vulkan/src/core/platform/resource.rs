@@ -257,6 +257,52 @@ pub struct ExportedSurface<P: Platform> {
     pub memory: std::sync::Arc<dyn SurfaceMemory>,
 }
 
+/// No Metal counterpart: one plane of a surface over Direct3D 11 textures that another API
+/// writes ([`GpuDevice::import_d3d11_surface`](super::device::GpuDevice::import_d3d11_surface)).
+/// The plane is the shared 2D texture `handle` names, of one level, slice and sample, and its
+/// elements are `image_format`'s. Its texture is of `pixel_format`, `width` by `height`, with
+/// Metal's `usage`. The handle is borrowed for the call: the caller may close it afterwards.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub struct D3d11PlaneDesc<'a> {
+    /// The NT handle the texture is shared through.
+    pub handle: std::os::windows::io::BorrowedHandle<'a>,
+    /// The `MTLPixelFormat` of the texture's elements: `R8Unorm` or `R16Unorm` for a luma
+    /// plane, `R16Uint` or `R32Uint` for a chroma plane whose element is one packed pair.
+    pub image_format: u64,
+    /// The `MTLPixelFormat` of the plane's texture: `R8Unorm`, `RG8Unorm`, `R16Unorm` or
+    /// `RG16Unorm`.
+    pub pixel_format: u64,
+    /// Its width in texels.
+    pub width: u64,
+    /// Its height in texels.
+    pub height: u64,
+    /// Its texture's `MTLTextureUsage`.
+    pub usage: u64,
+}
+
+/// No Metal counterpart: the memory of a surface over Direct3D 11 textures ([`ImportedSurface`]),
+/// which another API writes.
+#[cfg(windows)]
+pub trait ImportedSurfaceMemory: Send + Sync {
+    /// Says that the other API wrote the planes, waited for those writes and let go of the
+    /// textures' keyed mutexes, so that the device's later reads of the planes see the writes.
+    /// `Err` says why the device will not see them.
+    fn external_writes_done(&self) -> Result<(), String>;
+}
+
+/// No Metal counterpart: a surface over Direct3D 11 textures
+/// ([`GpuDevice::import_d3d11_surface`](super::device::GpuDevice::import_d3d11_surface)). It
+/// holds each plane's texture, in the description's order, with no resource index of the guest's,
+/// and the memory they lie in. The textures and the memory go together.
+#[cfg(windows)]
+pub struct ImportedSurface<P: Platform> {
+    /// Each plane's texture, in the description's order.
+    pub planes: Vec<P::Texture>,
+    /// The memory they lie in.
+    pub memory: std::sync::Arc<dyn ImportedSurfaceMemory>,
+}
+
 /// `MTLTexture` (with `MTLTextureSPI`).
 ///
 /// `didModifyData` (SPI) is not declared: only the tiled EFI path, which nothing reaches, would

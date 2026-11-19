@@ -200,6 +200,22 @@ pub trait GpuDevice<P: Platform>: Handle {
         let _ = (on, desc);
         Ok(None)
     }
+    /// No Metal counterpart: a surface of `planes`, each plane a texture of the platform's over
+    /// the shared Direct3D 11 texture its handle names, which another API writes
+    /// ([`ImportedSurface`](super::resource::ImportedSurface)). The host's video on Windows
+    /// draws its pictures into the IOSurface device caches' plane images this way. The answer is
+    /// `Ok(None)` where the platform makes none: the default, and a device that imports no such
+    /// texture. The caller then keeps the planes in images of its own. Reached both under a
+    /// handler and with none: `on` says which this call is.
+    #[cfg(windows)]
+    fn import_d3d11_surface(
+        &self,
+        on: OnFault,
+        planes: &[super::resource::D3d11PlaneDesc<'_>],
+    ) -> RaiseResult<Option<super::resource::ImportedSurface<P>>> {
+        let _ = (on, planes);
+        Ok(None)
+    }
     /// sel: newCommandQueue
     /// Never nil-checked. No path reaches it under a handler: a raise inside it dies at the send.
     fn new_command_queue(&self) -> Option<P::CommandQueue>;

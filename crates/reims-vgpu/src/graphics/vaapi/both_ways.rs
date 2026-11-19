@@ -85,6 +85,8 @@ pub(super) fn land_both_ways(
         cache: None,
         #[cfg(unix)]
         surface: None,
+        #[cfg(windows)]
+        drawn: None,
     };
     let luma = plane(luma_at, luma_bytes, width, height);
     let chroma = plane(chroma_at, chroma_bytes, width.div_ceil(2), chroma_rows);
@@ -191,6 +193,8 @@ fn land_in_a_cache(
         cache: None,
         #[cfg(unix)]
         surface: None,
+        #[cfg(windows)]
+        drawn: None,
     };
     let luma = plane(luma_at, luma_bytes, width, height);
     let chroma = plane(chroma_at, chroma_bytes, width.div_ceil(2), chroma_rows);

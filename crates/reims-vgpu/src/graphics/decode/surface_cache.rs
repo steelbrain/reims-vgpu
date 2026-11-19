@@ -1878,6 +1878,10 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// Whether laid-out caches of two planes are made with their memory a dma-buf, for the host's
     /// video to decode into ([`Caches::set_dma_buf`]).
     dma_buf: bool,
+    /// The draws that write the host's video's pictures into Direct3D 11 textures, where laid-out
+    /// caches of two planes take their planes over such textures ([`Caches::set_drawn`]).
+    #[cfg(windows)]
+    drawn: Option<Arc<reims_vgpu_video::vaapi::PlaneDraw>>,
     /// The device's recoveries the caches were last looked at for ([`Self::after_recovery`]),
     /// told to begins outside the lock too ([`Unlocked::recoveries`]).
     recoveries: u64,
@@ -2107,6 +2111,8 @@ impl<P: Platform> SurfaceCaches<P> {
             answering: HashSet::new(),
             copy_gpu: Arc::default(),
             dma_buf: false,
+            #[cfg(windows)]
+            drawn: None,
             recoveries: 0,
             unlocked,
             fence: None,
@@ -2915,6 +2921,8 @@ impl<P: Platform> SurfaceCaches<P> {
         CacheMaker {
             exportable: self.exportable,
             dma_buf: self.dma_buf,
+            #[cfg(windows)]
+            drawn: self.drawn.is_some(),
             shaped: self.shaped,
         }
     }
@@ -5129,6 +5137,10 @@ struct CacheMaker {
     /// Laid-out caches of two planes are made with their memory a dma-buf
     /// ([`Caches::set_dma_buf`]).
     dma_buf: bool,
+    /// Laid-out caches of two planes are made for the host's video, their planes over
+    /// Direct3D 11 textures it draws its pictures into ([`Caches::set_drawn`]).
+    #[cfg(windows)]
+    drawn: bool,
     /// The per-shape form: no cache is laid out at the GPU's pitch, as no texture lies over it
     /// ([`shapes`]).
     shaped: bool,
@@ -5192,10 +5204,8 @@ impl CacheMaker {
             None => layout.and_then(aligned_byte),
         };
         let length = repitched.map_or(length, Repitched::length);
-        #[cfg(unix)]
         let two_planes = layout.is_some_and(|planes| planes.len() == 2);
         let mut counts = MakerCounts::default();
-        #[cfg(unix)]
         let life = || Some(MemoryLife::new());
         #[cfg(unix)]
         if self.exportable && two_planes {
@@ -5236,6 +5246,14 @@ impl CacheMaker {
             }
             None => device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)?,
         };
+        // A laid-out cache of two planes for the host's video on Windows is a buffer as any
+        // other's, whose surface's planes lie over the textures its pictures are drawn into
+        // (`graphics::drawn`).
+        #[cfg(windows)]
+        if self.drawn && two_planes {
+            counts.drawn = made.is_some();
+            return Ok(NewCache::new(made.map(|cache| (cache, life())), counts));
+        }
         Ok(NewCache::new(made.map(|cache| (cache, None)), counts))
     }
 }
@@ -5249,6 +5267,10 @@ struct MakerCounts {
     dma_buf: bool,
     no_dma_buf: bool,
     aligned: bool,
+    /// A cache for the host's video whose planes lie over Direct3D 11 textures
+    /// ([`CacheMaker::drawn`]).
+    #[cfg(windows)]
+    drawn: bool,
 }
 
 /// A new cache's buffer made with the caches' lock let go of ([`CacheMaker::make`]), with its
@@ -5282,6 +5304,10 @@ impl<P: Platform> NewCache<P> {
     /// ([`exported::VideoMemory`]).
     fn video_memory(&self) -> Option<exported::VideoMemory> {
         let made = self.made.as_ref().is_some_and(|(_, life)| life.is_some());
+        #[cfg(windows)]
+        if made && self.counts.drawn {
+            return Some(exported::VideoMemory::Drawn);
+        }
         made.then(|| exported::VideoMemory::of(self.counts.exportable, self.counts.dma_buf))
             .flatten()
     }
@@ -5526,7 +5552,6 @@ impl<P: Platform> Caches<P> {
             Some(None) => {}
         }
         // A video cache's plane takes its surface's ([`exported`]).
-        #[cfg(unix)]
         if let Some(found) = self.plane_shape(device, block, &key) {
             return Some(found);
         }
@@ -5890,6 +5915,23 @@ impl<P: Platform> Caches<P> {
     /// one plane).
     pub(crate) fn set_dma_buf(&self) {
         self.state.lock().dma_buf = true;
+    }
+
+    /// Makes each laid-out cache of two planes from now on a cache for the host's video whose
+    /// planes may lie over Direct3D 11 textures that `draw` writes its pictures into
+    /// (`graphics::drawn`): set once, at the device's make, before any cache, where the device's
+    /// video lands its pictures so. The video lands pictures only in two-plane surfaces (NV12,
+    /// P010), so a cache of one plane is made as any other laid-out cache.
+    #[cfg(windows)]
+    pub(crate) fn set_drawn(&self, draw: Arc<reims_vgpu_video::vaapi::PlaneDraw>) {
+        self.state.lock().drawn = Some(draw);
+    }
+
+    /// The draws of the host's video's pictures into Direct3D 11 textures, where they were set
+    /// ([`Self::set_drawn`]).
+    #[cfg(windows)]
+    fn drawn(&self) -> Option<Arc<reims_vgpu_video::vaapi::PlaneDraw>> {
+        self.state.lock().drawn.clone()
     }
 
     /// Sets the bytes deferred blocks' caches may hold at once (the device's `DEFERRED_BUDGET`,

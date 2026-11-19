@@ -470,8 +470,8 @@ pub(super) fn set_purgeable(held: &AtomicU64, state: u64) -> u64 {
 
 /// The plane texture `plane` of an exported surface rt made (`super::surface`), of `desc`, for
 /// `sel`: a texture with no index of its own, the image under the textures made as its views, as
-/// [`RtObj::new_texture_for_views`]'s is.
-#[cfg(unix)]
+/// [`RtObj::new_texture_for_views`]'s is. On Windows, a plane of a surface over Direct3D 11
+/// textures (`super::d3d11_surface`).
 pub(super) fn surface_plane(
     device: &RtObj<RtDevice>,
     sel: &'static str,

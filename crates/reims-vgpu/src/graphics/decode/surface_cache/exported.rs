@@ -22,33 +22,35 @@
 //!
 //! A platform that makes no such surface (the default, and one that exports no such memory)
 //! answers `None`, counted, and the cache's shapes are made as any other's.
+//!
+//! On Windows the surface's planes lie over two Direct3D 11 textures that the host's video draws
+//! its pictures into (`graphics::drawn`), made at the ask and imported by the platform
+//! (`GpuDevice::import_d3d11_surface`), each plane the size of its plane shape with no rows of
+//! room below it: a decode's targets are then the planes' images and those textures
+//! ([`Caches::drawn_targets`]).
 
-#[cfg(unix)]
 use std::sync::Arc;
 
-#[cfg(unix)]
 use reims_vgpu_video::core::device_memory::MemoryLife;
-#[cfg(unix)]
 use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::Platform;
-#[cfg(unix)]
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+#[cfg(windows)]
+use reims_vgpu_vulkan::core::platform::resource::{
+    D3d11PlaneDesc, ImportedSurface, ImportedSurfaceMemory,
+};
 #[cfg(unix)]
 use reims_vgpu_vulkan::core::platform::resource::{
     ExportedSurface, SurfaceDesc, SurfaceHandle, SurfaceMemory, SurfacePlaneDesc,
 };
 use reims_vgpu_vulkan::core::platform::values::PagesPlane;
-#[cfg(unix)]
 use reims_vgpu_vulkan::core::raise::refusals;
 
+#[cfg(windows)]
+use super::super::super::drawn::{DrawnPlanes, DrawnTarget};
 #[cfg(unix)]
 use super::super::video::SurfaceTarget;
-#[cfg(unix)]
-use super::shapes::Held;
-#[cfg(unix)]
-use super::shapes::ShapeKey;
-use super::shapes::{ShapeCounts, ShapeTable};
-#[cfg(unix)]
+use super::shapes::{Held, ShapeCounts, ShapeKey, ShapeTable};
 use super::{Caches, ON, SurfaceCaches};
 
 /// While a video cache's buffer is a copy of its own, apart from its surface's memory: a picture
@@ -57,11 +59,15 @@ const BUFFER_APART: bool = true;
 
 /// `MTLPixelFormatR8Unorm`, `RG8Unorm`, `R16Unorm` and `RG16Unorm`: a plane image's format, by
 /// the bytes of a luma sample.
-#[cfg(unix)]
 const PLANE_FORMATS: [(u64, [u64; 2]); 2] = [(1, [10, 30]), (2, [20, 60])];
 
+/// `MTLPixelFormatR8Unorm`, `R16Uint`, `R16Unorm` and `R32Uint`: the element format of the
+/// Direct3D 11 texture under a plane image on Windows (the module doc), by the bytes of a luma
+/// sample, luma's then chroma's, whose element is one packed pair.
+#[cfg(windows)]
+const DRAWN_FORMATS: [(u64, [u64; 2]); 2] = [(1, [10, 23]), (2, [20, 53])];
+
 /// A plane image's usage: `ShaderRead | RenderTarget | PixelFormatView`.
-#[cfg(unix)]
 const PLANE_USAGE: u64 = 0x1 | 0x4 | 0x10;
 
 /// Each plane's start after the first a multiple of this many bytes, and a dma-buf's pitch:
@@ -85,6 +91,10 @@ pub(super) enum VideoMemory {
     OpaqueFd,
     /// A dma-buf, for VA-API to decode into.
     DmaBuf,
+    /// A buffer as any other's, whose surface's planes lie over Direct3D 11 textures that VA-API's
+    /// pictures are drawn into (the module doc).
+    #[cfg(windows)]
+    Drawn,
 }
 
 impl VideoMemory {
@@ -102,59 +112,76 @@ impl VideoMemory {
 pub(super) struct CacheSurface<P: Platform> {
     /// Where the cache was made for the host's video with a surface of two planes: its memory's
     /// kind and the planes' layout in the surface's bytes.
-    #[cfg(unix)]
     video: Option<(VideoMemory, [PagesPlane; 2])>,
-    /// A surface was asked of the platform ([`Self::ask`]), once a cache.
-    #[cfg(unix)]
+    /// A surface was asked of the platform ([`Self::plane_keys_to_ask`]), once a cache.
     asked: bool,
     /// The surface made.
     #[cfg(unix)]
     made: Option<PlaneSurface<P>>,
+    /// The surface made, over Direct3D 11 textures.
+    #[cfg(windows)]
+    made: Option<DrawnSurface<P>>,
     /// A decode of the command buffer being walked was given the surface's planes
     /// (`Caches::surface_targets`); taken at its finish ([`take_landed`]).
     landed: bool,
     /// A decode given the planes answered no picture ([`skipped`]): the command buffer wrote
     /// nothing of the cache.
     skipped: bool,
-    #[cfg(not(unix))]
-    _platform: std::marker::PhantomData<fn() -> P>,
 }
 
 impl<P: Platform> CacheSurface<P> {
     /// A cache's, made for the host's video as `video` says (`None` for any other cache), its
     /// surface laid out as `layout` where its ask gave it.
     pub(super) fn new(video: Option<VideoMemory>, layout: Option<&[PagesPlane]>) -> Self {
-        #[cfg(unix)]
         let planes = layout.and_then(|planes| <[PagesPlane; 2]>::try_from(planes).ok());
-        #[cfg(not(unix))]
-        let _ = (video, layout);
         CacheSurface {
-            #[cfg(unix)]
             video: video.zip(planes),
-            #[cfg(unix)]
             asked: false,
-            #[cfg(unix)]
             made: None,
             landed: false,
             skipped: false,
-            #[cfg(not(unix))]
-            _platform: std::marker::PhantomData,
         }
     }
 
     /// Whether the cache has its surface.
     pub(super) fn is_made(&self) -> bool {
-        #[cfg(unix)]
-        return self.made.is_some();
-        #[cfg(not(unix))]
-        false
+        self.made.is_some()
+    }
+
+    /// The plane shapes of the surface to ask where `key`, a shape the cache's `shapes` hold none
+    /// of, is a plane shape of the cache's surface (module doc), and no shape of either plane is
+    /// held: with the cache's memory's kind, the bytes of a luma sample and the planes' image
+    /// formats. Asked once a cache; `None` otherwise.
+    fn plane_keys_to_ask(
+        &mut self,
+        key: &ShapeKey,
+        shapes: &ShapeTable<P::Texture>,
+    ) -> Option<(VideoMemory, [ShapeKey; 2], u64, [u64; 2])> {
+        if self.asked || key.storage {
+            return None;
+        }
+        let (memory, layout) = self.video?;
+        let luma_texel = match key.plane {
+            0 => key.texel_bytes,
+            1 if key.texel_bytes.is_multiple_of(2) => key.texel_bytes / 2,
+            _ => return None,
+        };
+        let (_, formats) = PLANE_FORMATS.iter().find(|(t, _)| *t == luma_texel)?;
+        let keys = plane_keys(&layout, luma_texel)?;
+        if keys.get(usize::try_from(key.plane).ok()?) != Some(key) {
+            return None;
+        }
+        if (shapes.iter()).any(|s| keys.iter().any(|k| s.key.same_plane(k))) {
+            return None;
+        }
+        self.asked = true;
+        Some((memory, keys, luma_texel, *formats))
     }
 }
 
 /// The plane shapes of the planes `layout` lays out, of `luma_texel`-byte luma samples: each
 /// plane's whole extent at its place and pitch, plain; `None` where a plane's rows are no whole
 /// texels, or the chroma plane is not half the luma's each way, rounded up.
-#[cfg(unix)]
 fn plane_keys(layout: &[PagesPlane; 2], luma_texel: u64) -> Option<[ShapeKey; 2]> {
     let key = |plane: u64| {
         let laid = layout[usize::try_from(plane).ok()?];
@@ -222,24 +249,7 @@ impl<P: Platform> CacheSurface<P> {
     /// shape of the cache's surface (module doc), and no shape of either plane is held: asked
     /// once a cache. `None` otherwise.
     fn ask(&mut self, key: &ShapeKey, shapes: &ShapeTable<P::Texture>) -> Option<SurfaceAsk> {
-        if self.asked || key.storage {
-            return None;
-        }
-        let (memory, layout) = self.video?;
-        let luma_texel = match key.plane {
-            0 => key.texel_bytes,
-            1 if key.texel_bytes.is_multiple_of(2) => key.texel_bytes / 2,
-            _ => return None,
-        };
-        let (_, formats) = PLANE_FORMATS.iter().find(|(t, _)| *t == luma_texel)?;
-        let keys = plane_keys(&layout, luma_texel)?;
-        if keys.get(usize::try_from(key.plane).ok()?) != Some(key) {
-            return None;
-        }
-        if (shapes.iter()).any(|s| keys.iter().any(|k| s.key.same_plane(k))) {
-            return None;
-        }
-        self.asked = true;
+        let (memory, keys, _, formats) = self.plane_keys_to_ask(key, shapes)?;
         let plane = |n: usize| {
             let key = keys[n];
             let rows = key.height.next_multiple_of(CODED_ROWS[n]);
@@ -469,6 +479,237 @@ impl<P: Platform> Caches<P> {
     pub(crate) fn surface_targets(&self, block: u64) -> Option<[SurfaceTarget<P>; 2]> {
         let mut state = self.state.lock();
         state.by_block.get_mut(&block)?.surface.targets()
+    }
+}
+
+/// A cache's surface made over Direct3D 11 textures ([`Caches::plane_shape`], on Windows).
+#[cfg(windows)]
+pub(super) struct DrawnSurface<P: Platform> {
+    /// Each plane's image, luma's then chroma's: the cache's plane shapes'.
+    planes: [P::Texture; 2],
+    /// The memory they lie in.
+    memory: Arc<dyn ImportedSurfaceMemory>,
+    /// The Direct3D 11 textures under them, and their draws.
+    drawn: Arc<DrawnPlanes>,
+    /// The surface's life: its identity goes as the cache does.
+    life: MemoryLife,
+}
+
+/// What a surface over Direct3D 11 textures is asked of ([`CacheSurface::drawn_ask`]): the
+/// plane shapes, each plane's image format and its texture's element format, and whether its
+/// samples are 16 bits.
+#[cfg(windows)]
+pub(super) struct DrawnAsk {
+    keys: [ShapeKey; 2],
+    formats: [u64; 2],
+    elements: [u64; 2],
+    ten_bit: bool,
+}
+
+/// Whether the process has logged a cache's Direct3D 11 textures that were not made.
+#[cfg(windows)]
+static UNDRAWN_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
+impl DrawnAsk {
+    /// The surface that `device` makes over new Direct3D 11 textures of the plane shapes' sizes,
+    /// which `draw` makes for the block at `block`'s cache, with those textures. `None` where
+    /// either makes none; the process's first such miss of the textures is logged.
+    fn make<P: Platform>(
+        &self,
+        device: &P::Device,
+        draw: &Arc<reims_vgpu_video::vaapi::PlaneDraw>,
+        block: u64,
+    ) -> Option<(ImportedSurface<P>, DrawnPlanes)> {
+        let width = u32::try_from(self.keys[0].width).ok()?;
+        let height = u32::try_from(self.keys[0].height).ok()?;
+        let drawn = match DrawnPlanes::new(draw, (width, height), self.ten_bit) {
+            Ok(drawn) => drawn,
+            Err(why) => {
+                if !UNDRAWN_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "the IOSurface block at {block:#x}: no Direct3D 11 textures for its video \
+                         planes ({why}); they stay in images of their own, counted from here as \
+                         surfaces the platform made none of"
+                    );
+                }
+                return None;
+            }
+        };
+        let targets = drawn.targets();
+        let handles = [targets.luma_handle(), targets.chroma_handle()];
+        let planes: [D3d11PlaneDesc<'_>; 2] = std::array::from_fn(|n| D3d11PlaneDesc {
+            handle: handles[n],
+            image_format: self.elements[n],
+            pixel_format: self.formats[n],
+            width: self.keys[n].width,
+            height: self.keys[n].height,
+            usage: PLANE_USAGE,
+        });
+        match device.import_d3d11_surface(ON, &planes) {
+            Ok(made) => (made.filter(|m| m.planes.len() == 2)).map(|made| (made, drawn)),
+            Err(raise) => {
+                log::warn!(
+                    target: "reims_vgpu::graphics", kind:% = raise;
+                    "the IOSurface block at {block:#x}: the platform raised at its video planes' \
+                     surface over Direct3D 11 textures ({raise:?})"
+                );
+                None
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl<P: Platform> CacheSurface<P> {
+    /// The surface over Direct3D 11 textures to ask where `key` is a plane shape of the cache's
+    /// surface ([`Self::plane_keys_to_ask`]): asked once a cache. `None` otherwise.
+    fn drawn_ask(&mut self, key: &ShapeKey, shapes: &ShapeTable<P::Texture>) -> Option<DrawnAsk> {
+        let (_, keys, luma_texel, formats) = self.plane_keys_to_ask(key, shapes)?;
+        let (_, elements) = DRAWN_FORMATS.iter().find(|(t, _)| *t == luma_texel)?;
+        Some(DrawnAsk {
+            keys,
+            formats,
+            elements: *elements,
+            ten_bit: luma_texel == 2,
+        })
+    }
+
+    /// The targets of a decode into the surface's planes, where the cache has its surface:
+    /// counted as landed for the command buffer being walked.
+    fn drawn_targets(&mut self) -> Option<[DrawnTarget<P>; 2]> {
+        let made = self.made.as_ref()?;
+        let identity = made.life.identity();
+        let target = |n: usize| DrawnTarget {
+            memory: Arc::clone(&made.memory),
+            planes: Arc::clone(&made.drawn),
+            identity: identity.clone(),
+            texture: made.planes[n].clone_ref(),
+        };
+        let targets = [target(0), target(1)];
+        self.landed = true;
+        self.skipped = false;
+        Some(targets)
+    }
+}
+
+#[cfg(windows)]
+impl<P: Platform> SurfaceCaches<P> {
+    /// [`Caches::plane_shape`]'s ask, under the caches' lock: the surface over Direct3D 11
+    /// textures to ask of the block at `block`'s cache for the shape `key`
+    /// ([`CacheSurface::drawn_ask`]).
+    fn drawn_ask(&mut self, block: u64, key: &ShapeKey) -> Option<DrawnAsk> {
+        let cache = self.by_block.get_mut(&block)?;
+        cache.surface.drawn_ask(key, &cache.shapes)
+    }
+
+    /// Adds `made`, the surface `ask` asked over the textures `drawn`, to the block at `block`'s
+    /// cache, its planes its plane shapes, each owing a fill from the buffer: a reference to the
+    /// shape `key` and its image. Where the cache went, or holds a shape of either plane, since
+    /// the ask, `made` is not taken. What goes (`made` and `drawn` where not taken, and the shapes
+    /// past the bound), for the caller to let go of with the lock let go of.
+    fn add_drawn_planes(
+        &mut self,
+        block: u64,
+        key: &ShapeKey,
+        ask: &DrawnAsk,
+        made: ImportedSurface<P>,
+        drawn: DrawnPlanes,
+    ) -> (Option<Held<P::Texture>>, DrawnGone<P>) {
+        let ImportedSurface { planes, memory } = made;
+        let Some(cache) = self.by_block.get_mut(&block) else {
+            return (None, (planes, Some((memory, drawn))));
+        };
+        let taken = cache.surface.asked && !cache.surface.is_made();
+        let held = (cache.shapes.iter()).any(|s| ask.keys.iter().any(|k| s.key.same_plane(k)));
+        if !taken || held {
+            return (None, (planes, Some((memory, drawn))));
+        }
+        let Ok(images) = <[P::Texture; 2]>::try_from(planes) else {
+            return (None, (Vec::new(), Some((memory, drawn))));
+        };
+        self.shape_clock += 1;
+        let now = self.shape_clock;
+        let mut found = None;
+        let mut bytes = 0;
+        for (plane, image) in ask.keys.iter().zip(&images) {
+            let (reference, _) = cache
+                .shapes
+                .insert_plane(*plane, image.clone_ref(), true, now);
+            if plane == key {
+                found = Some((reference, image.clone_ref()));
+            }
+            bytes += plane.bytes();
+        }
+        cache.surface.made = Some(DrawnSurface {
+            planes: images,
+            memory,
+            drawn: Arc::new(drawn),
+            life: MemoryLife::new(),
+        });
+        let counts = &mut self.counts.shapes;
+        counts.made += 2;
+        counts.made_bytes += bytes;
+        counts.planes_made += 2;
+        counts.surfaces += 1;
+        let live = (self.by_block.values())
+            .filter(|c| c.surface.is_made())
+            .count();
+        let counts = &mut self.counts.shapes;
+        counts.surfaces_live_most = counts.surfaces_live_most.max(live.try_into().unwrap_or(0));
+        self.hold_bytes(bytes);
+        let gone = self.sweep_shapes(block);
+        self.note_shape_bound();
+        (found, (gone, None))
+    }
+}
+
+/// What [`SurfaceCaches::add_drawn_planes`] lets go of: images, and a surface's memory and
+/// textures not taken.
+#[cfg(windows)]
+type DrawnGone<P> = (
+    Vec<<P as Platform>::Texture>,
+    Option<(Arc<dyn ImportedSurfaceMemory>, DrawnPlanes)>,
+);
+
+#[cfg(windows)]
+impl<P: Platform> Caches<P> {
+    /// The plane shape `key` of the block at `block`'s cache, where `key` asks its surface's
+    /// (module doc): the surface made over two new Direct3D 11 textures with the lock let go of,
+    /// its planes added as the cache's plane shapes ([`SurfaceCaches::add_drawn_planes`]), and a
+    /// reference to `key`'s and its image. `None` where the cache takes no surface for `key`, or
+    /// no textures or surface were made (counted), for the caller to make the shape's image of
+    /// its own.
+    pub(super) fn plane_shape(
+        &self,
+        device: &P::Device,
+        block: u64,
+        key: &ShapeKey,
+    ) -> Option<Held<P::Texture>> {
+        let draw = self.drawn()?;
+        let ask = self.state.lock().drawn_ask(block, key)?;
+        let Some((made, drawn)) = ask.make::<P>(device, &draw, block) else {
+            self.state.lock().counts.shapes.surfaces_refused += 1;
+            return None;
+        };
+        let (found, gone) = (self.state.lock()).add_drawn_planes(block, key, &ask, made, drawn);
+        if let Err(refusal) = refusals::refusing(move || drop(gone)) {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = refusal;
+                "the IOSurface block at {block:#x}'s video planes or shapes past their bound were \
+                 let go of, and a release was refused: {refusal}"
+            );
+        }
+        found
+    }
+
+    /// The planes of the block at `block`'s surface over Direct3D 11 textures (module doc), as
+    /// the targets of a decode that shows them whole, where its cache has one: the command
+    /// buffer being walked lands its picture there ([`owe_video`]). `None` where it has none.
+    pub(crate) fn drawn_targets(&self, block: u64) -> Option<[DrawnTarget<P>; 2]> {
+        let mut state = self.state.lock();
+        state.by_block.get_mut(&block)?.surface.drawn_targets()
     }
 }
 

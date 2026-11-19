@@ -769,6 +769,18 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         Ok(super::surface::exported_surface(self, desc))
     }
 
+    /// rt's surface over the Direct3D 11 textures `planes` name (`super::d3d11_surface`); `None`
+    /// where rt makes none, counted, and the caller keeps the planes in images of its own.
+    #[cfg(windows)]
+    fn import_d3d11_surface(
+        &self,
+        on: OnFault,
+        planes: &[crate::core::platform::resource::D3d11PlaneDesc<'_>],
+    ) -> RaiseResult<Option<crate::core::platform::resource::ImportedSurface<RtPlatform>>> {
+        let _ = on;
+        Ok(super::d3d11_surface::imported_surface(self, planes))
+    }
+
     /// rt's queue, of Metal's default `maxCommandBufferCount`; nil where rt refuses it.
     fn new_command_queue(&self) -> Option<RtObj<RtQueue>> {
         let recorded_call = crate::recorder::rec_call!("newCommandQueue", self);

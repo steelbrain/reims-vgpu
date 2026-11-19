@@ -310,7 +310,8 @@ pub(crate) fn open_on_rt(
         log::info!("hardware video: no VA-API: the device's GPU names no DXGI adapter");
         return None;
     };
-    let copies: Arc<dyn GpuCopies<reims_vgpu_vulkan::RtPlatform>> = Arc::new(rt_windows::RtCopies);
+    let copies: Arc<dyn GpuCopies<reims_vgpu_vulkan::RtPlatform>> =
+        Arc::new(rt_windows::RtCopies::new(luid));
     let rules = PlatformRules {
         references: CachedReferences::Apart,
         encodes: false,
@@ -496,6 +497,12 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
     /// module doc's first way.
     fn decodes_into_device_caches(&self) -> bool {
         self.targets.is_some()
+    }
+
+    /// The draws the platform's GPU copies make (`GpuCopies::plane_draws`).
+    #[cfg(windows)]
+    fn plane_draws(&self) -> Option<Arc<reims_vgpu_video::vaapi::PlaneDraw>> {
+        self.copies.as_ref()?.plane_draws()
     }
 
     fn session(&self, codec: u32, direction: u32) -> Option<Arc<dyn GraphicsVideoSession<P>>> {
@@ -1455,6 +1462,20 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
             to.decoded_there();
             return Ok(());
         }
+        // Into its cache's surface over Direct3D 11 textures: drawn there from the shared
+        // texture it was decoded into, and the platform's images see it once the draw's writes
+        // are said done (`graphics::drawn`). A picture not drawn is copied there by the CPU.
+        #[cfg(windows)]
+        let undrawn = match (&to.luma.drawn, &to.chroma.drawn) {
+            (Some(luma), Some(_)) => match luma.planes.draw(&self.frame) {
+                Ok(()) => {
+                    luma.memory.external_writes_done()?;
+                    return Ok(());
+                }
+                Err(why) => Some(format!("not drawn into its cache's surface: {why}")),
+            },
+            _ => None,
+        };
         let bit_depth = self.frame.bit_depth();
         let declined = match &self.targets {
             // In its device cache, through the cache's memory as a dma-buf, where the video
@@ -1480,6 +1501,11 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
                 },
                 Err(why) => why,
             },
+        };
+        #[cfg(windows)]
+        let declined = match undrawn {
+            Some(why) => format!("{why}; {declined}"),
+            None => declined,
         };
         let declined = match &self.copier {
             // The GPU's copy writes the planes' buffer, which a plane in its cache's surface does
@@ -1529,6 +1555,13 @@ pub(crate) trait GpuCopies<P: Platform>: Send + Sync {
 
     /// An encode session's filler; `Err` with why where the device makes none.
     fn filler(&self) -> Result<Box<dyn GpuFiller<P>>, String>;
+
+    /// The draws of the video's pictures into a cache's planes over Direct3D 11 textures
+    /// (`graphics::drawn`), where the device makes them; `None` by default.
+    #[cfg(windows)]
+    fn plane_draws(&self) -> Option<Arc<reims_vgpu_video::vaapi::PlaneDraw>> {
+        None
+    }
 }
 
 /// One encode session's GPU copies of its frames into its encoder's input surfaces.

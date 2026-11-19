@@ -174,6 +174,8 @@ fn planes(source: &FakeBuffer, width: u64, height: u64) -> (VideoPlane<'_, P>, V
         rows_room: None,
         #[cfg(unix)]
         surface: None,
+        #[cfg(windows)]
+        drawn: None,
     };
     (plane(0, height), plane(8192, height / 2))
 }
