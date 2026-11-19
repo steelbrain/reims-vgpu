@@ -3,8 +3,8 @@
 # A Mac's GPU is shared by every process on it. The test that holds the most of its memory runs
 # first, with nothing else in flight; the longest tests start next, so the run does not end on one
 # that began late. Why, and what such tests did to the others before, is in docs/lessons.md
-# ("Tools and worktrees", and "The platform and the runtime" for Metal's compiles). Every override but the last three is the Mac's alone; on
-# Linux only the last three apply, and nextest runs the other tests in its own order. A filter that
+# ("Tools and worktrees", and "The platform and the runtime" for Metal's compiles). Every override but the last four is the Mac's alone; on
+# Linux only the last four apply, and nextest runs the other tests in its own order. A filter that
 # names a package or binary the workspace no longer has fails every nextest run, so a rename
 # updates this file too.
 
@@ -73,6 +73,35 @@ platform = 'cfg(target_os = "linux")'
 filter = 'binary_id(reims-vgpu-vulkan) & test(=gpu::resource::tests::a_device_cache_lays_its_planes_on_the_devices_lines_from_its_first_planes_byte)'
 success-output = "final"
 
+# The measurements whose `#[ignore]` says they hold the GPU or run alone, on every platform:
+# opt-in, taken only by a run of ignored tests (`--run-ignored all` or `only`), and then run with
+# nothing else in flight, in whatever filter takes them. One beside other GPU tests fails theirs:
+# on an RTX 3090 (driver 620.70.06) under `--profile nvidia --run-ignored all`, the tests of
+# `graphics::nvidia::`, `video_host::` and `surface_cache::`, which take surface_cache's download
+# costs, failed 3 of 4 runs, and `graphics::nvidia::` beside the download costs alone 1 of 4, each
+# failure an NVDEC decode whose status was 8 (cuvidDecodeStatus_Error); the same filters without
+# the download costs failed none of 8 (m3-max-53602, m3-max-53622, 2026-11-19).
+[[profile.default.overrides]]
+filter = '''
+    (binary_id(reims-vgpu) & (
+        test(=graphics::decode::surface_cache::costs::download_costs_vulkan)
+      | test(=graphics::decode::surface_pages::costs::surface_view_costs_vulkan)
+      | test(=graphics::decode::surface_pages::costs::pages_take_costs_vulkan)
+      | test(=graphics::decode::surface_pages::costs::large_take_costs_vulkan)
+      | test(=graphics::decode::icb_slots_cost::on_vulkan_icb_slots_cost)
+      | test(=graphics::decode::handler_cost::on_vulkan_handler_cost)
+      | test(=graphics::decode::close_cost::on_vulkan_close_cost)
+      | test(=graphics::decode::composite_cost::on_vulkan_composite_cost)
+      | test(=graphics::decode::composite_cost::on_rt_composite_cost)
+      | test(=graphics::decode::dispatch_cost::on_vulkan_dispatch_cost)
+      | test(=graphics::decode::dispatch_cost::on_rt_dispatch_cost)
+      | test(=graphics::decode::draw_cost::on_vulkan_draw_cost)))
+  | (binary_id(reims-vgpu-vulkan) & (
+        test(=os::linux::host_ram::tests::slab_heap_costs)
+      | test(=os::linux::host_ram::tests::slab_nocopy_costs)))
+'''
+threads-required = "num-test-threads"
+
 # The NVIDIA hosts' legs (`--profile nvidia`, AGENTS.md "The video crates' checks"): at most three
 # tests that make a Vulkan device at a time, the keep-awake's exit test, whose 8 children each
 # make one, taking all three. Each test process makes a device of its own, up to 16 at once where
@@ -89,6 +118,30 @@ success-output = "final"
 # the leg little.
 [test-groups]
 vulkan-devices = { max-threads = 3 }
+
+# The measurements that run alone (above, the same list) stay out of the group, so that what they
+# wait for is every test in flight rather than the group's three.
+[[profile.nvidia.overrides]]
+platform = 'cfg(target_os = "linux")'
+filter = '''
+    (binary_id(reims-vgpu) & (
+        test(=graphics::decode::surface_cache::costs::download_costs_vulkan)
+      | test(=graphics::decode::surface_pages::costs::surface_view_costs_vulkan)
+      | test(=graphics::decode::surface_pages::costs::pages_take_costs_vulkan)
+      | test(=graphics::decode::surface_pages::costs::large_take_costs_vulkan)
+      | test(=graphics::decode::icb_slots_cost::on_vulkan_icb_slots_cost)
+      | test(=graphics::decode::handler_cost::on_vulkan_handler_cost)
+      | test(=graphics::decode::close_cost::on_vulkan_close_cost)
+      | test(=graphics::decode::composite_cost::on_vulkan_composite_cost)
+      | test(=graphics::decode::composite_cost::on_rt_composite_cost)
+      | test(=graphics::decode::dispatch_cost::on_vulkan_dispatch_cost)
+      | test(=graphics::decode::dispatch_cost::on_rt_dispatch_cost)
+      | test(=graphics::decode::draw_cost::on_vulkan_draw_cost)))
+  | (binary_id(reims-vgpu-vulkan) & (
+        test(=os::linux::host_ram::tests::slab_heap_costs)
+      | test(=os::linux::host_ram::tests::slab_nocopy_costs)))
+'''
+test-group = "@global"
 
 [[profile.nvidia.overrides]]
 platform = 'cfg(target_os = "linux")'
