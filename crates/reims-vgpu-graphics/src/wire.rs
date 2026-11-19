@@ -520,6 +520,17 @@ pub const RGFX_FEATURE_CURSOR_COLOR: u64 = 0x80_0000_0000_0000;
 /// waits for no answer. Every host offers it; the x86-64 and arm64e kexts take it, and the bundle
 /// posts it only where they did.
 pub const RGFX_FEATURE_BUFFER_ESCAPED: u64 = 0x100_0000_0000_0000;
+/// `FEATURES_HI` bit 25, feature bit 57, `POOL`: the device has a Shared pool, guest physical
+/// addresses past the guest's RAM that the host fills with its own memory as the guest's buffers
+/// need it (`POOL_BASE_LO` to `POOL_LENGTH_HI` read its range). Ring 0 carries
+/// [`RGFX_CMD_POOL_TAKE`] and [`RGFX_CMD_POOL_GIVE`], a context's ask for a block of the pool and
+/// its giving one back, and a context's ring carries [`RGFX_CMD_HEAP_OVER_POOL`], a Shared heap
+/// over a block it holds, and, where the guest took [`RGFX_FEATURE_ICB_SLOTS`] too,
+/// [`RGFX_CMD_ICB_SLOTS_IN_POOL`], slots in one (docs/graphics-kext/design.md, "The Shared
+/// pool"). The host offers it where it reserved a pool, but on Windows; the x86-64 kext takes it,
+/// and a guest that did not take it is refused every one of those messages and keeps its slabs in
+/// the region.
+pub const RGFX_FEATURE_POOL: u64 = 0x200_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -578,6 +589,17 @@ pub const RGFX_REG_DOORBELL_PAGE_BIND: u32 = 0x040;
 /// Where a [`RGFX_REG_DOORBELL_PAGE_BIND`] value's context starts: bits 8 to 31, so a context of
 /// 2^24 or more (whose object ids would pass 64 bits) gets no page.
 pub const RGFX_DOORBELL_PAGE_BIND_CONTEXT_SHIFT: u32 = 8;
+/// `POOL_BASE_LO`, RO: where the guest took [`RGFX_FEATURE_POOL`], the guest physical address of
+/// the Shared pool's first byte, its low 32 bits; 0 otherwise. The range is the same for the
+/// device's life, so the kext's one read at its start holds.
+pub const RGFX_REG_POOL_BASE_LO: u32 = 0x044;
+/// `POOL_BASE_HI`, RO: as [`RGFX_REG_POOL_BASE_LO`], its high 32 bits.
+pub const RGFX_REG_POOL_BASE_HI: u32 = 0x048;
+/// `POOL_LENGTH_LO`, RO: where the guest took [`RGFX_FEATURE_POOL`], the Shared pool's length in
+/// bytes, its low 32 bits; 0 otherwise.
+pub const RGFX_REG_POOL_LENGTH_LO: u32 = 0x04c;
+/// `POOL_LENGTH_HI`, RO: as [`RGFX_REG_POOL_LENGTH_LO`], its high 32 bits.
+pub const RGFX_REG_POOL_LENGTH_HI: u32 = 0x050;
 /// What `MAGIC` reads: "RGFX", little-endian.
 pub const RGFX_MAGIC: u32 = 0x5846_4752;
 /// What `VERSION` reads: the wire's version, which every change a guest built before it would
@@ -1138,6 +1160,21 @@ pub const RGFX_CMD_ICB_SLOTS_IN_PAGES: u32 = 0x23a;
 /// such buffer is refused as a bad reference. A host without the feature refuses the message as one
 /// it does not know.
 pub const RGFX_CMD_BUFFER_ESCAPED: u32 = 0x23b;
+/// Command `HEAP_OVER_POOL` ([`RgfxHeapOverHostMemory`], its `region_offset` the heap's offset in
+/// the Shared pool), where the guest took [`RGFX_FEATURE_POOL`]: a Shared heap over `size_bytes`
+/// of a pool block the sender's context holds ([`RGFX_CMD_POOL_TAKE`]), at that offset, as
+/// [`RGFX_CMD_HEAP_OVER_HOST_MEMORY`] makes one over a region block. The heap holds the block:
+/// the block's `POOL_GIVE` is refused while the heap lives. A span that does not lie in one block
+/// of the sender's makes nothing, as an unknown id does. Not answered.
+pub const RGFX_CMD_HEAP_OVER_POOL: u32 = 0x23c;
+/// Command `ICB_SLOTS_IN_POOL` ([`RgfxIcbSlots`], then its runs, [`RgfxIcbSlotRun`], each run's
+/// `region_offset` its first slot's offset in the Shared pool), where the guest took
+/// [`RGFX_FEATURE_POOL`] and [`RGFX_FEATURE_ICB_SLOTS`]: as [`RGFX_CMD_ICB_SLOTS`], each run's
+/// slots in one pool block the sender's context holds ([`RGFX_CMD_POOL_TAKE`]), which the host
+/// reads in place. A run whose slots do not lie in one such block is skipped alone, as a run of
+/// `ICB_SLOTS` the host cannot read is. Ring 0 is carried out before any command buffer the
+/// process posts after it, as `ICB_WRITE` is. Not answered.
+pub const RGFX_CMD_ICB_SLOTS_IN_POOL: u32 = 0x23d;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -1206,6 +1243,30 @@ pub const RGFX_CMD_BLOCK_SHARE: u32 = 0x2f4;
 /// refused while an object of any context lies in the block; its answer waits for the command
 /// buffers this context committed before its unshare too, which may still use the block.
 pub const RGFX_CMD_BLOCK_UNSHARE: u32 = 0x2f5;
+/// `POOL_TAKE` ([`RgfxPoolTake`]), on ring 0 from the accelerator kext, where the guest took
+/// [`RGFX_FEATURE_POOL`]: context `context` asks for a block of the Shared pool of at least
+/// `length` bytes. Answered [`RGFX_EVT_POOL_BLOCK`] with this message's `seqno`: the block's offset
+/// in the pool and its length, `length` rounded up to [`RGFX_POOL_BLOCK_ALIGN`], every byte of it
+/// zero, and the block the context's from then until its `POOL_GIVE` or the context's
+/// `CONTEXT_CLOSE`; or [`RGFX_STATUS_INVALID_ARGUMENT`] for a `length` of 0 or past
+/// [`RGFX_POOL_TAKE_MAX`], and [`RGFX_STATUS_REFUSED`] where the pool has no room for it. The
+/// answer may come after later messages' answers: a take that finds no room in the pool's memory
+/// waits for the host to add more, and each context's takes are answered in its own order, never
+/// behind another context's. A take of a context closed before its answer is given back by the
+/// host, and its answer is not sent.
+pub const RGFX_CMD_POOL_TAKE: u32 = 0x2fb;
+/// `POOL_GIVE` ([`RgfxPoolGive`]), on ring 0 from the accelerator kext: context `context` gives
+/// back its pool block of `length` bytes at pool offset `pool_offset`, which no process maps any
+/// more. Answered [`RGFX_EVT_COMPLETE`]: [`RGFX_STATUS_REFUSED`] at once where an object the host
+/// holds (a heap) still lies in the block, or [`RGFX_STATUS_NOT_FOUND`] where the context holds no
+/// such block; otherwise [`RGFX_STATUS_OK`] once every command buffer the context had committed
+/// has finished, and only then does the block go back to the pool. Posted after every message the
+/// process posted before it gave the block up.
+pub const RGFX_CMD_POOL_GIVE: u32 = 0x2fc;
+/// A pool block's offset and length are multiples of this: 64 KiB.
+pub const RGFX_POOL_BLOCK_ALIGN: u64 = 0x1_0000;
+/// The longest block a `POOL_TAKE` may ask for: 4 GiB.
+pub const RGFX_POOL_TAKE_MAX: u64 = 0x1_0000_0000;
 /// `SURFACE_PAGES` ([`RgfxSurfacePages`]), on ring 0 from the accelerator kext, where the device
 /// has [`RGFX_FEATURE_SURFACE_PAGES`]: the guest RAM an IOSurface's `length` bytes lie in, whose
 /// shared block of `block_size` bytes at `block_offset` the kext made for the GPU to use the
@@ -1394,6 +1455,10 @@ pub const RGFX_VT_HOST_MESSAGE_BYTES_OFFSET: u32 = 24;
 /// record. The guest takes them in order where it takes the event, then stores `produced` to the
 /// ring's `consumer`; a `VT_RING` whose count it has taken already takes nothing.
 pub const RGFX_EVT_VT_RING: u32 = 0x40f;
+/// Event `POOL_BLOCK` ([`RgfxPoolBlock`], on the control completion ring), with a
+/// [`RGFX_CMD_POOL_TAKE`]'s `seqno`: its answer. `status` [`RGFX_STATUS_OK`] with the block's
+/// `pool_offset` and `length`; otherwise both 0.
+pub const RGFX_EVT_POOL_BLOCK: u32 = 0x410;
 
 /// A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 pub const RGFX_CB_OK: u32 = 0;
@@ -1924,6 +1989,9 @@ const _: () = {
     assert!(offset_of!(RgfxRingHeader, guest_clock_bound_ns) == 0x20);
     assert!(offset_of!(RgfxRingHeader, raise_all) == 0xc4);
     assert!(size_of::<RgfxMsgHeader>() == 16);
+    assert!(size_of::<RgfxPoolTake>() == 32);
+    assert!(size_of::<RgfxPoolGive>() == 40);
+    assert!(size_of::<RgfxPoolBlock>() == 40);
     assert!(size_of::<RgfxVtMessage>() == RGFX_VT_MESSAGE_RUNS_OFFSET as usize);
     assert!(size_of::<RgfxVtSurface>() == 88);
     assert!(size_of::<RgfxVtSurfacePlane>() == 24);
@@ -2723,6 +2791,58 @@ pub struct RgfxBlockGrant {
     pub size: u64,
 }
 
+/// `POOL_TAKE`: context `context` asks for a block of the Shared pool of at least `length` bytes.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxPoolTake {
+    /// [`RGFX_CMD_POOL_TAKE`].
+    pub header: RgfxMsgHeader,
+    /// The asking context.
+    pub context: u32,
+    /// Zero.
+    pub reserved_14: u32,
+    /// The bytes asked for.
+    pub length: u64,
+}
+
+/// `POOL_GIVE`: context `context` gives back its pool block of `length` bytes at `pool_offset`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxPoolGive {
+    /// [`RGFX_CMD_POOL_GIVE`].
+    pub header: RgfxMsgHeader,
+    /// The giving context.
+    pub context: u32,
+    /// Zero.
+    pub reserved_14: u32,
+    /// The block's offset in the pool.
+    pub pool_offset: u64,
+    /// The block's length, as its `POOL_BLOCK` answered it.
+    pub length: u64,
+}
+
+/// Event `POOL_BLOCK`: a `POOL_TAKE`'s answer, with its `seqno`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxPoolBlock {
+    /// [`RGFX_EVT_POOL_BLOCK`], the take's `seqno`.
+    pub header: RgfxMsgHeader,
+    /// [`RGFX_STATUS_OK`], [`RGFX_STATUS_INVALID_ARGUMENT`] or [`RGFX_STATUS_REFUSED`].
+    pub status: u32,
+    /// Zero.
+    pub reserved_14: u32,
+    /// The block's offset in the pool; 0 unless OK.
+    pub pool_offset: u64,
+    /// The block's length; 0 unless OK.
+    pub length: u64,
+}
+
 /// `HEAP_CREATE`: a device heap of `size_bytes` at the guest-picked
 /// `gpu_address`. `options` carries the heap's storage and cache modes and type.
 #[repr(C)]
@@ -3228,14 +3348,14 @@ pub struct RgfxIcbWrite {
     pub obj_id: u64,
 }
 
-/// `ICB_SLOTS`: `run_count` [`RgfxIcbSlotRun`]s follow, to the message's `size`; and
-/// `ICB_SLOTS_IN_PAGES`: `run_count` [`RgfxIcbSlotPagesRun`]s.
+/// `ICB_SLOTS` and `ICB_SLOTS_IN_POOL`: `run_count` [`RgfxIcbSlotRun`]s follow, to the message's
+/// `size`; and `ICB_SLOTS_IN_PAGES`: `run_count` [`RgfxIcbSlotPagesRun`]s.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
 )]
 pub struct RgfxIcbSlots {
-    /// [`RGFX_CMD_ICB_SLOTS`] or [`RGFX_CMD_ICB_SLOTS_IN_PAGES`].
+    /// [`RGFX_CMD_ICB_SLOTS`], [`RGFX_CMD_ICB_SLOTS_IN_PAGES`] or [`RGFX_CMD_ICB_SLOTS_IN_POOL`].
     pub header: RgfxMsgHeader,
     /// The first run's indirect command buffer, which places the message in its context.
     pub obj_id: u64,
@@ -3261,7 +3381,8 @@ pub const RGFX_ICB_SLOTS_COMPUTE: u16 = 2;
 pub struct RgfxIcbSlotRun {
     /// The indirect command buffer.
     pub icb_obj_id: u64,
-    /// The first slot's place in the region: 8-aligned.
+    /// The first slot's place in the region, or of an `ICB_SLOTS_IN_POOL` in the Shared pool:
+    /// 8-aligned.
     pub region_offset: u64,
     /// The first slot's command.
     pub first_command: u32,
