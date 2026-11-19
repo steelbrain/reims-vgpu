@@ -505,3 +505,254 @@ fn a_piece_given_back_and_taken_again_reads_zero() {
     assert_eq!(unsafe { hold.host.as_ptr().cast::<u64>().read() }, 0);
     assert_eq!(host.calls().len(), 4);
 }
+
+/// The pool at `range(64)` with one live piece, at `BASE`, and a ledger of it.
+fn live_pool(host: &Arc<Host>, delay: Duration) -> (Pool, Arc<HostBlocks>, PoolLedger) {
+    let (pool, blocks) = pool(range(64), host, delay);
+    pool.grow(BLOCK_LEN);
+    host.wait_for(1);
+    pool.added(BASE).unwrap();
+    let ledger = pool.ledger();
+    (pool, blocks, ledger)
+}
+
+type Answers = std::sync::mpsc::Receiver<Option<(u64, u64)>>;
+
+/// Context `context`'s take of `length` bytes, its answer sent to the receiver returned.
+fn take(ledger: &PoolLedger, context: u32, length: u64) -> Answers {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let answer: TakeAnswer = Box::new(move |block| {
+        let _ = tx.send(block);
+    });
+    ledger.take(context, length, answer).unwrap();
+    rx
+}
+
+/// A take's answer, or the test fails after 10 s.
+fn answer(rx: &Answers) -> Option<(u64, u64)> {
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("the take is answered")
+}
+
+/// Fills the `len` bytes at pool offset `offset` with `byte`, through the piece's mapping.
+fn fill(pool: &Pool, offset: u64, len: u64, byte: u8) {
+    let hold = pool.find(BASE + offset, len).unwrap();
+    // SAFETY: inside the live piece, which the hold keeps.
+    unsafe { std::ptr::write_bytes(hold.host.as_ptr(), byte, usize::try_from(len).unwrap()) };
+}
+
+/// Whether the `len` bytes at pool offset `offset` are all `byte`.
+fn all(pool: &Pool, offset: u64, len: u64, byte: u8) -> bool {
+    let hold = pool.find(BASE + offset, len).unwrap();
+    // SAFETY: as in `fill`.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(hold.host.as_ptr(), usize::try_from(len).unwrap()) };
+    bytes.iter().all(|&b| b == byte)
+}
+
+#[test]
+fn a_take_is_carved_zeroed_and_answered_with_its_length_rounded_up() {
+    let host = Arc::new(Host::default());
+    let (pool, _blocks, ledger) = live_pool(&host, LONG);
+    fill(&pool, 0, 3 * TAKE_ALIGN, 0xa5);
+    assert_eq!(answer(&take(&ledger, 1, 100 << 10)), Some((0, 2 * TAKE_ALIGN)));
+    // The block's bytes are zero, and those past it as they were.
+    assert!(all(&pool, 0, 2 * TAKE_ALIGN, 0));
+    assert!(all(&pool, 2 * TAKE_ALIGN, TAKE_ALIGN, 0xa5));
+    assert_eq!(ledger.counts(), (1, 2 * TAKE_ALIGN));
+}
+
+#[test]
+fn a_take_of_no_bytes_or_past_the_longest_is_an_invalid_argument() {
+    let host = Arc::new(Host::default());
+    let (_pool, _blocks, ledger) = live_pool(&host, LONG);
+    for length in [0, TAKE_MAX + 1] {
+        let answer: TakeAnswer = Box::new(|_| panic!("answered"));
+        assert_eq!(ledger.take(1, length, answer), Err(Error::InvalidArgument));
+    }
+    assert_eq!(ledger.counts(), (0, 0));
+}
+
+#[test]
+fn a_contexts_takes_are_answered_in_its_order_and_share_a_piece_first_fit() {
+    let host = Arc::new(Host::default());
+    let (_pool, _blocks, ledger) = live_pool(&host, LONG);
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (n, length) in [TAKE_ALIGN, 2 * TAKE_ALIGN, TAKE_ALIGN].into_iter().enumerate() {
+        let tx = tx.clone();
+        let answer: TakeAnswer = Box::new(move |block| {
+            let _ = tx.send((n, block));
+        });
+        ledger.take(1, length, answer).unwrap();
+    }
+    let got: Vec<_> = (0..3)
+        .map(|_| rx.recv_timeout(Duration::from_secs(10)).unwrap())
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (0, Some((0, TAKE_ALIGN))),
+            (1, Some((TAKE_ALIGN, 2 * TAKE_ALIGN))),
+            (2, Some((3 * TAKE_ALIGN, TAKE_ALIGN))),
+        ]
+    );
+    // Another context's take goes past them in the same piece.
+    assert_eq!(
+        answer(&take(&ledger, 2, TAKE_ALIGN)),
+        Some((4 * TAKE_ALIGN, TAKE_ALIGN))
+    );
+}
+
+#[test]
+fn a_take_that_fits_no_piece_grows_the_pool_and_waits_for_the_hosts_map() {
+    let host = Arc::new(Host::default());
+    let (pool, _blocks) = pool(range(64), &host, LONG);
+    let ledger = pool.ledger();
+    let rx = take(&ledger, 1, TAKE_ALIGN);
+    assert_eq!(host.wait_for(1)[0], Call::Add(BASE, BLOCK_LEN));
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(rx.try_recv().is_err(), "answered before the host mapped the piece");
+    pool.added(BASE).unwrap();
+    assert_eq!(answer(&rx), Some((0, TAKE_ALIGN)));
+    // Its piece used, the pool asks for another as headroom.
+    assert_eq!(host.wait_for(2)[1], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
+}
+
+#[test]
+fn a_take_whose_context_closed_before_its_answer_is_given_back_unanswered() {
+    let host = Arc::new(Host::default());
+    let (pool, _blocks) = pool(range(64), &host, LONG);
+    let ledger = pool.ledger();
+    let rx = take(&ledger, 1, TAKE_ALIGN);
+    host.wait_for(1);
+    assert_eq!(ledger.context_closed(1), []);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    );
+    pool.added(BASE).unwrap();
+    assert_eq!(ledger.counts(), (0, 0));
+    // The context's number, given out again, takes anew.
+    assert_eq!(answer(&take(&ledger, 1, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
+}
+
+#[test]
+fn a_give_finds_only_the_contexts_block_as_answered_and_frees_it_at_its_free() {
+    let host = Arc::new(Host::default());
+    let (_pool, _blocks, ledger) = live_pool(&host, LONG);
+    let len = 2 * TAKE_ALIGN;
+    assert_eq!(answer(&take(&ledger, 1, len)), Some((0, len)));
+    let free = |_, _| false;
+    assert_eq!(ledger.give(2, 0, len, free), Give::NotFound);
+    assert_eq!(ledger.give(1, 0, TAKE_ALIGN, free), Give::NotFound);
+    assert_eq!(ledger.give(1, TAKE_ALIGN, TAKE_ALIGN, free), Give::NotFound);
+    // An object in it keeps it the context's.
+    let in_use = ledger.give(1, 0, len, |offset, length| {
+        assert_eq!((offset, length), (0, len));
+        true
+    });
+    assert_eq!(in_use, Give::InUse);
+    assert!(ledger.over_held(1, 0, len, |_| ()).is_some());
+    let Give::Given(carve) = ledger.give(1, 0, len, free) else {
+        panic!("not given");
+    };
+    // Going: no heap is made over it, and no second give finds it, until its free.
+    assert!(ledger.over_held(1, 0, len, |_| ()).is_none());
+    assert_eq!(ledger.give(1, 0, len, free), Give::NotFound);
+    assert_eq!(ledger.counts(), (1, len));
+    ledger.free(&[carve]);
+    assert_eq!(ledger.counts(), (0, 0));
+    assert_eq!(answer(&take(&ledger, 3, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
+}
+
+#[test]
+fn a_heap_is_made_only_over_bytes_in_one_block_the_context_holds() {
+    let host = Arc::new(Host::default());
+    let (pool, _blocks, ledger) = live_pool(&host, LONG);
+    let len = 2 * TAKE_ALIGN;
+    assert_eq!(answer(&take(&ledger, 1, len)), Some((0, len)));
+    let first = pool.find(BASE + TAKE_ALIGN, 1).unwrap().host;
+    assert_eq!(ledger.over_held(1, TAKE_ALIGN, TAKE_ALIGN, |p| p), Some(first));
+    assert_eq!(ledger.over_held(1, TAKE_ALIGN, len, |p| p), None);
+    assert_eq!(ledger.over_held(2, 0, TAKE_ALIGN, |p| p), None);
+    assert_eq!(ledger.over_held(1, len, TAKE_ALIGN, |p| p), None);
+}
+
+#[test]
+fn a_close_lets_go_of_every_block_of_its_context_and_no_other() {
+    let host = Arc::new(Host::default());
+    let (_pool, _blocks, ledger) = live_pool(&host, LONG);
+    answer(&take(&ledger, 1, TAKE_ALIGN)).unwrap();
+    answer(&take(&ledger, 2, TAKE_ALIGN)).unwrap();
+    answer(&take(&ledger, 1, TAKE_ALIGN)).unwrap();
+    let gone = ledger.context_closed(1);
+    assert_eq!(gone.len(), 2);
+    assert_eq!(ledger.give(1, 0, TAKE_ALIGN, |_, _| false), Give::NotFound);
+    assert_eq!(ledger.counts(), (3, 3 * TAKE_ALIGN));
+    ledger.free(&gone);
+    assert_eq!(ledger.counts(), (1, TAKE_ALIGN));
+    assert!(ledger.over_held(2, TAKE_ALIGN, TAKE_ALIGN, |_| ()).is_some());
+}
+
+#[test]
+fn a_free_after_the_reset_frees_nothing_carved_since() {
+    let host = Arc::new(Host::default());
+    let (_pool, _blocks, ledger) = live_pool(&host, LONG);
+    answer(&take(&ledger, 1, TAKE_ALIGN)).unwrap();
+    let Give::Given(carve) = ledger.give(1, 0, TAKE_ALIGN, |_, _| false) else {
+        panic!("not given");
+    };
+    ledger.reset();
+    assert_eq!(ledger.counts(), (0, 0));
+    assert_eq!(answer(&take(&ledger, 3, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
+    ledger.free(&[carve]);
+    assert_eq!(ledger.counts(), (1, TAKE_ALIGN));
+}
+
+#[test]
+fn a_piece_with_a_block_stays_and_goes_back_once_its_last_block_is_freed() {
+    let delay = Duration::from_millis(50);
+    let host = Arc::new(Host::default());
+    let (pool, _blocks, ledger) = live_pool(&host, delay);
+    // The first piece full, the pool asks for headroom, which the next take uses.
+    assert_eq!(answer(&take(&ledger, 1, BLOCK_LEN)), Some((0, BLOCK_LEN)));
+    assert_eq!(host.wait_for(2)[1], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
+    pool.added(BASE + BLOCK_LEN).unwrap();
+    assert_eq!(
+        answer(&take(&ledger, 1, TAKE_ALIGN)),
+        Some((BLOCK_LEN, TAKE_ALIGN))
+    );
+    assert_eq!(
+        host.wait_for(3)[2],
+        Call::Add(BASE + 2 * BLOCK_LEN, BLOCK_LEN)
+    );
+    pool.added(BASE + 2 * BLOCK_LEN).unwrap();
+    // Both used pieces stay past the delay, and the empty one is the headroom.
+    std::thread::sleep(delay * 6);
+    assert_eq!(host.calls().len(), 3);
+    // The first emptied, it is the lowest empty piece: the third goes back.
+    let Give::Given(carve) = ledger.give(1, 0, BLOCK_LEN, |_, _| false) else {
+        panic!("not given");
+    };
+    ledger.free(&[carve]);
+    assert_eq!(
+        host.wait_for(4)[3],
+        Call::Remove(BASE + 2 * BLOCK_LEN, BLOCK_LEN)
+    );
+    assert_eq!(host.calls().len(), 4);
+}
+
+#[test]
+fn the_release_leaves_the_blocks_with_a_live_ledger_until_its_drop() {
+    let host = Arc::new(Host::default());
+    let (pool, blocks, ledger) = live_pool(&host, LONG);
+    answer(&take(&ledger, 1, TAKE_ALIGN)).unwrap();
+    host.wait_for(2);
+    drop(pool);
+    assert_eq!(blocks.counts(), (2, 0));
+    // A take after the release is never answered.
+    let rx = take(&ledger, 2, TAKE_ALIGN);
+    assert!(rx.recv_timeout(Duration::from_secs(1)).is_err());
+    drop(ledger);
+    assert_eq!(blocks.counts(), (0, 2));
+}

@@ -338,7 +338,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 56.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 57.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -392,7 +392,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_UPLOADS_WRITTEN
     | RGFX_FEATURE_VT_RING
     | RGFX_FEATURE_CURSOR_COLOR
-    | RGFX_FEATURE_BUFFER_ESCAPED;
+    | RGFX_FEATURE_BUFFER_ESCAPED
+    | RGFX_FEATURE_POOL;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -483,6 +484,40 @@ pub trait Host: Send + Sync + 'static {
     /// The default does nothing, for a host with no stage-3 decoder.
     fn block_unshared(&self, unshare: &RgfxBlockGrant) {
         let _ = unshare;
+    }
+
+    /// The device's Shared pool's guest physical range, its first address and its length, which
+    /// `POOL_BASE_LO` to `POOL_LENGTH_HI` read where the guest took [`RGFX_FEATURE_POOL`]: the
+    /// same for the device's life, so the kext's one read at its start holds. A host that offers
+    /// the feature answers its pool's. The default is none, `(0, 0)`.
+    fn pool_range(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
+    /// `POOL_TAKE`, where the guest took [`RGFX_FEATURE_POOL`]: context `take.context` asks for a
+    /// zeroed block of the pool of at least `take.length` bytes. The host gives `answer` from any
+    /// thread: the block's offset in the pool and its length, `take.length` rounded up to
+    /// [`RGFX_POOL_BLOCK_ALIGN`], every byte zero; [`RGFX_STATUS_INVALID_ARGUMENT`] for a length
+    /// of 0 or past [`RGFX_POOL_TAKE_MAX`]; or [`RGFX_STATUS_REFUSED`] where its pool has no room.
+    /// It answers each context's takes in their order, and none of a context closed or a device
+    /// reset since, whose block it gives back itself. Called on the context's lane, in ring
+    /// order; it waits for nothing there. The default refuses at once, for a host with no pool.
+    fn pool_take(&self, take: &RgfxPoolTake, answer: PoolAnswer) {
+        let _ = take;
+        answer.answer(RGFX_STATUS_REFUSED, 0, 0);
+    }
+
+    /// `POOL_GIVE`, where the guest took [`RGFX_FEATURE_POOL`]: context `give.context` gives
+    /// back its pool block of `give.length` bytes at pool offset `give.pool_offset`. The host
+    /// gives `answer` from any thread: [`RGFX_STATUS_NOT_FOUND`] at once where the context holds
+    /// no such block, [`RGFX_STATUS_REFUSED`] at once where an object it holds lies in the block,
+    /// which the context keeps, else [`RGFX_STATUS_OK`] once every command buffer of the context
+    /// it had committed has finished, and only then does the block go back to the pool. Called
+    /// on the context's lane, in ring order. The default finds no block, for a host with no
+    /// pool.
+    fn pool_give(&self, give: &RgfxPoolGive, answer: CompleteAnswer) {
+        let _ = give;
+        answer.answer(RGFX_STATUS_NOT_FOUND);
     }
 
     /// The device was reset ([`Device::reset`], or the guest's `STATUS` 0): the host drops every
@@ -1706,12 +1741,20 @@ impl Device {
     }
 
     /// A 32-bit read of BAR 0 at `offset`. Offsets with no register read 0, and so do
-    /// `HOST_TIME_LO` and `_HI` where the driver did not take `HOST_TIME`.
+    /// `HOST_TIME_LO` and `_HI` where the driver did not take `HOST_TIME`, and `POOL_BASE_LO` to
+    /// `POOL_LENGTH_HI` where it did not take `POOL`.
     pub fn mmio_read(&self, offset: u64) -> u32 {
         let size = self.shared.region.size();
         let host_time = || {
             self.shared.driver_features.load(Ordering::Acquire) & u64::from(RGFX_FEATURE_HOST_TIME)
                 != 0
+        };
+        let pool = || {
+            if self.shared.driver_took(RGFX_FEATURE_POOL) {
+                self.shared.host.pool_range()
+            } else {
+                (0, 0)
+            }
         };
         match u32::try_from(offset).unwrap_or(u32::MAX) {
             RGFX_REG_MAGIC => RGFX_MAGIC,
@@ -1732,6 +1775,10 @@ impl Device {
             // The clock the refresh thread's grid stamps each VBLANK on.
             RGFX_REG_HOST_TIME_LO if host_time() => (now_ns() & 0xffff_ffff) as u32,
             RGFX_REG_HOST_TIME_HI if host_time() => (now_ns() >> 32) as u32,
+            RGFX_REG_POOL_BASE_LO => (pool().0 & 0xffff_ffff) as u32,
+            RGFX_REG_POOL_BASE_HI => (pool().0 >> 32) as u32,
+            RGFX_REG_POOL_LENGTH_LO => (pool().1 & 0xffff_ffff) as u32,
+            RGFX_REG_POOL_LENGTH_HI => (pool().1 >> 32) as u32,
             _ => 0,
         }
     }
@@ -1840,6 +1887,44 @@ pub struct CompleteAnswer {
 
 /// A `PRESENT_SURFACE`'s answer.
 pub type PresentAnswer = CompleteAnswer;
+
+/// The `POOL_BLOCK` a `POOL_TAKE` owes ([`Host::pool_take`]), which the host gives from any thread
+/// once the block is zeroed, or once it knows the pool has no room. As a [`CompleteAnswer`], it
+/// holds a weak reference to the device, and an answer after the device has ended, or for a take
+/// before a reset, is dropped, and so is one never given.
+pub struct PoolAnswer {
+    /// The device's shared state, weakly.
+    shared: Weak<Shared>,
+    /// The take's `seqno`.
+    seqno: u64,
+    /// The reset count the take was taken at.
+    epoch: u64,
+}
+
+impl std::fmt::Debug for PoolAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolAnswer")
+            .field("seqno", &self.seqno)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PoolAnswer {
+    /// Posts the `POOL_BLOCK` with `status`, and with the block's `pool_offset` and `length`
+    /// where `status` is [`RGFX_STATUS_OK`] (0 otherwise), onto the control completion ring,
+    /// waiting for nothing, as [`CompleteAnswer::answer`] posts.
+    pub fn answer(self, status: u32, pool_offset: u64, length: u64) {
+        let (pool_offset, length) = if status == RGFX_STATUS_OK {
+            (pool_offset, length)
+        } else {
+            (0, 0)
+        };
+        if let Some(shared) = self.shared.upgrade() {
+            let block = crate::control::pool_block(self.seqno, status, pool_offset, length);
+            shared.post_unwaiting(&block, self.epoch);
+        }
+    }
+}
 
 impl std::fmt::Debug for CompleteAnswer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3812,6 +3897,15 @@ impl Shared {
     /// The answer ring-0 command `seqno`, taken at reset count `epoch`, owes ([`CompleteAnswer`]).
     pub(crate) fn complete_answer(&self, seqno: u64, epoch: u64) -> CompleteAnswer {
         CompleteAnswer {
+            shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
+            seqno,
+            epoch,
+        }
+    }
+
+    /// The answer `POOL_TAKE` `seqno`, taken at reset count `epoch`, owes ([`PoolAnswer`]).
+    pub(crate) fn pool_answer(&self, seqno: u64, epoch: u64) -> PoolAnswer {
+        PoolAnswer {
             shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
             seqno,
             epoch,

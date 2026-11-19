@@ -72,9 +72,11 @@
 //!   taken under no other lock and holding none, by a command buffer that holds `SURFACE_ORDER`
 //!   (or is waited for) while its waits and its signal are encoded, and at a queue's make and end.
 //!
-//! Where two are held at once, they are taken in this order: `libraries`, `contexts`, a context's
-//! table, then the compiles' pending set (`super::compile`, asked under the table's lock as a
-//! compiled pipeline is stored); and `surface_views` before `surface_caches`.
+//! Where two are held at once, they are taken in this order: the Shared pool's ([`PoolLedger`],
+//! held while a heap over a block of it is made and stored, and while a `POOL_GIVE` asks whether
+//! an object lies in the block), `libraries`, `contexts`, a context's table, then the compiles'
+//! pending set (`super::compile`, asked under the table's lock as a compiled pipeline is stored);
+//! and `surface_views` before `surface_caches`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -82,6 +84,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
+use crate::pool::PoolLedger;
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
@@ -89,7 +92,8 @@ use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_COMMAND_BUFFER,
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
     RGFX_CMD_FENCE_CREATE, RGFX_CMD_FUNCTION_TABLE_SET, RGFX_CMD_HEAP_CREATE,
-    RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_ICB_CREATE,
+    RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_HEAP_OVER_POOL,
+    RGFX_CMD_ICB_CREATE,
     RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_SLOTS_IN_PAGES, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE,
     RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
     RGFX_CMD_MANAGED_BUFFER_CREATE, RGFX_CMD_MANAGED_TEXTURE_CREATE,
@@ -162,6 +166,11 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 /// Metal's page on Apple silicon, to which a Shared heap's memory is rounded up: the guest's
 /// block holds it whole ([`RGFX_CMD_HEAP_OVER_HOST_MEMORY`]).
 const HEAP_PAGE: u64 = 0x4000;
+
+/// Where a heap over a block of the Shared pool lies, as its entry's span names it: this plus its
+/// offset in the pool ([`RGFX_CMD_HEAP_OVER_POOL`]). Past any offset in the region, so no region
+/// block's release finds it, and a `POOL_GIVE` finds it where it asks for the block's span.
+pub(crate) const POOL_SPANS: u64 = 1 << 62;
 
 mod argument;
 mod blit;
@@ -744,6 +753,9 @@ pub(crate) struct Shared<P: Platform> {
     surfaces: Mutex<SurfaceNames>,
     /// The host's hardware video, which makes the video sessions; unset where it has none.
     video: OnceLock<Arc<dyn GraphicsVideo<P>>>,
+    /// The ledger of the contexts' blocks of the guest's Shared pool, which `HEAP_OVER_POOL`
+    /// makes its heaps over; unset where the device offers no pool.
+    pool: OnceLock<PoolLedger>,
     /// The libraries' chunks, makes and cache (`library`).
     libraries: Mutex<Libraries<P>>,
     /// The context holding each small chunk of the texture resource ids
@@ -1137,6 +1149,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             unshared: Mutex::default(),
             surfaces: Mutex::default(),
             video: OnceLock::new(),
+            pool: OnceLock::new(),
             listener: OnceLock::new(),
             libraries: Mutex::new(Libraries::new()),
             id_chunks: Mutex::new(
@@ -1302,6 +1315,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// device's make; without it the caches hold what the platform makes.
     pub(crate) fn set_cache_budget(&self, budget: u64) {
         self.surface_caches.set_cache_budget(budget);
+    }
+
+    /// The ledger of the contexts' blocks of the guest's Shared pool, over which
+    /// `HEAP_OVER_POOL` makes its heaps: set once, at the device's make, where it offers the pool.
+    pub(crate) fn set_pool(&self, ledger: PoolLedger) {
+        let _ = self.shared.pool.set(ledger);
     }
 
     /// Sets the device's `maxBufferLength`, the one its info blob answers the guest: set once, at
@@ -3727,6 +3746,64 @@ impl<P: Platform> GraphicsDecoder<P> {
                         );
                         Ok(Err(DecodeError::Refused))
                     }
+                }
+            }
+            RGFX_CMD_HEAP_OVER_POOL => {
+                let Some(m) = read::<RgfxHeapOverHostMemory>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                // A Shared heap over a block of the guest's Shared pool the sender's context
+                // holds, in place, as `HEAP_OVER_HOST_MEMORY` makes one over a region block: its
+                // memory is the `size_bytes` at pool offset `region_offset`, rounded up to Metal's
+                // 16 KiB page. A span in no block of the context's is a guest protocol error. The
+                // heap is made and stored with the pool's lock held, so the block's `POOL_GIVE`
+                // finds it ([`PoolLedger::give`]); the pool's piece stays mapped while the decoder
+                // holds its ledger, and so the heap.
+                let (Some(ledger), Some(context)) = (self.shared.pool.get(), self.context) else {
+                    return Ok(Err(DecodeError::BadReference));
+                };
+                let Some(length) = m.size_bytes.checked_next_multiple_of(HEAP_PAGE) else {
+                    return Ok(Err(DecodeError::BadReference));
+                };
+                let Some(span) = POOL_SPANS
+                    .checked_add(m.region_offset)
+                    .filter(|&at| at.checked_add(length).is_some())
+                else {
+                    return Ok(Err(DecodeError::BadReference));
+                };
+                let desc = HeapDesc {
+                    size: m.size_bytes,
+                    heap_type: host_heap_type(m.heap_type),
+                    options: vec![OptionSet::ResourceOptions(m.options.into())],
+                    pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
+                };
+                let made = ledger.over_held(context, m.region_offset, length, |first| {
+                    let at = HostPtr::from_ptr(first.as_ptr());
+                    // SAFETY: the bytes lie in one block the context holds (checked under the
+                    // pool's lock), whose piece stays mapped while the decoder holds the ledger.
+                    let bytes = unsafe { HostRange::new(at, length) };
+                    let heap = device.new_heap_over_host_memory(bytes, &desc)?.heap;
+                    Ok(heap.map(|heap| {
+                        let mut entry = Entry::of(ObjHandle::Heap(heap)).over(Some((span, length)));
+                        entry.ram = Some((at, length));
+                        self.store(m.obj_id, entry);
+                    }))
+                });
+                match made {
+                    None => Ok(Err(DecodeError::BadReference)),
+                    Some(made) => match made? {
+                        Some(()) => Ok(Ok(())),
+                        None => {
+                            heap_refused(
+                                m.obj_id,
+                                m.size_bytes,
+                                m.heap_type,
+                                m.options,
+                                m.gpu_address,
+                            );
+                            Ok(Err(DecodeError::Refused))
+                        }
+                    },
                 }
             }
             RGFX_CMD_TEXTURE_CREATE => {

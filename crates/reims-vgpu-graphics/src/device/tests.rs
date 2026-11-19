@@ -5344,3 +5344,162 @@ fn a_reset_drops_what_the_lanes_have_not_begun() {
     let order: Vec<u32> = seen.order.lock().iter().map(|&(t, _)| t).collect();
     assert_eq!(order, [RGFX_CMD_BUFFER_CREATE, HELD_ENDED, RESET_TOLD]);
 }
+
+/// The pool a [`PoolHost`] offers: 4 GiB at 52 GiB.
+const POOL_RANGE: (u64, u64) = (52 << 30, 4 << 30);
+
+/// A host with a Shared pool, which records the takes and gives it is handed, `(type, context,
+/// length or offset)`, and the messages its decoder is: it answers each take with a block at the
+/// pool offset its length is, and each give OK.
+#[derive(Clone, Default)]
+struct PoolHost {
+    seen: Arc<Mutex<Vec<(u32, u32, u64)>>>,
+}
+
+impl Host for PoolHost {
+    fn raise_interrupt(&self, _vector: u32) {}
+    fn features(&self) -> u64 {
+        RGFX_FEATURE_POOL
+    }
+    fn pool_range(&self) -> (u64, u64) {
+        POOL_RANGE
+    }
+    fn pool_take(&self, take: &RgfxPoolTake, answer: PoolAnswer) {
+        (self.seen.lock()).push((RGFX_CMD_POOL_TAKE, take.context, take.length));
+        answer.answer(RGFX_STATUS_OK, take.length, take.length);
+    }
+    fn pool_give(&self, give: &RgfxPoolGive, answer: CompleteAnswer) {
+        (self.seen.lock()).push((RGFX_CMD_POOL_GIVE, give.context, give.pool_offset));
+        answer.answer(RGFX_STATUS_OK);
+    }
+    fn stage3_message(&self, _completion: &CompletionPoster, message: &[u8]) {
+        let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
+        self.seen.lock().push((header.r#type, 0, 0));
+    }
+}
+
+/// A `POOL_TAKE` of `length` bytes for `context`.
+fn pool_take(context: u32, length: u64) -> Vec<u8> {
+    RgfxPoolTake {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_POOL_TAKE,
+            size: size_of::<RgfxPoolTake>() as u32,
+            seqno: 0,
+        },
+        context,
+        reserved_14: 0,
+        length,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A `POOL_GIVE` of `context`'s block of `length` bytes at `pool_offset`.
+fn pool_give(context: u32, pool_offset: u64, length: u64) -> Vec<u8> {
+    RgfxPoolGive {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_POOL_GIVE,
+            size: size_of::<RgfxPoolGive>() as u32,
+            seqno: 0,
+        },
+        context,
+        reserved_14: 0,
+        pool_offset,
+        length,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// The pool's range reads in `POOL_BASE_LO` to `POOL_LENGTH_HI` only where the guest's driver took
+/// `POOL`, from the take on, and reads 0 before it and after a reset.
+#[test]
+fn the_pool_s_range_reads_only_where_the_driver_took_the_pool() {
+    let rig = Rig::with_host(Box::new(PoolHost::default()));
+    let read = |offset: u32| rig.device.mmio_read(offset.into());
+    let word = |lo: u32, hi: u32| (u64::from(read(hi)) << 32) | u64::from(read(lo));
+    let range = || {
+        (
+            word(RGFX_REG_POOL_BASE_LO, RGFX_REG_POOL_BASE_HI),
+            word(RGFX_REG_POOL_LENGTH_LO, RGFX_REG_POOL_LENGTH_HI),
+        )
+    };
+    assert_eq!(
+        word(RGFX_REG_FEATURES_LO, RGFX_REG_FEATURES_HI) & RGFX_FEATURE_POOL,
+        RGFX_FEATURE_POOL
+    );
+    assert_eq!(range(), (0, 0));
+    rig.device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_HI.into(),
+        (RGFX_FEATURE_POOL >> 32) as u32,
+    );
+    assert_eq!(range(), POOL_RANGE);
+    rig.start();
+    assert_eq!(range(), POOL_RANGE);
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    assert_eq!(range(), (0, 0));
+}
+
+/// Where the driver took `POOL`, a `POOL_TAKE` goes to the host, which answers it with a
+/// `POOL_BLOCK` of its seqno, and a `POOL_GIVE` goes to the host, which answers it with a
+/// `COMPLETE`; a take too short to read is answered `INVALID_ARGUMENT` by the device.
+#[test]
+fn a_pool_take_and_give_go_to_the_host_where_the_driver_took_the_pool() {
+    let host = PoolHost::default();
+    let mut rig = Rig::with_host(Box::new(host.clone()));
+    rig.device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_HI.into(),
+        (RGFX_FEATURE_POOL >> 32) as u32,
+    );
+    rig.start();
+    let take = |rig: &mut Rig, bytes: Vec<u8>| {
+        let seqno = rig.send(bytes);
+        let event = rig.event().expect("a POOL_BLOCK");
+        let block = RgfxPoolBlock::read_from_bytes(&event).unwrap();
+        assert_eq!(
+            (block.header.r#type, block.header.size, block.header.seqno),
+            (RGFX_EVT_POOL_BLOCK, 40, seqno)
+        );
+        (block.status, block.pool_offset, block.length)
+    };
+    assert_eq!(
+        take(&mut rig, pool_take(5, 0x3_0000)),
+        (RGFX_STATUS_OK, 0x3_0000, 0x3_0000)
+    );
+    let seqno = rig.send(pool_give(5, 0x3_0000, 0x3_0000));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    let mut short = pool_take(6, 0x1_0000);
+    short.truncate(24);
+    assert_eq!(
+        take(&mut rig, short),
+        (RGFX_STATUS_INVALID_ARGUMENT, 0, 0)
+    );
+    assert_eq!(
+        *host.seen.lock(),
+        [
+            (RGFX_CMD_POOL_TAKE, 5, 0x3_0000),
+            (RGFX_CMD_POOL_GIVE, 5, 0x3_0000)
+        ]
+    );
+}
+
+/// Where the driver did not take `POOL`, a `POOL_TAKE` and a `POOL_GIVE` go to the host's decoder,
+/// as messages it does not know, and the host's pool sees neither.
+#[test]
+fn pool_messages_go_to_the_decoder_where_the_driver_did_not_take_the_pool() {
+    let host = PoolHost::default();
+    let mut rig = Rig::with_host(Box::new(host.clone()));
+    rig.start();
+    rig.send(pool_take(5, 0x1_0000));
+    rig.send(pool_give(5, 0, 0x1_0000));
+    assert!(
+        eventually(|| host.seen.lock().len() == 2),
+        "{:?}",
+        host.seen.lock()
+    );
+    assert_eq!(
+        *host.seen.lock(),
+        [(RGFX_CMD_POOL_TAKE, 0, 0), (RGFX_CMD_POOL_GIVE, 0, 0)]
+    );
+}

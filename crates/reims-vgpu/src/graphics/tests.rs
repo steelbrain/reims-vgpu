@@ -13948,3 +13948,163 @@ fn the_pool_s_range_is_the_gpu_s_memory_heaps_at_most_the_addresses_given() {
     let raised = Arc::new(AtomicU32::new(0));
     assert_eq!(headless(&raised).pool_range(), None);
 }
+
+/// A `POOL_TAKE` by context `context` of `length` bytes, as the kext posts it.
+fn pool_take(context: u32, length: u64) -> Vec<u8> {
+    RgfxPoolTake {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_POOL_TAKE,
+            size: 0,
+            seqno: 0,
+        },
+        context,
+        reserved_14: 0,
+        length,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A `POOL_GIVE` by context `context` of its block of `length` bytes at pool offset `offset`.
+fn pool_give(context: u32, offset: u64, length: u64) -> Vec<u8> {
+    RgfxPoolGive {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_POOL_GIVE,
+            size: 0,
+            seqno: 0,
+        },
+        context,
+        reserved_14: 0,
+        pool_offset: offset,
+        length,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A `HEAP_OVER_POOL` of `size_bytes` at pool offset `offset`.
+fn heap_over_pool(obj_id: u64, offset: u64, size_bytes: u64) -> Vec<u8> {
+    RgfxHeapOverHostMemory {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_HEAP_OVER_POOL,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        gpu_address: 0x2_0000_0000,
+        region_offset: offset,
+        size_bytes,
+        ..RgfxHeapOverHostMemory::default()
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A take's `POOL_BLOCK`: its status, offset and length.
+fn pool_block(guest: &mut Guest) -> (u32, u64, u64) {
+    let bytes = next_event(guest, RGFX_EVT_POOL_BLOCK);
+    let block = RgfxPoolBlock::read_from_bytes(&bytes).unwrap();
+    assert_eq!(block.header.seqno, guest.seqno);
+    (block.status, block.pool_offset, block.length)
+}
+
+/// An x86-64 guest that took `POOL` takes a zeroed block of the device's Shared pool once the host
+/// mapped its piece, makes a heap over it, and gives it back only once the heap is gone; a heap
+/// over bytes the context does not hold is made never; and the context's close gives its blocks
+/// back to the pool
+#[cfg(not(windows))]
+#[test]
+fn a_guest_s_pool_block_is_taken_held_by_its_heap_and_given_back() {
+    const BASE: u64 = 52 << 30;
+    let raised = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&raised);
+    let (added, adds) = std::sync::mpsc::channel();
+    let added = Mutex::new(added);
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: Some(Arc::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+            })),
+            pool_add: Some(Arc::new(move |at, _, _| {
+                let _ = added.lock().send(at);
+            })),
+            pool_remove: Some(Arc::new(|_, _| {})),
+            ..GraphicsCallbacks::default()
+        },
+        pool: Some(PoolConfig {
+            physical_address: BASE,
+            physical_length: 4 << 30,
+        }),
+        guest_arch: GuestArch::X86_64,
+        ..GraphicsConfig::default()
+    };
+    let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+    let offered = (u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32)
+        | u64::from(device.mmio_read(RGFX_REG_FEATURES_LO.into()));
+    assert_eq!(offered & RGFX_FEATURE_POOL, RGFX_FEATURE_POOL);
+    device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_HI.into(),
+        (RGFX_FEATURE_POOL >> 32) as u32,
+    );
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let ledger = device.control.shared_pool.clone().expect("the pool is offered");
+    // The first take grows the pool, and is answered once the host mapped the piece.
+    guest.send(&device, pool_take(1, 0x1_8000));
+    let at = adds.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(at, BASE);
+    device.pool_added(at).unwrap();
+    assert_eq!(pool_block(&mut guest), (RGFX_STATUS_OK, 0, 0x2_0000));
+    // A heap over another's bytes, or past the block, is made never; one inside it is.
+    guest.send(&device, heap_over_pool(obj(2, 1), 0, 0x1_0000));
+    guest.send(&device, heap_over_pool(obj(1, 2), 0x1_0000, 0x2_0000));
+    guest.send(&device, heap_over_pool(obj(1, 1), 0, 0x1_0000));
+    let status = answered(&device, &mut guest, pool_give(1, 0, 0x2_0000));
+    assert_eq!(status, RGFX_STATUS_REFUSED, "the heap lies in it");
+    assert_eq!(device.decoder_object_count(), 1);
+    assert_eq!(ledger.counts(), (1, 0x2_0000));
+    guest.send(&device, object_destroy(obj(1, 1)));
+    let status = answered(&device, &mut guest, pool_give(1, 0, 0x2_0000));
+    assert_eq!(status, RGFX_STATUS_OK);
+    assert_eq!(ledger.counts(), (0, 0));
+    let status = answered(&device, &mut guest, pool_give(1, 0, 0x2_0000));
+    assert_eq!(status, RGFX_STATUS_NOT_FOUND);
+    // The context's close gives back the blocks it held, its heaps' among them.
+    guest.send(&device, pool_take(1, 0x1_0000));
+    assert_eq!(pool_block(&mut guest), (RGFX_STATUS_OK, 0, 0x1_0000));
+    guest.send(&device, pool_take(1, 0x1_0000));
+    assert_eq!(pool_block(&mut guest), (RGFX_STATUS_OK, 0x1_0000, 0x1_0000));
+    guest.send(&device, heap_over_pool(obj(1, 3), 0x1_0000, 0x1_0000));
+    assert_eq!(ledger.counts(), (2, 0x2_0000));
+    let status = answered(&device, &mut guest, context_close(1));
+    assert_eq!(status, RGFX_STATUS_OK);
+    assert_eq!(ledger.counts(), (0, 0));
+    assert_eq!(device.decoder_object_count(), 0);
+}
+
+/// An arm64 guest is offered no pool, nor is a guest of a device with none
+#[test]
+fn an_arm64_guest_is_offered_no_pool() {
+    let pool_of = |guest_arch: GuestArch| {
+        let config = GraphicsConfig {
+            callbacks: GraphicsCallbacks {
+                pool_add: Some(Arc::new(|_, _, _| {})),
+                pool_remove: Some(Arc::new(|_, _| {})),
+                ..GraphicsCallbacks::default()
+            },
+            pool: Some(PoolConfig {
+                physical_address: 52 << 30,
+                physical_length: 4 << 30,
+            }),
+            guest_arch,
+            ..GraphicsConfig::default()
+        };
+        let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+        let offered = u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32;
+        (offered & RGFX_FEATURE_POOL != 0, device.control.shared_pool.is_some())
+    };
+    assert_eq!(pool_of(GuestArch::Arm64), (false, false));
+    assert_eq!(pool_of(GuestArch::X86_64), (!cfg!(windows), !cfg!(windows)));
+    let raised = Arc::new(AtomicU32::new(0));
+    assert!(headless(&raised).control.shared_pool.is_none());
+}

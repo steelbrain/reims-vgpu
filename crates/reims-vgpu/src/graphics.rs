@@ -78,7 +78,7 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
     RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_ANSWERS,
-    RGFX_FEATURE_PIPELINE_KEYS, RGFX_FEATURE_POINTER_MOTION, RGFX_FEATURE_PRIVATE_RENDER_STATE,
+    RGFX_FEATURE_PIPELINE_KEYS, RGFX_FEATURE_POINTER_MOTION, RGFX_FEATURE_POOL, RGFX_FEATURE_PRIVATE_RENDER_STATE,
     RGFX_FEATURE_RATE_MAPS, RGFX_FEATURE_READ_ONLY_PAGES, RGFX_FEATURE_SCHEDULED_ASK,
     RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM,
     RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
@@ -93,13 +93,14 @@ use reims_vgpu_graphics::wire::{
     RGFX_VT_STATUS_MALFORMED, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages,
     RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor,
     RgfxEventSignalled, RgfxFunctionPointerState, RgfxHeapOverPages, RgfxIcbState,
-    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineAnswersQuery, RgfxRateMapAnswer,
+    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineAnswersQuery, RgfxPoolGive,
+    RgfxPoolTake, RgfxRateMapAnswer,
     RgfxRateMapState, RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName, RgfxSurfacePages,
     RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
-    CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PresentAnswer,
-    QueueClaim, RawDoorbell, RingDegradation, Scanout, Screen, VtAnswer, VtLink, VtMessage,
+    CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PoolAnswer,
+    PresentAnswer, QueueClaim, RawDoorbell, RingDegradation, Scanout, Screen, VtAnswer, VtLink, VtMessage,
     VtSurface,
 };
 use reims_vgpu_video::paravirt;
@@ -142,7 +143,9 @@ use crate::graphics::present::{Drawing, PresentAnswers, PresentQueue};
 use crate::graphics::read::DisplayRead;
 use crate::memory::{GuestMemoryLease, MemoryMap};
 use crate::platform::{ApiPlatform, api_state};
-use crate::pool::{HostBlocks, Pool, PoolAddFn, PoolConfig, PoolHost, PoolRemoveFn};
+use crate::pool::{
+    Give, HostBlocks, Pool, PoolAddFn, PoolConfig, PoolHost, PoolLedger, PoolRemoveFn, TAKE_MAX,
+};
 use crate::window::WindowLink;
 
 mod answers;
@@ -541,6 +544,27 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let identity = gpu_device.identity_caps();
             // The GPU's memory heaps, summed, which size the guest's Shared pool's range below.
             let memory_heaps = gpu_device.memory_heaps_total();
+            // The guest's Shared pool, its blocks the process's own memory until the device runs
+            // on metal2vulkan-rt, whose blocks then fill it through the same calls. Its range is
+            // what the GPU's memory heaps hold, of the addresses the host can give.
+            let shared_pool = match pool_host {
+                Some((room, host)) => match pool_range(room, memory_heaps) {
+                    Some(range) => {
+                        let clock = Arc::clone(&platform);
+                        let now = Box::new(move || clock.clock().now_mono());
+                        Some(Pool::new(range, host, now, Arc::new(HostBlocks::new()))?)
+                    }
+                    None => None,
+                },
+                None => None,
+            };
+            // The guest's processes take blocks of it for their buffers' slabs (`POOL`) where
+            // the guest is x86-64, on a Linux or macOS host: on Windows the pool waits for its
+            // cost under WHP to be measured within 5% of the region's, and on an arm64 guest for
+            // a boot that shows its kernel maps the pool's addresses cacheable.
+            let pool_ledger = (shared_pool.as_ref())
+                .filter(|_| !cfg!(windows) && config.guest_arch == GuestArch::X86_64)
+                .map(Pool::ledger);
             // `Managed` resources are one copy where the platform answers that the GPU shares the
             // CPU's memory, else two, which hold Metal's contract on any GPU: the guest's device
             // answers `hasUnifiedMemory` alike, from the blob.
@@ -560,6 +584,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             );
             let mut decoder = GraphicsDecoder::new(Arc::clone(&platform), Arc::clone(&region));
             decoder.set_unified_memory(unified_memory);
+            if let Some(ledger) = &pool_ledger {
+                decoder.set_pool(ledger.clone());
+            }
             // The guest's `maxBufferLength`, past which the decoder refuses a buffer over a
             // process's own pages, which the bundle's no-copy buffers make at any length.
             decoder.set_max_buffer_length(info.sizes[RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH]);
@@ -619,7 +646,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // (`CURSOR_COLOR`), which the device applies before the screen is handed the image.
             // Every host takes the guest's note that a no-copy buffer's identity left its Metal
             // with no message naming the buffer (`BUFFER_ESCAPED`, `decode::escape`), which it
-            // marks and counts.
+            // marks and counts. A host with the guest's Shared pool lets its processes take
+            // blocks of it for their buffers' slabs (`POOL`), where the pool is offered (below).
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES)
@@ -680,6 +708,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     0
                 } else {
                     u64::from(RGFX_FEATURE_MANAGED_AT_OFFSET)
+                }
+                | if pool_ledger.is_some() {
+                    RGFX_FEATURE_POOL
+                } else {
+                    0
                 }
                 // A window's captured pointer drives the guest's own mouse while a game hides
                 // the cursor ([`crate::window`]); a device with no window has no pointer to.
@@ -828,6 +861,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 pages_buffers: Arc::default(),
                 reset_gate: Arc::default(),
                 inline_walk_max: AtomicUsize::new(INLINE_WALK_MAX),
+                shared_pool: pool_ledger,
             });
             let cursors: Vec<Arc<HostCursor>> = (0..count)
                 .map(|display| {
@@ -911,20 +945,6 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let shown = first_shown.filter(|_| !windows.is_empty());
             #[cfg(not(test))]
             drop(first_shown);
-            // The guest's Shared pool, its blocks the process's own memory until the device runs
-            // on metal2vulkan-rt, whose blocks then fill it through the same calls. Its range is
-            // what the GPU's memory heaps hold, of the addresses the host can give.
-            let pool = match pool_host {
-                Some((room, host)) => match pool_range(room, memory_heaps) {
-                    Some(range) => {
-                        let clock = Arc::clone(&platform);
-                        let now = Box::new(move || clock.clock().now_mono());
-                        Some(Pool::new(range, host, now, Arc::new(HostBlocks::new()))?)
-                    }
-                    None => None,
-                },
-                None => None,
-            };
             let device = reims_vgpu_graphics::Device::with_screens(region, host, screens)
                 .ok_or(Error::HostResources)?;
             desktop.set_windows(by_display);
@@ -940,7 +960,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 #[cfg(test)]
                 shown,
                 reads,
-                pool,
+                pool: shared_pool,
                 platform: PhantomData,
             })
         })
@@ -1266,6 +1286,9 @@ struct GraphicsControl<P: ApiPlatform> {
     /// where it would wait for nothing ([`Self::carry_out`]): [`INLINE_WALK_MAX`]; the tests that
     /// hold a walk to stand for a long one set it to 0, as a long buffer goes to its lane.
     inline_walk_max: AtomicUsize,
+    /// The ledger of the contexts' blocks of the guest's Shared pool, where the device offers it
+    /// (`POOL_TAKE`, `POOL_GIVE`, [`Self::take_pool_block`]).
+    shared_pool: Option<PoolLedger>,
 }
 
 /// The longest `COMMAND_BUFFER` message, in bytes, that is walked and committed on its queue's
@@ -1704,10 +1727,19 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             self.queue_sinks
                 .write()
                 .retain(|&queue, _| decode::context_of(queue) != context);
+            // Its blocks of the Shared pool go back to it once its command buffers have finished,
+            // before the kext hears of the close's end.
+            let gone = (self.shared_pool.as_ref())
+                .map(|ledger| (ledger.clone(), ledger.context_closed(context)));
             let drain = decoder.drain_context(
                 context,
                 true,
-                Box::new(move || answer.answer(RGFX_STATUS_OK)),
+                Box::new(move || {
+                    if let Some((ledger, gone)) = gone {
+                        ledger.free(&gone);
+                    }
+                    answer.answer(RGFX_STATUS_OK);
+                }),
             );
             decoder.let_go_later(closed, drain);
             log::info!(
@@ -1738,6 +1770,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 let (contexts, dropped) = decoder.reset(&self.device);
                 for &context in &contexts {
                     self.pool.context_closed(context);
+                }
+                // Every block of the Shared pool goes back to it, the objects over them dropped.
+                if let Some(ledger) = &self.shared_pool {
+                    ledger.reset();
                 }
                 self.presents.reset();
                 self.queue_sinks.write().clear();
@@ -1812,6 +1848,79 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         });
         drop(decoder);
         drop(drain);
+    }
+
+    /// `POOL_TAKE` (`Host::pool_take`): context `take.context`'s block of the Shared pool, carved
+    /// now where a piece has room and answered from the context's take worker once it is zeroed
+    /// ([`PoolLedger::take`]); refused where the pool has no room, or the device offers none.
+    fn take_pool_block(&self, take: &RgfxPoolTake, answer: PoolAnswer) {
+        let Some(ledger) = &self.shared_pool else {
+            answer.answer(RGFX_STATUS_REFUSED, 0, 0);
+            return;
+        };
+        if take.length == 0 || take.length > TAKE_MAX {
+            answer.answer(RGFX_STATUS_INVALID_ARGUMENT, 0, 0);
+            return;
+        }
+        let (context, length) = (take.context, take.length);
+        let given = ledger.take(
+            context,
+            length,
+            Box::new(move |block| match block {
+                Some((offset, length)) => answer.answer(RGFX_STATUS_OK, offset, length),
+                None => {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "context {context} asked for {length:#x} bytes of the Shared pool, which \
+                         has no room for them: refused"
+                    );
+                    answer.answer(RGFX_STATUS_REFUSED, 0, 0);
+                }
+            }),
+        );
+        debug_assert!(given.is_ok(), "a take's length was checked");
+    }
+
+    /// `POOL_GIVE` (`Host::pool_give`): not found where context `give.context` holds no such block
+    /// of the Shared pool, refused at once where an object the decoder holds lies in it, else
+    /// answered, and the block freed, once every command buffer of the context the decoder
+    /// committed has finished ([`PoolLedger::give`]).
+    fn give_pool_block(&self, give: &RgfxPoolGive, answer: CompleteAnswer) {
+        let Some(ledger) = &self.shared_pool else {
+            answer.answer(RGFX_STATUS_NOT_FOUND);
+            return;
+        };
+        let decoder = self.decoder();
+        let given = ledger.give(give.context, give.pool_offset, give.length, |offset, length| {
+            decode::POOL_SPANS
+                .checked_add(offset)
+                .is_some_and(|span| decoder.span_in_use(span, length))
+        });
+        match given {
+            Give::NotFound => answer.answer(RGFX_STATUS_NOT_FOUND),
+            Give::InUse => {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "context {} gave back its block of the Shared pool of {:#x} bytes at {:#x} \
+                     while an object lies in it: the block is kept",
+                    give.context, give.length, give.pool_offset
+                );
+                answer.answer(RGFX_STATUS_REFUSED);
+            }
+            Give::Given(carve) => {
+                let ledger = ledger.clone();
+                let drain = decoder.drain_context(
+                    give.context,
+                    false,
+                    Box::new(move || {
+                        ledger.free(&[carve]);
+                        answer.answer(RGFX_STATUS_OK);
+                    }),
+                );
+                drop(decoder);
+                drop(drain);
+            }
+        }
     }
 
     /// `BLOCK_UNSHARE` (`Host::block_unshared`): the block's release, by its last holder, waits
@@ -3380,6 +3489,18 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn block_unshared(&self, unshare: &RgfxBlockGrant) {
         stepped(|| self.control.unshare_block(unshare));
+    }
+
+    fn pool_range(&self) -> (u64, u64) {
+        (self.control.shared_pool.as_ref()).map_or((0, 0), PoolLedger::range)
+    }
+
+    fn pool_take(&self, take: &RgfxPoolTake, answer: PoolAnswer) {
+        stepped(|| self.control.take_pool_block(take, answer));
+    }
+
+    fn pool_give(&self, give: &RgfxPoolGive, answer: CompleteAnswer) {
+        stepped(|| self.control.give_pool_block(give, answer));
     }
 
     fn device_reset(&self) {

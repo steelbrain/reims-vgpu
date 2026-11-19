@@ -16,10 +16,10 @@
 //!
 //! # Headroom and giving blocks back
 //!
-//! A new piece is empty: nothing of the guest's lies in it. The guest says when it puts something
-//! in a piece ([`Pool::piece_used`]) and when it has emptied one ([`Pool::piece_empty`]). The pool
-//! keeps one empty piece as headroom: when the guest uses the last empty one, the pool asks for a
-//! block more. A piece that stays empty for [`RELEASE_DELAY`] while a lower one is empty too goes
+//! A new piece is empty: nothing of the guest's lies in it. The guest's processes take blocks of
+//! the pool and give them back (`takes`): a piece is used from its first block's take and empty
+//! again once its last block went back. The pool keeps one empty piece as headroom: when the guest
+//! uses the last empty one, the pool asks for a block more. A piece that stays empty for [`RELEASE_DELAY`] while a lower one is empty too goes
 //! back to the source ([`BlockSource::release_block`]), as the release below says, and the source
 //! keeps the block ready or frees it; the lowest empty piece stays as the headroom. The delay
 //! rides out churn, where a guest empties and fills a piece again within seconds.
@@ -51,6 +51,7 @@
 
 mod host_blocks;
 mod rt_blocks;
+mod takes;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ptr::NonNull;
@@ -62,6 +63,9 @@ use parking_lot::{Condvar, Mutex};
 use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
 
 pub(crate) use host_blocks::HostBlocks;
+pub(crate) use takes::{Give, PoolLedger, TAKE_MAX};
+#[cfg(test)]
+use takes::{TAKE_ALIGN, TakeAnswer};
 
 use crate::Error;
 
@@ -247,6 +251,8 @@ struct Piece {
     empty_since: Option<MonoTime>,
     /// Holds on it ([`PieceHold`]).
     holds: u64,
+    /// The contexts' blocks in it (`takes`).
+    carves: u64,
 }
 
 impl Piece {
@@ -263,12 +269,69 @@ struct State {
     pieces: BTreeMap<u64, Piece>,
     /// Each piece's address, by its block.
     by_block: HashMap<BlockId, u64>,
-    /// Asks for more pool, in bytes, oldest first.
-    asks: VecDeque<u64>,
+    /// Asks for more pool, oldest first.
+    asks: VecDeque<Ask>,
+    /// The asks a take waits on, by number, with where each one's piece went once it was served:
+    /// `Some(None)` where no piece came of it (`takes`).
+    waits: HashMap<u64, Option<Option<u64>>>,
+    /// The contexts' blocks of the pool, by guest physical address (`takes`).
+    carves: BTreeMap<u64, takes::Carve>,
+    /// The contexts with a take in flight or a worker, by context (`takes`).
+    takers: HashMap<u32, takes::Taker>,
+    /// The last number a carve, a context's takes or an ask took.
+    serial: u64,
+    /// The take workers running (`takes`).
+    workers: usize,
+    /// The ledgers given out and not dropped ([`PoolLedger`]).
+    keepers: usize,
+    /// The source, handed over by the device's release while a ledger lived: the last ledger's
+    /// drop gives every block back to it ([`Pool::close`]).
+    left: Option<Arc<dyn BlockSource>>,
     /// The device was released: the host removed every piece it added.
     closed: bool,
     /// The pool's thread logged the range's being full once.
     full_logged: bool,
+}
+
+/// An ask for at least `length` more bytes of pool, and the number of the take's wait on it.
+#[derive(Clone, Copy, Debug)]
+struct Ask {
+    length: u64,
+    wait: Option<u64>,
+}
+
+impl State {
+    /// A number no carve, context's takes or ask took before.
+    fn next_serial(&mut self) -> u64 {
+        self.serial = self.serial.saturating_add(1);
+        self.serial
+    }
+
+    /// The guest put something in the piece at `at`: where no other piece is empty, the pool
+    /// asks for a block more, so one stays as headroom.
+    fn use_piece(&mut self, at: u64) {
+        let Some(p) = self.pieces.get_mut(&at) else {
+            return;
+        };
+        p.empty_since = None;
+        let headroom = (self.pieces.values()).any(|p| p.usable() && p.empty_since.is_some());
+        if !headroom && self.asks.is_empty() {
+            self.asks.push_back(Ask {
+                length: BLOCK_LEN,
+                wait: None,
+            });
+        }
+    }
+
+    /// The guest emptied the piece at `at`, at `now`: nothing of the guest's lies in it, and no
+    /// guest mapping of it is left.
+    fn empty_piece(&mut self, at: u64, now: MonoTime) {
+        if let Some(p) = self.pieces.get_mut(&at)
+            && p.empty_since.is_none()
+        {
+            p.empty_since = Some(now);
+        }
+    }
 }
 
 /// The pool's shared part: what the thread, the device and the holds hold.
@@ -391,8 +454,16 @@ impl Pool {
     /// Asks for at least `length` more bytes of pool: the pool's thread takes a block and has the
     /// host map it. Waits for nothing.
     pub fn grow(&self, length: u64) {
-        self.shared.state.lock().asks.push_back(length);
+        let ask = Ask { length, wait: None };
+        self.shared.state.lock().asks.push_back(ask);
         self.shared.changed.notify_all();
+    }
+
+    /// A ledger of the pool's blocks the guest's contexts hold ([`PoolLedger`]): takes, gives and
+    /// lookups. While one lives, the device's release ([`Pool::close`]) leaves every block with
+    /// the pool, and the last one's drop gives them back.
+    pub(crate) fn ledger(&self) -> PoolLedger {
+        PoolLedger::of(&self.shared)
     }
 
     /// The host mapped the piece at `physical_address` it was asked to add: lookups find it from
@@ -411,6 +482,9 @@ impl Pool {
             "pool: {} MiB at {physical_address:#x} mapped into the guest",
             p.block.len >> 20
         );
+        drop(st);
+        // A take may wait for it.
+        self.shared.changed.notify_all();
         Ok(())
     }
 
@@ -427,49 +501,38 @@ impl Pool {
         Ok(())
     }
 
-    /// The guest put something in the piece at `physical_address`. Where no other piece is
-    /// empty, the pool asks for a block more, so one stays as headroom.
-    /// [`Error::InvalidArgument`] for an address where no piece the guest may use starts.
-    #[allow(
-        dead_code,
-        reason = "the guest's side of the pool (its ring messages) calls it once it lands"
-    )]
+    /// The guest put something in the piece at `physical_address`, as a context's first block
+    /// in it does (`takes`). Where no other piece is empty, the pool asks for a block more, so one
+    /// stays as headroom. [`Error::InvalidArgument`] for an address where no piece the guest may
+    /// use starts. For the tests, which drive a piece's use without the takes.
+    #[cfg(test)]
     pub fn piece_used(&self, physical_address: u64) -> Result<(), Error> {
         let mut st = self.shared.state.lock();
-        let p = (st.pieces.get_mut(&physical_address)).ok_or(Error::InvalidArgument)?;
+        let p = (st.pieces.get(&physical_address)).ok_or(Error::InvalidArgument)?;
         if !p.usable() {
             return Err(Error::InvalidArgument);
         }
-        p.empty_since = None;
-        let headroom = (st.pieces.values()).any(|p| p.usable() && p.empty_since.is_some());
-        if !headroom && st.asks.is_empty() {
-            st.asks.push_back(BLOCK_LEN);
-        }
+        st.use_piece(physical_address);
         drop(st);
         self.shared.changed.notify_all();
         Ok(())
     }
 
-    /// The guest emptied the piece at `physical_address`: no guest mapping of it is left (the
-    /// kext unmapped every process's mapping into it and holds none of its own), and nothing of
-    /// the guest's lies in it. From now on the guest puts nothing there until it says
-    /// [`Pool::piece_used`]: [`RELEASE_DELAY`] later, if it is still empty and a lower piece is
-    /// empty too, its block goes back to the source, and the guest may not use it again until the
-    /// device hands it out anew. [`Error::InvalidArgument`] for an address where no piece the
-    /// guest may use starts.
-    #[allow(
-        dead_code,
-        reason = "the guest's side of the pool (its ring messages) calls it once it lands"
-    )]
+    /// The guest emptied the piece at `physical_address`, as a context's last block in it going
+    /// back does (`takes`): no guest mapping of it is left, and nothing of the guest's lies in it.
+    /// [`RELEASE_DELAY`] later, if it is still empty and a lower piece is empty too, its block
+    /// goes back to the source, and the guest may not use it again until the device hands it out
+    /// anew. [`Error::InvalidArgument`] for an address where no piece the guest may use starts.
+    /// For the tests, as [`Pool::piece_used`].
+    #[cfg(test)]
     pub fn piece_empty(&self, physical_address: u64) -> Result<(), Error> {
         let mut st = self.shared.state.lock();
-        let p = (st.pieces.get_mut(&physical_address)).ok_or(Error::InvalidArgument)?;
+        let p = (st.pieces.get(&physical_address)).ok_or(Error::InvalidArgument)?;
         if !p.usable() {
             return Err(Error::InvalidArgument);
         }
-        if p.empty_since.is_none() {
-            p.empty_since = Some((self.shared.now)());
-        }
+        let now = (self.shared.now)();
+        st.empty_piece(physical_address, now);
         drop(st);
         self.shared.changed.notify_all();
         Ok(())
@@ -520,23 +583,28 @@ impl Pool {
     }
 
     /// The device's release: the host removed every piece it added. Ends the pool's thread (a
-    /// piece it is giving back waits only for its holds from now on), waits for every hold on the
-    /// pieces left, gives each one's block back, then lets go of the source.
+    /// piece it is giving back waits only for its holds from now on) and its take workers (a take
+    /// in flight is answered never), then, where no ledger lives, waits for every hold on the
+    /// pieces left, gives each one's block back and lets go of the source. Where a ledger lives
+    /// (the decoder's, whose heaps over the contexts' blocks may outlive the device), the last
+    /// one's drop does that.
     pub(crate) fn close(&mut self) {
         self.shared.state.lock().closed = true;
         self.shared.changed.notify_all();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        self.shared.wait_for_workers();
         let Some(source) = self.source.take() else {
             return;
         };
-        for block in self.shared.take_all_out() {
-            if let Err(e) = source.release_block(block) {
-                log::warn!(kind:? = e; "pool: the source refused a block back: {e:?}");
-            }
+        let mut st = self.shared.state.lock();
+        if st.keepers > 0 {
+            st.left = Some(source);
+            return;
         }
-        drop(source);
+        drop(st);
+        self.shared.give_all_back(source);
     }
 
     /// The block source, for the tests.
@@ -561,12 +629,22 @@ impl Shared {
             if st.closed {
                 return;
             }
-            if let Some(length) = st.asks.pop_front() {
+            if let Some(Ask { length, wait }) = st.asks.pop_front() {
                 drop(st);
-                match source.take_block(MemoryClass::Shared, length) {
+                let placed = match source.take_block(MemoryClass::Shared, length) {
                     Ok(block) => self.place(source, block),
-                    Err(e) => log::warn!(kind:? = e; "pool: no block of {length} bytes: {e:?}"),
+                    Err(e) => {
+                        log::warn!(kind:? = e; "pool: no block of {length} bytes: {e:?}");
+                        None
+                    }
+                };
+                // The take waiting on it, where it still does, looks where the piece went.
+                if let Some(wait) = wait
+                    && let Some(outcome) = self.state.lock().waits.get_mut(&wait)
+                {
+                    *outcome = Some(placed);
                 }
+                self.changed.notify_all();
                 continue;
             }
             let now = (self.now)();
@@ -609,13 +687,14 @@ impl Shared {
         (None, next)
     }
 
-    /// Places `block` at the lowest free address that holds it and asks the host to map it.
-    fn place(&self, source: &dyn BlockSource, block: BlockInfo) {
+    /// Places `block` at the lowest free address that holds it and asks the host to map it: the
+    /// address, or `None` where the block went back, the range full.
+    fn place(&self, source: &dyn BlockSource, block: BlockInfo) -> Option<u64> {
         let mut st = self.state.lock();
         let Some(contents) = block.contents else {
             drop(st);
             let _ = source.release_block(block.id);
-            return;
+            return None;
         };
         let Some(at) = first_fit(self.range, &st.pieces, block.len) else {
             if !std::mem::replace(&mut st.full_logged, true) {
@@ -628,7 +707,7 @@ impl Shared {
             }
             drop(st);
             let _ = source.release_block(block.id);
-            return;
+            return None;
         };
         st.pieces.insert(
             at,
@@ -637,11 +716,13 @@ impl Shared {
                 mapped: Mapped::Adding,
                 empty_since: Some((self.now)()),
                 holds: 0,
+                carves: 0,
             },
         );
         st.by_block.insert(block.id, at);
         drop(st);
         (self.host.add)(at, contents.as_ptr(), block.len);
+        Some(at)
     }
 
     /// Takes `block`'s piece out before the block goes back: out of the lookups, then, once no
@@ -715,9 +796,22 @@ impl Shared {
             let _ = self.changed.wait_for(&mut st, Duration::from_millis(250));
         }
         st.by_block.clear();
+        st.carves.clear();
+        st.takers.clear();
         let pieces = std::mem::take(&mut st.pieces);
         drop(st);
         pieces.into_values().map(|p| p.block.id).collect()
+    }
+
+    /// The device's release's end, once no ledger lives: every block goes back to `source`
+    /// ([`Self::take_all_out`]), which is then let go of.
+    fn give_all_back(&self, source: Arc<dyn BlockSource>) {
+        for block in self.take_all_out() {
+            if let Err(e) = source.release_block(block) {
+                log::warn!(kind:? = e; "pool: the source refused a block back: {e:?}");
+            }
+        }
+        drop(source);
     }
 }
 

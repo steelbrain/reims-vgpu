@@ -98,7 +98,9 @@ pub(crate) fn unheld(shared: &Shared, message: &Message, epoch: u64) -> Option<V
 /// service, which drops its handle; a `CONTEXT_CLOSE` ends the context's queues and has the host
 /// drop its objects, and the host answers it once the context's command buffers have finished; a
 /// `BLOCK_RELEASE` is refused where a live queue's ring lies in the block, and else the host answers
-/// it; a `BLOCK_GRANT` is kept with the region (`Region::grant`), and so are a `BLOCK_SHARE` and a
+/// it; a `POOL_TAKE` and a `POOL_GIVE` go to the host, which answers them
+/// (`Host::pool_take`, `Host::pool_give`), where the guest took `POOL`, and else to its decoder as
+/// any message it does not know; a `BLOCK_GRANT` is kept with the region (`Region::grant`), and so are a `BLOCK_SHARE` and a
 /// `BLOCK_UNSHARE` (`Region::share`, `Region::unshare`); a `SURFACE_PAGES` hands its block's runs
 /// to the host (`Shared::surface_pages`), which answers with whether it mapped them; a
 /// `SURFACE_DOWNLOAD` the host answers once the surface's pages hold its device cache
@@ -192,6 +194,26 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
             }
             None => Some(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT)),
         },
+        RGFX_CMD_POOL_TAKE if shared.driver_took(RGFX_FEATURE_POOL) => {
+            match read::<RgfxPoolTake>(message) {
+                Some(take) => {
+                    shared.host.pool_take(&take, shared.pool_answer(seqno, epoch));
+                    None
+                }
+                None => Some(pool_block(seqno, RGFX_STATUS_INVALID_ARGUMENT, 0, 0)),
+            }
+        }
+        RGFX_CMD_POOL_GIVE if shared.driver_took(RGFX_FEATURE_POOL) => {
+            match read::<RgfxPoolGive>(message) {
+                Some(give) => {
+                    shared
+                        .host
+                        .pool_give(&give, shared.complete_answer(seqno, epoch));
+                    None
+                }
+                None => Some(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT)),
+            }
+        }
         RGFX_CMD_BLOCK_RELEASE => match read::<RgfxBlockRelease>(message) {
             // Whatever the answer, the block is no longer its process's to name.
             Some(release) => {
@@ -244,6 +266,21 @@ fn read<T: FromBytes>(message: &Message) -> Option<T> {
 fn read_at<T: FromBytes>(message: &Message, offset: u32) -> Option<T> {
     let bytes = message.bytes.get(offset as usize..)?;
     T::read_from_prefix(bytes).ok().map(|(t, _)| t)
+}
+
+/// A `POOL_BLOCK` for `POOL_TAKE` `seqno`.
+pub(crate) fn pool_block(seqno: u64, status: u32, pool_offset: u64, length: u64) -> Vec<u8> {
+    sized(&RgfxPoolBlock {
+        header: RgfxMsgHeader {
+            r#type: RGFX_EVT_POOL_BLOCK,
+            size: 0,
+            seqno,
+        },
+        status,
+        reserved_14: 0,
+        pool_offset,
+        length,
+    })
 }
 
 /// A `COMPLETE` for command `seqno`.
