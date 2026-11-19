@@ -1320,7 +1320,11 @@ mod tests {
         let before = zeroed();
         let buffer = scratch(100_000, 0).expect("a Shared scratch buffer");
         assert_eq!(
-            (buffer.length(), buffer.storage_mode(), buffer.resource_options()),
+            (
+                buffer.length(),
+                buffer.storage_mode(),
+                buffer.resource_options()
+            ),
             (100_000, 0, 0x200)
         );
         assert_ne!(buffer.contents(), HostPtr::NULL);
@@ -1330,12 +1334,21 @@ mod tests {
         let before = zeroed();
         let plain = (device.new_buffer_of_length(on, 100_000, 0)).expect("never a raise");
         assert!(plain.is_some());
-        assert!(zeroed() >= before + 100_000, "a new buffer's bytes are zeroed");
+        assert!(
+            zeroed() >= before + 100_000,
+            "a new buffer's bytes are zeroed"
+        );
 
         let before = zeroed();
         let private = scratch(4096, 0x20).expect("a Private scratch buffer");
-        assert_eq!((private.storage_mode(), private.contents()), (2, HostPtr::NULL));
-        assert!(zeroed() >= before + 4096, "a Private one is made as any, zeroed");
+        assert_eq!(
+            (private.storage_mode(), private.contents()),
+            (2, HostPtr::NULL)
+        );
+        assert!(
+            zeroed() >= before + 4096,
+            "a Private one is made as any, zeroed"
+        );
 
         assert!(scratch(0, 0).is_none() && scratch(64, 0x30).is_none());
     }

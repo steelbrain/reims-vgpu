@@ -13396,7 +13396,11 @@ pub(super) mod tests {
         let done = download(&r, BLOCK);
         let made = copies(&r.p.call_log().since(mark));
         assert_eq!(made.len(), 2, "{made:?}");
-        assert_eq!((made[0].1, made[1].0), (cache, cache), "a fill, then a download");
+        assert_eq!(
+            (made[0].1, made[1].0),
+            (cache, cache),
+            "a fill, then a download"
+        );
         assert_ne!(
             made[1].1, made[0].0,
             "the download's buffer is not the fill's, whose copy is in flight"
@@ -13461,7 +13465,10 @@ pub(super) mod tests {
         let out = copies(&calls);
         assert_eq!(out.len(), 3, "a copy a row: {out:?}");
         let staging = out[0].1;
-        assert!(out.iter().all(|&(from, to)| (from, to) == (out[0].0, staging)));
+        assert!(
+            out.iter()
+                .all(|&(from, to)| (from, to) == (out[0].0, staging))
+        );
         let parts = offsets(&calls);
         assert_eq!(
             parts,
@@ -13481,7 +13488,10 @@ pub(super) mod tests {
             let at = at as u64;
             match at / pitch < rows && at % pitch < texels {
                 true => assert_eq!(now, 0xc3, "byte {at:#x}, a texel: the GPU's copy's"),
-                false => assert_eq!(now, was, "byte {at:#x}, padding or past the rows: the CPU's"),
+                false => assert_eq!(
+                    now, was,
+                    "byte {at:#x}, padding or past the rows: the CPU's"
+                ),
             }
         }
     }
