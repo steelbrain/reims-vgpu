@@ -279,8 +279,9 @@ mod tests {
     }
 
     /// Exported surfaces of a 1080p NV12 picture's planes and a 2160p P010 picture's on the GPU
-    /// the test holds, of each handle its device exports a buffer's memory as, which rt makes in
-    /// place or in the copy form, never refusing: two plane textures of the planes' formats and
+    /// the test holds, of each handle its device exports a buffer's memory as, at a pitch multiple
+    /// of 256 and an opaque fd's also at 1 (its texels alone, as the host's video caches ask), which
+    /// rt makes in place or in the copy form, never refusing: two plane textures of the planes' formats and
     /// sizes, sampled at no index of their own; the layout plane 0 at 0 and plane 1 past its rows
     /// and the room below them, at one pitch, on the multiples; each export a new fd of the whole
     /// allocation, dedicated but for an opaque fd in place; the acquire taken; each make counted
@@ -298,13 +299,18 @@ mod tests {
             ([10, 30], [13, 33], 1920, 1080, 1),
             ([20, 60], [23, 63], 3840, 2160, 2),
         ];
-        for handle in [SurfaceHandle::OpaqueFd, SurfaceHandle::DmaBuf] {
+        let asks = [
+            (SurfaceHandle::OpaqueFd, 256),
+            (SurfaceHandle::OpaqueFd, 1),
+            (SurfaceHandle::DmaBuf, 256),
+        ];
+        for (handle, pitch_multiple) in asks {
             let exported = exports(&device, handle);
             for (formats, views, width, height, texel) in shapes {
                 let planes = planes(formats, width, height);
                 let desc = SurfaceDesc {
                     handle,
-                    pitch_multiple: 256,
+                    pitch_multiple,
                     start_multiple: 256,
                     planes: &planes,
                 };
@@ -350,7 +356,12 @@ mod tests {
                 let rows = planes.map(|p| p.height + u64::from(p.rows_below));
                 assert_eq!(layout[0].offset, 0);
                 assert_eq!(layout[1].row_pitch, pitch);
-                assert!(pitch >= width * texel && pitch % 256 == 0, "pitch {pitch}");
+                assert!(pitch >= width * texel, "pitch {pitch}");
+                // a multiple of the ask's and of the chroma's texel, twice the luma's
+                assert!(
+                    pitch.is_multiple_of(pitch_multiple) && pitch.is_multiple_of(2 * texel),
+                    "pitch {pitch}"
+                );
                 assert!(layout[1].offset >= rows[0] * pitch && layout[1].offset % 256 == 0);
                 let first = memory.export().expect("an export");
                 let second = memory.export().expect("another");
@@ -375,7 +386,8 @@ mod tests {
                     );
                 }
                 println!(
-                    "{handle:?}, {width}x{height}: in place {}, pitch {pitch}",
+                    "{handle:?} at a pitch multiple of {pitch_multiple}, {width}x{height}: in place \
+                     {}, pitch {pitch}",
                     memory.in_place()
                 );
             }

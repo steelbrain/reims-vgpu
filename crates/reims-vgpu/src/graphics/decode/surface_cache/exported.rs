@@ -64,8 +64,13 @@ const PLANE_FORMATS: [(u64, [u64; 2]); 2] = [(1, [10, 30]), (2, [20, 60])];
 #[cfg(unix)]
 const PLANE_USAGE: u64 = 0x1 | 0x4 | 0x10;
 
-/// The pitch, and each plane's start after the first, a multiple of this many bytes: VA-API's
-/// imports of a surface's planes take them on 256, CUDA's copies on any.
+/// Each plane's start after the first a multiple of this many bytes, and a dma-buf's pitch:
+/// VA-API's imports of a surface's planes take them on 256. An exportable surface's pitch is a
+/// multiple of 1 (its planes' texels alone): CUDA's copies take any pitch, and the platform makes
+/// such a surface in place only at its driver's own pitch for the images. On an RTX 3090 that
+/// pitch was off 256 for 1920 by 1080 NV12: at a pitch multiple of 256, a boot's first such
+/// surface was made in the copy form for its first plane's pitch, and 60 of its 74 surfaces in
+/// all (m3-max-53703, 2026-11-19).
 #[cfg(unix)]
 const PLANE_ALIGNMENT: u64 = 256;
 
@@ -196,11 +201,15 @@ pub(super) struct SurfaceAsk {
 
 #[cfg(unix)]
 impl SurfaceAsk {
-    /// The description the platform makes the surface of.
+    /// The description the platform makes the surface of: a dma-buf's pitch on
+    /// [`PLANE_ALIGNMENT`], an exportable surface's on its texels alone.
     fn desc(&self) -> SurfaceDesc<'_> {
         SurfaceDesc {
             handle: self.handle,
-            pitch_multiple: PLANE_ALIGNMENT,
+            pitch_multiple: match self.handle {
+                SurfaceHandle::DmaBuf => PLANE_ALIGNMENT,
+                SurfaceHandle::OpaqueFd => 1,
+            },
             start_multiple: PLANE_ALIGNMENT,
             planes: &self.planes,
         }
@@ -523,5 +532,32 @@ mod tests {
         assert_eq!(take_landed(&mut surface), Some(false));
         // A cache with no surface takes none of it.
         assert!(!decodes_into(&surface, true));
+    }
+
+    #[test]
+    fn an_exportable_surface_takes_any_pitch_and_a_dma_buf_256() {
+        let planes = [0, 1].map(|n| SurfacePlaneDesc {
+            pixel_format: [10, 30][n],
+            width: 1920 >> n,
+            height: 1080 >> n,
+            usage: PLANE_USAGE,
+            rows_below: 0,
+        });
+        let keys = plane_keys(&nv12(), 1).expect("NV12's planes");
+        for (handle, pitch_multiple) in [(SurfaceHandle::OpaqueFd, 1), (SurfaceHandle::DmaBuf, 256)]
+        {
+            let ask = SurfaceAsk {
+                handle,
+                planes,
+                keys,
+            };
+            let desc = ask.desc();
+            assert_eq!(desc.handle, handle);
+            assert_eq!(
+                (desc.pitch_multiple, desc.start_multiple),
+                (pitch_multiple, 256),
+                "{handle:?}"
+            );
+        }
     }
 }
