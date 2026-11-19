@@ -204,7 +204,13 @@ pub(super) fn exported_surface(
 }
 
 impl SurfaceMemory for RtSurfaceMemory {
+    /// The memory, once its planes are the other API's to write: rt's surface make leaves the
+    /// planes' move out of the undefined layout to its next submission, which may discard what
+    /// the memory holds, so the other API takes the memory only after that move
+    /// (`Surface::wait_until_ready`, at once for the copy form).
     fn export(&self) -> Result<ExportedMemory, String> {
+        (self.surface.wait_until_ready())
+            .map_err(|error| format!("the surface's ready wait: {error}"))?;
         let fd =
             (self.fd.try_clone()).map_err(|error| format!("a new fd of the surface: {error}"))?;
         Ok(ExportedMemory {
