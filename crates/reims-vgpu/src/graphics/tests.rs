@@ -14339,6 +14339,7 @@ fn a_guest_s_private_block_is_taken_held_by_its_objects_and_given_back() {
     guest.send(&device, private_take(3, 0x1_0000));
     assert_eq!(private_block(&mut guest).0, RGFX_STATUS_OK);
     assert_eq!(blocks.held().len(), 1);
+    // The control thread carries out the host's side of the reset after `reset` returns.
     device.reset();
-    assert!(blocks.held().is_empty());
+    assert!(eventually(|| blocks.held().is_empty()));
 }
