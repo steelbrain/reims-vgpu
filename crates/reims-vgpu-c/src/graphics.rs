@@ -805,6 +805,8 @@ pub unsafe extern "C" fn rvg_graphics_device_release(device: *mut RvgGraphicsDev
 
 /// Quiesces the library ahead of the process's exit: the host's last call before it exits, made
 /// on the thread that then exits, whether its graphics devices were released or kept to the exit.
+/// Not from an exit handler, where the runtime supports no quiesce: a host whose exit reaches
+/// one with no call made and a graphics device unreleased ends with `_exit` there instead.
 /// It takes no handle: the GPU devices the library keeps are the process's. Its answer is whether
 /// the host may then call `exit`. On the platform over metal2vulkan-rt, the library's threads park
 /// for good at their next call into it and its calls in progress on other threads are waited for;

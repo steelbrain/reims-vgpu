@@ -211,8 +211,10 @@ library's streams; then it ends with `_exit` and the cleanup's status. It does n
 trace backend's flush, record and replay's finish or the plugins' exit callbacks, which QEMU as
 reims-ctl runs it does not use. An `exit` that skips the cleanup (a refused realize of a later
 device, a failed incoming migration) reaches a handler registered as the device is made, after the
-driver loaded, which quiesces with the same bound and on a false answer does the same, ending with
-`_exit(EXIT_FAILURE)`.
+driver loaded. No release let go of the GPU device then, and the runtime supports no quiesce inside
+an exit handler, so the handler calls none: it runs the same exit work and ends with
+`_exit(EXIT_FAILURE)`, and the library writes no degradation counts. After the cleanup's true
+answer it does nothing. QEMU's trace event `reims_graphics_end` names each end through `_exit`.
 
 ### The guest's Shared pool
 
