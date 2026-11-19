@@ -423,9 +423,7 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     }
 
     /// Unbuilt ([`Unbuilt::Library`]): the `NSError`.
-    fn new_shader_library(
-        &self,
-    ) -> Result<Option<<RtPlatform as Platform>::Library>, NsErrorText> {
+    fn new_shader_library(&self) -> Result<Option<<RtPlatform as Platform>::Library>, NsErrorText> {
         Err(refused_error(
             Unbuilt::Library,
             "newLibraryWithSource:options:error:",
@@ -474,10 +472,7 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         descriptor: &<RtPlatform as Platform>::RateMapDescriptor,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::RateMap>> {
         let _ = descriptor;
-        refuse_create(
-            Unbuilt::RateMap,
-            "newRasterizationRateMapWithDescriptor:",
-        );
+        refuse_create(Unbuilt::RateMap, "newRasterizationRateMapWithDescriptor:");
         Ok(None)
     }
 
@@ -594,9 +589,8 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     fn memory_heaps_total(&self) -> u64 {
         let raw = self.rt.raw();
         // SAFETY: as above.
-        let memory = unsafe {
-            (raw.instance).get_physical_device_memory_properties(raw.physical_device)
-        };
+        let memory =
+            unsafe { (raw.instance).get_physical_device_memory_properties(raw.physical_device) };
         identity::memory_heaps_total_of(&memory)
     }
 
@@ -655,10 +649,7 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         desc: &DepthStencilDesc,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::DepthStencilState>> {
         let _ = desc;
-        refuse_create(
-            Unbuilt::DepthStencil,
-            "newDepthStencilStateWithDescriptor:",
-        );
+        refuse_create(Unbuilt::DepthStencil, "newDepthStencilStateWithDescriptor:");
         Ok(None)
     }
 
@@ -802,7 +793,11 @@ mod tests {
     #[test]
     fn a_debug_text_flattens_to_its_fields() {
         let mut out = Vec::new();
-        fields("x", "A { b: 1, c: C { d: [1, 2], e: Some(3) }, f: \"g, h\" }", &mut out);
+        fields(
+            "x",
+            "A { b: 1, c: C { d: [1, 2], e: Some(3) }, f: \"g, h\" }",
+            &mut out,
+        );
         let paths: Vec<&str> = out.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(paths, ["x.b", "x.c.d", "x.c.e", "x.f"]);
         assert_eq!(
