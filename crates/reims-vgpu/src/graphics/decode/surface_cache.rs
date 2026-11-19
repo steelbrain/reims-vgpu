@@ -1161,7 +1161,12 @@ impl CopiedPages {
         length: u64,
     ) -> Option<Self> {
         let runs: Vec<(HostPtr, u64)> = (runs.iter())
-            .map(|r| (HostPtr::from_addr(r.start.to_usize()), r.end.saturating_sub(r.start)))
+            .map(|r| {
+                (
+                    HostPtr::from_addr(r.start.to_usize()),
+                    r.end.saturating_sub(r.start),
+                )
+            })
             .collect();
         let mut pages = CopiedPages::new(&runs, length)?;
         pages._hold = Some(unmade as Arc<dyn Any + Send + Sync>);
@@ -1219,7 +1224,9 @@ fn imported<P: Platform>(
     unmade: &Unmade<P>,
     device: &P::Device,
 ) -> RaiseResult<Result<P::Buffer, PagesRefusal>> {
-    Ok(unmade.make(device)?.and_then(|(_view, import)| import.ok_or(PagesRefusal::NoBuffer)))
+    Ok(unmade
+        .make(device)?
+        .and_then(|(_view, import)| import.ok_or(PagesRefusal::NoBuffer)))
 }
 
 /// `copied` as a cache's pages: staged (the module doc, "Staged copies").
@@ -3964,7 +3971,14 @@ impl<P: Platform> SurfaceCaches<P> {
         wait_before::<P>(&cb, signal.as_ref())?;
         wait_for_users::<P>(&cb, &self.ends, cache)?;
         let timed = self.staged.as_ref();
-        let staged = copy::<P>(device, &cb, cache, (Way::In, block), &mut self.counts, timed)?;
+        let staged = copy::<P>(
+            device,
+            &cb,
+            cache,
+            (Way::In, block),
+            &mut self.counts,
+            timed,
+        )?;
         if let Some(staged) = staged {
             cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| drop(staged)))?;
         }
@@ -4395,7 +4409,14 @@ impl<P: Platform> SurfaceCaches<P> {
         // The dirty shapes go into the buffer first, which takes them on to the pages (rule 3).
         let back = shapes::write_back::<P>(&cb, &cache.device, &cache.shapes, |s| s.dirty)?;
         let timed = self.staged.as_ref();
-        let staged = copy::<P>(device, &cb, cache, (Way::Out, block), &mut self.counts, timed)?;
+        let staged = copy::<P>(
+            device,
+            &cb,
+            cache,
+            (Way::Out, block),
+            &mut self.counts,
+            timed,
+        )?;
         signal_after::<P>(&cb, signal.as_ref())?;
         // The buffers live until the copy is done, past the cache's own end at a release.
         let view = match &cache.pages {
