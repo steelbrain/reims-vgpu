@@ -8947,7 +8947,12 @@ pub(super) mod tests {
             "the second copies once the first landed"
         );
         assert!(!second.load(Ordering::SeqCst), "answered as its copy lands");
-        r.p.world().complete_all(CompleteOn::Caller);
+        // The pace's thread commits the copy's command buffer after it encodes the copy, which
+        // the log shows first: what completes it waits for that commit.
+        assert!(
+            eventually(|| r.p.world().complete_all(CompleteOn::Caller) > 0),
+            "the second's copy committed"
+        );
         assert!(second.load(Ordering::SeqCst));
         let counts = r.dec.caches().counts();
         assert_eq!((counts.downloads, counts.paced), (2, 1));
