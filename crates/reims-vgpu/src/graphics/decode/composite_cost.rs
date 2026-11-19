@@ -4,7 +4,8 @@
 //! render encoders and about 170 draws a frame of context 1 on car 9), its walk on the decoding
 //! thread, and when its GPU work ends. A measurement, run by hand in a release build, holding the
 //! host's GPU (`cargo nextest run -p reims-vgpu --release --no-default-features --features
-//! reims-vgpu/vulkan --run-ignored only -E 'test(composite_cost)' --no-capture`).
+//! reims-vgpu/vulkan --run-ignored only -E 'test(composite_cost)' --no-capture`). With
+//! `reims-vgpu/rt` added, `on_rt_composite_cost` runs it on the rt platform.
 //!
 //! A frame is one command buffer of [`Shape::passes`] render passes over a target of
 //! [`Shape::width`] x [`Shape::height`] BGRA8 texels, each pass loading what the one before it
@@ -493,4 +494,13 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>) {
 fn on_vulkan_composite_cost() {
     let bench = Bench::<reims_vgpu_vulkan::VulkanPlatform>::new(Shape::chosen());
     measure("vulkan", bench);
+}
+
+/// On the rt platform (`--features reims-vgpu/rt`).
+#[cfg(feature = "rt")]
+#[test]
+#[ignore = "a measurement, run by hand in a release build holding the GPU: prints a frame's times"]
+fn on_rt_composite_cost() {
+    let bench = Bench::<reims_vgpu_vulkan::RtPlatform>::new(Shape::chosen());
+    measure("rt", bench);
 }

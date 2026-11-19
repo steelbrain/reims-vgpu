@@ -3,7 +3,8 @@
 //! and through what the platform drives alone, metal2vulkan's runtime. A measurement, run by hand
 //! in a release build, in a potluck job holding the host's GPU (`--gpu`: `cargo nextest run -p
 //! reims-vgpu --release --no-default-features --features reims-vgpu/vulkan --run-ignored only -E
-//! 'test(dispatch_cost)' --no-capture`).
+//! 'test(dispatch_cost)' --no-capture`). With `reims-vgpu/rt` added, `on_rt_dispatch_cost` runs
+//! the decoder's and the platform's paths on the rt platform.
 //!
 //! Its default shape is Geekbench 7's Fluid Simulation as the trace of a timed pass on a Radeon
 //! 780M counted it (perfscout4's gbr-780m, its 20 big command buffers): a command buffer of 2,600
@@ -630,10 +631,14 @@ fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
     spent
 }
 
-/// Runs the paths of `bench`, `runtime` what the platform drives alone, and prints each one's
-/// figures a dispatch.
+/// Runs the paths of `bench`, `runtime` what the platform drives alone (none on rt, whose platform
+/// is rt's caller with nothing of ours below it), and prints each one's figures a dispatch.
 #[allow(clippy::disallowed_methods)] // a measurement: real time decides how long a profile runs
-fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>, runtime: fn(&Bench<P>) -> Counts) {
+fn measure<P: ApiPlatform>(
+    name: &str,
+    mut bench: Bench<P>,
+    runtime: Option<fn(&Bench<P>) -> Counts>,
+) {
     let runs: usize = std::env::var("DISPATCH_COST_RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -672,7 +677,7 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>, runtime: fn(&Bench<P
             let m = messages();
             spent += match only {
                 Some("platform") => bench.through_platform(),
-                Some("runtime") => runtime(&bench),
+                Some("runtime") => runtime.expect("no runtime path on this platform")(&bench),
                 _ => bench.through_decoder(&m),
             };
             reps += 1;
@@ -711,7 +716,9 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>, runtime: fn(&Bench<P
                 spent[1] = bench.through_platform();
                 took[1] = Some(ms(bench.latency.get()));
             }
-            if only.is_none_or(|o| o == "runtime") {
+            if let Some(runtime) = runtime
+                && only.is_none_or(|o| o == "runtime")
+            {
                 spent[2] = runtime(&bench);
                 took[2] = Some(ms(bench.latency.get()));
             }
@@ -815,5 +822,15 @@ fn on_vulkan_dispatch_cost() {
         size_of::<metal2vulkan_runtime::RenderCommandEncoder>()
     );
     let bench = Bench::<reims_vgpu_vulkan::VulkanPlatform>::new(Shape::chosen());
-    measure("vulkan", bench, through_runtime);
+    measure("vulkan", bench, Some(through_runtime));
+}
+
+/// On the rt platform (`--features reims-vgpu/rt`): the decoder and the platform, whose gap is the
+/// decoder's share; rt is what the platform drives, so there is no third path.
+#[cfg(feature = "rt")]
+#[test]
+#[ignore = "a measurement, run by hand in a release build holding the GPU: prints a dispatch's cost"]
+fn on_rt_dispatch_cost() {
+    let bench = Bench::<reims_vgpu_vulkan::RtPlatform>::new(Shape::chosen());
+    measure("rt", bench, None);
 }
