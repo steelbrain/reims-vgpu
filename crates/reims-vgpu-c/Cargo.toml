@@ -21,6 +21,9 @@ macos-sdl = ["reims-vgpu/macos-sdl"]
 # Kept for the builds that name it (`--features vulkan`): every handle is made on `VulkanPlatform`
 # with or without it (`Plat`, `lib.rs`).
 vulkan = ["reims-vgpu/vulkan"]
+# Every handle made on the platform over metal2vulkan-rt (`reims-vgpu`'s `rt`): a transition
+# switch, which goes at the cutover with the old runtime.
+rt = ["reims-vgpu/rt"]
 
 [dependencies]
 reims-vgpu.workspace = true

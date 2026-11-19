@@ -10,6 +10,10 @@ license.workspace = true
 [features]
 # core::testkit and testkit::capture outside this crate's own unit tests (architecture 13.2).
 testkit = ["dep:lzma-rs"]
+# The library's platform over metal2vulkan-rt (`rt_platform`, `RtPlatform`), which reims-vgpu's
+# `rt` makes its `DefaultPlatform`: a transition switch, which goes at the cutover with the old
+# runtime. Without it nothing of `rt_platform` is built.
+rt = []
 
 [dependencies]
 # core (`core`): its locks (`core::sync`), and the guest's physical ranges as bytes (`core::host`).

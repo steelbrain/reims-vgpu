@@ -50,10 +50,17 @@ pub use memory::{HostFile, MemoryFile, MemoryMap};
 pub use platform::ApiPlatform;
 pub use pool::{BLOCK_LEN, PIECE_ALIGN, PoolAddFn, PoolConfig, PoolRemoveFn, RELEASE_DELAY};
 pub use reims_vgpu_graphics::RawDoorbell;
+#[cfg(feature = "rt")]
+pub use reims_vgpu_vulkan::RtPlatform;
 pub use reims_vgpu_vulkan::VulkanPlatform;
 
 /// The platform every handle is made on by default: `VulkanPlatform`.
+#[cfg(not(feature = "rt"))]
 pub type DefaultPlatform = VulkanPlatform;
+/// The platform every handle is made on by default under the `rt` feature: `RtPlatform`, over
+/// metal2vulkan-rt.
+#[cfg(feature = "rt")]
+pub type DefaultPlatform = RtPlatform;
 pub use reims_vgpu_window::{
     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,
     MomentumPhase, PointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn, WindowCallbacks,

@@ -45,8 +45,12 @@ pub mod platform;
 pub mod recorder;
 pub(crate) mod records;
 pub mod remap;
+#[cfg(feature = "rt")]
+pub mod rt_platform;
 pub mod seam;
 pub mod swapchain;
 pub(crate) mod work_log;
 
 pub use platform::{Obj, VulkanPlatform};
+#[cfg(feature = "rt")]
+pub use rt_platform::RtPlatform;

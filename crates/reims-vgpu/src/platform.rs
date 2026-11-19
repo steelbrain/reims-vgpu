@@ -211,6 +211,8 @@ impl HostQueue for DisplayThread {
     }
 }
 
+#[cfg(feature = "rt")]
+mod rt;
 mod vulkan;
 /// A dma-buf of host memory the Vulkan platform mapped from files, for a device to import
 /// (`platform/vulkan/lent_memory.rs`).

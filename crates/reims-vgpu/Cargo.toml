@@ -18,6 +18,9 @@ testkit = ["reims-vgpu-vulkan/testkit"]
 # Kept for the builds that name it (`--features vulkan`): the Vulkan platform is the library's only
 # one, everywhere, so the feature changes nothing.
 vulkan = []
+# The platform over metal2vulkan-rt (`reims-vgpu-vulkan`'s `rt`, `platform/rt.rs`) as
+# `DefaultPlatform`: a transition switch, which goes at the cutover with the old runtime.
+rt = ["reims-vgpu-vulkan/rt"]
 
 [dependencies]
 reims-vgpu-window.workspace = true

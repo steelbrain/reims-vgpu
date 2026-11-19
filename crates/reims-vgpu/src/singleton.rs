@@ -28,6 +28,20 @@ pub fn platform() -> Arc<VulkanPlatform> {
         .clone()
 }
 
+/// The process's platform over metal2vulkan-rt (D17), under the `rt` feature, made on first use as
+/// [`platform`] makes `VulkanPlatform`'s: the panic hook first, the logger, then one `RtPlatform`.
+#[cfg(feature = "rt")]
+pub fn rt_platform() -> Arc<reims_vgpu_vulkan::RtPlatform> {
+    static RT_PLATFORM: OnceLock<Arc<reims_vgpu_vulkan::RtPlatform>> = OnceLock::new();
+    RT_PLATFORM
+        .get_or_init(|| {
+            install_panic_hook();
+            reims_vgpu_vulkan::core::logging::init();
+            Arc::new(reims_vgpu_vulkan::RtPlatform::new())
+        })
+        .clone()
+}
+
 /// The line the hook writes before it aborts.
 pub(crate) fn hook_message(info: &dyn std::fmt::Display) -> String {
     format!("reims-vgpu: panic: {info}\n")

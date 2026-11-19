@@ -52,9 +52,10 @@ pub use status::RvgStatus;
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// The platform every handle is made on: the Vulkan platform, over metal2vulkan's runtime
-/// (architecture 2.2).
+/// (architecture 2.2), or under the `rt` feature the platform over metal2vulkan-rt
+/// (`reims_vgpu::DefaultPlatform`).
 #[cfg(not(test))]
-pub(crate) type Plat = reims_vgpu::VulkanPlatform;
+pub(crate) type Plat = reims_vgpu::DefaultPlatform;
 /// The platform every handle is made on: core's testkit platform in this crate's unit tests.
 #[cfg(test)]
 pub(crate) type Plat = reims_vgpu_vulkan::core::testkit::FakePlatform;
