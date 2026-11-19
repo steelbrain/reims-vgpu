@@ -85,6 +85,9 @@ pub struct RtRenderPipeline {
     vertex_written: Box<[u32]>,
     /// The texture slots the fragment function may write.
     fragment_written: Box<[u32]>,
+    /// Its colour attachments' pixel formats, by index, and its sample count, as the guest's
+    /// descriptor gave them: what the boot diagnostics key its `imageblockSampleLength` asks by.
+    colors: ([u32; 8], u32),
 }
 
 impl RtRenderPipeline {
@@ -120,7 +123,9 @@ pub fn of_value(
         ..ColorAttachmentDesc::default()
     };
     d.color_attachments[0] = color_attachment(&color0).map_err(refused)?;
-    make(device, &d)
+    let mut formats = [0; 8];
+    formats[0] = u32::try_from(desc.color0_pixel_format).unwrap_or(u32::MAX);
+    make(device, &d, (formats, 1))
 }
 
 /// The state of core's whole descriptor `desc` (the module's docs).
@@ -143,7 +148,15 @@ pub fn of_descriptor(
     let mut d = rt::RenderPipelineDescriptor::new(rt::StageSource::Function(vertex));
     d.fragment = fragment;
     fields(&mut d, desc).map_err(refused)?;
-    make(device, &d)
+    let mut formats = [0; 8];
+    for (index, c) in &desc.colors {
+        let slot = usize::try_from(*index).ok();
+        if let Some(format) = slot.and_then(|i| formats.get_mut(i)) {
+            *format = u32::try_from(c.pixel_format).unwrap_or(u32::MAX);
+        }
+    }
+    let samples = u32::try_from(desc.raster_sample_count).unwrap_or(u32::MAX);
+    make(device, &d, (formats, samples))
 }
 
 /// Unbuilt ([`Unbuilt::MeshPipeline`]): the creator's `NSError`.
@@ -309,11 +322,13 @@ fn tessellation(t: &TessellationDesc) -> Result<Option<TessellationDescriptor>, 
     Ok(Some(d))
 }
 
-/// rt's state of `descriptor`, its samplers' indices taken (the module's docs). `Err` is the
-/// creator's `NSError`, counted under the refusal's kind.
+/// rt's state of `descriptor`, its samplers' indices taken (the module's docs), of colour formats
+/// and sample count `colors` ([`RtRenderPipeline::colors`]). `Err` is the creator's `NSError`,
+/// counted under the refusal's kind.
 fn make(
     device: &RtObj<RtDevice>,
     descriptor: &rt::RenderPipelineDescriptor,
+    colors: ([u32; 8], u32),
 ) -> Result<RtObj<RtRenderPipeline>, NsErrorText> {
     let mut taking = Taking::new(device);
     let made = (device.rt()).new_render_pipeline_state(descriptor, |samplers| taking.ids(samplers));
@@ -326,6 +341,7 @@ fn make(
         unique_identifier: next_identifier(),
         vertex_written,
         fragment_written,
+        colors,
     }))
 }
 
@@ -345,8 +361,11 @@ impl RenderPipeline for RtObj<RtRenderPipeline> {
         Ok(0)
     }
 
-    /// Unbuilt: 0 ([`Unbuilt::PipelineQuery`]).
+    /// Unbuilt: 0 ([`Unbuilt::PipelineQuery`]), the ask noted by its colour formats and sample
+    /// count (`super::diag::imageblock`).
     fn imageblock_sample_length(&self) -> u64 {
+        let (formats, samples) = self.colors;
+        super::diag::imageblock(formats, samples);
         refuse(Unbuilt::PipelineQuery, "imageblockSampleLength");
         0
     }

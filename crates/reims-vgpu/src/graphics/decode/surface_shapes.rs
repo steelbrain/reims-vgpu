@@ -128,6 +128,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(view) = view else {
             return unshaped(|c| c.views_refused += 1);
         };
+        // The rt platform's boot diagnostics name the usage the guest declared of the view.
+        #[cfg(feature = "rt")]
+        reims_vgpu_vulkan::rt_platform::diag::declared(&view, u64::from(d.usage));
         let shape = ShapeUse {
             block,
             writes: usage_writes(m),

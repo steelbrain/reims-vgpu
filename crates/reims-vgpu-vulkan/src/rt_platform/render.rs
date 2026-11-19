@@ -51,6 +51,9 @@ use crate::core::sync::Mutex;
 use super::blit::{Stop, report};
 use super::command::{Kept, OpenMark};
 use super::compute::{slots, small};
+use super::diag::{self, Bound, Target, Use};
+use super::render_pipeline::RtRenderPipeline;
+use super::texture::RtTexture;
 use super::unbuilt::{Unbuilt, refuse};
 use super::{RtBuffer, RtObj, RtPlatform};
 
@@ -68,6 +71,8 @@ pub struct RtRenderEncoder {
     mark: OpenMark,
     /// What its command buffer keeps until it completes.
     kept: Kept,
+    /// Its pass's targets, for the boot diagnostics (`diag::attachment_read`).
+    targets: Vec<Target>,
 }
 
 /// An encoder's rt encoder, until `endEncoding` ends it, and its pipeline state.
@@ -77,20 +82,60 @@ struct Open {
     /// The pipeline state set last, which the command buffer keeps: none before one is set, or
     /// once nil is.
     pipeline: Option<ObjId>,
+    /// What the boot diagnostics read of a draw rt refuses (`diag::attachment_read`).
+    seen: Seen,
+}
+
+/// What an encoder set that the boot diagnostics read of a refused draw: the textures bound, the
+/// pipeline state, and whether the depth stencil state writes depth.
+#[derive(Default)]
+struct Seen {
+    bound: Bound,
+    state: Option<RtObj<RtRenderPipeline>>,
+    depth_write: bool,
 }
 
 impl RtRenderEncoder {
     /// The encoder over rt's `encoder`, open as `mark` marks it, its pipeline states kept in
-    /// `kept`.
-    pub fn new(encoder: rt::RenderCommandEncoder, mark: OpenMark, kept: Kept) -> RtRenderEncoder {
+    /// `kept`, of a pass of `targets`.
+    pub fn new(
+        encoder: rt::RenderCommandEncoder,
+        mark: OpenMark,
+        kept: Kept,
+        targets: Vec<Target>,
+    ) -> RtRenderEncoder {
         RtRenderEncoder {
             open: Mutex::new(Open {
                 rt: Some(encoder),
                 pipeline: None,
+                seen: Seen::default(),
             }),
             mark,
             kept,
+            targets,
         }
+    }
+
+    /// Notes `texture` bound to slot `slot` of stage `stage` (0 vertex, 1 fragment) for the boot
+    /// diagnostics.
+    fn bound(&self, seen: &mut Seen, stage: usize, slot: u32, texture: Option<&RtObj<RtTexture>>) {
+        seen.bound.set(stage, slot, texture);
+        if let Some(t) = texture {
+            self.kept.uses().add(t, Use::Sampled);
+        }
+    }
+
+    /// rt refused a draw as an attachment read through a texture: notes it for the boot
+    /// diagnostics (`diag::attachment_read`).
+    fn attachment_read(&self, seen: &Seen) {
+        let Some(state) = &seen.state else {
+            return;
+        };
+        let vertex = state.rt().texture_accesses(rt::Stage::Vertex);
+        let fragment = state.rt().texture_accesses(rt::Stage::Fragment);
+        let pipeline = state.id().0;
+        let accesses = [vertex.as_slice(), fragment.as_slice()];
+        diag::attachment_read(pipeline, accesses, &seen.bound, &self.targets, seen.depth_write);
     }
 
     /// Encodes `cmd` but `endEncoding`, which the caller ends.
@@ -98,6 +143,7 @@ impl RtRenderEncoder {
         let Open {
             rt: encoder,
             pipeline,
+            seen,
         } = open;
         let Some(e) = encoder.as_mut() else {
             return Err(Stop::Metal("a command after endEncoding"));
@@ -307,6 +353,7 @@ impl RtRenderEncoder {
             } => {
                 let state = depth_stencil_state.map(|s| &**s);
                 e.set_depth_stencil_state(state)?;
+                seen.depth_write = state.is_some_and(|s| s.descriptor().depth_write_enabled);
             }
             RenderCmd::SetStencilFrontReferenceValue {
                 front_reference_value,
@@ -318,6 +365,7 @@ impl RtRenderEncoder {
             RenderCmd::SetRenderPipelineState { pipeline_state } => {
                 let Some(state) = pipeline_state else {
                     *pipeline = None;
+                    seen.state = None;
                     return Ok(());
                 };
                 e.set_render_pipeline_state(state.rt())?;
@@ -325,6 +373,7 @@ impl RtRenderEncoder {
                 if *pipeline != Some(id) {
                     self.kept.keep(id, Box::new(state.clone_ref()));
                     *pipeline = Some(id);
+                    seen.state = Some(state.clone_ref());
                 }
             }
             RenderCmd::SetScissorRect { rect } => e.set_scissor_rect(scissor(rect)),
@@ -397,18 +446,22 @@ impl RtRenderEncoder {
                 }
             }
             RenderCmd::SetFragmentTexture { texture, index } => {
-                e.set_fragment_texture(texture.map(|t| t.rt()), small(index)?)?;
+                let index = small(index)?;
+                e.set_fragment_texture(texture.map(|t| t.rt()), index)?;
+                self.bound(seen, 1, index, texture);
             }
             RenderCmd::SetVertexTextures { textures, range } => {
                 let at = slots(range, &[textures.len()])?;
                 for (texture, index) in textures.iter().zip(at) {
                     e.set_vertex_texture(texture.map(|t| t.rt()), index)?;
+                    self.bound(seen, 0, index, *texture);
                 }
             }
             RenderCmd::SetFragmentTextures { textures, range } => {
                 let at = slots(range, &[textures.len()])?;
                 for (texture, index) in textures.iter().zip(at) {
                     e.set_fragment_texture(texture.map(|t| t.rt()), index)?;
+                    self.bound(seen, 1, index, *texture);
                 }
             }
             RenderCmd::SetVertexSamplerStates { samplers, range } => {
@@ -542,6 +595,12 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
         let ending = matches!(cmd, RenderCmd::EndEncoding);
         let mut open = self.open.lock();
         let stopped = self.command(&mut open, cmd).err();
+        if let Some(Stop::Rt(rt::Error::Unsupported(rt::Gap::Draw {
+            kind: rt::DrawKind::AttachmentRead,
+        }))) = &stopped
+        {
+            self.attachment_read(&open.seen);
+        }
         if ending && let Some(e) = open.rt.take() {
             e.end_encoding();
             self.mark.end();

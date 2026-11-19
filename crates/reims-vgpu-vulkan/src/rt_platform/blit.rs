@@ -33,6 +33,7 @@ use crate::core::raise::{OnFault, RaiseResult};
 use crate::core::sync::Mutex;
 
 use super::command::OpenMark;
+use super::diag::{Use, Uses};
 use super::unbuilt::{RtRefusal, Unbuilt, refuse, refused_as, rt_refused_texture};
 use super::{RtObj, RtPlatform};
 
@@ -42,14 +43,56 @@ pub struct RtBlitEncoder {
     rt: Mutex<Option<rt::BlitCommandEncoder>>,
     /// Its command buffer's mark of it open, until it ends.
     open: OpenMark,
+    /// Its command buffer's uses of textures, for the boot diagnostics (`super::diag`).
+    uses: Uses,
 }
 
 impl RtBlitEncoder {
-    /// The encoder over rt's `encoder`, open as `open` marks it.
-    pub fn new(encoder: rt::BlitCommandEncoder, open: OpenMark) -> RtBlitEncoder {
+    /// The encoder over rt's `encoder`, open as `open` marks it, its uses of textures noted in
+    /// `uses` (`super::diag`).
+    pub fn new(encoder: rt::BlitCommandEncoder, open: OpenMark, uses: Uses) -> RtBlitEncoder {
         RtBlitEncoder {
             rt: Mutex::new(Some(encoder)),
             open,
+            uses,
+        }
+    }
+
+    /// Notes `cmd`'s copies' textures in its command buffer's uses (`super::diag`).
+    fn note_uses(&self, cmd: &BlitCmd<'_, RtPlatform>) {
+        let (from, into) = match *cmd {
+            BlitCmd::CopyBufferToTexture {
+                destination_texture,
+                ..
+            } => (None, Some(destination_texture)),
+            BlitCmd::CopyBufferToTextureOptions {
+                destination_texture,
+                ..
+            } => (None, destination_texture),
+            BlitCmd::CopyTextureToBuffer { source_texture, .. } => (Some(source_texture), None),
+            BlitCmd::CopyTextureToBufferOptions { source_texture, .. } => (source_texture, None),
+            BlitCmd::CopyTextureRegion {
+                source_texture,
+                destination_texture,
+                ..
+            }
+            | BlitCmd::CopyTextureRegionOptions {
+                source_texture,
+                destination_texture,
+                ..
+            }
+            | BlitCmd::CopyTextureSlices {
+                source_texture,
+                destination_texture,
+                ..
+            } => (Some(source_texture), Some(destination_texture)),
+            _ => (None, None),
+        };
+        if let Some(texture) = from {
+            self.uses.add(texture, Use::Blitted);
+        }
+        if let Some(texture) = into {
+            self.uses.add(texture, Use::BlittedInto);
         }
     }
 }
@@ -379,6 +422,7 @@ impl BlitEncoder<RtPlatform> for RtObj<RtBlitEncoder> {
         let sel = cmd.selector();
         let mut open = self.rt.lock();
         let ending = matches!(cmd, BlitCmd::EndEncoding);
+        self.note_uses(&cmd);
         let stopped = match open.as_mut() {
             Some(e) => encode(e, cmd).err(),
             None => Some(Stop::Metal("a command after endEncoding")),

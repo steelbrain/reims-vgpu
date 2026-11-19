@@ -44,6 +44,7 @@ use crate::core::sync::Mutex;
 
 use super::blit::{NIL, Stop, report};
 use super::command::{Kept, OpenMark};
+use super::diag::Use;
 use super::unbuilt::{Unbuilt, refuse};
 use super::{RtObj, RtPlatform};
 
@@ -217,11 +218,17 @@ impl RtComputeEncoder {
             }
             ComputeCmd::SetTexture { texture, index } => {
                 e.set_texture(texture.map(|t| t.rt()), small(index)?)?;
+                if let Some(texture) = texture {
+                    self.kept.uses().add(texture, Use::Sampled);
+                }
             }
             ComputeCmd::SetTextures { textures, range } => {
                 let at = slots(range, &[textures.len()])?;
                 for (texture, index) in textures.iter().zip(at) {
                     e.set_texture(texture.map(|t| t.rt()), index)?;
+                    if let Some(texture) = texture {
+                        self.kept.uses().add(texture, Use::Sampled);
+                    }
                 }
             }
             ComputeCmd::SetThreadgroupMemoryLength { length, index } => {

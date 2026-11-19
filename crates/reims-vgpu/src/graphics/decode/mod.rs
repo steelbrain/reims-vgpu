@@ -3494,6 +3494,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(header) = read::<RgfxMsgHeader>(message) else {
             return Ok(Err(DecodeError::Malformed));
         };
+        // The rt platform's boot diagnostics name an import by the message it was made under.
+        #[cfg(feature = "rt")]
+        reims_vgpu_vulkan::rt_platform::diag::message(header.r#type);
         match header.r#type {
             RGFX_CMD_OBJECT_DESTROY => {
                 let Some(m) = read::<RgfxObjectDestroy>(message) else {

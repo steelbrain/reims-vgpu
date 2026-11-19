@@ -3429,6 +3429,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 // The process that made the texture over the surface the display shows owns the
                 // scanout (WindowServer): its compiles go first.
                 self.pool.favour(owner);
+                // The rt platform's boot diagnostics count over-copies a frame, and name the
+                // compositor by it.
+                #[cfg(feature = "rt")]
+                reims_vgpu_vulkan::rt_platform::diag::presented(owner);
                 // Its block is held from here, before the texture's destroy and the block's
                 // release can come: the present shows it later.
                 let shown = presented.hold(texture, span);

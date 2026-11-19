@@ -37,6 +37,7 @@ use crate::core::raise::{OnFault, Raise, RaiseResult};
 use crate::core::sync::{Mutex, MutexGuard};
 use metal2vulkan_rt as rt;
 
+use super::diag::{Point, Target};
 use super::unbuilt::{Unbuilt, refuse};
 use super::{RtObj, RtPlatform, RtTexture};
 
@@ -353,6 +354,26 @@ impl PassFields {
         out.render_target_width = u32::try_from(pass.render_target_width).unwrap_or(u32::MAX);
         out.render_target_height = u32::try_from(pass.render_target_height).unwrap_or(u32::MAX);
         Ok(out)
+    }
+
+    /// The pass's targets, for the boot diagnostics (`super::diag`): each attachment of a texture,
+    /// with its level and slice, but one whose level or slice is past 32 bits, which rt's pass
+    /// takes none of.
+    pub fn targets(&self) -> Vec<Target> {
+        let pass = self.lock();
+        let one = |point: Point, a: &Attachment| {
+            let texture = a.texture.as_ref()?;
+            Some(Target {
+                point,
+                level: u32::try_from(a.level).ok()?,
+                slice: u32::try_from(a.slice).ok()?,
+                made: std::sync::Arc::clone(texture.made()),
+            })
+        };
+        let colors = (pass.colors.iter().enumerate()).filter_map(|(i, a)| one(Point::Color(i), a));
+        (colors.chain(one(Point::Depth, &pass.depth)))
+            .chain(one(Point::Stencil, &pass.stencil))
+            .collect()
     }
 }
 

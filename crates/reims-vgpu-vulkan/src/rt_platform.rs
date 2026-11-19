@@ -37,6 +37,7 @@ pub mod command;
 pub mod compute;
 pub mod descriptor;
 pub mod device;
+pub mod diag;
 pub mod event;
 pub mod format;
 pub mod heap;

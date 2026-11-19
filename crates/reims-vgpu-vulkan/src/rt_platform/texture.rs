@@ -51,6 +51,7 @@
 
 use std::collections::VecDeque;
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use metal2vulkan_rt as rt;
@@ -67,6 +68,7 @@ use crate::core::sync::Mutex;
 
 use super::descriptor::rt_texture_descriptor;
 use super::device::RtDevice;
+use super::diag::{Call, Made, Shape};
 use super::unbuilt::{
     RtRefusal, Unbuilt, refuse_create, refused_as, rt_refused, rt_refused_texture_create,
 };
@@ -135,6 +137,8 @@ pub struct RtTexture {
     own: Option<u32>,
     /// Its purgeable state, as Metal keeps it ([`GpuResource::set_purgeable_state`]).
     purgeable: AtomicU64,
+    /// What it is, for the boot diagnostics (`super::diag`).
+    made: Arc<Made>,
 }
 
 impl Drop for RtTexture {
@@ -149,6 +153,11 @@ impl RtTexture {
     /// rt's texture.
     pub fn rt(&self) -> &rt::Texture {
         &self.rt
+    }
+
+    /// What it is, for the boot diagnostics (`super::diag`).
+    pub(super) fn made(&self) -> &Arc<Made> {
+        &self.made
     }
 
     /// The host's read-back (`reims_vgpu`'s `ApiPlatform::read_pixels`): the whole of level 0 and
@@ -224,6 +233,8 @@ impl RtTexture {
         let (index, own) = self
             .device
             .index_for(sel, reaches(d.usage), resource_index)?;
+        let first = (levels.start, slices.start);
+        let format_raw = u32::try_from(pixel_format).unwrap_or(u32::MAX);
         let made = match channels {
             None => self
                 .rt
@@ -243,6 +254,7 @@ impl RtTexture {
             protection_options: self.protection_options,
             own,
             purgeable: purgeable_state(),
+            made: Made::view(&self.made, format_raw, first),
         })
     }
 }
@@ -257,34 +269,38 @@ pub fn make(
 ) -> Option<RtObj<RtTexture>> {
     let options = desc.resource_options.unwrap_or(0);
     let make = |d: &rt::TextureDescriptor, index: Option<u32>| device.rt().new_texture(d, index);
-    made_of(device, sel, desc, options, make)
+    let diag = |shape: &Shape| Made::new(Call::Plain, shape);
+    made_of(device, sel, desc, options, make, diag)
 }
 
 /// A texture of `desc` over a buffer's or a heap's memory of the resource options `held`, for
 /// `sel`: the texture `over` makes of rt's descriptor at the index [`make`] would give it (rt's
 /// `Buffer::new_texture`, `Device::new_heap_texture`), answering the descriptor's options with
 /// `held`'s bits `taken` (a buffer's storage mode, as rt makes the texture of the buffer's whatever
-/// the descriptor's; a heap's modes, which its resources take). Nil where rt refuses it, counted.
+/// the descriptor's; a heap's modes, which its resources take), what it is for the boot
+/// diagnostics `diag`'s of its shape. Nil where rt refuses it, counted.
 pub(super) fn make_over(
     device: &RtObj<RtDevice>,
     sel: &'static str,
     desc: &TextureDesc,
     (held, taken): (u64, u64),
     over: impl FnOnce(&rt::TextureDescriptor, Option<u32>) -> Result<rt::Texture, rt::Error>,
+    diag: impl FnOnce(&Shape) -> Arc<Made>,
 ) -> Option<RtObj<RtTexture>> {
     let options = desc.resource_options.unwrap_or(0);
     let options = (options & !taken) | (held & taken);
-    made_of(device, sel, desc, options, over)
+    made_of(device, sel, desc, options, over, diag)
 }
 
 /// The texture `make` of `desc` makes for `sel` (the module's docs), of the resource options
-/// `options`, hazard tracking yet to resolve.
+/// `options`, hazard tracking yet to resolve, what it is for the boot diagnostics `diag`'s.
 fn made_of(
     device: &RtObj<RtDevice>,
     sel: &'static str,
     desc: &TextureDesc,
     options: u64,
     make: impl FnOnce(&rt::TextureDescriptor, Option<u32>) -> Result<rt::Texture, rt::Error>,
+    diag: impl FnOnce(&Shape) -> Arc<Made>,
 ) -> Option<RtObj<RtTexture>> {
     let d = match rt_texture_descriptor(desc) {
         Ok(d) => d,
@@ -292,11 +308,12 @@ fn made_of(
     };
     let placed = desc.resource_index.map_or(0, |(index, _forced)| index);
     let (index, own) = device.index_for(sel, reaches(d.usage), placed)?;
-    answered(device, sel, desc, options, own, make(&d, index))
+    answered(device, sel, desc, options, own, make(&d, index), diag)
 }
 
 /// The texture of rt's answer `made` to `sel`, of `desc`, the resource options `options` and the
-/// platform's own index `own`: nil where rt refused it, counted, `own` given back.
+/// platform's own index `own`: nil where rt refused it, counted, `own` given back. What it is for
+/// the boot diagnostics is `diag`'s of its shape.
 fn answered(
     device: &RtObj<RtDevice>,
     sel: &'static str,
@@ -304,7 +321,15 @@ fn answered(
     options: u64,
     own: Option<u32>,
     made: Result<rt::Texture, rt::Error>,
+    diag: impl FnOnce(&Shape) -> Arc<Made>,
 ) -> Option<RtObj<RtTexture>> {
+    let shape = Shape {
+        format: u32::try_from(desc.pixel_format).unwrap_or(u32::MAX),
+        width: u32::try_from(desc.width).unwrap_or(u32::MAX),
+        height: u32::try_from(desc.height).unwrap_or(u32::MAX),
+        storage: (options & STORAGE_BITS) >> 4,
+        usage: desc.usage,
+    };
     let usage = match desc.usage {
         0 => UNKNOWN_ANSWERS,
         usage => usage & !DROPPED,
@@ -317,6 +342,7 @@ fn answered(
         protection_options: desc.protection_options.unwrap_or(0),
         own,
         purgeable: purgeable_state(),
+        made: diag(&shape),
     })
 }
 
@@ -363,7 +389,8 @@ impl RtObj<RtDevice> {
         };
         let options = desc.resource_options.unwrap_or(0);
         let made = self.rt().new_texture_for_views(&d);
-        answered(self, sel, desc, options, None, made)
+        let diag = |shape: &Shape| Made::new(Call::SurfaceImage, shape);
+        answered(self, sel, desc, options, None, made, diag)
     }
 
     /// The index a texture `sel` makes takes, as rt takes it, and whether it is one of the

@@ -2813,7 +2813,10 @@ static COUNTS_WRITTEN: crate::core::sync::Mutex<String> =
 pub fn write_counts() {
     crate::core::logging::write_repeats();
     #[cfg(feature = "rt")]
-    crate::rt_platform::device::fold_metrics();
+    {
+        crate::rt_platform::device::fold_metrics();
+        crate::rt_platform::diag::write();
+    }
     let Some(line) = counts_line(&degradation_counts()) else {
         return;
     };

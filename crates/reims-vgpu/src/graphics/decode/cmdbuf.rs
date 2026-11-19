@@ -2712,6 +2712,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         events: &mut EventOps,
         split: &mut Option<Splitting>,
     ) -> RaiseResult<Result<(), DecodeError>> {
+        // The rt platform's boot diagnostics total a refused draw by its process.
+        #[cfg(feature = "rt")]
+        reims_vgpu_vulkan::rt_platform::diag::walk_context(self.context);
         let mut encoder: Option<OpenEncoder<P>> = None;
         let walked = refusing(|| self.walk(ops, cb, &mut encoder, events, split));
         if let Some(open) = encoder.take() {

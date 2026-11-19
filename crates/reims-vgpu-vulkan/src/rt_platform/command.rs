@@ -64,6 +64,7 @@ use crate::core::sync::Mutex;
 use super::blit::RtBlitEncoder;
 use super::compute::RtComputeEncoder;
 use super::device::RtDevice;
+use super::diag::{Use, Uses};
 use super::render::RtRenderEncoder;
 use super::texture::refused_metal;
 use super::unbuilt::{RtRefusal, Unbuilt, refuse, refused_as, rt_refused, rt_refused_create};
@@ -235,10 +236,17 @@ impl RtCommandBuffer {
 /// state's drop gives back its sampler indices (`super::pipeline`), which rt's recorded work reads
 /// while rt keeps its own state. The commit hands them to a completed handler, which drops them
 /// after core's; a command buffer never committed drops them with itself.
+/// It holds too its uses of textures over an imported block, for the boot diagnostics
+/// (`super::diag`), which its commit counts.
 #[derive(Clone, Default)]
-pub struct Kept(Arc<Mutex<HashMap<ObjId, Box<dyn Send>>>>);
+pub struct Kept(Arc<Mutex<HashMap<ObjId, Box<dyn Send>>>>, Uses);
 
 impl Kept {
+    /// Its uses of textures over an imported block (`super::diag`).
+    pub fn uses(&self) -> &Uses {
+        &self.1
+    }
+
     /// Keeps `object`, whose identity is `id`, unless an object of that identity is kept.
     pub fn keep(&self, id: ObjId, object: Box<dyn Send>) {
         self.0.lock().entry(id).or_insert(object);
@@ -408,7 +416,10 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     ) -> RaiseResult<Option<<RtPlatform as Platform>::BlitEncoder>> {
         let _ = on;
         Ok(match self.rt.blit_command_encoder() {
-            Ok(encoder) => Some(RtObj::new(RtBlitEncoder::new(encoder, self.opened()))),
+            Ok(encoder) => {
+                let uses = self.kept.uses().clone();
+                Some(RtObj::new(RtBlitEncoder::new(encoder, self.opened(), uses)))
+            }
             Err(error) => {
                 rt_refused_create("blitCommandEncoder", &error);
                 None
@@ -439,6 +450,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         };
         submission.extend(scheduled);
         seen.extend(completed);
+        self.kept.uses().submitted();
         let kept = self.kept.take();
         if !kept.is_empty() {
             seen.push(Box::new(move |_made: &rt::CommandBuffer| drop(kept)));
@@ -544,7 +556,11 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         Ok(match self.rt.render_command_encoder(&pass) {
             Ok(encoder) => {
                 let (mark, kept) = (self.opened(), self.kept.clone());
-                Some(RtObj::new(RtRenderEncoder::new(encoder, mark, kept)))
+                let targets = render_pass_descriptor.targets();
+                for target in &targets {
+                    kept.uses().add_made(&target.made, Use::Rendered);
+                }
+                Some(RtObj::new(RtRenderEncoder::new(encoder, mark, kept, targets)))
             }
             Err(error) => {
                 rt_refused_create(sel, &error);

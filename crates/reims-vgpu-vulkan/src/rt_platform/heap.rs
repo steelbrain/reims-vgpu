@@ -44,6 +44,7 @@ use crate::core::raise::RaiseResult;
 
 use super::buffer::{self, BIT_20, FIELDS, READ_ONLY, RtBuffer, known_at, take, unpinned};
 use super::device::RtDevice;
+use super::diag::{Call, Made, Shape};
 use super::texture::{self, RtTexture, refused_metal};
 use super::unbuilt::{Unbuilt, refuse_create, rt_refused_create};
 use super::{RtObj, RtPlatform, TextureFields};
@@ -340,7 +341,8 @@ impl Heap<RtPlatform> for RtObj<RtHeap> {
             (self.device.rt()).new_heap_texture(d, index, range, offset)
         };
         let held = (self.options, FIELDS);
-        Ok(texture::make_over(&self.device, SEL, &desc, held, over))
+        let diag = |shape: &Shape| Made::new(Call::InHeap, shape);
+        Ok(texture::make_over(&self.device, SEL, &desc, held, over, diag))
     }
 
     /// The asked ones without bits 20 and 24, a default hazard tracking resolved to untracked.

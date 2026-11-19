@@ -69,6 +69,7 @@ use crate::core::sync::Mutex;
 use crate::gpu::device::descriptor_options;
 
 use super::device::RtDevice;
+use super::diag::{Made, Shape};
 use super::texture::{self, RtTexture, refused_metal};
 use super::unbuilt::{Unbuilt, refuse_create, rt_refused, rt_refused_create};
 use super::{RtObj, RtPlatform, TextureFields};
@@ -658,6 +659,7 @@ pub(super) fn import_pages(
     match imported {
         Ok((block, _)) => {
             imports_rise();
+            super::diag::imported(block.id, sel);
             Some((block, first - start))
         }
         Err(error) => {
@@ -732,7 +734,8 @@ impl RtObj<RtBuffer> {
             self.rt.new_texture(d, index, offset, bytes_per_row)
         };
         let held = (self.options, texture::STORAGE_BITS);
-        texture::make_over(&self.device, sel, &descriptor.desc(), held, over)
+        let diag = |shape: &Shape| Made::over_buffer(&self.rt, shape, offset, bytes_per_row);
+        texture::make_over(&self.device, sel, &descriptor.desc(), held, over, diag)
     }
 }
 

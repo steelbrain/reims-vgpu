@@ -100,6 +100,11 @@ pub fn fold_metrics() {
     fold(&mut FOLDED.lock(), now);
 }
 
+/// rt's metrics of the process's device now (`super::diag`); `None` before it is made.
+pub(super) fn metrics() -> Option<rt::Metrics> {
+    COUNTERS.get().map(rt::Counters::metrics)
+}
+
 /// Counts the rise of each of `now` over `folded`, the over-copies, their bytes, and those of an
 /// imported block, under its code, and keeps `now` as folded.
 fn fold(folded: &mut [u64; 4], now: [u64; 4]) {
