@@ -3421,6 +3421,25 @@ impl<P: Platform> SurfaceCaches<P> {
         (Some((reference, made)), gone)
     }
 
+    /// Whether the shape numbered `id` of the block at `block`'s cache owes its fill; `None` where
+    /// the cache holds no such shape.
+    fn shape_owes(&self, block: u64, id: u64) -> Option<bool> {
+        let cache = self.by_block.get(&block)?;
+        (cache.shapes.iter()).find(|s| s.id() == id).map(|s| s.owed)
+    }
+
+    /// Takes the shape numbered `id` out of the block at `block`'s cache as though it was never
+    /// made ([`SurfaceCaches::placed_shape`]), its bytes out of the caches' and its make out of the
+    /// counts: its image, for the caller to let go of with the lock let go of.
+    fn unmake_shape(&mut self, block: u64, id: u64) -> Option<P::Texture> {
+        let shape = self.by_block.get_mut(&block)?.shapes.take_id(id)?;
+        self.cache_bytes = self.cache_bytes.saturating_sub(shape.bytes);
+        let counts = &mut self.counts.shapes;
+        counts.made = counts.made.saturating_sub(1);
+        counts.made_bytes = counts.made_bytes.saturating_sub(shape.bytes);
+        Some(shape.image)
+    }
+
     /// The shapes that go: the block at `block`'s unreferenced ones past the bound
     /// ([`ShapeTable::sweep`]), then, past the caches' budget, the unreferenced ones of any block
     /// least recently used first, until the caches hold no more than the budget or no
@@ -5046,15 +5065,34 @@ pub(crate) struct Caches<P: Platform> {
     homes: AtomicBool,
     /// What makes a shape's image, in the per-shape form ([`Self::set_shapes`]).
     shape_maker: OnceLock<ShapeMaker<P>>,
+    /// The shape maker places images ([`Self::set_shapes`], [`shapes`]'s "Placed images").
+    shapes_placed: AtomicBool,
     /// Every cache's copies are staged ([`Self::set_staged`]).
     staged: AtomicBool,
 }
 
+/// Lets go of `gone`, shapes' images of the block at `block` that went, with no lock held, a
+/// refusal logged.
+fn let_go_of_shapes<T: Send + 'static>(block: u64, gone: Vec<T>) {
+    if gone.is_empty() {
+        return;
+    }
+    if let Err(refusal) = refusals::refusing(move || drop(gone)) {
+        log::warn!(
+            target: "reims_vgpu::graphics", kind:% = refusal;
+            "the IOSurface block at {block:#x}'s shapes past their bound were let go of, and a \
+             release was refused: {refusal}"
+        );
+    }
+}
+
 /// What makes a shape's image ([`shapes`]): a texture of the descriptor on the device, of the
-/// platform's own, at no resource index the guest names (`ApiPlatform::shape_image`); `None`
-/// where the platform makes none.
+/// platform's own, at no resource index the guest names (`ApiPlatform::shape_image`), or, where
+/// asked (`true`), one placed in memory whose bytes are as they are
+/// (`ApiPlatform::placed_shape_image`, [`shapes`]'s "Placed images"); `None` where the platform
+/// makes none.
 pub(crate) type ShapeMaker<P> = Arc<
-    dyn Fn(&<P as Platform>::Device, &TextureDesc) -> Option<<P as Platform>::Texture>
+    dyn Fn(&<P as Platform>::Device, &TextureDesc, bool) -> Option<<P as Platform>::Texture>
         + Send
         + Sync,
 >;
@@ -5398,14 +5436,17 @@ impl<P: Platform> Caches<P> {
             on_fill_done,
             homes: AtomicBool::new(false),
             shape_maker: OnceLock::new(),
+            shapes_placed: AtomicBool::new(false),
             staged: AtomicBool::new(false),
         }
     }
 
-    /// Takes the per-shape form from now on ([`shapes`]), each shape's image made by `maker`: set
-    /// once, at the device's make, before any cache; a second is ignored.
-    pub(crate) fn set_shapes(&self, maker: ShapeMaker<P>) {
+    /// Takes the per-shape form from now on ([`shapes`]), each shape's image made by `maker`,
+    /// which places one where `places` ([`shapes`]'s "Placed images"): set once, at the device's
+    /// make, before any cache; a second is ignored.
+    pub(crate) fn set_shapes(&self, maker: ShapeMaker<P>, places: bool) {
         if self.shape_maker.set(maker).is_ok() {
+            self.shapes_placed.store(places, Ordering::Release);
             self.state.lock().shaped = true;
         }
     }
@@ -5444,9 +5485,10 @@ impl<P: Platform> Caches<P> {
 
     /// The shape `key` of the block at `block`'s cache, its image made of `desc` where the cache
     /// holds none yet, with the lock let go of, and added ([`SurfaceCaches::add_shape`]): a
-    /// reference to it and its image. `None` where the caches take the default form, the block
-    /// has no cache, or the platform made no image (counted). What goes is let go of with no lock
-    /// held, a refusal logged.
+    /// reference to it and its image. Its image is placed where its first fill is made with its
+    /// make ([`Self::placed_shape`]), else the platform's own as before. `None` where the caches
+    /// take the default form, the block has no cache, or the platform made no image (counted).
+    /// What goes is let go of with no lock held, a refusal logged.
     pub(crate) fn shape(
         &self,
         device: &P::Device,
@@ -5465,19 +5507,107 @@ impl<P: Platform> Caches<P> {
         if let Some(found) = self.plane_shape(device, block, &key) {
             return Some(found);
         }
-        let Some(image) = maker(device, desc) else {
+        if self.shapes_placed.load(Ordering::Acquire)
+            && self.fills_at_once(block)
+            && let Some(image) = maker(device, desc, true)
+            && let Some(placed) = self.placed_shape(device, block, key, image)
+        {
+            return placed;
+        }
+        let Some(image) = maker(device, desc, false) else {
             self.state.lock().counts.shapes.images_refused += 1;
             return None;
         };
         let (shape, gone) = self.state.lock().add_shape(block, key, image);
-        if let Err(refusal) = refusals::refusing(move || drop(gone)) {
+        let_go_of_shapes(block, gone);
+        shape
+    }
+
+    /// Whether a new shape of the block at `block`'s cache would take its first fill with its
+    /// make ([`shapes`]'s "Placed images"): the cache is the block's, and no command buffer begun
+    /// and not finished uses it and no copy of it waits, so a use now would fill its shapes at
+    /// once. Counted where not ([`ShapeCounts::unplaced_busy`]).
+    fn fills_at_once(&self, block: u64) -> bool {
+        let mut st = self.state.lock();
+        if !st.by_block.contains_key(&block) {
+            return false;
+        }
+        let at_once = st.pending(block, false) == 0 && !st.deferring(block);
+        if !at_once {
+            st.counts.shapes.unplaced_busy += 1;
+            reims_vgpu_vulkan::answer::count_kind(shapes::UNPLACED_BUSY);
+        }
+        at_once
+    }
+
+    /// The shape `key` of the block at `block`'s cache on `image`, an image the platform placed
+    /// ([`shapes`]'s "Placed images"), added and filled at once from the cache's buffer
+    /// ([`SurfaceCachesState::fill_shapes`]), where no command buffer begun and not finished
+    /// uses the cache and no copy of it waits: the shape, `None` within where the block has no
+    /// cache. Where it is not filled so, as a command buffer was begun since
+    /// ([`Self::fills_at_once`]) or the fill was not made or did not fill it, the shape goes and
+    /// its image with it, counted ([`ShapeCounts::unplaced_busy`],
+    /// [`ShapeCounts::unplaced_unfilled`]), so that nothing reads the image's bytes as they
+    /// were: `None`, for the caller to make the shape as before. A cache that held the shape
+    /// meanwhile answers its own, `image` let go of.
+    fn placed_shape(
+        &self,
+        device: &P::Device,
+        block: u64,
+        key: ShapeKey,
+        image: P::Texture,
+    ) -> Option<Option<Held<P::Texture>>> {
+        let mut st = self.state.lock();
+        let bytes = key.bytes();
+        match st.find_shape(block, &key) {
+            None => {
+                drop(st);
+                let_go_of_shapes(block, vec![image]);
+                return Some(None);
+            }
+            Some(Some(found)) => {
+                drop(st);
+                let_go_of_shapes(block, vec![image]);
+                return Some(Some(found));
+            }
+            Some(None) => {}
+        }
+        if st.pending(block, false) > 0 || st.deferring(block) {
+            st.counts.shapes.unplaced_busy += 1;
+            reims_vgpu_vulkan::answer::count_kind(shapes::UNPLACED_BUSY);
+            drop(st);
+            let_go_of_shapes(block, vec![image]);
+            return None;
+        }
+        let (shape, mut gone) = st.add_shape(block, key, image);
+        let Some((reference, made)) = shape else {
+            drop(st);
+            let_go_of_shapes(block, gone);
+            return Some(None);
+        };
+        if let Err(raise) = st.fill_shapes(device, block) {
             log::warn!(
-                target: "reims_vgpu::graphics", kind:% = refusal;
-                "the IOSurface block at {block:#x}'s shapes past their bound were let go of, and \
-                 a release was refused: {refusal}"
+                target: "reims_vgpu::graphics", kind:% = raise;
+                "the IOSurface block at {block:#x}: the platform raised at a placed shape's first \
+                 fill ({raise:?}); the shape takes the platform's own image"
             );
         }
-        shape
+        let id = reference.id();
+        if st.shape_owes(block, id) == Some(false) {
+            st.counts.shapes.placed += 1;
+            st.counts.shapes.placed_bytes += bytes;
+            drop(st);
+            let_go_of_shapes(block, gone);
+            return Some(Some((reference, made)));
+        }
+        drop(reference);
+        gone.extend(st.unmake_shape(block, id));
+        gone.push(made);
+        st.counts.shapes.unplaced_unfilled += 1;
+        reims_vgpu_vulkan::answer::count_kind(shapes::UNPLACED_UNFILLED);
+        drop(st);
+        let_go_of_shapes(block, gone);
+        None
     }
 
     /// A count of the per-shape form's, `count` picking it ([`ShapeCounts`]).

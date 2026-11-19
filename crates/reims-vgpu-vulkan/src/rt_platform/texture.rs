@@ -14,6 +14,17 @@
 //! reach the image as any texture. Its `resourceIndex`, `uniqueIdentifier` and the index in its
 //! `gpuResourceID` are 0, and a slot that binds it reads Metal's nil texture.
 //!
+//! **Placed images for views.** A shape's image may be placed instead
+//! (`ApiPlatform::placed_shape_image`, [`RtObj::new_placed_texture_for_views`]): rt's texture for
+//! views bound at the start of a Private block of its own (rt's `take_block` and
+//! `new_heap_texture_for_views`), the block `max(size, align)` bytes of the image's
+//! `heap_texture_size_and_align`, so its base, which rt aligns to the block's length rounded up
+//! to a power of two, is aligned for the image. rt clears no placed image: its bytes are the
+//! block's as they are, which the caller fills before anything reads them. The texture holds the
+//! block, and the block goes back to rt as the image does. Counted with the blocks' bytes
+//! ([`PLACED_IMAGES_CODE`], [`PLACED_IMAGE_BYTES_CODE`]); one rt places none of is counted by its
+//! cause ([`UNPLACED_OWN_CODE`], [`UNPLACED_REFUSED_CODE`], logged once) and made as before.
+//!
 //! **Indices.** rt places a texture that shaders reach (shader-read or shader-write usage, or
 //! `Unknown`, which Metal takes as both) at an index of a live texture grant, and no other. A
 //! texture the guest places (the descriptor's `resourceIndex`, a view's `resourceIndex:`) takes the
@@ -82,6 +93,20 @@ pub const COPY_CODE: &str = "rt-copy-replace-region";
 
 /// The code of the bytes [`COPY_CODE`]'s calls copied, counted by the byte.
 pub const COPY_BYTES_CODE: &str = "rt-copy-replace-region-bytes";
+
+/// The code of the placed images for views made (the module's docs, "Placed images for views").
+pub const PLACED_IMAGES_CODE: &str = "rt-placed-shape-images";
+
+/// The code of the bytes of those images' blocks, counted by the byte.
+pub const PLACED_IMAGE_BYTES_CODE: &str = "rt-placed-shape-image-bytes";
+
+/// The code of the images for views rt places none of as it takes them in an allocation of their
+/// own ([`rt::Gap::HeapTexture`]).
+pub const UNPLACED_OWN_CODE: &str = "rt-placed-shape-images-own";
+
+/// The code of the images for views rt places none of for any other refusal: of the block, or of
+/// the place.
+pub const UNPLACED_REFUSED_CODE: &str = "rt-placed-shape-images-refused";
 
 /// `replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:`.
 const REPLACE: &str = "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:";
@@ -472,6 +497,54 @@ impl RtObj<RtDevice> {
         let made = self.rt().new_texture_for_views(&d);
         let diag = |shape: &Shape| Made::new(Call::SurfaceImage, shape);
         answered(self, sel, desc, options, None, made, diag)
+    }
+
+    /// A texture of `desc` for views alone, as [`Self::new_texture_for_views`] makes one, with its
+    /// image placed in a Private block of its own (the module's docs, "Placed images for views"):
+    /// its bytes are the block's as they are. `None` where rt places none, counted by its cause,
+    /// and where rt takes no descriptor of `desc`, as [`Self::new_texture_for_views`] then
+    /// refuses it.
+    pub fn new_placed_texture_for_views(&self, desc: &TextureDesc) -> Option<RtObj<RtTexture>> {
+        let sel = "newTextureWithDescriptor:offset:";
+        let d = rt_texture_descriptor(desc).ok()?;
+        let placed = (|| {
+            let rt::SizeAndAlign { size, align } = self.rt().heap_texture_size_and_align(&d)?;
+            let block = self.rt().take_block(rt::MemoryClass::Private, size.max(align))?;
+            let heap = rt::HeapRange {
+                block: block.id,
+                offset: 0,
+                len: block.len,
+            };
+            // The texture holds the block from here: this handle goes at once.
+            let made = self.rt().new_heap_texture_for_views(&d, heap, 0);
+            drop(block);
+            made.map(|texture| (texture, heap.len))
+        })();
+        let (texture, len) = match placed {
+            Ok(placed) => placed,
+            Err(error) => {
+                let code = match error {
+                    rt::Error::Unsupported(rt::Gap::HeapTexture { .. }) => UNPLACED_OWN_CODE,
+                    _ => UNPLACED_REFUSED_CODE,
+                };
+                crate::answer::count_kind(code);
+                if !UNPLACED_LOGGED.swap(true, Ordering::Relaxed) {
+                    log::info!(
+                        kind:% = code;
+                        "a shape's image of format {} and {}x{}: rt places none in a block of its \
+                         own ({error:?}); it takes rt's image as before ({code}; the rest are \
+                         counted)",
+                        desc.pixel_format, desc.width, desc.height
+                    );
+                }
+                return None;
+            }
+        };
+        crate::answer::count_kind(PLACED_IMAGES_CODE);
+        crate::answer::count_kind_by(PLACED_IMAGE_BYTES_CODE, len);
+        let options = desc.resource_options.unwrap_or(0);
+        let diag = |shape: &Shape| Made::new(Call::SurfaceImage, shape);
+        answered(self, sel, desc, options, None, Ok(texture), diag)
     }
 
     /// The index a texture `sel` makes takes, as rt takes it, and whether it is one of the
@@ -1047,6 +1120,10 @@ impl Texture<RtPlatform> for RtObj<RtTexture> {
 
 /// Whether the process copied a `replaceRegion:`'s bytes yet.
 static COPIED: AtomicBool = AtomicBool::new(false);
+
+/// Whether an image for views rt placed none of was logged
+/// ([`RtObj::new_placed_texture_for_views`]).
+static UNPLACED_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Counts a `replaceRegion:` copy of `bytes` bytes ([`COPY_CODE`], [`COPY_BYTES_CODE`]); the
 /// process's first writes its line.

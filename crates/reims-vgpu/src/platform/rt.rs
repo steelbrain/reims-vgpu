@@ -13,6 +13,11 @@ impl ApiPlatform for RtPlatform {
     /// (`graphics::decode::surface_shapes`), and every surface is cached.
     const SURFACE_SHAPES: bool = true;
 
+    /// rt places a shape's image in a Private block of its own, whose bytes the shape's first
+    /// fill writes before anything reads them, rather than clearing an image of its own
+    /// ([`ApiPlatform::placed_shape_image`]).
+    const PLACED_SHAPE_IMAGES: bool = true;
+
     /// rt places a pinned buffer or heap at its pin only inside a block it knows, and counts
     /// each other one (`rt-gpu-address-unpinned`), which the decoder counts again by kind.
     const PINS_IN_BLOCKS: bool = true;
@@ -94,6 +99,17 @@ impl ApiPlatform for RtPlatform {
         desc: &TextureDesc,
     ) -> Option<<Self as Platform>::Texture> {
         device.new_texture_for_views(desc)
+    }
+
+    /// rt's image for views placed in a Private block of its own
+    /// (`RtObj::<RtDevice>::new_placed_texture_for_views`), its bytes the block's as they are.
+    /// `None` where rt places none, counted.
+    fn placed_shape_image(
+        &self,
+        device: &<Self as Platform>::Device,
+        desc: &TextureDesc,
+    ) -> Option<<Self as Platform>::Texture> {
+        device.new_placed_texture_for_views(desc)
     }
 
     /// The first of the host's video arms that takes the device (`graphics::video_choice`): on

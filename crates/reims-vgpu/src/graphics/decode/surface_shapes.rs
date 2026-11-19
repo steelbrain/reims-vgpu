@@ -84,10 +84,12 @@ pub(super) const PAGES_COPIED: &str = "rt-surface-pages-copied";
 static COPIED_LOGGED: AtomicBool = AtomicBool::new(false);
 
 impl<P: Platform> GraphicsDecoder<P> {
-    /// Takes the per-shape form from now on (module doc), each shape's image made by `maker`:
-    /// set once, at the device's make, before any surface is named.
-    pub(crate) fn set_surface_shapes(&self, maker: ShapeMaker<P>) {
-        self.surface_caches.set_shapes(maker);
+    /// Takes the per-shape form from now on (module doc), each shape's image made by `maker`,
+    /// placed where `places` and its first fill is made with its make
+    /// (`surface_cache::shapes`, "Placed images"): set once, at the device's make, before any
+    /// surface is named.
+    pub(crate) fn set_surface_shapes(&self, maker: ShapeMaker<P>, places: bool) {
+        self.surface_caches.set_shapes(maker, places);
     }
 
     /// Refuses the block at `block` as uncached in the per-shape form (module doc): any device
@@ -393,13 +395,50 @@ mod tests {
         let p = Arc::clone(&r.p);
         let made = Made::default();
         let kept = Arc::clone(&made);
-        r.dec.set_surface_shapes(Arc::new(
-            move |device: &<FakePlatform as Platform>::Device, desc: &TextureDesc| {
-                kept.lock().push((desc.pixel_format, desc.usage));
-                p.own_texture(device, desc)
-            },
-        ));
+        r.dec.set_surface_shapes(
+            Arc::new(
+                move |device: &<FakePlatform as Platform>::Device,
+                      desc: &TextureDesc,
+                      _placed: bool| {
+                    kept.lock().push((desc.pixel_format, desc.usage));
+                    p.own_texture(device, desc)
+                },
+            ),
+            false,
+        );
         made
+    }
+
+    /// Whether each image the rig's decoder made was asked placed, in order.
+    type Placed = Arc<Mutex<Vec<bool>>>;
+
+    /// [`shaped`]'s rig with a maker that places images ("Placed images"), the fake's own
+    /// textures standing in for placed ones, and whether each make asked one placed.
+    fn placing() -> (Rig, Placed) {
+        let mut r = rig(8);
+        let page = r.page;
+        let p = Arc::clone(&r.p);
+        let placed = Placed::default();
+        let kept = Arc::clone(&placed);
+        r.dec.set_surface_shapes(
+            Arc::new(
+                move |device: &<FakePlatform as Platform>::Device,
+                      desc: &TextureDesc,
+                      asked: bool| {
+                    kept.lock().push(asked);
+                    p.own_texture(device, desc)
+                },
+            ),
+            true,
+        );
+        r.dec.hold_resource_ids(0, 1);
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        queues(&mut r);
+        assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
+        (r, placed)
     }
 
     /// [`cached`]'s rig in the per-shape form, its texture resource ids held, with buffer 10 over
@@ -613,6 +652,54 @@ mod tests {
         let shadow = entry.shape.as_ref().map(|s| (s.block, s.writes));
         assert_eq!(shadow, Some((BLOCK, false)), "the shadow's");
         assert_eq!(r.dec.caches().counts().shapes, ShapeCounts::default());
+    }
+
+    /// Where the platform places shapes' images, a new shape of a cache no command buffer uses
+    /// takes a placed image, filled from the buffer at its make before its view is answered, and
+    /// keeps it; one made while a command buffer begun and not finished uses the cache takes the
+    /// platform's own image, its fill asked of that buffer as before, counted
+    /// (`rt-shape-unplaced-busy`). A platform that places none is asked for none
+    #[test]
+    fn a_placed_shape_is_filled_at_its_make_and_one_of_a_busy_cache_is_the_platforms_own() {
+        let (mut r, placed) = placing();
+        let cache = cache_id(&r);
+        let mark = r.p.call_log().mark();
+        let image = texture_image(&mut r, 21, 80, (32, 8));
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(*placed.lock(), [true]);
+        assert_eq!(fills(&calls), [(cache, 0, image)], "filled at its make");
+        assert!(first(&calls, FILL) < first(&calls, VIEW), "before its view");
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.placed, counts.placed_bytes), (1, 32 * 8 * 4));
+        assert_eq!((counts.made, counts.fills_made), (1, 1));
+        assert_eq!((counts.unplaced_busy, counts.unplaced_unfilled), (0, 0));
+        assert_eq!(texture_image(&mut r, 22, 80, (32, 8)), image, "its shape's");
+        assert_eq!(*placed.lock(), [true], "found, not made");
+
+        let queue = r.device.new_command_queue().unwrap();
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        let (_, uses) = (r.dec.surface_caches)
+            .before(&r.device, &cb, &reading(BLOCK, 0), &NO_REACH)
+            .unwrap();
+        let mark = r.p.call_log().mark();
+        let own = texture_image(&mut r, 23, 80, (16, 4));
+        let calls = r.p.call_log().since(mark);
+        assert_ne!(own, image);
+        assert_eq!(*placed.lock(), [true, false], "the platform's own");
+        assert!(fills(&calls).is_empty(), "owed, as before");
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.placed, counts.unplaced_busy), (1, 1));
+        assert_eq!(counts.made, 2);
+        (r.dec.surface_caches)
+            .finish(&r.device, 1, None, &cb, uses.unwrap(), || cb.commit(ON))
+            .unwrap();
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let (mut r, made) = shaped_made();
+        texture(&mut r, 21, 80, (32, 8));
+        assert_eq!(made.lock().len(), 1);
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.placed, counts.unplaced_busy), (0, 0), "asked for none");
     }
 
     /// The usage a texture declares picks its shape's kind: one that declares Metal's Unknown

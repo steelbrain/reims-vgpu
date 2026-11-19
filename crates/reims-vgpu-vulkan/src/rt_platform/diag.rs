@@ -1264,6 +1264,22 @@ pub fn write() {
             "reims-vgpu: rt-diag allocation sites, longest call first: {}",
             all.join(", ")
         );
+        // The textures rt cleared at their make, which placed images skip
+        // (`texture::PLACED_IMAGES_CODE`), and the Private memory it holds now.
+        let (private, idle, blocks) = super::device::gauges().map_or((0, 0, 0), |g| {
+            (g.private_allocation_bytes, g.private_idle_bytes, g.blocks)
+        });
+        let _ = writeln!(
+            out,
+            "reims-vgpu: rt-diag memory: {} textures cleared ({} MiB), {} zeroed with no clear; \
+             Private {} MiB allocated, {} MiB idle; {} blocks",
+            m.texture_clears,
+            m.texture_clear_bytes >> 20,
+            m.zeroed_textures,
+            private >> 20,
+            idle >> 20,
+            blocks
+        );
     }
     for (kind, t) in OVERS.lock().iter() {
         let n = |a: &AtomicU64| a.load(Relaxed);

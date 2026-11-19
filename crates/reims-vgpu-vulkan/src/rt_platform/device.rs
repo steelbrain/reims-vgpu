@@ -130,6 +130,11 @@ pub(super) fn metrics() -> Option<rt::Metrics> {
     (COUNTERS.lock().as_ref()).map(|(counters, _)| counters.metrics())
 }
 
+/// rt's gauges of the process's device now (`super::diag`); `None` before it is made.
+pub(super) fn gauges() -> Option<rt::Gauges> {
+    (COUNTERS.lock().as_ref()).map(|(counters, _)| counters.gauges())
+}
+
 /// Counts the rise of each of `now` over `folded`, the over-copies, their bytes, and those of an
 /// imported block, under its code, and keeps `now` as folded.
 fn fold(folded: &mut [u64; 4], now: [u64; 4]) {

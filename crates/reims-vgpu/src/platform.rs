@@ -50,6 +50,12 @@ pub trait ApiPlatform: Platform {
     /// and every surface cached. False by default.
     const SURFACE_SHAPES: bool = false;
 
+    /// Whether the platform places a shape's image in memory of its own whose bytes are as they
+    /// are ([`ApiPlatform::placed_shape_image`]): a graphics device on it asks for one where a new
+    /// shape takes its first fill with its make (`graphics::decode::surface_cache`'s `shapes`,
+    /// "Placed images"). False by default.
+    const PLACED_SHAPE_IMAGES: bool = false;
+
     /// Whether the platform keeps a pinned buffer's or heap's GPU address only inside a block it
     /// knows, and places it at an address of its own elsewhere (metal2vulkan-rt's): a graphics
     /// device on it counts each pin not kept by the kind of object
@@ -113,6 +119,19 @@ pub trait ApiPlatform: Platform {
     /// ([`ApiPlatform::own_texture`]). `None` where the platform refuses it.
     fn shape_image(&self, device: &Self::Device, desc: &TextureDesc) -> Option<Self::Texture> {
         self.own_texture(device, desc)
+    }
+
+    /// A shape's image of `desc` on `device` as [`ApiPlatform::shape_image`] makes one, placed in
+    /// memory whose bytes are as they are, which the caller fills before anything reads them
+    /// (`decode::surface_cache`'s `shapes`, "Placed images"). `None` where the platform places
+    /// none, as by default: the caller then makes the shape's image as before.
+    fn placed_shape_image(
+        &self,
+        device: &Self::Device,
+        desc: &TextureDesc,
+    ) -> Option<Self::Texture> {
+        let _ = (device, desc);
+        None
     }
 
     /// What the platform holds of the guest's RAM while a graphics device made over `map` lives:

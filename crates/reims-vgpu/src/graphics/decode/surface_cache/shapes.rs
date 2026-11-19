@@ -87,6 +87,15 @@
 //! named again) refills every shape from the buffer, and the CPU's bytes win over the GPU's
 //! unwritten-back ones, as they win over the buffer's.
 //!
+//! **Placed images.** A new shape's image is made by the platform, which clears it. Where the
+//! platform places images (`ApiPlatform::PLACED_SHAPE_IMAGES`) and no command buffer begun and
+//! not finished uses the cache and no copy of it waits, its image is placed instead
+//! (`ApiPlatform::placed_shape_image`), in memory whose bytes are as they were, and filled at
+//! its make, before the shape is answered (`super::Caches::placed_shape`). A shape that fill left
+//! owing goes, its image with it, and the shape is made again with the platform's own image:
+//! counted by cause ([`UNPLACED_BUSY`], [`UNPLACED_UNFILLED`]). Nothing reads a placed image's
+//! bytes before the fill wrote them: every use of the cache waits for its last fill.
+//!
 //! **Plane shapes.** A cache of a two-plane surface the host's video writes keeps its planes in
 //! a surface the platform exports (`super::exported`): each plane's whole extent is a plane
 //! shape, its image the surface's plane, made with `PixelFormatView`, so a guest texture over the
@@ -141,6 +150,12 @@ pub(crate) const PLAIN_VIEW_REFUSED: &str = "rt-refused-surface-plain-view-forma
 pub(crate) const ORDER_CASE: &str = "rt-shape-order-case";
 pub(crate) const ORDER_COPIES: &str = "rt-shape-order-copies";
 pub(crate) const ORDER_COPY_BYTES: &str = "rt-shape-order-copy-bytes";
+
+/// The counts' codes of shapes made with the platform's own image where it places them (the
+/// module doc, "Placed images"): their cache was in use, or the fill at their make left them
+/// owing it ([`ShapeCounts::unplaced_busy`], [`ShapeCounts::unplaced_unfilled`]).
+pub(crate) const UNPLACED_BUSY: &str = "rt-shape-unplaced-busy";
+pub(crate) const UNPLACED_UNFILLED: &str = "rt-shape-unplaced-unfilled";
 
 /// The degradation code of an encoder that may have written two shapes of one plane: Metal
 /// would write the plane's one texture memory through both in the order the GPU ran them, which
@@ -380,6 +395,15 @@ pub(crate) struct ShapeCounts {
     pub(crate) plain_views_refused: u64,
     /// Textures over a plain shape that declare `PixelFormatView` usage.
     pub(crate) plain_format_views: u64,
+    /// Shapes whose image the platform placed and their first fill filled at their make, and
+    /// their bytes (the module doc, "Placed images").
+    pub(crate) placed: u64,
+    pub(crate) placed_bytes: u64,
+    /// Shapes made with the platform's own image instead, where the platform places them: a
+    /// command buffer begun and not finished used the cache or a copy of it waited
+    /// ([`UNPLACED_BUSY`]), or the fill at their make left them owing it ([`UNPLACED_UNFILLED`]).
+    pub(crate) unplaced_busy: u64,
+    pub(crate) unplaced_unfilled: u64,
 }
 
 /// One shape's image and its state.

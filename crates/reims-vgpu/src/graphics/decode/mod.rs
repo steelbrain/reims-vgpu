@@ -1804,6 +1804,15 @@ impl<P: Platform> GraphicsDecoder<P> {
             if let Some(line) = surface_cache::planes_line(&sh) {
                 log::info!(target: "reims_vgpu::graphics", "{line}");
             }
+            if sh.placed + sh.unplaced_busy + sh.unplaced_unfilled > 0 {
+                log::info!(
+                    target: "reims_vgpu::graphics",
+                    "IOSurface device caches' shapes placed: {} images in blocks of their own \
+                     ({} MiB), filled at their make; {} made with the platform's own image as \
+                     their cache was in use, {} as their fill left them owing",
+                    sh.placed, sh.placed_bytes >> 20, sh.unplaced_busy, sh.unplaced_unfilled
+                );
+            }
         }
         Some(status)
     }
