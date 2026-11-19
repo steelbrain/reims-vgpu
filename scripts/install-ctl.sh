@@ -51,8 +51,9 @@
 #             changed since that QEMU's build
 #
 # Environment: CARGO_TARGET_DIR, the library's build (default the checkout's
-# target/); XDG_DATA_HOME and XDG_CACHE_HOME move the install and the build
-# from ~/.local/share and ~/.cache.
+# target/); XDG_DATA_HOME and XDG_CACHE_HOME move the install, with reims-ctl's
+# record of it, which reims-ctl update reads, and the build from ~/.local/share
+# and ~/.cache.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

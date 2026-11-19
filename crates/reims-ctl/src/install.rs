@@ -1,8 +1,15 @@
-//! What scripts/install-ctl.sh installed: `install.toml` in the config directory names the
-//! repository it built from, and the QEMU builds live in the data directory's `qemu/<build>`,
-//! each a whole install prefix (QEMU finds its data files relative to its binary), with
-//! `qemu/current` linking the newest. An update installs a new build beside the others and moves
-//! the link, so a running VM's binary is never written.
+//! What scripts/install-ctl.sh installed: the QEMU builds live in the data directory's
+//! `qemu/<build>`, each a whole install prefix (QEMU finds its data files relative to its
+//! binary), with `qemu/current` linking the newest, and `install.toml` beside them names the
+//! repository the install built from, its commit and the QEMU build. An update installs a new
+//! build beside the others and moves the link, so a running VM's binary is never written.
+//!
+//! The record is where the install's files are: an install into another data directory (an
+//! `XDG_DATA_HOME` of its own, as a scratch install has) records itself there, and leaves the
+//! user's record as it was. A reims-ctl before 2026-11-18 kept the record in the config
+//! directory, which such an install overwrote while its QEMU went elsewhere. A record there is
+//! still read where the data directory has none, and an install's record replaces it where it
+//! named a QEMU build of the same data directory ([`Install::save`]).
 //!
 //! `REIMS_CTL_QEMU` names a QEMU binary to use instead (a build tree's, such as `make qemu`'s
 //! `build/qemu/qemu-system-x86_64`); `qemu-img` is taken from beside it.
@@ -47,16 +54,30 @@ fn is_empty(p: &Path) -> bool {
 }
 
 impl Install {
+    /// The data directory's record, else an earlier reims-ctl's in the config directory.
     pub fn load() -> Option<Install> {
-        let text = std::fs::read_to_string(paths::install_file()).ok()?;
+        let text = std::fs::read_to_string(paths::install_file())
+            .or_else(|_| std::fs::read_to_string(paths::config_install_file()))
+            .ok()?;
         toml::from_str(&text).ok()
     }
 
+    /// Writes the record into the data directory, and removes an earlier reims-ctl's record in
+    /// the config directory where that one named a QEMU build of this data directory: the same
+    /// install's, which this replaces. One of another data directory's install stays.
     pub fn save(&self) -> Result<()> {
         let file = paths::install_file();
         std::fs::create_dir_all(file.parent().unwrap())?;
         std::fs::write(&file, toml::to_string_pretty(self)?)
-            .with_context(|| format!("write {}", file.display()))
+            .with_context(|| format!("write {}", file.display()))?;
+        let old = paths::config_install_file();
+        if let Ok(text) = std::fs::read_to_string(&old)
+            && let Ok(i) = toml::from_str::<Install>(&text)
+            && i.qemu.starts_with(paths::qemu_root())
+        {
+            let _ = std::fs::remove_file(&old);
+        }
+        Ok(())
     }
 }
 
@@ -493,6 +514,44 @@ mod tests {
                  since: run this without --skip-qemu to build this checkout's\n"
             )
         );
+    }
+
+    /// The install's record is in the data directory, beside the QEMU builds it names: an
+    /// install into a scratch data directory records itself there, and the user's record stays
+    /// as it was, an earlier reims-ctl's in the config directory too, which the user's own
+    /// reims-ctl still reads; the user's next install moves that one to the data directory.
+    #[test]
+    fn an_install_is_recorded_beside_its_qemu_builds() {
+        let env = crate::testenv::Env::new("install-record");
+        let record = |commit: &str| Install {
+            repo: env.root.join("repo"),
+            commit: commit.into(),
+            qemu: paths::qemu_root().join(format!("20261118-000000-{commit}")),
+            installed_at: String::new(),
+            shell: PathBuf::new(),
+        };
+        let own = env.root.join("data");
+        let old = paths::config_install_file();
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, toml::to_string_pretty(&record("aaaaaaa")).unwrap()).unwrap();
+        let old_text = std::fs::read(&old).unwrap();
+        assert_eq!(Install::load().unwrap().commit, "aaaaaaa");
+
+        let scratch = env.root.join("scratch");
+        env.set("REIMS_CTL_DATA_DIR", &scratch);
+        record("bbbbbbb").save().unwrap();
+        assert!(scratch.join("install.toml").is_file());
+        assert_eq!(Install::load().unwrap().commit, "bbbbbbb");
+        assert_eq!(std::fs::read(&old).unwrap(), old_text);
+
+        env.set("REIMS_CTL_DATA_DIR", &own);
+        assert_eq!(Install::load().unwrap().commit, "aaaaaaa");
+        record("ccccccc").save().unwrap();
+        assert!(!old.exists());
+        assert!(own.join("install.toml").is_file());
+        assert_eq!(Install::load().unwrap().commit, "ccccccc");
+        env.set("REIMS_CTL_DATA_DIR", &scratch);
+        assert_eq!(Install::load().unwrap().commit, "bbbbbbb");
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! Where reims-ctl keeps things, the same on macOS and Linux (the XDG layout), so the paths
 //! carry no spaces and a printed QEMU command reads the same on both:
 //! - `$XDG_CONFIG_HOME/reims-ctl` (`~/.config/reims-ctl`): `vms.toml`, the VMs this user has,
-//!   each by its name and directory, and `install.toml`, what scripts/install-ctl.sh installed;
+//!   each by its name and directory;
 //! - `$XDG_DATA_HOME/reims-ctl` (`~/.local/share/reims-ctl`): `vms/<name>`, the default home of
-//!   a new VM, `qemu/<build>`, the QEMU builds, `qemu/current` naming the newest, and
-//!   `installers`, the macOS installers reims-util downloaded, which VMs use in place;
+//!   a new VM, `qemu/<build>`, the QEMU builds, `qemu/current` naming the newest,
+//!   `install.toml`, what scripts/install-ctl.sh installed there (install.rs), and `installers`,
+//!   the macOS installers reims-util downloaded, which VMs use in place;
 //! - `$XDG_CACHE_HOME/reims-ctl` (`~/.cache/reims-ctl`): builds, scripts/install-ctl.sh's and
 //!   reims-util's (reims_util.rs);
 //! - the runtime directory, for a QMP socket whose path in the VM's directory would be too long
@@ -91,7 +92,13 @@ pub fn registry_file() -> PathBuf {
     config_dir().join("vms.toml")
 }
 
+/// The install's record, beside the QEMU builds it names (install.rs).
 pub fn install_file() -> PathBuf {
+    data_dir().join("install.toml")
+}
+
+/// Where a reims-ctl before 2026-11-18 kept the install's record: the config directory.
+pub fn config_install_file() -> PathBuf {
     config_dir().join("install.toml")
 }
 
