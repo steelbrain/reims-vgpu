@@ -597,10 +597,12 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 		return false;
 	const uint64_t size = roundUp(length, kGranule);
 	keep = std::min(keep, size);
-	// The first source's limits where it says larger (CHUNKED SLABS GROW); the region's slabs keep
-	// theirs.
-	const uint64_t smallMax = first != nullptr ? std::max(kSmallMax, first->smallMax()) : kSmallMax;
-	const uint64_t slabMax = first != nullptr ? std::max(kSlabMax, first->slabMax()) : kSlabMax;
+	// The limits of the source a new slab is asked of first, where it says larger (CHUNKED SLABS
+	// GROW): the first source's where one is set, else the slabs' own source's (the Shared pool's,
+	// where it is the one source); the region's slabs keep theirs.
+	const RgfxSlabSource &leading = first != nullptr ? *first : m_source;
+	const uint64_t smallMax = std::max(kSmallMax, leading.smallMax());
+	const uint64_t slabMax = std::max(kSlabMax, leading.slabMax());
 	const bool dedicated = size > smallMax;
 	const uint64_t unit = m_source.unit();
 	std::vector<std::pair<uint64_t, uint64_t>> zero;
@@ -653,13 +655,24 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 		}
 	}
 	if (in == nullptr) {
-		// A new slab, from the first source at its unit, else the region's; once both refused
-		// one, the process's own room given back and the slab asked again; then, for a small
-		// buffer, region slabs half as large down to the buffer's size.
+		// A new slab, from the first source at its unit, else the slabs' own source's; once both
+		// refused one, the process's own room given back and the slab asked again; then, for a
+		// small buffer, slabs of the own source half as large down to the buffer's size. Where
+		// the own source serves no slab of the class or size (the Shared pool's, where it is the
+		// one source, for a class with no heap or a buffer past its longest block), there is
+		// none: nothing falls back to the region (THE SOURCES).
 		const uint64_t least = roundUp(size, unit);
-		// The region's slab of a class is kSlabMax at most, however large the first source's.
-		uint64_t ask = dedicated ? least : std::max(std::min(want, kSlabMax), least);
+		// The own source's slab of a class is its slabMax() at most (the region's kSlabMax),
+		// however large the first source's.
+		uint64_t ask = dedicated ? least : std::max(std::min(want, m_source.slabMax()), least);
 		bool refused = false;
+		auto fromOwn = [&]() -> Slab * {
+			if (!m_source.serves(options, ask, dedicated)) {
+				refused = true; // no smaller slab is served either
+				return nullptr;
+			}
+			return makeSlab(m_source, ask, options, dedicated, &refused);
+		};
 		auto fromEither = [&]() -> Slab * {
 			const uint64_t firstSize =
 			    first != nullptr ? roundUp(dedicated ? size : want, first->unit()) : 0;
@@ -669,7 +682,7 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 				if (slab != nullptr)
 					return slab;
 			}
-			return makeSlab(m_source, ask, options, dedicated, &refused);
+			return fromOwn();
 		};
 		Slab *made = fromEither();
 		if (made == nullptr && !refused) {
@@ -681,7 +694,7 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 		while (made == nullptr && !refused && !dedicated && ask > least) {
 			ask = std::max(roundUp(ask / 2, unit), least);
 			halved = true;
-			made = makeSlab(m_source, ask, options, dedicated, &refused);
+			made = fromOwn();
 		}
 		if (made == nullptr)
 			return false; // the source has no room for it

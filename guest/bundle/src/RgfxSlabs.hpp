@@ -38,8 +38,9 @@
  * the buffer that makes one. A larger buffer takes a slab of its own (dedicated), its length
  * rounded up to the source's unit; once freed, that slab is cached for a later buffer of the same
  * class that needs at least half of it, oldest let go first past a sixteenth of the source's
- * capacity, and let go after kCacheIdleMs unused. A first source may say larger limits of its
- * own (smallMax, slabMax), which hold for its slabs; the region's slabs keep these.
+ * capacity, and let go after kCacheIdleMs unused. A first source, or the own source where no
+ * first is set, may say larger limits of its own (smallMax, slabMax), which hold for its slabs;
+ * the region's slabs keep these.
  *
  * CHUNKED SLABS GROW. Where the kext gives chunks, a class's slabs of the process's own pages
  * grow past 2 MiB, doubling, to kChunkedSlabMax (16 MiB), each one heap over its block, and a
@@ -75,19 +76,23 @@
  * every kChurnLogMs, once they changed), so a run tells how many takes and give-backs a source
  * would serve without the empty and cached slabs kept.
  *
- * THE SOURCES. A new slab comes from the first source where one is set (setFirst), at its unit,
- * and from the region's source only where the first has no memory for it; a slab keeps the source
- * it came from, which makes its buffers and takes it back, and its cache's cap is a sixteenth of
- * that source's capacity. The first source is the Shared pool's (RgfxPoolSlabSource) where the
- * device has one and the kext maps its blocks, else the process's own pages
- * (RgfxPagesSlabSource) where the kext makes pages blocks.
+ * THE SOURCES. The slabs have one source of their own (the constructor's), and may have a first
+ * source (setFirst). A new slab comes from the first source where one is set, at its unit, and
+ * from the own source only where the first serves none of the class or size, or has no memory
+ * for it; a slab keeps the source it came from, which makes its buffers and takes it back, and
+ * its cache's cap is a sixteenth of that source's capacity. Where the device has a Shared pool,
+ * the kext maps its blocks and Managed buffers lie over copies, the pool's source
+ * (RgfxPoolSlabSource) is the own source, with no first and no region behind it: a buffer of a
+ * class it has no heap for, or past its longest block, or one it has no block for, is nil, as
+ * Metal's newBuffer is where the memory runs out. Else the own source is the region's, and the
+ * process's own pages (RgfxPagesSlabSource) are the first where the kext makes pages blocks.
  *
  * THE FALLBACKS, in order, where a buffer finds no room in its class's slabs: a new slab; then,
  * once the sources had no memory for one, the process's own empty and cached slabs let go, the
  * slabs other threads (the background's among them) were giving back at that moment waited for,
- * and a new slab asked again; then, for a small buffer, region slabs half as large down to the
- * buffer's own rounded size. Only where no source has memory even for that is the answer nil: the
- * region is full. A slab being given back is out of the slabs' books and not yet back in its
+ * and a new slab asked again; then, for a small buffer, slabs of the own source half as large
+ * down to the buffer's own rounded size. Only where no source has memory even for that is the
+ * answer nil: the region, or the pool, is full. A slab being given back is out of the slabs' books and not yet back in its
  * source's, for as long as its block's release takes, a host round trip: without the wait, one
  * thread's let-go of a batch of slabs makes another's create nil while the memory is on its way
  * back (measured on the M3 Max: test_slab_thread's 3 MiB takes refused in 8 of 1,000 runs under
@@ -155,11 +160,13 @@ public:
 
 	/// Whether this source makes a slab of `size` bytes (a multiple of unit()) for buffers of
 	/// `options`, one buffer's own where `dedicated`, else its class's: a first source that does
-	/// not leaves it to the region's (RgfxSlabs::setFirst).
+	/// not leaves it to the slabs' own source (RgfxSlabs::setFirst), and an own source that does
+	/// not leaves the buffer nil.
 	virtual bool serves(uint32_t options, uint64_t size, bool dedicated) const { return true; }
 
 	/// The largest buffer that shares a slab of its class from this source, where it is the
-	/// first (a larger one takes a slab of its own), and the largest slab of a class it makes.
+	/// first, or the own source with no first (a larger one takes a slab of its own), and the
+	/// largest slab of a class it makes.
 	virtual uint64_t smallMax() const { return kSmallMax; }
 	virtual uint64_t slabMax() const { return kSlabMax; }
 
@@ -371,9 +378,10 @@ struct RgfxPoolMemory {
 /// Shared heap over its block (HEAP_OVER_POOL), its buffers placed there as in a region slab's
 /// heap (BUFFER_AT_OFFSET, BUFFER_MANAGED_AT_OFFSET), a large buffer's own slab included; a
 /// Managed buffer lies over a Shared copy (MANAGED OVER A COPY) where the device makes one, else
-/// in a heap where its CPU copy is placed (BUFFER_MANAGED_AT_OFFSET), else its class is the
-/// region's. A class's slabs grow to kSlabMax and hold buffers of up to kSmallMax, as the kext's
-/// chunks do.
+/// in a heap where its CPU copy is placed (BUFFER_MANAGED_AT_OFFSET), else the source serves no
+/// slab of its class. A class's slabs grow to kSlabMax and hold buffers of up to kSmallMax, as the
+/// kext's chunks do. The device makes it the slabs' one source where Managed buffers lie over
+/// copies (THE SOURCES): a buffer it has no block for is nil.
 ///
 /// The allocator keeps none of these slabs once empty (keepsFreed): a slab goes with its last
 /// buffer, its heap's destroy and then its block's give, and a later buffer takes a new block.
@@ -426,7 +434,7 @@ public:
 	/// The largest buffer that shares a slab of its class, and the largest such slab.
 	static constexpr uint64_t kSmallMax = 4ull << 20;
 	static constexpr uint64_t kSlabMax = 16ull << 20;
-	/// The longest block: the wire's RGFX_POOL_TAKE_MAX. A larger buffer is the region's.
+	/// The longest block: the wire's RGFX_POOL_TAKE_MAX. The source serves no larger buffer.
 	static constexpr uint64_t kTakeMax = 1ull << 32;
 
 private:
@@ -485,11 +493,12 @@ public:
 	/// where they changed since the last call.
 	typedef void (*ChurnLog)(void *context, const Churn &churn);
 
-	/// Slabs of `source`: the region's, which RgfxRegion::setReclaim asks to give room back.
+	/// Slabs of `source`, their own (THE SOURCES): the region's, or the Shared pool's.
+	/// RgfxRegion::setReclaim asks them to give room back.
 	explicit RgfxSlabs(RgfxSlabSource &source);
 
-	/// A source asked before the region's for every new slab (THE SOURCES), or null for none. Set
-	/// before any take.
+	/// A source asked before the own source for every new slab (THE SOURCES), or null for none.
+	/// Set before any take.
 	void setFirst(RgfxSlabSource *first);
 
 	/// Stops the background thread. Gives nothing back: the slabs' memory and heaps go with the
@@ -553,8 +562,8 @@ public:
 	/// A buffer's page: what its range is a multiple of, and its offset in its slab.
 	static constexpr uint64_t kGranule = 0x1000;
 	/// The largest buffer a class's slabs hold, a larger one taking a slab of its own, and a
-	/// class's largest slab, unless the first source says otherwise (RgfxSlabSource::smallMax,
-	/// slabMax); and its first slab.
+	/// class's largest slab, unless the first source, or the own source with no first, says
+	/// larger (RgfxSlabSource::smallMax, slabMax); and its first slab.
 	static constexpr uint64_t kSmallMax = RgfxSlabSource::kSmallMax;
 	static constexpr uint64_t kSlabMax = RgfxSlabSource::kSlabMax;
 	static constexpr uint64_t kSlabFirst = 128ull << 10;

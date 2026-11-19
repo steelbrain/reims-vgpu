@@ -4707,19 +4707,21 @@ the host's import, and the kext's block table holds one entry per slab:
   holds only the slabs its buffers lie in. A slab let go destroys its heap,
   then frees its block on the background thread, so no buffer's free waits
   for a `BLOCK_RELEASE`.
-- Where the device has a Shared pool and the kext maps its blocks (`POOL`,
-  the kext's `Pool`; "The Shared pool", below), the pool is every heaped
-  slab's source, ahead of the region and in place of the process's own pages
-  below: each slab is one block of the pool, made one Shared Placement
-  `HEAP_OVER_POOL`, its buffers placed in it as in a region slab's heap. A
-  class's slabs grow to 16 MiB and hold buffers of up to 4 MiB, as chunked
-  slabs do, and a larger buffer takes a block of its own of its length
-  rounded up to 64 KiB, with its heap, up to 4 GiB. No slab of the pool is
-  kept once empty, a class's or a large buffer's: it goes with its last
-  buffer, its heap's destroy and then its block's give. A take the kext
-  refuses, a buffer past 4 GiB and a class with no heap (a Managed class
-  without `MANAGED_AT_OFFSET` or `MANAGED_BUFFER_SLABS`) take the region's
-  slabs.
+- Where the device has a Shared pool, the kext maps its blocks (`POOL`, the
+  kext's `Pool`; "The Shared pool", below) and Managed buffers lie over
+  Shared copies (`MANAGED_BUFFER_SLABS`, which every host that offers the
+  pool offers), the pool is every slab's one source, in place of the region
+  and of the process's own pages below: each slab is one block of the pool,
+  made one Shared Placement `HEAP_OVER_POOL`, its buffers placed in it as in
+  a region slab's heap. A class's slabs grow to 16 MiB and hold buffers of up
+  to 4 MiB, as chunked slabs do, and a larger buffer takes a block of its own
+  of its length rounded up to 64 KiB, with its heap, up to 4 GiB. No slab of
+  the pool is kept once empty, a class's or a large buffer's: it goes with
+  its last buffer, its heap's destroy and then its block's give. No slab
+  falls back to the region: where the kext refuses a take (the pool full, or
+  no GPU address left) for the slab and for slabs half as large down to the
+  buffer's size, the buffer is nil, as Metal's `newBufferWithLength:` is
+  where memory runs out, and so is one past 4 GiB.
 - Where the host maps a process's own pages (`PAGES_BUFFERS`, and the kext's
   `PagesBlock`) and makes heaps over them (`HEAP_OVER_PAGES`), a heaped slab
   of 2 MiB is the process's own memory instead: the kext's chunks where it
@@ -4797,8 +4799,8 @@ the host's import, and the kext's block table holds one entry per slab:
   pages are what every slab took once superpages ran out, minutes after a
   boot.
 - Where no source has memory for a new slab, the process's own empty and
-  cached slabs go first, then smaller region slabs are tried down to the
-  buffer's size; nil only past that. Any other block of the process's the
+  cached slabs go first, then smaller slabs of the same source (the region's,
+  or the pool's) are tried down to the buffer's size; nil only past that. Any other block of the process's the
   kext has no room for (a texture's CPU copy, a heap, an upload chunk, an
   IOSurface's block) is asked again once those slabs went
   (`RgfxRegion::setReclaim`).

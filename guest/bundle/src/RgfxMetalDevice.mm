@@ -1240,14 +1240,16 @@ RGFX_LOG_UNRECOGNIZED
 	_slabSource = std::make_unique<RgfxRegionSlabSource>(*_region, *_serializer, managedAtOffset,
 	                                                     managedOverCopy);
 	_slabSource->setZeroedBlocks((_caps.kextFeatures() & kRgfxKextFeatureZeroedBlocks) != 0);
-	_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
-	// The slabs whose buffers lie in heaps, and large Shared buffers, are blocks of the Shared
-	// pool, where the device has one and the kext maps its blocks; else the kext's chunks, or the
-	// process's own plain pages, wired into pages blocks the host makes heaps or buffers over,
-	// where the region has a pages block source (above) and the device took HEAP_OVER_PAGES; else
-	// the region's.
+	// Every slab is a block of the Shared pool, where the device has one, the kext maps its
+	// blocks and Managed buffers lie over Shared copies (MANAGED_BUFFER_SLABS, which every host
+	// that offers the pool offers): the pool is the slabs' one source, with no region behind it,
+	// so a buffer the pool has no block for is nil (RgfxSlabs.hpp, THE SOURCES). Else the slabs
+	// whose buffers lie in heaps, and large Shared buffers, are the kext's chunks, or the process's
+	// own plain pages, wired into pages blocks the host makes heaps or buffers over, where the
+	// region has a pages block source (above) and the device took HEAP_OVER_PAGES, ahead of the
+	// region's; else the region's.
 	if ((_caps.kextFeatures() & kRgfxKextFeaturePool) != 0 &&
-	    (_caps.features() & RGFX_FEATURE_POOL) != 0) {
+	    (_caps.features() & RGFX_FEATURE_POOL) != 0 && managedOverCopy) {
 		// Its blocks' heaps lie at the GPU addresses the host gives them, where the device and
 		// the kext both took POOL_ADDRESSES; else at the process's picks.
 		const bool addressed = (_caps.kextFeatures() & kRgfxKextFeaturePoolAddresses) != 0 &&
@@ -1258,7 +1260,7 @@ RGFX_LOG_UNRECOGNIZED
 		memory.give = &rgfxKextPoolGive;
 		_poolSource = std::make_unique<RgfxPoolSlabSource>(*_region, *_serializer, memory,
 		                                                   managedAtOffset, managedOverCopy);
-		_slabs->setFirst(_poolSource.get());
+		_slabs = std::make_unique<RgfxSlabs>(*_poolSource);
 	} else if (_region->hasPagesBlocks() &&
 	           (_caps.features() & RGFX_FEATURE_HEAP_OVER_PAGES) != 0) {
 		RgfxPagesMemory memory;
@@ -1267,7 +1269,10 @@ RGFX_LOG_UNRECOGNIZED
 		_pagesSource = std::make_unique<RgfxPagesSlabSource>(
 		    *_region, *_serializer, memory, [NSProcessInfo processInfo].physicalMemory,
 		    managedAtOffset, managedOverCopy);
+		_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
 		_slabs->setFirst(_pagesSource.get());
+	} else {
+		_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
 	}
 	_slabs->setChurnLog(&rgfxLogSlabChurn, _poolSource.get());
 	if (!_slabs->start())

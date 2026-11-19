@@ -1642,13 +1642,16 @@ struct PoolKext {
 	}
 };
 
-// The device's Shared pool as the first source: a heaped class's slab is a block of the pool the
-// kext maps, zero as the host gives it, made one HEAP_OVER_POOL whose region_offset is the block's
-// offset in the pool, its buffers placed in it (BUFFER_AT_OFFSET, and BUFFER_MANAGED_AT_OFFSET
-// where the device took MANAGED_AT_OFFSET). A class holds buffers of up to 4 MiB in slabs of up to
-// 16 MiB, and a larger buffer has a block and a heap of its own. A Managed buffer without
-// MANAGED_AT_OFFSET, and a buffer the kext takes no block for, are the region's. No slab of the
-// pool is kept once empty: its heap's destroy is posted, then its block given back.
+// The device's Shared pool as the slabs' one source: a heaped class's slab is a block of the pool
+// the kext maps, zero as the host gives it, made one HEAP_OVER_POOL whose region_offset is the
+// block's offset in the pool, its buffers placed in it (BUFFER_AT_OFFSET, and
+// BUFFER_MANAGED_AT_OFFSET where the device took MANAGED_AT_OFFSET, or a Managed buffer over a
+// Shared copy where it took MANAGED_BUFFER_SLABS). A class holds buffers of up to 4 MiB in slabs
+// of up to 16 MiB, and a larger buffer has a block and a heap of its own. No region is behind the
+// pool: a Managed class with no heap, a buffer past the longest block and a buffer the kext takes
+// no block for, after slabs half as large down to its size, are nil, and the region gives no
+// block. No slab of the pool is kept once empty: its heap's destroy is posted, then its block
+// given back.
 void test_pool_slab_source()
 {
 	using Pool = RgfxPoolSlabSource;
@@ -1667,7 +1670,6 @@ void test_pool_slab_source()
 	calls.context = &kext;
 	calls.take = &PoolKext::take;
 	calls.give = &PoolKext::give;
-	RgfxRegionSlabSource regionSource(region, ser);
 	Pool pool(region, ser, calls);
 	CHECK(pool.unit() == 64 * 1024 && pool.smallMax() == 4 * kMiB && pool.slabMax() == 16 * kMiB);
 	CHECK(!pool.keepsFreed() && pool.heaped(kShared) && !pool.heaped(kManaged));
@@ -1678,8 +1680,7 @@ void test_pool_slab_source()
 	CHECK(!pool.serves(kShared, Pool::kTakeMax + Pool::kUnit, true));
 	CHECK(!pool.serves(kManaged, Pool::kUnit, false) && !pool.serves(kManaged, 8 * kMiB, true));
 	CHECK(pool.heapedSlab(32 * kMiB, kShared, true));
-	RgfxSlabs slabs(regionSource);
-	slabs.setFirst(&pool);
+	RgfxSlabs slabs(pool);
 	RgfxMsgHeader h = {};
 	std::vector<uint8_t> bytes;
 	auto drain = [&] {
@@ -1697,7 +1698,7 @@ void test_pool_slab_source()
 	kext.fill = 0;
 	CHECK(log == std::vector<std::string>({"take 131072"}) && kext.blocks.size() == 1);
 	CHECK(a.contents == kext.blocks.at(Pool::kUnit).data() && allBytes(a.contents, a.size, 0xee));
-	CHECK(slabs.stats().dirtyBytes == 0 && slabs.stats().firstSlabs == 1);
+	CHECK(slabs.stats().dirtyBytes == 0 && slabs.stats().slabs == 1);
 	auto heap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_POOL);
 	CHECK(heap.region_offset == Pool::kUnit && heap.size_bytes == 128 * 1024);
 	CHECK(heap.options == kShared && heap.heap_type == 1 && heap.gpu_address != 0);
@@ -1725,23 +1726,27 @@ void test_pool_slab_source()
 	CHECK(dat.heap_obj_id == dheap.obj_id && dat.offset == 0 && dat.length == 5 * kMiB + 0x1000);
 	CHECK(made.gpuAddress == dheap.gpu_address && !made.ownsAddress);
 
-	// Managed, with no MANAGED_AT_OFFSET: the region's slab, nothing taken.
+	drain();
+
+	// Managed, with no MANAGED_AT_OFFSET: a class the pool has no heap for, so nil, nothing taken
+	// and nothing sent.
 	const size_t asked = log.size();
 	RgfxSlabs::Range m;
-	CHECK(slabs.take(0x1000, kManaged, 0, &m) && slabs.makeBuffer(m, 0x1000, kManaged, &made));
-	CHECK(log.size() == asked);
-	CHECK(expectMessage<RgfxBufferOverHostMemory>(ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY).length ==
-	      0x1000);
-	// A take the kext refuses: the region's heaped slab.
+	CHECK(!slabs.take(0x1000, kManaged, 0, &m) && log.size() == asked && !ring.next(&h, &bytes));
+	// A buffer past the longest block: nil, nothing taken.
+	CHECK(!slabs.take(Pool::kTakeMax + 1, kShared, 0, &m) && log.size() == asked);
+	CHECK(!ring.next(&h, &bytes));
+	// A take the kext refuses: asked again once the process's slabs went, then half as large down
+	// to the buffer's size, and nil, with no slab of the region's.
 	RgfxSlabs::Range f;
 	kext.refuse = true;
-	CHECK(slabs.take(0x1000, kSharedUntracked, 0, &f) && endsWith(log, {"take 131072 refused"}));
+	CHECK(!slabs.take(0x1000, kSharedUntracked, 0, &f));
+	CHECK(endsWith(log, {"take 131072 refused", "take 131072 refused", "take 65536 refused"}));
 	kext.refuse = false;
-	auto fheap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
-	CHECK(fheap.region_offset >= RGFX_ALLOCATIONS_OFFSET && fheap.size_bytes == 128 * 1024);
-	CHECK(slabs.stats().slabs == 5 && slabs.stats().firstSlabs == 3);
+	CHECK(!ring.next(&h, &bytes) && regionKext.blocks.empty());
+	CHECK(slabs.stats().slabs == 3);
 	Pool::Takes t = pool.takes();
-	CHECK(t.taken == 3 && t.takenBytes == 131072 + 8388608 + 5308416 && t.refused == 1);
+	CHECK(t.taken == 3 && t.takenBytes == 131072 + 8388608 + 5308416 && t.refused == 3);
 	CHECK(t.given == 0 && t.longestUs <= t.waitUs && t.addressed == 0);
 
 	// Each slab of the pool goes with its last buffer, its heap destroyed before its block is
@@ -1758,7 +1763,7 @@ void test_pool_slab_source()
 	CHECK(log.size() == 4);
 	slabs.give(b);
 	CHECK(endsWith(log, {"destroy " + std::to_string(heap.obj_id), "give 131072"}));
-	CHECK(log.size() == 6 && kext.blocks.empty() && slabs.stats().firstSlabs == 0);
+	CHECK(log.size() == 6 && kext.blocks.empty() && slabs.stats().slabs == 0);
 	CHECK(slabs.churn().emptyLetGo == 2 && slabs.churn().refilled == 0);
 	CHECK(pool.takes().given == 3 && pool.takes().taken == 3);
 	// A later buffer of the class takes a block again.
@@ -1768,20 +1773,36 @@ void test_pool_slab_source()
 	drain();
 	slabs.give(again);
 	CHECK(log.size() == 9 && endsWith(log, {"give " + log[6].substr(5)}) && kext.blocks.empty());
-	slabs.give(m);
-	slabs.give(f);
 	drain();
-	CHECK(slabs.reclaim() && slabs.stats().slabs == 0 && regionKext.blocks.empty());
-	CHECK(pool.takes().taken == 4 && pool.takes().given == 4 && pool.takes().refused == 1);
-	drain();
+	CHECK(slabs.stats().slabs == 0 && regionKext.blocks.empty());
+	CHECK(pool.takes().taken == 4 && pool.takes().given == 4 && pool.takes().refused == 3);
+
+	// A pool with room for a block of 64 KiB alone: the class's slab of 128 KiB is refused, and
+	// one half as large, the buffer's size, taken.
+	{
+		PoolKext tight(2 * Pool::kUnit, &log, &ring);
+		RgfxPoolMemory tightCalls = calls;
+		tightCalls.context = &tight;
+		Pool small(region, ser, tightCalls);
+		RgfxSlabs halved(small);
+		log.clear();
+		RgfxSlabs::Range e;
+		CHECK(halved.take(0x1000, kShared, 0, &e) && e.offset == 0);
+		CHECK(log == std::vector<std::string>(
+		                 {"take 131072 refused", "take 131072 refused", "take 65536"}));
+		auto eheap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_POOL);
+		CHECK(eheap.region_offset == Pool::kUnit && eheap.size_bytes == Pool::kUnit);
+		halved.give(e);
+		CHECK(endsWith(log, {"destroy " + std::to_string(eheap.obj_id), "give 65536"}));
+		CHECK(tight.blocks.empty() && regionKext.blocks.empty());
+		drain();
+	}
 
 	// With MANAGED_AT_OFFSET, a Managed class's slab is a block of the pool too, its buffers' CPU
 	// copies placed in its Shared heap.
 	Pool managed(region, ser, calls, true);
 	CHECK(managed.heaped(kManaged) && managed.serves(kManaged, Pool::kUnit, false));
-	RgfxRegionSlabSource managedRegion(region, ser, true);
-	RgfxSlabs both(managedRegion);
-	both.setFirst(&managed);
+	RgfxSlabs both(managed);
 	log.clear();
 	RgfxSlabs::Range g;
 	CHECK(both.take(0x1000, kManaged, 0, &g) && log == std::vector<std::string>({"take 131072"}));
@@ -1796,6 +1817,30 @@ void test_pool_slab_source()
 	both.give(g);
 	CHECK(endsWith(log, {"destroy " + std::to_string(mheap.obj_id), "give 131072"}));
 	CHECK(kext.blocks.empty() && managed.takes().given == 1);
+	drain();
+
+	// With MANAGED_BUFFER_SLABS, as the device takes the pool, a Managed buffer lies over a Shared
+	// copy in its Shared class's block.
+	Pool copies(region, ser, calls, false, true);
+	RgfxSlabs over(copies);
+	log.clear();
+	RgfxSlabs::Range o;
+	CHECK(over.take(0x1000, kManaged, 0, &o) && log == std::vector<std::string>({"take 131072"}));
+	auto oheap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_POOL);
+	CHECK(oheap.options == kShared && oheap.size_bytes == 128 * 1024);
+	CHECK(over.makeBuffer(o, 0x800, kManaged, &made));
+	auto copy = expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET);
+	CHECK(copy.heap_obj_id == oheap.obj_id && copy.offset == 0 && copy.options == kShared);
+	auto overWhole =
+	    expectMessage<RgfxManagedBufferCreateWhole>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+	CHECK(overWhole.create.cpu_buffer_obj_id == copy.obj_id && overWhole.create.length == 0x800);
+	CHECK(made.objId == overWhole.create.obj_id && made.ownsAddress);
+	drain();
+	over.give(o);
+	// The Managed buffer's own destroy is its RgfxBuffer's: the slabs post its copy's.
+	CHECK(endsWith(log, {"destroy " + std::to_string(copy.obj_id),
+	                     "destroy " + std::to_string(oheap.obj_id), "give 131072"}));
+	CHECK(kext.blocks.empty() && copies.takes().given == 1 && regionKext.blocks.empty());
 	drain();
 }
 
@@ -1822,10 +1867,8 @@ void test_pool_slab_source_at_host_addresses()
 	calls.context = &kext;
 	calls.take = &PoolKext::take;
 	calls.give = &PoolKext::give;
-	RgfxRegionSlabSource regionSource(region, ser);
 	Pool pool(region, ser, calls);
-	RgfxSlabs slabs(regionSource);
-	slabs.setFirst(&pool);
+	RgfxSlabs slabs(pool);
 	RgfxMsgHeader h = {};
 	std::vector<uint8_t> bytes;
 	auto drain = [&] {
