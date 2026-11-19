@@ -206,7 +206,7 @@ impl Platform for RtPlatform {
     type Clock = OsClock;
 
     fn new_render_pass_descriptor(&self) -> RtObj<PassFields> {
-        RtObj::new(PassFields)
+        RtObj::new(PassFields::default())
     }
 
     fn new_shared_event_listener(&self) -> RtObj<Listener> {
@@ -214,7 +214,7 @@ impl Platform for RtPlatform {
     }
 
     fn render_pass_descriptor(&self) -> RtObj<PassFields> {
-        RtObj::new(PassFields)
+        RtObj::new(PassFields::default())
     }
 
     fn texture_2d_descriptor(
