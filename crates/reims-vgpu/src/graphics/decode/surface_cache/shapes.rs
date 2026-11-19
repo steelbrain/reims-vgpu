@@ -101,7 +101,10 @@
 //! images: 397 new shapes were placed (1164 MiB), none fell back; rt cleared 1408 textures
 //! (652 MiB) where it had cleared 1993 (1721 MiB), 1069 MiB less; and rt's takes of blocks rose
 //! from 45 calls (3.64 GiB) to 76 (4.39 GiB), 31 more and 0.75 GiB more taken, the longest call
-//! 45.7 ms where it had been 27.5 ms (rt's allocation, `rt-diag allocation sites`).
+//! 45.7 ms where it had been 27.5 ms (rt's allocation, `rt-diag allocation sites`). The trade
+//! is taken: a clear is the GPU's work on every new shape's image, before the guest's own, and
+//! placing does 1069 MiB less of it; the longer takes are rt's allocation of its blocks, which
+//! keeping blocks ahead of their takes is rt's to shorten.
 //!
 //! **Plane shapes.** A cache of a two-plane surface the host's video writes keeps its planes in
 //! a surface the platform exports (`super::exported`): each plane's whole extent is a plane
