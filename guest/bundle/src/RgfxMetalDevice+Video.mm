@@ -281,7 +281,11 @@ id<MTLTexture> planeTexture(RgfxMetalDevice *device, IOSurfaceRef surface, size_
 	                                                                                width:w
 	                                                                               height:h
 	                                                                            mipmapped:NO];
-	desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+	// Read alone: the host's decode writes the plane's bytes in the surface's device cache or its
+	// pages, not a shader, and the decode op names the texture written whatever its usage
+	// (rgfxEncodeVideoSession). A usage with ShaderWrite would have the device take the plane as
+	// written wherever a shader with no interface at hand binds it.
+	desc.usage = MTLTextureUsageShaderRead;
 	auto make = [&]() -> id<MTLTexture> {
 		if (width == 0)
 			return [device newTextureWithDescriptor:desc iosurface:surface plane:plane];
