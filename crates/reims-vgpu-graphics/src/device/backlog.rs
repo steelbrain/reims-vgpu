@@ -81,7 +81,9 @@ pub(super) fn whose(r#type: u32, field: Option<u64>) -> Whose {
             RGFX_CMD_CONTEXT_CLOSE..=RGFX_CMD_SURFACE_PAGES
             | RGFX_CMD_RESOURCE_ID_SMALL_CHUNK
             | RGFX_CMD_POOL_TAKE
-            | RGFX_CMD_POOL_GIVE,
+            | RGFX_CMD_POOL_GIVE
+            | RGFX_CMD_PRIVATE_TAKE
+            | RGFX_CMD_PRIVATE_GIVE,
             Some(field),
         ) => Whose::Context(field as u32),
         _ => Whose::Every,
@@ -244,6 +246,8 @@ mod tests {
             RGFX_CMD_RESOURCE_ID_SMALL_CHUNK,
             RGFX_CMD_POOL_TAKE,
             RGFX_CMD_POOL_GIVE,
+            RGFX_CMD_PRIVATE_TAKE,
+            RGFX_CMD_PRIVATE_GIVE,
         ] {
             assert_eq!(whose(r#type, field), Whose::Context(9));
         }
@@ -260,7 +264,7 @@ mod tests {
         }
         assert_eq!(whose(RGFX_CMD_BUFFER_CREATE, None), Whose::Every);
         assert_eq!(whose(RGFX_CMD_SET_DISPLAY_POWER + 1, obj(5)), Whose::Every);
-        assert_eq!(whose(RGFX_CMD_POOL_GIVE + 1, obj(5)), Whose::Every);
+        assert_eq!(whose(RGFX_CMD_PRIVATE_GIVE + 1, obj(5)), Whose::Every);
         assert_eq!(whose(RGFX_CMD_COMMAND_BUFFER, obj(5)), Whose::Every);
     }
 }

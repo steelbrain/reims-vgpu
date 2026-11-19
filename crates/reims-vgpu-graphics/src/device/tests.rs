@@ -5548,3 +5548,180 @@ fn pool_messages_go_to_the_decoder_where_the_driver_did_not_take_the_pool() {
         [(RGFX_CMD_POOL_TAKE, 0, 0), (RGFX_CMD_POOL_GIVE, 0, 0)]
     );
 }
+
+/// A host that gives Private blocks, which records the takes and gives it is handed, `(type,
+/// context, length or address)`, and the messages its decoder is: it answers each take with a
+/// block at [`PRIVATE_GPU_ADDRESS`] plus its length, its length the take's rounded up to 64 KiB,
+/// and each give OK.
+#[derive(Clone, Default)]
+struct PrivateHost {
+    seen: Arc<Mutex<Vec<(u32, u32, u64)>>>,
+}
+
+/// Where [`PrivateHost`]'s blocks lie: a block of `n` bytes at this plus `n`.
+const PRIVATE_GPU_ADDRESS: u64 = 1 << 44;
+
+impl Host for PrivateHost {
+    fn raise_interrupt(&self, _vector: u32) {}
+    fn features(&self) -> u64 {
+        RGFX_FEATURE_PRIVATE_BLOCKS
+    }
+    fn private_take(&self, take: &RgfxPrivateTake, answer: PrivateAnswer) {
+        (self.seen.lock()).push((RGFX_CMD_PRIVATE_TAKE, take.context, take.length));
+        let length = take.length.next_multiple_of(RGFX_PRIVATE_BLOCK_ALIGN);
+        answer.answer(RGFX_STATUS_OK, PRIVATE_GPU_ADDRESS + length, length);
+    }
+    fn private_give(&self, give: &RgfxPrivateGive, answer: CompleteAnswer) {
+        (self.seen.lock()).push((RGFX_CMD_PRIVATE_GIVE, give.context, give.gpu_address));
+        answer.answer(RGFX_STATUS_OK);
+    }
+    fn stage3_message(&self, _completion: &CompletionPoster, message: &[u8]) {
+        let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
+        self.seen.lock().push((header.r#type, 0, 0));
+    }
+}
+
+/// A `PRIVATE_TAKE` of `length` bytes for `context`.
+fn private_take(context: u32, length: u64) -> Vec<u8> {
+    RgfxPrivateTake {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_PRIVATE_TAKE,
+            size: size_of::<RgfxPrivateTake>() as u32,
+            seqno: 0,
+        },
+        context,
+        reserved_14: 0,
+        length,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A `PRIVATE_GIVE` of `context`'s block of `length` bytes at `gpu_address`.
+fn private_give(context: u32, gpu_address: u64, length: u64) -> Vec<u8> {
+    RgfxPrivateGive {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_PRIVATE_GIVE,
+            size: size_of::<RgfxPrivateGive>() as u32,
+            seqno: 0,
+        },
+        context,
+        reserved_14: 0,
+        gpu_address,
+        length,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A `PRIVATE_TAKE`'s `PRIVATE_BLOCK` on `rig`: its status, GPU address and length.
+fn private_block(rig: &mut Rig, bytes: Vec<u8>) -> (u32, u64, u64) {
+    let seqno = rig.send(bytes);
+    let event = rig.event().expect("a PRIVATE_BLOCK");
+    let block = RgfxPrivateBlock::read_from_bytes(&event).unwrap();
+    assert_eq!(
+        (block.header.r#type, block.header.size, block.header.seqno),
+        (RGFX_EVT_PRIVATE_BLOCK, 40, seqno)
+    );
+    (block.status, block.gpu_address, block.length)
+}
+
+/// Where the driver took `PRIVATE_BLOCKS`, a `PRIVATE_TAKE` goes to the host, which answers it
+/// with a `PRIVATE_BLOCK` of its seqno, and a `PRIVATE_GIVE` goes to the host, which answers it
+/// with a `COMPLETE`; a take too short to read is answered `INVALID_ARGUMENT` by the device, and
+/// a give too short to read is too.
+#[test]
+fn a_private_take_and_give_go_to_the_host_where_the_driver_took_private_blocks() {
+    let host = PrivateHost::default();
+    let mut rig = Rig::with_host(Box::new(host.clone()));
+    assert_eq!(
+        rig.device.mmio_read(RGFX_REG_FEATURES_HI.into()) as u64,
+        RGFX_FEATURE_PRIVATE_BLOCKS >> 32
+    );
+    rig.device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_HI.into(),
+        (RGFX_FEATURE_PRIVATE_BLOCKS >> 32) as u32,
+    );
+    rig.start();
+    assert_eq!(
+        private_block(&mut rig, private_take(5, 0x2_8000)),
+        (RGFX_STATUS_OK, PRIVATE_GPU_ADDRESS + 0x3_0000, 0x3_0000)
+    );
+    let seqno = rig.send(private_give(5, PRIVATE_GPU_ADDRESS + 0x3_0000, 0x3_0000));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    let mut short = private_take(6, 0x1_0000);
+    short.truncate(24);
+    assert_eq!(
+        private_block(&mut rig, short),
+        (RGFX_STATUS_INVALID_ARGUMENT, 0, 0)
+    );
+    let mut short = private_give(6, PRIVATE_GPU_ADDRESS, 0x1_0000);
+    short.truncate(32);
+    let seqno = rig.send(short);
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_INVALID_ARGUMENT));
+    assert_eq!(
+        *host.seen.lock(),
+        [
+            (RGFX_CMD_PRIVATE_TAKE, 5, 0x2_8000),
+            (RGFX_CMD_PRIVATE_GIVE, 5, PRIVATE_GPU_ADDRESS + 0x3_0000)
+        ]
+    );
+}
+
+/// A refused `PRIVATE_TAKE`'s `PRIVATE_BLOCK` reads 0 for its address and length, whatever the
+/// host passed with the refusal; and a host that gives no Private blocks refuses every take.
+#[test]
+fn a_refused_private_take_reads_no_block() {
+    struct Refusing;
+    impl Host for Refusing {
+        fn raise_interrupt(&self, _vector: u32) {}
+        fn features(&self) -> u64 {
+            RGFX_FEATURE_PRIVATE_BLOCKS
+        }
+        fn private_take(&self, take: &RgfxPrivateTake, answer: PrivateAnswer) {
+            answer.answer(RGFX_STATUS_REFUSED, 1 << 44, take.length);
+        }
+    }
+    struct NoBlocks;
+    impl Host for NoBlocks {
+        fn raise_interrupt(&self, _vector: u32) {}
+        fn features(&self) -> u64 {
+            RGFX_FEATURE_PRIVATE_BLOCKS
+        }
+    }
+    for host in [Box::new(Refusing) as Box<dyn Host>, Box::new(NoBlocks)] {
+        let mut rig = Rig::with_host(host);
+        rig.device.mmio_write(
+            RGFX_REG_DRIVER_FEATURES_HI.into(),
+            (RGFX_FEATURE_PRIVATE_BLOCKS >> 32) as u32,
+        );
+        rig.start();
+        assert_eq!(
+            private_block(&mut rig, private_take(5, 0x1_0000)),
+            (RGFX_STATUS_REFUSED, 0, 0)
+        );
+        let seqno = rig.send(private_give(5, 1 << 44, 0x1_0000));
+        let status = rig.complete();
+        assert_eq!(status.0, seqno);
+    }
+}
+
+/// Where the driver did not take `PRIVATE_BLOCKS`, a `PRIVATE_TAKE` and a `PRIVATE_GIVE` go to the
+/// host's decoder, as messages it does not know, and the host's Private blocks see neither.
+#[test]
+fn private_messages_go_to_the_decoder_where_the_driver_did_not_take_private_blocks() {
+    let host = PrivateHost::default();
+    let mut rig = Rig::with_host(Box::new(host.clone()));
+    rig.start();
+    rig.send(private_take(5, 0x1_0000));
+    rig.send(private_give(5, PRIVATE_GPU_ADDRESS, 0x1_0000));
+    assert!(
+        eventually(|| host.seen.lock().len() == 2),
+        "{:?}",
+        host.seen.lock()
+    );
+    assert_eq!(
+        *host.seen.lock(),
+        [(RGFX_CMD_PRIVATE_TAKE, 0, 0), (RGFX_CMD_PRIVATE_GIVE, 0, 0)]
+    );
+}

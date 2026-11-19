@@ -1,20 +1,22 @@
-//! The GPU addresses the host gives the contexts' blocks of the Shared pool on a source whose
-//! blocks have none (`HostBlocks`, the Vulkan platform's): `POOL_ADDRESSES`
-//! (docs/graphics-kext/design.md, "The Shared pool"). A guest that took the feature places the
-//! heap over a block at the address its take's answer names, and the platform pins it there, as
-//! it pins every address the guest picks.
+//! The GPU addresses the host gives the contexts' blocks on a source whose blocks have none
+//! (`HostBlocks`, the Vulkan platform's): the Shared pool's (`POOL_ADDRESSES`,
+//! docs/graphics-kext/design.md, "The Shared pool") and the Private blocks
+//! (`PRIVATE_BLOCKS`, "Private blocks"). A guest that took the feature places its objects at
+//! the address its take's answer names, and the platform pins them there, as it pins every
+//! address the guest picks.
 //!
-//! The addresses lie in `[HOST_BASE, HOST_END)`, `[2^45, 2^46)`: below `RGFX_CONTEXT_VA_BASE`,
-//! where the guest's own picks start, and far above where the Vulkan platform's model of Metal's
-//! layout places the host's unpinned ranges (lowest first from 2^40, as far as its live ranges
-//! reach), so a pin of one meets only another of these. A block's address holds Metal's span
-//! of a plain range of its length ([`span`]): its pages, a guard page, rounded up to the 32 KiB
-//! granule a pin starts on, as the guest's own picks do.
+//! The pool's addresses lie in `[HOST_BASE, HOST_END)`, `[2^45, 2^46)`, and the Private blocks'
+//! in `[PRIVATE_BASE, PRIVATE_END)`, `[2^44, 2^45)`, each picked by its own [`HostAddresses`]:
+//! below `RGFX_CONTEXT_VA_BASE`, where the guest's own picks start, and far above where the
+//! Vulkan platform's model of Metal's layout places the host's unpinned ranges (lowest first from
+//! 2^40, as far as its live ranges reach), so a pin of one meets only another of these. A
+//! block's address holds Metal's span of a plain range of its length ([`span`]): its pages, a
+//! guard page, rounded up to the 32 KiB granule a pin starts on, as the guest's own picks do.
 //!
 //! The picks go next fit: each from the end of the last, wrapping to the start at the end. A
 //! block's address is free again at its free, but a pick reaches it only once the picks wrap,
-//! 32 TiB of spans later, so a platform that lets go of a pin a while after the heap over it
-//! went never meets it.
+//! 32 TiB of spans later in the pool's range and 16 TiB in the Private one, so a platform that
+//! lets go of a pin a while after the object over it went never meets it.
 
 /// The first address the host gives: 2^45.
 pub(crate) const HOST_BASE: u64 = 1 << 45;
@@ -22,6 +24,13 @@ pub(crate) const HOST_BASE: u64 = 1 << 45;
 /// The end of the addresses the host gives: 2^46, `RGFX_CONTEXT_VA_BASE`, where the guest's own
 /// picks start.
 pub(crate) const HOST_END: u64 = 1 << 46;
+
+/// The first address the host gives a Private block: 2^44.
+pub(crate) const PRIVATE_BASE: u64 = 1 << 44;
+
+/// The end of the addresses the host gives the Private blocks: 2^45, [`HOST_BASE`], where the
+/// pool's start.
+pub(crate) const PRIVATE_END: u64 = HOST_BASE;
 
 /// Metal's page on Apple silicon: a range holds whole pages, and one more as its guard.
 const PAGE: u64 = 0x4000;
@@ -37,36 +46,54 @@ pub(crate) fn span(len: u64) -> Option<u64> {
         .checked_next_multiple_of(GRANULE)
 }
 
-/// The addresses given and not yet freed, and where the next pick starts.
+/// The addresses of one range given and not yet freed, and where the next pick starts.
 #[derive(Debug)]
 pub(crate) struct HostAddresses {
     /// The spans held, by address: their ends.
     held: std::collections::BTreeMap<u64, u64>,
     /// Where the next pick looks first.
     next: u64,
+    /// The range's first address, a multiple of [`GRANULE`].
+    base: u64,
+    /// The range's end.
+    end: u64,
 }
 
 impl Default for HostAddresses {
+    /// The pool's: `[HOST_BASE, HOST_END)`.
     fn default() -> Self {
-        HostAddresses {
-            held: std::collections::BTreeMap::new(),
-            next: HOST_BASE,
-        }
+        HostAddresses::over(HOST_BASE, HOST_END)
     }
 }
 
 impl HostAddresses {
+    /// The addresses `[base, end)`, none held; `base` a multiple of [`GRANULE`].
+    pub(crate) fn over(base: u64, end: u64) -> HostAddresses {
+        debug_assert!(base.is_multiple_of(GRANULE) && base < end);
+        HostAddresses {
+            held: std::collections::BTreeMap::new(),
+            next: base,
+            base,
+            end,
+        }
+    }
+
+    /// The Private blocks': `[PRIVATE_BASE, PRIVATE_END)`.
+    pub(crate) fn private() -> HostAddresses {
+        HostAddresses::over(PRIVATE_BASE, PRIVATE_END)
+    }
+
     /// The address of a block of `len` bytes, its span now held: the first start from where the
-    /// last pick ended whose span meets no held one, wrapping once to [`HOST_BASE`]; `None`
+    /// last pick ended whose span meets no held one, wrapping once to the range's base; `None`
     /// where no room is left.
     pub(crate) fn pick(&mut self, len: u64) -> Option<u64> {
         let span = span(len)?;
         let at = self
-            .fit(self.next, HOST_END, span)
-            .or_else(|| self.fit(HOST_BASE, self.next, span))?;
+            .fit(self.next, self.end, span)
+            .or_else(|| self.fit(self.base, self.next, span))?;
         let end = at.checked_add(span)?;
         self.held.insert(at, end);
-        self.next = if end >= HOST_END { HOST_BASE } else { end };
+        self.next = if end >= self.end { self.base } else { end };
         Some(at)
     }
 
@@ -151,5 +178,23 @@ mod tests {
         b.held.insert(HOST_BASE, HOST_BASE + 0x10_0000);
         b.next = HOST_BASE + 0x8000;
         assert_eq!(b.pick(0x1_0000), Some(HOST_BASE + 0x10_0000));
+    }
+
+    /// The Private blocks' range is `[2^44, 2^45)`, below the pool's, and its picks stay in it:
+    /// from its base, and wrapping to its base at its end, never into the pool's.
+    #[test]
+    fn the_private_range_lies_below_the_pool_s_and_its_picks_stay_in_it() {
+        assert_eq!((PRIVATE_BASE, PRIVATE_END), (1 << 44, 1 << 45));
+        let mut a = HostAddresses::private();
+        assert_eq!(a.pick(0x10_0000), Some(PRIVATE_BASE));
+        assert_eq!(a.pick(0x1_0000), Some(PRIVATE_BASE + 0x10_8000));
+        a.free(PRIVATE_BASE);
+        a.next = PRIVATE_END - 0x1_8000;
+        assert_eq!(a.pick(0x1_0000), Some(PRIVATE_END - 0x1_8000));
+        // No room for a second one before the end: it wraps to the freed base.
+        assert_eq!(a.pick(0x1_0000), Some(PRIVATE_BASE));
+        let mut full = HostAddresses::private();
+        full.held.insert(PRIVATE_BASE, PRIVATE_END);
+        assert_eq!(full.pick(0x1_0000), None);
     }
 }

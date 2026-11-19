@@ -4535,6 +4535,28 @@ impl<P: Platform> GraphicsDecoder<P> {
         contexts.iter().any(|c| c.span_in(offset, size))
     }
 
+    /// Whether a buffer or heap the decoder holds starts in the `length` bytes of GPU addresses at
+    /// `gpu_address`: the Private block they make, in which the guest places each object whole
+    /// (`PRIVATE_TAKE`), is not to be given out again while one does. It looks at every object of
+    /// every context, as a block is given back seldom.
+    pub(crate) fn addresses_in_use(&self, gpu_address: u64, length: u64) -> bool {
+        let end = gpu_address.saturating_add(length);
+        let contexts: Vec<Arc<Context<P>>> =
+            self.shared.contexts.lock().values().cloned().collect();
+        contexts.iter().any(|c| {
+            let mut found = false;
+            c.for_each_live(|_, entry| {
+                let at = match &entry.handle {
+                    ObjHandle::Buffer(buffer) => buffer.gpu_address(),
+                    ObjHandle::Heap(heap) => heap.gpu_address(),
+                    _ => return,
+                };
+                found |= (gpu_address..end).contains(&at);
+            });
+            found
+        })
+    }
+
     /// Begins a drain of `context`'s command buffers: `answer` is given once every one the decoder
     /// has begun for the context has finished its completion handler, those begun before an
     /// earlier drain among them, and not later ones. The drain is returned for the caller to drop

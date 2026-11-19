@@ -1631,6 +1631,20 @@
 // offers it; the x86-64 kext takes it.
 #define RGFX_FEATURE_POOL_ADDRESSES 576460752303423488
 
+// `FEATURES_HI` bit 28, feature bit 60, `PRIVATE_BLOCKS`: the host gives each context blocks of
+// GPU addresses for its Private objects. Ring 0 carries [`RGFX_CMD_PRIVATE_TAKE`] and
+// [`RGFX_CMD_PRIVATE_GIVE`], a context's ask for a block and its giving one back. Where the
+// guest took it, the guest places its Private buffers and its heaps that are not Shared
+// ([`RGFX_CMD_BUFFER_CREATE`], [`RGFX_CMD_HEAP_CREATE`]) and its Managed buffers' GPU copies
+// ([`RGFX_CMD_MANAGED_BUFFER_CREATE`], [`RGFX_CMD_BUFFER_MANAGED_AT_OFFSET`]) at addresses inside
+// blocks its context holds, rather than at addresses it picks in its context's range
+// ([`RGFX_CONTEXT_VA_BASE`]). On metal2vulkan-rt's device a block is device memory no one maps,
+// and its address the memory's Vulkan device address; on the Vulkan platform before it, a range
+// of addresses the host picks in `[2^44, 2^45)`, below the Shared pool's, with no memory of its
+// own: the platform pins each object made there, as it pins the guest's picks. Every host offers
+// it; the x86-64 and arm64e kexts take it.
+#define RGFX_FEATURE_PRIVATE_BLOCKS 1152921504606846976
+
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 #define RGFX_REG_STATUS 16
@@ -1774,7 +1788,8 @@
 // guest's pin meets only the guest's own ranges then. The host takes each range as given: it
 // knows no context's range, only that the guest's lie here. The addresses the host gives the
 // Shared pool's blocks on that platform ([`RGFX_FEATURE_POOL_ADDRESSES`]) lie below them, in
-// `[2^45, 2^46)`.
+// `[2^45, 2^46)`, and those of the contexts' Private blocks ([`RGFX_FEATURE_PRIVATE_BLOCKS`])
+// below those, in `[2^44, 2^45)`.
 #define RGFX_CONTEXT_VA_BASE 70368744177664
 
 // Where the guest's GPU addresses end: 2^47, the Metal address space's end.
@@ -2427,6 +2442,33 @@
 // The longest block a `POOL_TAKE` may ask for: 4 GiB.
 #define RGFX_POOL_TAKE_MAX 4294967296
 
+// `PRIVATE_TAKE` ([`RgfxPrivateTake`]), on ring 0 from the accelerator kext, where the guest took
+// [`RGFX_FEATURE_PRIVATE_BLOCKS`]: context `context` asks for a block of GPU addresses for its
+// Private objects of at least `length` bytes. Answered [`RGFX_EVT_PRIVATE_BLOCK`] with this
+// message's `seqno`: the GPU address of the block's first byte and its length, at least
+// `length` rounded up to [`RGFX_PRIVATE_BLOCK_ALIGN`], the block the context's from then until
+// its `PRIVATE_GIVE` or the context's `CONTEXT_CLOSE`; or [`RGFX_STATUS_INVALID_ARGUMENT`] for a
+// `length` of 0 or past [`RGFX_PRIVATE_TAKE_MAX`], and [`RGFX_STATUS_REFUSED`] where the host has
+// no block or address left for it. A buffer made in the block reads zero from its create, as one
+// made at an address of the context's own range does, wherever in the block it lies and whatever
+// lay there before. The answer may come after later messages' answers.
+#define RGFX_CMD_PRIVATE_TAKE 765
+
+// `PRIVATE_GIVE` ([`RgfxPrivateGive`]), on ring 0 from the accelerator kext: context `context`
+// gives back its Private block of `length` bytes at GPU address `gpu_address`. Answered
+// [`RGFX_EVT_COMPLETE`]: [`RGFX_STATUS_REFUSED`] at once where an object the host holds still
+// lies in the block, or [`RGFX_STATUS_NOT_FOUND`] where the context holds no such block;
+// otherwise [`RGFX_STATUS_OK`] once every command buffer the context had committed has finished,
+// and only then does the block go back to the host. Posted after every message the process
+// posted before it gave the block up.
+#define RGFX_CMD_PRIVATE_GIVE 766
+
+// A Private block's length is a multiple of this: 64 KiB.
+#define RGFX_PRIVATE_BLOCK_ALIGN 65536
+
+// The longest block a `PRIVATE_TAKE` may ask for: 1 TiB.
+#define RGFX_PRIVATE_TAKE_MAX 1099511627776
+
 // `SURFACE_PAGES` ([`RgfxSurfacePages`]), on ring 0 from the accelerator kext, where the device
 // has [`RGFX_FEATURE_SURFACE_PAGES`]: the guest RAM an IOSurface's `length` bytes lie in, whose
 // shared block of `block_size` bytes at `block_offset` the kext made for the GPU to use the
@@ -2649,6 +2691,11 @@
 // `pool_offset` and `length`, and, where the guest took [`RGFX_FEATURE_POOL_ADDRESSES`], its
 // `gpu_address`; otherwise each 0.
 #define RGFX_EVT_POOL_BLOCK 1040
+
+// Event `PRIVATE_BLOCK` ([`RgfxPrivateBlock`], on the control completion ring), with a
+// [`RGFX_CMD_PRIVATE_TAKE`]'s `seqno`: its answer. `status` [`RGFX_STATUS_OK`] with the block's
+// `gpu_address` and `length`; otherwise each 0.
+#define RGFX_EVT_PRIVATE_BLOCK 1041
 
 // A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 #define RGFX_CB_OK 0
@@ -7034,6 +7081,47 @@ typedef struct {
   // The bytes asked for.
   uint64_t length;
 } RgfxPoolTake;
+
+// Event `PRIVATE_BLOCK`: a `PRIVATE_TAKE`'s answer, with its `seqno`.
+typedef struct {
+  // [`RGFX_EVT_PRIVATE_BLOCK`], the take's `seqno`.
+  RgfxMsgHeader header;
+  // [`RGFX_STATUS_OK`], [`RGFX_STATUS_INVALID_ARGUMENT`] or [`RGFX_STATUS_REFUSED`].
+  uint32_t status;
+  // Zero.
+  uint32_t reserved_14;
+  // The GPU address of the block's first byte, never 0; 0 unless OK.
+  uint64_t gpu_address;
+  // The block's length; 0 unless OK.
+  uint64_t length;
+} RgfxPrivateBlock;
+
+// `PRIVATE_GIVE`: context `context` gives back its Private block of `length` bytes at
+// `gpu_address`.
+typedef struct {
+  // [`RGFX_CMD_PRIVATE_GIVE`].
+  RgfxMsgHeader header;
+  // The giving context.
+  uint32_t context;
+  // Zero.
+  uint32_t reserved_14;
+  // The GPU address of the block's first byte, as its `PRIVATE_BLOCK` answered it.
+  uint64_t gpu_address;
+  // The block's length, as its `PRIVATE_BLOCK` answered it.
+  uint64_t length;
+} RgfxPrivateGive;
+
+// `PRIVATE_TAKE`: context `context` asks for a Private block of at least `length` bytes.
+typedef struct {
+  // [`RGFX_CMD_PRIVATE_TAKE`].
+  RgfxMsgHeader header;
+  // The asking context.
+  uint32_t context;
+  // Zero.
+  uint32_t reserved_14;
+  // The bytes asked for.
+  uint64_t length;
+} RgfxPrivateTake;
 
 // `PRESENT_SURFACE`: the display shows the IOSurface of global ID `iosurface_id` (plane 0), the
 // display pipe's swap, in place of the scanout, until the next `PRESENT_SURFACE`; 0 shows the

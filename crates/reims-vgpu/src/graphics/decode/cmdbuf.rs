@@ -7737,6 +7737,43 @@ mod tests {
         }
     }
 
+    /// The GPU addresses the host gives the contexts' Private blocks where their source has none
+    /// (`pool::addresses`, `[2^44, 2^45)`) take the Vulkan platform's pins as the pool's do: pins
+    /// of a block's span at the first picks and at the last, beside a pin at the pool's first
+    /// pick and one at the guest's, with a queue's and a texture buffer's ranges made, are made at
+    /// their addresses (a pin's rule is the same for a buffer as for a heap in the block).
+    #[test]
+    fn on_vulkan_the_host_s_private_addresses_take_pins() {
+        use crate::pool::{HOST_BASE, PRIVATE_BASE, PRIVATE_END};
+        use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        let _pins = CONTEXT_RANGE_PINS.lock();
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
+        let (mut dec, device) = decoder_with_a_texture_buffer();
+        let guest = buffer_at(11, RGFX_CONTEXT_VA_BASE + 0x8000, 0x1_0000);
+        assert_eq!(dec.decode(&device, guest.as_bytes()).unwrap(), Ok(()));
+        // Blocks of 64 KiB and 16 MiB, each a span of its pages and a guard page; the last
+        // Private block's span ends where the pool's first starts.
+        let picks = [
+            (PRIVATE_BASE, 0x1_0000),
+            (PRIVATE_BASE + 0x1_8000, 16 << 20),
+            (PRIVATE_END - 0x1_8000, 0x1_0000),
+            (HOST_BASE, 0x1_0000),
+        ];
+        for (obj_id, (at, length)) in (20..).zip(picks) {
+            let pinned = buffer_at(obj_id, at, length);
+            assert_eq!(
+                dec.decode(&device, pinned.as_bytes()).unwrap(),
+                Ok(()),
+                "the pin at {at:#x}"
+            );
+            let Some(ObjHandle::Buffer(buffer)) = dec.object(obj_id) else {
+                panic!("no buffer {obj_id}");
+            };
+            assert_eq!(buffer.gpu_address(), at);
+        }
+    }
+
     /// The host's own ranges lie below the guest's GPU addresses: a buffer the host places
     /// itself lies below them, and, with it, a queue's and a texture buffer's ranges made, the
     /// first pick of every unit the kext hands the contexts out in and the last unit's last pick

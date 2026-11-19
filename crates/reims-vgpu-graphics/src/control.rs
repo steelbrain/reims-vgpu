@@ -100,7 +100,8 @@ pub(crate) fn unheld(shared: &Shared, message: &Message, epoch: u64) -> Option<V
 /// `BLOCK_RELEASE` is refused where a live queue's ring lies in the block, and else the host answers
 /// it; a `POOL_TAKE` and a `POOL_GIVE` go to the host, which answers them
 /// (`Host::pool_take`, `Host::pool_give`), where the guest took `POOL`, and else to its decoder as
-/// any message it does not know; a `BLOCK_GRANT` is kept with the region (`Region::grant`), and so are a `BLOCK_SHARE` and a
+/// any message it does not know, and so do a `PRIVATE_TAKE` and a `PRIVATE_GIVE`
+/// (`Host::private_take`, `Host::private_give`), where the guest took `PRIVATE_BLOCKS`; a `BLOCK_GRANT` is kept with the region (`Region::grant`), and so are a `BLOCK_SHARE` and a
 /// `BLOCK_UNSHARE` (`Region::share`, `Region::unshare`); a `SURFACE_PAGES` hands its block's runs
 /// to the host (`Shared::surface_pages`), which answers with whether it mapped them; a
 /// `SURFACE_DOWNLOAD` the host answers once the surface's pages hold its device cache
@@ -216,6 +217,28 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
                 None => Some(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT)),
             }
         }
+        RGFX_CMD_PRIVATE_TAKE if shared.driver_took(RGFX_FEATURE_PRIVATE_BLOCKS) => {
+            match read::<RgfxPrivateTake>(message) {
+                Some(take) => {
+                    shared
+                        .host
+                        .private_take(&take, shared.private_answer(seqno, epoch));
+                    None
+                }
+                None => Some(private_block(seqno, RGFX_STATUS_INVALID_ARGUMENT, 0, 0)),
+            }
+        }
+        RGFX_CMD_PRIVATE_GIVE if shared.driver_took(RGFX_FEATURE_PRIVATE_BLOCKS) => {
+            match read::<RgfxPrivateGive>(message) {
+                Some(give) => {
+                    shared
+                        .host
+                        .private_give(&give, shared.complete_answer(seqno, epoch));
+                    None
+                }
+                None => Some(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT)),
+            }
+        }
         RGFX_CMD_BLOCK_RELEASE => match read::<RgfxBlockRelease>(message) {
             // Whatever the answer, the block is no longer its process's to name.
             Some(release) => {
@@ -289,6 +312,21 @@ pub(crate) fn pool_block(
         pool_offset,
         length,
         gpu_address,
+    })
+}
+
+/// A `PRIVATE_BLOCK` for `PRIVATE_TAKE` `seqno`.
+pub(crate) fn private_block(seqno: u64, status: u32, gpu_address: u64, length: u64) -> Vec<u8> {
+    sized(&RgfxPrivateBlock {
+        header: RgfxMsgHeader {
+            r#type: RGFX_EVT_PRIVATE_BLOCK,
+            size: 0,
+            seqno,
+        },
+        status,
+        reserved_14: 0,
+        gpu_address,
+        length,
     })
 }
 

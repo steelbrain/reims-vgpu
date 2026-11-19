@@ -338,7 +338,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 59.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 60.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -395,7 +395,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_BUFFER_ESCAPED
     | RGFX_FEATURE_POOL
     | RGFX_FEATURE_SURFACE_REFILL
-    | RGFX_FEATURE_POOL_ADDRESSES;
+    | RGFX_FEATURE_POOL_ADDRESSES
+    | RGFX_FEATURE_PRIVATE_BLOCKS;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -520,6 +521,33 @@ pub trait Host: Send + Sync + 'static {
     /// on the context's lane, in ring order. The default finds no block, for a host with no
     /// pool.
     fn pool_give(&self, give: &RgfxPoolGive, answer: CompleteAnswer) {
+        let _ = give;
+        answer.answer(RGFX_STATUS_NOT_FOUND);
+    }
+
+    /// `PRIVATE_TAKE`, where the guest took [`RGFX_FEATURE_PRIVATE_BLOCKS`]: context
+    /// `take.context` asks for a block of GPU addresses for its Private objects of at least
+    /// `take.length` bytes. The host gives `answer` from any thread: the GPU address of the
+    /// block's first byte, never 0, and its length, `take.length` rounded up to
+    /// [`RGFX_PRIVATE_BLOCK_ALIGN`]; [`RGFX_STATUS_INVALID_ARGUMENT`] for a length of 0 or past
+    /// [`RGFX_PRIVATE_TAKE_MAX`]; or [`RGFX_STATUS_REFUSED`] where it has no block or address
+    /// left for it. It answers none of a context closed or a device reset since, whose block it
+    /// gives back itself. Called on the context's lane, in ring order; it waits for nothing there.
+    /// The default refuses at once, for a host that gives no blocks.
+    fn private_take(&self, take: &RgfxPrivateTake, answer: PrivateAnswer) {
+        let _ = take;
+        answer.answer(RGFX_STATUS_REFUSED, 0, 0);
+    }
+
+    /// `PRIVATE_GIVE`, where the guest took [`RGFX_FEATURE_PRIVATE_BLOCKS`]: context
+    /// `give.context` gives back its Private block of `give.length` bytes at GPU address
+    /// `give.gpu_address`. The host gives `answer` from any thread: [`RGFX_STATUS_NOT_FOUND`] at
+    /// once where the context holds no such block, [`RGFX_STATUS_REFUSED`] at once where an object
+    /// it holds lies in the block, which the context keeps, else [`RGFX_STATUS_OK`] once every
+    /// command buffer of the context it had committed has finished, and only then does the block
+    /// go back. Called on the context's lane, in ring order. The default finds no block, for a
+    /// host that gives none.
+    fn private_give(&self, give: &RgfxPrivateGive, answer: CompleteAnswer) {
         let _ = give;
         answer.answer(RGFX_STATUS_NOT_FOUND);
     }
@@ -1931,6 +1959,45 @@ impl PoolAnswer {
         };
         let block =
             crate::control::pool_block(self.seqno, status, pool_offset, length, gpu_address);
+        shared.post_unwaiting(&block, self.epoch);
+    }
+}
+
+/// The `PRIVATE_BLOCK` a `PRIVATE_TAKE` owes ([`Host::private_take`]), which the host gives from
+/// any thread. As a [`CompleteAnswer`], it holds a weak reference to the device, and an answer
+/// after the device has ended, or for a take before a reset, is dropped, and so is one never
+/// given.
+pub struct PrivateAnswer {
+    /// The device's shared state, weakly.
+    shared: Weak<Shared>,
+    /// The take's `seqno`.
+    seqno: u64,
+    /// The reset count the take was taken at.
+    epoch: u64,
+}
+
+impl std::fmt::Debug for PrivateAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrivateAnswer")
+            .field("seqno", &self.seqno)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PrivateAnswer {
+    /// Posts the `PRIVATE_BLOCK` with `status`, and with the block's `gpu_address` and `length`
+    /// where `status` is [`RGFX_STATUS_OK`] (0 otherwise), onto the control completion ring,
+    /// waiting for nothing, as [`CompleteAnswer::answer`] posts.
+    pub fn answer(self, status: u32, gpu_address: u64, length: u64) {
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        let (gpu_address, length) = if status == RGFX_STATUS_OK {
+            (gpu_address, length)
+        } else {
+            (0, 0)
+        };
+        let block = crate::control::private_block(self.seqno, status, gpu_address, length);
         shared.post_unwaiting(&block, self.epoch);
     }
 }
@@ -3915,6 +3982,15 @@ impl Shared {
     /// The answer `POOL_TAKE` `seqno`, taken at reset count `epoch`, owes ([`PoolAnswer`]).
     pub(crate) fn pool_answer(&self, seqno: u64, epoch: u64) -> PoolAnswer {
         PoolAnswer {
+            shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
+            seqno,
+            epoch,
+        }
+    }
+
+    /// The answer `PRIVATE_TAKE` `seqno`, taken at reset count `epoch`, owes ([`PrivateAnswer`]).
+    pub(crate) fn private_answer(&self, seqno: u64, epoch: u64) -> PrivateAnswer {
+        PrivateAnswer {
             shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
             seqno,
             epoch,

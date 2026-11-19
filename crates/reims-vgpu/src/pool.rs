@@ -51,6 +51,7 @@
 
 mod addresses;
 mod host_blocks;
+mod private_blocks;
 mod rt_blocks;
 mod takes;
 
@@ -64,8 +65,9 @@ use parking_lot::{Condvar, Mutex};
 use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
 
 #[cfg(test)]
-pub(crate) use addresses::{HOST_BASE, HOST_END};
+pub(crate) use addresses::{HOST_BASE, HOST_END, PRIVATE_BASE, PRIVATE_END};
 pub(crate) use host_blocks::HostBlocks;
+pub(crate) use private_blocks::{PrivateBlocks, PrivateGive, TakeError as PrivateTakeError};
 pub(crate) use takes::{Give, PoolLedger, TAKE_MAX};
 #[cfg(test)]
 use takes::{TAKE_ALIGN, TakeAnswer, Taken};

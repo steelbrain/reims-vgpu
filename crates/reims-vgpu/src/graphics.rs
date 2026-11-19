@@ -79,7 +79,8 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
     RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_ANSWERS,
     RGFX_FEATURE_PIPELINE_KEYS, RGFX_FEATURE_POINTER_MOTION, RGFX_FEATURE_POOL,
-    RGFX_FEATURE_POOL_ADDRESSES, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_RATE_MAPS,
+    RGFX_FEATURE_POOL_ADDRESSES, RGFX_FEATURE_PRIVATE_BLOCKS, RGFX_FEATURE_PRIVATE_RENDER_STATE,
+    RGFX_FEATURE_RATE_MAPS,
     RGFX_FEATURE_READ_ONLY_PAGES, RGFX_FEATURE_SCHEDULED_ASK, RGFX_FEATURE_SHARED_EVENT_NAMES,
     RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
     RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
@@ -95,12 +96,13 @@ use reims_vgpu_graphics::wire::{
     RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled,
     RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
     RgfxFunctionPointerState, RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader,
-    RgfxPageRun, RgfxPipelineAnswersQuery, RgfxPoolGive, RgfxPoolTake, RgfxRateMapAnswer,
+    RgfxPageRun, RgfxPipelineAnswersQuery, RgfxPoolGive, RgfxPoolTake, RgfxPrivateGive,
+    RgfxPrivateTake, RgfxRateMapAnswer,
     RgfxRateMapState, RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName, RgfxSurfacePages,
     RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
-    CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PoolAnswer,
+    CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PoolAnswer, PrivateAnswer,
     PresentAnswer, QueueClaim, RawDoorbell, RingDegradation, Scanout, Screen, VtAnswer, VtLink,
     VtMessage, VtSurface,
 };
@@ -145,7 +147,8 @@ use crate::graphics::read::DisplayRead;
 use crate::memory::{GuestMemoryLease, MemoryMap};
 use crate::platform::{ApiPlatform, api_state};
 use crate::pool::{
-    Give, HostBlocks, Pool, PoolAddFn, PoolConfig, PoolHost, PoolLedger, PoolRemoveFn, TAKE_MAX,
+    Give, HostBlocks, Pool, PoolAddFn, PoolConfig, PoolHost, PoolLedger, PoolRemoveFn,
+    PrivateBlocks, PrivateGive, PrivateTakeError, TAKE_MAX,
 };
 use crate::window::WindowLink;
 
@@ -719,6 +722,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 } else {
                     0
                 }
+                // The contexts' Private blocks, ranges of addresses the host picks, which need
+                // no memory: on every host and for every guest.
+                | RGFX_FEATURE_PRIVATE_BLOCKS
                 // A window's captured pointer drives the guest's own mouse while a game hides
                 // the cursor ([`crate::window`]); a device with no window has no pointer to.
                 | if config.window.is_some() {
@@ -877,6 +883,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 reset_gate: Arc::default(),
                 inline_walk_max: AtomicUsize::new(INLINE_WALK_MAX),
                 shared_pool: pool_ledger,
+                private_blocks: PrivateBlocks::new(None),
             });
             let cursors: Vec<Arc<HostCursor>> = (0..count)
                 .map(|display| {
@@ -1313,6 +1320,10 @@ struct GraphicsControl<P: ApiPlatform> {
     /// The ledger of the contexts' blocks of the guest's Shared pool, where the device offers it
     /// (`POOL_TAKE`, `POOL_GIVE`, [`Self::take_pool_block`]).
     shared_pool: Option<PoolLedger>,
+    /// The ledger of the contexts' Private blocks (`PRIVATE_TAKE`, `PRIVATE_GIVE`,
+    /// [`Self::take_private_block`]): the host's picks of addresses until the device runs on
+    /// metal2vulkan-rt, whose Private blocks then fill it.
+    private_blocks: PrivateBlocks,
 }
 
 /// The longest `COMMAND_BUFFER` message, in bytes, that is walked and committed on its queue's
@@ -1755,6 +1766,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             // before the kext hears of the close's end.
             let gone = (self.shared_pool.as_ref())
                 .map(|ledger| (ledger.clone(), ledger.context_closed(context)));
+            // And so do its Private blocks.
+            let private = self.private_blocks.clone();
+            let private_gone = private.context_closed(context);
             let drain = decoder.drain_context(
                 context,
                 true,
@@ -1762,6 +1776,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     if let Some((ledger, gone)) = gone {
                         ledger.free(&gone);
                     }
+                    private.free(&private_gone);
                     answer.answer(RGFX_STATUS_OK);
                 }),
             );
@@ -1799,6 +1814,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 if let Some(ledger) = &self.shared_pool {
                     ledger.reset();
                 }
+                // And every Private block, the objects in them dropped.
+                self.private_blocks.reset();
                 self.presents.reset();
                 self.queue_sinks.write().clear();
                 for color in &self.colors {
@@ -1948,6 +1965,62 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     false,
                     Box::new(move || {
                         ledger.free(&[carve]);
+                        answer.answer(RGFX_STATUS_OK);
+                    }),
+                );
+                drop(decoder);
+                drop(drain);
+            }
+        }
+    }
+
+    /// `PRIVATE_TAKE` (`Host::private_take`): context `take.context`'s new Private block
+    /// ([`PrivateBlocks::take`]), answered at once; invalid for a length of 0 or past the wire's
+    /// longest, refused where no address is left for it.
+    fn take_private_block(&self, take: &RgfxPrivateTake, answer: PrivateAnswer) {
+        match self.private_blocks.take(take.context, take.length) {
+            Ok((gpu_address, length)) => answer.answer(RGFX_STATUS_OK, gpu_address, length),
+            Err(PrivateTakeError::Invalid) => answer.answer(RGFX_STATUS_INVALID_ARGUMENT, 0, 0),
+            Err(PrivateTakeError::Refused) => {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "context {} asked for a Private block of {:#x} bytes, for which no address is \
+                     left: refused",
+                    take.context, take.length
+                );
+                answer.answer(RGFX_STATUS_REFUSED, 0, 0);
+            }
+        }
+    }
+
+    /// `PRIVATE_GIVE` (`Host::private_give`): not found where context `give.context` holds no
+    /// such Private block, refused at once where a buffer or heap the decoder holds lies in it,
+    /// else answered, and the block freed, once every command buffer of the context the decoder
+    /// committed has finished ([`PrivateBlocks::give`]).
+    fn give_private_block(&self, give: &RgfxPrivateGive, answer: CompleteAnswer) {
+        let decoder = self.decoder();
+        let given =
+            (self.private_blocks).give(give.context, give.gpu_address, give.length, |at, len| {
+                decoder.addresses_in_use(at, len)
+            });
+        match given {
+            PrivateGive::NotFound => answer.answer(RGFX_STATUS_NOT_FOUND),
+            PrivateGive::InUse => {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "context {} gave back its Private block of {:#x} bytes at {:#x} while an \
+                     object lies in it: the block is kept",
+                    give.context, give.length, give.gpu_address
+                );
+                answer.answer(RGFX_STATUS_REFUSED);
+            }
+            PrivateGive::Given(block) => {
+                let blocks = self.private_blocks.clone();
+                let drain = decoder.drain_context(
+                    give.context,
+                    false,
+                    Box::new(move || {
+                        blocks.free(&[block]);
                         answer.answer(RGFX_STATUS_OK);
                     }),
                 );
@@ -3535,6 +3608,14 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn pool_give(&self, give: &RgfxPoolGive, answer: CompleteAnswer) {
         stepped(|| self.control.give_pool_block(give, answer));
+    }
+
+    fn private_take(&self, take: &RgfxPrivateTake, answer: PrivateAnswer) {
+        stepped(|| self.control.take_private_block(take, answer));
+    }
+
+    fn private_give(&self, give: &RgfxPrivateGive, answer: CompleteAnswer) {
+        stepped(|| self.control.give_private_block(give, answer));
     }
 
     fn device_reset(&self) {

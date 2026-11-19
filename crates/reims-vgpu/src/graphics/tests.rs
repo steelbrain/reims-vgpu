@@ -14181,3 +14181,155 @@ fn a_guest_that_took_pool_addresses_is_answered_each_block_s_gpu_address() {
     assert!(eventually(|| device.decoder_object_count() == 1));
     assert_eq!(device.decoder_gpu_address(obj(1, 1)), Some(first));
 }
+
+/// A `PRIVATE_TAKE` by context `context` of `length` bytes, as the kext posts it.
+#[cfg(not(windows))]
+fn private_take(context: u32, length: u64) -> Vec<u8> {
+    RgfxPrivateTake {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_PRIVATE_TAKE,
+            size: 0,
+            seqno: 0,
+        },
+        context,
+        reserved_14: 0,
+        length,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A `PRIVATE_GIVE` by context `context` of its block of `length` bytes at `gpu_address`.
+#[cfg(not(windows))]
+fn private_give(context: u32, gpu_address: u64, length: u64) -> Vec<u8> {
+    RgfxPrivateGive {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_PRIVATE_GIVE,
+            size: 0,
+            seqno: 0,
+        },
+        context,
+        reserved_14: 0,
+        gpu_address,
+        length,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A take's `PRIVATE_BLOCK`: its status, GPU address and length.
+#[cfg(not(windows))]
+fn private_block(guest: &mut Guest) -> (u32, u64, u64) {
+    let bytes = next_event(guest, RGFX_EVT_PRIVATE_BLOCK);
+    let block = RgfxPrivateBlock::read_from_bytes(&bytes).unwrap();
+    assert_eq!(block.header.seqno, guest.seqno);
+    (block.status, block.gpu_address, block.length)
+}
+
+/// A `BUFFER_CREATE` of a Private buffer `obj_id` of `length` bytes at `gpu_address`.
+#[cfg(not(windows))]
+fn private_buffer_at(obj_id: u64, gpu_address: u64, length: u64) -> Vec<u8> {
+    RgfxBufferCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_BUFFER_CREATE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        gpu_address,
+        length,
+        options: 0x20,
+        ..RgfxBufferCreate::default()
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A `HEAP_CREATE` of a Private Automatic heap `obj_id` of `size_bytes` at `gpu_address`.
+#[cfg(not(windows))]
+fn private_heap_at(obj_id: u64, gpu_address: u64, size_bytes: u64) -> Vec<u8> {
+    RgfxHeapCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_HEAP_CREATE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        gpu_address,
+        size_bytes,
+        options: 0x20,
+        heap_type: 0,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// Every device offers `PRIVATE_BLOCKS`; a guest that took it takes Private blocks, each the
+/// host's pick from 2^44 up on a platform whose blocks have none (each block's span its pages and
+/// a guard page on the 32 KiB granule), a take of no bytes invalid; a buffer at an address in the
+/// block is pinned there, and the block is given back only once nothing lies in it, by its own
+/// context alone; a context's close gives back its blocks, its heaps' among them; and the device's
+/// reset frees every block
+#[cfg(not(windows))]
+#[test]
+fn a_guest_s_private_block_is_taken_held_by_its_objects_and_given_back() {
+    use crate::pool::PRIVATE_BASE;
+    let raised = Arc::new(AtomicU32::new(0));
+    let device = headless(&raised);
+    let offered = u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32;
+    assert_eq!(
+        offered & RGFX_FEATURE_PRIVATE_BLOCKS,
+        RGFX_FEATURE_PRIVATE_BLOCKS
+    );
+    device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_HI.into(),
+        (RGFX_FEATURE_PRIVATE_BLOCKS >> 32) as u32,
+    );
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let blocks = device.control.private_blocks.clone();
+    guest.send(&device, private_take(1, 0x1_8000));
+    assert_eq!(
+        private_block(&mut guest),
+        (RGFX_STATUS_OK, PRIVATE_BASE, 0x2_0000)
+    );
+    let second = PRIVATE_BASE + 0x2_8000;
+    guest.send(&device, private_take(2, 0x1_0000));
+    assert_eq!(private_block(&mut guest), (RGFX_STATUS_OK, second, 0x1_0000));
+    guest.send(&device, private_take(1, 0));
+    assert_eq!(
+        private_block(&mut guest),
+        (RGFX_STATUS_INVALID_ARGUMENT, 0, 0)
+    );
+    // A buffer in the block is pinned at its address, and holds the block.
+    guest.send(&device, private_buffer_at(obj(1, 1), PRIVATE_BASE + 0x1000, 0x1000));
+    assert!(eventually(|| device.decoder_object_count() == 1));
+    assert_eq!(
+        device.decoder_gpu_address(obj(1, 1)),
+        Some(PRIVATE_BASE + 0x1000)
+    );
+    let status = answered(&device, &mut guest, private_give(1, PRIVATE_BASE, 0x2_0000));
+    assert_eq!(status, RGFX_STATUS_REFUSED, "the buffer lies in it");
+    let status = answered(&device, &mut guest, private_give(2, PRIVATE_BASE, 0x2_0000));
+    assert_eq!(status, RGFX_STATUS_NOT_FOUND, "another context's");
+    guest.send(&device, object_destroy(obj(1, 1)));
+    let status = answered(&device, &mut guest, private_give(1, PRIVATE_BASE, 0x2_0000));
+    assert_eq!(status, RGFX_STATUS_OK);
+    assert_eq!(blocks.held(), [(second, 2, 0x1_0000, false)]);
+    let status = answered(&device, &mut guest, private_give(1, PRIVATE_BASE, 0x2_0000));
+    assert_eq!(status, RGFX_STATUS_NOT_FOUND);
+    // The context's close gives back the blocks it held, its heaps' among them.
+    guest.send(&device, private_heap_at(obj(2, 1), second, 0x1_0000));
+    assert!(eventually(|| device.decoder_object_count() == 1));
+    assert_eq!(device.decoder_gpu_address(obj(2, 1)), Some(second));
+    let status = answered(&device, &mut guest, context_close(2));
+    assert_eq!(status, RGFX_STATUS_OK);
+    assert!(blocks.held().is_empty());
+    assert_eq!(device.decoder_object_count(), 0);
+    // The device's reset frees every block.
+    guest.send(&device, private_take(3, 0x1_0000));
+    assert_eq!(private_block(&mut guest).0, RGFX_STATUS_OK);
+    assert_eq!(blocks.held().len(), 1);
+    device.reset();
+    assert!(blocks.held().is_empty());
+}
