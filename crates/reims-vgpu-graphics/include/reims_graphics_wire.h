@@ -1661,6 +1661,20 @@
 // pages. Every host offers it; the x86-64 and arm64e kexts take it.
 #define RGFX_FEATURE_IMPORT_ADDRESSES 2305843009213693952
 
+// `FEATURES_HI` bit 30, feature bit 62, `SURFACE_CACHE_EVERY`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_HI`], beside [`RGFX_FEATURE_SURFACE_PAGES`]: the host's GPU form of
+// every IOSurface is its device cache. It keeps one for every block in place the kext names
+// cached ([`RGFX_SURFACE_PAGES_CACHED`]), lays no texture over a surface's pages, and refuses a
+// block in place named uncached ([`RGFX_STATUS_REFUSED`]). A copy block of a surface is then a
+// second copy beside the cache the surface's other holders use. A kext that took it names every
+// block in place cached, and refuses before it posts anything an ask in place it cannot cache;
+// its tables of the surfaces' blocks, of a block's holders and of the cached surfaces grow
+// rather than refuse; and it and its bundle count each copy block made, by why the surface's
+// view is not in place, logging each reason the first time. The host acts on nothing more. A
+// host offers it where its platform caches every surface (metal2vulkan-rt's per-shape form) and
+// it offers [`RGFX_FEATURE_POOL`]; the x86-64 and arm64e kexts take it.
+#define RGFX_FEATURE_SURFACE_CACHE_EVERY 4611686018427387904
+
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 #define RGFX_REG_STATUS 16

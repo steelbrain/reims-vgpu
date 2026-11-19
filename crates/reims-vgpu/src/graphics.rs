@@ -83,7 +83,8 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_PRIVATE_BLOCKS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_RATE_MAPS,
     RGFX_FEATURE_READ_ONLY_PAGES, RGFX_FEATURE_SCHEDULED_ASK, RGFX_FEATURE_SHARED_EVENT_NAMES,
     RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
-    RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
+    RGFX_FEATURE_SURFACE_CACHE_EVERY, RGFX_FEATURE_SURFACE_CACHE_REFUSED,
+    RGFX_FEATURE_SURFACE_DEFERRED,
     RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
     RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_SURFACE_REFILL,
     RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA, RGFX_FEATURE_UNSHARED_QUEUES,
@@ -750,12 +751,15 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // surface the GPU uses and copies it into the pages at a CPU lock after a GPU write
             // (**measured** on a MacBook Pro's UHD 630, docs/graphics-kext/design.md, Decided
             // 14): its textures over the surfaces the GPU draws and the CPU never locks (the
-            // compositor's) lie in its own memory rather than over the guest's pages.
+            // compositor's) lie in its own memory rather than over the guest's pages. A platform
+            // of the per-shape form, where the pool is offered, tells the guest that every
+            // surface's GPU form is its device cache (`SURFACE_CACHE_EVERY`, [`cache_every`]).
             let pages_features = if decoder.surface_pages_available() {
                 in_place
                     | u64::from(RGFX_FEATURE_SURFACE_CACHE)
                     | u64::from(RGFX_FEATURE_SURFACE_DEFERRED)
                     | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
+                    | cache_every(P::SURFACE_SHAPES, pool_ledger.is_some())
             } else {
                 0
             };
@@ -4590,6 +4594,20 @@ fn scanout_sink<P: ApiPlatform>(
     }
     let _ = (any, presented_any, region, shown);
     None
+}
+
+/// `SURFACE_CACHE_EVERY` where the platform caches every surface in the per-shape form (`shapes`,
+/// [`ApiPlatform::SURFACE_SHAPES`]) and the device offers the Shared pool (`pool`): the guest's
+/// kext then names every block in place cached, its tables grow rather than refuse, and it and
+/// the bundle count each copy block of a surface, a second copy beside the surface's device
+/// cache. A platform that lays textures over the surfaces' pages, and a device with no pool,
+/// offer it never: their guests keep the surfaces' blocks as before.
+fn cache_every(shapes: bool, pool: bool) -> u64 {
+    if shapes && pool {
+        RGFX_FEATURE_SURFACE_CACHE_EVERY
+    } else {
+        0
+    }
 }
 
 /// The video caps of the host's hardware video `video` on a device of `features`: its codecs,

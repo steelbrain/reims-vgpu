@@ -14327,6 +14327,35 @@ fn the_driver_s_take_of_the_pool_asks_one_piece_ahead_of_the_first_take() {
     );
 }
 
+/// `SURFACE_CACHE_EVERY` is offered only where the platform caches every surface in the
+/// per-shape form and the device offers the Shared pool: the platform that lays textures over the
+/// surfaces' pages offers it never, with the pool or without, and the per-shape form without the
+/// pool (a Windows host's) offers it never either
+#[test]
+fn surface_cache_every_is_offered_only_with_the_per_shape_form_and_the_pool() {
+    assert_eq!(cache_every(true, true), RGFX_FEATURE_SURFACE_CACHE_EVERY);
+    assert_eq!(cache_every(true, false), 0);
+    assert_eq!(cache_every(false, true), 0);
+    assert_eq!(cache_every(false, false), 0);
+    // The fake platform lays textures over the pages: with the pool, it offers no such bit.
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            pool_add: Some(Arc::new(|_, _, _| {})),
+            pool_remove: Some(Arc::new(|_, _| {})),
+            ..GraphicsCallbacks::default()
+        },
+        pool: Some(PoolConfig {
+            physical_address: 52 << 30,
+            physical_length: 4 << 30,
+        }),
+        guest_arch: GuestArch::X86_64,
+        ..GraphicsConfig::default()
+    };
+    let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+    let offered = u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32;
+    assert_eq!(offered & RGFX_FEATURE_SURFACE_CACHE_EVERY, 0);
+}
+
 /// An x86-64 guest that took `POOL_ADDRESSES` beside `POOL` is answered each block's GPU address:
 /// on a platform whose pool blocks have none, the host's picks from 2^45 up, each block's span
 /// its pages and a guard page on the 32 KiB granule; a heap over the block at that address is
