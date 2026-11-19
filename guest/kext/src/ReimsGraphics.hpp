@@ -570,6 +570,9 @@ private:
 	IOReturn setScanout(const Mode &mode);
 	// The boot screen in the scanout, black, once the display first shows a surface (handleEvent).
 	void clearBootScreen();
+	// The scanout's room, zeroed for a task that is not its last owner (newUserClient): false
+	// where the kernel would not map it.
+	bool zeroScanoutRoom();
 
 	IOPCIDevice *pci;
 	IOMemoryMap *registerMap;

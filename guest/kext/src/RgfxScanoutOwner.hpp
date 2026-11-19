@@ -39,6 +39,15 @@
 // unmapped from the task. What IOFramebuffer itself mapped for a task, the VRAM range on its
 // connections, is IOFramebuffer's, and goes only with its connection.
 //
+// The room holds what its last owner left there, and the region keeps it across that owner's
+// end. So an open by a task that is not the last owner (the next WindowServer, after a crash or a
+// logout) waits for the room to be zeroed (beginOpen's `*clear`): the framebuffer takes every
+// other task's hold of the scanout back, writes zeros over the room, then ends the wait
+// (endClear), and the task owns nothing until then, so no path above maps the room for it before
+// the zeros. The display shows black, not the last owner's frame, until the new owner presents.
+// The last owner opening again finds its own bytes, and the first owner the boot screen, which no
+// process wrote (ReimsGraphics::clearBootScreen clears it at the first present).
+//
 // Our own code.
 #ifndef RGFX_SCANOUT_OWNER_HPP_
 #define RGFX_SCANOUT_OWNER_HPP_
@@ -70,11 +79,13 @@ struct RgfxScanoutOwner {
 	const void *opening = nullptr;
 	// The thread running IOFramebuffer's setup for the current mode; null for none.
 	const void *settingUp = nullptr;
+	// Whether the open in flight waits for the room to be zeroed (beginOpen's `*clear`).
+	bool clearing = false;
 
 	// Whether `who` owns the scanout, `active` whether the recorded connection is still open.
 	bool owns(const void *who, bool active) const
 	{
-		return who && (who == opening || holdsConnection(who, active));
+		return who && ((who == opening && !clearing) || holdsConnection(who, active));
 	}
 
 	// Whether `who` holds the server connection, made and still open (`active`): an owner whose
@@ -85,14 +96,21 @@ struct RgfxScanoutOwner {
 	}
 
 	// A server connection's open by `who` begins, `active` whether the recorded one is still
-	// open. Returns whether `who` was marked as opening, which endOpen then clears.
-	bool beginOpen(const void *who, bool active)
+	// open. Returns whether `who` was marked as opening, which endOpen then clears. `*clear` is
+	// whether the room must be zeroed first: `who` is not the last owner, whose task the record
+	// holds until another replaces it. Then `who` owns nothing until endClear.
+	bool beginOpen(const void *who, bool active, bool *clear)
 	{
+		*clear = false;
 		if (!who || (client && active) || opening)
 			return false;
 		opening = who;
+		clearing = *clear = task && task != who;
 		return true;
 	}
+
+	// The room is zeroed: the open in flight owns the scanout from now on.
+	void endClear() { clearing = false; }
 
 	// The open `beginOpen` began for `who` ended, `made` the connection it made (null where it
 	// failed), `marked` beginOpen's answer. Where it made one, `who` and `made` are recorded, and
@@ -103,8 +121,10 @@ struct RgfxScanoutOwner {
 	{
 		*oldTask = nullptr;
 		*oldClient = nullptr;
-		if (marked && opening == who)
+		if (marked && opening == who) {
 			opening = nullptr;
+			clearing = false;
+		}
 		if (!who || !made)
 			return;
 		*oldTask = task;
@@ -119,6 +139,7 @@ struct RgfxScanoutOwner {
 		*oldTask = task;
 		*oldClient = client;
 		task = client = opening = nullptr;
+		clearing = false;
 	}
 
 	// IOFramebuffer's setup for the current mode begins on `thread`: returns the thread of the

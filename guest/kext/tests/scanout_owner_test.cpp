@@ -2,11 +2,13 @@
 // connection (or whose open of one is in flight) owns the scanout, a new connection's task
 // replaces the old one and takes every other task's hold of the scanout back, a closed connection
 // owns nothing, the VRAM range goes to the owner on its connection alone (never to IOFramebuffer's
-// own setup, for a new mode either), and the scanout's room never reaches the accelerator's blocks.
+// own setup, for a new mode either), the scanout's room never reaches the accelerator's blocks,
+// and a task that is not the room's last owner first reads it zero.
 #include "RgfxScanoutOwner.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace {
 int checks = 0;
@@ -23,12 +25,43 @@ void check(bool ok, const char *what)
 // Tasks and connections are opaque pointers to the rule: any distinct addresses do.
 int windowServer, app, nextWindowServer, kernel;
 int connection, nextConnection;
+
+// The scanout's room, as a process reads it through any of its mappings.
+unsigned char room[256];
+
+// A server connection's open as ReimsGraphics::newUserClient makes it: where the record asks, the
+// room is zeroed, then the wait ends; `ownsDuringClear` is whether `who` owned the scanout while
+// the room was being zeroed.
+bool open(RgfxScanoutOwner &o, const void *who, bool active, bool *cleared,
+          bool *ownsDuringClear = nullptr)
+{
+	bool clear = false;
+	const bool marked = o.beginOpen(who, active, &clear);
+	if (ownsDuringClear)
+		*ownsDuringClear = o.owns(who, false);
+	if (clear) {
+		std::memset(room, 0, sizeof(room));
+		o.endClear();
+	}
+	*cleared = clear;
+	return marked;
+}
+
+bool roomReads(unsigned char value)
+{
+	for (unsigned char b : room) {
+		if (b != value)
+			return false;
+	}
+	return true;
+}
 } // namespace
 
 int main()
 {
 	const void *ws = &windowServer, *other = &app, *ws2 = &nextWindowServer, *k = &kernel;
 	const void *oldTask = &app, *oldClient = &app;
+	bool cleared = false;
 	RgfxScanoutOwner o;
 
 	// Before any server connection, no task owns the scanout.
@@ -37,8 +70,9 @@ int main()
 
 	// The server connection's open: its task owns the scanout while it is in flight, as
 	// IOFramebuffer sets the display up inside it, and no other task does.
-	bool marked = o.beginOpen(ws, false);
+	bool marked = open(o, ws, false, &cleared);
 	check(marked, "the first open is marked");
+	check(!cleared, "the first owner's open zeroes nothing: the room holds the boot screen");
 	check(o.owns(ws, false), "the opening task owns the scanout during its open");
 	check(!o.owns(other, false), "another task does not, during the open");
 	o.endOpen(ws, &connection, marked, &oldTask, &oldClient);
@@ -49,8 +83,8 @@ int main()
 
 	// A second open while the connection is held is refused by IOFramebuffer: it marks nothing,
 	// makes nothing and changes no owner.
-	marked = o.beginOpen(other, true);
-	check(!marked, "an open while the connection is held is not marked");
+	marked = open(o, other, true, &cleared);
+	check(!marked && !cleared, "an open while the connection is held is not marked");
 	check(!o.owns(other, true), "nor does its task own the scanout during it");
 	o.endOpen(other, nullptr, marked, &oldTask, &oldClient);
 	check(!oldTask && !oldClient && o.owns(ws, true) && !o.owns(other, true),
@@ -59,24 +93,35 @@ int main()
 	// Its connection closed (the client terminated), the task owns nothing.
 	check(!o.owns(ws, false), "a closed connection owns nothing");
 
-	// A failed open after the close: its task owns the scanout only while it is in flight.
-	marked = o.beginOpen(other, false);
-	check(marked && o.owns(other, false), "a task owns the scanout during its open");
+	// A failed open after the close: its task owns the scanout only while it is in flight, and
+	// only once the room it would have read is zeroed.
+	std::memset(room, 0xab, sizeof(room));
+	bool ownedWhileZeroed = true;
+	marked = open(o, other, false, &cleared, &ownedWhileZeroed);
+	check(marked && cleared, "another task's open zeroes the room");
+	check(!ownedWhileZeroed, "and owns nothing before the zeros");
+	check(roomReads(0), "its first read of the room is zero, not the last owner's frame");
+	check(o.owns(other, false), "a task owns the scanout during its open");
 	o.endOpen(other, nullptr, marked, &oldTask, &oldClient);
 	check(!o.owns(other, false) && !oldTask && !oldClient, "and not after it failed");
 
 	// The next WindowServer's connection replaces the last: the caller lets the old task and
 	// connection go.
-	marked = o.beginOpen(ws2, false);
+	// Its open zeroes the room again: the record's last owner is still `ws`, the failed open's
+	// task never owned it.
+	std::memset(room, 0xcd, sizeof(room));
+	marked = open(o, ws2, false, &cleared);
+	check(cleared && roomReads(0), "the next WindowServer's first read is zero");
 	o.endOpen(ws2, &nextConnection, marked, &oldTask, &oldClient);
 	check(oldTask == ws && oldClient == &connection, "the replaced task and connection go back");
+	check(!o.clearing, "no wait outlives the open");
 	check(o.owns(ws2, true) && !o.owns(ws, true), "the new connection's task is the only owner");
 
 	// An open whose mark another open took (two at once, the second waiting on IOFramebuffer's
 	// gate) still records the connection it made, and clears no one else's mark.
 	RgfxScanoutOwner racing;
-	bool first = racing.beginOpen(ws, false);
-	bool second = racing.beginOpen(other, false);
+	bool first = open(racing, ws, false, &cleared);
+	bool second = open(racing, other, false, &cleared);
 	check(first && !second, "one open in flight is marked at a time");
 	racing.endOpen(other, &connection, second, &oldTask, &oldClient);
 	check(racing.opening == ws, "the unmarked open leaves the other's mark");
@@ -84,6 +129,25 @@ int main()
 	racing.endOpen(ws, nullptr, first, &oldTask, &oldClient);
 	check(racing.opening == nullptr && racing.owns(other, true) && !racing.owns(ws, true),
 	      "the marked open, refused, clears its mark");
+
+	// The same WindowServer opening again, its connection closed, keeps its bytes: the room is
+	// its own still.
+	std::memset(room, 0x5a, sizeof(room));
+	marked = open(o, ws2, false, &cleared);
+	check(marked && !cleared && roomReads(0x5a), "the last owner's open again keeps its bytes");
+	check(o.owns(ws2, false), "and owns the scanout during it");
+	o.endOpen(ws2, nullptr, marked, &oldTask, &oldClient);
+	check(!oldTask && !oldClient && o.opening == nullptr, "a failed reopen replaces nothing");
+	// A wait whose zeros failed ends with the open, and the task owns nothing.
+	RgfxScanoutOwner failing;
+	marked = open(failing, ws, false, &cleared);
+	failing.endOpen(ws, &connection, marked, &oldTask, &oldClient);
+	bool clear = false;
+	marked = failing.beginOpen(ws2, false, &clear);
+	check(marked && clear && !failing.owns(ws2, false), "the next task waits for the zeros");
+	failing.endOpen(ws2, nullptr, marked, &oldTask, &oldClient);
+	check(!failing.clearing && !failing.owns(ws2, false) && failing.opening == nullptr,
+	      "a failed open's wait ends with it");
 
 	// The record's end hands back what it held.
 	o.clear(&oldTask, &oldClient);
@@ -126,7 +190,7 @@ int main()
 	check(rgfxMayMapVram(ws, k, true, setting.inSetup(wsThread)),
 	      "and the owner maps the range on its connection again");
 	RgfxScanoutOwner held;
-	marked = held.beginOpen(ws, false);
+	marked = open(held, ws, false, &cleared);
 	check(held.owns(ws, false) && !held.holdsConnection(ws, false),
 	      "an open in flight owns the scanout but holds no connection");
 	held.endOpen(ws, &connection, marked, &oldTask, &oldClient);

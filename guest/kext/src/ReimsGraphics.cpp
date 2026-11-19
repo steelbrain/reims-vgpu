@@ -1471,6 +1471,34 @@ void ReimsGraphics::clearBootScreen()
 	      displayId, length);
 }
 
+// The display's whole room, as the VRAM range gives it, through a write-back mapping: the mode
+// the processes' windows and the locks map the scanout in, as the accelerator zeroes a block
+// before a window maps it (RgfxBlockZero.hpp). Once per new owner, so its time is logged each
+// time, the mapping's (made and taken down) apart from the stores'.
+bool ReimsGraphics::zeroScanoutRoom()
+{
+	const RgfxRoom room = scanoutRoom();
+	if (!region || !room.length)
+		return true;
+	const UInt64 made = mach_absolute_time();
+	IOMemoryMap *map = region->createMappingInTask(
+	    kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache, room.offset, room.length);
+	if (!map) {
+		IOLog("ReimsGraphics: display %u: the scanout's room was not zeroed: no mapping of it\n",
+		      displayId);
+		return false;
+	}
+	const UInt64 mapped = mach_absolute_time();
+	bzero(reinterpret_cast<void *>(map->getVirtualAddress()), static_cast<size_t>(room.length));
+	const UInt64 stored = mach_absolute_time();
+	map->release();
+	const UInt64 mapNs = clockNs(mapped - made) + clockNs(mach_absolute_time() - stored);
+	IOLog("ReimsGraphics: display %u: the scanout's room zeroed for its new owner: %llu KiB, "
+	      "%llu us mapping, %llu us stores\n",
+	      displayId, room.length >> 10, mapNs / 1000, clockNs(stored - mapped) / 1000);
+	return true;
+}
+
 IOReturn ReimsGraphics::setScanout(const Mode &mode)
 {
 	UInt32 stride = strideFor(mode.width);
@@ -1578,9 +1606,27 @@ IOReturn ReimsGraphics::newUserClient(task_t owningTask, void *securityID, UInt3
 	}
 	IOLockLock(stateLock);
 	const IOUserClient *held = static_cast<const IOUserClient *>(scanoutOwner.client);
-	bool marked = scanoutOwner.beginOpen(owningTask, held && !held->isInactive());
+	bool clear = false;
+	bool marked = scanoutOwner.beginOpen(owningTask, held && !held->isInactive(), &clear);
 	bool stale = modeConfig.serverOpens();
 	IOLockUnlock(stateLock);
+	if (clear) {
+		// A task that is not the scanout's last owner: the room holds what that owner left, which
+		// goes before this task owns it (RgfxScanoutOwner.hpp). Every other task's hold of the
+		// scanout goes first, so none of theirs lands after the zeros. A room the kernel will not
+		// map for the zeros fails the open, as a block's does its grant.
+		scanoutOwnerMoved(owningTask);
+		const bool zeroed = zeroScanoutRoom();
+		const void *oldTask = nullptr, *oldClient = nullptr;
+		IOLockLock(stateLock);
+		if (zeroed)
+			scanoutOwner.endClear();
+		else
+			scanoutOwner.endOpen(owningTask, nullptr, marked, &oldTask, &oldClient);
+		IOLockUnlock(stateLock);
+		if (!zeroed)
+			return kIOReturnNoMemory;
+	}
 	if (stale && getProperty(kIOFBConfigKey)) {
 		// Made from a list the device has changed since (RgfxDisplayModes.hpp).
 		removeProperty(kIOFBConfigKey);

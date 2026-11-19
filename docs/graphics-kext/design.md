@@ -4409,7 +4409,15 @@ every other task's hold of the scanout is taken back then: each grant, its
 span mapped back out of the context's window, and each lock's mapping,
 unmapped from the task. What IOFramebuffer itself mapped for a task (the VRAM
 range on its connections) is IOFramebuffer's, and goes only with its
-connection.
+connection. The room keeps what its last owner left there, so a task that is
+not the last owner (the next WindowServer, after a crash or a logout) owns
+nothing until the framebuffer has taken every other task's hold back and
+written zeros over the display's room, through a write-back mapping, the mode
+the windows and the locks map it in (`RgfxScanoutOwner.hpp`). The display
+shows black, not the last owner's frame, until the new owner presents. The
+last owner opening again keeps its bytes, and the first owner finds the boot
+screen, which no process wrote and which the first present clears. A room the
+kernel will not map for the zeros fails the open.
 
 Command buffers do not pass through the kext, so the host checks each
 object a message names: it must be
