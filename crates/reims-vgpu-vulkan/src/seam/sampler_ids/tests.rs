@@ -60,11 +60,16 @@ fn an_id_goes_back_with_its_last_holder() {
 #[test]
 fn a_numbering_past_the_last_free_id_holds_nothing() {
     let mut numbering = Numbering::new();
-    let all_but_one: Vec<_> = (0..u64::from(SAMPLER_ID_COUNT - 1)).map(constexpr).collect();
+    let all_but_one: Vec<_> = (0..u64::from(SAMPLER_ID_COUNT - 1))
+        .map(constexpr)
+        .collect();
     assert!(numbering.take(&all_but_one).is_some());
     let past = [constexpr(10_000), constexpr(10_001)];
     assert_eq!(numbering.take(&past), None);
-    assert_eq!(numbering.take(&[constexpr(10_002)]), Some(vec![SAMPLER_ID_COUNT]));
+    assert_eq!(
+        numbering.take(&[constexpr(10_002)]),
+        Some(vec![SAMPLER_ID_COUNT])
+    );
 }
 
 fn device() -> Device {
@@ -115,7 +120,10 @@ fn on_vulkan_reads_and_writes_take_ids_beside_constexpr_samplers() {
     let device = device();
     let ids = SamplerIds::new(&device).unwrap();
     let library = Library::from_metallib(NUMBERED).unwrap();
-    let state = |name| ids.new_compute_pipeline_state(&kernel(&library, name)).unwrap();
+    let state = |name| {
+        ids.new_compute_pipeline_state(&kernel(&library, name))
+            .unwrap()
+    };
     let read = state("numbered_read");
     let write = state("numbered_write");
     let sample = state("numbered_sample");
@@ -132,7 +140,9 @@ fn on_vulkan_five_constexpr_samplers_take_five_ids() {
     let device = device();
     let ids = SamplerIds::new(&device).unwrap();
     let library = Library::from_metallib(FIVE).unwrap();
-    let state = ids.new_compute_pipeline_state(&kernel(&library, "five_samplers")).unwrap();
+    let state = ids
+        .new_compute_pipeline_state(&kernel(&library, "five_samplers"))
+        .unwrap();
     assert_eq!(state.samplers().len(), 5, "{:?}", state.samplers());
     assert_eq!(state.sampler_ids().to_vec(), vec![1, 2, 3, 4, 5]);
 }
@@ -143,7 +153,8 @@ fn on_vulkan_a_render_state_numbers_its_fragment_functions_read() {
     let device = device();
     let ids = SamplerIds::new(&device).unwrap();
     let library = Library::from_metallib(NUMBERED).unwrap();
-    let function = |name| StageSource::Function(FunctionDescriptor::new(library.function(name).unwrap()));
+    let function =
+        |name| StageSource::Function(FunctionDescriptor::new(library.function(name).unwrap()));
     let mut descriptor = RenderPipelineDescriptor::new(function("numbered_vertex"));
     descriptor.fragment = Some(function("numbered_fragment_read"));
     descriptor.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm));
@@ -204,7 +215,9 @@ fn on_vulkan_a_state_rt_refuses_holds_no_id() {
     assert!(
         matches!(
             refused,
-            Err(PipelineError::Runtime(Error::Unsupported(Gap::IndirectCommandBuffers)))
+            Err(PipelineError::Runtime(Error::Unsupported(
+                Gap::IndirectCommandBuffers
+            )))
         ),
         "{:?}",
         refused.err()

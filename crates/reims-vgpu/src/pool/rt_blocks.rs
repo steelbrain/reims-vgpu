@@ -23,7 +23,10 @@ use super::{BlockError, BlockId, BlockInfo, BlockSource, MemoryClass};
 /// The pool's blocks from an rt device, with the handle of each one handed out.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "the pool's source over rt, which no device runs on yet")
+    expect(
+        dead_code,
+        reason = "the pool's source over rt, which no device runs on yet"
+    )
 )]
 pub(crate) struct RtBlocks {
     device: rt::Device,
@@ -35,7 +38,10 @@ impl RtBlocks {
     /// A source of `device`'s blocks, with none handed out.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "the pool's source over rt, which no device runs on yet")
+        expect(
+            dead_code,
+            reason = "the pool's source over rt, which no device runs on yet"
+        )
     )]
     pub(crate) fn new(device: rt::Device) -> RtBlocks {
         RtBlocks {
@@ -127,7 +133,10 @@ mod tests {
         let reused = device.counters().metrics().blocks_reused;
         assert_eq!(blocks.release_block(shared.id), Ok(()));
         assert_eq!(blocks.release_block(shared.id), Err(BlockError::NotHeld));
-        assert_eq!(blocks.release_block(BlockId(u32::MAX)), Err(BlockError::NotHeld));
+        assert_eq!(
+            blocks.release_block(BlockId(u32::MAX)),
+            Err(BlockError::NotHeld)
+        );
         assert_eq!(blocks.release_block(private.id), Ok(()));
         // rt keeps a block given back for a take of its length on its block-maker thread: a take
         // of it is rt's count of blocks taken again.
@@ -138,7 +147,10 @@ mod tests {
                 break;
             }
             assert_eq!(blocks.release_block(again.id), Ok(()));
-            assert!(Instant::now() < deadline, "rt took no block given back again");
+            assert!(
+                Instant::now() < deadline,
+                "rt took no block given back again"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
     }

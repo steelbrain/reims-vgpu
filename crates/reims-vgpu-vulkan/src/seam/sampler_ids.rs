@@ -64,7 +64,8 @@ impl SamplerIds {
     /// Err: rt's refusal of the grant: `Refusal::IndicesGranted` where any ID of the range is
     /// granted already, as for a second numbering of one device.
     pub fn new(device: &Device) -> Result<SamplerIds, Error> {
-        let grant = device.grant_indices(IndexClass::Sampler, FIRST_SAMPLER_ID, SAMPLER_ID_COUNT)?;
+        let grant =
+            device.grant_indices(IndexClass::Sampler, FIRST_SAMPLER_ID, SAMPLER_ID_COUNT)?;
         Ok(SamplerIds {
             device: device.clone(),
             grant,
@@ -136,7 +137,11 @@ impl SamplerIds {
 
     /// The handle of a state rt `made`, or its error, with the IDs `taken` for it: a failed
     /// creation drops them, as rt holds none of them then.
-    fn numbered<S>(&self, made: Result<S, Error>, taken: Taken) -> Result<Numbered<S>, PipelineError> {
+    fn numbered<S>(
+        &self,
+        made: Result<S, Error>,
+        taken: Taken,
+    ) -> Result<Numbered<S>, PipelineError> {
         let lease = match taken {
             Taken::Exhausted => return Err(PipelineError::SamplerIds),
             Taken::Ids(lease) => lease,

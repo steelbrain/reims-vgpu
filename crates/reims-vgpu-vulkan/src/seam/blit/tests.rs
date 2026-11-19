@@ -70,7 +70,11 @@ fn on_vulkan_a_copy_with_no_option_is_rts_copy() {
     let want: Vec<u8> = (0..BYTES).map(|i| (i * 7 + 3) as u8).collect();
     let contents = source.contents().unwrap();
     // SAFETY: the buffer is alive, Shared and `BYTES` long, and no work uses it yet.
-    unsafe { contents.as_ptr().copy_from_nonoverlapping(want.as_ptr(), BYTES) };
+    unsafe {
+        contents
+            .as_ptr()
+            .copy_from_nonoverlapping(want.as_ptr(), BYTES)
+    };
     let texture = texture(&device);
     let queue = device.new_command_queue(4).unwrap();
     let command_buffer = queue.command_buffer().unwrap();
@@ -99,7 +103,9 @@ fn on_vulkan_a_copy_with_no_option_is_rts_copy() {
 fn on_vulkan_a_copy_with_an_option_is_refused_with_nothing_recorded() {
     let device = device();
     let block = device.take_block(MemoryClass::Shared, 1).unwrap();
-    let source = device.new_buffer(block.id, 0, BYTES as u64, Some(0)).unwrap();
+    let source = device
+        .new_buffer(block.id, 0, BYTES as u64, Some(0))
+        .unwrap();
     let destination = (device.new_buffer(block.id, 4096, BYTES as u64, None)).unwrap();
     let contents = destination.contents().unwrap();
     // SAFETY: the buffer is alive, Shared and `BYTES` long, and no work uses it yet.
@@ -119,7 +125,10 @@ fn on_vulkan_a_copy_with_an_option_is_refused_with_nothing_recorded() {
             place,
             options,
         );
-        assert!(matches!(to, Err(BlitError::Options(o)) if o == options), "{to:?}");
+        assert!(
+            matches!(to, Err(BlitError::Options(o)) if o == options),
+            "{to:?}"
+        );
         let from = copy_from_texture_to_buffer_with_options(
             &mut encoder,
             &texture,
@@ -129,7 +138,10 @@ fn on_vulkan_a_copy_with_an_option_is_refused_with_nothing_recorded() {
             layout(),
             options,
         );
-        assert!(matches!(from, Err(BlitError::Options(o)) if o == options), "{from:?}");
+        assert!(
+            matches!(from, Err(BlitError::Options(o)) if o == options),
+            "{from:?}"
+        );
     }
     encoder.end_encoding();
     run(&command_buffer);

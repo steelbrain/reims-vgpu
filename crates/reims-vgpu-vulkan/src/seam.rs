@@ -16,7 +16,7 @@ pub mod blit;
 pub mod sampler_ids;
 
 pub use blit::BlitError;
-pub use sampler_ids::{Numbered, PipelineError, SamplerIds, FIRST_SAMPLER_ID, SAMPLER_ID_COUNT};
+pub use sampler_ids::{FIRST_SAMPLER_ID, Numbered, PipelineError, SAMPLER_ID_COUNT, SamplerIds};
 
 #[cfg(any(test, feature = "testkit"))]
 pub use testkit::test_device;
