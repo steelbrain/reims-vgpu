@@ -549,7 +549,11 @@ mod tests {
         let mark = r.p.call_log().mark();
         write(&mut r, 0x101, 21, (32, 8));
         let calls = r.p.call_log().since(mark);
-        assert_eq!(written_back(&calls), [(image, cache, 0)], "the early copy's");
+        assert_eq!(
+            written_back(&calls),
+            [(image, cache, 0)],
+            "the early copy's"
+        );
         let back = first(&calls, TO_BUFFER);
         assert!(copies(&calls[..back]).is_empty(), "written back first");
         assert_eq!(copies(&calls[back..]).len(), 1);
