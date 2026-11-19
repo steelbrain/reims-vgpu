@@ -89,7 +89,7 @@ RgfxRegion::SurfaceBlock RgfxRegion::acquireSurface(const void *plane, uint64_t 
 		releaseSurface(offset);
 		return out;
 	}
-	out.block = {offset, m_base + offset, size, true};
+	out.block = {offset, m_base + offset, size, true, 0};
 	out.serial = serial;
 	out.fresh = fresh;
 	return out;
@@ -128,7 +128,7 @@ RgfxRegion::SurfaceBlock RgfxRegion::acquireSurfacePages(const void *base, uint6
 		*answer = kPagesRefused;
 		return out;
 	}
-	out.block = {offset, m_base + offset, size, true};
+	out.block = {offset, m_base + offset, size, true, 0};
 	out.serial = serial;
 	out.fresh = fresh;
 	out.cached = cached;
