@@ -561,13 +561,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 },
                 None => None,
             };
-            // The guest's processes take blocks of it for their buffers' slabs (`POOL`) where
-            // the guest is x86-64, on a Linux or macOS host: on Windows the pool waits for its
-            // cost under WHP to be measured within 5% of the region's, and on an arm64 guest for
-            // a boot that shows its kernel maps the pool's addresses cacheable.
-            let pool_ledger = (shared_pool.as_ref())
-                .filter(|_| !cfg!(windows) && config.guest_arch == GuestArch::X86_64)
-                .map(Pool::ledger);
+            // The guest's processes take blocks of it for their buffers' slabs (`POOL`), on a
+            // Linux or macOS host: on Windows the pool waits for its cost under WHP to be measured
+            // within 5% of the region's. An arm64 guest's kernel maps the pool's addresses, past
+            // its RAM and above 2^36, write-back, as the x86-64 kernel does: an arm64 26 boot
+            // under TCG, which faults an unaligned load from Device memory, read each of its
+            // first blocks unaligned through such a mapping.
+            let pool_ledger = (shared_pool.as_ref()).filter(|_| !cfg!(windows)).map(Pool::ledger);
             // `Managed` resources are one copy where the platform answers that the GPU shares the
             // CPU's memory, else two, which hold Metal's contract on any GPU: the guest's device
             // answers `hasUnifiedMemory` alike, from the blob.

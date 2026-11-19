@@ -526,8 +526,8 @@ pub const RGFX_FEATURE_BUFFER_ESCAPED: u64 = 0x100_0000_0000_0000;
 /// [`RGFX_CMD_POOL_TAKE`] and [`RGFX_CMD_POOL_GIVE`], a context's ask for a block of the pool and
 /// its giving one back, and a context's ring carries [`RGFX_CMD_HEAP_OVER_POOL`], a Shared heap
 /// over a block it holds (docs/graphics-kext/design.md, "The Shared pool"). The host offers it
-/// where it reserved a pool, but on Windows; the x86-64 kext takes it, and a guest that did not
-/// take it is refused every one of those messages and keeps its slabs in the region.
+/// where it reserved a pool, but on Windows; the x86-64 and arm64e kexts take it, and a guest that
+/// did not take it is refused every one of those messages and keeps its slabs in the region.
 pub const RGFX_FEATURE_POOL: u64 = 0x200_0000_0000_0000;
 /// `FEATURES_HI` bit 26, feature bit 58, `SURFACE_REFILL`: an
 /// [`RGFX_OP_SURFACE_USE`](crate::ops::RGFX_OP_SURFACE_USE) may carry
@@ -549,7 +549,7 @@ pub const RGFX_FEATURE_SURFACE_REFILL: u64 = 0x400_0000_0000_0000;
 /// ([`RGFX_CONTEXT_VA_BASE`]). On metal2vulkan-rt's device the address is the block's Vulkan
 /// device address; on the Vulkan platform before it, an address the host picks in
 /// `[2^45, 2^46)`, below every context's range, and pins the heaps there. Every host with a pool
-/// offers it; the x86-64 kext takes it.
+/// offers it; the x86-64 and arm64e kexts take it.
 pub const RGFX_FEATURE_POOL_ADDRESSES: u64 = 0x800_0000_0000_0000;
 /// `FEATURES_HI` bit 28, feature bit 60, `PRIVATE_BLOCKS`: the host gives each context blocks of
 /// GPU addresses for its Private objects. Ring 0 carries [`RGFX_CMD_PRIVATE_TAKE`] and
