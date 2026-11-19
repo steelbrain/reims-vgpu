@@ -13493,7 +13493,7 @@ pub(super) mod tests {
             "one copy a run"
         );
         assert_eq!(
-            buffer_bytes(&r, staging, None),
+            buffer_bytes(&r, staging, None)[..ram.len()],
             ram,
             "the pages' bytes, in order"
         );
@@ -13528,7 +13528,7 @@ pub(super) mod tests {
             (0, cache, 0, page),
             "the whole page, the bytes beside its row's texels too"
         );
-        assert_eq!(buffer_bytes(&r, staging, None), ram);
+        assert_eq!(buffer_bytes(&r, staging, None)[..ram.len()], ram);
         r.p.world().complete_all(CompleteOn::Caller);
 
         assert_eq!(
@@ -13829,10 +13829,11 @@ pub(super) mod tests {
             before,
             "the pages wait for it"
         );
-        // As the GPU's copy would, the staging buffer takes the cache's bytes.
+        // As the GPU's copy would, the staging piece takes the cache's bytes: the surface's
+        // length, rounded up to rt's granule.
         assert_eq!(
             buffer_bytes(&r, out[0].1, Some(0xc3)).len(),
-            length.to_usize()
+            length.next_multiple_of(PIECE_GRANULE).to_usize()
         );
         complete_staged(&r);
         assert!(
@@ -13857,9 +13858,9 @@ pub(super) mod tests {
             "the download's staging buffer, a spare once its command buffer completed"
         );
         assert_eq!(
-            buffer_bytes(&r, filled[0].0, None),
+            buffer_bytes(&r, filled[0].0, None)[..written.len()],
             written,
-            "the CPU's write, in the fill's staging buffer before the GPU copies it"
+            "the CPU's write, in the fill's staging piece before the GPU copies it"
         );
         r.p.world().complete_all(CompleteOn::Caller);
         let released = release(&r, BLOCK);
@@ -13912,10 +13913,11 @@ pub(super) mod tests {
         let out = copies(&r.p.call_log().since(mark));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, cache, "out of the cache");
-        // As the GPU's copy would, the staging buffer takes the cache's bytes, all of them.
+        // As the GPU's copy would, the staging piece takes the cache's bytes, all of them: the
+        // surface's length, rounded up to rt's granule.
         assert_eq!(
             buffer_bytes(&r, out[0].1, Some(0xc3)).len(),
-            length.to_usize()
+            length.next_multiple_of(PIECE_GRANULE).to_usize()
         );
         complete_staged(&r);
         assert!(done.load(Ordering::SeqCst));
