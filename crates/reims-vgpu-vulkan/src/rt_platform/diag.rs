@@ -32,6 +32,12 @@
 //!   are not read: the committing thread runs the guest's call, and a hash of them at each commit
 //!   held it in proportion to them.
 //! - **Imports by origin**, as the textures' kinds name it.
+//! - **Imports by path.** Each import of the host's pages a no-copy buffer or heap asked
+//!   (`super::buffer::import_pages`), by the kind of the make that asked it
+//!   (`crate::answer::making_as`): how many were made by their pointer and as a dma-buf of the
+//!   files behind them, and how many were refused as too large for one dma-buf or otherwise, with
+//!   their bytes; the most runs and bytes of one refused as too large, and the limits of one
+//!   dma-buf; and every import asked, by size ([`import_path`]).
 //! - **Guest surface textures by declared usage.** Each texture the decoder made, or was refused,
 //!   over a surface's plane (`TEXTURE_FROM_IOSURFACE`), by the usage the guest declared, how it
 //!   was made (a view of a shape's image, or over the cache's buffer and why) and whether its
@@ -954,6 +960,78 @@ fn answered(answer: Option<u32>) -> String {
     answer.map_or_else(|| "refused".to_owned(), |n| format!("{n} bytes"))
 }
 
+// ----- Import paths.
+
+/// How an import of the host's pages was made, or why it was refused
+/// (`super::buffer::import_pages`).
+#[derive(Clone, Copy, Debug)]
+pub enum ImportPath {
+    /// Made by the pages' pointer (rt's `import_host_memory`).
+    Pointer,
+    /// Made as a dma-buf of the files behind the pages (rt's `import_dma_buf`).
+    DmaBuf,
+    /// Refused as more runs of file pages, or more bytes, than one dma-buf takes: `pieces` runs,
+    /// where one takes `most_pieces` runs and `most_bytes` bytes.
+    TooLarge {
+        /// The pages' runs of file pages.
+        pieces: u64,
+        /// One dma-buf's most runs.
+        most_pieces: u64,
+        /// One dma-buf's most bytes.
+        most_bytes: u64,
+    },
+    /// Refused otherwise.
+    Refused,
+}
+
+/// The most bytes of each size bucket of the imports asked but the last, which takes the rest.
+const SIZES: [u64; 5] = [64 << 10, 256 << 10, 1 << 20, 4 << 20, 16 << 20];
+
+/// The imports one kind of make asked, by path.
+#[derive(Default)]
+struct PathTotals {
+    /// The imports and their bytes, by path: pointer, dma-buf, too large, refused.
+    counts: [u64; 4],
+    bytes: [u64; 4],
+    /// The most runs and the most bytes of an import refused as too large.
+    most_pieces: u64,
+    most_bytes: u64,
+    /// One dma-buf's most runs and bytes, as the last refusal as too large gave them.
+    limits: (u64, u64),
+    /// The imports asked, on every path, by size ([`SIZES`]).
+    sizes: [u64; 6],
+}
+
+/// The imports asked, by the kind of the make that asked them.
+static PATHS: Mutex<BTreeMap<&'static str, PathTotals>> = Mutex::new(BTreeMap::new());
+
+/// Notes an import of `bytes` bytes of the host's pages for a make of kind `kind`, made or refused
+/// as `path` (`super::buffer::import_pages`).
+pub fn import_path(kind: &'static str, path: ImportPath, bytes: u64) {
+    let i = match path {
+        ImportPath::Pointer => 0,
+        ImportPath::DmaBuf => 1,
+        ImportPath::TooLarge { .. } => 2,
+        ImportPath::Refused => 3,
+    };
+    let mut paths = PATHS.lock();
+    let t = paths.entry(kind).or_default();
+    t.counts[i] += 1;
+    t.bytes[i] += bytes;
+    if let ImportPath::TooLarge {
+        pieces,
+        most_pieces,
+        most_bytes,
+    } = path
+    {
+        t.most_pieces = t.most_pieces.max(pieces);
+        t.most_bytes = t.most_bytes.max(bytes);
+        t.limits = (most_pieces, most_bytes);
+    }
+    let size = SIZES.iter().position(|&most| bytes <= most);
+    t.sizes[size.unwrap_or(SIZES.len())] += 1;
+}
+
 // ----- Frames.
 
 /// The contexts that presented to the display.
@@ -1130,6 +1208,28 @@ pub fn write() {
             out,
             "reims-vgpu: rt-diag imports: {}: {n}",
             origin_name(origin)
+        );
+    }
+    for (kind, t) in PATHS.lock().iter() {
+        let (c, kib) = (&t.counts, t.bytes.map(|b| b >> 10));
+        let _ = writeln!(
+            out,
+            "reims-vgpu: rt-diag import-paths: {kind}: pointer {} ({} KiB), dma-buf {} ({} KiB), \
+             too large {} ({} KiB; most {} runs, {} KiB; one dma-buf takes {} runs, {} KiB), \
+             refused {} ({} KiB); asked up to 64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, more: {:?}",
+            c[0],
+            kib[0],
+            c[1],
+            kib[1],
+            c[2],
+            kib[2],
+            t.most_pieces,
+            t.most_bytes >> 10,
+            t.limits.0,
+            t.limits.1 >> 10,
+            c[3],
+            kib[3],
+            t.sizes,
         );
     }
     if !presenters.is_empty() {

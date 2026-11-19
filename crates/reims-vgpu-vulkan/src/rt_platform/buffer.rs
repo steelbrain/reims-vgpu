@@ -53,6 +53,23 @@
 //! (measured on the M3 Max, `crate::gpu::command`'s docs): counted ([`READ_ONLY_CODE`]), the
 //! process's first with a line.
 //!
+//! **Dma-bufs of the pages** (Linux). A GPU may take no pointer to some pages: RADV refuses the
+//! pages of a shared mapping of a memfd at the import, as the guest's RAM and the views of its
+//! pages are (rt's `import_host_memory`). There the import is of a dma-buf of the files behind the
+//! pages instead (`crate::os::dma_buf_of_host`, rt's `import_dma_buf`), one dma-buf a block, so
+//! the bytes are the same pages the CPU's mapping reaches. One holds as many runs of file pages as
+//! udmabuf's `list_limit` takes, and as many bytes as its `size_limit_mb`: at the stock limit of
+//! 1,024 runs about 4 MiB of a guest buffer, whose pages are nearly each a run of their own
+//! (`crate::os::linux::device_lend`'s measured note). Pages past either are refused as rt's
+//! refusal of the pointer is, counted as too large with their runs and bytes
+//! ([`IMPORTS_TOO_LARGE`], `super::diag::import_path`); so are pages with no file behind them. rt
+//! answers no `contents` for a dma-buf's block: until it takes the mapping, the device keeps the
+//! host address of the pages the dma-buf holds for it ([`KnownBlocks`]), which a buffer in the
+//! block answers as its `contents` and a pinned buffer over those bytes is a range of, as over a
+//! block rt maps. A Managed buffer over such a block is refused by rt (its block is not one rt
+//! maps), counted ([`MANAGED_OVER_DMA_BUF`]). Each import is counted by the way it was made or
+//! refused ([`IMPORTS_POINTER`], [`IMPORTS_DMA_BUF`], [`IMPORTS_REFUSED`]).
+//!
 //! **Answers.** A buffer's resource options are the asked ones without bits 20 and 24, Metal's
 //! default hazard tracking resolved to tracked, as the Vulkan platform's runtime answers them. A
 //! Private buffer's `contents` is NULL. `didModifyRange:` of a Managed buffer is rt's, which copies
@@ -68,8 +85,8 @@
 
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use metal2vulkan_rt as rt;
 
@@ -88,7 +105,7 @@ use crate::core::sync::Mutex;
 use crate::gpu::device::descriptor_options;
 
 use super::device::RtDevice;
-use super::diag::{Made, Shape};
+use super::diag::{ImportPath, Made, Shape};
 use super::texture::{self, RtTexture, refused_metal};
 use super::unbuilt::{Unbuilt, refuse_create, rt_refused, rt_refused_create};
 use super::{RtObj, RtPlatform, TextureFields};
@@ -117,6 +134,26 @@ pub const IMPORTS_UNNAMED: crate::answer::MadeCodes = crate::answer::MadeCodes {
 /// the GPU's writes reach a no-copy buffer's bytes, where Metal's GPU drops a kernel's and a
 /// blit's writes and faults a render pass's store. Counted per buffer or heap.
 pub const READ_ONLY_CODE: &str = "rt-no-copy-read-only";
+
+/// The code of an import of the host's memory made by its pointer (rt's `import_host_memory`),
+/// counted per import.
+pub const IMPORTS_POINTER: &str = "rt-imports-pointer";
+
+/// The code of an import of the host's memory made as a dma-buf of the files behind its pages, the
+/// GPU taking no pointer to them (the module's docs, "Dma-bufs of the pages"), counted per import.
+pub const IMPORTS_DMA_BUF: &str = "rt-imports-dma-buf";
+
+/// The code of an import of the host's memory refused as more runs of file pages, or more bytes,
+/// than one dma-buf holds, the GPU taking no pointer to them (the module's docs, "Dma-bufs of the
+/// pages"), counted per import asked.
+pub const IMPORTS_TOO_LARGE: &str = "rt-imports-too-large";
+
+/// The code of an import of the host's memory refused otherwise, counted per import asked.
+pub const IMPORTS_REFUSED: &str = "rt-imports-refused";
+
+/// The code of a Managed no-copy buffer asked over a dma-buf's block, which rt refuses as over a
+/// block it does not map (the module's docs, "Dma-bufs of the pages"), counted per buffer.
+pub const MANAGED_OVER_DMA_BUF: &str = "rt-managed-over-dma-buf";
 
 /// A buffer descriptor's `resourceOptions` before any setter: `Shared`.
 const BUFFER_DESCRIPTOR_OPTIONS: u64 = 0;
@@ -175,19 +212,41 @@ impl Drop for RtBuffer {
 /// range of (the module's docs, "A pinned address"): the graphics lane's, which knows a block as it
 /// hands its range to the guest and forgets it as it takes it back, just before it gives the block
 /// back to rt. Each held block is a handle of it, so it lives while known. A handle of the device's
-/// set: its clones are the same set (`RtDevice::known_blocks`).
+/// set: its clones are the same set (`RtDevice::known_blocks`). With them, the host's mappings of
+/// the device's dma-buf imports ([`HostMappings`]), known or not.
 #[derive(Default, Clone)]
-pub struct KnownBlocks(Arc<Mutex<BTreeMap<u64, rt::Block>>>);
+pub struct KnownBlocks {
+    /// The blocks known, by their GPU address.
+    known: Arc<Mutex<BTreeMap<u64, rt::Block>>>,
+    /// The host's mapping of each live dma-buf import.
+    mapped: HostMappings,
+}
+
+/// Interim, until rt takes the mapping of a dma-buf it imports, which it answers no `contents`
+/// for: the host address of the first byte of each live dma-buf import of the device's
+/// ([`import_pages`], the module's docs, "Dma-bufs of the pages"). It is the mapping whose pages
+/// the dma-buf holds (the guest's RAM's, or a view's of it), so the CPU's writes through it and
+/// the GPU's through the import reach the same pages, and each side sees the other's. An import's
+/// entry goes as rt frees it, from its release, which holds this map alone: no handle of rt's.
+#[derive(Default, Clone)]
+struct HostMappings(Arc<Mutex<BTreeMap<rt::BlockId, u64>>>);
+
+impl HostMappings {
+    /// The host address of the first byte of the dma-buf import `id`, where it is one.
+    fn of(&self, id: rt::BlockId) -> Option<u64> {
+        self.0.lock().get(&id).copied()
+    }
+}
 
 impl KnownBlocks {
     /// Knows `block` by its GPU address, in place of a block known there before.
     pub fn know(&self, block: rt::Block) {
-        self.0.lock().insert(block.gpu_address, block);
+        self.known.lock().insert(block.gpu_address, block);
     }
 
     /// Forgets the block `id`, giving back the handle it held; `None` where none is known.
     pub fn forget(&self, id: rt::BlockId) -> Option<rt::Block> {
-        let mut known = self.0.lock();
+        let mut known = self.known.lock();
         let at = known
             .iter()
             .find(|(_, block)| block.id == id)
@@ -198,7 +257,7 @@ impl KnownBlocks {
     /// The known block that holds the `length` bytes at GPU address `address`, and their offset
     /// in it.
     pub fn at(&self, address: u64, length: u64) -> Option<(rt::Block, u64)> {
-        let known = self.0.lock();
+        let known = self.known.lock();
         let (&start, block) = known.range(..=address).next_back()?;
         let offset = address - start;
         let inside = offset
@@ -208,12 +267,12 @@ impl KnownBlocks {
     }
 
     /// The known Shared block whose mapping holds the `length` bytes at `first`, and their offset
-    /// in it.
+    /// in it: rt's, or the host's of a dma-buf import ([`Self::contents_of`]).
     pub fn mapping(&self, first: HostPtr, length: u64) -> Option<(rt::Block, u64)> {
         let first = first.addr().to_u64();
-        let known = self.0.lock();
+        let known = self.known.lock();
         known.values().find_map(|block| {
-            let start = block.contents?.as_ptr().addr().to_u64();
+            let start = self.contents_of(block)?;
             let offset = first.checked_sub(start)?;
             let inside = offset
                 .checked_add(length)
@@ -221,6 +280,21 @@ impl KnownBlocks {
             let shared = block.class == rt::MemoryClass::Shared;
             (shared && inside).then(|| (block.clone(), offset))
         })
+    }
+
+    /// The host address of `block`'s first byte: rt's mapping of it, else the host's mapping of
+    /// the pages a dma-buf import of the device's holds ([`HostMappings`]); `None` for a block
+    /// with neither.
+    pub(super) fn contents_of(&self, block: &rt::Block) -> Option<u64> {
+        match block.contents {
+            Some(at) => Some(at.as_ptr().addr().to_u64()),
+            None => self.mapped.of(block.id),
+        }
+    }
+
+    /// Whether `id` is a live dma-buf import of the device's ([`HostMappings`]).
+    fn is_dma_buf(&self, id: rt::BlockId) -> bool {
+        self.mapped.of(id).is_some()
     }
 }
 
@@ -497,7 +571,8 @@ pub(super) fn private_options(raw: u64) -> Option<u64> {
 }
 
 /// The known block of `class` that holds the `length` bytes at GPU address `pin`, and their
-/// offset in it; where `bytes` is given, only one whose mapping holds them at that offset.
+/// offset in it; where `bytes` is given, only one whose mapping holds them at that offset (rt's,
+/// or the host's of a dma-buf import, `KnownBlocks::contents_of`).
 pub(super) fn known_at(
     device: &RtObj<RtDevice>,
     pin: u64,
@@ -505,9 +580,10 @@ pub(super) fn known_at(
     class: rt::MemoryClass,
     bytes: Option<HostPtr>,
 ) -> Option<(rt::Block, u64)> {
-    let (block, offset) = device.known_blocks().at(pin, length)?;
+    let known = device.known_blocks();
+    let (block, offset) = known.at(pin, length)?;
     let mapped = |at: HostPtr| {
-        let first = block.contents.map(|c| c.as_ptr().addr().to_u64());
+        let first = known.contents_of(&block);
         first.and_then(|first| first.checked_add(offset)) == Some(at.addr().to_u64())
     };
     let fits = block.class == class && bytes.is_none_or(mapped);
@@ -724,6 +800,9 @@ fn range_of(
     let (block, offset) = bytes;
     let made = match storage {
         Storage::Managed => {
+            if device.known_blocks().is_dma_buf(block.id) {
+                crate::answer::count_kind(MANAGED_OVER_DMA_BUF);
+            }
             let own = match device.rt().has_unified_memory() || copy.is_some() {
                 true => None,
                 false => Some(take(device, sel, rt::MemoryClass::Private, length)?),
@@ -747,7 +826,8 @@ fn range_of(
 
 /// rt's import of the host's pages that hold the `length` bytes at `first`, for `sel` (the module's
 /// docs, "Imports"), counted under the kind of the make running on the thread: the block, and the
-/// bytes' offset in it. rt's release of the import runs
+/// bytes' offset in it. Where the GPU takes no pointer to the pages, on Linux, the import is of a
+/// dma-buf of the files behind them ("Dma-bufs of the pages"). rt's release of the import runs
 /// `then`, after the import is freed. `None` where Metal or rt refuses it, counted, `then` dropped
 /// unrun.
 pub(super) fn import_pages(
@@ -766,30 +846,193 @@ pub(super) fn import_pages(
         return refused_metal(sel, &format!("{length} bytes at {first:#x}"));
     };
     let codes = crate::answer::making().unwrap_or(IMPORTS_UNNAMED);
-    let release: NoCopyDeallocator = Box::new(move || {
-        LIVE_IMPORTS.fetch_sub(1, Ordering::Relaxed);
-        crate::answer::count_gone(codes);
-        then();
-    });
-    // SAFETY: the creators' `HostRange` contracts keep the bytes mapped and readable until their
-    // deallocator runs, which runs only from `release`, once rt freed the import, or as the
-    // object over a known block goes, which holds no import; with none, for the object's life,
-    // which holds the import. The pages they lie in, which the import covers, are mapped as they
-    // are. They are mapped writable too: the no-copy creators' bytes are memory the host maps
-    // readable and writable (the device's region, the host's own).
-    let imported = unsafe { (device.rt()).import_host_memory(at, end - start, Some(release)) };
-    match imported {
+    let len = end - start;
+    let then: Then = Arc::new(Mutex::new(Some(Box::new(then))));
+    let release = released(codes, &then, None);
+    let imported = match pointer_refused() {
+        Some(error) => Err(error),
+        // SAFETY: the creators' `HostRange` contracts keep the bytes mapped and readable until
+        // their deallocator runs, which runs only from the release, once rt freed the import, or
+        // as the object over a known block goes, which holds no import; with none, for the
+        // object's life, which holds the import. The pages they lie in, which the import covers,
+        // are mapped as they are. They are mapped writable too: the no-copy creators' bytes are
+        // memory the host maps readable and writable (the device's region, the host's own).
+        None => unsafe { (device.rt()).import_host_memory(at, len, Some(release)) },
+    };
+    let (block, offset) = match imported {
         Ok((block, _)) => {
-            imports_rise();
-            super::diag::imported(block.id, sel);
-            crate::answer::count_made(codes);
-            Some((block, first - start))
+            crate::answer::count_kind(IMPORTS_POINTER);
+            super::diag::import_path(codes.made, ImportPath::Pointer, len);
+            (block, 0)
         }
         Err(error) => {
-            rt_refused_create(sel, &error);
-            None
+            let release = released_into(codes, &then);
+            by_dma_buf(device, sel, codes.made, (at, len), release, &error)?
         }
+    };
+    imports_rise();
+    super::diag::imported(block.id, sel);
+    crate::answer::count_made(codes);
+    Some((block, offset + (first - start)))
+}
+
+/// What an import's release runs, once: taken from its slot, which the release of an import
+/// refused and that of the one made in its place share ([`import_pages`]).
+type Then = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+/// The release of an import for a make of `codes`, which runs `then`: one fewer import live, and,
+/// for a dma-buf's, whose block `forget` names once it is made, the host's mapping of it forgotten
+/// first ([`HostMappings`]). It makes no call into rt and drops no handle of rt's.
+fn released(
+    codes: crate::answer::MadeCodes,
+    then: &Then,
+    forget: Option<(HostMappings, Arc<OnceLock<rt::BlockId>>)>,
+) -> NoCopyDeallocator {
+    let then = Arc::clone(then);
+    Box::new(move || {
+        LIVE_IMPORTS.fetch_sub(1, Ordering::Relaxed);
+        crate::answer::count_gone(codes);
+        if let Some((mapped, id)) = forget
+            && let Some(id) = id.get()
+        {
+            mapped.0.lock().remove(id);
+        }
+        let then = then.lock().take();
+        if let Some(then) = then {
+            then();
+        }
+    })
+}
+
+/// [`released`] for a dma-buf's import, given the host's mappings it forgets its block from and
+/// the slot its block's number goes into once it is made.
+type Released = Box<dyn FnOnce(HostMappings, Arc<OnceLock<rt::BlockId>>) -> NoCopyDeallocator>;
+
+/// The release of a dma-buf's import for a make of `codes` that runs `then` ([`released`]).
+fn released_into(codes: crate::answer::MadeCodes, then: &Then) -> Released {
+    let then = Arc::clone(then);
+    Box::new(move |mapped, id| released(codes, &then, Some((mapped, id))))
+}
+
+/// [`import_pages`]'s import of `pages`, the `len` bytes of whole pages at their address, as a
+/// dma-buf of the files behind them, where rt refused their pointer with `error` (the module's
+/// docs, "Dma-bufs of the pages"), for a make whose imports are counted as `kind`, rt's release of
+/// it from `release`: the block, and the offset of the pages' first byte in it, whose host address
+/// the device keeps for the block ([`HostMappings`]) until rt frees it. `None` where the pages are
+/// refused too, counted: past what one dma-buf holds or with no file behind them, as rt's refusal
+/// of their pointer, and as rt's of the dma-buf where it refuses that.
+#[cfg(target_os = "linux")]
+fn by_dma_buf(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    kind: &'static str,
+    (at, len): (NonNull<u8>, u64),
+    release: Released,
+    error: &rt::Error,
+) -> Option<(rt::Block, u64)> {
+    use crate::os::LendRefusal;
+    if matches!(error, rt::Error::Quiesced) {
+        return import_refused(sel, kind, len, error);
     }
+    let lent = match crate::os::dma_buf_of_host(at, len, &[(0, len)]) {
+        Ok(lent) => lent,
+        Err(LendRefusal::TooLarge {
+            pieces,
+            bytes,
+            most_pieces,
+            most_bytes,
+            ..
+        }) => {
+            crate::answer::count_kind(IMPORTS_TOO_LARGE);
+            let path = ImportPath::TooLarge {
+                pieces,
+                most_pieces,
+                most_bytes,
+            };
+            super::diag::import_path(kind, path, bytes);
+            rt_refused_create(sel, error);
+            return None;
+        }
+        Err(LendRefusal::Refused(_)) => return import_refused(sel, kind, len, error),
+    };
+    // The pages' first byte lies `skip` into the dma-buf, whose first byte the host maps `skip`
+    // before it: the host's pages are whole in it.
+    let skip = lent.offsets.first().copied().unwrap_or(0);
+    let mapped = device.known_blocks().mapped.clone();
+    let id = Arc::new(OnceLock::new());
+    let release = release(mapped.clone(), Arc::clone(&id));
+    match device.rt().import_dma_buf(lent.fd, lent.size, Some(release)) {
+        Ok((block, _)) => {
+            let _ = id.set(block.id);
+            let first = at.as_ptr().addr().to_u64().wrapping_sub(skip);
+            mapped.0.lock().insert(block.id, first);
+            crate::answer::count_kind(IMPORTS_DMA_BUF);
+            super::diag::import_path(kind, ImportPath::DmaBuf, len);
+            if !DMA_BUF_SAID.swap(true, Ordering::Relaxed) {
+                log::info!(
+                    target: TARGET,
+                    "{sel}: the GPU took no pointer to the pages of a no-copy buffer or heap \
+                     ({error}); each such is imported as a dma-buf of the files behind its pages \
+                     ({IMPORTS_DMA_BUF}), counted from here"
+                );
+            }
+            Some((block, skip))
+        }
+        Err(refusal) => import_refused(sel, kind, len, &refusal),
+    }
+}
+
+/// [`import_pages`]'s import of `pages` where rt refused their pointer with `error`, off Linux:
+/// refused, counted as rt's refusal of the pointer.
+#[cfg(not(target_os = "linux"))]
+fn by_dma_buf(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    kind: &'static str,
+    (at, len): (NonNull<u8>, u64),
+    release: Released,
+    error: &rt::Error,
+) -> Option<(rt::Block, u64)> {
+    let _ = (device, at, release);
+    import_refused(sel, kind, len, error)
+}
+
+/// Whether the process logged its first import made as a dma-buf.
+#[cfg(target_os = "linux")]
+static DMA_BUF_SAID: AtomicBool = AtomicBool::new(false);
+
+/// Counts rt's refusal `error` of an import of `len` bytes for `sel`, for a make whose imports are
+/// counted as `kind` ([`IMPORTS_REFUSED`]). `None`.
+fn import_refused<T>(
+    sel: &'static str,
+    kind: &'static str,
+    len: u64,
+    error: &rt::Error,
+) -> Option<T> {
+    crate::answer::count_kind(IMPORTS_REFUSED);
+    super::diag::import_path(kind, ImportPath::Refused, len);
+    rt_refused_create(sel, error);
+    None
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether this thread's imports find their pointer refused, with nothing asked of rt, as
+    /// RADV refuses a memfd's pages at the import (the tests').
+    static POINTER_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The tests' refusal of the thread's pointers (`POINTER_REFUSED`), RADV's to a memfd's pages;
+/// never outside the tests.
+fn pointer_refused() -> Option<rt::Error> {
+    #[cfg(test)]
+    if POINTER_REFUSED.get() {
+        return Some(rt::Error::Vulkan {
+            call: "vkAllocateMemory",
+            result: ash::vk::Result::ERROR_INVALID_EXTERNAL_HANDLE,
+        });
+    }
+    None
 }
 
 /// rt's import of the host's pages that hold the `length` bytes at `first`, as a no-copy buffer's
@@ -914,10 +1157,16 @@ impl GpuResource<RtPlatform> for RtObj<RtBuffer> {
 }
 
 impl Buffer<RtPlatform> for RtObj<RtBuffer> {
-    /// rt's: NULL for a Private buffer, as Metal's.
+    /// rt's: NULL for a Private buffer, as Metal's. A buffer in a dma-buf's block, which rt maps
+    /// no bytes of, answers the host's mapping of its pages (`KnownBlocks::contents_of`, interim
+    /// until rt takes that mapping).
     fn contents(&self) -> HostPtr {
-        match self.rt.contents() {
-            Some(at) => HostPtr::from_ptr(at.as_ptr()),
+        if let Some(at) = self.rt.contents() {
+            return HostPtr::from_ptr(at.as_ptr());
+        }
+        let mapped = self.device.known_blocks().mapped.of(self.rt.block());
+        match mapped.and_then(|first| first.checked_add(self.rt.offset())) {
+            Some(at) => HostPtr::from_addr(at.to_usize()),
             None => HostPtr::NULL,
         }
     }
@@ -1647,5 +1896,170 @@ mod tests {
             (before.0 + 1, before.1 + 1)
         );
         assert!(over(descriptor(20, 8, 4), plane(0, 32, None)).is_some());
+    }
+
+    /// On Linux, on the GPU the test holds, where the GPU takes no pointer to a no-copy buffer's
+    /// pages (`POINTER_REFUSED`, as RADV refuses a memfd's): pages with no file behind them, and
+    /// pages in more runs of file pages than one dma-buf takes, are refused, counted, a
+    /// deallocator never run. Over pages with a file behind them, the buffer is a range of rt's
+    /// import of a dma-buf of them, counted, its `contents` its bytes, which the CPU's writes and a
+    /// blit's reach both ways; a known import's block holds a no-copy buffer pinned over its bytes,
+    /// with no import of its own, and a Managed one over them is rt's refusal, counted; each
+    /// release runs once rt freed its import, and the device then forgets its mapping. Where the
+    /// device imports no dma-buf, the buffer is refused, counted, and the test says so.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dma_bufs_of_pages_on_vulkan() {
+        use crate::core::num::ToU64 as _;
+        use crate::core::platform::os::vm::HostVm as _;
+
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        POINTER_REFUSED.set(true);
+        let page = device.facts().page_size;
+        let flag = || {
+            let ran = Arc::new(AtomicBool::new(false));
+            let run = Arc::clone(&ran);
+            (ran, move || run.store(true, Ordering::Release))
+        };
+        let codes = [
+            IMPORTS_POINTER,
+            IMPORTS_DMA_BUF,
+            IMPORTS_REFUSED,
+            IMPORTS_TOO_LARGE,
+        ];
+        let counts = || codes.map(counted);
+        let plus = |before: [u64; 4], i: usize| {
+            let mut after = before;
+            after[i] += 1;
+            after
+        };
+
+        // Pages with no file behind them.
+        let layout = Layout::from_size_align(0x4000, 0x1000).expect("a layout");
+        // SAFETY: the layout's size is not 0.
+        let memory = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!memory.is_null());
+        let before = counts();
+        let (freed, deallocator) = flag();
+        // SAFETY: the memory is never freed.
+        let bytes = unsafe { HostRange::new(HostPtr::from_ptr(memory), 0x1000) };
+        let made = device.new_buffer_over_host_memory(on, bytes, 0, Some(Box::new(deallocator)));
+        assert!(made.expect("never a raise").is_none());
+        assert_eq!(counts(), plus(before, 2));
+        assert!(!freed.load(Ordering::Acquire));
+
+        // Pages with a file behind them, the test's own, which the process ends with: 0x11s, 16
+        // bytes in. Whether the host makes a dma-buf of them (udmabuf).
+        let pages = crate::os::allocate_aliasable(4 * page).expect("pages of a file");
+        let at = pages.wrapping_add(16);
+        // SAFETY: fresh pages of the test's own, which nothing uses yet.
+        unsafe { at.as_ptr::<u8>().write_bytes(0x11, 128) };
+        let first = NonNull::new(pages.as_ptr::<u8>()).expect("mapped pages");
+        let lent = crate::os::dma_buf_of_host(first, page, &[(0, page)]).is_ok();
+
+        // Pages in more runs than one dma-buf takes (udmabuf's `list_limit` as the host has it):
+        // a view of every other page of a file. Where it takes more runs than the test makes, or
+        // the host makes no dma-buf, unchecked.
+        let limit = std::fs::read_to_string("/sys/module/udmabuf/parameters/list_limit");
+        let limit = limit.ok().and_then(|limit| limit.trim().parse::<u64>().ok());
+        match limit.filter(|&limit| lent && limit < 4096) {
+            Some(limit) => {
+                let n = limit + 1;
+                let ram = crate::os::allocate_aliasable(2 * n * page).expect("pages of a file");
+                let runs: Vec<_> = (0..n)
+                    .map(|i| (ram.wrapping_add(2 * i * page), page))
+                    .collect();
+                let vm = crate::os::OsVm::new();
+                let view = vm.allocate_anywhere(n * page).expect("a range for a view");
+                assert!(vm.remap_runs_shared_overwrite(view, &runs).is_ok());
+                let before = counts();
+                // SAFETY: the view and its pages are the test's own, never freed.
+                let bytes = unsafe { HostRange::new(view, n * page) };
+                let made = device.new_buffer_over_host_memory(on, bytes, 0, None);
+                assert!(made.expect("never a raise").is_none());
+                assert_eq!(counts(), plus(before, 3));
+            }
+            None => eprintln!("udmabuf takes {limit:?} runs, dma-bufs {lent}: unchecked past it"),
+        }
+
+        // Over the pages with a file behind them.
+        let before = counts();
+        let (freed, deallocator) = flag();
+        // SAFETY: the pages are the test's own, never freed.
+        let bytes = unsafe { HostRange::new(at, 1000) };
+        let made = device.new_buffer_over_host_memory(on, bytes, 0, Some(Box::new(deallocator)));
+        let Some(buffer) = made.expect("never a raise") else {
+            assert_eq!(counts(), plus(before, 2));
+            eprintln!("no dma-buf imported here: refused, counted; the rest unchecked");
+            return;
+        };
+        assert_eq!(counts(), plus(before, 1));
+        assert_eq!((buffer.contents(), buffer.length()), (at, 1000));
+        let id = buffer.rt().block();
+        assert!(device.known_blocks().is_dma_buf(id));
+        assert_eq!(read(buffer.contents(), 128), [0x11; 128]);
+
+        // A blit reads the CPU's bytes through the import, and writes the pages the CPU reads.
+        let of = |length, options| device.new_buffer_of_length(on, length, options);
+        let of = |length| of(length, 0).expect("never a raise").expect("a buffer");
+        let (out, source) = (of(64), of(64));
+        // SAFETY: the Shared buffer's 64 bytes, mapped while it lives.
+        unsafe { source.contents().as_ptr::<u8>().write_bytes(0x77, 64) };
+        let queue = device.new_command_queue().expect("a command queue");
+        let commands = queue.command_buffer(on).expect("never a raise");
+        let commands = commands.expect("a command buffer");
+        let encoder = commands.blit_encoder(on).expect("never a raise");
+        let encoder = encoder.expect("a blit encoder");
+        for (from, to, offset) in [(&buffer, &out, 0), (&source, &buffer, 64)] {
+            let copy = BlitCmd::CopyBufferToBuffer {
+                source_buffer: Some(from),
+                source_offset: 0,
+                destination_buffer: Some(to),
+                destination_offset: offset,
+                size: 64,
+            };
+            assert_eq!(encoder.encode(on, copy), Ok(()));
+        }
+        assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+        assert_eq!(commands.commit(on), Ok(()));
+        assert_eq!(commands.wait_until_completed(on), Ok(()));
+        assert_eq!(read(out.contents(), 64), [0x11; 64]);
+        assert_eq!(read(at.wrapping_add(64), 64), [0x77; 64]);
+        drop((encoder, commands, buffer));
+        let ran = || freed.load(Ordering::Acquire);
+        assert!(waits_for(ran), "the deallocator ran");
+        assert!(!device.known_blocks().is_dma_buf(id));
+
+        // A known import of the pages: a no-copy buffer pinned over its bytes is a range of its
+        // block, with no import of its own; a Managed one is rt's refusal, counted.
+        let at = pages.wrapping_add(2 * page + 32);
+        let (released, then) = flag();
+        let known = import_known(&device, "a test's import", at, 256, then);
+        let (block, offset) = known.expect("a known import, as the buffer's above");
+        let mapped = device.known_blocks().contents_of(&block);
+        assert_eq!(block.contents, None);
+        assert_eq!(mapped.map(|first| first + offset), Some(at.addr().to_u64()));
+        let (pin, imports) = (block.gpu_address + offset, counted(IMPORTS_CODE));
+        // SAFETY: the pages are the test's own, never freed.
+        let bytes = unsafe { HostRange::new(at, 64) };
+        let made = device.new_buffer(pinned(pin, 0, Some(bytes)));
+        let made = made.expect("never a raise").expect("a buffer in the block");
+        assert_eq!((made.gpu_address(), made.contents()), (pin, at));
+        let managed = counted(MANAGED_OVER_DMA_BUF);
+        // SAFETY: as above.
+        let bytes = unsafe { HostRange::new(at, 64) };
+        let refused = device.new_buffer(pinned(pin, 0x10, Some(bytes)));
+        assert!(refused.expect("never a raise").is_none());
+        assert_eq!(counted(MANAGED_OVER_DMA_BUF), managed + 1);
+        assert_eq!(counted(IMPORTS_CODE), imports);
+        drop(made);
+        let id = block.id;
+        assert!(device.known_blocks().forget(id).is_some());
+        drop(block);
+        let ran = || released.load(Ordering::Acquire);
+        assert!(waits_for(ran), "the known import's release ran");
+        assert!(!device.known_blocks().is_dma_buf(id));
     }
 }
