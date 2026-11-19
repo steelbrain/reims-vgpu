@@ -6603,6 +6603,8 @@ Map 1:
 | 12 | `PagesChunked` | 1 << 8 `PagesChunked` | a block of the runs of 64 KiB chunks of the kext's own, mapped into the process, for its slabs |
 | 13 | `SurfaceSeeds` | 1 << 10 `SurfaceSeeds` | an IOSurface's lock and unlock seeds, for a copy synced while a CPU held the surface locked for writing |
 | 15 | `CpuPats` | 1 << 13 `CpuPats` | every online CPU's PAT, read on each CPU, for an administrator's process: the check that entry 2 is write-back everywhere ("The BAR is one host memory region"; the guest's `guest/bundle/tools/pat_probe.c`); x86-64 only |
+| 16 | `PoolTake` | 1 << 15 `Pool` | a block of the Shared pool for the process's context, mapped into the process write-back once the host answers its `POOL_TAKE`, however long that takes ("The Shared pool"); x86-64 only, `kIOReturnUnsupported` on arm64e |
+| 17 | `PoolGive` | 1 << 15 `Pool` | gives a pool block back: out of the process, then its `POOL_GIVE` |
 | 0x100 | `OpenContext` | 1 << 5 `ContextSpan` (its sixth output), 1 << 12 `DoorbellPage` (its seventh) | the context and its window; five outputs, six with its GPU addresses' span, or seven with its doorbell page's address in the process, 0 for none ("BAR4: the doorbell pages") |
 | 0x101 | `Alloc` | 1 << 7 `WriteCombined` (its third input), 1 << 14 `ZeroedBlocks` (the block reads zero) | a region block; 2 inputs, or 3 with the byte its write-combined part starts at |
 | 0x102 | `Free` | | frees a block |
@@ -6621,7 +6623,21 @@ the accelerator, which the bundle opens for each event it hands out: 10 and 11
 are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish`, 1 << 12 `DoorbellPage`, 1 << 13 `CpuPats` and 1 << 14 `ZeroedBlocks`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed and `CpuPats` only on x86-64; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish`, 1 << 12 `DoorbellPage`, 1 << 13 `CpuPats`, 1 << 14 `ZeroedBlocks` and 1 << 15 `Pool`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed, `CpuPats` only on x86-64, and `Pool` only on x86-64 where the device has a pool; no other bit yet.
+
+The arm64e kext takes no `POOL` of the device's offer, which offers an arm64
+guest none until a boot shows its kernel maps a range past its RAM, above
+2^36, write-back; it sets no `Pool` bit, selectors 16 and 17 answer
+`kIOReturnUnsupported` there, and its processes keep the region's blocks and
+the kext's chunked pages as before. A take waits for the host's answer with no
+deadline, `THREAD_UNINT` like each of the kext's other asks of the host, whose
+deadlines run 5 to 60 s: the host answers each take of an open context, and the
+context's close waits for its takes in flight. Where the host stops answering,
+each taking thread waits until it answers, holding one of the kext's 32 waiters
+for answers, and a kill of its process completes only then; other threads and
+processes go on, their asks ending at their deadlines. A paused VM runs no guest thread. The device's reset ends a take
+unanswered, but the kext resets the device only at its start and its stop,
+when no process holds it open, and a VM's reset restarts the guest.
 
 **A GL window: the drawable (type 7) and the window surface (type 0x20).**
 These are IOGPU's types, not ours. The bundle leaves `newGLDrawable` to its

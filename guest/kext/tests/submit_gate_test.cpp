@@ -111,7 +111,7 @@ int main()
 	    RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_MANAGED_BUFFER_CREATE,
 	    RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_RATE_MAP_CREATE,
 	    RGFX_CMD_FUNCTION_HANDLE_CREATE, RGFX_CMD_FUNCTION_TABLE_CREATE,
-	    RGFX_CMD_DYNAMIC_LIBRARY_CREATE,
+	    RGFX_CMD_DYNAMIC_LIBRARY_CREATE, RGFX_CMD_HEAP_OVER_POOL,
 	};
 	const uint32_t makesNone[] = {
 	    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_BUFFER_DID_MODIFY_RANGE, RGFX_CMD_TEXTURE_REPLACE_REGION,
@@ -134,11 +134,17 @@ int main()
 		if (type <= RGFX_CMD_BUFFER_OVER_PAGES || type == RGFX_CMD_BUFFER_MANAGED_AT_OFFSET ||
 		    type == RGFX_CMD_HEAP_OVER_PAGES || type == RGFX_CMD_MANAGED_BUFFER_CREATE ||
 		    type == RGFX_CMD_MESH_RENDER_PIPELINE_CREATE || type == RGFX_CMD_TEXTURE_DID_MODIFY_DATA ||
-		    (type >= RGFX_CMD_RATE_MAP_CREATE && type <= RGFX_CMD_BUFFER_ESCAPED))
+		    (type >= RGFX_CMD_RATE_MAP_CREATE && type <= RGFX_CMD_HEAP_OVER_POOL))
 			check(listed, "every wire type of the accepted range is placed");
 		else if (!listed)
 			check(!rgfxSubmitMakes(type), "a type the wire does not name makes none");
 	}
+
+	// The Shared pool's takes and gives are the kext's (kRgfxAccelMethodPoolTake and PoolGive),
+	// and a heap over a pool block a create of the process's own.
+	check(!rgfxSubmitAdmitted(RGFX_CMD_POOL_TAKE) && !rgfxSubmitAdmitted(RGFX_CMD_POOL_GIVE),
+	      "a pool take and give are the kext's");
+	check(rgfxSubmitAdmitted(RGFX_CMD_HEAP_OVER_POOL), "a heap over a pool block is accepted");
 
 	// The pipeline creates, which the device answers with a PIPELINE_REFLECTION and a client may
 	// post deferred: the render, mesh render and compute pipelines', and no other type.

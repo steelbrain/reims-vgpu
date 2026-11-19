@@ -462,7 +462,13 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 
 	// Take a waiter, so the answer finds this thread once the message is on the ring.
 	uint64_t deadline = 0;
-	clock_interval_to_deadline(timeoutMs, kMillisecondScale, &deadline);
+	if (timeoutMs != kLifecycleNoDeadline)
+		clock_interval_to_deadline(timeoutMs, kMillisecondScale, &deadline);
+	// Sleeps on `event` under stateLock until woken, or past the deadline where there is one.
+	auto sleepOn = [this, deadline](void *event) {
+		return deadline ? IOLockSleepDeadline(stateLock, event, deadline, THREAD_UNINT)
+		                : IOLockSleep(stateLock, event, THREAD_UNINT);
+	};
 	LifecycleWaiter *w = nullptr;
 	IOLockLock(stateLock);
 	while (!w) {
@@ -470,8 +476,7 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 			if (lifecycleWaiters[i].replyType == 0)
 				w = &lifecycleWaiters[i];
 		}
-		if (!w && IOLockSleepDeadline(stateLock, lifecycleWaiters, deadline, THREAD_UNINT) ==
-		              THREAD_TIMED_OUT)
+		if (!w && sleepOn(lifecycleWaiters) == THREAD_TIMED_OUT)
 			break;
 	}
 	if (!w) {
@@ -497,8 +502,7 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 	// every waiter (which, with many in flight, would herd on stateLock and starve the work loop
 	// that delivers the answers). The free event below stays the shared array, a slot's seekers'.
 	while (r == kIOReturnSuccess && !w->done) {
-		if (IOLockSleepDeadline(stateLock, &w->done, deadline, THREAD_UNINT) ==
-		    THREAD_TIMED_OUT && !w->done)
+		if (sleepOn(&w->done) == THREAD_TIMED_OUT && !w->done)
 			r = kIOReturnTimeout;
 	}
 	if (r == kIOReturnSuccess) {

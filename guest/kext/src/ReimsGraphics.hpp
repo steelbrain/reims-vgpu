@@ -366,9 +366,14 @@ public:
 	// seqno (*seqno, when not null). With `replyType` 0 it returns once the message is on the
 	// ring; else it waits up to `timeoutMs` for the device's answer of that type to this
 	// seqno and copies it, header and all, into `reply` (*replyLength its bytes, at most
-	// `replyCapacity`). Thread context only, never on the work loop.
+	// `replyCapacity`), or, with kLifecycleNoDeadline, for as long as the answer takes. Thread
+	// context only, never on the work loop.
 	static constexpr UInt32 kLifecycleMessageMax = RGFX_CONTROL_RING_DATA_SIZE / 2;
 	static constexpr UInt32 kLifecycleReplyMax = 128;
+	// A `timeoutMs` with no deadline: the waits, for a free waiter and for the answer, last until
+	// they end, for an ask the host answers however long it takes (a pool block's,
+	// RgfxPoolBlocks.hpp).
+	static constexpr UInt32 kLifecycleNoDeadline = UINT32_MAX;
 	// Where `seedOrder` is not null, the waiter is a seed's (LifecycleWaiter), its first
 	// PIPELINE_REFLECTION the *seedOrder th newest.
 	IOReturn postLifecycle(UInt32 type, const void *message, UInt32 size, UInt32 replyType,

@@ -93,6 +93,8 @@ void RgfxAcceleratorUserClient::stop(IOService *provider)
 
 void RgfxAcceleratorUserClient::free()
 {
+	// Every pool block went with the release (releaseContext); any left goes out of the process.
+	closePoolBlocks();
 	if (queueLock)
 		IOLockFree(queueLock);
 	queueLock = nullptr;
@@ -106,6 +108,9 @@ void RgfxAcceleratorUserClient::free()
 	if (windowLock)
 		IOLockFree(windowLock);
 	windowLock = nullptr;
+	if (poolBlocks.blocks)
+		IOFree(poolBlocks.blocks, poolBlocks.capacity * sizeof(RgfxHeldPoolBlock));
+	poolBlocks = {nullptr, 0, 0};
 	super::free();
 }
 

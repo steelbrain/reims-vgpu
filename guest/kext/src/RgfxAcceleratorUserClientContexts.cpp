@@ -375,15 +375,23 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 			return kIOReturnBadArgument;
 		owner->retireSurfaceWrites(in[0], in[1]);
 		return kIOReturnSuccess;
-	case kRgfxAccelMethodFeatures:
+	case kRgfxAccelMethodPoolTake:
+		return poolTakeMethod(a);
+	case kRgfxAccelMethodPoolGive:
+		return poolGiveMethod(a);
+	case kRgfxAccelMethodFeatures: {
 		if (a->scalarInputCount != 0 || a->scalarOutputCount != 3)
 			return kIOReturnBadArgument;
 		out[0] = owner->featureWord();
-		out[1] = rgfxSurfaceUnlockSeedExported()
-		             ? kRgfxKextFeatureWord
-		             : kRgfxKextFeatureWord & ~static_cast<uint64_t>(kRgfxKextFeatureSurfaceSeeds);
+		uint64_t kext = kRgfxKextFeatureWord;
+		if (!rgfxSurfaceUnlockSeedExported())
+			kext &= ~static_cast<uint64_t>(kRgfxKextFeatureSurfaceSeeds);
+		if (!owner->poolMemory())
+			kext &= ~static_cast<uint64_t>(kRgfxKextFeaturePool);
+		out[1] = kext;
 		out[2] = kRgfxSelectorMap;
 		return kIOReturnSuccess;
+	}
 	default:
 		return kIOReturnUnsupported;
 	}
@@ -1072,6 +1080,8 @@ void RgfxAcceleratorUserClient::releaseContext()
 	// published on from here.
 	closeWindow();
 	closeDoorbellPage();
+	// Its pool blocks go out of the process too, before the CONTEXT_CLOSE that gives them back.
+	closePoolBlocks();
 	RgfxAccelerator *accel = owner;
 	// Under the queue lock, which a QUEUE_CREATE watches its ring under, so none is left.
 	if (accel)
@@ -1112,6 +1122,103 @@ void RgfxAcceleratorUserClient::releaseContext()
 	// because an object lay in it may now be free to go.
 	if (closed == RgfxAccelerator::kCloseAnswered)
 		accel->retryRefusedBlocks();
+}
+
+// kRgfxAccelMethodPoolTake (RgfxUserClientABI.hpp, RgfxPoolBlocks.hpp): a block of the Shared
+// pool, mapped into the process and listed as the client's. An ask, so no block is listed for a
+// context releaseContext has closed: the close takes every listed block out of the process.
+IOReturn RgfxAcceleratorUserClient::poolTakeMethod(IOExternalMethodArguments *a)
+{
+	if (a->scalarInputCount != 1 || a->scalarOutputCount != 3)
+		return kIOReturnBadArgument;
+	UInt32 ctx = 0;
+	Ask ask = {this, beginAsk(&ctx)};
+	if (!ask.begun)
+		return kIOReturnBadArgument;
+	RgfxHeldPoolBlock block = {};
+	IOReturn r = owner->takePoolBlock(ctx, task, a->scalarInput[0], &block);
+	if (r != kIOReturnSuccess)
+		return r;
+	IOMemoryMap *map = static_cast<IOMemoryMap *>(block.map);
+	const UInt64 address = map->getAddress();
+	IOLockLock(listLock);
+	// Grown where full, under the list's lock: an allocation of a few KiB, no wait for the device.
+	bool listed = false;
+	const uint32_t to = rgfxPoolBlocksGrowTo(poolBlocks);
+	if (to == poolBlocks.capacity) {
+		listed = rgfxPoolBlocksAdd(poolBlocks, block.offset, block.length, map);
+	} else if (to) {
+		auto *grown = static_cast<RgfxHeldPoolBlock *>(IOMalloc(to * sizeof(RgfxHeldPoolBlock)));
+		if (grown) {
+			const uint32_t had = poolBlocks.capacity;
+			if (RgfxHeldPoolBlock *old = rgfxPoolBlocksGrow(poolBlocks, grown, to))
+				IOFree(old, had * sizeof(RgfxHeldPoolBlock));
+			listed = rgfxPoolBlocksAdd(poolBlocks, block.offset, block.length, map);
+		}
+	}
+	const uint32_t held = poolBlocks.count;
+	IOLockUnlock(listLock);
+	if (!listed) {
+		IOLog("RgfxAccelerator: context %u's pool block of 0x%llx bytes at 0x%llx is not listed "
+		      "(%u held): it is given back\n",
+		      ctx, block.length, block.offset, held);
+		map->unmap();
+		map->release();
+		owner->givePoolBlock(ctx, block.offset, block.length);
+		return kIOReturnNoResources;
+	}
+	a->scalarOutput[0] = address;
+	a->scalarOutput[1] = block.offset;
+	a->scalarOutput[2] = block.length;
+	return kIOReturnSuccess;
+}
+
+// kRgfxAccelMethodPoolGive (RgfxUserClientABI.hpp): the client's block goes off its list and out
+// of the process before its POOL_GIVE is posted, so the host never takes back a block a process
+// maps. An ask, as a take is, so the close never posts its CONTEXT_CLOSE between the two.
+IOReturn RgfxAcceleratorUserClient::poolGiveMethod(IOExternalMethodArguments *a)
+{
+	if (a->scalarInputCount != 1 || a->scalarOutputCount != 0)
+		return kIOReturnBadArgument;
+	UInt32 ctx = 0;
+	Ask ask = {this, beginAsk(&ctx)};
+	if (!ask.begun)
+		return kIOReturnBadArgument;
+	RgfxHeldPoolBlock block = {};
+	IOLockLock(listLock);
+	const bool found = rgfxPoolBlocksTake(poolBlocks, a->scalarInput[0], &block);
+	IOLockUnlock(listLock);
+	if (!found)
+		return kIOReturnNotFound;
+	IOMemoryMap *map = static_cast<IOMemoryMap *>(block.map);
+	map->unmap();
+	map->release();
+	return owner->givePoolBlock(ctx, block.offset, block.length);
+}
+
+void RgfxAcceleratorUserClient::closePoolBlocks()
+{
+	if (!listLock)
+		return;
+	UInt32 closed = 0;
+	UInt64 bytes = 0;
+	for (;;) {
+		RgfxHeldPoolBlock block = {};
+		IOLockLock(listLock);
+		const bool any = rgfxPoolBlocksTakeAny(poolBlocks, &block);
+		IOLockUnlock(listLock);
+		if (!any)
+			break;
+		IOMemoryMap *map = static_cast<IOMemoryMap *>(block.map);
+		map->unmap();
+		map->release();
+		closed++;
+		bytes += block.length;
+	}
+	if (closed)
+		IOLog("RgfxAccelerator: context %u: %u pool blocks of 0x%llx bytes in all go with its "
+		      "close\n",
+		      context, closed, bytes);
 }
 
 // kRgfxAccelMethodCpuPats (RgfxUserClientABI.hpp): every online CPU's PAT, each read by its CPU

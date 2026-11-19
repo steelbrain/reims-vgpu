@@ -58,6 +58,7 @@
 #include "RgfxDoorbellPages.hpp"
 #include "RgfxMemorySize.hpp"
 #include "RgfxPat.hpp"
+#include "RgfxPoolBlocks.hpp"
 #include "RgfxRegionMapping.hpp"
 #include "RgfxUserClientABI.hpp"
 #include "reims_graphics_wire.h"
@@ -94,8 +95,9 @@ enum {
 // write-combined part, where the region's write-combined mappings are ordinary memory
 // (RgfxRegionMapping.hpp), SurfaceSeeds, which Features leaves out where IOSurface exports no
 // unlock seed (rgfxSurfaceUnlockSeedExported), SubmitBatch's publish of a queue's ring,
-// OpenContext's doorbell page, on x86-64 CpuPats (RgfxPat.hpp), and ZeroedBlocks
-// (RgfxBlockZero.hpp). Each bit is set by the change that lands its call.
+// OpenContext's doorbell page, on x86-64 CpuPats (RgfxPat.hpp), ZeroedBlocks (RgfxBlockZero.hpp),
+// and on x86-64 Pool, which Features leaves out where the device has no pool (poolMemory). Each
+// bit is set by the change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeaturePagesChunked |
                                           kRgfxKextFeatureSubmitBatch |
@@ -108,7 +110,8 @@ constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeatureSurfaceSeeds |
                                           kRgfxKextFeatureRegionWriteCombined |
                                           kRgfxKextFeatureCpuPatsRead |
-                                          kRgfxKextFeatureZeroedBlocks;
+                                          kRgfxKextFeatureZeroedBlocks |
+                                          kRgfxKextFeaturePoolCarried;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
@@ -359,6 +362,20 @@ public:
 	// draws.10k's encode took 7.7 ms with the spans write-back, 1.05-1.3 ms write-combined.
 	// Defined with the contexts' state (RgfxAcceleratorContexts.cpp).
 	IODeviceMemory *copyWriteCombinedRegion() const;
+	// The device's Shared pool (RgfxPoolBlocks.hpp), defined with the contexts' state: its range
+	// as a descriptor of its own, made at the first call where the kext took RGFX_FEATURE_POOL
+	// and the device reads a range of it, and kept for the kernel's life (not retained for the
+	// caller); null where there is none. takePoolBlock posts context `context`'s POOL_TAKE of
+	// `length` bytes, waits for the host's answer however long it takes, and maps the block into
+	// `task`, read and write and write-back, as a range of its own: the block in *block, its
+	// mapping (an IOMemoryMap) the caller's, which holds it until the caller gives it back.
+	// kIOReturnUnsupported where there is no pool; kIOReturnBadArgument for 0 bytes or past
+	// RGFX_POOL_TAKE_MAX; kIOReturnNoMemory where the host had no room, or the task got no
+	// mapping, the block then given back. givePoolBlock posts the block's POOL_GIVE and returns,
+	// once no process maps it.
+	IODeviceMemory *poolMemory();
+	IOReturn takePoolBlock(UInt32 context, task_t task, UInt64 length, RgfxHeldPoolBlock *block);
+	IOReturn givePoolBlock(UInt32 context, UInt64 offset, UInt64 length);
 	// The region's first `size` bytes from RGFX_DEVICE_INFO_OFFSET (the device info, and the
 	// video caps after it), mapped read-only into the kernel: the map, which the caller
 	// releases, with *info its first byte; null where it cannot be mapped.

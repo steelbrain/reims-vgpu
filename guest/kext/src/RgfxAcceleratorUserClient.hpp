@@ -145,6 +145,13 @@ private:
 	IOReturn deviceInfoMethod(IOExternalMethodArguments *arguments);
 	// Every CPU's PAT (kRgfxAccelMethodCpuPats), on x86-64.
 	IOReturn cpuPatsMethod(IOExternalMethodArguments *arguments);
+	// The Shared pool's blocks (kRgfxAccelMethodPoolTake, kRgfxAccelMethodPoolGive,
+	// RgfxPoolBlocks.hpp): a take maps a block into the process and lists it, a give takes it off
+	// the list and out of the process and gives it back; closePoolBlocks takes every one out of
+	// the process at the release, before the CONTEXT_CLOSE that gives them back.
+	IOReturn poolTakeMethod(IOExternalMethodArguments *arguments);
+	IOReturn poolGiveMethod(IOExternalMethodArguments *arguments);
+	void closePoolBlocks();
 	// The surfaces a command buffer writes (kRgfxAccelMethodSurfaceWrites), and whether a queue is
 	// one of the client's open ones.
 	IOReturn surfaceWritesMethod(IOExternalMethodArguments *arguments);
@@ -204,6 +211,9 @@ private:
 	UInt32 doorbellPage;
 	IOMemoryMap *doorbellMap;
 	UInt64 doorbellAddress;
+	// Under listLock: the context's Shared pool blocks, each mapped into the task
+	// (RgfxPoolBlocks.hpp); the array grows as they do, and goes at the client's free.
+	RgfxPoolBlockList poolBlocks;
 	IOLock *queueLock;
 	IOLock *listLock;
 

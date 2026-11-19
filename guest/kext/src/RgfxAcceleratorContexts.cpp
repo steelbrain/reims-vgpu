@@ -234,6 +234,11 @@ struct ContextState {
 	// kZeroMapWriteCombined), which zeroSpan writes a new block's zeros through: set at the
 	// state's start and kept for the kernel's life, null where the kernel would not make one.
 	IOMemoryMap *zeroMaps[2];
+	// The Shared pool's range (poolMemory), a descriptor of its own that each block is mapped
+	// into its process from, and its length: set once, at the first call that finds the pool,
+	// and kept for the kernel's life; null and 0 until then, or where there is none.
+	IODeviceMemory *pool;
+	UInt64 poolLength;
 };
 ContextState state = {nullptr,
                       kRgfxContextSlotsEmpty,
@@ -251,7 +256,9 @@ ContextState state = {nullptr,
                       nullptr,
                       nullptr,
                       {},
-                      {nullptr, nullptr}};
+                      {nullptr, nullptr},
+                      nullptr,
+                      0};
 IOLock *&contextLock = state.contextLock;
 RgfxContextSlots &slots = state.slots;
 UInt32 &contextUnits = state.contextUnits;
@@ -1080,6 +1087,107 @@ IODeviceMemory *RgfxAccelerator::copyWriteCombinedRegion() const
 	if (combined)
 		combined->retain();
 	return combined;
+}
+
+// MARK: - The Shared pool
+
+IODeviceMemory *RgfxAccelerator::poolMemory()
+{
+	IODeviceMemory *pool = __atomic_load_n(&state.pool, __ATOMIC_ACQUIRE);
+	if (pool || !kRgfxKextFeaturePoolCarried || !(featureWord() & RGFX_FEATURE_POOL))
+		return pool;
+	// The range reads the same for the device's life (POOL_BASE_LO).
+	const UInt64 base = (static_cast<UInt64>(readRegister(RGFX_REG_POOL_BASE_HI)) << 32) |
+	                    readRegister(RGFX_REG_POOL_BASE_LO);
+	const UInt64 length = (static_cast<UInt64>(readRegister(RGFX_REG_POOL_LENGTH_HI)) << 32) |
+	                      readRegister(RGFX_REG_POOL_LENGTH_LO);
+	if (!base || !length || length % RGFX_POOL_BLOCK_ALIGN || base > UINT64_MAX - length)
+		return nullptr;
+	IODeviceMemory *made = IODeviceMemory::withRange(base, length);
+	if (!made)
+		return nullptr;
+	// One descriptor for the kernel's life: another caller's, where it made one first.
+	IODeviceMemory *expected = nullptr;
+	if (!__atomic_compare_exchange_n(&state.pool, &expected, made, false, __ATOMIC_ACQ_REL,
+	                                 __ATOMIC_ACQUIRE)) {
+		made->release();
+		return expected;
+	}
+	__atomic_store_n(&state.poolLength, length, __ATOMIC_RELEASE);
+	IOLog("RgfxAccelerator: the Shared pool: 0x%llx bytes at 0x%llx\n", length, base);
+	return made;
+}
+
+IOReturn RgfxAccelerator::takePoolBlock(UInt32 context, task_t task, UInt64 length,
+                                        RgfxHeldPoolBlock *block)
+{
+	*block = {};
+	IODeviceMemory *pool = poolMemory();
+	if (!pool)
+		return kIOReturnUnsupported;
+	if (!rgfxPoolTakeLength(length))
+		return kIOReturnBadArgument;
+	RgfxPoolTake take = {};
+	take.context = context;
+	take.length = length;
+	RgfxPoolBlock answer = {};
+	UInt32 answered = 0;
+	// The host answers each take of an open context, and the context's close waits for this ask
+	// (RgfxAskGate.hpp): a take that waits for the host to add memory to the pool waits as long.
+	IOReturn r = postLifecycle(RGFX_CMD_POOL_TAKE, &take, sizeof(take), RGFX_EVT_POOL_BLOCK,
+	                           &answer, sizeof(answer), &answered, nullptr,
+	                           ReimsGraphics::kLifecycleNoDeadline);
+	if (r != kIOReturnSuccess)
+		return r;
+	if (answered < sizeof(answer)) {
+		IOLog("RgfxAccelerator: context %u's pool take of 0x%llx bytes: an answer of %u bytes\n",
+		      context, length, answered);
+		return kIOReturnInternalError;
+	}
+	switch (answer.status) {
+	case RGFX_STATUS_OK:
+		break;
+	case RGFX_STATUS_REFUSED:
+		return kIOReturnNoMemory;
+	case RGFX_STATUS_INVALID_ARGUMENT:
+		return kIOReturnBadArgument;
+	default:
+		IOLog("RgfxAccelerator: context %u's pool take of 0x%llx bytes: status %u\n", context,
+		      length, answer.status);
+		return kIOReturnError;
+	}
+	const UInt64 poolLength = __atomic_load_n(&state.poolLength, __ATOMIC_ACQUIRE);
+	if (!rgfxPoolAnswerFits(poolLength, length, answer.pool_offset, answer.length)) {
+		IOLog("RgfxAccelerator: context %u's pool take of 0x%llx bytes: answered 0x%llx bytes at "
+		      "0x%llx of a pool of 0x%llx bytes, which it does not map\n",
+		      context, length, answer.length, answer.pool_offset, poolLength);
+		return kIOReturnInternalError;
+	}
+	// The block's own range in the process, write-back as the device reads the pool. The kernel
+	// maps no byte of it: the host zeroed it at the take.
+	IOMemoryMap *map = pool->createMappingInTask(task, 0, kIOMapAnywhere | kIOMapCopybackCache,
+	                                             answer.pool_offset, answer.length);
+	if (!map) {
+		IOLog("RgfxAccelerator: context %u's pool block of 0x%llx bytes at 0x%llx: the process "
+		      "got no mapping of it, and it is given back\n",
+		      context, answer.length, answer.pool_offset);
+		givePoolBlock(context, answer.pool_offset, answer.length);
+		return kIOReturnNoMemory;
+	}
+	*block = {answer.pool_offset, answer.length, map};
+	return kIOReturnSuccess;
+}
+
+IOReturn RgfxAccelerator::givePoolBlock(UInt32 context, UInt64 offset, UInt64 length)
+{
+	RgfxPoolGive give = {};
+	give.context = context;
+	give.pool_offset = offset;
+	give.length = length;
+	// Its COMPLETE no thread waits for: the host takes the block back once the context's command
+	// buffers committed before it have finished.
+	return postLifecycle(RGFX_CMD_POOL_GIVE, &give, sizeof(give), 0, nullptr, 0, nullptr, nullptr,
+	                     0);
 }
 
 // MARK: - Doorbell pages

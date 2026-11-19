@@ -135,6 +135,8 @@ static const Selector kSelectors[] = {
 	{"kRgfxAccelMethodPagesChunked", kRgfxAccelMethodPagesChunked, false},
 	{"kRgfxAccelMethodSurfaceSeeds", kRgfxAccelMethodSurfaceSeeds, false},
 	{"kRgfxAccelMethodCpuPats", kRgfxAccelMethodCpuPats, false},
+	{"kRgfxAccelMethodPoolTake", kRgfxAccelMethodPoolTake, false},
+	{"kRgfxAccelMethodPoolGive", kRgfxAccelMethodPoolGive, false},
 	{"kRgfxAccelMethodTakeAnswers", kRgfxAccelMethodTakeAnswers, false},
 	{"kRgfxAccelMethodSurfaceBlockRelease", kRgfxAccelMethodSurfaceBlockRelease, false},
 	{"kRgfxAccelMethodSurfaceRetire", kRgfxAccelMethodSurfaceRetire, false},
@@ -313,6 +315,7 @@ static void features()
 		kRgfxKextFeatureDoorbellPage,
 		kRgfxKextFeatureCpuPats,
 		kRgfxKextFeatureZeroedBlocks,
+		kRgfxKextFeaturePool,
 	};
 	for (unsigned i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
 		CHECK(bits[i] == uint64_t(1) << i);
@@ -340,6 +343,9 @@ static void features()
 	// Every CPU's PAT at the next number the sandbox allows: 14 is not one.
 	CHECK(kRgfxAccelMethodCpuPats == 15);
 	CHECK(!sandboxAllows(14));
+	// The Shared pool's take and give at the next two the sandbox allows.
+	CHECK(kRgfxAccelMethodPoolTake == 16);
+	CHECK(kRgfxAccelMethodPoolGive == 17);
 }
 
 int main()

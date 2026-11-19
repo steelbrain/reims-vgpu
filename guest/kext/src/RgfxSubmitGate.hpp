@@ -4,9 +4,9 @@
 //
 // Submit carries a process's creates and destroys of its own objects onto the control ring. It
 // accepts only the types strictly between QUEUE_CREATE and CONTEXT_CLOSE: a queue is made through
-// its own selector (kRgfxAccelMethodQueueCreate, which checks its rings), and CONTEXT_CLOSE and
-// the block grant/share/release messages (>= CONTEXT_CLOSE) are the kext's, never a process's. So
-// a process cannot drive block tracking through submit.
+// its own selector (kRgfxAccelMethodQueueCreate, which checks its rings), and CONTEXT_CLOSE, the
+// block grant/share/release messages and the Shared pool's takes and gives (>= CONTEXT_CLOSE) are
+// the kext's, never a process's. So a process cannot drive block tracking through submit.
 //
 // Of the accepted range, the command queue is the one object the kext tracks (it watches the
 // queue's completion ring and lists it per client), so an OBJECT_DESTROY of a queue must stop the
@@ -119,6 +119,7 @@ inline bool rgfxSubmitMakes(uint32_t type)
 	case RGFX_CMD_BUFFER_AT_OFFSET:
 	case RGFX_CMD_BUFFER_MANAGED_AT_OFFSET:
 	case RGFX_CMD_HEAP_OVER_PAGES:
+	case RGFX_CMD_HEAP_OVER_POOL:
 	case RGFX_CMD_TEXTURE_CREATE:
 	case RGFX_CMD_TEXTURE_FROM_BUFFER:
 	case RGFX_CMD_TEXTURE_FROM_IOSURFACE:

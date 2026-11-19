@@ -184,7 +184,12 @@
 //  - BUFFER_ESCAPED (bit 56), both kexts: the bundle tells the host, once, that a no-copy buffer
 //    the host reads in place handed its identity out with no message naming it
 //    (RGFX_CMD_BUFFER_ESCAPED), whose message the kext admits, and takes in a batch, as it does a
-//    Managed range's (RgfxSubmitGate.hpp).
+//    Managed range's (RgfxSubmitGate.hpp);
+//  - POOL (bit 57), the x86-64 kext alone: the accelerator reads the Shared pool's range
+//    (POOL_BASE_LO to POOL_LENGTH_HI) and maps the blocks the host gives a context's POOL_TAKE
+//    into its process (kRgfxAccelMethodPoolTake, RgfxPoolBlocks.hpp), and the bundle lays its
+//    buffers' slabs in them, a heap over each (HEAP_OVER_POOL), which the kext admits as any
+//    create of the client's own objects (RgfxSubmitGate.hpp). An arm64 host offers no pool.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -230,7 +235,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_BUFFER_ESCAPED |
     (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K | RGFX_FEATURE_VT_MESSAGES | RGFX_FEATURE_VT_RING |
                             RGFX_FEATURE_CURSOR_COLOR
-                      : RGFX_FEATURE_DISPLAY_POWER);
+                      : RGFX_FEATURE_DISPLAY_POWER | RGFX_FEATURE_POOL);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer and, on arm64, the
 // displays whose node the firmware placed under /arm-io, counted from display 0 (`mobileNodes`):

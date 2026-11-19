@@ -140,6 +140,26 @@ enum {
 	// administrator's process alone, as the read stops every CPU for a moment:
 	// kIOReturnNotPrivileged for any other. kIOReturnUnsupported on arm64, which has no PAT.
 	kRgfxAccelMethodCpuPats = 15,
+	// A block of the device's Shared pool for the client's context (kRgfxKextFeaturePool; the
+	// device's RGFX_FEATURE_POOL, design.md, "The Shared pool"): in the bytes asked for; out the
+	// block's address in the process, its offset in the pool and its length, the bytes asked for
+	// rounded up to RGFX_POOL_BLOCK_ALIGN. The kext posts the context's POOL_TAKE and waits for
+	// its answer however long the host takes, then maps the block into the process, read and
+	// write and write-back, as its own range: every byte of it reads zero, the host's zeroing at
+	// the take. The process names the block by its pool offset (HEAP_OVER_POOL) and gives it back
+	// through PoolGive; the context's close gives back every block it still holds.
+	// kIOReturnUnsupported where the device has no pool; kIOReturnBadArgument for 0 bytes or
+	// past RGFX_POOL_TAKE_MAX, or where the context is not open; kIOReturnNoMemory where the
+	// pool has no room for the block (RGFX_STATUS_REFUSED) or the process got no mapping of it,
+	// the block then given back; kIOReturnNoResources where the kext could not list it.
+	kRgfxAccelMethodPoolTake = 16,
+	// Gives back the client's Shared pool block at the pool offset scalarInput[0], and returns
+	// at once: the block's mapping goes from the process first, and its POOL_GIVE is posted
+	// after every message the process posted before the call. The host takes the block back once
+	// the context's command buffers committed before have finished, and refuses it while an
+	// object it holds (a heap) lies in it: the process destroys its objects over the block first.
+	// kIOReturnNotFound where the client holds no block at that offset.
+	kRgfxAccelMethodPoolGive = 17,
 	// A new selector takes the next number design.md's registry gives out.
 };
 
@@ -273,6 +293,8 @@ static inline int rgfxAccelContextSelector(unsigned selector)
 	case kRgfxAccelMethodPagesChunked:
 	case kRgfxAccelMethodSurfaceSeeds:
 	case kRgfxAccelMethodCpuPats:
+	case kRgfxAccelMethodPoolTake:
+	case kRgfxAccelMethodPoolGive:
 	case kRgfxAccelMethodSubmitBatch:
 	case kRgfxAccelMethodTakeAnswers:
 	case kRgfxAccelMethodSurfaceBlockRelease:
@@ -383,6 +405,9 @@ enum {
 	// over every byte the process's window maps of it, whatever its last holder, of any context,
 	// left there (the kext's RgfxBlockZero.hpp).
 	kRgfxKextFeatureZeroedBlocks = 1 << 14,
+	// PoolTake, 16, and PoolGive, 17, which the bundle uses where the feature word holds
+	// RGFX_FEATURE_POOL too; the x86-64 kext alone.
+	kRgfxKextFeaturePool = 1 << 15,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext
