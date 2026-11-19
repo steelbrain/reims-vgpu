@@ -11,10 +11,12 @@
 //!   storage mode, whether it is a view of a surface's shape image, the attachment it meets and
 //!   whether a second target renders the image, whether the texture is the attachment's own or a
 //!   twin view of one surface's image, the depth write state of a depth or stencil attachment's
-//!   draw, and whether the draw's process presents to the display (the compositor) or not (an
-//!   app). Class A, which rt builds, is the texture and the attachment's being one texture or
-//!   twin views of one surface's image. The first refused draw of each pipeline state, ten at
-//!   most, writes its line as it is refused.
+//!   draw, the usage its image was made with (a surface's shape image: storage where 0, plain
+//!   where `ShaderRead | RenderTarget`), whether a live texture that takes storage lies over the
+//!   texture's surface plane ([`surface_texture`]), and whether the draw's process presents to the
+//!   display (the compositor) or not (an app). Class A, which rt builds, is the texture and the
+//!   attachment's being one texture or twin views of one surface's image. The first refused draw
+//!   of each pipeline state, ten at most, writes its line as it is refused.
 //! - **Imageblock asks.** Each distinct combination of colour attachment formats (every index)
 //!   and sample count of the render states asked `imageblockSampleLength`, with its asks
 //!   ([`imageblock`]); its first ask writes its line.
@@ -31,6 +33,18 @@
 //!   them), how many found them changed after a submission that rendered into the texture or
 //!   blitted into it, and how many sampled, rendered or blitted it.
 //! - **Imports by origin**, as the textures' kinds name it.
+//! - **Guest surface textures by declared usage.** Each texture the decoder made, or was refused,
+//!   over a surface's plane (`TEXTURE_FROM_IOSURFACE`), by the usage the guest declared, how it
+//!   was made (a view of a shape's image, or over the cache's buffer and why) and whether its
+//!   process presents to the display ([`surface_texture`]); each kind says whether it takes
+//!   storage: usage 0 (Unknown), `ShaderWrite` (0x2) or `ShaderAtomic` (0x20).
+//! - **Two formats over one plane.** Each time a guest surface texture is made over a plane while
+//!   one of another format is live over it, by the pair of formats, with the most bytes of such a
+//!   texture; and each write noted through a texture of one of them while one of the other is
+//!   live ([`shape_written`]).
+//! - **Views refused over a plain shape.** Each texture over a plain shape (no texture over its
+//!   plane takes storage) in a format that is neither the shape's nor its sRGB sibling, by the
+//!   pair ([`plain_view_refused`]).
 //!
 //! Totals, numbers, formats, sizes and usages only: no name, label or byte of the guest's leaves
 //! the process. A diagnostic, which the contract leaves free: nothing the guest observes changes,
@@ -39,8 +53,8 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, OnceLock};
 
 use metal2vulkan_rt as rt;
 
@@ -107,6 +121,8 @@ pub struct Made {
     slice: u32,
     /// Where it lies over an imported block: what of it rt copies.
     over: Option<Over>,
+    /// A guest surface texture's plane ([`surface_texture`]).
+    on_plane: OnceLock<OnPlane>,
 }
 
 /// The texture of a descriptor, before it is made: what [`Made`] takes of it.
@@ -199,6 +215,7 @@ impl Made {
             level,
             slice,
             over,
+            on_plane: OnceLock::new(),
         })
     }
 
@@ -220,12 +237,207 @@ impl Made {
     }
 }
 
+impl Drop for Made {
+    /// A guest surface texture leaves its plane's live ones.
+    fn drop(&mut self) {
+        let Some(on) = self.on_plane.get() else {
+            return;
+        };
+        let mut planes = PLANES.lock();
+        let Some(p) = planes.get_mut(&on.plane) else {
+            return;
+        };
+        if on.storage {
+            p.storage = p.storage.saturating_sub(1);
+        }
+        if let Some(n) = p.formats.get_mut(&self.format) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                p.formats.remove(&self.format);
+            }
+        }
+        if p.formats.is_empty() {
+            planes.remove(&on.plane);
+        }
+    }
+}
+
 /// Notes the guest's declared `usage` of `texture`, a view of a surface's shape image, where it is
 /// one of the rt platform's (the decoder's surface shapes).
 pub fn declared<T: 'static>(texture: &T, usage: u64) {
     let any: &dyn std::any::Any = texture;
     if let Some(t) = any.downcast_ref::<RtObj<RtTexture>>() {
         t.made().declared.store(usage, Relaxed);
+    }
+}
+
+// ----- Guest surface textures.
+
+/// The usages that take storage on a shape's image, beside usage 0 (Unknown): `ShaderWrite`
+/// and `ShaderAtomic`.
+const STORAGE_USAGES: u64 = 0x2 | 0x20;
+
+/// A surface's plane: the block of its device cache, else its buffer's object id with the top
+/// bit set; and the plane's index.
+type Plane = (u64, u32);
+
+/// A guest surface texture's plane, whether it takes storage, and its bytes.
+#[derive(Clone, Copy)]
+struct OnPlane {
+    plane: Plane,
+    storage: bool,
+    bytes: u64,
+}
+
+/// A plane's live guest textures: how many take storage, and how many there are of each format.
+#[derive(Default)]
+struct PlaneLive {
+    storage: u64,
+    formats: BTreeMap<u32, u64>,
+}
+
+/// The planes with live guest textures.
+static PLANES: Mutex<BTreeMap<Plane, PlaneLive>> = Mutex::new(BTreeMap::new());
+
+/// Two formats live over one plane at once: the meetings, the most bytes of a texture at one, and
+/// the writes through a texture of one while one of the other was live.
+#[derive(Default)]
+struct PairTotals {
+    met: u64,
+    bytes_most: u64,
+    writes: u64,
+}
+
+/// Two formats over one plane, the lesser first, with their totals.
+static PAIRS: Mutex<BTreeMap<(u32, u32), PairTotals>> = Mutex::new(BTreeMap::new());
+
+/// A kind of guest surface texture, the key of their totals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SurfaceKind {
+    context: u32,
+    usage: u64,
+    form: &'static str,
+    made: bool,
+}
+
+/// The guest surface textures made or refused, by kind.
+static SURFACES: Mutex<BTreeMap<SurfaceKind, u64>> = Mutex::new(BTreeMap::new());
+
+/// The views refused over a plain shape, by (shape's format, view's format).
+static PLAIN_REFUSED: Mutex<BTreeMap<(u64, u64), u64>> = Mutex::new(BTreeMap::new());
+
+/// Whether a texture of declared `usage` takes storage on a shape's image.
+fn takes_storage(usage: u64) -> bool {
+    usage == 0 || usage & STORAGE_USAGES != 0
+}
+
+/// The texture the decoder made of a guest surface texture, for [`shape_written`]: where it is
+/// one of the rt platform's.
+#[derive(Clone)]
+pub struct Token(Arc<Made>);
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Token({})", self.0.id)
+    }
+}
+
+/// [`Token`] of `texture`, where it is one of the rt platform's.
+pub fn token<T: 'static>(texture: &T) -> Option<Token> {
+    let any: &dyn std::any::Any = texture;
+    let t = any.downcast_ref::<RtObj<RtTexture>>()?;
+    Some(Token(Arc::clone(t.made())))
+}
+
+/// Counts a guest surface texture the decoder made (`texture`) or was refused (`None`) for
+/// context `context` over plane `plane` of a surface (the block of its device cache, else its
+/// buffer's object id with the top bit set, and the plane's index), of the `usage` the guest
+/// declared and `bytes` bytes, made as `form` says (a view of a shape's image, or over the
+/// buffer and why). Where it is one of the rt platform's, notes its plane, whose live textures it
+/// is one of until it is let go, and counts each other format live over it ([`PairTotals`]).
+pub fn surface_texture<T: 'static>(
+    texture: Option<&T>,
+    context: u32,
+    plane: (u64, u32),
+    (usage, bytes): (u64, u64),
+    form: &'static str,
+) {
+    *SURFACES
+        .lock()
+        .entry(SurfaceKind {
+            context,
+            usage,
+            form,
+            made: texture.is_some(),
+        })
+        .or_insert(0) += 1;
+    if let Some(Token(made)) = texture.and_then(token) {
+        on_plane(&made, plane, usage, bytes);
+    }
+}
+
+/// Notes `made`'s plane `plane`, of declared `usage` and `bytes`, once.
+fn on_plane(made: &Made, plane: Plane, usage: u64, bytes: u64) {
+    let storage = takes_storage(usage);
+    if made.on_plane.set(OnPlane { plane, storage, bytes }).is_err() {
+        return;
+    }
+    let mut planes = PLANES.lock();
+    let p = planes.entry(plane).or_default();
+    let others: Vec<u32> = (p.formats.keys().copied())
+        .filter(|&f| f != made.format)
+        .collect();
+    *p.formats.entry(made.format).or_insert(0) += 1;
+    if storage {
+        p.storage += 1;
+    }
+    drop(planes);
+    let mut pairs = PAIRS.lock();
+    for other in others {
+        let pair = pairs.entry(pair_of(made.format, other)).or_default();
+        pair.met += 1;
+        pair.bytes_most = pair.bytes_most.max(bytes);
+    }
+}
+
+/// `a` and `b`, the lesser first.
+fn pair_of(a: u32, b: u32) -> (u32, u32) {
+    (a.min(b), a.max(b))
+}
+
+/// The decoder noted a write through the guest surface texture `token` is: counted for each
+/// other format live over its plane.
+pub fn shape_written(token: &Token) {
+    let made = &token.0;
+    let Some(on) = made.on_plane.get() else {
+        return;
+    };
+    let others: Vec<u32> = match PLANES.lock().get(&on.plane) {
+        Some(p) => (p.formats.keys().copied())
+            .filter(|&f| f != made.format)
+            .collect(),
+        None => return,
+    };
+    let mut pairs = PAIRS.lock();
+    for other in others {
+        pairs.entry(pair_of(made.format, other)).or_default().writes += 1;
+    }
+}
+
+/// Counts a view in `view`'s format of a plain shape of `shape`'s format, which rt refuses.
+pub fn plain_view_refused(shape: u64, view: u64) {
+    *PLAIN_REFUSED.lock().entry((shape, view)).or_insert(0) += 1;
+}
+
+/// The plane of `texture`, a guest surface texture, as an attachment read's class names it: one
+/// with a live texture that takes storage, or one with none.
+fn plane_storage(texture: &Made) -> &'static str {
+    let Some(on) = texture.on_plane.get() else {
+        return "no-surface-plane";
+    };
+    match PLANES.lock().get(&on.plane) {
+        Some(p) if p.storage != 0 => "plane-storage-live",
+        _ => "plane-no-storage",
     }
 }
 
@@ -626,7 +838,7 @@ pub fn attachment_read(
             };
             let class = format!(
                 "class {} {relation} {stage_name} {access:?} {} declared {:#x} format {} storage {} \
-                 at {point}{} second {}",
+                 at {point}{} second {} image-usage {:#x} {}",
                 if class_a { "A" } else { "other" },
                 texture.call_name(),
                 texture.declared_usage(),
@@ -634,6 +846,8 @@ pub fn attachment_read(
                 texture.storage,
                 depth,
                 meets.len() > 1,
+                texture.usage,
+                plane_storage(texture),
             );
             lines.push(format!(
                 "{class}; slot {slot}, texture level {} slice {}, attachment level {} slice {}, \
@@ -779,6 +993,43 @@ pub fn write() {
             "reims-vgpu: rt-diag attachment-read: {process}: {class}: {n}"
         );
     }
+    let mut surfaces: BTreeMap<(&str, u64, &str, bool), u64> = BTreeMap::new();
+    for (kind, n) in SURFACES.lock().iter() {
+        let process = if presenters.contains(&kind.context) {
+            "compositor"
+        } else {
+            "app"
+        };
+        *surfaces
+            .entry((process, kind.usage, kind.form, kind.made))
+            .or_insert(0) += n;
+    }
+    for ((process, usage, form, made), n) in &surfaces {
+        let _ = writeln!(
+            out,
+            "reims-vgpu: rt-diag surface-texture: {process}: usage {usage:#x} ({}) {form}{}: {n}",
+            if takes_storage(*usage) {
+                "takes storage"
+            } else {
+                "plain"
+            },
+            if *made { "" } else { " refused" },
+        );
+    }
+    for ((a, b), t) in PAIRS.lock().iter() {
+        let _ = writeln!(
+            out,
+            "reims-vgpu: rt-diag plane-formats: {a} and {b}: met {}, most bytes {}, writes while \
+             both live {}",
+            t.met, t.bytes_most, t.writes
+        );
+    }
+    for ((shape, view), n) in PLAIN_REFUSED.lock().iter() {
+        let _ = writeln!(
+            out,
+            "reims-vgpu: rt-diag plain-view-refused: shape format {shape}, view format {view}: {n}"
+        );
+    }
     for ((formats, samples), n) in IMAGEBLOCKS.lock().iter() {
         let _ = writeln!(
             out,
@@ -889,6 +1140,42 @@ mod tests {
             class("reims-vgpu.graphics-surfaces"),
             "reims-vgpu.graphics-surfaces"
         );
+    }
+
+    /// A guest surface texture is one of its plane's live textures, and of those that take storage
+    /// where its usage is 0, `ShaderWrite` or `ShaderAtomic`, until it is let go; a texture of
+    /// another format made, or written, while it is live counts the pair.
+    #[test]
+    fn a_plane_counts_its_live_textures_and_formats() {
+        let shape = |format, usage| Shape {
+            format,
+            width: 4,
+            height: 4,
+            storage: 2,
+            usage,
+        };
+        let plane = (0x5a5a_0000, 1);
+        let plain = Made::new(Call::View, &shape(80, 0x5));
+        on_plane(&plain, plane, 0x5, 64);
+        assert_eq!(plane_storage(&plain), "plane-no-storage");
+        for usage in [0, 0x2, 0x20] {
+            let storage = Made::new(Call::View, &shape(80, usage));
+            on_plane(&storage, plane, usage, 64);
+            assert_eq!(plane_storage(&plain), "plane-storage-live");
+            drop(storage);
+            assert_eq!(plane_storage(&plain), "plane-no-storage");
+        }
+        let other = Made::new(Call::View, &shape(53, 0));
+        on_plane(&other, plane, 0, 128);
+        shape_written(&Token(Arc::clone(&other)));
+        drop(other);
+        shape_written(&Token(Arc::clone(&plain)));
+        let pairs = PAIRS.lock();
+        let pair = pairs.get(&(53, 80)).expect("the pair is counted");
+        assert_eq!((pair.met, pair.bytes_most, pair.writes), (1, 128, 1));
+        drop(pairs);
+        let unplaned = Made::new(Call::Plain, &shape(80, 0x5));
+        assert_eq!(plane_storage(&unplaned), "no-surface-plane");
     }
 
     /// A gap is counted by its kind, a draw's by its draw kind; another error is not.

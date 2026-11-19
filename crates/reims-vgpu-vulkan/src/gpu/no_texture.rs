@@ -120,6 +120,18 @@ pub fn no_view(raw: u64) -> bool {
         .any(|&(first, last)| (first..=last).contains(&raw))
 }
 
+/// Whether Metal views a texture of the raw format `raw` in the raw format `view` with no
+/// `PixelFormatView` usage: the same format, its sRGB sibling, or the stencil format of a combined
+/// depth and stencil one (`metal2vulkan::metal::format::views_without_usage`). False for a value
+/// the runtime has no format of.
+pub fn views_without_usage(raw: u64, view: u64) -> bool {
+    let format = |raw: u64| u32::try_from(raw).ok().and_then(|r| PixelFormat::try_from(r).ok());
+    match (format(raw), format(view)) {
+        (Some(pf), Some(view)) => metal2vulkan::metal::format::views_without_usage(pf, view),
+        _ => false,
+    }
+}
+
 /// The runtime's descriptor of `fields`, which holds `pf`, a format Metal makes no texture of
 /// from a descriptor alone ([`TextureFields::formatless`]), for `sel`, a creator or the heap's
 /// size query the runtime answers as Metal does for it (the module's docs). Dies first where
@@ -202,6 +214,20 @@ mod tests {
             desc.set_pixel_format(format);
             assert_eq!(desc.pixel_format(), format);
         }
+    }
+
+    /// A texture is viewed with no `PixelFormatView` usage in its own format and its sRGB
+    /// sibling, and in no other format of its texel's size; a raw value of no format in neither.
+    #[test]
+    fn views_without_usage_are_the_format_and_its_srgb_sibling() {
+        use super::views_without_usage;
+        // BGRA8Unorm, BGRA8Unorm_sRGB, RGBA8Unorm, R32Uint.
+        assert!(views_without_usage(80, 80));
+        assert!(views_without_usage(80, 81));
+        assert!(views_without_usage(81, 80));
+        assert!(!views_without_usage(80, 70));
+        assert!(!views_without_usage(80, 53));
+        assert!(!views_without_usage(80, 0x7fff_ffff));
     }
 
     #[cfg(target_os = "macos")]

@@ -351,6 +351,10 @@ use shapes::{Held, ShapeCounts, ShapeKey, ShapeTable};
 /// (docs/conventions.md).
 static UNORDERED_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// Whether a shape was made over a plane holding one of the other kind ([`shapes::ORDER_CASE`]):
+/// its line is logged the first time alone, the rest counted (docs/conventions.md).
+static ORDER_CASE_LOGGED: AtomicBool = AtomicBool::new(false);
+
 /// The copies run under a live raise handler (the ring loop's, or the entry of the ring-0 thread
 /// that asks for them).
 const ON: OnFault = OnFault::Return;
@@ -2986,10 +2990,11 @@ impl<P: Platform> SurfaceCaches<P> {
     /// Adds the shape `key` of the block at `block`'s cache, its image `image` made with the lock
     /// let go of, where the cache holds no such shape yet: it owes its fill from the buffer, made
     /// before the next command buffer that uses the block runs ([`Self::fill_shapes`]). Then the
-    /// shapes past the bound and the caches' budget go ([`Self::sweep_shapes`]). A reference to
-    /// the shape and its image, `None` where the block has no cache; and what goes, `image`
-    /// among it where the cache held the shape already, for the caller to let go of with the
-    /// lock let go of.
+    /// shapes past the bound and the caches' budget go ([`Self::sweep_shapes`]). A shape made
+    /// over a plane holding one of the other kind, plain or storage, is counted
+    /// ([`ShapeCounts::order_case`]). A reference to the shape and its image, `None` where the
+    /// block has no cache; and what goes, `image` among it where the cache held the shape
+    /// already, for the caller to let go of with the lock let go of.
     fn add_shape(
         &mut self,
         block: u64,
@@ -3005,12 +3010,28 @@ impl<P: Platform> SurfaceCaches<P> {
             return (None, vec![image]);
         };
         let made = image.clone_ref();
+        let order_case = cache.shapes.holds_other_kind(&key);
         let (reference, again) = cache.shapes.insert(key, image, true, self.shape_clock);
         let bytes = key.bytes();
         self.counts.shapes.made += 1;
         self.counts.shapes.made_bytes += bytes;
         if again {
             self.counts.shapes.again += 1;
+        }
+        if order_case {
+            self.counts.shapes.order_case += 1;
+            reims_vgpu_vulkan::answer::count_kind(shapes::ORDER_CASE);
+            if !ORDER_CASE_LOGGED.swap(true, Ordering::Relaxed) {
+                log::info!(
+                    target: "reims_vgpu::graphics", kind:% = shapes::ORDER_CASE;
+                    "the IOSurface block at {block:#x}: a {} shape made over its plane {}, which \
+                     holds a {} one; rule 1 keeps the two current ({}; the rest are counted)",
+                    if key.storage { "storage" } else { "plain" },
+                    key.plane,
+                    if key.storage { "plain" } else { "storage" },
+                    shapes::ORDER_CASE
+                );
+            }
         }
         self.hold_bytes(bytes);
         let gone = self.sweep_shapes(block);

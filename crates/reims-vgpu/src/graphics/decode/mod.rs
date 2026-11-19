@@ -1673,14 +1673,18 @@ impl<P: Platform> GraphicsDecoder<P> {
                      write; {} unreferenced dropped ({} MiB); {} binds written as their usage \
                      says, {} read as their slots say; {} textures over the buffer instead ({} \
                      images and {} views refused); {} caches kept past the budget; {} blocks \
-                     refused uncached",
+                     refused uncached; {} made beside a shape of the other kind, {} copies \
+                     between the kinds ({} MiB); {} views of a plain shape in another format, {} \
+                     textures over a plain shape asking PixelFormatView",
                     sh.made, sh.made_bytes >> 20, sh.found, sh.again, sh.fills,
                     sh.filled_bytes >> 20, sh.fills_made, sh.fills_deferred, sh.written_back,
                     sh.written_back_bytes >> 20, sh.kept_dirty, sh.overlap_copies,
                     sh.overlap_bytes >> 20, sh.straddled, sh.overlap_dropped, sh.unordered,
                     sh.unseen, sh.video_owed, sh.dropped, sh.dropped_bytes >> 20,
                     sh.usage_writes, sh.slot_reads, sh.unshaped,
-                    sh.images_refused, sh.views_refused, sh.past_budget, sh.uncached_refused
+                    sh.images_refused, sh.views_refused, sh.past_budget, sh.uncached_refused,
+                    sh.order_case, sh.order_copies, sh.order_bytes >> 20, sh.plain_views_refused,
+                    sh.plain_format_views
                 );
             }
         }
@@ -4198,6 +4202,17 @@ impl<P: Platform> GraphicsDecoder<P> {
                     _ => descriptor,
                 };
                 let at = (plane.offset, plane.bytes_per_row);
+                // The rt platform's boot diagnostics count the texture by how it is made.
+                #[cfg(feature = "rt")]
+                let form = match (&shaped, span) {
+                    (Some(_), _) => "shape-view",
+                    (None, None) => "over-buffer: no region",
+                    (None, Some((block, _))) if !self.surface_caches.has(block) => {
+                        "over-buffer: no cache"
+                    }
+                    (None, Some(_)) if !self.surface_caches.shaped() => "over-buffer: default form",
+                    (None, Some(_)) => "over-buffer: unshaped",
+                };
                 let (made, shape) = match shaped {
                     Some((texture, shape)) => (Some(texture), Some(shape)),
                     None => {
@@ -4230,6 +4245,17 @@ impl<P: Platform> GraphicsDecoder<P> {
                         (made, shadow)
                     }
                 };
+                #[cfg(feature = "rt")]
+                reims_vgpu_vulkan::rt_platform::diag::surface_texture(
+                    made.as_ref(),
+                    context_of(m.obj_id),
+                    (span.map_or(m.buffer_obj_id | (1 << 63), |(at, _)| at), m.plane),
+                    (
+                        u64::from(m.desc.usage),
+                        row_bytes.saturating_mul(u64::from(m.desc.height)),
+                    ),
+                    form,
+                );
                 match made {
                     Some(texture) => {
                         // An id made again names only its new texture's surface.
@@ -6476,6 +6502,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         if !written {
             self.surface_caches.count_shapes(|c| c.usage_writes += 1);
+        }
+        // The rt platform's boot diagnostics count the write against the other formats live
+        // over the texture's plane.
+        #[cfg(feature = "rt")]
+        if let Some(token) = &used.diag {
+            reims_vgpu_vulkan::rt_platform::diag::shape_written(token);
         }
         let id = used.reference.id();
         let mut noted = self.shapes_written.borrow_mut();

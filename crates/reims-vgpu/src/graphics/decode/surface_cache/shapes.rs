@@ -12,10 +12,27 @@
 //!
 //! **The shape** ([`ShapeKey`]): the plane, where it lies in the buffer (its byte and its rows'
 //! pitch), its size and its texel's bytes ([`texel_bytes`]), of a 2D texture of one level and one
-//! slice, as Metal makes a texture over an IOSurface. The texture's usage is not part of it: the
-//! image is made with Metal's Unknown usage, which takes every usage and a view in any format of
-//! its texel's size, so an `R32Uint` texture over a `BGRA8Unorm` surface is a view of the same
-//! image, not a second shape.
+//! slice, as Metal makes a texture over an IOSurface, and whether it takes storage. A texture
+//! takes storage where it declares Metal's Unknown usage (0), `ShaderWrite` or `ShaderAtomic`.
+//! A storage shape's image is made with the Unknown usage, which takes every usage and a view in
+//! any format of its texel's size, so an `R32Uint` texture over a `BGRA8Unorm` storage shape is
+//! a view of the same image, not a second shape. A plain shape's image, of a texture that takes no
+//! storage, is made with `ShaderRead | RenderTarget` alone: a texture rt reads while a pass
+//! renders into it is rt's to build only on such an image, and the long list of view formats
+//! that `PixelFormatView` brings costs a compositing pass time on some GPUs. A plain image is
+//! viewed in its own format and its sRGB sibling alone, as Metal views a texture with no
+//! `PixelFormatView` usage: a texture over a plain shape in any other format is a view rt
+//! refuses, counted ([`PLAIN_VIEW_REFUSED`]), and lies over the buffer as one whose view the
+//! platform does not make.
+//!
+//! **A storage shape serves every texture of its extent** (its key but for the storage bit),
+//! whatever the texture declares: [`ShapeTable::find`] prefers it. A texture that takes storage
+//! over a plane with only a plain shape of its extent makes a storage shape beside it, and the two
+//! are kept current by rule 1 below, as any two shapes of a plane are: counted while a plane holds
+//! both kinds ([`ShapeCounts::order_case`], [`ShapeCounts::order_copies`]). The bound drops a
+//! plain shape that a storage shape of its extent supersedes as soon as no texture references it,
+//! and a dirty one once a copy out of the cache has written it back (rule 3,
+//! [`ShapeTable::sweep`]).
 //!
 //! **Every image an entry holds is current over its whole extent.** Three rules keep it so:
 //! - a new shape takes the buffer's bytes before anything reads it, once the dirty shapes are
@@ -101,6 +118,19 @@ use reims_vgpu_vulkan::gpu::no_texture::no_view;
 /// 2026-11-19: referenced shapes and 4 more).
 pub(crate) const UNREFERENCED_KEPT: usize = 4;
 
+/// The degradation code of a texture over a plain shape in a format that is neither the shape's
+/// nor its sRGB sibling: a view rt refuses, as Metal's validation refuses a view in another format
+/// of a texture without `PixelFormatView` usage (the module doc, "The shape"). The texture lies
+/// over the buffer as one whose view the platform does not make.
+pub(crate) const PLAIN_VIEW_REFUSED: &str = "rt-refused-surface-plain-view-format";
+
+/// The counts' codes of shapes made over a plane that held a shape of the other kind, plain or
+/// storage, and of rule 1's copies between a plain and a storage shape and their bytes
+/// ([`ShapeCounts::order_case`]): in the process's counts line, which the boot reads at its end.
+pub(crate) const ORDER_CASE: &str = "rt-shape-order-case";
+pub(crate) const ORDER_COPIES: &str = "rt-shape-order-copies";
+pub(crate) const ORDER_COPY_BYTES: &str = "rt-shape-order-copy-bytes";
+
 /// The degradation code of an encoder that may have written two shapes of one plane: Metal
 /// would write the plane's one texture memory through both in the order the GPU ran them, which
 /// the per-shape form cannot know; the shape the walk noted last is taken as the plane's write
@@ -142,9 +172,20 @@ pub(crate) struct ShapeKey {
     pub(crate) width: u64,
     pub(crate) height: u64,
     pub(crate) texel_bytes: u64,
+    /// Its image takes storage: the Unknown usage, for a texture that declares it, `ShaderWrite`
+    /// or `ShaderAtomic`; else `ShaderRead | RenderTarget` (the module doc, "The shape").
+    pub(crate) storage: bool,
 }
 
 impl ShapeKey {
+    /// The storage shape of the same extent: the shape [`ShapeTable::find`] prefers.
+    pub(crate) fn as_storage(&self) -> ShapeKey {
+        ShapeKey {
+            storage: true,
+            ..*self
+        }
+    }
+
     /// Whether `other` is a shape of the same plane, at the same place and pitch in the buffer.
     /// Every two shapes of a plane are, as a texture's place and pitch are its plane's, so the
     /// two overlap from the plane's first texel ([`Self::overlap`]).
@@ -209,13 +250,18 @@ pub(crate) type Held<T> = (ShapeRef, T);
 
 /// A guest texture's shape, in its decoder entry (`tables::Entry`'s `shape`): the block whose
 /// cache holds it, the shape's identity, whether the texture may be written where it is bound
-/// (its usage, `ShaderWrite` or none given; a render pass names its attachments), and the
-/// reference it holds.
+/// (its usage takes storage: Unknown, `ShaderWrite` or `ShaderAtomic`; a render pass names its
+/// attachments), and the reference it holds.
 #[derive(Debug)]
 pub(crate) struct ShapeUse {
     pub(crate) block: u64,
     pub(crate) writes: bool,
     pub(crate) reference: ShapeRef,
+    /// The rt platform's boot diagnostics' note of the texture, which a write noted through it
+    /// counts against the other formats live over its plane
+    /// (`reims_vgpu_vulkan::rt_platform::diag::shape_written`).
+    #[cfg(feature = "rt")]
+    pub(crate) diag: Option<reims_vgpu_vulkan::rt_platform::diag::Token>,
 }
 
 impl ShapeUse {
@@ -225,6 +271,8 @@ impl ShapeUse {
             block: self.block,
             writes: self.writes,
             reference: self.reference.clone_ref(),
+            #[cfg(feature = "rt")]
+            diag: self.diag.clone(),
         }
     }
 }
@@ -294,6 +342,17 @@ pub(crate) struct ShapeCounts {
     /// Shapes owed a fill after a video command buffer wrote their cache's buffer
     /// ([`ShapeTable::owe_all`]).
     pub(crate) video_owed: u64,
+    /// Shapes made over a plane that held a shape of the other kind, plain or storage (the module
+    /// doc, "A storage shape serves every texture of its extent"); and of rule 1's copies, those
+    /// between a plain and a storage shape, and their bytes.
+    pub(crate) order_case: u64,
+    pub(crate) order_copies: u64,
+    pub(crate) order_bytes: u64,
+    /// Textures over a plain shape in a format neither the shape's nor its sRGB sibling, whose
+    /// view rt refuses ([`PLAIN_VIEW_REFUSED`]).
+    pub(crate) plain_views_refused: u64,
+    /// Textures over a plain shape that declare `PixelFormatView` usage.
+    pub(crate) plain_format_views: u64,
 }
 
 /// One shape's image and its state.
@@ -349,12 +408,26 @@ impl<T> Default for ShapeTable<T> {
 }
 
 impl<T> ShapeTable<T> {
-    /// A reference to the shape of `key`, used now (`now`, the caches' clock), where the table
-    /// holds it.
+    /// A reference to the shape `key` takes, used now (`now`, the caches' clock), where the table
+    /// holds one: the storage shape of its extent where the table holds one, which serves every
+    /// texture; else, for a texture that takes no storage, its plain shape (the module doc).
     pub(crate) fn find(&mut self, key: &ShapeKey, now: u64) -> Option<(ShapeRef, &Shape<T>)> {
-        let shape = self.shapes.iter_mut().find(|s| s.key == *key)?;
+        let storage = key.as_storage();
+        let at = (self.shapes.iter().position(|s| s.key == storage))
+            .or_else(|| self.shapes.iter().position(|s| s.key == *key))?;
+        let shape = &mut self.shapes[at];
         shape.used = now;
         Some((shape.tag.clone_ref(), shape))
+    }
+
+    /// Whether the table holds a shape of `key`'s plane of the other kind, plain or storage.
+    pub(crate) fn holds_other_kind(&self, key: &ShapeKey) -> bool {
+        (self.shapes.iter()).any(|s| s.key.same_plane(key) && s.key.storage != key.storage)
+    }
+
+    /// Whether a storage shape of `key`'s extent supersedes `key`, a plain shape's.
+    fn superseded(&self, key: &ShapeKey) -> bool {
+        !key.storage && self.shapes.iter().any(|s| s.key == key.as_storage())
     }
 
     /// Adds the shape of `key`, its image `image`, owing a fill from the buffer where `owed`,
@@ -452,19 +525,28 @@ impl<T> ShapeTable<T> {
         self.shapes.iter_mut()
     }
 
-    /// The unreferenced shapes past the bound, taken out: all but the [`UNREFERENCED_KEPT`] most
-    /// recently used, and of those a dirty one is kept until a copy out of the cache writes it
-    /// back (rule 3), counted in `counts`.
+    /// The unreferenced shapes past the bound, taken out: each plain one a storage shape of its
+    /// extent supersedes, and of the others all but the [`UNREFERENCED_KEPT`] most recently used;
+    /// of those a dirty one is kept until a copy out of the cache writes it back (rule 3), counted
+    /// in `counts`.
     pub(crate) fn sweep(&mut self, counts: &mut ShapeCounts) -> Vec<Shape<T>> {
-        let mut unreferenced: Vec<(u64, u64, bool)> = (self.shapes.iter())
-            .filter(|s| !s.referenced())
-            .map(|s| (s.used, s.id(), s.dirty))
-            .collect();
-        if unreferenced.len() <= UNREFERENCED_KEPT {
+        let mut past: Vec<(u64, u64, bool)> = Vec::new();
+        let mut unreferenced: Vec<(u64, u64, bool)> = Vec::new();
+        for shape in self.shapes.iter().filter(|s| !s.referenced()) {
+            let one = (shape.used, shape.id(), shape.dirty);
+            if self.superseded(&shape.key) {
+                past.push(one);
+            } else {
+                unreferenced.push(one);
+            }
+        }
+        if unreferenced.len() > UNREFERENCED_KEPT {
+            unreferenced.sort_unstable();
+            past.extend_from_slice(&unreferenced[..unreferenced.len() - UNREFERENCED_KEPT]);
+        }
+        if past.is_empty() {
             return Vec::new();
         }
-        unreferenced.sort_unstable();
-        let past = &unreferenced[..unreferenced.len() - UNREFERENCED_KEPT];
         counts.kept_dirty += past.iter().filter(|&&(_, _, dirty)| dirty).count() as u64;
         let going: Vec<u64> = (past.iter())
             .filter(|&&(_, _, dirty)| !dirty)
@@ -669,6 +751,12 @@ pub(crate) fn copy_overlaps<P: Platform>(
         )?;
         counts.overlap_copies += 1;
         counts.overlap_bytes += width * rows * texel;
+        if target.key.storage != key.storage {
+            counts.order_copies += 1;
+            counts.order_bytes += width * rows * texel;
+            reims_vgpu_vulkan::answer::count_kind(ORDER_COPIES);
+            reims_vgpu_vulkan::answer::count_kind_by(ORDER_COPY_BYTES, width * rows * texel);
+        }
     }
     blit.encode(ON, BlitCmd::EndEncoding)?;
     Ok(())
@@ -697,6 +785,7 @@ mod tests {
             width,
             height: 64,
             texel_bytes: texel,
+            storage: true,
         }
     }
 
@@ -803,6 +892,60 @@ mod tests {
         let (_, again) = table.insert(key(50, 4), 50, true, 21);
         assert!(!again);
         drop(held);
+    }
+
+    /// A storage shape serves every texture of its extent, and is found first; a plain shape
+    /// serves only a texture that takes no storage; a texture that takes storage over a plane
+    /// with only a plain shape finds none, and makes a second kind there.
+    #[test]
+    fn a_storage_shape_serves_every_texture_of_its_extent() {
+        let plain = ShapeKey {
+            storage: false,
+            ..key(100, 4)
+        };
+        let storage = key(100, 4);
+        let mut table = ShapeTable::<u32>::default();
+        let (held_plain, _) = table.insert(plain, 1, true, 1);
+        assert_eq!(table.find(&plain, 2).map(|(_, s)| s.image), Some(1));
+        assert!(table.find(&storage, 3).is_none(), "a plain shape takes no storage");
+        assert!(table.holds_other_kind(&storage));
+        assert!(!table.holds_other_kind(&plain));
+        let (held_storage, _) = table.insert(storage, 2, true, 4);
+        assert_eq!(table.find(&plain, 5).map(|(_, s)| s.image), Some(2));
+        assert_eq!(table.find(&storage, 6).map(|(_, s)| s.image), Some(2));
+        let other = ShapeKey {
+            storage: false,
+            ..key(50, 4)
+        };
+        assert!(table.find(&other, 7).is_none(), "another extent");
+        drop((held_plain, held_storage));
+    }
+
+    /// The bound drops a plain shape that a storage shape of its extent supersedes once nothing
+    /// references it, however few shapes the table holds, and a dirty one only once it is
+    /// written back; a plain shape of another extent stays within the bound.
+    #[test]
+    fn the_bound_drops_a_superseded_plain_shape() {
+        let plain = |width| ShapeKey {
+            storage: false,
+            ..key(width, 4)
+        };
+        let mut table = ShapeTable::<u64>::default();
+        let (held, _) = table.insert(plain(100), 1, false, 1);
+        drop(table.insert(plain(50), 2, false, 2));
+        let (storage, _) = table.insert(key(100, 4), 3, false, 3);
+        let mut counts = ShapeCounts::default();
+        assert!(table.sweep(&mut counts).is_empty(), "the plain shape is referenced");
+        assert!(table.mark_dirty(held.id()));
+        let id = held.id();
+        drop(held);
+        assert!(table.sweep(&mut counts).is_empty(), "dirty, kept until written back");
+        assert_eq!(counts.kept_dirty, 1);
+        table.written_back(&[id], &mut counts);
+        let gone: Vec<u64> = table.sweep(&mut counts).iter().map(|s| s.image).collect();
+        assert_eq!(gone, vec![1]);
+        assert_eq!(table.iter().count(), 2, "the storage shape and the other extent's");
+        drop(storage);
     }
 
     /// A use of the surface counts as a use of each shape a texture references then, and of
@@ -932,6 +1075,7 @@ mod tests {
                 width,
                 height,
                 texel_bytes,
+                storage: true,
             };
             let image = platform
                 .own_texture(
@@ -1109,6 +1253,7 @@ mod tests {
                 width,
                 height,
                 texel_bytes,
+                storage: true,
             };
             let image = platform
                 .own_texture(

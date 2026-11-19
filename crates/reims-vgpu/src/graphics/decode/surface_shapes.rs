@@ -2,6 +2,16 @@
 //! the guest's texture is a view, at the guest's resource index and in the guest's format, of
 //! its shape's image, which the cache keeps for every texture of that shape over the surface.
 //!
+//! The usage the guest declares picks the shape's kind (`shapes`, "The shape"): a texture of
+//! Metal's Unknown usage (0), `ShaderWrite` or `ShaderAtomic` takes storage, and views the storage
+//! shape of its extent, made of the Unknown usage where the cache holds none; any other views the
+//! storage shape of its extent where the cache holds one, else its plain shape, made of
+//! `ShaderRead | RenderTarget` alone. A texture over a plain shape in a format neither the
+//! shape's nor its sRGB sibling asks a view rt refuses, counted
+//! ([`shapes::PLAIN_VIEW_REFUSED`], logged once), and lies over the buffer as any texture whose
+//! view the platform does not make; one over a plain shape that declares `PixelFormatView` is
+//! counted too.
+//!
 //! A texture takes a shape where it is a 2D texture of one level, one slice and one sample in a
 //! colour format of texels ([`shapes::texel_bytes`]) lying wholly inside the cache's buffer; any
 //! other, and one whose image or view the platform does not make, lies over the buffer as in the
@@ -25,14 +35,29 @@ use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, Texture as _};
 use reims_vgpu_vulkan::core::platform::types::{NsRange, PixelFormatInfo};
 use reims_vgpu_vulkan::core::platform::values::TextureDesc;
 use reims_vgpu_vulkan::core::raise::RaiseResult;
+use reims_vgpu_vulkan::gpu::no_texture::views_without_usage;
 
 use super::surface_cache::STORAGE_PRIVATE;
 use super::surface_cache::ShapeMaker;
-use super::surface_cache::shapes::{self, ShapeCounts, ShapeKey, ShapeUse};
+use super::surface_cache::shapes::{self, PLAIN_VIEW_REFUSED, ShapeCounts, ShapeKey, ShapeUse};
 use super::{GraphicsDecoder, ObjHandle, TEXTURE_USAGE_WRITES, texture_desc};
 
 /// `MTLTextureType2D`.
 const TEXTURE_TYPE_2D: u64 = 2;
+
+/// `MTLTextureUsageShaderAtomic`.
+const TEXTURE_USAGE_ATOMIC: u64 = 0x20;
+
+/// `MTLTextureUsagePixelFormatView`.
+const TEXTURE_USAGE_PIXEL_FORMAT_VIEW: u64 = 0x10;
+
+/// A plain shape's image's usage: `MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget`
+/// (`shapes`, "The shape").
+const PLAIN_USAGE: u64 = 0x1 | 0x4;
+
+/// Whether a view refused over a plain shape was logged ([`PLAIN_VIEW_REFUSED`]): its line is
+/// logged the first time alone, the rest counted (docs/conventions.md).
+static PLAIN_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// The degradation code of a block refused as uncached in the per-shape form, which the kext
 /// gives a copy block instead (module doc).
@@ -98,20 +123,25 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         let d = &m.desc;
         let pixel_format = u64::from(d.pixel_format);
-        // The image: the guest's format and size, Private, of Metal's Unknown usage, which takes
-        // every use and a view in any format of the texel's size, at no index of the guest's.
+        // The image: the guest's format and size, Private, at no index of the guest's; a storage
+        // shape's of Metal's Unknown usage, which takes every use and a view in any format of the
+        // texel's size, a plain shape's `ShaderRead | RenderTarget` alone (`shapes`, "The
+        // shape").
         let image = TextureDesc {
             texture_type: TEXTURE_TYPE_2D,
             pixel_format,
             width: key.width,
             height: key.height,
-            usage: 0,
+            usage: if key.storage { 0 } else { PLAIN_USAGE },
             resource_options: Some(STORAGE_PRIVATE),
             ..TextureDesc::default()
         };
         let Some((reference, image)) = caches.shape(device, block, key, &image) else {
             return unshaped(|_| {});
         };
+        if image.usage() == PLAIN_USAGE {
+            self.note_plain_view(m, image.pixel_format());
+        }
         let swizzle = texture_desc(d, m.resource_id).swizzle;
         let one_of = NsRange::new(0, 1);
         let view = match swizzle {
@@ -133,10 +163,40 @@ impl<P: Platform> GraphicsDecoder<P> {
         reims_vgpu_vulkan::rt_platform::diag::declared(&view, u64::from(d.usage));
         let shape = ShapeUse {
             block,
-            writes: usage_writes(m),
+            writes: takes_storage(m),
             reference,
+            #[cfg(feature = "rt")]
+            diag: reims_vgpu_vulkan::rt_platform::diag::token(&view),
         };
         Ok(Some((view, shape)))
+    }
+
+    /// The texture `m` asks lies over a plain shape of `shape_format`: one that declares
+    /// `PixelFormatView` is counted ([`ShapeCounts::plain_format_views`]), and one in a format
+    /// neither `shape_format` nor its sRGB sibling asks a view rt refuses, counted
+    /// ([`PLAIN_VIEW_REFUSED`], logged once). The view is asked all the same.
+    fn note_plain_view(&self, m: &RgfxTextureFromIOSurface, shape_format: u64) {
+        let caches = &self.surface_caches;
+        if u64::from(m.desc.usage) & TEXTURE_USAGE_PIXEL_FORMAT_VIEW != 0 {
+            caches.count_shapes(|c| c.plain_format_views += 1);
+        }
+        let pixel_format = u64::from(m.desc.pixel_format);
+        if views_without_usage(shape_format, pixel_format) {
+            return;
+        }
+        caches.count_shapes(|c| c.plain_views_refused += 1);
+        reims_vgpu_vulkan::answer::count_kind(PLAIN_VIEW_REFUSED);
+        #[cfg(feature = "rt")]
+        reims_vgpu_vulkan::rt_platform::diag::plain_view_refused(shape_format, pixel_format);
+        if !PLAIN_LOGGED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = PLAIN_VIEW_REFUSED;
+                "the texture {:#x} over plane {} of the IOSurface {}: a view in format \
+                 {pixel_format} of a plain shape of format {shape_format}, neither it nor its \
+                 sRGB sibling, which rt refuses ({PLAIN_VIEW_REFUSED}; the rest are counted)",
+                m.obj_id, m.plane, m.iosurface_id
+            );
+        }
     }
 
     /// The shape the texture `m` asks would take over its surface, of the format `info`
@@ -163,6 +223,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             width: u64::from(d.width),
             height: u64::from(d.height),
             texel_bytes,
+            storage: takes_storage(m),
         };
         let length = match self.named(m.buffer_obj_id) {
             Some(ObjHandle::Buffer(buffer)) => buffer.length(),
@@ -189,21 +250,24 @@ impl<P: Platform> GraphicsDecoder<P> {
         let reference = self.surface_caches.shadow_shape(block, &key)?;
         Some(ShapeUse {
             block,
-            writes: usage_writes(m),
+            writes: takes_storage(m),
             reference,
+            #[cfg(feature = "rt")]
+            diag: None,
         })
     }
 }
 
-/// Whether the texture `m` asks may be written where it is bound: its usage is Unknown or holds
-/// `ShaderWrite`.
-fn usage_writes(m: &RgfxTextureFromIOSurface) -> bool {
-    m.desc.usage == 0 || u64::from(m.desc.usage) & TEXTURE_USAGE_WRITES != 0
+/// Whether the texture `m` asks takes storage (`shapes`, "The shape"), and so may be written
+/// where it is bound: its usage is Unknown or holds `ShaderWrite` or `ShaderAtomic`.
+fn takes_storage(m: &RgfxTextureFromIOSurface) -> bool {
+    let usage = u64::from(m.desc.usage);
+    usage == 0 || usage & (TEXTURE_USAGE_WRITES | TEXTURE_USAGE_ATOMIC) != 0
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use reims_vgpu_graphics::wire::{RGFX_STATUS_CACHE, RGFX_STATUS_OK};
     use reims_vgpu_vulkan::core::testkit::FakePlatform;
@@ -242,22 +306,35 @@ mod tests {
                              toBuffer:destinationOffset:destinationBytesPerRow:\
                              destinationBytesPerImage:";
 
-    /// The rig's decoder takes the per-shape form, each image the platform's own texture.
-    fn take_shapes(r: &Rig) {
+    /// The (pixel format, usage) of each shape's image the rig's decoder made, in order.
+    type Made = Arc<Mutex<Vec<(u64, u64)>>>;
+
+    /// The rig's decoder takes the per-shape form, each image the platform's own texture, kept
+    /// in the list returned.
+    fn take_shapes(r: &Rig) -> Made {
         let p = Arc::clone(&r.p);
+        let made = Made::default();
+        let kept = Arc::clone(&made);
         r.dec.set_surface_shapes(Arc::new(
             move |device: &<FakePlatform as Platform>::Device, desc: &TextureDesc| {
+                kept.lock().unwrap().push((desc.pixel_format, desc.usage));
                 p.own_texture(device, desc)
             },
         ));
+        made
     }
 
     /// [`cached`]'s rig in the per-shape form, its texture resource ids held, with buffer 10 over
     /// the block's two pages.
     fn shaped() -> Rig {
+        shaped_made().0
+    }
+
+    /// [`shaped`], and the images its decoder makes ([`take_shapes`]).
+    fn shaped_made() -> (Rig, Made) {
         let mut r = rig(8);
         let page = r.page;
-        take_shapes(&r);
+        let made = take_shapes(&r);
         r.dec.hold_resource_ids(0, 1);
         assert_eq!(
             r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
@@ -265,7 +342,7 @@ mod tests {
         );
         queues(&mut r);
         assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
-        r
+        (r, made)
     }
 
     /// Texture `obj_id` over buffer 10, of `format` and `size`.
@@ -276,8 +353,20 @@ mod tests {
 
     /// [`texture`], and the image of its shape, which its view is of.
     fn texture_image(r: &mut Rig, obj_id: u64, format: u32, size: (u32, u32)) -> u64 {
+        texture_as_image(r, obj_id, format, size, 1)
+    }
+
+    /// [`texture_image`] of a texture that declares `usage`.
+    fn texture_as_image(
+        r: &mut Rig,
+        obj_id: u64,
+        format: u32,
+        size: (u32, u32),
+        usage: u32,
+    ) -> u64 {
         let mark = r.p.call_log().mark();
-        texture(r, obj_id, format, size);
+        let message = surface_texture_as(obj_id, 10, format, size, (usage, 0));
+        assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
         views(&r.p.call_log().since(mark))[0].0
     }
 
@@ -394,33 +483,38 @@ mod tests {
 
     /// In the per-shape form a texture over a cache is a view, at the guest's resource index and
     /// in the guest's format, of its shape's image, and no texture lies over the buffer: a second
-    /// texture of the same shape, in another format of the texel's size, is another view of the
-    /// same image; one of another size has an image of its own. Each holds its shape, and writes
-    /// it where its usage lets a shader write. In the default form the texture lies over the
-    /// buffer, and holds only its shape in the cache's shadow, which makes no image
+    /// texture of the same shape, in its format or the format's sRGB sibling, is another view of
+    /// the same image; one of another size has an image of its own, and so has one that takes
+    /// storage ([`a_texture_that_takes_storage_over_a_plain_shape_makes_a_second_shape`]). Each
+    /// holds its shape, and writes it where its usage lets a shader write. In the default form
+    /// the texture lies over the buffer, and holds only its shape in the cache's shadow, which
+    /// makes no image
     #[test]
     fn a_texture_over_a_cache_is_a_view_of_its_shapes_image() {
         let mut r = shaped();
         let mark = r.p.call_log().mark();
         texture(&mut r, 21, 80, (32, 8));
         texture(&mut r, 22, 80, (32, 8));
-        texture(&mut r, 23, 70, (32, 8));
+        texture(&mut r, 23, 81, (32, 8));
         texture(&mut r, 24, 80, (16, 8));
         let message = surface_texture_as(25, 10, 80, (32, 8), (0x2, 0));
         assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
         let calls = r.p.call_log().since(mark);
         assert!(surface_textures(&calls).is_empty(), "none over the buffer");
-        assert_eq!(calls.iter().filter(|c| c.sel == IMAGE).count(), 2);
+        assert_eq!(calls.iter().filter(|c| c.sel == IMAGE).count(), 3);
         let seen = views(&calls);
-        let at = |n: u64| (seen[0].0, if n == 23 { 70 } else { 80 }, 0x40 + n);
+        let at = |n: u64| (seen[0].0, if n == 23 { 81 } else { 80 }, 0x40 + n);
         assert_eq!(seen.len(), 5);
         assert_eq!(seen[..3], [at(21), at(22), at(23)]);
         assert_ne!(seen[3].0, seen[0].0, "another shape, another image");
         assert_eq!((seen[3].1, seen[3].2), (80, 0x40 + 24));
-        assert_eq!(seen[4], at(25));
+        let others = [seen[0].0, seen[3].0];
+        assert!(!others.contains(&seen[4].0), "storage's own image");
+        assert_eq!((seen[4].1, seen[4].2), (80, 0x40 + 25));
         let counts = r.dec.caches().counts().shapes;
-        assert_eq!((counts.made, counts.found, counts.unshaped), (2, 3, 0));
-        assert_eq!(counts.made_bytes, 32 * 8 * 4 + 16 * 8 * 4);
+        assert_eq!((counts.made, counts.found, counts.unshaped), (3, 2, 0));
+        assert_eq!(counts.made_bytes, 2 * 32 * 8 * 4 + 16 * 8 * 4);
+        assert_eq!(counts.plain_views_refused, 0);
         let shape = |n: u64| {
             let entry = r.dec.entry(n).unwrap();
             entry.shape.as_ref().map(|s| (s.block, s.writes))
@@ -441,6 +535,71 @@ mod tests {
         let shadow = entry.shape.as_ref().map(|s| (s.block, s.writes));
         assert_eq!(shadow, Some((BLOCK, false)), "the shadow's");
         assert_eq!(r.dec.caches().counts().shapes, ShapeCounts::default());
+    }
+
+    /// The usage a texture declares picks its shape's kind: one that declares Metal's Unknown
+    /// usage (0), `ShaderWrite` or `ShaderAtomic` takes storage, its image made of the Unknown
+    /// usage, and writes its shape where it is bound; any other takes a plain shape, its image
+    /// made of `ShaderRead | RenderTarget` alone, and leaves it clean. Over a plain shape a
+    /// texture in the shape's format's sRGB sibling is a view of it; one in another format is a
+    /// view rt refuses, counted, and one that declares `PixelFormatView` is counted
+    #[test]
+    fn a_textures_declared_usage_picks_its_shapes_kind() {
+        let (mut r, made) = shaped_made();
+        let plain = texture_as_image(&mut r, 21, 80, (32, 8), 0x5);
+        let mut storage = Vec::new();
+        for (obj_id, usage, width) in [(22, 0x2, 16), (23, 0x20, 8), (24, 0, 24)] {
+            storage.push(texture_as_image(&mut r, obj_id, 80, (width, 8), usage));
+        }
+        assert!(!storage.contains(&plain));
+        assert_eq!(
+            *made.lock().unwrap(),
+            [(80, 0x5), (80, 0), (80, 0), (80, 0)]
+        );
+        let writes = |r: &Rig, n: u64| r.dec.entry(n).unwrap().shape.as_ref().map(|s| s.writes);
+        let seen = [21, 22, 23, 24].map(|n| writes(&r, n));
+        assert_eq!(seen, [Some(false), Some(true), Some(true), Some(true)]);
+
+        let sibling = texture_as_image(&mut r, 25, 81, (32, 8), 0x1);
+        let format_view = texture_as_image(&mut r, 26, 80, (32, 8), 0x11);
+        let refused = texture_as_image(&mut r, 27, 70, (32, 8), 0x5);
+        assert_eq!([sibling, format_view, refused], [plain; 3]);
+        assert_eq!(made.lock().unwrap().len(), 4);
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.made, counts.found, counts.order_case), (4, 3, 0));
+        let plain_counts = (counts.plain_views_refused, counts.plain_format_views);
+        assert_eq!(plain_counts, (1, 1));
+    }
+
+    /// A texture that takes storage over a plane with only a plain shape of its extent makes a
+    /// storage shape beside it, counted, and rule 1 keeps the two current: a write through the
+    /// plain shape reaches the storage shape at the end of its encoder, counted as a copy between
+    /// the kinds. A later texture of the extent views the storage shape, whatever it declares
+    #[test]
+    fn a_texture_that_takes_storage_over_a_plain_shape_makes_a_second_shape() {
+        let (mut r, made) = shaped_made();
+        let plain = texture_as_image(&mut r, 21, 80, (32, 8), 0x5);
+        let storage = texture_as_image(&mut r, 25, 80, (32, 8), 0x2);
+        assert_ne!(storage, plain);
+        assert_eq!(*made.lock().unwrap(), [(80, 0x5), (80, 0)]);
+        assert_eq!(r.dec.caches().counts().shapes.order_case, 1);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let mark = r.p.call_log().mark();
+        write(&mut r, 0x101, 21, (32, 8));
+        let (out, into) = overlaps(&r.p.call_log().since(mark), &[plain, storage]);
+        assert_eq!(out, [(plain, texels(32, 8))]);
+        assert_eq!(into, [(storage, texels(32, 8))]);
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.order_copies, counts.order_bytes), (1, 32 * 8 * 4));
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        assert_eq!(texture_as_image(&mut r, 26, 80, (32, 8), 0x5), storage);
+        assert_eq!(texture_as_image(&mut r, 27, 70, (32, 8), 0x1), storage);
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.made, counts.found, counts.order_case), (2, 2, 1));
+        assert_eq!(counts.plain_views_refused, 0, "any view of storage");
     }
 
     /// In the default form the counts read what the per-shape form would hold, and nothing else
