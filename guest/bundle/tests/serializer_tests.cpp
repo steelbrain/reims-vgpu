@@ -365,8 +365,8 @@ void test_private_address_picks()
 // on an odd 64 KiB and a buffer's pick lies at its start: the heap lies 256 KiB into the block,
 // not at the granule past the buffer (block + 32 KiB) nor at the next absolute 256 KiB
 // (block + 192 KiB); HEAP_CREATE carries that address; a larger alignment asked counts from the
-// block too; a buffer picked after it keeps its granule. With no source, the heap lies at a
-// multiple of 256 KiB in the context's range.
+// block too; a buffer picked after it keeps its granule. With no source, the heap lies where any
+// pick in the context's range does, at the granule past a buffer's.
 void test_private_heaps_align_from_their_block()
 {
 	const uint64_t heapAlign = RgfxSerializer::kHeapAddressAlign;
@@ -407,14 +407,14 @@ void test_private_heaps_align_from_their_block()
 		ids.freeAddress(at);
 	CHECK(ids.privatePicksLive() == 0);
 
-	// No source: the context's range, at an absolute multiple of 256 KiB past a buffer's pick.
+	// No source: the context's range, at the granule past a buffer's pick, as before.
 	RgfxIdSpace own;
 	own.setBases(uint64_t{5} << RGFX_CONTEXT_OBJ_ID_SHIFT, base, RGFX_CONTEXT_VA_UNIT);
 	RgfxSerializer ownSer(writer, own);
 	const uint64_t first = own.allocPrivateAddress(0x4000, 256);
 	CHECK(first == base);
 	RgfxCreated ownHeap = ownSer.createHeap(0x10000, 0, 1);
-	CHECK(ownHeap.posted && ownHeap.gpu_address == base + heapAlign);
+	CHECK(ownHeap.posted && ownHeap.gpu_address == base + granule);
 	CHECK(expectMessage<RgfxHeapCreate>(ring, RGFX_CMD_HEAP_CREATE).gpu_address ==
 	      ownHeap.gpu_address);
 }

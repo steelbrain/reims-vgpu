@@ -276,16 +276,16 @@ void RgfxIdSpace::setPrivateBlockSource(PrivateTakeFn take, PrivateGiveFn give, 
 	m_privateContext = context;
 }
 
-uint64_t RgfxIdSpace::allocPrivateAddress(uint64_t size, uint64_t align, bool fromBlock)
+uint64_t RgfxIdSpace::allocPrivateAddress(uint64_t size, uint64_t asked, uint64_t blockAlign)
 {
 	if (m_privateTake == nullptr)
-		return allocAddress(size, align);
-	align = std::max(align, kAddressGranule);
+		return allocAddress(size, asked);
+	const uint64_t align = std::max({asked, blockAlign, kAddressGranule});
 	const uint64_t span = addressSpan(size);
-	// The address a free range is aligned from: 0, or with `fromBlock` its block's first byte.
-	// Caller holds m_addressLock.
+	// The address a free range is aligned from: 0, or with a `blockAlign` its block's first
+	// byte. Caller holds m_addressLock.
 	auto origin = [&](uint64_t at) -> uint64_t {
-		if (!fromBlock)
+		if (blockAlign == 0)
 			return 0;
 		const auto block = privateBlockOf(at);
 		return block == m_privateBlocks.end() ? 0 : block->first;
@@ -318,7 +318,7 @@ uint64_t RgfxIdSpace::allocPrivateAddress(uint64_t size, uint64_t align, bool fr
 			             "Private objects the context's blocks have no room for lie in its own "
 			             "range",
 			             (unsigned long long)want, (unsigned long long)size);
-		return allocAddress(size, align);
+		return allocAddress(size, asked);
 	}
 	{
 		std::lock_guard<std::mutex> hold(m_addressLock);
@@ -328,7 +328,7 @@ uint64_t RgfxIdSpace::allocPrivateAddress(uint64_t size, uint64_t align, bool fr
 			return start;
 	}
 	// Other threads' picks took the room first: the context's range, as for a refusal.
-	return allocAddress(size, align);
+	return allocAddress(size, asked);
 }
 
 size_t RgfxIdSpace::privateBlocksHeld() const

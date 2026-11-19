@@ -131,14 +131,14 @@ public:
 	/// but in a Private block the context holds where a block source is set: next
 	/// fit through the blocks held, in address order, then round from the first;
 	/// where none has room, a new block of kPrivateBlockBytes, or of the pick's span
-	/// and alignment where that is more. With `fromBlock` the pick in a block lies
-	/// at a multiple of `align` from the block's first byte, not from 0: the host
-	/// places it at that offset of the memory it gave the block, whose own address
-	/// is aligned only to the host's granule (a heap, whose textures the host binds
-	/// at their alignment in that memory). Where no source is set, or the source
-	/// has no block, allocAddress's pick in the context's range (the refusal logged
-	/// once). 0 where no address is left.
-	uint64_t allocPrivateAddress(uint64_t size, uint64_t align, bool fromBlock = false);
+	/// and alignment where that is more. With a `blockAlign`, the pick in a block
+	/// lies at a multiple of it and of `align` from the block's first byte, not from
+	/// 0: the host places it at that offset of the memory it gave the block, whose
+	/// own address is aligned only to the host's granule (a heap, whose textures the
+	/// host binds at their alignment in that memory). Where no source is set, or the
+	/// source has no block, allocAddress's pick in the context's range at `align`
+	/// alone (the refusal logged once). 0 where no address is left.
+	uint64_t allocPrivateAddress(uint64_t size, uint64_t align, uint64_t blockAlign = 0);
 
 	/// The bytes of addresses the space asks a Private block for at least: 256 MiB,
 	/// metal2vulkan-rt's pooled block, so a pick wraps round its blocks only after
