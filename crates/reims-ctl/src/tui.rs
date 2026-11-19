@@ -116,7 +116,8 @@ enum Msg {
     Progress(String, u64, String),
     Done(String, u64, Result<String, String>),
     Gpus(Vec<GpuInfo>),
-    /// Apple's catalog of IPSWs, read on an arm64 host as the interface starts.
+    /// Apple's catalog of IPSWs, read as the interface starts on an arm64 host, and as the first
+    /// arm64 VM's form opens on another (ask_ipsws).
     Ipsws(Result<Vec<reims_restore::catalog::Entry>, String>),
 }
 
@@ -158,7 +159,8 @@ enum Overlay {
 
 #[derive(Clone)]
 enum FormKind {
-    Create,
+    /// A new VM of the profile.
+    Create(Profile),
     Edit(String),
 }
 
@@ -183,6 +185,8 @@ enum Action {
     DeleteDownload(String),
     /// Shows the downloads again.
     Downloads,
+    /// Opens the form of a new VM of the profile.
+    Create(Profile),
     Quit,
 }
 
@@ -262,8 +266,10 @@ struct App {
     pending_view: Option<Vm>,
     /// The macOS versions reims-util downloads, read when the first x86-64 VM's form opens.
     macos_versions: Option<Result<Vec<reims_util::Version>, String>>,
-    /// Apple's catalog of IPSWs, on an arm64 host, once read.
+    /// Apple's catalog of IPSWs, once read.
     ipsw_catalog: Option<Result<Vec<reims_restore::catalog::Entry>, String>>,
+    /// Whether Apple's catalog of IPSWs was asked for (ask_ipsws).
+    ipsws_asked: bool,
     /// The works `spawn` started: the last one's id.
     spawned: u64,
     /// The forms closed while the work they started runs, by its id: one whose work fails
@@ -307,6 +313,7 @@ impl App {
             pending_view: None,
             macos_versions: None,
             ipsw_catalog: None,
+            ipsws_asked: false,
             spawned: 0,
             closed_forms: BTreeMap::new(),
             failed_forms: Vec::new(),
@@ -333,12 +340,7 @@ impl App {
             app.table.select(Some(0));
         }
         if host.default_profile() == Some(Profile::VmappleArm64) {
-            let tx = app.tx.clone();
-            std::thread::spawn(move || {
-                let client = reims_restore::http::Client::apple();
-                let r = reims_restore::catalog::fetch(&client, reims_restore::catalog::URL);
-                let _ = tx.send(Msg::Ipsws(r.map_err(|e| format!("{e:#}"))));
-            });
+            app.ask_ipsws();
         }
         if matches!(host.os, Os::Linux | Os::Windows) {
             let tx = app.tx.clone();
@@ -365,6 +367,22 @@ impl App {
 
     fn say(&mut self, s: &str, level: Level) {
         self.status = Some((s.to_string(), level));
+    }
+
+    /// Reads Apple's catalog of IPSWs in the background, once, for the arm64 form's choices
+    /// (Msg::Ipsws): as the interface starts where arm64 VMs are the host's own, and as the first
+    /// arm64 VM's form opens where they are its second profile.
+    fn ask_ipsws(&mut self) {
+        if self.ipsws_asked || self.ipsw_catalog.is_some() {
+            return;
+        }
+        self.ipsws_asked = true;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let client = reims_restore::http::Client::apple();
+            let r = reims_restore::catalog::fetch(&client, reims_restore::catalog::URL);
+            let _ = tx.send(Msg::Ipsws(r.map_err(|e| format!("{e:#}"))));
+        });
     }
 
     fn reload(&mut self) -> Result<()> {
@@ -589,9 +607,9 @@ impl App {
             Msg::Ipsws(r) => {
                 self.ipsw_catalog = Some(r);
                 let options = ipsw_options(self.ipsw_catalog.as_ref());
-                if let Some(Overlay::Form(FormKind::Create, f)) = &mut self.overlay
+                if let Some(Overlay::Form(FormKind::Create(p), f)) = &mut self.overlay
+                    && *p == Profile::VmappleArm64
                     && f.is_shown("source")
-                    && self.host.default_profile() == Some(Profile::VmappleArm64)
                 {
                     f.set_options("source", options);
                 }
@@ -1009,6 +1027,12 @@ impl App {
                 self.open_downloads();
             }
             Action::Quit => self.quit = true,
+            Action::Create(profile) => {
+                if profile == Profile::VmappleArm64 {
+                    self.ask_ipsws();
+                }
+                self.open_create_form(profile);
+            }
             Action::Update(channel) => {
                 self.update_requested = true;
                 self.update_channel = channel;
@@ -1548,11 +1572,40 @@ impl App {
         Field::choice("gpu", "GPU", options, &selected, help)
     }
 
+    /// The form of a new VM, or, where the host runs VMs of two profiles (x86-64 and arm64 VMs on
+    /// x86-64 Linux), first the choice of one.
     fn open_create(&mut self) {
-        let Some(profile) = self.host.default_profile() else {
-            self.say(crate::host::UNSUPPORTED, Level::Error);
-            return;
-        };
+        let host = self.host;
+        let profiles = Profile::supported_on(host);
+        match profiles {
+            [] => self.say(crate::host::UNSUPPORTED, Level::Error),
+            [profile] => self.open_create_form(*profile),
+            _ => {
+                let mut body = String::from("This host runs:");
+                for p in profiles {
+                    body += &format!("\n- {}", p.describe(host));
+                }
+                if profiles.iter().any(|p| p.accel(host) == "tcg") {
+                    body += "\n\nTCG, QEMU's emulation, runs an arm64 guest several times slower \
+                             than an arm64 host does.";
+                }
+                let mut options: Vec<(&'static str, Action)> = profiles
+                    .iter()
+                    .map(|&p| (profile_label(p), Action::Create(p)))
+                    .collect();
+                options.push(("Cancel", Action::None));
+                self.overlay = Some(Overlay::Confirm {
+                    title: "New VM".into(),
+                    body,
+                    options,
+                    choice: 0,
+                });
+            }
+        }
+    }
+
+    /// The form of a new VM of `profile`, one the host runs.
+    fn open_create_form(&mut self, profile: Profile) {
         if profile == Profile::VmappleArm64 {
             let options = ipsw_options(self.ipsw_catalog.as_ref());
             let first = options[0].0.clone();
@@ -1586,7 +1639,7 @@ impl App {
             ];
             fields.extend(place_fields());
             let form = Form::new("New arm64 VM", "create", fields);
-            self.overlay = Some(Overlay::Form(FormKind::Create, form));
+            self.overlay = Some(Overlay::Form(FormKind::Create(profile), form));
             return;
         }
         let mut fields = vec![
@@ -1665,7 +1718,7 @@ impl App {
             .show_if("network", &["yes"]),
         ]);
         let form = Form::new("New VM", "create", fields);
-        self.overlay = Some(Overlay::Form(FormKind::Create, form));
+        self.overlay = Some(Overlay::Form(FormKind::Create(profile), form));
     }
 
     fn open_edit(&mut self) {
@@ -1828,8 +1881,8 @@ impl App {
 
     fn submit(&mut self, kind: &FormKind, f: &mut Form) -> Result<()> {
         match kind {
-            FormKind::Create => {
-                let spec = self.spec_from(f)?;
+            FormKind::Create(profile) => {
+                let spec = self.spec_from(*profile, f)?;
                 let host = self.host;
                 let name = spec.name.clone();
                 self.spawn_for(f, &name, "creating", move |p| {
@@ -1910,7 +1963,7 @@ impl App {
         }
     }
 
-    fn spec_from(&self, f: &Form) -> Result<Spec> {
+    fn spec_from(&self, profile: Profile, f: &Form) -> Result<Spec> {
         let mut name = f.text("name");
         if name.is_empty() && f.is_shown("macos") && f.choice("source") == "download" {
             // Its error first: a version that cannot be had names nothing.
@@ -1922,6 +1975,7 @@ impl App {
             bail!("a VM named {name} already exists");
         }
         let mut s = Spec::new(&name);
+        s.profile = Some(profile);
         let dir = f.text("dir");
         s.dir = (!dir.is_empty()).then(|| paths::absolute(&dir));
         s.cpus = Some(f.text("cpus").parse().context("CPU cores: a number")?);
@@ -1933,8 +1987,8 @@ impl App {
             let t = f.text(key);
             (!t.is_empty()).then(|| paths::absolute(&t))
         };
-        match self.host.default_profile() {
-            Some(Profile::Q35X86_64) => {
+        match profile {
+            Profile::Q35X86_64 => {
                 let size = || -> Result<DiskSource> {
                     Ok(DiskSource::New {
                         size_mib: parse_size_mib(&f.text("disk_size")).context("disk size")?,
@@ -1959,7 +2013,7 @@ impl App {
                 }
                 s.opencore = opt_path("opencore");
             }
-            Some(Profile::VmappleArm64) => {
+            Profile::VmappleArm64 => {
                 s.ipsw = Some(match f.choice("source").as_str() {
                     "path" => opt_path("ipsw")
                         .context("give the IPSW to restore")?
@@ -1972,7 +2026,6 @@ impl App {
                     size_mib: parse_size_mib(&f.text("disk_size")).context("disk size")?,
                 });
             }
-            None => bail!(crate::host::UNSUPPORTED),
         }
         if f.is_shown("graphics") {
             s.graphics = Some(Graphics::parse(&f.choice("graphics"))?);
@@ -2697,7 +2750,8 @@ of its own. A VM runs reims-vgpu's own GPU device unless its settings choose ano
               Esc closes it meanwhile, and it opens again if the create fails. On an arm64
               Mac or arm64 Linux, it makes an arm64 VM: from the current macOS, which
               reims-ctl downloads from Apple (about 25 GB) and keeps for the next, or an IPSW
-              you have, restored onto its new disk
+              you have, restored onto its new disk. On x86-64 Linux, which runs both, it asks
+              which first; there an arm64 VM is emulated by TCG, several times slower
   s           start it
   x           stop it: the guest is asked to shut down, and powered off if it has not
               when its shutdown timeout ends (edit e to change it)
@@ -2946,6 +3000,14 @@ fn draw_usb(
             .scroll((scroll, 0)),
         popup,
     );
+}
+
+/// A profile's choice in the new VM's question (open_create).
+fn profile_label(p: Profile) -> &'static str {
+    match p {
+        Profile::Q35X86_64 => "x86-64 macOS",
+        Profile::VmappleArm64 => "arm64 macOS",
+    }
 }
 
 /// The arm64 form's choices of macOS: the current one from Apple (`latest`), as Apple's catalog
@@ -3233,6 +3295,70 @@ mod tests {
         assert_eq!(form(&app).choice("source"), "latest");
     }
 
+    /// On x86-64 Linux, which runs x86-64 VMs and arm64 ones, n asks which to make: x86-64 opens
+    /// its form, and arm64 the form of an arm64 VM restored from an IPSW, as on an arm64 host,
+    /// whose create makes an arm64 VM. An arm64 Mac, with one profile, opens its form at once.
+    #[test]
+    fn a_host_of_two_profiles_asks_which_vm_to_create() {
+        let _env = crate::testenv::Env::new("tui-profiles");
+        let x86 = Host {
+            os: Os::Linux,
+            arch: Arch::X86_64,
+        };
+        let mut app = App::with(x86);
+        app.macos_versions = Some(Ok(Vec::new()));
+        press(&mut app, [KeyCode::Char('n')]);
+        let Some(Overlay::Confirm { body, options, .. }) = &app.overlay else {
+            panic!("n asks nothing");
+        };
+        let labels: Vec<_> = options.iter().map(|o| o.0).collect();
+        assert_eq!(labels, ["x86-64 macOS", "arm64 macOS", "Cancel"]);
+        assert!(
+            body.contains("arm64 macOS guest (vmapple and Ambrosia, emulated by TCG)"),
+            "{body}"
+        );
+        press(&mut app, [KeyCode::Esc]);
+        assert!(app.overlay.is_none());
+
+        let created = |app: &App| match &app.overlay {
+            Some(Overlay::Form(FormKind::Create(p), f)) => Some((*p, f.title.clone())),
+            _ => None,
+        };
+        press(&mut app, [KeyCode::Char('n'), KeyCode::Enter]);
+        let x86_form = (Profile::Q35X86_64, "New VM".to_string());
+        assert_eq!(created(&app), Some(x86_form));
+        press(&mut app, [KeyCode::Esc]);
+
+        // The catalog read, as the form's first opening reads it.
+        app.ipsw_catalog = Some(Ok(vec![reims_restore::catalog::Entry {
+            version: "27.2.1".into(),
+            build: "26B131".into(),
+            url: "https://updates.cdn-apple.com/x.ipsw".into(),
+            sha1: None,
+        }]));
+        press(
+            &mut app,
+            [KeyCode::Char('n'), KeyCode::Right, KeyCode::Enter],
+        );
+        let arm64_form = (Profile::VmappleArm64, "New arm64 VM".to_string());
+        assert_eq!(created(&app), Some(arm64_form));
+        assert!(!app.ipsws_asked);
+        assert_eq!(form(&app).choice("source"), "latest");
+        assert!(!form(&app).is_shown("ipsw"));
+        press(&mut app, "arm".chars().map(KeyCode::Char));
+        let spec = app.spec_from(Profile::VmappleArm64, form(&app)).unwrap();
+        assert_eq!(spec.profile, Some(Profile::VmappleArm64));
+        assert_eq!(spec.ipsw.as_deref(), Some("latest"));
+
+        let mut mac = App::with(Host {
+            os: Os::Mac,
+            arch: Arch::Aarch64,
+        });
+        mac.ipsws_asked = true;
+        press(&mut mac, [KeyCode::Char('n')]);
+        assert_eq!(created(&mac).map(|c| c.0), Some(Profile::VmappleArm64));
+    }
+
     #[test]
     fn a_create_that_fails_keeps_its_form_open_with_the_error() {
         // The create and the list it reads again use these VMs, not the user's.
@@ -3243,7 +3369,8 @@ mod tests {
         };
         let mut app = App::with(host);
         app.macos_versions = Some(Ok(Vec::new()));
-        app.open_create();
+        // x86-64, the first of the host's two
+        press(&mut app, [KeyCode::Char('n'), KeyCode::Enter]);
         let name = format!("form-test-{}", std::process::id());
         let disk = std::env::temp_dir().join(&name).join("disk.qcow2");
         let disk = disk.to_string_lossy().into_owned();
@@ -3272,7 +3399,7 @@ mod tests {
         let busy = |app: &mut App, id| {
             let mut f = Form::new("t", "save", Vec::new());
             f.busy = Some((id, "working".into()));
-            app.overlay = Some(Overlay::Form(FormKind::Create, f));
+            app.overlay = Some(Overlay::Form(FormKind::Create(Profile::Q35X86_64), f));
         };
         let done = |app: &mut App, id, r: Result<&str, &str>| {
             let r = r.map(String::from).map_err(String::from);
