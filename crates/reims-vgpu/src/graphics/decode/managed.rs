@@ -1330,8 +1330,9 @@ mod tests {
         r.p.world().drop_pins(true);
         let (u, m, picks) = (unpinned(), made(), count(TEXTURE_PICKS));
         let buffers = live_now(Kind::Buffer.codes().made);
-        // Over the region: a Shared buffer and a heap; a `Managed` buffer over its block.
-        assert_eq!(r.buffer(10, BLOCKS, 0x100, 0), Ok(()));
+        // Over the region: a Shared buffer (the texture's CPU copy below) and a heap; a `Managed`
+        // buffer over its block.
+        assert_eq!(r.buffer(10, BLOCKS, 0x1000, 0), Ok(()));
         assert_eq!(r.buffer(11, BLOCKS + 0x1000, 0x100, MANAGED), Ok(()));
         assert_eq!(
             r.send(&RgfxHeapOverHostMemory {
