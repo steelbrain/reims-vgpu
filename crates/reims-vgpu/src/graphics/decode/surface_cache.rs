@@ -288,6 +288,14 @@
 //!   pages taken so at their naming. A fill is the host's CPU reading the pages' bytes into a
 //!   Shared buffer of its own, which the GPU then copies into the cache; a download is the GPU's
 //!   copy of the cache into such a buffer, which the CPU empties into the pages once it is done.
+//!   The buffers are the host's own, made unzeroed
+//!   ([`GpuDevice::new_scratch_buffer_of_length`]): a fill's CPU copy writes all of the
+//!   surface's bytes into its buffer ([`CopiedPages`] hold them all), and a download's CPU copy
+//!   reads only the bytes its GPU copy wrote, the surface's texels where its layout is known
+//!   (rows alone, with no padding between them or bytes past the last), else all of them. Once a
+//!   copy's command buffer has completed and its CPU copy is done, its buffer goes back to the
+//!   caches' spares ([`Spares`]), up to [`SPARE_BYTES`] of them, which the next copy of its
+//!   length takes in place of a make; a copy in flight never shares one.
 //!   Each is counted on the counts line by its kind's name (`cache-view`): how many and their
 //!   KiB, and the nanoseconds the host's CPU spent on them (`rt-fills-cache-view`,
 //!   `rt-fills-cache-view-kib`, `rt-fills-cache-view-cpu-ns`, and the same of `rt-downloads-`),
@@ -299,6 +307,7 @@
 //! [`GpuDevice::linear_rows_pitch`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::linear_rows_pitch
 //! [`GpuDevice::fresh_surface_never_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::fresh_surface_never_in_place
 //! [`GpuDevice::new_buffer_of_length_padding_unobserved`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::new_buffer_of_length_padding_unobserved
+//! [`GpuDevice::new_scratch_buffer_of_length`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::new_scratch_buffer_of_length
 //!
 //! What the guest observes is IOSurface's contract under its locks: a lock after a GPU write sees
 //! it, and a GPU use after a read-write lock sees the CPU's writes. A CPU write made without a
@@ -1698,6 +1707,8 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// Where every cache's copies are staged (the module doc, "Staged copies";
     /// [`Caches::set_staged`]), the platform's clock, which times the host's CPU's part of each.
     staged: Option<Now>,
+    /// The staged copies' buffers no copy uses (the module doc, "Staged copies").
+    spares: Arc<Spares<P>>,
 }
 
 /// The command buffers begun and not finished that use one block's cache, by the number each was
@@ -1896,6 +1907,7 @@ impl<P: Platform> SurfaceCaches<P> {
             shaped: false,
             shape_clock: 0,
             staged: None,
+            spares: Arc::new(Spares::new(SPARE_BYTES)),
         }
     }
 
@@ -3977,10 +3989,10 @@ impl<P: Platform> SurfaceCaches<P> {
             cache,
             (Way::In, block),
             &mut self.counts,
-            timed,
+            (timed, &self.spares),
         )?;
         if let Some(staged) = staged {
-            cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| drop(staged)))?;
+            cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| staged.done()))?;
         }
         // Every shape takes the CPU's bytes the buffer took, its own writes not copied out
         // overwritten as the buffer's are (the module doc of `shapes`).
@@ -4415,7 +4427,7 @@ impl<P: Platform> SurfaceCaches<P> {
             cache,
             (Way::Out, block),
             &mut self.counts,
-            timed,
+            (timed, &self.spares),
         )?;
         signal_after::<P>(&cb, signal.as_ref())?;
         // The buffers live until the copy is done, past the cache's own end at a release.
@@ -6664,10 +6676,13 @@ struct Staging<P: Platform> {
     /// Where the caches' copies are staged, the clock that times the copy into the pages
     /// ([`DOWNLOADS`]).
     timed: Option<Now>,
+    /// Where the buffer goes once the copy is done.
+    spares: Arc<Spares<P>>,
 }
 
 impl<P: Platform> Staging<P> {
-    /// The copy into the buffer is done: a copy out of the cache moves its bytes into the pages.
+    /// The copy's command buffer has completed: a copy out of the cache moves the bytes its GPU
+    /// copy wrote into the pages, the spans alone; then the buffer goes back to the spares.
     fn done(self) {
         if let Some((pages, spans)) = &self.into {
             let at = self.timed.as_ref().map(|now| now());
@@ -6679,6 +6694,55 @@ impl<P: Platform> Staging<P> {
                 DOWNLOADS.took(now, at);
             }
         }
+        let Staging { buffer, spares, .. } = self;
+        spares.give(buffer);
+    }
+}
+
+/// The idle bytes the caches keep in their staged copies' spare buffers ([`Spares`]): what the
+/// steady state's repeated small copies take, where a copy of a whole large surface makes its
+/// own.
+const SPARE_BYTES: u64 = 16 << 20;
+
+/// The staged copies' buffers no copy uses (the module doc, "Staged copies"), each given back
+/// once its copy's command buffer completed and its CPU copy was done, so a copy in flight never
+/// shares one; a copy of a length one is kept for takes it in place of a make. Kept to `cap`
+/// bytes in all: a buffer given past them is let go of.
+struct Spares<P: Platform> {
+    idle: Mutex<Vec<P::Buffer>>,
+    cap: u64,
+}
+
+impl<P: Platform> Spares<P> {
+    fn new(cap: u64) -> Self {
+        Spares {
+            idle: Mutex::new(Vec::new()),
+            cap,
+        }
+    }
+
+    /// A kept buffer of `length` bytes, no longer kept; `None` where none is.
+    fn take(&self, length: u64) -> Option<P::Buffer> {
+        let mut idle = self.idle.lock();
+        let at = idle.iter().position(|b| b.length() == length)?;
+        Some(idle.swap_remove(at))
+    }
+
+    /// `buffer`, whose copy is done, kept where it fits under the cap; else let go of, outside
+    /// the lock.
+    fn give(&self, buffer: P::Buffer) {
+        let over = {
+            let mut idle = self.idle.lock();
+            let held: u64 = idle.iter().map(|b| b.length()).sum();
+            match held.saturating_add(buffer.length()) <= self.cap {
+                true => {
+                    idle.push(buffer);
+                    None
+                }
+                false => Some(buffer),
+            }
+        };
+        drop(over);
     }
 }
 
@@ -6741,7 +6805,7 @@ fn copy<P: Platform>(
     cache: &mut SurfaceCache<P>,
     (way, block): (Way, u64),
     counts: &mut CacheCounts,
-    timed: Option<&Now>,
+    (timed, spares): (Option<&Now>, &Arc<Spares<P>>),
 ) -> RaiseResult<Option<Staging<P>>> {
     let Some(blit) = cb.blit_encoder(ON)? else {
         return Ok(None);
@@ -6788,8 +6852,13 @@ fn copy<P: Platform>(
             }
         }
         let at = timed.map(|now| now());
+        // A spare of the length, else a buffer of the copy's own, unzeroed: what its CPU copy
+        // reads of it, its GPU copy writes first, and the other way round.
         if let Some(CachePages::Copied(copied)) = &cache.pages
-            && let Some(buffer) = device.new_buffer_of_length(ON, cache.length, STORAGE_SHARED)?
+            && let Some(buffer) = match spares.take(cache.length) {
+                Some(buffer) => Some(buffer),
+                None => device.new_scratch_buffer_of_length(ON, cache.length, STORAGE_SHARED)?,
+            }
         {
             if way == Way::In {
                 let all = 0..cache.length;
@@ -6830,6 +6899,7 @@ fn copy<P: Platform>(
                 buffer,
                 into,
                 timed,
+                spares: Arc::clone(spares),
             });
         }
         if cache.pages.is_none()
@@ -13077,7 +13147,10 @@ pub(super) mod tests {
         let filled = copies(&r.p.call_log().since(mark));
         assert_eq!(filled.len(), 1);
         assert_eq!(filled[0].1, cache, "into the cache");
-        assert_ne!(filled[0].0, out[0].1, "from a staging buffer of its own");
+        assert_eq!(
+            filled[0].0, out[0].1,
+            "the download's staging buffer, a spare once its command buffer completed"
+        );
         assert_eq!(
             buffer_bytes(&r, filled[0].0, None),
             written,
@@ -13206,7 +13279,14 @@ pub(super) mod tests {
         let out = copies(&r.p.call_log().since(out_mark));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, cache, "out of the cache");
-        assert_ne!(out[0].1, filled[0].0, "into a staging buffer of its own");
+        assert_eq!(
+            out[0].1, filled[0].0,
+            "the fill's staging buffer, a spare once its command buffer completed"
+        );
+        assert!(
+            !(r.p.call_log().sels_since(out_mark)).contains(&"newBufferWithLength:options:"),
+            "no buffer made"
+        );
         buffer_bytes(&r, out[0].1, Some(0xc3));
         assert!(!done.load(Ordering::SeqCst), "not before the copy is done");
         r.p.world().complete_all(CompleteOn::Caller);
@@ -13269,6 +13349,163 @@ pub(super) mod tests {
             "no buffer over the pages, so no import of them: {sels:?}"
         );
         assert!(!sels.contains(&"mach_vm_remap"), "no mapping of the pages");
+    }
+
+    /// Writes `value` over the bytes `range` of the Shared buffer of id `id`.
+    fn fill_buffer(r: &Rig, id: u64, range: Range<u64>, value: u8) {
+        use reims_vgpu_vulkan::core::platform::ObjId;
+        use reims_vgpu_vulkan::core::testkit::objects::kind;
+        let buffer = (r.p.world().find(ObjId(id)))
+            .and_then(|o| o.cast::<kind::Buffer>())
+            .expect("a live buffer");
+        assert!(range.end <= buffer.length() && !buffer.contents().is_null());
+        // SAFETY: a live Shared buffer's bytes `range`, inside its length, which no work of the
+        // test's uses now.
+        unsafe {
+            let at = buffer.contents().as_ptr::<u8>().add(range.start.to_usize());
+            std::ptr::write_bytes(at, value, (range.end - range.start).to_usize());
+        }
+    }
+
+    /// Where the caches' copies are staged, a copy's staging buffer goes back to the caches'
+    /// spares only once its command buffer has completed and its CPU copy is done: a download
+    /// asked while the fill before it is in flight stages through a buffer of its own. Once both
+    /// completed, the next download of their length takes one of theirs and makes none
+    #[test]
+    fn a_staged_copy_in_flight_never_shares_its_buffer() {
+        let mut r = rig(8);
+        r.dec.set_staged_surface_copies();
+        queues(&mut r);
+        let page = r.page;
+        let length = 2 * page;
+        ram_bytes(&r, 1, length, Some(0x11));
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], length, true),
+            RGFX_STATUS_OK
+        );
+        let cache = cache_id(&r);
+
+        // The first use's fill, in flight, and a download behind it.
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        let done = download(&r, BLOCK);
+        let made = copies(&r.p.call_log().since(mark));
+        assert_eq!(made.len(), 2, "{made:?}");
+        assert_eq!((made[0].1, made[1].0), (cache, cache), "a fill, then a download");
+        assert_ne!(
+            made[1].1, made[0].0,
+            "the download's buffer is not the fill's, whose copy is in flight"
+        );
+        buffer_bytes(&r, made[1].1, Some(0xc3));
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+
+        // Both completed: the next download takes one of their buffers and makes none.
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        let again = copies(&r.p.call_log().since(mark));
+        assert_eq!(again.len(), 1, "{again:?}");
+        assert_eq!(again[0].0, cache, "out of the cache");
+        assert!(
+            [made[0].0, made[1].1].contains(&again[0].1),
+            "a spare: {again:?} of {made:?}"
+        );
+        assert!(
+            !(r.p.call_log().sels_since(mark)).contains(&"newBufferWithLength:options:"),
+            "no buffer made"
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+    }
+
+    /// Where the caches' copies are staged, a download of a cache laid out at the GPU's pitch
+    /// moves into the pages only what its GPU copy wrote of its staging buffer, whose other
+    /// bytes, made unzeroed or left there by an earlier copy, never reach the guest: each row's
+    /// texels, not the padding between the surface's rows nor the bytes past the last row
+    #[test]
+    fn a_staged_download_moves_only_what_its_gpu_copy_wrote() {
+        use super::super::surface_pages::tests::one_plane;
+        let mut r = rig(16);
+        r.dec.set_staged_surface_copies();
+        r.p.world().lay_linear_rows(Some(256));
+        queues(&mut r);
+        let page = r.page;
+        // Three rows 800 apart of 704 texel bytes, which the GPU lays 768 apart.
+        let (pitch, texels, rows) = (800u64, 704u64, 3u64);
+        assert_eq!(
+            r.pages_laid_out(
+                BLOCK,
+                0,
+                &[(1, 1)],
+                page,
+                RGFX_SURFACE_PAGES_CACHED,
+                Some(one_plane(pitch, texels, rows))
+            ),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(r.dec.caches().counts().repitched, 1);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let before = ram_bytes(&r, 1, page, Some(0x5a));
+
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        let calls = r.p.call_log().since(mark);
+        let out = copies(&calls);
+        assert_eq!(out.len(), 3, "a copy a row: {out:?}");
+        let staging = out[0].1;
+        assert!(out.iter().all(|&(from, to)| (from, to) == (out[0].0, staging)));
+        let parts = offsets(&calls);
+        assert_eq!(
+            parts,
+            [(0, 0, 704), (768, 800, 704), (1536, 1600, 704)],
+            "each row from the GPU's pitch to the surface's"
+        );
+        // The buffer's bytes as made unzeroed or left by an earlier copy: a marker, then the
+        // GPU's copy writes its parts.
+        buffer_bytes(&r, staging, Some(0xee));
+        for &(_, at, bytes) in &parts {
+            fill_buffer(&r, staging, at..at + bytes, 0xc3);
+        }
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+        let after = ram_bytes(&r, 1, page, None);
+        for (at, (&now, &was)) in after.iter().zip(&before).enumerate() {
+            let at = at as u64;
+            match at / pitch < rows && at % pitch < texels {
+                true => assert_eq!(now, 0xc3, "byte {at:#x}, a texel: the GPU's copy's"),
+                false => assert_eq!(now, was, "byte {at:#x}, padding or past the rows: the CPU's"),
+            }
+        }
+    }
+
+    /// The staged copies' spares keep a buffer given back for a take of its length, to their
+    /// cap: one given past it is let go of, and a take of another length finds none
+    #[test]
+    fn the_staged_copies_spares_keep_buffers_to_their_cap() {
+        let r = rig(8);
+        let page = r.page;
+        let made = |length| {
+            (r.device.new_buffer_of_length(ON, length, 0))
+                .unwrap()
+                .unwrap()
+        };
+        let spares = Spares::<FakePlatform>::new(3 * page);
+        let (a, b) = (made(2 * page), made(2 * page));
+        let kept = id_of(&a);
+        spares.give(a);
+        spares.give(b);
+        assert!(spares.take(page).is_none(), "none of another length");
+        let taken = spares.take(2 * page).expect("the one kept");
+        assert_eq!(id_of(&taken), kept);
+        assert!(
+            spares.take(2 * page).is_none(),
+            "the one given past the cap was let go of"
+        );
+        spares.give(taken);
+        assert!(spares.take(2 * page).is_some(), "given back, kept again");
     }
 
     /// The platform's command queue.
