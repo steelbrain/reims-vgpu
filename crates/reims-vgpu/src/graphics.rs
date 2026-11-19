@@ -148,7 +148,7 @@ use crate::memory::{GuestMemoryLease, MemoryMap};
 use crate::platform::{ApiPlatform, api_state};
 use crate::pool::{
     Give, HostBlocks, Pool, PoolAddFn, PoolConfig, PoolHost, PoolLedger, PoolRemoveFn,
-    PrivateBlocks, PrivateGive, PrivateTakeError, TAKE_MAX,
+    PrivateBlocks, PrivateGive, PrivateTakeAnswer, PrivateTakeError, TAKE_MAX,
 };
 use crate::window::WindowLink;
 
@@ -921,7 +921,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 reset_gate: Arc::default(),
                 inline_walk_max: AtomicUsize::new(INLINE_WALK_MAX),
                 shared_pool: pool_ledger,
-                private_blocks: PrivateBlocks::new(block_source),
+                private_blocks: {
+                    let clock = Arc::clone(&platform);
+                    PrivateBlocks::new(block_source, Box::new(move || clock.clock().now_mono()))
+                },
             });
             let cursors: Vec<Arc<HostCursor>> = (0..count)
                 .map(|display| {
@@ -1241,6 +1244,11 @@ impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
         // each block goes back to the source once no thread of the device's holds it, and the
         // source frees them.
         drop(self.pool.take());
+        // The contexts' Private takes in flight end unanswered, and their workers go, each
+        // giving back the block it was taking: none calls the source past the release.
+        if let Some(control) = self.ending.upgrade() {
+            control.private_blocks.close();
+        }
         let ending: Weak<dyn std::any::Any + Send + Sync> = self.ending.clone();
         let mut ended = ENDING.lock();
         ended.retain(|state| state.strong_count() > 0);
@@ -2045,18 +2053,19 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     }
 
     /// `PRIVATE_TAKE` (`Host::private_take`): context `take.context`'s new Private block
-    /// ([`PrivateBlocks::take`]), answered at once; invalid for a length of 0 or past the wire's
-    /// longest, refused where no address is left for it.
+    /// ([`PrivateBlocks::take`]): the host's pick answered at once, the source's block on the
+    /// context's take worker, after its earlier takes; invalid for a length of 0 or past the
+    /// wire's longest, refused where no block or address is left for it.
     fn take_private_block(&self, take: &RgfxPrivateTake, answer: PrivateAnswer) {
-        match self.private_blocks.take(take.context, take.length) {
+        let (context, asked) = (take.context, take.length);
+        let answer: PrivateTakeAnswer = Box::new(move |taken| match taken {
             Ok((gpu_address, length)) => {
                 static TOLD: AtomicBool = AtomicBool::new(false);
                 if !TOLD.swap(true, Ordering::Relaxed) {
                     log::info!(
                         target: "reims_vgpu::graphics",
-                        "the first Private block: context {}'s, {length:#x} bytes at \
-                         {gpu_address:#x}",
-                        take.context
+                        "the first Private block: context {context}'s, {length:#x} bytes at \
+                         {gpu_address:#x}"
                     );
                 }
                 answer.answer(RGFX_STATUS_OK, gpu_address, length);
@@ -2065,13 +2074,13 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             Err(PrivateTakeError::Refused) => {
                 log::warn!(
                     target: "reims_vgpu::graphics",
-                    "context {} asked for a Private block of {:#x} bytes, for which no address is \
-                     left: refused",
-                    take.context, take.length
+                    "context {context} asked for a Private block of {asked:#x} bytes, for which \
+                     no block or address is left: refused"
                 );
                 answer.answer(RGFX_STATUS_REFUSED, 0, 0);
             }
-        }
+        });
+        self.private_blocks.take(context, asked, answer);
     }
 
     /// `PRIVATE_GIVE` (`Host::private_give`): not found where context `give.context` holds no

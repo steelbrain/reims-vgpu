@@ -83,7 +83,9 @@ pub(crate) use addresses::{
     HOST_BASE, HOST_END, IMPORT_BASE, IMPORT_END, PRIVATE_BASE, PRIVATE_END,
 };
 pub(crate) use host_blocks::HostBlocks;
-pub(crate) use private_blocks::{PrivateBlocks, PrivateGive, TakeError as PrivateTakeError};
+pub(crate) use private_blocks::{
+    PrivateBlocks, PrivateGive, TakeAnswer as PrivateTakeAnswer, TakeError as PrivateTakeError,
+};
 #[cfg(feature = "rt")]
 pub(crate) use rt_blocks::RtBlocks;
 pub(crate) use takes::{Give, PoolLedger, TAKE_MAX};

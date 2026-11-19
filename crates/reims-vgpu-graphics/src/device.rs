@@ -540,8 +540,9 @@ pub trait Host: Send + Sync + 'static {
     /// block's first byte, never 0, and its length, `take.length` rounded up to
     /// [`RGFX_PRIVATE_BLOCK_ALIGN`]; [`RGFX_STATUS_INVALID_ARGUMENT`] for a length of 0 or past
     /// [`RGFX_PRIVATE_TAKE_MAX`]; or [`RGFX_STATUS_REFUSED`] where it has no block or address
-    /// left for it. It answers none of a context closed or a device reset since, whose block it
-    /// gives back itself. Called on the context's lane, in ring order; it waits for nothing there.
+    /// left for it. It answers each context's takes in their order, and none of a context closed
+    /// or a device reset since, whose block it gives back itself. Called on the context's lane, in
+    /// ring order; it waits for nothing there.
     /// The default refuses at once, for a host that gives no blocks.
     fn private_take(&self, take: &RgfxPrivateTake, answer: PrivateAnswer) {
         let _ = take;

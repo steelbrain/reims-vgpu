@@ -142,7 +142,12 @@ repeats the ones code cites.
     docs/graphics-kext/design.md, "A buffer's escaped identity"), and the
     Vulkan platform's command predication's
     (`predication-loop-overrun`, a command buffer whose loop ran past the
-    iterations laid down for it, which fails); a boot's degradations are
+    iterations laid down for it, which fails), and the contexts' Private
+    takes' (`private-take-queued`, a take that waited behind its context's
+    earlier one; `private-take-sourced`, one its worker took from the
+    source, and `private-take-sourced-us`, the source's time for them in
+    microseconds; `private-take-lane-us-most`, the longest a take held the
+    thread that carried it out); a boot's degradations are
     read from its last such line. `reims-vgpu INFO reims_vgpu_vulkan::core::logging: lines
     repeated since the last count: <n> more of <file>:<line>[ [<kind>]]
     (<target>: <the first line's message>); …` is how many lines of each

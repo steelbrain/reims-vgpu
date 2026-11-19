@@ -2714,7 +2714,11 @@ pub fn out_of_host_memory_count() -> u64 {
 /// live at once and imported by the kind of make ([`MadeCodes`], [`count_made`]), and, on a
 /// platform that keeps a pin only in its known blocks, the pins not kept by the kind of object
 /// (`rt-gpu-address-unpinned-<kind>`) and the textures placed at the guest's own pick
-/// (`rt-texture-address-guest-pick`).
+/// (`rt-texture-address-guest-pick`); and its contexts' Private takes by cause, those that
+/// waited behind their context's earlier take (`private-take-queued`) and those their worker
+/// took from the source (`private-take-sourced`, with the source's time in microseconds,
+/// `private-take-sourced-us`), with the longest a take held the thread that carried it out
+/// (`private-take-lane-us-most`).
 static COUNTED: crate::core::sync::Mutex<Vec<(&'static str, u64)>> =
     crate::core::sync::Mutex::new(Vec::new());
 
