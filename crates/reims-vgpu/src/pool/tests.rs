@@ -1,5 +1,6 @@
-// Test scaffolding: real time bounds the waits and runs the delays, and a helper thread stands in
-// for a thread of the device's.
+// Test scaffolding: real time bounds the waits and runs the delays, but for those a test must take
+// a step inside, which a clock the test moves runs (`Hand`); a helper thread stands in for a thread
+// of the device's.
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, LazyLock};
@@ -66,11 +67,41 @@ fn now() -> PoolNow {
     Box::new(|| MonoTime::from_nanos(u64::try_from(START.elapsed().as_nanos()).unwrap()))
 }
 
+/// A clock that stands still until the test moves it on ([`Hand::on`]): a pool on it gives a
+/// piece back only once the test has moved the clock past the piece's delay, so a step the test
+/// takes before that comes first however slowly a loaded host runs it.
+#[derive(Default)]
+struct Hand(Arc<std::sync::atomic::AtomicU64>);
+
+impl Hand {
+    /// The clock, at the nanoseconds the test moved it to.
+    fn clock(&self) -> PoolNow {
+        let nanos = Arc::clone(&self.0);
+        Box::new(move || MonoTime::from_nanos(nanos.load(std::sync::atomic::Ordering::SeqCst)))
+    }
+
+    /// Moves the clock on by `by`.
+    fn on(&self, by: Duration) {
+        let by = u64::try_from(by.as_nanos()).unwrap();
+        self.0.fetch_add(by, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The host blocks the pool takes from, kept for the tests' counts.
 fn pool(range: PoolConfig, host: &Arc<Host>, delay: Duration) -> (Pool, Arc<HostBlocks>) {
+    pool_at(range, host, delay, now())
+}
+
+/// [`pool`], on `clock`.
+fn pool_at(
+    range: PoolConfig,
+    host: &Arc<Host>,
+    delay: Duration,
+    clock: PoolNow,
+) -> (Pool, Arc<HostBlocks>) {
     let blocks = Arc::new(HostBlocks::new());
     let source: Arc<dyn BlockSource> = Arc::clone(&blocks) as _;
-    let pool = Pool::with_delay(range, host.pool_host(), delay, now(), source).unwrap();
+    let pool = Pool::with_delay(range, host.pool_host(), delay, clock, source).unwrap();
     (pool, blocks)
 }
 
@@ -196,7 +227,12 @@ fn a_piece_holds_the_blocks_memory_the_host_maps() {
 /// The pool at `range` with two live pieces, the upper one empty past `delay` and so given back
 /// once its turn comes.
 fn two_pieces(host: &Arc<Host>, delay: Duration) -> (Pool, Arc<HostBlocks>) {
-    let (pool, blocks) = pool(range(64), host, delay);
+    two_pieces_at(host, delay, now())
+}
+
+/// [`two_pieces`], on `clock`.
+fn two_pieces_at(host: &Arc<Host>, delay: Duration, clock: PoolNow) -> (Pool, Arc<HostBlocks>) {
+    let (pool, blocks) = pool_at(range(64), host, delay, clock);
     pool.grow(BLOCK_LEN);
     pool.grow(BLOCK_LEN);
     host.wait_for(2);
@@ -230,13 +266,18 @@ fn a_piece_goes_back_only_once_the_host_removed_it() {
 #[test]
 fn a_held_piece_goes_back_only_once_its_hold_ends() {
     let delay = Duration::from_millis(50);
-    let host = Arc::new(Host::default());
-    let (pool, blocks) = two_pieces(&host, delay);
+    let (host, hand) = (Arc::new(Host::default()), Hand::default());
+    let (pool, blocks) = two_pieces_at(&host, delay, hand.clock());
+    // The clock stands: the upper piece is live as the hold is taken.
     let hold = pool.find(BASE + BLOCK_LEN, 1).unwrap();
-    std::thread::sleep(delay * 6);
+    hand.on(delay);
     // Out of the lookups past the delay, but neither asked out of the guest nor given back while
     // the hold lives.
-    assert!(pool.find(BASE + BLOCK_LEN, 1).is_none());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pool.find(BASE + BLOCK_LEN, 1).is_some() {
+        assert!(Instant::now() < deadline, "still in the lookups past the delay");
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(host.calls().len(), 2, "no remove while a hold lives");
     assert_eq!(blocks.counts(), (2, 0));
     drop(hold);
@@ -383,9 +424,9 @@ fn the_lowest_empty_piece_stays_as_headroom() {
 
 #[test]
 fn a_piece_used_again_within_the_delay_is_kept() {
-    let delay = Duration::from_millis(400);
-    let host = Arc::new(Host::default());
-    let (pool, blocks) = pool(range(64), &host, delay);
+    let delay = Duration::from_millis(50);
+    let (host, hand) = (Arc::new(Host::default()), Hand::default());
+    let (pool, blocks) = pool_at(range(64), &host, delay, hand.clock());
     pool.grow(BLOCK_LEN);
     pool.grow(BLOCK_LEN);
     host.wait_for(2);
@@ -399,10 +440,12 @@ fn a_piece_used_again_within_the_delay_is_kept() {
         Call::Add(BASE + 2 * BLOCK_LEN, BLOCK_LEN)
     );
     pool.added(BASE + 2 * BLOCK_LEN).unwrap();
-    // Emptied, then used again within the delay: kept.
+    // Emptied, then used again within the delay: kept. The clock moves only as the test moves
+    // it; the real wait after gives a pool that kept the wrong piece the time to give it back.
     pool.piece_empty(BASE + BLOCK_LEN).unwrap();
-    std::thread::sleep(delay / 4);
+    hand.on(delay / 2);
     pool.piece_used(BASE + BLOCK_LEN).unwrap();
+    hand.on(delay * 2);
     std::thread::sleep(delay * 2);
     assert_eq!(blocks.counts(), (3, 0));
     // Emptied for good: the lowest empty piece, now this one, stays as the headroom, and the
@@ -473,14 +516,15 @@ fn ready_blocks_past_two_are_freed_with_no_word_to_the_host() {
 #[test]
 fn a_piece_given_back_and_taken_again_reads_zero() {
     let delay = Duration::from_millis(50);
-    let host = Arc::new(Host::default());
-    let (pool, blocks) = pool(range(64), &host, delay);
+    let (host, hand) = (Arc::new(Host::default()), Hand::default());
+    let (pool, blocks) = pool_at(range(64), &host, delay, hand.clock());
     pool.grow(BLOCK_LEN);
     pool.grow(BLOCK_LEN);
     host.wait_for(2);
     pool.added(BASE).unwrap();
     pool.added(BASE + BLOCK_LEN).unwrap();
-    // The guest writes into the upper piece, then empties it; it goes back past the delay.
+    // The guest writes into the upper piece, then empties it; it goes back past the delay, which
+    // the clock, standing still until the test moves it, cannot pass before the piece is used.
     pool.piece_used(BASE + BLOCK_LEN).unwrap();
     {
         let hold = pool.find(BASE + BLOCK_LEN + 4096, 8).unwrap();
@@ -488,6 +532,7 @@ fn a_piece_given_back_and_taken_again_reads_zero() {
         unsafe { hold.host.as_ptr().cast::<u64>().write(0xdead_beef) };
     }
     pool.piece_empty(BASE + BLOCK_LEN).unwrap();
+    hand.on(delay);
     assert_eq!(
         host.wait_for(3)[2],
         Call::Remove(BASE + BLOCK_LEN, BLOCK_LEN)
