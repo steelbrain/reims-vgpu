@@ -5019,6 +5019,53 @@ mod tests {
         );
     }
 
+    /// On the rt platform as on the Vulkan platform, a stream starts with the device's making and
+    /// then its identity, rt's `deviceName` and `hasUnifiedMemory`, before any call on the device.
+    #[cfg(feature = "rt")]
+    #[test]
+    fn on_vulkan_the_rt_platform_s_stream_starts_with_the_devices_identity() {
+        in_recording_child(
+            "recorder::tests::on_vulkan_the_rt_platform_s_stream_starts_with_the_devices_identity",
+            |streams| {
+                use crate::core::platform::Platform as _;
+                use crate::core::platform::device::GpuDevice as _;
+                let platform = crate::rt_platform::RtPlatform::new();
+                assert!(on(), "the child does not record");
+                let registry_id = platform
+                    .system_default_device()
+                    .expect("an rt device on the GPU the test holds")
+                    .facts()
+                    .registry_id;
+                let device = platform
+                    .open_device(registry_id)
+                    .expect("the default device");
+                let queue = device.new_command_queue().expect("a queue");
+                let (calls, _) = recorded(streams, |calls| {
+                    calls.iter().any(|c| c.selector == "newCommandQueue")
+                });
+                let made = calls.first().expect("a record");
+                assert_eq!(made.selector, "MTLCreateSystemDefaultDevice", "{calls:?}");
+                assert_ne!(made.result, 0);
+                let identity = Identity {
+                    name: device.facts().name.clone(),
+                    unified: device.facts().unified_memory,
+                };
+                assert_eq!(
+                    calls.get(1),
+                    Some(&identity.record(made.result)),
+                    "{calls:?}"
+                );
+                let queued = calls.get(2).expect("the queue's record");
+                assert_eq!(
+                    (queued.selector.as_str(), queued.receiver),
+                    ("newCommandQueue", made.result)
+                );
+                drop(queue);
+                drop(device);
+            },
+        );
+    }
+
     /// The count `key` of the stats file of this process's stream in `streams`, written once
     /// every queued call is: the writer's own write of it can meet the read, which then reads
     /// again.
