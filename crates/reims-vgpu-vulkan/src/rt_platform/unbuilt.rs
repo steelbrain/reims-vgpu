@@ -98,11 +98,14 @@ pub enum Unbuilt {
     /// A reservation of resource indices of a type core never reserves (other than 0, 1 and 5).
     /// It reserves nothing.
     ResourceType,
+    /// A tessellation factor scale other than 1 (`setTessellationFactorScale:`), which rt has no
+    /// call of: its patch draws read the factors as the factor buffer holds them, unscaled.
+    TessellationFactorScale,
 }
 
 impl Unbuilt {
     /// Every piece, once, in the order of their codes' places.
-    pub const ALL: [Unbuilt; 18] = [
+    pub const ALL: [Unbuilt; 19] = [
         Unbuilt::Buffer,
         Unbuilt::IosurfaceTexture,
         Unbuilt::SharedTexture,
@@ -121,6 +124,7 @@ impl Unbuilt {
         Unbuilt::Icb,
         Unbuilt::DynamicLibrary,
         Unbuilt::ResourceType,
+        Unbuilt::TessellationFactorScale,
     ];
 
     /// The piece's code in the degradation counts.
@@ -144,6 +148,7 @@ impl Unbuilt {
             Unbuilt::Icb => "rt-unbuilt-icb",
             Unbuilt::DynamicLibrary => "rt-unbuilt-dynamic-library",
             Unbuilt::ResourceType => "rt-unbuilt-resource-type",
+            Unbuilt::TessellationFactorScale => "rt-unbuilt-tessellation-factor-scale",
         }
     }
 
@@ -168,6 +173,7 @@ impl Unbuilt {
             Unbuilt::Icb => "an indirect command buffer",
             Unbuilt::DynamicLibrary => "a dynamic library",
             Unbuilt::ResourceType => "a reservation of resource indices of another type",
+            Unbuilt::TessellationFactorScale => "a tessellation factor scale other than 1",
         }
     }
 

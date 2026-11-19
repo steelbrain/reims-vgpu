@@ -16,19 +16,20 @@
 //!   earlier command before it and itself before every later one, and every resource is
 //!   resident), but that a tiled texture `useResources:` names is a use of it (`super::tiled`); the
 //!   store action options (rt renders one sample, and the one option is custom
-//!   sample positions); `setTessellationFactorScale:` (rt refuses a state that reads the scale);
-//!   the object, mesh and tile functions' buffers, textures, samplers and threadgroup memory, and
-//!   the tile threadgroup memory length (rt makes no state with such functions); and, each at
-//!   Metal's default, a resolve texture of nil, a visibility result mode of `Disabled`, a line
-//!   width of 1, primitive restart enabled, the viewport transform enabled and one vertex
-//!   amplification view.
+//!   sample positions); the object, mesh and tile functions' buffers, textures, samplers and
+//!   threadgroup memory, and the tile threadgroup memory length (rt makes no state with such
+//!   functions); and, each at Metal's default, a resolve texture of nil, a visibility result mode
+//!   of `Disabled`, a line width of 1, primitive restart enabled, the viewport transform enabled,
+//!   one vertex amplification view and a tessellation factor scale of 1.
 //! - **Unbuilt** ([`Unbuilt::RenderCommand`]), each encoding nothing, counted: indirect draws,
 //!   indexed patch draws, mesh draws, tile dispatches, a resolve texture, a visibility result
 //!   mode but `Disabled`, and the private settings of other than Metal's default rt has none of
 //!   (the alpha test's reference, a line width, a point size, the provoking vertex, primitive
 //!   restart disabled, the viewport transform disabled, vertex amplification, and an attachment
 //!   marked cleared). `tileWidth` and `tileHeight` answer 0, counted under
-//!   [`Unbuilt::RenderPass`]: rt's pass has no tiles.
+//!   [`Unbuilt::RenderPass`]: rt's pass has no tiles. A tessellation factor scale other than 1
+//!   is counted under [`Unbuilt::TessellationFactorScale`]: rt has no call of it, and the
+//!   encoder's later patch draws read their factors unscaled.
 //! - **Metal's refusals**, each encoding nothing, counted (`rt-refused-metal`): a draw with no
 //!   pipeline state set, or with nil set since; a value no Metal enumeration has (a primitive,
 //!   index or fill type, a cull mode, a winding, a depth clip mode, a store action); an index, a
@@ -277,6 +278,10 @@ impl RtRenderEncoder {
                 unbuilt_unless(mode == VISIBILITY_DISABLED)?;
             }
             RenderCmd::SetLineWidth { line_width } => unbuilt_unless(line_width == 1.0)?,
+            RenderCmd::SetTessellationFactorScale { scale } if scale != 1.0 => {
+                return Err(Stop::Unbuilt(Unbuilt::TessellationFactorScale));
+            }
+            RenderCmd::SetTessellationFactorScale { .. } => {}
             RenderCmd::SetPrimitiveRestartEnabled { enabled, .. } => unbuilt_unless(enabled)?,
             RenderCmd::SetViewportTransformEnabled { enabled } => unbuilt_unless(enabled)?,
             RenderCmd::SetVertexAmplificationCount { view_mappings } => {
@@ -296,7 +301,6 @@ impl RtRenderEncoder {
             | RenderCmd::SetColorStoreActionOptions { .. }
             | RenderCmd::SetDepthStoreActionOptions { .. }
             | RenderCmd::SetStencilStoreActionOptions { .. }
-            | RenderCmd::SetTessellationFactorScale { .. }
             | RenderCmd::SetThreadgroupMemoryLength { .. }
             | RenderCmd::SetObjectThreadgroupMemoryLength { .. }
             | RenderCmd::SetMeshBufferOffset { .. }
@@ -881,6 +885,8 @@ mod tests {
         let (unbuilt, pass_unbuilt) = (Unbuilt::RenderCommand.code(), Unbuilt::RenderPass.code());
         let (before, unbuilt_before, pass_before) =
             (counted(metal), counted(unbuilt), counted(pass_unbuilt));
+        let scale = Unbuilt::TessellationFactorScale.code();
+        let scale_before = counted(scale);
         let commands = made();
         let encoder = commands.render_encoder(on, &pass(&target, 2));
         let encoder = encoder.expect("never a raise").expect("a render encoder");
@@ -938,6 +944,7 @@ mod tests {
                 usage: 1,
             },
             RenderCmd::SetTessellationFactorScale { scale: 2.0 },
+            RenderCmd::SetTessellationFactorScale { scale: 1.0 },
             RenderCmd::SetRenderPipelineState {
                 pipeline_state: None,
             },
@@ -960,6 +967,7 @@ mod tests {
         assert_eq!(counted(metal), before + 7);
         assert_eq!(counted(unbuilt), unbuilt_before + 4);
         assert_eq!(counted(pass_unbuilt), pass_before + 2);
+        assert_eq!(counted(scale), scale_before + 1);
         assert_eq!(commands.commit(on), Ok(()));
         assert_eq!(commands.wait_until_completed(on), Ok(()));
         assert_eq!(commands.status(), done);
