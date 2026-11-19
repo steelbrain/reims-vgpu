@@ -561,8 +561,17 @@ void rgfxOwesEscapeNote(RgfxBuffer *buffer, MTLResourceOptions options, RgfxSeri
 	const MTLResourceOptions overPages =
 	    managed ? (hostOptions & ~MTLResourceStorageModeMask) | MTLResourceStorageModeShared
 	            : hostOptions;
-	RgfxCreated created = serializer->createBufferOverPages(
-	    length, static_cast<uint32_t>(overPages), block.offset, block.size, offset);
+	// At the GPU address the host gave the block's view, where it gave one
+	// (RGFX_FEATURE_IMPORT_ADDRESSES), which buffers over the same bytes share as they share the
+	// block; else at a pick of the process's.
+	const bool hostAddress = block.gpuAddress != 0;
+	RgfxCreated created =
+	    hostAddress
+	        ? serializer->createBufferOverPagesAt(length, static_cast<uint32_t>(overPages),
+	                                              block.offset, block.size, offset,
+	                                              block.gpuAddress)
+	        : serializer->createBufferOverPages(length, static_cast<uint32_t>(overPages),
+	                                            block.offset, block.size, offset);
 	const uint64_t at = block.offset;
 	if (created.obj_id == 0 || serializer->refused(created)) {
 		region->leavePages(at);
@@ -570,9 +579,10 @@ void rgfxOwesEscapeNote(RgfxBuffer *buffer, MTLResourceOptions options, RgfxSeri
 		return nil;
 	}
 	// A Managed one's CPU copy: the Shared buffer over the pages, destroyed once the Managed
-	// buffer's destroy is posted, its address then given back, and then the block.
+	// buffer's destroy is posted, its address then given back where it is a pick of the
+	// process's, and then the block.
 	const RgfxObjId copy = managed ? created.obj_id : 0;
-	const uint64_t copyPick = created.gpu_address;
+	const uint64_t copyPick = hostAddress ? 0 : created.gpu_address;
 	if (managed) {
 		// The app's own bytes, which its program wrote: nothing is said of them.
 		created = serializer->createManagedBuffer(copy, length, static_cast<uint32_t>(options),
@@ -581,7 +591,8 @@ void rgfxOwesEscapeNote(RgfxBuffer *buffer, MTLResourceOptions options, RgfxSeri
 		if (created.obj_id == 0 || serializer->refused(created)) {
 			region->leavePages(at);
 			serializer->destroy(copy, [serializer, copyPick, region, at] {
-				serializer->releaseAddress(copyPick);
+				if (copyPick != 0)
+					serializer->releaseAddress(copyPick);
 				region->release(at);
 			});
 			return nil;
@@ -608,7 +619,9 @@ void rgfxOwesEscapeNote(RgfxBuffer *buffer, MTLResourceOptions options, RgfxSeri
 		                                           serializer->destroy(copy, [serializer,
 		                                                                      copyPick,
 		                                                                      released] {
-			                                           serializer->releaseAddress(copyPick);
+			                                           if (copyPick != 0)
+				                                           serializer->releaseAddress(
+				                                               copyPick);
 			                                           released();
 		                                           });
 	                                           }
@@ -618,7 +631,9 @@ void rgfxOwesEscapeNote(RgfxBuffer *buffer, MTLResourceOptions options, RgfxSeri
 		region->leavePages(at);
 		return nil;
 	}
-	buffer->_ownsAddress = YES;
+	// The host's address of the block's view is the block's, not the process's to give back; a
+	// Managed buffer's is its own pick.
+	buffer->_ownsAddress = managed || !hostAddress;
 	buffer->_addressPick = created.gpu_address;
 	buffer->_pagesRegion = region;
 	buffer->_pagesBlock = at;

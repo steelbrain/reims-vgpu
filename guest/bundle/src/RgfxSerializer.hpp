@@ -472,6 +472,15 @@ public:
 	RgfxCreated createBufferOverPages(uint64_t length, uint32_t options, uint64_t block_offset,
 	                                  uint64_t block_size, uint64_t offset);
 
+	/// createBufferOverPages at `gpu_address`, the GPU address the host gave the block's view
+	/// (RGFX_FEATURE_IMPORT_ADDRESSES, RgfxRegion::Block::gpuAddress), with no pick: the
+	/// answer's `gpu_address` is that address, the host's, never given back through
+	/// releaseAddress, and the buffer's is that plus `offset`. No object where the address is 0
+	/// or the buffer's end would wrap.
+	RgfxCreated createBufferOverPagesAt(uint64_t length, uint32_t options, uint64_t block_offset,
+	                                    uint64_t block_size, uint64_t offset,
+	                                    uint64_t gpu_address);
+
 	/// A buffer at `offset` in the heap `heap`. No one waits for it: where the control ring
 	/// batches (RgfxRingWriter::postLater), it is held to go with the messages around it, before
 	/// anything posted after it and before any command buffer committed after it
@@ -846,6 +855,10 @@ private:
 	// `post`'s known pipelines, then the kext's answers of every process, where it can.
 	void postPipeline(uint32_t type, const uint8_t *message, uint32_t size, RgfxCreated &out,
 	                  RgfxPipelinePost *post);
+	// Posts the BUFFER_OVER_PAGES of `out`'s object at `out.gpu_address` plus `offset`
+	// (createBufferOverPages, createBufferOverPagesAt), its posting and seqno into `out`.
+	void postBufferOverPages(RgfxCreated &out, uint64_t length, uint32_t options,
+	                         uint64_t block_offset, uint64_t block_size, uint64_t offset);
 
 	// heapTextureSizeAndAlign's answers, by the shape's bytes, under m_sizesLock.
 	typedef std::array<uint8_t, sizeof(RgfxTextureDescriptor)> SizeKey;

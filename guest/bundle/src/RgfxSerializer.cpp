@@ -458,7 +458,28 @@ RgfxCreated RgfxSerializer::createBufferOverPages(uint64_t length, uint32_t opti
 	if (out.gpu_address == 0)
 		return out;
 	out.obj_id = m_ids.allocObjId();
+	postBufferOverPages(out, length, options, block_offset, block_size, offset);
+	return out;
+}
 
+RgfxCreated RgfxSerializer::createBufferOverPagesAt(uint64_t length, uint32_t options,
+                                                    uint64_t block_offset, uint64_t block_size,
+                                                    uint64_t offset, uint64_t gpu_address)
+{
+	RgfxCreated out = {};
+	if (gpu_address == 0 || length > UINT64_MAX - offset ||
+	    gpu_address > UINT64_MAX - (length + offset))
+		return out;
+	out.gpu_address = gpu_address;
+	out.obj_id = m_ids.allocObjId();
+	postBufferOverPages(out, length, options, block_offset, block_size, offset);
+	return out;
+}
+
+void RgfxSerializer::postBufferOverPages(RgfxCreated &out, uint64_t length, uint32_t options,
+                                         uint64_t block_offset, uint64_t block_size,
+                                         uint64_t offset)
+{
 	RgfxBufferOverPages msg = {};
 	msg.obj_id = out.obj_id;
 	msg.gpu_address = out.gpu_address + offset;
@@ -468,7 +489,6 @@ RgfxCreated RgfxSerializer::createBufferOverPages(uint64_t length, uint32_t opti
 	msg.length = length;
 	msg.options = RgfxHostResourceOptions(options);
 	out.posted = m_control.tryPost(RGFX_CMD_BUFFER_OVER_PAGES, &msg, sizeof(msg), &out.seqno);
-	return out;
 }
 
 RgfxCreated RgfxSerializer::createBufferAtOffset(RgfxObjId heap, uint64_t offset, uint64_t length,

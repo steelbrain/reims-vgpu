@@ -60,11 +60,15 @@ public:
 	/// A block handed out of the region. `offset` is its place in the region (always
 	/// at or above the floor), `ptr` the CPU pointer base + offset, `size` the bytes
 	/// reserved. `ok` is false when the region had no room (the other fields are 0).
+	/// `gpuAddress` is the GPU address the device gave a pages block's view
+	/// (acquirePages, RGFX_FEATURE_IMPORT_ADDRESSES), which a joined block shares; 0 where it
+	/// gave none, and for every other block.
 	struct Block {
 		uint64_t offset;
 		volatile uint8_t *ptr;
 		uint64_t size;
 		bool ok;
+		uint64_t gpuAddress;
 	};
 
 	/// A submission + completion ring pair for a queue. The offsets and data sizes
@@ -252,11 +256,13 @@ public:
 	/// Where pages blocks come from (the kext's PagesBlock, RGFX_FEATURE_PAGES_BUFFERS): `acquire`
 	/// answers the block of the runs of the pages that hold the `length` bytes at `address` in the
 	/// process, which the kext wires for the block's life and the device maps in place from the
-	/// first of them, where the memory is `writable`: its region offset and size, or false where
-	/// it gives none. Its blocks go back through the block source's release (release()). Called
-	/// with `context`, from any thread.
+	/// first of them, where the memory is `writable`: its region offset and size, and the GPU
+	/// address the device gave the view of its pages in `*gpuAddress`, 0 where none
+	/// (RGFX_FEATURE_IMPORT_ADDRESSES); or false where it gives none. Its blocks go back through
+	/// the block source's release (release()). Called with `context`, from any thread.
 	typedef bool (*PagesBlockFn)(void *context, const void *address, uint64_t length,
-	                             bool writable, uint64_t *offset, uint64_t *size);
+	                             bool writable, uint64_t *offset, uint64_t *size,
+	                             uint64_t *gpuAddress);
 	void setPagesBlockSource(PagesBlockFn acquire, void *context);
 
 	/// Whether a pages block source is set.
@@ -397,6 +403,8 @@ private:
 		uint32_t held;     // the times given whose release has not come
 		// The memory the bytes were when the block was given (rgfxPagesIdentity).
 		std::vector<uint64_t> identity;
+		// The GPU address the device gave the block's view (Block::gpuAddress).
+		uint64_t gpuAddress;
 	};
 	std::map<PagesRange, uint64_t> m_joinablePages;
 	std::map<uint64_t, JoinedPages> m_joinedPages;

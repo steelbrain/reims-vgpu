@@ -2,7 +2,7 @@
 //! (`HostBlocks`, the Vulkan platform's): the Shared pool's (`POOL_ADDRESSES`,
 //! docs/graphics-kext/design.md, "The Shared pool"), the Private blocks
 //! (`PRIVATE_BLOCKS`, "Private blocks") and the pages blocks' views (`IMPORT_ADDRESSES`,
-//! "No-copy buffers"). A guest that took the feature places its objects at the address its
+//! "Import addresses"). A guest that took the feature places its objects at the address its
 //! take's answer names, and the platform pins them there, as it pins every address the guest
 //! picks.
 //!

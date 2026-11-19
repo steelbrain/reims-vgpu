@@ -1047,9 +1047,10 @@ struct PagesKext {
 		return true;
 	}
 	static bool pagesBlock(void *context, const void *address, uint64_t length, bool writable,
-	                       uint64_t *offset, uint64_t *size)
+	                       uint64_t *offset, uint64_t *size, uint64_t *gpuAddress)
 	{
 		PagesKext *k = static_cast<PagesKext *>(context);
+		*gpuAddress = 0;
 		k->lastAddress = address;
 		k->lastLength = length;
 		k->lastWritable = writable;

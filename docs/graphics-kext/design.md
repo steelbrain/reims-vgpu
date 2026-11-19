@@ -5002,6 +5002,49 @@ its command buffer's completion, not as it runs, and memory mapped read-only is
 never written back, though the GPU's writes stay in the range for later command
 buffers to read, where Metal's are dropped.
 
+**Import addresses.** Where the guest took `IMPORT_ADDRESSES` (feature bit
+61), a no-copy buffer over a pages block lies at the GPU address the host
+gives the block's view, rather than at a pick in the context's range. Every
+host offers the bit, and both kexts take it (kext feature bit 1 << 18
+`ImportAddresses`); the bundle uses it where its kext sets that bit and the
+device took the feature.
+- **The answer.** Where the guest took the bit, the host answers a pages
+  block's `SURFACE_PAGES` with an `RgfxPagesAnswer`: the `COMPLETE`'s 24
+  bytes, then the GPU address of the block's view at byte 24 of 32, 0 where
+  it gives none. A kext that reads 24 bytes reads the answer as before. The
+  kext returns the address as `PagesBlock`'s third output where the bundle
+  asks for three outputs, and 0 where the answer was not `OK` or carried
+  none. The blocks of the kext's own chunks (`PagesChunked`) are given none.
+- **Where buffers lie.** The bundle makes each `BUFFER_OVER_PAGES` over such
+  a block at the view's address plus the buffer's offset in the view (its
+  pointer's offset in its first page). It picks no address in the context's
+  range for it and gives none back at its destroy. A no-copy buffer over the
+  same bytes as a live one joins its block, and so lies at the same address.
+  A Managed no-copy buffer's CPU copy, the Shared buffer over the pages, lies
+  there; the Managed buffer's own address is its GPU copy's, as before. Where
+  the address is 0, the bundle picks one in the context's range, as a guest
+  that did not take the bit does. Slabs over the process's own pages keep
+  their picks.
+- **Its address.** On metal2vulkan-rt's device the address is the Vulkan
+  device address of the import of the block's pages. On the Vulkan platform
+  before it, the host picks it in `[2^43, 2^44)`, below the Private blocks'
+  range, where the platform places none of its own ranges: next fit, as it
+  picks the pool's (`crates/reims-vgpu/src/pool/addresses.rs`), at the
+  block's first answer that asks for one, and held until the block goes. The
+  first buffer made there is pinned there, as a buffer at the guest's own
+  pick is, and the block keeps it until the block goes. A buffer over the
+  same bytes made after it is made where the platform places it, and the
+  guest's pointers to it reach the same pages through the first. A block of
+  memory the process maps read-only is given no address: each buffer over it
+  lies over a copy of its own.
+- **What the guest sees.** The `gpuAddress` of a no-copy Shared buffer over
+  writable memory the kext wires lies in `[2^43, 2^44)` on the Vulkan
+  platform, and at its pages' import on metal2vulkan-rt's, rather than in the
+  context's range in `[2^46, 2^47)`. Two no-copy buffers over the same bytes
+  answer the same `gpuAddress`, where each had a pick of its own before.
+  Buffers over read-only memory, over memory the bundle copies, and Managed
+  ones keep theirs.
+
 **A buffer's escaped identity.** The host reads a no-copy buffer's bytes in
 place: one over bytes in a block of the process's (`BUFFER_OVER_HOST_MEMORY`),
 or over pages the process maps, writable or read-only (`BUFFER_OVER_PAGES`),
@@ -6781,7 +6824,7 @@ Map 1:
 | 1 | `Consumed` | 1 << 3 `ConsumedDoorbell` | reserved: a completion ring's room doorbell (`CONSUMED`) |
 | 2 | | | given to none: the IOGPU base's device-info call on its own client type, so a trace names one call per number |
 | 3 | `Features` | | the device's feature word, the kext's and the selector map; at 3 in every map |
-| 4 | `PagesBlock` | 1 << 0 `PagesBlock` | a block of the runs of a process's own pages, wired, for its no-copy buffers |
+| 4 | `PagesBlock` | 1 << 0 `PagesBlock`, 1 << 18 `ImportAddresses` (its third output, the GPU address the device gave the block's view, 0 for none) | a block of the runs of a process's own pages, wired, for its no-copy buffers; two outputs, or three with its view's GPU address ("Import addresses") |
 | 5 | `SubmitBatch` | 1 << 1 `SubmitBatch`, 1 << 11 `QueuePublish` (three inputs and a second output: a queue's publish after them) | a process's destroys, and its creates and writes no one waits for that name no block, onto ring 0 in one call ("Destroys and creates no one waits for go together"), and with three inputs a command buffer's publish on its queue's ring after them ("A commit behind held messages is one call") |
 | 6 | `WakeCompletions` | 1 << 2 `WakeCompletions` | reserved: wakes the client's completion waiters |
 | 7 | `TakeAnswers` | 1 << 4 `DeferredAnswers` | hands a process its held pipeline-create answers ("Known pipeline creates") |
@@ -6814,7 +6857,7 @@ the accelerator, which the bundle opens for each event it hands out: 10 and 11
 are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish`, 1 << 12 `DoorbellPage`, 1 << 13 `CpuPats`, 1 << 14 `ZeroedBlocks`, 1 << 15 `Pool`, 1 << 16 `PoolAddresses` and 1 << 17 `PrivateBlocks`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed, `CpuPats` only on x86-64, and `Pool` and `PoolAddresses` only on x86-64 where the device has a pool; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish`, 1 << 12 `DoorbellPage`, 1 << 13 `CpuPats`, 1 << 14 `ZeroedBlocks`, 1 << 15 `Pool`, 1 << 16 `PoolAddresses`, 1 << 17 `PrivateBlocks` and 1 << 18 `ImportAddresses`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed, `CpuPats` only on x86-64, and `Pool` and `PoolAddresses` only on x86-64 where the device has a pool; no other bit yet.
 
 The arm64e kext takes no `POOL` of the device's offer, which offers an arm64
 guest none until a boot shows its kernel maps a range past its RAM, above

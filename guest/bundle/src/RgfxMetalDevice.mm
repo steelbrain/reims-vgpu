@@ -561,23 +561,41 @@ RgfxRegion::PagesAnswer rgfxKextSurfacePagesCarrying(void *context, const void *
 	                                   cached);
 }
 
-// The region's pages block source (RgfxRegion::setPagesBlockSource): the kext's pages block of
-// the process's own memory (kRgfxAccelMethodPagesBlock), false where it makes none, for any
-// reason, and the memory then takes a shadow.
-bool rgfxKextPagesBlock(void *context, const void *address, uint64_t length, bool writable,
-                        uint64_t *offset, uint64_t *size)
+// The kext's pages block of the process's own memory (kRgfxAccelMethodPagesBlock), asked for
+// `outputs` outputs: 3 for the GPU address the device gave the block's view too, else 2.
+static bool rgfxKextPagesBlockOf(void *context, const void *address, uint64_t length,
+                                 bool writable, uint64_t *offset, uint64_t *size,
+                                 uint64_t *gpuAddress, uint32_t outputs)
 {
 	io_connect_t conn = rgfxKextConn(context);
 	uint64_t in[3] = {reinterpret_cast<uintptr_t>(address), length, writable ? 1u : 0u};
-	uint64_t out[2] = {};
-	uint32_t outCount = 2;
+	uint64_t out[3] = {};
+	uint32_t outCount = outputs;
 	kern_return_t kr =
 	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodPagesBlock, in, 3, out, &outCount);
-	if (kr != KERN_SUCCESS || outCount != 2)
+	if (kr != KERN_SUCCESS || outCount != outputs)
 		return false;
 	*offset = out[0];
 	*size = out[1];
+	*gpuAddress = outputs == 3 ? out[2] : 0;
 	return true;
+}
+
+// The region's pages block source (RgfxRegion::setPagesBlockSource): the kext's pages block of
+// the process's own memory (kRgfxAccelMethodPagesBlock), false where it makes none, for any
+// reason, and the memory then takes a shadow. No GPU address.
+bool rgfxKextPagesBlock(void *context, const void *address, uint64_t length, bool writable,
+                        uint64_t *offset, uint64_t *size, uint64_t *gpuAddress)
+{
+	return rgfxKextPagesBlockOf(context, address, length, writable, offset, size, gpuAddress, 2);
+}
+
+// rgfxKextPagesBlock, with the GPU address the device gave the block's view, where the kext and
+// the device took IMPORT_ADDRESSES (kRgfxKextFeatureImportAddresses).
+bool rgfxKextPagesBlockAt(void *context, const void *address, uint64_t length, bool writable,
+                          uint64_t *offset, uint64_t *size, uint64_t *gpuAddress)
+{
+	return rgfxKextPagesBlockOf(context, address, length, writable, offset, size, gpuAddress, 3);
 }
 
 // The region's chunked pages source (RgfxRegion::setChunkedPagesSource): the kext's chunks and
@@ -1148,7 +1166,13 @@ RGFX_LOG_UNRECOGNIZED
 		// Whole 16 KiB pages where the kext took PAGES_16K, as it rounds the blocks' ranges then.
 		_region->setPagesPage((_caps.features() & RGFX_FEATURE_PAGES_16K) != 0 ? 0x4000 : 0x1000);
 #endif
-		_region->setPagesBlockSource(&rgfxKextPagesBlock, connContext);
+		// With the GPU address the host gave each block's view, where both took the feature
+		// (RgfxBuffer's bufferOverPagesOf places its buffers there).
+		const bool addressed =
+		    (_caps.kextFeatures() & kRgfxKextFeatureImportAddresses) != 0 &&
+		    (_caps.features() & RGFX_FEATURE_IMPORT_ADDRESSES) != 0;
+		_region->setPagesBlockSource(addressed ? &rgfxKextPagesBlockAt : &rgfxKextPagesBlock,
+		                             connContext);
 		// Slabs of the kext's chunks first, where it makes them.
 		if ((_caps.kextFeatures() & kRgfxKextFeaturePagesChunked) != 0)
 			_region->setChunkedPagesSource(&rgfxKextPagesChunked, connContext);

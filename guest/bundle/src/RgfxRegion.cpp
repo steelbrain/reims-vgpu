@@ -260,6 +260,7 @@ RgfxRegion::Block RgfxRegion::acquirePages(const void *address, uint64_t length,
 				out.offset = it->second;
 				out.size = joined.size;
 				out.ok = true;
+				out.gpuAddress = joined.gpuAddress;
 				return out;
 			}
 			// Other memory at the bytes now: the block is joinable no longer, and stays held
@@ -280,8 +281,9 @@ RgfxRegion::Block RgfxRegion::acquirePages(const void *address, uint64_t length,
 			m_rejoinsRefused++;
 		}
 	}
-	uint64_t offset = 0, size = 0;
-	if (!m_pagesBlock(m_pagesBlockContext, address, length, writable, &offset, &size))
+	uint64_t offset = 0, size = 0, gpuAddress = 0;
+	if (!m_pagesBlock(m_pagesBlockContext, address, length, writable, &offset, &size,
+	                  &gpuAddress))
 		return out; // ok == false
 	if (offset < m_floor || offset > m_size || size > m_size - offset) {
 		release(offset);
@@ -294,11 +296,13 @@ RgfxRegion::Block RgfxRegion::acquirePages(const void *address, uint64_t length,
 	if (join != kPagesOwn && rgfxPagesIdentity(address, length, &identity)) {
 		std::lock_guard<std::mutex> guard(m_pagesLock);
 		if (m_joinablePages.emplace(range, offset).second)
-			m_joinedPages[offset] = JoinedPages{range, size, 1, 1, std::move(identity)};
+			m_joinedPages[offset] =
+			    JoinedPages{range, size, 1, 1, std::move(identity), gpuAddress};
 	}
 	out.offset = offset;
 	out.size = size;
 	out.ok = true;
+	out.gpuAddress = gpuAddress;
 	return out;
 }
 

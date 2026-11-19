@@ -14791,12 +14791,13 @@ void test_no_copy_buffers_in_place()
 		uint64_t size = 0x1000;
 		bool gives = true;
 		static bool block(void *c, const void *address, uint64_t length, bool writable,
-		                  uint64_t *offset, uint64_t *size)
+		                  uint64_t *offset, uint64_t *size, uint64_t *gpuAddress)
 		{
 			Pages *p = static_cast<Pages *>(c);
 			p->asked.emplace_back(address, length, writable);
 			*offset = p->offset;
 			*size = p->size;
+			*gpuAddress = 0;
 			return p->gives;
 		}
 	} pages;
@@ -15084,12 +15085,14 @@ void test_no_copy_buffers_over_the_same_bytes_share_a_block()
 	struct Pages {
 		int asked = 0;
 		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x100000;
-		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size)
+		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size,
+		                  uint64_t *gpuAddress)
 		{
 			Pages *p = static_cast<Pages *>(c);
 			p->asked++;
 			*offset = p->next;
 			*size = 0x5000;
+			*gpuAddress = 0;
 			p->next += 0x10000;
 			return true;
 		}
@@ -15173,6 +15176,89 @@ void test_no_copy_buffers_over_the_same_bytes_share_a_block()
 	CHECK(!RgfxMemoryShadow::anyLive());
 }
 
+// A no-copy buffer over a pages block whose view the device gave a GPU address
+// (RGFX_FEATURE_IMPORT_ADDRESSES, RgfxRegion::Block::gpuAddress) lies there plus its pointer's
+// offset in the page, with no pick of the process's: a Shared one, and a Managed one's CPU copy,
+// the Shared buffer over the pages, while the Managed buffer itself keeps a pick of its own.
+// Buffers over the same bytes join the block and so share its address; a block given no address
+// takes a pick, as before.
+void test_no_copy_buffers_lie_at_the_host_s_address()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	(void)expectQueueCreate(f.control);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0xff);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	RgfxRegionSlabSource slabSource(region, f.ser, false, true);
+	RgfxSlabs slabs(slabSource);
+	struct Pages {
+		int asked = 0;
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x100000;
+		// The address the device gives the next block's view; 0 for none.
+		uint64_t view = 1ull << 43;
+		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size,
+		                  uint64_t *gpuAddress)
+		{
+			Pages *p = static_cast<Pages *>(c);
+			p->asked++;
+			*offset = p->next;
+			*size = 0x5000;
+			*gpuAddress = p->view;
+			p->next += 0x10000;
+			return true;
+		}
+	} pages;
+	region.setPagesBlockSource(&Pages::block, &pages);
+	vm_address_t app = 0;
+	CHECK(vm_allocate(mach_task_self(), &app, 0x10000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	uint8_t *p = reinterpret_cast<uint8_t *>(app) + 0x123;
+	std::memset(reinterpret_cast<uint8_t *>(app), 0x5a, 0x10000);
+	auto noCopy = [&](void *ptr, NSUInteger length, MTLResourceOptions options) {
+		return [RgfxBuffer bufferWithBytesNoCopy:ptr
+		                                  length:length
+		                                 options:options
+		                             deallocator:nil
+		                                  region:&region
+		                                   slabs:&slabs
+		                                  device:nil
+		                              serializer:&f.ser];
+	};
+	const uint64_t view = pages.view;
+	@autoreleasepool {
+		RgfxBuffer *shared = noCopy(p, 0x3000, MTLResourceStorageModeShared);
+		CHECK(shared != nil && [shared contents] == p && pages.asked == 1);
+		auto one = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(one.obj_id == shared.rgfxObjId && one.offset == 0x123);
+		CHECK(one.gpu_address == view + 0x123 && shared.gpuAddress == view + 0x123);
+		RgfxBuffer *again = noCopy(p, 0x3000, MTLResourceStorageModeShared);
+		auto two = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(again != nil && pages.asked == 1 && two.block_offset == one.block_offset);
+		CHECK(two.obj_id == again.rgfxObjId && again.gpuAddress == shared.gpuAddress &&
+		      two.gpu_address == one.gpu_address);
+		RgfxBuffer *managed = noCopy(p, 0x3000, MTLResourceStorageModeManaged);
+		auto three = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		auto over =
+		    expectMessage<RgfxManagedBufferCreateWhole>(f.control, RGFX_CMD_MANAGED_BUFFER_CREATE)
+		        .create;
+		CHECK(managed != nil && pages.asked == 1 && over.cpu_buffer_obj_id == three.obj_id);
+		CHECK(three.gpu_address == view + 0x123);
+		CHECK(over.gpu_address == managed.gpuAddress && managed.gpuAddress >= RGFX_CONTEXT_VA_BASE);
+		// Other bytes, in a block given no address: a pick of the process's.
+		pages.view = 0;
+		RgfxBuffer *picked = noCopy(p, 0x2000, MTLResourceStorageModeShared);
+		auto four = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(picked != nil && pages.asked == 2 && four.block_offset != one.block_offset);
+		CHECK(picked.gpuAddress >= RGFX_CONTEXT_VA_BASE && four.gpu_address == picked.gpuAddress &&
+		      picked.gpuAddress % 0x1000 == 0x123);
+	}
+	CHECK(eventually([&] { return blocks.released.size() == 2; }));
+	drainRing(f.control);
+	vm_deallocate(mach_task_self(), app, 0x10000);
+	}
+	CHECK(!RgfxMemoryShadow::anyLive());
+}
 
 // The references the VM object under `address` has, mapping and memory entries alike
 // (vm_region_recurse_64's ref_count), or 0 where nothing is mapped there.
@@ -15226,9 +15312,10 @@ void test_no_copy_buffer_over_remapped_memory_takes_its_own_block()
 		std::mutex lock;
 		std::map<uint64_t, mach_port_t> held; // each live pages block's memory entry
 		static bool block(void *c, const void *address, uint64_t length, bool writable,
-		                  uint64_t *offset, uint64_t *size)
+		                  uint64_t *offset, uint64_t *size, uint64_t *gpuAddress)
 		{
 			Pages *p = static_cast<Pages *>(c);
+			*gpuAddress = 0;
 			const vm_address_t at = reinterpret_cast<vm_address_t>(address);
 			const vm_address_t base = trunc_page(at);
 			memory_object_size_t bytes = round_page(at + length) - base;
@@ -15355,9 +15442,10 @@ void test_no_copy_buffer_escape_notes()
 	struct Pages {
 		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x100000;
 		static bool block(void *c, const void *address, uint64_t length, bool, uint64_t *offset,
-		                  uint64_t *size)
+		                  uint64_t *size, uint64_t *gpuAddress)
 		{
 			Pages *p = static_cast<Pages *>(c);
+			*gpuAddress = 0;
 			const uint64_t start = reinterpret_cast<uintptr_t>(address) & 0xfff;
 			*offset = p->next;
 			*size = (start + length + 0xfff) & ~uint64_t{0xfff};
@@ -15570,8 +15658,9 @@ void test_slab_buffers_over_pages_escape_notes()
 		}
 		static void unmap(void *c, uint8_t *bytes, uint64_t) { static_cast<Vm *>(c)->held.erase(bytes); }
 		static bool block(void *c, const void *, uint64_t, bool writable, uint64_t *offset,
-		                  uint64_t *size)
+		                  uint64_t *size, uint64_t *gpuAddress)
 		{
+			*gpuAddress = 0;
 			if (!writable)
 				return false;
 			*size = 0x1000;
@@ -15675,8 +15764,9 @@ void test_no_copy_shadows_lie_in_slabs()
 		}
 		static void unmap(void *c, uint8_t *bytes, uint64_t) { static_cast<Vm *>(c)->held.erase(bytes); }
 		static bool block(void *c, const void *address, uint64_t, bool writable, uint64_t *offset,
-		                  uint64_t *size)
+		                  uint64_t *size, uint64_t *gpuAddress)
 		{
+			*gpuAddress = 0;
 			// No block of read-only memory, as a kext on a host without READ_ONLY_PAGES.
 			if (!writable)
 				return false;
@@ -21970,6 +22060,7 @@ int main(int argc, char **argv)
 		test_no_copy_buffers();
 		test_no_copy_buffers_in_place();
 		test_no_copy_buffers_over_the_same_bytes_share_a_block();
+		test_no_copy_buffers_lie_at_the_host_s_address();
 		test_no_copy_buffer_over_remapped_memory_takes_its_own_block();
 		test_no_copy_buffer_escape_notes();
 		test_slab_buffers_over_pages_escape_notes();

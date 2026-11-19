@@ -978,6 +978,36 @@ void test_host_resource_options()
 	CHECK(expectMessage<RgfxHeapCreate>(ring, RGFX_CMD_HEAP_CREATE).options == 0x1000020);
 }
 
+// A buffer over a pages block at the address the host gave the block's view
+// (createBufferOverPagesAt, RGFX_FEATURE_IMPORT_ADDRESSES) picks no address: its message names
+// that address plus the pointer's offset, and the answer the address, which no pick of the
+// process's lands on; an address of 0, or a buffer whose end would wrap, is no object.
+void test_buffer_over_pages_at_the_host_s_address()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	const uint64_t view = 1ull << 43;
+	RgfxCreated at = ser.createBufferOverPagesAt(0x3000, 0, 0x60000, 0x1000, 0x123, view);
+	CHECK(at.posted && at.obj_id != 0 && at.gpu_address == view);
+	const RgfxBufferOverPages m =
+	    expectMessage<RgfxBufferOverPages>(ring, RGFX_CMD_BUFFER_OVER_PAGES);
+	CHECK(m.obj_id == at.obj_id && m.gpu_address == view + 0x123 && m.offset == 0x123 &&
+	      m.length == 0x3000 && m.block_offset == 0x60000 && m.block_size == 0x1000);
+	// A pick of the process's lies in its own range, not at the host's address.
+	RgfxCreated picked = ser.createBufferOverPages(0x3000, 0, 0x60000, 0x1000, 0x123);
+	CHECK(picked.posted && picked.gpu_address != 0 && picked.gpu_address != view);
+	CHECK(expectMessage<RgfxBufferOverPages>(ring, RGFX_CMD_BUFFER_OVER_PAGES).gpu_address ==
+	      picked.gpu_address + 0x123);
+	RgfxCreated none = ser.createBufferOverPagesAt(0x3000, 0, 0x60000, 0x1000, 0x123, 0);
+	RgfxCreated wraps =
+	    ser.createBufferOverPagesAt(0x3000, 0, 0x60000, 0x1000, 0x123, UINT64_MAX - 0x2000);
+	CHECK(none.obj_id == 0 && !none.posted && wraps.obj_id == 0 && !wraps.posted);
+}
+
 // A heap, buffer or device-placed texture (Managed or not) whose GPU address finds no room in the
 // context's range is no object: the create posts nothing and answers ids of 0, so the caller
 // answers nil, as Metal does for one it cannot place, and a texture's resource id goes back; a
@@ -4247,7 +4277,7 @@ void test_region_pages_blocks()
 		uint64_t offset = 0;
 		std::vector<uint64_t> released;
 		static bool block(void *c, const void *address, uint64_t length, bool writable,
-		                  uint64_t *offset, uint64_t *size)
+		                  uint64_t *offset, uint64_t *size, uint64_t *gpuAddress)
 		{
 			Source *s = static_cast<Source *>(c);
 			s->address = address;
@@ -4255,6 +4285,7 @@ void test_region_pages_blocks()
 			s->writable = writable;
 			*offset = s->offset;
 			*size = 0x1000;
+			*gpuAddress = 0;
 			return true;
 		}
 		static bool alloc(void *, uint64_t, uint64_t, uint64_t *) { return false; }
@@ -4268,7 +4299,8 @@ void test_region_pages_blocks()
 	CHECK(region.hasPagesBlocks());
 	src.offset = RGFX_ALLOCATIONS_OFFSET + 0x4000;
 	RgfxRegion::Block b = region.acquirePages(&marker, 0x4000, true);
-	CHECK(b.ok && b.offset == src.offset && b.size == 0x1000 && b.ptr == nullptr);
+	CHECK(b.ok && b.offset == src.offset && b.size == 0x1000 && b.ptr == nullptr &&
+	      b.gpuAddress == 0);
 	CHECK(src.address == &marker && src.length == 0x4000 && src.writable);
 	CHECK(src.released.empty());
 	src.offset = mem.size() - 0x800;
@@ -4290,12 +4322,15 @@ void test_region_pages_joins()
 		int asked = 0;
 		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x10000;
 		std::vector<uint64_t> released;
-		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size)
+		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size,
+		                  uint64_t *gpuAddress)
 		{
 			Source *s = static_cast<Source *>(c);
 			s->asked++;
 			*offset = s->next;
 			*size = 0x4000;
+			// The device's address of each block's view, as IMPORT_ADDRESSES gives one.
+			*gpuAddress = (1ull << 43) + (s->next << 4);
 			s->next += 0x4000;
 			return true;
 		}
@@ -4316,6 +4351,8 @@ void test_region_pages_joins()
 	RgfxRegion::Block b = region.acquirePages(bytes, 0x4000, true, join);
 	CHECK(a.ok && b.ok && a.offset == b.offset && a.size == b.size && b.ptr == nullptr);
 	CHECK(src.asked == 1);
+	// The address the device gave the block's view, which the join shares.
+	CHECK(a.gpuAddress != 0 && b.gpuAddress == a.gpuAddress);
 	// Each of these takes a block of its own.
 	const RgfxRegion::Block others[] = {
 	    region.acquirePages(bytes, 0x3000, true, join),
@@ -4329,6 +4366,8 @@ void test_region_pages_joins()
 	for (const RgfxRegion::Block &o : others)
 		CHECK(o.ok && o.offset != a.offset);
 	CHECK(others[4].offset != others[5].offset);
+	for (const RgfxRegion::Block &o : others)
+		CHECK(o.gpuAddress != 0 && o.gpuAddress != a.gpuAddress);
 
 	// The first holder's release before its leave: held still, and joinable.
 	region.release(a.offset);
@@ -4371,12 +4410,14 @@ void test_region_pages_join_over_remapped_memory()
 		int asked = 0;
 		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x10000;
 		std::vector<uint64_t> released;
-		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size)
+		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size,
+		                  uint64_t *gpuAddress)
 		{
 			Source *s = static_cast<Source *>(c);
 			s->asked++;
 			*offset = s->next;
 			*size = 0x4000;
+			*gpuAddress = 0;
 			s->next += 0x4000;
 			return true;
 		}
@@ -4565,6 +4606,7 @@ int main()
 	test_family_names();
 	test_vendor_names();
 	test_host_resource_options();
+	test_buffer_over_pages_at_the_host_s_address();
 	test_caps_features();
 	test_feature_profile_for_guest();
 	test_archive_file();
