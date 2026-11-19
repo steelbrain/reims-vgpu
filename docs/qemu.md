@@ -375,6 +375,27 @@ is its transport:
   `reims_graphics_prefault_*` traces give each piece's slices, cuts, wall
   and thread CPU time, each pause's wait, and the thread's totals at the
   device's teardown.
+- Measured 11-18 under KVM with the walk harness on um870's 3090 (the pool
+  mapped at 2 MiB) and um790's 780M (at 4 KiB), with the populate
+  (m3-max-49953, 49954, 49970, 49971) and without it (49663, 49683, 49701,
+  49962, 50036): the populate fills a 256 MiB piece in 22-31 ms of its
+  thread's wall time, 85-119 us of CPU a MiB, and the guest takes no fault
+  on a populated piece. The pool's pieces change only when it grows: the
+  harness's grow step adds 8, and the library gives 7 back about 5 s later.
+  A removal holds the BQL 0.62-0.69 ms at the median and at most 0.76 ms,
+  against 0.80-1.38 ms and at most 1.1-4.2 ms without the populate, and
+  3.9-5.4 ms and at most 4.5-8.4 ms with its slot delete under the BQL
+  (m3-max-49792, 49793, 49857); the delete takes 3.7-5.1 ms at the median,
+  at most 10.3 ms, on the library's thread. An add holds it 0.65-0.84 ms at
+  the median, against 0.48-0.80 ms without the populate. 3 of 72 adds with
+  the populate held it 3.0, 4.1 and 9.3 ms, where none of 40 without it
+  passed 1.9 ms, each the wait of one slot create (the SMM space's twice,
+  the first piece's address space 0 once): too few to tell from chance. The
+  boot, the desktop, a window's drag and a GPU benchmark took the same time
+  with and without the populate, within the walks' spread, and KVM's master
+  clock stayed on across a guest reboot. Under WHPX on the mini's UHD 630
+  (m3-max-50016), 256, 548 and 1024 MiB populated in 37, 86 and 151 ms, and
+  an add or a removal held the BQL 131-169 us.
 - **The guest's RAM**: on Linux the device gives the library the map of the
   RAM ranges that are a shared file in pages of the host's size (the memfd of
   `reims-ctl`'s VMs), with the files behind them, and the GPU uses an
