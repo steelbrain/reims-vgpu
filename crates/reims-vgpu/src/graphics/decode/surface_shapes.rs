@@ -862,6 +862,66 @@ mod tests {
         assert!(downloaded.load(Ordering::SeqCst));
     }
 
+    /// A command buffer whose work is video alone reads and writes the buffer, not the shapes'
+    /// images: a dirty shape is copied into the buffer before it runs, and after it, where it may
+    /// write the cache, every shape owes a fill, which the next command buffer that names the
+    /// block makes, counted. A command buffer of other work that writes the cache unseen leaves
+    /// the shapes as they were, counted.
+    #[test]
+    fn a_video_buffer_has_shapes_written_back_before_it_and_filled_after() {
+        use super::super::surface_cache::Reach;
+        let mut r = shaped();
+        let cache = cache_id(&r);
+        let image = texture_image(&mut r, 21, 80, (32, 8));
+        write(&mut r, 0x100, 21, (32, 8));
+        r.p.world().complete_all(CompleteOn::Caller);
+        let writes = [RgfxOpSurfaceUse {
+            flags: RGFX_SURFACE_USE_WRITES,
+            ..reading(BLOCK, 0)[0]
+        }];
+        let queue = r.device.new_command_queue().unwrap();
+        let run = |r: &mut Rig, reach: &Reach| {
+            let cb = queue.command_buffer(ON).unwrap().unwrap();
+            let mark = r.p.call_log().mark();
+            let (_, uses) = (r.dec.surface_caches)
+                .before(&r.device, &cb, &writes, reach)
+                .unwrap();
+            let calls = r.p.call_log().since(mark);
+            (r.dec.surface_caches)
+                .finish(&r.device, 1, None, &cb, uses.unwrap(), || cb.commit(ON))
+                .unwrap();
+            r.p.world().complete_all(CompleteOn::Caller);
+            calls
+        };
+        let video = Reach {
+            video: true,
+            ..Reach::default()
+        };
+        let calls = run(&mut r, &video);
+        assert_eq!(written_back(&calls), [(image, cache, 0)], "before it");
+        assert!(fills(&calls).is_empty());
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.video_owed, counts.unseen), (1, 0));
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, false)]);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(fills(&calls), [(cache, 0, image)], "the picture into the shape");
+        assert!(written_back(&calls).is_empty());
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let work = Reach {
+            work: true,
+            ..video
+        };
+        let calls = run(&mut r, &work);
+        assert!(written_back(&calls).is_empty() && fills(&calls).is_empty());
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.video_owed, counts.unseen), (1, 1));
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x102, &[(BLOCK, 0, false)]);
+        assert!(fills(&r.p.call_log().since(mark)).is_empty(), "nothing owed");
+    }
+
     /// Library 30 and compute pipeline `obj_id` of a function in it.
     fn compute_pipeline(r: &mut Rig, obj_id: u64) {
         use reims_vgpu_graphics::wire::{

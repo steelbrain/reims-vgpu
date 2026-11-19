@@ -1851,6 +1851,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let reach = Reach {
             context: self.context,
             work: take.work,
+            video: take.video,
             decoded: match take.work {
                 true => Vec::new(),
                 false => self.decoded_whole(&take.decodes),

@@ -42,14 +42,23 @@
 //! with it may write (its access in the function's interface write or read-write, not read or
 //! sample), and, outside a blit encoder, a texture whose usage lets a shader write it where no
 //! interface is at hand (a pipeline that answers none, a use through an argument buffer),
-//! counted ([`ShapeCounts::usage_writes`]). It holds each, so the bound keeps it, until the buffer's finish marks it dirty; where
-//! the buffer was counted behind a deferred copy of the cache, once that copy is made, as the
-//! buffer's write follows it (`SurfaceCaches::shapes_written`). Every copy of the buffer into the
-//! pages (a download, a release, a block named again, an early copy) copies the dirty shapes into
-//! the buffer first, in its own command buffer, after the same command buffers; they are clean
-//! once it is committed ([`write_back`], [`ShapeTable::written_back`]). A write the walk does not
-//! see (through an argument buffer with no use named, or a video op's) is no shape's: counted
-//! ([`ShapeCounts::unseen`]), and no shape is marked for it.
+//! counted ([`ShapeCounts::usage_writes`]). It holds each, so the bound keeps it, until the
+//! buffer's finish marks it dirty; where the buffer was counted behind a deferred copy of the
+//! cache, once that copy is made, as the buffer's write follows it
+//! (`SurfaceCaches::shapes_written`). Every copy of the buffer into the pages (a download, a
+//! release, a block named again, an early copy) copies the dirty shapes into the buffer first, in
+//! its own command buffer, after the same command buffers; they are clean once it is committed
+//! ([`write_back`], [`ShapeTable::written_back`]). A write the walk does not see through an
+//! argument buffer with no use named is no shape's: counted ([`ShapeCounts::unseen`]), and no
+//! shape is marked for it.
+//!
+//! **Video.** A command buffer whose work is video alone reads and writes the buffer, where its
+//! decodes land their pictures and its encodes read their sources, not the shapes' images: the
+//! dirty shapes are copied into the buffer before it runs, by a fill of the shapes
+//! (`SurfaceCaches::before_one`), and where it may write the cache every shape owes a fill from
+//! the buffer after it, its own write lost, as the decode writes its planes whole
+//! ([`ShapeTable::owe_all`], counted [`ShapeCounts::video_owed`]). A command buffer of video and
+//! other work writes the buffer unseen.
 //!
 //! **Fills.** A new shape owes its fill from the buffer. The first use of the surface, or present
 //! of it, that finds a shape owing one makes a fill of the shapes alone on the transfer queue,
@@ -255,8 +264,8 @@ pub(crate) struct ShapeCounts {
     pub(crate) written_back: u64,
     pub(crate) written_back_bytes: u64,
     /// Command buffers' uses that may write a cache with shapes and wrote none of them that the
-    /// walk saw (through an argument buffer with no use named, or a video op): the write is not
-    /// known to be any shape's, and no shape is marked dirty for it.
+    /// walk saw (through an argument buffer with no use named, or a video op beside other work):
+    /// the write is not known to be any shape's, and no shape is marked dirty for it.
     pub(crate) unseen: u64,
     /// Caches made past the caches' budget, which the per-shape form keeps all the same.
     pub(crate) past_budget: u64,
@@ -282,6 +291,9 @@ pub(crate) struct ShapeCounts {
     /// pipeline bound with them may write, so taken as read (`GraphicsDecoder`'s
     /// `note_slot_shape`).
     pub(crate) slot_reads: u64,
+    /// Shapes owed a fill after a video command buffer wrote their cache's buffer
+    /// ([`ShapeTable::owe_all`]).
+    pub(crate) video_owed: u64,
 }
 
 /// One shape's image and its state.
@@ -406,6 +418,18 @@ impl<T> ShapeTable<T> {
     pub(crate) fn mark_dirty(&mut self, id: u64) -> bool {
         let shape = self.shapes.iter_mut().find(|s| s.id() == id);
         shape.map(|s| s.dirty = true).is_some()
+    }
+
+    /// A video command buffer wrote the buffer, its decodes' pictures, not the images: every
+    /// shape owes a fill from it, its own write before the buffer's lost (the decode writes its
+    /// planes whole, and a write it does not cover was copied into the buffer before it ran);
+    /// counted in `counts`.
+    pub(crate) fn owe_all(&mut self, counts: &mut ShapeCounts) {
+        for shape in &mut self.shapes {
+            shape.owed = true;
+            shape.dirty = false;
+            counts.video_owed += 1;
+        }
     }
 
     /// The shapes `ids` were copied into the buffer ([`write_back`]), by a command buffer now

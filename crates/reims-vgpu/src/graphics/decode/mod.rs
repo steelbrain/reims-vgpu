@@ -1662,16 +1662,17 @@ impl<P: Platform> GraphicsDecoder<P> {
                      in {} fills of the shapes alone ({} behind command buffers); {} written \
                      back ({} MiB), {} kept dirty past the bound; {} took another shape's write \
                      ({} MiB), {} texels in part, {} dropped at one; {} encoders wrote two \
-                     shapes of a plane; {} writes no shape's; {} unreferenced dropped ({} MiB); \
-                     {} binds written as their usage says, {} read as their slots say; {} \
-                     textures over the buffer instead ({} images and {} views refused); {} \
-                     caches kept past the budget; {} blocks refused uncached",
+                     shapes of a plane; {} writes no shape's; {} owed a fill after a video \
+                     write; {} unreferenced dropped ({} MiB); {} binds written as their usage \
+                     says, {} read as their slots say; {} textures over the buffer instead ({} \
+                     images and {} views refused); {} caches kept past the budget; {} blocks \
+                     refused uncached",
                     sh.made, sh.made_bytes >> 20, sh.found, sh.again, sh.fills,
                     sh.filled_bytes >> 20, sh.fills_made, sh.fills_deferred, sh.written_back,
                     sh.written_back_bytes >> 20, sh.kept_dirty, sh.overlap_copies,
                     sh.overlap_bytes >> 20, sh.straddled, sh.overlap_dropped, sh.unordered,
-                    sh.unseen, sh.dropped, sh.dropped_bytes >> 20, sh.usage_writes,
-                    sh.slot_reads, sh.unshaped,
+                    sh.unseen, sh.video_owed, sh.dropped, sh.dropped_bytes >> 20,
+                    sh.usage_writes, sh.slot_reads, sh.unshaped,
                     sh.images_refused, sh.views_refused, sh.past_budget, sh.uncached_refused
                 );
             }

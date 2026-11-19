@@ -1696,6 +1696,9 @@ struct Since {
     /// The shapes their walks saw written ([`SurfaceCaches::shapes_written`]), marked dirty once
     /// the copy is made.
     dirty: Vec<u64>,
+    /// A video command buffer among them wrote the buffer: every shape owes a fill from it once
+    /// the copy is made ([`SurfaceCaches::unseen_writes`]).
+    owed: bool,
 }
 
 /// What a use's [`RGFX_SURFACE_USE_REFILL`] asks of its block's cache
@@ -2639,6 +2642,14 @@ impl<P: Platform> SurfaceCaches<P> {
         }) || self.owes_shape_fill(block)
     }
 
+    /// Whether a shape of the block at `block`'s cache holds a write the buffer lacks, or will
+    /// once the deferred copies asked of it are made ([`Self::dirty_since`]): a command buffer
+    /// whose work is video alone has them copied into the buffer first ([`Self::fill_shapes`]).
+    fn writes_back_first(&self, block: u64) -> bool {
+        (self.by_block.get(&block)).is_some_and(|cache| cache.shapes.iter().any(|s| s.dirty))
+            || !self.dirty_since(block).is_empty()
+    }
+
     /// Whether a shape of the block at `block`'s cache owes a fill from the buffer that no fill
     /// asked and not made will make ([`shapes::Shape::owed`]): a fill of the cache refills every
     /// shape, and one of the shapes fills those that owe one as it is made.
@@ -2688,13 +2699,15 @@ impl<P: Platform> SurfaceCaches<P> {
     /// ([`Reach::decoded`]), the first fill the cache owes is taken as met instead, where it is of
     /// the use's generation or a newer one and no device of the host wrote the pages since the
     /// make ([`Self::take_decoded`]): the use reads nothing of the cache, which the picture
-    /// lands over.
+    /// lands over. Where the buffer's work is `video` alone, which reads and writes the buffer,
+    /// not the shapes' images, a shape's write the buffer lacks is copied into it first, as a
+    /// shape's fill copies it ([`Self::writes_back_first`]).
     fn before_one(
         &mut self,
         device: &P::Device,
         cb: &P::CommandBuffer,
         u: &RgfxOpSurfaceUse,
-        decoded: Option<&[PagesPlane; 2]>,
+        (decoded, video): (Option<&[PagesPlane; 2]>, bool),
     ) -> (Option<Count>, RaiseResult<(bool, Option<u64>)>) {
         let block = u.block_offset;
         if let Some(planes) = decoded {
@@ -2722,7 +2735,7 @@ impl<P: Platform> SurfaceCaches<P> {
             } else {
                 filled = self.fill(device, block, u.cpu_gen).map(|_| ());
             }
-        } else if self.owes_shape_fill(block) {
+        } else if self.owes_shape_fill(block) || (video && self.writes_back_first(block)) {
             if waits {
                 self.defer_shapes_fill(device, block);
             } else {
@@ -2803,17 +2816,32 @@ impl<P: Platform> SurfaceCaches<P> {
         Ok(self.fence.as_ref().map(|f| f.clone_ref()))
     }
 
-    /// The command buffer that ended with uses that may write the blocks `written` wrote them
-    /// in ways its walk did not see ([`Self::reconcile`]): through an argument buffer with no use
-    /// named, or by a video op. A block among them with a wide home has its home copied into
-    /// again by the next command buffer that uses it ([`Self::home_in`]).
-    pub(crate) fn unseen_writes(&mut self, written: &[u64]) {
+    /// The command buffer whose counts among the caches' users are `counts`, which ended with
+    /// uses that may write the blocks `written`, wrote them in ways its walk did not see
+    /// ([`Self::reconcile`]): through an argument buffer with no use named, or by a video op. A
+    /// block among them with a wide home has its home copied into again by the next command
+    /// buffer that uses it ([`Self::home_in`]). Where its work is `video` alone, its decodes wrote
+    /// the buffer, which the shapes' images lack: every shape of the block owes a fill from it,
+    /// made before what reads it next ([`Self::fill_shapes`]), from now or, where the buffer was
+    /// counted after a deferred copy of the cache was asked, once that copy is made ([`Since`]).
+    /// Else the write is no known shape's, counted ([`shapes::ShapeCounts::unseen`]).
+    pub(crate) fn unseen_writes(&mut self, counts: &[Count], written: &[u64], video: bool) {
         for block in written {
             if let Some(home) = (self.by_block.get_mut(block)).and_then(|c| c.wide.as_mut()) {
                 home.stale = true;
             }
-            if (self.by_block.get(block)).is_some_and(|c| c.shapes.iter().next().is_some()) {
+            if !(self.by_block.get(block)).is_some_and(|c| c.shapes.iter().next().is_some()) {
+                continue;
+            }
+            if !video {
                 self.counts.shapes.unseen += 1;
+                continue;
+            }
+            let number = counts.iter().find(|c| c.block == *block).map(|c| c.number);
+            if let Some(since) = number.and_then(|number| self.since_mut(*block, number)) {
+                since.owed = true;
+            } else if let Some(cache) = self.by_block.get_mut(block) {
+                cache.shapes.owe_all(&mut self.counts.shapes);
             }
         }
     }
@@ -3499,6 +3527,9 @@ impl<P: Platform> SurfaceCaches<P> {
             read_back.writes = read_back.writes.saturating_add(since.writes);
             for id in since.dirty {
                 cache.shapes.mark_dirty(id);
+            }
+            if since.owed {
+                cache.shapes.owe_all(&mut self.counts.shapes);
             }
         }
         if let Some((event, number)) = self.signal_with.take() {
@@ -4801,6 +4832,9 @@ pub(crate) struct Reach {
     /// It holds render, compute or blit work, which may reach a texture over a surface with no
     /// use named (through an argument buffer).
     pub(crate) work: bool,
+    /// It holds a video encoder, whose decodes write the caches' buffers and whose encodes read
+    /// them, not the images of a cache's shapes.
+    pub(crate) video: bool,
     /// Where its work is decodes alone: the blocks of the surfaces its decodes write whole, each
     /// with the two planes they write, its luma's and its chroma's, as laid out in the surface's
     /// bytes.
@@ -4823,6 +4857,9 @@ pub(crate) struct Uses<P: Platform> {
     /// The shapes its walk saw written, each by its block, held until its finish marks them
     /// dirty ([`SurfaceCaches::shapes_written`]): a shape held so stays past the bound.
     shapes: Vec<(u64, shapes::ShapeRef)>,
+    /// Its work is video alone ([`Reach::video`]): its uses' writes are its decodes', into the
+    /// caches' buffers ([`SurfaceCaches::unseen_writes`]).
+    video: bool,
 }
 
 impl<P: Platform> Uses<P> {
@@ -5379,6 +5416,7 @@ impl<P: Platform> Caches<P> {
             follows: Vec::new(),
             seen: Vec::new(),
             shapes: Vec::new(),
+            video: reach.video && !reach.work,
         };
         let mut waits = reached;
         let mut raised = None;
@@ -5386,7 +5424,8 @@ impl<P: Platform> Caches<P> {
             let decoded = (reach.decoded.iter())
                 .find(|(block, _)| *block == u.block_offset)
                 .map(|(_, planes)| planes);
-            let (count, follows) = state.before_one(device, cb, u, decoded);
+            let video = reach.video && !reach.work;
+            let (count, follows) = state.before_one(device, cb, u, (decoded, video));
             // Counted at once, so a later copy of the block follows this buffer.
             held.blocks.extend(count);
             match follows {
@@ -5496,7 +5535,7 @@ impl<P: Platform> Caches<P> {
                 .filter(|c| c.writes && !uses.seen.contains(&c.block))
                 .map(|c| c.block)
                 .collect();
-            state.unseen_writes(&unseen);
+            state.unseen_writes(&uses.blocks, &unseen, uses.video);
             state.shapes_written(&uses.blocks, &uses.shapes);
             state.after(device, queue, cb, &uses.blocks)
         };
@@ -6628,6 +6667,7 @@ pub(super) mod tests {
     pub(crate) const NO_REACH: Reach = Reach {
         context: None,
         work: false,
+        video: false,
         decoded: Vec::new(),
     };
 
