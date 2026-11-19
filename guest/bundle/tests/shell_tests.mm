@@ -21018,7 +21018,8 @@ void test_iosurface_in_place_core_image_set()
 // none names nothing, and nor does one using a surface not cached. The texture's own CPU access
 // takes the surface's lock, a write a read-write one, which a texture not cached does not. Where
 // the host took SURFACE_REFILL, a use after the unlock of a CPU's write lock held as an earlier
-// commit named the generation asks the host to fill the cache again.
+// commit named the generation asks the host to fill the cache again. On the arm64 device, a
+// surface committed to a residency set the buffer uses or its queue holds is named as one it uses.
 void test_iosurface_cached()
 {
 	// Never freed, as Fixture's: the queue and its buffers may go after the test.
@@ -21382,6 +21383,44 @@ void test_iosurface_cached()
 		otherUnlock();
 		CHECK(is(read(), block, 15, 0) && kext.asked == 12);
 		region.setSurfaceSeedsSource(nullptr, nullptr);
+
+#if RgfxMakesResidencySets
+		// Reached only through a residency set the buffer uses or its queue holds: named at the
+		// commit as a resource the buffer uses, not written, with the set's members as its last
+		// commit left them. An add not yet committed is not named; a member removed is, until
+		// the set's commit drops it. A buffer that also uses the surface itself names it once.
+		RgfxResidencySet *set = [[RgfxResidencySet alloc] initWithDevice:nil descriptor:nil];
+		auto throughSet = [&] {
+			id<MTLCommandBuffer> scb = [queue commandBuffer];
+			[scb useResidencySet:set];
+			[[scb computeCommandEncoder] endEncoding];
+			return uses(scb);
+		};
+		auto encodesNothing = [&] {
+			id<MTLCommandBuffer> ncb = [queue commandBuffer];
+			[[ncb computeCommandEncoder] endEncoding];
+			return uses(ncb);
+		};
+		[set addAllocation:buffer];
+		[set addAllocation:view];
+		CHECK(throughSet().empty());
+		[set commit];
+		CHECK(is(throughSet(), block, 15, 0));
+		CHECK(encodesNothing().empty());
+		[queue addResidencySet:set];
+		CHECK(is(encodesNothing(), block, 15, 0));
+		cb = [queue commandBuffer];
+		ce = [cb computeCommandEncoder];
+		[ce useResource:t usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+		[ce endEncoding];
+		CHECK(is(uses(cb), block, 15, RGFX_SURFACE_USE_WRITES));
+		[queue removeResidencySet:set];
+		CHECK(encodesNothing().empty());
+		[set removeAllocation:view];
+		CHECK(is(throughSet(), block, 15, 0));
+		[set commit];
+		CHECK(throughSet().empty());
+#endif
 	}
 	rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 	drainRing(control);

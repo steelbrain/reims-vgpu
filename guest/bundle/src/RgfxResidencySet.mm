@@ -45,6 +45,13 @@ id memoryOf(id allocation)
 	return heap != nil ? heap : memory;
 }
 
+// Whether `allocation` is a texture over an IOSurface or a view of one (the root each texture
+// records as it is made), which a command buffer using the set names at its commit (rgfxSurfaces).
+bool overSurface(id allocation)
+{
+	return RgfxIsResource(allocation) && ((RgfxResource *)allocation)->_rgfxSurfaceRoot != nil;
+}
+
 } // namespace
 
 @implementation RgfxResidencySet {
@@ -62,6 +69,9 @@ id memoryOf(id allocation)
 	NSCountedSet *_memory;
 	// The bytes of `_memory`'s objects: allocatedSize.
 	uint64_t _allocatedSize;
+	// The committed allocations over IOSurfaces (overSurface), in the order they were committed:
+	// rgfxSurfaces.
+	NSMutableOrderedSet *_surfaces;
 }
 
 - (instancetype)initWithDevice:(id<MTLDevice>)device descriptor:(MTLResidencySetDescriptor *)descriptor
@@ -74,6 +84,7 @@ id memoryOf(id allocation)
 		_added = [NSMutableOrderedSet orderedSet];
 		_removed = [NSMutableSet set];
 		_memory = [NSCountedSet set];
+		_surfaces = [NSMutableOrderedSet orderedSet];
 	}
 	return self;
 }
@@ -244,6 +255,8 @@ id memoryOf(id allocation)
 		[dropped addObject:allocation];
 	for (id allocation in dropped) {
 		[_committed removeObject:allocation];
+		if (overSurface(allocation))
+			[_surfaces removeObject:allocation];
 		id memory = memoryOf(allocation);
 		if (memory == nil)
 			continue;
@@ -254,6 +267,8 @@ id memoryOf(id allocation)
 	[_removed removeAllObjects];
 	for (id allocation in _added) {
 		[_committed addObject:allocation];
+		if (overSurface(allocation))
+			[_surfaces addObject:allocation];
 		id memory = memoryOf(allocation);
 		if (memory == nil)
 			continue;
@@ -263,6 +278,14 @@ id memoryOf(id allocation)
 	}
 	[_added removeAllObjects];
 	os_unfair_lock_unlock(&_lock);
+}
+
+- (NSArray *)rgfxSurfaces
+{
+	os_unfair_lock_lock(&_lock);
+	NSArray *surfaces = _surfaces.count != 0 ? [_surfaces.array copy] : nil;
+	os_unfair_lock_unlock(&_lock);
+	return surfaces;
 }
 
 @end

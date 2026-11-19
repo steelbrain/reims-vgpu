@@ -706,6 +706,9 @@ struct RgfxBarrierSlot {
 - (dispatch_group_t)rgfxCommittedGroup;
 /// Whether its command buffers profile from their start (setProfilingEnabled:, MTLCommandQueueSPI).
 - (BOOL)isProfilingEnabled;
+/// The residency sets it holds (addResidencySet:), once each, as they are now: nil where none,
+/// as on the x86 device, which makes none (RgfxMakesResidencySets).
+- (nullable NSArray *)rgfxResidencySets;
 @end
 
 @implementation RgfxCommandQueue {
@@ -1201,7 +1204,8 @@ struct RgfxBarrierSlot {
 // The arm64 device's queue holds the sets it is given, each as many times as it was added, and
 // lets one go once it is removed as many times, as Metal's queue counts them in an NSCountedSet
 // (measured: the M3 Max, macOS 27.0.1, tools/oracle/oracle_residency's queue, retain and hold
-// cases): the device keeps every allocation resident, so holding them is all a queue does. The
+// cases): the device keeps every allocation resident, so holding them is all a queue does, but
+// that each buffer committed to it names the IOSurfaces they hold (rgfxNoteResidentSurfaces). The
 // M3's queue lets a set go a moment after its last removal, on a thread of its own (held right
 // after it, gone 100 ms later, with no buffer made); this one lets it go at that removal, as no
 // correct use can depend on what a moment decides. A nil set
@@ -1255,6 +1259,17 @@ struct RgfxBarrierSlot {
 #else
 	if (count != 0)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
+}
+
+- (NSArray *)rgfxResidencySets
+{
+#if RgfxMakesResidencySets
+	@synchronized(self) {
+		return _residencySets.count != 0 ? _residencySets.allObjects : nil;
+	}
+#else
+	return nil;
 #endif
 }
 
@@ -2212,6 +2227,11 @@ enum RgfxStage : unsigned {
 	[_queue rgfxEnqueue:self];
 	_kernelStart.store(rgfxHostTime());
 	[self rgfxNoteStage:kRgfxStageCommit];
+#if RgfxMakesResidencySets
+	// The IOSurfaces its residency sets and its queue's hold are among those it uses, with the
+	// sets' members as their last commits left them.
+	[self rgfxNoteResidentSurfaces];
+#endif
 	// The IOSurface copies the CPU changed since they last synced take the surfaces'
 	// pages before the GPU reads them; the copies this buffer writes go back at its
 	// completion.
@@ -3276,7 +3296,8 @@ static NSError *rgfxInvalidInputError()
 // from the use until it completes, as Metal's buffer counts them in an NSCountedSet and lets
 // them go at its completion (measured: the M3 Max, macOS 27.0.1, tools/oracle/oracle_residency's
 // cb, retain and hold cases): the device keeps every allocation resident, so holding them is all
-// a buffer does. A nil set raises the counted set's NSInvalidArgumentException, as Metal's
+// a buffer does, but that it names at its commit the IOSurfaces they hold
+// (rgfxNoteResidentSurfaces). A nil set raises the counted set's NSInvalidArgumentException, as Metal's
 // buffer does, and a use after the commit is taken. The x86 device makes no set
 // (RgfxMakesResidencySets), and its buffer logs one it is given.
 - (void)useResidencySet:(id<MTLResidencySet>)residencySet
@@ -3307,6 +3328,32 @@ static NSError *rgfxInvalidInputError()
 		RGFX_UNSUPPORTED("residency sets");
 #endif
 }
+
+#if RgfxMakesResidencySets
+// At its commit: names each texture over an IOSurface, or view of one, committed to a residency
+// set it uses or its queue holds (RgfxResidencySet's rgfxSurfaces), as a resource it uses
+// (rgfxIOSurfaceNoteUse): a cached surface is named to the host, and a copy synced, where the GPU
+// may read it through the set with nothing it encodes naming it. As read only: a set says nothing
+// of how the GPU uses its members.
+- (void)rgfxNoteResidentSurfaces
+{
+	auto note = [enc = _encoder](NSArray *sets) {
+		for (id set in sets) {
+			if ([set isKindOfClass:[RgfxResidencySet class]]) {
+				for (id surface in [(RgfxResidencySet *)set rgfxSurfaces])
+					rgfxIOSurfaceNoteUse(enc, surface);
+			}
+		}
+	};
+	note([_queue rgfxResidencySets]);
+	NSArray *own = nil;
+	@synchronized(self) {
+		if (_residencySets.count != 0)
+			own = _residencySets.allObjects;
+	}
+	note(own);
+}
+#endif
 
 // At its completion: the residency sets it used go, after the lock.
 - (void)rgfxLetResidencySetsGo

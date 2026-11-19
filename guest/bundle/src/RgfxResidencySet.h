@@ -4,8 +4,12 @@
  * device makes none, as the x86 Macs make none (RgfxMakesResidencySets).
  *
  * The device keeps every allocation resident, so a set is bookkeeping alone: it sends nothing to
- * the host, requestResidency and endResidency do nothing, and a queue or a command buffer only
- * holds the sets it is given. What the set answers is what the M3 Max's answers
+ * the host, requestResidency and endResidency do nothing, and a queue or a command buffer holds
+ * the sets it is given. One thing more: a command buffer that uses a set, or is committed to a
+ * queue that holds one, names at its commit each texture over an IOSurface, or view of one, the
+ * set holds committed, as a resource it uses (rgfxSurfaces), so that the surface's copy or
+ * device cache takes the CPU's writes before the GPU reads it through the set. What the set
+ * answers is what the M3 Max's answers
  * (docs/graphics-kext/dgpu-oracle.md, Q31; measured: macOS 27.0.1, tools/oracle/oracle_residency):
  *  - It holds its allocations as three groups: the committed ones, the adds since the last
  *    commit (none of them committed), and the committed ones a remove since then marks. An add
@@ -71,6 +75,14 @@ NS_ASSUME_NONNULL_BEGIN
 /// Changes the set's label (the descriptor's until then) to a copy of `label`, as Metal's set
 /// answers it (_MTLObjectWithLabel's).
 - (void)setLabel:(nullable NSString *)label;
+
+/// The committed allocations that are textures over an IOSurface or views of one, in the order
+/// they were committed, as the set's last commit left them (a remove since marks one, which
+/// stays until that commit drops it); nil where there is none. A command buffer that uses the set,
+/// or is committed to a queue that holds it, names each at its commit as a resource it uses
+/// (rgfxIOSurfaceNoteUse): it names a cached surface to the host (RGFX_OP_SURFACE_USE) and syncs
+/// a copy, where nothing else the buffer encodes may name the surface.
+- (nullable NSArray *)rgfxSurfaces;
 
 @end
 

@@ -618,8 +618,13 @@ Stages:
       dgpu-oracle.md Q37). The
       answer is that of a message with no layout. Each
       command buffer names the cached surfaces it uses
-      (`RGFX_OP_SURFACE_USE`) with the kext's count of the surface's
-      read-write locks when it was committed; the host fills the cache from
+      (`RGFX_OP_SURFACE_USE`), on the arm64 device those committed to a
+      residency set it uses or its queue holds among them (named as read, a
+      set carrying no usage: a shader's write to a cached surface the buffer
+      reaches only through a set is not downloaded at the CPU's next lock,
+      where Metal on an Apple GPU shows it; naming every member as written
+      would download each at every lock), with the kext's count of the
+      surface's read-write locks when it was committed; the host fills the cache from
       the pages before the first buffer of a newer count, on its own transfer
       queue, after every buffer that used the cache before. A new cache is
       made as zeros and owes its first fill from the pages, as of the count in
