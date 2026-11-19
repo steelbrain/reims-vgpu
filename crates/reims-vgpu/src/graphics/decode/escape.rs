@@ -961,6 +961,15 @@ mod tests {
         no_copy_memory_over_pages_lies_over_the_guests_bytes::<RtPlatform>(Runs::One);
     }
 
+    /// [`no_copy_memory_over_pages_lies_over_the_guests_bytes`] on the rt platform, in blocks of
+    /// two runs, whose views are not the guest's RAM itself.
+    #[cfg(feature = "rt")]
+    #[test]
+    fn on_vulkan_rt_s_no_copy_memory_over_two_runs_lies_over_the_guests_bytes() {
+        use reims_vgpu_vulkan::RtPlatform;
+        no_copy_memory_over_pages_lies_over_the_guests_bytes::<RtPlatform>(Runs::Two);
+    }
+
     /// The marker that makes a run of [`on_vulkan_a_recording_holds_each_buffers_first_escape`]
     /// the child, which records.
     const RECORD_CHILD: &str = "REIMS_VGPU_ESCAPE_RECORD_CHILD";
