@@ -15,12 +15,13 @@
 //! one triangle a plane over the crop's extent, each pixel its texel from the crop's origin, so
 //! the targets hold what the CPU's copy writes, at their first texel, and nothing past it.
 //!
-//! A draw takes both targets' keyed mutexes (key 0), records its writes and the mutexes'
-//! release behind them, and submits them with the queue's fence signalled after them, under
-//! the [`PlaneDraw`]'s lock; it then waits on its caller's thread for the fence without the
-//! lock, so that the targets of another picture are made, and another picture's draw is
-//! recorded, while the GPU writes. Once the wait returns the importer may read the targets:
-//! the caller says so to it (`external_writes_done`). The importer takes no keyed mutex.
+//! A picture's targets are made without the [`PlaneDraw`]'s lock, as both devices' methods are
+//! free-threaded (neither is made single-threaded). A draw takes both targets' keyed mutexes
+//! (key 0), records its writes and the mutexes' release behind them, and submits them with the
+//! queue's fence signalled after them, under the lock; it then waits on its caller's thread for
+//! the fence without the lock, so that another picture's draw is recorded while the GPU
+//! writes. Once the wait returns the importer may read the targets: the caller says so to it
+//! (`external_writes_done`). The importer takes no keyed mutex.
 //!
 //! What a picture's draw would otherwise pay the first time is made with the [`PlaneDraw`], at a
 //! decoder's open: the devices, the shaders, compiled by `D3DCompile` at run time, and the
@@ -288,9 +289,11 @@ fn formats(ten_bit: bool) -> Formats {
 
 /// The draws of pictures' planes on one adapter (module doc): its devices, shaders and fence,
 /// made at a decoder's open, and the pool textures opened so far, under one lock, so that one
-/// picture's draw is recorded at a time; and the fence, which a draw waits for without the lock.
+/// picture's draw is recorded at a time; and, outside it, the devices again, which make a
+/// picture's targets, and the fence, which a draw waits for.
 pub struct PlaneDraw {
     state: Mutex<State>,
+    makers: Makers,
     fence: Com,
 }
 
@@ -317,6 +320,14 @@ struct State {
     value: u64,
     /// The pool textures opened, each kept while it lives.
     opened: Vec<Opened>,
+}
+
+/// The devices a picture's targets are made on, without the [`PlaneDraw`]'s lock (module doc).
+struct Makers {
+    /// The native Direct3D 11 device, which makes the targets.
+    native: Com,
+    /// The draws' Direct3D 11 device, which opens them.
+    device: Com,
 }
 
 /// A pool texture opened on the draws' device (module doc).
@@ -419,6 +430,10 @@ impl PlaneDraw {
         let origin = constant_buffer(&device)?;
         let fence = new_fence(&d3d12.device)?;
         let waits = fence.query(&IID_ID3D12_FENCE, "ID3D12Fence")?;
+        let makers = Makers {
+            native: native.query(&IID_ID3D11_DEVICE1, "ID3D11Device1")?,
+            device: device.query(&IID_ID3D11_DEVICE1, "ID3D11Device1")?,
+        };
         let mut state = State {
             d3d12,
             queue,
@@ -437,6 +452,7 @@ impl PlaneDraw {
         state.make_pipelines()?;
         Ok(PlaneDraw {
             state: Mutex::new(state),
+            makers,
             fence: waits,
         })
     }
@@ -444,14 +460,13 @@ impl PlaneDraw {
     /// Targets of a picture `size` big in luma samples, of 10-bit samples in 16 or 8-bit ones
     /// (module doc).
     pub fn targets(&self, size: (u32, u32), ten_bit: bool) -> Result<PlaneTargets, String> {
-        let state = self.state.lock();
         let (width, height) = size;
         let chroma = (width.div_ceil(2), height.div_ceil(2));
         let formats = formats(ten_bit);
         Ok(PlaneTargets {
             planes: [
-                state.target(formats.targets[0], size)?,
-                state.target(formats.targets[1], chroma)?,
+                self.makers.target(formats.targets[0], size)?,
+                self.makers.target(formats.targets[1], chroma)?,
             ],
             ten_bit,
             size,
@@ -530,7 +545,7 @@ impl PlaneDraw {
     }
 }
 
-impl State {
+impl Makers {
     /// A target of `format`, `size` big (`PlaneTargets`).
     fn target(&self, format: u32, size: (u32, u32)) -> Result<Target, String> {
         let native = new_texture(
@@ -542,7 +557,7 @@ impl State {
         )?;
         let handle = share(&native)?;
         let native_mutex = native.query(&IID_IDXGI_KEYED_MUTEX, "IDXGIKeyedMutex")?;
-        let device1 = self.device.query(&IID_ID3D11_DEVICE1, "ID3D11Device1")?;
+        let device1 = &self.device;
         let mut out = null_mut();
         // SAFETY: the method is ID3D11Device1's `OpenSharedResource1`, of an NT handle of ours,
         // with ID3D11Texture2D's IID.
@@ -585,7 +600,9 @@ impl State {
             size,
         })
     }
+}
 
+impl State {
     /// The index in `opened` of `texture`'s open, made where there is none; the entries of
     /// textures that no longer live are let go first.
     fn opened(&mut self, texture: &Arc<SharedTexture>, ten_bit: bool) -> Result<usize, String> {
