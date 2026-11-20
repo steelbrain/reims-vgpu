@@ -18,8 +18,10 @@
 //!   images for views and surfaces' planes) as any other `newTextureWithDescriptor:`, of a
 //!   descriptor whose
 //!   `m2v.textureDescriptor` map holds [`OUTSIDE`] (`outside: true`) so a player places it
-//!   outside the guest's texture indices; an object's last reference going (`Obj`'s drop) is its
-//!   `release` record.
+//!   outside the guest's texture indices, and a buffer whose memory the platform makes at its
+//!   first use (the rt platform's `new_deferred_buffer_of_length`, an IOSurface device cache's in
+//!   the per-shape form) as the `newBufferWithLength:options:` of its length and options; an
+//!   object's last reference going (`Obj`'s drop) is its `release` record.
 //! - **The device's identity.** Right after the record that made a device, an
 //!   [`IDENTITY`] record on it answers what decides how a player makes its resources: the
 //!   device's `name`, which the guest's device info gives, and `hasUnifiedMemory`, by which a
@@ -239,8 +241,10 @@ pub const FIXES: &[&str] = &[
     "completion-before-guest-learns",
     // c6ab041d6: each no-copy buffer's escape, at the guest's first note
     "buffer-escaped",
-    // the commit that adds this name: each acquire of another API's writes into a buffer
+    // 2fe5515d8: each acquire of another API's writes into a buffer
     "external-write-done",
+    // the commit that adds this name: the make of each buffer whose memory is made at its use
+    "deferred-buffer-makes",
 ];
 
 /// The stats file's lines that name the recorder's build: its commit ([`COMMIT`]), the display
@@ -5171,6 +5175,216 @@ mod tests {
                     .count();
                 assert_eq!(all, 1, "{calls:?}");
                 drop((queue, buffer, device));
+            },
+        );
+    }
+
+    /// `newBufferWithLength:options:`'s Private storage mode.
+    const STORAGE_PRIVATE: u64 = 0x20;
+
+    /// A page-long buffer of each make of `device`'s by which the host makes buffers of its own
+    /// (an IOSurface device cache, a cache in the per-shape form, a staged copy's piece, a
+    /// cache for the host's video), Private where the make takes a storage mode, by the make's
+    /// name: those the device makes. The first four make one on every device.
+    fn host_buffers<P: crate::core::platform::Platform>(
+        device: &P::Device,
+    ) -> Vec<(&'static str, P::Buffer)> {
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::raise::OnFault;
+        let (on, len) = (OnFault::Return, crate::os::PAGE);
+        let private = STORAGE_PRIVATE;
+        let made = [
+            (
+                "new_buffer_of_length",
+                device.new_buffer_of_length(on, len, private),
+            ),
+            (
+                "new_scratch_buffer_of_length",
+                device.new_scratch_buffer_of_length(on, len, 0),
+            ),
+            (
+                "new_deferred_buffer_of_length",
+                device.new_deferred_buffer_of_length(on, len, private),
+            ),
+            (
+                "new_buffer_of_length_padding_unobserved",
+                device.new_buffer_of_length_padding_unobserved(on, len, private, None),
+            ),
+        ];
+        #[cfg(unix)]
+        let made: Vec<_> = made
+            .into_iter()
+            .chain([
+                (
+                    "new_exportable_buffer_of_length",
+                    device.new_exportable_buffer_of_length(on, len, private, None),
+                ),
+                (
+                    "new_dma_buf_buffer_of_length_padding_unobserved",
+                    device.new_dma_buf_buffer_of_length_padding_unobserved(on, len, private, None),
+                ),
+            ])
+            .collect();
+        (made.into_iter())
+            .filter_map(|(name, made)| Some((name, made.expect("never a raise")?)))
+            .collect()
+    }
+
+    /// Whether each of `buffers` has its make in `calls`: a record that answers its stream id.
+    fn host_buffers_made<B: RecObj>(calls: &[Call], buffers: &[(&'static str, B)]) -> bool {
+        (buffers.iter())
+            .all(|(_, b)| id_at(b.rec_ptr()).is_some_and(|id| calls.iter().any(|c| c.result == id)))
+    }
+
+    /// Each of `buffers` ([`host_buffers`]) has its stream id and its make in `calls`, the first
+    /// four makes' among them, and the stream in `streams` counts no object it could not name.
+    fn assert_host_buffers_named<B: RecObj>(
+        streams: &std::path::Path,
+        calls: &[Call],
+        buffers: &[(&'static str, B)],
+    ) {
+        let names: Vec<&str> = buffers.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names.get(..4), Some(&HOST_BUFFER_MAKES[..]), "{names:?}");
+        for (name, buffer) in buffers {
+            let id = id_at(buffer.rec_ptr());
+            let id = id.unwrap_or_else(|| panic!("{name}'s buffer has no stream id"));
+            assert!(
+                calls.iter().any(|c| c.result == id),
+                "nothing made {name}'s buffer {id}: {calls:?}"
+            );
+        }
+        assert_eq!(stat(streams, "unrecorded_refs"), 0);
+        assert_eq!(stat(streams, "unrecorded_receivers"), 0);
+    }
+
+    /// The makes of [`host_buffers`] that make a buffer on every device.
+    const HOST_BUFFER_MAKES: [&str; 4] = [
+        "new_buffer_of_length",
+        "new_scratch_buffer_of_length",
+        "new_deferred_buffer_of_length",
+        "new_buffer_of_length_padding_unobserved",
+    ];
+
+    /// Every buffer the host makes of its own on the Vulkan platform ([`host_buffers`]) is in the
+    /// stream from its make, so a copy or a bind that names it names its stream id.
+    #[test]
+    fn on_vulkan_every_buffer_the_host_makes_is_in_the_stream() {
+        in_recording_child(
+            "recorder::tests::on_vulkan_every_buffer_the_host_makes_is_in_the_stream",
+            |streams| {
+                use crate::core::platform::device::GpuDevice as _;
+                let (_platform, device) = recording_device();
+                let buffers = host_buffers::<crate::platform::VulkanPlatform>(&device);
+                let queue = device.new_command_queue().expect("a queue");
+                let (calls, _) = recorded(streams, |calls| {
+                    calls.iter().any(|c| c.selector == "newCommandQueue")
+                        && host_buffers_made(calls, &buffers)
+                });
+                assert_host_buffers_named(streams, &calls, &buffers);
+                drop((queue, buffers, device));
+            },
+        );
+    }
+
+    /// On rt, a buffer whose memory is made at its first use (`new_deferred_buffer_of_length`, an
+    /// IOSurface device cache's in the per-shape form) is in the stream as the
+    /// `newBufferWithLength:options:` of its length and options it stands for, and a host copy
+    /// out of it on an unshared queue into a shape's image, as a fill of the cache's shapes is,
+    /// names its stream id; every other buffer the host makes of its own is in the stream from
+    /// its make too ([`host_buffers`]), and no object goes unnamed.
+    #[cfg(feature = "rt")]
+    #[test]
+    fn on_vulkan_an_rt_deferred_buffer_is_named_by_a_host_copy_on_the_unshared_queue() {
+        in_recording_child(
+            "recorder::tests::on_vulkan_an_rt_deferred_buffer_is_named_by_a_host_copy_on_the_unshared_queue",
+            |streams| {
+                use crate::core::platform::Platform as _;
+                use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+                use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+                use crate::core::platform::device::GpuDevice as _;
+                use crate::core::platform::types::{MtlOrigin, MtlSize};
+                use crate::core::platform::values::TextureDesc;
+                use crate::core::raise::OnFault;
+                const COPY: &str = "copyFromBuffer:sourceOffset:sourceBytesPerRow:\
+                                    sourceBytesPerImage:sourceSize:toTexture:destinationSlice:\
+                                    destinationLevel:destinationOrigin:";
+                const SIDE: u64 = 16;
+                let platform = crate::rt_platform::RtPlatform::new();
+                assert!(on(), "the child does not record");
+                let registry_id = platform
+                    .system_default_device()
+                    .expect("an rt device on the GPU the test holds")
+                    .facts()
+                    .registry_id;
+                let device = platform
+                    .open_device(registry_id)
+                    .expect("the default device");
+                let on = OnFault::Return;
+                let length = SIDE * SIDE * 4;
+                let cache = device.new_deferred_buffer_of_length(on, length, STORAGE_PRIVATE);
+                let cache = cache.expect("never a raise").expect("a deferred buffer");
+                let desc = TextureDesc {
+                    pixel_format: 80, // BGRA8Unorm
+                    width: SIDE,
+                    height: SIDE,
+                    usage: 0x5, // shader read, render target
+                    resource_options: Some(STORAGE_PRIVATE),
+                    ..TextureDesc::default()
+                };
+                let image = device
+                    .new_texture_for_views(&desc)
+                    .expect("a shape's image");
+                let queue = device
+                    .new_command_queue_unshared()
+                    .expect("an unshared queue");
+                let made = queue.command_buffer(on).expect("never a raise");
+                let made = made.expect("a command buffer");
+                let encoder = made.blit_encoder(on).expect("never a raise");
+                let encoder = encoder.expect("a blit encoder");
+                let fill = BlitCmd::CopyBufferToTexture {
+                    source_buffer: &cache,
+                    source_offset: 0,
+                    source_bytes_per_row: SIDE * 4,
+                    source_bytes_per_image: length,
+                    source_size: MtlSize::new(SIDE, SIDE, 1),
+                    destination_texture: &image,
+                    destination_slice: 0,
+                    destination_level: 0,
+                    destination_origin: MtlOrigin::default(),
+                };
+                assert_eq!(encoder.encode(on, fill), Ok(()));
+                assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+                assert_eq!(made.commit(on), Ok(()));
+                assert_eq!(made.wait_until_completed(on), Ok(()));
+                let buffers = host_buffers::<crate::rt_platform::RtPlatform>(&device);
+                let (calls, _) = recorded(streams, |calls| {
+                    calls.iter().any(|c| c.selector == COPY) && host_buffers_made(calls, &buffers)
+                });
+                let device_id = id_at(device.rec_ptr()).expect("the device's stream id");
+                let id = id_at(cache.rec_ptr()).expect("the deferred buffer's stream id");
+                let make = (calls.iter())
+                    .find(|c| c.result == id)
+                    .unwrap_or_else(|| panic!("nothing made buffer {id}: {calls:?}"));
+                assert_eq!(
+                    (make.selector.as_str(), make.receiver, &make.args[..]),
+                    (
+                        "newBufferWithLength:options:",
+                        device_id,
+                        &[Value::Uint(length), Value::Uint(STORAGE_PRIVATE)][..]
+                    ),
+                    "{make:?}"
+                );
+                let image_id = id_at(image.rec_ptr()).expect("the image's stream id");
+                let copy = (calls.iter())
+                    .find(|c| c.selector == COPY)
+                    .unwrap_or_else(|| panic!("no copy: {calls:?}"));
+                assert_eq!(
+                    (copy.args.first(), copy.args.get(5)),
+                    (Some(&Value::Object(id)), Some(&Value::Object(image_id))),
+                    "{copy:?}"
+                );
+                assert_host_buffers_named(streams, &calls, &buffers);
+                drop((encoder, made, queue, image, cache, buffers, device));
             },
         );
     }

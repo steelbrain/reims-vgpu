@@ -738,16 +738,27 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     }
 
     /// [`new_buffer_of_length`](GpuDevice::new_buffer_of_length)'s, a Private one's memory made
-    /// at its first use ([`buffer::deferred_of_length`]).
+    /// at its first use ([`buffer::deferred_of_length`]). A recording holds it as the
+    /// `newBufferWithLength:options:` it stands for, a buffer of zeros, as the Vulkan platform's
+    /// is, so the copies and binds that name it (an IOSurface device cache's in the per-shape
+    /// form) name its stream id.
     fn new_deferred_buffer_of_length(
         &self,
         on: OnFault,
         length: u64,
         options: u64,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
-        let _ = on;
-        let sel = "newBufferWithLength:options:";
-        Ok(buffer::deferred_of_length(self, sel, length, options))
+        let recorded_call =
+            crate::recorder::rec_call!("newBufferWithLength:options:", self, length, options);
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+                let _ = on;
+                let sel = "newBufferWithLength:options:";
+                Ok(buffer::deferred_of_length(self, sel, length, options))
+            },
+        );
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
     }
 
     /// A buffer of zeros of its own exported block, whose memory CUDA imports as an opaque fd
