@@ -886,10 +886,11 @@ impl RtSwapchain {
         let told = (count, images.len());
         if self.told != Some(told) {
             self.told = Some(told);
+            // One of the two modes `present_mode` picks, by name: ash builds its enums without `Debug`.
+            let mode = if self.is_mailbox() { "MAILBOX" } else { "FIFO" };
             log::info!(
                 target: TARGET,
-                "a window's swapchain presents with {:?}, {} images ({count} asked for)",
-                self.mode,
+                "a window's swapchain presents with {mode}, {} images ({count} asked for)",
                 images.len()
             );
         }
