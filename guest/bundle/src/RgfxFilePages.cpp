@@ -9,7 +9,6 @@
 #include <libproc.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
-#include <mach/vm_page_info.h>
 #include <mach/vm_region.h>
 #include <mach/vm_statistics.h>
 #include <os/log.h>
