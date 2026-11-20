@@ -874,14 +874,11 @@ fn own(
 /// keeps one) in blocks of their own, for `sel`; `None` where rt refuses it, counted.
 fn own_managed(device: &RtObj<RtDevice>, sel: &'static str, length: u64) -> Option<rt::Buffer> {
     let bytes = take(device, sel, rt::MemoryClass::Shared, length)?;
-    match bytes.contents {
-        Some(at) => {
-            // SAFETY: the block is this call's alone, mapped for its life, and its `len`, the
-            // length rounded up, holds the `length` bytes.
-            unsafe { at.as_ptr().write_bytes(0, length.to_usize()) };
-            crate::answer::count_kind_by(ZEROED_BYTES_CODE, length);
-        }
-        None => {}
+    if let Some(at) = bytes.contents {
+        // SAFETY: the block is this call's alone, mapped for its life, and its `len`, the length
+        // rounded up, holds the `length` bytes.
+        unsafe { at.as_ptr().write_bytes(0, length.to_usize()) };
+        crate::answer::count_kind_by(ZEROED_BYTES_CODE, length);
     }
     let copy = match device.rt().has_unified_memory() {
         true => None,
