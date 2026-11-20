@@ -2072,6 +2072,7 @@ fn copied(
         Ok(block) => {
             let _ = id.set(block.id);
             (homes.0.lock()).insert(block.id, at.as_ptr().addr().to_u64());
+            super::diag::copy_made(block.id);
             crate::answer::count_kind(IMPORTS_COPIED);
             if !COPIED_SAID.swap(true, Ordering::Relaxed) {
                 log::info!(

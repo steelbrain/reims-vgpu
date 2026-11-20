@@ -48,8 +48,9 @@
 //! - **Textures over an imported block**, which rt keeps in an image of their own and copies the
 //!   bytes of into it at each submission that uses them (rt's `over` module), by kind: format,
 //!   size, rows, usage, storage mode, and where their block was imported (the selector, the
-//!   decoder's message the import was made under and the thread's name without its number,
-//!   [`imported`]). For each kind, the textures made, and their uses in submissions
+//!   decoder's message the import was made under, the thread's name without its number, and
+//!   whether rt took the pages themselves or a copy of them, `pages` or `copy`: [`imported`]).
+//!   For each kind, the textures made, and their uses in submissions
 //!   ([`Uses::submitted`]): their bytes, and how many sampled, rendered or blitted it. Their bytes
 //!   are not read: the committing thread runs the guest's call, and a hash of them at each commit
 //!   held it in proportion to them.
@@ -630,12 +631,14 @@ pub fn walk_context(context: Option<u32>) {
 }
 
 /// Where a block was imported: the selector, the decoder's message carried out on the thread
-/// (0: none), and the thread's name without its number.
+/// (0: none), the thread's name without its number, and whether the block is a copy of the
+/// pages ([`copy_made`]) rather than the pages themselves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Origin {
     sel: &'static str,
     message: u32,
     thread: &'static str,
+    copy: bool,
 }
 
 /// The blocks imported, by rt's number, which rt never reuses, with where.
@@ -644,12 +647,25 @@ static IMPORTED: Mutex<BTreeMap<rt::BlockId, Origin>> = Mutex::new(BTreeMap::new
 /// The imports by origin.
 static IMPORTS: Mutex<BTreeMap<Origin, u64>> = Mutex::new(BTreeMap::new());
 
-/// Notes block `block`, imported now for `sel` (`super::buffer::import_pages`).
+/// The blocks made as copies of an import's pages ([`copy_made`]) whose import is yet to be
+/// noted ([`imported`]).
+static COPIES: Mutex<BTreeSet<rt::BlockId>> = Mutex::new(BTreeSet::new());
+
+/// Notes that block `block`, made now, is a copy of an import's pages (`super::buffer`'s
+/// `copied`: pages whose GPU writes Metal drops, or pages rt took neither by their pointer nor
+/// as a dma-buf), for its import's origin ([`imported`]).
+pub fn copy_made(block: rt::BlockId) {
+    COPIES.lock().insert(block);
+}
+
+/// Notes block `block`, imported now for `sel` (`super::buffer::import_pages`): a copy of the
+/// pages where [`copy_made`] noted it, else the pages themselves.
 pub fn imported(block: rt::BlockId, sel: &'static str) {
     let origin = Origin {
         sel,
         message: MESSAGE.get(),
         thread: thread_class(),
+        copy: COPIES.lock().remove(&block),
     };
     IMPORTED.lock().insert(block, origin);
     *IMPORTS.lock().entry(origin).or_insert(0) += 1;
@@ -2317,10 +2333,12 @@ fn paths_line(kind: &str, t: &PathTotals) -> String {
     )
 }
 
-/// `origin` as a line names it: the selector, the message's type in hex, and the thread.
+/// `origin` as a line names it: the selector, the message's type in hex, the thread, and
+/// `copy` for a copy of the pages or `pages` for the pages themselves.
 fn origin_name(origin: &Origin) -> String {
+    let made = if origin.copy { "copy" } else { "pages" };
     format!(
-        "{} message {:#x} thread {}",
+        "{} message {:#x} thread {}, {made}",
         origin.sel, origin.message, origin.thread
     )
 }
