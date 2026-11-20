@@ -978,6 +978,10 @@ pub(crate) struct Shared<P: Platform> {
     /// a wait the work did not end in, as the wait asks whether to go on (for the tests).
     #[cfg(test)]
     cache_wait_looks: std::sync::atomic::AtomicU64,
+    /// The looks of the walks' waits after a cut while their parts run too far ahead of the GPU
+    /// that went on waiting, one before each slice of a wait (for the tests).
+    #[cfg(test)]
+    pace_waits: std::sync::atomic::AtomicU64,
     /// The device's BAR 2 region: the host memory the over-host-memory buffers
     /// and heaps are placed over. Held so it stays mapped while the decoder's
     /// objects live; declared last so the contexts drop before it (a buffer
@@ -1014,6 +1018,13 @@ impl<P: Platform> Decoders<P> {
     #[cfg(test)]
     pub(crate) fn cache_wait_looks(&self) -> u64 {
         (self.0.cache_wait_looks).load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The looks of the walks' waits after a cut that went on waiting so far (for the tests): a
+    /// walk waits for its parts once it rises.
+    #[cfg(test)]
+    pub(crate) fn pace_waits(&self) -> u64 {
+        (self.0.pace_waits).load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// A decoder for a message from `context` (`None`: what is no context's), its records going
@@ -1348,6 +1359,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             deal_waits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             cache_wait_looks: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            pace_waits: std::sync::atomic::AtomicU64::new(0),
             region,
         });
         GraphicsDecoder::on(shared, None, Sinks::default())

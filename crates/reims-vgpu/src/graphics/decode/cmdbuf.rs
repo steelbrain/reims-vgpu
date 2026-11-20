@@ -2857,6 +2857,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                         0
                     };
                     cut.set(why);
+                    #[cfg(test)]
+                    if why == 0 {
+                        (self.shared.pace_waits).fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                     why != 0
                 },
             )
@@ -7421,6 +7425,7 @@ mod tests {
         };
         assert_eq!(dec.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
         let sinks = dec.sinks.clone();
+        let sequencer = Arc::clone(&dec.shared.sequencer);
         let mut first = dec.sender(Some(0), sinks.clone());
         let mut second = dec.sender(Some(0), sinks);
         let asked = asking(100, 1);
@@ -7439,7 +7444,8 @@ mod tests {
                 .name("second".into())
                 .spawn_scoped(scope, || second.decode(&p.device(), &later).unwrap())
                 .unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            let held = crate::graphics::tests::eventually(|| sequencer.holds_up(0));
+            assert!(held, "never waited for the answer's ticket");
             assert!(commits().is_empty(), "committed before the answered buffer");
             let a = std::thread::Builder::new()
                 .name("first".into())
@@ -7680,9 +7686,9 @@ mod tests {
 
     /// Through the decoder on `P`: a buffer fills a buffer, signals shared event 7 to 1, waits
     /// for 7 to reach 2, and fills it again, as a guest whose CPU waits for the signal before it
-    /// sets 2 encodes it. Whether the value 1 reached the guest within 5 s of the commit, before
-    /// the buffer completed; then the CPU sets 2, whatever came: whether the buffer completed
-    /// within 10 s of that, and whether the value went ahead of its completion, once.
+    /// sets 2 encodes it. Whether the value 1 reached the guest before the buffer completed,
+    /// which it cannot before 2 is set; then the CPU sets 2, whatever came: whether the buffer
+    /// completed within 10 s of that, and whether the value went ahead of its completion, once.
     #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
     fn a_cpu_wait_for_a_mid_buffer_signal<P: crate::platform::ApiPlatform>() -> (bool, bool, bool) {
         use std::time::{Duration, Instant};
@@ -7758,10 +7764,9 @@ mod tests {
         assert_eq!(dec.decode(&device, &cb).unwrap(), Ok(()));
         let signalled = (RGFX_EVT_EVENT_SIGNALLED, 7, 1);
         let completed = (RGFX_EVT_CB_COMPLETE, 20, 0);
-        let start = Instant::now();
-        while !posted.lock().contains(&signalled) && start.elapsed() < Duration::from_secs(5) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        // The buffer completes only once the CPU sets 2 below, so the signal is waited for
+        // however long the host takes: one that comes only at the buffer's end never comes here.
+        crate::graphics::tests::eventually(|| posted.lock().contains(&signalled));
         let early = {
             let posted = posted.lock();
             posted.contains(&signalled) && !posted.contains(&completed)
@@ -7802,7 +7807,7 @@ mod tests {
     /// Through the decoder on `P`, as the host takes two queues' rings on threads of their own:
     /// buffer A of queue 1 fills a tracked buffer, and buffer B of queue 2, committed plainly
     /// after A by the guest, names A in its `COMMIT_ORDER` and copies the buffer out. B is taken
-    /// first, on a thread of its own; A is begun 50 ms on and committed 100 ms after that, and
+    /// first, on a thread of its own; A is begun and committed once B waits for A's commit, and
     /// its message ends, raising its queue's commit mark, once the platform has scheduled it. The
     /// bytes B copied.
     #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
@@ -7885,6 +7890,7 @@ mod tests {
 
         let mut first = dec.decoders().sender(None, dec.sinks.clone());
         let mut second = dec.decoders().sender(None, dec.sinks.clone());
+        let marks = Arc::clone(&dec.queue_counts(1).expect("queue 1").order);
         std::thread::scope(|scope| {
             let device = &device;
             let taken_first = scope.spawn(|| {
@@ -7897,12 +7903,12 @@ mod tests {
                 second.end_message();
                 done
             });
-            std::thread::sleep(Duration::from_millis(50));
+            let waits = crate::graphics::tests::eventually(|| marks.commit.has_waiters());
+            assert!(waits, "B never waited for A's commit");
             let begun = first
                 .begin_taken(device, &a, Some(1), false)
                 .unwrap()
                 .unwrap();
-            std::thread::sleep(Duration::from_millis(100));
             assert_eq!(
                 first.finish_command_buffer(device, &a, begun).unwrap(),
                 Ok(())
@@ -10181,6 +10187,7 @@ mod tests {
         let mut ring0 = dec.sender(Some(0), super::super::Sinks::default());
         let mut other = dec.sender(Some(2), super::super::Sinks::default());
         let gate = Gate::on(&dec, 0);
+        let sequencer = Arc::clone(&dec.shared.sequencer);
         drop(dec);
         let range = |obj_id| {
             reims_vgpu_graphics::wire::RgfxBufferDidModifyRange {
@@ -10231,7 +10238,8 @@ mod tests {
                     .unwrap(),
                 Err(DecodeError::BadReference)
             );
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            let held = crate::graphics::tests::eventually(|| sequencer.holds_up(0));
+            assert!(held, "never waited for the answer's ticket");
             assert!(commits().is_empty(), "committed before the answered buffer");
             assert!(!b.is_finished());
             gate.open();
@@ -11065,6 +11073,12 @@ mod tests {
         }
     }
 
+    /// Whether a walk of `decoders` waits after a cut for its parts to be seen complete
+    /// ([`Decoders::pace_waits`](super::super::Decoders::pace_waits)), polled until one does.
+    fn pace_waiting(decoders: &super::super::Decoders<FakePlatform>) -> bool {
+        crate::graphics::tests::eventually(|| decoders.pace_waits() > 0)
+    }
+
     /// A paced walk waits after a cut while its parts out run far ahead of the GPU
     /// ([`super::super::split`], "How far ahead of the GPU"): with nothing to estimate their GPU
     /// time from, once two parts or more are out and walked over [`PACE_UNKNOWN_WALK`]; it goes
@@ -11078,11 +11092,12 @@ mod tests {
         } = pacing();
         let device = p.device();
         let rate = Arc::clone(&dec.queue_counts(1).expect("queue 1").rate);
+        let decoders = dec.decoders();
         let message = command_buffer_message(410, 140, &passes(8));
         std::thread::scope(|scope| {
             let walk = scope.spawn(|| dec.decode(&device, &message).unwrap());
             let out = committed_at_least(&p, 2);
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(pace_waiting(&decoders), "never waited for its parts");
             let held = p.world().committed();
             assert!(!walk.is_finished(), "waits with {} parts out", held.len());
             assert!(held.len() < 8, "{} parts out", held.len());
@@ -11130,11 +11145,12 @@ mod tests {
             clock.virtual_clock().advance(Duration::from_nanos(ns));
         })));
         dec.queue_counts(1).expect("queue 1").rate.set(0.01);
+        let decoders = dec.decoders();
         let message = command_buffer_message(415, 145, &passes(8));
         std::thread::scope(|scope| {
             let walk = scope.spawn(|| dec.decode(&device, &message).unwrap());
             committed_at_least(&p, 2);
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(pace_waiting(&decoders), "never waited for its parts");
             let held = p.world().committed();
             assert!(!walk.is_finished(), "waits with {} parts out", held.len());
             assert!(held.len() < 8, "{} parts out", held.len());
@@ -11192,11 +11208,15 @@ mod tests {
             let device = p.device();
             let shared = Arc::clone(&dec.shared);
             let marks = Arc::clone(&dec.queue_counts(1).expect("queue 1").order);
+            let decoders = dec.decoders();
             let message = command_buffer_message(420, 150, &passes(8));
             std::thread::scope(|scope| {
                 let walk = scope.spawn(|| dec.decode(&device, &message).unwrap());
                 let out = committed_at_least(&p, 2);
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                assert!(
+                    pace_waiting(&decoders),
+                    "{end:?}: never waited for its parts"
+                );
                 assert!(!walk.is_finished(), "{end:?}: waits");
                 match end {
                     PaceEnd::Reset => shared.commit_cancel.begin(),
@@ -11302,13 +11322,17 @@ mod tests {
                 .filter(|t| t == "parts" || t == "other")
                 .collect::<Vec<_>>()
         };
+        let decoders = dec.decoders();
         std::thread::scope(|scope| {
             let walk = std::thread::Builder::new()
                 .name("parts".into())
                 .spawn_scoped(scope, || dec.decode(&p.device(), &message).unwrap())
                 .unwrap();
             committed_at_least(&p, 3);
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(
+                pace_waiting(&decoders),
+                "paced from its begin's wait: never waited"
+            );
             assert!(!walk.is_finished(), "paced from its begin's wait");
             let out = commits().len();
             assert!(out < 8, "{out} parts out");
