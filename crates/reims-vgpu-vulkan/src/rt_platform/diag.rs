@@ -88,9 +88,9 @@
 //!   of them each that clamps to its border colour in some direction, by its border colour
 //!   ([`sampler`]). A function's constexpr samplers are not counted.
 //! - **Exported block makes.** Each of rt's `Device::new_exported_block` calls the platform made
-//!   (`super::export`), timed alone with the host's monotonic clock ([`exported_block_made`]):
-//!   their count, those over 5 ms, and the longest with its bytes. Each is an allocation of its
-//!   own: rt dedicates an exported block's memory to it.
+//!   (`super::export`, on Unix; Windows makes none), timed alone with rt's host clock
+//!   (`exported_block_made`): their count, those over 5 ms, and the longest with its bytes. Each
+//!   is an allocation of its own: rt dedicates an exported block's memory to it.
 //! - **rt's timed take parts.** rt's `Timed` metrics of its block takes and makes (`takes`,
 //!   `take_lock_waits`, `take_makes`, `take_maps`, `maker_makes`, `zero_writes`,
 //!   `long_take_zero_writes`): for each, its calls, those over 5 ms, and its longest call with
@@ -1164,6 +1164,7 @@ struct ExportMakes {
 
 impl ExportMakes {
     /// Adds a make of `bytes` that took `nanos`.
+    #[cfg(any(unix, test))]
     fn add(&mut self, nanos: u64, bytes: u64) {
         self.count += 1;
         if nanos > 5_000_000 {
@@ -1186,6 +1187,7 @@ static EXPORT_MAKES: Mutex<ExportMakes> = Mutex::new(ExportMakes {
 
 /// Counts one of rt's `Device::new_exported_block` calls, of `bytes`, which took `nanos` (the
 /// module's docs).
+#[cfg(unix)]
 pub(super) fn exported_block_made(nanos: u64, bytes: u64) {
     EXPORT_MAKES.lock().add(nanos, bytes);
 }
