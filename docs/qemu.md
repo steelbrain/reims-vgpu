@@ -935,6 +935,36 @@ with the driver's own cache on or off, in one cache or twelve, and destroying
 a cache gives none of it back. Only fewer bytes help: smaller shaders, fewer
 pipelines per state.
 
+### Linux hosts: a first boot's pipeline makes
+
+The Vulkan platform gives the runtime a cache directory, `reims-vgpu-rt`
+under the cache directory of the user QEMU runs as
+(`crates/reims-vgpu-vulkan/src/rt_platform/device.rs`), where the runtime
+keeps its lowered functions and pipeline caches. A guest's first boot on a
+host fills it; later boots load from it.
+
+**Measured** on 2026-11-20, on an RTX 2080 and x86-64 macOS 26.7.2, at
+reims-vgpu c5e66703ba with metal2vulkan 9ea53f7acd. There were two boots
+of the same guest disk on overlays, one after the other on the same host and
+card: the first with the directory empty, the second with the 31.2 MiB the
+first left there. Each ran the desktop, browser pages and a 3D benchmark's
+first five scenes.
+
+| | first boot | second boot |
+|---|---|---|
+| translations | 627 | 94 |
+| translations loaded from the cache | 299 | 914 |
+| pipelines created | 497 | 599 |
+| pipeline creation, summed | 12.5 s | 3.7 s |
+| translation, summed | 2.8 s | 0.45 s |
+
+The benchmark's first scene loads in one long present gap: 7.5 s on the
+first boot and 3.9 s on the second. The runtime made 147 pipelines inside it
+in both boots, 4124 ms summed the first time and 442 ms the second. These
+makes are a first boot's cost. The scene's other load gaps, 0.8 to 6.1 s,
+hold no pipeline makes in either boot. Over the benchmark the guest presented
+22.0 frames a second on the first boot and 23.4 on the second.
+
 ### Linux hosts: the guest's disk
 
 `reims-ctl` gives a VM its system disk as an image file in the VM's
