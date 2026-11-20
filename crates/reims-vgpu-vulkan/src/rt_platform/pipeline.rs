@@ -343,6 +343,9 @@ fn make(
     let mut taking = Taking::new(device);
     let made =
         (device.rt()).new_compute_pipeline_state(descriptor, |samplers| taking.ids(samplers));
+    if let Err(error) = &made {
+        super::diag::keep_refused_air(sel, error, &[Some(&descriptor.kernel)]);
+    }
     let (rt, lease) = taking.made(sel, made)?;
     let written = written_slots(rt.texture_accesses());
     Ok(RtObj::new(RtComputePipeline {

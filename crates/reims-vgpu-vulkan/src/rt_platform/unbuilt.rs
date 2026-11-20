@@ -334,7 +334,7 @@ static SAID_RT: [AtomicBool; RtRefusal::ALL.len()] =
 /// Metal's call answers where it fails. Returns the kind.
 pub fn rt_refused(sel: &'static str, error: &rt::Error) -> RtRefusal {
     let kind = RtRefusal::of(error);
-    super::diag::gap(error);
+    super::diag::refusal(error);
     refused_as(sel, kind, error);
     kind
 }
@@ -391,7 +391,7 @@ pub fn rt_refused_texture(sel: &'static str, error: &rt::Error) -> RtRefusal {
     };
     let (code, first) = format_code(pixel_format.as_raw());
     crate::answer::count_kind(code);
-    super::diag::gap(error);
+    super::diag::refusal(error);
     if first {
         say(&format!(
             "reims-vgpu: {sel}: metal2vulkan-rt refused it ({error}); refused ({code}), the first \
@@ -415,7 +415,7 @@ pub fn rt_refused_imageblock(sel: &'static str, error: &rt::Error) {
         return;
     }
     crate::answer::count_kind(IMAGEBLOCK_LENGTH);
-    super::diag::gap(error);
+    super::diag::refusal(error);
     if !SAID_IMAGEBLOCK.swap(true, Ordering::Relaxed) {
         say(&format!(
             "reims-vgpu: {sel}: metal2vulkan-rt refused it ({error}); refused \
@@ -453,6 +453,7 @@ fn heap_texture_place(sel: &'static str, error: &rt::Error) -> Option<RtRefusal>
         return None;
     }
     crate::answer::count_kind(HEAP_TEXTURE_PLACE);
+    super::diag::refusal(error);
     if let Some(code) = crate::answer::refusing() {
         crate::answer::count_kind(code);
     }

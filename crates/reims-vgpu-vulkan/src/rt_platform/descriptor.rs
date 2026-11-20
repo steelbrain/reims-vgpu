@@ -473,10 +473,14 @@ impl PassFields {
         let pass = self.lock();
         let one = |point: Point, a: &Attachment| {
             let texture = a.texture.as_ref()?;
+            let d = texture.rt().descriptor();
             Some(Target {
                 point,
                 level: u32::try_from(a.level).ok()?,
                 slice: u32::try_from(a.slice).ok()?,
+                texture_type: d.texture_type.as_raw(),
+                samples: d.sample_count,
+                index: texture.rt().gpu_resource_id().index,
                 made: std::sync::Arc::clone(texture.made()),
             })
         };

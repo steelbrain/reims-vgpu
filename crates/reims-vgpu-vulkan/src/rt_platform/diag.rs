@@ -3,7 +3,11 @@
 //! `crate::answer::write_counts` runs). They hold:
 //!
 //! - **Gaps by kind.** Each refusal of rt's `Gap`, by the gap's kind, a draw's by its draw kind
-//!   ([`gap`]), which the counts line holds as one `rt-refused-gap`.
+//!   ([`refusal`]), which the counts line holds as one `rt-refused-gap`.
+//! - **Refusals by variant.** Each refusal of Metal's that rt answers (`Error::Refused`) and each of
+//!   its limits (`Error::Limit`), by its variant, `Refused-<variant>` and `Limit-<variant>`
+//!   ([`refusal`]), which the counts line holds as `rt-refused-metal` and `rt-refused-limit` with
+//!   the platform's own refusals of those kinds.
 //! - **Attachment reads through a texture.** Each draw rt refused as one
 //!   (`Gap::Draw { kind: AttachmentRead }`), by its class ([`attachment_read`]): for each texture
 //!   slot of the draw's state whose texture's image a target of the pass renders, the slot's stage
@@ -17,6 +21,15 @@
 //!   display (the compositor) or not (an app). Class A, which rt builds, is the texture and the
 //!   attachment's being one texture or twin views of one surface's image. The first refused draw
 //!   of each pipeline state, ten at most, writes its line as it is refused.
+//! - **Fetched colour attachments.** Each draw rt refused as reading a colour attachment through
+//!   its texture (`Gap::Draw { kind: FetchedAttachment }`, framebuffer fetch), by its class
+//!   ([`fetched_attachment`]): for each colour target of its pass, as rt does not say which the
+//!   fragment function reads, how its texture was made, its texture type and sample count, the
+//!   level and slice the pass renders and a view's first, whether it has an index (rt reads a
+//!   fetched attachment through its texture's index), whether its image's usage lets shaders read
+//!   it and write it (Unknown, 0, as both), the usage its maker declared and its image's, and
+//!   whether another target of the pass renders its image. The first refused draw of each
+//!   pipeline state, ten at most, writes its line as it is refused.
 //! - **Imageblock asks.** Each distinct combination of colour attachment formats (every index)
 //!   and sample count of the render states asked `imageblockSampleLength`, with its asks and rt's
 //!   answer, or its refusal ([`imageblock`]); its first ask writes its line.
@@ -61,9 +74,22 @@
 //!   plane takes storage) in a format that is neither the shape's nor its sRGB sibling, by the
 //!   pair ([`plain_view_refused`]).
 //!
+//! - **Sampler states by border.** Each sampler state made (`newSamplerStateWithDescriptor:`), and
+//!   of them each that clamps to its border colour in some direction, by its border colour
+//!   ([`sampler`]). A function's constexpr samplers are not counted.
+//!
 //! Totals, numbers, formats, sizes and usages only: no name, label or byte of the guest's leaves
-//! the process. A diagnostic, which the contract leaves free: nothing the guest observes changes,
-//! and a texture's bytes are only read.
+//! the process, but through the switch below. A diagnostic, which the contract leaves free:
+//! nothing the guest observes changes, and a texture's bytes are only read.
+//!
+//! **Refused pipelines' AIR**, a diagnostic switch that is off by default: where
+//! `REIMS_VGPU_REFUSED_AIR_DIR` ([`REFUSED_AIR_VAR`]) names a directory, each pipeline state the
+//! translator refused (`Error::Translation`) has the metallib of each of its stages' functions
+//! written into `air-<pid>` there, once per library, as `<its SHA-256's first 16 hex
+//! digits>.metallib`, and a line in `refused.txt` there naming the creator, each function (its
+//! library's file, its index and name) and the refusal, once per creator and functions
+//! ([`keep_refused_air`]). The lines give how many it kept. The AIR is the guest's: it stays on
+//! the host that made it, and nothing commits it or copies it off.
 //!
 //! One count is not a diagnostic but a degradation code on the counts line: each use, by a
 //! committed command buffer, of a guest surface texture over a buffer in an imported block,
@@ -81,6 +107,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use metal2vulkan_rt as rt;
@@ -790,20 +817,28 @@ pub const SURFACE_PLANE_COPY_BYTES_CODE: &str = "rt-surface-plane-copy-bytes";
 /// The refusals of rt's gaps by kind.
 static GAPS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 
-/// Counts a refusal of rt's `error` under its gap's kind, where it is a gap.
-pub fn gap(error: &rt::Error) {
-    let rt::Error::Unsupported(gap) = error else {
-        return;
+/// The refusals of Metal's that rt answers, and its limits, by variant.
+static REFUSALS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+
+/// Counts a refusal of rt's `error`: a gap under its gap's kind, a draw's by its draw kind; a
+/// refusal of Metal's and a limit under their variant, `Refused-<variant>` and `Limit-<variant>`;
+/// any other error not.
+pub fn refusal(error: &rt::Error) {
+    let (map, name) = match error {
+        rt::Error::Unsupported(rt::Gap::Draw { kind }) => (&GAPS, format!("Draw-{kind:?}")),
+        rt::Error::Unsupported(gap) => (&GAPS, variant(&format!("{gap:?}")).to_owned()),
+        rt::Error::Refused(r) => (&REFUSALS, format!("Refused-{}", variant(&format!("{r:?}")))),
+        rt::Error::Limit(l) => (&REFUSALS, format!("Limit-{}", variant(&format!("{l:?}")))),
+        _ => return,
     };
-    let name = match gap {
-        rt::Gap::Draw { kind } => format!("Draw-{kind:?}"),
-        other => {
-            let debug = format!("{other:?}");
-            let end = debug.find(|c: char| !c.is_alphanumeric());
-            debug[..end.unwrap_or(debug.len())].to_owned()
-        }
-    };
-    *GAPS.lock().entry(name).or_insert(0) += 1;
+    *map.lock().entry(name).or_insert(0) += 1;
+}
+
+/// The variant `debug` names, the `{:?}` of an enum's value: up to its first character that is not
+/// alphanumeric.
+fn variant(debug: &str) -> &str {
+    let end = debug.find(|c: char| !c.is_alphanumeric());
+    &debug[..end.unwrap_or(debug.len())]
 }
 
 // ----- Attachment reads through a texture.
@@ -827,6 +862,12 @@ pub struct Target {
     pub level: u32,
     /// The slice it renders.
     pub slice: u32,
+    /// Its texture's `MTLTextureType`.
+    pub texture_type: u32,
+    /// Its texture's sample count.
+    pub samples: u32,
+    /// Its texture's index, 0 for one with none: rt reads a fetched attachment through it.
+    pub index: u32,
     /// Its texture.
     pub made: Arc<Made>,
 }
@@ -946,20 +987,217 @@ pub fn attachment_read(
         ));
     }
     let class = classes.join(" + ");
-    *READS
-        .lock()
-        .entry(ReadClass { context, class })
-        .or_insert(0) += 1;
-    let mut firsts = FIRSTS.lock();
-    if firsts.1 < FIRST_LINES && firsts.0.insert(pipeline) {
-        firsts.1 += 1;
-        drop(firsts);
-        let context = context.map_or("unknown".to_owned(), |c| c.to_string());
-        say(&format!(
-            "reims-vgpu: rt-diag attachment-read first of a state: context {context}: {}\n",
-            lines.join(" + ")
-        ));
+    let draw = Refused {
+        totals: &READS,
+        firsts: &FIRSTS,
+        what: "attachment-read",
+    };
+    draw.count(context, pipeline, class, &lines.join(" + "));
+}
+
+/// The totals of a kind of refused draws, and its first lines.
+struct Refused {
+    /// Its refused draws by class.
+    totals: &'static Mutex<BTreeMap<ReadClass, u64>>,
+    /// The pipeline states whose first refused draw wrote its line, and the lines written.
+    firsts: &'static Mutex<(BTreeSet<u64>, usize)>,
+    /// The kind's name in its lines.
+    what: &'static str,
+}
+
+impl Refused {
+    /// Counts a refused draw of class `class` of a process of context `context`, and writes
+    /// `line`, as the kind's first of a state, where it is the first of pipeline state `pipeline`
+    /// and fewer than [`FIRST_LINES`] were written.
+    fn count(&self, context: Option<u32>, pipeline: u64, class: String, line: &str) {
+        *self
+            .totals
+            .lock()
+            .entry(ReadClass { context, class })
+            .or_insert(0) += 1;
+        let mut firsts = self.firsts.lock();
+        if firsts.1 < FIRST_LINES && firsts.0.insert(pipeline) {
+            firsts.1 += 1;
+            drop(firsts);
+            let context = context.map_or("unknown".to_owned(), |c| c.to_string());
+            say(&format!(
+                "reims-vgpu: rt-diag {} first of a state: context {context}: {line}\n",
+                self.what
+            ));
+        }
     }
+}
+
+/// Each process's totals of `totals`, by class and by whether the process presents (`presenters`).
+fn by_process(
+    totals: &Mutex<BTreeMap<ReadClass, u64>>,
+    presenters: &BTreeSet<u32>,
+) -> BTreeMap<(String, &'static str), u64> {
+    let mut out = BTreeMap::new();
+    for (key, n) in totals.lock().iter() {
+        let process = match key.context {
+            Some(c) if presenters.contains(&c) => "compositor",
+            Some(_) => "app",
+            None => "unknown",
+        };
+        *out.entry((key.class.clone(), process)).or_insert(0) += n;
+    }
+    out
+}
+
+// ----- Fetched colour attachments.
+
+/// The draws rt refused as reading a colour attachment through its texture, by class.
+static FETCHES: Mutex<BTreeMap<ReadClass, u64>> = Mutex::new(BTreeMap::new());
+
+/// The pipeline states whose first such refused draw wrote its line, and the lines written.
+static FETCH_FIRSTS: Mutex<(BTreeSet<u64>, usize)> = Mutex::new((BTreeSet::new(), 0));
+
+/// Counts a draw of pipeline state `pipeline` in a pass of `targets` that rt refused as reading a
+/// colour attachment through its texture, by its class (the module's docs): each colour target's.
+pub fn fetched_attachment(pipeline: u64, targets: &[Target]) {
+    let colors: Vec<String> = (targets.iter())
+        .filter(|t| matches!(t.point, Point::Color(_)))
+        .map(|t| fetched_class(t, targets))
+        .collect();
+    let class = match colors.is_empty() {
+        true => "no colour target".to_owned(),
+        false => colors.join(" + "),
+    };
+    let draw = Refused {
+        totals: &FETCHES,
+        firsts: &FETCH_FIRSTS,
+        what: "fetched-attachment",
+    };
+    draw.count(context_now(), pipeline, class.clone(), &class);
+}
+
+/// The class of colour target `t` of a pass of `targets` (the module's docs).
+fn fetched_class(t: &Target, targets: &[Target]) -> String {
+    let m = &t.made;
+    let point = match t.point {
+        Point::Color(i) => format!("color{i}"),
+        Point::Depth => "depth".to_owned(),
+        Point::Stencil => "stencil".to_owned(),
+    };
+    let shared = (targets.iter()).filter(|o| o.made.image == m.image).count() > 1;
+    format!(
+        "{point} {} type {} samples {} level {} slice {} view-first {} {} index {} reads {} \
+         writes {} declared {:#x} image-usage {:#x} shares-image {shared}",
+        m.call_name(),
+        t.texture_type,
+        t.samples,
+        t.level,
+        t.slice,
+        m.level,
+        m.slice,
+        if t.index == 0 { "none" } else { "yes" },
+        m.usage == 0 || m.usage & TEXTURE_USAGE_SHADER_READ != 0,
+        m.usage == 0 || m.usage & TEXTURE_USAGE_SHADER_WRITE != 0,
+        m.declared_usage(),
+        m.usage,
+    )
+}
+
+/// `MTLTextureUsageShaderRead`.
+const TEXTURE_USAGE_SHADER_READ: u64 = 0x1;
+
+/// `MTLTextureUsageShaderWrite`.
+const TEXTURE_USAGE_SHADER_WRITE: u64 = 0x2;
+
+// ----- Sampler states by border.
+
+/// The sampler states made, and of them those that clamp to their border colour in some direction,
+/// by border colour: transparent black, opaque black, opaque white, and any other.
+static SAMPLERS: Mutex<(u64, [u64; 4])> = Mutex::new((0, [0; 4]));
+
+/// Counts a sampler state made of `d` (the module's docs).
+pub fn sampler(d: &rt::SamplerDescriptor) {
+    let border = [d.s_address_mode, d.t_address_mode, d.r_address_mode]
+        .contains(&rt::SamplerAddressMode::ClampToBorderColor);
+    let mut samplers = SAMPLERS.lock();
+    samplers.0 += 1;
+    if border {
+        let at = usize::try_from(d.border_color.as_raw()).map_or(3, |raw| raw.min(3));
+        samplers.1[at] += 1;
+    }
+}
+
+// ----- Refused pipelines' AIR.
+
+/// The variable that names the directory refused pipelines' AIR is written into (the module's
+/// docs).
+pub const REFUSED_AIR_VAR: &str = "REIMS_VGPU_REFUSED_AIR_DIR";
+
+/// What the process kept of refused pipelines' AIR: the libraries written, by their files' names,
+/// and the refusals written, by their creator and functions.
+static KEPT_AIR: Mutex<(BTreeSet<String>, BTreeSet<String>)> =
+    Mutex::new((BTreeSet::new(), BTreeSet::new()));
+
+/// [`REFUSED_AIR_VAR`]'s directory, read once: `None` where it is unset or empty.
+fn refused_air_dir() -> Option<&'static Path> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        let dir = std::env::var_os(REFUSED_AIR_VAR).filter(|v| !v.is_empty())?;
+        Some(PathBuf::from(dir).join(format!("air-{}", std::process::id())))
+    });
+    dir.as_deref()
+}
+
+/// The translator refused a pipeline state of `stages` (those it has) by the creator `sel` with
+/// `error`: where [`REFUSED_AIR_VAR`] names a directory, keeps its functions' AIR there (the
+/// module's docs). A write that fails keeps nothing more of the refusal, and the next refusal
+/// tries again.
+pub fn keep_refused_air(sel: &str, error: &rt::Error, stages: &[Option<&rt::StageSource>]) {
+    let rt::Error::Translation(_) = error else {
+        return;
+    };
+    let Some(dir) = refused_air_dir() else {
+        return;
+    };
+    let functions: Vec<&metal2vulkan::library::Function> = (stages.iter().flatten())
+        .filter_map(|s| match s {
+            rt::StageSource::Function(f) => Some(&f.function),
+            _ => None,
+        })
+        .collect();
+    let _ = keep_air_in(dir, sel, error, &functions);
+}
+
+/// [`keep_refused_air`] into `dir`, of the refusal `why` of the functions `functions` by `sel`.
+fn keep_air_in(
+    dir: &Path,
+    sel: &str,
+    why: &dyn std::fmt::Display,
+    functions: &[&metal2vulkan::library::Function],
+) -> std::io::Result<()> {
+    let mut kept = KEPT_AIR.lock();
+    let mut named = Vec::new();
+    for f in functions {
+        let library = f.library();
+        let hash: String = (library.content_hash().iter().take(8))
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let file = format!("{hash}.metallib");
+        if !kept.0.contains(&file) {
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(dir.join(&file), library.bytes())?;
+            kept.0.insert(file.clone());
+        }
+        named.push(format!("{file} #{} {}", f.index(), f.info().name));
+    }
+    let key = format!("{sel}; {}", named.join(", "));
+    if kept.1.contains(&key) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    let mut lines = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("refused.txt"))?;
+    std::io::Write::write_all(&mut lines, format!("{key}; refused: {why}\n").as_bytes())?;
+    kept.1.insert(key);
+    Ok(())
 }
 
 // ----- Imageblock asks.
@@ -1177,22 +1415,44 @@ pub fn write() {
         let _ = writeln!(out, "reims-vgpu: rt-diag gaps: {}", all.join(", "));
     }
     drop(gaps);
-    let presenters = PRESENTERS.lock().clone();
-    let mut reads: BTreeMap<(String, &str), u64> = BTreeMap::new();
-    for (key, n) in READS.lock().iter() {
-        let process = match key.context {
-            Some(c) if presenters.contains(&c) => "compositor",
-            Some(_) => "app",
-            None => "unknown",
-        };
-        *reads.entry((key.class.clone(), process)).or_insert(0) += n;
+    let refusals = REFUSALS.lock();
+    if !refusals.is_empty() {
+        let all: Vec<String> = refusals.iter().map(|(k, n)| format!("{k} {n}")).collect();
+        let _ = writeln!(out, "reims-vgpu: rt-diag refusals: {}", all.join(", "));
     }
-    for ((class, process), n) in &reads {
+    drop(refusals);
+    let presenters = PRESENTERS.lock().clone();
+    for ((class, process), n) in &by_process(&READS, &presenters) {
         let _ = writeln!(
             out,
             "reims-vgpu: rt-diag attachment-read: {process}: {class}: {n}"
         );
     }
+    for ((class, process), n) in &by_process(&FETCHES, &presenters) {
+        let _ = writeln!(
+            out,
+            "reims-vgpu: rt-diag fetched-attachment: {process}: {class}: {n}"
+        );
+    }
+    let (made, borders) = *SAMPLERS.lock();
+    if made != 0 {
+        let _ = writeln!(
+            out,
+            "reims-vgpu: rt-diag samplers: {made} made; clamping to the border colour, by it: \
+             transparent-black {}, opaque-black {}, opaque-white {}, other {}",
+            borders[0], borders[1], borders[2], borders[3]
+        );
+    }
+    let kept = KEPT_AIR.lock();
+    if !kept.1.is_empty() {
+        let _ = writeln!(
+            out,
+            "reims-vgpu: rt-diag refused-air: {} refusals, {} libraries kept",
+            kept.1.len(),
+            kept.0.len()
+        );
+    }
+    drop(kept);
     let mut surfaces: BTreeMap<(&str, u64, &str, bool), u64> = BTreeMap::new();
     for (kind, n) in SURFACES.lock().iter() {
         let process = if presenters.contains(&kind.context) {
@@ -1529,17 +1789,127 @@ mod tests {
         assert!(line.contains(shown), "{line}");
     }
 
-    /// A gap is counted by its kind, a draw's by its draw kind; another error is not.
+    /// A gap is counted by its kind, a draw's by its draw kind, and a refusal of Metal's and a
+    /// limit by their variant; another error is not.
     #[test]
-    fn gaps_count_by_kind() {
-        gap(&rt::Error::Unsupported(rt::Gap::Draw {
+    fn refusals_count_by_kind() {
+        refusal(&rt::Error::Unsupported(rt::Gap::Draw {
             kind: rt::DrawKind::AttachmentRead,
         }));
-        gap(&rt::Error::Unsupported(rt::Gap::CubicSampler));
-        gap(&rt::Error::Quiesced);
+        refusal(&rt::Error::Unsupported(rt::Gap::CubicSampler));
+        refusal(&rt::Error::Refused(rt::Refusal::BufferTooLong { length: 8, max: 4 }));
+        refusal(&rt::Error::Limit(rt::Limit::BlockLen { len: 8, max: 4 }));
+        refusal(&rt::Error::Quiesced);
         let gaps = GAPS.lock();
         assert!(gaps.get("Draw-AttachmentRead").is_some_and(|&n| n >= 1));
         assert!(gaps.get("CubicSampler").is_some_and(|&n| n >= 1));
-        assert!(!gaps.keys().any(|k| k.contains("Quiesced")));
+        drop(gaps);
+        let refusals = REFUSALS.lock();
+        assert!(refusals.get("Refused-BufferTooLong").is_some_and(|&n| n >= 1));
+        assert!(refusals.get("Limit-BlockLen").is_some_and(|&n| n >= 1));
+        drop(refusals);
+        for map in [&GAPS, &REFUSALS] {
+            assert!(!map.lock().keys().any(|k| k.contains("Quiesced")));
+        }
+    }
+
+    /// A draw rt refused as reading a colour attachment through its texture is counted by each
+    /// colour target's class: how its texture was made, its type, samples, level and slice, whether
+    /// it has an index, whether its image's usage lets shaders read and write it (Unknown as both),
+    /// and whether another target renders its image. The depth target is not in it.
+    #[test]
+    fn fetched_attachments_count_by_each_colour_target() {
+        let shape = |usage| Shape {
+            format: 80,
+            width: 4,
+            height: 4,
+            storage: 2,
+            usage,
+        };
+        let target = |point, made: &Arc<Made>, index| Target {
+            point,
+            level: 0,
+            slice: 0,
+            texture_type: 2,
+            samples: 1,
+            index,
+            made: Arc::clone(made),
+        };
+        let render_only = Made::new(Call::Plain, &shape(0x4));
+        let unknown = Made::new(Call::Plain, &shape(0));
+        let view = Made::view(&render_only, 80, (0, 0));
+        let depth = Made::new(Call::Plain, &shape(0x4));
+        let targets = [
+            target(Point::Color(0), &render_only, 0),
+            target(Point::Color(1), &unknown, 7),
+            target(Point::Color(2), &view, 3),
+            target(Point::Depth, &depth, 0),
+        ];
+        fetched_attachment(0x5eed, &targets);
+        fetched_attachment(0x5eed, &targets);
+        let common = "type 2 samples 1 level 0 slice 0 view-first 0 0";
+        let class = [
+            format!(
+                "color0 ordinary {common} index none reads false writes false declared 0x4 \
+                 image-usage 0x4 shares-image true"
+            ),
+            format!(
+                "color1 ordinary {common} index yes reads true writes true declared 0x0 \
+                 image-usage 0x0 shares-image false"
+            ),
+            format!(
+                "color2 view {common} index yes reads false writes false declared 0x4 \
+                 image-usage 0x4 shares-image true"
+            ),
+        ]
+        .join(" + ");
+        let fetches = FETCHES.lock();
+        let counted = (fetches.iter()).find(|(k, _)| k.class == class);
+        assert_eq!(counted.map(|(_, &n)| n), Some(2), "{:?}", fetches.keys());
+    }
+
+    /// Each sampler state made is counted, and one that clamps to its border colour in some
+    /// direction by its border colour.
+    #[test]
+    fn samplers_count_by_their_border() {
+        let (made, borders) = *SAMPLERS.lock();
+        let mut d = rt::SamplerDescriptor::new();
+        sampler(&d);
+        d.t_address_mode = rt::SamplerAddressMode::ClampToBorderColor;
+        d.border_color = rt::SamplerBorderColor::OpaqueBlack;
+        sampler(&d);
+        d.t_address_mode = rt::SamplerAddressMode::Repeat;
+        d.r_address_mode = rt::SamplerAddressMode::ClampToBorderColor;
+        d.border_color = rt::SamplerBorderColor::OpaqueWhite;
+        sampler(&d);
+        let (now, by) = *SAMPLERS.lock();
+        assert_eq!(now - made, 3);
+        let added: Vec<u64> = by.iter().zip(borders).map(|(n, was)| n - was).collect();
+        assert_eq!(added, [0, 1, 1, 0]);
+    }
+
+    /// A refused pipeline's functions' library is written once into the directory, as its hash
+    /// names it, and a line of the creator, its functions and the refusal once.
+    #[test]
+    fn a_refused_pipelines_air_is_kept_once() {
+        let library = rt::Library::from_metallib(crate::gpu::shaders::METALLIB).expect("shaders");
+        let f = library.function_at(0).expect("a function");
+        let dir = std::env::temp_dir().join(format!("rvg-refused-air-{}", std::process::id()));
+        for _ in 0..2 {
+            keep_air_in(&dir, "sel:", &"a refusal", &[&f, &f]).expect("written");
+        }
+        let hash: String = (library.content_hash()[..8].iter())
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let kept = std::fs::read(dir.join(format!("{hash}.metallib"))).expect("the library");
+        assert_eq!(kept, library.bytes());
+        let lines = std::fs::read_to_string(dir.join("refused.txt")).expect("the lines");
+        let name = f.info().name;
+        let function = format!("{hash}.metallib #0 {name}");
+        assert_eq!(
+            lines,
+            format!("sel:; {function}, {function}; refused: a refusal\n")
+        );
+        std::fs::remove_dir_all(&dir).expect("removed");
     }
 }

@@ -74,7 +74,8 @@ pub struct RtRenderEncoder {
     mark: OpenMark,
     /// What its command buffer keeps until it completes.
     kept: Kept,
-    /// Its pass's targets, for the boot diagnostics (`diag::attachment_read`).
+    /// Its pass's targets, for the boot diagnostics (`diag::attachment_read`,
+    /// `diag::fetched_attachment`).
     targets: Vec<Target>,
 }
 
@@ -145,6 +146,14 @@ impl RtRenderEncoder {
             &self.targets,
             seen.depth_write,
         );
+    }
+
+    /// rt refused a draw as reading a colour attachment through its texture: notes it for the boot
+    /// diagnostics (`diag::fetched_attachment`).
+    fn fetched_attachment(&self, seen: &Seen) {
+        if let Some(state) = &seen.state {
+            diag::fetched_attachment(state.id().0, &self.targets);
+        }
     }
 
     /// Encodes `cmd` but `endEncoding`, which the caller ends.
@@ -615,11 +624,12 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
             let ending = matches!(cmd, RenderCmd::EndEncoding);
             let mut open = self.open.lock();
             let stopped = self.command(&mut open, cmd).err();
-            if let Some(Stop::Rt(rt::Error::Unsupported(rt::Gap::Draw {
-                kind: rt::DrawKind::AttachmentRead,
-            }))) = &stopped
-            {
-                self.attachment_read(&open.seen);
+            if let Some(Stop::Rt(rt::Error::Unsupported(rt::Gap::Draw { kind }))) = &stopped {
+                match kind {
+                    rt::DrawKind::AttachmentRead => self.attachment_read(&open.seen),
+                    rt::DrawKind::FetchedAttachment => self.fetched_attachment(&open.seen),
+                    _ => {}
+                }
             }
             if ending && let Some(e) = open.rt.take() {
                 e.end_encoding();

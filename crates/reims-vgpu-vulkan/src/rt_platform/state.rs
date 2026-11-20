@@ -187,11 +187,14 @@ pub fn new_sampler_state(device: &RtObj<RtDevice>, desc: &SamplerDesc) -> Option
         },
     };
     match device.rt().new_sampler_state(&descriptor, index) {
-        Ok(made) => Some(RtObj::new(RtSampler {
-            rt: made,
-            device: device.clone_ref(),
-            own,
-        })),
+        Ok(made) => {
+            super::diag::sampler(&descriptor);
+            Some(RtObj::new(RtSampler {
+                rt: made,
+                device: device.clone_ref(),
+                own,
+            }))
+        }
         Err(error) => {
             if let Some(index) = own {
                 device.sampler_indices().give_back(index);
