@@ -488,7 +488,9 @@ pub(super) fn surface_plane(
 ) -> Option<RtObj<RtTexture>> {
     let options = desc.resource_options.unwrap_or(0);
     let diag = |shape: &Shape| Made::new(Call::SurfaceImage, shape);
-    recorded_image(device, desc, || answered(device, sel, desc, options, None, Ok(plane), diag))
+    recorded_image(device, desc, || {
+        answered(device, sel, desc, options, None, Ok(plane), diag)
+    })
 }
 
 /// An image for views, or a surface's plane (`surface_plane`), as a recording holds it: the

@@ -5409,7 +5409,6 @@ mod tests {
             |streams| {
                 use ash::{khr, vk};
 
-                use crate::core::platform::Platform as _;
                 use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
                 use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
                 use crate::core::platform::device::GpuDevice as _;
