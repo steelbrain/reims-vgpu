@@ -10493,7 +10493,7 @@ pub(super) mod tests {
     /// `SURFACE_PAGES` waited about half a second for a thread
     #[test]
     fn a_pages_job_made_while_released_caches_wait_to_go_does_not_wait_for_them() {
-        let mut r = cached();
+        let r = cached();
         let cache = reims_vgpu_vulkan::core::platform::ObjId(cache_id(&r));
         r.dec.let_go_worker().hold();
         r.dec

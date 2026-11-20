@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::core::runtime::{Runtime as _, StdRuntime};
 
@@ -439,15 +439,21 @@ fn pairs_let_go_together_share_one_flush() {
     let threads: Vec<_> = (pairs.into_iter())
         .map(|pair| {
             let returned = Arc::clone(&returned);
-            std::thread::spawn(move || {
+            StdRuntime::thread("pair-drop", move || {
                 drop(pair);
                 returned.fetch_add(1, Ordering::SeqCst);
             })
+            .expect("a thread")
         })
         .collect();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // The tests' clock: std's, which the library does not read.
+    let clock = StdRuntime;
+    let asked = clock.now();
     while draw.flushes.owed.lock().asked < 4 {
-        assert!(Instant::now() < deadline, "the four pairs ask for a flush");
+        assert!(
+            clock.elapsed_since(asked) < Duration::from_secs(10),
+            "the four pairs ask for a flush"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     std::thread::sleep(Duration::from_millis(20));
