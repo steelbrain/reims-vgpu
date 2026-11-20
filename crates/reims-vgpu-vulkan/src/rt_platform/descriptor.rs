@@ -762,7 +762,12 @@ impl PassDetail {
         let colors = (pass.color_attachments.iter().enumerate()).filter_map(|(i, c)| {
             let resolve = (&c.resolve_texture, [c.resolve_level, c.resolve_slice]);
             let actions = (c.load_action, c.store_action);
-            attached(Point::Color(i), (&c.texture, [c.level, c.slice]), actions, resolve)
+            attached(
+                Point::Color(i),
+                (&c.texture, [c.level, c.slice]),
+                actions,
+                resolve,
+            )
         });
         let d = &pass.depth_attachment;
         let depth = attached(
@@ -802,7 +807,9 @@ fn attached(
         texture: AttachedTexture::of(texture.as_ref()?),
         at,
         actions,
-        resolve: resolve.as_ref().map(|t| (AttachedTexture::of(t), resolved_at)),
+        resolve: resolve
+            .as_ref()
+            .map(|t| (AttachedTexture::of(t), resolved_at)),
         clear_depth: None,
     })
 }
@@ -878,7 +885,10 @@ mod tests {
             texture: texture(PixelFormat::BGRA8Unorm, TextureType::Type2DMultisample, 4),
             at: [0, 0],
             actions: (LoadAction::Clear, StoreAction::MultisampleResolve),
-            resolve: Some((texture(PixelFormat::BGRA8Unorm, TextureType::Type2D, 1), [1, 0])),
+            resolve: Some((
+                texture(PixelFormat::BGRA8Unorm, TextureType::Type2D, 1),
+                [1, 0],
+            )),
             clear_depth: None,
         };
         let depth = PassAttachment {
@@ -905,7 +915,10 @@ mod tests {
             attachments: Vec::new(),
             size: [16, 16],
         };
-        assert_eq!(none.to_string(), "a pass of 0 attachments, render target 16x16");
+        assert_eq!(
+            none.to_string(),
+            "a pass of 0 attachments, render target 16x16"
+        );
     }
 
     /// A mipmapped 2D descriptor has the levels of its larger side down to 1×1; one not mipmapped

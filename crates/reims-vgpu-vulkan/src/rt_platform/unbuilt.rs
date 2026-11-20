@@ -827,7 +827,10 @@ mod tests {
                  format 70\n"
             )
         );
-        assert!(format!("{samples:?}").contains("sample_count: 4"), "{samples:?}");
+        assert!(
+            format!("{samples:?}").contains("sample_count: 4"),
+            "{samples:?}"
+        );
         let points = rt::Error::Unsupported(rt::Gap::Draw {
             kind: rt::DrawKind::Points,
         });
