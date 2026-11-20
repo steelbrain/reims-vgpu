@@ -413,12 +413,13 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
     log::info!(
         target: TARGET,
         "the rt platform's device: {} ({:04x}:{:04x}), driver {driver}, registry ID {:#x}; \
-         instance extensions {:?}; present fences: {present_fences}",
+         instance extensions {:?}; device extensions {:?}; present fences: {present_fences}",
         facts.name,
         facts.vendor_id,
         facts.device_id,
         facts.registry_id,
-        instance.extensions()
+        instance.extensions(),
+        device.extensions()
     );
     let caps = answers::caps(&facts);
     let gpu = format!(
