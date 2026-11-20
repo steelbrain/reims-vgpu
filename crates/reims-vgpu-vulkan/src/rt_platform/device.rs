@@ -291,6 +291,15 @@ impl RtDevice {
         &self.loss
     }
 
+    /// Whether it is lost, which nothing makes again: rt's `Device::loss` names a cause. rt sets
+    /// it at its own Vulkan call that meets the loss, before any of its command buffers ends with
+    /// the device lost, and a window's swapchain reports a loss its own call meets first
+    /// (`super::swapchain`'s docs, "A lost device"). A window's swapchain makes no Vulkan call on
+    /// it from then on but its end's destroys.
+    pub fn is_lost(&self) -> bool {
+        self.rt.loss().is_some()
+    }
+
     /// The blocks it knows by address (`super::buffer`'s docs, "A pinned address"): the graphics
     /// lane keeps a clone, the same set, to know and forget its blocks in.
     pub fn known_blocks(&self) -> &KnownBlocks {

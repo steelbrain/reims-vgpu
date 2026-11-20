@@ -104,7 +104,7 @@ impl FrameSink for RtScanoutSink {
     /// either is refused, or rt's device is known lost (the module doc, "A lost device"), which is
     /// logged.
     fn presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>> {
-        if self.draw.device.loss().is_lost() {
+        if self.draw.device.is_lost() {
             log::warn!(
                 target: "reims_vgpu::graphics",
                 "no swapchain for the graphics display's window: rt's device is lost, which \
@@ -227,7 +227,8 @@ mod tests {
         }
     }
 
-    /// On the host's GPU, once rt's device is known lost the sink makes no presenter, and asks the
+    /// On the host's GPU, once rt's device is lost (here a loss reported to rt as its own
+    /// `vkQueueSubmit2`'s, rt's `Device::report_loss`) the sink makes no presenter, and asks the
     /// window for no surface: a window made after the loss stays empty (the module doc, "A lost
     /// device")
     #[test]
@@ -248,7 +249,10 @@ mod tests {
                 "no surface, no presenter"
             );
             assert_eq!(window.0.load(Ordering::SeqCst), 1, "asked before the loss");
-            sink.draw.device.loss().seen_lost();
+            sink.draw.device.rt().report_loss(metal2vulkan_runtime::DeviceLoss {
+                call: "vkQueueSubmit2",
+                result: vk::Result::ERROR_DEVICE_LOST,
+            });
             assert!(sink.presenter(&window).is_none());
             assert_eq!(window.0.load(Ordering::SeqCst), 1, "asked for none after");
         });
