@@ -1,7 +1,7 @@
 //! rt's part of the host's summary of each ten seconds (reims-vgpu's `graphics::summary`): what
-//! rt's metrics of the process's device counted since the part before ([`Part::take`]). A
-//! diagnostic: the metrics are rt's own, which no Metal call answers, and which lines the host
-//! writes is free under the contract.
+//! rt's metrics of the process's device counted since the part before, and some of its gauges now
+//! ([`Part::take`]). A diagnostic: the metrics and gauges are rt's own, which no Metal call
+//! answers, and which lines the host writes is free under the contract.
 //!
 //! A part is `rt: ...` ([`line()`]):
 //! - the `VkPipeline`s rt made;
@@ -13,7 +13,11 @@
 //!   queue lock before them, their time in all and the longest since the device was made;
 //! - the bytes rt copied for calls: in all, then by cause: staging (`replace_region` and
 //!   `get_bytes`), attachments' images into their shadows, and the over-copies between a texture
-//!   over a buffer and its image of its own, by the cause rt gives each, those of none left out.
+//!   over a buffer and its image of its own, by the cause rt gives each, those of none left out;
+//! - the gauges of its texture blocks and of the Private blocks the consumer takes, by their
+//!   fields' names, as they are now: the bytes of the texture blocks it holds, of the sparse ones
+//!   among them and their count; and the bytes of the Private allocations that hold taken blocks,
+//!   of the taken blocks in them, and of the sparse allocations among them and their count.
 //!
 //! A device made after the one before reads as counted from none again: each count is what it rose
 //! by, or what it is where it fell.
@@ -29,18 +33,19 @@ pub struct Part {
 }
 
 impl Part {
-    /// The part of what rt counted since the part before, or since the device was made; `None`
-    /// before a device is made.
+    /// The part of what rt counted since the part before, or since the device was made, with its
+    /// gauges now; `None` before a device is made.
     pub fn take(&mut self) -> Option<String> {
         let now = super::device::metrics()?;
-        let part = line(&self.last.unwrap_or_default(), &now);
+        let gauges = super::device::gauges().unwrap_or_default();
+        let part = line(&self.last.unwrap_or_default(), &now, &gauges);
         self.last = Some(now);
         Some(part)
     }
 }
 
-/// The part of what rose from `before` to `now` (the module doc).
-pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics) -> String {
+/// The part of what rose from `before` to `now`, with `gauges` as they are (the module doc).
+pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges) -> String {
     // What a count rose by; where it fell, a new device's, what it is.
     macro_rules! rose {
         ($field:ident) => {
@@ -78,7 +83,10 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics) -> String {
          in {:.1} ms), the longest since the device was made {:.1} ms; submits {} in {:.1} ms \
          ({} over 100 ms), the longest since the device was made {:.1} ms; queue-lock waits \
          {:.1} ms, the longest since the device was made {:.1} ms; bytes copied {copied}: \
-         staging {staging}, attachment reads {attachments}, over-copies {over}{}",
+         staging {staging}, attachment reads {attachments}, over-copies {over}{}; gauges \
+         texture_block_held_bytes {}, texture_block_sparse_bytes {}, texture_block_sparse_blocks \
+         {}, private_take_held_bytes {}, private_take_bytes {}, private_take_sparse_bytes {}, \
+         private_take_sparse_allocations {}",
         rose!(pipelines_created),
         rose!(first_use_waits),
         ms(rose!(first_use_wait_nanos)),
@@ -98,6 +106,13 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics) -> String {
         } else {
             format!(" ({})", by_cause.join(", "))
         },
+        gauges.texture_block_held_bytes,
+        gauges.texture_block_sparse_bytes,
+        gauges.texture_block_sparse_blocks,
+        gauges.private_take_held_bytes,
+        gauges.private_take_bytes,
+        gauges.private_take_sparse_bytes,
+        gauges.private_take_sparse_allocations,
     )
 }
 
@@ -107,7 +122,8 @@ mod tests {
 
     /// A part says what rose since the metrics before, the maxima since the device was made as
     /// they are, each over-copy cause with bytes by name and none without, staging as the copies
-    /// neither of attachments nor over-copies; a count that fell, a new device's, reads as it is.
+    /// neither of attachments nor over-copies, then the block gauges by name as they are; a count
+    /// that fell, a new device's, reads as it is.
     #[test]
     fn an_rt_part_says_what_rose_with_each_copy_cause_by_name() {
         let mut before = rt::Metrics::default();
@@ -141,21 +157,39 @@ mod tests {
         now.over_copy_bytes = 4_096;
         now.over_copy_bytes_dma_buf = 4_000;
         now.over_copy_bytes_pitch = 96;
+        let mut gauges = rt::Gauges::default();
+        gauges.texture_block_held_bytes = 50_331_648;
+        gauges.texture_block_sparse_bytes = 16_777_216;
+        gauges.texture_block_sparse_blocks = 1;
+        gauges.private_take_held_bytes = 33_554_432;
+        gauges.private_take_bytes = 18_874_368;
+        gauges.private_take_sparse_bytes = 16_777_216;
+        gauges.private_take_sparse_allocations = 1;
         assert_eq!(
-            line(&before, &now),
+            line(&before, &now, &gauges),
             "rt: pipelines made 3; first-use waits 3 in 7.5 ms (variants 2 in 6.0 ms, lines 1 in \
              1.5 ms), the longest since the device was made 4.2 ms; submits 60 in 312.5 ms (2 \
              over 100 ms), the longest since the device was made 140.0 ms; queue-lock waits 2.3 \
              ms, the longest since the device was made 0.9 ms; bytes copied 4672: staging 64, \
-             attachment reads 512, over-copies 4096 (dma-buf 4000, pitch 96)"
+             attachment reads 512, over-copies 4096 (dma-buf 4000, pitch 96); gauges \
+             texture_block_held_bytes 50331648, texture_block_sparse_bytes 16777216, \
+             texture_block_sparse_blocks 1, private_take_held_bytes 33554432, private_take_bytes \
+             18874368, private_take_sparse_bytes 16777216, private_take_sparse_allocations 1"
         );
         let mut fresh = rt::Metrics::default();
         fresh.pipelines_created = 2;
-        let part = line(&now, &fresh);
+        let part = line(&now, &fresh, &rt::Gauges::default());
         assert!(
             part.starts_with("rt: pipelines made 2; first-use waits 0 in 0.0 ms"),
             "{part}"
         );
-        assert!(part.ends_with("over-copies 0"), "{part}");
+        assert!(
+            part.ends_with(
+                "over-copies 0; gauges texture_block_held_bytes 0, texture_block_sparse_bytes 0, \
+                 texture_block_sparse_blocks 0, private_take_held_bytes 0, private_take_bytes 0, \
+                 private_take_sparse_bytes 0, private_take_sparse_allocations 0"
+            ),
+            "{part}"
+        );
     }
 }
