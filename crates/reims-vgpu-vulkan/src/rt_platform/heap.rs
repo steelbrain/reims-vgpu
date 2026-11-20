@@ -622,8 +622,14 @@ mod tests {
         let line = format!("kHeapAddressAlign = {GUEST_HEAP_ALIGN:#x};");
         assert!(serializer.contains(&line), "the serializer has no `{line}`");
         let object_model = include_str!("../../../../guest/bundle/src/RgfxObjectModel.hpp");
-        let line = format!("kPrivateBlockBytes = uint64_t{{{}}} << 20;", GUEST_BLOCK >> 20);
-        assert!(object_model.contains(&line), "the object model has no `{line}`");
+        let line = format!(
+            "kPrivateBlockBytes = uint64_t{{{}}} << 20;",
+            GUEST_BLOCK >> 20
+        );
+        assert!(
+            object_model.contains(&line),
+            "the object model has no `{line}`"
+        );
     }
 
     /// The textures a heap can hold whose alignments the GPU's answers range over: of each of the
@@ -654,7 +660,10 @@ mod tests {
                     let levels = u64::from(64 - d.width.max(d.height).max(d.depth).leading_zeros());
                     shapes.push(d);
                     if d.sample_count == 1 && levels > 1 {
-                        shapes.push(TextureDesc { mipmap_level_count: levels, ..d });
+                        shapes.push(TextureDesc {
+                            mipmap_level_count: levels,
+                            ..d
+                        });
                     }
                 };
                 for side in [8192, 4096, 1024, 256, 16] {
@@ -680,7 +689,13 @@ mod tests {
                 }
             }
         }
-        let faces = |d: &TextureDesc| if matches!(d.texture_type, 5 | 6) { 6 } else { 1 };
+        let faces = |d: &TextureDesc| {
+            if matches!(d.texture_type, 5 | 6) {
+                6
+            } else {
+                1
+            }
+        };
         shapes.retain(|d| {
             let texels = d.width * d.height * d.depth * d.array_length * faces(d);
             texels * d.sample_count * 16 <= SHAPE_BYTES
@@ -698,9 +713,8 @@ mod tests {
             let answer = super::super::descriptor::rt_texture_descriptor(&desc)
                 .map_err(|_| "descriptor".to_owned())
                 .and_then(|d| {
-                    (device.rt().heap_texture_size_and_align(&d)).map_err(|e| {
-                        diag::refusal_name(&e).unwrap_or_else(|| format!("{e:?}"))
-                    })
+                    (device.rt().heap_texture_size_and_align(&d))
+                        .map_err(|e| diag::refusal_name(&e).unwrap_or_else(|| format!("{e:?}")))
                 });
             match answer {
                 Ok(answer) => sized.push((desc, answer)),
@@ -741,7 +755,11 @@ mod tests {
             }
         }
         let name = &device.facts().name;
-        println!("{name}: {} shapes sized of {}", sized.len(), heap_shapes().len());
+        println!(
+            "{name}: {} shapes sized of {}",
+            sized.len(),
+            heap_shapes().len()
+        );
         for (kind, (n, formats)) in &not {
             println!("{name}: {n} not sized, {kind}: formats {formats:?}");
         }
@@ -801,7 +819,9 @@ mod tests {
             assert_eq!(at.gpu_address(), block.gpu_address + pinned);
             let own = heap(&placement(size, 0x20, None)).expect("a heap of its own");
             for (placed_in, offset) in [(&at, 0), (&at, align), (&own, 0), (&own, align)] {
-                let placed = placed_in.new_texture(&texture, offset).expect("never a raise");
+                let placed = placed_in
+                    .new_texture(&texture, offset)
+                    .expect("never a raise");
                 let placed = placed.unwrap_or_else(|| panic!("{what}, placed at {offset:#x}"));
                 assert_eq!(placed.resource_options(), 0x120);
             }
