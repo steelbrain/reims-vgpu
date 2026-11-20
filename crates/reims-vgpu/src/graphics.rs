@@ -820,7 +820,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 );
             }
             // The reset gate ([`GraphicsControl::reset_gate`]), which the staged copies' spares'
-            // top-ups and the takes of blocks ahead of shapes' images hold shared too.
+            // top-ups, the takes of blocks ahead of shapes' images and the video caches' spare
+            // surfaces' makes hold shared too.
             let reset_gate: Arc<RwLock<()>> = Arc::default();
             // A platform that places shapes' images takes the block of a large surface's
             // whole-extent shape ahead of its image, off the ring
@@ -916,7 +917,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 }
                 #[cfg(windows)]
                 if cached && let Some(draw) = video.plane_draws() {
-                    decoder.set_drawn_caches(draw);
+                    decoder.set_drawn_caches(draw, Arc::clone(&reset_gate));
                 }
                 decoder.set_video(video);
             }

@@ -49,6 +49,10 @@
 //!   the take of a block ahead of its cache's whole-extent shape's image, handed over after the
 //!   block's `SURFACE_PAGES` is answered (`surface_cache::shapes`, "Blocks taken ahead"), under
 //!   the reset gate held shared, waiting for no key's job and answering nothing.
+//! - The video caches' spare surfaces' worker's (`reims-vgpu.graphics-drawn-spares-<i>`, on
+//!   Windows) jobs share one key: the spare surfaces over Direct3D 11 textures an ask hands over,
+//!   made ahead one at a time (`surface_cache`'s `exported` and `spares`), each under the reset
+//!   gate held shared, waiting for no key's job and answering nothing.
 //!
 //! **No job waits for another key's.** A job waits only for jobs of its own key, which were handed
 //! over before it and are done when it runs: a `BUFFER_OVER_PAGES` waits for its block's

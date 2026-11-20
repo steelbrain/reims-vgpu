@@ -63,6 +63,8 @@ use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
 use reims_vgpu_vulkan::core::platform::event::EventRef;
+#[cfg(windows)]
+use reims_vgpu_vulkan::core::platform::event::SharedEvent as _;
 use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 #[cfg(unix)]
 use reims_vgpu_vulkan::core::platform::resource::SurfaceMemory;
@@ -892,6 +894,13 @@ pub(super) fn decode_op<P: Platform>(
     // output it would land over among them.
     objs.wait_for_order_on_cpu();
     let done = session.decode(&decode)?;
+    // The guest's decodes in flight, this one among them, as many as the spare surfaces of the
+    // caches over Direct3D 11 textures an ask keeps (`surface_cache`'s `exported`).
+    #[cfg(windows)]
+    if let EventRef::Shared(event) = session.event() {
+        let in_flight = done.value.saturating_sub(event.signaled_value());
+        objs.surface_caches.saw_decodes_in_flight(in_flight);
+    }
     // A decoder's new output whose first fill the buffer's begin took as met holds the cache's
     // zeros: a picture lands over them, and none makes the fill, before anything reads the cache
     // (`surface_cache`, "Fill").
@@ -1009,10 +1018,15 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Makes each laid-out cache of two planes from now on one whose planes may lie over
     /// Direct3D 11 textures that `draw` writes the host's video's pictures into
     /// (`graphics::drawn`): set once, at the device's make, before any cache, where the device's
-    /// video lands pictures so.
+    /// video lands pictures so, their spares made ahead under the device's `reset_gate` held
+    /// shared.
     #[cfg(windows)]
-    pub(crate) fn set_drawn_caches(&self, draw: Arc<reims_vgpu_video::vaapi::PlaneDraw>) {
-        self.shared.surface_caches.set_drawn(draw);
+    pub(crate) fn set_drawn_caches(
+        &self,
+        draw: Arc<reims_vgpu_video::vaapi::PlaneDraw>,
+        reset_gate: Arc<parking_lot::RwLock<()>>,
+    ) {
+        self.shared.surface_caches.set_drawn(draw, reset_gate);
     }
 
     /// A hold of the session `id` names; an exec fault where it names none, and a refused

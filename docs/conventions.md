@@ -144,7 +144,11 @@ repeats the ones code cites.
     picture the CPU copied, the GPU's copy declined; `video-pictures-drawn`,
     a picture drawn into a cache's planes over Direct3D 11 textures, and
     `video-drawn-kib`, the KiB of their crops: one GPU pass a picture that
-    a Mac does not make) and its decodes'
+    a Mac does not make; `video-drawn-spares-used` and
+    `video-drawn-spares-missed`, such a cache's surfaces that used a spare
+    made ahead and those made on the guest's ring-0 thread, and
+    `video-drawn-spares-made` and `video-drawn-spares-dropped`, the spares
+    made and those dropped untaken: no degradation) and its decodes'
     (`video-landing-failure-carried`, a picture whose copy into its output's
     caches failed after its command buffer completed at its decode, the
     session's next decode failing in its stead), the rt platform's on Windows

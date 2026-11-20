@@ -57,6 +57,20 @@
 //! shapes of 23608 MiB, nearly all of them those surfaces' 3954 plane shapes, in 2522 fills on
 //! the transfer queue; the caches' fills took 2502 ms of the GPU's time, and a held picture's
 //! decode op waited 5.0 to 11.5 ms for its planes (each pass's mean), which waited for that fill.
+//!
+//! Such a surface is made on the ring-0 thread that carries the guest's texture make out, which
+//! the guest's next messages wait for, and a player that holds each picture it decoded takes a
+//! new IOSurface, and so a new surface, for every picture. So each ask of a surface takes a spare
+//! made ahead for the same ask, where one is kept, and hands the makes of the next ones over to a
+//! thread of the spares' own, `reims-vgpu.graphics-drawn-spares-<i>` (`spares`,
+//! [`DrawnSpares`]), which nothing waits for; an ask that finds none makes its surface itself, as
+//! before. An ask keeps as many spares, kept and being made, as the guest had decodes in flight
+//! at its last decode on the device's video ([`Caches::saw_decodes_in_flight`]), at least one
+//! and at most `spares::MOST_SPARES` of every ask, by the plane shapes, their formats and the
+//! device's recoveries it was made at, so none made before a recovery is taken after it.
+//! Counted: `video-drawn-spares-used`, the asks that took a spare; `video-drawn-spares-missed`,
+//! those that made their own; `video-drawn-spares-made`, the spares made; and
+//! `video-drawn-spares-dropped`, those let go of untaken.
 
 use std::sync::Arc;
 
@@ -76,10 +90,17 @@ use reims_vgpu_vulkan::core::platform::values::PagesPlane;
 use reims_vgpu_vulkan::core::raise::refusals;
 
 #[cfg(windows)]
+use parking_lot::RwLock;
+#[cfg(windows)]
+use reims_vgpu_vulkan::core::raise::Raise;
+
+#[cfg(windows)]
 use super::super::super::drawn::{DrawnPlanes, DrawnTarget};
 #[cfg(unix)]
 use super::super::video::SurfaceTarget;
 use super::shapes::{Held, ShapeCounts, ShapeKey, ShapeTable};
+#[cfg(windows)]
+use super::spares::{SpareCodes, Spares};
 use super::{Caches, ON, SurfaceCaches};
 
 /// While a video cache's buffer is a copy of its own, apart from its surface's memory: a picture
@@ -619,6 +640,7 @@ pub(super) struct DrawnSurface<P: Platform> {
 /// plane shapes, each plane's image format and its texture's element format, and whether its
 /// samples are 16 bits.
 #[cfg(windows)]
+#[derive(Clone, PartialEq)]
 pub(super) struct DrawnAsk {
     keys: [ShapeKey; 2],
     formats: [u64; 2],
@@ -630,33 +652,51 @@ pub(super) struct DrawnAsk {
 #[cfg(windows)]
 static UNDRAWN_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The spare surfaces over Direct3D 11 textures made ahead (the module doc), by their ask and the
+/// device's recoveries they were made at.
+#[cfg(windows)]
+pub(super) type DrawnSpares<P> = Spares<(DrawnAsk, u64), (ImportedSurface<P>, DrawnPlanes)>;
+
+/// The kinds [`DrawnSpares`] count (the module doc).
+#[cfg(windows)]
+static DRAWN_SPARE_CODES: SpareCodes = SpareCodes {
+    used: "video-drawn-spares-used",
+    missed: "video-drawn-spares-missed",
+    made: "video-drawn-spares-made",
+    dropped: "video-drawn-spares-dropped",
+};
+
+/// The spare surfaces made ahead for a device's caches (the module doc), each make under the
+/// device's reset `gate` held shared.
+#[cfg(windows)]
+pub(super) fn drawn_spares<P: Platform>(gate: Arc<RwLock<()>>) -> DrawnSpares<P> {
+    Spares::new("reims-vgpu.graphics-drawn-spares", gate, &DRAWN_SPARE_CODES)
+}
+
+/// Why [`DrawnAsk::make`] made no surface.
+#[cfg(windows)]
+enum Unmade {
+    /// The textures were not made, and why.
+    Textures(String),
+    /// The platform raised at the surface.
+    Raised(Raise),
+    /// The platform made none, or the shapes are past a texture's size.
+    None,
+}
+
 #[cfg(windows)]
 impl DrawnAsk {
     /// The surface that `device` makes over new Direct3D 11 textures of the plane shapes' sizes,
-    /// which `draw` makes for the block at `block`'s cache, with those textures. `None` where
-    /// either makes none; the process's first such miss of the textures is logged.
+    /// which `draw` makes, with those textures; why none was made where either makes none.
     fn make<P: Platform>(
         &self,
         device: &P::Device,
         draw: &Arc<reims_vgpu_video::vaapi::PlaneDraw>,
-        block: u64,
-    ) -> Option<(ImportedSurface<P>, DrawnPlanes)> {
-        let width = u32::try_from(self.keys[0].width).ok()?;
-        let height = u32::try_from(self.keys[0].height).ok()?;
-        let drawn = match DrawnPlanes::new(draw, (width, height), self.ten_bit) {
-            Ok(drawn) => drawn,
-            Err(why) => {
-                if !UNDRAWN_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    log::warn!(
-                        target: "reims_vgpu::graphics",
-                        "the IOSurface block at {block:#x}: no Direct3D 11 textures for its video \
-                         planes ({why}); they stay in images of their own, counted from here as \
-                         surfaces the platform made none of"
-                    );
-                }
-                return None;
-            }
-        };
+    ) -> Result<(ImportedSurface<P>, DrawnPlanes), Unmade> {
+        let width = u32::try_from(self.keys[0].width).map_err(|_| Unmade::None)?;
+        let height = u32::try_from(self.keys[0].height).map_err(|_| Unmade::None)?;
+        let drawn =
+            DrawnPlanes::new(draw, (width, height), self.ten_bit).map_err(Unmade::Textures)?;
         let targets = drawn.targets();
         let handles = [targets.luma_handle(), targets.chroma_handle()];
         let planes: [D3d11PlaneDesc<'_>; 2] = std::array::from_fn(|n| D3d11PlaneDesc {
@@ -668,8 +708,35 @@ impl DrawnAsk {
             usage: PLANE_USAGE,
         });
         match device.import_d3d11_surface(ON, &planes) {
-            Ok(made) => (made.filter(|m| m.planes.len() == 2)).map(|made| (made, drawn)),
-            Err(raise) => {
+            Ok(made) => (made.filter(|m| m.planes.len() == 2))
+                .map(|made| (made, drawn))
+                .ok_or(Unmade::None),
+            Err(raise) => Err(Unmade::Raised(raise)),
+        }
+    }
+
+    /// [`Self::make`] for the block at `block`'s cache: `None` where no surface was made, the
+    /// process's first miss of the textures logged, and each raise.
+    fn make_for<P: Platform>(
+        &self,
+        device: &P::Device,
+        draw: &Arc<reims_vgpu_video::vaapi::PlaneDraw>,
+        block: u64,
+    ) -> Option<(ImportedSurface<P>, DrawnPlanes)> {
+        match self.make::<P>(device, draw) {
+            Ok(made) => Some(made),
+            Err(Unmade::Textures(why)) => {
+                if !UNDRAWN_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "the IOSurface block at {block:#x}: no Direct3D 11 textures for its video \
+                         planes ({why}); they stay in images of their own, counted from here as \
+                         surfaces the platform made none of"
+                    );
+                }
+                None
+            }
+            Err(Unmade::Raised(raise)) => {
                 log::warn!(
                     target: "reims_vgpu::graphics", kind:% = raise;
                     "the IOSurface block at {block:#x}: the platform raised at its video planes' \
@@ -677,6 +744,7 @@ impl DrawnAsk {
                 );
                 None
             }
+            Err(Unmade::None) => None,
         }
     }
 }
@@ -811,11 +879,12 @@ type DrawnGone<P> = (
 #[cfg(windows)]
 impl<P: Platform> Caches<P> {
     /// The plane shape `key` of the block at `block`'s cache, where `key` asks its surface's
-    /// (module doc): the surface made over two new Direct3D 11 textures with the lock let go of,
-    /// its planes added as the cache's plane shapes ([`SurfaceCaches::add_drawn_planes`]), and a
-    /// reference to `key`'s and its image. `None` where the cache takes no surface for `key`, or
-    /// no textures or surface were made (counted), for the caller to make the shape's image of
-    /// its own.
+    /// (module doc): the spare made ahead for its ask, else the surface made over two new
+    /// Direct3D 11 textures with the lock let go of, its planes added as the cache's plane shapes
+    /// ([`SurfaceCaches::add_drawn_planes`]), and a reference to `key`'s and its image; the next
+    /// spare's make handed over. `None` where the cache takes no surface for `key`, or no
+    /// textures or surface were made (counted), for the caller to make the shape's image of its
+    /// own.
     pub(super) fn plane_shape(
         &self,
         device: &P::Device,
@@ -824,10 +893,17 @@ impl<P: Platform> Caches<P> {
     ) -> Option<Held<P::Texture>> {
         let draw = self.drawn()?;
         let ask = self.state.lock().drawn_ask(block, key)?;
-        let Some((made, drawn)) = ask.make::<P>(device, &draw, block) else {
+        let spares = self.drawn_spares.get();
+        let spare_ask = (ask.clone(), device.recoveries());
+        let spare = spares.and_then(|spares| spares.take(&spare_ask));
+        let Some((made, drawn)) = spare.or_else(|| ask.make_for::<P>(device, &draw, block)) else {
             self.state.lock().counts.shapes.surfaces_refused += 1;
             return None;
         };
+        if let Some(spares) = spares {
+            let (device, draw, next) = (device.clone_ref(), Arc::clone(&draw), ask.clone());
+            spares.want(spare_ask, move || next.make::<P>(&device, &draw).ok());
+        }
         let (found, gone) = (self.state.lock()).add_drawn_planes(block, key, &ask, made, drawn);
         if let Err(refusal) = refusals::refusing(move || drop(gone)) {
             log::warn!(
@@ -845,6 +921,14 @@ impl<P: Platform> Caches<P> {
     pub(crate) fn drawn_targets(&self, block: u64) -> Option<[DrawnTarget<P>; 2]> {
         let mut state = self.state.lock();
         state.by_block.get_mut(&block)?.surface.drawn_targets()
+    }
+
+    /// Makes `in_flight`, the guest's decodes in flight on the device's video at its last decode,
+    /// the spare surfaces an ask keeps (module doc), where the caches make spares.
+    pub(crate) fn saw_decodes_in_flight(&self, in_flight: u64) {
+        if let Some(spares) = self.drawn_spares.get() {
+            spares.set_depth(in_flight);
+        }
     }
 }
 

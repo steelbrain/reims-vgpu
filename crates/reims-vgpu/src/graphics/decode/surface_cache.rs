@@ -469,6 +469,8 @@ use crate::platform::ShapeBlock;
 
 mod exported;
 pub(crate) mod shapes;
+#[cfg(any(windows, test))]
+mod spares;
 
 pub(crate) use exported::planes_line;
 
@@ -5588,6 +5590,9 @@ pub(crate) struct Caches<P: Platform> {
     /// What takes blocks ahead of shapes' images, and places images in them
     /// ([`Self::set_shape_blocks`], [`shapes`]'s "Blocks taken ahead").
     shape_blocks: OnceLock<ShapeBlocks<P>>,
+    /// The spare surfaces over Direct3D 11 textures made ahead ([`Self::set_drawn`], `exported`).
+    #[cfg(windows)]
+    drawn_spares: OnceLock<exported::DrawnSpares<P>>,
 }
 
 /// What takes a block ahead of a shape's image on the device, for an image of each of the
@@ -6190,6 +6195,8 @@ impl<P: Platform> Caches<P> {
             shapes_placed: AtomicBool::new(false),
             staged: AtomicBool::new(false),
             shape_blocks: OnceLock::new(),
+            #[cfg(windows)]
+            drawn_spares: OnceLock::new(),
         }
     }
 
@@ -6871,9 +6878,15 @@ impl<P: Platform> Caches<P> {
     /// planes may lie over Direct3D 11 textures that `draw` writes its pictures into
     /// (`graphics::drawn`): set once, at the device's make, before any cache, where the device's
     /// video lands its pictures so. The video lands pictures only in two-plane surfaces (NV12,
-    /// P010), so a cache of one plane is made as any other laid-out cache.
+    /// P010), so a cache of one plane is made as any other laid-out cache. The surfaces' spares
+    /// are made ahead under the device's reset `gate` held shared (`exported`).
     #[cfg(windows)]
-    pub(crate) fn set_drawn(&self, draw: Arc<reims_vgpu_video::vaapi::PlaneDraw>) {
+    pub(crate) fn set_drawn(
+        &self,
+        draw: Arc<reims_vgpu_video::vaapi::PlaneDraw>,
+        gate: Arc<RwLock<()>>,
+    ) {
+        drop(self.drawn_spares.set(exported::drawn_spares(gate)));
         self.lock().drawn = Some(draw);
     }
 
