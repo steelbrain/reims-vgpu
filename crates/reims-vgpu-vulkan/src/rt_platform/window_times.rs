@@ -1,7 +1,7 @@
 //! A window's own times, for the host's summary of each ten seconds (reims-vgpu's
 //! `graphics::summary`). Each kind is counted in full, every call or command buffer of it, with
 //! its count, its time in all and the longest ([`take`]), and written as the summary's `window:`
-//! part ([`line`]):
+//! part ([`line()`]):
 //! - **`vkAcquireNextImageKHR`**: the CPU time inside each call of a window's swapchain
 //!   (`super::swapchain`), from the call's start, holding the window system's lock, to its
 //!   return. A take of an image makes one call or more, each waiting up to 1 ms
