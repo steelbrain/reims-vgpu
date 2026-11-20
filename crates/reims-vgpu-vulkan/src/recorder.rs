@@ -1004,6 +1004,53 @@ impl<T: Send + Sync + 'static> RecObj for crate::rt_platform::RtObj<T> {
     }
 }
 
+/// A platform's runtime command buffer under a guest's, which the recorder holds until the
+/// completion it takes is taken ([`Completion::raw`]) and reads the status of.
+#[derive(Clone)]
+pub enum RawCb {
+    /// The Vulkan platform's runtime's.
+    Vulkan(metal2vulkan_runtime::CommandBuffer),
+}
+
+impl RawCb {
+    /// Whether it completed or failed.
+    fn finished(&self) -> bool {
+        match self {
+            RawCb::Vulkan(raw) => is_final(CommandBufferStatus(raw.status().raw())),
+        }
+    }
+}
+
+/// Whether `status` is a command buffer's last: completed or failed.
+fn is_final(status: CommandBufferStatus) -> bool {
+    status == CommandBufferStatus::COMPLETED || status == CommandBufferStatus::ERROR
+}
+
+/// A command buffer of a platform's whose commits the recorder writes memory around
+/// ([`before_commit`]).
+pub trait RecCommandBuffer: RecObj {
+    /// Its runtime's command buffer, which the recorder holds until its completion is taken.
+    fn rec_raw(&self) -> RawCb;
+    /// Runs `seen` where the platform sees the command buffer complete, before any of its
+    /// handlers can tell the guest; never, where the platform refuses a handler of it.
+    fn rec_on_seen(&self, seen: Box<dyn FnOnce() + Send>);
+}
+
+impl RecCommandBuffer for VulkanCommandBuffer {
+    fn rec_raw(&self) -> RawCb {
+        RawCb::Vulkan(self.raw.clone())
+    }
+
+    /// A completion-seen handler of the runtime's, after any of core's added before (whose hook
+    /// takes the bytes first), before its completed handlers and before `waitUntilCompleted`
+    /// returns.
+    fn rec_on_seen(&self, seen: Box<dyn FnOnce() + Send>) {
+        let seen: metal2vulkan_runtime::Handler =
+            Box::new(move |_: &metal2vulkan_runtime::CommandBuffer| seen());
+        let _ = self.raw.add_completion_seen_handler(seen);
+    }
+}
+
 /// The selector of a device's identity record ([`Identity`]).
 pub const IDENTITY: &str = "m2v.deviceIdentity";
 
@@ -1500,12 +1547,14 @@ pub fn draws<T: Send + Sync + 'static>(
 /// learning of one before it completes ([`event_reached`]), and the events it waits for, which its
 /// completion tells reached; and the runtime's command buffer, held until the completion is taken
 /// ([`Completion::raw`]).
-pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
+pub fn before_commit<C: RecCommandBuffer>(active: &Option<Active>, cb: &C) {
     if active.is_none() {
         return;
     }
     let Some(state) = state() else { return };
-    let Some(id) = id_at(cb.id().0) else { return };
+    let Some(id) = id_at(cb.rec_ptr()) else {
+        return;
+    };
     state.drain(true);
     let t0 = now_ns();
     let mut reaped = state.reap();
@@ -1540,7 +1589,7 @@ pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
             signals: signals.into_iter().map(|(e, v)| (e, v, false)).collect(),
             waits,
             heard: false,
-            raw: cb.raw.clone(),
+            raw: cb.rec_raw(),
         };
         {
             let mut sync = state.sync.lock();
@@ -1548,13 +1597,10 @@ pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
             sync.unqueued.insert(id);
         }
         COMMITTED.with(|c| c.borrow_mut().push(id));
-        // Run where the runtime sees the command buffer complete, after any of core's added
-        // before (whose hook takes the bytes first), before its completed handlers and before
-        // `waitUntilCompleted` returns. Refused, the bytes are taken where the platform first
-        // tells of the completion, or once it is reaped.
-        let seen: metal2vulkan_runtime::Handler =
-            Box::new(move |_: &metal2vulkan_runtime::CommandBuffer| completion_seen(id));
-        let _ = cb.raw.add_completion_seen_handler(seen);
+        // Run where the platform sees the command buffer complete, before its handlers can tell
+        // the guest ([`RecCommandBuffer::rec_on_seen`]). Refused, the bytes are taken where the
+        // platform first tells of the completion, or once it is reaped.
+        cb.rec_on_seen(Box::new(move || completion_seen(id)));
     }
     let t2 = now_ns();
     (state.stats.capture_ns).fetch_add(t2 - t1, Ordering::Relaxed);
@@ -1575,11 +1621,11 @@ pub fn before_commit(active: &Option<Active>, cb: &VulkanCommandBuffer) {
 /// The stream id of `cb` while the process records, which a completion-seen handler of core's
 /// passes to [`completion_seen`] before its own work; `None`, at the cost of one relaxed load,
 /// where it does not.
-pub fn completion_key(cb: &VulkanCommandBuffer) -> Option<u64> {
+pub fn completion_key<C: RecCommandBuffer>(cb: &C) -> Option<u64> {
     if !on() {
         return None;
     }
-    id_at(cb.id().0)
+    id_at(cb.rec_ptr())
 }
 
 /// The command buffer of stream id `id` seen complete, before the platform can tell the guest
@@ -1610,11 +1656,11 @@ pub fn completion_seen(id: u64) {
 /// The stream id of the shared event `event` while the process records, which the platform
 /// passes to [`event_reached`] where it learns the event's value; `None`, at the cost of one
 /// relaxed load, where it does not.
-pub fn event_key(event: &crate::gpu::event::VulkanSharedEvent) -> Option<u64> {
+pub fn event_key<E: RecObj>(event: &E) -> Option<u64> {
     if !on() {
         return None;
     }
-    id_at(event.id().0)
+    id_at(event.rec_ptr())
 }
 
 /// The shared event of stream id `event` seen at `value` or above, where the platform learns
@@ -1816,9 +1862,9 @@ pub fn text_value<T: std::fmt::Debug>(x: &T) -> Value {
 /// buffers that can run have finished, as before a commit ([`before_commit`]), each run's bytes,
 /// read now, and the byte of `destination` they land from become the call's arguments,
 /// `[destination, [[byte, bytes], …]]`, the bytes a blob where they are long.
-pub fn guest_ram_source(
+pub fn guest_ram_source<B: RecObj>(
     active: &mut Option<Active>,
-    destination: &VulkanBuffer,
+    destination: &B,
     runs: impl Iterator<Item = (u64, std::ops::Range<u64>)>,
 ) {
     let Some(a) = active else { return };
@@ -1836,7 +1882,7 @@ pub fn guest_ram_source(
         .stats
         .wait_ns
         .fetch_add(now_ns() - t0, Ordering::Relaxed);
-    let destination = id_at(destination.id().0).map_or(Value::Nil, Value::Object);
+    let destination = id_at(destination.rec_ptr()).map_or(Value::Nil, Value::Object);
     // SAFETY: the platform copied the runs, so they lie in guest RAM a live lease holds
     // (`os::ram_over`), mapped while the lease lives.
     let (args, n) = unsafe { guest_ram_args(destination, runs) };
@@ -1884,13 +1930,13 @@ unsafe fn guest_ram_args(
 /// stream's last recorded bytes of the range are the guest's, those the GPU wrote and the stream
 /// took without a write ([`State::absorb`]) included, whenever it took them: what
 /// [`format::FLAG_ANNOUNCED_BYTES_RECORDED`] promises a player.
-pub fn before_modify(active: &Option<Active>, buffer: &VulkanBuffer, range: &NsRange) {
+pub fn before_modify<B: RecObj>(active: &Option<Active>, buffer: &B, range: &NsRange) {
     let Some(a) = active else { return };
     if !a.recorded() {
         return;
     }
     let Some(state) = state() else { return };
-    let Some(id) = id_at(buffer.id().0) else {
+    let Some(id) = id_at(buffer.rec_ptr()) else {
         return;
     };
     let ranges = state.ranges_of(&[id]);
@@ -2040,7 +2086,7 @@ struct Completion {
     /// the status and waits here. It is no object of the stream's, and holding it changes nothing
     /// the guest observes: its object, its id and its release are core's, as before. It is
     /// dropped with no recorder lock held.
-    raw: metal2vulkan_runtime::CommandBuffer,
+    raw: RawCb,
 }
 
 /// One span of host memory to compare: `start..end` of the target's bytes, the target's first
@@ -2709,7 +2755,6 @@ impl State {
     fn track(&self, call: &Call) {
         self.count_selector(&call.selector);
         let recv_type = self.type_of(call.receiver);
-        let cb_type = std::any::type_name::<CommandBufferObject>();
         let mut named = Vec::new();
         for a in &call.args {
             a.each_object(&mut |id| named.push(id));
@@ -2729,7 +2774,7 @@ impl State {
                 info.parent = parent;
             }
         }
-        let cb = if recv_type == cb_type {
+        let cb = if is_command_buffer(recv_type) {
             call.receiver
         } else {
             let objects = self.objects.lock();
@@ -2737,15 +2782,14 @@ impl State {
             let parent_is_cb = objects
                 .info
                 .get(&parent)
-                .is_some_and(|i| i.type_name == cb_type);
+                .is_some_and(|i| is_command_buffer(i.type_name));
             if parent_is_cb { parent } else { 0 }
         };
         if cb == 0 {
             // A descriptor keeps what its calls name, for the encoder made of it.
             // So does an indirect command buffer what its commands name, for the command buffers
             // that execute it, whose calls name only the buffer.
-            let icb = recv_type == std::any::type_name::<crate::gpu::icb::IcbObject>();
-            if (recv_type.contains("Descriptor") || icb) && !named.is_empty() {
+            if (is_descriptor(recv_type) || is_icb(recv_type)) && !named.is_empty() {
                 let mut objects = self.objects.lock();
                 if let Some(info) = objects.info.get_mut(&call.receiver) {
                     info.refs.extend(named.iter().copied());
@@ -2784,9 +2828,8 @@ impl State {
             }
             // An indirect command buffer named here lets go of what was released since its
             // commands named it, which a capture skips (`ranges_of`), so its refs stay few.
-            let icb = std::any::type_name::<crate::gpu::icb::IcbObject>();
             for id in &named {
-                let Some(info) = objects.info.get(id).filter(|i| i.type_name == icb) else {
+                let Some(info) = objects.info.get(id).filter(|i| is_icb(i.type_name)) else {
                     continue;
                 };
                 let gone: Vec<u64> = (info.refs.iter().copied())
@@ -2799,7 +2842,7 @@ impl State {
                 }
             }
         }
-        if recv_type.contains("BlitCommandEncoder") {
+        if is_blit_encoder(recv_type) {
             gpu_writes.extend(blit_writes(call, &named));
         }
         let stores = may_store(recv_type, call);
@@ -2842,7 +2885,7 @@ impl State {
                 let info = objects.info.get(&cb);
                 let queue = info.map_or(0, |i| i.parent);
                 let weak = info
-                    .filter(|i| i.type_name == cb_type)
+                    .filter(|i| is_command_buffer(i.type_name))
                     .and_then(|i| i.weak.clone());
                 drop(objects);
                 if let Some(weak) = weak {
@@ -2874,16 +2917,16 @@ impl State {
                 signalled,
                 ..
             } = &mut *sync;
-            // The command buffers looked at are let go once the lock is (`let_go_cb` may record a
-            // release).
+            // The command buffers looked at are let go once the lock is (`HeldCb::let_go` may
+            // record a release).
             let mut done = Vec::new();
             pending.retain(|p| {
                 let finished = match absorbs.get(&p.id) {
-                    Some(completion) => raw_finished(&completion.raw),
+                    Some(completion) => completion.raw.finished(),
                     None => match upgrade_cb(&p.weak) {
                         None => true,
                         Some(cb) => {
-                            let finished = finished(&cb);
+                            let finished = cb.finished();
                             held.push(cb);
                             finished
                         }
@@ -2900,7 +2943,7 @@ impl State {
                 *s = (*s).max(v);
             }
         }
-        held.into_iter().for_each(let_go_cb);
+        held.into_iter().for_each(HeldCb::let_go);
         reaped
     }
 
@@ -3140,11 +3183,11 @@ impl State {
             self.stats.waits.fetch_add(1, Ordering::Relaxed);
             loop {
                 let done = match watched {
-                    Watched::Raw(raw) => raw_finished(raw),
+                    Watched::Raw(raw) => raw.finished(),
                     Watched::Weak(weak) => {
                         let Some(cb) = upgrade_cb(weak) else { break };
-                        let done = finished(&cb);
-                        let_go_cb(cb);
+                        let done = cb.finished();
+                        cb.let_go();
                         done
                     }
                 };
@@ -3256,12 +3299,25 @@ impl State {
         spans: &mut Vec<Span>,
     ) {
         let Some(ptr) = b.raw.contents() else { return };
-        let ptr = ptr.as_ptr().addr();
-        let length = b.raw.length();
+        let heap = b.heap.as_ref().and_then(|heap| id_at(heap.id().0));
+        let host = (ptr.as_ptr().addr(), b.raw.length());
+        self.host_span(id, host, heap, bytes, spans);
+    }
+
+    /// The span of `bytes` of the buffer of stream id `id`, all of it where `None`, its bytes at
+    /// `ptr` in host memory and `length` long: in its block, where it lies in the block of the
+    /// heap of stream id `heap`, else its own.
+    fn host_span(
+        &self,
+        id: u64,
+        (ptr, length): (usize, u64),
+        heap: Option<u64>,
+        bytes: Option<std::ops::Range<u64>>,
+        spans: &mut Vec<Span>,
+    ) {
         let bytes = bytes.unwrap_or(0..length);
         // A buffer in a block is written as the block's bytes.
-        if let Some(heap) = &b.heap
-            && let Some(hid) = id_at(heap.id().0)
+        if let Some(hid) = heap
             && let Some((base, len)) = self.block_of(hid)
             && ptr >= base
             && ((ptr - base) as u64) < len
@@ -3472,14 +3528,67 @@ impl State {
 
 /// The committed command buffer `weak` names, while it lives: upgraded on a calling thread
 /// alone, so the writer never holds an object's last reference.
-fn upgrade_cb(weak: &Weak<dyn Any + Send + Sync>) -> Option<Arc<CommandBufferObject>> {
+fn upgrade_cb(weak: &Weak<dyn Any + Send + Sync>) -> Option<HeldCb> {
     match weak.upgrade()?.downcast::<CommandBufferObject>() {
-        Ok(cb) => Some(cb),
+        Ok(cb) => Some(HeldCb::Vulkan(cb)),
         Err(other) => {
             let_go_any(other);
             None
         }
     }
+}
+
+/// A guest's command buffer the recorder holds for a moment ([`upgrade_cb`]).
+enum HeldCb {
+    /// The Vulkan platform's.
+    Vulkan(Arc<CommandBufferObject>),
+}
+
+impl HeldCb {
+    /// Whether it completed or failed.
+    fn finished(&self) -> bool {
+        match self {
+            HeldCb::Vulkan(cb) => is_final(CommandBufferStatus(cb.raw.status().raw())),
+        }
+    }
+
+    /// Drops it: where that was its last reference, as its handle's drop does, its release
+    /// record first.
+    fn let_go(self) {
+        match self {
+            HeldCb::Vulkan(cb) => let_go_cb(cb),
+        }
+    }
+}
+
+/// Whether objects of the type `type_name` are command buffers, whose encoders' calls, and
+/// their own, a commit's capture follows ([`State::track`]).
+fn is_command_buffer(type_name: &str) -> bool {
+    type_name == std::any::type_name::<CommandBufferObject>()
+}
+
+/// Whether objects of the type `type_name` are indirect command buffers, which keep what their
+/// commands name for the command buffers that execute them.
+fn is_icb(type_name: &str) -> bool {
+    type_name == std::any::type_name::<crate::gpu::icb::IcbObject>()
+}
+
+/// Whether objects of the type `type_name` are descriptors, which keep what their calls name for
+/// the encoders made of them.
+fn is_descriptor(type_name: &str) -> bool {
+    type_name.contains("Descriptor")
+}
+
+/// Whether objects of the type `type_name` are blit encoders ([`blit_writes`]).
+fn is_blit_encoder(type_name: &str) -> bool {
+    type_name.contains("BlitCommandEncoder")
+}
+
+/// Whether objects of the type `type_name` are compute or render encoders, whose kernels and
+/// render stages could store to what their calls reach ([`may_store`]).
+fn is_storing_encoder(type_name: &str) -> bool {
+    type_name == std::any::type_name::<crate::gpu::predication::PredicatedEncoder>()
+        || type_name == std::any::type_name::<crate::gpu::encode_render::RenderEncoderObject>()
 }
 
 /// `MTLResourceUsageWrite`.
@@ -3492,9 +3601,7 @@ const USAGE_WRITE: u64 = 2;
 /// is taken as written, and so are the resources an argument buffer names, as `useResources:`
 /// with a write and `useHeaps:` name them, and what an indirect command buffer's commands bind.
 fn may_store(recv_type: &str, call: &Call) -> bool {
-    let compute = std::any::type_name::<crate::gpu::predication::PredicatedEncoder>();
-    let render = std::any::type_name::<crate::gpu::encode_render::RenderEncoderObject>();
-    if recv_type != compute && recv_type != render {
+    if !is_storing_encoder(recv_type) {
         return false;
     }
     if !call.selector.starts_with("useResources:count:usage:") {
@@ -3561,28 +3668,17 @@ fn gpu_copy_apart(b: &BufferObject) -> bool {
     b.raw.storage_mode().raw() == MANAGED && !b.device.raw.properties().has_unified_memory
 }
 
-/// Whether the command buffer completed or failed.
-fn finished(cb: &CommandBufferObject) -> bool {
-    raw_finished(&cb.raw)
-}
-
-/// Whether the runtime's command buffer completed or failed.
-fn raw_finished(raw: &metal2vulkan_runtime::CommandBuffer) -> bool {
-    let status = raw.status().raw();
-    status == CommandBufferStatus::COMPLETED.raw() || status == CommandBufferStatus::ERROR.raw()
-}
-
 /// A committed command buffer a capture waits for ([`State::wait_for_earlier`]).
 enum Watched {
     /// The runtime's, of one whose completion is to be taken ([`Completion::raw`]).
-    Raw(metal2vulkan_runtime::CommandBuffer),
+    Raw(RawCb),
     /// The guest's, while it lives ([`upgrade_cb`]).
     Weak(Weak<dyn Any + Send + Sync>),
 }
 
 /// Drops a command buffer the recorder held for a moment: where that was its last reference, as
-/// `Obj`'s drop does, its release record first.
-fn let_go_cb(cb: Arc<CommandBufferObject>) {
+/// its handle's drop does, its release record first.
+fn let_go_cb<T>(cb: Arc<T>) {
     let ptr = Arc::as_ptr(&cb).cast::<u8>().addr() as u64;
     if let Some(inner) = Arc::into_inner(cb) {
         released(ptr);
