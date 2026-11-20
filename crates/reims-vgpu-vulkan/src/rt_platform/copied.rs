@@ -9,8 +9,9 @@
 //!   an image of its own that rt copies the buffer's bytes into at each submission that uses it,
 //!   as over an import (rt's `Buffer::new_texture`). The device answers the pages, not the copy,
 //!   as a buffer's `contents` and as the block's mapping (`super::buffer::KnownBlocks`).
-//! - **The base.** For each copy, the bytes the pages and the copy last agreed on, in the
-//!   process's memory: at first the bytes copied.
+//! - **The base.** For each copy of pages whose GPU writes reach them, the bytes the pages and
+//!   the copy last agreed on, in the process's memory: at first the bytes copied. A copy of pages
+//!   whose GPU writes are dropped has none.
 //! - **Synced for the command buffers that use it** ([`Used`]), as Metal makes resident for a
 //!   command buffer the resources its encoders set and those it declares, and no others: a
 //!   buffer, a texture or a heap over the copy that an encoder sets (a buffer or texture bound, a
@@ -35,7 +36,8 @@
 //!   before rt is handed the command buffer, so before the work that reads it): every byte of the
 //!   pages that differs from the base is written into the copy and the base. A byte the CPU did
 //!   not change is never written, so a GPU write to the copy by work still in flight stays. rt's
-//!   memory of a Shared block is coherent, so the GPU reads the bytes written with no flush.
+//!   memory of a Shared block is coherent, so the GPU reads the bytes written with no flush. A
+//!   copy of pages whose GPU writes are dropped is written whole instead ("Writes dropped").
 //! - **Merged back at the completions of the command buffers that can write it** ([`merging`],
 //!   the first of the command buffer's completed handlers, so before core's and before a waiter
 //!   returns): every byte of the copy that differs from the base is written into the pages where
@@ -48,14 +50,15 @@
 //!   copy, as memory the guest writes at any time is read, and compared with the base's, and only
 //!   a chunk that differs is compared a word and then a byte at a time, and stored byte by byte
 //!   where not all of a word's bytes change.
-//! - **Writes dropped** where the copy is of pages whose GPU writes Metal drops ([`import`]'s
-//!   `drops`: pages their process maps read-only, `super::buffer`'s docs, "Read-only memory"): at
-//!   each completion of a command buffer that can write it every byte the GPU changed in the copy
-//!   is put back from the base instead, and nothing is ever written into the pages, so the CPU and
-//!   the command buffers committed after the completion read the pages' bytes, as the M3 Max, the
-//!   5300M and the UHD 630 answer (`crate::gpu::command`'s docs). Within a command buffer, and
-//!   between command buffers in flight at once, a read after the GPU's write sees the write until
-//!   the completion that drops it.
+//! - **Writes dropped** where the copy is of pages whose GPU writes Metal drops ([`Kind::Drops`]:
+//!   pages their process maps read-only, `super::buffer`'s docs, "Read-only memory"): nothing is
+//!   ever written into the pages, and each commit that uses the copy writes the whole of the pages
+//!   into it, with no base and no compare, so the CPU and the command buffers committed after a
+//!   write read the pages' bytes, as the M3 Max, the 5300M and the UHD 630 answer
+//!   (`crate::gpu::command`'s docs). A completion does nothing with such a copy. Within a command
+//!   buffer, and between command buffers in flight at once, a read after the GPU's write sees the
+//!   write until the next commit that uses the copy, which writes over it, that of work still in
+//!   flight among it.
 //! - **Unchanging pages** ([`Kind::Unchanging`]): a copy of pages whose GPU writes are dropped
 //!   that are a file's own on a volume mounted read-only, which no one writes while the block
 //!   lives (`RGFX_SURFACE_PAGES_UNCHANGING`, the guest's word, read once as the copy is made).
@@ -73,13 +76,17 @@
 //!   copy just made is held by [`import`] too, until the make that asked for it holds it
 //!   ([`Fresh`]).
 //!
-//! Counted: the bytes written into copies ([`IN_BYTES_CODE`]) and into pages ([`BACK_BYTES_CODE`]),
-//! the bytes of the GPU's writes dropped ([`DROPPED_BYTES_CODE`]), the bytes of unchanging pages
-//! written into their copies again ([`RESTORED_BYTES_CODE`]), the render passes that store into a
-//! copy whose writes are dropped ([`STORE_OUTS_CODE`]), and the nanoseconds the syncs took
-//! ([`SYNC_NS_CODE`]); and as each copy of pages whose writes are dropped is made, its KiB, by
-//! whether the pages are unchanging and how their process maps them
-//! ([`UNCHANGING_KIB_CODE`], [`UNCHANGING_COW_KIB_CODE`], [`READ_ONLY_KIB_CODE`]).
+//! Counted: the bytes the CPU changed that commits wrote into copies ([`IN_BYTES_CODE`]) and the
+//! GPU's that completions wrote into pages ([`BACK_BYTES_CODE`]), the render passes that store
+//! into a copy whose writes are dropped ([`STORE_OUTS_CODE`]), and the nanoseconds the syncs took
+//! ([`SYNC_NS_CODE`]); by kind ([`COMMITS_CODES`], [`BYTES_CODES`], [`NS_CODES`]), the commits that
+//! use a copy, the bytes the syncs went through (the writable copies' compared, the read-only
+//! ones' written whole, the unchanging ones' written again), and their nanoseconds; the commits
+//! and bytes of the read-only copies by the guest's why ([`WHY_COMMITS_CODES`],
+//! [`WHY_BYTES_CODES`], `crate::core::platform::values::pages_why`); and as each copy of pages
+//! whose writes are dropped is made, its KiB, by whether the pages are unchanging and how their
+//! process maps them ([`UNCHANGING_KIB_CODE`], [`UNCHANGING_COW_KIB_CODE`],
+//! [`READ_ONLY_KIB_CODE`]).
 
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
@@ -100,21 +107,93 @@ use super::RtPlatform;
 use super::buffer::RtBuffer;
 use super::heap::RtHeap;
 
-/// The code whose count is the bytes the CPU changed in copied pages that commits wrote into their
-/// copies ([`copy_in`]).
+/// The code whose count is the bytes the CPU changed in copied pages whose GPU writes reach them
+/// that commits wrote into their copies ([`copy_in`]).
 pub const IN_BYTES_CODE: &str = "rt-copied-in-bytes";
 
 /// The code whose count is the bytes the GPU changed in copies that completions wrote into their
 /// pages ([`merging`]).
 pub const BACK_BYTES_CODE: &str = "rt-copied-back-bytes";
 
-/// The code whose count is the bytes the GPU changed in copies whose writes are dropped that
-/// completions put back from their bases ([`merging`], the module's docs, "Writes dropped").
-pub const DROPPED_BYTES_CODE: &str = "rt-copied-dropped-bytes";
-
 /// The code whose count is the bytes of unchanging pages that completions wrote into their copies
 /// again, putting back the GPU's writes ([`merging`], the module's docs, "Unchanging pages").
 pub const RESTORED_BYTES_CODE: &str = "rt-copied-restored-bytes";
+
+/// The codes whose counts are the commits that use a copy, by kind ([`kind_at`]): of pages whose
+/// GPU writes reach them, which the commit compares; of read-only pages that may change, which it
+/// writes whole; of unchanging pages, which it leaves as they are ([`copy_in`]).
+pub const COMMITS_CODES: [&str; KINDS] = [
+    "rt-copied-writable-commits",
+    "rt-copied-read-only-commits",
+    "rt-copied-unchanging-commits",
+];
+
+/// The codes whose counts are the bytes the syncs went through, by kind ([`kind_at`]): those of
+/// the copies of pages whose GPU writes reach them that the commits and completions compared,
+/// those of the read-only copies the commits wrote whole, and those of unchanging pages the
+/// completions wrote again ([`RESTORED_BYTES_CODE`]).
+pub const BYTES_CODES: [&str; KINDS] = [
+    "rt-copied-writable-compared-bytes",
+    "rt-copied-read-only-copied-bytes",
+    RESTORED_BYTES_CODE,
+];
+
+/// The codes whose counts are the nanoseconds the syncs took, by kind ([`kind_at`],
+/// [`BYTES_CODES`]).
+pub const NS_CODES: [&str; KINDS] = [
+    "rt-copied-writable-sync-ns",
+    "rt-copied-read-only-sync-ns",
+    "rt-copied-unchanging-sync-ns",
+];
+
+/// The codes whose counts are the commits that write a copy of read-only pages whole, by the
+/// guest's why the pages are not unchanging (the index,
+/// `crate::core::platform::values::pages_why`).
+pub const WHY_COMMITS_CODES: [&str; WHYS] = [
+    "rt-copied-read-only-why-0-commits",
+    "rt-copied-read-only-why-1-commits",
+    "rt-copied-read-only-why-2-commits",
+    "rt-copied-read-only-why-3-commits",
+    "rt-copied-read-only-why-4-commits",
+    "rt-copied-read-only-why-5-commits",
+    "rt-copied-read-only-why-6-commits",
+    "rt-copied-read-only-why-7-commits",
+    "rt-copied-read-only-why-8-commits",
+    "rt-copied-read-only-why-9-commits",
+    "rt-copied-read-only-why-10-commits",
+    "rt-copied-read-only-why-11-commits",
+    "rt-copied-read-only-why-12-commits",
+    "rt-copied-read-only-why-13-commits",
+    "rt-copied-read-only-why-14-commits",
+    "rt-copied-read-only-why-15-commits",
+];
+
+/// The codes whose counts are the bytes of copies of read-only pages the commits wrote whole, by
+/// the guest's why ([`WHY_COMMITS_CODES`]).
+pub const WHY_BYTES_CODES: [&str; WHYS] = [
+    "rt-copied-read-only-why-0-bytes",
+    "rt-copied-read-only-why-1-bytes",
+    "rt-copied-read-only-why-2-bytes",
+    "rt-copied-read-only-why-3-bytes",
+    "rt-copied-read-only-why-4-bytes",
+    "rt-copied-read-only-why-5-bytes",
+    "rt-copied-read-only-why-6-bytes",
+    "rt-copied-read-only-why-7-bytes",
+    "rt-copied-read-only-why-8-bytes",
+    "rt-copied-read-only-why-9-bytes",
+    "rt-copied-read-only-why-10-bytes",
+    "rt-copied-read-only-why-11-bytes",
+    "rt-copied-read-only-why-12-bytes",
+    "rt-copied-read-only-why-13-bytes",
+    "rt-copied-read-only-why-14-bytes",
+    "rt-copied-read-only-why-15-bytes",
+];
+
+/// The kinds of copies ([`Kind`], [`kind_at`]).
+const KINDS: usize = 3;
+
+/// The guest's whys a copy is counted by ([`WHY_COMMITS_CODES`]): the four bits that carry one.
+const WHYS: usize = 16;
 
 /// The code whose count is the KiB of the copies made of unchanging pages whose process maps them
 /// with no write in their maximum protection ([`import`], [`Kind::Unchanging`]).
@@ -172,8 +251,8 @@ pub(super) enum Kind {
     /// The CPU's writes are copied in at the commits, and the GPU's merged back at the
     /// completions ("Copied in", "Merged back").
     Merges,
-    /// The CPU's writes are copied in at the commits, and the GPU's dropped at the completions
-    /// ("Writes dropped").
+    /// The whole of the pages is written into the copy at each commit that uses it, which drops
+    /// the GPU's writes ("Writes dropped").
     Drops,
     /// The pages never change, and the GPU's writes are dropped at the completions ("Unchanging
     /// pages"); `copy_on_write` where their process maps them private and copy-on-write.
@@ -196,6 +275,78 @@ impl Kind {
     /// Whether the GPU's writes to the copy are dropped.
     pub(super) fn drops(self) -> bool {
         self != Kind::Merges
+    }
+}
+
+/// The place of `kind`'s counts in the codes' arrays ([`COMMITS_CODES`]).
+fn kind_at(kind: Kind) -> usize {
+    match kind {
+        Kind::Merges => 0,
+        Kind::Drops => 1,
+        Kind::Unchanging { .. } => 2,
+    }
+}
+
+/// What the syncs of a commit or of a completion did, counted as they end ([`Tally::count`]).
+#[derive(Default)]
+struct Tally {
+    /// The bytes written: the CPU's into copies at a commit ([`IN_BYTES_CODE`]), the GPU's into
+    /// pages at a completion ([`BACK_BYTES_CODE`]), of the copies whose GPU writes reach them.
+    written: u64,
+    /// By kind ([`kind_at`]): whether a copy of it was synced, the bytes the syncs went through,
+    /// and their nanoseconds.
+    kinds: [(bool, u64, u64); KINDS],
+    /// The copies of read-only pages written whole, by the guest's why: whether one was, and
+    /// their bytes.
+    whys: [(bool, u64); WHYS],
+}
+
+impl Tally {
+    /// Notes a sync of `copied` that wrote `written` bytes, went through `bytes` and took the time
+    /// since `began` on `clock`.
+    fn note(
+        &mut self,
+        copied: &Copied,
+        (written, bytes): (u64, u64),
+        (clock, began): (&crate::os::OsClock, MonoTime),
+    ) {
+        let took = clock.now_mono().saturating_duration_since(began).as_nanos();
+        let took = u64::try_from(took).unwrap_or(u64::MAX);
+        if copied.kind == Kind::Merges {
+            self.written += written;
+        }
+        let (synced, all, ns) = &mut self.kinds[kind_at(copied.kind)];
+        *synced = true;
+        *all = all.saturating_add(bytes);
+        *ns = ns.saturating_add(took);
+        if copied.kind == Kind::Drops
+            && let Some((used, all)) = self.whys.get_mut(usize::from(copied.why))
+        {
+            *used = true;
+            *all = all.saturating_add(bytes);
+        }
+    }
+
+    /// Counts what was noted: at a commit (`commit`), one commit for each kind and why synced.
+    fn count(&self, commit: bool) {
+        for (k, &(synced, bytes, ns)) in self.kinds.iter().enumerate() {
+            if !synced {
+                continue;
+            }
+            if commit {
+                crate::answer::count_kind(COMMITS_CODES[k]);
+            }
+            if bytes > 0 {
+                crate::answer::count_kind_by(BYTES_CODES[k], bytes);
+            }
+            crate::answer::count_kind_by(NS_CODES[k], ns);
+        }
+        for (why, &(used, bytes)) in self.whys.iter().enumerate() {
+            if used {
+                crate::answer::count_kind(WHY_COMMITS_CODES[why]);
+                crate::answer::count_kind_by(WHY_BYTES_CODES[why], bytes);
+            }
+        }
     }
 }
 
@@ -248,7 +399,10 @@ pub(super) unsafe fn import(
     // aligned and taken for the copy alone, mapped while a handle of it lives, which the copy
     // holds.
     let copied = unsafe { Copied::new(pages, len.to_usize(), kind, (copy, cap, Some(block))) };
-    let copied = copied.ok_or(Uncopied::NoMemory)?;
+    let mut copied = copied.ok_or(Uncopied::NoMemory)?;
+    if kind == Kind::Drops {
+        copied.why = crate::core::platform::values::pages_why();
+    }
     let code = match kind {
         Kind::Merges => None,
         Kind::Drops => Some(READ_ONLY_KIB_CODE),
@@ -388,10 +542,14 @@ impl Used {
     }
 }
 
-/// Whether a use of any of `copies`, those a command buffer uses, can write it: the command
-/// buffer's completion then merges them back ([`merging`]).
+/// Whether the completion of the command buffer that uses `copies` has one to sync
+/// ([`merging`]): a use that can write a copy whose GPU writes reach its pages, which it merges
+/// back, or one of unchanging pages, which it writes again. A copy of other read-only pages is
+/// written whole at each commit instead ("Writes dropped").
 pub(super) fn writes(copies: &[CopyUse]) -> bool {
-    copies.iter().any(|u| u.writes)
+    copies
+        .iter()
+        .any(|u| u.writes && u.copied.kind != Kind::Drops)
 }
 
 /// Counts a render pass `sel` made whose attachments lie in the blocks `blocks` where one is a
@@ -415,23 +573,33 @@ pub(super) fn store_outs(sel: &'static str, mut blocks: impl Iterator<Item = rt:
 static STORE_OUT_SAID: AtomicBool = AtomicBool::new(false);
 
 /// Writes into each of `copies`, those a command buffer uses, the bytes the CPU changed in its
-/// pages since they last agreed (the module's docs): at its commit, before rt is handed it.
-/// Nothing where it uses none.
+/// pages since they last agreed, the whole of them for one of read-only pages that may change
+/// (the module's docs), and counts them: at its commit, before rt is handed it. Nothing where it
+/// uses none.
 pub(super) fn copy_in(copies: &[CopyUse]) {
     if copies.is_empty() {
         return;
     }
     let clock = crate::os::OsClock::new();
     let began = clock.now_mono();
-    let written: u64 = copies.iter().map(|u| u.copied.copy_in()).sum();
-    synced(IN_BYTES_CODE, written, &clock, began);
+    let mut tally = Tally::default();
+    for u in copies {
+        let at = clock.now_mono();
+        let written = u.copied.copy_in();
+        let bytes = match u.copied.kind {
+            Kind::Merges | Kind::Drops => u.copied.len.to_u64(),
+            Kind::Unchanging { .. } => 0,
+        };
+        tally.note(&u.copied, (written, bytes), (&clock, at));
+    }
+    tally.count(true);
+    synced(IN_BYTES_CODE, tally.written, &clock, began);
 }
 
 /// The completed handler, to run first of a command buffer's, that writes back into the pages
 /// of each of `copies`, those it uses, that a use of it can write the bytes the GPU changed in
-/// the copy, or puts back from the base those of one whose writes are dropped, or writes the
-/// whole of one of unchanging pages again from them (the module's docs), and that holds every
-/// one of `copies` until it ran ("Released"); `None` where it uses none.
+/// the copy, or writes the whole of one of unchanging pages again from them (the module's docs),
+/// and that holds every one of `copies` until it ran ("Released"); `None` where it uses none.
 pub(super) fn merging(
     copies: &[CopyUse],
 ) -> Option<impl FnOnce(&rt::CommandBuffer) + Send + 'static> {
@@ -440,29 +608,26 @@ pub(super) fn merging(
 }
 
 /// Writes back into the pages of each of `copies` that a use of it can write the bytes the GPU
-/// changed in the copy, puts back from its base those of a copy whose writes are dropped, and
-/// writes the whole of a copy of unchanging pages again from them; of the others, nothing.
+/// changed in the copy, and writes the whole of a copy of unchanging pages again from them, and
+/// counts them; of the others, a copy of read-only pages that may change among them, nothing.
 fn merge_back(copies: &[CopyUse]) {
     if !writes(copies) {
         return;
     }
     let clock = crate::os::OsClock::new();
     let began = clock.now_mono();
-    let (mut written, mut dropped, mut restored) = (0, 0, 0);
+    let mut tally = Tally::default();
     for u in copies.iter().filter(|u| u.writes) {
-        match u.copied.kind {
-            Kind::Merges => written += u.copied.merge_back(),
-            Kind::Drops => dropped += u.copied.drop_back(),
-            Kind::Unchanging { .. } => restored += u.copied.restore(),
-        }
+        let at = clock.now_mono();
+        let written = match u.copied.kind {
+            Kind::Merges => u.copied.merge_back(),
+            Kind::Drops => continue,
+            Kind::Unchanging { .. } => u.copied.copy_whole(),
+        };
+        tally.note(&u.copied, (written, u.copied.len.to_u64()), (&clock, at));
     }
-    if dropped > 0 {
-        crate::answer::count_kind_by(DROPPED_BYTES_CODE, dropped);
-    }
-    if restored > 0 {
-        crate::answer::count_kind_by(RESTORED_BYTES_CODE, restored);
-    }
-    synced(BACK_BYTES_CODE, written, &clock, began);
+    tally.count(false);
+    synced(BACK_BYTES_CODE, tally.written, &clock, began);
 }
 
 /// Counts a sync's `written` bytes as `code`, and its time since `began` on `clock`.
@@ -478,11 +643,15 @@ pub struct Copied {
     home: NonNull<u8>,
     /// The copy's first byte.
     copy: NonNull<u8>,
-    /// The base, a word per 8 bytes of the pages; none for a copy of unchanging pages, whose lock
-    /// its writes of the pages' bytes take all the same.
+    /// The base, a word per 8 bytes of the pages; none for a copy of pages whose GPU writes are
+    /// dropped, whose lock its writes of the pages' bytes take all the same.
     base: Mutex<Box<[u64]>>,
     /// What it does with the GPU's writes and the CPU's ([`Kind`]).
     kind: Kind,
+    /// The guest's why the pages of a copy of read-only pages that may change are not unchanging,
+    /// as its import was made (`crate::core::platform::values::pages_why`), which it is counted
+    /// by; 0 for any other.
+    why: u8,
     /// The bytes of the pages it copies.
     len: usize,
     /// The copy's memory, rt's Shared block taken for it alone ([`import`]), whose handle keeps
@@ -522,9 +691,9 @@ impl Drop for Copied {
 impl Copied {
     /// A copy of the `len` bytes at `home` in the memory `block` holds where given, whose first
     /// byte is `copy` and which holds `cap` bytes, the copy's bytes past `len` zeros, and its base,
-    /// the bytes copied, of `kind` (one of unchanging pages with no base); `None` where `len` is
-    /// 0, no whole number of chunks or past `cap`, or where the process has no memory for the
-    /// base.
+    /// the bytes copied, of `kind` (one whose GPU writes are dropped with no base), counted by no
+    /// why; `None` where `len` is 0, no whole number of chunks or past `cap`, or where the process
+    /// has no memory for the base.
     ///
     /// # Safety
     ///
@@ -542,8 +711,8 @@ impl Copied {
         }
         let mut base = Vec::new();
         let words = match kind {
-            Kind::Unchanging { .. } => 0,
-            Kind::Merges | Kind::Drops => len / 8,
+            Kind::Drops | Kind::Unchanging { .. } => 0,
+            Kind::Merges => len / 8,
         };
         base.try_reserve_exact(words).ok()?;
         base.resize(words, 0_u64);
@@ -560,6 +729,7 @@ impl Copied {
             copy,
             base: Mutex::new(base.into_boxed_slice()),
             kind,
+            why: 0,
             len,
             block,
             release: Mutex::new(None),
@@ -567,10 +737,13 @@ impl Copied {
     }
 
     /// Writes into the copy the bytes of the pages that differ from the base, and the base takes
-    /// them: the bytes written. Nothing for a copy of unchanging pages ("Unchanging pages").
+    /// them: the bytes written. The whole of the pages for a copy of read-only pages that may
+    /// change ("Writes dropped"); nothing for one of unchanging pages ("Unchanging pages").
     fn copy_in(&self) -> u64 {
-        if matches!(self.kind, Kind::Unchanging { .. }) {
-            return 0;
+        match self.kind {
+            Kind::Merges => {}
+            Kind::Drops => return self.copy_whole(),
+            Kind::Unchanging { .. } => return 0,
         }
         let mut base = self.base.lock();
         let mut now = [0_u64; WORDS];
@@ -625,35 +798,9 @@ impl Copied {
         written
     }
 
-    /// Puts back into the copy from the base the bytes of the copy that differ from it, the
-    /// GPU's writes, which are dropped ("Writes dropped"); the pages are never written: the
-    /// bytes put back.
-    fn drop_back(&self) -> u64 {
-        let base = self.base.lock();
-        let mut gpu = [0_u64; WORDS];
-        let mut dropped = 0;
-        for (chunk, was) in base.as_chunks::<WORDS>().0.iter().enumerate() {
-            let at = chunk * CHUNK;
-            // SAFETY: the chunk lies in the copy's first bytes, the length of the pages.
-            unsafe { read_chunk(self.copy.as_ptr().add(at), &mut gpu) };
-            if gpu == *was {
-                continue;
-            }
-            for (i, (gpu, was)) in gpu.iter().zip(was.iter()).enumerate() {
-                if gpu != was {
-                    // SAFETY: the word lies in the copy's first bytes, 8-aligned as the copy is.
-                    let to = unsafe { self.copy.as_ptr().add(at + 8 * i) };
-                    // SAFETY: as above.
-                    dropped += unsafe { store(to, *was, *gpu, None) };
-                }
-            }
-        }
-        dropped
-    }
-
-    /// Writes the whole of the pages into the copy again, the GPU's writes to a copy of unchanging
-    /// pages put back ("Unchanging pages"); the pages are never written: the bytes written.
-    fn restore(&self) -> u64 {
+    /// Writes the whole of the pages into the copy again, the GPU's writes to it put back ("Writes
+    /// dropped", "Unchanging pages"); the pages are never written: the bytes written.
+    fn copy_whole(&self) -> u64 {
         let _held = self.base.lock();
         // SAFETY: the pages' `len` bytes are readable until the copy goes (`new`'s contract), and
         // the copy's first `len` bytes its own; a raw copy, as memory others write at any time is
@@ -781,19 +928,31 @@ mod tests {
         assert_eq!((copied.copy_in(), copied.merge_back()), (0, 0));
     }
 
-    /// A copy whose writes are dropped never writes its pages: a completion puts back from the
-    /// base every byte the GPU changed in the copy, a byte both sides changed among them, counting
-    /// them, and the next commit's copy in takes the CPU's bytes.
+    /// The count of `code` in the degradation counts' line.
+    fn counted(code: &str) -> u64 {
+        (crate::answer::degradation_counts().into_iter())
+            .find(|(c, _)| c == code)
+            .map_or(0, |(_, n)| n)
+    }
+
+    /// A copy whose writes are dropped keeps no base and never writes its pages: each commit that
+    /// uses it writes the whole of the pages into it, which puts back every byte the GPU changed,
+    /// a byte both sides changed among them, and takes the CPU's; a completion leaves it as it is,
+    /// a use that can write it among its uses. Each commit is counted, with the bytes it wrote, by
+    /// kind and by the guest's why.
     #[test]
-    fn a_dropping_copy_puts_the_gpus_bytes_back_and_never_writes_its_pages() {
+    fn a_dropping_copy_takes_its_pages_whole_at_each_commit_and_never_writes_them() {
         let mut pages = chunks(2);
         let home = NonNull::new(pages.as_mut_ptr().cast::<u8>()).expect("the pages");
         let len = 2 * CHUNK;
         // SAFETY: the pages are the test's own, written below only through `home`.
         unsafe { home.as_ptr().write_bytes(0x11, len) };
         // SAFETY: the pages live until the test's end, past the copy.
-        let copied = unsafe { copy_of(home, len, Kind::Drops) }.expect("a copy");
+        let mut copied = unsafe { copy_of(home, len, Kind::Drops) }.expect("a copy");
         assert!(copied.kind.drops());
+        assert!(copied.base.lock().is_empty(), "no base");
+        copied.why = 5;
+        let copied = Arc::new(copied);
 
         // The GPU writes a word in the first chunk and a byte in the second, which the CPU also
         // writes, and the CPU 2 bytes elsewhere.
@@ -805,25 +964,47 @@ mod tests {
             home.as_ptr().add(far).write(0x66);
             home.as_ptr().add(32).write_bytes(0x22, 2);
         }
-        assert_eq!((copied.drop_back(), copied.drop_back()), (8 + 1, 0));
-        let mut expect = vec![0x11; len];
-        expect[far] = 0x66;
-        expect[32..34].fill(0x22);
+        let used = Used::default();
+        used.add(Some(&copied), true);
+        let uses = used.take();
+        assert!(!writes(&uses), "nothing for its completion to sync");
+        merge_back(&uses);
+        let mut gpu = vec![0x11; len];
+        gpu[16..24].fill(0x44);
+        gpu[far] = 0x55;
         assert_eq!(
-            bytes(home, len),
-            expect,
-            "the pages hold only the CPU's bytes"
+            bytes(copied.copy, len),
+            gpu,
+            "the GPU's bytes, until a commit"
         );
-        assert_eq!(bytes(copied.copy, len), vec![0x11; len], "the base's bytes");
-        assert_eq!(copied.copy_in(), 1 + 2);
-        assert_eq!(bytes(copied.copy, len), expect);
-        assert_eq!((copied.copy_in(), copied.drop_back()), (0, 0));
+        let mut cpu = vec![0x11; len];
+        cpu[far] = 0x66;
+        cpu[32..34].fill(0x22);
+        assert_eq!(bytes(home, len), cpu, "the pages hold only the CPU's bytes");
+
+        let codes = [COMMITS_CODES[1], BYTES_CODES[1]];
+        let whys = [WHY_COMMITS_CODES[5], WHY_BYTES_CODES[5]];
+        let (counts, why_counts) = (codes.map(counted), whys.map(counted));
+        copy_in(&uses);
+        assert_eq!(
+            bytes(copied.copy, len),
+            cpu,
+            "the pages' bytes, the GPU's dropped"
+        );
+        assert_eq!(bytes(home, len), cpu, "the pages are never written");
+        assert_eq!(
+            codes.map(counted),
+            [counts[0] + 1, counts[1] + len.to_u64()]
+        );
+        let why_now = [why_counts[0] + 1, why_counts[1] + len.to_u64()];
+        assert_eq!(whys.map(counted), why_now, "by the guest's why");
+        assert_eq!(copied.copy_in(), len.to_u64(), "whole at each");
     }
 
-    /// A command buffer's completion merges back, or puts back, only the copies a use of which
-    /// can write them: one whose uses all read it keeps the bytes the GPU changed in it (none, in
-    /// Metal's run of such work) and its pages theirs, whether or not its writes are dropped; a
-    /// use that can write a copy noted after reads of it makes its uses writing.
+    /// A command buffer's completion merges back only the copies a use of which can write them:
+    /// one whose uses all read it keeps the bytes the GPU changed in it (none, in Metal's run of
+    /// such work) and its pages theirs, whether or not its writes are dropped; a use that can
+    /// write a copy noted after reads of it makes its uses writing.
     #[test]
     fn a_completion_merges_only_the_copies_its_uses_can_write() {
         let len = CHUNK;
@@ -982,6 +1163,6 @@ mod tests {
             "the pages' bytes, the GPU's dropped"
         );
         assert_eq!(bytes(home, len), cpu, "the pages are never written");
-        assert_eq!(copied.restore(), len.to_u64());
+        assert_eq!(copied.copy_whole(), len.to_u64());
     }
 }

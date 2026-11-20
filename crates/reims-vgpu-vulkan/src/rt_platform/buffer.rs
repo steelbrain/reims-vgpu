@@ -64,17 +64,17 @@
 //! heap of option bit 24, and to the pages a guest process maps read-only, and the CPU and later
 //! command buffers read the pages' bytes (measured on the M3 Max, the 5300M and the UHD 630,
 //! `crate::gpu::command`'s docs); Vulkan has no memory that drops writes, and rt no read-only
-//! import. So such pages are imported as a copy whose GPU writes are dropped at each completion
-//! (`super::copied`, "Writes dropped"), never by their pointer or a dma-buf, which the GPU would
-//! write: a pages block's view its process maps read-only (`import_known`'s `access`), whose
-//! address the guest's buffers over the block are pinned in, and a buffer or heap of option bit 24
-//! with no pin, over a copy of its own. Each such import is counted ([`IMPORTS_READ_ONLY`]), and
-//! as a copy ([`IMPORTS_COPIED`]). A render pass's store into a texture over such a copy completes
-//! and is dropped with the copy's other writes, as the 5300M and the UHD 630 answer; the M3 Max
-//! faults it: counted at the pass ([`super::copied::STORE_OUTS_CODE`]). A buffer or heap of option
-//! bit 24 pinned in a known block that is no such copy stays there, at the guest's address, where
-//! the GPU's writes reach the bytes: counted ([`READ_ONLY_CODE`]), the process's first with a
-//! line.
+//! import. So such pages are imported as a copy whose GPU writes are dropped, the pages written
+//! whole into it at each commit that uses it (`super::copied`, "Writes dropped"), never by their
+//! pointer or a dma-buf, which the GPU would write: a pages block's view its process maps
+//! read-only (`import_known`'s `access`), whose address the guest's buffers over the block are
+//! pinned in, and a buffer or heap of option bit 24 with no pin, over a copy of its own. Each such
+//! import is counted ([`IMPORTS_READ_ONLY`]), and as a copy ([`IMPORTS_COPIED`]). A render pass's
+//! store into a texture over such a copy completes and is dropped with the copy's other writes, as
+//! the 5300M and the UHD 630 answer; the M3 Max faults it: counted at the pass
+//! ([`super::copied::STORE_OUTS_CODE`]). A buffer or heap of option bit 24 pinned in a known block
+//! that is no such copy stays there, at the guest's address, where the GPU's writes reach the
+//! bytes: counted ([`READ_ONLY_CODE`]), the process's first with a line.
 //!
 //! **Dma-bufs of the pages** (Linux). A GPU may take no pointer to some pages: RADV refuses the
 //! pages of a shared mapping of a memfd at the import, as the guest's RAM and the views of its
@@ -4433,12 +4433,13 @@ mod tests {
     /// over a copy of its own whose GPU writes are dropped ("Read-only memory"), counted as such
     /// and not as one whose writes reach its bytes. A blit's fill and copy into it complete, and
     /// once their command buffer completed the pages hold the CPU's bytes alone, as after
-    /// Metal's; a later command buffer reads those, a CPU write made before its commit among them.
+    /// Metal's; a later command buffer reads those, a CPU write made before its commit among them,
+    /// as each commit that uses the copy writes the whole of the pages into it, counted.
     /// A render pass that stores into a texture over it completes with its store dropped too,
     /// counted at the pass, as the 5300M and the UHD 630 answer.
     #[test]
     fn read_only_copies_drop_the_gpu_s_writes_on_vulkan() {
-        use super::super::copied::{DROPPED_BYTES_CODE, STORE_OUTS_CODE};
+        use super::super::copied::{BYTES_CODES, COMMITS_CODES, STORE_OUTS_CODE};
         use crate::core::num::ToUsize as _;
         use crate::core::platform::descriptor::RenderPassDescriptor as _;
         use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
@@ -4488,7 +4489,8 @@ mod tests {
         let (source, out) = (of(64), of(128));
         // SAFETY: the Shared buffer's 64 bytes, mapped while it lives.
         unsafe { source.contents().as_ptr::<u8>().write_bytes(0x77, 64) };
-        let dropped = counted(DROPPED_BYTES_CODE);
+        let codes = [COMMITS_CODES[1], BYTES_CODES[1]];
+        let counts = codes.map(counted);
         let fill = BlitCmd::FillBuffer {
             buffer: &buffer,
             range: NsRange::new(0, 64),
@@ -4503,9 +4505,11 @@ mod tests {
         };
         blit_and_wait(&queue, vec![fill, copy]);
         assert_eq!(read(at, 128), [0x11; 128], "the pages as the CPU left them");
-        assert!(
-            counted(DROPPED_BYTES_CODE) > dropped,
-            "the GPU's bytes put back"
+        let copied_now = [counts[0] + 1, counts[1] + 2 * page];
+        assert_eq!(
+            codes.map(counted),
+            copied_now,
+            "the pages written whole at the commit"
         );
 
         // The CPU writes 0x22s at 128; a later command buffer reads them beside the dropped bytes.
@@ -4520,6 +4524,8 @@ mod tests {
         };
         blit_and_wait(&queue, vec![copy]);
         assert_eq!(read(out.contents(), 128), [[0x11; 64], [0x22; 64]].concat());
+        let copied_now = [counts[0] + 2, counts[1] + 4 * page];
+        assert_eq!(codes.map(counted), copied_now, "and again at the next");
 
         // A render pass that clears and stores a texture over the second page: it completes, its
         // store dropped, counted at the pass.
@@ -4684,10 +4690,11 @@ mod tests {
     /// its command buffer (`super::super::copied`'s docs, "Synced for the command buffers that use
     /// it"): a dispatch reads the bytes the CPU wrote before the commit, and once the command
     /// buffer completed the bytes a dispatch wrote into the copy are in the pages, or, where the
-    /// copy's writes are dropped, put back, counted.
+    /// copy's writes are dropped, never there, the commit having written the whole of the pages
+    /// into the copy, counted.
     #[test]
     fn a_copy_bound_by_set_buffers_is_synced_at_commit_and_completion_on_vulkan() {
-        use super::super::copied::DROPPED_BYTES_CODE;
+        use super::super::copied::COMMITS_CODES;
         use crate::core::platform::resource::Library as _;
         use crate::core::platform::types::{MtlSize, NsRange};
 
@@ -4709,7 +4716,7 @@ mod tests {
             let (out, zeros) = (of(16), of(16));
             // SAFETY: inside the test's pages.
             unsafe { c.pages.as_ptr::<u8>().write_bytes(0x22, 16) };
-            let dropped = counted(DROPPED_BYTES_CODE);
+            let commits = counted(COMMITS_CODES[usize::from(drops)]);
             let threads = || ComputeCmd::DispatchThreads {
                 threads_per_grid: MtlSize::new(4, 1, 1),
                 threads_per_threadgroup: MtlSize::new(4, 1, 1),
@@ -4737,14 +4744,10 @@ mod tests {
             let back = read(c.pages.wrapping_add(128), 16);
             match drops {
                 false => assert_eq!(back, [1, 0, 0, 0].repeat(4)),
-                true => {
-                    assert_eq!(back, [0x11; 16]);
-                    assert!(
-                        counted(DROPPED_BYTES_CODE) > dropped,
-                        "the GPU's bytes put back"
-                    );
-                }
+                true => assert_eq!(back, [0x11; 16]),
             }
+            let counts = counted(COMMITS_CODES[usize::from(drops)]);
+            assert_eq!(counts, commits + 1, "drops: {drops}: its commit counted");
         }
     }
 
@@ -4785,10 +4788,12 @@ mod tests {
     /// On the GPU the test holds: a copy a compute encoder declares with `useResources:`, as a
     /// shader that reaches it through an argument buffer's address asks, and binds not, is synced
     /// for its command buffer: the CPU's bytes copied in at the commit, and, declared for writing
-    /// (`MTLResourceUsageRead | Write`), the copy's merged back, or put back, at the completion;
-    /// declared for reading alone, no work of its command buffer writes it, and its completion
-    /// leaves the copy's bytes and the pages' as they were (`super::super::copied`'s docs, "Merged
-    /// back at the completions of the command buffers that can write it").
+    /// (`MTLResourceUsageRead | Write`), the copy's merged back at the completion; declared for
+    /// reading alone, no work of its command buffer writes it, and its completion leaves the
+    /// copy's bytes and the pages' as they were (`super::super::copied`'s docs, "Merged back at the
+    /// completions of the command buffers that can write it"). A copy whose GPU writes are dropped
+    /// takes the whole of its pages at the commit however it is declared, the GPU's bytes put
+    /// back ("Writes dropped").
     #[test]
     fn a_copy_declared_with_use_resources_is_synced_on_vulkan() {
         use crate::core::platform::blit::ResourceRef;
@@ -4805,7 +4810,8 @@ mod tests {
             };
             compute_and_wait(&queue, vec![declare]);
             let writes = usage & 2 != 0;
-            assert_eq!(c.synced(), (true, writes), "drops: {drops}, usage: {usage}");
+            let synced = (true, writes || drops);
+            assert_eq!(c.synced(), synced, "drops: {drops}, usage: {usage}");
         }
     }
 
@@ -4818,7 +4824,7 @@ mod tests {
     /// at its completion.
     #[test]
     fn a_texture_over_a_read_only_copy_lies_in_place_on_vulkan() {
-        use super::super::copied::{BACK_BYTES_CODE, DROPPED_BYTES_CODE};
+        use super::super::copied::{BACK_BYTES_CODE, COMMITS_CODES};
         use crate::core::platform::types::{MtlOrigin, MtlSize};
 
         let platform = RtPlatform::new();
@@ -4849,10 +4855,8 @@ mod tests {
         let out = out.expect("never a raise").expect("a buffer");
         let metrics = || device.rt().counters().metrics();
         let over = |m: rt::Metrics| (m.over_copies, m.over_copies_imported);
-        let (before, counts) = (
-            over(metrics()),
-            [BACK_BYTES_CODE, DROPPED_BYTES_CODE].map(counted),
-        );
+        let codes = [BACK_BYTES_CODE, COMMITS_CODES[1]];
+        let (before, counts) = (over(metrics()), codes.map(counted));
         let row = |y: u64| c.pages.wrapping_add(y * pitch).as_ptr::<u8>();
         for (y, value) in [(0, 0x22_u8), (1, 0x44)] {
             // SAFETY: inside the test's pages: two rows of the pitch, within two pages.
@@ -4880,8 +4884,12 @@ mod tests {
             );
         }
         assert_eq!(over(metrics()), before, "no over-copy");
-        let counts_now = [BACK_BYTES_CODE, DROPPED_BYTES_CODE].map(counted);
-        assert_eq!(counts_now, counts, "nothing merged or put back");
+        let counts_now = codes.map(counted);
+        assert_eq!(
+            counts_now,
+            [counts[0], counts[1] + 2],
+            "nothing merged back"
+        );
         assert_eq!(read(c.copy, 256), [0x22; 256]);
     }
 
@@ -4955,7 +4963,9 @@ mod tests {
     /// holds and its pages theirs, and no sync is counted.
     #[test]
     fn a_command_buffer_that_uses_no_copy_syncs_none_on_vulkan() {
-        use super::super::copied::{BACK_BYTES_CODE, IN_BYTES_CODE, SYNC_NS_CODE};
+        use super::super::copied::{
+            BACK_BYTES_CODE, COMMITS_CODES, IN_BYTES_CODE, NS_CODES, SYNC_NS_CODE,
+        };
         use crate::core::platform::command::EscapedCopies;
         use crate::core::platform::types::NsRange;
 
@@ -4965,7 +4975,15 @@ mod tests {
         let queue = device.new_command_queue().expect("a command queue");
         let other = device.new_buffer_of_length(on, 64, 0);
         let other = other.expect("never a raise").expect("a buffer");
-        let codes = [IN_BYTES_CODE, BACK_BYTES_CODE, SYNC_NS_CODE];
+        let codes = [
+            IN_BYTES_CODE,
+            BACK_BYTES_CODE,
+            SYNC_NS_CODE,
+            COMMITS_CODES[0],
+            COMMITS_CODES[1],
+            NS_CODES[0],
+            NS_CODES[1],
+        ];
         for drops in [false, true] {
             let c = over_a_copy(&device, drops);
             let (ours, others) = (EscapedCopies::default(), EscapedCopies::default());

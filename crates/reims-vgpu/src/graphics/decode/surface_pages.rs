@@ -383,7 +383,7 @@ use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, Deadline, MonoTim
 use reims_vgpu_vulkan::core::platform::os::vm::{GroupHold, GroupLimits, HostAddr};
 use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, Heap as _};
 use reims_vgpu_vulkan::core::platform::values::{
-    BufferDesc, HeapDesc, OptionSet, PagesAccess, PagesPlane,
+    BufferDesc, HeapDesc, OptionSet, PagesAccess, PagesPlane, pages_why_as,
 };
 use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{RaiseResult, refusals};
@@ -1996,7 +1996,7 @@ impl<P: Platform> SurfaceViews<P> {
         block_size: u64,
         context: Option<u32>,
     ) -> RaiseResult<Option<Arc<SurfaceView<P>>>> {
-        let (mapped, runs, length, copies, imports, access) = {
+        let (mapped, runs, length, copies, imports, (access, why)) = {
             let mut v = views.lock();
             let Some(p) = (v.private.get_mut(&block))
                 .filter(|p| block_size <= p.block_size && context.is_none_or(|c| c == p.context))
@@ -2007,7 +2007,7 @@ impl<P: Platform> SurfaceViews<P> {
                 return Ok(Some(Arc::clone(view)));
             }
             let (runs, length, mapped) = (p.runs.clone(), p.length, p.mapped.take());
-            let access = p.access;
+            let (access, why) = (p.access, p.why);
             if mapped.is_none() {
                 if let Some(view) = v.take_cached(block, &runs, access) {
                     return Ok(Some(view));
@@ -2023,7 +2023,7 @@ impl<P: Platform> SurfaceViews<P> {
                 length,
                 v.over_copies(access.read_only()),
                 v.known_imports.clone(),
-                access,
+                (access, why),
             )
         };
         let clock = platform.clock();
@@ -2040,10 +2040,11 @@ impl<P: Platform> SurfaceViews<P> {
             Ok(view) if copies => Ok((view, None)),
             Ok(view) => {
                 let mapped = clock.now_mono();
-                let import = match &imports {
-                    Some(imports) => known_import_over(imports, device, &view, access)?,
-                    None => buffer_over(device, &view, 0, view.length(), 0, None)?,
-                };
+                // The platform's copies of the pages count by the guest's why, where it gave one.
+                let import = pages_why_as(why, || match &imports {
+                    Some(imports) => known_import_over(imports, device, &view, access),
+                    None => buffer_over(device, &view, 0, view.length(), 0, None),
+                })?;
                 match import {
                     Some(import) => {
                         log::trace!(

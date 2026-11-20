@@ -2803,9 +2803,7 @@ static NSError *rgfxInvalidInputError()
 {
 	rgfxIOSurfaceWriteBack(_surfaceWrites);
 	_surfaceWrites.clear();
-	for (const std::shared_ptr<RgfxMemoryShadow> &shadow : _shadowWrites)
-		shadow->writeBack();
-	_shadowWrites.clear();
+	rgfxShadowsWriteBack(_shadowWrites);
 	_kept.land();
 }
 
@@ -2837,9 +2835,7 @@ static NSError *rgfxInvalidInputError()
 		_namedGone = true;
 	}
 	// So does the app memory it may have written under no-copy buffers.
-	for (const std::shared_ptr<RgfxMemoryShadow> &shadow : _shadowWrites)
-		shadow->writeBack();
-	_shadowWrites.clear();
+	rgfxShadowsWriteBack(_shadowWrites);
 	// The resources it kept are out of flight before it is seen complete, where its take did
 	// not do it.
 	_kept.land();

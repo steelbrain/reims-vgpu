@@ -4256,7 +4256,9 @@ void test_function_pointer_messages()
 // A no-copy buffer's block and the app's memory (RgfxMemoryShadow): the block starts as the
 // memory; each sync moves the bytes one side changed since the two last agreed, byte by byte,
 // so a CPU write and a GPU write beside it in one word both stand; memory mapped read-only is
-// never written; the encoder's notes sync each shadow once and keep the ones written.
+// never written, and each sync in writes the whole of it into the block, the GPU's writes
+// dropped; the encoder's notes sync each shadow once and keep the ones written; the commits,
+// bytes and write-backs are counted by kind.
 void test_memory_shadow()
 {
 	CHECK(!RgfxMemoryShadow::anyLive());
@@ -4294,13 +4296,16 @@ void test_memory_shadow()
 	}
 	CHECK(!RgfxMemoryShadow::anyLive());
 
-	// Read-only memory: synced in, never written.
+	// Read-only memory: written whole at each sync in, never written back.
 	std::vector<uint8_t> ro(64, 3), roBlock(64, 0);
 	auto r = std::make_shared<RgfxMemoryShadow>(ro.data(), roBlock.data(), ro.size(), false);
-	CHECK(!r->writable() && roBlock == ro);
-	roBlock[5] = 9;
+	CHECK(r->ok() && !r->writable() && roBlock == ro);
+	roBlock[5] = 9; // the GPU's
+	ro[6] = 4;      // another mapping's write of the memory
 	r->writeBack();
-	CHECK(ro[5] == 3);
+	CHECK(ro[5] == 3 && roBlock[5] == 9 && roBlock[6] == 3);
+	r->syncIn();
+	CHECK(roBlock == ro); // the GPU's dropped, the memory's taken
 
 	// The notes: each shadow synced once, the ones any use writes kept.
 	std::vector<uint8_t> a2(16, 1), b2(16, 2), aBlock(16), bBlock(16);
@@ -4318,10 +4323,28 @@ void test_memory_shadow()
 	CHECK(uses.size() == 4 && enc.takeShadowUses().empty());
 	a2[0] = 5;
 	b2[0] = 6;
+	const RgfxShadowCounts before = rgfxShadowCounts();
 	std::vector<std::shared_ptr<RgfxMemoryShadow>> written = rgfxShadowsSyncIn(uses);
 	CHECK(aBlock[0] == 5 && bBlock[0] == 6);
 	CHECK(written.size() == 1 && written[0] == a);
 	CHECK(rgfxShadowsSyncIn({}).empty());
+	const unsigned w = RgfxShadowCounts::kWritable, rd = RgfxShadowCounts::kReadOnly;
+	const RgfxShadowCounts synced = rgfxShadowCounts();
+	CHECK(synced.commits[w] == before.commits[w] + 1 && synced.bytes[w] == before.bytes[w] + 32);
+	CHECK(synced.commits[rd] == before.commits[rd] + 1 &&
+	      synced.bytes[rd] == before.bytes[rd] + 64);
+	CHECK(synced.writeBacks == before.writeBacks);
+	// The completion writes back the one written, counted, and lets go of them; a read-only
+	// shadow among them writes nothing back and counts nothing.
+	aBlock[1] = 7;
+	written.push_back(r);
+	rgfxShadowsWriteBack(written);
+	CHECK(a2[1] == 7 && written.empty());
+	const RgfxShadowCounts back = rgfxShadowCounts();
+	CHECK(back.writeBacks == synced.writeBacks + 1 && back.bytes[w] == synced.bytes[w] + 16);
+	CHECK(back.commits[w] == synced.commits[w] && back.bytes[rd] == synced.bytes[rd]);
+	rgfxShadowsWriteBack(written);
+	CHECK(rgfxShadowCounts().writeBacks == back.writeBacks);
 }
 
 // What a fake device answers an argument layout query, and what it was asked.

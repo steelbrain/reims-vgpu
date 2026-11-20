@@ -5087,9 +5087,12 @@ the buffer, and back to it as one that may write it completes, before its
 completion is reported. Each side's bytes that moved since the two last agreed go
 to the other, byte by byte, so CPU and GPU writes beside each other both stand
 (`guest/bundle/src/RgfxMemoryShadow.hpp`). A GPU write shows in the memory at
-its command buffer's completion, not as it runs, and memory mapped read-only is
-never written back, though the GPU's writes stay in the range for later command
-buffers to read, where Metal's are dropped.
+its command buffer's completion, not as it runs. Memory mapped read-only is
+never written back and keeps no agreed copy: the whole of it is written into
+the range before each commit that uses it, with no compare, so the GPU's writes
+to the range are dropped at the next such commit, as Metal's are dropped. The
+bundle counts the commits that sync each kind, the bytes and the time, and logs
+the process's totals at the info level within a minute of a change.
 
 **Unchanging pages.** Read-only memory under a no-copy buffer is read from a
 copy where the host's GPU cannot import it as it is (the rt platform's
@@ -5136,8 +5139,10 @@ Where the host's GPU cannot import the pages as they are, the rt platform
 copies an unchanging block's pages into its copy once, as the view is made,
 and never compares them: it writes the whole copy again from the pages only at
 the completion of a command buffer that can write it, which drops the GPU's
-writes, as for any read-only memory
-(`crates/reims-vgpu-vulkan/src/rt_platform/copied.rs`).
+writes (`crates/reims-vgpu-vulkan/src/rt_platform/copied.rs`). A copy of any
+other read-only block has no base either: the whole of its pages is written
+into it at each commit that uses it, with no compare, which drops the GPU's
+writes there.
 
 Memory that is neither takes a read-only block, as before, with why not in
 `PagesBlock`'s third input from bit 8 (`kRgfxPagesWhyShift`), which the kext

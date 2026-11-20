@@ -425,7 +425,7 @@ pub trait CommandBuffer<P: Platform>: Handle {
     /// is of the process whose escaped copies are `escapes`: each commit of it, and of each part
     /// cut from it ([`Self::split`], [`Self::part`]), brings up to date each copy `escapes`
     /// holds at that commit, as one its encoders use: copied in at the commit, and merged back or
-    /// dropped at the completion. Nothing by default, where the platform keeps no copy.
+    /// its GPU writes dropped. Nothing by default, where the platform keeps no copy.
     fn reaches_escaped(&self, escapes: &EscapedCopies) {
         let _ = escapes;
     }

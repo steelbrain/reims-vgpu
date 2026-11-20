@@ -20,19 +20,29 @@
  * the bytes both agreed on last are kept (`m_agreed`). Where both moved the same byte, the
  * side that syncs last wins, as a data race on Metal's shared memory has no answer either.
  *
+ * Memory the process maps read-only is never written back, and keeps no agreed copy: each
+ * commit that uses its block writes the whole of the memory into it, with no compare, so the
+ * GPU's writes to the block are dropped at the next such commit, as Metal's GPU drops writes to
+ * read-only memory.
+ *
  * Left as Metal's differs: a GPU write shows in the memory once the completion of its command
  * buffer is taken, not as it runs (a CPU waiting on a shared event the buffer signals sees the
- * bytes as of the last completion taken); memory the process maps read-only is never written
- * back.
+ * bytes as of the last completion taken); a GPU write to read-only memory shows to the work of
+ * its command buffer and of those in flight with it until the next commit that uses the block.
  *
- * Header-only and free of Metal's headers, so the serializer test builds it as the bundle
- * does. Thread-safe. Our own code.
+ * Counted (RgfxMemoryShadow.cpp): the commits that sync in a shadow of each kind, writable and
+ * read-only, the bytes the syncs went through and their time, and the completions that write
+ * back, logged at the info level as the process's totals within a minute of a change.
+ *
+ * Free of Metal's headers, so the serializer test builds it as the bundle does. Thread-safe. Our
+ * own code.
  */
 #ifndef RGFX_MEMORY_SHADOW_HPP_
 #define RGFX_MEMORY_SHADOW_HPP_
 
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 #include <algorithm>
 #include <atomic>
@@ -42,20 +52,43 @@
 #include <new>
 #include <vector>
 
+/// What the process's shadows' syncs did (RgfxMemoryShadow.cpp), by kind: kWritable, the
+/// shadows of memory the process maps writable, which merge both ways, and kReadOnly, those of
+/// read-only memory, which a commit writes whole.
+struct RgfxShadowCounts {
+	static const unsigned kWritable = 0, kReadOnly = 1, kKinds = 2;
+	// Commits that synced in a shadow of the kind.
+	uint64_t commits[kKinds];
+	// The bytes the syncs went through: a writable shadow's compared at its commits and
+	// completions, a read-only one's written whole at its commits.
+	uint64_t bytes[kKinds];
+	// The time those syncs took.
+	uint64_t ns[kKinds];
+	// Completions that wrote back a writable shadow.
+	uint64_t writeBacks;
+};
+
+/// Adds `delta` to the process's counts; logs the totals within a minute.
+void rgfxShadowsNote(const RgfxShadowCounts &delta);
+
+/// The process's counts so far.
+RgfxShadowCounts rgfxShadowCounts();
+
 class RgfxMemoryShadow {
 public:
 	/// The block `block` (`length` bytes) as the GPU's copy of the app's `memory`, seeded from
 	/// it. `writable`: the GPU's writes go back to the memory (false for memory the process
-	/// maps read-only). ok() is false where the agreed copy could not be allocated.
+	/// maps read-only, which keeps no agreed copy). ok() is false where the agreed copy could not
+	/// be allocated.
 	RgfxMemoryShadow(const void *memory, void *block, size_t length, bool writable)
 	    : m_memory(static_cast<uint8_t *>(const_cast<void *>(memory))),
 	      m_block(static_cast<uint8_t *>(block)), m_length(length), m_writable(writable),
-	      m_agreed(new (std::nothrow) uint8_t[length == 0 ? 1 : length])
+	      m_agreed(writable ? new (std::nothrow) uint8_t[length == 0 ? 1 : length] : nullptr)
 	{
-		if (m_agreed != nullptr) {
+		if (m_agreed != nullptr)
 			std::memcpy(m_agreed.get(), m_memory, m_length);
-			std::memcpy(m_block, m_agreed.get(), m_length);
-		}
+		if (ok())
+			std::memcpy(m_block, m_writable ? m_agreed.get() : m_memory, m_length);
 		live().fetch_add(1, std::memory_order_relaxed);
 	}
 	~RgfxMemoryShadow() { live().fetch_sub(1, std::memory_order_relaxed); }
@@ -63,15 +96,18 @@ public:
 	RgfxMemoryShadow(const RgfxMemoryShadow &) = delete;
 	RgfxMemoryShadow &operator=(const RgfxMemoryShadow &) = delete;
 
-	bool ok() const { return m_agreed != nullptr; }
+	bool ok() const { return !m_writable || m_agreed != nullptr; }
 	size_t length() const { return m_length; }
 	bool writable() const { return m_writable; }
 
-	/// Memory -> block: the bytes the CPU wrote since the last sync.
+	/// Memory -> block: the bytes the CPU wrote since the last sync; the whole of read-only
+	/// memory, which puts back the GPU's writes to the block.
 	void syncIn()
 	{
 		std::lock_guard<std::mutex> g(m_lock);
-		if (m_agreed != nullptr)
+		if (!m_writable)
+			std::memcpy(m_block, m_memory, m_length);
+		else if (m_agreed != nullptr)
 			merge(m_memory, m_block, m_agreed.get(), m_length);
 	}
 
@@ -154,7 +190,7 @@ struct RgfxShadowUse {
 };
 
 /// At a commit: syncs in each shadow `uses` names, once each, and answers those the command
-/// buffer may write, which its completion writes back.
+/// buffer may write, which its completion writes back (rgfxShadowsWriteBack); counted.
 inline std::vector<std::shared_ptr<RgfxMemoryShadow>> rgfxShadowsSyncIn(
     std::vector<RgfxShadowUse> uses)
 {
@@ -164,17 +200,46 @@ inline std::vector<std::shared_ptr<RgfxMemoryShadow>> rgfxShadowsSyncIn(
 	std::sort(uses.begin(), uses.end(), [](const RgfxShadowUse &a, const RgfxShadowUse &b) {
 		return a.shadow.get() < b.shadow.get();
 	});
+	RgfxShadowCounts delta = {};
 	for (size_t i = 0; i < uses.size();) {
 		size_t j = i;
 		bool w = false;
 		for (; j < uses.size() && uses[j].shadow == uses[i].shadow; j++)
 			w = w || uses[j].writes;
+		const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 		uses[i].shadow->syncIn();
+		const unsigned kind = uses[i].shadow->writable() ? RgfxShadowCounts::kWritable
+		                                                 : RgfxShadowCounts::kReadOnly;
+		delta.commits[kind] = 1;
+		delta.bytes[kind] += uses[i].shadow->length();
+		delta.ns[kind] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
 		if (w)
 			writes.push_back(uses[i].shadow);
 		i = j;
 	}
+	rgfxShadowsNote(delta);
 	return writes;
+}
+
+/// At a completion: writes back each of `writes`, those rgfxShadowsSyncIn answered (nothing for a
+/// read-only one), and lets go of them; counted.
+inline void rgfxShadowsWriteBack(std::vector<std::shared_ptr<RgfxMemoryShadow>> &writes)
+{
+	if (writes.empty())
+		return;
+	RgfxShadowCounts delta = {};
+	for (const std::shared_ptr<RgfxMemoryShadow> &shadow : writes) {
+		if (!shadow->writable())
+			continue;
+		const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+		shadow->writeBack();
+		delta.writeBacks = 1;
+		delta.bytes[RgfxShadowCounts::kWritable] += shadow->length();
+		delta.ns[RgfxShadowCounts::kWritable] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+	}
+	writes.clear();
+	if (delta.writeBacks != 0)
+		rgfxShadowsNote(delta);
 }
 
 #endif // RGFX_MEMORY_SHADOW_HPP_

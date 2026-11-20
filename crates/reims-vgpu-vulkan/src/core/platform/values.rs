@@ -81,6 +81,34 @@ impl PagesAccess {
     }
 }
 
+thread_local! {
+    /// The guest's why for the pages of the import made on the thread ([`pages_why_as`]).
+    static PAGES_WHY: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `import` with `why` as the guest's why the pages it imports are not unchanging, as a
+/// read-only pages block's `SURFACE_PAGES` gives it (`RGFX_SURFACE_PAGES_WHY_SHIFT`): a
+/// diagnostic, which a platform's import of such memory made on the thread counts its copies by
+/// ([`pages_why`]), and does nothing else with.
+pub fn pages_why_as<T>(why: u8, import: impl FnOnce() -> T) -> T {
+    /// Puts back the why that was set before, however `import` returns.
+    struct Restore(u8);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PAGES_WHY.with(|w| w.set(self.0));
+        }
+    }
+    let _restore = Restore(PAGES_WHY.with(|w| w.replace(why)));
+    import()
+}
+
+/// The guest's why for the pages of the import made on this thread ([`pages_why_as`]); 0, the
+/// guest's "unsaid", where none is set.
+#[must_use]
+pub fn pages_why() -> u8 {
+    PAGES_WHY.with(std::cell::Cell::get)
+}
+
 /// The block Metal calls once, with the contents and the length, when a buffer made from a
 /// [`BufferDesc`] is released.
 pub type BufferDeallocator = Box<dyn FnOnce(HostPtr, u64) + Send>;
@@ -1192,6 +1220,16 @@ mod tests {
     /// The selectors sent since `m`.
     fn sels(p: &FakePlatform, m: u64) -> Vec<&'static str> {
         p.call_log().sels_since(m)
+    }
+
+    /// An import's why is set for the call alone, an inner call's for its own, and put back as
+    /// each returns; with none set it is 0, the guest's "unsaid".
+    #[test]
+    fn a_pages_why_holds_for_its_call_alone() {
+        assert_eq!(pages_why(), 0);
+        let inner = pages_why_as(5, || (pages_why(), pages_why_as(4, pages_why), pages_why()));
+        assert_eq!(inner, (5, 4, 5));
+        assert_eq!(pages_why(), 0);
     }
 
     /// A texture value's ordered setters (the pixel format, which Metal checks, and the resource
