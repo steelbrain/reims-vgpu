@@ -310,8 +310,10 @@
 //!   each make under the device's reset gate. A use's fill, at once or deferred, a present's fill,
 //!   a download's copy out and a release's find their pieces made ahead: where the spares and the
 //!   pieces reserved for the block lack some a copy of all of the bytes it may move would take
-//!   ([`SurfaceCaches::lacking`]), they are made with no lock of the caches' held and reserved for
-//!   the block ([`SurfaceCaches::reserved`]): a fill's by the thread that begins the use's command
+//!   ([`SurfaceCaches::lacking`]), the spares that serve it are taken into the block's reserve
+//!   under the lock, so no other copy takes them and no other block's reservation counts them,
+//!   and the rest are made with no lock of the caches' held and reserved for the block
+//!   ([`SurfaceCaches::reserved`]): a fill's by the thread that begins the use's command
 //!   buffer, the lock let go of once for them ([`Caches::before_answering`]), or by the present's
 //!   for its fill ([`Caches::fill_now`]), or by ring 0 for a download's copy out, which the guest
 //!   waits for ([`Caches::download`]); a release's on the releases' pace's thread ([`ReleasePace`])
@@ -322,8 +324,8 @@
 //!   it ([`reserve_ahead`]). The copy takes them first; what it leaves is the next copy's of the
 //!   block under the same hold of the lock ([`SurfaceCaches::left_over`]), and the spares take
 //!   back on their thread what is left as the lock is let go of. A copy that still finds no spare
-//!   (another copy took the spares meanwhile) makes its piece on its own thread, under the caches'
-//!   lock, counted (`rt-staging-piece-makes-locked`).
+//!   (one with no reservation, or one that moves more bytes than its reservation saw) makes its
+//!   piece on its own thread, under the caches' lock, counted (`rt-staging-piece-makes-locked`).
 //!   Each piece taken is counted (`rt-staging-pieces`, and
 //!   `rt-staging-pieces-spared` those a spare served), and each a copy made, with the
 //!   nanoseconds its make took in all and the longest, for a cache's first staged copy
@@ -4777,12 +4779,13 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// The pieces a staged copy `way` of the block at `block`'s cache, of all of the bytes it may
-    /// move, would make for want of a piece reserved for the block or a spare
-    /// ([`Spares::lacking`]): their lengths, and whether it is the cache's first staged copy;
-    /// `None` where its copies that way are not staged, or it would make none. A copy out that
-    /// moves fewer bytes (the record narrows it) lays them in no more pieces, none longer.
-    fn lacking(&self, block: u64, way: Way) -> Option<(Vec<u64>, bool)> {
-        let (_, lacking, first) = self.lacking_for(&[(block, way)]).pop()?;
+    /// move, would make for want of a piece reserved for the block or a spare, the spares that
+    /// serve it taken into the block's reserve ([`Self::reserve_spares`]): their lengths, and
+    /// whether it is the cache's first staged copy; `None` where its copies that way are not
+    /// staged, or it would make none. A copy out that moves fewer bytes (the record narrows it)
+    /// lays them in no more pieces, none longer.
+    fn lacking(&mut self, block: u64, way: Way) -> Option<(Vec<u64>, bool)> {
+        let (_, lacking, first) = self.reserve_spares(&[(block, way)]).pop()?;
         Some((lacking, first))
     }
 
@@ -4807,8 +4810,14 @@ impl<P: Platform> SurfaceCaches<P> {
 
     /// [`Self::lacking`] of each staged copy of `wants`, by block and way, by block: the copies of
     /// one block taken together, as each takes what the one before it left of the pieces reserved
-    /// for it ([`Self::left_over`]). None for a block whose copies would make none.
-    fn lacking_for(&self, wants: &[(u64, Way)]) -> Vec<(u64, Vec<u64>, bool)> {
+    /// for it ([`Self::left_over`]). None for a block whose copies would make none. Each piece is
+    /// served as the copy serves it ([`Spares::pieces_from`]): by the shortest piece reserved for
+    /// the block that holds it, else by the shortest spare that does, which is taken into the
+    /// block's reserve ([`Self::reserved`]) now, counted as taken as a copy counts it
+    /// ([`piece_taken`]). So the spares counted for a copy are its own while the lock is let go
+    /// of to make what they lack: no other copy takes them meanwhile, and no other block's
+    /// reservation counts them.
+    fn reserve_spares(&mut self, wants: &[(u64, Way)]) -> Vec<(u64, Vec<u64>, bool)> {
         let mut by_block: Vec<(u64, Vec<u64>, bool)> = Vec::new();
         for &(block, way) in wants {
             let Some((lens, first)) = self.staged_lens(block, way) else {
@@ -4819,13 +4828,39 @@ impl<P: Platform> SurfaceCaches<P> {
                 None => by_block.push((block, lens, first)),
             }
         }
-        (by_block.into_iter())
-            .filter_map(|(block, lens, first)| {
-                let reserved = self.reserved.get(&block).map_or(&[][..], Vec::as_slice);
-                let lacking = self.spares.lacking(&lens, reserved);
-                (!lacking.is_empty()).then_some((block, lacking, first))
-            })
-            .collect()
+        let mut lacking = Vec::new();
+        for (block, lens, first) in by_block {
+            let mut reserved: Vec<u64> = (self.reserved.get(&block).into_iter().flatten())
+                .map(|b| b.length())
+                .collect();
+            let (mut taken, mut short) = (Vec::new(), Vec::new());
+            for length in lens {
+                let at = (reserved.iter().enumerate())
+                    .filter(|&(_, &l)| l >= length)
+                    .min_by_key(|&(_, &l)| l)
+                    .map(|(at, _)| at);
+                if let Some(at) = at {
+                    reserved.swap_remove(at);
+                    continue;
+                }
+                match self.spares.take(length) {
+                    Some(piece) => {
+                        if self.staged.is_some() {
+                            piece_taken(true);
+                        }
+                        taken.push(piece);
+                    }
+                    None => short.push(length),
+                }
+            }
+            if !taken.is_empty() {
+                self.reserved.entry(block).or_default().extend(taken);
+            }
+            if !short.is_empty() {
+                lacking.push((block, short, first));
+            }
+        }
+        lacking
     }
 
     /// The staged copies the finish of a command buffer whose counts are `counts` may make: those
@@ -6503,13 +6538,11 @@ impl<P: Platform> Caches<P> {
         let picked: Vec<RgfxOpSurfaceUse> = by_block(&state, uses).into_iter().copied().collect();
         // The pieces the uses' staged fills would make for want of a spare are made with the
         // lock let go of, once, and reserved for their blocks (the module doc, "Staged copies").
-        let lacking: Vec<(u64, Vec<u64>, bool)> = (picked.iter())
+        let fills: Vec<(u64, Way)> = (picked.iter())
             .filter(|u| state.fills(u))
-            .filter_map(|u| {
-                let (lens, first) = state.lacking(u.block_offset, Way::In)?;
-                Some((u.block_offset, lens, first))
-            })
+            .map(|u| (u.block_offset, Way::In))
             .collect();
+        let lacking = state.reserve_spares(&fills);
         reserve_unlocked(&mut state, device, lacking);
         let mut spare = Vec::new();
         let mut no_event = HashSet::new();
@@ -7281,7 +7314,7 @@ fn reserve_unlocked<P: Platform>(
 }
 
 /// The pieces the staged copies `wants` names (by block and way) would make for want of a piece
-/// reserved for their blocks or a spare ([`SurfaceCaches::lacking_for`]), with those of the
+/// reserved for their blocks or a spare ([`SurfaceCaches::reserve_spares`]), with those of the
 /// refills of a recovery of `device` not yet seen ([`SurfaceCaches::refills`]), made with the
 /// caches' lock let go of and reserved for their blocks ([`reserve_unlocked`]), so the copies the
 /// holder makes next take them under it (the module doc, "Staged copies"). Whether it let go of
@@ -7293,7 +7326,7 @@ fn reserve_ahead<P: Platform>(
 ) -> bool {
     let mut wants = wants.to_vec();
     wants.extend(state.refills(device));
-    let lacking = state.lacking_for(&wants);
+    let lacking = state.reserve_spares(&wants);
     let any = !lacking.is_empty();
     reserve_unlocked(state, device, lacking);
     any
@@ -8092,29 +8125,6 @@ impl<P: Platform> Spares<P> {
         }
         self.top_up(device, timed);
         Ok(Some(pieces))
-    }
-
-    /// Of `lens`, the pieces a copy would make ([`Self::pieces_from`]) where `reserved` and the
-    /// spares kept now serve it: each the shortest of them that holds it, the reserved first.
-    fn lacking(&self, lens: &[u64], reserved: &[P::Buffer]) -> Vec<u64> {
-        let mut reserved: Vec<u64> = reserved.iter().map(|b| b.length()).collect();
-        let mut kept: Vec<u64> = (self.kept.idle.lock().iter())
-            .map(|s| s.buffer.length())
-            .collect();
-        let mut lacking = Vec::new();
-        for &length in lens {
-            let served = [&mut reserved, &mut kept].into_iter().any(|from| {
-                let at = (from.iter().enumerate())
-                    .filter(|&(_, &l)| l >= length)
-                    .min_by_key(|&(_, &l)| l)
-                    .map(|(at, _)| at);
-                at.map(|at| from.swap_remove(at)).is_some()
-            });
-            if !served {
-                lacking.push(length);
-            }
-        }
-        lacking
     }
 
     /// Gives `pieces`, reserved for a copy that left them ([`Self::pieces_from`]), back to the
@@ -16171,6 +16181,51 @@ pub(super) mod tests {
             [6, 2, 3, 1],
             "six pieces taken, two of them spares; three made for the first copy, one after"
         );
+    }
+
+    /// Where the caches' copies are staged, a download whose copy the spares serve in part takes
+    /// the spares that serve it into its block's reserve before it lets go of the caches' lock to
+    /// make the piece they lack: the make takes no spare counted for the copy, which then finds
+    /// each of its pieces reserved, and makes none under the lock ([`PIECE_MAKES_LOCKED`])
+    #[test]
+    fn a_reservation_holds_the_spares_it_counts_while_it_makes_the_rest() {
+        let mut r = rig(8);
+        r.dec.set_staged_surface_copies(Arc::default());
+        let page = r.page;
+        let piece = 2 * page;
+        r.dec.surface_caches.set_staging_piece(piece);
+        queues(&mut r);
+        let length = 5 * page;
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 5)], length, true),
+            RGFX_STATUS_OK
+        );
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        // The spares keep two of the fill's three pieces; the download's copy takes three.
+        assert_eq!(
+            r.dec.caches().spares.held(),
+            (vec![piece, piece], 0),
+            "the fill's pieces kept"
+        );
+        let locked = counted(PIECE_MAKES_LOCKED);
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        let calls = r.p.call_log().since(mark);
+        let last = page.next_multiple_of(PIECE_GRANULE).min(piece);
+        assert_eq!(
+            scratch_made(&calls),
+            (vec![], vec![last]),
+            "the one piece the spares lack"
+        );
+        assert_eq!(copies_at(&calls).len(), 3, "the download's copy, at once");
+        assert_eq!(
+            counted(PIECE_MAKES_LOCKED),
+            locked,
+            "none made under the lock"
+        );
+        complete_staged(&r);
+        assert!(done.load(Ordering::SeqCst));
     }
 
     /// Where the caches' copies are staged, a download of a cache laid out at the GPU's pitch
