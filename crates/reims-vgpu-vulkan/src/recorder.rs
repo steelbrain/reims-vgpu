@@ -15,7 +15,8 @@
 //!   object an argument names are the objects' stream ids, which the recorder gives each object
 //!   as a call makes it (`State::register`) and never gives again, a texture of the platform's
 //!   own (the window's cursor glyph, `VulkanDevice::new_own_texture`, and the rt platform's
-//!   images for views) as any other `newTextureWithDescriptor:`, of a descriptor whose
+//!   images for views and surfaces' planes) as any other `newTextureWithDescriptor:`, of a
+//!   descriptor whose
 //!   `m2v.textureDescriptor` map holds [`OUTSIDE`] (`outside: true`) so a player places it
 //!   outside the guest's texture indices; an object's last reference going (`Obj`'s drop) is its
 //!   `release` record.
@@ -1208,6 +1209,13 @@ pub fn adopt_texture(t: &VulkanTexture) {
     adopt::<crate::platform::VulkanPlatform, _>(t);
 }
 
+/// [`adopt_texture`] of the rt platform's texture `t` (a window's drawable,
+/// `RtSwapchain::texture`).
+#[cfg(feature = "rt")]
+pub fn adopt_rt_texture(t: &crate::rt_platform::RtObj<crate::rt_platform::RtTexture>) {
+    adopt::<crate::rt_platform::RtPlatform, _>(t);
+}
+
 /// [`adopt_texture`] of a texture of the platform `P`'s.
 fn adopt<P, T>(t: &T)
 where
@@ -1241,16 +1249,17 @@ where
 }
 
 /// The key of an `m2v.textureDescriptor` record's map that marks a descriptor of a texture of the
-/// platform's own (the window's cursor glyph, and on the rt platform a shape's image for views),
-/// `true`: its texture takes no resource ID and no range of Metal's space, so a player places it
-/// outside the guest's texture indices. Only such a descriptor carries it
-/// ([`outside_descriptor`]).
+/// platform's own (the window's cursor glyph, and on the rt platform a shape's image for views
+/// and a surface's plane), `true`: its texture takes no resource ID and no range of Metal's
+/// space, so a player places it outside the guest's texture indices. Only such a descriptor
+/// carries it ([`outside_descriptor`]).
 pub const OUTSIDE: &str = "outside";
 
 /// Records the making of `descriptor`, of `desc`, for a texture of the platform's own
 /// (`VulkanDevice::new_own_texture`, and with feature `rt` the rt platform's images for views,
-/// `RtObj::<RtDevice>::new_texture_for_views`): an `m2v.textureDescriptor` on the platform, as
-/// its `texture_descriptor` records one, whose map ends with [`OUTSIDE`] `true`. The texture's
+/// `RtObj::<RtDevice>::new_texture_for_views`, and its surfaces' planes, the exported and
+/// Direct3D 11 surfaces'): an `m2v.textureDescriptor` on the platform, as its
+/// `texture_descriptor` records one, whose map ends with [`OUTSIDE`] `true`. The texture's
 /// `newTextureWithDescriptor:` names it as any other's names its descriptor.
 pub fn outside_descriptor(
     descriptor: &impl AsMade,
@@ -1297,7 +1306,7 @@ fn adopt_shown(t: &dyn Any) -> Option<u64> {
     }
     #[cfg(feature = "rt")]
     if let Some(t) = t.downcast_ref::<crate::rt_platform::RtObj<crate::rt_platform::RtTexture>>() {
-        adopt::<crate::rt_platform::RtPlatform, _>(t);
+        adopt_rt_texture(t);
         return Some(t.rec_ptr());
     }
     None
@@ -5255,6 +5264,239 @@ mod tests {
                 assert_eq!(stat(streams, "unrecorded_refs"), 0);
                 assert_eq!(stat(streams, "unrecorded_receivers"), 0);
                 drop((queue, views, images, device));
+            },
+        );
+    }
+
+    /// An rt exported surface's planes are each a `newTextureWithDescriptor:` on the device of a
+    /// descriptor whose `m2v.textureDescriptor` map ends with [`OUTSIDE`] `true`, as an image for
+    /// views is; the stream names a plane as the receiver of the view made of it and as the
+    /// source of a copy out of it, and counts no object it could not name. On a device that
+    /// exports no surface nothing is made, and nothing tested.
+    #[cfg(all(feature = "rt", unix))]
+    #[test]
+    fn on_vulkan_an_rt_surface_s_planes_are_named_where_they_are_used() {
+        in_recording_child(
+            "recorder::tests::on_vulkan_an_rt_surface_s_planes_are_named_where_they_are_used",
+            |streams| {
+                use crate::core::platform::Platform as _;
+                use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+                use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+                use crate::core::platform::device::GpuDevice as _;
+                use crate::core::platform::resource::{
+                    SurfaceDesc, SurfaceHandle, SurfacePlaneDesc, Texture as _,
+                };
+                use crate::core::platform::types::{MtlOrigin, MtlSize};
+                use crate::core::raise::OnFault;
+                const VIEW: &str = "newTextureViewWithPixelFormat:";
+                const MADE: &str = "newTextureWithDescriptor:";
+                const DESCRIPTOR: &str = "m2v.textureDescriptor";
+                let platform = crate::rt_platform::RtPlatform::new();
+                assert!(on(), "the child does not record");
+                let registry_id = platform
+                    .system_default_device()
+                    .expect("an rt device on the GPU the test holds")
+                    .facts()
+                    .registry_id;
+                let device = platform
+                    .open_device(registry_id)
+                    .expect("the default device");
+                // An NV12 picture's planes: R8Unorm luma, 64 x 32, and RG8Unorm chroma at half
+                // its size each way; sampled, rendered and viewed in another format.
+                let plane = |pixel_format, width, height| SurfacePlaneDesc {
+                    pixel_format,
+                    width,
+                    height,
+                    usage: 0x1 | 0x4 | 0x10,
+                    rows_below: 0,
+                };
+                let planes = [plane(10, 64, 32), plane(30, 32, 16)];
+                let on = OnFault::Return;
+                let handles = [SurfaceHandle::OpaqueFd, SurfaceHandle::DmaBuf];
+                let made = handles.into_iter().find_map(|handle| {
+                    let desc = SurfaceDesc {
+                        handle,
+                        pitch_multiple: 256,
+                        start_multiple: 256,
+                        planes: &planes,
+                    };
+                    (device.new_exported_surface(on, &desc)).expect("never a raise")
+                });
+                let Some(surface) = made else {
+                    println!("the device exports no surface: none tested");
+                    return;
+                };
+                let views: Vec<_> = (surface.planes.iter())
+                    .map(|plane| plane.new_texture_view(plane.pixel_format()).unwrap())
+                    .map(|view| view.expect("a view of the plane"))
+                    .collect();
+                let queue = device.new_command_queue().expect("a queue");
+                let out = device.new_buffer_of_length(on, 4096, 0);
+                let out = out.expect("never a raise").expect("a Shared buffer");
+                let made = queue.command_buffer(on).expect("never a raise");
+                let made = made.expect("a command buffer");
+                let encoder = made.blit_encoder(on).expect("never a raise");
+                let encoder = encoder.expect("a blit encoder");
+                for (plane, desc) in surface.planes.iter().zip(&planes) {
+                    let cmd = BlitCmd::CopyTextureToBuffer {
+                        source_texture: plane,
+                        source_slice: 0,
+                        source_level: 0,
+                        source_origin: MtlOrigin::default(),
+                        source_size: MtlSize::new(desc.width, desc.height, 1),
+                        destination_buffer: &out,
+                        destination_offset: 0,
+                        destination_bytes_per_row: 64,
+                        destination_bytes_per_image: 64 * desc.height,
+                    };
+                    assert_eq!(encoder.encode(on, cmd), Ok(()));
+                }
+                assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+                assert_eq!(made.commit(on), Ok(()));
+                assert_eq!(made.wait_until_completed(on), Ok(()));
+                let is_copy = |c: &&Call| c.selector.starts_with("copyFromTexture:");
+                let copies = |calls: &[Call]| calls.iter().filter(is_copy).count();
+                let (calls, _) = recorded(streams, |calls| copies(calls) == planes.len());
+                assert_eq!(copies(&calls), planes.len(), "{calls:?}");
+                let device_id = id_at(device.rec_ptr()).expect("the device's stream id");
+                for plane in &surface.planes {
+                    let id = id_at(plane.rec_ptr()).expect("the plane's stream id");
+                    let made = (calls.iter())
+                        .find(|c| c.selector == MADE && c.result == id)
+                        .unwrap_or_else(|| panic!("nothing made plane {id}: {calls:?}"));
+                    assert_eq!(made.receiver, device_id, "{made:?}");
+                    let Some(&Value::Object(descriptor)) = made.args.first() else {
+                        panic!("no descriptor named: {made:?}");
+                    };
+                    let record = (calls.iter())
+                        .find(|c| c.selector == DESCRIPTOR && c.result == descriptor)
+                        .unwrap_or_else(|| panic!("nothing made descriptor {descriptor}"));
+                    let Some(Value::Map(pairs)) = record.args.first() else {
+                        panic!("a descriptor's map: {record:?}");
+                    };
+                    assert_eq!(
+                        pairs.last(),
+                        Some(&(OUTSIDE.to_owned(), Value::Bool(true))),
+                        "{record:?}"
+                    );
+                    assert!(
+                        calls.iter().any(|c| c.selector == VIEW && c.receiver == id),
+                        "no view of plane {id}: {calls:?}"
+                    );
+                    let names = |c: &Call| c.args.first() == Some(&Value::Object(id));
+                    assert!(
+                        calls.iter().any(|c| is_copy(&c) && names(c)),
+                        "no copy out of plane {id}: {calls:?}"
+                    );
+                }
+                assert_eq!(stat(streams, "unrecorded_refs"), 0);
+                assert_eq!(stat(streams, "unrecorded_receivers"), 0);
+                drop((made, queue, out, views, surface, device));
+            },
+        );
+    }
+
+    /// A window's drawable on rt is made in the stream before its first use, as the Vulkan
+    /// platform's is: a `newTextureWithDescriptor:` of its shape answering `m2v.drawable` true,
+    /// which a copy out of it then names, and no object goes unnamed. Where the loader offers no
+    /// headless surface (`VK_EXT_headless_surface`), or the device presents to none, there is no
+    /// window, and nothing tested.
+    #[cfg(feature = "rt")]
+    #[test]
+    fn on_vulkan_an_rt_drawable_is_made_before_its_first_use() {
+        in_recording_child(
+            "recorder::tests::on_vulkan_an_rt_drawable_is_made_before_its_first_use",
+            |streams| {
+                use ash::{khr, vk};
+
+                use crate::core::platform::Platform as _;
+                use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+                use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+                use crate::core::platform::device::GpuDevice as _;
+                use crate::core::platform::types::{MtlOrigin, MtlSize};
+                use crate::core::raise::OnFault;
+                use crate::rt_platform::swapchain::RtSwapchain;
+                use crate::swapchain::Acquired;
+                let platform = crate::rt_platform::RtPlatform::new();
+                assert!(on(), "the child does not record");
+                let device = (platform.system_default_device()).expect("an rt device");
+                let headless = ash::ext::headless_surface::NAME;
+                if !(device.instance().extensions().iter()).any(|e| e.as_c_str() == headless) {
+                    println!("the loader offers no VK_EXT_headless_surface: none tested");
+                    return;
+                }
+                let (entry, instance) = device.instance().raw();
+                let surfaces = khr::surface::Instance::new(entry, instance);
+                let made = ash::ext::headless_surface::Instance::new(entry, instance);
+                let info = vk::HeadlessSurfaceCreateInfoEXT::default();
+                // SAFETY: a valid create info, on rt's live instance, which enabled the extension.
+                let surface = unsafe { made.create_headless_surface(&info, None) }.expect("one");
+                let raw = device.rt().raw();
+                let (physical, family) = (raw.physical_device, raw.queue_family_index);
+                // SAFETY: the surface and the physical device are live, of one instance.
+                let presents = unsafe {
+                    surfaces.get_physical_device_surface_support(physical, family, surface)
+                };
+                if presents != Ok(true) {
+                    println!("the device presents to no headless surface: none tested");
+                    // SAFETY: the surface is this test's, and nothing was made of it.
+                    unsafe { surfaces.destroy_surface(surface, None) };
+                    return;
+                }
+                // SAFETY: the surface is live, of the device's instance, and the swapchain's.
+                let made = unsafe { RtSwapchain::new(&device, surface) };
+                let mut swapchain = made.expect("a swapchain over the headless surface");
+                let size = (64, 48);
+                let frame = (0..100)
+                    .find_map(|_| match swapchain.acquire(size) {
+                        Acquired::Image(frame) => Some(frame),
+                        Acquired::Retry => None,
+                        ended => panic!("no image: {ended:?}"),
+                    })
+                    .expect("an image in 100 takes");
+                let texture = swapchain.texture(frame).expect("the frame's drawable");
+                let drawable = texture.rec_ptr();
+                let on = OnFault::Return;
+                let queue = device.new_command_queue().expect("a queue");
+                let out = device.new_buffer_of_length(on, size.0 * size.1 * 4, 0);
+                let out = out.expect("never a raise").expect("a Shared buffer");
+                let made = queue.command_buffer(on).expect("never a raise");
+                let made = made.expect("a command buffer");
+                let encoder = made.blit_encoder(on).expect("never a raise");
+                let encoder = encoder.expect("a blit encoder");
+                let cmd = BlitCmd::CopyTextureToBuffer {
+                    source_texture: texture,
+                    source_slice: 0,
+                    source_level: 0,
+                    source_origin: MtlOrigin::default(),
+                    source_size: MtlSize::new(size.0, size.1, 1),
+                    destination_buffer: &out,
+                    destination_offset: 0,
+                    destination_bytes_per_row: size.0 * 4,
+                    destination_bytes_per_image: size.0 * size.1 * 4,
+                };
+                assert_eq!(encoder.encode(on, cmd), Ok(()));
+                assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+                assert!(swapchain.encode_ready(frame, &made));
+                assert_eq!(made.commit(on), Ok(()));
+                assert!(swapchain.present(frame, &made));
+                assert_eq!(made.wait_until_completed(on), Ok(()));
+                let is_copy = |c: &&Call| c.selector.starts_with("copyFromTexture:");
+                let (calls, _) = recorded(streams, |calls| calls.iter().any(|c| is_copy(&c)));
+                let id = id_at(drawable).expect("the drawable's stream id");
+                let adopted = (calls.iter())
+                    .find(|c| c.selector == "newTextureWithDescriptor:" && c.result == id)
+                    .unwrap_or_else(|| panic!("nothing made drawable {id}: {calls:?}"));
+                let answer = ("m2v.drawable".to_owned(), Value::Bool(true));
+                assert!(adopted.answers.contains(&answer), "{adopted:?}");
+                let names = |c: &Call| c.args.first() == Some(&Value::Object(id));
+                assert!(
+                    calls.iter().any(|c| is_copy(&c) && names(c)),
+                    "no copy out of drawable {id}: {calls:?}"
+                );
+                assert_eq!(stat(streams, "unrecorded_refs"), 0);
+                assert_eq!(stat(streams, "unrecorded_receivers"), 0);
+                drop((made, queue, out, swapchain, device));
             },
         );
     }

@@ -16,7 +16,8 @@
 //! it, placed or not, as the device's `newTextureWithDescriptor:` of a descriptor whose
 //! `m2v.textureDescriptor` record marks it outside the guest's texture indices
 //! (`crate::recorder::outside_descriptor`), so the views, copies and commands that name it name
-//! its stream id.
+//! its stream id. A surface's plane (`super::surface`, `super::d3d11_surface`), which the guest's
+//! textures over the plane are views of in the same way, is recorded so too (`surface_plane`).
 //!
 //! **Placed images for views.** A shape's image may be placed instead
 //! (`ApiPlatform::placed_shape_image`, [`RtObj::new_placed_texture_for_views`]): rt's texture for
@@ -475,7 +476,10 @@ pub(super) fn set_purgeable(held: &AtomicU64, state: u64) -> u64 {
 /// The plane texture `plane` of an exported surface rt made (`super::surface`), of `desc`, for
 /// `sel`: a texture with no index of its own, the image under the textures made as its views, as
 /// [`RtObj::new_texture_for_views`]'s is. On Windows, a plane of a surface over Direct3D 11
-/// textures (`super::d3d11_surface`).
+/// textures (`super::d3d11_surface`). A recording holds it as it holds an image for views
+/// (`recorded_image`): the device's `newTextureWithDescriptor:` of a descriptor of `desc` marked
+/// outside the guest's texture indices, so the views, copies and commands that name the plane
+/// name its stream id. What the other API writes into the plane is not in the stream.
 pub(super) fn surface_plane(
     device: &RtObj<RtDevice>,
     sel: &'static str,
@@ -484,15 +488,15 @@ pub(super) fn surface_plane(
 ) -> Option<RtObj<RtTexture>> {
     let options = desc.resource_options.unwrap_or(0);
     let diag = |shape: &Shape| Made::new(Call::SurfaceImage, shape);
-    answered(device, sel, desc, options, None, Ok(plane), diag)
+    recorded_image(device, desc, || answered(device, sel, desc, options, None, Ok(plane), diag))
 }
 
-/// An image for views as a recording holds it: the device's `newTextureWithDescriptor:` of a
-/// descriptor of `desc` whose `m2v.textureDescriptor` record marks it
-/// [`crate::recorder::OUTSIDE`] ([`crate::recorder::outside_descriptor`]), as the Vulkan
-/// platform's own texture is, so a player places it outside the guest's texture indices, as rt
-/// gives it none, and the views, copies and commands that name the image name its stream id.
-/// `make` makes the image; where the process does not record, nothing else is made.
+/// An image for views, or a surface's plane (`surface_plane`), as a recording holds it: the
+/// device's `newTextureWithDescriptor:` of a descriptor of `desc` whose `m2v.textureDescriptor`
+/// record marks it [`crate::recorder::OUTSIDE`] ([`crate::recorder::outside_descriptor`]), as the
+/// Vulkan platform's own texture is, so a player places it outside the guest's texture indices,
+/// as rt gives it none, and the views, copies and commands that name the image name its stream
+/// id. `make` makes the image; where the process does not record, nothing else is made.
 fn recorded_image(
     device: &RtObj<RtDevice>,
     desc: &TextureDesc,

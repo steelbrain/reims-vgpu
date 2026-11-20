@@ -460,9 +460,15 @@ impl RtSwapchain {
         }
     }
 
-    /// The texture over `frame`'s image, which the display's draw draws into.
+    /// The texture over `frame`'s image, which the display's draw draws into. A recorded stream
+    /// makes it before its first use, as the Vulkan platform's swapchain's
+    /// (`crate::recorder::adopt_rt_texture`).
     pub fn texture(&self, frame: Frame) -> Option<&RtObj<RtTexture>> {
-        self.image(frame.index()).map(|i| &i.texture)
+        let texture = self.image(frame.index()).map(|i| &i.texture);
+        if let Some(t) = texture {
+            crate::recorder::adopt_rt_texture(t);
+        }
+        texture
     }
 
     /// Has `command_buffer` present `frame`'s image once its commands have run, signalling the
