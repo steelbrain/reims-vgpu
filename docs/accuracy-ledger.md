@@ -2,12 +2,13 @@
 
 A ledger, not a journal: rows are edited in place. It lists where the Vulkan platform's answers
 can differ from Metal's. The platform (`RtPlatform`, over metal2vulkan-runtime) has no switches: no
-fast or exact form to choose, and no policy by device. What differs is of three kinds:
+fast or exact form to choose, and no policy by device. What differs is of four kinds:
 - **the device's own answers**: values the host's GPU computes (its maths, sampling, conversions,
   blends and resolves), which the contract makes the device's own (AGENTS.md, "The contract"),
   each with its bound where one was measured;
 - **what the platform has not built, and what rt refuses**: answered as Metal's call answers
   where it fails, and counted;
+- **memory whose GPU writes Metal drops**, which the platform makes over a copy;
 - **the loss of the device**, which rt never recovers from.
 
 The process ends only where Metal ends it, or where the platform has no form for a raw value the
@@ -97,6 +98,12 @@ answers its `NSError`. A device's sample and offset reads may read the quad's ot
 and RADV's read garbage where those have left the control flow (measured by metal2vulkan in a
 1x1 framebuffer, whose quad holds three helper invocations). The same reads in the first block,
 before any discard, are made.
+
+## Memory whose GPU writes Metal drops
+
+| Entry | What runs instead of Metal's answer |
+|---|---|
+| `read-only-pages-written` | Memory whose GPU writes Metal drops (pages a guest process maps read-only, `RGFX_SURFACE_PAGES_READ_ONLY`, and a no-copy buffer or heap of `MTLResourceOptions` bit 24) is made over a copy of its pages, and the pages are never written, so the CPU and the command buffers committed after a GPU write read the pages' bytes, as Metal's GPU drops a kernel's and a blit's writes there (the M3 Max, the 5300M and the UHD 630, dgpu-oracle.md Q38). Where Metal drops a write at the write, the copy keeps it for a while. A copy of pages that may change is written whole from the pages at each commit that uses it, so within a command buffer, and between command buffers in flight at once, a read after the GPU's write sees the write until the next commit that uses the copy. A copy of unchanging pages (`RGFX_SURFACE_PAGES_UNCHANGING`, a file's own on a volume mounted read-only) is never copied in, and is written whole again from the pages at each completion of a command buffer that can write it, so a read after the write sees it until that completion (`crates/reims-vgpu-vulkan/src/rt_platform/copied.rs`, "Writes dropped" and "Unchanging pages"). A render pass with an attachment over such a copy completes, its stores and resolves there dropped with the copy's other writes, as over read-only pages on the 5300M and the UHD 630, where the M3 Max faults the command buffer of a pass that stores or resolves into it (`PageFault`): counted at the pass, `rt-copied-store-outs`. A no-copy buffer or heap of bit 24 pinned in a known block that is no such copy stays at the guest's address, where the GPU's writes reach its bytes, counted `rt-no-copy-read-only`, the process's first with a line (`crates/reims-vgpu-vulkan/src/rt_platform/buffer.rs`, "Read-only memory") |
 
 ## The loss of the device
 
