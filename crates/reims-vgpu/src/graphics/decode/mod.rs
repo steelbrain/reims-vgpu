@@ -941,6 +941,9 @@ pub(crate) struct Shared<P: Platform> {
     /// The listener the command buffers' notifications of the values they signal run on, made at
     /// the first ([`Shared::listener`]).
     listener: OnceLock<P::SharedEventListener>,
+    /// The pipelines the command buffers' dispatch pre-passes handed over, by the platform's key
+    /// of each, of every compute state ([`prepass::Handed`]).
+    handed: prepass::Handed<P::DispatchVariant>,
     /// Called after each op of every command buffer's walk (the tests' look inside a walk).
     #[cfg(test)]
     walk_hook: Mutex<Option<WalkHook>>,
@@ -1344,6 +1347,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             shares: Arc::default(),
             lanes,
             helpers,
+            handed: prepass::Handed::default(),
             #[cfg(test)]
             walk_hook: Mutex::new(None),
             #[cfg(test)]

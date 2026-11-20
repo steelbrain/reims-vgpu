@@ -6,10 +6,10 @@
 //! threadgroup memory lengths and the grid's tiles, which come with each dispatch), the first
 //! dispatch of each shape made it on the walk's thread, and the buffer's commit, and its
 //! process's wait for it, waited the make out. The pre-pass reads a buffer's
-//! dispatches as its queue's service thread begins it, and hands each shape not handed before to
-//! the compile pool (`CompileKind::Prepass`, `graphics::compile`, "Turns"), whose threads make it
-//! ([`ComputePipeline::prepare_dispatch`]) while the walk goes on; a dispatch then finds it made,
-//! or waits for the one thread making it.
+//! dispatches as its queue's service thread begins it, and hands each pipeline not handed before
+//! to the compile pool (`CompileKind::Prepass`, `graphics::compile`, "Turns"), whose threads make
+//! it ([`ComputePipeline::prepare_dispatch`]) while the walk goes on; a dispatch then finds it
+//! made, or waits for the one thread making it.
 //!
 //! - **What it reads.** Each compute encoder's `dispatchThreads`, `dispatchThreadgroups` and
 //!   indirect `dispatchThreadgroups`, in stream order, with the compute state set before it and
@@ -19,10 +19,22 @@
 //!   indirect dispatch of no buffer (the walk faults it), the indirect `dispatchThreads`, which
 //!   the platform's make ahead takes no grid of, and the dispatches an indirect command buffer
 //!   holds, which its own writes encode.
-//! - **Each shape once.** A compute state's entry keeps the last [`MEMO`] shapes handed for it
-//!   ([`Handed`]): a dispatch of one of them hands nothing, so once a run's shapes are made its
-//!   buffers hand nothing and the pool is given nothing. A buffer hands [`MOST`] at the most; the
-//!   rest are counted (`dispatch-prepass-past-most`) and left to the walk.
+//! - **Each pipeline once.** The platform names the pipeline a dispatch runs by a key
+//!   ([`ComputePipeline::dispatch_variant`]): dispatches of equal keys, of one compute state or of
+//!   several, run one pipeline. The device keeps the last [`MEMO`] keys handed, of every state
+//!   ([`Handed`]): a dispatch whose key is there hands nothing, so neither does another shape of a
+//!   pipeline handed (a grid of more whole threadgroups) nor another state's dispatch of it, and
+//!   once a run's pipelines are made its buffers hand nothing and the pool is given nothing. A
+//!   dispatch with no key, one the platform would make nothing for, hands nothing, counted
+//!   (`dispatch-prepass-no-variant`). A buffer hands [`MOST`] at the most; the rest are counted
+//!   (`dispatch-prepass-past-most`) and left to the walk.
+//! - **One memo for the device.** The rt platform's key is of the kernel's compiled content,
+//!   which every state of one kernel shares with its `VkPipeline`s, and names no other content's
+//!   pipeline even once its own is gone. So one memo serves every state: the states the guest's
+//!   processes each make of one kernel hand its pipelines once between them, not once a state,
+//!   and the memo's bound holds its memory whatever the number of states. It forgets the oldest
+//!   key first: a key of a pipeline gone stays until then, and a key forgotten and met again is
+//!   handed once more, where the platform finds it made and returns.
 //! - **The walk waits for none of it.** Each shape is one compile of the pool's, taken in the
 //!   order handed by the first free thread; where no thread is free the walk makes the shape as
 //!   before, and a thread that takes it later finds it made.
@@ -41,10 +53,11 @@
 //!   value is its dispatch's own, decided in the walk as before; only how soon the walk has it
 //!   changes.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
+use std::hash::Hash;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 
 use reims_vgpu_graphics::ops::compute::{
     RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT,
@@ -71,14 +84,17 @@ use super::{DecodeError, GraphicsDecoder, ObjHandle, read};
 /// The most shapes one command buffer hands over.
 pub(crate) const MOST: usize = 32;
 
-/// The shapes a compute state remembers handed ([`Handed`]).
-pub(crate) const MEMO: usize = 64;
+/// The most keys of pipelines handed that the device remembers, of every compute state
+/// ([`Handed`]). A pipeline whose key it forgot is handed again at its next dispatch, one make
+/// ahead that finds it made.
+pub(crate) const MEMO: usize = 1024;
 
 /// The target of the pre-pass's lines.
 const LOG_TARGET: &str = "reims_vgpu::graphics::prepass";
 
 /// Codes counted ([`reims_vgpu_vulkan::answer::count_kind`]).
 const HANDED: &str = "dispatch-prepass-handed";
+const NO_VARIANT: &str = "dispatch-prepass-no-variant";
 const PAST_MOST: &str = "dispatch-prepass-past-most";
 const DROPPED: &str = "dispatch-prepass-dropped";
 const WAITED: &str = "dispatch-prepass-waited";
@@ -89,58 +105,51 @@ const WAIT_MAX_NS: &str = "dispatch-prepass-wait-max-ns";
 static WAIT_MOST: AtomicU64 = AtomicU64::new(0);
 
 /// A dispatch's shape: its arguments as the platform's make ahead takes them.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Shape {
+#[derive(Debug)]
+struct Shape {
     dispatch: Dispatch,
     threads: MtlSize,
     lengths: Box<[(u64, u64)]>,
 }
 
-impl Shape {
-    /// Whether it is the shape of `dispatch` of `threads` threads a threadgroup with `lengths`.
-    fn is(&self, dispatch: Dispatch, threads: MtlSize, lengths: &[(u64, u64)]) -> bool {
-        self.dispatch == dispatch && self.threads == threads && *self.lengths == *lengths
+/// The keys of the pipelines the device's pre-passes handed, the latest [`MEMO`], of every
+/// compute state (the module doc, "Each pipeline once" and "One memo for the device").
+pub(crate) struct Handed<V>(Mutex<Memo<V>>);
+
+/// [`Handed`]'s keys, and the order they were handed in.
+struct Memo<V> {
+    keys: HashSet<V>,
+    order: VecDeque<V>,
+}
+
+impl<V> Default for Handed<V> {
+    fn default() -> Self {
+        Handed(Mutex::new(Memo {
+            keys: HashSet::new(),
+            order: VecDeque::new(),
+        }))
     }
 }
 
-/// The shapes a compute state's entry remembers its buffers' pre-passes handed, the latest
-/// [`MEMO`] (the module doc, "Each shape once").
-#[derive(Default)]
-pub(crate) struct Handed(Mutex<VecDeque<Shape>>);
-
-impl Handed {
-    /// The shape of `dispatch` of `threads` threads a threadgroup with `lengths`, where it was not
-    /// handed before, noted as handed now, the oldest past [`MEMO`] forgotten; `None` where it
-    /// was. Where `note` is false, nothing is noted, and `Some` says only that it is new.
-    fn new_shape(
-        &self,
-        dispatch: Dispatch,
-        threads: MtlSize,
-        lengths: &[(u64, u64)],
-        note: bool,
-    ) -> Option<Shape> {
-        let mut shapes = self.0.lock();
-        if shapes.iter().any(|s| s.is(dispatch, threads, lengths)) {
-            return None;
+impl<V: Copy + Eq + Hash> Handed<V> {
+    /// Whether `key` was not handed since the latest [`MEMO`]: where it was not, and `note`, it is
+    /// noted as handed now, the oldest past [`MEMO`] forgotten.
+    fn is_new(&self, key: V, note: bool) -> bool {
+        let mut memo = self.0.lock();
+        if memo.keys.contains(&key) {
+            return false;
         }
-        let shape = Shape {
-            dispatch,
-            threads,
-            lengths: lengths.into(),
-        };
         if note {
-            if shapes.len() == MEMO {
-                shapes.pop_front();
+            if memo.order.len() == MEMO
+                && let Some(oldest) = memo.order.pop_front()
+            {
+                memo.keys.remove(&oldest);
             }
-            shapes.push_back(shape.clone());
+            memo.order.push_back(key);
+            memo.keys.insert(key);
         }
-        Some(shape)
+        true
     }
-}
-
-/// The entry's [`Handed`], made at its first ask.
-fn handed<P: Platform>(entry: &Entry<P>) -> &Handed {
-    entry.handed.get_or_init(Box::default)
 }
 
 /// A shape handed over: the compute state it is of, by its handle and its guest id.
@@ -329,8 +338,8 @@ fn make_next<P: Platform>(shared: &Shared<P>) {
 
 impl<P: Platform> GraphicsDecoder<P> {
     /// The pre-pass of the `COMMAND_BUFFER` `message` (the module doc): the shapes of its
-    /// dispatches no buffer handed before, read through the message's views of the table; `None`
-    /// where it hands none.
+    /// dispatches whose pipelines no buffer handed before, read through the message's views of the
+    /// table; `None` where it hands none.
     pub(crate) fn prepass(&self, message: &[u8]) -> Option<Prepass<P>> {
         let m = read::<RgfxCommandBuffer>(message)?;
         let ops = ops_of(message, &m)?;
@@ -338,9 +347,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         let mut state: Option<(u64, &Entry<P>)> = None;
         let mut lengths: Vec<(u64, u64)> = Vec::new();
         // The last dispatch's state, dispatch and threads, while the lengths stay as they were:
-        // a run of the same dispatch looks its shape up once.
+        // a run of the same dispatch looks its key up once.
         let mut last: Option<(u64, Dispatch, MtlSize)> = None;
         let mut past_most = 0u64;
+        let mut no_variant = 0u64;
         for (tag, body) in op_bodies(ops) {
             let dispatch = match tag {
                 RGFX_OP_ENCODER_BEGIN_COMPUTE | RGFX_OP_ENCODER_END => {
@@ -405,17 +415,26 @@ impl<P: Platform> GraphicsDecoder<P> {
                 continue;
             }
             last = Some((obj_id, dispatch, threads));
-            let room = items.len() < MOST;
-            let Some(shape) = handed(entry).new_shape(dispatch, threads, &lengths, room) else {
-                continue;
-            };
             let ObjHandle::ComputePipeline(handle) = &entry.handle else {
                 continue;
             };
+            let Some(key) = handle.dispatch_variant(dispatch, threads, &lengths) else {
+                no_variant += 1;
+                continue;
+            };
+            let room = items.len() < MOST;
+            if !self.shared.handed.is_new(key, room) {
+                continue;
+            }
             if !room {
                 past_most += 1;
                 continue;
             }
+            let shape = Shape {
+                dispatch,
+                threads,
+                lengths: lengths.as_slice().into(),
+            };
             items.push_back(Item {
                 state: handle.clone_ref(),
                 obj_id,
@@ -423,6 +442,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             });
         }
         reims_vgpu_vulkan::answer::count_kind_by(PAST_MOST, past_most);
+        reims_vgpu_vulkan::answer::count_kind_by(NO_VARIANT, no_variant);
         if items.is_empty() {
             return None;
         }
@@ -443,6 +463,3 @@ impl<P: Platform> GraphicsDecoder<P> {
         })
     }
 }
-
-/// An entry's [`Handed`] cell, which [`Entry::of`] starts empty.
-pub(crate) type HandedCell = OnceLock<Box<Handed>>;

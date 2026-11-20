@@ -153,8 +153,9 @@ pub fn out_of_host_memory_count() -> u64 {
 /// (`control-ring-full`, `control-ring-post-waited`, `vblank-dropped`, `queue-ring-full`,
 /// `queue-ring-post-waited`), as its decoder keeps a buffer dealt to two threads whole
 /// (`two-ranges-kept-whole`), as its command buffers' dispatch pre-pass hands their dispatches'
-/// shapes to its compile threads (`dispatch-prepass-handed`), leaves those past a buffer's most to
-/// its walk (`dispatch-prepass-past-most`), drops those no thread took by the walk's end
+/// pipelines to its compile threads (`dispatch-prepass-handed`), hands none for a dispatch the
+/// platform would make nothing for (`dispatch-prepass-no-variant`), leaves those past a buffer's
+/// most to its walk (`dispatch-prepass-past-most`), drops those no thread took by the walk's end
 /// (`dispatch-prepass-dropped`) and the walk's end waits for those being made
 /// (`dispatch-prepass-waited`, its nanoseconds waited, `dispatch-prepass-wait-ns`, and the longest
 /// wait, `dispatch-prepass-wait-max-ns`), as it makes a no-copy buffer over pages their process

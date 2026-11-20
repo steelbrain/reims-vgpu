@@ -1,6 +1,8 @@
-//! A command buffer's dispatch pre-pass (`decode::prepass`): each shape of its dispatches made
-//! ahead once, on the compile threads, with the dispatch's own arguments; the walk waiting for
-//! none of it; and nothing of it outliving the buffer's views of the table, nor its device.
+//! A command buffer's dispatch pre-pass (`decode::prepass`): each pipeline its dispatches run,
+//! by the platform's key of it, made ahead once for the device, on the compile threads, with the
+//! arguments of the first dispatch of it; a dispatch with no key made ahead never; the walk
+//! waiting for none of it; and nothing of it outliving the buffer's views of the table, nor its
+//! device.
 
 use reims_vgpu_graphics::ops::compute::{
     RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT,
@@ -189,7 +191,8 @@ fn counted(code: &str) -> u64 {
         .map_or(0, |(_, n)| n)
 }
 
-/// Each shape of a command buffer's dispatches is made ahead once while its walk waits at its
+/// With the fake's keys, one of each compute state and shape: each shape of a command buffer's
+/// dispatches is made ahead once while its walk waits at its
 /// first op, with the dispatch's own grid and threads a threadgroup and the threadgroup memory
 /// lengths its encoder set before it (each index once, in the order first set, at its last
 /// length; a new encoder sets none); both buffers complete as without the pre-pass, and a later
@@ -261,6 +264,175 @@ fn each_dispatch_shape_is_made_ahead_once_with_its_own_arguments() {
     assert_eq!(completed(&platform, &mut ring, 101), RGFX_CB_OK);
     std::thread::sleep(Duration::from_millis(20));
     assert_eq!(made(&platform), expected, "a shape was made ahead again");
+}
+
+/// Dispatches of one key, of two shapes of a compute state or of two states, are made ahead
+/// once, with the arguments of the first of them in the buffer, while a dispatch of another key
+/// is made ahead too; the buffer completes as without the pre-pass
+#[test]
+fn dispatches_of_one_key_are_made_ahead_once() {
+    let (device, platform, _guest, mut ring) = with_states(&[11, 12]);
+    let world = platform.world();
+    let states = world.live(CLASS);
+    assert_eq!(states.len(), 2);
+    let other = states[1];
+    world.key_dispatches(move |p| match p.dispatch {
+        PreparedGrid::Threads(..) => Some(1),
+        PreparedGrid::Threadgroups(..) if p.state == other => Some(1),
+        _ => Some(2),
+    });
+    let ops = [
+        begin(),
+        set_state(11),
+        threads([64, 1, 1], [32, 1, 1]),
+        threads([128, 1, 1], [32, 1, 1]),
+        groups([4, 2, 1], [8, 8, 1]),
+        set_state(12),
+        threads([64, 1, 1], [32, 1, 1]),
+        groups([2, 1, 1], [32, 1, 1]),
+        end(),
+    ];
+    let gate = WalkGate::on(&device);
+    ring.send(&device, command_buffer_of(100, &ops));
+    assert!(gate.reached(), "the walk did not start");
+    let mut expected = vec![
+        Prepared {
+            state: states[0],
+            dispatch: PreparedGrid::Threads(64, 1, 1),
+            threads: (32, 1, 1),
+            lengths: vec![],
+        },
+        Prepared {
+            state: states[0],
+            dispatch: PreparedGrid::Threadgroups(4, 2, 1),
+            threads: (8, 8, 1),
+            lengths: vec![],
+        },
+    ];
+    expected.sort();
+    assert!(
+        eventually(|| made(&platform).len() >= expected.len()),
+        "made ahead: {:?}",
+        made(&platform)
+    );
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(made(&platform), expected, "a key was made ahead twice");
+    gate.open();
+    assert_eq!(completed(&platform, &mut ring, 100), RGFX_CB_OK);
+}
+
+/// A dispatch the platform answers no key of, which it would make nothing for, is made ahead
+/// never, and counted; the buffer's other dispatches are made ahead, and it completes as without
+/// the pre-pass
+#[test]
+fn a_dispatch_of_no_key_is_made_ahead_never_and_counted() {
+    let (device, platform, _guest, mut ring) = with_states(&[11]);
+    let world = platform.world();
+    let state = world.live(CLASS);
+    assert_eq!(state.len(), 1);
+    world.key_dispatches(|p| match p.dispatch {
+        PreparedGrid::Threads(..) => None,
+        _ => Some(1),
+    });
+    let before = counted("dispatch-prepass-no-variant");
+    let ops = [
+        begin(),
+        set_state(11),
+        threads([64, 1, 1], [32, 1, 1]),
+        groups([4, 2, 1], [8, 8, 1]),
+        end(),
+    ];
+    let gate = WalkGate::on(&device);
+    ring.send(&device, command_buffer_of(100, &ops));
+    assert!(gate.reached(), "the walk did not start");
+    let expected = vec![Prepared {
+        state: state[0],
+        dispatch: PreparedGrid::Threadgroups(4, 2, 1),
+        threads: (8, 8, 1),
+        lengths: vec![],
+    }];
+    assert!(
+        eventually(|| !made(&platform).is_empty()),
+        "nothing was made ahead"
+    );
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(made(&platform), expected);
+    assert_eq!(counted("dispatch-prepass-no-variant"), before + 1);
+    gate.open();
+    assert_eq!(completed(&platform, &mut ring, 100), RGFX_CB_OK);
+}
+
+/// A dispatch of a key a command buffer handed before, of another shape or another compute
+/// state, is made ahead never by a later buffer, which still makes ahead a dispatch of a new key
+#[test]
+fn a_key_handed_before_is_made_ahead_never_again() {
+    let (device, platform, _guest, mut ring) = with_states(&[11, 12]);
+    let world = platform.world();
+    let states = world.live(CLASS);
+    assert_eq!(states.len(), 2);
+    world.key_dispatches(|p| match p.dispatch {
+        PreparedGrid::Threadgroups(4, 2, 1) => Some(8),
+        _ => Some(7),
+    });
+    let first = Prepared {
+        state: states[0],
+        dispatch: PreparedGrid::Threads(64, 1, 1),
+        threads: (32, 1, 1),
+        lengths: vec![],
+    };
+    let ops = [
+        begin(),
+        set_state(11),
+        threads([64, 1, 1], [32, 1, 1]),
+        end(),
+    ];
+    let gate = WalkGate::on(&device);
+    ring.send(&device, command_buffer_of(100, &ops));
+    assert!(gate.reached(), "the walk did not start");
+    assert!(
+        eventually(|| !made(&platform).is_empty()),
+        "nothing was made ahead"
+    );
+    gate.open();
+    assert_eq!(completed(&platform, &mut ring, 100), RGFX_CB_OK);
+    assert_eq!(made(&platform), vec![first.clone()]);
+
+    let ops = [
+        begin(),
+        set_state(11),
+        threads([256, 1, 1], [32, 1, 1]),
+        set_state(12),
+        groups([2, 1, 1], [32, 1, 1]),
+        set_state(11),
+        groups([4, 2, 1], [8, 8, 1]),
+        end(),
+    ];
+    let gate = WalkGate::on(&device);
+    ring.send(&device, command_buffer_of(101, &ops));
+    assert!(gate.reached(), "the second walk did not start");
+    let mut expected = vec![
+        first,
+        Prepared {
+            state: states[0],
+            dispatch: PreparedGrid::Threadgroups(4, 2, 1),
+            threads: (8, 8, 1),
+            lengths: vec![],
+        },
+    ];
+    expected.sort();
+    assert!(
+        eventually(|| made(&platform).len() >= expected.len()),
+        "the new key was not made ahead: {:?}",
+        made(&platform)
+    );
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        made(&platform),
+        expected,
+        "a key handed before was made again"
+    );
+    gate.open();
+    assert_eq!(completed(&platform, &mut ring, 101), RGFX_CB_OK);
 }
 
 /// A command buffer hands its first [`MOST`] new shapes at the most; a later buffer hands those
