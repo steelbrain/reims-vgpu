@@ -844,7 +844,7 @@ struct DealStats {
 /// and its whole op stream, `op_bytes` the stream's length (`RgfxEncoder::finish`), so a message
 /// that disagrees is not one the guest made: carrying out the ops a shorter `op_bytes` covers
 /// would drop the rest without a word and answer the buffer completed.
-fn ops_of<'m>(message: &'m [u8], m: &RgfxCommandBuffer) -> Option<&'m [u8]> {
+pub(super) fn ops_of<'m>(message: &'m [u8], m: &RgfxCommandBuffer) -> Option<&'m [u8]> {
     let ops = message.get(RGFX_COMMAND_BUFFER_OPS_OFFSET as usize..)?;
     (u64::try_from(ops.len()).ok()? == m.op_bytes).then_some(ops)
 }
@@ -907,6 +907,8 @@ pub(crate) struct Begun<P: Platform> {
     /// The blocks of its decode's output, where it is a decode alone that may post its completion
     /// at its decode ([`ahead_at_decode`]).
     ahead: Option<Vec<u64>>,
+    /// It holds a compute encoder ([`Take::computes`]).
+    computes: bool,
 }
 
 /// A command buffer's turn of its completion post, taken by the first of its completion handler
@@ -980,6 +982,11 @@ impl<P: Platform> Begun<P> {
     /// It holds a video encoder, so it is walked in its turn.
     pub(crate) fn ordered(&self) -> bool {
         self.ordered
+    }
+
+    /// It holds a compute encoder, whose dispatches its pre-pass reads ([`super::prepass`]).
+    pub(crate) fn computes(&self) -> bool {
+        self.computes
     }
 
     /// Its `CB_SUBMITTED`, where it gets it at its take: it asks for one, waits for no event and
@@ -1201,6 +1208,9 @@ struct Take {
     video: bool,
     /// The stream holds a render, compute or blit encoder, or an op of one.
     work: bool,
+    /// The stream holds a compute encoder, whose dispatches its pre-pass reads
+    /// ([`super::prepass`]).
+    computes: bool,
     /// The stream holds a record of command predication (an `ENCODE_START_*` op), the only ones
     /// the walk sends: where it holds none, its command buffer is told so before any encoder
     /// (`CommandBuffer::holds_no_predication`), and keeps nothing for one.
@@ -1267,9 +1277,11 @@ fn take(mut ops: &[u8]) -> Take {
                     .collect();
             }
             RGFX_OP_ENCODER_BEGIN_VIDEO => out.video = true,
-            RGFX_OP_ENCODER_BEGIN_RENDER
-            | RGFX_OP_ENCODER_BEGIN_COMPUTE
-            | RGFX_OP_ENCODER_BEGIN_BLIT => out.work = true,
+            RGFX_OP_ENCODER_BEGIN_COMPUTE => {
+                out.work = true;
+                out.computes = true;
+            }
+            RGFX_OP_ENCODER_BEGIN_RENDER | RGFX_OP_ENCODER_BEGIN_BLIT => out.work = true,
             RGFX_OP_COMPUTE_ENCODE_START_IF
             | RGFX_OP_COMPUTE_ENCODE_START_WHILE
             | RGFX_OP_COMPUTE_ENCODE_START_ELSE
@@ -1303,7 +1315,7 @@ fn names_order(ops: &[u8]) -> bool {
 
 /// Each op of the op stream `ops`, in stream order: its tag and its body, read in place. It stops
 /// at an op it cannot step past, as the walk does.
-fn op_bodies(mut ops: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
+pub(super) fn op_bodies(mut ops: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
     std::iter::from_fn(move || {
         let h = read::<RgfxOpHeader>(ops)?;
         let len = h.len as usize;
@@ -2037,6 +2049,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             ordered: take.video,
             completions: Arc::clone(&counts.completions),
             ahead,
+            computes: take.computes,
         };
         // A thread of its process that waits for it to be scheduled may ask for its record from
         // now, where it would have got it here had it asked for its `CB_SUBMITTED`.

@@ -206,6 +206,7 @@ mod lane;
 mod library;
 mod managed;
 mod pipeline_key;
+pub(crate) mod prepass;
 mod rate_map;
 mod refused;
 mod render;

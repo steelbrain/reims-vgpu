@@ -152,10 +152,15 @@ pub fn out_of_host_memory_count() -> u64 {
 /// `reims-vgpu`'s, as its reims-graphics device tells it of its completion rings
 /// (`control-ring-full`, `control-ring-post-waited`, `vblank-dropped`, `queue-ring-full`,
 /// `queue-ring-post-waited`), as its decoder keeps a buffer dealt to two threads whole
-/// (`two-ranges-kept-whole`), as it makes a no-copy buffer over pages their process maps
-/// read-only (`read-only-pages-buffers`, and their bytes' KiB, `read-only-pages-kib`), and as it
-/// makes a no-copy buffer (`no-copy-buffers`) and the guest notes that one's identity escaped, by
-/// the act that noted it (`buffer-escaped-gpu-address`, `-argument-encoder`, `-resource-id`,
+/// (`two-ranges-kept-whole`), as its command buffers' dispatch pre-pass hands their dispatches'
+/// shapes to its compile threads (`dispatch-prepass-handed`), leaves those past a buffer's most to
+/// its walk (`dispatch-prepass-past-most`), drops those no thread took by the walk's end
+/// (`dispatch-prepass-dropped`) and the walk's end waits for those being made
+/// (`dispatch-prepass-waited`, its nanoseconds waited, `dispatch-prepass-wait-ns`, and the longest
+/// wait, `dispatch-prepass-wait-max-ns`), as it makes a no-copy buffer over pages their process
+/// maps read-only (`read-only-pages-buffers`, and their bytes' KiB, `read-only-pages-kib`), and as
+/// it makes a no-copy buffer (`no-copy-buffers`) and the guest notes that one's identity escaped,
+/// by the act that noted it (`buffer-escaped-gpu-address`, `-argument-encoder`, `-resource-id`,
 /// `-residency-set`), one over a copy of its pages counted too (`buffer-escaped-read-only-pages`),
 /// with each command buffer begun of a process that holds such a copy (`escaped-copy-commits`),
 /// and as its VA-API video on the rt platform on Windows lands a picture by the CPU's copy, the

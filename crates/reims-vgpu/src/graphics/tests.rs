@@ -18,6 +18,7 @@ use super::*;
 
 mod displays;
 mod full_ring;
+mod prepass;
 
 /// A graphics device on the testkit's platform, with no window, raising through `raised`.
 fn headless(raised: &Arc<AtomicU32>) -> GraphicsDevice<FakePlatform> {

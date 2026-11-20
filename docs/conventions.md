@@ -54,7 +54,12 @@ repeats the ones code cites.
     sharing, making ahead), never by making core or the device's lanes
     non-blocking, or by deferring or reordering their waits, since the guest
     sees where they wait. Compiles run concurrently only inside the synchronous wait
-    that needs them, which joins every one before it returns: nothing
+    that needs them, which joins every one before it returns, with one
+    exception: a command buffer's dispatch pre-pass makes its dispatches'
+    pipelines on the compile threads while its walk goes on, and the walk's
+    end drops those no thread took and joins those being made, before the
+    message lets go of anything
+    (`crates/reims-vgpu/src/graphics/decode/prepass.rs`). Otherwise nothing
     compiles in the background, and nothing is deferred or released early.
     Nothing the guest sees (IDs, addresses, stamps, reflection order, shared
     state) is decided inside a concurrent section; it is assigned in order,

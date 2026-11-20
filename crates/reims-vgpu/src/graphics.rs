@@ -134,6 +134,7 @@ use crate::graphics::answers::PipelineAnswers;
 use crate::graphics::color::{ColorChange, ColorStaging, DisplayColor};
 use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
+use crate::graphics::decode::prepass::{Prepass, WalkEnd};
 use crate::graphics::decode::shares::ListenSink;
 use crate::graphics::decode::worker::{Job, Settle, Unsettled, Worker};
 use crate::graphics::decode::{
@@ -1404,6 +1405,14 @@ struct GraphicsControl<P: ApiPlatform> {
 /// its walk.
 const INLINE_WALK_MAX: usize = 2048;
 
+/// A `COMMAND_BUFFER` message as its queue's service thread began it
+/// ([`GraphicsDecoder::begin_taken`]), with its pre-pass where it hands one
+/// ([`GraphicsControl::hand_prepass`]): what [`GraphicsControl::carry_out`] walks and closes.
+type BegunBuffer<P> = (
+    RaiseResult<Result<Begun<P>, DecodeError>>,
+    Option<Prepass<P>>,
+);
+
 /// The display's hold of the region block a surface's texture lies over, as a compositor holds
 /// the IOSurface it shows: made as the present is taken ([`Presented::hold`]), and held by the
 /// present until it is shown, by the display while it shows the texture, and by each window draw
@@ -2576,13 +2585,35 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             let to_lane = self.goes_to_lane(&message);
             let queue = poster.queue_obj_id();
             let begun = refusing(|| decoder.begin_taken(&self.device, &message, queue, to_lane));
+            let prepass = match &begun {
+                Ok(Ok(b)) if b.computes() => self.hand_prepass(&decoder, &message),
+                _ => None,
+            };
+            let begun = (begun, prepass);
             self.carry_out(decoder, begun, carried, poster.clone(), message, claim);
         });
     }
 
-    /// The rest of the `COMMAND_BUFFER` `message`'s work once it is begun (`begun`, on `decoder`),
-    /// on its queue's lane where it took a turn there ([`GraphicsDecoder::lane`]), else here: it
-    /// is walked and committed in its turn ([`GraphicsDecoder::finish_command_buffer`]), stood in
+    /// The pre-pass of the `COMMAND_BUFFER` `message` `decoder` began
+    /// ([`GraphicsDecoder::prepass`]): each shape it hands over is one compile of the pool's,
+    /// which its walk does not wait for. A shape the pool takes no compile of, its threads gone,
+    /// is left to the walk.
+    fn hand_prepass(&self, decoder: &GraphicsDecoder<P>, message: &[u8]) -> Option<Prepass<P>> {
+        let prepass = decoder.prepass(message)?;
+        let of = CompileOf::new(CompileKind::Prepass, prepass.cb_obj_id());
+        for _ in 0..prepass.handed() {
+            if self.pool.submit(of, prepass.job()).is_err() {
+                break;
+            }
+        }
+        Some(prepass)
+    }
+
+    /// The rest of the `COMMAND_BUFFER` `message`'s work once it is begun (`begun`, on `decoder`,
+    /// with its pre-pass, where it hands one), on its queue's lane where it took a turn there
+    /// ([`GraphicsDecoder::lane`]), else here: it
+    /// is walked and committed in its turn ([`GraphicsDecoder::finish_command_buffer`]), its
+    /// pre-pass then closed before the decoder lets go of anything ([`Prepass::close`]), stood in
     /// for where it was not carried out, and reported through `poster` as
     /// [`Self::handle_stage3`] reports a message, its failure posted in its turn too. The decoder
     /// lets go of what the message holds, and `carried` of the reset gate, before the report,
@@ -2616,7 +2647,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     fn carry_out(
         self: &Arc<Self>,
         decoder: GraphicsDecoder<P>,
-        begun: RaiseResult<Result<Begun<P>, DecodeError>>,
+        (begun, prepass): BegunBuffer<P>,
         carried: ArcRwLockReadGuard<RawRwLock, ()>,
         poster: CompletionPoster,
         message: Vec<u8>,
@@ -2644,6 +2675,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     Ok(Err(e)) => Ok(Err(e)),
                     Err(raise) => Err(raise),
                 };
+                // Nothing of its pre-pass outlives the views of the table its message holds.
+                if let Some(prepass) = prepass {
+                    prepass.close(WalkEnd::of(&outcome), || control.pool.now());
+                }
                 // A buffer of a context closed before it came is owed nothing: its queue ended.
                 let stood_in = !matches!(outcome, Ok(Ok(()) | Err(DecodeError::ContextClosed)))
                     && matches!(

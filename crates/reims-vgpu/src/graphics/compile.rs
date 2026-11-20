@@ -20,8 +20,11 @@
 //! owner's waits
 //! behind no other context's. Library makes go before every pipeline compile: a pipeline that
 //! names a library another context is still making waits for it on its thread, and that library
-//! has then always been taken by a thread already. Each compile's wait and run time is logged at
-//! debug (`reims_vgpu::graphics::compile`), and, in the profiling trace
+//! has then always been taken by a thread already. A command buffer's dispatches made ahead of its
+//! walk ([`super::decode::prepass`]) go after both, one make a compile, on every thread of the
+//! pool's but one at once (one at the least), so one thread is left to the creates where the pool
+//! has two or more; they do not count among a context's compiles running. Each compile's wait and
+//! run time is logged at debug (`reims_vgpu::graphics::compile`), and, in the profiling trace
 //! ([`reims_vgpu_vulkan::core::trace`]), its hand-over, start and end as `cmphand`, `cmpstart`
 //! and `cmpend` events, each with the object's id.
 //!
@@ -79,13 +82,17 @@ pub(crate) type CompileJob = Box<dyn FnOnce() + Send>;
 /// The platform's monotonic clock, which times each compile's wait and run.
 pub(crate) type Now = Box<dyn Fn() -> MonoTime + Send + Sync>;
 
-/// What a compile makes: a library, or a pipeline.
+/// What a compile makes: a library, a pipeline, or what a command buffer's dispatch makes at its
+/// first use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompileKind {
     /// A `LIBRARY_CREATE` or a library's last `LIBRARY_FROM_REGION` chunk.
     Library,
     /// A `RENDER_PIPELINE_CREATE` or a `COMPUTE_PIPELINE_CREATE`.
     Pipeline,
+    /// One dispatch of a `COMMAND_BUFFER`'s pre-pass, made ahead of its walk
+    /// ([`super::decode::prepass`]): its object is the command buffer.
+    Prepass,
 }
 
 /// A compile's object: its kind, its id, and the context that created it.
@@ -123,6 +130,7 @@ struct Queued {
 struct ContextQueue {
     libraries: VecDeque<Queued>,
     pipelines: VecDeque<Queued>,
+    prepasses: VecDeque<Queued>,
 }
 
 impl ContextQueue {
@@ -130,6 +138,7 @@ impl ContextQueue {
         match kind {
             CompileKind::Library => &mut self.libraries,
             CompileKind::Pipeline => &mut self.pipelines,
+            CompileKind::Prepass => &mut self.prepasses,
         }
     }
 
@@ -137,11 +146,16 @@ impl ContextQueue {
         match kind {
             CompileKind::Library => !self.libraries.is_empty(),
             CompileKind::Pipeline => !self.pipelines.is_empty(),
+            CompileKind::Prepass => !self.prepasses.is_empty(),
         }
     }
 
+    fn len(&self) -> usize {
+        self.libraries.len() + self.pipelines.len() + self.prepasses.len()
+    }
+
     fn is_empty(&self) -> bool {
-        self.libraries.is_empty() && self.pipelines.is_empty()
+        self.len() == 0
     }
 }
 
@@ -153,8 +167,12 @@ struct PoolState {
     /// The contexts with compiles waiting, in the order they take turns: a context goes to the
     /// back as a compile of it is taken and as one ends.
     turns: VecDeque<u32>,
-    /// The compiles each context has running.
+    /// The compiles each context has running, its pre-passes' not among them.
     running: HashMap<u32, usize>,
+    /// The pre-passes' makes running, and the most that run at once: one thread fewer than the
+    /// pool's, one at the least.
+    prepasses_running: usize,
+    prepasses_most: usize,
     /// The context that owns the scanout, whose compiles go first.
     favoured: Option<u32>,
     /// The pool is gone (or stopped): the threads end once nothing waits.
@@ -169,18 +187,20 @@ struct PoolState {
 impl PoolState {
     /// The compiles waiting.
     fn waiting(&self) -> usize {
-        self.queues
-            .values()
-            .map(|q| q.libraries.len() + q.pipelines.len())
-            .sum()
+        self.queues.values().map(ContextQueue::len).sum()
     }
 
     /// Takes the next compile (the module doc, "Turns"), and counts it running.
     fn take(&mut self) -> Option<Queued> {
-        let kind = if self.queues.values().any(|q| q.holds(CompileKind::Library)) {
+        let waits = |kind| self.queues.values().any(|q| q.holds(kind));
+        let kind = if waits(CompileKind::Library) {
             CompileKind::Library
-        } else {
+        } else if waits(CompileKind::Pipeline) {
             CompileKind::Pipeline
+        } else if self.prepasses_running < self.prepasses_most {
+            CompileKind::Prepass
+        } else {
+            return None;
         };
         let holds = |c: &u32| self.queues.get(c).is_some_and(|q| q.holds(kind));
         let context = self.favoured.filter(holds).or_else(|| {
@@ -199,16 +219,21 @@ impl PoolState {
         } else {
             self.turns.push_back(context);
         }
-        *self.running.entry(context).or_default() += 1;
+        match kind {
+            CompileKind::Prepass => self.prepasses_running += 1,
+            _ => *self.running.entry(context).or_default() += 1,
+        }
         #[cfg(test)]
         self.taken.push(context);
         Some(queued)
     }
 
-    /// A compile of `context` ended: the context goes to the back of the turns, behind those
-    /// that waited while it ran.
-    fn ended(&mut self, context: u32) {
-        if let Some(n) = self.running.get_mut(&context) {
+    /// A compile of `kind` of `context` ended: the context goes to the back of the turns, behind
+    /// those that waited while it ran.
+    fn ended(&mut self, context: u32, kind: CompileKind) {
+        if kind == CompileKind::Prepass {
+            self.prepasses_running = self.prepasses_running.saturating_sub(1);
+        } else if let Some(n) = self.running.get_mut(&context) {
             *n -= 1;
             if *n == 0 {
                 self.running.remove(&context);
@@ -267,7 +292,7 @@ impl CompilePool {
         });
         #[cfg(test)]
         let gate = Arc::new(Gate::default());
-        let mut started = 0;
+        let mut started: usize = 0;
         for i in 0..threads {
             let shared = Arc::clone(&shared);
             #[cfg(test)]
@@ -290,13 +315,16 @@ impl CompilePool {
                 started += 1;
             }
         }
+        let mut state = shared.state.lock();
+        state.prepasses_most = started.saturating_sub(1).max(1);
         if started == 0 {
             log::warn!(
                 target: "reims_vgpu::graphics",
                 "no compile thread could be started: pipelines compile where they are prepared"
             );
-            shared.state.lock().closed = true;
+            state.closed = true;
         }
+        drop(state);
         CompilePool {
             shared,
             threads: started,
@@ -382,6 +410,13 @@ impl CompilePool {
         self.gate.set(true);
     }
 
+    /// What opens the gate as [`Self::release`] does, once the pool is gone too (tests only).
+    #[cfg(test)]
+    pub(crate) fn opener(&self) -> impl Fn() + Send + Sync + 'static {
+        let gate = Arc::clone(&self.gate);
+        move || gate.set(true)
+    }
+
     /// Lets the threads go: every compile from then on runs where it is handed over, as with a
     /// pool no thread started for (tests only).
     #[cfg(test)]
@@ -439,12 +474,17 @@ fn run(shared: &Shared, queued: Queued) {
         match of.kind {
             CompileKind::Library => "library",
             CompileKind::Pipeline => "pipeline",
+            CompileKind::Prepass => "command buffer's dispatch made ahead",
         },
         of.obj_id,
         ms(started.saturating_duration_since(handed)),
         ms(ended.saturating_duration_since(started)),
     );
-    shared.state.lock().ended(of.context());
+    shared.state.lock().ended(of.context(), of.kind);
+    // A thread that found the pre-passes' makes at their most may take the next now.
+    if of.kind == CompileKind::Prepass {
+        shared.waiting.notify_one();
+    }
 }
 
 /// A gate the tests shut to hold every compile.

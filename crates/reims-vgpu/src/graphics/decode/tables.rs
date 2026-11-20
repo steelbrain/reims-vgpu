@@ -187,6 +187,9 @@ pub(crate) struct Entry<P: Platform> {
     /// A heap over a copy of its pages on its process's escaped copies, which it leaves at its drop
     /// ([`super::escape::Listed`]); `None` for any other object.
     pub(crate) listed: Option<super::escape::Listed>,
+    /// A compute state's dispatch shapes its command buffers' pre-passes handed over, made at the
+    /// first ([`super::prepass::Handed`]); empty for any other object.
+    pub(crate) handed: super::prepass::HandedCell,
     /// The table's clock at its make.
     made: u64,
     /// The first clock of a view that names it: its make's, or the making message's view's where
@@ -216,6 +219,7 @@ impl<P: Platform> Entry<P> {
             over_cache: false,
             escape: None,
             listed: None,
+            handed: super::prepass::HandedCell::new(),
             made: 0,
             seen: 0,
             live: None,
