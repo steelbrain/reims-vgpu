@@ -5079,10 +5079,13 @@ writes dropped, a file mapped under it unchanged (the AMD 5300M and the Intel
 UHD 630, `oracle_bundle` `nocopy.ro`; the M3, accuracy-ledger.md
 `read-only-pages-written`, whose row the host's drop follows). A texture over
 such a buffer takes the same answers: a draw's, a kernel's or a blit's write of
-it completes, dropped, and a render pass that stores into it or resolves into
-it fails its command buffer with a page fault, as the M3's does, where the x86
-Macs, on which bit 24 does nothing, complete it and write the pages
-(dgpu-oracle.md Q38). Over any other
+it completes, dropped, and so does a render pass that stores into it or
+resolves into it, its stores and resolves dropped with the buffer's other
+writes, as the 5300M and the UHD 630 complete one over pages the process maps
+read-only, the pages unchanged; the M3 fails its command buffer with a page
+fault (`PageFault`). The host counts such a pass, `rt-copied-store-outs`, the
+process's first with a line (accuracy-ledger.md `read-only-pages-written`,
+dgpu-oracle.md Q38). Over any other
 memory (read-only Managed memory, whose copies the host would write back to
 its pages; read-only memory where the kext makes no block of it; a Managed
 buffer's where the device makes no Managed buffer over a Shared one; or memory

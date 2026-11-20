@@ -2220,19 +2220,20 @@ unchanged. The M3 Max keeps the GPU's writes out under bit 24 and over read-only
 | the CPU's `replaceRegion:` of a texture over pages the process maps read-only | ends the process (`SIGBUS`), with the bit or without | the same | 3 |
 | a late colour resolve texture where the pass named none, under a late resolving action | completes, nothing resolved, with the bit or without | the 5300M ends the process at `endEncoding` (`SIGSEGV`); the 630 fails the command buffer (code 9), with the bit or without | 2 |
 
-What our stack does: on Linux the runtime makes read-only memory over a copy of its pages whose
-GPU writes it drops (accuracy-ledger.md, `read-only-pages-written`). A store-out faults the
-command buffer as the M3 Max's does *(class 2: the runtime's own fault, which costs nothing)*;
-every other GPU write completes with its write dropped *(class 2 or 3: the draw's `write()`,
-which the M3 Max faults, takes the x86 Macs' completion, the cheaper)*; a CPU write writes the
-pages where the process can, and ends the process over pages it maps read-only *(class 3)*. A
-depth attachment's `StoreAndMultisampleResolve` into such memory completes, the attachment
-stored and the resolve dropped, the texture unchanged *(class 2: the M3 Max's answer; the x86
-Macs write the texture)*: the runtime (metal2vulkan 5d33e0c74a) drops the resolve, which it
-faulted until then, when this platform ended the process there. Beside a stencil attachment
-that resolves, which no Mac was asked, the runtime still faults it, and the process ends where
-the pass is made, or at the late store action or resolve texture. On macOS MoltenVK hands Metal
-the pages, or a read-only view of them, and Metal answers.
+What our stack does, on every host: the rt platform makes read-only memory (a no-copy buffer or
+heap of bit 24, and pages the process maps read-only) over a copy of its pages whose GPU writes
+it drops, the pages written whole into the copy at each commit that uses it, so the CPU and the
+command buffers committed after a GPU write read the pages' bytes (accuracy-ledger.md,
+`read-only-pages-written`; `crates/reims-vgpu-vulkan/src/rt_platform/copied.rs`, "Writes
+dropped"). Every GPU write into it completes, dropped: a kernel's and a blit's, as the M3 Max's
+*(class 2)*; a draw's `write()`, which the M3 Max faults, and a render pass's store-out, its
+stores and resolves there, which the M3 Max faults with `PageFault`, as the 5300M and the UHD
+630 complete them over pages the process maps read-only, the pages unchanged *(class 2: the x86
+Macs' completion, the cheaper)*. A pass with an attachment over such a copy is counted at the
+pass, `rt-copied-store-outs`, the process's first with a line (`copied.rs`, `store_outs`). Within
+a command buffer, and between command buffers in flight at once, a read after such a write sees
+it until the next commit that uses the copy. A CPU write writes the pages where the process can,
+and ends the process over pages it maps read-only *(class 3)*.
 
 ## Q39: a command buffer failed two ways: a read-only store-out beside protection options
 
@@ -2261,20 +2262,21 @@ every Mac: what one does beside another failure is not measured.
 The next command buffer on the same queue, and one on a new queue, ran after every shape on all
 three Macs.
 
-What our stack does (`crate::gpu::command`): it keeps protection options itself, and fails a
-command buffer of encoders made under them as the M3 Max does: code 16 or 1, the encoders from
-the first made under them running nothing, the signals encoded before it firing and none after
-it *(class 2: the M3 Max's and the 5300M's answer)*. The runtime's injected failure fires every
-signal or none, so the platform sends no signal encoded after such an encoder. Options from 0x10
-set after every encoder fail it with code 1, every encoder running and every signal firing (the
-M3 Max's). A store-out's fault beside such a failure is answered by that failure, as on all
-three Macs *(class 2)*, the encoders from the faulting pass on running nothing, as the M3 Max
-runs nothing there in 7 runs of 18; until 11-14 the platform ended the process at such a commit.
-A type-9 draw's failure beside another way still ends the process there.
+What our stack does: the rt platform builds no protection options. A command buffer with options
+other than 0 runs as one without them, every encoder running and every signal firing, counted
+`rt-unbuilt-protection` (accuracy-ledger.md;
+`crates/reims-vgpu-vulkan/src/rt_platform/command.rs`, "Protection options"): where encoders
+are made under options 2 or 0x10 it completes, which no Mac answers *(class 4)*; options set
+after every encoder complete it, as the x86 Macs answer under both and the M3 Max under 2
+*(class 2)*. A store-out into
+read-only memory completes, its store dropped (Q38), alone and beside options, where the M3 Max
+faults it alone *(class 2: the x86 Macs' completion)*. A type-9 draw, of a primitive type Metal
+documents none of, is refused, counted and dropped, beside another way or not
+(`crates/reims-vgpu-vulkan/src/rt_platform/render.rs`, `primitive`).
 
 Outside the envelope for x86 guests *(class 4, not yet answered)*: the M3 Max's code 1 under
 options from 0x10, and its failure where such options come after every encoder; both x86 Macs
-answer code 16 and complete the latter. The platform answers the M3 Max's for every guest.
+answer code 16 and complete the latter. The platform fails no command buffer for its options.
 
 ## Q40: what Metal stores through the 4:4:4 `_sRGB` two-plane formats
 
