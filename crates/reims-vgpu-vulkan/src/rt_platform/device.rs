@@ -35,6 +35,7 @@
 //! [`OVER_COPIES_CODE`] and [`OVER_COPY_BYTES_CODE`], and of those over an imported block,
 //! [`OVER_COPIES_IMPORTED_CODE`] and [`OVER_COPY_BYTES_IMPORTED_CODE`].
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 
 use ash::vk;
@@ -190,6 +191,9 @@ pub struct RtDevice {
     present_fences: bool,
     /// Where its GPU lies on the host.
     host_gpu: HostGpu,
+    /// Whether a command buffer in flight at its loss was answered as the hang (`super::command`'s
+    /// docs, "What a completed handler learns").
+    hung: Arc<AtomicBool>,
 }
 
 /// Where a device's GPU lies on the host, as Vulkan answers it, which the host's video opens its
@@ -232,6 +236,12 @@ impl RtDevice {
     /// The sampler indices its pipeline states' samplers hold.
     pub fn numbering(&self) -> &Numbering {
         &self.numbering
+    }
+
+    /// Whether a command buffer in flight at its loss was answered as the hang (`super::command`'s
+    /// docs, "What a completed handler learns"), which each of its command buffers keeps.
+    pub fn hung(&self) -> &Arc<AtomicBool> {
+        &self.hung
     }
 
     /// The blocks it knows by address (`super::buffer`'s docs, "A pinned address"): the graphics
@@ -404,6 +414,7 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         drm,
         present_fences,
         host_gpu,
+        hung: Arc::default(),
     }))
 }
 

@@ -14,8 +14,18 @@
 //! - **What a completed handler learns**: rt's status and error then, and its GPU times, in
 //!   nanoseconds of rt's host clock (`metal2vulkan_rt::host_time`); none where either is 0,
 //!   as for a command buffer that ended with an error. rt's errors are Metal's
-//!   `MTLCommandBufferErrorDomain` codes: a lost device `DeviceRemoved` (11), and a command
-//!   buffer rt ended without running (its device quiesced, its queue abandoned) `Internal` (1).
+//!   `MTLCommandBufferErrorDomain` codes, as Metal answers its GPU's recovery (measured on the M3
+//!   Max, macOS 27.0.1, the bundle's `rgfxCommandBufferError`): of the work a lost device ends,
+//!   the hang `Timeout` (2) and its victims `Internal` (1). Metal's hang is the oldest command
+//!   buffer not complete: here the earliest submitted of those rt ends as in flight
+//!   (`DeviceLost { in_flight: true }`), which is the first of them it ends, as its completion
+//!   thread ends the work in flight in its order of submission. It is answered as the hang, once
+//!   for the device ([`RtDevice::hung`]); every other command buffer rt ends at the loss or after
+//!   (in flight after it, held, not yet submitted or committed later) is a victim, so where none
+//!   was in flight every one is. A command buffer rt ended without running (its device quiesced,
+//!   its queue abandoned) is `Internal` (1) too. Each command buffer's answer is made as it
+//!   completes, by a completed handler its commit adds ahead of core's ([`Failure`]), and kept:
+//!   its handlers and `error` read the same one.
 //! - **Encoders**: blit encoders ([`super::blit`]), compute encoders ([`super::compute`]), of
 //!   the serial dispatch type or the descriptor's (another value is Metal's refusal, nil), and
 //!   render encoders ([`super::render`]) of the pass the descriptor keeps
@@ -48,8 +58,8 @@
 //! wait), counted under the refusal's kind ([`rt_refused`]); never a death.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use metal2vulkan_rt as rt;
 
@@ -82,8 +92,8 @@ const ERROR_DOMAIN: &str = "MTLCommandBufferErrorDomain";
 /// `MTLCommandBufferErrorInternal`.
 const ERROR_INTERNAL: i64 = 1;
 
-/// `MTLCommandBufferErrorDeviceRemoved`.
-const ERROR_DEVICE_REMOVED: i64 = 11;
+/// `MTLCommandBufferErrorTimeout`.
+const ERROR_TIMEOUT: i64 = 2;
 
 /// A handler as rt runs it.
 type Handler = Box<dyn FnOnce(&rt::CommandBuffer) + Send>;
@@ -102,6 +112,26 @@ pub struct RtCommandBuffer {
     open: Arc<AtomicUsize>,
     /// What it keeps until it completes.
     kept: Kept,
+    /// Its error as Metal's, made as it completes ([`Failure`]).
+    failure: Arc<Failure>,
+}
+
+/// A command buffer's error as Metal's (the module's docs, "What a completed handler learns"):
+/// made at its first read, which a completed handler its commit adds ahead of core's makes, and
+/// kept.
+struct Failure {
+    /// Its error as Metal's, once read.
+    error: OnceLock<NsErrorText>,
+    /// Whether its device's loss has its hang ([`RtDevice::hung`]).
+    hung: Arc<AtomicBool>,
+}
+
+impl Failure {
+    /// The answer of rt's `error`, made at the first that is not `None` and kept.
+    fn read(&self, error: Option<rt::CommandBufferError>) -> Option<NsErrorText> {
+        let error = error?;
+        Some(self.error.get_or_init(|| ns_error(error, &self.hung)).clone())
+    }
 }
 
 /// A command buffer's handlers until its commit hands them to rt, each kind in the order added,
@@ -133,6 +163,10 @@ impl RtCommandBuffer {
         queue: rt::CommandQueue,
         device: RtObj<RtDevice>,
     ) -> RtCommandBuffer {
+        let failure = Arc::new(Failure {
+            error: OnceLock::new(),
+            hung: Arc::clone(device.hung()),
+        });
         RtCommandBuffer {
             rt: made,
             queue,
@@ -140,6 +174,7 @@ impl RtCommandBuffer {
             held: Mutex::new(Held::default()),
             open: Arc::default(),
             kept: Kept::default(),
+            failure,
         }
     }
 
@@ -327,16 +362,17 @@ fn scheduled(block: ScheduledHandler) -> Handler {
 }
 
 /// rt's handler that runs core's completed or completion-seen handler `block` with what the
-/// command buffer answers then ([`completed_info`]). Added inside a refusal scope (the graphics
-/// lane's), the read and `block` run in one on rt's thread too ([`run_completed`]).
-fn completed(block: CompletedHandler) -> Handler {
+/// command buffer answers then ([`completed_info`]), its error `failure`'s. Added inside a refusal
+/// scope (the graphics lane's), the read and `block` run in one on rt's thread too
+/// ([`run_completed`]).
+fn completed(block: CompletedHandler, failure: Arc<Failure>) -> Handler {
     #[cfg(test)]
     let slot = crate::core::testkit::capture::current_slot();
     let carried = refusals::carry();
     Box::new(move |made: &rt::CommandBuffer| {
         // A callout on rt's thread: marked ours, so a panic here aborts.
         let _env = BlockEnv::foreign();
-        let run = || run_completed(carried, || completed_info(made), block);
+        let run = || run_completed(carried, || completed_info(made, &failure), block);
         #[cfg(test)]
         crate::core::testkit::capture::with_slot(slot, run);
         #[cfg(not(test))]
@@ -344,12 +380,12 @@ fn completed(block: CompletedHandler) -> Handler {
     })
 }
 
-/// What a completed handler learns of `made` (the module's docs).
-fn completed_info(made: &rt::CommandBuffer) -> CompletedInfo {
+/// What a completed handler learns of `made`, its error `failure`'s (the module's docs).
+fn completed_info(made: &rt::CommandBuffer, failure: &Failure) -> CompletedInfo {
     let (start, end) = (made.gpu_start_time(), made.gpu_end_time());
     CompletedInfo {
         status: status(made.status()),
-        error: made.error().map(ns_error),
+        error: failure.read(made.error()),
         gpu_times_ns: (start != 0 && end >= start).then_some((start, end)),
     }
 }
@@ -366,10 +402,15 @@ fn status(status: rt::CommandBufferStatus) -> CommandBufferStatus {
     }
 }
 
-/// rt's error as Metal's `NSError` (the module's docs).
-fn ns_error(error: rt::CommandBufferError) -> NsErrorText {
+/// rt's error as Metal's `NSError` (the module's docs): `Timeout` for the first command buffer
+/// lost in flight on the device whose loss `hung` notes, `Internal` for any other.
+fn ns_error(error: rt::CommandBufferError, hung: &AtomicBool) -> NsErrorText {
     let code = match error {
-        rt::CommandBufferError::DeviceLost { .. } => ERROR_DEVICE_REMOVED,
+        rt::CommandBufferError::DeviceLost { in_flight: true }
+            if !hung.swap(true, Ordering::SeqCst) =>
+        {
+            ERROR_TIMEOUT
+        }
         _ => ERROR_INTERNAL,
     };
     NsErrorText {
@@ -398,7 +439,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     /// Held until the commit, behind the completion-seen handlers (the module's docs).
     fn add_completed_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
         let _ = on;
-        let handler = completed(block);
+        let handler = completed(block, Arc::clone(&self.failure));
         self.hold("addCompletedHandler:", |h| &mut h.completed, handler);
         Ok(())
     }
@@ -423,7 +464,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     /// Run first of the completed handlers, on rt's completion thread.
     fn add_completion_seen_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
         let _ = on;
-        let handler = completed(block);
+        let handler = completed(block, Arc::clone(&self.failure));
         self.hold("addCompletionSeenHandler", |h| &mut h.seen, handler);
         Ok(())
     }
@@ -481,6 +522,13 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
             };
             submission.extend(scheduled);
             seen.extend(completed);
+            // Its error is made before core's handlers run, as rt completes it, so a lost
+            // device's hang is the first it ends in flight (the module's docs).
+            let failure = Arc::clone(&self.failure);
+            seen.insert(
+                0,
+                Box::new(move |made: &rt::CommandBuffer| drop(failure.read(made.error()))),
+            );
             if let Some(merge) = super::copied::merging() {
                 seen.insert(0, Box::new(merge));
             }
@@ -498,9 +546,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 if !submission.is_empty() {
                     self.rt.add_scheduled_handler(run(submission))?;
                 }
-                if !seen.is_empty() {
-                    self.rt.add_completed_handler(run(seen))?;
-                }
+                self.rt.add_completed_handler(run(seen))?;
                 super::copied::copy_in();
                 self.kept.takes().take(&self.device);
                 self.rt.commit()
@@ -604,9 +650,9 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         recorded_answer
     }
 
-    /// rt's error as Metal's (the module's docs).
+    /// rt's error as Metal's, the one its completed handlers learn (the module's docs).
     fn error(&self) -> Option<NsErrorText> {
-        self.rt.error().map(ns_error)
+        self.failure.read(self.rt.error())
     }
 
     /// rt's render encoder of the pass the descriptor keeps: nil where Metal refuses the pass (an
@@ -821,14 +867,39 @@ mod tests {
             .map_or(0, |(_, n)| n)
     }
 
-    /// rt's errors are Metal's, in Metal's command buffer domain: a lost device `DeviceRemoved`
-    /// (11), a command buffer ended unrun `Internal` (1); rt's statuses are Metal's values.
+    /// rt's errors are Metal's, in Metal's command buffer domain, as Metal answers its GPU's
+    /// recovery: of a lost device's work, the first command buffer lost in flight the hang,
+    /// `Timeout` (2), once for the device, and every other its victim, `Internal` (1), as is a
+    /// command buffer ended unrun; each command buffer keeps the answer of its first read. rt's
+    /// statuses are Metal's values.
     #[test]
     fn rt_s_errors_and_statuses_are_metal_s() {
-        let lost = ns_error(rt::CommandBufferError::DeviceLost { in_flight: true });
-        assert_eq!((lost.domain.as_str(), lost.code), (ERROR_DOMAIN, 11));
-        let unrun = ns_error(rt::CommandBufferError::NotRun);
-        assert_eq!((unrun.domain.as_str(), unrun.code), (ERROR_DOMAIN, 1));
+        use rt::CommandBufferError::{DeviceLost, NotRun};
+        let codes = |errors: &[rt::CommandBufferError]| {
+            let hung = AtomicBool::new(false);
+            (errors.iter())
+                .map(|&e| ns_error(e, &hung))
+                .inspect(|e| assert_eq!(e.domain, ERROR_DOMAIN))
+                .map(|e| e.code)
+                .collect::<Vec<_>>()
+        };
+        let in_flight = DeviceLost { in_flight: true };
+        let held = DeviceLost { in_flight: false };
+        assert_eq!(codes(&[in_flight, in_flight, held]), [2, 1, 1]);
+        assert_eq!(codes(&[held, NotRun, in_flight, in_flight]), [1, 1, 2, 1]);
+        assert_eq!(codes(&[NotRun, held]), [1, 1]);
+        // A command buffer keeps its answer; the device's next one lost in flight is a victim.
+        let hung = Arc::new(AtomicBool::new(false));
+        let failure = |hung: &Arc<AtomicBool>| Failure {
+            error: OnceLock::new(),
+            hung: Arc::clone(hung),
+        };
+        let (first, second) = (failure(&hung), failure(&hung));
+        assert_eq!(first.read(None), None);
+        let reads = [first.read(Some(in_flight)), second.read(Some(in_flight))];
+        assert_eq!(reads.map(|e| e.map(|e| e.code)), [Some(2), Some(1)]);
+        assert_eq!(first.read(Some(in_flight)).map(|e| e.code), Some(2));
+        assert_eq!(second.read(Some(in_flight)).map(|e| e.code), Some(1));
         let statuses = [
             rt::CommandBufferStatus::NotEnqueued,
             rt::CommandBufferStatus::Enqueued,
