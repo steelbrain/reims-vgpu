@@ -11848,9 +11848,8 @@ mod tests {
         dec.set_helper_first(true);
         // The helper started first, the two walks then in whatever order they run; then the
         // helper's walk held at its first op until this thread waits for one of its chunks.
-        let decoders = dec.decoders();
         for (seqno, held) in [(361, false), (362, true)] {
-            let (clock, decoders) = (Arc::clone(&p), decoders.clone());
+            let (clock, decoders) = (Arc::clone(&p), dec.decoders());
             let waits = dec.deal_waits();
             dec.set_walk_hook(Some(Arc::new(move |_| {
                 let helper = std::thread::current().name() == Some("reims-vgpu.graphics-helper");
