@@ -854,7 +854,11 @@ mod tests {
                     let _hold = gate.split(1);
                     took.store(true, Ordering::Release);
                 });
-                std::thread::sleep(Duration::from_millis(50));
+                let splitting = || (gate.contexts.lock().get(&1)).map_or(0, |g| g.splitting);
+                assert!(
+                    crate::graphics::tests::eventually(|| splitting() == 1),
+                    "never waited (parts out: {parts_out})"
+                );
                 assert!(
                     !took.load(Ordering::Acquire),
                     "taken early (parts out: {parts_out})"
@@ -879,7 +883,8 @@ mod tests {
                 let _commit = gate.commit(1);
                 went.store(true, Ordering::Release);
             });
-            std::thread::sleep(Duration::from_millis(50));
+            let waits = crate::graphics::tests::eventually(|| gate.waiting(1) == 1);
+            assert!(waits, "never waited for the parts");
             assert!(!went.load(Ordering::Acquire), "committed between the parts");
             drop(hold);
         });
@@ -928,7 +933,8 @@ mod tests {
                 let _commit = gate.commit(1);
                 done.lock().push(5);
             });
-            std::thread::sleep(Duration::from_millis(50));
+            let waits = crate::graphics::tests::eventually(|| gate.waiting(1) == 1);
+            assert!(waits, "the commit never waited for the parts");
             drop(hold);
         });
         assert_eq!(*done.lock(), [1, 4, 2, 3, 5]);
@@ -1132,13 +1138,19 @@ mod tests {
             parts.wait_ahead(young, |_| false),
             "0.2 ms ahead, 15 ms old"
         );
-        let went = AtomicBool::new(false);
+        let (went, looks) = (AtomicBool::new(false), AtomicU64::new(0));
+        // Counts its looks, each before a slice of the wait, and never ends it.
+        let over = |_: u64| {
+            looks.fetch_add(1, Ordering::SeqCst);
+            false
+        };
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                assert!(parts.wait_ahead(|| AT.saturating_add(PACE_AHEAD), |_| false));
+                assert!(parts.wait_ahead(|| AT.saturating_add(PACE_AHEAD), over));
                 went.store(true, Ordering::Release);
             });
-            std::thread::sleep(Duration::from_millis(50));
+            let waits = crate::graphics::tests::eventually(|| looks.load(Ordering::SeqCst) > 0);
+            assert!(waits, "never waited with its oldest 16 ms old");
             assert!(
                 !went.load(Ordering::Acquire),
                 "went on with its oldest 16 ms old"
@@ -1164,13 +1176,19 @@ mod tests {
         let first = parts.part_handler((), Some((ms(1), AT)));
         let _second = parts.part_handler((), Some((ms(1), AT)));
         // 20 ms ahead: waits until the first part is seen complete.
-        let went = AtomicBool::new(false);
+        let (went, looks) = (AtomicBool::new(false), AtomicU64::new(0));
+        // Counts its looks, each before a slice of the wait, and never ends it.
+        let over = |_: u64| {
+            looks.fetch_add(1, Ordering::SeqCst);
+            false
+        };
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                assert!(parts.wait_ahead(|| AT, |_| false));
+                assert!(parts.wait_ahead(|| AT, over));
                 went.store(true, Ordering::Release);
             });
-            std::thread::sleep(Duration::from_millis(50));
+            let waits = crate::graphics::tests::eventually(|| looks.load(Ordering::SeqCst) > 0);
+            assert!(waits, "never waited 20 ms ahead");
             assert!(!went.load(Ordering::Acquire), "went on 20 ms ahead");
             first(CompletedInfo {
                 status: CommandBufferStatus::COMPLETED,
