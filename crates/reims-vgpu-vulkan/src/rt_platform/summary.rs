@@ -3,7 +3,7 @@
 //! diagnostic: the metrics are rt's own, which no Metal call answers, and which lines the host
 //! writes is free under the contract.
 //!
-//! A part is `rt: ...` ([`line`]):
+//! A part is `rt: ...` ([`line()`]):
 //! - the `VkPipeline`s rt made;
 //! - its first-use waits, their count and time in all, then those for a kernel's variant and for
 //!   a content's lines among them, and the longest since the device was made (rt keeps no longest
