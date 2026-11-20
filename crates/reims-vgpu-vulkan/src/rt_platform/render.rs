@@ -57,7 +57,7 @@ use super::command::{Kept, OpenMark};
 use super::compute::{slots, small};
 use super::copied::Used;
 use super::diag::{self, Bound, Target, Use};
-use super::render_pipeline::RtRenderPipeline;
+use super::render_pipeline::{Raster, RtRenderPipeline};
 use super::texture::RtTexture;
 use super::unbuilt::{Unbuilt, refuse};
 use super::{RtBuffer, RtObj, RtPlatform};
@@ -584,24 +584,30 @@ fn drawn_primitive(cmd: &RenderCmd<'_, RtPlatform>) -> Option<u64> {
 }
 
 /// What a draw asked of rt, for the process's first line of each kind of rt's refusals of it
-/// (`super::unbuilt::refusal_detail`): its primitive type (Metal's number; none for a command
-/// other than a draw of one) and the vertex function of the pipeline state set (none before
-/// one is set). The function's name is the guest's.
-struct DrawDetail<'a> {
+/// (`super::unbuilt::refusal_detail`), as structure alone: its primitive type (Metal's number;
+/// none for a command other than a draw of one) and the rasterization fields of the pipeline
+/// state set (none before one is set). Whether the state's vertex function writes
+/// `[[point_size]]` is rt's to know (its translator's), which no call of rt's answers here, so the
+/// line says it is not known.
+struct DrawDetail {
     /// The draw's primitive type.
     primitive: Option<u64>,
-    /// The name of the vertex function of the pipeline state set.
-    vertex: Option<&'a str>,
+    /// The rasterization fields of the pipeline state set.
+    raster: Option<Raster>,
 }
 
-impl std::fmt::Display for DrawDetail<'_> {
+impl std::fmt::Display for DrawDetail {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.primitive {
             Some(primitive) => write!(f, "a draw of primitive type {primitive}")?,
             None => f.write_str("a command other than a draw of a primitive type")?,
         }
-        match self.vertex {
-            Some(vertex) => write!(f, ", the pipeline state's vertex function {vertex}"),
+        match self.raster {
+            Some(raster) => write!(
+                f,
+                ", the pipeline state's {raster}, its vertex function's point size write not known \
+                 here"
+            ),
             None => f.write_str(", no pipeline state set"),
         }
     }
@@ -769,8 +775,8 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
             let stopped = self.command(&mut open, cmd).err();
             if let Some(Stop::Rt(error @ rt::Error::Unsupported(rt::Gap::Draw { kind }))) = &stopped
             {
-                let vertex = open.seen.state.as_ref().map(|state| state.vertex_name());
-                let what = DrawDetail { primitive, vertex };
+                let raster = open.seen.state.as_ref().map(|state| state.raster());
+                let what = DrawDetail { primitive, raster };
                 super::unbuilt::refusal_detail(sel, error, Some(&what));
                 match kind {
                     rt::DrawKind::AttachmentRead => self.attachment_read(&open.seen),
@@ -836,10 +842,11 @@ mod tests {
             .map_or(0, |(_, n)| n)
     }
 
-    /// A refused draw's detail names its primitive type and the vertex function of the pipeline
-    /// state set, or that the command draws no primitive type, or that no state is set.
+    /// A refused draw's detail names its primitive type and the rasterization fields of the
+    /// pipeline state set, and no name, or that the command draws no primitive type, or that no
+    /// state is set.
     #[test]
-    fn a_refused_draw_s_detail_names_its_primitive_and_vertex_function() {
+    fn a_refused_draw_s_detail_names_its_primitive_and_rasterization_fields() {
         let draw = drawn_primitive(&RenderCmd::<RtPlatform>::DrawPrimitives {
             primitive_type: 0,
             vertex_start: 0,
@@ -848,15 +855,24 @@ mod tests {
         assert_eq!(draw, Some(0));
         let what = DrawDetail {
             primitive: draw,
-            vertex: Some("vertex_points"),
+            raster: Some(Raster {
+                enabled: true,
+                topology: metal2vulkan::metal::PrimitiveTopologyClass::Unspecified,
+                samples: 1,
+                alpha_to_coverage: false,
+                alpha_to_one: false,
+                open_gl_mode: true,
+            }),
         };
         assert_eq!(
             what.to_string(),
-            "a draw of primitive type 0, the pipeline state's vertex function vertex_points"
+            "a draw of primitive type 0, the pipeline state's rasterization enabled true, input \
+             primitive topology Unspecified, raster sample count 1, alpha to coverage false, alpha \
+             to one false, OpenGL mode true, its vertex function's point size write not known here"
         );
         let what = DrawDetail {
             primitive: drawn_primitive(&RenderCmd::<RtPlatform>::EndEncoding),
-            vertex: None,
+            raster: None,
         };
         assert_eq!(
             what.to_string(),

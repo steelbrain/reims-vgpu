@@ -96,9 +96,57 @@ pub struct RtRenderPipeline {
     /// Its colour attachments' pixel formats, by index, and its sample count, as the guest's
     /// descriptor gave them: what the boot diagnostics key its `imageblockSampleLength` asks by.
     colors: ([u32; 8], u32),
-    /// Its vertex function's name, for the first line of each kind of rt's refusals of a draw
-    /// of it (`super::render`).
-    vertex_name: Box<str>,
+    /// Its rasterization fields, for the first line of each kind of rt's refusals of a draw of it
+    /// (`super::render`).
+    raster: Raster,
+}
+
+/// A render pipeline state's rasterization fields as its descriptor set them, for the first line
+/// of each kind of rt's refusals of a draw of it (`super::render`): structure alone, no name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Raster {
+    /// `rasterizationEnabled`.
+    pub enabled: bool,
+    /// `inputPrimitiveTopology`.
+    pub topology: PrimitiveTopologyClass,
+    /// `rasterSampleCount`.
+    pub samples: u32,
+    /// `alphaToCoverageEnabled`.
+    pub alpha_to_coverage: bool,
+    /// `alphaToOneEnabled`.
+    pub alpha_to_one: bool,
+    /// The private state's OpenGL mode.
+    pub open_gl_mode: bool,
+}
+
+impl Raster {
+    /// The fields of rt's descriptor `d`.
+    fn of(d: &rt::RenderPipelineDescriptor) -> Raster {
+        Raster {
+            enabled: d.rasterization_enabled,
+            topology: d.input_primitive_topology,
+            samples: d.raster_sample_count,
+            alpha_to_coverage: d.alpha_to_coverage,
+            alpha_to_one: d.alpha_to_one,
+            open_gl_mode: d.private.open_gl_mode_enabled,
+        }
+    }
+}
+
+impl std::fmt::Display for Raster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rasterization enabled {}, input primitive topology {:?}, raster sample count {}, \
+             alpha to coverage {}, alpha to one {}, OpenGL mode {}",
+            self.enabled,
+            self.topology,
+            self.samples,
+            self.alpha_to_coverage,
+            self.alpha_to_one,
+            self.open_gl_mode
+        )
+    }
 }
 
 impl RtRenderPipeline {
@@ -107,9 +155,9 @@ impl RtRenderPipeline {
         &self.rt
     }
 
-    /// Its vertex function's name.
-    pub fn vertex_name(&self) -> &str {
-        &self.vertex_name
+    /// Its rasterization fields.
+    pub fn raster(&self) -> Raster {
+        self.raster
     }
 
     /// The samplers it numbers, in rt's order.
@@ -141,7 +189,7 @@ pub fn of_value(
     d.color_attachments[0] = color_attachment(&color0).map_err(refused)?;
     let mut formats = [0; 8];
     formats[0] = u32::try_from(desc.color0_pixel_format).unwrap_or(u32::MAX);
-    make(device, &d, (formats, 1), desc.vertex.name())
+    make(device, &d, (formats, 1))
 }
 
 /// The state of core's whole descriptor `desc` (the module's docs).
@@ -172,7 +220,7 @@ pub fn of_descriptor(
         }
     }
     let samples = u32::try_from(desc.raster_sample_count).unwrap_or(u32::MAX);
-    make(device, &d, (formats, samples), desc.vertex.name())
+    make(device, &d, (formats, samples))
 }
 
 /// Unbuilt ([`Unbuilt::MeshPipeline`]): the creator's `NSError`.
@@ -339,13 +387,12 @@ fn tessellation(t: &TessellationDesc) -> Result<Option<TessellationDescriptor>, 
 }
 
 /// rt's state of `descriptor`, its samplers' indices taken (the module's docs), of colour formats
-/// and sample count `colors` ([`RtRenderPipeline::colors`]) and of the vertex function named
-/// `vertex_name`. `Err` is the creator's `NSError`, counted under the refusal's kind.
+/// and sample count `colors` ([`RtRenderPipeline::colors`]). `Err` is the creator's `NSError`,
+/// counted under the refusal's kind.
 fn make(
     device: &RtObj<RtDevice>,
     descriptor: &rt::RenderPipelineDescriptor,
     colors: ([u32; 8], u32),
-    vertex_name: &str,
 ) -> Result<RtObj<RtRenderPipeline>, NsErrorText> {
     let mut taking = Taking::new(device);
     let started = trace::on().then(trace::now);
@@ -367,7 +414,7 @@ fn make(
         vertex_written,
         fragment_written,
         colors,
-        vertex_name: vertex_name.into(),
+        raster: Raster::of(descriptor),
     }))
 }
 

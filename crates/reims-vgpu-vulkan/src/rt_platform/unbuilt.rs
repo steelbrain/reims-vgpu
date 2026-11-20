@@ -13,12 +13,16 @@
 //! gap, a failed Vulkan call) answers the same way, counted under the error's kind,
 //! `rt-refused-<kind>` ([`RtRefusal::code`]), its first line naming the call and rt's error. The
 //! first of each of rt's kinds by its name in the boot diagnostics (`Draw-Points`,
-//! `TextureCopy`, `Limit-TextureSamples`) writes a line of its own too, with what the call asked
-//! of rt where its site names it: a texture's descriptor, a copy's textures and places, a draw's
-//! primitive type and vertex function ([`refusal_detail`]). A texture rt makes none of for its pixel format (`Gap::TextureFormat`) is counted under its
-//! format's own code instead, `rt-refused-texture-format-<n>` ([`rt_refused_texture`]), so a
-//! boot's counts line gives each format number with its count. A pipeline state's imageblock
-//! length rt refuses (`Gap::ImageblockLength`) is counted apart from rt's other gaps too,
+//! `TextureCopy`, `RenderPass`, `Limit-TextureSamples`), whichever count it goes to, writes a line
+//! of its own too: rt's error as it displays and as it debugs, which carries the gap's fields, and
+//! what the call asked of rt where its site names it, as structure alone: a texture's descriptor,
+//! a copy's kind, textures, places and buffer layout, a pass's attachments, a draw's primitive
+//! type and its pipeline state's rasterization fields ([`refusal_detail`]). No name of the
+//! guest's (a function's, a label) is in it. A texture rt makes none of for its pixel format
+//! (`Gap::TextureFormat`) is counted under its format's own code instead,
+//! `rt-refused-texture-format-<n>` ([`rt_refused_texture`]), so a boot's counts line gives each
+//! format number with its count. A pipeline state's imageblock length rt refuses
+//! (`Gap::ImageblockLength`) is counted apart from rt's other gaps too,
 //! `rt-refused-imageblock-length` ([`rt_refused_imageblock`]). So is a heap texture rt refuses on
 //! its place in its block where Metal places it in its heap, `rt-refused-heap-texture-place`
 //! ([`HEAP_TEXTURE_PLACE`]).
@@ -343,14 +347,25 @@ pub fn rt_refused(sel: &'static str, error: &rt::Error) -> RtRefusal {
     kind
 }
 
+/// Counts rt's refusal `error` of the call `sel` in the boot diagnostics by its name
+/// (`super::diag::refusal`), and the process's first of the name writes its line
+/// ([`refusal_detail`]), as [`rt_refused`] does: for the refusals counted under a code of their
+/// own (a pixel format's, an imageblock length's, a heap texture's place).
+fn diagnosed(sel: &'static str, error: &rt::Error) {
+    super::diag::refusal(error);
+    refusal_detail(sel, error, None);
+}
+
 /// Writes on stderr the process's first line of each kind of rt's refusals by its name in the
-/// boot diagnostics (`super::diag::refusal_name`: `Draw-Points`, `TextureCopy`,
+/// boot diagnostics (`super::diag::refusal_name`: `Draw-Points`, `TextureCopy`, `RenderPass`,
 /// `Limit-TextureSamples`), which the line of the first of its [`RtRefusal`] kind
 /// ([`refused_as`]) leaves out past that kind's first: [`detail_line`] of the call `sel`, rt's
-/// `error` and `what`, what the call asked of rt that rt's error does not name (a texture's
-/// descriptor, a copy's textures and places, a draw's primitive type and vertex function). A
-/// caller that names `what` calls it before it counts the refusal, whose own call here
-/// ([`rt_refused`]) then writes nothing. Counts nothing.
+/// `error` and `what`, what the call asked of rt that rt's error does not name, as structure
+/// alone (a texture's descriptor; a copy's kind, textures, places and buffer layout; a pass's
+/// attachments; a draw's primitive type and its pipeline state's rasterization fields). A caller
+/// that names `what` calls it before it counts the refusal, whose own call here ([`rt_refused`],
+/// [`diagnosed`]) then writes nothing. Every count of the diagnostics' calls here, so each name
+/// the counts give has its line. Counts nothing.
 pub fn refusal_detail(sel: &'static str, error: &rt::Error, what: Option<&dyn std::fmt::Display>) {
     let Some(name) = super::diag::refusal_name(error) else {
         return;
@@ -368,23 +383,39 @@ fn first_named(name: String) -> bool {
 }
 
 /// The line [`refusal_detail`] writes of rt's `error` of the call `sel`, of the kind `name`, and
-/// what the call asked of rt, `what`, where it names it.
+/// what the call asked of rt, `what`, where it names it: rt's error as it displays and as it
+/// debugs (its variant's fields), the name, and the code of [`counted_code`].
 fn detail_line(
     sel: &str,
     error: &rt::Error,
     name: &str,
     what: Option<&dyn std::fmt::Display>,
 ) -> String {
-    let code = RtRefusal::of(error).code();
+    let code = counted_code(error);
     match what {
         Some(what) => format!(
-            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({error}); the first of {name} \
-             ({code}): {what}\n"
+            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({error}; {error:?}); the first of \
+             {name} ({code}): {what}\n"
         ),
         None => format!(
-            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({error}); the first of {name} \
-             ({code})\n"
+            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({error}; {error:?}); the first of \
+             {name} ({code})\n"
         ),
+    }
+}
+
+/// The code [`detail_line`] names for rt's `error`: a pixel format's own for `Gap::TextureFormat`
+/// and [`IMAGEBLOCK_LENGTH`] for `Gap::ImageblockLength`, which [`rt_refused_texture`] and
+/// [`rt_refused_imageblock`] count them under, [`HEAP_TEXTURE_PLACE`] for a heap texture's place
+/// Metal places ([`metal_places`]), and its kind's code for any other.
+fn counted_code(error: &rt::Error) -> std::borrow::Cow<'static, str> {
+    match *error {
+        rt::Error::Unsupported(rt::Gap::TextureFormat { pixel_format }) => {
+            format!("rt-refused-texture-format-{}", pixel_format.as_raw()).into()
+        }
+        rt::Error::Unsupported(rt::Gap::ImageblockLength) => IMAGEBLOCK_LENGTH.into(),
+        _ if metal_places(error) => HEAP_TEXTURE_PLACE.into(),
+        _ => RtRefusal::of(error).code().into(),
     }
 }
 
@@ -440,7 +471,7 @@ pub fn rt_refused_texture(sel: &'static str, error: &rt::Error) -> RtRefusal {
     };
     let (code, first) = format_code(pixel_format.as_raw());
     crate::answer::count_kind(code);
-    super::diag::refusal(error);
+    diagnosed(sel, error);
     if first {
         say(&format!(
             "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({error}); refused ({code}), the \
@@ -464,7 +495,7 @@ pub fn rt_refused_imageblock(sel: &'static str, error: &rt::Error) {
         return;
     }
     crate::answer::count_kind(IMAGEBLOCK_LENGTH);
-    super::diag::refusal(error);
+    diagnosed(sel, error);
     if !SAID_IMAGEBLOCK.swap(true, Ordering::Relaxed) {
         say(&format!(
             "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({error}); refused \
@@ -488,21 +519,11 @@ pub const HEAP_TEXTURE_PLACE: &str = "rt-refused-heap-texture-place";
 /// any other error, which the caller counts.
 fn heap_texture_place(sel: &'static str, error: &rt::Error) -> Option<RtRefusal> {
     static SAID_HEAP_PLACE: AtomicBool = AtomicBool::new(false);
-    let rt::Error::Refused(rt::Refusal::HeapTexturePlace {
-        offset,
-        size,
-        align,
-        heap_len,
-    }) = *error
-    else {
-        return None;
-    };
-    let aligned = align != 0 && offset.is_multiple_of(align);
-    if !aligned || offset.checked_add(size).is_none_or(|end| end > heap_len) {
+    if !metal_places(error) {
         return None;
     }
     crate::answer::count_kind(HEAP_TEXTURE_PLACE);
-    super::diag::refusal(error);
+    diagnosed(sel, error);
     if let Some(code) = crate::answer::refusing() {
         crate::answer::count_kind(code);
     }
@@ -513,6 +534,23 @@ fn heap_texture_place(sel: &'static str, error: &rt::Error) -> Option<RtRefusal>
         ));
     }
     Some(RtRefusal::Refused)
+}
+
+/// Whether `error` is rt's `HeapTexturePlace` of a place Metal's own rule places
+/// ([`heap_texture_place`]): its offset a multiple of the alignment, and its bytes inside the
+/// heap.
+fn metal_places(error: &rt::Error) -> bool {
+    let rt::Error::Refused(rt::Refusal::HeapTexturePlace {
+        offset,
+        size,
+        align,
+        heap_len,
+    }) = *error
+    else {
+        return false;
+    };
+    let aligned = align != 0 && offset.is_multiple_of(align);
+    aligned && offset.checked_add(size).is_some_and(|end| end <= heap_len)
 }
 
 /// [`rt_refused_create`] of a creator with an `error:` out-parameter: the `NSError` it answers, in
@@ -770,8 +808,8 @@ mod tests {
     }
 
     /// The first refusal of each of rt's kinds by name has a line of its own, naming the call,
-    /// rt's error, the kind, its code and what the call asked of rt where its site names it; the
-    /// kind's next refusal writes none.
+    /// rt's error as it displays and as it debugs, the kind, its code and what the call asked of
+    /// rt where its site names it; the kind's next refusal writes none.
     #[test]
     fn the_first_refusal_of_each_named_kind_has_its_own_line() {
         let samples = rt::Error::Limit(rt::Limit::TextureSamples {
@@ -784,11 +822,12 @@ mod tests {
         assert_eq!(
             detail_line("newTextureWithDescriptor:", &samples, &name, Some(&what)),
             format!(
-                "reims-vgpu: newTextureWithDescriptor:: metal2vulkan-runtime refused it \
-                 ({samples}); the first of Limit-TextureSamples (rt-refused-limit): a texture of \
+                "reims-vgpu: newTextureWithDescriptor:: metal2vulkan-runtime refused it ({samples}; \
+                 {samples:?}); the first of Limit-TextureSamples (rt-refused-limit): a texture of \
                  format 70\n"
             )
         );
+        assert!(format!("{samples:?}").contains("sample_count: 4"), "{samples:?}");
         let points = rt::Error::Unsupported(rt::Gap::Draw {
             kind: rt::DrawKind::Points,
         });
@@ -799,12 +838,48 @@ mod tests {
                 "Draw-Points",
                 None
             ),
-            "reims-vgpu: drawPrimitives:vertexStart:vertexCount:: metal2vulkan-runtime refused it \
-             (a draw with Points is not built); the first of Draw-Points (rt-refused-gap)\n"
+            "reims-vgpu: drawPrimitives:vertexStart:vertexCount:: metal2vulkan-runtime refused it (a \
+             draw with Points is not built; Unsupported(Draw { kind: Points })); the first of \
+             Draw-Points (rt-refused-gap)\n"
+        );
+        let format = rt::Error::Unsupported(rt::Gap::TextureFormat {
+            pixel_format: rt::PixelFormat::BGRA8Unorm,
+        });
+        let line = detail_line("newTextureWithDescriptor:", &format, "TextureFormat", None);
+        assert!(
+            line.ends_with("the first of TextureFormat (rt-refused-texture-format-80)\n"),
+            "{line}"
         );
         let kind = "test-first-named";
         assert!(first_named(kind.to_owned()));
         assert!(!first_named(kind.to_owned()));
+    }
+
+    /// The refusals counted under a code of their own (a pixel format's, an imageblock length's, a
+    /// heap texture's place Metal places) write their name's line too, as every refusal the boot
+    /// diagnostics count by name does.
+    #[test]
+    fn a_refusal_of_a_code_of_its_own_writes_its_name_s_line() {
+        let format = rt::Error::Unsupported(rt::Gap::TextureFormat {
+            pixel_format: rt::PixelFormat::BGRA8Unorm,
+        });
+        rt_refused_texture("newTextureWithDescriptor:", &format);
+        assert!(!first_named("TextureFormat".to_owned()));
+        rt_refused_imageblock(
+            "imageblockSampleLength",
+            &rt::Error::Unsupported(rt::Gap::ImageblockLength),
+        );
+        assert!(!first_named("ImageblockLength".to_owned()));
+        let place = rt::Error::Refused(rt::Refusal::HeapTexturePlace {
+            offset: 0,
+            size: 0x1000,
+            align: 0x1000,
+            heap_len: 0x2000,
+        });
+        assert!(metal_places(&place));
+        rt_refused_texture("newTextureWithDescriptor:offset:", &place);
+        assert!(!first_named("Refused-HeapTexturePlace".to_owned()));
+        assert_eq!(counted_code(&place), HEAP_TEXTURE_PLACE);
     }
 
     /// The first refusal's line names the call, the piece and its code.

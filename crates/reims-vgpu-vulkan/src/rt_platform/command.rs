@@ -1146,6 +1146,8 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                         )))
                     }
                     Err(error) => {
+                        let what = super::descriptor::PassDetail::of(&pass);
+                        super::unbuilt::refusal_detail(sel, &error, Some(&what));
                         rt_refused_create(sel, &error);
                         None
                     }
