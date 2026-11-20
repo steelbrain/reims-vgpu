@@ -875,7 +875,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 }
                 if cached && video.imports_device_caches() {
                     decoder.set_exportable_caches();
-                } else if cached && video.decodes_into_device_caches() {
+                } else if cached && video.writes_into_device_caches() {
                     decoder.set_dma_buf_caches();
                 }
                 #[cfg(windows)]

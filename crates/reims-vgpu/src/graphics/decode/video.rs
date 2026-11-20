@@ -150,11 +150,11 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     fn imports_device_caches(&self) -> bool {
         false
     }
-    /// Whether its hardware decodes a picture straight into a device cache, through an import of
-    /// the cache's memory as a dma-buf, where the cache was made so: the device's laid-out caches
-    /// of two planes, the decodes' output, are then made with their memory a dma-buf
-    /// ([`VideoPlane::cache`]).
-    fn decodes_into_device_caches(&self) -> bool {
+    /// Whether its hardware writes a picture into a device cache, by its decode or by its video
+    /// processing, through an import of the cache's memory as a dma-buf, where the cache was made
+    /// so: the device's laid-out caches of two planes, the decodes' output, are then made with
+    /// their memory a dma-buf ([`VideoPlane::cache`]).
+    fn writes_into_device_caches(&self) -> bool {
         false
     }
     /// The draws that write its pictures into Direct3D 11 textures, where it lands pictures so
@@ -1019,7 +1019,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Makes the device's laid-out caches of two planes dma-bufs from now on, for the host's video
-    /// to decode into ([`GraphicsVideo::decodes_into_device_caches`]): once, at the device's make,
+    /// to write into ([`GraphicsVideo::writes_into_device_caches`]): once, at the device's make,
     /// before any cache.
     pub(crate) fn set_dma_buf_caches(&self) {
         self.shared.surface_caches.set_dma_buf();

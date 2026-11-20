@@ -29,6 +29,6 @@ fn the_rt_platforms_arm_opens_on_the_devices_adapter_and_decodes_alone() {
         assert!(video.guest_encoders().is_empty());
         assert!(video.guest_decodes());
         assert!(video.lands_in_device_caches());
-        assert!(!video.decodes_into_device_caches());
+        assert!(!video.writes_into_device_caches());
     });
 }

@@ -127,11 +127,23 @@ impl TargetChecks {
         TargetChecks { answers }
     }
 
+    /// The answers `answers`, each a codec, a format and whether it passed, as a stand-in
+    /// driver's check would give them: for a host's tests of what it makes of them. A codec and
+    /// format left out was not checked.
+    pub fn of_answers(answers: Vec<(TargetCodec, TargetFormat, Result<(), String>)>) -> Self {
+        TargetChecks { answers }
+    }
+
     /// Whether decodes of `codec` into `format` may be handed targets: `Err` with why not.
     pub fn passed(&self, codec: TargetCodec, format: TargetFormat) -> Result<(), String> {
         (self.answers.iter())
             .find(|(c, f, _)| *c == codec && *f == format)
             .map_or_else(|| Err("not checked".to_owned()), |(_, _, a)| a.clone())
+    }
+
+    /// Whether decodes of `codec` into any format may be handed targets.
+    pub fn passed_any(&self, codec: TargetCodec) -> bool {
+        (self.answers.iter()).any(|(c, _, answer)| *c == codec && answer.is_ok())
     }
 
     /// The answers in one line, for the log.
@@ -777,5 +789,17 @@ mod tests {
         );
         assert!(read(&file, "another key").is_none());
         std::fs::remove_dir_all(&dir).expect("removed");
+    }
+
+    #[test]
+    fn a_codec_passes_where_any_of_its_formats_passed() {
+        let checks = TargetChecks::of_answers(vec![
+            (TargetCodec::H264, TargetFormat::Nv12, Err("tiled".into())),
+            (TargetCodec::Hevc, TargetFormat::Nv12, Err("tiled".into())),
+            (TargetCodec::Hevc, TargetFormat::P010, Ok(())),
+        ]);
+        assert!(!checks.passed_any(TargetCodec::H264));
+        assert!(checks.passed_any(TargetCodec::Hevc));
+        assert!(!TargetChecks::of_answers(Vec::new()).passed_any(TargetCodec::Hevc));
     }
 }

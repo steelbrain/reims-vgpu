@@ -103,9 +103,7 @@ use reims_vgpu_video::vaapi::{
     TargetCodec, TargetFor, encoder_support,
 };
 #[cfg(unix)]
-use reims_vgpu_video::vaapi::{
-    TARGET_ALIGNMENT, Target, TargetChecks, TargetFormat, TargetPlane, TargetShape,
-};
+use reims_vgpu_video::vaapi::{TARGET_ALIGNMENT, Target, TargetChecks, TargetPlane, TargetShape};
 #[cfg(unix)]
 use reims_vgpu_vulkan::core::num::ToU64 as _;
 use reims_vgpu_vulkan::core::num::ToUsize as _;
@@ -331,8 +329,8 @@ struct VaapiVideo<P: Platform> {
     imports: Arc<GuestWrites>,
     /// What makes each session's GPU copies of its pictures (the module doc's second way).
     copies: Option<Arc<dyn GpuCopies<P>>>,
-    /// What decodes pictures straight into device caches, where the platform makes caches of
-    /// dma-bufs and the driver's check passed any codec.
+    /// What writes pictures into device caches through their memory, where the platform makes
+    /// caches of dma-bufs and the driver's checks passed anything ([`cache_writes`]).
     targets: Option<Arc<CacheTargets<P>>>,
 }
 
@@ -373,8 +371,15 @@ impl<P: Platform> VaapiVideo<P> {
             writes_imports.p010(),
         );
         let imports = Arc::new(GuestWrites::new(&display));
-        let targets =
-            CacheTargets::new(device, &display, &runtime, checks, rules.references).map(Arc::new);
+        let targets = CacheTargets::new(
+            device,
+            &display,
+            &runtime,
+            checks,
+            &writes_imports,
+            rules.references,
+        )
+        .map(Arc::new);
         Ok(Self {
             display,
             device: device.clone_ref(),
@@ -415,9 +420,10 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
         true
     }
 
-    /// Where the platform makes caches of dma-bufs and the driver's check passed a codec: the
-    /// module doc's first way.
-    fn decodes_into_device_caches(&self) -> bool {
+    /// Where the platform makes caches of dma-bufs and the driver's checks passed anything
+    /// ([`cache_writes`]): a picture is decoded into its cache, or written there by the driver's
+    /// video processing (module doc).
+    fn writes_into_device_caches(&self) -> bool {
         self.targets.is_some()
     }
 
@@ -649,9 +655,9 @@ const STORAGE_PRIVATE: u64 = 2 << 4;
 #[cfg(unix)]
 const MOST_CACHES: usize = 64;
 
-/// What decodes the video's pictures straight into their outputs' device caches (module doc):
-/// the driver's check's answers, and each cache's memory as a dma-buf, by the cache's identity,
-/// while the cache lives.
+/// What writes the video's pictures into their outputs' device caches through the caches' memory
+/// (module doc), by decodes into them or the driver's video processing: the driver's check's
+/// answers, and each cache's memory as a dma-buf, by the cache's identity, while the cache lives.
 #[cfg(unix)]
 struct CacheTargets<P: Platform> {
     display: Display,
@@ -710,20 +716,61 @@ impl<P: Platform> CacheOf<P> {
     }
 }
 
+/// How the arm writes pictures into device caches made dma-bufs, as the driver's checks let it
+/// ([`cache_writes`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheWrites {
+    /// A picture of a codec and format the driver's decode check passed is decoded into its
+    /// cache, and the others are written there by its video processing where its import check
+    /// passed their format.
+    Decodes,
+    /// The driver's video processing alone writes pictures into caches: its import check passed
+    /// a format, and its decode check none, as on a driver whose decodes write their render
+    /// target tiled whatever the import says (iHD, `docs/video/bugs.md`, U30).
+    VideoProcessing,
+}
+
+/// What the driver's checks let the arm write into device caches made dma-bufs: `checks`, the
+/// answers of its check of decodes into targets, and `writes`, its import check's. `Err` with
+/// both checks' answers where neither passed anything: no cache is then made a dma-buf for the
+/// video.
+#[cfg(unix)]
+fn cache_writes(checks: &TargetChecks, writes: &ImportWrites) -> Result<CacheWrites, String> {
+    if [TargetCodec::H264, TargetCodec::Hevc]
+        .into_iter()
+        .any(|codec| checks.passed_any(codec))
+    {
+        return Ok(CacheWrites::Decodes);
+    }
+    match (writes.nv12(), writes.p010()) {
+        (Err(nv12), Err(p010)) => Err(format!(
+            "the driver's check: {}; and its video processing writes no import: NV12: {nv12}; \
+             P010: {p010}",
+            checks.summary()
+        )),
+        _ => Ok(CacheWrites::VideoProcessing),
+    }
+}
+
 #[cfg(unix)]
 impl<P: Platform> CacheTargets<P> {
     /// Where `device`'s platform makes caches of dma-bufs, as a cache of a 4K picture's bytes made
     /// so and exported shows, the answers of the driver's check (kept in `checks` where given),
-    /// where any passed; `None` otherwise, logged at `info` with why.
+    /// where it or the import check (`writes`) passed anything ([`cache_writes`]); `None`
+    /// otherwise, logged at `info` with why.
     fn new(
         device: &P::Device,
         display: &Display,
         runtime: &Arc<dyn Runtime>,
         checks: Option<&Path>,
+        writes: &ImportWrites,
         references: CachedReferences,
     ) -> Option<Self> {
         let declined = |why: &str| {
-            log::info!("hardware video: {NAME}: no picture is decoded into a device cache: {why}");
+            log::info!(
+                "hardware video: {NAME}: no device cache is made a dma-buf for the video: {why}"
+            );
             None
         };
         let made = device.new_dma_buf_buffer_of_length_padding_unobserved(
@@ -742,24 +789,24 @@ impl<P: Platform> CacheTargets<P> {
         }
         drop(probe);
         let checks = TargetChecks::of(display, checks);
-        let passed = [
-            (TargetCodec::H264, TargetFormat::Nv12),
-            (TargetCodec::Hevc, TargetFormat::Nv12),
-            (TargetCodec::Hevc, TargetFormat::P010),
-        ]
-        .into_iter()
-        .any(|(codec, format)| checks.passed(codec, format).is_ok());
-        if !passed {
-            return declined(&format!("the driver's check: {}", checks.summary()));
+        match cache_writes(&checks, writes) {
+            Err(why) => return declined(&why),
+            Ok(CacheWrites::Decodes) => {
+                let which = match references {
+                    CachedReferences::Apart => "pictures no later picture predicts from are",
+                };
+                log::info!(
+                    "hardware video: {NAME}: {which} decoded into device caches where the \
+                     driver's check passed: {}",
+                    checks.summary()
+                );
+            }
+            Ok(CacheWrites::VideoProcessing) => log::info!(
+                "hardware video: {NAME}: pictures are written into device caches by the driver's \
+                 video processing, none decoded there: the driver's check: {}",
+                checks.summary()
+            ),
         }
-        let which = match references {
-            CachedReferences::Apart => "pictures no later picture predicts from are",
-        };
-        log::info!(
-            "hardware video: {NAME}: {which} decoded into device caches where the driver's check \
-             passed: {}",
-            checks.summary()
-        );
         Some(Self {
             display: display.clone_ref(),
             checks,
@@ -769,10 +816,11 @@ impl<P: Platform> CacheTargets<P> {
     }
 
     /// What gives a decode of `codec` into `output` its picture's target: `None` where the
-    /// output's planes do not both lie in one device cache made for the host's video
-    /// ([`OutputPlane::cache`]), and for a reference picture where references are kept apart
-    /// (module doc). Each reason a picture's target is not given then is logged once a session,
-    /// in `said`, and the picture's role is counted in `roles`.
+    /// driver's check passed none of the codec's formats, where the output's planes do not both
+    /// lie in one device cache made for the host's video ([`OutputPlane::cache`]), and for a
+    /// reference picture where references are kept apart (module doc). Each reason a picture's
+    /// target is not given then is logged once a session, in `said`, but the check's, which the
+    /// open logged, and the picture's role is counted in `roles`.
     fn target_for(
         self: &Arc<Self>,
         codec: TargetCodec,
@@ -780,6 +828,9 @@ impl<P: Platform> CacheTargets<P> {
         said: &Arc<Mutex<Vec<String>>>,
         roles: &Arc<RoleCounts>,
     ) -> Option<TargetFor> {
+        if !self.checks.passed_any(codec) {
+            return None;
+        }
         let (luma, chroma) = (&output.luma, &output.chroma);
         let (Some(cache), Some(other)) = (&luma.cache, &chroma.cache) else {
             return None;
@@ -977,11 +1028,12 @@ impl<P: Platform> CacheTargets<P> {
         _display: &Display,
         _runtime: &Arc<dyn Runtime>,
         _checks: Option<&Path>,
+        _writes: &ImportWrites,
         _references: CachedReferences,
     ) -> Option<Self> {
         log::info!(
-            "hardware video: {NAME}: no picture is decoded into a device cache: this host makes \
-             no dma-buf"
+            "hardware video: {NAME}: no device cache is made a dma-buf for the video: this host \
+             makes no dma-buf"
         );
         None
     }

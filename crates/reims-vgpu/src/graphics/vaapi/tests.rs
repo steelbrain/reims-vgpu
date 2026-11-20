@@ -1,6 +1,6 @@
 use super::*;
 use crate::graphics::video_choice::tested_gpu::Arm;
-use reims_vgpu_video::vaapi::{ImportWrite, SurfaceCapabilities};
+use reims_vgpu_video::vaapi::{ImportWrite, SurfaceCapabilities, TargetFormat};
 
 /// A VLD config of `profile`, decoding `rt_formats`, up to `max` with surfaces from `min`.
 fn config(
@@ -248,10 +248,56 @@ fn references_are_kept_apart_from_their_caches_where_the_rules_say_and_counted()
     );
 }
 
+/// The device's caches are made dma-bufs for a driver whose check of decodes into targets passed a
+/// codec and format, whose pictures are then decoded into them, and for one whose decodes passed
+/// none where its import check passed a format, whose video processing then writes each picture
+/// into its cache (iHD's, U30); for neither, none is, the decline naming both checks' answers
+#[test]
+fn caches_are_dma_bufs_where_either_of_the_drivers_checks_passed() {
+    let refused = |why: &str| Err::<(), String>(why.to_owned());
+    let checks = |hevc: Result<(), String>| {
+        TargetChecks::of_answers(vec![
+            (TargetCodec::H264, TargetFormat::Nv12, refused("Y-tiled")),
+            (TargetCodec::Hevc, TargetFormat::Nv12, refused("Y-tiled")),
+            (TargetCodec::Hevc, TargetFormat::P010, hevc),
+        ])
+    };
+    let whole_rows = ImportWrite {
+        alignment: 64,
+        whole_rows: true,
+    };
+    let none = ImportWrites::of_answers(Err("no NV12".to_owned()), Err("no P010".to_owned()));
+    let p010 = ImportWrites::of_answers(Err("no NV12".to_owned()), Ok(whole_rows));
+    let nv12 = ImportWrites::of_answers(Ok(whole_rows), Err("no P010".to_owned()));
+    assert_eq!(
+        cache_writes(&checks(Ok(())), &none),
+        Ok(CacheWrites::Decodes)
+    );
+    assert_eq!(
+        cache_writes(&checks(Ok(())), &p010),
+        Ok(CacheWrites::Decodes)
+    );
+    for writes in [&p010, &nv12] {
+        assert_eq!(
+            cache_writes(&checks(refused("Y-tiled")), writes),
+            Ok(CacheWrites::VideoProcessing)
+        );
+    }
+    let why = cache_writes(&checks(refused("Y-tiled")), &none).expect_err("no cache made so");
+    assert!(
+        why.starts_with("the driver's check: h264-nv12 not taken: Y-tiled;")
+            && why.ends_with(
+                "; and its video processing writes no import: NV12: no NV12; P010: no P010"
+            ),
+        "{why}"
+    );
+}
+
 /// On the rt platform the VA-API arm answers what the driver decodes and no encoder (the platform
-/// releases no encoder's sources to the driver yet), and decodes into the device's caches where
-/// the driver's check passed a codec: rt's exported blocks, as dma-bufs, take the pictures no
-/// later one predicts from.
+/// releases no encoder's sources to the driver yet), and writes into the device's caches where the
+/// driver's check of decodes into targets passed a codec, or its import check a format: rt's
+/// exported blocks, as dma-bufs, take the pictures no later one predicts from, decoded there, or
+/// the pictures the driver's video processing writes there.
 /// The rt device must be of a GPU the arm runs on (`video_choice::tested_gpu::check_rt`).
 #[test]
 #[ignore = "needs a VA-API GPU: run on the VA-API host"]
@@ -286,11 +332,15 @@ fn the_rt_platforms_va_api_arm_decodes_alone() {
         ]
         .into_iter()
         .any(|(codec, format)| checks.passed(codec, format).is_ok());
+        let writes = display.import_writes();
+        let written = writes.nv12().is_ok() || writes.p010().is_ok();
         assert_eq!(
-            video.decodes_into_device_caches(),
-            passed,
-            "{}",
-            checks.summary()
+            video.writes_into_device_caches(),
+            passed || written,
+            "{}; NV12 {:?}, P010 {:?}",
+            checks.summary(),
+            writes.nv12(),
+            writes.p010()
         );
     });
 }
@@ -310,7 +360,6 @@ fn the_rt_platforms_va_api_arm_decodes_alone() {
 #[test]
 #[ignore = "needs a VA-API GPU and the conformance suite's streams: run on the VA-API host"]
 fn a_picture_written_into_a_dma_buf_cache_by_video_processing_is_the_cpus_copy() {
-    use reims_vgpu_video::codec::{h264, hevc};
     use reims_vgpu_video::core::device_memory::MemoryLife;
     use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
     use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
@@ -319,20 +368,8 @@ fn a_picture_written_into_a_dma_buf_cache_by_video_processing_is_the_cpus_copy()
     use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, NsRange};
     use reims_vgpu_vulkan::core::raise::OnFault;
 
-    /// The pictures of each stream written into caches.
-    const PICTURES: usize = 4;
     const PAGE: u64 = 4096;
-    let dirs = std::env::var("RVG_VA_STREAMS").expect("RVG_VA_STREAMS: the streams' directories");
-    let mut streams: Vec<std::path::PathBuf> = (dirs.split(':'))
-        .flat_map(|dir| std::fs::read_dir(dir).expect("a streams directory"))
-        .map(|entry| entry.expect("a directory entry").path())
-        .filter(|path| {
-            let name = path.to_string_lossy();
-            (name.ends_with(".264") || name.ends_with(".265")) && !name.contains(".part.")
-        })
-        .collect();
-    streams.sort();
-    assert!(!streams.is_empty(), "no streams in {dirs}");
+    let streams = va_streams();
     let platform = crate::rt_test_end::platform();
     crate::entry::run(|_| {
         let device = platform.system_default_device().expect("an rt device");
@@ -358,168 +395,135 @@ fn a_picture_written_into_a_dma_buf_cache_by_video_processing_is_the_cpus_copy()
             cb.wait_until_completed(OnFault::Return).expect("the wait");
             assert_eq!(cb.status(), CommandBufferStatus::COMPLETED, "{what}");
         };
-        let (mut pictures, mut declined, mut refused) = (0usize, Vec::new(), Vec::new());
-        for stream in &streams {
-            let file = std::fs::read(stream).expect("a stream");
-            let (units, mut decoder) = if stream.to_string_lossy().ends_with(".265") {
-                let decoder = HevcDecoder::new_annex_b(&display);
-                (hevc::nal::access_units(&file), Codec::Hevc(decoder))
-            } else {
-                let decoder = H264Decoder::new_annex_b(&display);
-                (h264::nal::access_units(&file), Codec::H264(decoder))
+        let (mut pictures, mut declined) = (0usize, Vec::new());
+        let mut each = |stream: &std::path::Path, id: u64, frame: &Frame| -> bool {
+            let sample: u64 = if frame.bit_depth() > 8 { 2 } else { 1 };
+            let (width, height) = (u64::from(frame.width()), u64::from(frame.height()));
+            let (even_w, even_h) = (width.next_multiple_of(2), height.next_multiple_of(2));
+            let (luma_bytes, chroma_bytes) = (width * sample, width.div_ceil(2) * 2 * sample);
+            let pitch = (even_w * sample).next_multiple_of(TARGET_ALIGNMENT);
+            let chroma_rows = height.div_ceil(2);
+            let (luma_at, chroma_at) = (0, (pitch * even_h).next_multiple_of(PAGE));
+            let len = (chroma_at + pitch * even_h / 2).next_multiple_of(PAGE);
+            let cache = (device.new_dma_buf_buffer_of_length_padding_unobserved(
+                OnFault::Return,
+                len,
+                STORAGE_PRIVATE,
+                Some(luma_at),
+            ))
+            .expect("no raise")
+            .expect("a dma-buf cache");
+            blit_and_wait(
+                BlitCmd::FillBuffer {
+                    buffer: &cache,
+                    range: NsRange {
+                        location: 0,
+                        length: len,
+                    },
+                    value: UNTOUCHED,
+                },
+                "the cache's fill",
+            );
+            let exported = cache.export_dma_buf().expect("the cache's dma-buf");
+            let life = MemoryLife::new();
+            let bytes = CacheBytes::<reims_vgpu_vulkan::RtPlatform> {
+                memory: Arc::new(CacheMemory {
+                    dma_buf: exported.fd,
+                    size: exported.allocation_size,
+                    offset: exported.offset,
+                    cache: CacheOf::Buffer(cache.clone_ref()),
+                    last: Mutex::new(None),
+                }),
+                identity: life.identity(),
             };
-            let mut written = 0;
-            'units: for (id, unit) in units.iter().enumerate() {
-                let id = u64::try_from(id).expect("an id");
-                let frames = match &mut decoder {
-                    Codec::H264(d) => d.decode(unit, id),
-                    Codec::Hevc(d) => d.decode(unit, id),
-                };
-                let frames = match frames {
-                    Ok(frames) => frames,
-                    Err(reims_vgpu_video::vaapi::Error::HevcBitstream(
-                        hevc::Error::SkippedLeadingPicture,
-                    )) => continue,
-                    Err(error) => {
-                        refused.push(format!("{}: {error}", stream.display()));
-                        break;
-                    }
-                };
-                for frame in &frames {
-                    let sample: u64 = if frame.bit_depth() > 8 { 2 } else { 1 };
-                    let (width, height) = (u64::from(frame.width()), u64::from(frame.height()));
-                    let (even_w, even_h) = (width.next_multiple_of(2), height.next_multiple_of(2));
-                    let (luma_bytes, chroma_bytes) =
-                        (width * sample, width.div_ceil(2) * 2 * sample);
-                    let pitch = (even_w * sample).next_multiple_of(TARGET_ALIGNMENT);
-                    let chroma_rows = height.div_ceil(2);
-                    let (luma_at, chroma_at) = (0, (pitch * even_h).next_multiple_of(PAGE));
-                    let len = (chroma_at + pitch * even_h / 2).next_multiple_of(PAGE);
-                    let cache = (device.new_dma_buf_buffer_of_length_padding_unobserved(
-                        OnFault::Return,
-                        len,
-                        STORAGE_PRIVATE,
-                        Some(luma_at),
-                    ))
-                    .expect("no raise")
-                    .expect("a dma-buf cache");
-                    blit_and_wait(
-                        BlitCmd::FillBuffer {
-                            buffer: &cache,
-                            range: NsRange {
-                                location: 0,
-                                length: len,
-                            },
-                            value: UNTOUCHED,
-                        },
-                        "the cache's fill",
-                    );
-                    let exported = cache.export_dma_buf().expect("the cache's dma-buf");
-                    let life = MemoryLife::new();
-                    let bytes = CacheBytes::<reims_vgpu_vulkan::RtPlatform> {
-                        memory: Arc::new(CacheMemory {
-                            dma_buf: exported.fd,
-                            size: exported.allocation_size,
-                            offset: exported.offset,
-                            cache: CacheOf::Buffer(cache.clone_ref()),
-                            last: Mutex::new(None),
-                        }),
-                        identity: life.identity(),
-                    };
-                    let place = |offset: u64, row_bytes: u64, w: u64, h: u64| Place {
-                        offset,
-                        bytes_per_row: pitch,
-                        row_bytes,
-                        width: w,
-                        height: h,
-                        rows_held: h.next_multiple_of(2),
-                    };
-                    let layout = in_place_layout(
-                        place(luma_at, even_w * sample, width, height),
-                        place(chroma_at, even_w * sample, width.div_ceil(2), even_h / 2),
-                        frame.bit_depth(),
-                    )
-                    .expect("a layout");
-                    let target = GuestTarget::new(&layout, &bytes).expect("a target");
-                    match frame.write_to_guest(&target, &writes).expect("the write") {
-                        DeviceWrite::Written => {}
-                        DeviceWrite::Declined(why) => {
-                            declined.push(format!("{} picture {id}: {why}", stream.display()));
-                            continue;
-                        }
-                    }
-                    cache.external_write_done().expect("the acquire");
-                    let back = (device.new_buffer_of_length(OnFault::Return, len, 0))
-                        .expect("no raise")
-                        .expect("a buffer to read the cache back into");
-                    blit_and_wait(
-                        BlitCmd::CopyBufferToBuffer {
-                            source_buffer: Some(&cache),
-                            source_offset: 0,
-                            destination_buffer: Some(&back),
-                            destination_offset: 0,
-                            size: len,
-                        },
-                        "the copy back",
-                    );
-                    let mut cpu = vec![UNTOUCHED; usize_of(len)];
-                    let (y, uv) = cpu.split_at_mut(usize_of(chroma_at));
-                    (frame.read_back().expect("the read back"))
-                        .copy_into(
-                            plane_rows(&mut y[usize_of(luma_at)..], pitch, height, luma_bytes),
-                            plane_rows(uv, pitch, chroma_rows, chroma_bytes),
-                        )
-                        .expect("the CPU's copy");
-                    // SAFETY: the read-back buffer's `len` bytes, which the blit finished writing
-                    // before its command buffer completed, and which nothing writes meanwhile.
-                    let gpu = unsafe {
-                        std::slice::from_raw_parts(back.contents().as_ptr::<u8>(), usize_of(len))
-                    };
-                    // The bytes the run may write past the crop: each row's samples to the even
-                    // width, and the even height's last row.
-                    let (luma_even, chroma_even) = (even_w * sample, even_w * sample);
-                    let past_crop = |i: u64| {
-                        let in_plane =
-                            |at: u64, rows: u64, even_rows: u64, crop: u64, even: u64| {
-                                let Some(from) = i.checked_sub(at) else {
-                                    return false;
-                                };
-                                let (row, column) = (from / pitch, from % pitch);
-                                row < even_rows
-                                    && ((row < rows && column >= crop && column < even)
-                                        || (row >= rows && column < even))
-                            };
-                        in_plane(luma_at, height, even_h, luma_bytes, luma_even)
-                            || in_plane(
-                                chroma_at,
-                                chroma_rows,
-                                even_h / 2,
-                                chroma_bytes,
-                                chroma_even,
-                            )
-                    };
-                    let first =
-                        (0..gpu.len()).find(|&i| gpu[i] != cpu[i] && !past_crop(i.to_u64()));
-                    if let Some(first) = first {
-                        panic!(
-                            "{} picture {id} written into a cache, {width}x{height} at \
-                             {sample}-byte samples, rows of {pitch}: byte {first} is {:#x} by the \
-                             driver's video processing and {:#x} by the CPU's copy (luma at \
-                             {luma_at}, chroma at {chroma_at})",
-                            stream.display(),
-                            gpu[first],
-                            cpu[first]
-                        );
-                    }
-                    drop((bytes, life, cache, back));
-                    pictures += 1;
-                    written += 1;
-                    if written == PICTURES {
-                        break 'units;
-                    }
+            let place = |offset: u64, row_bytes: u64, w: u64, h: u64| Place {
+                offset,
+                bytes_per_row: pitch,
+                row_bytes,
+                width: w,
+                height: h,
+                rows_held: h.next_multiple_of(2),
+            };
+            let layout = in_place_layout(
+                place(luma_at, even_w * sample, width, height),
+                place(chroma_at, even_w * sample, width.div_ceil(2), even_h / 2),
+                frame.bit_depth(),
+            )
+            .expect("a layout");
+            let target = GuestTarget::new(&layout, &bytes).expect("a target");
+            match frame.write_to_guest(&target, &writes).expect("the write") {
+                DeviceWrite::Written => {}
+                DeviceWrite::Declined(why) => {
+                    declined.push(format!("{} picture {id}: {why}", stream.display()));
+                    return false;
                 }
             }
-        }
+            cache.external_write_done().expect("the acquire");
+            let back = (device.new_buffer_of_length(OnFault::Return, len, 0))
+                .expect("no raise")
+                .expect("a buffer to read the cache back into");
+            blit_and_wait(
+                BlitCmd::CopyBufferToBuffer {
+                    source_buffer: Some(&cache),
+                    source_offset: 0,
+                    destination_buffer: Some(&back),
+                    destination_offset: 0,
+                    size: len,
+                },
+                "the copy back",
+            );
+            let mut cpu = vec![UNTOUCHED; usize_of(len)];
+            let (y, uv) = cpu.split_at_mut(usize_of(chroma_at));
+            (frame.read_back().expect("the read back"))
+                .copy_into(
+                    plane_rows(&mut y[usize_of(luma_at)..], pitch, height, luma_bytes),
+                    plane_rows(uv, pitch, chroma_rows, chroma_bytes),
+                )
+                .expect("the CPU's copy");
+            // SAFETY: the read-back buffer's `len` bytes, which the blit finished writing
+            // before its command buffer completed, and which nothing writes meanwhile.
+            let gpu = unsafe {
+                std::slice::from_raw_parts(back.contents().as_ptr::<u8>(), usize_of(len))
+            };
+            // The bytes the run may write past the crop: each row's samples to the even
+            // width, and the even height's last row.
+            let (luma_even, chroma_even) = (even_w * sample, even_w * sample);
+            let past_crop = |i: u64| {
+                let in_plane = |at: u64, rows: u64, even_rows: u64, crop: u64, even: u64| {
+                    let Some(from) = i.checked_sub(at) else {
+                        return false;
+                    };
+                    let (row, column) = (from / pitch, from % pitch);
+                    row < even_rows
+                        && ((row < rows && column >= crop && column < even)
+                            || (row >= rows && column < even))
+                };
+                in_plane(luma_at, height, even_h, luma_bytes, luma_even)
+                    || in_plane(
+                        chroma_at,
+                        chroma_rows,
+                        even_h / 2,
+                        chroma_bytes,
+                        chroma_even,
+                    )
+            };
+            let first = (0..gpu.len()).find(|&i| gpu[i] != cpu[i] && !past_crop(i.to_u64()));
+            if let Some(first) = first {
+                panic!(
+                    "{} picture {id} written into a cache, {width}x{height} at \
+                     {sample}-byte samples, rows of {pitch}: byte {first} is {:#x} by the \
+                     driver's video processing and {:#x} by the CPU's copy (luma at \
+                     {luma_at}, chroma at {chroma_at})",
+                    stream.display(),
+                    gpu[first],
+                    cpu[first]
+                );
+            }
+            drop((bytes, life, cache, back));
+            pictures += 1;
+            true
+        };
+        let refused = each_picture(&display, &streams, PICTURES, &mut each);
         eprintln!(
             "{pictures} pictures of {} streams written into dma-buf caches as by the CPU; \
              declined: {declined:?}; refused: {refused:?}",
@@ -527,6 +531,270 @@ fn a_picture_written_into_a_dma_buf_cache_by_video_processing_is_the_cpus_copy()
         );
         assert!(pictures > 0, "no picture written: {declined:?}");
     });
+}
+
+/// A picture the driver decoded into a surface of its own, written by its video processing into a
+/// surface the platform exported as a dma-buf, laid out as the device asks a dma-buf cache's
+/// surface of the platform (`surface_cache/exported.rs`: each plane an image of `R8Unorm` and
+/// `RG8Unorm`, or `R16Unorm` and `RG16Unorm`, the pitch and the chroma plane's start on 256 bytes,
+/// each plane holding its coded rows below its own), through the surface's memory as the arm hands
+/// it, as a picture lands in its output's cache's surface where the driver's check refused to
+/// decode it there, is the CPU's copy of the same picture in each plane image's crop, read back by
+/// a blit once the platform was told what the driver wrote (`SurfaceMemory::external_writes_done`).
+/// The first [`PICTURES`] pictures of each H.264 and HEVC stream in `RVG_VA_STREAMS`'s
+/// directories, 8 and 10 bits. The surface's luma plane lies at its memory's first byte and its
+/// chroma plane whole rows after it, as a driver whose video processing writes whole rows alone
+/// (iHD's, U26) takes them; a picture the driver's video processing declines is counted and
+/// named, and a stream the decoder refuses is left at its refusal.
+#[test]
+#[ignore = "needs a VA-API GPU and the conformance suite's streams: run on the VA-API host"]
+fn a_picture_written_into_a_dma_buf_caches_surface_by_video_processing_is_the_cpus_copy() {
+    use reims_vgpu_video::core::device_memory::MemoryLife;
+    use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
+    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+    use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+    use reims_vgpu_vulkan::core::platform::resource::{
+        SurfaceDesc, SurfaceHandle, SurfacePlaneDesc,
+    };
+    use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, MtlOrigin, MtlSize};
+    use reims_vgpu_vulkan::core::raise::OnFault;
+
+    /// `MTLPixelFormatR8Unorm` and `RG8Unorm`, then `R16Unorm` and `RG16Unorm`: the plane images'
+    /// formats, by the bytes of a sample.
+    const FORMATS: [[u64; 2]; 2] = [[10, 30], [20, 60]];
+    /// `ShaderRead | RenderTarget | PixelFormatView`.
+    const USAGE: u64 = 0x1 | 0x4 | 0x10;
+    /// The coded rows each plane holds: its rows rounded up to these, luma's and chroma's.
+    const CODED_ROWS: [u64; 2] = [64, 32];
+    let streams = va_streams();
+    let platform = crate::rt_test_end::platform();
+    crate::entry::run(|_| {
+        let device = platform.system_default_device().expect("an rt device");
+        crate::graphics::video_choice::tested_gpu::check_rt(&device, Arm::VaApi);
+        let gpu = device.host_gpu();
+        let node = reims_vgpu_vulkan::host_gpus::render_node_at(gpu.render, gpu.pci);
+        let node = node.expect("a render node");
+        let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
+        let display = Display::open(&node, runtime).expect("a VA display on the device's GPU");
+        let writes = GuestWrites::new(&display);
+        let queue = device.new_command_queue().expect("a queue");
+        let blit_and_wait = |cmd: BlitCmd<'_, reims_vgpu_vulkan::RtPlatform>, what: &str| {
+            let cb = (queue.command_buffer(OnFault::Return))
+                .expect("no raise")
+                .expect("a command buffer");
+            let blit = (cb.blit_encoder(OnFault::Return))
+                .expect("no raise")
+                .expect("a blit encoder");
+            blit.encode(OnFault::Return, cmd).expect(what);
+            blit.encode(OnFault::Return, BlitCmd::EndEncoding)
+                .expect("its end");
+            cb.commit(OnFault::Return).expect("the commit");
+            cb.wait_until_completed(OnFault::Return).expect("the wait");
+            assert_eq!(cb.status(), CommandBufferStatus::COMPLETED, "{what}");
+        };
+        let (mut pictures, mut declined) = (0usize, Vec::new());
+        let mut each = |stream: &std::path::Path, id: u64, frame: &Frame| -> bool {
+            let sample: u64 = if frame.bit_depth() > 8 { 2 } else { 1 };
+            let (width, height) = (u64::from(frame.width()), u64::from(frame.height()));
+            let (even_w, even_h) = (width.next_multiple_of(2), height.next_multiple_of(2));
+            let sizes = [(even_w, even_h), (even_w / 2, even_h / 2)];
+            let planes: [SurfacePlaneDesc; 2] = std::array::from_fn(|n| {
+                let rows = sizes[n].1;
+                SurfacePlaneDesc {
+                    pixel_format: FORMATS[usize_of(sample - 1)][n],
+                    width: sizes[n].0,
+                    height: rows,
+                    usage: USAGE,
+                    rows_below: u32::try_from(rows.next_multiple_of(CODED_ROWS[n]) - rows)
+                        .expect("rows"),
+                }
+            });
+            let desc = SurfaceDesc {
+                handle: SurfaceHandle::DmaBuf,
+                pitch_multiple: TARGET_ALIGNMENT,
+                start_multiple: TARGET_ALIGNMENT,
+                planes: &planes,
+            };
+            let made = (device.new_exported_surface(OnFault::Return, &desc))
+                .expect("no raise")
+                .expect("a dma-buf surface");
+            let laid = made.memory.layout().to_vec();
+            let exported = made.memory.export().expect("the surface's dma-buf");
+            let life = MemoryLife::new();
+            let cache = CacheBytes::<reims_vgpu_vulkan::RtPlatform> {
+                memory: Arc::new(CacheMemory {
+                    dma_buf: exported.fd,
+                    size: exported.allocation_size,
+                    offset: exported.offset,
+                    cache: CacheOf::Surface(Arc::clone(&made.memory)),
+                    last: Mutex::new(None),
+                }),
+                identity: life.identity(),
+            };
+            // Each plane's rows of the image, the luma's samples and the chroma's pairs of them
+            // to the even width.
+            let row = even_w * sample;
+            let place = |n: usize, w: u64, h: u64| Place {
+                offset: laid[n].offset,
+                bytes_per_row: laid[n].row_pitch,
+                row_bytes: row,
+                width: w,
+                height: h,
+                rows_held: sizes[n].1,
+            };
+            let layout = in_place_layout(
+                place(0, width, height),
+                place(1, width.div_ceil(2), height.div_ceil(2)),
+                frame.bit_depth(),
+            )
+            .expect("a layout");
+            let target = GuestTarget::new(&layout, &cache).expect("a target");
+            match frame.write_to_guest(&target, &writes).expect("the write") {
+                DeviceWrite::Written => {}
+                DeviceWrite::Declined(why) => {
+                    declined.push(format!("{} picture {id}: {why}", stream.display()));
+                    return false;
+                }
+            }
+            made.memory.external_writes_done().expect("the acquire");
+            let rows = [height, height.div_ceil(2)];
+            let crop = [width * sample, width.div_ceil(2) * 2 * sample];
+            let mut cpu = [0, 1].map(|n| vec![0u8; usize_of(row * sizes[n].1)]);
+            let [luma, chroma] = &mut cpu;
+            (frame.read_back().expect("the read back"))
+                .copy_into(
+                    plane_rows(luma, row, rows[0], crop[0]),
+                    plane_rows(chroma, row, rows[1], crop[1]),
+                )
+                .expect("the CPU's copy");
+            for n in 0..2 {
+                let len = row * sizes[n].1;
+                let back = (device.new_buffer_of_length(OnFault::Return, len, 0))
+                    .expect("no raise")
+                    .expect("a buffer to read the plane back into");
+                blit_and_wait(
+                    BlitCmd::CopyTextureToBuffer {
+                        source_texture: &made.planes[n],
+                        source_slice: 0,
+                        source_level: 0,
+                        source_origin: MtlOrigin::new(0, 0, 0),
+                        source_size: MtlSize::new(sizes[n].0, sizes[n].1, 1),
+                        destination_buffer: &back,
+                        destination_offset: 0,
+                        destination_bytes_per_row: row,
+                        destination_bytes_per_image: len,
+                    },
+                    "the plane's read back",
+                );
+                // SAFETY: the read-back buffer's `len` bytes, which the blit finished writing
+                // before its command buffer completed, and which nothing writes meanwhile.
+                let gpu = unsafe {
+                    std::slice::from_raw_parts(back.contents().as_ptr::<u8>(), usize_of(len))
+                };
+                for y in 0..rows[n] {
+                    let at = usize_of(y * row);
+                    let (by_gpu, by_cpu) = (
+                        &gpu[at..at + usize_of(crop[n])],
+                        &cpu[n][at..at + usize_of(crop[n])],
+                    );
+                    if let Some(x) = (0..by_gpu.len()).find(|&x| by_gpu[x] != by_cpu[x]) {
+                        panic!(
+                            "{} picture {id} written into a dma-buf cache's surface, \
+                             {width}x{height} at {sample}-byte samples, planes at {laid:?}: \
+                             plane {n} row {y} byte {x} is {:#x} by the driver's video \
+                             processing and {:#x} by the CPU's copy",
+                            stream.display(),
+                            by_gpu[x],
+                            by_cpu[x]
+                        );
+                    }
+                }
+            }
+            drop((cache, life, made));
+            pictures += 1;
+            true
+        };
+        let refused = each_picture(&display, &streams, PICTURES, &mut each);
+        eprintln!(
+            "{pictures} pictures of {} streams written into dma-buf caches' surfaces as by the \
+             CPU; declined: {declined:?}; refused: {refused:?}",
+            streams.len()
+        );
+        assert!(pictures > 0, "no picture written: {declined:?}");
+    });
+}
+
+/// The pictures of each stream the tests of writes into caches write.
+const PICTURES: usize = 4;
+
+/// The H.264 and HEVC streams in `RVG_VA_STREAMS`'s directories, the conformance suite's: their
+/// Annex B forms but the parts a run left.
+fn va_streams() -> Vec<std::path::PathBuf> {
+    let dirs = std::env::var("RVG_VA_STREAMS").expect("RVG_VA_STREAMS: the streams' directories");
+    let mut streams: Vec<std::path::PathBuf> = (dirs.split(':'))
+        .flat_map(|dir| std::fs::read_dir(dir).expect("a streams directory"))
+        .map(|entry| entry.expect("a directory entry").path())
+        .filter(|path| {
+            let name = path.to_string_lossy();
+            (name.ends_with(".264") || name.ends_with(".265")) && !name.contains(".part.")
+        })
+        .collect();
+    streams.sort();
+    assert!(!streams.is_empty(), "no streams in {dirs}");
+    streams
+}
+
+/// Decodes each of `streams` on `display`, in decode order, and hands each frame to `each` with
+/// its stream and its access unit's id, until `each` answered `true` (written) for `most` of the
+/// stream's frames or the stream ends. A stream the decoder refuses is left at its refusal, which
+/// is answered.
+fn each_picture(
+    display: &Display,
+    streams: &[std::path::PathBuf],
+    most: usize,
+    each: &mut dyn FnMut(&std::path::Path, u64, &Frame) -> bool,
+) -> Vec<String> {
+    use reims_vgpu_video::codec::{h264, hevc};
+
+    let mut refused = Vec::new();
+    for stream in streams {
+        let file = std::fs::read(stream).expect("a stream");
+        let (units, mut decoder) = if stream.to_string_lossy().ends_with(".265") {
+            let decoder = HevcDecoder::new_annex_b(display);
+            (hevc::nal::access_units(&file), Codec::Hevc(decoder))
+        } else {
+            let decoder = H264Decoder::new_annex_b(display);
+            (h264::nal::access_units(&file), Codec::H264(decoder))
+        };
+        let mut written = 0;
+        'units: for (id, unit) in units.iter().enumerate() {
+            let id = u64::try_from(id).expect("an id");
+            let frames = match &mut decoder {
+                Codec::H264(d) => d.decode(unit, id),
+                Codec::Hevc(d) => d.decode(unit, id),
+            };
+            let frames = match frames {
+                Ok(frames) => frames,
+                Err(reims_vgpu_video::vaapi::Error::HevcBitstream(
+                    hevc::Error::SkippedLeadingPicture,
+                )) => continue,
+                Err(error) => {
+                    refused.push(format!("{}: {error}", stream.display()));
+                    break;
+                }
+            };
+            for frame in &frames {
+                if each(stream, id, frame) {
+                    written += 1;
+                    if written == most {
+                        break 'units;
+                    }
+                }
+            }
+        }
+    }
+    refused
 }
 
 /// What the GPU's copies leave as it was: every byte past the planes' rows.
