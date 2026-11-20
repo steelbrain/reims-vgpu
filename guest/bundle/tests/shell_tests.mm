@@ -22001,18 +22001,21 @@ void test_iosurface_cached()
 		otherUnlock();
 		CHECK(is(read(), block, 13, refill) && kext.asked == 7);
 		CHECK(is(read(), block, 13, 0) && kext.asked == 7);
-		// A buffer that writes the surface after the unlock carries both flags.
+		// A GPU write moves both seeds. Under a lock held, the next commit asks the refill, which
+		// the host keeps where a buffer wrote the cache since its last copy into the pages, and
+		// leaves the record owed: a buffer that writes the surface after the unlock carries both
+		// flags. A settled record asks nothing after one.
 		otherLock();
 		CHECK(is(read(), block, 14, 0) && kext.asked == 8);
+		kext.lockSeed++;
+		kext.unlockSeed++;
+		CHECK(is(read(), block, 14, refill) && kext.asked == 9);
 		otherUnlock();
 		cb = [queue commandBuffer];
 		[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
-		CHECK(is(uses(cb), block, 14, RGFX_SURFACE_USE_WRITES | refill) && kext.asked == 9);
-		// A GPU write moves both seeds: the next commit asks again, which the host keeps where a
-		// buffer wrote the cache since its last copy into the pages.
+		CHECK(is(uses(cb), block, 14, RGFX_SURFACE_USE_WRITES | refill) && kext.asked == 10);
 		kext.lockSeed++;
 		kext.unlockSeed++;
-		CHECK(is(read(), block, 14, refill) && kext.asked == 10);
 		CHECK(is(read(), block, 14, 0) && kext.asked == 10);
 		// A commit that read the generation before a lock moved it finds the newer generation's
 		// record, and asks nothing.

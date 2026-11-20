@@ -23,8 +23,9 @@
 // A use that finds the unlock seed where the record has it, the lock held still or being taken,
 // asks nothing and leaves the record owed. A lock held again as the record is settled (a lock
 // seed past the unlock seed) leaves it owed at the unlock seed then. A GPU write moves both seeds
-// too, so the first use after one asks again: the host keeps a cache a command buffer wrote
-// since its last copy into the pages (its Refill::Kept), which a fill would lose.
+// too, so the first use after one asks again where the record is owed: the host keeps a cache a
+// command buffer wrote since its last copy into the pages (its Refill::Kept), which a fill would
+// lose. A settled record asks nothing after one.
 //
 // A record of an older generation than the use's (the kext's lost to another holder's write, or
 // none written) is made as a commit names the generation first, as before the kext wrote one:
