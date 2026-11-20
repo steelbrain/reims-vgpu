@@ -105,7 +105,6 @@ fn a_picture_lands_in_an_imported_rt_cache_as_it_reads_back() {
             .expect("NVDEC on the device's GPU");
         lands_in_an_imported_device_cache(&device, &video, &runtime);
     });
-    crate::rt_test_end::drop_last(platform);
 }
 
 /// On the rt platform the guest's caps name each codec NVDEC decodes on the GPU, with the
@@ -177,7 +176,6 @@ fn the_rt_platforms_caps_name_what_nvdec_decodes_and_nvenc_encodes() {
         );
         assert!(video.guest_decodes());
     });
-    crate::rt_test_end::drop_last(platform);
 }
 
 /// The body of the imported cache's tests, on `P`'s `device`, NVDEC's arm on it `video`.
@@ -374,7 +372,6 @@ fn an_encode_first_processs_waits_run_on_the_arms_runtime() {
                 "NVENC's lock thread was not the arm's runtime's: it started {started:?}"
             );
         });
-        crate::rt_test_end::drop_last(platform);
         return;
     }
     let name = "graphics::nvidia::tests::an_encode_first_processs_waits_run_on_the_arms_runtime";
@@ -644,7 +641,6 @@ fn a_videotoolbox_picture_lands_in_the_lent_surfaces_pages_as_it_reads_back() {
             }
         }
     });
-    crate::rt_test_end::drop_last(platform);
 }
 
 /// The CPU's copy of a picture read back lands each plane's rows at the surface's offset and

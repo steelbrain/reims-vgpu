@@ -619,7 +619,6 @@ fn each_frame_filled_by_the_gpu_encodes_as_uploaded_on_rt() {
         assert!(video.imports.is_some(), "CUDA imports no rt export");
         frames_filled_by_the_gpu_encode_as_uploaded(&device, &video);
     });
-    crate::rt_test_end::drop_last(platform);
 }
 
 /// The body of the fill tests, on `P`'s `device`, NVENC's arm on it `video`.

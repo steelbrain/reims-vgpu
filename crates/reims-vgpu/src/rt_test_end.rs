@@ -24,16 +24,19 @@
 //! Unix only: Windows runs a thread's destructors under the loader lock, which a thread started
 //! or joined there waits for. There a test's process exits with the device as before.
 //!
-//! A test that hands its platform to the video crate (a VA display's runtime, an NVDEC or NVENC
-//! session's) drops it with `drop_last` (Linux's): the threads of what it made there hold the
-//! platform until they end, behind the test's own drops, and the platform's last hold destroys
-//! rt's instance and closes the Vulkan loader, which unloads the drivers. Where that hold is a
-//! video thread's, ending as the process exits, NVIDIA's EGL library, which NVIDIA's Vulkan
-//! driver loaded, is unloaded beside the exit's handlers: on an i9-13900H's Iris Xe, with NVIDIA
-//! 620.70.06 installed beside Mesa 26.2.6, `graphics::vaapi`'s tests of writes into dma-buf caches
-//! printed ok and then died of `SIGSEGV` in 3 of 9 processes, at `libEGL_nvidia.so.0` + 0xa28c2
-//! after its link map was destroyed, its own finaliser having left the libraries it loaded mapped
-//! (**measured**, `LD_DEBUG=files`, 2026-11-20; docs/lessons.md).
+//! A test that hands its platform to the video crate's VA-API arm (a VA display's runtime) drops
+//! it with `drop_last` (Linux's): the threads of what it made there hold the platform until they
+//! end, behind the test's own drops, and the platform's last hold destroys rt's instance and
+//! closes the Vulkan loader, which unloads the drivers. Where that hold is a video thread's,
+//! ending as the process exits, NVIDIA's EGL library, which NVIDIA's Vulkan driver loaded, is
+//! unloaded beside the exit's handlers: on an i9-13900H's Iris Xe, with NVIDIA 620.70.06
+//! installed beside Mesa 26.2.6, `graphics::vaapi`'s tests of writes into dma-buf caches printed
+//! ok and then died of `SIGSEGV` in 3 of 9 processes, at `libEGL_nvidia.so.0` + 0xa28c2 after its
+//! link map was destroyed, its own finaliser having left the libraries it loaded mapped
+//! (**measured**, `LD_DEBUG=files`, 2026-11-20; docs/lessons.md). The NVIDIA crate keeps the
+//! first runtime it is opened with, and so the platform in it, for the process's life (its waits'
+//! `RUNTIME`): an NVDEC or NVENC test's platform is never dropped, and `drop_last` would wait for
+//! good there (**measured**: 6 such tests on an RTX 3090 each failed its bound, 2026-11-20).
 
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
@@ -61,7 +64,7 @@ const LAST_BOUND: Duration = Duration::from_secs(30);
 /// Drops `platform`, a test's own ([`platform`]), once its other holds ended, on the test's
 /// thread: rt's instance and the Vulkan loader then go before the test returns, not beside the
 /// process's exit (the module docs). Fails the test where another hold outlives [`LAST_BOUND`].
-/// Linux's video tests alone hand a platform to the video crate's threads.
+/// Linux's VA-API tests alone hand a platform to video threads that end (the module docs).
 #[cfg(target_os = "linux")]
 pub(crate) fn drop_last(platform: Arc<RtPlatform>) {
     const POLL: Duration = Duration::from_millis(1);
