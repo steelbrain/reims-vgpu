@@ -1175,7 +1175,10 @@ pub fn keep_refused_compute(sel: &str, error: &rt::Error, d: &rt::ComputePipelin
 /// [`REFUSED_AIR_VAR`] names a directory, keeps its functions' AIR and the state's record there
 /// (the module's docs).
 pub fn keep_refused_render(sel: &str, error: &rt::Error, d: &rt::RenderPipelineDescriptor) {
-    let stages = [("vertex", Some(&d.vertex)), ("fragment", d.fragment.as_ref())];
+    let stages = [
+        ("vertex", Some(&d.vertex)),
+        ("fragment", d.fragment.as_ref()),
+    ];
     keep_refused_air(sel, error, &stages, || render_fields(d));
 }
 
@@ -1242,7 +1245,10 @@ fn keep_air_in(
     }
     let key = format!("{sel}; {}", named.join(", "));
     if !kept.refusals.contains(&key) {
-        append(&dir.join("refused.txt"), &format!("{key}; refused: {why}\n"))?;
+        append(
+            &dir.join("refused.txt"),
+            &format!("{key}; refused: {why}\n"),
+        )?;
         kept.refusals.insert(key.clone());
     }
     let body: String = (record.iter()).map(|line| format!("  {line}\n")).collect();
@@ -1290,9 +1296,9 @@ fn stage_lines(out: &mut Vec<String>, role: &str, f: &rt::FunctionDescriptor) {
         ("private functions", &linked.private_functions),
         ("binary functions", &linked.binary_functions),
     ];
-    let listed = kinds.into_iter().flat_map(|(kind, fs)| {
-        fs.iter().map(move |l| (kind.to_owned(), l))
-    });
+    let listed = kinds
+        .into_iter()
+        .flat_map(|(kind, fs)| fs.iter().map(move |l| (kind.to_owned(), l)));
     let grouped = groups.map(|(name, l)| (format!("group {name}"), l));
     for (kind, l) in listed.chain(grouped) {
         let prefix = format!("{role} linked {kind}");
@@ -1328,12 +1334,22 @@ fn constant_lines(
     for (index, v) in &values.by_index {
         let name = (declared.iter()).find(|c| c.index == Some(*index));
         let name = name.map_or("?", |c| c.name.as_str());
-        out.push(format!("{prefix} constant #{index} {name}: {:?} {}", v.ty, hex(&v.bytes)));
+        out.push(format!(
+            "{prefix} constant #{index} {name}: {:?} {}",
+            v.ty,
+            hex(&v.bytes)
+        ));
     }
     for (name, v) in &values.by_name {
-        let index = (declared.iter()).find(|c| c.name == *name).and_then(|c| c.index);
+        let index = (declared.iter())
+            .find(|c| c.name == *name)
+            .and_then(|c| c.index);
         let index = index.map_or_else(|| "?".to_owned(), |i| i.to_string());
-        out.push(format!("{prefix} constant #{index} {name} (by name): {:?} {}", v.ty, hex(&v.bytes)));
+        out.push(format!(
+            "{prefix} constant #{index} {name} (by name): {:?} {}",
+            v.ty,
+            hex(&v.bytes)
+        ));
     }
     for c in declared {
         let valued = c.index.is_some_and(|i| values.by_index.contains_key(&i))
@@ -1341,7 +1357,10 @@ fn constant_lines(
         if !valued {
             let index = c.index.map_or_else(|| "?".to_owned(), |i| i.to_string());
             let ty = c.ty.map_or_else(|| "?".to_owned(), |t| format!("{t:?}"));
-            out.push(format!("{prefix} constant #{index} {}: {ty} undefined", c.name));
+            out.push(format!(
+                "{prefix} constant #{index} {}: {ty} undefined",
+                c.name
+            ));
         }
     }
 }
@@ -2118,7 +2137,10 @@ mod tests {
         let records = std::fs::read_to_string(dir.join("records.txt")).expect("the records");
         let header = format!(": sel:; {function}, {function}; refused: a refusal\n");
         assert_eq!(records.lines().count(), 1, "{records}");
-        assert!(records.starts_with("record ") && records.ends_with(&header), "{records}");
+        assert!(
+            records.starts_with("record ") && records.ends_with(&header),
+            "{records}"
+        );
         std::fs::remove_dir_all(&dir).expect("removed");
     }
 
@@ -2156,14 +2178,21 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("removed");
         let function = function_name(&f);
         let header = format!(": sel:; {function}; refused: a refusal");
-        let starts: Vec<&str> = records.lines().filter(|l| l.starts_with("record ")).collect();
+        let starts: Vec<&str> = records
+            .lines()
+            .filter(|l| l.starts_with("record "))
+            .collect();
         assert_eq!(starts.len(), 2, "{records}");
         assert!(starts.iter().all(|l| l.ends_with(&header)), "{records}");
         let lines: Vec<&str> = records.lines().map(str::trim).collect();
         let has = |line: &str| assert!(lines.contains(&line), "no {line:?} in {records}");
         has(&format!("kernel: {function}; specialized true"));
-        has(&format!("kernel constant #0 optional_value: {int_name} 05000000"));
-        has(&format!("kernel constant #0 optional_value: {int_name} undefined"));
+        has(&format!(
+            "kernel constant #0 optional_value: {int_name} 05000000"
+        ));
+        has(&format!(
+            "kernel constant #0 optional_value: {int_name} undefined"
+        ));
         has("descriptor threadgroup_size_is_multiple_of_execution_width: true");
         has("descriptor max_call_stack_depth: 3");
         has("descriptor max_total_threads_per_threadgroup: None");
