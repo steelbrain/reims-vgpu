@@ -1,6 +1,6 @@
 use metal2vulkan_rt::{
-    CommandBuffer, CommandBufferStatus, Device, MemoryClass, PixelFormat, TextureDescriptor,
-    TextureType, TextureUsage,
+    CommandBuffer, CommandBufferStatus, Device, IndexClass, MemoryClass, PixelFormat,
+    TextureDescriptor, TextureType, TextureUsage,
 };
 
 use super::*;
@@ -22,12 +22,16 @@ fn device() -> Device {
     device
 }
 
-/// A texture the copies reach, with no shader usage, so rt takes no index for it.
+/// A texture the copies reach: a colour render target, which rt places at an index, as a fragment
+/// function reads a colour target through its attachment; at the first index of the class, which
+/// the test's own device grants.
 fn texture(device: &Device) -> Texture {
     let mut descriptor =
         TextureDescriptor::new(TextureType::Type2D, PixelFormat::RGBA8Unorm, SIDE, SIDE);
     descriptor.usage = TextureUsage::RENDER_TARGET;
-    device.new_texture(&descriptor, None).unwrap()
+    let first = IndexClass::Texture.range().start;
+    let grant = device.grant_indices(IndexClass::Texture, first, 1).unwrap();
+    device.new_texture(&descriptor, Some(grant.first)).unwrap()
 }
 
 /// The whole texture's bytes from a buffer's first, row after row.
