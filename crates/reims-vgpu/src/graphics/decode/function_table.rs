@@ -408,11 +408,14 @@ mod tests {
     const VISIBLE_TABLES: &[u8] =
         include_bytes!("../../../../reims-vgpu-vulkan/metallibs/visible_tables.metallib");
 
+    /// Each decode's answer, and each reply's pipeline id and status, in order
+    /// ([`table_pipelines`]).
+    type Made = (Vec<Result<(), DecodeError>>, Vec<(u64, u32)>);
+
     /// The creates of `table_kernel`'s and `table_arg_kernel`'s pipelines through the decoder on
     /// platform `P`, each linking `table_add1` and `table_mul2`: each decode's answer, and each
     /// reply's pipeline id and status, in order.
-    fn table_pipelines<P: crate::platform::ApiPlatform>()
-    -> (Vec<Result<(), DecodeError>>, Vec<(u64, u32)>) {
+    fn table_pipelines<P: crate::platform::ApiPlatform>() -> Made {
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
