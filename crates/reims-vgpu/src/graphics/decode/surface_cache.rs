@@ -14140,10 +14140,8 @@ pub(super) mod tests {
             let locked = counted(PIECE_MAKES_LOCKED);
             let mark = r.p.call_log().mark();
             match finished {
-                true => {
-                    (caches.finish(&r.device, 7, None, &cb, uses.unwrap(), || cb.commit(ON)))
-                        .unwrap()
-                }
+                true => (caches.finish(&r.device, 7, None, &cb, uses.unwrap(), || cb.commit(ON)))
+                    .unwrap(),
                 false => drop(uses),
             }
             let calls = r.p.call_log().since(mark);
@@ -14152,7 +14150,9 @@ pub(super) mod tests {
             assert!(
                 (calls.iter())
                     .filter(|c| c.sel == SCRATCH_BUFFER)
-                    .filter(|c| !(c.thread.as_deref()).is_some_and(|t| t.starts_with(SPARES_THREADS)))
+                    .filter(
+                        |c| !(c.thread.as_deref()).is_some_and(|t| t.starts_with(SPARES_THREADS))
+                    )
                     .all(|c| c.thread == here),
                 "finished {finished}: its pieces, made by the thread that let go of the writer"
             );
@@ -14181,10 +14181,17 @@ pub(super) mod tests {
             RGFX_STATUS_OK
         );
         let calls = r.p.call_log().since(mark);
-        assert_eq!(copies(&calls).len(), 2, "its write copied out, then its fill");
+        assert_eq!(
+            copies(&calls).len(),
+            2,
+            "its write copied out, then its fill"
+        );
         let (_, made) = scratch_made(&calls);
         let lens = pack(std::iter::once(0..length), PIECE).lens;
-        assert!(made.len() <= 2 * lens.len(), "{made:?}: one copy's pieces each");
+        assert!(
+            made.len() <= 2 * lens.len(),
+            "{made:?}: one copy's pieces each"
+        );
         assert_eq!(
             counted(PIECE_MAKES_LOCKED),
             locked,
