@@ -10108,8 +10108,15 @@ pub(super) mod tests {
             eventually(|| copies(&r.p.call_log().since(mark)).len() == 1),
             "past it: copied with the first's still in flight"
         );
-        r.p.world().complete_all(CompleteOn::Caller);
-        assert!(first.load(Ordering::SeqCst) && second.load(Ordering::SeqCst));
+        // The pace's thread commits the copy's command buffer after it encodes the copy, which
+        // the log shows first: what completes it waits for that commit.
+        assert!(
+            eventually(|| {
+                r.p.world().complete_all(CompleteOn::Caller);
+                first.load(Ordering::SeqCst) && second.load(Ordering::SeqCst)
+            }),
+            "each answered as its copy lands"
+        );
     }
 
     /// A release's turn comes once no other's is out and the last release's copy landed as long
