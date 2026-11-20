@@ -29,8 +29,10 @@
 //!   its handlers and `error` read the same one.
 //! - **A lost device's line.** rt writes nothing at a loss, and nothing makes the device again:
 //!   the first of its command buffers that fails with the device lost writes one line on stderr
-//!   for the device, naming its GPU (name, PCI vendor and device IDs) and how many of its command
-//!   buffers were committed and not complete then, the one failing among them ([`DeviceLoss`]).
+//!   for the device, naming its GPU (name, PCI vendor and device IDs), the Vulkan call rt took the
+//!   device as lost at and what it returned (rt's `Device::loss`, set before any command buffer
+//!   ends with the device lost), and how many of its command buffers were committed and not
+//!   complete then, the one failing among them ([`DeviceLoss`]).
 //!   Each command buffer that fails with the device lost is counted, `rt-device-lost`, in the
 //!   process's degradation counts (docs/conventions.md).
 //!   One its caller failed for a deferred buffer's memory rt refused
@@ -362,6 +364,8 @@ struct Failure {
     error: OnceLock<NsErrorText>,
     /// Its device's loss ([`RtDevice::loss`]).
     loss: Arc<DeviceLoss>,
+    /// rt's cause of its device's loss (rt's `Device::loss`), which the loss's line names.
+    cause: Box<dyn Fn() -> Option<rt::DeviceLoss> + Send + Sync>,
 }
 
 impl Failure {
@@ -370,7 +374,7 @@ impl Failure {
         let error = error?;
         Some(
             self.error
-                .get_or_init(|| ns_error(error, &self.loss))
+                .get_or_init(|| ns_error(error, &self.loss, &*self.cause))
                 .clone(),
         )
     }
@@ -410,15 +414,19 @@ impl DeviceLoss {
     }
 
     /// A command buffer failed with the device lost: counted, and the first writes the loss's
-    /// line (the module's docs, "A lost device's line").
-    fn lost(&self) {
+    /// line, with rt's cause, which `cause` reads (the module's docs, "A lost device's line").
+    fn lost(&self, cause: &dyn Fn() -> Option<rt::DeviceLoss>) {
         crate::answer::count_kind(DEVICE_LOST);
         if self.said.swap(true, Ordering::SeqCst) {
             return;
         }
         let open = self.open.load(Ordering::SeqCst).max(0);
+        let at = match cause() {
+            Some(rt::DeviceLoss { call, result }) => format!(" at {call} ({result:?})"),
+            None => " with no call rt named".to_owned(),
+        };
         say_lost(&format!(
-            "reims-vgpu: the rt platform's device on {} was lost, with {open} command buffers \
+            "reims-vgpu: the rt platform's device on {} was lost{at}, with {open} command buffers \
              committed and not complete: every command buffer fails from here on, and nothing \
              makes the device again ({DEVICE_LOST})\n",
             self.gpu
@@ -484,9 +492,11 @@ impl RtCommandBuffer {
         queue: rt::CommandQueue,
         device: RtObj<RtDevice>,
     ) -> RtCommandBuffer {
+        let rt_device = queue.device().clone();
         let failure = Arc::new(Failure {
             error: OnceLock::new(),
             loss: Arc::clone(device.loss()),
+            cause: Box::new(move || rt_device.loss()),
         });
         RtCommandBuffer {
             rt: made,
@@ -800,10 +810,15 @@ fn status(status: rt::CommandBufferStatus) -> CommandBufferStatus {
 
 /// rt's error as Metal's `NSError` (the module's docs): `Timeout` for the first command buffer
 /// lost in flight on the device whose loss is `loss`, `Internal` for any other; a command buffer
-/// that fails with its device lost tells `loss` ([`DeviceLoss::lost`]).
-fn ns_error(error: rt::CommandBufferError, loss: &DeviceLoss) -> NsErrorText {
+/// that fails with its device lost tells `loss`, with rt's cause, which `cause` reads
+/// ([`DeviceLoss::lost`]).
+fn ns_error(
+    error: rt::CommandBufferError,
+    loss: &DeviceLoss,
+    cause: &dyn Fn() -> Option<rt::DeviceLoss>,
+) -> NsErrorText {
     if let rt::CommandBufferError::DeviceLost { .. } = error {
-        loss.lost();
+        loss.lost(cause);
     }
     let code = match error {
         rt::CommandBufferError::DeviceLost { in_flight: true }
@@ -1375,7 +1390,7 @@ mod tests {
         let codes = |errors: &[rt::CommandBufferError]| {
             let loss = DeviceLoss::new("a GPU".to_owned());
             (errors.iter())
-                .map(|&e| ns_error(e, &loss))
+                .map(|&e| ns_error(e, &loss, &|| None))
                 .inspect(|e| assert_eq!(e.domain, ERROR_DOMAIN))
                 .map(|e| e.code)
                 .collect::<Vec<_>>()
@@ -1390,6 +1405,7 @@ mod tests {
         let failure = |loss: &Arc<DeviceLoss>| Failure {
             error: OnceLock::new(),
             loss: Arc::clone(loss),
+            cause: Box::new(|| None),
         };
         let (first, second) = (failure(&loss), failure(&loss));
         assert_eq!(first.read(None), None);
@@ -1409,9 +1425,10 @@ mod tests {
     }
 
     /// A lost device writes one line, at the first of its command buffers that fails with it lost,
-    /// naming its GPU and how many of its command buffers were committed and not complete then,
-    /// the failing one among them; each command buffer that fails so is counted, once however
-    /// often its error is read (the module's docs, "A lost device's line").
+    /// naming its GPU, the Vulkan call rt took it as lost at and what it returned, and how many of
+    /// its command buffers were committed and not complete then, the failing one among them; each
+    /// command buffer that fails so is counted, once however often its error is read (the
+    /// module's docs, "A lost device's line"). Where rt names no call, the line says so.
     #[test]
     fn a_lost_device_writes_one_line_and_counts_each_command_buffer() {
         use rt::CommandBufferError::{DeviceLost, NotRun};
@@ -1421,6 +1438,12 @@ mod tests {
         let failure = || Failure {
             error: OnceLock::new(),
             loss: Arc::clone(&loss),
+            cause: Box::new(|| {
+                Some(rt::DeviceLoss {
+                    call: "vkQueueSubmit2",
+                    result: ash::vk::Result::ERROR_DEVICE_LOST,
+                })
+            }),
         };
         let (first, second, third) = (failure(), failure(), failure());
         // Three committed (`RtCommandBuffer::commit`'s count).
@@ -1437,13 +1460,31 @@ mod tests {
         assert_eq!(
             said(),
             [
-                "reims-vgpu: the rt platform's device on A GPU (1234:5678) was lost, with 2 command \
-                 buffers committed and not complete: every command buffer fails from here on, and \
-                 nothing makes the device again (rt-device-lost)\n"
+                "reims-vgpu: the rt platform's device on A GPU (1234:5678) was lost at \
+                 vkQueueSubmit2 (ERROR_DEVICE_LOST), with 2 command buffers committed and not \
+                 complete: every command buffer fails from here on, and nothing makes the device \
+                 again (rt-device-lost)\n"
             ]
         );
         assert_eq!(counted(DEVICE_LOST), before + 2);
         assert_eq!(loss.open.load(Ordering::SeqCst), 0);
+        // Another device, whose loss rt names no call for.
+        let other = Arc::new(DeviceLoss::new("B GPU (1234:9abc)".to_owned()));
+        other.open.fetch_add(1, Ordering::SeqCst);
+        let unnamed = Failure {
+            error: OnceLock::new(),
+            loss: Arc::clone(&other),
+            cause: Box::new(|| None),
+        };
+        unnamed.completed(Some(DeviceLost { in_flight: true }));
+        assert_eq!(
+            said().last().map(String::as_str),
+            Some(
+                "reims-vgpu: the rt platform's device on B GPU (1234:9abc) was lost with no call \
+                 rt named, with 1 command buffers committed and not complete: every command \
+                 buffer fails from here on, and nothing makes the device again (rt-device-lost)\n"
+            )
+        );
     }
 
     /// On the GPU the test holds: a command buffer its caller failed for a deferred buffer's
