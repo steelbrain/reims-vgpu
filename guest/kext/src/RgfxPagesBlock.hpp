@@ -14,7 +14,7 @@
 // Memory the bundle names unchanging (kRgfxPagesUnchanging) takes a block where the guest took
 // RGFX_FEATURE_UNCHANGING_PAGES too: read-only memory its process can never write and no one else
 // writes, mapped with no write in the mapping's maximum protection, a file's pages on a read-only
-// volume or anonymous memory of the process's own, as the bundle finds it at the call (its
+// volume or anonymous memory with a copy pending, as the bundle finds it at the call (its
 // RgfxFilePages.hpp). It is the app's own memory, wired for reading as any read-only memory is: a
 // shared mapping's pages are the file's own, and a private copy-on-write one's are copied for the
 // process by the wire, as IOMemoryDescriptor::prepare's vm_map_create_upl resolves the entry's

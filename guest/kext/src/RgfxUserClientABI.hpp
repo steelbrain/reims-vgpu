@@ -72,7 +72,7 @@ enum {
 	// where the device took RGFX_FEATURE_READ_ONLY_PAGES: the host lets only objects whose GPU
 	// writes it drops lie over it. Memory named unchanging (kRgfxPagesUnchanging,
 	// kRgfxKextFeatureUnchangingPages) is read-only memory the process can never write and no one
-	// else writes, a file's pages on a read-only volume or anonymous memory of the process's own
+	// else writes, a file's pages on a read-only volume or anonymous memory with a copy pending
 	// (the bundle's RgfxFilePages.hpp), wired for reading as read-only memory is, and its
 	// SURFACE_PAGES marked RGFX_SURFACE_PAGES_UNCHANGING too, and
 	// RGFX_SURFACE_PAGES_COPY_ON_WRITE where it is also named so, where the device took
@@ -378,8 +378,8 @@ enum {
 
 // How the process maps the memory of a PagesBlock (4), its third scalar in: writable; unchanging,
 // read-only memory the process can never write and no one else writes, mapped with no write in
-// the mapping's maximum protection, a file's pages on a read-only volume or anonymous memory of
-// the process's own (kRgfxKextFeatureUnchangingPages; never with kRgfxPagesWritable);
+// the mapping's maximum protection, a file's pages on a read-only volume or anonymous memory with a
+// copy pending (kRgfxKextFeatureUnchangingPages; never with kRgfxPagesWritable);
 // copy-on-write, which only unchanging memory is named, where the process maps the file's pages
 // private or the anonymous memory with a copy pending; and for read-only memory not named
 // unchanging, in the bits from

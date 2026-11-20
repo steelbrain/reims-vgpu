@@ -29,31 +29,31 @@
  *
  * UNCHANGING ANONYMOUS MEMORY. Memory no pager stands behind (no object of the region's chain is
  * a file's or a device's: mach_vm_region_recurse's external_pager 0, and no submap) cannot change
- * where its maximum protection has no write and the kernel answers one of two share modes for it,
- * as xnu's osfmk/vm/vm_map.c computes them in vm_map_region_walk (lines 16088-16098 of xnu's main
- * as read on 2026-11-20; the modes' values are osfmk/mach/vm_region.h:129-130):
- *   - SM_PRIVATE (kRgfxAnonymousPrivate): no shadow, no copy pending, and the object held by one
- *     reference, the region's, so no other mapping, in this process or another, reaches its
- *     pages. None with write can be made after: a mapping or memory entry that shares the region
- *     takes no protection the region's maximum lacks (vm_map_remap_extract, vm_map.c:18037-18058
- *     and 18733-18734), and vm_protect's VM_PROT_COPY maps a copy in the region's place, leaving
- *     its pages as they are (vm_map_protect, vm_map.c:5832-5905);
- *   - SM_COW with a shadow depth of 0 (kRgfxAnonymousCopyOnWrite): a copy pending on the region's
- *     own object, which has no object below it, as a copy of anonymous memory leaves the entries
- *     of both sides over the one object, each with a copy pending (vm_object_copy_quickly,
- *     osfmk/vm/vm_object.c:3586-3605; the source's entry marked at vm_map.c:12727, 14046 and
- *     18604, for vm_copy, fork and vm_remap). The other side's write goes to a copy of the
- *     other side's own: a write through an entry whose copy is pending shadows the entry first
- *     (vm_map_lookup_and_lock_object, vm_map.c:14866-14897), and an entry shared from one whose
- *     copy is pending shares a shadow of its own (vm_map_remap_extract, vm_map.c:18314-18396).
- *     A region of shadow depth 1 or more leaves in doubt whether another mapping shares its top
- *     object, writable, so it is neither.
- * Every other share mode is neither (shared, truly shared, aliased within the process, empty,
- * large pages), and so is memory whose maximum protection has write, why not a file.
- * The one doubt SM_PRIVATE leaves: the walk takes one from the object's reference count while
- * the object pages (vm_map.c:16002-16005), so an object two mappings hold, one of them another's
- * with write, reads SM_PRIVATE for as long as a page-out or UPL of one of its pages runs. No
- * query answers the count without it.
+ * where its maximum protection has no write and the kernel answers it SM_COW with a shadow depth
+ * of 0 (kRgfxAnonymousCopyOnWrite), as xnu's osfmk/vm/vm_map.c computes the share mode in
+ * vm_map_region_walk (lines 16088-16098 of xnu's main as read on 2026-11-20; the modes' values are
+ * osfmk/mach/vm_region.h:129-130): a copy pending on the region's own object, which has no object
+ * below it. Such a copy is vm_object_copy_quickly's of an object whose copy strategy is still
+ * symmetric (osfmk/vm/vm_object.c:3586-3605; the source's entry marked at vm_map.c:12727, 14046
+ * and 18604, for vm_copy, fork and vm_remap), which leaves the entries of both sides over the one
+ * object, each with a copy pending; the object was not wired before it, as a wire makes its
+ * object's copy strategy a delayed one (vm_object_iopl_request, osfmk/vm/vm_pageout.c:8404-8423).
+ * The other side's write goes to a copy of the other side's own: a write through an entry whose
+ * copy is pending shadows the entry first (vm_map_lookup_and_lock_object, vm_map.c:14866-14897),
+ * and so do a wire (vm_map_create_upl, vm_pageout.c:7140-7188) and an entry shared from it
+ * (vm_map_remap_extract, vm_map.c:18314-18396). A share of the region takes no protection its
+ * maximum lacks (vm_map_remap_extract, vm_map.c:18037-18058 and 18733-18734), and vm_protect's
+ * VM_PROT_COPY maps a copy in its place, leaving its pages as they are (vm_map_protect,
+ * vm_map.c:5832-5905).
+ * Every other share mode is neither, why not a file, and so is memory whose maximum protection
+ * has write. SM_COW at a shadow depth of 1 or more leaves in doubt whether another mapping shares
+ * the region's top object with write. SM_PRIVATE leaves in doubt that no one else writes the
+ * object's pages: the walk takes one from the object's reference count while the object pages
+ * (vm_map.c:16002-16005), so an object another mapping holds reads private while paging on it is
+ * in progress; and a wire holds no reference (vm_object_iopl_request,
+ * vm_pageout.c:8331; upl_destroy, 5683-5685), so a driver's wire for writing, taken while the
+ * memory was writable, our own kext's for a writable block among them, writes its pages still
+ * after the maximum protection lost write, under a count of one.
  *
  * THE PAGES THE KEXT WIRES are the app's own, as for any pages block. A shared mapping's are the
  * file's pages. A private mapping needs a copy (xnu's vm_map_create_upl resolves it, and
@@ -87,8 +87,6 @@ enum RgfxFileClause : uint8_t {
 	kRgfxFileMaxNoWrite = 0,
 	// A private copy-on-write mapping of the file whose maximum protection has no write.
 	kRgfxFileCopyOnWrite,
-	// Anonymous memory whose maximum protection has no write, of share mode SM_PRIVATE.
-	kRgfxAnonymousPrivate,
 	// Anonymous memory whose maximum protection has no write, of share mode SM_COW with a shadow
 	// depth of 0: a copy pending on the region's own object.
 	kRgfxAnonymousCopyOnWrite,

@@ -61,7 +61,7 @@
 //!   flight among it.
 //! - **Unchanging pages** ([`Kind::Unchanging`]): a copy of pages whose GPU writes are dropped
 //!   that no one writes while the block lives, a file's own on a volume mounted read-only or
-//!   anonymous memory of their process's own (`RGFX_SURFACE_PAGES_UNCHANGING`, the guest's word,
+//!   anonymous memory with a copy pending (`RGFX_SURFACE_PAGES_UNCHANGING`, the guest's word,
 //!   read once as the copy is made).
 //!   Such a copy has no base and is never copied in: its bytes are the pages' as it was made. At
 //!   each completion of a command buffer that can write it, the whole of the copy is written

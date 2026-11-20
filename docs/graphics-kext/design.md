@@ -2120,7 +2120,7 @@ only where no negotiation can carry it.
 - Bit 31 is `UNCHANGING_PAGES`, which means nothing without
   `READ_ONLY_PAGES`: a read-only pages block may be of pages its process can
   never write and no one else writes, a file's on a volume mounted read-only
-  or anonymous memory of the process's own, and its `SURFACE_PAGES` then
+  or anonymous memory with a copy pending, and its `SURFACE_PAGES` then
   carries `RGFX_SURFACE_PAGES_UNCHANGING` (1 << 6), with
   `RGFX_SURFACE_PAGES_COPY_ON_WRITE` (1 << 7) where the process maps them
   private and copy-on-write. The host reads such a block's pages once, as its
@@ -5133,33 +5133,32 @@ or as anonymous memory. A file's pages cannot change where:
 
 Anonymous memory, in one region with no submap and no pager behind it
 (`mach_vm_region_recurse`'s `external_pager` 0), cannot change where its
-maximum protection has no write and the kernel answers one of two share modes
-for it (xnu's `vm_map_region_walk`, `osfmk/vm/vm_map.c:16088-16098` of its
-main as read on 2026-11-20):
+maximum protection has no write and the kernel answers it `SM_COW` at shadow
+depth 0 (xnu's `vm_map_region_walk`, `osfmk/vm/vm_map.c:16088-16098` of its
+main as read on 2026-11-20): a copy pending on the region's own object. Such a
+copy is `vm_object_copy_quickly`'s of an object whose copy strategy is still
+symmetric (`osfmk/vm/vm_object.c:3586-3605`; the source's entry marked at
+`vm_map.c:12727`, `14046` and `18604`), which leaves both sides' entries over
+the one object, each with its copy pending, and the object was not wired
+before it, as a wire makes its object's copy strategy a delayed one
+(`vm_object_iopl_request`, `osfmk/vm/vm_pageout.c:8404-8423`). The other
+side's write goes to a copy of its own: a write through an entry whose copy is
+pending shadows it first (`vm_map_lookup_and_lock_object`,
+`vm_map.c:14866-14897`), and so do a wire (`vm_map_create_upl`,
+`vm_pageout.c:7140-7188`) and a share of it (`vm_map_remap_extract`,
+`vm_map.c:18314-18396`). A share of the region takes no protection its maximum
+lacks (`vm_map.c:18037-18058` and `18733-18734`).
 
-- `SM_PRIVATE`: no shadow, no copy pending, and the object held by the
-  region's reference alone, so no other mapping reaches its pages, and none
-  that writes can be made after: a share of the region takes no protection its
-  maximum lacks (`vm_map_remap_extract`, `vm_map.c:18037-18058` and
-  `18733-18734`), and `VM_PROT_COPY` maps a copy in the region's place
-  (`vm_map_protect`, `vm_map.c:5832-5905`);
-- `SM_COW` at shadow depth 0: a copy pending on the region's own object, as a
-  copy of anonymous memory leaves both sides' entries over the one object, each
-  with its copy pending (`vm_object_copy_quickly`,
-  `osfmk/vm/vm_object.c:3586-3605`; the source's entry marked at
-  `vm_map.c:12727`, `14046` and `18604`). The other side's write goes to a copy
-  of its own: a write through an entry whose copy is pending shadows it first
-  (`vm_map_lookup_and_lock_object`, `vm_map.c:14866-14897`), and so does a
-  share of it (`vm_map_remap_extract`, `vm_map.c:18314-18396`).
-
-At a shadow depth of 1 or more another mapping may share the region's top
-object with write, so such memory is neither, as is every other share mode
-(shared, truly shared, aliased, empty, large pages) and memory whose maximum
-protection has write: why not a file. The one doubt `SM_PRIVATE` leaves: the
-walk takes one from the object's reference count while the object pages
-(`vm_map.c:16002-16005`), so an object two mappings hold, one of them another's
-with write, reads `SM_PRIVATE` while a page-out or UPL of one of its pages
-runs, and no query answers the count without it.
+Every other share mode is neither, why not a file, and so is memory whose
+maximum protection has write. At a shadow depth of 1 or more another mapping
+may share the region's top object with write. `SM_PRIVATE` leaves in doubt
+that no one else writes the object's pages: the walk takes one from the
+object's reference count while paging on the object is in progress
+(`vm_map.c:16002-16005`), and a wire holds no reference
+(`vm_object_iopl_request`, `vm_pageout.c:8331`; `upl_destroy`, `5683-5685`),
+so a driver's wire for writing taken while the memory was writable, our own
+kext's for a writable block among them, still writes the pages after the
+maximum protection lost write, under a count of one.
 
 The block is of the app's own memory, as every pages block is, named
 `kRgfxPagesUnchanging` (and `kRgfxPagesCopyOnWrite`). The kext wires it for
@@ -5172,8 +5171,8 @@ the wired pages are the process's copy of the file's bytes, as a Mac's
 driver's wire of an app's memory makes it (read from xnu's
 `osfmk/vm/vm_pageout.c`, which holds both). Anonymous memory's wire takes the
 region's pending copy the same way (`vm_pageout.c:7140-7188`) and faults each
-page into the region's own object (`vm_pageout.c:8584-8592`), which no one else
-holds. The process can write neither. Where the kext refuses the block,
+page into the region's own new object (`vm_pageout.c:8584-8592`), which no one
+else holds. The process can write neither. Where the kext refuses the block,
 the bundle asks again for a read-only block, why `RGFX_PAGES_WHY_REFUSED`.
 
 Where the host's GPU cannot import the pages as they are, the rt platform

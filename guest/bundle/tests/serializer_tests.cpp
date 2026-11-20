@@ -4833,10 +4833,10 @@ static unsigned shadowDepthAt(const void *address) { return regionAt(address).sh
 // a shadow over the file's pages, and is neither (shadowed), while its pages past the written one
 // are copy-on-write still; so are a shared writable mapping (writable mapping), a file on a
 // writable volume, and a range over two regions. Anonymous memory whose maximum protection has
-// no write is unchanging where the kernel answers it private (kRgfxAnonymousPrivate) or
-// copy-on-write with a copy pending on its own object (kRgfxAnonymousCopyOnWrite), as vm_copy
-// leaves its destination, which keeps its bytes when the source is written after; it is neither,
-// why not a file, with write in its maximum protection, mapped at a second address too, or
+// no write is unchanging where the kernel answers it copy-on-write with a copy pending on its own
+// object (kRgfxAnonymousCopyOnWrite), as vm_copy leaves its destination, which keeps its bytes
+// when the source is written after; it is neither, why not a file, with write in its maximum
+// protection, held by the process alone (SM_PRIVATE), mapped at a second address too, or
 // copy-on-write over an object below its own.
 void test_file_pages_classify()
 {
@@ -4890,8 +4890,8 @@ void test_file_pages_classify()
 	CHECK(rgfxFilePagesOf(split + 3 * page, 2 * page).why == kRgfxNeitherSpansRegions);
 	CHECK(rgfxFilePagesOf(split + 4 * page, page).clause == kRgfxFileMaxNoWrite);
 
-	// Anonymous memory, read-only now: neither while its maximum protection has write, and
-	// private and unchanging once it has none.
+	// Anonymous memory, read-only now: neither while its maximum protection has write, and still
+	// neither, why not a file, once it has none and the process holds it alone (SM_PRIVATE).
 	auto anonymous = [](size_t bytes, uint8_t fill) {
 		mach_vm_address_t a = 0;
 		CHECK(mach_vm_allocate(mach_task_self(), &a, bytes, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
@@ -4905,7 +4905,7 @@ void test_file_pages_classify()
 	CHECK(e.clause == kRgfxFileNeither && e.why == kRgfxNeitherNotAFile);
 	CHECK(lowerMax(anon, mapped) && regionAt(anon).share_mode == SM_PRIVATE);
 	RgfxFilePages f = rgfxFilePagesOf(anon + into, length);
-	CHECK(f.clause == kRgfxAnonymousPrivate && f.why == kRgfxNeitherNone);
+	CHECK(f.clause == kRgfxFileNeither && f.why == kRgfxNeitherNotAFile);
 	CHECK(mprotect(anon, mapped, PROT_READ | PROT_WRITE) != 0);
 
 	// Mapped at a second address too, writable there: truly shared, neither.
@@ -4995,8 +4995,9 @@ void test_file_pages_classify()
 // protection lost write (shadowed), whose GPU's pages hold the process's bytes. Memory whose
 // unchanging block the kext refused is asked again read-only, why RGFX_PAGES_WHY_REFUSED. Writable
 // memory is not classified, and without setUnchangingPages nothing is. Anonymous memory whose
-// maximum protection has no write, private to the process, is named unchanging too, and the GPU's
-// pages hold the process's bytes. Each classification is counted.
+// maximum protection has no write is named unchanging and copy-on-write with a copy pending on its
+// own object, the GPU's pages the copy's bytes, and is read-only, why not a file, where the
+// process holds it alone. Each classification is counted.
 void test_region_unchanging_file_pages()
 {
 	const uint64_t page = vm_page_size;
@@ -5162,27 +5163,44 @@ void test_region_unchanging_file_pages()
 	      src.asked[7].address == shared + into);
 	CHECK(rgfxFilePagesCounts().classified == after.classified);
 
-	// Anonymous memory whose maximum protection has no write, private: named unchanging, the GPU's
-	// pages the process's bytes, counted by its clause.
-	mach_vm_address_t anon = 0;
-	CHECK(mach_vm_allocate(mach_task_self(), &anon, mapped, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
-	uint8_t *anonymous = reinterpret_cast<uint8_t *>(anon);
-	std::memset(anonymous, 0x5a, mapped);
-	CHECK(mach_vm_protect(mach_task_self(), anon, mapped, true, VM_PROT_READ) == KERN_SUCCESS);
-	RgfxRegion::Block p =
-	    region.acquirePages(anonymous + into, length, false, RgfxRegion::kPagesOwn);
-	CHECK(p.ok && src.asked.size() == 9 && src.asked[8].how == RgfxRegion::kPagesUnchanging &&
-	      src.asked[8].address == anonymous + into);
+	// Anonymous memory with a copy pending on its own object, vm_copy's destination, whose maximum
+	// protection has no write: named unchanging and copy-on-write, the GPU's pages the copy's
+	// bytes, which the source's write after leaves as they are. Anonymous memory the process holds
+	// alone (SM_PRIVATE) is read-only, why not a file. Each counted by its clause.
+	const size_t large = 64 * page;
+	mach_vm_address_t from = 0, to = 0, alone = 0;
+	for (mach_vm_address_t *a : {&from, &to})
+		CHECK(mach_vm_allocate(mach_task_self(), a, large, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	std::memset(reinterpret_cast<void *>(from), 0x5a, large);
+	CHECK(mach_vm_copy(mach_task_self(), from, large, to) == KERN_SUCCESS);
+	CHECK(mach_vm_protect(mach_task_self(), to, large, true, VM_PROT_READ) == KERN_SUCCESS);
+	uint8_t *copied = reinterpret_cast<uint8_t *>(to);
+	RgfxRegion::Block h = region.acquirePages(copied + into, length, false, RgfxRegion::kPagesOwn);
+	CHECK(h.ok && src.asked.size() == 9 &&
+	      src.asked[8].how == (RgfxRegion::kPagesUnchanging | RgfxRegion::kPagesCopyOnWrite) &&
+	      src.asked[8].address == copied + into);
+	std::memset(reinterpret_cast<void *>(from), 0x66, large);
 	CHECK(src.asked[8].seen == std::vector<uint8_t>(length, 0x5a) &&
 	      src.now(8) == src.asked[8].seen);
+	CHECK(mach_vm_allocate(mach_task_self(), &alone, mapped, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	std::memset(reinterpret_cast<void *>(alone), 0x5a, mapped);
+	CHECK(mach_vm_protect(mach_task_self(), alone, mapped, true, VM_PROT_READ) == KERN_SUCCESS);
+	uint8_t *own = reinterpret_cast<uint8_t *>(alone);
+	RgfxRegion::Block k = region.acquirePages(own + into, length, false, RgfxRegion::kPagesOwn);
+	CHECK(k.ok && src.asked.size() == 10 &&
+	      src.asked[9].how == (RGFX_PAGES_WHY_NOT_A_FILE << shift) &&
+	      src.asked[9].address == own + into);
 	const RgfxFilePagesCounts last = rgfxFilePagesCounts();
-	CHECK(last.classified - after.classified == 1 &&
-	      grew(last.count, after.count, kRgfxAnonymousPrivate) == 1 &&
-	      grew(last.bytes, after.bytes, kRgfxAnonymousPrivate) == length);
+	CHECK(last.classified - after.classified == 2 &&
+	      grew(last.count, after.count, kRgfxAnonymousCopyOnWrite) == 1 &&
+	      grew(last.bytes, after.bytes, kRgfxAnonymousCopyOnWrite) == length &&
+	      last.neitherCount[kRgfxNeitherNotAFile] - after.neitherCount[kRgfxNeitherNotAFile] == 1);
 
 	for (const Source::Ask &ask : src.asked)
 		mach_port_deallocate(mach_task_self(), ask.held);
-	mach_vm_deallocate(mach_task_self(), anon, mapped);
+	for (mach_vm_address_t a : {from, to})
+		mach_vm_deallocate(mach_task_self(), a, large);
+	mach_vm_deallocate(mach_task_self(), alone, mapped);
 	munmap(written, mapped);
 	munmap(cow, mapped);
 	munmap(priv, mapped);

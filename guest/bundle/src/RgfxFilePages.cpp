@@ -54,20 +54,16 @@ bool everyPageExternal(mach_vm_address_t start, mach_vm_address_t end, uint64_t 
 }
 
 // The clause of anonymous memory, the region `region` (RgfxFilePages.hpp, UNCHANGING ANONYMOUS
-// MEMORY): unchanging where its maximum protection has no write and the kernel answers it
-// SM_PRIVATE, or SM_COW with no object below the region's own; else not a file.
+// MEMORY): unchanging where its maximum protection has no write and the kernel answers it SM_COW
+// with no object below the region's own; else not a file.
 RgfxFilePages anonymousPagesOf(const vm_region_submap_short_info_data_64_t &region)
 {
-	if ((region.max_protection & VM_PROT_WRITE) != 0)
+	if ((region.max_protection & VM_PROT_WRITE) != 0 || region.share_mode != SM_COW ||
+	    region.shadow_depth != 0)
 		return neither(kRgfxNeitherNotAFile);
 	RgfxFilePages out;
+	out.clause = kRgfxAnonymousCopyOnWrite;
 	out.why = kRgfxNeitherNone;
-	if (region.share_mode == SM_PRIVATE)
-		out.clause = kRgfxAnonymousPrivate;
-	else if (region.share_mode == SM_COW && region.shadow_depth == 0)
-		out.clause = kRgfxAnonymousCopyOnWrite;
-	else
-		return neither(kRgfxNeitherNotAFile);
 	return out;
 }
 
@@ -179,7 +175,7 @@ std::atomic<bool> gReportDue{false};
 const int64_t kReportNs = 60ll * 1000 * 1000 * 1000;
 
 const char *const kClauseNames[kRgfxFileClauses] = {
-    "max-no-write", "copy-on-write", "anonymous private", "anonymous copy-on-write", "neither",
+    "max-no-write", "copy-on-write", "anonymous copy-on-write", "neither",
 };
 
 const char *const kNeitherNames[kRgfxNeitherKinds] = {

@@ -162,7 +162,7 @@
 //!
 //! **Unchanging pages** (`RGFX_SURFACE_PAGES_UNCHANGING`, `RGFX_FEATURE_UNCHANGING_PAGES`). A
 //! read-only block the guest marks unchanging holds pages its process can never write and no one
-//! else writes, a file's on a read-only volume or anonymous memory of the process's own
+//! else writes, a file's on a read-only volume or anonymous memory with a copy pending
 //! (docs/graphics-kext/design.md, "Unchanging pages"): its import is asked as unchanging,
 //! copy-on-write where the guest marks it so (`RGFX_SURFACE_PAGES_COPY_ON_WRITE`, counted
 //! apart), and the platform reads its pages into the copy once, at the import's make,
