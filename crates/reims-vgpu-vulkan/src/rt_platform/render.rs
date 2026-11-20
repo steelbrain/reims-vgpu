@@ -54,6 +54,7 @@ use crate::core::sync::Mutex;
 use super::blit::{Stop, report};
 use super::command::{Kept, OpenMark};
 use super::compute::{slots, small};
+use super::copied::Used;
 use super::diag::{self, Bound, Target, Use};
 use super::render_pipeline::RtRenderPipeline;
 use super::texture::RtTexture;
@@ -614,6 +615,91 @@ fn scissor(r: MtlScissorRect) -> rt::ScissorRect {
     }
 }
 
+/// Notes the copies `cmd` uses in `used` ([`Used`]): those the buffers it sets or draws from and
+/// the heaps and resources it declares lie over. Its textures are noted as they bind
+/// ([`Kept::used`]), its pass's attachments at its making ([`super::PassFields::note_copies`]).
+fn note_copies(used: &Used, cmd: &RenderCmd<'_, RtPlatform>) {
+    if !super::copied::any() {
+        return;
+    }
+    match cmd {
+        RenderCmd::DrawIndexedPatchesIndirect {
+            patch_index_buffer,
+            control_point_index_buffer,
+            indirect_buffer,
+            ..
+        } => {
+            patch_index_buffer.iter().for_each(|b| used.buffer(b));
+            used.buffer(control_point_index_buffer);
+            used.buffer(indirect_buffer);
+        }
+        RenderCmd::DrawIndexedPatches {
+            patch_index_buffer,
+            control_point_index_buffer,
+            ..
+        } => {
+            patch_index_buffer.iter().for_each(|b| used.buffer(b));
+            used.buffer(control_point_index_buffer);
+        }
+        RenderCmd::DrawIndexedPrimitivesIndirect {
+            index_buffer,
+            indirect_buffer,
+            ..
+        } => {
+            used.buffer(index_buffer);
+            used.buffer(indirect_buffer);
+        }
+        RenderCmd::DrawPatchesIndirect {
+            patch_index_buffer,
+            indirect_buffer,
+            ..
+        } => {
+            patch_index_buffer.iter().for_each(|b| used.buffer(b));
+            used.buffer(indirect_buffer);
+        }
+        RenderCmd::DrawPatches {
+            patch_index_buffer: buffer,
+            ..
+        }
+        | RenderCmd::SetFragmentBuffer { buffer, .. }
+        | RenderCmd::SetTessellationFactorBuffer { buffer, .. }
+        | RenderCmd::SetVertexBuffer { buffer, .. } => buffer.iter().for_each(|b| used.buffer(b)),
+        RenderCmd::DrawIndexedPrimitives {
+            index_buffer: buffer,
+            ..
+        }
+        | RenderCmd::DrawIndexedPrimitivesInstances {
+            index_buffer: buffer,
+            ..
+        }
+        | RenderCmd::DrawIndexedPrimitivesBase {
+            index_buffer: buffer,
+            ..
+        }
+        | RenderCmd::DrawPrimitivesIndirect {
+            indirect_buffer: buffer,
+            ..
+        }
+        | RenderCmd::ExecuteCommandsIndirect {
+            indirect_range_buffer: buffer,
+            ..
+        } => used.buffer(buffer),
+        RenderCmd::SetFragmentBuffers { buffers, .. }
+        | RenderCmd::SetVertexBuffersAttributeStrides { buffers, .. }
+        | RenderCmd::SetVertexBuffers { buffers, .. } => {
+            buffers.iter().flatten().for_each(|b| used.buffer(b));
+        }
+        RenderCmd::UseHeaps { heaps } | RenderCmd::UseHeapsStages { heaps, .. } => {
+            heaps.iter().flatten().for_each(|h| used.heap(h));
+        }
+        RenderCmd::UseResources { resources, .. }
+        | RenderCmd::UseResourcesStages { resources, .. } => {
+            resources.iter().flatten().for_each(|r| used.resource(r));
+        }
+        _ => {}
+    }
+}
+
 impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
     /// rt's command (the module's docs); `endEncoding` ends rt's encoder.
     fn encode(&self, on: OnFault, cmd: RenderCmd<'_, RtPlatform>) -> RaiseResult<()> {
@@ -622,6 +708,7 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
             let _ = on;
             let sel = cmd.selector();
             let ending = matches!(cmd, RenderCmd::EndEncoding);
+            note_copies(self.kept.copies(), &cmd);
             let mut open = self.open.lock();
             let stopped = self.command(&mut open, cmd).err();
             if let Some(Stop::Rt(rt::Error::Unsupported(rt::Gap::Draw { kind }))) = &stopped {

@@ -496,6 +496,24 @@ impl PassFields {
         let attachments = (pass.colors.iter()).chain([&pass.depth, &pass.stencil]);
         (attachments.filter_map(|a| a.texture.as_ref()?.tiled().cloned())).collect()
     }
+
+    /// Notes in `used` the copies the pass's attachments, their resolves and its visibility
+    /// result buffer lie over ([`super::copied::Used`]).
+    pub fn note_copies(&self, used: &super::copied::Used) {
+        if !super::copied::any() {
+            return;
+        }
+        let pass = self.lock();
+        let attachments = (pass.colors.iter()).chain([&pass.depth, &pass.stencil]);
+        for a in attachments {
+            for texture in [&a.texture, &a.resolve_texture].into_iter().flatten() {
+                used.add(texture.copied());
+            }
+        }
+        if let Some(buffer) = &pass.visibility_result_buffer {
+            used.buffer(buffer);
+        }
+    }
 }
 
 /// Colour attachment `index`, or Metal's raise at its subscript past the eighth.

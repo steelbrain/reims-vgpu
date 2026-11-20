@@ -61,8 +61,10 @@ impl RtBlitEncoder {
 
     /// Notes `cmd`'s textures in its command buffer's `kept`: its copies' as uses
     /// ([`Kept::used`]), and a mipmap generation's and a synchronize's as tiled textures' uses
-    /// alone (`super::tiled`).
+    /// alone (`super::tiled`); and the copies its buffers and textures lie over
+    /// ([`super::copied::Used`]).
     fn note_uses(&self, cmd: &BlitCmd<'_, RtPlatform>) {
+        self.note_copies(cmd);
         let (from, into) = match *cmd {
             BlitCmd::CopyBufferToTexture {
                 destination_texture,
@@ -97,6 +99,7 @@ impl RtBlitEncoder {
             }
             | BlitCmd::SynchronizeTexture { texture, .. } => {
                 self.kept.takes().used(texture);
+                self.kept.copies().add(texture.copied());
                 (None, None)
             }
             _ => (None, None),
@@ -106,6 +109,47 @@ impl RtBlitEncoder {
         }
         if let Some(texture) = into {
             self.kept.used(texture, Use::BlittedInto);
+        }
+    }
+
+    /// Notes the copies `cmd`'s buffers lie over in its command buffer's `kept`
+    /// ([`super::copied::Used`]); its textures' are noted with their uses.
+    fn note_copies(&self, cmd: &BlitCmd<'_, RtPlatform>) {
+        if !super::copied::any() {
+            return;
+        }
+        let used = self.kept.copies();
+        match *cmd {
+            BlitCmd::CopyBufferToTexture {
+                source_buffer: buffer,
+                ..
+            }
+            | BlitCmd::CopyTextureToBuffer {
+                destination_buffer: buffer,
+                ..
+            }
+            | BlitCmd::FillBufferPattern4 { buffer, .. }
+            | BlitCmd::FillBuffer { buffer, .. }
+            | BlitCmd::SynchronizeResource {
+                resource: Some(ResourceRef::Buffer(buffer)),
+            } => used.buffer(buffer),
+            BlitCmd::CopyBufferToTextureOptions {
+                source_buffer: buffer,
+                ..
+            }
+            | BlitCmd::CopyTextureToBufferOptions {
+                destination_buffer: buffer,
+                ..
+            } => buffer.iter().for_each(|b| used.buffer(b)),
+            BlitCmd::CopyBufferToBuffer {
+                source_buffer,
+                destination_buffer,
+                ..
+            } => {
+                source_buffer.iter().for_each(|b| used.buffer(b));
+                destination_buffer.iter().for_each(|b| used.buffer(b));
+            }
+            _ => {}
         }
     }
 }

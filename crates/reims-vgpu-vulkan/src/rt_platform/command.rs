@@ -40,9 +40,11 @@
 //!   the serial dispatch type or the descriptor's (another value is Metal's refusal, nil), and
 //!   render encoders ([`super::render`]) of the pass the descriptor keeps
 //!   ([`super::descriptor`]): a pass Metal refuses, or rt does, is nil, counted.
-//! - **Copies of host pages** (`super::copied`): each commit copies the CPU's writes into them
-//!   before rt is handed the command buffer, and while one is live its first completed handler
-//!   merges the GPU's writes back into their pages, before core's completion-seen handlers.
+//! - **Copies of host pages** (`super::copied`): its encoders note each copy they set or declare
+//!   an object over, as Metal makes resident only those; its commit copies the CPU's writes into
+//!   those before rt is handed the command buffer, and where it used one its first completed
+//!   handler merges the GPU's writes back into their pages, before core's completion-seen
+//!   handlers.
 //! - **What it keeps**: the pipeline states its encoders set ([`Kept`]), from their set until it
 //!   completes, released after its completed handlers ran.
 //! - **Tiled textures** (`super::tiled`): its encoders note each tiled texture they use whose
@@ -364,14 +366,16 @@ impl RtCommandBuffer {
 /// after core's; a command buffer never committed drops them with itself.
 /// It holds too its uses of textures over an imported block, for the boot diagnostics
 /// (`super::diag`), which its commit counts, the tiled textures it used whose bytes its commit
-/// takes (`super::tiled`), and whether its caller failed it for a deferred buffer's memory
-/// ([`Failed`]).
+/// takes (`super::tiled`), whether its caller failed it for a deferred buffer's memory
+/// ([`Failed`]), and the copies of host pages it used, which its commit and completion sync
+/// (`super::copied`).
 #[derive(Clone, Default)]
 pub struct Kept(
     Arc<Mutex<HashMap<ObjId, Box<dyn Send>>>>,
     Uses,
     Takes,
     Failed,
+    super::copied::Used,
 );
 
 /// Whether a command buffer's caller failed it for a deferred buffer's memory rt refused
@@ -397,12 +401,18 @@ impl Kept {
         &self.2
     }
 
+    /// The copies of host pages it used, to sync at its commit and completion (`super::copied`).
+    pub fn copies(&self) -> &super::copied::Used {
+        &self.4
+    }
+
     /// An encoder of it used `texture` as `how` says: a use for the boot diagnostics
-    /// ([`Uses::add`]), and of a tiled texture whose bytes are to take, a take at its commit
-    /// ([`Takes::used`]).
+    /// ([`Uses::add`]), of a tiled texture whose bytes are to take, a take at its commit
+    /// ([`Takes::used`]), and of a texture over a copy, the copy's use (`super::copied::Used`).
     pub fn used(&self, texture: &RtObj<RtTexture>, how: Use) {
         self.1.add(texture, how);
         self.2.used(texture);
+        self.4.add(texture.copied());
     }
 
     /// Keeps `object`, whose identity is `id`, unless an object of that identity is kept.
@@ -627,10 +637,10 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         recorded_answer
     }
 
-    /// Hands rt the held handlers (the module's docs), then commits, the copies of host pages
-    /// copied in first and merged back first of the completed handlers (`super::copied`), then the
-    /// bytes of the tiled textures it used taken (`super::tiled`). A second commit is Metal's
-    /// refusal, counted; a commit rt refuses is counted, and its handlers never run.
+    /// Hands rt the held handlers (the module's docs), then commits, the copies of host pages it
+    /// used copied in first and merged back first of the completed handlers (`super::copied`),
+    /// then the bytes of the tiled textures it used taken (`super::tiled`). A second commit is
+    /// Metal's refusal, counted; a commit rt refuses is counted, and its handlers never run.
     fn commit(&self, on: OnFault) -> RaiseResult<()> {
         let recorded_call = crate::recorder::rec_call!("commit", self);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
@@ -661,7 +671,8 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 0,
                 Box::new(move |made: &rt::CommandBuffer| failure.completed(made.error())),
             );
-            if let Some(merge) = super::copied::merging() {
+            let copies = self.kept.copies().take();
+            if let Some(merge) = super::copied::merging(&copies) {
                 seen.insert(0, Box::new(merge));
             }
             self.kept.uses().submitted();
@@ -679,7 +690,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                     self.rt.add_scheduled_handler(run(submission))?;
                 }
                 self.rt.add_completed_handler(run(seen))?;
-                super::copied::copy_in();
+                super::copied::copy_in(&copies);
                 self.kept.takes().take(&self.device);
                 // Not complete until its first completed handler runs, which a refusal never runs.
                 let loss = &self.failure.loss;
@@ -825,6 +836,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                         }
                         let blocks = targets.iter().filter_map(|t| t.made.block());
                         super::copied::store_outs(sel, blocks);
+                        render_pass_descriptor.note_copies(kept.copies());
                         for tiled in render_pass_descriptor.tiled() {
                             kept.takes().used_tiled(&tiled);
                         }

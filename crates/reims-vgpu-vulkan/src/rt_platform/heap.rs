@@ -44,6 +44,7 @@
 //! Private heaps at 256 KiB from their block's first byte, the largest image alignment measured. A
 //! sparse heap is unbuilt ([`Unbuilt::Heap`]).
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use metal2vulkan_rt as rt;
@@ -99,9 +100,17 @@ pub struct RtHeap {
     device: RtObj<RtDevice>,
     /// Its purgeable state, as Metal keeps it (`super::texture::set_purgeable`).
     purgeable: AtomicU64,
+    /// The copy of host pages it lies over (`super::copied`), which a command buffer that uses it,
+    /// or a resource of it, syncs; `None` for any other.
+    copied: Option<Arc<super::copied::Copied>>,
 }
 
 impl RtHeap {
+    /// The copy of host pages it lies over, where it lies over one (`super::copied`).
+    pub(super) fn copied(&self) -> Option<&Arc<super::copied::Copied>> {
+        self.copied.as_ref()
+    }
+
     /// The number of the block it is a range of, which `useHeap:` keeps.
     pub fn block_id(&self) -> rt::BlockId {
         self.block.id
@@ -261,13 +270,14 @@ fn heap(
     options: u64,
 ) -> RtObj<RtHeap> {
     RtObj::new(RtHeap {
-        block,
         offset,
         size,
         placement,
         options,
         device: device.clone_ref(),
         purgeable: texture::purgeable_state(),
+        copied: super::copied::of(block.id),
+        block,
     })
 }
 
@@ -345,7 +355,8 @@ impl Heap<RtPlatform> for RtObj<RtHeap> {
                     return Ok(None);
                 }
             };
-            let buffer = buffer::buffer_of(&self.device, made, self.options, true, None);
+            let placed = (true, self.copied.clone());
+            let buffer = buffer::buffer_of(&self.device, made, self.options, placed, None);
             Ok(Some(buffer))
         });
         crate::recorder::rec_done!(recorded_call, recorded_answer);
@@ -386,6 +397,7 @@ impl Heap<RtPlatform> for RtObj<RtHeap> {
                 held,
                 over,
                 made,
+                self.copied.as_ref(),
             ))
         });
         crate::recorder::rec_done!(recorded_call, recorded_answer);

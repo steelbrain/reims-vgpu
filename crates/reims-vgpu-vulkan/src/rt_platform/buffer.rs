@@ -462,6 +462,9 @@ pub struct RtBuffer {
     /// An exportable buffer's export (`super::export`).
     #[cfg(unix)]
     exported: Option<super::export::Exported>,
+    /// The copy of host pages it lies over (`super::copied`), which a command buffer that uses it
+    /// syncs; `None` for any other.
+    copied: Option<Arc<super::copied::Copied>>,
 }
 
 /// What a deferred buffer's memory is made of at its first use (the module's docs, "Deferred
@@ -536,6 +539,11 @@ impl RtBuffer {
         let most = DEFERRED_FOR_MOST_NS[made_for].fetch_max(took, Ordering::Relaxed);
         crate::answer::count_kind_by(most_code, took.saturating_sub(most));
         Some(self.rt.get_or_init(|| made))
+    }
+
+    /// The copy of host pages it lies over, where it lies over one (`super::copied`).
+    pub(super) fn copied(&self) -> Option<&Arc<super::copied::Copied>> {
+        self.copied.as_ref()
     }
 }
 
@@ -959,6 +967,7 @@ pub fn deferred_of_length(
         deallocator: None,
         #[cfg(unix)]
         exported: None,
+        copied: None,
     }))
 }
 
@@ -1088,16 +1097,17 @@ fn made(
 
 /// The buffer's handle, of rt's buffer `rt` answering `options`.
 fn buffer(device: &RtObj<RtDevice>, rt: rt::Buffer, options: u64) -> RtObj<RtBuffer> {
-    buffer_of(device, rt, options, false, None)
+    buffer_of(device, rt, options, (false, None), None)
 }
 
 /// The buffer's handle, of rt's buffer `rt` answering `options`, placed by a heap where `in_heap`,
-/// running `deallocator` as it goes where given.
+/// lying over `copied` where it lies over a copy of host pages (`super::copied`), running
+/// `deallocator` as it goes where given.
 pub(super) fn buffer_of(
     device: &RtObj<RtDevice>,
     rt: rt::Buffer,
     options: u64,
-    in_heap: bool,
+    (in_heap, copied): (bool, Option<Arc<super::copied::Copied>>),
     deallocator: Option<Slot>,
 ) -> RtObj<RtBuffer> {
     RtObj::new(RtBuffer {
@@ -1110,6 +1120,7 @@ pub(super) fn buffer_of(
         deallocator,
         #[cfg(unix)]
         exported: None,
+        copied,
     })
 }
 
@@ -1131,6 +1142,7 @@ pub(super) fn with_export(
         in_heap: false,
         deallocator: None,
         exported: Some(exported),
+        copied: None,
     })
 }
 
@@ -1369,7 +1381,8 @@ fn no_copy(
     if in_place {
         read_only(sel);
     }
-    Some(buffer_of(device, made, o.answered, false, deallocator))
+    let placed = (false, super::copied::of(block.id));
+    Some(buffer_of(device, made, o.answered, placed, deallocator))
 }
 
 /// rt's no-copy buffer of `length` bytes at `bytes`, an offset in a block, of `storage`, for `sel`:
@@ -2240,7 +2253,8 @@ impl RtObj<RtBuffer> {
         };
         let held = (self.options, texture::STORAGE_BITS);
         let diag = |shape: &Shape| Made::over_buffer(made, shape, offset, bytes_per_row);
-        texture::make_over(&self.device, sel, &descriptor.desc(), held, over, diag)
+        let (desc, copied) = (descriptor.desc(), self.copied.as_ref());
+        texture::make_over(&self.device, sel, &desc, held, over, diag, copied)
     }
 }
 
@@ -2441,7 +2455,8 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
                 |d: &rt::TextureDescriptor, index: Option<u32>| rt_device.new_texture(d, index);
             let held = (self.options, texture::STORAGE_BITS);
             let diag = |shape: &Shape| Made::new(Call::Tiled, shape);
-            let made = texture::make_over(&self.device, sel, &desc, held, own, diag);
+            let copied = self.copied.as_ref();
+            let made = texture::make_over(&self.device, sel, &desc, held, own, diag, copied);
             if let Some(texture) = &made {
                 let tiled = Tiled::new(rt_device, texture.rt(), self, offset, bytes_per_row);
                 texture.set_tiled(tiled);
@@ -2534,6 +2549,7 @@ mod tests {
     use crate::core::platform::Platform as _;
     use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
     use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
     use crate::core::platform::device::GpuDevice as _;
     use crate::core::platform::values::{OptionSet, TextureDesc};
     use crate::rt_platform::RtRefusal;
@@ -4389,5 +4405,305 @@ mod tests {
         );
         // SAFETY: the deallocator ran: rt holds no copy of the memory.
         unsafe { std::alloc::dealloc(memory, layout) };
+    }
+
+    /// A buffer over a copy of two pages of the test's own, 0x11s, and rt's mapping of the copy
+    /// (`super::super::copied`'s docs).
+    struct OverACopy {
+        /// The buffer, whose `contents` are the pages.
+        buffer: RtObj<RtBuffer>,
+        /// The pages.
+        pages: HostPtr,
+        /// rt's mapping of the copy.
+        copy: HostPtr,
+        /// Whether the GPU's writes to the copy are dropped.
+        drops: bool,
+    }
+
+    /// A buffer over a copy of two fresh pages of 0x11s on `device`: read-only (option bit 24),
+    /// whose GPU writes are dropped, where `drops`, else one whose pointer the GPU takes not
+    /// (`POINTER_REFUSED`). The pages are never freed.
+    fn over_a_copy(device: &RtObj<RtDevice>, drops: bool) -> OverACopy {
+        use crate::core::num::ToUsize as _;
+
+        let on = OnFault::Return;
+        let page = device.facts().page_size;
+        let layout = Layout::from_size_align((2 * page).to_usize(), page.to_usize());
+        let layout = layout.expect("a layout");
+        // SAFETY: the layout's size is not 0.
+        let memory = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!memory.is_null());
+        // SAFETY: the test's own memory.
+        unsafe { memory.write_bytes(0x11, (2 * page).to_usize()) };
+        let pages = HostPtr::from_ptr(memory);
+        let copied = counted(IMPORTS_COPIED);
+        // SAFETY: the memory is never freed.
+        let bytes = unsafe { HostRange::new(pages, 2 * page) };
+        let made = match drops {
+            true => device.new_buffer(BufferDesc {
+                length: 2 * page,
+                options: vec![OptionSet::ResourceOptions(READ_ONLY)],
+                pinned_gpu_address: None,
+                contents: Some(bytes),
+                no_copy: true,
+                deallocator: None,
+                zero_from: None,
+            }),
+            false => {
+                POINTER_REFUSED.set(true);
+                let made = device.new_buffer_over_host_memory(on, bytes, 0, None);
+                POINTER_REFUSED.set(false);
+                made
+            }
+        };
+        let buffer = made.expect("never a raise").expect("a buffer over a copy");
+        assert_eq!(counted(IMPORTS_COPIED), copied + 1);
+        let copy = buffer.rt().contents().expect("rt's mapping of the copy");
+        let copy = HostPtr::from_ptr(copy.as_ptr());
+        assert_ne!(copy, pages);
+        OverACopy {
+            buffer,
+            pages,
+            copy,
+            drops,
+        }
+    }
+
+    impl OverACopy {
+        /// The CPU writes 0x22s at the pages' first 64 bytes, and 0x33s at the copy's 64 from
+        /// 128, as the GPU writes it.
+        fn mark(&self) {
+            // SAFETY: inside the test's pages and the copy, which no command buffer in flight
+            // writes.
+            unsafe {
+                self.pages.as_ptr::<u8>().write_bytes(0x22, 64);
+                self.copy
+                    .wrapping_add(128)
+                    .as_ptr::<u8>()
+                    .write_bytes(0x33, 64);
+            }
+        }
+
+        /// What a commit and completion did with the copy since [`OverACopy::mark`]: whether
+        /// the CPU's bytes reached the copy, and whether the copy's reached the pages, or where
+        /// its writes are dropped, were put back from the pages' bytes. The pages of a copy
+        /// whose writes are dropped never change.
+        fn synced(&self) -> (bool, bool) {
+            let copied_in = read(self.copy, 64) == [0x22; 64];
+            let back = match self.drops {
+                false => read(self.pages.wrapping_add(128), 64) == [0x33; 64],
+                true => {
+                    assert_eq!(read(self.pages.wrapping_add(128), 64), [0x11; 64]);
+                    read(self.copy.wrapping_add(128), 64) == [0x11; 64]
+                }
+            };
+            (copied_in, back)
+        }
+    }
+
+    /// Runs `cmds` in a compute encoder of a new command buffer of `queue`, and waits for it.
+    fn compute_and_wait(
+        queue: &<RtPlatform as crate::core::platform::Platform>::CommandQueue,
+        cmds: Vec<ComputeCmd<'_, RtPlatform>>,
+    ) {
+        let on = OnFault::Return;
+        let commands = queue.command_buffer(on).expect("never a raise");
+        let commands = commands.expect("a command buffer");
+        let encoder = commands.compute_encoder(on).expect("never a raise");
+        let encoder = encoder.expect("a compute encoder");
+        for cmd in cmds {
+            assert_eq!(encoder.encode(on, cmd), Ok(()));
+        }
+        assert_eq!(encoder.encode(on, ComputeCmd::EndEncoding), Ok(()));
+        assert_eq!(commands.commit(on), Ok(()));
+        assert_eq!(commands.wait_until_completed(on), Ok(()));
+    }
+
+    /// On the GPU the test holds: a copy a compute encoder binds with `setBuffers:` is synced for
+    /// its command buffer (`super::super::copied`'s docs, "Synced for the command buffers that use
+    /// it"): a dispatch reads the bytes the CPU wrote before the commit, and once the command
+    /// buffer completed the bytes a dispatch wrote into the copy are in the pages, or, where the
+    /// copy's writes are dropped, put back, counted.
+    #[test]
+    fn a_copy_bound_by_set_buffers_is_synced_at_commit_and_completion_on_vulkan() {
+        use super::super::copied::DROPPED_BYTES_CODE;
+        use crate::core::platform::resource::Library as _;
+        use crate::core::platform::types::{MtlSize, NsRange};
+
+        const ADD: &[u8] = include_bytes!("../../../../tests/shaders/compute_add.metallib");
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let library = device.new_library(ADD).expect("never a raise");
+        let library = library.expect("a metallib").expect("a library");
+        let function = library.new_function(on, "add_one").expect("never a raise");
+        let function = function.expect("a function of the table");
+        let add = device.new_compute_pipeline_state_for_function(Some(&function));
+        let add = add.expect("a compute state").expect("a compute state");
+        let of = |length| device.new_buffer_of_length(on, length, 0);
+        let of = |length| of(length).expect("never a raise").expect("a buffer");
+        for drops in [false, true] {
+            let c = over_a_copy(&device, drops);
+            let (out, zeros) = (of(16), of(16));
+            // SAFETY: inside the test's pages.
+            unsafe { c.pages.as_ptr::<u8>().write_bytes(0x22, 16) };
+            let dropped = counted(DROPPED_BYTES_CODE);
+            let threads = || ComputeCmd::DispatchThreads {
+                threads_per_grid: MtlSize::new(4, 1, 1),
+                threads_per_threadgroup: MtlSize::new(4, 1, 1),
+            };
+            // Reads the copy's first 4 words into `out`, then writes 1s into its 4 from 128.
+            compute_and_wait(
+                &queue,
+                vec![
+                    ComputeCmd::SetComputePipelineState { state: Some(&add) },
+                    ComputeCmd::SetBuffers {
+                        buffers: &[Some(&out), Some(&c.buffer)],
+                        offsets: &[0, 0],
+                        range: NsRange::new(0, 2),
+                    },
+                    threads(),
+                    ComputeCmd::SetBuffers {
+                        buffers: &[Some(&c.buffer), Some(&zeros)],
+                        offsets: &[128, 0],
+                        range: NsRange::new(0, 2),
+                    },
+                    threads(),
+                ],
+            );
+            assert_eq!(read(out.contents(), 16), [0x23, 0x22, 0x22, 0x22].repeat(4));
+            let back = read(c.pages.wrapping_add(128), 16);
+            match drops {
+                false => assert_eq!(back, [1, 0, 0, 0].repeat(4)),
+                true => {
+                    assert_eq!(back, [0x11; 16]);
+                    assert!(
+                        counted(DROPPED_BYTES_CODE) > dropped,
+                        "the GPU's bytes put back"
+                    );
+                }
+            }
+        }
+    }
+
+    /// On the GPU the test holds: a copy a blit names is synced for its command buffer as one an
+    /// encoder binds: a copy out of it reads the bytes the CPU wrote before the commit, and once
+    /// the command buffer completed a copy into it is in the pages, or dropped.
+    #[test]
+    fn a_copy_bound_by_a_blit_is_synced_at_commit_and_completion_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let of = |length| device.new_buffer_of_length(on, length, 0);
+        let of = |length| of(length).expect("never a raise").expect("a buffer");
+        for drops in [false, true] {
+            let c = over_a_copy(&device, drops);
+            let (out, source) = (of(64), of(64));
+            // SAFETY: the Shared buffer's 64 bytes, mapped while it lives, and the test's pages.
+            unsafe {
+                source.contents().as_ptr::<u8>().write_bytes(0x77, 64);
+                c.pages.as_ptr::<u8>().write_bytes(0x22, 64);
+            }
+            let copy = |(from, to, destination_offset)| BlitCmd::CopyBufferToBuffer {
+                source_buffer: Some(from),
+                source_offset: 0,
+                destination_buffer: Some(to),
+                destination_offset,
+                size: 64,
+            };
+            let cmds = [(&c.buffer, &out, 0), (&source, &c.buffer, 128)];
+            blit_and_wait(&queue, cmds.into_iter().map(copy).collect());
+            assert_eq!(read(out.contents(), 64), [0x22; 64]);
+            let back = read(c.pages.wrapping_add(128), 64);
+            assert_eq!(back, [if drops { 0x11 } else { 0x77 }; 64]);
+        }
+    }
+
+    /// On the GPU the test holds: a copy a compute encoder declares with `useResources:`, as a
+    /// shader that reaches it through an argument buffer's address asks, and binds not, is synced
+    /// for its command buffer: the CPU's bytes copied in at the commit, the copy's merged back,
+    /// or put back, at the completion.
+    #[test]
+    fn a_copy_declared_with_use_resources_is_synced_on_vulkan() {
+        use crate::core::platform::blit::ResourceRef;
+
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let queue = device.new_command_queue().expect("a command queue");
+        for drops in [false, true] {
+            let c = over_a_copy(&device, drops);
+            c.mark();
+            let declare = ComputeCmd::UseResources {
+                resources: &[Some(ResourceRef::Buffer(&c.buffer))],
+                usage: 1,
+            };
+            compute_and_wait(&queue, vec![declare]);
+            assert_eq!(c.synced(), (true, true), "drops: {drops}");
+        }
+    }
+
+    /// On the GPU the test holds: a command buffer that uses no copy syncs none, as the
+    /// platform's own command buffers, its fills and write-backs, use none: a live copy keeps
+    /// what it holds and its pages theirs, and no sync is counted.
+    #[test]
+    fn a_command_buffer_that_uses_no_copy_syncs_none_on_vulkan() {
+        use super::super::copied::{BACK_BYTES_CODE, IN_BYTES_CODE, SYNC_NS_CODE};
+        use crate::core::platform::types::NsRange;
+
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let other = device.new_buffer_of_length(on, 64, 0);
+        let other = other.expect("never a raise").expect("a buffer");
+        let codes = [IN_BYTES_CODE, BACK_BYTES_CODE, SYNC_NS_CODE];
+        for drops in [false, true] {
+            let c = over_a_copy(&device, drops);
+            c.mark();
+            let counts = codes.map(counted);
+            let fill = BlitCmd::FillBuffer {
+                buffer: &other,
+                range: NsRange::new(0, 64),
+                value: 0x55,
+            };
+            blit_and_wait(&queue, vec![fill]);
+            assert_eq!(read(other.contents(), 64), [0x55; 64]);
+            assert_eq!(c.synced(), (false, false), "drops: {drops}");
+            assert_eq!(codes.map(counted), counts, "no sync counted");
+        }
+    }
+
+    /// On the GPU the test holds: a copy a command buffer reaches only through its address, held
+    /// in a buffer the encoder binds and declared with no `useResource:`, is not synced for it,
+    /// a read that Metal leaves undefined (`super::super::copied`'s docs): the copy holds what the
+    /// last command buffer that used it left, and its pages theirs. The next command buffer that
+    /// uses it syncs it.
+    #[test]
+    fn a_copy_reached_only_through_an_undeclared_address_is_not_synced_on_vulkan() {
+        use crate::core::platform::types::NsRange;
+
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        for drops in [false, true] {
+            let c = over_a_copy(&device, drops);
+            let addresses = device.new_buffer_of_length(on, 8, 0);
+            let addresses = addresses.expect("never a raise").expect("a buffer");
+            // SAFETY: the Shared buffer's 8 bytes, mapped while it lives.
+            unsafe { (addresses.contents().as_ptr::<u64>()).write(c.buffer.gpu_address()) };
+            c.mark();
+            for (buffer, synced) in [(&addresses, false), (&c.buffer, true)] {
+                let bind = ComputeCmd::SetBuffers {
+                    buffers: &[Some(buffer)],
+                    offsets: &[0],
+                    range: NsRange::new(0, 1),
+                };
+                compute_and_wait(&queue, vec![bind]);
+                assert_eq!(c.synced(), (synced, synced), "drops: {drops}");
+            }
+        }
     }
 }

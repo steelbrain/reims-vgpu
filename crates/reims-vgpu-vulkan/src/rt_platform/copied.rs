@@ -10,29 +10,38 @@
 //!   (`super::buffer::KnownBlocks`).
 //! - **The base.** For each copy, the bytes the pages and the copy last agreed on, in the
 //!   process's memory: at first the bytes copied.
-//! - **Copied in at each commit** ([`copy_in`], from `super::command`'s commit, before rt is
-//!   handed the command buffer): every byte of the pages that differs from the base is written
-//!   into the copy and the base, of every live copy, as a command buffer may reach any of them
-//!   through an address. A byte the CPU did not change is never written, so a GPU write to the
-//!   copy by work still in flight stays.
-//! - **Merged back at each completion** ([`merging`], the first of the command buffer's completed
-//!   handlers, so before core's and before a waiter returns): every byte of the copy that differs
-//!   from the base is written into the pages where the pages' byte still is the base's, and the
-//!   base takes the copy's byte. A byte both sides changed keeps the CPU's, which the next commit
-//!   copies in, as Metal keeps the later of two writes. A byte the guest writes between the
-//!   merge's read of it and its store is lost only where the GPU changed it too.
+//! - **Synced for the command buffers that use it** ([`Used`]), as Metal makes resident for a
+//!   command buffer the resources its encoders set and those it declares, and no others: a
+//!   buffer, a texture or a heap over the copy that an encoder sets (a buffer or texture bound, a
+//!   blit's source or destination, an attachment of its pass, an index or tessellation factor
+//!   buffer), or that it declares with `useResource:` or `useHeap:`, which Metal asks for a
+//!   resource a shader reaches through an address (an argument buffer's). Each object over a copy
+//!   holds it from its make, so a use costs one check; a command buffer that uses no copy syncs
+//!   none. A command buffer that reads a copy through an address it never declared reads it as
+//!   the last commit that used it left it: Metal leaves such a read undefined.
+//! - **Copied in at the commits that use it** ([`copy_in`], from `super::command`'s commit,
+//!   before rt is handed the command buffer): every byte of the pages that differs from the base
+//!   is written into the copy and the base. A byte the CPU did not change is never written, so a
+//!   GPU write to the copy by work still in flight stays.
+//! - **Merged back at the completions of the command buffers that use it** ([`merging`], the
+//!   first of the command buffer's completed handlers, so before core's and before a waiter
+//!   returns): every byte of the copy that differs from the base is written into the pages where
+//!   the pages' byte still is the base's, and the base takes the copy's byte. A byte both sides
+//!   changed keeps the CPU's, which the next commit that uses it copies in, as Metal keeps the
+//!   later of two writes. A byte the guest writes between the merge's read of it and its store is
+//!   lost only where the GPU changed it too.
 //! - **Compared a chunk at a time** (`CHUNK`, 4 KiB): a chunk of one side is copied out with a raw
 //!   copy, as memory the guest writes at any time is read, and compared with the base's, and only
 //!   a chunk that differs is compared a word and then a byte at a time, and stored byte by byte
 //!   where not all of a word's bytes change.
 //! - **Writes dropped** where the copy is of pages whose GPU writes Metal drops ([`import`]'s
 //!   `drops`: pages their process maps read-only, `super::buffer`'s docs, "Read-only memory"): at
-//!   each completion every byte the GPU changed in the copy is put back from the base instead,
-//!   and nothing is ever written into the pages, so the CPU and the command buffers committed
-//!   after the completion read the pages' bytes, as the M3 Max, the 5300M and the UHD 630 answer
-//!   (`crate::gpu::command`'s docs). Within a command buffer, and between command buffers in
-//!   flight at once, a read after the GPU's write sees the write until the completion that drops
-//!   it.
+//!   each completion of a command buffer that used it every byte the GPU changed in the copy is
+//!   put back from the base instead, and nothing is ever written into the pages, so the CPU and
+//!   the command buffers committed after the completion read the pages' bytes, as the M3 Max, the
+//!   5300M and the UHD 630 answer (`crate::gpu::command`'s docs). Within a command buffer, and
+//!   between command buffers in flight at once, a read after the GPU's write sees the write until
+//!   the completion that drops it.
 //! - **Released** as rt frees the import: the copy stops syncing, waiting for a sync in progress,
 //!   before the import's own release runs (the buffer's deallocator among it), and its memory goes
 //!   with the last handle of it.
@@ -43,6 +52,7 @@
 //! ([`SYNC_NS_CODE`]).
 
 use std::alloc::Layout;
+use std::collections::BTreeMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -50,10 +60,15 @@ use std::sync::{Arc, OnceLock};
 use metal2vulkan_rt as rt;
 
 use crate::core::num::{ToU64 as _, ToUsize as _};
+use crate::core::platform::blit::ResourceRef;
 use crate::core::platform::device::NoCopyDeallocator;
 use crate::core::platform::os::Clock as _;
 use crate::core::platform::os::clock::MonoTime;
 use crate::core::sync::Mutex;
+
+use super::RtPlatform;
+use super::buffer::RtBuffer;
+use super::heap::RtHeap;
 
 /// The code whose count is the bytes the CPU changed in copied pages that commits wrote into their
 /// copies ([`copy_in`]).
@@ -85,8 +100,8 @@ const WORDS: usize = CHUNK / 8;
 /// A copy's alignment, and what its length is a multiple of.
 const ALIGN: usize = 64 << 10;
 
-/// The live copies, in the order made.
-static COPIES: Mutex<Vec<Arc<Copied>>> = Mutex::new(Vec::new());
+/// The live copies, by their blocks.
+static COPIES: Mutex<BTreeMap<rt::BlockId, Arc<Copied>>> = Mutex::new(BTreeMap::new());
 
 /// How many copies are live: none, and a commit or a buffer's `contents` asks nothing more.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -138,7 +153,7 @@ pub(super) unsafe fn import(
     match unsafe { device.import_host_memory(copied.copy, size, Some(release)) } {
         Ok((block, _)) => {
             let _ = copied.block.set(block.id);
-            COPIES.lock().push(copied);
+            COPIES.lock().insert(block.id, copied);
             LIVE.fetch_add(1, Ordering::Release);
             Ok(block)
         }
@@ -153,7 +168,55 @@ pub(super) fn any() -> bool {
 
 /// Whether the block `id` is a live copy whose GPU writes are dropped ("Writes dropped").
 pub(super) fn drops(id: rt::BlockId) -> bool {
-    any() && (COPIES.lock().iter()).any(|c| c.drops && c.block.get() == Some(&id))
+    of(id).is_some_and(|copied| copied.drops)
+}
+
+/// The live copy whose block is `id`, for an object made over it to hold ("Synced for the command
+/// buffers that use it"); `None` where the block is no live copy.
+pub(super) fn of(id: rt::BlockId) -> Option<Arc<Copied>> {
+    any().then(|| COPIES.lock().get(&id).cloned()).flatten()
+}
+
+/// The copies a command buffer uses, each once ("Synced for the command buffers that use it"),
+/// noted by its encoders as they set or declare an object over one, and taken at its commit.
+#[derive(Clone, Default)]
+pub struct Used(Arc<Mutex<Vec<Arc<Copied>>>>);
+
+impl Used {
+    /// The command buffer uses `copied`, where it is a copy (an object over none holds `None`).
+    pub(super) fn add(&self, copied: Option<&Arc<Copied>>) {
+        let Some(copied) = copied else {
+            return;
+        };
+        let mut used = self.0.lock();
+        if !used.iter().any(|u| Arc::ptr_eq(u, copied)) {
+            used.push(Arc::clone(copied));
+        }
+    }
+
+    /// The command buffer uses `buffer`: its copy, where it lies over one.
+    pub(super) fn buffer(&self, buffer: &RtBuffer) {
+        self.add(buffer.copied());
+    }
+
+    /// The command buffer uses `heap`: its copy, where it lies over one.
+    pub(super) fn heap(&self, heap: &RtHeap) {
+        self.add(heap.copied());
+    }
+
+    /// The command buffer declares `resource` (`useResource:`): its copy, where it lies over one.
+    pub(super) fn resource(&self, resource: &ResourceRef<'_, RtPlatform>) {
+        match resource {
+            ResourceRef::Buffer(buffer) => self.buffer(buffer),
+            ResourceRef::Texture(texture) => self.add(texture.copied()),
+            ResourceRef::Icb(_) => {}
+        }
+    }
+
+    /// The copies used, taken: none is used since.
+    pub(super) fn take(&self) -> Vec<Arc<Copied>> {
+        std::mem::take(&mut *self.0.lock())
+    }
 }
 
 /// Counts a render pass `sel` made whose attachments lie in the blocks `blocks` where one is a
@@ -176,37 +239,36 @@ pub(super) fn store_outs(sel: &'static str, mut blocks: impl Iterator<Item = rt:
 /// Whether the process logged its first render pass over a copy whose writes are dropped.
 static STORE_OUT_SAID: AtomicBool = AtomicBool::new(false);
 
-/// Writes into every live copy the bytes the CPU changed in its pages since they last agreed
-/// (the module's docs): at a commit, before rt is handed the command buffer.
-pub(super) fn copy_in() {
-    if !any() {
+/// Writes into each of `copies`, those a command buffer uses, the bytes the CPU changed in its
+/// pages since they last agreed (the module's docs): at its commit, before rt is handed it.
+/// Nothing where it uses none.
+pub(super) fn copy_in(copies: &[Arc<Copied>]) {
+    if copies.is_empty() {
         return;
     }
     let clock = crate::os::OsClock::new();
     let began = clock.now_mono();
-    let copies = COPIES.lock().clone();
     let written: u64 = copies.iter().map(|copied| copied.copy_in()).sum();
     synced(IN_BYTES_CODE, written, &clock, began);
 }
 
-/// The completed handler that writes back into every live copy's pages the bytes the GPU changed
-/// in the copy (the module's docs), to run first of a command buffer's; `None` while no copy is
-/// live, as at the command buffer's commit.
-pub(super) fn merging() -> Option<impl FnOnce(&rt::CommandBuffer) + Send + 'static> {
-    any().then_some(|_: &rt::CommandBuffer| merge_back())
+/// The completed handler that writes back into the pages of each of `copies`, those a command
+/// buffer uses, the bytes the GPU changed in the copy (the module's docs), to run first of its;
+/// `None` where it uses none.
+pub(super) fn merging(
+    copies: &[Arc<Copied>],
+) -> Option<impl FnOnce(&rt::CommandBuffer) + Send + 'static> {
+    let copies = copies.to_vec();
+    (!copies.is_empty()).then_some(move |_: &rt::CommandBuffer| merge_back(&copies))
 }
 
-/// Writes back into every live copy's pages the bytes the GPU changed in the copy, and puts back
-/// from its base those of a copy whose writes are dropped.
-fn merge_back() {
-    if !any() {
-        return;
-    }
+/// Writes back into the pages of each of `copies` the bytes the GPU changed in the copy, and puts
+/// back from its base those of a copy whose writes are dropped.
+fn merge_back(copies: &[Arc<Copied>]) {
     let clock = crate::os::OsClock::new();
     let began = clock.now_mono();
-    let copies = COPIES.lock().clone();
     let (mut written, mut dropped) = (0, 0);
-    for copied in &copies {
+    for copied in copies {
         match copied.drops {
             true => dropped += copied.drop_back(),
             false => written += copied.merge_back(),
@@ -228,8 +290,11 @@ fn synced(code: &'static str, written: u64, clock: &crate::os::OsClock, began: M
 /// `copied` released: no longer live, and once a sync of it in progress ends, never synced again.
 fn unregister(copied: &Arc<Copied>) {
     let mut copies = COPIES.lock();
-    if let Some(i) = copies.iter().position(|c| Arc::ptr_eq(c, copied)) {
-        copies.swap_remove(i);
+    let id = copied.block.get();
+    if let Some(id) = id
+        && copies.get(id).is_some_and(|c| Arc::ptr_eq(c, copied))
+    {
+        copies.remove(id);
         LIVE.fetch_sub(1, Ordering::Release);
     }
     drop(copies);
@@ -237,7 +302,7 @@ fn unregister(copied: &Arc<Copied>) {
 }
 
 /// A copy of pages and its base (the module's docs).
-struct Copied {
+pub struct Copied {
     /// The pages' first byte.
     home: NonNull<u8>,
     /// The copy's first byte.

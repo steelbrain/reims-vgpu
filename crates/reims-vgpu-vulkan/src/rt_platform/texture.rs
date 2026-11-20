@@ -88,6 +88,7 @@ use crate::core::platform::values::TextureDesc;
 use crate::core::raise::RaiseResult;
 use crate::core::sync::Mutex;
 
+use super::copied::Copied;
 use super::descriptor::rt_texture_descriptor;
 use super::device::RtDevice;
 use super::diag::{Call, Made, Shape};
@@ -201,6 +202,9 @@ pub struct RtTexture {
     /// What a tiled texture takes its bytes from, and a view's of one (`super::tiled`); unset
     /// for any other.
     tiled: OnceLock<Arc<Tiled>>,
+    /// The copy of host pages it lies over, a buffer's or a heap's, and a view's of one
+    /// (`super::copied`); unset for any other.
+    copied: OnceLock<Arc<Copied>>,
 }
 
 impl Drop for RtTexture {
@@ -226,6 +230,12 @@ impl RtTexture {
     /// (`super::tiled`).
     pub(super) fn tiled(&self) -> Option<&Arc<Tiled>> {
         self.tiled.get()
+    }
+
+    /// The copy of host pages it lies over, where it lies over one (`super::copied`), which a
+    /// command buffer that uses it syncs.
+    pub(super) fn copied(&self) -> Option<&Arc<Copied>> {
+        self.copied.get()
     }
 
     /// Makes it a tiled texture, taking its bytes as `tiled` says (`super::tiled`): once, as
@@ -331,6 +341,7 @@ impl RtTexture {
             purgeable: purgeable_state(),
             made: Made::view(&self.made, format_raw, first),
             tiled: self.tiled.clone(),
+            copied: self.copied.clone(),
         })
     }
 }
@@ -354,7 +365,8 @@ pub fn make(
 /// `Buffer::new_texture`, `Device::new_heap_texture`), answering the descriptor's options with
 /// `held`'s bits `taken` (a buffer's storage mode, as rt makes the texture of the buffer's whatever
 /// the descriptor's; a heap's modes, which its resources take), what it is for the boot
-/// diagnostics `diag`'s of its shape. Nil where rt refuses it, counted.
+/// diagnostics `diag`'s of its shape, lying over `copied` where the memory is a copy of host
+/// pages (`super::copied`). Nil where rt refuses it, counted.
 pub(super) fn make_over(
     device: &RtObj<RtDevice>,
     sel: &'static str,
@@ -362,10 +374,15 @@ pub(super) fn make_over(
     (held, taken): (u64, u64),
     over: impl FnOnce(&rt::TextureDescriptor, Option<u32>) -> Result<rt::Texture, rt::Error>,
     diag: impl FnOnce(&Shape) -> Arc<Made>,
+    copied: Option<&Arc<Copied>>,
 ) -> Option<RtObj<RtTexture>> {
     let options = desc.resource_options.unwrap_or(0);
     let options = (options & !taken) | (held & taken);
-    made_of(device, sel, desc, options, over, diag)
+    let made = made_of(device, sel, desc, options, over, diag);
+    if let (Some(texture), Some(copied)) = (&made, copied) {
+        let _ = texture.copied.set(Arc::clone(copied));
+    }
+    made
 }
 
 /// The texture `make` of `desc` makes for `sel` (the module's docs), of the resource options
@@ -420,6 +437,7 @@ fn answered(
         purgeable: purgeable_state(),
         made: diag(&shape),
         tiled: OnceLock::new(),
+        copied: OnceLock::new(),
     })
 }
 
@@ -450,6 +468,7 @@ pub(super) fn drawable(device: &RtObj<RtDevice>, texture: rt::Texture) -> RtObj<
         purgeable: purgeable_state(),
         made: Made::new(Call::Drawable, &shape),
         tiled: OnceLock::new(),
+        copied: OnceLock::new(),
     })
 }
 

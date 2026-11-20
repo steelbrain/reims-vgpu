@@ -44,6 +44,7 @@ use crate::core::sync::Mutex;
 
 use super::blit::{NIL, Stop, report};
 use super::command::{Kept, OpenMark};
+use super::copied::Used;
 use super::diag::Use;
 use super::unbuilt::{Unbuilt, refuse};
 use super::{RtObj, RtPlatform};
@@ -324,6 +325,44 @@ fn resource_usage(usage: u64) -> Result<rt::ResourceUsage, Stop> {
     }
 }
 
+/// Notes the copies `cmd` uses in `used` ([`Used`]): those the buffers it sets, the heaps and
+/// resources it declares and its indirect buffers lie over. Its textures are noted as they bind
+/// ([`Kept::used`]).
+fn note_copies(used: &Used, cmd: &ComputeCmd<'_, RtPlatform>) {
+    if !super::copied::any() {
+        return;
+    }
+    match cmd {
+        ComputeCmd::DispatchThreadgroupsIndirect {
+            indirect_buffer: buffer,
+            ..
+        }
+        | ComputeCmd::DispatchThreadsIndirect {
+            indirect_buffer: buffer,
+            ..
+        }
+        | ComputeCmd::EncodeStartIf { buffer, .. }
+        | ComputeCmd::EncodeStartWhile { buffer, .. } => buffer.iter().for_each(|b| used.buffer(b)),
+        ComputeCmd::ExecuteCommandsIndirect {
+            indirect_range_buffer: buffer,
+            ..
+        }
+        | ComputeCmd::SetStageInRegionIndirect {
+            indirect_buffer: buffer,
+            ..
+        } => used.buffer(buffer),
+        ComputeCmd::SetBuffers { buffers, .. }
+        | ComputeCmd::SetBuffersAttributeStrides { buffers, .. } => {
+            buffers.iter().flatten().for_each(|b| used.buffer(b));
+        }
+        ComputeCmd::UseHeaps { heaps } => heaps.iter().flatten().for_each(|h| used.heap(h)),
+        ComputeCmd::UseResources { resources, .. } => {
+            resources.iter().flatten().for_each(|r| used.resource(r));
+        }
+        _ => {}
+    }
+}
+
 impl ComputeEncoder<RtPlatform> for RtObj<RtComputeEncoder> {
     /// rt's command (the module's docs); `endEncoding` ends rt's encoder.
     fn encode(&self, on: OnFault, cmd: ComputeCmd<'_, RtPlatform>) -> RaiseResult<()> {
@@ -332,6 +371,7 @@ impl ComputeEncoder<RtPlatform> for RtObj<RtComputeEncoder> {
             let _ = on;
             let sel = cmd.selector();
             let ending = matches!(cmd, ComputeCmd::EndEncoding);
+            note_copies(self.kept.copies(), &cmd);
             let mut open = self.open.lock();
             let stopped = self.command(&mut open, cmd).err();
             if ending && let Some(e) = open.rt.take() {
