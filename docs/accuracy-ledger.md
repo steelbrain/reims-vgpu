@@ -77,6 +77,15 @@ code instead, `rt-refused-texture-format-<n>`; a pipeline state's imageblock len
 `rt-refused-heap-texture-place`. The boot diagnostics (`rt_platform/diag.rs`, lines that start
 `reims-vgpu: rt-diag`) add what the call asked of rt where its site names it.
 
+Among the translator's refusals (`rt-refused-translation`), a fragment function that reads an
+interpolant at a sample or an offset (`interpolate_at_sample`, `interpolate_at_offset`) outside
+its first block, or after a `discard_fragment` in it, is refused on every device, where Metal
+makes it (metal2vulkan's `Feature::DivergentInterpolation`): the render pipeline state's creator
+answers its `NSError`. A device's sample and offset reads may read the quad's other invocations,
+and RADV's read garbage where those have left the control flow (measured by metal2vulkan in a
+1x1 framebuffer, whose quad holds three helper invocations). The same reads in the first block,
+before any discard, are made.
+
 ## The loss of the device
 
 | What runs instead of Metal's answer | Where |
