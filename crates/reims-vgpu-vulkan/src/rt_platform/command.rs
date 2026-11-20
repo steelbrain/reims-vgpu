@@ -66,12 +66,17 @@
 //!   status, error, GPU times and handlers are core's, from its parts.
 //! - **Protection options** other than 0 are unbuilt ([`Unbuilt::Protection`]): rt protects no
 //!   work, and the command buffer runs as one without them.
+//! - **The trace** (`core::trace`), where it is on: each command buffer's completion writes the
+//!   Vulkan platform's `cbdone`, with its commit's time and rt's submission and GPU times
+//!   ([`trace_commit`]), so a traced walk splits a command buffer's wait at its submission's end
+//!   and its GPU's start and end; and commits and completions write rt's metrics, first-use
+//!   waits and lowerings among them, at most every 50 ms ([`trace_metrics`]).
 //!
 //! Every call rt refuses answers as Metal's answers where it fails (nothing encoded, nil, no
 //! wait), counted under the refusal's kind ([`rt_refused`]); never a death.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use metal2vulkan_rt as rt;
@@ -88,6 +93,7 @@ use crate::core::raise::refusals;
 use crate::core::raise::{OnFault, RaiseResult};
 use crate::core::rt::BlockEnv;
 use crate::core::sync::Mutex;
+use crate::core::trace;
 
 use super::blit::RtBlitEncoder;
 use super::compute::RtComputeEncoder;
@@ -117,6 +123,103 @@ const ERROR_OUT_OF_MEMORY: i64 = 8;
 
 /// A handler as rt runs it.
 type Handler = Box<dyn FnOnce(&rt::CommandBuffer) + Send>;
+
+/// The number of the last commit the trace timed ([`trace_commit`]).
+static TRACED_COMMITS: AtomicU64 = AtomicU64::new(0);
+
+/// When the trace last wrote rt's metrics ([`trace_metrics`]), on its clock.
+static METRICS_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// The least time between two of the trace's `rtmetrics` lines, in nanoseconds: 50 ms.
+const METRICS_EVERY: u64 = 50_000_000;
+
+/// Where the trace is on (`core::trace`), a completed handler that writes `cb`'s `cbdone`, which
+/// the commit runs before core's: the event and values the Vulkan platform writes
+/// (`gpu::timing::commit`), so one reader reads both platforms' traces; and rt's metrics, where
+/// they are due ([`trace_metrics`]). The command buffer is named by its address, and numbered in
+/// the order of the commits the trace timed. `cbdone`'s times are rt's (the module's docs, what
+/// a completed handler learns), on rt's host clock, which on Linux is not the trace's
+/// (`CLOCK_MONOTONIC` where the trace counts `CLOCK_MONOTONIC_RAW`): each is moved onto the
+/// trace's clock by the two clocks' difference, read at the handler; 0 stays 0.
+fn trace_commit(cb: &rt::CommandBuffer) -> Option<Handler> {
+    if !trace::on() {
+        return None;
+    }
+    let n = TRACED_COMMITS
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    let id = address(cb);
+    let at = trace::now();
+    trace_metrics(at);
+    Some(Box::new(move |made: &rt::CommandBuffer| {
+        let host = rt::host_time();
+        let now = trace::now();
+        let on_trace = |t: u64| -> u64 {
+            if t == 0 {
+                return 0;
+            }
+            let moved = i128::from(t) + i128::from(now) - i128::from(host);
+            u64::try_from(moved.max(0)).unwrap_or(u64::MAX)
+        };
+        // cbdone (timed at its handler): command buffer, commit number, then its commit, its
+        // submission's start and end, its GPU's start and end, in the trace's nanoseconds
+        let times = [
+            made.kernel_start_time(),
+            made.kernel_end_time(),
+            made.gpu_start_time(),
+            made.gpu_end_time(),
+        ]
+        .map(on_trace);
+        let [kernel_start, kernel_end, gpu_start, gpu_end] = times;
+        trace::event_at(
+            now,
+            "cbdone",
+            &[id, n, at, kernel_start, kernel_end, gpu_start, gpu_end],
+        );
+        trace_metrics(now);
+    }))
+}
+
+/// Writes rt's metrics to the trace at `now`, its clock's time, where [`METRICS_EVERY`] has
+/// passed since the last write: a commit and a completion call it, so a stall with neither has
+/// a line at most that long before it and one at its end.
+fn trace_metrics(now: u64) {
+    let last = METRICS_WRITTEN.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < METRICS_EVERY
+        || (METRICS_WRITTEN.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed))
+            .is_err()
+    {
+        return;
+    }
+    let Some(m) = super::device::metrics() else {
+        return;
+    };
+    // rtmetrics: rt's counts since its device was made: first-use waits, their nanoseconds and
+    // the longest; the nanoseconds commits waited for the submission lock and the longest;
+    // `VkSubmitInfo2`s and `vkQueueSubmit2` calls; `VkPipeline`s created; lowerings made and
+    // lowerings read from the cache directory
+    trace::event_at(
+        now,
+        "rtmetrics",
+        &[
+            m.first_use_waits,
+            m.first_use_wait_nanos,
+            m.first_use_wait_max_nanos,
+            m.commit_lock_wait_nanos,
+            m.commit_lock_wait_max_nanos,
+            m.submit_infos,
+            m.submissions,
+            m.pipelines_created,
+            m.translations,
+            m.translations_loaded,
+        ],
+    );
+}
+
+/// `of`'s address, which names it in the trace.
+fn address<T>(of: &T) -> u64 {
+    u64::try_from(std::ptr::from_ref(of).addr()).unwrap_or_default()
+}
 
 /// `id<MTLCommandBuffer>` on metal2vulkan-rt.
 pub struct RtCommandBuffer {
@@ -672,6 +775,10 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
             };
             submission.extend(scheduled);
             seen.extend(completed);
+            // The trace's cbdone goes after its error and its merge, before core's handlers.
+            if let Some(done) = trace_commit(&self.rt) {
+                seen.insert(0, done);
+            }
             // Its error is made before core's handlers run, as rt completes it, so a lost
             // device's hang is the first it ends in flight (the module's docs).
             let failure = Arc::clone(&self.failure);

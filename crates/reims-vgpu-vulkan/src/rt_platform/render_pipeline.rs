@@ -57,6 +57,7 @@ use crate::core::platform::values::{
     RenderPipelineDesc, TessellationDesc, VertexDesc,
 };
 use crate::core::raise::RaiseResult;
+use crate::core::trace;
 
 use super::device::RtDevice;
 use super::pipeline::{
@@ -338,7 +339,12 @@ fn make(
     colors: ([u32; 8], u32),
 ) -> Result<RtObj<RtRenderPipeline>, NsErrorText> {
     let mut taking = Taking::new(device);
+    let started = trace::on().then(trace::now);
     let made = (device.rt()).new_render_pipeline_state(descriptor, |samplers| taking.ids(samplers));
+    if let Some(started) = started {
+        // rtpso: the nanoseconds rt's make of the state took
+        trace::event("rtpso", &[trace::now().saturating_sub(started)]);
+    }
     if let Err(error) = &made {
         super::diag::keep_refused_render(WITH_DESCRIPTOR, error, descriptor);
     }

@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 use metal2vulkan_rt as rt;
 use parking_lot::Mutex;
+use reims_vgpu_vulkan::core::trace;
 
 use super::{BlockError, BlockId, BlockInfo, BlockSource, MemoryClass};
 
@@ -101,7 +102,16 @@ impl BlockSource for RtBlocks {
             MemoryClass::Private => rt::MemoryClass::Private,
             MemoryClass::Shared => rt::MemoryClass::Shared,
         };
-        let block = (self.device.take_block(rt_class, len)).map_err(|error| match error {
+        let started = trace::on().then(trace::now);
+        let taken = self.device.take_block(rt_class, len);
+        if let Some(started) = started {
+            // rttake: the class (0 Private, 1 Shared), the length asked, the nanoseconds rt's
+            // take took, 1 where rt refused it
+            let shared = u64::from(matches!(class, MemoryClass::Shared));
+            let took = trace::now().saturating_sub(started);
+            trace::event("rttake", &[shared, len, took, u64::from(taken.is_err())]);
+        }
+        let block = taken.map_err(|error| match error {
             rt::Error::Limit(rt::Limit::BlockLen { .. }) => BlockError::Length,
             _ => BlockError::OutOfMemory,
         })?;

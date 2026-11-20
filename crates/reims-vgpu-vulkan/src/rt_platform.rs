@@ -682,6 +682,74 @@ mod tests {
         (queue, ended)
     }
 
+    /// A traced commit, on the GPU the test holds, writes the Vulkan platform's `cbdone` at its
+    /// completion: its commit number, then its commit's time and rt's submission and GPU times
+    /// on the trace's clock, in their order (an empty command buffer's GPU times are at its
+    /// submission's end or later) and none after the line's own time; and its commit writes
+    /// rt's metrics (`command::trace_metrics`).
+    #[test]
+    fn on_vulkan_a_traced_commit_writes_its_cbdone_and_rt_metrics() {
+        use std::sync::atomic::Ordering;
+
+        use crate::core::trace;
+        // nextest runs each test in a process of its own, whose trace file is this one
+        let path = std::env::temp_dir().join(format!("rvg-rt-cbdone-{}.txt", std::process::id()));
+        assert!(trace::to_file(&path));
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU");
+        let (_queue, ended) = commit_work(&device);
+        let clock = crate::os::OsClock::new();
+        let start = clock.now_mono();
+        while ended.load(Ordering::SeqCst) < 8 {
+            let waited = clock.now_mono().saturating_duration_since(start);
+            assert!(waited < Duration::from_secs(10), "8 completions in 10 s");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        trace::flush_before_death();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let lines = |kind: &str| -> Vec<Vec<u64>> {
+            (text.lines())
+                .map(|l| l.split(' ').collect::<Vec<_>>())
+                .filter(|f| f.get(2) == Some(&kind))
+                .map(|f| {
+                    let at = f[0].parse::<u64>().unwrap();
+                    let values = f[3..].iter().map(|v| v.parse::<u64>().unwrap());
+                    std::iter::once(at).chain(values).collect()
+                })
+                .collect()
+        };
+        let done = lines("cbdone");
+        assert_eq!(done.len(), 8, "{text}");
+        let mut numbers: Vec<u64> = done.iter().map(|f| f[2]).collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, (1..=8).collect::<Vec<_>>(), "{text}");
+        for f in &done {
+            let [
+                line,
+                _id,
+                _n,
+                at,
+                kernel_start,
+                kernel_end,
+                gpu_start,
+                gpu_end,
+            ] = f[..]
+            else {
+                panic!("cbdone's 7 values: {text}");
+            };
+            assert!(at > 0, "{text}");
+            // rt's clock moved onto the trace's, which drift apart by far less than this
+            assert!(at <= kernel_start + 1_000_000, "{text}");
+            assert!(kernel_start <= kernel_end, "{text}");
+            assert!(kernel_end <= gpu_start && gpu_start <= gpu_end, "{text}");
+            assert!(gpu_end <= line, "{text}");
+        }
+        let metrics = lines("rtmetrics");
+        assert!(!metrics.is_empty(), "{text}");
+        assert!(metrics.iter().all(|f| f.len() == 11), "{text}");
+    }
+
     /// Runs the test named `test` again in a child process, with `RVG_QUIESCE_CHILD` naming it:
     /// its exit status and its standard error.
     fn run_child(test: &str) -> (Option<i32>, String) {

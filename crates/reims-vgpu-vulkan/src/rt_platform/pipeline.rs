@@ -51,6 +51,7 @@ use crate::core::platform::values::{FullComputePipelineDesc, LinkedFunctionsDesc
 use crate::core::platform::{Handle, Platform};
 use crate::core::raise::RaiseResult;
 use crate::core::sync::Mutex;
+use crate::core::trace;
 
 use super::device::RtDevice;
 use super::library::RtFunction;
@@ -341,8 +342,13 @@ fn make(
     descriptor: &rt::ComputePipelineDescriptor,
 ) -> Result<RtObj<RtComputePipeline>, NsErrorText> {
     let mut taking = Taking::new(device);
+    let started = trace::on().then(trace::now);
     let made =
         (device.rt()).new_compute_pipeline_state(descriptor, |samplers| taking.ids(samplers));
+    if let Some(started) = started {
+        // rtcpso: the nanoseconds rt's make of the state took
+        trace::event("rtcpso", &[trace::now().saturating_sub(started)]);
+    }
     if let Err(error) = &made {
         super::diag::keep_refused_compute(sel, error, descriptor);
     }
