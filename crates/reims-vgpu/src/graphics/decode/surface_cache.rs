@@ -11582,9 +11582,9 @@ pub(super) mod tests {
                     .map(|(_, uses)| uses.is_some())
                     .map_err(|_| ())
             });
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // The writer's commit is held until `go`: a begin that waited for it never ends here.
             assert!(
-                begin.is_finished(),
+                crate::graphics::tests::eventually(|| begin.is_finished()),
                 "a begin waited for another buffer's commit"
             );
             assert_eq!(begin.join().unwrap(), Ok(true));
@@ -11600,9 +11600,8 @@ pub(super) mod tests {
                     .map(|_| ())
                     .map_err(|_| ())
             });
-            std::thread::sleep(std::time::Duration::from_millis(50));
             assert!(
-                fill.is_finished(),
+                crate::graphics::tests::eventually(|| fill.is_finished()),
                 "a begin waited for another buffer's commit"
             );
             assert!(
@@ -14437,14 +14436,11 @@ pub(super) mod tests {
             let mut filling = r.dec.sender(None, super::super::Sinks::default());
             let device = r.device.clone_ref();
             let two = scope.spawn(move || filling.decode(&device, &second).unwrap());
-            let mut encoded = false;
-            for _ in 0..400 {
-                if events(&r.p.call_log().since(mark), SIGNAL).len() >= 2 {
-                    encoded = true;
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
+            // The first's commit is held until it opens: a fill that waited for it never encodes
+            // here.
+            let encoded = crate::graphics::tests::eventually(|| {
+                events(&r.p.call_log().since(mark), SIGNAL).len() >= 2
+            });
             held.open();
             (encoded, (one.join().unwrap(), two.join().unwrap()))
         });
@@ -16832,9 +16828,10 @@ pub(super) mod tests {
             });
             committing.recv().unwrap();
             let asked = scope.spawn(ask);
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // The writer's commit is held until `go` drops: a download that waited for it never
+            // ends here.
             assert!(
-                asked.is_finished(),
+                crate::graphics::tests::eventually(|| asked.is_finished()),
                 "a download waited for the writer's commit"
             );
             asked.join().unwrap();
