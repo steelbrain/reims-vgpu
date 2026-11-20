@@ -48,6 +48,10 @@ use crate::core::platform::os::vm::{HostAddr, HostVm as _};
 /// The device extension the video's copies take, on Windows (`os/windows/plane_copy.rs`).
 #[cfg(windows)]
 pub(crate) use host_os::add_video_extensions;
+/// Whether views are mapped from their files for the imports of their pages, on Linux
+/// (`os/linux/import.rs`).
+#[cfg(all(test, target_os = "linux", feature = "rt"))]
+pub(crate) use host_os::imports_need_files;
 /// Learns whether a device imports views of guest pages mapped through dma-bufs, on Linux
 /// (`os/linux/import.rs`).
 #[cfg(target_os = "linux")]
@@ -60,6 +64,11 @@ pub(crate) use host_os::take_region_keeps;
 /// (`os/linux/thread_counts.rs`).
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use host_os::thread_counts;
+/// The setting, at the rt platform's first import of a view mapped through dma-bufs that rt takes
+/// through none of them, of views mapped from their files for the imports of their pages, on Linux
+/// (`os/linux/import.rs`).
+#[cfg(all(target_os = "linux", feature = "rt"))]
+pub(crate) use host_os::views_need_files;
 pub(crate) use host_os::{
     COPIES_READ_ONLY, Drawables, ImportMade, allocate_aliasable, dma_buf_refusal, host_memory,
     host_memory_vouched, import_heap_view, import_view,
@@ -88,15 +97,6 @@ pub use host_os::{LendRefusal, LentDmaBuf, dma_buf_of_host, map_for_pointer};
 /// (`os/linux/device_lend.rs`).
 #[cfg(all(target_os = "linux", feature = "rt"))]
 pub(crate) use host_os::{MappingsHeld, dma_bufs_of_host, hold_mappings, through_dma_bufs};
-/// The setting, at the rt platform's first import of a view mapped through dma-bufs that rt takes
-/// through none of them, of views mapped from their files for the imports of their pages, on Linux
-/// (`os/linux/import.rs`).
-#[cfg(all(target_os = "linux", feature = "rt"))]
-pub(crate) use host_os::views_need_files;
-/// Whether views are mapped from their files for the imports of their pages, on Linux
-/// (`os/linux/import.rs`).
-#[cfg(all(test, target_os = "linux", feature = "rt"))]
-pub(crate) use host_os::imports_need_files;
 #[cfg(test)]
 pub(crate) use host_os::{PAGE, mapped, writable};
 /// Whether one dma-buf takes the pages of a range, as the runtime asks for a texture's own, of a

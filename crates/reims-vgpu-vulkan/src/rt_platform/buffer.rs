@@ -3371,7 +3371,10 @@ mod tests {
             let first = NonNull::new(view.as_ptr::<u8>()).expect("a mapped view");
             (view, crate::os::through_dma_bufs(first, 2 * page))
         };
-        let hooks = [(&HOST_MAKES_NO_DMA_BUF, 3, view()), (&DMA_BUF_REFUSED, 4, view())];
+        let hooks = [
+            (&HOST_MAKES_NO_DMA_BUF, 3, view()),
+            (&DMA_BUF_REFUSED, 4, view()),
+        ];
         for (hook, why, (view, through)) in hooks {
             let before = counts();
             hook.set(true);
@@ -3438,24 +3441,41 @@ mod tests {
             eprintln!("views are not mapped through dma-bufs here: unchecked");
             return;
         }
-        assert!(!crate::os::imports_need_files(), "no import refused a view before");
+        assert!(
+            !crate::os::imports_need_files(),
+            "no import refused a view before"
+        );
 
         HOST_MAKES_NO_DMA_BUF.set(true);
         // SAFETY: the view and its pages are the test's own, never freed.
         let bytes = unsafe { HostRange::new(refused, 2 * page) };
         let made = device.new_buffer_over_host_memory(on, bytes, 0, None);
         HOST_MAKES_NO_DMA_BUF.set(false);
-        let first = made.expect("never a raise").expect("a buffer over the view");
-        assert!(crate::os::imports_need_files(), "views are mapped from their files now");
+        let first = made
+            .expect("never a raise")
+            .expect("a buffer over the view");
+        assert!(
+            crate::os::imports_need_files(),
+            "views are mapped from their files now"
+        );
 
         let (later, through) = view(0x77, 0x88);
-        assert!(!through, "a view made after it lies in no dma-buf's mapping");
+        assert!(
+            !through,
+            "a view made after it lies in no dma-buf's mapping"
+        );
         let from_files = counted(IMPORTS_FROM_FILES);
         // SAFETY: the view and its pages are the test's own, never freed.
         let bytes = unsafe { HostRange::new(later, 2 * page) };
         let made = device.new_buffer_over_host_memory(on, bytes, 0, None);
-        let buffer = made.expect("never a raise").expect("a buffer over the view");
-        assert_eq!(counted(IMPORTS_FROM_FILES), from_files, "nothing mapped again");
+        let buffer = made
+            .expect("never a raise")
+            .expect("a buffer over the view");
+        assert_eq!(
+            counted(IMPORTS_FROM_FILES),
+            from_files,
+            "nothing mapped again"
+        );
         assert_eq!((buffer.contents(), buffer.length()), (later, 2 * page));
         assert_eq!(read(later, 16), [0x88; 16]);
         assert_eq!(read(later.wrapping_add(page), 16), [0x77; 16]);
