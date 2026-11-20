@@ -57,7 +57,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "check",
-        about: "paths, testkit, header --check, the records of the prebuilt option ROM and guest kexts (make -C firmware prebuilt-check, make -C guest prebuilt-check), rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux and, where Rosetta runs x86-64 code, core's tests as x86-64; off Windows, clippy for x86-64 Windows",
+        about: "paths, testkit, header --check, the records of the prebuilt option ROM and guest kexts (make -C firmware prebuilt-check, make -C guest prebuilt-check), rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux, links to Homebrew's Vulkan loader and KosmicKrisp where the tests load them (make vulkan-links), and, where Rosetta runs x86-64 code, core's tests as x86-64; off Windows, clippy for x86-64 Windows",
         run: cmd_check,
     },
 ];
@@ -213,6 +213,17 @@ fn empty_archive() -> Res<std::path::PathBuf> {
     Ok(path)
 }
 
+/// Where a Mac's test binaries find the Vulkan loader and Mesa's KosmicKrisp: the rt platform
+/// loads each only from beside the process's executable or from `../lib`
+/// (`crates/reims-vgpu-vulkan/src/os/macos/rt_driver.rs`), and nextest runs the binaries from
+/// `<target>/debug/deps`, so `<target>/debug/lib`. Without them every test that opens a device
+/// finds none. The Makefile's `vulkan-links` links them there from Homebrew, as it does for a
+/// QEMU in `build/qemu`, with `BUILD` (its `build/`) set to `<target>/debug`, and names a file
+/// Homebrew lacks.
+fn mac_test_libs_build(target: &std::path::Path) -> String {
+    format!("BUILD={}", target.join("debug").display())
+}
+
 /// The macOS core's tests run as under Rosetta, with the x86-64 guest's pages.
 const X86_64_MACOS_TARGET: &str = "x86_64-apple-darwin";
 
@@ -279,6 +290,10 @@ fn cmd_check(args: &[String]) -> Res<bool> {
                 &[],
             )?;
         }
+        if cfg!(target_os = "macos") {
+            let target = tools::target_dir(&mut tools::System)?;
+            ok &= make(&["vulkan-links", &mac_test_libs_build(&target)])?;
+        }
         ok &= cargo(&[
             "nextest",
             "run",
@@ -335,5 +350,27 @@ mod tests {
                 "{target} in {targets}"
             );
         }
+    }
+
+    /// The Mac's test binaries load the Vulkan libraries from `<target>/debug/lib` only where
+    /// the Makefile's `vulkan-links` writes `$(BUILD)/lib`: a rename of either there would link
+    /// them elsewhere, and every test that opens a device would find none.
+    #[test]
+    fn the_mac_test_libs_go_where_the_test_binaries_load_them() {
+        let makefile = read(&repo_root().join("Makefile")).unwrap();
+        for line in [
+            "BUILD_DIR := $(if $(filter /%,$(BUILD)),$(BUILD),$(CURDIR)/$(BUILD))",
+            "VULKAN_LIBS := $(BUILD_DIR)/lib",
+            "vulkan-links:",
+        ] {
+            assert!(
+                makefile.lines().any(|l| l == line),
+                "the Makefile has no line {line}"
+            );
+        }
+        assert_eq!(
+            mac_test_libs_build(std::path::Path::new("/t")),
+            "BUILD=/t/debug"
+        );
     }
 }
