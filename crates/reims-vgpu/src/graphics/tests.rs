@@ -240,11 +240,13 @@ fn the_device_reserves_the_guest_s_texture_ids_first() {
 }
 
 /// On the Vulkan platform, a texture the guest places at one of its ids and the plain textures the
-/// host makes never share an id, and one placed at the guest's last id, past the table a fresh
-/// device has, is made and lives. Each test runs in a process of its own, so the device's ids
+/// host makes never share an index, and one placed at the guest's last id, past the table a fresh
+/// device has, is made and lives. Each answers rt's resource id: its index in the low word, the
+/// guest's id for a placed texture, and in the high word rt's word for its descriptor
+/// (metal2vulkan-rt's `ResourceId`), the same for every texture here, whose descriptors differ
+/// only in where they are placed. Each test runs in a process of its own, so the device's ids
 /// start fresh
 #[test]
-#[ignore = "rt does not place a texture at the guest's resource id: id 1 is answered 0x500d2400000001"]
 fn on_vulkan_guest_texture_ids_are_kept_from_the_host_s() {
     use reims_vgpu_vulkan::core::platform::resource::Texture as _;
     use reims_vgpu_vulkan::core::platform::values::TextureDesc;
@@ -276,9 +278,17 @@ fn on_vulkan_guest_texture_ids_are_kept_from_the_host_s() {
     for id in [1, 2, 65, last / 2, last - 1, last] {
         let d = platform.texture_descriptor(&desc(Some((id, true))));
         let t = gpu.new_texture(OnFault::Return, &d).unwrap().unwrap();
-        assert_eq!(t.gpu_resource_id(), id);
+        assert_eq!(
+            t.gpu_resource_id() & 0xffff_ffff,
+            id,
+            "{:#x}",
+            t.gpu_resource_id()
+        );
         placed.push(t);
     }
+    // rt's word for the descriptor, which no index changes.
+    let word = placed[0].gpu_resource_id() >> 32;
+    assert_ne!(word, 0);
     let plain_desc = platform.texture_descriptor(&desc(None));
     let plain: Vec<_> = (0..256)
         .map(|_| {
@@ -287,9 +297,14 @@ fn on_vulkan_guest_texture_ids_are_kept_from_the_host_s() {
                 .unwrap()
         })
         .collect();
+    let words: Vec<u64> = (placed.iter().chain(&plain))
+        .map(|t| t.gpu_resource_id() >> 32)
+        .filter(|&w| w != word)
+        .collect();
+    assert!(words.is_empty(), "other words than {word:#x}: {words:x?}");
     let inside: Vec<u64> = plain
         .iter()
-        .map(|t| t.gpu_resource_id())
+        .map(|t| t.gpu_resource_id() & 0xffff_ffff)
         .filter(|id| (1..=last).contains(id))
         .collect();
     assert!(
@@ -297,7 +312,7 @@ fn on_vulkan_guest_texture_ids_are_kept_from_the_host_s() {
         "plain textures took the guest's ids {inside:?}"
     );
     for (t, id) in placed.iter().zip([1, 2, 65, last / 2, last - 1, last]) {
-        assert_eq!(t.gpu_resource_id(), id);
+        assert_eq!(t.gpu_resource_id(), word << 32 | id);
     }
 }
 
@@ -377,9 +392,10 @@ fn on_vulkan_a_cold_device_takes_no_guest_texture_id() {
                 .unwrap()
         })
         .collect();
+    // rt's resource id: the texture's index in its low word (metal2vulkan-rt's `ResourceId`).
     let inside: Vec<u64> = plain
         .iter()
-        .map(|t| t.gpu_resource_id())
+        .map(|t| t.gpu_resource_id() & 0xffff_ffff)
         .filter(|id| guest_texture_ids().contains(id))
         .collect();
     assert!(

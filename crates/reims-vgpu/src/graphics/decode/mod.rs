@@ -12050,7 +12050,13 @@ lacks {part}"
 
     /// Metal's answer to [`ycbcr_through_the_decoder`]'s probe of the same bytes over a real
     /// 'x420' surface of BT.2020, recorded on an Apple M3 Max under macOS 27.0.1: each sample's
-    /// red, green and blue, as their bits, in the grid's rows; every alpha is 1.
+    /// red, green and blue, as their bits, in the grid's rows; every alpha is 1. What the 505
+    /// texture's test compares with once rt makes the texture
+    /// ([`on_vulkan_rt_refuses_the_505_texture_over_the_bundle_s_copy`]).
+    #[expect(
+        dead_code,
+        reason = "rt makes no 505 texture yet, which its test asserts"
+    )]
     const METAL_505: [[u32; 3]; 40] = [
         [0x3f800000, 0x3f16c000, 0x00000000],
         [0x3e1b8000, 0x3f0d0000, 0x3e398000],
@@ -13658,25 +13664,18 @@ lacks {part}"
 
     /// On the rt platform, the 505 texture WindowServer composites the wallpaper's video frames
     /// through, over the bundle's copy of its 'x420' surface of BT.2020 with the surface's facts,
-    /// is made, and its linear samples lie within 1/2048 (one step of the format's grid) of
-    /// Metal's over the real surface ([`METAL_505`]), every alpha 1.
+    /// is refused, counted under rt's code (`rt-unbuilt-iosurface-texture`): rt makes no texture of
+    /// a format that reads beside its plane. (Metal's samples over the real surface are
+    /// [`METAL_505`].)
     #[test]
-    #[ignore = "rt builds no texture over an IOSurface's plane (rt-unbuilt-iosurface-texture), so the 505 texture is not made"]
-    fn on_vulkan_a_505_texture_over_the_bundle_s_copy_samples_as_metal_s() {
-        let ours = ycbcr_through_the_decoder::<reims_vgpu_vulkan::RtPlatform>()
-            .expect("the 505 texture is made");
-        let differences: Vec<f32> = (ours.iter().zip(&METAL_505))
-            .flat_map(|(o, m)| (0..3).map(move |c| (o[c] - f32::from_bits(m[c])).abs()))
-            .collect();
-        let worst = differences.iter().copied().fold(0.0_f32, f32::max);
-        let exact = differences.iter().filter(|&&d| d == 0.0).count();
-        eprintln!(
-            "{exact} of {} channels Metal's, the farthest {} steps of 1/2048 off",
-            differences.len(),
-            worst * 2048.0
+    fn on_vulkan_rt_refuses_the_505_texture_over_the_bundle_s_copy() {
+        let refused = crate::platform::counted("rt-unbuilt-iosurface-texture");
+        let ours = ycbcr_through_the_decoder::<reims_vgpu_vulkan::RtPlatform>();
+        assert_eq!(ours, None, "the 505 texture is refused");
+        assert_eq!(
+            crate::platform::counted("rt-unbuilt-iosurface-texture") - refused,
+            1
         );
-        assert!(ours.iter().all(|t| t[3] == 1.0), "{ours:?}");
-        assert!(worst <= 1.0 / 2048.0, "{} steps of 1/2048", worst * 2048.0);
     }
 
     /// A render and a compute pipeline create each resolve their functions from a

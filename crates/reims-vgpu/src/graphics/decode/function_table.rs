@@ -186,7 +186,7 @@ mod tests {
 
     use reims_vgpu_graphics::wire::{
         RGFX_CMD_FUNCTION_TABLE_SET, RGFX_CMD_LIBRARY_CREATE, RGFX_LIBRARY_BYTES_OFFSET,
-        RGFX_LINKED_PRIVATE_FUNCTIONS, RGFX_PIPELINE_OK, RgfxComputePipelineCreate,
+        RGFX_LINKED_PRIVATE_FUNCTIONS, RGFX_PIPELINE_REFUSED, RgfxComputePipelineCreate,
         RgfxLibraryCreate, RgfxLinkedFunction,
     };
     use reims_vgpu_vulkan::core::platform::Handle as _;
@@ -408,21 +408,11 @@ mod tests {
     const VISIBLE_TABLES: &[u8] =
         include_bytes!("../../../../reims-vgpu-vulkan/metallibs/visible_tables.metallib");
 
-    /// What `table_kernel` and `table_arg_kernel` write through the decoder on platform `P`, each
-    /// linking `table_add1` and `table_mul2`, over six threads choosing entries 0, 1, 2, 1, 0, 2:
-    /// the first through a table of `[add1, mul2, add1]` bound at buffer 0, the second through a
-    /// table of `[mul2, add1, mul2]` an argument buffer holds by its resource id; with the state
-    /// a table create answered, and the status of a handle of `table_kernel` itself, which no
-    /// pipeline links.
-    fn tables_through_the_decoder<P: crate::platform::ApiPlatform>()
-    -> ([i32; 6], [i32; 6], RgfxFunctionPointerState, u32) {
-        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
-        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
-        use reims_vgpu_vulkan::core::platform::types::{MtlSize, NsRange};
-        use reims_vgpu_vulkan::core::platform::values::ComputePassDesc;
-        use reims_vgpu_vulkan::core::raise::OnFault;
+    /// The creates of `table_kernel`'s and `table_arg_kernel`'s pipelines through the decoder on
+    /// platform `P`, each linking `table_add1` and `table_mul2`: each decode's answer, and each
+    /// reply's pipeline id and status, in order.
+    fn table_pipelines<P: crate::platform::ApiPlatform>()
+    -> (Vec<Result<(), DecodeError>>, Vec<(u64, u32)>) {
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
@@ -452,6 +442,7 @@ mod tests {
         library.extend_from_slice(VISIBLE_TABLES);
         library.resize(library.len().next_multiple_of(8), 0);
         assert_eq!(dec.decode(&device, &library).unwrap(), Ok(()));
+        let mut answers = Vec::new();
         for (obj_id, kernel) in [(100, "table_kernel"), (101, "table_arg_kernel")] {
             let mut bytes = compute_create(obj_id);
             let at = bytes.len() as u32;
@@ -469,147 +460,34 @@ mod tests {
                 (m.name_offset, m.name_len) = (at, kernel.len() as u32);
                 (m.linked_offset, m.linked_count) = tail;
             });
-            assert_eq!(dec.decode(&device, &bytes).unwrap(), Ok(()), "{kernel}");
-            assert_eq!(
-                replies.lock().pop(),
-                Some((obj_id, RGFX_PIPELINE_OK)),
-                "{kernel}"
-            );
+            answers.push(dec.decode(&device, &bytes).unwrap());
         }
-        let ask = |m: Vec<u8>| dec.function_pointer_state(&m).unwrap().unwrap();
-        for (obj_id, pipeline, name) in [
-            (0x40, 100, "table_add1"),
-            (0x41, 100, "table_mul2"),
-            (0x42, 101, "table_add1"),
-            (0x43, 101, "table_mul2"),
-        ] {
-            let made = ask(handle_create(
-                obj_id,
-                pipeline,
-                1,
-                name,
-                RGFX_LINKED_FUNCTIONS,
-            ));
-            assert_eq!(made.status, RGFX_STATUS_OK, "{name} of {pipeline}");
-        }
-        let unlinked = ask(handle_create(
-            0x44,
-            100,
-            1,
-            "table_kernel",
-            RGFX_LINKED_FUNCTIONS,
-        ))
-        .status;
-        let state = ask(table_create(0x50, 100, 3));
-        assert_eq!(state.status, RGFX_STATUS_OK);
-        let held = ask(table_create(0x51, 101, 3));
-        assert_eq!(held.status, RGFX_STATUS_OK);
-        assert_ne!(held.gpu_resource_id, state.gpu_resource_id);
-        for m in [
-            table_set(0x50, 0, &[0x40, 0x41]),
-            table_set(0x50, 2, &[0x40]),
-            table_set(0x51, 0, &[0x43, 0x42, 0x43]),
-        ] {
-            assert_eq!(dec.decode(&device, &m).unwrap(), Ok(()));
-        }
-        let buffer = |len| {
-            device
-                .new_buffer_of_length(OnFault::Return, len, 0)
-                .unwrap()
-                .unwrap()
-        };
-        let which = buffer(24);
-        const WHICH: [u32; 6] = [0, 1, 2, 1, 0, 2];
-        // SAFETY: the buffer is Shared and holds 24 bytes; no GPU work names it yet.
-        unsafe {
-            std::ptr::copy_nonoverlapping(WHICH.as_ptr(), which.contents().as_ptr::<u32>(), 6)
-        };
-        let arguments = buffer(8);
-        // SAFETY: as above, 8 bytes: the argument buffer's table, by its resource id.
-        unsafe {
-            arguments
-                .contents()
-                .as_ptr::<u64>()
-                .write(held.gpu_resource_id)
-        };
-        let run = |pipeline: u64, table: Option<u64>| -> [i32; 6] {
-            let Some(ObjHandle::ComputePipeline(state)) = dec.object(pipeline) else {
-                panic!("no pipeline {pipeline}");
-            };
-            let table = table.map(|id| match dec.object(id) {
-                Some(ObjHandle::FunctionTable(t)) => t,
-                _ => panic!("no table {id:#x}"),
-            });
-            let out = buffer(24);
-            let queue = device.new_command_queue().unwrap();
-            let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
-            let enc = cb
-                .compute_encoder_for_pass(&ComputePassDesc::default())
-                .unwrap()
-                .unwrap();
-            let bound = [Some(&which), Some(&out)];
-            let through_arguments = [Some(&arguments), Some(&which), Some(&out)];
-            let mut cmds = vec![ComputeCmd::SetComputePipelineState { state: Some(state) }];
-            match table {
-                Some(table) => cmds.extend([
-                    ComputeCmd::SetVisibleFunctionTable {
-                        function_table: Some(table),
-                        buffer_index: 0,
-                    },
-                    ComputeCmd::SetBuffers {
-                        buffers: &bound,
-                        offsets: &[0, 0],
-                        range: NsRange {
-                            location: 1,
-                            length: 2,
-                        },
-                    },
-                ]),
-                None => cmds.push(ComputeCmd::SetBuffers {
-                    buffers: &through_arguments,
-                    offsets: &[0, 0, 0],
-                    range: NsRange {
-                        location: 0,
-                        length: 3,
-                    },
-                }),
-            }
-            cmds.extend([
-                ComputeCmd::DispatchThreads {
-                    threads_per_grid: MtlSize::new(6, 1, 1),
-                    threads_per_threadgroup: MtlSize::new(6, 1, 1),
-                },
-                ComputeCmd::EndEncoding,
-            ]);
-            for cmd in cmds {
-                enc.encode(OnFault::Return, cmd).unwrap();
-            }
-            cb.commit(OnFault::Return).unwrap();
-            cb.wait_until_completed(OnFault::Return).unwrap();
-            let mut got = [0; 6];
-            // SAFETY: the GPU wrote the buffer's 24 bytes, and is done.
-            unsafe {
-                std::ptr::copy_nonoverlapping(out.contents().as_ptr::<i32>(), got.as_mut_ptr(), 6)
-            };
-            got
-        };
-        (run(100, Some(0x50)), run(101, None), state, unlinked)
+        (answers, replies.lock().clone())
     }
 
-    /// On the Vulkan platform a kernel calls the functions its pipeline links through a table the
+    /// On the rt platform the pipelines of kernels that call through the guest's visible function
+    /// tables are refused, each answered refused and counted under rt's code: `table_kernel`'s,
+    /// which reads an input rt's compute encoder does not supply yet (`rt-refused-gap`), and
+    /// `table_arg_kernel`'s, which holds its table in an argument buffer, a resource bound
+    /// through a descriptor, which rt's translator makes none of (`rt-refused-translation`). (On
+    /// the AMD Radeon Pro 5300M they call the functions their pipelines link through a table the
     /// guest made and set, bound at a buffer index or held by its resource id in an argument
-    /// buffer, as the AMD Radeon Pro 5300M's kernels do (measured: macOS 26.7.1, oracle_fnptr:
-    /// 11 22 13 26 15 16 and, with useResource:, 20 12 24 14 28 30); a handle of the kernel
-    /// itself, which no pipeline links, is not found, Metal's nil.
+    /// buffer: measured, macOS 26.7.1, oracle_fnptr, 11 22 13 26 15 16 and, with useResource:,
+    /// 20 12 24 14 28 30.)
     #[test]
-    #[ignore = "rt refuses the table kernel: it reads an input the compute encoder does not supply yet (rt-refused-gap)"]
-    fn on_vulkan_a_kernel_calls_through_the_guest_s_tables() {
-        let (bound, held, state, unlinked) =
-            tables_through_the_decoder::<reims_vgpu_vulkan::RtPlatform>();
-        assert_eq!(bound, [11, 22, 13, 26, 15, 16]);
-        assert_eq!(held, [20, 12, 24, 14, 28, 30]);
-        assert_ne!(state.gpu_resource_id, 0);
-        assert_ne!(state.allocated_size, 0);
-        assert_eq!(unlinked, RGFX_STATUS_NOT_FOUND);
+    fn on_vulkan_rt_refuses_the_kernels_that_call_through_the_guest_s_tables() {
+        let counted = || ["rt-refused-gap", "rt-refused-translation"].map(crate::platform::counted);
+        let before = counted();
+        let (answers, replies) = table_pipelines::<reims_vgpu_vulkan::RtPlatform>();
+        assert_eq!(
+            answers,
+            [Err(DecodeError::Refused), Err(DecodeError::Refused)]
+        );
+        assert_eq!(
+            replies,
+            [(100, RGFX_PIPELINE_REFUSED), (101, RGFX_PIPELINE_REFUSED)]
+        );
+        let after = counted();
+        assert_eq!([after[0] - before[0], after[1] - before[1]], [1, 1]);
     }
 }

@@ -8573,17 +8573,23 @@ mod tests {
         [words[0], words[1], words[2], words[3]]
     }
 
-    /// The sub-encoders' draws under `Disabled` write nothing, as every Mac's do: the count at 16
-    /// is the square's 4096 samples, and the words at 0 and 24 keep their bytes. The runtime
-    /// writes nothing under `Disabled` at any offset; the M3 Max writes 0 at 24 for `Disabled` sent
-    /// at those offsets (measured), which [`render::visibility_offset`] keeps it from.
+    /// rt builds `setVisibilityResultMode:offset:` of `Disabled` alone: the sub-encoders' counting
+    /// mode at 16 is refused, counted once under rt's code (`rt-unbuilt-render-command`), their
+    /// two `Disabled` modes are built, and their draws write nothing into the results, every word
+    /// keeping its bytes. (Every Mac writes the square's 4096 samples at 16, and nothing at 0 and
+    /// 24 under `Disabled`, which [`render::visibility_offset`] keeps the M3 Max from writing 0
+    /// at.)
     #[test]
-    #[ignore = "rt builds no setVisibilityResultMode:offset: (rt-unbuilt-render-command), so the count at 16 is never written"]
-    fn on_vulkan_sub_encoders_after_a_count_write_nothing_under_disabled() {
+    fn on_vulkan_rt_s_sub_encoders_write_no_count_under_its_unbuilt_counting_mode() {
         let fill = u64::from_ne_bytes([0xee; 8]);
+        let refused = crate::platform::counted("rt-unbuilt-render-command");
         assert_eq!(
             sub_encoders_after_a_count::<reims_vgpu_vulkan::RtPlatform>(),
-            [fill, fill, 4096, fill]
+            [fill, fill, fill, fill]
+        );
+        assert_eq!(
+            crate::platform::counted("rt-unbuilt-render-command") - refused,
+            1
         );
     }
 
@@ -8612,9 +8618,10 @@ mod tests {
     static CONTEXT_RANGE_PINS: Mutex<()> = Mutex::new(());
 
     /// A decoder on the Vulkan platform with a queue (1), and, as a process in slot 0 picks
-    /// (`RgfxIdSpace`, next fit from the slot's base, a pick of Metal's span of a pin), a
-    /// device-placed 1 MiB texture buffer (10) at the slot's first pick, which the host takes no
-    /// pin of: the runtime makes its bytes at an address it picks itself.
+    /// (`RgfxIdSpace`, next fit from the slot's base, a pick of Metal's span of a pin), the create
+    /// of a device-placed 1 MiB texture buffer (10) at the slot's first pick, which the host takes
+    /// no pin of. rt builds no texture buffers: the create is refused, counted under rt's code
+    /// (`rt-refused-gap`), so no range of its lies among the pins the tests make after it.
     fn decoder_with_a_texture_buffer() -> (
         GraphicsDecoder<reims_vgpu_vulkan::RtPlatform>,
         <reims_vgpu_vulkan::RtPlatform as Platform>::Device,
@@ -8662,15 +8669,21 @@ mod tests {
             },
             ..RgfxTextureCreate::default()
         };
-        assert_eq!(dec.decode(&device, texture.as_bytes()).unwrap(), Ok(()));
+        let refused = crate::platform::counted("rt-refused-gap");
+        assert_eq!(
+            dec.decode(&device, texture.as_bytes()).unwrap(),
+            Err(DecodeError::Refused),
+            "rt builds no texture buffers"
+        );
+        assert_eq!(crate::platform::counted("rt-refused-gap") - refused, 1);
+        assert!(dec.object(10).is_none());
         (dec, device)
     }
 
     /// A guest's pin meets no range the Vulkan platform's runtime placed for itself: a buffer
-    /// pinned at the pick after a texture buffer's is made, though the runtime made the texture
-    /// buffer's bytes where it picks.
+    /// pinned at the pick after a texture buffer's is made, the texture buffer refused (rt builds
+    /// none).
     #[test]
-    #[ignore = "rt builds no texture buffers (rt-refused-gap), and the test's decoder makes one first"]
     fn on_vulkan_a_pin_meets_no_range_of_a_texture_buffer() {
         use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
         let _pins = CONTEXT_RANGE_PINS.lock();
@@ -8680,30 +8693,20 @@ mod tests {
         assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
     }
 
-    /// The GPU addresses the host gives the Shared pool's blocks where their source has none
-    /// (`pool::addresses`, `[2^45, 2^46)`), take the Vulkan platform's pins beside the host's own
-    /// ranges and the guest's: pins of a pool block's span at the first picks and at the last,
-    /// with a queue's and a texture buffer's ranges made and a pin at the guest's first pick, are
-    /// made at their addresses (a pin's rule is the same for a buffer as for a heap over the
-    /// block).
-    #[test]
-    #[ignore = "rt builds no texture buffers (rt-refused-gap), and the test's decoder makes one first"]
-    fn on_vulkan_the_host_s_pool_addresses_take_pins() {
-        use crate::pool::{HOST_BASE, HOST_END};
+    /// The pins of `picks` (address, length), each after a pin at the guest's first pick and a
+    /// queue's range made and a texture buffer refused (`decoder_with_a_texture_buffer`): each made,
+    /// in no block the rt platform's device knows, at rt's address, counted under rt's code
+    /// (`rt-gpu-address-unpinned`), the guest's among them.
+    fn pins_in_no_known_block_lie_at_rt_s_own(picks: &[(u64, u64)]) {
         use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
         use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
         let _pins = CONTEXT_RANGE_PINS.lock();
         let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let (mut dec, device) = decoder_with_a_texture_buffer();
+        let unpinned = crate::platform::counted("rt-gpu-address-unpinned");
         let guest = buffer_at(11, RGFX_CONTEXT_VA_BASE + 0x8000, 0x1_0000);
         assert_eq!(dec.decode(&device, guest.as_bytes()).unwrap(), Ok(()));
-        // Blocks of 64 KiB and 16 MiB, each a span of its pages and a guard page.
-        let picks = [
-            (HOST_BASE, 0x1_0000),
-            (HOST_BASE + 0x1_8000, 16 << 20),
-            (HOST_END - 0x1_8000, 0x1_0000),
-        ];
-        for (obj_id, (at, length)) in (20..).zip(picks) {
+        for (obj_id, &(at, length)) in (20..).zip(picks) {
             let pinned = buffer_at(obj_id, at, length);
             assert_eq!(
                 dec.decode(&device, pinned.as_bytes()).unwrap(),
@@ -8713,93 +8716,75 @@ mod tests {
             let Some(ObjHandle::Buffer(buffer)) = dec.object(obj_id) else {
                 panic!("no buffer {obj_id}");
             };
-            assert_eq!(buffer.gpu_address(), at);
+            assert_ne!(
+                buffer.gpu_address(),
+                at,
+                "rt's address for the pin at {at:#x}"
+            );
         }
+        assert_eq!(
+            crate::platform::counted("rt-gpu-address-unpinned") - unpinned,
+            1 + picks.len() as u64
+        );
+    }
+
+    /// The GPU addresses the host gives the Shared pool's blocks where their source has none
+    /// (`pool::addresses`, `[2^45, 2^46)`, the testkit's) lie in no block the rt platform's device
+    /// knows, whose pool's blocks lie at rt's addresses: pins of a pool block's span there, at the
+    /// first picks and at the last, are made at rt's address, counted
+    /// ([`pins_in_no_known_block_lie_at_rt_s_own`]).
+    #[test]
+    fn on_vulkan_pins_at_the_host_s_pool_addresses_lie_at_rt_s_own() {
+        use crate::pool::{HOST_BASE, HOST_END};
+        // Blocks of 64 KiB and 16 MiB, each a span of its pages and a guard page.
+        pins_in_no_known_block_lie_at_rt_s_own(&[
+            (HOST_BASE, 0x1_0000),
+            (HOST_BASE + 0x1_8000, 16 << 20),
+            (HOST_END - 0x1_8000, 0x1_0000),
+        ]);
     }
 
     /// The GPU addresses the host gives the contexts' Private blocks where their source has none
-    /// (`pool::addresses`, `[2^44, 2^45)`) take the Vulkan platform's pins as the pool's do: pins
-    /// of a block's span at the first picks and at the last, beside a pin at the pool's first
-    /// pick and one at the guest's, with a queue's and a texture buffer's ranges made, are made at
-    /// their addresses (a pin's rule is the same for a buffer as for a heap in the block).
+    /// (`pool::addresses`, `[2^44, 2^45)`) lie in no block the rt platform's device knows, as the
+    /// pool's do: pins of a block's span there, at the first picks and at the last, and one at
+    /// the pool's first pick, are made at rt's address, counted
+    /// ([`pins_in_no_known_block_lie_at_rt_s_own`]).
     #[test]
-    #[ignore = "rt builds no texture buffers (rt-refused-gap), and the test's decoder makes one first"]
-    fn on_vulkan_the_host_s_private_addresses_take_pins() {
+    fn on_vulkan_pins_at_the_host_s_private_addresses_lie_at_rt_s_own() {
         use crate::pool::{HOST_BASE, PRIVATE_BASE, PRIVATE_END};
-        use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
-        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
-        let _pins = CONTEXT_RANGE_PINS.lock();
-        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
-        let (mut dec, device) = decoder_with_a_texture_buffer();
-        let guest = buffer_at(11, RGFX_CONTEXT_VA_BASE + 0x8000, 0x1_0000);
-        assert_eq!(dec.decode(&device, guest.as_bytes()).unwrap(), Ok(()));
         // Blocks of 64 KiB and 16 MiB, each a span of its pages and a guard page; the last
         // Private block's span ends where the pool's first starts.
-        let picks = [
+        pins_in_no_known_block_lie_at_rt_s_own(&[
             (PRIVATE_BASE, 0x1_0000),
             (PRIVATE_BASE + 0x1_8000, 16 << 20),
             (PRIVATE_END - 0x1_8000, 0x1_0000),
             (HOST_BASE, 0x1_0000),
-        ];
-        for (obj_id, (at, length)) in (20..).zip(picks) {
-            let pinned = buffer_at(obj_id, at, length);
-            assert_eq!(
-                dec.decode(&device, pinned.as_bytes()).unwrap(),
-                Ok(()),
-                "the pin at {at:#x}"
-            );
-            let Some(ObjHandle::Buffer(buffer)) = dec.object(obj_id) else {
-                panic!("no buffer {obj_id}");
-            };
-            assert_eq!(buffer.gpu_address(), at);
-        }
+        ]);
     }
 
     /// The GPU addresses the host gives the pages blocks' views where the guest took
-    /// `IMPORT_ADDRESSES` (`pool::addresses`, `[2^43, 2^44)`) take the Vulkan platform's pins as
-    /// the Private blocks' do: pins of a view's span at the first picks and at the last, beside a
-    /// pin at the Private blocks' first pick and one at the guest's, with a queue's and a texture
-    /// buffer's ranges made, are made at their addresses (a pin's rule is the same for a buffer
-    /// over a view as for one of its own).
+    /// `IMPORT_ADDRESSES` (`pool::addresses`, `[2^43, 2^44)`) lie in no block the rt platform's
+    /// device knows, as the Private blocks' do: pins of a view's span there, at the first picks
+    /// and at the last, and one at the Private blocks' first pick, are made at rt's address,
+    /// counted ([`pins_in_no_known_block_lie_at_rt_s_own`]).
     #[test]
-    #[ignore = "rt builds no texture buffers (rt-refused-gap), and the test's decoder makes one first"]
-    fn on_vulkan_the_host_s_import_addresses_take_pins() {
+    fn on_vulkan_pins_at_the_host_s_import_addresses_lie_at_rt_s_own() {
         use crate::pool::{IMPORT_BASE, IMPORT_END, PRIVATE_BASE};
-        use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
-        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
-        let _pins = CONTEXT_RANGE_PINS.lock();
-        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
-        let (mut dec, device) = decoder_with_a_texture_buffer();
-        let guest = buffer_at(11, RGFX_CONTEXT_VA_BASE + 0x8000, 0x1_0000);
-        assert_eq!(dec.decode(&device, guest.as_bytes()).unwrap(), Ok(()));
         // Views of 64 KiB and 16 MiB, each a span of its pages and a guard page; the last view's
         // span ends where the Private blocks' first starts.
-        let picks = [
+        pins_in_no_known_block_lie_at_rt_s_own(&[
             (IMPORT_BASE, 0x1_0000),
             (IMPORT_BASE + 0x1_8000, 16 << 20),
             (IMPORT_END - 0x1_8000, 0x1_0000),
             (PRIVATE_BASE, 0x1_0000),
-        ];
-        for (obj_id, (at, length)) in (20..).zip(picks) {
-            let pinned = buffer_at(obj_id, at, length);
-            assert_eq!(
-                dec.decode(&device, pinned.as_bytes()).unwrap(),
-                Ok(()),
-                "the pin at {at:#x}"
-            );
-            let Some(ObjHandle::Buffer(buffer)) = dec.object(obj_id) else {
-                panic!("no buffer {obj_id}");
-            };
-            assert_eq!(buffer.gpu_address(), at);
-        }
+        ]);
     }
 
     /// The host's own ranges lie below the guest's GPU addresses: a buffer the host places
-    /// itself lies below them, and, with it, a queue's and a texture buffer's ranges made, the
-    /// first pick of every unit the kext hands the contexts out in and the last unit's last pick
+    /// itself lies below them, and, with it, a queue's range made and a texture buffer refused,
+    /// the first pick of every unit the kext hands the contexts out in and the last unit's last pick
     /// are made.
     #[test]
-    #[ignore = "rt builds no texture buffers (rt-refused-gap), and the test's decoder makes one first"]
     fn on_vulkan_the_host_s_own_ranges_lie_below_every_unit() {
         use reims_vgpu_graphics::wire::{
             RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_END, RGFX_CONTEXT_VA_UNIT, RGFX_CONTEXT_VA_UNITS,

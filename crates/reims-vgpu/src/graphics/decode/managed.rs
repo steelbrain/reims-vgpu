@@ -2689,11 +2689,12 @@ mod tests {
 
     /// What a one-level `Managed` 2D array of 3 slices of 48 x 16 RGBA8 texels shows on `P` on
     /// unified memory, made by the decoder over its CPU copy in a region block: each texel's bytes
-    /// in the copy name its slice, row and column. In order: slice 2 read back by a blit (the GPU
+    /// in the copy name its slice, row and column, which the guest's `replaceRegion:` of each
+    /// slice sends. In order: slice 2 read back by a blit (the GPU
     /// reads the copy where its layout puts the slice: rows 256 bytes apart, slices 16 rows), and
     /// the copy after a blit wrote 0x5a into slice 1 and synchronized it, as a guest does (the GPU
-    /// writes it there, slices 0 and 2 kept).
-    fn managed_array_in_place_on<P: crate::platform::ApiPlatform>() -> (Vec<u8>, Vec<u8>) {
+    /// writes it there, slices 0 and 2 kept); first, whether the texture lies over the copy.
+    fn managed_array_in_place_on<P: crate::platform::ApiPlatform>() -> (bool, (Vec<u8>, Vec<u8>)) {
         use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
         use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
         use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
@@ -2753,19 +2754,41 @@ mod tests {
             },
         };
         send(&mut dec, texture.as_bytes());
-        assert!(
-            dec.managed_copy(21).unwrap().cpu.is_none(),
-            "over its CPU copy"
-        );
+        // The guest's replaceRegion: of each slice, which brings the CPU copy's bytes to the
+        // texture where it is a copy of its own, and has nothing to bring where it lies over them.
+        for slice in 0..3 {
+            let replace = RgfxTextureReplaceRegion {
+                header: header(RGFX_CMD_TEXTURE_REPLACE_REGION),
+                obj_id: 21,
+                level: 0,
+                slice,
+                origin: [0; 3],
+                size: [W as u32, H as u32, 1],
+            };
+            send(&mut dec, replace.as_bytes());
+        }
+        let in_place = dec.managed_copy(21).unwrap().cpu.is_none();
         let Some(ObjHandle::Texture(t)) = dec.named(21) else {
             panic!("no texture 21");
         };
         let queue = device.new_command_queue().unwrap();
-        let run = |cmds: Vec<BlitCmd<'_, P>>| {
+        // A blit pass of `cmds`, then, where given, the guest's synchronizeTexture: of a slice
+        // through the decoder's blit op: the platform's own where the texture lies over its CPU
+        // copy, else the decoder's copy of the slice into it (`synchronize_managed`).
+        let run = |cmds: Vec<BlitCmd<'_, P>>, synchronized: Option<u64>| {
             let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
             let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
             for cmd in cmds {
                 e.encode(OnFault::Return, cmd).unwrap();
+            }
+            if let Some(slice) = synchronized {
+                let m = RgfxBlitOpSynchronizeTexture {
+                    texture_obj_id: 21,
+                    slice,
+                    level: 0,
+                };
+                let op = RGFX_OP_BLIT_SYNCHRONIZE_TEXTURE;
+                assert!(decode_op(op, m.as_bytes(), &dec, &e, OnFault::Return).unwrap());
             }
             e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
             cb.commit(OnFault::Return).unwrap();
@@ -2780,17 +2803,20 @@ mod tests {
         };
         let out = shared();
         let whole = MtlSize::new(W, H, 1);
-        run(vec![BlitCmd::CopyTextureToBuffer {
-            source_texture: t,
-            source_slice: 2,
-            source_level: 0,
-            source_origin: MtlOrigin::new(0, 0, 0),
-            source_size: whole,
-            destination_buffer: &out,
-            destination_offset: 0,
-            destination_bytes_per_row: W * 4,
-            destination_bytes_per_image: W * H * 4,
-        }]);
+        run(
+            vec![BlitCmd::CopyTextureToBuffer {
+                source_texture: t,
+                source_slice: 2,
+                source_level: 0,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: whole,
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: W * 4,
+                destination_bytes_per_image: W * H * 4,
+            }],
+            None,
+        );
         // SAFETY: a Shared buffer's bytes, read after the blit completed.
         let read = unsafe {
             std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), (W * H * 4) as usize)
@@ -2801,10 +2827,9 @@ mod tests {
         unsafe {
             std::ptr::write_bytes(fill.contents().as_ptr::<u8>(), 0x5a, (W * H * 4) as usize)
         };
-        // The guest's synchronizeTexture: of the slice after the write, which the platform's own
-        // takes for a texture over its CPU copy (`synchronize_managed`).
-        run(vec![
-            BlitCmd::CopyBufferToTexture {
+        // The guest's synchronizeTexture: of the slice after the write.
+        run(
+            vec![BlitCmd::CopyBufferToTexture {
                 source_buffer: &fill,
                 source_offset: 0,
                 source_bytes_per_row: W * 4,
@@ -2814,22 +2839,19 @@ mod tests {
                 destination_slice: 1,
                 destination_level: 0,
                 destination_origin: MtlOrigin::new(0, 0, 0),
-            },
-            BlitCmd::SynchronizeTexture {
-                texture: t,
-                slice: 1,
-                level: 0,
-            },
-        ]);
+            }],
+            Some(1),
+        );
         // SAFETY: the region's block, which the blit's writes finished.
         let after =
             unsafe { std::slice::from_raw_parts(copy(0).cast_const(), (3 * SLICE) as usize) }
                 .to_vec();
-        (read, after)
+        (in_place, (read, after))
     }
 
-    /// Checks [`managed_array_in_place_on`]'s answers against the layout.
-    fn check_managed_array_in_place((read, after): (Vec<u8>, Vec<u8>)) {
+    /// Checks [`managed_array_in_place_on`]'s answers against the layout, the texture over its
+    /// CPU copy where `in_place`.
+    fn check_managed_array_in_place(in_place: bool, (read, after): (Vec<u8>, Vec<u8>)) {
         let (w, h, row, slice) = (48usize, 16usize, 256usize, 256 * 16usize);
         for y in 0..h {
             for x in 0..w {
@@ -2837,7 +2859,7 @@ mod tests {
                 assert_eq!(
                     read[at..at + 4],
                     [2, y as u8, x as u8, 0xa5],
-                    "slice 2 ({x}, {y})"
+                    "slice 2 ({x}, {y}), in place: {in_place}"
                 );
             }
         }
@@ -2849,17 +2871,28 @@ mod tests {
                         1 => [0x5a; 4],
                         _ => [s as u8, y as u8, x as u8, 0xa5],
                     };
-                    assert_eq!(after[at..at + 4], want, "the copy's slice {s} ({x}, {y})");
+                    assert_eq!(
+                        after[at..at + 4],
+                        want,
+                        "the copy's slice {s} ({x}, {y}), in place: {in_place}"
+                    );
                 }
             }
         }
     }
 
-    /// A one-level `Managed` 2D array on unified memory lies over its CPU copy where the layout
-    /// puts its slices: the GPU reads and writes the copy's bytes.
+    /// A one-level `Managed` 2D array on unified memory shows the guest its CPU copy's bytes where
+    /// the layout puts its slices: the GPU reads them once the guest's `replaceRegion:` sent them,
+    /// and its writes land there once the guest synchronizes. It lies over the copy where rt holds
+    /// such a texture over a buffer in place; where rt cannot, it refuses the texture over the
+    /// buffer, counted under rt's code (`rt-refused-gap`; measured on a Radeon 780M's RADV), and
+    /// the texture is a copy of its own, which the `replaceRegion:` fills.
     #[test]
-    #[ignore = "rt refuses this RGBA8Unorm 2D array over a buffer where it cannot hold it in place (rt-refused-gap; measured on a Radeon 780M's RADV)"]
-    fn on_vulkan_a_managed_2d_array_lies_over_its_cpu_copy() {
-        check_managed_array_in_place(managed_array_in_place_on::<reims_vgpu_vulkan::RtPlatform>());
+    fn on_vulkan_a_managed_2d_array_shows_its_cpu_copy() {
+        let refused = crate::platform::counted("rt-refused-gap");
+        let (in_place, answers) = managed_array_in_place_on::<reims_vgpu_vulkan::RtPlatform>();
+        let counted = crate::platform::counted("rt-refused-gap") - refused;
+        assert_eq!(counted, u64::from(!in_place), "in place: {in_place}");
+        check_managed_array_in_place(in_place, answers);
     }
 }

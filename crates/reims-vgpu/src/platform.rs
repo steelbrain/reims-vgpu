@@ -179,6 +179,16 @@ pub(crate) fn test_region<P: ApiPlatform>(
     reims_vgpu_graphics::region::Region::new(len).expect("a region")
 }
 
+/// This process's count of the degradation kind `code`
+/// (`reims_vgpu_vulkan::answer::degradation_counts`), which another test in it may have counted
+/// before: a test reads it before and after what it checks.
+#[cfg(test)]
+pub(crate) fn counted(code: &str) -> u64 {
+    (reims_vgpu_vulkan::answer::degradation_counts().into_iter())
+        .find(|(c, _)| c == code)
+        .map_or(0, |(_, n)| n)
+}
+
 /// The API's state for one platform instance.
 pub(crate) struct ApiState<P: Platform> {
     /// The display thread, made at the first device whose host takes the cursor.

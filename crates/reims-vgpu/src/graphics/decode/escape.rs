@@ -24,7 +24,9 @@
 //! ([`recorder::buffer_escaped`]): the stream holds it after the memory writes of each command
 //! buffer committed before it and before those of each committed after. A replay player stops
 //! there, typed, where a later write holds an address in the buffer. A later note, a note for a
-//! refused create and a bad reference write none.
+//! refused create and a bad reference write none. The rt platform's buffers, whose `gpuAddress`
+//! rt answers at their make, take their record at their make, of act 0, a read of the address
+//! (the recorder's `MADE_ESCAPE_KIND`), so a note of one writes none.
 //!
 //! An escaped buffer over a copy of its pages is one the GPU may read through memory, with no
 //! binding naming it, after the guest's CPU changed its pages. Metal requires a function's reach
@@ -1045,18 +1047,18 @@ mod tests {
         no_copy_memory_over_pages_lies_over_the_guests_bytes::<RtPlatform>(Runs::Two);
     }
 
-    /// The marker that makes a run of [`on_vulkan_a_recording_holds_each_buffers_first_escape`]
+    /// The marker that makes a run of [`on_vulkan_a_recording_holds_each_rt_buffers_escape_from_its_make`]
     /// the child, which records.
     const RECORD_CHILD: &str = "REIMS_VGPU_ESCAPE_RECORD_CHILD";
 
-    /// With the process recording, each no-copy buffer's first note is one `m2v.bufferEscaped`
-    /// record on the buffer, `[act]`, its act's `RGFX_BUFFER_ESCAPED_*` value; a later note for
-    /// it, by any act, a note for a buffer whose create the host refused, and a bad reference (a
-    /// device buffer, an id the sender holds no object under) write none. The recorder is the
-    /// process's, so the test runs in a child of its own, recording into a scratch directory.
+    /// With the process recording on the rt platform, each buffer rt makes, no-copy or the
+    /// device's, holds one `m2v.bufferEscaped` record, `[0]`, from its make, where rt answers its
+    /// `gpuAddress`; the guest's notes for it, by any act, a note for a buffer whose create the
+    /// host refused (of 0 bytes, which Metal answers nil for), and a bad reference (a device
+    /// buffer, an id the sender holds no object under) write none. The recorder is the process's,
+    /// so the test runs in a child of its own, recording into a scratch directory.
     #[test]
-    #[ignore = "rt refuses the test's buffer of 0 bytes (rt-refused-metal), so the escapes recorded differ"]
-    fn on_vulkan_a_recording_holds_each_buffers_first_escape() {
+    fn on_vulkan_a_recording_holds_each_rt_buffers_escape_from_its_make() {
         use reims_vgpu_vulkan::recorder::ENV_VAR;
         if std::env::var_os(RECORD_CHILD).is_some() {
             let streams = std::env::var_os(ENV_VAR).expect("the child records");
@@ -1067,7 +1069,7 @@ mod tests {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "graphics::decode::escape::tests::on_vulkan_a_recording_holds_each_buffers_first_escape",
+                "graphics::decode::escape::tests::on_vulkan_a_recording_holds_each_rt_buffers_escape_from_its_make",
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -1081,7 +1083,7 @@ mod tests {
         assert!(ran, "the child ran no test: {out:?}");
     }
 
-    /// [`on_vulkan_a_recording_holds_each_buffers_first_escape`]'s child, recording into
+    /// [`on_vulkan_a_recording_holds_each_rt_buffers_escape_from_its_make`]'s child, recording into
     /// `streams`.
     fn recorded_escapes(streams: &std::path::Path) {
         use reims_vgpu_graphics::wire::RGFX_CURSOR_SPAN;
@@ -1125,12 +1127,15 @@ mod tests {
             dec.decode(&device, device_buffer.as_bytes()).unwrap(),
             Ok(())
         );
-        // Of no bytes: refused, and its id stands for the refused buffer.
+        // Of no bytes: refused, as Metal answers nil for a buffer of length 0, counted as
+        // Metal's refusal (`rt-refused-metal`); its id stands for the refused buffer.
+        let metal = counted("rt-refused-metal");
         let refused = over(30, BLOCK + 0x60000, 0);
         assert_eq!(
             dec.decode_refusing(&device, refused.as_bytes()).unwrap(),
             Err(DecodeError::Refused)
         );
+        assert_eq!(counted("rt-refused-metal") - metal, 1);
         let mut note = |obj_id, kind| {
             let m = RgfxBufferEscaped {
                 header: header(RGFX_CMD_BUFFER_ESCAPED),
@@ -1173,16 +1178,17 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        // Each no-copy buffer's stream id, by its create's length.
+        // Each buffer's stream id, by its create's length: the descriptor's `length`, or the
+        // first argument of a create by length.
         let made = |length: u64| {
             let length_of = |c: &Call| match c.args.first() {
                 Some(Value::Map(fields)) => (fields.iter())
                     .find(|(k, _)| k == "length")
                     .map(|(_, v)| v.clone()),
-                _ => None,
+                first => first.cloned(),
             };
             let create = calls.iter().find(|c| {
-                c.selector == "newBufferWithDescriptor:"
+                c.selector.starts_with("newBuffer")
                     && c.result != 0
                     && length_of(c) == Some(Value::Uint(length))
             });
@@ -1190,22 +1196,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("no create of {length:#x} bytes: {calls:?}"))
                 .result
         };
-        let (ten, eleven) = (made(3 * page), made(5 * page));
-        let escape = |receiver, kind: u32| Call {
+        let (ten, eleven, twenty) = (made(3 * page), made(5 * page), made(0x1000));
+        let escape = |receiver| Call {
             selector: BUFFER_ESCAPED.to_owned(),
             receiver,
-            args: vec![Value::Uint(kind.into())],
+            args: vec![Value::Uint(0)],
             ..Call::default()
         };
         let escapes: Vec<&Call> = (calls.iter())
             .filter(|c| c.selector == BUFFER_ESCAPED)
             .collect();
-        assert_eq!(
-            escapes,
-            [
-                &escape(ten, RGFX_BUFFER_ESCAPED_RESOURCE_ID),
-                &escape(eleven, RGFX_BUFFER_ESCAPED_RESIDENCY_SET)
-            ]
-        );
+        assert_eq!(escapes, [&escape(ten), &escape(eleven), &escape(twenty)]);
     }
 }

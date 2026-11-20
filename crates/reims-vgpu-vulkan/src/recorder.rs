@@ -5214,13 +5214,22 @@ mod tests {
         }
     }
 
+    /// The count of `code` in the process's degradation counts.
+    fn counted(code: &str) -> u64 {
+        (crate::answer::degradation_counts().into_iter())
+            .find(|(c, _)| c == code)
+            .map_or(0, |(_, n)| n)
+    }
+
     /// A compute pipeline's record carries the stage-input descriptor it was made with, through
     /// the stream and back: its map's `stageInput` holds each layout (`bufferIndex`, `stride`,
     /// `stepFunction`, `stepRate`), each attribute (`attributeIndex`, `format`, `offset`,
     /// `bufferIndex`), the `indexType` and the `indexBufferIndex`, each as given, none of them
-    /// Metal's default but the attribute's index, which the kernel names.
+    /// Metal's default but the attribute's index, which the kernel names. rt refuses the
+    /// pipeline, with an error that names its code (`rt-refused-gap`), counted under it: the
+    /// kernel reads a stage input, which rt's compute encoder does not supply yet. The record
+    /// carries the descriptor all the same.
     #[test]
-    #[ignore = "rt refuses a kernel with stage input: it reads an input the compute encoder does not supply yet (rt-refused-gap)"]
     fn on_vulkan_a_compute_pipeline_record_carries_its_stage_input() {
         in_recording_child(
             "recorder::tests::on_vulkan_a_compute_pipeline_record_carries_its_stage_input",
@@ -5258,9 +5267,11 @@ mod tests {
                     }),
                     ..FullComputePipelineDesc::new(&function)
                 };
-                let pipeline = (device.new_compute_pipeline_state_full(&desc))
-                    .unwrap()
-                    .expect("a pipeline");
+                let refused = counted("rt-refused-gap");
+                let made = device.new_compute_pipeline_state_full(&desc);
+                let error = made.err().expect("rt refuses a kernel with stage input");
+                assert!(error.description.contains("(rt-refused-gap)"), "{error:?}");
+                assert_eq!(counted("rt-refused-gap") - refused, 1);
                 let (calls, _) =
                     recorded(streams, |calls| calls.iter().any(|c| c.selector == MADE));
                 let made = (calls.iter())
@@ -5298,7 +5309,7 @@ mod tests {
                     ("indexBufferIndex", Value::Uint(2)),
                 ]);
                 assert_eq!(stage_input, Some(expected), "{made:?}");
-                drop((pipeline, function, library));
+                drop((function, library));
             },
         );
     }
@@ -5309,9 +5320,11 @@ mod tests {
     /// `factorFormat`, `controlPointIndexType`, `factorStepFunction` and `outputWinding`, then
     /// `maxVertexCallStackDepth` and `maxFragmentCallStackDepth`, each Metal's raw value as given.
     /// Every value but the factor format, whose one value is Metal's `Half`, is other than
-    /// Metal's default. The pipeline is of `render_tess`, a post-tessellation vertex function.
+    /// Metal's default. The pipeline is of `render_tess`, a post-tessellation vertex function,
+    /// which rt's translator makes none of: rt refuses the pipeline, with an error that names its
+    /// code (`rt-refused-translation`), counted under it, and the record carries the descriptor
+    /// all the same.
     #[test]
-    #[ignore = "rt's translator makes no tessellation pipeline (rt-refused-translation)"]
     fn on_vulkan_a_render_pipeline_record_carries_its_tessellation_state() {
         in_recording_child(
             "recorder::tests::on_vulkan_a_render_pipeline_record_carries_its_tessellation_state",
@@ -5354,9 +5367,14 @@ mod tests {
                     max_fragment_call_stack_depth: 3,
                     ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
                 };
-                let pipeline = (device.new_render_pipeline_state_full(&desc))
-                    .unwrap()
-                    .expect("a pipeline");
+                let refused = counted("rt-refused-translation");
+                let made = device.new_render_pipeline_state_full(&desc);
+                let error = made.err().expect("rt translates no tessellation");
+                assert!(
+                    error.description.contains("(rt-refused-translation)"),
+                    "{error:?}"
+                );
+                assert_eq!(counted("rt-refused-translation") - refused, 1);
                 let (calls, _) =
                     recorded(streams, |calls| calls.iter().any(|c| c.selector == MADE));
                 let made = (calls.iter())
@@ -5411,7 +5429,7 @@ mod tests {
                     ("maxFragmentCallStackDepth", Value::Uint(3)),
                 ]);
                 assert_eq!(fields[17..], expected, "{made:?}");
-                drop((pipeline, vertex, fragment, vertex_library, fragment_library));
+                drop((vertex, fragment, vertex_library, fragment_library));
             },
         );
     }

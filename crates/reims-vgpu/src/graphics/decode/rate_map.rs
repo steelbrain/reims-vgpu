@@ -557,16 +557,18 @@ mod tests {
         assert_eq!(sels, ["copyParameterDataToBuffer:offset:"]);
     }
 
-    /// What a map of one layer whose rates vary answers through the decoder on platform `P`: its
-    /// state, its layer 0's physical size, a coordinate mapped either way, and the bytes its copy
-    /// wrote into a Shared buffer of the sender's at offset 4, past 4 bytes of 0xa5.
-    fn round_trip<P: crate::platform::ApiPlatform>()
-    -> (RgfxRateMapState, [u64; 3], [u64; 3], [u64; 3], Vec<u8>) {
-        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
-        use reims_vgpu_vulkan::core::platform::values::{BufferDesc, OptionSet};
-        let platform = P::process();
+    /// On the rt platform a map of one layer whose rates vary makes nothing through the decoder,
+    /// as rt builds no rasterization rate map: the map's descriptor and its layer are each
+    /// refused, counted under rt's code (`rt-unbuilt-rate-map`), and the create answers invalid,
+    /// as [`GraphicsDecoder::rate_map_descriptor`] makes no descriptor where the platform makes
+    /// no layer, with no size, granularity, layer or parameters; a query of it is not found, as
+    /// the sender holds no map.
+    #[test]
+    fn on_vulkan_rt_refuses_a_rate_map_through_the_decoder() {
+        use crate::platform::ApiPlatform as _;
+        let platform = reims_vgpu_vulkan::RtPlatform::process();
         let device = platform.metal_device(None).unwrap();
-        let dec = GraphicsDecoder::<P>::new(
+        let dec = GraphicsDecoder::<reims_vgpu_vulkan::RtPlatform>::new(
             Arc::clone(&platform),
             Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
@@ -577,77 +579,19 @@ mod tests {
             None,
             &[(&[1.0, 0.25, 1.0], &[1.0, 0.5])],
         );
+        let refused = crate::platform::counted("rt-unbuilt-rate-map");
         let state = dec.rate_map_state(&device, &made, false).unwrap().unwrap();
-        const BUFFER: u64 = 0x32;
-        let length = state.parameter_size + 0x40;
-        let buffer = device
-            .new_buffer(BufferDesc {
-                length,
-                options: vec![OptionSet::ResourceOptions(0)],
-                pinned_gpu_address: None,
-                contents: None,
-                no_copy: false,
-                deallocator: None,
-                zero_from: None,
-            })
-            .unwrap()
-            .unwrap();
-        let contents = buffer.contents().as_ptr::<u8>();
-        // SAFETY: the buffer's `length` bytes, which no command uses.
-        unsafe { std::ptr::write_bytes(contents, 0xa5, length as usize) };
-        dec.insert(BUFFER, ObjHandle::Buffer(buffer))
-            .unwrap()
-            .unwrap();
-        let ask = |q, at, buffer, x, y| {
-            let answer = dec
-                .rate_map_answer(&query(q, at, buffer, x, y))
-                .unwrap()
-                .unwrap();
-            assert_eq!(answer.status, RGFX_STATUS_OK, "query {q}");
-            answer.values
-        };
-        let physical = ask(RGFX_RATE_MAP_QUERY_PHYSICAL_SIZE, 0, 0, 0.0, 0.0);
-        let to_physical = ask(RGFX_RATE_MAP_QUERY_SCREEN_TO_PHYSICAL, 0, 0, 200.0, 100.0);
-        let to_screen = ask(RGFX_RATE_MAP_QUERY_PHYSICAL_TO_SCREEN, 0, 0, 10.0, 10.0);
-        ask(RGFX_RATE_MAP_QUERY_COPY_PARAMETER_DATA, 4, BUFFER, 0.0, 0.0);
-        // SAFETY: as above; the copy is done.
-        let bytes = unsafe { std::slice::from_raw_parts(contents, length as usize) }.to_vec();
-        (state, physical, to_physical, to_screen, bytes)
-    }
-
-    /// On the Vulkan platform a map whose rates vary is compiled by the platform: its state is
-    /// the runtime's (24,624 bytes of parameter data aligned to 4, a granularity of 32 by 32), its
-    /// physical size is below its screen's, its coordinate maps answer the platform's, and its
-    /// copy writes the parameter data where the sender's buffer's contents lie, at the offset
-    /// asked and nowhere else.
-    #[test]
-    #[ignore = "rt builds no rasterization rate map (rt-unbuilt-rate-map), so query 0 answers 4, not 0"]
-    fn on_vulkan_a_rate_map_is_the_platform_s_through_the_decoder() {
-        let (state, physical, to_physical, to_screen, bytes) =
-            round_trip::<reims_vgpu_vulkan::RtPlatform>();
-        assert_eq!(state.status, RGFX_STATUS_OK);
-        assert_eq!((state.screen_width, state.screen_height), (256, 128));
+        assert_eq!(crate::platform::counted("rt-unbuilt-rate-map") - refused, 2);
+        assert_eq!(state.status, RGFX_STATUS_INVALID_ARGUMENT);
         assert_eq!(
-            (
-                state.granularity_width,
-                state.granularity_height,
-                state.granularity_depth
-            ),
-            (32, 32, 1)
+            (state.screen_width, state.layer_count, state.parameter_size),
+            (0, 0, 0)
         );
-        assert_eq!(state.layer_count, 1);
-        assert_eq!((state.parameter_size, state.parameter_align), (24624, 4));
-        assert!(physical[0] < 256 && physical[0] > 0, "{physical:?}");
-        assert!(physical[1] < 128 && physical[1] > 0, "{physical:?}");
-        assert_eq!(physical[2], 1);
-        let x = f32::from_bits(to_physical[0] as u32);
-        assert!(x > 0.0 && x < 200.0, "{x}");
-        let back = f32::from_bits(to_screen[0] as u32);
-        assert!(back > 0.0, "{back}");
-        assert_eq!(bytes[..4], [0xa5; 4]);
-        let end = 4 + state.parameter_size as usize;
-        assert!(bytes[4..end].iter().any(|&b| b != 0xa5));
-        assert!(bytes[end..].iter().all(|&b| b == 0xa5));
+        let answer = dec
+            .rate_map_answer(&query(RGFX_RATE_MAP_QUERY_PHYSICAL_SIZE, 0, 0, 0.0, 0.0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.status, RGFX_STATUS_NOT_FOUND);
     }
 
     /// A query of a map the sender does not hold is not found.
