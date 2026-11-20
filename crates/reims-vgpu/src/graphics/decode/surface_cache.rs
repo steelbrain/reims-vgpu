@@ -3068,6 +3068,16 @@ impl<P: Platform> SurfaceCaches<P> {
             && self.last_deferred_fill(block).is_none()
     }
 
+    /// Whether the use `u` fills its block's cache from its pages as its command buffer begins,
+    /// at once or deferred ([`Self::before_one`]): the cache holds an older generation, a device
+    /// of the host's wrote the pages since its last fill, or the use asks a refill that is made.
+    fn fills(&self, u: &RgfxOpSurfaceUse) -> bool {
+        let block = u.block_offset;
+        self.will_hold(block).is_some_and(|(held, host)| {
+            held.is_none_or(|held| u.cpu_gen > held) || self.watched.writes(block) > host
+        }) || self.refill(u) == Refill::Fill
+    }
+
     /// Whether the use `u` needs a fill of its block's cache first: [`Self::needs_fill_at`] of its
     /// block and generation, or a refill it asks that is made ([`Self::refill`]).
     fn needs_fill(&self, u: &RgfxOpSurfaceUse) -> bool {
@@ -4699,17 +4709,24 @@ impl<P: Platform> SurfaceCaches<P> {
         (!out.landing.landed()).then(|| Arc::clone(&out.landing))
     }
 
-    /// The pieces a staged copy of the block at `block`'s cache into its pages, of all of its
-    /// bytes, would make for want of a piece reserved for the block or a spare
+    /// The pieces a staged copy `way` of the block at `block`'s cache, of all of the bytes it may
+    /// move, would make for want of a piece reserved for the block or a spare
     /// ([`Spares::lacking`]): their lengths, and whether it is the cache's first staged copy;
-    /// `None` where its copies out are not staged, or it would make none. A copy that moves fewer
-    /// bytes (the record narrows it) lays them in no more pieces, none longer.
-    fn lacking(&self, block: u64) -> Option<(Vec<u64>, bool)> {
+    /// `None` where its copies that way are not staged, or it would make none. A copy out that
+    /// moves fewer bytes (the record narrows it) lays them in no more pieces, none longer.
+    fn lacking(&self, block: u64, way: Way) -> Option<(Vec<u64>, bool)> {
         let cache = self.by_block.get(&block)?;
-        if !matches!(cache.pages, Some(CachePages::Copied(_))) || self.staged.is_none() {
-            return None;
-        }
-        let lens = pack(std::iter::once(0..cache.length), self.spares.piece).lens;
+        self.staged.as_ref()?;
+        let lens = match (&cache.pages, way, &cache.carried) {
+            (Some(CachePages::Copied(_)), _, _) => {
+                pack(std::iter::once(0..cache.length), self.spares.piece).lens
+            }
+            (None, Way::In, Some(carried)) => {
+                let runs = (carried.runs.iter()).map(|&(at, _, bytes)| at..at + bytes);
+                pack(runs, self.spares.piece).lens
+            }
+            _ => return None,
+        };
         let reserved = self.reserved.get(&block).map_or(&[][..], Vec::as_slice);
         let lacking = self.spares.lacking(&lens, reserved);
         (!lacking.is_empty()).then_some((lacking, !cache.staged))
@@ -6148,6 +6165,29 @@ impl<P: Platform> Caches<P> {
             return Ok((reached, None));
         }
         let picked: Vec<RgfxOpSurfaceUse> = by_block(&state, uses).into_iter().copied().collect();
+        // The pieces the uses' staged fills would make for want of a spare are made with the
+        // lock let go of, once, and reserved for their blocks (the module doc, "Staged copies").
+        let lacking: Vec<(u64, Vec<u64>, bool)> = (picked.iter())
+            .filter(|u| state.fills(u))
+            .filter_map(|u| {
+                let (lens, first) = state.lacking(u.block_offset, Way::In)?;
+                Some((u.block_offset, lens, first))
+            })
+            .collect();
+        if !lacking.is_empty() {
+            let (spares, timed) = (Arc::clone(&state.spares), state.staged.clone());
+            drop(state);
+            let made: Vec<(u64, Vec<P::Buffer>)> = (lacking.into_iter())
+                .filter_map(|(block, lens, first)| {
+                    let pieces = spares.pieces(device, &lens, first, timed.as_ref());
+                    pieces.ok().flatten().map(|pieces| (block, pieces))
+                })
+                .collect();
+            state = self.state.lock();
+            for (block, pieces) in made {
+                state.reserved.entry(block).or_default().extend(pieces);
+            }
+        }
         let mut spare = Vec::new();
         let mut no_event = HashSet::new();
         let mut waited = false;
@@ -6471,7 +6511,8 @@ impl<P: Platform> Caches<P> {
         let (done, failed, may_copy, reserve) = {
             let mut state = self.state.lock();
             let may_copy = state.release_may_copy(block, unheld);
-            let reserve = (may_copy.then(|| state.lacking(block)).flatten()).map(|(lens, first)| {
+            let lacking = may_copy.then(|| state.lacking(block, Way::Out)).flatten();
+            let reserve = lacking.map(|(lens, first)| {
                 Reserve {
                     spares: Arc::clone(&state.spares),
                     lens,
@@ -15008,12 +15049,17 @@ pub(super) mod tests {
         let locked = counted(PIECE_MAKES_LOCKED);
         let mark = r.p.call_log().mark();
         let done = release(&r, BLOCK);
+        // The use is not finished yet, so its fill's piece is not given back meanwhile.
+        assert!(
+            eventually(|| (r.p.call_log().sels_since(mark)).contains(&SCRATCH_BUFFER)),
+            "the release's piece made"
+        );
         assert!(
             eventually(|| {
                 r.p.world().complete_all(CompleteOn::Caller);
                 copies(&r.p.call_log().since(mark)).len() == 1
             }),
-            "the release's copy, once its piece is made and the use finished"
+            "the release's copy, once the use finished"
         );
         let calls = r.p.call_log().since(mark);
         let made: Vec<(u64, Option<String>)> = (calls.iter())
