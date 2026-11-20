@@ -10,6 +10,7 @@ mod metallibs;
 mod tools;
 mod util;
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use util::{Res, read, repo_root};
 
@@ -57,7 +58,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "check",
-        about: "paths, testkit, header --check, the records of the prebuilt option ROM and guest kexts (make -C firmware prebuilt-check, make -C guest prebuilt-check), rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux, links to Homebrew's Vulkan loader and KosmicKrisp where the tests load them (make vulkan-links), and, where Rosetta runs x86-64 code, core's tests as x86-64; off Windows, clippy for x86-64 Windows",
+        about: "paths, testkit, header --check, the records of the prebuilt option ROM and guest kexts (make -C firmware prebuilt-check, make -C guest prebuilt-check), rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux, links to Homebrew's Vulkan loader and KosmicKrisp in ../lib of each test binary's directory (cargo nextest list), and, where Rosetta runs x86-64 code, core's tests as x86-64; off Windows, clippy for x86-64 Windows",
         run: cmd_check,
     },
 ];
@@ -213,15 +214,108 @@ fn empty_archive() -> Res<std::path::PathBuf> {
     Ok(path)
 }
 
-/// Where a Mac's test binaries find the Vulkan loader and Mesa's KosmicKrisp: the rt platform
-/// loads each only from beside the process's executable or from `../lib`
-/// (`crates/reims-vgpu-vulkan/src/os/macos/rt_driver.rs`), and nextest runs the binaries from
-/// `<target>/debug/deps`, so `<target>/debug/lib`. Without them every test that opens a device
-/// finds none. The Makefile's `vulkan-links` links them there from Homebrew, as it does for a
-/// QEMU in `build/qemu`, with `BUILD` (its `build/`) set to `<target>/debug`, and names a file
-/// Homebrew lacks.
-fn mac_test_libs_build(target: &std::path::Path) -> String {
-    format!("BUILD={}", target.join("debug").display())
+/// The Vulkan libraries a Mac's tests load, under Homebrew's prefix: its loader, and Mesa's
+/// KosmicKrisp, each through its formula's `opt` directory, which `brew upgrade` moves to the new
+/// version, as the Makefile's `vulkan-links` links them for QEMU.
+const MAC_TEST_LIBS: [&str; 2] = [
+    "opt/vulkan-loader/lib/libvulkan.1.dylib",
+    "opt/mesa/lib/libvulkan_kosmickrisp.dylib",
+];
+
+/// Where each of `binaries` finds the Vulkan libraries: `../lib` from its directory, where the rt
+/// platform looks (`crates/reims-vgpu-vulkan/src/os/macos/rt_driver.rs`), each once, sorted.
+fn test_lib_dirs(binaries: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs: Vec<_> = (binaries.iter())
+        .filter_map(|b| Some(b.parent()?.parent()?.join("lib")))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// A symbolic link at `at` to `to`.
+#[cfg(unix)]
+fn symlink(to: &Path, at: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(to, at)
+}
+
+/// A symbolic link at `at` to `to`: refused, as only a Mac's check links.
+#[cfg(not(unix))]
+fn symlink(_to: &Path, _at: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other("the check links only on a Mac"))
+}
+
+/// On a Mac, links [`MAC_TEST_LIBS`] where each test binary of the run loads them
+/// ([`test_lib_dirs`]): the rt platform loads both only from beside the process's executable or
+/// from `../lib`, and without them every test that opens a device finds none. Where Cargo puts a
+/// test binary is its own: `<target>/debug/deps` before its build-dir layout,
+/// `build/<crate>/<hash>/out` under it. So the paths are nextest's, from `cargo nextest list`
+/// with the run's arguments, which builds the binaries the run then takes. A file Homebrew lacks
+/// is named and not linked, as `vulkan-links` does. False where the list fails or names no binary.
+fn link_mac_test_libs(features: &str) -> Res<bool> {
+    let args = [
+        "nextest",
+        "list",
+        "--workspace",
+        "--features",
+        features,
+        "--list-type",
+        "binaries-only",
+        "--message-format",
+        "json",
+    ];
+    println!("$ cargo {}", args.join(" "));
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let out = std::process::Command::new(cargo)
+        .args(args)
+        .current_dir(repo_root())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|e| format!("cargo: {e}"))?;
+    if !out.status.success() {
+        println!("check: cargo nextest list failed ({})", out.status);
+        return Ok(false);
+    }
+    let listed = tools::json_strings(&String::from_utf8_lossy(&out.stdout), "binary-path");
+    let binaries: Vec<PathBuf> = listed.into_iter().map(PathBuf::from).collect();
+    if binaries.is_empty() {
+        println!("check: cargo nextest list named no test binary");
+        return Ok(false);
+    }
+    let dirs = test_lib_dirs(&binaries);
+    let prefix = match tools::Tools::output(&mut tools::System, "brew", &["--prefix".to_owned()]) {
+        Ok(p) => PathBuf::from(p),
+        Err(e) => {
+            println!("check: no Homebrew ({e}): no Vulkan library linked for the tests");
+            return Ok(true);
+        }
+    };
+    for lib in MAC_TEST_LIBS {
+        let from = prefix.join(lib);
+        let name = from.file_name().unwrap_or_default();
+        if !from.is_file() {
+            println!(
+                "check: Homebrew has no {}: {} not linked for the tests",
+                from.display(),
+                name.to_string_lossy()
+            );
+            continue;
+        }
+        for dir in &dirs {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            let at = dir.join(name);
+            // A link left by an earlier check, which may name another prefix.
+            let _ = std::fs::remove_file(&at);
+            symlink(&from, &at).map_err(|e| format!("{}: {e}", at.display()))?;
+        }
+        println!(
+            "check: {} linked in {} directories, ../lib of the {} test binaries",
+            name.to_string_lossy(),
+            dirs.len(),
+            binaries.len()
+        );
+    }
+    Ok(true)
 }
 
 /// The macOS core's tests run as under Rosetta, with the x86-64 guest's pages.
@@ -291,8 +385,7 @@ fn cmd_check(args: &[String]) -> Res<bool> {
             )?;
         }
         if cfg!(target_os = "macos") {
-            let target = tools::target_dir(&mut tools::System)?;
-            ok &= make(&["vulkan-links", &mac_test_libs_build(&target)])?;
+            ok &= link_mac_test_libs(features)?;
         }
         ok &= cargo(&[
             "nextest",
@@ -352,25 +445,25 @@ mod tests {
         }
     }
 
-    /// The Mac's test binaries load the Vulkan libraries from `<target>/debug/lib` only where
-    /// the Makefile's `vulkan-links` writes `$(BUILD)/lib`: a rename of either there would link
-    /// them elsewhere, and every test that opens a device would find none.
+    /// Each test binary's `../lib`, once a directory: under Cargo's build-dir layout each binary
+    /// has a directory of its own, and before it they share `deps`.
     #[test]
-    fn the_mac_test_libs_go_where_the_test_binaries_load_them() {
-        let makefile = read(&repo_root().join("Makefile")).unwrap();
-        for line in [
-            "BUILD_DIR := $(if $(filter /%,$(BUILD)),$(BUILD),$(CURDIR)/$(BUILD))",
-            "VULKAN_LIBS := $(BUILD_DIR)/lib",
-            "vulkan-links:",
-        ] {
-            assert!(
-                makefile.lines().any(|l| l == line),
-                "the Makefile has no line {line}"
-            );
-        }
+    fn the_test_libs_go_in_lib_beside_each_binarys_directory() {
+        let binaries = [
+            "/t/debug/build/a/1f/out/a-1f",
+            "/t/debug/build/a/2e/out/a-2e",
+            "/t/debug/deps/b-3d",
+            "/t/debug/deps/c-4c",
+        ]
+        .map(PathBuf::from);
         assert_eq!(
-            mac_test_libs_build(std::path::Path::new("/t")),
-            "BUILD=/t/debug"
+            test_lib_dirs(&binaries),
+            [
+                "/t/debug/build/a/1f/lib",
+                "/t/debug/build/a/2e/lib",
+                "/t/debug/lib",
+            ]
+            .map(PathBuf::from)
         );
     }
 }

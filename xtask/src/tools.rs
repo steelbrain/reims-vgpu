@@ -67,16 +67,40 @@ pub fn target_dir(tools: &mut dyn Tools) -> Res<PathBuf> {
 
 /// The `target_directory` string of `cargo metadata`'s JSON, unescaped.
 pub fn parse_target_directory(json: &str) -> Option<PathBuf> {
-    const KEY: &str = "\"target_directory\":";
-    let rest = json[json.find(KEY)? + KEY.len()..].trim_start();
-    let mut chars = rest.strip_prefix('"')?.chars();
+    json_strings(json, "target_directory")
+        .into_iter()
+        .next()
+        .map(PathBuf::from)
+}
+
+/// Every string value of `key` in `json`, unescaped, in their order: what xtask reads of Cargo's
+/// and nextest's JSON needs no more of its structure. A key inside a string is escaped there, so
+/// it is not matched; a value of the key that is not a string is passed over.
+pub fn json_strings(json: &str, key: &str) -> Vec<String> {
+    let pattern = format!("\"{key}\":");
+    let mut out = Vec::new();
+    let mut rest = json;
+    while let Some(at) = rest.find(&pattern) {
+        rest = rest[at + pattern.len()..].trim_start();
+        if let Some((value, after)) = json_string(rest) {
+            out.push(value);
+            rest = after;
+        }
+    }
+    out
+}
+
+/// The JSON string `text` starts with, unescaped, and the text after it.
+fn json_string(text: &str) -> Option<(String, &str)> {
+    let body = text.strip_prefix('"')?;
+    let mut chars = body.char_indices();
     let mut out = String::new();
     loop {
         match chars.next()? {
-            '"' => return Some(PathBuf::from(out)),
-            '\\' => match chars.next()? {
+            (at, '"') => return Some((out, &body[at + 1..])),
+            (_, '\\') => match chars.next()?.1 {
                 'u' => {
-                    let hex: String = chars.by_ref().take(4).collect();
+                    let hex: String = chars.by_ref().take(4).map(|(_, c)| c).collect();
                     out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
                 }
                 'n' => out.push('\n'),
@@ -86,7 +110,7 @@ pub fn parse_target_directory(json: &str) -> Option<PathBuf> {
                 'f' => out.push('\u{c}'),
                 c => out.push(c),
             },
-            c => out.push(c),
+            (_, c) => out.push(c),
         }
     }
 }
@@ -130,6 +154,18 @@ mod tests {
             Some(PathBuf::from("/a/b \"c\"\u{e9}"))
         );
         assert_eq!(parse_target_directory("{}"), None);
+    }
+
+    /// nextest's list names each test binary by its `binary-path`; the key's other values, a
+    /// non-string one and an escaped key inside a string, are passed over.
+    #[test]
+    fn json_strings_reads_every_string_value_of_a_key() {
+        let json = r#"{"rust-suites":{"a":{"binary-path":"/t/build/a/1/out/a-1","note":"\"binary-path\":\"/no\""},"b":{"binary-path":null},"c":{"binary-path": "/t/d\u00e9ps/c-2\n"}}}"#;
+        assert_eq!(
+            json_strings(json, "binary-path"),
+            ["/t/build/a/1/out/a-1", "/t/d\u{e9}ps/c-2\n"]
+        );
+        assert!(json_strings(json, "binary-id").is_empty());
     }
 
     #[test]
