@@ -238,10 +238,13 @@ impl<P: Platform> OrderWait<P> {
     /// Waits on the CPU, at most `milliseconds`, for the buffer waited for to finish; whether it
     /// did.
     fn wait(&self, milliseconds: u64) -> bool {
-        self.marks.done.load(Ordering::Acquire) >= self.value
-            || self
-                .event
-                .wait_until_signaled_value(self.value, milliseconds)
+        if self.marks.done.load(Ordering::Acquire) >= self.value {
+            return true;
+        }
+        let began = reims_vgpu_vulkan::core::long_waits::begin();
+        let done = (self.event).wait_until_signaled_value(self.value, milliseconds);
+        began.end("surface-order-cpu");
+        done
     }
 }
 

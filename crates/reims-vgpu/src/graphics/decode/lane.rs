@@ -661,12 +661,15 @@ impl Turn {
         if state.passed >= self.number {
             return;
         }
+        let began = reims_vgpu_vulkan::core::long_waits::begin();
         let turned = Arc::new(Condvar::new());
         state.turn_waits.insert(self.number, Arc::clone(&turned));
         while state.passed < self.number {
             turned.wait(&mut state);
         }
         state.turn_waits.remove(&self.number);
+        drop(state);
+        began.end("lane-turn");
     }
 }
 

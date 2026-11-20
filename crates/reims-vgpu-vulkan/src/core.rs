@@ -36,6 +36,7 @@ pub mod collections;
 pub mod display;
 pub mod host;
 pub mod logging;
+pub mod long_waits;
 pub mod memory;
 pub mod num;
 pub mod platform;

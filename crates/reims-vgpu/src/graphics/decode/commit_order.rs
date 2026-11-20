@@ -186,6 +186,7 @@ pub(crate) fn wait(
     until: Until,
 ) -> Waited {
     let mut waited = Waited::default();
+    let began = reims_vgpu_vulkan::core::long_waits::begin();
     let begun = cancel.now();
     let over = || {
         own.is_some_and(|own| own.commit.ended.load(Ordering::SeqCst)) || cancel.cut_since(begun)
@@ -214,6 +215,10 @@ pub(crate) fn wait(
             break;
         }
     }
+    began.end(match until {
+        Until::Begun => "commit-order-begun",
+        Until::Committed => "commit-order",
+    });
     waited
 }
 

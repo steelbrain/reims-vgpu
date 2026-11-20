@@ -57,6 +57,7 @@
 use ash::{khr, vk};
 use metal2vulkan_rt as rt;
 
+use crate::core::long_waits;
 use crate::core::platform::Handle as _;
 use crate::core::platform::os::Clock as _;
 use crate::core::sync::MutexGuard;
@@ -377,6 +378,7 @@ impl RtSwapchain {
             let waited = clock.now_mono().saturating_duration_since(began).as_nanos();
             u64::try_from(waited).unwrap_or(u64::MAX)
         };
+        let long = long_waits::begin();
         let taken = take_image(
             |timeout| {
                 let asked = trace::on().then(trace::now);
@@ -406,6 +408,7 @@ impl RtSwapchain {
             },
             elapsed,
         );
+        long.end("window-take");
         match taken {
             Ok((index, suboptimal)) => {
                 self.stale |= suboptimal;
@@ -430,8 +433,10 @@ impl RtSwapchain {
     /// made, or a retry with it pending.
     fn wait_for(&mut self, index: u32) -> Acquired {
         let began = trace::on().then(trace::now);
+        let long = long_waits::begin();
         // SAFETY: the fence is live, and image `index`'s acquire signals it.
         let waited = unsafe { self.vk.wait_for_fences(&[self.fence], true, WAIT_NS) };
+        long.end("window-fence");
         if let Some(began) = began {
             // winfence (timed at the wait's return): when the wait for a taken image's fence
             // began, and 1 where the fence signalled, else 0
@@ -553,7 +558,9 @@ impl RtSwapchain {
         image.last = Some(raw.clone());
         image.acquired = false;
         let scheduling = trace::on().then(trace::now);
+        let began = long_waits::begin();
         let scheduled = raw.wait_until_scheduled();
+        began.end("window-scheduled");
         if scheduled.is_err() || raw.status() == rt::CommandBufferStatus::Error {
             // It signals nothing, and the image stays taken, its move home perhaps not run: the
             // swapchain is made again, its retire settling the image (the module doc).
@@ -591,10 +598,12 @@ impl RtSwapchain {
             unsafe { api.queue_present(queue, &info) }
         };
         let asked = scheduling.map(|_| trace::now());
+        let began = long_waits::begin();
         let wsi = WSI.lock();
         let presented = self.device.rt().with_present_queue(present);
         let returned = scheduling.map(|_| trace::now());
         drop(wsi);
+        began.end("window-present");
         if let (Some(scheduling), Some(asked), Some(returned)) = (scheduling, asked, returned) {
             // winpresent (timed at the call's return): when the wait for the frame's command
             // buffer to be scheduled began, when the take of the window system's lock began, when

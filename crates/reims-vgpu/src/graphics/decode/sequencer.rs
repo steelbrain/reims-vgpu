@@ -188,6 +188,7 @@ impl Sequencer {
         if self.done_through.load(Ordering::Acquire) >= mark {
             return;
         }
+        let began = reims_vgpu_vulkan::core::long_waits::begin();
         let mut open = self.open.lock();
         let mut waits = false;
         while self.done_through.load(Ordering::Acquire) < mark
@@ -201,6 +202,8 @@ impl Sequencer {
         if waits {
             open.stop_waiting(context);
         }
+        drop(open);
+        began.end("sequencer-tickets");
     }
 
     /// Whether a thread waits to commit a command buffer that `context`'s tickets or range
@@ -263,6 +266,7 @@ impl Sequencer {
     /// Waits, with no lock of the caller's held, until `asked` range messages of `context` are
     /// carried out.
     pub(crate) fn wait_for_ranges(&self, context: u32, asked: u64) {
+        let began = reims_vgpu_vulkan::core::long_waits::begin();
         let mut open = self.open.lock();
         let mut waits = false;
         while open.ranges.get(&context).is_some_and(|r| r.done < asked) {
@@ -274,6 +278,8 @@ impl Sequencer {
         if waits {
             open.stop_waiting(Some(context));
         }
+        drop(open);
+        began.end("sequencer-ranges");
     }
 
     /// Carries out, on this thread and one at a time, each range message of `context` whose

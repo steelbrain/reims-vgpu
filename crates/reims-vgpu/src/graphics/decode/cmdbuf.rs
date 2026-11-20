@@ -3280,6 +3280,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                         (self.shared.deal_waits).fetch_add(1, Ordering::Relaxed);
                     });
                     let waited = clock.now_mono().saturating_duration_since(waiting);
+                    reims_vgpu_vulkan::core::long_waits::waited("deal-chunk", waited);
                     deal.stats.waited += waited;
                     deal.stats.waits += u64::from(did);
                     let Some(chunk) = chunk else {

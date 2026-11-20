@@ -497,9 +497,12 @@ impl Unsettled {
                 "a job of key {own:#x} waits for key {key:#x}, another key's"
             );
         }
+        let began = reims_vgpu_vulkan::core::long_waits::begin();
         while keys.contains_key(&key) {
             self.settled.wait(&mut keys);
         }
+        drop(keys);
+        began.end("surface-worker");
     }
     /// Whether any of `keys` is unsettled.
     pub(crate) fn any(&self, mut keys: impl Iterator<Item = u64>) -> bool {

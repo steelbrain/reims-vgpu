@@ -325,10 +325,13 @@ impl Hand {
     /// Waits, with no lock of the caller's held, until a helper's run of the job has ended; at
     /// once where it was taken back.
     pub(crate) fn wait(&self) {
+        let began = reims_vgpu_vulkan::core::long_waits::begin();
         let mut state = self.state.lock();
         while matches!(*state, HandState::Running) {
             self.done.wait(&mut state);
         }
+        drop(state);
+        began.end("helper-run");
     }
 }
 

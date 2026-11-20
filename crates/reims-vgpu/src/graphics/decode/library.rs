@@ -358,10 +358,14 @@ impl<P: Platform> LibrarySlot<P> {
 
     /// The library once it is made; `None` where the platform refused it.
     pub(crate) fn wait(&self) -> Option<P::Library> {
+        let began = reims_vgpu_vulkan::core::long_waits::begin();
         let mut made = self.made.lock();
         loop {
             if let Some(library) = &*made {
-                return library.as_ref().map(Handle::clone_ref);
+                let library = library.as_ref().map(Handle::clone_ref);
+                drop(made);
+                began.end("library-make");
+                return library;
             }
             self.done.wait(&mut made);
         }

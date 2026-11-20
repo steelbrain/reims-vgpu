@@ -7663,7 +7663,9 @@ impl<P: Platform> Caches<P> {
         };
         let start = now();
         let done = fill.wait(over);
-        let waited = now().saturating_duration_since(start).as_micros();
+        let waited = now().saturating_duration_since(start);
+        reims_vgpu_vulkan::core::long_waits::waited("video-fill", waited);
+        let waited = waited.as_micros();
         let waited = u64::try_from(waited).unwrap_or(u64::MAX);
         let mut state = self.lock();
         let counts = &mut state.counts.shapes;

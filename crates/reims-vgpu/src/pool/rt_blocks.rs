@@ -81,7 +81,9 @@ impl BlockSource for RtBlocks {
             MemoryClass::Shared => rt::MemoryClass::Shared,
         };
         let started = trace::on().then(trace::now);
+        let began = reims_vgpu_vulkan::core::long_waits::begin();
         let taken = self.device.take_block(rt_class, len);
+        began.end("pool-take");
         if let Some(started) = started {
             // rttake: the class (0 Private, 1 Shared), the length asked, the nanoseconds rt's
             // take took, 1 where rt refused it
