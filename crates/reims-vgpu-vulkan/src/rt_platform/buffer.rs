@@ -66,7 +66,7 @@
 //! `crate::gpu::command`'s docs); Vulkan has no memory that drops writes, and rt no read-only
 //! import. So such pages are imported as a copy whose GPU writes are dropped at each completion
 //! (`super::copied`, "Writes dropped"), never by their pointer or a dma-buf, which the GPU would
-//! write: a pages block's view its process maps read-only (`import_known`'s `read_only`), whose
+//! write: a pages block's view its process maps read-only (`import_known`'s `access`), whose
 //! address the guest's buffers over the block are pinned in, and a buffer or heap of option bit 24
 //! with no pin, over a copy of its own. Each such import is counted ([`IMPORTS_READ_ONLY`]), and
 //! as a copy ([`IMPORTS_COPIED`]). A render pass's store into a texture over such a copy completes
@@ -216,12 +216,15 @@ use crate::core::platform::os::Clock as _;
 use crate::core::platform::resource::ExportedMemory;
 use crate::core::platform::resource::{Buffer, GpuResource, MemoryFor};
 use crate::core::platform::types::NsRange;
-use crate::core::platform::values::{BufferDeallocator, BufferDesc, SurfacePlane, TextureDesc};
+use crate::core::platform::values::{
+    BufferDeallocator, BufferDesc, PagesAccess, SurfacePlane, TextureDesc,
+};
 use crate::core::raise::death::{DeathId, DeathKind, fatal_with_detail};
 use crate::core::raise::{OnFault, RaiseResult};
 use crate::core::sync::Mutex;
 use crate::gpu::device::descriptor_options;
 
+use super::copied::Kind;
 use super::device::RtDevice;
 use super::diag::{Call, ImportPath, Made, Shape};
 use super::texture::{self, RtTexture, refused_metal};
@@ -1395,7 +1398,11 @@ fn no_copy(
                 None => {
                     let held = Arc::clone(slot);
                     let then = move || run(&held);
-                    let made = import_pages(device, sel, first, length, o.read_only, then);
+                    let access = match o.read_only {
+                        true => PagesAccess::ReadOnly,
+                        false => PagesAccess::Writable,
+                    };
+                    let made = import_pages(device, sel, first, length, access, then);
                     let (block, offset) = made?;
                     (block, offset, None)
                 }
@@ -1465,8 +1472,9 @@ fn range_of(
 /// bytes' offset in it. Where the GPU takes no pointer to the pages, on Linux, the import is of a
 /// dma-buf of the files behind them ("Dma-bufs of the pages"); the pages of a view mapped through
 /// dma-bufs go to rt as a dma-buf first, and by their pointer only once mapped from their files
-/// ("Pages no pin takes"). Pages whose GPU writes Metal drops (`read_only`) are imported as a
-/// copy that drops them, and never otherwise ("Read-only memory"). rt's release of the import runs
+/// ("Pages no pin takes"). Pages whose GPU writes Metal drops (`access` read-only) are imported as
+/// a copy that drops them, and never otherwise ("Read-only memory"), one that reads them once
+/// where they never change (`PagesAccess::Unchanging`). rt's release of the import runs
 /// `then`, after the import is freed; a copy's runs it as the copy goes ("A copy at the refusal
 /// point"), which the caller holds, from an object it makes over the block (`super::copied::of`),
 /// until its `super::copied::Fresh` of the block drops. `None` where Metal or rt refuses it,
@@ -1476,7 +1484,7 @@ pub(super) fn import_pages(
     sel: &'static str,
     first: HostPtr,
     length: u64,
-    read_only: bool,
+    access: PagesAccess,
     then: impl FnOnce() + Send + 'static,
 ) -> Option<(rt::Block, u64)> {
     let first = first.addr().to_u64();
@@ -1490,7 +1498,7 @@ pub(super) fn import_pages(
     let codes = crate::answer::making().unwrap_or(IMPORTS_UNNAMED);
     let len = end - start;
     let then: Then = Arc::new(Mutex::new(Some(Box::new(then))));
-    if read_only {
+    if access.read_only() {
         let why = "pages whose GPU writes are dropped";
         let made = copied(
             device,
@@ -1499,7 +1507,7 @@ pub(super) fn import_pages(
             (at, len),
             &then,
             &why,
-            true,
+            Kind::of(access),
             |uncopied| {
                 refused_uncopied(sel, uncopied);
             },
@@ -1790,9 +1798,18 @@ fn by_dma_buf(
     }
     count_refused(kind, len);
     let why = format!("metal2vulkan-runtime refused their pointer: {error}");
-    copied(device, sel, codes, (at, len), then, &why, false, |_| {
-        rt_refused_create(sel, error);
-    })
+    copied(
+        device,
+        sel,
+        codes,
+        (at, len),
+        then,
+        &why,
+        Kind::Merges,
+        |_| {
+            rt_refused_create(sel, error);
+        },
+    )
 }
 
 /// Why a dma-buf of an import's pages was not imported ([`dma_buf`]).
@@ -2067,14 +2084,14 @@ fn refused(
         (at, len),
         then,
         &no.why(),
-        false,
+        Kind::Merges,
         |_| refuse(),
     )
 }
 
 /// [`import_pages`]'s import of `pages`, the `len` bytes of whole pages at their address, for
 /// `sel`, for a make of `codes`, that rt took neither by their pointer nor as a dma-buf, `why` in
-/// words, or whose GPU writes are dropped (`drops`, "Read-only memory"): as a copy (the module's
+/// words, or whose GPU writes are dropped (`kind`, "Read-only memory"): as a copy (the module's
 /// docs, "A copy at the refusal point"), whose pages the device keeps for the block
 /// ([`KnownBlocks`]) until the copy goes, its release running `then`; counted
 /// ([`IMPORTS_COPIED`]), the process's first with a line. The block, and the offset of the pages'
@@ -2091,7 +2108,7 @@ fn copied(
     (at, len): (NonNull<u8>, u64),
     then: &Then,
     why: &dyn std::fmt::Display,
-    drops: bool,
+    kind: Kind,
     refuse: impl FnOnce(&super::copied::Uncopied),
 ) -> Option<(rt::Block, u64)> {
     let homes = device.known_blocks().homes.clone();
@@ -2100,8 +2117,8 @@ fn copied(
     // SAFETY: the creators' `HostRange` contracts keep the bytes mapped until their deallocator
     // runs, which runs only from `then`, from the copy's release, as the copy goes, once nothing
     // syncs it; the pages they lie in are mapped readable, as `by_pointer`'s are, and writable
-    // unless `drops`, where nothing writes them.
-    match unsafe { super::copied::import(device.rt(), (at, len), drops, release) } {
+    // unless `kind` drops the GPU's writes, where nothing writes them.
+    match unsafe { super::copied::import(device.rt(), (at, len), kind, release) } {
         Ok(block) => {
             let _ = id.set(block.id);
             (homes.0.lock()).insert(block.id, at.as_ptr().addr().to_u64());
@@ -2204,8 +2221,9 @@ fn pointer_refused() -> Option<rt::Error> {
 }
 
 /// rt's import of the host's pages that hold the `length` bytes at `first`, as a no-copy buffer's
-/// is made and counted ([`import_pages`]), as a copy that drops the GPU's writes where `read_only`
-/// (the module's docs, "Read-only memory"), known to `device` from now (`KnownBlocks::know`): the
+/// is made and counted ([`import_pages`]), as a copy that drops the GPU's writes where `access` is
+/// read-only (the module's docs, "Read-only memory"), read once where the pages never change
+/// (`PagesAccess::Unchanging`), known to `device` from now (`KnownBlocks::know`): the
 /// block and the bytes' offset in it. A no-copy buffer over the bytes pinned at the block's
 /// address plus their offset is then that range of the block ("A pinned address"), with no import
 /// of its own. The caller forgets the block (`KnownBlocks::forget`) as the last such buffer goes;
@@ -2218,10 +2236,10 @@ pub fn import_known(
     sel: &'static str,
     first: HostPtr,
     length: u64,
-    read_only: bool,
+    access: PagesAccess,
     then: impl FnOnce() + Send + 'static,
 ) -> Option<(rt::Block, u64)> {
-    let (block, offset) = import_pages(device, sel, first, length, read_only, then)?;
+    let (block, offset) = import_pages(device, sel, first, length, access, then)?;
     let _fresh = super::copied::Fresh(block.id);
     device.known_blocks().know(block.clone());
     Some((block, offset))
@@ -3667,7 +3685,14 @@ mod tests {
         // block, with no import of its own; so is a Managed one, counted.
         let at = pages.wrapping_add(2 * page + 32);
         let (released, then) = flag();
-        let known = import_known(&device, "a test's import", at, 256, false, then);
+        let known = import_known(
+            &device,
+            "a test's import",
+            at,
+            256,
+            PagesAccess::Writable,
+            then,
+        );
         let (block, offset) = known.expect("a known import, as the buffer's above");
         let mapped = device.known_blocks().contents_of(&block);
         assert_eq!(block.contents, None);
@@ -4368,7 +4393,14 @@ mod tests {
         // is a range of its block, with no import of its own.
         let first = at.wrapping_add(2 * page + 32);
         let (released, then) = flag();
-        let known = import_known(&device, "a test's import", first, 256, false, then);
+        let known = import_known(
+            &device,
+            "a test's import",
+            first,
+            256,
+            PagesAccess::Writable,
+            then,
+        );
         let (block, offset) = known.expect("a known import over a copy");
         let home = device.known_blocks().contents_of(&block);
         assert_eq!(home.map(|home| home + offset), Some(first.addr().to_u64()));

@@ -14954,9 +14954,10 @@ void test_no_copy_buffers_in_place()
 		uint64_t offset = RGFX_ALLOCATIONS_OFFSET + 0x100000;
 		uint64_t size = 0x1000;
 		bool gives = true;
-		static bool block(void *c, const void *address, uint64_t length, bool writable,
+		static bool block(void *c, const void *address, uint64_t length, uint32_t how,
 		                  uint64_t *offset, uint64_t *size, uint64_t *gpuAddress)
 		{
+			const bool writable = (how & RgfxRegion::kPagesWritable) != 0;
 			Pages *p = static_cast<Pages *>(c);
 			p->asked.emplace_back(address, length, writable);
 			*offset = p->offset;
@@ -15281,8 +15282,8 @@ void test_no_copy_buffers_over_the_same_bytes_share_a_block()
 	struct Pages {
 		int asked = 0;
 		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x100000;
-		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size,
-		                  uint64_t *gpuAddress)
+		static bool block(void *c, const void *, uint64_t, uint32_t, uint64_t *offset,
+		                  uint64_t *size, uint64_t *gpuAddress)
 		{
 			Pages *p = static_cast<Pages *>(c);
 			p->asked++;
@@ -15394,8 +15395,8 @@ void test_no_copy_buffers_lie_at_the_host_s_address()
 		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x100000;
 		// The address the device gives the next block's view; 0 for none.
 		uint64_t view = 1ull << 43;
-		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size,
-		                  uint64_t *gpuAddress)
+		static bool block(void *c, const void *, uint64_t, uint32_t, uint64_t *offset,
+		                  uint64_t *size, uint64_t *gpuAddress)
 		{
 			Pages *p = static_cast<Pages *>(c);
 			p->asked++;
@@ -15478,8 +15479,8 @@ void test_no_copy_buffers_ask_the_host_s_address_where_their_block_is_answered_f
 	struct Pages {
 		int asked = 0;
 		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x100000;
-		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size,
-		                  uint64_t *gpuAddress)
+		static bool block(void *c, const void *, uint64_t, uint32_t, uint64_t *offset,
+		                  uint64_t *size, uint64_t *gpuAddress)
 		{
 			Pages *p = static_cast<Pages *>(c);
 			p->asked++;
@@ -15644,9 +15645,10 @@ void test_no_copy_buffer_over_remapped_memory_takes_its_own_block()
 		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x100000;
 		std::mutex lock;
 		std::map<uint64_t, mach_port_t> held; // each live pages block's memory entry
-		static bool block(void *c, const void *address, uint64_t length, bool writable,
+		static bool block(void *c, const void *address, uint64_t length, uint32_t how,
 		                  uint64_t *offset, uint64_t *size, uint64_t *gpuAddress)
 		{
+			const bool writable = (how & RgfxRegion::kPagesWritable) != 0;
 			Pages *p = static_cast<Pages *>(c);
 			*gpuAddress = 0;
 			const vm_address_t at = reinterpret_cast<vm_address_t>(address);
@@ -15774,7 +15776,7 @@ void test_no_copy_buffer_escape_notes()
 	// A pages block for each buffer's bytes, one after another.
 	struct Pages {
 		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x100000;
-		static bool block(void *c, const void *address, uint64_t length, bool, uint64_t *offset,
+		static bool block(void *c, const void *address, uint64_t length, uint32_t, uint64_t *offset,
 		                  uint64_t *size, uint64_t *gpuAddress)
 		{
 			Pages *p = static_cast<Pages *>(c);
@@ -15990,9 +15992,10 @@ void test_slab_buffers_over_pages_escape_notes()
 			return KERN_SUCCESS;
 		}
 		static void unmap(void *c, uint8_t *bytes, uint64_t) { static_cast<Vm *>(c)->held.erase(bytes); }
-		static bool block(void *c, const void *, uint64_t, bool writable, uint64_t *offset,
+		static bool block(void *c, const void *, uint64_t, uint32_t how, uint64_t *offset,
 		                  uint64_t *size, uint64_t *gpuAddress)
 		{
+			const bool writable = (how & RgfxRegion::kPagesWritable) != 0;
 			*gpuAddress = 0;
 			if (!writable)
 				return false;
@@ -16096,9 +16099,10 @@ void test_no_copy_shadows_lie_in_slabs()
 			return KERN_SUCCESS;
 		}
 		static void unmap(void *c, uint8_t *bytes, uint64_t) { static_cast<Vm *>(c)->held.erase(bytes); }
-		static bool block(void *c, const void *address, uint64_t, bool writable, uint64_t *offset,
+		static bool block(void *c, const void *address, uint64_t, uint32_t how, uint64_t *offset,
 		                  uint64_t *size, uint64_t *gpuAddress)
 		{
+			const bool writable = (how & RgfxRegion::kPagesWritable) != 0;
 			*gpuAddress = 0;
 			// No block of read-only memory, as a kext on a host without READ_ONLY_PAGES.
 			if (!writable)

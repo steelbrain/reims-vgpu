@@ -254,20 +254,39 @@ public:
 	                                 uint32_t surfaceId, bool cacheable,
 	                                 const RgfxSurfacePagesLayout *layout, PagesAnswer *answer);
 
+	/// How a pages block's memory is (PagesBlockFn's `how`, the kext's kRgfxPagesWritable,
+	/// kRgfxPagesUnchanging, kRgfxPagesCopyOnWrite and kRgfxPagesWhyShift): none of them for
+	/// memory the process may not write; kPagesWritable for memory it may; kPagesUnchanging for
+	/// read-only memory that cannot change (RgfxFilePages.hpp), with kPagesCopyOnWrite where the
+	/// app maps it private and copy-on-write; and for read-only memory not named unchanging, why
+	/// not in the bits from kPagesWhyShift (RGFX_PAGES_WHY_*, a diagnostic the host counts its
+	/// copies by).
+	static const uint32_t kPagesWritable = 1u << 0;
+	static const uint32_t kPagesUnchanging = 1u << 1;
+	static const uint32_t kPagesCopyOnWrite = 1u << 2;
+	static const uint32_t kPagesWhyShift = 8;
+
 	/// Where pages blocks come from (the kext's PagesBlock, RGFX_FEATURE_PAGES_BUFFERS): `acquire`
 	/// answers the block of the runs of the pages that hold the `length` bytes at `address` in the
 	/// process, which the kext wires for the block's life and the device maps in place from the
-	/// first of them, where the memory is `writable`: its region offset and size, and the GPU
-	/// address the device gave the view of its pages in `*gpuAddress`, 0 where none
+	/// first of them, the memory as `how` says (kPagesWritable): its region offset and size, and
+	/// the GPU address the device gave the view of its pages in `*gpuAddress`, 0 where none
 	/// (RGFX_FEATURE_IMPORT_ADDRESSES); or false where it gives none. Its blocks go back through
 	/// the block source's release (release()). Called with `context`, from any thread.
 	typedef bool (*PagesBlockFn)(void *context, const void *address, uint64_t length,
-	                             bool writable, uint64_t *offset, uint64_t *size,
+	                             uint32_t how, uint64_t *offset, uint64_t *size,
 	                             uint64_t *gpuAddress);
 	void setPagesBlockSource(PagesBlockFn acquire, void *context);
 
 	/// Whether a pages block source is set.
 	bool hasPagesBlocks() const { return m_pagesBlock != nullptr; }
+
+	/// Whether the pages block source takes unchanging memory (kPagesUnchanging), where the kext
+	/// and the device took it (kRgfxKextFeatureUnchangingPages, RGFX_FEATURE_UNCHANGING_PAGES):
+	/// acquirePages then classifies the read-only memory it is asked for. Set with the pages
+	/// block source, before any block is asked.
+	void setUnchangingPages(bool on) { m_unchangingPages = on; }
+	bool unchangingPages() const { return m_unchangingPages; }
 
 	/// Where chunked pages blocks come from (the kext's PagesChunked,
 	/// kRgfxKextFeaturePagesChunked): `make` answers `length` bytes of the kext's own memory,
@@ -320,6 +339,13 @@ public:
 	/// and writes would reach the old memory's pages, wired under the old block, while the app
 	/// writes the new: in a macOS 26.7.2 guest, System Settings' labels drew the strings of
 	/// labels on the pane before.
+	///
+	/// Where the source takes unchanging memory (setUnchangingPages), memory the process may not
+	/// write that a block is made for is classified (rgfxFilePagesOf): where it cannot change, the
+	/// block of the app's own memory is asked named kPagesUnchanging (and kPagesCopyOnWrite), which
+	/// the host reads once; else, and where the kext refuses that, it is asked read-only with why
+	/// not (kPagesWhyShift; RGFX_PAGES_WHY_REFUSED for the kext's refusal). Each classification is
+	/// counted (rgfxFilePagesNote), and only it is timed.
 	Block acquirePages(const void *address, uint64_t length, bool writable,
 	                   uint32_t join = kPagesOwn);
 
@@ -379,6 +405,7 @@ private:
 	void *m_pagesContext = nullptr;
 	PagesBlockFn m_pagesBlock = nullptr; // the pages block source, where set (the kext)
 	void *m_pagesBlockContext = nullptr;
+	bool m_unchangingPages = false; // unchangingPages()
 	ChunkedPagesFn m_chunkedPages = nullptr; // the chunked pages source, where set (the kext)
 	void *m_chunkedPagesContext = nullptr;
 #if defined(__arm64__)

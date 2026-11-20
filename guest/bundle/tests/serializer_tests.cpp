@@ -11,8 +11,12 @@
  */
 
 #include <IOKit/IOReturn.h>
+#include <fcntl.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <sys/mman.h>
+#include <sys/mount.h>
+#include <unistd.h>
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -30,6 +34,7 @@
 #include <utility>
 #include "RgfxEncoder.hpp"
 #include "RgfxFeatureProfile.hpp"
+#include "RgfxFilePages.hpp"
 #include "RgfxHeapRanges.hpp"
 #include "RgfxLibraryKey.hpp"
 #include "RgfxMemoryShadow.hpp"
@@ -4511,9 +4516,10 @@ void test_region_pages_blocks()
 		bool writable = false;
 		uint64_t offset = 0;
 		std::vector<uint64_t> released;
-		static bool block(void *c, const void *address, uint64_t length, bool writable,
+		static bool block(void *c, const void *address, uint64_t length, uint32_t how,
 		                  uint64_t *offset, uint64_t *size, uint64_t *gpuAddress)
 		{
+			const bool writable = (how & RgfxRegion::kPagesWritable) != 0;
 			Source *s = static_cast<Source *>(c);
 			s->address = address;
 			s->length = length;
@@ -4557,8 +4563,8 @@ void test_region_pages_joins()
 		int asked = 0;
 		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x10000;
 		std::vector<uint64_t> released;
-		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size,
-		                  uint64_t *gpuAddress)
+		static bool block(void *c, const void *, uint64_t, uint32_t, uint64_t *offset,
+		                  uint64_t *size, uint64_t *gpuAddress)
 		{
 			Source *s = static_cast<Source *>(c);
 			s->asked++;
@@ -4645,8 +4651,8 @@ void test_region_pages_join_over_remapped_memory()
 		int asked = 0;
 		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x10000;
 		std::vector<uint64_t> released;
-		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size,
-		                  uint64_t *gpuAddress)
+		static bool block(void *c, const void *, uint64_t, uint32_t, uint64_t *offset,
+		                  uint64_t *size, uint64_t *gpuAddress)
 		{
 			Source *s = static_cast<Source *>(c);
 			s->asked++;
@@ -4748,6 +4754,347 @@ void test_region_pages_join_over_remapped_memory()
 	mach_vm_deallocate(mach_task_self(), at, length);
 }
 
+// A file on a read-only volume for the unchanging pages tests (RgfxFilePages.hpp): /bin/bash, on
+// the system volume, which every macOS since 10.15 mounts read-only, opened read-only, and the
+// `length` bytes at `offset` in it as read.
+struct ReadOnlyFile {
+	int fd = -1;
+	std::vector<uint8_t> bytes;
+	ReadOnlyFile(off_t offset, size_t length) : bytes(length)
+	{
+		fd = open("/bin/bash", O_RDONLY | O_CLOEXEC);
+		CHECK(fd >= 0);
+		struct statfs volume = {};
+		CHECK(fstatfs(fd, &volume) == 0 && (volume.f_flags & MNT_RDONLY) != 0);
+		CHECK(pread(fd, bytes.data(), length, offset) == static_cast<ssize_t>(length));
+	}
+	~ReadOnlyFile() { close(fd); }
+};
+
+// The object and the offset the kernel finds the page at `address` in, below any private object
+// over it (mach_vm_page_info).
+static vm_page_info_basic_data_t pageAt(const void *address)
+{
+	vm_page_info_basic_data_t info = {};
+	mach_msg_type_number_t count = VM_PAGE_INFO_BASIC_COUNT;
+	CHECK(mach_vm_page_info(mach_task_self(), reinterpret_cast<uintptr_t>(address),
+	                        VM_PAGE_INFO_BASIC, reinterpret_cast<vm_page_info_t>(&info),
+	                        &count) == KERN_SUCCESS);
+	return info;
+}
+
+// The region's shadow depth at `address` (mach_vm_region_recurse's short info).
+static unsigned shadowDepthAt(const void *address)
+{
+	mach_vm_address_t base = reinterpret_cast<uintptr_t>(address);
+	mach_vm_size_t size = 0;
+	natural_t depth = 0;
+	vm_region_submap_short_info_data_64_t info = {};
+	mach_msg_type_number_t count = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
+	CHECK(mach_vm_region_recurse(mach_task_self(), &base, &size, &depth,
+	                             reinterpret_cast<vm_region_recurse_info_t>(&info),
+	                             &count) == KERN_SUCCESS);
+	return info.shadow_depth;
+}
+
+// The classification of read-only memory at a no-copy buffer's make (rgfxFilePagesOf): a shared
+// mapping of a file on a read-only volume, from a descriptor opened read-only, has no write in its
+// maximum protection and the file's object at depth 0 (kRgfxFileMaxNoWrite). A private mapping
+// has write in its maximum protection, as mmap makes it, and is neither (writable max
+// protection); with its maximum protection taken down to read (vm_protect's set_maximum) it is
+// copy-on-write, the delayed copy object xnu makes for it at depth 1, every page the file's
+// (kRgfxFileCopyOnWrite). A private mapping written before its maximum protection lost write has
+// a shadow over the file's pages, and is neither (shadowed), while its pages past the written one
+// are copy-on-write still; so are a shared writable mapping (writable mapping), a file on a
+// writable volume, anonymous memory, and a range over two regions.
+void test_file_pages_classify()
+{
+	const uint64_t page = vm_page_size;
+	const off_t at = static_cast<off_t>(8 * page);
+	const size_t mapped = 8 * page;
+	const uint64_t into = 0x180, length = 3 * page + 0x40;
+	ReadOnlyFile file(at + static_cast<off_t>(into), length);
+	auto lowerMax = [](void *address, size_t bytes) {
+		return mach_vm_protect(mach_task_self(), reinterpret_cast<uintptr_t>(address), bytes,
+		                       true, VM_PROT_READ) == KERN_SUCCESS;
+	};
+
+	// Shared, read-only: max-no-write, depth 0.
+	uint8_t *shared = static_cast<uint8_t *>(mmap(nullptr, mapped, PROT_READ, MAP_SHARED, file.fd, at));
+	CHECK(shared != MAP_FAILED && shadowDepthAt(shared) == 0);
+	RgfxFilePages a = rgfxFilePagesOf(shared + into, length);
+	CHECK(a.clause == kRgfxFileMaxNoWrite && a.why == kRgfxNeitherNone);
+	CHECK(std::memcmp(shared + into, file.bytes.data(), length) == 0);
+
+	// Private, as mmap makes it: write in its maximum protection.
+	uint8_t *priv = static_cast<uint8_t *>(mmap(nullptr, mapped, PROT_READ, MAP_PRIVATE, file.fd, at));
+	CHECK(priv != MAP_FAILED && shadowDepthAt(priv) == 1);
+	RgfxFilePages b = rgfxFilePagesOf(priv + into, length);
+	CHECK(b.clause == kRgfxFileNeither && b.why == kRgfxNeitherWritableMaxProtection);
+	// Its maximum protection taken down: copy-on-write, every page the file's below the delayed
+	// copy, and the process can no longer make it writable.
+	CHECK(lowerMax(priv, mapped));
+	RgfxFilePages c = rgfxFilePagesOf(priv + into, length);
+	CHECK(c.clause == kRgfxFileCopyOnWrite && c.why == kRgfxNeitherNone);
+	CHECK(mprotect(priv, mapped, PROT_READ | PROT_WRITE) != 0);
+	CHECK(pageAt(priv + into).object_id == pageAt(shared + into).object_id);
+
+	// Written before its maximum protection lost write: its written page is the process's own,
+	// under a shadow.
+	uint8_t *written = static_cast<uint8_t *>(mmap(nullptr, mapped, PROT_READ, MAP_PRIVATE, file.fd, at));
+	CHECK(written != MAP_FAILED);
+	CHECK(mprotect(written, mapped, PROT_READ | PROT_WRITE) == 0);
+	written[into + page] ^= 0xff;
+	CHECK(mprotect(written, mapped, PROT_READ) == 0 && lowerMax(written, mapped));
+	RgfxFilePages d = rgfxFilePagesOf(written + into, length);
+	CHECK(d.clause == kRgfxFileNeither && d.why == kRgfxNeitherShadowed);
+	// The bytes of the range's other pages are still the file's, and so is the range past it.
+	CHECK(rgfxFilePagesOf(written + 5 * page, page).clause == kRgfxFileCopyOnWrite);
+
+	// Two regions: the second half of a shared mapping replaced by other pages of the file.
+	uint8_t *split = static_cast<uint8_t *>(mmap(nullptr, mapped, PROT_READ, MAP_SHARED, file.fd, at));
+	CHECK(split != MAP_FAILED);
+	CHECK(mmap(split + 4 * page, 4 * page, PROT_READ, MAP_SHARED | MAP_FIXED, file.fd,
+	           at + static_cast<off_t>(16 * page)) == split + 4 * page);
+	CHECK(rgfxFilePagesOf(split + 3 * page, 2 * page).why == kRgfxNeitherSpansRegions);
+	CHECK(rgfxFilePagesOf(split + 4 * page, page).clause == kRgfxFileMaxNoWrite);
+
+	// Anonymous memory, read-only now, its maximum protection too.
+	mach_vm_address_t anon = 0;
+	CHECK(mach_vm_allocate(mach_task_self(), &anon, mapped, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	std::memset(reinterpret_cast<void *>(anon), 0x11, mapped);
+	CHECK(lowerMax(reinterpret_cast<void *>(anon), mapped));
+	CHECK(rgfxFilePagesOf(reinterpret_cast<void *>(anon + into), length).why ==
+	      kRgfxNeitherNotAFile);
+
+	// A file on a writable volume, shared from a read-only descriptor and private with its
+	// maximum protection taken down; and shared writable.
+	char path[] = "/tmp/rgfx-file-pages-XXXXXX";
+	const int temp = mkstemp(path);
+	CHECK(temp >= 0);
+	std::vector<uint8_t> fill(mapped, 0x22);
+	CHECK(write(temp, fill.data(), mapped) == static_cast<ssize_t>(mapped));
+	const int readOnly = open(path, O_RDONLY | O_CLOEXEC);
+	uint8_t *onData = static_cast<uint8_t *>(mmap(nullptr, mapped, PROT_READ, MAP_SHARED, readOnly, 0));
+	uint8_t *onDataPriv =
+	    static_cast<uint8_t *>(mmap(nullptr, mapped, PROT_READ, MAP_PRIVATE, readOnly, 0));
+	uint8_t *writable =
+	    static_cast<uint8_t *>(mmap(nullptr, mapped, PROT_READ, MAP_SHARED, temp, 0));
+	CHECK(onData != MAP_FAILED && onDataPriv != MAP_FAILED && writable != MAP_FAILED);
+	CHECK(lowerMax(onDataPriv, mapped));
+	CHECK(rgfxFilePagesOf(onData + into, length).why == kRgfxNeitherWritableVolume);
+	CHECK(rgfxFilePagesOf(onDataPriv + into, length).why == kRgfxNeitherWritableVolume);
+	CHECK(rgfxFilePagesOf(writable + into, length).why == kRgfxNeitherWritableMapping);
+
+	munmap(writable, mapped);
+	munmap(onDataPriv, mapped);
+	munmap(onData, mapped);
+	close(readOnly);
+	close(temp);
+	unlink(path);
+	mach_vm_deallocate(mach_task_self(), anon, mapped);
+	munmap(split, mapped);
+	munmap(written, mapped);
+	munmap(priv, mapped);
+	munmap(shared, mapped);
+}
+
+// Read-only memory under a no-copy buffer (RgfxRegion::acquirePages with setUnchangingPages): the
+// block is always of the app's own memory. Where it cannot change it is named unchanging, and
+// copy-on-write for a private mapping whose maximum protection has no write, and the GPU's pages
+// hold the file's bytes; a block of the same bytes joins while they are the same memory. Memory
+// that is neither is asked read-only with why not in the bits from kPagesWhyShift: a private
+// mapping as mmap makes it (writable max protection) and one written before its maximum
+// protection lost write (shadowed), whose GPU's pages hold the process's bytes. Memory whose
+// unchanging block the kext refused is asked again read-only, why RGFX_PAGES_WHY_REFUSED. Writable
+// memory is not classified, and without setUnchangingPages nothing is. Each classification is
+// counted.
+void test_region_unchanging_file_pages()
+{
+	const uint64_t page = vm_page_size;
+	const off_t at = static_cast<off_t>(8 * page);
+	const size_t mapped = 8 * page;
+	const uint64_t into = 0x180, length = 3 * page + 0x40;
+	ReadOnlyFile file(at + static_cast<off_t>(into), length);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	struct Source {
+		struct Ask {
+			const void *address;
+			uint64_t length;
+			uint32_t how;
+			std::vector<uint8_t> seen; // what the GPU reads at the call
+			mach_port_t held;          // the pages, as the kext's wire holds them
+		};
+		std::vector<Ask> asked;
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x10000;
+		bool refuseUnchanging = false;
+		static bool block(void *c, const void *address, uint64_t length, uint32_t how,
+		                  uint64_t *offset, uint64_t *size, uint64_t *gpuAddress)
+		{
+			Source *s = static_cast<Source *>(c);
+			const uint8_t *bytes = static_cast<const uint8_t *>(address);
+			Source::Ask ask{address, length, how, std::vector<uint8_t>(bytes, bytes + length),
+			                MACH_PORT_NULL};
+			// The pages the bytes lie in, shared, as the kext's wire of a block's pages holds the
+			// process's pages.
+			const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+			const uintptr_t base = start & ~(uintptr_t)(vm_page_size - 1);
+			memory_object_size_t held =
+			    ((start + length + vm_page_size - 1) & ~(uintptr_t)(vm_page_size - 1)) - base;
+			CHECK(mach_make_memory_entry_64(mach_task_self(), &held, base,
+			                                VM_PROT_READ | MAP_MEM_VM_SHARE, &ask.held,
+			                                MACH_PORT_NULL) == KERN_SUCCESS);
+			s->asked.push_back(std::move(ask));
+			if (s->refuseUnchanging && (how & RgfxRegion::kPagesUnchanging) != 0)
+				return false;
+			*offset = s->next;
+			*size = 0x4000;
+			*gpuAddress = 0;
+			s->next += 0x4000;
+			return true;
+		}
+		static bool alloc(void *, uint64_t, uint64_t, uint64_t *) { return false; }
+		static void release(void *, uint64_t) {}
+		// What the GPU's pages of ask `i` hold now.
+		std::vector<uint8_t> now(size_t i) const
+		{
+			// The entry starts at the address's page.
+			const uint64_t in = reinterpret_cast<uintptr_t>(asked[i].address) & (vm_page_size - 1);
+			const uint64_t span = (in + asked[i].length + vm_page_size - 1) & ~(vm_page_size - 1);
+			mach_vm_address_t view = 0;
+			CHECK(mach_vm_map(mach_task_self(), &view, span, 0, VM_FLAGS_ANYWHERE, asked[i].held,
+			                  0, false, VM_PROT_READ, VM_PROT_READ,
+			                  VM_INHERIT_NONE) == KERN_SUCCESS);
+			const uint8_t *p = reinterpret_cast<const uint8_t *>(view) + in;
+			std::vector<uint8_t> out(p, p + asked[i].length);
+			mach_vm_deallocate(mach_task_self(), view, span);
+			return out;
+		}
+	} src;
+	region.setBlockSource(&Source::alloc, &Source::release, &src);
+	region.setPagesBlockSource(&Source::block, &src);
+	region.setUnchangingPages(true);
+	CHECK(region.unchangingPages());
+	const RgfxFilePagesCounts before = rgfxFilePagesCounts();
+	const uint32_t join = 2;
+	const uint32_t shift = RgfxRegion::kPagesWhyShift;
+	auto privateOf = [&](bool lowerMax) {
+		uint8_t *p = static_cast<uint8_t *>(mmap(nullptr, mapped, PROT_READ, MAP_PRIVATE, file.fd, at));
+		CHECK(p != MAP_FAILED);
+		if (lowerMax)
+			CHECK(mach_vm_protect(mach_task_self(), reinterpret_cast<uintptr_t>(p), mapped, true,
+			                      VM_PROT_READ) == KERN_SUCCESS);
+		return p;
+	};
+
+	// Shared, max-no-write: the app's own pages, named unchanging, the file's bytes.
+	uint8_t *shared = static_cast<uint8_t *>(mmap(nullptr, mapped, PROT_READ, MAP_SHARED, file.fd, at));
+	CHECK(shared != MAP_FAILED);
+	RgfxRegion::Block a = region.acquirePages(shared + into, length, false, join);
+	CHECK(a.ok && src.asked.size() == 1);
+	CHECK(src.asked[0].how == RgfxRegion::kPagesUnchanging &&
+	      src.asked[0].address == shared + into);
+	CHECK(src.asked[0].seen == file.bytes && src.now(0) == file.bytes);
+
+	// Private as mmap makes it: neither, writable max protection, the app's own memory read-only.
+	uint8_t *priv = privateOf(false);
+	RgfxRegion::Block b = region.acquirePages(priv + into, length, false, join);
+	CHECK(b.ok && b.offset != a.offset && src.asked.size() == 2);
+	CHECK(src.asked[1].how == (RGFX_PAGES_WHY_WRITABLE_MAX_PROTECTION << shift) &&
+	      src.asked[1].address == priv + into);
+
+	// Private with its maximum protection taken down: copy-on-write, the GPU's pages the file's
+	// bytes, which the process can never write; the same bytes join.
+	uint8_t *cow = privateOf(true);
+	RgfxRegion::Block c = region.acquirePages(cow + into, length, false, join);
+	CHECK(c.ok && c.offset != b.offset && src.asked.size() == 3);
+	CHECK(src.asked[2].how == (RgfxRegion::kPagesUnchanging | RgfxRegion::kPagesCopyOnWrite) &&
+	      src.asked[2].address == cow + into);
+	CHECK(src.asked[2].seen == file.bytes && src.now(2) == file.bytes);
+	CHECK(mprotect(cow, mapped, PROT_READ | PROT_WRITE) != 0);
+	RgfxRegion::Block again = region.acquirePages(cow + into, length, false, join);
+	CHECK(again.ok && again.offset == c.offset && src.asked.size() == 3);
+
+	// Written before its maximum protection lost write: neither, shadowed, the GPU's pages the
+	// process's bytes.
+	uint8_t *written = privateOf(false);
+	CHECK(mprotect(written, mapped, PROT_READ | PROT_WRITE) == 0);
+	for (uint64_t i = 0; i < page; i++)
+		written[into + i] = file.bytes[i] ^ 0xff;
+	CHECK(mprotect(written, mapped, PROT_READ) == 0);
+	CHECK(mach_vm_protect(mach_task_self(), reinterpret_cast<uintptr_t>(written), mapped, true,
+	                      VM_PROT_READ) == KERN_SUCCESS);
+	RgfxRegion::Block d = region.acquirePages(written + into, length, false, join);
+	CHECK(d.ok && src.asked.size() == 4);
+	CHECK(src.asked[3].how == (RGFX_PAGES_WHY_SHADOWED << shift) &&
+	      src.asked[3].address == written + into);
+	CHECK(src.asked[3].seen[0] == (file.bytes[0] ^ 0xff) && src.now(3)[0] == (file.bytes[0] ^ 0xff));
+
+	// The kext refuses the unchanging block: the app's own memory again, read-only, why refused.
+	src.refuseUnchanging = true;
+	RgfxRegion::Block e = region.acquirePages(shared + into, length, false, RgfxRegion::kPagesOwn);
+	CHECK(e.ok && src.asked.size() == 6);
+	CHECK(src.asked[4].how == RgfxRegion::kPagesUnchanging &&
+	      src.asked[5].how == (RGFX_PAGES_WHY_REFUSED << shift) &&
+	      src.asked[4].address == shared + into && src.asked[5].address == shared + into);
+	src.refuseUnchanging = false;
+
+	// Writable memory is never classified, and is asked writable.
+	std::vector<uint8_t> heap(4 * page, 0x33);
+	RgfxRegion::Block f = region.acquirePages(heap.data(), heap.size(), true, RgfxRegion::kPagesOwn);
+	CHECK(f.ok && src.asked.size() == 7 && src.asked[6].how == RgfxRegion::kPagesWritable &&
+	      src.asked[6].address == heap.data());
+
+	const RgfxFilePagesCounts after = rgfxFilePagesCounts();
+	auto grew = [&](const uint64_t (&now)[kRgfxFileClauses], const uint64_t (&was)[kRgfxFileClauses],
+	                RgfxFileClause clause) { return now[clause] - was[clause]; };
+	CHECK(after.classified - before.classified == 5);
+	CHECK(grew(after.count, before.count, kRgfxFileMaxNoWrite) == 2 &&
+	      grew(after.bytes, before.bytes, kRgfxFileMaxNoWrite) == 2 * length);
+	CHECK(grew(after.count, before.count, kRgfxFileCopyOnWrite) == 1 &&
+	      grew(after.bytes, before.bytes, kRgfxFileCopyOnWrite) == length);
+	CHECK(grew(after.count, before.count, kRgfxFileNeither) == 2);
+	for (RgfxFileNeither why : {kRgfxNeitherWritableMaxProtection, kRgfxNeitherShadowed})
+		CHECK(after.neitherCount[why] - before.neitherCount[why] == 1 &&
+		      after.neitherBytes[why] - before.neitherBytes[why] == length);
+	CHECK(after.kextRefused - before.kextRefused == 1 &&
+	      after.kextRefusedBytes - before.kextRefusedBytes == length);
+	uint64_t timed = 0;
+	for (unsigned i = 0; i < RgfxFilePagesCounts::kBuckets; i++)
+		timed += after.buckets[i] - before.buckets[i];
+	CHECK(timed == 5 && after.ns > before.ns);
+
+	// Without setUnchangingPages nothing is classified, and read-only memory is asked as it is.
+	RgfxRegion plain(mem.data(), mem.size());
+	plain.setBlockSource(&Source::alloc, &Source::release, &src);
+	plain.setPagesBlockSource(&Source::block, &src);
+	RgfxRegion::Block g = plain.acquirePages(shared + into, length, false, RgfxRegion::kPagesOwn);
+	CHECK(g.ok && src.asked.size() == 8 && src.asked[7].how == 0 &&
+	      src.asked[7].address == shared + into);
+	CHECK(rgfxFilePagesCounts().classified == after.classified);
+
+	for (const Source::Ask &ask : src.asked)
+		mach_port_deallocate(mach_task_self(), ask.held);
+	munmap(written, mapped);
+	munmap(cow, mapped);
+	munmap(priv, mapped);
+	munmap(shared, mapped);
+}
+
+// The bucket of a classification's time (RgfxFilePagesCounts::buckets): four an octave, each
+// from its least time to the next one's.
+void test_file_pages_buckets()
+{
+	CHECK(rgfxFilePagesBucketNs(0) == 0 && rgfxFilePagesBucketNs(3) == 3);
+	CHECK(rgfxFilePagesBucketNs(8) == 4 && rgfxFilePagesBucketNs(11) == 7);
+	CHECK(rgfxFilePagesBucketNs(12) == 8 && rgfxFilePagesBucketNs(13) == 10);
+	CHECK(rgfxFilePagesBucketNs(4 * 10) == 1024 && rgfxFilePagesBucketNs(4 * 10 + 1) == 1280);
+	CHECK(rgfxFilePagesBucketNs(255) == 7ull << 61);
+	for (unsigned i = 8; i + 1 < RgfxFilePagesCounts::kBuckets; i++)
+		CHECK(rgfxFilePagesBucketNs(i) < rgfxFilePagesBucketNs(i + 1));
+}
+
 // Where the kext maps parts of blocks write-combined, a block asked with a write-combined part
 // takes it from the write-combined source, and one asked without from the block source; a queue's
 // submission ring's data starts its block's second page, write-combined, with the ring's header
@@ -4831,6 +5178,9 @@ int main()
 	test_region_pages_blocks();
 	test_region_pages_joins();
 	test_region_pages_join_over_remapped_memory();
+	test_file_pages_classify();
+	test_region_unchanging_file_pages();
+	test_file_pages_buckets();
 	test_region_write_combined_parts();
 	test_address_picks();
 	test_resource_id_chunks();

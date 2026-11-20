@@ -88,19 +88,20 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
     RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
     RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_SURFACE_REFILL,
-    RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA, RGFX_FEATURE_UNSHARED_QUEUES,
-    RGFX_FEATURE_UPLOADS_WRITTEN, RGFX_FEATURE_VT_MESSAGES, RGFX_RESOURCE_ID_CHUNK,
-    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK,
-    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
-    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RGFX_VIDEO_CODEC_H264,
-    RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH,
-    RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RGFX_VT_STATUS_MALFORMED,
-    RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled,
-    RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
-    RgfxFunctionPointerState, RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader,
-    RgfxPageRun, RgfxPipelineAnswersQuery, RgfxPoolGive, RgfxPoolTake, RgfxPrivateGive,
-    RgfxPrivateTake, RgfxRateMapAnswer, RgfxRateMapState, RgfxSamplerState, RgfxScheduledAsk,
-    RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA, RGFX_FEATURE_UNCHANGING_PAGES,
+    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_FEATURE_UPLOADS_WRITTEN, RGFX_FEATURE_VT_MESSAGES,
+    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT,
+    RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
+    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION,
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_H264_BASELINE,
+    RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10,
+    RGFX_VT_STATUS_MALFORMED, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages,
+    RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor,
+    RgfxEventSignalled, RgfxFunctionPointerState, RgfxHeapOverPages, RgfxIcbState,
+    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineAnswersQuery, RgfxPoolGive,
+    RgfxPoolTake, RgfxPrivateGive, RgfxPrivateTake, RgfxRateMapAnswer, RgfxRateMapState,
+    RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName, RgfxSurfacePages,
+    RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PoolAnswer,
@@ -604,7 +605,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // the guest's pages maps a process's own pages too, for its no-copy buffers
             // (`BUFFER_OVER_PAGES`), the heaps of its buffers' slabs (`HEAP_OVER_PAGES`) and its
             // indirect command buffers' slots (`ICB_SLOTS_IN_PAGES`), and the pages it maps
-            // read-only, which it keeps every object over from writing (`READ_ONLY_PAGES`). Every
+            // read-only, which it keeps every object over from writing (`READ_ONLY_PAGES`), those
+            // of them a file's own on a read-only volume read once (`UNCHANGING_PAGES`). Every
             // host carries the display pipe's colour out (`DISPLAY_COLOR`), its window drawing
             // through it, names the shared events one process hands another
             // (`SHARED_EVENT_NAMES`), and tells the guest its window's screen's scale
@@ -646,6 +648,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES)
                 | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
                 | RGFX_FEATURE_READ_ONLY_PAGES
+                | RGFX_FEATURE_UNCHANGING_PAGES
                 | if view_imports.is_some() {
                     u64::from(RGFX_FEATURE_IMPORT_ADDRESSES_LATER)
                 } else {

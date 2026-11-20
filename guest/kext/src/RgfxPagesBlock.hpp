@@ -11,6 +11,21 @@
 // RGFX_SURFACE_PAGES_READ_ONLY, for the host to keep every object over it from writing them
 // (rgfxPagesWiring).
 //
+// Memory the bundle names unchanging (kRgfxPagesUnchanging) takes a block where the guest took
+// RGFX_FEATURE_UNCHANGING_PAGES too: read-only memory its process can never write, a file's pages on
+// a read-only volume mapped with no write in the mapping's maximum protection, as the bundle finds
+// it at the call (its RgfxFilePages.hpp). It is the app's own memory, wired for reading as any
+// read-only memory is: a shared mapping's pages are the file's own, and a private copy-on-write
+// one's are copied for the process by the wire, as IOMemoryDescriptor::prepare's
+// vm_map_create_upl resolves the entry's copy and vm_object_iopl_request faults each page into
+// the process's own object (read from xnu's vm_map.c and vm_upl.c), as a Mac's driver's wire of an
+// app's memory does; the process can write neither. The block's SURFACE_PAGES is marked
+// RGFX_SURFACE_PAGES_UNCHANGING, and RGFX_SURFACE_PAGES_COPY_ON_WRITE where the bundle names the
+// memory so too, for the host to read the pages once. Read-only memory not named unchanging may
+// carry why not (kRgfxPagesWhyShift, the RGFX_PAGES_WHY_* values), which the block's SURFACE_PAGES
+// carries on to the host in its RGFX_SURFACE_PAGES_WHY_SHIFT bits, where the guest took
+// RGFX_FEATURE_UNCHANGING_PAGES: a diagnostic the host counts its copies by.
+//
 // Where the guest took RGFX_FEATURE_IMPORT_ADDRESSES, the device answers a pages block's
 // SURFACE_PAGES with the GPU address of the block's view, at which the bundle places its buffers
 // over the block (rgfxPagesAnswer). Where it took RGFX_FEATURE_IMPORT_ADDRESSES_LATER too, the
@@ -70,8 +85,9 @@ struct RgfxPagesRange {
 };
 
 // How a pages block's pages are wired (kRgfxAccelMethodPagesBlock): not at all, for reading
-// alone, or for reading and writing.
-enum class RgfxPagesAccess { kRefused, kRead, kReadWrite };
+// alone, or for reading and writing; kBadArgument where the call names them so no memory is
+// mapped.
+enum class RgfxPagesAccess { kRefused, kBadArgument, kRead, kReadWrite };
 
 // How a pages block of memory the process maps writable or not is made: its wiring, and the
 // RGFX_SURFACE_PAGES_* its SURFACE_PAGES carries.
@@ -80,22 +96,47 @@ struct RgfxPagesWiring {
 	uint32_t flags;
 };
 
-// The wiring of a pages block over memory the process maps `writable` or not, given the feature
-// word: writable memory for reading and writing, which resolves copy-on-write first, so a
-// private mapping's pages are its own before the device maps them, a block of the process's
-// (RGFX_SURFACE_PAGES_PRIVATE); read-only memory, where the word holds
+// The wiring of a pages block over memory the process maps as `how` says (kRgfxPagesWritable,
+// kRgfxPagesUnchanging, kRgfxPagesCopyOnWrite, and why not unchanging from kRgfxPagesWhyShift),
+// given the feature word: writable memory for reading and writing, which resolves copy-on-write
+// first, so a private mapping's pages are its own before the device maps them, a block of the
+// process's (RGFX_SURFACE_PAGES_PRIVATE); read-only memory, where the word holds
 // RGFX_FEATURE_READ_ONLY_PAGES, for reading alone, which asks of the VM system no access the
 // process lacks, its block marked RGFX_SURFACE_PAGES_READ_ONLY too, for the host to keep every
 // object over it from writing its pages (the process can post any message on its rings, so the
-// mark, not the bundle's buffers' options, is what holds the line); and without the bit none,
-// as a host that does not know the mark would not hold it.
-inline RgfxPagesWiring rgfxPagesWiring(bool writable, uint64_t word)
+// mark, not the bundle's buffers' options, is what holds the line), with the why the bundle gave
+// where the word holds RGFX_FEATURE_UNCHANGING_PAGES too, and without READ_ONLY_PAGES none, as a
+// host that does not know the mark would not hold it; unchanging memory, where the word holds
+// RGFX_FEATURE_UNCHANGING_PAGES too, as read-only memory, its block marked
+// RGFX_SURFACE_PAGES_UNCHANGING too, and RGFX_SURFACE_PAGES_COPY_ON_WRITE where `how` says so, and
+// without the bit none, as a host that does not know the mark could not tell its pages from any
+// read-only memory's. Bits of no meaning, writable unchanging memory, copy-on-write memory not
+// named unchanging and a why with writable or unchanging memory are no mapping at all
+// (kBadArgument).
+inline RgfxPagesWiring rgfxPagesWiring(uint64_t how, uint64_t word)
 {
+	const bool writable = (how & kRgfxPagesWritable) != 0;
+	const bool unchanging = (how & kRgfxPagesUnchanging) != 0;
+	const bool copyOnWrite = (how & kRgfxPagesCopyOnWrite) != 0;
+	const uint64_t why = (how & kRgfxPagesWhyMask) >> kRgfxPagesWhyShift;
+	if ((how & ~static_cast<uint64_t>(kRgfxPagesHowBits | kRgfxPagesWhyMask)) != 0 ||
+	    (unchanging && writable) || (copyOnWrite && !unchanging) ||
+	    (why != 0 && (writable || unchanging)))
+		return {RgfxPagesAccess::kBadArgument, 0};
 	if (writable)
 		return {RgfxPagesAccess::kReadWrite, RGFX_SURFACE_PAGES_PRIVATE};
-	if (word & RGFX_FEATURE_READ_ONLY_PAGES)
-		return {RgfxPagesAccess::kRead, RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_READ_ONLY};
-	return {RgfxPagesAccess::kRefused, 0};
+	if (!(word & RGFX_FEATURE_READ_ONLY_PAGES))
+		return {RgfxPagesAccess::kRefused, 0};
+	const uint32_t readOnly = RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_READ_ONLY;
+	const bool marks = (word & RGFX_FEATURE_UNCHANGING_PAGES) != 0;
+	if (!unchanging) {
+		const uint32_t said = marks ? static_cast<uint32_t>(why) << RGFX_SURFACE_PAGES_WHY_SHIFT : 0;
+		return {RgfxPagesAccess::kRead, readOnly | said};
+	}
+	if (!marks)
+		return {RgfxPagesAccess::kRefused, 0};
+	return {RgfxPagesAccess::kRead, readOnly | RGFX_SURFACE_PAGES_UNCHANGING |
+	                                    (copyOnWrite ? RGFX_SURFACE_PAGES_COPY_ON_WRITE : 0u)};
 }
 
 // The whole pages of `page` (a power of two) that hold the `length` bytes at `address`: false

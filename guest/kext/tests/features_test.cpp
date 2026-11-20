@@ -18,6 +18,7 @@ static_assert(RGFX_SURFACE_PAGES_ATTACH == (1u << 3), "SURFACE_PAGES_ATTACH");
 static_assert(RGFX_SURFACE_PAGES_ASK_CACHE == (1u << 4), "SURFACE_PAGES_ASK_CACHE");
 static_assert(RGFX_FEATURE_SURFACE_CACHE_REFUSED == (1u << 29), "SURFACE_CACHE_REFUSED is bit 29");
 static_assert(RGFX_FEATURE_SURFACE_DEFERRED_ASK == (1u << 30), "SURFACE_DEFERRED_ASK is bit 30");
+static_assert(RGFX_FEATURE_UNCHANGING_PAGES == (1ull << 31), "UNCHANGING_PAGES is bit 31");
 static_assert(RGFX_FEATURE_SURFACE_DEFERRED_CARRY == (1ull << 32),
               "SURFACE_DEFERRED_CARRY is bit 32");
 static_assert(RGFX_FEATURE_SCHEDULED_ASK == (1ull << 33), "SCHEDULED_ASK is bit 33");
@@ -126,8 +127,8 @@ constexpr uint64_t kCacheEvery = RGFX_FEATURE_SURFACE_CACHE_EVERY;
 // MANAGED_AT_COPY, which both kexts carry, their bundles making each Managed buffer at its CPU
 // copy's address.
 constexpr uint64_t kManagedAtCopy = RGFX_FEATURE_MANAGED_AT_COPY;
-// A bit the wire does not name: FEATURES_LO bit 31.
-constexpr uint64_t kUnnamed = 1ull << 31;
+// A bit the wire does not name: FEATURES_LO bit 10, which it keeps reserved.
+constexpr uint64_t kUnnamed = 1ull << 10;
 // Every bit the wire names from bit 3 that the kext does not carry out yet.
 constexpr uint64_t kNotCarried = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CONSUMED_DOORBELL |
                                  RGFX_FEATURE_QUEUE_BARRIER | RGFX_FEATURE_CB_PARTS |
@@ -199,6 +200,9 @@ constexpr uint64_t kGuestTimes = RGFX_FEATURE_GUEST_TIMES;
 // Its kext makes pages blocks of memory a process maps read-only, and its bundle lays its no-copy
 // buffers over read-only memory there.
 constexpr uint64_t kReadOnlyPages = RGFX_FEATURE_READ_ONLY_PAGES;
+// Its kext makes pages blocks of a file's pages on a read-only volume marked unchanging, of its
+// bundle's shared mapping of them.
+constexpr uint64_t kUnchangingPages = RGFX_FEATURE_UNCHANGING_PAGES;
 // Its kext binds a doorbell page to each context and maps it into the process, where its bundle
 // rings its queues.
 constexpr uint64_t kDoorbellPages = RGFX_FEATURE_DOORBELL_PAGES;
@@ -211,7 +215,8 @@ constexpr uint64_t kSurfaceRefill = RGFX_FEATURE_SURFACE_REFILL;
 constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kHeaps | kRoom |
                               kSlots | kCommits | kDeferred | kTime | kTextureSlabs |
                               kBufferSlabs | kSmallIds | kColor | kMesh | kShares | kOpenCL |
-                              kPrivate | kCacheRefused | kDeferredAsk | kDeferredCarry |
+                              kPrivate | kCacheRefused | kDeferredAsk | kUnchangingPages |
+                              kDeferredCarry |
                               kScheduledAsk | kDisplayScale | kDidModify | kRateMaps |
                               kFunctionPointers | kDynamicLibraries | kPipelineKeys |
                               kSlotsInPages | kDoorbellAsks | kGuestTimes | kReadOnlyPages |
@@ -233,7 +238,7 @@ int main()
 	// ICB_SLOTS, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, MANAGED_TEXTURE_SLABS,
 	// MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR, MESH_PIPELINES,
 	// SHARED_EVENT_NAMES, OPENCL_MODE, PRIVATE_RENDER_STATE, SURFACE_CACHE_REFUSED,
-	// SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK, DISPLAY_SCALE,
+	// SURFACE_DEFERRED_ASK, UNCHANGING_PAGES, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK, DISPLAY_SCALE,
 	// TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, PIPELINE_KEYS,
 	// ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, DOORBELL_PAGES,
 	// PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, DISPLAY_BOUNDS,
@@ -246,7 +251,8 @@ int main()
 	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
 	      "MANAGED_TEXTURE_SLABS, MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR, "
 	      "MESH_PIPELINES, SHARED_EVENT_NAMES, OPENCL_MODE, PRIVATE_RENDER_STATE, "
-	      "SURFACE_CACHE_REFUSED, SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK, "
+	      "SURFACE_CACHE_REFUSED, SURFACE_DEFERRED_ASK, UNCHANGING_PAGES, SURFACE_DEFERRED_CARRY, "
+	      "SCHEDULED_ASK, "
 	      "DISPLAY_SCALE, TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, "
 	      "PIPELINE_KEYS, ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, "
 	      "DOORBELL_PAGES, PIPELINE_ANSWERS, POINTER_MOTION, MULTI_DISPLAY, POINTER_OVER, "
@@ -426,6 +432,14 @@ int main()
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kReadOnlyPages, kReadOnlyPages) ==
 	          (kRgfxOfferedFeatures | kReadOnlyPages),
 	      "READ_ONLY_PAGES taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kUnchangingPages) ==
+	          kUnchangingPages,
+	      "UNCHANGING_PAGES offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kUnchangingPages, 0) == kRgfxOfferedFeatures,
+	      "UNCHANGING_PAGES offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kUnchangingPages, kUnchangingPages) ==
+	          (kRgfxOfferedFeatures | kUnchangingPages),
+	      "UNCHANGING_PAGES taken is in the word");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kDoorbellPages) == kDoorbellPages,
 	      "DOORBELL_PAGES offered, written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried) == 0,

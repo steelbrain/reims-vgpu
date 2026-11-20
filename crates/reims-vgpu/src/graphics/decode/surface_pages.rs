@@ -160,6 +160,18 @@
 //! cached apart: a read-only block takes only a cached view whose import drops the GPU's writes,
 //! and any other block only one whose import keeps them. The refusals above stay.
 //!
+//! **Unchanging pages** (`RGFX_SURFACE_PAGES_UNCHANGING`, `RGFX_FEATURE_UNCHANGING_PAGES`). A
+//! read-only block the guest marks unchanging holds pages its process can never write, a file's
+//! on a read-only volume (docs/graphics-kext/design.md, "Unchanging pages"): its import is asked
+//! as unchanging, copy-on-write where the guest marks it so (`RGFX_SURFACE_PAGES_COPY_ON_WRITE`,
+//! counted apart), and the platform reads its pages into the copy once, at the import's make,
+//! with no compare at a commit (metal2vulkan-runtime's, its `copied` module's docs, "Unchanging
+//! pages"); the GPU's writes are dropped as a read-only block's are. Such a view is cached apart
+//! again: a block takes only a cached view whose import was asked as its own would be, so a view
+//! read once serves no block whose pages may change. A read-only block not marked unchanging may
+//! carry why not (`RGFX_SURFACE_PAGES_WHY_SHIFT`), a diagnostic: the views count such blocks by
+//! it, and the decoder the textures made over them ([`whys`]).
+//!
 //! **Surfaces with no views** (`ApiPlatform::SURFACE_VIEWS`). A platform may keep no view of an
 //! IOSurface's pages (metal2vulkan-runtime, whose surfaces are device images that the device
 //! cache's copies sync at the guest's events): an IOSurface block's `SURFACE_PAGES`, and a deferred
@@ -355,7 +367,7 @@ use reims_vgpu_graphics::wire::{
     RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
     RGFX_SURFACE_PAGES_PLANES, RgfxBufferOverPages, RgfxBufferOverSurfacePages, RgfxHeapOverPages,
     RgfxMsgHeader, RgfxPageRun, RgfxPagesAnswer, RgfxPagesBufferAddress, RgfxSurfacePages,
-    RgfxSurfacePagesLayout,
+    RgfxSurfacePagesLayout, RgfxTextureDescriptor,
 };
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity, MemoryLife};
 #[cfg(target_os = "linux")]
@@ -370,7 +382,9 @@ use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, Deadline, MonoTime};
 use reims_vgpu_vulkan::core::platform::os::vm::{GroupHold, GroupLimits, HostAddr};
 use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, Heap as _};
-use reims_vgpu_vulkan::core::platform::values::{BufferDesc, HeapDesc, OptionSet, PagesPlane};
+use reims_vgpu_vulkan::core::platform::values::{
+    BufferDesc, HeapDesc, OptionSet, PagesAccess, PagesPlane,
+};
 use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{RaiseResult, refusals};
 use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
@@ -878,9 +892,11 @@ struct Cached<P: Platform> {
     import: Option<P::Buffer>,
     /// The import is a block the platform knows ([`ViewImports`]).
     known: bool,
-    /// The import is a known one asked as read-only, whose GPU writes are dropped: a read-only
-    /// pages block's (the module doc, "Addresses the host gives").
-    drops: bool,
+    /// How the known import was asked ([`ViewImports`]): read-only, its GPU writes dropped, for a
+    /// read-only pages block, and unchanging, read once, for one of a file's unchanging pages
+    /// (the module doc, "Addresses the host gives", "Unchanging pages"); `Writable` for every
+    /// other import.
+    access: PagesAccess,
 }
 
 impl<P: Platform> Cached<P> {
@@ -940,9 +956,15 @@ pub(crate) struct Private<P: Platform> {
     /// `HEAP_OVER_PAGES` lies over, which then makes no view (a block of more runs holds its heap
     /// over the view).
     ram: Option<(HostPtr, u64)>,
-    /// Pages its process maps read-only (`RGFX_SURFACE_PAGES_READ_ONLY`): only a buffer whose GPU
-    /// writes are dropped lies over the block (`GraphicsDecoder::read_only_pages_admit`).
-    read_only: bool,
+    /// How its process maps the pages: read-only (`RGFX_SURFACE_PAGES_READ_ONLY`), where only a
+    /// buffer whose GPU writes are dropped lies over the block
+    /// (`GraphicsDecoder::read_only_pages_admit`), and unchanging among those
+    /// (`RGFX_SURFACE_PAGES_UNCHANGING`), where the platform's known import reads them once (the
+    /// module doc, "Unchanging pages").
+    access: PagesAccess,
+    /// Why its guest found its pages not unchanging, for a read-only block that is not
+    /// (`RGFX_SURFACE_PAGES_WHY_SHIFT`, [`whys`]): a diagnostic; 0 for every other block.
+    why: u8,
     /// When its view was made, which a regroup takes only once old enough ("Regroups").
     made: Option<MonoTime>,
     /// The objects its `BUFFER_OVER_PAGES` made, by id, which a regroup moves into its view
@@ -1080,6 +1102,8 @@ pub(crate) struct SurfaceViews<P: Platform> {
     /// The views made or taken last, the latest at the back.
     cache: VecDeque<Cached<P>>,
     counts: ViewCounts,
+    /// The read-only pages blocks that are not unchanging made, by their guest's why ([`whys`]).
+    read_only_whys: [whys::WhyCounts; whys::WHYS],
     /// The device's resets so far: a `SURFACE_PAGES` begun before the last makes no view
     /// ([`Settle`]).
     resets: u64,
@@ -1154,6 +1178,7 @@ impl<P: Platform> SurfaceViews<P> {
             private: HashMap::new(),
             cache: VecDeque::new(),
             counts: ViewCounts::default(),
+            read_only_whys: [whys::WhyCounts::default(); whys::WHYS],
             resets: 0,
             forming: Vec::new(),
             next_group: 0,
@@ -1217,7 +1242,7 @@ impl<P: Platform> SurfaceViews<P> {
         let Some(p) = self.private.get_mut(&block) else {
             return 0;
         };
-        if p.read_only && !known_imports {
+        if p.access.read_only() && !known_imports {
             return 0;
         }
         if let Some(address) = &p.address {
@@ -1305,6 +1330,51 @@ impl<P: Platform> SurfaceViews<P> {
     /// What the views did so far.
     pub(crate) fn counts(&self) -> ViewCounts {
         self.counts
+    }
+
+    /// The read-only pages blocks that are not unchanging made so far, by their guest's why
+    /// ([`whys`]).
+    pub(crate) fn read_only_whys(&self) -> [whys::WhyCounts; whys::WHYS] {
+        self.read_only_whys
+    }
+
+    /// The `len` bytes at `at` in the view of the pages block at `block`, where it is read-only and
+    /// not unchanging ([`PagesAccess::ReadOnly`]): its why, the bytes of the 4 KiB pages the range
+    /// touches and the block's page runs it touches, and the block's bytes and runs ([`whys`]).
+    /// `None` for any other block, and for a range past the block's runs.
+    pub(crate) fn read_only_range(
+        &self,
+        block: u64,
+        at: u64,
+        len: u64,
+    ) -> Option<whys::TextureRange> {
+        const PAGE: u64 = 4096;
+        let p = self.private.get(&block)?;
+        if p.access != PagesAccess::ReadOnly || len == 0 {
+            return None;
+        }
+        let end = at.checked_add(len)?;
+        let (mut from, mut bytes, mut runs, mut block_bytes) = (0_u64, 0_u64, 0_u64, 0_u64);
+        for &(_, length) in &p.runs {
+            let to = from.saturating_add(length);
+            let (lo, hi) = (from.max(at), to.min(end));
+            if lo < hi {
+                // The run's pages lie from its start, which is a page's.
+                let first = from + (lo - from) / PAGE * PAGE;
+                let last = (from + (hi - from).div_ceil(PAGE) * PAGE).min(to);
+                bytes += last - first;
+                runs += 1;
+            }
+            block_bytes = to;
+            from = to;
+        }
+        (end <= block_bytes).then_some(whys::TextureRange {
+            why: p.why,
+            bytes,
+            runs,
+            block_bytes,
+            block_runs: p.runs.len().to_u64(),
+        })
     }
 
     /// `SURFACE_PAGES`: the view of `runs` for the block `pages` names, in place of any it had:
@@ -1480,8 +1550,10 @@ impl<P: Platform> SurfaceViews<P> {
 
     /// `SURFACE_PAGES` of a pages block (`RGFX_SURFACE_PAGES_PRIVATE`, the module doc): `runs`,
     /// checked and in guest RAM, for the block `pages` names, in place of any view it had, of
-    /// pages its process maps read-only where `read_only` (`RGFX_SURFACE_PAGES_READ_ONLY`); its
-    /// view is made at its first `BUFFER_OVER_PAGES` ([`Self::private_view`]). What the block
+    /// pages its process maps as `access` (`RGFX_SURFACE_PAGES_READ_ONLY`,
+    /// `RGFX_SURFACE_PAGES_UNCHANGING`), and for a read-only block that is not unchanging, `why`
+    /// not ([`whys`]), by which it is counted; its view is made at its first `BUFFER_OVER_PAGES`
+    /// ([`Self::private_view`]). What the block
     /// had goes once the lock is let go, on this thread. `None` where the device was reset since
     /// `settle` began it.
     pub(crate) fn private_pages(
@@ -1489,7 +1561,7 @@ impl<P: Platform> SurfaceViews<P> {
         platform: &P,
         pages: &RgfxSurfacePages,
         runs: &[RgfxPageRun],
-        read_only: bool,
+        (access, why): (PagesAccess, u8),
         settle: &Settle,
     ) -> Option<Result<(), PagesRefusal>> {
         let mut v = views.lock();
@@ -1513,6 +1585,15 @@ impl<P: Platform> SurfaceViews<P> {
                     }
                     _ => None,
                 };
+                let why = match access {
+                    PagesAccess::ReadOnly => why,
+                    PagesAccess::Writable | PagesAccess::Unchanging { .. } => 0,
+                };
+                if access == PagesAccess::ReadOnly
+                    && let Some(counts) = v.read_only_whys.get_mut(usize::from(why))
+                {
+                    counts.note(pages.length, runs.len().to_u64());
+                }
                 v.private.insert(
                     pages.block_offset,
                     Private {
@@ -1523,7 +1604,8 @@ impl<P: Platform> SurfaceViews<P> {
                         view: None,
                         mapped: None,
                         ram,
-                        read_only,
+                        access,
+                        why,
                         made: None,
                         buffers: Vec::new(),
                         heaped: false,
@@ -1688,11 +1770,12 @@ impl<P: Platform> SurfaceViews<P> {
         idle_mappings: Option<u64>,
     ) -> Vec<Cached<P>> {
         self.counts.made += 1;
-        self.cache_view(key, Arc::clone(view), import, (false, false), idle_mappings)
+        let kinds = (false, PagesAccess::Writable);
+        self.cache_view(key, Arc::clone(view), import, kinds, idle_mappings)
     }
 
     /// Caches `view` of the runs `key`, with `import` over it where it has one, a block the
-    /// platform knows where `known` ([`ViewImports`]), asked as read-only where `drops`, at the
+    /// platform knows where `known` ([`ViewImports`]), asked as `access`, at the
     /// back; what leaves the cache
     /// past [`CACHED_VIEWS`] views or [`CACHED_BYTES`], the oldest first, and the oldest views no
     /// block holds past `idle_mappings` mappings, a mapping a run (the module doc), is returned,
@@ -1702,7 +1785,7 @@ impl<P: Platform> SurfaceViews<P> {
         key: Vec<(u64, u64)>,
         view: Arc<SurfaceView<P>>,
         import: Option<P::Buffer>,
-        (known, drops): (bool, bool),
+        (known, access): (bool, PagesAccess),
         idle_mappings: Option<u64>,
     ) -> Vec<Cached<P>> {
         self.cache.push_back(Cached {
@@ -1710,7 +1793,7 @@ impl<P: Platform> SurfaceViews<P> {
             view,
             import,
             known,
-            drops,
+            access,
         });
         let mut evicted = Vec::new();
         let mut bytes: u64 = self.cache.iter().map(|c| c.view.length()).sum();
@@ -1913,7 +1996,7 @@ impl<P: Platform> SurfaceViews<P> {
         block_size: u64,
         context: Option<u32>,
     ) -> RaiseResult<Option<Arc<SurfaceView<P>>>> {
-        let (mapped, runs, length, copies, imports, read_only) = {
+        let (mapped, runs, length, copies, imports, access) = {
             let mut v = views.lock();
             let Some(p) = (v.private.get_mut(&block))
                 .filter(|p| block_size <= p.block_size && context.is_none_or(|c| c == p.context))
@@ -1924,9 +2007,9 @@ impl<P: Platform> SurfaceViews<P> {
                 return Ok(Some(Arc::clone(view)));
             }
             let (runs, length, mapped) = (p.runs.clone(), p.length, p.mapped.take());
-            let read_only = p.read_only;
+            let access = p.access;
             if mapped.is_none() {
-                if let Some(view) = v.take_cached(block, &runs, read_only) {
+                if let Some(view) = v.take_cached(block, &runs, access) {
                     return Ok(Some(view));
                 }
                 if v.memory.is_none() {
@@ -1938,9 +2021,9 @@ impl<P: Platform> SurfaceViews<P> {
                 mapped,
                 runs,
                 length,
-                v.over_copies(read_only),
+                v.over_copies(access.read_only()),
                 v.known_imports.clone(),
-                read_only,
+                access,
             )
         };
         let clock = platform.clock();
@@ -1958,7 +2041,7 @@ impl<P: Platform> SurfaceViews<P> {
             Ok(view) => {
                 let mapped = clock.now_mono();
                 let import = match &imports {
-                    Some(imports) => known_import_over(imports, device, &view, read_only)?,
+                    Some(imports) => known_import_over(imports, device, &view, access)?,
                     None => buffer_over(device, &view, 0, view.length(), 0, None)?,
                 };
                 match import {
@@ -2008,27 +2091,31 @@ impl<P: Platform> SurfaceViews<P> {
     }
 
     /// The cache's view of `runs`, taken to the back, with its import, as the view of the pages
-    /// block at `block`; one with no import only where the block is `read_only` and its buffers
-    /// lie over copies of its pages ([`Self::over_copies`]; the module doc, "Read-only pages
-    /// blocks"); where the platform knows views' imports, one whose import drops the GPU's writes
-    /// only where the block is `read_only`, and one whose import keeps them only where it is not.
-    /// `None` where the cache has none.
+    /// block at `block`, whose process maps its pages as `access`; one with no import only where
+    /// the block is read-only and its buffers lie over copies of its pages ([`Self::over_copies`];
+    /// the module doc, "Read-only pages blocks"); where the platform knows views' imports, one
+    /// whose import was asked as the block's would be: dropping the GPU's writes only where the
+    /// block is read-only, and reading its pages once only where they are unchanging (the module
+    /// doc, "Unchanging pages"). `None` where the cache has none.
     fn take_cached(
         &mut self,
         block: u64,
         runs: &[(u64, u64)],
-        read_only: bool,
+        access: PagesAccess,
     ) -> Option<Arc<SurfaceView<P>>> {
         // Where the platform knows views' imports as blocks, a block takes only a view whose
         // import is one.
-        let copies = self.over_copies(read_only);
+        let copies = self.over_copies(access.read_only());
         let known_only = self.known_imports.is_some();
-        let drops = read_only && known_only;
+        let asked = match known_only {
+            true => access,
+            false => PagesAccess::Writable,
+        };
         let at = (self.cache.iter()).position(|c| {
             c.runs == runs
                 && (copies || c.import.is_some())
                 && (c.known || !known_only)
-                && c.drops == drops
+                && c.access == asked
         })?;
         let cached = self.cache.remove(at)?;
         let view = Arc::clone(&cached.view);
@@ -2109,7 +2196,7 @@ impl<P: Platform> SurfaceViews<P> {
                 return Joined::Now(then);
             };
             let (runs, length) = (p.runs.clone(), p.length);
-            let alone = p.view.is_some() || p.mapped.is_some() || p.read_only;
+            let alone = p.view.is_some() || p.mapped.is_some() || p.access.read_only();
             let alone = alone || (heap && p.ram.is_some());
             // A member of a group not yet carried out to its end, its view made or not: behind
             // the messages that joined with it, on the group's job ([`Self::group_jobs`]).
@@ -2427,7 +2514,9 @@ impl<P: Platform> SurfaceViews<P> {
     /// Whether the block at `block` is a pages block of pages its process maps read-only
     /// (`RGFX_SURFACE_PAGES_READ_ONLY`).
     pub(crate) fn private_read_only(&self, block: u64) -> bool {
-        self.private.get(&block).is_some_and(|p| p.read_only)
+        self.private
+            .get(&block)
+            .is_some_and(|p| p.access.read_only())
     }
 
     /// The host addresses of the guest pages of `runs` in the mapping of the guest's RAM the
@@ -2551,8 +2640,11 @@ impl<P: Platform> SurfaceViews<P> {
             if cached || made.length() > CACHED_PAGES_BYTES || p.regrouped.is_some() {
                 p.view = Some((made, import));
             } else {
-                let (known, drops) = (p.known, p.known && p.read_only);
-                let kinds = (known, drops);
+                let access = match p.known {
+                    true => p.access,
+                    false => PagesAccess::Writable,
+                };
+                let kinds = (p.known, access);
                 evicted = self.cache_view(p.runs.clone(), made, import, kinds, idle_mappings);
             }
         }
@@ -2836,13 +2928,13 @@ fn known_import_over<P: Platform>(
     imports: &ViewImports<P>,
     device: &P::Device,
     view: &Arc<SurfaceView<P>>,
-    read_only: bool,
+    access: PagesAccess,
 ) -> RaiseResult<Option<P::Buffer>> {
     let (first, length) = (view.base(), view.length());
     let keep = Arc::clone(view);
     super::unkept::Kind::PagesView.making(|| {
         let then = Box::new(move || drop(keep));
-        let Some((at, forget)) = imports(device, first, length, read_only, then) else {
+        let Some((at, forget)) = imports(device, first, length, access, then) else {
             return Ok(None);
         };
         let forget = Arc::new(Mutex::new(Some(forget)));
@@ -3005,6 +3097,30 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             );
         }
         admitted
+    }
+
+    /// Counts a texture of `desc` made over the buffer `buffer_obj_id` names, whose span is
+    /// `span`, taking the `len` bytes at `offset` in it, where the buffer lies over a read-only
+    /// pages block that is not unchanging ([`whys::note_texture`]); nothing for any other. A
+    /// diagnostic: the guest sees nothing of it.
+    pub(super) fn note_read_only_texture(
+        &self,
+        span: Option<(u64, u64)>,
+        buffer_obj_id: u64,
+        (offset, len): (u64, u64),
+        desc: &RgfxTextureDescriptor,
+    ) {
+        let Some((block, _)) = span else {
+            return;
+        };
+        let Some(bytes) = self.bytes_of(buffer_obj_id) else {
+            return;
+        };
+        let at = bytes.at.saturating_add(offset);
+        let range = (self.shared.surface_views.lock()).read_only_range(block, at, len);
+        if let Some(range) = range {
+            whys::note_texture(desc, &range);
+        }
     }
 
     /// Counts the blit command `writer` writing buffer `obj_id`, where the buffer lies over a
@@ -3464,6 +3580,7 @@ impl<P: Platform> OwnPages<P> {
 pub(super) mod costs;
 pub(crate) mod overlaps;
 pub(crate) mod regroup;
+pub(crate) mod whys;
 
 #[cfg(test)]
 pub(super) mod tests {
@@ -3473,11 +3590,12 @@ pub(super) mod tests {
         RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_HEAP_OVER_PAGES,
         RGFX_CMD_MANAGED_BUFFER_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_SURFACE_PAGES,
         RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT,
-        RGFX_CURSOR_SPAN, RGFX_STATUS_CACHE, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
-        RGFX_STATUS_REFUSED, RGFX_SURFACE_PAGES_ASK_CACHE, RGFX_SURFACE_PAGES_CACHED,
-        RGFX_SURFACE_PAGES_PRIVATE, RGFX_SURFACE_PAGES_READ_ONLY, RgfxBufferAtOffset,
-        RgfxBufferOverHostMemory, RgfxManagedBufferCreate, RgfxMsgHeader, RgfxObjectDestroy,
-        RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout, RgfxTextureDescriptor,
+        RGFX_CURSOR_SPAN, RGFX_PAGES_WHY_SHADOWED, RGFX_STATUS_CACHE, RGFX_STATUS_INVALID_ARGUMENT,
+        RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_PAGES_ASK_CACHE,
+        RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_COPY_ON_WRITE, RGFX_SURFACE_PAGES_PRIVATE,
+        RGFX_SURFACE_PAGES_READ_ONLY, RGFX_SURFACE_PAGES_UNCHANGING, RGFX_SURFACE_PAGES_WHY_SHIFT,
+        RgfxBufferAtOffset, RgfxBufferOverHostMemory, RgfxManagedBufferCreate, RgfxMsgHeader,
+        RgfxObjectDestroy, RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout, RgfxTextureDescriptor,
         RgfxTextureFromBuffer,
     };
     use reims_vgpu_vulkan::core::memory::descriptor::{GuestPhysicalRange, MemoryMapDescriptor};
@@ -4966,14 +5084,14 @@ pub(super) mod tests {
         const IMPORTS: u64 = 0x6_0000_0000;
         let mut r = rig(16);
         let page = r.page;
-        // The imports made, by address, those forgotten, and whether each was asked read-only.
-        type Log = (Vec<u64>, Vec<u64>, Vec<bool>);
+        // The imports made, by address, those forgotten, and how each was asked.
+        type Log = (Vec<u64>, Vec<u64>, Vec<PagesAccess>);
         let log: Arc<Mutex<Log>> = Arc::default();
         let made = Arc::clone(&log);
-        let imports: ViewImports<FakePlatform> = Arc::new(move |_, _, _, read_only, then| {
+        let imports: ViewImports<FakePlatform> = Arc::new(move |_, _, _, access, then| {
             let at = IMPORTS + made.lock().0.len().to_u64() * 0x100_0000;
             made.lock().0.push(at);
-            made.lock().2.push(read_only);
+            made.lock().2.push(access);
             let gone = Arc::clone(&made);
             let forget: Box<dyn FnOnce() + Send> = Box::new(move || {
                 gone.lock().1.push(at);
@@ -5048,7 +5166,7 @@ pub(super) mod tests {
         assert_eq!(log.lock().0, both, "one import a view");
         assert_eq!(
             log.lock().2,
-            [false, true],
+            [PagesAccess::Writable, PagesAccess::ReadOnly],
             "the read-only block's asked so"
         );
         for obj_id in [10, 11] {
@@ -5090,11 +5208,103 @@ pub(super) mod tests {
         );
         let writable_at = r.dec.pages_address(&r.device, writable);
         assert_eq!(writable_at, IMPORTS + 0x200_0000, "an import of its own");
-        assert_eq!(log.lock().2, [false, true, false], "asked writable");
+        let asked = [
+            PagesAccess::Writable,
+            PagesAccess::ReadOnly,
+            PagesAccess::Writable,
+        ];
+        assert_eq!(log.lock().2, asked, "asked writable");
         r.dec.reset(&r.device);
         let mut forgotten = log.lock().1.clone();
         forgotten.sort_unstable();
         assert_eq!(forgotten, [IMPORTS, read_only_at, writable_at], "forgotten");
+    }
+
+    /// A pages block marked unchanging (`RGFX_SURFACE_PAGES_UNCHANGING`, a file's own pages that
+    /// never change) has its view's known import asked as unchanging, copy-on-write where it is
+    /// marked so, which the platform reads once; its view, cached at its release, is taken by a
+    /// later block over the same runs that is marked the same, at the same address, and by no
+    /// block that is only read-only, which gets an import of its own. A block marked unchanging
+    /// and not read-only, or copy-on-write and not unchanging, is refused as an invalid argument
+    #[test]
+    fn an_unchanging_pages_block_s_view_is_asked_unchanging_and_taken_only_by_its_kind() {
+        const IMPORTS: u64 = 0x6_0000_0000;
+        let mut r = rig(16);
+        let page = r.page;
+        let log: Arc<Mutex<Vec<PagesAccess>>> = Arc::default();
+        let made = Arc::clone(&log);
+        let imports: ViewImports<FakePlatform> = Arc::new(move |_, _, _, access, then| {
+            let at = IMPORTS + made.lock().len().to_u64() * 0x100_0000;
+            made.lock().push(access);
+            Some((at, then))
+        });
+        r.dec.set_view_imports(imports);
+        let read_only = RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_READ_ONLY;
+        let unchanging = read_only | RGFX_SURFACE_PAGES_UNCHANGING;
+        let cow = unchanging | RGFX_SURFACE_PAGES_COPY_ON_WRITE;
+        let runs = [(8, 4)];
+        for refused in [
+            RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_UNCHANGING,
+            read_only | RGFX_SURFACE_PAGES_COPY_ON_WRITE,
+            RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_COPY_ON_WRITE,
+        ] {
+            assert_eq!(
+                r.pages_flagged(BLOCK, 0, &runs, 4 * page, refused),
+                RGFX_STATUS_INVALID_ARGUMENT,
+                "flags {refused:#x}"
+            );
+        }
+        assert_eq!(
+            r.pages_flagged(BLOCK, 0, &runs, 4 * page, cow),
+            RGFX_STATUS_OK
+        );
+        let at = r.dec.pages_address(&r.device, BLOCK);
+        assert_eq!(at, IMPORTS, "the import's address");
+        let file_cow = PagesAccess::Unchanging {
+            copy_on_write: true,
+        };
+        assert_eq!(*log.lock(), [file_cow], "asked unchanging, copy-on-write");
+        r.dec
+            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+        r.dec.surface_worker().flush();
+
+        // The same kind over the same runs takes the cached view.
+        let again = BLOCK + 0x8000;
+        assert_eq!(
+            r.pages_flagged(again, 0, &runs, 4 * page, cow),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(r.dec.pages_address(&r.device, again), at, "the cached view");
+        assert_eq!(log.lock().len(), 1, "no import more");
+        r.dec
+            .block_released(&r.device, again, 0, Box::new(|| ()), no_raise());
+        r.dec.surface_worker().flush();
+
+        // A read-only block, and an unchanging one not copy-on-write, over the same runs: each an
+        // import of its own.
+        let (plain, file) = (BLOCK + 0x10000, BLOCK + 0x18000);
+        assert_eq!(
+            r.pages_flagged(plain, 0, &runs, 4 * page, read_only),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(
+            r.pages_flagged(file, 0, &runs, 4 * page, unchanging),
+            RGFX_STATUS_OK
+        );
+        let plain_at = r.dec.pages_address(&r.device, plain);
+        let file_at = r.dec.pages_address(&r.device, file);
+        assert_eq!(
+            (plain_at, file_at),
+            (IMPORTS + 0x100_0000, IMPORTS + 0x200_0000)
+        );
+        let file_only = PagesAccess::Unchanging {
+            copy_on_write: false,
+        };
+        assert_eq!(
+            *log.lock(),
+            [file_cow, PagesAccess::ReadOnly, file_only],
+            "each asked as its block"
+        );
     }
 
     /// A `BUFFER_OVER_PAGES` longer than the device's `maxBufferLength`, as the bundle's
@@ -5347,6 +5557,113 @@ pub(super) mod tests {
         assert_eq!(counts().0, buffers + 1);
         assert_eq!(r.pages_buffer_of(14, 0, BLOCK, 0, 0x3ff, bit), Ok(()));
         assert_eq!(counts(), (buffers + 2, kib + 5));
+    }
+
+    /// A read-only pages block that is not unchanging is counted by the why its `SURFACE_PAGES`
+    /// carries in bits 8 to 11, with its bytes and page runs ([`whys`]); a writable block, an
+    /// unchanging one and their whys are not. A texture made over a buffer over such a block is
+    /// counted by the why too, with the 4 KiB pages and page runs of its range
+    /// ([`SurfaceViews::read_only_range`]), and one over a writable block is not
+    #[test]
+    fn a_read_only_pages_block_and_its_textures_are_counted_by_the_guests_why() {
+        let mut r = rig(16);
+        let page = r.page;
+        r.dec.hold_resource_ids(0, 1);
+        let read_only = RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_READ_ONLY;
+        let why = |n: u32| n << RGFX_SURFACE_PAGES_WHY_SHIFT;
+        let shadowed = read_only | why(RGFX_PAGES_WHY_SHADOWED);
+        let (writable, unchanging) = (BLOCK + 0x8000, BLOCK + 0xc000);
+        let counts = |r: &Rig| r.dec.shared.surface_views.lock().read_only_whys();
+        let before = counts(&r);
+        // Two runs, apart.
+        assert_eq!(
+            r.pages_flagged(BLOCK, 0, &[(0, 2), (4, 2)], 4 * page, shadowed),
+            RGFX_STATUS_OK
+        );
+        let flags = RGFX_SURFACE_PAGES_PRIVATE | why(RGFX_PAGES_WHY_SHADOWED);
+        assert_eq!(
+            r.pages_flagged(writable, 0, &[(8, 2)], 2 * page, flags),
+            RGFX_STATUS_OK
+        );
+        let flags = shadowed | RGFX_SURFACE_PAGES_UNCHANGING;
+        assert_eq!(
+            r.pages_flagged(unchanging, 0, &[(12, 2)], 2 * page, flags),
+            RGFX_STATUS_OK
+        );
+        let after = counts(&r);
+        let shadowed_why = RGFX_PAGES_WHY_SHADOWED as usize;
+        assert_eq!(
+            after[shadowed_why],
+            whys::WhyCounts {
+                blocks: before[shadowed_why].blocks + 1,
+                bytes: before[shadowed_why].bytes + 4 * page,
+                runs: before[shadowed_why].runs + 2,
+                most_runs: before[shadowed_why].most_runs.max(2),
+            }
+        );
+        for (i, (now, was)) in after.iter().zip(&before).enumerate() {
+            if i != shadowed_why {
+                assert_eq!(now, was, "why {i}");
+            }
+        }
+        // A range in the first run, and one over both, by 4 KiB pages.
+        let views = &r.dec.shared.surface_views;
+        let range = views.lock().read_only_range(BLOCK, 0x10, 0x100);
+        let expected = |bytes, runs| whys::TextureRange {
+            why: RGFX_PAGES_WHY_SHADOWED as u8,
+            bytes,
+            runs,
+            block_bytes: 4 * page,
+            block_runs: 2,
+        };
+        assert_eq!(range, Some(expected(4096, 1)));
+        let range = views.lock().read_only_range(BLOCK, 2 * page - 0x200, 0x400);
+        assert_eq!(range, Some(expected(8192, 2)));
+        assert_eq!(
+            views.lock().read_only_range(BLOCK, 4 * page - 0x10, 0x20),
+            None
+        );
+        assert_eq!(views.lock().read_only_range(writable, 0, 0x100), None);
+        assert_eq!(views.lock().read_only_range(unchanging, 0, 0x100), None);
+        // Textures over buffers over the blocks: counted over the read-only one alone.
+        let counted = |code: &str| {
+            (reims_vgpu_vulkan::answer::degradation_counts().into_iter())
+                .find(|(c, _)| c == code)
+                .map_or(0, |(_, n)| n)
+        };
+        let code = whys::TEXTURE_CODES[shadowed_why];
+        let textures = counted(code);
+        assert_eq!(
+            r.pages_buffer_of(10, 0, BLOCK, 0, 4 * page, READ_ONLY_OPTION),
+            Ok(())
+        );
+        assert_eq!(r.pages_buffer_of(11, 0, writable, 0, 2 * page, 0), Ok(()));
+        let texture = |obj_id, resource_id, buffer_obj_id, offset| RgfxTextureFromBuffer {
+            header: header(RGFX_CMD_TEXTURE_FROM_BUFFER),
+            obj_id,
+            resource_id,
+            buffer_obj_id,
+            offset,
+            bytes_per_row: 32 * 8,
+            desc: RgfxTextureDescriptor {
+                pixel_format: 110,
+                texture_type: 2,
+                width: 32,
+                height: 4,
+                depth: 1,
+                mipmap_level_count: 1,
+                array_length: 1,
+                sample_count: 1,
+                usage: 1,
+                ..RgfxTextureDescriptor::default()
+            },
+        };
+        let m = texture(12, 0x41, 10, 2 * page - 0x200);
+        assert_eq!(r.dec.decode(&r.device, m.as_bytes()).unwrap(), Ok(()));
+        assert_eq!(counted(code), textures + 1);
+        let m = texture(13, 0x42, 11, 0);
+        assert_eq!(r.dec.decode(&r.device, m.as_bytes()).unwrap(), Ok(()));
+        assert_eq!(counted(code), textures + 1);
     }
 
     /// Where the platform places pinned objects only in its known blocks (metal2vulkan-runtime's),

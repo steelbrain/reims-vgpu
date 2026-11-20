@@ -97,7 +97,8 @@ enum {
 // unlock seed (rgfxSurfaceUnlockSeedExported), SubmitBatch's publish of a queue's ring,
 // OpenContext's doorbell page, on x86-64 CpuPats (RgfxPat.hpp), ZeroedBlocks (RgfxBlockZero.hpp),
 // Pool and PoolAddresses, which Features leaves out where the device has no pool (poolMemory),
-// and PrivateBlocks. Each bit is set by the change that lands its call.
+// PrivateBlocks, ImportAddresses and UnchangingPages. Each bit is set by the change that lands its
+// call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeaturePagesChunked |
                                           kRgfxKextFeatureSubmitBatch |
@@ -114,7 +115,8 @@ constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeaturePool |
                                           kRgfxKextFeaturePoolAddresses |
                                           kRgfxKextFeaturePrivateBlocks |
-                                          kRgfxKextFeatureImportAddresses;
+                                          kRgfxKextFeatureImportAddresses |
+                                          kRgfxKextFeatureUnchangingPages;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
@@ -501,14 +503,15 @@ public:
 	                    UInt64 align, UInt64 writeCombinedFrom, UInt64 *offset);
 	IOReturn freeBlock(RgfxAcceleratorUserClient *owner, UInt64 offset);
 	// A pages block (kRgfxAccelMethodPagesBlock) of `owner` of context `context` over the
-	// `length` bytes at `address` in `task`, `writable` there or not (rgfxPagesWiring): the
+	// `length` bytes at `address` in `task`, mapped there as `how` says (kRgfxPagesWritable,
+	// kRgfxPagesUnchanging, kRgfxPagesCopyOnWrite; rgfxPagesWiring): the
 	// block's offset and size, and the GPU address the device gave its view, 0 where none
 	// (RGFX_FEATURE_IMPORT_ADDRESSES, rgfxPagesAnswer), as where the device answers before the
 	// view has one (RGFX_FEATURE_IMPORT_ADDRESSES_LATER). The
 	// block is never in the owner's window; freeBlock frees it, and its pages are unwired once
 	// its release is answered OK, or once freeBlocks frees it after the owner's close.
 	IOReturn pagesBlock(RgfxAcceleratorUserClient *owner, UInt32 context, task_t task,
-	                    UInt64 address, UInt64 length, bool writable, UInt64 *offset,
+	                    UInt64 address, UInt64 length, UInt64 how, UInt64 *offset,
 	                    UInt64 *size, UInt64 *gpuAddress);
 	// A chunked pages block (kRgfxAccelMethodPagesChunked) of `owner` of context `context`: the
 	// `length` bytes of the kext's own chunks, mapped into `task` at `*address`, and the block of

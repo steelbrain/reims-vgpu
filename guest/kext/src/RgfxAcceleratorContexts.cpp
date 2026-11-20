@@ -3307,7 +3307,7 @@ IOReturn RgfxAccelerator::postPages(UInt32 context, UInt64 offset, UInt64 total,
 }
 
 IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 context,
-                                     task_t task, UInt64 address, UInt64 length, bool writable,
+                                     task_t task, UInt64 address, UInt64 length, UInt64 how,
                                      UInt64 *offset, UInt64 *size, UInt64 *gpuAddress)
 {
 	if (!contextLock)
@@ -3317,8 +3317,11 @@ IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 c
 	if (!surfacePages || !region || !(featureWord() & RGFX_FEATURE_PAGES_BUFFERS))
 		return kIOReturnUnsupported;
 	// Read-only memory only where the host keeps the GPU's writes out of it: the GPU's writes
-	// would otherwise land in pages the process cannot write, a file's among them.
-	const RgfxPagesWiring wiring = rgfxPagesWiring(writable, featureWord());
+	// would otherwise land in pages the process cannot write, a file's among them; unchanging
+	// memory only where the host knows its mark.
+	const RgfxPagesWiring wiring = rgfxPagesWiring(how, featureWord());
+	if (wiring.access == RgfxPagesAccess::kBadArgument)
+		return kIOReturnBadArgument;
 	if (wiring.access == RgfxPagesAccess::kRefused)
 		return kIOReturnUnsupported;
 	RgfxPagesRange range = {};
@@ -3334,7 +3337,8 @@ IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 c
 	// Wired for the block's life: writable memory for reading and writing, which resolves
 	// copy-on-write first, so a private mapping's pages are its own before the device maps them;
 	// read-only memory for reading alone (kIODirectionOut: the device reads the memory), which
-	// asks of the VM system no access the process lacks.
+	// asks of the VM system no access the process lacks, unchanging memory among it, whose
+	// private mapping's pages the wire copies for the process (RgfxPagesBlock.hpp).
 	const IODirection direction =
 	    wiring.access == RgfxPagesAccess::kRead ? kIODirectionOut : kIODirectionOutIn;
 	IOMemoryDescriptor *md =

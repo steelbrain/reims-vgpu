@@ -359,7 +359,7 @@ impl<P: Platform> SurfaceViews<P> {
                 p.heaped,
                 p.stays,
                 p.queued,
-                p.read_only,
+                p.access.read_only(),
                 p.regrouped.is_some(),
                 self.regroups.ready.contains_key(&p.context),
                 view.group.lock().is_some(),

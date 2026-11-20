@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use reims_vgpu_vulkan::core::host::{HostPtr, HostQueue};
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
-use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+use reims_vgpu_vulkan::core::platform::values::{PagesAccess, TextureDesc};
 use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::core::rt::{Executor, Job, SerialQueue};
 use reims_vgpu_vulkan::core::sync::Mutex;
@@ -26,17 +26,17 @@ use crate::memory::MemoryMap;
 
 /// A platform's import of a pages block's view as a block it knows
 /// ([`ApiPlatform::view_imports`]): given the device, the view's first byte, on a host page, its
-/// length, whether the block's process maps its pages read-only (the import then drops the GPU's
-/// writes to them, as Metal's GPU does), and what runs once the platform freed the import (which
-/// holds the view's mapping until then), the import's GPU address, at the view's first byte, and
-/// what forgets the block, which runs as the last buffer over the view at that address goes.
-/// `None` where the platform refuses it, counted.
+/// length, how the block's process maps its pages (read-only: the import then drops the GPU's
+/// writes to them, as Metal's GPU does; and unchanging: it may then read them once), and what
+/// runs once the platform freed the import (which holds the view's mapping until then), the
+/// import's GPU address, at the view's first byte, and what forgets the block, which runs as the
+/// last buffer over the view at that address goes. `None` where the platform refuses it, counted.
 pub type ViewImports<P> = Arc<
     dyn Fn(
             &<P as Platform>::Device,
             HostPtr,
             u64,
-            bool,
+            PagesAccess,
             Box<dyn FnOnce() + Send>,
         ) -> Option<(u64, Box<dyn FnOnce() + Send>)>
         + Send

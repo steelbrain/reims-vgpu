@@ -49,6 +49,38 @@ pub struct ArgumentDesc {
     pub constant_block_alignment: u64,
 }
 
+/// How a pages block's process maps the pages of the block, as its `SURFACE_PAGES` says
+/// (`RGFX_SURFACE_PAGES_READ_ONLY`, `RGFX_SURFACE_PAGES_UNCHANGING`), for a platform's import of
+/// the block's view: what the import does with the GPU's writes to them, and whether it need read
+/// them again once made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PagesAccess {
+    /// Mapped read and write: the import keeps the GPU's writes.
+    Writable,
+    /// Mapped read-only: the import drops the GPU's writes, as Metal's GPU drops them, and reads
+    /// the pages again for the work that uses them, since their memory may be another process's,
+    /// which it writes.
+    ReadOnly,
+    /// Mapped read-only, with no write in the mapping's maximum protection, and the pages are a
+    /// file's bytes on a volume mounted read-only, which no one writes while the block lives
+    /// (`RGFX_SURFACE_PAGES_UNCHANGING`, the guest's word): the import drops the GPU's writes and
+    /// reads the pages once, as it is made. `copy_on_write` where the process maps the file
+    /// private and copy-on-write (`RGFX_SURFACE_PAGES_COPY_ON_WRITE`): the block's pages are then
+    /// the process's copy of the file's bytes, which the guest's wire of them made.
+    Unchanging {
+        /// The process maps the file's bytes private and copy-on-write.
+        copy_on_write: bool,
+    },
+}
+
+impl PagesAccess {
+    /// Whether the process maps the pages read-only: the import drops the GPU's writes.
+    #[must_use]
+    pub fn read_only(self) -> bool {
+        self != PagesAccess::Writable
+    }
+}
+
 /// The block Metal calls once, with the contents and the length, when a buffer made from a
 /// [`BufferDesc`] is released.
 pub type BufferDeallocator = Box<dyn FnOnce(HostPtr, u64) + Send>;

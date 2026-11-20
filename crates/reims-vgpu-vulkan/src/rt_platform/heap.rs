@@ -68,7 +68,7 @@ use crate::core::num::ToUsize as _;
 use crate::core::platform::Handle as _;
 use crate::core::platform::host_range::HostRange;
 use crate::core::platform::resource::Heap;
-use crate::core::platform::values::HeapDesc;
+use crate::core::platform::values::{HeapDesc, PagesAccess};
 use crate::core::raise::RaiseResult;
 
 use super::buffer::{self, BIT_20, FIELDS, READ_ONLY, RtBuffer, known_at, take, unpinned};
@@ -266,7 +266,11 @@ pub fn over_host_memory(
             if let Some(pin) = pin {
                 unpinned(SEL, pin);
             }
-            buffer::import_pages(device, SEL, first, size, read_only, || {})?
+            let access = match read_only {
+                true => PagesAccess::ReadOnly,
+                false => PagesAccess::Writable,
+            };
+            buffer::import_pages(device, SEL, first, size, access, || {})?
         }
     };
     // A copy just made is the heap's to hold from here (`super::copied::Fresh`).

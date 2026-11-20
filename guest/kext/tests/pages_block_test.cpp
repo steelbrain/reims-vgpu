@@ -113,22 +113,70 @@ int main()
 	// word.
 	const uint64_t pagesWord = RGFX_FEATURE_PAGES_BUFFERS;
 	const uint64_t readOnlyWord = RGFX_FEATURE_PAGES_BUFFERS | RGFX_FEATURE_READ_ONLY_PAGES;
-	for (uint64_t word : {pagesWord, readOnlyWord}) {
-		const RgfxPagesWiring w = rgfxPagesWiring(true, word);
+	const uint64_t unchangingWord = readOnlyWord | RGFX_FEATURE_UNCHANGING_PAGES;
+	for (uint64_t word : {pagesWord, readOnlyWord, unchangingWord}) {
+		const RgfxPagesWiring w = rgfxPagesWiring(kRgfxPagesWritable, word);
 		check(w.access == RgfxPagesAccess::kReadWrite && w.flags == RGFX_SURFACE_PAGES_PRIVATE,
 		      "writable memory is wired for reading and writing, unmarked");
 	}
 	// Read-only memory: wired for reading alone and marked read-only where the host took
 	// READ_ONLY_PAGES, which holds every object over the block to leave its pages as they are;
 	// else no block, as a host that does not know the mark would not hold it.
-	const RgfxPagesWiring ro = rgfxPagesWiring(false, readOnlyWord);
-	check(ro.access == RgfxPagesAccess::kRead &&
-	          ro.flags == (RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_READ_ONLY),
-	      "read-only memory is wired for reading alone, marked read-only");
-	check(rgfxPagesWiring(false, pagesWord).access == RgfxPagesAccess::kRefused,
+	const uint32_t readOnly = RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_READ_ONLY;
+	for (uint64_t word : {readOnlyWord, unchangingWord}) {
+		const RgfxPagesWiring ro = rgfxPagesWiring(0, word);
+		check(ro.access == RgfxPagesAccess::kRead && ro.flags == readOnly,
+		      "read-only memory is wired for reading alone, marked read-only");
+	}
+	check(rgfxPagesWiring(0, pagesWord).access == RgfxPagesAccess::kRefused,
 	      "read-only memory makes no block where the host did not take READ_ONLY_PAGES");
-	check(rgfxPagesWiring(false, 0).access == RgfxPagesAccess::kRefused,
+	check(rgfxPagesWiring(0, 0).access == RgfxPagesAccess::kRefused,
 	      "nor with no feature at all");
+	// Unchanging memory, read-only memory its process can never write: wired for reading as
+	// read-only memory is, marked unchanging, and copy-on-write where named so, where the host took
+	// UNCHANGING_PAGES; else no block, as a host that does not know the mark could not tell its
+	// pages from any read-only memory's.
+	const RgfxPagesWiring file = rgfxPagesWiring(kRgfxPagesUnchanging, unchangingWord);
+	check(file.access == RgfxPagesAccess::kRead &&
+	          file.flags == (readOnly | RGFX_SURFACE_PAGES_UNCHANGING),
+	      "unchanging memory is wired for reading, marked unchanging");
+	const RgfxPagesWiring cow =
+	    rgfxPagesWiring(kRgfxPagesUnchanging | kRgfxPagesCopyOnWrite, unchangingWord);
+	check(cow.access == RgfxPagesAccess::kRead &&
+	          cow.flags ==
+	              (readOnly | RGFX_SURFACE_PAGES_UNCHANGING | RGFX_SURFACE_PAGES_COPY_ON_WRITE),
+	      "unchanging copy-on-write memory is marked copy-on-write too");
+	for (uint64_t word : {pagesWord, readOnlyWord})
+		check(rgfxPagesWiring(kRgfxPagesUnchanging, word).access == RgfxPagesAccess::kRefused,
+		      "unchanging memory makes no block where the host did not take UNCHANGING_PAGES");
+	// Why read-only memory is not unchanging: carried on in the block's flags where the host
+	// took UNCHANGING_PAGES, any value of the four bits, and dropped where it did not.
+	for (uint64_t why : {uint64_t{RGFX_PAGES_WHY_SHADOWED}, uint64_t{RGFX_PAGES_WHY_REFUSED},
+	                     uint64_t{0xf}}) {
+		const RgfxPagesWiring said = rgfxPagesWiring(why << kRgfxPagesWhyShift, unchangingWord);
+		check(said.access == RgfxPagesAccess::kRead &&
+		          said.flags == (readOnly | static_cast<uint32_t>(why << RGFX_SURFACE_PAGES_WHY_SHIFT)),
+		      "read-only memory's why is carried on in its flags");
+		check((said.flags & RGFX_SURFACE_PAGES_WHY_MASK) >> RGFX_SURFACE_PAGES_WHY_SHIFT == why,
+		      "in the wire's why bits");
+		const RgfxPagesWiring unsaid = rgfxPagesWiring(why << kRgfxPagesWhyShift, readOnlyWord);
+		check(unsaid.access == RgfxPagesAccess::kRead && unsaid.flags == readOnly,
+		      "and dropped where the host did not take UNCHANGING_PAGES");
+	}
+	check(kRgfxPagesWhyShift == RGFX_SURFACE_PAGES_WHY_SHIFT &&
+	          uint64_t{kRgfxPagesWhyMask} == RGFX_SURFACE_PAGES_WHY_MASK,
+	      "the call's why bits are the wire's");
+	// What names no mapping: writable and unchanging, copy-on-write and not unchanging, a why
+	// with writable or unchanging memory, a bit of no meaning.
+	const uint64_t why = uint64_t{RGFX_PAGES_WHY_SHADOWED} << kRgfxPagesWhyShift;
+	for (uint64_t how : {uint64_t{kRgfxPagesWritable | kRgfxPagesUnchanging},
+	                     uint64_t{kRgfxPagesCopyOnWrite},
+	                     uint64_t{kRgfxPagesWritable | kRgfxPagesCopyOnWrite},
+	                     uint64_t{kRgfxPagesHowBits}, uint64_t{1u << 3}, kRgfxPagesWritable | why,
+	                     kRgfxPagesUnchanging | why, uint64_t{1u << 12}})
+		check(rgfxPagesWiring(how, unchangingWord).access == RgfxPagesAccess::kBadArgument,
+		      "a mapping no memory has is a bad argument");
+	check(kRgfxPagesWritable == 1, "1, as the kexts before the bits took writable memory");
 
 	// The chunks' physical mask: each chunk at a multiple of its own 64 KiB, on 4 KiB and on
 	// 16 KiB pages; a mask that clears only the page's bits gives the page alone.

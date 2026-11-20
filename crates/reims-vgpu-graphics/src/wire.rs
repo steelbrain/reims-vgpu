@@ -88,8 +88,8 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// [`RGFX_FEATURE_SMALL_ID_CHUNKS`], [`RGFX_FEATURE_DISPLAY_COLOR`],
 /// [`RGFX_FEATURE_MESH_PIPELINES`], [`RGFX_FEATURE_SHARED_EVENT_NAMES`],
 /// [`RGFX_FEATURE_OPENCL_MODE`], [`RGFX_FEATURE_PRIVATE_RENDER_STATE`],
-/// [`RGFX_FEATURE_SURFACE_CACHE_REFUSED`] and [`RGFX_FEATURE_SURFACE_DEFERRED_ASK`]). Bit 10 is
-/// reserved.
+/// [`RGFX_FEATURE_SURFACE_CACHE_REFUSED`], [`RGFX_FEATURE_SURFACE_DEFERRED_ASK`] and
+/// [`RGFX_FEATURE_UNCHANGING_PAGES`]). Bit 10 is reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63, the ones the host offers, which the guest takes
 /// through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`],
@@ -316,6 +316,16 @@ pub const RGFX_FEATURE_SURFACE_CACHE_REFUSED: u32 = 1 << 29;
 /// bytes of its GPU's memory such caches may hold. A host offers it where it offers
 /// `SURFACE_CACHE_REFUSED`.
 pub const RGFX_FEATURE_SURFACE_DEFERRED_ASK: u32 = 1 << 30;
+/// `FEATURES_LO` bit 31, `UNCHANGING_PAGES`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`], and which means nothing without
+/// [`RGFX_FEATURE_READ_ONLY_PAGES`]: a read-only pages block's `SURFACE_PAGES` may carry
+/// [`RGFX_SURFACE_PAGES_UNCHANGING`], a block of pages its process can never write, a file's own on
+/// a volume the guest's OS mounted read-only, which no one writes while the block lives, and the
+/// host may then read them once, as the block's view is imported, and never again; and one that
+/// does not carry it may say why not ([`RGFX_SURFACE_PAGES_WHY_SHIFT`], a diagnostic). A `u64`,
+/// unlike the other bits of `FEATURES_LO`, so that C's `1 << 31` of a signed `int` never stands for
+/// it. A host offers it where it offers `READ_ONLY_PAGES`.
+pub const RGFX_FEATURE_UNCHANGING_PAGES: u64 = 0x8000_0000;
 /// `FEATURES_HI` bit 0, feature bit 32, `SURFACE_DEFERRED_CARRY`, which the guest takes through
 /// [`RGFX_REG_DRIVER_FEATURES_HI`], and which means nothing without
 /// [`RGFX_FEATURE_SURFACE_DEFERRED`] or [`RGFX_FEATURE_SURFACE_DEFERRED_ASK`]: a deferral
@@ -2696,6 +2706,53 @@ pub const RGFX_SURFACE_PAGES_ASK_CACHE: u32 = 1 << 4;
 /// whose CPU copy lies over it. One without [`RGFX_SURFACE_PAGES_PRIVATE`] is
 /// [`RGFX_STATUS_INVALID_ARGUMENT`].
 pub const RGFX_SURFACE_PAGES_READ_ONLY: u32 = 1 << 5;
+/// [`RgfxSurfacePagesCache::flags`], with [`RGFX_SURFACE_PAGES_READ_ONLY`], where the guest took
+/// [`RGFX_FEATURE_UNCHANGING_PAGES`]: the read-only pages block's pages are of a mapping its
+/// process can never write, whose maximum protection has no write, of a file on a volume the
+/// guest's OS mounted read-only, and the mapping showed the file's own pages as the block was made:
+/// a shared mapping ([`RGFX_SURFACE_PAGES_COPY_ON_WRITE`] clear), whose pages the kext wires are
+/// the file's, or a private copy-on-write one (the flag set), whose pages the kext's wire copies
+/// for the process, as a Mac's driver's wire of the process's memory does. No one writes them while
+/// the block lives, so the host may read them once, as the block's view is imported, and never
+/// again. The flag is the guest's word, which the host does not check: where it is false, the GPU
+/// of the objects over the block may read the bytes the block had as its view was imported. One
+/// without [`RGFX_SURFACE_PAGES_READ_ONLY`] is [`RGFX_STATUS_INVALID_ARGUMENT`].
+pub const RGFX_SURFACE_PAGES_UNCHANGING: u32 = 1 << 6;
+/// [`RgfxSurfacePagesCache::flags`], with [`RGFX_SURFACE_PAGES_UNCHANGING`]: the process maps the
+/// file's bytes private and copy-on-write, with no write in the mapping's maximum protection. The
+/// host counts its blocks apart. One without [`RGFX_SURFACE_PAGES_UNCHANGING`] is
+/// [`RGFX_STATUS_INVALID_ARGUMENT`].
+pub const RGFX_SURFACE_PAGES_COPY_ON_WRITE: u32 = 1 << 7;
+/// Where [`RgfxSurfacePagesCache::flags`] of a block with [`RGFX_SURFACE_PAGES_READ_ONLY`] and no
+/// [`RGFX_SURFACE_PAGES_UNCHANGING`] holds, in its bits 8 to 11 ([`RGFX_SURFACE_PAGES_WHY_MASK`]),
+/// why the guest found the block's pages not unchanging, where it took
+/// [`RGFX_FEATURE_UNCHANGING_PAGES`]: one of the `RGFX_PAGES_WHY_*` values. A diagnostic: the host
+/// counts the block's copies by it, takes any value, and does nothing else with it.
+pub const RGFX_SURFACE_PAGES_WHY_SHIFT: u32 = 8;
+/// The bits of [`RgfxSurfacePagesCache::flags`] that hold a why ([`RGFX_SURFACE_PAGES_WHY_SHIFT`]).
+pub const RGFX_SURFACE_PAGES_WHY_MASK: u32 = 3840;
+/// [`RGFX_SURFACE_PAGES_WHY_SHIFT`]: the guest said no why (it did not classify the pages).
+pub const RGFX_PAGES_WHY_UNSAID: u32 = 0;
+/// [`RGFX_SURFACE_PAGES_WHY_SHIFT`]: the pages are not a file's (anonymous or device memory, a
+/// submap, or a region the kernel names no vnode for).
+pub const RGFX_PAGES_WHY_NOT_A_FILE: u32 = 1;
+/// [`RGFX_SURFACE_PAGES_WHY_SHIFT`]: the pages lie in more than one VM region of the process.
+pub const RGFX_PAGES_WHY_SPANS_REGIONS: u32 = 2;
+/// [`RGFX_SURFACE_PAGES_WHY_SHIFT`]: a shared mapping of a file whose maximum protection has write.
+pub const RGFX_PAGES_WHY_WRITABLE_MAPPING: u32 = 3;
+/// [`RGFX_SURFACE_PAGES_WHY_SHIFT`]: a private copy-on-write mapping of a file whose maximum
+/// protection has write, as mmap makes one.
+pub const RGFX_PAGES_WHY_WRITABLE_MAX_PROTECTION: u32 = 4;
+/// [`RGFX_SURFACE_PAGES_WHY_SHIFT`]: a page the process sees is not the file's own (it wrote it, or
+/// it was paged out).
+pub const RGFX_PAGES_WHY_SHADOWED: u32 = 5;
+/// [`RGFX_SURFACE_PAGES_WHY_SHIFT`]: the file's volume is not mounted read-only.
+pub const RGFX_PAGES_WHY_WRITABLE_VOLUME: u32 = 6;
+/// [`RGFX_SURFACE_PAGES_WHY_SHIFT`]: a call of the classification's failed.
+pub const RGFX_PAGES_WHY_OTHER: u32 = 7;
+/// [`RGFX_SURFACE_PAGES_WHY_SHIFT`]: the pages were unchanging, and the kext refused the block so
+/// marked.
+pub const RGFX_PAGES_WHY_REFUSED: u32 = 8;
 
 /// Where a `SURFACE_PAGES` message's [`RgfxSurfacePagesLayout`] starts: right after its
 /// [`RgfxSurfacePagesCache`].
@@ -2749,7 +2806,9 @@ pub struct RgfxSurfacePagesLayout {
 pub struct RgfxSurfacePagesCache {
     /// `RGFX_SURFACE_PAGES_*`: [`RGFX_SURFACE_PAGES_CACHED`], [`RGFX_SURFACE_PAGES_PRIVATE`],
     /// [`RGFX_SURFACE_PAGES_DEFERRED`], [`RGFX_SURFACE_PAGES_ATTACH`],
-    /// [`RGFX_SURFACE_PAGES_ASK_CACHE`] and [`RGFX_SURFACE_PAGES_READ_ONLY`].
+    /// [`RGFX_SURFACE_PAGES_ASK_CACHE`], [`RGFX_SURFACE_PAGES_READ_ONLY`],
+    /// [`RGFX_SURFACE_PAGES_UNCHANGING`] and [`RGFX_SURFACE_PAGES_COPY_ON_WRITE`]; and a why
+    /// ([`RGFX_SURFACE_PAGES_WHY_SHIFT`]).
     pub flags: u32,
     /// Zero.
     pub reserved_04: u32,

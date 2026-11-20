@@ -9704,7 +9704,8 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         | RGFX_FEATURE_PAGES_BUFFERS
         | RGFX_FEATURE_HEAP_OVER_PAGES
         | RGFX_FEATURE_SURFACE_CACHE
-        | RGFX_FEATURE_SURFACE_DEFERRED;
+        | RGFX_FEATURE_SURFACE_DEFERRED
+        | u32::try_from(RGFX_FEATURE_UNCHANGING_PAGES).unwrap();
     let page = platform.vm().page_size();
     assert!(
         page == 4096 || page == 16384,
@@ -9994,6 +9995,11 @@ fn a_gpu_of_its_own_memory_has_the_guest_align_its_surfaces_rows_too() {
         high & RGFX_FEATURE_READ_ONLY_PAGES != 0,
         !sixteen,
         "pages blocks of memory a process maps read-only"
+    );
+    assert_eq!(
+        u64::from(low) & RGFX_FEATURE_UNCHANGING_PAGES != 0,
+        !sixteen,
+        "read-only pages blocks of a file's pages that never change"
     );
     assert_eq!(
         u64::from(device_info_of(&device).linear_row_alignment),

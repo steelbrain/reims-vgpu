@@ -1046,9 +1046,10 @@ struct PagesKext {
 		k->blocks[*offset] = size;
 		return true;
 	}
-	static bool pagesBlock(void *context, const void *address, uint64_t length, bool writable,
+	static bool pagesBlock(void *context, const void *address, uint64_t length, uint32_t how,
 	                       uint64_t *offset, uint64_t *size, uint64_t *gpuAddress)
 	{
+		const bool writable = (how & RgfxRegion::kPagesWritable) != 0;
 		PagesKext *k = static_cast<PagesKext *>(context);
 		*gpuAddress = 0;
 		k->lastAddress = address;

@@ -81,6 +81,12 @@
 //    cache (RGFX_SURFACE_PAGES_ASK_CACHE, with the layout the bundle gives with its ask), and
 //    makes the block cached where the host answers RGFX_STATUS_CACHE, its cached blocks then kept
 //    as SURFACE_CACHE's are (RgfxSurfaceCaches.hpp);
+//  - UNCHANGING_PAGES (bit 31), both kexts, meaningful only with READ_ONLY_PAGES: the bundle maps
+//    a file's pages on a read-only volume, which the app maps copy-on-write with no copy made yet
+//    or with no write allowed, shared and read-only for the call, and the kext makes a pages
+//    block of that mapping marked unchanging (RGFX_SURFACE_PAGES_UNCHANGING, and
+//    RGFX_SURFACE_PAGES_COPY_ON_WRITE where the app's mapping is copy-on-write;
+//    kRgfxPagesUnchanging, RgfxPagesBlock.hpp), for the host to read its pages once;
 //  - SURFACE_DEFERRED_CARRY (bit 32), meaningful only with SURFACE_DEFERRED: the bundle lists, at
 //    its ask of a cacheable block in place, the few resident pages of its surface it finds in its
 //    mapping, and the kext defers a surface fresh but for those, carrying them in the deferral's
@@ -250,7 +256,8 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_MANAGED_BUFFER_SLABS | RGFX_FEATURE_SMALL_ID_CHUNKS | RGFX_FEATURE_DISPLAY_COLOR |
     RGFX_FEATURE_MESH_PIPELINES | RGFX_FEATURE_SHARED_EVENT_NAMES | RGFX_FEATURE_OPENCL_MODE |
     RGFX_FEATURE_PRIVATE_RENDER_STATE | RGFX_FEATURE_SURFACE_CACHE_REFUSED |
-    RGFX_FEATURE_SURFACE_DEFERRED_ASK | RGFX_FEATURE_SURFACE_DEFERRED_CARRY |
+    RGFX_FEATURE_SURFACE_DEFERRED_ASK | RGFX_FEATURE_UNCHANGING_PAGES |
+    RGFX_FEATURE_SURFACE_DEFERRED_CARRY |
     RGFX_FEATURE_SCHEDULED_ASK | RGFX_FEATURE_DISPLAY_SCALE |
     RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA | RGFX_FEATURE_RATE_MAPS |
     RGFX_FEATURE_FUNCTION_POINTERS | RGFX_FEATURE_DYNAMIC_LIBRARIES | RGFX_FEATURE_PIPELINE_KEYS |

@@ -55,8 +55,9 @@ enum {
 	// before this one answers kIOReturnUnsupported here, and the bundle then has no device.
 	kRgfxAccelMethodFeatures = 3,
 	// A pages block over the process's own memory (kRgfxKextFeaturePagesBlock;
-	// RgfxPagesBlock.hpp): in the memory's address in the process, its bytes, and 1 for memory the
-	// process may write; out the block's region offset and its size, and where asked for
+	// RgfxPagesBlock.hpp): in the memory's address in the process, its bytes, and how the process
+	// maps it (kRgfxPagesWritable and, below, kRgfxPagesUnchanging and kRgfxPagesCopyOnWrite; 0
+	// for memory it may not write); out the block's region offset and its size, and where asked for
 	// (kRgfxKextFeatureImportAddresses), a third: the GPU address the device gave the block's
 	// view, 0 where it gave none. The kext wires the pages that
 	// hold the range, rounded out to whole pages, in the process for as long as the block lives,
@@ -69,10 +70,20 @@ enum {
 	// close, and stay wired for good where neither is answered. Memory the process may not write
 	// (0) is wired for reading alone and its SURFACE_PAGES marked RGFX_SURFACE_PAGES_READ_ONLY,
 	// where the device took RGFX_FEATURE_READ_ONLY_PAGES: the host lets only objects whose GPU
-	// writes it drops lie over it. kIOReturnUnsupported where the device lacks
-	// RGFX_FEATURE_PAGES_BUFFERS or refused the pages, and for memory the process may not write
+	// writes it drops lie over it. Memory named unchanging (kRgfxPagesUnchanging,
+	// kRgfxKextFeatureUnchangingPages) is read-only memory the process can never write, a file's
+	// pages on a read-only volume (the bundle's RgfxFilePages.hpp), wired for reading as read-only
+	// memory is, and its SURFACE_PAGES marked RGFX_SURFACE_PAGES_UNCHANGING too, and
+	// RGFX_SURFACE_PAGES_COPY_ON_WRITE where it is also named so, where the device took
+	// RGFX_FEATURE_UNCHANGING_PAGES (RgfxPagesBlock.hpp); read-only memory not named so may carry
+	// why not (kRgfxPagesWhyShift), which its SURFACE_PAGES carries on where the device took
+	// RGFX_FEATURE_UNCHANGING_PAGES. kIOReturnUnsupported where the device lacks
+	// RGFX_FEATURE_PAGES_BUFFERS or refused the pages, for memory the process may not write
 	// where it lacks RGFX_FEATURE_READ_ONLY_PAGES: the GPU's writes would land in pages the
-	// process cannot write. kIOReturnBadArgument where the range is not mapped in the process;
+	// process cannot write, and for memory named unchanging where it lacks
+	// RGFX_FEATURE_UNCHANGING_PAGES. kIOReturnBadArgument where the range is not mapped in the
+	// process, for memory named writable and unchanging, or copy-on-write and not unchanging, and
+	// for a why with writable or unchanging memory;
 	// kIOReturnNoSpace or kIOReturnNoResources where the region or the kext's table has no room
 	// for the block.
 	kRgfxAccelMethodPagesBlock = 4,
@@ -364,6 +375,22 @@ enum {
 	kRgfxSharedEventMethodImport = 11,
 };
 
+// How the process maps the memory of a PagesBlock (4), its third scalar in: writable; unchanging,
+// read-only memory the process can never write, a file's pages on a read-only volume mapped with
+// no write in the mapping's maximum protection (kRgfxKextFeatureUnchangingPages; never with
+// kRgfxPagesWritable); copy-on-write, which only unchanging memory is named, where the process
+// maps the file's pages private; and for read-only memory not named unchanging, in the bits from
+// kRgfxPagesWhyShift (kRgfxPagesWhyMask), why not: one of the wire's RGFX_PAGES_WHY_* values, a
+// diagnostic the block's SURFACE_PAGES carries to the host (RGFX_SURFACE_PAGES_WHY_SHIFT).
+enum {
+	kRgfxPagesWritable = 1 << 0,
+	kRgfxPagesUnchanging = 1 << 1,
+	kRgfxPagesCopyOnWrite = 1 << 2,
+	kRgfxPagesHowBits = kRgfxPagesWritable | kRgfxPagesUnchanging | kRgfxPagesCopyOnWrite,
+	kRgfxPagesWhyShift = 8,
+	kRgfxPagesWhyMask = 0xf << kRgfxPagesWhyShift,
+};
+
 // PagesChunked's (12) chunk, 64 KiB, each at a multiple of 64 KiB of guest RAM
 // (RgfxPagesBlock.hpp, kRgfxPagesChunkMask), and the most bytes one call takes, 1 GiB. A 64 KiB
 // run of RAM is one the kernel finds at once, however long the guest has run: measured on an
@@ -445,6 +472,10 @@ enum {
 	// bundle asks for where the feature word holds RGFX_FEATURE_IMPORT_ADDRESSES too; the x86-64
 	// and arm64e kexts.
 	kRgfxKextFeatureImportAddresses = 1 << 18,
+	// PagesBlock's (4) memory named unchanging (kRgfxPagesUnchanging, kRgfxPagesCopyOnWrite),
+	// which the bundle names where the feature word holds RGFX_FEATURE_UNCHANGING_PAGES too; the
+	// x86-64 and arm64e kexts.
+	kRgfxKextFeatureUnchangingPages = 1 << 19,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

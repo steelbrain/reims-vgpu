@@ -324,17 +324,17 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		return owner->releaseSurfaceBlock(this, in[0]);
 	case kRgfxAccelMethodPagesBlock: {
 		// A third output, the view's GPU address, where the bundle asks for it
-		// (kRgfxKextFeatureImportAddresses).
-		if (a->scalarInputCount != 3 || a->scalarOutputCount < 2 || a->scalarOutputCount > 3 ||
-		    in[2] > 1)
+		// (kRgfxKextFeatureImportAddresses). The third input's bits are pagesBlock's to check
+		// (rgfxPagesWiring).
+		if (a->scalarInputCount != 3 || a->scalarOutputCount < 2 || a->scalarOutputCount > 3)
 			return kIOReturnBadArgument;
 		// An ask, so no pages block is made for a context releaseContext has closed: every block
 		// of the client's goes after its close.
 		UInt32 ctx = 0;
 		Ask ask = {this, beginAsk(&ctx)};
 		UInt64 offset = 0, size = 0, gpuAddress = 0;
-		IOReturn r = ask.begun ? owner->pagesBlock(this, ctx, task, in[0], in[1], in[2] != 0,
-		                                           &offset, &size, &gpuAddress)
+		IOReturn r = ask.begun ? owner->pagesBlock(this, ctx, task, in[0], in[1], in[2], &offset,
+		                                           &size, &gpuAddress)
 		                       : kIOReturnBadArgument;
 		if (r != kIOReturnSuccess)
 			return r;

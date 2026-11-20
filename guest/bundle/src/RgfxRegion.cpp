@@ -8,9 +8,11 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <os/log.h>
+#include <time.h>
 
 #include <cstring>
 
+#include "RgfxFilePages.hpp"
 #include "RgfxLog.hpp"
 #include "RgfxLogOnce.hpp"
 
@@ -282,8 +284,35 @@ RgfxRegion::Block RgfxRegion::acquirePages(const void *address, uint64_t length,
 		}
 	}
 	uint64_t offset = 0, size = 0, gpuAddress = 0;
-	if (!m_pagesBlock(m_pagesBlockContext, address, length, writable, &offset, &size,
-	                  &gpuAddress))
+	const uint32_t how = writable ? kPagesWritable : 0;
+	bool given = false;
+	if (!writable && m_unchangingPages) {
+		// Read-only memory, classified (RgfxFilePages.hpp): the app's own pages named unchanging
+		// where they cannot change, and else with why not, which the host counts its copies by.
+		const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+		const RgfxFilePages file = rgfxFilePagesOf(address, length);
+		const uint64_t ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+		uint32_t why = file.why;
+		bool refused = false;
+		if (file.clause != kRgfxFileNeither) {
+			const uint32_t unchanging =
+			    kPagesUnchanging | (file.clause == kRgfxFileCopyOnWrite ? kPagesCopyOnWrite : 0);
+			given = m_pagesBlock(m_pagesBlockContext, address, length, unchanging, &offset, &size,
+			                     &gpuAddress);
+			refused = !given;
+			why = RGFX_PAGES_WHY_REFUSED;
+		}
+		rgfxFilePagesNote(file, length, ns, refused);
+		if (!given) {
+			const uint32_t readOnly = how | (why << kPagesWhyShift);
+			given = m_pagesBlock(m_pagesBlockContext, address, length, readOnly, &offset, &size,
+			                     &gpuAddress);
+		}
+	} else {
+		given = m_pagesBlock(m_pagesBlockContext, address, length, how, &offset, &size,
+		                     &gpuAddress);
+	}
+	if (!given)
 		return out; // ok == false
 	if (offset < m_floor || offset > m_size || size > m_size - offset) {
 		release(offset);
