@@ -41,8 +41,12 @@
 //! place, rt keeps the texels in an image of its own and copies the bytes between the two,
 //! counting each copy and its bytes (rt's `Metrics`). The process's counts line carries them as
 //! amounts ([`fold_metrics`], which `crate::answer::write_counts` runs first):
-//! [`OVER_COPIES_CODE`] and [`OVER_COPY_BYTES_CODE`], and of those over an imported block,
-//! [`OVER_COPIES_IMPORTED_CODE`] and [`OVER_COPY_BYTES_IMPORTED_CODE`].
+//! [`OVER_COPIES_CODE`] and [`OVER_COPY_BYTES_CODE`]; of those over an imported block,
+//! [`OVER_COPIES_IMPORTED_CODE`] and [`OVER_COPY_BYTES_IMPORTED_CODE`]; and by the cause rt gives
+//! each copy, `rt-over-copies-<cause>` and `rt-over-copy-bytes-<cause>` ([`over_copy_counts`]).
+//! rt counts each copy under one cause, so the causes sum to the over-copies; a copy over an
+//! imported block is counted under its import's cause too, so the imported ones are an axis of
+//! their own and no cause.
 
 use std::sync::{Arc, OnceLock};
 
@@ -97,9 +101,13 @@ pub const OVER_COPIES_IMPORTED_CODE: &str = "rt-over-copies-imported";
 /// The code of their bytes (`Metrics::over_copy_bytes_imported`).
 pub const OVER_COPY_BYTES_IMPORTED_CODE: &str = "rt-over-copy-bytes-imported";
 
+/// The over-copy metrics the counts line carries ([`over_copy_counts`]): the over-copies and their
+/// bytes, those over an imported block, and the 12 causes' pairs.
+const OVER_COPY_METRICS: usize = 4 + 2 * 12;
+
 /// The counters of the device the process made last ([`open`]), which [`fold_metrics`] reads,
-/// with what it folded so far of each of their metrics, in [`fold`]'s order.
-type Folding = Option<(rt::Counters, [u64; 4])>;
+/// with what it folded so far of each of their metrics, in [`over_copy_counts`]'s order.
+type Folding = Option<(rt::Counters, [u64; OVER_COPY_METRICS])>;
 
 /// The process's [`Folding`], once a device is made.
 static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::new(None);
@@ -109,7 +117,7 @@ static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::n
 /// docs). Nothing before the device is made.
 pub fn fold_metrics() {
     if let Some((counters, folded)) = COUNTERS.lock().as_mut() {
-        fold(folded, over_copies(counters));
+        fold(folded, over_copy_counts(&counters.metrics()));
     }
 }
 
@@ -119,20 +127,43 @@ pub fn fold_metrics() {
 fn follow(counters: rt::Counters) {
     let mut latest = COUNTERS.lock();
     if let Some((before, folded)) = latest.as_mut() {
-        fold(folded, over_copies(before));
+        fold(folded, over_copy_counts(&before.metrics()));
     }
-    *latest = Some((counters, [0; 4]));
+    *latest = Some((counters, [0; OVER_COPY_METRICS]));
 }
 
-/// The over-copy metrics of `counters` now, in [`fold`]'s order.
-fn over_copies(counters: &rt::Counters) -> [u64; 4] {
-    let m = counters.metrics();
-    [
-        m.over_copies,
-        m.over_copy_bytes,
-        m.over_copies_imported,
-        m.over_copy_bytes_imported,
-    ]
+/// The over-copy metrics of `m`, each with its code (the module's docs): the over-copies and
+/// their bytes, those over an imported block, then each cause's copies and their bytes, the code
+/// named for rt's field.
+fn over_copy_counts(m: &rt::Metrics) -> [(&'static str, u64); OVER_COPY_METRICS] {
+    macro_rules! by_cause {
+        ($($cause:literal $copies:ident $bytes:ident),* $(,)?) => {
+            [
+                (OVER_COPIES_CODE, m.over_copies),
+                (OVER_COPY_BYTES_CODE, m.over_copy_bytes),
+                (OVER_COPIES_IMPORTED_CODE, m.over_copies_imported),
+                (OVER_COPY_BYTES_IMPORTED_CODE, m.over_copy_bytes_imported),
+                $(
+                    (concat!("rt-over-copies-", $cause), m.$copies),
+                    (concat!("rt-over-copy-bytes-", $cause), m.$bytes),
+                )*
+            ]
+        };
+    }
+    by_cause!(
+        "host-memory" over_copies_host_memory over_copy_bytes_host_memory,
+        "dma-buf" over_copies_dma_buf over_copy_bytes_dma_buf,
+        "dma-bufs" over_copies_dma_bufs over_copy_bytes_dma_bufs,
+        "dedicated" over_copies_dedicated over_copy_bytes_dedicated,
+        "surface" over_copies_surface over_copy_bytes_surface,
+        "spilled" over_copies_spilled over_copy_bytes_spilled,
+        "linear" over_copies_linear over_copy_bytes_linear,
+        "linear-features" over_copies_linear_features over_copy_bytes_linear_features,
+        "pitch" over_copies_pitch over_copy_bytes_pitch,
+        "render-reach" over_copies_render_reach over_copy_bytes_render_reach,
+        "alignment" over_copies_alignment over_copy_bytes_alignment,
+        "image-memory" over_copies_image_memory over_copy_bytes_image_memory,
+    )
 }
 
 /// rt's metrics of the process's device now (`super::diag`); `None` before it is made.
@@ -145,16 +176,10 @@ pub(super) fn gauges() -> Option<rt::Gauges> {
     (COUNTERS.lock().as_ref()).map(|(counters, _)| counters.gauges())
 }
 
-/// Counts the rise of each of `now` over `folded`, the over-copies, their bytes, and those of an
-/// imported block, under its code, and keeps `now` as folded.
-fn fold(folded: &mut [u64; 4], now: [u64; 4]) {
-    let codes = [
-        OVER_COPIES_CODE,
-        OVER_COPY_BYTES_CODE,
-        OVER_COPIES_IMPORTED_CODE,
-        OVER_COPY_BYTES_IMPORTED_CODE,
-    ];
-    for ((code, now), was) in codes.into_iter().zip(now).zip(folded.iter_mut()) {
+/// Counts the rise of each over-copy metric of `now` ([`over_copy_counts`]) over `folded` under
+/// its code, and keeps `now` as folded.
+fn fold(folded: &mut [u64; OVER_COPY_METRICS], now: [(&'static str, u64); OVER_COPY_METRICS]) {
+    for ((code, now), was) in now.into_iter().zip(folded.iter_mut()) {
         crate::answer::count_kind_by(code, now.saturating_sub(*was));
         *was = now;
     }
@@ -1415,7 +1440,8 @@ mod tests {
     use crate::core::platform::values::{OptionSet, TextureDesc};
 
     /// Each fold counts what each over-copy metric rose by since the last, under its code, so the
-    /// counts line carries the metrics' totals.
+    /// counts line carries the metrics' totals: the over-copies and their bytes, those over an
+    /// imported block, and each cause's, by the cause's name.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -1423,19 +1449,45 @@ mod tests {
             OVER_COPY_BYTES_CODE,
             OVER_COPIES_IMPORTED_CODE,
             OVER_COPY_BYTES_IMPORTED_CODE,
+            "rt-over-copies-host-memory",
+            "rt-over-copy-bytes-host-memory",
+            "rt-over-copies-pitch",
+            "rt-over-copy-bytes-pitch",
+            "rt-over-copies-image-memory",
+            "rt-over-copy-bytes-image-memory",
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
             codes.map(|code| (all.iter()).find(|(c, _)| c == code).map_or(0, |&(_, n)| n))
         };
         let before = counts();
-        let mut folded = [0; 4];
-        fold(&mut folded, [2, 8192, 1, 4096]);
-        fold(&mut folded, [3, 12288, 1, 4096]);
-        assert_eq!(folded, [3, 12288, 1, 4096]);
+        let mut m = rt::Metrics::default();
+        m.over_copies = 2;
+        m.over_copy_bytes = 8192;
+        m.over_copies_imported = 1;
+        m.over_copy_bytes_imported = 4096;
+        m.over_copies_host_memory = 1;
+        m.over_copy_bytes_host_memory = 4096;
+        m.over_copies_pitch = 1;
+        m.over_copy_bytes_pitch = 4096;
+        let mut folded = [0; OVER_COPY_METRICS];
+        fold(&mut folded, over_copy_counts(&m));
+        m.over_copies = 3;
+        m.over_copy_bytes = 12288;
+        m.over_copies_image_memory = 1;
+        m.over_copy_bytes_image_memory = 4096;
+        fold(&mut folded, over_copy_counts(&m));
+        assert_eq!(folded, over_copy_counts(&m).map(|(_, n)| n));
         let after = counts();
         let rose: Vec<u64> = (after.iter().zip(before)).map(|(a, b)| a - b).collect();
-        assert_eq!(rose, [3, 12288, 1, 4096]);
+        assert_eq!(rose, [3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096]);
+        let named = over_copy_counts(&m).map(|(code, _)| code);
+        let unique: std::collections::BTreeSet<&str> = named.iter().copied().collect();
+        assert_eq!(unique.len(), OVER_COPY_METRICS, "{named:?}");
+        assert!(
+            named.iter().all(|code| code.starts_with("rt-over-cop")),
+            "{named:?}"
+        );
     }
 
     /// The counts read the device the process made last ([`follow`]), on the GPU the test holds:

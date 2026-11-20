@@ -14,10 +14,16 @@
 //! - the bytes rt copied for calls: in all, then by cause: staging (`replace_region` and
 //!   `get_bytes`), attachments' images into their shadows, and the over-copies between a texture
 //!   over a buffer and its image of its own, by the cause rt gives each, those of none left out;
-//! - the gauges of its texture blocks and of the Private blocks the consumer takes, by their
-//!   fields' names, as they are now: the bytes of the texture blocks it holds, of the sparse ones
-//!   among them and their count; and the bytes of the Private allocations that hold taken blocks,
-//!   of the taken blocks in them, and of the sparse allocations among them and their count.
+//! - `counted`, more of what rt counted, by their fields' names: new textures' images zeroed,
+//!   their bytes and the barriers that moved them home after it; the acquires of another API's
+//!   writes; the barriers rt recorded; and the releases of a texture or block an unsent upload
+//!   held, their bytes, and the sends of uploads they started;
+//! - `gauges`, some of rt's gauges as they are now, by their fields' names: the live textures,
+//!   those held in an image of their own beside their buffer, the bytes of textures' places in
+//!   texture blocks, of textures' allocations of their own and of the spills; then the bytes of
+//!   the texture blocks it holds, of the sparse ones among them and their count; and the bytes of
+//!   the Private allocations that hold taken blocks, of the taken blocks in them, and of the
+//!   sparse allocations among them and their count.
 //!
 //! A device made after the one before reads as counted from none again: each count is what it rose
 //! by, or what it is where it fell.
@@ -78,15 +84,48 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges)
         rose!(over_copy_bytes),
     );
     let staging = copied.saturating_sub(attachments).saturating_sub(over);
+    // What rose, and the gauges as they are, each by its field's name.
+    macro_rules! rose_by_name {
+        ($($field:ident),* $(,)?) => {
+            [$((stringify!($field), rose!($field))),*]
+        };
+    }
+    macro_rules! gauges_by_name {
+        ($($field:ident),* $(,)?) => {
+            [$((stringify!($field), gauges.$field)),*]
+        };
+    }
+    let counted = rose_by_name!(
+        texture_clears,
+        texture_clear_bytes,
+        texture_clear_barriers,
+        external_acquires,
+        barriers,
+        held_releases,
+        held_release_bytes,
+        held_release_starts,
+    );
+    let gauged = gauges_by_name!(
+        textures,
+        textures_copied_over,
+        texture_block_bytes,
+        texture_own_bytes,
+        spilled_bytes,
+        texture_block_held_bytes,
+        texture_block_sparse_bytes,
+        texture_block_sparse_blocks,
+        private_take_held_bytes,
+        private_take_bytes,
+        private_take_sparse_bytes,
+        private_take_sparse_allocations,
+    );
     format!(
         "rt: pipelines made {}; first-use waits {} in {:.1} ms (variants {} in {:.1} ms, lines {} \
          in {:.1} ms), the longest since the device was made {:.1} ms; submits {} in {:.1} ms \
          ({} over 100 ms), the longest since the device was made {:.1} ms; queue-lock waits \
          {:.1} ms, the longest since the device was made {:.1} ms; bytes copied {copied}: \
-         staging {staging}, attachment reads {attachments}, over-copies {over}{}; gauges \
-         texture_block_held_bytes {}, texture_block_sparse_bytes {}, texture_block_sparse_blocks \
-         {}, private_take_held_bytes {}, private_take_bytes {}, private_take_sparse_bytes {}, \
-         private_take_sparse_allocations {}",
+         staging {staging}, attachment reads {attachments}, over-copies {over}{}; counted {}; \
+         gauges {}",
         rose!(pipelines_created),
         rose!(first_use_waits),
         ms(rose!(first_use_wait_nanos)),
@@ -106,14 +145,17 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges)
         } else {
             format!(" ({})", by_cause.join(", "))
         },
-        gauges.texture_block_held_bytes,
-        gauges.texture_block_sparse_bytes,
-        gauges.texture_block_sparse_blocks,
-        gauges.private_take_held_bytes,
-        gauges.private_take_bytes,
-        gauges.private_take_sparse_bytes,
-        gauges.private_take_sparse_allocations,
+        by_name(&counted),
+        by_name(&gauged),
     )
+}
+
+/// `NAME VALUE` of each of `named`, in its order.
+fn by_name(named: &[(&str, u64)]) -> String {
+    let pairs: Vec<String> = (named.iter())
+        .map(|(name, value)| format!("{name} {value}"))
+        .collect();
+    pairs.join(", ")
 }
 
 #[cfg(test)]
@@ -122,8 +164,8 @@ mod tests {
 
     /// A part says what rose since the metrics before, the maxima since the device was made as
     /// they are, each over-copy cause with bytes by name and none without, staging as the copies
-    /// neither of attachments nor over-copies, then the block gauges by name as they are; a count
-    /// that fell, a new device's, reads as it is.
+    /// neither of attachments nor over-copies, then the other counts' rises and the gauges by name,
+    /// the gauges as they are; a count that fell, a new device's, reads as it is.
     #[test]
     fn an_rt_part_says_what_rose_with_each_copy_cause_by_name() {
         let mut before = rt::Metrics::default();
@@ -157,7 +199,23 @@ mod tests {
         now.over_copy_bytes = 4_096;
         now.over_copy_bytes_dma_buf = 4_000;
         now.over_copy_bytes_pitch = 96;
+        before.texture_clears = 5;
+        before.texture_clear_bytes = 1_000_000;
+        before.barriers = 40;
+        now.texture_clears = 7;
+        now.texture_clear_bytes = 1_000_000 + 524_288;
+        now.texture_clear_barriers = 1;
+        now.external_acquires = 2;
+        now.barriers = 40 + 9;
+        now.held_releases = 3;
+        now.held_release_bytes = 16_777_216 + 65_536;
+        now.held_release_starts = 1;
         let mut gauges = rt::Gauges::default();
+        gauges.textures = 12;
+        gauges.textures_copied_over = 2;
+        gauges.texture_block_bytes = 20_971_520;
+        gauges.texture_own_bytes = 33_554_432;
+        gauges.spilled_bytes = 0;
         gauges.texture_block_held_bytes = 50_331_648;
         gauges.texture_block_sparse_bytes = 16_777_216;
         gauges.texture_block_sparse_blocks = 1;
@@ -171,7 +229,11 @@ mod tests {
              1.5 ms), the longest since the device was made 4.2 ms; submits 60 in 312.5 ms (2 \
              over 100 ms), the longest since the device was made 140.0 ms; queue-lock waits 2.3 \
              ms, the longest since the device was made 0.9 ms; bytes copied 4672: staging 64, \
-             attachment reads 512, over-copies 4096 (dma-buf 4000, pitch 96); gauges \
+             attachment reads 512, over-copies 4096 (dma-buf 4000, pitch 96); counted \
+             texture_clears 2, texture_clear_bytes 524288, texture_clear_barriers 1, \
+             external_acquires 2, barriers 9, held_releases 3, held_release_bytes 16842752, \
+             held_release_starts 1; gauges textures 12, textures_copied_over 2, \
+             texture_block_bytes 20971520, texture_own_bytes 33554432, spilled_bytes 0, \
              texture_block_held_bytes 50331648, texture_block_sparse_bytes 16777216, \
              texture_block_sparse_blocks 1, private_take_held_bytes 33554432, private_take_bytes \
              18874368, private_take_sparse_bytes 16777216, private_take_sparse_allocations 1"
@@ -185,7 +247,11 @@ mod tests {
         );
         assert!(
             part.ends_with(
-                "over-copies 0; gauges texture_block_held_bytes 0, texture_block_sparse_bytes 0, \
+                "over-copies 0; counted texture_clears 0, texture_clear_bytes 0, \
+                 texture_clear_barriers 0, external_acquires 0, barriers 0, held_releases 0, \
+                 held_release_bytes 0, held_release_starts 0; gauges textures 0, \
+                 textures_copied_over 0, texture_block_bytes 0, texture_own_bytes 0, spilled_bytes \
+                 0, texture_block_held_bytes 0, texture_block_sparse_bytes 0, \
                  texture_block_sparse_blocks 0, private_take_held_bytes 0, private_take_bytes 0, \
                  private_take_sparse_bytes 0, private_take_sparse_allocations 0"
             ),
