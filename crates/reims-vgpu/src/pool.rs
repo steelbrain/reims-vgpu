@@ -11,13 +11,14 @@
 //! own length on its context's worker (`takes`), so only that take waits for the source's
 //! allocation. The pool's thread, `reims-vgpu.graphics-pool`, places each block taken, the takes'
 //! before the taker's, at the lowest free address of the range that holds it, 2 MiB aligned, so
-//! pieces go out in ascending addresses, and asks the host to map it there ([`PoolHost::add`])
-//! with no lock of the pool's held: it waits for no source, so neither another context's take nor
-//! the headroom waits behind a take's allocation, nor a take behind the headroom's. The host maps
-//! it (QEMU: a RAM region of its own over the block, added on its main loop) and says so
-//! ([`Pool::added`], the C API's "range added"); only then does [`Pool::find`] find it. A block
-//! the source hands out again after the pool gave it back is placed and mapped anew, as any block
-//! is: its piece went before it went back.
+//! pieces go out in ascending addresses, carves a take's block for it at its piece's first byte,
+//! and asks the host to map it there ([`PoolHost::add`]) with no lock of the pool's held: it waits
+//! for no source, so neither another context's take nor the headroom waits behind a take's
+//! allocation, nor a take behind the headroom's. The host maps it (QEMU: a RAM region of its own
+//! over the block, added on its main loop) and says so ([`Pool::added`], the C API's "range
+//! added"); only then does [`Pool::find`] find it. A block the source hands out again after the
+//! pool gave it back is placed and mapped anew, as any block is: its piece went before it went
+//! back.
 //!
 //! # Headroom and giving blocks back
 //!
@@ -167,7 +168,8 @@ pub const TAKE_WAITS_CODE: &str = "pool-take-waits";
 
 /// The codes of the answered takes' waits, from each take's carry-out to its answer (`takes`):
 /// the whole wait, then its parts behind the context's earlier takes, for a piece of the take's
-/// own, and the take worker's zeroing; each the nanoseconds in all, then the longest.
+/// own, and the take worker's zeroing, which for a piece of its own runs while the host maps the
+/// piece and is left out of the wait for it; each the nanoseconds in all, then the longest.
 pub const TAKE_WAIT_CODES: [(&str, &str); 4] = [
     ("pool-take-wait-ns", "pool-take-wait-max-ns"),
     ("pool-take-wait-queue-ns", "pool-take-wait-queue-max-ns"),
@@ -435,8 +437,8 @@ struct State {
     /// thread to place before any of [`Self::ahead`]'s (`takes`).
     own: VecDeque<Own>,
     /// The takes waiting for their own blocks' places, by number, with where each one's piece
-    /// went once it was placed: `Some(None)` where no piece came of it (`takes`).
-    waits: HashMap<u64, Option<Option<u64>>>,
+    /// went once it was placed (`takes`).
+    waits: HashMap<u64, Option<Placed>>,
     /// The source, for the take workers' own blocks: let go of at the device's release.
     source: Option<Arc<dyn BlockSource>>,
     /// The contexts' blocks of the pool, by guest physical address (`takes`).
@@ -483,12 +485,32 @@ struct Ask {
     length: u64,
 }
 
-/// A block a take worker took for its take (`takes`), and the number of the take's wait on its
-/// place.
+/// A block a take worker took for its take (`takes`), and the take.
 #[derive(Clone, Copy, Debug)]
 struct Own {
     block: BlockInfo,
+    take: OwnTake,
+}
+
+/// The take a take worker took a block for: the number of its wait on the block's place, and the
+/// take, `len` bytes of `context`'s takes numbered `life`, which the pool's thread carves at the
+/// block's piece's first byte as it places it.
+#[derive(Clone, Copy, Debug)]
+struct OwnTake {
     wait: u64,
+    context: u32,
+    life: u64,
+    len: u64,
+}
+
+/// Where a take's own block went (`takes`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Placed {
+    /// No piece came of it.
+    Nowhere,
+    /// Its piece's address, and the take's carve at the piece's first byte, by number, where the
+    /// pool's thread carved it there.
+    At(u64, Option<u64>),
 }
 
 impl State {
@@ -1022,11 +1044,11 @@ impl Shared {
                 return;
             }
             let next = match st.own.pop_front() {
-                Some(own) => Some((own.block, Some(own.wait))),
+                Some(own) => Some((own.block, Some(own.take))),
                 None => st.ahead.pop_front().map(|block| (block, None)),
             };
-            if let Some((block, wait)) = next {
-                self.place(&mut st, source, block, wait);
+            if let Some((block, take)) = next {
+                self.place(&mut st, source, block, take);
                 continue;
             }
             if let Some((at, len)) = st.next_remove() {
@@ -1115,22 +1137,32 @@ impl Shared {
         (None, next)
     }
 
-    /// Places `block` at the lowest free address that holds it, where a take waits on it
-    /// (`wait`) says where it went, and asks the host to map it, with the lock `st` holds let go
-    /// of for the add. No piece comes of it, and it goes back, where the range is full or the
-    /// block is not whole host pages ([`UNALIGNED_CODE`]).
+    /// Places `block` at the lowest free address that holds it and asks the host to map it, with
+    /// the lock `st` holds let go of for the add. Where `take` still waits on it, the take is
+    /// carved at the piece's first byte, and learns where it went before the add, so its worker
+    /// zeroes the carve while the host maps the piece (`takes`). No piece comes of it, and it goes
+    /// back, where the range is full or the block is not whole host pages ([`UNALIGNED_CODE`]).
     fn place(
         self: &Arc<Self>,
         st: &mut MutexGuard<'_, State>,
         source: &dyn BlockSource,
         block: BlockInfo,
-        wait: Option<u64>,
+        take: Option<OwnTake>,
     ) {
         let placed = self.fit_piece(st, source, block);
-        if let Some(wait) = wait
-            && let Some(outcome) = st.waits.get_mut(&wait)
+        if let Some(take) = take
+            && st.waits.contains_key(&take.wait)
         {
-            *outcome = Some(placed.map(|(at, _)| at));
+            let outcome = match placed {
+                Some((at, _)) => {
+                    let carved = (st.stands(take.context, take.life))
+                        .then(|| st.carve_first(take.context, take.len, at))
+                        .flatten();
+                    Placed::At(at, carved)
+                }
+                None => Placed::Nowhere,
+            };
+            st.waits.insert(take.wait, Some(outcome));
         }
         let start = placed.is_some() && st.start_zeroer();
         MutexGuard::unlocked(st, || {

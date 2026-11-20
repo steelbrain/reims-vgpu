@@ -949,8 +949,9 @@ device takes as many as its GPU device's memory heaps hold, every heap summed (`
 then reserves (`rvg_graphics_device_pool_range`). The pool's taker takes Shared blocks from its
 block source for the pool's own asks, and a take that fits no piece takes a block of its own length
 on its context's take worker, so only that take waits for the source's allocation. The pool's thread
-places each block, the takes' first, at the range's lowest free 2 MiB-aligned address, and has the
-host map it there (`pool_add`); a piece is found only once the host says it is in (`pool_added`).
+places each block, the takes' first, at the range's lowest free 2 MiB-aligned address, carves a
+take's block for it at its piece's first byte, and has the host map it there (`pool_add`), while the
+take's worker zeroes the carve; a piece is found only once the host says it is in (`pool_added`).
 The source is rt's blocks (`pool::RtBlocks`, the platform's `ApiPlatform::block_source`), each known
 to its device while handed out; where a platform gives none (the testkit's), it is `HostBlocks`, the
 process's own memory, in the same shape (`take_block`, `release_block`). A piece the pool asks for

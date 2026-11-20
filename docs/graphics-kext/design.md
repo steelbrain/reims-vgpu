@@ -4860,8 +4860,9 @@ reads it once.
   own worker (`reims-vgpu.graphics-pool-take`) zeroes the block through the
   host's mapping and answers. Where nothing fit, the worker first takes a
   block of the take's length from rt itself, so only that take waits for
-  rt's allocation, and the pool's thread places it ahead of the headroom's
-  blocks; the worker carves the take once the host has mapped it. rt says
+  rt's allocation; the pool's thread places it ahead of the headroom's
+  blocks and carves the take at its first byte, and the worker zeroes the
+  take while the host maps the piece, answering once it is mapped. rt says
   nothing of a block's bytes as it hands it out, so bytes no block of the
   piece held before are zeroed too. Ahead
   of the takes, the pool's zeroer (`reims-vgpu.graphics-pool-zero`) zeroes,
