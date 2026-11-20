@@ -1,6 +1,7 @@
 //! Builds `tests/c/harness.c` against the committed `include/reims_vgpu.h`, links it to this
 //! crate's dynamic library, and runs it. The harness uses the platform the library is built on, as
-//! a C host does: `VulkanPlatform`, over MoltenVK on macOS. On Windows it links the DLL's import
+//! a C host does: by default the one over metal2vulkan-rt, which on macOS runs on Mesa's
+//! KosmicKrisp, found beside the harness ([`link_vulkan`]). On Windows it links the DLL's import
 //! library.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -55,6 +56,8 @@ fn compile(source: &Path, out: &Path) {
 struct Harness {
     dir: PathBuf,
     bin: PathBuf,
+    /// The Vulkan files [`link_vulkan`] found missing, each its path: none off macOS.
+    vulkan_missing: Vec<String>,
 }
 
 impl Drop for Harness {
@@ -71,7 +74,50 @@ fn harness(name: &str) -> Harness {
     std::fs::create_dir_all(&dir).unwrap();
     let bin = dir.join(format!("harness{}", std::env::consts::EXE_SUFFIX));
     compile(&crate_dir().join("tests/c/harness.c"), &bin);
-    Harness { dir, bin }
+    #[cfg(target_os = "macos")]
+    let vulkan_missing = link_vulkan(&dir);
+    #[cfg(not(target_os = "macos"))]
+    let vulkan_missing = Vec::new();
+    Harness {
+        dir,
+        bin,
+        vulkan_missing,
+    }
+}
+
+/// The Vulkan files the rt platform loads on macOS, under Homebrew's prefix: the loader, and
+/// Mesa's KosmicKrisp, each through its formula's `opt` directory, the files `make vulkan-links`
+/// links for QEMU.
+#[cfg(target_os = "macos")]
+const VULKAN_FILES: [&str; 2] = [
+    "opt/vulkan-loader/lib/libvulkan.1.dylib",
+    "opt/mesa/lib/libvulkan_kosmickrisp.dylib",
+];
+
+/// Links [`VULKAN_FILES`] into `dir`, beside the harness: the rt platform loads each only from
+/// beside the process's executable or from `../lib` from it (reims-vgpu-vulkan's
+/// `os/macos/rt_driver.rs`), as a QEMU install has them in its `lib`. Returns each file Homebrew
+/// lacks, or Homebrew itself where `brew --prefix` answers none.
+#[cfg(target_os = "macos")]
+fn link_vulkan(dir: &Path) -> Vec<String> {
+    let prefix = match Command::new("brew").arg("--prefix").output() {
+        Ok(out) if out.status.success() => {
+            PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+        }
+        _ => return vec!["Homebrew (`brew --prefix` answered none)".to_owned()],
+    };
+    let mut missing = Vec::new();
+    for file in VULKAN_FILES {
+        let from = prefix.join(file);
+        if from.is_file() {
+            let at = dir.join(from.file_name().unwrap());
+            std::os::unix::fs::symlink(&from, &at)
+                .unwrap_or_else(|e| panic!("{}: {e}", at.display()));
+        } else {
+            missing.push(from.display().to_string());
+        }
+    }
+    missing
 }
 
 /// Runs the harness with `args`. Windows has no rpath: the DLL's directory leads the harness's
@@ -98,6 +144,12 @@ fn run(h: &Harness, args: &[&str]) -> Output {
 #[test]
 fn c_harness_passes() {
     let h = harness("run");
+    assert!(
+        h.vulkan_missing.is_empty(),
+        "the harness's library has no Vulkan driver to run on: {} missing (on macOS 26 or later, \
+         brew install vulkan-loader mesa)",
+        h.vulkan_missing.join(" and ")
+    );
     let out = run(&h, &[]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
