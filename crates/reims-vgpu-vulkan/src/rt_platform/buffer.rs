@@ -260,6 +260,35 @@ pub const DEFERRED_ON_USE_CODE: &str = "rt-deferred-buffers-made-on-use";
 /// The code of a deferred buffer that went with its memory never made, counted per buffer.
 pub const DEFERRED_GONE_UNMADE_CODE: &str = "rt-deferred-buffers-released-unmade";
 
+/// The codes of a deferred buffer whose memory is not made, counted as it is made and as its
+/// memory is made or it goes unmade, and the most so at once.
+pub const DEFERRED_UNMADE: crate::answer::MadeCodes = crate::answer::MadeCodes {
+    made: "rt-deferred-buffers-unmade",
+    live_most: "rt-deferred-buffers-unmade-live-most",
+};
+
+/// The code whose count is the longest block take of a deferred buffer's memory, in nanoseconds
+/// (`Device::take_block`, which allocates where no free range fits).
+pub const DEFERRED_TAKE_NS_MOST_CODE: &str = "rt-deferred-buffers-take-ns-most";
+
+/// The code whose count is the longest make of a deferred buffer's rt buffer over its block, in
+/// nanoseconds (`Device::new_buffer`, which asks its zeros).
+pub const DEFERRED_BUFFER_NS_MOST_CODE: &str = "rt-deferred-buffers-buffer-ns-most";
+
+/// The code whose count is the nanoseconds of rt's allocations on the consumer's threads while the
+/// block takes of deferred buffers' memory ran (`Metrics::consumer_allocation_nanos`, every
+/// thread's: an allocation of another thread's beside a take counts too).
+pub const DEFERRED_TAKE_ALLOCATION_NS_CODE: &str = "rt-deferred-buffers-take-allocation-ns";
+
+/// The code whose count is the most bytes of rt's Private allocations (`Gauges::
+/// private_allocation_bytes`: the blocks handed out, the free ranges between them and the idle
+/// allocations) seen after a take of a Private block ([`take`]), where they rise: the peak of
+/// the memory the platform's Private blocks hold, as of their takes.
+pub const PRIVATE_ALLOCATION_MOST_CODE: &str = "rt-private-allocation-bytes-most";
+
+/// The most bytes of rt's Private allocations seen after a take ([`PRIVATE_ALLOCATION_MOST_CODE`]).
+static PRIVATE_ALLOCATION_MOST: AtomicU64 = AtomicU64::new(0);
+
 /// The codes of the deferred buffers' makes by what they were made for: each [`MemoryFor`]'s, by
 /// its discriminant, then the use's own ([`DEFERRED_ON_USE_CODE`]): the count of makes, and the
 /// longest one, in nanoseconds.
@@ -466,19 +495,38 @@ impl RtBuffer {
         if let Some(made) = self.rt.get() {
             return Some(made);
         }
+        // As `own`'s, its two calls of rt's timed apart ([`DeferredSplit`]).
+        let length = deferred.length;
+        let allocated = allocations_now();
         let start = rt::host_time();
-        let made = own(
-            &self.device,
-            DEFERRED_SEL,
-            rt::MemoryClass::Private,
-            deferred.length,
-        );
-        let took = rt::host_time().saturating_sub(start);
+        let block = take(&self.device, DEFERRED_SEL, rt::MemoryClass::Private, length);
+        let taken = rt::host_time();
+        let made = block.and_then(|block| {
+            match (self.device.rt()).new_buffer(block.id, 0, length, Some(0)) {
+                Ok(made) => Some(made),
+                Err(error) => {
+                    rt_refused_create(DEFERRED_SEL, &error);
+                    None
+                }
+            }
+        });
+        let end = rt::host_time();
+        let took = end.saturating_sub(start);
         let Some(made) = made else {
             crate::answer::count_kind(DEFERRED_REFUSED_CODE);
             return None;
         };
+        DeferredSplit {
+            length,
+            made_for,
+            take: taken.saturating_sub(start),
+            buffer: end.saturating_sub(taken),
+            allocations: (allocations_now().zip(allocated))
+                .map(|(a, b)| (a.0.saturating_sub(b.0), a.1.saturating_sub(b.1))),
+        }
+        .count();
         crate::answer::count_made(DEFERRED_MADE);
+        crate::answer::count_gone(DEFERRED_UNMADE);
         crate::answer::count_kind_by(DEFERRED_MADE_NS_CODE, took);
         let most = DEFERRED_MOST_NS.fetch_max(took, Ordering::Relaxed);
         crate::answer::count_kind_by(DEFERRED_MADE_NS_MOST_CODE, took.saturating_sub(most));
@@ -494,6 +542,58 @@ impl RtBuffer {
 /// The longest a deferred buffer's memory took to make, in nanoseconds
 /// ([`DEFERRED_MADE_NS_MOST_CODE`]).
 static DEFERRED_MOST_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The longest take, buffer's make and whole make of a deferred buffer's memory so far, which
+/// [`DEFERRED_TAKE_NS_MOST_CODE`] and [`DEFERRED_BUFFER_NS_MOST_CODE`] rise to, and past which a
+/// make is logged ([`DeferredSplit`]).
+static DEFERRED_SPLIT_MOST: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// One deferred buffer's memory made (the module's docs, "Deferred memory"), of `length` bytes,
+/// for `made_for` (`None`, the use itself): its two calls of rt's apart, the block's take
+/// (`Device::take_block`, which allocates where no free range fits) and the buffer's make over it
+/// (`Device::new_buffer`, which asks its zeros), in nanoseconds; and rt's allocations on the
+/// consumer's threads while the take ran, how many and their nanoseconds.
+struct DeferredSplit {
+    length: u64,
+    made_for: Option<MemoryFor>,
+    take: u64,
+    buffer: u64,
+    allocations: Option<(u64, u64)>,
+}
+
+impl DeferredSplit {
+    /// Counted ([`DEFERRED_TAKE_NS_MOST_CODE`], [`DEFERRED_BUFFER_NS_MOST_CODE`],
+    /// [`DEFERRED_TAKE_ALLOCATION_NS_CODE`]), and logged where the make is the longest so far.
+    fn count(&self) {
+        let rise = |at: usize, value: u64| {
+            let was = DEFERRED_SPLIT_MOST[at].fetch_max(value, Ordering::Relaxed);
+            value.saturating_sub(was)
+        };
+        let (allocations, allocation_ns) = self.allocations.unwrap_or((0, 0));
+        crate::answer::count_kind_by(DEFERRED_TAKE_NS_MOST_CODE, rise(0, self.take));
+        crate::answer::count_kind_by(DEFERRED_BUFFER_NS_MOST_CODE, rise(1, self.buffer));
+        crate::answer::count_kind_by(DEFERRED_TAKE_ALLOCATION_NS_CODE, allocation_ns);
+        let whole = self.take.saturating_add(self.buffer);
+        if rise(2, whole) > 0 {
+            let ms = |ns: u64| ns as f64 / 1e6;
+            let made_for = self
+                .made_for
+                .map_or("its use".to_owned(), |m| format!("{m:?}"));
+            log::info!(
+                target: TARGET,
+                "a deferred buffer's memory of {} KiB took {:.3} ms to make for {made_for}, the \
+                 longest yet: its block's take {:.3} ms ({allocations} allocations of rt's on \
+                 the consumer's threads, {:.3} ms, while it ran), the buffer over it {:.3} ms",
+                self.length.div_ceil(1024),
+                ms(whole),
+                ms(self.take),
+                ms(allocation_ns),
+                ms(self.buffer)
+            );
+        }
+    }
+}
 
 /// The longest a deferred buffer's memory took to make for each use, in nanoseconds, by the index
 /// of its codes in [`DEFERRED_FOR_CODES`].
@@ -530,7 +630,10 @@ impl Drop for RtBuffer {
             crate::answer::count_gone(DEFERRED);
             match self.rt.get() {
                 Some(_) => crate::answer::count_gone(DEFERRED_MADE),
-                None => crate::answer::count_kind(DEFERRED_GONE_UNMADE_CODE),
+                None => {
+                    crate::answer::count_kind(DEFERRED_GONE_UNMADE_CODE);
+                    crate::answer::count_gone(DEFERRED_UNMADE);
+                }
             }
         }
     }
@@ -842,6 +945,7 @@ pub fn deferred_of_length(
         return made(device, sel, length, o, None, None);
     }
     crate::answer::count_made(DEFERRED);
+    crate::answer::count_made(DEFERRED_UNMADE);
     Some(RtObj::new(RtBuffer {
         rt: OnceLock::new(),
         deferred: Some(Deferred {
@@ -1084,7 +1188,9 @@ fn in_known(
     }
 }
 
-/// A block of `class` for `length` bytes, for `sel`; `None` where rt refuses it, counted.
+/// A block of `class` for `length` bytes, for `sel`; `None` where rt refuses it, counted. A
+/// Private one's take counts rt's Private allocations where they rise past their most
+/// ([`PRIVATE_ALLOCATION_MOST_CODE`]).
 pub(super) fn take(
     device: &RtObj<RtDevice>,
     sel: &'static str,
@@ -1092,7 +1198,14 @@ pub(super) fn take(
     length: u64,
 ) -> Option<rt::Block> {
     match device.rt().take_block(class, length) {
-        Ok(block) => Some(block),
+        Ok(block) => {
+            if class == rt::MemoryClass::Private {
+                let now = device.rt().counters().gauges().private_allocation_bytes;
+                let was = PRIVATE_ALLOCATION_MOST.fetch_max(now, Ordering::Relaxed);
+                crate::answer::count_kind_by(PRIVATE_ALLOCATION_MOST_CODE, now.saturating_sub(was));
+            }
+            Some(block)
+        }
         Err(error) => {
             rt_refused_create(sel, &error);
             None
