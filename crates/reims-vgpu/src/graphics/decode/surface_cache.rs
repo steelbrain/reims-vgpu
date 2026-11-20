@@ -305,15 +305,17 @@
 //!   flight never shares one. A copy whose takes leave no whole piece among the spares hands a
 //!   top-up to a thread of theirs ([`SPARES_THREADS`]), which nothing waits for: it makes whole
 //!   pieces until the spares hold [`SPARE_BYTES`] of them, letting go of shorter ones to fit,
-//!   each make under the device's reset gate. A release's copy out finds its pieces made ahead:
-//!   where the spares and the pieces reserved for its block lack some a copy of all of the
-//!   cache's bytes would take ([`SurfaceCaches::lacking`]), they are made on the releases' pace's
-//!   thread ([`ReleasePace`]) with no lock of the caches' held, and reserved for the block
-//!   ([`SurfaceCaches::reserved`]) before the release is carried out, so neither ring 0 nor the
-//!   caches' lock waits for a make; the copy takes them first, and the spares take back on their
-//!   thread what it leaves. Any other copy that finds no spare still makes its piece on its own
-//!   thread, under the caches' lock, counted (`rt-staging-piece-makes-locked`). Each piece taken
-//!   is counted (`rt-staging-pieces`, and
+//!   each make under the device's reset gate. A use's fill, at once or deferred, and a release's
+//!   copy out find their pieces made ahead: where the spares and the pieces reserved for the
+//!   block lack some a copy of all of the bytes it may move would take
+//!   ([`SurfaceCaches::lacking`]), they are made with no lock of the caches' held and reserved
+//!   for the block ([`SurfaceCaches::reserved`]): a fill's by the thread that begins the use's
+//!   command buffer, the lock let go of once for them ([`Caches::before_answering`]); a
+//!   release's on the releases' pace's thread ([`ReleasePace`]) before the release is carried
+//!   out, so ring 0 waits for no make either. The copy takes them first, and the spares take
+//!   back on their thread what it leaves. Any other copy that finds no spare still makes its
+//!   piece on its own thread, under the caches' lock, counted (`rt-staging-piece-makes-locked`).
+//!   Each piece taken is counted (`rt-staging-pieces`, and
 //!   `rt-staging-pieces-spared` those a spare served), and each a copy made, with the
 //!   nanoseconds its make took in all and the longest, for a cache's first staged copy
 //!   (`rt-staging-piece-makes-first`, `-first-ns`, `-first-max-ns`, `-first-kib`) apart from
@@ -15024,6 +15026,42 @@ pub(super) mod tests {
             }
         }
         (topped, rest)
+    }
+
+    /// Where the caches' copies are staged, a use whose fill lacks pieces the spares do not hold
+    /// has them made as its command buffer begins with the caches' lock let go of, and reserved
+    /// for its block: the fill takes them, its CPU's bytes in them, and makes none under the lock
+    /// ([`PIECE_MAKES_LOCKED`])
+    #[test]
+    fn a_staged_fills_pieces_are_made_with_the_caches_lock_let_go_of() {
+        let mut r = rig(8);
+        r.dec.set_staged_surface_copies(Arc::default());
+        queues(&mut r);
+        let page = r.page;
+        let length = 2 * page;
+        let written = ram_bytes(&r, 1, length, Some(0x11));
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], length, true),
+            RGFX_STATUS_OK
+        );
+        let locked = counted(PIECE_MAKES_LOCKED);
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        let calls = r.p.call_log().since(mark);
+        let made: Vec<Option<u64>> = (calls.iter())
+            .filter(|c| c.sel == SCRATCH_BUFFER)
+            .map(|c| c.args[0].as_u64())
+            .collect();
+        let lens = pack(std::iter::once(0..length), PIECE).lens;
+        assert_eq!(made, lens.into_iter().map(Some).collect::<Vec<_>>(), "its piece made");
+        let filled = copies(&calls);
+        assert_eq!(filled.len(), 1);
+        assert_eq!(
+            buffer_bytes(&r, filled[0].0, None)[..written.len()],
+            written,
+            "the CPU's bytes, in the piece reserved for the fill"
+        );
+        assert_eq!(counted(PIECE_MAKES_LOCKED), locked, "none made under the lock");
     }
 
     /// Where the caches' copies are staged, a release whose copy lacks pieces the spares do not
