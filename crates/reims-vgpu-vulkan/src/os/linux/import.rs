@@ -257,15 +257,36 @@ fn folds_after_import(device: &rt::Device) -> bool {
 
 /// Whether a device of the process imports by pointer only pages mapped from their files: learned
 /// of each device as it is made ([`learn_view_imports`]), and set where any refuses a view through
-/// dma-bufs. From then on views are mapped from their files (`super::vm`'s module docs, "Imports
-/// of views").
+/// dma-bufs; on the rt platform, at the first import of a view mapped through dma-bufs that rt
+/// takes through none of them ([`views_need_files`]). From then on views are mapped from their
+/// files (`super::vm`'s module docs, "Imports of views").
 static IMPORTS_NEED_FILES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Whether a device of the process imports by pointer only pages mapped from their files
-/// ([`learn_view_imports`]).
+/// ([`learn_view_imports`], [`views_need_files`]).
 pub(crate) fn imports_need_files() -> bool {
     IMPORTS_NEED_FILES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Views are mapped from their files from now on ([`IMPORTS_NEED_FILES`]): an import of a view
+/// mapped through dma-bufs was taken through none of them, for `why`, so its pages go to the
+/// device by their pointer, mapped from their files first (`super::vm`'s `unfold`). The rt
+/// platform's answer at that refusal (`crate::rt_platform`'s `buffer` docs, "Pages no pin
+/// takes"), where no probe runs as the device is made: a later view is mapped from its files at
+/// once, so its import maps none of its pages again. Logged the first time, with what the
+/// budget then leaves imports (`super::budget`'s `warn_if_imports_short`).
+#[cfg(feature = "rt")]
+pub(crate) fn views_need_files(why: &str) {
+    if IMPORTS_NEED_FILES.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    log::info!(
+        target: "reims_vgpu_vulkan::os",
+        "an import of a view of guest pages mapped through dma-bufs was taken through none of \
+         them ({why}): views are mapped from their files from now on"
+    );
+    budget::warn_if_imports_short();
 }
 
 /// Whether the device that needs imported pages mapped from their files ([`IMPORTS_NEED_FILES`])

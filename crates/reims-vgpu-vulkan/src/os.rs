@@ -88,6 +88,11 @@ pub use host_os::{LendRefusal, LentDmaBuf, dma_buf_of_host, map_for_pointer};
 /// (`os/linux/device_lend.rs`).
 #[cfg(all(target_os = "linux", feature = "rt"))]
 pub(crate) use host_os::{MappingsHeld, dma_bufs_of_host, hold_mappings, through_dma_bufs};
+/// Whether views are mapped from their files for the imports of their pages, and its setting at
+/// the rt platform's first import of a view mapped through dma-bufs that rt takes through none of
+/// them, on Linux (`os/linux/import.rs`).
+#[cfg(all(target_os = "linux", feature = "rt"))]
+pub(crate) use host_os::{imports_need_files, views_need_files};
 #[cfg(test)]
 pub(crate) use host_os::{PAGE, mapped, writable};
 /// Whether one dma-buf takes the pages of a range, as the runtime asks for a texture's own, of a

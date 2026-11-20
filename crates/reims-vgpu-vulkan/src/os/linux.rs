@@ -28,6 +28,8 @@ pub use clock::LinuxClock;
 pub use device_lend::{LendRefusal, LentDmaBuf, dma_buf_of_host, map_for_pointer};
 #[cfg(feature = "rt")]
 pub(crate) use device_lend::{MappingsHeld, dma_bufs_of_host, hold_mappings, through_dma_bufs};
+#[cfg(feature = "rt")]
+pub(crate) use import::{imports_need_files, views_need_files};
 pub use lease::{GuestMemoryLease, lease_guest_memory};
 pub use plane_copy::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFill, PlaneFormat};
 pub use threads::LinuxThreads;

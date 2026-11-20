@@ -109,10 +109,14 @@
 //! ([`IMPORTS_FROM_FILES_NO_DMA_BUF`]), the process's first of each with a line saying why, rt's
 //! refusal named; where they cannot all be mapped so (near the views' budget), or rt refuses that
 //! pointer, they are imported as a copy, with no pointer of theirs asked of rt while a page of
-//! them lies in a dma-buf's mapping. Pages in no dma-buf's mapping go by their pointer first. From before an import asks where its pages
-//! lie until rt frees an import of their pointer, the platform holds their mappings as they are
-//! (`crate::os`'s `MappingsHeld`), so no fold of the views maps them through dma-bufs under it
-//! (`vm`'s docs, "Folding back").
+//! them lies in a dma-buf's mapping. The first such import maps every view made after it from its
+//! files at once, as the Vulkan platform's do where its device's probe finds them imported so
+//! (`crate::os`'s `views_need_files`): a later view's import then takes its pointer with nothing
+//! mapped again, where it would otherwise be mapped twice, through dma-bufs and then from its
+//! files. Pages in no dma-buf's mapping go by their pointer first. From before an import asks
+//! where its pages lie until rt frees an import of their pointer, the platform holds their
+//! mappings as they are (`crate::os`'s `MappingsHeld`), so no fold of the views maps them through
+//! dma-bufs under it (`vm`'s docs, "Folding back").
 //!
 //! **A copy at the refusal point.** Pages that rt imports neither by their pointer nor as
 //! dma-bufs of their files (on Linux past one dma-buf's limits where no several are imported, with
@@ -1234,6 +1238,9 @@ fn unpinnable(
         }
         Err(no) => no,
     };
+    // The refusal point: the views made from now on are mapped from their files at once, so their
+    // imports map none of their pages again (the module's docs, "Pages no pin takes").
+    crate::os::views_need_files(&no.why());
     if !crate::os::map_for_pointer(at, len) || crate::os::through_dma_bufs(at, len) {
         return refused(device, sel, codes, (at, len), then, &no, None);
     }
@@ -3325,7 +3332,8 @@ mod tests {
     /// made by its pointer once it is mapped from its files, counted as from its files and as why
     /// no dma-buf went, each once; else by its pointer. Where rt refuses that pointer too (RADV's,
     /// of a file's pages), made over a copy, counted as refused and copied. Its bytes are the
-    /// pages the view shows.
+    /// pages the view shows. Both views are made before either import, as the first import's
+    /// refusal maps every view made after it from its files (`crate::os`'s `views_need_files`).
     #[cfg(target_os = "linux")]
     #[test]
     fn views_whose_dma_buf_went_nowhere_count_why_on_vulkan() {
@@ -3348,9 +3356,9 @@ mod tests {
         ];
         let counts = || codes.map(counted);
         let vm = crate::os::OsVm::new();
-        let hooks = [(&HOST_MAKES_NO_DMA_BUF, 3), (&DMA_BUF_REFUSED, 4)];
-        for (hook, why) in hooks {
-            // Two pages of a file, 0x55s then 0x66s, and a view of them, the second first.
+        // Two pages of a file, 0x55s then 0x66s, and a view of them, the second first, for each
+        // hook.
+        let view = || {
             let ram = crate::os::allocate_aliasable(2 * page).expect("pages of a file");
             // SAFETY: fresh pages of the test's own, which nothing uses yet.
             unsafe {
@@ -3361,8 +3369,10 @@ mod tests {
             let runs = [(ram.wrapping_add(page), page), (ram, page)];
             assert!(vm.remap_runs_shared_overwrite(view, &runs).is_ok());
             let first = NonNull::new(view.as_ptr::<u8>()).expect("a mapped view");
-            let through = crate::os::through_dma_bufs(first, 2 * page);
-
+            (view, crate::os::through_dma_bufs(first, 2 * page))
+        };
+        let hooks = [(&HOST_MAKES_NO_DMA_BUF, 3, view()), (&DMA_BUF_REFUSED, 4, view())];
+        for (hook, why, (view, through)) in hooks {
             let before = counts();
             hook.set(true);
             // SAFETY: the view and its pages are the test's own, never freed.
@@ -3388,6 +3398,68 @@ mod tests {
             assert_eq!(read(view, 16), [0x66; 16]);
             assert_eq!(read(view.wrapping_add(page), 16), [0x55; 16]);
         }
+    }
+
+    /// On Linux, on the GPU the test holds, where views are mapped through dma-bufs: the first
+    /// import of one that goes through none of them, the host making no dma-buf of its pages
+    /// (`HOST_MAKES_NO_DMA_BUF`), maps every view made after it from its files at once
+    /// (`crate::os`'s `views_need_files`). A view of two runs made then lies in no dma-buf's
+    /// mapping, and its no-copy buffer maps none of its pages from their files again: by its
+    /// pointer, or, where rt refuses that (RADV's, of a file's pages), as a dma-buf of the files
+    /// behind them, or a copy, none counted as from its files. Its bytes are the pages the view
+    /// shows. Where views are not mapped through dma-bufs here, unchecked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn views_after_one_refused_through_dma_bufs_are_mapped_from_files_on_vulkan() {
+        use crate::core::num::ToUsize as _;
+        use crate::core::platform::os::vm::HostVm as _;
+
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let page = device.facts().page_size;
+        let vm = crate::os::OsVm::new();
+        // Two pages of a file, `first`s then `second`s, and a view of them, the second first.
+        let view = |first: u8, second: u8| {
+            let ram = crate::os::allocate_aliasable(2 * page).expect("pages of a file");
+            // SAFETY: fresh pages of the test's own, which nothing uses yet.
+            unsafe {
+                ram.as_ptr::<u8>().write_bytes(first, page.to_usize());
+                (ram.wrapping_add(page).as_ptr::<u8>()).write_bytes(second, page.to_usize());
+            }
+            let view = vm.allocate_anywhere(2 * page).expect("a range for a view");
+            let runs = [(ram.wrapping_add(page), page), (ram, page)];
+            assert!(vm.remap_runs_shared_overwrite(view, &runs).is_ok());
+            let at = NonNull::new(view.as_ptr::<u8>()).expect("a mapped view");
+            (view, crate::os::through_dma_bufs(at, 2 * page))
+        };
+        let (refused, through) = view(0x55, 0x66);
+        if !through {
+            eprintln!("views are not mapped through dma-bufs here: unchecked");
+            return;
+        }
+        assert!(!crate::os::imports_need_files(), "no import refused a view before");
+
+        HOST_MAKES_NO_DMA_BUF.set(true);
+        // SAFETY: the view and its pages are the test's own, never freed.
+        let bytes = unsafe { HostRange::new(refused, 2 * page) };
+        let made = device.new_buffer_over_host_memory(on, bytes, 0, None);
+        HOST_MAKES_NO_DMA_BUF.set(false);
+        let first = made.expect("never a raise").expect("a buffer over the view");
+        assert!(crate::os::imports_need_files(), "views are mapped from their files now");
+
+        let (later, through) = view(0x77, 0x88);
+        assert!(!through, "a view made after it lies in no dma-buf's mapping");
+        let from_files = counted(IMPORTS_FROM_FILES);
+        // SAFETY: the view and its pages are the test's own, never freed.
+        let bytes = unsafe { HostRange::new(later, 2 * page) };
+        let made = device.new_buffer_over_host_memory(on, bytes, 0, None);
+        let buffer = made.expect("never a raise").expect("a buffer over the view");
+        assert_eq!(counted(IMPORTS_FROM_FILES), from_files, "nothing mapped again");
+        assert_eq!((buffer.contents(), buffer.length()), (later, 2 * page));
+        assert_eq!(read(later, 16), [0x88; 16]);
+        assert_eq!(read(later.wrapping_add(page), 16), [0x77; 16]);
+        drop((first, buffer));
     }
 
     /// On Linux, on the GPU the test holds, where rt refuses both pages' pointer

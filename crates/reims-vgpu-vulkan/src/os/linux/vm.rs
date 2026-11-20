@@ -82,12 +82,14 @@
 //! memory type (measured 2026-10-27, RTX 5080 Laptop, Linux 7.2.8). A device that imports every
 //! page with a file behind it by a dma-buf of the pages (RADV, `super::import`'s module docs)
 //! pins none. So where a device of the process refuses such a view (`super::import`'s
-//! `learn_view_imports`, as the device is made), views are mapped from their files from then on,
-//! a mapping a run, and an import of a view made through dma-bufs before maps what of its pages
-//! lies in them from their files ([`unfold`]), until the import is made where the device keeps
-//! what it pinned (below, "Folding back"), else for as long as the view lives. Where those
-//! mappings would come within the headroom of the views' budget (`super::budget`'s `claim`), a
-//! view is mapped through dma-bufs there too, and no view ends the process. A no-copy buffer's or
+//! `learn_view_imports`, as the device is made; on the rt platform, at the first import of one
+//! that rt takes through none of its dma-bufs, `super::import`'s `views_need_files`), views are
+//! mapped from their files from then on, a mapping a run, and an import of a view made through
+//! dma-bufs before maps what of its pages lies in them from their files ([`unfold`]), until the
+//! import is made where the device keeps what it pinned (below, "Folding back"), else for as long
+//! as the view lives. Where those mappings would come within the headroom of the views' budget
+//! (`super::budget`'s `claim`), a view is mapped through dma-bufs there too, and no view ends the
+//! process. A no-copy buffer's or
 //! heap's import of pages left in dma-bufs for want of mappings, which the runtime asks the
 //! views' gate about, maps them from their files only short of that headroom, the views no import
 //! holds folded back first where that may free some ([`fold_short_due`]); past it the gate
