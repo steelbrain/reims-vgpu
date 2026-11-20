@@ -1395,7 +1395,15 @@ fn gpus(host: Host) {
         );
     }
     println!("Give a VM one with: reims-ctl set NAME --gpu NUMBER");
+    println!("{CROSSING}");
 }
+
+/// What a VM's window costs on a GPU that does not drive the screen, for `gpus` and the TUI's GPU
+/// field (the library's `rt_window` logs the route each window takes).
+pub const CROSSING: &str = "If your screen is plugged into a different GPU than the VM's, the \
+                            window system copies every frame across to it over the VM's GPU's \
+                            link: an RTX 3090 in a PCIe 3.0 x4 slot spends about 16 ms a frame \
+                            on it at 3648 x 2039.";
 
 /// `reims-ctl usb`: this host's USB devices, or a VM's choice of them, changed by `add` and
 /// `remove` first.

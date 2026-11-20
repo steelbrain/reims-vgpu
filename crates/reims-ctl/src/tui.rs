@@ -1566,8 +1566,14 @@ impl App {
         let help = if self.gpus.is_none() {
             "Looking for the host's GPUs…"
         } else {
-            "The GPU the library draws on. Automatic takes the only GPU, or, of several, a \
-             discrete GPU before an integrated one."
+            concat!(
+                "The GPU the library draws on. Automatic takes the only GPU, or, of several, a \
+                 discrete GPU before an integrated one. ",
+                // cli::CROSSING, which concat! cannot name.
+                "If your screen is plugged into a different GPU than the VM's, the window system \
+                 copies every frame across to it over the VM's GPU's link: an RTX 3090 in a PCIe \
+                 3.0 x4 slot spends about 16 ms a frame on it at 3648 x 2039."
+            )
         };
         Field::choice("gpu", "GPU", options, &selected, help)
     }
