@@ -5202,7 +5202,9 @@ mod tests {
                     height: 4,
                     ..TextureDesc::default()
                 };
-                let image = device.new_texture_for_views(&value).expect("an image for views");
+                let image = device
+                    .new_texture_for_views(&value)
+                    .expect("an image for views");
                 // rt may place none on this GPU, counted: then the image is the first alone.
                 let placed = device.new_placed_texture_for_views(&value);
                 let images: Vec<_> = std::iter::once(image).chain(placed).collect();
@@ -5243,7 +5245,9 @@ mod tests {
                     let selectors: &[&str] = if n == 0 { &[REPLACE, VIEW] } else { &[VIEW] };
                     for selector in selectors {
                         assert!(
-                            calls.iter().any(|c| c.selector == *selector && c.receiver == id),
+                            calls
+                                .iter()
+                                .any(|c| c.selector == *selector && c.receiver == id),
                             "no {selector} on image {id}: {calls:?}"
                         );
                     }
