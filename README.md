@@ -243,7 +243,7 @@ it needs itself; working on the code needs the following.
   Metal toolchain, with which the Vulkan platform's crate compiles its metallibs as it builds
   (`xcodebuild -downloadComponent MetalToolchain`), and Homebrew's `vulkan-loader` and `mesa`,
   whose KosmicKrisp, on macOS 26 and later, is the Vulkan driver the library runs on there. The
-  guest's kexts build with Xcode and a macOS 26 KDK (`guest/Makefile`).
+  guest's kexts build with Xcode alone (`guest/Makefile`).
 - clang and lld for the option ROM and the Ambrosia module (`firmware/`; on a Mac, Homebrew's
   `lld`). reims-ctl's build makes the module itself with clang and the Rust toolchain's own lld.
 - For `make qemu`: the `vendor/qemu` submodule (`git submodule update --init vendor/qemu`) and
