@@ -123,8 +123,9 @@ pub const ZERO_HOLD_MAX_NS_CODE: &str = "pool-zero-hold-max-ns";
 
 /// The codes of the longest each part of the zeroer's hold of the pool's lock for one chunk took
 /// so far (`takes`, "Zeros ahead"), in nanoseconds, their counts rising to it: the chunk's pick
-/// and claim (`State::next_zero`), and its mark as reading zero (`State::zeroed`). Its write lies
-/// between them, with the lock let go of.
+/// and claim (`State::next_zero`), and its mark as reading zero (`State::zeroed`) with the choice
+/// of whether to wake the pool's waiters. Its write lies between them, and the wake after the
+/// mark, each with the lock let go of.
 pub const ZERO_HOLD_PART_MAX_NS_CODES: [&str; 2] =
     ["pool-zero-hold-pick-max-ns", "pool-zero-hold-mark-max-ns"];
 

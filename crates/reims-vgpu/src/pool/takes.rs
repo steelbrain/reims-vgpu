@@ -40,7 +40,8 @@
 //! a [`super::PieceHold`] does ([`State::next_zero`]), lets the lock go while it writes the
 //! chunk's zeros through the piece's mapping, then, the lock held again, records the chunk in
 //! the piece as reading zero ([`Ranges`]) and lets the claim and the piece go
-//! ([`State::zeroed`]). Counted: its bytes ([`super::ZEROED_AHEAD_BYTES_CODE`]), its writes'
+//! ([`State::zeroed`]), and wakes the pool's waiters, where one waits for a mark, once the lock
+//! is let go of again. Counted: its bytes ([`super::ZEROED_AHEAD_BYTES_CODE`]), its writes'
 //! nanoseconds in all and the longest ([`super::ZERO_WRITE_NS_CODE`]), the longest it held the
 //! lock for a chunk ([`super::ZERO_HOLD_MAX_NS_CODE`]) with the longest of each of its parts, the
 //! pick and the mark, and each hold longer than [`super::ZERO_HOLD_LONG`] with its parts' time
@@ -1142,7 +1143,6 @@ impl Shared {
             });
             let marking = (self.now)();
             st.zeroed(piece, range);
-            let marked = (self.now)();
             #[cfg(test)]
             {
                 st.zeroed_by[1] = st.zeroed_by[1].saturating_add(len);
@@ -1151,14 +1151,18 @@ impl Shared {
             // for the hold on a piece on its way out or at the release wait for a mark; a wake
             // of the rest at each chunk would cost the lock's other users for nothing.
             let gone = !(st.pieces.get(&piece)).is_some_and(|p| p.usable());
-            if st.claim_waits > 0 || st.closed || gone {
-                self.changed.notify_all();
-            }
+            let wake = st.claim_waits > 0 || st.closed || gone;
+            let marked = (self.now)();
             let parts = [
                 picked.saturating_duration_since(picking),
                 marked.saturating_duration_since(marking),
             ];
             MutexGuard::unlocked(&mut st, || {
+                // The wake comes once the lock is let go of: a waiter it wakes finds the lock
+                // free, never the zeroer holding it, and the mark is in the state it reads.
+                if wake {
+                    self.changed.notify_all();
+                }
                 count_kind_by(ZEROED_AHEAD_BYTES_CODE, len);
                 zero_written(written);
                 zero_held(parts);
