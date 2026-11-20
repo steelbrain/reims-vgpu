@@ -2265,5 +2265,4 @@ core::slice::sort::shared::smallsort::insertion_sort_shift_left::<(metal2vulkan_
 metal2vulkan::pipeline::link::graphics::graphics_state
 metal2vulkan::pipeline::link::graphics::textured_fetches
 metal2vulkan::pipeline::compile::compile_one
-metal2vulkan::spirv::serialize::serialize_for
 metal2vulkan::memory::provenance::fixpoint
