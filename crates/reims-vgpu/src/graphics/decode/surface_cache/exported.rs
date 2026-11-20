@@ -988,7 +988,8 @@ mod rt_windows_tests {
 
 /// On Windows, a video cache's surface over the plane draws' Direct3D 11 textures in the caches'
 /// rig: the plane shapes' fills a decode takes as met (the module doc).
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 mod drawn_tests {
     use reims_vgpu_graphics::ops::{RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
     use reims_vgpu_video::vaapi::PlaneDraw;
