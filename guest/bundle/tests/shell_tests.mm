@@ -22064,19 +22064,19 @@ void test_iosurface_cached()
 		[set addAllocation:view];
 		CHECK(throughSet().empty());
 		[set commit];
-		CHECK(is(throughSet(), block, 15, 0));
+		CHECK(is(throughSet(), block, 18, 0));
 		CHECK(encodesNothing().empty());
 		[queue addResidencySet:set];
-		CHECK(is(encodesNothing(), block, 15, 0));
+		CHECK(is(encodesNothing(), block, 18, 0));
 		cb = [queue commandBuffer];
 		ce = [cb computeCommandEncoder];
 		[ce useResource:t usage:MTLResourceUsageRead | MTLResourceUsageWrite];
 		[ce endEncoding];
-		CHECK(is(uses(cb), block, 15, RGFX_SURFACE_USE_WRITES));
+		CHECK(is(uses(cb), block, 18, RGFX_SURFACE_USE_WRITES));
 		[queue removeResidencySet:set];
 		CHECK(encodesNothing().empty());
 		[set removeAllocation:view];
-		CHECK(is(throughSet(), block, 15, 0));
+		CHECK(is(throughSet(), block, 18, 0));
 		[set commit];
 		CHECK(throughSet().empty());
 #endif
