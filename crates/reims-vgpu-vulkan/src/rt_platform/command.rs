@@ -130,7 +130,11 @@ impl Failure {
     /// The answer of rt's `error`, made at the first that is not `None` and kept.
     fn read(&self, error: Option<rt::CommandBufferError>) -> Option<NsErrorText> {
         let error = error?;
-        Some(self.error.get_or_init(|| ns_error(error, &self.hung)).clone())
+        Some(
+            self.error
+                .get_or_init(|| ns_error(error, &self.hung))
+                .clone(),
+        )
     }
 }
 
