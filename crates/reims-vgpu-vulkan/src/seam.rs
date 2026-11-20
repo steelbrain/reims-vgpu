@@ -1,5 +1,6 @@
 //! Our side of metal2vulkan-rt's seam: what the Vulkan platform gives rt, built on rt at the commit
-//! the workspace pins. Its tests run it on the GPU each test host holds, but on the Mac, whose Vulkan, MoltenVK, rt's floor refuses (it lacks `nullDescriptor`).
+//! the workspace pins. Its tests run it on the GPU each test host holds, but on the Mac: rt's floor
+//! refuses MoltenVK (it lacks `nullDescriptor`), and the tests have not run on KosmicKrisp.
 //!
 //! - **Sampler IDs** ([`sampler_ids`]): rt's creation of a pipeline state takes one sampler ID
 //!   for each sampler the state numbers, each constexpr sampler's an index of a live grant.

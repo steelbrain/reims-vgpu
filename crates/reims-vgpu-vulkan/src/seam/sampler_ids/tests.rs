@@ -90,7 +90,7 @@ fn kernel(library: &Library, name: &str) -> ComputePipelineDescriptor {
 #[test]
 #[cfg_attr(
     target_os = "macos",
-    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), and these have not run on KosmicKrisp, which the M3 Max lacks; ledger: rt on the Mac"
 )]
 fn on_vulkan_a_constexpr_sampler_takes_a_granted_id_an_equal_one_shares() {
     let device = device();
@@ -122,7 +122,7 @@ fn on_vulkan_a_constexpr_sampler_takes_a_granted_id_an_equal_one_shares() {
 #[test]
 #[cfg_attr(
     target_os = "macos",
-    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), and these have not run on KosmicKrisp, which the M3 Max lacks; ledger: rt on the Mac"
 )]
 fn on_vulkan_reads_and_writes_take_ids_beside_constexpr_samplers() {
     let device = device();
@@ -146,7 +146,7 @@ fn on_vulkan_reads_and_writes_take_ids_beside_constexpr_samplers() {
 #[test]
 #[cfg_attr(
     target_os = "macos",
-    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), and these have not run on KosmicKrisp, which the M3 Max lacks; ledger: rt on the Mac"
 )]
 fn on_vulkan_five_constexpr_samplers_take_five_ids() {
     let device = device();
@@ -163,7 +163,7 @@ fn on_vulkan_five_constexpr_samplers_take_five_ids() {
 #[test]
 #[cfg_attr(
     target_os = "macos",
-    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), and these have not run on KosmicKrisp, which the M3 Max lacks; ledger: rt on the Mac"
 )]
 fn on_vulkan_a_render_state_numbers_its_fragment_functions_read() {
     let device = device();
@@ -183,7 +183,7 @@ fn on_vulkan_a_render_state_numbers_its_fragment_functions_read() {
 #[test]
 #[cfg_attr(
     target_os = "macos",
-    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), and these have not run on KosmicKrisp, which the M3 Max lacks; ledger: rt on the Mac"
 )]
 fn on_vulkan_a_second_numbering_of_a_device_is_refused() {
     let device = device();
@@ -206,7 +206,7 @@ fn on_vulkan_a_second_numbering_of_a_device_is_refused() {
 #[test]
 #[cfg_attr(
     target_os = "macos",
-    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), and these have not run on KosmicKrisp, which the M3 Max lacks; ledger: rt on the Mac"
 )]
 fn on_vulkan_a_state_with_no_free_id_is_refused_holding_nothing() {
     let device = device();
@@ -231,7 +231,7 @@ fn on_vulkan_a_state_with_no_free_id_is_refused_holding_nothing() {
 #[test]
 #[cfg_attr(
     target_os = "macos",
-    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), so no rt device on the Mac before KosmicKrisp at the cutover; ledger: rt on the Mac"
+    ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), and these have not run on KosmicKrisp, which the M3 Max lacks; ledger: rt on the Mac"
 )]
 fn on_vulkan_a_state_rt_refuses_holds_no_id() {
     let device = device();
