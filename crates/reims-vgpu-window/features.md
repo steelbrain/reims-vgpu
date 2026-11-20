@@ -23,6 +23,7 @@ them; its `manual` checks are on a Linux host's guest boot.
 |---|---|
 | `REIMS_VGPU_WINDOW=0` | QEMU stays headless under `-display none` (QEMU reads it) |
 | `REIMS_VGPU_WINDOW_BORDERLESS=1` | borderless windows that fill their screens |
+| `REIMS_VGPU_WINDOW_SEAMLESS_INPUT=1` | on Linux, let the pointer cross the window freely and send the focus click to the guest |
 | `REIMS_VGPU_WINDOW_SCREENS=1,0` | display i opens on the host screen the list's i-th entry names |
 | `resolution=2560x1600` | the mode the window opens for, and the guest is offered until the window's pixels are known (QEMU's reims-graphics-pci property; 1920x1080 by default); with several displays, every window's |
 | `displays=2` | the reims-graphics device's displays, 1 to 4, a window each (QEMU's reims-graphics-pci property; 1 by default) |
@@ -427,7 +428,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: sdl::shell::the_last_show_or_hide_of_a_batch_decides`,
   `test: native::sdl_thread::render::a_hidden_window_takes_no_retry`, `manual`
 - Pointer: absolute, held at the image's nearest edge; five buttons; a
-  drag ends in the guest; the click that focuses the window is not sent;
+  drag ends in the guest; in capture mode the click that focuses the window is not sent;
   nothing is sent before the guest has a mode.
   `test: native::sdl_thread::input::sdl_buttons_are_the_hosts_bits`,
   `test: native::sdl_thread::input::a_drag_ends_in_the_guest_outside_the_window`,
@@ -462,6 +463,12 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: sdl::shell::the_end_lets_go_of_the_grab_and_the_holds`,
   `test: sdl::shell::the_pointer_is_held_over_the_image_in_whole_points`,
   `manual` (the grab and the hold)
+- Seamless input is optional on Linux. A click in the image, including the
+  click that gives the window focus, reaches the guest without a keyboard grab
+  or click-to-capture pointer confinement. The host pointer can cross the
+  window boundary, and a drag released outside still ends at the guest edge.
+  `test: native::sdl_thread::input::seamless_input_forwards_the_focus_click_without_capturing`,
+  `test: native::sdl_thread::input::a_seamless_drag_releases_at_the_edge_without_confining_the_pointer`
 - Scrolling: the wheel's notches, or, where the host takes smooth
   scrolling, its lines at 10 points each, in no gesture (SDL gives no
   phases); the guest gets the device's own direction.

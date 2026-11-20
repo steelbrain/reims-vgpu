@@ -12,7 +12,8 @@
 //! - **The pointer** once the guest has a mode, at the guest pixel under the host's pointer, held
 //!   at the image's nearest edge outside it; a move is sent where that pixel changes. A click in
 //!   the image captures the keyboard and the pointer; the click that focuses the window (one that
-//!   comes within [`FOCUS_CLICK_NS`] of the window gaining the keyboard) is not sent. A click
+//!   comes within [`FOCUS_CLICK_NS`] of the window gaining the keyboard) is not sent. In Linux's
+//!   optional seamless mode input stays free and the focus click reaches the guest. A click
 //!   outside the image is not sent and starts nothing. A button's release is sent wherever it
 //!   happens, so a drag that leaves the image ends in the guest. The left, middle and right
 //!   buttons and the two side buttons each have their bit.
@@ -139,6 +140,8 @@ pub(crate) struct Input {
     keys: KeyState,
     /// Who gets the keyboard.
     capture: Capture,
+    /// Linux input that sends clicks without taking the keyboard or pointer.
+    seamless: bool,
     /// The `BUTTON_*` bits of the buttons the guest was told are down.
     buttons: u32,
     /// The pointer event last sent.
@@ -153,8 +156,11 @@ pub(crate) struct Input {
 
 impl Input {
     /// Nothing held, nothing captured, no keyboard.
-    pub(crate) fn new() -> Input {
-        Input::default()
+    pub(crate) fn new(seamless: bool) -> Self {
+        Self {
+            seamless,
+            ..Self::default()
+        }
     }
 
     /// Whether input, the keyboard and the pointer, is captured.
@@ -168,9 +174,11 @@ impl Input {
         self.capture.pointer_confinement(image)
     }
 
-    /// What the title ends with: the release chord while captured, that a click captures while not.
+    /// What the title ends with: the current input mode or the capture control.
     pub(crate) fn title_suffix(&self) -> &'static str {
-        if self.is_captured() {
+        if self.seamless {
+            " \u{2014} seamless input"
+        } else if self.is_captured() {
             CAPTURED_SUFFIX
         } else {
             UNCAPTURED_SUFFIX
@@ -216,11 +224,8 @@ impl Input {
                 .focused_at
                 .is_some_and(|t| timestamp.saturating_sub(t) < FOCUS_CLICK_NS);
         let was_captured = self.is_captured();
-        let forward = if was_captured {
-            true
-        } else {
-            self.capture.click_in_image(!focusing).forward
-        };
+        let forward =
+            self.seamless || was_captured || self.capture.click_in_image(!focusing).forward;
         if forward {
             self.buttons |= bit;
             self.pointer(point, at.image, mode, true);
@@ -392,7 +397,7 @@ mod tests {
 
     /// An input whose window has had the keyboard for a second.
     fn focused() -> Input {
-        let mut input = Input::new();
+        let mut input = Input::new(false);
         input.focus_gained(0);
         input
     }
@@ -409,7 +414,7 @@ mod tests {
     /// The click that focuses the window is not sent, but captures; the next one is sent
     #[test]
     fn the_click_that_focuses_the_window_is_not_sent() {
-        let mut input = Input::new();
+        let mut input = Input::new(false);
         input.focus_gained(1_000_000_000);
         let r = input.button_down(BUTTON_LEFT, 1_010_000_000, &at((10.0, 10.0)));
         assert!(r.capture_changed);
@@ -417,6 +422,50 @@ mod tests {
         assert_eq!(input.take(), vec![]);
         input.button_down(BUTTON_LEFT, 2_000_000_000, &at((10.0, 10.0)));
         assert_eq!(input.take(), vec![pointer(20, 20, BUTTON_LEFT)]);
+    }
+
+    /// The focusing click reaches the guest whether or not SDL has reported focus yet.
+    #[test]
+    fn seamless_input_forwards_the_focus_click_without_capturing() {
+        let at = at((10.0, 10.0));
+        let now = 1_000_000_000;
+        for focused in [false, true] {
+            let mut input = Input::new(true);
+            if focused {
+                input.focus_gained(now);
+            }
+            assert!(!input.button_down(BUTTON_LEFT, now, &at).capture_changed);
+            assert!(!input.is_captured());
+            assert_eq!(input.pointer_confinement(at.image), None);
+            input.button_up(BUTTON_LEFT, &at);
+            assert_eq!(
+                input.take(),
+                vec![pointer(20, 20, BUTTON_LEFT), pointer(20, 20, 0)]
+            );
+        }
+    }
+
+    /// A seamless drag still reaches the nearest guest edge and releases its button there.
+    #[test]
+    fn a_seamless_drag_releases_at_the_edge_without_confining_the_pointer() {
+        let mut input = Input::new(true);
+        input.focus_gained(0);
+        let inside = at((10.0, 10.0));
+        let outside = at((150.0, 10.0));
+        input.button_down(BUTTON_LEFT, 1_000_000_000, &inside);
+        input.moved(&outside);
+        input.button_up(BUTTON_LEFT, &outside);
+        input.moved(&inside);
+        assert_eq!(
+            input.take(),
+            vec![
+                pointer(20, 20, BUTTON_LEFT),
+                pointer(199, 20, BUTTON_LEFT),
+                pointer(199, 20, 0),
+                pointer(20, 20, 0)
+            ]
+        );
+        assert_eq!(input.pointer_confinement(inside.image), None);
     }
 
     /// A click in the image captures and is sent; one outside starts nothing
