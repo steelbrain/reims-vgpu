@@ -156,6 +156,13 @@ pub trait Buffer<P: Platform>: GpuResource<P> {
     fn memory_made(&self) -> bool {
         true
     }
+    /// No Metal counterpart: the copy of host pages the buffer lies over, where the platform made
+    /// it over one, which a command buffer that may reach the buffer through memory with no use
+    /// naming it brings up to date ([`EscapedCopies`](super::command::EscapedCopies)). `None` by
+    /// default, where the platform keeps no copy.
+    fn escaped_copy(&self) -> Option<super::command::EscapedCopy> {
+        None
+    }
 }
 
 /// No Metal counterpart: the use a deferred buffer's memory is made ahead of
@@ -467,6 +474,12 @@ pub trait Heap<P: Platform>: Handle {
     fn set_purgeable_state(&self, state: u64) -> RaiseResult<u64>;
     /// sel: storageMode
     fn storage_mode(&self) -> u64;
+    /// No Metal counterpart: the copy of host pages the heap lies over, as
+    /// [`Buffer::escaped_copy`] answers a buffer's. `None` by default, where the platform keeps no
+    /// copy.
+    fn escaped_copy(&self) -> Option<super::command::EscapedCopy> {
+        None
+    }
 }
 
 /// `MTLSamplerState` (with `MTLSamplerStateSPI`).

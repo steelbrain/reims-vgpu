@@ -1923,6 +1923,11 @@ impl<P: Platform> GraphicsDecoder<P> {
         if !take.predicates {
             cb.holds_no_predication();
         }
+        // Its commits, and its parts', bring up to date its process's escaped copies, which its
+        // work may reach through memory with no use naming them ([`super::escape`]).
+        if let Some(escapes) = self.escapes(context_of(m.queue_obj_id)) {
+            cb.reaches_escaped(&escapes);
+        }
         super::work::command_buffer(self.context);
         let in_flight = InFlight::new(&counts.in_flight, &counts.out);
         // Its queue's commit marks rise to it, where its begin on a queue's service thread did

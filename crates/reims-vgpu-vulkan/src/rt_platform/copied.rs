@@ -17,8 +17,14 @@
 //!   buffer), or that it declares with `useResource:` or `useHeap:`, which Metal asks for a
 //!   resource a shader reaches through an address (an argument buffer's). Each object over a copy
 //!   holds it from its make, so a use costs one check; a command buffer that uses no copy syncs
-//!   none. A command buffer that reads a copy through an address it never declared reads it as
-//!   the last commit that used it left it: Metal leaves such a read undefined.
+//!   none.
+//! - **And for every command buffer of its process once it escaped** ([`Used::escaped`]): a copy
+//!   under an object whose identity left the guest's Metal with no message naming it (core's
+//!   `EscapedCopies`: a buffer's `gpuAddress` read, written by an argument encoder, under a
+//!   texture whose `gpuResourceID` was read, or added to a residency set; a heap from its make)
+//!   may be reached through memory with no use naming it, so each commit of its process's command
+//!   buffers, and of their parts, syncs it as a use, from the escape until the last such object
+//!   goes. A copy no object of which escaped is reached through no address the guest holds.
 //! - **Copied in at the commits that use it** ([`copy_in`], from `super::command`'s commit,
 //!   before rt is handed the command buffer): every byte of the pages that differs from the base
 //!   is written into the copy and the base. A byte the CPU did not change is never written, so a
@@ -210,6 +216,16 @@ impl Used {
             ResourceRef::Buffer(buffer) => self.buffer(buffer),
             ResourceRef::Texture(texture) => self.add(texture.copied()),
             ResourceRef::Icb(_) => {}
+        }
+    }
+
+    /// The command buffer is of the process whose escaped copies are `escapes`: it uses each
+    /// copy `escapes` holds now ("And for every command buffer of its process once it escaped").
+    pub(super) fn escaped(&self, escapes: &crate::core::platform::command::EscapedCopies) {
+        for copy in escapes.copies() {
+            if let Ok(copied) = copy.downcast::<Copied>() {
+                self.add(Some(&copied));
+            }
         }
     }
 

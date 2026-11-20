@@ -41,10 +41,11 @@
 //!   render encoders ([`super::render`]) of the pass the descriptor keeps
 //!   ([`super::descriptor`]): a pass Metal refuses, or rt does, is nil, counted.
 //! - **Copies of host pages** (`super::copied`): its encoders note each copy they set or declare
-//!   an object over, as Metal makes resident only those; its commit copies the CPU's writes into
-//!   those before rt is handed the command buffer, and where it used one its first completed
-//!   handler merges the GPU's writes back into their pages, before core's completion-seen
-//!   handlers.
+//!   an object over, as Metal makes resident only those, and its commit adds its process's
+//!   escaped copies, which the caller names before any encoder (`reaches_escaped`) and its parts
+//!   take from it; its commit copies the CPU's writes into those before rt is handed the command
+//!   buffer, and where it used one its first completed handler merges the GPU's writes back into
+//!   their pages, before core's completion-seen handlers.
 //! - **What it keeps**: the pipeline states its encoders set ([`Kept`]), from their set until it
 //!   completes, released after its completed handlers ran.
 //! - **Tiled textures** (`super::tiled`): its encoders note each tiled texture they use whose
@@ -76,8 +77,8 @@ use std::sync::{Arc, OnceLock};
 use metal2vulkan_rt as rt;
 
 use crate::core::platform::command::{
-    CommandBuffer, CompletedHandler, CompletedInfo, KeptWhole, PartCut, ScheduledHandler,
-    run_completed,
+    CommandBuffer, CompletedHandler, CompletedInfo, EscapedCopies, KeptWhole, PartCut,
+    ScheduledHandler, run_completed,
 };
 use crate::core::platform::event::EventRef;
 use crate::core::platform::types::{CommandBufferStatus, NsErrorText};
@@ -133,6 +134,9 @@ pub struct RtCommandBuffer {
     kept: Kept,
     /// Its error as Metal's, made as it completes ([`Failure`]).
     failure: Arc<Failure>,
+    /// Its process's escaped copies (`super::copied`), which each of its commits syncs, as do
+    /// its parts', where the caller named them (`reaches_escaped`).
+    escapes: OnceLock<EscapedCopies>,
 }
 
 /// A command buffer's error as Metal's (the module's docs, "What a completed handler learns"):
@@ -262,6 +266,7 @@ impl RtCommandBuffer {
             open: Arc::default(),
             kept: Kept::default(),
             failure,
+            escapes: OnceLock::new(),
         }
     }
 
@@ -346,11 +351,13 @@ impl RtCommandBuffer {
     /// device, a wait for room on rt's own handler thread), counted: then it is kept whole.
     fn next_part(&self) -> Option<RtObj<RtCommandBuffer>> {
         match self.queue.command_buffer() {
-            Ok(made) => Some(RtObj::new(RtCommandBuffer::new(
-                made,
-                self.queue.clone(),
-                self.device.clone_ref(),
-            ))),
+            Ok(made) => {
+                let part = RtCommandBuffer::new(made, self.queue.clone(), self.device.clone_ref());
+                if let Some(escapes) = self.escapes.get() {
+                    let _ = part.escapes.set(escapes.clone());
+                }
+                Some(RtObj::new(part))
+            }
             Err(error) => {
                 rt_refused("commandBuffer", &error);
                 None
@@ -638,9 +645,10 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     }
 
     /// Hands rt the held handlers (the module's docs), then commits, the copies of host pages it
-    /// used copied in first and merged back first of the completed handlers (`super::copied`),
-    /// then the bytes of the tiled textures it used taken (`super::tiled`). A second commit is
-    /// Metal's refusal, counted; a commit rt refuses is counted, and its handlers never run.
+    /// used and its process's escaped copies copied in first and merged back first of the
+    /// completed handlers (`super::copied`), then the bytes of the tiled textures it used taken
+    /// (`super::tiled`). A second commit is Metal's refusal, counted; a commit rt refuses is
+    /// counted, and its handlers never run.
     fn commit(&self, on: OnFault) -> RaiseResult<()> {
         let recorded_call = crate::recorder::rec_call!("commit", self);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
@@ -671,6 +679,9 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 0,
                 Box::new(move |made: &rt::CommandBuffer| failure.completed(made.error())),
             );
+            if let Some(escapes) = self.escapes.get() {
+                self.kept.copies().escaped(escapes);
+            }
             let copies = self.kept.copies().take();
             if let Some(merge) = super::copied::merging(&copies) {
                 seen.insert(0, Box::new(merge));
@@ -1004,6 +1015,12 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
             drop(later);
         });
         crate::recorder::rec_done!(recorded_call, ());
+    }
+
+    /// Keeps `escapes`, its process's escaped copies, which each of its commits syncs, and each
+    /// part's cut from it (`super::copied`, the module's docs); the first named alone is kept.
+    fn reaches_escaped(&self, escapes: &EscapedCopies) {
+        let _ = self.escapes.set(escapes.clone());
     }
 }
 

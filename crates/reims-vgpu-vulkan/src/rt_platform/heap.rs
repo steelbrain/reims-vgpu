@@ -423,6 +423,12 @@ impl Heap<RtPlatform> for RtObj<RtHeap> {
     fn storage_mode(&self) -> u64 {
         (self.options >> 4) & 0xf
     }
+
+    /// The copy of host pages it lies over (`super::copied`), where it lies over one.
+    fn escaped_copy(&self) -> Option<crate::core::platform::command::EscapedCopy> {
+        let copied = self.copied.as_ref()?;
+        Some(Arc::clone(copied) as crate::core::platform::command::EscapedCopy)
+    }
 }
 
 #[cfg(test)]

@@ -29,15 +29,25 @@
 //! An escaped buffer over a copy of its pages is one the GPU may read through memory, with no
 //! binding naming it, after the guest's CPU changed its pages. Metal requires a function's reach
 //! of a buffer through memory to be made resident by its encoder (`useResource:usage:`), which
-//! names it as a use, and the runtime brings every copy a command buffer's uses name up to date at
-//! its commit, and every copy where its work may reach memory no use names (metal2vulkan's
-//! `command_buffer/mod.rs`, "Every byte the CPU changed in the pages of a copied host buffer"),
-//! so the decoder adds nothing to a commit for one, and the guest observes nothing of this: it
-//! keeps each process's count of its live escaped copies ([`Context::escaped_copies`]), and
+//! names it as a use, and the Vulkan platform's runtime brings every copy a command buffer's uses
+//! name up to date at its commit, and every copy where its work may reach memory no use names
+//! (metal2vulkan's `command_buffer/mod.rs`, "Every byte the CPU changed in the pages of a copied
+//! host buffer"). A platform that keeps copies of its own and syncs a copy only for the command
+//! buffers that use it (the rt platform's `copied`) answers each object's copy
+//! (`Buffer::escaped_copy`): the first note puts the buffer's copy on its context's escaped
+//! copies ([`Context::escapes`]), and a heap over a copy, whose address is the guest's own pick
+//! and which no note names, is put on at its make; each takes its copy off at its drop
+//! ([`Listed`]). Each command buffer of the context is handed them at its begin, before any
+//! encoder (`CommandBuffer::reaches_escaped`), and each of its commits, and of its parts, brings
+//! up to date every copy they hold then, as for a use: so a command buffer that reaches an escaped
+//! copy through its address alone reads the CPU's writes made before its commit, and its writes
+//! there reach the pages at its completion. The decoder also keeps each process's count of its
+//! live escaped buffers over a copy of their read-only pages ([`Context::escaped_copies`]), and
 //! counts each command buffer begun of a process that holds one ([`ESCAPED_COPY_COMMITS`]), the
-//! first logged at info. The tests pin the runtime's copy in of such a copy.
+//! first logged at info. The tests pin both platforms' copy in of such a copy.
 //!
 //! [`Context::escaped_copies`]: super::tables::Context::escaped_copies
+//! [`Context::escapes`]: super::tables::Context::escapes
 
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -47,6 +57,8 @@ use reims_vgpu_graphics::wire::RgfxBufferEscaped;
 use reims_vgpu_vulkan::answer::count_kind;
 use reims_vgpu_vulkan::core::num::ToU64 as _;
 use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::command::{EscapedCopies, EscapedCopy};
+use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 use reims_vgpu_vulkan::recorder;
 
 use super::tables::Entry;
@@ -104,6 +116,34 @@ pub(crate) struct Escape {
     /// ([`super::tables::Context::escaped_copies`]), which it added itself to at its first note
     /// and leaves at its drop.
     copies: OnceLock<Arc<AtomicUsize>>,
+    /// Where it lies over a copy the platform keeps (`Buffer::escaped_copy`) and escaped, that
+    /// copy on its context's escaped copies, put on at its first note and taken off at its drop.
+    listed: OnceLock<Listed>,
+}
+
+/// A copy the platform keeps on its process's escaped copies ([`EscapedCopies`]) for the life of
+/// an object over it that escaped: put on at the escape, taken off at the drop.
+pub(crate) struct Listed {
+    escapes: EscapedCopies,
+    copy: EscapedCopy,
+}
+
+impl Listed {
+    /// `copy` put on `escapes` for an object over it that escaped.
+    pub(crate) fn new(escapes: &EscapedCopies, copy: EscapedCopy) -> Self {
+        escapes.add(&copy);
+        Listed {
+            escapes: escapes.clone(),
+            copy,
+        }
+    }
+}
+
+impl Drop for Listed {
+    /// The object gone: its copy off its process's escaped copies.
+    fn drop(&mut self) {
+        self.escapes.remove(&self.copy);
+    }
 }
 
 impl Escape {
@@ -115,6 +155,7 @@ impl Escape {
             over,
             escaped: AtomicBool::new(false),
             copies: OnceLock::new(),
+            listed: OnceLock::new(),
         }
     }
 
@@ -130,13 +171,25 @@ impl Escape {
     }
 
     /// The guest's note that buffer `obj_id`'s identity escaped by the act at `act` of
-    /// [`ESCAPED_BY`]: the first marks it, records it where the process records, on `buffer`,
-    /// the platform's (`m2v.bufferEscaped`, [`recorder::buffer_escaped`]), and counts it, a
-    /// buffer over a copy of its pages added to `copies`, its context's count of its escaped
-    /// copies, and the first of its act in this process is logged; a later one changes nothing.
-    fn note(&self, act: usize, obj_id: u64, buffer: &dyn Any, copies: Option<Arc<AtomicUsize>>) {
+    /// [`ESCAPED_BY`]: the first marks it, puts the platform's copy under it on its context's
+    /// escaped copies where `listed` names both ([`Listed`]), records it where the process
+    /// records, on `buffer`, the platform's (`m2v.bufferEscaped`, [`recorder::buffer_escaped`]),
+    /// and counts it, a buffer over a copy of its read-only pages added to `copies`, its context's
+    /// count of those, and the first of its act in this process is logged; a later one changes
+    /// nothing.
+    fn note(
+        &self,
+        act: usize,
+        obj_id: u64,
+        buffer: &dyn Any,
+        copies: Option<Arc<AtomicUsize>>,
+        listed: Option<(EscapedCopies, EscapedCopy)>,
+    ) {
         if self.escaped.swap(true, Ordering::Relaxed) {
             return;
+        }
+        if let Some((escapes, copy)) = listed {
+            let _ = self.listed.set(Listed::new(&escapes, copy));
         }
         recorder::buffer_escaped(buffer, act.to_u64());
         count_kind(ESCAPED_BY[act]);
@@ -199,7 +252,11 @@ impl<P: Platform> GraphicsDecoder<P> {
                 ..
             }) => {
                 let copies = self.escaped_copies(context_of(m.obj_id), Arc::clone);
-                escape.note(act, m.obj_id, buffer, copies);
+                let listed = buffer.escaped_copy().and_then(|copy| {
+                    let context = self.context_state(context_of(m.obj_id))?;
+                    Some((context.escapes.clone(), copy))
+                });
+                escape.note(act, m.obj_id, buffer, copies, listed);
                 Ok(())
             }
             _ => Err(DecodeError::BadReference),
@@ -214,10 +271,16 @@ impl<P: Platform> GraphicsDecoder<P> {
         Some(f(&view.context().escaped_copies))
     }
 
+    /// The escaped copies of context `context` ([`super::tables::Context::escapes`]), where it
+    /// has a state, for a command buffer of it begun to sync at its commits
+    /// (`CommandBuffer::reaches_escaped`).
+    pub(super) fn escapes(&self, context: u32) -> Option<EscapedCopies> {
+        Some(self.context_state(context)?.escapes.clone())
+    }
+
     /// A command buffer of context `context` begun, once it named the buffer's queue: counted
     /// ([`ESCAPED_COPY_COMMITS`]) where the context holds an escaped buffer over a copy of its
-    /// pages, the first logged. The runtime brings the copy up to date at its commit where its
-    /// work may reach it, as it does any copy; nothing is added to it.
+    /// read-only pages, the first logged.
     pub(super) fn escaped_copy_commit(&self, context: u32) {
         let held = self.escaped_copies(context, |copies| copies.load(Ordering::Relaxed));
         let Some(held @ 1..) = held else {
@@ -228,8 +291,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             log::info!(
                 target: "reims_vgpu::graphics",
                 "a command buffer of context {context}, which holds {held} escaped no-copy \
-                 buffers over a copy of their pages, begun: the runtime brings the copies up to \
-                 date at its commit where its work may reach them (logged once, counted as {})",
+                 buffers over a copy of their pages, begun: its commits bring the copies up to \
+                 date (logged once, counted as {})",
                 ESCAPED_COPY_COMMITS
             );
         }
@@ -528,21 +591,27 @@ mod tests {
     /// loads from another (its `reach.metal`), which a host without Metal takes as a Mac does.
     const REACH: &[u8] = include_bytes!("../../../../reims-vgpu-vulkan/metallibs/reach.metallib");
 
-    /// On the Vulkan platform, a buffer over a copy of its read-only pages whose identity escaped
-    /// (an argument encoder's write of its address) is read by a kernel that reaches it only
-    /// through that address, the encoder having made it resident (`useResource:usage:`), as Metal
-    /// requires of a buffer a function reaches through memory: before the guest's CPU writes its
-    /// pages the kernel reads their old bytes, and after, their new ones. The decoder adds nothing
-    /// to the command buffer for the escaped copy: this holds the runtime's own copy in, at a
-    /// commit, of each copy its encoders' uses name (metal2vulkan's `command_buffer/mod.rs`, "Every
-    /// byte the CPU changed in the pages of a copied host buffer"). A reach of a buffer no encoder
-    /// made resident is undefined in Metal, and reads zero on the runtime (its `residency.rs`).
-    #[test]
-    fn on_vulkan_an_escaped_copy_reached_by_its_address_reads_the_cpus_writes() {
+    /// On `P`, a buffer over a copy of its read-only pages whose identity escaped (an argument
+    /// encoder's write of its address). Where the platform keeps copies of its own
+    /// (`keeps_copies`, the rt platform's), the note puts the copy on its context's escaped
+    /// copies, which the decoder's begin hands each command buffer of the context
+    /// (`CommandBuffer::reaches_escaped`), and the copy comes off at the buffer's destroy. No
+    /// kernel reads the copy there: rt reaches no copy a command buffer leaves undeclared (its
+    /// translator lowers no address a function loads, and a texture over the copy is an image of
+    /// its own that rt fills only before the submissions that use it), and the rt platform's
+    /// `an_escaped_copy_no_encoder_names_is_synced_at_its_process_s_commits_on_vulkan` holds the
+    /// sync. Otherwise the decoder lists nothing, and a kernel that reaches the buffer only through
+    /// that address, which the encoder makes resident (`useResource:usage:`) as Metal requires of
+    /// a buffer a function reaches through memory, reads the pages' old bytes before the guest's
+    /// CPU writes them, and after, their new ones: this holds the Vulkan platform's runtime's own
+    /// copy in, at a commit, of each copy its encoders' uses name (metal2vulkan's
+    /// `command_buffer/mod.rs`, "Every byte the CPU changed in the pages of a copied host
+    /// buffer"), where a reach of a buffer no encoder made resident, undefined in Metal, reads
+    /// zero (its `residency.rs`).
+    fn an_escaped_copy_over_read_only_pages<P: ApiPlatform>(keeps_copies: bool) {
         use reims_vgpu_graphics::wire::{
             RGFX_CMD_SURFACE_PAGES, RGFX_CURSOR_SPAN, RgfxPageRun, RgfxSurfacePages,
         };
-        use reims_vgpu_vulkan::VulkanPlatform;
         use reims_vgpu_vulkan::core::memory::map::MemoryMap as CoreMemoryMap;
         use reims_vgpu_vulkan::core::platform::blit::ResourceRef;
         use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
@@ -554,10 +623,9 @@ mod tests {
 
         use super::super::surface_pages::Lease;
         use super::super::surface_pages::costs::{RAM, guest_ram};
-        use crate::platform::ApiPlatform as _;
 
         let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
-        let platform = VulkanPlatform::process();
+        let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let page = platform.vm().page_size().max(4096);
         // The guest's RAM, which outlives the decoder and its views.
@@ -567,7 +635,7 @@ mod tests {
             CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
         let size = BLOCK + 0x10_0000 + RGFX_CURSOR_SPAN;
         let region = Arc::new(crate::platform::test_region(&*platform, size as usize));
-        let mut dec = GraphicsDecoder::<VulkanPlatform>::new(Arc::clone(&platform), region);
+        let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), region);
         dec.set_guest_memory(core, lease);
         assert!(
             dec.surface_pages_available(),
@@ -626,72 +694,106 @@ mod tests {
             dec.escape_of(10).map(|e| (e.over(), e.escaped())),
             Some((NoCopy::ReadOnlyPages, true))
         );
+        let listed = |dec: &GraphicsDecoder<P>| dec.escapes(0).map(|escapes| escapes.len());
+        assert_eq!(
+            listed(&dec),
+            Some(usize::from(keeps_copies)),
+            "the copy listed"
+        );
         let Some(ObjHandle::Buffer(copy)) = dec.object(10) else {
             panic!("no buffer 10");
         };
-
-        let library = device.new_library(REACH).unwrap().unwrap().unwrap();
-        let f = library
-            .new_function(OnFault::Die, "reach")
-            .unwrap()
-            .unwrap();
-        let state = device
-            .new_compute_pipeline_state_for_function(Some(&f))
-            .unwrap()
-            .unwrap();
-        let shared = |length: u64| {
-            device
-                .new_buffer_of_length(OnFault::Die, length, 0)
+        if !keeps_copies {
+            let library = device.new_library(REACH).unwrap().unwrap().unwrap();
+            let f = library
+                .new_function(OnFault::Die, "reach")
                 .unwrap()
+                .unwrap();
+            let state = device
+                .new_compute_pipeline_state_for_function(Some(&f))
                 .unwrap()
-        };
-        // The address the argument encoder wrote, and the kernel's two words.
-        let (addresses, out) = (shared(8), shared(8));
-        // SAFETY: Shared buffers of 8 bytes, which no command uses yet.
-        unsafe {
-            addresses
-                .contents()
-                .as_ptr::<u64>()
-                .write(copy.gpu_address());
-            out.contents().as_ptr::<u32>().add(1).write(AFTER);
-        }
-        let queue = device.new_command_queue().unwrap();
-        // What the kernel reads through the address alone.
-        let reach = || {
-            let cb = queue.command_buffer(OnFault::Die).unwrap().unwrap();
-            let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
-            let one = MtlSize::new(1, 1, 1);
-            for cmd in [
-                ComputeCmd::SetComputePipelineState {
-                    state: Some(&state),
-                },
-                ComputeCmd::SetBuffers {
-                    buffers: &[Some(&addresses), Some(&out)],
-                    offsets: &[0, 0],
-                    range: NsRange::new(0, 2),
-                },
-                // MTLResourceUsageRead.
-                ComputeCmd::UseResources {
-                    resources: &[Some(ResourceRef::Buffer(copy))],
-                    usage: 1,
-                },
-                ComputeCmd::DispatchThreads {
-                    threads_per_grid: one,
-                    threads_per_threadgroup: one,
-                },
-                ComputeCmd::EndEncoding,
-            ] {
-                e.encode(OnFault::Die, cmd).unwrap();
+                .unwrap();
+            let shared = |length: u64| {
+                device
+                    .new_buffer_of_length(OnFault::Die, length, 0)
+                    .unwrap()
+                    .unwrap()
+            };
+            // The address the argument encoder wrote, and the kernel's two words.
+            let (addresses, out) = (shared(8), shared(8));
+            // SAFETY: Shared buffers of 8 bytes, which no command uses yet.
+            unsafe {
+                addresses
+                    .contents()
+                    .as_ptr::<u64>()
+                    .write(copy.gpu_address());
+                out.contents().as_ptr::<u32>().add(1).write(AFTER);
             }
-            cb.commit(OnFault::Die).unwrap();
-            cb.wait_until_completed(OnFault::Die).unwrap();
-            assert!(cb.error().is_none(), "{:?}", cb.error());
-            // SAFETY: a Shared buffer's first word, read after the command buffer completed.
-            unsafe { out.contents().as_ptr::<u32>().read() }
+            let queue = device.new_command_queue().unwrap();
+            // What the kernel reads through the address alone.
+            let reach = || {
+                let cb = queue.command_buffer(OnFault::Die).unwrap().unwrap();
+                let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
+                let one = MtlSize::new(1, 1, 1);
+                let resources = [Some(ResourceRef::Buffer(copy))];
+                let buffers = [Some(&addresses), Some(&out)];
+                let cmds = [
+                    ComputeCmd::SetComputePipelineState {
+                        state: Some(&state),
+                    },
+                    ComputeCmd::SetBuffers {
+                        buffers: &buffers,
+                        offsets: &[0, 0],
+                        range: NsRange::new(0, 2),
+                    },
+                    // MTLResourceUsageRead.
+                    ComputeCmd::UseResources {
+                        resources: &resources,
+                        usage: 1,
+                    },
+                    ComputeCmd::DispatchThreads {
+                        threads_per_grid: one,
+                        threads_per_threadgroup: one,
+                    },
+                    ComputeCmd::EndEncoding,
+                ];
+                for cmd in cmds {
+                    e.encode(OnFault::Die, cmd).unwrap();
+                }
+                cb.commit(OnFault::Die).unwrap();
+                cb.wait_until_completed(OnFault::Die).unwrap();
+                assert!(cb.error().is_none(), "{:?}", cb.error());
+                // SAFETY: a Shared buffer's first word, read after the command buffer completed.
+                unsafe { out.contents().as_ptr::<u32>().read() }
+            };
+            assert_eq!(reach(), OLD, "before the CPU's write");
+            write(0, NEW);
+            assert_eq!(reach(), NEW, "after the CPU's write");
+        }
+        let destroy = RgfxObjectDestroy {
+            header: header(RGFX_CMD_OBJECT_DESTROY),
+            obj_id: 10,
         };
-        assert_eq!(reach(), OLD, "before the CPU's write");
-        write(0, NEW);
-        assert_eq!(reach(), NEW, "after the CPU's write");
+        assert_eq!(dec.decode(&device, destroy.as_bytes()).unwrap(), Ok(()));
+        assert_eq!(listed(&dec), Some(0), "the copy off at the destroy");
+    }
+
+    /// [`an_escaped_copy_over_read_only_pages`] on the Vulkan platform, whose runtime keeps the
+    /// copies: a kernel that reaches it by its address reads the CPU's writes.
+    #[test]
+    fn on_vulkan_an_escaped_copy_reached_by_its_address_reads_the_cpus_writes() {
+        use reims_vgpu_vulkan::VulkanPlatform;
+        an_escaped_copy_over_read_only_pages::<VulkanPlatform>(false);
+    }
+
+    /// [`an_escaped_copy_over_read_only_pages`] on the rt platform, which keeps copies of its own
+    /// and syncs an escaped one at each commit of its process: the decoder lists the copy until
+    /// the buffer's destroy.
+    #[cfg(feature = "rt")]
+    #[test]
+    fn on_vulkan_rt_lists_an_escaped_copy_until_its_destroy() {
+        use reims_vgpu_vulkan::RtPlatform;
+        an_escaped_copy_over_read_only_pages::<RtPlatform>(true);
     }
 
     /// The pages blocks [`no_copy_memory_over_pages_lies_over_the_guests_bytes`] makes its no-copy

@@ -1,10 +1,73 @@
 //! Platform trait: `CommandQueue`, `CommandBuffer`: queue and command-buffer selectors.
 
+use std::any::Any;
+use std::sync::Arc;
+
 use super::event::EventRef;
 use super::types::{CommandBufferStatus, NsErrorText};
 use super::values::ComputePassDesc;
 use super::{Handle, Platform};
 use crate::core::raise::{OnFault, RaiseResult};
+use crate::core::sync::Mutex;
+
+/// No Metal counterpart: a copy of host pages the platform keeps for a buffer or heap over them,
+/// as its `escaped_copy` answers it ([`Buffer::escaped_copy`](super::resource::Buffer::escaped_copy),
+/// [`Heap::escaped_copy`](super::resource::Heap::escaped_copy)): the platform's own, which only
+/// it reads.
+pub type EscapedCopy = Arc<dyn Any + Send + Sync>;
+
+/// No Metal counterpart: a process's escaped copies, those under its objects whose identity left
+/// its Metal with no message naming them (`reims-vgpu`'s `decode/escape.rs`): a buffer whose
+/// `gpuAddress` the app read, that an argument encoder wrote, under a texture whose
+/// `gpuResourceID` the app read, or that joined a residency set, and a heap, whose address is the
+/// guest's own pick, from its make. The GPU may reach each through memory with no use naming it,
+/// so each commit of the process's command buffers brings each up to date
+/// ([`CommandBuffer::reaches_escaped`]). A copy is held once however many of its objects escaped,
+/// until the last of them goes; the list is the process's, so a use costs no pass over the copies
+/// of others.
+#[derive(Clone, Default)]
+pub struct EscapedCopies(Arc<Mutex<Vec<(EscapedCopy, usize)>>>);
+
+impl EscapedCopies {
+    /// One more escaped object over `copy`.
+    pub fn add(&self, copy: &EscapedCopy) {
+        let mut held = self.0.lock();
+        match held.iter_mut().find(|(c, _)| Arc::ptr_eq(c, copy)) {
+            Some((_, objects)) => *objects += 1,
+            None => held.push((Arc::clone(copy), 1)),
+        }
+    }
+
+    /// One escaped object over `copy` gone: the copy leaves with the last.
+    pub fn remove(&self, copy: &EscapedCopy) {
+        let mut held = self.0.lock();
+        let Some(at) = held.iter().position(|(c, _)| Arc::ptr_eq(c, copy)) else {
+            return;
+        };
+        let last = held.get_mut(at).is_some_and(|(_, objects)| {
+            *objects -= 1;
+            *objects == 0
+        });
+        if last {
+            held.swap_remove(at);
+        }
+    }
+
+    /// How many copies are held.
+    pub fn len(&self) -> usize {
+        self.0.lock().len()
+    }
+
+    /// Whether none is.
+    pub fn is_empty(&self) -> bool {
+        self.0.lock().is_empty()
+    }
+
+    /// The copies held now.
+    pub fn copies(&self) -> Vec<EscapedCopy> {
+        self.0.lock().iter().map(|(c, _)| Arc::clone(c)).collect()
+    }
+}
 
 /// What a completed handler learns of its buffer: core's handlers read `status`, `error` and the
 /// GPU times of the buffer they were added to, on Metal's completion thread. The platform reads
@@ -391,4 +454,12 @@ pub trait CommandBuffer<P: Platform>: Handle {
     /// platform keeps nothing for one. A record sent after it dies. Nothing by default: the
     /// platform then keeps what a record would need, as before.
     fn holds_no_predication(&self) {}
+    /// The platform's own, no Metal call: before any encoder, the caller's word that the buffer
+    /// is of the process whose escaped copies are `escapes`: each commit of it, and of each part
+    /// cut from it ([`Self::split`], [`Self::part`]), brings up to date each copy `escapes`
+    /// holds at that commit, as one its encoders use: copied in at the commit, and merged back or
+    /// dropped at the completion. Nothing by default, where the platform keeps no copy.
+    fn reaches_escaped(&self, escapes: &EscapedCopies) {
+        let _ = escapes;
+    }
 }

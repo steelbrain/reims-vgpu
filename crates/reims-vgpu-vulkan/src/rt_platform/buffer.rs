@@ -2344,6 +2344,12 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
         self.rt.get().map_or(0, rt::Buffer::gpu_address)
     }
 
+    /// The copy of host pages it lies over (`super::copied`), where it lies over one.
+    fn escaped_copy(&self) -> Option<crate::core::platform::command::EscapedCopy> {
+        let copied = self.copied.as_ref()?;
+        Some(Arc::clone(copied) as crate::core::platform::command::EscapedCopy)
+    }
+
     /// rt's; a deferred buffer's own, whose memory is not made.
     fn length(&self) -> u64 {
         match (self.rt.get(), &self.deferred) {
@@ -2889,9 +2895,22 @@ mod tests {
         queue: &<RtPlatform as crate::core::platform::Platform>::CommandQueue,
         cmds: Vec<BlitCmd<'_, RtPlatform>>,
     ) {
+        blit_and_wait_of(queue, None, cmds);
+    }
+
+    /// [`blit_and_wait`], the command buffer of the process whose escaped copies are `escapes`
+    /// where given (`reaches_escaped`).
+    fn blit_and_wait_of(
+        queue: &<RtPlatform as crate::core::platform::Platform>::CommandQueue,
+        escapes: Option<&crate::core::platform::command::EscapedCopies>,
+        cmds: Vec<BlitCmd<'_, RtPlatform>>,
+    ) {
         let on = OnFault::Return;
         let commands = queue.command_buffer(on).expect("never a raise");
         let commands = commands.expect("a command buffer");
+        if let Some(escapes) = escapes {
+            commands.reaches_escaped(escapes);
+        }
         let encoder = commands.blit_encoder(on).expect("never a raise");
         let encoder = encoder.expect("a blit encoder");
         for cmd in cmds {
@@ -4644,12 +4663,14 @@ mod tests {
         }
     }
 
-    /// On the GPU the test holds: a command buffer that uses no copy syncs none, as the
-    /// platform's own command buffers, its fills and write-backs, use none: a live copy keeps
-    /// what it holds and its pages theirs, and no sync is counted.
+    /// On the GPU the test holds: a command buffer that uses no copy, of a process none of whose
+    /// copies escaped, syncs none, as the platform's own command buffers, its fills and
+    /// write-backs, use none, though another process's copy escaped: a live copy keeps what it
+    /// holds and its pages theirs, and no sync is counted.
     #[test]
     fn a_command_buffer_that_uses_no_copy_syncs_none_on_vulkan() {
         use super::super::copied::{BACK_BYTES_CODE, IN_BYTES_CODE, SYNC_NS_CODE};
+        use crate::core::platform::command::EscapedCopies;
         use crate::core::platform::types::NsRange;
 
         let platform = RtPlatform::new();
@@ -4661,6 +4682,8 @@ mod tests {
         let codes = [IN_BYTES_CODE, BACK_BYTES_CODE, SYNC_NS_CODE];
         for drops in [false, true] {
             let c = over_a_copy(&device, drops);
+            let (ours, others) = (EscapedCopies::default(), EscapedCopies::default());
+            others.add(&c.buffer.escaped_copy().expect("the copy under the buffer"));
             c.mark();
             let counts = codes.map(counted);
             let fill = BlitCmd::FillBuffer {
@@ -4668,42 +4691,49 @@ mod tests {
                 range: NsRange::new(0, 64),
                 value: 0x55,
             };
-            blit_and_wait(&queue, vec![fill]);
+            blit_and_wait_of(&queue, Some(&ours), vec![fill]);
             assert_eq!(read(other.contents(), 64), [0x55; 64]);
             assert_eq!(c.synced(), (false, false), "drops: {drops}");
             assert_eq!(codes.map(counted), counts, "no sync counted");
         }
     }
 
-    /// On the GPU the test holds: a copy a command buffer reaches only through its address, held
-    /// in a buffer the encoder binds and declared with no `useResource:`, is not synced for it,
-    /// a read that Metal leaves undefined (`super::super::copied`'s docs): the copy holds what the
-    /// last command buffer that used it left, and its pages theirs. The next command buffer that
-    /// uses it syncs it.
+    /// On the GPU the test holds: a copy whose identity escaped (`super::super::copied`'s docs,
+    /// "And for every command buffer of its process once it escaped"), as an app's read of its
+    /// buffer's `gpuAddress`, or of the `gpuResourceID` of a texture over it, makes it, is synced
+    /// at each commit of its process's command buffers though none of their encoders sets or
+    /// declares it: the CPU's bytes copied in at the commit, the copy's merged back, or put back,
+    /// at the completion. No kernel of ours shows it on rt, which reaches no copy a command buffer
+    /// leaves undeclared: its translator lowers no address a function loads (its README, "Known
+    /// gaps of pipeline states"), a texture over the copy, a buffer in an imported block, is an
+    /// image of its own that rt copies the buffer's bytes into only before the submissions that
+    /// use it, and a storage read through a resource ID no `use_resource` declared answers zeros.
+    /// So the test reads the copy and the pages, as its sibling of another process's escape does
+    /// ([`a_command_buffer_that_uses_no_copy_syncs_none_on_vulkan`]).
     #[test]
-    fn a_copy_reached_only_through_an_undeclared_address_is_not_synced_on_vulkan() {
+    fn an_escaped_copy_no_encoder_names_is_synced_at_its_process_s_commits_on_vulkan() {
+        use crate::core::platform::command::EscapedCopies;
         use crate::core::platform::types::NsRange;
 
         let platform = RtPlatform::new();
         let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
         let on = OnFault::Return;
         let queue = device.new_command_queue().expect("a command queue");
+        let other = device.new_buffer_of_length(on, 64, 0);
+        let other = other.expect("never a raise").expect("a buffer");
         for drops in [false, true] {
             let c = over_a_copy(&device, drops);
-            let addresses = device.new_buffer_of_length(on, 8, 0);
-            let addresses = addresses.expect("never a raise").expect("a buffer");
-            // SAFETY: the Shared buffer's 8 bytes, mapped while it lives.
-            unsafe { (addresses.contents().as_ptr::<u64>()).write(c.buffer.gpu_address()) };
+            let escapes = EscapedCopies::default();
+            escapes.add(&c.buffer.escaped_copy().expect("the copy under the buffer"));
             c.mark();
-            for (buffer, synced) in [(&addresses, false), (&c.buffer, true)] {
-                let bind = ComputeCmd::SetBuffers {
-                    buffers: &[Some(buffer)],
-                    offsets: &[0],
-                    range: NsRange::new(0, 1),
-                };
-                compute_and_wait(&queue, vec![bind]);
-                assert_eq!(c.synced(), (synced, synced), "drops: {drops}");
-            }
+            let fill = BlitCmd::FillBuffer {
+                buffer: &other,
+                range: NsRange::new(0, 64),
+                value: 0x55,
+            };
+            blit_and_wait_of(&queue, Some(&escapes), vec![fill]);
+            assert_eq!(read(other.contents(), 64), [0x55; 64]);
+            assert_eq!(c.synced(), (true, true), "drops: {drops}");
         }
     }
 }

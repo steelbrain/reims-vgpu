@@ -41,6 +41,7 @@ use parking_lot::RwLock;
 use reims_vgpu_vulkan::core::collections::hasher::KeyBuild;
 use reims_vgpu_vulkan::core::host::HostPtr;
 use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::command::EscapedCopies;
 use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::lane::Lane;
@@ -183,6 +184,9 @@ pub(crate) struct Entry<P: Platform> {
     /// A no-copy buffer whose identity the guest may hand on with no message naming it, and
     /// whether it did ([`super::escape`]); `None` for any other object.
     pub(crate) escape: Option<super::escape::Escape>,
+    /// A heap over a copy of its pages on its process's escaped copies, which it leaves at its drop
+    /// ([`super::escape::Listed`]); `None` for any other object.
+    pub(crate) listed: Option<super::escape::Listed>,
     /// The table's clock at its make.
     made: u64,
     /// The first clock of a view that names it: its make's, or the making message's view's where
@@ -211,6 +215,7 @@ impl<P: Platform> Entry<P> {
             shape: None,
             over_cache: false,
             escape: None,
+            listed: None,
             made: 0,
             seen: 0,
             live: None,
@@ -512,6 +517,10 @@ pub(crate) struct Context<P: Platform> {
     /// The context's live buffers over a copy of their read-only pages whose identity escaped
     /// ([`super::escape`]): each adds itself at its first note and leaves at its drop.
     pub(crate) escaped_copies: Arc<AtomicUsize>,
+    /// The platform's copies under the context's objects whose identity escaped, which each of
+    /// its command buffers syncs at its commit ([`super::escape`]): each object adds its copy at
+    /// its first note, a heap at its make, and takes it off at its drop.
+    pub(crate) escapes: EscapedCopies,
 }
 
 impl<P: Platform> Context<P> {
@@ -532,6 +541,7 @@ impl<P: Platform> Context<P> {
             drain: Mutex::new(Arc::default()),
             managed_recoveries: Mutex::new(0),
             escaped_copies: Arc::default(),
+            escapes: EscapedCopies::default(),
         }
     }
 

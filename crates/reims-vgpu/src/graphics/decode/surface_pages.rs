@@ -3301,10 +3301,18 @@ impl<P: Platform> super::GraphicsDecoder<P> {
                         "in the block's view"
                     }
                 );
+                // A heap over a copy the platform keeps is on its process's escaped copies for
+                // its life: its address is the guest's own pick, which no note names
+                // ([`super::escape`]).
+                let listed = heap.escaped_copy().map(|copy| {
+                    let context = self.context_made(super::context_of(m.obj_id));
+                    super::escape::Listed::new(&context.escapes, copy)
+                });
                 let mut entry = super::tables::Entry::of(super::ObjHandle::Heap(heap))
                     .over(Some((m.block_offset, m.block_size)))
                     .counted(live);
                 entry.ram = Some((at, length));
+                entry.listed = listed;
                 self.store(m.obj_id, entry);
                 Ok(Ok(()))
             }
