@@ -12,7 +12,7 @@
 //!   of rt's counters, which costs the work they count nothing.
 //! - **One thread a process.** It reads the latest device's gauges at each look, so a device made
 //!   after a let-go is read with no thread of its own, and a device torn down reads as zeros.
-//! - **A line** is `rt gauges: NAME VALUE, ...` ([`line`]), each name the field of rt's `Gauges`
+//! - **A line** is `rt gauges: NAME VALUE, ...` ([`line()`]), each name the field of rt's `Gauges`
 //!   it reads, bytes and counts as rt keeps them: the Private and the Shared pool's allocations,
 //!   their idle allocations and reserve, the blocks taken from them, the live buffers in them and
 //!   the long allocations held again, the textures' places in texture blocks, which are Private
@@ -164,6 +164,10 @@ mod tests {
         let changed = lines.next(&gauges).expect("a gauge changed");
         assert!(changed.ends_with("buffers 4, textures 6"), "{changed}");
         let zeros = line(&rt::Gauges::default());
-        assert_eq!(lines.next(&rt::Gauges::default()), Some(zeros), "a torn-down device's");
+        assert_eq!(
+            lines.next(&rt::Gauges::default()),
+            Some(zeros),
+            "a torn-down device's"
+        );
     }
 }
