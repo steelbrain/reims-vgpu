@@ -455,11 +455,17 @@ answers for its device, `rt_platform::HostGpu`). The arm
      ("Zero copy"): where both planes lie in one memory a dma-buf is made
      of, and the import check's answer for the frame's format takes their
      layout; or into the output's device cache, through the cache's memory
-     as a dma-buf, where the arm decodes into caches (the driver's check of
-     decodes into targets passed a codec) and this picture was not decoded
-     there: its codec and format failed the check, as HEVC Main 10 into
-     P010 does on an RX 550's radeonsi (a picture whose reference's target
-     was overwritten), or its planes do not lie as a target's must;
+     as a dma-buf, where the arm writes into caches (the driver's check of
+     decodes into targets passed a codec, or the import check a format) and
+     this picture was not decoded there: its codec and format failed the
+     check, as HEVC Main 10 into P010 does on an RX 550's radeonsi (a
+     picture whose reference's target was overwritten), and every kind does
+     on iHD, whose decodes write their render target Y-tiled
+     ([bugs.md](bugs.md), U30), or its planes do not lie as a target's
+     must. iHD's run writes a cache's surface, whose luma plane lies at its
+     memory's first byte and its chroma plane whole rows after it, and
+     declines a cache's buffer, whose luma plane lies off its dma-buf's
+     first byte (U26);
   2. by the device's GPU, into the buffer each plane lies in, the
      surface's pages or its device cache, at the plane's offset and rows,
      the crop alone as the CPU's copy writes it, where the open made a

@@ -16,12 +16,18 @@
 //! - **A decode** hands the access unit to the decoder (`H264Decoder`, `HevcDecoder` on Annex B,
 //!   in decode order), which starts the hardware's work and answers the access unit's frame: one,
 //!   or none for parameter sets and for a picture the stream's random access skips.
-//! - **A picture is decoded into its output's device cache** where it can be ([`CacheTargets`]):
-//!   where both planes lie in one cache whose memory the platform made a dma-buf
-//!   (`decodes_into_device_caches`), the driver's check passed the codec and format (the VA
-//!   crate's `TargetChecks`, kept under `device-checks/va-targets` in the platform's cache
-//!   directory), the planes' rows and starts lie on multiples of 256 bytes of the memory, and
-//!   they hold the coded picture's rows. The cache's memory is exported once, and imported as the
+//! - **The device's caches are made dma-bufs** ([`CacheTargets`], `writes_into_device_caches`)
+//!   where the platform makes caches of dma-bufs and either of the driver's checks passed anything
+//!   ([`cache_writes`]): the check of decodes into targets (the VA crate's `TargetChecks`, kept
+//!   under `device-checks/va-targets` in the platform's cache directory) a codec and format, or
+//!   the import check (the VA crate's `import_check`) NV12 or P010. iHD fails the first for every
+//!   kind, its decodes writing their render target tiled whatever the import says
+//!   (`docs/video/bugs.md`, U30), and passes the second, so on iHD every picture is written into
+//!   its cache by the driver's video processing (the first way below).
+//! - **A picture is decoded into its output's device cache** where it can be: where both planes
+//!   lie in one cache made a dma-buf, the driver's check passed the codec and format, the planes'
+//!   rows and starts lie on multiples of 256 bytes of the memory, and they hold the coded
+//!   picture's rows. The cache's memory is exported once, and imported as the
 //!   decode's render target once a cache, a new import made while the decoder still holds the
 //!   last (a reference's). The picture is then there once its decode is done and the platform
 //!   acquired what the driver wrote (`Buffer::external_write_done`, which the device's next
@@ -41,15 +47,20 @@
 //!      pitches. It is taken where both planes lie in one memory a dma-buf is made of
 //!      ([`PlanePages`]), or in one device cache made a dma-buf for the video
 //!      ([`CacheTargets`]), whose pictures the driver's check refused to decode there or whose
-//!      planes do not lie as a target's must, and where the driver's import check (the VA
-//!      crate's `import_check`) found it writes imports of the frame's format right, at the
-//!      alignment the planes' rows and starts are a multiple of, and in whole rows where it
-//!      writes them so. A picture written into a cache is acquired as a decode into it is
-//!      (`Buffer::external_write_done`). The run writes the planes' whole even width
-//!      and height within the coded picture, which [`layout`] tells the guest to make room for.
+//!      planes do not lie as a target's must, and where the driver's import check found it writes
+//!      imports of the frame's format right, at the alignment the planes' rows and starts are a
+//!      multiple of, and in whole rows where it writes them so. A picture written into a cache is
+//!      acquired as a decode into it is (`Buffer::external_write_done`, or the cache's surface's
+//!      `SurfaceMemory::external_writes_done`). The run writes the planes' whole even width and
+//!      height within the coded picture, which [`layout`] tells the guest to make room for.
 //!      CoreVideo's planes, 32 bytes into their pages, are written so by no driver: radeonsi
-//!      imports planes 256 bytes apart alone, iHD writes a plane only at its dma-buf's first byte
-//!      (`docs/video/bugs.md`, U26).
+//!      imports planes 256 bytes apart alone, iHD writes its luma plane only at its dma-buf's
+//!      first byte and its chroma plane only whole rows after it (`docs/video/bugs.md`, U26). A
+//!      cache's surface, where the guest's textures show its planes whole (the decode's, as the
+//!      guest's video driver makes them), lays its luma plane at its memory's first byte and its
+//!      chroma plane whole rows of a pitch on 256 bytes after it, which iHD writes; a cache's
+//!      buffer keeps CoreVideo's layout, its luma plane off its dma-buf's first byte, which iHD's
+//!      run declines.
 //!   2. **By the device's GPU** ([`GpuCopies`]): each plane copied into the plane's buffer, the
 //!      guest's pages or the surface's device cache, at its own rows and offset, the crop alone as
 //!      the CPU's copy writes it, where the open made a copier. On Linux the open
