@@ -39,6 +39,24 @@
 //! (`GpuDevice::import_d3d11_surface`), each plane the size of its plane shape with no rows of
 //! room below it: a decode's targets are then the planes' images and those textures
 //! (`Caches::drawn_targets`).
+//!
+//! The textures' bytes are undefined at their make, and the plane shapes owe a fill from the
+//! buffer, as any new shape does. A decode that takes a new cache's first fill as met, the
+//! buffer holding its make's zeros (`SurfaceCaches::take_decoded`), takes the plane shapes'
+//! fills as met too ([`take_drawn_fill`]), and its command buffer waits for no fill: the
+//! textures owe zeros instead (`graphics::drawn`), which the picture's draw writes wherever it
+//! does not write the picture, as that fill would have left them, so a picture smaller than its
+//! planes leaves the texels past it zero, as the module doc of `super` says of a picture that
+//! lands short of the planes. A fill of the plane shapes made since leaves the textures owing
+//! nothing ([`planes_filled`]), and a command buffer whose decode answered nothing over them
+//! has them cleared to zeros at its finish ([`SurfaceCaches::undrawn`]).
+//!
+//! **Measured** (2026-11-19, Intel UHD 630, a macOS guest's 4K H.264 and HEVC playback, its
+//! pictures held and released), before the fills were taken: the boot made 1977 such surfaces,
+//! each for a first fill a decode took as met, and its fills of the shapes alone filled 4808
+//! shapes of 23608 MiB, nearly all of them those surfaces' 3954 plane shapes, in 2522 fills on
+//! the transfer queue; the caches' fills took 2502 ms of the GPU's time, and a held picture's
+//! decode op waited 5.0 to 11.5 ms for its planes (each pass's mean), which waited for that fill.
 
 use std::sync::Arc;
 
@@ -359,17 +377,22 @@ pub(super) fn decodes_into<P: Platform>(surface: &CacheSurface<P>, decoded: bool
 }
 
 /// The log's line of the video caches' planes and the fills a video write owed, from the shapes'
-/// counts `sh`; `None` where nothing of either was counted.
+/// counts `sh`, and the plane shapes' fills taken as met where any were ([`take_drawn_fill`]);
+/// `None` where nothing of either was counted.
 pub(crate) fn planes_line(sh: &ShapeCounts) -> Option<String> {
     let any = sh.surfaces + sh.surfaces_refused + sh.planes_landed + sh.video_fills > 0;
     any.then(|| {
+        let taken = match sh.drawn_fills_taken {
+            0 => String::new(),
+            n => format!("; {n} plane shapes' fills taken as met by a decode drawn over zeros"),
+        };
         format!(
             "IOSurface device caches' video planes: {} surfaces made ({} plane shapes), {} the \
              platform made none of, {} caches holding one at once at most; {} video command \
              buffers landed in them; of the fills, {} owed by a video write ({} MiB); plane \
              shapes filled {} at their make, {} at a later use, {} surfaces' planes owing theirs \
              past their make as their cache was busy; {} video ops waited on the CPU for a \
-             cache's fill not done, the longest {} us",
+             cache's fill not done, the longest {} us{taken}",
             sh.surfaces,
             sh.planes_made,
             sh.surfaces_refused,
@@ -384,6 +407,35 @@ pub(crate) fn planes_line(sh: &ShapeCounts) -> Option<String> {
             sh.video_fill_wait_max_us
         )
     })
+}
+
+/// A decode took the first fill of the cache whose surface is `surface` and shapes `shapes` as
+/// met, the buffer holding its make's zeros ([`super::SurfaceCaches::take_decoded`]): where the
+/// surface's planes lie over Direct3D 11 textures, the fills its plane shapes owe are taken as
+/// met too, and the textures owe zeros instead (module doc); counted in `counts`.
+#[cfg(windows)]
+pub(super) fn take_drawn_fill<P: Platform>(
+    surface: &CacheSurface<P>,
+    shapes: &mut ShapeTable<P::Texture>,
+    counts: &mut ShapeCounts,
+) {
+    let Some(made) = &surface.made else {
+        return;
+    };
+    let taken = shapes.take_plane_fills();
+    if taken > 0 {
+        made.drawn.fill_taken();
+        counts.drawn_fills_taken += taken;
+    }
+}
+
+/// A fill of the plane shapes of the cache whose surface is `surface` from its buffer was made:
+/// where the planes lie over Direct3D 11 textures, they owe no zeros (module doc).
+#[cfg(windows)]
+pub(super) fn planes_filled<P: Platform>(surface: &CacheSurface<P>) {
+    if let Some(made) = &surface.made {
+        made.drawn.filled();
+    }
 }
 
 #[cfg(unix)]
@@ -664,6 +716,21 @@ impl<P: Platform> CacheSurface<P> {
 
 #[cfg(windows)]
 impl<P: Platform> SurfaceCaches<P> {
+    /// The Direct3D 11 textures under the planes of the blocks `counts` names whose caches still
+    /// hold their make's zeros where a decode took their first fill as met
+    /// ([`super::SurfaceCache::zeros`]) as a command buffer that used them finishes, and that
+    /// owe zeros: no decode answered a picture over them, so none is drawn, and the caller
+    /// clears them to the zeros a fill would have left before the buffer's commit (module doc).
+    pub(super) fn undrawn(&self, counts: &[super::Count]) -> Vec<Arc<DrawnPlanes>> {
+        (counts.iter())
+            .filter_map(|count| {
+                let cache = self.by_block.get(&count.block)?;
+                let made = cache.surface.made.as_ref().filter(|_| cache.zeros)?;
+                made.drawn.owes_zeros().then(|| Arc::clone(&made.drawn))
+            })
+            .collect()
+    }
+
     /// [`Caches::plane_shape`]'s ask, under the caches' lock: the surface over Direct3D 11
     /// textures to ask of the block at `block`'s cache for the shape `key`
     /// ([`CacheSurface::drawn_ask`]).
@@ -916,5 +983,186 @@ mod rt_windows_tests {
                 }
             }
         });
+    }
+}
+
+/// On Windows, a video cache's surface over the plane draws' Direct3D 11 textures in the caches'
+/// rig: the plane shapes' fills a decode takes as met (the module doc).
+#[cfg(all(test, windows))]
+mod drawn_tests {
+    use reims_vgpu_graphics::ops::{RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
+    use reims_vgpu_video::vaapi::PlaneDraw;
+    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
+
+    use super::super::super::surface_pages::tests::{BLOCK, Rig};
+    use super::super::Reach;
+    use super::super::tests::cached;
+    use super::*;
+
+    /// The memory of the rig's surface, whose writes the tests make none of.
+    struct Unwritten;
+
+    impl ImportedSurfaceMemory for Unwritten {
+        fn external_writes_done(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// The planes of the rig's 64 by 48 NV12 surface in its pages: the luma's rows, then the
+    /// chroma's.
+    const PLANES: [PagesPlane; 2] = [
+        PagesPlane {
+            offset: 0,
+            bytes_per_row: 64,
+            row_bytes: 64,
+            rows: 48,
+        },
+        PagesPlane {
+            offset: 64 * 48,
+            bytes_per_row: 64,
+            row_bytes: 64,
+            rows: 24,
+        },
+    ];
+
+    /// The rig's cache made for the host's video, its surface's planes over the Direct3D 11
+    /// textures `draw` makes, its plane shapes owing their fills from the buffer, as
+    /// [`SurfaceCaches::add_drawn_planes`] leaves a new surface's: the textures, and the CPU
+    /// generation of the first fill the cache owes.
+    fn drawn_cache(r: &Rig, draw: &Arc<PlaneDraw>) -> (Arc<DrawnPlanes>, u64) {
+        let drawn = Arc::new(DrawnPlanes::new(draw, (64, 48), false).expect("the textures"));
+        let images: [<FakePlatform as Platform>::Texture; 2] = std::array::from_fn(|n| {
+            let desc = r.p.texture_descriptor(&TextureDesc {
+                pixel_format: PLANE_FORMATS[0].1[n],
+                width: 64 >> n,
+                height: 48 >> n,
+                usage: PLANE_USAGE,
+                ..TextureDesc::default()
+            });
+            (r.device.new_texture(ON, &desc).unwrap()).expect("a plane's image")
+        });
+        let key = |plane, offset, width, height, texel_bytes| ShapeKey {
+            plane,
+            offset,
+            bytes_per_row: 64,
+            width,
+            height,
+            texel_bytes,
+            storage: false,
+        };
+        let keys = [key(0, 0, 64, 48, 1), key(1, 64 * 48, 32, 24, 2)];
+        let mut state = r.dec.surface_caches.lock();
+        let cache = state.by_block.get_mut(&BLOCK).expect("the rig's cache");
+        let owed = cache.first_fill.expect("the cache owes its first fill");
+        cache.surface = CacheSurface::new(Some(VideoMemory::Drawn), Some(&PLANES));
+        cache.surface.asked = true;
+        for (key, image) in keys.into_iter().zip(&images) {
+            drop(cache.shapes.insert_plane(key, image.clone_ref(), true, 0));
+        }
+        cache.surface.made = Some(DrawnSurface {
+            planes: images,
+            memory: Arc::new(Unwritten),
+            drawn: Arc::clone(&drawn),
+            life: MemoryLife::new(),
+        });
+        (drawn, owed)
+    }
+
+    /// The use of a decode that writes the rig's block at CPU generation `cpu_gen`.
+    fn decodes(cpu_gen: u64) -> [RgfxOpSurfaceUse; 1] {
+        [RgfxOpSurfaceUse {
+            block_offset: BLOCK,
+            cpu_gen,
+            flags: RGFX_SURFACE_USE_WRITES,
+            reserved_14: 0,
+        }]
+    }
+
+    /// The reach of a command buffer of a decode alone that writes the rig's surface's planes
+    /// whole.
+    fn decoding() -> Reach {
+        Reach {
+            context: None,
+            work: false,
+            video: true,
+            decoded: vec![(BLOCK, PLANES)],
+        }
+    }
+
+    /// The fills of a buffer or an image from a buffer that `r`'s platform was asked for since
+    /// `mark`.
+    fn fills_since(r: &Rig, mark: u64) -> usize {
+        (r.p.call_log().since(mark).iter())
+            .filter(|c| c.sel.starts_with("copyFromBuffer:"))
+            .count()
+    }
+
+    /// A decode that writes the planes whole, into a new cache whose surface's planes lie over
+    /// Direct3D 11 textures, takes the plane shapes' fills as met with the cache's first fill:
+    /// its command buffer fills neither and waits for no fill, and the textures owe zeros
+    /// instead, for the picture's draw to write. Nothing is filled at its finish either, its
+    /// picture answered
+    #[test]
+    #[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
+    fn a_decode_into_a_new_drawn_cache_fills_no_plane_shape_and_waits_for_none() {
+        let r = cached();
+        let draw = Arc::new(PlaneDraw::new(None).expect("the plane draws"));
+        let (drawn, owed) = drawn_cache(&r, &draw);
+        let queue = r.device.new_command_queue().unwrap();
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        let caches = &r.dec.surface_caches;
+        let mark = r.p.call_log().mark();
+        let (waits, uses) = (caches.before(&r.device, &cb, &decodes(owed), &decoding())).unwrap();
+        assert!(!waits, "no wait on the GPU");
+        assert!(
+            caches.lock().last_fill(BLOCK).is_none(),
+            "no fill to wait for"
+        );
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (counts.fills, counts.made_fills, counts.decode_firsts),
+            (0, 0, 1)
+        );
+        let shapes = counts.shapes;
+        assert_eq!(
+            (shapes.fills, shapes.fills_made, shapes.drawn_fills_taken),
+            (0, 0, 2)
+        );
+        assert!(drawn.owes_zeros(), "the textures owe zeros");
+        drop(caches.drawn_targets(BLOCK).expect("the decode's targets"));
+        caches.decoded(Some(&r.device), BLOCK, true).unwrap();
+        (caches.finish(&r.device, 7, None, &cb, uses.unwrap(), || cb.commit(ON))).unwrap();
+        assert_eq!(fills_since(&r, mark), 0, "nothing filled");
+        assert!(drawn.owes_zeros(), "the picture's draw writes them");
+    }
+
+    /// Where such a decode answers nothing at all, its command buffer's finish clears the
+    /// textures to the zeros they owe; where it answers no picture, the cache's first fill is
+    /// made, which fills the plane shapes from the buffer: either way the textures owe nothing
+    /// after the finish
+    #[test]
+    #[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
+    fn a_drawn_cache_no_picture_lands_in_owes_nothing_after_the_finish() {
+        let draw = Arc::new(PlaneDraw::new(None).expect("the plane draws"));
+        for answer in [None, Some(false)] {
+            let r = cached();
+            let (drawn, owed) = drawn_cache(&r, &draw);
+            let queue = r.device.new_command_queue().unwrap();
+            let cb = queue.command_buffer(ON).unwrap().unwrap();
+            let caches = &r.dec.surface_caches;
+            let (_, uses) = (caches.before(&r.device, &cb, &decodes(owed), &decoding())).unwrap();
+            assert!(drawn.owes_zeros(), "{answer:?}: owed at the begin");
+            drop(caches.drawn_targets(BLOCK).expect("the decode's targets"));
+            if let Some(picture) = answer {
+                caches.decoded(Some(&r.device), BLOCK, picture).unwrap();
+            }
+            (caches.finish(&r.device, 7, None, &cb, uses.unwrap(), || cb.commit(ON))).unwrap();
+            assert!(!drawn.owes_zeros(), "{answer:?}: owed after the finish");
+            let filled = r.dec.caches().counts().shapes.fills;
+            let expected = if answer.is_some() { 2 } else { 0 };
+            assert_eq!(filled, expected, "{answer:?}: the plane shapes filled");
+        }
     }
 }

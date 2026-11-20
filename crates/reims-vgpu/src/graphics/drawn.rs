@@ -12,6 +12,16 @@
 //! across its write, waits for it on the landing's thread and releases them, and the landing then
 //! says the writes are done (`ImportedSurfaceMemory::external_writes_done`).
 //!
+//! A new cache's plane shapes owe a fill from its buffer, its make's zeros. A decode that takes
+//! the cache's first fill as met takes theirs as met too (`decode::surface_cache`'s
+//! `exported`), so the textures are to read zeros wherever its picture's draw does not write
+//! them, as that fill would have left them ([`DrawnPlanes::fill_taken`]): the draw clears them
+//! to zeros first where its picture is smaller than the planes (reims-vgpu-video's
+//! `PlaneTargets::owe_zeros`). Where no picture is drawn, they are cleared alone
+//! ([`DrawnPlanes::unwritten`]): a draw that fails, before the CPU's copy, and a command buffer
+//! whose decode answered nothing, at its finish. A fill of the shapes from the buffer since
+//! leaves them owing nothing ([`DrawnPlanes::filled`]).
+//!
 //! Each draw is counted by picture ([`DRAWN_CODE`]) and by the KiB of its planes' crop
 //! ([`DRAWN_KIB_CODE`]). A real Mac decodes straight into the surface the guest reads, so the
 //! draw is one GPU pass per picture that a Mac does not make.
@@ -59,16 +69,54 @@ impl DrawnPlanes {
     }
 
     /// Draws `frame`'s crop into the textures once its decode is done (the module doc), and
-    /// counts it. `Err` says why it was not drawn.
+    /// counts it. `Err` says why it was not drawn, the textures cleared to the zeros they owe
+    /// first ([`Self::unwritten`]).
     pub(crate) fn draw(&self, frame: &Frame) -> Result<(), String> {
-        frame.sync().map_err(|error| error.to_string())?;
-        let texture = (frame.texture()).ok_or("the picture lies in no shared texture")?;
-        let extent = (frame.width(), frame.height());
-        self.draw
-            .draw(&texture, frame.crop_origin(), &self.targets, extent)?;
+        let drawn = frame
+            .sync()
+            .map_err(|error| error.to_string())
+            .and_then(|()| {
+                let texture = (frame.texture()).ok_or("the picture lies in no shared texture")?;
+                let extent = (frame.width(), frame.height());
+                self.draw
+                    .draw(&texture, frame.crop_origin(), &self.targets, extent)
+            });
+        if let Err(why) = drawn {
+            self.unwritten();
+            return Err(why);
+        }
         reims_vgpu_vulkan::answer::count_kind(DRAWN_CODE);
         reims_vgpu_vulkan::answer::count_kind_by(DRAWN_KIB_CODE, crop_bytes(frame) >> 10);
         Ok(())
+    }
+
+    /// A decode took the fill the cache's plane shapes owe as met: the textures are to read
+    /// zeros wherever no picture's draw writes them (the module doc).
+    pub(crate) fn fill_taken(&self) {
+        self.targets.owe_zeros();
+    }
+
+    /// A fill of the plane shapes' images from the cache's buffer was made: the textures owe no
+    /// zeros (the module doc).
+    pub(crate) fn filled(&self) {
+        self.targets.written();
+    }
+
+    /// Whether the textures owe zeros ([`Self::fill_taken`]).
+    pub(crate) fn owes_zeros(&self) -> bool {
+        self.targets.owes_zeros()
+    }
+
+    /// Clears the textures to the zeros they owe, where no picture is drawn into them (the module
+    /// doc), and returns once the GPU did; nothing where they owe none. A failure is logged.
+    pub(crate) fn unwritten(&self) {
+        if let Err(why) = self.draw.zero_owed(&self.targets) {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = why;
+                "a video cache's Direct3D 11 textures were not cleared to the zeros they owe: \
+                 {why}"
+            );
+        }
     }
 }
 

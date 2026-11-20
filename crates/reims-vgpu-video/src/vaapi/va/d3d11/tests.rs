@@ -1,16 +1,20 @@
-//! The plane draws on the default adapter, against `vaGetImage`'s read back of each picture.
+//! The plane draws on the default adapter, against `vaGetImage`'s read back of each picture,
+//! and the zeros their targets owe.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::core::runtime::{Runtime as _, StdRuntime};
 
+use super::super::d3d12::{Device, SharedTexture};
 use super::super::display::Display;
 use super::super::frame::{Frame, PlaneRows};
 use super::super::h264::H264Decoder;
 use super::super::hevc::HevcDecoder;
 use super::super::readback::{ReadbackWay, read_back_by};
-use super::{PlaneDraw, PlaneTargets};
+use super::super::surface::SurfaceFormat;
+use super::{PlaneDraw, PlaneTargets, covers};
 
 /// The streams of the directories `RVG_VA_STREAMS` lists (as `PATH` lists them): each H.264
 /// (`.264`) and HEVC (`.265`) file, in name order.
@@ -176,4 +180,149 @@ fn each_picture_drawn_into_its_targets_is_what_get_image_reads_back() {
     );
     assert!(pictures > 0);
     assert!(differ.is_empty(), "{differ:?}");
+}
+
+/// A shared texture of the default adapter's, of `ten_bit` samples or 8-bit ones, 64 by 48: a
+/// picture's pool texture, its texels as they were made.
+fn source(ten_bit: bool) -> Arc<SharedTexture> {
+    let format = if ten_bit {
+        SurfaceFormat::P010
+    } else {
+        SurfaceFormat::Nv12
+    };
+    let device = Device::new(None).expect("a Direct3D 12 device");
+    let texture = device
+        .shared_texture(format, 64, 48)
+        .expect("a shared texture");
+    Arc::new(texture)
+}
+
+/// The bytes of `targets`' planes past a picture of `extent` luma samples drawn from their first
+/// texel, of `sample` bytes a luma sample: the luma's and the chroma's, each a plane of `size`
+/// luma samples read back row after row with nothing between them.
+fn past_picture(
+    planes: &[Vec<u8>; 2],
+    size: (usize, usize),
+    extent: (usize, usize),
+    sample: usize,
+) -> [Vec<u8>; 2] {
+    let half = |(w, h): (usize, usize)| (w.div_ceil(2), h.div_ceil(2));
+    let shapes = [
+        (size.0 * sample, extent.0 * sample, extent.1),
+        (
+            half(size).0 * 2 * sample,
+            half(extent).0 * 2 * sample,
+            half(extent).1,
+        ),
+    ];
+    std::array::from_fn(|n| {
+        let (row, drawn_row, drawn_rows) = shapes[n];
+        (planes[n].chunks(row).enumerate())
+            .flat_map(|(y, bytes)| {
+                if y < drawn_rows {
+                    &bytes[drawn_row..]
+                } else {
+                    bytes
+                }
+            })
+            .copied()
+            .collect()
+    })
+}
+
+/// Targets of 64 by 48 luma samples, of 8-bit samples and of 10-bit ones, cleared to bytes of
+/// their own, then drawn a picture of 32 by 16 from a pool texture: where they owe zeros, the
+/// draw clears them first, so every byte past the picture reads zero, and they owe none after;
+/// where they owe none, every byte past the picture is as it was. Run holding the GPU, on the
+/// default adapter.
+#[test]
+#[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
+fn a_draw_short_of_its_targets_leaves_zeros_past_the_picture_only_where_they_owe_them() {
+    let draw = PlaneDraw::new(None).expect("the plane draws");
+    for ten_bit in [false, true] {
+        let texture = source(ten_bit);
+        let sample = if ten_bit { 2 } else { 1 };
+        for owed in [true, false] {
+            let to = draw.targets((64, 48), ten_bit).expect("the targets");
+            draw.clear_to(&to, [255.0; 4]).expect("the targets' clear");
+            let before = draw.read_back(&to).expect("the targets' read back");
+            let kept = past_picture(&before, (64, 48), (32, 16), sample);
+            assert!(
+                kept.iter().all(|plane| plane.iter().any(|&b| b != 0)),
+                "{ten_bit}: the clear wrote bytes of its own"
+            );
+            if owed {
+                to.owe_zeros();
+            }
+            draw.draw(&texture, (0, 0), &to, (32, 16))
+                .expect("the draw");
+            assert!(
+                !to.owes_zeros(),
+                "{ten_bit}, {owed}: none owed after the draw"
+            );
+            let after = draw.read_back(&to).expect("the targets' read back");
+            let past = past_picture(&after, (64, 48), (32, 16), sample);
+            for (plane, (past, kept)) in ["luma", "chroma"].iter().zip(past.iter().zip(&kept)) {
+                if owed {
+                    assert!(
+                        past.iter().all(|&b| b == 0),
+                        "{ten_bit}: the {plane}'s bytes past the picture read zero"
+                    );
+                } else {
+                    assert_eq!(
+                        past, kept,
+                        "{ten_bit}: the {plane}'s bytes past the picture"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// [`PlaneDraw::zero_owed`] clears targets that owe zeros, and they owe none after; it keeps
+/// the bytes of targets that owe none, as of targets another device has since said it wrote
+/// whole ([`PlaneTargets::written`]). Run holding the GPU, on the default adapter.
+#[test]
+#[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
+fn zero_owed_clears_only_targets_that_owe_zeros() {
+    let draw = PlaneDraw::new(None).expect("the plane draws");
+    for ten_bit in [false, true] {
+        let to = draw.targets((64, 48), ten_bit).expect("the targets");
+        draw.clear_to(&to, [255.0; 4]).expect("the targets' clear");
+        let before = draw.read_back(&to).expect("the targets' read back");
+        assert!(before.iter().all(|plane| plane.iter().any(|&b| b != 0)));
+        draw.zero_owed(&to).expect("no clear");
+        assert_eq!(
+            draw.read_back(&to).expect("a read back"),
+            before,
+            "{ten_bit}: none owed"
+        );
+        to.owe_zeros();
+        to.written();
+        draw.zero_owed(&to).expect("no clear");
+        assert_eq!(
+            draw.read_back(&to).expect("a read back"),
+            before,
+            "{ten_bit}: written"
+        );
+        to.owe_zeros();
+        draw.zero_owed(&to).expect("the clear");
+        assert!(!to.owes_zeros(), "{ten_bit}: none owed after");
+        let after = draw.read_back(&to).expect("a read back");
+        assert!(
+            after.iter().all(|plane| plane.iter().all(|&b| b == 0)),
+            "{ten_bit}: every byte reads zero"
+        );
+    }
+}
+
+/// A picture's extent covers its targets where it is their size, or more, each way, and only
+/// then.
+#[test]
+fn a_picture_covers_its_targets_only_at_their_size_each_way() {
+    assert!(covers((64, 48), (64, 48)));
+    assert!(covers((63, 47), (64, 48)));
+    assert!(!covers((64, 48), (64, 47)));
+    assert!(!covers((64, 48), (63, 48)));
+    assert!(!covers((3840, 2160), (1920, 1080)));
 }

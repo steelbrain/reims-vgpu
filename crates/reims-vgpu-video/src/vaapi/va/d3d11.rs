@@ -28,6 +28,15 @@
 //! pipelines of the four target formats, by a draw into a texture of each. A pool texture's open
 //! and views are made at its first picture, and kept while it lives.
 //!
+//! A target's bytes are undefined at its make. Its owner may say they are to read zeros wherever
+//! no draw writes them ([`PlaneTargets::owe_zeros`]): the next draw whose extent leaves part of
+//! them unwritten then clears both to zeros first, in the same hold of their keyed mutexes and
+//! the same wait, and a draw that writes them whole clears nothing; where no draw is to come,
+//! [`PlaneDraw::zero_owed`] clears them alone. Either way they owe no zeros after, nor once their
+//! owner says another device wrote them whole ([`PlaneTargets::written`]). The zeros are a
+//! clear of each target's render target view to 0, which every target format stores as zero
+//! bits.
+//!
 //! The form is made only where both Direct3D 11 devices answer `ExtendedResourceSharing`
 //! (`D3D11_FEATURE_D3D11_OPTIONS`), which sharing the targets' formats needs; elsewhere
 //! [`PlaneDraw::new`] says why not, and the caller copies by the CPU.
@@ -45,6 +54,7 @@
 
 use std::ffi::{CStr, c_void};
 use std::ptr::{NonNull, null, null_mut};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use crate::core::sync::Mutex;
@@ -110,6 +120,7 @@ const CONTEXT_OM_SET_RENDER_TARGETS: usize = 33;
 const CONTEXT_RS_SET_VIEWPORTS: usize = 44;
 const CONTEXT_COPY_RESOURCE: usize = 47;
 const CONTEXT_UPDATE_SUBRESOURCE: usize = 48;
+const CONTEXT_CLEAR_RENDER_TARGET_VIEW: usize = 50;
 const CONTEXT_FLUSH: usize = 111;
 const ON12_CREATE_WRAPPED_RESOURCE: usize = 3;
 const ON12_RELEASE_WRAPPED_RESOURCES: usize = 4;
@@ -346,6 +357,9 @@ pub struct PlaneTargets {
     planes: [Target; 2],
     ten_bit: bool,
     size: (u32, u32),
+    /// They are to read zeros wherever no draw writes them, and no draw or clear has since
+    /// (module doc).
+    zeros_owed: AtomicBool,
 }
 
 /// One of [`PlaneTargets`]: a texture of the native device, shared by NT handle with a keyed
@@ -382,6 +396,29 @@ impl PlaneTargets {
     pub fn size(&self) -> (u32, u32) {
         self.size
     }
+
+    /// Says that they are to read zeros wherever no draw writes them, until a draw or
+    /// [`PlaneDraw::zero_owed`] writes them, or [`Self::written`] (module doc).
+    pub fn owe_zeros(&self) {
+        self.zeros_owed.store(true, Ordering::Release);
+    }
+
+    /// Says that another device wrote them whole: they owe no zeros (module doc).
+    pub fn written(&self) {
+        self.zeros_owed.store(false, Ordering::Release);
+    }
+
+    /// Whether they owe zeros ([`Self::owe_zeros`]).
+    pub fn owes_zeros(&self) -> bool {
+        self.zeros_owed.load(Ordering::Acquire)
+    }
+}
+
+/// Whether a picture's draw of `extent` luma samples, from their first texel, writes targets of
+/// `size` luma samples whole: the extent is at least the size each way, and so the chroma's
+/// half of it, rounded up, at least theirs.
+fn covers(size: (u32, u32), extent: (u32, u32)) -> bool {
+    extent.0 >= size.0 && extent.1 >= size.1
 }
 
 impl Target {
@@ -470,14 +507,17 @@ impl PlaneDraw {
             ],
             ten_bit,
             size,
+            zeros_owed: AtomicBool::new(false),
         })
     }
 
     /// Draws the picture in `texture`, a pool's, once its decode is done, into `to`: the
     /// `extent.0` by `extent.1` luma samples from `origin` (the crop's first column and row,
     /// even), at the targets' first texel, and half as many chroma samples of each, rounded up,
-    /// from half the origin (module doc). Returns once the GPU wrote them, however long it
-    /// takes; `Err` with why where a call failed, or the device was removed.
+    /// from half the origin (module doc), cleared to zeros first where they owe zeros and the
+    /// extent leaves part of them unwritten ([`PlaneTargets::owe_zeros`]). Returns once the GPU
+    /// wrote them, however long it takes, owing no zeros; `Err` with why where a call failed, or
+    /// the device was removed, owing what they owed.
     pub fn draw(
         &self,
         texture: &Arc<SharedTexture>,
@@ -504,6 +544,10 @@ impl PlaneDraw {
         let at = state.opened(texture, to.ten_bit)?;
         let (x, y) = origin;
         state.set_origin([x, y, x / 2, y / 2]);
+        // The owed zeros are taken as the draw is recorded, under the state's lock, as
+        // `zero_owed` takes them: no clear of theirs is recorded after a draw that wrote them.
+        let owed = to.zeros_owed.swap(false, Ordering::AcqRel);
+        let clear = owed && !covers(to.size, extent);
         let mutexes = [&luma_target.mutex, &chroma_target.mutex];
         let mut held = 0;
         let acquired = mutexes.iter().try_for_each(|mutex| {
@@ -512,6 +556,9 @@ impl PlaneDraw {
             Ok::<(), String>(())
         });
         let encoded = acquired.map(|()| {
+            if clear {
+                state.clear(&to.planes, [0.0; 4]);
+            }
             let opened = &state.opened[at];
             let shaders = &state.pixel[usize::from(to.ten_bit)];
             let draws = [
@@ -528,8 +575,38 @@ impl PlaneDraw {
         let signalled = encoded.and_then(|()| state.flush_and_signal());
         drop(state);
         // The wait for the GPU's writes holds no lock (module doc).
-        wait_for(&self.fence, signalled?)?;
-        released.into_iter().collect()
+        let drawn = signalled
+            .and_then(|value| wait_for(&self.fence, value))
+            .and_then(|()| released.into_iter().collect());
+        if drawn.is_err() && owed {
+            to.owe_zeros();
+        }
+        drawn
+    }
+
+    /// Clears `to` to zeros where it owes them ([`PlaneTargets::owe_zeros`]), and returns once
+    /// the GPU did, however long it takes; nothing where it owes none. It owes none after,
+    /// `Err` with why where a call failed, or the device was removed, included.
+    pub fn zero_owed(&self, to: &PlaneTargets) -> Result<(), String> {
+        let mut state = self.state.lock();
+        if !to.zeros_owed.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        holding(to, || {
+            state.clear(&to.planes, [0.0; 4]);
+            state.flush_and_wait()
+        })
+    }
+
+    /// Clears `to` to `colour`, as a target's format converts it, and returns once the GPU did:
+    /// bytes a test's draw is to keep or replace.
+    #[cfg(test)]
+    fn clear_to(&self, to: &PlaneTargets, colour: [f32; 4]) -> Result<(), String> {
+        let mut state = self.state.lock();
+        holding(to, || {
+            state.clear(&to.planes, colour);
+            state.flush_and_wait()
+        })
     }
 
     /// What `targets` hold, for checks: the luma's bytes and the chroma's, row after row with
@@ -723,6 +800,20 @@ impl State {
                 0,
                 0,
             );
+        }
+    }
+
+    /// Records a clear of each of `targets` to `colour`, as its format converts it: 0 is zero bits
+    /// in each. The caller holds the targets' keyed mutexes.
+    fn clear(&self, targets: &[Target], colour: [f32; 4]) {
+        // SAFETY: the method is ID3D11DeviceContext's `ClearRenderTargetView`, of render target
+        // views of the device's, from four floats; the context is called under the state's lock.
+        unsafe {
+            let clear: unsafe extern "system" fn(*mut c_void, *mut c_void, *const f32) =
+                self.context.method(CONTEXT_CLEAR_RENDER_TARGET_VIEW);
+            for target in targets {
+                clear(self.context.raw(), target.view.raw(), colour.as_ptr());
+            }
         }
     }
 
@@ -1331,6 +1422,26 @@ fn completed(fence: &Com) -> u64 {
             fence.method(FENCE_GET_COMPLETED_VALUE);
         completed(fence.raw())
     }
+}
+
+/// Runs `work` holding both of `to`'s keyed mutexes on the draws' device (key 0), and lets go of
+/// those it took once `work` returns, or a take failed: `Err` where `work`, a take or a release
+/// failed, the first of them.
+fn holding(to: &PlaneTargets, work: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    let mutexes = to.planes.each_ref().map(|target| &target.mutex);
+    let mut held = 0;
+    let acquired = mutexes.iter().try_for_each(|mutex| {
+        acquire_sync(mutex)?;
+        held += 1;
+        Ok::<(), String>(())
+    });
+    let done = acquired.and_then(|()| work());
+    // The targets are let go once the GPU wrote them, or where a call failed.
+    let released: Vec<_> = (mutexes.iter().take(held))
+        .map(|mutex| release_sync(mutex))
+        .collect();
+    done?;
+    released.into_iter().collect()
 }
 
 /// Takes `mutex`, an `IDXGIKeyedMutex`, at key 0, however long its holder keeps it.

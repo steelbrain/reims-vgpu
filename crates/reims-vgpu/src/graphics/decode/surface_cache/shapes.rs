@@ -165,7 +165,11 @@
 //! planes' texels (each row's padding, and the rows of room below): a fill and a write-back move
 //! the shapes' texels alone, and a copy out of a cache of a surface the kext laid out moves its
 //! planes' texels alone (`super::SurfaceCache`'s `texels`), so those bytes of the pages stay as
-//! the guest's CPU wrote them, a new IOSurface's zeros.
+//! the guest's CPU wrote them, a new IOSurface's zeros. On Windows the planes lie over
+//! Direct3D 11 textures that the pictures are drawn into, and take no fill at their make: a
+//! decode that takes a new cache's first fill as met takes its plane shapes' fills as met too
+//! (`ShapeTable::take_plane_fills`), as the buffer holds its make's zeros and the textures are
+//! cleared to zeros wherever the picture's draw does not write them (`super::exported`).
 //!
 //! **References.** Each guest texture over a shape, and each guest view of one, holds a
 //! [`ShapeRef`] in its decoder entry; the count of those is the shape's reference count, so every
@@ -446,6 +450,9 @@ pub(crate) struct ShapeCounts {
     /// command buffers' writes that landed in them.
     pub(crate) planes_made: u64,
     pub(crate) planes_landed: u64,
+    /// Plane shapes' fills taken as met by a decode drawn over a new cache's zeros
+    /// ([`ShapeTable::take_plane_fills`], on Windows).
+    pub(crate) drawn_fills_taken: u64,
     /// Surfaces made for video caches' planes, those the platform made none of, and the most
     /// caches that held one at once (`super::exported`).
     pub(crate) surfaces: u64,
@@ -705,6 +712,22 @@ impl<T> ShapeTable<T> {
             shape.dirty = false;
             counts.video_owed += 1;
         }
+    }
+
+    /// A decode that writes the planes whole took the cache's first fill as met, its buffer
+    /// holding its make's zeros, where the plane shapes' images lie over Direct3D 11 textures
+    /// that its picture is drawn into, cleared to zeros wherever it does not write them (the
+    /// module doc, "Plane shapes"): each plane shape that owes a fill owes none. How many owed
+    /// one.
+    #[cfg(any(windows, test))]
+    pub(crate) fn take_plane_fills(&mut self) -> u64 {
+        let mut taken = 0;
+        for shape in self.shapes.iter_mut().filter(|s| s.plane && s.owed) {
+            shape.owed = false;
+            shape.video = false;
+            taken += 1;
+        }
+        taken
     }
 
     /// The shapes `ids` were copied into the buffer ([`write_back`]), by a command buffer now
@@ -1242,6 +1265,32 @@ mod tests {
         let gone: Vec<u64> = table.sweep(&mut counts).iter().map(|s| s.image).collect();
         assert_eq!(gone, vec![0]);
         assert_eq!(counts.kept_dirty, 1);
+    }
+
+    /// A decode drawn over a new cache's zeros takes as met the fills its plane shapes owe, and
+    /// no other shape's (the module doc, "Plane shapes"): the shapes still owe a fill while
+    /// another does.
+    #[test]
+    fn a_decode_drawn_over_zeros_takes_only_the_plane_shapes_fills() {
+        let mut table = ShapeTable::<u64>::default();
+        let chroma = ShapeKey {
+            plane: 1,
+            offset: 64 * 4096,
+            ..key(32, 2)
+        };
+        drop(table.insert_plane(key(64, 1), 0, true, 0));
+        drop(table.insert_plane(chroma, 1, true, 0));
+        drop(table.insert(key(16, 4), 2, true, 0));
+        table.owe_all(&mut ShapeCounts::default());
+        assert_eq!(table.take_plane_fills(), 2);
+        let owing: Vec<u64> = (table.iter().filter(|s| s.owed)).map(|s| s.image).collect();
+        assert_eq!(owing, vec![2], "the other shape's fill is owed still");
+        assert!(
+            table.iter().all(|s| s.owed || !s.video),
+            "a fill taken is no video write's"
+        );
+        assert!(table.owes());
+        assert_eq!(table.take_plane_fills(), 0, "none owed");
     }
 
     /// On the Vulkan platform, shapes over one cache's buffer, of three formats, sizes and places,

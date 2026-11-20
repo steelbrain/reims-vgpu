@@ -3867,7 +3867,9 @@ impl<P: Platform> SurfaceCaches<P> {
     /// generation `generation`: where the fill owed is of that generation or a newer one, and no
     /// device of the host wrote the pages since the make. The cache holds that generation, its
     /// zeros until the picture lands ([`SurfaceCache::zeros`]), and copies into the pages only
-    /// the planes' rows where the kext gave no layout ([`SurfaceCache::texels`]).
+    /// the planes' rows where the kext gave no layout ([`SurfaceCache::texels`]). On Windows,
+    /// where its surface's planes lie over Direct3D 11 textures, its plane shapes' fills are
+    /// taken as met too ([`exported::take_drawn_fill`]).
     fn take_decoded(&mut self, block: u64, generation: u64, planes: &[PagesPlane; 2]) {
         let host = self.watched.writes(block);
         let Some(cache) = self.by_block.get_mut(&block) else {
@@ -3883,6 +3885,8 @@ impl<P: Platform> SurfaceCaches<P> {
         cache.first_fill = None;
         cache.owner = None;
         cache.zeros = true;
+        #[cfg(windows)]
+        exported::take_drawn_fill(&cache.surface, &mut cache.shapes, &mut self.counts.shapes);
         if cache.texels.is_none() {
             cache.texels = Some(texel_spans(planes));
             cache.planes = planes.len();
@@ -4644,6 +4648,8 @@ impl<P: Platform> SurfaceCaches<P> {
         // overwritten as the buffer's are (the module doc of `shapes`).
         let (buffer, table) = (&cache.device, &mut cache.shapes);
         shapes::fill::<P>(&cb, buffer, table, |_| true, &mut self.counts.shapes)?;
+        #[cfg(windows)]
+        exported::planes_filled(&cache.surface);
         transfer.signalled += 1;
         let value = transfer.signalled;
         cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
@@ -4714,7 +4720,13 @@ impl<P: Platform> SurfaceCaches<P> {
         wait_for_users::<P>(&cb, &self.ends, cache)?;
         let (buffer, table) = (&cache.device, &mut cache.shapes);
         let back = shapes::write_back::<P>(&cb, buffer, table, |s| s.dirty && !s.owed)?;
+        #[cfg(windows)]
+        let planes = table.iter().any(|s| s.plane && s.owed);
         shapes::fill::<P>(&cb, buffer, table, |s| s.owed, &mut self.counts.shapes)?;
+        #[cfg(windows)]
+        if planes {
+            exported::planes_filled(&cache.surface);
+        }
         transfer.signalled += 1;
         let value = transfer.signalled;
         cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
@@ -7200,8 +7212,12 @@ impl<P: Platform> Caches<P> {
         mut uses: Uses<P>,
         commit: impl FnOnce() -> RaiseResult<()>,
     ) -> RaiseResult<()> {
+        #[cfg(windows)]
+        let mut undrawn = Vec::new();
         let signalled = {
             let mut state = self.lock();
+            #[cfg(windows)]
+            undrawn.extend(state.undrawn(&uses.blocks));
             let unseen: Vec<u64> = (uses.blocks.iter())
                 .filter(|c| c.writes && !uses.seen.contains(&c.block))
                 .map(|c| c.block)
@@ -7217,6 +7233,13 @@ impl<P: Platform> Caches<P> {
             (state.after(device, queue, cb, &uses.blocks), buffers)
         };
         let (signalled, buffers) = signalled;
+        // Textures no picture is drawn into are cleared to the zeros they owe before the commit,
+        // with the lock let go of, so every later use of their caches reads them
+        // (`exported::undrawn`).
+        #[cfg(windows)]
+        for drawn in undrawn {
+            drawn.unwritten();
+        }
         let done = signalled.and_then(|()| commit());
         if done.is_ok() {
             self.make_memory(buffers, MemoryFor::EarlyCopy);
