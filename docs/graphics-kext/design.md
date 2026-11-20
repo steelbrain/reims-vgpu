@@ -1163,11 +1163,15 @@ Stages:
       - The compositor's GPU does its part fast: the 780M copies a 30.1 MB
         image from host memory in 1.25 to 1.44 ms, and presents a cleared
         image of the window's size 4656 times a second.
-    - **Built: the window shown by the compositor's GPU.**
-      Where the compositor runs on another GPU, the window's swapchain is
-      made on that GPU, whose buffers are its own, and only what changed of
-      each frame crosses the runtime's GPU's link. Two routes were weighed.
-      Route 2 was measured and rejected (below); route 1 is built:
+    - **The window shown by the compositor's GPU**, built on the platform
+      before rt and deleted with it: rt makes one device for everything,
+      and the window presents from it, each image crossing to the
+      compositor's GPU through the window system (reims-vgpu's
+      `graphics/rt_window.rs`, "The compositor's GPU"). Where the
+      compositor ran on another GPU, the window's swapchain was made on
+      that GPU, whose buffers are its own, and only what changed of each
+      frame crossed the runtime's GPU's link. Two routes were weighed.
+      Route 2 was measured and rejected (below); route 1 was built:
       - *Which device, either route.* The GPU the compositor composites on
         is the main device of the window's surface's dma-buf feedback
         (`zwp_linux_dmabuf_feedback_v1`), matched to a physical device by
@@ -1176,8 +1180,8 @@ Stages:
         makes a second `VkDevice` there (one graphics queue,
         `VK_KHR_swapchain`, `VK_EXT_external_memory_host`), apart from the
         runtime's, and its swapchain over the window's surface.
-      - *Route 1, built: a mirror of the changed tiles* (reims-vgpu's
-        `graphics::mirror`). The window's mirror is a frame-sized buffer
+      - *Route 1, built and since deleted: a mirror of the changed tiles*
+        (reims-vgpu's `graphics::mirror`). The window's mirror is a frame-sized buffer
         of host memory of its own. The runtime's device and the window's
         device each make a buffer over it. At each draw of a presented
         surface on the compositor's GPU:

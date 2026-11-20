@@ -30,21 +30,25 @@ repeats the ones code cites.
   OS's. A file the OSes share is the exception, where
   splitting cannot be avoided, and keeps its `cfg`s to a few whole items;
   index files that pick modules are exempt.
-- **The Vulkan platform** answers as Metal does through metal2vulkan's
-  runtime, and these rules decide where its code goes and how it gets fast:
-  - **Guest memory in place**, as on Metal. Resources are packed into
-    contiguous host views of guest memory (a Mach remap on macOS, `memfd`
-    layouts on Linux) that Vulkan imports as host pointers, with linear
-    images and buffers made over them. A copy is taken only where a named
-    hardware rule forbids use in place, and only of the area drawn or
-    changed. The driver is asked, not assumed: NVIDIA's drivers lack the
-    core colour-attachment bit for linear images, and give it through
-    `VK_NV_linear_color_attachment`. This is the current runtime's rule,
-    and it ends at the cutover to metal2vulkan's new runtime, whose
-    contract reverses it (AGENTS.md, "metal2vulkan's runtime is being
-    replaced"). There, the runtime allocates GPU memory, the device maps its
-    host-visible blocks into the guest, and textures are device images
-    synced at the guest's events. No new work extends the in-place path.
+- **The Vulkan platform** (`RtPlatform`) answers as Metal does through
+  metal2vulkan-rt, and these rules decide where its code goes and how it
+  gets fast:
+  - **GPU memory is the runtime's.** rt allocates it, and the device maps
+    its host-visible blocks into the guest: the pool's blocks and the
+    guest's Private blocks are rt's (`pool::RtBlocks`), and the buffers and
+    heaps the guest pins in them are ranges of them, at the guest's
+    addresses. A buffer's `gpuAddress` is its Vulkan device address, and a
+    `gpuResourceID` a descriptor index. Textures are device images, synced
+    at the guest's events (an IOSurface's lock and unlock, `didModifyRange:`,
+    `replaceRegion:`), with no page logs. An app's no-copy memory, which no
+    block maps, is rt's import of its pages, by their pointer or as a
+    dma-buf of their files, and only where rt takes neither a copy synced
+    at the commits that use it (`rt_platform::copied`). One VkDevice per
+    process serves everything, the window's presents included, and no path
+    shares objects across devices. The guest's processes are therefore not
+    isolated from each other on the device: every byte on it is
+    guest-writable, and the host never parses or trusts host data it keeps
+    there.
   - **Stalls are fixed on the Vulkan side**: in this crate (caches, their
     keys, when states are made) and in the runtime (translation speed,
     sharing, making ahead), never by making core or the device's lanes
@@ -59,9 +63,10 @@ repeats the ones code cites.
     sharing, concurrency inside a wait. Nothing is loaded or ordered by what
     an earlier run drew, and no measurement starts from a cache seeded for
     it. Two stores stand in for Metal's own caches across runs, as a Mac
-    keeps its compiled pipelines on disk: the runtime's pipeline records
-    (`crates/reims-vgpu-vulkan/src/records.rs`), across a host's processes,
-    and the device's kept pipeline answers
+    keeps its compiled pipelines on disk: rt's shader and pipeline caches,
+    in `reims-vgpu-rt` under the user's cache directory
+    (`crates/reims-vgpu-vulkan/src/rt_platform/device.rs`, `CACHE`), across
+    a host's processes, and the device's kept pipeline answers
     (`crates/reims-vgpu/src/graphics/answers.rs`), across boots. Each holds
     only what the platform or the device gave before, under the identity of
     what decides it, so it changes no value the guest reads, only how soon
@@ -75,8 +80,9 @@ repeats the ones code cites.
     in the runtime goes to it with a repro (the call, its descriptor or
     arguments, the error or the difference from Metal, the device) rather
     than being patched around here.
-  - **Dependencies are used as released.** MoltenVK, SPIRV-Cross and the
-    others are never patched or rebuilt with changes: a fix one needs is
+  - **Dependencies are used as released.** The Vulkan loader, the drivers
+    (Mesa's KosmicKrisp on a Mac among them) and the others are never
+    patched or rebuilt with changes: a fix one needs is
     proposed upstream, and the workaround lives here or in the runtime. A
     mark in the runtime that pays off only once upstream takes a fix stays
     if it changes nothing on the stock release.
@@ -110,15 +116,16 @@ repeats the ones code cites.
     `log::warn!(target: "…", kind:% = error; "…: {error}")`: the cause's
     text up to its first digit, quote or `;`. A site with one cause names
     none.
-  - The runtime's degradations, inexact values and the driver's error
-    messages are relayed on stderr the first time alone of each kind
-    (`answer`), and counted.
+  - What the platform has not built and what rt refuses are answered as
+    Metal's call answers where it fails, each kind's first on a line of
+    stderr naming the call, and counted: `rt-unbuilt-<piece>` and
+    `rt-refused-<kind>` (`rt_platform::unbuilt`).
   - At each reset of the device and at the process's exit, two lines give
     the counts. `reims-vgpu: degradation counts: <code> <n>, <code> <n>, …`,
     on stderr, sorted by code, is every kind relayed or counted since the
-    process began: the runtime's degradation codes
-    (`metal2vulkan-degrade-…`), `inexact-…`, `out-of-host-memory`, the
-    driver's message id names, and the reims-graphics device's completion
+    process began: the platform's (`rt-unbuilt-<piece>`,
+    `rt-refused-<kind>`, `rt-refused-texture-format-<n>` and the other
+    `rt-…` codes), `out-of-host-memory`, and the reims-graphics device's completion
     rings' (`control-ring-full`, `control-ring-post-waited`,
     `vblank-dropped`, `vt-ring-full`, `queue-ring-full`,
     `queue-ring-post-waited`) and its
@@ -131,9 +138,9 @@ repeats the ones code cites.
     `decode-faulted`, those a raise kept it from, each kind's first logged;
     `read-only-pages-buffers`, the no-copy buffers it made
     over pages their process maps read-only, and `read-only-pages-kib`,
-    their bytes' sum in KiB, rounded up: a copy of each on Linux and
-    Windows, and no degradation on macOS, where the platform imports the
-    pages in place; `no-copy-buffers`, the no-copy buffers it made, and
+    their bytes' sum in KiB, rounded up: a copy of each on every host,
+    whose GPU writes are dropped (`rt_platform/buffer.rs`, "Read-only
+    memory"); `no-copy-buffers`, the no-copy buffers it made, and
     `buffer-escaped-gpu-address`, `-argument-encoder`, `-resource-id` and
     `-residency-set`, those whose identity the guest noted escaped, by the
     act, with `buffer-escaped-read-only-pages`, those of them over a copy of
@@ -157,9 +164,7 @@ repeats the ones code cites.
     decode, the session's next decode failing in its stead), the rt
     platform's on Windows (`rt-d3d11-surfaces`, the surfaces over Direct3D
     11 textures it made, and `rt-refused-d3d11-surface`, those it refused),
-    the Vulkan platform's command predication's
-    (`predication-loop-overrun`, a command buffer whose loop ran past the
-    iterations laid down for it, which fails), and the contexts' Private
+    and the contexts' Private
     takes' (`private-take-queued`, a take that waited behind its context's
     earlier one; `private-take-sourced`, one its worker took from the
     source, and `private-take-sourced-us`, the source's time for them in

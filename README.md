@@ -184,8 +184,7 @@ reads them once per process, and an unset or unparsable value is the default.
 | `REIMS_VGPU_LOG=info` | the library's log lines to stderr, filtered by a level and `target=level` pairs (`warn,reims_vgpu_graphics=debug`); unset, nowhere. `reims-ctl set <vm> --log-level` sets it |
 | `REIMS_VGPU_WINDOW=0` | QEMU stays headless under `-display none` (QEMU reads it, not the library) |
 | `REIMS_VGPU_WINDOW_BORDERLESS=1` | a borderless window that fills its screen |
-| `REIMS_VGPU_STRICT=1` | end the process at each difference from Metal's answer the Vulkan platform would otherwise log |
-| `REIMS_VGPU_EXACT` | the runtime's exact forms in place of its fast ones, by field ([docs/accuracy-ledger.md](docs/accuracy-ledger.md)) |
+| `REIMS_VGPU_STRICT=1` | end the process when the host runs out of memory, instead of answering the guest the way Metal does then |
 
 The window opens at the size of QEMU's `reims-graphics-pci` property `resolution=` (1920x1080 by
 default), which `reims-ctl`'s resolution setting sets, and the guest follows the window as you

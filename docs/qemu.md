@@ -34,8 +34,8 @@ make qemu          # cargo xtask dist, then build/qemu/qemu-system-x86_64
 ```
 
 `make qemu` runs `cargo xtask dist`, which writes the library into the dist
-tree, `<target>/dist-vulkan` (`target`, or `CARGO_TARGET_DIR`): on Linux on
-Vulkan, and on a Mac over MoltenVK. Then it configures `vendor/qemu` out of tree in
+tree, `<target>/dist-vulkan` (`target`, or `CARGO_TARGET_DIR`), on Vulkan:
+on a Mac on Mesa's KosmicKrisp (below). Then it configures `vendor/qemu` out of tree in
 `build/qemu`, on Linux:
 
 ```sh
@@ -81,11 +81,11 @@ through ninja at its default, to the same binary. configure fetches meson subpro
   reims-vgpu. The device has no default option ROM: `reims-ctl` gives it
   `firmware/prebuilt/ReimsGraphics.rom` as its `romfile`.
 - **Hosts.** On Linux the guest runs under KVM. On a Mac the same
-  `qemu-system-x86_64` runs it under TCG, over MoltenVK, which realizes the
+  `qemu-system-x86_64` runs it under TCG, on KosmicKrisp, which realizes the
   device and checks it paused ("The reims-graphics device", below). On
   Windows QEMU builds in MSYS2's CLANG64 environment and runs the guest
   under WHPX ("Windows hosts", below).
-- **The rt platform's Vulkan on a Mac.** The library's rt platform loads
+- **The platform's Vulkan on a Mac.** The library's platform loads
   the Vulkan loader, `libvulkan.1.dylib`, and Mesa's KosmicKrisp driver,
   `libvulkan_kosmickrisp.dylib`, only from beside QEMU's binary or from
   `../lib` (`crates/reims-vgpu-vulkan/src/os/macos/rt_driver.rs`). On a Mac
@@ -96,20 +96,12 @@ through ninja at its default, to the same binary. configure fetches meson subpro
   through the formula's `opt` directory, so `brew upgrade` reaches it. A
   file Homebrew lacks is named and not linked. `scripts/install-ctl.sh`
   makes the same links in the `lib` directory of the QEMU it installs.
-  Neither installs `mesa`, which the default platform does not use: with
-  KosmicKrisp's manifest where Homebrew's `mesa` puts it, the system loader
-  lists KosmicKrisp first and MoltenVK second, and the default platform
-  passes KosmicKrisp over, since it lists no `VK_EXT_metal_objects` and a
-  display's window cannot present on it, and opens MoltenVK
-  (`crates/reims-vgpu-vulkan/src/device_choice.rs`). On the M3 Max
-  (2026-11-19, macOS 27.0.1 guest under HVF, Mesa 26.3.1), with that
-  manifest, the full-screen Metal app of `firmware/ambrosia/check-boot.sh`
-  presented 600 frames at 60 fps and dropped none, and all 16 checks
-  passed, as without it (601 frames). Before the choice passed KosmicKrisp
-  over, the default platform timed it as the faster and took it, and the
-  app presented 294 frames at 30 fps and dropped 106. The rt build of the
-  same tree, with both links in its `lib`, passed all 16 of check-boot's
-  checks on KosmicKrisp.
+  Neither installs `mesa`: where Homebrew has no KosmicKrisp, no link to it
+  is made, and the platform makes rt's own instance, whose device the
+  system's drivers give (MoltenVK), which rt's floor refuses. On the M3 Max
+  (2026-11-19, macOS 27.0.1 guest under HVF, Mesa 26.3.1), a build of the
+  platform with both links in its `lib` passed all 16 of
+  `firmware/ambrosia/check-boot.sh`'s checks on KosmicKrisp.
 
 ## What vendor/qemu carries
 

@@ -63,7 +63,7 @@ The Makefile's header lists every target. README.md lists the requirements.
 | the device: its wire, rings and transport | `crates/reims-vgpu-graphics`, whose `include/reims_graphics_wire.h` the guest's kexts and the option ROM compile; its design and protocol are [docs/graphics-kext](docs/graphics-kext) |
 | the device over the platform: the Metal-call decoder, the display and its window, the host's read-back | `crates/reims-vgpu/src/graphics.rs` and `graphics/` |
 | the display's shaders | `crates/reims-vgpu-vulkan/src/gpu/shaders.metal` |
-| the Vulkan platform | `crates/reims-vgpu-vulkan`, over metal2vulkan's runtime, at the commit of its public repository `Cargo.toml` names; what its defaults trade against Metal's answers is [docs/accuracy-ledger.md](docs/accuracy-ledger.md) |
+| the Vulkan platform | `crates/reims-vgpu-vulkan`'s `RtPlatform` (`src/rt_platform.rs`, `src/rt_platform/`), over metal2vulkan's runtime, metal2vulkan-rt, at the commit of its public repository `Cargo.toml` names; where its answers can differ from Metal's, and what it has not built or rt refuses, is [docs/accuracy-ledger.md](docs/accuracy-ledger.md) |
 | core: the platform traits, the runtime, raises and deaths, the guest's RAM, the testkit | `crates/reims-vgpu-vulkan/src/core.rs` and `core/`, the Vulkan crate's module `core`; the testkit is its `testkit` feature |
 | the Vulkan platform's metallibs, which a build off a Mac copies | `crates/reims-vgpu-vulkan/metallibs`, written on a Mac by `cargo xtask metallibs` (README.md, Building) |
 | a display's own window, and the register of what it does | `crates/reims-vgpu-window`, its `features.md` and its manual walk on macOS, `scripts/internal/walk_window_macos.sh`; the wiring is `crates/reims-vgpu/src/window.rs` |

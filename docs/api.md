@@ -22,7 +22,7 @@ library's `reims-vgpu.ui` on Linux and Windows.
 | layer | crate | what it is |
 |---|---|---|
 | core | `reims-vgpu-vulkan`'s `core` | the platform traits, the runtime (threads, queues, holds), raises and deaths, the display's present pipeline, guest memory and the fake platform the tests run on |
-| platform | `reims-vgpu-vulkan` | core's `Platform`: `VulkanPlatform`, over metal2vulkan's runtime, natively on Linux and Windows, and on macOS over MoltenVK |
+| platform | `reims-vgpu-vulkan` | core's `Platform`: `RtPlatform`, over metal2vulkan-rt, on the host's Vulkan driver on Linux and Windows, and on macOS on Mesa's KosmicKrisp |
 | window | `reims-vgpu-window` | a display's own window (AppKit's or SDL3's on macOS, SDL3's on Linux and Windows), its input and the host's screens; it knows nothing of devices |
 | device | `reims-vgpu-graphics` | the wire: the records, rings and registers the guest and the host share, and the C header the guest's kexts and the option ROM compile |
 | Rust API | `reims-vgpu` | the graphics device over the platform: its rings, decoder, display and window, and owned Rust types for its config and callbacks |
@@ -139,8 +139,10 @@ then `abort()`, for:
 - anything a host callback throws (`ffi::host_call` runs each call inside a catch);
 - a panic under an export: the library's panic hook ends the process before anything unwinds;
 - a guest command the platform cannot carry out as Metal does, where Metal ends the process: a
-  raise of Metal's that nothing catches, and on the Vulkan platform a refusal of the runtime's it
-  passes on ([accuracy-ledger.md](accuracy-ledger.md)).
+  raise of Metal's that nothing catches, the platform's own raises where Metal's call raises
+  among them, or a raw value the platform has no form for (the Vulkan crate's `answer`,
+  [accuracy-ledger.md](accuracy-ledger.md)). What the platform has not built, or what rt refuses,
+  is answered as Metal's call answers where it fails, and counted, never a death.
 
 Every export is `extern "C"`: nothing unwinds out of one into the host
 (`crates/reims-vgpu-c/src/ffi.rs`).
@@ -158,56 +160,45 @@ handler, runs as before. The host does nothing for it: QEMU's quit waits for it.
 
 The library keeps the GPU device it opens for the process, with what it makes of it for itself,
 while any graphics device lives, and a device created after another was released runs on the same
-one. The release of the process's last graphics device lets go of it: it waits, at most 5 s, for
-that device's threads, its objects and their GPU work to let go of the GPU device, and then lets go
-of every GPU device the library keeps, whose runtime is torn down on the releasing thread before
-the release returns (`reims_vgpu_vulkan::let_go`). So no GPU device is live as the process exits:
-on NVIDIA's proprietary driver an exit with one live can end with `SIGSEGV` inside the driver's own
-exit handler, which tears its SPIR-V compiler down while a worker thread of the driver's still runs
-in it (on an RTX 3090, 6 of 80 exits right after the device's check of textures over host pages,
-none with the device let go of first). A device callback still running holds that wait up: one
-that waits for a lock the host holds around the release, for the whole 5 s. Past them the library
-keeps its GPU devices for the process, as it does while a device lives, and logs a warning saying
-what still held them. A device created after the let-go runs on a new GPU device, whose numbering
-starts again. On the platform over metal2vulkan-rt the let-go lets go of its one GPU device the
-same way, once nothing beyond the platform holds it: the runtime's `Device::quiesce` first, with
-what is left of the 5 s, then the drop of its last handle, which tears it down on the releasing
-thread, and a wait for the runtime's gauges of it to read zero. A device whose quiesce answered
-false is kept to the exit, since its drop would wait with no deadline. QEMU releases its device as it quits, once the VM stopped for good (its
-`vm_shutdown`), with the BQL let go for the release alone; a VM whose shutdown action
-pauses it keeps its device to the exit, and so does a quit while a read of its display
-(`rvg_graphics_device_read_display`) still waits for its draw on the GPU 5 s into the teardown.
+one. The release of the process's last graphics device lets go of it
+(`RtPlatform::let_go_of_device`): it waits, at most 5 s, for that device's threads, its objects and
+their GPU work to let go of the GPU device, so that nothing beyond the platform holds it; then runs
+rt's `Device::quiesce`, with what is left of the 5 s, drops its last handle, which tears it down on
+the releasing thread before the release returns, and waits for rt's gauges of it to read zero. A
+device whose quiesce answered false is kept to the exit, since its drop would wait with no deadline.
+So no GPU device is live as the process exits: on NVIDIA's proprietary driver an exit with one live
+can end with `SIGSEGV` inside the driver's own exit handler, which tears its SPIR-V compiler down
+while a worker thread of the driver's still runs in it (on an RTX 3090, 6 of 80 exits right after
+the device's check of textures over host pages, none with the device let go of first). A device
+callback still running holds that wait up: one that waits for a lock the host holds around the
+release, for the whole 5 s. Past them the library keeps its GPU device for the process, as it does
+while a device lives, and logs a warning saying what still held it. A device created after the
+let-go runs on a new GPU device, whose numbering starts again. QEMU releases its device as it quits,
+once the VM stopped for good (its `vm_shutdown`), with the BQL let go for the release alone; a VM
+whose shutdown action pauses it keeps its device to the exit, and so does a quit while a read of its
+display (`rvg_graphics_device_read_display`) still waits for its draw on the GPU 5 s into the
+teardown.
 
-A host quiesces the library as its last call before it exits: `rvg_quiesce_for_exit`, on the
-thread that then exits. It takes no handle, since the GPU devices are the process's. Its answer is
-whether the host may then call `exit`. It closes the exit gate ahead of the exit, as the handler
-would, so that each thread of the library's parks for good at its next step, and waits for the
-steps in progress on other threads. On the platform over metal2vulkan-rt, then, where a GPU device
-is still live (a device kept to the exit, or one a let-go could not tear down), the runtime's
-`Device::quiesce` stops its threads: what is ready is submitted and the rest ends unrun, the GPU
-completes what was submitted, and the runtime's threads end. Every wait ends within the call's
-bound, and nothing is freed. It answers true where the steps ended in time and the library
-holds no GPU device the exit could meet: on the Vulkan platform, where none was opened in the
-process; on the platform over metal2vulkan-rt, also where the release of the last graphics
-device let go of them. It answers false otherwise, quiesced or not, and where a step outlasted
-the wait, since neither platform's runtime supports an `exit` with a device live.
-metal2vulkan-rt supports it on no device (its README, "Quiesce and exit"): on an RTX 3090
-(620.70.06), 3 of 9 power-offs that called `exit` after the quiesce stopped everything in time
-ended with `SIGSEGV` in a thread of the driver's own while its exit handler waited on a lock. On
-the Vulkan platform the runtime's own exit handler, registered as its first device was made,
-waits for the runtime's work in progress for a bound only, and on Linux past it ends the process
-with `_exit` there, so the exit handlers registered before it never run, QEMU's exit notifiers
-among them: with a device kept to a paused VM's quit, 5 of 9 quits on an RTX 3090 and 5 of 9 on an
-RTX 2080 left QEMU's pidfile behind. The let-go of the device does not end that work: a quit 24 s
-into a boot on the RTX 2080, whose release let go of the device 315 ms after the quit, met the
-handler waiting for a pipeline's making still in the driver, and ended 9.6 s after the quit with
-the pidfile left. So once that platform opened a device it answers false, let go of since or not.
-On false the library writes its degradation counts then, as the exit gate's handler would, and the
-host runs its own exit work and ends with `_exit`, running no exit handler, the runtime's and the
-driver's included. A second call on the same thread answers at once, with the first answer; after
-it, a call on any other thread parks that thread for good, and on the platform over metal2vulkan-rt
-the runtime refuses GPU work asked for on this one (`rt-refused-quiesced` in the degradation
-counts). After a true answer the exit gate's handler still runs at the exit, and writes the counts.
+A host quiesces the library as its last call before it exits: `rvg_quiesce_for_exit`, on the thread
+that then exits. It takes no handle, since the GPU devices are the process's. Its answer is whether
+the host may then call `exit`. It closes the exit gate ahead of the exit, as the handler would, so
+that each thread of the library's parks for good at its next step, and waits for the steps in
+progress on other threads. Then, where a GPU device is still live (a device kept to the exit, or one
+a let-go could not tear down), the runtime's `Device::quiesce` stops its threads: what is ready is
+submitted and the rest ends unrun, the GPU completes what was submitted, and the runtime's threads
+end. Every wait ends within the call's bound, and nothing is freed. It answers true where the steps
+ended in time and the library holds no GPU device the exit could meet: none was opened in the
+process, or the release of the last graphics device let go of it. It answers false otherwise,
+quiesced or not, and where a step outlasted the wait, since metal2vulkan-rt supports an `exit` with
+a device live on no device (its README, "Quiesce and exit"): on an RTX 3090 (620.70.06), 3 of 9
+power-offs that called `exit` after the quiesce stopped everything in time ended with `SIGSEGV` in a
+thread of the driver's own while its exit handler waited on a lock. On false the library writes its
+degradation counts then, as the exit gate's handler would, and the host runs its own exit work and
+ends with `_exit`, running no exit handler, the runtime's and the driver's included. A second call
+on the same thread answers at once, with the first answer; after it, a call on any other thread
+parks that thread for good, and rt refuses GPU work asked for on this one (`rt-refused-quiesced` in
+the degradation counts). After a true answer the exit gate's handler still runs at the exit, and
+writes the counts.
 
 QEMU calls it, with a bound of 5 s, at the end of its cleanup (`qemu_cleanup`, through a notifier of
 its own run there, `qemu_add_cleanup_notifier`), on every quit that reaches it: a released device,
@@ -304,9 +295,9 @@ Two items take the host's OS handles, and Windows has its own form of each, unde
 Everything a host can set that shapes what the library does, beside the guest's own input:
 - **The config**: the device's callbacks, how many displays it has (1 to 4), each display's window
   (its callbacks and the mode it opens at),
-  the guest's RAM with the files behind it, which let the GPU use an IOSurface's own pages in place
-  and, on a host GPU that shares the CPU's memory, set the device's `recommendedMaxWorkingSetSize`
-  (three quarters of that RAM, at most the host GPU's answer), and the guest's architecture,
+  the guest's RAM with the files behind it, through which the GPU reaches an app's no-copy memory
+  in the guest's own pages and, on a host GPU that shares the CPU's memory, set the device's
+  `recommendedMaxWorkingSetSize` (three quarters of that RAM, at most the host GPU's answer), and the guest's architecture,
   which the device's `isFramebufferReadSupported` follows: the host GPU's answer for an arm64
   guest, no for an x86-64 one. Zero is every field's default (section 1): an x86-64 guest.
 - **Cargo features**, for a host that builds the library: `macos-sdl` (on by default) builds
@@ -321,17 +312,13 @@ Everything a host can set that shapes what the library does, beside the guest's 
   | `REIMS_VGPU_LOG` | the library's log lines to stderr, filtered by a level and `target=level` pairs (core's `logging`); unset, nowhere |
   | `REIMS_VGPU_WINDOW_SCREENS`, `_BORDERLESS`, `_REFRESH` | a window's screen, its style and the offered mode's refresh rate (`reims-vgpu-window`) |
   | `REIMS_VGPU_WINDOW_IMPL` | macOS: `sdl` opens SDL3's window in place of AppKit's, in a build with `macos-sdl` |
-  | `REIMS_VGPU_STRICT` | the Vulkan platform: `1` ends the process at each difference from Metal's answer it would otherwise log |
-  | `REIMS_VGPU_EXACT` | the Vulkan platform: the runtime's exact forms in place of its fast ones, by field ([accuracy-ledger.md](accuracy-ledger.md)) |
-  | `REIMS_VGPU_CENSUS_DIR` | the Vulkan platform on Linux, a diagnostic for inventory runs: each difference that would end the process is recorded in that directory and logged instead, and the run says it is not faithful to Metal |
+  | `REIMS_VGPU_STRICT` | the Vulkan platform: `1` ends the process where the host runs out of memory, mappings, files or commit charge, where by default the platform answers as Metal's call answers when memory runs out (the Vulkan crate's `answer`) |
   | `REIMS_VGPU_TRACE` | the Vulkan platform, a diagnostic for profiling: a timeline of the device's work, a line per event, written to the file it names (core's `trace`) |
-  | `REIMS_VGPU_TRACE_DEGRADE` | with `REIMS_VGPU_TRACE`, `1`: every occurrence of every difference from Metal the runtime announces is written to the trace |
-  | `REIMS_VGPU_RECORD` | the Vulkan platform, a diagnostic for replay: every call core makes of the platform, the commands the guest's CPU encodes into indirect command buffers (`indirectRenderCommandAtIndex:` and `indirectComputeCommandAtIndex:` on the buffer, `[index, commands]`), the guest's presents as the display shows them, each device's identity as the stream first names it and again at the start of each later segment (`m2v.deviceIdentity` on the device, answering its `name` and `hasUnifiedMemory`), the host memory each command buffer reaches as it changes, the bytes a no-copy `Managed` buffer's create copies into the device's own copy where the device keeps two (its `hasUnifiedMemory` NO), and the bytes of each Private buffer range a dispatch of a compute pipeline made with linked functions binds, before and after it (`m2v.privateBytes`), and each no-copy buffer's escape as the guest first notes it (`m2v.bufferEscaped` on the buffer, `[kind]`, the note's `RGFX_BUFFER_ESCAPED_*` act, after the memory writes of each command buffer committed before the note and before those of each committed after it, where a player stops, typed, at a later write that holds an address in the buffer), and each acquire of what another API wrote into a buffer's exported memory (`m2v.externalWriteDone` on the buffer, no arguments, as the call returns: the host's video once a picture is in a surface's device cache, before the session's signal that lets a command buffer read it), written as a replay stream (metal2vulkan's format version 2) into the directory it names, the libraries and those bytes into a `blobs` directory beside it, and its counts every few seconds into `<pid>.stats.txt`, which names the recorder's build first: the commit the library was built from (`recorder_commit`, which `cargo xtask dist` stamps, else `unknown`), the device's own display library, which the stream records as `newLibraryWithSource:options:error:` on the device with no arguments, by the hex of its SHA-256 and its length (`display_library`), and a `recorder_fix` line for each change to what a stream holds that it carries (the crate's `recorder`). The stream holds the guest's data: it stays on the host that made it |
-  | `REIMS_VGPU_REFUSED_AIR_DIR` | the platform over metal2vulkan-rt, a diagnostic: for each pipeline state the translator refused, the metallib of each of its stages' functions, once per library, a line naming the creator, the functions and the refusal, and a record of the state's function-constant values and descriptor fields, written into `air-<pid>` in the directory it names (`rt_platform::diag`). It holds the guest's data: it stays on the host that made it, and is never written to the log |
+  | `REIMS_VGPU_RECORD` | the Vulkan platform, a diagnostic for replay: every call core makes of the platform, the guest's presents as the display shows them, each device's identity as the stream first names it and again at the start of each later segment (`m2v.deviceIdentity` on the device, answering its `name` and `hasUnifiedMemory`), the host memory each command buffer reaches as it changes, the bytes a no-copy `Managed` buffer's create copies into the device's own copy where the device keeps two (its `hasUnifiedMemory` NO), each no-copy buffer's escape as the guest first notes it (`m2v.bufferEscaped` on the buffer, `[kind]`, the note's `RGFX_BUFFER_ESCAPED_*` act, after the memory writes of each command buffer committed before the note and before those of each committed after it, where a player stops, typed, at a later write that holds an address in the buffer), and each acquire of what another API wrote into a buffer's exported memory (`m2v.externalWriteDone` on the buffer, no arguments, as the call returns: the host's video once a picture is in a surface's device cache, before the session's signal that lets a command buffer read it), written as a replay stream (metal2vulkan's format version 2) into the directory it names, the libraries and those bytes into a `blobs` directory beside it, and its counts every few seconds into `<pid>.stats.txt`, which names the recorder's build first: the commit the library was built from (`recorder_commit`, which `cargo xtask dist` stamps, else `unknown`), the device's own display library, which the stream records as `newLibraryWithSource:options:error:` on the device with no arguments, by the hex of its SHA-256 and its length (`display_library`), and a `recorder_fix` line for each change to what a stream holds that it carries (the crate's `recorder`). The stream holds the guest's data: it stays on the host that made it |
+  | `REIMS_VGPU_REFUSED_AIR_DIR` | the Vulkan platform, a diagnostic: for each pipeline state the translator refused, the metallib of each of its stages' functions, once per library, a line naming the creator, the functions and the refusal, and a record of the state's function-constant values and descriptor fields, written into `air-<pid>` in the directory it names (`rt_platform::diag`). It holds the guest's data: it stays on the host that made it, and is never written to the log |
 
-  Of these, only `REIMS_VGPU_STRICT`, `REIMS_VGPU_EXACT` and `REIMS_VGPU_CENSUS_DIR` change what the
-  guest or host observes, and only on the Vulkan platform; `REIMS_VGPU_WINDOW_SCREENS` and
-  `_REFRESH` change the mode the window's display offers its guest.
+  Of these, only `REIMS_VGPU_STRICT` changes what the guest or host observes, beside
+  `REIMS_VGPU_WINDOW_SCREENS` and `_REFRESH`, which change the mode the window's display offers its guest.
 
 ### cbindgen
 

@@ -53,8 +53,9 @@ docs/
   qemu.md                   QEMU on the library: its build, VM boots and
                             what they measured
   lessons.md                traps that tests, reviews and boots found
-  accuracy-ledger.md        what the Vulkan platform's defaults trade
-                            against Metal's answers, and the switches
+  accuracy-ledger.md        where the Vulkan platform's answers can
+                            differ from Metal's, and what it has not
+                            built or rt refuses
   graphics-kext/            the reims-graphics device: its design, the dGPU
                             oracle and the benchmark
   video/                    the device's host video: what it answers, its
@@ -69,9 +70,8 @@ LICENSE                     the license, and LICENSES/ its texts (README.md, Lic
 
 - **`cargo xtask check`** runs the lints, rustfmt, clippy and every unit test. Run it once before a
   branch that changes code merges.
-- **Unit tests** sit beside the code. A test of the Metal or the Vulkan platform runs on the host's
-  GPU, and on a Mac the Vulkan platform's tests compare its answers with Metal's
-  ([testing.md](testing.md)).
+- **Unit tests** sit beside the code. A test of the Vulkan platform runs on an rt device of the
+  host's GPU ([testing.md](testing.md)).
 - **VM boots** are the only check of what a guest's frameworks choose and of QEMU's side of the C
   API ([qemu.md](qemu.md), "Booting a guest to check a change").
 - **The guest's kext sets against old releases**: a rebuild of `guest/prebuilt` or
@@ -103,7 +103,7 @@ doc holds its area's ordering contracts and the measured platform facts it relie
 
 | crate | path | role |
 |---|---|---|
-| `reims-vgpu-vulkan` | `crates/reims-vgpu-vulkan` | `core` (`src/core.rs`, `src/core/`), what the platform and the device share, generic over `P: Platform`: the platform traits, the runtime, raises and deaths, the testkit, using nothing else of the crate; and the `Platform` over metal2vulkan's runtime, the library's only one: on Linux, and on macOS over MoltenVK, a build for development and tests; its OS services (on macOS Mach VM, threads and the Objective-C message layer the window's AppKit side sends through), and the library's shaders (`src/gpu/shaders.metal`) |
+| `reims-vgpu-vulkan` | `crates/reims-vgpu-vulkan` | `core` (`src/core.rs`, `src/core/`), what the platform and the device share, generic over `P: Platform`: the platform traits, the runtime, raises and deaths, the testkit, using nothing else of the crate; and the `Platform` over metal2vulkan-rt, `RtPlatform` (`src/rt_platform.rs`, `src/rt_platform/`), the library's only one: on Linux and Windows, and on macOS on Mesa's KosmicKrisp; the pick of the host's GPU (`src/device_choice.rs`); its OS services (on macOS Mach VM, threads and the Objective-C message layer the window's AppKit side sends through), and the library's shaders (`src/gpu/shaders.metal`) |
 | `reims-vgpu-window` | `crates/reims-vgpu-window` | the device's own window: AppKit's or SDL3's on macOS, SDL3's on Linux, its input and the host's screens; knows nothing of devices or displays. `features.md` lists what the window does, each entry deliberate |
 | `reims-vgpu` | `crates/reims-vgpu` | the public Rust API: the reims-graphics device over the platform, its Metal-call decoder and its window; the process's platform |
 | `reims-vgpu-c` | `crates/reims-vgpu-c` | the C API (`rvg_*`, `include/reims_vgpu.h`), which QEMU links; `cdylib`, `staticlib` and `rlib` |
@@ -190,8 +190,7 @@ package's test processes (`OUT_DIR` where the package has a build script), and
 directory in its place (measured with cargo 1.98.1 and nextest 0.9.140). `env!` of any of them
 compiles the worktree's path into the test. `include_bytes!` and `include_str!` compile in a file's
 bytes, which kache keys by content, so a test includes a fixture unless the fixture's bytes name the
-worktree: the Vulkan tests read their import metallibs, whose install names are paths in `OUT_DIR`,
-at run time. These are built again in each worktree:
+worktree, and then reads it at run time. These are built again in each worktree:
 - `xtask` and its tests: the binary finds the repository from where it was built
   (`env!("CARGO_MANIFEST_DIR")`), so a run of another tree's binary acts on the tree that built it;
 - on a Mac, the Vulkan crate's build script, whose import metallibs name its `OUT_DIR`: a
@@ -334,8 +333,7 @@ Set in `Cargo.toml` (architecture 2.3):
   the macOS library has no SDL.
 - `reims-vgpu-window/sdl-no-link`: SDL left unbuilt, for the Linux and Windows targets' clippy on
   another OS.
-- `reims-vgpu-vulkan/testkit`: `core::testkit` for other crates' tests and the Vulkan crate's
-  integration tests.
+- `reims-vgpu-vulkan/testkit`: `core::testkit` for other crates' tests.
 - `reims-vgpu/testkit`: the same, through the public crate, and each handle's core object.
 
 [api.md](api.md) section 2 lists the device's settings and the environment variables the library

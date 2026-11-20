@@ -32,7 +32,7 @@ Intel runs were made on the Iris Xe of an i9-13900H on iHD. Paths are
 | A frame written in place into a caller's pages ("Zero copy"), and the wait for a run's writes outside the driver's lock | `src/vaapi/va/zero_copy.rs`, `src/vaapi/va/fence.rs` |
 | The bounded waits ("Waiting for the GPU"), and their tests on a held GPU | `src/vaapi/va/wait.rs`, `src/vaapi/va/wait/`, `src/vaapi/va/spin.rs` |
 | The encoders: `VideoEncoder` and its accelerator | `src/vaapi/va/encoder.rs`, `src/vaapi/va/encoder/`, `src/vaapi/va/ffi/encode.rs` |
-| The reims-graphics device's decode on VA-API: each picture written in place by the driver's video processing, copied by the runtime device's GPU, or copied by the CPU ("The reims-graphics device") | reims-vgpu's `src/graphics/vaapi.rs`, `src/graphics/vaapi/gpu_copy.rs`, `src/graphics/video_host.rs`; the decode surface's export, `src/vaapi/va/export.rs`; the Vulkan platform's copy, `os/linux/plane_copy.rs` |
+| The reims-graphics device's decode on VA-API: each picture written in place by the driver's video processing, copied by the runtime device's GPU, or copied by the CPU ("The reims-graphics device") | reims-vgpu's `src/graphics/vaapi.rs`, `src/graphics/vaapi/rt_windows.rs`, `src/graphics/video_host.rs`; the decode surface's export, `src/vaapi/va/export.rs` |
 | `vaapi-probe`, which stands in for `vainfo`; `vaapi-encode-probe`, the encoders' attributes | `examples/vaapi-probe.rs`, `examples/vaapi-encode-probe.rs` |
 | H.264's hardware check and its tools | `tools/h264-check.sh`, `examples/h264-framemd5/`, `examples/h264-info.rs`, `examples/h264-poc1.rs`, `examples/h264-craft.rs` |
 | HEVC's hardware check and its tools | `tools/hevc-check.sh`, `examples/hevc-framemd5.rs`, `examples/hevc-info.rs`, `examples/hevc-cut.rs`, `examples/hevc-craft.rs` |
@@ -316,7 +316,7 @@ memory"). The graphics device's are its output planes' pages in the
 guest's RAM (reims-vgpu's `PlanePages`), whose dma-buf reims-vgpu makes of
 ranges of their bytes: a udmabuf of the memfd behind the guest's RAM, the
 pages in the order the bytes lie in (reims-vgpu's
-`platform/vulkan/dma_buf.rs`, over
+`platform/dma_buf.rs`, over
 `crates/reims-vgpu-vulkan/src/os/linux/device_lend.rs`,
 `dma_buf_of_host`).
 
@@ -460,31 +460,15 @@ answers for its device, `rt_platform::HostGpu`). The arm
      there: its codec and format failed the check, as HEVC Main 10 into
      P010 does on an RX 550's radeonsi (a picture whose reference's target
      was overwritten), or its planes do not lie as a target's must;
-  2. by the runtime device's GPU, into the buffer each plane lies in, the
-     surface's pages or its device cache, at the plane's offset and rows:
-     the decode surface's export as dma-bufs (`Frame::export`,
-     `vaExportSurfaceHandle` with each plane a layer of its own, kept with
-     the surface's pool), each plane imported once as an image of its
-     format and DRM format modifier, and copied out with
-     `vkCmdCopyImageToBuffer` on a queue of the session's copier
-     (reims-vgpu's `src/graphics/vaapi/gpu_copy.rs`, the Vulkan
-     platform's `PlaneCopier`). On Windows the source is the shared texture
-     the surface is (`Frame::texture`), imported once by its NT handle as
-     one two-plane image (`VK_KHR_external_memory_win32`, which the
-     platform enables where the device lists it), each plane copied from
-     its aspect. It writes the crop the CPU's copy writes,
-     and nothing past it (`crop_extent`), once the decode is done, and the
-     session signals the decode once the copy is done on the GPU, however
-     long the GPU takes: the copier's wait for its fence has no bound of its
-     own, so a GPU slowed by other work slows the picture, and only a lost
-     device fails it. A device
-     that lists none of the dma-buf image extensions, an export not of a
-     layer a plane, or a plane in a buffer whose GPU writes do not reach
-     its memory, declines it. The rt platform's copier on Windows declines
-     every picture, each counted as `rt-video-gpu-copy-declined`
-     (reims-vgpu's `src/graphics/vaapi/rt_windows.rs`): rt imports no
-     image of the shared texture yet, so each lands the third way
-     ([bugs.md](bugs.md), B94);
+  2. by the device's GPU, into the buffer each plane lies in, the
+     surface's pages or its device cache, at the plane's offset and rows,
+     the crop alone as the CPU's copy writes it (`crop_extent`), where the
+     open made a copier (reims-vgpu's `src/graphics/vaapi.rs`,
+     `GpuCopies`). On Linux the open makes none. On Windows the platform's
+     copier declines every picture, each counted as
+     `rt-video-gpu-copy-declined` (reims-vgpu's
+     `src/graphics/vaapi/rt_windows.rs`): rt imports no image of the shared
+     texture yet, so each lands the third way ([bugs.md](bugs.md), B94);
   3. by the CPU: the frame read back ("The copy back") and copied into the
      planes' host bytes, or into the session's staging where a plane lies
      in a device cache.
