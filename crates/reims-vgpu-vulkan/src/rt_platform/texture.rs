@@ -12,7 +12,11 @@
 //! of the platform's own indices. The guest's textures over the plane are its views, each at the
 //! guest's index (`newTextureViewWithPixelFormat:resourceIndex:`). Copies, uploads and readbacks
 //! reach the image as any texture. Its `resourceIndex`, `uniqueIdentifier` and the index in its
-//! `gpuResourceID` are 0, and a slot that binds it reads Metal's nil texture.
+//! `gpuResourceID` are 0, and a slot that binds it reads Metal's nil texture. A recording holds
+//! it, placed or not, as the device's `newTextureWithDescriptor:` of a descriptor whose
+//! `m2v.textureDescriptor` record marks it outside the guest's texture indices
+//! (`crate::recorder::outside_descriptor`), so the views, copies and commands that name it name
+//! its stream id.
 //!
 //! **Placed images for views.** A shape's image may be placed instead
 //! (`ApiPlatform::placed_shape_image`, [`RtObj::new_placed_texture_for_views`]): rt's texture for
@@ -483,11 +487,51 @@ pub(super) fn surface_plane(
     answered(device, sel, desc, options, None, Ok(plane), diag)
 }
 
+/// An image for views as a recording holds it: the device's `newTextureWithDescriptor:` of a
+/// descriptor of `desc` whose `m2v.textureDescriptor` record marks it
+/// [`crate::recorder::OUTSIDE`] ([`crate::recorder::outside_descriptor`]), as the Vulkan
+/// platform's own texture is, so a player places it outside the guest's texture indices, as rt
+/// gives it none, and the views, copies and commands that name the image name its stream id.
+/// `make` makes the image; where the process does not record, nothing else is made.
+fn recorded_image(
+    device: &RtObj<RtDevice>,
+    desc: &TextureDesc,
+    make: impl FnOnce() -> Option<RtObj<RtTexture>>,
+) -> Option<RtObj<RtTexture>> {
+    if !crate::recorder::on() {
+        return make();
+    }
+    let descriptor = RtObj::new(super::TextureFields::new(*desc));
+    crate::recorder::outside_descriptor(&descriptor, desc);
+    let recorded_call =
+        crate::recorder::rec_call!("newTextureWithDescriptor:", device, &descriptor);
+    let recorded_answer = crate::recorder::run(make);
+    crate::recorder::rec_done!(recorded_call, recorded_answer);
+    recorded_answer
+}
+
 impl RtObj<RtDevice> {
     /// A texture of `desc` with no index of its own, the image under the textures made as its
     /// views (the module's docs, "Images for views"), as `newTextureWithDescriptor:` would make
-    /// it otherwise. Nil where rt refuses it, counted.
+    /// it otherwise. Nil where rt refuses it, counted. A recording holds it as the device's
+    /// `newTextureWithDescriptor:` of a descriptor marked outside the guest's texture indices
+    /// (`recorded_image`).
     pub fn new_texture_for_views(&self, desc: &TextureDesc) -> Option<RtObj<RtTexture>> {
+        recorded_image(self, desc, || self.image_for_views(desc))
+    }
+
+    /// A texture of `desc` for views alone, as [`Self::new_texture_for_views`] makes one, with its
+    /// image placed in a Private block of its own (the module's docs, "Placed images for views"):
+    /// its bytes are the block's as they are. `None` where rt places none, counted by its cause,
+    /// and where rt takes no descriptor of `desc`, as [`Self::new_texture_for_views`] then
+    /// refuses it. A recording holds it as it holds [`Self::new_texture_for_views`]'s image: a
+    /// player makes the image as one that is not placed, its bytes those the caller fills.
+    pub fn new_placed_texture_for_views(&self, desc: &TextureDesc) -> Option<RtObj<RtTexture>> {
+        recorded_image(self, desc, || self.placed_image_for_views(desc))
+    }
+
+    /// [`Self::new_texture_for_views`]'s image, unrecorded.
+    fn image_for_views(&self, desc: &TextureDesc) -> Option<RtObj<RtTexture>> {
         let sel = "newTextureWithDescriptor:";
         let d = match rt_texture_descriptor(desc) {
             Ok(d) => d,
@@ -499,12 +543,8 @@ impl RtObj<RtDevice> {
         answered(self, sel, desc, options, None, made, diag)
     }
 
-    /// A texture of `desc` for views alone, as [`Self::new_texture_for_views`] makes one, with its
-    /// image placed in a Private block of its own (the module's docs, "Placed images for views"):
-    /// its bytes are the block's as they are. `None` where rt places none, counted by its cause,
-    /// and where rt takes no descriptor of `desc`, as [`Self::new_texture_for_views`] then
-    /// refuses it.
-    pub fn new_placed_texture_for_views(&self, desc: &TextureDesc) -> Option<RtObj<RtTexture>> {
+    /// [`Self::new_placed_texture_for_views`]'s image, unrecorded.
+    fn placed_image_for_views(&self, desc: &TextureDesc) -> Option<RtObj<RtTexture>> {
         let sel = "newTextureWithDescriptor:offset:";
         let d = rt_texture_descriptor(desc).ok()?;
         let placed = (|| {

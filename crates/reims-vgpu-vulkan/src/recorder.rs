@@ -14,10 +14,11 @@
 //!   Metal has no call for; an encoder's command is its enum's selector. The receiver and every
 //!   object an argument names are the objects' stream ids, which the recorder gives each object
 //!   as a call makes it (`State::register`) and never gives again, a texture of the platform's
-//!   own (the window's cursor glyph, `VulkanDevice::new_own_texture`) as any other
-//!   `newTextureWithDescriptor:`, of a descriptor whose `m2v.textureDescriptor` map holds
-//!   [`OUTSIDE`] (`outside: true`) so a player places it outside the guest's texture indices; an
-//!   object's last reference going (`Obj`'s drop) is its `release` record.
+//!   own (the window's cursor glyph, `VulkanDevice::new_own_texture`, and the rt platform's
+//!   images for views) as any other `newTextureWithDescriptor:`, of a descriptor whose
+//!   `m2v.textureDescriptor` map holds [`OUTSIDE`] (`outside: true`) so a player places it
+//!   outside the guest's texture indices; an object's last reference going (`Obj`'s drop) is its
+//!   `release` record.
 //! - **The device's identity.** Right after the record that made a device, an
 //!   [`IDENTITY`] record on it answers what decides how a player makes its resources: the
 //!   device's `name`, which the guest's device info gives, and `hasUnifiedMemory`, by which a
@@ -1240,17 +1241,19 @@ where
 }
 
 /// The key of an `m2v.textureDescriptor` record's map that marks a descriptor of a texture of the
-/// platform's own (the window's cursor glyph), `true`: its texture takes no resource ID and no
-/// range of Metal's space, so a player places it outside the guest's texture indices. Only such
-/// a descriptor carries it ([`outside_descriptor`]).
+/// platform's own (the window's cursor glyph, and on the rt platform a shape's image for views),
+/// `true`: its texture takes no resource ID and no range of Metal's space, so a player places it
+/// outside the guest's texture indices. Only such a descriptor carries it
+/// ([`outside_descriptor`]).
 pub const OUTSIDE: &str = "outside";
 
 /// Records the making of `descriptor`, of `desc`, for a texture of the platform's own
-/// (`VulkanDevice::new_own_texture`): an `m2v.textureDescriptor` on the platform, as its
-/// `texture_descriptor` records one, whose map ends with [`OUTSIDE`] `true`. The texture's
+/// (`VulkanDevice::new_own_texture`, and with feature `rt` the rt platform's images for views,
+/// `RtObj::<RtDevice>::new_texture_for_views`): an `m2v.textureDescriptor` on the platform, as
+/// its `texture_descriptor` records one, whose map ends with [`OUTSIDE`] `true`. The texture's
 /// `newTextureWithDescriptor:` names it as any other's names its descriptor.
 pub fn outside_descriptor(
-    descriptor: &crate::gpu::desc::VulkanTextureDescriptor,
+    descriptor: &impl AsMade,
     desc: &crate::core::platform::values::TextureDesc,
 ) {
     let Some(token) = enter() else { return };
@@ -1261,7 +1264,7 @@ pub fn outside_descriptor(
         }
         ("m2v.textureDescriptor", 0, vec![fields])
     });
-    finish(active, Some(Made::of(descriptor)));
+    finish(active, descriptor.as_made());
 }
 
 /// The guest's frame ends here, showing `t`: the texture over the surface a present names, as
@@ -5159,6 +5162,95 @@ mod tests {
                     .count();
                 assert_eq!(all, 1, "{calls:?}");
                 drop((queue, buffer, device));
+            },
+        );
+    }
+
+    /// An rt shape's image for views, placed or not, is a `newTextureWithDescriptor:` on the
+    /// device of a descriptor whose `m2v.textureDescriptor` map ends with [`OUTSIDE`] `true`, as
+    /// the Vulkan platform's own texture's is; the stream names the image as the receiver of the
+    /// view made of it, and of its `replaceRegion:` where it is not placed, and counts no object
+    /// it could not name.
+    #[cfg(feature = "rt")]
+    #[test]
+    fn on_vulkan_an_rt_image_for_views_is_named_where_it_is_used() {
+        in_recording_child(
+            "recorder::tests::on_vulkan_an_rt_image_for_views_is_named_where_it_is_used",
+            |streams| {
+                use crate::core::platform::device::GpuDevice as _;
+                use crate::core::platform::resource::Texture as _;
+                use crate::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+                use crate::core::platform::values::TextureDesc;
+                use crate::core::platform::{HostRange, Platform as _};
+                const REPLACE: &str =
+                    "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:";
+                const VIEW: &str = "newTextureViewWithPixelFormat:";
+                const MADE: &str = "newTextureWithDescriptor:";
+                const DESCRIPTOR: &str = "m2v.textureDescriptor";
+                let platform = crate::rt_platform::RtPlatform::new();
+                assert!(on(), "the child does not record");
+                let registry_id = platform
+                    .system_default_device()
+                    .expect("an rt device on the GPU the test holds")
+                    .facts()
+                    .registry_id;
+                let device = platform
+                    .open_device(registry_id)
+                    .expect("the default device");
+                let value = TextureDesc {
+                    width: 4,
+                    height: 4,
+                    ..TextureDesc::default()
+                };
+                let image = device.new_texture_for_views(&value).expect("an image for views");
+                // rt may place none on this GPU, counted: then the image is the first alone.
+                let placed = device.new_placed_texture_for_views(&value);
+                let images: Vec<_> = std::iter::once(image).chain(placed).collect();
+                // A placed image's block is Private: only the first takes the CPU's bytes.
+                let pixels = [0x7fu8; 64];
+                let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(4, 4, 1));
+                (images[0].replace_region(region, 0, 0, HostRange::of_slice(&pixels), 16, 64))
+                    .unwrap();
+                let views: Vec<_> = (images.iter())
+                    .map(|image| image.new_texture_view(value.pixel_format).unwrap())
+                    .map(|view| view.expect("a view of the image"))
+                    .collect();
+                let queue = device.new_command_queue().expect("a queue");
+                let (calls, _) = recorded(streams, |calls| {
+                    calls.iter().any(|c| c.selector == "newCommandQueue")
+                });
+                let device_id = id_at(device.rec_ptr()).expect("the device's stream id");
+                for (n, image) in images.iter().enumerate() {
+                    let id = id_at(image.rec_ptr()).expect("the image's stream id");
+                    let made = (calls.iter())
+                        .find(|c| c.selector == MADE && c.result == id)
+                        .unwrap_or_else(|| panic!("nothing made image {id}: {calls:?}"));
+                    assert_eq!(made.receiver, device_id, "{made:?}");
+                    let Some(&Value::Object(descriptor)) = made.args.first() else {
+                        panic!("no descriptor named: {made:?}");
+                    };
+                    let record = (calls.iter())
+                        .find(|c| c.selector == DESCRIPTOR && c.result == descriptor)
+                        .unwrap_or_else(|| panic!("nothing made descriptor {descriptor}"));
+                    let Some(Value::Map(pairs)) = record.args.first() else {
+                        panic!("a descriptor's map: {record:?}");
+                    };
+                    assert_eq!(
+                        pairs.last(),
+                        Some(&(OUTSIDE.to_owned(), Value::Bool(true))),
+                        "{record:?}"
+                    );
+                    let selectors: &[&str] = if n == 0 { &[REPLACE, VIEW] } else { &[VIEW] };
+                    for selector in selectors {
+                        assert!(
+                            calls.iter().any(|c| c.selector == *selector && c.receiver == id),
+                            "no {selector} on image {id}: {calls:?}"
+                        );
+                    }
+                }
+                assert_eq!(stat(streams, "unrecorded_refs"), 0);
+                assert_eq!(stat(streams, "unrecorded_receivers"), 0);
+                drop((queue, views, images, device));
             },
         );
     }
