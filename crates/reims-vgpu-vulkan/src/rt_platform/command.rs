@@ -2,15 +2,16 @@
 //! and handed to rt's submit thread at its commit.
 //!
 //! - **Handlers.** rt runs a command buffer's scheduled handlers on its submit thread before the
-//!   submission goes to the driver, and its completed handlers on its completion thread, each
-//!   kind in the order added. Core's submission handlers run before its scheduled handlers, and
-//!   its completion-seen handlers before its completed handlers, whatever the order they were
-//!   added in: so the command buffer holds each kind until its commit, which hands rt one
-//!   scheduled handler that runs the submission handlers and then the scheduled ones, and one
-//!   completed handler that runs the completion-seen handlers and then the completed ones. A
-//!   submission handler therefore runs on rt's submit thread, never inside the commit. A handler
-//!   added after the commit is Metal's refusal (its validation stops it): counted
-//!   (`rt-refused-metal`), and it never runs.
+//!   submission goes to the driver (after it, for one that presents a drawable), or on its
+//!   completion thread, for one held at `Committed` for a shared event's value, before it retires;
+//!   and its completed handlers on its completion thread, each kind in the order added. Core's
+//!   submission handlers run before its scheduled handlers, and its completion-seen handlers before
+//!   its completed handlers, whatever the order they were added in: so the command buffer holds
+//!   each kind until its commit, which hands rt one scheduled handler that runs the submission
+//!   handlers and then the scheduled ones, and one completed handler that runs the completion-seen
+//!   handlers and then the completed ones. A submission handler therefore runs on one of those two
+//!   threads of rt's, never inside the commit. A handler added after the commit is Metal's refusal
+//!   (its validation stops it): counted (`rt-refused-metal`), and it never runs.
 //! - **What a completed handler learns**: rt's status and error then, and its GPU times, in
 //!   nanoseconds of rt's host clock (`metal2vulkan_rt::host_time`); none where either is 0,
 //!   as for a command buffer that ended with an error. rt's errors are Metal's
