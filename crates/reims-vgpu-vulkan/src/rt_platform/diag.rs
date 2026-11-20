@@ -73,6 +73,15 @@
 //! - **Views refused over a plain shape.** Each texture over a plain shape (no texture over its
 //!   plane takes storage) in a format that is neither the shape's nor its sRGB sibling, by the
 //!   pair ([`plain_view_refused`]).
+//! - **Render passes over a video plane.** Each render pass the decoder began that takes a view of
+//!   a video plane image (a plane shape of a video cache's surface, its exported planes) as an
+//!   attachment, by its shape ([`plane_pass`]): one plane alone, the two planes of one picture
+//!   alone, with a depth or stencil attachment, with a colour attachment that is not a plane, a
+//!   plane as a multisample resolve target, and planes of more than one picture or one plane
+//!   twice. Beside each shape some pass had, how many of its passes the compositor's process
+//!   (one that presents to the display) began and how many another's, an app's: the host is told
+//!   no process's name, nor whether a system framework in it encoded the pass. Its line is
+//!   written whether or not a pass was counted.
 //!
 //! - **Sampler states by border.** Each sampler state made (`newSamplerStateWithDescriptor:`), and
 //!   of them each that clamps to its border colour in some direction, by its border colour
@@ -1620,6 +1629,177 @@ pub fn presented(owner: u32) {
     f.last = Some(now);
 }
 
+// ----- Render passes over a video plane.
+
+/// A view of a video plane image (a plane shape of a video cache's surface): the block of its
+/// cache and its plane.
+pub type VideoPlane = (u64, u64);
+
+/// A render pass's attachments, as [`PlanePass::of`] classes them: each texture that is a view of
+/// a video plane image, and of the others only what the shape needs.
+#[derive(Debug, Default)]
+pub struct PassAttachments {
+    /// Each attachment's texture that is a view of a video plane image: the plane, and whether it
+    /// is a resolve texture.
+    planes: Vec<(VideoPlane, bool)>,
+    /// The colour attachments' textures and resolve textures that are not.
+    other_colours: u32,
+    /// Whether the pass has a depth or a stencil attachment.
+    depth_stencil: bool,
+}
+
+impl PassAttachments {
+    /// A colour attachment's texture, or where `resolve` its resolve texture: a view of the video
+    /// plane `plane` where `Some`.
+    pub fn colour(&mut self, plane: Option<VideoPlane>, resolve: bool) {
+        match plane {
+            Some(plane) => self.planes.push((plane, resolve)),
+            None => self.other_colours += 1,
+        }
+    }
+
+    /// A depth or stencil attachment, its resolve texture a view of the video plane `resolve`
+    /// where `Some`.
+    pub fn depth_or_stencil(&mut self, resolve: Option<VideoPlane>) {
+        self.depth_stencil = true;
+        if let Some(plane) = resolve {
+            self.planes.push((plane, true));
+        }
+    }
+}
+
+/// The shape of a render pass that takes a view of a video plane image as an attachment
+/// ([`Self::of`]). A pass may have several of the last four; `alone` and `both` hold only where
+/// none of those does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PlanePass {
+    /// One plane, a colour attachment, is its only attachment.
+    pub alone: bool,
+    /// The two planes of one picture, colour attachments, are its only attachments.
+    pub both: bool,
+    /// A depth or stencil attachment beside a plane.
+    pub depth_stencil: bool,
+    /// A colour attachment, or a colour attachment's resolve texture, that is not a plane.
+    pub other_colour: bool,
+    /// A plane as a resolve texture: the target of a multisample resolve.
+    pub resolve: bool,
+    /// Planes as colour attachments that are neither one plane nor the two planes of one
+    /// picture: planes of more than one picture, or one plane twice.
+    pub apart: bool,
+}
+
+/// The shapes as the plane-passes line names them, in [`PlanePass::shapes`]' order.
+const PLANE_PASS_SHAPES: [&str; 6] = [
+    "one plane alone",
+    "both planes of one picture",
+    "with a depth or stencil attachment",
+    "with a colour attachment not a plane",
+    "a plane as a resolve target",
+    "planes of more than one picture",
+];
+
+impl PlanePass {
+    /// The shape of a pass of the attachments `a`; `None` where none of them is a view of a video
+    /// plane image.
+    pub fn of(a: &PassAttachments) -> Option<PlanePass> {
+        if a.planes.is_empty() {
+            return None;
+        }
+        let resolve = a.planes.iter().any(|&(_, resolve)| resolve);
+        let mut colours = (a.planes.iter())
+            .filter(|&&(_, resolve)| !resolve)
+            .map(|&(plane, _)| plane);
+        let (first, second, more) = (colours.next(), colours.next(), colours.next().is_some());
+        let one_picture = matches!(
+            (first, second, more),
+            (Some((b0, p0)), Some((b1, p1)), false) if b0 == b1 && p0 != p1
+        );
+        let only = !a.depth_stencil && a.other_colours == 0 && !resolve;
+        Some(PlanePass {
+            alone: only && first.is_some() && second.is_none(),
+            both: only && one_picture,
+            depth_stencil: a.depth_stencil,
+            other_colour: a.other_colours != 0,
+            resolve,
+            apart: second.is_some() && !one_picture,
+        })
+    }
+
+    /// Whether it has each shape, in [`PLANE_PASS_SHAPES`]' order.
+    fn shapes(&self) -> [bool; 6] {
+        [
+            self.alone,
+            self.both,
+            self.depth_stencil,
+            self.other_colour,
+            self.resolve,
+            self.apart,
+        ]
+    }
+}
+
+/// The render passes that took a view of a video plane image as an attachment, by the context
+/// whose command buffer began them and their shape.
+static PLANE_PASSES: Mutex<BTreeMap<(Option<u32>, PlanePass), u64>> = Mutex::new(BTreeMap::new());
+
+/// A render pass of the attachments `a` begins in the command buffer this thread walks: counted
+/// by its shape and the walk's context where it takes a view of a video plane image as an
+/// attachment ([`PlanePass::of`]).
+pub fn plane_pass(a: &PassAttachments) {
+    if let Some(shape) = PlanePass::of(a) {
+        *PLANE_PASSES
+            .lock()
+            .entry((context_now(), shape))
+            .or_insert(0) += 1;
+    }
+}
+
+/// The plane-passes line (the module's docs, "Render passes over a video plane"): the passes, and
+/// each shape's, with those some pass had split between the compositor's process (a context of
+/// `presenters`), an app's, and a context not known.
+fn plane_passes_line(presenters: &BTreeSet<u32>) -> String {
+    let mut all = [0u64; 3];
+    let mut shapes = [[0u64; 3]; 6];
+    for (&(context, shape), &n) in PLANE_PASSES.lock().iter() {
+        let process = match context {
+            Some(c) if presenters.contains(&c) => 0,
+            Some(_) => 1,
+            None => 2,
+        };
+        all[process] += n;
+        for (i, has) in shape.shapes().into_iter().enumerate() {
+            if has {
+                shapes[i][process] += n;
+            }
+        }
+    }
+    // The passes of `n`, and where there are any, how many each process began.
+    let counted = |n: [u64; 3]| {
+        let total: u64 = n.iter().sum();
+        let by: Vec<String> = (["compositor", "app", "unknown"].iter().zip(n))
+            .filter(|&(_, n)| n != 0)
+            .map(|(class, n)| format!("{class} {n}"))
+            .collect();
+        let by = if by.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", by.join(", "))
+        };
+        (total, by)
+    };
+    let each: Vec<String> = (PLANE_PASS_SHAPES.iter().zip(shapes))
+        .map(|(name, n)| {
+            let (total, by) = counted(n);
+            format!("{name} {total}{by}")
+        })
+        .collect();
+    let (total, by) = counted(all);
+    format!(
+        "reims-vgpu: rt-diag plane-passes: {total} in all{by}; {}",
+        each.join("; ")
+    )
+}
+
 // ----- The lines.
 
 /// Writes the lines (the module's docs) on stderr, in one write.
@@ -1809,6 +1989,7 @@ pub fn write() {
     for (kind, t) in PATHS.lock().iter() {
         let _ = writeln!(out, "{}", paths_line(kind, t));
     }
+    let _ = writeln!(out, "{}", plane_passes_line(&presenters));
     if !presenters.is_empty() {
         let _ = writeln!(
             out,
@@ -1889,6 +2070,114 @@ mod tests {
         assert_eq!(
             class("reims-vgpu.graphics-surfaces"),
             "reims-vgpu.graphics-surfaces"
+        );
+    }
+
+    /// A pass is classed by its attachments only where one is a view of a video plane image: one
+    /// plane or one picture's two planes as its only attachments are `alone` and `both`; a depth
+    /// or stencil attachment, a colour that is not a plane, a plane as a resolve target, and
+    /// planes of two pictures or one plane twice each say so, and leave both of those unset.
+    #[test]
+    fn a_pass_over_a_video_plane_is_classed_by_its_shape() {
+        let (y, uv, other) = ((0x10_0000, 0), (0x10_0000, 1), (0x20_0000, 0));
+        let of = |colours: &[(Option<VideoPlane>, bool)], depth: Option<Option<VideoPlane>>| {
+            let mut a = PassAttachments::default();
+            for &(plane, resolve) in colours {
+                a.colour(plane, resolve);
+            }
+            if let Some(resolve) = depth {
+                a.depth_or_stencil(resolve);
+            }
+            PlanePass::of(&a)
+        };
+        let none = PlanePass::default();
+        assert_eq!(of(&[], None), None);
+        assert_eq!(of(&[(None, false), (None, true)], Some(None)), None);
+        let alone = PlanePass {
+            alone: true,
+            ..none
+        };
+        assert_eq!(of(&[(Some(y), false)], None), Some(alone));
+        assert_eq!(of(&[(Some(uv), false)], None), Some(alone));
+        let both = PlanePass { both: true, ..none };
+        assert_eq!(of(&[(Some(y), false), (Some(uv), false)], None), Some(both));
+        assert_eq!(of(&[(Some(uv), false), (Some(y), false)], None), Some(both));
+        let depth = PlanePass {
+            depth_stencil: true,
+            ..none
+        };
+        assert_eq!(of(&[(Some(y), false)], Some(None)), Some(depth));
+        assert_eq!(
+            of(&[(Some(y), false), (Some(uv), false)], Some(None)),
+            Some(depth)
+        );
+        let colour = PlanePass {
+            other_colour: true,
+            ..none
+        };
+        assert_eq!(of(&[(None, false), (Some(y), false)], None), Some(colour));
+        assert_eq!(
+            of(&[(Some(y), false), (Some(uv), false), (None, false)], None),
+            Some(colour)
+        );
+        assert_eq!(
+            of(&[(None, false), (Some(y), true)], None),
+            Some(PlanePass {
+                other_colour: true,
+                resolve: true,
+                ..none
+            })
+        );
+        assert_eq!(
+            of(&[], Some(Some(uv))),
+            Some(PlanePass {
+                depth_stencil: true,
+                resolve: true,
+                ..none
+            })
+        );
+        let apart = PlanePass {
+            apart: true,
+            ..none
+        };
+        assert_eq!(
+            of(&[(Some(y), false), (Some(other), false)], None),
+            Some(apart)
+        );
+        assert_eq!(of(&[(Some(y), false), (Some(y), false)], None), Some(apart));
+        assert_eq!(
+            of(
+                &[(Some(y), false), (Some(uv), false), (Some(other), false)],
+                None
+            ),
+            Some(apart)
+        );
+    }
+
+    /// The plane-passes line gives every shape, and beside each some pass had, its passes by the
+    /// process that began them: the compositor's (a context that presented), an app's, or one
+    /// whose context the walk did not name.
+    #[test]
+    fn the_plane_passes_line_splits_each_shape_by_process() {
+        let mut one = PassAttachments::default();
+        one.colour(Some((0x30_0000, 0)), false);
+        let mut beside = PassAttachments::default();
+        beside.colour(Some((0x30_0000, 1)), false);
+        beside.depth_or_stencil(None);
+        walk_context(Some(7));
+        plane_pass(&one);
+        plane_pass(&one);
+        plane_pass(&PassAttachments::default());
+        walk_context(Some(8));
+        plane_pass(&beside);
+        walk_context(None);
+        plane_pass(&one);
+        assert_eq!(
+            plane_passes_line(&BTreeSet::from([8])),
+            "reims-vgpu: rt-diag plane-passes: 4 in all (compositor 1, app 2, unknown 1); one \
+             plane alone 3 (app 2, unknown 1); both planes of one picture 0; with a depth or \
+             stencil attachment 1 (compositor 1); with a colour attachment not a plane 0; a plane \
+             as a resolve target 0; planes of more than one picture 0"
         );
     }
 

@@ -269,6 +269,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         let shape = ShapeUse {
             block,
             writes: takes_storage(m),
+            #[cfg(feature = "rt")]
+            video_plane: caches.video_plane(block, &reference),
             reference,
             #[cfg(feature = "rt")]
             diag: reims_vgpu_vulkan::rt_platform::diag::token(&view),
@@ -359,6 +361,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             reference,
             #[cfg(feature = "rt")]
             diag: None,
+            #[cfg(feature = "rt")]
+            video_plane: None,
         })
     }
 }

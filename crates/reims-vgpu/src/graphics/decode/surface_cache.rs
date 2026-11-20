@@ -6704,6 +6704,14 @@ impl<P: Platform> Caches<P> {
         self.lock().has(block)
     }
 
+    /// The plane of the block at `block`'s cache's surface whose image the shape `reference`
+    /// names is, where it is one of the cache's plane shapes ([`exported`]); `None` for any other.
+    #[cfg(feature = "rt")]
+    pub(crate) fn video_plane(&self, block: u64, reference: &shapes::ShapeRef) -> Option<u64> {
+        let state = self.lock();
+        state.by_block.get(&block)?.shapes.plane_of(reference.id())
+    }
+
     /// The block at `block`'s cache's layout at the GPU's pitch, where it lays its surface out so
     /// ([`SurfaceCaches::repitched`]).
     pub(crate) fn repitched(&self, block: u64) -> Option<Arc<Repitched>> {

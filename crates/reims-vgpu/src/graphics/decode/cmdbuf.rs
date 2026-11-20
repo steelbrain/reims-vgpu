@@ -3949,6 +3949,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             set.default_raster_sample_count = Some(desc.default_raster_sample_count as u64);
         }
         pass.set_pass(&set);
+        // The rt platform's boot diagnostics count the pass where it takes a view of a video plane
+        // image as an attachment, by its shape.
+        #[cfg(feature = "rt")]
+        let mut attached = reims_vgpu_vulkan::rt_platform::diag::PassAttachments::default();
 
         let stride = size_of::<RgfxRenderPassColorAttachment>();
         let color_start = RGFX_RENDER_PASS_COLOR_OFFSET as usize;
@@ -3968,6 +3972,13 @@ impl<P: Platform> GraphicsDecoder<P> {
             // The pass may write each attachment, and each resolve texture.
             self.texture_written(a.texture_obj_id);
             self.texture_written(a.resolve_texture_obj_id);
+            #[cfg(feature = "rt")]
+            {
+                attached.colour(self.video_plane(a.texture_obj_id), false);
+                if resolve.is_some() {
+                    attached.colour(self.video_plane(a.resolve_texture_obj_id), true);
+                }
+            }
             let aset = ColorAttachmentSet {
                 texture: Some(Some(tex)),
                 resolve_texture: resolve.map(Some),
@@ -4055,6 +4066,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             let resolve = self.get_texture(d.resolve_texture_obj_id)?;
             self.texture_written(d.texture_obj_id);
             self.texture_written(d.resolve_texture_obj_id);
+            #[cfg(feature = "rt")]
+            attached.depth_or_stencil(self.video_plane(d.resolve_texture_obj_id));
             let dset = DepthAttachmentSet {
                 texture: Some(Some(tex)),
                 resolve_texture: resolve.map(Some),
@@ -4079,6 +4092,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             let resolve = self.get_texture(s.resolve_texture_obj_id)?;
             self.texture_written(s.texture_obj_id);
             self.texture_written(s.resolve_texture_obj_id);
+            #[cfg(feature = "rt")]
+            attached.depth_or_stencil(self.video_plane(s.resolve_texture_obj_id));
             let sset = StencilAttachmentSet {
                 texture: Some(Some(tex)),
                 resolve_texture: resolve.map(Some),
@@ -4097,6 +4112,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             pass.set_stencil_attachment(&sset);
         }
 
+        #[cfg(feature = "rt")]
+        reims_vgpu_vulkan::rt_platform::diag::plane_pass(&attached);
         Ok((pass, facts))
     }
 }

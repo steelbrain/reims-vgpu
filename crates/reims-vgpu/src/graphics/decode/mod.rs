@@ -6855,6 +6855,16 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.note_over_cache(entry);
     }
 
+    /// The video plane image the texture `id` names is a view of, where it is one (its shape a
+    /// plane shape of a video cache's surface, [`surface_cache::shapes::ShapeUse::video_plane`]):
+    /// the block of its cache and its plane, which the rt platform's boot diagnostics count the
+    /// render passes of. `None` for 0 and any other texture.
+    #[cfg(feature = "rt")]
+    pub(crate) fn video_plane(&self, id: u64) -> Option<(u64, u64)> {
+        let used = self.entry(id)?.shape.as_ref()?;
+        Some((used.block, used.video_plane?))
+    }
+
     /// The buffer `id` names; an exec fault when `id` is 0 or names no buffer. One over a device
     /// cache's buffer itself is noted ([`Self::note_over_cache`]), and has its memory made, which
     /// the cache's buffer gets at its first use (the cache's module doc, "Deferred memory"):

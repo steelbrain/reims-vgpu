@@ -359,6 +359,12 @@ pub(crate) struct ShapeUse {
     /// (`reims_vgpu_vulkan::rt_platform::diag::shape_written`).
     #[cfg(feature = "rt")]
     pub(crate) diag: Option<reims_vgpu_vulkan::rt_platform::diag::Token>,
+    /// The plane of its cache's surface whose image the shape is, where it is a plane shape (a
+    /// video cache's, [`super::exported`]): the rt platform's boot diagnostics count the render
+    /// passes that take a view of one as an attachment
+    /// (`reims_vgpu_vulkan::rt_platform::diag::plane_pass`).
+    #[cfg(feature = "rt")]
+    pub(crate) video_plane: Option<u64>,
 }
 
 impl ShapeUse {
@@ -370,6 +376,8 @@ impl ShapeUse {
             reference: self.reference.clone_ref(),
             #[cfg(feature = "rt")]
             diag: self.diag.clone(),
+            #[cfg(feature = "rt")]
+            video_plane: self.video_plane,
         }
     }
 }
@@ -569,6 +577,15 @@ impl<T> ShapeTable<T> {
         let shape = &mut self.shapes[at];
         shape.used = now;
         Some((shape.tag.clone_ref(), shape))
+    }
+
+    /// The plane of the cache's surface whose image the shape `id` names is, where it is a plane
+    /// shape ([`Self::insert_plane`]); `None` for any other shape, and where the table holds
+    /// none of `id`.
+    #[cfg(feature = "rt")]
+    pub(crate) fn plane_of(&self, id: u64) -> Option<u64> {
+        let shape = self.shapes.iter().find(|s| s.plane && s.id() == id)?;
+        Some(shape.key.plane)
     }
 
     /// Whether the table holds a shape of `key`'s plane of the other kind, plain or storage.
