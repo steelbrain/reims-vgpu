@@ -507,14 +507,14 @@ impl PlaneDraw {
         });
         // The targets are let go behind the draws, or where a call failed; the flush submits
         // both, and the queue signals the fence after them.
-        let released: Result<(), String> = (mutexes.iter().take(held))
+        let released: Vec<_> = (mutexes.iter().take(held))
             .map(|mutex| release_sync(mutex))
             .collect();
         let signalled = encoded.and_then(|()| state.flush_and_signal());
         drop(state);
         // The wait for the GPU's writes holds no lock (module doc).
         wait_for(&self.fence, signalled?)?;
-        released
+        released.into_iter().collect()
     }
 
     /// What `targets` hold, for checks: the luma's bytes and the chroma's, row after row with
@@ -1300,7 +1300,9 @@ fn wait_for(fence: &Com, value: u64) -> Result<(), String> {
         // A removed device's fence answers `UINT64_MAX`, which says nothing of its writes.
         u64::MAX => Err("the device was removed".to_owned()),
         reached if reached >= value => Ok(()),
-        reached => Err(format!("the fence answers {reached} after the wait for {value}")),
+        reached => Err(format!(
+            "the fence answers {reached} after the wait for {value}"
+        )),
     }
 }
 
