@@ -400,6 +400,11 @@ pub fn created_or_decided<T>(
 ///   render encoder, whose biased depth is the device's. The runtime this platform runs on
 ///   announces its own depth-bias kinds instead (`BiasedDepthPastUnitRange`, `UnormDepthBias`),
 ///   so no draw here announces it until the device runs on rt;
+/// - the note `SwizzledOpaqueBlackBorder`: a sampler that reads an opaque-black border through a
+///   swizzled view on metal2vulkan-rt, on a device without `borderColorSwizzleFromImage`, whose
+///   border texel is the device's. The runtime this platform runs on makes the sampler for the
+///   view's mapping, or refuses the pair, instead, so no sampler here announces it until the
+///   device runs on rt;
 /// - `RestrictedDepthUpload` and the note `RestrictedDepthRange`: a `Depth32Float` value outside
 ///   `[0, 1]` on a device without `VK_EXT_depth_range_unrestricted`, MoltenVK included, which
 ///   stores it clamped where Metal keeps it. Announced inside the call that meets it (an upload;
@@ -1321,7 +1326,7 @@ pub fn created_or_decided<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 149] = [
+pub const DIES: [rt::Degradation; 150] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1333,6 +1338,7 @@ pub const DIES: [rt::Degradation; 149] = [
     rt::Degradation::HeapTextureBlockCompressedLayout,
     rt::Degradation::BiasedDepthPastUnitRange,
     rt::Degradation::DeviceDepthBias,
+    rt::Degradation::SwizzledOpaqueBlackBorder,
     rt::Degradation::UnormDepthBias,
     rt::Degradation::UnormDepthRounding,
     rt::Degradation::RestrictedDepthUpload,
