@@ -4,7 +4,7 @@
 //! guest's device info from it; the guest's work is refused at each unbuilt piece it reaches.
 
 use reims_vgpu_vulkan::core::num::ToU64 as _;
-use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::{Handle as _, Platform};
 use reims_vgpu_vulkan::os::GuestRamFile;
 use reims_vgpu_vulkan::{RtPlatform, rt_platform};
 
