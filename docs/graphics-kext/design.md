@@ -4942,9 +4942,10 @@ reads it once.
   answers the fourth output, makes the block's heap there, picking no address
   of the context's and giving none back at the heap's destroy; its buffers
   lie at their offsets from it. On metal2vulkan-runtime's device the address is
-  the block's Vulkan device address. On the Vulkan platform before it, whose
-  blocks have none, the host picks it in `[2^45, 2^46)`, below the context's
-  range, where the platform places none of its own ranges: next fit, each
+  the block's Vulkan device address. On a platform whose blocks have none
+  (the testkit's, whose blocks are the host's own memory), the host picks it
+  in `[2^45, 2^46)`, below the context's range, where the platform places
+  none of its own ranges: next fit, each
   address holding the span a guest pick of the block's length holds (its
   pages and a guard page, on the 32 KiB granule), a freed one picked again
   only once the picks wrap (`crates/reims-vgpu/src/pool/addresses.rs`); the
@@ -5035,9 +5036,10 @@ its kext sets that bit and the device took the feature.
   device's reset of every block.
 - **Its addresses.** On metal2vulkan-runtime's device a block is device memory no
   process maps, its address the memory's Vulkan device address, and the host
-  answers the whole block it took. On the Vulkan platform before it, the
-  host picks a block's addresses in `[2^44, 2^45)`, below the Shared pool's
-  and every context's range, where the platform places none of its own
+  answers the whole block it took. On a platform that gives no Private blocks
+  (the testkit's), the host picks a block's addresses in `[2^44, 2^45)`,
+  below the Shared pool's and every context's range, where the platform
+  places none of its own
   ranges: next fit, as it picks the pool's
   (`crates/reims-vgpu/src/pool/addresses.rs`, `private_blocks.rs`), with no
   memory behind them; the platform pins each object made there, as it pins

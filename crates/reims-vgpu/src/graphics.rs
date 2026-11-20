@@ -4753,10 +4753,10 @@ fn cache_every(shapes: bool, pool: bool) -> u64 {
 /// address, and every CPU copy lies in a block the platform knows, a slab's in a pool block at the
 /// address the host gave it (`POOL_ADDRESSES`), a no-copy one's in a pages block's view at its
 /// import's (`IMPORT_ADDRESSES`), so the platform keeps the pin. A GPU of its own memory keeps a
-/// `Managed` buffer's GPU copy elsewhere; the Vulkan platform before metal2vulkan-runtime pins each
-/// buffer at the guest's pick and refuses a pin inside another buffer's range; and with no pool the
-/// slabs' copies lie in heaps over the region, which no block the platform knows holds: none offers
-/// it, and their guests pick each buffer an address of its own.
+/// `Managed` buffer's GPU copy elsewhere; a platform that keeps every pin where the guest picks
+/// (the testkit's) knows no block a CPU copy lies in; and with no pool the slabs' copies lie in
+/// heaps over the region, which no block the platform knows holds: none offers it, and their
+/// guests pick each buffer an address of its own.
 fn managed_at_copy(unified: bool, pins_in_blocks: bool, pool: bool) -> u64 {
     if unified && pins_in_blocks && pool {
         RGFX_FEATURE_MANAGED_AT_COPY
