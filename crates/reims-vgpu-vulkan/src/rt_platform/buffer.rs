@@ -641,8 +641,8 @@ fn deferred_refused(length: u64) -> ! {
             call: DEFERRED_SEL,
         },
         &format!(
-            "metal2vulkan-runtime refused the memory of a deferred buffer of {length} bytes at a use \
-             that answers no refusal ({DEFERRED_REFUSED_CODE})"
+            "metal2vulkan-runtime refused the memory of a deferred buffer of {length} bytes at a \
+             use that answers no refusal ({DEFERRED_REFUSED_CODE})"
         ),
     )
 }
@@ -2011,8 +2011,8 @@ fn both_refused(sel: &'static str, dma_buf: &rt::Error, pointer: &rt::Error) {
     if !BOTH_REFUSED_SAID.swap(true, Ordering::Relaxed) {
         log::info!(
             target: TARGET,
-            "{sel}: metal2vulkan-runtime refused both a dma-buf of the pages of a no-copy buffer or \
-             heap ({dma_buf}) and their pointer ({pointer}); each such import is counted from \
+            "{sel}: metal2vulkan-runtime refused both a dma-buf of the pages of a no-copy buffer \
+             or heap ({dma_buf}) and their pointer ({pointer}); each such import is counted from \
              here ({IMPORTS_DMA_BUF_AND_POINTER_REFUSED})"
         );
     }

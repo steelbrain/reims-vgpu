@@ -955,8 +955,8 @@ take's worker zeroes the carve; a piece is found only once the host says it is i
 The source is rt's blocks (`pool::RtBlocks`, the platform's `ApiPlatform::block_source`), each known
 to its device while handed out; where a platform gives none (the testkit's), it is `HostBlocks`, the
 process's own memory, in the same shape (`take_block`, `release_block`). A piece the pool asks for
-itself is one of metal2vulkan-runtime's units, 16 MiB (`BLOCK_LEN`, read from rt), and a take longer than
-a unit has a piece of its own length. The pool keeps 64 MiB of empty pieces as headroom
+itself is one of metal2vulkan-runtime's units, 16 MiB (`BLOCK_LEN`, read from rt), and a take longer
+than a unit has a piece of its own length. The pool keeps 64 MiB of empty pieces as headroom
 (`HEADROOM`), from the guest driver's take of `POOL` on (`Host::pool_taken`), so the guest's first
 takes find them, and gives a piece above them that stays empty past `RELEASE_DELAY` back to the
 source, which keeps it ready or frees it. Before a block goes back the pool takes its piece out of

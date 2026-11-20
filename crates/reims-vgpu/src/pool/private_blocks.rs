@@ -5,10 +5,10 @@
 //!
 //! # A block
 //!
-//! On a source that gives Private blocks (metal2vulkan-runtime's device), a take is one block of the
-//! source's ([`BlockSource::take_block`] of [`MemoryClass::Private`]): device memory no one maps,
-//! at the block's own GPU address, the whole of it the context's (the take's length rounded up to
-//! rt's 64 KiB, carved from one of its 16 MiB allocations where it fits, else the start of an
+//! On a source that gives Private blocks (metal2vulkan-runtime's device), a take is one block of
+//! the source's ([`BlockSource::take_block`] of [`MemoryClass::Private`]): device memory no one
+//! maps, at the block's own GPU address, the whole of it the context's (the take's length rounded
+//! up to rt's 64 KiB, carved from one of its 16 MiB allocations where it fits, else the start of an
 //! allocation of its own: [`super::BLOCK_LEN`]). The guest asks for blocks of [`UNIT_LEN`], rt's
 //! allocation unit, each a range of an allocation rt's block maker may have made ahead of need; an
 //! object whose span is longer takes a block of its own length, which rt allocates in the take
@@ -24,8 +24,8 @@
 //! source gives no Private blocks, is answered at once on the thread that carries the take out,
 //! the context's lane. A source's block may be an allocation of the driver's, which waits for the
 //! memory and, on NVIDIA's driver, holds the device's other calls while it allocates (about
-//! 0.08 ms a MiB of Private memory, metal2vulkan-runtime's `memory.rs`, `ALLOCATION_LEN`): on an RTX
-//! 3090 a boot whose guest asked for blocks of 256 MiB took 7, 52.7 ms in all and 11.5 ms at
+//! 0.08 ms a MiB of Private memory, metal2vulkan-runtime's `memory.rs`, `ALLOCATION_LEN`): on an
+//! RTX 3090 a boot whose guest asked for blocks of 256 MiB took 7, 52.7 ms in all and 11.5 ms at
 //! most, each on the control ring's lane, which held every context's next messages behind it
 //! (**measured**). So a take of
 //! the source's goes to its context's worker (`reims-vgpu.graphics-private-take`), which takes
@@ -88,8 +88,8 @@ pub const SOURCED_CODE: &str = "private-take-sourced";
 pub const SOURCED_US_CODE: &str = "private-take-sourced-us";
 
 /// The length of the guest's Private blocks, `kPrivateBlockBytes` in its Metal bundle: 16 MiB,
-/// metal2vulkan-runtime's allocation unit ([`metal2vulkan_runtime::MemoryClass::block_len`]), which rt's
-/// block maker makes ahead of need while the class's free bytes are fewer than half of one. A
+/// metal2vulkan-runtime's allocation unit ([`metal2vulkan_runtime::MemoryClass::block_len`]), which
+/// rt's block maker makes ahead of need while the class's free bytes are fewer than half of one. A
 /// longer take is an object's own span, which rt makes an allocation for in the take.
 pub const UNIT_LEN: u64 = metal2vulkan_runtime::MemoryClass::Private.block_len();
 

@@ -4,9 +4,9 @@
 //! A device is made from one config ([`GraphicsConfig`]) holding closures for its callbacks, and
 //! answers a [`Result`] with what refused it ([`Error`]). It is generic over the platform with
 //! [`DefaultPlatform`] as the default, so its forwarding is unit-tested on core's fake platform.
-//! The platform is `RtPlatform`, over metal2vulkan-runtime, on the host's Vulkan driver on Linux and
-//! Windows and on macOS on Mesa's KosmicKrisp; it draws the device's window into a swapchain of its
-//! window, on macOS one over the window's `CAMetalLayer`.
+//! The platform is `RtPlatform`, over metal2vulkan-runtime, on the host's Vulkan driver on Linux
+//! and Windows and on macOS on Mesa's KosmicKrisp; it draws the device's window into a swapchain of
+//! its window, on macOS one over the window's `CAMetalLayer`.
 //!
 //! The library logs through the `log` crate: a Rust host installs its own logger.
 

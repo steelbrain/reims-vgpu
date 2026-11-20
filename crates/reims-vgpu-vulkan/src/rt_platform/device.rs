@@ -1,5 +1,5 @@
-//! The rt platform's device ([`RtDevice`]): one metal2vulkan-runtime device for the process, made of
-//! the physical device the library's choice of device picks ([`open`]), with its answers
+//! The rt platform's device ([`RtDevice`]): one metal2vulkan-runtime device for the process, made
+//! of the physical device the library's choice of device picks ([`open`]), with its answers
 //! (`super::answers`), its command queues (`super::queue`), its buffers (`super::buffer`), heaps
 //! (`super::heap`) and the blocks it knows ([`KnownBlocks`]), its textures (`super::texture`),
 //! events and fences, and the reservation of resource indices as rt's index grants. Every other

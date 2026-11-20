@@ -377,10 +377,10 @@ fn user_selection(var: impl Fn(&str) -> Option<OsString>) -> Vec<(&'static str, 
         .collect()
 }
 
-/// The device of `seen` (an instance's physical devices that meet metal2vulkan-runtime's floor, in the
-/// loader's order) the rt platform opens (`crate::rt_platform`), and logged: the device the host's
-/// user's selection variables name, else the one GPU, else the first by kind (the module doc).
-/// `None` where no device is a candidate.
+/// The device of `seen` (an instance's physical devices that meet metal2vulkan-runtime's floor, in
+/// the loader's order) the rt platform opens (`crate::rt_platform`), and logged: the device the
+/// host's user's selection variables name, else the one GPU, else the first by kind (the module
+/// doc). `None` where no device is a candidate.
 pub(crate) fn chosen(seen: &[Seen]) -> Option<usize> {
     for (at, device) in seen.iter().enumerate() {
         log::info!(target: TARGET, "Vulkan device {at}: {}", device.describe());

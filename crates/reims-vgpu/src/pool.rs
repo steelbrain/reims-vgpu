@@ -54,12 +54,12 @@
 //!
 //! # The block source
 //!
-//! [`BlockSource`] is metal2vulkan-runtime's block calls as its API names them (`Device::take_block`,
-//! `release_block`, [`BlockInfo`]). On the rt platform the source is the runtime's blocks
-//! ([`rt_blocks::RtBlocks`], the platform's `ApiPlatform::block_source`), each known to its device
-//! while handed out. A platform that gives none (the testkit's) takes [`HostBlocks`], blocks of
-//! the process's own memory, which hands blocks out, keeps them ready and frees them as the
-//! runtime does.
+//! [`BlockSource`] is metal2vulkan-runtime's block calls as its API names them
+//! (`Device::take_block`, `release_block`, [`BlockInfo`]). On the rt platform the source is the
+//! runtime's blocks ([`rt_blocks::RtBlocks`], the platform's `ApiPlatform::block_source`), each
+//! known to its device while handed out. A platform that gives none (the testkit's) takes
+//! [`HostBlocks`], blocks of the process's own memory, which hands blocks out, keeps them ready and
+//! frees them as the runtime does.
 //!
 //! The host maps a block into the guest whole host pages at a time: a block whose mapping does
 //! not start at a host page, or whose length is no whole number of them, goes back to the source
@@ -217,7 +217,8 @@ pub const PIECE_ALIGN: u64 = 2 << 20;
 /// source (the module doc's "Headroom and giving blocks back").
 pub const RELEASE_DELAY: Duration = Duration::from_secs(5);
 
-/// A block's storage mode as the guest's buffers in it see it (metal2vulkan-runtime's `MemoryClass`).
+/// A block's storage mode as the guest's buffers in it see it (metal2vulkan-runtime's
+/// `MemoryClass`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[allow(
     dead_code,

@@ -128,8 +128,8 @@
 //! pages block's `SURFACE_PAGES` is answered with a GPU address for the first byte of its view
 //! ([`SurfaceViews::pages_address`]), and the guest places each `BUFFER_OVER_PAGES` over the
 //! block there, plus the buffer's offset in the view: buffers over the same bytes, which share
-//! a block, share their address, as they share the import of its pages on metal2vulkan-runtime. Here
-//! the address is the host's pick in `[2^43, 2^44)` (`pool::addresses`), holding Metal's span
+//! a block, share their address, as they share the import of its pages on metal2vulkan-runtime.
+//! Here the address is the host's pick in `[2^43, 2^44)` (`pool::addresses`), holding Metal's span
 //! of the view's length until the block goes. The first buffer made there is pinned there, as a
 //! buffer at the guest's own pick is, and the block keeps it until it goes, so the address
 //! reaches the view's pages for as long as any buffer over the block lives; a buffer made there
@@ -138,8 +138,8 @@
 //! gets no address here: each of its buffers lies over a copy of its own.
 //!
 //! Where the platform keeps a pin only inside a block it knows and knows a view's import as one
-//! (metal2vulkan-runtime's, [`ViewImports`]), the address is the import's own: a block's view and its
-//! import are made at its `SURFACE_PAGES`, before the answer, rather than at its first
+//! (metal2vulkan-runtime's, [`ViewImports`]), the address is the import's own: a block's view and
+//! its import are made at its `SURFACE_PAGES`, before the answer, rather than at its first
 //! `BUFFER_OVER_PAGES`, so the view joins no group, and every buffer over the block at the
 //! address plus its offset is pinned there, a range of the import with no import of its own; no
 //! buffer is kept. The import is known while the view's import buffer lives: in the block's entry,
@@ -155,14 +155,14 @@
 //! until the cache lets it go. A block of pages its process maps read-only is made so too, one
 //! known import a view, its address the import's and its buffers pinned in it, the import asked
 //! as read-only: the platform makes it a copy of the pages whose GPU writes are dropped at each
-//! completion (metal2vulkan-runtime's, its `buffer` module's docs, "Read-only memory"), so a GPU write
-//! through its buffers never reaches the pages, as Metal's GPU drops it. Such a view is cached
-//! apart: a read-only block takes only a cached view whose import drops the GPU's writes, and
-//! any other block only one whose import keeps them. The refusals above stay.
+//! completion (metal2vulkan-runtime's, its `buffer` module's docs, "Read-only memory"), so a GPU
+//! write through its buffers never reaches the pages, as Metal's GPU drops it. Such a view is
+//! cached apart: a read-only block takes only a cached view whose import drops the GPU's writes,
+//! and any other block only one whose import keeps them. The refusals above stay.
 //!
 //! **Surfaces with no views** (`ApiPlatform::SURFACE_VIEWS`). A platform may keep no view of an
-//! IOSurface's pages (metal2vulkan-runtime, whose surfaces are device images that the device cache's
-//! copies sync at the guest's events): an IOSurface block's `SURFACE_PAGES`, and a deferred
+//! IOSurface's pages (metal2vulkan-runtime, whose surfaces are device images that the device
+//! cache's copies sync at the guest's events): an IOSurface block's `SURFACE_PAGES`, and a deferred
 //! block's pages, then make no view and import nothing, however the guest's RAM is mapped, its
 //! runs checked as a view's are ([`PagesRefusal::Unviewed`], counted), and a block named by its
 //! runs that gets no device cache makes none either ([`Unmade::make`]). The surface takes a copy
@@ -4883,10 +4883,10 @@ pub(super) mod tests {
     }
 
     /// On a platform that keeps no view of an IOSurface's pages (`ApiPlatform::SURFACE_VIEWS`
-    /// false, metal2vulkan-runtime's), an IOSurface block's `SURFACE_PAGES` makes no view and imports
-    /// nothing, though the guest's RAM is mapped, counted as kept unviewed, and bad runs are still
-    /// refused as bad runs; a pages block, an app's no-copy memory, still takes its view and its
-    /// known import, at its `SURFACE_PAGES` answer
+    /// false, metal2vulkan-runtime's), an IOSurface block's `SURFACE_PAGES` makes no view and
+    /// imports nothing, though the guest's RAM is mapped, counted as kept unviewed, and bad runs
+    /// are still refused as bad runs; a pages block, an app's no-copy memory, still takes its view
+    /// and its known import, at its `SURFACE_PAGES` answer
     #[test]
     fn surfaces_take_no_view_where_the_platform_keeps_none_but_pages_blocks_do() {
         const IMPORTS: u64 = 0x6_0000_0000;

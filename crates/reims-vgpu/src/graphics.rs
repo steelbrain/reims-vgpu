@@ -523,8 +523,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // The GPU's memory heaps, summed, which size the guest's Shared pool's range below.
             let memory_heaps = gpu_device.memory_heaps_total();
             // The source of the guest's pool's blocks and of its contexts' Private blocks: the
-            // platform's where it gives blocks (metal2vulkan-runtime's), else the process's own memory
-            // for the pool and the host's picks of Private addresses.
+            // platform's where it gives blocks (metal2vulkan-runtime's), else the process's own
+            // memory for the pool and the host's picks of Private addresses.
             let block_source = platform.block_source(&gpu_device);
             // The guest's Shared pool, its blocks the source's. Its range is what the GPU's
             // memory heaps hold, of the addresses the host can give.
@@ -1277,11 +1277,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     /// the last call of the host's before its exit, on the thread that then exits. Its answer is
     /// whether the host may then call `exit`. The library's threads park at their next step and
     /// the steps in progress on other threads are waited for; on the platform over
-    /// metal2vulkan-runtime, then, where a GPU device is still live, rt's threads end and its GPU work
-    /// completes, and the process's GPU work after it is refused. Nothing is freed. On the
-    /// platform over metal2vulkan-runtime, true where it keeps no GPU device (the release of the last
-    /// graphics device let go of it, [`Self::let_go_of_gpu`]) and the steps ended in time; false
-    /// where it keeps one, stopped or not, since its runtime supports no `exit` with a device
+    /// metal2vulkan-runtime, then, where a GPU device is still live, rt's threads end and its GPU
+    /// work completes, and the process's GPU work after it is refused. Nothing is freed. On the
+    /// platform over metal2vulkan-runtime, true where it keeps no GPU device (the release of the
+    /// last graphics device let go of it, [`Self::let_go_of_gpu`]) and the steps ended in time;
+    /// false where it keeps one, stopped or not, since its runtime supports no `exit` with a device
     /// live. On the Vulkan platform, true only where it never asked its runtime for a GPU device
     /// in the process and the steps ended in time; false once it did, let go of since or not,
     /// since that runtime's exit hook, registered as the device was made, waits for the runtime's

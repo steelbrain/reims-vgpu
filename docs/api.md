@@ -189,8 +189,8 @@ submitted and the rest ends unrun, the GPU completes what was submitted, and the
 end. Every wait ends within the call's bound, and nothing is freed. It answers true where the steps
 ended in time and the library holds no GPU device the exit could meet: none was opened in the
 process, or the release of the last graphics device let go of it. It answers false otherwise,
-quiesced or not, and where a step outlasted the wait, since metal2vulkan-runtime supports an `exit` with
-a device live on no device (its README, "Quiesce and exit"): on an RTX 3090 (620.70.06), 3 of 9
+quiesced or not, and where a step outlasted the wait, since metal2vulkan-runtime supports an `exit`
+with a device live on no device (its README, "Quiesce and exit"): on an RTX 3090 (620.70.06), 3 of 9
 power-offs that called `exit` after the quiesce stopped everything in time ended with `SIGSEGV` in a
 thread of the driver's own while its exit handler waited on a lock. On false the library writes its
 degradation counts then, as the exit gate's handler would, and the host runs its own exit work and

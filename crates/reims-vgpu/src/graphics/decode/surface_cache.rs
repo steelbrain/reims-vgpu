@@ -8253,8 +8253,8 @@ fn encode_home<P: Platform>(
     Ok(true)
 }
 
-/// The longest piece of a staged copy (the module doc, "Staged copies"): metal2vulkan-runtime's unit,
-/// the length of each allocation its pool makes ([`MemoryClass::block_len`]), so a piece is
+/// The longest piece of a staged copy (the module doc, "Staged copies"): metal2vulkan-runtime's
+/// unit, the length of each allocation its pool makes ([`MemoryClass::block_len`]), so a piece is
 /// carved from the pool's free ranges, or is the start of one unit's allocation where none fits,
 /// and never takes an allocation of a surface's length.
 ///

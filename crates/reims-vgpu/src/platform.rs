@@ -285,8 +285,8 @@ mod fake {
         parking_lot::const_mutex(Vec::new());
 
     /// Has `platform` import each pages block's view as a block it knows, through `imports`, as
-    /// metal2vulkan-runtime's does ([`ApiPlatform::view_imports`]): a graphics device made on it from
-    /// now on offers what goes with them. The entries of processes gone are dropped here.
+    /// metal2vulkan-runtime's does ([`ApiPlatform::view_imports`]): a graphics device made on it
+    /// from now on offers what goes with them. The entries of processes gone are dropped here.
     #[cfg(test)]
     pub(crate) fn fake_view_imports(
         platform: &Arc<FakePlatform>,

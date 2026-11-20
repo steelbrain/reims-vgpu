@@ -5,9 +5,9 @@
 //!
 //! **Pins not kept.** On such a platform any other pinned object lies at the platform's own
 //! address, which the guest's pointers to it do not hold. The platform counts each such object
-//! once (metal2vulkan-runtime's `rt-gpu-address-unpinned`); the decoder, which knows what each create
-//! makes, counts it again under its kind's code ([`Codes::unpinned`]), so the kinds' counts sum to
-//! that total. A pin counts where the decoder passed it to the platform and the object made
+//! once (metal2vulkan-runtime's `rt-gpu-address-unpinned`); the decoder, which knows what each
+//! create makes, counts it again under its kind's code ([`Codes::unpinned`]), so the kinds' counts
+//! sum to that total. A pin counts where the decoder passed it to the platform and the object made
 //! answers another `gpuAddress` ([`made`]). A texture placed by the device at the guest's own pick
 //! is counted apart, as [`TEXTURE_PICKS`]: no platform takes a texture's pin, so none is in the
 //! total, and its `gpuAddress` is the guest's answer alone.
@@ -17,14 +17,14 @@
 //! holds a [`Live`], which counts it gone as the entry goes.
 //!
 //! **Imports.** Each make the decoder or the device asks of the platform runs as a make of its
-//! kind on its thread (`reims_vgpu_vulkan::answer::making_as`, [`Codes::imports`]): metal2vulkan-runtime
-//! counts each import of the host's memory it makes there under that kind, with the most live at
-//! once, and under its total (`rt-imports`), so the kinds' counts sum to it. Each refusal of rt's
-//! there is counted under the kind too (`reims_vgpu_vulkan::answer::refusing_as`,
-//! [`Codes::refused`]), beside its own code (`rt-refused-vulkan` and the others). The device's
-//! own makes that import are kinds of their own: the views of pages blocks ([`Kind::PagesView`]),
-//! the views a device cache's copies use ([`Kind::CacheView`]) and the display's scanout
-//! ([`Kind::Scanout`]).
+//! kind on its thread (`reims_vgpu_vulkan::answer::making_as`, [`Codes::imports`]):
+//! metal2vulkan-runtime counts each import of the host's memory it makes there under that kind,
+//! with the most live at once, and under its total (`rt-imports`), so the kinds' counts sum to it.
+//! Each refusal of rt's there is counted under the kind too
+//! (`reims_vgpu_vulkan::answer::refusing_as`, [`Codes::refused`]), beside its own code
+//! (`rt-refused-vulkan` and the others). The device's own makes that import are kinds of their own:
+//! the views of pages blocks ([`Kind::PagesView`]), the views a device cache's copies use
+//! ([`Kind::CacheView`]) and the display's scanout ([`Kind::Scanout`]).
 //!
 //! On a platform that places a pinned object anywhere (`ApiPlatform::PINS_IN_BLOCKS` false, the
 //! default, the fake platform's) no pin or object is counted here, and none of its makes imports through a counted path.

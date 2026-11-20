@@ -231,8 +231,8 @@ pub fn refused_error(piece: Unbuilt, sel: &'static str) -> NsErrorText {
 /// The line of the process's first refusal of `piece`, at `sel`.
 fn refusal_line(piece: Unbuilt, sel: &'static str) -> String {
     format!(
-        "reims-vgpu: {sel}: {} is not built on metal2vulkan-runtime; refused ({}), the first of its \
-         kind\n",
+        "reims-vgpu: {sel}: {} is not built on metal2vulkan-runtime; refused ({}), the first of \
+         its kind\n",
         piece.what(),
         piece.code()
     )
@@ -395,8 +395,8 @@ pub fn refused_as(sel: &'static str, kind: RtRefusal, why: &dyn std::fmt::Displa
     count_refusal(kind);
     if first(&SAID_RT, kind.at()) {
         say(&format!(
-            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({why}); refused ({}), the first of \
-             its kind\n",
+            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({why}); refused ({}), the first \
+             of its kind\n",
             kind.code()
         ));
     }
@@ -443,8 +443,8 @@ pub fn rt_refused_texture(sel: &'static str, error: &rt::Error) -> RtRefusal {
     super::diag::refusal(error);
     if first {
         say(&format!(
-            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({error}); refused ({code}), the first \
-             of its format\n"
+            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({error}); refused ({code}), the \
+             first of its format\n"
         ));
     }
     RtRefusal::Gap
@@ -784,8 +784,9 @@ mod tests {
         assert_eq!(
             detail_line("newTextureWithDescriptor:", &samples, &name, Some(&what)),
             format!(
-                "reims-vgpu: newTextureWithDescriptor:: metal2vulkan-runtime refused it ({samples}); \
-                 the first of Limit-TextureSamples (rt-refused-limit): a texture of format 70\n"
+                "reims-vgpu: newTextureWithDescriptor:: metal2vulkan-runtime refused it \
+                 ({samples}); the first of Limit-TextureSamples (rt-refused-limit): a texture of \
+                 format 70\n"
             )
         );
         let points = rt::Error::Unsupported(rt::Gap::Draw {
@@ -798,8 +799,8 @@ mod tests {
                 "Draw-Points",
                 None
             ),
-            "reims-vgpu: drawPrimitives:vertexStart:vertexCount:: metal2vulkan-runtime refused it (a \
-             draw with Points is not built); the first of Draw-Points (rt-refused-gap)\n"
+            "reims-vgpu: drawPrimitives:vertexStart:vertexCount:: metal2vulkan-runtime refused it \
+             (a draw with Points is not built); the first of Draw-Points (rt-refused-gap)\n"
         );
         let kind = "test-first-named";
         assert!(first_named(kind.to_owned()));

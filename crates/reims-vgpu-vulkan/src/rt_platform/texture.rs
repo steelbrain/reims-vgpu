@@ -202,8 +202,8 @@ pub(super) const NON_VOLATILE: u64 = 2;
 /// `MTLPurgeableStateEmpty`, the last state.
 const EMPTY: u64 = 4;
 
-/// `id<MTLTexture>` on metal2vulkan-runtime: rt's texture and what the platform answers of it beyond
-/// rt's descriptor.
+/// `id<MTLTexture>` on metal2vulkan-runtime: rt's texture and what the platform answers of it
+/// beyond rt's descriptor.
 pub struct RtTexture {
     /// rt's texture.
     rt: rt::Texture,
@@ -1480,8 +1480,8 @@ fn counted_copy(bytes: usize) {
     if !COPIED.swap(true, Ordering::Relaxed) {
         log::warn!(
             target: "reims_vgpu_vulkan::rt_platform",
-            "{REPLACE}: the guest's bytes are copied before metal2vulkan-runtime takes them, a copy \
-             Metal does not make ({COPY_CODE}), counted from here"
+            "{REPLACE}: the guest's bytes are copied before metal2vulkan-runtime takes them, a \
+             copy Metal does not make ({COPY_CODE}), counted from here"
         );
     }
 }

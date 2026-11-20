@@ -88,9 +88,9 @@ fn refused(sel: &'static str, why: &dyn std::fmt::Display) {
         log::warn!(
             target: TARGET,
             kind:% = EXPORT_REFUSED_CODE;
-            "{sel}: metal2vulkan-runtime makes no exportable buffer ({why}); the buffer is made as any \
-             other, and the host's video lands its pictures another way ({EXPORT_REFUSED_CODE}), \
-             counted from here"
+            "{sel}: metal2vulkan-runtime makes no exportable buffer ({why}); the buffer is made as \
+             any other, and the host's video lands its pictures another way \
+             ({EXPORT_REFUSED_CODE}), counted from here"
         );
     }
 }

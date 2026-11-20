@@ -1,6 +1,6 @@
-//! [`RtBlocks`], the pool's [`BlockSource`] over metal2vulkan-runtime's blocks (`Device::take_block`
-//! and `release_block`), the runtime the device runs on from the cutover: the source of the
-//! guest's Shared pool and of its contexts' Private blocks on the rt platform
+//! [`RtBlocks`], the pool's [`BlockSource`] over metal2vulkan-runtime's blocks
+//! (`Device::take_block` and `release_block`), the runtime the device runs on from the cutover: the
+//! source of the guest's Shared pool and of its contexts' Private blocks on the rt platform
 //! (`ApiPlatform::block_source`). Its tests run it on the GPU each test host holds, but on the
 //! Mac, whose Vulkan, MoltenVK, rt's floor refuses.
 //!

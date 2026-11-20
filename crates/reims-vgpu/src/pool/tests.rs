@@ -1652,8 +1652,8 @@ fn the_release_leaves_the_blocks_with_a_live_ledger_until_its_drop() {
     assert_eq!(blocks.counts(), (0, 2));
 }
 
-/// A source whose blocks have GPU addresses, as metal2vulkan-runtime's do: [`HostBlocks`]' blocks, the
-/// `n`th handed out at `ADDRESSED + n * BLOCK_LEN`.
+/// A source whose blocks have GPU addresses, as metal2vulkan-runtime's do: [`HostBlocks`]' blocks,
+/// the `n`th handed out at `ADDRESSED + n * BLOCK_LEN`.
 struct Addressed {
     blocks: HostBlocks,
     handed: Mutex<u64>,
