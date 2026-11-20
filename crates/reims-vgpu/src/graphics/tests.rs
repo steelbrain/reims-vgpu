@@ -2311,6 +2311,19 @@ fn wait_idle(device: &GraphicsDevice<FakePlatform>, submit_off: u64) {
     eventually(|| ring_idle(device, submit_off));
 }
 
+/// Waits, [`PATIENCE`] polls at most, for the queue whose submission ring is at region offset
+/// `submit_off` to have its handle made, as a helper that hands a test a device with its queues
+/// made does: the queue's service thread has the decoder make the handle after the create's
+/// answer, and sleeps on its idle ring only after that, so neither a mark of the platform's calls
+/// nor a fault on a call's next one, taken from then on, meets the handle's make, however late a
+/// loaded host runs the thread.
+fn handle_made(device: &GraphicsDevice<FakePlatform>, submit_off: u64) {
+    assert!(
+        eventually(|| ring_idle(device, submit_off)),
+        "the service thread of the queue at {submit_off:#x} did not make its handle"
+    );
+}
+
 /// Whether the queue's thread of the submission ring at `submit_off` sleeps with it idle.
 fn ring_idle(device: &GraphicsDevice<FakePlatform>, submit_off: u64) -> bool {
     // SAFETY: the region is the device's, mapped while it lives; `consumer_idle` is at 0x80 of
@@ -4424,9 +4437,9 @@ fn with_ask(mut message: Vec<u8>) -> Vec<u8> {
     message
 }
 
-/// A device with process 1's queues 1 and 2 and process 2's queue 1 made, their rings in that
-/// order, each process's shared event 20, library 10 and render pipeline 11, and process 1's
-/// sampler 4.
+/// A device with process 1's queues 1 and 2 and process 2's queue 1 made, their handles among
+/// them, their rings in that order, each process's shared event 20, library 10 and render
+/// pipeline 11, and process 1's sampler 4.
 fn two_processes(
     raised: &Arc<AtomicU32>,
 ) -> (
@@ -4489,6 +4502,9 @@ fn two_processes_taking(
         QueueRing::new(&device, submit, complete, u64::from(RING_DATA))
     };
     let queues = [ring(0), ring(1), ring(2)];
+    for at in 0..3 {
+        handle_made(&device, rings(at).0);
+    }
     (device, platform, guest, queues)
 }
 
@@ -5213,7 +5229,8 @@ fn command_buffer_of(queue_obj_id: u64, cb_obj_id: u64, ops: &[(u16, &[u8])]) ->
     bytes
 }
 
-/// A headless device with queue 1 of process 1 made, its ring, and the process's sampler 4.
+/// A headless device with queue 1 of process 1 made, its handle among it, its ring, and the
+/// process's sampler 4.
 fn one_queue(
     raised: &Arc<AtomicU32>,
 ) -> (
@@ -5238,6 +5255,7 @@ fn one_queue(
         RGFX_STATUS_OK
     );
     let ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
+    handle_made(&device, SUBMIT_OFF);
     (device, platform, guest, ring)
 }
 
@@ -7508,7 +7526,7 @@ fn uploads_written_of_no_managed_buffer_are_dropped() {
 }
 
 /// A process's queue rings at `submit`, `complete` (data `RING_DATA`), queue `n` of context 1,
-/// on `device`, after the guest granted their blocks.
+/// on `device`, after the guest granted their blocks, once the queue's handle is made.
 fn managed_order_queue(
     device: &GraphicsDevice<FakePlatform>,
     guest: &mut Guest,
@@ -7520,6 +7538,7 @@ fn managed_order_queue(
         create_queue(device, guest, 1, n, (submit, complete), RING_DATA, 0),
         RGFX_STATUS_OK
     );
+    handle_made(device, submit);
     QueueRing::new(device, submit, complete, u64::from(RING_DATA))
 }
 
@@ -9042,6 +9061,7 @@ fn surface_and_queue(device: &GraphicsDevice<FakePlatform>) -> (Guest, QueueRing
         texture_from_iosurface(obj(1, 3), 1, obj(1, 2), 0x77, 64, WRITERS),
     );
     let ring = QueueRing::new(device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    handle_made(device, SUBMIT);
     (guest, ring)
 }
 
@@ -12442,6 +12462,7 @@ fn one_queue_raising(
         RGFX_STATUS_OK
     );
     let ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(data));
+    handle_made(&device, SUBMIT_OFF);
     (device, platform, guest, ring)
 }
 
