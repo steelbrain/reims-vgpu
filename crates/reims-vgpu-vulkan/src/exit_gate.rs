@@ -276,9 +276,9 @@ fn enter(making: bool) -> Option<Step> {
         MAKINGS.fetch_add(1, Ordering::SeqCst);
     }
     DEPTH.with(|d| d.set(depth + 1));
-    let slot = (depth == 0)
-        .then(|| take_slot(Location::caller()))
-        .flatten();
+    // Read here, not in a closure: a closure's `Location::caller` is the closure's own site.
+    let site = Location::caller();
+    let slot = if depth == 0 { take_slot(site) } else { None };
     Some(Step {
         making,
         slot,
