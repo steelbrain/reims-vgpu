@@ -819,9 +819,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     P::PLACED_SHAPE_IMAGES,
                 );
             }
-            // The reset gate ([`GraphicsControl::reset_gate`]), which the staged copies' spares'
-            // top-ups, the takes of blocks ahead of shapes' images and the video caches' spare
-            // surfaces' makes hold shared too.
+            // The reset gate ([`GraphicsControl::reset_gate`]), which the takes of blocks ahead of
+            // shapes' images and the video caches' spare surfaces' makes hold shared too.
             let reset_gate: Arc<RwLock<()>> = Arc::default();
             // A platform that places shapes' images takes the block of a large surface's
             // whole-extent shape ahead of its image, off the ring
@@ -843,7 +842,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // A platform whose imports of the host's memory cost each submission stages the
             // caches' copies through the host's CPU (`ApiPlatform::STAGED_SURFACE_COPIES`).
             if P::STAGED_SURFACE_COPIES {
-                decoder.set_staged_surface_copies(Arc::clone(&reset_gate));
+                decoder.set_staged_surface_copies();
             }
             if unified_memory {
                 let cache_budget = cache_budget(own_memory);

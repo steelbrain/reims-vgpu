@@ -815,7 +815,7 @@ mod tests {
         hold: bool,
     ) -> (Rig, Placed, Arc<AheadLog>) {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.set_staged_surface_copies();
         r.dec.surface_caches.set_staging_piece(UNIT);
         let page = r.page;
         let (p, q) = (Arc::clone(&r.p), Arc::clone(&r.p));
@@ -2445,7 +2445,7 @@ mod tests {
     /// [`ram_bytes`]); pipeline 31's function writes every texture slot it is asked of.
     fn shaped_staged() -> Rig {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.set_staged_surface_copies();
         let page = r.page;
         take_shapes(&r);
         r.dec.hold_resource_ids(0, 1);

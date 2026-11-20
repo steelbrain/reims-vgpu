@@ -300,18 +300,19 @@
 //!   unzeroed ([`GpuDevice::new_scratch_buffer_of_length`]): a fill's CPU copy writes all of
 //!   the surface's bytes into them ([`CopiedPages`] hold them all), and a download's CPU copy
 //!   reads only the bytes its GPU copy wrote, the surface's texels where its layout is known
-//!   (rows alone, with no padding between them or bytes past the last), else all of them. Once a
-//!   copy's command buffer has completed and its CPU copy is done, its pieces go back to the
-//!   caches' spares ([`Spares`]), up to [`SPARE_BYTES`] of them, two whole pieces, which the
-//!   next copies take in place of a make, the shortest spare that holds each piece; a copy in
-//!   flight never shares one. A copy whose takes leave no whole piece among the spares hands a
-//!   top-up to a thread of theirs ([`SPARES_THREADS`]), which nothing waits for: it makes whole
-//!   pieces until the spares hold [`SPARE_BYTES`] of them, letting go of shorter ones to fit,
-//!   each make under the device's reset gate. A use's fill, at once or deferred, a present's fill,
-//!   a download's copy out and a release's find their pieces made ahead: where the spares and the
+//!   (rows alone, with no padding between them or bytes past the last), else all of them. The
+//!   caches keep [`SPARE_BYTES`] of pieces, two whole ones ([`Spares`]), which circulate: a copy
+//!   takes an idle one for each piece it needs in place of a make, and gives it back once its
+//!   command buffer has completed and its CPU copy is done, so a copy in flight never shares
+//!   one. The first copies that find none idle make them, whole, each on its own thread, until
+//!   two are kept; nothing makes one after, and none is let go of. A copy that finds none idle
+//!   once both are kept makes a scratch piece of the length it needs on its own thread, let go
+//!   of once its copy is done. A use's fill, at once or deferred, a present's fill, a download's
+//!   copy out and a release's find their pieces made ahead: where the idle kept pieces and the
 //!   pieces reserved for the block lack some a copy of all of the bytes it may move would take
-//!   ([`SurfaceCaches::lacking`]), the spares that serve it are taken into the block's reserve
-//!   under the lock, so no other copy takes them and no other block's reservation counts them,
+//!   ([`SurfaceCaches::lacking`]), the kept pieces that serve it are taken into the block's
+//!   reserve under the lock, so no other copy takes them and no other block's reservation counts
+//!   them,
 //!   and the rest are made with no lock of the caches' held and reserved for the block
 //!   ([`SurfaceCaches::reserved`]): a fill's by the thread that begins the use's command
 //!   buffer, the lock let go of once for them ([`Caches::before_answering`]), or by the present's
@@ -322,20 +323,21 @@
 //!   finishes it, and those of a first fill a begin, a buffer or a decode reaches, of a block named
 //!   again, of a cache's refills after a recovery of the device, each by the thread that asks
 //!   it ([`reserve_ahead`]). The copy takes them first; what it leaves is the next copy's of the
-//!   block under the same hold of the lock ([`SurfaceCaches::left_over`]), and the spares take
-//!   back on their thread what is left as the lock is let go of. A copy that still finds no spare
-//!   (one with no reservation, or one that moves more bytes than its reservation saw) makes its
-//!   piece on its own thread, under the caches' lock, counted (`rt-staging-piece-makes-locked`).
-//!   Each piece taken is counted (`rt-staging-pieces`, and
-//!   `rt-staging-pieces-spared` those a spare served), and each a copy made, with the
-//!   nanoseconds its make took in all and the longest, for a cache's first staged copy
-//!   (`rt-staging-piece-makes-first`, `-first-ns`, `-first-max-ns`, `-first-kib`) apart from
-//!   the copies after it (`rt-staging-piece-makes-repeat`, `-repeat-ns`, `-repeat-max-ns`,
-//!   `-repeat-kib`); each a top-up made the same way (`rt-staging-spares-made`, `-made-ns`,
-//!   `-made-max-ns`, `-made-kib`), the spares let go of (`rt-staging-spares-let-go`,
-//!   `-let-go-kib`) and of them those a top-up made and no copy took, with those still unused
-//!   as the spares go (`rt-staging-spares-unused`, `-unused-kib`), and the most KiB the spares
-//!   held at once (`rt-staging-spares-held-most-kib`).
+//!   block under the same hold of the lock ([`SurfaceCaches::left_over`]), and what is left is
+//!   given back as the lock is let go of, the scratch pieces let go of with no lock held. A copy
+//!   that still finds no piece (one with no reservation, or one that moves more bytes than its
+//!   reservation saw) makes its piece on its own thread, under the caches' lock, counted
+//!   (`rt-staging-piece-makes-locked`). Each piece taken is counted (`rt-staging-pieces`, and
+//!   `rt-staging-pieces-spared` those a kept piece served), with the nanoseconds its take or make
+//!   took in all and the longest (`rt-staging-piece-get-ns`, `-get-max-ns`), and each a copy
+//!   made, with the nanoseconds its make took in all and the longest, for a cache's first staged
+//!   copy (`rt-staging-piece-makes-first`, `-first-ns`, `-first-max-ns`, `-first-kib`) apart
+//!   from the copies after it (`rt-staging-piece-makes-repeat`, `-repeat-ns`, `-repeat-max-ns`,
+//!   `-repeat-kib`); the kept pieces made the same way (`rt-staging-spares-made`, `-made-ns`,
+//!   `-made-max-ns`, `-made-kib`), the scratch pieces let go of (`rt-staging-spares-let-go`,
+//!   `-let-go-kib`), the kept pieces let go of as a copy dropped them without giving them back
+//!   (`rt-staging-spares-dropped`, `-dropped-kib`), and the most KiB of idle kept pieces at once
+//!   (`rt-staging-spares-held-most-kib`).
 //!   A download's CPU copy, and the answers that wait for it, run on a thread of the caches' own
 //!   ([`INTO_PAGES_THREADS`]), not in its command buffer's completed handler: the platform sees
 //!   every queue's completions on one thread, which a large surface's copy, tens of milliseconds
@@ -436,7 +438,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::{Deref, DerefMut, Range};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::RwLock;
 use reims_vgpu_graphics::ops::{
@@ -2051,17 +2053,20 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// Where every cache's copies are staged (the module doc, "Staged copies";
     /// [`Caches::set_staged`]), the platform's clock, which times the host's CPU's part of each.
     staged: Option<Now>,
-    /// The staged copies' buffers no copy uses (the module doc, "Staged copies").
+    /// The staged copies' kept pieces (the module doc, "Staged copies").
     spares: Arc<Spares<P>>,
-    /// Pieces made for a block's next staged copy with the caches' lock let go of, by block (the
-    /// module doc, "Staged copies"): the copy takes them before the spares, and gives back what it
-    /// leaves ([`Spares::pieces_from`]).
-    reserved: HashMap<u64, Vec<P::Buffer>>,
+    /// Pieces taken or made for a block's next staged copy with the caches' lock let go of, by
+    /// block (the module doc, "Staged copies"): the copy takes them before an idle kept piece,
+    /// and gives back what it leaves ([`Spares::pieces_from`]).
+    reserved: HashMap<u64, Vec<Piece<P>>>,
     /// The pieces a staged copy took from those reserved for its block and left
     /// ([`Spares::pieces_from`]), by block: the next copy of the block under the same hold of the
-    /// lock takes them first, as named again its copy out and its fill; the rest go back to the
-    /// spares as the lock is let go of ([`Locked`]).
-    left_over: HashMap<u64, Vec<P::Buffer>>,
+    /// lock takes them first, as named again its copy out and its fill; the rest are given back
+    /// as the lock is let go of ([`Locked`]).
+    left_over: HashMap<u64, Vec<Piece<P>>>,
+    /// The scratch pieces given back under the lock ([`Self::give_back`]), let go of once it is
+    /// let go of ([`Locked`]).
+    let_go: Vec<P::Buffer>,
     /// The threads that move a staged download's bytes into its pages and land it
     /// ([`INTO_PAGES_THREADS`]), a block's in the order their command buffers completed.
     lands_out: Arc<Worker>,
@@ -2290,9 +2295,10 @@ impl<P: Platform> SurfaceCaches<P> {
             shaped: false,
             shape_clock: 0,
             staged: None,
-            spares: Arc::new(Spares::new(SPARE_BYTES, PIECE, Arc::default())),
+            spares: Arc::new(Spares::new(SPARE_BYTES, PIECE)),
             reserved: HashMap::new(),
             left_over: HashMap::new(),
+            let_go: Vec::new(),
             lands_out: Arc::new(Worker::new(INTO_PAGES_THREADS)),
             memory_refused: false,
         }
@@ -4990,7 +4996,7 @@ impl<P: Platform> SurfaceCaches<P> {
         }
         self.watched.0.lock().remove(&block);
         if let Some(reserve) = self.reserved.remove(&block) {
-            self.spares.give_later(reserve);
+            self.give_back(reserve);
         }
         Ok(gone)
     }
@@ -5032,15 +5038,24 @@ impl<P: Platform> SurfaceCaches<P> {
         Some((lens, !cache.staged))
     }
 
+    /// Gives `pieces` back under the caches' lock ([`Piece::give_back`]): the kept ones to the
+    /// idle kept pieces now, the scratch ones let go of once the lock is let go of
+    /// ([`Self::let_go`]).
+    fn give_back(&mut self, pieces: Vec<Piece<P>>) {
+        for piece in pieces {
+            self.let_go.extend(piece.give_back());
+        }
+    }
+
     /// [`Self::lacking`] of each staged copy of `wants`, by block and way, by block: the copies of
     /// one block taken together, as each takes what the one before it left of the pieces reserved
     /// for it ([`Self::left_over`]). None for a block whose copies would make none. Each piece is
     /// served as the copy serves it ([`Spares::pieces_from`]): by the shortest piece reserved for
-    /// the block that holds it, else by the shortest spare that does, which is taken into the
-    /// block's reserve ([`Self::reserved`]) now, counted as taken as a copy counts it
-    /// ([`piece_taken`]). So the spares counted for a copy are its own while the lock is let go
-    /// of to make what they lack: no other copy takes them meanwhile, and no other block's
-    /// reservation counts them.
+    /// the block that holds it, else by an idle kept piece, which is taken into the block's
+    /// reserve ([`Self::reserved`]) now, counted as taken as a copy counts it ([`piece_taken`]).
+    /// So the kept pieces counted for a copy are its own while the lock is let go of to make what
+    /// they lack: no other copy takes them meanwhile, and no other block's reservation counts
+    /// them.
     fn reserve_spares(&mut self, wants: &[(u64, Way)]) -> Vec<(u64, Vec<u64>, bool)> {
         let mut by_block: Vec<(u64, Vec<u64>, bool)> = Vec::new();
         for &(block, way) in wants {
@@ -5067,10 +5082,11 @@ impl<P: Platform> SurfaceCaches<P> {
                     reserved.swap_remove(at);
                     continue;
                 }
+                let at = self.staged.as_ref().map(|now| now());
                 match self.spares.take(length) {
                     Some(piece) => {
-                        if self.staged.is_some() {
-                            piece_taken(true);
+                        if let (Some(now), Some(at)) = (&self.staged, at) {
+                            piece_taken(true, now().saturating_duration_since(at));
                         }
                         taken.push(piece);
                     }
@@ -6128,23 +6144,27 @@ impl<P: Platform> DerefMut for Locked<'_, P> {
 }
 
 impl<P: Platform> Locked<'_, P> {
-    /// Hands over the command buffers owed their commits under the lock; whether there were any.
-    fn hand_over(&mut self) -> bool {
+    /// Hands over the command buffers owed their commits under the lock, and gives back the
+    /// pieces left over ([`SurfaceCaches::left_over`]); whether any commits were owed, and the
+    /// scratch pieces to let go of once the lock is let go of.
+    fn hand_over(&mut self) -> (bool, Vec<P::Buffer>) {
         for (_, left) in std::mem::take(&mut self.left_over) {
-            self.spares.give_later(left);
+            self.give_back(left);
         }
+        let gone = std::mem::take(&mut self.let_go);
         let owed = std::mem::take(&mut self.owed_commits);
         let any = !owed.is_empty();
         self.commits.owe(owed);
-        any
+        (any, gone)
     }
 
     /// `f` with the lock let go of, the commits owed made first ([`Commits::commit_owed`]).
     pub(crate) fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R {
-        self.hand_over();
+        let (_, gone) = self.hand_over();
         let commits = self.commits;
         match &mut self.guard {
             Some(guard) => MutexGuard::unlocked(guard, || {
+                drop(gone);
                 commits.commit_owed();
                 f()
             }),
@@ -6153,11 +6173,12 @@ impl<P: Platform> Locked<'_, P> {
     }
 
     /// Waits on `moved` with the lock let go of, as `Condvar::wait`, and may wake without
-    /// cause, as it does; where this thread owes commits, makes them with the lock let go of
-    /// instead, and returns.
+    /// cause, as it does; where this thread owes commits, or holds scratch pieces to let go of,
+    /// makes or lets go of them with the lock let go of instead, and returns.
     fn wait(&mut self, moved: &Condvar) {
-        if self.hand_over() {
-            self.unlocked(|| ());
+        let (owed, gone) = self.hand_over();
+        if owed || !gone.is_empty() {
+            self.unlocked(|| drop(gone));
             return;
         }
         match &mut self.guard {
@@ -6169,8 +6190,9 @@ impl<P: Platform> Locked<'_, P> {
 
 impl<P: Platform> Drop for Locked<'_, P> {
     fn drop(&mut self) {
-        self.hand_over();
+        let (_, gone) = self.hand_over();
         drop(self.guard.take());
+        drop(gone);
         self.commits.commit_owed();
     }
 }
@@ -6346,10 +6368,9 @@ impl<P: Platform> Caches<P> {
     }
 
     /// Stages every cache's copies from now on (the module doc, "Staged copies"), the host's
-    /// CPU's part of each timed by `now`, the spares' top-ups made under the device's reset
-    /// `gate` ([`Spares`]): set once, at the device's make, before any cache.
-    pub(crate) fn set_staged(&self, now: Now, gate: Arc<RwLock<()>>) {
-        let spares = Arc::new(Spares::new(SPARE_BYTES, PIECE, gate));
+    /// CPU's part of each timed by `now`: set once, at the device's make, before any cache.
+    pub(crate) fn set_staged(&self, now: Now) {
+        let spares = Arc::new(Spares::new(SPARE_BYTES, PIECE));
         let mut state = self.lock();
         state.staged = Some(now);
         let was = std::mem::replace(&mut state.spares, spares);
@@ -6363,11 +6384,7 @@ impl<P: Platform> Caches<P> {
     #[cfg(test)]
     pub(crate) fn set_staging_piece(&self, piece: u64) {
         let mut state = self.lock();
-        let gate = Arc::clone(&state.spares.gate);
-        let was = std::mem::replace(
-            &mut state.spares,
-            Arc::new(Spares::new(2 * piece, piece, gate)),
-        );
+        let was = std::mem::replace(&mut state.spares, Arc::new(Spares::new(2 * piece, piece)));
         drop(state);
         drop(was);
     }
@@ -7903,7 +7920,7 @@ fn reserve_unlocked<P: Platform>(
         return;
     }
     let (spares, timed) = (Arc::clone(&state.spares), state.staged.clone());
-    let made: Vec<(u64, Vec<P::Buffer>)> = state.unlocked(|| {
+    let made: Vec<(u64, Vec<Piece<P>>)> = state.unlocked(|| {
         (lacking.into_iter())
             .filter_map(|(block, lens, first)| {
                 let pieces = spares.pieces(device, &lens, first, timed.as_ref());
@@ -8533,7 +8550,7 @@ fn placed(spans: &[Range<u64>], places: &[Place]) -> Vec<Place> {
 }
 
 /// `places` each with the address in `pieces` of its first byte, for [`CopiedPages::copy`].
-fn addresses<P: Platform>(places: &[Place], pieces: &[P::Buffer]) -> Vec<(Range<u64>, *mut u8)> {
+fn addresses<P: Platform>(places: &[Place], pieces: &[Piece<P>]) -> Vec<(Range<u64>, *mut u8)> {
     (places.iter())
         .map(|place| {
             let base = pieces[place.piece].contents().as_ptr::<u8>();
@@ -8548,18 +8565,17 @@ fn addresses<P: Platform>(places: &[Place], pieces: &[P::Buffer]) -> Vec<(Range<
 /// pieces: its texels alone where its layout is known ([`SurfaceCache::texels`]), as every copy
 /// out of the cache does, else all its bytes, of those the copy moved.
 struct Staging<P: Platform> {
-    pieces: Vec<P::Buffer>,
+    pieces: Vec<Piece<P>>,
     into: Option<(Arc<CopiedPages>, Vec<Place>)>,
     /// Where the caches' copies are staged, the clock that times the copy into the pages
     /// ([`DOWNLOADS`]).
     timed: Option<Now>,
-    /// Where the pieces go once the copy is done.
-    spares: Arc<Spares<P>>,
 }
 
 impl<P: Platform> Staging<P> {
     /// The copy's command buffer has completed: a copy out of the cache moves the bytes its GPU
-    /// copy wrote into the pages, the spans alone; then the pieces go back to the spares.
+    /// copy wrote into the pages, the spans alone; then the pieces are given back
+    /// ([`Piece::give_back`]): the kept ones to the idle kept pieces, the scratch ones let go of.
     fn done(self) {
         if let Some((pages, spans)) = &self.into {
             let at = self.timed.as_ref().map(|now| now());
@@ -8572,124 +8588,201 @@ impl<P: Platform> Staging<P> {
                 DOWNLOADS.took(now, at);
             }
         }
-        let Staging { pieces, spares, .. } = self;
-        for piece in pieces {
-            spares.give(piece);
+        give_back(self.pieces);
+    }
+}
+
+/// The bytes of the staged copies' kept pieces ([`Spares`]): two whole pieces, what the steady
+/// state's repeated copies take, where a copy longer than they hold makes the rest.
+const SPARE_BYTES: u64 = 2 * PIECE;
+
+/// The staged copies' kept pieces (the module doc, "Staged copies"): `cap` bytes of whole pieces,
+/// `piece` bytes each, which circulate. A copy takes an idle one for each piece it needs, of any
+/// length up to `piece`, and gives it back to the idle ones once its command buffer has completed
+/// and its CPU copy is done ([`Piece::give_back`]), so a copy in flight never shares one. The
+/// first copies that find none idle while fewer than the cap's are kept make them, whole, each on
+/// its own thread; nothing makes one after, and none is let go of while the spares last. A copy
+/// that finds none idle once all are kept makes a scratch piece of the length it needs on its own
+/// thread, let go of once its copy is done, counted ([`spare_let_go`]).
+struct Spares<P: Platform> {
+    kept: Arc<Mutex<Kept<P>>>,
+    /// How many whole pieces are kept at most: the cap's bytes of them.
+    most: usize,
+    /// The longest piece a copy lays its bytes in ([`PIECE`]; shorter in the tests).
+    piece: u64,
+}
+
+/// The kept pieces no copy holds, and how many are kept in all: idle, held by a copy, or being
+/// made.
+struct Kept<P: Platform> {
+    idle: Vec<P::Buffer>,
+    all: usize,
+}
+
+/// A staged copy's piece ([`Spares`]): a kept one, which goes back to the idle kept pieces once
+/// given back, or a scratch one, the copy's own, let go of then, counted ([`spare_let_go`]). One
+/// dropped without being given back (a copy that ended before its command buffer was committed)
+/// is let go of: a kept one so leaves the kept pieces, counted ([`SPARES_DROPPED`]), and the next
+/// copy that finds none idle makes a whole one in its place.
+struct Piece<P: Platform> {
+    /// `None` only as it goes.
+    buffer: Option<P::Buffer>,
+    /// The kept pieces it goes back to: `None` for a scratch piece.
+    home: Option<Weak<Mutex<Kept<P>>>>,
+}
+
+impl<P: Platform> Deref for Piece<P> {
+    type Target = P::Buffer;
+
+    fn deref(&self) -> &P::Buffer {
+        match &self.buffer {
+            Some(buffer) => buffer,
+            None => unreachable!("a piece's buffer is taken only as it goes"),
         }
     }
 }
 
-/// The idle bytes the caches keep in their staged copies' spare pieces ([`Spares`]): two whole
-/// pieces, what the steady state's repeated copies take of them, where a copy longer than they
-/// hold takes the rest from the platform.
-const SPARE_BYTES: u64 = 2 * PIECE;
-
-/// The name of the threads, `<name>-<i>`, that top the staged copies' spares up ([`Spares`]),
-/// one at a time, as every top-up is under one key ([`Worker`]).
-pub(crate) const SPARES_THREADS: &str = "reims-vgpu.graphics-staging-spares";
-
-/// The staged copies' pieces no copy uses (the module doc, "Staged copies"), each given back
-/// once its copy's command buffer completed and its CPU copy was done, so a copy in flight never
-/// shares one; a copy takes the shortest one that holds a piece it needs in place of a make.
-/// Kept to `cap` bytes in all: a piece given past them takes the place of the shortest kept
-/// where it is longer, else is let go of.
-///
-/// A copy whose takes leave no whole piece kept (`piece` bytes) hands a top-up over to a thread
-/// of the spares' own ([`SPARES_THREADS`]), which nothing waits for: it makes whole pieces until
-/// `cap` bytes of them are kept, letting go of shorter ones kept to fit, each make under the
-/// device's reset gate held shared, so none runs while the device resets. A copy that finds no
-/// spare makes its piece on its own thread, as the top-up is not ahead of it.
-struct Spares<P: Platform> {
-    kept: Arc<Kept<P>>,
-    cap: u64,
-    /// The longest piece a copy lays its bytes in ([`PIECE`]; shorter in the tests).
-    piece: u64,
-    /// Runs the top-ups, under one key.
-    topper: Worker,
-    /// The device's reset gate, which each top-up's make holds shared.
-    gate: Arc<RwLock<()>>,
+impl<P: Platform> Piece<P> {
+    /// The piece's copy is done, or did not use it: a kept piece goes back to the idle kept
+    /// pieces; a scratch one is let go of, counted ([`spare_let_go`]), returned for the caller to
+    /// drop where it holds no lock.
+    fn give_back(mut self) -> Option<P::Buffer> {
+        let buffer = self.buffer.take()?;
+        let Some(home) = self.home.take() else {
+            spare_let_go(buffer.length());
+            return Some(buffer);
+        };
+        // Its spares gone (a test's pieces set again): let go of with them.
+        let Some(kept) = home.upgrade() else {
+            return Some(buffer);
+        };
+        let held = {
+            let mut kept = kept.lock();
+            kept.idle.push(buffer);
+            kept.idle.iter().map(|b| b.length()).sum::<u64>()
+        };
+        spares_held(held);
+        None
+    }
 }
 
-/// What [`Spares`] and their top-ups share: the pieces kept, whether a top-up is handed over and
-/// not yet begun, and whether the spares are gone.
-struct Kept<P: Platform> {
-    idle: Mutex<Vec<Spare<P>>>,
-    asked: AtomicBool,
-    closed: AtomicBool,
-}
-
-/// A kept piece, and whether a top-up made it and no copy has taken it.
-struct Spare<P: Platform> {
-    buffer: P::Buffer,
-    unused: bool,
+impl<P: Platform> Drop for Piece<P> {
+    /// A piece not given back is let go of: a kept one leaves the kept pieces, counted
+    /// ([`SPARES_DROPPED`]), a scratch one is let go of, counted ([`spare_let_go`]).
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        match &self.home {
+            None => spare_let_go(buffer.length()),
+            Some(home) => {
+                if let Some(kept) = home.upgrade() {
+                    let mut kept = kept.lock();
+                    kept.all = kept.all.saturating_sub(1);
+                    drop(kept);
+                    spare_dropped(buffer.length());
+                }
+            }
+        }
+    }
 }
 
 impl<P: Platform> Spares<P> {
-    fn new(cap: u64, piece: u64, gate: Arc<RwLock<()>>) -> Self {
-        let topper = Worker::new(SPARES_THREADS);
-        // A test's copies see no top-up until it lets them ([`Self::release_top_ups`]): what a
-        // copy does where the top-up is not ahead of it, which a run meets as well.
-        #[cfg(test)]
-        topper.hold();
+    fn new(cap: u64, piece: u64) -> Self {
         Spares {
-            kept: Arc::new(Kept {
-                idle: Mutex::new(Vec::new()),
-                asked: AtomicBool::new(false),
-                closed: AtomicBool::new(false),
-            }),
-            cap,
+            kept: Arc::new(Mutex::new(Kept {
+                idle: Vec::new(),
+                all: 0,
+            })),
+            most: (cap / piece).to_usize(),
             piece,
-            topper,
-            gate,
         }
     }
 
-    /// The shortest kept piece of at least `length` bytes, no longer kept; `None` where none is.
-    fn take(&self, length: u64) -> Option<P::Buffer> {
-        let mut idle = self.kept.idle.lock();
-        let (at, _) = (idle.iter().enumerate())
-            .filter(|(_, s)| s.buffer.length() >= length)
-            .min_by_key(|(_, s)| s.buffer.length())?;
-        Some(idle.swap_remove(at).buffer)
+    /// An idle kept piece for a piece of `length` bytes, taken; `None` where none is idle.
+    fn take(&self, length: u64) -> Option<Piece<P>> {
+        if length > self.piece {
+            return None;
+        }
+        let buffer = self.kept.lock().idle.pop()?;
+        Some(Piece {
+            buffer: Some(buffer),
+            home: Some(Arc::downgrade(&self.kept)),
+        })
     }
 
-    /// `buffer`, whose copy is done, kept under the cap ([`Kept::keep`]); what is let go of goes
-    /// outside the lock.
-    fn give(&self, buffer: P::Buffer) {
-        drop(self.kept.keep(buffer, false, self.cap));
+    /// A piece for a piece of `length` bytes made on `device`, the host's own, unzeroed: a whole
+    /// kept one where fewer than the most are kept, counted where the copies are `timed`
+    /// ([`spare_made`]); else a scratch one of `length` bytes. `None` where the platform made
+    /// none.
+    fn make(
+        &self,
+        device: &P::Device,
+        length: u64,
+        timed: Option<&Now>,
+    ) -> RaiseResult<Option<Piece<P>>> {
+        let keeps = {
+            let mut kept = self.kept.lock();
+            let keeps = kept.all < self.most;
+            kept.all += usize::from(keeps);
+            keeps
+        };
+        if !keeps {
+            let made = device.new_scratch_buffer_of_length(ON, length, STORAGE_SHARED)?;
+            return Ok(made.map(|buffer| Piece {
+                buffer: Some(buffer),
+                home: None,
+            }));
+        }
+        let at = timed.map(|now| now());
+        match device.new_scratch_buffer_of_length(ON, self.piece, STORAGE_SHARED) {
+            Ok(Some(buffer)) => {
+                if let (Some(now), Some(at)) = (timed, at) {
+                    spare_made(now().saturating_duration_since(at), self.piece);
+                }
+                Ok(Some(Piece {
+                    buffer: Some(buffer),
+                    home: Some(Arc::downgrade(&self.kept)),
+                }))
+            }
+            made => {
+                let mut kept = self.kept.lock();
+                kept.all = kept.all.saturating_sub(1);
+                made.map(|_| None)
+            }
+        }
     }
 
     /// A piece of each of `lens`' lengths, for a copy of a cache, its `first` staged copy where
-    /// so: the shortest spare that holds it, else one made on `device`, the host's own,
-    /// unzeroed. Counted where the copies are `timed` ([`piece_taken`], [`piece_made`]): each
-    /// taken, those spared, and those made with the nanoseconds each make took, apart for a
-    /// cache's first staged copy and those after it. `None` where one is not made, the pieces
-    /// taken given back. Where the takes leave no whole piece kept, a top-up is handed over
-    /// ([`Self::top_up`]).
+    /// so: an idle kept piece, else one made on `device` ([`Self::make`]). Counted where the
+    /// copies are `timed` ([`piece_taken`], [`piece_made`]): each taken, with the nanoseconds its
+    /// take or make took, those kept, and those made with the nanoseconds each make took, apart
+    /// for a cache's first staged copy and those after it. `None` where one is not made, the
+    /// pieces taken given back.
     fn pieces(
         &self,
         device: &P::Device,
         lens: &[u64],
         first: bool,
         timed: Option<&Now>,
-    ) -> RaiseResult<Option<Vec<P::Buffer>>> {
+    ) -> RaiseResult<Option<Vec<Piece<P>>>> {
         self.pieces_from(device, &mut Vec::new(), lens, (first, false), timed)
     }
 
     /// [`Self::pieces`] for a copy made under the caches' lock (`locked`), each piece the shortest
     /// of `reserve`, those reserved for the copy's block ([`SurfaceCaches::reserved`]), that holds
-    /// it before a spare: a piece taken from `reserve` was counted as it was reserved. A make
-    /// under the caches' lock is counted ([`PIECE_MAKES_LOCKED`]). `None` where one is not made,
-    /// the pieces taken given back to the spares.
+    /// it before an idle kept one: a piece taken from `reserve` was counted as it was reserved. A
+    /// make under the caches' lock is counted ([`PIECE_MAKES_LOCKED`]). `None` where one is not
+    /// made, the pieces taken given back.
     fn pieces_from(
         &self,
         device: &P::Device,
-        reserve: &mut Vec<P::Buffer>,
+        reserve: &mut Vec<Piece<P>>,
         lens: &[u64],
         (first, locked): (bool, bool),
         timed: Option<&Now>,
-    ) -> RaiseResult<Option<Vec<P::Buffer>>> {
-        let mut pieces = Vec::with_capacity(lens.len());
+    ) -> RaiseResult<Option<Vec<Piece<P>>>> {
+        let mut pieces: Vec<Piece<P>> = Vec::with_capacity(lens.len());
         for &length in lens {
             let reserved = (reserve.iter().enumerate())
                 .filter(|(_, b)| b.length() >= length)
@@ -8699,15 +8792,21 @@ impl<P: Platform> Spares<P> {
                 pieces.push(reserve.swap_remove(at));
                 continue;
             }
-            let spared = self.take(length);
-            let from_spares = spared.is_some();
-            let piece = match spared {
+            let at = timed.map(|now| now());
+            let kept = self.take(length);
+            let from_kept = kept.is_some();
+            let piece = match kept {
                 Some(piece) => Some(piece),
                 None => {
-                    let at = timed.map(|now| now());
-                    let made = device.new_scratch_buffer_of_length(ON, length, STORAGE_SHARED)?;
-                    if let (Some(now), Some(at), Some(_)) = (timed, at, &made) {
-                        piece_made(first, now().saturating_duration_since(at), length);
+                    let made = match self.make(device, length, timed) {
+                        Ok(made) => made,
+                        Err(raise) => {
+                            give_back(pieces);
+                            return Err(raise);
+                        }
+                    };
+                    if let (Some(now), Some(at), Some(made)) = (timed, at, &made) {
+                        piece_made(first, now().saturating_duration_since(at), made.length());
                         if locked {
                             reims_vgpu_vulkan::answer::count_kind(PIECE_MAKES_LOCKED);
                         }
@@ -8716,213 +8815,32 @@ impl<P: Platform> Spares<P> {
                 }
             };
             let Some(piece) = piece else {
-                for piece in pieces {
-                    self.give(piece);
-                }
+                give_back(pieces);
                 return Ok(None);
             };
-            if timed.is_some() {
-                piece_taken(from_spares);
+            if let (Some(now), Some(at)) = (timed, at) {
+                piece_taken(from_kept, now().saturating_duration_since(at));
             }
             pieces.push(piece);
         }
-        self.top_up(device, timed);
         Ok(Some(pieces))
     }
 
-    /// Gives `pieces`, reserved for a copy that left them ([`Self::pieces_from`]), back to the
-    /// spares on the spares' thread, so what is let go of goes with no lock of the caches' held.
-    fn give_later(&self, pieces: Vec<P::Buffer>) {
-        if pieces.is_empty() {
-            return;
-        }
-        let kept = Arc::clone(&self.kept);
-        let cap = self.cap;
-        self.topper.submit(
-            0,
-            Box::new(move || {
-                for piece in pieces {
-                    drop(kept.keep(piece, false, cap));
-                }
-            }),
-        );
-    }
-
-    /// Hands a top-up over to the spares' thread ([`Kept::top_up`]) where no whole piece is
-    /// kept and none is handed over and not yet begun, its makes on `device`, timed by `timed`.
-    fn top_up(&self, device: &P::Device, timed: Option<&Now>) {
-        let kept = &self.kept;
-        if kept.wholes(self.piece) > 0 || kept.asked.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let kept = Arc::clone(kept);
-        let gate = Arc::clone(&self.gate);
-        let device = device.clone_ref();
-        let timed = timed.cloned();
-        let sizes = (self.cap, self.piece);
-        self.topper.submit(
-            0,
-            Box::new(move || {
-                kept.asked.store(false, Ordering::Release);
-                kept.top_up(&device, &gate, sizes, timed.as_ref());
-            }),
-        );
-    }
-
-    /// Lets the top-ups run, which a test's spares hold from their make ([`Self::new`]).
-    #[cfg(test)]
-    fn release_top_ups(&self) {
-        self.topper.release();
-    }
-
-    /// Waits until no top-up is handed over or runs (tests only).
-    #[cfg(test)]
-    fn settle(&self) {
-        self.topper.flush();
-    }
-
-    /// The lengths of the pieces kept, and how many of them a top-up made and no copy took
-    /// (tests only).
+    /// The lengths of the idle kept pieces, and how many are kept in all (tests only).
     #[cfg(test)]
     fn held(&self) -> (Vec<u64>, usize) {
-        let idle = self.kept.idle.lock();
-        let mut lengths: Vec<u64> = idle.iter().map(|s| s.buffer.length()).collect();
+        let kept = self.kept.lock();
+        let mut lengths: Vec<u64> = kept.idle.iter().map(|b| b.length()).collect();
         lengths.sort_unstable();
-        (lengths, idle.iter().filter(|s| s.unused).count())
+        (lengths, kept.all)
     }
 }
 
-impl<P: Platform> Drop for Spares<P> {
-    /// Ends the top-ups: one running stops before its next make, and the spares go once it has
-    /// returned, the pieces a top-up made and no copy took counted ([`SPARES_UNUSED`]).
-    fn drop(&mut self) {
-        self.kept.closed.store(true, Ordering::Release);
-        #[cfg(test)]
-        self.topper.release();
-        self.topper.flush();
-        let idle = std::mem::take(&mut *self.kept.idle.lock());
-        for spare in idle.iter().filter(|s| s.unused) {
-            spare_unused(spare.buffer.length());
-        }
-    }
-}
-
-impl<P: Platform> Kept<P> {
-    /// How many whole pieces, `piece` bytes or longer, are kept.
-    fn wholes(&self, piece: u64) -> usize {
-        let idle = self.idle.lock();
-        idle.iter().filter(|s| s.buffer.length() >= piece).count()
-    }
-
-    /// Keeps `buffer`, `unused` where a top-up made it, under `cap` bytes kept in all: where it
-    /// does not fit, it takes the place of the shortest kept if it is longer and then fits, else
-    /// it is let go of. The piece let go of, counted ([`spare_let_go`]), is returned for the
-    /// caller to drop outside the lock.
-    fn keep(&self, buffer: P::Buffer, unused: bool, cap: u64) -> Option<Spare<P>> {
-        let spare = Spare::<P> { buffer, unused };
-        let length = spare.buffer.length();
-        let mut idle = self.idle.lock();
-        let held: u64 = idle.iter().map(|s| s.buffer.length()).sum();
-        let gone = if held.saturating_add(length) <= cap {
-            idle.push(spare);
-            None
-        } else {
-            let shortest = (idle.iter().enumerate())
-                .map(|(at, s)| (at, s.buffer.length()))
-                .min_by_key(|&(_, short)| short);
-            match shortest {
-                Some((at, short)) if short < length && held - short + length <= cap => {
-                    Some(std::mem::replace(&mut idle[at], spare))
-                }
-                _ => Some(spare),
-            }
-        };
-        let held: u64 = idle.iter().map(|s| s.buffer.length()).sum();
-        drop(idle);
-        spares_held(held);
-        if let Some(gone) = &gone {
-            spare_let_go(gone.buffer.length(), gone.unused);
-        }
-        gone
-    }
-
-    /// A top-up, on the spares' thread: makes whole pieces of `piece` bytes on `device` until
-    /// `cap` bytes of them are kept, letting go of shorter pieces kept to fit, each make under
-    /// `gate` held shared and counted ([`SPARES_MADE`]), timed by `timed`. Stops once the spares
-    /// are gone, or where the platform makes no piece.
-    fn top_up(
-        &self,
-        device: &P::Device,
-        gate: &RwLock<()>,
-        (cap, piece): (u64, u64),
-        timed: Option<&Now>,
-    ) {
-        loop {
-            if self.closed.load(Ordering::Acquire) {
-                return;
-            }
-            let gone = {
-                let mut idle = self.idle.lock();
-                let wholes = idle.iter().filter(|s| s.buffer.length() >= piece).count();
-                if (wholes.to_u64() + 1).saturating_mul(piece) > cap {
-                    return;
-                }
-                let mut gone = Vec::new();
-                while idle.iter().map(|s| s.buffer.length()).sum::<u64>() + piece > cap {
-                    let shortest = (idle.iter().enumerate())
-                        .filter(|(_, s)| s.buffer.length() < piece)
-                        .min_by_key(|(_, s)| s.buffer.length())
-                        .map(|(at, _)| at);
-                    let Some(at) = shortest else {
-                        break;
-                    };
-                    gone.push(idle.swap_remove(at));
-                }
-                gone
-            };
-            for spare in &gone {
-                spare_let_go(spare.buffer.length(), spare.unused);
-            }
-            drop(gone);
-            let made = {
-                let _shared = gate.read();
-                if self.closed.load(Ordering::Acquire) {
-                    return;
-                }
-                let at = timed.map(|now| now());
-                let made =
-                    refusing(|| device.new_scratch_buffer_of_length(ON, piece, STORAGE_SHARED));
-                if let (Some(now), Some(at), Ok(Some(_))) = (timed, at, &made) {
-                    spare_made(now().saturating_duration_since(at), piece);
-                }
-                made
-            };
-            let buffer = match made {
-                Ok(Some(buffer)) => buffer,
-                Ok(None) => {
-                    top_up_ended("the platform made no piece");
-                    return;
-                }
-                Err(raise) => {
-                    top_up_ended(&format!("the platform raised ({raise:?})"));
-                    return;
-                }
-            };
-            drop(self.keep(buffer, true, cap));
-        }
-    }
-}
-
-/// A top-up that stopped short of the cap as its make failed, `why`: logged the first time
-/// alone (docs/conventions.md); the next copy that leaves no whole piece kept hands another over.
-fn top_up_ended(why: &str) {
-    static LOGGED: AtomicBool = AtomicBool::new(false);
-    if !LOGGED.swap(true, Ordering::Relaxed) {
-        log::warn!(
-            target: "reims_vgpu::graphics",
-            "the staged copies' spares were not topped up: {why}; a copy that finds no spare \
-             makes its piece on its own thread"
-        );
+/// Gives each of `pieces`, which no command buffer uses, back ([`Piece::give_back`]), on this
+/// thread.
+fn give_back<P: Platform>(pieces: Vec<Piece<P>>) {
+    for piece in pieces {
+        drop(piece.give_back());
     }
 }
 
@@ -8963,9 +8881,17 @@ const UNWRITTEN_KIB: &str = "rt-downloads-cache-view-unwritten-kib";
 /// The staged downloads that moved nothing: no copy of the host's wrote the cache since.
 const UNWRITTEN_NONE: &str = "rt-downloads-cache-view-unwritten";
 
-/// The staged copies' pieces taken ([`Spares::pieces`]), and of them those a spare served.
+/// The staged copies' pieces taken ([`Spares::pieces`]), and of them those a kept piece served.
 const PIECES_TAKEN: &str = "rt-staging-pieces";
 const PIECES_SPARED: &str = "rt-staging-pieces-spared";
+
+/// The nanoseconds the staged copies took to get their pieces ([`PIECES_TAKEN`]), each a kept
+/// piece's take or a make ([`Spares::pieces`], [`SurfaceCaches::reserve_spares`]), and the
+/// longest of them.
+const PIECE_GETS: (&str, &str) = ("rt-staging-piece-get-ns", "rt-staging-piece-get-max-ns");
+
+/// The longest get of [`PIECE_GETS`] so far, which its code's count rises to.
+static PIECE_GET_MAX_NS: AtomicU64 = AtomicU64::new(0);
 
 /// The shapes' images made on the decoding thread ([`Caches::shape`]), where the caches' copies
 /// are staged: through the platform's maker, an image placed in a block taken at its make or the
@@ -9117,8 +9043,8 @@ const PIECE_MAKES_KIB: [&str; 2] = [
 /// The longest make of [`PIECE_MAKES`] so far, of each, which its code's count rises to.
 static PIECE_MAKE_MAX_NS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
-/// The whole pieces the spares' top-ups made ([`Kept::top_up`]): how many, the nanoseconds their
-/// makes took, under the reset gate, and the longest of them; and their KiB
+/// The kept pieces the first copies that found none idle made, whole ([`Spares::make`]): how
+/// many, the nanoseconds their makes took, and the longest of them; and their KiB
 /// ([`SPARES_MADE_KIB`]).
 const SPARES_MADE: (&str, &str, &str) = (
     "rt-staging-spares-made",
@@ -9130,22 +9056,21 @@ const SPARES_MADE_KIB: &str = "rt-staging-spares-made-kib";
 /// The longest make of [`SPARES_MADE`] so far, which its code's count rises to.
 static SPARES_MADE_MAX_NS: AtomicU64 = AtomicU64::new(0);
 
-/// The pieces the spares let go of ([`Kept::keep`], [`Kept::top_up`]): one given past the cap,
-/// or the shorter one a longer took the place of, or one a top-up let go of to fit a whole
-/// piece; how many, and their KiB.
+/// The scratch pieces let go of ([`Piece`]), each made by a copy that found no kept piece idle,
+/// once its copy was done: how many, and their KiB.
 const SPARES_LET_GO: (&str, &str) = ("rt-staging-spares-let-go", "rt-staging-spares-let-go-kib");
 
-/// Of the pieces let go of, those a top-up made and no copy took, with those the spares held
-/// as they went ([`Spares`]'s drop): how many, and their KiB.
-const SPARES_UNUSED: (&str, &str) = ("rt-staging-spares-unused", "rt-staging-spares-unused-kib");
+/// The kept pieces let go of as dropped without being given back ([`Piece`]), each leaving the
+/// kept pieces: how many, and their KiB.
+const SPARES_DROPPED: (&str, &str) = ("rt-staging-spares-dropped", "rt-staging-spares-dropped-kib");
 
-/// The most KiB the spares held at once ([`SPARES_HELD_MOST`]), which its count rises to.
+/// The most KiB of idle kept pieces at once ([`SPARES_HELD_MOST`]), which its count rises to.
 const SPARES_HELD_KIB: &str = "rt-staging-spares-held-most-kib";
 
-/// The most bytes the spares held at once, of every device's.
+/// The most bytes of idle kept pieces at once, of every device's.
 static SPARES_HELD_MOST: AtomicU64 = AtomicU64::new(0);
 
-/// One whole piece of `length` bytes a top-up made, in `took` ([`SPARES_MADE`]).
+/// One kept piece of `length` bytes made, in `took` ([`SPARES_MADE`]).
 fn spare_made(took: std::time::Duration, length: u64) {
     let (made, ns, longest) = SPARES_MADE;
     let took = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
@@ -9156,24 +9081,19 @@ fn spare_made(took: std::time::Duration, length: u64) {
     reims_vgpu_vulkan::answer::count_kind_by(longest, took.saturating_sub(was));
 }
 
-/// One piece of `length` bytes the spares let go of, `unused` where a top-up made it and no copy
-/// took it ([`SPARES_LET_GO`]).
-fn spare_let_go(length: u64, unused: bool) {
+/// One scratch piece of `length` bytes let go of ([`SPARES_LET_GO`]).
+fn spare_let_go(length: u64) {
     reims_vgpu_vulkan::answer::count_kind(SPARES_LET_GO.0);
     reims_vgpu_vulkan::answer::count_kind_by(SPARES_LET_GO.1, length.div_ceil(1024));
-    if unused {
-        spare_unused(length);
-    }
 }
 
-/// One piece of `length` bytes a top-up made that went with no copy taking it
-/// ([`SPARES_UNUSED`]).
-fn spare_unused(length: u64) {
-    reims_vgpu_vulkan::answer::count_kind(SPARES_UNUSED.0);
-    reims_vgpu_vulkan::answer::count_kind_by(SPARES_UNUSED.1, length.div_ceil(1024));
+/// One kept piece of `length` bytes dropped without being given back ([`SPARES_DROPPED`]).
+fn spare_dropped(length: u64) {
+    reims_vgpu_vulkan::answer::count_kind(SPARES_DROPPED.0);
+    reims_vgpu_vulkan::answer::count_kind_by(SPARES_DROPPED.1, length.div_ceil(1024));
 }
 
-/// The spares hold `held` bytes now ([`SPARES_HELD_KIB`]).
+/// The idle kept pieces hold `held` bytes now ([`SPARES_HELD_KIB`]).
 fn spares_held(held: u64) {
     let was = SPARES_HELD_MOST.fetch_max(held, Ordering::Relaxed);
     if held > was {
@@ -9183,16 +9103,22 @@ fn spares_held(held: u64) {
 }
 
 /// Of the pieces made for staged copies ([`PIECE_MAKES`]), those made with the caches' lock held:
-/// a copy found neither a piece reserved for its block nor a spare (the module doc, "Staged
-/// copies").
+/// a copy found neither a piece reserved for its block nor an idle kept one (the module doc,
+/// "Staged copies").
 const PIECE_MAKES_LOCKED: &str = "rt-staging-piece-makes-locked";
 
-/// One piece taken for a staged copy, from the spares where `spared` ([`PIECES_TAKEN`]).
-fn piece_taken(spared: bool) {
+/// One piece taken for a staged copy, a kept one where `spared` ([`PIECES_TAKEN`]), its take or
+/// make in `took` ([`PIECE_GETS`]).
+fn piece_taken(spared: bool, took: std::time::Duration) {
     reims_vgpu_vulkan::answer::count_kind(PIECES_TAKEN);
     if spared {
         reims_vgpu_vulkan::answer::count_kind(PIECES_SPARED);
     }
+    let (ns, longest) = PIECE_GETS;
+    let took = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
+    reims_vgpu_vulkan::answer::count_kind_by(ns, took);
+    let was = PIECE_GET_MAX_NS.fetch_max(took, Ordering::Relaxed);
+    reims_vgpu_vulkan::answer::count_kind_by(longest, took.saturating_sub(was));
 }
 
 /// One piece of `length` bytes made for a staged copy, a cache's `first`, in `took`
@@ -9244,7 +9170,7 @@ fn copy<P: Platform>(
     cache: &mut SurfaceCache<P>,
     (way, block): (Way, u64),
     counts: &mut CacheCounts,
-    (timed, spares, reserve): (Option<&Now>, &Arc<Spares<P>>, &mut Vec<P::Buffer>),
+    (timed, spares, reserve): (Option<&Now>, &Arc<Spares<P>>, &mut Vec<Piece<P>>),
 ) -> RaiseResult<Option<Staging<P>>> {
     if way == Way::In && cache.pages.is_some() {
         cache.changed = Changed::All;
@@ -9307,8 +9233,8 @@ fn copy<P: Platform>(
         moved |= nothing;
         // The bytes the copy moves, laid back to back in pieces of at most rt's unit ([`pack`]):
         // a fill's, all of the surface's; a copy out's the record narrows, the record's alone,
-        // else all of them. Each piece is the shortest spare that holds it, else one of the
-        // copy's own, unzeroed: what its CPU copy reads of it, its GPU copy writes first, and the
+        // else all of them. Each piece is one reserved for the block or an idle kept one, else
+        // one made, unzeroed: what its CPU copy reads of it, its GPU copy writes first, and the
         // other way round.
         let first = !cache.staged;
         let packed = match (&cache.pages, way, &cache.carried) {
@@ -9345,7 +9271,7 @@ fn copy<P: Platform>(
             // takes the texels of those bytes.
             for place in &packed.places {
                 let parts = cache.moves([(place.bytes.clone(), place.at)]);
-                between::<P>(&blit, (&cache.device, &pieces[place.piece]), &parts, way)?;
+                between::<P>(&blit, (&cache.device, &*pieces[place.piece]), &parts, way)?;
             }
             let into = out.map(|(cpu, _)| (Arc::clone(copied), placed(&cpu, &packed.places)));
             moved = true;
@@ -9368,7 +9294,6 @@ fn copy<P: Platform>(
                 pieces,
                 into,
                 timed,
-                spares: Arc::clone(spares),
             });
         }
         // Pieces as a staged copy's, unzeroed: the CPU copy writes each of their bytes, the
@@ -9398,7 +9323,7 @@ fn copy<P: Platform>(
                 let parts = cache.moves([(place.bytes.clone(), place.at)]);
                 between::<P>(
                     &blit,
-                    (&cache.device, &pieces[place.piece]),
+                    (&cache.device, &*pieces[place.piece]),
                     &parts,
                     Way::In,
                 )?;
@@ -9413,7 +9338,6 @@ fn copy<P: Platform>(
                 pieces,
                 into: None,
                 timed: None,
-                spares: Arc::clone(spares),
             });
         }
     }
@@ -14960,7 +14884,7 @@ pub(super) mod tests {
     /// [`BLOCK`] is two pages of a surface, marked cached; the block's length.
     fn staged_cached() -> (Rig, u64) {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.set_staged_surface_copies();
         queues(&mut r);
         let length = 2 * r.page;
         assert_eq!(
@@ -15004,9 +14928,6 @@ pub(super) mod tests {
             assert!(
                 (calls.iter())
                     .filter(|c| c.sel == SCRATCH_BUFFER)
-                    .filter(
-                        |c| !(c.thread.as_deref()).is_some_and(|t| t.starts_with(SPARES_THREADS))
-                    )
                     .all(|c| c.thread == here),
                 "finished {finished}: its pieces, made by the thread that let go of the writer"
             );
@@ -15040,7 +14961,7 @@ pub(super) mod tests {
             2,
             "its write copied out, then its fill"
         );
-        let (_, made) = scratch_made(&calls);
+        let made = scratch_made(&calls);
         let lens = pack(std::iter::once(0..length), PIECE).lens;
         assert!(
             made.len() <= 2 * lens.len(),
@@ -15611,8 +15532,8 @@ pub(super) mod tests {
             .collect();
         assert_eq!(
             made,
-            [Some(page.next_multiple_of(PIECE_GRANULE))],
-            "unzeroed, the carried page's length rounded up to rt's granule"
+            [Some(PIECE)],
+            "unzeroed, a whole piece: the first made is kept"
         );
         // The fake made each byte of it its marker, not zero: the CPU's copy wrote them all.
         let staged = buffer_bytes(&r, staging, None);
@@ -15997,11 +15918,11 @@ pub(super) mod tests {
             before,
             "the pages wait for it"
         );
-        // As the GPU's copy would, the staging piece takes the cache's bytes: the surface's
-        // length, rounded up to rt's granule.
+        // As the GPU's copy would, the staging piece takes the cache's bytes: a whole piece, as
+        // the first made is kept.
         assert_eq!(
             buffer_bytes(&r, out[0].1, Some(0xc3)).len(),
-            length.next_multiple_of(PIECE_GRANULE).to_usize()
+            PIECE.to_usize()
         );
         complete_staged(&r);
         assert!(
@@ -16081,11 +16002,11 @@ pub(super) mod tests {
         let out = copies(&r.p.call_log().since(mark));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, cache, "out of the cache");
-        // As the GPU's copy would, the staging piece takes the cache's bytes, all of them: the
-        // surface's length, rounded up to rt's granule.
+        // As the GPU's copy would, the staging piece takes the cache's bytes, all of them: a
+        // whole piece, as the first made is kept.
         assert_eq!(
             buffer_bytes(&r, out[0].1, Some(0xc3)).len(),
-            length.next_multiple_of(PIECE_GRANULE).to_usize()
+            PIECE.to_usize()
         );
         complete_staged(&r);
         assert!(done.load(Ordering::SeqCst));
@@ -16116,7 +16037,7 @@ pub(super) mod tests {
     #[test]
     fn a_staged_caches_copies_make_no_import() {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.set_staged_surface_copies();
         queues(&mut r);
         let page = r.page;
         let length = 2 * page;
@@ -16193,7 +16114,7 @@ pub(super) mod tests {
     #[test]
     fn a_staged_deferred_blocks_pages_are_taken_copied_with_no_import() {
         let mut r = deferring(8);
-        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.set_staged_surface_copies();
         let page = r.page;
         let length = 2 * page;
         assert_eq!(defer(&mut r, BLOCK, length), RGFX_STATUS_OK);
@@ -16249,7 +16170,7 @@ pub(super) mod tests {
     #[test]
     fn a_staged_copy_in_flight_never_shares_its_buffer() {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.set_staged_surface_copies();
         queues(&mut r);
         let page = r.page;
         let length = 2 * page;
@@ -16308,7 +16229,7 @@ pub(super) mod tests {
     #[test]
     fn a_staged_downloads_copy_into_its_pages_holds_up_no_other_completion() {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.set_staged_surface_copies();
         queues(&mut r);
         let page = r.page;
         let length = 2 * page;
@@ -16370,7 +16291,7 @@ pub(super) mod tests {
     fn a_staged_download_moves_only_what_its_gpu_copy_wrote() {
         use super::super::surface_pages::tests::one_plane;
         let mut r = rig(16);
-        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.set_staged_surface_copies();
         r.p.world().lay_linear_rows(Some(256));
         queues(&mut r);
         let page = r.page;
@@ -16429,86 +16350,142 @@ pub(super) mod tests {
         }
     }
 
-    /// The staged copies' spares give a take the shortest piece kept that holds it, to their
-    /// cap: a piece given past it is let go of, and a take longer than every piece kept finds
-    /// none
+    /// The staged copies' first two pieces made are whole and kept, whatever the length the copy
+    /// needs, each made on the copy's own thread: a copy takes an idle one for each piece it
+    /// needs, and gives it back to the idle ones; once both are kept, a copy that finds none idle
+    /// makes a scratch piece of its own length, let go of as it is given back, counted. Nothing is
+    /// made but by a copy, and a kept piece is never let go of as it comes back
     #[test]
-    fn the_staged_copies_spares_give_the_shortest_that_holds_a_take() {
+    fn the_staged_copies_first_two_pieces_made_are_kept_whole_and_circulate() {
         let r = rig(8);
         let page = r.page;
-        let made = |length| {
-            (r.device.new_buffer_of_length(ON, length, 0))
-                .unwrap()
-                .unwrap()
-        };
-        let spares = Spares::<FakePlatform>::new(5 * page, 4 * page, Arc::default());
-        let (long, short) = (made(3 * page), made(2 * page));
-        let (long_id, short_id) = (id_of(&long), id_of(&short));
-        spares.give(long);
-        spares.give(short);
-        spares.give(made(page));
-        assert!(spares.take(4 * page).is_none(), "none holds four pages");
-        let taken = spares.take(page).expect("the shortest that holds a page");
-        assert_eq!(id_of(&taken), short_id);
-        let next = spares.take(page).expect("the longer, the shorter taken");
-        assert_eq!(id_of(&next), long_id);
-        assert!(
-            spares.take(page).is_none(),
-            "the one given past the cap was let go of"
-        );
-        spares.give(taken);
-        assert!(spares.take(2 * page).is_some(), "given back, kept again");
-    }
-
-    /// A piece given back past the spares' cap takes the place of the shortest kept where it is
-    /// longer and then fits, that one let go of; else it is let go of itself; each counted
-    #[test]
-    fn a_piece_given_past_the_spares_cap_takes_a_shorter_ones_place() {
-        let r = rig(8);
-        let page = r.page;
-        let made = |length| {
-            (r.device.new_buffer_of_length(ON, length, 0))
-                .unwrap()
-                .unwrap()
-        };
-        let spares = Spares::<FakePlatform>::new(4 * page, 4 * page, Arc::default());
-        let codes = [SPARES_LET_GO.0, SPARES_LET_GO.1, SPARES_UNUSED.0];
+        let piece = 2 * page;
+        let spares = Spares::<FakePlatform>::new(2 * piece, piece);
+        let tick = Arc::new(AtomicU64::new(0));
+        let now: Now =
+            Arc::new(move || MonoTime::from_nanos(tick.fetch_add(1000, Ordering::SeqCst)));
+        let codes = [
+            SPARES_MADE.0,
+            SPARES_MADE_KIB,
+            SPARES_LET_GO.0,
+            SPARES_LET_GO.1,
+            SPARES_DROPPED.0,
+            PIECES_TAKEN,
+            PIECES_SPARED,
+        ];
         let before = codes.map(counted);
-        spares.give(made(2 * page));
-        spares.give(made(page));
-        spares.give(made(2 * page));
-        assert_eq!(
-            spares.held(),
-            (vec![2 * page, 2 * page], 0),
-            "the longer took the shorter's place"
+        let here = std::thread::current().name().map(str::to_owned);
+
+        // The first copy needs a page: a whole piece, made on its thread and kept.
+        let mark = r.p.call_log().mark();
+        let first = (spares.pieces(&r.device, &[page], true, Some(&now)))
+            .unwrap()
+            .expect("a piece");
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(scratch_made(&calls), [piece], "whole");
+        assert!(
+            (calls.iter())
+                .filter(|c| c.sel == SCRATCH_BUFFER)
+                .all(|c| c.thread == here),
+            "on the copy's thread"
         );
-        spares.give(made(page));
+        assert_eq!(spares.held(), (vec![], 1), "one kept, held by the copy");
+
+        // A second, while the first is in flight: the second kept piece, then a scratch one.
+        let mark = r.p.call_log().mark();
+        let second = (spares.pieces(&r.device, &[page, page], false, Some(&now)))
+            .unwrap()
+            .expect("two pieces");
         assert_eq!(
-            spares.held(),
-            (vec![2 * page, 2 * page], 0),
-            "one no longer than any kept is let go of"
+            scratch_made(&r.p.call_log().since(mark)),
+            [piece, page],
+            "the second kept piece whole, then one of the copy's own length"
         );
-        let kib = page.div_ceil(1024);
+        assert_eq!(spares.held(), (vec![], 2));
+
+        // Given back: the kept pieces go idle, the scratch one is let go of.
+        give_back(first);
+        give_back(second);
+        assert_eq!(spares.held(), (vec![piece, piece], 2), "both kept, idle");
+
+        // A third copy takes both and makes only what it lacks, of its own length.
+        let mark = r.p.call_log().mark();
+        let mut third = (spares.pieces(&r.device, &[piece, page, page], false, Some(&now)))
+            .unwrap()
+            .expect("three pieces");
+        assert_eq!(
+            scratch_made(&r.p.call_log().since(mark)),
+            [page],
+            "the two kept taken; one made"
+        );
+        assert_eq!(spares.held(), (vec![], 2));
+
+        // A kept piece dropped, not given back, leaves the kept pieces: the next copy that finds
+        // none idle makes a whole one in its place.
+        drop(third.swap_remove(0));
+        assert_eq!(spares.held(), (vec![], 1), "one kept left");
+        let mark = r.p.call_log().mark();
+        let fourth = (spares.pieces(&r.device, &[page], false, Some(&now)))
+            .unwrap()
+            .expect("a piece");
+        assert_eq!(
+            scratch_made(&r.p.call_log().since(mark)),
+            [piece],
+            "a whole one made, kept in its place"
+        );
+        give_back(third);
+        give_back(fourth);
+        assert_eq!(spares.held(), (vec![piece, piece], 2));
+
         let after = codes.map(counted);
+        let kib = |bytes: u64| bytes.div_ceil(1024);
         assert_eq!(
-            [0, 1, 2].map(|i| after[i] - before[i]),
-            [2, 2 * kib, 0],
-            "two pieces of a page let go of, none a top-up's"
+            [0, 1, 2, 3, 4, 5, 6].map(|i| after[i] - before[i]),
+            [3, 3 * kib(piece), 2, 2 * kib(page), 1, 7, 2],
+            "three kept made, two scratch let go of, one kept dropped; seven pieces taken, two \
+             of them idle kept ones"
         );
     }
 
-    /// The lengths of the scratch buffers `calls` made: those the spares' top-ups made
-    /// ([`SPARES_THREADS`]), then the rest.
-    fn scratch_made(calls: &[Call]) -> (Vec<u64>, Vec<u64>) {
-        let (mut topped, mut rest) = (Vec::new(), Vec::new());
-        for call in calls.iter().filter(|c| c.sel == SCRATCH_BUFFER) {
-            let length = call.args[0].as_u64().expect("a length");
-            match (call.thread.as_deref()).is_some_and(|t| t.starts_with(SPARES_THREADS)) {
-                true => topped.push(length),
-                false => rest.push(length),
-            }
+    /// A staged copy's pieces given back under the caches' lock (those reserved for a block whose
+    /// cache goes, or those its copies left) put the kept ones back at once, and let go of the
+    /// scratch ones only once the lock is let go of
+    #[test]
+    fn scratch_pieces_given_back_under_the_caches_lock_are_let_go_of_after_it() {
+        let r = rig(8);
+        r.dec.set_staged_surface_copies();
+        let page = r.page;
+        let piece = 2 * page;
+        r.dec.surface_caches.set_staging_piece(piece);
+        let spares = Arc::clone(&r.dec.caches().spares);
+        let pieces = (spares.pieces(&r.device, &[page, page, page], false, None))
+            .unwrap()
+            .expect("three pieces");
+        let let_go = counted(SPARES_LET_GO.0);
+        {
+            let mut state = r.dec.surface_caches.lock();
+            state.give_back(pieces);
+            assert_eq!(
+                spares.held(),
+                (vec![piece, piece], 2),
+                "the kept ones, back"
+            );
+            assert_eq!(
+                state.let_go.len(),
+                1,
+                "the scratch one, held to the lock's end"
+            );
         }
-        (topped, rest)
+        assert!(r.dec.caches().let_go.is_empty(), "let go of with the lock");
+        assert_eq!(counted(SPARES_LET_GO.0), let_go + 1);
+    }
+
+    /// The lengths of the scratch buffers `calls` made.
+    fn scratch_made(calls: &[Call]) -> Vec<u64> {
+        (calls.iter())
+            .filter(|c| c.sel == SCRATCH_BUFFER)
+            .map(|c| c.args[0].as_u64().expect("a length"))
+            .collect()
     }
 
     /// Where the caches' copies are staged, a use whose fill lacks pieces the spares do not hold
@@ -16518,7 +16495,7 @@ pub(super) mod tests {
     #[test]
     fn a_staged_fills_pieces_are_made_with_the_caches_lock_let_go_of() {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.set_staged_surface_copies();
         queues(&mut r);
         let page = r.page;
         let length = 2 * page;
@@ -16535,11 +16512,10 @@ pub(super) mod tests {
             .filter(|c| c.sel == SCRATCH_BUFFER)
             .map(|c| c.args[0].as_u64())
             .collect();
-        let lens = pack(std::iter::once(0..length), PIECE).lens;
         assert_eq!(
             made,
-            lens.into_iter().map(Some).collect::<Vec<_>>(),
-            "its piece made"
+            [Some(PIECE)],
+            "its piece made, whole: the first made is kept"
         );
         let filled = copies(&calls);
         assert_eq!(filled.len(), 1);
@@ -16561,7 +16537,7 @@ pub(super) mod tests {
     #[test]
     fn a_staged_presents_fill_makes_its_pieces_with_the_caches_lock_let_go_of() {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.set_staged_surface_copies();
         queues(&mut r);
         let page = r.page;
         let length = 2 * page;
@@ -16581,11 +16557,10 @@ pub(super) mod tests {
             .filter(|c| c.sel == SCRATCH_BUFFER)
             .map(|c| c.args[0].as_u64())
             .collect();
-        let lens = pack(std::iter::once(0..length), PIECE).lens;
         assert_eq!(
             made,
-            lens.into_iter().map(Some).collect::<Vec<_>>(),
-            "its piece made"
+            [Some(PIECE)],
+            "its piece made, whole: the first made is kept"
         );
         let filled = copies(&calls);
         assert_eq!(filled.len(), 1);
@@ -16610,7 +16585,7 @@ pub(super) mod tests {
     #[test]
     fn a_staged_downloads_pieces_are_made_with_the_caches_lock_let_go_of() {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.set_staged_surface_copies();
         queues(&mut r);
         let page = r.page;
         let length = 2 * page;
@@ -16630,11 +16605,10 @@ pub(super) mod tests {
             .map(|c| (c.args[0].as_u64().expect("a length"), c.thread.clone()))
             .collect();
         let here = std::thread::current().name().map(str::to_owned);
-        let lens = pack(std::iter::once(0..length), PIECE).lens;
         assert_eq!(
             made,
-            lens.iter().map(|&l| (l, here.clone())).collect::<Vec<_>>(),
-            "its piece, made by the thread that asked it"
+            [(PIECE, here)],
+            "its piece, made whole by the thread that asked it: the second made is kept"
         );
         assert!(
             eventually(|| {
@@ -16669,7 +16643,7 @@ pub(super) mod tests {
     #[test]
     fn a_staged_releases_pieces_are_made_off_its_ring_and_the_caches_lock() {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.set_staged_surface_copies();
         queues(&mut r);
         let page = r.page;
         let length = 2 * page;
@@ -16701,13 +16675,10 @@ pub(super) mod tests {
             .filter(|c| c.sel == SCRATCH_BUFFER)
             .map(|c| (c.args[0].as_u64().expect("a length"), c.thread.clone()))
             .collect();
-        let lens = pack(std::iter::once(0..length), PIECE).lens;
         assert_eq!(
             made,
-            (lens.iter())
-                .map(|&l| (l, Some(RELEASE_PACE_THREAD.to_owned())))
-                .collect::<Vec<_>>(),
-            "its piece, made on the pace's thread"
+            [(PIECE, Some(RELEASE_PACE_THREAD.to_owned()))],
+            "its piece, made whole on the pace's thread: the second made is kept"
         );
         let out = copies(&calls);
         buffer_bytes(&r, out[0].1, Some(0xc3));
@@ -16724,98 +16695,6 @@ pub(super) mod tests {
             counted(PIECE_MAKES_LOCKED),
             locked,
             "none made under the lock"
-        );
-    }
-
-    /// A copy whose takes leave no whole piece among the staged copies' spares hands a top-up to
-    /// the spares' own thread ([`SPARES_THREADS`]), which the copy does not wait for: the copy
-    /// makes the piece it found no spare for on its own thread, and the top-up makes whole
-    /// pieces until the spares hold their cap, letting go of a shorter one kept to fit, none
-    /// while the device's reset gate is held alone. A copy that takes both whole pieces hands
-    /// another over; the pieces given back past the cap are let go of, and those a top-up made
-    /// and no copy took are counted unused as the spares go
-    #[test]
-    fn the_staged_copies_spares_are_topped_up_to_their_cap_on_a_thread_of_their_own() {
-        let r = rig(8);
-        let page = r.page;
-        let piece = 2 * page;
-        let gate: Arc<RwLock<()>> = Arc::default();
-        let spares = Spares::<FakePlatform>::new(2 * piece, piece, Arc::clone(&gate));
-        let tick = Arc::new(AtomicU64::new(0));
-        let now: Now =
-            Arc::new(move || MonoTime::from_nanos(tick.fetch_add(1000, Ordering::SeqCst)));
-        let codes = [
-            PIECE_MAKES[0].0,
-            SPARES_MADE.0,
-            SPARES_MADE_KIB,
-            SPARES_LET_GO.0,
-            SPARES_UNUSED.0,
-        ];
-        let before = codes.map(counted);
-
-        // No spare: the copy makes its piece on its own thread; the top-up waits its turn.
-        let mark = r.p.call_log().mark();
-        let mut pieces = (spares.pieces(&r.device, &[page], true, Some(&now)))
-            .unwrap()
-            .expect("a piece");
-        assert_eq!(
-            scratch_made(&r.p.call_log().since(mark)),
-            (vec![], vec![page]),
-            "made on the copy's thread"
-        );
-        assert_eq!(spares.held(), (vec![], 0), "nothing kept yet");
-
-        // The top-up makes nothing while the reset gate is held alone.
-        let mark = r.p.call_log().mark();
-        let alone = gate.write();
-        spares.release_top_ups();
-        spares.give(pieces.pop().expect("the copy's piece"));
-        assert_eq!(
-            scratch_made(&r.p.call_log().since(mark)),
-            (vec![], vec![]),
-            "none made under the reset"
-        );
-        drop(alone);
-        spares.settle();
-        assert_eq!(
-            scratch_made(&r.p.call_log().since(mark)),
-            (vec![piece, piece], vec![]),
-            "two whole pieces, on the spares' thread"
-        );
-        assert_eq!(
-            spares.held(),
-            (vec![piece, piece], 2),
-            "the cap's worth, the copy's shorter piece let go of to fit"
-        );
-
-        // A copy that takes both hands another top-up over, and makes nothing itself.
-        let mark = r.p.call_log().mark();
-        let taken = (spares.pieces(&r.device, &[piece, piece], false, Some(&now)))
-            .unwrap()
-            .expect("two pieces");
-        spares.settle();
-        assert_eq!(
-            scratch_made(&r.p.call_log().since(mark)),
-            (vec![piece, piece], vec![]),
-            "the spares topped up again, the copy's pieces both spares"
-        );
-        assert_eq!(spares.held(), (vec![piece, piece], 2));
-        for buffer in taken {
-            spares.give(buffer);
-        }
-        assert_eq!(
-            spares.held(),
-            (vec![piece, piece], 2),
-            "given back past the cap"
-        );
-        drop(spares);
-
-        let after = codes.map(counted);
-        assert_eq!(
-            [0, 1, 2, 3, 4].map(|i| after[i] - before[i]),
-            [1, 4, 4 * piece.div_ceil(1024), 3, 2],
-            "one made by a copy, four by top-ups; three let go of, and two a top-up made went \
-             unused"
         );
     }
 
@@ -16932,7 +16811,7 @@ pub(super) mod tests {
     #[test]
     fn a_staged_copy_longer_than_a_piece_lays_its_bytes_in_pieces() {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.set_staged_surface_copies();
         let page = r.page;
         let piece = 2 * page;
         r.dec.surface_caches.set_staging_piece(piece);
@@ -17034,7 +16913,7 @@ pub(super) mod tests {
     #[test]
     fn a_reservation_holds_the_spares_it_counts_while_it_makes_the_rest() {
         let mut r = rig(8);
-        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.set_staged_surface_copies();
         let page = r.page;
         let piece = 2 * page;
         r.dec.surface_caches.set_staging_piece(piece);
@@ -17046,10 +16925,10 @@ pub(super) mod tests {
         );
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
         r.p.world().complete_all(CompleteOn::Caller);
-        // The spares keep two of the fill's three pieces; the download's copy takes three.
+        // The fill's first two pieces are the kept ones; the download's copy takes three.
         assert_eq!(
             r.dec.caches().spares.held(),
-            (vec![piece, piece], 0),
+            (vec![piece, piece], 2),
             "the fill's pieces kept"
         );
         let locked = counted(PIECE_MAKES_LOCKED);
@@ -17059,8 +16938,8 @@ pub(super) mod tests {
         let last = page.next_multiple_of(PIECE_GRANULE).min(piece);
         assert_eq!(
             scratch_made(&calls),
-            (vec![], vec![last]),
-            "the one piece the spares lack"
+            vec![last],
+            "the one piece the kept ones lack"
         );
         assert_eq!(copies_at(&calls).len(), 3, "the download's copy, at once");
         assert_eq!(
@@ -17081,7 +16960,7 @@ pub(super) mod tests {
     fn a_staged_download_whose_rows_cross_its_pieces_ends_lands_each_in_its_place() {
         use super::super::surface_pages::tests::one_plane;
         let mut r = rig(16);
-        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.set_staged_surface_copies();
         r.dec.surface_caches.set_staging_piece(1024);
         r.p.world().lay_linear_rows(Some(256));
         queues(&mut r);
