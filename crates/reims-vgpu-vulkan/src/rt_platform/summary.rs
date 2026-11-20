@@ -16,8 +16,11 @@
 //!   over a buffer and its image of its own, by the cause rt gives each, those of none left out;
 //! - `counted`, more of what rt counted, by their fields' names: new textures' images zeroed,
 //!   their bytes and the barriers that moved them home after it; the acquires of another API's
-//!   writes; the barriers rt recorded; and the releases of a texture or block an unsent upload
-//!   held, their bytes, and the sends of uploads they started;
+//!   writes; the barriers rt recorded; the releases of a texture or block an unsent upload held,
+//!   their bytes, and the sends of uploads they started; the sends of groups a queue held behind
+//!   its submissions in flight, and the GPU's nanoseconds from the end of the work submitted
+//!   before each to its own start; and a pipeline's makes split in two, the nanoseconds of the
+//!   driver's `vkCreate*Pipelines` calls and of rt's calls into the translator;
 //! - `gauges`, some of rt's gauges as they are now, by their fields' names: the live textures,
 //!   those held in an image of their own beside their buffer, the bytes of textures' places in
 //!   texture blocks, of textures' allocations of their own and of the spills; then the bytes of
@@ -104,6 +107,10 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges)
         held_releases,
         held_release_bytes,
         held_release_starts,
+        held_starts,
+        held_start_gap_nanos,
+        pipeline_creation_nanos,
+        translation_nanos,
     );
     let gauged = gauges_by_name!(
         textures,
@@ -210,6 +217,14 @@ mod tests {
         now.held_releases = 3;
         now.held_release_bytes = 16_777_216 + 65_536;
         now.held_release_starts = 1;
+        before.held_starts = 4;
+        before.held_start_gap_nanos = 1_000_000;
+        now.held_starts = 4 + 6;
+        now.held_start_gap_nanos = 1_000_000 + 250_000;
+        before.pipeline_creation_nanos = 2_000_000;
+        before.translation_nanos = 500_000;
+        now.pipeline_creation_nanos = 2_000_000 + 7_250_000;
+        now.translation_nanos = 500_000 + 3_125_000;
         let mut gauges = rt::Gauges::default();
         gauges.textures = 12;
         gauges.textures_copied_over = 2;
@@ -232,11 +247,13 @@ mod tests {
              attachment reads 512, over-copies 4096 (dma-buf 4000, pitch 96); counted \
              texture_clears 2, texture_clear_bytes 524288, texture_clear_barriers 1, \
              external_acquires 2, barriers 9, held_releases 3, held_release_bytes 16842752, \
-             held_release_starts 1; gauges textures 12, textures_copied_over 2, \
-             texture_block_bytes 20971520, texture_own_bytes 33554432, spilled_bytes 0, \
-             texture_block_held_bytes 50331648, texture_block_sparse_bytes 16777216, \
-             texture_block_sparse_blocks 1, private_take_held_bytes 33554432, private_take_bytes \
-             18874368, private_take_sparse_bytes 16777216, private_take_sparse_allocations 1"
+             held_release_starts 1, held_starts 6, held_start_gap_nanos 250000, \
+             pipeline_creation_nanos 7250000, translation_nanos 3125000; gauges textures 12, \
+             textures_copied_over 2, texture_block_bytes 20971520, texture_own_bytes 33554432, \
+             spilled_bytes 0, texture_block_held_bytes 50331648, texture_block_sparse_bytes \
+             16777216, texture_block_sparse_blocks 1, private_take_held_bytes 33554432, \
+             private_take_bytes 18874368, private_take_sparse_bytes 16777216, \
+             private_take_sparse_allocations 1"
         );
         let mut fresh = rt::Metrics::default();
         fresh.pipelines_created = 2;
@@ -249,7 +266,8 @@ mod tests {
             part.ends_with(
                 "over-copies 0; counted texture_clears 0, texture_clear_bytes 0, \
                  texture_clear_barriers 0, external_acquires 0, barriers 0, held_releases 0, \
-                 held_release_bytes 0, held_release_starts 0; gauges textures 0, \
+                 held_release_bytes 0, held_release_starts 0, held_starts 0, held_start_gap_nanos \
+                 0, pipeline_creation_nanos 0, translation_nanos 0; gauges textures 0, \
                  textures_copied_over 0, texture_block_bytes 0, texture_own_bytes 0, spilled_bytes \
                  0, texture_block_held_bytes 0, texture_block_sparse_bytes 0, \
                  texture_block_sparse_blocks 0, private_take_held_bytes 0, private_take_bytes 0, \
