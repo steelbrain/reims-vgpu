@@ -625,6 +625,7 @@ fn each_frame_filled_by_the_gpu_encodes_as_uploaded() {
 /// [`each_frame_filled_by_the_gpu_encodes_as_uploaded`] on the rt platform: its input is a
 /// buffer of rt's exported block, which each frame's blit releases to CUDA after its copies
 /// (`fill`'s module doc).
+/// The rt device must be of a GPU the arm runs on (`video_choice::tested_gpu::check_rt`).
 #[cfg(feature = "rt")]
 #[test]
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
@@ -634,6 +635,7 @@ fn each_frame_filled_by_the_gpu_encodes_as_uploaded_on_rt() {
     let platform = crate::rt_test_end::platform();
     crate::entry::run(|_| {
         let device = platform.system_default_device().expect("an rt device");
+        crate::graphics::video_choice::tested_gpu::check_rt(&device, Arm::Nvidia);
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let gpu = crate::graphics::video_choice::rt_nvidia_gpu(&device);
         let video = super::super::NvidiaVideo::<RtPlatform>::new(&device, gpu, &runtime)

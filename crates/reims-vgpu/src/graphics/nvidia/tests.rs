@@ -112,6 +112,7 @@ fn a_picture_lands_in_an_imported_device_cache_as_it_reads_back() {
 /// As [`a_picture_lands_in_an_imported_device_cache_as_it_reads_back`], on the rt platform: its
 /// exportable buffers are blocks of their own, exported as opaque fds, which CUDA imports, and
 /// the acquire is rt's (`rt_platform::export`).
+/// The rt device must be of a GPU the arm runs on (`video_choice::tested_gpu::check_rt`).
 #[cfg(feature = "rt")]
 #[test]
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
@@ -120,6 +121,7 @@ fn a_picture_lands_in_an_imported_rt_cache_as_it_reads_back() {
     let platform = crate::rt_test_end::platform();
     crate::entry::run(|_| {
         let device = platform.system_default_device().expect("an rt device");
+        crate::graphics::video_choice::tested_gpu::check_rt(&device, Arm::Nvidia);
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let gpu = super::super::video_choice::rt_nvidia_gpu(&device);
         let video = NvidiaVideo::<RtPlatform>::new(&device, gpu, &runtime)
@@ -134,6 +136,7 @@ fn a_picture_lands_in_an_imported_rt_cache_as_it_reads_back() {
 /// NVENC's. They say each picture lands in the device's caches, as every cache on rt is a
 /// shape's (`video_caps`), and the arm imports the device's exportable caches, rt's exported
 /// blocks, to write them in.
+/// The rt device must be of a GPU the arm runs on (`video_choice::tested_gpu::check_rt`).
 #[cfg(feature = "rt")]
 #[test]
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
@@ -143,6 +146,7 @@ fn the_rt_platforms_caps_name_what_nvdec_decodes_and_nvenc_encodes() {
     let platform = crate::rt_test_end::platform();
     crate::entry::run(|_| {
         let device = platform.system_default_device().expect("an rt device");
+        crate::graphics::video_choice::tested_gpu::check_rt(&device, Arm::Nvidia);
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let gpu = super::super::video_choice::rt_nvidia_gpu(&device);
         let nvdec = NvidiaVideo::<RtPlatform>::new(&device, gpu, &runtime)

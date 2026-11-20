@@ -317,6 +317,7 @@ fn references_are_kept_apart_from_their_caches_where_the_rules_say_and_counted()
 /// releases no encoder's sources to the driver yet), and decodes into the device's caches where
 /// the driver's check passed a codec: rt's exported blocks, as dma-bufs, take the pictures no
 /// later one predicts from.
+/// The rt device must be of a GPU the arm runs on (`video_choice::tested_gpu::check_rt`).
 #[cfg(feature = "rt")]
 #[test]
 #[ignore = "needs a VA-API GPU: run on the VA-API host"]
@@ -324,6 +325,7 @@ fn the_rt_platforms_va_api_arm_decodes_alone() {
     let platform = crate::rt_test_end::platform();
     crate::entry::run(|_| {
         let device = platform.system_default_device().expect("an rt device");
+        crate::graphics::video_choice::tested_gpu::check_rt(&device, Arm::VaApi);
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let video = open_on_rt(&device, runtime).expect("VA-API on the rt device's GPU");
         let caps = video.caps();
