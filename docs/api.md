@@ -400,8 +400,8 @@ returns. The library logs through the `log` crate; a Rust host installs its own 
 
 Threads are named `reims-vgpu.<role>`: those above, `reims-vgpu.display` (the display thread),
 `reims-vgpu.window` (a window's drawing thread), `reims-vgpu.ui` (on Linux and Windows, the thread
-every window's events and callbacks run on), and `reims-vgpu.graphics-video-<i>` and
-`reims-vgpu.graphics-event-waits` (a graphics device's). The names are diagnostics, not contract.
+every window's events and callbacks run on), and `reims-vgpu.graphics-video-<i>`,
+`reims-vgpu.graphics-let-go-<i>` and `reims-vgpu.graphics-event-waits` (a graphics device's). The names are diagnostics, not contract.
 A queue's worker, the display thread among them, has core's `WORKER_STACK`, 512 KiB.
 
 ### The locks around `raise_interrupt`

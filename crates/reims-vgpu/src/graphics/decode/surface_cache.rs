@@ -10485,6 +10485,36 @@ pub(super) mod tests {
         assert_eq!(r.dec.caches().counts().downloads, 1);
     }
 
+    /// A released block's device cache is let go of on the let-go worker, off the surface
+    /// worker's threads: a `SURFACE_PAGES` handed to the surface worker while the caches' drops
+    /// wait for a thread is carried out without waiting for them, and the caches go once the
+    /// let-go worker runs. A session's video caches go together at its end, a Direct3D 11 target
+    /// pair's flushes each; behind them on the surface worker the next session's first
+    /// `SURFACE_PAGES` waited about half a second for a thread
+    #[test]
+    fn a_pages_job_made_while_released_caches_wait_to_go_does_not_wait_for_them() {
+        let mut r = cached();
+        let cache = reims_vgpu_vulkan::core::platform::ObjId(cache_id(&r));
+        r.dec.let_go_worker().hold();
+        r.dec
+            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+        assert_eq!(r.dec.caches().len(), 0, "the cache went with its block");
+        let (tx, rx) = std::sync::mpsc::channel();
+        r.dec.hand_off_surface_pages(BLOCK + 0x8000, move |settle| {
+            let _ = tx.send(());
+            drop(settle);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the SURFACE_PAGES is carried out while the cache's drop waits");
+        assert!(
+            r.p.world().find(cache).is_some(),
+            "the cache's drop still waits"
+        );
+        r.dec.let_go_worker().release();
+        r.dec.let_go_worker().flush();
+        assert!(r.p.world().find(cache).is_none(), "let go of");
+    }
+
     /// A release of a written cache whose surface had no client left (its `BLOCK_RELEASE`'s
     /// `RGFX_BLOCK_RELEASE_NO_CLIENT`) still copies the cache into the pages, and is done once
     /// the copy is: a mach port or an XPC object holds such a surface, and the process that

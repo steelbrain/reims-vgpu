@@ -480,7 +480,8 @@ so a block that takes a recursive lock its caller holds would re-enter it.
   thread and lane threads per command queue (`reims-vgpu.graphics-queue-<id>`,
   `reims-vgpu.graphics-lane-<id>`), and its pools: pipeline compiles
   (`reims-vgpu.graphics-compile-<n>`), surface and pages-block views
-  (`reims-vgpu.graphics-surfaces-<i>`), ICB creation (`reims-vgpu.icb-create-<i>`), a closed
+  (`reims-vgpu.graphics-surfaces-<i>`), surfaces' device caches let go of
+  (`reims-vgpu.graphics-let-go-<i>`), ICB creation (`reims-vgpu.icb-create-<i>`), a closed
   process's releases (`reims-vgpu.graphics-closes-<i>`), staged copies of surfaces' caches into
   their pages (`reims-vgpu.graphics-into-pages-<i>`), the video caches' spare surfaces made
   ahead on Windows (`reims-vgpu.graphics-drawn-spares-<i>`), video

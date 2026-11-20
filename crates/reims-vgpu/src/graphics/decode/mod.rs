@@ -897,8 +897,13 @@ pub(crate) struct Shared<P: Platform> {
     /// The blocks whose `SURFACE_PAGES` is not yet carried out ([`worker::Unsettled`]).
     unsettled: Arc<worker::Unsettled>,
     /// The threads the views are made and let go of on, a block's jobs in their order
-    /// ([`worker::Worker`]), and a block's device cache at its release ([`Caches::release`]).
+    /// ([`worker::Worker`]).
     surface_worker: Arc<worker::Worker>,
+    /// The threads a block's device cache is let go of on, at its release
+    /// ([`Caches::release`]) or once its block is named again without one, each block's in
+    /// their order: off the surface worker's, so that no `SURFACE_PAGES` waits for a thread
+    /// behind them.
+    let_go_worker: Arc<worker::Worker>,
     /// The thread a closed context's objects and views are let go of on, its close answered
     /// after them ([`GraphicsDecoder::let_go_later`]).
     close_worker: worker::Worker,
@@ -1325,6 +1330,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             last_slow_copy: Arc::default(),
             unsettled: Arc::default(),
             surface_worker: Arc::new(worker::Worker::new("reims-vgpu.graphics-surfaces")),
+            let_go_worker: Arc::new(worker::Worker::new("reims-vgpu.graphics-let-go")),
             close_worker: worker::Worker::new("reims-vgpu.graphics-closes"),
             video_worker: Arc::new(worker::Worker::new("reims-vgpu.graphics-video")),
             surface_caches: Arc::new(Caches::new()),
@@ -2639,17 +2645,20 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// The block at `block`, named again without a cache, loses any it had, as at a release: what
-    /// a buffer wrote of it goes into the pages first ([`surface_cache`]).
+    /// a buffer wrote of it goes into the pages first ([`surface_cache`]), and the cache is let
+    /// go of on the let-go worker.
     fn uncache_surface(&self, device: &P::Device, block: u64) {
         if !self.surface_caches.lock().has(block) {
             return;
         }
-        if let Err(raise) = self.surface_caches.released(device, block, Box::new(|| {})) {
-            log::warn!(
+        match self.surface_caches.released(device, block, Box::new(|| {})) {
+            Ok(Some(cache)) => self.shared.let_go_worker.drop_later(block, block, cache),
+            Ok(None) => {}
+            Err(raise) => log::warn!(
                 target: "reims_vgpu::graphics", kind:% = raise;
                 "the IOSurface block at {block:#x}: the platform raised at the copy of its device \
                  cache into its pages ({raise:?})"
-            );
+            ),
         }
     }
 
@@ -2776,8 +2785,11 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// is only counted). Where nothing but the kext held the surface
     /// ([`RGFX_BLOCK_RELEASE_UNHELD`](reims_vgpu_graphics::wire::RGFX_BLOCK_RELEASE_UNHELD)) the cache
     /// goes uncopied. There is no wait here for a buffer still walked; `done` then, or `failed`
-    /// where the platform raised at the copy ([`surface_cache`]). The block's holds of them are
-    /// let go of on the surface worker, where either may be the last of an import or a mapping.
+    /// where the platform raised at the copy ([`surface_cache`]). The block's hold of its view
+    /// is let go of on the surface worker, where it may be the last of an import or a mapping,
+    /// and its cache on the let-go worker, behind none of the surface worker's jobs: a burst of
+    /// releases' caches, whose drops may take a while each, keeps no `SURFACE_PAGES` waiting for
+    /// a thread.
     pub(crate) fn block_released(
         &self,
         device: &P::Device,
@@ -2796,7 +2808,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         // What the host's video devices made of the block's memory goes with its life.
         drop(self.shared.block_lives.lock().remove(&offset));
-        let worker = Arc::clone(&self.shared.surface_worker);
+        let worker = Arc::clone(&self.shared.let_go_worker);
         let let_go = Box::new(move |cache| worker.drop_later(offset, offset, cache));
         let region = Arc::clone(&self.shared.region);
         let now: surface_cache::Now = {
@@ -3199,6 +3211,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     #[cfg(test)]
     pub(crate) fn surface_worker(&self) -> &worker::Worker {
         &self.shared.surface_worker
+    }
+
+    /// The let-go worker, which lets go of the device caches (for the tests).
+    #[cfg(test)]
+    pub(crate) fn let_go_worker(&self) -> &worker::Worker {
+        &self.shared.let_go_worker
     }
 
     /// The video worker (for the tests).
