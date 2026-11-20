@@ -52,8 +52,6 @@ sdl3-sys = { version = "=0.7.2", default-features = false, features = [
     "sdl-video",
     "use-ash-v0-38",
 ] }
-# Metal's recorded answers too long for text, in xz files (core::testkit::metal_answers).
-lzma-rs = "0.3.0"
 # core (architecture 2.2)
 parking_lot = "0.12.5"
 zerocopy = { version = "0.8.27", features = ["derive"] }

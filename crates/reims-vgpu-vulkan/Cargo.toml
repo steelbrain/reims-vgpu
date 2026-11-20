@@ -9,14 +9,12 @@ license.workspace = true
 
 [features]
 # core::testkit and testkit::capture outside this crate's own unit tests (architecture 13.2).
-testkit = ["dep:lzma-rs"]
+testkit = []
 
 [dependencies]
 # core (`core`): its locks (`core::sync`), and the guest's physical ranges as bytes (`core::host`).
 parking_lot.workspace = true
 zerocopy.workspace = true
-# core's testkit::metal_answers: the recorded answers too long for text, in xz files.
-lzma-rs = { workspace = true, optional = true }
 # metal2vulkan's Metal types, for the enums and descriptor values the runtime's calls take.
 metal2vulkan.workspace = true
 # The library's runtime (`rt_platform`, `RtPlatform`), and our side of its seam (`seam`).
@@ -70,8 +68,6 @@ sha2.workspace = true
 # core's testkit for the integration tests (`tests/`), which link the library as other
 # crates do.
 reims-vgpu-vulkan = { path = ".", features = ["testkit"] }
-# core's testkit in the unit tests, compiled under cfg(test).
-lzma-rs.workspace = true
 
 [lints]
 workspace = true
