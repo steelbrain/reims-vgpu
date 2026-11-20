@@ -338,7 +338,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 63.
+/// `RGFX_FEATURE_*`, bits 0 to 9 and 11 to 63.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -348,6 +348,7 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_CB_PARTS
     | RGFX_FEATURE_PAGES_BUFFERS
     | RGFX_FEATURE_QUEUE_VECTORS
+    | RGFX_FEATURE_IMPORT_ADDRESSES_LATER
     | RGFX_FEATURE_SURFACE_ORDER
     | RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS
     | RGFX_FEATURE_UNSHARED_QUEUES
@@ -1936,7 +1937,9 @@ impl Device {
 /// weak reference to the device; an answer after the device has ended, or for a command taken
 /// before a reset, is dropped, and so is one never given. A pages block's `SURFACE_PAGES`
 /// ([`RGFX_SURFACE_PAGES_PRIVATE`]), where the guest took [`RGFX_FEATURE_IMPORT_ADDRESSES`], is
-/// answered with the block's GPU address ([`Self::wants_address`], [`Self::answer_at`]).
+/// answered with the block's GPU address ([`Self::wants_address`], [`Self::answer_at`]), and
+/// where it took [`RGFX_FEATURE_IMPORT_ADDRESSES_LATER`] too, before the block's view is given
+/// one ([`Self::answers_later`]).
 pub struct CompleteAnswer {
     /// The device's shared state, weakly.
     shared: Weak<Shared>,
@@ -1947,6 +1950,9 @@ pub struct CompleteAnswer {
     /// A pages block's `SURFACE_PAGES` of a guest that took `IMPORT_ADDRESSES`: answered as an
     /// [`RgfxPagesAnswer`].
     pages: bool,
+    /// Such an answer of a guest that took `IMPORT_ADDRESSES_LATER` too: given before the block's
+    /// view has its address, which it carries none of.
+    later: bool,
 }
 
 /// A `PRESENT_SURFACE`'s answer.
@@ -2111,6 +2117,13 @@ impl CompleteAnswer {
     /// took [`RGFX_FEATURE_IMPORT_ADDRESSES`].
     pub fn wants_address(&self) -> bool {
         self.pages
+    }
+
+    /// Whether the answer is given before the block's view has its address, with none: a pages
+    /// block's `SURFACE_PAGES` of a guest that took [`RGFX_FEATURE_IMPORT_ADDRESSES_LATER`]
+    /// beside [`RGFX_FEATURE_IMPORT_ADDRESSES`], which the host gives the view after the answer.
+    pub fn answers_later(&self) -> bool {
+        self.later
     }
 
     /// Posts the answer as [`Self::answer`] does, with `gpu_address`, the GPU address of the
@@ -3393,6 +3406,8 @@ impl Shared {
         let mut answer = self.complete_answer(seqno, epoch);
         answer.pages = flags & RGFX_SURFACE_PAGES_PRIVATE != 0
             && self.driver_took(RGFX_FEATURE_IMPORT_ADDRESSES);
+        answer.later =
+            answer.pages && self.driver_took(u64::from(RGFX_FEATURE_IMPORT_ADDRESSES_LATER));
         (self.host).surface_pages(pages, runs, flags, layout, answer);
         None
     }
@@ -4037,6 +4052,7 @@ impl Shared {
             seqno,
             epoch,
             pages: false,
+            later: false,
         }
     }
 

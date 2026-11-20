@@ -63,18 +63,19 @@ use reims_vgpu_graphics::wire::{
     RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS,
     RGFX_CMD_ICB_SLOTS_IN_PAGES, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE,
     RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE,
-    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_PIPELINE_ANSWERS, RGFX_CMD_RATE_MAP_CREATE,
-    RGFX_CMD_RATE_MAP_QUERY, RGFX_CMD_RATE_MAP_RESET, RGFX_CMD_RENDER_PIPELINE_CREATE,
-    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT, RGFX_CMD_SHARED_EVENT_NAME,
-    RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH,
-    RGFX_DEVICE_INFO_OFFSET, RGFX_DISPLAYS_MAX, RGFX_EVT_FUNCTION_POINTER_STATE,
-    RGFX_EVT_ICB_STATE, RGFX_EVT_RATE_MAP_ANSWER, RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE,
-    RGFX_FEATURE_BUFFER_ESCAPED, RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_COMMIT_ORDER,
-    RGFX_FEATURE_CURSOR_COLOR, RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_DISPLAY_POWER,
-    RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_DOORBELL_ASKS, RGFX_FEATURE_DOORBELL_PAGES,
-    RGFX_FEATURE_DYNAMIC_LIBRARIES, RGFX_FEATURE_FUNCTION_POINTERS, RGFX_FEATURE_GUEST_TIMES,
-    RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS,
-    RGFX_FEATURE_ICB_SLOTS_IN_PAGES, RGFX_FEATURE_IMPORT_ADDRESSES,
+    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_PAGES_BUFFER_ADDRESS, RGFX_CMD_PIPELINE_ANSWERS,
+    RGFX_CMD_RATE_MAP_CREATE, RGFX_CMD_RATE_MAP_QUERY, RGFX_CMD_RATE_MAP_RESET,
+    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT,
+    RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT,
+    RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH, RGFX_DEVICE_INFO_OFFSET, RGFX_DISPLAYS_MAX,
+    RGFX_EVT_FUNCTION_POINTER_STATE, RGFX_EVT_ICB_STATE, RGFX_EVT_RATE_MAP_ANSWER,
+    RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_BUFFER_ESCAPED,
+    RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_CURSOR_COLOR,
+    RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_DISPLAY_POWER, RGFX_FEATURE_DISPLAY_SCALE,
+    RGFX_FEATURE_DOORBELL_ASKS, RGFX_FEATURE_DOORBELL_PAGES, RGFX_FEATURE_DYNAMIC_LIBRARIES,
+    RGFX_FEATURE_FUNCTION_POINTERS, RGFX_FEATURE_GUEST_TIMES, RGFX_FEATURE_HEAP_OVER_PAGES,
+    RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_ICB_SLOTS_IN_PAGES,
+    RGFX_FEATURE_IMPORT_ADDRESSES, RGFX_FEATURE_IMPORT_ADDRESSES_LATER,
     RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_COPY,
     RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
@@ -632,12 +633,22 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // blocks of it for their buffers' slabs (`POOL`), where the pool is offered (below).
             // Every host fills a surface's device cache again at the generation it holds where a
             // use asks it, the CPU having written the pages after the lock that moved it
-            // (`SURFACE_REFILL`, `decode::surface_cache`, "Refill").
+            // (`SURFACE_REFILL`, `decode::surface_cache`, "Refill"). On a platform that imports a
+            // pages block's view as a block it knows, a host answers the block's `SURFACE_PAGES`
+            // before it makes the view and its import, which it does after the answer, so the
+            // guest's call waits for neither (`IMPORT_ADDRESSES_LATER`, `start_surface_pages`).
+            // No other platform offers it: its guests' answers carry the view's address as before.
+            let view_imports = platform.view_imports();
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES)
                 | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
-                | RGFX_FEATURE_READ_ONLY_PAGES;
+                | RGFX_FEATURE_READ_ONLY_PAGES
+                | if view_imports.is_some() {
+                    u64::from(RGFX_FEATURE_IMPORT_ADDRESSES_LATER)
+                } else {
+                    0
+                };
             let features = u64::from(RGFX_FEATURE_CB_SUBMITTED)
                 | u64::from(RGFX_FEATURE_SURFACE_ORDER)
                 | u64::from(RGFX_FEATURE_COMMIT_ORDER)
@@ -758,7 +769,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             }
             // One that knows a pages block's view's import as a block answers the view's address
             // with the import's (`decode::surface_pages`, "Addresses the host gives").
-            if let Some(imports) = platform.view_imports() {
+            if let Some(imports) = view_imports {
                 decoder.set_view_imports(imports);
             }
             // One that keeps no view of an IOSurface's pages has its surfaces take device caches
@@ -2104,7 +2115,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// surface worker (`decode::surface_pages`), so ring 0 goes on meanwhile, under the reset
     /// gate, held shared recursively, as a queue that holds it may wait for the block. Answered
     /// there once the block's view and device cache are made, before the block settles, so a
-    /// message that names the block and waited for it is answered after it.
+    /// message that names the block and waited for it is answered after it. A pages block of a
+    /// guest that took `IMPORT_ADDRESSES_LATER` is answered as soon as its runs are carried out,
+    /// with no address ([`CompleteAnswer::answers_later`]), and its view is made and given its
+    /// address after the answer, on the same job, before the block settles: the messages that
+    /// name the block wait for that on the host's side, and the guest's call for none of it.
     fn start_surface_pages(
         self: &Arc<Self>,
         pages: RgfxSurfacePages,
@@ -2122,21 +2137,32 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         (self.decoder()).wait_copies_into(pages.block_offset, &runs);
         let me = Arc::clone(self);
         let job = move |settle| {
-            let (status, at) = {
+            let wants_address = answer.wants_address();
+            let (status, at, answer) = {
                 let _carried = me.reset_gate.read_recursive();
                 let status = (me.decoder())
                     .carry_out_surface_pages(&me.device, &pages, &runs, flags, layout, &settle);
+                // Where the guest took IMPORT_ADDRESSES_LATER, answered now, with no address,
+                // before the view is made and given one below.
+                let answer = match status {
+                    Some(status) if answer.answers_later() => {
+                        me.decoder().surface_pages_answered(begun);
+                        answer.answer_at(status, 0);
+                        None
+                    }
+                    _ => Some(answer),
+                };
                 // A pages block's view's address, where the guest took IMPORT_ADDRESSES.
                 let at = match status {
-                    Some(RGFX_STATUS_OK) if answer.wants_address() => {
+                    Some(RGFX_STATUS_OK) if wants_address => {
                         (me.decoder()).pages_address(&me.device, pages.block_offset)
                     }
                     _ => 0,
                 };
-                (status, at)
+                (status, at, answer)
             };
-            // Nothing is owed where the device was reset since.
-            if let Some(status) = status {
+            // Nothing is owed where the device was reset since, nor where it was answered above.
+            if let (Some(status), Some(answer)) = (status, answer) {
                 me.decoder().surface_pages_answered(begun);
                 answer.answer_at(status, at);
             }
@@ -2258,6 +2284,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             }
             RGFX_CMD_PIPELINE_ANSWERS => {
                 self.pipeline_answers(poster, message);
+                return;
+            }
+            RGFX_CMD_PAGES_BUFFER_ADDRESS => {
+                self.pages_buffer_address(poster, message);
                 return;
             }
             RGFX_CMD_RATE_MAP_CREATE | RGFX_CMD_RATE_MAP_RESET => {
@@ -2812,6 +2842,23 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         );
         if let Some(seqno) = seqno {
             poster.post(complete(seqno, status).as_bytes());
+        }
+    }
+
+    /// A `PAGES_BUFFER_ADDRESS` from ring 0 (`IMPORT_ADDRESSES_LATER`), answered at once through
+    /// `poster` with the GPU address of the buffer over a pages block it names
+    /// ([`GraphicsDecoder::pages_buffer_address`]). It is carried out after the sender's messages
+    /// before it, the buffer's make on the surface worker among them
+    /// ([`Self::wait_for_pages_buffers`]), which waits for its block's view's address: the address
+    /// is the one the buffer lies at.
+    fn pages_buffer_address(&self, poster: &CompletionPoster, message: &[u8]) {
+        let answer = entry::run(|_| {
+            (self.decoders)
+                .sender(Some(sender_context(poster, message)), Sinks::default())
+                .pages_buffer_address(message)
+        });
+        if let Some(answer) = answer {
+            poster.post(answer.as_bytes());
         }
     }
 

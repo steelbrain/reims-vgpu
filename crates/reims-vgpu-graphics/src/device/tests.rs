@@ -3344,6 +3344,95 @@ fn a_pages_block_s_answer_carries_its_address_where_the_driver_took_import_addre
     assert_eq!(*host.0.lock(), [false]);
 }
 
+/// Where the driver took `IMPORT_ADDRESSES_LATER` beside `IMPORT_ADDRESSES`, a pages block's
+/// `SURFACE_PAGES` hands the host an answer that wants an address and is given later, before the
+/// block's view has one; any other block's wants neither. A driver that took
+/// `IMPORT_ADDRESSES_LATER` alone, or `IMPORT_ADDRESSES` alone, has its pages blocks answered
+/// as before, with no answer given later
+#[test]
+fn a_pages_block_s_answer_is_given_later_where_the_driver_took_import_addresses_later() {
+    #[derive(Clone, Default)]
+    struct Pages(Arc<Mutex<Vec<(bool, bool)>>>);
+    impl Host for Pages {
+        fn raise_interrupt(&self, _vector: u32) {}
+        fn features(&self) -> u64 {
+            u64::from(RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_IMPORT_ADDRESSES_LATER)
+                | RGFX_FEATURE_IMPORT_ADDRESSES
+        }
+        fn surface_pages(
+            &self,
+            _pages: &RgfxSurfacePages,
+            _runs: Vec<RgfxPageRun>,
+            _flags: u32,
+            _layout: Option<RgfxSurfacePagesLayout>,
+            answer: CompleteAnswer,
+        ) {
+            self.0
+                .lock()
+                .push((answer.wants_address(), answer.answers_later()));
+            answer.answer_at(RGFX_STATUS_OK, 0);
+        }
+    }
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4000;
+    let runs = [RgfxPageRun {
+        address: 0x9000,
+        length: 0x1000,
+    }];
+    let message = |flags: u32| {
+        let mut bytes = RgfxSurfacePages {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SURFACE_PAGES,
+                ..Default::default()
+            },
+            context: 3,
+            run_count: 1,
+            block_offset: BLOCK,
+            block_size: 0x2000,
+            runs_offset: BLOCK + 0x1000,
+            length: 0x1000,
+        }
+        .as_bytes()
+        .to_vec();
+        bytes.extend_from_slice(
+            RgfxSurfacePagesCache {
+                flags,
+                reserved_04: 0,
+            }
+            .as_bytes(),
+        );
+        bytes
+    };
+    let taking = |features: u64| {
+        let host = Pages::default();
+        let mut rig = Rig::with_host(Box::new(host.clone()));
+        assert_eq!(
+            rig.device.mmio_read(RGFX_REG_FEATURES_LO.into()) & RGFX_FEATURE_IMPORT_ADDRESSES_LATER,
+            RGFX_FEATURE_IMPORT_ADDRESSES_LATER
+        );
+        rig.device
+            .mmio_write(RGFX_REG_DRIVER_FEATURES_LO.into(), features as u32);
+        rig.device
+            .mmio_write(RGFX_REG_DRIVER_FEATURES_HI.into(), (features >> 32) as u32);
+        rig.start();
+        rig.region().write(BLOCK + 0x1000, runs.as_bytes());
+        for flags in [RGFX_SURFACE_PAGES_PRIVATE, RGFX_SURFACE_PAGES_CACHED] {
+            rig.send(message(flags));
+            rig.event().expect("an answer");
+        }
+        host.0.lock().clone()
+    };
+    let later = u64::from(RGFX_FEATURE_IMPORT_ADDRESSES_LATER);
+    assert_eq!(
+        taking(RGFX_FEATURE_IMPORT_ADDRESSES | later),
+        [(true, true), (false, false)]
+    );
+    assert_eq!(taking(later), [(false, false), (false, false)]);
+    assert_eq!(
+        taking(RGFX_FEATURE_IMPORT_ADDRESSES),
+        [(true, false), (false, false)]
+    );
+}
+
 /// What a [`TakingHost`] records, and what it is set to do.
 #[derive(Default)]
 struct Taking {

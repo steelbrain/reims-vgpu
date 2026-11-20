@@ -351,9 +351,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use reims_vgpu_graphics::wire::{
-    RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_HEAP_OVER_PAGES, RGFX_SURFACE_PAGES_PLANES,
-    RgfxBufferOverPages, RgfxBufferOverSurfacePages, RgfxHeapOverPages, RgfxMsgHeader, RgfxPageRun,
-    RgfxSurfacePages, RgfxSurfacePagesLayout,
+    RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_HEAP_OVER_PAGES, RGFX_EVT_COMPLETE,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+    RGFX_SURFACE_PAGES_PLANES, RgfxBufferOverPages, RgfxBufferOverSurfacePages, RgfxHeapOverPages,
+    RgfxMsgHeader, RgfxPageRun, RgfxPagesAnswer, RgfxPagesBufferAddress, RgfxSurfacePages,
+    RgfxSurfacePagesLayout,
 };
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity, MemoryLife};
 #[cfg(target_os = "linux")]
@@ -1256,6 +1258,14 @@ impl<P: Platform> SurfaceViews<P> {
         (address.at..end)
             .contains(&gpu_address)
             .then_some(p.kept.is_some() && !p.known)
+    }
+
+    /// The address the view of the pages block at `block` was given ([`Self::pages_address`])
+    /// plus `offset`, where a buffer at the host's address (`IMPORT_ADDRESSES_LATER`) lies;
+    /// `None` for a block given no address, or an offset past its view's.
+    pub(crate) fn view_address_plus(&self, block: u64, offset: u64) -> Option<u64> {
+        let address = self.private.get(&block)?.address.as_ref()?;
+        (offset < address.length).then(|| address.at.checked_add(offset))?
     }
 
     /// The pages block at `block` keeps `buffer`, the first made at its view's address, until it
@@ -3023,7 +3033,8 @@ impl<P: Platform> super::GraphicsDecoder<P> {
     }
 
     /// `BUFFER_OVER_PAGES`: a Shared buffer over the `length` bytes at `offset` in the view of a
-    /// pages block of the sender's (the module doc), at the guest's GPU address, lying over the
+    /// pages block of the sender's (the module doc), at the guest's GPU address, or at 0 the
+    /// view's address plus `offset` ([`SurfaceViews::view_address_plus`]), lying over the
     /// block, so the block is not released while it lives, its contents those bytes of the view.
     /// A block the sender does not hold is a guest protocol error; one that is no pages block of
     /// its context's, or a range past its view, is refused, and so is a buffer longer than the
@@ -3068,12 +3079,19 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         // ("Addresses the host gives"): the first buffer there pinned, and kept by the block;
         // one over the same bytes after it, which the guest's pointers reach through the first,
         // where the platform places it. A block is its context's, whose messages are carried out
-        // in order, so no other buffer over it is made between the two.
+        // in order, so no other buffer over it is made between the two. At 0, the host's: the
+        // view's address plus the buffer's offset (`IMPORT_ADDRESSES_LATER`), where the guest
+        // would have placed it had the block's answer carried the address; where the view has
+        // none, where the platform places it.
         let views = &self.shared.surface_views;
-        let at_view = (m.gpu_address != 0)
-            .then(|| views.lock().at_view_address(m.block_offset, m.gpu_address))
+        let gpu_address = match m.gpu_address {
+            0 => (views.lock().view_address_plus(m.block_offset, m.offset)).unwrap_or(0),
+            at => at,
+        };
+        let at_view = (gpu_address != 0)
+            .then(|| views.lock().at_view_address(m.block_offset, gpu_address))
             .flatten();
-        let pin = (m.gpu_address != 0 && at_view != Some(true)).then_some(m.gpu_address);
+        let pin = (gpu_address != 0 && at_view != Some(true)).then_some(gpu_address);
         let kind = match at_view {
             Some(_) => super::unkept::Kind::Import,
             None => super::unkept::Kind::Pages,
@@ -3123,6 +3141,45 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             count_read_only_pages_buffer(m.length);
         }
         Ok(Ok(()))
+    }
+
+    /// A `PAGES_BUFFER_ADDRESS`' answer (`IMPORT_ADDRESSES_LATER`): [`RGFX_STATUS_OK`] and the
+    /// GPU address of the buffer it names, a no-copy buffer a `BUFFER_OVER_PAGES` of the sender's
+    /// made, the address its `gpuAddress` answers; [`RGFX_STATUS_REFUSED`] where the host refused
+    /// the buffer's create, [`RGFX_STATUS_NOT_FOUND`] where the id names no such buffer the sender
+    /// may name (another context's object among them), and [`RGFX_STATUS_INVALID_ARGUMENT`] for a
+    /// body too short, each with 0. `None` for a message too short to carry its seqno, which no
+    /// one can be answered by. The caller carries it out after the sender's messages before it,
+    /// the buffer's create among them.
+    pub(crate) fn pages_buffer_address(&self, message: &[u8]) -> Option<RgfxPagesAnswer> {
+        let header = super::read::<RgfxMsgHeader>(message)?;
+        let answer = |status, gpu_address| RgfxPagesAnswer {
+            header: RgfxMsgHeader {
+                r#type: RGFX_EVT_COMPLETE,
+                size: size_of::<RgfxPagesAnswer>() as u32,
+                seqno: header.seqno,
+            },
+            status,
+            reserved_14: 0,
+            gpu_address,
+        };
+        let Some(m) = super::read::<RgfxPagesBufferAddress>(message) else {
+            return Some(answer(RGFX_STATUS_INVALID_ARGUMENT, 0));
+        };
+        let entry = self.entry(m.obj_id);
+        Some(
+            match entry.map(|e| (&e.handle, e.escape.as_ref().map(|e| e.over()))) {
+                Some((super::ObjHandle::Refused(refused), _)) => {
+                    refused.used(m.obj_id);
+                    answer(RGFX_STATUS_REFUSED, 0)
+                }
+                Some((
+                    super::ObjHandle::Buffer(buffer),
+                    Some(super::escape::NoCopy::Pages | super::escape::NoCopy::ReadOnlyPages),
+                )) => answer(RGFX_STATUS_OK, buffer.gpu_address()),
+                _ => answer(RGFX_STATUS_NOT_FOUND, 0),
+            },
+        )
     }
 
     /// [`SurfaceViews::join_group`] for the `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` `message` of

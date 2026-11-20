@@ -269,11 +269,38 @@ mod fake {
         static PLATFORM: Arc<FakePlatform> = Arc::new(FakePlatform::new());
     }
 
+    /// The fake processes that import their pages blocks' views as blocks they know, each with
+    /// what imports them ([`fake_view_imports`]).
+    static VIEW_IMPORTS: Mutex<Vec<(std::sync::Weak<FakePlatform>, ViewImports<FakePlatform>)>> =
+        parking_lot::const_mutex(Vec::new());
+
+    /// Has `platform` import each pages block's view as a block it knows, through `imports`, as
+    /// metal2vulkan-rt's does ([`ApiPlatform::view_imports`]): a graphics device made on it from
+    /// now on offers what goes with them. The entries of processes gone are dropped here.
+    #[cfg(test)]
+    pub(crate) fn fake_view_imports(
+        platform: &Arc<FakePlatform>,
+        imports: ViewImports<FakePlatform>,
+    ) {
+        let mut held = VIEW_IMPORTS.lock();
+        held.retain(|(p, _)| p.strong_count() > 0);
+        held.push((Arc::downgrade(platform), imports));
+    }
+
     /// The testkit's platform: a process per test thread, its one device (registry ID
-    /// [`FAKE_REGISTRY_ID`]), and pixels that read as zero.
+    /// [`FAKE_REGISTRY_ID`]), and pixels that read as zero. A process a test gave view imports
+    /// ([`fake_view_imports`]) answers them.
     impl ApiPlatform for FakePlatform {
         fn process() -> Arc<FakePlatform> {
             PLATFORM.with(Arc::clone)
+        }
+
+        fn view_imports(&self) -> Option<ViewImports<Self>> {
+            let held = VIEW_IMPORTS.lock();
+            // A process gone may have left its entry, at an address a new one can take.
+            let mine =
+                (held.iter()).find(|(p, _)| p.strong_count() > 0 && std::ptr::eq(p.as_ptr(), self));
+            mine.map(|(_, imports)| Arc::clone(imports))
         }
 
         fn metal_device(&self, registry_id: Option<u64>) -> Option<<Self as Platform>::Device> {
@@ -293,6 +320,8 @@ mod fake {
         }
     }
 }
+#[cfg(test)]
+pub(crate) use fake::fake_view_imports;
 
 #[cfg(test)]
 mod tests {

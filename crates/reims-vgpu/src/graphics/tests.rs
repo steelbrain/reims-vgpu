@@ -11013,7 +11013,25 @@ fn surface_device_taking(
     reims_vgpu_vulkan::core::testkit::GuestRam,
     u64,
 ) {
+    surface_device_importing(pages, features, None)
+}
+
+/// [`surface_device_taking`] on a platform that imports each pages block's view as a block it
+/// knows through `imports`, where given (metal2vulkan-rt's, `ApiPlatform::view_imports`).
+fn surface_device_importing(
+    pages: u64,
+    features: u64,
+    imports: Option<crate::platform::ViewImports<FakePlatform>>,
+) -> (
+    GraphicsDevice<FakePlatform>,
+    Arc<FakePlatform>,
+    reims_vgpu_vulkan::core::testkit::GuestRam,
+    u64,
+) {
     let platform = Arc::new(FakePlatform::new());
+    if let Some(imports) = imports {
+        crate::platform::fake_view_imports(&platform, imports);
+    }
     let page = platform.vm().page_size();
     let ram =
         reims_vgpu_vulkan::core::testkit::GuestRam::with_range(SURFACE_RAM, pages * page).unwrap();
@@ -11346,6 +11364,116 @@ fn a_pages_block_s_answer_carries_its_view_s_address_where_the_guest_took_import
             .views_of_surfaces()
             .view_addresses_held(),
         0
+    );
+}
+
+/// Where the platform imports a pages block's view as a block it knows (metal2vulkan-rt's) and
+/// the guest took `IMPORT_ADDRESSES_LATER` beside `IMPORT_ADDRESSES`, a pages block's
+/// `SURFACE_PAGES` is answered OK with no address while its view's import is held, so the guest's
+/// call waits for none of it. A `BUFFER_OVER_PAGES` at 0 over the block, a texture over that
+/// buffer and the guest's `PAGES_BUFFER_ADDRESS` wait for the block to settle, on the host's
+/// side: then the buffer lies at the import's address plus its offset, where the guest would have
+/// placed it from an answer that carried the address, and the address' answer gives it. An id
+/// that names no buffer over a pages block of the sender's is answered not found. A device on a
+/// platform that knows no imports does not offer the bit
+#[test]
+fn a_pages_block_is_answered_before_its_view_s_import_where_the_guest_took_import_addresses_later()
+{
+    const IMPORTS: u64 = 0x6_0000_0000;
+    let later = u64::from(RGFX_FEATURE_IMPORT_ADDRESSES_LATER);
+    // While it holds true, the view's import waits.
+    let gate = Arc::new((parking_lot::Mutex::new(true), parking_lot::Condvar::new()));
+    let held = Arc::clone(&gate);
+    let imports: crate::platform::ViewImports<FakePlatform> = Arc::new(move |_, _, _, _, then| {
+        let (shut, opened) = &*held;
+        let mut shut = shut.lock();
+        while *shut {
+            opened.wait(&mut shut);
+        }
+        Some((IMPORTS, then))
+    });
+    let features = RGFX_FEATURE_IMPORT_ADDRESSES | later;
+    let (device, _platform, _ram, page) = surface_device_importing(8, features, Some(imports));
+    assert_eq!(
+        u64::from(device.mmio_read(RGFX_REG_FEATURES_LO.into())) & later,
+        later
+    );
+    let mut guest = Guest::new(&device);
+    guest.send(&device, block_grant(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
+    guest.send(&device, resource_id_chunk(1, 0));
+    let mut pages = surface_pages(&device, page, &[(1, 6)]);
+    pages.extend_from_slice(
+        RgfxSurfacePagesCache {
+            flags: RGFX_SURFACE_PAGES_PRIVATE,
+            reserved_04: 0,
+        }
+        .as_bytes(),
+    );
+    guest.send(&device, pages);
+    let seqno = guest.seqno;
+    let answer = guest
+        .event()
+        .expect("the SURFACE_PAGES' answer, its import held");
+    let answer = RgfxPagesAnswer::read_from_bytes(&answer).unwrap();
+    assert_eq!(
+        (answer.header.r#type, answer.header.seqno),
+        (RGFX_EVT_COMPLETE, seqno)
+    );
+    assert_eq!((answer.status, answer.gpu_address), (RGFX_STATUS_OK, 0));
+    // A buffer at the host's address a page into the view, a texture over it, and its address
+    // asked: none carried out while the import is held.
+    let mut over =
+        RgfxBufferOverPages::read_from_bytes(&buffer_over_pages(obj(1, 11), 4 * page)).unwrap();
+    over.offset = page;
+    guest.send(&device, over.as_bytes().to_vec());
+    guest.send(&device, texture_from_buffer(obj(1, 12), 1, obj(1, 11)));
+    let address_of = |obj_id| {
+        RgfxPagesBufferAddress {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_PAGES_BUFFER_ADDRESS,
+                size: 0,
+                seqno: 0,
+            },
+            obj_id,
+        }
+        .as_bytes()
+        .to_vec()
+    };
+    guest.send(&device, address_of(obj(1, 11)));
+    let asked = guest.seqno;
+    assert!(guest.quiet_for(50), "the address waits for the buffer");
+    assert_eq!(
+        device.decoder_object_count(),
+        0,
+        "the buffer and the texture wait for the block's view"
+    );
+    *gate.0.lock() = false;
+    gate.1.notify_all();
+    let answer = guest.event().expect("the address' answer");
+    let answer = RgfxPagesAnswer::read_from_bytes(&answer).unwrap();
+    assert_eq!(
+        (answer.header.seqno, answer.status, answer.gpu_address),
+        (asked, RGFX_STATUS_OK, IMPORTS + page)
+    );
+    assert!(objects_become(&device, 2));
+    #[cfg(not(windows))]
+    assert_eq!(device.decoder_gpu_address(obj(1, 11)), Some(IMPORTS + page));
+    // The texture, another context's id, and an id of nothing.
+    for obj_id in [obj(1, 12), obj(2, 11), obj(1, 13)] {
+        guest.send(&device, address_of(obj_id));
+        let answer = RgfxPagesAnswer::read_from_bytes(&guest.event().unwrap()).unwrap();
+        assert_eq!(
+            (answer.status, answer.gpu_address),
+            (RGFX_STATUS_NOT_FOUND, 0),
+            "{obj_id:#x}"
+        );
+    }
+
+    let (device, _platform, _ram, _page) = surface_device_taking(8, features);
+    assert_eq!(
+        u64::from(device.mmio_read(RGFX_REG_FEATURES_LO.into())) & later,
+        0,
+        "offered only where the platform knows the views' imports"
     );
 }
 
