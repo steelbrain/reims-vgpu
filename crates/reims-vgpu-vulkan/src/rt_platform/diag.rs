@@ -2016,17 +2016,22 @@ pub fn write() {
             ("staging-region", m.staging_region_allocations),
             ("staging-buffer", m.staging_buffer_allocations),
             ("zero-source", m.zero_source_allocations),
-            ("take", m.take_allocations),
+            ("shared-take", m.shared_take_allocations),
+            ("private-take", m.private_take_allocations),
         ];
         sites.sort_by_key(|(_, s)| std::cmp::Reverse(s.longest_nanos));
         let all: Vec<String> = sites
             .iter()
             .map(|(site, s)| {
                 format!(
-                    "{site} {} calls {} bytes longest {:.3} ms",
+                    "{site} {} calls {} bytes longest {:.3} ms of {} bytes, takes ahead {} of {} \
+                     bytes",
                     s.count,
                     s.bytes,
-                    s.longest_nanos as f64 / 1e6
+                    s.longest_nanos as f64 / 1e6,
+                    s.longest_bytes,
+                    s.takes_ahead,
+                    s.takes_ahead_bytes
                 )
             })
             .collect();
