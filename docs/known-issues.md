@@ -55,6 +55,15 @@ when it asks for more. When the guest lets go of some, QEMU gives it back once i
 for 5 seconds. On a Radeon 780M, a desktop with a browser and video used at most 73 MiB of it at
 a time, and 3D apps use more. So leave your host some memory beyond what you give the VM.
 
+## An app can pause when it asks for a lot of graphics memory at once
+
+When an app in the guest asks for more graphics memory at once than QEMU has spare, the host's GPU
+driver has to allocate that much, and the app waits until it's done. Other apps in the guest don't
+wait for it. On an RTX 2080, an app that asked for 547 MiB waited 271.5 ms, and 139.5 ms of that
+was the driver's allocation. On a Radeon RX 550, an app waited 65 ms, 64.4 ms of it the driver's.
+We measured these before a change to how QEMU handles such a request, and we'll update them once
+we've measured again. The driver's part stays either way. We don't know of a workaround yet.
+
 ## On a Mac
 
 ### You need macOS 26 or later to run VMs
