@@ -1467,6 +1467,59 @@ mod tests {
         assert_eq!(rose, [3, 12288, 1, 4096]);
     }
 
+    /// The counts read the device the process made last ([`follow`]), on the GPU the test holds:
+    /// two devices made in turn, the first let go of before the second is made
+    /// (`RtPlatform::let_go_of_device`), each one's submissions read as its own as it is made and
+    /// after its work, the first's no more once the second is made; and the over-copies folded
+    /// are both devices' ([`fold_metrics`]).
+    #[test]
+    fn the_counts_read_each_device_made_in_turn_on_vulkan() {
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::device::GpuDevice as _;
+
+        let platform = RtPlatform::new();
+        let read = || metrics().map(|m| m.submissions);
+        let over_copies = || {
+            let all = crate::answer::degradation_counts();
+            (all.iter())
+                .find(|(code, _)| *code == OVER_COPIES_CODE)
+                .map_or(0, |&(_, n)| n)
+        };
+        let counted = over_copies();
+        let mut made: Vec<rt::Counters> = Vec::new();
+        // Each commit waited for before the next, so each is a submission of its own: the first
+        // device's count differs from the second's at each read.
+        for (turn, commits) in [(1, 8), (2, 1)] {
+            let device = (platform.system_default_device()).expect("an rt device on the GPU");
+            let counters = device.rt().counters();
+            let own = || Some(counters.metrics().submissions);
+            let others = || (made.iter()).map(|c| Some(c.metrics().submissions));
+            assert_eq!(read(), own(), "device {turn} made: its count");
+            let queue = device.new_command_queue().expect("a command queue");
+            for _ in 0..commits {
+                let buffer = (queue.command_buffer(OnFault::Return))
+                    .expect("never a raise")
+                    .expect("a command buffer");
+                assert_eq!(buffer.commit(OnFault::Return), Ok(()));
+                assert_eq!(buffer.wait_until_completed(OnFault::Return), Ok(()));
+            }
+            assert_eq!(read(), own(), "device {turn}'s work: its count");
+            assert!(
+                others().all(|other| other != own()),
+                "device {turn}: the devices' counts tell them apart"
+            );
+            drop((queue, device));
+            assert_eq!(
+                platform.let_go_of_device(std::time::Duration::from_secs(5)),
+                Ok(())
+            );
+            made.push(counters);
+        }
+        fold_metrics();
+        let copied: u64 = (made.iter()).map(|c| c.metrics().over_copies).sum();
+        assert_eq!(over_copies() - counted, copied, "both devices' over-copies");
+    }
+
     /// The flat fields of a struct's `Debug` text name each field once.
     #[test]
     fn a_debug_text_flattens_to_its_fields() {
