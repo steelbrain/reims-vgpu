@@ -19,6 +19,9 @@ use crate::wire::*;
 /// The queue the tests make, in context 5.
 const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
 
+/// The posts a host timed for the trace: each one's kind and values ([`Host::trace`]).
+type Timed = Arc<Mutex<Vec<(&'static str, Vec<u64>)>>>;
+
 /// A host that keeps each queue's completion poster as the device tells it of the queue, and
 /// records what the device told it of its completion rings, the threads it raised on, and the
 /// posts it timed for the trace, which it times on the tests' platform handler thread
@@ -28,7 +31,7 @@ struct PostingHost {
     posters: Arc<Mutex<Vec<CompletionPoster>>>,
     degraded: Arc<Mutex<Vec<RingDegradation>>>,
     raised_on: Arc<Mutex<Vec<Option<String>>>>,
-    timed: Arc<Mutex<Vec<(&'static str, Vec<u64>)>>>,
+    timed: Timed,
 }
 
 impl Host for PostingHost {

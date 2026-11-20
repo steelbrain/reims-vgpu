@@ -1036,7 +1036,9 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
             if let Some(event) = rt_event(sel, event) {
                 match self.rt.encode_signal_event(event, value) {
                     Ok(()) => trace_event_op("evsignal", &self.rt, event, value),
-                    Err(error) => rt_refused(sel, &error),
+                    Err(error) => {
+                        rt_refused(sel, &error);
+                    }
                 }
             }
             Ok(())
@@ -1087,7 +1089,9 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
             if let Some(event) = rt_event(sel, event) {
                 match self.rt.encode_wait_for_event(event, value) {
                     Ok(()) => trace_event_op("evwait", &self.rt, event, value),
-                    Err(error) => rt_refused(sel, &error),
+                    Err(error) => {
+                        rt_refused(sel, &error);
+                    }
                 }
             }
             Ok(())
