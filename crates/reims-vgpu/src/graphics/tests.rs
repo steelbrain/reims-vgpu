@@ -11003,7 +11003,9 @@ fn surface_device(
     surface_device_taking(pages, 0)
 }
 
-/// [`surface_device`], started by a driver that took `features`.
+/// [`surface_device`], started by a driver that took `features`, their `DRIVER_FEATURES_HI` half
+/// written first, as the kext takes `PAGES_16K` before the rest: a host of 16 KiB pages offers
+/// the guest RAM's features only once it is taken.
 fn surface_device_taking(
     pages: u64,
     features: u64,
@@ -11056,10 +11058,21 @@ fn surface_device_importing(
         ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
-    device.mmio_write(RGFX_REG_DRIVER_FEATURES_LO.into(), features as u32);
     device.mmio_write(RGFX_REG_DRIVER_FEATURES_HI.into(), (features >> 32) as u32);
+    device.mmio_write(RGFX_REG_DRIVER_FEATURES_LO.into(), features as u32);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     (device, platform, ram, page)
+}
+
+/// `PAGES_16K` on a host of 16 KiB pages, which a guest there takes to be offered the guest RAM's
+/// features (the arm64e kext); nothing on a host of 4 KiB pages. The host's page is the mapping
+/// granule wherever the device offers those features at all
+/// (`surface_pages::SurfaceViews::available`).
+fn pages_16k_here() -> u64 {
+    match reims_vgpu_vulkan::core::memory::PAGE_SIZE {
+        16384 => RGFX_FEATURE_PAGES_16K,
+        _ => 0,
+    }
 }
 
 /// The guest RAM's first byte in [`surface_device`].
@@ -11375,7 +11388,8 @@ fn a_pages_block_s_answer_carries_its_view_s_address_where_the_guest_took_import
 /// side: then the buffer lies at the import's address plus its offset, where the guest would have
 /// placed it from an answer that carried the address, and the address' answer gives it. An id
 /// that names no buffer over a pages block of the sender's is answered not found. A device on a
-/// platform that knows no imports does not offer the bit
+/// platform that knows no imports does not offer the bit. The bit is one of the guest RAM's
+/// features, which a guest on a host of 16 KiB pages reads once it takes `PAGES_16K`
 #[test]
 fn a_pages_block_is_answered_before_its_view_s_import_where_the_guest_took_import_addresses_later()
 {
@@ -11392,7 +11406,7 @@ fn a_pages_block_is_answered_before_its_view_s_import_where_the_guest_took_impor
         }
         Some((IMPORTS, then))
     });
-    let features = RGFX_FEATURE_IMPORT_ADDRESSES | later;
+    let features = RGFX_FEATURE_IMPORT_ADDRESSES | later | pages_16k_here();
     let (device, _platform, _ram, page) = surface_device_importing(8, features, Some(imports));
     assert_eq!(
         u64::from(device.mmio_read(RGFX_REG_FEATURES_LO.into())) & later,
@@ -11469,10 +11483,13 @@ fn a_pages_block_is_answered_before_its_view_s_import_where_the_guest_took_impor
         );
     }
 
+    // The guest RAM's features offered, this one not among them.
     let (device, _platform, _ram, _page) = surface_device_taking(8, features);
+    let offered = u64::from(device.mmio_read(RGFX_REG_FEATURES_LO.into()));
+    let pages = u64::from(RGFX_FEATURE_SURFACE_PAGES);
     assert_eq!(
-        u64::from(device.mmio_read(RGFX_REG_FEATURES_LO.into())) & later,
-        0,
+        (offered & pages, offered & later),
+        (pages, 0),
         "offered only where the platform knows the views' imports"
     );
 }
