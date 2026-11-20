@@ -117,6 +117,18 @@ impl VideoMemory {
             (false, false) => None,
         }
     }
+
+    /// Whether the host's video writes the cache's memory itself, with no work of the platform's
+    /// (CUDA's copies into an exportable cache, VA-API's decodes into a dma-buf), so that its make
+    /// zeroes it ([`SurfaceCaches::zeros_of_new`]); a drawn cache's buffer is the platform's
+    /// alone, the video's draws writing the Direct3D 11 textures under its planes.
+    pub(super) fn written_outside(self) -> bool {
+        match self {
+            Self::OpaqueFd | Self::DmaBuf => true,
+            #[cfg(windows)]
+            Self::Drawn => false,
+        }
+    }
 }
 
 /// A cache's surface (module doc): what it may take, and what it took.

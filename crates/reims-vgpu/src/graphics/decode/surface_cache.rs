@@ -2502,7 +2502,8 @@ impl<P: Platform> SurfaceCaches<P> {
             return Ok(false);
         };
         let bytes = repitched.as_deref().map_or(length, Repitched::length);
-        let Some(filled_at) = self.zeros_of_new(device, &cache, life.is_some(), bytes)? else {
+        let outside = video.is_some_and(exported::VideoMemory::written_outside);
+        let Some(filled_at) = self.zeros_of_new(device, &cache, outside, bytes)? else {
             return Ok(false);
         };
         if matches!(pages, CachePages::Runs { .. }) {
@@ -2761,7 +2762,10 @@ impl<P: Platform> SurfaceCaches<P> {
             .and_then(|(_, _, repitched)| repitched.as_deref())
             .map_or(length, Repitched::length);
         let zeroed = match &made {
-            Some((cache, life, _)) => self.zeros_of_new(device, cache, life.is_some(), bytes)?,
+            Some((cache, _, _)) => {
+                let outside = video.is_some_and(exported::VideoMemory::written_outside);
+                self.zeros_of_new(device, cache, outside, bytes)?
+            }
             None => None,
         };
         let (Some((cache, life, repitched)), Some(filled_at)) = (made, zeroed) else {
@@ -2828,18 +2832,20 @@ impl<P: Platform> SurfaceCaches<P> {
     /// The transfer event's value at which the new `cache`, of `length` bytes, is zeros, for its
     /// uses to wait for (the module doc, "Fill"): 0, none to wait for, where its memory is the
     /// platform's alone, as its bytes are `newBufferWithLength:options:`'s, zeros before any work
-    /// of the platform's reads them; where it was made for the host's `video` (exportable, or a
-    /// dma-buf), whose writes are no work of the platform's, the value at which [`Self::zero`]'s
-    /// fill is done. `None`, the cache refused, where the platform made no transfer queue for its
-    /// copies, or no command buffer or encoder for that fill.
+    /// of the platform's reads them (a drawn cache's too, whose planes' pictures land in textures
+    /// of their own); where the host's video writes it itself (`outside`: exportable, or a
+    /// dma-buf, [`exported::VideoMemory::written_outside`]), with no work of the platform's, the
+    /// value at which [`Self::zero`]'s fill is done. `None`, the cache refused, where the
+    /// platform made no transfer queue for its copies, or no command buffer or encoder for that
+    /// fill.
     fn zeros_of_new(
         &mut self,
         device: &P::Device,
         cache: &P::Buffer,
-        video: bool,
+        outside: bool,
         length: u64,
     ) -> RaiseResult<Option<u64>> {
-        if video {
+        if outside {
             return self.zero(device, cache, length);
         }
         Ok(self.make_transfer(device)?.then_some(0))
@@ -7530,8 +7536,8 @@ impl<P: Platform> Caches<P> {
     /// ([`SurfaceCaches::zeros_of_new`]), and owes its first fill from the pages as of
     /// `generation`, the CPU's generation of the surface in the block's header (the module doc,
     /// "Fill"); `Ok(false)` too where the platform made no transfer queue for its copies, or no
-    /// command buffer for the zeros of a cache made for the host's video, as for no buffer: no
-    /// cache holds what the GPU's memory held before.
+    /// command buffer for the zeros of a cache the host's video writes itself, as for no buffer:
+    /// no cache holds what the GPU's memory held before.
     ///
     /// A block that has a cache keeps it where its pages are the same, filled again from them as
     /// of `generation` ([`SurfaceCaches::fill_named_again`]), as the kext's generations of the
@@ -12876,6 +12882,107 @@ pub(super) mod tests {
             (vec![PADDING_UNOBSERVED_BUFFER], false),
             "one plane: as any other laid-out cache, none"
         );
+    }
+
+    /// On Windows, where the host's video draws its pictures into Direct3D 11 textures under a
+    /// laid-out two-plane cache's planes (`graphics::drawn`), the cache's buffer is the
+    /// platform's alone, as a plain laid-out cache's is, in the per-shape form or not: it is made
+    /// by the same call as a plain cache's, whose bytes read zero before any write
+    /// (`on_vulkan_a_fresh_cache_reads_zero_before_its_first_write`), and its make zeroes nothing
+    /// on the transfer queue, so a decode's wait for the cache's fill waits for none of the
+    /// make's. The cache still gives the video its identity.
+    #[cfg(windows)]
+    #[test]
+    fn a_drawn_caches_make_zeroes_nothing_as_a_plain_caches() {
+        use reims_vgpu_graphics::wire::RgfxSurfacePlaneLayout;
+        use reims_vgpu_vulkan::core::testkit::impls::device::{
+            DEFERRED_BUFFER, PADDING_UNOBSERVED_BUFFER,
+        };
+
+        use crate::platform::ApiPlatform as _;
+        // NV12 as CoreVideo lays it from 0x20: the chroma plane's rows after the luma's,
+        // interleaved and half as many.
+        let mut layout = RgfxSurfacePagesLayout {
+            plane_count: 2,
+            ..Default::default()
+        };
+        layout.planes[0] = RgfxSurfacePlaneLayout {
+            offset: 0x20,
+            bytes_per_row: 256,
+            row_bytes: 240,
+            rows: 16,
+        };
+        layout.planes[1] = RgfxSurfacePlaneLayout {
+            offset: 0x20 + 16 * 256,
+            bytes_per_row: 256,
+            row_bytes: 240,
+            rows: 8,
+        };
+        let draw =
+            Arc::new(reims_vgpu_video::vaapi::PlaneDraw::new(None).expect("the Direct3D 11 draws"));
+        // The make's buffer (its call and arguments) and zero fills, whether the cache gives the
+        // video its identity, and whether a wait for its fill that gives up at once ends.
+        let made = |drawn: bool, shaped: bool| {
+            let mut r = rig(16);
+            let page = r.page;
+            r.dec.set_unified_memory(true);
+            if drawn {
+                r.dec.set_drawn_caches(Arc::clone(&draw));
+            }
+            if shaped {
+                let p = Arc::clone(&r.p);
+                r.dec.set_surface_shapes(
+                    Arc::new(
+                        move |device: &<FakePlatform as Platform>::Device,
+                              desc: &TextureDesc,
+                              _placed: bool| p.own_texture(device, desc),
+                    ),
+                    false,
+                );
+            }
+            let world = Arc::clone(r.p.world());
+            world.answer_surface_pages(PagesInPlace::No("off the device's alignment".into()));
+            let mark = r.p.call_log().mark();
+            assert_eq!(
+                r.pages_asking(BLOCK, &[(1, 4)], 4 * page, Some(layout)),
+                RGFX_STATUS_CACHE
+            );
+            assert_eq!(
+                r.pages_cached(BLOCK, &[(1, 4)], 4 * page, true),
+                RGFX_STATUS_OK
+            );
+            let calls = r.p.call_log().since(mark);
+            let buffers: Vec<(&str, Vec<Arg>)> = (calls.iter())
+                .filter(|c| [PADDING_UNOBSERVED_BUFFER, DEFERRED_BUFFER].contains(&c.sel))
+                .map(|c| (c.sel, c.args.clone()))
+                .collect();
+            assert_eq!(buffers.len(), 1, "one buffer made");
+            let mut short = || true;
+            let now = || MonoTime::from_nanos(0);
+            let waited = r.dec.surface_caches.wait_filled(BLOCK, &mut short, &now);
+            let given = r.dec.caches().identity(BLOCK).is_some();
+            (buffers, zeroed(&calls).len(), given, waited)
+        };
+        for shaped in [false, true] {
+            let (plain, plain_zeroed, plain_given, plain_waited) = made(false, shaped);
+            let (drawn, drawn_zeroed, drawn_given, drawn_waited) = made(true, shaped);
+            assert_eq!(drawn, plain, "shaped {shaped}: the plain cache's make");
+            assert_eq!(
+                (drawn_zeroed, drawn_waited),
+                (0, true),
+                "shaped {shaped}: no zeros of the host's, no fill to wait for"
+            );
+            assert_eq!(
+                (plain_zeroed, plain_waited),
+                (0, true),
+                "shaped {shaped}: a plain cache's alike"
+            );
+            assert_eq!(
+                (drawn_given, plain_given),
+                (true, false),
+                "shaped {shaped}: the video's cache gives its identity"
+            );
+        }
     }
 
     /// Where the host's video imports caches (NVDEC, on a GPU of its own memory, where the kext
