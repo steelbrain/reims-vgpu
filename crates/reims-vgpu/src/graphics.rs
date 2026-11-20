@@ -4523,7 +4523,9 @@ const RESERVATION_CHECKS: usize = 16;
 /// Metal takes a texture reservation only before the device's first texture (it ignores a later
 /// one, logging so), and one after the device's first command queue keeps the pool's first range
 /// beside the ids it leaves, which it hands out twice. So this is the first call on the device,
-/// and a few plain textures check it took: one inside the guest's ids is logged as an error.
+/// and a few plain textures check it took: one whose index lies inside the guest's ids is logged
+/// as an error. The index is a resource id's low word: rt's ids carry its word for the texture's
+/// descriptor in the high one (metal2vulkan-rt's `ResourceId`).
 fn reserve_guest_texture_ids<P: Platform>(platform: &P, device: &P::Device) {
     let ids: Vec<u64> = guest_texture_ids().collect();
     if let Err(raise) = refusing(|| device.reserve_resource_indices(0, &ids)) {
@@ -4547,11 +4549,11 @@ fn reserve_guest_texture_ids<P: Platform>(platform: &P, device: &P::Device) {
         .collect();
     if let Some(id) = made
         .iter()
-        .map(Texture::gpu_resource_id)
+        .map(|t| t.gpu_resource_id() & 0xffff_ffff)
         .find(|id| guest_texture_ids().contains(id))
     {
         log::error!(
-            "a texture of the host's took resource id {id}, one of the guest's ({} to {}): \
+            "a texture of the host's took resource index {id}, one of the guest's ({} to {}): \
              something made a texture or a command queue on the device before the guest's ids \
              were reserved, and the guest's textures may share ids with the host's",
             guest_texture_ids().start(),
