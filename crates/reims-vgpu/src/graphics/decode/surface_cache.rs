@@ -305,16 +305,17 @@
 //!   flight never shares one. A copy whose takes leave no whole piece among the spares hands a
 //!   top-up to a thread of theirs ([`SPARES_THREADS`]), which nothing waits for: it makes whole
 //!   pieces until the spares hold [`SPARE_BYTES`] of them, letting go of shorter ones to fit,
-//!   each make under the device's reset gate. A use's fill, at once or deferred, a present's fill
-//!   and a release's copy out find their pieces made ahead: where the spares and the pieces
-//!   reserved for the block lack some a copy of all of the bytes it may move would take
+//!   each make under the device's reset gate. A use's fill, at once or deferred, a present's fill,
+//!   a download's copy out and a release's find their pieces made ahead: where the spares and the
+//!   pieces reserved for the block lack some a copy of all of the bytes it may move would take
 //!   ([`SurfaceCaches::lacking`]), they are made with no lock of the caches' held and reserved for
 //!   the block ([`SurfaceCaches::reserved`]): a fill's by the thread that begins the use's command
 //!   buffer, the lock let go of once for them ([`Caches::before_answering`]), or by the present's
-//!   for its fill ([`Caches::fill_now`]); a release's on the releases' pace's thread
-//!   ([`ReleasePace`]) before the release is carried out, so ring 0 waits for no make either. The
-//!   copy takes them first, and the spares take back on their thread what it leaves. Any other copy
-//!   that finds no spare still makes its piece on its own thread, under the caches' lock, counted
+//!   for its fill ([`Caches::fill_now`]), or by ring 0 for a download's copy out, which the guest
+//!   waits for ([`Caches::download`]); a release's on the releases' pace's thread ([`ReleasePace`])
+//!   before the release is carried out, so ring 0 waits for no make either. The copy takes them
+//!   first, and the spares take back on their thread what it leaves. Any other copy that finds no
+//!   spare still makes its piece on its own thread, under the caches' lock, counted
 //!   (`rt-staging-piece-makes-locked`).
 //!   Each piece taken is counted (`rt-staging-pieces`, and
 //!   `rt-staging-pieces-spared` those a spare served), and each a copy made, with the
@@ -6428,11 +6429,18 @@ impl<P: Platform> Caches<P> {
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
-        self.after_writers(
-            device,
-            block,
-            download_op(device, block, region, ran, trace, done, failed),
-        );
+        let mut state = self.state.lock();
+        // The pieces a staged copy of its cache would make for want of a spare are made with the
+        // lock let go of, and reserved for the block (the module doc, "Staged copies").
+        if state.release_may_copy(block, false)
+            && let Some((lens, first)) = state.lacking(block, Way::Out)
+        {
+            reserve_unlocked(&mut state, device, vec![(block, lens, first)]);
+        }
+        let op = download_op(device, block, region, ran, trace, done, failed);
+        state.after_writers(device, block, op);
+        drop(state);
+        self.moved.notify_all();
     }
 
     /// [`Self::download`] where it waits for no lock and commits no copy now: the caches' lock
@@ -15130,6 +15138,60 @@ pub(super) mod tests {
         assert_eq!(counted(PIECE_MAKES_LOCKED), locked, "none made under the lock");
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(wait.done());
+    }
+
+    /// Where the caches' copies are staged, a download whose copy lacks pieces the spares do not
+    /// hold has them made by the thread that asks it with the caches' lock let go of, and
+    /// reserved for its block: the copy, made in its writer's finish, takes them, and makes none
+    /// under the lock ([`PIECE_MAKES_LOCKED`]); the pages hold what it copied out
+    #[test]
+    fn a_staged_downloads_pieces_are_made_with_the_caches_lock_let_go_of() {
+        let mut r = rig(8);
+        r.dec.set_staged_surface_copies(Arc::default());
+        queues(&mut r);
+        let page = r.page;
+        let length = 2 * page;
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], length, true),
+            RGFX_STATUS_OK
+        );
+        // The use writes the cache, and its fill's piece stays in flight: no spare holds one.
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        let lands_out = r.dec.caches().lands_out();
+        lands_out.hold();
+        let locked = counted(PIECE_MAKES_LOCKED);
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        let made: Vec<(u64, Option<String>)> = (r.p.call_log().since(mark).iter())
+            .filter(|c| c.sel == SCRATCH_BUFFER)
+            .map(|c| (c.args[0].as_u64().expect("a length"), c.thread.clone()))
+            .collect();
+        let here = std::thread::current().name().map(str::to_owned);
+        let lens = pack(std::iter::once(0..length), PIECE).lens;
+        assert_eq!(
+            made,
+            lens.iter().map(|&l| (l, here.clone())).collect::<Vec<_>>(),
+            "its piece, made by the thread that asked it"
+        );
+        assert!(
+            eventually(|| {
+                r.p.world().complete_all(CompleteOn::Caller);
+                copies(&r.p.call_log().since(mark)).len() == 1
+            }),
+            "the download's copy, once the use finished"
+        );
+        let out = copies(&r.p.call_log().since(mark));
+        buffer_bytes(&r, out[0].1, Some(0x5a));
+        lands_out.release();
+        assert!(eventually(|| {
+            complete_staged(&r);
+            done.load(Ordering::SeqCst)
+        }));
+        assert!(
+            ram_bytes(&r, 1, length, None).iter().all(|&b| b == 0x5a),
+            "the pages hold what the GPU copied out of the cache"
+        );
+        assert_eq!(counted(PIECE_MAKES_LOCKED), locked, "none made under the lock");
     }
 
     /// Where the caches' copies are staged, a release whose copy lacks pieces the spares do not
