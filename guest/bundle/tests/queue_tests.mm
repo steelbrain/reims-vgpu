@@ -37,6 +37,7 @@
 #import "RgfxResidencySet.h"
 #import "RgfxResource.h"
 #import "RgfxSharedEvent.h"
+#import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
 #include "RgfxCompletionThread.hpp"
@@ -2345,6 +2346,168 @@ void test_residency_sets_are_held_until_let_go()
 }
 #endif
 
+// The obj_ids of the OBJECT_DESTROYs on `control`, in the order sent; every message is taken off
+// the ring.
+std::vector<uint64_t> destroysOn(TestRing &control)
+{
+	std::vector<uint64_t> ids;
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	while (control.next(&h, &bytes)) {
+		RgfxObjectDestroy m = {};
+		if (h.type != RGFX_CMD_OBJECT_DESTROY || bytes.size() < sizeof(m))
+			continue;
+		std::memcpy(&m, bytes.data(), sizeof(m));
+		ids.push_back(m.obj_id);
+	}
+	return ids;
+}
+
+// How a case of test_buffers_keep_what_they_name_until_completed makes its command buffer.
+enum class KeepCase { kUnretained, kUnretainedDescriptor, kRetained };
+
+// One case of test_buffers_keep_what_they_name_until_completed: a buffer made as `made` says.
+void keepsWhatItNamesUntilCompleted(KeepCase made)
+{
+	TestRing *control = nullptr;
+	std::vector<uint64_t> named;
+	@autoreleasepool {
+		Queue q(true);
+		control = &q.control;
+		int &calls = *new int(0);
+		q.ids.setResourceIdSource(&oneIdChunk, &calls);
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:8
+		                                                      height:8
+		                                                   mipmapped:NO];
+		desc.storageMode = MTLStorageModePrivate;
+		auto makeTexture = [&] {
+			RgfxTexture *t = [RgfxTexture textureWithDescriptor:desc
+			                                               heap:RGFX_OBJ_NONE
+			                                         heapOffset:0
+			                                             device:nil
+			                                         serializer:&q.ser];
+			CHECK(t != nil);
+			return t;
+		};
+		auto makeBuffer = [&] {
+			RgfxBuffer *b = [RgfxBuffer bufferWithLength:256
+			                                     options:MTLResourceStorageModePrivate
+			                                      device:nil
+			                                  serializer:&q.ser];
+			CHECK(b != nil);
+			return b;
+		};
+		id<MTLCommandBuffer> cb = nil;
+		switch (made) {
+		case KeepCase::kUnretained:
+			cb = [q.queue commandBufferWithUnretainedReferences];
+			break;
+		case KeepCase::kUnretainedDescriptor: {
+			MTLCommandBufferDescriptor *d = [MTLCommandBufferDescriptor new];
+			d.retainedReferences = NO;
+			cb = [q.queue commandBufferWithDescriptor:d];
+			break;
+		}
+		case KeepCase::kRetained:
+			cb = [q.queue commandBuffer];
+			break;
+		}
+		CHECK(cb != nil && cb.retainedReferences == (made == KeepCase::kRetained));
+		// Its handler, added before the commit as Metal requires, takes what was destroyed by then.
+		bool handled = false;
+		std::vector<uint64_t> atHandler;
+		bool *handledp = &handled;
+		std::vector<uint64_t> *atHandlerp = &atHandler;
+		[cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+			(void)c;
+			*handledp = true;
+			*atHandlerp = destroysOn(*control);
+		}];
+		std::vector<uint64_t> resourceIds;
+		@autoreleasepool {
+			// A blit names a buffer and a texture; a compute pass binds an argument buffer and
+			// makes resident a texture only it reaches (useResource:usage:).
+			RgfxTexture *copied = makeTexture();
+			RgfxBuffer *source = makeBuffer();
+			RgfxBuffer *arguments = makeBuffer();
+			RgfxTexture *resident = makeTexture();
+			named = {copied.rgfxObjId, source.rgfxObjId, arguments.rgfxObjId, resident.rgfxObjId};
+			resourceIds = {[copied gpuResourceID]._impl, [resident gpuResourceID]._impl};
+			id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+			[blit copyFromBuffer:source
+			           sourceOffset:0
+			      sourceBytesPerRow:32
+			    sourceBytesPerImage:256
+			             sourceSize:MTLSizeMake(8, 8, 1)
+			              toTexture:copied
+			       destinationSlice:0
+			       destinationLevel:0
+			      destinationOrigin:MTLOriginMake(0, 0, 0)];
+			[blit endEncoding];
+			id<MTLComputeCommandEncoder> compute = [cb computeCommandEncoder];
+			[compute setBuffer:arguments offset:0 atIndex:0];
+			[compute useResource:resident usage:MTLResourceUsageRead];
+			[compute endEncoding];
+#if RgfxMakesResidencySets
+			// The arm64 device's buffer also holds a residency set it uses, and with it a texture
+			// committed to the set (test_residency_sets_are_held_until_let_go).
+			RgfxResidencySet *set = [[RgfxResidencySet alloc] initWithDevice:nil descriptor:nil];
+			RgfxTexture *inSet = makeTexture();
+			named.push_back(inSet.rgfxObjId);
+			resourceIds.push_back([inSet gpuResourceID]._impl);
+			[set addAllocation:inSet];
+			[set commit];
+			[cb useResidencySet:set];
+#endif
+			[cb commit];
+		} // the app lets them go while the buffer is in flight
+		const std::vector<uint64_t> early = destroysOn(q.control);
+		for (uint64_t obj : named)
+			CHECK(std::count(early.begin(), early.end(), obj) == 0);
+		// A texture made meanwhile takes another resource id, and goes at once.
+		uint64_t otherId = 0;
+		@autoreleasepool {
+			RgfxTexture *other = makeTexture();
+			otherId = other.rgfxObjId;
+			const uint64_t otherResourceId = [other gpuResourceID]._impl;
+			CHECK(std::count(resourceIds.begin(), resourceIds.end(), otherResourceId) == 0);
+		}
+		CHECK(destroysOn(q.control) == std::vector<uint64_t>{otherId});
+
+		complete(q, cb);
+		CHECK(handled);
+		const std::vector<uint64_t> after = destroysOn(q.control);
+		for (uint64_t obj : named) {
+			CHECK(std::count(atHandler.begin(), atHandler.end(), obj) == 0);
+			CHECK(std::count(after.begin(), after.end(), obj) == 1);
+		}
+	}
+	// Once each: none of them is destroyed again as the buffer and its queue go.
+	const std::vector<uint64_t> gone = destroysOn(*control);
+	for (uint64_t obj : named)
+		CHECK(std::count(gone.begin(), gone.end(), obj) == 0);
+}
+
+// A command buffer keeps what its encoders name until the host's completion of it is delivered,
+// whether it retains references or not, so the host never sees an object's destroy, nor its
+// resource id go to another, before a buffer that names it has run. Each object a buffer names
+// (a buffer and a texture a blit names, an argument buffer a compute pass binds and a texture it
+// makes resident with useResource:usage:, and on the arm64 device a texture committed to a
+// residency set the buffer uses), let go by the app once the buffer is committed, reaches the
+// host's OBJECT_DESTROY only after the buffer's completed handlers have run, and once; a texture
+// made meanwhile takes another resource id. A buffer made with unretained references, by
+// commandBufferWithUnretainedReferences or by a descriptor, keeps them as one made with retained
+// references does, though it answers retainedReferences NO (RgfxCmdBuffer's
+// commandBufferForQueue:, its keeper).
+void test_buffers_keep_what_they_name_until_completed()
+{
+	keepsWhatItNamesUntilCompleted(KeepCase::kUnretained);
+	keepsWhatItNamesUntilCompleted(KeepCase::kUnretainedDescriptor);
+	keepsWhatItNamesUntilCompleted(KeepCase::kRetained);
+}
+
 
 #if defined(__arm64__)
 // A shared event of `q`'s, registered with its queue's reader, at `initial`.
@@ -2605,6 +2768,7 @@ void rgfxQueueTests(const char *self)
 	test_threads_commit_in_enqueue_order();
 	test_submitted_waits_for_the_buffers_before();
 	test_resources_wait_for_their_buffers_in_flight();
+	test_buffers_keep_what_they_name_until_completed();
 	test_enqueue_and_commit_are_once();
 	test_buffers_let_go_give_their_blocks_back();
 	test_in_place_writes_retire_at_the_take();
