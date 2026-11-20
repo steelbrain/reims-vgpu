@@ -275,7 +275,8 @@ pub fn of_descriptor(
 /// Whether Metal makes a state of `stage` by the creator `sel`: none of a function made
 /// unspecialized that declares function constants (`FunctionDescriptor::needs_specialization`),
 /// whose creation ends the process on Metal. `Err` is the creator's `NSError`, counted: Metal's
-/// refusal, or the translator's of the function's constants.
+/// refusal, or the translator's of the function's constants. Neither names the function, whose
+/// name is the guest's.
 pub(super) fn specialized(
     sel: &'static str,
     stage: &rt::FunctionDescriptor,
@@ -283,10 +284,7 @@ pub(super) fn specialized(
     match stage.needs_specialization(&Budget::standard(), &StageEntries::default()) {
         Ok(false) => Ok(()),
         Ok(true) => {
-            let why = format!(
-                "function {} declares function constants and was made unspecialized",
-                stage.function.info().name
-            );
+            let why = "a function that declares function constants was made unspecialized";
             Err(refused_error_as(sel, RtRefusal::Refused, &why))
         }
         Err(error) => Err(rt_refused_error(sel, &rt::Error::Translation(error))),
@@ -634,6 +632,45 @@ mod tests {
         (crate::answer::degradation_counts().into_iter())
             .find(|(c, _)| c == code)
             .map_or(0, |(_, n)| n)
+    }
+
+    /// A kernel made unspecialized that declares function constants is refused, and neither the
+    /// refusal's line nor its `NSError` names the function, whose name is the guest's (in a child,
+    /// whose stderr is its own)
+    #[test]
+    fn an_unspecialized_function_s_refusal_names_no_function() {
+        use crate::core::testkit::death::{Expect, Options, Outcome, run};
+        const NAME: &str = "optional_constant";
+        run(
+            Expect::Any,
+            Options::default(),
+            module_path!(),
+            "an_unspecialized_function_s_refusal_names_no_function",
+            |_| {
+                let library = rt::Library::from_metallib(OPTIONAL).expect("a library");
+                let kernel = library.function(NAME).expect("the kernel");
+                let stage = rt::FunctionDescriptor::new(kernel);
+                let refused = specialized(WITH_FUNCTION, &stage).expect_err("a refusal");
+                super::super::unbuilt::say(&format!("test: NSError: {}\n", refused.description));
+            },
+            |r| {
+                assert_eq!(r.outcome(), &Outcome::Returned, "{}", r.stderr());
+                let out = r.stderr();
+                let said = "a function that declares function constants was made unspecialized";
+                let line = format!(
+                    "reims-vgpu: {WITH_FUNCTION}: metal2vulkan-runtime refused it ({said}); \
+                     refused (rt-refused-metal), the first of its kind"
+                );
+                let answered = format!(
+                    "test: NSError: metal2vulkan-runtime refused it: {said} \
+                     (rt-refused-metal)"
+                );
+                let lines: Vec<&str> = out.lines().collect();
+                assert!(lines.contains(&line.as_str()), "{out}");
+                assert!(lines.contains(&answered.as_str()), "{out}");
+                assert!(!out.contains(NAME), "{out}");
+            },
+        );
     }
 
     /// Each value of a stage-input descriptor is the translator's, a dynamic stride none; a value

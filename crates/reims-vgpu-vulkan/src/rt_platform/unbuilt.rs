@@ -11,16 +11,17 @@
 //!
 //! A call of a built piece that rt refuses (its `Error`: a limit, a refusal of Metal's, a known
 //! gap, a failed Vulkan call) answers the same way, counted under the error's kind,
-//! `rt-refused-<kind>` ([`RtRefusal::code`]), its first line naming the call and rt's error. The
-//! first of each of rt's kinds by its name in the boot diagnostics (`Draw-AttachmentRead`,
-//! `TextureCopy`, `RenderPass`, `Limit-TextureSamples`, `Translation-Lowering`), whichever count
-//! it goes to, writes a line of its own too: rt's error as it displays and as it debugs, which
-//! carries the gap's fields (the translator's refusal as the feature it refused, what it needs and
-//! its attachment alone), and what the call asked of rt where its site names it, as structure
-//! alone: a texture's descriptor, a view's and the texture it views, a copy's kind, textures,
-//! places, buffer layout and what its two textures share, a pass's attachments and store actions,
-//! a draw's primitive type and its pipeline state's rasterization fields ([`refusal_detail`]). No
-//! name of the guest's (a function's, a symbol's, a label) is in it. A texture rt makes none of
+//! `rt-refused-<kind>` ([`RtRefusal::code`]), its first line naming the call and rt's error as
+//! structure alone ([`said`]), as the `NSError` a creator answers names it. The first of each of
+//! rt's kinds by its name in the boot diagnostics (`Draw-AttachmentRead`, `TextureCopy`,
+//! `RenderPass`, `Limit-TextureSamples`, `Translation-Lowering`), whichever count it goes to,
+//! writes a line of its own too: rt's error as [`said`] gives it and, but for the translator's
+//! refusal, as it debugs, which carries the gap's fields, and what the call asked of rt where its
+//! site names it, as structure alone: a texture's descriptor, a view's and the texture it views, a
+//! copy's kind, textures, places, buffer layout and what its two textures share, a pass's
+//! attachments and store actions, a draw's primitive type and its pipeline state's rasterization
+//! fields ([`refusal_detail`]). No name of the guest's (a function's, a symbol's, a library's, a
+//! label) is in a line or an `NSError` of this module's. A texture rt makes none of
 //! for its pixel format (`Gap::TextureFormat`) is counted under its format's own code instead,
 //! `rt-refused-texture-format-<n>` ([`rt_refused_texture`]), so a boot's counts line gives each
 //! format number with its count. A pipeline state's imageblock length rt refuses
@@ -333,12 +334,12 @@ static SAID_RT: [AtomicBool; RtRefusal::ALL.len()] =
     [const { AtomicBool::new(false) }; RtRefusal::ALL.len()];
 
 /// Counts rt's refusal `error` of the call `sel` under its kind's code, and the process's first of
-/// the kind writes its line on stderr, naming the call and the error. The caller answers as
-/// Metal's call answers where it fails. Returns the kind.
+/// the kind writes its line on stderr, naming the call and the error as [`said`] gives it. The
+/// caller answers as Metal's call answers where it fails. Returns the kind.
 pub fn rt_refused(sel: &'static str, error: &rt::Error) -> RtRefusal {
     let kind = RtRefusal::of(error);
     super::diag::refusal(error);
-    refused_as(sel, kind, error);
+    refused_as(sel, kind, &said(error));
     refusal_detail(sel, error, None);
     kind
 }
@@ -380,8 +381,9 @@ fn first_named(name: String) -> bool {
 }
 
 /// The line [`refusal_detail`] writes of rt's `error` of the call `sel`, of the kind `name`, and
-/// what the call asked of rt, `what`, where it names it: rt's error as [`said`] gives it, the
-/// name, and the code of [`counted_code`].
+/// what the call asked of rt, `what`, where it names it: rt's error as [`said`] gives it and, but
+/// for the translator's refusal, whose fields can name the guest's functions and symbols, as it
+/// debugs (its variant's fields), the name, and the code of [`counted_code`].
 fn detail_line(
     sel: &str,
     error: &rt::Error,
@@ -389,36 +391,54 @@ fn detail_line(
     what: Option<&dyn std::fmt::Display>,
 ) -> String {
     let (code, said) = (counted_code(error), said(error));
+    let fields = match error {
+        rt::Error::Translation(_) => String::new(),
+        _ => format!("; {error:?}"),
+    };
     match what {
         Some(what) => format!(
-            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({said}); the first of {name} \
-             ({code}): {what}\n"
+            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({said}{fields}); the first of \
+             {name} ({code}): {what}\n"
         ),
         None => format!(
-            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({said}); the first of {name} \
-             ({code})\n"
+            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({said}{fields}); the first of \
+             {name} ({code})\n"
         ),
     }
 }
 
-/// rt's `error` in [`detail_line`]: as it displays and as it debugs (its variant's fields), but
-/// the translator's refusal, whose display and fields can name the guest's functions and symbols,
-/// as structure alone: the feature it refused and what it needs (their variants' fields) and the
-/// attachment it is tied to, else its error's variant
-/// ([`refusal_name`](super::diag::refusal_name)).
-fn said(error: &rt::Error) -> String {
-    use metal2vulkan::error::Error as Translator;
-    match error {
-        rt::Error::Translation(Translator::Unsupported(u)) => {
-            let at = (u.location.as_ref()).and_then(|l| l.attachment());
-            let at = at.map_or(String::new(), |a| format!(", at the {a}"));
-            format!(
-                "the translator refused the feature {:?}, needing {:?}{at}",
-                u.feature, u.needs
-            )
+/// rt's `error` as structure alone ([`Said`]), for a line or an `NSError` that names it, which
+/// may name an error of any kind.
+pub fn said(error: &rt::Error) -> Said<'_> {
+    Said(error)
+}
+
+/// rt's error as [`said`] gives it: as it displays, but the translator's refusal, whose display
+/// and fields can name the guest's functions, symbols and libraries, as the feature it refused and
+/// what it needs (their variants' fields, the translator's enums and numbers) and the attachment
+/// it is tied to, else as a refusal of the translator's alone. rt's other errors name nothing of
+/// the guest's: their fields are rt's own enums and numbers, a Vulkan call and its result, and the
+/// host's own I/O and loader errors.
+pub struct Said<'a>(&'a rt::Error);
+
+impl std::fmt::Display for Said<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use metal2vulkan::error::Error as Translator;
+        match self.0 {
+            rt::Error::Translation(Translator::Unsupported(u)) => {
+                write!(
+                    f,
+                    "the translator refused the feature {:?}, needing {:?}",
+                    u.feature, u.needs
+                )?;
+                match (u.location.as_ref()).and_then(|l| l.attachment()) {
+                    Some(at) => write!(f, ", at the {at}"),
+                    None => Ok(()),
+                }
+            }
+            rt::Error::Translation(_) => f.write_str("the translator refused it"),
+            error => write!(f, "{error}"),
         }
-        rt::Error::Translation(_) => "the translator refused it".to_owned(),
-        _ => format!("{error}; {error:?}"),
     }
 }
 
@@ -572,10 +592,10 @@ fn metal_places(error: &rt::Error) -> bool {
 }
 
 /// [`rt_refused_create`] of a creator with an `error:` out-parameter: the `NSError` it answers, in
-/// [`RT_DOMAIN`], code 0, naming rt's error and its kind's code.
+/// [`RT_DOMAIN`], code 0, naming rt's error as [`said`] gives it and its kind's code.
 pub fn rt_refused_error(sel: &'static str, error: &rt::Error) -> NsErrorText {
     let kind = rt_refused_create(sel, error);
-    rt_error(kind, error)
+    rt_error(kind, &said(error))
 }
 
 /// [`refused_as`] of a creator with an `error:` out-parameter, noted for core as a gap of the
@@ -905,6 +925,90 @@ mod tests {
             "reims-vgpu: newRenderPipelineStateWithDescriptor:error:: metal2vulkan-runtime refused \
              it (the translator refused it); the first of Translation-Cancelled \
              (rt-refused-translation)\n"
+        );
+    }
+
+    /// No line the library writes of the translator's refusals, nor the `NSError` a creator
+    /// answers of one, names what the guest named: refusals whose display names a function, a
+    /// symbol and an entry point (`secret_fn`, a name of our own) write the first line of their
+    /// kind, the first line of each name and an `NSError` each, which give the refusal as
+    /// structure alone (in a child, whose stderr is its own)
+    #[test]
+    fn no_line_of_a_translator_refusal_names_the_guest_s_function() {
+        use crate::core::testkit::death::{Expect, Options, Outcome, run};
+        use metal2vulkan::error::{DescriptorError, DiagName, Error as Translator, Feature};
+        use metal2vulkan::error::{Location, LowerFamily, RuntimeInput, Unsupported};
+        const SECRET: &str = "secret_fn";
+        let refusals = || {
+            let at = Location::function(DiagName::new(SECRET), Some(3), Some(9));
+            let lowering = Unsupported::not_implemented(Feature::Lowering(LowerFamily::Texture))
+                .at(at)
+                .naming(DiagName::new(SECRET));
+            [
+                Translator::Unsupported(lowering),
+                Translator::InvalidDescriptor(DescriptorError::EntryNotFound {
+                    requested: DiagName::new(SECRET),
+                    available: 2,
+                }),
+                Translator::NeedsInput(RuntimeInput::LinkedFunction {
+                    symbol: DiagName::new(SECRET),
+                }),
+            ]
+            .map(rt::Error::Translation)
+        };
+        for error in refusals() {
+            assert!(error.to_string().contains(SECRET), "{error}");
+        }
+        run(
+            Expect::Any,
+            Options::default(),
+            module_path!(),
+            "no_line_of_a_translator_refusal_names_the_guest_s_function",
+            |_| {
+                for error in refusals() {
+                    rt_refused("newRenderPipelineStateWithDescriptor:error:", &error);
+                    let sel = "newComputePipelineStateWithFunction:error:";
+                    let answered = rt_refused_error(sel, &error);
+                    say(&format!("test: NSError: {}\n", answered.description));
+                }
+            },
+            |r| {
+                assert_eq!(r.outcome(), &Outcome::Returned, "{}", r.stderr());
+                let out = r.stderr();
+                let lines: Vec<&str> = out.lines().collect();
+                assert!(
+                    lines.contains(
+                        &"reims-vgpu: newRenderPipelineStateWithDescriptor:error:: \
+                          metal2vulkan-runtime refused it (the translator refused the feature \
+                          Lowering(Texture), needing NotImplemented); refused \
+                          (rt-refused-translation), the first of its kind"
+                    ),
+                    "{out}"
+                );
+                for name in ["Lowering", "InvalidDescriptor", "NeedsInput"] {
+                    let first = format!("the first of Translation-{name} (rt-refused-translation)");
+                    assert!(lines.iter().any(|l| l.ends_with(&first)), "{first}: {out}");
+                }
+                let answered = |said: &str| {
+                    format!(
+                        "test: NSError: metal2vulkan-runtime refused it: {said} \
+                         (rt-refused-translation)"
+                    )
+                };
+                let lowering = "the translator refused the feature Lowering(Texture), needing \
+                                NotImplemented";
+                let answers = [
+                    lowering,
+                    "the translator refused it",
+                    "the translator refused it",
+                ]
+                .map(answered);
+                let said: Vec<&str> = (lines.iter().copied())
+                    .filter(|l| l.starts_with("test: NSError: "))
+                    .collect();
+                assert_eq!(said, answers, "{out}");
+                assert!(!out.contains(SECRET), "{out}");
+            },
         );
     }
 
