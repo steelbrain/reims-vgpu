@@ -30,8 +30,16 @@
 //! shares the CPU's memory it keeps no copy, so a pin lies at its bytes, as a Shared one's does.
 //! Any other pinned buffer is made as an unpinned one, at rt's address, which the guest observes as
 //! a `gpuAddress` other than the one it pinned: counted ([`UNPINNED_CODE`]), the process's first
-//! with a line. A no-copy buffer's bytes that a known Shared block maps are a range of that block,
-//! with no import of their own: a Managed buffer's in a slab of the pool or in a pages block's
+//! with a line. A known block is found by its address alone, so a pin the guest picks in its
+//! context's range, `[2^46, 2^47)` (reims-vgpu-graphics' `RGFX_CONTEXT_VA_BASE`), lies in no known
+//! block only while no device address of the driver's lies there. None did on any device measured
+//! (2026-11-20, a 64 MiB Shared buffer's): RADV's on the Radeon 780M lie in the upper canonical
+//! half (`0xffff8001_03400000`) and on the RX 550 below 2^46 (`0x1_0340_0000`), Intel's Windows
+//! driver's on the UHD 630 in the upper half (`0xffffb802_03a80000`), and those on the RTX 3090
+//! (NVIDIA) and the Iris Xe (ANV) below 2^46. reims-vgpu's test
+//! `on_vulkan_the_host_s_own_ranges_lie_outside_every_unit` checks it on each device it runs on.
+//! A no-copy buffer's bytes that a known Shared block maps are a range of that block, with no
+//! import of their own: a Managed buffer's in a slab of the pool or in a pages block's
 //! view, and those of a buffer whose pin no known block keeps, which then lies at the block's
 //! address plus their offset.
 //!

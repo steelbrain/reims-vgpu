@@ -8613,7 +8613,7 @@ mod tests {
     /// platform. Its device is the process's, and so are its addresses: under `cargo test`, whose
     /// tests share one process, `on_vulkan_a_pin_meets_no_range_of_a_texture_buffer`'s pin was
     /// refused in 4 of 20 one-process runs of `graphics::decode` (measured on the M3 Max), where
-    /// `on_vulkan_the_host_s_own_ranges_lie_below_every_unit`'s pin at the range's base, 96 KiB,
+    /// `on_vulkan_the_host_s_own_ranges_lie_outside_every_unit`'s pin at the range's base, 96 KiB,
     /// covers its address.
     static CONTEXT_RANGE_PINS: Mutex<()> = Mutex::new(());
 
@@ -8780,12 +8780,14 @@ mod tests {
         ]);
     }
 
-    /// The host's own ranges lie below the guest's GPU addresses: a buffer the host places
-    /// itself lies below them, and, with it, a queue's range made and a texture buffer refused,
-    /// the first pick of every unit the kext hands the contexts out in and the last unit's last pick
-    /// are made.
+    /// The host's own ranges lie outside the guest's GPU addresses: a buffer the host places
+    /// itself meets none of `[RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_END)`, and, with it, a queue's
+    /// range made and a texture buffer refused, the first pick of every unit the kext hands the
+    /// contexts out in and the last unit's last pick are made. On rt the buffer lies at the
+    /// driver's device address, below the range on some drivers and above its end on others
+    /// (`reims_vgpu_vulkan::rt_platform::buffer`, "A pinned address").
     #[test]
-    fn on_vulkan_the_host_s_own_ranges_lie_below_every_unit() {
+    fn on_vulkan_the_host_s_own_ranges_lie_outside_every_unit() {
         use reims_vgpu_graphics::wire::{
             RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_END, RGFX_CONTEXT_VA_UNIT, RGFX_CONTEXT_VA_UNITS,
         };
@@ -8798,7 +8800,12 @@ mod tests {
         let Some(ObjHandle::Buffer(buffer)) = dec.object(11) else {
             panic!("no buffer 11");
         };
-        assert!(buffer.gpu_address() < RGFX_CONTEXT_VA_BASE);
+        let (at, end) = (buffer.gpu_address(), buffer.gpu_address() + buffer.length());
+        assert!(
+            end <= RGFX_CONTEXT_VA_BASE || at >= RGFX_CONTEXT_VA_END,
+            "the host's buffer at {at:#x}..{end:#x} meets the contexts' range \
+             {RGFX_CONTEXT_VA_BASE:#x}..{RGFX_CONTEXT_VA_END:#x}"
+        );
         // A pick of 64 KiB holds 96 KiB: its four pages, the guard page, rounded up to 32 KiB.
         let units = u64::from(RGFX_CONTEXT_VA_UNITS);
         let last = RGFX_CONTEXT_VA_END - 0x1_8000;
