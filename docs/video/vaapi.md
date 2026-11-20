@@ -327,9 +327,14 @@ strips of the frame's rows ("What udmabuf takes", below): each strip an
 even number of rows, a linear VA surface over one dma-buf of its luma and
 chroma rows, at the caller's own offsets and pitches (`DRM_PRIME_2`, one
 object of two planes, `DRM_FORMAT_MOD_LINEAR`), as the import check
-imports its memory. The strips share one video-processing context, and
-the import is kept by the mapping's identity until the mapping goes (at
-most 96 at once, `MOST_IMPORTS`, the one used longest ago dropped first).
+imports its memory. The import is kept by the mapping's identity until the
+mapping goes (at most 96 at once, `MOST_IMPORTS`, the one used longest ago
+dropped first), and runs on its frame size's video-processing context, made
+on no surface with the size's first import and destroyed with its last: every
+import of a size shares it, as a driver's first run on a new context costs a
+few milliseconds (5.3 ms at the median on the Radeon 780M, Mesa 26.2.6,
+2026-11-19, against 94 us on a shared one), and a guest's decoder makes new
+buffers for each stream. One import's runs are issued on it at a time.
 Each frame is then one run a strip, from the decode surface's rows into
 the strip, BT.709 on both sides as the staged run's, a wait for the runs'
 writes ("The driver's lock", below), and their syncs.

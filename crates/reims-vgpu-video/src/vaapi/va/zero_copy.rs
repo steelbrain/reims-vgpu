@@ -20,9 +20,17 @@
 //! its chroma plane whole rows after it ([`ImportWrite::whole_rows`]), each
 //! strip but the last is a multiple of the rows after which a luma row
 //! starts a page again, so that every strip's luma plane starts its dma-buf
-//! as the buffer's first does. They share one video-processing context, and
-//! are kept by the mapping's identity in core's [`DeviceImports`] until the
-//! mapping goes.
+//! as the buffer's first does. The import is kept by the mapping's identity
+//! in core's [`DeviceImports`] until the mapping goes, and runs on the one
+//! video-processing context of its frame's size ([`Contexts`]), which every
+//! import of the size shares: made with the size's first import, and
+//! destroyed with its last. A driver's first run on a context costs it a few
+//! milliseconds its later runs do not, and a guest's decoder makes a new pool
+//! of buffers for each stream: measured on the Radeon 780M (radeonsi, Mesa
+//! 26.2.6, 2026-11-19, the start of three streams in Safari), a new import's
+//! first run was issued in 5.3 ms at the median on a context of its own, 43
+//! of them, against 94 us on its size's shared one; later runs took 81 and
+//! 88 us.
 //! Each frame is then one run a strip, from the decode surface's rows into
 //! it, and their syncs: the staged copy back's run, into the guest's pages
 //! instead of ours. The runs are issued right behind the frame's decode,
@@ -66,7 +74,7 @@
 
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::core::backend::DeviceWrite;
 use crate::core::device_memory::{DeviceImports, GuestTarget, TargetPlane};
@@ -86,8 +94,7 @@ use super::wait::{self, Work};
 
 /// The most imports a backend keeps at once: a guest's decoders use a few
 /// pools of 10 to 30 buffers each, and each import is a VA surface a strip
-/// and a context (core's [`DeviceImports`] drops the one used longest ago
-/// past it).
+/// (core's [`DeviceImports`] drops the one used longest ago past it).
 const MOST_IMPORTS: usize = 96;
 
 /// The most strips one buffer is imported in: an 8192x4352 P010 buffer, the
@@ -97,6 +104,61 @@ const MOST_STRIPS: usize = 64;
 /// A backend's imports of guest buffers, shared by its sessions.
 pub(crate) struct GuestImports {
     imports: DeviceImports<GuestImport, Variant>,
+    contexts: Contexts,
+}
+
+/// The video-processing contexts a backend's imports run on, one a frame size
+/// (module docs): each import holds its size's, and this table none, so a
+/// context goes with the last import of its size, and holds nothing past
+/// them.
+#[derive(Default)]
+struct Contexts(Mutex<Vec<((u32, u32), Weak<SharedContext>)>>);
+
+impl Contexts {
+    /// The context of frames of `size`: the one its imports hold, or a new one
+    /// where none holds one.
+    fn of(&self, display: &Display, size: (u32, u32)) -> Result<Arc<SharedContext>, Error> {
+        let mut contexts = self.0.lock();
+        contexts.retain(|(_, context)| context.strong_count() > 0);
+        let held = (contexts.iter())
+            .find(|(of, _)| *of == size)
+            .and_then(|(_, context)| context.upgrade());
+        if let Some(context) = held {
+            return Ok(context);
+        }
+        let context = Arc::new(SharedContext::new(display, size)?);
+        contexts.push((size, Arc::downgrade(&context)));
+        Ok(context)
+    }
+
+    /// How many contexts imports hold.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        (self.0.lock().iter())
+            .filter(|(_, context)| context.strong_count() > 0)
+            .count()
+    }
+}
+
+/// A video-processing context on no surface, which runs into any import of its
+/// frame size.
+struct SharedContext {
+    context: Context,
+    /// One import's runs issued at a time: a context takes one picture at a
+    /// time, and the imports sharing it may run at once.
+    issue: Mutex<()>,
+}
+
+impl SharedContext {
+    /// A context for frames of `size`.
+    fn new(display: &Display, (width, height): (u32, u32)) -> Result<Self, Error> {
+        let context = Config::new(display, Profile::NONE, Entrypoint::VIDEO_PROC, &mut [])
+            .and_then(|config| Context::new(display, config, width, height, &mut []))?;
+        Ok(Self {
+            context,
+            issue: Mutex::new(()),
+        })
+    }
 }
 
 /// What a buffer's import is made for besides its mapping: the frame's size
@@ -131,16 +193,18 @@ impl Variant {
 pub(crate) fn imports(display: &Display) -> Arc<GuestImports> {
     Arc::new(GuestImports {
         imports: DeviceImports::new(display.runtime(), "vaapi", MOST_IMPORTS),
+        contexts: Contexts::default(),
     })
 }
 
 /// A guest buffer imported for frames of one size and format: its rows in
-/// strips, each a linear VA surface over a dma-buf of them, and a
-/// video-processing context on them.
+/// strips, each a linear VA surface over a dma-buf of them, and the
+/// video-processing context it runs on.
 pub(crate) struct GuestImport {
     display: Display,
-    /// Destroyed before the surfaces.
-    context: Option<Context>,
+    /// Its size's ([`Contexts`]), or its own (the import check's); let go
+    /// before the surfaces.
+    context: Option<Arc<SharedContext>>,
     /// Top to bottom.
     strips: Vec<Strip>,
     /// One run at a time into it: a guest may lend one buffer to two
@@ -163,8 +227,8 @@ struct Strip {
 impl Drop for GuestImport {
     fn drop(&mut self) {
         self.context.take();
-        // Their context is gone, and no run into them is left, as every user
-        // holds this import.
+        // No run into them is left, as every user holds this import. The
+        // context, where other imports still hold it, may outlive them.
         destroy(&self.display, &self.strips);
     }
 }
@@ -254,7 +318,18 @@ pub(crate) fn write(
     let import = match imports.imports.get_or_make(
         &memory.identity(),
         Variant::of(target, format, (width, height)),
-        || GuestImport::new(display, target, format, (width, height), write, None),
+        || {
+            let contexts = Some(&imports.contexts);
+            GuestImport::new(
+                display,
+                target,
+                format,
+                (width, height),
+                write,
+                None,
+                contexts,
+            )
+        },
         || "the buffer's mapping went while it was held".to_owned(),
     ) {
         Ok(import) => import,
@@ -294,8 +369,9 @@ pub(crate) fn write(
 impl GuestImport {
     /// `target`'s buffer imported for `format` frames of `size`, as `write`
     /// says the driver takes it, in as few strips as udmabuf's limits allow
-    /// (or in `forced`, a test's), with a context on them; `Err` says why
-    /// not, for the log.
+    /// (or in `forced`, a test's), running on its size's context of
+    /// `contexts`, or, without them, on a context of its own made as those
+    /// are (the import check's); `Err` says why not, for the log.
     fn new(
         display: &Display,
         target: &GuestTarget<'_>,
@@ -303,6 +379,7 @@ impl GuestImport {
         (width, height): (u32, u32),
         write: ImportWrite,
         forced: Option<usize>,
+        contexts: Option<&Contexts>,
     ) -> Result<Self, String> {
         let mut count = forced.unwrap_or(1);
         let strips = loop {
@@ -340,9 +417,10 @@ impl GuestImport {
                 }
             }
         };
-        let mut surfaces: Vec<ffi::VASurfaceID> = strips.iter().map(|s| s.surface).collect();
-        let made = Config::new(display, Profile::NONE, Entrypoint::VIDEO_PROC, &mut [])
-            .and_then(|config| Context::new(display, config, width, height, &mut surfaces));
+        let made = match contexts {
+            Some(contexts) => contexts.of(display, (width, height)),
+            None => SharedContext::new(display, (width, height)).map(Arc::new),
+        };
         let context = match made {
             Ok(made) => made,
             Err(error) => {
@@ -390,10 +468,12 @@ impl GuestImport {
         deadline: MonoTime,
         between: impl FnOnce(),
     ) -> Result<(), Error> {
-        let Some(context) = &self.context else {
+        let Some(shared) = &self.context else {
             return Err(Error::Unsupported("an import with no context".into()));
         };
+        let context = &shared.context;
         let _running = self.running.lock();
+        let issue = shared.issue.lock();
         for strip in &self.strips {
             let (Some(top), Ok(rows)) = (
                 i16::try_from(strip.top)
@@ -432,6 +512,7 @@ impl GuestImport {
             )?;
             super::buffer::render_picture(&self.display, context.id, strip.surface, &[&[&buffer]])?;
         }
+        drop(issue);
         between();
         // The runs' fences, waited for with no lock of the driver's held,
         // so that the display's other calls go on meanwhile (`fence.rs`).
@@ -466,7 +547,15 @@ pub(crate) fn trial(
 ) -> Result<(), String> {
     let (width, height) = (target.width(), target.height());
     let format = source.format();
-    let import = GuestImport::new(display, target, format, (width, height), write, strips)?;
+    let import = GuestImport::new(
+        display,
+        target,
+        format,
+        (width, height),
+        write,
+        strips,
+        None,
+    )?;
     let Ok(columns) = u16::try_from(width) else {
         return Err("a trial too wide for a video-processing region".to_owned());
     };
@@ -916,5 +1005,155 @@ mod tests {
             "no decode was still running as its runs were issued"
         );
         eprintln!("{written} pictures written, {running} of them behind a decode still running");
+    }
+
+    /// The imports of one frame size run on one context, made on no surface,
+    /// which goes with the last of them, and another size's on another: each
+    /// import's run writes what its frame decoded, a new context's after the
+    /// old one went as well.
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "needs a VA-API driver that decodes H.264 at 4K, on its GPU: run on a VA-API host"]
+    fn the_imports_of_a_size_share_a_context_that_goes_with_the_last() {
+        use super::super::frame::PlaneRows;
+        use super::super::import_check::TrialMemory;
+        use super::super::teardown::{SIZE, Stream, display};
+        use crate::core::fourcc::FourCc;
+        use crate::core::surfaces::{PlaneLayout, SurfaceLayout};
+
+        let display = display();
+        let stream = Stream::new(&display);
+        let mut decoder = stream.decoder(&display);
+        let mut frames = Vec::new();
+        for (id, sample) in stream.samples.iter().enumerate() {
+            frames = decoder
+                .decode(sample, u64::try_from(id).expect("an id"))
+                .expect("a decode");
+            if !frames.is_empty() {
+                break;
+            }
+        }
+        let frame = frames.first().expect("a decoded frame");
+        let format = frame.surface.format();
+        let write = display.writes_imports(format).expect("imports written");
+        // The frame's samples, read back by the CPU: rows of the frame's width.
+        let (width, height) = (SIZE.0 as usize, SIZE.1 as usize);
+        let mut luma = vec![0; width * height];
+        let mut chroma = vec![0; width * height / 2];
+        (frame.read_back().expect("a read back"))
+            .copy_into(
+                PlaneRows {
+                    bytes: &mut luma,
+                    bytes_per_row: width,
+                    rows: height,
+                    row_bytes: width,
+                },
+                PlaneRows {
+                    bytes: &mut chroma,
+                    bytes_per_row: width,
+                    rows: height / 2,
+                    row_bytes: width,
+                },
+            )
+            .expect("the CPU's copy");
+        // Buffers of rows of 3840 bytes, a multiple of every alignment a
+        // driver's imports take, their chroma plane at a page, whole rows after
+        // the luma: of the frame's size, or of 2048x1152 from its first sample.
+        let pitch = width;
+        let buffer = |(w, h): (u32, u32)| {
+            let chroma_at = pitch * h as usize;
+            let plane = |offset: usize, w: u32, h: u32| PlaneLayout {
+                offset,
+                bytes_per_row: pitch,
+                width: w,
+                height: h,
+            };
+            let layout = SurfaceLayout {
+                pixel_format: FourCc::new(*b"420v"),
+                width: w,
+                height: h,
+                planes: vec![plane(0, w, h), plane(chroma_at, w / 2, h / 2)],
+                bytes_per_row: 0,
+            };
+            let size = (chroma_at + pitch * h as usize / 2).next_multiple_of(PAGE);
+            (layout, TrialMemory::new(size).expect("a buffer's memory"))
+        };
+        let contexts = Contexts::default();
+        let import = |(layout, memory): &(SurfaceLayout, TrialMemory)| {
+            let target = GuestTarget::new(layout, memory).expect("a target");
+            let size = (layout.width, layout.height);
+            GuestImport::new(
+                &display,
+                &target,
+                format,
+                size,
+                write,
+                None,
+                Some(&contexts),
+            )
+            .expect("an import")
+        };
+        // Its run from the frame's first sample, and its bytes against the
+        // read back's.
+        let check = |what: &str,
+                     import: &GuestImport,
+                     (layout, memory): &(SurfaceLayout, TrialMemory)| {
+            memory.memory.lock().bytes_mut().fill(0xa5);
+            let (x, y) = (
+                i16::try_from(frame.rect.x).expect("x"),
+                i16::try_from(frame.rect.y).expect("y"),
+            );
+            let columns = u16::try_from(layout.width).expect("columns");
+            let deadline = wait::deadline(&display);
+            (import.run(frame.surface.id(), x, y, columns, deadline, || {}))
+                .unwrap_or_else(|error| panic!("{what}: the run: {error}"));
+            let (w, h) = (layout.width as usize, layout.height as usize);
+            let chroma_at = pitch * h;
+            let held = memory.memory.lock();
+            let bytes = held.bytes();
+            let first = (0..h)
+                .flat_map(|row| (0..w).map(move |column| (row, column)))
+                .find(|&(row, column)| bytes[row * pitch + column] != luma[row * width + column])
+                .map(|at| ("luma", at))
+                .or_else(|| {
+                    (0..h / 2)
+                        .flat_map(|row| (0..w).map(move |column| (row, column)))
+                        .find(|&(row, column)| {
+                            bytes[chroma_at + row * pitch + column] != chroma[row * width + column]
+                        })
+                        .map(|at| ("chroma", at))
+                });
+            assert_eq!(
+                first, None,
+                "{what}: the run's byte differs from the read back's"
+            );
+        };
+        let (a, b, c) = (buffer(SIZE), buffer(SIZE), buffer((2048, 1152)));
+        let (ia, ib) = (import(&a), import(&b));
+        let shared = |one: &GuestImport, other: &GuestImport| {
+            Arc::ptr_eq(
+                one.context.as_ref().expect("a context"),
+                other.context.as_ref().expect("a context"),
+            )
+        };
+        assert!(shared(&ia, &ib), "two imports of a size share its context");
+        assert_eq!(contexts.held(), 1);
+        let ic = import(&c);
+        assert!(!shared(&ia, &ic), "another size runs on another context");
+        assert_eq!(contexts.held(), 2);
+        check("the first import", &ia, &a);
+        check("the second import of its size", &ib, &b);
+        check("the other size's import", &ic, &c);
+        drop(ia);
+        assert_eq!(contexts.held(), 2, "an import of the size still holds it");
+        drop(ib);
+        assert_eq!(
+            contexts.held(),
+            1,
+            "the size's context went with its last import"
+        );
+        let again = import(&a);
+        assert_eq!(contexts.held(), 2);
+        check("an import on the size's new context", &again, &a);
     }
 }
