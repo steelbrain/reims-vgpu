@@ -130,6 +130,10 @@ pub(crate) fn gpu_name(device: &VulkanDevice) -> String {
 }
 
 /// A render node sysfs lists.
+#[cfg_attr(
+    not(feature = "rt"),
+    expect(dead_code, reason = "its path and IDs are the rt platform's check's")
+)]
 struct RenderNode {
     /// Its major and minor numbers (`/sys/class/drm/renderD128/dev` reads `226:128`).
     numbers: (u32, u32),
