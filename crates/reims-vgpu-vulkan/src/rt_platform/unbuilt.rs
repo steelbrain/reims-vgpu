@@ -12,7 +12,7 @@
 //! A call of a built piece that rt refuses (its `Error`: a limit, a refusal of Metal's, a known
 //! gap, a failed Vulkan call) answers the same way, counted under the error's kind,
 //! `rt-refused-<kind>` ([`RtRefusal::code`]), its first line naming the call and rt's error. The
-//! first of each of rt's kinds by its name in the boot diagnostics (`Draw-Points`,
+//! first of each of rt's kinds by its name in the boot diagnostics (`Draw-AttachmentRead`,
 //! `TextureCopy`, `RenderPass`, `Limit-TextureSamples`), whichever count it goes to, writes a line
 //! of its own too: rt's error as it displays and as it debugs, which carries the gap's fields, and
 //! what the call asked of rt where its site names it, as structure alone: a texture's descriptor,
@@ -351,8 +351,8 @@ fn diagnosed(sel: &'static str, error: &rt::Error) {
 }
 
 /// Writes on stderr the process's first line of each kind of rt's refusals by its name in the
-/// boot diagnostics (`super::diag::refusal_name`: `Draw-Points`, `TextureCopy`, `RenderPass`,
-/// `Limit-TextureSamples`), which the line of the first of its [`RtRefusal`] kind
+/// boot diagnostics (`super::diag::refusal_name`: `Draw-AttachmentRead`, `TextureCopy`,
+/// `RenderPass`, `Limit-TextureSamples`), which the line of the first of its [`RtRefusal`] kind
 /// ([`refused_as`]) leaves out past that kind's first: [`detail_line`] of the call `sel`, rt's
 /// `error` and `what`, what the call asked of rt that rt's error does not name, as structure
 /// alone (a texture's descriptor; a copy's kind, textures, places and buffer layout; a pass's
@@ -825,19 +825,19 @@ mod tests {
             format!("{samples:?}").contains("sample_count: 4"),
             "{samples:?}"
         );
-        let points = rt::Error::Unsupported(rt::Gap::Draw {
-            kind: rt::DrawKind::Points,
+        let clamp = rt::Error::Unsupported(rt::Gap::Draw {
+            kind: rt::DrawKind::DepthBiasClamp,
         });
         assert_eq!(
             detail_line(
                 "drawPrimitives:vertexStart:vertexCount:",
-                &points,
-                "Draw-Points",
+                &clamp,
+                "Draw-DepthBiasClamp",
                 None
             ),
             "reims-vgpu: drawPrimitives:vertexStart:vertexCount:: metal2vulkan-runtime refused it \
-             (a draw with Points is not built; Unsupported(Draw { kind: Points })); the first of \
-             Draw-Points (rt-refused-gap)\n"
+             (a draw with DepthBiasClamp is not built; Unsupported(Draw { kind: DepthBiasClamp \
+             })); the first of Draw-DepthBiasClamp (rt-refused-gap)\n"
         );
         let format = rt::Error::Unsupported(rt::Gap::TextureFormat {
             pixel_format: rt::PixelFormat::BGRA8Unorm,
