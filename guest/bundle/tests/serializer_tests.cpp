@@ -4934,14 +4934,14 @@ void test_file_pages_classify()
 	CHECK(held.clause == kRgfxFileNeither && held.why == kRgfxNeitherNotAFile);
 	mach_port_deallocate(mach_task_self(), entry);
 	CHECK(pageAt(anon).ref_count == 1 && soleHolder());
-	mach_vm_address_t second = 0;
-	vm_prot_t secondCur = VM_PROT_NONE, secondMax = VM_PROT_NONE;
-	CHECK(mach_vm_remap(mach_task_self(), &second, mapped, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
-	                    reinterpret_cast<uintptr_t>(anon), false, &secondCur, &secondMax,
+	mach_vm_address_t remapped = 0;
+	vm_prot_t remapCur = VM_PROT_NONE, remapMax = VM_PROT_NONE;
+	CHECK(mach_vm_remap(mach_task_self(), &remapped, mapped, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
+	                    reinterpret_cast<uintptr_t>(anon), false, &remapCur, &remapMax,
 	                    VM_INHERIT_NONE) == KERN_SUCCESS);
-	CHECK((secondMax & VM_PROT_WRITE) == 0 && pageAt(anon).ref_count == 2);
+	CHECK((remapMax & VM_PROT_WRITE) == 0 && pageAt(anon).ref_count == 2);
 	CHECK(rgfxFilePagesOf(anon + into, length, true).clause == kRgfxFileNeither);
-	mach_vm_deallocate(mach_task_self(), second, mapped);
+	mach_vm_deallocate(mach_task_self(), remapped, mapped);
 	CHECK(pageAt(anon).ref_count == 1 && soleHolder());
 	// Asked for its regions' footprint: a count of 1 with an id of none of its objects, neither.
 	int footprint = 1;
