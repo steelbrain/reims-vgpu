@@ -305,16 +305,17 @@
 //!   flight never shares one. A copy whose takes leave no whole piece among the spares hands a
 //!   top-up to a thread of theirs ([`SPARES_THREADS`]), which nothing waits for: it makes whole
 //!   pieces until the spares hold [`SPARE_BYTES`] of them, letting go of shorter ones to fit,
-//!   each make under the device's reset gate. A use's fill, at once or deferred, and a release's
-//!   copy out find their pieces made ahead: where the spares and the pieces reserved for the
-//!   block lack some a copy of all of the bytes it may move would take
-//!   ([`SurfaceCaches::lacking`]), they are made with no lock of the caches' held and reserved
-//!   for the block ([`SurfaceCaches::reserved`]): a fill's by the thread that begins the use's
-//!   command buffer, the lock let go of once for them ([`Caches::before_answering`]); a
-//!   release's on the releases' pace's thread ([`ReleasePace`]) before the release is carried
-//!   out, so ring 0 waits for no make either. The copy takes them first, and the spares take
-//!   back on their thread what it leaves. Any other copy that finds no spare still makes its
-//!   piece on its own thread, under the caches' lock, counted (`rt-staging-piece-makes-locked`).
+//!   each make under the device's reset gate. A use's fill, at once or deferred, a present's fill
+//!   and a release's copy out find their pieces made ahead: where the spares and the pieces
+//!   reserved for the block lack some a copy of all of the bytes it may move would take
+//!   ([`SurfaceCaches::lacking`]), they are made with no lock of the caches' held and reserved for
+//!   the block ([`SurfaceCaches::reserved`]): a fill's by the thread that begins the use's command
+//!   buffer, the lock let go of once for them ([`Caches::before_answering`]), or by the present's
+//!   for its fill ([`Caches::fill_now`]); a release's on the releases' pace's thread
+//!   ([`ReleasePace`]) before the release is carried out, so ring 0 waits for no make either. The
+//!   copy takes them first, and the spares take back on their thread what it leaves. Any other copy
+//!   that finds no spare still makes its piece on its own thread, under the caches' lock, counted
+//!   (`rt-staging-piece-makes-locked`).
 //!   Each piece taken is counted (`rt-staging-pieces`, and
 //!   `rt-staging-pieces-spared` those a spare served), and each a copy made, with the
 //!   nanoseconds its make took in all and the longest, for a cache's first staged copy
@@ -3042,9 +3043,7 @@ impl<P: Platform> SurfaceCaches<P> {
     /// host wrote its pages since; or one of its shapes ([`Self::owes_shape_fill`]). False for a
     /// block with no cache.
     fn needs_fill_at(&self, block: u64, generation: u64) -> bool {
-        self.will_hold(block).is_some_and(|(held, host)| {
-            held.is_none_or(|held| generation > held) || self.watched.writes(block) > host
-        }) || self.owes_shape_fill(block)
+        self.fills_at(block, generation) || self.owes_shape_fill(block)
     }
 
     /// Whether a shape of the block at `block`'s cache holds a write the buffer lacks, or will
@@ -3071,13 +3070,19 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// Whether the use `u` fills its block's cache from its pages as its command buffer begins,
-    /// at once or deferred ([`Self::before_one`]): the cache holds an older generation, a device
-    /// of the host's wrote the pages since its last fill, or the use asks a refill that is made.
+    /// at once or deferred ([`Self::before_one`]): [`Self::fills_at`] its generation, or the use
+    /// asks a refill that is made.
     fn fills(&self, u: &RgfxOpSurfaceUse) -> bool {
-        let block = u.block_offset;
+        self.fills_at(u.block_offset, u.cpu_gen) || self.refill(u) == Refill::Fill
+    }
+
+    /// Whether a need of the block at `block`'s cache at `generation` fills it from its pages:
+    /// the cache holds an older generation, or a device of the host's wrote the pages since its
+    /// last fill. Not a fill of its shapes alone ([`Self::needs_fill_at`]).
+    fn fills_at(&self, block: u64, generation: u64) -> bool {
         self.will_hold(block).is_some_and(|(held, host)| {
-            held.is_none_or(|held| u.cpu_gen > held) || self.watched.writes(block) > host
-        }) || self.refill(u) == Refill::Fill
+            held.is_none_or(|held| generation > held) || self.watched.writes(block) > host
+        })
     }
 
     /// Whether the use `u` needs a fill of its block's cache first: [`Self::needs_fill_at`] of its
@@ -6176,20 +6181,7 @@ impl<P: Platform> Caches<P> {
                 Some((u.block_offset, lens, first))
             })
             .collect();
-        if !lacking.is_empty() {
-            let (spares, timed) = (Arc::clone(&state.spares), state.staged.clone());
-            drop(state);
-            let made: Vec<(u64, Vec<P::Buffer>)> = (lacking.into_iter())
-                .filter_map(|(block, lens, first)| {
-                    let pieces = spares.pieces(device, &lens, first, timed.as_ref());
-                    pieces.ok().flatten().map(|pieces| (block, pieces))
-                })
-                .collect();
-            state = self.state.lock();
-            for (block, pieces) in made {
-                state.reserved.entry(block).or_default().extend(pieces);
-            }
-        }
+        reserve_unlocked(&mut state, device, lacking);
         let mut spare = Vec::new();
         let mut no_event = HashSet::new();
         let mut waited = false;
@@ -6406,6 +6398,16 @@ impl<P: Platform> Caches<P> {
         state.touch_shapes(block);
         if !state.needs_fill_at(block, generation) {
             return Ok(None);
+        }
+        // The pieces its staged fill would make for want of a spare are made with the lock let
+        // go of, and reserved for the block (the module doc, "Staged copies").
+        if state.fills_at(block, generation)
+            && let Some((lens, first)) = state.lacking(block, Way::In)
+        {
+            reserve_unlocked(&mut state, device, vec![(block, lens, first)]);
+            if !state.needs_fill_at(block, generation) {
+                return Ok(None);
+            }
         }
         state.fill_now(device, block, generation)
     }
@@ -6877,6 +6879,32 @@ impl<P: Platform> Caches<P> {
 /// ([`SurfaceCaches::download`]), reading the CPU's generation in the block's header in `region`
 /// as it is made, `ran` first: `done` once the pages hold the cache, or `failed` where the
 /// platform raised.
+/// Makes the pieces each `(block, lens, first)` of `lacking` names ([`SurfaceCaches::lacking`])
+/// with the caches' lock, `state`, let go of, and reserves them for their blocks
+/// ([`SurfaceCaches::reserved`]), so no copy makes them under it (the module doc, "Staged
+/// copies"). Pieces the platform raises at are left to their copy, which raises.
+fn reserve_unlocked<P: Platform>(
+    state: &mut MutexGuard<'_, SurfaceCaches<P>>,
+    device: &P::Device,
+    lacking: Vec<(u64, Vec<u64>, bool)>,
+) {
+    if lacking.is_empty() {
+        return;
+    }
+    let (spares, timed) = (Arc::clone(&state.spares), state.staged.clone());
+    let made: Vec<(u64, Vec<P::Buffer>)> = MutexGuard::unlocked(state, || {
+        (lacking.into_iter())
+            .filter_map(|(block, lens, first)| {
+                let pieces = spares.pieces(device, &lens, first, timed.as_ref());
+                pieces.ok().flatten().map(|pieces| (block, pieces))
+            })
+            .collect()
+    });
+    for (block, pieces) in made {
+        state.reserved.entry(block).or_default().extend(pieces);
+    }
+}
+
 fn download_op<P: Platform>(
     device: &P::Device,
     block: u64,
@@ -15062,6 +15090,46 @@ pub(super) mod tests {
             "the CPU's bytes, in the piece reserved for the fill"
         );
         assert_eq!(counted(PIECE_MAKES_LOCKED), locked, "none made under the lock");
+    }
+
+    /// Where the caches' copies are staged, a present's fill that lacks pieces the spares do not
+    /// hold has them made with the caches' lock let go of, and reserved for its block: the fill
+    /// takes them, its CPU's bytes in them, and makes none under the lock ([`PIECE_MAKES_LOCKED`])
+    #[test]
+    fn a_staged_presents_fill_makes_its_pieces_with_the_caches_lock_let_go_of() {
+        let mut r = rig(8);
+        r.dec.set_staged_surface_copies(Arc::default());
+        queues(&mut r);
+        let page = r.page;
+        let length = 2 * page;
+        let written = ram_bytes(&r, 1, length, Some(0x2d));
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], length, true),
+            RGFX_STATUS_OK
+        );
+        let locked = counted(PIECE_MAKES_LOCKED);
+        let mark = r.p.call_log().mark();
+        let wait = (r.dec.surface_caches)
+            .fill_now(&r.device, BLOCK, 1)
+            .unwrap()
+            .expect("a wait for the fill");
+        let calls = r.p.call_log().since(mark);
+        let made: Vec<Option<u64>> = (calls.iter())
+            .filter(|c| c.sel == SCRATCH_BUFFER)
+            .map(|c| c.args[0].as_u64())
+            .collect();
+        let lens = pack(std::iter::once(0..length), PIECE).lens;
+        assert_eq!(made, lens.into_iter().map(Some).collect::<Vec<_>>(), "its piece made");
+        let filled = copies(&calls);
+        assert_eq!(filled.len(), 1);
+        assert_eq!(
+            buffer_bytes(&r, filled[0].0, None)[..written.len()],
+            written,
+            "the CPU's bytes, in the piece reserved for the fill"
+        );
+        assert_eq!(counted(PIECE_MAKES_LOCKED), locked, "none made under the lock");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(wait.done());
     }
 
     /// Where the caches' copies are staged, a release whose copy lacks pieces the spares do not
