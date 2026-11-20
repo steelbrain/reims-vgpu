@@ -288,15 +288,16 @@ missing=()
 # below). Homebrew's mesa builds KosmicKrisp on macOS 26 and later only (its
 # formula's vulkan-drivers are "kosmickrisp,swrast" from Tahoe on, "swrast"
 # before), so on an older macOS mesa is left out, and the install goes on
-# saying that VMs there get no GPU (mac_gpu_note). Nothing of ours loads
-# MoltenVK: rt's floor refuses it
+# saying that VMs there do not start: with no GPU device the library can use,
+# QEMU's reims-graphics-pci refuses its realize (mac_gpu_note). Nothing of
+# ours loads MoltenVK: rt's floor refuses it
 # (crates/reims-vgpu-vulkan/src/os/macos/rt_driver.rs), so it is not listed;
 # Homebrew's mesa depends on molten-vk itself, for its zink driver.
 MAC_GPU=1
 # mac_gpu_note: where this Mac's macOS is too old for KosmicKrisp, says so.
 mac_gpu_note() {
   [[ $MAC_GPU == 1 ]] ||
-    warn "VMs on this Mac get no GPU: reims-vgpu runs on Mesa's KosmicKrisp Vulkan driver, which needs macOS 26 or later, and this Mac runs macOS $(sw_vers -productVersion 2>/dev/null). reims-ctl and QEMU install anyway."
+    warn "VMs on this Mac will not start: reims-vgpu runs on Mesa's KosmicKrisp Vulkan driver, which needs macOS 26 or later, and this Mac runs macOS $(sw_vers -productVersion 2>/dev/null). reims-ctl and QEMU install anyway."
 }
 if [[ $OS == Darwin ]]; then
   xcode-select -p >/dev/null 2>&1 || die "Xcode's command line tools are missing: run xcode-select --install, then this again"
@@ -653,8 +654,8 @@ kept_qemu() {
 # version: the loader to vulkan-loader's, and KosmicKrisp to mesa's, which the
 # dependencies above install on macOS 26 and later. Without KosmicKrisp the rt
 # platform makes its own instance, over the system loader's drivers, which give
-# it no device (rt's floor refuses MoltenVK): a mesa without it, as one poured
-# for an older macOS, is said to give VMs no GPU.
+# it no device (rt's floor refuses MoltenVK), and a VM does not start: a mesa
+# without it, as one poured for an older macOS, is said to stop VMs.
 mac_vulkan_links() {
   local brew_prefix loader driver
   brew_prefix="$(brew --prefix)"
@@ -666,7 +667,7 @@ mac_vulkan_links() {
   if [[ -f $driver ]]; then
     ln -sfn "$driver" "$1/libvulkan_kosmickrisp.dylib"
   elif [[ $MAC_GPU == 1 ]]; then
-    warn "Homebrew's mesa has no KosmicKrisp Vulkan driver ($driver), so VMs get no GPU: run brew reinstall mesa, then this again"
+    warn "Homebrew's mesa has no KosmicKrisp Vulkan driver ($driver), so VMs will not start: run brew reinstall mesa, then this again"
   fi
 }
 

@@ -55,10 +55,10 @@ when it asks for more. When the guest lets go of some, QEMU gives it back once i
 for 5 seconds. On a Radeon 780M, a desktop with a browser and video used at most 73 MiB of it at
 a time, and 3D apps use more. So leave your host some memory beyond what you give the VM.
 
-## A Mac needs macOS 26 or later for the VM's GPU
+## A Mac needs macOS 26 or later to run VMs
 
 On a Mac, reims-vgpu runs on Mesa's KosmicKrisp Vulkan driver, which comes with Homebrew's `mesa`.
 Homebrew builds KosmicKrisp only on macOS 26 and later, so on a Mac running macOS 15 or earlier,
-VMs get no GPU. `scripts/install-ctl.sh` installs `mesa` for you on macOS 26 and later, and tells
-you when your Mac's macOS is too old. We've booted arm64 macOS 27.0.1 to its desktop this way on
-an M3 Max.
+VMs don't start: QEMU finds no GPU it can use and stops. `scripts/install-ctl.sh` installs `mesa`
+for you on macOS 26 and later, and tells you when your Mac's macOS is too old. We've booted arm64
+macOS 27.0.1 to its desktop this way on an M3 Max.
