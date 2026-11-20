@@ -112,7 +112,10 @@ pub(crate) struct GuestImports {
 /// context goes with the last import of its size, and holds nothing past
 /// them.
 #[derive(Default)]
-struct Contexts(Mutex<Vec<((u32, u32), Weak<SharedContext>)>>);
+struct Contexts(Mutex<Vec<SizeContext>>);
+
+/// A frame size, and the context its imports hold.
+type SizeContext = ((u32, u32), Weak<SharedContext>);
 
 impl Contexts {
     /// The context of frames of `size`: the one its imports hold, or a new one
