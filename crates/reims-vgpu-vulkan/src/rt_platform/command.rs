@@ -151,9 +151,12 @@ const METRICS_EVERY: u64 = 50_000_000;
 /// command buffer; and rt's metrics, where
 /// they are due ([`trace_metrics`]). The command buffer is named by its address, and numbered in
 /// the order of the commits the trace timed. `cbdone`'s times are rt's (the module's docs, what
-/// a completed handler learns), on rt's host clock, which on Linux is not the trace's
-/// (`CLOCK_MONOTONIC` where the trace counts `CLOCK_MONOTONIC_RAW`): each is moved onto the
-/// trace's clock by the two clocks' difference, read at the handler; 0 stays 0.
+/// a completed handler learns), on rt's host clock (`metal2vulkan_rt::host_time`:
+/// `CLOCK_MONOTONIC` on Linux, `CLOCK_MONOTONIC_RAW` on macOS, the performance counter on
+/// Windows), which is the trace's own clock wherever the platform installs it
+/// (`crate::gpu::timing::trace_clock`): each is moved onto the trace's clock by the two clocks'
+/// difference read at the handler, which is then only the time between those two reads; 0 stays
+/// 0.
 fn trace_commit(cb: &rt::CommandBuffer) -> Option<Handler> {
     if !trace::on() {
         return None;
