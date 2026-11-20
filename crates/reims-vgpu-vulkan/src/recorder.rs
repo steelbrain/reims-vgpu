@@ -107,6 +107,19 @@
 //!   range are the guest's, those the GPU wrote and the guest read back included, however late
 //!   their completion was taken. The header says so ([`format::FLAG_ANNOUNCED_BYTES_RECORDED`]),
 //!   for a player that pushes the recorded bytes at an announce.
+//!
+//!   Both platforms record all of this: each calls these hooks at its commits, those inside
+//!   `m2v.split` and `m2v.commitPart` among them, its command buffers' completions, its shared
+//!   events' values and its announces ([`RecCommandBuffer`]). The Vulkan platform's buffer in a
+//!   heap over the guest's memory, and its texture in one, are written as the block's bytes; so is
+//!   the rt platform's buffer made in a block (`m2v.newBufferInBlock`), whose bytes are those its
+//!   `contents` answers. A texture over a buffer is written as the bytes of the buffer it lies
+//!   over, on both; rt makes no texture in a heap over the guest's memory. The rt platform runs the
+//!   recorder's completion in the first of its command buffer's completed handlers after it merges
+//!   back the host pages it imported as a copy, before the guest's; a status read final before
+//!   that takes the bytes from before the merge, and the GPU's bytes there reach the stream as
+//!   writes at the next commit that reaches them. The rt platform copies none of the guest's RAM,
+//!   so its streams hold no copy out of it.
 //! - **Private buffers around dispatches.** Around each recorded dispatch of a compute pipeline
 //!   made with linked functions, a blit copies each Private buffer range it binds into a Shared
 //!   buffer of the recorder's own, before the dispatch and after it, and at the command buffer's
@@ -243,8 +256,10 @@ pub const FIXES: &[&str] = &[
     "buffer-escaped",
     // 2fe5515d8: each acquire of another API's writes into a buffer
     "external-write-done",
-    // the commit that adds this name: the make of each buffer whose memory is made at its use
+    // cc8676e0c: the make of each buffer whose memory is made at its use
     "deferred-buffer-makes",
+    // the commit that adds this name: the rt platform's memory, as the Vulkan platform's
+    "rt-memory",
 ];
 
 /// The stats file's lines that name the recorder's build: its commit ([`COMMIT`]), the display
@@ -1010,6 +1025,9 @@ impl<T: Send + Sync + 'static> RecObj for crate::rt_platform::RtObj<T> {
 pub enum RawCb {
     /// The Vulkan platform's runtime's.
     Vulkan(metal2vulkan_runtime::CommandBuffer),
+    /// The rt platform's: rt's.
+    #[cfg(feature = "rt")]
+    Rt(metal2vulkan_rt::CommandBuffer),
 }
 
 impl RawCb {
@@ -1017,8 +1035,19 @@ impl RawCb {
     fn finished(&self) -> bool {
         match self {
             RawCb::Vulkan(raw) => is_final(CommandBufferStatus(raw.status().raw())),
+            #[cfg(feature = "rt")]
+            RawCb::Rt(raw) => rt_finished(raw),
         }
     }
+}
+
+/// Whether rt's command buffer `raw`, which a commit returned from, completed or failed, or never
+/// runs. rt sets the status before it runs the command buffer's handlers; one whose commit rt
+/// refused stays not enqueued, and nothing of it runs, so no capture waits for it.
+#[cfg(feature = "rt")]
+fn rt_finished(raw: &metal2vulkan_rt::CommandBuffer) -> bool {
+    use metal2vulkan_rt::CommandBufferStatus as S;
+    matches!(raw.status(), S::Completed | S::Error | S::NotEnqueued)
 }
 
 /// Whether `status` is a command buffer's last: completed or failed.
@@ -1965,6 +1994,9 @@ struct Info {
     parent: u64,
     /// A block's host memory: its address and length.
     block: Option<(usize, u64)>,
+    /// The stream id of the block a buffer was made in (`m2v.newBufferInBlock`), whose bytes a
+    /// capture writes for it: the rt platform's, whose buffers name no heap.
+    in_block: Option<u64>,
     /// Its GPU range, where the guest pinned it.
     pin: Option<(u64, u64)>,
     /// The objects a descriptor's calls named, or an indirect command buffer's commands.
@@ -2708,6 +2740,9 @@ impl State {
                         Value::Uint(length),
                         options,
                     ];
+                    if let Some(info) = objects.info.get_mut(&call.result) {
+                        info.in_block = Some(heap);
+                    }
                 }
                 if let Some((start, _)) = pin {
                     self.pin_locked(&mut objects, call, start + offset, length);
@@ -3277,9 +3312,62 @@ impl State {
                     None => {}
                 }
             }
+            #[cfg(feature = "rt")]
+            self.rt_spans(id, &*any, stored, &mut spans);
             let_go_any(any);
         }
         spans
+    }
+
+    /// The spans of the rt platform's object `any` of stream id `id`, where it is a buffer or a
+    /// texture, as [`State::spans_of`] reads them: a buffer's bytes as `contents` answers them, in
+    /// the block it was made in where it was ([`Info::in_block`]); a texture's, of the bytes of
+    /// the buffer it lies over (`RtTexture::over`); not those the GPU's work writes a copy of
+    /// apart from the CPU's, where `stored`. rt makes no texture in a heap over host memory,
+    /// whose block is Shared, so none lies in a block but through its buffer.
+    #[cfg(feature = "rt")]
+    fn rt_spans(
+        &self,
+        id: u64,
+        any: &(dyn Any + Send + Sync),
+        stored: bool,
+        spans: &mut Vec<Span>,
+    ) {
+        use crate::rt_platform::{RtBuffer, RtTexture};
+        if let Some(b) = any.downcast_ref::<RtBuffer>() {
+            if !(stored && b.gpu_copy_apart()) {
+                self.rt_buffer_span(id, b, None, spans);
+            }
+        } else if let Some((buffer, bytes)) =
+            (any.downcast_ref::<RtTexture>()).and_then(RtTexture::over)
+        {
+            let ptr = Weak::as_ptr(buffer).addr() as u64;
+            let (Some(bid), Some(b)) = (id_at(ptr), buffer.upgrade()) else {
+                return;
+            };
+            if !(stored && b.gpu_copy_apart()) {
+                self.rt_buffer_span(bid, &b, Some(bytes.clone()), spans);
+            }
+            let_go_cb(b);
+        }
+    }
+
+    /// The span of `bytes` of the rt platform's buffer `b`, of stream id `id`, all of it where
+    /// `None` ([`State::host_span`]); none where it has no host bytes (a Private buffer's).
+    #[cfg(feature = "rt")]
+    fn rt_buffer_span(
+        &self,
+        id: u64,
+        b: &crate::rt_platform::RtBuffer,
+        bytes: Option<std::ops::Range<u64>>,
+        spans: &mut Vec<Span>,
+    ) {
+        let ptr = b.host_contents();
+        if ptr.is_null() {
+            return;
+        }
+        let block = (self.objects.lock().info.get(&id)).and_then(|i| i.in_block);
+        self.host_span(id, (ptr.addr(), b.byte_length()), block, bytes, spans);
     }
 
     fn block_of(&self, id: u64) -> Option<(usize, u64)> {
@@ -3529,19 +3617,26 @@ impl State {
 /// The committed command buffer `weak` names, while it lives: upgraded on a calling thread
 /// alone, so the writer never holds an object's last reference.
 fn upgrade_cb(weak: &Weak<dyn Any + Send + Sync>) -> Option<HeldCb> {
-    match weak.upgrade()?.downcast::<CommandBufferObject>() {
-        Ok(cb) => Some(HeldCb::Vulkan(cb)),
-        Err(other) => {
-            let_go_any(other);
-            None
-        }
-    }
+    let other = match weak.upgrade()?.downcast::<CommandBufferObject>() {
+        Ok(cb) => return Some(HeldCb::Vulkan(cb)),
+        Err(other) => other,
+    };
+    #[cfg(feature = "rt")]
+    let other = match other.downcast::<crate::rt_platform::RtCommandBuffer>() {
+        Ok(cb) => return Some(HeldCb::Rt(cb)),
+        Err(other) => other,
+    };
+    let_go_any(other);
+    None
 }
 
 /// A guest's command buffer the recorder holds for a moment ([`upgrade_cb`]).
 enum HeldCb {
     /// The Vulkan platform's.
     Vulkan(Arc<CommandBufferObject>),
+    /// The rt platform's.
+    #[cfg(feature = "rt")]
+    Rt(Arc<crate::rt_platform::RtCommandBuffer>),
 }
 
 impl HeldCb {
@@ -3549,6 +3644,8 @@ impl HeldCb {
     fn finished(&self) -> bool {
         match self {
             HeldCb::Vulkan(cb) => is_final(CommandBufferStatus(cb.raw.status().raw())),
+            #[cfg(feature = "rt")]
+            HeldCb::Rt(cb) => rt_finished(cb.rt()),
         }
     }
 
@@ -3557,38 +3654,75 @@ impl HeldCb {
     fn let_go(self) {
         match self {
             HeldCb::Vulkan(cb) => let_go_cb(cb),
+            #[cfg(feature = "rt")]
+            HeldCb::Rt(cb) => let_go_cb(cb),
         }
     }
 }
 
+/// Whether `type_name` is `T`'s.
+fn is<T: ?Sized>(type_name: &str) -> bool {
+    type_name == std::any::type_name::<T>()
+}
+
 /// Whether objects of the type `type_name` are command buffers, whose encoders' calls, and
-/// their own, a commit's capture follows ([`State::track`]).
+/// their own, a commit's capture follows ([`State::track`]): the Vulkan platform's, and the rt
+/// platform's.
 fn is_command_buffer(type_name: &str) -> bool {
-    type_name == std::any::type_name::<CommandBufferObject>()
+    #[cfg(feature = "rt")]
+    if is::<crate::rt_platform::RtCommandBuffer>(type_name) {
+        return true;
+    }
+    is::<CommandBufferObject>(type_name)
 }
 
 /// Whether objects of the type `type_name` are indirect command buffers, which keep what their
-/// commands name for the command buffers that execute them.
+/// commands name for the command buffers that execute them: the Vulkan platform's (the rt
+/// platform makes none).
 fn is_icb(type_name: &str) -> bool {
-    type_name == std::any::type_name::<crate::gpu::icb::IcbObject>()
+    is::<crate::gpu::icb::IcbObject>(type_name)
 }
 
 /// Whether objects of the type `type_name` are descriptors, which keep what their calls name for
-/// the encoders made of them.
+/// the encoders made of them: the Vulkan platform's, and the rt platform's texture, pass and rate
+/// map descriptors.
 fn is_descriptor(type_name: &str) -> bool {
+    #[cfg(feature = "rt")]
+    {
+        use crate::rt_platform::{PassFields, RateMapFields, TextureFields};
+        if is::<PassFields>(type_name)
+            || is::<TextureFields>(type_name)
+            || is::<RateMapFields>(type_name)
+        {
+            return true;
+        }
+    }
     type_name.contains("Descriptor")
 }
 
-/// Whether objects of the type `type_name` are blit encoders ([`blit_writes`]).
+/// Whether objects of the type `type_name` are blit encoders ([`blit_writes`]): the Vulkan
+/// platform's, and the rt platform's.
 fn is_blit_encoder(type_name: &str) -> bool {
+    #[cfg(feature = "rt")]
+    if is::<crate::rt_platform::RtBlitEncoder>(type_name) {
+        return true;
+    }
     type_name.contains("BlitCommandEncoder")
 }
 
 /// Whether objects of the type `type_name` are compute or render encoders, whose kernels and
-/// render stages could store to what their calls reach ([`may_store`]).
+/// render stages could store to what their calls reach ([`may_store`]): the Vulkan platform's,
+/// and the rt platform's.
 fn is_storing_encoder(type_name: &str) -> bool {
-    type_name == std::any::type_name::<crate::gpu::predication::PredicatedEncoder>()
-        || type_name == std::any::type_name::<crate::gpu::encode_render::RenderEncoderObject>()
+    #[cfg(feature = "rt")]
+    {
+        use crate::rt_platform::{RtComputeEncoder, RtRenderEncoder};
+        if is::<RtComputeEncoder>(type_name) || is::<RtRenderEncoder>(type_name) {
+            return true;
+        }
+    }
+    is::<crate::gpu::predication::PredicatedEncoder>(type_name)
+        || is::<crate::gpu::encode_render::RenderEncoderObject>(type_name)
 }
 
 /// `MTLResourceUsageWrite`.
@@ -3676,8 +3810,9 @@ enum Watched {
     Weak(Weak<dyn Any + Send + Sync>),
 }
 
-/// Drops a command buffer the recorder held for a moment: where that was its last reference, as
-/// its handle's drop does, its release record first.
+/// Drops a command buffer the recorder held for a moment, or the rt platform's buffer under a
+/// texture: where that was its last reference, as its handle's drop does, its release record
+/// first.
 fn let_go_cb<T>(cb: Arc<T>) {
     let ptr = Arc::as_ptr(&cb).cast::<u8>().addr() as u64;
     if let Some(inner) = Arc::into_inner(cb) {

@@ -351,6 +351,21 @@ struct Held {
     seen: Vec<Handler>,
     /// Core's completed handlers.
     completed: Vec<Handler>,
+    /// In a process that records, the recorder's hook of its commit, run first of the handlers
+    /// that can tell the guest of its completion ([`crate::recorder::RecCommandBuffer`]).
+    recorder: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl crate::recorder::RecCommandBuffer for RtObj<RtCommandBuffer> {
+    fn rec_raw(&self) -> crate::recorder::RawCb {
+        crate::recorder::RawCb::Rt(self.rt.clone())
+    }
+
+    /// Kept for the commit under way, which runs it after the merge of the host pages it copied
+    /// and before core's handlers (`commit`).
+    fn rec_on_seen(&self, seen: Box<dyn FnOnce() + Send>) {
+        self.held.lock().recorder = Some(seen);
+    }
 }
 
 impl RtCommandBuffer {
@@ -767,13 +782,22 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     /// used and its process's escaped copies copied in first and merged back first of the
     /// completed handlers (`super::copied`), then the bytes of the tiled textures it used taken
     /// (`super::tiled`). A second commit is Metal's refusal, counted; a commit rt refuses is
-    /// counted, and its handlers never run.
+    /// counted, and its handlers never run. In a process that records, the recorder writes the
+    /// memory it reaches that changed before rt has it ([`crate::recorder::before_commit`]), and
+    /// takes what its GPU work wrote after the merge of the host pages it copied, before core's
+    /// handlers can tell the guest ([`crate::recorder::completion_seen`]).
     fn commit(&self, on: OnFault) -> RaiseResult<()> {
         let recorded_call = crate::recorder::rec_call!("commit", self);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
             let _ = on;
             let sel = "commit";
-            let (mut submission, scheduled, mut seen, completed) = {
+            if self.held.lock().committed {
+                rt_refused(sel, &rt::Error::Refused(rt::Refusal::Committed));
+                return Ok(());
+            }
+            // Before the handlers are taken: the recorder's hook joins them (`rec_on_seen`).
+            crate::recorder::before_commit(&recorded_call, self);
+            let (mut submission, scheduled, mut seen, completed, recorder) = {
                 let mut held = self.held.lock();
                 if held.committed {
                     drop(held);
@@ -787,10 +811,16 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                     take(&mut held.scheduled),
                     take(&mut held.seen),
                     take(&mut held.completed),
+                    held.recorder.take(),
                 )
             };
             submission.extend(scheduled);
             seen.extend(completed);
+            // The recorder's hook goes after the merge, the error and the trace's cbdone, before
+            // core's handlers.
+            if let Some(hook) = recorder {
+                seen.insert(0, Box::new(move |_made: &rt::CommandBuffer| hook()));
+            }
             // The trace's cbdone goes after its error and its merge, before core's handlers.
             if let Some(done) = trace_commit(&self.rt) {
                 seen.insert(0, done);
@@ -1012,9 +1042,18 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         recorded_answer
     }
 
-    /// rt's status as Metal's, or the caller's failure of it (the module's docs).
+    /// rt's status as Metal's, or the caller's failure of it (the module's docs). In a process
+    /// that records, a final status, which rt sets before it runs the command buffer's handlers,
+    /// is answered once the recorder took what its GPU work wrote
+    /// ([`crate::recorder::completion_seen`]).
     fn status(&self) -> CommandBufferStatus {
-        status_of(&self.rt, &self.kept.3)
+        let status = status_of(&self.rt, &self.kept.3);
+        if (status == CommandBufferStatus::COMPLETED || status == CommandBufferStatus::ERROR)
+            && let Some(id) = crate::recorder::completion_key(self)
+        {
+            crate::recorder::completion_seen(id);
+        }
+        status
     }
 
     /// Ends the command buffer with `OutOfMemory` (the module's docs, "What a completed handler
@@ -1024,13 +1063,22 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     }
 
     /// rt's wait; none, counted, where rt refuses it (in a scheduled handler, or on rt's
-    /// completion thread for a command buffer not yet completed, which it would never see).
+    /// completion thread for a command buffer not yet completed, which it would never see). In a
+    /// process that records, it returns once the recorder took what the command buffer's GPU work
+    /// wrote ([`crate::recorder::completion_seen`]).
     fn wait_until_completed(&self, on: OnFault) -> RaiseResult<()> {
         let recorded_call = crate::recorder::rec_call!("waitUntilCompleted", self);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
             let _ = on;
-            if let Err(error) = self.rt.wait_until_completed() {
-                rt_refused("waitUntilCompleted", &error);
+            match self.rt.wait_until_completed() {
+                Ok(_) => {
+                    if let Some(id) = crate::recorder::completion_key(self) {
+                        crate::recorder::completion_seen(id);
+                    }
+                }
+                Err(error) => {
+                    rt_refused("waitUntilCompleted", &error);
+                }
             }
             Ok(())
         });

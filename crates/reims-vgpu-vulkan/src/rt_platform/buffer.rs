@@ -180,6 +180,7 @@
 //! ([`DEFERRED_REFUSED_CODE`]).
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -196,7 +197,7 @@ use crate::core::platform::os::Clock as _;
 use crate::core::platform::resource::ExportedMemory;
 use crate::core::platform::resource::{Buffer, GpuResource, MemoryFor};
 use crate::core::platform::types::NsRange;
-use crate::core::platform::values::{BufferDeallocator, BufferDesc, SurfacePlane};
+use crate::core::platform::values::{BufferDeallocator, BufferDesc, SurfacePlane, TextureDesc};
 use crate::core::raise::death::{DeathId, DeathKind, fatal_with_detail};
 use crate::core::raise::{OnFault, RaiseResult};
 use crate::core::sync::Mutex;
@@ -2236,9 +2237,76 @@ pub(super) fn read_only(sel: &'static str) {
     }
 }
 
+impl RtBuffer {
+    /// The host address of its first byte, as `contents` answers it: NULL for a Private buffer,
+    /// as Metal's, and for a deferred one whose memory is not made; a buffer in a dma-buf's block
+    /// answers the host's mapping of its pages, and one in a copy's block the pages it copies
+    /// (`KnownBlocks::contents_of`).
+    pub(crate) fn host_contents(&self) -> HostPtr {
+        // A deferred buffer, Private, whose memory is not made: none to answer.
+        let Some(made) = self.rt.get() else {
+            return HostPtr::NULL;
+        };
+        let known = self.device.known_blocks();
+        let home = known.home_of(made.block());
+        if let Some(at) = home.and_then(|first| first.checked_add(made.offset())) {
+            return HostPtr::from_addr(at.to_usize());
+        }
+        if let Some(at) = made.contents() {
+            return HostPtr::from_ptr(at.as_ptr());
+        }
+        let mapped = known.mapped.of(made.block());
+        match mapped.and_then(|first| first.checked_add(made.offset())) {
+            Some(at) => HostPtr::from_addr(at.to_usize()),
+            None => HostPtr::NULL,
+        }
+    }
+
+    /// Whether the GPU's work writes a copy of it apart from the CPU's: a `Managed` buffer of a
+    /// device without unified memory, which rt gives a device copy.
+    pub(crate) fn gpu_copy_apart(&self) -> bool {
+        (self.options >> 4) & 0xf == MANAGED && !self.device.rt().has_unified_memory()
+    }
+
+    /// Its length, as `length` answers it: a deferred buffer's own, whose memory is not made.
+    pub(crate) fn byte_length(&self) -> u64 {
+        match (self.rt.get(), &self.deferred) {
+            (Some(made), _) => made.length(),
+            (None, Some(deferred)) => deferred.length,
+            (None, None) => 0,
+        }
+    }
+}
+
+/// The bytes of a buffer of `length` bytes that a texture of `desc` over it from `offset`, rows
+/// `bytes_per_row` apart, lies over: its image, each slice of a 2D array's a 128-byte multiple
+/// apart, a texture buffer's from its offset's 16-byte boundary, as the Vulkan platform reads one.
+/// For the recorder, which writes them as the buffer's.
+fn texel_bytes(desc: &TextureDesc, offset: u64, bytes_per_row: u64, length: u64) -> Range<u64> {
+    /// `MTLTextureType2DArray`.
+    const TYPE_2D_ARRAY: u64 = 3;
+    /// `MTLTextureTypeTextureBuffer`.
+    const TYPE_TEXTURE_BUFFER: u64 = 9;
+    let image = bytes_per_row.saturating_mul(desc.height.max(1));
+    let (slices, pitch) = match desc.texture_type {
+        TYPE_2D_ARRAY => (
+            desc.array_length.max(1),
+            image.checked_next_multiple_of(128).unwrap_or(u64::MAX),
+        ),
+        _ => (1, image),
+    };
+    let start = match desc.texture_type {
+        TYPE_TEXTURE_BUFFER => offset - offset % 16,
+        _ => offset,
+    };
+    let span = (pitch.saturating_mul(slices - 1)).saturating_add(image);
+    start.min(length)..offset.saturating_add(span).min(length)
+}
+
 impl RtObj<RtBuffer> {
     /// The texture `sel` makes of `descriptor` over the buffer's bytes from `offset`, rows
-    /// `bytes_per_row` apart (`super::texture::make_over`).
+    /// `bytes_per_row` apart (`super::texture::make_over`), which keeps what bytes of the buffer
+    /// it lies over (`RtTexture::over`).
     fn texture(
         &self,
         sel: &'static str,
@@ -2254,7 +2322,24 @@ impl RtObj<RtBuffer> {
         let held = (self.options, texture::STORAGE_BITS);
         let diag = |shape: &Shape| Made::over_buffer(made, shape, offset, bytes_per_row);
         let (desc, copied) = (descriptor.desc(), self.copied.as_ref());
-        texture::make_over(&self.device, sel, &desc, held, over, diag, copied)
+        let texture = texture::make_over(&self.device, sel, &desc, held, over, diag, copied);
+        self.lies_under(texture.as_ref(), &desc, offset, bytes_per_row);
+        texture
+    }
+
+    /// Notes that `texture`, where made, of `desc` from `offset`, rows `bytes_per_row` apart,
+    /// lies over this buffer's bytes ([`texel_bytes`]).
+    fn lies_under(
+        &self,
+        texture: Option<&RtObj<RtTexture>>,
+        desc: &TextureDesc,
+        offset: u64,
+        bytes_per_row: u64,
+    ) {
+        if let Some(texture) = texture {
+            let bytes = texel_bytes(desc, offset, bytes_per_row, self.byte_length());
+            texture.set_over(RtObj::downgrade(self), bytes);
+        }
     }
 }
 
@@ -2300,30 +2385,17 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
     /// no bytes of, answers the host's mapping of its pages (`KnownBlocks::contents_of`, interim
     /// until rt takes that mapping), and one in a copy's block the pages it copies.
     fn contents(&self) -> HostPtr {
-        // A deferred buffer, Private, whose memory is not made: none to answer.
-        let Some(made) = self.rt.get() else {
-            return HostPtr::NULL;
-        };
-        let known = self.device.known_blocks();
-        let home = known.home_of(made.block());
-        if let Some(at) = home.and_then(|first| first.checked_add(made.offset())) {
-            return HostPtr::from_addr(at.to_usize());
-        }
-        if let Some(at) = made.contents() {
-            return HostPtr::from_ptr(at.as_ptr());
-        }
-        let mapped = known.mapped.of(made.block());
-        match mapped.and_then(|first| first.checked_add(made.offset())) {
-            Some(at) => HostPtr::from_addr(at.to_usize()),
-            None => HostPtr::NULL,
-        }
+        self.host_contents()
     }
 
     /// Of a Managed buffer, rt's, which copies the range into its device copy at the next commit;
     /// a range past the buffer changes nothing, counted, where Metal's validation aborts. Of any
-    /// other, nothing, as Metal.
+    /// other, nothing, as Metal. In a process that records, the recorder first writes each chunk
+    /// of the range whose bytes differ from those the stream last recorded
+    /// ([`crate::recorder::before_modify`]).
     fn did_modify_range(&self, on: OnFault, range: NsRange) -> RaiseResult<()> {
         let recorded_call = crate::recorder::rec_call!("didModifyRange:", self, range);
+        crate::recorder::before_modify(&recorded_call, self, &range);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
             let _ = on;
             if self.storage_mode() == MANAGED
@@ -2352,11 +2424,7 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
 
     /// rt's; a deferred buffer's own, whose memory is not made.
     fn length(&self) -> u64 {
-        match (self.rt.get(), &self.deferred) {
-            (Some(made), _) => made.length(),
-            (None, Some(deferred)) => deferred.length,
-            (None, None) => 0,
-        }
+        self.byte_length()
     }
 
     /// A deferred buffer's memory, made now where it is not yet: `false` where rt refuses it,
@@ -2467,6 +2535,7 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
                 let tiled = Tiled::new(rt_device, texture.rt(), self, offset, bytes_per_row);
                 texture.set_tiled(tiled);
             }
+            self.lies_under(made.as_ref(), &desc, offset, bytes_per_row);
             Ok(made)
         });
         crate::recorder::rec_done!(recorded_call, recorded_answer);

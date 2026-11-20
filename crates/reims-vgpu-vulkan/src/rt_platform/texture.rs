@@ -80,7 +80,7 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use metal2vulkan_rt as rt;
 
@@ -94,6 +94,7 @@ use crate::core::platform::values::TextureDesc;
 use crate::core::raise::RaiseResult;
 use crate::core::sync::Mutex;
 
+use super::buffer::RtBuffer;
 use super::copied::Copied;
 use super::descriptor::rt_texture_descriptor;
 use super::device::RtDevice;
@@ -192,6 +193,9 @@ pub struct RtTexture {
     /// The copy of host pages it lies over, a buffer's or a heap's, and a view's of one
     /// (`super::copied`); unset for any other.
     copied: OnceLock<Arc<Copied>>,
+    /// The buffer it lies over and which bytes of it, and a view's of one: what the recorder
+    /// writes for it ([`crate::recorder`]); unset for any other.
+    over: OnceLock<(Weak<RtBuffer>, Range<u64>)>,
 }
 
 impl Drop for RtTexture {
@@ -235,6 +239,17 @@ impl RtTexture {
     /// the buffers' piece makes it.
     pub(super) fn set_tiled(&self, tiled: Arc<Tiled>) {
         let _ = self.tiled.set(tiled);
+    }
+
+    /// The buffer it lies over and which bytes of it, where it lies over one, a view's of one
+    /// among them: what the recorder writes for it ([`crate::recorder`]).
+    pub(crate) fn over(&self) -> Option<&(Weak<RtBuffer>, Range<u64>)> {
+        self.over.get()
+    }
+
+    /// Notes that it lies over `bytes` of `buffer`: once, as the buffers' piece makes it.
+    pub(super) fn set_over(&self, buffer: Weak<RtBuffer>, bytes: Range<u64>) {
+        let _ = self.over.set((buffer, bytes));
     }
 
     /// The host's read-back (`reims_vgpu`'s `ApiPlatform::read_pixels`): the whole of level 0 and
@@ -336,6 +351,7 @@ impl RtTexture {
             made: Made::view(&self.made, format_raw, first),
             tiled: self.tiled.clone(),
             copied: self.copied.clone(),
+            over: self.over.clone(),
         })
     }
 }
@@ -433,6 +449,7 @@ fn answered(
         made: diag(&shape),
         tiled: OnceLock::new(),
         copied: OnceLock::new(),
+        over: OnceLock::new(),
     })
 }
 
@@ -472,6 +489,7 @@ pub(super) fn drawable(
         made,
         tiled: OnceLock::new(),
         copied: OnceLock::new(),
+        over: OnceLock::new(),
     })
 }
 

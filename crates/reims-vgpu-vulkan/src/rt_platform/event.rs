@@ -31,13 +31,22 @@ impl SharedEvent<RtPlatform> for RtObj<rt::SharedEvent> {
         recorded_answer
     }
 
+    /// rt's value. In a process that records, it is answered once the recorder compared what the
+    /// command buffers that signal the event to that value could have written
+    /// ([`crate::recorder::event_reached`]).
     fn signaled_value(&self) -> u64 {
-        rt::SharedEvent::signaled_value(self)
+        let value = rt::SharedEvent::signaled_value(self);
+        if let Some(id) = crate::recorder::event_key(self) {
+            crate::recorder::event_reached(id, value);
+        }
+        value
     }
 
     /// rt's wait. False, counted, where rt refuses it: in a scheduled handler, or on rt's
     /// completion thread (a completed handler or a notification) for a value that thread has not
-    /// yet seen, which a wait there would never see.
+    /// yet seen, which a wait there would never see. In a process that records, a wait that saw
+    /// the value reached returns once the recorder compared what the command buffers that signal
+    /// the event could have written ([`crate::recorder::event_reached`]).
     fn wait_until_signaled_value(&self, value: u64, milliseconds: u64) -> bool {
         let recorded_call = crate::recorder::rec_call!(
             "waitUntilSignaledValue:timeoutMS:",
@@ -48,7 +57,12 @@ impl SharedEvent<RtPlatform> for RtObj<rt::SharedEvent> {
         let recorded_answer = crate::recorder::run(|| -> bool {
             let timeout = Duration::from_millis(milliseconds);
             match rt::SharedEvent::wait_until_signaled_value(self, value, timeout) {
-                Ok(reached) => reached,
+                Ok(reached) => {
+                    if reached && let Some(id) = crate::recorder::event_key(self) {
+                        crate::recorder::event_reached(id, value);
+                    }
+                    reached
+                }
                 Err(error) => {
                     rt_refused("waitUntilSignaledValue:timeoutMS:", &error);
                     false
@@ -60,7 +74,9 @@ impl SharedEvent<RtPlatform> for RtObj<rt::SharedEvent> {
     }
 
     /// `block` runs once on rt's completion thread (the module's docs), once the value reaches
-    /// `value`. Refused, counted, after the device was quiesced, when `block` never runs.
+    /// `value`. Refused, counted, after the device was quiesced, when `block` never runs. In a
+    /// process that records, `block` runs once the recorder compared what the command buffers
+    /// that signal the event to `value` could have written ([`crate::recorder::event_reached`]).
     fn notify_listener(
         &self,
         listener: &<RtPlatform as Platform>::SharedEventListener,
@@ -70,9 +86,13 @@ impl SharedEvent<RtPlatform> for RtObj<rt::SharedEvent> {
         let _ = listener;
         #[cfg(test)]
         let slot = crate::core::testkit::capture::current_slot();
+        let recorded = crate::recorder::event_key(self);
         let notification = move |_value: u64| {
             // A callout on rt's thread: marked ours, so a panic here aborts.
             let _env = BlockEnv::foreign();
+            if let Some(id) = recorded {
+                crate::recorder::event_reached(id, value);
+            }
             #[cfg(test)]
             crate::core::testkit::capture::with_slot(slot, block);
             #[cfg(not(test))]

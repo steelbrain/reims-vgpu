@@ -1,6 +1,7 @@
-//! The memory a recording holds, on the Vulkan platform: what reaches the stream as `m2v.write`
-//! records around commits ([`super::before_commit`]), completions ([`super::completion_seen`])
-//! and announces ([`super::before_modify`]).
+//! The memory a recording holds, on the Vulkan platform, and the block tests' on the rt platform
+//! too: what reaches the stream as `m2v.write` records around commits
+//! ([`super::before_commit`]), completions ([`super::completion_seen`]) and announces
+//! ([`super::before_modify`]).
 //! The recorder is the process's, started once, so each test records in a child copy of the
 //! test binary of its own ([`in_recording_child`]).
 
@@ -13,7 +14,7 @@ use super::format::{self, Record, Value};
 use super::{ENV_VAR, id_at, on, start_from_env, state};
 use crate::core::host::HostPtr;
 use crate::core::platform::Handle as _;
-use crate::core::platform::Platform as _;
+use crate::core::platform::Platform;
 use crate::core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
 use crate::core::platform::command::{
     CommandBuffer as _, CommandQueue as _, CompletedHandler, PartCut,
@@ -32,6 +33,8 @@ use crate::gpu::command::{VulkanCommandBuffer, VulkanCommandQueue};
 use crate::gpu::icb::VulkanIcb;
 use crate::gpu::resource::{VulkanBuffer, VulkanComputePipeline, VulkanHeap};
 use crate::platform::VulkanPlatform;
+#[cfg(feature = "rt")]
+use crate::rt_platform::RtPlatform;
 
 /// The marker that makes a run of a recording test its child, which records: the test's name.
 const RECORD_CHILD: &str = "REIMS_VGPU_RECORDER_CHILD";
@@ -49,7 +52,8 @@ const READ: u64 = 1;
 const READ_WRITE: u64 = 3;
 
 /// Runs `body` in a child copy of this test binary that records into a scratch directory of its
-/// own, `body` given the directory its stream goes into; in the child, runs it.
+/// own, `body` given the directory its stream goes into; in the child, runs it. The child's
+/// stderr lines that start `recorder-test: ` are passed on to the parent's.
 fn in_recording_child(test: &str, body: impl FnOnce(&Path)) {
     if std::env::var(RECORD_CHILD).as_deref() == Ok(test) {
         let streams = PathBuf::from(std::env::var_os(ENV_VAR).expect("the child records"));
@@ -70,6 +74,10 @@ fn in_recording_child(test: &str, body: impl FnOnce(&Path)) {
     assert!(out.status.success(), "{out:?}");
     let ran = String::from_utf8_lossy(&out.stdout).contains("1 passed");
     assert!(ran, "the child ran no test: {out:?}");
+    let told = String::from_utf8_lossy(&out.stderr);
+    (told.lines())
+        .filter(|l| l.starts_with("recorder-test: "))
+        .for_each(|l| eprintln!("{l}"));
 }
 
 /// The records of the stream in `streams` once `done` holds of them, read again every 50 ms for
@@ -1241,4 +1249,246 @@ fn on_vulkan_an_external_write_done_lies_between_the_decodes_commit_and_its_sign
         let counted = state().expect("the child records").selectors.lock();
         assert_eq!(counted.get(super::EXTERNAL_WRITE_DONE), Some(&1));
     });
+}
+
+/// The bytes the block tests' buffers take in their block: 176 of them, as the guest's small
+/// buffers lie in its blocks, from 256 bytes past a chunk's start, at the alignment Metal asks of
+/// a buffer's offset in a heap.
+const IN_BLOCK: std::ops::Range<u64> = 0x2100..0x21b0;
+
+/// `MTLResourceStorageModeShared`, with no other option.
+const SHARED: u64 = 0;
+
+/// A block of [`BLOCK`] bytes on `d`, a `Shared` heap over pages of the test's, as the decoder
+/// makes one over the guest's memory, and its stream id.
+fn block_on<P: Platform>(d: &P::Device) -> (P::Heap, u64) {
+    use crate::gpu::resource::tests::{guest_pages_of, heap_over};
+    let heap = heap_over::<P>(d, guest_pages_of(BLOCK), BLOCK);
+    let id = id_at(heap.id().0).expect("the block is recorded");
+    (heap, id)
+}
+
+/// A `Shared` buffer of `heap`'s over [`IN_BLOCK`] (`newBufferWithLength:options:offset:`, the
+/// stream's `m2v.newBufferInBlock`), each of its bytes then written `value` by the CPU.
+fn in_block_with<P: Platform>(heap: &P::Heap, value: u8) -> P::Buffer {
+    let length = IN_BLOCK.end - IN_BLOCK.start;
+    let made = heap.new_buffer_of_length(length, SHARED, IN_BLOCK.start);
+    let b = made.unwrap().expect("a buffer in the block");
+    write_at(b.contents().addr(), 0..length, value);
+    b
+}
+
+/// The pipeline of `inc_k` ([`INC`]) on `d`.
+fn inc_on<P: Platform>(d: &P::Device) -> P::ComputePipeline {
+    let library = d.new_library(INC).unwrap().unwrap().unwrap();
+    let f = library.new_function(OnFault::Return, "inc_k").unwrap();
+    d.new_compute_pipeline_state_for_function(f.as_ref())
+        .unwrap()
+        .unwrap()
+}
+
+/// Commits on `q` a command buffer of one compute encoder that binds `c` at index 0 and runs one
+/// thread of `inc` on it, and waits for it.
+fn count_on<P: Platform>(q: &P::CommandQueue, inc: &P::ComputePipeline, c: &P::Buffer) {
+    let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+    let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+    let buffers = [Some(c)];
+    for cmd in [
+        ComputeCmd::SetComputePipelineState { state: Some(inc) },
+        ComputeCmd::SetBuffers {
+            buffers: &buffers,
+            offsets: &[0],
+            range: NsRange::new(0, 1),
+        },
+        ComputeCmd::DispatchThreads {
+            threads_per_grid: MtlSize::new(1, 1, 1),
+            threads_per_threadgroup: MtlSize::new(1, 1, 1),
+        },
+        ComputeCmd::EndEncoding,
+    ] {
+        e.encode(OnFault::Return, cmd).unwrap();
+    }
+    cb.commit(OnFault::Return).unwrap();
+    cb.wait_until_completed(OnFault::Return).unwrap();
+}
+
+/// Commits on `q` a command buffer of one blit encoder that copies the bytes of `from`, a buffer
+/// of [`IN_BLOCK`]'s length, into `to`, and waits for it.
+fn read_on<P: Platform>(q: &P::CommandQueue, from: &P::Buffer, to: &P::Buffer) {
+    let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+    let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+    let copy = BlitCmd::CopyBufferToBuffer {
+        source_buffer: Some(from),
+        source_offset: 0,
+        destination_buffer: Some(to),
+        destination_offset: 0,
+        size: IN_BLOCK.end - IN_BLOCK.start,
+    };
+    for cmd in [copy, BlitCmd::EndEncoding] {
+        e.encode(OnFault::Return, cmd).unwrap();
+    }
+    cb.commit(OnFault::Return).unwrap();
+    cb.wait_until_completed(OnFault::Return).unwrap();
+}
+
+/// The place in `records` of the `n`th buffer made in a block (`m2v.newBufferInBlock`), from 0.
+fn made_in_block(records: &[Record], n: usize) -> usize {
+    place(records, "m2v.newBufferInBlock:offset:length:options:", n)
+        .unwrap_or_else(|| panic!("buffer {n} made in a block: {records:?}"))
+}
+
+/// The bytes of the block of stream id `block` that a player holds once it played
+/// `records[..end]`: the block's `m2v.write` records among them, in order, over the zeros a block
+/// is made of.
+fn played(records: &[Record], block: u64, end: usize) -> Vec<u8> {
+    let mut held = vec![0u8; BLOCK as usize];
+    for i in 0..end {
+        for (at, data) in writes_of(records, block, i..i + 1) {
+            let at = at as usize;
+            held[at..at + data.len()].copy_from_slice(&data);
+        }
+    }
+    held
+}
+
+/// [`IN_BLOCK`]'s bytes of `held`, a block's.
+fn in_block(held: &[u8]) -> &[u8] {
+    &held[IN_BLOCK.start as usize..IN_BLOCK.end as usize]
+}
+
+/// A CPU write into a `Shared` buffer made in a block, which a compute encoder binds, is in the
+/// stream before the commit, as an `m2v.write` of the block between the buffer's make and the
+/// commit: a player holds the CPU's bytes there as the kernel runs. On `d`, a device of `P`, the
+/// stream in `streams`. The device's `hasUnifiedMemory` answer goes to stderr, a line the parent
+/// passes on ([`in_recording_child`]).
+fn kernel_reads_a_block_buffer_the_cpu_wrote<P: Platform>(d: &P::Device, streams: &Path) {
+    let unified = d.identity_caps().flags.has_unified_memory;
+    eprintln!("recorder-test: hasUnifiedMemory {unified:?}");
+    let (heap, block) = block_on::<P>(d);
+    let b = in_block_with::<P>(&heap, 0x5a);
+    let q = d.new_command_queue().expect("a queue");
+    count_on::<P>(&q, &inc_on::<P>(d), &b);
+
+    let records = records_once(streams, |rs| place(rs, "commit", 0).is_some());
+    let made = made_in_block(&records, 0);
+    let commit = place(&records, "commit", 0).expect("the commit's record");
+    let written = writes_of(&records, block, made..commit);
+    assert!(
+        !written.is_empty(),
+        "no write of the block between the buffer's make at {made} and its commit at {commit}"
+    );
+    let length = (IN_BLOCK.end - IN_BLOCK.start) as usize;
+    assert_eq!(
+        in_block(&played(&records, block, commit)),
+        &bytes(0x5a, length)[..],
+        "the stream's bytes of the buffer at its commit"
+    );
+}
+
+/// The Vulkan platform's arm of [`kernel_reads_a_block_buffer_the_cpu_wrote`], on the default
+/// device: run on a device that answers `hasUnifiedMemory` YES, it covers the guest's blocks of
+/// such a device.
+#[test]
+fn on_vulkan_a_cpu_write_into_a_block_buffer_a_kernel_binds_is_written_before_its_commit() {
+    let test = "recorder::memory_tests::\
+                on_vulkan_a_cpu_write_into_a_block_buffer_a_kernel_binds_is_written_before_its_commit";
+    in_recording_child(test, |streams| {
+        let d = crate::gpu::device::tests::dev();
+        kernel_reads_a_block_buffer_the_cpu_wrote::<VulkanPlatform>(&d, streams);
+    });
+}
+
+/// The rt platform's arm of [`kernel_reads_a_block_buffer_the_cpu_wrote`], on its default
+/// device: its commits write what they reach, as the Vulkan platform's do.
+#[cfg(feature = "rt")]
+#[test]
+fn on_vulkan_rt_a_cpu_write_into_a_block_buffer_a_kernel_binds_is_written_before_its_commit() {
+    let test = "recorder::memory_tests::\
+                on_vulkan_rt_a_cpu_write_into_a_block_buffer_a_kernel_binds_is_written_before_its_commit";
+    in_recording_child(test, |streams| {
+        let d = rt_device();
+        kernel_reads_a_block_buffer_the_cpu_wrote::<RtPlatform>(&d, streams);
+    });
+}
+
+/// A buffer made in block space an earlier buffer left, which the CPU writes with the very bytes
+/// the earlier one left there and a compute encoder then binds: no write of the block comes
+/// between its make and its commit, as the bytes did not change, and a player that plays the
+/// stream holds the CPU's bytes there at the commit, those the earlier buffer's write recorded.
+/// So a buffer read before any write of its own, in a stream, can be a buffer whose bytes the
+/// block's earlier writes hold. On `d`, a device of `P`, the stream in `streams`.
+fn a_reused_block_space_holds_the_equal_bytes<P: Platform>(d: &P::Device, streams: &Path) {
+    let (heap, block) = block_on::<P>(d);
+    let q = d.new_command_queue().expect("a queue");
+    let to = d.new_buffer_of_length(OnFault::Return, 4096, SHARED);
+    let to = to.unwrap().expect("a Shared buffer");
+    let earlier = in_block_with::<P>(&heap, 0x5a);
+    read_on::<P>(&q, &earlier, &to);
+    drop(earlier);
+    let later = in_block_with::<P>(&heap, 0x5a);
+    count_on::<P>(&q, &inc_on::<P>(d), &later);
+
+    let records = records_once(streams, |rs| place(rs, "commit", 1).is_some());
+    let made = [0, 1].map(|n| made_in_block(&records, n));
+    let commits = [0, 1].map(|n| place(&records, "commit", n).expect("a commit's record"));
+    assert!(
+        made[0] < commits[0] && commits[0] < made[1] && made[1] < commits[1],
+        "the makes at {made:?}, the commits at {commits:?}"
+    );
+    let earlier_writes = writes_of(&records, block, made[0]..commits[0]);
+    assert!(
+        !earlier_writes.is_empty(),
+        "no write of the block before the earlier buffer's commit"
+    );
+    let later_writes = writes_of(&records, block, made[1]..commits[1]);
+    assert!(
+        later_writes.is_empty(),
+        "a write of the block between the later buffer's make and its commit: {:?}",
+        later_writes.keys().collect::<Vec<_>>()
+    );
+    let length = (IN_BLOCK.end - IN_BLOCK.start) as usize;
+    assert_eq!(
+        in_block(&played(&records, block, commits[1])),
+        &bytes(0x5a, length)[..],
+        "the stream's bytes of the later buffer at its commit"
+    );
+}
+
+/// The Vulkan platform's arm of [`a_reused_block_space_holds_the_equal_bytes`], on the default
+/// device.
+#[test]
+fn on_vulkan_a_buffer_in_reused_block_space_holds_the_equal_bytes_an_earlier_write_recorded() {
+    let test = "recorder::memory_tests::\
+                on_vulkan_a_buffer_in_reused_block_space_holds_the_equal_bytes_an_earlier_write_recorded";
+    in_recording_child(test, |streams| {
+        let d = crate::gpu::device::tests::dev();
+        a_reused_block_space_holds_the_equal_bytes::<VulkanPlatform>(&d, streams);
+    });
+}
+
+/// The rt platform's arm of [`a_reused_block_space_holds_the_equal_bytes`], on its default
+/// device.
+#[cfg(feature = "rt")]
+#[test]
+fn on_vulkan_rt_a_buffer_in_reused_block_space_holds_the_equal_bytes_an_earlier_write_recorded() {
+    let test = "recorder::memory_tests::\
+                on_vulkan_rt_a_buffer_in_reused_block_space_holds_the_equal_bytes_an_earlier_write_recorded";
+    in_recording_child(test, |streams| {
+        let d = rt_device();
+        a_reused_block_space_holds_the_equal_bytes::<RtPlatform>(&d, streams);
+    });
+}
+
+/// The rt platform's default device, on the GPU the test holds.
+#[cfg(feature = "rt")]
+fn rt_device() -> <RtPlatform as Platform>::Device {
+    let platform = RtPlatform::new();
+    let registry_id = platform
+        .system_default_device()
+        .expect("an rt device on the GPU the test holds")
+        .facts()
+        .registry_id;
+    platform
+        .open_device(registry_id)
+        .expect("the default device")
 }
