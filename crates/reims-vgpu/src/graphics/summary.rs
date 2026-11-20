@@ -1,9 +1,10 @@
 //! The host's summary of each ten seconds in its log, for the walks that time a guest's frames.
 //! Every [`PERIOD`], while the log names [`TARGET`] at debug, the summary writes three lines of
 //! what the period held. Each line starts with its stamp: the host's wall time (`CLOCK_REALTIME`,
-//! seconds since the Unix epoch to the millisecond) and `CLOCK_MONOTONIC_RAW` in nanoseconds (`-`
-//! on Windows, `reims_vgpu_vulkan::os::raw_mono_nanos`), so a reader joins the lines to its own
-//! steps by either clock:
+//! seconds since the Unix epoch to the millisecond) and the trace's clock in nanoseconds
+//! (`reims_vgpu_vulkan::core::trace::now`, rt's host clock, which `cbdone` and the trace's other
+//! events count: `CLOCK_MONOTONIC` on Linux), so a reader joins the lines to its own steps by the
+//! wall time, and to a trace with no conversion on any host:
 //!
 //! - **Presents**: the presents answered, and how many a second. Then the time from each one's
 //!   take to its show, from its show to its answer, and from its take to its answer, at the 50th,
@@ -85,7 +86,7 @@ pub(crate) fn start<P: Platform>(platform: &Arc<P>) {
                     let now = clock.now_mono();
                     let over = now.saturating_duration_since(since);
                     since = now;
-                    let stamp = stamp(clock.now_wall(), reims_vgpu_vulkan::os::raw_mono_nanos());
+                    let stamp = stamp(clock.now_wall(), reims_vgpu_vulkan::core::trace::now());
                     let mut presents = std::mem::take(&mut *PRESENTS.lock());
                     let parts = [
                         Some(presents_part(over, &mut presents)),
@@ -108,12 +109,10 @@ pub(crate) fn start<P: Platform>(platform: &Arc<P>) {
     });
 }
 
-/// A line's stamp at `wall`, with `raw`, `CLOCK_MONOTONIC_RAW` in nanoseconds where the host
-/// has it.
-fn stamp(wall: WallTime, raw: Option<u64>) -> String {
+/// A line's stamp at `wall`, with `trace`, the trace's clock in nanoseconds.
+fn stamp(wall: WallTime, trace: u64) -> String {
     let ms = wall.as_nanos() / 1_000_000;
-    let raw = raw.map_or_else(|| "-".to_owned(), |raw| raw.to_string());
-    format!("summary at {}.{:03} raw {raw}", ms / 1_000, ms % 1_000)
+    format!("summary at {}.{:03} trace {trace}", ms / 1_000, ms % 1_000)
 }
 
 /// The presents' part of a line `over` that time, of `presents`, each one's times as
@@ -171,17 +170,14 @@ fn waits_part(waits: &[(&'static str, Waits)]) -> String {
 mod tests {
     use super::*;
 
-    /// A stamp gives the wall time to the millisecond, and the raw clock, or `-` without it.
+    /// A stamp gives the wall time to the millisecond, and the trace's clock.
     #[test]
-    fn a_stamp_gives_the_wall_time_to_the_millisecond_and_the_raw_clock() {
+    fn a_stamp_gives_the_wall_time_to_the_millisecond_and_the_trace_clock() {
         let wall = WallTime::from_nanos(1_795_190_400_123_456_789);
+        assert_eq!(stamp(wall, 98_765), "summary at 1795190400.123 trace 98765");
         assert_eq!(
-            stamp(wall, Some(98_765)),
-            "summary at 1795190400.123 raw 98765"
-        );
-        assert_eq!(
-            stamp(WallTime::from_nanos(5_000_000), None),
-            "summary at 0.005 raw -"
+            stamp(WallTime::from_nanos(5_000_000), 0),
+            "summary at 0.005 trace 0"
         );
     }
 

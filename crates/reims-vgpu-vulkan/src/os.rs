@@ -96,28 +96,6 @@ pub(crate) fn rt_instance(
     metal2vulkan_rt::Instance::new(extensions)
 }
 
-/// `CLOCK_MONOTONIC_RAW` in nanoseconds, on Linux and macOS, for a diagnostic line whose reader
-/// joins it to its own reading of that clock (reims-vgpu's `graphics::summary`); `None` on
-/// Windows, which has no such clock, or where it cannot be read.
-pub fn raw_mono_nanos() -> Option<u64> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: a valid clock id and a live out-parameter.
-        let read = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) };
-        let secs = u64::try_from(ts.tv_sec).ok()?;
-        let nanos = u64::try_from(ts.tv_nsec).ok()?;
-        (read == 0).then(|| secs.saturating_mul(1_000_000_000).saturating_add(nanos))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
-}
-
 /// The user's cache directory, where the library keeps for the host's later processes what they
 /// would otherwise work out again: the shader cache and its device checks ([`cache_directory`])
 /// and the reims-graphics device's kept answers, each in a directory of its own in it. `.cache` under
