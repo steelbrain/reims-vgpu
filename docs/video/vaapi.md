@@ -462,8 +462,8 @@ answers for its device, `rt_platform::HostGpu`). The arm
      was overwritten), or its planes do not lie as a target's must;
   2. by the device's GPU, into the buffer each plane lies in, the
      surface's pages or its device cache, at the plane's offset and rows,
-     the crop alone as the CPU's copy writes it (`crop_extent`), where the
-     open made a copier (reims-vgpu's `src/graphics/vaapi.rs`,
+     the crop alone as the CPU's copy writes it, where the open made a
+     copier (reims-vgpu's `src/graphics/vaapi.rs`,
      `GpuCopies`). On Linux the open makes none. On Windows the platform's
      copier declines every picture, each counted as
      `rt-video-gpu-copy-declined` (reims-vgpu's
