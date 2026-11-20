@@ -950,19 +950,13 @@ impl Platform for VulkanPlatform {
     /// 2080, whose release let go of the device 315 ms after it, met the hook waiting for one
     /// making in the driver, ended 9.6 s after the quit and left the pidfile. On that driver an
     /// exit with a device live can also end in `SIGSEGV` in the driver's exit handler
-    /// ([`crate::let_go`]). False also where a step outlasted the wait, which it warns of.
+    /// ([`crate::let_go`]). False also where a step outlasted the wait, which the gate's close
+    /// warns of, naming where the steps still in progress began.
     fn quiesce(&self, bound: std::time::Duration) -> bool {
         use crate::core::platform::os::clock::Clock as _;
 
         let until = self.clock.now_mono().saturating_add(bound);
         let parked = crate::exit_gate::close_ahead(until);
-        if !parked {
-            log::warn!(
-                target: "reims_vgpu_vulkan::exit_gate",
-                "the quiesce ahead of the exit ended after {bound:?} with a thread still in a \
-                 step of the library's"
-            );
-        }
         let asked = crate::let_go::asked_the_runtime_for_devices();
         if asked {
             let live = crate::let_go::gpus_kept();

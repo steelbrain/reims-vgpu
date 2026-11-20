@@ -37,7 +37,14 @@
 //!   steps in progress until its own deadline. The hook still runs at the exit: it finds no step
 //!   in progress where the wait ended in time, and writes the counts. Where the quiesce answers
 //!   false, the host ends with `_exit`, which runs no exit handler, so the counts are written then
-//!   ([`write_counts_ahead`]).
+//!   ([`write_counts_ahead`]). The close logs what it found: at debug, how long the close and the
+//!   wait took and how many steps were in progress on other threads, with where the outermost
+//!   began; at warn, where the deadline passed first, the steps still in progress and where the
+//!   outermost began.
+//! - **Where a step began.** Each step records its caller's site (`#[track_caller]`): a thread's
+//!   outermost step takes a slot of [`SITE_SLOTS`] as it begins and empties it as it ends, so that
+//!   the close can name the steps it waits for. Past [`SITE_SLOTS`] outermost steps at once, the
+//!   rest are counted and not named.
 //! - **Its order.** The C library runs exit handlers in the reverse order of their registration,
 //!   so the hook runs before every destructor registered before it. It is registered as a device
 //!   is adopted (`crate::gpu::device`) and as a compile pool starts, after the driver was loaded;
@@ -51,9 +58,11 @@
 //!   registration, which runs before the hook.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::panic::Location;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::time::Duration;
 
 use metal2vulkan_runtime as rt;
@@ -82,9 +91,30 @@ static IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
 /// Of them, the makings.
 static MAKINGS: AtomicU64 = AtomicU64::new(0);
 
+/// The log target of the close's lines.
+const TARGET: &str = "reims_vgpu_vulkan::exit_gate";
+
+/// How many outermost steps in progress at once the gate names by where they began ([`SITES`]).
+pub const SITE_SLOTS: usize = 64;
+
+/// One slot of [`SITES`]: the site of the outermost step that took it, or null. On a cache line
+/// of its own, so that steps of threads in neighbouring slots write no line in common.
+#[repr(align(128))]
+struct SiteSlot(AtomicPtr<Location<'static>>);
+
+/// Where each outermost step in progress began (the module docs): a thread's outermost step takes
+/// a free slot as it begins, after it was counted in [`IN_PROGRESS`], and empties it before its
+/// count ends. Only `Location::caller`'s `'static` sites are stored.
+static SITES: [SiteSlot; SITE_SLOTS] =
+    [const { SiteSlot(AtomicPtr::new(std::ptr::null_mut())) }; SITE_SLOTS];
+
 thread_local! {
     /// The steps this thread is inside.
     static DEPTH: Cell<u64> = const { Cell::new(0) };
+    /// The slot of [`SITES`] this thread's outermost step in progress took, if it took one.
+    static SLOT: Cell<Option<usize>> = const { Cell::new(None) };
+    /// The slot this thread took last, where its next outermost step looks first.
+    static HINT: Cell<usize> = const { Cell::new(0) };
     /// The steps of this thread's that ended, which register the hook again at each power of
     /// two: counted by thread, so no step's end writes what every thread's does.
     static ENDED: Cell<u64> = const { Cell::new(0) };
@@ -97,17 +127,22 @@ thread_local! {
 #[derive(Debug)]
 pub struct Step {
     making: bool,
+    /// The slot of [`SITES`] this step took, where it is its thread's outermost and found one.
+    slot: Option<usize>,
     _not_send: PhantomData<*const ()>,
 }
 
 /// A step of this thread's: `None` once the process's exit closed the gate, unless the step is
-/// inside one this thread is in, or this thread runs the exit.
+/// inside one this thread is in, or this thread runs the exit. Where it began is its caller's
+/// site (the module docs).
+#[track_caller]
 pub fn step() -> Option<Step> {
     enter(false)
 }
 
 /// A step that compiles a pipeline or a library: as [`step`], and the hook waits for it as long
 /// as [`MAKING_BOUND`], and registers again as it ends.
+#[track_caller]
 pub fn making() -> Option<Step> {
     enter(true)
 }
@@ -131,19 +166,85 @@ pub fn stay() -> ! {
 /// progress on other threads until `until`, a making's included. True once none is in progress;
 /// false where one still is at `until`, whose thread may still be in a GPU's driver. A later call
 /// closes nothing more and waits again.
+///
+/// Logs what it found (the module docs): at debug, the close's time (the hook's registration
+/// included), the steps in progress on other threads then, how many were makings and where the
+/// outermost began, and the wait's time; at warn, where `until` came first, the steps still in
+/// progress and where the outermost began.
 pub fn close_ahead(until: MonoTime) -> bool {
+    let clock = crate::os::OsClock::new();
+    let began = clock.now_mono();
     arm();
     let _ = EXITING_HERE.try_with(|e| e.set(true));
     CLOSED.store(true, Ordering::SeqCst);
-    let clock = crate::os::OsClock::new();
+    let closed = clock.now_mono();
+    let at_close = others_in_progress();
+    let makings = MAKINGS.load(Ordering::SeqCst);
+    let sites = if at_close > 0 {
+        begun_at(&sites_of_others())
+    } else {
+        String::new()
+    };
+    let mut now = closed;
     while others_in_progress() > 0 {
-        let now = clock.now_mono();
         if now >= until {
+            log::warn!(
+                target: TARGET,
+                "the gate closed ahead of the exit waited {} us, to its deadline, with {} of the \
+                 library's steps still in progress on other threads, steps inside steps counted \
+                 ({} making){}",
+                now.saturating_duration_since(closed).as_micros(),
+                others_in_progress(),
+                MAKINGS.load(Ordering::SeqCst),
+                begun_at(&sites_of_others())
+            );
             return false;
         }
         clock.sleep_until(Deadline::Mono(now.saturating_add(POLL).min(until)));
+        now = clock.now_mono();
     }
+    log::debug!(
+        target: TARGET,
+        "the gate closed ahead of the exit in {} us, the hook's registration included, with \
+         {at_close} of the library's steps in progress on other threads, steps inside steps \
+         counted ({makings} making){sites}; they ended {} us after the close",
+        closed.saturating_duration_since(began).as_micros(),
+        now.saturating_duration_since(closed).as_micros()
+    );
     true
+}
+
+/// `sites` ([`sites_of_others`]) as the close's lines end with them: `, the outermost begun at
+/// <sites>`, or nothing where there are none.
+fn begun_at(sites: &str) -> String {
+    if sites.is_empty() {
+        String::new()
+    } else {
+        format!(", the outermost begun at {sites}")
+    }
+}
+
+/// Where the outermost steps in progress on other threads began (the module docs), each site once
+/// with how many began there, `file:line:column (n)`, in order; empty where none took a slot.
+fn sites_of_others() -> String {
+    let own = SLOT.try_with(Cell::get).ok().flatten();
+    let mut at: BTreeMap<(&'static str, u32, u32), u64> = BTreeMap::new();
+    for (i, slot) in SITES.iter().enumerate() {
+        let site = slot.0.load(Ordering::SeqCst);
+        if site.is_null() || own == Some(i) {
+            continue;
+        }
+        // SAFETY: a slot holds only `Location::caller`'s sites, which live for the process.
+        let site: &'static Location<'static> = unsafe { &*site };
+        let n = at
+            .entry((site.file(), site.line(), site.column()))
+            .or_insert(0);
+        *n = n.saturating_add(1);
+    }
+    at.iter()
+        .map(|((file, line, column), n)| format!("{file}:{line}:{column} ({n})"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Registers the hook (the module docs), after every exit handler registered so far. Once the
@@ -155,12 +256,13 @@ pub fn arm() {
     // SAFETY: `at_exit` is a plain function that never unwinds.
     if unsafe { atexit(at_exit) } != 0 {
         log::warn!(
-            target: "reims_vgpu_vulkan::exit_gate",
+            target: TARGET,
             "atexit refused: the library's GPU work may run beside the driver's exit"
         );
     }
 }
 
+#[track_caller]
 fn enter(making: bool) -> Option<Step> {
     let depth = DEPTH.with(Cell::get);
     // Counted before the gate is read, and the hook closes it before it reads the count: either
@@ -174,15 +276,46 @@ fn enter(making: bool) -> Option<Step> {
         MAKINGS.fetch_add(1, Ordering::SeqCst);
     }
     DEPTH.with(|d| d.set(depth + 1));
+    let slot = (depth == 0)
+        .then(|| take_slot(Location::caller()))
+        .flatten();
     Some(Step {
         making,
+        slot,
         _not_send: PhantomData,
     })
+}
+
+/// Takes a free slot of [`SITES`] for `site`, this thread's outermost step's, looking first where
+/// this thread's last one was: the slot, or `None` where every slot is taken.
+fn take_slot(site: &'static Location<'static>) -> Option<usize> {
+    let site = std::ptr::from_ref(site).cast_mut();
+    let first = HINT.with(Cell::get).min(SITE_SLOTS - 1);
+    let taken = (first..SITE_SLOTS).chain(0..first).find(|&i| {
+        SITES.get(i).is_some_and(|slot| {
+            slot.0.load(Ordering::Relaxed).is_null()
+                && (slot.0)
+                    .compare_exchange(
+                        std::ptr::null_mut(),
+                        site,
+                        Ordering::SeqCst,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+        })
+    })?;
+    HINT.with(|h| h.set(taken));
+    SLOT.with(|s| s.set(Some(taken)));
+    Some(taken)
 }
 
 impl Drop for Step {
     fn drop(&mut self) {
         DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        if let Some(slot) = self.slot.and_then(|i| SITES.get(i)) {
+            slot.0.store(std::ptr::null_mut(), Ordering::SeqCst);
+            let _ = SLOT.try_with(|s| s.set(None));
+        }
         if self.making {
             MAKINGS.fetch_sub(1, Ordering::SeqCst);
         }
@@ -424,8 +557,9 @@ mod tests {
     }
 
     /// A gate closed ahead of the exit waits for a step in progress on another thread until its
-    /// deadline, answering false where the step outlasts it and true once it ended; it refuses a
-    /// later step of another thread, passes the closing thread's own, and leaves the hook its
+    /// deadline, answering false where the step outlasts it and true once it ended, and logs
+    /// each wait with where the step began, the first at warn and the second at debug; it refuses
+    /// a later step of another thread, passes the closing thread's own, and leaves the hook its
     /// counts at the exit: the child closes it while one thread is 300 ms into a step, first with
     /// a 50 ms deadline, then with a 5 s one, then exits
     #[test]
@@ -440,19 +574,29 @@ mod tests {
             std::thread::Builder::new()
                 .name("in a step".into())
                 .spawn(move || {
-                    let held = step().unwrap();
-                    began.send(()).unwrap();
+                    let (held, here) = (step().unwrap(), Location::caller());
+                    began.send(here).unwrap();
                     std::thread::sleep(Duration::from_millis(300));
                     say("the step in progress ended");
                     drop(held);
                 })
                 .unwrap();
-            at_begin.recv().unwrap();
+            let here = at_begin.recv().unwrap();
+            say(&format!(
+                "the step began at {}:{}:",
+                here.file(),
+                here.line()
+            ));
+            let logs = crate::core::testkit::logs::capture();
             let clock = crate::os::OsClock::new();
             let short = close_ahead(clock.now_mono().saturating_add(Duration::from_millis(50)));
             say(&format!("a 50 ms deadline answered {short}"));
             let long = close_ahead(clock.now_mono().saturating_add(Duration::from_secs(5)));
             say(&format!("a 5 s deadline answered {long}"));
+            for (level, target, line) in logs.take() {
+                say(&format!("logged {level} {target}: {line}"));
+            }
+            drop(logs);
             say(&format!("closed {}", closed()));
             match step() {
                 Some(_) => say("the closing thread's step passed"),
@@ -487,6 +631,25 @@ mod tests {
         };
         assert!(at("a 50 ms deadline answered false") < at("the step in progress ended"));
         assert!(at("the step in progress ended") < at("a 5 s deadline answered true"));
+        let site = stderr
+            .lines()
+            .find_map(|l| l.strip_prefix("the step began at "))
+            .unwrap_or_else(|| panic!("no site: {stderr}"));
+        let logged = |level: &str, words: &str| {
+            stderr.lines().any(|l| {
+                l.starts_with(&format!("logged {level} {TARGET}: "))
+                    && l.contains(words)
+                    && l.contains(&format!("the outermost begun at {site}"))
+            })
+        };
+        assert!(
+            logged("WARN", "to its deadline, with 1 of the library's steps"),
+            "{stderr}"
+        );
+        assert!(
+            logged("DEBUG", "with 1 of the library's steps in progress"),
+            "{stderr}"
+        );
         at("closed true");
         at("the closing thread's step passed");
         at("the step after the close was refused");
@@ -497,6 +660,39 @@ mod tests {
             counts.is_some_and(|l| l.contains(&format!("{CODE} 1"))),
             "{stderr}"
         );
+    }
+
+    /// The sites of the steps in progress on other threads name where each other thread's
+    /// outermost step began, once with how many began there, and neither the steps inside it nor
+    /// this thread's own; a step that ended is not named
+    #[test]
+    fn the_sites_name_where_other_threads_outermost_steps_began() {
+        let (own, own_here) = (step().unwrap(), Location::caller());
+        let (began, at_begin) = std::sync::mpsc::channel();
+        let (end, at_end) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("in a step".into())
+            .spawn(move || {
+                let (outer, here) = (step().unwrap(), Location::caller());
+                let inner = making().unwrap();
+                began.send(here).unwrap();
+                at_end.recv().unwrap();
+                drop(inner);
+                drop(outer);
+            })
+            .unwrap();
+        let here = at_begin.recv().unwrap();
+        let at = |l: &Location<'_>| format!("{}:{}:", l.file(), l.line());
+        let sites = sites_of_others();
+        end.send(()).unwrap();
+        thread.join().unwrap();
+        let named: Vec<&str> = (sites.split(", "))
+            .filter(|s| s.starts_with(&at(here)))
+            .collect();
+        assert!(named.len() == 1 && named[0].ends_with(" (1)"), "{sites}");
+        assert!(!sites.contains(&at(own_here)), "{sites}");
+        assert!(!sites_of_others().contains(&at(here)));
+        drop(own);
     }
 
     /// A step inside a step is part of it: both count until they end, and a making counts among
