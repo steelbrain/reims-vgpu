@@ -28,6 +28,14 @@
 //! pipelines of the four target formats, by a draw into a texture of each. A pool texture's open
 //! and views are made at its first picture, and kept while it lives.
 //!
+//! Direct3D 11 destroys an object whose last reference goes only at a later flush of its
+//! device's immediate context ("deferred destruction", `ID3D11DeviceContext::Flush`'s
+//! remarks). The native device's context records nothing in a draw, so its targets' textures
+//! would never be destroyed, and the draws' device would destroy their opens only at its next
+//! draw, all of a held session's at once. So a pair of targets let go flushes both contexts,
+//! under the lock, once its objects are released ([`PlaneTargets`]' last field): its textures
+//! and their memory go as it does.
+//!
 //! A target's bytes are undefined at its make. Its owner may say they are to read zeros wherever
 //! no draw writes them ([`PlaneTargets::owe_zeros`]): the next draw whose extent leaves part of
 //! them unwritten then clears both to zeros first, in the same hold of their keyed mutexes and
@@ -303,7 +311,8 @@ fn formats(ten_bit: bool) -> Formats {
 /// picture's draw is recorded at a time; and, outside it, the devices again, which make a
 /// picture's targets, and the fence, which a draw waits for.
 pub struct PlaneDraw {
-    state: Mutex<State>,
+    /// Shared with each pair of targets made, whose release flushes its contexts (module doc).
+    state: Arc<Mutex<State>>,
     makers: Makers,
     fence: Com,
 }
@@ -360,6 +369,19 @@ pub struct PlaneTargets {
     /// They are to read zeros wherever no draw writes them, and no draw or clear has since
     /// (module doc).
     zeros_owed: AtomicBool,
+    /// The flushes that destroy their objects once released (module doc). Last: a struct's
+    /// fields drop in their order, so this drops after the planes.
+    _destroyed: Destroyed,
+}
+
+/// The flushes of a [`PlaneDraw`]'s two immediate contexts, under its lock, as a pair of targets
+/// goes, once the pair's objects are released (module doc).
+struct Destroyed(Arc<Mutex<State>>);
+
+impl Drop for Destroyed {
+    fn drop(&mut self) {
+        self.0.lock().flush_destroyed();
+    }
 }
 
 /// One of [`PlaneTargets`]: a texture of the native device, shared by NT handle with a keyed
@@ -488,7 +510,7 @@ impl PlaneDraw {
         };
         state.make_pipelines()?;
         Ok(PlaneDraw {
-            state: Mutex::new(state),
+            state: Arc::new(Mutex::new(state)),
             makers,
             fence: waits,
         })
@@ -500,14 +522,18 @@ impl PlaneDraw {
         let (width, height) = size;
         let chroma = (width.div_ceil(2), height.div_ceil(2));
         let formats = formats(ten_bit);
+        // Made first, so that a luma target made before the chroma's make fails is destroyed too.
+        let destroyed = Destroyed(Arc::clone(&self.state));
+        let planes = [
+            self.makers.target(formats.targets[0], size)?,
+            self.makers.target(formats.targets[1], chroma)?,
+        ];
         Ok(PlaneTargets {
-            planes: [
-                self.makers.target(formats.targets[0], size)?,
-                self.makers.target(formats.targets[1], chroma)?,
-            ],
+            planes,
             ten_bit,
             size,
             zeros_owed: AtomicBool::new(false),
+            _destroyed: destroyed,
         })
     }
 
@@ -940,6 +966,19 @@ impl State {
             )?;
         }
         Ok(self.value)
+    }
+
+    /// Flushes the draws' device's immediate context and the native device's, so that the
+    /// objects released since are destroyed (module doc).
+    fn flush_destroyed(&self) {
+        for context in [&self.context, &self.native_context] {
+            // SAFETY: the method is ID3D11DeviceContext's `Flush`, of one of the state's
+            // immediate contexts, under the state's lock.
+            unsafe {
+                let flush: unsafe extern "system" fn(*mut c_void) = context.method(CONTEXT_FLUSH);
+                flush(context.raw());
+            }
+        }
     }
 
     /// Makes the pipelines of the draws (module doc): a draw of each pixel shader into a

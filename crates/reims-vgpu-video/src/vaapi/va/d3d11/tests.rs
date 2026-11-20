@@ -1,13 +1,15 @@
 //! The plane draws on the default adapter, against `vaGetImage`'s read back of each picture,
 //! and the zeros their targets owe.
 
+use std::ffi::c_void;
 use std::path::PathBuf;
+use std::ptr::null_mut;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::core::runtime::{Runtime as _, StdRuntime};
 
-use super::super::d3d12::{Device, SharedTexture};
+use super::super::d3d12::{Com, Device, Guid, Hresult, SharedTexture, check, guid};
 use super::super::display::Display;
 use super::super::frame::{Frame, PlaneRows};
 use super::super::h264::H264Decoder;
@@ -314,6 +316,106 @@ fn zero_owed_clears_only_targets_that_owe_zeros() {
             "{ten_bit}: every byte reads zero"
         );
     }
+}
+
+const IID_IDXGI_DEVICE: Guid = guid(
+    0x54ec_77fa,
+    0x1377,
+    0x44e6,
+    [0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c],
+);
+const IID_IDXGI_ADAPTER3: Guid = guid(
+    0x6459_67a4,
+    0x1392,
+    0x4310,
+    [0xa7, 0x98, 0x80, 0x53, 0xce, 0x3e, 0x93, 0xfd],
+);
+// The vtable indices of the methods called (the SDK's `<interface>Vtbl` structures).
+const DXGI_DEVICE_GET_ADAPTER: usize = 7;
+const ADAPTER3_QUERY_VIDEO_MEMORY_INFO: usize = 14;
+const DXGI_MEMORY_SEGMENT_GROUP_LOCAL: u32 = 0;
+const DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL: u32 = 1;
+
+/// `DXGI_QUERY_VIDEO_MEMORY_INFO`.
+#[repr(C)]
+#[derive(Default)]
+struct VideoMemoryInfo {
+    budget: u64,
+    current_usage: u64,
+    available_for_reservation: u64,
+    current_reservation: u64,
+}
+
+/// The bytes of the native device's adapter the process holds: its current usage of the
+/// adapter's local segment group and of its non-local one, as
+/// `IDXGIAdapter3::QueryVideoMemoryInfo` answers for node 0.
+fn memory_used(draw: &PlaneDraw) -> u64 {
+    let state = draw.state.lock();
+    let device = (state.native)
+        .query(&IID_IDXGI_DEVICE, "IDXGIDevice")
+        .expect("the native device's IDXGIDevice");
+    let mut adapter = null_mut();
+    // SAFETY: the method is IDXGIDevice's `GetAdapter`, which writes its output once.
+    let result = unsafe {
+        let get: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> Hresult =
+            device.method(DXGI_DEVICE_GET_ADAPTER);
+        get(device.raw(), &mut adapter)
+    };
+    let adapter = Com::made("IDXGIDevice::GetAdapter", result, adapter)
+        .expect("the device's adapter")
+        .query(&IID_IDXGI_ADAPTER3, "IDXGIAdapter3")
+        .expect("its IDXGIAdapter3");
+    [
+        DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+        DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
+    ]
+    .into_iter()
+    .map(|group| {
+        let mut info = VideoMemoryInfo::default();
+        // SAFETY: the method is IDXGIAdapter3's `QueryVideoMemoryInfo`, of node 0 and a segment
+        // group, which writes a `DXGI_QUERY_VIDEO_MEMORY_INFO`.
+        let result = unsafe {
+            let query: unsafe extern "system" fn(
+                *mut c_void,
+                u32,
+                u32,
+                *mut VideoMemoryInfo,
+            ) -> Hresult = adapter.method(ADAPTER3_QUERY_VIDEO_MEMORY_INFO);
+            query(adapter.raw(), 0, group, &mut info)
+        };
+        check("IDXGIAdapter3::QueryVideoMemoryInfo", result).expect("the adapter's memory");
+        info.current_usage
+    })
+    .sum()
+}
+
+/// Pairs of targets let go give back their memory as they go, with no draw or read back after
+/// (the module doc's deferred destruction): 16 pairs of targets of 3840 by 2160 luma samples, of
+/// 8-bit samples, hold at least their 16 times 12.4 MB of the adapter's memory more while they
+/// live, and less than a tenth of what they held once let go. Run holding the GPU, on the default
+/// adapter.
+#[test]
+#[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
+fn targets_let_go_give_back_their_memory() {
+    const SIZE: (u32, u32) = (3840, 2160);
+    let pair = u64::from(SIZE.0 * SIZE.1 + SIZE.0.div_ceil(2) * SIZE.1.div_ceil(2) * 2);
+    let draw = PlaneDraw::new(None).expect("the plane draws");
+    let before = memory_used(&draw);
+    let pairs: Vec<PlaneTargets> = (0..16)
+        .map(|_| draw.targets(SIZE, false).expect("the targets"))
+        .collect();
+    let held = memory_used(&draw).saturating_sub(before);
+    assert!(
+        held >= 16 * pair,
+        "16 pairs hold {held} bytes more, of their {} bytes",
+        16 * pair
+    );
+    drop(pairs);
+    let left = memory_used(&draw).saturating_sub(before);
+    assert!(
+        left < held / 10,
+        "{left} bytes of the {held} that 16 pairs held are left once they are let go"
+    );
 }
 
 /// A picture's extent covers its targets where it is their size, or more, each way, and only
