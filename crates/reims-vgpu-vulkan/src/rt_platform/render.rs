@@ -1033,7 +1033,10 @@ mod tests {
         };
         let resolve = 2;
         let done = CommandBufferStatus::COMPLETED;
-        assert_eq!(run(&made(), &pass(resolve, Some(&resolved)), Vec::new()), done);
+        assert_eq!(
+            run(&made(), &pass(resolve, Some(&resolved)), Vec::new()),
+            done
+        );
         let mut texels = [0u8; 64];
         resolved.read_pixels(&mut texels, 16);
         let red: [u8; 64] = std::array::from_fn(|i| [255, 0, 0, 255][i % 4]);

@@ -824,7 +824,10 @@ mod tests {
         assert_eq!(d.depth_attachment.clear_depth, 0.5);
         let z = &d.depth_attachment;
         assert_eq!((z.resolve_level, z.resolve_slice), (0, 3));
-        assert_eq!(z.depth_resolve_filter, rt::MultisampleDepthResolveFilter::Max);
+        assert_eq!(
+            z.depth_resolve_filter,
+            rt::MultisampleDepthResolveFilter::Max
+        );
         let s = &d.stencil_attachment;
         assert_eq!((s.level, s.clear_stencil), (1, 0x1ff));
         assert_eq!((s.resolve_level, s.resolve_slice), (4, 0));
