@@ -1136,13 +1136,14 @@
 
 // `FEATURES_LO` bit 1, `SURFACE_CACHE`, beside [`RGFX_FEATURE_SURFACE_PAGES`]: the host keeps
 // the GPU's copy of an IOSurface whose block the kext marks cached ([`RGFX_SURFACE_PAGES_CACHED`])
-// in its own GPU's memory, the surface's device cache, as a GPU that does not share the CPU's
-// memory keeps one. The cache is filled from the surface's pages at the first command buffer
-// that uses it after the CPU's generation of the surface moved (`RGFX_OP_SURFACE_USE`), and the
-// pages from the cache only at a [`RGFX_CMD_SURFACE_DOWNLOAD`] and at the block's
-// `BLOCK_RELEASE`; a write the host's own devices make into the pages (a video device's frame)
-// has the next use fill it again. Set where the host's GPU does not share the CPU's memory; the
-// kext alone reads it, and nothing the guest's processes see changes but the time copies take.
+// apart from its pages, the surface's device cache: in its GPU's own memory, or in the host's RAM
+// beside the pages where the GPU shares the CPU's memory. The cache is filled from the surface's
+// pages at the first command buffer that uses it after the CPU's generation of the surface moved
+// (`RGFX_OP_SURFACE_USE`), and the pages from the cache only at a [`RGFX_CMD_SURFACE_DOWNLOAD`]
+// and at the block's `BLOCK_RELEASE`; a write the host's own devices make into the pages (a video
+// device's frame) has the next use fill it again. Set on every host that offers `SURFACE_PAGES`,
+// whether or not its GPU shares the CPU's memory; the kext alone reads it, and nothing the guest's
+// processes see changes but the time copies take.
 #define RGFX_FEATURE_SURFACE_CACHE (1 << 1)
 
 // `FEATURES_LO` bit 2, `CB_SUBMITTED`: a command buffer that holds an
@@ -1353,9 +1354,8 @@
 // those pages, for any access a texture over the surface may take, would not lie in place, and
 // the kext then names the block cached ([`RGFX_SURFACE_PAGES_CACHED`]), the host keeping its
 // device cache as [`RGFX_FEATURE_SURFACE_CACHE`] says. Every other block stays in place as on a
-// host without it. A host offers it where it offers `SURFACE_PAGES` and its GPU shares the CPU's
-// memory, and offers neither `SURFACE_CACHE` nor [`RGFX_FEATURE_SURFACE_DEFERRED`] there, but
-// [`RGFX_FEATURE_SURFACE_DEFERRED_ASK`].
+// host without it. No host offers it now: one whose GPU shares the CPU's memory offers
+// `SURFACE_CACHE` and [`RGFX_FEATURE_SURFACE_DEFERRED`], as every other does.
 #define RGFX_FEATURE_SURFACE_CACHE_REFUSED (1 << 29)
 
 // `FEATURES_LO` bit 30, `SURFACE_DEFERRED_ASK`, which the guest takes through
