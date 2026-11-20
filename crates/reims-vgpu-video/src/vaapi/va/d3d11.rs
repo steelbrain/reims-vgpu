@@ -15,9 +15,12 @@
 //! one triangle a plane over the crop's extent, each pixel its texel from the crop's origin, so
 //! the targets hold what the CPU's copy writes, at their first texel, and nothing past it.
 //!
-//! A draw holds both targets' keyed mutexes (key 0) across its writes, waits on its caller's
-//! thread for the queue's fence, and then releases them, after which the importer may read
-//! them: the caller says so to it (`external_writes_done`). The importer takes no keyed mutex.
+//! A draw takes both targets' keyed mutexes (key 0), records its writes and the mutexes'
+//! release behind them, and submits them with the queue's fence signalled after them, under
+//! the [`PlaneDraw`]'s lock; it then waits on its caller's thread for the fence without the
+//! lock, so that the targets of another picture are made, and another picture's draw is
+//! recorded, while the GPU writes. Once the wait returns the importer may read the targets:
+//! the caller says so to it (`external_writes_done`). The importer takes no keyed mutex.
 //!
 //! What a picture's draw would otherwise pay the first time is made with the [`PlaneDraw`], at a
 //! decoder's open: the devices, the shaders, compiled by `D3DCompile` at run time, and the
@@ -285,9 +288,10 @@ fn formats(ten_bit: bool) -> Formats {
 
 /// The draws of pictures' planes on one adapter (module doc): its devices, shaders and fence,
 /// made at a decoder's open, and the pool textures opened so far, under one lock, so that one
-/// picture is drawn at a time.
+/// picture's draw is recorded at a time; and the fence, which a draw waits for without the lock.
 pub struct PlaneDraw {
     state: Mutex<State>,
+    fence: Com,
 }
 
 /// A [`PlaneDraw`]'s objects.
@@ -311,8 +315,6 @@ struct State {
     fence: Com,
     /// The fence's last value signalled.
     value: u64,
-    /// The event the fence's completion sets.
-    event: Handle,
     /// The pool textures opened, each kept while it lives.
     opened: Vec<Opened>,
 }
@@ -416,10 +418,7 @@ impl PlaneDraw {
         let pixel = [pair("255.0", "8")?, pair("65535.0", "16")?];
         let origin = constant_buffer(&device)?;
         let fence = new_fence(&d3d12.device)?;
-        // SAFETY: an auto-reset event, unnamed, with no security attributes.
-        let event = NonNull::new(unsafe { CreateEventW(null(), 0, 0, null()) })
-            .map(Handle)
-            .ok_or_else(|| format!("CreateEventW: {}", std::io::Error::last_os_error()))?;
+        let waits = fence.query(&IID_ID3D12_FENCE, "ID3D12Fence")?;
         let mut state = State {
             d3d12,
             queue,
@@ -433,12 +432,12 @@ impl PlaneDraw {
             origin,
             fence,
             value: 0,
-            event,
             opened: Vec::new(),
         };
         state.make_pipelines()?;
         Ok(PlaneDraw {
             state: Mutex::new(state),
+            fence: waits,
         })
     }
 
@@ -497,7 +496,7 @@ impl PlaneDraw {
             held += 1;
             Ok::<(), String>(())
         });
-        let drawn = acquired.and_then(|()| {
+        let encoded = acquired.map(|()| {
             let opened = &state.opened[at];
             let shaders = &state.pixel[usize::from(to.ten_bit)];
             let draws = [
@@ -505,14 +504,17 @@ impl PlaneDraw {
                 (chroma_target, &opened.views[1], &shaders[1], chroma),
             ];
             state.encode(&opened.wrapped, &draws);
-            state.flush_and_wait()
         });
-        // The targets are let go once the GPU wrote them, or where a call failed.
-        let released: Vec<_> = (mutexes.iter().take(held))
+        // The targets are let go behind the draws, or where a call failed; the flush submits
+        // both, and the queue signals the fence after them.
+        let released: Result<(), String> = (mutexes.iter().take(held))
             .map(|mutex| release_sync(mutex))
             .collect();
-        drawn?;
-        released.into_iter().collect()
+        let signalled = encoded.and_then(|()| state.flush_and_signal());
+        drop(state);
+        // The wait for the GPU's writes holds no lock (module doc).
+        wait_for(&self.fence, signalled?)?;
+        released
     }
 
     /// What `targets` hold, for checks: the luma's bytes and the chroma's, row after row with
@@ -809,10 +811,16 @@ impl State {
     /// Flushes what the context recorded, and waits on this thread until the GPU did it,
     /// however long it takes; `Err` where a call failed, or the device was removed.
     fn flush_and_wait(&mut self) -> Result<(), String> {
+        let value = self.flush_and_signal()?;
+        wait_for(&self.fence, value)
+    }
+
+    /// Flushes what the context recorded, and signals the fence after it on the queue: the
+    /// value it reaches once the GPU did it. `Err` where a call failed.
+    fn flush_and_signal(&mut self) -> Result<u64, String> {
         self.value += 1;
         // SAFETY: each method is the named one of its object's interface: the context's flush
-        // under the state's lock, the queue's signal of the state's fence, and the fence's
-        // event, the state's.
+        // under the state's lock, and the queue's signal of the state's fence.
         unsafe {
             let flush: unsafe extern "system" fn(*mut c_void) = self.context.method(CONTEXT_FLUSH);
             flush(self.context.raw());
@@ -822,43 +830,8 @@ impl State {
                 "ID3D12CommandQueue::Signal",
                 signal(self.queue.raw(), self.fence.raw(), self.value),
             )?;
-            if self.completed() < self.value {
-                let on_completion: unsafe extern "system" fn(
-                    *mut c_void,
-                    u64,
-                    *mut c_void,
-                ) -> Hresult = self.fence.method(FENCE_SET_EVENT_ON_COMPLETION);
-                check(
-                    "ID3D12Fence::SetEventOnCompletion",
-                    on_completion(self.fence.raw(), self.value, self.event.0.as_ptr()),
-                )?;
-                if WaitForSingleObject(self.event.0.as_ptr(), INFINITE) != WAIT_OBJECT_0 {
-                    return Err(format!(
-                        "the wait for the draw: {}",
-                        std::io::Error::last_os_error()
-                    ));
-                }
-            }
         }
-        match self.completed() {
-            // A removed device's fence answers `UINT64_MAX`, which says nothing of its writes.
-            u64::MAX => Err("the device was removed".to_owned()),
-            value if value >= self.value => Ok(()),
-            value => Err(format!(
-                "the fence answers {value} after the wait for {}",
-                self.value
-            )),
-        }
-    }
-
-    /// The fence's value.
-    fn completed(&self) -> u64 {
-        // SAFETY: the method is ID3D12Fence's `GetCompletedValue`.
-        unsafe {
-            let completed: unsafe extern "system" fn(*mut c_void) -> u64 =
-                self.fence.method(FENCE_GET_COMPLETED_VALUE);
-            completed(self.fence.raw())
-        }
+        Ok(self.value)
     }
 
     /// Makes the pipelines of the draws (module doc): a draw of each pixel shader into a
@@ -1294,6 +1267,51 @@ fn share(texture: &Com) -> Result<Handle, String> {
     NonNull::new(handle)
         .map(Handle)
         .ok_or_else(|| "IDXGIResource1::CreateSharedHandle made no handle".to_owned())
+}
+
+/// Waits on this thread until `fence`, an `ID3D12Fence`, reaches `value`, however long it takes,
+/// with an event of the wait's own, so that waits on several threads need no lock; `Err` where a
+/// call failed, or the device was removed.
+fn wait_for(fence: &Com, value: u64) -> Result<(), String> {
+    if completed(fence) < value {
+        // SAFETY: an auto-reset event, unnamed, with no security attributes; closed as the
+        // handle drops.
+        let event = NonNull::new(unsafe { CreateEventW(null(), 0, 0, null()) })
+            .map(Handle)
+            .ok_or_else(|| format!("CreateEventW: {}", std::io::Error::last_os_error()))?;
+        // SAFETY: the method is ID3D12Fence's `SetEventOnCompletion`, with the wait's event,
+        // which is open until the wait returns.
+        unsafe {
+            let on_completion: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> Hresult =
+                fence.method(FENCE_SET_EVENT_ON_COMPLETION);
+            check(
+                "ID3D12Fence::SetEventOnCompletion",
+                on_completion(fence.raw(), value, event.0.as_ptr()),
+            )?;
+            if WaitForSingleObject(event.0.as_ptr(), INFINITE) != WAIT_OBJECT_0 {
+                return Err(format!(
+                    "the wait for the draw: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+    }
+    match completed(fence) {
+        // A removed device's fence answers `UINT64_MAX`, which says nothing of its writes.
+        u64::MAX => Err("the device was removed".to_owned()),
+        reached if reached >= value => Ok(()),
+        reached => Err(format!("the fence answers {reached} after the wait for {value}")),
+    }
+}
+
+/// `fence`'s value, an `ID3D12Fence`'s.
+fn completed(fence: &Com) -> u64 {
+    // SAFETY: the method is ID3D12Fence's `GetCompletedValue`.
+    unsafe {
+        let completed: unsafe extern "system" fn(*mut c_void) -> u64 =
+            fence.method(FENCE_GET_COMPLETED_VALUE);
+        completed(fence.raw())
+    }
 }
 
 /// Takes `mutex`, an `IDXGIKeyedMutex`, at key 0, however long its holder keeps it.
