@@ -242,18 +242,21 @@ impl<T> Slots<T> {
 
     /// Chunk `at`'s walk, taken, once the helper filled its slot, waiting with no lock of the
     /// caller's held; and whether it waited. `None` where the helper's walk ended leaving it
-    /// empty.
-    pub(crate) fn wait_for(&self, at: usize) -> (Option<T>, bool) {
+    /// empty. `waits` runs once, under the slots' lock, where it starts to wait: before the
+    /// helper can fill the slot.
+    pub(crate) fn wait_for(&self, at: usize, waits: impl FnOnce()) -> (Option<T>, bool) {
         let mut state = self.state.lock();
-        let mut waited = false;
+        let mut waits = Some(waits);
         loop {
             if let Some(item) = state.items[at].take() {
-                return (Some(item), waited);
+                return (Some(item), waits.is_none());
             }
             if state.ended {
-                return (None, waited);
+                return (None, waits.is_none());
             }
-            waited = true;
+            if let Some(waits) = waits.take() {
+                waits();
+            }
             self.filled.wait(&mut state);
         }
     }
@@ -381,11 +384,16 @@ mod tests {
     fn a_chunk_s_slot_is_taken_once_filled_or_answers_none_once_the_walk_ended() {
         let slots = Slots::<u32>::new(4);
         slots.fill(0, 10);
+        let waits = AtomicUsize::new(0);
+        let count = || {
+            waits.fetch_add(1, Ordering::SeqCst);
+        };
         assert_eq!(
-            slots.wait_for(0),
+            slots.wait_for(0, count),
             (Some(10), false),
             "filled first: no wait"
         );
+        assert_eq!(waits.load(Ordering::SeqCst), 0, "filled first: no wait");
         assert!(slots.starts(3));
         slots.stop_at(3);
         slots.stop_at(4);
@@ -394,17 +402,27 @@ mod tests {
             "the earliest stop holds"
         );
         let filler = Arc::clone(&slots);
+        let waits_at = |n: usize| {
+            let waits = &waits;
+            move || crate::graphics::tests::eventually(|| waits.load(Ordering::SeqCst) == n)
+        };
+        let (first, second) = (waits_at(1), waits_at(2));
         std::thread::scope(|scope| {
             scope.spawn(move || {
                 let ending = filler.ending();
-                std::thread::sleep(Duration::from_millis(20));
+                assert!(first(), "the take of slot 1 waits");
                 filler.fill(1, 11);
-                std::thread::sleep(Duration::from_millis(20));
+                assert!(second(), "the take of slot 2 waits");
                 drop(ending);
             });
-            assert_eq!(slots.wait_for(1).0, Some(11), "waited for its fill");
-            assert_eq!(slots.wait_for(2).0, None, "the walk ended leaving it empty");
+            assert_eq!(slots.wait_for(1, count), (Some(11), true), "its fill");
+            assert_eq!(
+                slots.wait_for(2, count),
+                (None, true),
+                "the walk ended leaving it empty"
+            );
         });
-        assert_eq!(slots.wait_for(1), (None, false), "taken once");
+        assert_eq!(slots.wait_for(1, count), (None, false), "taken once");
+        assert_eq!(waits.load(Ordering::SeqCst), 2, "once a wait");
     }
 }

@@ -738,10 +738,17 @@ mod tests {
                 third.wait();
                 order.lock().push(3);
             });
-            std::thread::sleep(Duration::from_millis(30));
+            assert!(
+                until(|| lane.walks_and_turn_waits().1 == 1),
+                "the third waits"
+            );
             // The second passes before the first: the third still waits.
             drop(second);
-            std::thread::sleep(Duration::from_millis(30));
+            assert_eq!(
+                lane.walks_and_turn_waits().1,
+                1,
+                "the third went before the first passed"
+            );
             assert!(
                 order.lock().is_empty(),
                 "the third went before the first passed"
@@ -869,8 +876,8 @@ mod tests {
             (0, 1, 0),
             "(woken by a job, by an expectation, idle)"
         );
-        // The woken thread spins meanwhile, as the buffer's begin ends.
-        std::thread::sleep(Duration::from_millis(10));
+        // The job comes while the woken thread spins, whenever it comes: the spin outlasts the
+        // test's waits, and no thread is idle for the job to wake.
         assert_eq!(ran_on(&lane, 1), first, "the job ran on another thread");
         assert_eq!(lane.wakes(), (0, 1, 1), "the job woke a thread as it came");
         assert_eq!(lane.counts(), (1, 1, 0), "(idle, made, gone)");
@@ -1271,9 +1278,6 @@ mod tests {
         assert!(until(|| quiet.threads() == 0));
     }
 
-    /// How long the lanes of the tests below keep a thread with no job.
-    const TEST_IDLE: Duration = Duration::from_millis(100);
-
     /// Runs `n` jobs on `lane` that wait at one gate, and waits until they run at once and the lane
     /// has `n` threads; the gate opened, waits until they are done.
     fn burst(lane: &Arc<Lane>, n: usize) {
@@ -1296,83 +1300,6 @@ mod tests {
         assert_eq!(lane.threads(), n, "a thread a job of the burst");
         gate.open();
         assert!(until(|| done.load(Ordering::Acquire) == n));
-    }
-
-    /// The pause after each job of [`one_at_a_time_until_one_thread`], and how many jobs it runs at
-    /// most: about 4 s of them.
-    const JOB_GAP: Duration = Duration::from_millis(5);
-    const MOST_JOBS: u32 = 800;
-
-    /// Runs jobs on `lane` one at a time, each after the one before has ended and its thread has
-    /// had [`JOB_GAP`] to wait again, until the lane has one thread left after the jobs of more
-    /// than [`TEST_IDLE`]; whether it came to that within [`MOST_JOBS`]. The threads the jobs ran
-    /// on are pushed to `ran_on`.
-    fn one_at_a_time_until_one_thread(
-        lane: &Arc<Lane>,
-        ran_on: &Mutex<Vec<std::thread::ThreadId>>,
-    ) -> bool {
-        let past_idle = u32::try_from(TEST_IDLE.as_millis() / JOB_GAP.as_millis()).unwrap() + 1;
-        for n in 0..MOST_JOBS {
-            let ended = Arc::new(AtomicUsize::new(0));
-            let (job_ended, ran) = (Arc::clone(&ended), Arc::new(Mutex::new(None)));
-            let job_ran = Arc::clone(&ran);
-            lane.run(Box::new(move || {
-                *job_ran.lock() = Some(std::thread::current().id());
-                job_ended.store(1, Ordering::Release);
-            }));
-            assert!(until(|| ended.load(Ordering::Acquire) == 1));
-            ran_on.lock().extend(ran.lock().take());
-            std::thread::sleep(JOB_GAP);
-            if n >= past_idle && lane.threads() == 1 {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Jobs that come one at a time go to the thread that went idle last, so the threads a burst
-    /// made go after the lane's idle time while the jobs go on, the budget's first: woken the
-    /// longest idle first, each of the three took a job in turn and none went.
-    #[test]
-    fn a_burst_s_threads_go_while_jobs_come_one_at_a_time() {
-        let budget = Budget::new(LANE_THREADS);
-        let lane = Lane::with_idle(4, Arc::clone(&budget), TEST_IDLE);
-        burst(&lane, 3);
-        let ran_on = Mutex::new(Vec::new());
-        assert!(
-            one_at_a_time_until_one_thread(&lane, &ran_on),
-            "{} threads stayed for jobs one at a time",
-            lane.threads()
-        );
-        assert_eq!(budget.taken(), 0, "the lane's own thread is the one left");
-        // The last jobs ran on the one thread left.
-        let ran_on = ran_on.lock();
-        let last = ran_on.last().copied();
-        assert!(ran_on.iter().rev().take(5).all(|id| Some(*id) == last));
-        drop(ran_on);
-        lane.close();
-        assert!(until(|| lane.threads() == 0));
-    }
-
-    /// A burst that comes once a lane is down to one thread grows it to [`LANE_THREADS`] again,
-    /// as the first burst did.
-    #[test]
-    fn a_burst_after_the_threads_went_grows_the_lane_to_its_limit_again() {
-        let budget = Budget::new(LANE_THREADS);
-        let lane = Lane::with_idle(5, Arc::clone(&budget), TEST_IDLE);
-        burst(&lane, LANE_THREADS);
-        assert!(one_at_a_time_until_one_thread(
-            &lane,
-            &Mutex::new(Vec::new())
-        ));
-        burst(&lane, LANE_THREADS);
-        assert_eq!(budget.taken(), LANE_THREADS - 1);
-        // With no job at all, every thread goes.
-        assert!(
-            until(|| lane.threads() == 0),
-            "the idle lane's threads stayed"
-        );
-        assert_eq!(budget.taken(), 0);
     }
 
     /// A lane's threads on a clock the tests move, kept [`KEEP`].
@@ -1461,6 +1388,35 @@ mod tests {
             assert_eq!(budget.taken(), 0, "the lane's own thread is the one left");
             clock.advance(KEEP);
             assert!(until(|| lane.threads() == 0), "the last thread stayed");
+        }
+
+        /// A burst that comes once a lane is down to one thread, its burst's others gone after
+        /// [`KEEP`] while one took the jobs, grows it to [`LANE_THREADS`] again, as the first burst
+        /// did; with no job at all, every thread goes after [`KEEP`].
+        #[test]
+        fn a_burst_after_the_threads_went_grows_the_lane_to_its_limit_again() {
+            let clock = TestClock::new();
+            let budget = Budget::new(LANE_THREADS);
+            let lane = lane_on(&clock, &budget);
+            burst(&lane, LANE_THREADS);
+            assert!(until(|| lane.counts().0 == LANE_THREADS));
+            for _ in 1..KEEP.as_secs() / 2 {
+                clock.advance(Duration::from_secs(2));
+                one_job(&lane, LANE_THREADS);
+            }
+            clock.advance(Duration::from_secs(2));
+            one_job(&lane, 1);
+            assert!(until(|| lane.threads() == 1), "the burst's others went");
+            assert_eq!(budget.taken(), 0, "the lane's own thread is the one left");
+            burst(&lane, LANE_THREADS);
+            assert_eq!(budget.taken(), LANE_THREADS - 1);
+            assert!(until(|| lane.counts().0 == LANE_THREADS));
+            clock.advance(KEEP);
+            assert!(
+                until(|| lane.threads() == 0),
+                "the idle lane's threads stayed"
+            );
+            assert_eq!(budget.taken(), 0);
         }
     }
 }

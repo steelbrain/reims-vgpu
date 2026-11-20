@@ -1155,6 +1155,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         let start = clock.now_mono();
         let mut named = false;
         let mut over = || {
+            #[cfg(test)]
+            (self.shared.cache_wait_looks).fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if cancel.cut_since(begun) {
                 return true;
             }

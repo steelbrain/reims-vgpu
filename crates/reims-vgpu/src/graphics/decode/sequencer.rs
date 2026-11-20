@@ -359,9 +359,16 @@ impl Drop for Ticket {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;
-    use std::time::Duration;
 
     use super::*;
+
+    /// Whether a thread waits to commit a buffer of `context` on `s` ([`Sequencer::holds_up`]),
+    /// polled until it does as the graphics tests wait
+    /// ([`crate::graphics::tests::eventually`]).
+    fn waits(s: &Sequencer, context: Option<u32>) -> bool {
+        // A thread of no context holds up every context, context 0 among them.
+        crate::graphics::tests::eventually(|| s.holds_up(context.unwrap_or(0)))
+    }
 
     /// A commit marked after a ticket waits for it, and one marked before does not.
     #[test]
@@ -378,7 +385,7 @@ mod tests {
                 s.wait_for(Some(1), after);
                 went.store(true, Ordering::Release);
             });
-            std::thread::sleep(Duration::from_millis(50));
+            assert!(waits(&s, Some(1)), "held up by the open ticket");
             assert!(!went.load(Ordering::Acquire), "held up by the open ticket");
             drop(ticket);
         });
@@ -404,7 +411,6 @@ mod tests {
                     crate::graphics::tests::eventually(|| [s.holds_up(1), s.holds_up(2)] == holds),
                     "{what}"
                 );
-                std::thread::sleep(Duration::from_millis(20));
                 assert!(!waiter.is_finished(), "{what}: waits for the ticket");
                 drop(ticket);
             });
@@ -458,8 +464,8 @@ mod tests {
                     s.wait_for(context, mark);
                     went.store(true, Ordering::Release);
                 });
-                std::thread::sleep(Duration::from_millis(50));
-                let early = went.load(Ordering::Acquire);
+                let held = waits(&s, context);
+                let early = !held || went.load(Ordering::Acquire);
                 drop(ticket);
                 assert!(
                     !early,
@@ -512,7 +518,7 @@ mod tests {
                 s.wait_for_ranges(1, asked);
                 went.store(true, Ordering::Release);
             });
-            std::thread::sleep(Duration::from_millis(50));
+            assert!(waits(&s, Some(1)), "committed before the range messages");
             assert!(
                 !went.load(Ordering::Acquire),
                 "committed before the range messages"

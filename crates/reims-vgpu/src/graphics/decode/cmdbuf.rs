@@ -3272,12 +3272,13 @@ impl<P: Platform> GraphicsDecoder<P> {
                 Some(chunk) => (chunk, Duration::ZERO),
                 None => {
                     let waiting = clock.now_mono();
-                    let (chunk, did) = deal.slots.wait_for(j);
+                    let (chunk, did) = deal.slots.wait_for(j, || {
+                        #[cfg(test)]
+                        (self.shared.deal_waits).fetch_add(1, Ordering::Relaxed);
+                    });
                     let waited = clock.now_mono().saturating_duration_since(waiting);
                     deal.stats.waited += waited;
                     deal.stats.waits += u64::from(did);
-                    #[cfg(test)]
-                    (self.shared.deal_waits).fetch_add(u64::from(did), Ordering::Relaxed);
                     let Some(chunk) = chunk else {
                         return Err(op_fault("a dealt chunk was walked by no helper"));
                     };
@@ -3425,7 +3426,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         deal.slots.stop_at(at);
         let before = deal.own.iter().enumerate().take(at).skip(deal.next);
         for (j, _) in before.filter(|(_, own)| own.is_none()) {
-            match deal.slots.wait_for(j).0 {
+            match deal.slots.wait_for(j, || {}).0 {
                 Some(chunk) if !chunk.walked() => return chunk.outcome,
                 Some(_) => {}
                 None => return Err(op_fault("a dealt chunk was walked by no helper")),
@@ -5393,6 +5394,18 @@ mod tests {
         );
     }
 
+    /// Whether a thread waits on the CPU for a buffer's shared event since `mark`, as the host's
+    /// work started off a command buffer waits for the buffers of other queues
+    /// (`GraphicsDecoder::wait_for_order_on_cpu`): polled until it does, [`PATIENCE`] times at
+    /// most.
+    ///
+    /// [`PATIENCE`]: crate::graphics::tests::PATIENCE
+    fn waits_on_the_cpu(p: &FakePlatform, mark: u64) -> bool {
+        crate::graphics::tests::eventually(|| {
+            (p.call_log().sels_since(mark)).contains(&"waitUntilSignaledValue:timeoutMS:")
+        })
+    }
+
     /// A video decode of a command buffer that waits for a buffer of another queue starts once
     /// that buffer has finished: the session's work runs on a queue of its own, which the command
     /// buffer's GPU wait does not hold, so the host waits on the CPU first. A decode whose named
@@ -5477,9 +5490,13 @@ mod tests {
         ops.extend(op(RGFX_OP_ENCODER_END, &[]));
         let message = command_buffer_message(100, 1, &ops);
         let mut walker = dec.sender(None, super::super::Sinks::default());
+        let mark = p.call_log().mark();
         std::thread::scope(|scope| {
             let walk = scope.spawn(|| walker.decode(&p.device(), &message).unwrap());
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                waits_on_the_cpu(&p, mark),
+                "the decode waits on the CPU for the read"
+            );
             assert!(
                 seen.decodes.lock().is_empty(),
                 "the decode waits for the read"
@@ -6039,9 +6056,13 @@ mod tests {
         assert_eq!(posted(&records).len(), 1);
         let message = on_queue(writes_cached_video(200, 1, true), 9);
         let mut walker = r.dec.sender(None, super::super::Sinks::default());
+        let mark = r.p.call_log().mark();
         std::thread::scope(|scope| {
             let walk = scope.spawn(|| walker.decode(&r.p.device(), &message).unwrap());
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                waits_on_the_cpu(&r.p, mark),
+                "the decode waits on the CPU for buffer 100's end"
+            );
             assert_eq!(
                 seen.decodes.lock().len(),
                 1,
@@ -6322,28 +6343,32 @@ mod tests {
         let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
         let message = writes_cached_video(101, 2, true);
         let p = Arc::clone(&r.p);
+        let decoders = r.dec.decoders();
         let mut walker = r.dec.sender(None, super::super::Sinks::default());
         std::thread::scope(|scope| {
             let walk = scope.spawn(|| walker.decode(&p.device(), &message).unwrap());
-            let mut lines = Vec::new();
+            // The wait looks, and looks again: so the look after the first one seen began after
+            // the platform's clock moved on, and went on.
+            let looked_twice = |what: &str| {
+                let looks = decoders.cache_wait_looks();
+                assert!(
+                    crate::graphics::tests::eventually(|| decoders.cache_wait_looks() > looks + 1),
+                    "{what}: the wait goes on"
+                );
+            };
+            looked_twice("the decode waits for the fill");
             let named = |lines: &[reims_vgpu_vulkan::core::testkit::logs::Line]| {
                 (lines.iter()).any(|(level, _, line)| {
                     *level == log::Level::Warn && line.contains("has not finished after 2s")
                 })
             };
-            // The platform's clock moves on, a second at a time, until the log names the wait.
-            for _ in 0..1000 {
-                lines.extend(logs.take());
-                if named(&lines) {
-                    break;
-                }
-                p.virtual_clock().advance(std::time::Duration::from_secs(1));
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+            p.virtual_clock().advance(std::time::Duration::from_secs(2));
+            looked_twice("2 s on");
+            let lines = logs.take();
             assert!(named(&lines), "the wait is named: {lines:?}");
             p.virtual_clock()
                 .advance(std::time::Duration::from_secs(60));
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            looked_twice("a minute on");
             assert!(
                 !walk.is_finished() && seen.decodes.lock().is_empty(),
                 "the decode waits for the fill"
@@ -6372,7 +6397,11 @@ mod tests {
         let mut walker = r.dec.sender(None, super::super::Sinks::default());
         std::thread::scope(|scope| {
             let walk = scope.spawn(|| walker.decode(&p.device(), &message));
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            let looks = decoders.cache_wait_looks();
+            assert!(
+                crate::graphics::tests::eventually(|| decoders.cache_wait_looks() > looks + 1),
+                "the decode waits for the fill"
+            );
             assert!(!walk.is_finished(), "the decode waits for the fill");
             decoders.resetting();
             assert!(walk.join().unwrap().is_err(), "the op faults");
@@ -11726,12 +11755,35 @@ mod tests {
         assert_eq!(answered(&posted), answered_whole);
     }
 
-    /// What finding the cuts costs ([`deal`]): nothing measurable on a stream under the least
-    /// bytes, which it does not read; a read of each op's header on a long one. Printed (run
-    /// with `--no-capture`).
+    /// [`deal`] answers a stream under the least bytes from its length alone, so it reads none of
+    /// it: `None` whatever it holds, the ops of a stream it deals at its own length as much as
+    /// bytes no walk parses. At the least bytes it reads the stream, and its answer follows what
+    /// the stream holds. What that costs is [`deal_costs`]'s measurement.
     #[test]
-    #[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
     fn deal_reads_nothing_of_a_short_stream() {
+        let dealt = passes(107);
+        let least = dealt.len();
+        let unparsed = vec![0xff; least];
+        let deal_at =
+            |ops: &[u8], min_bytes| deal(ops, min_bytes, DEAL_CHUNK_BYTES, TAKE_IN_FLIGHT_MAX);
+        assert!(deal_at(&dealt, least).is_some(), "read: it deals");
+        assert_eq!(deal_at(&unparsed, least), None, "read: it does not parse");
+        for (ops, what) in [
+            (&dealt[..], "it deals"),
+            (&unparsed[..], "it does not parse"),
+        ] {
+            assert_eq!(deal_at(ops, least + 1), None, "a byte short, where {what}");
+        }
+        assert_eq!(deal_at(&[], least), None, "no ops");
+    }
+
+    /// What finding the cuts costs ([`deal`]): nothing measurable on a stream under the least
+    /// bytes, which it does not read ([`deal_reads_nothing_of_a_short_stream`]); a read of each
+    /// op's header on a long one. Printed: run it by name with `--no-capture`, in a release build.
+    #[test]
+    #[ignore = "a measurement, run by hand in a release build with --no-capture"]
+    #[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
+    fn deal_costs() {
         use std::hint::black_box;
         let short = passes(2);
         let long = passes(107);
@@ -11759,7 +11811,6 @@ mod tests {
             long.len(),
             cuts.map_or(0, |c| c.len() + 1)
         );
-        assert!(short_ns < 50.0, "{short_ns} ns a short stream");
     }
 
     /// A command buffer dealt to two threads answers as one walked whole, whichever thread is
@@ -11795,18 +11846,21 @@ mod tests {
         dec.set_deal_min_bytes(Some(0));
         dec.set_deal_chunk_bytes(Some(0));
         dec.set_helper_first(true);
-        // The helper ahead, this thread's walk held 2 ms an op; then this thread ahead, the
-        // helper's held so, so this thread waits for each of its chunks.
-        for (seqno, ahead) in [(361, true), (362, false)] {
-            let clock = Arc::clone(&p);
+        // The helper started first, the two walks then in whatever order they run; then the
+        // helper's walk held at its first op until this thread waits for one of its chunks.
+        let decoders = dec.decoders();
+        for (seqno, held) in [(361, false), (362, true)] {
+            let (clock, decoders) = (Arc::clone(&p), decoders.clone());
+            let waits = dec.deal_waits();
             dec.set_walk_hook(Some(Arc::new(move |_| {
                 let helper = std::thread::current().name() == Some("reims-vgpu.graphics-helper");
-                if helper != ahead {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
+                if helper && held {
+                    // Bounded: a walk that never waits ends the hold, and the check below fails.
+                    crate::graphics::tests::eventually(|| decoders.deal_waits() > waits);
                 }
                 clock.virtual_clock().advance(SPLIT_AFTER);
             })));
-            let (begun, waits, mark) = (dec.walks_begun(), dec.deal_waits(), p.call_log().mark());
+            let (begun, mark) = (dec.walks_begun(), p.call_log().mark());
             assert_eq!(
                 dec.decode(&device, &command_buffer_message(seqno, 91, &ops))
                     .unwrap(),
@@ -11826,7 +11880,7 @@ mod tests {
                 calls.len() / 2,
                 "the odd chunks on a helper"
             );
-            if !ahead {
+            if held {
                 assert!(
                     dec.deal_waits() > waits,
                     "this thread waited for the helper"

@@ -218,12 +218,10 @@ pub(crate) fn wait(
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the threads
 mod tests {
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::thread::JoinHandle;
-    use std::time::{Duration, Instant};
 
     use reims_vgpu_graphics::ops::{
         RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_COMMIT_ORDER, RGFX_OP_SUBMITTED, RgfxCommandBuffer,
@@ -243,11 +241,6 @@ mod tests {
     const A: u64 = 1 << RGFX_CONTEXT_OBJ_ID_SHIFT | 1;
     const A2: u64 = 1 << RGFX_CONTEXT_OBJ_ID_SHIFT | 2;
     const B: u64 = 2 << RGFX_CONTEXT_OBJ_ID_SHIFT | 1;
-
-    /// How long a test waits for a thread it expects to go on.
-    const PATIENCE: Duration = Duration::from_secs(10);
-    /// How long a test watches a thread it expects to stay held.
-    const WATCH: Duration = Duration::from_millis(100);
 
     struct Rig {
         p: Arc<FakePlatform>,
@@ -410,23 +403,21 @@ mod tests {
         }
     }
 
-    /// `thread`'s outcome, once it ends, which it must within [`PATIENCE`].
+    /// `thread`'s outcome, once it ends, polled for as the graphics tests poll
+    /// ([`crate::graphics::tests::eventually`]: a loaded host starves the decoder's threads for
+    /// seconds).
     fn joined<T>(thread: JoinHandle<T>, what: &str) -> T {
-        let start = Instant::now();
-        while !thread.is_finished() {
-            assert!(start.elapsed() < PATIENCE, "{what} never went on");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        until(&format!("{what}'s end"), || thread.is_finished());
         thread.join().unwrap()
     }
 
-    /// Waits until `done`, which must come within [`PATIENCE`].
+    /// Waits until `done`, polled for as the graphics tests poll
+    /// ([`crate::graphics::tests::eventually`]).
     fn until(what: &str, done: impl Fn() -> bool) {
-        let start = Instant::now();
-        while !done() {
-            assert!(start.elapsed() < PATIENCE, "{what} never came");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        assert!(
+            crate::graphics::tests::eventually(done),
+            "{what} never came"
+        );
     }
 
     /// A buffer that names a buffer of another queue of its process takes its place among the
@@ -437,7 +428,9 @@ mod tests {
     fn a_buffer_is_begun_and_committed_after_the_buffer_of_another_queue_it_names() {
         let r = rig();
         let x = r.carry_out("x", A2, 3, &ops(&[(A, 5)], false));
-        std::thread::sleep(WATCH);
+        until("its wait for the begin of the buffer it names", || {
+            r.waited_on(A)
+        });
         assert_eq!(r.state(A2), (0, 0), "begun before the buffer it names");
 
         let device = r.p.device();
@@ -450,7 +443,6 @@ mod tests {
         assert_eq!(r.state(A), (5, 0));
         until("its begin", || r.state(A2).0 == 3);
         until("its wait on the named queue", || r.waited_on(A));
-        std::thread::sleep(WATCH);
         assert!(
             r.commits().is_empty(),
             "committed before the buffer it names"
@@ -504,7 +496,9 @@ mod tests {
                 outcomes
             })
             .unwrap();
-        std::thread::sleep(WATCH);
+        // The service thread waits in the begin of the buffer that names, so it takes no later
+        // buffer.
+        until("the begin's wait for the buffer named", || r.waited_on(A));
         assert!(
             !r.submitted.lock().contains(&cb(A2, 4)),
             "its later buffer taken before the buffer named was begun"
@@ -530,7 +524,9 @@ mod tests {
         };
         let x = r.carry_out("x", A2, 3, &ops(&[(A, 5)], false));
         let y = r.carry_out("y", A, 5, &ops(&[(A2, 3)], false));
-        std::thread::sleep(WATCH);
+        until("each one's wait for the other's begin", || {
+            r.waited_on(A) && r.waited_on(A2)
+        });
         assert!(!x.is_finished() && !y.is_finished());
 
         let device = r.p.device();
@@ -572,7 +568,9 @@ mod tests {
         for how in ["op_bytes", "short", "refused"] {
             let r = rig();
             let x = r.carry_out("x", A2, 3, &ops(&[(A, 5)], false));
-            std::thread::sleep(WATCH);
+            until("its wait for the begin of the buffer it names", || {
+                r.waited_on(A)
+            });
             assert_eq!(r.state(A2), (0, 0), "begun before the buffer it names");
 
             let device = r.p.device();
@@ -595,7 +593,8 @@ mod tests {
             };
             assert_eq!(failed.err(), Some(expected), "{how}");
             until("its begin", || r.state(A2).0 == 3);
-            std::thread::sleep(WATCH);
+            // Its begin's wait ended before its begin: a wait seen now is its commit's.
+            until("its commit's wait for the failure", || r.waited_on(A));
             assert!(r.commits().is_empty(), "committed before the failure");
             drop(y);
             assert_eq!(joined(x, "the buffer"), Ok(()));
@@ -617,7 +616,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let x = r.carry_out("x", A2, 3, &ops(&[(A, 5)], false));
-            std::thread::sleep(WATCH);
+            until("its wait for the buffer it names", || r.waited_on(A));
             assert!(
                 r.commits().is_empty(),
                 "committed before the buffer it names"
@@ -643,7 +642,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let x = r.carry_out("x", A2, 3, &ops(&[(A, 5)], false));
-        std::thread::sleep(WATCH);
+        until("its wait for the buffer it names", || r.waited_on(A));
         assert!(
             r.commits().is_empty(),
             "committed before the buffer it names"
@@ -655,7 +654,7 @@ mod tests {
         r.dec.decoders().reset_done();
 
         let after = r.carry_out("after", A2, 6, &ops(&[(A, 5)], false));
-        std::thread::sleep(WATCH);
+        until("a wait after the reset", || r.waited_on(A));
         assert!(!after.is_finished(), "a wait after the reset did not wait");
         assert_eq!(
             y.finish_command_buffer(&device, &named, begun).unwrap(),

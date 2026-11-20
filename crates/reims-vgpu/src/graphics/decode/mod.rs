@@ -970,9 +970,14 @@ pub(crate) struct Shared<P: Platform> {
     /// the tests).
     #[cfg(test)]
     walks_begun: std::sync::atomic::AtomicU64,
-    /// The helpers' chunks a dealt walk waited for at their commit (for the tests).
+    /// The helpers' chunks a dealt walk waited for at their commit, counted as each wait starts
+    /// (for the tests).
     #[cfg(test)]
     deal_waits: std::sync::atomic::AtomicU64,
+    /// The looks of the video ops' waits for the host's work on a cache, one after each slice of
+    /// a wait the work did not end in, as the wait asks whether to go on (for the tests).
+    #[cfg(test)]
+    cache_wait_looks: std::sync::atomic::AtomicU64,
     /// The device's BAR 2 region: the host memory the over-host-memory buffers
     /// and heaps are placed over. Held so it stays mapped while the decoder's
     /// objects live; declared last so the contexts drop before it (a buffer
@@ -997,6 +1002,20 @@ impl<P: Platform> Shared<P> {
 pub(crate) struct Decoders<P: Platform>(Arc<Shared<P>>);
 
 impl<P: Platform> Decoders<P> {
+    /// The helpers' chunks the dealt walks waited for at their commit so far, counted as each
+    /// wait starts (for the tests): read from any thread, a walk hook's among them.
+    #[cfg(test)]
+    pub(crate) fn deal_waits(&self) -> u64 {
+        (self.0.deal_waits).load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The looks of the video ops' waits for the host's work on a cache so far, one after each
+    /// slice the work did not end in (for the tests): a wait is under way once it rises.
+    #[cfg(test)]
+    pub(crate) fn cache_wait_looks(&self) -> u64 {
+        (self.0.cache_wait_looks).load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// A decoder for a message from `context` (`None`: what is no context's), its records going
     /// to `sinks`.
     pub(crate) fn sender(&self, context: Option<u32>, sinks: Sinks) -> GraphicsDecoder<P> {
@@ -1327,6 +1346,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             walks_begun: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             deal_waits: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            cache_wait_looks: std::sync::atomic::AtomicU64::new(0),
             region,
         });
         GraphicsDecoder::on(shared, None, Sinks::default())
@@ -3289,10 +3310,11 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.shared.helper_first.store(first, Ordering::Relaxed);
     }
 
-    /// The helpers' chunks the dealt walks waited for at their commit so far (for the tests).
+    /// The helpers' chunks the dealt walks waited for at their commit so far, counted as each
+    /// wait starts (for the tests).
     #[cfg(test)]
     pub(crate) fn deal_waits(&self) -> u64 {
-        (self.shared.deal_waits).load(std::sync::atomic::Ordering::Relaxed)
+        self.decoders().deal_waits()
     }
 
     /// The command buffers' walks begun so far, once a buffer (for the tests).
