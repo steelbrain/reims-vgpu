@@ -27,7 +27,8 @@
 //! are never reached. The piece that makes the kind gives it a type of its own.
 //!
 //! **What it shares with `VulkanPlatform`** is the platform's and not the runtime's: the OS's VM,
-//! clocks and threads ([`crate::os`]), the logger, and the degradation counts ([`crate::answer`]).
+//! clocks and threads ([`crate::os`]), the logger, the degradation counts ([`crate::answer`]), and
+//! the trace's clock ([`crate::core::trace`]).
 //! It keeps none of the old runtime's device tables, device checks, vendor, device or driver ID
 //! branches, or queue-sharing policies: rt has none.
 //!
@@ -257,10 +258,14 @@ impl std::fmt::Debug for RtPlatform {
 
 impl RtPlatform {
     /// The process's platform. Make one per process (D17). It installs what the OS's services need
-    /// first ([`crate::os::install_process_services`]).
+    /// first ([`crate::os::install_process_services`]), and the trace's clock: the Vulkan
+    /// platform's ([`crate::gpu::timing::trace_clock`]), which the tools that read a trace place
+    /// its events by, so a run with the trace's file (`REIMS_VGPU_TRACE`) writes its events on rt
+    /// too. Without the file the clock writes nothing ([`crate::core::trace`]).
     pub fn new() -> RtPlatform {
         crate::os::install_process_services();
         crate::recorder::start_from_env();
+        crate::core::trace::set_clock(crate::gpu::timing::trace_clock);
         RtPlatform {
             vm: OsVm::new(),
             clock: OsClock::new(),
@@ -593,6 +598,30 @@ impl Platform for RtPlatform {
 mod tests {
     use super::*;
     use crate::core::platform::descriptor::TextureDescriptor;
+
+    /// The platform installs the trace's clock at its start, so a run with the trace's file
+    /// writes events on rt as on the Vulkan platform: an event after the platform's start is a
+    /// line of the file, on the clock's time.
+    #[test]
+    fn a_trace_run_writes_events() {
+        use crate::core::trace;
+        // nextest runs each test in a process of its own, whose trace file is this one
+        let path = std::env::temp_dir().join(format!("rvg-rt-trace-{}.txt", std::process::id()));
+        assert!(trace::to_file(&path));
+        assert!(!trace::on(), "no clock before the platform's start");
+        let _platform = RtPlatform::new();
+        assert!(trace::on());
+        let before = crate::gpu::timing::trace_clock();
+        trace::event("probe", &[7]);
+        trace::flush_before_death();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let probe = text.lines().find(|l| l.split(' ').nth(2) == Some("probe"));
+        let fields: Vec<&str> = probe.expect("the event's line").split(' ').collect();
+        let at: u64 = fields[0].parse().unwrap();
+        assert!(at >= before && before > 0, "{text}");
+        assert_eq!(fields[3..], ["7"]);
+    }
 
     /// The count of `code` in the process's degradation counts.
     fn counted(code: &str) -> u64 {
