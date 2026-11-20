@@ -2187,8 +2187,7 @@ mod tests {
     /// the one posted. On a GPU of its own memory no such bit is offered, and the buffer keeps two
     /// copies: the GPU reads its own, which holds the CPU's bytes as of the first commit after the
     /// make, until a `didModifyRange:` brings a later write over; and the CPU's bytes keep out the
-    /// GPU's write. (A blit, not a kernel that loads the address from an argument buffer: rt's
-    /// translator refuses that kernel, `reach.metal`: IdentityDomains, rt-refused-translation.)
+    /// GPU's write.
     #[test]
     fn on_vulkan_rt_s_managed_buffer_at_its_copy_is_the_copy_s_bytes_where_memory_is_shared() {
         use std::sync::mpsc;
