@@ -86,6 +86,14 @@
 //! - **Sampler states by border.** Each sampler state made (`newSamplerStateWithDescriptor:`), and
 //!   of them each that clamps to its border colour in some direction, by its border colour
 //!   ([`sampler`]). A function's constexpr samplers are not counted.
+//! - **Exported block makes.** Each of rt's `Device::new_exported_block` calls the platform made
+//!   (`super::export`), timed alone with the host's monotonic clock ([`exported_block_made`]):
+//!   their count, those over 5 ms, and the longest with its bytes. Each is an allocation of its
+//!   own: rt dedicates an exported block's memory to it.
+//! - **rt's timed take parts.** rt's `Timed` metrics of its block takes and makes (`takes`,
+//!   `take_lock_waits`, `take_makes`, `take_maps`, `maker_makes`, `zero_writes`,
+//!   `long_take_zero_writes`): for each, its calls, those over 5 ms, and its longest call with
+//!   that call's bytes and whether it made an allocation of its own.
 //!
 //! Totals, numbers, formats, sizes and usages only: no name, label or byte of the guest's leaves
 //! the process, but through the switch below. A diagnostic, which the contract leaves free:
@@ -1138,6 +1146,85 @@ pub fn sampler(d: &rt::SamplerDescriptor) {
     }
 }
 
+// ----- Exported block makes.
+
+/// rt's exported block makes (the module's docs): their count, those over 5 ms, and the longest's
+/// nanoseconds and bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ExportMakes {
+    count: u64,
+    over_5_ms: u64,
+    longest_nanos: u64,
+    longest_bytes: u64,
+}
+
+impl ExportMakes {
+    /// Adds a make of `bytes` that took `nanos`.
+    fn add(&mut self, nanos: u64, bytes: u64) {
+        self.count += 1;
+        if nanos > 5_000_000 {
+            self.over_5_ms += 1;
+        }
+        if nanos > self.longest_nanos {
+            self.longest_nanos = nanos;
+            self.longest_bytes = bytes;
+        }
+    }
+}
+
+/// The process's exported block makes.
+static EXPORT_MAKES: Mutex<ExportMakes> = Mutex::new(ExportMakes {
+    count: 0,
+    over_5_ms: 0,
+    longest_nanos: 0,
+    longest_bytes: 0,
+});
+
+/// Counts one of rt's `Device::new_exported_block` calls, of `bytes`, which took `nanos` (the
+/// module's docs).
+pub(super) fn exported_block_made(nanos: u64, bytes: u64) {
+    EXPORT_MAKES.lock().add(nanos, bytes);
+}
+
+/// The exported block makes' line.
+fn export_makes_line(e: &ExportMakes) -> String {
+    format!(
+        "reims-vgpu: rt-diag exported-block makes: {} calls, {} over 5 ms, longest {:.3} ms of {} \
+         bytes (an allocation of its own)",
+        e.count,
+        e.over_5_ms,
+        e.longest_nanos as f64 / 1e6,
+        e.longest_bytes
+    )
+}
+
+/// rt's timed take parts' line (the module's docs), from `m`.
+fn timed_parts_line(m: &rt::Metrics) -> String {
+    let parts = [
+        ("takes", m.takes),
+        ("take-lock-waits", m.take_lock_waits),
+        ("take-makes", m.take_makes),
+        ("take-maps", m.take_maps),
+        ("maker-makes", m.maker_makes),
+        ("zero-writes", m.zero_writes),
+        ("long-take-zero-writes", m.long_take_zero_writes),
+    ];
+    let all: Vec<String> = parts
+        .iter()
+        .map(|(part, t)| {
+            format!(
+                "{part} {} calls {} over 5 ms longest {:.3} ms of {} bytes{}",
+                t.count,
+                t.over_5_ms,
+                t.longest_nanos as f64 / 1e6,
+                t.longest_bytes,
+                if t.longest_made { " made" } else { "" }
+            )
+        })
+        .collect();
+    format!("reims-vgpu: rt-diag timed take parts: {}", all.join(", "))
+}
+
 // ----- Refused pipelines' AIR.
 
 /// The variable that names the directory refused pipelines' AIR is written into (the module's
@@ -1942,6 +2029,7 @@ pub fn write() {
             "reims-vgpu: rt-diag allocation sites, longest call first: {}",
             all.join(", ")
         );
+        let _ = writeln!(out, "{}", timed_parts_line(&m));
         // The textures rt cleared at their make, which placed images skip
         // (`texture::PLACED_IMAGES_CODE`), and the Private memory it holds now.
         let (private, idle, blocks) = super::device::gauges().map_or((0, 0, 0), |g| {
@@ -1958,6 +2046,7 @@ pub fn write() {
             blocks
         );
     }
+    let _ = writeln!(out, "{}", export_makes_line(&EXPORT_MAKES.lock()));
     for (kind, t) in OVERS.lock().iter() {
         let n = |a: &AtomicU64| a.load(Relaxed);
         let _ = writeln!(
@@ -2399,6 +2488,54 @@ mod tests {
         assert_eq!(now - made, 3);
         let added: Vec<u64> = by.iter().zip(borders).map(|(n, was)| n - was).collect();
         assert_eq!(added, [0, 1, 1, 0]);
+    }
+
+    /// The exported block makes keep the longest call's bytes and count those over 5 ms; the
+    /// line says each.
+    #[test]
+    fn exported_block_makes_keep_the_longest_calls_bytes() {
+        let mut e = ExportMakes::default();
+        e.add(2_000_000, 1 << 20);
+        e.add(30_400_000, 12 << 20);
+        e.add(6_000_000, 4 << 20);
+        assert_eq!(
+            e,
+            ExportMakes {
+                count: 3,
+                over_5_ms: 2,
+                longest_nanos: 30_400_000,
+                longest_bytes: 12 << 20
+            }
+        );
+        assert_eq!(
+            export_makes_line(&e),
+            "reims-vgpu: rt-diag exported-block makes: 3 calls, 2 over 5 ms, longest 30.400 ms \
+             of 12582912 bytes (an allocation of its own)"
+        );
+    }
+
+    /// rt's timed take parts' line names each part with its longest call's bytes, and `made`
+    /// where that call made an allocation of its own.
+    #[test]
+    fn the_timed_take_parts_line_names_each_longest_call() {
+        let mut m = rt::Metrics::default();
+        m.takes.count = 9;
+        m.takes.over_5_ms = 1;
+        m.takes.longest_nanos = 7_250_000;
+        m.takes.longest_bytes = 1 << 20;
+        m.takes.longest_made = true;
+        m.zero_writes.count = 2;
+        m.zero_writes.longest_nanos = 1_000;
+        m.zero_writes.longest_bytes = 4096;
+        assert_eq!(
+            timed_parts_line(&m),
+            "reims-vgpu: rt-diag timed take parts: takes 9 calls 1 over 5 ms longest 7.250 ms \
+             of 1048576 bytes made, take-lock-waits 0 calls 0 over 5 ms longest 0.000 ms of 0 \
+             bytes, take-makes 0 calls 0 over 5 ms longest 0.000 ms of 0 bytes, take-maps 0 calls \
+             0 over 5 ms longest 0.000 ms of 0 bytes, maker-makes 0 calls 0 over 5 ms longest \
+             0.000 ms of 0 bytes, zero-writes 2 calls 0 over 5 ms longest 0.001 ms of 4096 bytes, \
+             long-take-zero-writes 0 calls 0 over 5 ms longest 0.000 ms of 0 bytes"
+        );
     }
 
     /// A refused pipeline's functions' library is written once into the directory, as its hash

@@ -119,7 +119,10 @@ pub(super) fn exportable(
         refused(sel, &format!("a buffer of {length} bytes at {offset}"));
         return None;
     };
-    let (block, export) = match device.rt().new_exported_block(handle, span) {
+    let start = rt::host_time();
+    let made = device.rt().new_exported_block(handle, span);
+    super::diag::exported_block_made(rt::host_time().saturating_sub(start), span);
+    let (block, export) = match made {
         Ok(made) => made,
         Err(error) => {
             refused(sel, &error);
