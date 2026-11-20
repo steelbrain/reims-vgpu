@@ -125,9 +125,8 @@ header --check` keeps the committed header equal to cbindgen's output.
 ## Checking a change
 
 Run the checks a change can reach, and no others. Measured on the M3 Max on
-COUNT_FROM_CUTDEL_BATCH, the workspace's tests take COUNT_FROM_CUTDEL_BATCH
-of GPU time after their build (`cargo nextest run --workspace` with the
-tested features, COUNT_FROM_CUTDEL_BATCH tests). A GPU test can fail beside
+2026-11-20, the workspace's tests take 13 s of GPU time after their build
+(`cargo nextest run --workspace` with the tested features, 2260 tests). A GPU test can fail beside
 GPU work or heavy load elsewhere on the host, and passes run again alone.
 
 | the change touches | check it with |
