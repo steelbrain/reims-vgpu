@@ -42,10 +42,6 @@
 //!   staged copy out of its cache, its command buffer completed, moves into its pages there and
 //!   lands, answering what waited for it (`surface_cache`, "Staged copies"), in the order its
 //!   block's copies completed, other blocks' beside it. It waits for nothing.
-//! - The shape blocks' worker's (`reims-vgpu.graphics-shape-blocks-<i>`) key is a block's offset:
-//!   the take of a block ahead of its cache's whole-extent shape's image, handed over after the
-//!   block's `SURFACE_PAGES` is answered (`surface_cache::shapes`, "Blocks taken ahead"), under
-//!   the reset gate held shared, waiting for no key's job and answering nothing.
 //! - The video caches' spare surfaces' worker's (`reims-vgpu.graphics-drawn-spares-<i>`, on
 //!   Windows) jobs share one key: the spare surfaces over Direct3D 11 textures an ask hands over,
 //!   made ahead one at a time (`surface_cache`'s `exported` and `spares`), each under the reset

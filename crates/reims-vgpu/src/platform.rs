@@ -43,43 +43,6 @@ pub type ViewImports<P> = Arc<
         + Sync,
 >;
 
-/// A block of the platform's memory taken ahead of a shape's image
-/// ([`ApiPlatform::shape_block`]), which [`ApiPlatform::placed_shape_image_in`] places one in:
-/// the platform's own, which goes back to it as this drops, and its length in bytes.
-pub struct ShapeBlock {
-    block: Box<dyn Any + Send>,
-    length: u64,
-}
-
-impl ShapeBlock {
-    /// `block`, of `length` bytes, the platform's own.
-    pub fn new(block: Box<dyn Any + Send>, length: u64) -> Self {
-        ShapeBlock { block, length }
-    }
-
-    /// The block's length in bytes.
-    pub fn length(&self) -> u64 {
-        self.length
-    }
-
-    /// The platform's block, where it is a `T`; else this, untouched.
-    pub fn downcast<T: Any>(self) -> Result<T, ShapeBlock> {
-        let length = self.length;
-        match self.block.downcast::<T>() {
-            Ok(block) => Ok(*block),
-            Err(block) => Err(ShapeBlock { block, length }),
-        }
-    }
-}
-
-impl std::fmt::Debug for ShapeBlock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ShapeBlock")
-            .field("length", &self.length)
-            .finish_non_exhaustive()
-    }
-}
-
 /// What the API asks of a platform beyond core's: the process's instance, its GPU device, a
 /// texture's pixels, what it holds of the guest's RAM, a graphics device's region and its video.
 pub trait ApiPlatform: Platform {
@@ -171,28 +134,6 @@ pub trait ApiPlatform: Platform {
     ) -> Option<Self::Texture> {
         let _ = (device, desc);
         None
-    }
-
-    /// A block of the platform's memory that a placed shape's image of each of `descs` on
-    /// `device` fits ([`ApiPlatform::placed_shape_image`]), taken ahead of the image, off the
-    /// thread that makes it (`decode::surface_cache`'s `shapes`, "Blocks taken ahead"). `None`
-    /// where the platform takes none, as by default.
-    fn shape_block(&self, device: &Self::Device, descs: &[TextureDesc]) -> Option<ShapeBlock> {
-        let _ = (device, descs);
-        None
-    }
-
-    /// A shape's image of `desc` on `device` as [`ApiPlatform::placed_shape_image`] makes one,
-    /// placed in `block`, taken ahead ([`ApiPlatform::shape_block`]) rather than at the make:
-    /// `Err(block)` where the image does not fit it, nothing made, as by default.
-    fn placed_shape_image_in(
-        &self,
-        device: &Self::Device,
-        desc: &TextureDesc,
-        block: ShapeBlock,
-    ) -> Result<Option<Self::Texture>, ShapeBlock> {
-        let _ = (device, desc);
-        Err(block)
     }
 
     /// What the platform holds of the guest's RAM while a graphics device made over `map` lives:

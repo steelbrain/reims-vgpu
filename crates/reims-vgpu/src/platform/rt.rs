@@ -112,35 +112,6 @@ impl ApiPlatform for RtPlatform {
         device.new_placed_texture_for_views(desc)
     }
 
-    /// A Private block of rt's taken ahead of a placed image for views of each of `descs`
-    /// (`RtObj::<RtDevice>::image_block`). `None` where rt takes none.
-    fn shape_block(
-        &self,
-        device: &<Self as Platform>::Device,
-        descs: &[TextureDesc],
-    ) -> Option<ShapeBlock> {
-        let block = device.image_block(descs)?;
-        let length = block.length();
-        Some(ShapeBlock::new(Box::new(block), length))
-    }
-
-    /// rt's image for views placed at the start of `block`
-    /// (`RtObj::<RtDevice>::new_texture_for_views_in`): `Err(block)` where it does not fit.
-    fn placed_shape_image_in(
-        &self,
-        device: &<Self as Platform>::Device,
-        desc: &TextureDesc,
-        block: ShapeBlock,
-    ) -> Result<Option<<Self as Platform>::Texture>, ShapeBlock> {
-        let block = block.downcast::<rt_platform::ImageBlock>()?;
-        device
-            .new_texture_for_views_in(desc, block)
-            .map_err(|block| {
-                let length = block.length();
-                ShapeBlock::new(Box::new(block), length)
-            })
-    }
-
     /// The first of the host's video arms that takes the device (`graphics::video_choice`): on
     /// Linux, NVDEC's decodes on an NVIDIA GPU, then VA-API's on the GPU's render node; on
     /// Windows, VA-API's on the GPU's DXGI adapter; none on macOS.

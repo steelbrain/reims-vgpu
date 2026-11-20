@@ -482,12 +482,12 @@ so a block that takes a recursive lock its caller holds would re-enter it.
   (`reims-vgpu.graphics-compile-<n>`), surface and pages-block views
   (`reims-vgpu.graphics-surfaces-<i>`), ICB creation (`reims-vgpu.icb-create-<i>`), a closed
   process's releases (`reims-vgpu.graphics-closes-<i>`), staged copies of surfaces' caches into
-  their pages (`reims-vgpu.graphics-into-pages-<i>`), the takes of blocks ahead of shapes' images
-  (`reims-vgpu.graphics-shape-blocks-<i>`), the video caches' spare surfaces made ahead on
-  Windows (`reims-vgpu.graphics-drawn-spares-<i>`), video (`reims-vgpu.graphics-video-<i>`)
-  and event waits (`reims-vgpu.graphics-event-waits`). How long a pool keeps an idle thread is
-  `reims-vgpu-graphics`'s `keep`. The guest's Shared pool has a thread of its own
-  (`reims-vgpu.graphics-pool`, 15.1), which takes blocks and gives them back.
+  their pages (`reims-vgpu.graphics-into-pages-<i>`), the video caches' spare surfaces made
+  ahead on Windows (`reims-vgpu.graphics-drawn-spares-<i>`), video
+  (`reims-vgpu.graphics-video-<i>`) and event waits (`reims-vgpu.graphics-event-waits`). How
+  long a pool keeps an idle thread is `reims-vgpu-graphics`'s `keep`. The guest's Shared pool
+  has a thread of its own (`reims-vgpu.graphics-pool`, 15.1), which takes blocks and gives them
+  back.
 - A worker per serial queue while it has work (it ends after 5 s idle), the process's display
   thread among them.
 - Metal's completion threads, and the host's own threads inside a call that may call back (both

@@ -29,11 +29,6 @@
 //! block, and the block goes back to rt as the image does. Counted with the blocks' bytes
 //! ([`PLACED_IMAGES_CODE`], [`PLACED_IMAGE_BYTES_CODE`]); one rt places none of is counted by its
 //! cause ([`UNPLACED_OWN_CODE`], [`UNPLACED_REFUSED_CODE`], logged once) and made as before.
-//! The block may be taken ahead of the image, off the thread that makes it
-//! ([`RtObj::image_block`], [`ImageBlock`]): of `max(size, align)` bytes of the longest of the
-//! images it is taken for, so each fits it at its start, aligned. An image placed in it
-//! ([`RtObj::new_texture_for_views_in`]) is made, recorded and counted as one whose block was
-//! taken at the make; one that does not fit it is not made, and the block is the caller's still.
 //!
 //! **Indices.** rt places a texture that shaders reach (shader-read or shader-write usage,
 //! `Unknown`, which Metal takes as both, or render-target usage of a pixel format with no depth or
@@ -106,28 +101,6 @@ pub const COPY_CODE: &str = "rt-copy-replace-region";
 
 /// The code of the bytes [`COPY_CODE`]'s calls copied, counted by the byte.
 pub const COPY_BYTES_CODE: &str = "rt-copy-replace-region-bytes";
-
-/// A Private block taken ahead of a placed image for views ([`RtObj::image_block`]), which
-/// [`RtObj::new_texture_for_views_in`] places one at the start of; it goes back to rt as it
-/// drops, where no image took it.
-pub struct ImageBlock {
-    block: rt::Block,
-}
-
-impl ImageBlock {
-    /// The block's length in bytes.
-    pub fn length(&self) -> u64 {
-        self.block.len
-    }
-}
-
-impl std::fmt::Debug for ImageBlock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ImageBlock")
-            .field("len", &self.block.len)
-            .finish()
-    }
-}
 
 /// The code of the placed images for views made (the module's docs, "Placed images for views").
 pub const PLACED_IMAGES_CODE: &str = "rt-placed-shape-images";
@@ -605,84 +578,23 @@ impl RtObj<RtDevice> {
 
     /// [`Self::new_placed_texture_for_views`]'s image, unrecorded.
     fn placed_image_for_views(&self, desc: &TextureDesc) -> Option<RtObj<RtTexture>> {
+        let sel = "newTextureWithDescriptor:offset:";
         let d = rt_texture_descriptor(desc).ok()?;
         let placed = (|| {
             let rt::SizeAndAlign { size, align } = self.rt().heap_texture_size_and_align(&d)?;
             let block = self
                 .rt()
                 .take_block(rt::MemoryClass::Private, size.max(align))?;
-            self.image_in(&d, block)
+            let heap = rt::HeapRange {
+                block: block.id,
+                offset: 0,
+                len: block.len,
+            };
+            // The texture holds the block from here: this handle goes at once.
+            let made = self.rt().new_heap_texture_for_views(&d, heap, 0);
+            drop(block);
+            made.map(|texture| (texture, heap.len))
         })();
-        self.placed_answered(desc, placed)
-    }
-
-    /// A Private block a placed image for views of each of `descs` fits at its start (the
-    /// module's docs, "Placed images for views"), taken ahead of the image: `max(size, align)`
-    /// bytes of the longest of their `heap_texture_size_and_align`, so its base is aligned for
-    /// each. `None` where rt takes no descriptor of one of them, or gives no block.
-    pub fn image_block(&self, descs: &[TextureDesc]) -> Option<ImageBlock> {
-        let mut len = 0;
-        for desc in descs {
-            let d = rt_texture_descriptor(desc).ok()?;
-            let rt::SizeAndAlign { size, align } =
-                self.rt().heap_texture_size_and_align(&d).ok()?;
-            len = len.max(size.max(align));
-        }
-        if len == 0 {
-            return None;
-        }
-        let block = (self.rt().take_block(rt::MemoryClass::Private, len)).ok()?;
-        Some(ImageBlock { block })
-    }
-
-    /// [`Self::new_placed_texture_for_views`]'s texture, placed at the start of `block`, taken
-    /// ahead ([`Self::image_block`]) rather than at the make: `Err(block)` where the image does
-    /// not fit it, nothing made or recorded; else as [`Self::new_placed_texture_for_views`]
-    /// answers, recorded and counted as it is.
-    pub fn new_texture_for_views_in(
-        &self,
-        desc: &TextureDesc,
-        block: ImageBlock,
-    ) -> Result<Option<RtObj<RtTexture>>, ImageBlock> {
-        let Ok(d) = rt_texture_descriptor(desc) else {
-            return Err(block);
-        };
-        match self.rt().heap_texture_size_and_align(&d) {
-            Ok(rt::SizeAndAlign { size, align }) if size.max(align) <= block.block.len => {}
-            _ => return Err(block),
-        }
-        let block = block.block;
-        Ok(recorded_image(self, desc, || {
-            self.placed_answered(desc, self.image_in(&d, block))
-        }))
-    }
-
-    /// The image for views of `d` at the start of `block`, which the texture holds from here, and
-    /// the block's length.
-    fn image_in(
-        &self,
-        d: &rt::TextureDescriptor,
-        block: rt::Block,
-    ) -> Result<(rt::Texture, u64), rt::Error> {
-        let heap = rt::HeapRange {
-            block: block.id,
-            offset: 0,
-            len: block.len,
-        };
-        // The texture holds the block from here: this handle goes at once.
-        let made = self.rt().new_heap_texture_for_views(d, heap, 0);
-        drop(block);
-        made.map(|texture| (texture, heap.len))
-    }
-
-    /// A placed image for views of `desc` as rt answered it: counted with its block's bytes, or,
-    /// where rt placed none, by its cause, logged once.
-    fn placed_answered(
-        &self,
-        desc: &TextureDesc,
-        placed: Result<(rt::Texture, u64), rt::Error>,
-    ) -> Option<RtObj<RtTexture>> {
-        let sel = "newTextureWithDescriptor:offset:";
         let (texture, len) = match placed {
             Ok(placed) => placed,
             Err(error) => {

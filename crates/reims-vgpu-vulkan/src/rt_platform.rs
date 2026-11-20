@@ -95,7 +95,7 @@ pub use queue::RtQueue;
 pub use render::RtRenderEncoder;
 pub use render_pipeline::RtRenderPipeline;
 pub use state::RtSampler;
-pub use texture::{ImageBlock, RtTexture};
+pub use texture::RtTexture;
 pub use unbuilt::Unbuilt;
 pub use unmade::{Unmade, kinds};
 

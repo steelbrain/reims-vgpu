@@ -467,7 +467,6 @@ use super::refusing;
 use super::surface_pages::{PagesRefusal, SurfaceView, Unmade, buffer_over};
 use super::worker::Worker;
 use crate::device_writes::{self, Watcher};
-use crate::platform::ShapeBlock;
 
 mod exported;
 pub(crate) mod shapes;
@@ -632,56 +631,6 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// Where the cache was made for the host's video, the surface its planes may take
     /// ([`exported`]).
     surface: exported::CacheSurface<P>,
-    /// The bytes of a row's texels and the rows of the surface's plane, where its layout is
-    /// known and it has one plane: what a block taken ahead of its whole-extent shape's image is
-    /// sized by ([`Caches::take_shape_block_ahead`]).
-    extent: Option<(u64, u64)>,
-    /// The block taken ahead of its shape's image, and where that stands ([`Ahead`]).
-    ahead: Ahead,
-}
-
-/// Where a cache's block taken ahead of its whole-extent shape's image stands
-/// ([`shapes`]'s "Blocks taken ahead").
-#[derive(Debug, Default)]
-enum Ahead {
-    /// None was asked.
-    #[default]
-    None,
-    /// Asked of the shape blocks' worker, by the number given, and not taken yet.
-    Asked(u64),
-    /// Taken: the cache's first new shape places its image in it, where it is over rt's unit
-    /// ([`PIECE`]) and fits.
-    Taken(TakenAhead),
-    /// A new shape took it or was made without it: none is asked or kept from here.
-    Done,
-}
-
-/// A block taken ahead of a shape's image ([`Ahead::Taken`]): one that goes with no image placed
-/// in it is counted ([`SHAPE_BLOCKS_UNUSED`]).
-#[derive(Debug)]
-struct TakenAhead(Option<ShapeBlock>);
-
-impl TakenAhead {
-    /// The block, no longer counted as it goes.
-    fn take(mut self) -> Option<ShapeBlock> {
-        self.0.take()
-    }
-}
-
-impl Drop for TakenAhead {
-    fn drop(&mut self) {
-        if let Some(block) = self.0.take() {
-            shape_block_unused(&block);
-        }
-    }
-}
-
-/// The bytes of a row's texels and the rows of the one plane of `planes`, where there is one.
-fn one_plane_extent(planes: &[PagesPlane]) -> Option<(u64, u64)> {
-    match planes {
-        [plane] => Some((plane.row_bytes, plane.rows)),
-        _ => None,
-    }
 }
 
 /// Where a cache's buffer may differ from its pages ([`SurfaceCache::changed`]), as bytes of the
@@ -2551,8 +2500,6 @@ impl<P: Platform> SurfaceCaches<P> {
                 wide: None,
                 shapes: ShapeTable::default(),
                 shadow: ShapeTable::default(),
-                extent: layout.as_deref().and_then(one_plane_extent),
-                ahead: Ahead::None,
             },
         );
         let pages = Pages {
@@ -2817,8 +2764,6 @@ impl<P: Platform> SurfaceCaches<P> {
                 wide: None,
                 shapes: ShapeTable::default(),
                 shadow: ShapeTable::default(),
-                extent: layout.as_deref().and_then(one_plane_extent),
-                ahead: Ahead::None,
             },
         );
         if carries {
@@ -3665,25 +3610,6 @@ impl<P: Platform> SurfaceCaches<P> {
             self.counts.shapes.found += 1;
         }
         Some(found.map(|(reference, shape)| (reference, shape.image.clone_ref())))
-    }
-
-    /// For a new shape of the block at `block`'s cache, `over` rt's unit where so: the block taken
-    /// ahead of its image, where one is ([`shapes`]'s "Blocks taken ahead"); one asked and not yet
-    /// taken is counted for a shape over the unit ([`SHAPE_BLOCKS_LATE`]). The cache asks and
-    /// keeps none from here: a block taken that the shape does not take goes as the caller lets go
-    /// of it, counted ([`SHAPE_BLOCKS_UNUSED`]).
-    fn ahead_block(&mut self, block: u64, over: bool) -> Option<TakenAhead> {
-        let cache = self.by_block.get_mut(&block)?;
-        match std::mem::replace(&mut cache.ahead, Ahead::Done) {
-            Ahead::Taken(taken) => Some(taken),
-            Ahead::Asked(_) => {
-                if over {
-                    reims_vgpu_vulkan::answer::count_kind(SHAPE_BLOCKS_LATE);
-                }
-                None
-            }
-            Ahead::None | Ahead::Done => None,
-        }
     }
 
     /// Adds the shape `key` of the block at `block`'s cache, its image `image` made with the lock
@@ -5603,41 +5529,9 @@ pub(crate) struct Caches<P: Platform> {
     shapes_placed: AtomicBool,
     /// Every cache's copies are staged ([`Self::set_staged`]).
     staged: AtomicBool,
-    /// What takes blocks ahead of shapes' images, and places images in them
-    /// ([`Self::set_shape_blocks`], [`shapes`]'s "Blocks taken ahead").
-    shape_blocks: OnceLock<ShapeBlocks<P>>,
     /// The spare surfaces over Direct3D 11 textures made ahead ([`Self::set_drawn`], `exported`).
     #[cfg(windows)]
     drawn_spares: OnceLock<exported::DrawnSpares<P>>,
-}
-
-/// What takes a block ahead of a shape's image on the device, for an image of each of the
-/// descriptors (`ApiPlatform::shape_block`); `None` where it takes none.
-pub(crate) type ShapeBlockTaker<P> =
-    Arc<dyn Fn(&<P as Platform>::Device, &[TextureDesc]) -> Option<ShapeBlock> + Send + Sync>;
-
-/// What places a shape's image of the descriptor in a block taken ahead
-/// (`ApiPlatform::placed_shape_image_in`): `Err` gives the block back where the image does not
-/// fit it.
-pub(crate) type ShapeBlockPlacer<P> = Arc<
-    dyn Fn(
-            &<P as Platform>::Device,
-            &TextureDesc,
-            ShapeBlock,
-        ) -> Result<Option<<P as Platform>::Texture>, ShapeBlock>
-        + Send
-        + Sync,
->;
-
-/// The takes of blocks ahead of shapes' images ([`shapes`]'s "Blocks taken ahead"), on a worker
-/// of their own ([`SHAPE_BLOCKS_THREADS`]), each under the device's reset gate held shared.
-struct ShapeBlocks<P: Platform> {
-    take: ShapeBlockTaker<P>,
-    place: ShapeBlockPlacer<P>,
-    gate: Arc<RwLock<()>>,
-    worker: Worker,
-    /// The asks so far, which number each ([`Ahead::Asked`]).
-    asks: AtomicU64,
 }
 
 /// Lets go of `gone`, shapes' images of the block at `block` that went, with no lock held, a
@@ -6216,7 +6110,6 @@ impl<P: Platform> Caches<P> {
             shape_maker: OnceLock::new(),
             shapes_placed: AtomicBool::new(false),
             staged: AtomicBool::new(false),
-            shape_blocks: OnceLock::new(),
             #[cfg(windows)]
             drawn_spares: OnceLock::new(),
         }
@@ -6235,136 +6128,6 @@ impl<P: Platform> Caches<P> {
     /// Whether the caches take the per-shape form ([`Self::set_shapes`]).
     pub(crate) fn shaped(&self) -> bool {
         self.shape_maker.get().is_some()
-    }
-
-    /// Takes a block ahead of a cache's whole-extent shape's image from now on, by `take`, and
-    /// places the image in it by `place` ([`shapes`]'s "Blocks taken ahead"), each take under the
-    /// device's reset `gate` held shared: set once, at the device's make, before any cache, where
-    /// the shapes' images are placed ([`Self::set_shapes`]); a second is ignored.
-    pub(crate) fn set_shape_blocks(
-        &self,
-        take: ShapeBlockTaker<P>,
-        place: ShapeBlockPlacer<P>,
-        gate: Arc<RwLock<()>>,
-    ) {
-        let worker = Worker::new(SHAPE_BLOCKS_THREADS);
-        let _ = self.shape_blocks.set(ShapeBlocks {
-            take,
-            place,
-            gate,
-            worker,
-            asks: AtomicU64::new(0),
-        });
-    }
-
-    /// Hands over the take of a block ahead of the image of the whole extent of the block at
-    /// `block`'s cache, on `device`, where it is asked for none yet and its shapes' images are
-    /// placed ([`shapes`]'s "Blocks taken ahead"): for a cache of one plane over rt's unit
-    /// ([`PIECE`]), of the surface's own and not the host's video's, which no new shape was made
-    /// over yet. The take runs on the shape blocks' worker, which nothing waits for; the block is
-    /// kept for the cache's first new shape where the cache is still the one it was asked for and
-    /// still waits for it, else let go of, counted ([`SHAPE_BLOCKS_UNUSED`]).
-    pub(crate) fn take_shape_block_ahead(self: &Arc<Self>, device: &P::Device, block: u64) {
-        let Some(blocks) = self.shape_blocks.get() else {
-            return;
-        };
-        if !self.shapes_placed.load(Ordering::Acquire) {
-            return;
-        }
-        let (number, (row_bytes, rows), timed) = {
-            let mut st = self.lock();
-            let timed = st.staged.clone();
-            // rt's unit ([`PIECE`]; shorter in the tests).
-            let unit = st.spares.piece;
-            let Some(cache) = st.by_block.get_mut(&block) else {
-                return;
-            };
-            let Some(extent) = cache.extent.filter(|_| {
-                matches!(cache.ahead, Ahead::None) && !cache.raw && cache.life.is_none()
-            }) else {
-                return;
-            };
-            if extent.0.saturating_mul(extent.1) <= unit || extent.0 % 4 != 0 {
-                return;
-            }
-            let number = blocks.asks.fetch_add(1, Ordering::Relaxed) + 1;
-            cache.ahead = Ahead::Asked(number);
-            (number, extent, timed)
-        };
-        let descs = ahead_descs(row_bytes / 4, rows);
-        let caches = Arc::downgrade(self);
-        let device = device.clone_ref();
-        let take = Arc::clone(&blocks.take);
-        let gate = Arc::clone(&blocks.gate);
-        blocks.worker.submit_waitless(
-            block,
-            Box::new(move || {
-                let taken = {
-                    let _shared = gate.read_recursive();
-                    let at = timed.as_ref().map(|now| now());
-                    let taken = take(&device, &descs);
-                    if let (Some(now), Some(at), Some(taken)) = (&timed, at, &taken) {
-                        shape_block_taken(now().saturating_duration_since(at), taken.length());
-                    }
-                    taken
-                };
-                match caches.upgrade() {
-                    Some(caches) => caches.park_shape_block(block, number, taken),
-                    None => drop(taken.map(|taken| TakenAhead(Some(taken)))),
-                }
-            }),
-        );
-    }
-
-    /// Keeps `taken`, the block taken ahead for the block at `block`'s cache by ask `number`
-    /// ([`Self::take_shape_block_ahead`]), where the cache is still the one asked and still waits
-    /// for it; else lets it go, counted, with the lock let go of. Where none was taken, the cache
-    /// asks for none again ([`SHAPE_BLOCKS_REFUSED`]).
-    fn park_shape_block(&self, block: u64, number: u64, taken: Option<ShapeBlock>) {
-        let taken = TakenAhead(taken);
-        let mut st = self.lock();
-        let Some(cache) = st.by_block.get_mut(&block) else {
-            drop(st);
-            drop(taken);
-            return;
-        };
-        if !matches!(cache.ahead, Ahead::Asked(asked) if asked == number) {
-            drop(st);
-            drop(taken);
-            return;
-        }
-        if taken.0.is_none() {
-            cache.ahead = Ahead::Done;
-            drop(st);
-            reims_vgpu_vulkan::answer::count_kind(SHAPE_BLOCKS_REFUSED);
-            return;
-        }
-        cache.ahead = Ahead::Taken(taken);
-    }
-
-    /// Waits until no take of a block ahead is handed over or runs (tests only).
-    #[cfg(test)]
-    pub(crate) fn settle_shape_blocks(&self) {
-        if let Some(blocks) = self.shape_blocks.get() {
-            blocks.worker.flush();
-        }
-    }
-
-    /// Shuts the shape blocks' worker: no take starts until [`Self::release_shape_blocks`]
-    /// (tests only).
-    #[cfg(test)]
-    pub(crate) fn hold_shape_blocks(&self) {
-        if let Some(blocks) = self.shape_blocks.get() {
-            blocks.worker.hold();
-        }
-    }
-
-    /// Opens the shape blocks' worker (tests only).
-    #[cfg(test)]
-    pub(crate) fn release_shape_blocks(&self) {
-        if let Some(blocks) = self.shape_blocks.get() {
-            blocks.worker.release();
-        }
     }
 
     /// Stages every cache's copies from now on (the module doc, "Staged copies"), the host's
@@ -6405,15 +6168,10 @@ impl<P: Platform> Caches<P> {
     /// The shape `key` of the block at `block`'s cache, its image made of `desc` where the cache
     /// holds none yet, with the lock let go of, and added ([`SurfaceCaches::add_shape`]): a
     /// reference to it and its image. Its image is placed where its first fill is made with its
-    /// make ([`Self::placed_shape`]): in the block taken ahead for the cache, where the shape is
-    /// the cache's first new one, over rt's unit, and the block is taken and fits it ([`shapes`]'s
-    /// "Blocks taken ahead"), though its fill would copy zeros, as the image then takes no make on
-    /// the ring; else in one taken now, where its fill would copy more than zeros
-    /// ([`Self::fills_zeros`]); else it is the platform's own as before.
-    /// `None` where the caches take the default form, the block has no cache, or the platform
-    /// made no image (counted). Where the caches' copies are staged, the images' makes here are
-    /// counted ([`shape_image_made`]). What goes is let go of with no lock held, a refusal
-    /// logged.
+    /// make ([`Self::placed_shape`]), in a block taken now, where its fill would copy more than
+    /// zeros ([`Self::fills_zeros`]); else it is the platform's own as before. `None` where the
+    /// caches take the default form, the block has no cache, or the platform made no image
+    /// (counted). What goes is let go of with no lock held, a refusal logged.
     pub(crate) fn shape(
         &self,
         device: &P::Device,
@@ -6422,66 +6180,24 @@ impl<P: Platform> Caches<P> {
         desc: &TextureDesc,
     ) -> Option<Held<P::Texture>> {
         let maker = self.shape_maker.get()?;
-        let (timed, over, ahead) = {
-            let mut st = self.lock();
-            match st.find_shape(block, &key) {
-                None => return None,
-                Some(Some(found)) => return Some(found),
-                Some(None) => {}
-            }
-            // Over rt's unit ([`PIECE`]; shorter in the tests).
-            let over = key.bytes() > st.spares.piece;
-            (st.staged.clone(), over, st.ahead_block(block, over))
-        };
+        match self.lock().find_shape(block, &key) {
+            None => return None,
+            Some(Some(found)) => return Some(found),
+            Some(None) => {}
+        }
         // A video cache's plane takes its surface's ([`exported`]).
         if let Some(found) = self.plane_shape(device, block, &key) {
             return Some(found);
         }
-        let make = |placed: bool| {
-            let at = timed.as_ref().map(|now| now());
-            let image = maker(device, desc, placed);
-            if let (Some(now), Some(at)) = (&timed, at) {
-                shape_image_made(SHAPE_MADE, now().saturating_duration_since(at), over);
-            }
-            image
-        };
-        let placing = self.shapes_placed.load(Ordering::Acquire) && self.fills_at_once(block);
-        // A block taken ahead serves only an image over rt's unit placed now, whether its fill
-        // copies zeros or not: where none is, it goes now, counted.
-        let ahead = ahead.filter(|_| placing && over).and_then(TakenAhead::take);
-        let mut placed_ahead = false;
-        if let Some(taken) = ahead
-            && let Some(blocks) = self.shape_blocks.get()
-        {
-            let at = timed.as_ref().map(|now| now());
-            match (blocks.place)(device, desc, taken) {
-                Ok(image) => {
-                    if let (Some(now), Some(at)) = (&timed, at) {
-                        let took = now().saturating_duration_since(at);
-                        shape_image_made(SHAPE_MADE_AHEAD, took, over);
-                    }
-                    placed_ahead = true;
-                    if let Some(image) = image
-                        && let Some(placed) = self.placed_shape(device, block, key, image)
-                    {
-                        return placed;
-                    }
-                }
-                Err(unfit) => {
-                    reims_vgpu_vulkan::answer::count_kind(SHAPE_BLOCKS_UNFIT);
-                    drop(unfit);
-                }
-            }
-        }
-        if placing
-            && !placed_ahead
+        if self.shapes_placed.load(Ordering::Acquire)
+            && self.fills_at_once(block)
             && !self.fills_zeros(block)
-            && let Some(image) = make(true)
+            && let Some(image) = maker(device, desc, true)
             && let Some(placed) = self.placed_shape(device, block, key, image)
         {
             return placed;
         }
-        let Some(image) = make(false) else {
+        let Some(image) = maker(device, desc, false) else {
             self.lock().counts.shapes.images_refused += 1;
             return None;
         };
@@ -8892,131 +8608,6 @@ const PIECE_GETS: (&str, &str) = ("rt-staging-piece-get-ns", "rt-staging-piece-g
 
 /// The longest get of [`PIECE_GETS`] so far, which its code's count rises to.
 static PIECE_GET_MAX_NS: AtomicU64 = AtomicU64::new(0);
-
-/// The shapes' images made on the decoding thread ([`Caches::shape`]), where the caches' copies
-/// are staged: through the platform's maker, an image placed in a block taken at its make or the
-/// platform's own; of those, the images of shapes over rt's unit ([`PIECE`]), each of which takes
-/// an allocation of its own on that thread; and the images placed in a block taken ahead
-/// ([`shapes`]'s "Blocks taken ahead"). How many, the nanoseconds their makes took, and the
-/// longest of them ([`shape_image_made`]).
-const SHAPE_IMAGE_MAKES: [(&str, &str, &str); 3] = [
-    (
-        "rt-shape-image-makes",
-        "rt-shape-image-makes-ns",
-        "rt-shape-image-makes-max-ns",
-    ),
-    (
-        "rt-shape-image-makes-over-unit",
-        "rt-shape-image-makes-over-unit-ns",
-        "rt-shape-image-makes-over-unit-max-ns",
-    ),
-    (
-        "rt-shape-image-makes-ahead",
-        "rt-shape-image-makes-ahead-ns",
-        "rt-shape-image-makes-ahead-max-ns",
-    ),
-];
-
-/// [`SHAPE_IMAGE_MAKES`]' made through the platform's maker, and of those over rt's unit.
-const SHAPE_MADE: usize = 0;
-const SHAPE_MADE_OVER: usize = 1;
-
-/// [`SHAPE_IMAGE_MAKES`]' placed in a block taken ahead.
-const SHAPE_MADE_AHEAD: usize = 2;
-
-/// The longest make of [`SHAPE_IMAGE_MAKES`] so far, of each, which its code's count rises to.
-static SHAPE_IMAGE_MAKE_MAX_NS: [AtomicU64; 3] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-
-/// The blocks taken ahead of shapes' images ([`Caches::take_shape_block_ahead`]): how many, the
-/// nanoseconds their takes took, under the reset gate, and the longest of them; and their KiB
-/// ([`SHAPE_BLOCKS_AHEAD_KIB`]).
-const SHAPE_BLOCKS_AHEAD: (&str, &str, &str) = (
-    "rt-shape-blocks-ahead",
-    "rt-shape-blocks-ahead-ns",
-    "rt-shape-blocks-ahead-max-ns",
-);
-const SHAPE_BLOCKS_AHEAD_KIB: &str = "rt-shape-blocks-ahead-kib";
-
-/// The longest take of [`SHAPE_BLOCKS_AHEAD`] so far, which its code's count rises to.
-static SHAPE_BLOCK_MAX_NS: AtomicU64 = AtomicU64::new(0);
-
-/// The new shapes over rt's unit made while their cache's block was asked and not yet taken
-/// ([`SurfaceCaches::ahead_block`]): each made its image on the decoding thread, as before.
-const SHAPE_BLOCKS_LATE: &str = "rt-shape-blocks-ahead-late";
-
-/// The blocks taken ahead that the shape's image did not fit: let go of, the image placed in a
-/// block taken at its make as before.
-const SHAPE_BLOCKS_UNFIT: &str = "rt-shape-blocks-ahead-unfit";
-
-/// The takes ahead the platform gave no block for: the cache asks for none again.
-const SHAPE_BLOCKS_REFUSED: &str = "rt-shape-blocks-ahead-refused";
-
-/// The blocks taken ahead that went with no image placed in them: the cache's first new shape
-/// was not over rt's unit or was not placed, or came before the block, or the cache went first;
-/// how many, and their KiB.
-const SHAPE_BLOCKS_UNUSED: (&str, &str) = (
-    "rt-shape-blocks-ahead-unused",
-    "rt-shape-blocks-ahead-unused-kib",
-);
-
-/// The name of the threads, `<name>-<i>`, that take blocks ahead of shapes' images
-/// ([`Caches::take_shape_block_ahead`]): a block's takes under its key ([`Worker`]), at most
-/// [`super::worker::POOL_THREADS`] at once.
-pub(crate) const SHAPE_BLOCKS_THREADS: &str = "reims-vgpu.graphics-shape-blocks";
-
-/// The descriptors a block taken ahead for a surface of one plane of `rows` rows of `width` 4-byte
-/// texels fits an image of each of ([`Caches::take_shape_block_ahead`]): its whole extent's plain
-/// and storage shapes in `BGRA8Unorm`, the format of most surfaces that large.
-fn ahead_descs(width: u64, rows: u64) -> [TextureDesc; 2] {
-    let key = |storage| ShapeKey {
-        plane: 0,
-        offset: 0,
-        bytes_per_row: width.saturating_mul(4),
-        width,
-        height: rows,
-        texel_bytes: 4,
-        storage,
-    };
-    [false, true].map(|storage| super::surface_shapes::shape_image_desc(BGRA8_UNORM, &key(storage)))
-}
-
-/// `MTLPixelFormatBGRA8Unorm`.
-const BGRA8_UNORM: u64 = 80;
-
-/// Counts a shape's image made on the decoding thread, as `kind` of [`SHAPE_IMAGE_MAKES`], in
-/// `took`: one through the platform's maker counted `over` rt's unit too where it is.
-fn shape_image_made(kind: usize, took: std::time::Duration, over: bool) {
-    let took = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
-    let over = kind == SHAPE_MADE && over;
-    for kind in std::iter::once(kind).chain(over.then_some(SHAPE_MADE_OVER)) {
-        let (made, ns, longest) = SHAPE_IMAGE_MAKES[kind];
-        reims_vgpu_vulkan::answer::count_kind(made);
-        reims_vgpu_vulkan::answer::count_kind_by(ns, took);
-        let was = SHAPE_IMAGE_MAKE_MAX_NS[kind].fetch_max(took, Ordering::Relaxed);
-        reims_vgpu_vulkan::answer::count_kind_by(longest, took.saturating_sub(was));
-    }
-}
-
-/// Counts a block of `length` bytes taken ahead of a shape's image in `took`
-/// ([`SHAPE_BLOCKS_AHEAD`]).
-fn shape_block_taken(took: std::time::Duration, length: u64) {
-    let took = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
-    let (taken, ns, longest) = SHAPE_BLOCKS_AHEAD;
-    reims_vgpu_vulkan::answer::count_kind(taken);
-    reims_vgpu_vulkan::answer::count_kind_by(ns, took);
-    reims_vgpu_vulkan::answer::count_kind_by(SHAPE_BLOCKS_AHEAD_KIB, length.div_ceil(1024));
-    let was = SHAPE_BLOCK_MAX_NS.fetch_max(took, Ordering::Relaxed);
-    reims_vgpu_vulkan::answer::count_kind_by(longest, took.saturating_sub(was));
-}
-
-/// Counts `block`, taken ahead of a shape's image, going with no image placed in it
-/// ([`SHAPE_BLOCKS_UNUSED`]).
-fn shape_block_unused(block: &ShapeBlock) {
-    let (unused, kib) = SHAPE_BLOCKS_UNUSED;
-    reims_vgpu_vulkan::answer::count_kind(unused);
-    reims_vgpu_vulkan::answer::count_kind_by(kib, block.length().div_ceil(1024));
-}
 
 /// The staged copies' pieces made on the copy's thread ([`Spares::pieces`]), for a cache's
 /// first staged copy and for the copies after it: how many, the nanoseconds their makes took,
