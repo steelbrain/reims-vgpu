@@ -748,7 +748,7 @@ mod tests {
         }
         let metrics = lines("rtmetrics");
         assert!(!metrics.is_empty(), "{text}");
-        assert!(metrics.iter().all(|f| f.len() == 11), "{text}");
+        assert!(metrics.iter().all(|f| f.len() == 14), "{text}");
     }
 
     /// Runs the test named `test` again in a child process, with `RVG_QUIESCE_CHILD` naming it:

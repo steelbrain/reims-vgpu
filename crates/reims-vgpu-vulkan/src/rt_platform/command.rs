@@ -210,7 +210,9 @@ fn trace_metrics(now: u64) {
     // rtmetrics: rt's counts since its device was made: first-use waits, their nanoseconds and
     // the longest; the nanoseconds commits waited for the submission lock and the longest;
     // `VkSubmitInfo2`s and `vkQueueSubmit2` calls; `VkPipeline`s created; lowerings made and
-    // lowerings read from the cache directory
+    // lowerings read from the cache directory; submissions made while rt's block-maker thread was
+    // inside a `vkFreeMemory`; that thread's `vkAllocateMemory` and `vkFreeMemory` calls, and those
+    // of them that waited first for a `vkQueueSubmit2` call inside the driver
     trace::event_at(
         now,
         "rtmetrics",
@@ -225,6 +227,9 @@ fn trace_metrics(now: u64) {
             m.pipelines_created,
             m.translations,
             m.translations_loaded,
+            m.submissions_during_frees,
+            m.maker_memory_calls,
+            m.maker_yields,
         ],
     );
 }
