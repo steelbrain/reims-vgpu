@@ -246,9 +246,8 @@ Three tiers:
   - kache is a tool on the PATH, never Cargo's configured wrapper, so a host
     without it builds as before. Its host configuration is in
     [docs/development.md](docs/development.md), "Building through kache".
-- **Two full checks at once can exceed RAM** (one test holds 16 GiB of a
-  Mac's GPU memory), and their GPU tests compete for the GPU: run one at a
-  time on the host.
+- **Two full checks at once can exceed RAM**, and their GPU tests compete
+  for the GPU: run one at a time on the host.
 - **Set work aside with a WIP commit or a patch**, never `git stash`, whose
   list every worktree shares.
 - **Never initialise `vendor/qemu` inside a worktree** that shares the main
@@ -427,8 +426,8 @@ Three tiers:
 
 ## GPU and VM discipline
 
-Some tests fault the GPU and crash processes on purpose, and the GPU
-watchdog corrupts concurrent work.
+Some tests crash processes on purpose, and the GPU watchdog corrupts
+concurrent work.
 
 - **A VM boot never overlaps GPU work.** No test boots a VM. A boot's
   potluck job holds the GPU it boots on ([docs/qemu.md](docs/qemu.md),
