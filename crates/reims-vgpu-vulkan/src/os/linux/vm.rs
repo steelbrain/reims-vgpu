@@ -601,8 +601,8 @@ fn no_file(call: &'static str, length: u64, error: std::io::Error) -> std::io::E
 /// lies over them, as the runtime imports no page without read access and nothing imports a
 /// fresh range before its remaps succeed, so putting zeros there is reported to no one, as
 /// nothing tracks the pages under an address; the table's files are mapped back as they were,
-/// the same pages. A put-back the kernel refuses too (`vm.max_map_count`) leaves the range forgotten by the table,
-/// logged.
+/// the same pages. A put-back the kernel refuses too (`vm.max_map_count`) leaves the range
+/// forgotten by the table, logged.
 fn put_back(at: u64, length: u64) {
     let page = page_size();
     let has_file = |first: u64| files::pieces(first, page).is_some();

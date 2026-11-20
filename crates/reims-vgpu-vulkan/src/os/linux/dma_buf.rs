@@ -22,8 +22,8 @@
 //! (64) in one dma-buf, parameters of the `udmabuf` module only root can raise, and the library
 //! asks no one to. An import of a macOS 26 guest's boot took up to 16,201 runs of file pages
 //! (`docs/qemu.md`, "Linux hosts: AMD GPUs and udmabuf"), so a window is cut into chunks, each a
-//! dma-buf within the limits the host has now ([`within_limits`]), cut only where the runtime can bind
-//! the next ([`chunks`]); the runtime binds them in order behind one buffer.
+//! dma-buf within the limits the host has now ([`within_limits`]), cut only where the runtime can
+//! bind the next ([`chunks`]); the runtime binds them in order behind one buffer.
 //!
 //! **Costs** (measured on the same host, 2026-10-12): a udmabuf pins every page it takes,
 //! allocating those never touched (64 MiB of untouched memory in 18 ms), and keeps showing a page
@@ -215,11 +215,11 @@ fn mono_now() -> u64 {
     super::clock::LinuxClock::new().now_mono().as_nanos()
 }
 
-/// `attempt` within udmabuf's limits, read through [`LIMITS`]; where they refuse it ([`Refusal::Limit`]), or
-/// the kernel does (it refuses a list past limits lowered since they were read), once more within
-/// the limits read from the host now, where those differ from the ones it was refused at: a limit
-/// raised or lowered while the process runs is taken at the first refusal it would change, as
-/// when every call read the host's limits.
+/// `attempt` within udmabuf's limits, read through [`LIMITS`]; where they refuse it
+/// ([`Refusal::Limit`]), or the kernel does (it refuses a list past limits lowered since they were
+/// read), once more within the limits read from the host now, where those differ from the ones it
+/// was refused at: a limit raised or lowered while the process runs is taken at the first refusal
+/// it would change, as when every call read the host's limits.
 fn within_limits<T>(attempt: impl FnMut(Limits) -> Result<T, Refusal>) -> Result<T, Refusal> {
     within(&LIMITS, mono_now(), attempt)
 }
