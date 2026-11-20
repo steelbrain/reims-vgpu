@@ -3467,7 +3467,7 @@ mod tests {
     /// once their command buffer completed the pages hold the CPU's bytes alone, as after
     /// Metal's; a later command buffer reads those, a CPU write made before its commit among them.
     /// A render pass that stores into a texture over it completes with its store dropped too,
-    /// counted at the pass, as the 5300M and the UHD 630 answer
+    /// counted at the pass, as the 5300M and the UHD 630 answer.
     #[test]
     fn read_only_copies_drop_the_gpu_s_writes_on_vulkan() {
         use super::super::copied::{DROPPED_BYTES_CODE, STORE_OUTS_CODE};
