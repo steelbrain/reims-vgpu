@@ -451,7 +451,7 @@ pub(crate) struct ShapeCounts {
     pub(crate) planes_made: u64,
     pub(crate) planes_landed: u64,
     /// Plane shapes' fills taken as met by a decode drawn over a new cache's zeros
-    /// ([`ShapeTable::take_plane_fills`], on Windows).
+    /// (`ShapeTable::take_plane_fills`, on Windows).
     pub(crate) drawn_fills_taken: u64,
     /// Surfaces made for video caches' planes, those the platform made none of, and the most
     /// caches that held one at once (`super::exported`).

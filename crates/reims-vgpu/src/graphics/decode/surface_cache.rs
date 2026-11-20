@@ -3869,7 +3869,7 @@ impl<P: Platform> SurfaceCaches<P> {
     /// zeros until the picture lands ([`SurfaceCache::zeros`]), and copies into the pages only
     /// the planes' rows where the kext gave no layout ([`SurfaceCache::texels`]). On Windows,
     /// where its surface's planes lie over Direct3D 11 textures, its plane shapes' fills are
-    /// taken as met too ([`exported::take_drawn_fill`]).
+    /// taken as met too (`exported::take_drawn_fill`).
     fn take_decoded(&mut self, block: u64, generation: u64, planes: &[PagesPlane; 2]) {
         let host = self.watched.writes(block);
         let Some(cache) = self.by_block.get_mut(&block) else {

@@ -43,13 +43,13 @@
 //! The textures' bytes are undefined at their make, and the plane shapes owe a fill from the
 //! buffer, as any new shape does. A decode that takes a new cache's first fill as met, the
 //! buffer holding its make's zeros (`SurfaceCaches::take_decoded`), takes the plane shapes'
-//! fills as met too ([`take_drawn_fill`]), and its command buffer waits for no fill: the
+//! fills as met too (`take_drawn_fill`), and its command buffer waits for no fill: the
 //! textures owe zeros instead (`graphics::drawn`), which the picture's draw writes wherever it
 //! does not write the picture, as that fill would have left them, so a picture smaller than its
 //! planes leaves the texels past it zero, as the module doc of `super` says of a picture that
 //! lands short of the planes. A fill of the plane shapes made since leaves the textures owing
-//! nothing ([`planes_filled`]), and a command buffer whose decode answered nothing over them
-//! has them cleared to zeros at its finish ([`SurfaceCaches::undrawn`]).
+//! nothing (`planes_filled`), and a command buffer whose decode answered nothing over them
+//! has them cleared to zeros at its finish (`SurfaceCaches::undrawn`).
 //!
 //! **Measured** (2026-11-19, Intel UHD 630, a macOS guest's 4K H.264 and HEVC playback, its
 //! pictures held and released), before the fills were taken: the boot made 1977 such surfaces,
@@ -377,7 +377,7 @@ pub(super) fn decodes_into<P: Platform>(surface: &CacheSurface<P>, decoded: bool
 }
 
 /// The log's line of the video caches' planes and the fills a video write owed, from the shapes'
-/// counts `sh`, and the plane shapes' fills taken as met where any were ([`take_drawn_fill`]);
+/// counts `sh`, and the plane shapes' fills taken as met where any were (`take_drawn_fill`);
 /// `None` where nothing of either was counted.
 pub(crate) fn planes_line(sh: &ShapeCounts) -> Option<String> {
     let any = sh.surfaces + sh.surfaces_refused + sh.planes_landed + sh.video_fills > 0;
