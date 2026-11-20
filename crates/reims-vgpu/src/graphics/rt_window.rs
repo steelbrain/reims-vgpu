@@ -9,15 +9,21 @@
 //! present, the module doc of `reims_vgpu_vulkan::swapchain`). No window device is made on the
 //! compositor's GPU: rt makes one device for everything. The route is logged once a sink, at its
 //! first presenter.
+//!
+//! **A frame's GPU time** is counted for the host's summary where it counts the window's times
+//! (`reims_vgpu_vulkan::rt_platform::window_times`): a completed handler of the frame's command
+//! buffer, added after its presents' handler and before its commit, hands on its GPU start and
+//! end.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_vulkan::RtPlatform;
-use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CompletedInfo};
 use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::rt_platform::swapchain::RtSwapchain;
+use reims_vgpu_vulkan::rt_platform::window_times;
 use reims_vgpu_vulkan::swapchain::{Acquired, Refused};
 use reims_vgpu_window::{Drawn, DrawnCursor, FrameSink, PixelRect, Presenter, VulkanTarget};
 
@@ -161,6 +167,13 @@ impl Presenter for RtPresenter {
                     return None;
                 }
                 presents.after(&command_buffer);
+                if window_times::on() {
+                    // Its GPU time, for the host's summary (the module doc).
+                    let ran = Box::new(|info: CompletedInfo| {
+                        window_times::frame_ran(info.gpu_times_ns);
+                    });
+                    no_catch(command_buffer.add_completed_handler(OnFault::Die, ran));
+                }
                 no_catch(command_buffer.commit(OnFault::Die));
                 Some(command_buffer)
             });

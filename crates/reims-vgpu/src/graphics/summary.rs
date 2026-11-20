@@ -1,5 +1,5 @@
 //! The host's summary of each ten seconds in its log, for the walks that time a guest's frames.
-//! Every [`PERIOD`], while the log names [`TARGET`] at debug, the summary writes three lines of
+//! Every [`PERIOD`], while the log names [`TARGET`] at debug, the summary writes four lines of
 //! what the period held. Each line starts with its stamp: the host's wall time (`CLOCK_REALTIME`,
 //! seconds since the Unix epoch to the millisecond) and the trace's clock in nanoseconds
 //! (`reims_vgpu_vulkan::core::trace::now`, rt's host clock, which `cbdone` and the trace's other
@@ -10,15 +10,20 @@
 //!   take to its show, from its show to its answer, and from its take to its answer, at the 50th,
 //!   90th and 99th percentiles by nearest rank ([`answered`], which `present`'s
 //!   `PresentAnswers::refreshed` calls).
+//! - **Window**: the window's own times (`reims_vgpu_vulkan::rt_platform::window_times`): the CPU
+//!   time inside its swapchain's `vkAcquireNextImageKHR` and `vkQueuePresentKHR` calls, its
+//!   presents' waits for rt's lock of the presenting queue, and its frames' command buffers' GPU
+//!   time, each with its count, its time in all and the longest (the waits with no count: one a
+//!   present).
 //! - **rt**: rt's part (`reims_vgpu_vulkan::rt_platform::summary`), once its device is made.
 //! - **Waits**: our waits of 5 ms or more, by name, each with its count, its time in all and the
 //!   longest (`reims_vgpu_vulkan::core::long_waits`, whose doc names them).
 //!
-//! - **Asked for by name**: [`start`] turns the summary on, and the long waits' counting, only
-//!   where `REIMS_VGPU_LOG` names the target itself at debug as the first decoder is made
-//!   (`reims_vgpu_vulkan::core::logging::names`), as `decode::work` does, and makes its thread
-//!   then.
-//! - **Off**, a present's answer costs one relaxed load, and so does a wait.
+//! - **Asked for by name**: [`start`] turns the summary on, and the long waits' and the window's
+//!   times' counting, only where `REIMS_VGPU_LOG` names the target itself at debug as the first
+//!   decoder is made (`reims_vgpu_vulkan::core::logging::names`), as `decode::work` does, and
+//!   makes its thread then.
+//! - **Off**, a present's answer costs one relaxed load, and so do a wait and a window's call.
 //!
 //! A diagnostic: which lines the host writes is free under the contract.
 
@@ -31,6 +36,7 @@ use reims_vgpu_vulkan::core::long_waits::{self, Waits};
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, Deadline, MonoTime, WallTime};
 use reims_vgpu_vulkan::core::sync::Mutex;
+use reims_vgpu_vulkan::rt_platform::window_times;
 
 /// The log target of the lines, at debug, which the filter names to start them ([`start`]).
 pub(crate) const TARGET: &str = "reims_vgpu::summary";
@@ -90,6 +96,7 @@ pub(crate) fn start<P: Platform>(platform: &Arc<P>) {
                     let mut presents = std::mem::take(&mut *PRESENTS.lock());
                     let parts = [
                         Some(presents_part(over, &mut presents)),
+                        Some(window_times::line(&window_times::take())),
                         rt.take(),
                         Some(waits_part(&long_waits::take())),
                     ];
@@ -104,6 +111,7 @@ pub(crate) fn start<P: Platform>(platform: &Arc<P>) {
             });
         if made.is_ok() {
             long_waits::count();
+            window_times::count();
             ON.store(true, Ordering::Relaxed);
         }
     });

@@ -34,6 +34,10 @@
 //! second (NVIDIA's has 16), else the runtime's queue, under the lock every submission of rt's
 //! takes. A present takes [`WSI`] before it.
 //!
+//! **Its calls are timed** for the host's summary, where it counts them
+//! ([`super::window_times`]): each `vkAcquireNextImageKHR` call and each `vkQueuePresentKHR` call,
+//! and each present's wait before its call for rt's lock of the presenting queue.
+//!
 //! **Destroying a swapchain** (rt's guide, "Destroying a swapchain"). Every command buffer that
 //! drew into or presented one of its images has completed, waited for as it retires, and so has
 //! each of its presents (above). An image taken and not presented since, its `drawable_acquired`
@@ -73,6 +77,7 @@ use super::command::RtCommandBuffer;
 use super::device::RtDevice;
 use super::texture::{self, RtTexture};
 use super::unbuilt::rt_refused;
+use super::window_times;
 
 /// The log target.
 const TARGET: &str = "reims_vgpu_vulkan::rt_swapchain";
@@ -379,11 +384,13 @@ impl RtSwapchain {
             u64::try_from(waited).unwrap_or(u64::MAX)
         };
         let long = long_waits::begin();
+        let counted = window_times::on();
         let taken = take_image(
             |timeout| {
                 let asked = trace::on().then(trace::now);
                 let wsi = WSI.lock();
-                let locked = asked.map(|_| trace::now());
+                let timed = asked.is_some() || counted;
+                let locked = timed.then(trace::now);
                 // SAFETY: the swapchain and fence are live, and the fence unsignalled with nothing
                 // pending on it: a take that answers no image leaves it so.
                 let taken = unsafe {
@@ -394,9 +401,12 @@ impl RtSwapchain {
                         self.fence,
                     )
                 };
-                let returned = asked.map(|_| trace::now());
+                let returned = timed.then(trace::now);
                 // Handed to a window waiting for it, if any, before this one takes it again.
                 MutexGuard::unlock_fair(wsi);
+                if counted && let (Some(locked), Some(returned)) = (locked, returned) {
+                    window_times::acquired(returned.saturating_sub(locked));
+                }
                 if let (Some(asked), Some(locked), Some(returned)) = (asked, locked, returned) {
                     // winacquire (timed at the call's return): when the take of the window
                     // system's lock began, when the `vkAcquireNextImageKHR` call began, holding
@@ -586,24 +596,40 @@ impl RtSwapchain {
             info = info.push_next(&mut fenced);
         }
         let api = &self.swapchain_api;
+        let counted = window_times::on();
+        let timed = scheduling.is_some() || counted;
         let mut called = 0;
+        let mut call_returned = 0;
         let present = |queue: vk::Queue| {
-            if scheduling.is_some() {
+            if timed {
                 called = trace::now();
             }
             // SAFETY: the present is the only call on rt's presenting queue, inside its lock; the
             // image was taken from this swapchain and its semaphore's signal is submitted, as its
             // command buffer is scheduled. A fence is chained only where the device enabled
             // `swapchainMaintenance1`, and is unsignalled with nothing pending on it.
-            unsafe { api.queue_present(queue, &info) }
+            let presented = unsafe { api.queue_present(queue, &info) };
+            if counted {
+                call_returned = trace::now();
+            }
+            presented
         };
         let asked = scheduling.map(|_| trace::now());
         let began = long_waits::begin();
         let wsi = WSI.lock();
+        let locking = counted.then(trace::now);
         let presented = self.device.rt().with_present_queue(present);
         let returned = scheduling.map(|_| trace::now());
         drop(wsi);
         began.end("window-present");
+        if let Some(locking) = locking {
+            // From the window system's lock taken to the call's start, rt's lock of its
+            // presenting queue; then the call.
+            window_times::presented(
+                called.saturating_sub(locking),
+                call_returned.saturating_sub(called),
+            );
+        }
         if let (Some(scheduling), Some(asked), Some(returned)) = (scheduling, asked, returned) {
             // winpresent (timed at the call's return): when the wait for the frame's command
             // buffer to be scheduled began, when the take of the window system's lock began, when

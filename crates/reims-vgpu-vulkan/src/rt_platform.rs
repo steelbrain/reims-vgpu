@@ -64,6 +64,7 @@ pub mod texture;
 pub mod tiled;
 pub mod unbuilt;
 pub mod unmade;
+pub mod window_times;
 
 use std::mem::ManuallyDrop;
 use std::sync::{Arc, Weak};
