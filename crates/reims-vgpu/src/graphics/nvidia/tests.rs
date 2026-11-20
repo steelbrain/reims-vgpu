@@ -116,7 +116,7 @@ fn a_picture_lands_in_an_imported_device_cache_as_it_reads_back() {
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
 fn a_picture_lands_in_an_imported_rt_cache_as_it_reads_back() {
     use reims_vgpu_vulkan::RtPlatform;
-    let platform = Arc::new(RtPlatform::new());
+    let platform = crate::rt_test_end::platform();
     crate::entry::run(|_| {
         let device = platform.system_default_device().expect("an rt device");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
@@ -139,7 +139,7 @@ fn a_picture_lands_in_an_imported_rt_cache_as_it_reads_back() {
 fn the_rt_platforms_caps_name_what_nvdec_decodes_and_nvenc_encodes() {
     use reims_vgpu_graphics::wire::RGFX_VIDEO_CAPS_OUTPUT_CACHED;
     use reims_vgpu_vulkan::RtPlatform;
-    let platform = Arc::new(RtPlatform::new());
+    let platform = crate::rt_test_end::platform();
     crate::entry::run(|_| {
         let device = platform.system_default_device().expect("an rt device");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);

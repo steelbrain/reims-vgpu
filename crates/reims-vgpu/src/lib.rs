@@ -32,6 +32,10 @@ mod graphics;
 mod memory;
 pub mod platform;
 mod pool;
+/// A unit test's rt devices, let go of as the test's thread ends.
+#[cfg(test)]
+#[cfg(feature = "rt")]
+mod rt_test_end;
 pub mod singleton;
 mod video;
 mod window;

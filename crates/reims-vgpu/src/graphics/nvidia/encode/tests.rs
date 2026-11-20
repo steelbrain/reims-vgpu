@@ -630,7 +630,7 @@ fn each_frame_filled_by_the_gpu_encodes_as_uploaded() {
 fn each_frame_filled_by_the_gpu_encodes_as_uploaded_on_rt() {
     use reims_vgpu_vulkan::RtPlatform;
 
-    let platform = Arc::new(RtPlatform::new());
+    let platform = crate::rt_test_end::platform();
     crate::entry::run(|_| {
         let device = platform.system_default_device().expect("an rt device");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);

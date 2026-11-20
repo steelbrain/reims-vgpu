@@ -320,8 +320,7 @@ fn references_are_kept_apart_from_their_caches_where_the_rules_say_and_counted()
 #[test]
 #[ignore = "needs a VA-API GPU: run on the VA-API host"]
 fn the_rt_platforms_va_api_arm_decodes_alone() {
-    use reims_vgpu_vulkan::RtPlatform;
-    let platform = Arc::new(RtPlatform::new());
+    let platform = crate::rt_test_end::platform();
     crate::entry::run(|_| {
         let device = platform.system_default_device().expect("an rt device");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);

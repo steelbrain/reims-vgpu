@@ -14624,7 +14624,7 @@ fn rt_s_window_has_a_sink_on_vulkan() {
             .collect::<Vec<_>>()
     };
     let before = refused();
-    let platform = Arc::new(RtPlatform::new());
+    let platform = crate::rt_test_end::platform();
     let region = Arc::new(Region::new(reims_vgpu_graphics::REGION_SIZE as usize).unwrap());
     let presented = Arc::new(Presented::<RtPlatform>::default());
     let shown = Arc::new(Shown::default());

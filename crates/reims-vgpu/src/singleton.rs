@@ -33,13 +33,17 @@ pub fn platform() -> Arc<VulkanPlatform> {
 #[cfg(feature = "rt")]
 pub fn rt_platform() -> Arc<reims_vgpu_vulkan::RtPlatform> {
     static RT_PLATFORM: OnceLock<Arc<reims_vgpu_vulkan::RtPlatform>> = OnceLock::new();
-    RT_PLATFORM
+    let platform = RT_PLATFORM
         .get_or_init(|| {
             install_panic_hook();
             reims_vgpu_vulkan::core::logging::init();
             Arc::new(reims_vgpu_vulkan::RtPlatform::new())
         })
-        .clone()
+        .clone();
+    // A unit test's process lets go of the device as the test's thread ends (`rt_test_end`).
+    #[cfg(all(test, unix))]
+    crate::rt_test_end::process_platform(&platform);
+    platform
 }
 
 /// The line the hook writes before it aborts.
