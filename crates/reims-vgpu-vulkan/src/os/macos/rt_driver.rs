@@ -15,9 +15,13 @@
 //! executable or in `../lib` from it, the first present; where neither is, rt's own search, which
 //! asks `dlopen` for the loader by name.
 //!
-//! **Where the build puts them**: nowhere yet. A build that runs QEMU on rt puts each in QEMU's
-//! build directory as a link, beside `qemu-system-aarch64`: the driver to a Mesa release's
-//! KosmicKrisp, the loader to Homebrew's `vulkan-loader`. Shipping them with QEMU is owed.
+//! **Where the build puts them**: in `../lib` from QEMU's binary, each a link to the file in its
+//! Homebrew formula's `opt` directory, which `brew upgrade` moves to the new version: the loader
+//! to `vulkan-loader`'s, the driver to `mesa`'s, whose build has KosmicKrisp on macOS 26 and
+//! later. `scripts/install-ctl.sh` links them in the `lib` directory of the QEMU it installs, and
+//! `make qemu` (or `make vulkan-links`) in `build/lib`, `../lib` from `build/qemu` and from any
+//! build directory beside it. Neither installs `mesa`: where Homebrew has no KosmicKrisp, no link
+//! to it is made, and the instance is rt's own.
 //!
 //! **The driver stays loaded** for the rest of the process once loaded: rt's contract asks that it
 //! stay loaded while the instance or anything made from it lives, and the process's devices live

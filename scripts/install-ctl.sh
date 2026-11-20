@@ -623,6 +623,31 @@ kept_qemu() {
   fi
 }
 
+# mac_vulkan_links DIR: on a Mac, links in DIR, the lib directory beside QEMU's
+# bin, to the Vulkan loader and to Mesa's KosmicKrisp driver, which the
+# library's rt platform loads only from beside QEMU's binary or from ../lib
+# (crates/reims-vgpu-vulkan/src/os/macos/rt_driver.rs). Each links to the file
+# in its Homebrew formula's opt directory, which brew upgrade moves to the new
+# version: the loader to vulkan-loader's, and KosmicKrisp to mesa's, where mesa
+# is installed (its build has KosmicKrisp on macOS 26 and later). mesa is not
+# among the packages this script installs: with its manifest in Homebrew's
+# share, the system loader lists KosmicKrisp ahead of MoltenVK (measured on an
+# M3 Max, 2026-11-19), and the library's default platform takes the first GPU
+# of its kind the loader lists. Without KosmicKrisp the rt platform makes its
+# own instance.
+mac_vulkan_links() {
+  local brew_prefix loader driver
+  brew_prefix="$(brew --prefix)"
+  loader="$brew_prefix/opt/vulkan-loader/lib/libvulkan.1.dylib"
+  driver="$brew_prefix/opt/mesa/lib/libvulkan_kosmickrisp.dylib"
+  [[ -f $loader ]] || die "Homebrew's vulkan-loader has no $loader"
+  mkdir -p "$1"
+  ln -sfn "$loader" "$1/libvulkan.1.dylib"
+  if [[ -f $driver ]]; then
+    ln -sfn "$driver" "$1/libvulkan_kosmickrisp.dylib"
+  fi
+}
+
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD)"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
 DIST="$TARGET/dist-vulkan"
@@ -700,6 +725,9 @@ if [[ $SKIP_QEMU == 0 ]]; then
     } | sort -u | while read -r dll; do cp "$dll" "$STAGE$PREFIX/bin/"; done
   else
     DESTDIR="$STAGE" ninja -C "$BUILD" install >/dev/null
+  fi
+  if [[ $OS == Darwin ]]; then
+    mac_vulkan_links "$STAGE$PREFIX/lib"
   fi
   for bin in "${QEMU_BINARIES[@]}"; do
     [[ -x "$STAGE$PREFIX/bin/$bin" ]] || die "QEMU's install has no bin/$bin"

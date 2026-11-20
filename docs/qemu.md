@@ -85,6 +85,17 @@ through ninja at its default, to the same binary. configure fetches meson subpro
   device and checks it paused ("The reims-graphics device", below). On
   Windows QEMU builds in MSYS2's CLANG64 environment and runs the guest
   under WHPX ("Windows hosts", below).
+- **The rt platform's Vulkan on a Mac.** The library's rt platform loads
+  the Vulkan loader, `libvulkan.1.dylib`, and Mesa's KosmicKrisp driver,
+  `libvulkan_kosmickrisp.dylib`, only from beside QEMU's binary or from
+  `../lib` (`crates/reims-vgpu-vulkan/src/os/macos/rt_driver.rs`). On a Mac
+  `make qemu` (or `make vulkan-links` alone) puts a link to each in
+  `build/lib`, which is `../lib` from `build/qemu` and from any build
+  directory beside it: the loader to Homebrew's `vulkan-loader`, KosmicKrisp
+  to Homebrew's `mesa`, whose build has it on macOS 26 and later, each
+  through the formula's `opt` directory, so `brew upgrade` reaches it. A
+  file Homebrew lacks is named and not linked. `scripts/install-ctl.sh`
+  makes the same links in the `lib` directory of the QEMU it installs.
 
 ## What vendor/qemu carries
 
@@ -2221,6 +2232,7 @@ own, on the same dist tree, with `make qemu`'s options and `vmapple`'s:
 
 ```sh
 make                                    # cargo xtask dist: target/dist-vulkan
+make vulkan-links                       # build/lib, the rt platform's Vulkan (above)
 mkdir -p build/qemu-aarch64 && cd build/qemu-aarch64
 PKG_CONFIG_PATH=$PWD/../../target/dist-vulkan/lib/pkgconfig ../../vendor/qemu/configure \
   --target-list=aarch64-softmmu --enable-hvf --enable-reims-vgpu --enable-gnutls \

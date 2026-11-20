@@ -9,6 +9,11 @@
 #               vendor/qemu's qemu-system-x86_64 with reims-graphics-pci on
 #               its C API, linked statically through pkg-config, in
 #               build/qemu (docs/qemu.md)
+#   make vulkan-links
+#               on a Mac, links in build/lib to Homebrew's Vulkan loader and
+#               Mesa's KosmicKrisp driver, which the library's rt platform
+#               loads from ../lib of a QEMU in build/qemu or in a directory
+#               beside it (make qemu makes them too); nothing elsewhere
 #   make clean  remove build/, QEMU's build included
 #
 # QEMU_CONFIGURE adds options to QEMU's configure and runs it again.
@@ -28,7 +33,7 @@ RUST_TARGET := $(if $(filter /%,$(RUST_TARGET_REL)),$(RUST_TARGET_REL),$(CURDIR)
 # The dist tree cargo xtask dist writes (xtask/src/dist.rs).
 RUST_DIST := $(RUST_TARGET)/dist-vulkan
 
-.PHONY: all qemu clean
+.PHONY: all qemu vulkan-links clean
 
 all:
 	CARGO_TARGET_DIR="$(RUST_TARGET)" cargo xtask dist
@@ -67,7 +72,7 @@ QEMU_PKG_CONFIG := $(RUST_DIST)/lib/pkgconfig
 QEMU_PC_READ := $(QEMU_BUILD)/reims-vgpu.pc.configured
 QEMU_CONFIGURE_INPUTS := configure scripts/meson-buildoptions.sh pythondeps.toml VERSION
 
-qemu: all vendor/qemu/configure
+qemu: all vendor/qemu/configure vulkan-links
 	@src=$$(git -C "$(QEMU_SRC)" rev-parse HEAD 2>/dev/null); \
 		if [ -n "$$src" ] && [ "$$(cat "$(QEMU_BUILD)/qemu-source" 2>/dev/null)" != "$$src" ]; then \
 			rm -rf "$(QEMU_BUILD)"; \
@@ -86,6 +91,30 @@ qemu: all vendor/qemu/configure
 	fi
 	@git -C "$(QEMU_SRC)" rev-parse HEAD >"$(QEMU_BUILD)/qemu-source" 2>/dev/null || rm -f "$(QEMU_BUILD)/qemu-source"
 	ninja -C "$(QEMU_BUILD)" $(filter-out -j,$(filter -j%,$(MAKEFLAGS))) qemu-system-x86_64
+
+# On a Mac, the library's rt platform loads the Vulkan loader and Mesa's
+# KosmicKrisp driver only from beside the process's executable or from ../lib
+# (crates/reims-vgpu-vulkan/src/os/macos/rt_driver.rs). build/lib is ../lib
+# from build/qemu and from any QEMU build directory beside it, such as the
+# arm64 one docs/qemu.md configures. It holds a link to each file in its
+# Homebrew formula's opt directory, which brew upgrade moves to the new
+# version: the loader to vulkan-loader's, KosmicKrisp to mesa's (whose build
+# has KosmicKrisp on macOS 26 and later). A file Homebrew lacks is named and
+# not linked, and the rt platform then makes its own instance, or searches for
+# the loader itself.
+VULKAN_LIBS := $(BUILD_DIR)/lib
+
+vulkan-links:
+	@[ "$$(uname -s)" = Darwin ] || exit 0; \
+	hb=$$(brew --prefix 2>/dev/null) || { echo "vulkan-links: no Homebrew: nothing linked in $(VULKAN_LIBS)" >&2; exit 0; }; \
+	mkdir -p "$(VULKAN_LIBS)"; \
+	for f in vulkan-loader/lib/libvulkan.1.dylib mesa/lib/libvulkan_kosmickrisp.dylib; do \
+		if [ -f "$$hb/opt/$$f" ]; then \
+			ln -sfn "$$hb/opt/$$f" "$(VULKAN_LIBS)/$${f##*/}"; \
+		else \
+			echo "vulkan-links: Homebrew's $${f%%/*} has no $$hb/opt/$$f: $${f##*/} not linked in $(VULKAN_LIBS)" >&2; \
+		fi; \
+	done
 
 clean:
 	rm -rf "$(BUILD_DIR)"
