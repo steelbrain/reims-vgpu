@@ -503,7 +503,8 @@ public:
 	// A pages block (kRgfxAccelMethodPagesBlock) of `owner` of context `context` over the
 	// `length` bytes at `address` in `task`, `writable` there or not (rgfxPagesWiring): the
 	// block's offset and size, and the GPU address the device gave its view, 0 where none
-	// (RGFX_FEATURE_IMPORT_ADDRESSES, rgfxPagesAnswer). The
+	// (RGFX_FEATURE_IMPORT_ADDRESSES, rgfxPagesAnswer), as where the device answers before the
+	// view has one (RGFX_FEATURE_IMPORT_ADDRESSES_LATER). The
 	// block is never in the owner's window; freeBlock frees it, and its pages are unwired once
 	// its release is answered OK, or once freeBlocks frees it after the owner's close.
 	IOReturn pagesBlock(RgfxAcceleratorUserClient *owner, UInt32 context, task_t task,

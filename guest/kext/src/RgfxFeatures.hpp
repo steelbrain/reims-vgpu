@@ -11,6 +11,11 @@
 //  - PAGES_BUFFERS (bit 7): the kext makes pages blocks over a process's own memory
 //    (kRgfxAccelMethodPagesBlock), and the bundle lays its no-copy buffers over them
 //    (BUFFER_OVER_PAGES);
+//  - IMPORT_ADDRESSES_LATER (bit 9), both kexts, read with IMPORT_ADDRESSES: the device answers a
+//    pages block before its view has an address, with none (rgfxPagesAnswer), the bundle makes
+//    its buffers over such a block at the host's address (BUFFER_OVER_PAGES at gpu_address 0),
+//    and asks a buffer's address where it needs it (RGFX_CMD_PAGES_BUFFER_ADDRESS), a query the
+//    kext admits as any (rgfxSubmitAdmitted) and answers with the device's COMPLETE;
 //  - SURFACE_ORDER (bit 11): the bundle names, as it commits a command buffer that uses
 //    IOSurfaces, the buffers of other queues it runs after (design.md, "Surface order"), which
 //    needs nothing of the kext;
@@ -258,8 +263,8 @@ constexpr uint64_t kRgfxCarriedFeatures =
                             RGFX_FEATURE_CURSOR_COLOR
                       : RGFX_FEATURE_DISPLAY_POWER) |
     RGFX_FEATURE_POOL | RGFX_FEATURE_POOL_ADDRESSES | RGFX_FEATURE_PRIVATE_BLOCKS |
-    RGFX_FEATURE_IMPORT_ADDRESSES | RGFX_FEATURE_SURFACE_CACHE_EVERY |
-    RGFX_FEATURE_MANAGED_AT_COPY;
+    RGFX_FEATURE_IMPORT_ADDRESSES | RGFX_FEATURE_IMPORT_ADDRESSES_LATER |
+    RGFX_FEATURE_SURFACE_CACHE_EVERY | RGFX_FEATURE_MANAGED_AT_COPY;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer and, on arm64, the
 // displays whose node the firmware placed under /arm-io, counted from display 0 (`mobileNodes`):

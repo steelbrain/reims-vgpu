@@ -3287,7 +3287,8 @@ IOReturn RgfxAccelerator::postPages(UInt32 context, UInt64 offset, UInt64 total,
 	                     : flags ? RGFX_SURFACE_PAGES_LAYOUT_OFFSET
 	                             : sizeof(message.pages);
 	// A COMPLETE, or for a pages block where the kext took IMPORT_ADDRESSES, an RgfxPagesAnswer,
-	// which carries the GPU address of the block's view (rgfxPagesAnswer).
+	// which carries the GPU address of the block's view (rgfxPagesAnswer); 0 where it took
+	// IMPORT_ADDRESSES_LATER too, the device answering before the view has one.
 	RgfxPagesAnswer answer = {};
 	UInt32 answered = 0;
 	IOReturn r = postLifecycle(RGFX_CMD_SURFACE_PAGES, &message, bytes, RGFX_EVT_COMPLETE,

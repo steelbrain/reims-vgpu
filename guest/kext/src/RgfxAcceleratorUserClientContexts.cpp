@@ -600,8 +600,9 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	// a rate map query's RATE_MAP_ANSWER, a function handle or table create's
 	// FUNCTION_POINTER_STATE, and the
 	// COMPLETE of a library create or lookup (a library's last region chunk is its create), of a
-	// dynamic library create, or of an argument layout, whose layout the device writes into the
-	// client's block before it.
+	// dynamic library create, of an argument layout, whose layout the device writes into the
+	// client's block before it, or of a pages buffer's address query, an RgfxPagesAnswer
+	// (IMPORT_ADDRESSES_LATER), which makes nothing, so none is destroyed behind it.
 	UInt32 replyType = 0;
 	if (pipeline)
 		replyType = RGFX_EVT_PIPELINE_REFLECTION;
@@ -619,6 +620,7 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 		replyType = RGFX_EVT_FUNCTION_POINTER_STATE;
 	else if (type == RGFX_CMD_LIBRARY_CREATE || type == RGFX_CMD_LIBRARY_LOOKUP ||
 	         type == RGFX_CMD_ARGUMENT_LAYOUT || type == RGFX_CMD_DYNAMIC_LIBRARY_CREATE ||
+	         type == RGFX_CMD_PAGES_BUFFER_ADDRESS ||
 	         (type == RGFX_CMD_LIBRARY_FROM_REGION && lastLibraryChunk(message, size)))
 		replyType = RGFX_EVT_COMPLETE;
 	UInt8 reply[ReimsGraphics::kLifecycleReplyMax];

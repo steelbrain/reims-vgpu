@@ -13,7 +13,8 @@
 //
 // Where the guest took RGFX_FEATURE_IMPORT_ADDRESSES, the device answers a pages block's
 // SURFACE_PAGES with the GPU address of the block's view, at which the bundle places its buffers
-// over the block (rgfxPagesAnswer).
+// over the block (rgfxPagesAnswer). Where it took RGFX_FEATURE_IMPORT_ADDRESSES_LATER too, the
+// device answers before the view has an address, with 0, and places the buffers itself.
 //
 // The range a call names is rounded out to whole pages, as the wiring takes them; the device's
 // view starts at the first page, so a buffer over the call's first byte lies at its offset in that
