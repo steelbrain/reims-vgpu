@@ -23,6 +23,31 @@
 //! **Refusals.** Where rt makes no surface, the call answers `None`, counted
 //! ([`D3D11_SURFACE_REFUSED_CODE`]). The process's first refusal also writes a line naming rt's
 //! error and the planes.
+//!
+//! **Shared Usage counts every import.** Each import adds its textures' size to the process's
+//! `GPU Process Memory\Shared Usage` counter, which Task Manager shows as shared GPU memory, and
+//! nothing takes it off: not the import's free, and not the textures' release. No memory is
+//! behind that growth, so nothing here keeps imports alive to hold the counter down.
+//! **Measured** (2026-11-20, Intel UHD 630, Windows 11). In a test of three rounds of 32 pairs
+//! of 4K targets (64 textures, 385 MiB a round), the round that imported none ended with
+//! Shared Usage back at its start (149 MiB). In the two that imported theirs, Shared Usage less
+//! the counter `Total Committed` grew by each round's 64 imports and never fell:
+//! - 384 MiB after the first;
+//! - 768 MiB after the second;
+//! - still 768 MiB once the first round's imports were freed.
+//!
+//! Over the run, `\Memory\Available MBytes` fell only 165 MiB and `\Memory\Committed Bytes`
+//! rose only 123 MiB. In a macOS guest's boot of 3940 imports (fps passes, then 8 rounds of a
+//! held and a released 4K H.264 check):
+//! - Shared Usage rose from 1.7 to 52.6 GiB, passing the process's DXGI budget of 48230 MiB in
+//!   the sixth round.
+//! - The process's DXGI usage (`QueryVideoMemoryInfo`, local; the non-local group answers 0 and
+//!   a budget of 0 on this GPU), read every 40th pair of targets made, rose to 9.6-19.2 GiB in
+//!   each held pass, and its lowest read in each pass after the first was 1.6-3.0 GiB.
+//! - The budget read 48230 MiB in all 130 reads.
+//! - Available MBytes went from 46443 to 48237, Committed Bytes from 19.5 to 17.9 GiB, and the
+//!   process's handles from 1117 to 971.
+//! - No import was refused, and every check matched all 240 of its pictures.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
