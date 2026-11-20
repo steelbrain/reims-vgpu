@@ -96,18 +96,20 @@ through ninja at its default, to the same binary. configure fetches meson subpro
   through the formula's `opt` directory, so `brew upgrade` reaches it. A
   file Homebrew lacks is named and not linked. `scripts/install-ctl.sh`
   makes the same links in the `lib` directory of the QEMU it installs.
-  Neither installs `mesa`, and until the cutover a Mac that boots the
-  default platform is better without it: with KosmicKrisp's manifest where
-  Homebrew's `mesa` puts it, the system loader lists KosmicKrisp first and
-  MoltenVK second, and the default platform times both and takes the
-  faster. On the M3 Max (2026-11-19, macOS 27.0.1 guest under HVF, Mesa
-  26.3.1) it took KosmicKrisp, logged that a display's window cannot present
-  on it (no `VK_EXT_metal_objects`), and the full-screen Metal app of
-  `firmware/ambrosia/check-boot.sh` presented 294 frames at 30 fps and
-  dropped 106, where on MoltenVK it presented 601 at 60 fps and dropped
-  none, and the check failed. The rt build of the same tree, with
-  both links in its `lib`, passed all 16 of check-boot's checks on
-  KosmicKrisp.
+  Neither installs `mesa`, which the default platform does not use: with
+  KosmicKrisp's manifest where Homebrew's `mesa` puts it, the system loader
+  lists KosmicKrisp first and MoltenVK second, and the default platform
+  passes KosmicKrisp over, since it lists no `VK_EXT_metal_objects` and a
+  display's window cannot present on it, and opens MoltenVK
+  (`crates/reims-vgpu-vulkan/src/device_choice.rs`). On the M3 Max
+  (2026-11-19, macOS 27.0.1 guest under HVF, Mesa 26.3.1), with that
+  manifest, the full-screen Metal app of `firmware/ambrosia/check-boot.sh`
+  presented 600 frames at 60 fps and dropped none, and all 16 checks
+  passed, as without it (601 frames). Before the choice passed KosmicKrisp
+  over, the default platform timed it as the faster and took it, and the
+  app presented 294 frames at 30 fps and dropped 106. The rt build of the
+  same tree, with both links in its `lib`, passed all 16 of check-boot's
+  checks on KosmicKrisp.
 
 ## What vendor/qemu carries
 
