@@ -3,6 +3,7 @@ use reims_vgpu_vulkan::gpu::resource::{VulkanBuffer, VulkanTexture};
 
 use super::both_ways::{UNTOUCHED, land_both_ways, plane_rows, usize_of};
 use super::*;
+use crate::graphics::video_choice::tested_gpu::{Arm, device_for, gpu_name};
 
 /// A VLD config of `profile`, decoding `rt_formats`, up to `max` with surfaces from `min`.
 fn config(
@@ -365,7 +366,8 @@ fn the_rt_platforms_va_api_arm_decodes_alone() {
 /// 64 bytes past a multiple of 64 for the next, so rows with bytes past them are copied too. The
 /// pages are host memory a no-copy buffer lies over, as a surface's in the guest's RAM do.
 ///
-/// The runtime's default device must be of the GPU `RVG_VAAPI_NODE` names, where it is set.
+/// On the device of a GPU the arm runs on (`video_choice::tested_gpu`), which must be the GPU
+/// `RVG_VAAPI_NODE` names, where it is set.
 /// `RVG_VA_STREAMS` names the directories, `:`-separated, whose Annex B streams (`*.264`,
 /// `*.265`, but `*.part.*`) are decoded: the conformance scripts' `build/h264-check` and
 /// `build/hevc-check`. A stream the decoder refuses (as the suite has it refuse some) is decoded up
@@ -390,20 +392,19 @@ fn a_picture_copied_by_the_gpu_is_the_cpus_copy_byte_for_byte() {
     assert!(!streams.is_empty(), "no streams in {dirs}");
     let platform = Arc::new(VulkanPlatform::new());
     crate::entry::run(|_| {
-        let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+        let device = device_for(&platform, Arm::VaApi);
         let node = reims_vgpu_vulkan::host_gpus::render_node_of(&device.raw).expect("a node");
         if let Ok(asked) = std::env::var("RVG_VAAPI_NODE") {
             let canonical = |p: &std::path::Path| std::fs::canonicalize(p).expect("a node");
             assert_eq!(
                 canonical(&node),
                 canonical(std::path::Path::new(&asked)),
-                "the runtime device is not of the GPU RVG_VAAPI_NODE names"
+                "the tested device is not of the GPU RVG_VAAPI_NODE names"
             );
         }
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let display = Display::open(&node, runtime).expect("a VA display on the device's GPU");
-        let copies = gpu_copy::RuntimeCopies::new(&device);
-        let Some(mut copier) = copier_of(&copies) else {
+        let Some(mut copier) = copier_of(&device) else {
             return;
         };
         let (mut pictures, mut refused) = (0usize, Vec::new());
@@ -456,18 +457,23 @@ fn a_picture_copied_by_the_gpu_is_the_cpus_copy_byte_for_byte() {
     });
 }
 
-/// The GPU copier of `copies`' device; `None`, said on stderr, where the device lists no extension
-/// the copier takes (`VK_EXT_image_drm_format_modifier` among them, which an RX 550's RADV does
-/// not list): the device's own answer, as the arm takes it. Any other refusal fails the test.
-fn copier_of(copies: &gpu_copy::RuntimeCopies) -> Option<Box<dyn GpuCopier<VulkanPlatform>>> {
-    match copies.copier() {
+/// The GPU copier of `device`'s; `None`, said on stderr naming the GPU, where the device lists no
+/// extension the copier takes (`VK_EXT_image_drm_format_modifier` among them, which an RX 550's
+/// RADV does not list): the device's own answer, as the arm takes it. Any other refusal fails the
+/// test.
+fn copier_of(device: &VulkanDevice) -> Option<Box<dyn GpuCopier<VulkanPlatform>>> {
+    match gpu_copy::RuntimeCopies::new(device).copier() {
         Ok(copier) => Some(copier),
         Err(why) => {
             assert!(
                 why.starts_with("the device lists no "),
-                "a GPU copier on the device: {why}"
+                "a GPU copier on {}: {why}",
+                gpu_name(device)
             );
-            eprintln!("no GPU copier on the device, so no copy to compare: {why}");
+            eprintln!(
+                "no GPU copier on {}, so no copy to compare: {why}",
+                gpu_name(device)
+            );
             None
         }
     }
@@ -497,12 +503,11 @@ fn a_copy_after_the_devices_recovery_is_the_cpus_copy_byte_for_byte() {
     streams.sort();
     let platform = Arc::new(VulkanPlatform::new());
     crate::entry::run(|_| {
-        let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+        let device = device_for(&platform, Arm::VaApi);
         let node = reims_vgpu_vulkan::host_gpus::render_node_of(&device.raw).expect("a node");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let display = Display::open(&node, runtime).expect("a VA display on the device's GPU");
-        let copies = gpu_copy::RuntimeCopies::new(&device);
-        let Some(mut copier) = copier_of(&copies) else {
+        let Some(mut copier) = copier_of(&device) else {
             return;
         };
         let mut n = 0;
@@ -574,7 +579,7 @@ fn a_picture_decoded_into_a_dma_buf_cache_reads_through_its_textures_as_the_cpus
     streams.sort();
     let platform = Arc::new(VulkanPlatform::new());
     crate::entry::run(|_| {
-        let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+        let device = device_for(&platform, Arm::VaApi);
         let node = reims_vgpu_vulkan::host_gpus::render_node_of(&device.raw).expect("a node");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let display = Display::open(&node, runtime).expect("a VA display on the device's GPU");
@@ -1030,7 +1035,7 @@ fn a_picture_written_into_a_dma_buf_cache_by_video_processing_is_the_cpus_copy()
     assert!(!streams.is_empty(), "no streams in {dirs}");
     let platform = Arc::new(VulkanPlatform::new());
     crate::entry::run(|_| {
-        let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+        let device = device_for(&platform, Arm::VaApi);
         let node = reims_vgpu_vulkan::host_gpus::render_node_of(&device.raw).expect("a node");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let display = Display::open(&node, runtime).expect("a VA display on the device's GPU");

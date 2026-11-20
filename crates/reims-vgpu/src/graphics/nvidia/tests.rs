@@ -23,6 +23,7 @@ use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueu
 use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
 
 use super::*;
+use crate::graphics::video_choice::tested_gpu::{Arm, device_for};
 
 /// What the GPU's copies must leave as it was: the bytes past each row.
 const UNTOUCHED: u8 = 0xee;
@@ -99,7 +100,7 @@ fn copy<P: Platform>(queue: &P::CommandQueue, from: &P::Buffer, to: &P::Buffer, 
 fn a_picture_lands_in_an_imported_device_cache_as_it_reads_back() {
     let platform = Arc::new(VulkanPlatform::new());
     crate::entry::run(|_| {
-        let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+        let device = device_for(&platform, Arm::Nvidia);
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let gpu = super::super::video_choice::nvidia_gpu(&device);
         let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime)
@@ -361,7 +362,7 @@ fn an_encode_first_processs_waits_run_on_the_arms_runtime() {
     if std::env::var_os(ENCODE_FIRST_CHILD).is_some() {
         let platform = Arc::new(VulkanPlatform::new());
         crate::entry::run(|_| {
-            let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+            let device = device_for(&platform, Arm::Nvidia);
             let naming = Arc::new(Naming {
                 platform: crate::video::runtime::PlatformRuntime::of(&platform),
                 started: Mutex::new(Vec::new()),
@@ -531,7 +532,7 @@ fn surface_layout(
 fn a_videotoolbox_picture_lands_in_the_lent_surfaces_pages_as_it_reads_back() {
     let platform = Arc::new(VulkanPlatform::new());
     crate::entry::run(|_| {
-        let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+        let device = device_for(&platform, Arm::Nvidia);
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let gpu = super::super::video_choice::nvidia_gpu(&device);
         let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime);

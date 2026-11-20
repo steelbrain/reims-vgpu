@@ -23,6 +23,10 @@ use reims_vgpu_vulkan::gpu::device::VulkanDevice;
 
 use super::decode::GraphicsVideo;
 
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+pub(crate) mod tested_gpu;
+
 /// The hardware video of `device`, from the first arm that takes it (module docs), the host
 /// APIs' threads and waits `runtime`'s; `None` where none does.
 pub(crate) fn graphics_video(

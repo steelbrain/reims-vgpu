@@ -16,6 +16,7 @@ use zerocopy::FromBytes;
 use super::super::super::decode::{GraphicsVideoSession, VideoEncode, VideoPlane};
 use super::super::super::video_host::HostEncodeSession;
 use super::*;
+use crate::graphics::video_choice::tested_gpu::{Arm, device_for};
 
 /// Settings of a `width` by `height` stream of `profile` of `codec` at a constant QP.
 fn settings(codec: u32, profile: u32, width: u32, height: u32) -> RgfxVideoEncodeSettings {
@@ -611,7 +612,7 @@ fn each_frame_filled_by_the_gpu_encodes_as_uploaded() {
 
     let platform = Arc::new(VulkanPlatform::new());
     crate::entry::run(|_| {
-        let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+        let device = device_for(&platform, Arm::Nvidia);
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let gpu = crate::graphics::video_choice::nvidia_gpu(&device);
         let video = super::super::NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime)

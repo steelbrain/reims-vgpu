@@ -11,6 +11,7 @@ use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::core::platform::Handle as _;
 
 use super::*;
+use crate::graphics::video_choice::tested_gpu::{Arm, device_for, gpu_name};
 
 /// Settings of a 320x192 stream of `profile` of `codec` at a constant QP.
 fn settings(codec: u32, profile: u32) -> RgfxVideoEncodeSettings {
@@ -497,13 +498,13 @@ fn each_profile_encodes_on_the_driver_and_decodes_back() {
 
 /// A frame the runtime device's GPU copies into an input surface of the encoder's
 /// (`gpu_copy`'s filler) encodes as the same frame uploaded by the CPU, byte for byte: on the
-/// driver of the runtime device's GPU, for each codec and profile it encodes, 6 frames of a
-/// moving picture at a constant QP, 320x192 (no margin to the coded size) and 330x202 (a margin
-/// of columns and rows), each in a runtime buffer, its own memory or over host pages, by turns,
-/// rows wider than the picture's (512 bytes apart for 8-bit samples, 768 or 1024 for 16-bit)
-/// from byte 32. Two encoders of the same settings code the frames, one from the host bytes, one
-/// from the filled surfaces; every access unit of the second is the first's.
-/// A device with no GPU copier checks nothing: the test says so and ends.
+/// driver of a GPU the arm runs on (`video_choice::tested_gpu`), for each codec and profile it
+/// encodes, 6 frames of a moving picture at a constant QP, 320x192 (no margin to the coded size)
+/// and 330x202 (a margin of columns and rows), each in a runtime buffer, its own memory or over
+/// host pages, by turns, rows wider than the picture's (512 bytes apart for 8-bit samples, 768 or
+/// 1024 for 16-bit) from byte 32. Two encoders of the same settings code the frames, one from the
+/// host bytes, one from the filled surfaces; every access unit of the second is the first's.
+/// A device with no GPU filler checks nothing: the test says so, naming its GPU, and ends.
 #[test]
 #[ignore = "needs a VA-API GPU: run on the VA-API host"]
 fn a_frame_filled_by_the_gpu_encodes_as_the_uploaded_frame_byte_for_byte() {
@@ -520,7 +521,7 @@ fn a_frame_filled_by_the_gpu_encodes_as_the_uploaded_frame_byte_for_byte() {
 
     let platform = Arc::new(VulkanPlatform::new());
     crate::entry::run(|_| {
-        let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+        let device = device_for(&platform, Arm::VaApi);
         let node = reims_vgpu_vulkan::host_gpus::render_node_of(&device.raw).expect("a node");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let display = Display::open(&node, runtime).expect("a VA display on the device's GPU");
@@ -530,9 +531,13 @@ fn a_frame_filled_by_the_gpu_encodes_as_the_uploaded_frame_byte_for_byte() {
             Err(why) => {
                 assert!(
                     why.starts_with("the device lists no "),
-                    "a GPU filler: {why}"
+                    "a GPU filler on {}: {why}",
+                    gpu_name(&device)
                 );
-                eprintln!("no GPU filler on the device, so no frame to compare: {why}");
+                eprintln!(
+                    "no GPU filler on {}, so no frame to compare: {why}",
+                    gpu_name(&device)
+                );
                 return;
             }
         };
@@ -882,12 +887,12 @@ fn a_guest_encoder_encodes_the_frames_of_the_surfaces_it_is_lent() {
     }
 }
 
-/// On the driver of the runtime device's GPU, each guest encoder it answers, at each profile it
-/// encodes, at a constant QP: 6 frames of a 64x48 stream read from guest surfaces wider and
-/// taller than it, copied by the GPU (`gpu_copy`'s filler) from a buffer of the device's that
-/// holds the surface's bytes, code as the same frames read by the CPU from the surface's host
-/// bytes, sample for sample and byte for byte. A device with no GPU filler checks nothing: the
-/// test says so and ends.
+/// On the driver of a GPU the arm runs on (`video_choice::tested_gpu`), each guest encoder it
+/// answers, at each profile it encodes, at a constant QP: 6 frames of a 64x48 stream read from
+/// guest surfaces wider and taller than it, copied by the GPU (`gpu_copy`'s filler) from a buffer
+/// of the device's that holds the surface's bytes, code as the same frames read by the CPU from
+/// the surface's host bytes, sample for sample and byte for byte. A device with no GPU filler
+/// checks nothing: the test says so, naming its GPU, and ends.
 #[test]
 #[ignore = "needs a VA-API GPU: run on the VA-API host"]
 fn a_guest_encoders_frames_filled_by_the_gpu_code_as_read_by_the_cpu() {
@@ -899,7 +904,7 @@ fn a_guest_encoders_frames_filled_by_the_gpu_code_as_read_by_the_cpu() {
 
     let platform = Arc::new(VulkanPlatform::new());
     crate::entry::run(|_| {
-        let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+        let device = device_for(&platform, Arm::VaApi);
         let node = reims_vgpu_vulkan::host_gpus::render_node_of(&device.raw).expect("a node");
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let display = Display::open(&node, runtime).expect("a VA display on the device's GPU");
@@ -907,9 +912,13 @@ fn a_guest_encoders_frames_filled_by_the_gpu_code_as_read_by_the_cpu() {
         if let Err(why) = copies.filler() {
             assert!(
                 why.starts_with("the device lists no "),
-                "a GPU filler: {why}"
+                "a GPU filler on {}: {why}",
+                gpu_name(&device)
             );
-            eprintln!("no GPU filler on the device, so no frame to compare: {why}");
+            eprintln!(
+                "no GPU filler on {}, so no frame to compare: {why}",
+                gpu_name(&device)
+            );
             return;
         }
         let supports: Arc<[EncoderSupport]> = encoder_support(&display).into();

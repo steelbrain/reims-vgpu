@@ -13,6 +13,7 @@ use reims_vgpu_video::nvidia::{Error, Packet};
 use reims_vgpu_video::paravirt::Codec;
 
 use super::*;
+use crate::graphics::video_choice::tested_gpu::{Arm, device_for};
 
 /// NVENC's answer for `profile` up to `max_width` by `max_height`.
 fn support(profile: EncodeProfile, max_width: u32, max_height: u32) -> EncodeProfileSupport {
@@ -399,7 +400,7 @@ fn a_guest_encoders_frames_code_alike_from_the_cpu_and_the_gpu_and_decode_back()
 
     let platform = Arc::new(VulkanPlatform::new());
     crate::entry::run(|_| {
-        let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+        let device = device_for(&platform, Arm::Nvidia);
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let gpu = crate::graphics::video_choice::nvidia_gpu(&device);
         let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime);
