@@ -7,26 +7,30 @@
 //! opens over whichever the window library picks; on Windows `VK_KHR_win32_surface`; on macOS
 //! `VK_EXT_metal_surface`, over a window's `CAMetalLayer`). The device takes `VK_KHR_swapchain`,
 //! and the OS's own device extensions (`WINDOW_DEVICE_EXTENSIONS`: on macOS `VK_EXT_metal_objects`,
-//! whose export of an image's Metal texture fetches its drawable, `crate::swapchain`), where every
-//! physical device lists them: the runtime refuses a device whose extension it asked for is
-//! missing, and which physical device it picks is its own choice, so a host where one of them lacks
-//! one gets no swapchain at all, and its windows say so and stay closed, rather than losing the
-//! device. The physical devices' lists are read through an instance of the probe's own, made with
-//! no extensions but `VK_KHR_portability_enumeration` where the loader lists it, as the runtime
-//! makes its own (so the probe lists MoltenVK, a portability driver, as the runtime does), and
-//! destroyed at once. The loader is the one the runtime opens (`crate::os`'s `open_loader`). The
-//! probe runs once a process ([`HOST`]), and the library's choice of device reads what it read of
-//! each physical device too ([`seen_devices`], [`crate::device_choice`]), so the choice costs no
-//! instance of its own.
+//! whose export of an image's Metal texture fetches its drawable, `crate::swapchain`), together
+//! [`window_device_extensions`], where a candidate of the library's choice of device lists them,
+//! as each candidate does ([`crate::device_choice`]: a device that lacks one is no candidate).
+//! The runtime refuses to make a device that lacks an extension it was asked for, and the
+//! platform makes devices only of candidates (the choice's pick, the GPUs it times, the
+//! compositor's GPU), so the window presents on the pick wherever another device lacks one. A
+//! host where no device the runtime makes lists them all gets no swapchain at all, and its windows
+//! say so and stay closed, rather than losing the device. The physical devices' lists are read
+//! through an instance of the probe's own, made with no extensions but
+//! `VK_KHR_portability_enumeration` where the loader lists it, as the runtime makes its own (so
+//! the probe lists MoltenVK, a portability driver, as the runtime does), and destroyed at once.
+//! The loader is the one the runtime opens (`crate::os`'s `open_loader`). The probe runs once a
+//! process ([`HOST`]), and the library's choice of device reads what it read of each physical
+//! device too ([`seen_devices`], [`crate::device_choice`]), so the choice costs no instance of its
+//! own.
 //!
 //! **Present fences.** The device also takes `VK_KHR_swapchain_maintenance1` (or, where a device
 //! lists only that, `VK_EXT_swapchain_maintenance1`), and the instance its surface counterpart
-//! and `VK_KHR_get_surface_capabilities2`, where every physical device lists the extension and
-//! has its feature, `swapchainMaintenance1`, and the loader lists the instance's: a swapchain
+//! and `VK_KHR_get_surface_capabilities2`, where every candidate lists the extension and has its
+//! feature, `swapchainMaintenance1`, and the loader lists the instance's: a swapchain
 //! then knows when each present is done ([`crate::swapchain`]). The runtime enables the feature
 //! of a device extension it knows where the device lists it, and refuses a device that lacks it
 //! (`Error::ExtensionFeature`), which dies at the creator ([`crate::platform`]): the probe asks
-//! each device for the feature as the runtime does, so no device it lists is refused so. Where
+//! each device for the feature as the runtime does, so no candidate is refused so. Where
 //! any of them is missing, the swapchain waits as unextended Vulkan lets it, and the reason is
 //! logged.
 //!
@@ -106,6 +110,13 @@ pub(crate) fn rt_present_fences(
         .map(|&(device, _)| device)
 }
 
+/// The device extensions a display's window's swapchain is made with: `VK_KHR_swapchain` and the
+/// OS's own (`WINDOW_DEVICE_EXTENSIONS`). A device that lacks one is no candidate of the library's
+/// choice of device ([`crate::device_choice`], `Seen::window_lacks`).
+fn window_device_extensions() -> impl Iterator<Item = &'static CStr> {
+    std::iter::once(ash::khr::swapchain::NAME).chain(WINDOW_DEVICE_EXTENSIONS)
+}
+
 /// Adds to `options` the window system's extensions this host's loader and devices list (the
 /// module doc). Where the loader does not open, or lists no `VK_KHR_surface`, it adds nothing,
 /// and says why once.
@@ -135,18 +146,18 @@ pub fn add_window_extensions(options: &mut rt::DeviceOptions) {
         }
     }
     let devices = &host.devices;
-    let wanted = std::iter::once(ash::khr::swapchain::NAME).chain(WINDOW_DEVICE_EXTENSIONS);
-    for name in wanted.clone() {
-        if !devices.every_lists(name) {
-            log::warn!(
-                target: "reims_vgpu_vulkan::wsi",
-                "a physical device lists no {}: a display's window cannot present",
-                name.to_string_lossy()
-            );
-            return;
-        }
+    if !devices.any_candidate() {
+        let wanted: Vec<_> = window_device_extensions()
+            .map(CStr::to_string_lossy)
+            .collect();
+        log::warn!(
+            target: "reims_vgpu_vulkan::wsi",
+            "no physical device the runtime makes lists {}: a display's window cannot present",
+            wanted.join(" and ")
+        );
+        return;
     }
-    for name in wanted {
+    for name in window_device_extensions() {
         add(&mut options.device_extensions, name);
     }
     match fence_extensions(&listed, devices) {
@@ -257,9 +268,9 @@ fn add(names: &mut Vec<CString>, name: &CStr) {
     }
 }
 
-/// The device extension that gives present fences on every physical device of `devices`, and
-/// the instance extension it requires, of those the loader lists (`listed`): the first of
-/// [`PRESENT_FENCES`] every device lists, where every device has the feature. Otherwise why
+/// The device extension that gives present fences on every candidate of `devices`, and the
+/// instance extension it requires, of those the loader lists (`listed`): the first of
+/// [`PRESENT_FENCES`] every candidate lists, where every candidate has the feature. Otherwise why
 /// not.
 fn fence_extensions(
     listed: &[&CStr],
@@ -273,11 +284,11 @@ fn fence_extensions(
         .find(|(device, surface)| listed.contains(surface) && devices.every_lists(device))
     else {
         return Err(
-            "no swapchain_maintenance1 that every physical device and the loader list".to_owned(),
+            "no swapchain_maintenance1 that every candidate device and the loader list".to_owned(),
         );
     };
-    if !devices.every_has_maintenance1 {
-        return Err("a physical device lacks the feature swapchainMaintenance1".to_owned());
+    if !devices.every_has_maintenance1() {
+        return Err("a candidate device lacks the feature swapchainMaintenance1".to_owned());
     }
     Ok((device, surface))
 }
@@ -285,25 +296,46 @@ fn fence_extensions(
 /// What the probe read of every physical device ([`probe`]).
 #[derive(Debug, Default)]
 struct Probed {
-    /// Each device's extensions; empty where there is no device.
+    /// Each device's extensions, in the loader's order; empty where there is no device.
     extensions: Vec<Vec<CString>>,
-    /// Whether every device has the feature `swapchainMaintenance1`, asked of those that list
-    /// one of [`PRESENT_FENCES`]' device extensions; false where there is no device, or the
-    /// loader cannot ask.
-    every_has_maintenance1: bool,
+    /// Whether each device has the feature `swapchainMaintenance1`, in the loader's order, asked
+    /// of a device that lists one of [`PRESENT_FENCES`]' device extensions: true for one that
+    /// lists neither (none is chosen then), false where the loader cannot ask.
+    maintenance1: Vec<bool>,
     /// What the library's choice of device reads of each ([`crate::device_choice`]), in the
     /// loader's order.
     seen: Vec<Seen>,
 }
 
 impl Probed {
-    /// Whether there is a device and every one lists `name`.
+    /// Each candidate's extensions and whether it has `swapchainMaintenance1` (the module doc):
+    /// the devices the platform makes devices of.
+    fn candidates(&self) -> impl Iterator<Item = (&[CString], bool)> {
+        let each = self
+            .seen
+            .iter()
+            .zip(&self.extensions)
+            .zip(&self.maintenance1);
+        each.filter(|((seen, _), _)| seen.candidate())
+            .map(|((_, names), &has)| (names.as_slice(), has))
+    }
+
+    /// Whether there is a candidate.
+    fn any_candidate(&self) -> bool {
+        self.candidates().next().is_some()
+    }
+
+    /// Whether there is a candidate and every one lists `name`.
     fn every_lists(&self, name: &CStr) -> bool {
-        !self.extensions.is_empty()
+        self.any_candidate()
             && self
-                .extensions
-                .iter()
-                .all(|names| names.iter().any(|n| n.as_c_str() == name))
+                .candidates()
+                .all(|(names, _)| names.iter().any(|n| n.as_c_str() == name))
+    }
+
+    /// Whether there is a candidate and every one has `swapchainMaintenance1`.
+    fn every_has_maintenance1(&self) -> bool {
+        self.any_candidate() && self.candidates().all(|(_, has)| has)
     }
 }
 
@@ -353,25 +385,26 @@ fn probe(entry: &ash::Entry, listed: &[&CStr]) -> Probed {
                     .collect()
             })
             .collect();
-        let every_has_maintenance1 = features2
-            && !devices.is_empty()
-            && devices.iter().zip(&extensions).all(|(&device, names)| {
+        let maintenance1 = (devices.iter().zip(&extensions))
+            .map(|(&device, names)| {
                 let lists = names
                     .iter()
                     .any(|n| PRESENT_FENCES.iter().any(|(d, _)| n.as_c_str() == *d));
                 // A device that lists neither extension is not asked: none is chosen then.
-                !lists || {
-                    let properties = instance.get_physical_device_properties(device);
-                    properties.api_version >= vk::API_VERSION_1_1 && {
-                        let mut maintenance1 =
-                            vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
-                        let mut features =
-                            vk::PhysicalDeviceFeatures2::default().push_next(&mut maintenance1);
-                        instance.get_physical_device_features2(device, &mut features);
-                        maintenance1.swapchain_maintenance1 == vk::TRUE
-                    }
-                }
-            });
+                features2
+                    && (!lists || {
+                        let properties = instance.get_physical_device_properties(device);
+                        properties.api_version >= vk::API_VERSION_1_1 && {
+                            let mut maintenance1 =
+                                vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
+                            let mut features =
+                                vk::PhysicalDeviceFeatures2::default().push_next(&mut maintenance1);
+                            instance.get_physical_device_features2(device, &mut features);
+                            maintenance1.swapchain_maintenance1 == vk::TRUE
+                        }
+                    })
+            })
+            .collect();
         let seen = devices
             .iter()
             .zip(&extensions)
@@ -379,12 +412,15 @@ fn probe(entry: &ash::Entry, listed: &[&CStr]) -> Probed {
                 let lists = |name: &CStr| names.iter().any(|n| n.as_c_str() == name);
                 let drm = lists(ash::ext::physical_device_drm::NAME);
                 let pci = lists(ash::ext::pci_bus_info::NAME);
-                seen(&instance, device, features2, drm, pci)
+                let window_lacks = window_device_extensions()
+                    .filter(|&name| !lists(name))
+                    .collect();
+                seen(&instance, device, features2, drm, pci, window_lacks)
             })
             .collect();
         Probed {
             extensions,
-            every_has_maintenance1,
+            maintenance1,
             seen,
         }
     };
@@ -397,7 +433,8 @@ fn probe(entry: &ash::Entry, listed: &[&CStr]) -> Probed {
 /// largest device-local heap, whether a queue family does graphics and compute work, and its UUID,
 /// read where the instance (`properties2`) and the device are at Vulkan 1.1 or later, its DRM
 /// nodes where it also lists `VK_EXT_physical_device_drm` (`drm`), and its PCI address where it
-/// also lists `VK_EXT_pci_bus_info` (`pci`).
+/// also lists `VK_EXT_pci_bus_info` (`pci`); `window_lacks`, the window's device extensions it
+/// does not list, as the caller's platform names them (`Seen::window_lacks`).
 ///
 /// # Safety
 ///
@@ -408,6 +445,7 @@ pub(crate) unsafe fn seen(
     properties2: bool,
     drm: bool,
     pci: bool,
+    window_lacks: Vec<&'static CStr>,
 ) -> Seen {
     // SAFETY: the caller's.
     let (properties, memory, families) = unsafe {
@@ -484,6 +522,7 @@ pub(crate) unsafe fn seen(
         uuid,
         drm,
         pci,
+        window_lacks,
     }
 }
 
@@ -514,6 +553,60 @@ mod tests {
         );
     }
 
+    /// A probe of devices that list `lists`, each with `swapchainMaintenance1` as `has` says, the
+    /// first `no_window` of them lacking `VK_EXT_metal_objects` among the window's extensions,
+    /// so no candidate, and the rest candidates.
+    fn probed_of(lists: &[&[&CStr]], has: &[bool], no_window: usize) -> Probed {
+        let metal_objects = ash::ext::metal_objects::NAME;
+        Probed {
+            extensions: (lists.iter())
+                .map(|names| names.iter().map(|n| (*n).to_owned()).collect())
+                .collect(),
+            maintenance1: has.to_vec(),
+            seen: (0..lists.len())
+                .map(|at| Seen {
+                    window_lacks: if at < no_window {
+                        vec![metal_objects]
+                    } else {
+                        Vec::new()
+                    },
+                    ..crate::device_choice::tests::integrated(2, u8::try_from(at).unwrap())
+                })
+                .collect(),
+        }
+    }
+
+    /// The window's extensions and present fences are judged on the candidates alone: a device
+    /// the window cannot present on, which the platform makes no device of, takes no part, and
+    /// with no candidate there is neither
+    #[test]
+    fn a_device_the_window_cannot_present_on_takes_no_part() {
+        let khr = c"VK_KHR_swapchain_maintenance1";
+        let loader = [
+            ash::khr::get_surface_capabilities2::NAME,
+            c"VK_KHR_surface_maintenance1",
+        ];
+        let both: &[&CStr] = &[khr];
+        let none: &[&CStr] = &[];
+        // A device first in the loader's order that lists neither fence extension nor has the
+        // feature, and lacks the window's extensions, beside one that has all.
+        let host = probed_of(&[none, both], &[false, true], 1);
+        assert!(host.any_candidate());
+        assert!(host.every_lists(khr) && host.every_has_maintenance1());
+        assert_eq!(
+            fence_extensions(&loader, &host),
+            Ok((khr, c"VK_KHR_surface_maintenance1"))
+        );
+        // The same devices, both candidates: the first lists no fence extension.
+        let host = probed_of(&[none, both], &[false, true], 0);
+        assert!(!host.every_lists(khr) && !host.every_has_maintenance1());
+        assert!(fence_extensions(&loader, &host).is_err());
+        // No candidate: nothing is judged to be listed or had.
+        let host = probed_of(&[both], &[true], 1);
+        assert!(!host.any_candidate() && !host.every_lists(khr));
+        assert!(fence_extensions(&loader, &host).is_err());
+    }
+
     /// Present fences take the KHR extension where every device lists it, else the EXT one,
     /// each with its own surface extension, and none where a device lacks the feature, a device
     /// lists neither, or the loader lists the instance's extensions not
@@ -521,14 +614,7 @@ mod tests {
     fn present_fences_take_what_every_device_lists_and_has() {
         let khr = c"VK_KHR_swapchain_maintenance1";
         let ext = ash::ext::swapchain_maintenance1::NAME;
-        let probed = |lists: &[&[&CStr]], has: bool| Probed {
-            extensions: lists
-                .iter()
-                .map(|names| names.iter().map(|n| (*n).to_owned()).collect())
-                .collect(),
-            every_has_maintenance1: has,
-            seen: Vec::new(),
-        };
+        let probed = |lists: &[&[&CStr]], has: bool| probed_of(lists, &vec![has; lists.len()], 0);
         let loader = [
             ash::khr::get_surface_capabilities2::NAME,
             c"VK_KHR_surface_maintenance1",

@@ -15,7 +15,10 @@
 //! **The choice.** The candidates are the physical devices that meet rt's floor; the pick among
 //! them is the library's (`crate::device_choice::chosen_untimed`): the device the host's user's
 //! selection variables name, else the one GPU, else the first of the runtime's order. Unlike the
-//! Vulkan platform's, it times no GPU (the module's docs there).
+//! Vulkan platform's, it times no GPU (the module's docs there). The library's rule that a
+//! candidate lists the device extensions a display's window takes holds here as there: the
+//! window here takes `VK_KHR_swapchain` alone, which rt's floor takes, so it passes over no
+//! device that meets the floor.
 //!
 //! **Its window system.** The instance enables the OS's surface extensions and present fences'
 //! where the loader lists them, and the device the extension of present fences where it lists
@@ -333,8 +336,14 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
             };
             let drm = lists(ash::ext::physical_device_drm::NAME);
             let pci = lists(ash::ext::pci_bus_info::NAME);
+            // The one device extension a display's window takes here, which rt's floor takes
+            // too (the module's docs, "Its window system").
+            let window_lacks = [ash::khr::swapchain::NAME]
+                .into_iter()
+                .filter(|&name| !lists(name))
+                .collect();
             // SAFETY: as above; rt's instance is at Vulkan 1.3, where `properties2` is core.
-            unsafe { crate::os::seen(raw, physical.raw(), true, drm, pci) }
+            unsafe { crate::os::seen(raw, physical.raw(), true, drm, pci, window_lacks) }
         })
         .collect();
     let Some(at) = crate::device_choice::chosen_untimed(&seen) else {

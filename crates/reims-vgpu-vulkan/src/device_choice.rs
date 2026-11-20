@@ -4,9 +4,28 @@
 //!
 //! **Candidates.** The physical devices are those the window's probe lists, in the loader's order
 //! (`crate::os`'s `seen_devices`, read through the probe's one instance). A candidate is one the
-//! runtime makes a device of: at Vulkan 1.2 or later, with a queue family of graphics and compute
-//! work, and a `deviceUUID`, which names it to the runtime: the registry ID the runtime answers
-//! for the physical device of that UUID names it ([`listed_registry_id`]).
+//! runtime makes a device of ([`Seen::usable`]): at Vulkan 1.2 or later, with a queue family of
+//! graphics and compute work, and a `deviceUUID`, which names it to the runtime: the registry ID
+//! the runtime answers for the physical device of that UUID names it ([`listed_registry_id`]).
+//! And it is one a display's window presents on: it lists every device extension the window's
+//! swapchain is made with ([`Seen::window_lacks`]): on the Vulkan platform `VK_KHR_swapchain` and
+//! the OS's own (`crate::os`'s `WINDOW_DEVICE_EXTENSIONS`: `VK_EXT_metal_objects` on macOS, none
+//! on Linux and Windows), on the rt platform `VK_KHR_swapchain`, which rt's floor takes. The rule
+//! is the same on every OS, and no vendor, device or driver takes part in it.
+//!
+//! **Why the window decides.** The platform names the window's device extensions in the options
+//! of every device it makes where a candidate lists them (`crate::os`'s `add_window_extensions`),
+//! and the runtime refuses to make a device that lacks one, so a device that lacks one is never
+//! made: not picked, not timed, and not the compositor's GPU ([`compositor_gpu`]). Before, the
+//! extensions were named only where every device listed them, and a device that lacked one was a
+//! candidate like any other. On the M3 Max with Mesa's KosmicKrisp beside MoltenVK (Mesa 26.3.1,
+//! its manifest where Homebrew's `mesa` puts it), the loader listed KosmicKrisp first, which lists
+//! no `VK_EXT_metal_objects`; the choice timed it at 1.71 ms to MoltenVK's 3.01 ms and took it,
+//! no device was given the window's extensions, and `firmware/ambrosia/check-boot.sh`'s
+//! full-screen Metal app presented 294 frames at 30 fps and dropped 106, where on MoltenVK alone
+//! it presented 601 at 60 fps (**measured**, 2026-11-19, a macOS 27.0.1 guest under HVF,
+//! m3-max-57095 against m3-max-57094). A device passed over for the window is logged with what it
+//! lacks, on its own line and on the pick's.
 //!
 //! **The pick.**
 //! - Where the host's user picked a device, through `MESA_VK_DEVICE_SELECT` (with or without its
@@ -14,18 +33,25 @@
 //!   variable names ([`named`]): by its vendor and device IDs (`vendor:device` in hex, in any of
 //!   the three), or by its PCI address (`DRI_PRIME=pci-0000_03_00_0`); of two candidates of the
 //!   same IDs, the first in the loader's order. The variables are read in that order, and one
-//!   that names no candidate (no device of the host's, or one below Vulkan 1.2) is passed over
-//!   for the next. The loader's order is not the pick: Mesa's device-select layer sorts the
-//!   devices after the loader and lists its own default first unless its own variables name a
-//!   device, so with `VK_LOADER_DEVICE_SELECT` alone naming um870's RTX 3090, the loader's first
-//!   device was the layer's default, its Radeon 780M (**measured**, 2026-11-14, m3-max-30538,
-//!   Mesa 26.2.6 and the loader 1.4.363). `DRI_PRIME`'s index (`DRI_PRIME=1`, with or without
-//!   its `!`) selects the Nth GPU other than the layer's default, which the library cannot tell,
-//!   and the layer lists the GPU it selects first, so there the pick is the loader's first
-//!   candidate (read from Mesa's documentation of `DRI_PRIME`). Where no variable set names a
-//!   candidate, the pick is the loader's first candidate, and the log line says that none names
-//!   a device the runtime can use. The runtime alone ranks the candidates by kind first, so left
-//!   to itself it opens a discrete GPU even where the user's variable named an integrated one.
+//!   that names no candidate (no device of the host's, one below Vulkan 1.2, or one the window
+//!   cannot present on) is passed over for the next. The loader's order is not the pick: Mesa's
+//!   device-select layer sorts the devices after the loader and lists its own default first
+//!   unless its own variables name a device, so with `VK_LOADER_DEVICE_SELECT` alone naming
+//!   um870's RTX 3090, the loader's first device was the layer's default, its Radeon 780M
+//!   (**measured**, 2026-11-14, m3-max-30538, Mesa 26.2.6 and the loader 1.4.363).
+//!   `DRI_PRIME`'s index (`DRI_PRIME=1`, with or without its `!`) selects the Nth GPU other than
+//!   the layer's default, which the library cannot tell, and the layer lists the GPU it selects
+//!   first, so there the pick is the loader's first candidate (read from Mesa's documentation of
+//!   `DRI_PRIME`). Where no variable set names a candidate, the pick is the loader's first
+//!   candidate, and the log line says that none names one. The runtime alone ranks the devices
+//!   by kind first, so left to itself it opens a discrete GPU even where the user's variable
+//!   named an integrated one.
+//! - A device the window cannot present on is passed over even where the user's variable names
+//!   it, as one below Vulkan 1.2 is: the window's extensions are named before the pick, from the
+//!   candidates, and the runtime refuses to make a device that lacks one, so the device would not
+//!   open. A host's user who wants such a device hides the other drivers from the loader (its
+//!   `VK_DRIVER_FILES`): with no candidate, no device is given the window's extensions, and the
+//!   runtime's default device opens as before.
 //! - Otherwise, where one candidate is a GPU (any kind but a CPU implementation such as
 //!   llvmpipe), that GPU, never timed.
 //! - Where several are, the one that ran a fixed workload fastest ([`measured`]): the display's
@@ -35,10 +61,13 @@
 //!   directory, under a key of every timed GPU's UUID and driver version (`verdict.rs`), so only
 //!   the first open after a GPU or driver change times them; a verdict that does not read times
 //!   them again. Where the runtime refuses any GPU's workload, nothing is kept and the runtime's
-//!   own order stands.
+//!   own order of the candidates stands.
 //! - A CPU implementation is picked only where no GPU is a candidate, and never timed. The
 //!   runtime's own order: discrete GPUs, then integrated, virtual and CPU ones, each kind in the
-//!   loader's order (`Device::system_default_with`, read from code).
+//!   loader's order (`Device::system_default_with`, read from code). The runtime tries the
+//!   devices it makes in that order and takes the first it does not refuse, so where the first
+//!   lacks one of the window's extensions it makes the next; the choice opens its pick by registry
+//!   ID wherever the runtime's first try is another device ([`runtime_first`]).
 //!
 //! No vendor or device ID takes part: what a device reports picks the GPUs to time, and their
 //! times pick among them. The kind, the memory heaps and the PCIe link do not tell a GPU's speed
@@ -53,15 +82,16 @@
 //! - The measurement took 197 ms in all on um790 and about 180 ms on gem10, once; a first open
 //!   that reads the kept verdict took 39 to 45 ms on either.
 //!
-//! **Unchanged hosts.** Where the pick is the device the runtime would make its default device of
-//! anyway, it is made as before, by `Device::system_default_with` ([`chosen`] answers `None`). The
+//! **Unchanged hosts.** Where the pick is the device the runtime tries first for its default
+//! device, it is made as before, by `Device::system_default_with` ([`chosen`] answers `None`). The
 //! choice is logged once, at info: every device seen, each GPU's time and what its measurement
-//! cost in all, then the one picked and why.
+//! cost in all, then the one picked and why, with each device passed over for the window and why
+//! ([`choice_line`]).
 
 mod timing;
 mod verdict;
 
-use std::ffi::OsString;
+use std::ffi::{CStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -114,6 +144,11 @@ pub(crate) struct Seen {
     /// Its PCI domain, bus, device and function (`VK_EXT_pci_bus_info`); `None` where it does not
     /// list the extension.
     pub(crate) pci: Option<(u32, u32, u32, u32)>,
+    /// The device extensions a display's window's swapchain is made with that it does not list,
+    /// in their order: on the Vulkan platform `VK_KHR_swapchain` and the OS's own (`crate::os`'s
+    /// `window_device_extensions`), on the rt platform `VK_KHR_swapchain`. Empty where it lists
+    /// them all, as a device the window presents on does (the module doc's candidates).
+    pub(crate) window_lacks: Vec<&'static CStr>,
 }
 
 /// The device a selection variable's value names ([`named`]).
@@ -252,9 +287,30 @@ impl Seen {
         self.uuid.as_ref().and_then(listed_registry_id)
     }
 
-    /// Whether the runtime makes a device of it (the module doc's candidates).
-    pub(crate) fn candidate(&self) -> bool {
+    /// Whether the runtime makes a device of it: at Vulkan 1.2 or later, with a graphics and
+    /// compute queue family and a UUID.
+    pub(crate) fn usable(&self) -> bool {
         self.api_version >= vk::API_VERSION_1_2 && self.graphics_compute && self.uuid.is_some()
+    }
+
+    /// Whether it is a candidate (the module doc's): the runtime makes a device of it, and a
+    /// display's window presents on it.
+    pub(crate) fn candidate(&self) -> bool {
+        self.usable() && self.window_lacks.is_empty()
+    }
+
+    /// Why a display's window cannot present on it, where it cannot: the window's device
+    /// extensions it does not list.
+    fn window_refusal(&self) -> Option<String> {
+        let lacks: Vec<_> = (self.window_lacks.iter())
+            .map(|name| name.to_string_lossy())
+            .collect();
+        (!lacks.is_empty()).then(|| {
+            format!(
+                "a display's window cannot present on it: it lists no {}",
+                lacks.join(" and no ")
+            )
+        })
     }
 
     /// Whether it is a GPU: any kind but a CPU implementation.
@@ -272,13 +328,15 @@ impl Seen {
             _ => "other",
         };
         let not = if self.api_version < vk::API_VERSION_1_2 {
-            ", not usable: below Vulkan 1.2"
+            ", not usable: below Vulkan 1.2".to_owned()
         } else if !self.graphics_compute {
-            ", not usable: no graphics and compute queue"
+            ", not usable: no graphics and compute queue".to_owned()
         } else if self.uuid.is_none() {
-            ", not usable: no device UUID"
+            ", not usable: no device UUID".to_owned()
+        } else if let Some(why) = self.window_refusal() {
+            format!(", not a candidate: {why}")
         } else {
-            ""
+            String::new()
         };
         format!(
             "{} ({kind}, {:04x}:{:04x}, Vulkan {}.{}, driver {:#x}, {:.2} GiB device-local){not}",
@@ -333,8 +391,8 @@ impl Why {
     /// The reason as the log line gives it.
     fn describe(self) -> String {
         match self {
-            Why::Only => "the only device the runtime can use".to_owned(),
-            Why::OnlyGpu => "the only GPU the runtime can use, beside CPU devices".to_owned(),
+            Why::Only => "the only candidate".to_owned(),
+            Why::OnlyGpu => "the only GPU of the candidates, beside CPU devices".to_owned(),
             Why::Measured => "the fastest of the GPUs at the choice's workload".to_owned(),
             Why::Cached => "the fastest of the GPUs at the choice's workload, as measured \
                             before on the same GPUs and drivers"
@@ -347,12 +405,12 @@ impl Why {
                  device, which Mesa's device-select layer lists first for it"
             ),
             Why::UserNamedNone(var) => format!(
-                "{var} is set, but no selection variable set names a device the runtime can use \
-                 here, so the loader's first device"
+                "{var} is set, but no selection variable set names a candidate here, so the \
+                 loader's first candidate"
             ),
-            Why::RuntimeOrder => {
-                "first in the runtime's own order (discrete, integrated, virtual, CPU)".to_owned()
-            }
+            Why::RuntimeOrder => "first of the candidates in the runtime's own order (discrete, \
+                                  integrated, virtual, CPU)"
+                .to_owned(),
         }
     }
 }
@@ -360,10 +418,11 @@ impl Why {
 /// The device of `seen` (the loader's order) the library opens, and why: where `user` lists the
 /// selection variables the host's user set, with what each names ([`user_selection`]), the
 /// candidate the first of them to name one names, or the loader's first candidate where an index
-/// comes before it or none names one (the module doc); else the one GPU
+/// comes before it or none names one (the module doc); else the one candidate, or the one GPU
 /// among the candidates; else, of several GPUs, the one `measure` answers for them (their
-/// indices in `seen`), or the first of the runtime's own order where it answers none (the module
-/// doc). `measure` is asked only of two GPUs or more. `None` where no device is a candidate.
+/// indices in `seen`), or the first candidate of the runtime's own order where it answers none
+/// (the module doc). `measure` is asked only of two GPUs or more. `None` where no device is a
+/// candidate.
 pub(crate) fn choose(
     seen: &[Seen],
     user: &[(&'static str, Option<Named>)],
@@ -389,8 +448,8 @@ pub(crate) fn choose(
         }
         return loaders_first(Why::UserNamedNone(first));
     }
-    if candidates.len() == 1 {
-        return runtime_first(seen).map(|at| (at, Why::Only));
+    if let &[only] = candidates.as_slice() {
+        return Some((only, Why::Only));
     }
     let gpus: Vec<usize> = (candidates.iter().copied())
         .filter(|&at| seen.get(at).is_some_and(Seen::gpu))
@@ -400,7 +459,7 @@ pub(crate) fn choose(
         [_, _, ..] => measure(&gpus),
         [] => None,
     }
-    .or_else(|| runtime_first(seen).map(|at| (at, Why::RuntimeOrder)))
+    .or_else(|| first_of_kinds(seen, Seen::candidate).map(|at| (at, Why::RuntimeOrder)))
 }
 
 /// Of the GPUs `gpus` (indices in `seen`), the one that ran the workload fastest: the verdict kept
@@ -469,10 +528,18 @@ fn verdict_file() -> Option<PathBuf> {
     )
 }
 
-/// The candidate of `seen` the runtime alone makes its default device of: the first of its order
-/// of kinds (discrete, integrated, virtual, CPU, any other), then the loader's
-/// (`Device::system_default_with`, read from code).
+/// The device of `seen` the runtime tries first for its default device: of those it makes a
+/// device of ([`Seen::usable`]), the first of its order of kinds (`Device::system_default_with`,
+/// read from code). Where it refuses that one, as a device that lacks an extension its options
+/// name, it makes the next, so a pick that is not this device is opened by its registry ID
+/// ([`to_open`]).
 fn runtime_first(seen: &[Seen]) -> Option<usize> {
+    first_of_kinds(seen, Seen::usable)
+}
+
+/// Of the devices of `seen` that `keep` keeps, the first of the runtime's order of kinds
+/// (discrete, integrated, virtual, CPU, any other), then the loader's.
+fn first_of_kinds(seen: &[Seen], keep: impl Fn(&Seen) -> bool) -> Option<usize> {
     let preference = |kind: vk::PhysicalDeviceType| match kind {
         vk::PhysicalDeviceType::DISCRETE_GPU => 0,
         vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
@@ -482,14 +549,14 @@ fn runtime_first(seen: &[Seen]) -> Option<usize> {
     };
     seen.iter()
         .enumerate()
-        .filter(|(_, s)| s.candidate())
+        .filter(|&(_, s)| keep(s))
         .min_by_key(|&(at, s)| (preference(s.kind), at))
         .map(|(at, _)| at)
 }
 
 /// The device `picked` of `seen` to open by its registry ID ([`Seen::registry_id`]), where the
-/// runtime's default device is another: `None` where nothing was picked, or the pick is the
-/// device the runtime makes its default device of anyway.
+/// runtime tries another first for its default device ([`runtime_first`]): `None` where nothing
+/// was picked, or the pick is the device the runtime tries first.
 fn to_open(seen: &[Seen], picked: Option<usize>) -> Option<usize> {
     let at = picked?;
     (Some(at) != runtime_first(seen) && at < seen.len()).then_some(at)
@@ -547,20 +614,31 @@ pub(crate) fn chosen_untimed(seen: &[Seen]) -> Option<usize> {
     picked.map(|(at, _)| at)
 }
 
-/// Logs the device of `seen` `picked`, with why, at info.
+/// Logs the device of `seen` `picked`, with why, at info ([`choice_line`]).
 fn log_choice(seen: &[Seen], picked: Option<(usize, Why)>) {
-    match picked.and_then(|(at, why)| Some((at, seen.get(at)?, why))) {
-        Some((at, device, why)) => log::info!(
-            target: TARGET,
+    log::info!(target: TARGET, "{}", choice_line(seen, picked));
+}
+
+/// The log line of the device of `seen` `picked`, with why, and each device the runtime makes
+/// that was passed over as no candidate, with why (the module doc).
+fn choice_line(seen: &[Seen], picked: Option<(usize, Why)>) -> String {
+    let mut line = match picked.and_then(|(at, why)| Some((at, seen.get(at)?, why))) {
+        Some((at, device, why)) => format!(
             "the library's GPU is Vulkan device {at}, {}: {}",
             device.name,
             why.describe()
         ),
-        None => log::info!(
-            target: TARGET,
-            "no Vulkan device the runtime can use was listed: the runtime's default device"
-        ),
+        None => "no candidate was listed: the runtime's default device".to_owned(),
+    };
+    for (at, device) in seen.iter().enumerate() {
+        if let Some(why) = device.window_refusal().filter(|_| device.usable()) {
+            line.push_str(&format!(
+                "; passed over Vulkan device {at}, {}: {why}",
+                device.name
+            ));
+        }
     }
+    line
 }
 
 /// The registry ID the runtime answers for the physical device whose `deviceUUID` is `uuid`,
@@ -612,6 +690,7 @@ pub(crate) mod tests {
             uuid: Some(std::array::from_fn(|i| if i == 0 { id } else { 0 })),
             drm: None,
             pci: None,
+            window_lacks: Vec::new(),
         }
     }
 
@@ -930,6 +1009,143 @@ pub(crate) mod tests {
         assert_eq!(choose(&list, &[], unasked), Some((3, Why::Only)));
         assert_eq!(runtime_first(&list), Some(3));
         assert_eq!(choose(&list[..3], &[], unasked), None);
+    }
+
+    /// `seen` named `name`, of PCI vendor and device IDs `ids`, lacking the window's device
+    /// extensions `lacks`.
+    fn lacking(seen: Seen, name: &str, ids: (u32, u32), lacks: &[&'static CStr]) -> Seen {
+        Seen {
+            name: name.to_owned(),
+            vendor_id: ids.0,
+            device_id: ids.1,
+            window_lacks: lacks.to_vec(),
+            ..seen
+        }
+    }
+
+    /// The M3 Max's devices with Mesa's KosmicKrisp beside MoltenVK, in the loader's order
+    /// (m3-max-57095): KosmicKrisp, which lists no `VK_EXT_metal_objects`, then MoltenVK, both
+    /// integrated.
+    fn kosmickrisp_then_moltenvk() -> [Seen; 2] {
+        let metal_objects = ash::ext::metal_objects::NAME;
+        [
+            lacking(
+                integrated(51, 1),
+                "kosmickrisp",
+                (0x106b, 0x64),
+                &[metal_objects],
+            ),
+            lacking(integrated(64, 2), "moltenvk", (0x106b, 0x1b00_0209), &[]),
+        ]
+    }
+
+    /// A device a display's window cannot present on is no candidate, whatever its kind and
+    /// wherever the loader lists it: never picked, timed or the compositor's GPU, on every OS by
+    /// the same rule; the pick is opened by ID where the runtime would try such a device first,
+    /// and alone it leaves no pick
+    #[test]
+    fn a_device_the_window_cannot_present_on_is_no_candidate() {
+        let list = kosmickrisp_then_moltenvk();
+        assert!(list[0].usable() && !list[0].candidate() && list[1].candidate());
+        assert_eq!(choose(&list, &[], unasked), Some((1, Why::Only)));
+        assert_eq!(runtime_first(&list), Some(0));
+        assert_eq!(to_open(&list, Some(1)), Some(1));
+        assert_eq!(choose(&list[..1], &[], unasked), None);
+        // Of three GPUs, the two the window presents on are timed; where the timing answers
+        // nothing, the first candidate of the runtime's order.
+        let three = [list[0].clone(), list[1].clone(), integrated(8, 3)];
+        let mut asked = Vec::new();
+        let picked = choose(&three, &[], |gpus| {
+            asked = gpus.to_vec();
+            None
+        });
+        assert_eq!(
+            (picked, asked.as_slice()),
+            (Some((1, Why::RuntimeOrder)), &[1, 2][..])
+        );
+        // A GPU without `VK_KHR_swapchain`, which every OS's window takes, beside llvmpipe.
+        let swapchain = ash::khr::swapchain::NAME;
+        let headless = lacking(discrete(24, 4), "headless", (0x10de, 0x2204), &[swapchain]);
+        let list = [headless.clone(), cpu(5)];
+        assert_eq!(choose(&list, &[], unasked), Some((1, Why::Only)));
+        assert_eq!(to_open(&list, Some(1)), Some(1));
+        // The compositor on such a GPU composites on none the runtime opens for it.
+        let id = |s: &Seen| s.uuid.map(|u| u64::from(u[0]));
+        let list = [
+            with_nodes(discrete(24, 1), 0, 128),
+            with_nodes(headless, 1, 129),
+        ];
+        assert_eq!(
+            compositor_gpu_of(&list, (226, 129), Some(1), id),
+            CompositorGpu::Own
+        );
+    }
+
+    /// A selection variable that names a device the window cannot present on is passed over,
+    /// as one that names a device below Vulkan 1.2 is: the next variable's device, else the
+    /// loader's first candidate
+    #[test]
+    fn a_variable_naming_a_device_the_window_cannot_present_on_is_passed_over() {
+        let list = kosmickrisp_then_moltenvk();
+        let kosmickrisp = ("MESA_VK_DEVICE_SELECT", Some(Named::Ids(0x106b, 0x64)));
+        assert_eq!(
+            choose(&list, &[kosmickrisp], unasked),
+            Some((1, Why::UserNamedNone("MESA_VK_DEVICE_SELECT")))
+        );
+        let moltenvk = Named::Ids(0x106b, 0x1b00_0209);
+        let user = [kosmickrisp, ("VK_LOADER_DEVICE_SELECT", Some(moltenvk))];
+        assert_eq!(
+            choose(&list, &user, unasked),
+            Some((1, Why::UserChose("VK_LOADER_DEVICE_SELECT", moltenvk)))
+        );
+        assert_eq!(choose(&list[..1], &[kosmickrisp], unasked), None);
+    }
+
+    /// The choice's line names the pick and why, then each device the runtime makes that was
+    /// passed over for the window, with the extensions it lacks; a device the runtime cannot
+    /// make is not named there, and a device's own line says why it is no candidate
+    #[test]
+    fn the_choices_line_names_each_device_passed_over_for_the_window() {
+        let list = kosmickrisp_then_moltenvk();
+        let lacks = "a display's window cannot present on it: it lists no VK_EXT_metal_objects";
+        assert_eq!(
+            choice_line(&list, Some((1, Why::Only))),
+            format!(
+                "the library's GPU is Vulkan device 1, moltenvk: the only candidate; passed over \
+                 Vulkan device 0, kosmickrisp: {lacks}"
+            )
+        );
+        assert_eq!(
+            choice_line(&list[..1], None),
+            format!(
+                "no candidate was listed: the runtime's default device; passed over Vulkan \
+                 device 0, kosmickrisp: {lacks}"
+            )
+        );
+        assert!(
+            list[0]
+                .describe()
+                .ends_with(&format!(", not a candidate: {lacks}"))
+        );
+        assert!(!list[1].describe().contains("not"));
+        let old = Seen {
+            api_version: vk::API_VERSION_1_1,
+            ..list[0].clone()
+        };
+        assert_eq!(
+            choice_line(&[old.clone(), list[1].clone()], Some((1, Why::Only))),
+            "the library's GPU is Vulkan device 1, moltenvk: the only candidate"
+        );
+        assert!(old.describe().ends_with(", not usable: below Vulkan 1.2"));
+        let both = [ash::khr::swapchain::NAME, ash::ext::metal_objects::NAME];
+        let bare = lacking(integrated(2, 3), "bare", (0, 0), &both);
+        assert_eq!(
+            bare.window_refusal().as_deref(),
+            Some(
+                "a display's window cannot present on it: it lists no VK_KHR_swapchain and no \
+                 VK_EXT_metal_objects"
+            )
+        );
     }
 
     /// A timer of fixed times, in milliseconds by index in `seen`, counting its calls; a time of
