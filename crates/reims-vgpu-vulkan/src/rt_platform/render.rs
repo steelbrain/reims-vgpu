@@ -568,6 +568,45 @@ fn named<T: TryFrom<u32>>(raw: u64, what: &'static str) -> Result<T, Stop> {
     value.ok_or(Stop::Metal(what))
 }
 
+/// The primitive type of the draw `cmd`; `None` for a command other than a draw of one.
+fn drawn_primitive(cmd: &RenderCmd<'_, RtPlatform>) -> Option<u64> {
+    match *cmd {
+        RenderCmd::DrawPrimitives { primitive_type, .. }
+        | RenderCmd::DrawPrimitivesInstances { primitive_type, .. }
+        | RenderCmd::DrawPrimitivesBase { primitive_type, .. }
+        | RenderCmd::DrawPrimitivesIndirect { primitive_type, .. }
+        | RenderCmd::DrawIndexedPrimitives { primitive_type, .. }
+        | RenderCmd::DrawIndexedPrimitivesInstances { primitive_type, .. }
+        | RenderCmd::DrawIndexedPrimitivesBase { primitive_type, .. }
+        | RenderCmd::DrawIndexedPrimitivesIndirect { primitive_type, .. } => Some(primitive_type),
+        _ => None,
+    }
+}
+
+/// What a draw asked of rt, for the process's first line of each kind of rt's refusals of it
+/// (`super::unbuilt::refusal_detail`): its primitive type (Metal's number; none for a command
+/// other than a draw of one) and the vertex function of the pipeline state set (none before
+/// one is set). The function's name is the guest's.
+struct DrawDetail<'a> {
+    /// The draw's primitive type.
+    primitive: Option<u64>,
+    /// The name of the vertex function of the pipeline state set.
+    vertex: Option<&'a str>,
+}
+
+impl std::fmt::Display for DrawDetail<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.primitive {
+            Some(primitive) => write!(f, "a draw of primitive type {primitive}")?,
+            None => f.write_str("a command other than a draw of a primitive type")?,
+        }
+        match self.vertex {
+            Some(vertex) => write!(f, ", the pipeline state's vertex function {vertex}"),
+            None => f.write_str(", no pipeline state set"),
+        }
+    }
+}
+
 /// `MTLPrimitiveType` of `raw`.
 fn primitive(raw: u64) -> Result<PrimitiveType, Stop> {
     named(raw, "a primitive type Metal has none of")
@@ -715,9 +754,14 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
             let sel = cmd.selector();
             let ending = matches!(cmd, RenderCmd::EndEncoding);
             note_copies(self.kept.copies(), &cmd);
+            let primitive = drawn_primitive(&cmd);
             let mut open = self.open.lock();
             let stopped = self.command(&mut open, cmd).err();
-            if let Some(Stop::Rt(rt::Error::Unsupported(rt::Gap::Draw { kind }))) = &stopped {
+            if let Some(Stop::Rt(error @ rt::Error::Unsupported(rt::Gap::Draw { kind }))) = &stopped
+            {
+                let vertex = open.seen.state.as_ref().map(|state| state.vertex_name());
+                let what = DrawDetail { primitive, vertex };
+                super::unbuilt::refusal_detail(sel, error, Some(&what));
                 match kind {
                     rt::DrawKind::AttachmentRead => self.attachment_read(&open.seen),
                     rt::DrawKind::FetchedAttachment => self.fetched_attachment(&open.seen),
@@ -780,6 +824,34 @@ mod tests {
         (crate::answer::degradation_counts().into_iter())
             .find(|(c, _)| c == code)
             .map_or(0, |(_, n)| n)
+    }
+
+    /// A refused draw's detail names its primitive type and the vertex function of the pipeline
+    /// state set, or that the command draws no primitive type, or that no state is set.
+    #[test]
+    fn a_refused_draw_s_detail_names_its_primitive_and_vertex_function() {
+        let draw = drawn_primitive(&RenderCmd::<RtPlatform>::DrawPrimitives {
+            primitive_type: 0,
+            vertex_start: 0,
+            vertex_count: 3,
+        });
+        assert_eq!(draw, Some(0));
+        let what = DrawDetail {
+            primitive: draw,
+            vertex: Some("vertex_points"),
+        };
+        assert_eq!(
+            what.to_string(),
+            "a draw of primitive type 0, the pipeline state's vertex function vertex_points"
+        );
+        let what = DrawDetail {
+            primitive: drawn_primitive(&RenderCmd::<RtPlatform>::EndEncoding),
+            vertex: None,
+        };
+        assert_eq!(
+            what.to_string(),
+            "a command other than a draw of a primitive type, no pipeline state set"
+        );
     }
 
     /// A pass of `texture` as colour attachment 0, of `load_action` (cleared to opaque red) and a

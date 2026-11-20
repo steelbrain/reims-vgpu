@@ -646,6 +646,13 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         match self.rt.heap_texture_size_and_align(&d) {
             Ok(rt::SizeAndAlign { size, align }) => Ok(SizeAndAlign { size, align }),
             Err(error) => {
+                let desc = desc.desc();
+                let options = desc.resource_options.unwrap_or(0);
+                let what = super::texture::TextureDetail {
+                    desc: &desc,
+                    options,
+                };
+                super::unbuilt::refusal_detail(SEL, &error, Some(&what));
                 let kind = rt_refused_texture(SEL, &error);
                 Err(refused_raise(SEL, kind, &error))
             }

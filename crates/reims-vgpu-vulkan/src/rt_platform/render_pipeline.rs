@@ -96,12 +96,20 @@ pub struct RtRenderPipeline {
     /// Its colour attachments' pixel formats, by index, and its sample count, as the guest's
     /// descriptor gave them: what the boot diagnostics key its `imageblockSampleLength` asks by.
     colors: ([u32; 8], u32),
+    /// Its vertex function's name, for the first line of each kind of rt's refusals of a draw
+    /// of it (`super::render`).
+    vertex_name: Box<str>,
 }
 
 impl RtRenderPipeline {
     /// rt's state.
     pub fn rt(&self) -> &rt::RenderPipelineState {
         &self.rt
+    }
+
+    /// Its vertex function's name.
+    pub fn vertex_name(&self) -> &str {
+        &self.vertex_name
     }
 
     /// The samplers it numbers, in rt's order.
@@ -133,7 +141,7 @@ pub fn of_value(
     d.color_attachments[0] = color_attachment(&color0).map_err(refused)?;
     let mut formats = [0; 8];
     formats[0] = u32::try_from(desc.color0_pixel_format).unwrap_or(u32::MAX);
-    make(device, &d, (formats, 1))
+    make(device, &d, (formats, 1), desc.vertex.name())
 }
 
 /// The state of core's whole descriptor `desc` (the module's docs).
@@ -164,7 +172,7 @@ pub fn of_descriptor(
         }
     }
     let samples = u32::try_from(desc.raster_sample_count).unwrap_or(u32::MAX);
-    make(device, &d, (formats, samples))
+    make(device, &d, (formats, samples), desc.vertex.name())
 }
 
 /// Unbuilt ([`Unbuilt::MeshPipeline`]): the creator's `NSError`.
@@ -331,12 +339,13 @@ fn tessellation(t: &TessellationDesc) -> Result<Option<TessellationDescriptor>, 
 }
 
 /// rt's state of `descriptor`, its samplers' indices taken (the module's docs), of colour formats
-/// and sample count `colors` ([`RtRenderPipeline::colors`]). `Err` is the creator's `NSError`,
-/// counted under the refusal's kind.
+/// and sample count `colors` ([`RtRenderPipeline::colors`]) and of the vertex function named
+/// `vertex_name`. `Err` is the creator's `NSError`, counted under the refusal's kind.
 fn make(
     device: &RtObj<RtDevice>,
     descriptor: &rt::RenderPipelineDescriptor,
     colors: ([u32; 8], u32),
+    vertex_name: &str,
 ) -> Result<RtObj<RtRenderPipeline>, NsErrorText> {
     let mut taking = Taking::new(device);
     let started = trace::on().then(trace::now);
@@ -358,6 +367,7 @@ fn make(
         vertex_written,
         fragment_written,
         colors,
+        vertex_name: vertex_name.into(),
     }))
 }
 

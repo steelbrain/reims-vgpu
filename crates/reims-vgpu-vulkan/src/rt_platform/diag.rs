@@ -863,17 +863,30 @@ static REFUSALS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 /// refusal of Metal's and a limit under their variant, `Refused-<variant>` and `Limit-<variant>`;
 /// any other error not.
 pub fn refusal(error: &rt::Error) {
-    let (map, name) = match error {
-        rt::Error::Unsupported(rt::Gap::Draw { kind }) => (&GAPS, format!("Draw-{kind:?}")),
-        rt::Error::Unsupported(rt::Gap::LinearPlanePass { kind }) => {
-            (&GAPS, format!("LinearPlanePass-{kind:?}"))
-        }
-        rt::Error::Unsupported(gap) => (&GAPS, variant(&format!("{gap:?}")).to_owned()),
-        rt::Error::Refused(r) => (&REFUSALS, format!("Refused-{}", variant(&format!("{r:?}")))),
-        rt::Error::Limit(l) => (&REFUSALS, format!("Limit-{}", variant(&format!("{l:?}")))),
-        _ => return,
+    let Some(name) = refusal_name(error) else {
+        return;
+    };
+    let map = match error {
+        rt::Error::Unsupported(_) => &GAPS,
+        _ => &REFUSALS,
     };
     *map.lock().entry(name).or_insert(0) += 1;
+}
+
+/// The kind [`refusal`] counts rt's `error` under: a gap's kind, a draw's `Draw-<kind>`, a
+/// refusal of Metal's `Refused-<variant>` and a limit `Limit-<variant>`; `None` for any other
+/// error.
+pub fn refusal_name(error: &rt::Error) -> Option<String> {
+    Some(match error {
+        rt::Error::Unsupported(rt::Gap::Draw { kind }) => format!("Draw-{kind:?}"),
+        rt::Error::Unsupported(rt::Gap::LinearPlanePass { kind }) => {
+            format!("LinearPlanePass-{kind:?}")
+        }
+        rt::Error::Unsupported(gap) => variant(&format!("{gap:?}")).to_owned(),
+        rt::Error::Refused(r) => format!("Refused-{}", variant(&format!("{r:?}"))),
+        rt::Error::Limit(l) => format!("Limit-{}", variant(&format!("{l:?}"))),
+        _ => return None,
+    })
 }
 
 /// The variant `debug` names, the `{:?}` of an enum's value: up to its first character that is not

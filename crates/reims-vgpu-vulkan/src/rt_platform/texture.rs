@@ -155,6 +155,38 @@ const HAZARD_TRACKED: u64 = 0x200;
 /// The resource options' storage mode, bits 4 to 7.
 pub(super) const STORAGE_BITS: u64 = 0xf0;
 
+/// What a texture's make asked of rt, for the process's first line of each kind of rt's
+/// refusals of it (`super::unbuilt::refusal_detail`): the guest's descriptor `desc` (its pixel
+/// format, size, levels, array length, sample count, texture type and usage, Metal's numbers),
+/// and the storage mode of the resource options `options` the texture is made of.
+pub(super) struct TextureDetail<'a> {
+    /// The guest's descriptor.
+    pub desc: &'a TextureDesc,
+    /// The resource options the texture is made of.
+    pub options: u64,
+}
+
+impl std::fmt::Display for TextureDetail<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let d = self.desc;
+        write!(
+            f,
+            "a texture of format {} {}x{}x{}, {} levels, array length {}, {} samples, type {}, \
+             usage {:#x}, storage {}",
+            d.pixel_format,
+            d.width,
+            d.height,
+            d.depth,
+            d.mipmap_level_count,
+            d.array_length,
+            d.sample_count,
+            d.texture_type,
+            d.usage,
+            (self.options & STORAGE_BITS) >> 4
+        )
+    }
+}
+
 /// `MTLPurgeableStateKeepCurrent`.
 const KEEP_CURRENT: u64 = 1;
 
@@ -437,6 +469,10 @@ fn answered(
         0 => UNKNOWN_ANSWERS,
         usage => usage & !DROPPED,
     };
+    if let Err(error) = &made {
+        let what = TextureDetail { desc, options };
+        super::unbuilt::refusal_detail(sel, error, Some(&what));
+    }
     device.made(sel, made, own, |texture| RtTexture {
         rt: texture,
         device: device.clone_ref(),
@@ -1441,6 +1477,31 @@ fn counted_copy(bytes: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused texture's detail names its descriptor's pixel format, size, levels, array
+    /// length, sample count, texture type and usage, as Metal numbers them, and the storage mode
+    /// of its resource options.
+    #[test]
+    fn a_refused_texture_s_detail_names_its_descriptor() {
+        let desc = TextureDesc {
+            texture_type: 4,
+            pixel_format: 70,
+            width: 826,
+            height: 826,
+            sample_count: 4,
+            usage: 0x5,
+            ..TextureDesc::default()
+        };
+        let what = TextureDetail {
+            desc: &desc,
+            options: STORAGE_PRIVATE,
+        };
+        assert_eq!(
+            what.to_string(),
+            "a texture of format 70 826x826x1, 1 levels, array length 1, 4 samples, type 4, \
+             usage 0x5, storage 2"
+        );
+    }
 
     /// The platform's own indices: the highest first, none reserved, each fresh one once, then
     /// those given back in the order they were, never one reserved since.

@@ -11,8 +11,11 @@
 //!
 //! A call of a built piece that rt refuses (its `Error`: a limit, a refusal of Metal's, a known
 //! gap, a failed Vulkan call) answers the same way, counted under the error's kind,
-//! `rt-refused-<kind>` ([`RtRefusal::code`]), its first line naming the call and rt's error. A
-//! texture rt makes none of for its pixel format (`Gap::TextureFormat`) is counted under its
+//! `rt-refused-<kind>` ([`RtRefusal::code`]), its first line naming the call and rt's error. The
+//! first of each of rt's kinds by its name in the boot diagnostics (`Draw-Points`,
+//! `TextureCopy`, `Limit-TextureSamples`) writes a line of its own too, with what the call asked
+//! of rt where its site names it: a texture's descriptor, a copy's textures and places, a draw's
+//! primitive type and vertex function ([`refusal_detail`]). A texture rt makes none of for its pixel format (`Gap::TextureFormat`) is counted under its
 //! format's own code instead, `rt-refused-texture-format-<n>` ([`rt_refused_texture`]), so a
 //! boot's counts line gives each format number with its count. A pipeline state's imageblock
 //! length rt refuses (`Gap::ImageblockLength`) is counted apart from rt's other gaps too,
@@ -22,7 +25,7 @@
 //!
 //! [`Unbuilt::ALL`] is the list of what is still unbuilt. A piece leaves it when it is built.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use metal2vulkan_rt as rt;
@@ -336,7 +339,53 @@ pub fn rt_refused(sel: &'static str, error: &rt::Error) -> RtRefusal {
     let kind = RtRefusal::of(error);
     super::diag::refusal(error);
     refused_as(sel, kind, error);
+    refusal_detail(sel, error, None);
     kind
+}
+
+/// Writes on stderr the process's first line of each kind of rt's refusals by its name in the
+/// boot diagnostics (`super::diag::refusal_name`: `Draw-Points`, `TextureCopy`,
+/// `Limit-TextureSamples`), which the line of the first of its [`RtRefusal`] kind
+/// ([`refused_as`]) leaves out past that kind's first: [`detail_line`] of the call `sel`, rt's
+/// `error` and `what`, what the call asked of rt that rt's error does not name (a texture's
+/// descriptor, a copy's textures and places, a draw's primitive type and vertex function). A
+/// caller that names `what` calls it before it counts the refusal, whose own call here
+/// ([`rt_refused`]) then writes nothing. Counts nothing.
+pub fn refusal_detail(sel: &'static str, error: &rt::Error, what: Option<&dyn std::fmt::Display>) {
+    let Some(name) = super::diag::refusal_name(error) else {
+        return;
+    };
+    if first_named(name.clone()) {
+        say(&detail_line(sel, error, &name, what));
+    }
+}
+
+/// Whether this is the process's first ask of the refusal kind `name` ([`refusal_detail`]):
+/// notes it.
+fn first_named(name: String) -> bool {
+    static SAID: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    SAID.lock().insert(name)
+}
+
+/// The line [`refusal_detail`] writes of rt's `error` of the call `sel`, of the kind `name`, and
+/// what the call asked of rt, `what`, where it names it.
+fn detail_line(
+    sel: &str,
+    error: &rt::Error,
+    name: &str,
+    what: Option<&dyn std::fmt::Display>,
+) -> String {
+    let code = RtRefusal::of(error).code();
+    match what {
+        Some(what) => format!(
+            "reims-vgpu: {sel}: metal2vulkan-rt refused it ({error}); the first of {name} \
+             ({code}): {what}\n"
+        ),
+        None => format!(
+            "reims-vgpu: {sel}: metal2vulkan-rt refused it ({error}); the first of {name} \
+             ({code})\n"
+        ),
+    }
 }
 
 /// Counts a refusal of the call `sel` of the kind `kind` under its code, and under the code of the
@@ -715,6 +764,43 @@ mod tests {
         let ((), relayed) = relaying_gaps(|| refused_again(RtRefusal::NoDevice));
         assert!(relayed);
         assert!(counted(code) > before, "{code}");
+    }
+
+    /// The first refusal of each of rt's kinds by name has a line of its own, naming the call,
+    /// rt's error, the kind, its code and what the call asked of rt where its site names it; the
+    /// kind's next refusal writes none.
+    #[test]
+    fn the_first_refusal_of_each_named_kind_has_its_own_line() {
+        let samples = rt::Error::Limit(rt::Limit::TextureSamples {
+            sample_count: 4,
+            counts: 0x1,
+        });
+        let name = crate::rt_platform::diag::refusal_name(&samples).expect("a limit's name");
+        assert_eq!(name, "Limit-TextureSamples");
+        let what = "a texture of format 70";
+        assert_eq!(
+            detail_line("newTextureWithDescriptor:", &samples, &name, Some(&what)),
+            format!(
+                "reims-vgpu: newTextureWithDescriptor:: metal2vulkan-rt refused it ({samples}); \
+                 the first of Limit-TextureSamples (rt-refused-limit): a texture of format 70\n"
+            )
+        );
+        let points = rt::Error::Unsupported(rt::Gap::Draw {
+            kind: rt::DrawKind::Points,
+        });
+        assert_eq!(
+            detail_line(
+                "drawPrimitives:vertexStart:vertexCount:",
+                &points,
+                "Draw-Points",
+                None
+            ),
+            "reims-vgpu: drawPrimitives:vertexStart:vertexCount:: metal2vulkan-rt refused it (a \
+             draw with Points is not built); the first of Draw-Points (rt-refused-gap)\n"
+        );
+        let kind = "test-first-named";
+        assert!(first_named(kind.to_owned()));
+        assert!(!first_named(kind.to_owned()));
     }
 
     /// The first refusal's line names the call, the piece and its code.
