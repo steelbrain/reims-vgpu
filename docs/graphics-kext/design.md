@@ -1949,16 +1949,22 @@ only where no negotiation can carry it.
   among them, and a sandbox that refuses the call, leave the process with no
   Metal device, logged: the bundle works by no guess at the words.
 - Bits 3-8 are named (`QUIET_SCHEDULED`, `CONSUMED_DOORBELL`, `QUEUE_BARRIER`,
-  `CB_PARTS`, `PAGES_BUFFERS`, `QUEUE_VECTORS`; `wire.rs`), and bits 9-12 are
-  reserved. Of them the host offers bit 7, `PAGES_BUFFERS`, where it offers
-  `SURFACE_PAGES`, and the kext takes it: a process's no-copy buffers lie over
-  its own pages, wired by the kext in a pages block (selector 4, "The
-  accelerator's user client"; `BUFFER_OVER_PAGES`). No host offers the others
-  yet, the kext takes none of them, and the host carries out none of their
-  queue flags: each lands with its feature, which says what it changes.
-- Bit 10 is reserved for a pipeline's warm-up, and bit 11 is `SURFACE_ORDER`:
-  a command buffer that uses IOSurfaces runs after the buffers of other queues
-  it names (`RGFX_OP_SURFACE_ORDER`; "Surface order", below).
+  `CB_PARTS`, `PAGES_BUFFERS`, `QUEUE_VECTORS`; `wire.rs`). Of them the host
+  offers bit 7, `PAGES_BUFFERS`, where it offers `SURFACE_PAGES`, and the kext
+  takes it: a process's no-copy buffers lie over its own pages, wired by the
+  kext in a pages block (selector 4, "The accelerator's user client";
+  `BUFFER_OVER_PAGES`). No host offers the others yet, the kext takes none of
+  them, and the host carries out none of their queue flags: each lands with
+  its feature, which says what it changes.
+- Bit 9 is `IMPORT_ADDRESSES_LATER`: a pages block's `SURFACE_PAGES` is
+  answered before the host gives the block's view its address, and the host
+  places the buffers over the block ("Import addresses", below). A host offers
+  it where a view's address is an import of the block's pages, on
+  metal2vulkan-rt's device, and on no other platform.
+- Bit 10 is reserved for a pipeline's warm-up, bit 11 is `SURFACE_ORDER`: a
+  command buffer that uses IOSurfaces runs after the buffers of other queues
+  it names (`RGFX_OP_SURFACE_ORDER`; "Surface order", below), and bit 12 is
+  `INDIRECT_COMMAND_BUFFERS`.
 - Bit 13, `UNSHARED_QUEUES`, every host offers and the kext takes: the queue
   flag `RGFX_QUEUE_UNSHARED` (`1 << 3`; `1 << 2` is reserved), which the kext
   sets on WindowServer's queues ("WindowServer's queues are unshared", below).
@@ -5106,6 +5112,24 @@ device took the feature.
   answer the same `gpuAddress`, where each had a pick of its own before.
   Buffers over read-only memory (on the Vulkan platform), over memory the
   bundle copies, and Managed ones keep theirs.
+- **Addresses given later.** Where the guest also took
+  `IMPORT_ADDRESSES_LATER` (feature bit 9), the host answers a pages block's
+  `SURFACE_PAGES` once it has checked and kept the block's runs, with the
+  address 0, and then makes the view and gives it its address on the same
+  surface-worker job, before the block settles. On metal2vulkan-rt's device
+  that is the import of the block's pages, which the guest's no-copy call then
+  no longer waits for. The
+  sender's later messages that name the block (its `BUFFER_OVER_PAGES`, and
+  the textures and command buffers over those buffers) wait for the block to
+  settle on the host's side, as they wait for its view elsewhere. The bundle
+  makes each `BUFFER_OVER_PAGES` over such a block at `gpu_address` 0, which
+  the host places at the view's address plus the buffer's offset, where it
+  would lie had the answer carried the address: what `gpuAddress` answers is
+  unchanged. The bundle learns the address only where the process asks for it,
+  with `PAGES_BUFFER_ADDRESS` (ring 0, `0x23d`), answered by an
+  `RgfxPagesAnswer` once the buffer is made. A host offers the bit only where
+  its platform imports the views as blocks it knows (`ViewImports`), so the
+  Vulkan platform's guests see `IMPORT_ADDRESSES` alone, as before.
 
 **Every surface cached.** Where the guest took `SURFACE_CACHE_EVERY` (feature
 bit 62), the host's GPU form of every IOSurface is its device cache: it keeps

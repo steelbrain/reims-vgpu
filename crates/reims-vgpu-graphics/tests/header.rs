@@ -110,6 +110,9 @@ CHECK(RGFX_PRIVATE_BLOCK_ALIGN == 0x10000 && RGFX_PRIVATE_TAKE_MAX == 0x10000000
 CHECK(RGFX_FEATURE_IMPORT_ADDRESSES == (1ULL << 61));
 CHECK(sizeof(RgfxPagesAnswer) == 32 && offsetof(RgfxPagesAnswer, status) == 16);
 CHECK(offsetof(RgfxPagesAnswer, gpu_address) == 24);
+CHECK(RGFX_FEATURE_IMPORT_ADDRESSES_LATER == (1 << 9));
+CHECK(RGFX_CMD_PAGES_BUFFER_ADDRESS == 0x23d && sizeof(RgfxPagesBufferAddress) == 24);
+CHECK(offsetof(RgfxPagesBufferAddress, obj_id) == 16);
 CHECK(RGFX_FEATURE_SURFACE_CACHE_EVERY == (1ULL << 62));
 CHECK(RGFX_FEATURE_MANAGED_AT_COPY == (1ULL << 63));
 CHECK(offsetof(RgfxCursorColor, on) == 20 && offsetof(RgfxCursorColor, source_curves) == 24);

@@ -1102,7 +1102,8 @@
 // [`RGFX_FEATURE_SURFACE_PAGES`], [`RGFX_FEATURE_SURFACE_CACHE`] and
 // [`RGFX_FEATURE_CB_SUBMITTED`], and from bit 3 the ones the guest takes through
 // [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
-// [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`],
+// [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_IMPORT_ADDRESSES_LATER`],
+// [`RGFX_FEATURE_SURFACE_ORDER`],
 // [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`], [`RGFX_FEATURE_UNSHARED_QUEUES`],
 // [`RGFX_FEATURE_MANAGED_AT_OFFSET`], [`RGFX_FEATURE_HEAP_OVER_PAGES`],
 // [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`], [`RGFX_FEATURE_COMMIT_ORDER`],
@@ -1111,8 +1112,8 @@
 // [`RGFX_FEATURE_SMALL_ID_CHUNKS`], [`RGFX_FEATURE_DISPLAY_COLOR`],
 // [`RGFX_FEATURE_MESH_PIPELINES`], [`RGFX_FEATURE_SHARED_EVENT_NAMES`],
 // [`RGFX_FEATURE_OPENCL_MODE`], [`RGFX_FEATURE_PRIVATE_RENDER_STATE`],
-// [`RGFX_FEATURE_SURFACE_CACHE_REFUSED`] and [`RGFX_FEATURE_SURFACE_DEFERRED_ASK`]). Bits 9 and
-// 10 are reserved.
+// [`RGFX_FEATURE_SURFACE_CACHE_REFUSED`] and [`RGFX_FEATURE_SURFACE_DEFERRED_ASK`]). Bit 10 is
+// reserved.
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63, the ones the host offers, which the guest takes
@@ -1181,6 +1182,20 @@
 // `FEATURES_LO` bit 8, `QUEUE_VECTORS`: the device has an MSI-X vector for each context slot
 // after vector 0, and a queue's completion ring raises its context's. No host offers it yet.
 #define RGFX_FEATURE_QUEUE_VECTORS (1 << 8)
+
+// `FEATURES_LO` bit 9, `IMPORT_ADDRESSES_LATER`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`] beside [`RGFX_FEATURE_IMPORT_ADDRESSES`] and
+// [`RGFX_FEATURE_PAGES_BUFFERS`]: a pages block's `SURFACE_PAGES` ([`RGFX_SURFACE_PAGES_PRIVATE`])
+// is answered once the host has checked and kept its runs, before it makes the block's view and
+// gives the view its address, which it does after the answer; the answer's `gpu_address`
+// ([`RgfxPagesAnswer`]) is 0. The sender's messages after it that name the block are carried out
+// once the view has its address, so the wait for it is the host's, not the guest's call's. The
+// guest makes each `BUFFER_OVER_PAGES` over such a block at `gpu_address` 0, which the host
+// places at the view's address plus the buffer's `offset`, where it would lie had the answer
+// carried the address, and asks a buffer's address with [`RGFX_CMD_PAGES_BUFFER_ADDRESS`] where
+// it needs it. A host offers it where a view's address is that of an import of the block's pages
+// (metal2vulkan-rt's device), and else not, so a guest there sees `IMPORT_ADDRESSES` alone.
+#define RGFX_FEATURE_IMPORT_ADDRESSES_LATER (1 << 9)
 
 // `FEATURES_LO` bit 11, `SURFACE_ORDER`, which the guest takes through
 // [`RGFX_REG_DRIVER_FEATURES_LO`]: the host decodes
@@ -1652,7 +1667,10 @@
 // guest places the `BUFFER_OVER_PAGES` buffers it makes over the block at that address plus
 // their offsets in the view, rather than at addresses it picks in its context's range
 // ([`RGFX_CONTEXT_VA_BASE`]); buffers over the same bytes, which share a block, share their
-// address. On metal2vulkan-rt's device the address is the Vulkan device address of the import of
+// address. Where the guest took [`RGFX_FEATURE_IMPORT_ADDRESSES_LATER`] too, the answer comes
+// before the view has its address and carries 0, and the host places the buffers at it, the
+// guest asking each one's ([`RGFX_CMD_PAGES_BUFFER_ADDRESS`]). On metal2vulkan-rt's device the
+// address is the Vulkan device address of the import of
 // the block's pages; on the Vulkan platform before it, an address the host picks in
 // `[2^43, 2^44)`, holding Metal's span of the view's length, where the platform pins the first
 // buffer made over the block, which then reaches the block's pages for the buffers made over the
@@ -2388,6 +2406,18 @@
 // answer gave it plus the span's offset in the block, else the guest's own pick. Not answered.
 #define RGFX_CMD_HEAP_OVER_POOL 572
 
+// Command `PAGES_BUFFER_ADDRESS` ([`RgfxPagesBufferAddress`]), where the guest took
+// [`RGFX_FEATURE_IMPORT_ADDRESSES_LATER`]: the GPU address of buffer `obj_id`, one a
+// `BUFFER_OVER_PAGES` of the sender's made, answered by an [`RgfxPagesAnswer`], an
+// [`RGFX_EVT_COMPLETE`] of 32 bytes: [`RGFX_STATUS_OK`] and the address the buffer lies at, which
+// its `gpuAddress` answers; [`RGFX_STATUS_REFUSED`] and 0 for a buffer whose create the host
+// refused; [`RGFX_STATUS_NOT_FOUND`] and 0 where `obj_id` names no buffer over a pages block of
+// the sender's (another context's object among them); [`RGFX_STATUS_INVALID_ARGUMENT`] and 0
+// for a message too short. Carried out after the sender's messages before it, the buffer's
+// create among them, which waits for its block's view's address: the answer comes once the
+// buffer lies there. Makes nothing.
+#define RGFX_CMD_PAGES_BUFFER_ADDRESS 573
+
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
 // and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
@@ -2560,6 +2590,10 @@
 // status is [`RGFX_STATUS_OK`], and 0 otherwise or where the host has no address for it; the
 // address holds until the block's `BLOCK_RELEASE` is carried out, or its context's
 // `CONTEXT_CLOSE`. A reader of the 24 bytes of an [`RgfxComplete`] reads the answer as before.
+// Where it took [`RGFX_FEATURE_IMPORT_ADDRESSES_LATER`] too, such a block is answered once the
+// host has checked and kept its runs, its `gpu_address` 0, and the host gives the view its
+// address after the answer; the sender's later messages that name the block are carried out
+// after that, and a `BUFFER_OVER_PAGES` at `gpu_address` 0 lies at it plus its `offset`.
 #define RGFX_CMD_SURFACE_PAGES 758
 
 // `SURFACE_DOWNLOAD` ([`RgfxSurfaceDownload`]), on ring 0 from the accelerator kext, where the
@@ -4128,7 +4162,10 @@ typedef struct {
   RgfxMsgHeader header;
   // The new buffer's guest-picked id.
   uint64_t obj_id;
-  // The buffer's guest-picked GPU address.
+  // The buffer's guest-picked GPU address. 0, where the guest took
+  // [`RGFX_FEATURE_IMPORT_ADDRESSES_LATER`], for the host's: the address the host gave the
+  // block's view plus `offset`, and where it gave the view none, where the platform places the
+  // buffer ([`RGFX_CMD_PAGES_BUFFER_ADDRESS`] answers it).
   uint64_t gpu_address;
   // The pages block's region offset, a block of the sender's context.
   uint64_t block_offset;
@@ -6998,18 +7035,31 @@ typedef struct {
 
 // A pages block's `SURFACE_PAGES` answer where the guest took
 // [`RGFX_FEATURE_IMPORT_ADDRESSES`]: an [`RgfxComplete`] and the GPU address of the block's
-// view's first byte.
+// view's first byte. Also a `PAGES_BUFFER_ADDRESS`'s answer
+// ([`RGFX_CMD_PAGES_BUFFER_ADDRESS`]), with the buffer's address.
 typedef struct {
-  // [`RGFX_EVT_COMPLETE`], with the `SURFACE_PAGES`' `seqno`.
+  // [`RGFX_EVT_COMPLETE`], with the `SURFACE_PAGES`' or `PAGES_BUFFER_ADDRESS`' `seqno`.
   RgfxMsgHeader header;
   // An `RGFX_STATUS_*`, as an [`RgfxComplete`]'s.
   uint32_t status;
   // Zero.
   uint32_t reserved_14;
   // The GPU address of the first byte of the block's view, never 0 where given; 0 unless
-  // the status is [`RGFX_STATUS_OK`], or where the host gives the block none.
+  // the status is [`RGFX_STATUS_OK`], where the host gives the block none, and where the
+  // guest took [`RGFX_FEATURE_IMPORT_ADDRESSES_LATER`], whose block's view is given its
+  // address after the answer. A `PAGES_BUFFER_ADDRESS`' answer: the buffer's GPU address, 0
+  // unless the status is [`RGFX_STATUS_OK`].
   uint64_t gpu_address;
 } RgfxPagesAnswer;
+
+// `PAGES_BUFFER_ADDRESS`: the GPU address of buffer `obj_id`, answered by an
+// [`RgfxPagesAnswer`].
+typedef struct {
+  // [`RGFX_CMD_PAGES_BUFFER_ADDRESS`].
+  RgfxMsgHeader header;
+  // The buffer, one a `BUFFER_OVER_PAGES` of the sender's made.
+  uint64_t obj_id;
+} RgfxPagesBufferAddress;
 
 // `PIPELINE_ANSWERS`: the kept answers the kext asks for, from the `first`th, at most `most`
 // ([`RGFX_CMD_PIPELINE_ANSWERS`]).
