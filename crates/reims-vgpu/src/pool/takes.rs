@@ -1147,7 +1147,13 @@ impl Shared {
             {
                 st.zeroed_by[1] = st.zeroed_by[1].saturating_add(len);
             }
-            self.changed.notify_all();
+            // Of the pool's waiters, a take waiting for the claim and the pool's thread waiting
+            // for the hold on a piece on its way out or at the release wait for a mark; a wake
+            // of the rest at each chunk would cost the lock's other users for nothing.
+            let gone = !(st.pieces.get(&piece)).is_some_and(|p| p.usable());
+            if st.claim_waits > 0 || st.closed || gone {
+                self.changed.notify_all();
+            }
             let parts = [
                 picked.saturating_duration_since(picking),
                 marked.saturating_duration_since(marking),
