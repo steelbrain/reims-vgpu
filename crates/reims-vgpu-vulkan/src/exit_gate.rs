@@ -253,13 +253,55 @@ pub fn arm() {
     if CLOSED.load(Ordering::SeqCst) {
         return;
     }
-    // SAFETY: `at_exit` is a plain function that never unwinds.
-    if unsafe { atexit(at_exit) } != 0 {
+    if register() != 0 {
         log::warn!(
             target: TARGET,
             "atexit refused: the library's GPU work may run beside the driver's exit"
         );
     }
+}
+
+/// Registers [`at_exit`] with the C library as its `atexit` does, for the image the library is
+/// linked into: on macOS through `__cxa_atexit`, with that image's `__dso_handle`. macOS's
+/// `atexit` first looks its function up with `dladdr`, for the base of its image, which is that
+/// header, and the lookup is slow. Measured on the M3 Max (macOS 27.0.1, 2026-11-19), in a child
+/// of this crate's test binary, beside the workspace's tests: `dladdr` took 0.40 ms a call at the
+/// median, a second call as long as the first, and `atexit` 1.0 ms, up to 5.6 ms. A quiesce
+/// ahead of the exit, whose close registers the hook ([`close_ahead`]), took 0.42 ms at the
+/// median and up to 12.8 ms through `atexit`, all of it in the close, with no step in progress
+/// (one of 30 runs of the workspace's tests on that Mac found it past 100 ms); through
+/// `__cxa_atexit`, 14 µs at the median and at most 1.3 ms, in 1035 runs.
+#[cfg(target_os = "macos")]
+fn register() -> i32 {
+    unsafe extern "C" {
+        /// The C library's `__cxa_atexit`: `f` runs with `arg` at the exit, or as the image whose
+        /// header is `dso` is unloaded.
+        fn __cxa_atexit(
+            f: extern "C" fn(*mut std::ffi::c_void),
+            arg: *mut std::ffi::c_void,
+            dso: *mut std::ffi::c_void,
+        ) -> i32;
+        /// The header of the image this is linked into, which the linker defines.
+        static __dso_handle: u8;
+    }
+    extern "C" fn hook(_: *mut std::ffi::c_void) {
+        at_exit();
+    }
+    // SAFETY: `hook` is a plain function that never unwinds; `__dso_handle` is only addressed.
+    unsafe {
+        __cxa_atexit(
+            hook,
+            std::ptr::null_mut(),
+            (&raw const __dso_handle).cast_mut().cast(),
+        )
+    }
+}
+
+/// Registers [`at_exit`] with the C library's `atexit`.
+#[cfg(not(target_os = "macos"))]
+fn register() -> i32 {
+    // SAFETY: `at_exit` is a plain function that never unwinds.
+    unsafe { atexit(at_exit) }
 }
 
 #[track_caller]
