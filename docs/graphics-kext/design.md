@@ -696,8 +696,10 @@ Stages:
         committed apart and taken in the other order) reads the newer bytes;
         a download of a cache nothing
         wrote since its last copy copies nothing; a decoder's new output whose
-        picture fails to land, or lands short of its planes, reads zeros where
-        the picture did not write, where the pages would give their bytes
+        picture fails to land, lands short of its planes, or lands with its
+        copy into the caches skipped (the runtime made no blit encoder for it,
+        docs/video/devices.md), reads zeros where the picture did not write,
+        where the pages would give their bytes
         (Metal leaves a failed decode's output undefined, and a new surface's
         texels are the kernel's zero-filled pages unless its client wrote them
         under a lock, which moves the count and has the decode's use fill the

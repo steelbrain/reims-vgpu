@@ -164,6 +164,13 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   decode (above) fails the session's next decode in its stead, whose command buffer completes
   failed at its end: the guest is told of the failure one picture late, counted as a degradation
   (`video-landing-failure-carried`).
+- **A picture whose copy into its output's caches the runtime makes no blit encoder for**
+  (metal2vulkan-runtime's refusal, which it counts under `rt-refused-<kind>`) lands with the
+  caches as they were: the copy is skipped, as the decoder skips whole a pass the platform makes
+  no encoder of, and the command buffer completes as for any landed picture. The process's first
+  is logged. An encode whose source's copy out of its caches the runtime makes no blit encoder
+  for fails its frame instead (`RGFX_VIDEO_ENCODE_FAILED`), since the encoder would read the
+  staging buffer's earlier bytes.
 - **A failed picture's output holds what the driver wrote** where the driver writes the output
   itself: a picture decoded into its output's cache, and one the driver's video processing
   copies there or into the pages, which on VA-API is issued right behind its decode and copies

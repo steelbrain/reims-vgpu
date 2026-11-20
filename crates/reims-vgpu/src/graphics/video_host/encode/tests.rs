@@ -401,6 +401,44 @@ fn a_source_in_a_device_cache_is_copied_out_of_it_first() {
     drop(s);
 }
 
+/// A source plane in a device cache whose copy out the platform makes no blit encoder for fails
+/// its frame, signalled with a failed result, rather than handing the encoder the staging
+/// buffer's earlier bytes (`Stage::copy_with_caches`); the next frame's copy runs as any.
+#[test]
+fn a_source_whose_copy_out_has_no_blit_encoder_fails_its_frame() {
+    use reims_vgpu_vulkan::core::testkit::Step;
+    let p = FakePlatform::new();
+    p.world().set_auto_complete(Some(CompleteOn::Caller));
+    let log = Log::default();
+    let s = session(&p, vec![], &log);
+    let cache = buffer(&p, 16384, PRIVATE);
+    let pages = source(&p);
+    let (failed, next) = (buffer(&p, 4096, SHARED), buffer(&p, 4096, SHARED));
+    let (luma, _) = planes(&cache, 64, 32);
+    let (_, chroma) = planes(&pages, 64, 32);
+    p.script().push("blitCommandEncoder", Step::Nil);
+    let mut e = encode(&pages, &failed, 0, Some(settings()));
+    (e.luma, e.chroma) = (luma, chroma);
+    assert_eq!(s.encode(&e).unwrap(), 1);
+    assert!(event_of(&s).wait_until_signaled_value(1, 10_000));
+    assert!(p.call_log().calls_to(COPY).is_empty(), "no copy out of the cache");
+    assert_eq!(result_in(&bytes(&failed)).status, RGFX_VIDEO_ENCODE_FAILED);
+    assert!(
+        !(log.lock().iter()).any(|seen| matches!(seen, Seen::Finished(..))),
+        "the encoder read no source"
+    );
+
+    let (luma, _) = planes(&cache, 64, 32);
+    let (_, chroma) = planes(&pages, 64, 32);
+    let mut e = encode(&pages, &next, 1, None);
+    (e.luma, e.chroma) = (luma, chroma);
+    assert_eq!(s.encode(&e).unwrap(), 2);
+    assert!(event_of(&s).wait_until_signaled_value(2, 10_000));
+    assert_eq!(p.call_log().calls_to(COPY).len(), 32, "the next frame's copy, one a row");
+    assert_eq!(result_in(&bytes(&next)).status, RGFX_VIDEO_ENCODE_OK);
+    drop(s);
+}
+
 /// The settings every backend takes: each H.264 and HEVC profile with its format, and H.264's
 /// entropy coders where the profile has them.
 #[test]

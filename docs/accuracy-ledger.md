@@ -88,7 +88,11 @@ refuses, as a resolve it builds none of, counted as above) is skipped whole: the
 the pass's ops up to its end, and the command buffer runs the rest and completes as it would
 have, as a Metal app's sends to a nil encoder do nothing and fail no command buffer
 (`crates/reims-vgpu/src/graphics/decode/cmdbuf.rs`, `unmade`). The process's first such pass of
-each kind has a line.
+each kind has a line. The host's video landing does the same with a picture's copy into its
+output's device caches that rt makes no blit encoder for: the copy is skipped, the caches keep
+their bytes and the decode's command buffer completes as for any landed picture; an encode's copy
+of its source out of the caches fails the frame instead
+(`crates/reims-vgpu/src/graphics/video_host.rs`, `Stage::copy_with_caches`).
 
 Among the translator's refusals (`rt-refused-translation`), a fragment function that reads an
 interpolant at a sample or an offset (`interpolate_at_sample`, `interpolate_at_offset`) outside

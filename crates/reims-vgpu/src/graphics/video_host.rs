@@ -31,7 +31,10 @@
 //!   error leaves one. A picture the hardware answered failed that the backend lands all the
 //!   same, as the hardware left it ([`Landing::hardware_failed`]), is logged and counted apart,
 //!   and lands as any other: a Mac's hardware H.264 decoder hands such a picture on with no
-//!   error (`super::nvidia`).
+//!   error (`super::nvidia`). A copy into the caches that the platform makes no blit encoder
+//!   for is skipped, as the decoder skips whole a pass the platform makes no encoder of: the
+//!   picture lands with the caches as they were, and is not counted as a failure to land
+//!   (`Stage::copy_with_caches`).
 //!
 //!   A picture holds the hardware's surface until it has landed, so the session holds no more
 //!   pictures unlanded than the decoder spares ([`HostDecoder::most_unlanded`]): a decode past
@@ -488,6 +491,15 @@ impl<P: Platform> Stage<P> {
     /// Copies each plane `staged` says is staged between the staging buffer and its device
     /// cache, into the cache where `into`, else out of it, on the session's queue, and waits for
     /// the copy.
+    ///
+    /// **A copy into the caches the platform makes no blit encoder for** (on the rt platform, an
+    /// encoder metal2vulkan-runtime refuses, which it counts under `rt-refused-<kind>`) is
+    /// skipped, as the decoder skips whole a pass the platform makes no encoder of
+    /// (`decode::cmdbuf`'s `unmade`): the caches keep their bytes, and the picture lands with
+    /// them, its value signalled and its command buffer completing as any landed picture's. The
+    /// process's first is logged. A copy out of the caches, an encode's source, answers the
+    /// refusal as an error, which fails the frame: skipped, it would hand the encoder the staging
+    /// buffer's earlier bytes, another frame's or what the buffer held when it was made.
     fn copy_with_caches(
         &mut self,
         luma: &OutputPlane<P>,
@@ -513,9 +525,18 @@ impl<P: Platform> Stage<P> {
         let cb = (queue.command_buffer(OnFault::Return))
             .map_err(|r| fault("its command buffer", r))?
             .ok_or_else(|| format!("the copy {way} a device cache: no command buffer"))?;
-        let blit = (cb.blit_encoder(OnFault::Return))
-            .map_err(|r| fault("its blit encoder", r))?
-            .ok_or_else(|| format!("the copy {way} a device cache: no blit encoder"))?;
+        let Some(blit) =
+            (cb.blit_encoder(OnFault::Return)).map_err(|r| fault("its blit encoder", r))?
+        else {
+            if into {
+                log::warn!(
+                    "hardware video: the platform made no blit encoder for a picture's copy into \
+                     its device caches: the copy is skipped, and the caches keep their bytes"
+                );
+                return Ok(());
+            }
+            return Err(format!("the copy {way} a device cache: no blit encoder").into());
+        };
         for (plane, at) in [(luma, staged.luma), (chroma, staged.chroma)] {
             let Some(at) = at else { continue };
             // A plane that lands in its cache's surface is copied into its image, staged at the

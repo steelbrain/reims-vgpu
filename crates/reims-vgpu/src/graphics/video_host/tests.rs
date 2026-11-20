@@ -423,6 +423,39 @@ fn a_plane_in_a_device_cache_lands_staged_then_copied() {
     );
 }
 
+/// A copy into the output's caches that the platform makes no blit encoder for is skipped, as
+/// the decoder skips whole a pass the platform makes no encoder of: the caches keep their bytes,
+/// and the picture lands with them, its value signalled and its command buffer completing as any
+/// landed picture's, not counted as a failure to land; the next picture's copy runs as any.
+#[test]
+fn a_copy_into_caches_the_platform_makes_no_blit_encoder_for_is_skipped() {
+    use reims_vgpu_vulkan::core::testkit::Step;
+    let p = FakePlatform::new();
+    p.world().set_auto_complete(Some(CompleteOn::Caller));
+    let log = Log::default();
+    let s = session(&p, vec![], &log);
+    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
+    let cache = buffer(&p, 16384, PRIVATE);
+    p.script().push("blitCommandEncoder", Step::Nil);
+    let skipped = (s.decode(&decode(&bitstream, &[], planes(&cache, &cache, 128)))).unwrap();
+    assert_eq!(skipped.value, 1);
+    assert!(event_of(&s).wait_until_signaled_value(1, 10_000));
+    assert!(p.call_log().calls_to(COPY).is_empty(), "no copy into the caches");
+    assert!(
+        skipped.landed.as_deref().is_some_and(|l| !l.failed()),
+        "its command buffer completes as any landed picture's"
+    );
+    assert_eq!(s.counts.lock().failed, 0);
+
+    let next = (s.decode(&decode(&bitstream, &[], planes(&cache, &cache, 128)))).unwrap();
+    assert_eq!(next.value, 2);
+    assert!(event_of(&s).wait_until_signaled_value(2, 10_000));
+    assert_eq!(p.call_log().calls_to(COPY).len(), 2, "the next picture's copy");
+    assert!(next.landed.as_deref().is_some_and(|l| !l.failed()));
+    assert_eq!(s.counts.lock().failed, 0);
+    drop(s);
+}
+
 /// Values are signalled in decode order, each once its picture landed: a decode that answers no
 /// picture is signalled in its turn, behind a picture still landing.
 #[test]
