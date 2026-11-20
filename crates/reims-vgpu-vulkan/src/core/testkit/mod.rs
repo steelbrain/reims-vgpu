@@ -30,6 +30,6 @@ pub mod vm;
 pub use calllog::{Arg, Call, CallLog};
 pub use clock::VirtualClock;
 pub use guest_ram::GuestRam;
-pub use objects::{CompleteOn, Fk, World, kind};
+pub use objects::{CompleteOn, Fk, Prepared, PreparedGrid, World, kind};
 pub use platform::FakePlatform;
 pub use script::{HeldCall, Policy, Script, Step};

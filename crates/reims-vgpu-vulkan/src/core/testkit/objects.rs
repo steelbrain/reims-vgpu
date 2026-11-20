@@ -914,6 +914,38 @@ pub struct World {
     pins_drop: AtomicBool,
     /// How many pins the devices dropped ([`World::dropped_pins`]).
     pins_dropped: AtomicU64,
+    /// Each dispatch made ahead, in the order the calls came ([`World::prepared`]).
+    prepared: Mutex<Vec<Prepared>>,
+    /// The holds the next makes ahead wait in, one each, in order ([`World::hold_prepare`]).
+    prepare_holds: Mutex<std::collections::VecDeque<HeldCall>>,
+}
+
+/// One call of a compute state's
+/// [`prepare_dispatch`](crate::core::platform::resource::ComputePipeline::prepare_dispatch): the
+/// state and the call's arguments. Kept beside the call log, not in it: the call reaches nothing
+/// the guest sees, and a pre-pass makes it on a thread of its own, at no fixed place among the
+/// logged calls.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Prepared {
+    /// The compute state.
+    pub state: ObjId,
+    /// The dispatch's grid.
+    pub dispatch: PreparedGrid,
+    /// Its threads per threadgroup.
+    pub threads: (u64, u64, u64),
+    /// The threadgroup memory lengths, as (index, length) pairs.
+    pub lengths: Vec<(u64, u64)>,
+}
+
+/// A [`Prepared`] call's dispatch, ordered so a test can sort the calls several threads made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PreparedGrid {
+    /// `dispatchThreads:threadsPerThreadgroup:`'s threads per grid.
+    Threads(u64, u64, u64),
+    /// `dispatchThreadgroups:threadsPerThreadgroup:`'s threadgroups per grid.
+    Threadgroups(u64, u64, u64),
+    /// An indirect dispatch of threadgroups.
+    ThreadgroupsIndirect,
 }
 
 /// A surface's pages as host addresses, as runs, in its order.
@@ -966,7 +998,29 @@ impl World {
             fresh_never_in_place: Mutex::new((None, Vec::new())),
             pins_drop: AtomicBool::new(false),
             pins_dropped: AtomicU64::new(0),
+            prepared: Mutex::new(Vec::new()),
+            prepare_holds: Mutex::new(std::collections::VecDeque::new()),
         })
+    }
+
+    /// The compute states' makes ahead so far, in the order the calls came ([`Prepared`]).
+    pub fn prepared(&self) -> Vec<Prepared> {
+        self.prepared.lock().clone()
+    }
+
+    /// Holds the next make ahead not held yet in `held`, after it is noted, until the test lets
+    /// it go, as a driver's cold pipeline make holds its thread.
+    pub fn hold_prepare(&self, held: HeldCall) {
+        self.prepare_holds.lock().push_back(held);
+    }
+
+    /// Notes a make ahead, then holds its thread where the test asked ([`World::hold_prepare`]).
+    pub(crate) fn note_prepared(&self, prepared: Prepared) {
+        self.prepared.lock().push(prepared);
+        let held = self.prepare_holds.lock().pop_front();
+        if let Some(held) = held {
+            held.hold();
+        }
     }
 
     /// Has the devices keep no pin of a buffer or heap they make from now on, where `on`: each

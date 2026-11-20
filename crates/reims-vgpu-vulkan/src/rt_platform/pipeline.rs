@@ -36,6 +36,13 @@
 //!   interface of it (`texture_accesses`): a slot it writes, or reads and writes, as its
 //!   operations do, not as its argument's `access::` qualifier says. Every other slot it only
 //!   samples, reads or queries, or does not use. The state keeps the written slots as it is made.
+//! - **Its dispatches made ahead.** rt's make of the state lowers every variant a dispatch can
+//!   run, but a kernel's `VkPipeline` depends on the dispatch's threadgroup size, threadgroup
+//!   memory lengths and grid tiles, so rt makes it at the dispatch's first use of them;
+//!   `prepare_dispatch` is rt's make of it ahead, at the size the dispatch gives, on the caller's
+//!   thread, for the device's pre-pass of a committed command buffer (reims-vgpu's
+//!   `graphics::decode::prepass`). It lowers nothing. A dispatch that needs what such a call is
+//!   making waits for that call alone, and gets every result and error of its own.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,6 +55,7 @@ use metal2vulkan::pipeline::{
 };
 use metal2vulkan_rt as rt;
 
+use crate::core::platform::compute::Dispatch;
 use crate::core::platform::resource::ComputePipeline;
 use crate::core::platform::types::{MtlSize, NsErrorText};
 use crate::core::platform::values::{FullComputePipelineDesc, LinkedFunctionsDesc, StageInputDesc};
@@ -541,6 +549,34 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
     /// writes it, as rt's interface of the kernel says; `Some(false)` for every other slot.
     fn texture_slot_writes(&self, index: u64) -> Option<bool> {
         Some(writes(&self.written, index))
+    }
+
+    /// rt's make ahead (`prepare_dispatch`) of the `VkPipeline` the dispatch would make at its
+    /// first use, at its threadgroup size, threadgroup memory lengths and grid tiles. A value past
+    /// rt's 32 bits makes nothing: the dispatch, or the length's set, refuses it
+    /// (`super::compute`).
+    fn prepare_dispatch(
+        &self,
+        dispatch: Dispatch,
+        threads_per_threadgroup: MtlSize,
+        threadgroup_memory_lengths: &[(u64, u64)],
+    ) {
+        let small = |n: u64| u32::try_from(n).ok();
+        let size = |s: MtlSize| Some([small(s.width)?, small(s.height)?, small(s.depth)?]);
+        let Some(threads) = size(threads_per_threadgroup) else {
+            return;
+        };
+        let dispatch = match dispatch {
+            Dispatch::Threads(grid) => size(grid).map(rt::Dispatch::Threads),
+            Dispatch::Threadgroups(groups) => size(groups).map(rt::Dispatch::Threadgroups),
+            Dispatch::ThreadgroupsIndirect => Some(rt::Dispatch::Indirect),
+        };
+        let lengths = (threadgroup_memory_lengths.iter())
+            .map(|&(index, length)| Some((small(index)?, small(length)?)))
+            .collect::<Option<Vec<_>>>();
+        if let (Some(dispatch), Some(lengths)) = (dispatch, lengths) {
+            self.rt.prepare_dispatch(dispatch, threads, &lengths);
+        }
     }
 }
 

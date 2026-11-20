@@ -551,6 +551,23 @@ pub trait ComputePipeline<P: Platform>: Handle {
     fn texture_slot_writes(&self, _index: u64) -> Option<bool> {
         None
     }
+    /// No Metal counterpart: makes ahead, on the calling thread, what a dispatch of the state
+    /// makes at its first use, so the dispatch finds it made: a platform whose pipeline depends
+    /// on the dispatch's threadgroup size, threadgroup memory lengths or grid compiles it there.
+    /// `dispatch` and `threads_per_threadgroup` are the dispatch's own arguments, and
+    /// `threadgroup_memory_lengths` what `setThreadgroupMemoryLength:atIndex:` set on its
+    /// encoder before it, as (index, length) pairs, each index once, in the order first set.
+    ///
+    /// It changes nothing the guest or the dispatch observes, and reports nothing: every result
+    /// and error is the dispatch's own. A dispatch that needs what another thread is making here
+    /// waits for that thread. The default makes nothing.
+    fn prepare_dispatch(
+        &self,
+        _dispatch: super::compute::Dispatch,
+        _threads_per_threadgroup: MtlSize,
+        _threadgroup_memory_lengths: &[(u64, u64)],
+    ) {
+    }
 }
 
 /// The function of a render pipeline a texture slot is bound for, as the render encoder's

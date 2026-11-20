@@ -251,6 +251,22 @@ impl<P: Platform> ComputeCmd<'_, P> {
         }
     }
 }
+/// A compute dispatch's grid as its encoder call takes it, for a pre-pass that makes ahead what
+/// the dispatch makes at its first use
+/// ([`ComputePipeline::prepare_dispatch`](super::resource::ComputePipeline::prepare_dispatch)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Dispatch {
+    /// `dispatchThreads:threadsPerThreadgroup:`'s threads per grid
+    /// ([`ComputeCmd::DispatchThreads`]).
+    Threads(MtlSize),
+    /// `dispatchThreadgroups:threadsPerThreadgroup:`'s threadgroups per grid
+    /// ([`ComputeCmd::DispatchThreadgroups`]).
+    Threadgroups(MtlSize),
+    /// `dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:`,
+    /// whose grid the GPU reads ([`ComputeCmd::DispatchThreadgroupsIndirect`]).
+    ThreadgroupsIndirect,
+}
+
 /// The compute encoder core gets from `-computeCommandEncoder` or
 /// `-computeCommandEncoderWithDescriptor:` (`CommandBuffer`).
 pub trait ComputeEncoder<P: Platform>: Handle {

@@ -5,15 +5,18 @@
 //! getters read the models.
 
 use super::super::calllog::Arg;
-use super::super::objects::{Fk, Model, ResourceCommon, TexDesc, TextureModel, kind};
+use super::super::objects::{
+    Fk, Model, Prepared, PreparedGrid, ResourceCommon, TexDesc, TextureModel, kind,
+};
 use super::super::platform::FakePlatform;
 use super::{Backing, fatal, new_buffer, new_texture};
 use crate::core::host::HostPtr;
 use crate::core::num::ToU64 as _;
+use crate::core::platform::compute::Dispatch;
 use crate::core::platform::resource::*;
 use crate::core::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
 use crate::core::platform::values::SurfacePlane;
-use crate::core::platform::{HostRange, Platform};
+use crate::core::platform::{Handle as _, HostRange, Platform};
 use crate::core::raise::{OnFault, RaiseResult};
 use crate::core::testkit::script::Policy;
 
@@ -701,6 +704,29 @@ impl ComputePipeline<FakePlatform> for Fk<kind::ComputePipeline> {
     /// Logged as [`TEXTURE_SLOT_WRITES`]; the script's answer, else none known.
     fn texture_slot_writes(&self, index: u64) -> Option<bool> {
         self.get_logged(TEXTURE_SLOT_WRITES, vec![Arg::U64(index)], || None)
+    }
+
+    /// Noted beside the call log
+    /// ([`World::prepared`](super::super::objects::World::prepared)), and held where the test
+    /// asked; it makes nothing.
+    fn prepare_dispatch(
+        &self,
+        dispatch: Dispatch,
+        threads_per_threadgroup: MtlSize,
+        threadgroup_memory_lengths: &[(u64, u64)],
+    ) {
+        let size = |s: MtlSize| (s.width, s.height, s.depth);
+        let dispatch = match dispatch {
+            Dispatch::Threads(s) => PreparedGrid::Threads(s.width, s.height, s.depth),
+            Dispatch::Threadgroups(s) => PreparedGrid::Threadgroups(s.width, s.height, s.depth),
+            Dispatch::ThreadgroupsIndirect => PreparedGrid::ThreadgroupsIndirect,
+        };
+        self.world().note_prepared(Prepared {
+            state: self.id(),
+            dispatch,
+            threads: size(threads_per_threadgroup),
+            lengths: threadgroup_memory_lengths.to_vec(),
+        });
     }
 }
 
