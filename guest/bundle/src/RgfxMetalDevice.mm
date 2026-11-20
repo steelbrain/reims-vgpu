@@ -1223,6 +1223,12 @@ RGFX_LOG_UNRECOGNIZED
 	_serializer->setCarriesDynamicLibraries((_caps.features() & RGFX_FEATURE_DYNAMIC_LIBRARIES) !=
 	                                        0);
 	_serializer->setManagedAtCopy((_caps.features() & RGFX_FEATURE_MANAGED_AT_COPY) != 0);
+	// Buffers over pages blocks at the host's address, asked where it is read, where the host
+	// answers a block before its view has one (RgfxBuffer's bufferOverPagesOf): both took
+	// IMPORT_ADDRESSES and IMPORT_ADDRESSES_LATER.
+	const uint64_t later = RGFX_FEATURE_IMPORT_ADDRESSES | RGFX_FEATURE_IMPORT_ADDRESSES_LATER;
+	_serializer->setPagesLater((_caps.kextFeatures() & kRgfxKextFeatureImportAddresses) != 0 &&
+	                           (_caps.features() & later) == later);
 	// Shared events cross processes through the kext's ports where the kext makes them and the
 	// host took the feature that names their events (RgfxUserClientABI.hpp,
 	// kRgfxSharedEventUserClientType).

@@ -390,6 +390,12 @@ public:
 	/// Managed buffer is its bytes. Set once, before the first buffer; off by default.
 	void setManagedAtCopy(bool atCopy) { m_managedAtCopy = atCopy; }
 	bool managedAtCopy() const { return m_managedAtCopy; }
+	/// Whether the process's buffers over its pages blocks lie at the host's address, asked where
+	/// it is read (createBufferOverPagesLater, pagesBufferAddress): the host took
+	/// RGFX_FEATURE_IMPORT_ADDRESSES_LATER beside IMPORT_ADDRESSES, so it answers a block before
+	/// the block's view has an address. Set once, before the first buffer; off by default.
+	void setPagesLater(bool later) { m_pagesLater = later; }
+	bool pagesLater() const { return m_pagesLater; }
 	/// Names shared event `event` for other processes: its port, 0 where none was given.
 	uint32_t shareEvent(RgfxObjId event);
 	/// The process's new shared event made of the one `port` names: its id in `obj_id` and the
@@ -490,6 +496,21 @@ public:
 	RgfxCreated createBufferOverPagesAt(uint64_t length, uint32_t options, uint64_t block_offset,
 	                                    uint64_t block_size, uint64_t offset,
 	                                    uint64_t gpu_address);
+
+	/// createBufferOverPages at the host's address (RGFX_FEATURE_IMPORT_ADDRESSES_LATER, whose
+	/// block's answer carries none), with no pick: its message names `gpu_address` 0, which the
+	/// host places at the block's view's address plus `offset`. The answer's `gpu_address` is 0;
+	/// the buffer's is asked of the host (pagesBufferAddress). No object where the buffer's end
+	/// would wrap.
+	RgfxCreated createBufferOverPagesLater(uint64_t length, uint32_t options,
+	                                       uint64_t block_offset, uint64_t block_size,
+	                                       uint64_t offset);
+
+	/// The GPU address of `buffer`, a buffer createBufferOverPagesLater made, asked of the host
+	/// (PAGES_BUFFER_ADDRESS), which answers once the buffer lies there; 0 where no asker is set,
+	/// no answer came, the host refused the buffer's create, or it knows no such buffer of the
+	/// process's.
+	uint64_t pagesBufferAddress(RgfxObjId buffer);
 
 	/// A buffer at `offset` in the heap `heap`. No one waits for it: where the control ring
 	/// batches (RgfxRingWriter::postLater), it is held to go with the messages around it, before
@@ -872,6 +893,7 @@ private:
 	bool m_functionPointers = false;
 	bool m_dynamicLibraries = false;
 	bool m_managedAtCopy = false;
+	bool m_pagesLater = false;
 	bool m_sharesPipelines = false;
 	void *m_eventContext = nullptr;
 

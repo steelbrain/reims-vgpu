@@ -230,6 +230,10 @@ void rgfxOwesEscapeNote(RgfxBuffer *buffer, MTLResourceOptions options, RgfxSeri
 	// YES for the buffer newBufferWithBytesNoCopy: makes (bufferWithBytesNoCopy), over the
 	// caller's bytes, which stays NonVolatile (setPurgeableState:).
 	BOOL _noCopy;
+	// YES for a Shared buffer over a pages block the host placed
+	// (RGFX_FEATURE_IMPORT_ADDRESSES_LATER): `_gpuAddress` is 0 until its first read asks the
+	// host (RgfxSerializer::pagesBufferAddress), and holds the answer from then on.
+	BOOL _asksAddress;
 	// Held while the buffer's escape note is posted (rgfxNoteEscape:), so a thread whose act
 	// comes while another's posts it returns only once it has gone. No post path takes it.
 	os_unfair_lock _escapeLock;
@@ -563,10 +567,14 @@ void rgfxOwesEscapeNote(RgfxBuffer *buffer, MTLResourceOptions options, RgfxSeri
 	            : hostOptions;
 	// At the GPU address the host gave the block's view, where it gave one
 	// (RGFX_FEATURE_IMPORT_ADDRESSES), which buffers over the same bytes share as they share the
-	// block; else at a pick of the process's.
-	const bool hostAddress = block.gpuAddress != 0;
+	// block; at the host's, asked where it is read, where the host answers the block before its
+	// view has an address (RGFX_FEATURE_IMPORT_ADDRESSES_LATER); else at a pick of the process's.
+	const bool later = serializer->pagesLater();
+	const bool hostAddress = later || block.gpuAddress != 0;
 	RgfxCreated created =
-	    hostAddress
+	    later ? serializer->createBufferOverPagesLater(length, static_cast<uint32_t>(overPages),
+	                                                   block.offset, block.size, offset)
+	    : block.gpuAddress != 0
 	        ? serializer->createBufferOverPagesAt(length, static_cast<uint32_t>(overPages),
 	                                              block.offset, block.size, offset,
 	                                              block.gpuAddress)
@@ -585,10 +593,14 @@ void rgfxOwesEscapeNote(RgfxBuffer *buffer, MTLResourceOptions options, RgfxSeri
 	const uint64_t copyPick = hostAddress ? 0 : created.gpu_address;
 	if (managed) {
 		// The app's own bytes, which its program wrote: nothing is said of them. At the copy's
-		// address where the host makes Managed buffers there (managedAtCopy).
+		// address where the host makes Managed buffers there (managedAtCopy): where the host
+		// placed the copy, its address asked of it now, which waits for the block's view.
+		uint64_t copyAddress = created.gpu_address + offset;
+		if (later)
+			copyAddress = serializer->managedAtCopy() ? serializer->pagesBufferAddress(copy) : 0;
 		created = serializer->createManagedBuffer(copy, length, static_cast<uint32_t>(options),
 		                                          length, RgfxSerializer::kDefaultAddressAlign,
-		                                          offset, created.gpu_address + offset);
+		                                          offset, copyAddress);
 		if (created.obj_id == 0 || serializer->refused(created)) {
 			region->leavePages(at);
 			serializer->destroy(copy, [serializer, copyPick, region, at] {
@@ -607,8 +619,11 @@ void rgfxOwesEscapeNote(RgfxBuffer *buffer, MTLResourceOptions options, RgfxSeri
 		if (appDeallocator != nil)
 			appDeallocator(pointer, length);
 	};
+	// A Shared one the host placed has its address asked where it is read (gpuAddress).
+	const bool asksAddress = later && !managed;
+	const uint64_t address = asksAddress ? 0 : created.gpu_address + offset;
 	RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:created.obj_id
-	                                            gpuAddress:created.gpu_address + offset
+	                                            gpuAddress:address
 	                                                length:length
 	                                               options:options
 	                                              contents:pointer
@@ -637,6 +652,7 @@ void rgfxOwesEscapeNote(RgfxBuffer *buffer, MTLResourceOptions options, RgfxSeri
 	// copy.
 	buffer->_ownsAddress = managed ? !created.sharesAddress : !hostAddress;
 	buffer->_addressPick = created.gpu_address;
+	buffer->_asksAddress = asksAddress;
 	buffer->_pagesRegion = region;
 	buffer->_pagesBlock = at;
 	rgfxOwesEscapeNote(buffer, options, serializer);
@@ -743,7 +759,16 @@ void rgfxOwesEscapeNote(RgfxBuffer *buffer, MTLResourceOptions options, RgfxSeri
 - (uint64_t)gpuAddress
 {
 	RgfxEscapes(self, RGFX_BUFFER_ESCAPED_GPU_ADDRESS);
-	return _gpuAddress;
+	uint64_t at = __atomic_load_n(&_gpuAddress, __ATOMIC_RELAXED);
+	// Where the host placed it, asked of the host at the first read, which answers once the
+	// buffer lies there; a read on another thread meanwhile asks too, and is answered the same.
+	// No answer keeps it 0, and the next read asks again.
+	if (at == 0 && _asksAddress && _serializer != nullptr) {
+		at = _serializer->pagesBufferAddress(_objId);
+		if (at != 0)
+			__atomic_store_n(&_gpuAddress, at, __ATOMIC_RELAXED);
+	}
+	return at;
 }
 
 // The note goes once for the buffer's life: the first act posts it under the buffer's lock, and

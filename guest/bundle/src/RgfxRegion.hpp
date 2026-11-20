@@ -62,7 +62,8 @@ public:
 	/// reserved. `ok` is false when the region had no room (the other fields are 0).
 	/// `gpuAddress` is the GPU address the device gave a pages block's view
 	/// (acquirePages, RGFX_FEATURE_IMPORT_ADDRESSES), which a joined block shares; 0 where it
-	/// gave none, and for every other block.
+	/// gave none, where it answered the block before its view had one
+	/// (RGFX_FEATURE_IMPORT_ADDRESSES_LATER), and for every other block.
 	struct Block {
 		uint64_t offset;
 		volatile uint8_t *ptr;

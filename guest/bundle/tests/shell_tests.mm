@@ -15456,6 +15456,143 @@ void test_no_copy_buffers_lie_at_the_host_s_address()
 	CHECK(!RgfxMemoryShadow::anyLive());
 }
 
+// Where the host answers a pages block before its view has an address
+// (RGFX_FEATURE_IMPORT_ADDRESSES_LATER, RgfxSerializer::pagesLater), a no-copy buffer over it
+// picks none: its BUFFER_OVER_PAGES names 0, for the host to place it, and its first gpuAddress
+// read asks the host (PAGES_BUFFER_ADDRESS), whose answer every later read keeps; a texture over
+// it lies at that address plus its offset. A buffer joining the block asks for its own, and no
+// answer leaves it 0, asked again at the next read. A Managed one's CPU copy, the Shared buffer
+// over the pages, has its address asked as the Managed buffer is made, which lies at it
+// (MANAGED_AT_COPY).
+void test_no_copy_buffers_ask_the_host_s_address_where_their_block_is_answered_first()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	(void)expectQueueCreate(f.control);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0xff);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	RgfxRegionSlabSource slabSource(region, f.ser, false, true);
+	RgfxSlabs slabs(slabSource);
+	struct Pages {
+		int asked = 0;
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x100000;
+		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size,
+		                  uint64_t *gpuAddress)
+		{
+			Pages *p = static_cast<Pages *>(c);
+			p->asked++;
+			*offset = p->next;
+			*size = 0x5000;
+			*gpuAddress = 0; // answered before the view has one
+			p->next += 0x10000;
+			return true;
+		}
+	} pages;
+	region.setPagesBlockSource(&Pages::block, &pages);
+	// The host's answers: each buffer's address by its id, else `fallback`, and NOT_FOUND where
+	// that is 0; the ids asked, in order.
+	struct Host {
+		std::vector<RgfxObjId> asked;
+		std::map<RgfxObjId, uint64_t> at;
+		uint64_t fallback = 0;
+		static bool ask(void *c, const void *message, uint32_t size, void *reply,
+		                uint32_t capacity, uint32_t *replySize)
+		{
+			Host *h = static_cast<Host *>(c);
+			RgfxPagesBufferAddress m = {};
+			CHECK(size == sizeof(m));
+			std::memcpy(&m, message, sizeof(m));
+			CHECK(m.header.type == RGFX_CMD_PAGES_BUFFER_ADDRESS && m.header.size == sizeof(m));
+			h->asked.push_back(m.obj_id);
+			auto it = h->at.find(m.obj_id);
+			const uint64_t at = it != h->at.end() ? it->second : h->fallback;
+			RgfxPagesAnswer answer = {};
+			answer.header = {RGFX_EVT_COMPLETE, sizeof(answer), 7};
+			answer.status = at != 0 ? RGFX_STATUS_OK : RGFX_STATUS_NOT_FOUND;
+			answer.gpu_address = at;
+			CHECK(capacity >= sizeof(answer));
+			std::memcpy(reply, &answer, sizeof(answer));
+			*replySize = sizeof(answer);
+			return true;
+		}
+	} host;
+	f.ser.setAsker(&Host::ask, &host);
+	CHECK(!f.ser.pagesLater());
+	f.ser.setPagesLater(true);
+	f.ser.setManagedAtCopy(true);
+	vm_address_t app = 0;
+	CHECK(vm_allocate(mach_task_self(), &app, 0x10000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	uint8_t *p = reinterpret_cast<uint8_t *>(app) + 0x123;
+	std::memset(reinterpret_cast<uint8_t *>(app), 0x5a, 0x10000);
+	auto noCopy = [&](void *ptr, NSUInteger length, MTLResourceOptions options) {
+		return [RgfxBuffer bufferWithBytesNoCopy:ptr
+		                                  length:length
+		                                 options:options
+		                             deallocator:nil
+		                                  region:&region
+		                                   slabs:&slabs
+		                                  device:nil
+		                              serializer:&f.ser];
+	};
+	const uint64_t view = 1ull << 43;
+	@autoreleasepool {
+		RgfxBuffer *shared = noCopy(p, 0x3000, MTLResourceStorageModeShared);
+		CHECK(shared != nil && [shared contents] == p && pages.asked == 1);
+		auto one = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(one.obj_id == shared.rgfxObjId && one.offset == 0x123 && one.gpu_address == 0);
+		CHECK(host.asked.empty());
+		host.at[shared.rgfxObjId] = view + 0x123;
+		CHECK(shared.gpuAddress == view + 0x123 && host.asked.size() == 1 &&
+		      host.asked[0] == shared.rgfxObjId);
+		CHECK(shared.gpuAddress == view + 0x123 && host.asked.size() == 1);
+		// A texture over it, 0x100 in, rows 0x100 bytes apart: no ask of its own.
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:64
+		                                                      height:4
+		                                                   mipmapped:NO];
+		desc.storageMode = MTLStorageModeShared;
+		RgfxTexture *tex = [RgfxTexture textureWithDescriptor:desc
+		                                               buffer:shared
+		                                               offset:0x100
+		                                          bytesPerRow:0x100
+		                                               device:nil
+		                                           serializer:&f.ser];
+		CHECK(tex != nil);
+		CHECK([(id<RgfxMetalTextureInternals>)tex gpuAddress] == view + 0x223 &&
+		      host.asked.size() == 1);
+		drainRing(f.control);
+		// Over the same bytes: the same block, at 0 too, its own address asked; none answered
+		// is 0, asked again.
+		RgfxBuffer *again = noCopy(p, 0x3000, MTLResourceStorageModeShared);
+		auto two = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(again != nil && pages.asked == 1 && two.block_offset == one.block_offset);
+		CHECK(two.obj_id == again.rgfxObjId && two.gpu_address == 0 && two.offset == 0x123);
+		CHECK(again.gpuAddress == 0 && host.asked.size() == 2);
+		host.at[again.rgfxObjId] = view + 0x123;
+		CHECK(again.gpuAddress == view + 0x123 && host.asked.size() == 3 &&
+		      host.asked[2] == again.rgfxObjId);
+		// Managed: its copy at 0, its address asked as the Managed buffer is made there.
+		host.fallback = view + 0x123;
+		RgfxBuffer *managed = noCopy(p, 0x3000, MTLResourceStorageModeManaged);
+		auto three = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		auto over =
+		    expectMessage<RgfxManagedBufferCreateWhole>(f.control, RGFX_CMD_MANAGED_BUFFER_CREATE)
+		        .create;
+		CHECK(managed != nil && pages.asked == 1 && three.gpu_address == 0);
+		CHECK(host.asked.size() == 4 && host.asked[3] == three.obj_id);
+		CHECK(over.cpu_buffer_obj_id == three.obj_id && over.gpu_address == view + 0x123);
+		CHECK(managed.gpuAddress == view + 0x123 && host.asked.size() == 4);
+	}
+	CHECK(eventually([&] { return blocks.released.size() == 1; }));
+	drainRing(f.control);
+	vm_deallocate(mach_task_self(), app, 0x10000);
+	}
+	CHECK(!RgfxMemoryShadow::anyLive());
+}
+
 // The references the VM object under `address` has, mapping and memory entries alike
 // (vm_region_recurse_64's ref_count), or 0 where nothing is mapped there.
 static unsigned objectReferences(const void *address)
@@ -22465,6 +22602,7 @@ int main(int argc, char **argv)
 		test_no_copy_buffers_in_place();
 		test_no_copy_buffers_over_the_same_bytes_share_a_block();
 		test_no_copy_buffers_lie_at_the_host_s_address();
+		test_no_copy_buffers_ask_the_host_s_address_where_their_block_is_answered_first();
 		test_no_copy_buffer_over_remapped_memory_takes_its_own_block();
 		test_no_copy_buffer_escape_notes();
 		test_slab_buffers_over_pages_escape_notes();

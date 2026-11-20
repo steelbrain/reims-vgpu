@@ -486,13 +486,43 @@ RgfxCreated RgfxSerializer::createBufferOverPagesAt(uint64_t length, uint32_t op
 	return out;
 }
 
+RgfxCreated RgfxSerializer::createBufferOverPagesLater(uint64_t length, uint32_t options,
+                                                       uint64_t block_offset,
+                                                       uint64_t block_size, uint64_t offset)
+{
+	RgfxCreated out = {};
+	if (length > UINT64_MAX - offset)
+		return out;
+	out.obj_id = m_ids.allocObjId();
+	postBufferOverPages(out, length, options, block_offset, block_size, offset);
+	return out;
+}
+
+uint64_t RgfxSerializer::pagesBufferAddress(RgfxObjId buffer)
+{
+	if (m_ask == nullptr)
+		return 0;
+	RgfxPagesBufferAddress msg = {};
+	msg.header.type = RGFX_CMD_PAGES_BUFFER_ADDRESS;
+	msg.header.size = sizeof(msg);
+	msg.obj_id = buffer;
+	RgfxPagesAnswer answer = {};
+	uint32_t length = 0;
+	if (!m_ask(m_askContext, &msg, sizeof(msg), &answer, sizeof(answer), &length) ||
+	    length < sizeof(answer) || answer.header.type != RGFX_EVT_COMPLETE ||
+	    answer.status != RGFX_STATUS_OK)
+		return 0;
+	return answer.gpu_address;
+}
+
 void RgfxSerializer::postBufferOverPages(RgfxCreated &out, uint64_t length, uint32_t options,
                                          uint64_t block_offset, uint64_t block_size,
                                          uint64_t offset)
 {
 	RgfxBufferOverPages msg = {};
 	msg.obj_id = out.obj_id;
-	msg.gpu_address = out.gpu_address + offset;
+	// 0, the host's address, where the create picked none (createBufferOverPagesLater).
+	msg.gpu_address = out.gpu_address != 0 ? out.gpu_address + offset : 0;
 	msg.block_offset = block_offset;
 	msg.block_size = block_size;
 	msg.offset = offset;

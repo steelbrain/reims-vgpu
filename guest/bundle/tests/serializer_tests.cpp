@@ -1096,6 +1096,91 @@ void test_buffer_over_pages_at_the_host_s_address()
 	CHECK(none.obj_id == 0 && !none.posted && wraps.obj_id == 0 && !wraps.posted);
 }
 
+// The host's answers to PAGES_BUFFER_ADDRESS: `status` and `at`, or no answer where `answers` is
+// false, or one `short_by` bytes short; the messages asked, in order.
+struct PagesAddressAsker {
+	uint32_t status = RGFX_STATUS_OK;
+	uint64_t at = 0;
+	bool answers = true;
+	uint32_t short_by = 0;
+	uint32_t type = RGFX_EVT_COMPLETE;
+	std::vector<RgfxPagesBufferAddress> asked;
+	static bool ask(void *context, const void *message, uint32_t size, void *reply,
+	                uint32_t capacity, uint32_t *reply_size)
+	{
+		auto *self = static_cast<PagesAddressAsker *>(context);
+		RgfxPagesBufferAddress m = {};
+		CHECK(size == sizeof(m));
+		std::memcpy(&m, message, sizeof(m));
+		self->asked.push_back(m);
+		if (!self->answers)
+			return false;
+		RgfxPagesAnswer answer = {};
+		answer.header = {self->type, sizeof(answer), 9};
+		answer.status = self->status;
+		answer.gpu_address = self->at;
+		CHECK(capacity >= sizeof(answer));
+		std::memcpy(reply, &answer, sizeof(answer));
+		*reply_size = sizeof(answer) - self->short_by;
+		return true;
+	}
+};
+
+// A buffer over a pages block the host answered before its view had an address
+// (createBufferOverPagesLater, RGFX_FEATURE_IMPORT_ADDRESSES_LATER) picks no address: its message
+// names 0 and the pointer's offset, for the host to place it, and the answer's address is 0; one
+// whose end would wrap is no object. Its address is asked of the host (pagesBufferAddress,
+// PAGES_BUFFER_ADDRESS naming the buffer): the answer's where it is OK, and 0 where there is no
+// asker, no answer, a short one, another event, or a status but OK.
+void test_buffer_over_pages_at_the_host_s_address_later()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	CHECK(!ser.pagesLater());
+	ser.setPagesLater(true);
+	CHECK(ser.pagesLater());
+	RgfxCreated later = ser.createBufferOverPagesLater(0x3000, 0, 0x60000, 0x1000, 0x123);
+	CHECK(later.posted && later.obj_id != 0 && later.gpu_address == 0);
+	const RgfxBufferOverPages m =
+	    expectMessage<RgfxBufferOverPages>(ring, RGFX_CMD_BUFFER_OVER_PAGES);
+	CHECK(m.obj_id == later.obj_id && m.gpu_address == 0 && m.offset == 0x123 &&
+	      m.length == 0x3000 && m.block_offset == 0x60000 && m.block_size == 0x1000);
+	RgfxCreated wraps = ser.createBufferOverPagesLater(UINT64_MAX - 0x100, 0, 0x60000, 0x1000,
+	                                                   0x123);
+	CHECK(wraps.obj_id == 0 && !wraps.posted);
+
+	CHECK(ser.pagesBufferAddress(later.obj_id) == 0);
+	PagesAddressAsker asker;
+	ser.setAsker(&PagesAddressAsker::ask, &asker);
+	const uint64_t view = 1ull << 43;
+	asker.at = view + 0x123;
+	CHECK(ser.pagesBufferAddress(later.obj_id) == view + 0x123 && asker.asked.size() == 1);
+	const RgfxPagesBufferAddress &asked = asker.asked[0];
+	CHECK(asked.header.type == RGFX_CMD_PAGES_BUFFER_ADDRESS &&
+	      asked.header.size == sizeof(RgfxPagesBufferAddress) && asked.obj_id == later.obj_id);
+	asker.status = RGFX_STATUS_NOT_FOUND;
+	CHECK(ser.pagesBufferAddress(later.obj_id) == 0);
+	asker.status = RGFX_STATUS_REFUSED;
+	CHECK(ser.pagesBufferAddress(later.obj_id) == 0);
+	asker.status = RGFX_STATUS_OK;
+	asker.short_by = 8;
+	CHECK(ser.pagesBufferAddress(later.obj_id) == 0);
+	asker.short_by = 0;
+	asker.type = RGFX_EVT_SIZE_AND_ALIGN;
+	CHECK(ser.pagesBufferAddress(later.obj_id) == 0);
+	asker.type = RGFX_EVT_COMPLETE;
+	asker.answers = false;
+	CHECK(ser.pagesBufferAddress(later.obj_id) == 0 && asker.asked.size() == 6);
+	// Nothing went on the ring.
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!ring.next(&h, &bytes));
+}
+
 // Where the host makes Managed buffers at their copies (MANAGED_AT_COPY), a Managed buffer's
 // create posts its CPU copy's address, with no pick of the process's: the answer's address less
 // the offset its caller gives, so the buffer's is still the answer's plus the offset, and it
@@ -4758,6 +4843,7 @@ int main()
 	test_vendor_names();
 	test_host_resource_options();
 	test_buffer_over_pages_at_the_host_s_address();
+	test_buffer_over_pages_at_the_host_s_address_later();
 	test_caps_features();
 	test_feature_profile_for_guest();
 	test_archive_file();
