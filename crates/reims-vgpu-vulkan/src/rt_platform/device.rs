@@ -16,16 +16,16 @@
 //! the loader's order and picks none of (`Instance::physical_devices`, read from code). The pick
 //! among them is the library's (`crate::device_choice::chosen_untimed`): the device the host's
 //! user's selection variables name, else the one GPU, else the first by kind: discrete GPUs, then
-//! integrated, virtual and CPU ones, each kind in the loader's order. Unlike the Vulkan platform's,
-//! it times no GPU (the module's docs there), so a weak discrete GPU beside a strong integrated
-//! one is picked wrongly: an RX 550 beside a Radeon 780M, which composites a 3840x2400 frame in
-//! 24.4 ms to the RX 550's 40.4 ms (**measured**, 2026-11-08, by reims-vgpu's `composite_cost`,
-//! `crate::device_choice`'s docs). There the host's user's selection variable is the answer, as
-//! the code reads it (`crate::device_choice::SELECTION_VARIABLES`): `MESA_VK_DEVICE_SELECT`
-//! (`MESA_VK_DEVICE_SELECT=1002:15bf` names that 780M by its vendor and device IDs), `DRI_PRIME`
-//! or `VK_LOADER_DEVICE_SELECT`. The library's rule that a candidate lists the device extensions
-//! a display's window takes holds here as there: the window here takes `VK_KHR_swapchain` alone,
-//! which rt's floor takes, so it passes over no device that meets the floor.
+//! integrated, virtual and CPU ones, each kind in the loader's order. It times no GPU, so a weak
+//! discrete GPU beside a strong integrated one is picked wrongly: an RX 550 beside a Radeon 780M,
+//! which composites a 3840x2400 frame in 24.4 ms to the RX 550's 40.4 ms (**measured**,
+//! 2026-11-08, Mesa 26.2.6, by reims-vgpu's `composite_cost`). There the host's user's selection
+//! variable is the answer, as the code reads it (`crate::device_choice::SELECTION_VARIABLES`):
+//! `MESA_VK_DEVICE_SELECT` (`MESA_VK_DEVICE_SELECT=1002:15bf` names that 780M by its vendor and
+//! device IDs), `DRI_PRIME` or `VK_LOADER_DEVICE_SELECT`. The library's rule that a candidate
+//! lists the device extensions a display's window takes holds here: the window takes
+//! `VK_KHR_swapchain` alone, which rt's floor takes, so it passes over no device that meets the
+//! floor.
 //!
 //! **Its window system.** The instance enables the OS's surface extensions and present fences'
 //! where the loader lists them, and the device the extension of present fences where it lists
