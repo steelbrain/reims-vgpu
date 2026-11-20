@@ -385,6 +385,10 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         (options.extensions).push(rt::DeviceExtension::with_features(name, wanted, needs));
     }
     let device = rt::Device::new(physical, options)?;
+    // Where it binds no several dma-bufs behind one buffer, a view more than one holds is mapped
+    // from its files from the first (`buffer`'s docs, "Pages no pin takes").
+    #[cfg(target_os = "linux")]
+    crate::os::learn_dma_buf_granule(device.dma_buf_granule());
     let present_fences =
         fences.is_some_and(|name| (device.extensions().iter()).any(|n| n.as_c_str() == name));
     // The process's latest device (the module's docs), the one before it folded first.

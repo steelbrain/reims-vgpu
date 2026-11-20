@@ -257,25 +257,26 @@ fn folds_after_import(device: &rt::Device) -> bool {
 
 /// Whether a device of the process imports by pointer only pages mapped from their files: learned
 /// of each device as it is made ([`learn_view_imports`]), and set where any refuses a view through
-/// dma-bufs; on the rt platform, at the first import of a view mapped through dma-bufs that rt
-/// takes through none of them ([`views_need_files`]). From then on views are mapped from their
-/// files (`super::vm`'s module docs, "Imports of views").
+/// dma-bufs; on the rt platform, at rt's first refusal of a view's one dma-buf
+/// (`views_need_files`). From then on views are mapped from their files (`super::vm`'s module
+/// docs, "Imports of views").
 static IMPORTS_NEED_FILES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Whether a device of the process imports by pointer only pages mapped from their files
-/// ([`learn_view_imports`], [`views_need_files`]).
+/// ([`learn_view_imports`], and on the rt platform `views_need_files`).
 pub(crate) fn imports_need_files() -> bool {
     IMPORTS_NEED_FILES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Views are mapped from their files from now on ([`IMPORTS_NEED_FILES`]): an import of a view
-/// mapped through dma-bufs was taken through none of them, for `why`, so its pages go to the
-/// device by their pointer, mapped from their files first (`super::vm`'s `unfold`). The rt
+/// Views are mapped from their files from now on ([`IMPORTS_NEED_FILES`]): rt refused a dma-buf
+/// of the pages of a view mapped through dma-bufs, one that holds them all, for `why`, so they go
+/// to the device by their pointer, mapped from their files first (`super::vm`'s `unfold`). The rt
 /// platform's answer at that refusal (`crate::rt_platform`'s `buffer` docs, "Pages no pin
-/// takes"), where no probe runs as the device is made: a later view is mapped from its files at
-/// once, so its import maps none of its pages again. Logged the first time, with what the
-/// budget then leaves imports (`super::budget`'s `warn_if_imports_short`).
+/// takes"), which rt gives only at the call, where no probe runs as the device is made: a later
+/// view is mapped from its files at once, so its import maps none of its pages again. Logged the
+/// first time, with what the budget then leaves imports (`super::budget`'s
+/// `warn_if_imports_short`).
 #[cfg(feature = "rt")]
 pub(crate) fn views_need_files(why: &str) {
     if IMPORTS_NEED_FILES.swap(true, Ordering::Relaxed) {
@@ -283,10 +284,39 @@ pub(crate) fn views_need_files(why: &str) {
     }
     log::info!(
         target: "reims_vgpu_vulkan::os",
-        "an import of a view of guest pages mapped through dma-bufs was taken through none of \
-         them ({why}): views are mapped from their files from now on"
+        "rt refused a dma-buf of the pages of a view mapped through dma-bufs ({why}): views are \
+         mapped from their files from now on"
     );
     budget::warn_if_imports_short();
+}
+
+/// Whether a device of the process imports no several dma-bufs behind one buffer, so the pages of
+/// a view more than one dma-buf holds go to it by their pointer, mapped from their files: the rt
+/// platform's device's answer as it is made, rt's `dma_buf_granule` (`None`), read by
+/// `learn_dma_buf_granule`. From then on such a view is mapped from its files at once
+/// (`super::vm`'s module docs, "Imports of views").
+static SEVERAL_DMA_BUFS_REFUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a device of the process imports no several dma-bufs behind one buffer
+/// ([`SEVERAL_DMA_BUFS_REFUSED`]).
+pub(crate) fn several_dma_bufs_refused() -> bool {
+    SEVERAL_DMA_BUFS_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Learns of the rt platform's device, as it is made, whether it imports several dma-bufs behind
+/// one buffer: rt's `dma_buf_granule`, `granule`, where `None` it imports none
+/// ([`SEVERAL_DMA_BUFS_REFUSED`]). Logged where it imports none.
+#[cfg(feature = "rt")]
+pub(crate) fn learn_dma_buf_granule(granule: Option<u64>) {
+    if granule.is_some() || SEVERAL_DMA_BUFS_REFUSED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    log::info!(
+        target: "reims_vgpu_vulkan::os",
+        "the device imports no several dma-bufs behind one buffer: views of guest pages more than \
+         one dma-buf holds are mapped from their files"
+    );
 }
 
 /// Whether the device that needs imported pages mapped from their files ([`IMPORTS_NEED_FILES`])

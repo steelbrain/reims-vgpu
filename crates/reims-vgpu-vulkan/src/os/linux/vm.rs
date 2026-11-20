@@ -82,17 +82,19 @@
 //! memory type (measured 2026-10-27, RTX 5080 Laptop, Linux 7.2.8). A device that imports every
 //! page with a file behind it by a dma-buf of the pages (RADV, `super::import`'s module docs)
 //! pins none. So where a device of the process refuses such a view (`super::import`'s
-//! `learn_view_imports`, as the device is made; on the rt platform, at the first import of one
-//! that rt takes through none of its dma-bufs, `super::import`'s `views_need_files`), views are
-//! mapped from their files from then on, a mapping a run, and an import of a view made through
-//! dma-bufs before maps what of its pages lies in them from their files ([`unfold`]), until the
-//! import is made where the device keeps what it pinned (below, "Folding back"), else for as long
-//! as the view lives. Where those mappings would come within the headroom of the views' budget
-//! (`super::budget`'s `claim`), a view is mapped through dma-bufs there too, and no view ends the
-//! process. A no-copy buffer's or
-//! heap's import of pages left in dma-bufs for want of mappings, which the runtime asks the
-//! views' gate about, maps them from their files only short of that headroom, the views no import
-//! holds folded back first where that may free some ([`fold_short_due`]); past it the gate
+//! `learn_view_imports`, as the device is made; on the rt platform, at rt's first refusal of a
+//! view's one dma-buf, `super::import`'s `views_need_files`), views are mapped from their files
+//! from then on, a mapping a run, and an import of a view made through dma-bufs before maps what
+//! of its pages lies in them from their files ([`unfold`]), until the import is made where the
+//! device keeps what it pinned (below, "Folding back"), else for as long as the view lives. So is
+//! a view more than one dma-buf holds where the rt platform's device imports no several dma-bufs
+//! behind one buffer (rt's `dma_buf_granule`, read as the device is made: `super::import`'s
+//! `several_dma_bufs_refused`, [`past_one_dma_buf`]), whose import takes its pointer. Where those
+//! mappings would come within the headroom of the views' budget (`super::budget`'s `claim`), a
+//! view is mapped through dma-bufs there too, and no view ends the process. A no-copy buffer's or
+//! heap's import of pages left in dma-bufs for want of mappings, which the runtime asks the views'
+//! gate about, maps them from their files only short of that headroom, the views no import holds
+//! folded back first where that may free some ([`fold_short_due`]); past it the gate
 //! refuses them, and the runtime makes the buffer or heap over a copy of them, which takes no
 //! mapping (`super::import`'s `import_gate`); a rebind's alike, which the runtime then makes over
 //! a copy too. Pages one dma-buf holds are let through instead where the device takes such a
@@ -814,15 +816,16 @@ pub(super) fn mappings_added(pieces: &[files::Piece]) -> u64 {
 
 /// Maps `pieces`, which follow on from `target`, each from its file, or, where they are more than
 /// one, through dma-bufs of their pages where the host makes them: where no device of the process
-/// needs imported pages mapped from their files; where one does and takes the pages one dma-buf
-/// holds through it, through one kept for the view's imports where one holds them all
+/// needs imported pages mapped from their files, nor imports no several dma-bufs while more than
+/// one holds them ([`past_one_dma_buf`]); where one does and takes the pages one dma-buf holds
+/// through it, through one kept for the view's imports where one holds them all
 /// ([`one_buf_view`]); and otherwise there once the pieces from their files would come within the
 /// headroom of the views' budget ([`budget::claim`]; module docs, "Views through dma-bufs" and
 /// "Imports of views"). Records them: all or nothing, the pieces mapped before a refusal put back.
 fn map_view(target: u64, pieces: Vec<files::Piece>) -> Result<(), KernReturn> {
     trace_view(target, &pieces);
     let adding = mappings_added(&pieces);
-    let need_files = super::import::imports_need_files();
+    let need_files = super::import::imports_need_files() || past_one_dma_buf(&pieces);
     if need_files && one_buf_view(&pieces, adding) {
         match super::dma_buf::of_view(&pieces) {
             Ok(bufs) if bufs.len() == 1 => return map_through(target, pieces, bufs, true),
@@ -927,6 +930,17 @@ fn no_dma_bufs(refusal: &super::dma_buf::Refusal) {
              vm.max_map_count, as {refusal}"
         );
     }
+}
+
+/// Whether `pieces`, a view's, are more than one dma-buf holds ([`super::dma_buf::fits_view`]), on
+/// a device of the process that imports no several dma-bufs behind one buffer
+/// (`super::import`'s `several_dma_bufs_refused`, rt's answer as its device is made): the view's
+/// import would map them from their files ([`unfold`]) whatever they are mapped through first, so
+/// they are mapped from their files at once (module docs, "Imports of views").
+fn past_one_dma_buf(pieces: &[files::Piece]) -> bool {
+    pieces.len() > 1
+        && super::import::several_dma_bufs_refused()
+        && super::dma_buf::fits_view(pieces).is_err()
 }
 
 /// Whether a view of `pieces`, `adding` mappings from their files ([`mappings_added`]), is mapped

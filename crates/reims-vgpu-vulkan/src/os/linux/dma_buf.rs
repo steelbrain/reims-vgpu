@@ -592,6 +592,28 @@ pub(crate) fn fits_one_of(ranges: &[std::ops::Range<u64>]) -> Result<(), Refusal
     fits_pieces(pieces, bytes)
 }
 
+/// Whether one dma-buf takes the pages `pieces` show, in order, a view's: refused as [`fits_one`]
+/// is, past udmabuf's limits, counting the runs of file pages as [`fits_one_of`] does, asked as
+/// the view is made (`super::vm`'s `map_view`).
+pub(crate) fn fits_view(pieces: &[files::Piece]) -> Result<(), Refusal> {
+    let mut runs: u64 = 0;
+    let mut bytes: u64 = 0;
+    // The last piece's file and the offset past its end.
+    let mut last: Option<(&Arc<OwnedFd>, u64)> = None;
+    for piece in pieces {
+        let follows = matches!(
+            last,
+            Some((fd, end)) if Arc::ptr_eq(fd, &piece.backing.file) && end == piece.backing.offset
+        );
+        if !follows {
+            runs += 1;
+        }
+        last = Some((&piece.backing.file, piece.backing.offset + piece.length));
+        bytes = bytes.saturating_add(piece.length);
+    }
+    fits_pieces(runs, bytes)
+}
+
 /// Whether one dma-buf takes `pieces` pieces of `bytes` bytes in all, within udmabuf's limits as
 /// the host has them now, asked of pages that do not exist yet: refused as [`fits_one_of`] refuses
 /// pages past the limits.
