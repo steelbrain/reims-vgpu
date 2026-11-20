@@ -136,6 +136,12 @@ const UNKNOWN_ANSWERS: u64 = 0x17;
 /// The usage bit Metal's descriptor takes and its texture drops.
 const DROPPED: u64 = 0x8;
 
+/// `MTLTextureUsageShaderWrite`.
+const USAGE_SHADER_WRITE: u64 = 0x2;
+
+/// `MTLTextureUsageShaderAtomic`.
+const USAGE_SHADER_ATOMIC: u64 = 0x20;
+
 /// The usage bits a view of a swizzle other than the default keeps of its texture's:
 /// `ShaderRead`, `PixelFormatView`, 0x4000 and 0x10000 (measured, `crate::gpu::desc`'s docs).
 const SWIZZLED_VIEW_KEEPS: u64 = 0x1 | 0x10 | 0x4000 | 0x10000;
@@ -265,6 +271,13 @@ impl RtTexture {
     /// command buffer that uses it syncs.
     pub(super) fn copied(&self) -> Option<&Arc<Copied>> {
         self.copied.get()
+    }
+
+    /// Whether a shader can write it, bound to a slot: of shader-write or shader-atomic usage,
+    /// which `Unknown` answers too (the module's docs, "Answers"). rt makes a texture of no
+    /// such usage with no storage usage, so no shader writes it (`super::copied`'s docs).
+    pub(super) fn shader_writes(&self) -> bool {
+        self.usage & (USAGE_SHADER_WRITE | USAGE_SHADER_ATOMIC) != 0
     }
 
     /// Makes it a tiled texture, taking its bytes as `tiled` says (`super::tiled`): once, as

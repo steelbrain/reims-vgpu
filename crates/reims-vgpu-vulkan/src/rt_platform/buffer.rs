@@ -131,15 +131,20 @@
 //! dma-bufs of their files (on Linux past one dma-buf's limits where no several are imported, with
 //! no file behind them, near the views' budget, or refused by the driver; elsewhere wherever rt
 //! refuses their pointer) are
-//! imported as a copy (`super::copied`), as rt refused nothing: memory of the platform's own that
-//! holds their bytes, which rt imports by its pointer. A buffer in the copy's block answers the
-//! pages as its `contents`, and a pinned buffer over the pages is a range of the block, as over a
-//! dma-buf's ([`KnownBlocks`]). The copy is synced byte by byte: at each commit the bytes the CPU
-//! changed in the pages since they and the copy last agreed are written into the copy, and at each
-//! completion, before the command buffer's completed handlers run or a waiter returns, the bytes
-//! the GPU changed in the copy are written into the pages where the CPU did not change them since,
-//! a byte both changed keeping the CPU's. Counted ([`IMPORTS_COPIED`]), the process's first with a
-//! line; a copy rt refuses too is rt's refusal of the pages, counted, and nil. Pages copied as rt
+//! imported as a copy (`super::copied`), as rt refused nothing: a Shared block of rt's own that
+//! holds their bytes, which no import makes, so a texture over a buffer in it lies in place where
+//! the device's linear image takes the texture, as over any Shared block of rt's. A buffer in the
+//! copy's block answers the pages as its `contents`, and a pinned buffer over the pages is a range
+//! of the block, as over a dma-buf's ([`KnownBlocks`]). The copy is synced byte by byte: at each
+//! commit that uses it the bytes the CPU changed in the pages since they and the copy last agreed
+//! are written into the copy, and at each completion of a command buffer whose uses of it can
+//! write it, before its completed handlers run or a waiter returns, the bytes the GPU changed in
+//! the copy are written into the pages where the CPU did not change them since, a byte both
+//! changed keeping the CPU's. The import's deallocator runs as the copy goes, after the objects
+//! over it and every command buffer that used it are gone (`super::copied`, "Released"); rt frees
+//! the block once no buffer over it and no command buffer that used it remains. Counted
+//! ([`IMPORTS_COPIED`]), the process's first with a line; a copy whose block rt refuses is rt's
+//! refusal of the pages, counted, and nil. Pages copied as rt
 //! refused both a dma-buf of theirs and their pointer, in either order, are counted as such too
 //! ([`IMPORTS_DMA_BUF_AND_POINTER_REFUSED`]), the process's first with a line naming both
 //! refusals. Where it differs
@@ -655,14 +660,16 @@ impl Drop for RtBuffer {
 /// The blocks the device knows by their GPU address, which a pinned buffer or heap inside one is a
 /// range of (the module's docs, "A pinned address"): the graphics lane's, which knows a block as it
 /// hands its range to the guest and forgets it as it takes it back, just before it gives the block
-/// back to rt. Each held block is a handle of it, so it lives while known. A handle of the
-/// device's set: its clones are the same set
-/// (`RtDevice::known_blocks`). With them, the host's mappings of the device's dma-buf imports and
-/// the pages of its copies ([`HostMappings`]), known or not.
+/// back to rt. Each held block is a handle of it, so it lives while known, and so is the copy a
+/// block that is one holds (`super::copied`, "Released"). A handle of the device's set: its clones
+/// are the same set (`RtDevice::known_blocks`). With them, the host's mappings of the device's
+/// dma-buf imports and the pages of its copies ([`HostMappings`]), known or not.
 #[derive(Default, Clone)]
 pub struct KnownBlocks {
     /// The blocks known, by their GPU address.
     known: Arc<Mutex<BTreeMap<u64, rt::Block>>>,
+    /// The copy each known block that is one holds, by its block.
+    copies: Arc<Mutex<BTreeMap<rt::BlockId, Arc<super::copied::Copied>>>>,
     /// The host's mapping of each live dma-buf import.
     mapped: HostMappings,
     /// The pages each live copy's import holds a copy of (the module's docs, "A copy at the
@@ -687,19 +694,32 @@ impl HostMappings {
 }
 
 impl KnownBlocks {
-    /// Knows `block` by its GPU address, in place of a block known there before.
+    /// Knows `block` by its GPU address, in place of a block known there before, holding the
+    /// copy it is, where it is one.
     pub fn know(&self, block: rt::Block) {
-        self.known.lock().insert(block.gpu_address, block);
+        let copy = super::copied::of(block.id);
+        let id = block.id;
+        let replaced = self.known.lock().insert(block.gpu_address, block);
+        let mut copies = self.copies.lock();
+        let gone = replaced.and_then(|old| copies.remove(&old.id));
+        let held = copy.and_then(|copy| copies.insert(id, copy));
+        drop(copies);
+        drop((gone, held));
     }
 
-    /// Forgets the block `id`, giving back the handle it held; `None` where none is known.
+    /// Forgets the block `id`, giving back the handle it held, and lets go of the copy it is,
+    /// where it is one; `None` where none is known.
     pub fn forget(&self, id: rt::BlockId) -> Option<rt::Block> {
         let mut known = self.known.lock();
         let at = known
             .iter()
             .find(|(_, block)| block.id == id)
             .map(|(&at, _)| at)?;
-        known.remove(&at)
+        let block = known.remove(&at);
+        drop(known);
+        let copy = self.copies.lock().remove(&id);
+        drop(copy);
+        block
     }
 
     /// The known block that holds the `length` bytes at GPU address `address`, and their offset
@@ -1374,6 +1394,8 @@ fn no_copy(
             }
         }
     };
+    // A copy just made is the buffer's to hold from here (`super::copied::Fresh`).
+    let _fresh = super::copied::Fresh(block.id);
     let copy = copy.map(|(block, offset)| (block.id, offset));
     // In place in a known block whose writes are not dropped.
     let in_place = o.read_only && !super::copied::drops(block.id);
@@ -1437,8 +1459,10 @@ fn range_of(
 /// dma-bufs go to rt as a dma-buf first, and by their pointer only once mapped from their files
 /// ("Pages no pin takes"). Pages whose GPU writes Metal drops (`read_only`) are imported as a
 /// copy that drops them, and never otherwise ("Read-only memory"). rt's release of the import runs
-/// `then`, after the import is freed. `None` where Metal or rt refuses it, counted, `then` dropped
-/// unrun.
+/// `then`, after the import is freed; a copy's runs it as the copy goes ("A copy at the refusal
+/// point"), which the caller holds, from an object it makes over the block (`super::copied::of`),
+/// until its `super::copied::Fresh` of the block drops. `None` where Metal or rt refuses it,
+/// counted, `then` dropped unrun.
 pub(super) fn import_pages(
     device: &RtObj<RtDevice>,
     sel: &'static str,
@@ -2044,9 +2068,10 @@ fn refused(
 /// `sel`, for a make of `codes`, that rt took neither by their pointer nor as a dma-buf, `why` in
 /// words, or whose GPU writes are dropped (`drops`, "Read-only memory"): as a copy (the module's
 /// docs, "A copy at the refusal point"), whose pages the device keeps for the block
-/// ([`KnownBlocks`]) until rt frees it, rt's release of it running `then`; counted
+/// ([`KnownBlocks`]) until the copy goes, its release running `then`; counted
 /// ([`IMPORTS_COPIED`]), the process's first with a line. The block, and the offset of the pages'
-/// first byte in it. `None` where no copy is made or rt refuses it, counted by `refuse`, given why.
+/// first byte in it. `None` where no copy is made or rt refuses its block, counted by `refuse`,
+/// given why.
 #[expect(
     clippy::too_many_arguments,
     reason = "the import's pages, make and release, and how the copy is made or refused"
@@ -2065,9 +2090,9 @@ fn copied(
     let id = Arc::new(OnceLock::new());
     let release = released(codes, then, Some((homes.clone(), Arc::clone(&id))));
     // SAFETY: the creators' `HostRange` contracts keep the bytes mapped until their deallocator
-    // runs, which runs only from `then`, after the copy's release, once rt freed it; the pages
-    // they lie in are mapped readable, as `by_pointer`'s are, and writable unless `drops`, where
-    // nothing writes them.
+    // runs, which runs only from `then`, from the copy's release, as the copy goes, once nothing
+    // syncs it; the pages they lie in are mapped readable, as `by_pointer`'s are, and writable
+    // unless `drops`, where nothing writes them.
     match unsafe { super::copied::import(device.rt(), (at, len), drops, release) } {
         Ok(block) => {
             let _ = id.set(block.id);
@@ -2105,13 +2130,13 @@ static COPIED_SAID: AtomicBool = AtomicBool::new(false);
 static UNCOPIED_SAID: AtomicBool = AtomicBool::new(false);
 
 /// Counts the refusal of a copy of read-only pages for `sel` ([`import_pages`]), `uncopied` why:
-/// rt's refusal of its import, or the host's memory, a limit.
+/// rt's refusal of its block, or the host's memory or rt's mapping of the block, a limit.
 fn refused_uncopied(sel: &'static str, uncopied: &super::copied::Uncopied) {
     match uncopied {
         super::copied::Uncopied::Rt(error) => {
             rt_refused_create(sel, error);
         }
-        super::copied::Uncopied::NoMemory => {
+        super::copied::Uncopied::NoMemory | super::copied::Uncopied::Unmapped => {
             super::unbuilt::refused_as(sel, super::unbuilt::RtRefusal::Limit, uncopied);
         }
     }
@@ -2177,7 +2202,9 @@ fn pointer_refused() -> Option<rt::Error> {
 /// address plus their offset is then that range of the block ("A pinned address"), with no import
 /// of its own. The caller forgets the block (`KnownBlocks::forget`) as the last such buffer goes;
 /// rt frees the import once no buffer over it and no command buffer that used it lives, then
-/// runs `then`. `None` where Metal or rt refuses it, counted, `then` dropped unrun.
+/// runs `then`; a copy's release runs it as the copy goes, which the known block holds until
+/// forgotten (the module's docs, "A copy at the refusal point"). `None` where Metal or rt refuses
+/// it, counted, `then` dropped unrun.
 pub fn import_known(
     device: &RtObj<RtDevice>,
     sel: &'static str,
@@ -2187,6 +2214,7 @@ pub fn import_known(
     then: impl FnOnce() + Send + 'static,
 ) -> Option<(rt::Block, u64)> {
     let (block, offset) = import_pages(device, sel, first, length, read_only, then)?;
+    let _fresh = super::copied::Fresh(block.id);
     device.known_blocks().know(block.clone());
     Some((block, offset))
 }
@@ -4716,8 +4744,11 @@ mod tests {
 
     /// On the GPU the test holds: a copy a compute encoder declares with `useResources:`, as a
     /// shader that reaches it through an argument buffer's address asks, and binds not, is synced
-    /// for its command buffer: the CPU's bytes copied in at the commit, the copy's merged back,
-    /// or put back, at the completion.
+    /// for its command buffer: the CPU's bytes copied in at the commit, and, declared for writing
+    /// (`MTLResourceUsageRead | Write`), the copy's merged back, or put back, at the completion;
+    /// declared for reading alone, no work of its command buffer writes it, and its completion
+    /// leaves the copy's bytes and the pages' as they were (`super::super::copied`'s docs, "Merged
+    /// back at the completions of the command buffers that can write it").
     #[test]
     fn a_copy_declared_with_use_resources_is_synced_on_vulkan() {
         use crate::core::platform::blit::ResourceRef;
@@ -4725,16 +4756,93 @@ mod tests {
         let platform = RtPlatform::new();
         let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
         let queue = device.new_command_queue().expect("a command queue");
-        for drops in [false, true] {
+        for (drops, usage) in [(false, 1), (true, 1), (false, 3), (true, 3)] {
             let c = over_a_copy(&device, drops);
             c.mark();
             let declare = ComputeCmd::UseResources {
                 resources: &[Some(ResourceRef::Buffer(&c.buffer))],
-                usage: 1,
+                usage,
             };
             compute_and_wait(&queue, vec![declare]);
-            assert_eq!(c.synced(), (true, true), "drops: {drops}");
+            let writes = usage & 2 != 0;
+            assert_eq!(c.synced(), (true, writes), "drops: {drops}, usage: {usage}");
         }
+    }
+
+    /// On the GPU the test holds: a texture over a buffer over a copy whose GPU writes are
+    /// dropped, of a pitch at rt's alignment for its format, lies in the copy's block in place,
+    /// with no copy of rt's between the buffer and an image of its own (rt's over-copies), as the
+    /// copy is a Shared block of rt's ("A copy at the refusal point"). The CPU's writes to the
+    /// pages before each commit reach a blit's read of the texture, copied in before the work
+    /// that reads them; a command buffer whose use of the copy reads it alone puts nothing back
+    /// at its completion.
+    #[test]
+    fn a_texture_over_a_read_only_copy_lies_in_place_on_vulkan() {
+        use super::super::copied::{BACK_BYTES_CODE, DROPPED_BYTES_CODE};
+        use crate::core::platform::types::{MtlOrigin, MtlSize};
+
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let c = over_a_copy(&device, true);
+        let align = device
+            .rt()
+            .minimum_linear_texture_alignment(rt::PixelFormat::BGRA8Unorm);
+        let pitch = (4 * 64_u64).next_multiple_of(align.expect("BGRA8Unorm's alignment"));
+        assert!(
+            2 * pitch <= 2 * device.facts().page_size,
+            "two rows in the pages"
+        );
+        let descriptor = platform.texture_descriptor(&TextureDesc {
+            pixel_format: 80,
+            width: 64,
+            height: 2,
+            usage: 0x1,
+            ..TextureDesc::default()
+        });
+        let texture = c.buffer.new_texture(on, &descriptor, 0, pitch);
+        let texture = texture
+            .expect("never a raise")
+            .expect("a texture over the buffer");
+        let out = device.new_buffer_of_length(on, 512, 0);
+        let out = out.expect("never a raise").expect("a buffer");
+        let metrics = || device.rt().counters().metrics();
+        let over = |m: rt::Metrics| (m.over_copies, m.over_copies_imported);
+        let (before, counts) = (
+            over(metrics()),
+            [BACK_BYTES_CODE, DROPPED_BYTES_CODE].map(counted),
+        );
+        let row = |y: u64| c.pages.wrapping_add(y * pitch).as_ptr::<u8>();
+        for (y, value) in [(0, 0x22_u8), (1, 0x44)] {
+            // SAFETY: inside the test's pages: two rows of the pitch, within two pages.
+            unsafe { row(y).write_bytes(value, 256) };
+            let copy = BlitCmd::CopyTextureToBuffer {
+                source_texture: &texture,
+                source_slice: 0,
+                source_level: 0,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: MtlSize::new(64, 2, 1),
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: 256,
+                destination_bytes_per_image: 512,
+            };
+            blit_and_wait(&queue, vec![copy]);
+            let rows = match y {
+                0 => [[0x22; 256], [0x11; 256]].concat(),
+                _ => [[0x22; 256], [0x44; 256]].concat(),
+            };
+            assert_eq!(
+                read(out.contents(), 512),
+                rows,
+                "after the write of row {y}"
+            );
+        }
+        assert_eq!(over(metrics()), before, "no over-copy");
+        let counts_now = [BACK_BYTES_CODE, DROPPED_BYTES_CODE].map(counted);
+        assert_eq!(counts_now, counts, "nothing merged or put back");
+        assert_eq!(read(c.copy, 256), [0x22; 256]);
     }
 
     /// On the GPU the test holds: a command buffer that uses no copy, of a process none of whose
@@ -4777,12 +4885,10 @@ mod tests {
     /// buffer's `gpuAddress`, or of the `gpuResourceID` of a texture over it, makes it, is synced
     /// at each commit of its process's command buffers though none of their encoders sets or
     /// declares it: the CPU's bytes copied in at the commit, the copy's merged back, or put back,
-    /// at the completion. No kernel of ours shows it on rt, which reaches no copy a command buffer
-    /// leaves undeclared: its translator lowers no address a function loads (its README, "Known
-    /// gaps of pipeline states"), a texture over the copy, a buffer in an imported block, is an
-    /// image of its own that rt copies the buffer's bytes into only before the submissions that
-    /// use it, and a storage read through a resource ID no `use_resource` declared answers zeros.
-    /// So the test reads the copy and the pages, as its sibling of another process's escape does
+    /// at the completion. No kernel of ours shows it on rt: its translator lowers no address a
+    /// function loads (its README, "Known gaps of pipeline states"), and a storage read through a
+    /// resource ID no `use_resource` declared answers zeros. So the test reads the copy and the
+    /// pages, as its sibling of another process's escape does
     /// ([`a_command_buffer_that_uses_no_copy_syncs_none_on_vulkan`]).
     #[test]
     fn an_escaped_copy_no_encoder_names_is_synced_at_its_process_s_commits_on_vulkan() {

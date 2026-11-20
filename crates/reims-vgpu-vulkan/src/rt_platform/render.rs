@@ -661,8 +661,10 @@ fn scissor(r: MtlScissorRect) -> rt::ScissorRect {
 }
 
 /// Notes the copies `cmd` uses in `used` ([`Used`]): those the buffers it sets or draws from and
-/// the heaps and resources it declares lie over. Its textures are noted as they bind
-/// ([`Kept::used`]), its pass's attachments at its making ([`super::PassFields::note_copies`]).
+/// the heaps and resources it declares lie over, each in a use that can write it but an index,
+/// indirect or tessellation factor buffer's and a resource's declared for reading alone. Its
+/// textures are noted as they bind ([`Kept::used`]), its pass's attachments at its making
+/// ([`super::PassFields::note_copies`]).
 fn note_copies(used: &Used, cmd: &RenderCmd<'_, RtPlatform>) {
     if !super::copied::any() {
         return;
@@ -674,41 +676,44 @@ fn note_copies(used: &Used, cmd: &RenderCmd<'_, RtPlatform>) {
             indirect_buffer,
             ..
         } => {
-            patch_index_buffer.iter().for_each(|b| used.buffer(b));
-            used.buffer(control_point_index_buffer);
-            used.buffer(indirect_buffer);
+            patch_index_buffer.iter().for_each(|b| used.buffer_read(b));
+            used.buffer_read(control_point_index_buffer);
+            used.buffer_read(indirect_buffer);
         }
         RenderCmd::DrawIndexedPatches {
             patch_index_buffer,
             control_point_index_buffer,
             ..
         } => {
-            patch_index_buffer.iter().for_each(|b| used.buffer(b));
-            used.buffer(control_point_index_buffer);
+            patch_index_buffer.iter().for_each(|b| used.buffer_read(b));
+            used.buffer_read(control_point_index_buffer);
         }
         RenderCmd::DrawIndexedPrimitivesIndirect {
             index_buffer,
             indirect_buffer,
             ..
         } => {
-            used.buffer(index_buffer);
-            used.buffer(indirect_buffer);
+            used.buffer_read(index_buffer);
+            used.buffer_read(indirect_buffer);
         }
         RenderCmd::DrawPatchesIndirect {
             patch_index_buffer,
             indirect_buffer,
             ..
         } => {
-            patch_index_buffer.iter().for_each(|b| used.buffer(b));
-            used.buffer(indirect_buffer);
+            patch_index_buffer.iter().for_each(|b| used.buffer_read(b));
+            used.buffer_read(indirect_buffer);
         }
         RenderCmd::DrawPatches {
             patch_index_buffer: buffer,
             ..
         }
-        | RenderCmd::SetFragmentBuffer { buffer, .. }
-        | RenderCmd::SetTessellationFactorBuffer { buffer, .. }
-        | RenderCmd::SetVertexBuffer { buffer, .. } => buffer.iter().for_each(|b| used.buffer(b)),
+        | RenderCmd::SetTessellationFactorBuffer { buffer, .. } => {
+            buffer.iter().for_each(|b| used.buffer_read(b));
+        }
+        RenderCmd::SetFragmentBuffer { buffer, .. } | RenderCmd::SetVertexBuffer { buffer, .. } => {
+            buffer.iter().for_each(|b| used.buffer(b));
+        }
         RenderCmd::DrawIndexedPrimitives {
             index_buffer: buffer,
             ..
@@ -728,7 +733,7 @@ fn note_copies(used: &Used, cmd: &RenderCmd<'_, RtPlatform>) {
         | RenderCmd::ExecuteCommandsIndirect {
             indirect_range_buffer: buffer,
             ..
-        } => used.buffer(buffer),
+        } => used.buffer_read(buffer),
         RenderCmd::SetFragmentBuffers { buffers, .. }
         | RenderCmd::SetVertexBuffersAttributeStrides { buffers, .. }
         | RenderCmd::SetVertexBuffers { buffers, .. } => {
@@ -737,9 +742,14 @@ fn note_copies(used: &Used, cmd: &RenderCmd<'_, RtPlatform>) {
         RenderCmd::UseHeaps { heaps } | RenderCmd::UseHeapsStages { heaps, .. } => {
             heaps.iter().flatten().for_each(|h| used.heap(h));
         }
-        RenderCmd::UseResources { resources, .. }
-        | RenderCmd::UseResourcesStages { resources, .. } => {
-            resources.iter().flatten().for_each(|r| used.resource(r));
+        RenderCmd::UseResources { resources, usage }
+        | RenderCmd::UseResourcesStages {
+            resources, usage, ..
+        } => {
+            resources
+                .iter()
+                .flatten()
+                .for_each(|r| used.resource(r, *usage));
         }
         _ => {}
     }

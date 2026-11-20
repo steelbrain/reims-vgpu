@@ -329,8 +329,9 @@ fn resource_usage(usage: u64) -> Result<rt::ResourceUsage, Stop> {
 }
 
 /// Notes the copies `cmd` uses in `used` ([`Used`]): those the buffers it sets, the heaps and
-/// resources it declares and its indirect buffers lie over. Its textures are noted as they bind
-/// ([`Kept::used`]).
+/// resources it declares and its indirect buffers lie over, each in a use that can write it but
+/// an indirect or condition buffer's and a resource's declared for reading alone. Its textures are
+/// noted as they bind ([`Kept::used`]).
 fn note_copies(used: &Used, cmd: &ComputeCmd<'_, RtPlatform>) {
     if !super::copied::any() {
         return;
@@ -345,7 +346,9 @@ fn note_copies(used: &Used, cmd: &ComputeCmd<'_, RtPlatform>) {
             ..
         }
         | ComputeCmd::EncodeStartIf { buffer, .. }
-        | ComputeCmd::EncodeStartWhile { buffer, .. } => buffer.iter().for_each(|b| used.buffer(b)),
+        | ComputeCmd::EncodeStartWhile { buffer, .. } => {
+            buffer.iter().for_each(|b| used.buffer_read(b));
+        }
         ComputeCmd::ExecuteCommandsIndirect {
             indirect_range_buffer: buffer,
             ..
@@ -353,14 +356,17 @@ fn note_copies(used: &Used, cmd: &ComputeCmd<'_, RtPlatform>) {
         | ComputeCmd::SetStageInRegionIndirect {
             indirect_buffer: buffer,
             ..
-        } => used.buffer(buffer),
+        } => used.buffer_read(buffer),
         ComputeCmd::SetBuffers { buffers, .. }
         | ComputeCmd::SetBuffersAttributeStrides { buffers, .. } => {
             buffers.iter().flatten().for_each(|b| used.buffer(b));
         }
         ComputeCmd::UseHeaps { heaps } => heaps.iter().flatten().for_each(|h| used.heap(h)),
-        ComputeCmd::UseResources { resources, .. } => {
-            resources.iter().flatten().for_each(|r| used.resource(r));
+        ComputeCmd::UseResources { resources, usage } => {
+            resources
+                .iter()
+                .flatten()
+                .for_each(|r| used.resource(r, *usage));
         }
         _ => {}
     }

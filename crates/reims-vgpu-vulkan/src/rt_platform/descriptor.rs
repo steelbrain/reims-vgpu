@@ -507,7 +507,7 @@ impl PassFields {
     }
 
     /// Notes in `used` the copies the pass's attachments, their resolves and its visibility
-    /// result buffer lie over ([`super::copied::Used`]).
+    /// result buffer lie over ([`super::copied::Used`]), each in a use that can write it.
     pub fn note_copies(&self, used: &super::copied::Used) {
         if !super::copied::any() {
             return;
@@ -516,7 +516,7 @@ impl PassFields {
         let attachments = (pass.colors.iter()).chain([&pass.depth, &pass.stencil]);
         for a in attachments {
             for texture in [&a.texture, &a.resolve_texture].into_iter().flatten() {
-                used.add(texture.copied());
+                used.add(texture.copied(), true);
             }
         }
         if let Some(buffer) = &pass.visibility_result_buffer {

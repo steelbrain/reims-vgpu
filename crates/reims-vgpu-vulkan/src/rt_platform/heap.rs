@@ -254,6 +254,8 @@ pub fn over_host_memory(
             buffer::import_pages(device, SEL, first, size, read_only, || {})?
         }
     };
+    // A copy just made is the heap's to hold from here (`super::copied::Fresh`).
+    let _fresh = super::copied::Fresh(block.id);
     if read_only && !super::copied::drops(block.id) {
         buffer::read_only(SEL);
     }

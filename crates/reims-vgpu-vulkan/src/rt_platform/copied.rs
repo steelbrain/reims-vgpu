@@ -1,13 +1,14 @@
 //! The rt platform's copies of host pages, the floor of an import of them (`super::buffer`'s
 //! docs, "A copy at the refusal point"): pages that rt imports neither by their pointer nor as a
-//! dma-buf of their files are imported as a copy ([`import`]), memory of the platform's own that
-//! holds their bytes, which rt imports by its pointer.
+//! dma-buf of their files, and pages whose GPU writes are dropped, are imported as a copy
+//! ([`import`]), a Shared block of rt's own that holds their bytes.
 //!
-//! - **The copy.** Anonymous memory of the process's, `ALIGN`-aligned and a whole number of
-//!   `ALIGN`s long (64 KiB, a multiple of every driver's `minImportedHostPointerAlignment` we
-//!   met), the pages' bytes at its start; rt's block over it is Shared, and the device answers
-//!   the pages, not the copy, as a buffer's `contents` and as the block's mapping
-//!   (`super::buffer::KnownBlocks`).
+//! - **The copy.** A Shared block rt takes for it (rt's `take_block`), the pages' bytes at its
+//!   start and zeros past them to the block's end. A texture over a buffer in it lies in place
+//!   where the device's linear image takes the texture, as over any Shared buffer of rt's, not in
+//!   an image of its own that rt copies the buffer's bytes into at each submission that uses it,
+//!   as over an import (rt's `Buffer::new_texture`). The device answers the pages, not the copy,
+//!   as a buffer's `contents` and as the block's mapping (`super::buffer::KnownBlocks`).
 //! - **The base.** For each copy, the bytes the pages and the copy last agreed on, in the
 //!   process's memory: at first the bytes copied.
 //! - **Synced for the command buffers that use it** ([`Used`]), as Metal makes resident for a
@@ -17,55 +18,65 @@
 //!   buffer), or that it declares with `useResource:` or `useHeap:`, which Metal asks for a
 //!   resource a shader reaches through an address (an argument buffer's). Each object over a copy
 //!   holds it from its make, so a use costs one check; a command buffer that uses no copy syncs
-//!   none.
+//!   none. Each use notes whether it can write the copy: a buffer bound to a shader's slot, a
+//!   blit's destination or fill, an attachment, a visibility result buffer, a heap, a texture of
+//!   shader-write or atomic usage bound to a shader's slot and a resource declared for writing
+//!   can; an index, indirect or tessellation factor buffer, a blit's source, another texture
+//!   bound to a shader's slot and a resource declared for reading alone cannot.
 //! - **And for every command buffer of its process once it escaped** ([`Used::escaped`]): a copy
 //!   under an object whose identity left the guest's Metal with no message naming it (core's
 //!   `EscapedCopies`: a buffer's `gpuAddress` read, written by an argument encoder, under a
 //!   texture whose `gpuResourceID` was read, or added to a residency set; a heap from its make)
 //!   may be reached through memory with no use naming it, so each commit of its process's command
-//!   buffers, and of their parts, syncs it as a use, from the escape until the last such object
-//!   goes. A copy no object of which escaped is reached through no address the guest holds.
+//!   buffers, and of their parts, syncs it as a use that can write it, from the escape until the
+//!   last such object goes. A copy no object of which escaped is reached through no address the
+//!   guest holds.
 //! - **Copied in at the commits that use it** ([`copy_in`], from `super::command`'s commit,
-//!   before rt is handed the command buffer): every byte of the pages that differs from the base
-//!   is written into the copy and the base. A byte the CPU did not change is never written, so a
-//!   GPU write to the copy by work still in flight stays.
-//! - **Merged back at the completions of the command buffers that use it** ([`merging`], the
-//!   first of the command buffer's completed handlers, so before core's and before a waiter
+//!   before rt is handed the command buffer, so before the work that reads it): every byte of the
+//!   pages that differs from the base is written into the copy and the base. A byte the CPU did
+//!   not change is never written, so a GPU write to the copy by work still in flight stays. rt's
+//!   memory of a Shared block is coherent, so the GPU reads the bytes written with no flush.
+//! - **Merged back at the completions of the command buffers that can write it** ([`merging`],
+//!   the first of the command buffer's completed handlers, so before core's and before a waiter
 //!   returns): every byte of the copy that differs from the base is written into the pages where
 //!   the pages' byte still is the base's, and the base takes the copy's byte. A byte both sides
 //!   changed keeps the CPU's, which the next commit that uses it copies in, as Metal keeps the
 //!   later of two writes. A byte the guest writes between the merge's read of it and its store is
-//!   lost only where the GPU changed it too.
+//!   lost only where the GPU changed it too. A command buffer whose uses of a copy can only read
+//!   it neither merges it back nor puts back its bytes: its work wrote none of them.
 //! - **Compared a chunk at a time** (`CHUNK`, 4 KiB): a chunk of one side is copied out with a raw
 //!   copy, as memory the guest writes at any time is read, and compared with the base's, and only
 //!   a chunk that differs is compared a word and then a byte at a time, and stored byte by byte
 //!   where not all of a word's bytes change.
 //! - **Writes dropped** where the copy is of pages whose GPU writes Metal drops ([`import`]'s
 //!   `drops`: pages their process maps read-only, `super::buffer`'s docs, "Read-only memory"): at
-//!   each completion of a command buffer that used it every byte the GPU changed in the copy is
-//!   put back from the base instead, and nothing is ever written into the pages, so the CPU and
+//!   each completion of a command buffer that can write it every byte the GPU changed in the copy
+//!   is put back from the base instead, and nothing is ever written into the pages, so the CPU and
 //!   the command buffers committed after the completion read the pages' bytes, as the M3 Max, the
 //!   5300M and the UHD 630 answer (`crate::gpu::command`'s docs). Within a command buffer, and
 //!   between command buffers in flight at once, a read after the GPU's write sees the write until
 //!   the completion that drops it.
-//! - **Released** as rt frees the import: the copy stops syncing, waiting for a sync in progress,
-//!   before the import's own release runs (the buffer's deallocator among it), and its memory goes
-//!   with the last handle of it.
+//! - **Released** as the last of its holders lets go of it: the objects over it, the command
+//!   buffers that used it, until their completed handlers ran, the device's known blocks while
+//!   its block is known, and its process's escaped copies. Then its import's release runs (the
+//!   buffer's deallocator among it), with no sync in progress, and its block goes back to rt,
+//!   which frees it once no buffer of rt's over it and no command buffer that used it remains. A
+//!   copy just made is held by [`import`] too, until the make that asked for it holds it
+//!   ([`Fresh`]).
 //!
 //! Counted: the bytes written into copies ([`IN_BYTES_CODE`]) and into pages ([`BACK_BYTES_CODE`]),
 //! the bytes of the GPU's writes dropped ([`DROPPED_BYTES_CODE`]), the render passes that store
 //! into a copy whose writes are dropped ([`STORE_OUTS_CODE`]), and the nanoseconds the syncs took
 //! ([`SYNC_NS_CODE`]).
 
-use std::alloc::Layout;
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Weak};
 
 use metal2vulkan_rt as rt;
 
-use crate::core::num::{ToU64 as _, ToUsize as _};
+use crate::core::num::ToUsize as _;
 use crate::core::platform::blit::ResourceRef;
 use crate::core::platform::device::NoCopyDeallocator;
 use crate::core::platform::os::Clock as _;
@@ -94,7 +105,7 @@ pub const DROPPED_BYTES_CODE: &str = "rt-copied-dropped-bytes";
 pub const STORE_OUTS_CODE: &str = "rt-copied-store-outs";
 
 /// The code whose count is the nanoseconds the copies' syncs took, on the committing thread and
-/// on rt's completion thread.
+/// on the thread that runs the command buffers' completed handlers.
 pub const SYNC_NS_CODE: &str = "rt-copied-sync-cpu-ns";
 
 /// The bytes a sync compares at a time.
@@ -103,37 +114,55 @@ const CHUNK: usize = 4096;
 /// A chunk's 8-byte words.
 const WORDS: usize = CHUNK / 8;
 
-/// A copy's alignment, and what its length is a multiple of.
-const ALIGN: usize = 64 << 10;
+/// `MTLResourceUsageRead`.
+const USAGE_READ: u64 = 1;
 
-/// The live copies, by their blocks.
-static COPIES: Mutex<BTreeMap<rt::BlockId, Arc<Copied>>> = Mutex::new(BTreeMap::new());
+/// `MTLResourceUsageSample`.
+const USAGE_SAMPLE: u64 = 4;
+
+/// The live copies, by their blocks (the module's docs, "Released").
+static COPIES: Mutex<BTreeMap<rt::BlockId, Entry>> = Mutex::new(BTreeMap::new());
 
 /// How many copies are live: none, and a commit or a buffer's `contents` asks nothing more.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 
-/// Why no copy was imported ([`import`]).
+/// A live copy as [`COPIES`] keeps it: as its holders hold it, and a copy just made held here too
+/// until the make that asked for it holds it ([`Fresh`]). No copy is dropped while [`COPIES`] is
+/// locked, since its drop locks it.
+struct Entry {
+    /// The copy, while a holder holds it.
+    copy: Weak<Copied>,
+    /// The copy, until the make that asked for it holds it.
+    fresh: Option<Arc<Copied>>,
+}
+
+/// Why no copy was made ([`import`]).
 #[derive(Debug)]
 pub(super) enum Uncopied {
-    /// The process has no memory for the copy or its base.
+    /// The process has no memory for the copy's base.
     NoMemory,
-    /// rt refused the copy's import.
+    /// rt refused the copy's block.
     Rt(rt::Error),
+    /// rt answered no mapping of the copy's block.
+    Unmapped,
 }
 
 impl std::fmt::Display for Uncopied {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Uncopied::NoMemory => f.write_str("no host memory for the copy"),
-            Uncopied::Rt(error) => write!(f, "metal2vulkan-rt refused the copy's import: {error}"),
+            Uncopied::NoMemory => f.write_str("no host memory for the copy's base"),
+            Uncopied::Rt(error) => write!(f, "metal2vulkan-rt refused the copy's block: {error}"),
+            Uncopied::Unmapped => f.write_str("metal2vulkan-rt mapped none of the copy's block"),
         }
     }
 }
 
-/// rt's import of a copy of the `len` bytes of whole pages at `pages`, made on `device` (the
-/// module's docs): the copy's block, the pages' first byte at its start, the GPU's writes to it
-/// dropped at each completion where `drops` ("Writes dropped"). rt runs `release` once it freed
-/// the import, after the copy stopped syncing. Else why none was made, `release` dropped unrun.
+/// A copy of the `len` bytes of whole pages at `pages`, made on `device` (the module's docs): its
+/// block, the pages' first byte at its start, the GPU's writes to it dropped at each completion
+/// where `drops` ("Writes dropped"). `release` runs as the copy goes ("Released"), after it stopped
+/// syncing. The copy is held here until the caller's [`Fresh`] of the block goes, by which time an
+/// object the caller made over it holds it ([`of`]). Else why none was made, `release` dropped
+/// unrun.
 ///
 /// # Safety
 ///
@@ -145,26 +174,24 @@ pub(super) unsafe fn import(
     drops: bool,
     release: NoCopyDeallocator,
 ) -> Result<rt::Block, Uncopied> {
-    // SAFETY: the caller's.
-    let copied = unsafe { Copied::new(pages, len.to_usize(), drops) }.ok_or(Uncopied::NoMemory)?;
+    let block = (device.take_block(rt::MemoryClass::Shared, len)).map_err(Uncopied::Rt)?;
+    let copy = block.contents.ok_or(Uncopied::Unmapped)?;
+    let (id, taken, cap) = (block.id, block.clone(), block.len.to_usize());
+    // SAFETY: the caller's; the block's `cap` bytes from `copy` are rt's mapping of it, 64 KiB
+    // aligned and taken for the copy alone, mapped while a handle of it lives, which the copy
+    // holds.
+    let copied = unsafe { Copied::new(pages, len.to_usize(), drops, (copy, cap, Some(block))) };
+    let copied = copied.ok_or(Uncopied::NoMemory)?;
+    *copied.release.lock() = Some(release);
     let copied = Arc::new(copied);
-    let held = Arc::clone(&copied);
-    let release: NoCopyDeallocator = Box::new(move || {
-        unregister(&held);
-        release();
-    });
-    let size = copied.layout.size().to_u64();
-    // SAFETY: the copy's `size` bytes are the process's own memory, mapped readable and writable,
-    // and freed only as the last handle of the copy goes, which the release holds until it runs.
-    match unsafe { device.import_host_memory(copied.copy, size, Some(release)) } {
-        Ok((block, _)) => {
-            let _ = copied.block.set(block.id);
-            COPIES.lock().insert(block.id, copied);
-            LIVE.fetch_add(1, Ordering::Release);
-            Ok(block)
-        }
-        Err(error) => Err(Uncopied::Rt(error)),
-    }
+    let entry = Entry {
+        copy: Arc::downgrade(&copied),
+        fresh: Some(copied),
+    };
+    let replaced = COPIES.lock().insert(id, entry);
+    drop(replaced);
+    LIVE.fetch_add(1, Ordering::Release);
+    Ok(taken)
 }
 
 /// Whether a copy is live.
@@ -180,59 +207,111 @@ pub(super) fn drops(id: rt::BlockId) -> bool {
 /// The live copy whose block is `id`, for an object made over it to hold ("Synced for the command
 /// buffers that use it"); `None` where the block is no live copy.
 pub(super) fn of(id: rt::BlockId) -> Option<Arc<Copied>> {
-    any().then(|| COPIES.lock().get(&id).cloned()).flatten()
+    if !any() {
+        return None;
+    }
+    let copies = COPIES.lock();
+    copies.get(&id).and_then(|entry| entry.copy.upgrade())
 }
 
-/// The copies a command buffer uses, each once ("Synced for the command buffers that use it"),
-/// noted by its encoders as they set or declare an object over one, and taken at its commit.
+/// [`import`]'s hold of the copy just made in the block it names, which it lets go of as it
+/// drops: the make that asked for the copy holds it by then where it made an object over it, and
+/// else the copy goes with it ("Released").
+pub(super) struct Fresh(pub(super) rt::BlockId);
+
+impl Drop for Fresh {
+    fn drop(&mut self) {
+        if !any() {
+            return;
+        }
+        let fresh = (COPIES.lock().get_mut(&self.0)).and_then(|entry| entry.fresh.take());
+        drop(fresh);
+    }
+}
+
+/// A copy a command buffer uses, and whether a use of it can write it ([`Used`]).
+#[derive(Clone)]
+pub(super) struct CopyUse {
+    /// The copy.
+    copied: Arc<Copied>,
+    /// Whether a use of it can write it.
+    writes: bool,
+}
+
+/// The copies a command buffer uses, each once, with whether a use of it can write it ("Synced
+/// for the command buffers that use it"), noted by its encoders as they set or declare an object
+/// over one, and taken at its commit.
 #[derive(Clone, Default)]
-pub struct Used(Arc<Mutex<Vec<Arc<Copied>>>>);
+pub struct Used(Arc<Mutex<Vec<CopyUse>>>);
 
 impl Used {
-    /// The command buffer uses `copied`, where it is a copy (an object over none holds `None`).
-    pub(super) fn add(&self, copied: Option<&Arc<Copied>>) {
+    /// The command buffer uses `copied`, where it is a copy (an object over none holds `None`), in
+    /// a use that can write it where `writes`.
+    pub(super) fn add(&self, copied: Option<&Arc<Copied>>, writes: bool) {
         let Some(copied) = copied else {
             return;
         };
         let mut used = self.0.lock();
-        if !used.iter().any(|u| Arc::ptr_eq(u, copied)) {
-            used.push(Arc::clone(copied));
+        match used.iter_mut().find(|u| Arc::ptr_eq(&u.copied, copied)) {
+            Some(u) => u.writes |= writes,
+            None => used.push(CopyUse {
+                copied: Arc::clone(copied),
+                writes,
+            }),
         }
     }
 
-    /// The command buffer uses `buffer`: its copy, where it lies over one.
+    /// The command buffer uses `buffer` where its work can write it (bound to a shader's slot, a
+    /// blit's destination or fill): its copy, where it lies over one.
     pub(super) fn buffer(&self, buffer: &RtBuffer) {
-        self.add(buffer.copied());
+        self.add(buffer.copied(), true);
     }
 
-    /// The command buffer uses `heap`: its copy, where it lies over one.
+    /// The command buffer's work reads `buffer` alone (as indices, as an indirect or tessellation
+    /// factor buffer, as a blit's source): its copy, where it lies over one.
+    pub(super) fn buffer_read(&self, buffer: &RtBuffer) {
+        self.add(buffer.copied(), false);
+    }
+
+    /// The command buffer uses `heap`, whose resources its work can write: its copy, where it lies
+    /// over one.
     pub(super) fn heap(&self, heap: &RtHeap) {
-        self.add(heap.copied());
+        self.add(heap.copied(), true);
     }
 
-    /// The command buffer declares `resource` (`useResource:`): its copy, where it lies over one.
-    pub(super) fn resource(&self, resource: &ResourceRef<'_, RtPlatform>) {
+    /// The command buffer declares `resource` for `usage` (`useResource:usage:`): its copy, where
+    /// it lies over one, in a use that can write it unless `usage` is reads alone
+    /// (`MTLResourceUsageRead`, `Sample`).
+    pub(super) fn resource(&self, resource: &ResourceRef<'_, RtPlatform>, usage: u64) {
+        let reads_alone = usage != 0 && usage & !(USAGE_READ | USAGE_SAMPLE) == 0;
         match resource {
-            ResourceRef::Buffer(buffer) => self.buffer(buffer),
-            ResourceRef::Texture(texture) => self.add(texture.copied()),
+            ResourceRef::Buffer(buffer) => self.add(buffer.copied(), !reads_alone),
+            ResourceRef::Texture(texture) => self.add(texture.copied(), !reads_alone),
             ResourceRef::Icb(_) => {}
         }
     }
 
     /// The command buffer is of the process whose escaped copies are `escapes`: it uses each
-    /// copy `escapes` holds now ("And for every command buffer of its process once it escaped").
+    /// copy `escapes` holds now, in a use that can write it ("And for every command buffer of its
+    /// process once it escaped").
     pub(super) fn escaped(&self, escapes: &crate::core::platform::command::EscapedCopies) {
         for copy in escapes.copies() {
             if let Ok(copied) = copy.downcast::<Copied>() {
-                self.add(Some(&copied));
+                self.add(Some(&copied), true);
             }
         }
     }
 
     /// The copies used, taken: none is used since.
-    pub(super) fn take(&self) -> Vec<Arc<Copied>> {
+    pub(super) fn take(&self) -> Vec<CopyUse> {
         std::mem::take(&mut *self.0.lock())
     }
+}
+
+/// Whether a use of any of `copies`, those a command buffer uses, can write it: the command
+/// buffer's completion then merges them back ([`merging`]).
+pub(super) fn writes(copies: &[CopyUse]) -> bool {
+    copies.iter().any(|u| u.writes)
 }
 
 /// Counts a render pass `sel` made whose attachments lie in the blocks `blocks` where one is a
@@ -258,36 +337,42 @@ static STORE_OUT_SAID: AtomicBool = AtomicBool::new(false);
 /// Writes into each of `copies`, those a command buffer uses, the bytes the CPU changed in its
 /// pages since they last agreed (the module's docs): at its commit, before rt is handed it.
 /// Nothing where it uses none.
-pub(super) fn copy_in(copies: &[Arc<Copied>]) {
+pub(super) fn copy_in(copies: &[CopyUse]) {
     if copies.is_empty() {
         return;
     }
     let clock = crate::os::OsClock::new();
     let began = clock.now_mono();
-    let written: u64 = copies.iter().map(|copied| copied.copy_in()).sum();
+    let written: u64 = copies.iter().map(|u| u.copied.copy_in()).sum();
     synced(IN_BYTES_CODE, written, &clock, began);
 }
 
-/// The completed handler that writes back into the pages of each of `copies`, those a command
-/// buffer uses, the bytes the GPU changed in the copy (the module's docs), to run first of its;
-/// `None` where it uses none.
+/// The completed handler, to run first of a command buffer's, that writes back into the pages
+/// of each of `copies`, those it uses, that a use of it can write the bytes the GPU changed in
+/// the copy, or puts back from the base those of one whose writes are dropped (the module's
+/// docs), and that holds every one of `copies` until it ran ("Released"); `None` where it uses
+/// none.
 pub(super) fn merging(
-    copies: &[Arc<Copied>],
+    copies: &[CopyUse],
 ) -> Option<impl FnOnce(&rt::CommandBuffer) + Send + 'static> {
     let copies = copies.to_vec();
     (!copies.is_empty()).then_some(move |_: &rt::CommandBuffer| merge_back(&copies))
 }
 
-/// Writes back into the pages of each of `copies` the bytes the GPU changed in the copy, and puts
-/// back from its base those of a copy whose writes are dropped.
-fn merge_back(copies: &[Arc<Copied>]) {
+/// Writes back into the pages of each of `copies` that a use of it can write the bytes the GPU
+/// changed in the copy, and puts back from its base those of a copy whose writes are dropped; of
+/// the others, nothing.
+fn merge_back(copies: &[CopyUse]) {
+    if !writes(copies) {
+        return;
+    }
     let clock = crate::os::OsClock::new();
     let began = clock.now_mono();
     let (mut written, mut dropped) = (0, 0);
-    for copied in copies {
-        match copied.drops {
-            true => dropped += copied.drop_back(),
-            false => written += copied.merge_back(),
+    for u in copies.iter().filter(|u| u.writes) {
+        match u.copied.drops {
+            true => dropped += u.copied.drop_back(),
+            false => written += u.copied.merge_back(),
         }
     }
     if dropped > 0 {
@@ -303,102 +388,101 @@ fn synced(code: &'static str, written: u64, clock: &crate::os::OsClock, began: M
     crate::answer::count_kind_by(SYNC_NS_CODE, u64::try_from(took).unwrap_or(u64::MAX));
 }
 
-/// `copied` released: no longer live, and once a sync of it in progress ends, never synced again.
-fn unregister(copied: &Arc<Copied>) {
-    let mut copies = COPIES.lock();
-    let id = copied.block.get();
-    if let Some(id) = id
-        && copies.get(id).is_some_and(|c| Arc::ptr_eq(c, copied))
-    {
-        copies.remove(id);
-        LIVE.fetch_sub(1, Ordering::Release);
-    }
-    drop(copies);
-    *copied.base.lock() = None;
-}
-
 /// A copy of pages and its base (the module's docs).
 pub struct Copied {
     /// The pages' first byte.
     home: NonNull<u8>,
     /// The copy's first byte.
     copy: NonNull<u8>,
-    /// The copy's memory.
-    layout: Layout,
-    /// The base, a word per 8 bytes of the pages; `None` once released, when nothing syncs it.
-    base: Mutex<Option<Box<[u64]>>>,
+    /// The base, a word per 8 bytes of the pages.
+    base: Mutex<Box<[u64]>>,
     /// Whether the GPU's writes to the copy are dropped ("Writes dropped").
     drops: bool,
-    /// The copy's block, once rt imported it.
-    block: OnceLock<rt::BlockId>,
+    /// The copy's memory, rt's Shared block taken for it alone ([`import`]), whose handle keeps
+    /// it until the copy goes; `None` in the tests, whose memory is their own.
+    block: Option<rt::Block>,
+    /// What runs as the copy goes, after it stopped syncing ([`import`]'s `release`).
+    release: Mutex<Option<NoCopyDeallocator>>,
 }
 
-// SAFETY: the pointers are to the pages, which stay mapped until the copy is released, and to the
-// copy's memory, the copy's own; each is read and written only under the base's lock, or by rt
-// through its import.
+// SAFETY: the pointers are to the pages, which stay mapped until the copy's release runs, and to
+// the copy's memory, the copy's own, which its `block` keeps; each is read and written only under
+// the base's lock, or by rt through its block.
 unsafe impl Send for Copied {}
 // SAFETY: as for `Send`.
 unsafe impl Sync for Copied {}
 
 impl Drop for Copied {
+    /// No longer live, then its release (the module's docs, "Released"); its block goes back to
+    /// rt after, with its handle. No sync runs: each holds the copy.
     fn drop(&mut self) {
-        // SAFETY: the copy's memory was allocated with this layout, and nothing reaches it now:
-        // its import's release, or the refusal of its import, dropped the last handle of it.
-        unsafe { std::alloc::dealloc(self.copy.as_ptr(), self.layout) };
+        if let Some(block) = &self.block {
+            let mut copies = COPIES.lock();
+            let ours = (copies.get(&block.id)).is_some_and(|e| std::ptr::eq(e.copy.as_ptr(), self));
+            let gone = ours.then(|| copies.remove(&block.id)).flatten();
+            drop(copies);
+            if gone.is_some() {
+                LIVE.fetch_sub(1, Ordering::Release);
+            }
+        }
+        let release = self.release.lock().take();
+        if let Some(release) = release {
+            release();
+        }
     }
 }
 
 impl Copied {
-    /// A copy of the `len` bytes at `home`, and its base, each those bytes, the GPU's writes to
-    /// the copy dropped where `drops`; `None` where `len` is 0 or no whole number of chunks, or
-    /// where the process has no memory for them.
+    /// A copy of the `len` bytes at `home` in the memory `block` holds where given, whose first
+    /// byte is `copy` and which holds `cap` bytes, the copy's bytes past `len` zeros, and its base,
+    /// the bytes copied, the GPU's writes to the copy dropped where `drops`; `None` where `len` is
+    /// 0, no whole number of chunks or past `cap`, or where the process has no memory for the
+    /// base.
     ///
     /// # Safety
     ///
-    /// The `len` bytes at `home` are mapped readable until the copy is released, and writable too
-    /// unless `drops`.
-    unsafe fn new(home: NonNull<u8>, len: usize, drops: bool) -> Option<Copied> {
-        if len == 0 || !len.is_multiple_of(CHUNK) {
+    /// The `len` bytes at `home` are mapped readable until the copy goes, and writable too unless
+    /// `drops`; the `cap` bytes at `copy`, 8-aligned, are memory of the copy's alone, mapped
+    /// readable and writable until the copy goes.
+    unsafe fn new(
+        home: NonNull<u8>,
+        len: usize,
+        drops: bool,
+        (copy, cap, block): (NonNull<u8>, usize, Option<rt::Block>),
+    ) -> Option<Copied> {
+        if len == 0 || !len.is_multiple_of(CHUNK) || len > cap {
             return None;
         }
-        let layout = Layout::from_size_align(len.checked_next_multiple_of(ALIGN)?, ALIGN).ok()?;
-        // SAFETY: the layout's size is not 0.
-        let copy = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })?;
-        let copied = Copied {
-            home,
-            copy,
-            layout,
-            base: Mutex::new(None),
-            drops,
-            block: OnceLock::new(),
-        };
         let mut base = Vec::new();
         base.try_reserve_exact(len / 8).ok()?;
         base.resize(len / 8, 0_u64);
-        // SAFETY: the pages' `len` bytes are readable (the caller's), and the copy's first `len`
-        // bytes, then the base's, are memory of the copy's own.
+        // SAFETY: the pages' `len` bytes are readable, and the copy's `cap` bytes, then the
+        // base's, are memory of the copy's own (the caller's).
         unsafe {
             std::ptr::copy_nonoverlapping(home.as_ptr(), copy.as_ptr(), len);
+            copy.as_ptr().add(len).write_bytes(0, cap - len);
             let to = base.as_mut_ptr().cast::<u8>();
             std::ptr::copy_nonoverlapping(copy.as_ptr(), to, len);
         }
-        *copied.base.lock() = Some(base.into_boxed_slice());
-        Some(copied)
+        Some(Copied {
+            home,
+            copy,
+            base: Mutex::new(base.into_boxed_slice()),
+            drops,
+            block,
+            release: Mutex::new(None),
+        })
     }
 
     /// Writes into the copy the bytes of the pages that differ from the base, and the base takes
     /// them: the bytes written.
     fn copy_in(&self) -> u64 {
         let mut base = self.base.lock();
-        let Some(base) = base.as_deref_mut() else {
-            return 0;
-        };
         let mut now = [0_u64; WORDS];
         let mut written = 0;
         for (chunk, was) in base.as_chunks_mut::<WORDS>().0.iter_mut().enumerate() {
             let at = chunk * CHUNK;
-            // SAFETY: the chunk lies in the pages, mapped until the copy is released (`new`'s
-            // contract).
+            // SAFETY: the chunk lies in the pages, mapped until the copy goes (`new`'s contract).
             unsafe { read_chunk(self.home.as_ptr().add(at), &mut now) };
             if now == *was {
                 continue;
@@ -421,9 +505,6 @@ impl Copied {
     /// still are the base's, and the base takes the copy's: the bytes written.
     fn merge_back(&self) -> u64 {
         let mut base = self.base.lock();
-        let Some(base) = base.as_deref_mut() else {
-            return 0;
-        };
         let (mut gpu, mut cpu) = ([0_u64; WORDS], [0_u64; WORDS]);
         let mut written = 0;
         for (chunk, was) in base.as_chunks_mut::<WORDS>().0.iter_mut().enumerate() {
@@ -433,7 +514,7 @@ impl Copied {
             if gpu == *was {
                 continue;
             }
-            // SAFETY: the chunk lies in the pages, mapped until the copy is released.
+            // SAFETY: the chunk lies in the pages, mapped until the copy goes.
             unsafe { read_chunk(self.home.as_ptr().add(at), &mut cpu) };
             let words = gpu.iter().zip(cpu.iter()).zip(was.iter_mut());
             for (i, ((gpu, cpu), was)) in words.enumerate() {
@@ -454,9 +535,6 @@ impl Copied {
     /// bytes put back.
     fn drop_back(&self) -> u64 {
         let base = self.base.lock();
-        let Some(base) = base.as_deref() else {
-            return 0;
-        };
         let mut gpu = [0_u64; WORDS];
         let mut dropped = 0;
         for (chunk, was) in base.as_chunks::<WORDS>().0.iter().enumerate() {
@@ -530,11 +608,27 @@ mod tests {
         unsafe { std::slice::from_raw_parts(at.as_ptr(), len) }.to_vec()
     }
 
-    /// A copy holds its pages' bytes; a commit's copy in writes the bytes the CPU changed and
-    /// leaves the copy's others, which the GPU may have written meanwhile; a completion's merge
-    /// back writes the bytes the GPU changed where the CPU did not, a byte both changed keeping
-    /// the CPU's, which the next copy in takes; each counts the bytes it wrote; a released copy
-    /// syncs nothing.
+    /// The bytes past the copy's first `len` in its memory, as [`copy_of`] makes it.
+    const TAIL: usize = 64;
+
+    /// A copy of the `len` bytes at `home` in memory of the test's own, never freed, [`TAIL`]
+    /// bytes of 0xee past them, the GPU's writes dropped where `drops` (`Copied::new`).
+    ///
+    /// # Safety
+    ///
+    /// As `Copied::new`'s for `home`.
+    unsafe fn copy_of(home: NonNull<u8>, len: usize, drops: bool) -> Option<Copied> {
+        let memory = vec![0xeeee_eeee_eeee_eeee_u64; (len + TAIL) / 8].leak();
+        let cap = memory.len() * 8;
+        let copy = NonNull::new(memory.as_mut_ptr().cast::<u8>()).expect("the memory");
+        // SAFETY: the caller's for `home`; the memory is the copy's alone, never freed, 8-aligned.
+        unsafe { Copied::new(home, len, drops, (copy, cap, None)) }
+    }
+
+    /// A copy holds its pages' bytes and zeros past them; a commit's copy in writes the bytes the
+    /// CPU changed and leaves the copy's others, which the GPU may have written meanwhile; a
+    /// completion's merge back writes the bytes the GPU changed where the CPU did not, a byte both
+    /// changed keeping the CPU's, which the next copy in takes; each counts the bytes it wrote.
     #[test]
     fn a_copy_syncs_the_bytes_each_side_changed() {
         let mut pages = chunks(2);
@@ -543,9 +637,11 @@ mod tests {
         // SAFETY: the pages are the test's own, written below only through `home`.
         unsafe { home.as_ptr().write_bytes(0x11, len) };
         // SAFETY: the pages live until the test's end, past the copy.
-        let copied = unsafe { Copied::new(home, len, false) }.expect("a copy");
-        assert!(copied.layout.size() >= len && copied.layout.align() == ALIGN);
+        let copied = unsafe { copy_of(home, len, false) }.expect("a copy");
         assert_eq!(bytes(copied.copy, len), vec![0x11; len]);
+        // SAFETY: the copy's memory holds `TAIL` bytes past the pages'.
+        let tail = bytes(unsafe { copied.copy.add(len) }, TAIL);
+        assert_eq!(tail, vec![0; TAIL], "zeros past the pages' bytes");
         assert_eq!((copied.copy_in(), copied.merge_back()), (0, 0));
 
         // The CPU writes 3 bytes of the pages; the GPU, meanwhile, a byte of the copy beside one.
@@ -577,13 +673,6 @@ mod tests {
         assert_eq!(copied.copy_in(), 1);
         assert_eq!(bytes(copied.copy, len), back);
         assert_eq!((copied.copy_in(), copied.merge_back()), (0, 0));
-
-        // Released, it syncs nothing.
-        *copied.base.lock() = None;
-        // SAFETY: inside the pages.
-        unsafe { home.as_ptr().write(0x77) };
-        assert_eq!((copied.copy_in(), copied.merge_back()), (0, 0));
-        assert_eq!(bytes(copied.copy, 1), [0x11]);
     }
 
     /// A copy whose writes are dropped never writes its pages: a completion puts back from the
@@ -597,7 +686,7 @@ mod tests {
         // SAFETY: the pages are the test's own, written below only through `home`.
         unsafe { home.as_ptr().write_bytes(0x11, len) };
         // SAFETY: the pages live until the test's end, past the copy.
-        let copied = unsafe { Copied::new(home, len, true) }.expect("a copy");
+        let copied = unsafe { copy_of(home, len, true) }.expect("a copy");
         assert!(copied.drops);
 
         // The GPU writes a word in the first chunk and a byte in the second, which the CPU also
@@ -625,6 +714,77 @@ mod tests {
         assert_eq!((copied.copy_in(), copied.drop_back()), (0, 0));
     }
 
+    /// A command buffer's completion merges back, or puts back, only the copies a use of which
+    /// can write them: one whose uses all read it keeps the bytes the GPU changed in it (none, in
+    /// Metal's run of such work) and its pages theirs, whether or not its writes are dropped; a
+    /// use that can write a copy noted after reads of it makes its uses writing.
+    #[test]
+    fn a_completion_merges_only_the_copies_its_uses_can_write() {
+        let len = CHUNK;
+        let mut made = Vec::new();
+        for drops in [false, true, false] {
+            let mut pages = chunks(1);
+            let home = NonNull::new(pages.as_mut_ptr().cast::<u8>()).expect("the pages");
+            // SAFETY: the pages are the test's own, written below only through `home`.
+            unsafe { home.as_ptr().write_bytes(0x11, len) };
+            // SAFETY: the pages live until the test's end, past the copy.
+            let copied = Arc::new(unsafe { copy_of(home, len, drops) }.expect("a copy"));
+            // SAFETY: inside the copy, as the GPU writes it.
+            unsafe { copied.copy.as_ptr().write_bytes(0x44, 8) };
+            made.push((pages, home, copied));
+        }
+        let used = Used::default();
+        let [
+            (_, read_home, read),
+            (_, dropped_home, dropped),
+            (_, written_home, written),
+        ] = &made[..]
+        else {
+            unreachable!("three copies");
+        };
+        used.add(Some(read), false);
+        used.add(Some(dropped), false);
+        used.add(Some(written), false);
+        used.add(Some(written), true);
+        used.add(None, true);
+        let copies = used.take();
+        let uses: Vec<bool> = copies.iter().map(|u| u.writes).collect();
+        assert_eq!(uses, [false, false, true], "each copy once");
+        assert!(writes(&copies));
+        assert!(used.take().is_empty(), "taken");
+        merge_back(&copies);
+        assert_eq!(bytes(*read_home, 8), [0x11; 8], "a read copy's pages");
+        assert_eq!(
+            bytes(read.copy, 8),
+            [0x44; 8],
+            "a read copy keeps its bytes"
+        );
+        assert_eq!(bytes(*dropped_home, 8), [0x11; 8]);
+        assert_eq!(bytes(dropped.copy, 8), [0x44; 8], "nothing put back");
+        assert_eq!(bytes(*written_home, 8), [0x44; 8], "merged back");
+        assert!(!writes(&copies[..2]));
+    }
+
+    /// A copy's release runs as the copy goes, once.
+    #[test]
+    fn a_copy_s_release_runs_as_it_goes() {
+        let mut pages = chunks(1);
+        let home = NonNull::new(pages.as_mut_ptr().cast::<u8>()).expect("the pages");
+        // SAFETY: the pages live until the test's end, past the copy.
+        let copied = unsafe { copy_of(home, CHUNK, false) }.expect("a copy");
+        let ran = Arc::new(AtomicUsize::new(0));
+        let runs = Arc::clone(&ran);
+        *copied.release.lock() = Some(Box::new(move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+        }));
+        let held = Arc::new(copied);
+        let other = Arc::clone(&held);
+        drop(held);
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "held still");
+        drop(other);
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
     /// A store writes the bytes that changed, and of those only where the other side's byte is
     /// still the old one: all 8 in one store, else byte by byte.
     #[test]
@@ -647,14 +807,19 @@ mod tests {
         assert_eq!(word[0], u64::from_ne_bytes(kept));
     }
 
-    /// A length of no whole number of chunks takes no copy.
+    /// A length of no whole number of chunks takes no copy, and nor does one past the memory.
     #[test]
     fn a_copy_is_of_whole_chunks() {
         let mut pages = chunks(1);
         let home = NonNull::new(pages.as_mut_ptr().cast::<u8>()).expect("the pages");
         // SAFETY: the pages are the test's own, past any copy.
-        assert!(unsafe { Copied::new(home, CHUNK / 2, false) }.is_none());
+        assert!(unsafe { copy_of(home, CHUNK / 2, false) }.is_none());
         // SAFETY: as above.
-        assert!(unsafe { Copied::new(home, 0, false) }.is_none());
+        assert!(unsafe { copy_of(home, 0, false) }.is_none());
+        let mut memory = chunks(1);
+        let copy = NonNull::new(memory.as_mut_ptr().cast::<u8>()).expect("the memory");
+        let small = (copy, CHUNK / 2, None);
+        // SAFETY: the pages are the test's own; the memory's first half is the copy's.
+        assert!(unsafe { Copied::new(home, CHUNK, false, small) }.is_none());
     }
 }

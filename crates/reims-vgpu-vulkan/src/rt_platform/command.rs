@@ -44,8 +44,8 @@
 //!   an object over, as Metal makes resident only those, and its commit adds its process's
 //!   escaped copies, which the caller names before any encoder (`reaches_escaped`) and its parts
 //!   take from it; its commit copies the CPU's writes into those before rt is handed the command
-//!   buffer, and where it used one its first completed handler merges the GPU's writes back into
-//!   their pages, before core's completion-seen handlers.
+//!   buffer, and where a use of one can write it its first completed handler merges the GPU's
+//!   writes back into their pages, before core's completion-seen handlers.
 //! - **What it keeps**: the pipeline states its encoders set ([`Kept`]), from their set until it
 //!   completes, released after its completed handlers ran. It keeps no texture or sampler state:
 //!   it notes those its work reads through one of the platform's own indices (`super::texture`'s
@@ -545,12 +545,19 @@ impl Kept {
 
     /// An encoder of it used `texture` as `how` says: a use for the boot diagnostics
     /// ([`Uses::add`]), of a tiled texture whose bytes are to take, a take at its commit
-    /// ([`Takes::used`]), of a texture over a copy, the copy's use (`super::copied::Used`), and of
-    /// one bound to a shader's slot, a read through its index ([`Reads::note`]).
+    /// ([`Takes::used`]), of a texture over a copy, the copy's use (`super::copied::Used`), one
+    /// that can write it unless the texture is a blit's source or is bound to a shader's slot and
+    /// no shader writes it (`RtTexture::shader_writes`), and of one bound to a shader's slot, a
+    /// read through its index ([`Reads::note`]).
     pub fn used(&self, texture: &RtObj<RtTexture>, how: Use) {
         self.1.add(texture, how);
         self.2.used(texture);
-        self.4.add(texture.copied());
+        let writes = match how {
+            Use::Sampled => texture.shader_writes(),
+            Use::Blitted => false,
+            Use::Rendered | Use::BlittedInto => true,
+        };
+        self.4.add(texture.copied(), writes);
         if how == Use::Sampled {
             self.5.note(texture.index_use());
         }
@@ -779,13 +786,14 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     }
 
     /// Hands rt the held handlers (the module's docs), then commits, the copies of host pages it
-    /// used and its process's escaped copies copied in first and merged back first of the
-    /// completed handlers (`super::copied`), then the bytes of the tiled textures it used taken
-    /// (`super::tiled`). A second commit is Metal's refusal, counted; a commit rt refuses is
-    /// counted, and its handlers never run. In a process that records, the recorder writes the
-    /// memory it reaches that changed before rt has it ([`crate::recorder::before_commit`]), and
-    /// takes what its GPU work wrote after the merge of the host pages it copied, before core's
-    /// handlers can tell the guest ([`crate::recorder::completion_seen`]).
+    /// used and its process's escaped copies copied in first and, those a use of which can write
+    /// them, merged back first of the completed handlers (`super::copied`), then the bytes of the
+    /// tiled textures it used taken (`super::tiled`). A second commit is Metal's refusal,
+    /// counted; a commit rt refuses is counted, and its handlers never run. In a process that
+    /// records, the recorder writes the memory it reaches that changed before rt has it
+    /// ([`crate::recorder::before_commit`]), and takes what its GPU work wrote after the merge of
+    /// the host pages it copied, before core's handlers can tell the guest
+    /// ([`crate::recorder::completion_seen`]).
     fn commit(&self, on: OnFault) -> RaiseResult<()> {
         let recorded_call = crate::recorder::rec_call!("commit", self);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {

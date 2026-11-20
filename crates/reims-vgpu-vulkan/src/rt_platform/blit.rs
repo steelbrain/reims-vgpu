@@ -100,7 +100,7 @@ impl RtBlitEncoder {
             }
             | BlitCmd::SynchronizeTexture { texture, .. } => {
                 self.kept.takes().used(texture);
-                self.kept.copies().add(texture.copied());
+                self.kept.copies().add(texture.copied(), true);
                 (None, None)
             }
             _ => (None, None),
@@ -124,8 +124,8 @@ impl RtBlitEncoder {
             BlitCmd::CopyBufferToTexture {
                 source_buffer: buffer,
                 ..
-            }
-            | BlitCmd::CopyTextureToBuffer {
+            } => used.buffer_read(buffer),
+            BlitCmd::CopyTextureToBuffer {
                 destination_buffer: buffer,
                 ..
             }
@@ -137,8 +137,8 @@ impl RtBlitEncoder {
             BlitCmd::CopyBufferToTextureOptions {
                 source_buffer: buffer,
                 ..
-            }
-            | BlitCmd::CopyTextureToBufferOptions {
+            } => buffer.iter().for_each(|b| used.buffer_read(b)),
+            BlitCmd::CopyTextureToBufferOptions {
                 destination_buffer: buffer,
                 ..
             } => buffer.iter().for_each(|b| used.buffer(b)),
@@ -147,7 +147,7 @@ impl RtBlitEncoder {
                 destination_buffer,
                 ..
             } => {
-                source_buffer.iter().for_each(|b| used.buffer(b));
+                source_buffer.iter().for_each(|b| used.buffer_read(b));
                 destination_buffer.iter().for_each(|b| used.buffer(b));
             }
             _ => {}
