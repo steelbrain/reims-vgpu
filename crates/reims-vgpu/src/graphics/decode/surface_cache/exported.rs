@@ -63,9 +63,9 @@
 //! new IOSurface, and so a new surface, for every picture. So each ask of a surface takes a spare
 //! made ahead for the same ask, where one is kept, and hands the makes of the next ones over to a
 //! thread of the spares' own, `reims-vgpu.graphics-drawn-spares-<i>` (`spares`,
-//! [`DrawnSpares`]), which nothing waits for; an ask that finds none makes its surface itself, as
+//! `DrawnSpares`), which nothing waits for; an ask that finds none makes its surface itself, as
 //! before. An ask keeps as many spares, kept and being made, as the guest had decodes in flight
-//! at its last decode on the device's video ([`Caches::saw_decodes_in_flight`]), at least one
+//! at its last decode on the device's video (`Caches::saw_decodes_in_flight`), at least one
 //! and at most `spares::MOST_SPARES` of every ask, by the plane shapes, their formats and the
 //! device's recoveries it was made at, so none made before a recovery is taken after it.
 //! Counted: `video-drawn-spares-used`, the asks that took a spare; `video-drawn-spares-missed`,

@@ -12971,7 +12971,7 @@ pub(super) mod tests {
             let page = r.page;
             r.dec.set_unified_memory(true);
             if drawn {
-                r.dec.set_drawn_caches(Arc::clone(&draw));
+                r.dec.set_drawn_caches(Arc::clone(&draw), Arc::default());
             }
             if shaped {
                 let p = Arc::clone(&r.p);
