@@ -822,9 +822,9 @@ mod tests {
         assert_eq!(
             detail_line("newTextureWithDescriptor:", &samples, &name, Some(&what)),
             format!(
-                "reims-vgpu: newTextureWithDescriptor:: metal2vulkan-runtime refused it ({samples}; \
-                 {samples:?}); the first of Limit-TextureSamples (rt-refused-limit): a texture of \
-                 format 70\n"
+                "reims-vgpu: newTextureWithDescriptor:: metal2vulkan-runtime refused it \
+                 ({samples}; {samples:?}); the first of Limit-TextureSamples (rt-refused-limit): a \
+                 texture of format 70\n"
             )
         );
         assert!(
@@ -841,8 +841,8 @@ mod tests {
                 "Draw-Points",
                 None
             ),
-            "reims-vgpu: drawPrimitives:vertexStart:vertexCount:: metal2vulkan-runtime refused it (a \
-             draw with Points is not built; Unsupported(Draw { kind: Points })); the first of \
+            "reims-vgpu: drawPrimitives:vertexStart:vertexCount:: metal2vulkan-runtime refused it \
+             (a draw with Points is not built; Unsupported(Draw { kind: Points })); the first of \
              Draw-Points (rt-refused-gap)\n"
         );
         let format = rt::Error::Unsupported(rt::Gap::TextureFormat {
