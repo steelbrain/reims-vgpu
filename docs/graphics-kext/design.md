@@ -4303,7 +4303,11 @@ entry of it is nil; a render pass with it as
 an attachment, and a video encoder of its session, are skipped whole; a wait
 for it as an event is dropped, and a signal of it as a shared event still
 reaches the guest's value; a create over it stands refused in turn. The
-buffer then completes as it would have. Where there is no stand-in (a message
+buffer then completes as it would have. So does a buffer with a pass the
+platform makes no encoder of (on the Vulkan platform, a pass its runtime
+refuses, as a resolve it builds none of, which it counts): the pass is skipped
+whole, its ops dropped up to its end, as a Metal app's sends to a nil encoder
+do nothing and fail no command buffer. Where there is no stand-in (a message
 too short to name its queue, a queue the process does not hold), the error
 status is posted at once. Nothing in
 this lane ends the offending context or its process on malformed input. The

@@ -1613,8 +1613,9 @@ enum OpenEncoder<P: Platform> {
     /// the session go on the video worker ([`video::SessionHold`]).
     Video(video::SessionHold<P>),
     /// An encoder of the op group, skipped whole: its pass named an object whose create the host
-    /// refused (an attachment, a video session). No platform encoder is open, and its ops up to
-    /// its end are dropped ([`refused`]).
+    /// refused (an attachment, a video session), or the platform made no encoder of it
+    /// ([`unmade`]). No platform encoder is open, and its ops up to its end are dropped
+    /// ([`refused`]).
     Skipped(u16),
 }
 
@@ -3812,28 +3813,31 @@ impl<P: Platform> GraphicsDecoder<P> {
                     }
                     built => built?,
                 };
-                let enc = cb
-                    .render_encoder(ON, &pass)?
-                    .ok_or_else(|| op_fault("the render encoder was nil"))?;
-                super::work::render_encoder(self.context);
-                *encoder = Some(OpenEncoder::Render(enc, facts));
+                // A pass the platform makes no encoder of is skipped whole ([`unmade`]).
+                *encoder = Some(match cb.render_encoder(ON, &pass)? {
+                    Some(enc) => {
+                        super::work::render_encoder(self.context);
+                        OpenEncoder::Render(enc, facts)
+                    }
+                    None => unmade(RGFX_OP_GROUP_RENDER),
+                });
             }
             RGFX_OP_ENCODER_BEGIN_COMPUTE => {
                 already_open(encoder, "ENCODER_BEGIN_COMPUTE")?;
                 self.laid_blit.set(false);
                 let desc = compute_pass(body)?;
-                let enc = cb
-                    .compute_encoder_for_pass(&desc)?
-                    .ok_or_else(|| op_fault("the compute encoder was nil"))?;
-                *encoder = Some(OpenEncoder::Compute(enc, refused::Marks::default()));
+                *encoder = Some(match cb.compute_encoder_for_pass(&desc)? {
+                    Some(enc) => OpenEncoder::Compute(enc, refused::Marks::default()),
+                    None => unmade(RGFX_OP_GROUP_COMPUTE),
+                });
             }
             RGFX_OP_ENCODER_BEGIN_BLIT => {
                 already_open(encoder, "ENCODER_BEGIN_BLIT")?;
                 self.laid_blit.set(true);
-                let enc = cb
-                    .blit_encoder(ON)?
-                    .ok_or_else(|| op_fault("the blit encoder was nil"))?;
-                *encoder = Some(OpenEncoder::Blit(enc));
+                *encoder = Some(match cb.blit_encoder(ON)? {
+                    Some(enc) => OpenEncoder::Blit(enc),
+                    None => unmade(RGFX_OP_GROUP_BLIT),
+                });
             }
             RGFX_OP_ENCODER_BEGIN_VIDEO => {
                 already_open(encoder, "ENCODER_BEGIN_VIDEO")?;
@@ -4479,6 +4483,34 @@ impl<'a, P: Platform> Draws<'a, P> {
         let draws = unsafe { std::slice::from_raw_parts(self.held.as_ptr().cast(), len) };
         enc.encode_draws(ON, draws)
     }
+}
+
+/// The encoder of the op group `group` (render, compute or blit) at its `ENCODER_BEGIN_*` where
+/// the platform made none: skipped whole, as a pass that names an object whose create the host
+/// refused is ([`OpenEncoder::Skipped`]). The Vulkan platform answers none where its runtime
+/// refuses the pass (an attachment or a resolve it builds none of, a gap), and counts the
+/// refusal (`rt-refused-<kind>`). Its ops up to its end are dropped and the command buffer goes
+/// on, completing as it would have: a Metal app's sends to a nil encoder do nothing and fail no
+/// command buffer, and Metal fails none for a pass it renders. The process's first of each group
+/// is logged at WARN, the rest not, as the platform counts each refusal (docs/conventions.md).
+#[cold]
+#[inline(never)]
+fn unmade<P: Platform>(group: u16) -> OpenEncoder<P> {
+    /// Whether the first skip of each group (render, compute, blit) was logged.
+    static LOGGED: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
+    let (what, logged) = match group {
+        RGFX_OP_GROUP_RENDER => ("render", &LOGGED[0]),
+        RGFX_OP_GROUP_COMPUTE => ("compute", &LOGGED[1]),
+        _ => ("blit", &LOGGED[2]),
+    };
+    if !logged.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            target: "reims_vgpu::graphics", kind:% = what;
+            "the platform made no {what} encoder for a command buffer's pass: the pass is skipped \
+             whole and the command buffer goes on (the rest are not logged)"
+        );
+    }
+    OpenEncoder::Skipped(group)
 }
 
 /// A fault when an encoder is already open at an `ENCODER_BEGIN_*`.
@@ -6679,6 +6711,91 @@ mod tests {
         assert_eq!(recs[0].status, RGFX_CB_OK);
         // The fake answers no GPU times unless set: 0 for each.
         assert_eq!((recs[0].gpu_start_ns, recs[0].gpu_end_ns), (0, 0));
+    }
+
+    /// A pass the platform makes no encoder of, render, compute or blit (the Vulkan platform
+    /// answers none where its runtime refuses the pass, a gap of its own it counts), is skipped
+    /// whole, as one naming an object whose create the host refused is: its ops reach no encoder,
+    /// the encoders after it run, and the buffer completes as it would have, `RGFX_CB_OK`, as a
+    /// Metal app's sends to a nil encoder do nothing and fail no command buffer.
+    #[test]
+    fn a_pass_the_platform_makes_no_encoder_of_is_skipped_whole() {
+        use reims_vgpu_graphics::ops::blit::{RGFX_OP_BLIT_FILL_BUFFER, RgfxBlitOpFillBuffer};
+        use reims_vgpu_graphics::ops::compute::{
+            RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, RgfxComputeOpDispatchThreadgroups,
+        };
+        use reims_vgpu_vulkan::core::platform::types::NsErrorText;
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let captured = Arc::new(Mutex::new(Vec::<RgfxCbComplete>::new()));
+        let sink = Arc::clone(&captured);
+        dec.set_completion_sink(Arc::new(move |record| sink.lock().push(record)));
+        let gap = NsErrorText {
+            domain: "metal2vulkan-runtime".to_owned(),
+            code: 1,
+            description: "a pass the runtime renders none of".to_owned(),
+        };
+        p.script()
+            .push("renderCommandEncoderWithDescriptor:", Step::Gap(gap));
+        p.script()
+            .push("computeCommandEncoderWithDescriptor:", Step::Nil);
+        p.script().push("blitCommandEncoder", Step::Nil);
+        let dispatch = RgfxComputeOpDispatchThreadgroups {
+            threadgroups_width: 1,
+            threadgroups_height: 1,
+            threadgroups_depth: 1,
+            threads_width: 1,
+            threads_height: 1,
+            threads_depth: 1,
+        };
+        let compute = [
+            op(
+                RGFX_OP_ENCODER_BEGIN_COMPUTE,
+                RgfxComputePassDesc::default().as_bytes(),
+            ),
+            op(RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, dispatch.as_bytes()),
+            op(RGFX_OP_ENCODER_END, &[]),
+        ]
+        .concat();
+        let fill = RgfxBlitOpFillBuffer {
+            buffer_obj_id: 2,
+            range_location: 0,
+            range_length: 256,
+            value: 7,
+            ..RgfxBlitOpFillBuffer::default()
+        };
+        let blit = [
+            op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]),
+            op(RGFX_OP_BLIT_FILL_BUFFER, fill.as_bytes()),
+            op(RGFX_OP_ENCODER_END, &[]),
+        ]
+        .concat();
+        let pass = [render_ops(), compute, blit].concat();
+        let message = command_buffer_message(160, 75, &[pass.clone(), pass].concat());
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let sels = p.call_log().sels_since(mark);
+        let sent = |sel: &str| sels.iter().filter(|s| **s == sel).count();
+        let asked = [
+            "renderCommandEncoderWithDescriptor:",
+            "computeCommandEncoderWithDescriptor:",
+            "blitCommandEncoder",
+        ]
+        .map(sent);
+        assert_eq!(asked, [2, 2, 2], "each encoder asked for at each pass");
+        let ran = [
+            "drawPrimitives:vertexStart:vertexCount:",
+            "dispatchThreadgroups:threadsPerThreadgroup:",
+            "fillBuffer:range:value:",
+            "endEncoding",
+        ]
+        .map(sent);
+        assert_eq!(ran, [1, 1, 1, 3], "only the encoders made run and end");
+        assert_eq!(sent("commit"), 1);
+        p.world().complete_all(CompleteOn::Caller);
+        let recs = captured.lock();
+        let answered: Vec<_> = (recs.iter()).map(|r| (r.cb_obj_id, r.status)).collect();
+        assert_eq!(answered, [(160, RGFX_CB_OK)], "completed as it would have");
     }
 
     /// A command buffer's completion record carries the GPU times the platform answers as its

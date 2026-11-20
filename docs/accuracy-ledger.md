@@ -76,6 +76,13 @@ code instead, `rt-refused-texture-format-<n>`; a pipeline state's imageblock len
 `rt-refused-heap-texture-place`. The boot diagnostics (`rt_platform/diag.rs`, lines that start
 `reims-vgpu: rt-diag`) add what the call asked of rt where its site names it.
 
+A render, compute or blit pass whose encoder the platform makes none of (on rt, a pass it
+refuses, as a resolve it builds none of, counted as above) is skipped whole: the decoder drops
+the pass's ops up to its end, and the command buffer runs the rest and completes as it would
+have, as a Metal app's sends to a nil encoder do nothing and fail no command buffer
+(`crates/reims-vgpu/src/graphics/decode/cmdbuf.rs`, `unmade`). The process's first such pass of
+each kind has a line.
+
 Among the translator's refusals (`rt-refused-translation`), a fragment function that reads an
 interpolant at a sample or an offset (`interpolate_at_sample`, `interpolate_at_offset`) outside
 its first block, or after a `discard_fragment` in it, is refused on every device, where Metal
