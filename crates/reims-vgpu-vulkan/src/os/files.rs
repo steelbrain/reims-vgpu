@@ -697,8 +697,8 @@ impl Registration {
         Registration::made(first, length, backing, false)
     }
 
-    /// [`Registration::new`], of a range of the guest's RAM (the OS's lease of it, Linux's
-    /// `super::linux::lease`).
+    /// The tests' `Registration::new`, of a range of the guest's RAM (the OS's lease of it,
+    /// Linux's `super::linux::lease`).
     pub(crate) fn guest_ram(first: u64, length: u64, backing: Backing) -> Registration {
         Registration::made(first, length, backing, true)
     }

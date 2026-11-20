@@ -599,9 +599,9 @@ fn no_file(call: &'static str, length: u64, error: std::io::Error) -> std::io::E
 /// or a fresh range its caller frees after the failure (core's range mappings, a surface's
 /// view), so the protection of those zeros never shows. No import of the runtime's
 /// lies over them, as the runtime imports no page without read access and nothing imports a
-/// fresh range before its remaps succeed, so putting zeros there is reported to no one
-/// ([`crate::remap`]); the table's files are mapped back as they were, the same pages. A
-/// put-back the kernel refuses too (`vm.max_map_count`) leaves the range forgotten by the table,
+/// fresh range before its remaps succeed, so putting zeros there is reported to no one, as
+/// nothing tracks the pages under an address; the table's files are mapped back as they were,
+/// the same pages. A put-back the kernel refuses too (`vm.max_map_count`) leaves the range forgotten by the table,
 /// logged.
 fn put_back(at: u64, length: u64) {
     let page = page_size();
