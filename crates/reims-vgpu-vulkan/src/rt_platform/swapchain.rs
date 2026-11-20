@@ -902,6 +902,7 @@ impl RtSwapchain {
             .map_err(|e| refused("vkGetSwapchainImagesKHR", e))?;
         let extent = info.image_extent;
         let descriptor = texture::drawable_descriptor(extent.width, extent.height);
+        let reached = texture::reaches(descriptor.usage, descriptor.pixel_format);
         let mut images: Vec<Image> = Vec::with_capacity(raw_images.len());
         let undo = |images: Vec<Image>, e: Refused| {
             let semaphores: Vec<vk::Semaphore> = images.iter().map(|i| i.ready).collect();
@@ -913,6 +914,13 @@ impl RtSwapchain {
             e
         };
         for raw in raw_images {
+            // A colour target, it takes an index as any texture shaders reach (`texture::reaches`).
+            let Some((index, own)) = self.device.index_for(NEXT_DRAWABLE, reached, 0) else {
+                return Err(undo(
+                    images,
+                    Refused("no texture index for a drawable".into()),
+                ));
+            };
             // SAFETY: the image is one `vkGetSwapchainImagesKHR` gives of `swapchain`, made on
             // rt's device with `info`, exclusive to rt's one queue family; no other drawable
             // texture is over it, and it is not taken. The swapchain is destroyed only once every
@@ -920,10 +928,13 @@ impl RtSwapchain {
             // `drawable_acquired` has run, and its texture is gone ([`RtSwapchain::retire`],
             // [`RtSwapchain::destroy`]).
             let made =
-                unsafe { (self.device.rt()).new_drawable_texture(&descriptor, None, raw, info) };
-            let made = match made {
-                Ok(made) => made,
+                unsafe { (self.device.rt()).new_drawable_texture(&descriptor, index, raw, info) };
+            let texture = match made {
+                Ok(made) => texture::drawable(&self.device, made, own),
                 Err(e) => {
+                    if let Some(own) = own {
+                        self.device.indices().give_back(own);
+                    }
                     rt_refused(NEXT_DRAWABLE, &e);
                     return Err(undo(images, Refused(format!("new_drawable_texture: {e}"))));
                 }
@@ -937,7 +948,7 @@ impl RtSwapchain {
                 Err(e) => return Err(undo(images, refused("vkCreateSemaphore", e))),
             };
             images.push(Image {
-                texture: texture::drawable(&self.device, made),
+                texture,
                 ready,
                 last: None,
                 presented: 0,

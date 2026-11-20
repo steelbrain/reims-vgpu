@@ -35,19 +35,21 @@
 //! ([`RtObj::new_texture_for_views_in`]) is made, recorded and counted as one whose block was
 //! taken at the make; one that does not fit it is not made, and the block is the caller's still.
 //!
-//! **Indices.** rt places a texture that shaders reach (shader-read or shader-write usage, or
-//! `Unknown`, which Metal takes as both) at an index of a live texture grant, and no other. A
-//! texture the guest places (the descriptor's `resourceIndex`, a view's `resourceIndex:`) takes the
-//! guest's index, from the guest's reservation (`reserveResourceIndicesForResourceType:`). One it
-//! does not place takes one of the platform's own ([`OwnIndices`]): the highest index of the class
-//! that no reservation holds and no texture of the platform's took yet, granted as it is taken,
-//! and once those are gone the one given back longest ago. So an index a released texture held is
-//! taken again as late as can be: rt leaves to the program that no work in flight reads a released
-//! texture through its index, and Metal frees a texture's ID only once its command buffers
-//! completed. A texture no shader reaches has no index. Its `gpuResourceID` is rt's, the index and
-//! the translator's word of its format and swizzle, and its `resourceIndex` and `uniqueIdentifier`
-//! the index: 0 for one with no index, where Metal numbers every texture from its lowest free ID.
-//! Nothing of core or the decoder reads them but the check of the guest's reservation.
+//! **Indices.** rt places a texture that shaders reach (shader-read or shader-write usage,
+//! `Unknown`, which Metal takes as both, or render-target usage of a pixel format with no depth or
+//! stencil aspect, a colour target, which a fragment function reads through its attachment;
+//! [`reaches`]) at an index of a live texture grant, and no other. A texture the guest places (the
+//! descriptor's `resourceIndex`, a view's `resourceIndex:`) takes the guest's index, from the
+//! guest's reservation (`reserveResourceIndicesForResourceType:`). One it does not place takes one
+//! of the platform's own ([`OwnIndices`]): the highest index of the class that no reservation holds
+//! and no texture of the platform's took yet, granted as it is taken, and once those are gone the
+//! one given back longest ago. So an index a released texture held is taken again as late as can
+//! be: rt leaves to the program that no work in flight reads a released texture through its index,
+//! and Metal frees a texture's ID only once its command buffers completed. A texture no shader
+//! reaches has no index. Its `gpuResourceID` is rt's, the index and the translator's word of its
+//! format and swizzle, and its `resourceIndex` and `uniqueIdentifier` the index: 0 for one with no
+//! index, where Metal numbers every texture from its lowest free ID. Nothing of core or the decoder
+//! reads them but the check of the guest's reservation.
 //!
 //! **Answers.** A texture's descriptor values are rt's descriptor of it. Its usage is Metal's
 //! answer (measured on the M3 Max, `crate::gpu::desc`'s docs): the usage set without 0x8, which
@@ -316,7 +318,7 @@ impl RtTexture {
         }
         let (index, own) = self
             .device
-            .index_for(sel, reaches(d.usage), resource_index)?;
+            .index_for(sel, reaches(d.usage, format), resource_index)?;
         let first = (levels.start, slices.start);
         let format_raw = u32::try_from(pixel_format).unwrap_or(u32::MAX);
         let made = match channels {
@@ -400,7 +402,7 @@ fn made_of(
         Err(why) => return refused_metal(sel, &why),
     };
     let placed = desc.resource_index.map_or(0, |(index, _forced)| index);
-    let (index, own) = device.index_for(sel, reaches(d.usage), placed)?;
+    let (index, own) = device.index_for(sel, reaches(d.usage, d.pixel_format), placed)?;
     answered(device, sel, desc, options, own, make(&d, index), diag)
 }
 
@@ -448,8 +450,13 @@ const STORAGE_PRIVATE: u64 = 0x20;
 const USAGE_RENDER_TARGET: u64 = 0x4;
 
 /// The texture over a window swapchain's image (`super::swapchain`): rt's drawable `texture`, made
-/// of [`drawable_descriptor`]'s descriptor, at no index, as the display's own textures are.
-pub(super) fn drawable(device: &RtObj<RtDevice>, texture: rt::Texture) -> RtObj<RtTexture> {
+/// of [`drawable_descriptor`]'s descriptor at `own`, one of the platform's own indices, which its
+/// drop gives back.
+pub(super) fn drawable(
+    device: &RtObj<RtDevice>,
+    texture: rt::Texture,
+    own: Option<u32>,
+) -> RtObj<RtTexture> {
     let d = texture.descriptor();
     let shape = Shape {
         format: d.pixel_format.as_raw(),
@@ -464,7 +471,7 @@ pub(super) fn drawable(device: &RtObj<RtDevice>, texture: rt::Texture) -> RtObj<
         options: tracked(STORAGE_PRIVATE),
         usage: USAGE_RENDER_TARGET,
         protection_options: 0,
-        own: None,
+        own,
         purgeable: purgeable_state(),
         made: Made::new(Call::Drawable, &shape),
         tiled: OnceLock::new(),
@@ -474,8 +481,9 @@ pub(super) fn drawable(device: &RtObj<RtDevice>, texture: rt::Texture) -> RtObj<
 
 /// The descriptor of a drawable's texture over a swapchain's image of `width` x `height` pixels:
 /// a `Private` `BGRA8Unorm` render target of one level, which rt holds in `B8G8R8A8_UNORM`, the
-/// swapchain's format. Shaders do not reach it, so it takes no index, and the guest's textures'
-/// `gpuResourceID`s are the same whether or not a window is open.
+/// swapchain's format. A colour target, shaders reach it ([`reaches`]), so it takes one of the
+/// platform's own indices, which no texture the guest places at its own index takes: such a
+/// texture's `gpuResourceID` is the same whether or not a window is open.
 pub(super) fn drawable_descriptor(width: u32, height: u32) -> rt::TextureDescriptor {
     let mut d = rt::TextureDescriptor::new(
         rt::TextureType::Type2D,
@@ -706,7 +714,7 @@ impl RtObj<RtDevice> {
     /// platform's own: none where shaders do not reach it (`reached`), the guest's `placed` where
     /// it places one (0: none), else one of the platform's own. `None` where none can be had,
     /// counted.
-    fn index_for(
+    pub(super) fn index_for(
         &self,
         sel: &'static str,
         reached: bool,
@@ -758,11 +766,16 @@ impl RtObj<RtDevice> {
     }
 }
 
-/// Whether shaders reach a texture of `usage`, as rt decides where it takes an index: shader-read
-/// or shader-write usage, or `Unknown`, which Metal takes as both.
-fn reaches(usage: rt::TextureUsage) -> bool {
+/// Whether shaders reach a texture of `usage` and `format`, as rt decides where it takes an
+/// index: shader-read or shader-write usage, `Unknown`, which Metal takes as both, or
+/// render-target usage of a format with no depth or stencil aspect, a colour target, which a
+/// fragment function reads through its attachment. A depth or stencil target shaders neither
+/// read nor write is not reached.
+pub(super) fn reaches(usage: rt::TextureUsage, format: rt::PixelFormat) -> bool {
     let shaders = rt::TextureUsage::SHADER_READ | rt::TextureUsage::SHADER_WRITE;
-    usage.is_empty() || usage.intersects(shaders)
+    let colour_target = usage.contains(rt::TextureUsage::RENDER_TARGET)
+        && !metal2vulkan::metal::format::is_depth_stencil(format);
+    usage.is_empty() || usage.intersects(shaders) || colour_target
 }
 
 /// The slices of a texture of `d`: a cube's six faces each a slice, a 3D texture's one.
@@ -1330,13 +1343,24 @@ mod tests {
         assert_eq!(own.own.lock().next(), Some((65534, true)));
     }
 
-    /// A texture reaches shaders by shader-read or shader-write usage, or `Unknown`.
+    /// A texture reaches shaders by shader-read or shader-write usage, `Unknown`, or render-target
+    /// usage of a colour format; a depth or stencil target of neither read nor write usage does
+    /// not.
     #[test]
-    fn shaders_reach_read_write_and_unknown_usage() {
+    fn shaders_reach_read_write_unknown_and_colour_target_usage() {
+        use rt::PixelFormat as F;
         let usage = |raw: u32| rt::TextureUsage::try_from(raw).unwrap();
-        assert!(reaches(usage(0)));
-        assert!(reaches(usage(1)) && reaches(usage(2)) && reaches(usage(0x15)));
-        assert!(!reaches(usage(4)) && !reaches(usage(0x10)) && !reaches(usage(0x8)));
+        for format in [F::BGRA8Unorm, F::Depth32Float] {
+            assert!(reaches(usage(0), format));
+            assert!(reaches(usage(1), format) && reaches(usage(2), format));
+            assert!(reaches(usage(0x15), format));
+            assert!(!reaches(usage(0x10), format) && !reaches(usage(0x8), format));
+        }
+        assert!(reaches(usage(4), F::BGRA8Unorm) && reaches(usage(4), F::RGBA16Float));
+        assert!(reaches(usage(0x14), F::R32Uint));
+        for depth in [F::Depth32Float, F::Stencil8, F::Depth32FloatStencil8] {
+            assert!(!reaches(usage(4), depth) && !reaches(usage(0x14), depth));
+        }
     }
 
     /// A texture of 0x8 alone goes to rt as one of `ShaderRead` alone, and so reaches shaders,
@@ -1352,7 +1376,7 @@ mod tests {
         };
         assert_eq!(rt_usage(0x8), rt_usage(0x1));
         assert_eq!(rt_usage(0x8), Ok(rt::TextureUsage::SHADER_READ));
-        assert!(rt_usage(0x8).is_ok_and(reaches));
+        assert!(rt_usage(0x8).is_ok_and(|usage| reaches(usage, rt::PixelFormat::Depth32Float)));
         assert_eq!(rt_usage(0), Ok(rt::TextureUsage::UNKNOWN));
         assert_eq!(rt_usage(0xc).map(|u| u.as_raw()), Ok(0xc));
     }
@@ -1375,13 +1399,14 @@ mod tests {
     }
 
     /// Textures on the GPU the test holds: those the guest does not place take the platform's own
-    /// indices, distinct and from the top down past the guest's reservation, a released one's
-    /// index not taken again before the fresh ones; one the guest places answers its index; one
-    /// no shader reaches has none, the guest's placement dropped; `Unknown` usage answers Metal's
-    /// 0x17 and 0x8 is dropped; a texture of 0x8 alone answers no usage and is rt's of
+    /// indices, distinct and from the top down past the guest's reservation, a released one's index
+    /// not taken again before the fresh ones; one the guest places answers its index, a colour
+    /// render target's too, which a fragment function reads through its attachment; a depth target
+    /// no shader reads or writes has none, the guest's placement dropped; `Unknown` usage answers
+    /// Metal's 0x17 and 0x8 is dropped; a texture of 0x8 alone answers no usage and is rt's of
     /// `ShaderRead`, with an index, a format view of it answering no usage and a swizzled one
-    /// refused and counted; views of another format, at a placed index, of one slice of a 2D
-    /// array as a 2D texture and through a swizzle; `replaceRegion:` of a Shared texture copied and
+    /// refused and counted; views of another format, at a placed index, of one slice of a 2D array
+    /// as a 2D texture and through a swizzle; `replaceRegion:` of a Shared texture copied and
     /// counted, of a Private one refused and counted; a texture type rt has none of refused and
     /// counted, never a raise.
     #[test]
@@ -1434,6 +1459,18 @@ mod tests {
         let target = make(&target).expect("a render target");
         assert_eq!(
             (index(&target), target.gpu_resource_id() & 0xffff_ffff),
+            (9, 9)
+        );
+        let depth = TextureDesc {
+            pixel_format: 252,
+            usage: 0x4,
+            resource_options: Some(0x20),
+            resource_index: Some((11, false)),
+            ..small
+        };
+        let depth = make(&depth).expect("a depth target");
+        assert_eq!(
+            (index(&depth), depth.gpu_resource_id() & 0xffff_ffff),
             (0, 0)
         );
         let unknown = make(&TextureDesc { usage: 0, ..small }).expect("a texture");
