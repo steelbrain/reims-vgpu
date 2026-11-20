@@ -4850,17 +4850,20 @@ reads it once.
   own worker (`reims-vgpu.graphics-pool-take`) zeroes the block through the
   host's mapping and answers, first growing the pool by a piece of the take's
   length where nothing fit; rt says nothing of a block's bytes as it hands
-  it out, so bytes no block of the piece held before are zeroed too. The
-  bytes of a freed block, in a piece another block still holds, are zeroed after its
-  free by the pool's zeroer (`reims-vgpu.graphics-pool-zero`), off every
-  take's path, and a take over them leaves them as zeroed
-  (`pool-zeroed-after-free-bytes`, `pool-take-zero-skipped-prezeroed-bytes`);
-  a take over bytes still waiting for the zeroer zeroes them itself. The
-  zeroer zeroes 16 KiB at a time with the pool's lock held, so no take waits
-  for it beyond that lock, and it waits for no take; the device's release
-  waits for it and the take workers to let go of the pool. An emptied piece
-  is not zeroed: it may go back whole. So a context's takes are answered in its order,
-  and never wait behind another context's growth or zeroing. The host keeps
+  it out, so bytes no block of the piece held before are zeroed too. Ahead
+  of the takes, the pool's zeroer (`reims-vgpu.graphics-pool-zero`) zeroes,
+  off every take's path, the bytes no block holds in each piece a block
+  lies in and in the headroom piece (below), a new piece's from its place
+  on, and a take over them leaves them as zeroed (`pool-zeroed-ahead-bytes`,
+  `pool-take-zero-skipped-prezeroed-bytes`); a take over bytes it has not
+  reached zeroes them itself. The zeroer claims 64 KiB at a time with the
+  pool's lock held, writes it with the lock let go of, and marks it zeroed
+  with the lock held again; a take passes over the claimed 64 KiB, and waits
+  for its write only where it alone keeps the take out of every piece
+  (`pool-take-claim-waits`). No other empty piece is zeroed: it goes back
+  whole. The device's release waits for the zeroer and the take workers to
+  let go of the pool. So a context's takes are answered in its order, and
+  never wait behind another context's growth or zeroing. The host keeps
   one empty piece ahead of the takes from the kext's take of `POOL` on
   (`Host::pool_taken`), so a take grows the pool only where that piece has no
   room for it. The answer is

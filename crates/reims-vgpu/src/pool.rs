@@ -102,26 +102,31 @@ pub const UNALIGNED_CODE: &str = "rt-pool-block-unaligned";
 pub const TAKE_ZEROED_BYTES_CODE: &str = "pool-take-zeroed-bytes";
 
 /// The code of a carve's bytes the take workers did not zero, as the pool's zeroer zeroed them
-/// after an earlier carve of them was freed and no carve held them since (`takes`, "Zeros after
-/// a free"). Counted by the byte.
+/// ahead of the take and no carve held them since (`takes`, "Zeros ahead"). Counted by the byte.
 pub const TAKE_ZERO_PREZEROED_BYTES_CODE: &str = "pool-take-zero-skipped-prezeroed-bytes";
 
-/// The code of the bytes the pool's zeroer zeroed after their carves' frees (`takes`, "Zeros
-/// after a free"), counted by the byte.
-pub const ZEROED_AFTER_FREE_BYTES_CODE: &str = "pool-zeroed-after-free-bytes";
+/// The code of the bytes the pool's zeroer zeroed ahead of their takes (`takes`, "Zeros ahead"),
+/// counted by the byte.
+pub const ZEROED_AHEAD_BYTES_CODE: &str = "pool-zeroed-ahead-bytes";
+
+/// The code of the nanoseconds the pool's zeroer spent writing its chunks' zeros, on its own
+/// thread with no lock held (`takes`, "Zeros ahead"), counted in all.
+pub const ZERO_WRITE_NS_CODE: &str = "pool-zero-write-ns";
+
+/// The code of the longest write of one chunk's zeros by the pool's zeroer (`takes`, "Zeros
+/// ahead"), in nanoseconds: its count rises to it.
+pub const ZERO_WRITE_MAX_NS_CODE: &str = "pool-zero-write-max-ns";
 
 /// The code of the longest the pool's zeroer held the pool's lock for one chunk (`takes`, "Zeros
-/// after a free"), in nanoseconds: its count rises to it.
+/// ahead"), in nanoseconds: its count rises to it.
 pub const ZERO_HOLD_MAX_NS_CODE: &str = "pool-zero-hold-max-ns";
 
 /// The codes of the longest each part of the zeroer's hold of the pool's lock for one chunk took
-/// so far (`takes`, "Zeros after a free"), in nanoseconds, their counts rising to it: the chunk's
-/// pick (`State::next_zero`), its write, and its mark as reading zero (`State::zeroed`).
-pub const ZERO_HOLD_PART_MAX_NS_CODES: [&str; 3] = [
-    "pool-zero-hold-pick-max-ns",
-    "pool-zero-hold-write-max-ns",
-    "pool-zero-hold-mark-max-ns",
-];
+/// so far (`takes`, "Zeros ahead"), in nanoseconds, their counts rising to it: the chunk's pick
+/// and claim (`State::next_zero`), and its mark as reading zero (`State::zeroed`). Its write lies
+/// between them, with the lock let go of.
+pub const ZERO_HOLD_PART_MAX_NS_CODES: [&str; 2] =
+    ["pool-zero-hold-pick-max-ns", "pool-zero-hold-mark-max-ns"];
 
 /// The code of the zeroer's holds of the pool's lock for one chunk longer than 50 µs (`takes`,
 /// [`ZERO_HOLD_LONG`]), counted by the hold.
@@ -129,15 +134,19 @@ pub const ZERO_HOLDS_LONG_CODE: &str = "pool-zero-holds-over-50us";
 
 /// The codes of the nanoseconds the holds [`ZERO_HOLDS_LONG_CODE`] counts spent in each part, in
 /// the order of [`ZERO_HOLD_PART_MAX_NS_CODES`].
-pub const ZERO_LONG_HOLD_PART_NS_CODES: [&str; 3] = [
-    "pool-zero-long-hold-pick-ns",
-    "pool-zero-long-hold-write-ns",
-    "pool-zero-long-hold-mark-ns",
-];
+pub const ZERO_LONG_HOLD_PART_NS_CODES: [&str; 2] =
+    ["pool-zero-long-hold-pick-ns", "pool-zero-long-hold-mark-ns"];
 
 /// A zeroer's hold longer than this is counted with its parts ([`ZERO_HOLDS_LONG_CODE`]): the
-/// longest the walks of 11-19 saw at 16 KiB a chunk was 64 µs.
+/// longest the walks of 11-19 saw, with 16 KiB written inside the hold, was 64 µs.
 pub const ZERO_HOLD_LONG: std::time::Duration = std::time::Duration::from_micros(50);
+
+/// The code of the takes that waited for the zeroer's claimed chunk, which alone kept them out of
+/// a piece, to be written (`takes`, "Zeros ahead"), counted by the take.
+pub const TAKE_CLAIM_WAITS_CODE: &str = "pool-take-claim-waits";
+
+/// The code of the nanoseconds the takes [`TAKE_CLAIM_WAITS_CODE`] counts waited, in all.
+pub const TAKE_CLAIM_WAIT_NS_CODE: &str = "pool-take-claim-wait-ns";
 
 /// The code of the takes answered, whose waits [`TAKE_WAIT_CODES`] count (`takes`).
 pub const TAKE_WAITS_CODE: &str = "pool-take-waits";
@@ -347,9 +356,12 @@ struct Piece {
     holds: u64,
     /// The contexts' blocks in it (`takes`).
     carves: u64,
-    /// The bytes of it that read zero, as the zeroer zeroed them after their carve's free, by
-    /// offset in the block; none of them is carved (`takes`, "Zeros after a free").
+    /// The bytes of it that read zero, as the zeroer zeroed them ahead of their takes, by offset
+    /// in the block; none of them is carved (`takes`, "Zeros ahead").
     zeros: takes::Ranges,
+    /// Whether some of its bytes may be neither carved nor in `zeros`: set at its place and at
+    /// each carve's free, and cleared once the zeroer finds none (`takes`, "Zeros ahead").
+    zero_pending: bool,
 }
 
 impl Piece {
@@ -381,11 +393,23 @@ struct State {
     serial: u64,
     /// The take workers running, and the zeroer (`takes`).
     workers: usize,
-    /// Freed carves' bytes the zeroer zeroes, oldest first: each its piece's address and the
-    /// bytes' offsets in the piece's block (`takes`, "Zeros after a free").
-    to_zero: VecDeque<(u64, std::ops::Range<u64>)>,
+    /// The chunk the zeroer is writing, which no carve takes: its piece's address and its
+    /// offsets in the piece's block (`takes`, "Zeros ahead").
+    claim: Option<(u64, std::ops::Range<u64>)>,
+    /// The takes waiting for the claimed chunk's write, the only room for them: the zeroer claims
+    /// no other meanwhile (`takes`, "Zeros ahead").
+    claim_waits: usize,
     /// The zeroer runs.
     zeroer: bool,
+    /// For the tests: the zeroer claims no chunk.
+    #[cfg(test)]
+    zero_shut: bool,
+    /// For the tests: the zeroer waits, its chunk claimed, before its write.
+    #[cfg(test)]
+    zero_paused: bool,
+    /// For the tests: the bytes the take workers zeroed, then the zeroer.
+    #[cfg(test)]
+    zeroed_by: [u64; 2],
     /// The ledgers given out and not dropped ([`PoolLedger`]).
     keepers: usize,
     /// The source, handed over by the device's release while a ledger lived: the last ledger's
@@ -789,9 +813,10 @@ impl Drop for Pool {
 }
 
 impl Shared {
-    /// The pool's thread: takes a block for each ask and has the host map it, and gives back the
-    /// pieces that stayed empty past their delay, until the pool closes.
-    fn serve(&self, source: &dyn BlockSource) {
+    /// The pool's thread: takes a block for each ask and has the host map it, making the zeroer
+    /// where none runs (`takes`, "Zeros ahead"), and gives back the pieces that stayed empty past
+    /// their delay, until the pool closes.
+    fn serve(self: &Arc<Self>, source: &dyn BlockSource) {
         loop {
             let mut st = self.state.lock();
             if st.closed {
@@ -806,6 +831,9 @@ impl Shared {
                         None
                     }
                 };
+                if placed.is_some() && self.state.lock().start_zeroer() {
+                    takes::spawn_zeroer(self);
+                }
                 // The take waiting on it, where it still does, looks where the piece went.
                 if let Some(wait) = wait
                     && let Some(outcome) = self.state.lock().waits.get_mut(&wait)
@@ -910,6 +938,7 @@ impl Shared {
                 holds: 0,
                 carves: 0,
                 zeros: takes::Ranges::new(),
+                zero_pending: true,
             },
         );
         st.by_block.insert(block.id, at);

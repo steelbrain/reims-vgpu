@@ -564,6 +564,76 @@ fn live_pool(host: &Arc<Host>, delay: Duration) -> (Pool, Arc<HostBlocks>, PoolL
     (pool, blocks, ledger)
 }
 
+/// [`live_pool`] with its zeroer shut before the piece is placed, so it zeroes nothing until
+/// the test opens it ([`open_zeroer`]): the takes zero every byte themselves.
+fn live_pool_unzeroed(host: &Arc<Host>, delay: Duration) -> (Pool, Arc<HostBlocks>, PoolLedger) {
+    let (pool, blocks) = pool(range(64), host, delay);
+    pool.shared.state.lock().zero_shut = true;
+    pool.grow(BLOCK_LEN);
+    host.wait_for(1);
+    pool.added(BASE).unwrap();
+    let ledger = pool.ledger();
+    (pool, blocks, ledger)
+}
+
+/// Opens `pool`'s zeroer, shut by [`live_pool_unzeroed`], making one where none runs.
+fn open_zeroer(pool: &Pool) {
+    let mut st = pool.shared.state.lock();
+    st.zero_shut = false;
+    let start = st.start_zeroer();
+    drop(st);
+    pool.shared.changed.notify_all();
+    if start {
+        takes::spawn_zeroer(&pool.shared);
+    }
+}
+
+/// The bytes of the piece at `at` the zeroer's record says read zero.
+fn zeroed(pool: &Pool, at: u64) -> u64 {
+    let st = pool.shared.state.lock();
+    st.pieces
+        .get(&at)
+        .map_or(0, |p| p.zeros.iter().map(|(first, end)| end - first).sum())
+}
+
+/// Waits until the zeroer's record of the piece at `at` holds `len` bytes, or the test fails
+/// after 10 s.
+fn wait_zeroed(pool: &Pool, at: u64, len: u64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while zeroed(pool, at) != len {
+        assert!(
+            Instant::now() < deadline,
+            "{} of {len} bytes zeroed",
+            zeroed(pool, at)
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The chunk the zeroer claimed once it claimed one, or the test fails after 10 s.
+fn wait_claim(pool: &Pool) -> (u64, std::ops::Range<u64>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(claim) = pool.shared.state.lock().claim.clone() {
+            return claim;
+        }
+        assert!(Instant::now() < deadline, "the zeroer claimed no chunk");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The bytes the take workers of `pool` zeroed, then its zeroer.
+fn zeroed_by(pool: &Pool) -> [u64; 2] {
+    pool.shared.state.lock().zeroed_by
+}
+
+/// The count of `code` so far.
+fn counted(code: &str) -> u64 {
+    (reims_vgpu_vulkan::answer::counted_kinds().into_iter())
+        .find(|(c, _)| *c == code)
+        .map_or(0, |(_, n)| n)
+}
+
 type Answers = std::sync::mpsc::Receiver<Option<Taken>>;
 
 /// Context `context`'s take of `length` bytes, its answer sent to the receiver returned.
@@ -606,7 +676,7 @@ fn all(pool: &Pool, offset: u64, len: u64, byte: u8) -> bool {
 #[test]
 fn a_take_is_carved_zeroed_and_answered_with_its_length_rounded_up() {
     let host = Arc::new(Host::default());
-    let (pool, _blocks, ledger) = live_pool(&host, LONG);
+    let (pool, _blocks, ledger) = live_pool_unzeroed(&host, LONG);
     fill(&pool, 0, 3 * TAKE_ALIGN, 0xa5);
     assert_eq!(
         answer(&take(&ledger, 1, 100 << 10)),
@@ -624,7 +694,7 @@ fn a_take_is_carved_zeroed_and_answered_with_its_length_rounded_up() {
 #[test]
 fn a_take_over_a_given_back_carve_and_past_it_zeroes_all_of_it() {
     let host = Arc::new(Host::default());
-    let (pool, _blocks, ledger) = live_pool(&host, LONG);
+    let (pool, _blocks, ledger) = live_pool_unzeroed(&host, LONG);
     assert_eq!(answer(&take(&ledger, 1, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
     // The carve's bytes as the guest wrote them, and past them as the source's block holds them.
     fill(&pool, 0, 3 * TAKE_ALIGN, 0xa5);
@@ -642,12 +712,7 @@ fn a_take_over_a_given_back_carve_and_past_it_zeroes_all_of_it() {
 /// with no take, and the carved block beside them is left as it is; a take over them then finds
 /// them zero and leaves them, counted as zeroed ahead
 #[test]
-fn a_freed_blocks_bytes_are_zeroed_after_its_free_and_a_take_over_them_leaves_them() {
-    let counted = |code: &str| {
-        (reims_vgpu_vulkan::answer::counted_kinds().into_iter())
-            .find(|(c, _)| *c == code)
-            .map_or(0, |(_, n)| n)
-    };
+fn a_freed_blocks_bytes_are_zeroed_ahead_and_a_take_over_them_leaves_them() {
     let host = Arc::new(Host::default());
     let (pool, _blocks, ledger) = live_pool(&host, LONG);
     assert_eq!(answer(&take(&ledger, 1, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
@@ -657,7 +722,7 @@ fn a_freed_blocks_bytes_are_zeroed_after_its_free_and_a_take_over_them_leaves_th
     );
     fill(&pool, 0, TAKE_ALIGN, 0xa5);
     fill(&pool, TAKE_ALIGN, TAKE_ALIGN, 0x5a);
-    let zeroed = counted(ZEROED_AFTER_FREE_BYTES_CODE);
+    let zeroed = counted(ZEROED_AHEAD_BYTES_CODE);
     let Give::Given(carve) = ledger.give(1, 0, TAKE_ALIGN, |_, _| false) else {
         panic!("not given");
     };
@@ -670,7 +735,7 @@ fn a_freed_blocks_bytes_are_zeroed_after_its_free_and_a_take_over_them_leaves_th
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    while counted(ZEROED_AFTER_FREE_BYTES_CODE) < zeroed + TAKE_ALIGN {
+    while counted(ZEROED_AHEAD_BYTES_CODE) < zeroed + TAKE_ALIGN {
         assert!(start.elapsed() < Duration::from_secs(10), "counted");
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -779,19 +844,14 @@ fn a_take_that_fits_no_piece_grows_the_pool_and_waits_for_the_hosts_map() {
 }
 
 /// A zeroer's hold of the pool's lock longer than [`ZERO_HOLD_LONG`] is counted with the
-/// nanoseconds of each of its parts, the chunk's pick, its write and its mark, and each part's
-/// longest rises to that part at least
+/// nanoseconds of each of its parts, the chunk's pick and its mark, and each part's longest rises
+/// to that part at least
 #[test]
 fn a_zeroers_long_hold_is_counted_with_its_parts() {
-    let counted = |code: &str| {
-        (reims_vgpu_vulkan::answer::counted_kinds().into_iter())
-            .find(|(c, _)| *c == code)
-            .map_or(0, |(_, n)| n)
-    };
-    let [pick, write, mark] = ZERO_LONG_HOLD_PART_NS_CODES;
-    let codes = [ZERO_HOLDS_LONG_CODE, pick, write, mark];
+    let [pick, mark] = ZERO_LONG_HOLD_PART_NS_CODES;
+    let codes = [ZERO_HOLDS_LONG_CODE, pick, mark];
     let before = codes.map(counted);
-    let parts = [10_000, 45_000, 1_000];
+    let parts = [10_000, 45_000];
     takes::zero_held(parts.map(Duration::from_nanos));
     let after = codes.map(counted);
     // Another test's zeroer may count a long hold meanwhile, so the counts rise at least by this
@@ -806,8 +866,147 @@ fn a_zeroers_long_hold_is_counted_with_its_parts() {
         );
     }
     assert!(
-        counted(ZERO_HOLD_MAX_NS_CODE) >= 56_000,
+        counted(ZERO_HOLD_MAX_NS_CODE) >= 55_000,
         "the hold's longest"
+    );
+}
+
+/// The zeroer zeroes a new piece, the headroom, ahead of every take, from its place on: a take
+/// carved there once it ran zeroes nothing, and reads zero
+#[test]
+fn a_take_in_a_new_piece_the_zeroer_ran_over_zeroes_nothing() {
+    let host = Arc::new(Host::default());
+    let (pool, _blocks, ledger) = live_pool_unzeroed(&host, LONG);
+    // The source's bytes, which it says nothing of.
+    fill(&pool, 0, BLOCK_LEN, 0xa5);
+    open_zeroer(&pool);
+    wait_zeroed(&pool, BASE, BLOCK_LEN);
+    assert_eq!(zeroed_by(&pool), [0, BLOCK_LEN]);
+    let len = 4 * MIB;
+    assert_eq!(answer(&take(&ledger, 1, len)), Some((0, len)));
+    assert_eq!(zeroed_by(&pool)[0], 0, "the take zeroed bytes");
+    assert!(all(&pool, 0, BLOCK_LEN, 0));
+}
+
+/// An emptied piece is zeroed once it is the headroom, the lowest empty piece, and kept; one
+/// emptied above the headroom, which goes back whole past its delay, is not: its bytes are left
+/// as the guest wrote them until it is out of the guest
+#[test]
+fn an_emptied_piece_is_zeroed_as_the_headroom_and_not_where_it_goes_back_whole() {
+    let delay = Duration::from_millis(50);
+    let (host, hand) = (Arc::new(Host::default()), Hand::default());
+    let (pool, _blocks) = pool_at(range(64), &host, delay, hand.clock());
+    let ledger = pool.ledger();
+    assert!(ledger.keep_headroom());
+    host.wait_for(1);
+    pool.added(BASE).unwrap();
+    wait_zeroed(&pool, BASE, BLOCK_LEN);
+    // The first piece taken whole, the next is the headroom, zeroed; taken whole too, the third.
+    for (context, at, calls) in [(1, 0, 2), (2, BLOCK_LEN, 3)] {
+        assert_eq!(
+            answer(&take(&ledger, context, BLOCK_LEN)),
+            Some((at, BLOCK_LEN))
+        );
+        let next = BASE + at + BLOCK_LEN;
+        assert_eq!(host.wait_for(calls)[calls - 1], Call::Add(next, BLOCK_LEN));
+        pool.added(next).unwrap();
+        wait_zeroed(&pool, next, BLOCK_LEN);
+    }
+    fill(&pool, 0, BLOCK_LEN, 0xa5);
+    fill(&pool, BLOCK_LEN, BLOCK_LEN, 0x5a);
+    // The first emptied is the lowest empty piece, the headroom: zeroed.
+    let Give::Given(first) = ledger.give(1, 0, BLOCK_LEN, |_, _| false) else {
+        panic!("not given");
+    };
+    ledger.free(&[first]);
+    wait_zeroed(&pool, BASE, BLOCK_LEN);
+    assert!(all(&pool, 0, BLOCK_LEN, 0));
+    // The second emptied lies above it: it goes back whole, and nothing zeroes it.
+    let before = zeroed_by(&pool);
+    let Give::Given(second) = ledger.give(2, BLOCK_LEN, BLOCK_LEN, |_, _| false) else {
+        panic!("not given");
+    };
+    ledger.free(&[second]);
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(all(&pool, BLOCK_LEN, BLOCK_LEN, 0x5a));
+    assert_eq!(zeroed(&pool, BASE + BLOCK_LEN), 0);
+    hand.on(delay);
+    assert_eq!(
+        host.wait_for(4)[3],
+        Call::Remove(BASE + BLOCK_LEN, BLOCK_LEN)
+    );
+    assert_eq!(zeroed_by(&pool), before, "a piece going back was zeroed");
+}
+
+/// A take carved while the zeroer writes a chunk of the same piece is carved off that chunk, and
+/// reads zero at its answer, its worker zeroing it; the zeroer's write lands on its chunk alone,
+/// so the bytes the guest then writes stay as written
+#[test]
+fn a_take_racing_the_zeroer_reads_zero_and_keeps_what_the_guest_writes() {
+    let host = Arc::new(Host::default());
+    let (pool, _blocks) = pool(range(64), &host, LONG);
+    pool.shared.state.lock().zero_paused = true;
+    let ledger = pool.ledger();
+    assert!(ledger.keep_headroom());
+    host.wait_for(1);
+    pool.added(BASE).unwrap();
+    // The zeroer claimed the piece's top chunk, and waits before its write.
+    let top = BLOCK_LEN - takes::ZERO_CHUNK;
+    assert_eq!(wait_claim(&pool), (BASE, top..BLOCK_LEN));
+    fill(&pool, 0, BLOCK_LEN, 0xa5);
+    assert_eq!(answer(&take(&ledger, 1, top)), Some((0, top)));
+    assert!(all(&pool, 0, top, 0));
+    assert_eq!(zeroed_by(&pool), [top, 0]);
+    fill(&pool, 0, top, 0x5a);
+    pool.shared.state.lock().zero_paused = false;
+    pool.shared.changed.notify_all();
+    wait_zeroed(&pool, BASE, takes::ZERO_CHUNK);
+    assert!(all(&pool, 0, top, 0x5a));
+    assert!(all(&pool, top, takes::ZERO_CHUNK, 0));
+    // Its own bytes zeroed once: the take's worker zeroed none of the zeroer's chunk.
+    assert_eq!(zeroed_by(&pool)[0], top);
+}
+
+/// A take that only the zeroer's claimed chunk keeps out of a piece waits for the chunk's write
+/// rather than asking for a piece, counted, and is carved over it once it is written; its worker
+/// zeroes the rest
+#[test]
+fn a_take_only_the_claimed_chunk_keeps_out_waits_for_its_write_and_asks_no_piece() {
+    let host = Arc::new(Host::default());
+    let (pool, _blocks) = pool(range(64), &host, LONG);
+    pool.shared.state.lock().zero_paused = true;
+    let ledger = pool.ledger();
+    assert!(ledger.keep_headroom());
+    host.wait_for(1);
+    pool.added(BASE).unwrap();
+    let top = BLOCK_LEN - takes::ZERO_CHUNK;
+    assert_eq!(wait_claim(&pool), (BASE, top..BLOCK_LEN));
+    fill(&pool, 0, BLOCK_LEN, 0xa5);
+    let waits = counted(TAKE_CLAIM_WAITS_CODE);
+    let rx = take(&ledger, 1, BLOCK_LEN);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pool.shared.state.lock().claim_waits == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the take did not wait for the chunk"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(rx.try_recv().is_err(), "answered over the claimed chunk");
+    pool.shared.state.lock().zero_paused = false;
+    pool.shared.changed.notify_all();
+    assert_eq!(answer(&rx), Some((0, BLOCK_LEN)));
+    assert!(all(&pool, 0, BLOCK_LEN, 0));
+    // The worker zeroed all but the zeroer's chunk.
+    assert_eq!(zeroed_by(&pool)[0], top);
+    assert!(counted(TAKE_CLAIM_WAITS_CODE) > waits);
+    // No piece was asked for the take: the next is the headroom, asked once the take used this.
+    assert_eq!(
+        host.wait_for(2),
+        [
+            Call::Add(BASE, BLOCK_LEN),
+            Call::Add(BASE + BLOCK_LEN, BLOCK_LEN)
+        ]
     );
 }
 
@@ -817,11 +1016,6 @@ fn a_zeroers_long_hold_is_counted_with_its_parts() {
 /// within its whole wait
 #[test]
 fn a_takes_wait_is_counted_by_its_cause() {
-    let counted = |code: &str| {
-        (reims_vgpu_vulkan::answer::counted_kinds().into_iter())
-            .find(|(c, _)| *c == code)
-            .map_or(0, |(_, n)| n)
-    };
     let codes = || {
         [
             TAKE_WAITS_CODE,
