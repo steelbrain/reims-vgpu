@@ -1133,7 +1133,7 @@ impl<P: Platform> ReleasePace<P> {
 
     /// A turn taken at once, where one may be ([`turn_at`]) and no release waits for its own.
     fn turn_now(self: &Arc<Self>, now: &Now) -> Option<Turn<P>> {
-        let mut state = self.lock();
+        let mut state = self.state.lock();
         if !state.waiting.is_empty()
             || turn_at(state.turns, state.last.as_ref(), now()) != TurnAt::Now
         {
@@ -1270,7 +1270,7 @@ impl<P: Platform> ReleasePace<P> {
     /// timed from its landing, on `now`'s clock ([`turn_at`]), which wakes the pace's thread.
     fn copied(self: &Arc<Self>, copy: Arc<Landing>, now: Now) {
         let id = Arc::as_ptr(&copy) as usize;
-        self.lock().last = Some(LastCopy {
+        self.state.lock().last = Some(LastCopy {
             copy: Arc::clone(&copy),
             landed: None,
         });
