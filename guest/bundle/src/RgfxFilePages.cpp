@@ -53,6 +53,24 @@ bool everyPageExternal(mach_vm_address_t start, mach_vm_address_t end, uint64_t 
 	return true;
 }
 
+// The clause of anonymous memory, the region `region` (RgfxFilePages.hpp, UNCHANGING ANONYMOUS
+// MEMORY): unchanging where its maximum protection has no write and the kernel answers it
+// SM_PRIVATE, or SM_COW with no object below the region's own; else not a file.
+RgfxFilePages anonymousPagesOf(const vm_region_submap_short_info_data_64_t &region)
+{
+	if ((region.max_protection & VM_PROT_WRITE) != 0)
+		return neither(kRgfxNeitherNotAFile);
+	RgfxFilePages out;
+	out.why = kRgfxNeitherNone;
+	if (region.share_mode == SM_PRIVATE)
+		out.clause = kRgfxAnonymousPrivate;
+	else if (region.share_mode == SM_COW && region.shadow_depth == 0)
+		out.clause = kRgfxAnonymousCopyOnWrite;
+	else
+		return neither(kRgfxNeitherNotAFile);
+	return out;
+}
+
 // Whether the file system whose fsid is `fsid` is mounted read-only (getfsstat, which reads no
 // path).
 bool readOnlyVolume(const fsid_t &fsid)
@@ -96,8 +114,10 @@ RgfxFilePages rgfxFilePagesOf(const void *address, uint64_t length)
 		return neither(kRgfxNeitherOther);
 	if (base + size < end)
 		return neither(kRgfxNeitherSpansRegions);
-	if (region.is_submap || !region.external_pager)
+	if (region.is_submap)
 		return neither(kRgfxNeitherNotAFile);
+	if (!region.external_pager)
+		return anonymousPagesOf(region);
 	// The process can never write it: its maximum protection has no write.
 	const bool copyOnWrite = region.share_mode == SM_COW;
 	if ((region.max_protection & VM_PROT_WRITE) != 0)
@@ -158,6 +178,10 @@ unsigned bucketOf(uint64_t ns)
 std::atomic<bool> gReportDue{false};
 const int64_t kReportNs = 60ll * 1000 * 1000 * 1000;
 
+const char *const kClauseNames[kRgfxFileClauses] = {
+    "max-no-write", "copy-on-write", "anonymous private", "anonymous copy-on-write", "neither",
+};
+
 const char *const kNeitherNames[kRgfxNeitherKinds] = {
     "none",     "not a file",      "spans regions", "writable mapping", "writable max protection",
     "shadowed", "writable volume", "other",
@@ -185,12 +209,11 @@ void report(void *)
 	gReportDue.store(false);
 	const RgfxFilePagesCounts c = rgfxFilePagesCounts();
 	Line line;
-	line.put("%llu classified, %.3f ms; max-no-write %llu %llu KiB, copy-on-write %llu %llu KiB, "
-	         "neither %llu %llu KiB (",
-	         (unsigned long long)c.classified, c.ns / 1e6, (unsigned long long)c.count[0],
-	         (unsigned long long)(c.bytes[0] / 1024), (unsigned long long)c.count[1],
-	         (unsigned long long)(c.bytes[1] / 1024), (unsigned long long)c.count[2],
-	         (unsigned long long)(c.bytes[2] / 1024));
+	line.put("%llu classified, %.3f ms;", (unsigned long long)c.classified, c.ns / 1e6);
+	for (unsigned i = 0; i < kRgfxFileClauses; i++)
+		line.put("%s %s %llu %llu KiB", i == 0 ? "" : ",", kClauseNames[i],
+		         (unsigned long long)c.count[i], (unsigned long long)(c.bytes[i] / 1024));
+	line.put(" (");
 	for (unsigned i = 1; i < kRgfxNeitherKinds; i++)
 		line.put("%s%s %llu %llu KiB", i == 1 ? "" : ", ", kNeitherNames[i],
 		         (unsigned long long)c.neitherCount[i],

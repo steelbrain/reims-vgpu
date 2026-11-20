@@ -295,8 +295,9 @@ RgfxRegion::Block RgfxRegion::acquirePages(const void *address, uint64_t length,
 		uint32_t why = file.why;
 		bool refused = false;
 		if (file.clause != kRgfxFileNeither) {
-			const uint32_t unchanging =
-			    kPagesUnchanging | (file.clause == kRgfxFileCopyOnWrite ? kPagesCopyOnWrite : 0);
+			const bool copyOnWrite =
+			    file.clause == kRgfxFileCopyOnWrite || file.clause == kRgfxAnonymousCopyOnWrite;
+			const uint32_t unchanging = kPagesUnchanging | (copyOnWrite ? kPagesCopyOnWrite : 0);
 			given = m_pagesBlock(m_pagesBlockContext, address, length, unchanging, &offset, &size,
 			                     &gpuAddress);
 			refused = !given;

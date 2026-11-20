@@ -2119,8 +2119,9 @@ only where no negotiation can carry it.
   and `_HI`.
 - Bit 31 is `UNCHANGING_PAGES`, which means nothing without
   `READ_ONLY_PAGES`: a read-only pages block may be of pages its process can
-  never write, a file's on a volume mounted read-only, and its `SURFACE_PAGES`
-  then carries `RGFX_SURFACE_PAGES_UNCHANGING` (1 << 6), with
+  never write and no one else writes, a file's on a volume mounted read-only
+  or anonymous memory of the process's own, and its `SURFACE_PAGES` then
+  carries `RGFX_SURFACE_PAGES_UNCHANGING` (1 << 6), with
   `RGFX_SURFACE_PAGES_COPY_ON_WRITE` (1 << 7) where the process maps them
   private and copy-on-write. The host reads such a block's pages once, as its
   view is imported ("Unchanging pages", under "No-copy buffers"). A read-only
@@ -5105,7 +5106,8 @@ copy where the host's GPU cannot import it as it is (the rt platform's
 `copied` module), so memory that provably cannot change is named so, and the
 host reads it once (`UNCHANGING_PAGES`). "Cannot change" is the guest OS's
 word, read once at the buffer's make, never a compare of the bytes. The bundle
-classifies the range (`guest/bundle/src/RgfxFilePages.hpp`):
+classifies the range (`guest/bundle/src/RgfxFilePages.hpp`) as a file's pages
+or as anonymous memory. A file's pages cannot change where:
 
 - it lies in one VM region mapped from a file: no submap, the region's object
   has a pager of its own, and `proc_pidinfo`'s `PROC_PIDREGIONPATHINFO` names
@@ -5129,6 +5131,36 @@ classifies the range (`guest/bundle/src/RgfxFilePages.hpp`):
   every Metal process loads the bundle, sandboxed ones among them, which log a
   refused file operation (`guest/bundle/tests/bundle_files_check.sh`).
 
+Anonymous memory, in one region with no submap and no pager behind it
+(`mach_vm_region_recurse`'s `external_pager` 0), cannot change where its
+maximum protection has no write and the kernel answers one of two share modes
+for it (xnu's `vm_map_region_walk`, `osfmk/vm/vm_map.c:16088-16098` of its
+main as read on 2026-11-20):
+
+- `SM_PRIVATE`: no shadow, no copy pending, and the object held by the
+  region's reference alone, so no other mapping reaches its pages, and none
+  that writes can be made after: a share of the region takes no protection its
+  maximum lacks (`vm_map_remap_extract`, `vm_map.c:18037-18058` and
+  `18733-18734`), and `VM_PROT_COPY` maps a copy in the region's place
+  (`vm_map_protect`, `vm_map.c:5832-5905`);
+- `SM_COW` at shadow depth 0: a copy pending on the region's own object, as a
+  copy of anonymous memory leaves both sides' entries over the one object, each
+  with its copy pending (`vm_object_copy_quickly`,
+  `osfmk/vm/vm_object.c:3586-3605`; the source's entry marked at
+  `vm_map.c:12727`, `14046` and `18604`). The other side's write goes to a copy
+  of its own: a write through an entry whose copy is pending shadows it first
+  (`vm_map_lookup_and_lock_object`, `vm_map.c:14866-14897`), and so does a
+  share of it (`vm_map_remap_extract`, `vm_map.c:18314-18396`).
+
+At a shadow depth of 1 or more another mapping may share the region's top
+object with write, so such memory is neither, as is every other share mode
+(shared, truly shared, aliased, empty, large pages) and memory whose maximum
+protection has write: why not a file. The one doubt `SM_PRIVATE` leaves: the
+walk takes one from the object's reference count while the object pages
+(`vm_map.c:16002-16005`), so an object two mappings hold, one of them another's
+with write, reads `SM_PRIVATE` while a page-out or UPL of one of its pages
+runs, and no query answers the count without it.
+
 The block is of the app's own memory, as every pages block is, named
 `kRgfxPagesUnchanging` (and `kRgfxPagesCopyOnWrite`). The kext wires it for
 reading as any read-only block and marks its `SURFACE_PAGES`
@@ -5137,8 +5169,11 @@ wired pages are the file's own. A private mapping's entry still needs its
 copy, and the wire makes it: `vm_map_create_upl` resolves the entry's copy and
 `vm_object_iopl_request` faults each page into the process's own object, so
 the wired pages are the process's copy of the file's bytes, as a Mac's
-driver's wire of an app's memory makes it (read from xnu's `vm_map.c` and
-`vm_upl.c`). The process can write neither. Where the kext refuses the block,
+driver's wire of an app's memory makes it (read from xnu's
+`osfmk/vm/vm_pageout.c`, which holds both). Anonymous memory's wire takes the
+region's pending copy the same way (`vm_pageout.c:7140-7188`) and faults each
+page into the region's own object (`vm_pageout.c:8584-8592`), which no one else
+holds. The process can write neither. Where the kext refuses the block,
 the bundle asks again for a read-only block, why `RGFX_PAGES_WHY_REFUSED`.
 
 Where the host's GPU cannot import the pages as they are, the rt platform
@@ -5153,11 +5188,12 @@ writes there.
 Memory that is neither takes a read-only block, as before, with why not in
 `PagesBlock`'s third input from bit 8 (`kRgfxPagesWhyShift`), which the kext
 carries on in the block's flags' bits 8 to 11 (`RGFX_SURFACE_PAGES_WHY_SHIFT`):
-not a file (1), spans regions (2), a shared mapping with write in its maximum
-protection (3, writable mapping), a private one with write in its maximum
-protection (4, writable max protection), a page not the file's (5, shadowed),
-a writable volume (6), a call that failed (7), and the kext's refusal of the
-unchanging block (8). The host takes any value and only counts by it: the
+not a file or unchanging anonymous memory (1), spans regions (2), a shared
+mapping with write in its maximum protection (3, writable mapping), a private
+one with write in its maximum protection (4, writable max protection), a page
+not the file's (5, shadowed), a writable volume (6), a call that failed (7),
+and the kext's refusal of the unchanging block (8). The host takes any value
+and only counts by it: the
 read-only blocks that are not unchanging, with their bytes and page runs, in
 the views' summary line, and the textures made over them
 (`read-only-pages-textures-why-N` in the degradation counts), each pixel

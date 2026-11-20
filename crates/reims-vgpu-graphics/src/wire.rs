@@ -320,8 +320,9 @@ pub const RGFX_FEATURE_SURFACE_DEFERRED_ASK: u32 = 1 << 30;
 /// [`RGFX_REG_DRIVER_FEATURES_LO`], and which means nothing without
 /// [`RGFX_FEATURE_READ_ONLY_PAGES`]: a read-only pages block's `SURFACE_PAGES` may carry
 /// [`RGFX_SURFACE_PAGES_UNCHANGING`], a block of pages its process can never write, a file's own on
-/// a volume the guest's OS mounted read-only, which no one writes while the block lives, and the
-/// host may then read them once, as the block's view is imported, and never again; and one that
+/// a volume the guest's OS mounted read-only or anonymous memory of the process's own, which no one
+/// writes while the block lives, and the host may then read them once, as the block's view is
+/// imported, and never again; and one that
 /// does not carry it may say why not ([`RGFX_SURFACE_PAGES_WHY_SHIFT`], a diagnostic). A `u64`,
 /// unlike the other bits of `FEATURES_LO`, so that C's `1 << 31` of a signed `int` never stands for
 /// it. A host offers it where it offers `READ_ONLY_PAGES`.
@@ -2715,20 +2716,23 @@ pub const RGFX_SURFACE_PAGES_ASK_CACHE: u32 = 1 << 4;
 pub const RGFX_SURFACE_PAGES_READ_ONLY: u32 = 1 << 5;
 /// [`RgfxSurfacePagesCache::flags`], with [`RGFX_SURFACE_PAGES_READ_ONLY`], where the guest took
 /// [`RGFX_FEATURE_UNCHANGING_PAGES`]: the read-only pages block's pages are of a mapping its
-/// process can never write, whose maximum protection has no write, of a file on a volume the
-/// guest's OS mounted read-only, and the mapping showed the file's own pages as the block was made:
-/// a shared mapping ([`RGFX_SURFACE_PAGES_COPY_ON_WRITE`] clear), whose pages the kext wires are
-/// the file's, or a private copy-on-write one (the flag set), whose pages the kext's wire copies
-/// for the process, as a Mac's driver's wire of the process's memory does. No one writes them while
-/// the block lives, so the host may read them once, as the block's view is imported, and never
-/// again. The flag is the guest's word, which the host does not check: where it is false, the GPU
-/// of the objects over the block may read the bytes the block had as its view was imported. One
-/// without [`RGFX_SURFACE_PAGES_READ_ONLY`] is [`RGFX_STATUS_INVALID_ARGUMENT`].
+/// process can never write, whose maximum protection has no write. Either of a file on a volume the
+/// guest's OS mounted read-only, the mapping showing the file's own pages as the block was made: a
+/// shared mapping ([`RGFX_SURFACE_PAGES_COPY_ON_WRITE`] clear), whose pages the kext wires are the
+/// file's, or a private copy-on-write one (the flag set), whose pages the kext's wire copies for
+/// the process, as a Mac's driver's wire of the process's memory does. Or anonymous memory that no
+/// other mapping writes: the process's alone ([`RGFX_SURFACE_PAGES_COPY_ON_WRITE`] clear), or with
+/// a copy pending, whose other side's writes go to a copy of its own (the flag set), its pages
+/// copied for the process by the kext's wire as a private file mapping's are. No one writes them
+/// while the block lives, so the host may read them once, as the block's view is imported, and
+/// never again. The flag is the guest's word, which the host does not check: where it is false, the
+/// GPU of the objects over the block may read the bytes the block had as its view was imported.
+/// One without [`RGFX_SURFACE_PAGES_READ_ONLY`] is [`RGFX_STATUS_INVALID_ARGUMENT`].
 pub const RGFX_SURFACE_PAGES_UNCHANGING: u32 = 1 << 6;
 /// [`RgfxSurfacePagesCache::flags`], with [`RGFX_SURFACE_PAGES_UNCHANGING`]: the process maps the
-/// file's bytes private and copy-on-write, with no write in the mapping's maximum protection. The
-/// host counts its blocks apart. One without [`RGFX_SURFACE_PAGES_UNCHANGING`] is
-/// [`RGFX_STATUS_INVALID_ARGUMENT`].
+/// file's bytes, or the anonymous memory, private and copy-on-write, with no write in the mapping's
+/// maximum protection. The host counts its blocks apart. One without
+/// [`RGFX_SURFACE_PAGES_UNCHANGING`] is [`RGFX_STATUS_INVALID_ARGUMENT`].
 pub const RGFX_SURFACE_PAGES_COPY_ON_WRITE: u32 = 1 << 7;
 /// Where [`RgfxSurfacePagesCache::flags`] of a block with [`RGFX_SURFACE_PAGES_READ_ONLY`] and no
 /// [`RGFX_SURFACE_PAGES_UNCHANGING`] holds, in its bits 8 to 11 ([`RGFX_SURFACE_PAGES_WHY_MASK`]),
@@ -2740,8 +2744,8 @@ pub const RGFX_SURFACE_PAGES_WHY_SHIFT: u32 = 8;
 pub const RGFX_SURFACE_PAGES_WHY_MASK: u32 = 3840;
 /// [`RGFX_SURFACE_PAGES_WHY_SHIFT`]: the guest said no why (it did not classify the pages).
 pub const RGFX_PAGES_WHY_UNSAID: u32 = 0;
-/// [`RGFX_SURFACE_PAGES_WHY_SHIFT`]: the pages are not a file's (anonymous or device memory, a
-/// submap, or a region the kernel names no vnode for).
+/// [`RGFX_SURFACE_PAGES_WHY_SHIFT`]: the pages are not a file's (anonymous memory that is not
+/// unchanging, device memory, a submap, or a region the kernel names no vnode for).
 pub const RGFX_PAGES_WHY_NOT_A_FILE: u32 = 1;
 /// [`RGFX_SURFACE_PAGES_WHY_SHIFT`]: the pages lie in more than one VM region of the process.
 pub const RGFX_PAGES_WHY_SPANS_REGIONS: u32 = 2;

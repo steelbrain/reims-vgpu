@@ -606,7 +606,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // (`BUFFER_OVER_PAGES`), the heaps of its buffers' slabs (`HEAP_OVER_PAGES`) and its
             // indirect command buffers' slots (`ICB_SLOTS_IN_PAGES`), and the pages it maps
             // read-only, which it keeps every object over from writing (`READ_ONLY_PAGES`), those
-            // of them a file's own on a read-only volume read once (`UNCHANGING_PAGES`). Every
+            // of them no one writes read once (`UNCHANGING_PAGES`). Every
             // host carries the display pipe's colour out (`DISPLAY_COLOR`), its window drawing
             // through it, names the shared events one process hands another
             // (`SHARED_EVENT_NAMES`), and tells the guest its window's screen's scale

@@ -1,9 +1,10 @@
 /*
  * RgfxFilePages: whether the read-only memory under a no-copy buffer cannot change, as the guest's
  * OS answers once, at the buffer's make (RgfxRegion::acquirePages, kRgfxPagesUnchanging,
- * RGFX_FEATURE_UNCHANGING_PAGES), and why not where it can.
+ * RGFX_FEATURE_UNCHANGING_PAGES), and why not where it can: a file's pages (UNCHANGING FILE
+ * PAGES) or anonymous memory (UNCHANGING ANONYMOUS MEMORY).
  *
- * UNCHANGING. The memory cannot change where all of these hold at the make:
+ * UNCHANGING FILE PAGES. The memory cannot change where all of these hold at the make:
  *   - the range lies in one VM region of the process, mapped from a file (no submap, no anonymous
  *     memory, no device memory: the region's object has a pager of its own, and the kernel names
  *     a vnode for it, proc_pidinfo's PROC_PIDREGIONPATHINFO);
@@ -26,12 +27,44 @@
  *     or looked up: every Metal process loads the bundle, sandboxed ones too, which report a
  *     refused file operation to the kernel's log (tests/bundle_files_check.sh).
  *
+ * UNCHANGING ANONYMOUS MEMORY. Memory no pager stands behind (no object of the region's chain is
+ * a file's or a device's: mach_vm_region_recurse's external_pager 0, and no submap) cannot change
+ * where its maximum protection has no write and the kernel answers one of two share modes for it,
+ * as xnu's osfmk/vm/vm_map.c computes them in vm_map_region_walk (lines 16088-16098 of xnu's main
+ * as read on 2026-11-20; the modes' values are osfmk/mach/vm_region.h:129-130):
+ *   - SM_PRIVATE (kRgfxAnonymousPrivate): no shadow, no copy pending, and the object held by one
+ *     reference, the region's, so no other mapping, in this process or another, reaches its
+ *     pages. None with write can be made after: a mapping or memory entry that shares the region
+ *     takes no protection the region's maximum lacks (vm_map_remap_extract, vm_map.c:18037-18058
+ *     and 18733-18734), and vm_protect's VM_PROT_COPY maps a copy in the region's place, leaving
+ *     its pages as they are (vm_map_protect, vm_map.c:5832-5905);
+ *   - SM_COW with a shadow depth of 0 (kRgfxAnonymousCopyOnWrite): a copy pending on the region's
+ *     own object, which has no object below it, as a copy of anonymous memory leaves the entries
+ *     of both sides over the one object, each with a copy pending (vm_object_copy_quickly,
+ *     osfmk/vm/vm_object.c:3586-3605; the source's entry marked at vm_map.c:12727, 14046 and
+ *     18604, for vm_copy, fork and vm_remap). The other side's write goes to a copy of the
+ *     other side's own: a write through an entry whose copy is pending shadows the entry first
+ *     (vm_map_lookup_and_lock_object, vm_map.c:14866-14897), and an entry shared from one whose
+ *     copy is pending shares a shadow of its own (vm_map_remap_extract, vm_map.c:18314-18396).
+ *     A region of shadow depth 1 or more leaves in doubt whether another mapping shares its top
+ *     object, writable, so it is neither.
+ * Every other share mode is neither (shared, truly shared, aliased within the process, empty,
+ * large pages), and so is memory whose maximum protection has write, why not a file.
+ * The one doubt SM_PRIVATE leaves: the walk takes one from the object's reference count while
+ * the object pages (vm_map.c:16002-16005), so an object two mappings hold, one of them another's
+ * with write, reads SM_PRIVATE for as long as a page-out or UPL of one of its pages runs. No
+ * query answers the count without it.
+ *
  * THE PAGES THE KEXT WIRES are the app's own, as for any pages block. A shared mapping's are the
  * file's pages. A private mapping needs a copy (xnu's vm_map_create_upl resolves it, and
  * vm_object_iopl_request faults each page into the process's private object for the wire), so the
  * wire makes the process a copy of the file's bytes, as a Mac's driver's wire of the app's memory
  * does; no one writes it after, as the process's maximum protection has no write. Either way the
- * GPU reads what the app reads, the file's bytes as of the make.
+ * GPU reads what the app reads, the file's bytes as of the make. Anonymous memory's wire, as
+ * IOMemoryDescriptor::prepare's for reading, takes the region's pending copy first
+ * (vm_map_create_upl, osfmk/vm/vm_pageout.c:7140-7188) and faults each page into the region's own
+ * object (vm_object_iopl_request, vm_pageout.c:8584-8592), which no one else holds; the bytes the
+ * GPU reads are the app's as of the make.
  *
  * COUNTS. Every make that classifies is counted (rgfxFilePagesNote): its bytes by clause, and by
  * why for memory that is neither, how long the classification took, and the unchanging blocks the
@@ -54,6 +87,11 @@ enum RgfxFileClause : uint8_t {
 	kRgfxFileMaxNoWrite = 0,
 	// A private copy-on-write mapping of the file whose maximum protection has no write.
 	kRgfxFileCopyOnWrite,
+	// Anonymous memory whose maximum protection has no write, of share mode SM_PRIVATE.
+	kRgfxAnonymousPrivate,
+	// Anonymous memory whose maximum protection has no write, of share mode SM_COW with a shadow
+	// depth of 0: a copy pending on the region's own object.
+	kRgfxAnonymousCopyOnWrite,
 	// Neither: the memory is not provably unchanging.
 	kRgfxFileNeither,
 	kRgfxFileClauses,
@@ -63,7 +101,8 @@ enum RgfxFileClause : uint8_t {
 /// carries to it.
 enum RgfxFileNeither : uint8_t {
 	kRgfxNeitherNone = RGFX_PAGES_WHY_UNSAID,
-	// Anonymous or device memory, a submap, or a region the kernel names no vnode for.
+	// Anonymous memory that is not unchanging, device memory, a submap, or a region the kernel
+	// names no vnode for.
 	kRgfxNeitherNotAFile = RGFX_PAGES_WHY_NOT_A_FILE,
 	// The range's pages lie in more than one VM region.
 	kRgfxNeitherSpansRegions = RGFX_PAGES_WHY_SPANS_REGIONS,

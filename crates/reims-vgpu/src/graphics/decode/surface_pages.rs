@@ -161,10 +161,11 @@
 //! and any other block only one whose import keeps them. The refusals above stay.
 //!
 //! **Unchanging pages** (`RGFX_SURFACE_PAGES_UNCHANGING`, `RGFX_FEATURE_UNCHANGING_PAGES`). A
-//! read-only block the guest marks unchanging holds pages its process can never write, a file's
-//! on a read-only volume (docs/graphics-kext/design.md, "Unchanging pages"): its import is asked
-//! as unchanging, copy-on-write where the guest marks it so (`RGFX_SURFACE_PAGES_COPY_ON_WRITE`,
-//! counted apart), and the platform reads its pages into the copy once, at the import's make,
+//! read-only block the guest marks unchanging holds pages its process can never write and no one
+//! else writes, a file's on a read-only volume or anonymous memory of the process's own
+//! (docs/graphics-kext/design.md, "Unchanging pages"): its import is asked as unchanging,
+//! copy-on-write where the guest marks it so (`RGFX_SURFACE_PAGES_COPY_ON_WRITE`, counted
+//! apart), and the platform reads its pages into the copy once, at the import's make,
 //! with no compare at a commit (metal2vulkan-runtime's, its `copied` module's docs, "Unchanging
 //! pages"); the GPU's writes are dropped as a read-only block's are. Such a view is cached apart
 //! again: a block takes only a cached view whose import was asked as its own would be, so a view
@@ -893,7 +894,7 @@ struct Cached<P: Platform> {
     /// The import is a block the platform knows ([`ViewImports`]).
     known: bool,
     /// How the known import was asked ([`ViewImports`]): read-only, its GPU writes dropped, for a
-    /// read-only pages block, and unchanging, read once, for one of a file's unchanging pages
+    /// read-only pages block, and unchanging, read once, for one of unchanging pages
     /// (the module doc, "Addresses the host gives", "Unchanging pages"); `Writable` for every
     /// other import.
     access: PagesAccess,
@@ -5221,9 +5222,9 @@ pub(super) mod tests {
         assert_eq!(forgotten, [IMPORTS, read_only_at, writable_at], "forgotten");
     }
 
-    /// A pages block marked unchanging (`RGFX_SURFACE_PAGES_UNCHANGING`, a file's own pages that
-    /// never change) has its view's known import asked as unchanging, copy-on-write where it is
-    /// marked so, which the platform reads once; its view, cached at its release, is taken by a
+    /// A pages block marked unchanging (`RGFX_SURFACE_PAGES_UNCHANGING`, pages that never change)
+    /// has its view's known import asked as unchanging, copy-on-write where it is marked so, which
+    /// the platform reads once; its view, cached at its release, is taken by a
     /// later block over the same runs that is marked the same, at the same address, and by no
     /// block that is only read-only, which gets an import of its own. A block marked unchanging
     /// and not read-only, or copy-on-write and not unchanging, is refused as an invalid argument

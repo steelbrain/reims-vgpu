@@ -12,14 +12,15 @@
 // (rgfxPagesWiring).
 //
 // Memory the bundle names unchanging (kRgfxPagesUnchanging) takes a block where the guest took
-// RGFX_FEATURE_UNCHANGING_PAGES too: read-only memory its process can never write, a file's pages on
-// a read-only volume mapped with no write in the mapping's maximum protection, as the bundle finds
-// it at the call (its RgfxFilePages.hpp). It is the app's own memory, wired for reading as any
-// read-only memory is: a shared mapping's pages are the file's own, and a private copy-on-write
-// one's are copied for the process by the wire, as IOMemoryDescriptor::prepare's
-// vm_map_create_upl resolves the entry's copy and vm_object_iopl_request faults each page into
-// the process's own object (read from xnu's vm_map.c and vm_upl.c), as a Mac's driver's wire of an
-// app's memory does; the process can write neither. The block's SURFACE_PAGES is marked
+// RGFX_FEATURE_UNCHANGING_PAGES too: read-only memory its process can never write and no one else
+// writes, mapped with no write in the mapping's maximum protection, a file's pages on a read-only
+// volume or anonymous memory of the process's own, as the bundle finds it at the call (its
+// RgfxFilePages.hpp). It is the app's own memory, wired for reading as any read-only memory is: a
+// shared mapping's pages are the file's own, and a private copy-on-write one's are copied for the
+// process by the wire, as IOMemoryDescriptor::prepare's vm_map_create_upl resolves the entry's
+// copy and vm_object_iopl_request faults each page into the process's own object (read from
+// xnu's osfmk/vm/vm_pageout.c, which holds both), as a Mac's driver's wire of an app's memory
+// does; the process can write neither. The block's SURFACE_PAGES is marked
 // RGFX_SURFACE_PAGES_UNCHANGING, and RGFX_SURFACE_PAGES_COPY_ON_WRITE where the bundle names the
 // memory so too, for the host to read the pages once. Read-only memory not named unchanging may
 // carry why not (kRgfxPagesWhyShift, the RGFX_PAGES_WHY_* values), which the block's SURFACE_PAGES

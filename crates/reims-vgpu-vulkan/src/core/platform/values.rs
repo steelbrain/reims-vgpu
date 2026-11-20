@@ -62,13 +62,14 @@ pub enum PagesAccess {
     /// which it writes.
     ReadOnly,
     /// Mapped read-only, with no write in the mapping's maximum protection, and the pages are a
-    /// file's bytes on a volume mounted read-only, which no one writes while the block lives
-    /// (`RGFX_SURFACE_PAGES_UNCHANGING`, the guest's word): the import drops the GPU's writes and
-    /// reads the pages once, as it is made. `copy_on_write` where the process maps the file
-    /// private and copy-on-write (`RGFX_SURFACE_PAGES_COPY_ON_WRITE`): the block's pages are then
-    /// the process's copy of the file's bytes, which the guest's wire of them made.
+    /// file's bytes on a volume mounted read-only or anonymous memory of the process's own, which
+    /// no one writes while the block lives (`RGFX_SURFACE_PAGES_UNCHANGING`, the guest's word):
+    /// the import drops the GPU's writes and reads the pages once, as it is made. `copy_on_write`
+    /// where the process maps the file, or the anonymous memory, private and copy-on-write
+    /// (`RGFX_SURFACE_PAGES_COPY_ON_WRITE`): the block's pages are then the process's copy of the
+    /// bytes, which the guest's wire of them made.
     Unchanging {
-        /// The process maps the file's bytes private and copy-on-write.
+        /// The process maps the bytes private and copy-on-write.
         copy_on_write: bool,
     },
 }

@@ -258,9 +258,9 @@ public:
 	/// kRgfxPagesUnchanging, kRgfxPagesCopyOnWrite and kRgfxPagesWhyShift): none of them for
 	/// memory the process may not write; kPagesWritable for memory it may; kPagesUnchanging for
 	/// read-only memory that cannot change (RgfxFilePages.hpp), with kPagesCopyOnWrite where the
-	/// app maps it private and copy-on-write; and for read-only memory not named unchanging, why
-	/// not in the bits from kPagesWhyShift (RGFX_PAGES_WHY_*, a diagnostic the host counts its
-	/// copies by).
+	/// app maps it private and copy-on-write (a file's, or anonymous memory with a copy pending);
+	/// and for read-only memory not named unchanging, why not in the bits from kPagesWhyShift
+	/// (RGFX_PAGES_WHY_*, a diagnostic the host counts its copies by).
 	static const uint32_t kPagesWritable = 1u << 0;
 	static const uint32_t kPagesUnchanging = 1u << 1;
 	static const uint32_t kPagesCopyOnWrite = 1u << 2;

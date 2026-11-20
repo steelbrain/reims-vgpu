@@ -1793,8 +1793,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// one marked [`RGFX_SURFACE_PAGES_READ_ONLY`] too a block of pages its process maps read-only,
     /// which nothing over it writes (one so marked that is no pages block is
     /// [`RGFX_STATUS_INVALID_ARGUMENT`]), and one marked [`RGFX_SURFACE_PAGES_UNCHANGING`] with it
-    /// a block of a file's own pages that never change, which the platform's known import reads
-    /// once, [`RGFX_SURFACE_PAGES_COPY_ON_WRITE`] saying the process maps them copy-on-write (one
+    /// a block of pages that never change, which the platform's known import reads once,
+    /// [`RGFX_SURFACE_PAGES_COPY_ON_WRITE`] saying the process maps them copy-on-write (one
     /// marked unchanging and not read-only, or copy-on-write and not unchanging, is
     /// [`RGFX_STATUS_INVALID_ARGUMENT`]); else
     /// one marked [`RGFX_SURFACE_PAGES_CACHED`] may be given a device cache, and with it one
