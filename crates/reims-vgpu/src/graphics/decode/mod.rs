@@ -3084,9 +3084,7 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// The device caches, locked (for the tests).
     #[cfg(test)]
-    pub(crate) fn caches(
-        &self,
-    ) -> reims_vgpu_vulkan::core::sync::MutexGuard<'_, surface_cache::SurfaceCaches<P>> {
+    pub(crate) fn caches(&self) -> surface_cache::Locked<'_, P> {
         self.surface_caches.lock()
     }
 

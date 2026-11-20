@@ -197,7 +197,9 @@
 //!   asked while such a buffer is still walked (begun and not committed) is made in that buffer's
 //!   finish, and a buffer begun after it that reads what it writes, or writes what it reads,
 //!   waits for it on the GPU, on the cache's own event ([`Caches`]): no begin of a buffer, no
-//!   present and no ring-0 copy waits on the CPU for another queue's walk.
+//!   present and no ring-0 copy waits on the CPU for another queue's walk. Each copy's command
+//!   buffer is encoded under the caches' lock and committed once the lock is let go of, in the
+//!   order encoded, so the transfer event's values are signalled in order ([`Commits`]).
 //! - **Releases' pace.** A release's copy into the pages waits for its turn ([`ReleasePace`]):
 //!   until the last release's copy has landed, and as long again as that copy held the GPU has
 //!   passed, so a burst of releases leaves the GPU to other work between its copies and takes at
@@ -401,7 +403,8 @@
 use std::any::Any;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::ops::Range;
+use std::cell::Cell;
+use std::ops::{Deref, DerefMut, Range};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -1077,7 +1080,7 @@ impl<P: Platform> Reserve<P> {
             .spares
             .pieces(device, &self.lens, self.first, self.timed.as_ref());
         if let Ok(Some(pieces)) = made {
-            let mut state = caches.state.lock();
+            let mut state = caches.lock();
             state.reserved.entry(block).or_default().extend(pieces);
         }
     }
@@ -1130,7 +1133,7 @@ impl<P: Platform> ReleasePace<P> {
 
     /// A turn taken at once, where one may be ([`turn_at`]) and no release waits for its own.
     fn turn_now(self: &Arc<Self>, now: &Now) -> Option<Turn<P>> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         if !state.waiting.is_empty()
             || turn_at(state.turns, state.last.as_ref(), now()) != TurnAt::Now
         {
@@ -1267,7 +1270,7 @@ impl<P: Platform> ReleasePace<P> {
     /// timed from its landing, on `now`'s clock ([`turn_at`]), which wakes the pace's thread.
     fn copied(self: &Arc<Self>, copy: Arc<Landing>, now: Now) {
         let id = Arc::as_ptr(&copy) as usize;
-        self.state.lock().last = Some(LastCopy {
+        self.lock().last = Some(LastCopy {
             copy: Arc::clone(&copy),
             landed: None,
         });
@@ -1864,6 +1867,9 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     early: bool,
     by_block: HashMap<u64, SurfaceCache<P>>,
     transfer: Option<Transfer<P>>,
+    /// The transfer queue's command buffers encoded whole under the caches' lock and not yet
+    /// committed, in the order encoded: committed once the lock is let go of ([`Commits`]).
+    owed_commits: Vec<P::CommandBuffer>,
     /// Each command queue's end event, by the queue's id, and the last value signalled: made with
     /// the queue ([`Caches::queue_made`]), or at its first buffer that uses a cache where it was
     /// not; let go of once the queue is gone and no cache names it any more
@@ -2140,6 +2146,7 @@ impl<P: Platform> SurfaceCaches<P> {
             early: true,
             by_block: HashMap::new(),
             transfer: None,
+            owed_commits: Vec::new(),
             ends: HashMap::new(),
             gone: HashSet::new(),
             watched,
@@ -2717,7 +2724,7 @@ impl<P: Platform> SurfaceCaches<P> {
             ON,
             Box::new(move |_: CompletedInfo| fills.finished(value)),
         )?;
-        cb.commit(ON)?;
+        self.owed_commits.push(cb);
         Ok(Some(value))
     }
 
@@ -4077,13 +4084,13 @@ impl<P: Platform> SurfaceCaches<P> {
     ) {
         let signalled = refusing(|| {
             if !self.make_transfer(device)? {
-                return Ok(false);
+                return Ok(None);
             }
             let Some(transfer) = self.transfer.as_ref() else {
-                return Ok(false);
+                return Ok(None);
             };
             let Some(cb) = transfer.queue.command_buffer(ON)? else {
-                return Ok(false);
+                return Ok(None);
             };
             if number > 1 {
                 cb.encode_wait(Some(EventRef::Shared(event)), number - 1)?;
@@ -4102,9 +4109,9 @@ impl<P: Platform> SurfaceCaches<P> {
                 cb.encode_wait(Some(EventRef::Event(&transfer.event)), out.value)?;
             }
             cb.encode_signal(Some(EventRef::Shared(event)), number)?;
-            cb.commit(ON)?;
-            Ok(true)
+            Ok(Some(cb))
         });
+        let signalled = signalled.map(|cb| cb.map(|cb| self.owed_commits.push(cb)).is_some());
         if !matches!(signalled, Ok(true)) {
             log::warn!(
                 target: "reims_vgpu::graphics",
@@ -4422,7 +4429,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 fills.finished(value)
             }),
         )?;
-        cb.commit(ON)?;
+        self.owed_commits.push(cb);
         if signal.is_some() {
             self.signal_with = None;
         }
@@ -4482,7 +4489,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 fills.finished(value)
             }),
         )?;
-        cb.commit(ON)?;
+        self.owed_commits.push(cb);
         if signal.is_some() {
             self.signal_with = None;
         }
@@ -4924,7 +4931,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| drop(held)))?;
             }
         }
-        cb.commit(ON)?;
+        self.owed_commits.push(cb);
         if let Some(trace) = trace {
             trace.made(users, &landing);
         }
@@ -5174,6 +5181,8 @@ impl Unlocked {
 /// it.
 pub(crate) struct Caches<P: Platform> {
     state: Mutex<SurfaceCaches<P>>,
+    /// The transfer queue's commits, made with `state`'s lock let go of ([`Locked`]).
+    commits: Commits<P>,
     /// What a begin reads of `state` without its lock ([`Self::before_answering`]).
     unlocked: Arc<Unlocked>,
     /// The turns of the releases' copies into their pages ([`ReleasePace`]).
@@ -5454,7 +5463,7 @@ impl<P: Platform> Drop for Answering<'_, P> {
         if self.blocks.is_empty() {
             return;
         }
-        let mut state = self.caches.state.lock();
+        let mut state = self.caches.lock();
         for block in &self.blocks {
             state.answering.remove(block);
         }
@@ -5537,7 +5546,7 @@ impl<P: Platform> Drop for Uses<P> {
             return;
         }
         let tell = {
-            let mut state = self.caches.state.lock();
+            let mut state = self.caches.lock();
             state.unhold(&self.blocks);
             state.take_tell()
         };
@@ -5559,6 +5568,160 @@ fn by_block<'u>(
     out
 }
 
+/// The transfer queue's command buffers, committed with the caches' lock let go of: each one a
+/// copy encodes whole under the lock is owed its commit ([`SurfaceCaches::owed_commits`]), handed
+/// here in the order encoded as the lock is let go of ([`Locked`]), and committed then, in that
+/// order, by the first thread to take [`Self::committing`], so the transfer event's values are
+/// signalled in order. A commit runs the platform's work at it, a sync of the guest's pages it
+/// imported as copies among it (2.4 ms a commit and up to 9.4 ms on the Radeon 780M host, at most
+/// 0.1 ms of it rt's own commit: **measured** 2026-11-19, a macOS guest's desktop walk, job
+/// m3-max-55211), which under the lock held every begin of a buffer that uses a cache.
+struct Commits<P: Platform> {
+    /// Owed, in the order encoded.
+    owed: Mutex<VecDeque<P::CommandBuffer>>,
+    /// Held while committing, so the commits are made in the order owed.
+    committing: Mutex<()>,
+}
+
+thread_local! {
+    /// Whether this thread is committing the transfer queue's command buffers
+    /// ([`Commits::commit_owed`]): a handler a commit runs on it that lets go of the caches' lock
+    /// leaves what it owes to that commit's loop, which takes it next.
+    static COMMITTING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks this thread committing ([`COMMITTING`]) until dropped.
+struct CommittingHere;
+
+impl CommittingHere {
+    fn mark() -> CommittingHere {
+        COMMITTING.set(true);
+        CommittingHere
+    }
+}
+
+impl Drop for CommittingHere {
+    fn drop(&mut self) {
+        COMMITTING.set(false);
+    }
+}
+
+impl<P: Platform> Commits<P> {
+    fn new() -> Self {
+        Commits {
+            owed: Mutex::new(VecDeque::new()),
+            committing: Mutex::new(()),
+        }
+    }
+
+    /// Hands over `owed`, encoded under the caches' lock, which the caller holds: after those
+    /// handed over before it.
+    fn owe(&self, owed: Vec<P::CommandBuffer>) {
+        if !owed.is_empty() {
+            self.owed.lock().extend(owed);
+        }
+    }
+
+    /// Commits every command buffer owed, in order, once a commit on another thread ends: those
+    /// it hands over meanwhile among them. A refusal is logged where it was returned. Nothing on
+    /// a thread already committing them.
+    fn commit_owed(&self) {
+        if COMMITTING.get() || self.owed.lock().is_empty() {
+            return;
+        }
+        let _turn = self.committing.lock();
+        let _here = CommittingHere::mark();
+        loop {
+            let next = self.owed.lock().pop_front();
+            let Some(cb) = next else {
+                break;
+            };
+            if let Err(raise) = cb.commit(ON) {
+                log::warn!(
+                    target: "reims_vgpu::graphics", kind:% = raise;
+                    "a copy of the IOSurface device caches on the transfer queue was not \
+                     committed: the platform raised at its commit ({raise:?})"
+                );
+            }
+        }
+    }
+}
+
+/// The caches' lock, held ([`Caches::lock`]). As it is let go of, the transfer queue's command
+/// buffers encoded under it are handed over and committed ([`Commits`]); so are they before a
+/// wait on it ([`Self::wait`]) and before work with it let go of ([`Self::unlocked`]), so
+/// nothing waits for a copy its own thread owes.
+pub(crate) struct Locked<'a, P: Platform> {
+    /// `None` only as it is let go of.
+    guard: Option<MutexGuard<'a, SurfaceCaches<P>>>,
+    commits: &'a Commits<P>,
+}
+
+impl<P: Platform> Deref for Locked<'_, P> {
+    type Target = SurfaceCaches<P>;
+
+    fn deref(&self) -> &SurfaceCaches<P> {
+        match &self.guard {
+            Some(guard) => guard,
+            None => unreachable!("the caches' lock is held until let go of"),
+        }
+    }
+}
+
+impl<P: Platform> DerefMut for Locked<'_, P> {
+    fn deref_mut(&mut self) -> &mut SurfaceCaches<P> {
+        match &mut self.guard {
+            Some(guard) => guard,
+            None => unreachable!("the caches' lock is held until let go of"),
+        }
+    }
+}
+
+impl<P: Platform> Locked<'_, P> {
+    /// Hands over the command buffers owed their commits under the lock; whether there were any.
+    fn hand_over(&mut self) -> bool {
+        let owed = std::mem::take(&mut self.owed_commits);
+        let any = !owed.is_empty();
+        self.commits.owe(owed);
+        any
+    }
+
+    /// `f` with the lock let go of, the commits owed made first ([`Commits::commit_owed`]).
+    pub(crate) fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        self.hand_over();
+        let commits = self.commits;
+        match &mut self.guard {
+            Some(guard) => MutexGuard::unlocked(guard, || {
+                commits.commit_owed();
+                f()
+            }),
+            None => unreachable!("the caches' lock is held until let go of"),
+        }
+    }
+
+    /// Waits on `moved` with the lock let go of, as `Condvar::wait`, and may wake without
+    /// cause, as it does; where this thread owes commits, makes them with the lock let go of
+    /// instead, and returns.
+    fn wait(&mut self, moved: &Condvar) {
+        if self.hand_over() {
+            self.unlocked(|| ());
+            return;
+        }
+        match &mut self.guard {
+            Some(guard) => moved.wait(guard),
+            None => unreachable!("the caches' lock is held until let go of"),
+        }
+    }
+}
+
+impl<P: Platform> Drop for Locked<'_, P> {
+    fn drop(&mut self) {
+        self.hand_over();
+        drop(self.guard.take());
+        self.commits.commit_owed();
+    }
+}
+
 impl<P: Platform> Caches<P> {
     /// No caches.
     pub(crate) fn new() -> Self {
@@ -5569,6 +5732,7 @@ impl<P: Platform> Caches<P> {
                 Arc::clone(&on_fill_done),
                 Arc::clone(&unlocked),
             )),
+            commits: Commits::new(),
             unlocked,
             pace: Arc::new(ReleasePace::new()),
             moved: Condvar::new(),
@@ -5586,7 +5750,7 @@ impl<P: Platform> Caches<P> {
     pub(crate) fn set_shapes(&self, maker: ShapeMaker<P>, places: bool) {
         if self.shape_maker.set(maker).is_ok() {
             self.shapes_placed.store(places, Ordering::Release);
-            self.state.lock().shaped = true;
+            self.lock().shaped = true;
         }
     }
 
@@ -5600,7 +5764,7 @@ impl<P: Platform> Caches<P> {
     /// `gate` ([`Spares`]): set once, at the device's make, before any cache.
     pub(crate) fn set_staged(&self, now: Now, gate: Arc<RwLock<()>>) {
         let spares = Arc::new(Spares::new(SPARE_BYTES, PIECE, gate));
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         state.staged = Some(now);
         let was = std::mem::replace(&mut state.spares, spares);
         drop(state);
@@ -5612,7 +5776,7 @@ impl<P: Platform> Caches<P> {
     /// spare, in place of rt's unit ([`PIECE`]): a test's surfaces are shorter than it.
     #[cfg(test)]
     pub(crate) fn set_staging_piece(&self, piece: u64) {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let gate = Arc::clone(&state.spares.gate);
         let was = std::mem::replace(
             &mut state.spares,
@@ -5649,7 +5813,7 @@ impl<P: Platform> Caches<P> {
         desc: &TextureDesc,
     ) -> Option<Held<P::Texture>> {
         let maker = self.shape_maker.get()?;
-        match self.state.lock().find_shape(block, &key) {
+        match self.lock().find_shape(block, &key) {
             None => return None,
             Some(Some(found)) => return Some(found),
             Some(None) => {}
@@ -5666,10 +5830,10 @@ impl<P: Platform> Caches<P> {
             return placed;
         }
         let Some(image) = maker(device, desc, false) else {
-            self.state.lock().counts.shapes.images_refused += 1;
+            self.lock().counts.shapes.images_refused += 1;
             return None;
         };
-        let (shape, gone) = self.state.lock().add_shape(block, key, image);
+        let (shape, gone) = self.lock().add_shape(block, key, image);
         let_go_of_shapes(block, gone);
         shape
     }
@@ -5679,7 +5843,7 @@ impl<P: Platform> Caches<P> {
     /// and not finished uses it and no copy of it waits, so a use now would fill its shapes at
     /// once. Counted where not ([`ShapeCounts::unplaced_busy`]).
     fn fills_at_once(&self, block: u64) -> bool {
-        let mut st = self.state.lock();
+        let mut st = self.lock();
         if !st.by_block.contains_key(&block) {
             return false;
         }
@@ -5708,7 +5872,7 @@ impl<P: Platform> Caches<P> {
         key: ShapeKey,
         image: P::Texture,
     ) -> Option<Option<Held<P::Texture>>> {
-        let mut st = self.state.lock();
+        let mut st = self.lock();
         let bytes = key.bytes();
         match st.find_shape(block, &key) {
             None => {
@@ -5763,20 +5927,20 @@ impl<P: Platform> Caches<P> {
 
     /// A count of the per-shape form's, `count` picking it ([`ShapeCounts`]).
     pub(crate) fn count_shapes(&self, count: impl FnOnce(&mut ShapeCounts)) {
-        count(&mut self.state.lock().counts.shapes);
+        count(&mut self.lock().counts.shapes);
     }
 
     /// In the default form, a reference to the shape `key` the per-shape form would make over the
     /// block at `block`'s cache ([`SurfaceCaches::shadow_shape`]), for the counts alone.
     pub(crate) fn shadow_shape(&self, block: u64, key: &ShapeKey) -> Option<shapes::ShapeRef> {
-        self.state.lock().shadow_shape(block, key)
+        self.lock().shadow_shape(block, key)
     }
 
     /// Whether the transfer queue and the end events are made with the command queues
     /// ([`Self::queue_made`]): not where the host's GPU shares the CPU's memory, whose first copy
     /// makes them.
     pub(crate) fn set_early(&self, early: bool) {
-        self.state.lock().early = early;
+        self.lock().early = early;
     }
 
     /// Has each fill tell `hook` as it finishes, after the threads waiting for it are woken: the
@@ -5796,7 +5960,7 @@ impl<P: Platform> Caches<P> {
     /// semaphores).
     pub(crate) fn queue_made(&self, device: &P::Device, queue: u64) -> RaiseResult<()> {
         let (early, transfer, read_back) = {
-            let state = self.state.lock();
+            let state = self.lock();
             (
                 state.early,
                 state.transfer.is_some(),
@@ -5817,7 +5981,7 @@ impl<P: Platform> Caches<P> {
             false => device.new_event(ON)?,
         };
         let swept = {
-            let mut state = self.state.lock();
+            let mut state = self.lock();
             // A queue of the same id is the queue's again, whose event it takes on.
             state.gone.remove(&queue);
             // Kept only where no buffer's begin or finish made the same meanwhile; else let go of
@@ -5855,7 +6019,7 @@ impl<P: Platform> Caches<P> {
     /// once no cache names it, and so do the other gone queues' that none names any more
     /// ([`SurfaceCaches::queue_ended`]), let go of with no lock held. A refusal is logged.
     pub(crate) fn queue_ended(&self, queue: u64) {
-        let ends = self.state.lock().queue_ended(queue);
+        let ends = self.lock().queue_ended(queue);
         if ends.is_empty() {
             return;
         }
@@ -5868,25 +6032,38 @@ impl<P: Platform> Caches<P> {
         }
     }
 
-    /// The caches, locked: for what orders nothing against command buffers' uses.
-    pub(crate) fn lock(&self) -> MutexGuard<'_, SurfaceCaches<P>> {
-        self.state.lock()
+    /// The caches, locked: for what orders nothing against command buffers' uses. The transfer
+    /// queue's command buffers encoded under the lock are committed as it is let go of
+    /// ([`Locked`]).
+    pub(crate) fn lock(&self) -> Locked<'_, P> {
+        Locked {
+            guard: Some(self.state.lock()),
+            commits: &self.commits,
+        }
+    }
+
+    /// [`Self::lock`] where no other thread holds the lock; `None` where one does.
+    fn try_lock(&self) -> Option<Locked<'_, P>> {
+        Some(Locked {
+            guard: Some(self.state.try_lock()?),
+            commits: &self.commits,
+        })
     }
 
     /// The identity of the cache of the block at `block` ([`SurfaceCaches::identity`]).
     pub(crate) fn identity(&self, block: u64) -> Option<MemoryIdentity> {
-        self.state.lock().identity(block)
+        self.lock().identity(block)
     }
 
     /// Whether the block at `block` has a cache.
     pub(crate) fn has(&self, block: u64) -> bool {
-        self.state.lock().has(block)
+        self.lock().has(block)
     }
 
     /// The block at `block`'s cache's layout at the GPU's pitch, where it lays its surface out so
     /// ([`SurfaceCaches::repitched`]).
     pub(crate) fn repitched(&self, block: u64) -> Option<Arc<Repitched>> {
-        self.state.lock().repitched(block)
+        self.lock().repitched(block)
     }
 
     /// The block at `block`'s wide home, made where it has none ([`SurfaceCaches::wide_home`]).
@@ -5895,7 +6072,7 @@ impl<P: Platform> Caches<P> {
         device: &P::Device,
         block: u64,
     ) -> RaiseResult<Option<(P::Buffer, bool)>> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         state.after_recovery(device);
         let home = state.wide_home(device, block)?;
         if home.is_some() {
@@ -5912,7 +6089,7 @@ impl<P: Platform> Caches<P> {
     /// The fence an encoder that may have written a laid-out cache or its wide home updates as
     /// it ends ([`SurfaceCaches::writes_fence`]).
     pub(crate) fn writes_fence(&self, device: &P::Device) -> RaiseResult<Option<P::Fence>> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         state.after_recovery(device);
         state.writes_fence(device)
     }
@@ -5925,7 +6102,7 @@ impl<P: Platform> Caches<P> {
         cb: &P::CommandBuffer,
         written: &[(u64, bool)],
     ) -> RaiseResult<()> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         for &(block, from_home) in written {
             state.reconcile(cb, block, from_home)?;
         }
@@ -5937,7 +6114,7 @@ impl<P: Platform> Caches<P> {
     /// updates the writers' fence as it ends, which rule 1's copies wait for
     /// ([`Self::reconcile_shapes`]).
     pub(crate) fn shares_plane(&self, written: &[(u64, shapes::ShapeRef)]) -> bool {
-        !written.is_empty() && self.state.lock().shares_plane(written)
+        !written.is_empty() && self.lock().shares_plane(written)
     }
 
     /// An encoder just ended in command buffer `cb` that may have written the shapes `written`,
@@ -5954,7 +6131,7 @@ impl<P: Platform> Caches<P> {
         blocks.dedup();
         let mut gone = Vec::new();
         {
-            let mut state = self.state.lock();
+            let mut state = self.lock();
             for block in blocks {
                 let ids: Vec<u64> = (written.iter())
                     .filter(|(b, _)| *b == block)
@@ -5979,7 +6156,7 @@ impl<P: Platform> Caches<P> {
     /// the guest's messages carried out before it have ended.
     pub(crate) fn reset(&self) {
         let tell = {
-            let mut state = self.state.lock();
+            let mut state = self.lock();
             state.reset();
             state.take_tell()
         };
@@ -6002,7 +6179,7 @@ impl<P: Platform> Caches<P> {
     /// device's video imports caches. The video writes only two-plane surfaces (NV12, P010), so
     /// a cache of one plane, or of a surface no layout gave, is made as any other cache.
     pub(crate) fn set_exportable(&self) {
-        self.state.lock().exportable = true;
+        self.lock().exportable = true;
     }
 
     /// Makes each laid-out cache of two planes from now on with its memory a dma-buf where the
@@ -6017,7 +6194,7 @@ impl<P: Platform> Caches<P> {
     /// 2026-11-09, a macOS 12.7.6 guest's Safari scroll on a Radeon 780M, whose caches all have
     /// one plane).
     pub(crate) fn set_dma_buf(&self) {
-        self.state.lock().dma_buf = true;
+        self.lock().dma_buf = true;
     }
 
     /// Makes each laid-out cache of two planes from now on a cache for the host's video whose
@@ -6027,47 +6204,47 @@ impl<P: Platform> Caches<P> {
     /// P010), so a cache of one plane is made as any other laid-out cache.
     #[cfg(windows)]
     pub(crate) fn set_drawn(&self, draw: Arc<reims_vgpu_video::vaapi::PlaneDraw>) {
-        self.state.lock().drawn = Some(draw);
+        self.lock().drawn = Some(draw);
     }
 
     /// The draws of the host's video's pictures into Direct3D 11 textures, where they were set
     /// ([`Self::set_drawn`]).
     #[cfg(windows)]
     fn drawn(&self) -> Option<Arc<reims_vgpu_video::vaapi::PlaneDraw>> {
-        self.state.lock().drawn.clone()
+        self.lock().drawn.clone()
     }
 
     /// Sets the bytes deferred blocks' caches may hold at once (the device's `DEFERRED_BUDGET`,
     /// read once at its start); 0, as at the caches' make, defers none.
     pub(crate) fn set_deferred_budget(&self, budget: u64) {
-        self.state.lock().set_deferred_budget(budget);
+        self.lock().set_deferred_budget(budget);
     }
 
     /// Sets the bytes every cache may hold at once, deferred or not, on a device whose GPU shares
     /// the CPU's memory (the module doc, "Within a budget"): set once, at the device's make.
     pub(crate) fn set_cache_budget(&self, budget: u64) {
-        self.state.lock().set_cache_budget(budget);
+        self.lock().set_cache_budget(budget);
     }
 
     /// Has a deferred block ask with its surface's layout from now on
     /// ([`SurfaceCaches::set_deferred_asks`]): set once, at the device's make.
     pub(crate) fn set_deferred_asks(&self) {
-        self.state.lock().set_deferred_asks();
+        self.lock().set_deferred_asks();
     }
 
     /// Has a deferral carry its surface's resident pages from now on
     /// ([`SurfaceCaches::set_deferred_carries`]): set once, at the device's make.
     pub(crate) fn set_deferred_carries(&self) {
-        self.state.lock().set_deferred_carries();
+        self.lock().set_deferred_carries();
     }
 
     /// Waits, letting the lock go meanwhile, while a command buffer begun and not finished that
     /// may write the block at `block`'s cache is, or a copy of it asked waits for command buffers
     /// ([`SurfaceCaches::deferred`]): for the block's pages named again, whose buffers made on
     /// ring 0 after it lie over what it leaves.
-    fn wait_copies(&self, state: &mut MutexGuard<'_, SurfaceCaches<P>>, block: u64) {
+    fn wait_copies(&self, state: &mut Locked<'_, P>, block: u64) {
         while state.pending(block, true) > 0 || state.deferring(block) {
-            self.moved.wait(state);
+            state.wait(&self.moved);
         }
     }
 
@@ -6130,9 +6307,9 @@ impl<P: Platform> Caches<P> {
             }
             return Ok((false, false, None));
         }
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         while (uses.iter()).any(|u| state.answering.contains(&u.block_offset)) {
-            self.moved.wait(&mut state);
+            state.wait(&self.moved);
         }
         // Let go of as the begin ends, however it ends (a raise, or a panic its caller catches),
         // so no later begin waits for good.
@@ -6147,7 +6324,7 @@ impl<P: Platform> Caches<P> {
                 state.answering.extend(answered.blocks.iter().copied());
                 drop(state);
                 answer();
-                state = self.state.lock();
+                state = self.lock();
             }
         }
         let before = self.before_locked(state, device, cb, uses, reach);
@@ -6160,7 +6337,7 @@ impl<P: Platform> Caches<P> {
     /// [`Self::before_answering`] from its lock on, `state`, which it lets go of.
     fn before_locked<'a>(
         self: &'a Arc<Self>,
-        mut state: MutexGuard<'a, SurfaceCaches<P>>,
+        mut state: Locked<'a, P>,
         device: &P::Device,
         cb: &P::CommandBuffer,
         uses: &[RgfxOpSurfaceUse],
@@ -6204,14 +6381,14 @@ impl<P: Platform> Caches<P> {
                 if !std::mem::replace(&mut waited, true) {
                     state.counts.cpu_waits += 1;
                 }
-                self.moved.wait(&mut state);
+                state.wait(&self.moved);
                 continue;
             }
             drop(state);
             let made: Vec<_> = (make.into_iter())
                 .map(|block| (block, device.new_shared_event()))
                 .collect();
-            state = self.state.lock();
+            state = self.lock();
             for (block, event) in made {
                 if let Some(event) = event
                     && let Some(event) = state.give_event(block, event)
@@ -6280,7 +6457,7 @@ impl<P: Platform> Caches<P> {
         &self,
         mut uses: impl Iterator<Item = RgfxOpSurfaceUse>,
     ) -> Option<bool> {
-        let mut state = self.state.try_lock()?;
+        let mut state = self.try_lock()?;
         let (mut cached, mut busy) = (false, false);
         let none = uses.all(|u| {
             cached |= state.has(u.block_offset);
@@ -6344,7 +6521,7 @@ impl<P: Platform> Caches<P> {
         commit: impl FnOnce() -> RaiseResult<()>,
     ) -> RaiseResult<()> {
         let signalled = {
-            let mut state = self.state.lock();
+            let mut state = self.lock();
             let unseen: Vec<u64> = (uses.blocks.iter())
                 .filter(|c| c.writes && !uses.seen.contains(&c.block))
                 .map(|c| c.block)
@@ -6355,7 +6532,7 @@ impl<P: Platform> Caches<P> {
             state.after(device, queue, cb, &uses.blocks)
         };
         let done = signalled.and_then(|()| commit());
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         state.after_recovery(device);
         // The read-back queue runs its copies in order, so one behind a buffer that waits for a
         // deferred copy not yet made would hold every copy after it there, one of which that
@@ -6396,7 +6573,7 @@ impl<P: Platform> Caches<P> {
         block: u64,
         generation: u64,
     ) -> RaiseResult<Option<FillWait>> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         state.after_recovery(device);
         state.touch_shapes(block);
         if !state.needs_fill_at(block, generation) {
@@ -6431,7 +6608,7 @@ impl<P: Platform> Caches<P> {
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         // The pieces a staged copy of its cache would make for want of a spare are made with the
         // lock let go of, and reserved for the block (the module doc, "Staged copies").
         if state.release_may_copy(block, false)
@@ -6462,7 +6639,7 @@ impl<P: Platform> Caches<P> {
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) -> bool {
-        let Some(mut state) = self.state.try_lock() else {
+        let Some(mut state) = self.try_lock() else {
             return false;
         };
         if state.copies_now(block) {
@@ -6483,7 +6660,7 @@ impl<P: Platform> Caches<P> {
     /// ([`SurfaceCaches::downloaded_now`]), the caches' lock tried, which the caller then answers.
     /// Allocates and frees nothing.
     pub(crate) fn try_downloaded(&self, block: u64) -> bool {
-        let Some(mut state) = self.state.try_lock() else {
+        let Some(mut state) = self.try_lock() else {
             return false;
         };
         let done = state.downloaded_now(block);
@@ -6523,7 +6700,7 @@ impl<P: Platform> Caches<P> {
         // pages waits for from here, while the copy waits for the buffers that write the cache,
         // and for its turn.
         let (done, failed, may_copy, reserve) = {
-            let mut state = self.state.lock();
+            let mut state = self.lock();
             let may_copy = state.release_may_copy(block, unheld);
             let lacking = may_copy.then(|| state.lacking(block, Way::Out)).flatten();
             let reserve = lacking.map(|(lens, first)| Reserve {
@@ -6595,7 +6772,7 @@ impl<P: Platform> Caches<P> {
     /// ([`SurfaceCaches::follow`]), as one begun after the copy, which the ring-0 thread that
     /// asked for it made before going on, was ordered after it.
     fn after_writers(&self, device: &P::Device, block: u64, op: CopyOut<P>) {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         state.after_writers(device, block, op);
         drop(state);
         self.moved.notify_all();
@@ -6612,7 +6789,7 @@ impl<P: Platform> Caches<P> {
         block: u64,
         done: Box<dyn FnOnce() + Send>,
     ) -> RaiseResult<Option<SurfaceCache<P>>> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         self.wait_copies(&mut state, block);
         state.released(device, block, 0, None, None, done, None)
     }
@@ -6676,7 +6853,7 @@ impl<P: Platform> Caches<P> {
         layout: CacheLayout,
         pages: impl FnOnce() -> RaiseResult<Option<CachePages<P>>>,
     ) -> RaiseResult<bool> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         self.wait_copies(&mut state, block);
         if state.keeps(block, length, &host_pages) {
             return state.named_again(device, block, generation);
@@ -6695,7 +6872,7 @@ impl<P: Platform> Caches<P> {
                 Ok(Made { cache, pages })
             })
         });
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         self.wait_copies(&mut state, block);
         let taken = state.make_with(
             device, block, length, host_pages, generation, layout, &mut made,
@@ -6724,12 +6901,12 @@ impl<P: Platform> Caches<P> {
         host_pages: Vec<Range<u64>>,
     ) -> RaiseResult<bool> {
         let (room, maker) = {
-            let state = self.state.lock();
+            let state = self.lock();
             (state.deferred_room(block), state.maker())
         };
         let layout = layout.into_planes();
         let mut made = (length <= room).then(|| maker.make::<P>(device, length, layout.as_deref()));
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         self.wait_copies(&mut state, block);
         let taken = state.make_deferred(
             device, block, length, block_size, layout, carried, host_pages, &mut made,
@@ -6748,7 +6925,7 @@ impl<P: Platform> Caches<P> {
         named: Named<P>,
         host_pages: Vec<Range<u64>>,
     ) -> RaiseResult<Option<bool>> {
-        self.state.lock().attach(device, block, named, host_pages)
+        self.lock().attach(device, block, named, host_pages)
     }
 
     /// A cache of `length` bytes for the block of `block_size` bytes at `block`, named cached,
@@ -6812,7 +6989,7 @@ impl<P: Platform> Caches<P> {
         block: u64,
         context: Option<u32>,
     ) -> RaiseResult<()> {
-        self.state.lock().buffer_made(device, block, context)
+        self.lock().buffer_made(device, block, context)
     }
 
     /// A decode into the block at `block`'s surface answered its picture (`picture`) or none
@@ -6823,7 +7000,7 @@ impl<P: Platform> Caches<P> {
         block: u64,
         picture: bool,
     ) -> RaiseResult<()> {
-        self.state.lock().decoded(device, block, picture)
+        self.lock().decoded(device, block, picture)
     }
 
     /// The deferred block at `block`'s pages taken copied ([`SurfaceCaches::attach_copied`]),
@@ -6834,7 +7011,7 @@ impl<P: Platform> Caches<P> {
         copied: &[(HostPtr, u64)],
         host_pages: Vec<Range<u64>>,
     ) -> Option<bool> {
-        self.state.lock().attach_copied(block, copied, host_pages)
+        self.lock().attach_copied(block, copied, host_pages)
     }
 
     /// Waits, on the calling thread, for the last fill of the block at `block`'s cache to be done,
@@ -6846,7 +7023,7 @@ impl<P: Platform> Caches<P> {
     /// no fill.
     pub(crate) fn wait_filled(&self, block: u64, over: Over<'_>) -> bool {
         let fill = {
-            let mut state = self.state.lock();
+            let mut state = self.lock();
             let fill = state.last_fill(block);
             if let Some(FillWait::Deferred(filled)) = &fill
                 && !filled.done()
@@ -6865,7 +7042,7 @@ impl<P: Platform> Caches<P> {
     /// copy never reads what it writes. True where it landed, or the block has no cache or no
     /// copy in flight.
     pub(crate) fn wait_copied_out(&self, block: u64, over: Over<'_>) -> bool {
-        let landing = (self.state.lock().by_block.get(&block))
+        let landing = (self.lock().by_block.get(&block))
             .and_then(|cache| cache.read_back.copy.as_ref())
             .map(|copy| Arc::clone(&copy.landing));
         landing.is_none_or(|landing| landing.wait(over))
@@ -6881,7 +7058,7 @@ impl<P: Platform> Caches<P> {
         runs: &[Range<u64>],
         timeout: std::time::Duration,
     ) -> bool {
-        let landings = self.state.lock().copies_into(runs);
+        let landings = self.lock().copies_into(runs);
         (landings.iter()).all(|landing| landing.wait(&mut after(timeout)))
     }
 }
@@ -6895,7 +7072,7 @@ impl<P: Platform> Caches<P> {
 /// ([`SurfaceCaches::reserved`]), so no copy makes them under it (the module doc, "Staged
 /// copies"). Pieces the platform raises at are left to their copy, which raises.
 fn reserve_unlocked<P: Platform>(
-    state: &mut MutexGuard<'_, SurfaceCaches<P>>,
+    state: &mut Locked<'_, P>,
     device: &P::Device,
     lacking: Vec<(u64, Vec<u64>, bool)>,
 ) {
@@ -6903,7 +7080,7 @@ fn reserve_unlocked<P: Platform>(
         return;
     }
     let (spares, timed) = (Arc::clone(&state.spares), state.staged.clone());
-    let made: Vec<(u64, Vec<P::Buffer>)> = MutexGuard::unlocked(state, || {
+    let made: Vec<(u64, Vec<P::Buffer>)> = state.unlocked(|| {
         (lacking.into_iter())
             .filter_map(|(block, lens, first)| {
                 let pieces = spares.pieces(device, &lens, first, timed.as_ref());
@@ -13646,6 +13823,63 @@ pub(super) mod tests {
             buffers + 1,
             "the second's cache alone: the refused one's buffer let go of"
         );
+    }
+
+    /// The transfer queue's command buffers are committed with the caches' lock let go of, in the
+    /// order their copies were encoded: while the platform holds a fill's commit, as the Vulkan
+    /// platform's commit holds it for its sync of the guest's copied pages (2.4 ms a commit, up to
+    /// 9.4 ms, on a Radeon 780M), a command buffer on another queue that fills another block's
+    /// cache is decoded and its fill encoded; its commit follows the held one, so the transfer
+    /// event's values are signalled in order
+    #[test]
+    fn a_transfer_queues_commits_signal_in_value_order_with_the_caches_lock_let_go_of() {
+        let mut r = cached();
+        let page = r.page;
+        let other = BLOCK + 0x8000;
+        assert_eq!(
+            r.pages_cached(other, &[(4, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        let held = HeldCall::new();
+        (r.p.faults()).at("MTLCommandBuffer", "commit", 0, Fault::Hold(held.clone()));
+        let mark = r.p.call_log().mark();
+        let first = surfaces_message(1, 0x100, &[(BLOCK, 1, false)], false);
+        let second = surfaces_message(2, 0x200, &[(other, 1, false)], false);
+        let (encoded, decoded) = std::thread::scope(|scope| {
+            let mut filling = r.dec.sender(None, super::super::Sinks::default());
+            let device = r.device.clone_ref();
+            let one = scope.spawn(move || filling.decode(&device, &first).unwrap());
+            assert!(
+                held.reached(std::time::Duration::from_secs(5)),
+                "the first fill's commit is held"
+            );
+            let mut filling = r.dec.sender(None, super::super::Sinks::default());
+            let device = r.device.clone_ref();
+            let two = scope.spawn(move || filling.decode(&device, &second).unwrap());
+            let mut encoded = false;
+            for _ in 0..400 {
+                if events(&r.p.call_log().since(mark), SIGNAL).len() >= 2 {
+                    encoded = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            held.open();
+            (encoded, (one.join().unwrap(), two.join().unwrap()))
+        });
+        assert_eq!(decoded, (Ok(()), Ok(())));
+        assert!(encoded, "the second fill encoded while the first's commit was held");
+        let calls = r.p.call_log().since(mark);
+        let transfer = events(&calls, SIGNAL)[0].0;
+        let signalled: HashMap<_, u64> = (calls.iter())
+            .filter(|c| c.sel == SIGNAL && c.args[0].as_obj().map(|o| o.0) == Some(transfer))
+            .map(|c| (c.obj, c.args[1].as_u64().unwrap_or(0)))
+            .collect();
+        let committed: Vec<u64> = (calls.iter())
+            .filter(|c| c.sel == "commit")
+            .filter_map(|c| signalled.get(&c.obj).copied())
+            .collect();
+        assert_eq!(committed, [1, 2], "the transfer queue's commits, in value order");
     }
 
     /// Command queues 1 and 2.
