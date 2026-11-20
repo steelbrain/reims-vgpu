@@ -1037,7 +1037,7 @@ mod tests {
 
 /// The rt platform's surfaces over the Direct3D 11 textures that reims-vgpu-video's plane draws
 /// make, on the Windows host.
-#[cfg(all(test, windows, feature = "rt"))]
+#[cfg(all(test, windows))]
 mod rt_windows_tests {
     use reims_vgpu_vulkan::RtPlatform;
     use reims_vgpu_vulkan::core::platform::resource::Texture as _;

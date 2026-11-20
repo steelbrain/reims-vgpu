@@ -1,6 +1,6 @@
 [package]
 name = "reims-vgpu-vulkan"
-description = "The library's platform: core, what the graphics device and its platform share, and the Platform implementation over metal2vulkan-runtime, on Vulkan"
+description = "The library's platform: core, what the graphics device and its platform share, and the Platform implementation over metal2vulkan-rt, on Vulkan"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,13 +8,8 @@ publish.workspace = true
 license.workspace = true
 
 [features]
-default = ["rt"]
 # core::testkit and testkit::capture outside this crate's own unit tests (architecture 13.2).
 testkit = ["dep:lzma-rs"]
-# The library's platform over metal2vulkan-rt (`rt_platform`, `RtPlatform`), which reims-vgpu's
-# `rt` makes its `DefaultPlatform`, on by default: the library's platform. Without it nothing of
-# `rt_platform` is built; the old platform goes with its code.
-rt = []
 
 [dependencies]
 # core (`core`): its locks (`core::sync`), and the guest's physical ranges as bytes (`core::host`).
@@ -22,10 +17,9 @@ parking_lot.workspace = true
 zerocopy.workspace = true
 # core's testkit::metal_answers: the recorded answers too long for text, in xz files.
 lzma-rs = { workspace = true, optional = true }
-metal2vulkan-runtime.workspace = true
+# metal2vulkan's Metal types, for the enums and descriptor values the runtime's calls take.
 metal2vulkan.workspace = true
-# The runtime that replaces metal2vulkan-runtime at the cutover: our side of its seam (`seam`),
-# which only tests reach until then.
+# The library's runtime (`rt_platform`, `RtPlatform`), and our side of its seam (`seam`).
 metal2vulkan-rt.workspace = true
 # The debug lines that time the runtime's compiles (gpu/timing.rs), through core's logger.
 log.workspace = true

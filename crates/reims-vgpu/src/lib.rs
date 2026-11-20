@@ -6,8 +6,7 @@
 //! [`DefaultPlatform`] as the default, so its forwarding is unit-tested on core's fake platform.
 //! The platform is `RtPlatform`, over metal2vulkan-rt, on the host's Vulkan driver on Linux and
 //! Windows and on macOS on Mesa's KosmicKrisp; it draws the device's window into a swapchain of its
-//! window, on macOS one over the window's `CAMetalLayer`. The old platform, `VulkanPlatform` over
-//! metal2vulkan's old runtime, builds only without the `rt` feature, which is on by default.
+//! window, on macOS one over the window's `CAMetalLayer`.
 //!
 //! The library logs through the `log` crate: a Rust host installs its own logger.
 
@@ -35,7 +34,6 @@ pub mod platform;
 mod pool;
 /// A unit test's rt devices, let go of as the test's thread ends.
 #[cfg(test)]
-#[cfg(feature = "rt")]
 mod rt_test_end;
 pub mod singleton;
 mod video;
@@ -55,17 +53,9 @@ pub use memory::{HostFile, MemoryFile, MemoryMap};
 pub use platform::ApiPlatform;
 pub use pool::{BLOCK_LEN, PIECE_ALIGN, PoolAddFn, PoolConfig, PoolRemoveFn, RELEASE_DELAY};
 pub use reims_vgpu_graphics::RawDoorbell;
-#[cfg(feature = "rt")]
 pub use reims_vgpu_vulkan::RtPlatform;
-pub use reims_vgpu_vulkan::VulkanPlatform;
 
-/// The platform every handle is made on without the `rt` feature: the old platform,
-/// `VulkanPlatform`.
-#[cfg(not(feature = "rt"))]
-pub type DefaultPlatform = VulkanPlatform;
-/// The platform every handle is made on by default (the `rt` feature, on by default):
-/// `RtPlatform`, over metal2vulkan-rt.
-#[cfg(feature = "rt")]
+/// The platform every handle is made on: `RtPlatform`, over metal2vulkan-rt.
 pub type DefaultPlatform = RtPlatform;
 pub use reims_vgpu_window::{
     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,

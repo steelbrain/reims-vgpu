@@ -2,7 +2,7 @@
 //! platform (ignored: a measurement, not a check). Run it alone, holding the host's GPU locks:
 //!
 //! ```sh
-//! cargo nextest run -p reims-vgpu --features vulkan -E 'test(/surface_view_costs/)' \
+//! cargo nextest run -p reims-vgpu -E 'test(/surface_view_costs/)' \
 //!   --run-ignored only --no-capture
 //! ```
 //!
@@ -12,11 +12,11 @@
 //! are slots of the RAM picked at random, so no two surfaces name the same runs and the cache of
 //! views takes none. Each step is timed on the thread that carries it out (the surface worker, for
 //! `SURFACE_PAGES`):
-//! - `SURFACE_PAGES`: the view (a range mapping of the runs) and the buffer over all of it, which
-//!   holds the runtime's import; for a cached block also the device cache;
+//! - `SURFACE_PAGES`: the view (a range mapping of the runs) and the buffer over all of it; for a
+//!   cached block also the device cache;
 //! - `BUFFER_OVER_SURFACE_PAGES`, its `OBJECT_DESTROY`, and the block's `BLOCK_RELEASE`;
-//! - and apart, the same steps one at a time: the range mapping, the first buffer over it (the
-//!   import), a second (which shares it), and each one's drop.
+//! - and apart, the same steps one at a time: the range mapping, the first buffer over it, a
+//!   second, and each one's drop.
 //!
 //! `RGK_BENCH_ITERS` surfaces a case (default 40, past the cache's 32 views, so its drops are
 //! counted), `RGK_BENCH_RAM_MIB` MiB of RAM (default 768), `RGK_BENCH_THP=1` asks for huge pages
@@ -35,9 +35,7 @@
 //! after the one before continuing its run: upwards (each page after the one before: one run, as
 //! a kernel with free RAM in one piece gives them), downwards (each page right below the one
 //! before: 512 runs of a page, as a kernel's free list may give them) and scattered (pages picked
-//! at random over the RAM: 512 runs). A device that takes the guest's RAM whole (the Vulkan
-//! platform on NVIDIA's driver, `os/host_ram.rs`) imports it in the runtime's chunks, so
-//! this is where a take over a chunk not yet imported shows. `RGK_BENCH_TAKES` slabs an order
+//! at random over the RAM: 512 runs). `RGK_BENCH_TAKES` slabs an order
 //! (default 256, 512 MiB), `RGK_BENCH_RAM_MIB` the RAM (at least twice the takes'),
 //! `RGK_BENCH_TAKE_GAP_US` a pause before each take (default 0, a burst), and `RGK_BENCH_ORDERS` a
 //! comma list of the orders' names to run.
@@ -217,33 +215,17 @@ pub(in crate::graphics::decode) struct Ram {
     pub(in crate::graphics::decode) map: MemoryMap,
     pub(in crate::graphics::decode) at: *mut u8,
     length: u64,
-    /// The memfd behind it, on Linux.
-    #[cfg(target_os = "linux")]
-    fd: Arc<std::os::fd::OwnedFd>,
 }
 
 impl Drop for Ram {
-    /// Unmaps the RAM once no import of the runtime's lies over it any more: the objects over it
-    /// went before it, and the runtime may free their imports after they went, on its own threads
-    /// (`reims_vgpu_vulkan::remap`'s module docs, "Memory the library does not unmap"). Where an
-    /// import outlives the wait, the RAM stays mapped.
+    /// Unmaps the RAM: the objects over it went before it.
     fn drop(&mut self) {
-        let Some(at) = std::ptr::NonNull::new(self.at) else {
-            return;
-        };
-        if !reims_vgpu_vulkan::remap::wait_unimported(at, self.length, IMPORTS_BOUND) {
-            eprintln!(
-                "the test's guest RAM stays mapped: an import over it outlived {IMPORTS_BOUND:?}"
-            );
+        if self.at.is_null() {
             return;
         }
         unmap(self.at, self.length);
     }
 }
-
-/// The longest a test's memory waits, before it is unmapped, for the runtime to free the imports
-/// over it ([`Ram`]'s drop).
-pub(in crate::graphics::decode) const IMPORTS_BOUND: Duration = Duration::from_secs(30);
 
 /// Unmaps the RAM's own mapping, which no device, view or import uses any more.
 #[cfg(unix)]
@@ -376,16 +358,10 @@ pub(in crate::graphics::decode) fn guest_ram(length: u64, touched: bool) -> Ram 
     let mut map = MemoryMap::new();
     #[cfg(target_os = "linux")]
     {
-        let fd = Arc::clone(&file.file);
         // SAFETY: the RAM stays mapped until `Ram`'s drop, after every device and view made over
         // it.
         unsafe { map.push_with_file(RAM, length, at, Some(file)) };
-        Ram {
-            map,
-            at,
-            length,
-            fd,
-        }
+        Ram { map, at, length }
     }
     #[cfg(windows)]
     {
@@ -910,142 +886,27 @@ fn map_only<P: ApiPlatform>(label: &str) {
     drop(ram);
 }
 
-/// The Vulkan platform's costs (module docs).
+/// The rt platform's costs (module docs).
 #[test]
 #[ignore = "a measurement: run it alone, under the GPU locks"]
 fn surface_view_costs_vulkan() {
     if env_u64("RGK_BENCH_MAP_ONLY", 0) == 1 {
-        map_only::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
+        map_only::<reims_vgpu_vulkan::RtPlatform>("rt");
         return;
     }
-    measure::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
-    #[cfg(target_os = "linux")]
-    raw::measure();
+    measure::<reims_vgpu_vulkan::RtPlatform>("rt");
 }
 
-/// The same views and imports made with nothing of ours between: the kernel's `mmap` of each
-/// run, and the runtime's import of the view, as it checks the pages' write permission
-/// (`PROCMAP_QUERY` a mapping) and as it is told they are writable (`assume_writable`).
-#[cfg(target_os = "linux")]
-mod raw {
-    use std::os::fd::AsRawFd as _;
-    use std::ptr::NonNull;
-
-    use metal2vulkan_runtime as rt;
-
-    use super::*;
-
-    pub(super) fn measure() {
-        let device = rt::Device::system_default().expect("a runtime device");
-        let page = 4096u64;
-        let ram_bytes = env_u64("RGK_BENCH_RAM_MIB", 768) * MIB;
-        let iters = env_u64("RGK_BENCH_ITERS", 40);
-        let only = std::env::var("RGK_BENCH_CASES").ok();
-        let ram = guest_ram(ram_bytes, true);
-        let mut rng = XorShift(0x2545_f491_4f6c_dd1d);
-        for case in cases(page) {
-            if only
-                .as_ref()
-                .is_some_and(|o| !o.split(',').any(|n| n == case.name))
-            {
-                continue;
-            }
-            if case.length > ram_bytes / 2 {
-                continue;
-            }
-            let mut steps: [Step; 6] = Default::default();
-            for _ in 0..iters {
-                let runs = surface_runs(&mut rng, ram_bytes, case.length, case.run);
-                let len = case.length.to_usize();
-                let view = steps[0].time(|| {
-                    // SAFETY: a fresh reservation, every run then mapped over it at its place.
-                    unsafe {
-                        let at = libc::mmap(
-                            std::ptr::null_mut(),
-                            len,
-                            libc::PROT_NONE,
-                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                            -1,
-                            0,
-                        );
-                        assert_ne!(at, libc::MAP_FAILED);
-                        let mut offset = 0usize;
-                        for r in &runs {
-                            let got = libc::mmap(
-                                at.cast::<u8>().add(offset).cast(),
-                                r.length.to_usize(),
-                                libc::PROT_READ | libc::PROT_WRITE,
-                                libc::MAP_SHARED | libc::MAP_FIXED,
-                                ram.fd.as_raw_fd(),
-                                (r.address - RAM) as libc::off_t,
-                            );
-                            assert_ne!(got, libc::MAP_FAILED);
-                            offset += r.length.to_usize();
-                        }
-                        at.cast::<u8>()
-                    }
-                });
-                let pointer = NonNull::new(view).expect("a view");
-                // Each import's keep-alive holds a sender, which goes as the runtime drops it,
-                // once it freed the import: the channel closes once both did.
-                let (freed, imports_freed) = std::sync::mpsc::channel::<()>();
-                let import = |vouched: bool| {
-                    // SAFETY: the view stays mapped, writable, until the runtime dropped the
-                    // keep-alive, which the view's unmap waits for.
-                    let memory = unsafe {
-                        let m = rt::HostMemory::new(pointer);
-                        if vouched { m.assume_writable() } else { m }
-                    };
-                    let contents = rt::BufferContents::NoCopy {
-                        memory,
-                        deallocator: None,
-                        keep_alive: Some(Box::new(freed.clone())),
-                    };
-                    device.new_buffer_with_descriptor(rt::BufferDescriptor::new(
-                        case.length,
-                        rt::ResourceOptions::shared(),
-                        contents,
-                    ))
-                };
-                let checked = steps[1].time(|| import(false)).expect("an import");
-                steps[2].time(|| drop(checked));
-                let vouched = steps[3].time(|| import(true)).expect("an import");
-                steps[4].time(|| drop(vouched));
-                drop(freed);
-                assert!(
-                    matches!(
-                        imports_freed.recv_timeout(IMPORTS_BOUND),
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
-                    ),
-                    "the runtime freed both imports"
-                );
-                // SAFETY: the view made above, which no buffer or import lies over any more.
-                steps[5].time(|| unsafe { libc::munmap(view.cast(), len) });
-            }
-            for (step, name) in steps.iter().zip([
-                "raw mmap of each run",
-                "runtime import, checked",
-                "its free",
-                "runtime import, vouched",
-                "its free",
-                "raw munmap",
-            ]) {
-                eprintln!("raw: {}", step.line(case.name, name));
-            }
-        }
-    }
-}
-
-/// The Vulkan platform's takes of pages slabs (module docs).
+/// The rt platform's takes of pages slabs (module docs).
 #[test]
 #[ignore = "a measurement: run it alone, under the GPU locks"]
 fn pages_take_costs_vulkan() {
-    measure_takes::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
+    measure_takes::<reims_vgpu_vulkan::RtPlatform>("rt");
 }
 
-/// The Vulkan platform's takes of large pages slabs (module docs).
+/// The rt platform's takes of large pages slabs (module docs).
 #[test]
 #[ignore = "a measurement: run it alone, under the GPU locks"]
 fn large_take_costs_vulkan() {
-    measure_large_takes::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
+    measure_large_takes::<reims_vgpu_vulkan::RtPlatform>("rt");
 }

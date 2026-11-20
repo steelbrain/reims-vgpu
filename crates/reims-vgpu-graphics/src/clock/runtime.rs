@@ -4,22 +4,15 @@
 //! `reims-vgpu`'s decoder writes them into its `CB_COMPLETE` (`graphics/decode/cmdbuf.rs`).
 //!
 //! **Which clock the platform's times count** is [`PLATFORM`]:
-//! - metal2vulkan's runtime, which the library runs today (`metal2vulkan-runtime`), counts
-//!   `CLOCK_MONOTONIC_RAW` on Linux and the performance counter on Windows (**read**: its
-//!   `gpu_time.rs`, `BASE`, at the commit the workspace pins), the device's own clocks, so
-//!   [`PLATFORM`] is [`Domain::Device`] and the times pass unchanged: what the guest sees is
-//!   what it saw before this module. On macOS it counts `CLOCK_UPTIME_RAW`, which stops while
-//!   the Mac sleeps, where the device's `CLOCK_MONOTONIC_RAW` does not, so there the two differ by
-//!   the time the host slept since it booted. The times pass unchanged there too, as they did
-//!   before this module; the guest reads only a run's length (`gpu_end_ns - gpu_start_ns`), which
-//!   that gap leaves exact.
-//! - metal2vulkan's new runtime (`metal2vulkan-rt`) counts `CLOCK_MONOTONIC` on Linux and the
+//! - [`PLATFORM`] is [`Domain::Device`]: the times pass unchanged. The guest reads only a run's
+//!   length (`gpu_end_ns - gpu_start_ns`), which an offset between the clocks leaves as it is.
+//! - metal2vulkan's runtime (`metal2vulkan-rt`) counts `CLOCK_MONOTONIC` on Linux and the
 //!   other Unix systems but macOS, `CLOCK_MONOTONIC_RAW` on macOS and the performance counter on
 //!   Windows (**read**: its `times.rs`, `host_time` and `HOST_DOMAIN`). metal2vulkan's ruling of
 //!   2026-11-18 keeps Linux on `CLOCK_MONOTONIC`, as lavapipe calibrates its GPU clock against no
-//!   `CLOCK_MONOTONIC_RAW`. At the cutover [`PLATFORM`] is `Domain::Monotonic` on Linux, and
-//!   stays [`Domain::Device`] on macOS and Windows.
-//! - Should the new runtime count `CLOCK_MONOTONIC_RAW` on Linux too (once lavapipe calibrates
+//!   `CLOCK_MONOTONIC_RAW`. So on Linux [`PLATFORM`] is to be `Domain::Monotonic`, and on macOS
+//!   and Windows it stays [`Domain::Device`].
+//! - Should the runtime count `CLOCK_MONOTONIC_RAW` on Linux too (once lavapipe calibrates
 //!   it), every OS's times are the device's, and this module goes, with its one call.
 //!
 //! **A paired read, fresh at each conversion** (`pair.rs`): the platform's clock, the device's,

@@ -14,23 +14,20 @@ license.workspace = true
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
-default = ["macos-sdl", "rt"]
+default = ["macos-sdl"]
 # SDL3's window on macOS (`reims-vgpu`'s `macos-sdl`), on by default: `--no-default-features`
 # builds the macOS library without SDL, its windows AppKit's alone.
 macos-sdl = ["reims-vgpu/macos-sdl"]
-# Kept for the builds that name it (`--features vulkan`): every handle is made on `VulkanPlatform`
+# Kept for the builds that name it (`--features vulkan`): every handle is made on `RtPlatform`
 # with or without it (`Plat`, `lib.rs`).
 vulkan = ["reims-vgpu/vulkan"]
-# Every handle made on the platform over metal2vulkan-rt (`reims-vgpu`'s `rt`), on by default: the
-# library's platform. The old platform builds only without it, and goes with its code.
-rt = ["reims-vgpu/rt"]
 
 [dependencies]
 reims-vgpu.workspace = true
 # The graphics device's wire constants, which the C API's PCI constants are checked against.
 reims-vgpu-graphics.workspace = true
 # The death of a NULL handle, and the mark of the library's threads (the unit tests' testkit
-# platform stands where VulkanPlatform stands in the product).
+# platform stands where RtPlatform stands in the product).
 reims-vgpu-vulkan.workspace = true
 # A refusal of a memory map's files.
 log.workspace = true

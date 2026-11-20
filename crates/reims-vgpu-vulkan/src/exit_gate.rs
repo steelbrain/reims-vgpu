@@ -7,18 +7,17 @@
 //! handlers too, before the system ends the other threads, but `std::process::exit` is
 //! `ExitProcess` there, which runs none of them: a process that ends through it never runs the
 //! hook (QEMU ends through the C library's). A call into what a driver's destructors freed ends the process: on the
-//! RTX 5080 Laptop GPU (NVIDIA 615.71.09), the awake thread's touches segfaulted 79 times in a
-//! six-minute run of the workspace's tests, in processes whose tests had passed (`crate::awake`),
-//! and test processes ended with `SIGSEGV` inside `libnvidia-glvkspirv.so`, the driver's SPIR-V
-//! compiler, after their tests passed. The runtime's own exit guard (`rt::process_exiting`) waits
-//! for the runtime's calls on its own threads; the library's calls on its own threads (making
+//! RTX 5080 Laptop GPU (NVIDIA 615.71.09), a thread of the library's that touched the device
+//! segfaulted 79 times in a six-minute run of the workspace's tests, in processes whose tests had
+//! passed, and test processes ended with `SIGSEGV` inside `libnvidia-glvkspirv.so`, the driver's
+//! SPIR-V compiler, after their tests passed. The library's calls on its own threads (making
 //! objects and pipelines, importing pages, encoding, committing, presenting, decoding video) are
 //! the library's to keep out of that window. This gate does it:
 //! - **Steps.** Each job of a thread of the library's that may call a GPU's driver runs as a step
 //!   ([`step`]; [`making`] for a pipeline's or a library's compile): every entry of
 //!   `reims-vgpu`'s (its C API's calls, the device's callbacks, the jobs of its lanes, compile
 //!   threads and surface workers), a window's frame, a video picture landed or a frame encoded,
-//!   each call the video crate's threads make, and the awake thread's touches. Steps are counted.
+//!   and each call the video crate's threads make. Steps are counted.
 //!   A step taken once the gate closed is refused, and its thread parks for good ([`stay`]): what
 //!   it holds stays held, and the process's end frees it. A step inside a step is part of the
 //!   outer one and is never refused. Neither is a step on the thread that ran the hook, the
@@ -26,11 +25,9 @@
 //!   it.
 //! - **The hook.** An exit handler ([`arm`]) closes the gate and waits for the steps in progress
 //!   on other threads to end, never for the exiting thread's own (an exit from inside a step): at
-//!   most [`BOUND`], or [`MAKING_BOUND`] while a making is among them, as the runtime's guard
-//!   waits for its own makings (a cold compile can outlast seconds under load). It says so on
-//!   standard error once the wait passes half its bound, and past the bound the exit goes on.
-//!   The gate also counts as closed once the runtime's guard closed (`rt::process_exiting`): no
-//!   step starts after either hook ran.
+//!   most [`BOUND`], or [`MAKING_BOUND`] while a making is among them (a cold compile can outlast
+//!   seconds under load). It says so on standard error once the wait passes half its bound, and
+//!   past the bound the exit goes on. No step starts after the hook ran.
 //! - **Ahead of the exit.** A host that quiesces the platform before it exits
 //!   (`reims-vgpu`'s `GraphicsDevice::quiesce_for_exit`, the C API's `rvg_quiesce_for_exit`)
 //!   closes the gate then ([`close_ahead`]), on the thread that then exits, and waits for the
@@ -46,11 +43,10 @@
 //!   the close can name the steps it waits for. Past [`SITE_SLOTS`] outermost steps at once, the
 //!   rest are counted and not named.
 //! - **Its order.** The C library runs exit handlers in the reverse order of their registration,
-//!   so the hook runs before every destructor registered before it. It is registered as a device
-//!   is adopted (`crate::gpu::device`) and as a compile pool starts, after the driver was loaded;
-//!   again as the video crate loads a driver (`reims-vgpu`'s video runtime's `arm_exit`); again
-//!   as each making ends, after what the driver's compiler registered at its first use of a path,
-//!   as the runtime's guard does for its own makings; and again as each thread's count of its
+//!   so the hook runs before every destructor registered before it. It is registered as a compile
+//!   pool starts, after the driver was loaded; again as the video crate loads a driver
+//!   (`reims-vgpu`'s video runtime's `arm_exit`); again as each making ends, after what the
+//!   driver's compiler registered at its first use of a path; and again as each thread's count of its
 //!   steps ended reaches each power of two, for what a later call registered, at most 64 times a
 //!   thread. A run of an
 //!   earlier registration finds the hook ran and does nothing. Left open: a destructor
@@ -65,15 +61,13 @@ use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::time::Duration;
 
-use metal2vulkan_runtime as rt;
-
 use crate::core::platform::os::clock::{Clock as _, Deadline, MonoTime};
 
 /// The longest the hook waits for the steps in progress, while none is a making.
 pub const BOUND: Duration = Duration::from_secs(2);
 
-/// The longest the hook waits while a making is among the steps in progress: the runtime's guard
-/// waits as long for its own makings.
+/// The longest the hook waits while a making is among the steps in progress: a cold compile can
+/// outlast seconds under load.
 pub const MAKING_BOUND: Duration = Duration::from_secs(60);
 
 /// How often the hook looks at the steps in progress.
@@ -148,9 +142,9 @@ pub fn making() -> Option<Step> {
 }
 
 /// Whether the process's exit closed the gate: the hook ran, a host closed it ahead of the exit
-/// ([`close_ahead`]), or the runtime's guard closed.
+/// ([`close_ahead`]).
 pub fn closed() -> bool {
-    CLOSED.load(Ordering::SeqCst) || rt::process_exiting()
+    CLOSED.load(Ordering::SeqCst)
 }
 
 /// Parks this thread for good: a step was refused, the process exiting (the module docs).

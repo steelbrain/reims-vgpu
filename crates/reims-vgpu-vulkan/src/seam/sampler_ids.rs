@@ -17,9 +17,8 @@
 //! took. The handle is to live as long as the guest's object, which the guest's command buffers
 //! retain while their work runs.
 //!
-//! Beside a state's samplers, Metal numbers what metal2vulkan-runtime's numbering models
-//! (`crate::gpu::states`, `metal2vulkan-runtime`'s `resource_ids`), which this does not: its
-//! plain allocation from the smallest free range of a pool that doubles, the device's own
+//! Beside a state's samplers, Metal numbers more, which this does not model: its plain
+//! allocation from the smallest free range of a pool that doubles, the device's own
 //! sampler ID, the sampler states' IDs from the same range, and the function objects and
 //! libraries that hold a state's IDs beside it.
 

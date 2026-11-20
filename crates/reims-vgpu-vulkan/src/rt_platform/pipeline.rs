@@ -731,8 +731,8 @@ mod tests {
         let limited = limited.expect("a compute state").expect("a compute state");
         assert_eq!(limited.max_total_threads_per_threadgroup(), 64);
 
-        // A kernel's static threadgroup memory is rt's answer: Metal's, as `metal_answers` records
-        // it for this kernel on an M3 Max.
+        // A kernel's static threadgroup memory is rt's answer: Metal's for this kernel on an M3
+        // Max.
         let tgstatic = device.new_library(TGSTATIC).expect("never a raise");
         let tgstatic = tgstatic.expect("a metallib").expect("a library");
         let kernel = tgstatic

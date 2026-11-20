@@ -775,7 +775,7 @@ mod tests {
     fn the_files_lie_in_the_user_s_cache_directory() {
         let cache = reims_vgpu_vulkan::os::user_cache_directory().expect("a user cache directory");
         assert_eq!(directory(), Some(cache.join("reims-vgpu-pipeline-answers")));
-        let shaders = reims_vgpu_vulkan::platform::cache_directory().expect("a shader cache");
+        let shaders = reims_vgpu_vulkan::os::cache_directory().expect("a shader cache");
         assert_eq!(shaders.parent(), Some(cache.as_path()));
         if cfg!(unix) {
             let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));

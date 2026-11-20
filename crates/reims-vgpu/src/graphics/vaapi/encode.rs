@@ -15,7 +15,8 @@
 //!   to the encoder from the next frame. `min_qp`, `max_qp` and a change of `quality` alone are
 //!   not taken: the VA crate's encoder has no such setting.
 //! - **A frame** ([`VaFrame`]) reaches the encoder on the session's encode thread one of two
-//!   ways. By the runtime device's GPU, where the session has its copier (`super::gpu_copy`): a
+//!   ways. By the device's GPU, where the session's copier gives a filler (`super::GpuCopies`;
+//!   the rt platform's gives none, so a frame reaches the encoder the other way): a
 //!   copy of the source's planes, where they lie, in the surface's pages or its device caches,
 //!   into an input surface of the encoder's, exported as dma-bufs (the VA crate's
 //!   `VideoEncoder::input_surface`), its margin to the coded size filled as an upload fills it, so

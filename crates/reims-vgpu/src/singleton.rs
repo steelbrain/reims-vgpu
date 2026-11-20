@@ -2,7 +2,7 @@
 //!
 //! The process-wide state (the serial number set, the latest IOSurface host device) lives in one
 //! platform instance (D17), so every public constructor goes through the process's: [`platform`],
-//! one `VulkanPlatform` per process, made on first use. Making it installs the aborting panic hook
+//! one `RtPlatform` per process, made on first use. Making it installs the aborting panic hook
 //! first (6.5), and on Windows the handler whose lines name a fault's module and offset
 //! (`faults.rs`), then the stderr logger if `REIMS_VGPU_LOG` asks for it
 //! (`reims_vgpu_vulkan::core::logging::init`). Every function of the C API installs the hook too, before
@@ -10,34 +10,20 @@
 
 use std::sync::{Arc, Once, OnceLock};
 
-use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::RtPlatform;
 use reims_vgpu_vulkan::core::rt::is_our_thread;
 
-static PLATFORM: OnceLock<Arc<VulkanPlatform>> = OnceLock::new();
+static PLATFORM: OnceLock<Arc<RtPlatform>> = OnceLock::new();
 static HOOK: Once = Once::new();
 
 /// The process's platform (D17), made on first use: the panic hook first, the logger, then one
-/// `VulkanPlatform`.
-pub fn platform() -> Arc<VulkanPlatform> {
-    PLATFORM
+/// `RtPlatform`.
+pub fn platform() -> Arc<RtPlatform> {
+    let platform = PLATFORM
         .get_or_init(|| {
             install_panic_hook();
             reims_vgpu_vulkan::core::logging::init();
-            Arc::new(VulkanPlatform::new())
-        })
-        .clone()
-}
-
-/// The process's platform over metal2vulkan-rt (D17), under the `rt` feature, made on first use as
-/// [`platform`] makes `VulkanPlatform`'s: the panic hook first, the logger, then one `RtPlatform`.
-#[cfg(feature = "rt")]
-pub fn rt_platform() -> Arc<reims_vgpu_vulkan::RtPlatform> {
-    static RT_PLATFORM: OnceLock<Arc<reims_vgpu_vulkan::RtPlatform>> = OnceLock::new();
-    let platform = RT_PLATFORM
-        .get_or_init(|| {
-            install_panic_hook();
-            reims_vgpu_vulkan::core::logging::init();
-            Arc::new(reims_vgpu_vulkan::RtPlatform::new())
+            Arc::new(RtPlatform::new())
         })
         .clone();
     // A unit test's process lets go of the device as the test's thread ends (`rt_test_end`).

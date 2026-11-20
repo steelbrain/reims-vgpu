@@ -147,9 +147,9 @@ fn measure<P: ApiPlatform>(name: &str) {
     }
 }
 
-/// On the Vulkan platform: the runtime's completion thread, then its handler thread.
+/// On the rt platform: rt's completion thread, then its handler thread.
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU"]
 fn on_vulkan_handler_cost() {
-    measure::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
+    measure::<reims_vgpu_vulkan::RtPlatform>("rt");
 }

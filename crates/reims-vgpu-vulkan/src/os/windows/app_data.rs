@@ -42,8 +42,7 @@ mod tests {
     /// The user's cache directory is `reims-vgpu` in the user's local application data folder,
     /// the folder Windows names in the process's `LOCALAPPDATA` (a path is the same in any case),
     /// and the library's stores lie in it under the names they have under `~/.cache` on Linux and
-    /// macOS. A process with no `HOME` finds the same directory
-    /// (`crate::platform`'s `a_translation_one_process_keeps_is_the_next_process_s`)
+    /// macOS.
     #[test]
     fn the_cache_directory_is_reims_vgpu_in_the_local_application_data_folder() {
         let dir = cache_directory().expect("a local application data folder");
@@ -52,12 +51,8 @@ mod tests {
         assert_eq!(lower(&dir), lower(&folder.join("reims-vgpu")));
         assert_eq!(crate::os::user_cache_directory(), Some(dir.clone()));
         assert_eq!(
-            crate::platform::cache_directory(),
+            crate::os::cache_directory(),
             Some(dir.join("reims-vgpu-vulkan-tests"))
-        );
-        assert_eq!(
-            crate::records::path_in(&dir),
-            dir.join("reims-vgpu-vulkan-pipelines")
         );
     }
 }

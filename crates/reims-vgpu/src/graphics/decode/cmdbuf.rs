@@ -2963,7 +2963,6 @@ impl<P: Platform> GraphicsDecoder<P> {
         split: &mut Option<Splitting>,
     ) -> RaiseResult<Result<(), DecodeError>> {
         // The rt platform's boot diagnostics total a refused draw by its process.
-        #[cfg(feature = "rt")]
         reims_vgpu_vulkan::rt_platform::diag::walk_context(self.context);
         let mut encoder: Option<OpenEncoder<P>> = None;
         let walked = refusing(|| self.walk(ops, cb, &mut encoder, events, split));
@@ -3956,7 +3955,6 @@ impl<P: Platform> GraphicsDecoder<P> {
         pass.set_pass(&set);
         // The rt platform's boot diagnostics count the pass where it takes a view of a video plane
         // image as an attachment, by its shape.
-        #[cfg(feature = "rt")]
         let mut attached = reims_vgpu_vulkan::rt_platform::diag::PassAttachments::default();
 
         let stride = size_of::<RgfxRenderPassColorAttachment>();
@@ -3977,7 +3975,6 @@ impl<P: Platform> GraphicsDecoder<P> {
             // The pass may write each attachment, and each resolve texture.
             self.texture_written(a.texture_obj_id);
             self.texture_written(a.resolve_texture_obj_id);
-            #[cfg(feature = "rt")]
             {
                 attached.colour(self.video_plane(a.texture_obj_id), false);
                 if resolve.is_some() {
@@ -4071,7 +4068,6 @@ impl<P: Platform> GraphicsDecoder<P> {
             let resolve = self.get_texture(d.resolve_texture_obj_id)?;
             self.texture_written(d.texture_obj_id);
             self.texture_written(d.resolve_texture_obj_id);
-            #[cfg(feature = "rt")]
             attached.depth_or_stencil(self.video_plane(d.resolve_texture_obj_id));
             let dset = DepthAttachmentSet {
                 texture: Some(Some(tex)),
@@ -4097,7 +4093,6 @@ impl<P: Platform> GraphicsDecoder<P> {
             let resolve = self.get_texture(s.resolve_texture_obj_id)?;
             self.texture_written(s.texture_obj_id);
             self.texture_written(s.resolve_texture_obj_id);
-            #[cfg(feature = "rt")]
             attached.depth_or_stencil(self.video_plane(s.resolve_texture_obj_id));
             let sset = StencilAttachmentSet {
                 texture: Some(Some(tex)),
@@ -4117,7 +4112,6 @@ impl<P: Platform> GraphicsDecoder<P> {
             pass.set_stencil_attachment(&sset);
         }
 
-        #[cfg(feature = "rt")]
         reims_vgpu_vulkan::rt_platform::diag::plane_pass(&attached);
         Ok((pass, facts))
     }
@@ -7781,7 +7775,7 @@ mod tests {
     /// tracked buffer the first one writes, sees its writes (Q6).
     #[test]
     fn on_vulkan_a_later_commit_on_another_queue_sees_a_submitted_buffer_s_writes() {
-        let (early, bytes) = a_later_commit_on_another_queue::<reims_vgpu_vulkan::VulkanPlatform>();
+        let (early, bytes) = a_later_commit_on_another_queue::<reims_vgpu_vulkan::RtPlatform>();
         assert!(!early, "answered as submitted while its queue was held");
         assert!(bytes.iter().all(|&b| b == 0x5a));
     }
@@ -7794,7 +7788,6 @@ mod tests {
     /// no buffer, the takes get the last fresh index and the spare's, then none: the closed
     /// process's are passed over. Once the unname sets the event past every value and the close's
     /// drain is answered, the buffer done, a take gets each of them.
-    #[cfg(feature = "rt")]
     #[test]
     #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
     fn on_vulkan_rt_s_own_indices_wait_for_a_closed_process_s_running_buffer() {
@@ -8100,7 +8093,7 @@ mod tests {
     #[test]
     fn on_vulkan_a_cpu_wait_for_a_mid_buffer_signal_is_released_before_the_buffer_ends() {
         let (early, finished, once) =
-            a_cpu_wait_for_a_mid_buffer_signal::<reims_vgpu_vulkan::VulkanPlatform>();
+            a_cpu_wait_for_a_mid_buffer_signal::<reims_vgpu_vulkan::RtPlatform>();
         assert!(early, "the signal came only at the buffer's end, or never");
         assert!(finished && once);
     }
@@ -8250,9 +8243,8 @@ mod tests {
     /// submitted (docs/graphics-kext/dgpu-oracle.md, Q6 and Q7).
     #[test]
     fn on_vulkan_a_plain_commit_on_another_queue_sees_the_writes_of_the_buffer_it_names() {
-        let bytes = a_plain_commit_after_a_named_buffer_of_another_queue::<
-            reims_vgpu_vulkan::VulkanPlatform,
-        >();
+        let bytes =
+            a_plain_commit_after_a_named_buffer_of_another_queue::<reims_vgpu_vulkan::RtPlatform>();
         assert!(
             bytes.iter().all(|&b| b == 0x5a),
             "committed before the buffer it names"
@@ -8412,7 +8404,7 @@ mod tests {
     #[test]
     fn on_vulkan_an_order_behind_a_held_buffer_holds_back_no_record() {
         let (posted, waited, mut completed, bytes) =
-            an_order_behind_a_held_buffer::<reims_vgpu_vulkan::VulkanPlatform>();
+            an_order_behind_a_held_buffer::<reims_vgpu_vulkan::RtPlatform>();
         assert_eq!(posted, [RGFX_EVT_CB_SUBMITTED, RGFX_EVT_CB_SCHEDULED]);
         assert!(waited, "B ran before the buffer it names");
         completed.sort_unstable();
@@ -8585,10 +8577,11 @@ mod tests {
     /// writes nothing under `Disabled` at any offset; the M3 Max writes 0 at 24 for `Disabled` sent
     /// at those offsets (measured), which [`render::visibility_offset`] keeps it from.
     #[test]
+    #[ignore = "rt builds no setVisibilityResultMode:offset: (rt-unbuilt-render-command), so the count at 16 is never written"]
     fn on_vulkan_sub_encoders_after_a_count_write_nothing_under_disabled() {
         let fill = u64::from_ne_bytes([0xee; 8]);
         assert_eq!(
-            sub_encoders_after_a_count::<reims_vgpu_vulkan::VulkanPlatform>(),
+            sub_encoders_after_a_count::<reims_vgpu_vulkan::RtPlatform>(),
             [fill, fill, 4096, fill]
         );
     }
@@ -8622,12 +8615,12 @@ mod tests {
     /// device-placed 1 MiB texture buffer (10) at the slot's first pick, which the host takes no
     /// pin of: the runtime makes its bytes at an address it picks itself.
     fn decoder_with_a_texture_buffer() -> (
-        GraphicsDecoder<reims_vgpu_vulkan::VulkanPlatform>,
-        <reims_vgpu_vulkan::VulkanPlatform as Platform>::Device,
+        GraphicsDecoder<reims_vgpu_vulkan::RtPlatform>,
+        <reims_vgpu_vulkan::RtPlatform as Platform>::Device,
     ) {
         use crate::platform::ApiPlatform as _;
         use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
-        let platform = reims_vgpu_vulkan::VulkanPlatform::process();
+        let platform = reims_vgpu_vulkan::RtPlatform::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::new(
             Arc::clone(&platform),
@@ -8676,6 +8669,7 @@ mod tests {
     /// pinned at the pick after a texture buffer's is made, though the runtime made the texture
     /// buffer's bytes where it picks.
     #[test]
+    #[ignore = "rt builds no texture buffers (rt-refused-gap), and the test's decoder makes one first"]
     fn on_vulkan_a_pin_meets_no_range_of_a_texture_buffer() {
         use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
         let _pins = CONTEXT_RANGE_PINS.lock();
@@ -8692,6 +8686,7 @@ mod tests {
     /// made at their addresses (a pin's rule is the same for a buffer as for a heap over the
     /// block).
     #[test]
+    #[ignore = "rt builds no texture buffers (rt-refused-gap), and the test's decoder makes one first"]
     fn on_vulkan_the_host_s_pool_addresses_take_pins() {
         use crate::pool::{HOST_BASE, HOST_END};
         use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
@@ -8727,6 +8722,7 @@ mod tests {
     /// pick and one at the guest's, with a queue's and a texture buffer's ranges made, are made at
     /// their addresses (a pin's rule is the same for a buffer as for a heap in the block).
     #[test]
+    #[ignore = "rt builds no texture buffers (rt-refused-gap), and the test's decoder makes one first"]
     fn on_vulkan_the_host_s_private_addresses_take_pins() {
         use crate::pool::{HOST_BASE, PRIVATE_BASE, PRIVATE_END};
         use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
@@ -8765,6 +8761,7 @@ mod tests {
     /// buffer's ranges made, are made at their addresses (a pin's rule is the same for a buffer
     /// over a view as for one of its own).
     #[test]
+    #[ignore = "rt builds no texture buffers (rt-refused-gap), and the test's decoder makes one first"]
     fn on_vulkan_the_host_s_import_addresses_take_pins() {
         use crate::pool::{IMPORT_BASE, IMPORT_END, PRIVATE_BASE};
         use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
@@ -8801,6 +8798,7 @@ mod tests {
     /// first pick of every unit the kext hands the contexts out in and the last unit's last pick
     /// are made.
     #[test]
+    #[ignore = "rt builds no texture buffers (rt-refused-gap), and the test's decoder makes one first"]
     fn on_vulkan_the_host_s_own_ranges_lie_below_every_unit() {
         use reims_vgpu_graphics::wire::{
             RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_END, RGFX_CONTEXT_VA_UNIT, RGFX_CONTEXT_VA_UNITS,

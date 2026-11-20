@@ -19,9 +19,8 @@ mod tests {
     use super::*;
 
     /// The user's cache directory is `.cache` under `HOME`, and none without it, so the library's
-    /// shader cache is `~/.cache/reims-vgpu-vulkan` (a test build's
-    /// `~/.cache/reims-vgpu-vulkan-tests`) and its pipeline records
-    /// `~/.cache/reims-vgpu-vulkan-pipelines`
+    /// cache directory is `~/.cache/reims-vgpu-vulkan` (a test build's
+    /// `~/.cache/reims-vgpu-vulkan-tests`)
     #[test]
     fn the_cache_directory_is_dot_cache_under_home() {
         assert_eq!(
@@ -32,12 +31,8 @@ mod tests {
         let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
         assert_eq!(crate::os::user_cache_directory(), Some(home.join(".cache")));
         assert_eq!(
-            crate::platform::cache_directory(),
+            crate::os::cache_directory(),
             Some(home.join(".cache/reims-vgpu-vulkan-tests"))
-        );
-        assert_eq!(
-            crate::records::path_in(&home.join(".cache")),
-            home.join(".cache/reims-vgpu-vulkan-pipelines")
         );
     }
 }

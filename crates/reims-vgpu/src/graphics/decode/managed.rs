@@ -1346,7 +1346,7 @@ mod tests {
         };
         let unpinned = || KINDS.map(|k| count(k.codes().unpinned));
         let made = || KINDS.map(|k| count(k.codes().made.made));
-        let rise = |after: [u64; 13], before: [u64; 13], kind: Kind| {
+        let rise = |after: [u64; KINDS.len()], before: [u64; KINDS.len()], kind: Kind| {
             let at = KINDS.iter().position(|&k| k == kind).unwrap();
             after[at] - before[at]
         };
@@ -2189,7 +2189,6 @@ mod tests {
     /// make, until a `didModifyRange:` brings a later write over; and the CPU's bytes keep out the
     /// GPU's write. (A blit, not a kernel that loads the address from an argument buffer: rt's
     /// translator refuses that kernel, `reach.metal`: IdentityDomains, rt-refused-translation.)
-    #[cfg(feature = "rt")]
     #[test]
     fn on_vulkan_rt_s_managed_buffer_at_its_copy_is_the_copy_s_bytes_where_memory_is_shared() {
         use std::sync::mpsc;
@@ -2859,9 +2858,8 @@ mod tests {
     /// A one-level `Managed` 2D array on unified memory lies over its CPU copy where the layout
     /// puts its slices: the GPU reads and writes the copy's bytes.
     #[test]
+    #[ignore = "rt refuses this RGBA8Unorm 2D array over a buffer where it cannot hold it in place (rt-refused-gap; measured on a Radeon 780M's RADV)"]
     fn on_vulkan_a_managed_2d_array_lies_over_its_cpu_copy() {
-        check_managed_array_in_place(
-            managed_array_in_place_on::<reims_vgpu_vulkan::VulkanPlatform>(),
-        );
+        check_managed_array_in_place(managed_array_in_place_on::<reims_vgpu_vulkan::RtPlatform>());
     }
 }

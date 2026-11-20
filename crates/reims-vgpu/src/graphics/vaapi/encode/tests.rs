@@ -7,11 +7,9 @@ use reims_vgpu_video::core::surfaces::{SurfaceError, SurfaceLayout};
 use reims_vgpu_video::paravirt::Codec;
 use reims_vgpu_video::vaapi::{H264Decoder, HevcDecoder, encoder_support};
 
-use reims_vgpu_vulkan::VulkanPlatform;
-use reims_vgpu_vulkan::core::platform::Handle as _;
+use reims_vgpu_vulkan::RtPlatform;
 
 use super::*;
-use crate::graphics::video_choice::tested_gpu::{Arm, device_for, gpu_name};
 
 /// Settings of a 320x192 stream of `profile` of `codec` at a constant QP.
 fn settings(codec: u32, profile: u32) -> RgfxVideoEncodeSettings {
@@ -398,7 +396,7 @@ fn each_profile_encodes_on_the_driver_and_decodes_back() {
             .filter(|b| entry.profiles & b != 0)
         {
             let s = settings(entry.codec, bit);
-            let encoder = VaEncoder::<VulkanPlatform>::new(
+            let encoder = VaEncoder::<RtPlatform>::new(
                 &display,
                 entry.codec,
                 Arc::clone(&supports),
@@ -406,7 +404,7 @@ fn each_profile_encodes_on_the_driver_and_decodes_back() {
                 &rates,
                 Err("the test copies none by the GPU".to_owned()),
             );
-            HostEncoder::<VulkanPlatform>::check(&encoder, &s).unwrap();
+            HostEncoder::<RtPlatform>::check(&encoder, &s).unwrap();
             let sets: &[u8] = if entry.codec == RGFX_VIDEO_CODEC_H264 {
                 &[7, 8]
             } else {
@@ -496,211 +494,6 @@ fn each_profile_encodes_on_the_driver_and_decodes_back() {
     }
 }
 
-/// A frame the runtime device's GPU copies into an input surface of the encoder's
-/// (`gpu_copy`'s filler) encodes as the same frame uploaded by the CPU, byte for byte: on the
-/// driver of a GPU the arm runs on (`video_choice::tested_gpu`), for each codec and profile it
-/// encodes, 6 frames of a moving picture at a constant QP, 320x192 (no margin to the coded size)
-/// and 330x202 (a margin of columns and rows), each in a runtime buffer, its own memory or over
-/// host pages, by turns, rows wider than the picture's (512 bytes apart for 8-bit samples, 768 or
-/// 1024 for 16-bit) from byte 32. Two encoders of the same settings code the frames, one from the
-/// host bytes, one from the filled surfaces; every access unit of the second is the first's.
-/// A device with no GPU filler checks nothing: the test says so, naming its GPU, and ends.
-#[test]
-#[ignore = "needs a VA-API GPU: run on the VA-API host"]
-fn a_frame_filled_by_the_gpu_encodes_as_the_uploaded_frame_byte_for_byte() {
-    use reims_vgpu_video::codec::encode::{InputFrame, Plane};
-    use reims_vgpu_vulkan::core::platform::HostRange;
-    use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
-    use reims_vgpu_vulkan::core::platform::os::vm::HostVm as _;
-    use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
-    use reims_vgpu_vulkan::core::raise::OnFault;
-    use reims_vgpu_vulkan::remap::VulkanVm;
-
-    use super::super::super::video_host::OutputPlane;
-    use super::super::{GpuCopies as _, gpu_copy};
-
-    let platform = Arc::new(VulkanPlatform::new());
-    crate::entry::run(|_| {
-        let device = device_for(&platform, Arm::VaApi);
-        let node = reims_vgpu_vulkan::host_gpus::render_node_of(&device.raw).expect("a node");
-        let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
-        let display = Display::open(&node, runtime).expect("a VA display on the device's GPU");
-        let copies = gpu_copy::RuntimeCopies::new(&device);
-        let mut filler = match copies.filler() {
-            Ok(filler) => filler,
-            Err(why) => {
-                assert!(
-                    why.starts_with("the device lists no "),
-                    "a GPU filler on {}: {why}",
-                    gpu_name(&device)
-                );
-                eprintln!(
-                    "no GPU filler on {}, so no frame to compare: {why}",
-                    gpu_name(&device)
-                );
-                return;
-            }
-        };
-        let supports: Arc<[EncoderSupport]> = encoder_support(&display).into();
-        let entries = encode_caps_of(&supports, &display.capabilities().unwrap());
-        assert!(
-            !entries.is_empty(),
-            "the driver encodes neither H.264 nor HEVC"
-        );
-        let vm = VulkanVm::new();
-        let first = 32u64;
-        let mut frames = 0;
-        for entry in &entries {
-            for bit in (0..32)
-                .map(|b| 1u32 << b)
-                .filter(|b| entry.profiles & b != 0)
-            {
-                for (width, height) in [(320u32, 192u32), (330, 202)] {
-                    let s = RgfxVideoEncodeSettings {
-                        width,
-                        height,
-                        ..settings(entry.codec, bit)
-                    };
-                    let what = format!("codec {} profile {bit:#x} {width}x{height}", entry.codec);
-                    let made = settings_of(entry.codec, &s, None).expect("the VA settings");
-                    let mut by_cpu = VideoEncoder::new(&display, made.clone()).expect("an encoder");
-                    let mut by_gpu = VideoEncoder::new(&display, made).expect("an encoder");
-                    let sample = made_sample(&s);
-                    let row = u64::from(width) * sample;
-                    // Rows wider than the picture's, from a byte past the buffer's start: 512
-                    // apart for 8-bit samples, 768 or 1024 for 16-bit ones.
-                    let pitch = (row + 128).next_multiple_of(256);
-                    let chroma_at = first + pitch * u64::from(height);
-                    let len = (chroma_at + pitch * u64::from(height / 2))
-                        .next_multiple_of(vm.page_size());
-                    for n in 0..6u64 {
-                        let (luma, chroma) = picture(&s, n);
-                        // The frame's bytes in a buffer: the device's own memory, or host pages.
-                        let (buffer, at) = if n % 2 == 0 {
-                            let buffer = (device.new_buffer_of_length(OnFault::Return, len, 0))
-                                .expect("no raise")
-                                .expect("a buffer");
-                            let at = buffer.contents();
-                            (buffer, at)
-                        } else {
-                            let at = vm.allocate_anywhere(len).expect("host pages");
-                            // SAFETY: the pages stay mapped until the runtime's release of the
-                            // buffer runs the deallocator, as `land_both_ways` keeps them.
-                            let bytes = unsafe { HostRange::new(at, len) };
-                            let unmap: Box<dyn FnOnce() + Send> = Box::new(move || {
-                                let _ = VulkanVm::new().deallocate(at, len);
-                            });
-                            let buffer = (device.new_buffer_over_host_memory(
-                                OnFault::Return,
-                                bytes,
-                                0,
-                                Some(unmap),
-                            ))
-                            .expect("no raise")
-                            .expect("a buffer over the pages");
-                            (buffer, at)
-                        };
-                        for (plane, from, rows) in [
-                            (first, &luma, u64::from(height)),
-                            (chroma_at, &chroma, u64::from(height / 2)),
-                        ] {
-                            for r in 0..rows {
-                                let src = &from[(r * row) as usize..((r + 1) * row) as usize];
-                                // SAFETY: the row lies in the buffer's `len` host bytes, which no
-                                // GPU work reaches yet.
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        src.as_ptr(),
-                                        at.wrapping_add(plane + r * pitch).as_ptr::<u8>(),
-                                        src.len(),
-                                    );
-                                }
-                            }
-                        }
-                        let plane = |offset: u64, rows: u64, w: u64| OutputPlane {
-                            buffer: buffer.clone_ref(),
-                            offset,
-                            bytes_per_row: pitch,
-                            row_bytes: row,
-                            width: w,
-                            height: rows,
-                            rows_held: rows,
-                            cached: n % 2 == 0,
-                            host: Some(at.wrapping_add(offset)),
-                            pages: None,
-                            cache: None,
-                            #[cfg(unix)]
-                            surface: None,
-                            #[cfg(windows)]
-                            drawn: None,
-                        };
-                        let luma_plane = plane(first, u64::from(height), u64::from(width));
-                        let chroma_plane =
-                            plane(chroma_at, u64::from(height / 2), u64::from(width / 2));
-                        let input = InputFrame {
-                            planes: [
-                                Plane {
-                                    data: &luma,
-                                    bytes_per_row: row as usize,
-                                },
-                                Plane {
-                                    data: &chroma,
-                                    bytes_per_row: row as usize,
-                                },
-                            ],
-                            pts: i64::try_from(n).expect("a time"),
-                            duration: 1,
-                            force_key_frame: false,
-                            id: n,
-                        };
-                        let uploaded = by_cpu.encode(&input).expect("the upload's encode");
-                        let surface = by_gpu.input_surface().expect("an input surface");
-                        let written = filler
-                            .fill(
-                                &surface,
-                                &luma_plane,
-                                &chroma_plane,
-                                (width, height),
-                                u32::try_from(sample).expect("a sample"),
-                            )
-                            .expect("the GPU's copy");
-                        match written {
-                            DeviceWrite::Written => {}
-                            DeviceWrite::Declined(why) => panic!("{what}: declined: {why}"),
-                        }
-                        let filled = by_gpu.encode_surface(surface, &input).expect("the encode");
-                        let data =
-                            |coded: &[Coded<reims_vgpu_video::vaapi::Error>]| -> Vec<Vec<u8>> {
-                                (coded.iter())
-                                    .map(|c| c.as_ref().expect("a sample").data.to_vec())
-                                    .collect()
-                            };
-                        let (a, b) = (data(&uploaded), data(&filled));
-                        assert_eq!(a.len(), b.len(), "{what} frame {n}: samples");
-                        assert!(
-                            a == b,
-                            "{what} frame {n}: the filled frame's access unit differs"
-                        );
-                        frames += 1;
-                        drop((luma_plane, chroma_plane, buffer));
-                    }
-                }
-            }
-        }
-        eprintln!("{frames} frames filled by the GPU encoded as uploaded");
-        assert!(frames > 0);
-    });
-}
-
-/// The bytes of a sample of `settings`' format.
-fn made_sample(settings: &RgfxVideoEncodeSettings) -> u64 {
-    if settings.format == RGFX_VIDEO_FORMAT_P010 {
-        2
-    } else {
-        1
-    }
-}
-
 /// A guest surface's memory in host bytes, which a [`HostView`] reaches.
 struct HostSurface {
     life: MemoryLife,
@@ -785,7 +578,7 @@ fn a_guest_encoder_encodes_the_frames_of_the_surfaces_it_is_lent() {
             settings,
             quality: Some(0.5),
         };
-        let mut guest = VaGuestEncoder::<VulkanPlatform>::new(
+        let mut guest = VaGuestEncoder::<RtPlatform>::new(
             &display,
             &supports,
             &config,
@@ -885,125 +678,6 @@ fn a_guest_encoder_encodes_the_frames_of_the_surfaces_it_is_lent() {
         }
         assert_eq!(sizes, vec![(64, 48); 8], "{profile:?}");
     }
-}
-
-/// On the driver of a GPU the arm runs on (`video_choice::tested_gpu`), each guest encoder it
-/// answers, at each profile it encodes, at a constant QP: 6 frames of a 64x48 stream read from
-/// guest surfaces wider and taller than it, copied by the GPU (`gpu_copy`'s filler) from a buffer
-/// of the device's that holds the surface's bytes, code as the same frames read by the CPU from
-/// the surface's host bytes, sample for sample and byte for byte. A device with no GPU filler
-/// checks nothing: the test says so, naming its GPU, and ends.
-#[test]
-#[ignore = "needs a VA-API GPU: run on the VA-API host"]
-fn a_guest_encoders_frames_filled_by_the_gpu_code_as_read_by_the_cpu() {
-    use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
-    use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
-    use reims_vgpu_vulkan::core::raise::OnFault;
-
-    use super::super::{GpuCopies as _, gpu_copy};
-
-    let platform = Arc::new(VulkanPlatform::new());
-    crate::entry::run(|_| {
-        let device = device_for(&platform, Arm::VaApi);
-        let node = reims_vgpu_vulkan::host_gpus::render_node_of(&device.raw).expect("a node");
-        let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
-        let display = Display::open(&node, runtime).expect("a VA display on the device's GPU");
-        let copies = gpu_copy::RuntimeCopies::new(&device);
-        if let Err(why) = copies.filler() {
-            assert!(
-                why.starts_with("the device lists no "),
-                "a GPU filler on {}: {why}",
-                gpu_name(&device)
-            );
-            eprintln!(
-                "no GPU filler on {}, so no frame to compare: {why}",
-                gpu_name(&device)
-            );
-            return;
-        }
-        let supports: Arc<[EncoderSupport]> = encoder_support(&display).into();
-        let encoders = guest_encoders(&supports);
-        assert!(
-            !encoders.is_empty(),
-            "the driver encodes neither H.264 nor HEVC"
-        );
-        let mut frames = 0;
-        for encoder in &encoders {
-            for &profile in &encoder.profiles {
-                if profile.bit_depth() != 8 {
-                    continue;
-                }
-                let mut settings = EncoderSettings::new(profile, 64, 48);
-                settings.timescale = 90_000;
-                settings.rate_control = RateControl::ConstantQp {
-                    intra: 26,
-                    predicted: 28,
-                    bidirectional: 30,
-                };
-                let config = EncoderConfig {
-                    settings,
-                    quality: Some(0.5),
-                };
-                let open = |filler| {
-                    VaGuestEncoder::<VulkanPlatform>::new(&display, &supports, &config, filler)
-                        .expect("a guest encoder")
-                };
-                let mut by_cpu = open(Err("read by the CPU in this test".to_owned()));
-                let mut by_gpu = open(copies.filler());
-                let (mut read, mut filled) = (Vec::new(), Vec::new());
-                for index in 0..6 {
-                    let (layout, memory) = guest_surface(index);
-                    let length = memory.bytes.len() as u64;
-                    let buffer = (device.new_buffer_of_length(OnFault::Return, length, 0))
-                        .expect("no raise")
-                        .expect("a buffer");
-                    // SAFETY: the buffer's `length` host bytes, which no GPU work reaches yet.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            memory.bytes.as_ptr(),
-                            buffer.contents().as_ptr::<u8>(),
-                            memory.bytes.len(),
-                        );
-                    }
-                    let frame = SourceFrame {
-                        id: index as u64,
-                        pts: index as i64 * 3000,
-                        duration: 3000,
-                        force_key_frame: false,
-                    };
-                    let from_host = GuestSource::<VulkanPlatform> {
-                        layout: layout.clone(),
-                        memory: &memory,
-                        buffer: None,
-                    };
-                    let from_buffer = GuestSource {
-                        layout,
-                        memory: &memory,
-                        buffer: Some(&buffer),
-                    };
-                    read.extend(by_cpu.encode(&from_host, &frame).unwrap());
-                    filled.extend(by_gpu.encode(&from_buffer, &frame).unwrap());
-                    frames += 1;
-                }
-                read.extend(by_cpu.flush().unwrap());
-                filled.extend(by_gpu.flush().unwrap());
-                assert!(
-                    by_gpu.fills.said.is_empty(),
-                    "{profile:?}: frames uploaded by the CPU: {:?}",
-                    by_gpu.fills.said
-                );
-                let data = |coded: Vec<Coded<VideoError>>| -> Vec<Vec<u8>> {
-                    let samples = coded.into_iter().map(|c| c.expect("a sample").data);
-                    samples.collect()
-                };
-                let (a, b) = (data(read), data(filled));
-                assert_eq!(a.len(), 6, "{profile:?}: samples");
-                assert!(a == b, "{profile:?}: a filled frame's sample differs");
-            }
-        }
-        eprintln!("{frames} guest frames filled by the GPU coded as read by the CPU");
-        assert!(frames > 0);
-    });
 }
 
 /// A driver's answer for `profile` up to `max_width` by `max_height`, with no attribute but its

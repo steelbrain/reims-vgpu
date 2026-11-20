@@ -882,11 +882,6 @@ pub struct World {
     ///
     /// [`GpuDevice::copies_guest_ram`]: crate::core::platform::device::GpuDevice::copies_guest_ram
     guest_ram_copies: AtomicBool,
-    /// Whether the devices' [`GpuDevice::new_command_queue_for_copies`] gives a queue
-    /// ([`World::give_copy_queues`]).
-    ///
-    /// [`GpuDevice::new_command_queue_for_copies`]: crate::core::platform::device::GpuDevice::new_command_queue_for_copies
-    copy_queues: AtomicBool,
     /// Whether the devices' `GpuDevice::new_exported_surface` makes a surface
     /// ([`World::give_exported_surfaces`]).
     exported_surfaces: AtomicBool,
@@ -963,7 +958,6 @@ impl World {
             notifications: Mutex::new(Vec::new()),
             splits: AtomicBool::new(false),
             guest_ram_copies: AtomicBool::new(false),
-            copy_queues: AtomicBool::new(false),
             exported_surfaces: AtomicBool::new(false),
             recoveries: AtomicU64::new(0),
             linear_rows: AtomicU64::new(0),
@@ -1128,20 +1122,6 @@ impl World {
     /// [`GpuDevice::copies_guest_ram`]: crate::core::platform::device::GpuDevice::copies_guest_ram
     pub fn copies_guest_ram(&self) -> bool {
         self.guest_ram_copies.load(Ordering::SeqCst)
-    }
-
-    /// Has the devices give a queue for copies ([`GpuDevice::new_command_queue_for_copies`]),
-    /// logged under [`COPY_QUEUE`], or not, as the platform's default answers; not at first.
-    ///
-    /// [`GpuDevice::new_command_queue_for_copies`]: crate::core::platform::device::GpuDevice::new_command_queue_for_copies
-    /// [`COPY_QUEUE`]: super::impls::device::COPY_QUEUE
-    pub fn give_copy_queues(&self, on: bool) {
-        self.copy_queues.store(on, Ordering::SeqCst);
-    }
-
-    /// Whether the devices give a queue for copies ([`World::give_copy_queues`]).
-    pub fn gives_copy_queues(&self) -> bool {
-        self.copy_queues.load(Ordering::SeqCst)
     }
 
     /// Has the devices make an exported surface (`GpuDevice::new_exported_surface`, on Unix

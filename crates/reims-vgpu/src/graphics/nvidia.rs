@@ -6,9 +6,8 @@
 //! - **Which GPU.** The platform device's own, by its PCI address ([`NvidiaGpu`]), where the
 //!   device is NVIDIA's and CUDA opens the GPU there. Anywhere else the arm declines, with one
 //!   line at info, and the device's video goes to the next arm (`super::video_choice`). One video
-//!   a platform device, shared by its sessions while one lives. The arm is the same on either
-//!   platform (`VulkanPlatform`'s, and under the `rt` feature `RtPlatform`'s): NVENC's input is
-//!   handed to CUDA by the platform's release after each frame's copy (`encode::fill`).
+//!   a platform device, shared by its sessions while one lives, the rt platform's: NVENC's input
+//!   is handed to CUDA by the platform's release after each frame's copy (`encode::fill`).
 //! - **The decode caps** are NVDEC's own answers (`cuvidGetDecoderCaps`): H.264's Baseline, Main and
 //!   High where NVDEC decodes H.264 at 8 bits, and HEVC's Main where it decodes HEVC at 8 bits
 //!   and Main 10 where it does at 10, each into its format (NV12, P010), at the least of their

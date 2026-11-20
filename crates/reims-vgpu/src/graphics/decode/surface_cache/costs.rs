@@ -2,7 +2,7 @@
 //! its time goes (ignored: a measurement, not a check). Run it alone, holding the host's GPU:
 //!
 //! ```sh
-//! cargo nextest run -p reims-vgpu --features vulkan -E 'test(/download_costs/)' \
+//! cargo nextest run -p reims-vgpu -E 'test(/download_costs/)' \
 //!   --run-ignored only --no-capture
 //! ```
 //!
@@ -21,12 +21,8 @@
 //!   decoder's thread (`SurfaceCaches::early_copies`); a case's first write takes none;
 //! - `record+commit`: the download's call, which records the copy and commits it;
 //! - `to GPU start`: from the call's return to the copy's `GPUStartTime`, when the GPU began it
-//!   (the Vulkan platform's GPU times are the GPU's: `reims_vgpu_vulkan::platform`, "GPU times are
-//!   the GPU's"; on MoltenVK the host time the runtime called the driver's submission that
-//!   carried it);
-//! - `GPU start to end`: from `GPUStartTime` to `GPUEndTime`: the GPU's run of the copy (on
-//!   MoltenVK, to the host time the runtime saw the copy done, with what the driver and the
-//!   runtime take around it, whose fixed part the one-page case shows);
+//!   (the rt platform's GPU times: `rt_platform/command.rs`);
+//! - `GPU start to end`: from `GPUStartTime` to `GPUEndTime`: the GPU's run of the copy;
 //! - `answer`: from `GPUEndTime` to the answer;
 //! - `lock`: from the call to the answer, which a CPU lock of the surface waits for, past its
 //!   ring's messages.
@@ -45,9 +41,7 @@
 //! (default all of it: a booted guest's surfaces are pages from anywhere in its RAM), and
 //! `RGK_BENCH_CASES` a comma list of the cases' names to run; `RGK_BENCH_TOUCH=0` leaves the RAM's
 //! pages untouched until the platform maps them. Each case's line names the [`CHUNK`]s of the RAM
-//! its pages lie in (`chunks`): the runtime imports a RAM it is handed whole in pieces of that
-//! size on NVIDIA's driver, and copies by runs with a dispatch per piece the runs touch
-//! (metal2vulkan's `host_ram/copy.rs`, "Runs of words: one dispatch per chunk").
+//! its pages lie in (`chunks`).
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -608,9 +602,9 @@ fn raw<P: ApiPlatform>(label: &str, device: &P::Device, sizes: &[u64], rounds: u
     }
 }
 
-/// The Vulkan platform's downloads (module docs).
+/// The rt platform's downloads (module docs).
 #[test]
 #[ignore = "a measurement: run it alone, holding the host's GPU"]
 fn download_costs_vulkan() {
-    measure::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
+    measure::<reims_vgpu_vulkan::RtPlatform>("rt");
 }

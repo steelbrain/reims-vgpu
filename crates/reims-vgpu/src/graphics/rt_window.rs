@@ -1,16 +1,14 @@
 //! A graphics display's window sink on the rt platform: [`RtScanoutSink`] makes a presenter over a
 //! swapchain of the window's surface on rt's device ([`RtSwapchain`], rt's drawables), and each
-//! draw draws the display into the swapchain's next image, as the Vulkan platform's window does
-//! (`super::vulkan`, `super::sink`), and presents it.
+//! draw draws the display into the swapchain's next image (`super::sink`), and presents it.
 //!
 //! **The compositor's GPU.** The window presents from rt's device, the process's one device,
 //! wherever the host's compositor composites it. Where that is another GPU (the window system
 //! names it: [`VulkanTarget::compositor_device`]), each image presented crosses to it through the
-//! window system, as the Vulkan platform's presents from the runtime's GPU do (an RTX 3090 on
-//! PCIe 3.0 x4 spends 16.4 ms of its link on a 3648 x 2039 present, the module doc of
-//! `reims_vgpu_vulkan::swapchain`). The Vulkan platform's window device on the compositor's GPU,
-//! and the mirror of the presented surfaces it draws from, are not made on the rt platform: rt
-//! makes one device for everything. The route is logged once a sink, at its first presenter.
+//! window system (an RTX 3090 on PCIe 3.0 x4 spends 16.4 ms of its link on a 3648 x 2039
+//! present, the module doc of `reims_vgpu_vulkan::swapchain`). No window device is made on the
+//! compositor's GPU: rt makes one device for everything. The route is logged once a sink, at its
+//! first presenter.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -150,7 +148,7 @@ impl Presenter for RtPresenter {
                 Acquired::Image(frame) => frame,
                 Acquired::Retry => return Drawn::Retry,
                 // rt parks no device: a take that ends answers Failed.
-                Acquired::Failed | Acquired::Parked => return Drawn::Ended,
+                Acquired::Failed => return Drawn::Ended,
             };
             let Some(texture) = self.swapchain.texture(frame) else {
                 return Drawn::Nothing;

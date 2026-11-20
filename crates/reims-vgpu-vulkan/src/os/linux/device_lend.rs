@@ -85,7 +85,6 @@ pub fn dma_buf_of_host(
 /// bytes than one dma-buf holds.
 ///
 /// The caller keeps the `length` bytes from `first` mapped for the call.
-#[cfg(feature = "rt")]
 pub(crate) fn dma_bufs_of_host(
     first: NonNull<u8>,
     length: u64,
@@ -142,7 +141,6 @@ pub fn map_for_pointer(first: NonNull<u8>, length: u64) -> bool {
 /// pin takes, so no driver imports its pointer, and the rt platform hands rt none
 /// (`crate::rt_platform`'s `buffer::import_pages`). False where every page of them is mapped
 /// otherwise: from its file, or with no file behind it.
-#[cfg(any(test, feature = "rt"))]
 pub(crate) fn through_dma_bufs(first: NonNull<u8>, length: u64) -> bool {
     let (start, end) = whole_pages(first, length);
     !crate::os::files::through_pieces(start, end).is_empty()
@@ -153,7 +151,6 @@ pub(crate) fn through_dma_bufs(first: NonNull<u8>, length: u64) -> bool {
 /// device may pin (`super::import`'s `Pinned`). The rt platform holds one for each import it
 /// may hand rt by its pointer, from before it asks where the pages lie ([`through_dma_bufs`])
 /// until rt frees the import, so no pointer it hands rt comes to lie in a dma-buf's mapping.
-#[cfg(any(test, feature = "rt"))]
 #[derive(Debug)]
 pub(crate) struct MappingsHeld {
     /// The record no fold maps through dma-bufs, until it drops.
@@ -162,7 +159,6 @@ pub(crate) struct MappingsHeld {
 
 /// The whole pages of the `length` bytes from `first`, held as they are mapped while the answer
 /// lives ([`MappingsHeld`]).
-#[cfg(any(test, feature = "rt"))]
 pub(crate) fn hold_mappings(first: NonNull<u8>, length: u64) -> MappingsHeld {
     let (start, end) = whole_pages(first, length);
     MappingsHeld {
@@ -172,7 +168,6 @@ pub(crate) fn hold_mappings(first: NonNull<u8>, length: u64) -> MappingsHeld {
 
 /// The first byte of the first host page the `length` bytes from `first` lie in, and the end of
 /// the last.
-#[cfg(any(test, feature = "rt"))]
 fn whole_pages(first: NonNull<u8>, length: u64) -> (u64, u64) {
     let page = vm::page_size();
     let first = first.as_ptr().addr().to_u64();

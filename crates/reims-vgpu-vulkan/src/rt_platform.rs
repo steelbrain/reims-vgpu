@@ -1,8 +1,5 @@
-//! The library's platform over metal2vulkan-rt, the runtime that replaces metal2vulkan-runtime at
-//! the cutover: [`RtPlatform`], core's [`Platform`] over rt's public API. It is built under the
-//! `rt` feature, which makes it reims-vgpu's `DefaultPlatform`. The feature is a transition
-//! switch, and it goes at the cutover with the old runtime and `VulkanPlatform`. Without it nothing
-//! here is compiled.
+//! The library's platform over metal2vulkan-rt: [`RtPlatform`], core's [`Platform`] over rt's
+//! public API, and reims-vgpu's `DefaultPlatform`.
 //!
 //! **Built piece by piece**, in the order a guest's boot reaches the pieces: the device and its
 //! answers, queues, buffers, textures, libraries and pipelines, command buffers and encoders,
@@ -26,14 +23,13 @@
 //! **An object of a kind no call makes yet is [`Unmade`]**: a type with no values, so its methods
 //! are never reached. The piece that makes the kind gives it a type of its own.
 //!
-//! **What it shares with `VulkanPlatform`** is the platform's and not the runtime's: the OS's VM,
-//! clocks and threads ([`crate::os`]), the logger, the degradation counts ([`crate::answer`]), and
-//! the trace's clock ([`crate::core::trace`]).
-//! It keeps none of the old runtime's device tables, device checks, vendor, device or driver ID
-//! branches, or queue-sharing policies: rt has none.
+//! **What it takes from beside rt** is the platform's and not the runtime's: the OS's VM, clocks
+//! and threads ([`crate::os`]), the logger, the degradation counts ([`crate::answer`]), and the
+//! trace's clock ([`crate::core::trace`]). It has no device tables, device checks, vendor, device
+//! or driver ID branches, or queue-sharing policies: rt has none.
 //!
-//! rt's floor refuses MoltenVK (it lacks `nullDescriptor`), so the platform is tested on Linux
-//! GPUs. On a Mac it builds.
+//! rt's floor refuses MoltenVK (it lacks `nullDescriptor`): on a Mac the platform runs over Mesa's
+//! KosmicKrisp (`os/macos/rt_driver.rs`).
 
 pub mod answers;
 pub mod blit;
@@ -172,6 +168,10 @@ pub struct Listener;
 /// The log target of the platform's lines.
 const TARGET: &str = "reims_vgpu_vulkan::rt_platform";
 
+/// How often the let-go of the process's device looks at the handles held of it
+/// ([`RtPlatform::let_go_of_device`]).
+pub const POLL: Duration = Duration::from_millis(1);
+
 /// The process's platform over metal2vulkan-rt (the module's docs): the OS's VM, clocks and
 /// threads, the process's one rt device once asked for, and rt's objects as its pieces are built.
 ///
@@ -307,7 +307,7 @@ impl RtPlatform {
     /// (reims-vgpu's `ApiPlatform::let_go_of_devices`), so that no device of rt's is live as the
     /// process exits (the type's docs). In order, each wait ending by `bound`:
     /// - it waits for every handle beyond the platform's own to go (an object, a command buffer
-    ///   still running, a thread that holds one), looking every [`crate::let_go::POLL`]. Where
+    ///   still running, a thread that holds one), looking every [`POLL`]. Where
     ///   one outlives the wait, nothing goes, and `Err` says how many still held it;
     /// - rt's `Device::quiesce`, so that the drop's wait for rt's threads and GPU work, which
     ///   has no deadline, finds them ended. Where it answers false, the device is kept to the
@@ -345,7 +345,7 @@ impl RtPlatform {
                     "the rt device by {beyond} handles beyond the platform's"
                 ));
             }
-            std::thread::sleep(crate::let_go::POLL);
+            std::thread::sleep(POLL);
         };
         let facts = device.facts();
         let named = format!("{} (registry ID {:#x})", facts.name, facts.registry_id);
@@ -400,7 +400,7 @@ impl RtPlatform {
             if self.clock.now_mono() >= until {
                 return Err(Box::new(gauges));
             }
-            std::thread::sleep(crate::let_go::POLL);
+            std::thread::sleep(POLL);
         }
     }
 }

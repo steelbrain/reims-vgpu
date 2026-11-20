@@ -2,7 +2,7 @@
 //!
 //! Core is generic over one `P: Platform` (D3). Its associated types name every Metal object kind
 //! core touches, so a handle flows into another Metal call with its kind checked at compile time.
-//! Two implementations: `reims_vgpu_vulkan::VulkanPlatform` and
+//! Two implementations: `reims_vgpu_vulkan::rt_platform::RtPlatform` and
 //! `core::testkit::platform::FakePlatform`.
 
 pub mod blit;

@@ -16,7 +16,7 @@ use zerocopy::FromBytes;
 use super::super::super::decode::{GraphicsVideoSession, VideoEncode, VideoPlane};
 use super::super::super::video_host::HostEncodeSession;
 use super::*;
-use crate::graphics::video_choice::tested_gpu::{Arm, device_for};
+use crate::graphics::video_choice::tested_gpu::Arm;
 
 /// Settings of a `width` by `height` stream of `profile` of `codec` at a constant QP.
 fn settings(codec: u32, profile: u32, width: u32, height: u32) -> RgfxVideoEncodeSettings {
@@ -599,34 +599,10 @@ struct Layout {
     planes: [(usize, usize); 2],
 }
 
-/// On the NVIDIA host, an encode session whose frames the runtime device's GPU copies into
-/// memory NVENC reads (`fill`'s module doc) writes the same access units, byte for byte, as one
-/// whose frames NVENC's input buffer takes by the CPU's copy: H.264 High and HEVC Main at
-/// 1920x1080, 12 frames of a moving picture at a constant QP with a forced IDR picture (frame
-/// 6), from a source in pages whose planes share a pitch NVENC takes (a copy a plane), and from
-/// one in a device cache whose planes do not (a copy a row). Every frame went the GPU's way.
-#[test]
-#[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
-fn each_frame_filled_by_the_gpu_encodes_as_uploaded() {
-    use reims_vgpu_vulkan::VulkanPlatform;
-
-    let platform = Arc::new(VulkanPlatform::new());
-    crate::entry::run(|_| {
-        let device = device_for(&platform, Arm::Nvidia);
-        let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
-        let gpu = crate::graphics::video_choice::nvidia_gpu(&device);
-        let video = super::super::NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime)
-            .expect("NVENC on the GPU");
-        assert!(video.imports.is_some(), "CUDA imports no exportable buffer");
-        frames_filled_by_the_gpu_encode_as_uploaded(&device, &video);
-    });
-}
-
 /// [`each_frame_filled_by_the_gpu_encodes_as_uploaded`] on the rt platform: its input is a
 /// buffer of rt's exported block, which each frame's blit releases to CUDA after its copies
 /// (`fill`'s module doc).
 /// The rt device must be of a GPU the arm runs on (`video_choice::tested_gpu::check_rt`).
-#[cfg(feature = "rt")]
 #[test]
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
 fn each_frame_filled_by_the_gpu_encodes_as_uploaded_on_rt() {

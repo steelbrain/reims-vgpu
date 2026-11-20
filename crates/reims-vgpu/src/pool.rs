@@ -47,11 +47,11 @@
 //! # The block source
 //!
 //! [`BlockSource`] is metal2vulkan-rt's block calls as its API names them (`Device::take_block`,
-//! `release_block`, [`BlockInfo`]). On the Vulkan platform the source is [`HostBlocks`], blocks of
+//! `release_block`, [`BlockInfo`]). On the rt platform the source is the runtime's blocks
+//! ([`rt_blocks::RtBlocks`], the platform's `ApiPlatform::block_source`), each known to its device
+//! while handed out. A platform that gives none (the testkit's) takes [`HostBlocks`], blocks of
 //! the process's own memory, which hands blocks out, keeps them ready and frees them as the
-//! runtime does. On the rt platform it is the runtime's blocks
-//! ([`rt_blocks::RtBlocks`], the platform's `ApiPlatform::block_source`), each known to
-//! its device while handed out.
+//! runtime does.
 //!
 //! The host maps a block into the guest whole host pages at a time: a block whose mapping does
 //! not start at a host page, or whose length is no whole number of them, goes back to the source
@@ -89,7 +89,6 @@ pub(crate) use host_blocks::HostBlocks;
 pub(crate) use private_blocks::{
     PrivateBlocks, PrivateGive, TakeAnswer as PrivateTakeAnswer, TakeError as PrivateTakeError,
 };
-#[cfg(feature = "rt")]
 pub(crate) use rt_blocks::RtBlocks;
 pub(crate) use takes::{Give, PoolLedger, TAKE_MAX};
 #[cfg(test)]

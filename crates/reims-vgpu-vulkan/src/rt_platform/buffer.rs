@@ -434,13 +434,11 @@ pub(super) const BUFFER_DESCRIPTOR_OPTIONS: u64 = 0;
 /// The resource options' CPU cache, storage and hazard tracking modes: bits 0 to 9.
 pub(super) const FIELDS: u64 = 0x3ff;
 
-/// Resource option bit 20, which Metal takes and answers without (`ResourceOptions::BIT_20` of
-/// metal2vulkan-runtime, measured).
+/// Resource option bit 20, which Metal takes and answers without (measured).
 pub(super) const BIT_20: u64 = 1 << 20;
 
 /// Resource option bit 24, read-only, which Metal takes for a no-copy buffer and answers without,
-/// and at which a buffer the device makes ends Metal's process (`ResourceOptions::PRIVATE_BIT` of
-/// metal2vulkan-runtime, measured).
+/// and at which a buffer the device makes ends Metal's process (measured).
 pub(super) const READ_ONLY: u64 = 1 << 24;
 
 /// `MTLStorageModeManaged`, in the resource options' bits 4 to 7.

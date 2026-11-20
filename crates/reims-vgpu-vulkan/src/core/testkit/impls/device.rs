@@ -37,12 +37,6 @@ use crate::core::raise::{OnFault, RaiseResult};
 /// of Metal's names it.
 pub const UNSHARED_QUEUE: &str = "newCommandQueue (unshared)";
 
-/// The name the fake logs and scripts [`GpuDevice::new_command_queue_for_copies`] under, where
-/// its world gives such queues ([`World::give_copy_queues`]): no selector of Metal's names it.
-///
-/// [`World::give_copy_queues`]: crate::core::testkit::objects::World::give_copy_queues
-pub const COPY_QUEUE: &str = "newCommandQueue (copies)";
-
 /// The name the fake logs and scripts [`GpuDevice::new_buffer_of_length_padding_unobserved`]
 /// under: no selector of Metal's names it.
 pub const PADDING_UNOBSERVED_BUFFER: &str = "newBufferWithLength:options: (padding unobserved)";
@@ -429,20 +423,6 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
     /// queue is `newCommandQueue`'s.
     fn new_command_queue_unshared(&self) -> Option<<FakePlatform as Platform>::CommandQueue> {
         fatal(self.make(Policy::Fatal, UNSHARED_QUEUE, vec![], |w| {
-            Some(w.new_obj::<kind::CommandQueue>(Model::None))
-        }))
-    }
-
-    /// `None`, unlogged, as the platform's default, unless the world gives such queues
-    /// ([`World::give_copy_queues`]): then logged and scripted under [`COPY_QUEUE`], as no
-    /// selector of Metal's names it; its queue is `newCommandQueue`'s.
-    ///
-    /// [`World::give_copy_queues`]: crate::core::testkit::objects::World::give_copy_queues
-    fn new_command_queue_for_copies(&self) -> Option<<FakePlatform as Platform>::CommandQueue> {
-        if !self.world().gives_copy_queues() {
-            return None;
-        }
-        fatal(self.make(Policy::Fatal, COPY_QUEUE, vec![], |w| {
             Some(w.new_obj::<kind::CommandQueue>(Model::None))
         }))
     }

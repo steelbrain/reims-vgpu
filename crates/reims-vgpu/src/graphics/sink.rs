@@ -20,29 +20,6 @@
 //! sample the surface in its own format (WindowServer's display surfaces are 10-bit,
 //! `BGR10A2Unorm`) and write the drawable's. The first surface of each format is logged.
 //!
-//! **The compositor's GPU.** A draw made on a device of the window's own, on the GPU the host's
-//! compositor composites the window on where that is not the runtime's
-//! ([`ScanoutDraw::on_compositor`]; `graphics::vulkan`, "The compositor's GPU"), cannot read the
-//! decoder's textures, which are the runtime's device's. It draws a presented surface from the
-//! window's mirror instead (`mirror`): at each draw the runtime's GPU brings the mirror, in host
-//! memory, up to the presented texture, sending only the tiles that changed, and the draw's
-//! device draws from a linear texture over its import of the mirror's pages, as the surface's
-//! texture is drawn above. The draw waits for the mirror's sync on its own GPU where the sync's
-//! completion comes as a sync file, else the window's thread waits for it (`mirror`,
-//! "Ordering"). Only the sync reads the guest's surface, its copy of it, and the draw reads the
-//! mirror alone, which the next sync writes only once the draw has finished: so the presents a
-//! draw there takes are answered, and the surface's block let go of, once that copy has finished,
-//! not the draw (`mirror`, "The surface's read"). The guest then draws into its surfaces again
-//! with no wait for the compositor's GPU, its link or any other work there: on a Radeon 780M
-//! with the compositor on an RTX 3090 behind PCIe 3.0 x4, the draws there ran 16.5 ms on the
-//! GPU on average and up to 228 ms, where the syncs ran 3.35 ms and none over 30 ms (a traced
-//! boot, 2026-11-15). The import is made once a mirror, its deallocator holding the runtime's
-//! buffer over the mirror, so the mirror's pages stay mapped while it lives. A
-//! presented surface the mirror cannot carry, or whose mirror, import or texture is refused,
-//! cannot be drawn there: the draw draws nothing, says so ([`ScanoutDraw::foreign_refused`]),
-//! and the window presents from the runtime's GPU from then on. The scanout is imported from the
-//! region's pages as on the runtime's device.
-//!
 //! **Clears.** A draw clears the drawable to black first only where what it draws does not cover
 //! all of it: a pass whose draw covers the drawable writes each of its pixels, so it loads none
 //! of the drawable's old ones ([`pass_load`]), and its pixels are those it would draw after a
@@ -133,7 +110,6 @@ use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
 use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
 use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor as _;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
-use reims_vgpu_vulkan::core::platform::os::clock::Clock as _;
 use reims_vgpu_vulkan::core::platform::os::vm::HostVm as _;
 use reims_vgpu_vulkan::core::platform::render::{RenderCmd, RenderEncoder as _};
 use reims_vgpu_vulkan::core::platform::resource::Texture as _;
@@ -154,7 +130,6 @@ use reims_vgpu_vulkan::core::platform::types::MtlViewport;
 use self::cursor::CursorPass;
 use super::color::DisplayColor;
 use super::decode::unkept::Kind;
-use super::mirror::{Completion, Mirror, Synced};
 use super::{DisplayHold, Drawable, DrawnPresents, Presented, Shown};
 use crate::entry::no_catch;
 use crate::platform::ApiPlatform;
@@ -240,81 +215,9 @@ pub(crate) struct ScanoutDraw<P: Platform> {
     /// What draws the guest's cursor where the window draws it (`cursor`): its pipelines and its
     /// glyph's texture, made at their first use.
     cursor: Mutex<CursorPass<P>>,
-    /// Where the draw is on a device of the window's own, on the compositor's GPU (the module
-    /// doc, "The compositor's GPU"): the presented surfaces' pages it imported there, and
-    /// whether it met one it could not draw. `None` on the runtime's device, whose textures the
-    /// decoder made.
-    foreign: Option<Foreign<P>>,
     /// For the tests: every colour takes the pass, with no table.
     #[cfg(test)]
     tables_off: AtomicBool,
-}
-
-/// `MTLTextureUsageShaderRead`.
-const TEXTURE_USAGE_SHADER_READ: u64 = 1;
-
-/// What a draw on the compositor's GPU keeps of the presented surfaces (the module doc, "The
-/// compositor's GPU").
-pub(crate) struct Foreign<P: Platform> {
-    /// The window's mirror on the runtime's device, made at the first presented surface; `None`
-    /// inside where the runtime refused it.
-    mirror: Kept<Mirror<P>>,
-    /// The mirror's import on the draw's device, and the textures over it.
-    import: Mutex<Option<ForeignImport<P>>>,
-    /// The completion of the mirror's last sync, which the next draw of it waits for on its GPU
-    /// ([`Mirror::sync`]).
-    waiting: Mutex<Option<Completion<P>>>,
-    /// The draw's device could not wait for a sync's completion on its GPU, which was logged.
-    waits_on_host: AtomicBool,
-    /// It met a presented surface it cannot draw.
-    refused: AtomicBool,
-}
-
-impl<P: Platform> Default for Foreign<P> {
-    fn default() -> Self {
-        Foreign {
-            mirror: Kept::new(),
-            import: Mutex::new(None),
-            waiting: Mutex::new(None),
-            waits_on_host: AtomicBool::new(false),
-            refused: AtomicBool::new(false),
-        }
-    }
-}
-
-impl<P: Platform> Foreign<P> {
-    /// A presented surface of pixel format `format` that the draw cannot draw: logged once.
-    fn refuse(&self, format: u64) {
-        if !self.refused.swap(true, Ordering::AcqRel) {
-            log::warn!(
-                target: "reims_vgpu::graphics",
-                "the presented IOSurface (pixel format {format}) cannot be drawn on the \
-                 compositor's GPU: the window's mirror, its import or its texture was refused; \
-                 the window presents from the runtime's GPU"
-            );
-        }
-    }
-}
-
-/// The mirror's import on the compositor's GPU, and the textures made over it.
-struct ForeignImport<P: Platform> {
-    /// The mirror's host address, as the runtime's buffer over it answers it.
-    base: usize,
-    /// The runtime's buffer's length.
-    length: u64,
-    /// The import.
-    buffer: P::Buffer,
-    /// The textures made over it, by their shape.
-    textures: Vec<(TextureKey, P::Texture)>,
-}
-
-/// A texture over the mirror's import: its shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TextureKey {
-    bytes_per_row: u64,
-    width: u64,
-    height: u64,
-    pixel_format: u64,
 }
 
 /// An encoder a draw holds open, ended by [`Open::end`]. One a death in the draw unwinds past
@@ -421,11 +324,6 @@ impl<T> Kept<T> {
     fn get_or_make(&self, make: impl FnOnce() -> Option<T>) -> Option<Arc<T>> {
         let mut kept = self.0.lock();
         kept.get_or_insert_with(|| make().map(Arc::new)).clone()
-    }
-
-    /// The object, where it was made.
-    fn made(&self) -> Option<Arc<T>> {
-        self.0.lock().clone().flatten()
     }
 
     /// Lets go of the object, or of the refusal: the next [`Kept::get_or_make`] makes it again.
@@ -597,23 +495,6 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         })
     }
 
-    /// A draw as [`Self::new`]'s on `device`, a device of the window's own on the compositor's
-    /// GPU, apart from the runtime's (the module doc, "The compositor's GPU"): it draws the
-    /// presented surfaces from the window's mirror, imported there; `None` where it refuses a
-    /// queue.
-    pub(crate) fn on_compositor(
-        platform: Arc<P>,
-        device: P::Device,
-        region: &Arc<Region>,
-        shown: &Arc<Shown>,
-        presented: &Arc<Presented<P>>,
-    ) -> Option<ScanoutDraw<P>> {
-        let queue = device.new_command_queue_unshared()?;
-        let mut draw = Self::made(platform, device, queue, region, shown, presented);
-        draw.foreign = Some(Foreign::default());
-        Some(draw)
-    }
-
     /// [`Self::new`], on the queue `queue` makes on the device.
     fn on_queue(
         platform: Arc<P>,
@@ -658,19 +539,9 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             ramps: Mutex::default(),
             scanout_ramp: Kept::new(),
             cursor: Mutex::default(),
-            foreign: None,
             #[cfg(test)]
             tables_off: AtomicBool::new(false),
         }
-    }
-
-    /// Whether the draw, on the compositor's GPU, met a presented surface it cannot draw there:
-    /// one the window's mirror cannot carry, or whose mirror, import or texture was refused. The
-    /// window then presents from the runtime's GPU (`graphics::vulkan`).
-    pub(crate) fn foreign_refused(&self) -> bool {
-        self.foreign
-            .as_ref()
-            .is_some_and(|f| f.refused.load(Ordering::Acquire))
     }
 
     /// For the tests: every colour takes the pass from now on, with no table.
@@ -819,20 +690,12 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         cursor: Option<&DrawnCursor>,
     ) -> Option<(P::CommandBuffer, DrawnPresents<P>)> {
         self.scoped(|| {
-            let mut taken = Some(self.presented.drawn());
-            let (command_buffer, hold) = self.encode_shown_with(texture, region, &mut taken)?;
-            // On the compositor's GPU the mirror's sync took them, with the surface's block (the
-            // module doc, "The compositor's GPU"): this draw holds neither.
-            let presents = match taken {
-                Some(mut presents) => {
-                    if let Some(hold) = hold {
-                        // The surface's block stays until the draw has read it.
-                        presents.reading(hold);
-                    }
-                    presents
-                }
-                None => self.presented.drawn_by_none(),
-            };
+            let mut presents = self.presented.drawn();
+            let (command_buffer, hold) = self.encode_shown(texture, region)?;
+            if let Some(hold) = hold {
+                // The surface's block stays until the draw has read it.
+                presents.reading(hold);
+            }
             if let Some(cursor) = cursor
                 && !self.shown.asleep()
             {
@@ -930,19 +793,6 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         texture: &P::Texture,
         region: PixelRect,
     ) -> Option<(P::CommandBuffer, Option<Arc<DisplayHold>>)> {
-        self.encode_shown_with(texture, region, &mut None)
-    }
-
-    /// [`Self::encode_shown`], for a window draw that takes `presents`: on the compositor's GPU,
-    /// the mirror's sync that reads the presented surface takes them, with the surface's hold,
-    /// until it has finished, and leaves `None` (the module doc, "The compositor's GPU");
-    /// elsewhere they stay for the caller, as where the sync does not come to its read.
-    fn encode_shown_with(
-        &self,
-        texture: &P::Texture,
-        region: PixelRect,
-        presents: &mut Option<DrawnPresents<P>>,
-    ) -> Option<(P::CommandBuffer, Option<Arc<DisplayHold>>)> {
         self.forget_if_recovered();
         if self.shown.asleep() {
             // The display's panel is off: black, whatever the guest shows.
@@ -952,27 +802,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         }
         let (changes, color) = self.presented.color();
         let color = (!color.is_identity()).then_some((changes, color));
-        let shown = match &self.foreign {
-            None => self.presented.shown(),
-            Some(foreign) => match self.presented.shown() {
-                None => None,
-                Some((surface, hold)) => {
-                    let here = self.mirrored(foreign, &surface, |sync| {
-                        if let Some(mut taken) = presents.take() {
-                            taken.reading(Arc::clone(&hold));
-                            taken.after(sync);
-                        }
-                    });
-                    let Some(here) = here else {
-                        // Nothing drawn: the window presents from the runtime's GPU from now.
-                        foreign.refuse(surface.pixel_format());
-                        return None;
-                    };
-                    Some((here, hold))
-                }
-            },
-        };
-        if let Some((surface, hold)) = shown {
+        if let Some((surface, hold)) = self.presented.shown() {
             let (from, to) = (surface.pixel_format(), texture.pixel_format());
             self.presented.seen_format(from, to);
             let drawn = if let Some((changes, color)) = &color {
@@ -983,10 +813,6 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                 self.encode_converted(&surface, texture, region)
             };
             if let Some(drawn) = drawn {
-                if let Some(mirror) = (self.foreign.as_ref()).and_then(|f| f.mirror.made()) {
-                    // The next sync writes the mirror once this draw has read it.
-                    mirror.read_by(&drawn);
-                }
                 return Some((drawn, Some(hold)));
             }
             self.presented.refuse_format(from, to);
@@ -1004,134 +830,9 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         Some((command_buffer, None))
     }
 
-    /// The presented surface `surface` (the runtime's texture) as a texture of this draw's
-    /// device, the compositor's GPU's: the window's mirror, brought up to it ([`Mirror::sync`]),
-    /// imported there as a no-copy buffer whose deallocator holds the runtime's buffer over the
-    /// mirror, so its pages stay mapped while the import lives, and a linear texture over the
-    /// import. The import is made again where the mirror is. `None` where the mirror cannot carry
-    /// the surface, or the runtime or the device refuses the mirror, its sync, the import or the
-    /// texture. `reading` is handed the sync's command buffer that reads `surface`, before its
-    /// commit ([`Mirror::sync`]).
-    fn mirrored(
-        &self,
-        foreign: &Foreign<P>,
-        surface: &P::Texture,
-        reading: impl FnOnce(&P::CommandBuffer),
-    ) -> Option<P::Texture> {
-        if foreign.mirror.made().is_some_and(|m| m.recovered()) {
-            // The runtime's device recovered: its objects carry nothing on (the module doc, "A
-            // recovered device").
-            foreign.mirror.forget();
-            *foreign.import.lock() = None;
-        }
-        let mirror = foreign
-            .mirror
-            .get_or_make(|| Mirror::new(self.platform.metal_device(None)?))?;
-        let align = self.device.caps().limits.linear_texture_alignment_bytes;
-        let mut synced = mirror.sync(
-            surface,
-            align,
-            &|| self.platform.clock().now_mono(),
-            reading,
-        )?;
-        let completion = synced.completion.take();
-        let texture = self.foreign_texture(foreign, surface.pixel_format(), &synced)?;
-        // The draw of the texture waits for the sync ([`Self::surface_command_buffer`]).
-        *foreign.waiting.lock() = completion;
-        Some(texture)
-    }
-
-    /// A command buffer of the sink's queue for a draw of a presented surface. On the
-    /// compositor's GPU it waits first, on that GPU, for the window's mirror's sync the draw
-    /// reads, where the sync's completion came as a sync file ([`Mirror::sync`]); where this
-    /// device cannot wait for the file, the window's thread waits for the sync here, logged once.
-    #[cfg_attr(
-        windows,
-        expect(
-            unreachable_code,
-            reason = "a Windows sync file has no values (`SyncFile`): no code past one runs"
-        )
-    )]
+    /// A command buffer of the sink's queue for a draw of a presented surface.
     fn surface_command_buffer(&self) -> Option<P::CommandBuffer> {
-        let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
-        let waiting = (self.foreign.as_ref()).and_then(|f| f.waiting.lock().take());
-        if let Some(Completion { file, sync }) = waiting
-            && !command_buffer.encode_wait_for_sync_file(file)
-        {
-            if let Some(foreign) = &self.foreign
-                && !foreign.waits_on_host.swap(true, Ordering::AcqRel)
-            {
-                log::info!(
-                    target: "reims_vgpu::graphics",
-                    "the compositor's GPU cannot wait for the runtime's sync file of the window's \
-                     mirror: the window's thread waits for each sync"
-                );
-            }
-            no_catch(sync.wait_until_completed(OnFault::Die));
-        }
-        Some(command_buffer)
-    }
-
-    /// The mirror `synced` as a texture of `format` on this draw's device ([`Self::mirrored`]).
-    fn foreign_texture(
-        &self,
-        foreign: &Foreign<P>,
-        format: u64,
-        synced: &Synced<P>,
-    ) -> Option<P::Texture> {
-        let base = synced.buffer.contents();
-        let length = synced.buffer.length();
-        let key = TextureKey {
-            bytes_per_row: synced.bytes_per_row,
-            width: synced.width,
-            height: synced.height,
-            pixel_format: format,
-        };
-        let mut import = foreign.import.lock();
-        if !import
-            .as_ref()
-            .is_some_and(|i| (i.base, i.length) == (base.addr(), length))
-        {
-            *import = None;
-            let keep = synced.buffer.clone_ref();
-            // SAFETY: the runtime's buffer over the mirror holds the mirror's pages while it
-            // lives (`mirror`), a whole number of pages from a page, and the deallocator holds
-            // that buffer until the platform runs it, once the import has gone.
-            let bytes = unsafe { HostRange::new(base, length) };
-            let buffer = Kind::Mirror.making(|| {
-                no_catch(self.device.new_buffer_over_host_memory(
-                    OnFault::Die,
-                    bytes,
-                    0,
-                    Some(Box::new(move || drop(keep))),
-                ))
-            })?;
-            *import = Some(ForeignImport {
-                base: base.addr(),
-                length,
-                buffer,
-                textures: Vec::new(),
-            });
-        }
-        let import = import.as_mut()?;
-        if let Some((_, texture)) = import.textures.iter().find(|(k, _)| *k == key) {
-            return Some(texture.clone_ref());
-        }
-        let descriptor = self.platform.texture_descriptor(&TextureDesc {
-            pixel_format: key.pixel_format,
-            width: key.width,
-            height: key.height,
-            usage: TEXTURE_USAGE_SHADER_READ,
-            ..TextureDesc::default()
-        });
-        let texture = no_catch(import.buffer.new_linear_texture(
-            &descriptor,
-            0,
-            key.bytes_per_row,
-            0,
-        ))?;
-        import.textures.push((key, texture.clone_ref()));
-        Some(texture)
+        no_catch(self.queue.command_buffer(OnFault::Die))
     }
 
     /// A command buffer of the sink's queue with the scanout drawn into `texture` at `region`
@@ -1920,40 +1621,6 @@ mod tests {
         (platform, draw, presented, drawable)
     }
 
-    /// A draw as `rig`'s on a device of the window's own on the compositor's GPU (the fake
-    /// platform's one device stands for it and for the runtime's), presenting a 64 × 32 surface
-    /// of `format`.
-    fn rig_on_compositor(
-        format: u64,
-    ) -> (
-        Arc<FakePlatform>,
-        ScanoutDraw<FakePlatform>,
-        <FakePlatform as Platform>::Texture,
-        <FakePlatform as Platform>::Texture,
-    ) {
-        let platform = Arc::new(FakePlatform::new());
-        // The mirror's syncs wait for their command buffers, which complete as they commit.
-        platform.world().set_auto_complete(Some(CompleteOn::Thread));
-        let region = Arc::new(Region::new(reims_vgpu_graphics::REGION_SIZE as usize).unwrap());
-        let shown = Arc::new(Shown::default());
-        *shown.scanout.lock() = Some(SCANOUT);
-        let presented = Arc::new(Presented::<FakePlatform>::default());
-        let device = platform.metal_device(None).unwrap();
-        let draw =
-            ScanoutDraw::on_compositor(Arc::clone(&platform), device, &region, &shown, &presented)
-                .unwrap();
-        let drawable = texture(&draw, 80);
-        let surface = texture(&draw, format);
-        *presented.texture.lock() = Some(ShownTexture {
-            texture: surface.clone_ref(),
-            hold: Arc::new(DisplayHold {
-                span: None,
-                answers: Mutex::default(),
-            }),
-        });
-        (platform, draw, drawable, surface)
-    }
-
     /// The whole 64 × 32 drawable.
     const WHOLE: PixelRect = PixelRect {
         x: 0,
@@ -1961,64 +1628,6 @@ mod tests {
         width: 64,
         height: 32,
     };
-
-    /// On the compositor's GPU a presented surface is drawn from the window's mirror: the
-    /// runtime's GPU copies the surface's texture into a buffer of its own and runs the tile
-    /// kernel over the frame's one tile, which writes the mirror in host memory; the mirror is
-    /// imported on the draw's device and a linear texture over the import, at the mirror's
-    /// pitch, is copied into the drawable, never the runtime's texture. The next draw syncs the
-    /// mirror again, and takes the same import and texture
-    #[test]
-    fn on_the_compositors_gpu_a_surface_is_drawn_from_the_windows_mirror() {
-        let (platform, draw, drawable, surface) = rig_on_compositor(80);
-        let log = platform.call_log();
-        let mark = log.mark();
-        let _ = draw.encode(&drawable, WHOLE, None).unwrap();
-        let calls = log.since(mark);
-        let count =
-            |calls: &[Call], sel: &str| calls.iter().filter(|c| c.sel.starts_with(sel)).count();
-        // The sync: the surface copied into the runtime's buffer, the kernel over one tile.
-        let to_buffer: Vec<_> = (calls.iter())
-            .filter(|c| c.sel.starts_with("copyFromTexture") && c.sel.contains("toBuffer"))
-            .collect();
-        assert_eq!(to_buffer.len(), 1);
-        assert_eq!(to_buffer[0].args[0].as_obj(), Some(surface.id()));
-        assert_eq!(
-            count(&calls, "dispatchThreadgroups:threadsPerThreadgroup:"),
-            1
-        );
-        // The mirror over host pages, and its import: two no-copy buffers.
-        assert_eq!(count(&calls, "newBufferWithBytesNoCopy"), 2);
-        let linear: Vec<_> = (calls.iter())
-            .filter(|c| c.sel == "newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:")
-            .collect();
-        assert_eq!(linear.len(), 1);
-        assert_eq!(linear[0].args[1], Arg::U64(0));
-        assert_eq!(linear[0].args[2], Arg::U64(256));
-        let drawn: Vec<_> = (calls.iter())
-            .filter(|c| c.sel.starts_with("copyFromTexture") && c.sel.contains("toTexture"))
-            .map(|c| c.args[0].as_obj())
-            .collect();
-        assert_eq!(drawn.len(), 1);
-        assert_ne!(drawn[0], Some(surface.id()));
-        assert!(!draw.foreign_refused());
-        let mark = log.mark();
-        let _ = draw.encode(&drawable, WHOLE, None).unwrap();
-        let again = log.since(mark);
-        assert_eq!(
-            count(&again, "dispatchThreadgroups:threadsPerThreadgroup:"),
-            1
-        );
-        assert_eq!(count(&again, "newBufferWithBytesNoCopy"), 0);
-        assert_eq!(count(&again, "newLinearTexture"), 0);
-        assert_eq!(
-            (again.iter())
-                .filter(|c| c.sel.starts_with("copyFromTexture") && c.sel.contains("toTexture"))
-                .map(|c| c.args[0].as_obj())
-                .collect::<Vec<_>>(),
-            drawn
-        );
-    }
 
     /// `presented` shows `surface`, under a hold of its own: the hold, weakly, whose strong count
     /// is 1 while the display alone holds it.
@@ -2054,64 +1663,6 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-    }
-
-    /// On the compositor's GPU the mirror's sync is the only reader of the presented surface: the
-    /// presents a draw takes and the surface's block go once the sync has finished, while the
-    /// draw from the mirror is still running, and a draw held on its GPU holds neither. The next
-    /// sync writes the mirror only once that draw has finished
-    #[test]
-    fn on_the_compositors_gpu_the_presents_go_with_the_syncs_read_not_the_draw() {
-        let (platform, draw, drawable, surface) = rig_on_compositor(80);
-        let hold = show_held(&draw.presented, &surface);
-        let (command_buffer, presents) = draw.encode(&drawable, WHOLE, None).unwrap();
-        // The sync completed as it committed: the presents and the block went with it.
-        assert_eq!(hold.strong_count(), 1, "the sync let the surface go");
-        // The draw, held on its GPU, holds nothing of the surface's.
-        platform.world().set_auto_complete(None);
-        presents.after(&command_buffer);
-        no_catch(command_buffer.commit(OnFault::Die));
-        let running = committed(&platform, 1);
-        assert_eq!(running, [command_buffer.id()]);
-        assert_eq!(hold.strong_count(), 1, "the running draw holds no surface");
-        // The next draw's sync waits for that draw before it reads the surface or writes the
-        // mirror.
-        let draw = Arc::new(draw);
-        let log = platform.call_log();
-        let mark = log.mark();
-        let next = {
-            let (draw, drawable) = (Arc::clone(&draw), drawable.clone_ref());
-            #[allow(clippy::disallowed_methods)] // test helper thread: no Objective-C runs here
-            std::thread::spawn(move || draw.encode(&drawable, WHOLE, None).map(|(cb, _)| cb.id()))
-        };
-        #[allow(clippy::disallowed_methods)] // test scaffolding: real time lets the thread run
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert_eq!(
-            platform.world().committed(),
-            running,
-            "no sync while the draw runs"
-        );
-        assert!(
-            !log.since(mark)
-                .iter()
-                .any(|c| c.sel.starts_with("copyFromTexture")),
-            "nothing read or written"
-        );
-        platform.world().set_auto_complete(Some(CompleteOn::Thread));
-        assert!(platform.world().complete(
-            running[0],
-            CommandBufferStatus::COMPLETED,
-            None,
-            CompleteOn::Thread
-        ));
-        assert!(next.join().unwrap().is_some());
-        let calls = log.since(mark);
-        let read: Vec<_> = (calls.iter())
-            .filter(|c| c.sel.starts_with("copyFromTexture") && c.sel.contains("toBuffer"))
-            .collect();
-        assert_eq!(read.len(), 1, "the next sync, once the draw finished");
-        assert_eq!(read[0].args[0].as_obj(), Some(surface.id()));
-        assert_eq!(hold.strong_count(), 1);
     }
 
     /// On the runtime's own device the draw reads the presented surface itself: the presents it
@@ -2176,26 +1727,8 @@ mod tests {
         assert_eq!(count(&calls, "copyFrom"), 1, "{calls:?}");
     }
 
-    /// On the compositor's GPU a presented surface of a pixel format the window's mirror does not
-    /// carry draws nothing, and the draw says so, so the window presents from the runtime's GPU
-    /// (`graphics::vulkan`)
-    #[test]
-    fn on_the_compositors_gpu_a_surface_the_mirror_cannot_carry_ends_its_draws() {
-        // A8Unorm: one byte a pixel.
-        let (platform, draw, drawable, _) = rig_on_compositor(1);
-        let log = platform.call_log();
-        let mark = log.mark();
-        assert!(draw.encode(&drawable, WHOLE, None).is_none());
-        assert!(draw.foreign_refused());
-        assert!(
-            !log.since(mark)
-                .iter()
-                .any(|c| c.sel.starts_with("copyFrom"))
-        );
-    }
-
     /// On the runtime's own device a presented surface is drawn from the runtime's texture, with
-    /// no mirror, and the draw never says it cannot draw it
+    /// no import of its pages and no compare kernel
     #[test]
     fn on_the_runtimes_device_a_surface_is_drawn_from_its_texture() {
         let (platform, draw, presented, drawable) = rig();
@@ -2222,7 +1755,6 @@ mod tests {
             .map(|c| c.args[0].as_obj())
             .collect();
         assert_eq!(copies, [Some(surface.id())]);
-        assert!(!draw.foreign_refused());
     }
 
     /// A cursor of a 4 × 4 glyph, its hot spot at (1, 1), at (10, 20) in a 64 × 32 mode.
@@ -2372,13 +1904,13 @@ mod tests {
         assert!(sels.contains(&"commit"));
     }
 
-    /// On Vulkan, the cursor's pass puts the guest's glyph over the frame by its alpha where the
+    /// On the host's GPU, the cursor's pass puts the guest's glyph over the frame by its alpha where the
     /// guest put its hot spot, at a pixel of the drawable to a pixel of the glyph, and keeps
     /// every other pixel of the frame: an opaque pixel of the glyph replaces the frame's, a half
     /// transparent one is blended over it, a transparent one leaves it
     #[test]
     fn on_vulkan_the_cursor_s_pass_blends_the_glyph_over_the_frame() {
-        let platform = Arc::new(reims_vgpu_vulkan::VulkanPlatform::new());
+        let platform = crate::rt_test_end::platform();
         crate::entry::run(|_| cursor_blends_over_the_frame(&platform));
     }
 
@@ -3106,7 +2638,7 @@ mod tests {
     /// none the identity
     #[test]
     fn on_vulkan_the_table_draws_what_the_pass_draws() {
-        the_table_draws_what_the_pass_draws(Arc::new(reims_vgpu_vulkan::VulkanPlatform::new()));
+        the_table_draws_what_the_pass_draws(crate::rt_test_end::platform());
     }
 
     /// `on_vulkan_the_table_draws_what_the_pass_draws`, on `platform`.
@@ -3310,114 +2842,6 @@ mod tests {
         }
     }
 
-    /// After the device's recovery (its `VkDevice` lost and made again), a draw of the scanout
-    /// through a colour draws what it drew before the recovery, through the colour's table and
-    /// through its pass: the draws make again what they kept (the module doc, "A recovered
-    /// device"), where the kept pipelines, buffers, ramp and table would be refused on the new
-    /// `VkDevice`, or read zero
-    #[test]
-    fn on_vulkan_a_recovered_device_draws_through_the_colour_as_before() {
-        let platform = Arc::new(reims_vgpu_vulkan::VulkanPlatform::new());
-        crate::entry::run(|_| recovered_device_draws_as_before(&platform));
-    }
-
-    /// [`on_vulkan_a_recovered_device_draws_through_the_colour_as_before`]'s body, inside the
-    /// library's entry.
-    fn recovered_device_draws_as_before(platform: &Arc<reims_vgpu_vulkan::VulkanPlatform>) {
-        use reims_vgpu_graphics::wire::RGFX_ALLOCATIONS_OFFSET;
-        type P = reims_vgpu_vulkan::VulkanPlatform;
-
-        const W: u32 = 512;
-        const H: u32 = 4;
-        let region = Arc::new(crate::platform::test_region(
-            &**platform,
-            reims_vgpu_graphics::REGION_SIZE as usize,
-        ));
-        // BGRA bytes, every value in each channel along a row.
-        let scanout: Vec<u8> = (0..H)
-            .flat_map(|y| (0..W).map(move |x| (x, y)))
-            .flat_map(|(x, y)| {
-                [x % 256, (x * 3 + y * 7) % 256, 255 - (x + y) % 256, 255]
-                    .map(|v| u8::try_from(v).unwrap())
-            })
-            .collect();
-        // SAFETY: the scanout lies inside the region, mapped while it lives.
-        unsafe {
-            let at = region.base().add(RGFX_ALLOCATIONS_OFFSET as usize);
-            std::ptr::copy_nonoverlapping(scanout.as_ptr(), at, scanout.len());
-        }
-        let shown = Arc::new(Shown::default());
-        *shown.scanout.lock() = Some(Scanout {
-            width: W,
-            height: H,
-            stride: W * 4,
-            offset: RGFX_ALLOCATIONS_OFFSET,
-        });
-        let presented = Arc::new(Presented::<P>::default());
-        let tabled = ScanoutDraw::new(Arc::clone(platform), &region, &shown, &presented).unwrap();
-        let passed = ScanoutDraw::new(Arc::clone(platform), &region, &shown, &presented).unwrap();
-        passed.without_tables();
-        let entries: Table = Arc::from(
-            (0..256)
-                .map(|k| {
-                    #[expect(clippy::as_conversions, reason = "a small count")]
-                    let x = k as f32 / 255.0;
-                    [x.powf(1.0 / 2.2), x.powf(1.8), 1.0 - x, 0.0]
-                })
-                .collect::<Vec<_>>(),
-        );
-        *presented.color.lock() = (
-            1,
-            Arc::new(DisplayColor {
-                stages: [Some(entries), None, None, None],
-            }),
-        );
-        let whole = PixelRect {
-            x: 0,
-            y: 0,
-            width: u64::from(W),
-            height: u64::from(H),
-        };
-        let device = platform.metal_device(None).unwrap();
-        let read = |draw: &ScanoutDraw<P>| -> Vec<u8> {
-            let descriptor = platform.texture_descriptor(&TextureDesc {
-                pixel_format: 80,
-                width: u64::from(W),
-                height: u64::from(H),
-                usage: 0x1 | 0x4,
-                resource_options: Some(0),
-                ..TextureDesc::default()
-            });
-            let target = (device.new_texture(OnFault::Die, &descriptor))
-                .unwrap()
-                .unwrap();
-            let (command_buffer, hold) = draw.encode_shown(&target, whole).unwrap();
-            command_buffer.commit(OnFault::Die).unwrap();
-            command_buffer.wait_until_completed(OnFault::Die).unwrap();
-            assert_eq!(command_buffer.status(), CommandBufferStatus::COMPLETED);
-            drop(hold);
-            let mut bytes = vec![0; (W * H * 4) as usize];
-            platform.read_pixels(&target, &mut bytes, (W * 4) as usize);
-            bytes
-        };
-        // Twice before: the first draws the table, the second draws through it.
-        let before = [read(&tabled), read(&tabled), read(&passed)];
-        assert!(tabled.color_table.lock().is_some(), "no table drawn");
-        assert_eq!(before[0], before[2], "the table draws what the pass draws");
-        assert_eq!(before[1], before[2]);
-        assert_ne!(before[2], scanout, "the colour changed the bytes");
-
-        let recoveries = device.recoveries();
-        device.raw.recover_for_test().expect("the recovery");
-        assert!(device.recoveries() > recoveries, "the recovery was counted");
-
-        for (i, draw) in [&tabled, &tabled, &passed].into_iter().enumerate() {
-            let after = read(draw);
-            let differ = (after.iter().zip(&before[i])).position(|(a, b)| a != b);
-            assert_eq!(differ, None, "draw {i} after the recovery: byte {differ:?}");
-        }
-    }
-
     /// A pass whose draw covers the drawable loads none of its old pixels, and one whose draw
     /// covers part of it, a guest mode smaller than the drawable, clears the rest to black first
     /// ([`pass_load`]): drawn over a drawable that held one value in every pixel and over one that
@@ -3427,7 +2851,7 @@ mod tests {
     /// offers in each (its width down to a multiple of 16, its height to even)
     #[test]
     fn on_vulkan_a_pass_that_skips_its_clear_writes_every_pixel_of_the_drawable() {
-        let platform = Arc::new(reims_vgpu_vulkan::VulkanPlatform::new());
+        let platform = crate::rt_test_end::platform();
         crate::entry::run(|_| a_pass_writes_every_pixel(&platform));
     }
 
@@ -3599,203 +3023,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// On Vulkan, a draw on a device of the window's own (here on the runtime's GPU too) from the
-    /// window's mirror draws the pixels a draw from the presented texture draws: at the mirror's
-    /// first sync, which sends every tile, after a change to two tiles of the frame (one at its
-    /// edges), which sends those alone, with nothing changed, which sends none, and at a frame of
-    /// another size and format, for which the mirror is made again. Each sync asks for its
-    /// completion as a sync file where the runtime exports one (Linux's drivers), which the draw
-    /// waits for on its GPU unless the sync finished before the export looked; else the window's
-    /// thread waits for it (MoltenVK). Where the runtime exports one, at least one of the test's
-    /// eight syncs goes to the draw as a sync file
-    #[test]
-    fn on_vulkan_a_draw_from_the_mirror_draws_what_a_draw_from_the_texture_draws() {
-        mirror_draws_what_the_texture_draws(false);
-    }
-
-    /// On Vulkan, with the mirror's copies on a queue of their own (`mirror`, "On a copy
-    /// engine"), a draw from the mirror draws the pixels a draw from the presented texture
-    /// draws, at the same syncs as above: the compare's kernel lists the tiles that changed on
-    /// the GPU, and only those are copied into the mirror. The queue is one of the runtime's
-    /// own, the Vulkan platform giving no queue on a copy engine: what the copies write is the
-    /// same on either. A sync that lists no tile copies nothing and asks for no sync file
-    #[test]
-    fn on_vulkan_with_a_queue_for_copies_a_draw_from_the_mirror_draws_what_a_draw_from_the_texture_draws()
-     {
-        mirror_draws_what_the_texture_draws(true);
-    }
-
-    /// The tests above, the mirror's copies on a queue of their own where `copies`.
-    fn mirror_draws_what_the_texture_draws(copies: bool) {
-        use reims_vgpu_vulkan::VulkanPlatform;
-        let platform = Arc::new(VulkanPlatform::new());
-        crate::entry::run(|_| {
-            let Some(window) = VulkanPlatform::default_device_registry_id()
-                .and_then(VulkanPlatform::window_device)
-            else {
-                panic!("no window device on the runtime's GPU");
-            };
-            let region = Arc::new(crate::platform::test_region(
-                &*platform,
-                reims_vgpu_graphics::REGION_SIZE as usize,
-            ));
-            let shown = Arc::new(Shown::default());
-            *shown.scanout.lock() = Some(SCANOUT);
-            let presented = Arc::new(Presented::<VulkanPlatform>::default());
-            let own = ScanoutDraw::new(Arc::clone(&platform), &region, &shown, &presented).unwrap();
-            let theirs = ScanoutDraw::on_compositor(
-                Arc::clone(&platform),
-                window,
-                &region,
-                &shown,
-                &presented,
-            )
-            .unwrap();
-            let texture_on = |device: &<VulkanPlatform as Platform>::Device,
-                              format: u64,
-                              usage: u64,
-                              (width, height): (u64, u64)| {
-                let descriptor = platform.texture_descriptor(&TextureDesc {
-                    pixel_format: format,
-                    width,
-                    height,
-                    usage,
-                    resource_options: Some(0),
-                    ..TextureDesc::default()
-                });
-                no_catch(device.new_texture(OnFault::Die, &descriptor)).unwrap()
-            };
-            let fill = |texture: &<VulkanPlatform as Platform>::Texture,
-                        bytes: &[u8],
-                        at: (u64, u64),
-                        (width, height): (u64, u64),
-                        pixel: u64| {
-                let length = bytes.len() as u64;
-                // SAFETY: the bytes live across the call, which copies them out.
-                let range =
-                    unsafe { HostRange::new(HostPtr::from_ptr(bytes.as_ptr().cast_mut()), length) };
-                texture
-                    .replace_region(
-                        MtlRegion {
-                            origin: MtlOrigin::new(at.0, at.1, 0),
-                            size: MtlSize::new(width, height, 1),
-                        },
-                        0,
-                        0,
-                        range,
-                        width * pixel,
-                        length,
-                    )
-                    .unwrap();
-            };
-            let pattern = |(width, height): (u64, u64), pixel: u64, seed: u64| -> Vec<u8> {
-                (0..width * height * pixel)
-                    .map(|i| ((i * 2654435761 + seed * 40503) >> 7) as u8)
-                    .collect()
-            };
-            // What `draw` draws of the presented surface into a drawable of its device.
-            let read = |draw: &ScanoutDraw<VulkanPlatform>, size: (u64, u64)| -> Vec<u8> {
-                let target = texture_on(&draw.device, 80, 0x1 | 0x4, size);
-                let whole = PixelRect {
-                    x: 0,
-                    y: 0,
-                    width: size.0,
-                    height: size.1,
-                };
-                let (command_buffer, hold) = draw.encode_shown(&target, whole).unwrap();
-                command_buffer.commit(OnFault::Die).unwrap();
-                command_buffer.wait_until_completed(OnFault::Die).unwrap();
-                drop(hold);
-                let mut bytes = vec![0; (size.0 * size.1 * 4) as usize];
-                platform.read_pixels(&target, &mut bytes, (size.0 * 4) as usize);
-                bytes
-            };
-            let runtime = platform.metal_device(None).unwrap();
-            if copies {
-                let foreign = theirs.foreign.as_ref().unwrap();
-                let queue = runtime.new_command_queue();
-                let mirror = foreign
-                    .mirror
-                    .get_or_make(|| Mirror::with_copies(runtime.clone_ref(), queue))
-                    .unwrap();
-                assert!(
-                    mirror.copies_on_their_queue(),
-                    "the list's kernel's pipeline"
-                );
-            }
-            // Whether the runtime exports a command buffer's completion as a sync file here.
-            let exports = {
-                let queue = runtime.new_command_queue().unwrap();
-                let probe = no_catch(queue.command_buffer(OnFault::Die)).unwrap();
-                let asked = probe.add_completion_sync_file();
-                probe.commit(OnFault::Die).unwrap();
-                if asked {
-                    assert!(probe.export_completion_sync_file().is_some());
-                }
-                probe.wait_until_completed(OnFault::Die).unwrap();
-                asked
-            };
-            // The syncs whose completion went to the draw as a sync file.
-            let mut on_gpu = 0;
-            // 200 x 130: four tiles by three, those at the right and the bottom partial.
-            for (format, pixel, size) in [(94, 4, (200, 130)), (80, 4, (67, 70))] {
-                let surface = texture_on(&runtime, format, 0x1, size);
-                fill(&surface, &pattern(size, pixel, 1), (0, 0), size, pixel);
-                *presented.texture.lock() = Some(ShownTexture {
-                    texture: Handle::clone_ref(&surface),
-                    hold: Arc::new(DisplayHold {
-                        span: None,
-                        answers: Mutex::default(),
-                    }),
-                });
-                let mut check = |case: &str, tiles: u64| {
-                    let (a, b) = (read(&own, size), read(&theirs, size));
-                    let mirror = (theirs.foreign.as_ref())
-                        .and_then(|f| f.mirror.made())
-                        .unwrap();
-                    assert_eq!(
-                        mirror.last_asked(),
-                        exports && (tiles > 0 || !copies),
-                        "format {format} {size:?}, {case}: the sync asked for its completion as \
-                         a sync file"
-                    );
-                    assert!(
-                        exports || !mirror.last_on_gpu(),
-                        "format {format} {size:?}, {case}: a sync file no sync asked for"
-                    );
-                    on_gpu += u64::from(mirror.last_on_gpu());
-                    assert_eq!(
-                        mirror.last_sent(),
-                        tiles,
-                        "format {format} {size:?}, {case}"
-                    );
-                    let differ = (a.chunks(4).zip(b.chunks(4))).position(|(x, y)| x != y);
-                    assert_eq!(
-                        differ,
-                        None,
-                        "format {format} {size:?}, {case}: pixel {:?} differs",
-                        differ.map(|d| (d as u64 % size.0, d as u64 / size.0))
-                    );
-                    assert!(!theirs.foreign_refused(), "{case}");
-                };
-                let all = size.0.div_ceil(64) * size.1.div_ceil(64);
-                check("the first sync", all);
-                // A pixel of the second tile of the second row, and a block across the last
-                // tile's edge.
-                let inner = (70.min(size.0 - 1), 70.min(size.1 - 1));
-                fill(&surface, &pattern((1, 1), pixel, 2), inner, (1, 1), pixel);
-                let edge = (size.0 - 3, size.1 - 2);
-                fill(&surface, &pattern((3, 2), pixel, 3), edge, (3, 2), pixel);
-                // 200 x 130: tiles (1, 1) and (3, 2); 67 x 70: both in tile (1, 1).
-                check("two tiles changed", if all == 12 { 2 } else { 1 });
-                check("nothing changed", 0);
-            }
-            assert!(
-                !exports || on_gpu > 0,
-                "no sync's completion went to the draw as a sync file"
-            );
-        });
     }
 }

@@ -30,13 +30,6 @@ use reims_vgpu_vulkan::core::trace;
 use super::{BlockError, BlockId, BlockInfo, BlockSource, MemoryClass};
 
 /// The pool's blocks from an rt device, with the handle of each one handed out.
-#[cfg_attr(
-    not(any(test, feature = "rt")),
-    expect(
-        dead_code,
-        reason = "the pool's source over rt, which only the rt platform's devices take"
-    )
-)]
 pub(crate) struct RtBlocks {
     device: rt::Device,
     /// The blocks the platform's device knows, where each block handed out is known.
@@ -48,13 +41,6 @@ pub(crate) struct RtBlocks {
 impl RtBlocks {
     /// A source of `device`'s blocks, with none handed out, each known in `known` (the rt
     /// platform's device's set) while it is.
-    #[cfg_attr(
-        not(any(test, feature = "rt")),
-        expect(
-            dead_code,
-            reason = "the pool's source over rt, which only the rt platform's devices take"
-        )
-    )]
     pub(crate) fn new(device: rt::Device, known: Box<dyn Knowing>) -> RtBlocks {
         RtBlocks {
             device,
@@ -66,13 +52,6 @@ impl RtBlocks {
 
 /// The set a source of rt's blocks tells of each block it hands out, which holds a handle of the
 /// block while it knows it: the rt platform's device's (`rt_platform::KnownBlocks`).
-#[cfg_attr(
-    not(any(test, feature = "rt")),
-    expect(
-        dead_code,
-        reason = "the pool's source over rt, which only the rt platform's devices take"
-    )
-)]
 pub(crate) trait Knowing: Send + Sync {
     /// Knows `block`, handed out.
     fn know(&self, block: rt::Block);
@@ -80,7 +59,6 @@ pub(crate) trait Knowing: Send + Sync {
     fn forget(&self, id: rt::BlockId);
 }
 
-#[cfg(feature = "rt")]
 impl Knowing for reims_vgpu_vulkan::rt_platform::KnownBlocks {
     fn know(&self, block: rt::Block) {
         reims_vgpu_vulkan::rt_platform::KnownBlocks::know(self, block);

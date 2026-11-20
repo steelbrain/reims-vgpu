@@ -251,17 +251,6 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// queue between command queues answers `new_command_queue`'s queue. Never nil-checked; a raise
     /// inside it dies at the call, as one inside `newCommandQueue` does.
     fn new_command_queue_unshared(&self) -> Option<P::CommandQueue>;
-    /// No Metal counterpart: a queue as [`new_command_queue`](GpuDevice::new_command_queue)'s
-    /// whose command buffers carry blits between the device's buffers alone, run by a copy
-    /// engine of the GPU apart from the engine its render and compute work runs on (a queue
-    /// family of transfers alone), so that its copies neither wait behind another queue's
-    /// command buffers nor take that engine's time while they cross the GPU's link: the window's
-    /// mirror's copies into host memory (`reims_vgpu::graphics::mirror`). `None` where the
-    /// platform has no such queue to give, the default: the Vulkan platform's runtime gives a
-    /// program no queue on a copy engine.
-    fn new_command_queue_for_copies(&self) -> Option<P::CommandQueue> {
-        None
-    }
     /// No Metal counterpart: how many times the platform recovered the device's GPU so far, its
     /// lost device made again behind the same device object (the Vulkan platform's runtime makes
     /// a new `VkDevice`, `device-recovered`). The textures, pipelines and pooled buffers made

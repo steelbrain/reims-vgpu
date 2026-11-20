@@ -9,7 +9,7 @@
 //! Two kinds of entry:
 //! - **Registrations** of memory the library does not map itself: the guest's RAM, a shared
 //!   mapping of the files the host names in its memory map (the `guest_memory` lease of the
-//!   memory map's device), and memory of the library's own (`super::linux`'s `vm::OwnMemory`).
+//!   memory map's device).
 //!   One registered again over the same descriptor and offset is counted, and goes with the
 //!   last. The C API duplicates the host's descriptors for each device it makes, so devices over
 //!   the same RAM register it each under its own: a byte resolves through the first registration
@@ -60,55 +60,30 @@ pub(crate) struct Backing {
 }
 
 /// A run of the library's own mapping: its end, its file, the protection set on it (core's
-/// `VmProt`), the dma-buf it is mapped through, if it is (module docs), and the view it is of.
+/// `VmProt`), and the dma-buf it is mapped through, if it is (module docs).
 #[derive(Clone, Debug)]
 struct Run {
     end: u64,
     backing: Backing,
     prot: VmProt,
     through: Option<Through>,
-    /// The number of the record that made it ([`next_view`]): the runs of one view, recorded at
-    /// once, share it, and a run cut or protected keeps it. A run's file and offset never change
-    /// under its number, so bytes of runs of one number show the pages they showed as the view
-    /// was recorded ([`view_of`]).
-    view: u64,
-}
-
-/// A number for a new record of runs ([`Run::view`]), unique in the process.
-fn next_view() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Where a run mapped through a dma-buf lies in it: the dma-buf, by a number of the process's
-/// own (one per mapping of one, never used again), the offset of the run's first byte there, and
-/// the dma-buf itself where a view is mapped through it whole and it is kept for the view's
-/// imports ([`Kept`]; module docs).
+/// own (one per mapping of one, never used again), and the offset of the run's first byte there
+/// (module docs).
 #[derive(Clone, Debug)]
 pub(crate) struct Through {
     pub(crate) buf: u64,
     pub(crate) offset: u64,
-    pub(crate) kept: Option<Arc<Kept>>,
 }
 
 /// Two places are the same where they are the same dma-buf's at the same offset: a dma-buf's
-/// number is its own, so its kept descriptor is the same too.
+/// number is its own.
 impl PartialEq for Through {
     fn eq(&self, other: &Through) -> bool {
         self.buf == other.buf && self.offset == other.offset
     }
-}
-
-/// A dma-buf a whole view is mapped through, kept open while a run of the table lies in it, so
-/// that an import of the view is given a duplicate of its descriptor and no dma-buf is made again
-/// (`super::linux`'s `vm` module docs, "Imports of views"): its descriptor and its bytes. It
-/// closes as the last run in it goes, before or as the view is unmapped, which holds the dma-buf
-/// until then. Dma-bufs are Linux's alone.
-#[derive(Debug)]
-#[cfg_attr(windows, allow(dead_code))]
-pub(crate) struct Kept {
-    pub(crate) fd: HostFile,
-    pub(crate) length: u64,
 }
 
 impl Through {
@@ -148,10 +123,6 @@ struct Table {
     runs: BTreeMap<u64, Run>,
     /// The pairs of neighbouring runs the kernel holds as one mapping ([`joined`]).
     joins: usize,
-    /// The kept dma-bufs of the runs dropped ([`Kept`]), let go of once the lock is (each public
-    /// call that drops runs takes them, [`Table::closing`]): where one is the last of its
-    /// dma-buf, its close releases the dma-buf's pages, which waits for nothing of the table.
-    closing: Vec<Arc<Kept>>,
 }
 
 /// The process's table.
@@ -159,7 +130,6 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
     registered: Vec::new(),
     runs: BTreeMap::new(),
     joins: 0,
-    closing: Vec::new(),
 });
 
 /// Whether the kernel holds the run `a` from `a_first` and the run `b` from `b_first` as one
@@ -217,19 +187,6 @@ impl Table {
     /// The registration holding byte `at`.
     fn registered_at(&self, at: u64) -> Option<&Registered> {
         self.registered.iter().find(|r| r.first <= at && at < r.end)
-    }
-
-    /// Where the byte at `offset` of the file `fd` lies in a range of the guest's RAM a lease
-    /// registered: its host address there, and the bytes from it to the range's end.
-    #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
-    fn ram_at(&self, file: &Arc<HostFile>, offset: u64) -> Option<(u64, u64)> {
-        (self.registered.iter())
-            .filter(|r| r.ram > 0 && Arc::ptr_eq(&r.backing.file, file))
-            .find_map(|r| {
-                let into = offset.checked_sub(r.backing.offset)?;
-                let length = r.end - r.first;
-                (into < length).then(|| (r.first + into, length - into))
-            })
     }
 
     /// Calls `each` with the file behind each stretch of `first..end`, in order: the run or
@@ -315,7 +272,6 @@ impl Table {
                 offset: t.offset + (at - first),
                 ..t.clone()
             }),
-            view: run.view,
         };
         self.insert(first, Run { end: at, ..run });
         self.insert(at, tail);
@@ -345,21 +301,11 @@ impl Table {
             prior = Some((at, run));
         }
         self.joins -= gone;
-        for (_, run) in self.runs.extract_if(first..end, |_, _| true) {
-            if let Some(kept) = run.through.and_then(|t| t.kept) {
-                self.closing.push(kept);
-            }
-        }
-    }
-
-    /// The kept dma-bufs of the runs dropped since the last call ([`Table::closing`]), for the
-    /// caller to let go of once the lock is.
-    fn closing(&mut self) -> Vec<Arc<Kept>> {
-        std::mem::take(&mut self.closing)
+        self.runs.extract_if(first..end, |_, _| true).for_each(drop);
     }
 
     /// `first..end` shows `backing` with protection `prot` from now on, mapped through the
-    /// dma-buf `through` names where it does (`record`), a record of its own ([`Run::view`]).
+    /// dma-buf `through` names where it does (`record`).
     fn record(
         &mut self,
         first: u64,
@@ -367,19 +313,6 @@ impl Table {
         backing: Backing,
         prot: VmProt,
         through: Option<Through>,
-    ) {
-        self.record_of(first, end, backing, prot, through, next_view());
-    }
-
-    /// [`Self::record`], as a run of the record numbered `view`.
-    fn record_of(
-        &mut self,
-        first: u64,
-        end: u64,
-        backing: Backing,
-        prot: VmProt,
-        through: Option<Through>,
-        view: u64,
     ) {
         self.forget(first, end);
         if first < end {
@@ -390,7 +323,6 @@ impl Table {
                     backing,
                     prot,
                     through,
-                    view,
                 },
             );
         }
@@ -437,8 +369,8 @@ impl Table {
     /// holds ([`Self::holds_none`]), in order: nothing of another run to cut or drop, and each
     /// piece joins only the one before it, the first the run before the range and the last the
     /// run after it, as [`Self::insert`] counts them, counted from the pieces themselves before
-    /// they go in. The runs are of the record numbered `view`.
-    fn record_fresh(&mut self, target: u64, pieces: Vec<Piece>, view: u64) {
+    /// they go in.
+    fn record_fresh(&mut self, target: u64, pieces: Vec<Piece>) {
         let runs: Vec<(u64, Run)> = (pieces.into_iter())
             .filter_map(|piece| {
                 let first = target.saturating_add(piece.at);
@@ -450,7 +382,6 @@ impl Table {
                         backing: piece.backing,
                         prot: piece.prot,
                         through: None,
-                        view,
                     },
                 ))
             })
@@ -558,18 +489,12 @@ pub(crate) fn file_spans() -> Vec<std::ops::Range<u64>> {
 pub(crate) fn record(first: u64, length: u64, backing: Backing, prot: VmProt) {
     let mut table = TABLE.lock();
     table.record(first, first.saturating_add(length), backing, prot, None);
-    let closing = table.closing();
-    drop(table);
-    drop(closing);
 }
 
 /// `length` bytes from `first` show no file from now on.
 pub(crate) fn forget(first: u64, length: u64) {
     let mut table = TABLE.lock();
     table.forget(first, first.saturating_add(length));
-    let closing = table.closing();
-    drop(table);
-    drop(closing);
 }
 
 /// The pieces of `length` bytes from `first`, in order, each bytes of one file that follow on in
@@ -640,8 +565,6 @@ pub(crate) fn view_pieces(sources: &[(u64, u64)]) -> Result<Vec<Piece>, (usize, 
 /// Over bytes no run holds, as a view's over core's fresh reservation, the pieces in order are
 /// added as they are, with no run to cut ([`Table::record_fresh`]).
 pub(crate) fn record_pieces(target: u64, pieces: Vec<Piece>) {
-    // One view's runs, one record's number.
-    let view = next_view();
     let mut table = TABLE.lock();
     let end = (pieces.iter())
         .map(|p| target.saturating_add(p.at).saturating_add(p.length))
@@ -651,33 +574,26 @@ pub(crate) fn record_pieces(target: u64, pieces: Vec<Piece>) {
         && in_order
         && table.holds_none(target, end)
     {
-        table.record_fresh(target, pieces, view);
+        table.record_fresh(target, pieces);
         return;
     }
     for piece in pieces {
         let first = target.saturating_add(piece.at);
         let end = first.saturating_add(piece.length);
-        table.record_of(first, end, piece.backing, piece.prot, None, view);
+        table.record(first, end, piece.backing, piece.prot, None);
     }
-    let closing = table.closing();
-    drop(table);
-    drop(closing);
 }
 
 /// As [`record_pieces`], for pieces mapped through dma-bufs, each where its [`Through`] says
 /// (module docs).
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn record_through(target: u64, pieces: Vec<(Piece, Through)>) {
-    let view = next_view();
     let mut table = TABLE.lock();
     for (piece, through) in pieces {
         let first = target.saturating_add(piece.at);
         let end = first.saturating_add(piece.length);
-        table.record_of(first, end, piece.backing, piece.prot, Some(through), view);
+        table.record(first, end, piece.backing, piece.prot, Some(through));
     }
-    let closing = table.closing();
-    drop(table);
-    drop(closing);
 }
 
 /// The runs in `first..end` mapped through a dma-buf, cut to it, in order, as pieces from
@@ -701,114 +617,6 @@ pub(crate) fn through_pieces(first: u64, end: u64) -> Vec<Piece> {
             }
         })
         .collect()
-}
-
-/// The view the `length` bytes from `first` lie in: the number of the record whose runs hold
-/// every byte of them, one run after another ([`Run::view`]); `None` where a byte lies in no
-/// run, or in a run of another record.
-#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
-pub(crate) fn view_of(first: u64, length: u64) -> Option<u64> {
-    let end = first.checked_add(length)?;
-    let table = TABLE.lock();
-    let (start, run) = table.run_at(first)?;
-    let view = run.view;
-    let mut at = start;
-    for (&from, run) in table.runs.range(start..end) {
-        if from != at || run.view != view {
-            return None;
-        }
-        at = run.end;
-    }
-    (at >= end).then_some(view)
-}
-
-/// The runs of the record numbered `view` around the byte `at` that follow on from one another
-/// with no byte between ([`Run::view`]), as pieces from the first of them ([`pieces`]): its
-/// first byte, and the pieces. `None` where `at` lies in no run of that record, or where they
-/// are more than `most` runs.
-#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
-pub(crate) fn view_runs(view: u64, at: u64, most: usize) -> Option<(u64, Vec<Piece>)> {
-    let table = TABLE.lock();
-    let (start, run) = table.run_at(at)?;
-    if run.view != view {
-        return None;
-    }
-    let (mut first, mut end, mut runs) = (start, run.end, 1usize);
-    for (&from, run) in table.runs.range(..start).rev() {
-        if run.end != first || run.view != view {
-            break;
-        }
-        (first, runs) = (from, runs + 1);
-        if runs > most {
-            return None;
-        }
-    }
-    for (&from, run) in table.runs.range(end..) {
-        if from != end || run.view != view {
-            break;
-        }
-        (end, runs) = (run.end, runs + 1);
-        if runs > most {
-            return None;
-        }
-    }
-    let mut pieces = Vec::new();
-    (table.pieces_into(first, end - first, 0, &mut pieces)).then_some((first, pieces))
-}
-
-/// The dma-buf a view is mapped through whole ([`Kept`]) where the `length` bytes from `first`
-/// are all of it, in order: each run there lies in that dma-buf at the offset of its first byte
-/// from `first`. None where a byte of them lies elsewhere, or the dma-buf holds more.
-#[cfg_attr(windows, allow(dead_code))]
-pub(crate) fn kept_whole(first: u64, length: u64) -> Option<Arc<Kept>> {
-    let end = first.checked_add(length)?;
-    let table = TABLE.lock();
-    let (start, run) = table.run_at(first)?;
-    let through = run.through.as_ref()?;
-    let kept = through.kept.as_ref()?;
-    if start != first || through.offset != 0 || kept.length != length {
-        return None;
-    }
-    let mut at = first;
-    for (&from, run) in table.runs.range(first..end) {
-        let lies = (run.through.as_ref())
-            .is_some_and(|t| t.buf == through.buf && t.offset == from - first);
-        if from != at || !lies {
-            return None;
-        }
-        at = run.end;
-    }
-    (at == end).then(|| Arc::clone(kept))
-}
-
-/// Whether a view mapped through one dma-buf kept whole ([`Kept`]) holds the `length` bytes from
-/// `first`: the view the run at `first` lies in, where [`kept_whole`] answers its own bytes and
-/// they reach past these.
-#[cfg_attr(windows, allow(dead_code))]
-pub(crate) fn kept_whole_holds(first: u64, length: u64) -> bool {
-    let Some(end) = first.checked_add(length) else {
-        return false;
-    };
-    let view = {
-        let table = TABLE.lock();
-        let Some((start, run)) = table.run_at(first) else {
-            return false;
-        };
-        let Some(through) = run.through.as_ref() else {
-            return false;
-        };
-        let Some(kept) = through.kept.as_ref() else {
-            return false;
-        };
-        start
-            .checked_sub(through.offset)
-            .map(|at| (at, kept.length))
-    };
-    view.is_some_and(|(at, bytes)| {
-        at.checked_add(bytes)
-            .is_some_and(|view_end| end <= view_end)
-            && kept_whole(at, bytes).is_some()
-    })
 }
 
 /// Sets the protection of what of the runs lies in `length` bytes from `first` to `prot`,
@@ -853,7 +661,8 @@ pub(crate) fn readable(first: u64, length: u64) -> Option<bool> {
     TABLE.lock().all_have(first, end, VmProt::READ)
 }
 
-/// As [`readable`], for write access.
+/// As [`readable`], for write access, which the tests check.
+#[cfg(test)]
 pub(crate) fn writable(first: u64, length: u64) -> Option<bool> {
     let end = first.checked_add(length)?;
     TABLE.lock().all_have(first, end, VmProt::WRITE)
@@ -883,6 +692,7 @@ pub(crate) struct Registration {
 impl Registration {
     /// Registers `length` bytes from `first` as showing `backing`: counted again where the same
     /// bytes are registered over the same file and offset.
+    #[cfg(test)]
     pub(crate) fn new(first: u64, length: u64, backing: Backing) -> Registration {
         Registration::made(first, length, backing, false)
     }
@@ -920,87 +730,6 @@ impl Registration {
             ram,
         }
     }
-}
-
-/// The guest's RAM behind `length` bytes from `first`, as the leases registered it: runs of the
-/// RAM's own host addresses, each an address and a length, in the bytes' order, neighbours that
-/// follow on joined; `None` where a byte shows no page of the guest's RAM (memory of the
-/// library's own), shows nothing, or is mapped without
-/// write permission: a device pins imported pages for writing, so read-only memory keeps the
-/// imports it has (`super::linux`'s `import` module docs).
-pub(crate) fn guest_ram_runs(first: u64, length: u64) -> Option<Vec<(u64, u64)>> {
-    let end = first.checked_add(length)?;
-    let table = TABLE.lock();
-    let mut runs: Vec<(u64, u64)> = Vec::new();
-    let all = table.walk(first, end, |file, mut offset, prot, mut at, to| {
-        if prot.raw() & VmProt::WRITE.raw() == 0 {
-            return false;
-        }
-        // A stretch may run past the end of the range of the RAM its offset starts in, into
-        // another's, or none.
-        while at < to {
-            let Some((host, room)) = table.ram_at(file, offset) else {
-                return false;
-            };
-            let take = (to - at).min(room);
-            match runs.last_mut() {
-                Some(last) if last.0 + last.1 == host => last.1 += take,
-                _ => runs.push((host, take)),
-            }
-            at += take;
-            offset += take;
-        }
-        true
-    });
-    all.then_some(runs)
-}
-
-/// The pieces of `length` bytes from `first`, as [`pieces`] gives them, where every byte shows a
-/// page of the guest's RAM, as the leases registered it, mapped with write permission: the file
-/// pages a dma-buf of the RAM's own holds them in (`super::linux`'s `dma_buf`, "Regions"). `None`
-/// where a byte shows memory of the library's own, shows nothing, or is mapped without write
-/// permission, as [`guest_ram_runs`] refuses them.
-#[cfg_attr(windows, allow(dead_code))]
-pub(crate) fn guest_ram_pieces(first: u64, length: u64) -> Option<Vec<Piece>> {
-    let end = first.checked_add(length)?;
-    let table = TABLE.lock();
-    let mut pieces: Vec<Piece> = Vec::new();
-    let all = table.walk(first, end, |file, offset, prot, from, to| {
-        if prot.raw() & VmProt::WRITE.raw() == 0 {
-            return false;
-        }
-        // Every byte of the stretch in a range of the RAM: a stretch may run past the range its
-        // offset starts in.
-        let (mut at, mut into) = (from, offset);
-        while at < to {
-            let Some((_, room)) = table.ram_at(file, into) else {
-                return false;
-            };
-            let take = (to - at).min(room);
-            at += take;
-            into += take;
-        }
-        match pieces.last_mut() {
-            Some(last)
-                if Arc::ptr_eq(&last.backing.file, file)
-                    && last.backing.offset + last.length == offset
-                    && last.prot == prot =>
-            {
-                last.length += to - from;
-            }
-            _ => pieces.push(Piece {
-                at: from - first,
-                length: to - from,
-                backing: Backing {
-                    file: Arc::clone(file),
-                    offset,
-                },
-                prot,
-            }),
-        }
-        true
-    });
-    all.then_some(pieces)
 }
 
 impl Registered {
@@ -1170,76 +899,6 @@ pub(crate) mod tests {
         assert!(pieces(base, 1).is_none());
     }
 
-    /// The guest's RAM behind a view resolves to the registered ranges' own addresses, a run per
-    /// stretch that follows on in one range, in the view's order; bytes of other memory resolve
-    /// to none
-    #[test]
-    fn a_views_bytes_resolve_to_the_guests_ram() {
-        let f = file();
-        let other = file();
-        let base = 0x7e00_0000_0000;
-        let backing = |offset| Backing {
-            file: Arc::clone(&f),
-            offset,
-        };
-        // The two ranges a lease of the guest's RAM registers (Linux's `lease`).
-        let lease = [
-            Registration::guest_ram(base, 0x4000, backing(0)),
-            Registration::guest_ram(base + 0x10_000, 0x4000, backing(0x4000)),
-        ];
-        // A view of five pages: the second range's first two, then the first range's last page,
-        // then its first two backwards.
-        let view = base + 0x40_000;
-        let rw = READ_WRITE;
-        record(view, 0x2000, backing(0x4000), rw);
-        record(view + 0x2000, 0x1000, backing(0x3000), rw);
-        record(view + 0x3000, 0x1000, backing(0x1000), rw);
-        record(view + 0x4000, 0x1000, backing(0), rw);
-        assert_eq!(
-            guest_ram_runs(view + 0x800, 0x4000),
-            Some(vec![
-                (base + 0x10_800, 0x1800),
-                (base + 0x3000, 0x1000),
-                (base + 0x1000, 0x1000),
-                (base, 0x800)
-            ])
-        );
-        // The RAM's own bytes resolve to themselves, across a page.
-        assert_eq!(
-            guest_ram_runs(base + 0xff0, 0x20),
-            Some(vec![(base + 0xff0, 0x20)])
-        );
-        // A read-only page of the RAM is left out, as is a page of another file, or of nothing.
-        protect(view + 0x2000, 0x1000, VmProt::READ);
-        assert_eq!(guest_ram_runs(view, 0x3000), None);
-        protect(view + 0x2000, 0x1000, rw);
-        record(
-            view + 0x5000,
-            0x1000,
-            Backing {
-                file: Arc::clone(&other),
-                offset: 0,
-            },
-            rw,
-        );
-        assert_eq!(guest_ram_runs(view + 0x4000, 0x2000), None);
-        assert_eq!(guest_ram_runs(view + 0x6000, 0x1000), None);
-        // The library's own memory's registration, of a file of its own, is no RAM either.
-        let stand_in = Registration::new(
-            base + 0x80_000,
-            0x1000,
-            Backing {
-                file: Arc::clone(&other),
-                offset: 0,
-            },
-        );
-        assert_eq!(guest_ram_runs(base + 0x80_000, 0x1000), None);
-        drop(stand_in);
-        drop(lease);
-        assert_eq!(guest_ram_runs(view, 0x1000), None);
-        forget(view, 0x6000);
-    }
-
     /// The table counts its runs' mappings as the kernel holds them: neighbours in one file at
     /// following offsets with one protection are one, and a protect or an unmap inside one cuts
     /// it
@@ -1304,11 +963,7 @@ pub(crate) mod tests {
             } else {
                 (two, (i - 4) * page)
             };
-            let through = Through {
-                buf,
-                offset,
-                kept: None,
-            };
+            let through = Through { buf, offset };
             t.record(at(i), at(i + 1), b(fd, (9 - i) * page), rw, Some(through));
         }
         assert_eq!(t.mappings(), 2);
@@ -1332,7 +987,6 @@ pub(crate) mod tests {
             Through {
                 buf: one,
                 offset: page / 2,
-                kept: None,
             }
         );
         // The third page unmapped, then mapped from its file at the offset that follows the
@@ -1367,82 +1021,6 @@ pub(crate) mod tests {
         assert!(t.runs.values().all(|run| run.prot == VmProt::READ));
         t.forget(at(0), at(4));
         assert_eq!((t.mappings(), t.joins, t.runs.len()), (0, 0, 0));
-    }
-
-    /// A view's runs, recorded at once, are one record's: a range in them answers its number,
-    /// and its runs around a byte resolve as its pieces, after a protect cut one; a range that
-    /// reaches a gap, another view or a run recorded over part of the view answers none, nor do
-    /// more runs than asked for
-    #[test]
-    fn a_views_runs_are_one_records() {
-        let (f, g) = (file(), file());
-        let base = 0x7d00_0000_0000;
-        let page = 0x1000;
-        let at = |i: u64| base + i * page;
-        let piece = |i: u64, fd: &Arc<HostFile>, offset| Piece {
-            at: i * page,
-            length: page,
-            backing: Backing {
-                file: Arc::clone(fd),
-                offset,
-            },
-            prot: READ_WRITE,
-        };
-        // A view of four pages, backwards in `f`, and another of two of `g` after a gap.
-        let view: Vec<Piece> = (0..4).map(|i| piece(i, &f, (9 - i) * page)).collect();
-        record_pieces(at(0), view);
-        record_pieces(at(5), vec![piece(0, &g, 0), piece(1, &g, 4 * page)]);
-        let one = view_of(at(0), 4 * page).expect("the first view's");
-        assert_eq!(view_of(at(1), 2 * page), Some(one));
-        let two = view_of(at(5), 2 * page).expect("the second's");
-        assert_ne!(one, two);
-        assert_eq!(view_of(at(3), 2 * page), None, "into the gap");
-        assert_eq!(view_of(at(4), page), None, "the gap");
-        let (first, pieces) = view_runs(one, at(2), 4).unwrap();
-        assert_eq!(first, at(0));
-        assert_eq!(
-            shape(&pieces),
-            [
-                (0, page, 9 * page),
-                (page, page, 8 * page),
-                (2 * page, page, 7 * page),
-                (3 * page, page, 6 * page)
-            ]
-        );
-        assert!(
-            view_runs(one, at(2), 3).is_none(),
-            "four runs, three asked for"
-        );
-        assert!(view_runs(two, at(2), 4).is_none(), "not the second view's");
-        protect(at(1), page, VmProt::READ);
-        assert_eq!(
-            view_of(at(0), 4 * page),
-            Some(one),
-            "a protect keeps the number"
-        );
-        let (first, pieces) = view_runs(one, at(3), 4).unwrap();
-        assert_eq!((first, pieces.len()), (at(0), 4));
-        let over = Backing {
-            file: Arc::clone(&g),
-            offset: 8 * page,
-        };
-        record(at(2), page, over, READ_WRITE);
-        assert_eq!(
-            view_of(at(0), 4 * page),
-            None,
-            "a run recorded over the view"
-        );
-        assert_eq!(view_of(at(0), 2 * page), Some(one));
-        let (first, pieces) = view_runs(one, at(0), 4).unwrap();
-        assert_eq!(
-            (first, shape(&pieces).len()),
-            (at(0), 2),
-            "the runs before it"
-        );
-        let (first, pieces) = view_runs(one, at(3), 4).unwrap();
-        assert_eq!((first, shape(&pieces)), (at(3), vec![(0, page, 6 * page)]));
-        forget(at(0), 7 * page);
-        assert_eq!(view_of(at(0), page), None);
     }
 
     /// Runs that follow on in one file with one protection resolve as one piece, as the kernel
@@ -1596,7 +1174,6 @@ pub(crate) mod tests {
                     let through = (next(3) == 0).then(|| Through {
                         buf: next(2),
                         offset: next(8) * page,
-                        kept: None,
                     });
                     t.record(first, end, backing, prot, through);
                 }
@@ -1724,7 +1301,7 @@ pub(crate) mod tests {
                 let start = at(2) + piece.at;
                 one.record(start, start + piece.length, piece.backing, piece.prot, None);
             }
-            fresh.record_fresh(at(2), pieces, next_view());
+            fresh.record_fresh(at(2), pieces);
             assert_eq!(shape(&fresh), shape(&one));
         }
     }
@@ -1797,130 +1374,5 @@ pub(crate) mod tests {
             [(0, page, 0x105 * page), (page, page, 0x10e * page)]
         );
         drop(held);
-    }
-
-    /// What the table costs a view of scattered pages of the guest's RAM over its life, a page
-    /// (a measurement, not a check; run it by name with `--run-ignored only --no-capture` in a
-    /// release build): Feature Matching's no-copy buffers, views of up to 140,000 scattered
-    /// 4 KiB pages each, made beside each other. The table first holds `FILES_COST_RUNS`
-    /// one-page runs of other views (default 200,000), then each of `FILES_COST_VIEWS` views
-    /// (default 8) of `FILES_COST_PAGES` pages (default 16,384, 64 MiB) goes through what a
-    /// buffer over a pages block's view asks of the table on a device that imports views
-    /// mapped from their files (Iris Xe's ANV): the resolve of its sources and the record of
-    /// its pieces (Linux's `vm`'s `remap_runs_shared_overwrite`), the import's write check, the
-    /// gate's write check and dma-buf pieces (Linux's `import`), the runs of the guest's RAM the
-    /// runtime asks for (`super::host_ram`'s `runs`), and the teardown's forget, a mebibyte at a
-    /// time (Linux's `vm`'s `deallocate`). Each step's user-space instructions and cycles a page,
-    /// the median of the views, are printed.
-    #[test]
-    #[cfg(target_os = "linux")]
-    #[ignore = "a measurement: run it by name"]
-    fn a_scattered_views_life_costs() {
-        let env = |name: &str, default: u64| {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default)
-        };
-        let (others, views, pages) = (
-            env("FILES_COST_RUNS", 200_000),
-            env("FILES_COST_VIEWS", 8),
-            env("FILES_COST_PAGES", 16_384),
-        );
-        let page = 0x1000u64;
-        let f = file();
-        let ram_first = 0x7100_0000_0000u64;
-        let ram_pages = 4 * (views * pages).max(1 << 20);
-        let _ram = Registration::guest_ram(
-            ram_first,
-            ram_pages * page,
-            Backing {
-                file: Arc::clone(&f),
-                offset: 0,
-            },
-        );
-        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
-        let mut next = move |n: u64| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed % n
-        };
-        // Other views' runs, one page each, none following on in the file.
-        let others_first = 0x7300_0000_0000u64;
-        let rw = READ_WRITE;
-        for i in 0..others {
-            let offset = 2 * next(ram_pages / 2) * page;
-            let backing = Backing {
-                file: Arc::clone(&f),
-                offset,
-            };
-            record(others_first + i * page, page, backing, rw);
-        }
-        const STEPS: [&str; 8] = [
-            "resolve (view_pieces)",
-            "record (record_pieces)",
-            "import's writable",
-            "import's through_pieces",
-            "gate's writable",
-            "guest_ram_runs",
-            "forget (teardown)",
-            "the view's life",
-        ];
-        let mut figures: Vec<[[u64; 2]; 8]> = Vec::new();
-        let views_first = 0x7500_0000_0000u64;
-        for v in 0..views {
-            let sources: Vec<(u64, u64)> = (0..pages)
-                .map(|_| (ram_first + next(ram_pages) * page, page))
-                .collect();
-            let target = views_first + v * (pages + 16) * page;
-            let length = pages * page;
-            let end = target + length;
-            let mut step = [[0u64; 2]; 8];
-            let mut timed = |i: usize, f: &mut dyn FnMut()| {
-                let before = crate::os::thread_counts::now();
-                f();
-                let after = crate::os::thread_counts::now();
-                for k in 0..2 {
-                    step[i][k] += after[k] - before[k];
-                    step[7][k] += after[k] - before[k];
-                }
-            };
-            let mut resolved = Vec::new();
-            timed(0, &mut || resolved = view_pieces(&sources).unwrap());
-            assert_eq!(resolved.len() as u64, pages, "scattered: a piece a page");
-            timed(1, &mut || {
-                record_pieces(target, std::mem::take(&mut resolved))
-            });
-            timed(2, &mut || assert_eq!(writable(target, length), Some(true)));
-            timed(3, &mut || assert!(through_pieces(target, end).is_empty()));
-            timed(4, &mut || assert_eq!(writable(target, length), Some(true)));
-            let mut runs = None;
-            timed(5, &mut || runs = guest_ram_runs(target, length));
-            let runs = runs.unwrap();
-            assert_eq!(runs.iter().map(|r| r.1).sum::<u64>(), length);
-            timed(6, &mut || {
-                let mut at = target;
-                while at < end {
-                    let now = (end - at).min(1 << 20);
-                    forget(at, now);
-                    at += now;
-                }
-            });
-            assert!(pieces(target, length).is_none(), "forgotten");
-            figures.push(step);
-        }
-        eprintln!(
-            "a view of {pages} scattered pages beside {others} other runs, {views} views: \
-             user-space instructions / cycles a page, the median"
-        );
-        for (i, name) in STEPS.iter().enumerate() {
-            let median = |k: usize| {
-                let mut all: Vec<u64> = figures.iter().map(|s| s[i][k]).collect();
-                all.sort_unstable();
-                all[all.len() / 2] as f64 / pages as f64
-            };
-            eprintln!("  {name:<26} {:9.1} {:9.1}", median(0), median(1));
-        }
     }
 }

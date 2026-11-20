@@ -3,17 +3,15 @@
 //! `CLOSE_COST_COUNT` objects of one kind (1000 by default) and puts them in a context's table, as
 //! their creates do, then closes the context, timing the thread's CPU time and the wall time
 //! between. On the fake platform, whose objects cost next to nothing to let go of, the figures are
-//! the decoder's own an object; on the Vulkan platform they add the platform's release
-//! and its driver's. Each kind runs once to warm up, then [`REPS`] times, and the median of each
+//! the decoder's own an object; on the rt platform they add the platform's release and its
+//! driver's. Each kind runs once to warm up, then [`REPS`] times, and the median of each
 //! figure is printed. A measurement, run by hand in a release build, in a potluck job holding the
-//! host's GPU (`--gpu`: `cargo nextest run -p reims-vgpu --release
-//! --no-default-features --features reims-vgpu/vulkan --run-ignored only -E 'test(close_cost)'
-//! --no-capture`); `CLOSE_COST_KINDS` names the kinds to run, a comma-separated list of
+//! host's GPU (`--gpu`: `cargo nextest run -p reims-vgpu --release --run-ignored only -E
+//! 'test(close_cost)' --no-capture`); `CLOSE_COST_KINDS` names the kinds to run, a comma-separated list of
 //! [`KINDS`]' names, every one by default.
 //!
 //! The kinds are those a closing process holds most of: buffers of the GPU's memory and over the
-//! region's (the bundle's `BUFFER_OVER_HOST_MEMORY`, which imports the guest's pages on the Vulkan
-//! platform), textures, samplers, render and compute pipeline states, events and command queues.
+//! region's (the bundle's `BUFFER_OVER_HOST_MEMORY`), textures, samplers, render and compute pipeline states, events and command queues.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -267,9 +265,9 @@ fn on_fake_close_cost() {
     measure::<reims_vgpu_vulkan::core::testkit::FakePlatform>("the fake platform");
 }
 
-/// On the Vulkan platform: the decoder's, the platform's and the runtime's.
+/// On the rt platform: the decoder's, the platform's and rt's.
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU: prints a close's cost an object"]
 fn on_vulkan_close_cost() {
-    measure::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
+    measure::<reims_vgpu_vulkan::RtPlatform>("rt");
 }

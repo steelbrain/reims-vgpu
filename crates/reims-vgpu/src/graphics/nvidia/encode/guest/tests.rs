@@ -13,7 +13,7 @@ use reims_vgpu_video::nvidia::{Error, Packet};
 use reims_vgpu_video::paravirt::Codec;
 
 use super::*;
-use crate::graphics::video_choice::tested_gpu::{Arm, device_for};
+use crate::graphics::video_choice::tested_gpu::Arm;
 
 /// NVENC's answer for `profile` up to `max_width` by `max_height`.
 fn support(profile: EncodeProfile, max_width: u32, max_height: u32) -> EncodeProfileSupport {
@@ -390,7 +390,7 @@ fn access_unit(codec: Codec, record: Option<&[u8]>, sample: &[u8]) -> Vec<u8> {
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
 fn a_guest_encoders_frames_code_alike_from_the_cpu_and_the_gpu_and_decode_back() {
     use reims_vgpu_video::nvidia::{AnnexBCodec, AnnexBDecoder};
-    use reims_vgpu_vulkan::VulkanPlatform;
+    use reims_vgpu_vulkan::RtPlatform;
     use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
     use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
     use reims_vgpu_vulkan::core::raise::OnFault;
@@ -398,12 +398,13 @@ fn a_guest_encoders_frames_code_alike_from_the_cpu_and_the_gpu_and_decode_back()
     use super::super::super::super::decode::GraphicsVideo as _;
     use super::super::super::{NvidiaVideo, Shared};
 
-    let platform = Arc::new(VulkanPlatform::new());
+    let platform = crate::rt_test_end::platform();
     crate::entry::run(|_| {
-        let device = device_for(&platform, Arm::Nvidia);
+        let device = platform.system_default_device().expect("an rt device");
+        crate::graphics::video_choice::tested_gpu::check_rt(&device, Arm::Nvidia);
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
-        let gpu = crate::graphics::video_choice::nvidia_gpu(&device);
-        let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime);
+        let gpu = crate::graphics::video_choice::rt_nvidia_gpu(&device);
+        let video = NvidiaVideo::<RtPlatform>::new(&device, gpu, &runtime);
         let video = Arc::new(video.expect("NVENC on the GPU"));
         assert!(video.imports.is_some(), "CUDA imports no exportable buffer");
         let encoders = Shared(Arc::clone(&video)).guest_encoders();
@@ -450,7 +451,7 @@ fn a_guest_encoders_frames_code_alike_from_the_cpu_and_the_gpu_and_decode_back()
                     matrix: 9,
                 });
                 let open = |filler| {
-                    NvGuestEncoder::<VulkanPlatform>::new(&video.gpu, &config, filler)
+                    NvGuestEncoder::<RtPlatform>::new(&video.gpu, &config, filler)
                         .expect("a guest encoder")
                 };
                 let mut by_cpu = open(Err("read by the CPU in this test".to_owned()));
@@ -477,7 +478,7 @@ fn a_guest_encoders_frames_code_alike_from_the_cpu_and_the_gpu_and_decode_back()
                         duration: 3000,
                         force_key_frame: n == 5,
                     };
-                    let from_host = GuestSource::<VulkanPlatform> {
+                    let from_host = GuestSource::<RtPlatform> {
                         layout: layout.clone(),
                         memory: &memory,
                         buffer: None,

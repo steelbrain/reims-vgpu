@@ -31,122 +31,10 @@
 //! (RADV passes each in a list on every submit): 1,024 live imports cost 642 µs a submit, 4,096
 //! about 2.5 ms. So the fewest chunks are made, and an import goes with its buffer.
 //!
-//! **Groups.** Views of guest pages that no-copy buffers lie over are imported one each, so a
-//! process with many of them pays for each at every submission. The graphics device's surface
-//! worker gathers the views a process makes at once and hands them to [`group_views`]
-//! (`crate::core::platform::os::vm::HostVm::group_views`): their pages go into group dma-bufs
-//! ([`of_group`]), each as many views back to back as fit udmabuf's limits, and each view's place
-//! is registered ([`GROUPED`]) while its membership lives. The import source then answers a
-//! buffer's or a heap's request over a registered view's pages with that piece of the group's
-//! file ([`piece_of`], `super::import`'s `host_memory`), the file shared by its `Arc`, and the
-//! runtime imports the file once for all of them. A member's place goes as its view does, before
-//! the view is unmapped, so a view mapped later at its address is never answered with its pages;
-//! a request after it, or once the group's file is gone (a device's recovery asking again), is
-//! answered as one over no group is (below). While any member's import lives, every member's
-//! pages stay pinned in the file and mapped in the device's import: a group holds at most
-//! [`GROUP_BYTES`], 64 MiB, whatever udmabuf takes.
-//!
-//! **Regions.** A buffer's or a heap's request over no grouped view, whose pages are the guest's
-//! RAM mapped writable (the leases' registrations, `crate::os::files`) and one run of the RAM's
-//! file inside one region, is answered with that piece of the region's dma-buf ([`ram_piece`]):
-//! each file of the RAM is cut into regions of [`REGION_BYTES`], 64 MiB at multiples of it in the
-//! file (udmabuf's `size_limit_mb`, down to a power of two, where a host has it lower), each one
-//! dma-buf of its one run of pages, made at its first piece and shared by its `Arc`, so a device
-//! that lists every import in every submission (RADV) lists one a region whatever objects lie in
-//! it. The piece lies at an offset its one-chunk alignment divides (the host page on RADV,
-//! whatever its granule), where the runtime binds a plain buffer: a heap over a pages block of
-//! one run, which lies in the RAM itself, a buffer over the RAM, a view of one run. Pages in
-//! several runs, or across two regions, take a piece of their view's dma-buf (below, "Views"),
-//! else a dma-buf of their own, one list of their runs (`UDMABUF_CREATE_LIST` takes the runs of
-//! several files in one list), cut into chunks only past udmabuf's limits ([`of_pages`]), as
-//! memory of the library's own and read-only pages do: a piece of each region would be bound in a
-//! sparse buffer, a GPU page-table update of each piece at the bind and again at the release
-//! (below, "Several pieces").
-//! The table of regions ([`REGIONS`]) holds each file weakly: the runtime's imports of it hold
-//! it, and so does each import source that answered with a piece of it, which the runtime keeps
-//! with the imports it made (`super::import`'s `host_memory`), and so do the imports of it the
-//! devices keep (below, "Kept imports"), so it lives while any buffer or heap bound in it does and
-//! for their linger after the last, and a later request in the region makes it again (the trace's
-//! `ramregion` writes each made, and `rampiece` each request's answer). A region's first
-//! piece from its first page is so a piece of a shared file, never a dma-buf of its own (the
-//! runtime takes a chunk at offset 0 whose `Arc` it alone holds as the buffer's own). While it
-//! lives it pins every page of its region and maps
-//! them in the device's GPU address space, the pages no object covers too: at most 64 MiB a
-//! region any object lies in, of the guest's RAM, which `reims-ctl` makes resident from the start
-//! (QEMU's `prealloc=on`), so the pins hold no page the RAM did not. Making one costs about 9 ms
-//! (below, "Costs"), once while objects lie in its region.
-//!
-//! What regions save (**measured** 2026-11-15, Radeon 780M, RADV of Mesa 26.2.6, a 26.7.2 guest's
-//! desktop walk, Finder then Launchpad three times, two walks with regions and two with a dma-buf
-//! an object): at the walk's end the device held 259 to 260 imports, 19 to 21 of them region
-//! dma-bufs, against 360 to 361, and Launchpad's submissions took 7.2 to 7.4 ms a present against
-//! 8.6 to 9.0 (263 to 271 us a submission against 319 to 333), its presents a second (53.5 to
-//! 53.6) and their take to show (a median of 12.4 to 12.7 ms) as before. A walk made 61 to 67
-//! region dma-bufs, at most 31 alive at once: 1.9 GiB of the guest's 8 GiB pinned, none of it
-//! memory the RAM did not already hold.
-//!
 //! **Several pieces.** RADV binds each chunk of a sparse buffer as a GPU VA operation of its own,
-//! and amdgpu updates its page tables for each, at the bind and again at the release; and each
-//! import the device holds is in every submission's list ("Costs", above). **Measured**
-//! 2026-11-16 on the RX 7900 XTX (RADV of Mesa 26.2.6, Linux 7.3.3), Geekbench 7.1.0's Metal
-//! compute pass on a 26.7.2 guest, whose slabs are runs of 64 KiB chunks of guest RAM, the timed
-//! pass of a traced warm run (jobs m3-max-36097, then two each: 36148 and 36149, 36273 and 36274):
-//! - a piece of each region, bound in a sparse buffer: the kernel's own SDMA jobs came to 181,391
-//!   (3.62 s of SDMA time), 137,742 of them its page tables' (an earlier trace of the same pass
-//!   had 937 such requests bound as 73,976 pieces), and the pass took 1.258 times its native time
-//!   (a geometric mean), Video Filter 1.17;
-//! - a dma-buf of each request's own: 51,020 to 54,829 (1.98 to 2.08 s), but the device held
-//!   about three times the imports (Super Resolution's mean 121 to 122 against 41, its submissions
-//!   taking 961 to 975 ms against 545): 1.259 to 1.279, Super Resolution 1.40 against 1.36;
-//! - a piece of the view's dma-buf (below, "Views"): 12,583 to 15,030 (0.46 to 0.56 s), 2,172 to
-//!   2,386 of them the page tables', Super Resolution's mean 99 (757 to 765 ms): 1.236 to 1.242,
-//!   Video Filter 1.06, against 1.256 and 1.10 before the regions (development d5dbecbda).
-//!
-//! **Views.** A buffer's or a heap's request in the runs of one of the library's views (one
-//! record of the backing table, `files::view_of`) that no group or region answers is answered
-//! with that piece of the view's dma-buf ([`view_piece`]): one list of the view's runs that follow
-//! on around the request, made at the first such request while none is alive and shared by its
-//! `Arc`, so the view's buffers and heaps are bound plainly in one import of it, as a region's
-//! are in the region's. The table of views' dma-bufs ([`VIEW_FILES`]) holds each file weakly, the
-//! runtime's imports of it and the sources that answered with it strongly, so it lives while an
-//! object over a piece of it does, with no linger. A record's runs never show other pages (a run
-//! recorded over part of a view is another record's), so a piece shows the pages its request's
-//! bytes show. A view of more runs than one dma-buf takes (udmabuf's limits as the host has them),
-//! or of more than [`GROUP_BYTES`], gives no piece, and its requests take dma-bufs of their own.
-//! While it lives the dma-buf pins every page of those runs and maps them in the device's GPU
-//! address space, the pages no object covers too: at most 64 MiB a view, of the guest's RAM
-//! (resident from the start, as above) or of the library's own memory. On the Radeon 780M
-//! (**measured** 2026-11-16, RADV of Mesa 26.2.6, Linux 7.3.3, the desktop walk above, two walks
-//! each: jobs m3-max-36128 and 36129, 36150 and 36151, 36227 and 36228) Launchpad's last steps
-//! ended with 225 to 234 imports held with pieces of regions, 242 to 251 with a dma-buf each, and
-//! 234 to 242 with pieces of views, at 54.2 to 54.6 presents a second and 5.9 to 6.9 ms of
-//! submissions a present in all three; Geekbench's pass there took 1.033 times its native time
-//! with pieces of views (job m3-max-36229), against 1.062 before the regions.
-//!
-//! **Kept imports.** Each region a no-copy buffer's or heap's source answered with is kept
-//! imported on the device that made the object ([`keep_regions`], on the thread that made it,
-//! once the runtime's call returned): the device's one import of the region's dma-buf, which the
-//! object's piece made or joined, is held by the device's keep (`rt::Device::import_shared_dma_buf`)
-//! besides the objects bound in it, so the region's next object joins it rather than importing the
-//! dma-buf again. Without the keep, a region whose objects come and go one at a time was imported
-//! again for each, and its dma-buf made again: on a Radeon 780M the import call took 820 to 907 us
-//! and the next submission started on the GPU about 3 ms after it, RADV mapping the import into
-//! the GPU's page tables first, against 25 to 69 us and 104 to 145 us joining a kept import
-//! (**measured** by metal2vulkan's lane, its `kept_file_bench`, RUNTIME 2389). A region is in use
-//! while a source that answered with it lives ([`RegionUse`]), which the runtime keeps with the
-//! imports it made through it, so while an object over a piece of it lives; once its last use
-//! goes, its kept imports linger [`LINGER_NS`], two seconds, then go, swept by a thread of their
-//! own ([`SWEEP`]), and with them the region's dma-buf, unless an object comes first. So a device
-//! holds an import of each region an object lay in within the last two seconds, at most the
-//! guest's RAM over 64 MiB of them (128 for 8 GiB), each in every submission's list on RADV, and
-//! the regions' pins hold no page the guest's RAM did not (`prealloc=on`, above). While one is
-//! kept, the runtime's residency thread releases no import of the region's objects: the keep is a
-//! hold of the file that is none of theirs, and the release would take nothing off the list. Kept
-//! only on a device the process adopted, which the platform's let-go lets go of with its keeps
-//! ([`take_region_keeps`]); the device's recovery carries its keeps to its new `VkDevice`, which
-//! imports the dma-buf again at the first object that needs it (the runtime's `kept.rs`). Nothing
-//! of it reaches the guest: an object lies at the same address over the same pages whether its
-//! piece imported the dma-buf or joined a kept import.
+//! and amdgpu updates its page tables for each, at the bind and again at the release, besides
+//! the import's place in every submission's list ("Costs", above): another reason the fewest
+//! chunks are made.
 //!
 //! **The pages' size** (**measured** 2026-10-26, RADV of Mesa 26.2.4, raw Vulkan with no runtime
 //! between, kernels of our own reading 64 MiB and writing 64 MiB, the median GPU time of five in
@@ -172,17 +60,16 @@
 //! which QEMU's `seal=on`, its default, sets, and [`super::vm::memfd`] sets on the library's own),
 //! at page offsets. The device node is the `kvm` group's on Ubuntu.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 
 use crate::core::num::ToU64 as _;
 use crate::core::platform::os::vm::VmProt;
 use crate::core::sync::Mutex;
-use metal2vulkan_runtime::{self as rt, DmaBufChunk};
 
 use super::vm;
 use crate::os::files;
@@ -196,6 +83,13 @@ const CREATE_LIST: u64 = (1 << 30) | (8 << 16) | ((b'u' as u64) << 8) | 0x43;
 /// udmabuf's defaults, taken where the system shows no parameters.
 const DEFAULT_LIST_LIMIT: u64 = 1024;
 const DEFAULT_SIZE_LIMIT_MB: u64 = 64;
+
+/// A dma-buf of pages ([`of_pages`]): `length` bytes of `file`.
+#[derive(Debug)]
+pub(crate) struct DmaBufChunk {
+    pub(crate) file: Arc<OwnedFd>,
+    pub(crate) length: u64,
+}
 
 /// Why no dma-bufs were made of a range.
 #[derive(Debug)]
@@ -258,33 +152,6 @@ impl fmt::Display for Refusal {
     }
 }
 
-impl Refusal {
-    /// Whether every range of pages that holds the one refused, asked for as one dma-buf, is
-    /// refused too while the pages stay mapped as they are, as the runtime's standing refusal
-    /// asks (`rt::DmaBufStandingRefusal`, which the import source answers for a texture's pages,
-    /// `super::import`'s `host_memory`):
-    /// - a byte with no file behind it ([`Refusal::Unresolved`]) lies in every such range;
-    /// - `/dev/udmabuf` not opening ([`Refusal::Device`]) is the process's, opened once;
-    /// - a range one dma-buf cannot hold ([`Refusal::Limit`] at a granule of its length, a
-    ///   texture's) is as many runs of file pages and bytes in a wider range, or more: a range
-    ///   only gains runs and bytes as it widens. Cut at a granule shorter than the range, a wider
-    ///   range is cut elsewhere, so it may fit;
-    /// - a writable piece of a file open read-only ([`Refusal::ReadOnlyFile`]) is in every such
-    ///   range.
-    ///
-    /// The kernel's refusal ([`Refusal::Kernel`]) does not stand: it answers `EINVAL` for a list
-    /// past limits lowered since they were read as for a file it takes no pages of, and `ENOMEM`
-    /// for pages it could not pin now. Nor does the kernel giving no file for a pad's zeros
-    /// ([`Refusal::NoFile`]), the host's memory running out now.
-    pub(crate) fn holds_wider(&self) -> bool {
-        match self {
-            Refusal::Unresolved | Refusal::Device(_) | Refusal::ReadOnlyFile => true,
-            Refusal::Limit { bytes, granule, .. } => granule >= bytes,
-            Refusal::Kernel(_) | Refusal::NoFile(_) => false,
-        }
-    }
-}
-
 /// What one dma-buf may hold: pieces, and bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Limits {
@@ -296,15 +163,17 @@ pub(crate) struct Limits {
 /// parameters at most once a second ([`LIMITS`]), so they are the host's within a second of now,
 /// and read again at a refusal they may have caused ([`within_limits`]). Each read of the two
 /// parameters cost a texture over a no-copy buffer's pages about 9% of its making's CPU on a
-/// Radeon 780M (**measured** 2026-11-15, Geekbench 7.1.0's compute pass, 606 such textures).
-pub(super) fn limits() -> Limits {
+/// Radeon 780M (**measured** 2026-11-15, Geekbench 7.1.0's compute pass, 606 such textures). The
+/// tests read them so; the library reads them through [`within_limits`].
+#[cfg(test)]
+fn limits() -> Limits {
     LIMITS.at(mono_now())
 }
 
-/// How long a read of udmabuf's limits stands, in nanoseconds ([`limits`]).
+/// How long a read of udmabuf's limits stands, in nanoseconds (`limits`).
 const LIMITS_STAND_NS: u64 = 1_000_000_000;
 
-/// udmabuf's limits as last read from the host ([`limits`]).
+/// udmabuf's limits as last read from the host (`limits`).
 static LIMITS: KeptLimits = KeptLimits::new(host_limits);
 
 /// Limits read by `read` and kept for [`LIMITS_STAND_NS`] ([`limits`]).
@@ -551,50 +420,10 @@ pub(crate) fn of_ranges(ranges: &[(u64, u64)]) -> Result<OwnedFd, Refusal> {
     })
 }
 
-/// Whether one dma-buf takes the whole pages of the `length` bytes from `first`, as the runtime
-/// asks an import's source for a texture's own pages, at a granule of their length
-/// (`super::import`'s `host_memory`): refused, with udmabuf's limits named, where they are more
-/// runs of file pages, or more bytes, than one takes, and where the backing table resolves a byte
-/// to no file. It counts the runs as [`add_runs`] makes them, and makes nothing.
-pub(crate) fn fits_one(first: u64, length: u64) -> Result<(), Refusal> {
-    let page = vm::page_size();
-    let start = first & !(page - 1);
-    let end = first.saturating_add(length).next_multiple_of(page);
-    fits_one_of(std::slice::from_ref(&(start..end)))
-}
-
-/// Whether one dma-buf takes the pages of `ranges`, host addresses of whole pages, in order: the
-/// pages a texture over a view of them binds, as [`fits_one`] counts a view's, asked before the
-/// view is made. Refused as [`fits_one`] is; a run of file pages that goes on from one range into
-/// the next counts once, as [`add_runs`] makes it one.
-pub(crate) fn fits_one_of(ranges: &[std::ops::Range<u64>]) -> Result<(), Refusal> {
-    let mut pieces: u64 = 0;
-    let mut bytes: u64 = 0;
-    // The file and the offset past the last run's end.
-    let mut last: Option<(Arc<OwnedFd>, u64)> = None;
-    for range in ranges {
-        let length = range.end.saturating_sub(range.start);
-        let resolved = files::pieces(range.start, length).ok_or(Refusal::Unresolved)?;
-        for piece in resolved {
-            let follows = matches!(
-                &last,
-                Some((fd, end)) if Arc::ptr_eq(fd, &piece.backing.file)
-                    && *end == piece.backing.offset
-            );
-            if !follows {
-                pieces += 1;
-            }
-            let end = piece.backing.offset + piece.length;
-            last = Some((piece.backing.file, end));
-        }
-        bytes = bytes.saturating_add(length);
-    }
-    fits_pieces(pieces, bytes)
-}
-
-/// Whether one dma-buf takes the pages `pieces` show, in order, a view's: refused as [`fits_one`]
-/// is, past udmabuf's limits, counting the runs of file pages as [`fits_one_of`] does, asked as
-/// the view is made (`super::vm`'s `map_view`).
+/// Whether one dma-buf takes the pages `pieces` show, in order, a view's: refused, with udmabuf's
+/// limits named, where they are more runs of file pages, or more bytes, than one takes. A run of
+/// file pages that goes on from one piece into the next counts once, as [`add_runs`] makes it
+/// one. Asked as the view is made (`super::vm`'s `map_view`).
 pub(crate) fn fits_view(pieces: &[files::Piece]) -> Result<(), Refusal> {
     let mut runs: u64 = 0;
     let mut bytes: u64 = 0;
@@ -615,9 +444,8 @@ pub(crate) fn fits_view(pieces: &[files::Piece]) -> Result<(), Refusal> {
 }
 
 /// Whether one dma-buf takes `pieces` pieces of `bytes` bytes in all, within udmabuf's limits as
-/// the host has them now, asked of pages that do not exist yet: refused as [`fits_one_of`] refuses
-/// pages past the limits.
-pub(crate) fn fits_pieces(pieces: u64, bytes: u64) -> Result<(), Refusal> {
+/// the host has them now: refused, with the limits named, past them.
+fn fits_pieces(pieces: u64, bytes: u64) -> Result<(), Refusal> {
     within_limits(|limits| {
         if pieces > limits.pieces || bytes > limits.bytes {
             return Err(Refusal::Limit {
@@ -638,9 +466,8 @@ pub(crate) fn of_pages(first: u64, length: u64, granule: u64) -> Result<Vec<DmaB
     of_pages_counted(first, length, granule).map(|(chunks, _)| chunks)
 }
 
-/// [`of_pages`], and the runs of file pages the chunks hold, the pad's among them: what the
-/// import source's trace event writes (`super::import`'s `host_memory`).
-pub(crate) fn of_pages_counted(
+/// [`of_pages`], and the runs of file pages the chunks hold, the pad's among them.
+fn of_pages_counted(
     first: u64,
     length: u64,
     granule: u64,
@@ -659,7 +486,6 @@ pub(crate) fn of_pages_counted(
         if !runs.is_empty() && resolved.to_u64() <= limits.pieces && length <= limits.bytes {
             let chunk = DmaBufChunk {
                 file: Arc::new(create(device, &runs)?),
-                offset: 0,
                 length,
             };
             return Ok((vec![chunk], resolved.to_u64()));
@@ -692,809 +518,11 @@ pub(crate) fn of_pages_counted(
             let fd = create(device, chunk)?;
             Ok(DmaBufChunk {
                 file: Arc::new(fd),
-                offset: 0,
                 length: chunk.iter().map(|r| r.length).sum(),
             })
         });
         Ok((made.collect::<Result<_, _>>()?, runs.len().to_u64()))
     })
-}
-
-/// A group dma-buf ([`of_group`]): several members' pages back to back in one file, and where
-/// each member starts in it.
-#[derive(Debug)]
-pub(crate) struct Group {
-    /// The file every member's piece is of.
-    pub(crate) file: Arc<OwnedFd>,
-    /// The first byte of each member taken, in the order given, each a multiple of the group's
-    /// alignment: `offsets.len()` members were taken, the first that fit.
-    pub(crate) offsets: Vec<u64>,
-    /// The file's bytes.
-    pub(crate) length: u64,
-}
-
-/// One dma-buf of the pages of the first of `members` that fit in it, each member a first byte
-/// and a length (whole pages, resolved through the backing table as [`add_runs`] resolves them),
-/// in order: each member starts at a multiple of `align` (a multiple of the host page; the host
-/// page where less), and the bytes between two members are a file of zeros of the group's own,
-/// so the file holds no page of other memory. A group takes members while they fit `limits`
-/// (within udmabuf's as the host has them, [`limits`]), counting each member's runs apart (two
-/// members whose pages follow on in a file are two runs), and stops at the first member that
-/// does not fit or whose
-/// pages resolve to no file, leaving it and those after it to another group. Refused where the
-/// first member alone does not fit, where its pages resolve to no file, where `/dev/udmabuf` does
-/// not open, or where the kernel refuses the list. A gap whose file of zeros the kernel does not
-/// give ends the group before the member after it.
-pub(crate) fn of_group(
-    members: &[(u64, u64)],
-    align: u64,
-    limits: Limits,
-) -> Result<Group, Refusal> {
-    let page = vm::page_size();
-    let align = align.max(page);
-    debug_assert!(align.is_multiple_of(page));
-    let device = device()?;
-    let mut runs: Vec<Run<Arc<OwnedFd>>> = Vec::new();
-    let mut offsets = Vec::new();
-    let mut length: u64 = 0;
-    // The file of zeros the gaps between members take, made at the first gap: a gap is less than
-    // `align`.
-    let mut gaps: Option<Arc<OwnedFd>> = None;
-    for &(first, bytes) in members {
-        let start = length.next_multiple_of(align);
-        let mut member = Vec::new();
-        if start > length {
-            let file = match &gaps {
-                Some(file) => Arc::clone(file),
-                // The first member starts the file, at no gap: where the kernel gives no file for
-                // a later one's, the group ends before that member.
-                None => match vm::memfd(align - page) {
-                    Ok(file) => Arc::clone(gaps.insert(file)),
-                    Err(_) => break,
-                },
-            };
-            member.push(Run {
-                file,
-                offset: 0,
-                length: start - length,
-            });
-        }
-        if let Err(refusal) = add_runs(&mut member, first, bytes) {
-            if offsets.is_empty() {
-                return Err(refusal);
-            }
-            break;
-        }
-        let pieces = (runs.len() + member.len()) as u64;
-        let end = start.saturating_add(bytes);
-        if pieces > limits.pieces || end > limits.bytes {
-            if offsets.is_empty() {
-                return Err(Refusal::Limit {
-                    pieces,
-                    bytes: end,
-                    granule: end,
-                    limits,
-                });
-            }
-            break;
-        }
-        runs.append(&mut member);
-        offsets.push(start);
-        length = end;
-    }
-    let file = Arc::new(create(device, &runs)?);
-    Ok(Group {
-        file,
-        offsets,
-        length,
-    })
-}
-
-/// The views [`group_views`] put in group dma-bufs whose membership lives ([`Membership`]), by
-/// first byte: what the import source answers a request over their pages with
-/// ([`piece_of`]).
-static GROUPED: Mutex<BTreeMap<u64, Grouped>> = Mutex::new(BTreeMap::new());
-
-/// A view in [`GROUPED`].
-#[derive(Debug)]
-struct Grouped {
-    /// The view's bytes.
-    length: u64,
-    /// Its group's file: the runtime's imports of it, and the caller of [`group_views`] until it
-    /// has made each member's import, hold it.
-    file: Weak<OwnedFd>,
-    /// Where the view's pages start in the file.
-    offset: u64,
-    /// Its membership's number, so a membership drops its own entry alone.
-    number: u64,
-}
-
-/// The largest alignment a request of the runtime's has asked a shared piece's offset to be a
-/// multiple of ([`asked_alignment`]), which each group's members start at, at least the host page.
-static ALIGNMENT: AtomicU64 = AtomicU64::new(0);
-
-/// A request of the runtime's asked for pieces at offsets that are multiples of `alignment`: the
-/// groups made from now on start their members at a multiple of it, at least.
-pub(crate) fn asked_alignment(alignment: u64) {
-    ALIGNMENT.fetch_max(alignment, Ordering::Relaxed);
-}
-
-/// A view's place in its group dma-buf ([`GROUPED`]), until it drops: the view's owner drops it
-/// before the view is unmapped, so a view mapped later at the same address is never answered with
-/// the old view's pages.
-#[derive(Debug)]
-pub(crate) struct Membership {
-    first: u64,
-    number: u64,
-}
-
-impl Drop for Membership {
-    fn drop(&mut self) {
-        let mut grouped = GROUPED.lock();
-        if grouped
-            .get(&self.first)
-            .is_some_and(|g| g.number == self.number)
-        {
-            grouped.remove(&self.first);
-        }
-    }
-}
-
-/// The most bytes one group dma-buf holds, whatever udmabuf takes: a member whose buffers went
-/// keeps its pages pinned and mapped in the device's import while another member's import lives,
-/// so a group's bytes bound what such members hold (`super::dma_buf`'s module docs, "Groups").
-/// udmabuf's default `size_limit_mb`, which CachyOS's 7.3 kernels raise to 2147483647 as they boot
-/// (`super::host_ram`'s module docs), where `list_limit` alone would let a group of large views
-/// grow to gigabytes.
-pub(crate) const GROUP_BYTES: u64 = 64 << 20;
-
-/// What one group dma-buf holds at most: udmabuf's limits as the host has them ([`limits`]), its
-/// bytes at most [`GROUP_BYTES`].
-pub(crate) fn group_limits() -> Limits {
-    group_limits_of(limits())
-}
-
-/// What one group dma-buf holds at most within udmabuf's `limits`: its bytes at most
-/// [`GROUP_BYTES`].
-fn group_limits_of(limits: Limits) -> Limits {
-    Limits {
-        pieces: limits.pieces,
-        bytes: limits.bytes.min(GROUP_BYTES),
-    }
-}
-
-/// What [`group_views`] made: the group dma-bufs, which the caller holds until it has made each
-/// member's import, and each view's membership, `None` for a view left alone.
-pub(crate) type Groups = (Vec<Arc<OwnedFd>>, Vec<Option<Membership>>);
-
-/// Puts `views`, each a first byte and a length (whole pages of the library's views, mapped),
-/// into group dma-bufs ([`of_group`]), in order, each as many as fit, the members starting at the
-/// alignment the runtime's requests have asked for ([`asked_alignment`]), and registers each
-/// member's place ([`GROUPED`]). A view a group refuses as its first member (its pages past the
-/// limits alone, or resolving to no file) is left alone and the next starts a group, and a group
-/// that would take only its first member is not made: its import is made as before, a dma-buf
-/// of its own.
-pub(crate) fn group_views(views: &[(u64, u64)]) -> Groups {
-    group_views_at(views, ALIGNMENT.load(Ordering::Relaxed))
-}
-
-/// [`group_views`], the members starting at multiples of `align`, at least the host page.
-fn group_views_at(views: &[(u64, u64)], align: u64) -> Groups {
-    static NUMBER: AtomicU64 = AtomicU64::new(0);
-    let mut files = Vec::new();
-    let mut members: Vec<Option<Membership>> = views.iter().map(|_| None).collect();
-    let align = align.max(vm::page_size());
-    let mut at = 0;
-    while views.len() - at > 1 {
-        let made = within_limits(|limits| of_group(&views[at..], align, group_limits_of(limits)));
-        let group = match made {
-            Ok(group) => group,
-            Err(refusal) => {
-                log::debug!(
-                    "a view of {:#x} bytes at {:#x} starts no group dma-buf: {refusal}",
-                    views[at].1,
-                    views[at].0
-                );
-                at += 1;
-                continue;
-            }
-        };
-        let taken = group.offsets.len();
-        if taken > 1 {
-            let mut grouped = GROUPED.lock();
-            for (i, &offset) in group.offsets.iter().enumerate() {
-                let (first, length) = views[at + i];
-                let number = NUMBER.fetch_add(1, Ordering::Relaxed);
-                let file = Arc::downgrade(&group.file);
-                grouped.insert(
-                    first,
-                    Grouped {
-                        length,
-                        file,
-                        offset,
-                        number,
-                    },
-                );
-                members[at + i] = Some(Membership { first, number });
-            }
-            drop(grouped);
-            log::debug!(
-                "{taken} views in a group dma-buf of {:#x} bytes, from the view at {:#x}",
-                group.length,
-                views[at].0
-            );
-            files.push(group.file);
-        }
-        at += taken;
-    }
-    (files, members)
-}
-
-/// The piece of a group dma-buf that holds the `length` bytes from `first` ([`GROUPED`]): its
-/// file and the bytes' offset in it, where they lie in one view whose membership lives, its file
-/// held still, and that offset is a multiple of `alignment`.
-pub(crate) fn piece_of(first: u64, length: u64, alignment: u64) -> Option<(Arc<OwnedFd>, u64)> {
-    let grouped = GROUPED.lock();
-    let (&base, view) = grouped.range(..=first).next_back()?;
-    let end = first.checked_add(length)?;
-    if end > base.saturating_add(view.length) {
-        return None;
-    }
-    let offset = view.offset + (first - base);
-    if !offset.is_multiple_of(alignment.max(1)) {
-        return None;
-    }
-    Some((view.file.upgrade()?, offset))
-}
-
-/// The bytes of a region of a guest RAM file (module docs, "Regions"), where udmabuf takes them in
-/// one dma-buf: udmabuf's default `size_limit_mb`, and [`GROUP_BYTES`], which bounds what a
-/// shared file pins that no object covers, whatever a host's udmabuf takes.
-pub(crate) const REGION_BYTES: u64 = 64 << 20;
-
-/// The bytes of a region on this host: [`REGION_BYTES`], or udmabuf's `size_limit_mb` where the
-/// host has it lower, down to a power of two, so a region of a file lies at a multiple of every
-/// alignment up to its own; `None` where that is less than a page.
-fn region_bytes() -> Option<u64> {
-    let bytes = 1u64 << REGION_BYTES.min(limits().bytes).checked_ilog2()?;
-    (bytes >= vm::page_size()).then_some(bytes)
-}
-
-/// A region of a guest RAM file (module docs, "Regions"): the file's identity (its `Arc`'s
-/// address), the regions' bytes and the region's index in the file.
-type RegionKey = (usize, u64, u64);
-
-/// The region dma-bufs made and alive now, by [`RegionKey`] (module docs, "Regions").
-static REGIONS: Mutex<BTreeMap<RegionKey, Region>> = Mutex::new(BTreeMap::new());
-
-/// A region's dma-buf in [`REGIONS`].
-#[derive(Debug)]
-struct Region {
-    /// The RAM's file, held weakly: its `Arc`'s allocation, whose address keys the entry, is not
-    /// let go of while the entry lives, so no other file is ever found under the key.
-    _ram: Weak<OwnedFd>,
-    /// The region's dma-buf: the runtime's imports of it, the sources that answered with it
-    /// ([`RegionUse`]) and its kept imports ([`Region::kept`]) hold it.
-    file: Weak<OwnedFd>,
-    /// How many [`RegionUse`]s of it live: the sources that answered with a piece of it, which the
-    /// runtime keeps while an object it made through one lives.
-    users: u64,
-    /// When the last of them went, on the monotonic clock, where an import of it is kept: its
-    /// kept imports go [`LINGER_NS`] after (module docs, "Kept imports").
-    idle_since: Option<u64>,
-    /// Its import kept on each device an object over a piece of it was made on, by the device's
-    /// registry ID (`rt::Device::import_shared_dma_buf`, module docs, "Kept imports").
-    kept: Vec<(u64, rt::SharedDmaBufImport)>,
-    /// The devices, by registry ID, that refused to keep its import: none is asked again.
-    refused: Vec<u64>,
-}
-
-/// How many region dma-bufs were made (module docs, "Regions"): a diagnostic, which the trace
-/// writes as each is made.
-static REGIONS_MADE: AtomicU64 = AtomicU64::new(0);
-
-/// A source's use of a region's dma-buf ([`ram_piece`]): the dma-buf held, and the region counted
-/// in use ([`Region::users`]) while it lives. The import source keeps one for each region it
-/// answered with (`super::import`'s `host_memory`), and the runtime keeps the source while an
-/// import made through it lives, so a region is in use while an object over a piece of it lives.
-#[derive(Debug)]
-pub(crate) struct RegionUse {
-    key: RegionKey,
-    file: Arc<OwnedFd>,
-}
-
-impl RegionUse {
-    /// Whether `self` and `other` are uses of one region's dma-buf.
-    pub(crate) fn same(&self, other: &RegionUse) -> bool {
-        Arc::ptr_eq(&self.file, &other.file)
-    }
-
-    /// The region, weakly: what [`keep_regions`] keeps on the device an object over a piece of
-    /// it was made on.
-    pub(crate) fn region(&self) -> RegionRef {
-        RegionRef {
-            key: self.key,
-            file: Arc::downgrade(&self.file),
-        }
-    }
-}
-
-impl Drop for RegionUse {
-    /// The region's last use going starts its kept imports' linger (module docs, "Kept imports").
-    fn drop(&mut self) {
-        let mut regions = REGIONS.lock();
-        let Some(region) = (regions.get_mut(&self.key))
-            .filter(|r| std::ptr::eq(r.file.as_ptr(), Arc::as_ptr(&self.file)))
-        else {
-            return;
-        };
-        region.users = region.users.saturating_sub(1);
-        let lingers = region.users == 0 && !region.kept.is_empty();
-        if lingers {
-            region.idle_since = Some(mono_now());
-        }
-        drop(regions);
-        if lingers {
-            SWEEP.wake();
-        }
-    }
-}
-
-/// A region a source answered with, weakly ([`RegionUse::region`]).
-#[derive(Clone, Debug)]
-pub(crate) struct RegionRef {
-    key: RegionKey,
-    file: Weak<OwnedFd>,
-}
-
-/// What [`ram_piece`] answers: the piece, and a use of the region it lies in.
-#[derive(Debug)]
-pub(crate) struct RegionPiece {
-    pub(crate) chunk: DmaBufChunk,
-    pub(crate) region: RegionUse,
-}
-
-/// The piece of a guest RAM region's dma-buf that holds the `length` bytes from `first` (whole
-/// pages), as a no-copy buffer's or heap's request at `one_chunk_alignment` takes it (module docs,
-/// "Regions"): where the bytes are one run of a file's pages inside one region, at their offset in
-/// the region's dma-buf, made at the region's first piece, with a use of the region
-/// ([`RegionUse`]). `None` where a byte shows no page of the guest's RAM mapped writable, where
-/// the pages are several runs or cross into another region (a piece of each would be bound in a
-/// sparse buffer: module docs, "Several pieces"), where the piece's offset is one
-/// `one_chunk_alignment` does not divide, or where udmabuf makes no region's dma-buf: the request
-/// is answered as before then, with a dma-buf of its own.
-pub(crate) fn ram_piece(first: u64, length: u64, one_chunk_alignment: u64) -> Option<RegionPiece> {
-    ram_piece_in(first, length, one_chunk_alignment, region_bytes()?)
-}
-
-/// Why [`ram_piece`] answered none.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NoPiece {
-    /// A byte shows no page of the guest's RAM mapped writable.
-    NotRam,
-    /// The piece lies at an offset the request's one-chunk alignment does not divide.
-    Alignment,
-    /// udmabuf made no region's dma-buf.
-    Made,
-    /// The pages are several runs of the RAM's files, or one run across two regions.
-    Runs,
-}
-
-impl NoPiece {
-    /// Its number in the trace's `rampiece` event.
-    fn code(self) -> u64 {
-        match self {
-            NoPiece::NotRam => 1,
-            NoPiece::Alignment => 2,
-            NoPiece::Made => 3,
-            NoPiece::Runs => 4,
-        }
-    }
-}
-
-/// [`ram_piece`] in regions of `region` bytes, a power of two of whole pages.
-fn ram_piece_in(
-    first: u64,
-    length: u64,
-    one_chunk_alignment: u64,
-    region: u64,
-) -> Option<RegionPiece> {
-    let answer = piece_in_region(first, length, one_chunk_alignment, region);
-    // The trace's `rampiece`: the request's first byte, its length, the pieces answered (1, or 0),
-    // and why none was where none was.
-    let (count, why) = match &answer {
-        Ok(_) => (1, 0),
-        Err(no) => (0, no.code()),
-    };
-    crate::core::trace::event("rampiece", &[first, length, count, why]);
-    answer.ok()
-}
-
-/// The piece [`ram_piece_in`] answers, or why there is none.
-fn piece_in_region(
-    first: u64,
-    length: u64,
-    one_chunk_alignment: u64,
-    region: u64,
-) -> Result<RegionPiece, NoPiece> {
-    debug_assert!(region.is_power_of_two() && region.is_multiple_of(vm::page_size()));
-    let pieces = files::guest_ram_pieces(first, length).ok_or(NoPiece::NotRam)?;
-    let [piece] = pieces.as_slice() else {
-        return Err(NoPiece::Runs);
-    };
-    let (offset, bytes) = (piece.backing.offset, piece.length);
-    let (index, into) = (offset / region, offset % region);
-    if bytes != length || into + bytes > region {
-        return Err(NoPiece::Runs);
-    }
-    if !into.is_multiple_of(one_chunk_alignment.max(1)) {
-        return Err(NoPiece::Alignment);
-    }
-    let device = device().map_err(|_| NoPiece::Made)?;
-    let used = region_use(device, &piece.backing.file, index, region).ok_or(NoPiece::Made)?;
-    let chunk = DmaBufChunk {
-        file: Arc::clone(&used.file),
-        offset: into,
-        length: bytes,
-    };
-    Ok(RegionPiece {
-        chunk,
-        region: used,
-    })
-}
-
-/// The views' dma-bufs ([`view_piece`]), by the number of the view's record
-/// ([`files::view_of`]), each weakly: the runtime's imports of pieces of it hold it, and so does
-/// each import source that answered with one, which the runtime keeps with the imports it made
-/// (`super::import`'s `host_memory`).
-static VIEW_FILES: Mutex<BTreeMap<u64, ViewFile>> = Mutex::new(BTreeMap::new());
-
-/// A view's dma-buf in [`VIEW_FILES`]: the first byte of the view's runs it holds, their bytes,
-/// and the file.
-#[derive(Debug)]
-struct ViewFile {
-    first: u64,
-    length: u64,
-    file: Weak<OwnedFd>,
-}
-
-/// The piece of its view's dma-buf that holds the `length` bytes from `first` (whole pages), as a
-/// no-copy buffer's or heap's request at `one_chunk_alignment` takes it (module docs, "Views"):
-/// where the bytes lie in the runs of one view ([`files::view_of`]), at their offset in a dma-buf
-/// of all the view's runs that follow on around them, made at the view's first such piece while
-/// none is alive and shared by its `Arc`. `None` where they do not, where those runs are more than
-/// one dma-buf takes (udmabuf's limits as the host has them, at most [`GROUP_BYTES`]), where the
-/// offset is one `one_chunk_alignment` does not divide, or where udmabuf makes none: the request
-/// is answered with a dma-buf of its own then.
-pub(crate) fn view_piece(first: u64, length: u64, one_chunk_alignment: u64) -> Option<DmaBufChunk> {
-    let view = files::view_of(first, length)?;
-    let piece = |at: u64, file: Arc<OwnedFd>, made: u64| {
-        let offset = first - at;
-        // The trace's `viewpiece`: the request's first byte and length, the first byte of the
-        // view's runs the dma-buf holds, and whether it was made for it (1) or joined (0).
-        crate::core::trace::event("viewpiece", &[first, length, at, made]);
-        (offset.is_multiple_of(one_chunk_alignment.max(1))).then_some(DmaBufChunk {
-            file,
-            offset,
-            length,
-        })
-    };
-    let alive =
-        (VIEW_FILES.lock().get(&view)).and_then(|v| Some((v.first, v.length, v.file.upgrade()?)));
-    if let Some((at, bytes, file)) = alive
-        && at <= first
-        && first + length <= at + bytes
-    {
-        return piece(at, file, 0);
-    }
-    let limits = limits();
-    let most = usize::try_from(limits.pieces).unwrap_or(usize::MAX);
-    let (at, pieces) = files::view_runs(view, first, most)?;
-    let bytes: u64 = pieces.iter().map(|p| p.length).sum();
-    let fits = pieces.len().to_u64() <= limits.pieces && bytes <= limits.bytes.min(GROUP_BYTES);
-    if !fits || !(first - at).is_multiple_of(one_chunk_alignment.max(1)) {
-        return None;
-    }
-    let runs: Vec<Run<Arc<OwnedFd>>> = (pieces.into_iter())
-        .map(|p| Run {
-            file: p.backing.file,
-            offset: p.backing.offset,
-            length: p.length,
-        })
-        .collect();
-    let file = Arc::new(create(device().ok()?, &runs).ok()?);
-    let mut files = VIEW_FILES.lock();
-    // The entries of views whose dma-buf went go with this one's entry.
-    files.retain(|_, v| v.file.strong_count() > 0);
-    files.insert(
-        view,
-        ViewFile {
-            first: at,
-            length: bytes,
-            file: Arc::downgrade(&file),
-        },
-    );
-    drop(files);
-    piece(at, file, 1)
-}
-
-/// A use of region `index` of the RAM's file `ram`, `region` bytes from `index * region` (fewer at
-/// the file's end): of its dma-buf alive in [`REGIONS`], or of one made now and entered there. A
-/// region made meanwhile by another thread is the one used, and this one goes. `None` where the
-/// file's size is not known or the kernel refuses the dma-buf.
-fn region_use(device: &OwnedFd, ram: &Arc<OwnedFd>, index: u64, region: u64) -> Option<RegionUse> {
-    let key = (Arc::as_ptr(ram).addr(), region, index);
-    // A use of the region's live dma-buf, counted, its linger ended.
-    let used = |regions: &mut BTreeMap<RegionKey, Region>| {
-        let entry = regions.get_mut(&key)?;
-        let file = entry.file.upgrade()?;
-        entry.users += 1;
-        entry.idle_since = None;
-        Some(RegionUse { key, file })
-    };
-    if let Some(used) = used(&mut REGIONS.lock()) {
-        return Some(used);
-    }
-    let start = index.checked_mul(region)?;
-    let stat = stat_of(ram)?;
-    let bytes = region.min(u64::try_from(stat.st_size).ok()?.checked_sub(start)?);
-    let run = Run {
-        file: Arc::clone(ram),
-        offset: start,
-        length: bytes,
-    };
-    let made = match create(device, std::slice::from_ref(&run)) {
-        Ok(fd) => Arc::new(fd),
-        Err(refusal) => {
-            log::debug!(
-                "no region dma-buf of the guest's RAM, {bytes:#x} bytes at {start:#x} of its \
-                 file: {refusal}"
-            );
-            return None;
-        }
-    };
-    let mut regions = REGIONS.lock();
-    if let Some(used) = used(&mut regions) {
-        return Some(used);
-    }
-    // An entry whose dma-buf went holds no kept import: each holds the dma-buf.
-    regions.retain(|_, r| r.file.strong_count() > 0);
-    regions.insert(
-        key,
-        Region {
-            _ram: Arc::downgrade(ram),
-            file: Arc::downgrade(&made),
-            users: 1,
-            idle_since: None,
-            kept: Vec::new(),
-            refused: Vec::new(),
-        },
-    );
-    let live = regions.len().to_u64();
-    drop(regions);
-    // The trace's `ramregion`: the region's first byte in the file, its bytes, the regions made
-    // so far, those alive now, the bytes of pages the file held before and after the dma-buf was
-    // made (`st_blocks`): what it gave pages to that nothing had touched, the guest's writes
-    // meanwhile among them.
-    let made_so_far = REGIONS_MADE.fetch_add(1, Ordering::Relaxed) + 1;
-    if crate::core::trace::on() {
-        let held = |stat: &libc::stat| u64::try_from(stat.st_blocks).unwrap_or(0) * 512;
-        let after = stat_of(ram).map_or(0, |s| held(&s));
-        let event = [start, bytes, made_so_far, live, held(&stat), after];
-        crate::core::trace::event("ramregion", &event);
-    }
-    Some(RegionUse { key, file: made })
-}
-
-/// How long a region's kept imports stay once no object lies in it, in nanoseconds (module docs,
-/// "Kept imports"): two seconds, the first window the runtime's residency thread keeps an idle
-/// import of a no-copy buffer for before it releases it (`host_residency.rs`'s `IDLE`).
-pub(crate) const LINGER_NS: u64 = 2_000_000_000;
-
-/// Keeps the import of each region of `answered`, those a source answered with as an object was
-/// made on `device`, on that device (module docs, "Kept imports"): its one import of the region's
-/// dma-buf, which the object's piece joined, held from now on by the device's keep
-/// (`rt::Device::import_shared_dma_buf`), so the region's next object joins it rather than
-/// importing the dma-buf again. Only on a device the process adopted, which the platform's let-go
-/// lets go of ([`take_region_keeps`]); only for a region in use, as one whose source the runtime
-/// dropped had no import made through it; once per device; and never on a device that refused
-/// it once. Called on the thread that made the object, once the runtime's call returned.
-pub(crate) fn keep_regions(device: &rt::Device, answered: Vec<RegionRef>) {
-    if answered.is_empty() || !crate::gpu::device::adopted(device) {
-        return;
-    }
-    let id = device.registry_id();
-    for region in answered {
-        // The region's dma-buf, where it is in use and this device keeps none of it yet.
-        let file = {
-            let regions = REGIONS.lock();
-            let Some(entry) =
-                (regions.get(&region.key)).filter(|r| Weak::ptr_eq(&r.file, &region.file))
-            else {
-                continue;
-            };
-            let asked = entry.kept.iter().any(|&(at, _)| at == id) || entry.refused.contains(&id);
-            if asked || entry.users == 0 {
-                continue;
-            }
-            let Some(file) = region.file.upgrade() else {
-                continue;
-            };
-            file
-        };
-        let made = device.import_shared_dma_buf(&file, rt::ResourceOptions::default());
-        let mut regions = REGIONS.lock();
-        let entry = (regions.get_mut(&region.key)).filter(|r| Weak::ptr_eq(&r.file, &region.file));
-        // Whether it lingers already: its last use went while the keep was made.
-        let mut lingers = false;
-        let left = match (made, entry) {
-            (Ok(kept), Some(entry)) if !entry.kept.iter().any(|&(at, _)| at == id) => {
-                entry.kept.push((id, kept));
-                // The trace's `regionkeep`: the region dma-buf's identity (its `Arc`'s address, as
-                // the import source's `dmabufans` writes it) and the device that keeps it.
-                let file = Arc::as_ptr(&file).addr().to_u64();
-                crate::core::trace::event("regionkeep", &[file, id]);
-                if entry.users == 0 {
-                    entry.idle_since = Some(mono_now());
-                    lingers = true;
-                }
-                None
-            }
-            (Ok(kept), _) => Some(kept),
-            (Err(error), entry) => {
-                if let Some(entry) = entry {
-                    entry.refused.push(id);
-                }
-                log::debug!(
-                    target: "reims_vgpu_vulkan::os",
-                    "the device keeps no import of a region dma-buf of the guest's RAM: {error}"
-                );
-                None
-            }
-        };
-        drop(regions);
-        // A keep made meanwhile by another thread is the one kept; this one goes, with no lock.
-        drop(left);
-        drop(file);
-        if lingers {
-            SWEEP.wake();
-        }
-    }
-}
-
-/// Every region import the devices keep, taken out of [`REGIONS`], for the platform's let-go of
-/// its devices (`crate::let_go`): each holds a handle of its device, which goes with the keep, and
-/// the imports go with their last buffer, or at once where none is bound in them.
-pub(crate) fn take_region_keeps() -> Vec<rt::SharedDmaBufImport> {
-    let mut regions = REGIONS.lock();
-    let mut taken = Vec::new();
-    for region in regions.values_mut() {
-        if !region.kept.is_empty() {
-            trace_let_go(region);
-        }
-        taken.extend(region.kept.drain(..).map(|(_, kept)| kept));
-        region.idle_since = None;
-    }
-    taken
-}
-
-/// The trace's `regionletgo`: the identity of a region dma-buf whose kept imports are let go of
-/// (as `regionkeep` writes it), and how many.
-fn trace_let_go(region: &Region) {
-    let file = Weak::as_ptr(&region.file).addr().to_u64();
-    crate::core::trace::event("regionletgo", &[file, region.kept.len().to_u64()]);
-}
-
-/// The kept imports of the regions whose linger ended by `now` ([`LINGER_NS`]), taken out of
-/// [`REGIONS`], and when the next linger ends, where one goes on.
-fn lingered(now: u64) -> (Vec<rt::SharedDmaBufImport>, Option<u64>) {
-    let mut regions = REGIONS.lock();
-    let mut taken = Vec::new();
-    let mut next: Option<u64> = None;
-    for region in regions.values_mut() {
-        let Some(since) = region.idle_since.filter(|_| region.users == 0) else {
-            continue;
-        };
-        let ends = since.saturating_add(LINGER_NS);
-        if ends <= now {
-            if !region.kept.is_empty() {
-                trace_let_go(region);
-            }
-            taken.extend(region.kept.drain(..).map(|(_, kept)| kept));
-            region.idle_since = None;
-        } else {
-            next = Some(next.map_or(ends, |n| n.min(ends)));
-        }
-    }
-    (taken, next)
-}
-
-/// Ends every region's linger now, as [`LINGER_NS`] after its last use would, its kept imports let
-/// go of: for tests, which wait no two seconds.
-#[cfg(test)]
-pub(crate) fn end_lingers() {
-    drop(lingered(u64::MAX).0);
-}
-
-/// The sweep of the regions' kept imports whose linger ended ([`lingered`]), on a thread of its
-/// own, `reims-vgpu.region-keeps`, started with the first keep: it waits until the next linger
-/// ends, or with none for a keep or a region's last use, takes what lingered out and lets go of it
-/// with no lock held. It holds nothing of a device but what [`REGIONS`] holds.
-static SWEEP: Sweep = Sweep::new();
-
-/// [`SWEEP`]'s state.
-struct Sweep {
-    /// Set as a keep or a last use wakes the thread, cleared as it sweeps.
-    woken: Mutex<bool>,
-    /// Raised as it is woken.
-    wake: crate::core::sync::Condvar,
-    /// Whether the thread was started.
-    started: OnceLock<()>,
-}
-
-impl Sweep {
-    const fn new() -> Sweep {
-        Sweep {
-            woken: Mutex::new(false),
-            wake: crate::core::sync::Condvar::new(),
-            started: OnceLock::new(),
-        }
-    }
-
-    /// Wakes the thread, starting it first where it was not.
-    fn wake(&'static self) {
-        self.started.get_or_init(|| {
-            let spawned = std::thread::Builder::new()
-                .name("reims-vgpu.region-keeps".into())
-                .spawn(move || self.run());
-            if let Err(error) = spawned {
-                log::warn!(
-                    target: "reims_vgpu_vulkan::os",
-                    "no thread lets go of the guest RAM's region imports kept idle: {error}"
-                );
-            }
-        });
-        *self.woken.lock() = true;
-        self.wake.notify_one();
-    }
-
-    /// The thread's loop ([`SWEEP`]).
-    fn run(&self) {
-        use crate::core::platform::os::Clock as _;
-        use crate::core::platform::os::clock::{Deadline, MonoTime};
-        let clock = super::clock::LinuxClock::new();
-        loop {
-            let (gone, next) = lingered(clock.now_mono().as_nanos());
-            drop(gone);
-            let mut woken = self.woken.lock();
-            while !*woken {
-                match next {
-                    Some(ends) => {
-                        let deadline = Deadline::Mono(MonoTime::from_nanos(ends));
-                        if clock
-                            .wait_until(&self.wake, &mut woken, deadline)
-                            .timed_out()
-                        {
-                            break;
-                        }
-                    }
-                    None => clock.wait(&self.wake, &mut woken),
-                }
-            }
-            *woken = false;
-        }
-    }
-}
-
-/// The status of the file `fd`.
-fn stat_of(fd: &OwnedFd) -> Option<libc::stat> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: the descriptor is open for the call, and `fstat` writes the structure.
-    if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    // SAFETY: the call succeeded, so it wrote the structure.
-    Some(unsafe { stat.assume_init() })
 }
 
 /// One dma-buf of a view's pages ([`of_view`]): `length` bytes of the view from `at`, to map with
@@ -1638,48 +666,6 @@ mod tests {
                 .read_volatile();
             libc::munmap(at, length);
             byte
-        }
-    }
-
-    /// The byte at `offset` of the dma-buf `file`, read through a mapping of it from its start.
-    fn read_file(file: &OwnedFd, offset: u64) -> u8 {
-        let length = (offset + 1).next_multiple_of(vm::page_size()).to_usize();
-        // SAFETY: a fresh read-only mapping of the dma-buf, read once and unmapped.
-        unsafe {
-            let at = libc::mmap(
-                std::ptr::null_mut(),
-                length,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
-                0,
-            );
-            assert_ne!(at, libc::MAP_FAILED);
-            let byte = (at.cast::<u8>()).add(offset.to_usize()).read_volatile();
-            libc::munmap(at, length);
-            byte
-        }
-    }
-
-    /// Writes `byte` at `offset` of the dma-buf, through a mapping of it, as the GPU writes
-    /// through its import.
-    fn write_through(chunk: &DmaBufChunk, offset: u64, byte: u8) {
-        let length = usize::try_from(chunk.length).unwrap();
-        // SAFETY: a fresh shared mapping of the dma-buf, written once and unmapped.
-        unsafe {
-            let at = libc::mmap(
-                std::ptr::null_mut(),
-                length,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                chunk.file.as_raw_fd(),
-                0,
-            );
-            assert_ne!(at, libc::MAP_FAILED);
-            (at.cast::<u8>())
-                .add(usize::try_from(offset).unwrap())
-                .write_volatile(byte);
-            libc::munmap(at, length);
         }
     }
 
@@ -1871,81 +857,6 @@ mod tests {
         assert_eq!(shape(&runs), [(offset, 2 * page)]);
     }
 
-    /// One dma-buf takes the pages of a list of ranges where they are no more runs of file pages
-    /// than its limit, counted as a dma-buf of them makes them: ranges whose pages follow on in
-    /// the file are one run, however they are cut, and every other page of a file one run each;
-    /// one more than the limit is refused with the count, and pages no file is behind are refused
-    /// as unresolved. It needs no udmabuf: it makes nothing
-    #[test]
-    fn a_list_of_ranges_fits_one_dma_buf_by_its_runs_of_file_pages() {
-        let page = vm::page_size();
-        let limits = limits();
-        let base = vm::allocate_aliasable(8 * page).unwrap().addr().to_u64();
-        let following = [base..base + page, base + page..base + 3 * page];
-        assert!(fits_one_of(&following).is_ok());
-        assert!(fits_one_of(std::slice::from_ref(&(base..base + 3 * page))).is_ok());
-        let private = vm::anonymous(None, page, "a test's private page").unwrap();
-        assert!(matches!(
-            fits_one_of(&[base..base + page, private..private + page]),
-            Err(Refusal::Unresolved)
-        ));
-        if limits.pieces > 1 << 16 {
-            eprintln!(
-                "skipped the limit: udmabuf takes {} pieces here",
-                limits.pieces
-            );
-            return;
-        }
-        // Every other page of a range, so no two pieces follow on in the file.
-        let count = limits.pieces + 1;
-        let at = vm::allocate_aliasable(2 * count * page)
-            .unwrap()
-            .addr()
-            .to_u64();
-        let apart: Vec<std::ops::Range<u64>> = (0..count)
-            .map(|i| at + 2 * i * page..at + (2 * i + 1) * page)
-            .collect();
-        assert!(fits_one_of(&apart[1..]).is_ok(), "as many as the limit");
-        match fits_one_of(&apart) {
-            Err(Refusal::Limit { pieces, .. }) => assert_eq!(pieces, count),
-            other => panic!("one past the limit: {other:?}"),
-        }
-    }
-
-    /// A refusal holds for every range that holds the one refused ([`Refusal::holds_wider`]) by
-    /// its class: pages with no file behind them, as a request of them is refused, a range past
-    /// one dma-buf's runs at a granule of its length, udmabuf not opening, and a writable piece of
-    /// a file open read-only do; the same range cut at a shorter granule, the kernel's refusals and
-    /// a pad's missing file do not. It needs no udmabuf
-    #[test]
-    fn refusals_hold_for_wider_ranges_by_their_class() {
-        let page = vm::page_size();
-        let private = vm::anonymous(None, 2 * page, "a test's private pages").unwrap();
-        let unresolved = of_pages_counted(private, 2 * page, 2 * page).unwrap_err();
-        assert!(
-            matches!(unresolved, Refusal::Unresolved) && unresolved.holds_wider(),
-            "{unresolved}"
-        );
-        let limits = Limits {
-            pieces: 1024,
-            bytes: 64 << 20,
-        };
-        let past = |granule| Refusal::Limit {
-            pieces: 1025,
-            bytes: 1025 * page,
-            granule,
-            limits,
-        };
-        assert!(past(1025 * page).holds_wider(), "one dma-buf of the range");
-        assert!(!past(16 * page).holds_wider(), "cut at a shorter granule");
-        let error = |code| io::Error::from_raw_os_error(code);
-        assert!(Refusal::Device(Arc::new(error(libc::ENOENT))).holds_wider());
-        assert!(Refusal::ReadOnlyFile.holds_wider());
-        assert!(!Refusal::Kernel(error(libc::EINVAL)).holds_wider());
-        assert!(!Refusal::Kernel(error(libc::ENOMEM)).holds_wider());
-        assert!(!Refusal::NoFile(error(libc::ENOMEM)).holds_wider());
-    }
-
     /// A view of more scattered pages than one dma-buf may hold is made of several, in order,
     /// each within the host's limits
     #[test]
@@ -1986,150 +897,10 @@ mod tests {
         }
     }
 
-    /// The limits the group tests make their dma-bufs within: udmabuf's defaults, whatever the
-    /// host's.
-    const LIMITS: Limits = Limits {
-        pieces: DEFAULT_LIST_LIMIT,
-        bytes: DEFAULT_SIZE_LIMIT_MB << 20,
-    };
-
-    /// The byte at `offset` of the group's file, read through a mapping of it.
-    fn read_group(group: &Group, offset: u64) -> u8 {
-        let chunk = DmaBufChunk {
-            file: Arc::clone(&group.file),
-            offset: 0,
-            length: group.length,
-        };
-        read_through(&chunk, offset)
-    }
-
-    /// A range of `pages` pages of memory the backing table resolves, each page's first byte
-    /// `0x40 + its index`.
-    fn marked(pages: u64) -> u64 {
-        let page = vm::page_size();
-        let at = vm::allocate_aliasable(pages * page)
-            .unwrap()
-            .addr()
-            .to_u64();
-        for i in 0..pages {
-            // SAFETY: the range just allocated, read and write.
-            unsafe {
-                vm::ptr(at + i * page)
-                    .cast::<u8>()
-                    .write_volatile(0x40 + i as u8)
-            };
-        }
-        at
-    }
-
-    /// A group dma-buf holds its members' pages back to back, in the order given, each where its
-    /// offset says, and they are the members' pages, not a copy: a write through the file shows
-    /// in the member's memory
-    #[test]
-    fn a_group_dma_buf_holds_its_members_pages_back_to_back() {
-        if !udmabuf() {
-            return;
-        }
-        let page = vm::page_size();
-        let at = marked(6);
-        let members = [(at + page, 2 * page), (at + 4 * page, page), (at, page)];
-        let group = of_group(&members, page, LIMITS).unwrap();
-        assert_eq!(group.offsets, [0, 2 * page, 3 * page]);
-        assert_eq!(group.length, 4 * page);
-        let read: Vec<u8> = (0..4).map(|i| read_group(&group, i * page)).collect();
-        assert_eq!(read, [0x41, 0x42, 0x44, 0x40]);
-        let chunk = DmaBufChunk {
-            file: Arc::clone(&group.file),
-            offset: 0,
-            length: group.length,
-        };
-        write_through(&chunk, 2 * page + 7, 0x5a);
-        // SAFETY: the range `marked` allocated, readable.
-        let shown = unsafe { vm::ptr(at + 4 * page + 7).cast::<u8>().read_volatile() };
-        assert_eq!(shown, 0x5a, "the member's own page");
-    }
-
-    /// Each member of a group starts at a multiple of the group's alignment, and the bytes
-    /// between two members read zeros, of a file of the group's own
-    #[test]
-    fn a_groups_members_start_at_its_alignment() {
-        if !udmabuf() {
-            return;
-        }
-        let page = vm::page_size();
-        let at = marked(3);
-        let members = [(at, page), (at + page, 2 * page)];
-        let group = of_group(&members, 4 * page, LIMITS).unwrap();
-        assert_eq!(group.offsets, [0, 4 * page]);
-        assert_eq!(group.length, 6 * page);
-        assert_eq!(read_group(&group, 0), 0x40);
-        for gap in 1..4 {
-            assert_eq!(read_group(&group, gap * page), 0, "the gap's page {gap}");
-        }
-        assert_eq!(read_group(&group, 4 * page), 0x41);
-        assert_eq!(read_group(&group, 5 * page), 0x42);
-    }
-
-    /// A group takes members while they fit one dma-buf: the first member past the limits, its
-    /// bytes or its runs, or whose pages no file is behind, ends it, and is left with those after
-    /// it; a first member that does not fit alone, or resolves to no file, is refused. With limits
-    /// of the test's own, udmabuf's defaults, so it holds whatever the host's are
-    #[test]
-    fn a_group_ends_at_the_first_member_that_does_not_fit() {
-        if !udmabuf() {
-            return;
-        }
-        let page = vm::page_size();
-        let at = marked(4);
-        // The whole of the limit and a page, untouched: the backing table resolves it, and only a
-        // group made of it would pin its pages.
-        let large = vm::allocate_aliasable(LIMITS.bytes + page)
-            .unwrap()
-            .addr()
-            .to_u64();
-        let group = of_group(
-            &[(at, page), (large, LIMITS.bytes), (at + page, page)],
-            page,
-            LIMITS,
-        )
-        .unwrap();
-        assert_eq!(group.offsets, [0], "the second is past the bytes");
-        assert_eq!(group.length, page);
-        assert!(matches!(
-            of_group(&[(large, LIMITS.bytes + page)], page, LIMITS),
-            Err(Refusal::Limit { .. })
-        ));
-        // Three runs apart, at two runs a dma-buf.
-        let two = Limits {
-            pieces: 2,
-            ..LIMITS
-        };
-        let apart = [(at, page), (at + 2 * page, page), (at + 3 * page, page)];
-        let group = of_group(&apart, page, two).unwrap();
-        assert_eq!(group.offsets, [0, page], "the third is past the runs");
-        let private = vm::anonymous(None, page, "a test's private page").unwrap();
-        let group = of_group(
-            &[(at, page), (private, page), (at + page, page)],
-            page,
-            LIMITS,
-        )
-        .unwrap();
-        assert_eq!(
-            group.offsets,
-            [0],
-            "a member no file is behind ends the group"
-        );
-        assert!(matches!(
-            of_group(&[(private, page), (at, page)], page, LIMITS),
-            Err(Refusal::Unresolved)
-        ));
-    }
-
     /// udmabuf's limits are read from the module's parameters where the host shows them, and
-    /// are its defaults where it does not; a group dma-buf takes them, its bytes at most
-    /// [`GROUP_BYTES`]
+    /// are its defaults where it does not
     #[test]
-    fn the_limits_are_the_hosts_and_a_groups_bytes_at_most_64_mib() {
+    fn the_limits_are_the_hosts() {
         let read = |name: &str| {
             std::fs::read_to_string(format!("/sys/module/udmabuf/parameters/{name}"))
                 .ok()
@@ -2140,9 +911,6 @@ mod tests {
             bytes: read("size_limit_mb").unwrap_or(DEFAULT_SIZE_LIMIT_MB) << 20,
         };
         assert_eq!(limits(), expected);
-        let group = group_limits();
-        assert_eq!(group.pieces, expected.pieces);
-        assert_eq!(group.bytes, expected.bytes.min(64 << 20));
     }
 
     /// The limits are read from the host at most once a second: a read less than a second after
@@ -2232,101 +1000,6 @@ mod tests {
         assert_eq!(READS.load(Ordering::Relaxed), reads);
     }
 
-    /// Grouped views are answered with their pieces of one group dma-buf while their memberships
-    /// live and the file is held: the same file for each, each view at its offset, a part of a
-    /// view at its offset there, which holds the view's own pages, and none at an offset that is
-    /// not a multiple of the alignment asked, nor past a view's end. A view whose membership
-    /// went, and every view once the group's file is let go of (a device's recovery asking
-    /// again after the imports went), is answered by no piece, so its pages take a dma-buf of
-    /// their own, as before
-    #[test]
-    fn grouped_views_are_answered_with_their_pieces_while_their_group_lives() {
-        if !udmabuf() {
-            return;
-        }
-        let page = vm::page_size();
-        let at = marked(6);
-        let views = [(at, 2 * page), (at + 3 * page, page), (at + 5 * page, page)];
-        let (files, members) = group_views_at(&views, page);
-        assert_eq!(files.len(), 1, "one group");
-        assert!(members.iter().all(Option::is_some), "each view a member");
-        let pieces: Vec<(Arc<OwnedFd>, u64)> = (views.iter())
-            .map(|&(first, length)| piece_of(first, length, page).expect("a piece"))
-            .collect();
-        assert!(pieces.iter().all(|(f, _)| Arc::ptr_eq(f, &files[0])));
-        let offsets: Vec<u64> = pieces.iter().map(|p| p.1).collect();
-        assert_eq!(offsets, [0, 2 * page, 3 * page]);
-        let group = Group {
-            file: Arc::clone(&files[0]),
-            offsets: offsets.clone(),
-            length: 4 * page,
-        };
-        assert_eq!(read_group(&group, 2 * page), 0x43, "the second view's page");
-        // A part of the first view, and its alignment.
-        let (file, offset) = piece_of(at + page, page, page).expect("a part's piece");
-        assert!(Arc::ptr_eq(&file, &files[0]));
-        assert_eq!(offset, page);
-        assert!(
-            piece_of(at + page, page, 2 * page).is_none(),
-            "not a multiple of 2 pages"
-        );
-        assert!(
-            piece_of(at + page, 2 * page, page).is_none(),
-            "past the view's end"
-        );
-        // Asked again, as at a recovery, while the group lives: the same piece.
-        let again = piece_of(views[1].0, views[1].1, page).expect("a piece again");
-        assert!(Arc::ptr_eq(&again.0, &files[0]));
-        assert_eq!(again.1, 2 * page);
-        drop(again);
-        // A membership gone: none for that view.
-        let mut members = members;
-        members[0] = None;
-        assert!(
-            piece_of(views[0].0, views[0].1, page).is_none(),
-            "its membership went"
-        );
-        assert!(piece_of(views[2].0, views[2].1, page).is_some());
-        // The group's file let go of: none for any, though their memberships live.
-        drop((pieces, file, group, files));
-        assert!(
-            piece_of(views[1].0, views[1].1, page).is_none(),
-            "the file went"
-        );
-        assert!(
-            piece_of(views[2].0, views[2].1, page).is_none(),
-            "the file went"
-        );
-        drop(members);
-    }
-
-    /// A group's members start at the alignment asked; a view a group cannot start with (its
-    /// pages resolving to no file) is left alone and the next starts the group; and a group that
-    /// would take one view alone is not made
-    #[test]
-    fn views_no_group_takes_are_left_alone() {
-        if !udmabuf() {
-            return;
-        }
-        let page = vm::page_size();
-        let at = marked(4);
-        let (files, members) = group_views_at(&[(at, page), (at + 2 * page, page)], 4 * page);
-        assert_eq!(files.len(), 1);
-        assert!(members.iter().all(Option::is_some));
-        assert_eq!(piece_of(at + 2 * page, page, 4 * page).unwrap().1, 4 * page);
-        drop((files, members));
-        let private = vm::anonymous(None, page, "a test's private page").unwrap();
-        let views = [(private, page), (at, page), (at + page, page)];
-        let (files, members) = group_views_at(&views, page);
-        assert_eq!(files.len(), 1);
-        assert!(members[0].is_none(), "no file behind it: alone");
-        assert!(members[1].is_some() && members[2].is_some());
-        assert!(piece_of(private, page, page).is_none());
-        drop((files, members));
-        let (files, members) = group_views_at(&[(at + 3 * page, page)], page);
-        assert!(files.is_empty() && members[0].is_none(), "one view alone");
-    }
-
     /// A range of the guest's RAM for a test: a memfd of `pages` pages mapped shared, each page's
     /// first byte its number (modulo 256), and registered as the guest's RAM while it lives.
     struct TestRam {
@@ -2381,8 +1054,8 @@ mod tests {
 
     /// A view of [`TestRam`] pages for a test: its runs, each a RAM, its first page and its
     /// pages, mapped shared one after another from the RAM's files and registered as showing them
-    /// while it lives, or recorded as one view's runs ([`TestView::recorded`]), as the library's
-    /// views of the guest's pages are.
+    /// while it lives, or recorded as one view's runs, as the library's views of the guest's pages
+    /// are.
     struct TestView {
         at: u64,
         length: u64,
@@ -2393,12 +1066,6 @@ mod tests {
     impl TestView {
         fn new(runs: &[(&TestRam, u64, u64)]) -> TestView {
             TestView::made(runs, false)
-        }
-
-        /// [`TestView::new`], its runs recorded in the backing table at once, one view's
-        /// (`files::record_pieces`), until it drops.
-        fn recorded(runs: &[(&TestRam, u64, u64)]) -> TestView {
-            TestView::made(runs, true)
         }
 
         fn made(runs: &[(&TestRam, u64, u64)], recorded: bool) -> TestView {
@@ -2472,189 +1139,6 @@ mod tests {
         }
     }
 
-    /// The uses ([`Region::users`]) and the kept imports of the region whose dma-buf is `file`.
-    fn region_of(file: &Arc<OwnedFd>) -> Option<(u64, usize)> {
-        let regions = REGIONS.lock();
-        (regions.values())
-            .find(|r| std::ptr::eq(r.file.as_ptr(), Arc::as_ptr(file)))
-            .map(|r| (r.users, r.kept.len()))
-    }
-
-    /// When the region whose dma-buf is `file` began to linger ([`Region::idle_since`]).
-    fn idle_since(file: &Arc<OwnedFd>) -> Option<u64> {
-        let regions = REGIONS.lock();
-        (regions.values())
-            .find(|r| std::ptr::eq(r.file.as_ptr(), Arc::as_ptr(file)))
-            .and_then(|r| r.idle_since)
-    }
-
-    /// A region an object was made over is kept imported on the device that made it, once
-    /// ([`keep_regions`]): its kept import lingers past its last use, which a use ends, the
-    /// region's own dma-buf answered again; the linger ends [`LINGER_NS`] after the last use, the
-    /// keep and the dma-buf with it. A region no source uses any more is not kept. Where udmabuf
-    /// does not open, or the device keeps no import of the dma-buf (NVIDIA's driver refuses one
-    /// dedicated to nothing this small), it says so and checks no more
-    #[test]
-    fn a_regions_kept_import_lingers_past_its_last_use() {
-        if !udmabuf() {
-            return;
-        }
-        let d = crate::gpu::device::tests::dev();
-        let page = vm::page_size();
-        let region = 16 * page;
-        let ram = TestRam::new(32);
-        let made = || REGIONS_MADE.load(Ordering::Relaxed);
-        let one = ram_piece_in(ram.at, page, page, region).unwrap();
-        let file = Arc::clone(&one.chunk.file);
-        keep_regions(&d.raw, refs_of(&one));
-        if region_of(&file) != Some((1, 1)) {
-            eprintln!(
-                "skipped: {} keeps no import of a region's dma-buf ({:?})",
-                d.raw.properties().name,
-                region_of(&file)
-            );
-            return;
-        }
-        keep_regions(&d.raw, refs_of(&one));
-        assert_eq!(region_of(&file), Some((1, 1)), "kept once a device");
-        let two = ram_piece_in(ram.at + page, page, page, region).unwrap();
-        assert_eq!(region_of(&file), Some((2, 1)));
-        drop((one, two));
-        assert_eq!(region_of(&file), Some((0, 1)), "kept past its last use");
-        let since = idle_since(&file).expect("lingering");
-        let (gone, next) = lingered(since);
-        assert!(gone.is_empty(), "lingering still");
-        assert_eq!(next, Some(since + LINGER_NS));
-        let before = made();
-        let three = ram_piece_in(ram.at + 2 * page, page, page, region).unwrap();
-        assert!(
-            Arc::ptr_eq(&three.chunk.file, &file),
-            "its own dma-buf again"
-        );
-        assert_eq!(made(), before, "none made");
-        assert_eq!((region_of(&file), idle_since(&file)), (Some((1, 1)), None));
-        drop(three);
-        let since = idle_since(&file).expect("lingering again");
-        let (gone, next) = lingered(since + LINGER_NS);
-        assert_eq!((gone.len(), next), (1, None), "its linger ended");
-        drop(gone);
-        let held = Arc::downgrade(&file);
-        drop(file);
-        assert!(held.upgrade().is_none(), "the dma-buf went with its keep");
-        // A region whose last use went before the object's making returned is not kept.
-        let four = ram_piece_in(ram.at + 17 * page, page, page, region).unwrap();
-        let (file, refs) = (Arc::clone(&four.chunk.file), refs_of(&four));
-        drop(four);
-        keep_regions(&d.raw, refs);
-        assert_eq!(region_of(&file), Some((0, 0)), "not kept");
-    }
-
-    /// The region `piece` lies in, weakly ([`RegionUse::region`]).
-    fn refs_of(piece: &RegionPiece) -> Vec<RegionRef> {
-        vec![piece.region.region()]
-    }
-
-    /// Two requests in one region of the guest's RAM are pieces of one file, at their pages'
-    /// offsets in the region, which show those pages; one in another region is a piece of another
-    /// file; the region's file is made once while a piece of it is held, and made again once the
-    /// last went
-    #[test]
-    fn requests_in_one_region_share_its_file() {
-        if !udmabuf() {
-            return;
-        }
-        let page = vm::page_size();
-        // Regions of 16 pages, four of them.
-        let region = 16 * page;
-        let ram = TestRam::new(64);
-        let made = || REGIONS_MADE.load(Ordering::Relaxed);
-        let before = made();
-        let one = ram_piece_in(ram.at + 2 * page, 3 * page, page, region).unwrap();
-        let two = ram_piece_in(ram.at + 9 * page, page, page, region).unwrap();
-        assert!(Arc::ptr_eq(&one.chunk.file, &two.chunk.file), "one file");
-        assert_eq!((one.chunk.offset, one.chunk.length), (2 * page, 3 * page));
-        assert_eq!((two.chunk.offset, two.chunk.length), (9 * page, page));
-        assert_eq!(made() - before, 1, "made once");
-        assert_eq!(
-            region_of(&one.chunk.file),
-            Some((2, 0)),
-            "a use of it each answer, kept nowhere"
-        );
-        assert_eq!(
-            read_file(&one.chunk.file, 2 * page),
-            2,
-            "the region's own pages"
-        );
-        assert_eq!(read_file(&one.chunk.file, 9 * page), 9);
-        let other = ram_piece_in(ram.at + 17 * page, page, page, region).unwrap();
-        assert!(
-            !Arc::ptr_eq(&one.chunk.file, &other.chunk.file),
-            "another region"
-        );
-        assert_eq!(other.chunk.offset, page);
-        assert_eq!(read_file(&other.chunk.file, page), 17);
-        assert_eq!(made() - before, 2);
-        // The first region's pieces let go of: its file goes, and the next request makes it again.
-        let held = Arc::downgrade(&one.chunk.file);
-        drop((one, two));
-        assert!(
-            held.upgrade().is_none(),
-            "the file went with its last piece"
-        );
-        let again = ram_piece_in(ram.at + 4 * page, page, page, region).unwrap();
-        assert_eq!(made() - before, 3, "made again");
-        assert_eq!(read_file(&again.chunk.file, 4 * page), 4);
-        drop((again, other));
-    }
-
-    /// A request takes a piece of a region's file only where its pages are one run of the RAM's
-    /// file inside one region, at an offset its one-chunk alignment divides: one whose pages cross
-    /// into the next region or lie in several runs takes none, though each run is whole granules
-    /// at offsets every alignment divides (a piece of each would be bound in a sparse buffer, a
-    /// page-table update each: module docs, "Several pieces"), and nor does memory of the
-    /// library's own. The file's last region is cut at its end
-    #[test]
-    fn a_region_piece_is_one_run_inside_one_region() {
-        if !udmabuf() {
-            return;
-        }
-        let page = vm::page_size();
-        let region = 16 * page;
-        let ram = TestRam::new(64);
-        let lone = ram_piece_in(ram.at + 2 * page, 8 * page, page, region);
-        let lone = lone.expect("one run inside one region");
-        assert_eq!((lone.chunk.offset, lone.chunk.length), (2 * page, 8 * page));
-        assert_eq!(read_file(&lone.chunk.file, 9 * page), 9);
-        drop(lone);
-        assert!(
-            ram_piece_in(ram.at + 2 * page, page, 4 * page, region).is_none(),
-            "off the one-chunk alignment"
-        );
-        assert!(
-            ram_piece_in(ram.at + 12 * page, 8 * page, page, region).is_none(),
-            "one run across a region's end"
-        );
-        let view = TestView::new(&[(&ram, 8, 4), (&ram, 0, 4)]);
-        assert!(
-            ram_piece_in(view.at, 8 * page, page, region).is_none(),
-            "two runs inside one region"
-        );
-        drop(view);
-        let own = vm::allocate_aliasable(4 * page).unwrap().addr().to_u64();
-        assert!(
-            ram_piece_in(own, page, page, region).is_none(),
-            "memory of the library's own"
-        );
-        // The file's last region is cut at its end: 24 pages in regions of 16.
-        let short = TestRam::new(24);
-        let tail = ram_piece_in(short.at + 18 * page, 2 * page, page, region).unwrap();
-        assert_eq!(tail.chunk.offset, 2 * page);
-        // SAFETY: a dma-buf answers `SEEK_END` with its size.
-        let bytes = unsafe { libc::lseek(tail.chunk.file.as_raw_fd(), 0, libc::SEEK_END) };
-        assert_eq!(u64::try_from(bytes).unwrap(), 8 * page);
-        assert_eq!(read_file(&tail.chunk.file, 3 * page), 19);
-    }
-
     /// A buffer's or heap's pages in several runs, of one file or of several, take one dma-buf of
     /// their own, one list of their runs (`UDMABUF_CREATE_LIST` takes runs of several memfds) at
     /// offset 0, whatever the granule a split would take, which shows the pages in their order:
@@ -2676,7 +1160,7 @@ mod tests {
             (1, 3),
             "one dma-buf of the three runs"
         );
-        assert_eq!((chunks[0].offset, chunks[0].length), (0, length));
+        assert_eq!(chunks[0].length, length);
         assert_eq!(
             Arc::strong_count(&chunks[0].file),
             1,
@@ -2699,105 +1183,6 @@ mod tests {
             "one run across a region's end"
         );
         assert_eq!(read_through(&across[0], 7 * page), 19);
-    }
-
-    /// Requests in one view's runs take pieces of one dma-buf of the view's runs, made at the
-    /// first and shared by its `Arc` while one lives, each at its offset in the view and showing
-    /// its pages in the view's order; one made again once none lives. A run recorded over part of
-    /// the view leaves its other runs' requests to the dma-buf alive, and to one of the runs
-    /// around them once none is. A piece at an offset its alignment does not divide, or a request
-    /// past the view's runs, takes none (module docs, "Views")
-    #[test]
-    fn pages_in_one_views_runs_share_its_dma_buf() {
-        if !udmabuf() {
-            return;
-        }
-        let page = vm::page_size();
-        let ram = TestRam::new(32);
-        let other = TestRam::new(4);
-        let view = TestView::recorded(&[(&ram, 16, 16), (&ram, 0, 16)]);
-        let made = || MADE.load(Ordering::Relaxed);
-        let before = made();
-        let whole = view_piece(view.at, 32 * page, page).expect("the whole view");
-        assert_eq!((whole.offset, whole.length), (0, 32 * page));
-        assert_eq!(made() - before, 1, "the view's dma-buf made");
-        let part = view_piece(view.at + 8 * page, 16 * page, page).expect("a part across its runs");
-        assert!(Arc::ptr_eq(&whole.file, &part.file), "the same file");
-        assert_eq!((part.offset, part.length), (8 * page, 16 * page));
-        assert_eq!(made() - before, 1, "none made for the part");
-        let shown: Vec<u8> = [0, 7, 8, 15]
-            .iter()
-            .map(|&i| read_file(&part.file, part.offset + i * page))
-            .collect();
-        assert_eq!(
-            shown,
-            [24, 31, 0, 7],
-            "the part's pages in the view's order"
-        );
-        assert!(
-            view_piece(view.at + page, page, 2 * page).is_none(),
-            "off its alignment"
-        );
-        assert!(
-            view_piece(view.at + 31 * page, 2 * page, page).is_none(),
-            "past the view"
-        );
-        drop((whole, part));
-        let again = view_piece(view.at + page, 2 * page, page).expect("made again");
-        assert_eq!((again.offset, made() - before), (page, 2));
-        // A run of another record over the view's fifth page.
-        let over = files::Backing {
-            file: Arc::clone(&other.file),
-            offset: 0,
-        };
-        files::record(view.at + 4 * page, page, over, VmProt::READ | VmProt::WRITE);
-        assert!(
-            view_piece(view.at, 8 * page, page).is_none(),
-            "across the run over it"
-        );
-        let after = view_piece(view.at + 5 * page, 4 * page, page).expect("after the run");
-        assert!(Arc::ptr_eq(&again.file, &after.file), "the file alive");
-        assert_eq!(
-            read_file(&after.file, after.offset),
-            21,
-            "the view's sixth page"
-        );
-        drop((again, after));
-        let around = view_piece(view.at + 5 * page, 4 * page, page).expect("its runs around");
-        assert_eq!(
-            (around.offset, made() - before),
-            (0, 3),
-            "the runs from the sixth page"
-        );
-        let shown: Vec<u8> = [0, 10, 11, 26]
-            .iter()
-            .map(|&i| read_file(&around.file, i * page))
-            .collect();
-        assert_eq!(shown, [21, 31, 0, 15], "the view's pages from its sixth");
-    }
-
-    /// A view of more runs than one dma-buf takes (udmabuf's `list_limit` as the host has it)
-    /// gives no piece of a dma-buf of its own: its requests take dma-bufs of their own. Where
-    /// the limits take more runs than the test makes, it says so and checks nothing
-    #[test]
-    fn a_view_past_one_dma_buf_gives_no_piece() {
-        if !udmabuf() {
-            return;
-        }
-        let page = vm::page_size();
-        let limits = limits();
-        let n = limits.pieces + 1;
-        if n > 4096 || n * page > limits.bytes.min(GROUP_BYTES) {
-            eprintln!(
-                "skipped: udmabuf takes {} runs of {:#x} bytes",
-                limits.pieces, limits.bytes
-            );
-            return;
-        }
-        let ram = TestRam::new(2 * n);
-        let runs: Vec<(&TestRam, u64, u64)> = (0..n).map(|i| (&ram, 2 * i, 1)).collect();
-        let view = TestView::recorded(&runs);
-        assert!(view_piece(view.at, 2 * page, page).is_none());
     }
 
     /// A buffer's or heap's pages in more runs than one dma-buf takes (udmabuf's `list_limit` as
@@ -2828,7 +1213,6 @@ mod tests {
             (chunks[0].length, chunks[1].length),
             (limits.pieces * page, page)
         );
-        assert!(chunks.iter().all(|c| c.offset == 0));
         assert_eq!(read_through(&chunks[1], 0), (2 * (n - 1)) as u8);
     }
 }

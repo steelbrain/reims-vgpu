@@ -106,13 +106,8 @@ fn c_harness_passes() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(stdout.contains("harness: ok"), "{stdout}");
-    let answer = if cfg!(feature = "rt") {
-        "true"
-    } else {
-        "false"
-    };
     // By lines, which end in "\r\n" where the harness, a C program, writes its stdout on Windows.
-    let answered = format!("harness: quiesce answered {answer}");
+    let answered = "harness: quiesce answered true";
     assert!(stdout.lines().any(|line| line == answered), "{stdout}");
 }
 

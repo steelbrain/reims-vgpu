@@ -8,7 +8,8 @@
 //! was queued. The queue's worker exits after [`reims_vgpu_vulkan::core::rt::queue::IDLE_EXIT`] idle and
 //! the next job starts another. The library never waits for it, and a queue's drop joins nothing.
 //!
-//! **By platform.** The Vulkan platform's `ApiPlatform` is `platform/vulkan.rs`.
+//! **By platform.** The rt platform's `ApiPlatform` is `platform/rt.rs`; on Linux the dma-bufs
+//! of host memory mapped from files, which a device imports, are `platform/dma_buf.rs`.
 
 use std::any::Any;
 use std::sync::{Arc, OnceLock, Weak};
@@ -21,7 +22,6 @@ use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::core::rt::{Executor, Job, SerialQueue};
 use reims_vgpu_vulkan::core::sync::Mutex;
 
-use crate::GuestArch;
 use crate::memory::MemoryMap;
 
 /// A platform's import of a pages block's view as a block it knows
@@ -83,23 +83,6 @@ pub trait ApiPlatform: Platform {
     /// The Metal device a config names: `None` is the system's default device, `Some(id)` the
     /// device whose registry ID is `id`. `None` when there is no such device.
     fn metal_device(&self, registry_id: Option<u64>) -> Option<Self::Device>;
-
-    /// Tells the platform the architecture of the guest a graphics device serves, before the
-    /// device asks for its Metal device ([`ApiPlatform::metal_device`]), so the platform's devices
-    /// give the answers of the Macs that guest's frameworks were written against where a Mac's GPU
-    /// decides them ([`GuestArch`]). Nothing by default.
-    fn present_guest(&self, guest: GuestArch) {
-        let _ = guest;
-    }
-
-    /// Tells the platform the texture resource IDs a graphics device keeps for its guest
-    /// (`crate::graphics`'s `guest_texture_ids`), before the device asks for its Metal device
-    /// ([`ApiPlatform::metal_device`]): a platform whose devices make command queues or textures
-    /// of their own as they are made reserves them there first, before those, and answers the
-    /// graphics device's own reservation of them at once. Nothing by default.
-    fn present_guest_texture_ids(&self, ids: std::ops::RangeInclusive<u64>) {
-        let _ = ids;
-    }
 
     /// Copies the whole of `texture` into `dst`: `height` rows of `width * 4` bytes, each
     /// `bytes_per_row` after the last. The caller has checked that `dst` holds them.
@@ -164,16 +147,6 @@ pub trait ApiPlatform: Platform {
         None
     }
 
-    /// A graphics device's region of `len` bytes (BAR 2, `reims_vgpu_graphics::region::Region`) in
-    /// memory of the platform's own: where its GPUs import that better than private anonymous
-    /// memory, or where its runtime frees an import of the region's pages after the region's last
-    /// reference can go, so that the platform frees the memory once no import holds it; `None` by
-    /// default, and where the host gives none, for the region's own mapping.
-    fn graphics_region(&self, len: usize) -> Option<reims_vgpu_graphics::region::Region> {
-        let _ = len;
-        None
-    }
-
     /// Lets go of the GPU devices the platform keeps for the process, once nothing beyond its own
     /// keeps holds one, waiting at most `bound` for that: a device made after it is a new one.
     /// `Err` names what still held one when the wait ended, and nothing is let go then. Nothing
@@ -196,41 +169,14 @@ pub trait ApiPlatform: Platform {
     }
 }
 
-/// A graphics device's region of `len` bytes for a test on `platform`, as the device takes one
-/// ([`crate::GraphicsDevice::with_platform`]): the platform's own memory where it gives one, else
-/// the region's own anonymous mapping. On a platform whose runtime imports host memory (Vulkan's),
-/// the platform's memory goes through its VM, whose unmap of the pages waits until the runtime
-/// freed every import of them (`reims_vgpu_vulkan::remap`), where `Region::new`'s drop unmaps
-/// them at once: on a Radeon 780M (RADV, Linux 7.3.3) a test's region unmapped so, while a
-/// completed command buffer's handler freed a no-copy buffer's import of it on another thread,
-/// faulted the kernel in amdgpu's notifier (`docs/lessons.md`).
+/// A graphics device's region of `len` bytes for a test on a platform, as the device takes one
+/// ([`crate::GraphicsDevice::with_platform`]): the region's own anonymous mapping.
 #[cfg(test)]
 pub(crate) fn test_region<P: ApiPlatform>(
-    platform: &P,
+    _platform: &P,
     len: usize,
 ) -> reims_vgpu_graphics::region::Region {
-    platform
-        .graphics_region(len)
-        .or_else(|| reims_vgpu_graphics::region::Region::new(len))
-        .expect("a region")
-}
-
-/// Whether the host page at `at` is mapped, for a test, read without touching it: `msync` of
-/// the page, which reads no byte of it and fails where none is mapped.
-#[cfg(all(test, unix))]
-pub(crate) fn page_mapped(at: *mut u8) -> bool {
-    // SAFETY: `msync` of one page, which reads no byte and fails where none is mapped.
-    unsafe { libc::msync(at.cast(), 1, libc::MS_ASYNC) == 0 }
-}
-
-/// [`page_mapped`] on Windows: the page is committed (`VirtualQuery`, which reads no byte of it).
-#[cfg(all(test, windows))]
-pub(crate) fn page_mapped(at: *mut u8) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    let mut info = MEMORY_BASIC_INFORMATION::default();
-    // SAFETY: a query of the address, which reads no byte there, into a live record of its size.
-    let got = unsafe { VirtualQuery(at.cast(), &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
-    got != 0 && info.State == MEM_COMMIT
+    reims_vgpu_graphics::region::Region::new(len).expect("a region")
 }
 
 /// The API's state for one platform instance.
@@ -304,13 +250,12 @@ impl HostQueue for DisplayThread {
     }
 }
 
-#[cfg(feature = "rt")]
-mod rt;
-mod vulkan;
-/// A dma-buf of host memory the Vulkan platform mapped from files, for a device to import
-/// (`platform/vulkan/lent_memory.rs`).
 #[cfg(target_os = "linux")]
-pub(crate) use vulkan::host_dma_buf;
+mod dma_buf;
+mod rt;
+/// A dma-buf of host memory the library mapped from files, for a device to import.
+#[cfg(target_os = "linux")]
+pub(crate) use dma_buf::host_dma_buf;
 
 #[cfg(any(test, feature = "testkit"))]
 mod fake {
@@ -388,56 +333,18 @@ mod tests {
         assert_eq!(got, (0..8).collect::<Vec<_>>());
     }
 
-    /// The Vulkan platform's devices: the default one, the same object again by the registry ID
-    /// the platform answers for it, and none for an ID no device has (`UINT64_MAX`)
+    /// The platform's devices: the default one, the same object again by the registry ID the
+    /// platform answers for it, and none for an ID no device has (`UINT64_MAX`)
     #[test]
-    fn vulkan_devices_by_registry_id() {
-        use reims_vgpu_vulkan::VulkanPlatform;
+    fn on_vulkan_the_devices_by_registry_id() {
         use reims_vgpu_vulkan::core::platform::Handle as _;
 
-        let p = VulkanPlatform::new();
-        let d = p.metal_device(None).expect("a Vulkan device (MoltenVK)");
-        let id = d.registry_id;
+        let p = crate::rt_test_end::platform();
+        let d = p.metal_device(None).expect("an rt device");
+        let id = d.facts().registry_id;
         assert_eq!(p.metal_device(Some(id)).map(|o| o.id()), Some(d.id()));
         assert_eq!(p.metal_device(None).map(|o| o.id()), Some(d.id()));
         assert!(p.metal_device(Some(u64::MAX)).is_none());
-    }
-
-    /// A test build's Vulkan device keeps no pipeline records: this crate's tests turn on the
-    /// Vulkan crate's `testkit` feature, which makes them a test build there too
-    /// (`reims_vgpu_vulkan::records`), so a test process neither adds its pipelines to the
-    /// records the host's next QEMU warms nor warms them itself
-    #[test]
-    fn a_test_build_keeps_no_pipeline_records() {
-        use reims_vgpu_vulkan::VulkanPlatform;
-        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
-        use reims_vgpu_vulkan::core::platform::resource::Library as _;
-        use reims_vgpu_vulkan::core::raise::OnFault;
-
-        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
-        let p = VulkanPlatform::new();
-        let d = p.metal_device(None).expect("a Vulkan device (MoltenVK)");
-        let library = d
-            .new_library(include_bytes!(
-                "../../../tests/shaders/compute_add.metallib"
-            ))
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let f = library
-            .new_function(OnFault::Die, "add_one")
-            .unwrap()
-            .unwrap();
-        let _state = d
-            .new_compute_pipeline_state_for_function(Some(&f))
-            .unwrap()
-            .unwrap();
-        let w = d.raw.warm_statistics();
-        assert_eq!(
-            (w.records_made, w.records_unmade),
-            (0, 0),
-            "a creation's record handed to a hook"
-        );
     }
 
     /// A test build's shader cache is the tests' own, `reims-vgpu-vulkan-tests` in the user's
@@ -446,27 +353,27 @@ mod tests {
     /// writes the cache the library's hosts share, nor the device checks kept beside it
     #[test]
     fn a_test_build_s_shader_cache_is_the_tests_own() {
-        let dir = reims_vgpu_vulkan::platform::cache_directory().expect("a shader cache directory");
+        let dir = reims_vgpu_vulkan::os::cache_directory().expect("a shader cache directory");
         let cache = reims_vgpu_vulkan::os::user_cache_directory().expect("a user cache directory");
         assert_eq!(dir, cache.join("reims-vgpu-vulkan-tests"));
     }
 
-    /// The Vulkan platform's lease of the guest's RAM lets views be made of the pages the host
+    /// The platform's lease of the guest's RAM lets views be made of the pages the host
     /// names a file behind, showing the file from its offset, while it lives; never of a range
     /// without a file
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_vulkan_lease_lets_views_be_made_of_the_guests_ram() {
+    fn the_lease_lets_views_be_made_of_the_guests_ram() {
         use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
-        use reims_vgpu_vulkan::VulkanPlatform;
+        use reims_vgpu_vulkan::RtPlatform;
         use reims_vgpu_vulkan::core::platform::os::vm::{HostAddr, HostVm as _};
         use reims_vgpu_vulkan::os::OsVm;
 
         use crate::memory::MemoryFile;
 
         const LEN: u64 = 0x4000;
-        let p = VulkanPlatform::new();
+        let p = RtPlatform::new();
         let vm = OsVm::new();
         // The guest's RAM as QEMU maps it: a shared mapping of a memfd, from an offset into it.
         // SAFETY: a NUL-terminated name; the descriptor is owned from here on.

@@ -46,10 +46,8 @@
 //! submitted (rt's `encode_wait_for_event`), so submitted work waits on nothing a later submission
 //! signals.
 //!
-//! **No device recovery, no drawable fetch.** rt makes its device once and recovers none: a lost
-//! device fails the take or the present, and the window's draws end ([`Acquired::Failed`]); never
-//! [`Acquired::Parked`]. The Vulkan platform's fetch of MoltenVK's drawables
-//! (`crate::os::Drawables`) has no counterpart: rt's floor refuses MoltenVK.
+//! **No device recovery.** rt makes its device once and recovers none: a lost device fails the
+//! take or the present, and the window's draws end ([`Acquired::Failed`]).
 
 use ash::{khr, vk};
 use metal2vulkan_rt as rt;

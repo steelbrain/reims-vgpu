@@ -5,7 +5,6 @@
 //! - **Commands** ([`Command`]): the encoder commands the window-drag walk's stream holds most of
 //!   (its recorder's counts by selector: binds, draws, fences, barriers, scissors, viewports,
 //!   pipeline and sampler states). Any other command answers `None`, and is read from its text.
-//!   Every command of an indirect command buffer is read here ([`icb_command`]).
 //! - **The pass descriptor's sets** (`m2v.setPass`, `m2v.set*Attachment`), whose `Debug` names
 //!   objects by their pointers. An object property set to nil is object 0, which no object is,
 //!   where the text reads nil for it and for one left unset alike: a player clears the one and
@@ -16,7 +15,6 @@
 use super::format::Value;
 use crate::core::platform::blit::BlitCmd;
 use crate::core::platform::compute::ComputeCmd;
-use crate::core::platform::icb::{IcbComputeCmd, IcbRenderCmd};
 use crate::core::platform::render::RenderCmd;
 use crate::core::platform::types::{
     ClearColor, MtlRegion, MtlScissorRect, MtlSize, MtlViewport, NsRange,
@@ -369,161 +367,6 @@ impl<P: Platform> Command for BlitCmd<'_, P> {
             _ => return None,
         })
     }
-}
-
-impl<P: Platform> Command for IcbRenderCmd<'_, P> {
-    fn sel(&self) -> &'static str {
-        self.selector()
-    }
-
-    fn typed(&self, cx: &mut Cx<'_>) -> Option<Vec<Value>> {
-        use IcbRenderCmd as C;
-        Some(match self {
-            C::ClearBarrier | C::Reset | C::SetBarrier => vec![],
-            C::DrawIndexedPatches {
-                number_of_patch_control_points,
-                patch_start,
-                patch_count,
-                patch_index_buffer,
-                patch_index_buffer_offset,
-                control_point_index_buffer,
-                control_point_index_buffer_offset,
-                instance_count,
-                base_instance,
-                buffer,
-                offset,
-                instance_stride,
-            } => vec![
-                uint(*number_of_patch_control_points),
-                uint(*patch_start),
-                uint(*patch_count),
-                cx.opt(*patch_index_buffer),
-                uint(*patch_index_buffer_offset),
-                cx.opt(*control_point_index_buffer),
-                uint(*control_point_index_buffer_offset),
-                uint(*instance_count),
-                uint(*base_instance),
-                cx.opt(*buffer),
-                uint(*offset),
-                uint(*instance_stride),
-            ],
-            C::DrawIndexedPrimitives {
-                primitive_type,
-                index_count,
-                index_type,
-                index_buffer,
-                index_buffer_offset,
-                instance_count,
-                base_vertex,
-                base_instance,
-            } => vec![
-                uint(*primitive_type),
-                uint(*index_count),
-                uint(*index_type),
-                cx.opt(*index_buffer),
-                uint(*index_buffer_offset),
-                uint(*instance_count),
-                sint(*base_vertex),
-                uint(*base_instance),
-            ],
-            C::DrawPatches {
-                number_of_patch_control_points,
-                patch_start,
-                patch_count,
-                patch_index_buffer,
-                patch_index_buffer_offset,
-                instance_count,
-                base_instance,
-                buffer,
-                offset,
-                instance_stride,
-            } => vec![
-                uint(*number_of_patch_control_points),
-                uint(*patch_start),
-                uint(*patch_count),
-                cx.opt(*patch_index_buffer),
-                uint(*patch_index_buffer_offset),
-                uint(*instance_count),
-                uint(*base_instance),
-                cx.opt(*buffer),
-                uint(*offset),
-                uint(*instance_stride),
-            ],
-            C::DrawPrimitives {
-                primitive_type,
-                vertex_start,
-                vertex_count,
-                instance_count,
-                base_instance,
-            } => vec![
-                uint(*primitive_type),
-                uint(*vertex_start),
-                uint(*vertex_count),
-                uint(*instance_count),
-                uint(*base_instance),
-            ],
-            C::SetFragmentBuffer {
-                buffer,
-                offset,
-                index,
-            }
-            | C::SetVertexBuffer {
-                buffer,
-                offset,
-                index,
-            } => vec![cx.opt(*buffer), uint(*offset), uint(*index)],
-            C::SetRenderPipelineState { pipeline_state } => vec![cx.opt(*pipeline_state)],
-            C::SetVertexBufferAttributeStride {
-                buffer,
-                offset,
-                stride,
-                index,
-            } => vec![cx.opt(*buffer), uint(*offset), uint(*stride), uint(*index)],
-        })
-    }
-}
-
-impl<P: Platform> Command for IcbComputeCmd<'_, P> {
-    fn sel(&self) -> &'static str {
-        self.selector()
-    }
-
-    fn typed(&self, cx: &mut Cx<'_>) -> Option<Vec<Value>> {
-        use IcbComputeCmd as C;
-        Some(match self {
-            C::ClearBarrier | C::Reset | C::SetBarrier => vec![],
-            C::ConcurrentDispatchThreadgroups {
-                threadgroups_per_grid,
-                threads_per_threadgroup,
-            } => vec![size(*threadgroups_per_grid), size(*threads_per_threadgroup)],
-            C::ConcurrentDispatchThreads {
-                threads_per_grid,
-                threads_per_threadgroup,
-            } => vec![size(*threads_per_grid), size(*threads_per_threadgroup)],
-            C::SetComputePipelineState { pipeline_state } => vec![cx.opt(*pipeline_state)],
-            C::SetImageblockWidth { width, height } => vec![uint(*width), uint(*height)],
-            C::SetKernelBuffer {
-                buffer,
-                offset,
-                index,
-            } => vec![cx.opt(*buffer), uint(*offset), uint(*index)],
-            C::SetKernelBufferAttributeStride {
-                buffer,
-                offset,
-                stride,
-                index,
-            } => vec![cx.opt(*buffer), uint(*offset), uint(*stride), uint(*index)],
-            C::SetStageInRegion { region: r } => vec![region(*r)],
-            C::SetThreadgroupMemoryLength { length, index } => vec![uint(*length), uint(*index)],
-        })
-    }
-}
-
-/// An indirect command buffer's command as an element of its call's list of them
-/// ([`super::icb_commands`]): a map of one pair, its selector and the list of its arguments.
-pub fn icb_command<C: Command>(cmd: &C, cx: &mut Cx<'_>) -> Value {
-    let args = cmd.typed(cx).unwrap_or_default();
-    Value::Map(vec![(cmd.sel().to_owned(), Value::List(args))])
 }
 
 /// `m2v.setPass`'s set, in its `Debug`'s order: the objects, then the values.

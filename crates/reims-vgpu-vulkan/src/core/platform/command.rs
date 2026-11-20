@@ -276,15 +276,6 @@ pub trait CommandQueue<P: Platform>: Handle {
     fn set_label(&self, label: &str);
 }
 
-/// A command buffer's completion as a sync file, which another device waits for on its GPU
-/// ([`CommandBuffer::export_completion_sync_file`]): an open descriptor on Linux and macOS.
-#[cfg(unix)]
-pub type SyncFile = std::os::fd::OwnedFd;
-/// On Windows the runtime exports no sync file, so the type has no values, and a caller always
-/// waits for a command buffer on the host.
-#[cfg(windows)]
-pub type SyncFile = std::convert::Infallible;
-
 /// `id<MTLCommandBuffer>` (`MTLCommandBufferSPI` included).
 pub trait CommandBuffer<P: Platform>: Handle {
     /// sel: addCompletedHandler:
@@ -423,30 +414,6 @@ pub trait CommandBuffer<P: Platform>: Handle {
     /// ([`Buffer::make_memory`](super::resource::Buffer::make_memory)), and was dropped. Nothing
     /// by default, for a platform that defers no buffer's memory.
     fn fail_out_of_memory(&self) {}
-    /// The platform's own, no Metal call: asked before the commit, the buffer's completion is
-    /// exported as a sync file once it is committed ([`Self::export_completion_sync_file`]).
-    /// `false` where the platform exports none, the default: the caller waits for the buffer on
-    /// the host.
-    fn add_completion_sync_file(&self) -> bool {
-        false
-    }
-    /// The platform's own, no Metal call: after the commit, the buffer's completion as a sync
-    /// file, asked for before it ([`Self::add_completion_sync_file`]), which a device of another
-    /// driver waits for on its GPU ([`Self::encode_wait_for_sync_file`]): `Some(Some(file))`;
-    /// `Some(None)` where the buffer has finished, so there is nothing to wait for (its
-    /// [`Self::status`] tells how it ended); `None` where the platform refuses it, the default:
-    /// the caller waits for the buffer on the host.
-    fn export_completion_sync_file(&self) -> Option<Option<SyncFile>> {
-        None
-    }
-    /// The platform's own, no Metal call: before any encoder, the buffer's work waits on its GPU
-    /// for the sync file it is given, another device's completion
-    /// ([`Self::export_completion_sync_file`]); the buffer's device takes the file. `false`, the
-    /// file closed, where the platform cannot, the default: the caller waits for that completion
-    /// on the host.
-    fn encode_wait_for_sync_file(&self, _file: SyncFile) -> bool {
-        false
-    }
     /// The platform's own, no Metal call: before any encoder, the caller's word that no
     /// compute encoder of the buffer, nor of the parts cut from it ([`Self::split`],
     /// [`Self::part`]), is sent a command predication record (`encodeStartIf:...`,

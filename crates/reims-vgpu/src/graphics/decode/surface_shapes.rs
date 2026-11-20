@@ -237,15 +237,12 @@ impl<P: Platform> GraphicsDecoder<P> {
             return unshaped(|c| c.views_refused += 1);
         };
         // The rt platform's boot diagnostics name the usage the guest declared of the view.
-        #[cfg(feature = "rt")]
         reims_vgpu_vulkan::rt_platform::diag::declared(&view, u64::from(d.usage));
         let shape = ShapeUse {
             block,
             writes: takes_storage(m),
-            #[cfg(feature = "rt")]
             video_plane: caches.video_plane(block, &reference),
             reference,
-            #[cfg(feature = "rt")]
             diag: reims_vgpu_vulkan::rt_platform::diag::token(&view),
         };
         Ok(Some((view, shape)))
@@ -266,7 +263,6 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         caches.count_shapes(|c| c.plain_views_refused += 1);
         reims_vgpu_vulkan::answer::count_kind(PLAIN_VIEW_REFUSED);
-        #[cfg(feature = "rt")]
         reims_vgpu_vulkan::rt_platform::diag::plain_view_refused(shape_format, pixel_format);
         if !PLAIN_LOGGED.swap(true, Ordering::Relaxed) {
             log::warn!(
@@ -332,9 +328,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             block,
             writes: takes_storage(m),
             reference,
-            #[cfg(feature = "rt")]
             diag: None,
-            #[cfg(feature = "rt")]
             video_plane: None,
         })
     }

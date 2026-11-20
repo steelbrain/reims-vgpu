@@ -1,9 +1,8 @@
 //! What a draw costs the thread that decodes it, through the decoder as a queue's ring hands it a
-//! `COMMAND_BUFFER`, against the same commands sent through the platform's core traits and
-//! through what the platform drives alone, metal2vulkan's runtime. A measurement, run by hand in a release build, in a potluck job
-//! holding the host's GPU (`--gpu`: `cargo nextest run -p reims-vgpu --release
-//! --no-default-features --features reims-vgpu/vulkan --run-ignored only -E 'test(draw_cost)'
-//! --no-capture`).
+//! `COMMAND_BUFFER`, against the same commands sent through the platform's core traits, on the rt
+//! platform. A measurement, run by hand in a release build, in a potluck job holding the host's
+//! GPU (`--gpu`: `cargo nextest run -p reims-vgpu --release --run-ignored only -E
+//! 'test(draw_cost)' --no-capture`).
 //!
 //! A command buffer is one render pass of draws, or, in a compositor's frame, many ([`Shape`],
 //! [`Stream`]). In `draws.10k`'s stream
@@ -11,15 +10,14 @@
 //! next 256-byte offset, as the bundle sends `setVertexBytes:` (a 64 KiB chunk, 256 draws a
 //! chunk, [`Chunks`]), under the bench's own pipeline: its vertex function reads the draw's bytes
 //! and its fragment function a colour set once a pass, each a `constant float4 &` at buffer 0
-//! (`render_small` and `render_flat` of the tests' shaders), as the runtime binds an app's bytes.
+//! (`render_small` and `render_flat` of the tests' shaders), as an app binds its bytes.
 //! In a compositor's, each
 //! draw of a 4-vertex strip binds a texture of 16 and its own vertex and fragment bytes, under one
 //! of 4 pipelines that change every 4 draws with the sampler set again. The command buffers go
 //! back to back and are then waited for, as `draws.10k` commits them. Each path's figures are
 //! the thread's CPU time, instructions and cycles a draw, from the first command buffer's begin
 //! to the last one's commit: the decoder's include the message's take, its walk and its commit
-//! with the decoder's handlers; the gaps between the paths are the decoder's share and the
-//! platform's. Instructions are the figure a busy host leaves alone (measured on the M3 Max at a
+//! with the decoder's handlers; the gap between the paths is the decoder's share. Instructions are the figure a busy host leaves alone (measured on the M3 Max at a
 //! load of 50: within 0.2% run to run, where CPU time moved 15%).
 //!
 //! The environment picks what runs: `DRAW_COST_SHAPE` the shape (`10k`, the default; `many`, 64
@@ -27,12 +25,10 @@
 //! draws of a compositor's stream; `mc`, 8 of WindowServer's Mission Control composites, each of
 //! 92 render passes of 3 draws; or `mc1`, the same ops in one pass a command buffer, whose gap to
 //! `mc` is what 91 more passes cost), `DRAW_COST_RUNS` the runs (9), `DRAW_COST_ONLY` one path, for
-//! a profile of it (`decoder`, `platform` or `runtime`, the runtime alone),
-//! `DRAW_COST_SECONDS` a time to keep running that path for, so a sampling profiler can attach,
-//! `DRAW_COST_CHUNKS` where the upload chunks lie: `pages`, the default where the host maps
-//! the guest's pages, else `heap`; or `buffer` ([`Chunks`]); and `DRAW_COST_RUNTIME_PASS=fresh`
-//! a runtime path that makes each pass's descriptor anew inside the count, as the platform's
-//! path and the decoder's do, where by default it takes one of two made before it.
+//! a profile of it (`decoder` or `platform`), `DRAW_COST_SECONDS` a time to keep running that path
+//! for, so a sampling profiler can attach, and `DRAW_COST_CHUNKS` where the upload chunks lie:
+//! `pages`, the default where the host maps the guest's pages, else `heap`; or `buffer`
+//! ([`Chunks`]).
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -939,7 +935,7 @@ impl<P: ApiPlatform> Bench<P> {
                 Some(ObjHandle::Texture(t)) => Bound::FragmentTexture(t, index),
                 _ => panic!("no texture {id}"),
             },
-            Step::FragmentSampler(_) => Bound::FragmentSampler(self.sampler()),
+            Step::FragmentSampler(_) => Bound::FragmentSampler,
             Step::Draw(primitive_type, count) => Bound::Draw(primitive_type, count),
         };
         (0..self.shape.cbs)
@@ -1001,7 +997,7 @@ impl<P: ApiPlatform> Bench<P> {
                     texture: Some(texture),
                     index,
                 },
-                Bound::FragmentSampler(_) => RenderCmd::SetFragmentSamplerStates {
+                Bound::FragmentSampler => RenderCmd::SetFragmentSamplerStates {
                     samplers,
                     range: NsRange {
                         location: 0,
@@ -1098,7 +1094,7 @@ enum Bound<'a, P: Platform> {
     VertexBuffer(&'a P::Buffer, u64, u64),
     FragmentBuffer(&'a P::Buffer, u64, u64),
     FragmentTexture(&'a P::Texture, u64),
-    FragmentSampler(&'a P::SamplerState),
+    FragmentSampler,
     Draw(u64, u64),
 }
 
@@ -1116,108 +1112,6 @@ enum Sent<'a, P: Platform> {
     Draws(Vec<VertexDraw<'a, P>>),
 }
 
-/// The pass descriptor of the bench's target for pass `pass` of a command buffer, as the
-/// platform's own form of it.
-fn target_pass<P: ApiPlatform>(bench: &Bench<P>, pass: usize) -> P::RenderPassDescriptor {
-    let (_, target) = bench.queue_and_target();
-    let desc = bench.platform.render_pass_descriptor();
-    let attachment = ColorAttachmentSet {
-        texture: Some(Some(target)),
-        load_action: Some(Shape::load(pass)),
-        store_action: Some(STORE),
-        ..ColorAttachmentSet::default()
-    };
-    desc.set_color_attachment(OnFault::Die, 0, &attachment)
-        .unwrap();
-    desc
-}
-
-/// The runtime alone, on the Vulkan platform's objects of `bench`: the calls the platform makes
-/// of it for each command.
-fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
-    use metal2vulkan_runtime as rt;
-    let (queue, target) = bench.queue_and_target();
-    let shape = bench.shape;
-    let bound = bench.bound();
-    let passes = [
-        target_pass(bench, 0).pass().0,
-        target_pass(bench, 1).pass().0,
-    ];
-    // The descriptor `target_pass` sets, made with the runtime alone.
-    let fresh = |p: usize| {
-        let mut d = rt::RenderPassDescriptor::new();
-        let a = &mut d.color_attachments[0];
-        a.texture = Some(target.raw.clone());
-        a.load_action = rt::LoadAction::from_raw(Shape::load(p)).unwrap();
-        a.store_action = rt::StoreAction::from_raw(STORE).unwrap();
-        d
-    };
-    let anew = runtime_passes_fresh();
-    let (tx, rx) = mpsc::channel();
-    let start = counts();
-    for cb_bound in &bound {
-        let cb = queue.raw.command_buffer().unwrap();
-        for (p, pass_bound) in cb_bound.iter().enumerate() {
-            let made;
-            let pass = if anew {
-                made = fresh(p);
-                &made
-            } else {
-                &passes[p.min(1)]
-            };
-            let mut e = cb.render_command_encoder(pass).unwrap();
-            for &b in pass_bound {
-                match b {
-                    Bound::Pipeline(p) => e.set_render_pipeline_state(&p.raw),
-                    Bound::VertexBuffer(buffer, offset, index) => {
-                        e.set_vertex_buffer(Some(&buffer.raw), offset, index as u32)
-                    }
-                    Bound::FragmentBuffer(buffer, offset, index) => {
-                        e.set_fragment_buffer(Some(&buffer.raw), offset, index as u32)
-                    }
-                    Bound::FragmentTexture(texture, index) => {
-                        let texels = texture.texels("setFragmentTexture:atIndex:");
-                        e.set_fragment_texture(Some(texels), index as u32)
-                    }
-                    Bound::FragmentSampler(sampler) => {
-                        e.set_fragment_sampler_states(&[Some(&**sampler)], None, 0)
-                    }
-                    Bound::Draw(primitive_type, count) => {
-                        let primitive = rt::DrawPrimitiveType::from_raw(primitive_type).unwrap();
-                        e.draw_primitives(primitive, 0, count as u32, 1, 0)
-                    }
-                }
-                .unwrap();
-            }
-            e.end_encoding().unwrap();
-        }
-        let tx = tx.clone();
-        cb.add_completed_handler(Box::new(move |_: &rt::CommandBuffer| tx.send(()).unwrap()))
-            .unwrap();
-        cb.commit().unwrap();
-    }
-    let spent = counts() - start;
-    for _ in 0..shape.cbs {
-        rx.recv_timeout(Duration::from_secs(30))
-            .expect("a command buffer never completed");
-    }
-    spent
-}
-
-/// Whether the runtime path makes each pass's descriptor anew (`DRAW_COST_RUNTIME_PASS=fresh`).
-fn runtime_passes_fresh() -> bool {
-    std::env::var("DRAW_COST_RUNTIME_PASS").is_ok_and(|v| v == "fresh")
-}
-
-/// What the figures' line says of the runtime path's descriptors where it makes them anew.
-fn fresh_note() -> &'static str {
-    if runtime_passes_fresh() {
-        ", the runtime's pass descriptors made anew each pass"
-    } else {
-        ""
-    }
-}
-
 /// The median, lowest and highest of `values`.
 pub(super) fn spread(values: &mut [f64]) -> [f64; 3] {
     values.sort_by(f64::total_cmp);
@@ -1230,14 +1124,9 @@ pub(super) fn spread(values: &mut [f64]) -> [f64; 3] {
     [median, values[0], values[n - 1]]
 }
 
-/// Runs the paths of `bench`, `alone` what the platform drives alone (the runtime) and
-/// its name, and prints each one's figures a draw.
+/// Runs the paths of `bench` and prints each one's figures a draw.
 #[allow(clippy::disallowed_methods)] // a measurement: real time decides how long a profile runs
-fn measure<P: ApiPlatform>(
-    name: &str,
-    mut bench: Bench<P>,
-    (alone, runtime): (&str, fn(&Bench<P>) -> Counts),
-) {
+fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>) {
     let runs: usize = std::env::var("DRAW_COST_RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1276,7 +1165,6 @@ fn measure<P: ApiPlatform>(
             let m = messages();
             spent += match only {
                 Some("platform") => bench.through_platform(),
-                Some("runtime") => runtime(&bench),
                 _ => bench.through_decoder(&m),
             };
             reps += 1;
@@ -1284,29 +1172,25 @@ fn measure<P: ApiPlatform>(
         let [ns, instructions, cycles] = a_draw(spent, reps);
         println!(
             "{name}: {} for {seconds} s: {reps} repetitions, a draw {ns:.1} ns, {instructions:.0} \
-             instructions, {cycles:.0} cycles, the upload chunks {:?}{}",
+             instructions, {cycles:.0} cycles, the upload chunks {:?}",
             only.unwrap_or("decoder"),
             bench.chunks,
-            fresh_note(),
         );
         return;
     }
-    let paths = ["decoder", "platform", alone];
+    let paths = ["decoder", "platform"];
     // Each path's figures a draw, by run.
-    let mut seen: [Vec<[f64; 3]>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut seen: [Vec<[f64; 3]>; 2] = [Vec::new(), Vec::new()];
     for _ in 0..runs {
-        let mut totals = [Counts::default(); 3];
+        let mut totals = [Counts::default(); 2];
         for rep in 0..WARM + REPS {
             let m = messages();
-            let mut spent = [Counts::default(); 3];
+            let mut spent = [Counts::default(); 2];
             if only.is_none_or(|o| o == "decoder") {
                 spent[0] = bench.through_decoder(&m);
             }
             if only.is_none_or(|o| o == "platform") {
                 spent[1] = bench.through_platform();
-            }
-            if only.is_none_or(|o| o == "runtime") {
-                spent[2] = runtime(&bench);
             }
             if rep >= WARM {
                 for (t, s) in totals.iter_mut().zip(spent) {
@@ -1322,17 +1206,11 @@ fn measure<P: ApiPlatform>(
     println!(
         "{name}: a draw on the decoding thread, median [lowest, highest] of {runs} runs of {REPS} \
          repetitions of {} command buffers of {} draws of {:?} in {} passes, {ops} ops (a command \
-         buffer's: {} times as much), the upload chunks {:?}{}",
-        shape.cbs,
-        shape.draws,
-        shape.stream,
-        shape.passes,
-        shape.draws,
-        bench.chunks,
-        fresh_note(),
+         buffer's: {} times as much), the upload chunks {:?}",
+        shape.cbs, shape.draws, shape.stream, shape.passes, shape.draws, bench.chunks,
     );
     for (f, figure) in FIGURES.iter().enumerate() {
-        let mut medians = [0.0f64; 3];
+        let mut medians = [0.0f64; 2];
         for (p, path) in paths.iter().enumerate() {
             let mut values: Vec<f64> = seen[p].iter().map(|v| v[f]).collect();
             if values.iter().all(|&v| v == 0.0) {
@@ -1346,12 +1224,6 @@ fn measure<P: ApiPlatform>(
             println!(
                 "  {figure:>12} decoder above platform: {:.1}",
                 medians[0] - medians[1]
-            );
-        }
-        if medians[1] > 0.0 && medians[2] > 0.0 {
-            println!(
-                "  {figure:>12} platform above {alone}: {:.1}",
-                medians[1] - medians[2]
             );
         }
     }
@@ -1416,10 +1288,10 @@ fn pages_slabs_are_the_bundle_s() {
     assert_eq!(SLAB_SPAN, (SLAB + 0x4000).next_multiple_of(0x8000));
 }
 
-/// On the Vulkan platform: the decoder, the platform and the runtime alone.
+/// On the rt platform: the decoder and the platform, whose gap is the decoder's share.
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU: prints a draw's cost"]
-fn on_vulkan_draw_cost() {
-    let bench = Bench::<reims_vgpu_vulkan::VulkanPlatform>::new(Shape::chosen());
-    measure("vulkan", bench, ("runtime", through_runtime));
+fn on_rt_draw_cost() {
+    let bench = Bench::<reims_vgpu_vulkan::RtPlatform>::new(Shape::chosen());
+    measure("rt", bench);
 }

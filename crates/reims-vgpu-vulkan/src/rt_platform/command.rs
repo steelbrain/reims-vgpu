@@ -137,8 +137,8 @@ static METRICS_WRITTEN: AtomicU64 = AtomicU64::new(0);
 const METRICS_EVERY: u64 = 50_000_000;
 
 /// Where the trace is on (`core::trace`), a completed handler that writes `cb`'s `cbdone`, which
-/// the commit runs before core's: the event and values the Vulkan platform writes
-/// (`gpu::timing::commit`), so one reader reads both platforms' traces; and rt's metrics, where
+/// the commit runs before core's: the event and values the trace's readers read for each
+/// command buffer; and rt's metrics, where
 /// they are due ([`trace_metrics`]). The command buffer is named by its address, and numbered in
 /// the order of the commits the trace timed. `cbdone`'s times are rt's (the module's docs, what
 /// a completed handler learns), on rt's host clock, which on Linux is not the trace's

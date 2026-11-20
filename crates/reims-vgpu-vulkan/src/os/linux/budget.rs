@@ -3,26 +3,24 @@
 //! A view of scattered guest pages is a mapping per run of them ([`super::vm`]), and the kernel
 //! refuses any map past `vm.max_map_count` mappings in the process: past that, not only views
 //! fail but every map the process makes, QEMU's, the C library's and the GPU driver's among them.
-//! So the views stop short of the limit: a view, a range a view can be made of or memory of the
-//! library's own that would take the mappings the library holds past
-//! `vm.max_map_count - RESERVE` is refused before anything is mapped ([`admit`]), and the mappings
+//! So the views stop short of the limit: a view or a range a view can be made of that would take
+//! the mappings the library holds past `vm.max_map_count - RESERVE` is refused before anything is mapped ([`admit`]), and the mappings
 //! the rest of the process makes are never refused for the views' sake. macOS has no such limit,
 //! so no answer of Metal's fits exactly: the call answers as it does on the Metal platform when
-//! memory runs out, a remap or a range `KERN_NO_SPACE`, the library's own memory none, counted and
-//! logged (`crate::answer::out_of_host_memory`), and in strict mode (`REIMS_VGPU_STRICT=1`) it
+//! memory runs out, a remap or a range `KERN_NO_SPACE`, counted and logged (`crate::answer::out_of_host_memory`), and in strict mode (`REIMS_VGPU_STRICT=1`) it
 //! ends the process, naming what it would have mapped, the mappings and the limit.
 //!
 //! The mappings the library holds are counted exactly where it makes them: the backing table's
-//! runs, each protect or unmap that cuts one included ([`crate::os::files::mappings`]), and its own
-//! memory ([`super::vm::OwnMemory`]). What it does not count is the reserve's to cover
+//! runs, each protect or unmap that cuts one included ([`crate::os::files::mappings`]). What it
+//! does not count is the reserve's to cover
 //! ([`RESERVE`]).
 //!
 //! Where the library has another way than mappings of its own, it takes it short of the budget,
 //! [`HEADROOM`] below it ([`claim`]): a view a device would need from its files goes through
 //! dma-bufs instead, and a no-copy buffer's or heap's import of such a view's pages is refused at
 //! the runtime's gate, the buffer or heap made over a copy (`super::vm`'s module docs, "Imports
-//! of views"). What has no other way has the headroom to itself: a view through dma-bufs, a range
-//! and the library's own memory.
+//! of views"). What has no other way has the headroom to itself: a view through dma-bufs and a
+//! range.
 //!
 //! What would pass the budget first folds the views' runs mapped from their files that no import
 //! a device may pin holds back into dma-bufs (`super::vm::fold_idle`), a mapping per 4 MiB of
@@ -92,7 +90,7 @@ pub(super) const RESERVE: u64 = 16_384;
 /// The mappings kept below the budget for what has no way but mappings of its own, where the
 /// library chooses a view's or an import's mappings ([`claim`]): views through dma-bufs, each a
 /// mapping per 4 MiB of scattered pages at udmabuf's stock `list_limit` and one at each end
-/// (`super::vm`'s `map_through`), the ranges views are made of, and the library's own memory. A
+/// (`super::vm`'s `map_through`), and the ranges views are made of. A
 /// margin, as [`RESERVE`] is, sized from the views it is for: views through dma-bufs of all of a 16 GiB
 /// guest's pages take 4,096 mappings and two for each view, and the
 /// views held at the 3840 × 2160 death (RTX 5080 Laptop, 16 GiB guest, 2026-10-27), 391 surfaces
@@ -165,21 +163,9 @@ fn budget(limit: u64) -> u64 {
 /// The mappings claimed ([`claim`]) and not yet counted where they are made.
 static CLAIMED: AtomicU64 = AtomicU64::new(0);
 
-/// The mappings of the library's own memory ([`super::vm::OwnMemory`]).
-static OWN_MAPPINGS: AtomicU64 = AtomicU64::new(0);
-
-/// Counts `count` more mappings of the library's own memory, or fewer.
-pub(super) fn own_hold(count: u64, holding: bool) {
-    if holding {
-        OWN_MAPPINGS.fetch_add(count, Ordering::Relaxed);
-    } else {
-        OWN_MAPPINGS.fetch_sub(count, Ordering::Relaxed);
-    }
-}
-
 /// The mappings the library's views hold now (module docs).
 pub(super) fn held() -> u64 {
-    files::mappings().saturating_add(OWN_MAPPINGS.load(Ordering::Relaxed))
+    files::mappings()
 }
 
 /// The mappings the views may still take, now: short of the headroom where a device of the
@@ -301,26 +287,17 @@ pub(super) fn warn_if_short(guest_ram: u64) {
 }
 
 /// Tells once, where a device of the process needs imported pages mapped from their files
-/// (`super::import`'s `learn_view_imports`) and imports of all of the guest's RAM, in 4 KiB pieces,
+/// (`super::import`'s `views_need_files`) and imports of all of the guest's RAM, in 4 KiB pieces,
 /// would come within the headroom of the budget: past that much of it, buffers and heaps over
-/// guest memory are copied rather than imported (`super::import`'s `import_gate`), which works and
-/// costs the copies, so it is information, not a warning: the setting is a speed-up. Where a GPU
-/// of the process folds its imports' views once made (`super::import`'s `folds_any`), only a
-/// buffer or heap past that much on its own is. Nothing before the guest's RAM is leased
+/// guest memory are copied rather than imported, which works and costs the copies, so it is
+/// information, not a warning: the setting is a speed-up. Nothing before the guest's RAM is leased
 /// ([`warn_if_short`] warns then).
 pub(super) fn warn_if_imports_short() {
-    // Where a GPU's made imports are folded, their views give their mappings back, so only an
-    // object of more pieces than the line on its own is copied.
-    let what = match super::import::folds_any() {
-        true => {
-            "a buffer or heap over guest memory, each on its own as its view is folded once \
-             imported, is copied rather than imported, which is slower,"
-        }
-        false => {
-            "buffers and heaps over guest memory are copied rather than imported, which is slower,"
-        }
-    };
-    short(what, HEADROOM, log::Level::Info);
+    short(
+        "buffers and heaps over guest memory are copied rather than imported, which is slower,",
+        HEADROOM,
+        log::Level::Info,
+    );
 }
 
 /// The line of [`warn_if_short`] and [`warn_if_imports_short`], once for the process at
@@ -414,18 +391,16 @@ mod tests {
         assert!(v.deallocate(src, 64 * PAGE).is_success());
     }
 
-    /// In strict mode, a range a view can be made of and the library's own memory end the process
-    /// past the budget too
+    /// In strict mode, a range a view can be made of ends the process past the budget too
     #[test]
-    fn ranges_and_own_memory_past_the_budget_die() {
+    fn ranges_past_the_budget_die() {
         let _limit = Limit::room(0);
         assert!(dies_at_the_budget(|| vm::allocate_aliasable(PAGE)));
-        assert!(dies_at_the_budget(|| vm::OwnMemory::new(PAGE)));
     }
 
     /// By default, past the budget, a view of guest pages and a range a view can be made of
-    /// answer `KERN_NO_SPACE` with nothing mapped, and the library's own memory none, each
-    /// counted, as Mach's calls answer when memory runs out
+    /// answer `KERN_NO_SPACE` with nothing mapped, each counted, as Mach's calls answer when memory
+    /// runs out
     #[test]
     fn past_the_budget_answers_as_memory_runs_out_by_default() {
         use crate::core::platform::os::vm::KernReturn;
@@ -452,10 +427,9 @@ mod tests {
             let _limit = Limit::room(0);
             crate::answer::relaxed(|| {
                 assert_eq!(vm::allocate_aliasable(PAGE).err(), Some(KernReturn(3)));
-                assert!(vm::OwnMemory::new(PAGE).is_none());
             });
         }
-        assert_eq!(crate::answer::out_of_host_memory_count(), before + 3);
+        assert_eq!(crate::answer::out_of_host_memory_count(), before + 2);
         assert!(v.deallocate(at, 64 * PAGE).is_success());
         assert!(v.deallocate(src, 64 * PAGE).is_success());
     }

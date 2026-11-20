@@ -1,10 +1,8 @@
 //! What a compute dispatch costs the thread that decodes it, through the decoder as a queue's ring
-//! hands it a `COMMAND_BUFFER`, against the same commands sent through the platform's core traits
-//! and through what the platform drives alone, metal2vulkan's runtime. A measurement, run by hand
-//! in a release build, in a potluck job holding the host's GPU (`--gpu`: `cargo nextest run -p
-//! reims-vgpu --release --no-default-features --features reims-vgpu/vulkan --run-ignored only -E
-//! 'test(dispatch_cost)' --no-capture`). With `reims-vgpu/rt` added, `on_rt_dispatch_cost` runs
-//! the decoder's and the platform's paths on the rt platform.
+//! hands it a `COMMAND_BUFFER`, against the same commands sent through the platform's core traits,
+//! on the rt platform. A measurement, run by hand in a release build, in a potluck job holding the
+//! host's GPU (`--gpu`: `cargo nextest run -p reims-vgpu --release --run-ignored only -E
+//! 'test(dispatch_cost)' --no-capture`).
 //!
 //! Its default shape is Geekbench 7's Fluid Simulation as the trace of a timed pass on a Radeon
 //! 780M counted it (perfscout4's gbr-780m, its 20 big command buffers): a command buffer of 2,600
@@ -17,21 +15,19 @@
 //! repetition go back to back and are then waited for. Each path's figures are the thread's CPU
 //! time, instructions and cycles a dispatch, from the first command buffer's begin to the last
 //! one's commit: the decoder's include the message's take, its walk and its commit with the
-//! decoder's handlers; the gaps between the paths are the decoder's share and the platform's. The
-//! runtime's path commits as the platform does (`commit_and_submit`), submitting on the thread.
+//! decoder's handlers; the gap between the paths is the decoder's share.
 //!
 //! Each path's latency too: a repetition's wall time from its first command buffer's begin to its
 //! last one's completion, which the guest waits for before it commits the next. The decoder's
 //! messages are a process's, of context 0, as a queue's ring hands them, so its walk commits a
-//! command buffer in parts where it may ([`super::split`]); the platform's and the runtime's paths
-//! commit theirs whole.
+//! command buffer in parts where it may ([`super::split`]); the platform's path commits its whole.
 //!
 //! The environment picks what runs: `DISPATCH_COST_SHAPE` the shape (`fluid`, the default; `one`,
 //! the same dispatches in one encoder, each after its bindings, whose gap to `fluid` is what an
 //! encoder a dispatch costs; `small`, 64 command buffers of 5 encoders, the median of the pass's
 //! other command buffers; or `heavy`, `fluid` with dispatches whose GPU work outlasts their walk),
 //! `DISPATCH_COST_RUNS` the runs (5), `DISPATCH_COST_ONLY` one path, for a profile of it
-//! (`decoder`, `platform` or `runtime`), `DISPATCH_COST_SECONDS` a time to keep running that path
+//! (`decoder` or `platform`), `DISPATCH_COST_SECONDS` a time to keep running that path
 //! for, so a sampling profiler can attach, and `DISPATCH_COST_SPLIT_US` how long a part of a
 //! command buffer is walked before the walk commits it (the decoder's own `SPLIT_AFTER` where
 //! unset; one longer than the walk keeps it whole).
@@ -573,72 +569,9 @@ impl<P: Platform> Clone for Bound<'_, P> {
 
 impl<P: Platform> Copy for Bound<'_, P> {}
 
-/// The runtime alone, on the Vulkan platform's objects of `bench`: the calls the platform makes
-/// of it for each command.
-#[allow(clippy::disallowed_methods)] // a measurement: real time is what it measures
-fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
-    use metal2vulkan_runtime as rt;
-    let queue = bench.queue();
-    let bound = bench.bound();
-    let (tx, rx) = mpsc::channel();
-    let began = Instant::now();
-    let start = counts();
-    for cb_bound in &bound {
-        let cb = queue.raw.command_buffer().unwrap();
-        let mut enc = None;
-        for &b in cb_bound {
-            match b {
-                Bound::Begin => {
-                    enc = Some(cb.compute_command_encoder().unwrap());
-                    continue;
-                }
-                Bound::End => {
-                    enc.take().unwrap().end_encoding().unwrap();
-                    continue;
-                }
-                _ => {}
-            }
-            let e = enc.as_mut().unwrap();
-            match b {
-                Bound::Begin | Bound::End => unreachable!(),
-                Bound::Pipeline(p) => e.set_compute_pipeline_state(&p.raw),
-                Bound::Texture(t, index) => {
-                    e.set_texture(Some(t.texels("setTexture:atIndex:")), index as u32)
-                }
-                Bound::Sampler(s) => e.set_sampler_states(&[Some(&**s)], 0),
-                Bound::Buffer(buffer, offset, index) => {
-                    e.set_buffers(&[Some(&buffer.raw)], &[offset], index as u32)
-                }
-                Bound::Dispatch => e.dispatch_threadgroups(
-                    rt::Size::new(bench.shape.groups, 1, 1),
-                    rt::Size::new(THREADS, 1, 1),
-                ),
-            }
-            .unwrap();
-        }
-        let tx = tx.clone();
-        cb.add_completed_handler(Box::new(move |_: &rt::CommandBuffer| tx.send(()).unwrap()))
-            .unwrap();
-        // As the platform commits: submitting on this thread.
-        cb.commit_and_submit().unwrap();
-    }
-    let spent = counts() - start;
-    for _ in 0..bench.shape.cbs {
-        rx.recv_timeout(Duration::from_secs(30))
-            .expect("a command buffer never completed");
-    }
-    bench.latency.set(began.elapsed());
-    spent
-}
-
-/// Runs the paths of `bench`, `runtime` what the platform drives alone (none on rt, whose platform
-/// is rt's caller with nothing of ours below it), and prints each one's figures a dispatch.
+/// Runs the paths of `bench` and prints each one's figures a dispatch.
 #[allow(clippy::disallowed_methods)] // a measurement: real time decides how long a profile runs
-fn measure<P: ApiPlatform>(
-    name: &str,
-    mut bench: Bench<P>,
-    runtime: Option<fn(&Bench<P>) -> Counts>,
-) {
+fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>) {
     let runs: usize = std::env::var("DISPATCH_COST_RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -677,7 +610,6 @@ fn measure<P: ApiPlatform>(
             let m = messages();
             spent += match only {
                 Some("platform") => bench.through_platform(),
-                Some("runtime") => runtime.expect("no runtime path on this platform")(&bench),
                 _ => bench.through_decoder(&m),
             };
             reps += 1;
@@ -690,20 +622,20 @@ fn measure<P: ApiPlatform>(
         );
         return;
     }
-    let paths = ["decoder", "platform", "runtime"];
+    let paths = ["decoder", "platform"];
     // Each path's figures a dispatch, by run, and its latencies in milliseconds, by repetition.
-    let mut seen: [Vec<[f64; 3]>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    let mut late: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut seen: [Vec<[f64; 3]>; 2] = [Vec::new(), Vec::new()];
+    let mut late: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
     // The parts the decoder's walks committed before their buffers' last, over the timed
     // repetitions.
     let mut cut = 0u64;
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
     for _ in 0..runs {
-        let mut totals = [Counts::default(); 3];
+        let mut totals = [Counts::default(); 2];
         for rep in 0..WARM + REPS {
             let m = messages();
-            let mut spent = [Counts::default(); 3];
-            let mut took = [None; 3];
+            let mut spent = [Counts::default(); 2];
+            let mut took = [None; 2];
             if only.is_none_or(|o| o == "decoder") {
                 let before = bench.decoder.parts_cut();
                 spent[0] = bench.through_decoder(&m);
@@ -715,12 +647,6 @@ fn measure<P: ApiPlatform>(
             if only.is_none_or(|o| o == "platform") {
                 spent[1] = bench.through_platform();
                 took[1] = Some(ms(bench.latency.get()));
-            }
-            if let Some(runtime) = runtime
-                && only.is_none_or(|o| o == "runtime")
-            {
-                spent[2] = runtime(&bench);
-                took[2] = Some(ms(bench.latency.get()));
             }
             if rep >= WARM {
                 for (t, s) in totals.iter_mut().zip(spent) {
@@ -745,7 +671,7 @@ fn measure<P: ApiPlatform>(
         steps(shape, 0).len()
     );
     for (f, figure) in FIGURES.iter().enumerate() {
-        let mut medians = [0.0f64; 3];
+        let mut medians = [0.0f64; 2];
         for (p, path) in paths.iter().enumerate() {
             let mut values: Vec<f64> = seen[p].iter().map(|v| v[f]).collect();
             if values.iter().all(|&v| v == 0.0) {
@@ -759,12 +685,6 @@ fn measure<P: ApiPlatform>(
             println!(
                 "  {figure:>12} decoder above platform: {:.1}",
                 medians[0] - medians[1]
-            );
-        }
-        if medians[1] > 0.0 && medians[2] > 0.0 {
-            println!(
-                "  {figure:>12} platform above runtime: {:.1}",
-                medians[1] - medians[2]
             );
         }
     }
@@ -812,25 +732,10 @@ fn the_fluid_shape_holds_an_encoder_a_dispatch() {
     assert_eq!(width(Shape::HEAVY.groups), HEAVY_GROUPS.to_le_bytes());
 }
 
-/// On the Vulkan platform: the decoder, the platform and the runtime alone.
-#[test]
-#[ignore = "a measurement, run by hand in a release build holding the GPU: prints a dispatch's cost"]
-fn on_vulkan_dispatch_cost() {
-    println!(
-        "the runtime's compute encoder: {} bytes; its render encoder: {} bytes",
-        size_of::<metal2vulkan_runtime::ComputeCommandEncoder>(),
-        size_of::<metal2vulkan_runtime::RenderCommandEncoder>()
-    );
-    let bench = Bench::<reims_vgpu_vulkan::VulkanPlatform>::new(Shape::chosen());
-    measure("vulkan", bench, Some(through_runtime));
-}
-
-/// On the rt platform (`--features reims-vgpu/rt`): the decoder and the platform, whose gap is the
-/// decoder's share; rt is what the platform drives, so there is no third path.
-#[cfg(feature = "rt")]
+/// On the rt platform: the decoder and the platform, whose gap is the decoder's share.
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU: prints a dispatch's cost"]
 fn on_rt_dispatch_cost() {
     let bench = Bench::<reims_vgpu_vulkan::RtPlatform>::new(Shape::chosen());
-    measure("rt", bench, None);
+    measure("rt", bench);
 }

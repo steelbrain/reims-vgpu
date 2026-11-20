@@ -12,7 +12,7 @@
 //! allocation of its own: [`super::BLOCK_LEN`]). The guest asks for blocks of [`UNIT_LEN`], rt's
 //! allocation unit, each a range of an allocation rt's block maker may have made ahead of need; an
 //! object whose span is longer takes a block of its own length, which rt allocates in the take
-//! ([`SPAN_CODE`]). On a source with none (`HostBlocks`, the Vulkan platform's), a block is a
+//! ([`SPAN_CODE`]). On a source with none (`HostBlocks`, the testkit platform's), a block is a
 //! range of addresses the host picks ([`HostAddresses::private`], `[2^44, 2^45)`) with no memory
 //! of its own, the take's length rounded up to [`TAKE_ALIGN`]: the platform makes each object the
 //! guest places there as it makes one at the guest's own picks, and pins it at its address.

@@ -23,11 +23,11 @@
 //! there is counted under the kind too (`reims_vgpu_vulkan::answer::refusing_as`,
 //! [`Codes::refused`]), beside its own code (`rt-refused-vulkan` and the others). The device's
 //! own makes that import are kinds of their own: the views of pages blocks ([`Kind::PagesView`]),
-//! the views a device cache's copies use ([`Kind::CacheView`]), the display's scanout
-//! ([`Kind::Scanout`]) and a window's mirror ([`Kind::Mirror`]).
+//! the views a device cache's copies use ([`Kind::CacheView`]) and the display's scanout
+//! ([`Kind::Scanout`]).
 //!
-//! On a platform that places a pinned object anywhere (the Vulkan platform's) no pin or object is
-//! counted here, and none of its makes imports through a counted path.
+//! On a platform that places a pinned object anywhere (`ApiPlatform::PINS_IN_BLOCKS` false, the
+//! default, the fake platform's) no pin or object is counted here, and none of its makes imports through a counted path.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -70,14 +70,11 @@ pub(crate) enum Kind {
     CacheView,
     /// The display's scanout, a no-copy buffer over its pages in the region.
     Scanout,
-    /// A window's mirror of the presented frame in the host's memory, and its import on the
-    /// compositor's device.
-    Mirror,
 }
 
 /// Every kind, in the order of their codes.
 #[cfg(test)]
-pub(crate) const KINDS: [Kind; 13] = [
+pub(crate) const KINDS: [Kind; 12] = [
     Kind::Pool,
     Kind::Private,
     Kind::Managed,
@@ -90,7 +87,6 @@ pub(crate) const KINDS: [Kind; 13] = [
     Kind::PagesView,
     Kind::CacheView,
     Kind::Scanout,
-    Kind::Mirror,
 ];
 
 /// A kind's codes.
@@ -142,7 +138,6 @@ impl Kind {
             Kind::PagesView => codes!("pages-view"),
             Kind::CacheView => codes!("cache-view"),
             Kind::Scanout => codes!("scanout"),
-            Kind::Mirror => codes!("mirror"),
         }
     }
 

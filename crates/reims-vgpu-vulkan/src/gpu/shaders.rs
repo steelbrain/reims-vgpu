@@ -1,142 +1,20 @@
-//! The library's own shaders on this platform: `shaders.metal` (the display's present
-//! functions), compiled by Apple's tools when this crate is built (`build.rs`) into
-//! [`METALLIB`], which [`library`] loads with the runtime's `new_library_with_data`. Core asks
-//! for it as `newLibraryWithSource:options:error:`.
-//!
-//! As in Metal, a library belongs to the device that made it, so the metallib is loaded once per
-//! device, the first time it is asked for (a display's pipelines), and every later ask answers
-//! the same library. Devices are told apart by the registry ID the platform answers for them
-//! (`device::registry_id`). A loaded library stays for the life of the process; one that fails to
-//! load is not kept, and the next ask loads again.
-
-use crate::core::platform::Handle;
-use crate::core::platform::types::NsErrorText;
-use crate::core::sync::Mutex;
-use metal2vulkan_runtime::Error;
-
-use crate::answer::{error_text, plain, refused};
-use crate::gpu::device::VulkanDevice;
-use crate::gpu::resource::{LibraryObject, VulkanLibrary};
-use crate::platform::Obj;
+//! The library's own shaders: `shaders.metal` (the display's present functions), compiled by
+//! Apple's tools when this crate is built (`build.rs`) into [`METALLIB`], which the rt platform
+//! loads as the library core asks for with `newLibraryWithSource:options:error:`
+//! (`crate::rt_platform::library`).
 
 /// The metallib `build.rs` compiled `shaders.metal` into.
 pub const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
 
-/// The selector core names the shader library's creation by.
-const SELECTOR: &str = "newLibraryWithSource:options:error:";
-
-/// The libraries loaded so far, each with its device's registry ID, kept until the platform lets
-/// go of its devices ([`crate::let_go`]).
-static LOADED: Mutex<Vec<(u64, VulkanLibrary)>> = Mutex::new(Vec::new());
-
-/// How many of the libraries loaded so far are of `device` (the device object itself, by its
-/// handle's identity), and whether a handle beyond [`LOADED`]'s holds any of those: what the
-/// platform's let-go of its devices counts as its own ([`crate::let_go`]).
-pub(crate) fn kept_of(device: &VulkanDevice) -> (usize, bool) {
-    use crate::core::platform::Handle as _;
-    let loaded = LOADED.lock();
-    let of = (loaded.iter()).filter(|(_, library)| library.device.id() == device.id());
-    of.fold((0, false), |(n, held), (_, library)| {
-        (n + 1, held || library.strong_count() > 1)
-    })
-}
-
-/// Takes the libraries loaded so far, for the platform's let-go of its devices
-/// ([`crate::let_go`]): a device of the same registry ID made after it loads its own.
-pub(crate) fn take_loaded() -> Vec<(u64, VulkanLibrary)> {
-    std::mem::take(&mut *LOADED.lock())
-}
-
-/// The shader library of `device` (a new reference), loaded on the first call for its registry
-/// ID. `Err` is the runtime's refusal of the metallib's contents (`Compile`), which stands where
-/// Metal's compiler hands back an `NSError`; any other refusal dies at the selector, as a raise
-/// inside Metal's compile does, since no path reaches it under a handler.
-pub(crate) fn library(device: &VulkanDevice) -> Result<Option<VulkanLibrary>, NsErrorText> {
-    let id = device.registry_id;
-    // Held through the load, so two first asks load once.
-    let mut loaded = LOADED.lock();
-    if let Some((_, library)) = loaded.iter().find(|(r, _)| *r == id) {
-        return Ok(Some(library.clone_ref()));
-    }
-    let made = load(device);
-    if let Ok(Some(library)) = &made {
-        loaded.push((id, library.clone_ref()));
-    }
-    made
-}
-
-/// [`METALLIB`] as a library of `device`.
-fn load(device: &VulkanDevice) -> Result<Option<VulkanLibrary>, NsErrorText> {
-    let made = crate::gpu::timing::creation(
-        SELECTOR,
-        "",
-        || plain(|| device.raw.new_library_with_data(METALLIB)),
-        || "the platform's shaders".to_owned(),
-        |made| match made {
-            Ok(_) => "made".to_owned(),
-            Err(e) => format!("refused: {e}"),
-        },
-    );
-    match made {
-        Ok(raw) => Ok(Some(Obj::new(LibraryObject {
-            raw,
-            device: device.clone_ref(),
-        }))),
-        Err(e @ Error::Compile(_)) => Err(error_text(&e)),
-        Err(e) => refused(SELECTOR, &e),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use metal2vulkan::metal::PixelFormat;
-    use metal2vulkan::pipeline::{
-        ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
-    };
-    use metal2vulkan_runtime as rt;
-
-    use super::*;
-    use crate::gpu::device::tests::dev;
-
-    /// The display's nine entry points: the window's mirror's two kernels among them.
-    const FUNCTIONS: [&str; 9] = [
-        "displayPresentVertex",
-        "displayPresentFragment",
-        "displayPresentFragmentWithGammaTableAndColorMatrix",
-        "displayPipeColorFragment",
-        "displayPipeColorScanoutFragment",
-        "displayPipeLutFragment",
-        "displayPipeLutScanoutFragment",
-        "displayMirrorTile",
-        "displayMirrorTileList",
-    ];
-
-    fn function(lib: &VulkanLibrary, name: &str) -> rt::Function {
-        lib.raw
-            .new_function_with_name(name)
-            .unwrap_or_else(|e| panic!("no function {name}: {e}"))
-    }
-
-    /// The metallib loads as a library of the device holding the nine functions
-    #[test]
-    fn the_metallib_loads_with_the_nine_functions() {
-        let d = dev();
-        let lib = library(&d).unwrap().unwrap();
-        assert_eq!(lib.device.id(), d.id());
-        let mut names = lib.raw.function_names();
-        names.sort();
-        let mut nine = FUNCTIONS.map(str::to_owned);
-        nine.sort();
-        assert_eq!(names, nine);
-    }
-
     /// The metallibs the repository holds for a build without Apple's tools (`metallibs/`,
     /// `build.rs`) are this tree's: their record is the one `build.rs` writes of this tree's
     /// commands and sources, and the directory holds every metallib it names and no other. So a
     /// source changed on a Mac without `cargo xtask metallibs` fails here, not on Linux.
     #[test]
     fn the_committed_metallibs_are_this_trees() {
-        let dir = crate::gpu::device::tests::crate_dir().join("metallibs");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("metallibs");
         let mend = "run `cargo xtask metallibs` on a Mac and commit what it writes";
         let tree = include_str!(concat!(env!("OUT_DIR"), "/metallibs.toml"));
         let committed = std::fs::read_to_string(dir.join("metallibs.toml"))
@@ -160,50 +38,5 @@ mod tests {
             .collect();
         held.sort_unstable();
         assert_eq!(held, named, "{}: {mend}", dir.display());
-    }
-
-    /// A later ask answers the library the first one loaded
-    #[test]
-    fn loaded_once_per_device() {
-        let d = dev();
-        let a = library(&d).unwrap().unwrap();
-        let b = library(&d).unwrap().unwrap();
-        assert_eq!(a.id(), b.id());
-    }
-
-    /// The present pipelines are made as `display/pipeline.rs` makes them, and the display
-    /// colour's as `reims-vgpu`'s `graphics/sink.rs` does: the vertex function, one of the six
-    /// fragment functions, colour 0 a frame target's format, blending off, no vertex descriptor;
-    /// for each format a frame target takes
-    #[test]
-    fn both_present_pipelines_are_made() {
-        let d = dev();
-        let lib = library(&d).unwrap().unwrap();
-        let vertex = function(&lib, "displayPresentVertex");
-        for fragment in [
-            "displayPresentFragment",
-            "displayPresentFragmentWithGammaTableAndColorMatrix",
-            "displayPipeColorFragment",
-            "displayPipeColorScanoutFragment",
-            "displayPipeLutFragment",
-            "displayPipeLutScanoutFragment",
-        ] {
-            let fragment = function(&lib, fragment);
-            for format in [
-                PixelFormat::BGRA8Unorm,
-                PixelFormat::BGRA8UnormSRGB,
-                PixelFormat::RGBA8Unorm,
-                PixelFormat::RGBA8UnormSRGB,
-            ] {
-                let mut desc = RenderPipelineDescriptor::new(StageSource::Function(
-                    vertex.function_descriptor(),
-                ));
-                desc.fragment = Some(StageSource::Function(fragment.function_descriptor()));
-                desc.color_attachments[0] = Some(ColorAttachmentDescriptor::new(format));
-                d.raw
-                    .new_render_pipeline_state(&desc, &rt::PipelineOptions::default())
-                    .unwrap_or_else(|e| panic!("{format:?}: {e}"));
-            }
-        }
     }
 }

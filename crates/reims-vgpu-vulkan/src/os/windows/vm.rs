@@ -771,70 +771,9 @@ fn fresh(views: &mut BTreeMap<u64, View>, length: u64) -> Result<(u64, Backing),
 
 /// A fresh range of `len` bytes, rounded up to whole pages, of zeros, that a view can be made of:
 /// every range of the VM's is one (module docs).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn allocate_aliasable(len: u64) -> Result<HostAddr, KernReturn> {
     WindowsVm::new().allocate_anywhere(len)
-}
-
-/// Memory of the library's own that a view can be made of and that only its holder frees: a
-/// section's view, registered in the backing table ([`files::Registration`]), so that
-/// `deallocate` refuses it: a graphics device's region ([`RegionMemory`]).
-#[derive(Debug)]
-pub(crate) struct OwnMemory {
-    first: u64,
-    length: u64,
-    registration: Option<files::Registration>,
-}
-
-impl OwnMemory {
-    /// `len` bytes, rounded up to whole pages, of zeros; `None` for none, or where the host gives
-    /// no section or address space, as when memory runs out.
-    pub(crate) fn new(len: u64) -> Option<OwnMemory> {
-        let (_, length) = pages(HostAddr::NULL, len)?;
-        if length == 0 {
-            return None;
-        }
-        let mut views = VIEWS.lock();
-        let (first, backing) = fresh(&mut views, length).ok()?;
-        Some(OwnMemory {
-            first,
-            length,
-            registration: Some(files::Registration::new(first, length, backing)),
-        })
-    }
-
-    /// The first byte.
-    pub(crate) fn first(&self) -> u64 {
-        self.first
-    }
-}
-
-impl Drop for OwnMemory {
-    /// Drops the registration, then the view, through the platform's VM, which waits for a
-    /// device's import of its pages to be freed first, as Vulkan requires of imported host memory
-    /// (`VK_EXT_external_memory_host`; [`crate::remap::UnmapHold`]).
-    fn drop(&mut self) {
-        drop(self.registration.take());
-        let at = HostAddr::from_addr(self.first.to_usize());
-        let _ = crate::remap::VulkanVm::new().deallocate(at, self.length);
-    }
-}
-
-/// A graphics device's region (BAR 2) in memory of the library's own ([`OwnMemory`]): a view of a
-/// section of its own, so views of its pages can be made as of any range's.
-#[derive(Debug)]
-pub struct RegionMemory(OwnMemory);
-
-impl RegionMemory {
-    /// `len` bytes of zeros, rounded up to whole pages; `None` where the host gives no section or
-    /// address space.
-    pub fn new(len: u64) -> Option<RegionMemory> {
-        OwnMemory::new(len).map(RegionMemory)
-    }
-
-    /// Its first byte.
-    pub fn base(&self) -> *mut u8 {
-        ptr(self.0.first()).cast()
-    }
 }
 
 /// Mach VM's calls on Windows (module docs).
@@ -1421,11 +1360,13 @@ pub(crate) mod tests {
     #[test]
     fn registered_memory_is_refused() {
         let v = vm();
-        let own = OwnMemory::new(2 * page()).unwrap();
-        let at = HostAddr::from_addr(own.first().to_usize());
+        let (first, backing) = fresh(&mut VIEWS.lock(), 2 * page()).unwrap();
+        let registration = files::Registration::new(first, 2 * page(), backing);
+        let at = HostAddr::from_addr(first.to_usize());
         assert_eq!(v.deallocate(at, page()), INVALID_ARGUMENT);
         assert!(mapped(at));
-        drop(own);
+        drop(registration);
+        assert_eq!(v.deallocate(at, 2 * page()), KernReturn::SUCCESS);
         assert!(!mapped(at));
     }
 }

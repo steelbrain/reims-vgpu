@@ -160,12 +160,10 @@ mod decode;
 mod device_info;
 #[cfg(windows)]
 mod drawn;
-mod mirror;
 #[cfg(target_os = "linux")]
 mod nvidia;
 mod present;
 mod read;
-#[cfg(feature = "rt")]
 mod rt_window;
 mod sink;
 #[cfg(any(target_os = "linux", windows))]
@@ -175,10 +173,7 @@ mod video_host;
 mod vt;
 #[cfg(any(target_os = "linux", windows))]
 mod vt_encode;
-mod vulkan;
 
-pub(crate) use video_choice::graphics_video as vulkan_graphics_video;
-#[cfg(feature = "rt")]
 pub(crate) use video_choice::rt_graphics_video;
 
 pub use decode::{GraphicsVideo, GraphicsVideoSession, PlanePages, VideoDecode, VideoPlane};
@@ -313,8 +308,7 @@ pub struct GraphicsConfig {
     /// discards guest RAM (a balloon, hot-unplug) gives none.
     pub memory_map: Option<MemoryMap>,
     /// The guest's architecture, which the device's answer of `isFramebufferReadSupported` follows
-    /// (`device_info`'s `lane_flags`), and the class of Mac whose answers the platform's devices
-    /// give where a Mac's GPU decides them ([`GuestArch::mac_class`]).
+    /// (`device_info`'s `lane_flags`).
     pub guest_arch: GuestArch,
     /// The host maps BAR 4, the doorbell pages (`RGFX_PCI_BAR_DOORBELLS`, 32-bit and not
     /// prefetchable, `RGFX_DOORBELLS_SIZE` bytes), and hands each of its writes to
@@ -341,25 +335,6 @@ pub enum GuestArch {
     X86_64,
     /// An arm64 guest, whose frameworks were written against Apple silicon's GPUs.
     Arm64,
-}
-
-impl GuestArch {
-    /// The class of Mac this guest's frameworks were written against, which the Vulkan platform's
-    /// devices present to the runtime ([`ApiPlatform::present_guest`],
-    /// `reims_vgpu_vulkan::platform::present_mac_class`), whatever GPU the host has: a Mac with an
-    /// Intel or AMD GPU for an x86-64 guest, as every x86-64 Mac's GPU is (the x86 oracles, an AMD
-    /// Radeon Pro 5300M and an Intel UHD 630, read zero in a new `Private` texture), and an Apple
-    /// silicon Mac for an arm64 guest, as every arm64 Mac's GPU is Apple's (an Apple M3 Max reads
-    /// Metal's fixed pattern there). The runtime gives that Mac's answers where a Mac's GPU decides
-    /// them: a new `Private` texture's contents, a blit's encodings through a compressed texture, a
-    /// `half` NaN clear's sign, and a `Clear` load's reach past the render area of a pass without
-    /// a draw call.
-    pub fn mac_class(self) -> metal2vulkan_runtime::MacClass {
-        match self {
-            GuestArch::X86_64 => metal2vulkan_runtime::MacClass::IntelOrAmd,
-            GuestArch::Arm64 => metal2vulkan_runtime::MacClass::AppleSilicon,
-        }
-    }
 }
 
 /// The bytes of the host GPU's memory deferred blocks' device caches may hold, which
@@ -533,19 +508,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let pool_host = pool_host(&config)?;
             let size = usize::try_from(reims_vgpu_graphics::REGION_SIZE)
                 .map_err(|_| Error::HostResources)?;
-            let region = platform
-                .graphics_region(size)
-                .or_else(|| Region::new(size))
-                .ok_or(Error::HostResources)?;
-            let region = Arc::new(region);
+            let region = Arc::new(Region::new(size).ok_or(Error::HostResources)?);
             // The device the decoder drives, and its caps blob, which the guest bundle reads
-            // before it makes any queue. A host with no GPU device cannot run the lane. The
-            // platform learns the guest's architecture first, so the device gives the answers of
-            // the Macs the guest's frameworks were written against (`GuestArch::mac_class`).
-            // It learns the guest's texture ids too, which a platform whose device makes queues
-            // or textures of its own as it is made reserves there first.
-            platform.present_guest(config.guest_arch);
-            platform.present_guest_texture_ids(guest_texture_ids());
+            // before it makes any queue. A host with no GPU device cannot run the lane.
             let gpu_device = platform.metal_device(None).ok_or(Error::HostResources)?;
             // Before anything else of this device makes a queue or a texture on it.
             reserve_guest_texture_ids(platform.as_ref(), &gpu_device);
@@ -1713,16 +1678,6 @@ impl<P: Platform> Presented<P> {
         DrawnPresents {
             presented: Arc::clone(self),
             drawing: self.answers.drawn(),
-            hold: None,
-        }
-    }
-
-    /// What a window draw holds where another command buffer took its presents and the surface's
-    /// block, the one that reads the surface (`sink`, "The compositor's GPU"): nothing.
-    pub(crate) fn drawn_by_none(self: &Arc<Self>) -> DrawnPresents<P> {
-        DrawnPresents {
-            presented: Arc::clone(self),
-            drawing: Drawing::default(),
             hold: None,
         }
     }
@@ -3553,7 +3508,6 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 self.pool.favour(owner);
                 // The rt platform's boot diagnostics count over-copies a frame, and name the
                 // compositor by it.
-                #[cfg(feature = "rt")]
                 reims_vgpu_vulkan::rt_platform::diag::presented(owner);
                 // Its block is held from here, before the texture's destroy and the block's
                 // release can come: the present shows it later.
@@ -4521,10 +4475,7 @@ const RESERVATION_CHECKS: usize = 16;
 /// Metal takes a texture reservation only before the device's first texture (it ignores a later
 /// one, logging so), and one after the device's first command queue keeps the pool's first range
 /// beside the ids it leaves, which it hands out twice. So this is the first call on the device,
-/// and a few plain textures check it took: one inside the guest's ids is logged as an error. A
-/// platform whose device makes a queue or texture of its own as it is made reserves the ids there
-/// first, told them before the device ([`ApiPlatform::present_guest_texture_ids`]), and answers
-/// this call at once.
+/// and a few plain textures check it took: one inside the guest's ids is logged as an error.
 fn reserve_guest_texture_ids<P: Platform>(platform: &P, device: &P::Device) {
     let ids: Vec<u64> = guest_texture_ids().collect();
     if let Err(raise) = refusing(|| device.reserve_resource_indices(0, &ids)) {
@@ -4657,9 +4608,9 @@ impl Screen for WindowScreen {
     }
 }
 
-/// The window's sink over `region` on `platform` ([`sink::ScanoutDraw`]): the Vulkan platform's
-/// swapchain presenter, or the rt platform's (`rt_window`); `None` on any other platform (the
-/// testkit's), or where the platform refuses a command queue.
+/// The window's sink over `region` on `platform` ([`sink::ScanoutDraw`]): the rt platform's
+/// swapchain presenter (`rt_window`); `None` on any other platform (the testkit's), or where the
+/// platform refuses a command queue.
 fn scanout_sink<P: ApiPlatform>(
     platform: &Arc<P>,
     region: &Arc<Region>,
@@ -4668,18 +4619,11 @@ fn scanout_sink<P: ApiPlatform>(
 ) -> Option<Arc<dyn FrameSink>> {
     let any: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(platform) as _;
     let presented_any: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(presented) as _;
-    #[cfg(feature = "rt")]
     if let (Ok(rt), Ok(presented)) = (
         Arc::clone(&any).downcast::<reims_vgpu_vulkan::RtPlatform>(),
         Arc::clone(&presented_any).downcast::<Presented<reims_vgpu_vulkan::RtPlatform>>(),
     ) {
         return rt_window::sink(rt, region, shown, &presented);
-    }
-    if let (Ok(vulkan), Ok(presented)) = (
-        Arc::clone(&any).downcast::<reims_vgpu_vulkan::VulkanPlatform>(),
-        Arc::clone(&presented_any).downcast::<Presented<reims_vgpu_vulkan::VulkanPlatform>>(),
-    ) {
-        return vulkan::sink(vulkan, region, shown, &presented);
     }
     let _ = (any, presented_any, region, shown);
     None

@@ -6528,7 +6528,6 @@ impl<P: Platform> Caches<P> {
 
     /// The plane of the block at `block`'s cache's surface whose image the shape `reference`
     /// names is, where it is one of the cache's plane shapes ([`exported`]); `None` for any other.
-    #[cfg(feature = "rt")]
     pub(crate) fn video_plane(&self, block: u64, reference: &shapes::ShapeRef) -> Option<u64> {
         let state = self.lock();
         state.by_block.get(&block)?.shapes.plane_of(reference.id())
@@ -9621,7 +9620,7 @@ pub(super) mod tests {
         use reims_vgpu_vulkan::core::platform::values::TextureDesc;
 
         use crate::platform::ApiPlatform as _;
-        type V = reims_vgpu_vulkan::VulkanPlatform;
+        type V = reims_vgpu_vulkan::RtPlatform;
         // A WebGL canvas's surface, 2648 texels wide: rows of 10592 bytes, 10624 apart.
         let plane = PagesPlane {
             offset: 0,

@@ -1,5 +1,5 @@
 //! The GPU addresses the host gives the contexts' blocks on a source whose blocks have none
-//! (`HostBlocks`, the Vulkan platform's): the Shared pool's (`POOL_ADDRESSES`,
+//! (`HostBlocks`, the testkit platform's): the Shared pool's (`POOL_ADDRESSES`,
 //! docs/graphics-kext/design.md, "The Shared pool"), the Private blocks
 //! (`PRIVATE_BLOCKS`, "Private blocks") and the pages blocks' views (`IMPORT_ADDRESSES`,
 //! "Import addresses"). A guest that took the feature places its objects at the address its

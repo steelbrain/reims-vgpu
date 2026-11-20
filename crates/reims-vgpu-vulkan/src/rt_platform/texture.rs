@@ -599,9 +599,8 @@ pub(super) fn surface_plane(
 
 /// An image for views, or a surface's plane (`surface_plane`), as a recording holds it: the
 /// device's `newTextureWithDescriptor:` of a descriptor of `desc` whose `m2v.textureDescriptor`
-/// record marks it [`crate::recorder::OUTSIDE`] ([`crate::recorder::outside_descriptor`]), as the
-/// Vulkan platform's own texture is, so a player places it outside the guest's texture indices,
-/// as rt gives it none, and the views, copies and commands that name the image name its stream
+/// record marks it [`crate::recorder::OUTSIDE`] ([`crate::recorder::outside_descriptor`]), so a
+/// player places it outside the guest's texture indices, as rt gives it none, and the views, copies and commands that name the image name its stream
 /// id. `make` makes the image; where the process does not record, nothing else is made.
 fn recorded_image(
     device: &RtObj<RtDevice>,

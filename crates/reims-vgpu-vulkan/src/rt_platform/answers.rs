@@ -7,16 +7,12 @@
 //! `minimumLinearTextureAlignmentForPixelFormat:`); the rest of a Metal device's answers are the
 //! consumer's. So each is the Vulkan platform's answer where that answer is the platform's own
 //! (its stand-ins, `crate::gpu::caps::stand_in`, and its fixed answers), and otherwise Metal's
-//! answer on an Apple M3 Max, recorded in
-//! `gpu/caps/tests/metal_answers/metal_tests.every_cap_is_metals.txt` ([`metal`]), held to the
+//! answer on an Apple M3 Max, recorded on 2026-11-07 ([`metal`]), held to the
 //! device's Vulkan limits where one bounds it ([`caps`]). The guest's device info is made from
 //! them as from the Vulkan platform's (reims-vgpu's `graphics::device_info`), which caps the
 //! families and the features the graphics lane does not offer.
 //!
-//! **Where they differ from the Vulkan platform's**, which asks metal2vulkan-runtime for its
-//! device's private properties and its family audit (`crate::gpu::caps`, `crate::gpu::identity`),
-//! the guest sees another answer. The rt platform's GPU test lists every such difference on its
-//! GPU (`device`'s tests); the expected ones:
+//! **Where the device's facts decide them**, the answers are these:
 //! - the counts the runtime clamped to its device's descriptor and stage limits are Metal's here,
 //!   and the device's Vulkan limits bound only sizes, layers, threadgroup memory, threads and
 //!   viewports;
@@ -50,8 +46,7 @@ use crate::core::raise::Raise;
 use crate::gpu::caps::{METAL_LINEAR_ALIGNMENT, stand_in};
 use crate::gpu::identity;
 
-/// Metal's answers on an Apple M3 Max (macOS 27.0.1, recorded 2026-11-07 in
-/// `gpu/caps/tests/metal_answers/metal_tests.every_cap_is_metals.txt`), which the rt device
+/// Metal's answers on an Apple M3 Max (macOS 27.0.1, recorded 2026-11-07), which the rt device
 /// answers but where the module's docs say otherwise.
 pub mod metal {
     use crate::core::platform::caps::{Flags, Limits};

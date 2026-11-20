@@ -8,7 +8,7 @@ publish.workspace = true
 license.workspace = true
 
 [features]
-default = ["macos-sdl", "rt"]
+default = ["macos-sdl"]
 # SDL3's window on macOS, the window crate's `macos-sdl`, which `REIMS_VGPU_WINDOW_IMPL=sdl` opens
 # in place of AppKit's. Without it the macOS library has no SDL, and its windows are AppKit's.
 # Linux's and Windows's window is SDL3's whatever this says.
@@ -18,10 +18,6 @@ testkit = ["reims-vgpu-vulkan/testkit"]
 # Kept for the builds that name it (`--features vulkan`): the Vulkan platform is the library's only
 # one, everywhere, so the feature changes nothing.
 vulkan = []
-# The platform over metal2vulkan-rt (`reims-vgpu-vulkan`'s `rt`, `platform/rt.rs`) as
-# `DefaultPlatform`, on by default: the library's platform. The old platform, `VulkanPlatform`
-# over metal2vulkan-runtime, builds only without it, and goes with its code.
-rt = ["reims-vgpu-vulkan/rt"]
 
 [dependencies]
 reims-vgpu-window.workspace = true
@@ -43,11 +39,9 @@ log.workspace = true
 parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
 
 # The Vulkan platform (architecture 2.2), the library's only one: natively on Linux and Windows,
-# and over MoltenVK on macOS.
+# and on macOS over Mesa's KosmicKrisp where the distribution ships it (`os/macos/rt_driver.rs`).
 reims-vgpu-vulkan.workspace = true
-metal2vulkan-runtime.workspace = true
-# The runtime that replaces metal2vulkan-runtime at the cutover: the pool's block source over it
-# (`pool::rt_blocks`), which only tests reach until then.
+# The platform's runtime, metal2vulkan-rt: the pool's block source over it (`pool::rt_blocks`).
 metal2vulkan-rt.workspace = true
 
 # On Windows, a file's ID and times, which name the library's build (`graphics/answers/windows.rs`),

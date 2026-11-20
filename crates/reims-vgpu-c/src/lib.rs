@@ -51,8 +51,7 @@ pub use status::RvgStatus;
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// The platform every handle is made on: the platform over metal2vulkan-rt under the `rt` feature,
-/// on by default, or without it the old platform over metal2vulkan's runtime (architecture 2.2)
+/// The platform every handle is made on: the platform over metal2vulkan-rt (architecture 2.2)
 /// (`reims_vgpu::DefaultPlatform`).
 #[cfg(not(test))]
 pub(crate) type Plat = reims_vgpu::DefaultPlatform;

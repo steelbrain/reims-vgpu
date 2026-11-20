@@ -1,6 +1,6 @@
 //! A unit test's rt devices go as the test's thread ends, before its process exits. rt supports
 //! no `exit` with a device of its live (its README, "Quiesce and exit"), and the process's
-//! platform ([`crate::singleton::rt_platform`]) keeps its device until a host's release of its
+//! platform ([`crate::singleton::platform`]) keeps its device until a host's release of its
 //! last graphics device lets go of it, which a test does not do. A test process that exits so
 //! races rt's threads, still freeing the device's memory, against the drivers' exit handlers: on
 //! an RTX 3090 (NVIDIA 620.70.06, Linux), two tiled-texture tests printed ok, then died of
@@ -135,7 +135,7 @@ mod end {
         });
     }
 
-    /// The process's platform, at each use ([`crate::singleton::rt_platform`]): kept at its first
+    /// The process's platform, at each use ([`crate::singleton::platform`]): kept at its first
     /// use on the test's thread.
     pub(crate) fn process_platform(platform: &Arc<RtPlatform>) {
         if !LOOKED.replace(true) {

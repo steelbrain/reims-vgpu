@@ -1,9 +1,11 @@
-//! `RtPlatform` as an `ApiPlatform`, under the `rt` feature: the platform over metal2vulkan-rt
+//! `RtPlatform` as an `ApiPlatform`: the platform over metal2vulkan-rt
 //! (`reims_vgpu_vulkan::rt_platform`), built piece by piece. A piece not built yet is a counted,
 //! typed refusal there. A graphics device's start makes the process's rt device and answers the
 //! guest's device info from it; the guest's work is refused at each unbuilt piece it reaches.
 
+use reims_vgpu_vulkan::core::num::ToU64 as _;
 use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::os::GuestRamFile;
 use reims_vgpu_vulkan::{RtPlatform, rt_platform};
 
 use super::*;
@@ -33,15 +35,15 @@ impl ApiPlatform for RtPlatform {
     const SURFACE_VIEWS: bool = false;
 
     fn process() -> Arc<RtPlatform> {
-        crate::singleton::rt_platform()
+        crate::singleton::platform()
     }
 
     /// The files behind the map's ranges, registered while the device lives
-    /// (`super::vulkan::lease_guest_ram`): on Linux the views of a pages block's guest pages, an
+    /// ([`lease_guest_ram`]): on Linux the views of a pages block's guest pages, an
     /// app's no-copy memory, are mapped from them, and where the GPU takes no pointer to those
     /// pages, the device imports a dma-buf of them (`rt_platform::import_known`).
     fn guest_memory(&self, map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
-        super::vulkan::lease_guest_ram(map)
+        lease_guest_ram(map)
     }
 
     /// rt's blocks (`pool::RtBlocks`), each known to `device` from its take until just before it
@@ -142,4 +144,24 @@ fn import_view(
     let (known, id) = (device.known_blocks().clone(), block.id);
     let forget: Box<dyn FnOnce() + Send> = Box::new(move || drop(known.forget(id)));
     Some((block.gpu_address.saturating_add(offset), forget))
+}
+
+/// The files behind `map`'s ranges, registered while what this returns lives
+/// (`reims_vgpu_vulkan::os::lease_guest_memory`): on Linux the platform makes its views of the
+/// guest's pages of them, and the dma-bufs of those pages. A range without a file is not
+/// registered, and a view of its pages is refused as a failed remap is. On macOS nothing is
+/// registered, since Mach makes a view by remapping addresses.
+fn lease_guest_ram(map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
+    let ranges = map.ranges().iter().zip(map.files());
+    let files = ranges.filter_map(|(range, file)| {
+        let file = file.as_ref()?;
+        Some(GuestRamFile {
+            host: range.host_address.addr().to_u64(),
+            guest: range.physical_address,
+            length: range.physical_length,
+            file: Arc::clone(&file.file),
+            offset: file.offset,
+        })
+    });
+    Box::new(reims_vgpu_vulkan::os::lease_guest_memory(files))
 }

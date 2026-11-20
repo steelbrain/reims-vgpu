@@ -16,14 +16,14 @@ use reims_vgpu_video::core::sync::{Condvar, MutexGuard};
 use reims_vgpu_video::nvidia::{
     EncodeParams, EncodeProfile, EncodeRateControl, NvencEncoder, RawFrame, Tuning,
 };
-use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::RtPlatform;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
 use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
 use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
 
 use super::*;
-use crate::graphics::video_choice::tested_gpu::{Arm, device_for};
+use crate::graphics::video_choice::tested_gpu::Arm;
 
 /// What the GPU's copies must leave as it was: the bytes past each row.
 const UNTOUCHED: u8 = 0xee;
@@ -88,36 +88,13 @@ fn copy<P: Platform>(queue: &P::CommandQueue, from: &P::Buffer, to: &P::Buffer, 
     assert_eq!(cb.status(), CommandBufferStatus::COMPLETED);
 }
 
-/// Each picture of NVENC's H.264 and HEVC at 1080p lands in an exportable buffer of the runtime
-/// device's, imported once, by NVDEC's copy within the GPU, its rows alone at a pitch of their
-/// own, its planes 32 bytes in as CoreVideo lays them, the byte the buffer places for textures
-/// in place (`aligned_byte`), and said written by another API (`Buffer::external_write_done`), as
-/// a landing says it: a copy of the buffer on the runtime's queue reads NVDEC's read back of the
-/// picture in each row, and the bytes before the planes and past each row as the runtime's fill
-/// left them.
-#[test]
-#[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
-fn a_picture_lands_in_an_imported_device_cache_as_it_reads_back() {
-    let platform = Arc::new(VulkanPlatform::new());
-    crate::entry::run(|_| {
-        let device = device_for(&platform, Arm::Nvidia);
-        let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
-        let gpu = super::super::video_choice::nvidia_gpu(&device);
-        let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime)
-            .expect("NVDEC on the device's GPU");
-        lands_in_an_imported_device_cache(&device, &video, &runtime);
-    });
-}
-
 /// As [`a_picture_lands_in_an_imported_device_cache_as_it_reads_back`], on the rt platform: its
 /// exportable buffers are blocks of their own, exported as opaque fds, which CUDA imports, and
 /// the acquire is rt's (`rt_platform::export`).
 /// The rt device must be of a GPU the arm runs on (`video_choice::tested_gpu::check_rt`).
-#[cfg(feature = "rt")]
 #[test]
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
 fn a_picture_lands_in_an_imported_rt_cache_as_it_reads_back() {
-    use reims_vgpu_vulkan::RtPlatform;
     let platform = crate::rt_test_end::platform();
     crate::entry::run(|_| {
         let device = platform.system_default_device().expect("an rt device");
@@ -137,12 +114,10 @@ fn a_picture_lands_in_an_imported_rt_cache_as_it_reads_back() {
 /// shape's (`video_caps`), and the arm imports the device's exportable caches, rt's exported
 /// blocks, to write them in.
 /// The rt device must be of a GPU the arm runs on (`video_choice::tested_gpu::check_rt`).
-#[cfg(feature = "rt")]
 #[test]
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
 fn the_rt_platforms_caps_name_what_nvdec_decodes_and_nvenc_encodes() {
     use reims_vgpu_graphics::wire::RGFX_VIDEO_CAPS_OUTPUT_CACHED;
-    use reims_vgpu_vulkan::RtPlatform;
     let platform = crate::rt_test_end::platform();
     crate::entry::run(|_| {
         let device = platform.system_default_device().expect("an rt device");
@@ -364,16 +339,17 @@ const ENCODE_FIRST_CHILD: &str = "RVG_TEST_NVIDIA_ENCODE_FIRST_CHILD";
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
 fn an_encode_first_processs_waits_run_on_the_arms_runtime() {
     if std::env::var_os(ENCODE_FIRST_CHILD).is_some() {
-        let platform = Arc::new(VulkanPlatform::new());
+        let platform = crate::rt_test_end::platform();
         crate::entry::run(|_| {
-            let device = device_for(&platform, Arm::Nvidia);
+            let device = platform.system_default_device().expect("an rt device");
+            crate::graphics::video_choice::tested_gpu::check_rt(&device, Arm::Nvidia);
             let naming = Arc::new(Naming {
                 platform: crate::video::runtime::PlatformRuntime::of(&platform),
                 started: Mutex::new(Vec::new()),
             });
             let runtime: Arc<dyn Runtime> = Arc::<Naming>::clone(&naming);
-            let gpu = super::super::video_choice::nvidia_gpu(&device);
-            let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime)
+            let gpu = super::super::video_choice::rt_nvidia_gpu(&device);
+            let video = NvidiaVideo::<RtPlatform>::new(&device, gpu, &runtime)
                 .expect("NVDEC on the device's GPU");
             let params = params(EncodeProfile::H264High, 1920, 1080);
             let mut encoder =
@@ -534,12 +510,13 @@ fn surface_layout(
 #[test]
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
 fn a_videotoolbox_picture_lands_in_the_lent_surfaces_pages_as_it_reads_back() {
-    let platform = Arc::new(VulkanPlatform::new());
+    let platform = crate::rt_test_end::platform();
     crate::entry::run(|_| {
-        let device = device_for(&platform, Arm::Nvidia);
+        let device = platform.system_default_device().expect("an rt device");
+        crate::graphics::video_choice::tested_gpu::check_rt(&device, Arm::Nvidia);
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
-        let gpu = super::super::video_choice::nvidia_gpu(&device);
-        let video = NvidiaVideo::<VulkanPlatform>::new(&device, gpu, &runtime);
+        let gpu = super::super::video_choice::rt_nvidia_gpu(&device);
+        let video = NvidiaVideo::<RtPlatform>::new(&device, gpu, &runtime);
         let video = Arc::new(video.expect("NVDEC on the device's GPU"));
         let shared = Shared(Arc::clone(&video));
         assert!(shared.guest_decodes());

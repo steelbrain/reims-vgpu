@@ -1,8 +1,5 @@
 //! The guest's RAM a device holds on Linux: each range of it registered in the backing table
-//! (`crate::os::files`) as a shared mapping of the file the host names, and handed whole to the
-//! devices that take it (`crate::os`'s `host_ram`), while the device lives.
-
-use std::sync::Arc;
+//! (`crate::os::files`) as a shared mapping of the file the host names, while the device lives.
 
 use crate::os::GuestRamFile;
 use crate::os::files::{Backing, Registration};
@@ -12,9 +9,6 @@ use crate::os::files::{Backing, Registration};
 /// guest's pages are made of these files.
 #[derive(Debug)]
 pub struct GuestMemoryLease {
-    /// The RAM as the devices that take it whole are handed it (`crate::os`'s `host_ram`), let go of
-    /// first.
-    _ram: Arc<crate::os::host_ram::LeasedRam>,
     _registrations: Vec<Registration>,
 }
 
@@ -24,7 +18,6 @@ pub struct GuestMemoryLease {
 /// budget of mappings is short of the guest's RAM (the `budget` module).
 pub fn lease_guest_memory(ranges: impl IntoIterator<Item = GuestRamFile>) -> GuestMemoryLease {
     let ranges: Vec<GuestRamFile> = ranges.into_iter().collect();
-    let ram: Vec<(u64, u64)> = ranges.iter().map(|r| (r.host, r.length)).collect();
     let guest_ram = ranges
         .iter()
         .map(|r| r.host.saturating_add(r.length) - r.host)
@@ -41,13 +34,14 @@ pub fn lease_guest_memory(ranges: impl IntoIterator<Item = GuestRamFile>) -> Gue
         .collect();
     super::budget::warn_if_short(guest_ram);
     GuestMemoryLease {
-        _ram: crate::os::host_ram::lease(&ram),
         _registrations: registrations,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::os::files::pieces;
     use crate::os::files::tests::{file, shape};

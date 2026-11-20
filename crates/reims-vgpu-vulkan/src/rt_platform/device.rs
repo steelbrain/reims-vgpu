@@ -35,8 +35,7 @@
 //! instance, and the device's DRM nodes tell its window whether the compositor composites on
 //! this GPU ([`RtDevice::composited_here`]).
 //!
-//! **Its registry ID** folds its `deviceUUID` (`super::answers::registry_id`), so it differs from
-//! the Vulkan platform's for the same GPU, which metal2vulkan-runtime gives.
+//! **Its registry ID** folds its `deviceUUID` (`super::answers::registry_id`).
 //!
 //! **Its over-copies.** Where the device's linear image cannot hold a texture over a buffer in
 //! place, rt keeps the texels in an image of its own and copies the bytes between the two,
@@ -164,15 +163,27 @@ fn fold(folded: &mut [u64; 4], now: [u64; 4]) {
 /// Metal's `maxCommandBufferCount` of a queue made by `newCommandQueue`.
 pub const METAL_MAX_COMMAND_BUFFER_COUNT: u32 = 64;
 
-/// The rt device's cache directory in the user's cache directory, beside the Vulkan platform's
-/// (`crate::platform::cache_directory`), which it shares nothing with: rt keeps its lowered
-/// functions and its pipeline caches there.
+/// The rt device's cache directory in the user's cache directory, beside the library's own
+/// (`crate::os::cache_directory`), which it shares nothing with: rt keeps its lowered functions
+/// and its pipeline caches there, within [`SHADER_CACHE_CAPACITY`].
 #[cfg(not(any(test, feature = "testkit")))]
 const CACHE: &str = "reims-vgpu-rt";
 
-/// A test build's rt cache directory, the tests' own, as the Vulkan platform's tests keep theirs.
+/// A test build's rt cache directory, the tests' own: a test of what a device compiles runs on an
+/// empty one as on a full one, and the tests write nothing into the one the library's hosts share.
 #[cfg(any(test, feature = "testkit"))]
 const CACHE: &str = "reims-vgpu-rt-tests";
+
+/// The most bytes [`CACHE`] holds, 25 GiB. A macOS 26 guest's built-in apps, each launched once,
+/// need more than 1 GiB of translations and driver records on an RTX 5080 laptop. An entry dropped
+/// past the capacity is compiled again at the next boot that draws with it.
+#[cfg(not(any(test, feature = "testkit")))]
+pub(crate) const SHADER_CACHE_CAPACITY: u64 = 25 << 30;
+
+/// A test build's capacity, 1 GiB: its directory holds what the tests compile and nothing a
+/// guest's boot reuses, so it is kept small on disk.
+#[cfg(any(test, feature = "testkit"))]
+pub(crate) const SHADER_CACHE_CAPACITY: u64 = 1 << 30;
 
 /// `id<MTLDevice>` on metal2vulkan-rt: rt's device and what the platform read of it.
 pub struct RtDevice {
@@ -353,7 +364,7 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
             unsafe { crate::os::seen(raw, physical.raw(), true, drm, pci, window_lacks) }
         })
         .collect();
-    let Some(at) = crate::device_choice::chosen_untimed(&seen) else {
+    let Some(at) = crate::device_choice::chosen(&seen) else {
         return Err(Unopened::NoDevice(if below.is_empty() {
             "the loader lists no physical device".to_owned()
         } else {
@@ -383,7 +394,7 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
     };
     let mut options = rt::DeviceOptions::default();
     options.pipeline_cache_dir = crate::os::user_cache_directory().map(|dir| dir.join(CACHE));
-    options.pipeline_cache_cap = Some(crate::platform::SHADER_CACHE_CAPACITY);
+    options.pipeline_cache_cap = Some(SHADER_CACHE_CAPACITY);
     let fences = {
         // SAFETY: the instance listed the device and is alive.
         let names = unsafe { raw.enumerate_device_extension_properties(physical.raw()) }
@@ -1403,62 +1414,6 @@ mod tests {
     use crate::core::platform::device::relaying_gaps;
     use crate::core::platform::values::{OptionSet, TextureDesc};
 
-    /// The flat `path = value` pairs of a value's `Debug` text, one per field of each struct in
-    /// it, for the list of the rt device's answers that differ from the Vulkan platform's.
-    fn fields(path: &str, debug: &str, out: &mut Vec<(String, String)>) {
-        let debug = debug.trim();
-        let open = debug.find(" { ").filter(|&at| {
-            debug.ends_with(" }") && debug[..at].chars().all(|c| c.is_alphanumeric() || c == '_')
-        });
-        let Some(at) = open else {
-            out.push((path.to_owned(), debug.to_owned()));
-            return;
-        };
-        let inner = &debug[at + 3..debug.len() - 2];
-        let (mut depth, mut start, mut quoted, mut escaped) = (0i32, 0usize, false, false);
-        let mut items = Vec::new();
-        for (i, c) in inner.char_indices() {
-            match c {
-                _ if escaped => escaped = false,
-                '\\' if quoted => escaped = true,
-                '"' => quoted = !quoted,
-                _ if quoted => {}
-                '{' | '[' | '(' => depth += 1,
-                '}' | ']' | ')' => depth -= 1,
-                ',' if depth == 0 => {
-                    items.push(&inner[start..i]);
-                    start = i + 1;
-                }
-                _ => {}
-            }
-        }
-        items.push(&inner[start..]);
-        for item in items {
-            let item = item.trim();
-            match item.split_once(": ") {
-                Some((key, value)) => fields(&format!("{path}.{key}"), value, out),
-                None if !item.is_empty() => out.push((path.to_owned(), item.to_owned())),
-                None => {}
-            }
-        }
-    }
-
-    /// Each field whose value differs between `rt` and `old`, as a line.
-    fn differences(name: &str, rt: &str, old: &str) -> Vec<String> {
-        let (mut a, mut b) = (Vec::new(), Vec::new());
-        fields(name, rt, &mut a);
-        fields(name, old, &mut b);
-        let mut lines = Vec::new();
-        for (path, value) in &a {
-            match b.iter().find(|(p, _)| p == path) {
-                Some((_, other)) if other == value => {}
-                Some((_, other)) => lines.push(format!("{path}: rt {value}, vulkan {other}")),
-                None => lines.push(format!("{path}: rt {value}, vulkan has none")),
-            }
-        }
-        lines
-    }
-
     /// Each fold counts what each over-copy metric rose by since the last, under its code, so the
     /// counts line carries the metrics' totals.
     #[test]
@@ -1551,29 +1506,11 @@ mod tests {
         assert_eq!(over_copies() - counted, copied, "both devices' over-copies");
     }
 
-    /// The flat fields of a struct's `Debug` text name each field once.
-    #[test]
-    fn a_debug_text_flattens_to_its_fields() {
-        let mut out = Vec::new();
-        fields(
-            "x",
-            "A { b: 1, c: C { d: [1, 2], e: Some(3) }, f: \"g, h\" }",
-            &mut out,
-        );
-        let paths: Vec<&str> = out.iter().map(|(p, _)| p.as_str()).collect();
-        assert_eq!(paths, ["x.b", "x.c.d", "x.c.e", "x.f"]);
-        assert_eq!(
-            differences("x", "A { b: 1, c: 2 }", "A { b: 1, c: 3 }"),
-            ["x.c: rt 2, vulkan 3"]
-        );
-    }
-
     /// The rt platform's device on the GPU the test holds: made once and answered at every ask,
     /// its registry ID opening it again; its answers bounded by its GPU; its queues, events and
     /// fences made; the guest's texture indices granted, twice without a refusal; a heap texture's
     /// size rt's, and a shape rt or Metal refuses a counted raise, never 0 bytes at 0; every
-    /// creator of an unbuilt piece nil and counted. The answers that differ from the Vulkan
-    /// platform's on the same GPU are printed, for RESULT.md: run it with `--no-capture`.
+    /// creator of an unbuilt piece nil and counted.
     #[test]
     fn the_device_and_its_answers_on_vulkan() {
         use crate::core::platform::device::GpuDevice as _;
@@ -1675,72 +1612,8 @@ mod tests {
         }
         assert_eq!(counted(metal), before + 2);
 
-        let old = crate::gpu::device::tests::dev();
-        let mut lines = differences(
-            "caps",
-            &format!("{:?}", *caps),
-            &format!("{:?}", *old.caps()),
-        );
-        let old_identity = old.identity_caps();
-        let (formats, old_formats) = (identity.formats.clone(), old_identity.formats.clone());
-        let strip = |mut id: IdentityCaps| {
-            id.formats.clear();
-            format!("{id:?}")
-        };
-        lines.extend(differences(
-            "identity",
-            &strip(identity),
-            &strip(old_identity),
-        ));
-        let differing: Vec<String> = (formats.iter().zip(&old_formats))
-            .filter(|(a, b)| a != b)
-            .map(|(a, b)| format!("format {}: rt {a:?}, vulkan {b:?}", a.format))
-            .collect();
-        lines.push(format!(
-            "formats: {} of {} differ",
-            differing.len(),
-            formats.len()
-        ));
-        lines.extend(differing.into_iter().take(6));
-        lines.push(format!(
-            "own_memory_budget: rt {}, vulkan {}",
-            device.own_memory_budget(),
-            old.own_memory_budget()
-        ));
-        lines.push(format!(
-            "memory_heaps_total: rt {}, vulkan {}",
-            device.memory_heaps_total(),
-            old.memory_heaps_total()
-        ));
-        lines.push(format!(
-            "heapTextureSizeAndAlign of a 64x64 BGRA8Unorm Private texture: rt {size} at {align}"
-        ));
-        lines.push(format!(
-            "linear_row_alignment: rt {}, vulkan {}",
-            device.linear_row_alignment(),
-            old.linear_row_alignment()
-        ));
-        // Format descriptions and level layouts are Metal's on both, from one table.
-        for raw in 0..2048 {
-            assert_eq!(device.pixel_format_info(raw), old.pixel_format_info(raw));
-        }
         let bgra8 = device.pixel_format_info(80);
         assert_eq!(bgra8.name.as_deref(), Some("MTLPixelFormatBGRA8Unorm"));
-        let shapes = [(80, 64, 32), (70, 17, 3), (130, 33, 9), (252, 5, 5)];
-        for (pixel_format, width, height) in shapes {
-            for (options, flags) in [(0, 0), (2, 0), (0, 1), (0, 2)] {
-                let q = TextureLevelQuery {
-                    pixel_format,
-                    width,
-                    height,
-                    depth: 1,
-                    array_length: 1,
-                    options,
-                    flags,
-                };
-                assert_eq!(device.texture_level_info(&q), old.texture_level_info(&q));
-            }
-        }
         let q = TextureLevelQuery {
             pixel_format: 80,
             width: 64,
@@ -1751,12 +1624,5 @@ mod tests {
         };
         let level = device.texture_level_info(&q);
         assert_eq!((level.bytes_per_row, level.aligned_height), (256, 32));
-        println!(
-            "rt platform's answers on {} that differ from the Vulkan platform's:",
-            device.facts().name
-        );
-        for line in lines {
-            println!("  {line}");
-        }
     }
 }

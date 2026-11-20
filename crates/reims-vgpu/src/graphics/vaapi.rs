@@ -50,13 +50,11 @@
 //!      CoreVideo's planes, 32 bytes into their pages, are written so by no driver: radeonsi
 //!      imports planes 256 bytes apart alone, iHD writes a plane only at its dma-buf's first byte
 //!      (`docs/video/bugs.md`, U26).
-//!   2. **By the runtime device's GPU** (`gpu_copy`): the decode surface exported as dma-bufs (on
-//!      Windows, the shared Direct3D 12 texture it is) and each plane copied into the plane's
-//!      buffer, the guest's pages or the surface's device cache, at its own rows and offset, the
-//!      crop alone as the CPU's copy writes it ([`crop_extent`]). It is taken wherever the open
-//!      made a copier on the runtime device ([`open_on`]), the device imports the driver's
-//!      surfaces as images, and the planes' buffer is their memory. The rt platform's copier on
-//!      Windows declines each picture, counted, so that each lands by the CPU (`rt_windows`).
+//!   2. **By the device's GPU** ([`GpuCopies`]): each plane copied into the plane's buffer, the
+//!      guest's pages or the surface's device cache, at its own rows and offset, the crop alone as
+//!      the CPU's copy writes it, where the open made a copier. On Linux the open
+//!      makes none; on Windows the rt platform's copier declines each picture, counted, so that
+//!      each lands by the CPU (`rt_windows`).
 //!   3. **By the CPU**: the frame read back (staged, or `vaGetImage`, the VA crate's way back),
 //!      and copied into the planes' host bytes, or into the session's staging for a plane in a
 //!      device cache.
@@ -125,8 +123,6 @@ use super::decode::{
     GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput, PlanePages,
 };
 use reims_vgpu_video::paravirt::{Encoder, EncoderConfig};
-use reims_vgpu_vulkan::VulkanPlatform;
-use reims_vgpu_vulkan::gpu::device::VulkanDevice;
 
 use super::video_host::{
     BackendError, DecodeOutput, HostDecoder, HostEncodeSession, HostPicture, HostPlane,
@@ -134,8 +130,7 @@ use super::video_host::{
 };
 
 mod encode;
-mod gpu_copy;
-#[cfg(all(feature = "rt", windows))]
+#[cfg(windows)]
 mod rt_windows;
 
 /// The backend's name in the session's log lines.
@@ -165,37 +160,16 @@ pub(crate) struct PlatformRules {
     /// Whether a picture a later one predicts from may be decoded into its device cache.
     pub(crate) references: CachedReferences,
     /// Whether the arm answers the driver's encoders: where the platform reads their sources for
-    /// them as the Vulkan platform does (`encode`'s module doc).
+    /// them (`encode`'s module doc).
     pub(crate) encodes: bool,
-}
-
-impl PlatformRules {
-    /// The Vulkan platform's: every picture may be decoded into its cache, and the driver's
-    /// encoders are answered.
-    pub(crate) const VULKAN: PlatformRules = PlatformRules {
-        references: CachedReferences::InCaches,
-        encodes: true,
-    };
 }
 
 /// Whether a reference picture is decoded into its output's device cache (module doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CachedReferences {
-    /// Every picture, a reference too: the platform's exported memory stays the driver's to read
-    /// after its acquire, and the driver's check keeps a driver that would read a reference from
-    /// its target from decoding into one at all (the VA crate's `TargetChecks`).
-    InCaches,
     /// Only a picture no later picture predicts from: the platform's exported memory is not the
     /// driver's to touch between its acquire and the driver's next write of a whole picture
     /// (the rt platform's `rt_platform::export`, "The acquire").
-    #[cfg_attr(
-        not(feature = "rt"),
-        allow(
-            dead_code,
-            reason = "the rt platform's arm alone keeps references apart ([`open_on_rt`]), and \
-                      the tests"
-        )
-    )]
     Apart,
 }
 
@@ -239,37 +213,12 @@ impl std::fmt::Display for DisplayAt<'_> {
     }
 }
 
-/// The VA-API video of the runtime device `device`: on the render node of its GPU
-/// (`host_gpus::render_node_of`), as [`open`] opens it; `None`, logged, where its GPU has none.
-#[cfg(unix)]
-pub(crate) fn open_on(
-    device: &VulkanDevice,
-    runtime: Arc<dyn Runtime>,
-) -> Option<Arc<dyn GraphicsVideo<VulkanPlatform>>> {
-    let Some(node) = reims_vgpu_vulkan::host_gpus::render_node_of(&device.raw) else {
-        log::info!("hardware video: no VA-API: the device's GPU has no render node");
-        return None;
-    };
-    let copies: Arc<dyn GpuCopies<VulkanPlatform>> = Arc::new(gpu_copy::RuntimeCopies::new(device));
-    let checks = reims_vgpu_vulkan::platform::cache_directory()
-        .map(|dir| dir.join("device-checks").join("va-targets"));
-    open::<VulkanPlatform>(
-        device,
-        device.registry_id,
-        DisplayAt::Node(&node),
-        runtime,
-        Some(copies),
-        checks,
-        PlatformRules::VULKAN,
-    )
-}
-
 /// The VA-API video of the rt platform's `device`, on its GPU's render node
 /// (`host_gpus::render_node_at`), as [`open`] opens it; `None`, logged, where its GPU has none.
 /// Its pictures land by the driver's video processing or the CPU's copy, as no GPU copier is
 /// given; a reference picture is not decoded into its cache ([`CachedReferences::Apart`]), and no
 /// encoder is answered: the platform does not yet release an encoder's sources to the driver.
-#[cfg(all(feature = "rt", unix))]
+#[cfg(unix)]
 pub(crate) fn open_on_rt(
     device: &RtDevice,
     runtime: Arc<dyn Runtime>,
@@ -279,7 +228,7 @@ pub(crate) fn open_on_rt(
         log::info!("hardware video: no VA-API: the device's GPU has no render node");
         return None;
     };
-    let checks = reims_vgpu_vulkan::platform::cache_directory()
+    let checks = reims_vgpu_vulkan::os::cache_directory()
         .map(|dir| dir.join("device-checks").join("va-targets"));
     let rules = PlatformRules {
         references: CachedReferences::Apart,
@@ -301,7 +250,7 @@ pub(crate) fn open_on_rt(
 /// [`open`] opens it; `None`, logged, where its GPU names none. Its pictures land by the CPU's
 /// copy, at the GPU's copy's refusal of each, counted (`rt_windows`); a reference picture is not
 /// decoded into its cache ([`CachedReferences::Apart`]), and no encoder is answered, as on Linux.
-#[cfg(all(feature = "rt", windows))]
+#[cfg(windows)]
 pub(crate) fn open_on_rt(
     device: &RtDevice,
     runtime: Arc<dyn Runtime>,
@@ -328,34 +277,7 @@ pub(crate) fn open_on_rt(
 }
 
 /// The rt platform's device.
-#[cfg(feature = "rt")]
 type RtDevice = reims_vgpu_vulkan::rt_platform::RtObj<reims_vgpu_vulkan::rt_platform::RtDevice>;
-
-/// The VA-API video of the runtime device `device` on Windows: on the DXGI adapter of its GPU, by
-/// the LUID Vulkan answers for it (`host_gpus::adapter_luid_of`), over Mesa's VA-on-D3D12 driver;
-/// `None`, logged, where its GPU names none. Its pictures land by the runtime device's GPU, from
-/// the shared texture each decodes into (`gpu_copy`), else by the CPU's copy: Windows makes no
-/// dma-buf, so there is no write in place and no decode into a cache.
-#[cfg(windows)]
-pub(crate) fn open_on(
-    device: &VulkanDevice,
-    runtime: Arc<dyn Runtime>,
-) -> Option<Arc<dyn GraphicsVideo<VulkanPlatform>>> {
-    let Some(luid) = reims_vgpu_vulkan::host_gpus::adapter_luid_of(&device.raw) else {
-        log::info!("hardware video: no VA-API: the device's GPU names no DXGI adapter");
-        return None;
-    };
-    let copies: Arc<dyn GpuCopies<VulkanPlatform>> = Arc::new(gpu_copy::RuntimeCopies::new(device));
-    open::<VulkanPlatform>(
-        device,
-        device.registry_id,
-        DisplayAt::Adapter(luid, std::marker::PhantomData),
-        runtime,
-        Some(copies),
-        None,
-        PlatformRules::VULKAN,
-    )
-}
 
 /// The VA-API video of `device`'s GPU, on its render node `at` (on Windows its adapter), its decoders' threads and waits
 /// on `runtime`, its pictures copied by the GPU through `copies` where given, the driver's check
@@ -831,7 +753,6 @@ impl<P: Platform> CacheTargets<P> {
             return declined(&format!("the driver's check: {}", checks.summary()));
         }
         let which = match references {
-            CachedReferences::InCaches => "pictures are",
             CachedReferences::Apart => "pictures no later picture predicts from are",
         };
         log::info!(
@@ -1092,7 +1013,6 @@ impl RoleCounts {
     fn count(&self, role: PictureRole, references: CachedReferences) -> bool {
         let (counter, taken) = match (role, references) {
             (PictureRole::NonReference, _) => (&self.non_references, true),
-            (PictureRole::Reference, CachedReferences::InCaches) => (&self.references, true),
             (PictureRole::Reference, CachedReferences::Apart) => {
                 self.kept_apart.fetch_add(1, Ordering::Relaxed);
                 (&self.references, false)
@@ -1595,7 +1515,7 @@ pub(crate) trait GpuFiller<P: Platform>: Send {
 /// One session's GPU copies of its pictures into their outputs.
 pub(crate) trait GpuCopier<P: Platform>: Send {
     /// Writes `frame` into `luma` and `chroma` where they lie, its crop as the CPU's copy writes
-    /// it (`crop_extent`), once its decode is done, and returns once the GPU wrote it;
+    /// it, once its decode is done, and returns once the GPU wrote it;
     /// [`DeviceWrite::Declined`] with why, nothing written, where it cannot. `Err` where the
     /// decode failed, or the copy failed once on the GPU, which may write the planes still.
     fn copy(
@@ -1606,47 +1526,21 @@ pub(crate) trait GpuCopier<P: Platform>: Send {
     ) -> Result<DeviceWrite, BackendError>;
 }
 
-/// What one output plane holds of a picture, as the CPU's copy fits a picture to it: the bytes of
-/// its rows, the bytes from one row to the next, and its rows.
+/// What one output plane holds of a picture: the bytes from one row to the next.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Room {
-    pub(crate) row_bytes: u64,
     pub(crate) bytes_per_row: u64,
-    pub(crate) rows: u64,
 }
 
+#[cfg(unix)]
 impl Room {
-    /// What `plane` holds: its row's bytes and pitch, and its crop's rows.
+    /// What `plane` holds: its rows' pitch.
     pub(crate) fn of<P: Platform>(plane: &OutputPlane<P>) -> Room {
         Room {
-            row_bytes: plane.row_bytes,
             bytes_per_row: plane.bytes_per_row,
-            rows: plane.height,
         }
     }
-}
-
-/// The columns and rows of a picture of `size`, of `sample`-byte samples, that the CPU's copy
-/// writes into planes of `luma` and `chroma` room (the VA crate's `ReadBack::copy_into`): as many
-/// as the picture, each plane's rows and its rows' bytes hold, the chroma plane's columns in whole
-/// pairs; `None` for none. The chroma plane takes half of each, rounded up, from half the crop's
-/// origin.
-pub(crate) fn crop_extent(
-    size: (u32, u32),
-    sample: u64,
-    luma: Room,
-    chroma: Room,
-) -> Option<(u32, u32)> {
-    let fit = |bytes: u64| u32::try_from(bytes / sample.max(1)).unwrap_or(u32::MAX);
-    let rows = |rows: u64| u32::try_from(rows).unwrap_or(u32::MAX);
-    let chroma_columns = fit(chroma.row_bytes.min(chroma.bytes_per_row)) & !1;
-    let width = (size.0)
-        .min(fit(luma.row_bytes.min(luma.bytes_per_row)))
-        .min(chroma_columns.max(1));
-    let height = (size.1)
-        .min(rows(luma.rows))
-        .min(rows(chroma.rows).saturating_mul(2));
-    (width > 0 && height > 0).then_some((width, height))
 }
 
 /// The layout of a frame of `bit_depth` written in place in the planes `luma` and `chroma`, and
@@ -1756,8 +1650,6 @@ fn in_place_layout(luma: Place, chroma: Place, bit_depth: u32) -> Result<Surface
     })
 }
 
-#[cfg(test)]
-mod both_ways;
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;

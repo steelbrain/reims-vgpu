@@ -7,19 +7,18 @@
 //!   host VM over `mmap` that makes views of the guest's pages by mapping their files (the backing
 //!   table).
 //!
-//! Either way the platform's VM reports the pages it changes to the runtime
-//! ([`crate::remap::VulkanVm`]), and a display's window presents through a swapchain over the
-//! window system's Vulkan extensions (`wsi.rs`), each OS naming its own surface extensions and
-//! its loader, and fetching an image's drawable ahead where the driver needs it
-//! (`Drawables`: MoltenVK's, on macOS). The user's cache directory, where the library keeps what
-//! later processes reuse, is each OS's own too ([`user_cache_directory`]).
+//! - **Windows** (`os/windows.rs`): the clocks, threads, and a host VM over views of
+//!   pagefile-backed sections, whose views of the guest's pages map the sections the backing
+//!   table names.
+//!
+//! A display's window presents through a swapchain over the window system's Vulkan extensions
+//! (`wsi.rs`), each OS naming its own surface extensions. The user's cache directory, where the
+//! library keeps what later processes reuse, is each OS's own too ([`user_cache_directory`]).
 
 #[cfg(any(target_os = "linux", windows))]
 mod files;
 #[cfg(unix)]
 mod home;
-#[cfg(any(target_os = "linux", windows))]
-mod host_ram;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -43,39 +42,11 @@ use home::cache_directory as host_cache_directory;
 #[cfg(windows)]
 use host_os::cache_directory as host_cache_directory;
 
-use crate::core::platform::os::vm::{HostAddr, HostVm as _};
-
-/// The device extension the video's copies take, on Windows (`os/windows/plane_copy.rs`).
-#[cfg(windows)]
-pub(crate) use host_os::add_video_extensions;
-/// Learns whether a device imports views of guest pages mapped through dma-bufs, on Linux
-/// (`os/linux/import.rs`).
-#[cfg(target_os = "linux")]
-pub(crate) use host_os::learn_view_imports;
-/// Takes the imports of the guest RAM's regions the devices keep, on Linux
-/// (`os/linux/dma_buf.rs`), for the platform's let-go of its devices ([`crate::let_go`]).
-#[cfg(target_os = "linux")]
-pub(crate) use host_os::take_region_keeps;
-/// The calling thread's user-space instructions and cycles, which cost tests count in, on Linux
-/// (`os/linux/thread_counts.rs`).
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) use host_os::thread_counts;
-pub(crate) use host_os::{
-    COPIES_READ_ONLY, Drawables, ImportMade, allocate_aliasable, dma_buf_refusal, host_memory,
-    host_memory_vouched, import_heap_view, import_view,
-};
-/// Copies by the GPU of planes another driver wrote into dma-bufs into a runtime buffer, and of a
-/// runtime buffer's planes into dma-bufs another driver reads, on Linux
-/// (`os/linux/plane_copy.rs`).
-#[cfg(target_os = "linux")]
-pub use host_os::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFill, PlaneFormat};
-/// Copies by the GPU of the planes another driver wrote into a shared Direct3D 12 texture into a
-/// runtime buffer, on Windows (`os/windows/plane_copy.rs`).
-#[cfg(windows)]
-pub use host_os::{CopyError, PlaneCopier, PlaneCopy, SharedPlanes, TextureFormat};
+#[cfg(test)]
+pub(crate) use host_os::allocate_aliasable;
 pub use host_os::{
-    GuestMemoryLease, OsClock, OsThreads, OsVm, RegionMemory, default_driver_sizes,
-    default_gpu_core_count, default_registry_id, install_process_services, lease_guest_memory,
+    GuestMemoryLease, OsClock, OsThreads, OsVm, default_driver_sizes, default_registry_id,
+    install_process_services, lease_guest_memory,
 };
 /// Dma-bufs of host memory lent to a device outside the runtime, and that memory mapped from its
 /// files for one that pins a pointer's pages, on Linux (`os/linux/device_lend.rs`).
@@ -86,68 +57,39 @@ pub use host_os::{LendRefusal, LentDmaBuf, dma_buf_of_host, map_for_pointer};
 /// pages as they are mapped while rt may take them by it, and dma-bufs of a range's pages cut for
 /// rt to bind behind one buffer where one dma-buf does not hold them, on Linux
 /// (`os/linux/device_lend.rs`).
-#[cfg(all(target_os = "linux", feature = "rt"))]
+#[cfg(target_os = "linux")]
 pub(crate) use host_os::{MappingsHeld, dma_bufs_of_host, hold_mappings, through_dma_bufs};
 #[cfg(test)]
 pub(crate) use host_os::{PAGE, mapped, writable};
 /// Whether views are mapped from their files for the imports of their pages, and whether those
 /// more than one dma-buf holds are, on Linux (`os/linux/import.rs`).
-#[cfg(all(test, target_os = "linux", feature = "rt"))]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) use host_os::{imports_need_files, several_dma_bufs_refused};
 /// The settings, from the rt platform's device as it is made and at rt's first refusal of a
 /// view's one dma-buf, of views mapped from their files for the imports of their pages, on Linux
 /// (`os/linux/import.rs`).
-#[cfg(all(target_os = "linux", feature = "rt"))]
-pub(crate) use host_os::{learn_dma_buf_granule, views_need_files};
-/// Whether one dma-buf takes the pages of a range, as the runtime asks for a texture's own, of a
-/// list of ranges, before a view of them is made, or of pieces of pages not made yet, on Linux
-/// (`os/linux/dma_buf.rs`).
 #[cfg(target_os = "linux")]
-pub(crate) use host_os::{one_dma_buf_fits, one_dma_buf_of_fits, one_dma_buf_of_pieces_fits};
-/// Hands a device the guest's RAM as it is adopted, on Windows (`os/host_ram.rs`); on Linux the
-/// learning of its imports of views hands it (`learn_view_imports`).
-#[cfg(windows)]
-pub(crate) use host_ram::hand_ram_to;
-/// Takes the devices handed the guest's RAM, on Linux and Windows (`os/host_ram.rs`), for the
-/// platform's let-go of its devices ([`crate::let_go`]).
-#[cfg(any(target_os = "linux", windows))]
-pub(crate) use host_ram::take_devices as take_ram_devices;
-/// The guest's RAM a device copies by runs of it, on Linux and Windows (`os/host_ram.rs`).
-#[cfg(any(target_os = "linux", windows))]
-pub(crate) use host_ram::{
-    copies as copies_guest_ram, copy_from_host_ram, copy_runs_from_host_ram, copy_to_host_ram,
-    ram_over,
-};
+pub(crate) use host_os::{learn_dma_buf_granule, views_need_files};
 /// The Objective-C message layer the window's AppKit side sends through, on macOS
 /// (`os/macos/msg.rs`).
 #[cfg(target_os = "macos")]
 pub use macos::msg;
-/// Runs a test's calls with their imports refused, so the runtime copies the pages, on macOS
-/// (`os/macos.rs`).
-#[cfg(all(test, target_os = "macos"))]
-pub(crate) use macos::refusing_imports;
 /// What the library's choice of device reads of one physical device, from an instance of the
 /// caller's (the rt platform's, `crate::rt_platform`).
-#[cfg(feature = "rt")]
 pub(crate) use wsi::seen;
-/// Every physical device the host's loader lists, as the window's probe read it, which the
-/// library's choice of device reads (`crate::device_choice`).
-pub(crate) use wsi::seen_devices;
-pub use wsi::{add_window_extensions, present_fences};
 /// The window system's extensions of the rt platform's instance and device
 /// (`crate::rt_platform::device`).
-#[cfg(feature = "rt")]
 pub(crate) use wsi::{rt_instance_extensions, rt_present_fences};
 
 /// The rt platform's instance with `extensions`: on macOS with the Vulkan driver the platform
 /// runs there, Mesa's KosmicKrisp, which the process loads (`os/macos/rt_driver.rs`); elsewhere
 /// rt's `Instance::new`, over the drivers the host's loader finds.
-#[cfg(all(feature = "rt", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub(crate) use macos::rt_instance;
 /// The rt platform's instance with `extensions`: on macOS with the Vulkan driver the platform
 /// runs there, Mesa's KosmicKrisp, which the process loads (`os/macos/rt_driver.rs`); elsewhere
 /// rt's `Instance::new`, over the drivers the host's loader finds.
-#[cfg(all(feature = "rt", not(target_os = "macos")))]
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn rt_instance(
     extensions: &[&std::ffi::CStr],
 ) -> Result<metal2vulkan_rt::Instance, metal2vulkan_rt::Error> {
@@ -155,9 +97,8 @@ pub(crate) fn rt_instance(
 }
 
 /// The user's cache directory, where the library keeps for the host's later processes what they
-/// would otherwise work out again: the shader cache and its device checks
-/// (`crate::platform::cache_directory`), the pipeline records (`crate::records`) and the
-/// reims-graphics device's kept answers, each in a directory of its own in it. `.cache` under
+/// would otherwise work out again: the shader cache and its device checks ([`cache_directory`])
+/// and the reims-graphics device's kept answers, each in a directory of its own in it. `.cache` under
 /// `HOME` on Linux and macOS (`os/home.rs`), and none where `HOME` is not set; on Windows
 /// `reims-vgpu` in the user's local application data folder (`os/windows/app_data.rs`), which a
 /// process has whatever its environment, as a QEMU started outside MSYS2's shell has no `HOME`.
@@ -169,6 +110,25 @@ pub fn user_cache_directory() -> Option<PathBuf> {
     }
     host_cache_directory()
 }
+
+/// The library's cache directory, [`CACHE`] in the user's cache directory
+/// ([`user_cache_directory`]): the device checks' `device-checks` (the host video's checks of its
+/// driver). `None` where the OS names no user cache directory (on Linux and macOS, where `HOME` is
+/// not set).
+pub fn cache_directory() -> Option<PathBuf> {
+    Some(user_cache_directory()?.join(CACHE))
+}
+
+/// The library's cache directory's name in the user's cache directory ([`cache_directory`]).
+#[cfg(not(any(test, feature = "testkit")))]
+const CACHE: &str = "reims-vgpu-vulkan";
+
+/// A test build's cache directory, the tests' own: this crate's unit tests', and every crate's
+/// tests', which turn on its `testkit` feature (only dev-dependencies do, `cargo xtask testkit`).
+/// The tests write nothing into the one the library's hosts share, nor read the device checks kept
+/// there.
+#[cfg(any(test, feature = "testkit"))]
+const CACHE: &str = "reims-vgpu-vulkan-tests";
 
 /// The variable that names a test build's user cache directory ([`user_cache_directory`]), for a
 /// test's child process that starts with nothing kept, as a user's first boot does: on Windows the
@@ -202,95 +162,15 @@ pub struct GuestRamFile {
     pub offset: u64,
 }
 
-/// Pages of the library's own, private and zero-filled: the OS VM's allocation anywhere (Mach's on
-/// macOS, an anonymous mapping on Linux), which commits a page only when something first touches
-/// it, and which Metal and MoltenVK import in place, as RADV and ANV import it by its pointer.
-/// Its drop deallocates the pages through the platform's VM ([`crate::remap::VulkanVm`]), so the
-/// unmap waits until the runtime has freed every import of them ([`crate::remap::UnmapHold`]):
-/// the runtime runs a no-copy buffer's deallocator at Metal's moment and frees the buffer's import
-/// after it, and the deallocator may drop the memory's last holder, as a graphics device's region
-/// goes with the last reference its sink's deallocators hold.
-#[derive(Debug)]
-pub struct PrivateMemory {
-    /// The first byte.
-    first: HostAddr,
-    /// The length in bytes, whole pages.
-    length: u64,
-}
-
-impl PrivateMemory {
-    /// `len` bytes of zeros, rounded up to whole pages; `None` for none, or where the host gives
-    /// no address space.
-    pub fn new(len: u64) -> Option<PrivateMemory> {
-        let vm = OsVm::new();
-        let length = len.checked_next_multiple_of(vm.page_size())?;
-        if length == 0 {
-            return None;
-        }
-        let first = vm.allocate_anywhere(length).ok()?;
-        Some(PrivateMemory { first, length })
-    }
-
-    /// Its first byte.
-    pub fn base(&self) -> *mut u8 {
-        self.first.as_ptr()
-    }
-}
-
-impl Drop for PrivateMemory {
-    /// Deallocates the pages through the platform's VM, which leaves those an import holds mapped
-    /// until its hold goes.
-    fn drop(&mut self) {
-        let _ = crate::remap::VulkanVm::new().deallocate(self.first, self.length);
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::core::platform::os::vm::HostVm as _;
 
     /// The tests' page is the host's
     #[test]
     fn the_tests_page_is_the_hosts() {
         assert_eq!(OsVm::new().page_size(), PAGE);
-    }
-
-    /// Private memory whose pages a device's import holds stays mapped past its drop, until the
-    /// import's hold goes, as a graphics device's region does whose last reference goes in a
-    /// no-copy buffer's deallocator, before the runtime frees the buffer's import
-    #[test]
-    fn private_memory_an_import_holds_is_unmapped_once_its_hold_goes() {
-        let memory = PrivateMemory::new(2 * PAGE).unwrap();
-        let at = HostAddr::from_ptr(memory.base());
-        let held = at.wrapping_add(PAGE);
-        let hold = crate::remap::UnmapHold::new(
-            std::ptr::NonNull::new(held.as_ptr::<u8>()).unwrap(),
-            PAGE,
-        );
-        // SAFETY: a byte of the memory's second page, mapped read and write.
-        unsafe { held.as_ptr::<u8>().write_volatile(0x5a) };
-        drop(memory);
-        assert!(crate::remap::unmap_waits(at, 2 * PAGE), "the unmap waits");
-        // SAFETY: the held page stays mapped while the hold lives.
-        let byte = unsafe { held.as_ptr::<u8>().read_volatile() };
-        assert_eq!(byte, 0x5a, "the held page stays mapped");
-        drop(hold);
-        assert!(!crate::remap::unmap_waits(at, 2 * PAGE), "unmapped");
-    }
-
-    /// Private memory is whole pages of zeros, and none for no bytes
-    #[test]
-    fn private_memory_is_whole_pages_of_zeros() {
-        use crate::core::num::{ToU64 as _, ToUsize as _};
-
-        assert!(PrivateMemory::new(0).is_none());
-        let memory = PrivateMemory::new(PAGE + 1).unwrap();
-        assert_eq!(memory.length, 2 * PAGE);
-        let at = HostAddr::from_ptr(memory.base());
-        assert_eq!(at.addr().to_u64() % PAGE, 0, "page-aligned");
-        // SAFETY: the memory's two pages, mapped read and write.
-        let bytes = unsafe { std::slice::from_raw_parts(memory.base(), (2 * PAGE).to_usize()) };
-        assert!(bytes.iter().all(|&b| b == 0));
     }
 
     /// Each call takes whole pages as Mach's does, which this checks on macOS (measured on the M3
