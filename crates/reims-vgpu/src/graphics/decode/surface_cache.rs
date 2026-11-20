@@ -315,10 +315,15 @@
 //!   buffer, the lock let go of once for them ([`Caches::before_answering`]), or by the present's
 //!   for its fill ([`Caches::fill_now`]), or by ring 0 for a download's copy out, which the guest
 //!   waits for ([`Caches::download`]); a release's on the releases' pace's thread ([`ReleasePace`])
-//!   before the release is carried out, so ring 0 waits for no make either. The copy takes them
-//!   first, and the spares take back on their thread what it leaves. Any other copy that finds no
-//!   spare still makes its piece on its own thread, under the caches' lock, counted
-//!   (`rt-staging-piece-makes-locked`).
+//!   before the release is carried out, so ring 0 waits for no make either. So are those of the
+//!   copies a command buffer's finish makes (the copies deferred behind it), by the thread that
+//!   finishes it, and those of a first fill a begin, a buffer or a decode reaches, of a block named
+//!   again, of a cache's refills after a recovery of the device, each by the thread that asks
+//!   it ([`reserve_ahead`]). The copy takes them first; what it leaves is the next copy's of the
+//!   block under the same hold of the lock ([`SurfaceCaches::left_over`]), and the spares take
+//!   back on their thread what is left as the lock is let go of. A copy that still finds no spare
+//!   (another copy took the spares meanwhile) makes its piece on its own thread, under the caches'
+//!   lock, counted (`rt-staging-piece-makes-locked`).
 //!   Each piece taken is counted (`rt-staging-pieces`, and
 //!   `rt-staging-pieces-spared` those a spare served), and each a copy made, with the
 //!   nanoseconds its make took in all and the longest, for a cache's first staged copy
@@ -1966,6 +1971,11 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// module doc, "Staged copies"): the copy takes them before the spares, and gives back what it
     /// leaves ([`Spares::pieces_from`]).
     reserved: HashMap<u64, Vec<P::Buffer>>,
+    /// The pieces a staged copy took from those reserved for its block and left
+    /// ([`Spares::pieces_from`]), by block: the next copy of the block under the same hold of the
+    /// lock takes them first, as named again its copy out and its fill; the rest go back to the
+    /// spares as the lock is let go of ([`Locked`]).
+    left_over: HashMap<u64, Vec<P::Buffer>>,
     /// The threads that move a staged download's bytes into its pages and land it
     /// ([`INTO_PAGES_THREADS`]), a block's in the order their command buffers completed.
     lands_out: Arc<Worker>,
@@ -2185,6 +2195,7 @@ impl<P: Platform> SurfaceCaches<P> {
             staged: None,
             spares: Arc::new(Spares::new(SPARE_BYTES, PIECE, Arc::default())),
             reserved: HashMap::new(),
+            left_over: HashMap::new(),
             lands_out: Arc::new(Worker::new(INTO_PAGES_THREADS)),
         }
     }
@@ -2237,11 +2248,7 @@ impl<P: Platform> SurfaceCaches<P> {
             cache.users.clear();
             video += 1;
         }
-        let blocks: Vec<(u64, u64)> = (self.by_block.iter())
-            .filter(|(_, c)| c.life.is_none())
-            .filter(|(_, c)| c.pages.is_some() && c.first_fill.is_none() && !c.zeros)
-            .map(|(&block, c)| (block, c.generation.unwrap_or(0)))
-            .collect();
+        let blocks = self.refilled();
         let signal_with = self.signal_with.take();
         let mut refused = 0usize;
         for &(block, generation) in &blocks {
@@ -2269,6 +2276,27 @@ impl<P: Platform> SurfaceCaches<P> {
                 self.by_block.len() - blocks.len() - video
             );
         }
+    }
+
+    /// The caches a recovery of the device fills again from their pages
+    /// ([`Self::after_recovery`]), each by block, with the generation it is filled as of.
+    fn refilled(&self) -> Vec<(u64, u64)> {
+        (self.by_block.iter())
+            .filter(|(_, c)| c.life.is_none())
+            .filter(|(_, c)| c.pages.is_some() && c.first_fill.is_none() && !c.zeros)
+            .map(|(&block, c)| (block, c.generation.unwrap_or(0)))
+            .collect()
+    }
+
+    /// The staged fills a recovery of `device` not yet seen would make ([`Self::after_recovery`]),
+    /// by block and way; none where none is.
+    fn refills(&self, device: &P::Device) -> Vec<(u64, Way)> {
+        if self.recoveries == device.recoveries() {
+            return Vec::new();
+        }
+        (self.refilled().into_iter())
+            .map(|(block, _)| (block, Way::In))
+            .collect()
     }
 
     /// What the caches did so far.
@@ -2469,19 +2497,35 @@ impl<P: Platform> SurfaceCaches<P> {
         cb: &P::CommandBuffer,
         context: Option<u32>,
     ) -> RaiseResult<bool> {
-        if self.owed.is_empty() {
-            return Ok(false);
-        }
-        let reached: Vec<u64> = (self.owed.iter())
-            .copied()
-            .filter(|block| (self.by_block.get(block)).is_some_and(|c| c.owner == Some(context)))
-            .collect();
         let mut waits = false;
-        for block in reached {
+        for block in self.reached(context) {
             self.fill_owed(device, block)?;
             waits |= self.wait_last_fill(cb, block)?;
         }
         Ok(waits)
+    }
+
+    /// The blocks whose first fills owed [`Self::fill_reached`] makes for a command buffer of
+    /// `context`'s.
+    fn reached(&self, context: Option<u32>) -> Vec<u64> {
+        (self.owed.iter())
+            .copied()
+            .filter(|block| (self.by_block.get(block)).is_some_and(|c| c.owner == Some(context)))
+            .collect()
+    }
+
+    /// Whether [`Self::buffer_made`] of a buffer over the block at `block` made in `context` makes
+    /// the first fill its cache owes now.
+    fn buffer_made_fills(&self, block: u64, context: Option<u32>) -> bool {
+        (self.by_block.get(&block)).is_some_and(|cache| {
+            cache.first_fill.is_some() && cache.owner.is_some_and(|owner| owner != context)
+        })
+    }
+
+    /// Whether [`Self::decoded`] of the block at `block`'s surface, `picture` answered or not,
+    /// makes the first fill its cache took as met.
+    fn decoded_fills(&self, block: u64, picture: bool) -> bool {
+        !picture && (self.by_block.get(&block)).is_some_and(|cache| cache.zeros)
     }
 
     /// A buffer over the block at `block` made in `context` (`BUFFER_OVER_SURFACE_PAGES`), its
@@ -4397,6 +4441,7 @@ impl<P: Platform> SurfaceCaches<P> {
         wait_for_users::<P>(&cb, &self.ends, cache)?;
         let timed = self.staged.as_ref();
         let mut reserve = self.reserved.remove(&block).unwrap_or_default();
+        reserve.extend(self.left_over.remove(&block).unwrap_or_default());
         let staged = copy::<P>(
             device,
             &cb,
@@ -4405,7 +4450,9 @@ impl<P: Platform> SurfaceCaches<P> {
             &mut self.counts,
             (timed, &self.spares, &mut reserve),
         );
-        self.spares.give_later(reserve);
+        if !reserve.is_empty() {
+            self.left_over.insert(block, reserve);
+        }
         let staged = staged?;
         if let Some(staged) = staged {
             cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| staged.done()))?;
@@ -4732,6 +4779,14 @@ impl<P: Platform> SurfaceCaches<P> {
     /// `None` where its copies that way are not staged, or it would make none. A copy out that
     /// moves fewer bytes (the record narrows it) lays them in no more pieces, none longer.
     fn lacking(&self, block: u64, way: Way) -> Option<(Vec<u64>, bool)> {
+        let (_, lacking, first) = self.lacking_for(&[(block, way)]).pop()?;
+        Some((lacking, first))
+    }
+
+    /// The lengths of the pieces a staged copy `way` of the block at `block`'s cache lays all of
+    /// the bytes it may move in, and whether it is the cache's first staged copy; `None` where its
+    /// copies that way are not staged.
+    fn staged_lens(&self, block: u64, way: Way) -> Option<(Vec<u64>, bool)> {
         let cache = self.by_block.get(&block)?;
         self.staged.as_ref()?;
         let lens = match (&cache.pages, way, &cache.carried) {
@@ -4744,9 +4799,78 @@ impl<P: Platform> SurfaceCaches<P> {
             }
             _ => return None,
         };
-        let reserved = self.reserved.get(&block).map_or(&[][..], Vec::as_slice);
-        let lacking = self.spares.lacking(&lens, reserved);
-        (!lacking.is_empty()).then_some((lacking, !cache.staged))
+        Some((lens, !cache.staged))
+    }
+
+    /// [`Self::lacking`] of each staged copy of `wants`, by block and way, by block: the copies of
+    /// one block taken together, as each takes what the one before it left of the pieces reserved
+    /// for it ([`Self::left_over`]). None for a block whose copies would make none.
+    fn lacking_for(&self, wants: &[(u64, Way)]) -> Vec<(u64, Vec<u64>, bool)> {
+        let mut by_block: Vec<(u64, Vec<u64>, bool)> = Vec::new();
+        for &(block, way) in wants {
+            let Some((lens, first)) = self.staged_lens(block, way) else {
+                continue;
+            };
+            match by_block.iter_mut().find(|(b, _, _)| *b == block) {
+                Some((_, all, _)) => all.extend(lens),
+                None => by_block.push((block, lens, first)),
+            }
+        }
+        (by_block.into_iter())
+            .filter_map(|(block, lens, first)| {
+                let reserved = self.reserved.get(&block).map_or(&[][..], Vec::as_slice);
+                let lacking = self.spares.lacking(&lens, reserved);
+                (!lacking.is_empty()).then_some((block, lacking, first))
+            })
+            .collect()
+    }
+
+    /// The staged copies the finish of a command buffer whose counts are `counts` may make: those
+    /// deferred of their blocks' caches ([`Self::run_deferred`]), by block and way. A fill of the
+    /// shapes alone stages nothing, nor does a copy out of a cache that would copy nothing
+    /// ([`Self::release_may_copy`]).
+    fn deferred_ways(&self, counts: &[Count]) -> Vec<(u64, Way)> {
+        let mut ways = Vec::new();
+        let mut seen = HashSet::new();
+        for c in counts.iter().filter(|c| seen.insert(c.block)) {
+            for deferred in self.deferred.get(&c.block).into_iter().flatten() {
+                match &deferred.copy {
+                    Asked::Fill { shapes: false, .. } => ways.push((c.block, Way::In)),
+                    Asked::Fill { shapes: true, .. } => {}
+                    Asked::Out(_) => {
+                        if self.release_may_copy(c.block, false) {
+                            ways.push((c.block, Way::Out));
+                        }
+                    }
+                }
+            }
+        }
+        ways
+    }
+
+    /// The device the first copy deferred of one of the blocks of `counts` is made on, where one
+    /// is ([`Self::deferred_ways`]).
+    fn deferred_device(&self, counts: &[Count]) -> Option<P::Device> {
+        (counts.iter())
+            .find_map(|c| self.deferred.get(&c.block).and_then(VecDeque::front))
+            .map(|deferred| deferred.device.clone_ref())
+    }
+
+    /// The staged copies [`Caches::make`] of the block at `block`, of a cache of `length` bytes
+    /// over `host_pages`, may make under the lock, by block and way: a copy out of the cache it has
+    /// ([`Self::release_may_copy`]), and its fill where it keeps it ([`Self::named_again`]).
+    fn remade_ways(&self, block: u64, length: u64, host_pages: &[Range<u64>]) -> Vec<(u64, Way)> {
+        if !self.by_block.contains_key(&block) {
+            return Vec::new();
+        }
+        let mut ways = Vec::new();
+        if self.release_may_copy(block, false) {
+            ways.push((block, Way::Out));
+        }
+        if self.keeps(block, length, host_pages) {
+            ways.push((block, Way::In));
+        }
+        ways
     }
 
     /// Whether a release of the block at `block` asked now may copy its cache into its pages
@@ -4867,6 +4991,7 @@ impl<P: Platform> SurfaceCaches<P> {
         cache.wrote_shapes(&back);
         let timed = self.staged.as_ref();
         let mut reserve = self.reserved.remove(&block).unwrap_or_default();
+        reserve.extend(self.left_over.remove(&block).unwrap_or_default());
         let staged = copy::<P>(
             device,
             &cb,
@@ -4875,7 +5000,9 @@ impl<P: Platform> SurfaceCaches<P> {
             &mut self.counts,
             (timed, &self.spares, &mut reserve),
         );
-        self.spares.give_later(reserve);
+        if !reserve.is_empty() {
+            self.left_over.insert(block, reserve);
+        }
         let staged = staged?;
         signal_after::<P>(&cb, signal.as_ref())?;
         // The buffers live until the copy is done, past the cache's own end at a release.
@@ -5547,6 +5674,12 @@ impl<P: Platform> Drop for Uses<P> {
         }
         let tell = {
             let mut state = self.caches.lock();
+            // As at a finish ([`Caches::finish`]): the pieces of the copies deferred behind the
+            // buffer are made with the lock let go of first.
+            if let Some(device) = state.deferred_device(&self.blocks) {
+                let deferred = state.deferred_ways(&self.blocks);
+                reserve_ahead(&mut state, &device, &deferred);
+            }
             state.unhold(&self.blocks);
             state.take_tell()
         };
@@ -5680,6 +5813,9 @@ impl<P: Platform> DerefMut for Locked<'_, P> {
 impl<P: Platform> Locked<'_, P> {
     /// Hands over the command buffers owed their commits under the lock; whether there were any.
     fn hand_over(&mut self) -> bool {
+        for (_, left) in std::mem::take(&mut self.left_over) {
+            self.spares.give_later(left);
+        }
         let owed = std::mem::take(&mut self.owed_commits);
         let any = !owed.is_empty();
         self.commits.owe(owed);
@@ -6073,7 +6209,7 @@ impl<P: Platform> Caches<P> {
         block: u64,
     ) -> RaiseResult<Option<(P::Buffer, bool)>> {
         let mut state = self.lock();
-        state.after_recovery(device);
+        recover(&mut state, device);
         let home = state.wide_home(device, block)?;
         if home.is_some() {
             self.homes.store(true, Ordering::Release);
@@ -6090,7 +6226,7 @@ impl<P: Platform> Caches<P> {
     /// it ends ([`SurfaceCaches::writes_fence`]).
     pub(crate) fn writes_fence(&self, device: &P::Device) -> RaiseResult<Option<P::Fence>> {
         let mut state = self.lock();
-        state.after_recovery(device);
+        recover(&mut state, device);
         state.writes_fence(device)
     }
 
@@ -6343,6 +6479,16 @@ impl<P: Platform> Caches<P> {
         uses: &[RgfxOpSurfaceUse],
         reach: &Reach,
     ) -> RaiseResult<(bool, Option<Uses<P>>)> {
+        // The pieces the first fills the buffer's work reaches, and a recovery's refills, would
+        // make for want of a spare are made with the lock let go of, and reserved for their
+        // blocks (the module doc, "Staged copies").
+        let reached: Vec<(u64, Way)> = match reach.work {
+            true => (state.reached(reach.context).into_iter())
+                .map(|block| (block, Way::In))
+                .collect(),
+            false => Vec::new(),
+        };
+        reserve_ahead(&mut state, device, &reached);
         state.after_recovery(device);
         let reached = match reach.work {
             true => state.fill_reached(device, cb, reach.context)?,
@@ -6533,6 +6679,11 @@ impl<P: Platform> Caches<P> {
         };
         let done = signalled.and_then(|()| commit());
         let mut state = self.lock();
+        // The pieces the copies its finish makes (those deferred behind it), and a recovery's
+        // refills, would make for want of a spare are made with the lock let go of, and reserved
+        // for their blocks (the module doc, "Staged copies").
+        let deferred = state.deferred_ways(&uses.blocks);
+        reserve_ahead(&mut state, device, &deferred);
         state.after_recovery(device);
         // The read-back queue runs its copies in order, so one behind a buffer that waits for a
         // deferred copy not yet made would hold every copy after it there, one of which that
@@ -6574,7 +6725,7 @@ impl<P: Platform> Caches<P> {
         generation: u64,
     ) -> RaiseResult<Option<FillWait>> {
         let mut state = self.lock();
-        state.after_recovery(device);
+        recover(&mut state, device);
         state.touch_shapes(block);
         if !state.needs_fill_at(block, generation) {
             return Ok(None);
@@ -6609,13 +6760,14 @@ impl<P: Platform> Caches<P> {
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
         let mut state = self.lock();
-        // The pieces a staged copy of its cache would make for want of a spare are made with the
-        // lock let go of, and reserved for the block (the module doc, "Staged copies").
-        if state.release_may_copy(block, false)
-            && let Some((lens, first)) = state.lacking(block, Way::Out)
-        {
-            reserve_unlocked(&mut state, device, vec![(block, lens, first)]);
-        }
+        // The pieces a staged copy of its cache, and a recovery's refills, would make for want of
+        // a spare are made with the lock let go of, and reserved for their blocks (the module
+        // doc, "Staged copies").
+        let wants = match state.release_may_copy(block, false) {
+            true => vec![(block, Way::Out)],
+            false => Vec::new(),
+        };
+        reserve_ahead(&mut state, device, &wants);
         let op = download_op(device, block, region, ran, trace, done, failed);
         state.after_writers(device, block, op);
         drop(state);
@@ -6791,6 +6943,13 @@ impl<P: Platform> Caches<P> {
     ) -> RaiseResult<Option<SurfaceCache<P>>> {
         let mut state = self.lock();
         self.wait_copies(&mut state, block);
+        let wants = match state.release_may_copy(block, false) {
+            true => vec![(block, Way::Out)],
+            false => Vec::new(),
+        };
+        if reserve_ahead(&mut state, device, &wants) {
+            self.wait_copies(&mut state, block);
+        }
         state.released(device, block, 0, None, None, done, None)
     }
 
@@ -6855,6 +7014,13 @@ impl<P: Platform> Caches<P> {
     ) -> RaiseResult<bool> {
         let mut state = self.lock();
         self.wait_copies(&mut state, block);
+        // The pieces its copies under the lock (out of the cache it has, and its fill where it
+        // keeps it), and a recovery's refills, would make for want of a spare are made with the
+        // lock let go of, and reserved for their blocks (the module doc, "Staged copies").
+        let remade = state.remade_ways(block, length, &host_pages);
+        if reserve_ahead(&mut state, device, &remade) {
+            self.wait_copies(&mut state, block);
+        }
         if state.keeps(block, length, &host_pages) {
             return state.named_again(device, block, generation);
         }
@@ -6874,6 +7040,10 @@ impl<P: Platform> Caches<P> {
         });
         let mut state = self.lock();
         self.wait_copies(&mut state, block);
+        let remade = state.remade_ways(block, length, &host_pages);
+        if reserve_ahead(&mut state, device, &remade) {
+            self.wait_copies(&mut state, block);
+        }
         let taken = state.make_with(
             device, block, length, host_pages, generation, layout, &mut made,
         );
@@ -6989,7 +7159,13 @@ impl<P: Platform> Caches<P> {
         block: u64,
         context: Option<u32>,
     ) -> RaiseResult<()> {
-        self.lock().buffer_made(device, block, context)
+        let mut state = self.lock();
+        // The pieces its fill would make for want of a spare are made with the lock let go of,
+        // and reserved for the block (the module doc, "Staged copies").
+        if state.buffer_made_fills(block, context) {
+            reserve_ahead(&mut state, device, &[(block, Way::In)]);
+        }
+        state.buffer_made(device, block, context)
     }
 
     /// A decode into the block at `block`'s surface answered its picture (`picture`) or none
@@ -7000,7 +7176,15 @@ impl<P: Platform> Caches<P> {
         block: u64,
         picture: bool,
     ) -> RaiseResult<()> {
-        self.lock().decoded(device, block, picture)
+        let mut state = self.lock();
+        // The pieces its fill would make for want of a spare are made with the lock let go of,
+        // and reserved for the block (the module doc, "Staged copies").
+        if let Some(device) = device
+            && state.decoded_fills(block, picture)
+        {
+            reserve_ahead(&mut state, device, &[(block, Way::In)]);
+        }
+        state.decoded(device, block, picture)
     }
 
     /// The deferred block at `block`'s pages taken copied ([`SurfaceCaches::attach_copied`]),
@@ -7091,6 +7275,32 @@ fn reserve_unlocked<P: Platform>(
     for (block, pieces) in made {
         state.reserved.entry(block).or_default().extend(pieces);
     }
+}
+
+/// The pieces the staged copies `wants` names (by block and way) would make for want of a piece
+/// reserved for their blocks or a spare ([`SurfaceCaches::lacking_for`]), with those of the
+/// refills of a recovery of `device` not yet seen ([`SurfaceCaches::refills`]), made with the
+/// caches' lock let go of and reserved for their blocks ([`reserve_unlocked`]), so the copies the
+/// holder makes next take them under it (the module doc, "Staged copies"). Whether it let go of
+/// the lock.
+fn reserve_ahead<P: Platform>(
+    state: &mut Locked<'_, P>,
+    device: &P::Device,
+    wants: &[(u64, Way)],
+) -> bool {
+    let mut wants = wants.to_vec();
+    wants.extend(state.refills(device));
+    let lacking = state.lacking_for(&wants);
+    let any = !lacking.is_empty();
+    reserve_unlocked(state, device, lacking);
+    any
+}
+
+/// The caches after a recovery of `device` ([`SurfaceCaches::after_recovery`]), the pieces their
+/// refills lack made first with the lock let go of ([`reserve_ahead`]).
+fn recover<P: Platform>(state: &mut Locked<'_, P>, device: &P::Device) {
+    reserve_ahead(state, device, &[]);
+    state.after_recovery(device);
 }
 
 fn download_op<P: Platform>(
@@ -13887,6 +14097,133 @@ pub(super) mod tests {
             [1, 2],
             "the transfer queue's commits, in value order"
         );
+    }
+
+    /// A rig whose caches' copies are staged, with command queues 1 and 2, and whose block at
+    /// [`BLOCK`] is two pages of a surface, marked cached; the block's length.
+    fn staged_cached() -> (Rig, u64) {
+        let mut r = rig(8);
+        r.dec.set_staged_surface_copies(Arc::default());
+        queues(&mut r);
+        let length = 2 * r.page;
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], length, true),
+            RGFX_STATUS_OK
+        );
+        (r, length)
+    }
+
+    /// Where the caches' copies are staged, a download asked while a writer of the cache is
+    /// still walked, copied once the writer is done with (its finish, or its uses let go of
+    /// unrun), has the pieces its copy lacks made by that thread with the caches' lock let go of,
+    /// and reserved for its block: the copy takes them, and makes none under the lock
+    /// ([`PIECE_MAKES_LOCKED`])
+    #[test]
+    fn a_copy_behind_a_writer_makes_its_pieces_with_the_caches_lock_let_go_of() {
+        for finished in [true, false] {
+            let (mut r, _) = staged_cached();
+            // The use writes the cache, and its fill's piece stays in flight: no spare holds one.
+            use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+            let queue = r.device.new_command_queue().unwrap();
+            let cb = queue.command_buffer(ON).unwrap().unwrap();
+            let writes = [RgfxOpSurfaceUse {
+                flags: RGFX_SURFACE_USE_WRITES,
+                ..reading(BLOCK, 0)[0]
+            }];
+            let caches = &r.dec.surface_caches;
+            let (_, uses) = caches.before(&r.device, &cb, &writes, &NO_REACH).unwrap();
+            let (asked, _) = try_download(&r, BLOCK);
+            assert!(asked, "made once the writer is done with");
+            let locked = counted(PIECE_MAKES_LOCKED);
+            let mark = r.p.call_log().mark();
+            match finished {
+                true => {
+                    (caches.finish(&r.device, 7, None, &cb, uses.unwrap(), || cb.commit(ON)))
+                        .unwrap()
+                }
+                false => drop(uses),
+            }
+            let calls = r.p.call_log().since(mark);
+            assert_eq!(copies(&calls).len(), 1, "finished {finished}: its copy");
+            let here = std::thread::current().name().map(str::to_owned);
+            assert!(
+                (calls.iter())
+                    .filter(|c| c.sel == SCRATCH_BUFFER)
+                    .filter(|c| !(c.thread.as_deref()).is_some_and(|t| t.starts_with(SPARES_THREADS)))
+                    .all(|c| c.thread == here),
+                "finished {finished}: its pieces, made by the thread that let go of the writer"
+            );
+            assert_eq!(
+                counted(PIECE_MAKES_LOCKED),
+                locked,
+                "finished {finished}: none made under the lock"
+            );
+        }
+    }
+
+    /// Where the caches' copies are staged, a block named again over the same pages, which
+    /// copies what a buffer wrote of its cache into its pages and then fills the cache again
+    /// under the caches' lock, has the pieces both copies lack made with the lock let go of, and
+    /// reserved for its block: the copy out takes them, the fill what it left, and neither makes
+    /// one under the lock ([`PIECE_MAKES_LOCKED`])
+    #[test]
+    fn a_block_named_again_makes_its_copies_pieces_with_the_caches_lock_let_go_of() {
+        let (mut r, length) = staged_cached();
+        // The use writes the cache, and its fill's piece stays in flight: no spare holds one.
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        let locked = counted(PIECE_MAKES_LOCKED);
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], length, true),
+            RGFX_STATUS_OK
+        );
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(copies(&calls).len(), 2, "its write copied out, then its fill");
+        let (_, made) = scratch_made(&calls);
+        let lens = pack(std::iter::once(0..length), PIECE).lens;
+        assert!(made.len() <= 2 * lens.len(), "{made:?}: one copy's pieces each");
+        assert_eq!(
+            counted(PIECE_MAKES_LOCKED),
+            locked,
+            "none made under the lock"
+        );
+    }
+
+    /// Where the caches' copies are staged, a first fill made under the caches' lock (one the
+    /// work of a command buffer in the context of the first buffer over the cache reaches, or a
+    /// buffer over it in another context makes) and a refill after a recovery of the device have
+    /// the pieces they lack made with the lock let go of, and reserved for their blocks: the fill
+    /// takes them, and makes none under the lock ([`PIECE_MAKES_LOCKED`])
+    #[test]
+    fn a_fill_made_under_the_lock_makes_its_pieces_with_the_lock_let_go_of() {
+        for case in ["work", "another context", "recovery"] {
+            let (mut r, length) = staged_cached();
+            if case == "recovery" {
+                // Its fill's piece stays in flight: no spare holds one.
+                use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
+                r.p.world().recover();
+            } else {
+                assert_eq!(r.buffer(10, BLOCK, length), Ok(()));
+            }
+            let locked = counted(PIECE_MAKES_LOCKED);
+            let mark = r.p.call_log().mark();
+            match case {
+                "another context" => {
+                    let caches = Arc::clone(&r.dec.surface_caches);
+                    caches.buffer_made(&r.device, BLOCK, Some(7)).unwrap();
+                }
+                _ => assert_eq!(r.dec.decode(&r.device, &blit_work(0x101)).unwrap(), Ok(())),
+            }
+            let calls = r.p.call_log().since(mark);
+            let filled = copies(&calls);
+            assert_eq!(filled.len(), 1, "{case}: the fill");
+            assert_eq!(filled[0].1, cache_id(&r), "{case}: into the cache");
+            assert_eq!(
+                counted(PIECE_MAKES_LOCKED),
+                locked,
+                "{case}: none made under the lock"
+            );
+        }
     }
 
     /// Command queues 1 and 2.
