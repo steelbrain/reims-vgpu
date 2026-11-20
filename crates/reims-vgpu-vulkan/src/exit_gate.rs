@@ -300,6 +300,10 @@ fn register() -> i32 {
 /// Registers [`at_exit`] with the C library's `atexit`.
 #[cfg(not(target_os = "macos"))]
 fn register() -> i32 {
+    unsafe extern "C" {
+        /// The C library's `atexit`.
+        fn atexit(f: extern "C" fn()) -> i32;
+    }
     // SAFETY: `at_exit` is a plain function that never unwinds.
     unsafe { atexit(at_exit) }
 }
@@ -371,11 +375,6 @@ impl Drop for Step {
             arm();
         }
     }
-}
-
-unsafe extern "C" {
-    /// The C library's `atexit`.
-    fn atexit(f: extern "C" fn()) -> i32;
 }
 
 /// Writes the process's degradation counts and the log's count of its repeated lines now, as the
@@ -478,6 +477,8 @@ mod tests {
         /// `std::process::exit` calls on Unix, where on Windows it calls `ExitProcess`, which runs
         /// none (the module docs).
         fn exit(status: i32) -> !;
+        /// The C library's `atexit`.
+        fn atexit(f: extern "C" fn()) -> i32;
     }
 
     /// Writes `line` to standard error at once.
