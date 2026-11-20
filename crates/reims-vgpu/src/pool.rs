@@ -148,6 +148,9 @@ pub const TAKE_CLAIM_WAITS_CODE: &str = "pool-take-claim-waits";
 /// The code of the nanoseconds the takes [`TAKE_CLAIM_WAITS_CODE`] counts waited, in all.
 pub const TAKE_CLAIM_WAIT_NS_CODE: &str = "pool-take-claim-wait-ns";
 
+/// The code of the longest wait [`TAKE_CLAIM_WAITS_CODE`] counts, in nanoseconds.
+pub const TAKE_CLAIM_WAIT_MAX_NS_CODE: &str = "pool-take-claim-wait-max-ns";
+
 /// The code of the takes answered, whose waits [`TAKE_WAIT_CODES`] count (`takes`).
 pub const TAKE_WAITS_CODE: &str = "pool-take-waits";
 

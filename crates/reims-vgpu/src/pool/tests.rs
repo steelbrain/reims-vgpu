@@ -1000,6 +1000,7 @@ fn a_take_only_the_claimed_chunk_keeps_out_waits_for_its_write_and_asks_no_piece
     // The worker zeroed all but the zeroer's chunk.
     assert_eq!(zeroed_by(&pool)[0], top);
     assert!(counted(TAKE_CLAIM_WAITS_CODE) > waits);
+    assert!(counted(TAKE_CLAIM_WAIT_MAX_NS_CODE) > 0);
     // No piece was asked for the take: the next is the headroom, asked once the take used this.
     assert_eq!(
         host.wait_for(2),

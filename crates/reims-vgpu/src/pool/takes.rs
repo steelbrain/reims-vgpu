@@ -55,9 +55,10 @@
 //! Private blocks' ([`super::private_blocks`], whose ledger, lock and workers it shares nothing
 //! with). One take may: where the claimed chunk alone keeps a take out of every piece, its worker
 //! waits for the chunk's write and mark rather than ask for a piece, the zeroer claiming no other
-//! chunk meanwhile, counted with its wait ([`super::TAKE_CLAIM_WAITS_CODE`]): one chunk's write at
-//! most. The device's release ends the zeroer once its chunk is written, and waits for it and for
-//! the take workers to let go of the pool ([`super::Threads`]). The guest writes no freed carve's
+//! chunk meanwhile, counted with its wait, in all and at its longest
+//! ([`super::TAKE_CLAIM_WAITS_CODE`]): one chunk's write at most. The device's release ends the
+//! zeroer once its chunk is written, and waits for it and for the take workers to let go of the
+//! pool ([`super::Threads`]). The guest writes no freed carve's
 //! bytes: the kext takes a block's mapping out of the process before its give, and the device
 //! frees it once the context's command buffers have finished.
 //!
@@ -101,11 +102,11 @@ use parking_lot::MutexGuard;
 use reims_vgpu_vulkan::answer::count_kind_by;
 
 use super::{
-    Ask, Error, Live, Mapped, MonoTime, Piece, Shared, State, TAKE_CLAIM_WAIT_NS_CODE,
-    TAKE_CLAIM_WAITS_CODE, TAKE_WAIT_CODES, TAKE_WAITS_CODE, TAKE_ZERO_PREZEROED_BYTES_CODE,
-    TAKE_ZEROED_BYTES_CODE, ZERO_HOLD_LONG, ZERO_HOLD_MAX_NS_CODE, ZERO_HOLD_PART_MAX_NS_CODES,
-    ZERO_HOLDS_LONG_CODE, ZERO_LONG_HOLD_PART_NS_CODES, ZERO_WRITE_MAX_NS_CODE, ZERO_WRITE_NS_CODE,
-    ZEROED_AHEAD_BYTES_CODE,
+    Ask, Error, Live, Mapped, MonoTime, Piece, Shared, State, TAKE_CLAIM_WAIT_MAX_NS_CODE,
+    TAKE_CLAIM_WAIT_NS_CODE, TAKE_CLAIM_WAITS_CODE, TAKE_WAIT_CODES, TAKE_WAITS_CODE,
+    TAKE_ZERO_PREZEROED_BYTES_CODE, TAKE_ZEROED_BYTES_CODE, ZERO_HOLD_LONG, ZERO_HOLD_MAX_NS_CODE,
+    ZERO_HOLD_PART_MAX_NS_CODES, ZERO_HOLDS_LONG_CODE, ZERO_LONG_HOLD_PART_NS_CODES,
+    ZERO_WRITE_MAX_NS_CODE, ZERO_WRITE_NS_CODE, ZEROED_AHEAD_BYTES_CODE,
 };
 
 /// A block's alignment and its length's granule: 64 KiB, the wire's `RGFX_POOL_BLOCK_ALIGN`.
@@ -227,6 +228,10 @@ static ZERO_HOLD_PART_MAX_NS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// [`ZERO_WRITE_MAX_NS_CODE`]'s count rises to.
 static ZERO_WRITE_MAX_NS: AtomicU64 = AtomicU64::new(0);
 
+/// The longest wait of a take for the zeroer's claimed chunk so far, in nanoseconds, which
+/// [`TAKE_CLAIM_WAIT_MAX_NS_CODE`]'s count rises to.
+static TAKE_CLAIM_WAIT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
 /// The longest of each of [`TAKE_WAIT_CODES`]' waits so far, in nanoseconds, which their
 /// `-max-ns` codes' counts rise to.
 static TAKE_WAIT_MAX_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
@@ -260,6 +265,19 @@ fn count_wait(context: u32, len: u64, waits: [Duration; 4]) {
         );
     }
     count_kind_by(TAKE_WAITS_CODE, 1);
+}
+
+/// A take's wait, `waited` long, for the zeroer's claimed chunk: counted, in all and at its
+/// longest ([`TAKE_CLAIM_WAITS_CODE`], [`TAKE_CLAIM_WAIT_NS_CODE`],
+/// [`TAKE_CLAIM_WAIT_MAX_NS_CODE`]).
+fn claim_waited(waited: Duration) {
+    let ns = u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
+    count_kind_by(TAKE_CLAIM_WAITS_CODE, 1);
+    count_kind_by(TAKE_CLAIM_WAIT_NS_CODE, ns);
+    let was = TAKE_CLAIM_WAIT_MAX_NS.fetch_max(ns, Ordering::Relaxed);
+    if ns > was {
+        count_kind_by(TAKE_CLAIM_WAIT_MAX_NS_CODE, ns.saturating_sub(was));
+    }
 }
 
 /// The zeroer's write of one chunk's zeros, `written` long: counted in all and at its longest
@@ -1054,11 +1072,7 @@ impl Shared {
                 }
                 st.claim_waits = st.claim_waits.saturating_sub(1);
                 let waited = (self.now)().saturating_duration_since(since);
-                MutexGuard::unlocked(st, || {
-                    count_kind_by(TAKE_CLAIM_WAITS_CODE, 1);
-                    let ns = u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
-                    count_kind_by(TAKE_CLAIM_WAIT_NS_CODE, ns);
-                });
+                MutexGuard::unlocked(st, || claim_waited(waited));
                 continue;
             }
             asked = asked.or_else(|| Some((self.now)()));
