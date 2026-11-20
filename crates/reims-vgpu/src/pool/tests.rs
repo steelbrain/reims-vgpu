@@ -114,6 +114,104 @@ fn range(gib: u64) -> PoolConfig {
 
 const LONG: Duration = Duration::from_secs(3600);
 
+/// The pieces of the pool's headroom: [`HEADROOM`] in pieces of [`BLOCK_LEN`].
+const KEPT: u64 = HEADROOM.div_ceil(BLOCK_LEN);
+
+/// [`KEPT`], as a count of the host's calls.
+const KEPT_CALLS: usize = KEPT as usize;
+
+/// The address of the first piece past a headroom of pieces from [`BASE`] up.
+const PAST: u64 = BASE + KEPT * BLOCK_LEN;
+
+/// The pieces of a headroom from [`BASE`] up, as the pool's adds of them and as its live pieces.
+fn headroom_adds() -> Vec<Call> {
+    (headroom_pieces().into_iter())
+        .map(|(at, len)| Call::Add(at, len))
+        .collect()
+}
+
+/// [`headroom_adds`], as [`Pool::live`] lists them.
+fn headroom_pieces() -> Vec<(u64, u64)> {
+    (0..KEPT)
+        .map(|i| (BASE + i * BLOCK_LEN, BLOCK_LEN))
+        .collect()
+}
+
+/// A piece is one of metal2vulkan-rt's units, its length read from rt, and the headroom is
+/// [`HEADROOM`] bytes of them, asked ahead of the guest's first take lowest address first: a take
+/// of a unit fills one, and the pool asks one more; a take longer than a unit has a piece of its
+/// own length past them, and the headroom's pieces stay empty, so the pool asks none
+#[test]
+fn a_piece_is_one_rt_unit() {
+    assert_eq!(BLOCK_LEN, metal2vulkan_rt::MemoryClass::Shared.block_len());
+    assert_eq!(KEPT * BLOCK_LEN, HEADROOM);
+    let host = Arc::new(Host::default());
+    let (pool, _blocks) = pool(range(64), &host, LONG);
+    let ledger = pool.ledger();
+    assert!(ledger.keep_headroom());
+    assert_eq!(host.wait_for(KEPT_CALLS), headroom_adds());
+    for (at, _) in headroom_pieces() {
+        pool.added(at).unwrap();
+    }
+    assert_eq!(answer(&take(&ledger, 1, BLOCK_LEN)), Some((0, BLOCK_LEN)));
+    assert_eq!(
+        host.wait_for(KEPT_CALLS + 1)[KEPT_CALLS],
+        Call::Add(PAST, BLOCK_LEN)
+    );
+    pool.added(PAST).unwrap();
+    let long = BLOCK_LEN + TAKE_ALIGN;
+    let rx = take(&ledger, 2, long);
+    let at = PAST + BLOCK_LEN;
+    // [`HostBlocks`] rounds a block longer than a unit up to 2 MiB.
+    assert_eq!(
+        host.wait_for(KEPT_CALLS + 2)[KEPT_CALLS + 1],
+        Call::Add(at, BLOCK_LEN + 2 * MIB)
+    );
+    pool.added(at).unwrap();
+    assert_eq!(answer(&rx), Some((at - BASE, long)));
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(host.calls().len(), KEPT_CALLS + 2);
+}
+
+/// A take of exactly one unit needs exactly one piece: its carve starts at the piece's first byte
+/// and ends at its last, with no pad, guard or rounding, so each of the headroom's pieces holds
+/// one such take whole, a take of one granule after them finds nothing left over in any of them,
+/// and the pool asks only unit pieces, none of a take's own length.
+#[test]
+fn a_take_of_one_unit_fills_one_piece_with_nothing_left_over() {
+    let host = Arc::new(Host::default());
+    let (pool, _blocks) = pool(range(64), &host, LONG);
+    let ledger = pool.ledger();
+    assert!(ledger.keep_headroom());
+    assert_eq!(host.wait_for(KEPT_CALLS), headroom_adds());
+    for (at, _) in headroom_pieces() {
+        pool.added(at).unwrap();
+    }
+    for i in 0..KEPT {
+        let rx = take(&ledger, 1, BLOCK_LEN);
+        assert_eq!(answer(&rx), Some((i * BLOCK_LEN, BLOCK_LEN)), "take {i}");
+    }
+    // Each filled piece has the pool ask one more unit, past the headroom's.
+    let calls = host.wait_for(2 * KEPT_CALLS);
+    let more: Vec<_> = (0..KEPT)
+        .map(|i| Call::Add(PAST + i * BLOCK_LEN, BLOCK_LEN))
+        .collect();
+    assert_eq!(calls[KEPT_CALLS..], more[..]);
+    for i in 0..KEPT {
+        pool.added(PAST + i * BLOCK_LEN).unwrap();
+    }
+    assert_eq!(
+        answer(&take(&ledger, 1, TAKE_ALIGN)),
+        Some((PAST - BASE, TAKE_ALIGN))
+    );
+    assert_eq!(
+        host.wait_for(2 * KEPT_CALLS + 1)[2 * KEPT_CALLS],
+        Call::Add(PAST + KEPT * BLOCK_LEN, BLOCK_LEN)
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(host.calls().len(), 2 * KEPT_CALLS + 1);
+}
+
 #[test]
 fn a_range_must_be_whole_large_pages_and_not_empty() {
     assert!(range(64).is_valid());
@@ -224,94 +322,95 @@ fn a_piece_holds_the_blocks_memory_the_host_maps() {
     assert_eq!(unsafe { b.host.as_ptr().cast::<u64>().read() }, 0x1234_5678);
 }
 
-/// The pool at `range` with two live pieces, the upper one empty past `delay` and so given back
-/// once its turn comes.
-fn two_pieces(host: &Arc<Host>, delay: Duration) -> (Pool, Arc<HostBlocks>) {
-    two_pieces_at(host, delay, now())
+/// The pool at `range` with the pieces of a headroom live from [`BASE`] up and one more above
+/// them, at [`PAST`], every one empty: the one above, empty past `delay`, is given back once its
+/// turn comes.
+fn one_past(host: &Arc<Host>, delay: Duration) -> (Pool, Arc<HostBlocks>) {
+    one_past_at(host, delay, now())
 }
 
-/// [`two_pieces`], on `clock`.
-fn two_pieces_at(host: &Arc<Host>, delay: Duration, clock: PoolNow) -> (Pool, Arc<HostBlocks>) {
+/// [`one_past`], on `clock`.
+fn one_past_at(host: &Arc<Host>, delay: Duration, clock: PoolNow) -> (Pool, Arc<HostBlocks>) {
     let (pool, blocks) = pool_at(range(64), host, delay, clock);
-    pool.grow(BLOCK_LEN);
-    pool.grow(BLOCK_LEN);
-    host.wait_for(2);
-    pool.added(BASE).unwrap();
-    pool.added(BASE + BLOCK_LEN).unwrap();
+    for _ in 0..=KEPT {
+        pool.grow(BLOCK_LEN);
+    }
+    host.wait_for(KEPT_CALLS + 1);
+    for i in 0..=KEPT {
+        pool.added(BASE + i * BLOCK_LEN).unwrap();
+    }
     (pool, blocks)
 }
 
 #[test]
 fn a_piece_goes_back_only_once_the_host_removed_it() {
     let host = Arc::new(Host::default());
-    let (pool, blocks) = two_pieces(&host, Duration::from_millis(50));
-    // The upper piece, empty past the delay, is asked out of the guest, and is out of the
-    // lookups.
-    assert_eq!(
-        host.wait_for(3)[2],
-        Call::Remove(BASE + BLOCK_LEN, BLOCK_LEN)
-    );
-    assert!(pool.find(BASE + BLOCK_LEN, 1).is_none());
+    let (pool, blocks) = one_past(&host, Duration::from_millis(50));
+    let n = KEPT_CALLS + 1;
+    // The piece above the headroom, empty past the delay, is asked out of the guest, and is out
+    // of the lookups.
+    assert_eq!(host.wait_for(n + 1)[n], Call::Remove(PAST, BLOCK_LEN));
+    assert!(pool.find(PAST, 1).is_none());
     // Its block stays the pool's until the host says the piece is out.
     std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(blocks.counts(), (2, 0));
-    pool.removed(BASE + BLOCK_LEN).unwrap();
-    wait_counts(&blocks, 1, 1);
-    assert_eq!(pool.live(), [(BASE, BLOCK_LEN)]);
+    assert_eq!(blocks.counts(), (n, 0));
+    pool.removed(PAST).unwrap();
+    wait_counts(&blocks, KEPT_CALLS, 1);
+    assert_eq!(pool.live(), headroom_pieces());
     // The address is free again: the next block goes there.
     pool.grow(BLOCK_LEN);
-    assert_eq!(host.wait_for(4)[3], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
+    assert_eq!(host.wait_for(n + 2)[n + 1], Call::Add(PAST, BLOCK_LEN));
 }
 
 #[test]
 fn a_held_piece_goes_back_only_once_its_hold_ends() {
     let delay = Duration::from_millis(50);
     let (host, hand) = (Arc::new(Host::default()), Hand::default());
-    let (pool, blocks) = two_pieces_at(&host, delay, hand.clock());
-    // The clock stands: the upper piece is live as the hold is taken.
-    let hold = pool.find(BASE + BLOCK_LEN, 1).unwrap();
+    let (pool, blocks) = one_past_at(&host, delay, hand.clock());
+    let n = KEPT_CALLS + 1;
+    // The clock stands: the piece above the headroom is live as the hold is taken.
+    let hold = pool.find(PAST, 1).unwrap();
     hand.on(delay);
     // Out of the lookups past the delay, but neither asked out of the guest nor given back while
     // the hold lives.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while pool.find(BASE + BLOCK_LEN, 1).is_some() {
+    while pool.find(PAST, 1).is_some() {
         assert!(
             Instant::now() < deadline,
             "still in the lookups past the delay"
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(host.calls().len(), 2, "no remove while a hold lives");
-    assert_eq!(blocks.counts(), (2, 0));
+    assert_eq!(host.calls().len(), n, "no remove while a hold lives");
+    assert_eq!(blocks.counts(), (n, 0));
     drop(hold);
-    assert_eq!(
-        host.wait_for(3)[2],
-        Call::Remove(BASE + BLOCK_LEN, BLOCK_LEN)
-    );
-    assert_eq!(blocks.counts(), (2, 0));
-    pool.removed(BASE + BLOCK_LEN).unwrap();
-    wait_counts(&blocks, 1, 1);
+    assert_eq!(host.wait_for(n + 1)[n], Call::Remove(PAST, BLOCK_LEN));
+    assert_eq!(blocks.counts(), (n, 0));
+    pool.removed(PAST).unwrap();
+    wait_counts(&blocks, KEPT_CALLS, 1);
 }
 
 #[test]
 fn a_piece_given_back_before_the_hosts_add_answers_still_waits_for_the_remove() {
     let host = Arc::new(Host::default());
     let (pool, blocks) = pool(range(64), &host, Duration::from_millis(50));
-    pool.grow(BLOCK_LEN);
-    pool.grow(BLOCK_LEN);
-    host.wait_for(2);
-    pool.added(BASE).unwrap();
-    // The upper piece goes back before the host's add answers: its remove is asked all the same.
-    assert_eq!(
-        host.wait_for(3)[2],
-        Call::Remove(BASE + BLOCK_LEN, BLOCK_LEN)
-    );
+    let n = KEPT_CALLS + 1;
+    for _ in 0..=KEPT {
+        pool.grow(BLOCK_LEN);
+    }
+    host.wait_for(n);
+    for (at, _) in headroom_pieces() {
+        pool.added(at).unwrap();
+    }
+    // The piece above the headroom goes back before the host's add answers: its remove is asked
+    // all the same.
+    assert_eq!(host.wait_for(n + 1)[n], Call::Remove(PAST, BLOCK_LEN));
     // The host's add, which it queued first, then its remove.
-    pool.added(BASE + BLOCK_LEN).unwrap();
-    assert!(pool.find(BASE + BLOCK_LEN, 1).is_none());
-    assert_eq!(blocks.counts(), (2, 0));
-    pool.removed(BASE + BLOCK_LEN).unwrap();
-    wait_counts(&blocks, 1, 1);
+    pool.added(PAST).unwrap();
+    assert!(pool.find(PAST, 1).is_none());
+    assert_eq!(blocks.counts(), (n, 0));
+    pool.removed(PAST).unwrap();
+    wait_counts(&blocks, KEPT_CALLS, 1);
 }
 
 #[test]
@@ -389,40 +488,42 @@ fn an_empty_piece_above_the_headroom_goes_back_after_the_delay() {
     let delay = Duration::from_millis(300);
     let host = Arc::new(Host::default());
     let (pool, blocks) = pool(range(64), &host, delay);
+    let n = KEPT_CALLS + 1;
     let start = Instant::now();
-    pool.grow(BLOCK_LEN);
-    pool.grow(BLOCK_LEN);
-    host.wait_for(2);
-    pool.added(BASE).unwrap();
-    pool.added(BASE + BLOCK_LEN).unwrap();
-    // The higher one is asked out of the guest, then goes back once the host says it is out.
-    assert_eq!(
-        host.wait_for(3)[2],
-        Call::Remove(BASE + BLOCK_LEN, BLOCK_LEN)
-    );
+    for _ in 0..=KEPT {
+        pool.grow(BLOCK_LEN);
+    }
+    host.wait_for(n);
+    for i in 0..=KEPT {
+        pool.added(BASE + i * BLOCK_LEN).unwrap();
+    }
+    // The one above the headroom is asked out of the guest, then goes back once the host says
+    // it is out.
+    assert_eq!(host.wait_for(n + 1)[n], Call::Remove(PAST, BLOCK_LEN));
     assert!(start.elapsed() >= delay, "{:?}", start.elapsed());
-    pool.removed(BASE + BLOCK_LEN).unwrap();
-    wait_counts(&blocks, 1, 1);
-    assert_eq!(pool.live(), [(BASE, BLOCK_LEN)]);
-    assert!(pool.find(BASE + BLOCK_LEN, 1).is_none());
-    assert_eq!(
-        pool.piece_used(BASE + BLOCK_LEN),
-        Err(Error::InvalidArgument)
-    );
-    assert_eq!(host.calls().len(), 3);
+    pool.removed(PAST).unwrap();
+    wait_counts(&blocks, KEPT_CALLS, 1);
+    assert_eq!(pool.live(), headroom_pieces());
+    assert!(pool.find(PAST, 1).is_none());
+    assert_eq!(pool.piece_used(PAST), Err(Error::InvalidArgument));
+    assert_eq!(host.calls().len(), n + 1);
 }
 
 #[test]
-fn the_lowest_empty_piece_stays_as_headroom() {
+fn the_lowest_empty_pieces_stay_as_headroom() {
     let delay = Duration::from_millis(50);
     let host = Arc::new(Host::default());
     let (pool, blocks) = pool(range(64), &host, delay);
-    pool.grow(BLOCK_LEN);
-    host.wait_for(1);
-    pool.added(BASE).unwrap();
+    for _ in 0..KEPT {
+        pool.grow(BLOCK_LEN);
+    }
+    host.wait_for(KEPT_CALLS);
+    for (at, _) in headroom_pieces() {
+        pool.added(at).unwrap();
+    }
     std::thread::sleep(delay * 6);
-    assert_eq!(blocks.counts(), (1, 0));
-    assert_eq!(pool.live(), [(BASE, BLOCK_LEN)]);
+    assert_eq!(blocks.counts(), (KEPT_CALLS, 0));
+    assert_eq!(pool.live(), headroom_pieces());
 }
 
 #[test]
@@ -430,64 +531,61 @@ fn a_piece_used_again_within_the_delay_is_kept() {
     let delay = Duration::from_millis(50);
     let (host, hand) = (Arc::new(Host::default()), Hand::default());
     let (pool, blocks) = pool_at(range(64), &host, delay, hand.clock());
-    pool.grow(BLOCK_LEN);
-    pool.grow(BLOCK_LEN);
-    host.wait_for(2);
-    pool.added(BASE).unwrap();
-    pool.added(BASE + BLOCK_LEN).unwrap();
+    for _ in 0..KEPT {
+        pool.grow(BLOCK_LEN);
+    }
+    host.wait_for(KEPT_CALLS);
+    for (at, _) in headroom_pieces() {
+        pool.added(at).unwrap();
+    }
+    // Using a piece of the headroom asked for a block more, so the headroom holds its bytes.
     pool.piece_used(BASE).unwrap();
-    pool.piece_used(BASE + BLOCK_LEN).unwrap();
-    // Using the last empty piece asked for a block more: the headroom.
     assert_eq!(
-        host.wait_for(3)[2],
-        Call::Add(BASE + 2 * BLOCK_LEN, BLOCK_LEN)
+        host.wait_for(KEPT_CALLS + 1)[KEPT_CALLS],
+        Call::Add(PAST, BLOCK_LEN)
     );
-    pool.added(BASE + 2 * BLOCK_LEN).unwrap();
-    // Emptied, then used again within the delay: kept. The clock moves only as the test moves
-    // it; the real wait after gives a pool that kept the wrong piece the time to give it back.
-    pool.piece_empty(BASE + BLOCK_LEN).unwrap();
+    pool.added(PAST).unwrap();
+    // Emptied, the used piece is of the headroom and the highest is above it; used again within
+    // the delay, the highest is of the headroom again and kept. The clock moves only as the test
+    // moves it; the real wait after gives a pool that kept the wrong piece the time to give it
+    // back.
+    pool.piece_empty(BASE).unwrap();
     hand.on(delay / 2);
-    pool.piece_used(BASE + BLOCK_LEN).unwrap();
+    pool.piece_used(BASE).unwrap();
     hand.on(delay * 2);
     std::thread::sleep(delay * 2);
-    assert_eq!(blocks.counts(), (3, 0));
-    // Emptied for good: the lowest empty piece, now this one, stays as the headroom, and the
-    // one above it, empty past the delay, goes.
-    pool.piece_empty(BASE + BLOCK_LEN).unwrap();
+    assert_eq!(blocks.counts(), (KEPT_CALLS + 1, 0));
+    // Emptied for good: the lowest empty pieces, this one among them, stay as the headroom, and
+    // the one above them, empty past the delay, goes.
+    pool.piece_empty(BASE).unwrap();
     assert_eq!(
-        host.wait_for(4)[3],
-        Call::Remove(BASE + 2 * BLOCK_LEN, BLOCK_LEN)
+        host.wait_for(KEPT_CALLS + 2)[KEPT_CALLS + 1],
+        Call::Remove(PAST, BLOCK_LEN)
     );
-    pool.removed(BASE + 2 * BLOCK_LEN).unwrap();
-    wait_counts(&blocks, 2, 1);
-    assert_eq!(
-        pool.live(),
-        [(BASE, BLOCK_LEN), (BASE + BLOCK_LEN, BLOCK_LEN)]
-    );
-    assert_eq!(host.calls().len(), 4);
+    pool.removed(PAST).unwrap();
+    wait_counts(&blocks, KEPT_CALLS, 1);
+    assert_eq!(pool.live(), headroom_pieces());
+    assert_eq!(host.calls().len(), KEPT_CALLS + 2);
 }
 
 #[test]
 fn a_block_taken_again_is_mapped_anew() {
     let host = Arc::new(Host::default());
-    let (pool, blocks) = two_pieces(&host, Duration::from_millis(50));
-    assert_eq!(
-        host.wait_for(3)[2],
-        Call::Remove(BASE + BLOCK_LEN, BLOCK_LEN)
-    );
-    pool.removed(BASE + BLOCK_LEN).unwrap();
-    wait_counts(&blocks, 1, 1);
-    // The headroom piece is used: the pool asks for a block more, the source hands the ready one
-    // out again, and the pool has the host map it at the lowest free address, where it was.
+    let (pool, blocks) = one_past(&host, Duration::from_millis(50));
+    let n = KEPT_CALLS + 1;
+    assert_eq!(host.wait_for(n + 1)[n], Call::Remove(PAST, BLOCK_LEN));
+    pool.removed(PAST).unwrap();
+    wait_counts(&blocks, KEPT_CALLS, 1);
+    // A piece of the headroom is used: the pool asks for a block more, the source hands the ready
+    // one out again, and the pool has the host map it at the lowest free address, where it was.
     pool.piece_used(BASE).unwrap();
-    assert_eq!(host.wait_for(4)[3], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
-    wait_counts(&blocks, 2, 0);
-    assert_eq!(pool.live(), [(BASE, BLOCK_LEN)]);
-    pool.added(BASE + BLOCK_LEN).unwrap();
-    assert_eq!(
-        pool.live(),
-        [(BASE, BLOCK_LEN), (BASE + BLOCK_LEN, BLOCK_LEN)]
-    );
+    assert_eq!(host.wait_for(n + 2)[n + 1], Call::Add(PAST, BLOCK_LEN));
+    wait_counts(&blocks, n, 0);
+    assert_eq!(pool.live(), headroom_pieces());
+    pool.added(PAST).unwrap();
+    let mut live = headroom_pieces();
+    live.push((PAST, BLOCK_LEN));
+    assert_eq!(pool.live(), live);
 }
 
 #[test]
@@ -495,24 +593,26 @@ fn ready_blocks_past_two_are_freed_with_no_word_to_the_host() {
     let delay = Duration::from_millis(30);
     let host = Arc::new(Host::default());
     let (pool, blocks) = pool(range(64), &host, delay);
-    for _ in 0..4 {
+    let n = KEPT_CALLS + 3;
+    for _ in 0..KEPT + 3 {
         pool.grow(BLOCK_LEN);
     }
-    host.wait_for(4);
-    for i in 0..4 {
+    host.wait_for(n);
+    for i in 0..KEPT + 3 {
         pool.added(BASE + i * BLOCK_LEN).unwrap();
     }
-    // Three go back above the headroom, lowest first, each asked out of the guest before it goes.
-    for i in 1..4 {
-        let at = BASE + i * BLOCK_LEN;
-        let n = usize::try_from(4 + i).unwrap();
-        assert_eq!(host.wait_for(n)[n - 1], Call::Remove(at, BLOCK_LEN));
+    // The three above the headroom go back, lowest first, each asked out of the guest before it
+    // goes.
+    for i in 0..3 {
+        let at = PAST + i * BLOCK_LEN;
+        let calls = n + 1 + usize::try_from(i).unwrap();
+        assert_eq!(host.wait_for(calls)[calls - 1], Call::Remove(at, BLOCK_LEN));
         pool.removed(at).unwrap();
     }
     // The source keeps two ready and frees the oldest, asking no one.
-    wait_counts(&blocks, 1, 2);
+    wait_counts(&blocks, KEPT_CALLS, 2);
     std::thread::sleep(delay * 4);
-    assert_eq!(host.calls().len(), 7);
+    assert_eq!(host.calls().len(), n + 3);
     assert!(pool.source().is_some());
 }
 
@@ -520,38 +620,32 @@ fn ready_blocks_past_two_are_freed_with_no_word_to_the_host() {
 fn a_piece_given_back_and_taken_again_reads_zero() {
     let delay = Duration::from_millis(50);
     let (host, hand) = (Arc::new(Host::default()), Hand::default());
-    let (pool, blocks) = pool_at(range(64), &host, delay, hand.clock());
-    pool.grow(BLOCK_LEN);
-    pool.grow(BLOCK_LEN);
-    host.wait_for(2);
-    pool.added(BASE).unwrap();
-    pool.added(BASE + BLOCK_LEN).unwrap();
-    // The guest writes into the upper piece, then empties it; it goes back past the delay, which
-    // the clock, standing still until the test moves it, cannot pass before the piece is used.
-    pool.piece_used(BASE + BLOCK_LEN).unwrap();
+    let (pool, blocks) = one_past_at(&host, delay, hand.clock());
+    let n = KEPT_CALLS + 1;
+    // The guest writes into the piece above the headroom, then empties it; it goes back past the
+    // delay, which the clock, standing still until the test moves it, cannot pass before the
+    // piece is used.
+    pool.piece_used(PAST).unwrap();
     {
-        let hold = pool.find(BASE + BLOCK_LEN + 4096, 8).unwrap();
+        let hold = pool.find(PAST + 4096, 8).unwrap();
         // SAFETY: inside the block, which the hold keeps.
         unsafe { hold.host.as_ptr().cast::<u64>().write(0xdead_beef) };
     }
-    pool.piece_empty(BASE + BLOCK_LEN).unwrap();
+    pool.piece_empty(PAST).unwrap();
     hand.on(delay);
-    assert_eq!(
-        host.wait_for(3)[2],
-        Call::Remove(BASE + BLOCK_LEN, BLOCK_LEN)
-    );
-    pool.removed(BASE + BLOCK_LEN).unwrap();
-    wait_counts(&blocks, 1, 1);
-    // The headroom piece is used: the ready block goes out again, mapped anew at its address,
-    // zeroed.
+    assert_eq!(host.wait_for(n + 1)[n], Call::Remove(PAST, BLOCK_LEN));
+    pool.removed(PAST).unwrap();
+    wait_counts(&blocks, KEPT_CALLS, 1);
+    // A piece of the headroom is used: the ready block goes out again, mapped anew at its
+    // address, zeroed.
     pool.piece_used(BASE).unwrap();
-    assert_eq!(host.wait_for(4)[3], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
-    pool.added(BASE + BLOCK_LEN).unwrap();
-    wait_counts(&blocks, 2, 0);
-    let hold = pool.find(BASE + BLOCK_LEN + 4096, 8).unwrap();
+    assert_eq!(host.wait_for(n + 2)[n + 1], Call::Add(PAST, BLOCK_LEN));
+    pool.added(PAST).unwrap();
+    wait_counts(&blocks, n, 0);
+    let hold = pool.find(PAST + 4096, 8).unwrap();
     // SAFETY: as above.
     assert_eq!(unsafe { hold.host.as_ptr().cast::<u64>().read() }, 0);
-    assert_eq!(host.calls().len(), 4);
+    assert_eq!(host.calls().len(), n + 2);
 }
 
 /// The pool at `range(64)` with one live piece, at `BASE`, and a ledger of it.
@@ -839,7 +933,7 @@ fn a_take_that_fits_no_piece_grows_the_pool_and_waits_for_the_hosts_map() {
     );
     pool.added(BASE).unwrap();
     assert_eq!(answer(&rx), Some((0, TAKE_ALIGN)));
-    // Its piece used, the pool asks for another as headroom.
+    // Its piece used, the pool asks for the headroom's pieces, the lowest next to it.
     assert_eq!(host.wait_for(2)[1], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
 }
 
@@ -871,7 +965,7 @@ fn a_zeroers_long_hold_is_counted_with_its_parts() {
     );
 }
 
-/// The zeroer zeroes a new piece, the headroom, ahead of every take, from its place on: a take
+/// The zeroer zeroes a new piece, of the headroom, ahead of every take, from its place on: a take
 /// carved there once it ran zeroes nothing, and reads zero
 #[test]
 fn a_take_in_a_new_piece_the_zeroer_ran_over_zeroes_nothing() {
@@ -888,7 +982,7 @@ fn a_take_in_a_new_piece_the_zeroer_ran_over_zeroes_nothing() {
     assert!(all(&pool, 0, BLOCK_LEN, 0));
 }
 
-/// An emptied piece is zeroed once it is the headroom, the lowest empty piece, and kept; one
+/// An emptied piece is zeroed once it is of the headroom, the lowest empty pieces, and kept; one
 /// emptied above the headroom, which goes back whole past its delay, is not: its bytes are left
 /// as the guest wrote them until it is out of the guest
 #[test]
@@ -897,43 +991,56 @@ fn an_emptied_piece_is_zeroed_as_the_headroom_and_not_where_it_goes_back_whole()
     let (host, hand) = (Arc::new(Host::default()), Hand::default());
     let (pool, _blocks) = pool_at(range(64), &host, delay, hand.clock());
     let ledger = pool.ledger();
-    assert!(ledger.keep_headroom());
-    host.wait_for(1);
-    pool.added(BASE).unwrap();
-    wait_zeroed(&pool, BASE, BLOCK_LEN);
-    // The first piece taken whole, the next is the headroom, zeroed; taken whole too, the third.
-    for (context, at, calls) in [(1, 0, 2), (2, BLOCK_LEN, 3)] {
-        assert_eq!(
-            answer(&take(&ledger, context, BLOCK_LEN)),
-            Some((at, BLOCK_LEN))
-        );
-        let next = BASE + at + BLOCK_LEN;
-        assert_eq!(host.wait_for(calls)[calls - 1], Call::Add(next, BLOCK_LEN));
-        pool.added(next).unwrap();
-        wait_zeroed(&pool, next, BLOCK_LEN);
+    let piece = |i: u64| BASE + i * BLOCK_LEN;
+    // The pieces of a headroom and one more, the lowest and the highest mapped, those between
+    // still being mapped: a take carves only mapped pieces.
+    for _ in 0..=KEPT {
+        pool.grow(BLOCK_LEN);
     }
+    host.wait_for(KEPT_CALLS + 1);
+    pool.added(piece(0)).unwrap();
+    pool.added(PAST).unwrap();
+    // The lowest taken whole, the highest is of the headroom; taken whole too, it leaves the
+    // headroom a piece short, which the pool asks for.
+    assert_eq!(answer(&take(&ledger, 1, BLOCK_LEN)), Some((0, BLOCK_LEN)));
+    assert_eq!(
+        answer(&take(&ledger, 2, BLOCK_LEN)),
+        Some((PAST - BASE, BLOCK_LEN))
+    );
+    let next = PAST + BLOCK_LEN;
+    assert_eq!(
+        host.wait_for(KEPT_CALLS + 2)[KEPT_CALLS + 1],
+        Call::Add(next, BLOCK_LEN)
+    );
+    for i in 1..KEPT {
+        pool.added(piece(i)).unwrap();
+        wait_zeroed(&pool, piece(i), BLOCK_LEN);
+    }
+    pool.added(next).unwrap();
+    wait_zeroed(&pool, next, BLOCK_LEN);
     fill(&pool, 0, BLOCK_LEN, 0xa5);
-    fill(&pool, BLOCK_LEN, BLOCK_LEN, 0x5a);
-    // The first emptied is the lowest empty piece, the headroom: zeroed.
+    fill(&pool, PAST - BASE, BLOCK_LEN, 0x5a);
+    // The first emptied is the lowest empty piece, of the headroom: zeroed.
     let Give::Given(first) = ledger.give(1, 0, BLOCK_LEN, |_, _| false) else {
         panic!("not given");
     };
     ledger.free(&[first]);
     wait_zeroed(&pool, BASE, BLOCK_LEN);
     assert!(all(&pool, 0, BLOCK_LEN, 0));
-    // The second emptied lies above it: it goes back whole, and nothing zeroes it.
+    // The second emptied lies above the headroom's pieces: it goes back whole, and nothing zeroes
+    // it.
     let before = zeroed_by(&pool);
-    let Give::Given(second) = ledger.give(2, BLOCK_LEN, BLOCK_LEN, |_, _| false) else {
+    let Give::Given(second) = ledger.give(2, PAST - BASE, BLOCK_LEN, |_, _| false) else {
         panic!("not given");
     };
     ledger.free(&[second]);
     std::thread::sleep(Duration::from_millis(50));
-    assert!(all(&pool, BLOCK_LEN, BLOCK_LEN, 0x5a));
-    assert_eq!(zeroed(&pool, BASE + BLOCK_LEN), 0);
+    assert!(all(&pool, PAST - BASE, BLOCK_LEN, 0x5a));
+    assert_eq!(zeroed(&pool, PAST), 0);
     hand.on(delay);
     assert_eq!(
-        host.wait_for(4)[3],
-        Call::Remove(BASE + BLOCK_LEN, BLOCK_LEN)
+        host.wait_for(KEPT_CALLS + 3)[KEPT_CALLS + 2],
+        Call::Remove(PAST, BLOCK_LEN)
     );
     assert_eq!(zeroed_by(&pool), before, "a piece going back was zeroed");
 }
@@ -1046,14 +1153,11 @@ fn a_take_only_the_claimed_chunk_keeps_out_waits_for_its_write_and_asks_no_piece
     assert_eq!(zeroed_by(&pool)[0], top);
     assert!(counted(TAKE_CLAIM_WAITS_CODE) > waits);
     assert!(counted(TAKE_CLAIM_WAIT_MAX_NS_CODE) > 0);
-    // No piece was asked for the take: the next is the headroom, asked once the take used this.
-    assert_eq!(
-        host.wait_for(2),
-        [
-            Call::Add(BASE, BLOCK_LEN),
-            Call::Add(BASE + BLOCK_LEN, BLOCK_LEN)
-        ]
-    );
+    // No piece was asked for the take: past the headroom's is the one more the headroom asked
+    // once the take used this.
+    let mut adds = headroom_adds();
+    adds.push(Call::Add(PAST, BLOCK_LEN));
+    assert_eq!(host.wait_for(KEPT_CALLS + 1), adds);
 }
 
 /// An answered take's wait is counted by its cause ([`TAKE_WAIT_CODES`]), the take counted once
@@ -1103,32 +1207,37 @@ fn a_takes_wait_is_counted_by_its_cause() {
     );
 }
 
-/// The guest's driver's take of the pool asks for a piece ahead of the first take, which that
-/// take then finds, answered with no piece of its own asked or mapped; taken again with the piece
-/// still empty, as after a reset, it asks none
+/// The guest's driver's take of the pool asks for the headroom's pieces ahead of the first take,
+/// which that take then finds, answered with no piece of its own asked or mapped; taken again
+/// with the pieces still empty, as after a reset, it asks none
 #[test]
-fn a_piece_asked_ahead_of_the_first_take_serves_it_with_no_wait() {
+fn the_pieces_asked_ahead_of_the_first_take_serve_it_with_no_wait() {
     let host = Arc::new(Host::default());
     let (pool, _blocks) = pool(range(64), &host, LONG);
     let ledger = pool.ledger();
     assert!(ledger.keep_headroom());
-    assert_eq!(host.wait_for(1), [Call::Add(BASE, BLOCK_LEN)]);
+    assert_eq!(host.wait_for(KEPT_CALLS), headroom_adds());
     assert!(
         !ledger.keep_headroom(),
-        "asked again while the host maps it"
+        "asked again while the host maps them"
     );
-    pool.added(BASE).unwrap();
+    for (at, _) in headroom_pieces() {
+        pool.added(at).unwrap();
+    }
     assert!(!ledger.keep_headroom(), "asked again");
     assert_eq!(answer(&take(&ledger, 1, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
-    // Its piece used, the pool asks for the next as headroom, which the take did not wait for.
-    assert_eq!(host.wait_for(2)[1], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
+    // Its piece used, the pool asks for one more as headroom, which the take did not wait for.
+    assert_eq!(
+        host.wait_for(KEPT_CALLS + 1)[KEPT_CALLS],
+        Call::Add(PAST, BLOCK_LEN)
+    );
 }
 
-/// A take carved from the headroom piece has the pool's thread make the next at once, not once
-/// the take's worker went idle: on a clock that stands still, as a test platform's does, the
+/// A take carved from a piece of the headroom has the pool's thread make the next at once, not
+/// once the take's worker went idle: on a clock that stands still, as a test platform's does, the
 /// worker never goes
 #[test]
-fn a_take_that_uses_the_headroom_piece_has_the_next_made_at_once() {
+fn a_take_that_uses_a_headroom_piece_has_the_next_made_at_once() {
     let host = Arc::new(Host::default());
     let still = (now())();
     let clock: PoolNow = Box::new(move || still);
@@ -1136,10 +1245,13 @@ fn a_take_that_uses_the_headroom_piece_has_the_next_made_at_once() {
     let pool = Pool::with_delay(range(64), host.pool_host(), LONG, clock, source).unwrap();
     let ledger = pool.ledger();
     assert!(ledger.keep_headroom());
-    assert_eq!(host.wait_for(1), [Call::Add(BASE, BLOCK_LEN)]);
+    assert_eq!(host.wait_for(KEPT_CALLS), headroom_adds());
     pool.added(BASE).unwrap();
     assert_eq!(answer(&take(&ledger, 1, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
-    assert_eq!(host.wait_for(2)[1], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
+    assert_eq!(
+        host.wait_for(KEPT_CALLS + 1)[KEPT_CALLS],
+        Call::Add(PAST, BLOCK_LEN)
+    );
 }
 
 /// A source whose takes wait until the test opens its gate.
@@ -1299,32 +1411,38 @@ fn a_piece_with_a_block_stays_and_goes_back_once_its_last_block_is_freed() {
     let delay = Duration::from_millis(50);
     let host = Arc::new(Host::default());
     let (pool, _blocks, ledger) = live_pool(&host, delay);
-    // The first piece full, the pool asks for headroom, which the next take uses.
+    // The first piece full, the pool asks for the headroom's pieces, the lowest of which the next
+    // take uses.
     assert_eq!(answer(&take(&ledger, 1, BLOCK_LEN)), Some((0, BLOCK_LEN)));
-    assert_eq!(host.wait_for(2)[1], Call::Add(BASE + BLOCK_LEN, BLOCK_LEN));
-    pool.added(BASE + BLOCK_LEN).unwrap();
+    let calls = host.wait_for(KEPT_CALLS + 1);
+    for i in 1..=KEPT {
+        let at = BASE + i * BLOCK_LEN;
+        assert_eq!(calls[usize::try_from(i).unwrap()], Call::Add(at, BLOCK_LEN));
+        pool.added(at).unwrap();
+    }
     assert_eq!(
         answer(&take(&ledger, 1, TAKE_ALIGN)),
         Some((BLOCK_LEN, TAKE_ALIGN))
     );
+    let top = PAST + BLOCK_LEN;
     assert_eq!(
-        host.wait_for(3)[2],
-        Call::Add(BASE + 2 * BLOCK_LEN, BLOCK_LEN)
+        host.wait_for(KEPT_CALLS + 2)[KEPT_CALLS + 1],
+        Call::Add(top, BLOCK_LEN)
     );
-    pool.added(BASE + 2 * BLOCK_LEN).unwrap();
-    // Both used pieces stay past the delay, and the empty one is the headroom.
+    pool.added(top).unwrap();
+    // Both used pieces stay past the delay, and the empty ones are the headroom.
     std::thread::sleep(delay * 6);
-    assert_eq!(host.calls().len(), 3);
-    // The first emptied, it is the lowest empty piece: the third goes back.
+    assert_eq!(host.calls().len(), KEPT_CALLS + 2);
+    // The first emptied, it is the lowest empty piece: the highest, above the headroom, goes back.
     let Give::Given(carve) = ledger.give(1, 0, BLOCK_LEN, |_, _| false) else {
         panic!("not given");
     };
     ledger.free(&[carve]);
     assert_eq!(
-        host.wait_for(4)[3],
-        Call::Remove(BASE + 2 * BLOCK_LEN, BLOCK_LEN)
+        host.wait_for(KEPT_CALLS + 3)[KEPT_CALLS + 2],
+        Call::Remove(top, BLOCK_LEN)
     );
-    assert_eq!(host.calls().len(), 4);
+    assert_eq!(host.calls().len(), KEPT_CALLS + 3);
 }
 
 #[test]
@@ -1332,13 +1450,15 @@ fn the_release_leaves_the_blocks_with_a_live_ledger_until_its_drop() {
     let host = Arc::new(Host::default());
     let (pool, blocks, ledger) = live_pool(&host, LONG);
     answer(&take(&ledger, 1, TAKE_ALIGN)).unwrap();
-    host.wait_for(2);
+    // The headroom's pieces, asked once the take used the first.
+    host.wait_for(KEPT_CALLS + 1);
     drop(pool);
-    assert_eq!(blocks.counts(), (2, 0));
+    assert_eq!(blocks.counts(), (KEPT_CALLS + 1, 0));
     // A take after the release is never answered.
     let rx = take(&ledger, 2, TAKE_ALIGN);
     assert!(rx.recv_timeout(Duration::from_secs(1)).is_err());
     drop(ledger);
+    // The source keeps two ready and frees the rest.
     assert_eq!(blocks.counts(), (0, 2));
 }
 
@@ -1412,7 +1532,8 @@ fn a_block_of_a_source_with_addresses_lies_at_its_offset_in_its_piece_s_block() 
     let second = taken(&take(&ledger, 1, 3 * TAKE_ALIGN)).unwrap();
     assert_eq!(second.offset, TAKE_ALIGN);
     assert_eq!(second.gpu_address, ADDRESSED + TAKE_ALIGN);
-    // The rest of the first piece, then the headroom piece, the second block handed out.
+    // The rest of the first piece, then the headroom's lowest piece, the second block handed
+    // out.
     let rest = BLOCK_LEN - 4 * TAKE_ALIGN;
     assert_eq!(
         answer(&take(&ledger, 1, rest)),

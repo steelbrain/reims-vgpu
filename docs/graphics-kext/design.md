@@ -4853,7 +4853,7 @@ reads it once.
   it out, so bytes no block of the piece held before are zeroed too. Ahead
   of the takes, the pool's zeroer (`reims-vgpu.graphics-pool-zero`) zeroes,
   off every take's path, the bytes no block holds in each piece a block
-  lies in and in the headroom piece (below), a new piece's from its place
+  lies in and in the headroom's pieces (below), a new piece's from its place
   on, and a take over them leaves them as zeroed (`pool-zeroed-ahead-bytes`,
   `pool-take-zero-skipped-prezeroed-bytes`); a take over bytes it has not
   reached zeroes them itself. The zeroer claims 64 KiB at a time with the
@@ -4864,9 +4864,10 @@ reads it once.
   whole. The device's release waits for the zeroer and the take workers to
   let go of the pool. So a context's takes are answered in its order, and
   never wait behind another context's growth or zeroing. The host keeps
-  one empty piece ahead of the takes from the kext's take of `POOL` on
-  (`Host::pool_taken`), so a take grows the pool only where that piece has no
-  room for it. The answer is
+  64 MiB of empty pieces ahead of the takes from the kext's take of `POOL`
+  on (`Host::pool_taken`), each 16 MiB, metal2vulkan-rt's unit, so a take
+  grows the pool only where those pieces have no room for it, as a take longer
+  than a unit does. The answer is
   the block's offset in the pool and its length, the bytes asked for rounded
   up to 64 KiB, every byte zero, or `REFUSED` where the pool has no room;
   where the guest took `POOL_ADDRESSES` (below), also its GPU address. The

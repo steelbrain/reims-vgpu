@@ -18,13 +18,17 @@
 //!
 //! A new piece is empty: nothing of the guest's lies in it. The guest's processes take blocks of
 //! the pool and give them back (`takes`): a piece is used from its first block's take and empty
-//! again once its last block went back. The pool keeps one empty piece as headroom: when the guest
-//! uses the last empty one, the pool asks for a block more. It keeps one from the moment the
-//! guest's driver takes the pool (`PoolLedger::keep_headroom`), before any take, so the guest's
-//! first take finds a piece made and mapped. A piece that stays empty for [`RELEASE_DELAY`] while a lower one is empty too goes
-//! back to the source ([`BlockSource::release_block`]), as the release below says, and the source
-//! keeps the block ready or frees it; the lowest empty piece stays as the headroom. The delay
-//! rides out churn, where a guest empties and fills a piece again within seconds.
+//! again once its last block went back. The pool keeps [`HEADROOM`] bytes of empty pieces as
+//! headroom, each [`BLOCK_LEN`] long, metal2vulkan-rt's unit: where the guest's use of a piece
+//! leaves the empty pieces, with the asks for more pool no take waits on, fewer bytes than that,
+//! the pool asks for a block more for each piece short ([`State::keep_headroom`]). It keeps them
+//! from the moment the guest's driver takes the pool (`PoolLedger::keep_headroom`), before any
+//! take, so the guest's first takes find pieces made and mapped. The headroom is the lowest empty
+//! pieces the guest may use, each one whose empty pieces below it hold fewer than [`HEADROOM`]
+//! bytes ([`State::empties`]). An empty piece above them that stays empty for [`RELEASE_DELAY`]
+//! goes back to the source ([`BlockSource::release_block`]), as the release below says, and the
+//! source keeps the block ready or frees it. The delay rides out churn, where a guest empties and
+//! fills a piece again within seconds.
 //!
 //! # Release
 //!
@@ -165,19 +169,37 @@ pub const TAKE_WAIT_CODES: [(&str, &str); 4] = [
     ("pool-take-wait-zero-ns", "pool-take-wait-zero-max-ns"),
 ];
 
-/// The length of the piece the pool keeps ahead of the guest's takes, its headroom (the module
-/// doc's "Headroom and giving blocks back"), and of every block [`HostBlocks`] hands out for an
-/// ask no longer: 64 MiB. It is the pool's own: metal2vulkan-rt hands out a block of the length
-/// asked, rounded up to 64 KiB, carved from its 16 MiB allocations (its
-/// `MemoryClass::block_len`) where it fits one, else at the start of an allocation of its own.
+/// The length of each piece the pool asks for as headroom (the module doc's "Headroom and giving
+/// blocks back"), and of every block [`HostBlocks`] hands out for an ask no longer:
+/// metal2vulkan-rt's unit, the length of the Shared allocations its block maker makes ahead of
+/// need ([`MemoryClass::block_len`], 16 MiB), read from rt.
+///
+/// rt hands out a block of the length asked, rounded up to 64 KiB. A take of up to a unit is the
+/// first free range of rt's allocations that fits it: a piece, a whole unit, lands in a unit the
+/// maker made ahead where one is wholly free, with no Vulkan call on the pool's thread, else in a
+/// unit's allocation the take makes; given back, it is a unit's range again, which rt keeps as its
+/// reserve or frees as one unit's call. A longer take makes an allocation of its own length on
+/// the pool's thread, which serves later takes of that length alone and which rt frees as one
+/// call of that length once it has been idle 250 ms. A driver may hold the device's submissions
+/// for the whole of an allocation's or a free's call, longer the longer it is (rt's
+/// `ALLOCATION_LEN`: on an RTX 3090 a 16 MiB Shared allocation held one for 3.3 ms at the median,
+/// one of 256 MiB for 51 ms, **measured**). So a piece is one unit, and a take longer than a piece
+/// has a piece of its own length, its allocation made in its growth.
 ///
 /// On a Radeon 780M a growth of 256 MiB (rt's take, the host's add and its populate) took at
 /// most 10.5, 2.3 and 76.0 ms, and a boot with a desktop, a browser, video and two 3D benchmarks
 /// took nothing longer than 16 MiB and carved at most 73 MiB at once outside the benchmarks
-/// (**measured**, 11-19). A shorter piece holds less memory the guest does not use, and takes
-/// less of the host's time to make, map and give back; a take longer than the piece has a piece
-/// of its own length.
-pub const BLOCK_LEN: u64 = 64 << 20;
+/// (**measured**, 11-19).
+///
+/// [`MemoryClass::block_len`]: metal2vulkan_rt::MemoryClass::block_len
+pub const BLOCK_LEN: u64 = metal2vulkan_rt::MemoryClass::Shared.block_len();
+
+/// The bytes of empty pieces the pool keeps ahead of the guest's takes, its headroom (the module
+/// doc's "Headroom and giving blocks back"): 64 MiB, in pieces of [`BLOCK_LEN`]. On an RTX 3090
+/// and a Radeon 780M, walks of the desktop, browser scroll, WebGL and 4K video, a GL scene and
+/// two 3D benchmarks raised the guest's carved memory by at most 28 MiB net within a window, and
+/// no take waited on a growth, with one 64 MiB piece kept (**measured**, 11-19).
+pub const HEADROOM: u64 = 64 << 20;
 
 /// The alignment of a piece's guest physical address and of a pool's range: 2 MiB, a large page
 /// of the guest's and of the hypervisors' second-level tables.
@@ -384,6 +406,9 @@ struct State {
     by_block: HashMap<BlockId, u64>,
     /// Asks for more pool, oldest first.
     asks: VecDeque<Ask>,
+    /// The length of the ask no take waits on that the pool's thread serves, from its take off
+    /// [`Self::asks`] to its piece's place or its end with no piece; 0 while it serves none.
+    serving: u64,
     /// The asks a take waits on, by number, with where each one's piece went once it was served:
     /// `Some(None)` where no piece came of it (`takes`).
     waits: HashMap<u64, Option<Option<u64>>>,
@@ -439,8 +464,8 @@ impl State {
         self.serial
     }
 
-    /// The guest put something in the piece at `at`: where no other piece is empty, the pool
-    /// asks for a block more, so one stays as headroom.
+    /// The guest put something in the piece at `at`: the pool keeps its headroom
+    /// ([`Self::keep_headroom`]).
     fn use_piece(&mut self, at: u64) {
         let Some(p) = self.pieces.get_mut(&at) else {
             return;
@@ -449,18 +474,37 @@ impl State {
         self.keep_headroom();
     }
 
-    /// Where no piece the guest may use is empty and no ask waits, asks for a block more, so one
-    /// stays as headroom: whether it asked.
+    /// Where the empty pieces the guest may use and the asks for more pool no take waits on, the
+    /// one the pool's thread serves among them, hold fewer than [`HEADROOM`] bytes, asks for a
+    /// block of [`BLOCK_LEN`] for each piece short, so they hold that many: whether it asked.
     fn keep_headroom(&mut self) -> bool {
-        let headroom = (self.pieces.values()).any(|p| p.usable() && p.empty_since.is_some());
-        let ask = !headroom && self.asks.is_empty();
-        if ask {
+        let empty = (self.empties()).fold(0, |all: u64, (_, p, _)| all.saturating_add(p.block.len));
+        let asked = (self.asks.iter())
+            .filter(|a| a.wait.is_none())
+            .fold(self.serving, |all: u64, a| all.saturating_add(a.length));
+        let mut held = empty.saturating_add(asked);
+        let ask = held < HEADROOM;
+        while held < HEADROOM {
             self.asks.push_back(Ask {
                 length: BLOCK_LEN,
                 wait: None,
             });
+            held = held.saturating_add(BLOCK_LEN);
         }
         ask
+    }
+
+    /// The empty pieces the guest may use, lowest address first, each with whether it is of the
+    /// headroom: each one whose empty pieces below it hold fewer than [`HEADROOM`] bytes.
+    fn empties(&self) -> impl Iterator<Item = (u64, &Piece, bool)> {
+        let mut below: u64 = 0;
+        (self.pieces.iter())
+            .filter(|(_, p)| p.usable() && p.empty_since.is_some())
+            .map(move |(&at, p)| {
+                let headroom = below < HEADROOM;
+                below = below.saturating_add(p.block.len);
+                (at, p, headroom)
+            })
     }
 
     /// The guest emptied the piece at `at`, at `now`: nothing of the guest's lies in it, and no
@@ -696,9 +740,9 @@ impl Pool {
     }
 
     /// The guest put something in the piece at `physical_address`, as a context's first block
-    /// in it does (`takes`). Where no other piece is empty, the pool asks for a block more, so one
-    /// stays as headroom. [`Error::InvalidArgument`] for an address where no piece the guest may
-    /// use starts. For the tests, which drive a piece's use without the takes.
+    /// in it does (`takes`): the pool keeps its headroom ([`State::keep_headroom`]).
+    /// [`Error::InvalidArgument`] for an address where no piece the guest may use starts. For the
+    /// tests, which drive a piece's use without the takes.
     #[cfg(test)]
     pub fn piece_used(&self, physical_address: u64) -> Result<(), Error> {
         let mut st = self.shared.state.lock();
@@ -714,10 +758,10 @@ impl Pool {
 
     /// The guest emptied the piece at `physical_address`, as a context's last block in it going
     /// back does (`takes`): no guest mapping of it is left, and nothing of the guest's lies in it.
-    /// [`RELEASE_DELAY`] later, if it is still empty and a lower piece is empty too, its block
-    /// goes back to the source, and the guest may not use it again until the device hands it out
-    /// anew. [`Error::InvalidArgument`] for an address where no piece the guest may use starts.
-    /// For the tests, as [`Pool::piece_used`].
+    /// [`RELEASE_DELAY`] later, if it is still empty and above the headroom, its block goes back to
+    /// the source, and the guest may not use it again until the device hands it out anew.
+    /// [`Error::InvalidArgument`] for an address where no piece the guest may use starts. For the
+    /// tests, as [`Pool::piece_used`].
     #[cfg(test)]
     pub fn piece_empty(&self, physical_address: u64) -> Result<(), Error> {
         let mut st = self.shared.state.lock();
@@ -827,6 +871,7 @@ impl Shared {
                 return;
             }
             if let Some(Ask { length, wait }) = st.asks.pop_front() {
+                st.serving = if wait.is_none() { length } else { 0 };
                 drop(st);
                 let placed = match source.take_block(MemoryClass::Shared, length) {
                     Ok(block) => self.place(source, block),
@@ -835,7 +880,11 @@ impl Shared {
                         None
                     }
                 };
-                if placed.is_some() && self.state.lock().start_zeroer() {
+                let mut st = self.state.lock();
+                st.serving = 0;
+                let start = placed.is_some() && st.start_zeroer();
+                drop(st);
+                if start {
                     takes::spawn_zeroer(self);
                 }
                 // The take waiting on it, where it still does, looks where the piece went.
@@ -868,14 +917,13 @@ impl Shared {
     }
 
     /// The piece whose block goes back now, if any, and how long until the next may: of the
-    /// empty pieces the guest may use, every one but the lowest, once empty for the delay.
+    /// empty pieces the guest may use, every one above the headroom ([`State::empties`]), once
+    /// empty for the delay.
     fn due(&self, st: &State, now: MonoTime) -> (Option<(u64, BlockId)>, Option<Duration>) {
-        let mut empty = (st.pieces.iter()).filter_map(|(&at, p)| {
-            let since = p.empty_since.filter(|_| p.usable())?;
+        let empty = (st.empties()).filter_map(|(at, p, headroom)| {
+            let since = p.empty_since.filter(|_| !headroom)?;
             Some((at, p.block.id, since.saturating_add(self.release_delay)))
         });
-        // The lowest empty piece is the headroom.
-        let _ = empty.next();
         let mut next: Option<Duration> = None;
         for (at, block, when) in empty {
             if when <= now {
@@ -946,6 +994,8 @@ impl Shared {
             },
         );
         st.by_block.insert(block.id, at);
+        // Its ask is served: the piece counts from here on.
+        st.serving = 0;
         drop(st);
         (self.host.add)(at, contents.as_ptr(), block.len);
         Some(at)

@@ -699,10 +699,11 @@ RvgStatus rvg_graphics_device_pool_added(RvgGraphicsDevice *device, uint64_t phy
 RvgStatus rvg_graphics_device_pool_removed(RvgGraphicsDevice *device, uint64_t physical_address);
 
 // Asks for at least `length` more bytes of the guest's Shared pool now, ahead of the guest's own
-// ask, as that ask does: the device's pool thread takes a block of at least `length` bytes (64 MiB
-// for the guest's ask) and asks the host to map it (pool_add). QEMU calls it for its device's
-// `x-pool-grow` property. RVG_ERR_INVALID_ARGUMENT for a device without a pool or a `length` of
-// 0. On any thread: waits for nothing. Calls back: never.
+// ask, as that ask does: the device's pool thread takes a block of at least `length` bytes (one
+// metal2vulkan-rt unit, 16 MiB, for each piece of the guest's headroom) and asks the host to map
+// it (pool_add). QEMU calls it for its device's `x-pool-grow` property. RVG_ERR_INVALID_ARGUMENT
+// for a device without a pool or a `length` of 0. On any thread: waits for nothing. Calls back:
+// never.
 //
 // # Safety
 // `device` is a live graphics device handle.

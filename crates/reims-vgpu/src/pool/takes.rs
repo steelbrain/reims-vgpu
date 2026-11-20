@@ -32,19 +32,19 @@
 //! a take is answered or a block freed and none runs, and gone after [`WORKER_IDLE`] with nothing
 //! to zero) zeroes ahead of the takes, off every take's path, the bytes no carve holds that do
 //! not read zero yet, in the pieces the takes carve next: each piece holding a carve, and the
-//! headroom, the lowest empty piece the guest may use (the pool's module doc), from its place
-//! on. It zeroes nothing in any other empty piece, which goes back whole past its delay unless it
-//! becomes the headroom first. It takes the pieces lowest address first, and in each the lowest
-//! run of such bytes, which a take's first fit meets first, from the run's top down,
-//! [`ZERO_CHUNK`] at a time: with the pool's lock held it claims the chunk and holds its piece as
-//! a [`super::PieceHold`] does ([`State::next_zero`]), lets the lock go while it writes the
-//! chunk's zeros through the piece's mapping, then, the lock held again, records the chunk in
-//! the piece as reading zero ([`Ranges`]) and lets the claim and the piece go
-//! ([`State::zeroed`]), and wakes the pool's waiters, where one waits for a mark, once the lock
-//! is let go of again. Counted: its bytes ([`super::ZEROED_AHEAD_BYTES_CODE`]), its writes'
-//! nanoseconds in all and the longest ([`super::ZERO_WRITE_NS_CODE`]), the longest it held the
-//! lock for a chunk ([`super::ZERO_HOLD_MAX_NS_CODE`]) with the longest of each of its parts, the
-//! pick and the mark, and each hold longer than [`super::ZERO_HOLD_LONG`] with its parts' time
+//! headroom's pieces, the lowest empty pieces the guest may use (the pool's module doc), each from
+//! its place on. It zeroes nothing in any other empty piece, which goes back whole past its delay
+//! unless it becomes one of the headroom's first. It takes the pieces lowest address first, and in
+//! each the lowest run of such bytes, which a take's first fit meets first, from the run's top
+//! down, [`ZERO_CHUNK`] at a time: with the pool's lock held it claims the chunk and holds its
+//! piece as a [`super::PieceHold`] does ([`State::next_zero`]), lets the lock go while it writes
+//! the chunk's zeros through the piece's mapping, then, the lock held again, records the chunk in
+//! the piece as reading zero ([`Ranges`]) and lets the claim and the piece go ([`State::zeroed`]),
+//! and wakes the pool's waiters, where one waits for a mark, once the lock is let go of again.
+//! Counted: its bytes ([`super::ZEROED_AHEAD_BYTES_CODE`]), its writes' nanoseconds in all and the
+//! longest ([`super::ZERO_WRITE_NS_CODE`]), the longest it held the lock for a chunk
+//! ([`super::ZERO_HOLD_MAX_NS_CODE`]) with the longest of each of its parts, the pick and the mark,
+//! and each hold longer than [`super::ZERO_HOLD_LONG`] with its parts' time
 //! ([`super::ZERO_HOLDS_LONG_CODE`]).
 //!
 //! No carve takes the claimed chunk, so no carve's bytes are ever the zeroer's, and the chunk's
@@ -64,7 +64,7 @@
 //! give, and the device frees it once the context's command buffers have finished.
 //!
 //! The zeroer touches no memory the pool does not hold already: the blocks of its pieces alone,
-//! and of those the headroom and the pieces the guest uses.
+//! and of those the headroom's and the pieces the guest uses.
 //!
 //! A take ends only at its answer, its context's close or the device's reset: there is no
 //! timeout. A take whose context closed, or that the reset ended, before its answer is given back
@@ -392,19 +392,19 @@ impl PoolLedger {
     }
 
     /// The guest's driver took the pool: its processes' takes may come from now on, so the pool
-    /// keeps one empty piece ahead of them, as it does once a piece is used (the module doc's
-    /// "Headroom and giving blocks back"). It asks for a block where no piece the guest may use
-    /// is empty and no ask waits: at a boot's take, not after a reset that left an empty piece.
-    /// Whether it asked; waits for nothing.
+    /// keeps its headroom's empty pieces ahead of them, as it does once a piece is used (the
+    /// module doc's "Headroom and giving blocks back"). It asks for a block for each piece the
+    /// headroom is short ([`State::keep_headroom`]): at a boot's take, every one, and after a
+    /// reset that left the headroom's pieces empty, none. Whether it asked; waits for nothing.
     pub(crate) fn keep_headroom(&self) -> bool {
         let asked = self.shared.state.lock().keep_headroom();
         self.shared.changed.notify_all();
         log::info!(
             "pool: the guest's driver took the pool: {}",
             if asked {
-                "a piece is asked ahead of its first take"
+                "pieces are asked ahead of its first take"
             } else {
-                "a piece is empty or asked ahead of its first take"
+                "the headroom's pieces are empty or asked ahead of its first take"
             }
         );
         asked
@@ -771,18 +771,21 @@ impl State {
         start
     }
 
-    /// The headroom: the lowest empty piece the guest may use (the pool's module doc), where one
-    /// is.
-    fn headroom(&self) -> Option<u64> {
-        (self.pieces.iter())
-            .find(|(_, p)| p.usable() && p.empty_since.is_some())
-            .map(|(&at, _)| at)
+    /// The address of the headroom's highest piece, where the headroom has one: of the lowest
+    /// empty pieces the guest may use, the last that is of the headroom ([`State::empties`], the
+    /// pool's module doc). Every empty piece the guest may use at that address or below it is of
+    /// the headroom.
+    fn headroom_top(&self) -> Option<u64> {
+        (self.empties())
+            .take_while(|&(_, _, headroom)| headroom)
+            .last()
+            .map(|(at, _, _)| at)
     }
 
     /// Whether bytes may wait for the zeroer: a piece it zeroes has some pending.
     fn zero_waiting(&self) -> bool {
-        let headroom = self.headroom();
-        (self.pieces.iter()).any(|(&at, p)| p.zero_pending && zeroes_ahead(at, p, headroom))
+        let top = self.headroom_top();
+        (self.pieces.iter()).any(|(&at, p)| p.zero_pending && zeroes_ahead(at, p, top))
     }
 
     /// The zeroer's next chunk, claimed ([`State::claim`]) and its piece held: its piece's
@@ -799,9 +802,9 @@ impl State {
             return None;
         }
         loop {
-            let headroom = self.headroom();
+            let top = self.headroom_top();
             let piece = (self.pieces.iter())
-                .find(|&(&at, p)| p.zero_pending && zeroes_ahead(at, p, headroom))
+                .find(|&(&at, p)| p.zero_pending && zeroes_ahead(at, p, top))
                 .map(|(&at, _)| at)?;
             let chunk = self.lowest_unzeroed(piece);
             let p = self.pieces.get_mut(&piece)?;
@@ -1231,11 +1234,13 @@ pub(super) fn spawn_zeroer(shared: &Arc<Shared>) {
     }
 }
 
-/// Whether the zeroer zeroes the piece `p` at `at` (the module doc's "Zeros ahead"), where
-/// `headroom` is the pool's headroom: a piece the guest may use, with a mapping of the host's,
-/// that holds a carve or is the headroom.
-fn zeroes_ahead(at: u64, p: &Piece, headroom: Option<u64>) -> bool {
-    p.usable() && p.block.contents.is_some() && (p.carves > 0 || headroom == Some(at))
+/// Whether the zeroer zeroes the piece `p` at `at` (the module doc's "Zeros ahead"), where `top`
+/// is the address of the headroom's highest piece ([`State::headroom_top`]): a piece the guest may
+/// use, with a mapping of the host's, that holds a carve or is of the headroom, an empty piece at
+/// `top` or below it.
+fn zeroes_ahead(at: u64, p: &Piece, top: Option<u64>) -> bool {
+    let headroom = p.empty_since.is_some() && top.is_some_and(|top| at <= top);
+    p.usable() && p.block.contents.is_some() && (p.carves > 0 || headroom)
 }
 
 /// The bytes of `parts`.

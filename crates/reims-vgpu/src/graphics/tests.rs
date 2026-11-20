@@ -14191,7 +14191,7 @@ fn a_guest_s_pool_block_is_taken_held_by_its_heap_and_given_back() {
         RGFX_REG_DRIVER_FEATURES_HI.into(),
         (RGFX_FEATURE_POOL >> 32) as u32,
     );
-    // The take of `POOL` asks for a piece ahead of the first take.
+    // The take of `POOL` asks for the headroom's pieces ahead of the first take, the lowest first.
     let at = adds.recv_timeout(Duration::from_secs(10)).unwrap();
     assert_eq!(at, BASE);
     device.pool_added(at).unwrap();
@@ -14265,13 +14265,15 @@ fn a_guest_of_either_architecture_is_offered_the_pool() {
     assert!(headless(&raised).control.shared_pool.is_none());
 }
 
-/// The guest's driver's take of `POOL` asks the host for one piece ahead of its processes' first
-/// take, which that take is carved from with no piece of its own asked; a take of `POOL` again
-/// after a reset, with that piece still empty, asks none; a driver that takes other features and
-/// not `POOL` asks none
+/// The guest's driver's take of `POOL` asks the host for the headroom's pieces ahead of its
+/// processes' first take, which that take is carved from with no piece of its own asked; a take
+/// of `POOL` again after a reset, with those pieces still empty, asks none; a driver that takes
+/// other features and not `POOL` asks none
 #[test]
-fn the_driver_s_take_of_the_pool_asks_one_piece_ahead_of_the_first_take() {
+fn the_driver_s_take_of_the_pool_asks_the_headroom_ahead_of_the_first_take() {
     const BASE: u64 = 52 << 30;
+    use crate::pool::{BLOCK_LEN, HEADROOM};
+    let kept = HEADROOM.div_ceil(BLOCK_LEN);
     let (added, adds) = std::sync::mpsc::channel();
     let added = Mutex::new(added);
     let config = GraphicsConfig {
@@ -14307,7 +14309,13 @@ fn the_driver_s_take_of_the_pool_asks_one_piece_ahead_of_the_first_take() {
         RGFX_REG_DRIVER_FEATURES_HI.into(),
         (RGFX_FEATURE_POOL >> 32) as u32,
     );
-    assert_eq!(adds.recv_timeout(Duration::from_secs(10)), Ok(BASE));
+    for i in 0..kept {
+        assert_eq!(
+            adds.recv_timeout(Duration::from_secs(10)),
+            Ok(BASE + i * BLOCK_LEN)
+        );
+    }
+    quiet(&adds);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
     device.mmio_write(
         RGFX_REG_DRIVER_FEATURES_HI.into(),
@@ -14319,10 +14327,10 @@ fn the_driver_s_take_of_the_pool_asks_one_piece_ahead_of_the_first_take() {
     let mut guest = Guest::new(&device);
     guest.send(&device, pool_take(1, 0x1_0000));
     assert_eq!(pool_block(&mut guest), (RGFX_STATUS_OK, 0, 0x1_0000, 0));
-    // Its piece used, the pool asks for the next as headroom, as it did before the take of `POOL`.
+    // Its piece used, the pool asks for one more as headroom, as it did before the take of `POOL`.
     assert_eq!(
         adds.recv_timeout(Duration::from_secs(10)),
-        Ok(BASE + crate::pool::BLOCK_LEN)
+        Ok(BASE + kept * BLOCK_LEN)
     );
 }
 

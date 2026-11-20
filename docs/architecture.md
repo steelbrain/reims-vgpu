@@ -937,16 +937,18 @@ takes Shared blocks from its block source, places each at the range's lowest fre
 address, and has the host map it there (`pool_add`); a piece is found only once the host says it is
 in (`pool_added`). The source is metal2vulkan-rt's block calls in shape (`take_block`,
 `release_block`); until the device runs on that runtime it is `HostBlocks`, the process's own
-memory. The pool keeps one empty piece as headroom, from the guest driver's take of `POOL` on
-(`Host::pool_taken`), so the guest's first take finds one, and gives a piece that stays empty past
-`RELEASE_DELAY` back to the source, which keeps it ready or frees it. Before a block goes back the
-pool takes its piece out of the lookups, waits for the device's holds on it, asks the host to remove
-it (`pool_remove`), and gives the block back once the host says it is out (`pool_removed`), so the
-source may free any block it gets back at once: no guest access and no thread touches it. A block
-taken again is placed and mapped anew. The device's drop closes the pool after its windows: the
-pool's thread ends, the pool waits for every hold, gives every block back and lets go of the source,
-which frees them; the host has removed every piece before the release (QEMU at its teardown), so the
-pool asks it nothing then.
+memory. A piece the pool asks for itself is one of metal2vulkan-rt's units, 16 MiB (`BLOCK_LEN`,
+read from rt), and a take longer than a unit has a piece of its own length. The pool keeps 64 MiB of
+empty pieces as headroom (`HEADROOM`), from the guest driver's take of `POOL` on
+(`Host::pool_taken`), so the guest's first takes find them, and gives a piece above them that stays
+empty past `RELEASE_DELAY` back to the source, which keeps it ready or frees it. Before a block goes
+back the pool takes its piece out of the lookups, waits for the device's holds on it, asks the host
+to remove it (`pool_remove`), and gives the block back once the host says it is out
+(`pool_removed`), so the source may free any block it gets back at once: no guest access and no
+thread touches it. A block taken again is placed and mapped anew. The device's drop closes the pool
+after its windows: the pool's thread ends, the pool waits for every hold, gives every block back and
+lets go of the source, which frees them; the host has removed every piece before the release (QEMU
+at its teardown), so the pool asks it nothing then.
 
 ### 15.3 Drop order is explicit
 
