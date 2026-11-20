@@ -89,7 +89,7 @@ pub(crate) fn start<P: Platform>(platform: &Arc<P>) {
                     let mut presents = std::mem::take(&mut *PRESENTS.lock());
                     let parts = [
                         Some(presents_part(over, &mut presents)),
-                        rt.next(),
+                        rt.take(),
                         Some(waits_part(&long_waits::take())),
                     ];
                     for part in parts.into_iter().flatten() {

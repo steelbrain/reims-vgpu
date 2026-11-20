@@ -1,5 +1,5 @@
 //! rt's part of the host's summary of each ten seconds (reims-vgpu's `graphics::summary`): what
-//! rt's metrics of the process's device counted since the part before ([`Part::next`]). A
+//! rt's metrics of the process's device counted since the part before ([`Part::take`]). A
 //! diagnostic: the metrics are rt's own, which no Metal call answers, and which lines the host
 //! writes is free under the contract.
 //!
@@ -28,7 +28,7 @@ pub struct Part {
 impl Part {
     /// The part of what rt counted since the part before, or since the device was made; `None`
     /// before a device is made.
-    pub fn next(&mut self) -> Option<String> {
+    pub fn take(&mut self) -> Option<String> {
         let now = super::device::metrics()?;
         let part = line(&self.last.unwrap_or_default(), &now);
         self.last = Some(now);
