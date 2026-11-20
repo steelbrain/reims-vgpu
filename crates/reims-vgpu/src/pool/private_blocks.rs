@@ -1064,10 +1064,16 @@ mod tests {
         let (held, len) = answered(&take(&blocks, 4, 0x1_0000)).unwrap();
         let taking = take(&blocks, 3, GATED);
         source.wait_waiting(1);
+        // The source gives the block in flight only once the release has begun, however slowly
+        // the host runs this thread to it: the worker then finds the takes ended.
         let opener = {
-            let source = Arc::clone(&source);
+            let (source, blocks) = (Arc::clone(&source), blocks.clone());
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
+                let mut state = blocks.inner.state.lock();
+                while !state.closed {
+                    blocks.inner.changed.wait(&mut state);
+                }
+                drop(state);
                 source.open();
             })
         };
