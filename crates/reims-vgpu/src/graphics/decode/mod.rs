@@ -5922,8 +5922,9 @@ impl<P: Platform> CompiledPipeline<P> {
 }
 
 /// [`compile_pipeline`] in the lane's refusal scope ([`refusing`]): a platform refusing the
-/// compile refuses the create, and a refusal's reason names the pipeline's functions and the
-/// constants each was specialised with, for the host's log.
+/// compile refuses the create, and a refusal's reason gives the pipeline's functions by their
+/// stages and the constants each was specialised with, for the host's log
+/// ([`PipelineFunctions`]), and no name of the guest's.
 pub(crate) fn compile_refusing<P: Platform>(
     device: &P::Device,
     job: PipelineJob<P>,
@@ -5944,22 +5945,26 @@ pub(crate) fn compile_refusing<P: Platform>(
     compiled
 }
 
-/// A pipeline create's functions, for the host's log: each stage's function name and the
-/// constants it is specialised with, then each linked function's. A constant reads
+/// A pipeline create's functions, for the host's log: each stage's function by its stage and the
+/// constants it is specialised with, then each linked function's by its stage's linked list. No
+/// function's name is in it: a name is the guest's, and the host's log carries none of the
+/// guest's names. The diagnostics that do name them write files of their own, which stay on the
+/// host and never reach the log (`REIMS_VGPU_REFUSED_AIR_DIR` for a state the translator refused,
+/// `REIMS_VGPU_RECORD` for every call; docs/api.md, "The environment"). A constant reads
 /// `index:Type=value (bytes)`, its value as its lanes read it, little-endian (an integer's in hex,
 /// a float's in decimal in as few digits as read back to it, a bool's as `true` or `false`; a
 /// vector's lanes in parentheses), then its bytes in the order they come:
 /// `114:UInt=0x08000251 (51020008)`. One of a type no function constant takes reads
 /// `index:data_type=bytes`, its `MTLDataType`'s number and its bytes alone.
-pub(crate) struct PipelineFunctions(Vec<(&'static str, String, Vec<FunctionConstant>)>);
+pub(crate) struct PipelineFunctions(Vec<(&'static str, Vec<FunctionConstant>)>);
 
 impl std::fmt::Display for PipelineFunctions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (i, (stage, name, constants)) in self.0.iter().enumerate() {
+        for (i, (stage, constants)) in self.0.iter().enumerate() {
             if i > 0 {
                 f.write_str(", ")?;
             }
-            write!(f, "{stage} {name:?} [")?;
+            write!(f, "{stage} [")?;
             for (j, c) in constants.iter().enumerate() {
                 if j > 0 {
                     f.write_str(" ")?;
@@ -6043,13 +6048,7 @@ impl<P: Platform> PipelineJob<P> {
     pub(crate) fn functions(&self) -> PipelineFunctions {
         let linked = |stage: &'static str, refs: &[LinkedRef<P>]| {
             refs.iter()
-                .map(move |r| {
-                    let name = match &r.specialized_name {
-                        Some(specialized) => format!("{} as {specialized:?}", r.name),
-                        None => r.name.clone(),
-                    };
-                    (stage, name, r.constants.clone())
-                })
+                .map(move |r| (stage, r.constants.clone()))
                 .collect::<Vec<_>>()
         };
         let mut out = Vec::new();
@@ -6062,9 +6061,9 @@ impl<P: Platform> PipelineJob<P> {
                 fragment_linked,
                 ..
             } => {
-                out.push(("vertex", vertex_name.clone(), vertex_constants.clone()));
-                if let Some((_, name, constants)) = fragment {
-                    out.push(("fragment", name.clone(), constants.clone()));
+                out.push(("vertex", vertex_constants.clone()));
+                if let Some((_, _, constants)) = fragment {
+                    out.push(("fragment", constants.clone()));
                 }
                 out.extend(linked("vertex-linked", vertex_linked));
                 out.extend(linked("fragment-linked", fragment_linked));
@@ -6079,24 +6078,23 @@ impl<P: Platform> PipelineJob<P> {
                     fragment_linked,
                     ..
                 } = &**shape;
-                if let Some((_, name, constants)) = object {
-                    out.push(("object", name.clone(), constants.clone()));
+                if let Some((_, _, constants)) = object {
+                    out.push(("object", constants.clone()));
                 }
-                out.push(("mesh", mesh.1.clone(), mesh.2.clone()));
-                if let Some((_, name, constants)) = fragment {
-                    out.push(("fragment", name.clone(), constants.clone()));
+                out.push(("mesh", mesh.2.clone()));
+                if let Some((_, _, constants)) = fragment {
+                    out.push(("fragment", constants.clone()));
                 }
                 out.extend(linked("object-linked", object_linked));
                 out.extend(linked("mesh-linked", mesh_linked));
                 out.extend(linked("fragment-linked", fragment_linked));
             }
             PipelineShape::Compute {
-                name,
                 constants,
                 linked: refs,
                 ..
             } => {
-                out.push(("kernel", name.clone(), constants.clone()));
+                out.push(("kernel", constants.clone()));
                 out.extend(linked("linked", refs));
             }
         }
@@ -6118,7 +6116,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
     let refused = |reason: String| CompiledPipeline::refused(obj_id, seqno, kind, reason);
     let no_library = |stage: &str| format!("its {stage} function's library was refused");
     let no_function =
-        |name: &str| format!("the library made no function {name:?} of its constants");
+        |stage: &str| format!("the library made no {stage} function of its constants");
     match job.shape {
         PipelineShape::Render {
             vertex_library,
@@ -6147,7 +6145,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
             let Some(vertex) =
                 stage_function::<P>(&vertex_library, &vertex_name, &vertex_constants)?
             else {
-                return Ok(refused(no_function(&vertex_name)));
+                return Ok(refused(no_function("vertex")));
             };
             let fragment = match fragment {
                 None => None,
@@ -6156,7 +6154,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
                         return Ok(refused(no_library("fragment")));
                     };
                     let Some(function) = stage_function::<P>(&library, &name, &constants)? else {
-                        return Ok(refused(no_function(&name)));
+                        return Ok(refused(no_function("fragment")));
                     };
                     Some(function)
                 }
@@ -6232,7 +6230,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
                     return Ok(Err(no_library(stage)));
                 };
                 Ok(stage_function::<P>(&library, &name, &constants)?
-                    .ok_or_else(|| no_function(&name)))
+                    .ok_or_else(|| no_function(stage)))
             };
             let object = match object.map(|f| function("object", f)).transpose()? {
                 None => None,
@@ -6322,7 +6320,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
                 return Ok(refused(no_library("kernel")));
             };
             let Some(function) = stage_function::<P>(&library, &name, &constants)? else {
-                return Ok(refused(no_function(&name)));
+                return Ok(refused(no_function("kernel")));
             };
             let linked = match linked_functions::<P>(linked)? {
                 Ok(linked) => linked,
@@ -6457,17 +6455,15 @@ fn specialised<P: Platform>(
 
 /// The linked functions `refs` name, made: each from its library, specialised by its constants,
 /// with its options where it was made with any, in its list. A library the platform refused, or
-/// a function the library makes none of, is the refusal's reason.
+/// a function the library makes none of, is the refusal's reason, which gives the linked function
+/// by its place among the stage's, from 0, and not by its name, the guest's.
 fn linked_functions<P: Platform>(
     refs: Vec<LinkedRef<P>>,
 ) -> RaiseResult<Result<LinkedFunctionsDesc<P>, String>> {
     let mut out = LinkedFunctionsDesc::<P>::default();
-    for r in refs {
+    for (at, r) in refs.into_iter().enumerate() {
         let Some(library) = r.library.resolve() else {
-            return Ok(Err(format!(
-                "linked function {:?}'s library was refused",
-                r.name
-            )));
+            return Ok(Err(format!("linked function {at}'s library was refused")));
         };
         let function = if r.options == 0 && r.specialized_name.is_none() {
             specialised::<P>(&library, &r.name, &r.constants)?
@@ -6482,8 +6478,7 @@ fn linked_functions<P: Platform>(
         };
         let Some(function) = function else {
             return Ok(Err(format!(
-                "the library made no linked function {:?} of its constants and options",
-                r.name
+                "the library made no linked function {at} of its constants and options"
             )));
         };
         match r.list {
@@ -7406,7 +7401,7 @@ mod tests {
     /// A pipeline's functions read each constant's value as its type's lanes read it,
     /// little-endian, before its bytes in order: a `uint` in hex, a `float` in decimal, a vector's
     /// lanes each (a `half2`, a `bool3`, a `short2`), and a type no constant takes by its number
-    /// and bytes alone
+    /// and bytes alone; each function by its stage alone
     #[test]
     fn a_pipeline_s_functions_read_each_constant_s_value_by_its_type() {
         use reims_vgpu_vulkan::core::platform::resource::FunctionConstant;
@@ -7423,7 +7418,6 @@ mod tests {
         let functions = super::PipelineFunctions(vec![
             (
                 "vertex",
-                "vs".to_owned(),
                 vec![
                     constant(114, 33, &[0x51, 0x02, 0x00, 0x08]), // UInt
                     constant(2, 3, &1.5f32.to_le_bytes()),        // Float
@@ -7431,7 +7425,6 @@ mod tests {
             ),
             (
                 "fragment",
-                "fs".to_owned(),
                 vec![
                     constant(0, 17, &[0x00, 0x3c, 0x01, 0xc0]), // Half2: 1.0, -2.001953125 exactly
                     constant(1, 55, &[1, 0, 1]),                // Bool3
@@ -7445,8 +7438,8 @@ mod tests {
         assert_eq!(
             functions.to_string(),
             format!(
-                "vertex \"vs\" [114:UInt=0x08000251 (51020008) 2:Float=1.5 (0000c03f)], \
-                 fragment \"fs\" [0:Half2=(1.0, -2.0019531) (003c01c0) \
+                "vertex [114:UInt=0x08000251 (51020008) 2:Float=1.5 (0000c03f)], \
+                 fragment [0:Half2=(1.0, -2.0019531) (003c01c0) \
                  1:Bool3=(true, false, true) (010001) 3:Short2=(0xffff, 0x0002) (ffff0200) \
                  4:121={bfloat}]"
             )
@@ -10763,8 +10756,13 @@ lacks {part}"
 
     /// A compute create of library 1's `cmain`, with no field past its function set.
     pub(super) fn compute_create(obj_id: u64) -> Vec<u8> {
+        compute_create_named(obj_id, "cmain")
+    }
+
+    /// [`compute_create`] of library 1's `name`.
+    fn compute_create_named(obj_id: u64, name: &str) -> Vec<u8> {
         let head = size_of::<RgfxComputePipelineCreate>() as u32;
-        let name = b"cmain".as_slice();
+        let name = name.as_bytes();
         let total = (head as usize + name.len()).next_multiple_of(8);
         let m = RgfxComputePipelineCreate {
             header: RgfxMsgHeader {
@@ -11013,6 +11011,80 @@ lacks {part}"
             ]
         );
         assert_eq!(dec.object_count(), 1, "only the library");
+    }
+
+    /// No reason a refused create gives, which the host's log writes, names a function the
+    /// guest named: a kernel the library makes none of, a linked function it makes none of, and a
+    /// state the platform makes none of, each of functions named `secret_fn`, give their stage, a
+    /// linked function's place among its stage's, and the constants, and no name
+    #[test]
+    fn a_refused_create_s_reason_names_no_function_of_the_guest_s() {
+        use reims_vgpu_vulkan::core::testkit::faults::Fault;
+        let (p, dec, _) = pipeline_decoder();
+        let device = p.device();
+        let secret = "secret_fn";
+        let reason = |bytes: &[u8]| {
+            let job = dec.prepare_pipeline(bytes).expect("a prepared create");
+            let compiled = compile_refusing::<FakePlatform>(&device, job);
+            compiled.refusal().expect("a refused create").to_owned()
+        };
+        let constant = RgfxFunctionConstant {
+            index: 2,
+            data_type: 29,
+            value: [7; 32],
+        };
+        let linked = |obj_id| {
+            let mut bytes = compute_create_named(obj_id, secret);
+            let linked = append_linked(
+                &mut bytes,
+                1,
+                &[(secret, RGFX_LINKED_FUNCTIONS, 0, "", &[constant], secret)],
+            );
+            edit_head(&mut bytes, |m: &mut RgfxComputePipelineCreate| {
+                (m.linked_offset, m.linked_count) = linked;
+            });
+            bytes
+        };
+
+        p.faults().at(
+            "MTLLibrary",
+            "newFunctionWithName:constantValues:error:",
+            0,
+            Fault::Nil,
+        );
+        let kernel = reason(&compute_create_named(100, secret));
+        assert_eq!(
+            kernel,
+            "the library made no kernel function of its constants; its functions: kernel []"
+        );
+        p.faults().at(
+            "MTLLibrary",
+            "newFunctionWithDescriptor:error:",
+            0,
+            Fault::Nil,
+        );
+        let made_none = reason(&linked(101));
+        assert!(
+            made_none.starts_with(
+                "the library made no linked function 0 of its constants and options; its \
+                 functions: kernel [], linked [2:Int="
+            ),
+            "{made_none}"
+        );
+        p.faults().at(
+            "MTLDevice",
+            "newComputePipelineStateWithDescriptor:options:reflection:error:",
+            0,
+            Fault::Nil,
+        );
+        let state = reason(&linked(102));
+        assert!(
+            state.starts_with("the platform answered nil; its functions: kernel [], linked ["),
+            "{state}"
+        );
+        for reason in [kernel, made_none, state] {
+            assert!(!reason.contains(secret), "{reason}");
+        }
     }
 
     /// A linked function the guest gave a specialized name is made by descriptor with that name,
