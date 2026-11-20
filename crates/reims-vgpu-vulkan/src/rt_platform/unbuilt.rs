@@ -975,16 +975,14 @@ mod tests {
             |r| {
                 assert_eq!(r.outcome(), &Outcome::Returned, "{}", r.stderr());
                 let out = r.stderr();
+                // A line ends with what was written: the child's first line starts with
+                // libtest's own "test NAME ... ".
                 let lines: Vec<&str> = out.lines().collect();
-                assert!(
-                    lines.contains(
-                        &"reims-vgpu: newRenderPipelineStateWithDescriptor:error:: \
-                          metal2vulkan-runtime refused it (the translator refused the feature \
-                          Lowering(Texture), needing NotImplemented); refused \
-                          (rt-refused-translation), the first of its kind"
-                    ),
-                    "{out}"
-                );
+                let first_of_kind = "reims-vgpu: newRenderPipelineStateWithDescriptor:error:: \
+                                     metal2vulkan-runtime refused it (the translator refused the \
+                                     feature Lowering(Texture), needing NotImplemented); refused \
+                                     (rt-refused-translation), the first of its kind";
+                assert!(lines.iter().any(|l| l.ends_with(first_of_kind)), "{out}");
                 for name in ["Lowering", "InvalidDescriptor", "NeedsInput"] {
                     let first = format!("the first of Translation-{name} (rt-refused-translation)");
                     assert!(lines.iter().any(|l| l.ends_with(&first)), "{first}: {out}");
@@ -1003,8 +1001,8 @@ mod tests {
                     "the translator refused it",
                 ]
                 .map(answered);
-                let said: Vec<&str> = (lines.iter().copied())
-                    .filter(|l| l.starts_with("test: NSError: "))
+                let said: Vec<&str> = (lines.iter())
+                    .filter_map(|l| l.find("test: NSError: ").map(|at| &l[at..]))
                     .collect();
                 assert_eq!(said, answers, "{out}");
                 assert!(!out.contains(SECRET), "{out}");

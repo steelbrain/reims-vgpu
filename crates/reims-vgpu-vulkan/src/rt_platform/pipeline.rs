@@ -665,9 +665,11 @@ mod tests {
                     "test: NSError: metal2vulkan-runtime refused it: {said} \
                      (rt-refused-metal)"
                 );
+                // A line ends with what was written: the child's first line starts with
+                // libtest's own "test NAME ... ".
                 let lines: Vec<&str> = out.lines().collect();
-                assert!(lines.contains(&line.as_str()), "{out}");
-                assert!(lines.contains(&answered.as_str()), "{out}");
+                assert!(lines.iter().any(|l| l.ends_with(&line)), "{out}");
+                assert!(lines.iter().any(|l| l.ends_with(&answered)), "{out}");
                 assert!(!out.contains(NAME), "{out}");
             },
         );
