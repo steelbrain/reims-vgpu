@@ -16,6 +16,7 @@
 #include <mach/mach_vm.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 #include <algorithm>
 #include <atomic>
@@ -4836,8 +4837,13 @@ static unsigned shadowDepthAt(const void *address) { return regionAt(address).sh
 // no write is unchanging where the kernel answers it copy-on-write with a copy pending on its own
 // object (kRgfxAnonymousCopyOnWrite), as vm_copy leaves its destination, which keeps its bytes
 // when the source is written after; it is neither, why not a file, with write in its maximum
-// protection, held by the process alone (SM_PRIVATE), mapped at a second address too, or
-// copy-on-write over an object below its own.
+// protection, held by the process alone (SM_PRIVATE) where the kext takes no sole holder's
+// memory, mapped at a second address too, or copy-on-write over an object below its own. Where
+// the kext takes it, anonymous memory the process's mapping alone holds, a count of 1, is
+// unchanging (kRgfxAnonymousPrivate); a memory entry of it, or a second mapping, which takes no
+// write the maximum lacks, holds it too, a count of 2, and it is neither until the holder goes; and
+// a process that asked for its regions' footprint is answered a count of 1 for every page with an
+// id of none of its objects, so neither.
 void test_file_pages_classify()
 {
 	const uint64_t page = vm_page_size;
@@ -4907,6 +4913,48 @@ void test_file_pages_classify()
 	RgfxFilePages f = rgfxFilePagesOf(anon + into, length);
 	CHECK(f.clause == kRgfxFileNeither && f.why == kRgfxNeitherNotAFile);
 	CHECK(mprotect(anon, mapped, PROT_READ | PROT_WRITE) != 0);
+
+	// Where the kext takes a sole holder's memory: the mapping alone holds it, and it is unchanging.
+	auto soleHolder = [&]() {
+		const RgfxFilePages p = rgfxFilePagesOf(anon + into, length, true);
+		return p.clause == kRgfxAnonymousPrivate && p.why == kRgfxNeitherNone;
+	};
+	CHECK(pageAt(anon).ref_count == 1 && pageAt(anon).depth == 0);
+	CHECK(static_cast<uint32_t>(pageAt(anon).object_id) == regionAt(anon).object_id);
+	CHECK(soleHolder());
+	// A memory entry of it holds it too, and a second mapping, which takes no write the maximum
+	// lacks: neither while each lasts.
+	mach_port_t entry = MACH_PORT_NULL;
+	memory_object_size_t entryBytes = mapped;
+	CHECK(mach_make_memory_entry_64(mach_task_self(), &entryBytes, reinterpret_cast<uintptr_t>(anon),
+	                                VM_PROT_READ | MAP_MEM_VM_SHARE, &entry,
+	                                MACH_PORT_NULL) == KERN_SUCCESS);
+	CHECK(pageAt(anon).ref_count == 2);
+	RgfxFilePages held = rgfxFilePagesOf(anon + into, length, true);
+	CHECK(held.clause == kRgfxFileNeither && held.why == kRgfxNeitherNotAFile);
+	mach_port_deallocate(mach_task_self(), entry);
+	CHECK(pageAt(anon).ref_count == 1 && soleHolder());
+	mach_vm_address_t second = 0;
+	vm_prot_t secondCur = VM_PROT_NONE, secondMax = VM_PROT_NONE;
+	CHECK(mach_vm_remap(mach_task_self(), &second, mapped, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
+	                    reinterpret_cast<uintptr_t>(anon), false, &secondCur, &secondMax,
+	                    VM_INHERIT_NONE) == KERN_SUCCESS);
+	CHECK((secondMax & VM_PROT_WRITE) == 0 && pageAt(anon).ref_count == 2);
+	CHECK(rgfxFilePagesOf(anon + into, length, true).clause == kRgfxFileNeither);
+	mach_vm_deallocate(mach_task_self(), second, mapped);
+	CHECK(pageAt(anon).ref_count == 1 && soleHolder());
+	// Asked for its regions' footprint: a count of 1 with an id of none of its objects, neither.
+	int footprint = 1;
+	CHECK(sysctlbyname("vm.self_region_footprint", nullptr, nullptr, &footprint,
+	                   sizeof(footprint)) == 0);
+	const vm_page_info_basic_data_t told = pageAt(anon);
+	const bool fake = told.ref_count == 1 &&
+	                  static_cast<uint32_t>(told.object_id) != regionAt(anon).object_id;
+	const bool refusedThen = rgfxFilePagesOf(anon + into, length, true).clause == kRgfxFileNeither;
+	footprint = 0;
+	CHECK(sysctlbyname("vm.self_region_footprint", nullptr, nullptr, &footprint,
+	                   sizeof(footprint)) == 0);
+	CHECK(fake && refusedThen && soleHolder());
 
 	// Mapped at a second address too, writable there: truly shared, neither.
 	uint8_t *aliased = anonymous(mapped, 0x44);
@@ -4997,7 +5045,9 @@ void test_file_pages_classify()
 // memory is not classified, and without setUnchangingPages nothing is. Anonymous memory whose
 // maximum protection has no write is named unchanging and copy-on-write with a copy pending on its
 // own object, the GPU's pages the copy's bytes, and is read-only, why not a file, where the
-// process holds it alone. Each classification is counted.
+// process holds it alone, until the kext takes a sole holder's memory (setSoleHolderPages): then it
+// is named unchanging and a sole holder's, the GPU's pages its bytes, and asked again read-only,
+// why refused, where the kext refuses that. Each classification is counted.
 void test_region_unchanging_file_pages()
 {
 	const uint64_t page = vm_page_size;
@@ -5196,11 +5246,45 @@ void test_region_unchanging_file_pages()
 	      grew(last.bytes, after.bytes, kRgfxAnonymousCopyOnWrite) == length &&
 	      last.neitherCount[kRgfxNeitherNotAFile] - after.neitherCount[kRgfxNeitherNotAFile] == 1);
 
+	// Where the kext takes a sole holder's memory, anonymous memory the process's mapping alone
+	// holds is named unchanging and a sole holder's, the GPU's pages its bytes; refused, it is
+	// asked again read-only, why refused. Each counted by its clause.
+	CHECK(!region.soleHolderPages());
+	region.setSoleHolderPages(true);
+	CHECK(region.soleHolderPages());
+	mach_vm_address_t sole = 0, refusedSole = 0;
+	for (mach_vm_address_t *a : {&sole, &refusedSole}) {
+		CHECK(mach_vm_allocate(mach_task_self(), a, mapped, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+		std::memset(reinterpret_cast<void *>(*a), 0x3c, mapped);
+		CHECK(mach_vm_protect(mach_task_self(), *a, mapped, true, VM_PROT_READ) == KERN_SUCCESS);
+	}
+	const uint32_t soleHow = RgfxRegion::kPagesUnchanging | RgfxRegion::kPagesSoleHolder;
+	uint8_t *soleBytes = reinterpret_cast<uint8_t *>(sole);
+	RgfxRegion::Block m = region.acquirePages(soleBytes + into, length, false, RgfxRegion::kPagesOwn);
+	CHECK(m.ok && src.asked.size() == 11 && src.asked[10].how == soleHow &&
+	      src.asked[10].address == soleBytes + into);
+	CHECK(src.asked[10].seen == std::vector<uint8_t>(length, 0x3c) &&
+	      src.now(10) == src.asked[10].seen);
+	src.refuseUnchanging = true;
+	uint8_t *refusedBytes = reinterpret_cast<uint8_t *>(refusedSole);
+	RgfxRegion::Block n =
+	    region.acquirePages(refusedBytes + into, length, false, RgfxRegion::kPagesOwn);
+	CHECK(n.ok && src.asked.size() == 13 && src.asked[11].how == soleHow &&
+	      src.asked[12].how == (RGFX_PAGES_WHY_REFUSED << shift) &&
+	      src.asked[12].address == refusedBytes + into);
+	src.refuseUnchanging = false;
+	const RgfxFilePagesCounts soleCounts = rgfxFilePagesCounts();
+	CHECK(soleCounts.classified - last.classified == 2 &&
+	      grew(soleCounts.count, last.count, kRgfxAnonymousPrivate) == 2 &&
+	      grew(soleCounts.bytes, last.bytes, kRgfxAnonymousPrivate) == 2 * length &&
+	      soleCounts.kextRefused - last.kextRefused == 1);
+
 	for (const Source::Ask &ask : src.asked)
 		mach_port_deallocate(mach_task_self(), ask.held);
 	for (mach_vm_address_t a : {from, to})
 		mach_vm_deallocate(mach_task_self(), a, large);
-	mach_vm_deallocate(mach_task_self(), alone, mapped);
+	for (mach_vm_address_t a : {alone, sole, refusedSole})
+		mach_vm_deallocate(mach_task_self(), a, mapped);
 	munmap(written, mapped);
 	munmap(cow, mapped);
 	munmap(priv, mapped);

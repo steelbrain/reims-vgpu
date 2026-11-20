@@ -255,15 +255,18 @@ public:
 	                                 const RgfxSurfacePagesLayout *layout, PagesAnswer *answer);
 
 	/// How a pages block's memory is (PagesBlockFn's `how`, the kext's kRgfxPagesWritable,
-	/// kRgfxPagesUnchanging, kRgfxPagesCopyOnWrite and kRgfxPagesWhyShift): none of them for
-	/// memory the process may not write; kPagesWritable for memory it may; kPagesUnchanging for
-	/// read-only memory that cannot change (RgfxFilePages.hpp), with kPagesCopyOnWrite where the
-	/// app maps it private and copy-on-write (a file's, or anonymous memory with a copy pending);
-	/// and for read-only memory not named unchanging, why not in the bits from kPagesWhyShift
-	/// (RGFX_PAGES_WHY_*, a diagnostic the host counts its copies by).
+	/// kRgfxPagesUnchanging, kRgfxPagesCopyOnWrite, kRgfxPagesSoleHolder and kRgfxPagesWhyShift):
+	/// none of them for memory the process may not write; kPagesWritable for memory it may;
+	/// kPagesUnchanging for read-only memory that cannot change (RgfxFilePages.hpp), with
+	/// kPagesCopyOnWrite where the app maps it private and copy-on-write (a file's, or anonymous
+	/// memory with a copy pending), or kPagesSoleHolder where the app's mapping alone holds the
+	/// anonymous memory, which the kext makes a block of only where no writable block of its own
+	/// covers a page of it; and for read-only memory not named unchanging, why not in the bits
+	/// from kPagesWhyShift (RGFX_PAGES_WHY_*, a diagnostic the host counts its copies by).
 	static const uint32_t kPagesWritable = 1u << 0;
 	static const uint32_t kPagesUnchanging = 1u << 1;
 	static const uint32_t kPagesCopyOnWrite = 1u << 2;
+	static const uint32_t kPagesSoleHolder = 1u << 3;
 	static const uint32_t kPagesWhyShift = 8;
 
 	/// Where pages blocks come from (the kext's PagesBlock, RGFX_FEATURE_PAGES_BUFFERS): `acquire`
@@ -287,6 +290,13 @@ public:
 	/// block source, before any block is asked.
 	void setUnchangingPages(bool on) { m_unchangingPages = on; }
 	bool unchangingPages() const { return m_unchangingPages; }
+
+	/// Whether the pages block source takes a sole holder's memory too (kPagesSoleHolder), where
+	/// the kext took it (kRgfxKextFeatureSoleHolderPages): acquirePages then names unchanging the
+	/// anonymous memory the app's mapping alone holds (kRgfxAnonymousPrivate). Set with
+	/// setUnchangingPages.
+	void setSoleHolderPages(bool on) { m_soleHolderPages = on; }
+	bool soleHolderPages() const { return m_soleHolderPages; }
 
 	/// Where chunked pages blocks come from (the kext's PagesChunked,
 	/// kRgfxKextFeaturePagesChunked): `make` answers `length` bytes of the kext's own memory,
@@ -342,10 +352,10 @@ public:
 	///
 	/// Where the source takes unchanging memory (setUnchangingPages), memory the process may not
 	/// write that a block is made for is classified (rgfxFilePagesOf): where it cannot change, the
-	/// block of the app's own memory is asked named kPagesUnchanging (and kPagesCopyOnWrite), which
-	/// the host reads once; else, and where the kext refuses that, it is asked read-only with why
-	/// not (kPagesWhyShift; RGFX_PAGES_WHY_REFUSED for the kext's refusal). Each classification is
-	/// counted (rgfxFilePagesNote), and only it is timed.
+	/// block of the app's own memory is asked named kPagesUnchanging (and kPagesCopyOnWrite, or
+	/// kPagesSoleHolder), which the host reads once; else, and where the kext refuses that, it is
+	/// asked read-only with why not (kPagesWhyShift; RGFX_PAGES_WHY_REFUSED for the kext's
+	/// refusal). Each classification is counted (rgfxFilePagesNote), and only it is timed.
 	Block acquirePages(const void *address, uint64_t length, bool writable,
 	                   uint32_t join = kPagesOwn);
 
@@ -406,6 +416,7 @@ private:
 	PagesBlockFn m_pagesBlock = nullptr; // the pages block source, where set (the kext)
 	void *m_pagesBlockContext = nullptr;
 	bool m_unchangingPages = false; // unchangingPages()
+	bool m_soleHolderPages = false; // soleHolderPages()
 	ChunkedPagesFn m_chunkedPages = nullptr; // the chunked pages source, where set (the kext)
 	void *m_chunkedPagesContext = nullptr;
 #if defined(__arm64__)

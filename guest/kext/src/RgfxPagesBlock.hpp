@@ -14,18 +14,35 @@
 // Memory the bundle names unchanging (kRgfxPagesUnchanging) takes a block where the guest took
 // RGFX_FEATURE_UNCHANGING_PAGES too: read-only memory its process can never write and no one else
 // writes, mapped with no write in the mapping's maximum protection, a file's pages on a read-only
-// volume or anonymous memory with a copy pending, as the bundle finds it at the call (its
-// RgfxFilePages.hpp). It is the app's own memory, wired for reading as any read-only memory is: a
-// shared mapping's pages are the file's own, and a private copy-on-write one's are copied for the
-// process by the wire, as IOMemoryDescriptor::prepare's vm_map_create_upl resolves the entry's
-// copy and vm_object_iopl_request faults each page into the process's own object (read from
-// xnu's osfmk/vm/vm_pageout.c, which holds both), as a Mac's driver's wire of an app's memory
-// does; the process can write neither. The block's SURFACE_PAGES is marked
-// RGFX_SURFACE_PAGES_UNCHANGING, and RGFX_SURFACE_PAGES_COPY_ON_WRITE where the bundle names the
-// memory so too, for the host to read the pages once. Read-only memory not named unchanging may
-// carry why not (kRgfxPagesWhyShift, the RGFX_PAGES_WHY_* values), which the block's SURFACE_PAGES
-// carries on to the host in its RGFX_SURFACE_PAGES_WHY_SHIFT bits, where the guest took
-// RGFX_FEATURE_UNCHANGING_PAGES: a diagnostic the host counts its copies by.
+// volume, anonymous memory with a copy pending, or anonymous memory its mapping alone holds
+// (below), as the bundle finds it at the call (its RgfxFilePages.hpp). It is the app's own memory,
+// wired for reading as any read-only memory is: a shared mapping's pages are the file's own, and a
+// private copy-on-write one's are copied for the process by the wire, as
+// IOMemoryDescriptor::prepare's vm_map_create_upl resolves the entry's copy and
+// vm_object_iopl_request faults each page into the process's own object (read from xnu's
+// osfmk/vm/vm_pageout.c, which holds both), as a Mac's driver's wire of an app's memory does; the
+// process can write neither. The block's SURFACE_PAGES is marked RGFX_SURFACE_PAGES_UNCHANGING, and
+// RGFX_SURFACE_PAGES_COPY_ON_WRITE where the bundle names the memory so too, for the host to read
+// the pages once. Read-only memory not named unchanging may carry why not (kRgfxPagesWhyShift, the
+// RGFX_PAGES_WHY_* values), which the block's SURFACE_PAGES carries on to the host in its
+// RGFX_SURFACE_PAGES_WHY_SHIFT bits, where the guest took RGFX_FEATURE_UNCHANGING_PAGES: a
+// diagnostic the host counts its copies by.
+//
+// Memory the bundle names a sole holder's (kRgfxPagesSoleHolder, with kRgfxPagesUnchanging alone)
+// is anonymous memory its process maps with no write in the mapping's maximum protection and its
+// mapping alone holds, as the bundle finds it at the call (its RgfxFilePages.hpp). A wire holds no
+// reference to the memory it wires, so the count the bundle reads leaves out the wires of drivers
+// taken while the memory was writable. The kext's own are known to it: such a block is made only
+// where, once its pages are wired, no writable block of the kext's in the table covers a page of
+// them, nor the pages of an in-place surface block, and no block of writable memory is being made
+// (the kext's pagesBlock, soleHolderAlone), which compares the block's runs, sorted and made apart
+// (rgfxRunsSorted), with each such block's physical segments (rgfxRunsMeet). It is then marked as
+// unchanging memory is, without RGFX_SURFACE_PAGES_COPY_ON_WRITE. The check leaves out the kext's
+// other writable wires: of IOSurfaces' memory outside its blocks (a lock's carry, a surface lent
+// to the host's video), of its own buffers, and of a call's structure output in its caller's
+// memory, which the kext writes during the call alone. Such a call started before the process
+// removed write, still writing after this call, is the bundle's residual, as another driver's
+// wire for writing is (its RgfxFilePages.hpp).
 //
 // Where the guest took RGFX_FEATURE_IMPORT_ADDRESSES, the device answers a pages block's
 // SURFACE_PAGES with the GPU address of the block's view, at which the bundle places its buffers
@@ -95,6 +112,9 @@ enum class RgfxPagesAccess { kRefused, kBadArgument, kRead, kReadWrite };
 struct RgfxPagesWiring {
 	RgfxPagesAccess access;
 	uint32_t flags;
+	// Named a sole holder's (kRgfxPagesSoleHolder): the block is made only where no writable
+	// block of the kext's covers a page of it (RgfxPagesBlock.hpp).
+	bool soleHolder;
 };
 
 // The wiring of a pages block over memory the process maps as `how` says (kRgfxPagesWritable,
@@ -111,33 +131,37 @@ struct RgfxPagesWiring {
 // RGFX_FEATURE_UNCHANGING_PAGES too, as read-only memory, its block marked
 // RGFX_SURFACE_PAGES_UNCHANGING too, and RGFX_SURFACE_PAGES_COPY_ON_WRITE where `how` says so, and
 // without the bit none, as a host that does not know the mark could not tell its pages from any
-// read-only memory's. Bits of no meaning, writable unchanging memory, copy-on-write memory not
-// named unchanging and a why with writable or unchanging memory are no mapping at all
-// (kBadArgument).
+// read-only memory's; memory named a sole holder's as unchanging memory, `soleHolder` set. Bits
+// of no meaning, writable unchanging memory, copy-on-write memory not named unchanging, a sole
+// holder's memory not named unchanging or named copy-on-write too, and a why with writable or
+// unchanging memory are no mapping at all (kBadArgument).
 inline RgfxPagesWiring rgfxPagesWiring(uint64_t how, uint64_t word)
 {
 	const bool writable = (how & kRgfxPagesWritable) != 0;
 	const bool unchanging = (how & kRgfxPagesUnchanging) != 0;
 	const bool copyOnWrite = (how & kRgfxPagesCopyOnWrite) != 0;
+	const bool soleHolder = (how & kRgfxPagesSoleHolder) != 0;
 	const uint64_t why = (how & kRgfxPagesWhyMask) >> kRgfxPagesWhyShift;
 	if ((how & ~static_cast<uint64_t>(kRgfxPagesHowBits | kRgfxPagesWhyMask)) != 0 ||
 	    (unchanging && writable) || (copyOnWrite && !unchanging) ||
-	    (why != 0 && (writable || unchanging)))
-		return {RgfxPagesAccess::kBadArgument, 0};
+	    (soleHolder && (!unchanging || copyOnWrite)) || (why != 0 && (writable || unchanging)))
+		return {RgfxPagesAccess::kBadArgument, 0, false};
 	if (writable)
-		return {RgfxPagesAccess::kReadWrite, RGFX_SURFACE_PAGES_PRIVATE};
+		return {RgfxPagesAccess::kReadWrite, RGFX_SURFACE_PAGES_PRIVATE, false};
 	if (!(word & RGFX_FEATURE_READ_ONLY_PAGES))
-		return {RgfxPagesAccess::kRefused, 0};
+		return {RgfxPagesAccess::kRefused, 0, false};
 	const uint32_t readOnly = RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_READ_ONLY;
 	const bool marks = (word & RGFX_FEATURE_UNCHANGING_PAGES) != 0;
 	if (!unchanging) {
 		const uint32_t said = marks ? static_cast<uint32_t>(why) << RGFX_SURFACE_PAGES_WHY_SHIFT : 0;
-		return {RgfxPagesAccess::kRead, readOnly | said};
+		return {RgfxPagesAccess::kRead, readOnly | said, false};
 	}
 	if (!marks)
-		return {RgfxPagesAccess::kRefused, 0};
-	return {RgfxPagesAccess::kRead, readOnly | RGFX_SURFACE_PAGES_UNCHANGING |
-	                                    (copyOnWrite ? RGFX_SURFACE_PAGES_COPY_ON_WRITE : 0u)};
+		return {RgfxPagesAccess::kRefused, 0, false};
+	return {RgfxPagesAccess::kRead,
+	        readOnly | RGFX_SURFACE_PAGES_UNCHANGING |
+	            (copyOnWrite ? RGFX_SURFACE_PAGES_COPY_ON_WRITE : 0u),
+	        soleHolder};
 }
 
 // The whole pages of `page` (a power of two) that hold the `length` bytes at `address`: false
@@ -191,6 +215,69 @@ inline uint32_t rgfxPagesRuns(uint64_t length, Segment segment, RgfxPageRun *run
 	if (count && runs)
 		runs[count - 1] = last;
 	return count;
+}
+
+// The `count` runs at `runs` sorted by address, and those that meet or overlap made one: how many
+// runs are left, each apart from the next, for rgfxRunsMeet. A heapsort in place, with no
+// allocation and no recursion.
+inline uint32_t rgfxRunsSorted(RgfxPageRun *runs, uint32_t count)
+{
+	auto sift = [runs](uint64_t root, uint64_t end) {
+		for (;;) {
+			uint64_t child = 2 * root + 1;
+			if (child >= end)
+				return;
+			if (child + 1 < end && runs[child].address < runs[child + 1].address)
+				child++;
+			if (!(runs[root].address < runs[child].address))
+				return;
+			const RgfxPageRun moved = runs[root];
+			runs[root] = runs[child];
+			runs[child] = moved;
+			root = child;
+		}
+	};
+	for (uint64_t i = count / 2; i > 0; i--)
+		sift(i - 1, count);
+	for (uint64_t end = count; end > 1; end--) {
+		const RgfxPageRun first = runs[0];
+		runs[0] = runs[end - 1];
+		runs[end - 1] = first;
+		sift(0, end - 1);
+	}
+	uint32_t kept = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		const RgfxPageRun &run = runs[i];
+		if (kept && run.address <= runs[kept - 1].address + runs[kept - 1].length) {
+			RgfxPageRun &last = runs[kept - 1];
+			const uint64_t end = run.address + run.length;
+			if (end > last.address + last.length)
+				last.length = end - last.address;
+		} else {
+			runs[kept++] = run;
+		}
+	}
+	return kept;
+}
+
+// Whether the `length` bytes at the physical `address` share a byte with any of the `count` runs
+// at `runs`, sorted and apart (rgfxRunsSorted): a binary search for the last run that starts
+// before the bytes end.
+inline bool rgfxRunsMeet(const RgfxPageRun *runs, uint32_t count, uint64_t address,
+                         uint64_t length)
+{
+	if (length == 0)
+		return false;
+	const uint64_t end = address > UINT64_MAX - length ? UINT64_MAX : address + length;
+	uint32_t lo = 0, hi = count;
+	while (lo < hi) {
+		const uint32_t mid = lo + (hi - lo) / 2;
+		if (runs[mid].address < end)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo != 0 && runs[lo - 1].address + runs[lo - 1].length > address;
 }
 
 // The bytes of a block that holds `count` runs: whole pages of `page`.

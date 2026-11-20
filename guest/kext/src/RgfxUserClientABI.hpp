@@ -56,8 +56,9 @@ enum {
 	kRgfxAccelMethodFeatures = 3,
 	// A pages block over the process's own memory (kRgfxKextFeaturePagesBlock;
 	// RgfxPagesBlock.hpp): in the memory's address in the process, its bytes, and how the process
-	// maps it (kRgfxPagesWritable and, below, kRgfxPagesUnchanging and kRgfxPagesCopyOnWrite; 0
-	// for memory it may not write); out the block's region offset and its size, and where asked for
+	// maps it (kRgfxPagesWritable and, below, kRgfxPagesUnchanging, kRgfxPagesCopyOnWrite and
+	// kRgfxPagesSoleHolder; 0 for memory it may not write); out the block's region offset and its
+	// size, and where asked for
 	// (kRgfxKextFeatureImportAddresses), a third: the GPU address the device gave the block's
 	// view, 0 where it gave none. The kext wires the pages that
 	// hold the range, rounded out to whole pages, in the process for as long as the block lives,
@@ -72,8 +73,10 @@ enum {
 	// where the device took RGFX_FEATURE_READ_ONLY_PAGES: the host lets only objects whose GPU
 	// writes it drops lie over it. Memory named unchanging (kRgfxPagesUnchanging,
 	// kRgfxKextFeatureUnchangingPages) is read-only memory the process can never write and no one
-	// else writes, a file's pages on a read-only volume or anonymous memory with a copy pending
-	// (the bundle's RgfxFilePages.hpp), wired for reading as read-only memory is, and its
+	// else writes, a file's pages on a read-only volume, anonymous memory with a copy pending, or
+	// anonymous memory the process's mapping alone holds (kRgfxPagesSoleHolder,
+	// kRgfxKextFeatureSoleHolderPages), whose pages the kext checks no writable block of its own
+	// covers (the bundle's RgfxFilePages.hpp), wired for reading as read-only memory is, and its
 	// SURFACE_PAGES marked RGFX_SURFACE_PAGES_UNCHANGING too, and
 	// RGFX_SURFACE_PAGES_COPY_ON_WRITE where it is also named so, where the device took
 	// RGFX_FEATURE_UNCHANGING_PAGES (RgfxPagesBlock.hpp); read-only memory not named so may carry
@@ -84,7 +87,9 @@ enum {
 	// process cannot write, and for memory named unchanging where it lacks
 	// RGFX_FEATURE_UNCHANGING_PAGES. kIOReturnBadArgument where the range is not mapped in the
 	// process, for memory named writable and unchanging, or copy-on-write and not unchanging, and
-	// for a why with writable or unchanging memory;
+	// for a why with writable or unchanging memory, and for memory named a sole holder's that is
+	// not named unchanging alone; kIOReturnNotPermitted for memory named a sole holder's whose pages
+	// a writable block of the kext's covers, or while a block of writable memory is being made;
 	// kIOReturnNoSpace or kIOReturnNoResources where the region or the kext's table has no room
 	// for the block.
 	kRgfxAccelMethodPagesBlock = 4,
@@ -378,10 +383,14 @@ enum {
 
 // How the process maps the memory of a PagesBlock (4), its third scalar in: writable; unchanging,
 // read-only memory the process can never write and no one else writes, mapped with no write in
-// the mapping's maximum protection, a file's pages on a read-only volume or anonymous memory with a
-// copy pending (kRgfxKextFeatureUnchangingPages; never with kRgfxPagesWritable);
+// the mapping's maximum protection, a file's pages on a read-only volume, anonymous memory with a
+// copy pending, or anonymous memory the process's mapping alone holds
+// (kRgfxKextFeatureUnchangingPages; never with kRgfxPagesWritable);
 // copy-on-write, which only unchanging memory is named, where the process maps the file's pages
-// private or the anonymous memory with a copy pending; and for read-only memory not named
+// private or the anonymous memory with a copy pending; a sole holder's, which only unchanging
+// memory not named copy-on-write is named (kRgfxKextFeatureSoleHolderPages), where the process's
+// mapping alone holds the anonymous memory, the kext then making the block only where no writable
+// block of its own covers a page of it (RgfxPagesBlock.hpp); and for read-only memory not named
 // unchanging, in the bits from
 // kRgfxPagesWhyShift (kRgfxPagesWhyMask), why not: one of the wire's RGFX_PAGES_WHY_* values, a
 // diagnostic the block's SURFACE_PAGES carries to the host (RGFX_SURFACE_PAGES_WHY_SHIFT).
@@ -389,7 +398,9 @@ enum {
 	kRgfxPagesWritable = 1 << 0,
 	kRgfxPagesUnchanging = 1 << 1,
 	kRgfxPagesCopyOnWrite = 1 << 2,
-	kRgfxPagesHowBits = kRgfxPagesWritable | kRgfxPagesUnchanging | kRgfxPagesCopyOnWrite,
+	kRgfxPagesSoleHolder = 1 << 3,
+	kRgfxPagesHowBits =
+	    kRgfxPagesWritable | kRgfxPagesUnchanging | kRgfxPagesCopyOnWrite | kRgfxPagesSoleHolder,
 	kRgfxPagesWhyShift = 8,
 	kRgfxPagesWhyMask = 0xf << kRgfxPagesWhyShift,
 };
@@ -479,6 +490,9 @@ enum {
 	// which the bundle names where the feature word holds RGFX_FEATURE_UNCHANGING_PAGES too; the
 	// x86-64 and arm64e kexts.
 	kRgfxKextFeatureUnchangingPages = 1 << 19,
+	// PagesBlock's (4) memory named a sole holder's (kRgfxPagesSoleHolder), which the bundle names
+	// where it names memory unchanging; the x86-64 and arm64e kexts.
+	kRgfxKextFeatureSoleHolderPages = 1 << 20,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

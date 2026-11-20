@@ -162,16 +162,16 @@
 //!
 //! **Unchanging pages** (`RGFX_SURFACE_PAGES_UNCHANGING`, `RGFX_FEATURE_UNCHANGING_PAGES`). A
 //! read-only block the guest marks unchanging holds pages its process can never write and no one
-//! else writes, a file's on a read-only volume or anonymous memory with a copy pending
-//! (docs/graphics-kext/design.md, "Unchanging pages"): its import is asked as unchanging,
-//! copy-on-write where the guest marks it so (`RGFX_SURFACE_PAGES_COPY_ON_WRITE`, counted
-//! apart), and the platform reads its pages into the copy once, at the import's make,
-//! with no compare at a commit (metal2vulkan-runtime's, its `copied` module's docs, "Unchanging
-//! pages"); the GPU's writes are dropped as a read-only block's are. Such a view is cached apart
-//! again: a block takes only a cached view whose import was asked as its own would be, so a view
-//! read once serves no block whose pages may change. A read-only block not marked unchanging may
-//! carry why not (`RGFX_SURFACE_PAGES_WHY_SHIFT`), a diagnostic: the views count such blocks by
-//! it, and the decoder the textures made over them ([`whys`]).
+//! else writes, a file's on a read-only volume, anonymous memory with a copy pending, or anonymous
+//! memory its process's mapping alone holds (docs/graphics-kext/design.md, "Unchanging pages"): its
+//! import is asked as unchanging, copy-on-write where the guest marks it so
+//! (`RGFX_SURFACE_PAGES_COPY_ON_WRITE`, counted apart), and the platform reads its pages into the
+//! copy once, at the import's make, with no compare at a commit (metal2vulkan-runtime's, its
+//! `copied` module's docs, "Unchanging pages"); the GPU's writes are dropped as a read-only block's
+//! are. Such a view is cached apart again: a block takes only a cached view whose import was asked
+//! as its own would be, so a view read once serves no block whose pages may change. A read-only
+//! block not marked unchanging may carry why not (`RGFX_SURFACE_PAGES_WHY_SHIFT`), a diagnostic:
+//! the views count such blocks by it, and the decoder the textures made over them ([`whys`]).
 //!
 //! **Surfaces with no views** (`ApiPlatform::SURFACE_VIEWS`). A platform may keep no view of an
 //! IOSurface's pages (metal2vulkan-runtime, whose surfaces are device images that the device

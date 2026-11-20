@@ -19,8 +19,8 @@
 #            the script stops where neither names one GPU, as an --exclusive job holds every GPU
 #            of its node and the library would take its own pick among them (docs/lessons.md).
 #   -b FILE  the configuration bundle; default build/Config.cpio (make config-bundle)
-#   -T DIR   the guest probes, bench and present_probe; default build/guest-tools (make
-#            guest-tools, on a Mac)
+#   -T DIR   the guest probes, bench, present_probe and sole_holder_probe; default
+#            build/guest-tools (make guest-tools, on a Mac)
 #   -p PORT  the host port forwarded to the guest's SSH; default 10090
 #   -o DIR   where the logs go, a new directory; default one made under ${TMPDIR:-/tmp}
 #   -e ECID  the guest's ECID, in decimal or 0x hex
@@ -75,6 +75,12 @@
 #              other work on the host shows it there. The probe is full-screen at the status level,
 #              which needs no right to be in front: WindowServer denied a probe started over SSH
 #              that right, and its titled window was never shown (docs/lessons.md).
+#   sole-holder
+#              the kernel answers anonymous memory as the bundle's sole holder's clause reads it,
+#              and the kext makes and refuses a sole holder's pages block as it says:
+#              sole_holder_probe (guest/bundle/tools/sole_holder_probe.c, which lists its steps)
+#              exits 0 in 30 s, run over SSH after metal-app, with no Metal work beside it. Its
+#              detail is its last line, or each step that failed.
 #   bundle-install
 #              RgfxGate installed the Metal bundle, as it records it and as the disk shows it:
 #              its Graft client state (GraftClient.ai.aneesiqbal.RgfxGate) reads installed,
@@ -173,7 +179,7 @@ fi
 [[ -n $firmware && -f $firmware ]] || die "no Ambrosia image: give its target/ambrosia.bin with -f"
 [[ -n $qemu && -x $qemu ]] || die "no QEMU: give our qemu-system-aarch64 with -q, or set QEMU"
 [[ -f $bundle ]] || die "no bundle $bundle: make config-bundle, or give one with -b"
-[[ -x $tools/bench && -x $tools/present_probe ]] ||
+[[ -x $tools/bench && -x $tools/present_probe && -x $tools/sole_holder_probe ]] ||
   die "no guest probes in $tools: make guest-tools on a Mac (copy build/guest-tools to a Linux member), or give them with -T"
 [[ -f $vm/disk.img ]] || die "no disk.img in $vm"
 [[ -f $vm/aux.img.trimmed || -f $vm/aux.img ]] || die "no aux.img.trimmed or aux.img in $vm"
@@ -341,8 +347,8 @@ qpid=$!
 
 # --- the checks ---------------------------------------------------------------------------------
 
-names=(firmware console ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count ax-matrix
-  icc amfi-refuse screen no-fatal)
+names=(firmware console ssh sip boot-args kexts windowserver-metal metal-app sole-holder bundle-install amfi-map
+  page-count ax-matrix icc amfi-refuse screen no-fatal)
 # What a check reports beside its verdict, printed under it: neither a pass nor a failure.
 findings=()
 # The guest's kern.bootsessionuuid at the login and after the Metal work, the panic reports
@@ -478,7 +484,7 @@ if [[ -n $ssh_s ]]; then
 
   # The probes, copied over the shared connection.
   G 30 'mkdir -p ~/ambrosia-check' > /dev/null
-  for t in bench present_probe; do
+  for t in bench present_probe sole_holder_probe; do
     timeout $((60 * slow)) "${GUEST_ENV[@]}" sshpass -p "$GUEST_PASS" ssh -p "$port" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" \
       "cat > ~/ambrosia-check/$t && chmod +x ~/ambrosia-check/$t" < "$tools/$t" >> "$out/guest.log" 2>&1
   done
@@ -539,6 +545,13 @@ if [[ -n $ssh_s ]]; then
     verdict metal-app FAIL "not run: $dev_say"
   else
     verdict metal-app FAIL "not run: $desk_say"
+  fi
+  # The kernel's answers the bundle's sole holder's clause reads, and the kext's refusals.
+  if sole=$(G 40 "perl -e 'alarm $((30 * slow)); exec @ARGV' ~/ambrosia-check/sole_holder_probe"); then
+    verdict sole-holder PASS "$(echo "$sole" | grep '^sole_holder_probe: ' | tail -1 | sed 's/^sole_holder_probe: //')"
+  else
+    said=$(echo "$sole" | grep '^sole_holder_probe: .* FAIL' | sed 's/^sole_holder_probe: //' | tr '\n' ';')
+    verdict sole-holder FAIL "${said:-sole_holder_probe printed no result line: $(echo "$sole" | tail -2 | tr '\n' ' ')}"
   fi
   # Graft's state on the registry root, kept in guest.log alone, so that a boot that fails into
   # Graft leaves it behind: GraftState, GraftReason, GraftLog and each GraftClient.<bundle id>.
@@ -662,12 +675,14 @@ if [[ -n $ssh_s ]]; then
     verdict amfi-refuse FAIL "the ad hoc signed copy exited ${sig_rc:-unread}, not 137 (killed)"
   fi
 elif [[ $(state firmware) == FAIL ]]; then
-  for n in ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count ax-matrix icc amfi-refuse; do
+  for n in ssh sip boot-args kexts windowserver-metal metal-app sole-holder bundle-install amfi-map page-count ax-matrix icc \
+    amfi-refuse; do
     verdict "$n" FAIL "not run: the firmware check failed"
   done
 else
   verdict ssh FAIL "no SSH login in $limit s"
-  for n in sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count ax-matrix icc amfi-refuse; do
+  for n in sip boot-args kexts windowserver-metal metal-app sole-holder bundle-install amfi-map page-count ax-matrix icc \
+    amfi-refuse; do
     verdict "$n" FAIL "not run: no SSH login"
   done
 fi

@@ -166,16 +166,67 @@ int main()
 	check(kRgfxPagesWhyShift == RGFX_SURFACE_PAGES_WHY_SHIFT &&
 	          uint64_t{kRgfxPagesWhyMask} == RGFX_SURFACE_PAGES_WHY_MASK,
 	      "the call's why bits are the wire's");
-	// What names no mapping: writable and unchanging, copy-on-write and not unchanging, a why
-	// with writable or unchanging memory, a bit of no meaning.
+	// A sole holder's memory, named unchanging alone: wired for reading as unchanging memory is,
+	// marked unchanging and not copy-on-write, its wiring saying so for the kext's check of its own
+	// writable blocks; no other memory's says so.
+	const RgfxPagesWiring sole =
+	    rgfxPagesWiring(kRgfxPagesUnchanging | kRgfxPagesSoleHolder, unchangingWord);
+	check(sole.access == RgfxPagesAccess::kRead &&
+	          sole.flags == (readOnly | RGFX_SURFACE_PAGES_UNCHANGING) && sole.soleHolder,
+	      "a sole holder's memory is wired for reading, marked unchanging, checked by the kext");
+	check(!file.soleHolder && !cow.soleHolder && !rgfxPagesWiring(0, unchangingWord).soleHolder &&
+	          !rgfxPagesWiring(kRgfxPagesWritable, unchangingWord).soleHolder,
+	      "no other memory's wiring is a sole holder's");
+	for (uint64_t word : {pagesWord, readOnlyWord})
+		check(rgfxPagesWiring(kRgfxPagesUnchanging | kRgfxPagesSoleHolder, word).access ==
+		          RgfxPagesAccess::kRefused,
+		      "a sole holder's memory makes no block where the host did not take UNCHANGING_PAGES");
+	// What names no mapping: writable and unchanging, copy-on-write and not unchanging, a sole
+	// holder's not unchanging or copy-on-write too, a why with writable or unchanging memory or a
+	// sole holder's, a bit of no meaning.
 	const uint64_t why = uint64_t{RGFX_PAGES_WHY_SHADOWED} << kRgfxPagesWhyShift;
 	for (uint64_t how : {uint64_t{kRgfxPagesWritable | kRgfxPagesUnchanging},
 	                     uint64_t{kRgfxPagesCopyOnWrite},
 	                     uint64_t{kRgfxPagesWritable | kRgfxPagesCopyOnWrite},
-	                     uint64_t{kRgfxPagesHowBits}, uint64_t{1u << 3}, kRgfxPagesWritable | why,
-	                     kRgfxPagesUnchanging | why, uint64_t{1u << 12}})
+	                     uint64_t{kRgfxPagesHowBits}, uint64_t{kRgfxPagesSoleHolder},
+	                     uint64_t{kRgfxPagesSoleHolder | kRgfxPagesWritable},
+	                     uint64_t{kRgfxPagesSoleHolder | kRgfxPagesUnchanging | kRgfxPagesCopyOnWrite},
+	                     kRgfxPagesSoleHolder | why,
+	                     kRgfxPagesSoleHolder | kRgfxPagesUnchanging | why, uint64_t{1u << 4},
+	                     kRgfxPagesWritable | why, kRgfxPagesUnchanging | why, uint64_t{1u << 12}})
 		check(rgfxPagesWiring(how, unchangingWord).access == RgfxPagesAccess::kBadArgument,
 		      "a mapping no memory has is a bad argument");
+
+	// A sole holder's runs, sorted and made apart for the kext's check (rgfxRunsSorted): runs that
+	// meet or overlap are one, in address order.
+	RgfxPageRun mixed[] = {{0x9000, 0x1000}, {0x2000, 0x2000}, {0x4000, 0x1000},
+	                       {0x3000, 0x3000}, {0x2'0000, 0x1000}, {0x2000, 0x1000}};
+	check(rgfxRunsSorted(mixed, 6) == 3, "six runs, four meeting or overlapping: three apart");
+	check(mixed[0].address == 0x2000 && mixed[0].length == 0x4000 && mixed[1].address == 0x9000 &&
+	          mixed[1].length == 0x1000 && mixed[2].address == 0x2'0000 &&
+	          mixed[2].length == 0x1000,
+	      "in address order, the meeting ones one run");
+	check(rgfxRunsSorted(nullptr, 0) == 0, "no runs: none");
+	std::vector<RgfxPageRun> reversed;
+	for (uint64_t i = 0; i < 1000; i++)
+		reversed.push_back({(1000 - i) * 0x2000, 0x1000});
+	check(rgfxRunsSorted(reversed.data(), 1000) == 1000, "a thousand runs apart stay apart");
+	bool ascending = true;
+	for (uint64_t i = 0; i < 1000; i++)
+		ascending = ascending && reversed[i].address == (i + 1) * 0x2000;
+	check(ascending, "sorted from the last to the first");
+	// Whether bytes share one with the runs (rgfxRunsMeet).
+	check(rgfxRunsMeet(mixed, 3, 0x5000, 0x1000), "bytes inside a run meet it");
+	check(!rgfxRunsMeet(mixed, 3, 0x6000, 0x3000), "bytes between two runs, touching both: none");
+	check(rgfxRunsMeet(mixed, 3, 0x8fff, 2), "bytes over a run's first byte meet it");
+	check(rgfxRunsMeet(mixed, 3, 0x5fff, 1), "and over its last");
+	check(!rgfxRunsMeet(mixed, 3, 0x1000, 0x1000), "bytes before the first run: none");
+	check(rgfxRunsMeet(mixed, 3, 0x1000, 0x1001), "bytes reaching the first run's first byte");
+	check(!rgfxRunsMeet(mixed, 3, 0x2'1000, 0x1000), "bytes past the last run: none");
+	check(rgfxRunsMeet(mixed, 3, 0, UINT64_MAX) && rgfxRunsMeet(mixed, 3, 0x2'0800, UINT64_MAX),
+	      "bytes to the end of the space, the end taken at its last byte");
+	check(!rgfxRunsMeet(mixed, 3, 0x5000, 0), "no bytes: none");
+	check(!rgfxRunsMeet(nullptr, 0, 0x5000, 0x1000), "no runs: none");
 	check(kRgfxPagesWritable == 1, "1, as the kexts before the bits took writable memory");
 
 	// The chunks' physical mask: each chunk at a multiple of its own 64 KiB, on 4 KiB and on

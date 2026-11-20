@@ -6,15 +6,17 @@
 # webgl.html, webgl-serve.pl, h264.list and hevc.list (the decode sets: their streams, in corpus/
 # beside each one's reference .md5, with the timed passes after a stream whose rate is measured),
 # h264-odd.list and hevc-odd.list (odd sizes and crops, in corpus/odd/), and, where the tree has
-# them, oracle_icb and its oracle_icb.metallib (guest/bundle/tools/oracle).
+# them, oracle_icb and its oracle_icb.metallib (guest/bundle/tools/oracle) and sole_holder_probe
+# (guest/bundle/tools/sole_holder_probe.c, the info phase's).
 #
 # It prints what it finds as lines the gate's report reads ("GATE item NAME PASS|FAIL|SKIP
 # detail", "GATE metric NAME VALUE"), each phase between "GATE phase NAME start" and "... end",
 # and the tools' own result lines ("sweep: ...", "bench: ...", "present_probe: ...",
-# "decode_md5: ...") as they come. The phases run in the order given (default: info idle bench
-# present sweep decode webgl final), over one run or several: what a later phase reads stays in
-# DIR. The gate's correctness boot runs info sweep decode icb webgl present final, its bench boot
-# info webgl present idle bench, then benchretry where the host asks, then decodefps final.
+# "decode_md5: ...", "sole_holder_probe: ...") as they come. The phases run in the order given
+# (default: info idle bench present sweep decode webgl final), over one run or several: what a
+# later phase reads stays in DIR. The gate's correctness boot runs info sweep decode icb webgl
+# present final, its bench boot info webgl present idle bench, then benchretry where the host
+# asks, then decodefps final.
 # benchretry runs the cases in GATE_RETRY again (run_benchretry). decode checks every
 # stream's MD5s, decodefps also times the streams the lists time (decode_md5 -l), and present
 # runs present_probe for GATE_PRESENT_S seconds (default 10) each way. Each tool runs under an
@@ -112,7 +114,29 @@ run_info() {
 	*" IOGVAHEVCDecode "*) echo "GATE info video-offer hevc=1 keys=${gva% }" ;;
 	*) echo "GATE info video-offer hevc=0 keys=${gva% }" ;;
 	esac
+	run_sole_holder
 	echo "GATE info uptime $(uptime | tr -s ' ')"
+}
+
+# The kernel's answers the bundle's sole holder's clause reads (guest/bundle/src/RgfxFilePages.hpp,
+# kRgfxAnonymousPrivate), and the kext's makes and refusals of a sole holder's pages block:
+# sole_holder_probe's steps, each as it prints it ("sole_holder_probe: STEP ok|FAIL|SKIP ..."),
+# with no program's work beside it. A release whose kernel answers otherwise fails it; the kext's
+# steps skip where the kext or the device takes no sole holder's memory.
+run_sole_holder() {
+	if [ ! -x ./sole_holder_probe ]; then
+		item sole-holder SKIP "no sole_holder_probe in the payload"
+		return
+	fi
+	local out rc
+	out=$(limit 30 ./sole_holder_probe 2>&1)
+	rc=$?
+	echo "$out" | grep -E '^sole_holder_probe: '
+	if [ "$rc" = 0 ]; then
+		item sole-holder PASS "$(echo "$out" | tail -1)"
+	else
+		item sole-holder FAIL "exit $rc: $(echo "$out" | grep -E ' FAIL' | tr '\n' ' ')"
+	fi
 }
 
 # The GPU's memory as the guest's frameworks state it: system_profiler's "VRAM" (the kext's

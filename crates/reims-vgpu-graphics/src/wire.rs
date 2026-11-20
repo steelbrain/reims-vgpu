@@ -320,9 +320,10 @@ pub const RGFX_FEATURE_SURFACE_DEFERRED_ASK: u32 = 1 << 30;
 /// [`RGFX_REG_DRIVER_FEATURES_LO`], and which means nothing without
 /// [`RGFX_FEATURE_READ_ONLY_PAGES`]: a read-only pages block's `SURFACE_PAGES` may carry
 /// [`RGFX_SURFACE_PAGES_UNCHANGING`], a block of pages its process can never write, a file's own on
-/// a volume the guest's OS mounted read-only or anonymous memory with a copy pending, which no one
-/// writes while the block lives, and the host may then read them once, as the block's view is
-/// imported, and never again; and one that does not carry it may say why not
+/// a volume the guest's OS mounted read-only, anonymous memory with a copy pending, or anonymous
+/// memory its process's mapping alone holds, which no one writes while the block lives, and the
+/// host may then read them once, as the block's view is imported, and never again; and one that
+/// does not carry it may say why not
 /// ([`RGFX_SURFACE_PAGES_WHY_SHIFT`], a diagnostic). A `u64`, unlike the other bits of
 /// `FEATURES_LO`, so that C's `1 << 31` of a signed `int` never stands for it. A host offers it
 /// where it offers `READ_ONLY_PAGES`.
@@ -2724,8 +2725,12 @@ pub const RGFX_SURFACE_PAGES_READ_ONLY: u32 = 1 << 5;
 /// the process, as a Mac's driver's wire of the process's memory does. Or anonymous memory with a
 /// copy pending on its own object (the flag set), whose other side's writes go to a copy of that
 /// side's own, its pages copied for the process by the kext's wire as a private file mapping's
-/// are. No one writes them while the block lives, so the host may read them once, as the block's
-/// view is imported, and never again. The flag is the guest's word, which the host does not check:
+/// are. Or anonymous memory the process's mapping alone holds (the flag clear): its object has one
+/// reference, the mapping's, and no shadow, and no writable block of the kext's covers its pages,
+/// which the kext's wire takes as they are. No one writes them while the block lives, but, for
+/// the last, a write another driver started before the process removed write for good, still
+/// landing after the block was made, so the host may read them once, as the block's view is
+/// imported, and never again. The flag is the guest's word, which the host does not check:
 /// where it is false, the GPU of the objects over the block may read the bytes the block had as its
 /// view was imported. One without [`RGFX_SURFACE_PAGES_READ_ONLY`] is
 /// [`RGFX_STATUS_INVALID_ARGUMENT`].

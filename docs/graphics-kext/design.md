@@ -2121,8 +2121,9 @@ only where no negotiation can carry it.
   and `_HI`.
 - Bit 31 is `UNCHANGING_PAGES`, which means nothing without
   `READ_ONLY_PAGES`: a read-only pages block may be of pages its process can
-  never write and no one else writes, a file's on a volume mounted read-only
-  or anonymous memory with a copy pending, and its `SURFACE_PAGES` then
+  never write and no one else writes, a file's on a volume mounted read-only,
+  anonymous memory with a copy pending, or anonymous memory its process's
+  mapping alone holds, and its `SURFACE_PAGES` then
   carries `RGFX_SURFACE_PAGES_UNCHANGING` (1 << 6), with
   `RGFX_SURFACE_PAGES_COPY_ON_WRITE` (1 << 7) where the process maps them
   private and copy-on-write. The host reads such a block's pages once, as its
@@ -2132,7 +2133,8 @@ only where no negotiation can carry it.
   diagnostic the host counts by. The kext takes it and carries it to the
   bundle, which names such blocks to the kext (`PagesBlock`'s third input:
   `kRgfxPagesUnchanging`, `kRgfxPagesCopyOnWrite`, and the why from bit 8,
-  where the kext sets `UnchangingPages`). A host offers it where it offers
+  where the kext sets `UnchangingPages`, and `kRgfxPagesSoleHolder` where it
+  sets `SoleHolderPages`). A host offers it where it offers
   `READ_ONLY_PAGES`.
 - Bit 32, `FEATURES_HI`'s bit 0, is `SURFACE_DEFERRED_CARRY`, which means
   nothing without `SURFACE_DEFERRED` or `SURFACE_DEFERRED_ASK`: a deferral
@@ -5154,16 +5156,49 @@ pending shadows it first (`vm_map_lookup_and_lock_object`,
 `vm_map.c:18314-18396`). A share of the region takes no protection its maximum
 lacks (`vm_map.c:18037-18058` and `18733-18734`).
 
+Anonymous memory is unchanging too where its maximum protection has no
+write, the kernel answers it `SM_PRIVATE` at shadow depth 0, and the region's
+object has one reference, the mapping's own, where the kext sets
+`SoleHolderPages`: a sole holder's, named `kRgfxPagesSoleHolder`. The share
+mode alone leaves the count in doubt, as the walk takes one from it while
+paging on the object is in progress (`vm_map.c:16002-16005`), so an object
+another mapping holds then reads private. `mach_vm_page_info`'s
+`VM_PAGE_INFO_BASIC` answers the count as the kernel keeps it, read before the
+query takes a reference of its own, with the object's id, whose low 32 bits
+are the region's object id, and the depth it found the page at
+(`vm_map_page_range_info_internal`, at xnu-12377.121.6's
+`osfmk/vm/vm_map.c:18686-18692` and `18802-18805`). The ids must match: a
+process that asked for its regions' footprint (`task_self_region_footprint`)
+is answered a count of 1 at depth 0 for every page, with an id of none of its
+objects (that file's `18644-18676`). With one reference no other mapping and
+no memory entry holds the object, and none made after takes a protection the
+maximum lacks, so nothing maps the pages for writing; a copy of them,
+`mach_vm_remap`'s or `VM_PROT_COPY`'s, writes pages of its own. What the count
+leaves out is a wire, which holds no reference (`vm_object_iopl_request`,
+`vm_pageout.c:8331`; `upl_destroy`, `5683-5685`). A wire for writing is
+refused once the maximum protection has no write (`vm_map_create_upl`, at
+xnu-12377.121.6's `osfmk/vm/vm_pageout.c:7659-7661`, and
+`vme_allows_upl_write`, `7408-7415`), but one taken while the memory was
+writable may write its pages still, under a count of one. The kext knows its
+own: it makes a sole holder's block only where, once its pages are wired, no
+writable block of its own in its table and no in-place surface block covers a
+page of them, and no block of writable memory is being made, and refuses it
+otherwise (`kIOReturnNotPermitted`; `guest/kext/src/RgfxPagesBlock.hpp`), and
+the bundle then asks for a read-only block, why `RGFX_PAGES_WHY_REFUSED`. A
+write another driver started before the app removed write for good, still
+landing after the make, is the clause's residual. The rules it rests on were
+read in the published kernel source of every release from macOS 11.0.1 to 26.5
+(xnu-7195.50.7.100.1 to xnu-12377.121.6); later releases are checked by test:
+`guest/bundle/tools/sole_holder_probe.c`, which the lane gate's guest checks
+(its info phase) and Ambrosia's `check-boot.sh` run at each boot, reads the
+count as 2 with a second holder and 1 once it goes, and sees the kext's
+writable wire of memory with no write in its maximum protection refused.
+
 Every other share mode is neither, why not a file, and so is memory whose
 maximum protection has write. At a shadow depth of 1 or more another mapping
-may share the region's top object with write. `SM_PRIVATE` leaves in doubt
-that no one else writes the object's pages: the walk takes one from the
-object's reference count while paging on the object is in progress
-(`vm_map.c:16002-16005`), and a wire holds no reference
-(`vm_object_iopl_request`, `vm_pageout.c:8331`; `upl_destroy`, `5683-5685`),
-so a driver's wire for writing taken while the memory was writable, our own
-kext's for a writable block among them, still writes the pages after the
-maximum protection lost write, under a count of one.
+may share the region's top object with write, and `SM_PRIVATE` leaves in doubt
+that no one else writes the object's pages where the kext does not set
+`SoleHolderPages` or the count is more than one.
 
 The block is of the app's own memory, as every pages block is, named
 `kRgfxPagesUnchanging` (and `kRgfxPagesCopyOnWrite`). The kext wires it for
@@ -5177,8 +5212,10 @@ driver's wire of an app's memory makes it (read from xnu's
 `osfmk/vm/vm_pageout.c`, which holds both). Anonymous memory's wire takes the
 region's pending copy the same way (`vm_pageout.c:7140-7188`) and faults each
 page into the region's own new object (`vm_pageout.c:8584-8592`), which no one
-else holds. The process can write neither. Where the kext refuses the block,
-the bundle asks again for a read-only block, why `RGFX_PAGES_WHY_REFUSED`.
+else holds. A sole holder's wire takes its object's own pages, as only the
+mapping holds the object. The process can write none of them. Where the kext
+refuses the block, the bundle asks again for a read-only block, why
+`RGFX_PAGES_WHY_REFUSED`.
 
 Where the host's GPU cannot import the pages as they are, the rt platform
 copies an unchanging block's pages into its copy once, as the view is made,
@@ -7147,7 +7184,7 @@ Map 1:
 | 1 | `Consumed` | 1 << 3 `ConsumedDoorbell` | reserved: a completion ring's room doorbell (`CONSUMED`) |
 | 2 | | | given to none: the IOGPU base's device-info call on its own client type, so a trace names one call per number |
 | 3 | `Features` | | the device's feature word, the kext's and the selector map; at 3 in every map |
-| 4 | `PagesBlock` | 1 << 0 `PagesBlock`, 1 << 18 `ImportAddresses` (its third output, the GPU address the device gave the block's view, 0 for none), 1 << 19 `UnchangingPages` (its third input's `kRgfxPagesUnchanging`, `kRgfxPagesCopyOnWrite` and why) | a block of the runs of a process's own pages, wired, for its no-copy buffers; three inputs, the address, the length and how the memory is (`kRgfxPagesWritable` 1 << 0, `kRgfxPagesUnchanging` 1 << 1, `kRgfxPagesCopyOnWrite` 1 << 2, and for read-only memory not unchanging why not in bits 8 to 11, `kRgfxPagesWhyShift`; none for read-only memory); two outputs, or three with its view's GPU address ("Import addresses") |
+| 4 | `PagesBlock` | 1 << 0 `PagesBlock`, 1 << 18 `ImportAddresses` (its third output, the GPU address the device gave the block's view, 0 for none), 1 << 19 `UnchangingPages` (its third input's `kRgfxPagesUnchanging`, `kRgfxPagesCopyOnWrite` and why), 1 << 20 `SoleHolderPages` (its third input's `kRgfxPagesSoleHolder`) | a block of the runs of a process's own pages, wired, for its no-copy buffers; three inputs, the address, the length and how the memory is (`kRgfxPagesWritable` 1 << 0, `kRgfxPagesUnchanging` 1 << 1, `kRgfxPagesCopyOnWrite` 1 << 2, `kRgfxPagesSoleHolder` 1 << 3, and for read-only memory not unchanging why not in bits 8 to 11, `kRgfxPagesWhyShift`; none for read-only memory); two outputs, or three with its view's GPU address ("Import addresses") |
 | 5 | `SubmitBatch` | 1 << 1 `SubmitBatch`, 1 << 11 `QueuePublish` (three inputs and a second output: a queue's publish after them) | a process's destroys, and its creates and writes no one waits for that name no block, onto ring 0 in one call ("Destroys and creates no one waits for go together"), and with three inputs a command buffer's publish on its queue's ring after them ("A commit behind held messages is one call") |
 | 6 | `WakeCompletions` | 1 << 2 `WakeCompletions` | reserved: wakes the client's completion waiters |
 | 7 | `TakeAnswers` | 1 << 4 `DeferredAnswers` | hands a process its held pipeline-create answers ("Known pipeline creates") |
@@ -7180,7 +7217,7 @@ the accelerator, which the bundle opens for each event it hands out: 10 and 11
 are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish`, 1 << 12 `DoorbellPage`, 1 << 13 `CpuPats`, 1 << 14 `ZeroedBlocks`, 1 << 15 `Pool`, 1 << 16 `PoolAddresses`, 1 << 17 `PrivateBlocks`, 1 << 18 `ImportAddresses` and 1 << 19 `UnchangingPages`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed, `CpuPats` only on x86-64, and `Pool` and `PoolAddresses` only where the device has a pool; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish`, 1 << 12 `DoorbellPage`, 1 << 13 `CpuPats`, 1 << 14 `ZeroedBlocks`, 1 << 15 `Pool`, 1 << 16 `PoolAddresses`, 1 << 17 `PrivateBlocks`, 1 << 18 `ImportAddresses`, 1 << 19 `UnchangingPages` and 1 << 20 `SoleHolderPages`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed, `CpuPats` only on x86-64, and `Pool` and `PoolAddresses` only where the device has a pool; no other bit yet.
 
 Where the device offers no `POOL` (an arm64 guest on a Windows host), the kext sets no `Pool`
 bit, selector 16 answers `kIOReturnUnsupported`, and its processes keep the

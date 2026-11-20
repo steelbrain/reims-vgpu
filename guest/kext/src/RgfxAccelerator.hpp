@@ -97,8 +97,8 @@ enum {
 // unlock seed (rgfxSurfaceUnlockSeedExported), SubmitBatch's publish of a queue's ring,
 // OpenContext's doorbell page, on x86-64 CpuPats (RgfxPat.hpp), ZeroedBlocks (RgfxBlockZero.hpp),
 // Pool and PoolAddresses, which Features leaves out where the device has no pool (poolMemory),
-// PrivateBlocks, ImportAddresses and UnchangingPages. Each bit is set by the change that lands its
-// call.
+// PrivateBlocks, ImportAddresses, UnchangingPages and SoleHolderPages. Each bit is set by the
+// change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeaturePagesChunked |
                                           kRgfxKextFeatureSubmitBatch |
@@ -116,7 +116,8 @@ constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeaturePoolAddresses |
                                           kRgfxKextFeaturePrivateBlocks |
                                           kRgfxKextFeatureImportAddresses |
-                                          kRgfxKextFeatureUnchangingPages;
+                                          kRgfxKextFeatureUnchangingPages |
+                                          kRgfxKextFeatureSoleHolderPages;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
@@ -504,7 +505,9 @@ public:
 	IOReturn freeBlock(RgfxAcceleratorUserClient *owner, UInt64 offset);
 	// A pages block (kRgfxAccelMethodPagesBlock) of `owner` of context `context` over the
 	// `length` bytes at `address` in `task`, mapped there as `how` says (kRgfxPagesWritable,
-	// kRgfxPagesUnchanging, kRgfxPagesCopyOnWrite; rgfxPagesWiring): the
+	// kRgfxPagesUnchanging, kRgfxPagesCopyOnWrite, kRgfxPagesSoleHolder; rgfxPagesWiring), made
+	// for memory named a sole holder's only where no writable block of the kext's covers a page
+	// of it, nor is being made (soleHolderAlone): the
 	// block's offset and size, and the GPU address the device gave its view, 0 where none
 	// (RGFX_FEATURE_IMPORT_ADDRESSES, rgfxPagesAnswer), as where the device answers before the
 	// view has one (RGFX_FEATURE_IMPORT_ADDRESSES_LATER). The
@@ -770,10 +773,13 @@ private:
 	// on (unwire), the device told of them (SURFACE_PAGES, of `flags`: RGFX_SURFACE_PAGES_PRIVATE,
 	// and RGFX_SURFACE_PAGES_READ_ONLY for read-only memory) and the block granted: its offset
 	// and size, and in `*gpuAddress` where asked for, the GPU address the device gave its view,
-	// 0 where none. `wired` is unwired where no block is made.
+	// 0 where none. `wired` is unwired where no block is made. Where `writableMake`, the block is
+	// of writable memory whose make pagesBlock counted (writableMakes), which ends here once the
+	// block is in the table, or once no block will be.
 	IOReturn pagesBlockOver(RgfxAcceleratorUserClient *owner, UInt32 context,
 	                        IOMemoryDescriptor *md, UInt64 length, void *wired, UInt64 *offset,
-	                        UInt64 *size, UInt32 flags, UInt64 *gpuAddress);
+	                        UInt64 *size, UInt32 flags, UInt64 *gpuAddress,
+	                        bool writableMake = false);
 	// The new deferred block of entry `e`, pending, held by its asker of context `context` alone,
 	// `total` bytes with its runs' room, its surface laid out as `layout`: makes its surface's
 	// device cache and reads the surface (rgfxSurfaceLocksDefer); fresh, asks the host to defer

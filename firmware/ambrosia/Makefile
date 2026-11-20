@@ -23,8 +23,9 @@
 #   make guest-tools
 #                build/guest-tools: the lane gate's guest probes that check-boot.sh runs
 #                in an arm64 guest, built on a Mac for arm64 and macOS 13 and later from
-#                ../../guest/bundle/tools: bench, whose -l lists the Metal devices, and
-#                present_probe, an on-screen Metal app
+#                ../../guest/bundle/tools: bench, whose -l lists the Metal devices,
+#                present_probe, an on-screen Metal app, and sole_holder_probe, the
+#                kernel's answers the bundle's sole holder's clause reads
 #   make clean   remove build/
 #
 # check-boot.sh boots a guest with a bundle and checks it (its header says how).
@@ -72,7 +73,8 @@ GUEST_TOOLS = ../../guest/bundle/tools
 TOOLCC = xcrun clang -arch arm64 -mmacosx-version-min=13.0 -fobjc-arc -O2 -Wall -Wextra -Werror \
 	-Wno-unused-parameter
 
-guest-tools: $(BUILD)/guest-tools/bench $(BUILD)/guest-tools/present_probe
+guest-tools: $(BUILD)/guest-tools/bench $(BUILD)/guest-tools/present_probe \
+	$(BUILD)/guest-tools/sole_holder_probe
 
 $(BUILD)/guest-tools/bench: $(GUEST_TOOLS)/bench/bench.m
 	@mkdir -p $(@D)
@@ -82,6 +84,14 @@ $(BUILD)/guest-tools/bench: $(GUEST_TOOLS)/bench/bench.m
 $(BUILD)/guest-tools/present_probe: $(GUEST_TOOLS)/present_probe.m
 	@mkdir -p $(@D)
 	$(TOOLCC) $< -framework AppKit -framework Metal -framework QuartzCore -framework CoreVideo -o $@
+
+# C, with no Metal, so built without ARC.
+$(BUILD)/guest-tools/sole_holder_probe: $(GUEST_TOOLS)/sole_holder_probe.c \
+		../../guest/kext/src/RgfxUserClientABI.hpp \
+		../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h
+	@mkdir -p $(@D)
+	xcrun clang -arch arm64 -mmacosx-version-min=13.0 -O2 -Wall -Wextra -Werror $< \
+		-framework IOKit -o $@
 
 $(BUILD)/ReimsGraphics.elf: $(BUILD)/ReimsGraphicsModule.o
 	$(LD) $(LDFLAGS) -o $@ $^

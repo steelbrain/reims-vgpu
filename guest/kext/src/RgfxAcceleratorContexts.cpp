@@ -314,6 +314,10 @@ bool deferCarries = false;
 const char *const kSurfaceMapperService = "IOSurfaceParavirtMapperService";
 // Under contextLock: the shared blocks of surface planes, made at the first ask.
 RgfxSurfaceTable surfaceTable = {nullptr, 0};
+// Under contextLock: the pages blocks of writable memory being made (pagesBlock), each counted
+// from before its pages are wired to its block's place in the table, or its failure
+// (pagesBlockOver). A sole holder's block is refused while any is (soleHolderAlone).
+UInt32 writableMakes = 0;
 // The bytes of surface pages the dormant blocks hold at most (RgfxSurfaceBlocks.hpp): an eighth
 // of the guest's memory, read at the first context's open.
 UInt64 dormantMaxBytes = 0;
@@ -554,6 +558,7 @@ void noteReserve();
 void noteReleases();
 void noteZeroing();
 void unwire(void *pages);
+bool soleHolderAlone(IOMemoryDescriptor *md, UInt64 length);
 bool releaseAnswered(OSObject *, UInt64 seqno, UInt32 status);
 
 // The releases in flight (RgfxReleaseTable.hpp), made at the first context's open, under
@@ -1911,6 +1916,86 @@ void unwire(void *pages)
 		md->complete(md->getDirection());
 		md->release();
 	}
+}
+
+// Whether a block of the kext's holding a wire for writing covers a byte of the `count` runs at
+// `runs`, sorted and apart (rgfxRunsSorted): a pages block's of writable memory or a chunked one's,
+// the pages of a surface block kept for the host, or an in-place surface block's runs. A wire of
+// no kind known here, or one with a byte of no segment, counts as covering them. Under
+// contextLock, which keeps every wire in the table from going (each is unwired once out of it).
+bool writableBlockMeets(const RgfxPageRun *runs, uint32_t count)
+{
+	for (uint32_t i = 0; i < blockTable.count; i++) {
+		OSObject *held = static_cast<OSObject *>(blockTable.blocks[i].wired);
+		if (!held)
+			continue;
+		IOMemoryMap *map = OSDynamicCast(IOMemoryMap, held);
+		IOMemoryDescriptor *md =
+		    map ? map->getMemoryDescriptor() : OSDynamicCast(IOMemoryDescriptor, held);
+		if (!md)
+			return true;
+		// Wired for the device's reads alone (kIODirectionOut): read-only memory's.
+		if (!(md->getDirection() & kIODirectionIn))
+			continue;
+		const IOByteCount length = md->getLength();
+		for (IOByteCount at = 0; at < length;) {
+			IOByteCount n = 0;
+			const addr64_t phys = md->getPhysicalSegment(at, &n, kIOMemoryMapperNone);
+			if (!phys || !n || rgfxRunsMeet(runs, count, phys, n))
+				return true;
+			at += n;
+		}
+	}
+	if (!surfaceTable.entries)
+		return false;
+	for (uint32_t i = 0; i < surfaceTable.capacity; i++) {
+		const RgfxSurfaceEntry &e = surfaceTable.entries[i];
+		if (!e.used || !e.inPlace || !e.runs)
+			continue;
+		for (uint32_t r = 0; r < e.runCount; r++)
+			if (rgfxRunsMeet(runs, count, e.runs[r].address, e.runs[r].length))
+				return true;
+	}
+	return false;
+}
+
+// Whether the `length` bytes `md` holds, a sole holder's memory wired for reading (pagesBlock),
+// may take a block marked unchanging: no pages block of writable memory is being made
+// (writableMakes), and no block of the kext's holding a wire for writing covers a page of them
+// (writableBlockMeets). A wire holds no reference to the memory it wires, so the bundle's count
+// leaves these out; a writable wire made from here on is refused the pages, whose mapping's
+// maximum protection holds no write (RgfxPagesBlock.hpp). Their runs are sorted and made apart in
+// memory of their own first; false where it could not be had. The first refusal is logged.
+bool soleHolderAlone(IOMemoryDescriptor *md, UInt64 length)
+{
+	auto segment = [md](uint64_t at, uint64_t *bytes) -> uint64_t {
+		IOByteCount n = 0;
+		const addr64_t phys = md->getPhysicalSegment(at, &n, kIOMemoryMapperNone);
+		*bytes = n;
+		return phys;
+	};
+	const uint32_t count = rgfxPagesRuns(length, segment, nullptr, 0);
+	const vm_size_t listBytes = static_cast<vm_size_t>(count) * sizeof(RgfxPageRun);
+	RgfxPageRun *runs = count ? static_cast<RgfxPageRun *>(IOMalloc(listBytes)) : nullptr;
+	bool alone = runs && rgfxPagesRuns(length, segment, runs, count) == count;
+	if (alone) {
+		const uint32_t apart = rgfxRunsSorted(runs, count);
+		IOLockLock(contextLock);
+		alone = writableMakes == 0 && !writableBlockMeets(runs, apart);
+		IOLockUnlock(contextLock);
+	}
+	if (runs)
+		IOFree(runs, listBytes);
+	static char refused;
+	if (!alone && rgfxFirstCalls(&refused, 0, 1)) {
+		char name[32] = {};
+		proc_name(proc_selfpid(), name, sizeof(name));
+		IOLog("RgfxAccelerator: %s[%d]'s sole holder's pages block of 0x%llx bytes is refused: a "
+		      "writable block of the kext's covers its pages, or one is being made; it takes a "
+		      "read-only block (the first refusal)\n",
+		      name, proc_selfpid(), length);
+	}
+	return alone;
 }
 
 // Writes the `count` runs of `runs` at region offset `at` (page aligned) for the device, through a
@@ -3341,19 +3426,40 @@ IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 c
 	// private mapping's pages the wire copies for the process (RgfxPagesBlock.hpp).
 	const IODirection direction =
 	    wiring.access == RgfxPagesAccess::kRead ? kIODirectionOut : kIODirectionOutIn;
+	// Writable memory's make is counted from before its wire, so a sole holder's block made while
+	// it is in flight sees it (soleHolderAlone).
+	const bool writableMake = direction == kIODirectionOutIn;
+	auto failMake = [writableMake](IOReturn r) {
+		if (writableMake) {
+			IOLockLock(contextLock);
+			writableMakes--;
+			IOLockUnlock(contextLock);
+		}
+		return r;
+	};
+	if (writableMake) {
+		IOLockLock(contextLock);
+		writableMakes++;
+		IOLockUnlock(contextLock);
+	}
 	IOMemoryDescriptor *md =
 	    IOMemoryDescriptor::withAddressRange(range.base, range.length, direction, task);
 	if (!md)
-		return kIOReturnNoMemory;
+		return failMake(kIOReturnNoMemory);
 #if defined(__x86_64__)
 	faultTopDown(task, range.base, range.length);
 #endif
 	if (md->prepare(direction) != kIOReturnSuccess) {
 		md->release();
-		return kIOReturnBadArgument;
+		return failMake(kIOReturnBadArgument);
+	}
+	if (wiring.soleHolder && !soleHolderAlone(md, range.length)) {
+		md->complete(direction);
+		md->release();
+		return kIOReturnNotPermitted;
 	}
 	return pagesBlockOver(client, context, md, range.length, md, offset, size, wiring.flags,
-	                      gpuAddress);
+	                      gpuAddress, writableMake);
 }
 
 IOReturn RgfxAccelerator::pagesChunked(RgfxAcceleratorUserClient *client, UInt32 context,
@@ -3419,7 +3525,7 @@ IOReturn RgfxAccelerator::pagesChunked(RgfxAcceleratorUserClient *client, UInt32
 IOReturn RgfxAccelerator::pagesBlockOver(RgfxAcceleratorUserClient *client, UInt32 context,
                                          IOMemoryDescriptor *md, UInt64 length, void *wired,
                                          UInt64 *offset, UInt64 *size, UInt32 flags,
-                                         UInt64 *gpuAddress)
+                                         UInt64 *gpuAddress, bool writableMake)
 {
 	auto segment = [md](uint64_t at, uint64_t *bytes) -> uint64_t {
 		IOByteCount n = 0;
@@ -3430,11 +3536,16 @@ IOReturn RgfxAccelerator::pagesBlockOver(RgfxAcceleratorUserClient *client, UInt
 	const uint32_t count = rgfxPagesRuns(length, segment, nullptr, 0);
 	if (!count) {
 		unwire(wired);
+		if (writableMake) {
+			IOLockLock(contextLock);
+			writableMakes--;
+			IOLockUnlock(contextLock);
+		}
 		return kIOReturnBadArgument;
 	}
 	// The client's block, holding the wired pages from here on, and pinned until the device has
 	// its grant. It is never in the client's window: the process never sees a guest physical
-	// address.
+	// address. A writable make's count ends here, its block in the table or failed.
 	const UInt64 bytes = rgfxPagesBlockSize(count, kPage);
 	RgfxBlockPin pin = {};
 	UInt64 at = 0;
@@ -3443,6 +3554,8 @@ IOReturn RgfxAccelerator::pagesBlockOver(RgfxAcceleratorUserClient *client, UInt
 	                                            &pin, client->isWindowServer());
 	if (made == kRgfxBlockOk)
 		rgfxBlockSetWired(blockTable, at, wired);
+	if (writableMake)
+		writableMakes--;
 	IOLockUnlock(contextLock);
 	if (made != kRgfxBlockOk) {
 		unwire(wired);

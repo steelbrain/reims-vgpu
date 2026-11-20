@@ -263,6 +263,12 @@ do_guest_build() {
     "$(tool_src guest/bundle/tools/decode_md5.m)" -o "$P/decode_md5"
   "${cc[@]}" -framework Foundation -framework CoreGraphics \
     "$(tool_src guest/bundle/tools/winmon.m)" -o "$P/winmon"
+  # sole_holder_probe, the kernel's answers the bundle's sole holder's clause reads and the kext's
+  # refusals of it (guest-run.sh's info phase), where the candidate has it: C, with no Metal, for
+  # every release the guests run.
+  local sole=guest/bundle/tools/sole_holder_probe.c
+  [[ ! -f $sole ]] || xcrun clang -arch x86_64 -mmacosx-version-min=11.0 -O2 -Wall -Wextra -Werror \
+    -framework IOKit "$sole" -o "$P/sole_holder_probe"
   cp guest/bundle/build/sweep-x86_64 "$P/sweep"
   cp guest/bundle/build/bench-x86_64 "$P/bench"
   # oracle_icb (the ICB probe, with its metallib beside it), as its build.sh builds it, where the
@@ -291,6 +297,7 @@ do_guest_build() {
     echo "bench $(shasum < guest/bundle/tools/bench/bench.m | cut -c1-16)"  # bench.m builds alone
     echo "present_probe $(shasum < "$(tool_src guest/bundle/tools/present_probe.m)" | cut -c1-16)"
     echo "decode_md5 $(shasum < "$(tool_src guest/bundle/tools/decode_md5.m)" | cut -c1-16)"
+    [[ ! -f $sole ]] || echo "sole_holder_probe $(shasum < "$sole" | cut -c1-16)"
     [[ ! -f $o/oracle_icb.m ]] || echo "oracle_icb $(cat "$o/oracle_icb.m" "$o/oracle_icb.metal" "$o/oracle_common.h" | shasum | cut -c1-16)"
     echo "drag $(cat "$(tool_src guest/bundle/tools/winmon.m)" "$L/msi-drag.py" | shasum | cut -c1-16)"
     echo "bundle $(shasum < guest/bundle/build/reims-graphics.bundle | cut -c1-16)"

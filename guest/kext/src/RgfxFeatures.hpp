@@ -83,8 +83,9 @@
 //    as SURFACE_CACHE's are (RgfxSurfaceCaches.hpp);
 //  - UNCHANGING_PAGES (bit 31), both kexts, meaningful only with READ_ONLY_PAGES: the bundle names
 //    read-only memory no one writes, a file's pages on a read-only volume, which the app maps
-//    copy-on-write with no copy made yet or with no write allowed, or anonymous memory with a copy
-//    pending and no write in its maximum protection (the bundle's RgfxFilePages.hpp), and the
+//    copy-on-write with no copy made yet or with no write allowed, or anonymous memory with no
+//    write in its maximum protection with a copy pending, or that its mapping alone holds where
+//    the kext takes it (kRgfxKextFeatureSoleHolderPages; the bundle's RgfxFilePages.hpp), and the
 //    kext makes a pages block of that mapping marked unchanging (RGFX_SURFACE_PAGES_UNCHANGING,
 //    and RGFX_SURFACE_PAGES_COPY_ON_WRITE where the app's mapping is copy-on-write;
 //    kRgfxPagesUnchanging, RgfxPagesBlock.hpp), for the host to read its pages once;

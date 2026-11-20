@@ -9,6 +9,7 @@
 #include <libproc.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <mach/vm_page_info.h>
 #include <mach/vm_region.h>
 #include <mach/vm_statistics.h>
 #include <os/log.h>
@@ -53,17 +54,39 @@ bool everyPageExternal(mach_vm_address_t start, mach_vm_address_t end, uint64_t 
 	return true;
 }
 
-// The clause of anonymous memory, the region `region` (RgfxFilePages.hpp, UNCHANGING ANONYMOUS
-// MEMORY): unchanging where its maximum protection has no write and the kernel answers it SM_COW
-// with no object below the region's own; else not a file.
-RgfxFilePages anonymousPagesOf(const vm_region_submap_short_info_data_64_t &region)
+// Whether the object `objectId` that holds the page at `address`, with no object below it, has one
+// reference, the process's mapping's: mach_vm_page_info's VM_PAGE_INFO_BASIC answers the object's
+// reference count as the kernel keeps it, read before the query takes one of its own, with the
+// object's id, which the region's is the low 32 bits of, and the depth it found the page at
+// (RgfxFilePages.hpp, UNCHANGING ANONYMOUS MEMORY).
+bool soleHolderAt(mach_vm_address_t address, uint32_t objectId)
 {
-	if ((region.max_protection & VM_PROT_WRITE) != 0 || region.share_mode != SM_COW ||
-	    region.shadow_depth != 0)
+	vm_page_info_basic_data_t info = {};
+	mach_msg_type_number_t count = VM_PAGE_INFO_BASIC_COUNT;
+	return mach_vm_page_info(mach_task_self(), address, VM_PAGE_INFO_BASIC,
+	                         reinterpret_cast<vm_page_info_t>(&info), &count) == KERN_SUCCESS &&
+	       count == VM_PAGE_INFO_BASIC_COUNT && info.ref_count == 1 && info.depth == 0 &&
+	       static_cast<uint32_t>(info.object_id) == objectId;
+}
+
+// The clause of anonymous memory, the region `region` from `start` (RgfxFilePages.hpp,
+// UNCHANGING ANONYMOUS MEMORY): unchanging where its maximum protection has no write and the
+// kernel answers it SM_COW with no object below the region's own, or, where `soleHolder`, SM_PRIVATE
+// with no object below it and that object's one reference the mapping's; else not a file.
+RgfxFilePages anonymousPagesOf(const vm_region_submap_short_info_data_64_t &region,
+                               mach_vm_address_t start, bool soleHolder)
+{
+	if ((region.max_protection & VM_PROT_WRITE) != 0 || region.shadow_depth != 0)
 		return neither(kRgfxNeitherNotAFile);
 	RgfxFilePages out;
-	out.clause = kRgfxAnonymousCopyOnWrite;
 	out.why = kRgfxNeitherNone;
+	if (region.share_mode == SM_COW)
+		out.clause = kRgfxAnonymousCopyOnWrite;
+	else if (soleHolder && region.share_mode == SM_PRIVATE &&
+	         soleHolderAt(start, region.object_id))
+		out.clause = kRgfxAnonymousPrivate;
+	else
+		return neither(kRgfxNeitherNotAFile);
 	return out;
 }
 
@@ -88,7 +111,7 @@ bool readOnlyVolume(const fsid_t &fsid)
 
 } // namespace
 
-RgfxFilePages rgfxFilePagesOf(const void *address, uint64_t length)
+RgfxFilePages rgfxFilePagesOf(const void *address, uint64_t length, bool soleHolder)
 {
 	const uint64_t page = vm_page_size;
 	const uintptr_t at = reinterpret_cast<uintptr_t>(address);
@@ -113,7 +136,7 @@ RgfxFilePages rgfxFilePagesOf(const void *address, uint64_t length)
 	if (region.is_submap)
 		return neither(kRgfxNeitherNotAFile);
 	if (!region.external_pager)
-		return anonymousPagesOf(region);
+		return anonymousPagesOf(region, start, soleHolder);
 	// The process can never write it: its maximum protection has no write.
 	const bool copyOnWrite = region.share_mode == SM_COW;
 	if ((region.max_protection & VM_PROT_WRITE) != 0)
@@ -175,7 +198,7 @@ std::atomic<bool> gReportDue{false};
 const int64_t kReportNs = 60ll * 1000 * 1000 * 1000;
 
 const char *const kClauseNames[kRgfxFileClauses] = {
-    "max-no-write", "copy-on-write", "anonymous copy-on-write", "neither",
+    "max-no-write", "copy-on-write", "anonymous copy-on-write", "anonymous private", "neither",
 };
 
 const char *const kNeitherNames[kRgfxNeitherKinds] = {

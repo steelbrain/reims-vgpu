@@ -290,14 +290,16 @@ RgfxRegion::Block RgfxRegion::acquirePages(const void *address, uint64_t length,
 		// Read-only memory, classified (RgfxFilePages.hpp): the app's own pages named unchanging
 		// where they cannot change, and else with why not, which the host counts its copies by.
 		const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-		const RgfxFilePages file = rgfxFilePagesOf(address, length);
+		const RgfxFilePages file = rgfxFilePagesOf(address, length, m_soleHolderPages);
 		const uint64_t ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
 		uint32_t why = file.why;
 		bool refused = false;
 		if (file.clause != kRgfxFileNeither) {
 			const bool copyOnWrite =
 			    file.clause == kRgfxFileCopyOnWrite || file.clause == kRgfxAnonymousCopyOnWrite;
-			const uint32_t unchanging = kPagesUnchanging | (copyOnWrite ? kPagesCopyOnWrite : 0);
+			const uint32_t unchanging =
+			    kPagesUnchanging | (copyOnWrite ? kPagesCopyOnWrite : 0) |
+			    (file.clause == kRgfxAnonymousPrivate ? kPagesSoleHolder : 0);
 			given = m_pagesBlock(m_pagesBlockContext, address, length, unchanging, &offset, &size,
 			                     &gpuAddress);
 			refused = !given;

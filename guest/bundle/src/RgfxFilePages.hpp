@@ -45,15 +45,34 @@
  * maximum lacks (vm_map_remap_extract, vm_map.c:18037-18058 and 18733-18734), and vm_protect's
  * VM_PROT_COPY maps a copy in its place, leaving its pages as they are (vm_map_protect,
  * vm_map.c:5832-5905).
+ * Anonymous memory is unchanging too where its maximum protection has no write, the kernel answers
+ * it SM_PRIVATE with a shadow depth of 0, and the region's object has one reference, the mapping's
+ * own (kRgfxAnonymousPrivate), where the kext takes such memory (kRgfxKextFeatureSoleHolderPages,
+ * rgfxFilePagesOf's `soleHolder`). The share mode alone leaves the count in doubt: the walk takes
+ * one from it while the object pages (vm_map.c:16002-16005), so an object another mapping holds
+ * reads private while paging on it is in progress. mach_vm_page_info's VM_PAGE_INFO_BASIC answers
+ * the count as the kernel keeps it, read before the query takes a reference of its own, with the
+ * object's id, whose low 32 bits are the region's object id, and the depth it found the page at
+ * (vm_map_page_range_info_internal, at xnu-12377.121.6's osfmk/vm/vm_map.c:18686-18692 and
+ * 18802-18805). The ids must match: a process that asked for its regions' footprint
+ * (task_self_region_footprint) is answered a count of 1 at depth 0 for every page, with an id of
+ * none of its objects (that file's 18644-18676). With one reference no other mapping and no memory
+ * entry holds the object, and none made after takes a protection the maximum lacks (above), so
+ * nothing maps the pages for writing; a copy of them, mach_vm_remap's or VM_PROT_COPY's, writes
+ * pages of its own. What the count leaves out is a wire, which holds no reference
+ * (vm_object_iopl_request, vm_pageout.c:8331; upl_destroy, 5683-5685). A wire for writing is
+ * refused once the maximum protection has no write (vm_map_create_upl, at xnu-12377.121.6's
+ * osfmk/vm/vm_pageout.c:7659-7661, and vme_allows_upl_write, 7408-7415), but one taken while the
+ * memory was writable may write its pages still, under a count of one. The kext's own are known to
+ * it, and it refuses the block where one covers a page (its RgfxPagesBlock.hpp). A write another
+ * driver started before the process removed write for good, still landing after the make, is this
+ * clause's residual. The rules it rests on were read in the published kernel source of every
+ * release from macOS 11.0.1 to 26.5 (xnu-7195.50.7.100.1 to xnu-12377.121.6); later releases are
+ * checked by test (tools/sole_holder_probe.c, which a guest's boot check runs).
  * Every other share mode is neither, why not a file, and so is memory whose maximum protection
  * has write. SM_COW at a shadow depth of 1 or more leaves in doubt whether another mapping shares
- * the region's top object with write. SM_PRIVATE leaves in doubt that no one else writes the
- * object's pages: the walk takes one from the object's reference count while the object pages
- * (vm_map.c:16002-16005), so an object another mapping holds reads private while paging on it is
- * in progress; and a wire holds no reference (vm_object_iopl_request,
- * vm_pageout.c:8331; upl_destroy, 5683-5685), so a driver's wire for writing, taken while the
- * memory was writable, our own kext's for a writable block among them, writes its pages still
- * after the maximum protection lost write, under a count of one.
+ * the region's top object with write, and so does SM_PRIVATE where the kext does not take a sole
+ * holder's memory, or the count is more than one.
  *
  * THE PAGES THE KEXT WIRES are the app's own, as for any pages block. A shared mapping's are the
  * file's pages. A private mapping needs a copy (xnu's vm_map_create_upl resolves it, and
@@ -90,6 +109,9 @@ enum RgfxFileClause : uint8_t {
 	// Anonymous memory whose maximum protection has no write, of share mode SM_COW with a shadow
 	// depth of 0: a copy pending on the region's own object.
 	kRgfxAnonymousCopyOnWrite,
+	// Anonymous memory whose maximum protection has no write, of share mode SM_PRIVATE with a
+	// shadow depth of 0, its object's one reference the mapping's: a sole holder's.
+	kRgfxAnonymousPrivate,
 	// Neither: the memory is not provably unchanging.
 	kRgfxFileNeither,
 	kRgfxFileClauses,
@@ -123,8 +145,9 @@ struct RgfxFilePages {
 	RgfxFileNeither why = kRgfxNeitherOther;
 };
 
-/// The clause of the `length` bytes at `address` in this process, now.
-RgfxFilePages rgfxFilePagesOf(const void *address, uint64_t length);
+/// The clause of the `length` bytes at `address` in this process, now; kRgfxAnonymousPrivate
+/// only where `soleHolder`, as the kext takes a sole holder's memory.
+RgfxFilePages rgfxFilePagesOf(const void *address, uint64_t length, bool soleHolder = false);
 
 /// The process's totals (rgfxFilePagesNote).
 struct RgfxFilePagesCounts {

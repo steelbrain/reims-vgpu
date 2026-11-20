@@ -566,6 +566,7 @@ RgfxRegion::PagesAnswer rgfxKextSurfacePagesCarrying(void *context, const void *
 static_assert(RgfxRegion::kPagesWritable == kRgfxPagesWritable &&
                   RgfxRegion::kPagesUnchanging == kRgfxPagesUnchanging &&
                   RgfxRegion::kPagesCopyOnWrite == kRgfxPagesCopyOnWrite &&
+                  RgfxRegion::kPagesSoleHolder == kRgfxPagesSoleHolder &&
                   RgfxRegion::kPagesWhyShift == kRgfxPagesWhyShift,
               "the region's pages block ways are the kext's");
 
@@ -1190,6 +1191,10 @@ RGFX_LOG_UNRECOGNIZED
 		    (_caps.kextFeatures() & kRgfxKextFeatureUnchangingPages) != 0 &&
 		    (_caps.features() & (RGFX_FEATURE_UNCHANGING_PAGES | RGFX_FEATURE_READ_ONLY_PAGES)) ==
 		        (RGFX_FEATURE_UNCHANGING_PAGES | RGFX_FEATURE_READ_ONLY_PAGES));
+		// Anonymous memory the app's mapping alone holds among it, where the kext checks no
+		// writable block of its own covers it.
+		_region->setSoleHolderPages(_region->unchangingPages() &&
+		                            (_caps.kextFeatures() & kRgfxKextFeatureSoleHolderPages) != 0);
 		// Slabs of the kext's chunks first, where it makes them.
 		if ((_caps.kextFeatures() & kRgfxKextFeaturePagesChunked) != 0)
 			_region->setChunkedPagesSource(&rgfxKextPagesChunked, connContext);

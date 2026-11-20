@@ -2430,7 +2430,7 @@ kexts' arm64e builds, and `check-boot.sh` checks one boot of it:
 ```sh
 make -C firmware/ambrosia config-bundle GRAFT=<Graft.kext> \
   REIMS_GRAPHICS=<ReimsGraphics.kext> RGFXGATE=<RgfxGate.kext>
-make -C firmware/ambrosia guest-tools          # on a Mac: bench and present_probe for arm64
+make -C firmware/ambrosia guest-tools          # on a Mac: the guest probes for arm64
 firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   -q <qemu-system-aarch64 with the device> ~/.local/share/reims-ctl/vms/macos-26
 ```
@@ -2524,7 +2524,11 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   level, which needs no right to be in front ([lessons.md](lessons.md)). A
   probe that falls short while Setup
   Assistant runs fails as unread, naming it, as its full-screen window
-  covers the probe's. `bundle-install`: RgfxGate's Graft client state reads
+  covers the probe's. `sole-holder`: `sole_holder_probe`
+  (`guest/bundle/tools/sole_holder_probe.c`) exits 0, the kernel answering
+  anonymous memory as the bundle's sole holder's clause reads it and the kext
+  making and refusing a sole holder's pages block as it says, with no Metal
+  work beside it. `bundle-install`: RgfxGate's Graft client state reads
   installed, tagged or present, and `/Library/GPUBundles/reims-graphics.bundle`
   carries the restricted flag and the `KernelExtensionManagement` rootless
   class. `amfi-map`: WindowServer maps the bundle's executable (`sudo lsof`
