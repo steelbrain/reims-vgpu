@@ -305,8 +305,15 @@
 //!   flight never shares one. A copy whose takes leave no whole piece among the spares hands a
 //!   top-up to a thread of theirs ([`SPARES_THREADS`]), which nothing waits for: it makes whole
 //!   pieces until the spares hold [`SPARE_BYTES`] of them, letting go of shorter ones to fit,
-//!   each make under the device's reset gate. A copy that finds no spare still makes its piece
-//!   on its own thread. Each piece taken is counted (`rt-staging-pieces`, and
+//!   each make under the device's reset gate. A release's copy out finds its pieces made ahead:
+//!   where the spares and the pieces reserved for its block lack some a copy of all of the
+//!   cache's bytes would take ([`SurfaceCaches::lacking`]), they are made on the releases' pace's
+//!   thread ([`ReleasePace`]) with no lock of the caches' held, and reserved for the block
+//!   ([`SurfaceCaches::reserved`]) before the release is carried out, so neither ring 0 nor the
+//!   caches' lock waits for a make; the copy takes them first, and the spares take back on their
+//!   thread what it leaves. Any other copy that finds no spare still makes its piece on its own
+//!   thread, under the caches' lock, counted (`rt-staging-piece-makes-locked`). Each piece taken
+//!   is counted (`rt-staging-pieces`, and
 //!   `rt-staging-pieces-spared` those a spare served), and each a copy made, with the
 //!   nanoseconds its make took in all and the longest, for a cache's first staged copy
 //!   (`rt-staging-piece-makes-first`, `-first-ns`, `-first-max-ns`, `-first-kib`) apart from
@@ -998,6 +1005,9 @@ fn after_landings(mut landings: Vec<Arc<Landing>>, done: Answer) {
 /// reached (`kRgfxWriteBackWaitMs`); the copy itself then still waits for the GPU.
 const RELEASE_TURN_MOST: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The name of the releases' pace's thread ([`ReleasePace`]).
+const RELEASE_PACE_THREAD: &str = "reims-vgpu.graphics-release-pace";
+
 /// What a release carries out on the caches once its turn comes ([`Caches::release`]): with its
 /// turn, where it took one.
 type PacedOp<P> = Box<dyn FnOnce(&mut SurfaceCaches<P>, Option<Turn<P>>) + Send>;
@@ -1039,6 +1049,32 @@ struct Paced<P: Platform> {
     op: PacedOp<P>,
     asked: MonoTime,
     now: Now,
+    /// The pieces its copy lacks, made before it is carried out ([`Reserve`]).
+    reserve: Option<Reserve<P>>,
+}
+
+/// The pieces a release's staged copy would make for want of a spare ([`SurfaceCaches::lacking`]),
+/// made on the pace's thread with no lock of the caches' held and reserved for the block
+/// ([`SurfaceCaches::reserved`]) before the release is carried out, so neither ring 0 nor the
+/// caches' lock waits for their makes.
+struct Reserve<P: Platform> {
+    spares: Arc<Spares<P>>,
+    lens: Vec<u64>,
+    /// Whether the copy is its cache's first staged copy ([`piece_made`]).
+    first: bool,
+    timed: Option<Now>,
+}
+
+impl<P: Platform> Reserve<P> {
+    /// Makes the pieces on `device` and reserves them for the block at `block` in `caches`; none
+    /// where the platform makes one not, or raises, as the copy then makes its own.
+    fn make(self, caches: &Caches<P>, device: &P::Device, block: u64) {
+        let made = self.spares.pieces(device, &self.lens, self.first, self.timed.as_ref());
+        if let Ok(Some(pieces)) = made {
+            let mut state = caches.state.lock();
+            state.reserved.entry(block).or_default().extend(pieces);
+        }
+    }
 }
 
 /// When the next release may take its turn ([`turn_at`]).
@@ -1112,6 +1148,7 @@ impl<P: Platform> ReleasePace<P> {
         block: u64,
         op: PacedOp<P>,
         now: Now,
+        reserve: Option<Reserve<P>>,
     ) {
         let pace = &caches.pace;
         let mut state = pace.state.lock();
@@ -1121,6 +1158,7 @@ impl<P: Platform> ReleasePace<P> {
             op,
             asked: now(),
             now,
+            reserve,
         });
         if state.draining {
             return;
@@ -1130,7 +1168,7 @@ impl<P: Platform> ReleasePace<P> {
         let spawned = {
             let caches = Arc::clone(caches);
             std::thread::Builder::new()
-                .name("reims-vgpu.graphics-release-pace".into())
+                .name(RELEASE_PACE_THREAD.into())
                 .spawn(move || ReleasePace::drain(&caches))
         };
         let Err(error) = spawned else {
@@ -1153,7 +1191,11 @@ impl<P: Platform> ReleasePace<P> {
                 op,
                 asked,
                 now,
+                reserve,
             } = paced;
+            if let Some(reserve) = reserve {
+                reserve.make(caches, &device, block);
+            }
             let turn = Turn {
                 pace: Arc::clone(pace),
                 waited: Some(now().saturating_duration_since(asked)),
@@ -1196,6 +1238,7 @@ impl<P: Platform> ReleasePace<P> {
                 op,
                 asked,
                 now,
+                reserve,
             }) = paced
             else {
                 continue;
@@ -1206,6 +1249,9 @@ impl<P: Platform> ReleasePace<P> {
                 now,
             };
             crate::entry::run(|_| {
+                if let Some(reserve) = reserve {
+                    reserve.make(caches, &device, block);
+                }
                 caches.after_writers(&device, block, Box::new(move |state| op(state, Some(turn))));
             });
         }
@@ -1904,6 +1950,10 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     staged: Option<Now>,
     /// The staged copies' buffers no copy uses (the module doc, "Staged copies").
     spares: Arc<Spares<P>>,
+    /// Pieces made for a block's next staged copy with the caches' lock let go of, by block (the
+    /// module doc, "Staged copies"): the copy takes them before the spares, and gives back what it
+    /// leaves ([`Spares::pieces_from`]).
+    reserved: HashMap<u64, Vec<P::Buffer>>,
     /// The threads that move a staged download's bytes into its pages and land it
     /// ([`INTO_PAGES_THREADS`]), a block's in the order their command buffers completed.
     lands_out: Arc<Worker>,
@@ -2121,6 +2171,7 @@ impl<P: Platform> SurfaceCaches<P> {
             shape_clock: 0,
             staged: None,
             spares: Arc::new(Spares::new(SPARE_BYTES, PIECE, Arc::default())),
+            reserved: HashMap::new(),
             lands_out: Arc::new(Worker::new(INTO_PAGES_THREADS)),
         }
     }
@@ -4318,14 +4369,17 @@ impl<P: Platform> SurfaceCaches<P> {
         wait_before::<P>(&cb, signal.as_ref())?;
         wait_for_users::<P>(&cb, &self.ends, cache)?;
         let timed = self.staged.as_ref();
+        let mut reserve = self.reserved.remove(&block).unwrap_or_default();
         let staged = copy::<P>(
             device,
             &cb,
             cache,
             (Way::In, block),
             &mut self.counts,
-            (timed, &self.spares),
-        )?;
+            (timed, &self.spares, &mut reserve),
+        );
+        self.spares.give_later(reserve);
+        let staged = staged?;
         if let Some(staged) = staged {
             cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| staged.done()))?;
         }
@@ -4632,6 +4686,9 @@ impl<P: Platform> SurfaceCaches<P> {
             }
         }
         self.watched.0.lock().remove(&block);
+        if let Some(reserve) = self.reserved.remove(&block) {
+            self.spares.give_later(reserve);
+        }
         Ok(gone)
     }
 
@@ -4640,6 +4697,22 @@ impl<P: Platform> SurfaceCaches<P> {
     fn out_copy(&self, block: u64) -> Option<Arc<Landing>> {
         let out = self.by_block.get(&block)?.out.as_ref()?;
         (!out.landing.landed()).then(|| Arc::clone(&out.landing))
+    }
+
+    /// The pieces a staged copy of the block at `block`'s cache into its pages, of all of its
+    /// bytes, would make for want of a piece reserved for the block or a spare
+    /// ([`Spares::lacking`]): their lengths, and whether it is the cache's first staged copy;
+    /// `None` where its copies out are not staged, or it would make none. A copy that moves fewer
+    /// bytes (the record narrows it) lays them in no more pieces, none longer.
+    fn lacking(&self, block: u64) -> Option<(Vec<u64>, bool)> {
+        let cache = self.by_block.get(&block)?;
+        if !matches!(cache.pages, Some(CachePages::Copied(_))) || self.staged.is_none() {
+            return None;
+        }
+        let lens = pack(std::iter::once(0..cache.length), self.spares.piece).lens;
+        let reserved = self.reserved.get(&block).map_or(&[][..], Vec::as_slice);
+        let lacking = self.spares.lacking(&lens, reserved);
+        (!lacking.is_empty()).then_some((lacking, !cache.staged))
     }
 
     /// Whether a release of the block at `block` asked now may copy its cache into its pages
@@ -4759,14 +4832,17 @@ impl<P: Platform> SurfaceCaches<P> {
         let back = shapes::write_back::<P>(&cb, &cache.device, &cache.shapes, |s| s.dirty)?;
         cache.wrote_shapes(&back);
         let timed = self.staged.as_ref();
+        let mut reserve = self.reserved.remove(&block).unwrap_or_default();
         let staged = copy::<P>(
             device,
             &cb,
             cache,
             (Way::Out, block),
             &mut self.counts,
-            (timed, &self.spares),
-        )?;
+            (timed, &self.spares, &mut reserve),
+        );
+        self.spares.give_later(reserve);
+        let staged = staged?;
         signal_after::<P>(&cb, signal.as_ref())?;
         // The buffers live until the copy is done, past the cache's own end at a release.
         let view = match &cache.pages {
@@ -6392,9 +6468,17 @@ impl<P: Platform> Caches<P> {
         // Its copy into the pages lands with its answer, which a `SURFACE_PAGES` over the same
         // pages waits for from here, while the copy waits for the buffers that write the cache,
         // and for its turn.
-        let (done, failed, may_copy) = {
+        let (done, failed, may_copy, reserve) = {
             let mut state = self.state.lock();
             let may_copy = state.release_may_copy(block, unheld);
+            let reserve = (may_copy.then(|| state.lacking(block)).flatten()).map(|(lens, first)| {
+                Reserve {
+                    spares: Arc::clone(&state.spares),
+                    lens,
+                    first,
+                    timed: state.staged.clone(),
+                }
+            });
             let runs = (state.by_block.contains_key(&block))
                 .then(|| (state.watched.0.lock().get(&block)).map(|p| p.runs.clone()))
                 .flatten();
@@ -6411,9 +6495,9 @@ impl<P: Platform> Caches<P> {
                         landing.land();
                         failed(raise);
                     });
-                    (done, failed, may_copy)
+                    (done, failed, may_copy, reserve)
                 }
-                None => (done, failed, may_copy),
+                None => (done, failed, may_copy, reserve),
             }
         };
         let op: PacedOp<P> = Box::new(move |state, turn| {
@@ -6438,11 +6522,13 @@ impl<P: Platform> Caches<P> {
             self.after_writers(device, block, Box::new(move |state| op(state, None)));
             return;
         }
-        match self.pace.turn_now(&now) {
+        // A copy that lacks pieces has them made on the pace's thread first.
+        let turn = reserve.is_none().then(|| self.pace.turn_now(&now)).flatten();
+        match turn {
             Some(turn) => {
                 self.after_writers(device, block, Box::new(move |state| op(state, Some(turn))));
             }
-            None => ReleasePace::wait_turn(self, device, block, op, now),
+            None => ReleasePace::wait_turn(self, device, block, op, now, reserve),
         }
     }
 
@@ -7479,8 +7565,32 @@ impl<P: Platform> Spares<P> {
         first: bool,
         timed: Option<&Now>,
     ) -> RaiseResult<Option<Vec<P::Buffer>>> {
+        self.pieces_from(device, &mut Vec::new(), lens, (first, false), timed)
+    }
+
+    /// [`Self::pieces`] for a copy made under the caches' lock (`locked`), each piece the shortest
+    /// of `reserve`, those reserved for the copy's block ([`SurfaceCaches::reserved`]), that holds
+    /// it before a spare: a piece taken from `reserve` was counted as it was reserved. A make
+    /// under the caches' lock is counted ([`PIECE_MAKES_LOCKED`]). `None` where one is not made,
+    /// the pieces taken given back to the spares.
+    fn pieces_from(
+        &self,
+        device: &P::Device,
+        reserve: &mut Vec<P::Buffer>,
+        lens: &[u64],
+        (first, locked): (bool, bool),
+        timed: Option<&Now>,
+    ) -> RaiseResult<Option<Vec<P::Buffer>>> {
         let mut pieces = Vec::with_capacity(lens.len());
         for &length in lens {
+            let reserved = (reserve.iter().enumerate())
+                .filter(|(_, b)| b.length() >= length)
+                .min_by_key(|(_, b)| b.length())
+                .map(|(at, _)| at);
+            if let Some(at) = reserved {
+                pieces.push(reserve.swap_remove(at));
+                continue;
+            }
             let spared = self.take(length);
             let from_spares = spared.is_some();
             let piece = match spared {
@@ -7490,6 +7600,9 @@ impl<P: Platform> Spares<P> {
                     let made = device.new_scratch_buffer_of_length(ON, length, STORAGE_SHARED)?;
                     if let (Some(now), Some(at), Some(_)) = (timed, at, &made) {
                         piece_made(first, now().saturating_duration_since(at), length);
+                        if locked {
+                            reims_vgpu_vulkan::answer::count_kind(PIECE_MAKES_LOCKED);
+                        }
                     }
                     made
                 }
@@ -7507,6 +7620,47 @@ impl<P: Platform> Spares<P> {
         }
         self.top_up(device, timed);
         Ok(Some(pieces))
+    }
+
+    /// Of `lens`, the pieces a copy would make ([`Self::pieces_from`]) where `reserved` and the
+    /// spares kept now serve it: each the shortest of them that holds it, the reserved first.
+    fn lacking(&self, lens: &[u64], reserved: &[P::Buffer]) -> Vec<u64> {
+        let mut reserved: Vec<u64> = reserved.iter().map(|b| b.length()).collect();
+        let mut kept: Vec<u64> = (self.kept.idle.lock().iter())
+            .map(|s| s.buffer.length())
+            .collect();
+        let mut lacking = Vec::new();
+        for &length in lens {
+            let served = [&mut reserved, &mut kept].into_iter().any(|from| {
+                let at = (from.iter().enumerate())
+                    .filter(|&(_, &l)| l >= length)
+                    .min_by_key(|&(_, &l)| l)
+                    .map(|(at, _)| at);
+                at.map(|at| from.swap_remove(at)).is_some()
+            });
+            if !served {
+                lacking.push(length);
+            }
+        }
+        lacking
+    }
+
+    /// Gives `pieces`, reserved for a copy that left them ([`Self::pieces_from`]), back to the
+    /// spares on the spares' thread, so what is let go of goes with no lock of the caches' held.
+    fn give_later(&self, pieces: Vec<P::Buffer>) {
+        if pieces.is_empty() {
+            return;
+        }
+        let kept = Arc::clone(&self.kept);
+        let cap = self.cap;
+        self.topper.submit(
+            0,
+            Box::new(move || {
+                for piece in pieces {
+                    drop(kept.keep(piece, false, cap));
+                }
+            }),
+        );
     }
 
     /// Hands a top-up over to the spares' thread ([`Kept::top_up`]) where no whole piece is
@@ -7818,6 +7972,11 @@ fn spares_held(held: u64) {
     }
 }
 
+/// Of the pieces made for staged copies ([`PIECE_MAKES`]), those made with the caches' lock held:
+/// a copy found neither a piece reserved for its block nor a spare (the module doc, "Staged
+/// copies").
+const PIECE_MAKES_LOCKED: &str = "rt-staging-piece-makes-locked";
+
 /// One piece taken for a staged copy, from the spares where `spared` ([`PIECES_TAKEN`]).
 fn piece_taken(spared: bool) {
     reims_vgpu_vulkan::answer::count_kind(PIECES_TAKEN);
@@ -7875,7 +8034,7 @@ fn copy<P: Platform>(
     cache: &mut SurfaceCache<P>,
     (way, block): (Way, u64),
     counts: &mut CacheCounts,
-    (timed, spares): (Option<&Now>, &Arc<Spares<P>>),
+    (timed, spares, reserve): (Option<&Now>, &Arc<Spares<P>>, &mut Vec<P::Buffer>),
 ) -> RaiseResult<Option<Staging<P>>> {
     if way == Way::In && cache.pages.is_some() {
         cache.changed = Changed::All;
@@ -7956,7 +8115,7 @@ fn copy<P: Platform>(
             _ => None,
         };
         let mut pieces = match &packed {
-            Some(packed) => spares.pieces(device, &packed.lens, first, timed)?,
+            Some(packed) => spares.pieces_from(device, reserve, &packed.lens, (first, true), timed)?,
             None => None,
         };
         if let Some(CachePages::Copied(copied)) = &cache.pages
@@ -14824,6 +14983,63 @@ pub(super) mod tests {
             }
         }
         (topped, rest)
+    }
+
+    /// Where the caches' copies are staged, a release whose copy lacks pieces the spares do not
+    /// hold has them made on the releases' pace's thread ([`RELEASE_PACE_THREAD`]), with no lock
+    /// of the caches' held, and reserved for its block: neither the ring-0 thread that asked it
+    /// nor the caches' lock waits for a make, and the copy takes them, making none under the lock
+    /// ([`PIECE_MAKES_LOCKED`]). It is answered once its copy lands, the pages holding the cache
+    #[test]
+    fn a_staged_releases_pieces_are_made_off_its_ring_and_the_caches_lock() {
+        let mut r = rig(8);
+        r.dec.set_staged_surface_copies(Arc::default());
+        queues(&mut r);
+        let page = r.page;
+        let length = 2 * page;
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], length, true),
+            RGFX_STATUS_OK
+        );
+        // The use writes the cache, and its fill's piece stays in flight: no spare holds one.
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        let lands_out = r.dec.caches().lands_out();
+        lands_out.hold();
+        let locked = counted(PIECE_MAKES_LOCKED);
+        let mark = r.p.call_log().mark();
+        let done = release(&r, BLOCK);
+        assert!(
+            eventually(|| {
+                r.p.world().complete_all(CompleteOn::Caller);
+                copies(&r.p.call_log().since(mark)).len() == 1
+            }),
+            "the release's copy, once its piece is made and the use finished"
+        );
+        let calls = r.p.call_log().since(mark);
+        let made: Vec<(u64, Option<String>)> = (calls.iter())
+            .filter(|c| c.sel == SCRATCH_BUFFER)
+            .map(|c| (c.args[0].as_u64().expect("a length"), c.thread.clone()))
+            .collect();
+        let lens = pack(std::iter::once(0..length), PIECE).lens;
+        assert_eq!(
+            made,
+            (lens.iter())
+                .map(|&l| (l, Some(RELEASE_PACE_THREAD.to_owned())))
+                .collect::<Vec<_>>(),
+            "its piece, made on the pace's thread"
+        );
+        let out = copies(&calls);
+        buffer_bytes(&r, out[0].1, Some(0xc3));
+        lands_out.release();
+        assert!(eventually(|| {
+            complete_staged(&r);
+            done.load(Ordering::SeqCst)
+        }));
+        assert!(
+            ram_bytes(&r, 1, length, None).iter().all(|&b| b == 0xc3),
+            "the pages hold what the GPU copied out of the cache"
+        );
+        assert_eq!(counted(PIECE_MAKES_LOCKED), locked, "none made under the lock");
     }
 
     /// A copy whose takes leave no whole piece among the staged copies' spares hands a top-up to
