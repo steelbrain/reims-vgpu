@@ -154,10 +154,17 @@ pub const TAKE_WAIT_CODES: [(&str, &str); 4] = [
 
 /// The length of the piece the pool keeps ahead of the guest's takes, its headroom (the module
 /// doc's "Headroom and giving blocks back"), and of every block [`HostBlocks`] hands out for an
-/// ask no longer: 256 MiB. It is the pool's own: metal2vulkan-rt hands out a block of the length
+/// ask no longer: 64 MiB. It is the pool's own: metal2vulkan-rt hands out a block of the length
 /// asked, rounded up to 64 KiB, carved from its 16 MiB allocations (its
 /// `MemoryClass::block_len`) where it fits one, else at the start of an allocation of its own.
-pub const BLOCK_LEN: u64 = 256 << 20;
+///
+/// On a Radeon 780M a growth of 256 MiB (rt's take, the host's add and its populate) took at
+/// most 10.5, 2.3 and 76.0 ms, and a boot with a desktop, a browser, video and two 3D benchmarks
+/// took nothing longer than 16 MiB and carved at most 73 MiB at once outside the benchmarks
+/// (**measured**, 11-19). A shorter piece holds less memory the guest does not use, and takes
+/// less of the host's time to make, map and give back; a take longer than the piece has a piece
+/// of its own length.
+pub const BLOCK_LEN: u64 = 64 << 20;
 
 /// The alignment of a piece's guest physical address and of a pool's range: 2 MiB, a large page
 /// of the guest's and of the hypervisors' second-level tables.

@@ -661,14 +661,14 @@ fn a_pool_s_pieces_reach_the_host_and_back() {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert_eq!(*POOL_ASKS.lock(), [(true, BASE, 256 << 20)]);
+        assert_eq!(*POOL_ASKS.lock(), [(true, BASE, reims_vgpu::BLOCK_LEN)]);
         assert_eq!(rvg_graphics_device_pool_added(device, BASE), RVG_OK);
         assert_eq!(
             rvg_graphics_device_pool_added(device, BASE),
             RVG_ERR_INVALID_ARGUMENT
         );
         assert_eq!(
-            rvg_graphics_device_pool_removed(device, BASE + (256 << 20)),
+            rvg_graphics_device_pool_removed(device, BASE + reims_vgpu::BLOCK_LEN),
             RVG_ERR_INVALID_ARGUMENT
         );
         // The host removes its pieces before the release, and the release asks it nothing.

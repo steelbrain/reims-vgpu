@@ -14322,7 +14322,7 @@ fn the_driver_s_take_of_the_pool_asks_one_piece_ahead_of_the_first_take() {
     // Its piece used, the pool asks for the next as headroom, as it did before the take of `POOL`.
     assert_eq!(
         adds.recv_timeout(Duration::from_secs(10)),
-        Ok(BASE + (256 << 20))
+        Ok(BASE + crate::pool::BLOCK_LEN)
     );
 }
 
