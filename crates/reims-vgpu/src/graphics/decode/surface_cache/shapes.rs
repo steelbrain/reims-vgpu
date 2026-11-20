@@ -96,6 +96,18 @@
 //! counted by cause ([`UNPLACED_BUSY`], [`UNPLACED_UNFILLED`]). Nothing reads a placed image's
 //! bytes before the fill wrote them: every use of the cache waits for its last fill.
 //!
+//! **Zeros.** A cache's buffer whose memory is not made yet (`super::SurfaceCaches`'s "Deferred
+//! memory") reads zero, as a new IOSurface's bytes do: every copy into it makes its memory first.
+//! While it holds none and no shape holds a write the buffer lacks, a fill from it would copy
+//! zeros, and a shape on the platform's own image, which the platform cleared at its make
+//! ([`Shape::cleared`]), holds them already: its fill is taken as made, with no copy, and the
+//! buffer's memory is left unmade (`SurfaceCaches::fill_shapes`), counted ([`ZERO_TAKEN`]). The
+//! guest reads the same zeros either way. A placed image holds its memory's bytes as they were,
+//! so it is never taken so: its fill makes the buffer's memory and copies its zeros, as before.
+//! Where the cache would hold zeros so, a new shape is not placed, but in a block taken ahead
+//! (below): the platform's own image takes its zeros from the platform's clear, with no block
+//! taken for the buffer nor a copy (`super::Caches::shape`), counted ([`UNPLACED_ZEROS`]).
+//!
 //! Placing trades the platform's clears for takes of blocks. Measured on rt on a Radeon 780M
 //! (RADV), a desktop and 3D-scene boot (11-19), against the same boot with the platform's own
 //! images: 397 new shapes were placed (1164 MiB), none fell back; rt cleared 1408 textures
@@ -118,12 +130,15 @@
 //! shared, of the length a `BGRA8Unorm` image of the plane's rows and texel bytes takes, plain or
 //! storage (`ApiPlatform::shape_block`). The block is kept in the cache, and the cache's first new
 //! shape takes it: where the shape is over the unit and placed now, its image is placed in the
-//! block (`ApiPlatform::placed_shape_image_in`) and filled as above; one that does not fit gives
-//! the block back to rt and is placed as before. A first new shape that finds the block asked and
-//! not yet taken makes its image as before, never waiting for the take, and the block goes as it
-//! comes. Every block that goes with no image in it goes back to rt. A cache asks once, and keeps
-//! no block past its first new shape, so a block is held only until the surface's first texture
-//! or its release. Counted: the takes, with their time and KiB (`rt-shape-blocks-ahead`), the
+//! block (`ApiPlatform::placed_shape_image_in`) and filled as above, though its fill would copy
+//! zeros: the fill then makes the buffer's memory, which the cache's first use would make, and
+//! copies its zeros, where the platform's own image would take a make on the ring. One that does
+//! not fit gives the block back to rt and is placed as before, or is the platform's own where
+//! its fill would copy zeros. A first new shape that finds the block asked and not yet taken
+//! makes its image as before, never waiting for the take, and the block goes as it comes. Every
+//! block that goes with no image in it goes back to rt. A cache asks once, and keeps no block
+//! past its first new shape, so a block is held only until the surface's first texture or its
+//! release. Counted: the takes, with their time and KiB (`rt-shape-blocks-ahead`), the
 //! shapes over the unit that came before the block (`-late`), the blocks the image did not fit
 //! (`-unfit`), the asks the platform gave none for (`-refused`), and the blocks that went unused
 //! (`-unused`), beside the decoding thread's makes of shapes' images, all, those over the unit,
@@ -189,6 +204,13 @@ pub(crate) const ORDER_COPY_BYTES: &str = "rt-shape-order-copy-bytes";
 /// owing it ([`ShapeCounts::unplaced_busy`], [`ShapeCounts::unplaced_unfilled`]).
 pub(crate) const UNPLACED_BUSY: &str = "rt-shape-unplaced-busy";
 pub(crate) const UNPLACED_UNFILLED: &str = "rt-shape-unplaced-unfilled";
+
+/// The counts' codes of the zeros (the module doc, "Zeros"): a shape whose fill was taken as made,
+/// its cache's buffer holding no memory yet and its image the platform's cleared one
+/// ([`ShapeCounts::zero_taken`]); and a shape made with the platform's own image where it places
+/// them, as its cache would hold zeros ([`ShapeCounts::unplaced_zeros`]).
+pub(crate) const ZERO_TAKEN: &str = "rt-shape-zero-taken";
+pub(crate) const UNPLACED_ZEROS: &str = "rt-shape-unplaced-zeros";
 
 /// The degradation code of an encoder that may have written two shapes of one plane: Metal
 /// would write the plane's one texture memory through both in the order the GPU ran them, which
@@ -437,6 +459,12 @@ pub(crate) struct ShapeCounts {
     /// ([`UNPLACED_BUSY`]), or the fill at their make left them owing it ([`UNPLACED_UNFILLED`]).
     pub(crate) unplaced_busy: u64,
     pub(crate) unplaced_unfilled: u64,
+    /// Shapes whose fill was taken as made, their cache's buffer holding no memory yet and their
+    /// image the platform's cleared one, and their bytes; and shapes made with the platform's own
+    /// image where it places them, as their cache would hold zeros (the module doc, "Zeros").
+    pub(crate) zero_taken: u64,
+    pub(crate) zero_taken_bytes: u64,
+    pub(crate) unplaced_zeros: u64,
 }
 
 /// One shape's image and its state.
@@ -457,6 +485,11 @@ pub(crate) struct Shape<T> {
     /// A plane shape: its image is a plane of the cache's surface, which the bound never drops
     /// (the module doc, "Plane shapes").
     pub(crate) plane: bool,
+    /// Its image is the platform's own, which the platform cleared at its make, not placed, and
+    /// no device recovery lost what it held since ([`ShapeTable::insert_cleared`]): with the
+    /// cache's buffer holding no memory, it holds the zeros a fill would copy (the module doc,
+    /// "Zeros").
+    pub(crate) cleared: bool,
     /// The caches' clock at its last use: its make, a texture made of it, or a use of its surface
     /// while a texture referenced it ([`ShapeTable::touch`]).
     used: u64,
@@ -547,9 +580,26 @@ impl<T> ShapeTable<T> {
             owed,
             video: false,
             plane: false,
+            cleared: false,
             used: now,
         });
         (reference, again)
+    }
+
+    /// Adds the shape of `key` as [`Self::insert`] does, its image `image` the platform's own,
+    /// which the platform cleared at its make ([`Shape::cleared`]).
+    pub(crate) fn insert_cleared(
+        &mut self,
+        key: ShapeKey,
+        image: T,
+        owed: bool,
+        now: u64,
+    ) -> (ShapeRef, bool) {
+        let made = self.insert(key, image, owed, now);
+        if let Some(shape) = self.shapes.last_mut() {
+            shape.cleared = true;
+        }
+        made
     }
 
     /// Adds the plane shape of `key`, its image `image` a plane of the cache's surface, owing a

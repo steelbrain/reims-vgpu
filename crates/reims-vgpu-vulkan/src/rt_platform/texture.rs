@@ -1574,4 +1574,153 @@ mod tests {
         let _of_plain = view(&plain, 71);
         assert_eq!(counted(plain_srgb), plain_before);
     }
+
+    /// On the GPU the test holds: an image for views (a shape's image of the platform's own,
+    /// `reims_vgpu`'s `ApiPlatform::shape_image`) reads zero before any write, through a blit and
+    /// through a view at a guest's index that a kernel samples, though an image of its descriptor
+    /// held other bytes just before it, read back so and let go of: the per-shape form takes such
+    /// an image's fill from a buffer with no memory as made (`shapes`, "Zeros"), which a runtime
+    /// that left a new image's bytes as its memory held them would break here, not in a guest
+    #[test]
+    fn a_texture_for_views_reads_zero_before_any_write_on_vulkan() {
+        use crate::core::num::ToUsize as _;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::resource::{Buffer as _, Library as _};
+        use crate::core::platform::types::{MtlOrigin, MtlSize};
+        use crate::core::platform::values::SamplerDesc;
+        use crate::core::raise::OnFault;
+        const SAMPLE: &[u8] = include_bytes!("../../../../tests/shaders/compute_sample.metallib");
+        const SIDE: u64 = 64;
+        const BYTES: u64 = SIDE * SIDE * 4;
+        const INDEX: u64 = 4000;
+        let on = OnFault::Return;
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let queue = device.new_command_queue().expect("a command queue");
+        let desc = TextureDesc {
+            pixel_format: 80, // BGRA8Unorm
+            width: SIDE,
+            height: SIDE,
+            usage: 0x5,                   // shader read, render target
+            resource_options: Some(0x20), // Private
+            ..TextureDesc::default()
+        };
+        let shared = |length: u64, byte: u8| {
+            let made = device.new_buffer_of_length(on, length, 0);
+            let made = made.expect("never a raise").expect("a buffer");
+            // SAFETY: a Shared buffer of `length` bytes, which no command uses yet.
+            unsafe {
+                std::ptr::write_bytes(made.contents().as_ptr::<u8>(), byte, length.to_usize())
+            };
+            made
+        };
+        let blit = |cmd: BlitCmd<'_, RtPlatform>| {
+            let cb = queue.command_buffer(on).expect("never a raise");
+            let cb = cb.expect("a command buffer");
+            let encoder = cb.blit_encoder(on).expect("never a raise");
+            let encoder = encoder.expect("a blit encoder");
+            assert_eq!(encoder.encode(on, cmd), Ok(()));
+            assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+            assert_eq!(cb.commit(on), Ok(()));
+            assert_eq!(cb.wait_until_completed(on), Ok(()));
+        };
+        let read = |texture: &RtObj<RtTexture>| -> Vec<u8> {
+            let out = shared(BYTES, 0x5a);
+            blit(BlitCmd::CopyTextureToBuffer {
+                source_texture: texture,
+                source_slice: 0,
+                source_level: 0,
+                source_origin: MtlOrigin::default(),
+                source_size: MtlSize::new(SIDE, SIDE, 1),
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: SIDE * 4,
+                destination_bytes_per_image: BYTES,
+            });
+            // SAFETY: the Shared buffer's bytes, which no command writes any more.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), BYTES.to_usize())
+            };
+            bytes.to_vec()
+        };
+
+        let dirty = device
+            .new_texture_for_views(&desc)
+            .expect("an image for views");
+        let bytes = shared(BYTES, 0xa5);
+        blit(BlitCmd::CopyBufferToTexture {
+            source_buffer: &bytes,
+            source_offset: 0,
+            source_bytes_per_row: SIDE * 4,
+            source_bytes_per_image: BYTES,
+            source_size: MtlSize::new(SIDE, SIDE, 1),
+            destination_texture: &dirty,
+            destination_slice: 0,
+            destination_level: 0,
+            destination_origin: MtlOrigin::default(),
+        });
+        assert!(
+            read(&dirty).iter().all(|&b| b == 0xa5),
+            "the write read back"
+        );
+        drop(dirty);
+
+        let fresh = device
+            .new_texture_for_views(&desc)
+            .expect("an image for views");
+        assert!(read(&fresh).iter().all(|&b| b == 0), "zero through a blit");
+
+        assert_eq!(device.reserve_resource_indices(0, &[INDEX]), Ok(()));
+        let view = fresh.new_texture_view_at_index(80, INDEX);
+        let view = view
+            .expect("never a raise")
+            .expect("a view at the guest's index");
+        let library = device.new_library(SAMPLE).expect("never a raise");
+        let library = library.expect("a metallib").expect("a library");
+        let function = library.new_function(on, "sample_k").expect("never a raise");
+        let function = function.expect("a function of the table");
+        let state = device.new_compute_pipeline_state_for_function(Some(&function));
+        let state = state.expect("a compute state").expect("a compute state");
+        let sampler = device.new_sampler_state(&SamplerDesc::default());
+        let sampler = sampler.expect("never a raise").expect("a sampler state");
+        let sampled = shared(16, 0xa5);
+        let cb = queue.command_buffer(on).expect("never a raise");
+        let cb = cb.expect("a command buffer");
+        let encoder = cb.compute_encoder(on).expect("never a raise");
+        let encoder = encoder.expect("a compute encoder");
+        let cmds = [
+            ComputeCmd::SetComputePipelineState {
+                state: Some(&state),
+            },
+            ComputeCmd::SetTextures {
+                textures: &[Some(&view)],
+                range: NsRange::new(0, 1),
+            },
+            ComputeCmd::SetSamplerStates {
+                samplers: &[Some(&sampler)],
+                range: NsRange::new(0, 1),
+            },
+            ComputeCmd::SetBuffers {
+                buffers: &[Some(&sampled)],
+                offsets: &[0],
+                range: NsRange::new(0, 1),
+            },
+            ComputeCmd::DispatchThreads {
+                threads_per_grid: MtlSize::new(4, 1, 1),
+                threads_per_threadgroup: MtlSize::new(4, 1, 1),
+            },
+            ComputeCmd::EndEncoding,
+        ];
+        for cmd in cmds {
+            assert_eq!(encoder.encode(on, cmd), Ok(()));
+        }
+        assert_eq!(cb.commit(on), Ok(()));
+        assert_eq!(cb.wait_until_completed(on), Ok(()));
+        // SAFETY: the Shared buffer's 4 words, which no command writes any more.
+        let words = unsafe { std::slice::from_raw_parts(sampled.contents().as_ptr::<u32>(), 4) };
+        assert_eq!(words.to_vec(), vec![0u32; 4], "zero through a sample");
+    }
 }

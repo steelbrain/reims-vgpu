@@ -447,6 +447,39 @@ mod tests {
     fn placing() -> (Rig, Placed) {
         let mut r = rig(8);
         let page = r.page;
+        let placed = places(&r);
+        r.dec.hold_resource_ids(0, 1);
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        queues(&mut r);
+        assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
+        (r, placed)
+    }
+
+    /// [`placing`]'s rig over a deferred block of two pages (`surface_cache`'s module doc,
+    /// "Deferred blocks"), as a surface the CPU has not locked for writing: no use fills its
+    /// cache from its pages, which are not named, so its buffer holds no memory until a copy
+    /// goes through it. Buffer 10 is the cache.
+    fn placing_deferred() -> (Rig, Placed) {
+        use reims_vgpu_graphics::wire::{RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED};
+        let mut r = rig(8);
+        let page = r.page;
+        r.dec.set_deferred_budget(8 * page);
+        let placed = places(&r);
+        r.dec.hold_resource_ids(0, 1);
+        let flags = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED;
+        let answer = r.pages_flagged(BLOCK, 0, &[], 2 * page, flags);
+        assert_eq!(answer, RGFX_STATUS_OK);
+        queues(&mut r);
+        assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
+        (r, placed)
+    }
+
+    /// The rig's decoder takes the per-shape form with a maker that places images, the fake's own
+    /// textures standing in for placed ones: whether each make asked one placed, in order.
+    fn places(r: &Rig) -> Placed {
         let p = Arc::clone(&r.p);
         let placed = Placed::default();
         let kept = Arc::clone(&placed);
@@ -461,14 +494,7 @@ mod tests {
             ),
             true,
         );
-        r.dec.hold_resource_ids(0, 1);
-        assert_eq!(
-            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
-            RGFX_STATUS_OK
-        );
-        queues(&mut r);
-        assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
-        (r, placed)
+        placed
     }
 
     /// [`cached`]'s rig in the per-shape form, its texture resource ids held, with buffer 10 over
@@ -684,15 +710,18 @@ mod tests {
         assert_eq!(r.dec.caches().counts().shapes, ShapeCounts::default());
     }
 
-    /// Where the platform places shapes' images, a new shape of a cache no command buffer uses
-    /// takes a placed image, filled from the buffer at its make before its view is answered, and
-    /// keeps it; one made while a command buffer begun and not finished uses the cache takes the
-    /// platform's own image, its fill asked of that buffer as before, counted
-    /// (`rt-shape-unplaced-busy`). A platform that places none is asked for none
+    /// Where the platform places shapes' images, a new shape of a cache no command buffer uses,
+    /// whose buffer holds the pages' bytes, takes a placed image, filled from the buffer at its
+    /// make before its view is answered, and keeps it; one made while a command buffer begun and
+    /// not finished uses the cache takes the platform's own image, its fill asked of that buffer
+    /// as before, counted (`rt-shape-unplaced-busy`). A platform that places none is asked for
+    /// none
     #[test]
     fn a_placed_shape_is_filled_at_its_make_and_one_of_a_busy_cache_is_the_platforms_own() {
         let (mut r, placed) = placing();
         let cache = cache_id(&r);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 2, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
         let mark = r.p.call_log().mark();
         let image = texture_image(&mut r, 21, 80, (32, 8));
         let calls = r.p.call_log().since(mark);
@@ -848,14 +877,24 @@ mod tests {
         Some(one_plane(page, page, 2))
     }
 
+    /// Makes the memory of the buffer of [`BLOCK`]'s cache, so that a new shape's fill copies
+    /// more than zeros (the module doc of `shapes`, "Zeros").
+    fn memory_made(r: &Rig) {
+        let caches = r.dec.caches();
+        let buffer = caches.buffer(BLOCK).unwrap();
+        assert!(r.dec.surface_caches.memory_of(buffer));
+    }
+
     /// A cache of one plane over rt's unit has the block of its whole-extent shape's image taken
     /// ahead after its `SURFACE_PAGES`, for the extent's plain and storage shapes in `BGRA8Unorm`,
     /// counted with its KiB. Its first new shape over the unit is placed in the block, filled at
-    /// its make, with no image made on the ring, counted apart; its next is made on the ring as
+    /// its make, with no image made on the ring, counted apart, though its cache's buffer held no
+    /// memory, so that the fill makes it and copies its zeros; its next is made on the ring as
     /// before, counted over the unit, as the cache keeps no block past its first new shape, and
     /// asks for none again
     #[test]
     fn a_block_taken_ahead_holds_the_caches_first_shape_over_rts_unit() {
+        use reims_vgpu_vulkan::core::testkit::impls::resource::MAKE_MEMORY;
         let (mut r, placed, log) = ahead(over_the_unit, true, false);
         let page = r.page;
         let extent = |usage| (80, page / 4, 2, usage);
@@ -876,8 +915,13 @@ mod tests {
         );
         assert!(placed.lock().is_empty(), "no image made on the ring");
         assert_eq!(fills(&calls), [(cache, 0, image)], "filled at its make");
+        assert!(
+            first(&calls, MAKE_MEMORY) < first(&calls, FILL),
+            "from zeros"
+        );
         let counts = r.dec.caches().counts().shapes;
         assert_eq!((counts.placed, counts.made), (1, 1));
+        assert_eq!(counts.unplaced_zeros, 0);
         assert_eq!(counted("rt-shape-image-makes-ahead"), 1);
         let ring = || {
             (
@@ -902,10 +946,12 @@ mod tests {
 
     /// The ring never waits for a block taken ahead: a first new shape over rt's unit made while
     /// the take has not run makes its image as before, counted late and over the unit, and the
-    /// block goes as it comes, unused, counted with its KiB
+    /// block goes as it comes, unused, counted with its KiB. Its cache's buffer holds its memory
+    /// ([`memory_made`]), so the image is placed
     #[test]
     fn a_shape_made_before_its_block_is_taken_waits_for_none() {
         let (mut r, placed, log) = ahead(over_the_unit, true, true);
+        memory_made(&r);
         texture_image(&mut r, 21, 80, (32, 8));
         assert_eq!(
             *placed.lock(),
@@ -933,10 +979,12 @@ mod tests {
 
     /// A block taken ahead that the shape's image does not fit goes back, counted, and the image
     /// is placed in a block taken at its make as before; a cache's first new shape at or under
-    /// rt's unit leaves its block unused, counted, its image made as before
+    /// rt's unit leaves its block unused, counted, its image made as before. Its cache's buffer
+    /// holds its memory ([`memory_made`]), so the image is placed
     #[test]
     fn a_block_taken_ahead_that_no_image_takes_goes() {
         let (mut r, placed, log) = ahead(over_the_unit, false, false);
+        memory_made(&r);
         texture_image(&mut r, 21, 80, (32, 8));
         assert_eq!(*log.places.lock(), [AHEAD_LEN]);
         assert_eq!(*placed.lock(), [true]);
@@ -945,6 +993,7 @@ mod tests {
         assert_eq!(counted("rt-shape-image-makes-over-unit"), 1);
 
         let (mut r, placed, log) = ahead(over_the_unit, true, false);
+        memory_made(&r);
         texture_image(&mut r, 21, 80, (8, 8));
         assert!(log.places.lock().is_empty());
         assert_eq!(*placed.lock(), [true]);
@@ -980,6 +1029,138 @@ mod tests {
             assert!(log.takes.lock().is_empty());
         }
         assert_eq!(counted("rt-shape-blocks-ahead"), 0);
+    }
+
+    /// A cache's first new shape over rt's unit whose fill would copy zeros, its buffer holding
+    /// no memory, takes the block taken ahead only where the block is taken and fits it
+    /// ([`a_block_taken_ahead_holds_the_caches_first_shape_over_rts_unit`]): where the block came
+    /// late, or did not fit, the shape is the platform's own image, as any whose fill would copy
+    /// zeros, counted (`rt-shape-unplaced-zeros`), and the buffer's memory is left unmade
+    #[test]
+    fn a_first_shape_over_rts_unit_on_zeros_is_the_platforms_own_where_its_block_is_not() {
+        use reims_vgpu_vulkan::core::testkit::impls::resource::MAKE_MEMORY;
+        for (fits, hold) in [(true, true), (false, false)] {
+            let (mut r, placed, log) = ahead(over_the_unit, fits, hold);
+            texture_image(&mut r, 21, 80, (32, 8));
+            assert_eq!(*placed.lock(), [false], "the platform's own");
+            assert_eq!(log.places.lock().len(), usize::from(!fits), "asked to fit");
+            let counts = r.dec.caches().counts().shapes;
+            assert_eq!((counts.placed, counts.unplaced_zeros), (0, 1));
+            assert_eq!(r.p.call_log().count(MAKE_MEMORY), 0, "left unmade");
+            if hold {
+                r.dec.surface_caches.release_shape_blocks();
+                r.dec.surface_caches.settle_shape_blocks();
+            }
+        }
+    }
+
+    /// Zeros: a new shape of a cache whose buffer holds no memory yet, and no shape a write the
+    /// buffer lacks, takes the platform's own image though the platform places images, counted
+    /// (`rt-shape-unplaced-zeros`); the first use of the surface takes its fill as made, with no
+    /// copy and the buffer's memory left unmade, counted (`rt-shape-zero-taken`), as the platform
+    /// cleared its image and the buffer reads zero. A CPU lock, its pages named then, moves none
+    /// of the shape's bytes: it holds the buffer's zeros. Once a copy through the buffer made its
+    /// memory, a new shape takes the buffer's bytes: placed and filled at its make
+    #[test]
+    fn a_shape_over_a_buffer_with_no_memory_takes_its_zeros_with_no_copy() {
+        use reims_vgpu_graphics::wire::{RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED};
+        use reims_vgpu_vulkan::core::testkit::impls::resource::MAKE_MEMORY;
+        let (mut r, placed) = placing_deferred();
+        let page = r.page;
+        let cache = cache_id(&r);
+        let image = texture_image(&mut r, 21, 80, (32, 8));
+        assert_eq!(*placed.lock(), [false], "the platform's own");
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.placed, counts.unplaced_zeros), (0, 1));
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(fills(&r.p.call_log().since(mark)).is_empty(), "taken");
+        assert_eq!(r.p.call_log().count(MAKE_MEMORY), 0, "left unmade");
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!(
+            (counts.zero_taken, counts.zero_taken_bytes, counts.fills),
+            (1, 32 * 8 * 4, 0)
+        );
+
+        let flags = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_ATTACH;
+        let attached = r.pages_flagged(BLOCK, 7, &[(1, 2)], 2 * page, flags);
+        assert_eq!(attached, RGFX_STATUS_OK);
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let calls = r.p.call_log().since(mark);
+        assert!(downloaded.load(Ordering::SeqCst));
+        assert!(written_back(&calls).is_empty(), "nothing written");
+        assert!(fills(&calls).is_empty());
+
+        write(&mut r, 0x101, 21, (32, 8));
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(r.p.call_log().count(MAKE_MEMORY), 1, "the copy's");
+        let mark = r.p.call_log().mark();
+        let new = texture_image(&mut r, 22, 80, (16, 4));
+        assert_eq!(*placed.lock(), [false, true]);
+        assert_eq!(fills(&r.p.call_log().since(mark)), [(cache, 0, new)]);
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!(
+            (counts.zero_taken, counts.unplaced_zeros, counts.placed),
+            (1, 1, 1)
+        );
+        assert_ne!(new, image);
+    }
+
+    /// Zeros are looked at as a shape's fill is made, not at its make: where the cache's buffer
+    /// takes its memory between the two (a copy through it made with the caches' lock let go of),
+    /// the shape is filled from the buffer, with what that copy wrote, and nothing is taken
+    #[test]
+    fn a_shapes_zeros_are_looked_at_as_its_fill_is_made() {
+        let (mut r, placed) = placing_deferred();
+        let cache = cache_id(&r);
+        let image = texture_image(&mut r, 21, 80, (32, 8));
+        assert_eq!(*placed.lock(), [false], "zeros at its make");
+        {
+            let caches = r.dec.caches();
+            let buffer = caches.buffer(BLOCK).unwrap();
+            assert!(r.dec.surface_caches.memory_of(buffer));
+        }
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(fills(&r.p.call_log().since(mark)), [(cache, 0, image)]);
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.zero_taken, counts.fills), (0, 1));
+    }
+
+    /// A shape holding a write the buffer lacks keeps a new shape from zeros: a shape whose
+    /// zeros were taken and that a shader then wrote is dirty, so a new shape of the cache, whose
+    /// buffer holds no memory still, is placed and filled at its make, the dirty shape written
+    /// back into the buffer first, the buffer's memory made before that copy
+    #[test]
+    fn a_new_shape_over_a_dirty_one_is_filled_though_the_buffer_held_no_memory() {
+        use reims_vgpu_vulkan::core::testkit::impls::resource::MAKE_MEMORY;
+        let (mut r, placed) = placing_deferred();
+        let cache = cache_id(&r);
+        compute_pipeline(&mut r, 31);
+        let written = writable_image(&mut r, 25);
+        computes(&mut r, 0x100, &[bind_pipeline(31), bind_texture(25, 0)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(r.p.call_log().count(MAKE_MEMORY), 0, "zeros taken");
+        assert_eq!(r.dec.caches().counts().shapes.zero_taken, 1);
+
+        let mark = r.p.call_log().mark();
+        let new = texture_image(&mut r, 22, 80, (16, 4));
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(*placed.lock(), [false, true]);
+        assert_eq!(written_back(&calls), [(written, cache, 0)]);
+        assert_eq!(fills(&calls), [(cache, 0, new)]);
+        let back = first(&calls, TO_BUFFER);
+        assert!(first(&calls, MAKE_MEMORY) < back, "made before");
+        assert!(back < first(&calls, FILL), "written back first");
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!(
+            (counts.zero_taken, counts.unplaced_zeros, counts.placed),
+            (1, 1, 1)
+        );
     }
 
     /// The usage a texture declares picks its shape's kind: one that declares Metal's Unknown
@@ -1337,6 +1518,32 @@ mod tests {
             "nothing through the buffer"
         );
         assert!(!calls.iter().any(|c| c.sel == FAIL_OUT_OF_MEMORY));
+    }
+
+    /// Where the platform refuses a shaped cache's buffer its memory, a write through one shape
+    /// whose copy into the other shapes of its plane goes through the buffer (rule 1) fails its
+    /// command buffer with `MTLCommandBufferErrorOutOfMemory`, once, and the other shape takes
+    /// nothing: the cache's first use took its shapes' zeros, its buffer's memory left unmade
+    /// ([`placing_deferred`]), so the write's copy is its first use
+    #[test]
+    fn a_refused_cache_buffer_fails_a_writes_copy_into_its_planes_other_shapes() {
+        use reims_vgpu_vulkan::core::testkit::impls::command::FAIL_OUT_OF_MEMORY;
+        use reims_vgpu_vulkan::core::testkit::impls::resource::MAKE_MEMORY;
+        let (mut r, _) = placing_deferred();
+        let a = texture_image(&mut r, 21, 80, (32, 8));
+        let b = texture_image(&mut r, 22, 80, (16, 4));
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        r.p.script().always(MAKE_MEMORY, Step::value(false));
+        let mark = r.p.call_log().mark();
+        write(&mut r, 0x101, 21, (32, 8));
+        r.p.world().complete_all(CompleteOn::Caller);
+        let calls = r.p.call_log().since(mark);
+        assert!(calls.iter().any(|c| c.sel == MAKE_MEMORY), "asked");
+        let (_, into) = overlaps(&calls, &[a, b]);
+        assert!(into.is_empty(), "B takes nothing");
+        let failed = calls.iter().filter(|c| c.sel == FAIL_OUT_OF_MEMORY).count();
+        assert_eq!(failed, 1);
     }
 
     /// A new shape is filled from the buffer after the dirty shapes are written back into it, in

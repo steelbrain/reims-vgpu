@@ -829,6 +829,14 @@ impl<P: Platform> SurfaceCache<P> {
             self.changed.add(shape.key.span());
         }
     }
+
+    /// Whether a fill of its shapes from its buffer would copy zeros (the module doc of `shapes`,
+    /// "Zeros"): its buffer holds no memory yet, so it reads zero, as every copy into it makes its
+    /// memory first; and no shape holds a write the buffer lacks, none that
+    /// [`shapes::write_back`] would copy into it first.
+    fn fills_zeros(&self) -> bool {
+        !self.device.memory_made() && !self.shapes.iter().any(|s| s.dirty && !s.owed)
+    }
 }
 
 /// A copy of a cache into its pages on the transfer queue ([`SurfaceCaches::write_back`]): the
@@ -2332,10 +2340,12 @@ impl<P: Platform> SurfaceCaches<P> {
         self.recoveries = now;
         self.unlocked.recoveries.store(now, Ordering::Release);
         // Each shape's image lost what it held: it is filled from its buffer again, by the fill
-        // below where the buffer is, else before what uses it next ([`Self::fill_shapes`]).
+        // below where the buffer is, else before what uses it next ([`Self::fill_shapes`]), its
+        // platform's clear lost with it.
         for shape in self.by_block.values_mut().flat_map(|c| c.shapes.iter_mut()) {
             shape.owed = true;
             shape.dirty = false;
+            shape.cleared = false;
         }
         // The lost device's buffers hold nothing known; a fill made again empties a record.
         for cache in self.by_block.values_mut() {
@@ -3663,8 +3673,10 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// Adds the shape `key` of the block at `block`'s cache, its image `image` made with the lock
-    /// let go of, where the cache holds no such shape yet: it owes its fill from the buffer, made
-    /// before the next command buffer that uses the block runs ([`Self::fill_shapes`]). Then the
+    /// let go of, the platform's own image which it cleared at its make where `cleared`
+    /// ([`shapes::Shape::cleared`]), where the cache holds no such shape yet: it owes its fill
+    /// from the buffer, made before the next command buffer that uses the block runs
+    /// ([`Self::fill_shapes`]). Then the
     /// shapes past the bound and the caches' budget go ([`Self::sweep_shapes`]). A shape made
     /// over a plane holding one of the other kind, plain or storage, is counted
     /// ([`ShapeCounts::order_case`]). A reference to the shape and its image, `None` where the
@@ -3675,6 +3687,7 @@ impl<P: Platform> SurfaceCaches<P> {
         block: u64,
         key: ShapeKey,
         image: P::Texture,
+        cleared: bool,
     ) -> (Option<Held<P::Texture>>, Vec<P::Texture>) {
         match self.find_shape(block, &key) {
             None => return (None, vec![image]),
@@ -3686,7 +3699,10 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         let made = image.clone_ref();
         let order_case = cache.shapes.holds_other_kind(&key);
-        let (reference, again) = cache.shapes.insert(key, image, true, self.shape_clock);
+        let (reference, again) = match cleared {
+            true => (cache.shapes).insert_cleared(key, image, true, self.shape_clock),
+            false => cache.shapes.insert(key, image, true, self.shape_clock),
+        };
         let bytes = key.bytes();
         self.counts.shapes.made += 1;
         self.counts.shapes.made_bytes += bytes;
@@ -4663,10 +4679,14 @@ impl<P: Platform> SurfaceCaches<P> {
     /// queue, after every command buffer that used the cache before, each dirty shape copied into
     /// the buffer first, so the new ones take its writes (rule 2; the module doc of `shapes`);
     /// signalled as [`Self::fill`] signals, so the uses counted after it wait for it on the GPU
-    /// ([`Self::wait_last_fill`]). The transfer event's value at which it is done; `None` where it
-    /// made none.
+    /// ([`Self::wait_last_fill`]). The shapes the cache's zeros fill take none first
+    /// ([`Self::take_zeros`]). The transfer event's value at which it is done; `None` where it
+    /// made none, as where nothing was left to fill.
     fn fill_shapes(&mut self, device: &P::Device, block: u64) -> RaiseResult<Option<u64>> {
         self.touch_shapes(block);
+        if self.take_zeros(block) {
+            return Ok(None);
+        }
         if !self.make_transfer(device)? {
             return Ok(None);
         }
@@ -4715,6 +4735,29 @@ impl<P: Platform> SurfaceCaches<P> {
         }
         self.counts.shapes.fills_made += 1;
         Ok(Some(value))
+    }
+
+    /// The zeros of the block at `block`'s cache (the module doc of `shapes`, "Zeros"), looked at
+    /// as its shapes' fill is made, under the caches' lock, never from an earlier look: where a
+    /// fill would copy zeros ([`SurfaceCache::fills_zeros`]), each shape that owes its fill and
+    /// whose image the platform cleared ([`shapes::Shape::cleared`]) holds them already: it owes
+    /// none, with no copy, counted. A placed image owes its fill still. Whether nothing is left
+    /// to fill: no shape owes one, and none is to be written back.
+    fn take_zeros(&mut self, block: u64) -> bool {
+        let Some(cache) = self.by_block.get_mut(&block) else {
+            return false;
+        };
+        if !cache.fills_zeros() {
+            return false;
+        }
+        let counts = &mut self.counts.shapes;
+        for shape in (cache.shapes.iter_mut()).filter(|s| s.owed && s.cleared) {
+            shape.owed = false;
+            counts.zero_taken += 1;
+            counts.zero_taken_bytes += shape.bytes;
+            reims_vgpu_vulkan::answer::count_kind(shapes::ZERO_TAKEN);
+        }
+        !cache.shapes.owes()
     }
 
     /// Fills the cache of the block at `block` where it holds, or will hold once the fills asked
@@ -6322,7 +6365,9 @@ impl<P: Platform> Caches<P> {
     /// reference to it and its image. Its image is placed where its first fill is made with its
     /// make ([`Self::placed_shape`]): in the block taken ahead for the cache, where the shape is
     /// the cache's first new one, over rt's unit, and the block is taken and fits it ([`shapes`]'s
-    /// "Blocks taken ahead"), else in one taken now; else it is the platform's own as before.
+    /// "Blocks taken ahead"), though its fill would copy zeros, as the image then takes no make on
+    /// the ring; else in one taken now, where its fill would copy more than zeros
+    /// ([`Self::fills_zeros`]); else it is the platform's own as before.
     /// `None` where the caches take the default form, the block has no cache, or the platform
     /// made no image (counted). Where the caches' copies are staged, the images' makes here are
     /// counted ([`shape_image_made`]). What goes is let go of with no lock held, a refusal
@@ -6359,8 +6404,8 @@ impl<P: Platform> Caches<P> {
             image
         };
         let placing = self.shapes_placed.load(Ordering::Acquire) && self.fills_at_once(block);
-        // A block taken ahead serves only an image over rt's unit placed now: where none is, it
-        // goes now, counted.
+        // A block taken ahead serves only an image over rt's unit placed now, whether its fill
+        // copies zeros or not: where none is, it goes now, counted.
         let ahead = ahead.filter(|_| placing && over).and_then(TakenAhead::take);
         let mut placed_ahead = false;
         if let Some(taken) = ahead
@@ -6388,6 +6433,7 @@ impl<P: Platform> Caches<P> {
         }
         if placing
             && !placed_ahead
+            && !self.fills_zeros(block)
             && let Some(image) = make(true)
             && let Some(placed) = self.placed_shape(device, block, key, image)
         {
@@ -6397,9 +6443,25 @@ impl<P: Platform> Caches<P> {
             self.lock().counts.shapes.images_refused += 1;
             return None;
         };
-        let (shape, gone) = self.lock().add_shape(block, key, image);
+        let (shape, gone) = self.lock().add_shape(block, key, image, true);
         let_go_of_shapes(block, gone);
         shape
+    }
+
+    /// Whether a new shape of the block at `block`'s cache would fill from zeros now
+    /// ([`shapes`]'s "Zeros"): its buffer holds no memory yet and no shape holds a write the
+    /// buffer lacks. Its image is then not placed: the platform's own takes its zeros from the
+    /// platform's clear, its fill taken as made ([`SurfaceCaches::take_zeros`]). Counted where so
+    /// ([`ShapeCounts::unplaced_zeros`]). Looked at again as its fill is made, which a use may
+    /// make otherwise meanwhile: the shape is then filled from the buffer as any.
+    fn fills_zeros(&self, block: u64) -> bool {
+        let mut st = self.lock();
+        let zeros = (st.by_block.get(&block)).is_some_and(SurfaceCache::fills_zeros);
+        if zeros {
+            st.counts.shapes.unplaced_zeros += 1;
+            reims_vgpu_vulkan::answer::count_kind(shapes::UNPLACED_ZEROS);
+        }
+        zeros
     }
 
     /// Whether a new shape of the block at `block`'s cache would take its first fill with its
@@ -6458,7 +6520,7 @@ impl<P: Platform> Caches<P> {
             let_go_of_shapes(block, vec![image]);
             return None;
         }
-        let (shape, mut gone) = st.add_shape(block, key, image);
+        let (shape, mut gone) = st.add_shape(block, key, image, false);
         let Some((reference, made)) = shape else {
             drop(st);
             let_go_of_shapes(block, gone);
