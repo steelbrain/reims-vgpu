@@ -11,6 +11,8 @@
 //! - its `vkQueueSubmit2` calls, their count and time inside the driver in all, those longer than
 //!   100 ms, and the longest since the device was made; then the submit thread's waits for rt's
 //!   queue lock before them, their time in all and the longest since the device was made;
+//! - rt's own command buffers (its uploads and Managed buffers' copy-ins) it submitted, and their
+//!   GPU time in all, from their own timestamp pairs;
 //! - the bytes rt copied for calls: in all, then by cause: staging (`replace_region` and
 //!   `get_bytes`), attachments' images into their shadows, and the over-copies between a texture
 //!   over a buffer and its image of its own, by the cause rt gives each, those of none left out;
@@ -130,9 +132,9 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges)
         "rt: pipelines made {}; first-use waits {} in {:.1} ms (variants {} in {:.1} ms, lines {} \
          in {:.1} ms, points {} in {:.1} ms), the longest since the device was made {:.1} ms; \
          submits {} in {:.1} ms ({} over 100 ms), the longest since the device was made {:.1} \
-         ms; queue-lock waits {:.1} ms, the longest since the device was made {:.1} ms; bytes \
-         copied {copied}: staging {staging}, attachment reads {attachments}, over-copies \
-         {over}{}; counted {}; gauges {}",
+         ms; queue-lock waits {:.1} ms, the longest since the device was made {:.1} ms; own \
+         command buffers {} in {:.1} ms on the GPU; bytes copied {copied}: staging {staging}, \
+         attachment reads {attachments}, over-copies {over}{}; counted {}; gauges {}",
         rose!(pipelines_created),
         rose!(first_use_waits),
         ms(rose!(first_use_wait_nanos)),
@@ -149,6 +151,8 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges)
         ms(now.submit_call_max_nanos),
         ms(rose!(queue_lock_wait_nanos)),
         ms(now.queue_lock_wait_max_nanos),
+        rose!(runtime_command_buffers),
+        ms(rose!(runtime_command_buffer_gpu_nanos)),
         if by_cause.is_empty() {
             String::new()
         } else {
@@ -205,6 +209,10 @@ mod tests {
         now.submit_call_max_nanos = 140_000_000;
         now.queue_lock_wait_nanos = 1_000_000 + 2_300_000;
         now.queue_lock_wait_max_nanos = 900_000;
+        before.runtime_command_buffers = 30;
+        before.runtime_command_buffer_gpu_nanos = 4_000_000;
+        now.runtime_command_buffers = 30 + 12;
+        now.runtime_command_buffer_gpu_nanos = 4_000_000 + 1_700_000;
         now.bytes_copied = 1_000 + 4_096 + 512 + 64;
         now.attachment_read_copy_bytes = 512;
         now.over_copy_bytes = 4_096;
@@ -247,17 +255,17 @@ mod tests {
             "rt: pipelines made 3; first-use waits 3 in 7.5 ms (variants 2 in 6.0 ms, lines 1 in \
              1.5 ms, points 1 in 0.5 ms), the longest since the device was made 4.2 ms; submits 60 \
              in 312.5 ms (2 over 100 ms), the longest since the device was made 140.0 ms; \
-             queue-lock waits 2.3 ms, the longest since the device was made 0.9 ms; bytes copied \
-             4672: staging 64, attachment reads 512, over-copies 4096 (dma-buf 4000, pitch 96); \
-             counted texture_clears 2, texture_clear_bytes 524288, texture_clear_barriers 1, \
-             external_acquires 2, barriers 9, held_releases 3, held_release_bytes 16842752, \
-             held_release_starts 1, held_starts 6, held_start_gap_nanos 250000, \
-             pipeline_creation_nanos 7250000, translation_nanos 3125000; gauges textures 12, \
-             textures_copied_over 2, texture_block_bytes 20971520, texture_own_bytes 33554432, \
-             spilled_bytes 0, texture_block_held_bytes 50331648, texture_block_sparse_bytes \
-             16777216, texture_block_sparse_blocks 1, private_take_held_bytes 33554432, \
-             private_take_bytes 18874368, private_take_sparse_bytes 16777216, \
-             private_take_sparse_allocations 1"
+             queue-lock waits 2.3 ms, the longest since the device was made 0.9 ms; own command \
+             buffers 12 in 1.7 ms on the GPU; bytes copied 4672: staging 64, attachment reads 512, \
+             over-copies 4096 (dma-buf 4000, pitch 96); counted texture_clears 2, \
+             texture_clear_bytes 524288, texture_clear_barriers 1, external_acquires 2, barriers \
+             9, held_releases 3, held_release_bytes 16842752, held_release_starts 1, held_starts \
+             6, held_start_gap_nanos 250000, pipeline_creation_nanos 7250000, translation_nanos \
+             3125000; gauges textures 12, textures_copied_over 2, texture_block_bytes 20971520, \
+             texture_own_bytes 33554432, spilled_bytes 0, texture_block_held_bytes 50331648, \
+             texture_block_sparse_bytes 16777216, texture_block_sparse_blocks 1, \
+             private_take_held_bytes 33554432, private_take_bytes 18874368, \
+             private_take_sparse_bytes 16777216, private_take_sparse_allocations 1"
         );
         let mut fresh = rt::Metrics::default();
         fresh.pipelines_created = 2;
