@@ -1300,4 +1300,63 @@ mod tests {
         assert_eq!(answered(&fences), Some(1), "{text}");
         assert_eq!(answered(&presents), Some(1), "{text}");
     }
+
+    /// A frame of a window's swapchain over a headless surface, on the GPU the test holds, with
+    /// the window's times counted (`super::window_times`): its takes' `vkAcquireNextImageKHR`
+    /// calls, one at least, its one `vkQueuePresentKHR` call and its wait for the presenting
+    /// queue's lock, and, through a completed handler as the window's draw adds one, its command
+    /// buffer's GPU time; each call took some time, and none longer than the period's in all.
+    #[test]
+    fn a_counted_window_frame_times_its_calls_and_gpu_time_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let Some(surface) = headless_surface(&device) else {
+            return;
+        };
+        // SAFETY: the surface is live, of the device's instance, and the swapchain's alone.
+        let made = unsafe { RtSwapchain::new(&device, surface) };
+        let mut swapchain = made.expect("a swapchain over the headless surface");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        window_times::count();
+        let _ = window_times::take();
+        let frame = take(&mut swapchain, (64, 48));
+        let texture = swapchain.texture(frame).expect("the frame's drawable");
+        let made = queue.command_buffer(on).expect("never a raise");
+        let made = made.expect("a command buffer");
+        let mut pass = rt::RenderPassDescriptor::default();
+        let attachment = &mut pass.color_attachments[0];
+        attachment.texture = Some(texture.rt().clone());
+        attachment.load_action = rt::LoadAction::Clear;
+        let clear = made.rt().render_command_encoder(&pass);
+        clear.expect("a clear of the drawable").end_encoding();
+        assert!(swapchain.encode_ready(frame, &made));
+        let (ran, done) = std::sync::mpsc::channel();
+        let handler = Box::new(move |info: crate::core::platform::command::CompletedInfo| {
+            window_times::frame_ran(info.gpu_times_ns);
+            let _ = ran.send(());
+        });
+        assert_eq!(made.add_completed_handler(on, handler), Ok(()));
+        assert_eq!(made.commit(on), Ok(()));
+        assert!(swapchain.present(frame, &made));
+        assert_eq!(made.wait_until_completed(on), Ok(()));
+        let waited = done.recv_timeout(std::time::Duration::from_secs(10));
+        waited.expect("the frame's completed handler ran");
+        drop(swapchain);
+        let counted = window_times::take();
+        let (acquires, presents) = (counted.acquires, counted.presents);
+        let (waits, frames) = (counted.present_lock_waits, counted.frames_on_gpu);
+        assert!(acquires.count >= 1, "{counted:?}");
+        assert_eq!(
+            (presents.count, waits.count, frames.count),
+            (1, 1, 1),
+            "{counted:?}"
+        );
+        for spans in [acquires, presents, frames] {
+            assert!(spans.total > std::time::Duration::ZERO, "{counted:?}");
+        }
+        for spans in [acquires, presents, waits, frames] {
+            assert!(spans.longest <= spans.total, "{counted:?}");
+        }
+    }
 }
