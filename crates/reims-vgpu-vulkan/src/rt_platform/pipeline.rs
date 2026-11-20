@@ -344,7 +344,7 @@ fn make(
     let made =
         (device.rt()).new_compute_pipeline_state(descriptor, |samplers| taking.ids(samplers));
     if let Err(error) = &made {
-        super::diag::keep_refused_air(sel, error, &[Some(&descriptor.kernel)]);
+        super::diag::keep_refused_compute(sel, error, descriptor);
     }
     let (rt, lease) = taking.made(sel, made)?;
     let written = written_slots(rt.texture_accesses());

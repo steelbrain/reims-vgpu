@@ -340,8 +340,7 @@ fn make(
     let mut taking = Taking::new(device);
     let made = (device.rt()).new_render_pipeline_state(descriptor, |samplers| taking.ids(samplers));
     if let Err(error) = &made {
-        let stages = [Some(&descriptor.vertex), descriptor.fragment.as_ref()];
-        super::diag::keep_refused_air(WITH_DESCRIPTOR, error, &stages);
+        super::diag::keep_refused_render(WITH_DESCRIPTOR, error, descriptor);
     }
     let (rt, lease) = taking.made(WITH_DESCRIPTOR, made)?;
     let vertex_written = written_slots(rt.texture_accesses(rt::Stage::Vertex));

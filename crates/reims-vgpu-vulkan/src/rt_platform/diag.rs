@@ -88,8 +88,14 @@
 //! written into `air-<pid>` there, once per library, as `<its SHA-256's first 16 hex
 //! digits>.metallib`, and a line in `refused.txt` there naming the creator, each function (its
 //! library's file, its index and name) and the refusal, once per creator and functions
-//! ([`keep_refused_air`]). The lines give how many it kept. The AIR is the guest's: it stays on
-//! the host that made it, and nothing commits it or copies it off.
+//! ([`keep_refused_compute`], [`keep_refused_render`]). Each refused state also has a record in
+//! `records.txt` there, once per record: its creator and refusal, then for each stage its
+//! function, whether it was made specialized, each function-constant value it was made with (its
+//! index, the name its function declares at that index, its type and its bytes in hex) and each
+//! constant it declares with no value, the same of each function it links, and each field of
+//! the descriptor rt was given, as rt's descriptor holds it. The lines give how many it kept.
+//! The AIR and the records are the guest's: they stay on the host that made them, are never
+//! written to stderr or the log, and nothing commits them or copies them off.
 //!
 //! One count is not a diagnostic but a degradation code on the counts line: each use, by a
 //! committed command buffer, of a guest surface texture over a buffer in an imported block,
@@ -1129,10 +1135,22 @@ pub fn sampler(d: &rt::SamplerDescriptor) {
 /// docs).
 pub const REFUSED_AIR_VAR: &str = "REIMS_VGPU_REFUSED_AIR_DIR";
 
-/// What the process kept of refused pipelines' AIR: the libraries written, by their files' names,
-/// and the refusals written, by their creator and functions.
-static KEPT_AIR: Mutex<(BTreeSet<String>, BTreeSet<String>)> =
-    Mutex::new((BTreeSet::new(), BTreeSet::new()));
+/// What the process kept of refused pipelines' AIR.
+struct KeptAir {
+    /// The libraries written, by their files' names.
+    libraries: BTreeSet<String>,
+    /// The refusals' lines written, by their creator and functions.
+    refusals: BTreeSet<String>,
+    /// The records written, by their text.
+    records: BTreeSet<String>,
+}
+
+/// What the process kept of refused pipelines' AIR.
+static KEPT_AIR: Mutex<KeptAir> = Mutex::new(KeptAir {
+    libraries: BTreeSet::new(),
+    refusals: BTreeSet::new(),
+    records: BTreeSet::new(),
+});
 
 /// [`REFUSED_AIR_VAR`]'s directory, read once: `None` where it is unset or empty.
 fn refused_air_dir() -> Option<&'static Path> {
@@ -1144,60 +1162,239 @@ fn refused_air_dir() -> Option<&'static Path> {
     dir.as_deref()
 }
 
-/// The translator refused a pipeline state of `stages` (those it has) by the creator `sel` with
-/// `error`: where [`REFUSED_AIR_VAR`] names a directory, keeps its functions' AIR there (the
-/// module's docs). A write that fails keeps nothing more of the refusal, and the next refusal
-/// tries again.
-pub fn keep_refused_air(sel: &str, error: &rt::Error, stages: &[Option<&rt::StageSource>]) {
+/// The translator refused the compute state of `d` by the creator `sel` with `error`: where
+/// [`REFUSED_AIR_VAR`] names a directory, keeps its kernel's AIR and the state's record there
+/// (the module's docs).
+pub fn keep_refused_compute(sel: &str, error: &rt::Error, d: &rt::ComputePipelineDescriptor) {
+    keep_refused_air(sel, error, &[("kernel", Some(&d.kernel))], || {
+        compute_fields(d)
+    });
+}
+
+/// The translator refused the render state of `d` by the creator `sel` with `error`: where
+/// [`REFUSED_AIR_VAR`] names a directory, keeps its functions' AIR and the state's record there
+/// (the module's docs).
+pub fn keep_refused_render(sel: &str, error: &rt::Error, d: &rt::RenderPipelineDescriptor) {
+    let stages = [("vertex", Some(&d.vertex)), ("fragment", d.fragment.as_ref())];
+    keep_refused_air(sel, error, &stages, || render_fields(d));
+}
+
+/// [`keep_refused_compute`] and [`keep_refused_render`]: the state's stages by their role, and
+/// its descriptor's fields' lines. A write that fails keeps nothing more of the refusal, and the
+/// next refusal tries again.
+fn keep_refused_air(
+    sel: &str,
+    error: &rt::Error,
+    stages: &[(&str, Option<&rt::StageSource>)],
+    fields: impl FnOnce() -> Vec<String>,
+) {
     let rt::Error::Translation(_) = error else {
         return;
     };
     let Some(dir) = refused_air_dir() else {
         return;
     };
-    let functions: Vec<&metal2vulkan::library::Function> = (stages.iter().flatten())
-        .filter_map(|s| match s {
-            rt::StageSource::Function(f) => Some(&f.function),
-            _ => None,
-        })
-        .collect();
-    let _ = keep_air_in(dir, sel, error, &functions);
+    let (functions, record) = refused_record(stages, fields);
+    let _ = keep_air_in(dir, sel, error, &functions, &record);
 }
 
-/// [`keep_refused_air`] into `dir`, of the refusal `why` of the functions `functions` by `sel`.
+/// The functions of `stages`, by their role, whose AIR is kept, and the state's record's lines:
+/// each stage's, then `fields`'.
+fn refused_record<'a>(
+    stages: &[(&str, Option<&'a rt::StageSource>)],
+    fields: impl FnOnce() -> Vec<String>,
+) -> (Vec<&'a metal2vulkan::library::Function>, Vec<String>) {
+    let mut functions = Vec::new();
+    let mut record = Vec::new();
+    for &(role, stage) in stages {
+        match stage {
+            Some(rt::StageSource::Function(f)) => {
+                functions.push(&f.function);
+                stage_lines(&mut record, role, f);
+            }
+            Some(_) => record.push(format!("{role}: a compiled function")),
+            None => record.push(format!("{role}: none")),
+        }
+    }
+    record.extend(fields());
+    (functions, record)
+}
+
+/// [`keep_refused_air`] into `dir`, of the refusal `why` of the functions `functions` by `sel`,
+/// with the state's record `record`, its lines.
 fn keep_air_in(
     dir: &Path,
     sel: &str,
     why: &dyn std::fmt::Display,
     functions: &[&metal2vulkan::library::Function],
+    record: &[String],
 ) -> std::io::Result<()> {
     let mut kept = KEPT_AIR.lock();
     let mut named = Vec::new();
     for f in functions {
-        let library = f.library();
-        let hash: String = (library.content_hash().iter().take(8))
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        let file = format!("{hash}.metallib");
-        if !kept.0.contains(&file) {
+        let file = air_file(f.library());
+        if !kept.libraries.contains(&file) {
             std::fs::create_dir_all(dir)?;
-            std::fs::write(dir.join(&file), library.bytes())?;
-            kept.0.insert(file.clone());
+            std::fs::write(dir.join(&file), f.library().bytes())?;
+            kept.libraries.insert(file);
         }
-        named.push(format!("{file} #{} {}", f.index(), f.info().name));
+        named.push(function_name(f));
     }
     let key = format!("{sel}; {}", named.join(", "));
-    if kept.1.contains(&key) {
-        return Ok(());
+    if !kept.refusals.contains(&key) {
+        append(&dir.join("refused.txt"), &format!("{key}; refused: {why}\n"))?;
+        kept.refusals.insert(key.clone());
     }
-    std::fs::create_dir_all(dir)?;
-    let mut lines = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("refused.txt"))?;
-    std::io::Write::write_all(&mut lines, format!("{key}; refused: {why}\n").as_bytes())?;
-    kept.1.insert(key);
+    let body: String = (record.iter()).map(|line| format!("  {line}\n")).collect();
+    let body = format!("{key}; refused: {why}\n{body}");
+    if !kept.records.contains(&body) {
+        let n = kept.records.len() + 1;
+        append(&dir.join("records.txt"), &format!("record {n}: {body}"))?;
+        kept.records.insert(body);
+    }
     Ok(())
+}
+
+/// Appends `text` to the file at `path`, making it and its directory where they are not.
+fn append(path: &Path, text: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut file = (std::fs::OpenOptions::new().create(true).append(true)).open(path)?;
+    std::io::Write::write_all(&mut file, text.as_bytes())
+}
+
+/// The file `library`'s AIR is kept in: its SHA-256's first 16 hex digits.
+fn air_file(library: &rt::Library) -> String {
+    let hash: String = (library.content_hash().iter().take(8))
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("{hash}.metallib")
+}
+
+/// `f` as the lines name it: its library's file, its index and its name.
+fn function_name(f: &metal2vulkan::library::Function) -> String {
+    format!("{} #{} {}", air_file(f.library()), f.index(), f.info().name)
+}
+
+/// The record's lines of the stage `role` of `f`: its function, the constants it was made with,
+/// and the functions it links with theirs.
+fn stage_lines(out: &mut Vec<String>, role: &str, f: &rt::FunctionDescriptor) {
+    let function = function_name(&f.function);
+    out.push(format!("{role}: {function}; specialized {}", f.specialized));
+    constant_lines(out, role, &f.function, &f.constants);
+    let linked = &f.linked;
+    let groups = (linked.groups.iter()).flat_map(|(name, fs)| fs.iter().map(move |l| (name, l)));
+    let kinds = [
+        ("functions", &linked.functions),
+        ("private functions", &linked.private_functions),
+        ("binary functions", &linked.binary_functions),
+    ];
+    let listed = kinds.into_iter().flat_map(|(kind, fs)| {
+        fs.iter().map(move |l| (kind.to_owned(), l))
+    });
+    let grouped = groups.map(|(name, l)| (format!("group {name}"), l));
+    for (kind, l) in listed.chain(grouped) {
+        let prefix = format!("{role} linked {kind}");
+        out.push(format!(
+            "{prefix}: {}; specialized {}; specialized name {:?}; precompiled {}",
+            function_name(&l.function),
+            l.specialized,
+            l.specialized_name,
+            l.precompiled
+        ));
+        constant_lines(out, &prefix, &l.function, &l.constants);
+    }
+    let libraries = &f.libraries;
+    if !libraries.is_empty() {
+        out.push(format!(
+            "{role} dynamic libraries: {} preloaded, {} loaded",
+            libraries.preloaded.len(),
+            libraries.loaded.len()
+        ));
+    }
+}
+
+/// The record's lines of the constants of `function` made with `values`, under `prefix`: each
+/// value, by index then by name, and each constant the function declares with no value.
+fn constant_lines(
+    out: &mut Vec<String>,
+    prefix: &str,
+    function: &metal2vulkan::library::Function,
+    values: &metal2vulkan::library::FunctionConstantValues,
+) {
+    let declared = function.info().constants;
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+    for (index, v) in &values.by_index {
+        let name = (declared.iter()).find(|c| c.index == Some(*index));
+        let name = name.map_or("?", |c| c.name.as_str());
+        out.push(format!("{prefix} constant #{index} {name}: {:?} {}", v.ty, hex(&v.bytes)));
+    }
+    for (name, v) in &values.by_name {
+        let index = (declared.iter()).find(|c| c.name == *name).and_then(|c| c.index);
+        let index = index.map_or_else(|| "?".to_owned(), |i| i.to_string());
+        out.push(format!("{prefix} constant #{index} {name} (by name): {:?} {}", v.ty, hex(&v.bytes)));
+    }
+    for c in declared {
+        let valued = c.index.is_some_and(|i| values.by_index.contains_key(&i))
+            || values.by_name.contains_key(&c.name);
+        if !valued {
+            let index = c.index.map_or_else(|| "?".to_owned(), |i| i.to_string());
+            let ty = c.ty.map_or_else(|| "?".to_owned(), |t| format!("{t:?}"));
+            out.push(format!("{prefix} constant #{index} {}: {ty} undefined", c.name));
+        }
+    }
+}
+
+/// `descriptor <field>: <value>` of each named field of `d`.
+macro_rules! fields {
+    ($d:expr, $($field:ident),+ $(,)?) => {
+        vec![$(format!(concat!("descriptor ", stringify!($field), ": {:?}"), $d.$field)),+]
+    };
+}
+
+/// The record's lines of the compute descriptor `d`'s fields, its kernel's aside.
+fn compute_fields(d: &rt::ComputePipelineDescriptor) -> Vec<String> {
+    fields!(
+        d,
+        stage_input,
+        max_total_threads_per_threadgroup,
+        threadgroup_size_is_multiple_of_execution_width,
+        support_indirect_command_buffers,
+        max_call_stack_depth,
+        required_threads_per_threadgroup,
+        support_adding_binary_functions,
+        buffers,
+        needs_custom_border_color_samplers,
+        open_cl_mode_enabled,
+    )
+}
+
+/// The record's lines of the render descriptor `d`'s fields, its functions' aside.
+fn render_fields(d: &rt::RenderPipelineDescriptor) -> Vec<String> {
+    fields!(
+        d,
+        vertex_descriptor,
+        color_attachments,
+        depth_format,
+        stencil_format,
+        raster_sample_count,
+        alpha_to_coverage,
+        alpha_to_one,
+        rasterization_enabled,
+        input_primitive_topology,
+        max_vertex_amplification_count,
+        tessellation,
+        support_indirect_command_buffers,
+        max_vertex_call_stack_depth,
+        max_fragment_call_stack_depth,
+        support_adding_vertex_binary_functions,
+        support_adding_fragment_binary_functions,
+        vertex_buffers,
+        fragment_buffers,
+        texture_write_rounding_mode,
+        private,
+    )
 }
 
 // ----- Imageblock asks.
@@ -1444,12 +1641,13 @@ pub fn write() {
         );
     }
     let kept = KEPT_AIR.lock();
-    if !kept.1.is_empty() {
+    if !kept.refusals.is_empty() {
         let _ = writeln!(
             out,
-            "reims-vgpu: rt-diag refused-air: {} refusals, {} libraries kept",
-            kept.1.len(),
-            kept.0.len()
+            "reims-vgpu: rt-diag refused-air: {} refusals, {} libraries, {} records kept",
+            kept.refusals.len(),
+            kept.libraries.len(),
+            kept.records.len()
         );
     }
     drop(kept);
@@ -1903,7 +2101,7 @@ mod tests {
         let f = library.function_at(0).expect("a function");
         let dir = std::env::temp_dir().join(format!("rvg-refused-air-{}", std::process::id()));
         for _ in 0..2 {
-            keep_air_in(&dir, "sel:", &"a refusal", &[&f, &f]).expect("written");
+            keep_air_in(&dir, "sel:", &"a refusal", &[&f, &f], &[]).expect("written");
         }
         let hash: String = (library.content_hash()[..8].iter())
             .map(|b| format!("{b:02x}"))
@@ -1917,6 +2115,58 @@ mod tests {
             lines,
             format!("sel:; {function}, {function}; refused: a refusal\n")
         );
+        let records = std::fs::read_to_string(dir.join("records.txt")).expect("the records");
+        let header = format!(": sel:; {function}, {function}; refused: a refusal\n");
+        assert_eq!(records.lines().count(), 1, "{records}");
+        assert!(records.starts_with("record ") && records.ends_with(&header), "{records}");
         std::fs::remove_dir_all(&dir).expect("removed");
+    }
+
+    /// A refused compute state's record holds the function-constant values its kernel was made
+    /// with, each by its index, its declared name and its type, and its descriptor's fields; a
+    /// state of the kernel made with no value, its constant undefined, has a record of its own.
+    #[test]
+    fn a_refused_states_record_holds_its_constants_and_fields() {
+        use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
+        const OPTIONAL: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/optional_constant.metallib"));
+        let library = rt::Library::from_metallib(OPTIONAL).expect("the kernel's library");
+        let f = library.function("optional_constant").expect("the kernel");
+        let int = metal2vulkan::metal::DataType::try_from(29u32).expect("MTLDataTypeInt");
+        let int_name = format!("{int:?}");
+        let five = FunctionConstantValue::new(int, 5i32.to_le_bytes().to_vec());
+        let mut stage = rt::FunctionDescriptor::new(f.clone()).with_specialized(true);
+        stage.constants = FunctionConstantValues::defaults().with_index(0, five);
+        let mut d = rt::ComputePipelineDescriptor::new(rt::StageSource::Function(stage));
+        d.threadgroup_size_is_multiple_of_execution_width = true;
+        d.max_call_stack_depth = 3;
+        let mut undefined = d.clone();
+        let rt::StageSource::Function(stage) = &mut undefined.kernel else {
+            unreachable!("made of a function")
+        };
+        stage.constants = FunctionConstantValues::defaults();
+
+        let dir = std::env::temp_dir().join(format!("rvg-refused-record-{}", std::process::id()));
+        for d in [&d, &d, &undefined] {
+            let stages = [("kernel", Some(&d.kernel))];
+            let (functions, record) = refused_record(&stages, || compute_fields(d));
+            keep_air_in(&dir, "sel:", &"a refusal", &functions, &record).expect("written");
+        }
+        let records = std::fs::read_to_string(dir.join("records.txt")).expect("the records");
+        std::fs::remove_dir_all(&dir).expect("removed");
+        let function = function_name(&f);
+        let header = format!(": sel:; {function}; refused: a refusal");
+        let starts: Vec<&str> = records.lines().filter(|l| l.starts_with("record ")).collect();
+        assert_eq!(starts.len(), 2, "{records}");
+        assert!(starts.iter().all(|l| l.ends_with(&header)), "{records}");
+        let lines: Vec<&str> = records.lines().map(str::trim).collect();
+        let has = |line: &str| assert!(lines.contains(&line), "no {line:?} in {records}");
+        has(&format!("kernel: {function}; specialized true"));
+        has(&format!("kernel constant #0 optional_value: {int_name} 05000000"));
+        has(&format!("kernel constant #0 optional_value: {int_name} undefined"));
+        has("descriptor threadgroup_size_is_multiple_of_execution_width: true");
+        has("descriptor max_call_stack_depth: 3");
+        has("descriptor max_total_threads_per_threadgroup: None");
+        has(&format!("descriptor buffers: {:?}", d.buffers));
     }
 }
