@@ -304,7 +304,7 @@ impl From<rt::Error> for Unopened {
 /// Makes the process's rt device (the module's docs), on a host of pages of `page_size` bytes,
 /// and logs it.
 pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
-    let instance = rt::Instance::new(&crate::os::rt_instance_extensions())?;
+    let instance = crate::os::rt_instance(&crate::os::rt_instance_extensions())?;
     let listed = instance.physical_devices()?;
     let (_, raw) = instance.raw();
     let mut below = Vec::new();
@@ -394,10 +394,26 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
     // The process's latest device (the module's docs), the one before it folded first.
     follow(device.counters());
     let facts = facts(&device, floor, &uuid, page_size);
+    let driver = {
+        let mut driver = vk::PhysicalDeviceDriverProperties::default();
+        let mut asked = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
+        // SAFETY: the instance listed the device and is alive; rt's instance is at Vulkan 1.3,
+        // where the structure is core.
+        unsafe { raw.get_physical_device_properties2(physical.raw(), &mut asked) };
+        let text = |name: Result<&std::ffi::CStr, _>| {
+            name.map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        format!(
+            "{} {}",
+            text(driver.driver_name_as_c_str()),
+            text(driver.driver_info_as_c_str())
+        )
+    };
     log::info!(
         target: TARGET,
-        "the rt platform's device: {} ({:04x}:{:04x}), registry ID {:#x}; instance extensions \
-         {:?}; present fences: {present_fences}",
+        "the rt platform's device: {} ({:04x}:{:04x}), driver {driver}, registry ID {:#x}; \
+         instance extensions {:?}; present fences: {present_fences}",
         facts.name,
         facts.vendor_id,
         facts.device_id,

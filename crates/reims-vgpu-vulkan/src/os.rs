@@ -139,6 +139,21 @@ pub use wsi::{add_window_extensions, present_fences};
 #[cfg(feature = "rt")]
 pub(crate) use wsi::{rt_instance_extensions, rt_present_fences};
 
+/// The rt platform's instance with `extensions`: on macOS with the Vulkan driver the platform
+/// runs there, Mesa's KosmicKrisp, which the process loads (`os/macos/rt_driver.rs`); elsewhere
+/// rt's `Instance::new`, over the drivers the host's loader finds.
+#[cfg(all(feature = "rt", target_os = "macos"))]
+pub(crate) use macos::rt_instance;
+/// The rt platform's instance with `extensions`: on macOS with the Vulkan driver the platform
+/// runs there, Mesa's KosmicKrisp, which the process loads (`os/macos/rt_driver.rs`); elsewhere
+/// rt's `Instance::new`, over the drivers the host's loader finds.
+#[cfg(all(feature = "rt", not(target_os = "macos")))]
+pub(crate) fn rt_instance(
+    extensions: &[&std::ffi::CStr],
+) -> Result<metal2vulkan_rt::Instance, metal2vulkan_rt::Error> {
+    metal2vulkan_rt::Instance::new(extensions)
+}
+
 /// The user's cache directory, where the library keeps for the host's later processes what they
 /// would otherwise work out again: the shader cache and its device checks
 /// (`crate::platform::cache_directory`), the pipeline records (`crate::records`) and the

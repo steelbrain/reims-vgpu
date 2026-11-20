@@ -9,6 +9,8 @@ mod clock;
 mod drawables;
 mod hints;
 pub mod msg;
+#[cfg(feature = "rt")]
+mod rt_driver;
 mod threads;
 mod vm;
 
@@ -28,6 +30,8 @@ use self::threads::MacThreads;
 use self::vm::MacVm;
 
 pub(crate) use drawables::Drawables;
+#[cfg(feature = "rt")]
+pub(crate) use rt_driver::rt_instance;
 
 /// The clocks: [`clock`]'s.
 pub type OsClock = MacClock;
