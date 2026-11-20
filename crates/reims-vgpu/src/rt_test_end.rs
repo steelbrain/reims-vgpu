@@ -184,7 +184,10 @@ mod tests {
         const LEN: u64 = 1 << 20;
         let platform = <RtPlatform as ApiPlatform>::process();
         let device = platform.metal_device(None).expect("the rt device");
-        let buffer = device.new_buffer_of_length(OnFault::Die, LEN, 0).unwrap().unwrap();
+        let buffer = device
+            .new_buffer_of_length(OnFault::Die, LEN, 0)
+            .unwrap()
+            .unwrap();
         let queue = device.new_command_queue().unwrap();
         let cb = queue.command_buffer(OnFault::Die).unwrap().unwrap();
         let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
