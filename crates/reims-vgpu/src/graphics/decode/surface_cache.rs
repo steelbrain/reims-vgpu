@@ -2508,6 +2508,9 @@ impl<P: Platform> SurfaceCaches<P> {
     /// The blocks whose first fills owed [`Self::fill_reached`] makes for a command buffer of
     /// `context`'s.
     fn reached(&self, context: Option<u32>) -> Vec<u64> {
+        if self.owed.is_empty() {
+            return Vec::new();
+        }
         (self.owed.iter())
             .copied()
             .filter(|block| (self.by_block.get(block)).is_some_and(|c| c.owner == Some(context)))
