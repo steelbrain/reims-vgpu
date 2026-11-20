@@ -46,6 +46,15 @@
 //!   take from it; its commit copies the CPU's writes into those before rt is handed the command
 //!   buffer, and where a use of one can write it its first completed handler merges the GPU's
 //!   writes back into their pages, before core's completion-seen handlers.
+//! - **Handed on** ([`hand_on`]): the completed handlers of a command buffer whose first merges a
+//!   copy back do not run on rt's completion thread, which retires every queue's work and would
+//!   wait for the merge, but on the platform's queue of handlers handed on
+//!   (`reims-vgpu.rt-handed-on`), one at a time, in the order rt's thread handed them on; and so
+//!   do those of every command buffer rt completes while handlers handed on have not yet run, so
+//!   each queue's completed handlers run in the order rt completes its command buffers, as
+//!   before. `waitUntilCompleted` returns once they ran, as rt's does for those it runs; on that
+//!   queue, as on rt's thread, it answers at once for a command buffer completed and is rt's
+//!   refusal for one not yet completed (`WaitOnOwnThread`), which would wait for itself.
 //! - **What it keeps**: the pipeline states its encoders set ([`Kept`]), from their set until it
 //!   completes, released after its completed handlers ran. It keeps no texture or sampler state:
 //!   it notes those its work reads through one of the platform's own indices (`super::texture`'s
@@ -78,6 +87,7 @@
 //! Every call rt refuses answers as Metal's answers where it fails (nothing encoded, nil, no
 //! wait), counted under the refusal's kind ([`rt_refused`]); never a death.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -94,8 +104,8 @@ use crate::core::platform::values::ComputePassDesc;
 use crate::core::platform::{Handle, ObjId, Platform};
 use crate::core::raise::refusals;
 use crate::core::raise::{OnFault, RaiseResult};
-use crate::core::rt::BlockEnv;
-use crate::core::sync::Mutex;
+use crate::core::rt::{BlockEnv, SerialQueue};
+use crate::core::sync::{Condvar, Mutex};
 use crate::core::trace;
 
 use super::blit::RtBlitEncoder;
@@ -224,6 +234,82 @@ fn address<T>(of: &T) -> u64 {
     u64::try_from(std::ptr::from_ref(of).addr()).unwrap_or_default()
 }
 
+/// The command buffers whose completed handlers rt's completion thread handed on ([`hand_on`])
+/// and that have not yet run.
+static HANDED: AtomicUsize = AtomicUsize::new(0);
+
+/// The queue that runs the completed handlers handed on ([`hand_on`]), made at the first.
+static HANDED_ON: OnceLock<SerialQueue> = OnceLock::new();
+
+thread_local! {
+    /// Whether this thread runs a command buffer's completed handlers handed on ([`hand_on`]).
+    static RUNS_HANDED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether a command buffer's completed handlers handed on ([`hand_on`]) are yet to run, which its
+/// wait waits for after rt's.
+#[derive(Default)]
+struct Handed {
+    /// Whether they were handed on and have not yet run.
+    pending: Mutex<bool>,
+    /// Woken once they ran.
+    ran: Condvar,
+}
+
+impl Handed {
+    /// Returns once no handlers handed on are yet to run.
+    fn wait(&self) {
+        let mut pending = self.pending.lock();
+        while *pending {
+            self.ran.wait(&mut pending);
+        }
+    }
+}
+
+/// rt's completed handler that runs `handlers`, a command buffer's (the module's docs, "Handed
+/// on"): on rt's completion thread, unless `merges` (the first of them merges a copy back) or
+/// handlers handed on are yet to run, when it hands them on to [`HANDED_ON`], `handed` holding
+/// them yet to run until they ran. Each run there is a step of the exit gate
+/// (`crate::exit_gate`), and parks for good once the process's exit closed it.
+fn hand_on(
+    handlers: impl FnOnce(&rt::CommandBuffer) + Send + 'static,
+    merges: bool,
+    handed: Arc<Handed>,
+) -> impl FnOnce(&rt::CommandBuffer) + Send + 'static {
+    move |made: &rt::CommandBuffer| {
+        if !merges && HANDED.load(Ordering::SeqCst) == 0 {
+            handlers(made);
+            return;
+        }
+        HANDED.fetch_add(1, Ordering::SeqCst);
+        *handed.pending.lock() = true;
+        let made = made.clone();
+        let queue = HANDED_ON.get_or_init(|| {
+            SerialQueue::new(&crate::os::OsThreads::new(), "reims-vgpu.rt-handed-on")
+        });
+        queue.exec_async(move || {
+            let Some(step) = crate::exit_gate::step() else {
+                crate::exit_gate::stay()
+            };
+            let was = RUNS_HANDED.replace(true);
+            handlers(&made);
+            RUNS_HANDED.set(was);
+            drop((made, step));
+            *handed.pending.lock() = false;
+            handed.ran.notify_all();
+            HANDED.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+}
+
+/// Whether rt's command buffer `cb` completed or ended.
+fn finished(cb: &rt::CommandBuffer) -> bool {
+    matches!(
+        cb.status(),
+        rt::CommandBufferStatus::Completed | rt::CommandBufferStatus::Error
+    )
+}
+
 /// `id<MTLCommandBuffer>` on metal2vulkan-rt.
 pub struct RtCommandBuffer {
     /// rt's command buffer.
@@ -243,6 +329,8 @@ pub struct RtCommandBuffer {
     /// Its process's escaped copies (`super::copied`), which each of its commits syncs, as do
     /// its parts', where the caller named them (`reaches_escaped`).
     escapes: OnceLock<EscapedCopies>,
+    /// Whether its completed handlers, handed on, have run ([`hand_on`]).
+    handed: Arc<Handed>,
 }
 
 /// A command buffer's error as Metal's (the module's docs, "What a completed handler learns"):
@@ -388,6 +476,7 @@ impl RtCommandBuffer {
             kept: Kept::default(),
             failure,
             escapes: OnceLock::new(),
+            handed: Arc::default(),
         }
     }
 
@@ -787,13 +876,13 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
 
     /// Hands rt the held handlers (the module's docs), then commits, the copies of host pages it
     /// used and its process's escaped copies copied in first and, those a use of which can write
-    /// them, merged back first of the completed handlers (`super::copied`), then the bytes of the
-    /// tiled textures it used taken (`super::tiled`). A second commit is Metal's refusal,
-    /// counted; a commit rt refuses is counted, and its handlers never run. In a process that
-    /// records, the recorder writes the memory it reaches that changed before rt has it
-    /// ([`crate::recorder::before_commit`]), and takes what its GPU work wrote after the merge of
-    /// the host pages it copied, before core's handlers can tell the guest
-    /// ([`crate::recorder::completion_seen`]).
+    /// them, merged back first of the completed handlers (`super::copied`), which are then handed
+    /// on ([`hand_on`]), then the bytes of the tiled textures it used taken (`super::tiled`). A
+    /// second commit is Metal's refusal, counted; a commit rt refuses is counted, and its
+    /// handlers never run. In a process that records, the recorder writes the memory it reaches
+    /// that changed before rt has it ([`crate::recorder::before_commit`]), and takes what its GPU
+    /// work wrote after the merge of the host pages it copied, before core's handlers can tell
+    /// the guest ([`crate::recorder::completion_seen`]).
     fn commit(&self, on: OnFault) -> RaiseResult<()> {
         let recorded_call = crate::recorder::rec_call!("commit", self);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
@@ -844,6 +933,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 self.kept.copies().escaped(escapes);
             }
             let copies = self.kept.copies().take();
+            let merges = super::copied::writes(&copies);
             if let Some(merge) = super::copied::merging(&copies) {
                 seen.insert(0, Box::new(merge));
             }
@@ -867,7 +957,9 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 if !submission.is_empty() {
                     self.rt.add_scheduled_handler(run(submission))?;
                 }
-                self.rt.add_completed_handler(run(seen))?;
+                let handed = Arc::clone(&self.handed);
+                self.rt
+                    .add_completed_handler(hand_on(run(seen), merges, handed))?;
                 super::copied::copy_in(&copies);
                 self.kept.takes().take(&self.device);
                 // Not complete until its first completed handler runs, which a refusal never runs.
@@ -1070,16 +1162,27 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         self.kept.3.0.store(true, Ordering::Release);
     }
 
-    /// rt's wait; none, counted, where rt refuses it (in a scheduled handler, or on rt's
-    /// completion thread for a command buffer not yet completed, which it would never see). In a
-    /// process that records, it returns once the recorder took what the command buffer's GPU work
-    /// wrote ([`crate::recorder::completion_seen`]).
+    /// rt's wait, then the wait for its completed handlers handed on ([`hand_on`]); none,
+    /// counted, where rt refuses it (in a scheduled handler, or on rt's completion thread for a
+    /// command buffer not yet completed, which it would never see), and so on the queue of
+    /// handlers handed on, as on rt's thread (the module's docs, "Handed on"). In a process that
+    /// records, it returns once the recorder took what the command buffer's GPU work wrote
+    /// ([`crate::recorder::completion_seen`]).
     fn wait_until_completed(&self, on: OnFault) -> RaiseResult<()> {
         let recorded_call = crate::recorder::rec_call!("waitUntilCompleted", self);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
             let _ = on;
+            let handing = RUNS_HANDED.get();
+            if handing && !finished(&self.rt) {
+                let own = rt::Error::Refused(rt::Refusal::WaitOnOwnThread);
+                rt_refused("waitUntilCompleted", &own);
+                return Ok(());
+            }
             match self.rt.wait_until_completed() {
                 Ok(_) => {
+                    if !handing {
+                        self.handed.wait();
+                    }
                     if let Some(id) = crate::recorder::completion_key(self) {
                         crate::recorder::completion_seen(id);
                     }

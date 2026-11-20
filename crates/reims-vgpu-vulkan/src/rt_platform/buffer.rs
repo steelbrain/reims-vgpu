@@ -4845,6 +4845,70 @@ mod tests {
         assert_eq!(read(c.copy, 256), [0x22; 256]);
     }
 
+    /// On the GPU the test holds: the completed handlers of a command buffer whose use of a copy
+    /// can write it are handed on off rt's completion thread (`super::super::command`'s docs,
+    /// "Handed on"): its wait returns once they ran, the copy's bytes merged back first, and those
+    /// of a command buffer of its queue committed after it run after them.
+    #[test]
+    fn a_merging_command_buffer_s_handlers_run_in_order_before_its_wait_returns_on_vulkan() {
+        use crate::core::platform::command::{CompletedHandler, CompletedInfo};
+        use crate::core::platform::types::NsRange;
+
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let of = |length| device.new_buffer_of_length(on, length, 0);
+        let of = |length| of(length).expect("never a raise").expect("a buffer");
+        let (source, other) = (of(64), of(64));
+        // SAFETY: the Shared buffer's 64 bytes, mapped while it lives.
+        unsafe { source.contents().as_ptr::<u8>().write_bytes(0x77, 64) };
+        for round in 0..4 {
+            let c = over_a_copy(&device, false);
+            let ran = Arc::new(Mutex::new(Vec::new()));
+            let see = |name: &'static str| -> CompletedHandler {
+                let (ran, pages) = (Arc::clone(&ran), c.pages.wrapping_add(128).addr());
+                Box::new(move |_: CompletedInfo| {
+                    let merged = read(HostPtr::from_addr(pages), 64) == [0x77; 64];
+                    ran.lock().push((name, merged));
+                })
+            };
+            let blit = |cmd, name| {
+                let commands = queue.command_buffer(on).expect("never a raise");
+                let commands = commands.expect("a command buffer");
+                assert_eq!(commands.add_completed_handler(on, see(name)), Ok(()));
+                let encoder = commands.blit_encoder(on).expect("never a raise");
+                let encoder = encoder.expect("a blit encoder");
+                assert_eq!(encoder.encode(on, cmd), Ok(()));
+                assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+                assert_eq!(commands.commit(on), Ok(()));
+                commands
+            };
+            let into = BlitCmd::CopyBufferToBuffer {
+                source_buffer: Some(&source),
+                source_offset: 0,
+                destination_buffer: Some(&c.buffer),
+                destination_offset: 128,
+                size: 64,
+            };
+            let fill = BlitCmd::FillBuffer {
+                buffer: &other,
+                range: NsRange::new(0, 64),
+                value: 0x55,
+            };
+            let (first, second) = (blit(into, "merging"), blit(fill, "after"));
+            assert_eq!(first.wait_until_completed(on), Ok(()));
+            assert_eq!(
+                ran.lock().first().copied(),
+                Some(("merging", true)),
+                "round {round}: its handlers ran, the copy merged back first"
+            );
+            assert_eq!(second.wait_until_completed(on), Ok(()));
+            let names: Vec<&str> = ran.lock().iter().map(|(name, _)| *name).collect();
+            assert_eq!(names, ["merging", "after"], "round {round}");
+        }
+    }
+
     /// On the GPU the test holds: a command buffer that uses no copy, of a process none of whose
     /// copies escaped, syncs none, as the platform's own command buffers, its fills and
     /// write-backs, use none, though another process's copy escaped: a live copy keeps what it
