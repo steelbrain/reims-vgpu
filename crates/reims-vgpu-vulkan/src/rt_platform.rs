@@ -50,6 +50,7 @@ pub mod event;
 #[cfg(unix)]
 pub mod export;
 pub mod format;
+pub mod gauge_log;
 pub mod heap;
 pub mod library;
 pub mod pipeline;

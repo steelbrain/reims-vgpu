@@ -409,6 +409,8 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         fences.is_some_and(|name| (device.extensions().iter()).any(|n| n.as_c_str() == name));
     // The process's latest device (the module's docs), the one before it folded first.
     follow(device.counters());
+    // Its gauges in the log, where the log asks for them (`super::gauge_log`).
+    super::gauge_log::start();
     let facts = facts(&device, floor, &uuid, page_size);
     let driver = {
         let mut driver = vk::PhysicalDeviceDriverProperties::default();
