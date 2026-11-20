@@ -85,7 +85,7 @@ pub fn dma_buf_of_host(
 /// bytes than one dma-buf holds.
 ///
 /// The caller keeps the `length` bytes from `first` mapped for the call.
-#[cfg(any(test, feature = "rt"))]
+#[cfg(feature = "rt")]
 pub(crate) fn dma_bufs_of_host(
     first: NonNull<u8>,
     length: u64,
