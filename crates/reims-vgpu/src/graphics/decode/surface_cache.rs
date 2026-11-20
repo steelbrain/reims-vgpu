@@ -440,7 +440,6 @@ use std::ops::{Deref, DerefMut, Range};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
-use parking_lot::RwLock;
 use reims_vgpu_graphics::ops::{
     RGFX_SURFACE_USE_REFILL, RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse,
 };
@@ -6618,7 +6617,7 @@ impl<P: Platform> Caches<P> {
     pub(crate) fn set_drawn(
         &self,
         draw: Arc<reims_vgpu_video::vaapi::PlaneDraw>,
-        gate: Arc<RwLock<()>>,
+        gate: Arc<parking_lot::RwLock<()>>,
         now: Now,
     ) {
         drop(self.drawn_spares.set(exported::drawn_spares(gate, now)));
