@@ -14,6 +14,11 @@
 //! complete, from present fences or Vulkan's rules ([`Presents`], [`Fences`]), and the one lock
 //! every call into the window system runs under ([`WSI`]), which the two platforms' windows share.
 //!
+//! **The present mode is logged** at info at the first swapchain made, with the images asked
+//! for and the images made; a later make logs it again only where its counts differ from the
+//! last line's. Which mode a window presents with depends on what its surface offers, and no
+//! other line says it.
+//!
 //! **Each frame, in rt's order.** The take of an image with a fence, the fence waited for; then
 //! `drawable_acquired`, rt's part of `nextDrawable`, which moves the image to its home layout in
 //! the upload of rt's next submission; the display's encoders into the image's texture;
@@ -148,6 +153,9 @@ pub struct RtSwapchain {
     lost: bool,
     /// The last making of the swapchain was refused, which was logged: the next refusal is not.
     refusing: bool,
+    /// The image counts the last line of its present mode gave: the images asked for and those
+    /// made ([`RtSwapchain::make`]).
+    told: Option<(u32, usize)>,
     /// The queue a retire commits its clears on ([`RtSwapchain::settle_acquired`]), made at the
     /// first.
     settling: Option<rt::CommandQueue>,
@@ -278,6 +286,7 @@ impl RtSwapchain {
             held: None,
             lost: false,
             refusing: false,
+            told: None,
             settling: None,
         })
     }
@@ -874,6 +883,16 @@ impl RtSwapchain {
                 unsafe { self.swapchain_api.destroy_swapchain(raw, None) };
             })
             .map_err(Unmade::Asked)?;
+        let told = (count, images.len());
+        if self.told != Some(told) {
+            self.told = Some(told);
+            log::info!(
+                target: TARGET,
+                "a window's swapchain presents with {:?}, {} images ({count} asked for)",
+                self.mode,
+                images.len()
+            );
+        }
         Ok(Chain {
             raw,
             size,
@@ -1023,7 +1042,8 @@ mod tests {
     /// drawable and copies it out in a command buffer that presents it, and the copy holds the
     /// clear; the swapchain is made again at a new size; an image taken for a frame that encodes
     /// nothing is the next draw's, and the swapchain ends with it taken, its move home settled.
-    /// rt refuses nothing on the way.
+    /// rt refuses nothing on the way. The present mode is logged once, at the first make: the
+    /// remake at the new size makes as many images.
     #[test]
     fn a_window_presents_rt_drawables_on_vulkan() {
         let platform = RtPlatform::new();
@@ -1051,6 +1071,7 @@ mod tests {
             return;
         }
         let before = refusals();
+        let logs = crate::core::testkit::logs::capture();
         // SAFETY: the surface is live, of the device's instance, and the swapchain's alone.
         let made = unsafe { RtSwapchain::new(&device, surface) };
         let mut swapchain = made.expect("a swapchain over the headless surface");
@@ -1110,6 +1131,21 @@ mod tests {
         // A frame that took an image and encoded nothing: the next draw takes it again.
         let kept = take(&mut swapchain, (80, 40));
         assert_eq!(take(&mut swapchain, (80, 40)), kept);
+        let told: Vec<String> = (logs.take().into_iter())
+            .filter(|(_, target, line)| target == TARGET && line.contains("presents with"))
+            .map(|(_, _, line)| line)
+            .collect();
+        let images = (swapchain.chain.as_ref()).map_or(0, |c| c.images.len());
+        let mode = if swapchain.is_mailbox() {
+            "MAILBOX"
+        } else {
+            "FIFO"
+        };
+        let start = format!("a window's swapchain presents with {mode}, {images} images (");
+        assert!(
+            told.len() == 1 && told[0].starts_with(&start) && told[0].ends_with(" asked for)"),
+            "{told:?}"
+        );
         drop(swapchain);
         assert_eq!(refusals(), before);
     }
