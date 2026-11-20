@@ -5269,7 +5269,7 @@ mod tests {
                 };
                 let refused = counted("rt-refused-gap");
                 let made = device.new_compute_pipeline_state_full(&desc);
-                let error = made.err().expect("rt refuses a kernel with stage input");
+                let error = made.expect_err("rt refuses a kernel with stage input");
                 assert!(error.description.contains("(rt-refused-gap)"), "{error:?}");
                 assert_eq!(counted("rt-refused-gap") - refused, 1);
                 let (calls, _) =
@@ -5369,7 +5369,7 @@ mod tests {
                 };
                 let refused = counted("rt-refused-translation");
                 let made = device.new_render_pipeline_state_full(&desc);
-                let error = made.err().expect("rt translates no tessellation");
+                let error = made.expect_err("rt translates no tessellation");
                 assert!(
                     error.description.contains("(rt-refused-translation)"),
                     "{error:?}"
