@@ -401,9 +401,9 @@
 //! [`RGFX_SURFACE_PAGES_CACHED`]: reims_vgpu_graphics::wire::RGFX_SURFACE_PAGES_CACHED
 
 use std::any::Any;
+use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::cell::Cell;
 use std::ops::{Deref, DerefMut, Range};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -13868,7 +13868,10 @@ pub(super) mod tests {
             (encoded, (one.join().unwrap(), two.join().unwrap()))
         });
         assert_eq!(decoded, (Ok(()), Ok(())));
-        assert!(encoded, "the second fill encoded while the first's commit was held");
+        assert!(
+            encoded,
+            "the second fill encoded while the first's commit was held"
+        );
         let calls = r.p.call_log().since(mark);
         let transfer = events(&calls, SIGNAL)[0].0;
         let signalled: HashMap<_, u64> = (calls.iter())
@@ -13879,7 +13882,11 @@ pub(super) mod tests {
             .filter(|c| c.sel == "commit")
             .filter_map(|c| signalled.get(&c.obj).copied())
             .collect();
-        assert_eq!(committed, [1, 2], "the transfer queue's commits, in value order");
+        assert_eq!(
+            committed,
+            [1, 2],
+            "the transfer queue's commits, in value order"
+        );
     }
 
     /// Command queues 1 and 2.
