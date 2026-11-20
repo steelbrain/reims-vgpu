@@ -978,4 +978,71 @@ mod tests {
         assert_eq!(commands.status(), done);
         assert_eq!(texels(), every(red));
     }
+
+    /// A pass whose colour attachment, a 4-sample texture, resolves into its resolve texture
+    /// leaves the cleared colour there, as Metal's resolve does; one that resolves with no
+    /// resolve texture is Metal's refusal, nil and counted.
+    #[test]
+    fn a_pass_resolves_into_its_resolve_texture_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let made = || {
+            let made = queue.command_buffer(on).expect("never a raise");
+            made.expect("a command buffer")
+        };
+        let texture = |desc: TextureDesc| {
+            let made = device.new_texture(on, &platform.texture_descriptor(&desc));
+            made.expect("never a raise").expect("a texture")
+        };
+        // `MTLTextureType2DMultisample` of 4 samples, render target usage and Private storage.
+        let samples = texture(TextureDesc {
+            texture_type: 4,
+            sample_count: 4,
+            width: 4,
+            height: 4,
+            usage: 4,
+            resource_options: Some(0x20),
+            ..TextureDesc::default()
+        });
+        let resolved = texture(TextureDesc {
+            width: 4,
+            height: 4,
+            usage: 5,
+            ..TextureDesc::default()
+        });
+        // A cleared pass of `samples` with store action `store` (opaque red), resolving into
+        // `into`.
+        let pass = |store: u64, into: Option<&RtObj<RtTexture>>| {
+            let pass = RtObj::new(PassFields::default());
+            let set = ColorAttachmentSet {
+                texture: Some(Some(&samples)),
+                resolve_texture: Some(into),
+                load_action: Some(2),
+                store_action: Some(store),
+                clear_color: Some(ClearColor {
+                    red: 1.0,
+                    alpha: 1.0,
+                    ..ClearColor::default()
+                }),
+                ..ColorAttachmentSet::default()
+            };
+            assert_eq!(pass.set_color_attachment(on, 0, &set), Ok(()));
+            pass
+        };
+        let resolve = 2;
+        let done = CommandBufferStatus::COMPLETED;
+        assert_eq!(run(&made(), &pass(resolve, Some(&resolved)), Vec::new()), done);
+        let mut texels = [0u8; 64];
+        resolved.read_pixels(&mut texels, 16);
+        let red: [u8; 64] = std::array::from_fn(|i| [255, 0, 0, 255][i % 4]);
+        assert_eq!(texels, red);
+
+        let metal = RtRefusal::Refused.code();
+        let before = counted(metal);
+        let refused = made().render_encoder(on, &pass(resolve, None));
+        assert!(matches!(refused, Ok(None)));
+        assert_eq!(counted(metal), before + 1);
+    }
 }

@@ -8,23 +8,23 @@
 //! - **The render pass descriptor** keeps what rt's pass has a field of, as it is set
 //!   ([`PassFields`]), from Metal's defaults: each attachment's texture, held as Metal's
 //!   descriptor retains it, its level and slice, its load and store actions as Metal's raw values,
-//!   which its reads answer, and its clear value; the render target's width and height; and the
-//!   visibility result buffer, held as Metal's descriptor retains it. rt's command buffer keeps
-//!   that buffer until it retires, and its bytes stay as they were: rt's pass writes no result,
-//!   and a visibility result mode but `Disabled` is unbuilt at the encoder (`super::render`). A
-//!   render encoder's creation turns them into rt's descriptor ([`PassFields::rt_pass`]): an
-//!   action Metal has none of, or a level or slice past 32 bits, is Metal's refusal there, as
-//!   Metal asserts at the encoder's creation, and a width or height past 32 bits renders the
-//!   attachments' area, as Metal's does. A colour attachment past the eighth raises at its
-//!   subscript, as Metal's does.
-//!   - **Kept nowhere, changing nothing rt renders**: a resolve texture, level, slice and depth
-//!     plane, and the resolve filters (a resolving store action is rt's refusal at the encoder); a
-//!     depth plane (rt renders into no 3D texture); store action options (rt renders one sample);
-//!     `defaultRasterSampleCount` (rt renders no pass without an attachment);
-//!     `defaultColorSampleCount` (SPI); and `visibilityResultType`, which decides only what an
-//!     enabled visibility result mode writes: Metal's pass leaves the buffer's bytes as they were
-//!     under either type where its encoder enables no mode (rt's docs: an Apple M3 Max, macOS
-//!     27.0.1).
+//!   which its reads answer, and its clear value; its resolve texture, held so too, its resolve
+//!   level, slice and depth plane, and a depth or stencil attachment's resolve filter as Metal's
+//!   raw value, by which rt's pass resolves where a store action resolves (rt's docs); the render
+//!   target's width and height; and the visibility result buffer, held as Metal's descriptor
+//!   retains it. rt's command buffer keeps that buffer until it retires, and its bytes stay as
+//!   they were: rt's pass writes no result, and a visibility result mode but `Disabled` is unbuilt
+//!   at the encoder (`super::render`). A render encoder's creation turns them into rt's
+//!   descriptor ([`PassFields::rt_pass`]): an action or resolve filter Metal has none of, or a
+//!   level, slice or plane past 32 bits, is Metal's refusal there, as Metal asserts at the
+//!   encoder's creation, and a width or height past 32 bits renders the attachments' area, as
+//!   Metal's does. A colour attachment past the eighth raises at its subscript, as Metal's does.
+//!   - **Kept nowhere, changing nothing rt renders**: a depth plane (rt renders into no 3D
+//!     texture); store action options (rt builds none); `defaultRasterSampleCount` (rt renders no
+//!     pass without an attachment); `defaultColorSampleCount` (SPI); and `visibilityResultType`,
+//!     which decides only what an enabled visibility result mode writes: Metal's pass leaves the
+//!     buffer's bytes as they were under either type where its encoder enables no mode (rt's
+//!     docs: an Apple M3 Max, macOS 27.0.1).
 //!   - **Unbuilt** ([`Unbuilt::RenderPass`]), counted at a set of other than Metal's default, and
 //!     kept nowhere, so the pass renders without them: a render target array length past 1, an
 //!     imageblock sample length, a threadgroup memory length, a tile width or height, and sample
@@ -229,17 +229,36 @@ const SUBSCRIPT: &str = "objectAtIndexedSubscript:";
 pub struct PassFields(Mutex<Pass>);
 
 /// One attachment as set: its texture, held as Metal's descriptor retains it, its level and slice,
-/// and its load and store actions as Metal's raw values.
+/// its load and store actions as Metal's raw values, its resolve texture, held so too, its resolve
+/// level, slice and depth plane, and its resolve filter, Metal's raw value (a depth or stencil
+/// attachment's; a colour attachment has none).
 struct Attachment {
     texture: Option<RtObj<RtTexture>>,
     level: u64,
     slice: u64,
     load_action: u64,
     store_action: u64,
+    resolve_texture: Option<RtObj<RtTexture>>,
+    resolve_level: u64,
+    resolve_slice: u64,
+    resolve_depth_plane: u64,
+    resolve_filter: u64,
+}
+
+/// What a set sends of an attachment's resolve: its texture (nil for `Some(None)`), level, slice
+/// and depth plane, and its filter, each `None` where it is not sent.
+#[derive(Default)]
+struct ResolveSet<'a> {
+    texture: Option<Option<&'a RtObj<RtTexture>>>,
+    level: Option<u64>,
+    slice: Option<u64>,
+    depth_plane: Option<u64>,
+    filter: Option<u64>,
 }
 
 impl Attachment {
-    /// One of no texture, level and slice 0, and the actions `load_action` and `store_action`.
+    /// One of no texture, level and slice 0, the actions `load_action` and `store_action`, and no
+    /// resolve texture, its level, slice, plane and filter 0.
     fn of(load_action: u64, store_action: u64) -> Attachment {
         Attachment {
             texture: None,
@@ -247,15 +266,21 @@ impl Attachment {
             slice: 0,
             load_action,
             store_action,
+            resolve_texture: None,
+            resolve_level: 0,
+            resolve_slice: 0,
+            resolve_depth_plane: 0,
+            resolve_filter: 0,
         }
     }
 
-    /// Takes the texture, level, slice and actions a set sends; nil for `Some(None)`.
+    /// Takes the texture, level, slice, actions and resolve a set sends; nil for `Some(None)`.
     fn set(
         &mut self,
         texture: Option<Option<&RtObj<RtTexture>>>,
         (level, slice): (Option<u64>, Option<u64>),
         (load_action, store_action): (Option<u64>, Option<u64>),
+        resolve: ResolveSet<'_>,
     ) {
         if let Some(texture) = texture {
             self.texture = texture.map(Handle::clone_ref);
@@ -264,6 +289,13 @@ impl Attachment {
         self.slice = slice.unwrap_or(self.slice);
         self.load_action = load_action.unwrap_or(self.load_action);
         self.store_action = store_action.unwrap_or(self.store_action);
+        if let Some(texture) = resolve.texture {
+            self.resolve_texture = texture.map(Handle::clone_ref);
+        }
+        self.resolve_level = resolve.level.unwrap_or(self.resolve_level);
+        self.resolve_slice = resolve.slice.unwrap_or(self.resolve_slice);
+        self.resolve_depth_plane = resolve.depth_plane.unwrap_or(self.resolve_depth_plane);
+        self.resolve_filter = resolve.filter.unwrap_or(self.resolve_filter);
     }
 
     /// Its actions, as Metal reads them.
@@ -274,8 +306,8 @@ impl Attachment {
         }
     }
 
-    /// rt's texture, level, slice and actions of it, which `what` names; `Err` names a level or
-    /// slice past 32 bits, or an action Metal has none of.
+    /// rt's texture, level, slice, actions and resolve of it, which `what` names; `Err` names a
+    /// level, slice or plane past 32 bits, or an action Metal has none of.
     fn rt(&self, what: &str) -> Result<RtAttachment, String> {
         let word =
             |name: &str, raw: u64| u32::try_from(raw).map_err(|_| format!("{what}'s {name} {raw}"));
@@ -300,6 +332,10 @@ impl Attachment {
             slice: word("slice", self.slice)?,
             load,
             store,
+            resolve_texture: self.resolve_texture.as_ref().map(|t| t.rt().clone()),
+            resolve_level: word("resolve level", self.resolve_level)?,
+            resolve_slice: word("resolve slice", self.resolve_slice)?,
+            resolve_depth_plane: word("resolve depth plane", self.resolve_depth_plane)?,
         })
     }
 }
@@ -311,6 +347,10 @@ struct RtAttachment {
     slice: u32,
     load: rt::LoadAction,
     store: rt::StoreAction,
+    resolve_texture: Option<rt::Texture>,
+    resolve_level: u32,
+    resolve_slice: u32,
+    resolve_depth_plane: u32,
 }
 
 /// What a render pass descriptor keeps.
@@ -356,7 +396,8 @@ impl PassFields {
     }
 
     /// rt's descriptor of what is set (the module's docs). `Err` names the first value Metal
-    /// takes no pass of: an action Metal has none of, or a level or slice past 32 bits.
+    /// takes no pass of: an action or resolve filter Metal has none of, or a level, slice or plane
+    /// past 32 bits.
     pub fn rt_pass(&self) -> Result<rt::RenderPassDescriptor, String> {
         let pass = self.lock();
         let mut out = rt::RenderPassDescriptor::default();
@@ -372,9 +413,14 @@ impl PassFields {
                 load_action: a.load,
                 store_action: a.store,
                 clear_color: rt::ClearColor::new(c.red, c.green, c.blue, c.alpha),
+                resolve_texture: a.resolve_texture,
+                resolve_level: a.resolve_level,
+                resolve_slice: a.resolve_slice,
+                resolve_depth_plane: a.resolve_depth_plane,
             };
         }
-        let a = pass.depth.rt("the depth attachment")?;
+        let what = "the depth attachment";
+        let a = pass.depth.rt(what)?;
         out.depth_attachment = rt::RenderPassDepthAttachmentDescriptor {
             texture: a.texture,
             level: a.level,
@@ -382,8 +428,19 @@ impl PassFields {
             load_action: a.load,
             store_action: a.store,
             clear_depth: pass.clear_depth,
+            resolve_texture: a.resolve_texture,
+            resolve_level: a.resolve_level,
+            resolve_slice: a.resolve_slice,
+            resolve_depth_plane: a.resolve_depth_plane,
+            depth_resolve_filter: match pass.depth.resolve_filter {
+                0 => rt::MultisampleDepthResolveFilter::Sample0,
+                1 => rt::MultisampleDepthResolveFilter::Min,
+                2 => rt::MultisampleDepthResolveFilter::Max,
+                raw => return Err(format!("{what}'s depth resolve filter {raw}")),
+            },
         };
-        let a = pass.stencil.rt("the stencil attachment")?;
+        let what = "the stencil attachment";
+        let a = pass.stencil.rt(what)?;
         out.stencil_attachment = rt::RenderPassStencilAttachmentDescriptor {
             texture: a.texture,
             level: a.level,
@@ -391,6 +448,15 @@ impl PassFields {
             load_action: a.load,
             store_action: a.store,
             clear_stencil: pass.clear_stencil,
+            resolve_texture: a.resolve_texture,
+            resolve_level: a.resolve_level,
+            resolve_slice: a.resolve_slice,
+            resolve_depth_plane: a.resolve_depth_plane,
+            stencil_resolve_filter: match pass.stencil.resolve_filter {
+                0 => rt::MultisampleStencilResolveFilter::Sample0,
+                1 => rt::MultisampleStencilResolveFilter::DepthResolvedSample,
+                raw => return Err(format!("{what}'s stencil resolve filter {raw}")),
+            },
         };
         // A size past 32 bits renders the area a size of the most 32 bits do: the attachments'.
         out.render_target_width = u32::try_from(pass.render_target_width).unwrap_or(u32::MAX);
@@ -508,7 +574,14 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
             };
             let mut pass = self.lock();
             let actions = (set.load_action, set.store_action);
-            pass.colors[i].set(set.texture, (set.level, set.slice), actions);
+            let resolve = ResolveSet {
+                texture: set.resolve_texture,
+                level: set.resolve_level,
+                slice: set.resolve_slice,
+                depth_plane: set.resolve_depth_plane,
+                filter: None,
+            };
+            pass.colors[i].set(set.texture, (set.level, set.slice), actions, resolve);
             if let Some(c) = set.clear_color {
                 pass.clear_colors[i] = c;
             }
@@ -523,7 +596,15 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
         crate::recorder::run(|| {
             let mut pass = self.lock();
             let actions = (set.load_action, set.store_action);
-            pass.depth.set(set.texture, (set.level, set.slice), actions);
+            let resolve = ResolveSet {
+                texture: set.resolve_texture,
+                level: set.resolve_level,
+                slice: set.resolve_slice,
+                depth_plane: set.resolve_depth_plane,
+                filter: set.depth_resolve_filter,
+            };
+            pass.depth
+                .set(set.texture, (set.level, set.slice), actions, resolve);
             pass.clear_depth = set.clear_depth.unwrap_or(pass.clear_depth);
         });
         crate::recorder::rec_done!(recorded_call, ());
@@ -534,8 +615,15 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
         crate::recorder::run(|| {
             let mut pass = self.lock();
             let actions = (set.load_action, set.store_action);
+            let resolve = ResolveSet {
+                texture: set.resolve_texture,
+                level: set.resolve_level,
+                slice: set.resolve_slice,
+                depth_plane: set.resolve_depth_plane,
+                filter: set.stencil_resolve_filter,
+            };
             pass.stencil
-                .set(set.texture, (set.level, set.slice), actions);
+                .set(set.texture, (set.level, set.slice), actions, resolve);
             pass.clear_stencil = set.clear_stencil.unwrap_or(pass.clear_stencil);
         });
         crate::recorder::rec_done!(recorded_call, ());
@@ -657,9 +745,10 @@ mod tests {
     }
 
     /// A pass descriptor answers Metal's defaults and the actions set, raw; rt's descriptor takes
-    /// each value kept, and names an action Metal has none of or a level past 32 bits; a colour
-    /// attachment past the eighth raises at the subscript; a property rt has no field of is
-    /// counted where it is set to other than Metal's default.
+    /// each value kept, the resolves' among them, and names an action or resolve filter Metal has
+    /// none of or a level past 32 bits; a colour attachment past the eighth raises at the
+    /// subscript; a property rt has no field of is counted where it is set to other than Metal's
+    /// default.
     #[test]
     fn a_pass_keeps_what_rt_renders() {
         let pass = RtObj::new(PassFields::default());
@@ -679,10 +768,17 @@ mod tests {
         assert_eq!(d.depth_attachment.clear_depth, 1.0);
         assert_eq!(d.stencil_attachment.store_action, rt::StoreAction::DontCare);
         assert_eq!((d.render_target_width, d.render_target_height), (0, 0));
+        assert!(c.resolve_texture.is_none());
+        let depth_filter = d.depth_attachment.depth_resolve_filter;
+        assert_eq!(depth_filter, rt::MultisampleDepthResolveFilter::Sample0);
+        let stencil_filter = d.stencil_attachment.stencil_resolve_filter;
+        assert_eq!(stencil_filter, rt::MultisampleStencilResolveFilter::Sample0);
 
         let on = OnFault::Return;
         let red = ColorAttachmentSet {
             slice: Some(2),
+            resolve_level: Some(1),
+            resolve_depth_plane: Some(5),
             load_action: Some(2),
             store_action: Some(0),
             clear_color: Some(ClearColor {
@@ -697,11 +793,15 @@ mod tests {
             load_action: Some(1),
             store_action: Some(4),
             clear_depth: Some(0.5),
+            resolve_slice: Some(3),
+            depth_resolve_filter: Some(2),
             ..DepthAttachmentSet::default()
         });
         pass.set_stencil_attachment(&StencilAttachmentSet {
             level: Some(1),
             clear_stencil: Some(0x1ff),
+            resolve_level: Some(4),
+            stencil_resolve_filter: Some(1),
             ..StencilAttachmentSet::default()
         });
         pass.set_pass(&PassSet {
@@ -717,11 +817,19 @@ mod tests {
         assert_eq!(c.load_action, rt::LoadAction::Clear);
         assert_eq!(c.store_action, rt::StoreAction::DontCare);
         assert_eq!(c.clear_color, rt::ClearColor::new(1.0, 0.0, 0.0, 1.0));
+        let resolve = (c.resolve_level, c.resolve_slice, c.resolve_depth_plane);
+        assert_eq!(resolve, (1, 0, 5));
         assert_eq!(d.depth_attachment.load_action, rt::LoadAction::Load);
         assert_eq!(d.depth_attachment.store_action, rt::StoreAction::Unknown);
         assert_eq!(d.depth_attachment.clear_depth, 0.5);
+        let z = &d.depth_attachment;
+        assert_eq!((z.resolve_level, z.resolve_slice), (0, 3));
+        assert_eq!(z.depth_resolve_filter, rt::MultisampleDepthResolveFilter::Max);
         let s = &d.stencil_attachment;
         assert_eq!((s.level, s.clear_stencil), (1, 0x1ff));
+        assert_eq!((s.resolve_level, s.resolve_slice), (4, 0));
+        let stencil_filter = rt::MultisampleStencilResolveFilter::DepthResolvedSample;
+        assert_eq!(s.stencil_resolve_filter, stencil_filter);
         assert_eq!(
             (d.render_target_width, d.render_target_height),
             (64, u32::MAX)
@@ -744,6 +852,26 @@ mod tests {
             ..ColorAttachmentSet::default()
         };
         assert_eq!(pass.set_color_attachment(on, 3, &known), Ok(()));
+        for (filter, named) in [
+            (3, Some("the depth attachment's depth resolve filter 3")),
+            (0, None),
+        ] {
+            pass.set_depth_attachment(&DepthAttachmentSet {
+                depth_resolve_filter: Some(filter),
+                ..DepthAttachmentSet::default()
+            });
+            assert_eq!(pass.rt_pass().err().as_deref(), named);
+        }
+        for (filter, named) in [
+            (2, Some("the stencil attachment's stencil resolve filter 2")),
+            (0, None),
+        ] {
+            pass.set_stencil_attachment(&StencilAttachmentSet {
+                stencil_resolve_filter: Some(filter),
+                ..StencilAttachmentSet::default()
+            });
+            assert_eq!(pass.rt_pass().err().as_deref(), named);
+        }
         pass.set_depth_attachment(&DepthAttachmentSet {
             level: Some(1 << 32),
             ..DepthAttachmentSet::default()
