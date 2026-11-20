@@ -4,9 +4,10 @@
 //! A device is made from one config ([`GraphicsConfig`]) holding closures for its callbacks, and
 //! answers a [`Result`] with what refused it ([`Error`]). It is generic over the platform with
 //! [`DefaultPlatform`] as the default, so its forwarding is unit-tested on core's fake platform.
-//! The platform is the Vulkan platform, `VulkanPlatform`, over metal2vulkan's runtime, natively on
-//! Linux and Windows and on macOS over MoltenVK; it draws the device's
-//! window into a swapchain of its window, on macOS one over the window's `CAMetalLayer`.
+//! The platform is `RtPlatform`, over metal2vulkan-rt, on the host's Vulkan driver on Linux and
+//! Windows and on macOS on Mesa's KosmicKrisp; it draws the device's window into a swapchain of its
+//! window, on macOS one over the window's `CAMetalLayer`. The old platform, `VulkanPlatform` over
+//! metal2vulkan's old runtime, builds only without the `rt` feature, which is on by default.
 //!
 //! The library logs through the `log` crate: a Rust host installs its own logger.
 
@@ -58,11 +59,12 @@ pub use reims_vgpu_graphics::RawDoorbell;
 pub use reims_vgpu_vulkan::RtPlatform;
 pub use reims_vgpu_vulkan::VulkanPlatform;
 
-/// The platform every handle is made on by default: `VulkanPlatform`.
+/// The platform every handle is made on without the `rt` feature: the old platform,
+/// `VulkanPlatform`.
 #[cfg(not(feature = "rt"))]
 pub type DefaultPlatform = VulkanPlatform;
-/// The platform every handle is made on by default under the `rt` feature: `RtPlatform`, over
-/// metal2vulkan-rt.
+/// The platform every handle is made on by default (the `rt` feature, on by default):
+/// `RtPlatform`, over metal2vulkan-rt.
 #[cfg(feature = "rt")]
 pub type DefaultPlatform = RtPlatform;
 pub use reims_vgpu_window::{

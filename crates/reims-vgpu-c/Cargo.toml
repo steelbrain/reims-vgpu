@@ -14,15 +14,15 @@ license.workspace = true
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
-default = ["macos-sdl"]
+default = ["macos-sdl", "rt"]
 # SDL3's window on macOS (`reims-vgpu`'s `macos-sdl`), on by default: `--no-default-features`
 # builds the macOS library without SDL, its windows AppKit's alone.
 macos-sdl = ["reims-vgpu/macos-sdl"]
 # Kept for the builds that name it (`--features vulkan`): every handle is made on `VulkanPlatform`
 # with or without it (`Plat`, `lib.rs`).
 vulkan = ["reims-vgpu/vulkan"]
-# Every handle made on the platform over metal2vulkan-rt (`reims-vgpu`'s `rt`): a transition
-# switch, which goes at the cutover with the old runtime.
+# Every handle made on the platform over metal2vulkan-rt (`reims-vgpu`'s `rt`), on by default: the
+# library's platform. The old platform builds only without it, and goes with its code.
 rt = ["reims-vgpu/rt"]
 
 [dependencies]

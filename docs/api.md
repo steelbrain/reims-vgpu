@@ -345,7 +345,7 @@ Rust enum; the handle is a Rust struct cbindgen emits as opaque; the configs are
 
 `reims-vgpu` is the device; the C API wraps it one to one. Its rustdoc is the reference:
 - `GraphicsDevice<P = DefaultPlatform>`, made by `GraphicsDevice::new(GraphicsConfig)` on the
-  default platform (`VulkanPlatform`) or `with_platform`, so its
+  default platform (`RtPlatform`, over metal2vulkan-rt) or `with_platform`, so its
   forwarding is unit-tested on core's fake platform;
 - `GraphicsConfig`: `GraphicsCallbacks` (closures, `Arc<dyn Fn … + Send + Sync>`, each optional),
   an optional `WindowConfig`, the display count and the windows of displays 1 and up, an optional

@@ -8,7 +8,7 @@ publish.workspace = true
 license.workspace = true
 
 [features]
-default = ["macos-sdl"]
+default = ["macos-sdl", "rt"]
 # SDL3's window on macOS, the window crate's `macos-sdl`, which `REIMS_VGPU_WINDOW_IMPL=sdl` opens
 # in place of AppKit's. Without it the macOS library has no SDL, and its windows are AppKit's.
 # Linux's and Windows's window is SDL3's whatever this says.
@@ -19,7 +19,8 @@ testkit = ["reims-vgpu-vulkan/testkit"]
 # one, everywhere, so the feature changes nothing.
 vulkan = []
 # The platform over metal2vulkan-rt (`reims-vgpu-vulkan`'s `rt`, `platform/rt.rs`) as
-# `DefaultPlatform`: a transition switch, which goes at the cutover with the old runtime.
+# `DefaultPlatform`, on by default: the library's platform. The old platform, `VulkanPlatform`
+# over metal2vulkan-runtime, builds only without it, and goes with its code.
 rt = ["reims-vgpu-vulkan/rt"]
 
 [dependencies]
