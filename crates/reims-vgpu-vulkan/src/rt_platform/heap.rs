@@ -11,9 +11,11 @@
 //! [`buffer::ZEROED_BYTES_CODE`]), unless rt said the block read zero as it was taken (its
 //! `zeroed`, counted as `buffer::zero_skipped` counts), and any other heap over the host's
 //! memory is a range of rt's import of its pages (`super::buffer::import_pages`, counted as the
-//! no-copy buffers' imports are), its bytes as they are. A pin neither keeps is counted
-//! (`rt-gpu-address-unpinned`, `super::buffer`'s docs): the heap lies at rt's address. The heap's
-//! size is the descriptor's rounded up to 16 KiB, as Metal's is; the heap holds its block.
+//! no-copy buffers' imports are), its bytes as they are; of option bit 24 (read-only), of a copy
+//! of them whose GPU writes are dropped (`super::buffer`'s docs, "Read-only memory"). A pin
+//! neither keeps is counted (`rt-gpu-address-unpinned`, `super::buffer`'s docs): the heap lies at
+//! rt's address. The heap's size is the descriptor's rounded up to 16 KiB, as Metal's is; the heap
+//! holds its block.
 //!
 //! **What is placed in it.** A buffer is the heap's range at its offset (rt's `new_heap_buffer`,
 //! its bytes as they are, as Metal's heap buffers are); a texture is rt's image bound there (rt's
@@ -26,9 +28,10 @@
 //! is done at the granularity of the heap", `MTLHeap.h`), so within a command buffer a write
 //! through one orders every later use of another.
 //!
-//! **Answers.** A heap's resource options are the asked ones without bits 20 and 24 (bit 24
-//! counted, `rt-no-copy-read-only`), a heap's default hazard tracking resolved to untracked, as
-//! Metal's heaps answer it; its GPU address is its first byte's in the block.
+//! **Answers.** A heap's resource options are the asked ones without bits 20 and 24 (bit 24 counted
+//! as `rt-no-copy-read-only` where the GPU's writes reach the heap's bytes: in a block of its own,
+//! or pinned in a known block that drops no writes), a heap's default hazard tracking resolved to
+//! untracked, as Metal's heaps answer it; its GPU address is its first byte's in the block.
 //!
 //! **Refusals.** What Metal refuses is nil, counted as Metal's refusal (`rt-refused-metal`): a
 //! size of 0, an option value Metal has none of, a Managed or Memoryless heap, a heap over the
@@ -175,7 +178,7 @@ pub fn of_desc(device: &RtObj<RtDevice>, desc: &HeapDesc, held: u64) -> Option<R
             (zeroed(device, SEL, class, size)?, 0)
         }
     };
-    if read_only {
+    if read_only && !super::copied::drops(block.id) {
         buffer::read_only(SEL);
     }
     Some(heap(device, block, offset, size, placement, options))
@@ -245,10 +248,10 @@ pub fn over_host_memory(
             if let Some(pin) = pin {
                 unpinned(SEL, pin);
             }
-            buffer::import_pages(device, SEL, first, size, || {})?
+            buffer::import_pages(device, SEL, first, size, read_only, || {})?
         }
     };
-    if read_only {
+    if read_only && !super::copied::drops(block.id) {
         buffer::read_only(SEL);
     }
     Some(heap(device, block, offset, size, placement, options))

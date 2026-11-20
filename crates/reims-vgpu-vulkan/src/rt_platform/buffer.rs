@@ -54,10 +54,23 @@
 //! code's highest value ([`IMPORTS_LIVE_MOST_CODE`]); each again, with the most live at once,
 //! under the kind of the make that asked for it on its thread (`crate::answer::making_as`), or
 //! [`IMPORTS_UNNAMED`] where no make named one, so the kinds' counts sum to the total. Option bit
-//! 24 (read-only) is taken and answered without, as Metal does, but the GPU's writes reach the
-//! bytes, where Metal's GPU drops a kernel's and a blit's writes and faults a render pass's store
-//! (measured on the M3 Max, `crate::gpu::command`'s docs): counted ([`READ_ONLY_CODE`]), the
-//! process's first with a line.
+//! 24 (read-only) is taken and answered without, as Metal does ("Read-only memory").
+//!
+//! **Read-only memory.** Metal's GPU drops a kernel's and a blit's writes to a no-copy buffer or
+//! heap of option bit 24, and to the pages a guest process maps read-only, and the CPU and later
+//! command buffers read the pages' bytes (measured on the M3 Max, the 5300M and the UHD 630,
+//! `crate::gpu::command`'s docs); Vulkan has no memory that drops writes, and rt no read-only
+//! import. So such pages are imported as a copy whose GPU writes are dropped at each completion
+//! (`super::copied`, "Writes dropped"), never by their pointer or a dma-buf, which the GPU would
+//! write: a pages block's view its process maps read-only (`import_known`'s `read_only`), whose
+//! address the guest's buffers over the block are pinned in, and a buffer or heap of option bit 24
+//! with no pin, over a copy of its own. Each such import is counted ([`IMPORTS_READ_ONLY`]), and
+//! as a copy ([`IMPORTS_COPIED`]). A render pass's store into a texture over such a copy completes
+//! and is dropped with the copy's other writes, as the 5300M and the UHD 630 answer; the M3 Max
+//! faults it: counted at the pass ([`super::copied::STORE_OUTS_CODE`]). A buffer or heap of option
+//! bit 24 pinned in a known block that is no such copy stays there, at the guest's address, where
+//! the GPU's writes reach the bytes: counted ([`READ_ONLY_CODE`]), the process's first with a
+//! line.
 //!
 //! **Dma-bufs of the pages** (Linux). A GPU may take no pointer to some pages: RADV refuses the
 //! pages of a shared mapping of a memfd at the import, as the guest's RAM and the views of its
@@ -189,10 +202,16 @@ pub const IMPORTS_UNNAMED: crate::answer::MadeCodes = crate::answer::MadeCodes {
     live_most: "rt-imports-unnamed-live-most",
 };
 
-/// The code of a no-copy buffer or a heap of option bit 24, which is taken and answered without:
-/// the GPU's writes reach a no-copy buffer's bytes, where Metal's GPU drops a kernel's and a
-/// blit's writes and faults a render pass's store. Counted per buffer or heap.
+/// The code of a no-copy buffer or a heap of option bit 24 pinned in a known block that is no copy
+/// whose writes are dropped (the module's docs, "Read-only memory"): the GPU's writes reach its
+/// bytes, where Metal's GPU drops a kernel's and a blit's writes and faults a render pass's store.
+/// Counted per buffer or heap.
 pub const READ_ONLY_CODE: &str = "rt-no-copy-read-only";
+
+/// The code of an import of the host's memory made as a copy whose GPU writes are dropped, of
+/// read-only pages (the module's docs, "Read-only memory"), counted per import, each counted as
+/// [`IMPORTS_COPIED`] too.
+pub const IMPORTS_READ_ONLY: &str = "rt-imports-read-only";
 
 /// The code of an import of the host's memory made by its pointer (rt's `import_host_memory`),
 /// counted per import.
@@ -1040,11 +1059,15 @@ fn no_copy(
             {
                 unpinned(sel, pin);
             }
-            match device.known_blocks().mapping(first, length) {
+            // A read-only buffer with no pin kept lies over a copy of its own, which drops the
+            // GPU's writes ("Read-only memory").
+            let mapping = (!o.read_only).then(|| device.known_blocks().mapping(first, length));
+            match mapping.flatten() {
                 Some((block, offset)) => (block, offset, Some(Arc::clone(slot))),
                 None => {
                     let held = Arc::clone(slot);
-                    let made = import_pages(device, sel, first, length, move || run(&held));
+                    let then = move || run(&held);
+                    let made = import_pages(device, sel, first, length, o.read_only, then);
                     let (block, offset) = made?;
                     (block, offset, None)
                 }
@@ -1052,13 +1075,15 @@ fn no_copy(
         }
     };
     let copy = copy.map(|(block, offset)| (block.id, offset));
+    // In place in a known block whose writes are not dropped.
+    let in_place = o.read_only && !super::copied::drops(block.id);
     let (bytes, storage) = ((&block, offset), o.storage);
     // The deallocator is kept unrun before the import goes, whose release would run it.
     let Some(made) = range_of(device, sel, bytes, length, storage, zero_from, copy) else {
         keep_unrun(slot);
         return None;
     };
-    if o.read_only {
+    if in_place {
         read_only(sel);
     }
     Some(buffer_of(device, made, o.answered, false, deallocator))
@@ -1109,13 +1134,16 @@ fn range_of(
 /// bytes' offset in it. Where the GPU takes no pointer to the pages, on Linux, the import is of a
 /// dma-buf of the files behind them ("Dma-bufs of the pages"); the pages of a view mapped through
 /// dma-bufs go to rt as a dma-buf first, and by their pointer only once mapped from their files
-/// ("Pages no pin takes"). rt's release of the import runs `then`, after the import is freed.
-/// `None` where Metal or rt refuses it, counted, `then` dropped unrun.
+/// ("Pages no pin takes"). Pages whose GPU writes Metal drops (`read_only`) are imported as a
+/// copy that drops them, and never otherwise ("Read-only memory"). rt's release of the import runs
+/// `then`, after the import is freed. `None` where Metal or rt refuses it, counted, `then` dropped
+/// unrun.
 pub(super) fn import_pages(
     device: &RtObj<RtDevice>,
     sel: &'static str,
     first: HostPtr,
     length: u64,
+    read_only: bool,
     then: impl FnOnce() + Send + 'static,
 ) -> Option<(rt::Block, u64)> {
     let first = first.addr().to_u64();
@@ -1129,6 +1157,23 @@ pub(super) fn import_pages(
     let codes = crate::answer::making().unwrap_or(IMPORTS_UNNAMED);
     let len = end - start;
     let then: Then = Arc::new(Mutex::new(Some(Box::new(then))));
+    if read_only {
+        let why = "pages whose GPU writes are dropped";
+        let made = copied(
+            device,
+            sel,
+            codes,
+            (at, len),
+            &then,
+            &why,
+            true,
+            |uncopied| {
+                refused_uncopied(sel, uncopied);
+            },
+        )?;
+        crate::answer::count_kind(IMPORTS_READ_ONLY);
+        return Some(made_import(sel, codes, made, first - start));
+    }
     // Held from before the pages' mappings are asked about, so no fold maps them through dma-bufs
     // before rt takes their pointer, nor while rt holds it.
     let held = Held::of(at, len);
@@ -1405,7 +1450,7 @@ fn by_dma_buf(
     }
     count_refused(kind, len);
     let why = format!("metal2vulkan-rt refused their pointer: {error}");
-    copied(device, sel, codes, (at, len), then, &why, || {
+    copied(device, sel, codes, (at, len), then, &why, false, |_| {
         rt_refused_create(sel, error);
     })
 }
@@ -1576,15 +1621,29 @@ fn refused(
         refuse();
         return None;
     }
-    copied(device, sel, codes, (at, len), then, &no.why(), refuse)
+    copied(
+        device,
+        sel,
+        codes,
+        (at, len),
+        then,
+        &no.why(),
+        false,
+        |_| refuse(),
+    )
 }
 
 /// [`import_pages`]'s import of `pages`, the `len` bytes of whole pages at their address, for
 /// `sel`, for a make of `codes`, that rt took neither by their pointer nor as a dma-buf, `why` in
-/// words: as a copy (the module's docs, "A copy at the refusal point"), whose pages the device
-/// keeps for the block ([`KnownBlocks`]) until rt frees it, rt's release of it running `then`;
-/// counted ([`IMPORTS_COPIED`]), the process's first with a line. The block, and the offset of the
-/// pages' first byte in it. `None` where rt refuses the copy too, counted by `refuse`.
+/// words, or whose GPU writes are dropped (`drops`, "Read-only memory"): as a copy (the module's
+/// docs, "A copy at the refusal point"), whose pages the device keeps for the block
+/// ([`KnownBlocks`]) until rt frees it, rt's release of it running `then`; counted
+/// ([`IMPORTS_COPIED`]), the process's first with a line. The block, and the offset of the pages'
+/// first byte in it. `None` where no copy is made or rt refuses it, counted by `refuse`, given why.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the import's pages, make and release, and how the copy is made or refused"
+)]
 fn copied(
     device: &RtObj<RtDevice>,
     sel: &'static str,
@@ -1592,15 +1651,17 @@ fn copied(
     (at, len): (NonNull<u8>, u64),
     then: &Then,
     why: &dyn std::fmt::Display,
-    refuse: impl FnOnce(),
+    drops: bool,
+    refuse: impl FnOnce(&super::copied::Uncopied),
 ) -> Option<(rt::Block, u64)> {
     let homes = device.known_blocks().homes.clone();
     let id = Arc::new(OnceLock::new());
     let release = released(codes, then, Some((homes.clone(), Arc::clone(&id))));
     // SAFETY: the creators' `HostRange` contracts keep the bytes mapped until their deallocator
     // runs, which runs only from `then`, after the copy's release, once rt freed it; the pages
-    // they lie in are mapped readable and writable, as `by_pointer`'s are.
-    match unsafe { super::copied::import(device.rt(), (at, len), release) } {
+    // they lie in are mapped readable, as `by_pointer`'s are, and writable unless `drops`, where
+    // nothing writes them.
+    match unsafe { super::copied::import(device.rt(), (at, len), drops, release) } {
         Ok(block) => {
             let _ = id.set(block.id);
             (homes.0.lock()).insert(block.id, at.as_ptr().addr().to_u64());
@@ -1623,7 +1684,7 @@ fn copied(
                      pointer nor as a dma-buf ({why}), nor as a copy ({uncopied}): refused"
                 );
             }
-            refuse();
+            refuse(&uncopied);
             None
         }
     }
@@ -1634,6 +1695,19 @@ static COPIED_SAID: AtomicBool = AtomicBool::new(false);
 
 /// Whether the process logged its first copy refused ([`copied`]).
 static UNCOPIED_SAID: AtomicBool = AtomicBool::new(false);
+
+/// Counts the refusal of a copy of read-only pages for `sel` ([`import_pages`]), `uncopied` why:
+/// rt's refusal of its import, or the host's memory, a limit.
+fn refused_uncopied(sel: &'static str, uncopied: &super::copied::Uncopied) {
+    match uncopied {
+        super::copied::Uncopied::Rt(error) => {
+            rt_refused_create(sel, error);
+        }
+        super::copied::Uncopied::NoMemory => {
+            super::unbuilt::refused_as(sel, super::unbuilt::RtRefusal::Limit, uncopied);
+        }
+    }
+}
 
 /// Whether the process logged its first import made as a dma-buf.
 #[cfg(target_os = "linux")]
@@ -1689,7 +1763,8 @@ fn pointer_refused() -> Option<rt::Error> {
 }
 
 /// rt's import of the host's pages that hold the `length` bytes at `first`, as a no-copy buffer's
-/// is made and counted ([`import_pages`]), known to `device` from now (`KnownBlocks::know`): the
+/// is made and counted ([`import_pages`]), as a copy that drops the GPU's writes where `read_only`
+/// (the module's docs, "Read-only memory"), known to `device` from now (`KnownBlocks::know`): the
 /// block and the bytes' offset in it. A no-copy buffer over the bytes pinned at the block's
 /// address plus their offset is then that range of the block ("A pinned address"), with no import
 /// of its own. The caller forgets the block (`KnownBlocks::forget`) as the last such buffer goes;
@@ -1700,9 +1775,10 @@ pub fn import_known(
     sel: &'static str,
     first: HostPtr,
     length: u64,
+    read_only: bool,
     then: impl FnOnce() + Send + 'static,
 ) -> Option<(rt::Block, u64)> {
-    let (block, offset) = import_pages(device, sel, first, length, then)?;
+    let (block, offset) = import_pages(device, sel, first, length, read_only, then)?;
     device.known_blocks().know(block.clone());
     Some((block, offset))
 }
@@ -2179,10 +2255,12 @@ mod tests {
         assert!(waits_for(ran), "the deallocator ran");
         assert_eq!(crate::answer::live_now(IMPORTS_UNNAMED), 0);
 
-        // Through a descriptor, read-only: the deallocator takes the bytes and the length.
+        // Through a descriptor, read-only, with no pin: over a copy of its own whose GPU writes are
+        // dropped, which no in-place count counts; the deallocator takes the bytes and the length.
         let given = Arc::new(Mutex::new(None));
         let take = Arc::clone(&given);
         let read_only_before = counted(READ_ONLY_CODE);
+        let copies = (counted(IMPORTS_READ_ONLY), counted(IMPORTS_COPIED));
         // Made as a kind of make of the test's, which its import counts under.
         const MADE: crate::answer::MadeCodes = crate::answer::MadeCodes {
             made: "rt-imports-test",
@@ -2211,7 +2289,9 @@ mod tests {
         assert_eq!(counted(IMPORTS_CODE), imports + 1);
         assert_eq!(counted(MADE.made), 1);
         assert_eq!(counted(IMPORTS_UNNAMED.made), unnamed);
-        assert_eq!(counted(READ_ONLY_CODE), read_only_before + 1);
+        assert_eq!(counted(READ_ONLY_CODE), read_only_before);
+        let copies_now = (counted(IMPORTS_READ_ONLY), counted(IMPORTS_COPIED));
+        assert_eq!(copies_now, (copies.0 + 1, copies.1 + 1));
         drop(buffer);
         assert!(waits_for(|| given.lock().is_some()));
         assert_eq!(*given.lock(), Some((at.addr(), 1000)));
@@ -2880,7 +2960,7 @@ mod tests {
         // block, with no import of its own; so is a Managed one, counted.
         let at = pages.wrapping_add(2 * page + 32);
         let (released, then) = flag();
-        let known = import_known(&device, "a test's import", at, 256, then);
+        let known = import_known(&device, "a test's import", at, 256, false, then);
         let (block, offset) = known.expect("a known import, as the buffer's above");
         let mapped = device.known_blocks().contents_of(&block);
         assert_eq!(block.contents, None);
@@ -3352,7 +3432,7 @@ mod tests {
         // is a range of its block, with no import of its own.
         let first = at.wrapping_add(2 * page + 32);
         let (released, then) = flag();
-        let known = import_known(&device, "a test's import", first, 256, then);
+        let known = import_known(&device, "a test's import", first, 256, false, then);
         let (block, offset) = known.expect("a known import over a copy");
         let home = device.known_blocks().contents_of(&block);
         assert_eq!(home.map(|home| home + offset), Some(first.addr().to_u64()));
@@ -3379,5 +3459,144 @@ mod tests {
             "the deallocator ran"
         );
         assert_eq!(device.known_blocks().homes.of(id), None);
+    }
+
+    /// On the GPU the test holds: a no-copy buffer of option bit 24 (read-only) with no pin lies
+    /// over a copy of its own whose GPU writes are dropped ("Read-only memory"), counted as such
+    /// and not as one whose writes reach its bytes. A blit's fill and copy into it complete, and
+    /// once their command buffer completed the pages hold the CPU's bytes alone, as after
+    /// Metal's; a later command buffer reads those, a CPU write made before its commit among them.
+    /// A render pass that stores into a texture over it completes with its store dropped too,
+    /// counted at the pass, as the 5300M and the UHD 630 answer
+    #[test]
+    fn read_only_copies_drop_the_gpu_s_writes_on_vulkan() {
+        use super::super::copied::{DROPPED_BYTES_CODE, STORE_OUTS_CODE};
+        use crate::core::num::ToUsize as _;
+        use crate::core::platform::descriptor::RenderPassDescriptor as _;
+        use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+        use crate::core::platform::types::{ClearColor, CommandBufferStatus, NsRange};
+        use crate::core::platform::values::ColorAttachmentSet;
+        use crate::rt_platform::PassFields;
+
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let page = device.facts().page_size;
+        let layout = Layout::from_size_align((2 * page).to_usize(), page.to_usize());
+        let layout = layout.expect("a layout");
+        // SAFETY: the layout's size is not 0.
+        let memory = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!memory.is_null());
+        let at = HostPtr::from_ptr(memory);
+        // SAFETY: the test's own memory, freed once the deallocator ran.
+        unsafe { memory.write_bytes(0x11, (2 * page).to_usize()) };
+        let in_place = counted(READ_ONLY_CODE);
+        let copies = (counted(IMPORTS_READ_ONLY), counted(IMPORTS_COPIED));
+        let freed = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&freed);
+        // SAFETY: the memory stays allocated until the deallocator ran (below).
+        let bytes = unsafe { HostRange::new(at, 2 * page) };
+        let made = device.new_buffer(BufferDesc {
+            length: 2 * page,
+            options: vec![OptionSet::ResourceOptions(READ_ONLY)],
+            pinned_gpu_address: None,
+            contents: Some(bytes),
+            no_copy: true,
+            deallocator: Some(Box::new(move |_, _| done.store(true, Ordering::Release))),
+            zero_from: None,
+        });
+        let buffer = made
+            .expect("never a raise")
+            .expect("a read-only no-copy buffer");
+        assert_eq!(buffer.contents(), at);
+        assert_eq!(counted(READ_ONLY_CODE), in_place, "none in place");
+        let copies_now = (counted(IMPORTS_READ_ONLY), counted(IMPORTS_COPIED));
+        assert_eq!(copies_now, (copies.0 + 1, copies.1 + 1));
+
+        // A fill of its first 64 bytes and a copy of 0x77s into the next 64: both dropped.
+        let queue = device.new_command_queue().expect("a command queue");
+        let of = |length| device.new_buffer_of_length(on, length, 0);
+        let of = |length| of(length).expect("never a raise").expect("a buffer");
+        let (source, out) = (of(64), of(128));
+        // SAFETY: the Shared buffer's 64 bytes, mapped while it lives.
+        unsafe { source.contents().as_ptr::<u8>().write_bytes(0x77, 64) };
+        let dropped = counted(DROPPED_BYTES_CODE);
+        let fill = BlitCmd::FillBuffer {
+            buffer: &buffer,
+            range: NsRange::new(0, 64),
+            value: 0x55,
+        };
+        let copy = BlitCmd::CopyBufferToBuffer {
+            source_buffer: Some(&source),
+            source_offset: 0,
+            destination_buffer: Some(&buffer),
+            destination_offset: 64,
+            size: 64,
+        };
+        blit_and_wait(&queue, vec![fill, copy]);
+        assert_eq!(read(at, 128), [0x11; 128], "the pages as the CPU left them");
+        assert!(
+            counted(DROPPED_BYTES_CODE) > dropped,
+            "the GPU's bytes put back"
+        );
+
+        // The CPU writes 0x22s at 128; a later command buffer reads them beside the dropped bytes.
+        // SAFETY: inside the test's memory.
+        unsafe { memory.wrapping_add(128).write_bytes(0x22, 64) };
+        let copy = BlitCmd::CopyBufferToBuffer {
+            source_buffer: Some(&buffer),
+            source_offset: 64,
+            destination_buffer: Some(&out),
+            destination_offset: 0,
+            size: 128,
+        };
+        blit_and_wait(&queue, vec![copy]);
+        assert_eq!(read(out.contents(), 128), [[0x11; 64], [0x22; 64]].concat());
+
+        // A render pass that clears and stores a texture over the second page: it completes, its
+        // store dropped, counted at the pass.
+        let descriptor = platform.texture_descriptor(&TextureDesc {
+            width: 64,
+            height: 4,
+            usage: 0x4,
+            ..TextureDesc::default()
+        });
+        let texture = buffer.new_texture(on, &descriptor, page, 256);
+        let texture = texture
+            .expect("never a raise")
+            .expect("a texture over the buffer");
+        let pass = RtObj::new(PassFields::default());
+        let set = ColorAttachmentSet {
+            texture: Some(Some(&texture)),
+            load_action: Some(2),
+            store_action: Some(1),
+            clear_color: Some(ClearColor {
+                red: 1.0,
+                alpha: 1.0,
+                ..ClearColor::default()
+            }),
+            ..ColorAttachmentSet::default()
+        };
+        assert_eq!(pass.set_color_attachment(on, 0, &set), Ok(()));
+        let store_outs = counted(STORE_OUTS_CODE);
+        let commands = queue.command_buffer(on).expect("never a raise");
+        let commands = commands.expect("a command buffer");
+        let encoder = commands.render_encoder(on, &pass).expect("never a raise");
+        let encoder = encoder.expect("a render encoder");
+        assert_eq!(counted(STORE_OUTS_CODE), store_outs + 1);
+        assert_eq!(encoder.encode(on, RenderCmd::EndEncoding), Ok(()));
+        assert_eq!(commands.commit(on), Ok(()));
+        assert_eq!(commands.wait_until_completed(on), Ok(()));
+        assert_eq!(commands.status(), CommandBufferStatus::COMPLETED);
+        let second = at.wrapping_add(page);
+        assert_eq!(read(second, 1024), [0x11; 1024], "the store dropped");
+
+        drop((encoder, commands, pass, texture, buffer));
+        assert!(
+            waits_for(|| freed.load(Ordering::Acquire)),
+            "the deallocator ran"
+        );
+        // SAFETY: the deallocator ran: rt holds no copy of the memory.
+        unsafe { std::alloc::dealloc(memory, layout) };
     }
 }

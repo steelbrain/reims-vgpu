@@ -25,16 +25,18 @@ use crate::GuestArch;
 use crate::memory::MemoryMap;
 
 /// A platform's import of a pages block's view as a block it knows
-/// ([`ApiPlatform::view_imports`]): given the device, the view's first byte, on a host page, and
-/// its length, and what runs once the platform freed the import (which holds the view's mapping
-/// until then), the import's GPU address, at the view's first byte, and what forgets the block,
-/// which runs as the last buffer over the view at that address goes. `None` where the platform
-/// refuses it, counted.
+/// ([`ApiPlatform::view_imports`]): given the device, the view's first byte, on a host page, its
+/// length, whether the block's process maps its pages read-only (the import then drops the GPU's
+/// writes to them, as Metal's GPU does), and what runs once the platform freed the import (which
+/// holds the view's mapping until then), the import's GPU address, at the view's first byte, and
+/// what forgets the block, which runs as the last buffer over the view at that address goes.
+/// `None` where the platform refuses it, counted.
 pub type ViewImports<P> = Arc<
     dyn Fn(
             &<P as Platform>::Device,
             HostPtr,
             u64,
+            bool,
             Box<dyn FnOnce() + Send>,
         ) -> Option<(u64, Box<dyn FnOnce() + Send>)>
         + Send

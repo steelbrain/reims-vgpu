@@ -637,6 +637,8 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                         for target in &targets {
                             kept.uses().add_made(&target.made, Use::Rendered);
                         }
+                        let blocks = targets.iter().filter_map(|t| t.made.block());
+                        super::copied::store_outs(sel, blocks);
                         for tiled in render_pass_descriptor.tiled() {
                             kept.takes().used_tiled(&tiled);
                         }

@@ -577,7 +577,10 @@ pub const RGFX_FEATURE_PRIVATE_BLOCKS: u64 = 0x1000_0000_0000_0000;
 /// buffer made over the block, which then reaches the block's pages for the buffers made over the
 /// same bytes after it until the block's release. A block of pages its process maps read-only
 /// ([`RGFX_SURFACE_PAGES_READ_ONLY`]) is given none there: its buffers lie over copies of the
-/// pages. Every host offers it; the x86-64 and arm64e kexts take it.
+/// pages. On metal2vulkan-rt's device such a block is given the address of a copy of its pages,
+/// whose GPU writes are dropped as each command buffer completes, as Metal drops a GPU write to
+/// memory mapped read-only, so the pages keep the bytes their process wrote. Every host offers
+/// it; the x86-64 and arm64e kexts take it.
 pub const RGFX_FEATURE_IMPORT_ADDRESSES: u64 = 0x2000_0000_0000_0000;
 /// `FEATURES_HI` bit 30, feature bit 62, `SURFACE_CACHE_EVERY`, which the guest takes through
 /// [`RGFX_REG_DRIVER_FEATURES_HI`], beside [`RGFX_FEATURE_SURFACE_PAGES`]: the host's GPU form of

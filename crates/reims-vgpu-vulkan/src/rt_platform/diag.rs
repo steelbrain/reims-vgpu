@@ -155,6 +155,8 @@ pub struct Made {
     slice: u32,
     /// Where it lies over an imported block: what of it rt copies.
     over: Option<Over>,
+    /// The block of the buffer it lies over; a view's, its texture's; `None` for any other.
+    block: Option<rt::BlockId>,
     /// A guest surface texture's plane ([`surface_texture`]).
     on_plane: OnceLock<OnPlane>,
     /// It is a view of a guest surface texture, or of a view of one ([`plane_view`]).
@@ -189,7 +191,7 @@ impl Made {
             call == Call::SurfaceImage,
             shape,
             (0, 0),
-            None,
+            (None, None),
         )
     }
 
@@ -210,12 +212,17 @@ impl Made {
             of.surface,
             &shape,
             (level, slice),
-            None,
+            (None, of.block),
         );
         if of.of_a_plane() {
             made.of_plane.store(true, Relaxed);
         }
         made
+    }
+
+    /// The block of the buffer it lies over, a view's its texture's: `None` for any other.
+    pub fn block(&self) -> Option<rt::BlockId> {
+        self.block
     }
 
     /// Whether it is a guest surface texture, or a view of one ([`plane_view`]).
@@ -234,7 +241,16 @@ impl Made {
         let id = NEXT.fetch_add(1, Relaxed);
         let image = buffer.gpu_address() | (1 << 63);
         let over = Over::of(buffer, shape, offset, bytes_per_row);
-        Made::of(id, image, Call::OverBuffer, false, shape, (0, 0), over)
+        let block = Some(buffer.block());
+        Made::of(
+            id,
+            image,
+            Call::OverBuffer,
+            false,
+            shape,
+            (0, 0),
+            (over, block),
+        )
     }
 
     fn of(
@@ -244,7 +260,7 @@ impl Made {
         surface: bool,
         shape: &Shape,
         (level, slice): (u32, u32),
-        over: Option<Over>,
+        (over, block): (Option<Over>, Option<rt::BlockId>),
     ) -> Arc<Made> {
         Arc::new(Made {
             id,
@@ -260,6 +276,7 @@ impl Made {
             level,
             slice,
             over,
+            block,
             on_plane: OnceLock::new(),
             of_plane: AtomicBool::new(false),
         })
