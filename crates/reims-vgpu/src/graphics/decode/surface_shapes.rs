@@ -388,6 +388,8 @@ mod tests {
     use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
 
     use reims_vgpu_vulkan::core::platform::types::MtlSize;
+    #[cfg(unix)]
+    use reims_vgpu_vulkan::core::platform::values::PagesPlane;
     use reims_vgpu_vulkan::core::sync::Mutex;
 
     use super::super::surface_cache::tests::{
@@ -1868,6 +1870,298 @@ mod tests {
             fills(&r.p.call_log().since(mark)).is_empty(),
             "nothing owed"
         );
+    }
+
+    /// NV12's planes as CoreVideo lays them in four pages, luma from 0x20 and chroma after its
+    /// rows: as the kext lays them out, and as a decode writes them whole.
+    #[cfg(unix)]
+    fn nv12_planes() -> [PagesPlane; 2] {
+        let luma = PagesPlane {
+            offset: 0x20,
+            bytes_per_row: 512,
+            row_bytes: 480,
+            rows: 16,
+        };
+        let chroma = PagesPlane {
+            offset: 0x20 + 16 * 512,
+            rows: 8,
+            ..luma
+        };
+        [luma, chroma]
+    }
+
+    /// [`shaped`]'s rig over a cache made for the host's video, a dma-buf of [`nv12_planes`] in
+    /// four pages, whose platform makes the planes' surface (`surface_cache::exported`): buffer
+    /// 10 is the cache.
+    #[cfg(unix)]
+    fn video_shaped() -> Rig {
+        use reims_vgpu_graphics::wire::{RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout};
+        use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
+        let mut layout = RgfxSurfacePagesLayout {
+            plane_count: 2,
+            ..Default::default()
+        };
+        for (laid, plane) in layout.planes.iter_mut().zip(nv12_planes()) {
+            *laid = RgfxSurfacePlaneLayout {
+                offset: plane.offset,
+                bytes_per_row: plane.bytes_per_row,
+                row_bytes: plane.row_bytes,
+                rows: plane.rows,
+            };
+        }
+        let mut r = rig(16);
+        let page = r.page;
+        take_shapes(&r);
+        r.dec.set_unified_memory(true);
+        r.dec.set_dma_buf_caches();
+        let world = Arc::clone(r.p.world());
+        world.answer_surface_pages(PagesInPlace::No("off the device's alignment".into()));
+        world.give_exported_surfaces(true);
+        r.dec.hold_resource_ids(0, 1);
+        assert_eq!(
+            r.pages_asking(BLOCK, &[(1, 4)], 4 * page, Some(layout)),
+            RGFX_STATUS_CACHE
+        );
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 4)], 4 * page, true),
+            RGFX_STATUS_OK
+        );
+        queues(&mut r);
+        assert_eq!(r.buffer(10, BLOCK, 4 * page), Ok(()));
+        r
+    }
+
+    /// Texture `obj_id` over buffer 10 that shows plane `plane` of [`nv12_planes`] whole, as a
+    /// decode's luma (`R8Unorm`) or chroma (`RG8Unorm`) texture: the image of its shape. The
+    /// rig's device describes every pixel format with the plane's texel bytes from then on,
+    /// where the fake's own answer is four.
+    #[cfg(unix)]
+    fn plane_texture(r: &mut Rig, obj_id: u64, plane: u32) -> u64 {
+        use reims_vgpu_graphics::wire::RgfxTextureFromIOSurface;
+        use reims_vgpu_vulkan::core::platform::types::PixelFormatInfo;
+        use zerocopy::{FromBytes as _, IntoBytes as _};
+        let texel = u64::from(plane + 1);
+        let info = PixelFormatInfo {
+            name: Some(["MTLPixelFormatR8Unorm", "MTLPixelFormatRG8Unorm"][plane as usize].into()),
+            block_bytes: texel,
+            block_width: 1,
+            block_height: 1,
+            block_depth: 1,
+            ..PixelFormatInfo::default()
+        };
+        r.p.script().clear();
+        (r.p.script()).always("MTLPixelFormatGetInfoForDevice()", Step::value(info));
+        let laid = nv12_planes()[plane as usize];
+        let width = laid.row_bytes / texel;
+        let format = [10, 30][plane as usize];
+        let size = (width as u32, laid.rows as u32);
+        let bytes = surface_texture_as(obj_id, 10, format, size, (1, 0));
+        let mut m = RgfxTextureFromIOSurface::read_from_bytes(&bytes).unwrap();
+        m.offset = laid.offset;
+        m.bytes_per_row = laid.bytes_per_row;
+        m.plane = plane;
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.dec.decode(&r.device, m.as_bytes()).unwrap(), Ok(()));
+        views(&r.p.call_log().since(mark))[0].0
+    }
+
+    /// The (buffer, image) of each fill of a shape in `calls`.
+    #[cfg(unix)]
+    fn filled_images(calls: &[Call]) -> Vec<(u64, u64)> {
+        fills(calls).into_iter().map(|(b, _, i)| (b, i)).collect()
+    }
+
+    /// A video cache's planes (`surface_cache::exported`) take their fill from the cache's buffer
+    /// as the first texture over either is made, which makes them: on the transfer queue,
+    /// committed, with no wait on the CPU, counted as filled at their make. A texture over the
+    /// other plane fills nothing, and the decode's begin owes the planes no fill
+    #[cfg(unix)]
+    #[test]
+    fn a_video_caches_planes_take_their_fill_at_their_make() {
+        use super::super::surface_cache::Reach;
+        use reims_vgpu_vulkan::core::testkit::impls::device::EXPORTED_SURFACE_PLANE;
+        let mut r = video_shaped();
+        let cache = cache_id(&r);
+        let mark = r.p.call_log().mark();
+        let luma = plane_texture(&mut r, 21, 0);
+        let calls = r.p.call_log().since(mark);
+        let sels: Vec<&str> = calls.iter().map(|c| c.sel).collect();
+        let surfaces = sels
+            .iter()
+            .filter(|&&s| s == EXPORTED_SURFACE_PLANE)
+            .count();
+        assert_eq!(surfaces, 2, "the surface's planes: {sels:?}");
+        let filled = filled_images(&calls);
+        assert_eq!(filled.len(), 2, "both planes: {filled:?}");
+        assert_eq!(filled[0], (cache, luma), "luma's from the buffer");
+        let chroma = filled[1].1;
+        assert!(
+            filled[1].0 == cache && chroma != luma,
+            "chroma's: {filled:?}"
+        );
+        assert!(
+            first(&calls, FILL) < first(&calls, "commit"),
+            "committed: {sels:?}"
+        );
+        assert!(!sels.contains(&"waitUntilCompleted"), "no wait: {sels:?}");
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.planes_filled_at_make, counts.plane_fills), (2, 2));
+        assert_eq!(counts.planes_owed_busy, 0);
+
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            plane_texture(&mut r, 22, 1),
+            chroma,
+            "the chroma plane's image"
+        );
+        assert!(fills(&r.p.call_log().since(mark)).is_empty());
+
+        let queue = r.device.new_command_queue().unwrap();
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        let decode = Reach {
+            video: true,
+            decoded: vec![(BLOCK, nv12_planes())],
+            ..Reach::default()
+        };
+        let writes = [RgfxOpSurfaceUse {
+            flags: RGFX_SURFACE_USE_WRITES,
+            ..reading(BLOCK, 0)[0]
+        }];
+        let mark = r.p.call_log().mark();
+        let (_, uses) = (r.dec.surface_caches)
+            .before(&r.device, &cb, &writes, &decode)
+            .unwrap();
+        let calls = r.p.call_log().since(mark);
+        assert!(fills(&calls).is_empty(), "none at the decode's begin");
+        assert!(copies(&calls).is_empty(), "the decode takes the first fill");
+        (r.dec.surface_caches)
+            .finish(&r.device, 1, None, &cb, uses.unwrap(), || cb.commit(ON))
+            .unwrap();
+        r.p.world().complete_all(CompleteOn::Caller);
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!(
+            (counts.planes_filled_at_make, counts.plane_fills),
+            (2, 2),
+            "none at a later use"
+        );
+    }
+
+    /// A picture smaller than its planes leaves the rest of them holding the cache's zeros, as a
+    /// new IOSurface reads: the cache's buffer took its zeros at its make, and nothing of the
+    /// pages since, as the decode takes the surface's first fill; the planes took the buffer at
+    /// their make, after the zeros, on the same queue; the decode op's wait on its thread for
+    /// the cache's last fill lasts until that fill is done, so the hardware's picture lands over
+    /// it; and its command buffer leaves the planes owing nothing, so no use after it fills them
+    /// from the buffer again. The fake holds no texels: the order pins the bytes
+    #[cfg(unix)]
+    #[test]
+    fn a_picture_smaller_than_its_planes_leaves_the_rest_reading_zeros() {
+        use super::super::surface_cache::Reach;
+        let mut r = video_shaped();
+        let cache = cache_id(&r);
+        let luma = plane_texture(&mut r, 21, 0);
+        let chroma = plane_texture(&mut r, 22, 1);
+        let queue = r.device.new_command_queue().unwrap();
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        let decode = Reach {
+            video: true,
+            decoded: vec![(BLOCK, nv12_planes())],
+            ..Reach::default()
+        };
+        let writes = [RgfxOpSurfaceUse {
+            flags: RGFX_SURFACE_USE_WRITES,
+            ..reading(BLOCK, 0)[0]
+        }];
+        let (_, uses) = (r.dec.surface_caches)
+            .before(&r.device, &cb, &writes, &decode)
+            .unwrap();
+        // The decode op, on its thread.
+        let mut short = || true;
+        let now = || reims_vgpu_vulkan::core::platform::os::clock::MonoTime::from_nanos(0);
+        assert!(
+            !r.dec.surface_caches.wait_filled(BLOCK, &mut short, &now),
+            "the planes' fill not done: the wait goes on"
+        );
+        assert_eq!(r.dec.caches().counts().shapes.video_fill_waits, 1);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(r.dec.surface_caches.wait_filled(BLOCK, &mut short, &now));
+        assert!(
+            r.dec.surface_caches.surface_targets(BLOCK).is_some(),
+            "the picture lands in the planes"
+        );
+        (r.dec.surface_caches)
+            .finish(&r.device, 1, None, &cb, uses.unwrap(), || cb.commit(ON))
+            .unwrap();
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, false)]);
+        assert!(
+            fills(&r.p.call_log().since(mark)).is_empty(),
+            "the planes hold the picture, and the zeros beside it"
+        );
+
+        let calls = r.p.call_log().since(0);
+        let id = |a: &Arg| a.as_obj().map_or(0, |o| o.0);
+        let zeros = (calls.iter())
+            .position(|c| c.sel == "fillBuffer:range:value:" && id(&c.args[0]) == cache)
+            .expect("the cache's zeros at its make");
+        assert_eq!(filled_images(&calls), [(cache, luma), (cache, chroma)]);
+        assert!(
+            first(&calls, FILL) > zeros,
+            "the planes' fill after the zeros"
+        );
+        let into_cache: Vec<_> = (copies(&calls).into_iter())
+            .filter(|&(_, to)| to == cache)
+            .collect();
+        assert!(
+            into_cache.is_empty(),
+            "nothing of the pages: {into_cache:?}"
+        );
+        let counts = r.dec.caches().counts();
+        assert_eq!(counts.decode_firsts, 1, "the decode took the first fill");
+        assert_eq!(
+            (counts.shapes.planes_landed, counts.shapes.plane_fills),
+            (1, 2)
+        );
+    }
+
+    /// A video cache's planes made while a command buffer begun and not finished uses the cache
+    /// owe their fill to its next use, counted, as a placed image's make finds the cache busy
+    /// (`shapes`, "Placed images"): that use fills them, counted as filled at a later use
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_video_caches_planes_owe_their_fill_to_its_next_use() {
+        let mut r = video_shaped();
+        let cache = cache_id(&r);
+        let queue = r.device.new_command_queue().unwrap();
+        let reader = queue.command_buffer(ON).unwrap().unwrap();
+        let (_, uses) = (r.dec.surface_caches)
+            .before(&r.device, &reader, &reading(BLOCK, 0), &NO_REACH)
+            .unwrap();
+        let mark = r.p.call_log().mark();
+        let luma = plane_texture(&mut r, 21, 0);
+        assert!(
+            fills(&r.p.call_log().since(mark)).is_empty(),
+            "none while a command buffer uses the cache"
+        );
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!(
+            (counts.planes_filled_at_make, counts.planes_owed_busy),
+            (0, 1)
+        );
+        (r.dec.surface_caches)
+            .finish(&r.device, 1, None, &reader, uses.unwrap(), || {
+                reader.commit(ON)
+            })
+            .unwrap();
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, false)]);
+        let filled = filled_images(&r.p.call_log().since(mark));
+        assert_eq!(filled.len(), 2, "both planes at the next use: {filled:?}");
+        assert!(filled.contains(&(cache, luma)), "{filled:?}");
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.planes_filled_at_make, counts.plane_fills), (0, 2));
     }
 
     /// Library 30 and compute pipeline `obj_id` of a function in it.

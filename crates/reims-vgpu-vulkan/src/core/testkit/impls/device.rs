@@ -55,6 +55,81 @@ pub const DMA_BUF_BUFFER: &str = "newBufferWithLength:options: (dma-buf, padding
 /// selector of Metal's names it.
 pub const EXPORTABLE_BUFFER: &str = "newBufferWithLength:options: (exportable)";
 
+/// The name the fake logs and scripts each plane's texture of `GpuDevice::new_exported_surface`
+/// under, where its world makes such surfaces ([`World::give_exported_surfaces`]), with the
+/// plane's pixel format, width, height and usage: no selector of Metal's names it.
+///
+/// [`World::give_exported_surfaces`]: crate::core::testkit::objects::World::give_exported_surfaces
+#[cfg(unix)]
+pub const EXPORTED_SURFACE_PLANE: &str = "newExportedSurface (a plane)";
+
+/// What the fake's exported surface lies in ([`EXPORTED_SURFACE_PLANE`]): memory that exports
+/// nothing, its planes in place, laid at the description's pitch and starts.
+#[cfg(unix)]
+struct FakeSurfaceMemory {
+    handle: crate::core::platform::resource::SurfaceHandle,
+    layout: Vec<crate::core::platform::resource::SurfacePlaneLayout>,
+}
+
+#[cfg(unix)]
+impl FakeSurfaceMemory {
+    /// The memory of `desc`'s planes: one pitch, the widest plane's row rounded up to its
+    /// multiple, the first plane at 0 and each after it on its start multiple past the one
+    /// before and its rows of room.
+    fn of(desc: &crate::core::platform::resource::SurfaceDesc<'_>) -> Self {
+        use crate::core::platform::resource::SurfacePlaneLayout;
+        // `MTLPixelFormatR8Unorm`, `RG8Unorm`, `R16Unorm` and `RG16Unorm`'s texel bytes; 4 for
+        // any other.
+        let texel = |format: u64| match format {
+            10 => 1,
+            30 | 20 => 2,
+            _ => 4,
+        };
+        let row =
+            |p: &crate::core::platform::resource::SurfacePlaneDesc| p.width * texel(p.pixel_format);
+        let widest = desc.planes.iter().map(row).max().unwrap_or(0);
+        let pitch = widest.next_multiple_of(desc.pitch_multiple.max(1));
+        let mut offset: u64 = 0;
+        let layout = (desc.planes.iter())
+            .map(|p| {
+                let at = offset.next_multiple_of(desc.start_multiple.max(1));
+                offset = at + pitch * (p.height + u64::from(p.rows_below));
+                SurfacePlaneLayout {
+                    offset: at,
+                    row_pitch: pitch,
+                }
+            })
+            .collect();
+        FakeSurfaceMemory {
+            handle: desc.handle,
+            layout,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl crate::core::platform::resource::SurfaceMemory for FakeSurfaceMemory {
+    fn export(&self) -> Result<crate::core::platform::resource::ExportedMemory, String> {
+        Err("the fake's surface exports no memory".to_owned())
+    }
+
+    fn external_writes_done(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn handle(&self) -> crate::core::platform::resource::SurfaceHandle {
+        self.handle
+    }
+
+    fn in_place(&self) -> bool {
+        true
+    }
+
+    fn layout(&self) -> &[crate::core::platform::resource::SurfacePlaneLayout] {
+        &self.layout
+    }
+}
+
 /// The name the fake logs and scripts [`GpuDevice::new_deferred_buffer_of_length`] under: no
 /// selector of Metal's names it.
 pub const DEFERRED_BUFFER: &str = "newBufferWithLength:options: (deferred)";
@@ -298,6 +373,50 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
             ],
             |w| new_buffer(w, length, options, Backing::Fresh, None),
         )
+    }
+
+    /// `None`, unlogged, as the platform's default, unless the world makes such surfaces
+    /// ([`World::give_exported_surfaces`]): then each plane a Private texture of the plane's
+    /// format, size and usage, logged and scripted under [`EXPORTED_SURFACE_PLANE`], in memory
+    /// that exports nothing ([`FakeSurfaceMemory`]); `None` where a plane's make answers none.
+    ///
+    /// [`World::give_exported_surfaces`]: crate::core::testkit::objects::World::give_exported_surfaces
+    #[cfg(unix)]
+    fn new_exported_surface(
+        &self,
+        on: OnFault,
+        desc: &crate::core::platform::resource::SurfaceDesc<'_>,
+    ) -> RaiseResult<Option<crate::core::platform::resource::ExportedSurface<FakePlatform>>> {
+        if !self.world().gives_exported_surfaces() {
+            return Ok(None);
+        }
+        let mut planes = Vec::with_capacity(desc.planes.len());
+        for plane in desc.planes {
+            let texture = super::super::objects::TexDesc {
+                pixel_format: plane.pixel_format,
+                width: plane.width,
+                height: plane.height,
+                usage: plane.usage,
+                resource_options: 2 << 4,
+                ..super::super::objects::TexDesc::default()
+            };
+            let args = [plane.pixel_format, plane.width, plane.height, plane.usage];
+            let made = self.make(
+                Policy::On(on),
+                EXPORTED_SURFACE_PLANE,
+                args.iter().copied().map(Arg::U64).collect(),
+                |w| Some(new_texture(w, texture, None, false)),
+            )?;
+            let Some(made) = made else {
+                return Ok(None);
+            };
+            planes.push(made);
+        }
+        let memory = Arc::new(FakeSurfaceMemory::of(desc));
+        Ok(Some(crate::core::platform::resource::ExportedSurface {
+            planes,
+            memory,
+        }))
     }
 
     fn new_command_queue(&self) -> Option<<FakePlatform as Platform>::CommandQueue> {

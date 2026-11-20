@@ -153,7 +153,19 @@
 //! every other shape owing a fill ([`ShapeTable::owe_but_planes`]), and, while the cache's buffer
 //! is a copy of its own, the plane shapes dirty, so the copies out and the fills of the others
 //! take the picture from them (rule 3). The bound never drops a plane shape, referenced or not,
-//! and rule 1 copies a write through another shape of the plane into it.
+//! and rule 1 copies a write through another shape of the plane into it. The surface's memory
+//! holds undefined bytes at its make, so the planes take their fill from the buffer then, at the
+//! texture's make, as a placed image does, where no command buffer begun and not finished uses
+//! the cache and no copy of it waits (`super::exported`, counted
+//! [`ShapeCounts::planes_filled_at_make`]); a decode's begin then owes none, and its wait for the
+//! cache's last fill finds that fill made ahead of it. A busy cache's planes owe theirs to its
+//! next use, as any new shape's ([`ShapeCounts::planes_owed_busy`]). A picture that lands over
+//! part of the planes alone (a picture smaller than them, or one not written) leaves the rest
+//! holding that fill. A CPU lock of the surface never reads the surface's memory beside the
+//! planes' texels (each row's padding, and the rows of room below): a fill and a write-back move
+//! the shapes' texels alone, and a copy out of a cache of a surface the kext laid out moves its
+//! planes' texels alone (`super::SurfaceCache`'s `texels`), so those bytes of the pages stay as
+//! the guest's CPU wrote them, a new IOSurface's zeros.
 //!
 //! **References.** Each guest texture over a shape, and each guest view of one, holds a
 //! [`ShapeRef`] in its decoder entry; the count of those is the shape's reference count, so every
@@ -465,6 +477,16 @@ pub(crate) struct ShapeCounts {
     pub(crate) zero_taken: u64,
     pub(crate) zero_taken_bytes: u64,
     pub(crate) unplaced_zeros: u64,
+    /// Fills of plane shapes from their cache's buffer, and of them those made at the planes'
+    /// make (the module doc, "Plane shapes"); surfaces whose planes owed their fill past their
+    /// make, as a command buffer begun and not finished used the cache or a copy of it waited.
+    pub(crate) plane_fills: u64,
+    pub(crate) planes_filled_at_make: u64,
+    pub(crate) planes_owed_busy: u64,
+    /// A video op's waits on the CPU for its surface's cache's last fill that found it not done
+    /// (`super::Caches::wait_filled`), and the longest, in microseconds.
+    pub(crate) video_fill_waits: u64,
+    pub(crate) video_fill_wait_max_us: u64,
 }
 
 /// One shape's image and its state.
@@ -804,6 +826,7 @@ pub(crate) fn fill<P: Platform>(
         shape.dirty = false;
         counts.fills += 1;
         counts.filled_bytes += shape.bytes;
+        counts.plane_fills += u64::from(shape.plane);
         if std::mem::take(&mut shape.video) {
             counts.video_fills += 1;
             counts.video_filled_bytes += shape.bytes;

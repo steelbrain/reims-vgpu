@@ -887,6 +887,9 @@ pub struct World {
     ///
     /// [`GpuDevice::new_command_queue_for_copies`]: crate::core::platform::device::GpuDevice::new_command_queue_for_copies
     copy_queues: AtomicBool,
+    /// Whether the devices' `GpuDevice::new_exported_surface` makes a surface
+    /// ([`World::give_exported_surfaces`]).
+    exported_surfaces: AtomicBool,
     /// What the devices' [`GpuDevice::recoveries`] answers ([`World::recover`]).
     ///
     /// [`GpuDevice::recoveries`]: crate::core::platform::device::GpuDevice::recoveries
@@ -961,6 +964,7 @@ impl World {
             splits: AtomicBool::new(false),
             guest_ram_copies: AtomicBool::new(false),
             copy_queues: AtomicBool::new(false),
+            exported_surfaces: AtomicBool::new(false),
             recoveries: AtomicU64::new(0),
             linear_rows: AtomicU64::new(0),
             surface_pages: Mutex::new((PagesInPlace::Yes, Vec::new())),
@@ -1138,6 +1142,18 @@ impl World {
     /// Whether the devices give a queue for copies ([`World::give_copy_queues`]).
     pub fn gives_copy_queues(&self) -> bool {
         self.copy_queues.load(Ordering::SeqCst)
+    }
+
+    /// Has the devices make an exported surface (`GpuDevice::new_exported_surface`, on Unix
+    /// hosts), each plane a texture logged under `impls::device::EXPORTED_SURFACE_PLANE`, or none,
+    /// as the platform's default answers; none at first.
+    pub fn give_exported_surfaces(&self, on: bool) {
+        self.exported_surfaces.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether the devices make an exported surface ([`World::give_exported_surfaces`]).
+    pub fn gives_exported_surfaces(&self) -> bool {
+        self.exported_surfaces.load(Ordering::SeqCst)
     }
 
     /// Has the devices answer one recovery more ([`GpuDevice::recoveries`]), as a device whose

@@ -1150,7 +1150,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             false
         };
-        let done = self.surface_caches.wait_filled(block, &mut over)
+        let now = || clock.now_mono();
+        let done = self.surface_caches.wait_filled(block, &mut over, &now)
             && self.surface_caches.wait_copied_out(block, &mut over);
         if named {
             log::info!(

@@ -12,6 +12,17 @@
 //! multiple of 64 luma rows, 32 chroma), for VA-API's decodes into it; the pitch and each plane's
 //! start are multiples of 256, as VA-API's imports and CUDA's copies take them.
 //!
+//! The surface's memory holds undefined bytes at its make, so the planes take their fill from the
+//! cache's buffer at once, on the transfer queue, as their texture is made
+//! (`SurfaceCaches::fill_planes_at_make`), where no command buffer begun and not finished uses
+//! the cache and no copy of it waits, as a placed image's fill is made (`shapes`, "Placed
+//! images"): the thread that makes the texture encodes and commits the fill and waits for
+//! nothing. A decode's begin then owes the planes no fill. The host's video writes them outside
+//! the platform's queues, so the decode op waits on its thread for the cache's last fill
+//! (`Caches::wait_filled`), which that fill, made ahead of it, has as a rule done by then; every
+//! command buffer that uses the cache after it waits for it on the GPU. A busy cache's planes owe
+//! their fill to its next use.
+//!
 //! A decode whose luma and chroma textures show the planes whole is given the surface's planes
 //! (`Caches::surface_targets`), and its picture lands there, by the hardware or by a copy into
 //! the plane images: its command buffer leaves the plane shapes holding the picture and every
@@ -343,14 +354,22 @@ pub(crate) fn planes_line(sh: &ShapeCounts) -> Option<String> {
         format!(
             "IOSurface device caches' video planes: {} surfaces made ({} plane shapes), {} the \
              platform made none of, {} caches holding one at once at most; {} video command \
-             buffers landed in them; of the fills, {} owed by a video write ({} MiB)",
+             buffers landed in them; of the fills, {} owed by a video write ({} MiB); plane \
+             shapes filled {} at their make, {} at a later use, {} surfaces' planes owing theirs \
+             past their make as their cache was busy; {} video ops waited on the CPU for a \
+             cache's fill not done, the longest {} us",
             sh.surfaces,
             sh.planes_made,
             sh.surfaces_refused,
             sh.surfaces_live_most,
             sh.planes_landed,
             sh.video_fills,
-            sh.video_filled_bytes >> 20
+            sh.video_filled_bytes >> 20,
+            sh.planes_filled_at_make,
+            sh.plane_fills.saturating_sub(sh.planes_filled_at_make),
+            sh.planes_owed_busy,
+            sh.video_fill_waits,
+            sh.video_fill_wait_max_us
         )
     })
 }
@@ -426,6 +445,35 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 }
 
+#[cfg(unix)]
+impl<P: Platform> SurfaceCaches<P> {
+    /// The planes just added to the block at `block`'s cache ([`Self::add_planes`]) take their
+    /// fill from its buffer at once (the module doc), with the cache's other shapes that owe one
+    /// and its dirty shapes written back first ([`Self::fill_shapes`]), where no command buffer
+    /// begun and not finished uses the cache and no copy of it waits; else they owe it to the
+    /// cache's next use, counted ([`ShapeCounts::planes_owed_busy`]). A fill the platform raises
+    /// at is logged, and the planes owe theirs still.
+    fn fill_planes_at_make(&mut self, device: &P::Device, block: u64) {
+        if self.pending(block, false) > 0 || self.deferring(block) {
+            self.counts.shapes.planes_owed_busy += 1;
+            return;
+        }
+        let before = self.counts.shapes.plane_fills;
+        // A refusal of a buffer's memory is a begin's to fail its command buffer on, not this.
+        let refused = self.memory_refused;
+        if let Err(raise) = self.fill_shapes(device, block) {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = raise;
+                "the IOSurface block at {block:#x}: the platform raised at its video planes' fill \
+                 at their make ({raise:?}); they owe it to the cache's next use"
+            );
+        }
+        self.memory_refused = refused;
+        let filled = self.counts.shapes.plane_fills - before;
+        self.counts.shapes.planes_filled_at_make += filled;
+    }
+}
+
 /// What [`SurfaceCaches::add_planes`] lets go of: images, and a surface's memory not taken.
 #[cfg(unix)]
 type Gone<P> = (
@@ -462,7 +510,15 @@ impl<P: Platform> Caches<P> {
             self.state.lock().counts.shapes.surfaces_refused += 1;
             return None;
         };
-        let (found, gone) = self.state.lock().add_planes(block, key, &ask, made);
+        // The caches' lock, whose let-go commits the planes' fill (`Locked`).
+        let (found, gone) = {
+            let mut state = self.lock();
+            let added = state.add_planes(block, key, &ask, made);
+            if added.0.is_some() {
+                state.fill_planes_at_make(device, block);
+            }
+            added
+        };
         if let Err(refusal) = refusals::refusing(move || drop(gone)) {
             log::warn!(
                 target: "reims_vgpu::graphics", kind:% = refusal;

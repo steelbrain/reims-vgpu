@@ -7774,8 +7774,14 @@ impl<P: Platform> Caches<P> {
     /// order. A deferred fill is waited for until it is made, as a begin waited for the command
     /// buffers before it (counted, [`CacheCounts::cpu_waits`]), and then as a fill made is; each
     /// until `over` answers true ([`Over`]). True where it is done, or the block has no cache or
-    /// no fill.
-    pub(crate) fn wait_filled(&self, block: u64, over: Over<'_>) -> bool {
+    /// no fill. A wait that finds the fill not done is counted, with the longest, timed on `now`,
+    /// the platform's monotonic clock ([`shapes::ShapeCounts::video_fill_waits`]): a video op's.
+    pub(crate) fn wait_filled(
+        &self,
+        block: u64,
+        over: Over<'_>,
+        now: &dyn Fn() -> MonoTime,
+    ) -> bool {
         let fill = {
             let mut state = self.lock();
             let fill = state.last_fill(block);
@@ -7786,7 +7792,18 @@ impl<P: Platform> Caches<P> {
             }
             fill
         };
-        fill.is_none_or(|fill| fill.wait(over))
+        let Some(fill) = fill.filter(|fill| !fill.done()) else {
+            return true;
+        };
+        let start = now();
+        let done = fill.wait(over);
+        let waited = now().saturating_duration_since(start).as_micros();
+        let waited = u64::try_from(waited).unwrap_or(u64::MAX);
+        let mut state = self.lock();
+        let counts = &mut state.counts.shapes;
+        counts.video_fill_waits += 1;
+        counts.video_fill_wait_max_us = counts.video_fill_wait_max_us.max(waited);
+        done
     }
 
     /// Waits, on the calling thread, for an early copy of the block at `block`'s cache into its
@@ -10337,22 +10354,25 @@ pub(super) mod tests {
         let mut r = cached();
         // A slice's wait.
         let mut short = || true;
+        let now = || MonoTime::from_nanos(0);
         assert!(
-            r.dec.surface_caches.wait_filled(BLOCK, &mut short),
+            r.dec.surface_caches.wait_filled(BLOCK, &mut short, &now),
             "a new cache: no fill of the make's"
         );
         assert!(
-            r.dec.surface_caches.wait_filled(BLOCK + 0x8000, &mut short),
+            r.dec
+                .surface_caches
+                .wait_filled(BLOCK + 0x8000, &mut short, &now),
             "no cache"
         );
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
         assert!(
-            !r.dec.surface_caches.wait_filled(BLOCK, &mut short),
+            !r.dec.surface_caches.wait_filled(BLOCK, &mut short, &now),
             "the fill runs"
         );
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(
-            r.dec.surface_caches.wait_filled(BLOCK, &mut short),
+            r.dec.surface_caches.wait_filled(BLOCK, &mut short, &now),
             "the fill is done"
         );
     }
