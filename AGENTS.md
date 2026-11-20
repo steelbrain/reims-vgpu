@@ -22,9 +22,11 @@ drivers drive in x86-64 macOS guests:
 
 The guest's Metal bundle serialises its Metal calls onto the device's rings,
 and the library carries them out on the host's GPU, on the Vulkan platform
-(`crates/reims-vgpu-vulkan`), over metal2vulkan's Metal-shaped runtime, on
-Linux, Windows and macOS hosts: on a Mac over MoltenVK, Vulkan rather than
-Metal. x86-64 VMs run on Linux and Windows hosts, and arm64 VMs on Ambrosia
+(`crates/reims-vgpu-vulkan`), over metal2vulkan's Metal-shaped runtime,
+metal2vulkan-rt, on Vulkan on Linux, Windows and macOS hosts: on a Mac over
+Mesa's KosmicKrisp from Homebrew's `mesa`, Vulkan rather than Metal, and
+not MoltenVK, which rt's floor refuses. x86-64 VMs run on Linux and Windows
+hosts, and arm64 VMs on Ambrosia
 under HVF on arm64 Macs, KVM on arm64 Linux and TCG on other hosts. Windows
 is tested on homelab-mac-mini-2018.
 The device's video decodes run on the host's VA-API or NVDEC.
@@ -123,15 +125,10 @@ header --check` keeps the committed header equal to cbindgen's output.
 ## Checking a change
 
 Run the checks a change can reach, and no others. Measured on the M3 Max on
-2026-11-07, the workspace's tests take 29 s of GPU time after their build
-(`cargo nextest run --workspace` with the tested features, 2415 tests).
-The test that faults a Mac's GPU on purpose and the one that holds the
-most of its memory are opt-in (`#[ignore]`): they fail the work of every
-process on the Mac, the desktop's included, so they run only for a change
-to what they test (`--run-ignored only`), and then first and alone
-(`.config/nextest.toml`, [docs/lessons.md](docs/lessons.md)). A GPU test
-can still fail beside GPU work or heavy load elsewhere on the host, and
-passes run again alone.
+COUNT_FROM_CUTDEL_BATCH, the workspace's tests take COUNT_FROM_CUTDEL_BATCH
+of GPU time after their build (`cargo nextest run --workspace` with the
+tested features, COUNT_FROM_CUTDEL_BATCH tests). A GPU test can fail beside
+GPU work or heavy load elsewhere on the host, and passes run again alone.
 
 | the change touches | check it with |
 |---|---|
@@ -276,25 +273,11 @@ Three tiers:
   one merge's checks for the move, never a check per runtime commit. A
   regression a move brings is fixed forward on development, in metal2vulkan
   or here. Holding, dropping or rolling back the pin never routes around it.
-- **metal2vulkan's runtime is being replaced** by a new runtime crate with
-  one path for every device: no vendor, device or driver IDs, no
-  device-start checks and no policy switches. Until reims-vgpu cuts over to
-  it:
-  - the current runtime takes regression fixes only, from one lane at most.
-    No new work extends it, its device tables, its device checks or its
-    queue-sharing policies (Adaptive, Grouped, Exact);
-  - reims-vgpu builds its side of the new runtime's contract with
-    metal2vulkan. The runtime allocates GPU memory, and the device maps its
-    host-visible blocks into the guest. Textures are device images synced at
-    the guest's events (surface lock and unlock, didModifyRange,
-    replaceRegion), with no page logs. gpuAddress is the Vulkan device
-    address and gpuResourceID a descriptor index, with one VkDevice per VM
-    (the host process) for everything, the compositor's work included, and no
-    path that shares objects across devices. Guest processes are therefore
-    not isolated from each other on the device. Every byte on it is
-    guest-writable, and the host never parses or trusts host data it keeps
-    there. At the cutover this replaces "guest memory in place"
-    ([docs/conventions.md](docs/conventions.md));
+- **The runtime's form is a rule**: GPU memory is the runtime's, with one
+  VkDevice per VM (the host process) and no page logs, and every byte on the
+  device is guest-writable, so the host trusts none it keeps there
+  ([docs/conventions.md](docs/conventions.md), "GPU memory is the
+  runtime's").
   - lanes split by feature, never by vendor, and a check fans out one leg
     per GPU kind at once.
 - **Decide what the rules decide.** A routine trade-off (a residual, an
@@ -344,9 +327,10 @@ Three tiers:
   test, which `features_md_guards_exist` keeps, or a manual check on a VM
   boot. Dropping or changing an entry is a deliberate change, made in its
   own commit that updates the file and says why.
-- **The Vulkan platform's rules** (guest memory in place until the
-  runtime's cutover, where stalls are fixed, what is the runtime's,
-  dependencies as released) are in
+- **The Vulkan platform's rules** (GPU memory is the runtime's, stalls are
+  fixed on the Vulkan side, speed comes from what every run gets, a
+  workaround for the OS or a driver lives in the runtime, what Metal does
+  is the runtime's to build, dependencies are used as released) are in
   [docs/conventions.md](docs/conventions.md).
 - **Never guess a name.** A field of a guest record or of a copy of a Metal
   struct whose meaning nothing states is `field_xx`, `xx` its byte offset in
@@ -359,9 +343,10 @@ Three tiers:
 - **Linux, Windows and macOS hosts; the Mac builds arm64.** The library
   runs on Linux as `x86_64-unknown-linux-gnu` and on Windows as
   `x86_64-pc-windows-gnullvm`, each built on its own host, Windows' under
-  MSYS2 CLANG64. On a Mac it runs over MoltenVK, and every Rust binary built
-  for macOS is arm64 (`aarch64-apple-darwin`): rustc's arm64e target has no
-  pointer authentication, and its binaries crash before `main`
+  MSYS2 CLANG64. On a Mac it runs over Mesa's KosmicKrisp from Homebrew's
+  `mesa`, not MoltenVK, and every Rust binary built for macOS is arm64
+  (`aarch64-apple-darwin`): rustc's arm64e target has no pointer
+  authentication, and its binaries crash before `main`
   (`rust-toolchain.toml`).
   `cargo xtask check` on a Mac also clippy-checks the Linux target, and, where
   Rosetta is installed, runs core's tests (the Vulkan crate's unit tests
