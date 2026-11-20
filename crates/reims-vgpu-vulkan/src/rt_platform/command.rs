@@ -20,12 +20,18 @@
 //!   buffer not complete: here the earliest submitted of those rt ends as in flight
 //!   (`DeviceLost { in_flight: true }`), which is the first of them it ends, as its completion
 //!   thread ends the work in flight in its order of submission. It is answered as the hang, once
-//!   for the device ([`RtDevice::hung`]); every other command buffer rt ends at the loss or after
+//!   for the device ([`RtDevice::loss`]); every other command buffer rt ends at the loss or after
 //!   (in flight after it, held, not yet submitted or committed later) is a victim, so where none
 //!   was in flight every one is. A command buffer rt ended without running (its device quiesced,
 //!   its queue abandoned) is `Internal` (1) too. Each command buffer's answer is made as it
 //!   completes, by a completed handler its commit adds ahead of core's ([`Failure`]), and kept:
 //!   its handlers and `error` read the same one.
+//! - **A lost device's line.** rt writes nothing at a loss, and nothing makes the device again:
+//!   the first of its command buffers that fails with the device lost writes one line on stderr
+//!   for the device, naming its GPU (name, PCI vendor and device IDs) and how many of its command
+//!   buffers were committed and not complete then, the one failing among them ([`DeviceLoss`]).
+//!   Each command buffer that fails with the device lost is counted, `rt-device-lost`, in the
+//!   process's degradation counts (docs/conventions.md).
 //! - **Encoders**: blit encoders ([`super::blit`]), compute encoders ([`super::compute`]), of
 //!   the serial dispatch type or the descriptor's (another value is Metal's refusal, nil), and
 //!   render encoders ([`super::render`]) of the pass the descriptor keeps
@@ -58,7 +64,7 @@
 //! wait), counted under the refusal's kind ([`rt_refused`]); never a death.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use metal2vulkan_rt as rt;
@@ -95,6 +101,10 @@ const ERROR_INTERNAL: i64 = 1;
 /// `MTLCommandBufferErrorTimeout`.
 const ERROR_TIMEOUT: i64 = 2;
 
+/// The degradation code of a command buffer that fails with its device lost (the module's docs,
+/// "A lost device's line").
+const DEVICE_LOST: &str = "rt-device-lost";
+
 /// A handler as rt runs it.
 type Handler = Box<dyn FnOnce(&rt::CommandBuffer) + Send>;
 
@@ -122,8 +132,8 @@ pub struct RtCommandBuffer {
 struct Failure {
     /// Its error as Metal's, once read.
     error: OnceLock<NsErrorText>,
-    /// Whether its device's loss has its hang ([`RtDevice::hung`]).
-    hung: Arc<AtomicBool>,
+    /// Its device's loss ([`RtDevice::loss`]).
+    loss: Arc<DeviceLoss>,
 }
 
 impl Failure {
@@ -132,10 +142,74 @@ impl Failure {
         let error = error?;
         Some(
             self.error
-                .get_or_init(|| ns_error(error, &self.hung))
+                .get_or_init(|| ns_error(error, &self.loss))
                 .clone(),
         )
     }
+
+    /// Its first completed handler's part: reads its error, then takes it off its device's
+    /// command buffers not complete ([`DeviceLoss`]).
+    fn completed(&self, error: Option<rt::CommandBufferError>) {
+        drop(self.read(error));
+        self.loss.open.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A device's loss as its command buffers see it (the module's docs, "What a completed handler
+/// learns" and "A lost device's line"), which each of them keeps.
+pub struct DeviceLoss {
+    /// The GPU, as the line names it: its name, and its PCI vendor and device IDs.
+    gpu: String,
+    /// Whether a command buffer in flight at the loss was answered as the hang.
+    hung: AtomicBool,
+    /// Whether the loss's line was written.
+    said: AtomicBool,
+    /// Its command buffers committed and not complete: a commit adds one before rt has it (and
+    /// takes it off where rt refuses it), and its first completed handler takes it off once its
+    /// error is read, so a failing command buffer counts itself.
+    open: AtomicI64,
+}
+
+impl DeviceLoss {
+    /// The loss of a device of the GPU `gpu`, before any.
+    pub fn new(gpu: String) -> DeviceLoss {
+        DeviceLoss {
+            gpu,
+            hung: AtomicBool::new(false),
+            said: AtomicBool::new(false),
+            open: AtomicI64::new(0),
+        }
+    }
+
+    /// A command buffer failed with the device lost: counted, and the first writes the loss's
+    /// line (the module's docs, "A lost device's line").
+    fn lost(&self) {
+        crate::answer::count_kind(DEVICE_LOST);
+        if self.said.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let open = self.open.load(Ordering::SeqCst).max(0);
+        say_lost(&format!(
+            "reims-vgpu: the rt platform's device on {} was lost, with {open} command buffers \
+             committed and not complete: every command buffer fails from here on, and nothing \
+             makes the device again ({DEVICE_LOST})\n",
+            self.gpu
+        ));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The lost devices' lines this thread wrote.
+    static SAID_LOST: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Writes a lost device's `line` on stderr, as the platform's other degradation lines
+/// (`super::unbuilt`); a test reads those its thread wrote.
+fn say_lost(line: &str) {
+    super::unbuilt::say(line);
+    #[cfg(test)]
+    SAID_LOST.with(|said| said.borrow_mut().push(line.to_owned()));
 }
 
 /// A command buffer's handlers until its commit hands them to rt, each kind in the order added,
@@ -169,7 +243,7 @@ impl RtCommandBuffer {
     ) -> RtCommandBuffer {
         let failure = Arc::new(Failure {
             error: OnceLock::new(),
-            hung: Arc::clone(device.hung()),
+            loss: Arc::clone(device.loss()),
         });
         RtCommandBuffer {
             rt: made,
@@ -407,11 +481,15 @@ fn status(status: rt::CommandBufferStatus) -> CommandBufferStatus {
 }
 
 /// rt's error as Metal's `NSError` (the module's docs): `Timeout` for the first command buffer
-/// lost in flight on the device whose loss `hung` notes, `Internal` for any other.
-fn ns_error(error: rt::CommandBufferError, hung: &AtomicBool) -> NsErrorText {
+/// lost in flight on the device whose loss is `loss`, `Internal` for any other; a command buffer
+/// that fails with its device lost tells `loss` ([`DeviceLoss::lost`]).
+fn ns_error(error: rt::CommandBufferError, loss: &DeviceLoss) -> NsErrorText {
+    if let rt::CommandBufferError::DeviceLost { .. } = error {
+        loss.lost();
+    }
     let code = match error {
         rt::CommandBufferError::DeviceLost { in_flight: true }
-            if !hung.swap(true, Ordering::SeqCst) =>
+            if !loss.hung.swap(true, Ordering::SeqCst) =>
         {
             ERROR_TIMEOUT
         }
@@ -531,7 +609,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
             let failure = Arc::clone(&self.failure);
             seen.insert(
                 0,
-                Box::new(move |made: &rt::CommandBuffer| drop(failure.read(made.error()))),
+                Box::new(move |made: &rt::CommandBuffer| failure.completed(made.error())),
             );
             if let Some(merge) = super::copied::merging() {
                 seen.insert(0, Box::new(merge));
@@ -553,7 +631,14 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 self.rt.add_completed_handler(run(seen))?;
                 super::copied::copy_in();
                 self.kept.takes().take(&self.device);
-                self.rt.commit()
+                // Not complete until its first completed handler runs, which a refusal never runs.
+                let loss = &self.failure.loss;
+                loss.open.fetch_add(1, Ordering::SeqCst);
+                let committed = self.rt.commit();
+                if committed.is_err() {
+                    loss.open.fetch_sub(1, Ordering::SeqCst);
+                }
+                committed
             };
             if let Err(error) = committed() {
                 rt_refused(sel, &error);
@@ -880,9 +965,9 @@ mod tests {
     fn rt_s_errors_and_statuses_are_metal_s() {
         use rt::CommandBufferError::{DeviceLost, NotRun};
         let codes = |errors: &[rt::CommandBufferError]| {
-            let hung = AtomicBool::new(false);
+            let loss = DeviceLoss::new("a GPU".to_owned());
             (errors.iter())
-                .map(|&e| ns_error(e, &hung))
+                .map(|&e| ns_error(e, &loss))
                 .inspect(|e| assert_eq!(e.domain, ERROR_DOMAIN))
                 .map(|e| e.code)
                 .collect::<Vec<_>>()
@@ -893,12 +978,12 @@ mod tests {
         assert_eq!(codes(&[held, NotRun, in_flight, in_flight]), [1, 1, 2, 1]);
         assert_eq!(codes(&[NotRun, held]), [1, 1]);
         // A command buffer keeps its answer; the device's next one lost in flight is a victim.
-        let hung = Arc::new(AtomicBool::new(false));
-        let failure = |hung: &Arc<AtomicBool>| Failure {
+        let loss = Arc::new(DeviceLoss::new("a GPU".to_owned()));
+        let failure = |loss: &Arc<DeviceLoss>| Failure {
             error: OnceLock::new(),
-            hung: Arc::clone(hung),
+            loss: Arc::clone(loss),
         };
-        let (first, second) = (failure(&hung), failure(&hung));
+        let (first, second) = (failure(&loss), failure(&loss));
         assert_eq!(first.read(None), None);
         let reads = [first.read(Some(in_flight)), second.read(Some(in_flight))];
         assert_eq!(reads.map(|e| e.map(|e| e.code)), [Some(2), Some(1)]);
@@ -913,6 +998,44 @@ mod tests {
             rt::CommandBufferStatus::Error,
         ];
         assert_eq!(statuses.map(|s| status(s).0), [0, 1, 2, 3, 4, 5]);
+    }
+
+    /// A lost device writes one line, at the first of its command buffers that fails with it lost,
+    /// naming its GPU and how many of its command buffers were committed and not complete then,
+    /// the failing one among them; each command buffer that fails so is counted, once however
+    /// often its error is read (the module's docs, "A lost device's line").
+    #[test]
+    fn a_lost_device_writes_one_line_and_counts_each_command_buffer() {
+        use rt::CommandBufferError::{DeviceLost, NotRun};
+        let said = || SAID_LOST.with(|said| said.borrow().clone());
+        let before = counted(DEVICE_LOST);
+        let loss = Arc::new(DeviceLoss::new("A GPU (1234:5678)".to_owned()));
+        let failure = || Failure {
+            error: OnceLock::new(),
+            loss: Arc::clone(&loss),
+        };
+        let (first, second, third) = (failure(), failure(), failure());
+        // Three committed (`RtCommandBuffer::commit`'s count).
+        loss.open.fetch_add(3, Ordering::SeqCst);
+        // A command buffer ended unrun is no loss.
+        third.completed(Some(NotRun));
+        assert_eq!(said(), Vec::<String>::new());
+        assert_eq!(counted(DEVICE_LOST), before);
+        first.completed(Some(DeviceLost { in_flight: true }));
+        second.completed(Some(DeviceLost { in_flight: false }));
+        // Read again, each keeps its answer and is not counted again.
+        let reads = [first.read(Some(NotRun)), second.read(Some(NotRun))];
+        assert_eq!(reads.map(|e| e.map(|e| e.code)), [Some(2), Some(1)]);
+        assert_eq!(
+            said(),
+            [
+                "reims-vgpu: the rt platform's device on A GPU (1234:5678) was lost, with 2 command \
+                 buffers committed and not complete: every command buffer fails from here on, and \
+                 nothing makes the device again (rt-device-lost)\n"
+            ]
+        );
+        assert_eq!(counted(DEVICE_LOST), before + 2);
+        assert_eq!(loss.open.load(Ordering::SeqCst), 0);
     }
 
     /// Command buffers on the GPU the test holds: handlers in core's order whatever the order

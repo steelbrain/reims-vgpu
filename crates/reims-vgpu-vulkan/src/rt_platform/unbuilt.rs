@@ -522,7 +522,7 @@ fn first(said: &[AtomicBool], at: usize) -> bool {
 }
 
 /// Writes `line` on stderr in one write, so it never interleaves with another thread's.
-fn say(line: &str) {
+pub(super) fn say(line: &str) {
     let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
 }
 

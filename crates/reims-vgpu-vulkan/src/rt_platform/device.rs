@@ -35,7 +35,6 @@
 //! [`OVER_COPIES_CODE`] and [`OVER_COPY_BYTES_CODE`], and of those over an imported block,
 //! [`OVER_COPIES_IMPORTED_CODE`] and [`OVER_COPY_BYTES_IMPORTED_CODE`].
 
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 
 use ash::vk;
@@ -60,6 +59,7 @@ use crate::gpu::identity;
 
 use super::answers::{self, Facts};
 use super::buffer::{self, KnownBlocks};
+use super::command::DeviceLoss;
 use super::heap;
 use super::library::{self, RtLibrary};
 use super::pipeline::{self, Numbering};
@@ -191,9 +191,9 @@ pub struct RtDevice {
     present_fences: bool,
     /// Where its GPU lies on the host.
     host_gpu: HostGpu,
-    /// Whether a command buffer in flight at its loss was answered as the hang (`super::command`'s
-    /// docs, "What a completed handler learns").
-    hung: Arc<AtomicBool>,
+    /// Its loss as its command buffers see it (`super::command`'s docs, "What a completed handler
+    /// learns" and "A lost device's line").
+    loss: Arc<DeviceLoss>,
 }
 
 /// Where a device's GPU lies on the host, as Vulkan answers it, which the host's video opens its
@@ -238,10 +238,10 @@ impl RtDevice {
         &self.numbering
     }
 
-    /// Whether a command buffer in flight at its loss was answered as the hang (`super::command`'s
-    /// docs, "What a completed handler learns"), which each of its command buffers keeps.
-    pub fn hung(&self) -> &Arc<AtomicBool> {
-        &self.hung
+    /// Its loss as its command buffers see it (`super::command`'s docs, "What a completed handler
+    /// learns" and "A lost device's line"), which each of them keeps.
+    pub fn loss(&self) -> &Arc<DeviceLoss> {
+        &self.loss
     }
 
     /// The blocks it knows by address (`super::buffer`'s docs, "A pinned address"): the graphics
@@ -401,6 +401,10 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         instance.extensions()
     );
     let caps = answers::caps(&facts);
+    let gpu = format!(
+        "{} ({:04x}:{:04x})",
+        facts.name, facts.vendor_id, facts.device_id
+    );
     Ok(RtObj::new(RtDevice {
         rt: device,
         facts,
@@ -414,7 +418,7 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         drm,
         present_fences,
         host_gpu,
-        hung: Arc::default(),
+        loss: Arc::new(DeviceLoss::new(gpu)),
     }))
 }
 
