@@ -311,6 +311,10 @@ fn a_piece_is_found_only_once_the_host_added_it() {
 fn a_piece_holds_the_blocks_memory_the_host_maps() {
     let host = Arc::new(Host::default());
     let (pool, _blocks) = pool(range(64), &host, LONG);
+    // The zeroer zeroes a new piece of the headroom ahead of its takes, and this test writes
+    // through a lookup, which no carve holds: shut it, or its chunk's write may land after the
+    // test's and read back as zero.
+    pool.shared.state.lock().zero_shut = true;
     pool.grow(BLOCK_LEN);
     host.wait_for(1);
     pool.added(BASE).unwrap();
