@@ -54,6 +54,7 @@ pub mod queue;
 pub mod render;
 pub mod render_pipeline;
 pub mod state;
+pub mod summary;
 #[cfg(unix)]
 pub mod surface;
 pub mod swapchain;

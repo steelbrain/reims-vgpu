@@ -167,6 +167,7 @@ mod present;
 mod read;
 mod rt_window;
 mod sink;
+mod summary;
 #[cfg(any(target_os = "linux", windows))]
 mod vaapi;
 mod video_choice;

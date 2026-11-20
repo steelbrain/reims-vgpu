@@ -670,7 +670,9 @@ impl<A: Answer> PresentAnswers<A> {
     pub(crate) fn refreshed(&self) {
         let at = (self.now)();
         let timed = log::log_enabled!(target: TIMING, log::Level::Debug);
+        let summed = super::summary::on();
         let mut timings = Vec::new();
+        let mut summary = Vec::new();
         let answers: Vec<A> = {
             let mut state = self.state.lock();
             state.refreshes += 1;
@@ -682,6 +684,9 @@ impl<A: Answer> PresentAnswers<A> {
             let mut answers = Vec::new();
             while !state.owed.is_empty() && held_after.is_none_or(|r| number <= r) {
                 if let Some(owed) = state.owed.pop_front() {
+                    if summed {
+                        summary.push((owed.taken.at, owed.shown));
+                    }
                     if timed {
                         timings.push(Timing {
                             taken: owed.taken,
@@ -703,6 +708,9 @@ impl<A: Answer> PresentAnswers<A> {
         }
         for timing in timings {
             timing.log();
+        }
+        for (taken, shown) in summary {
+            super::summary::answered(taken, shown, at);
         }
     }
 }
