@@ -60,6 +60,7 @@ use metal2vulkan_rt as rt;
 use crate::core::platform::Handle as _;
 use crate::core::platform::os::Clock as _;
 use crate::core::sync::MutexGuard;
+use crate::core::trace;
 use crate::swapchain::{
     Acquired, COLOR_SPACE, END_WAIT_NS, FIFO_IMAGES, FORMAT, Fences, Frame, MAILBOX_IMAGES,
     Presents, RETIRED, Refused, Remaking, USAGE, Unmade, WAIT_NS, WSI, extent_for, present_mode,
@@ -378,7 +379,9 @@ impl RtSwapchain {
         };
         let taken = take_image(
             |timeout| {
+                let asked = trace::on().then(trace::now);
                 let wsi = WSI.lock();
+                let locked = asked.map(|_| trace::now());
                 // SAFETY: the swapchain and fence are live, and the fence unsignalled with nothing
                 // pending on it: a take that answers no image leaves it so.
                 let taken = unsafe {
@@ -389,8 +392,16 @@ impl RtSwapchain {
                         self.fence,
                     )
                 };
+                let returned = asked.map(|_| trace::now());
                 // Handed to a window waiting for it, if any, before this one takes it again.
                 MutexGuard::unlock_fair(wsi);
+                if let (Some(asked), Some(locked), Some(returned)) = (asked, locked, returned) {
+                    // winacquire (timed at the call's return): when the take of the window
+                    // system's lock began, when the `vkAcquireNextImageKHR` call began, holding
+                    // it, and 1 where the call answered an image, else 0
+                    let image = u64::from(taken.is_ok());
+                    trace::event_at(returned, "winacquire", &[asked, locked, image]);
+                }
                 taken
             },
             elapsed,
@@ -418,8 +429,15 @@ impl RtSwapchain {
     /// Waits up to [`WAIT_NS`] for image `index`'s fence: the image, its `drawable_acquired`
     /// made, or a retry with it pending.
     fn wait_for(&mut self, index: u32) -> Acquired {
+        let began = trace::on().then(trace::now);
         // SAFETY: the fence is live, and image `index`'s acquire signals it.
-        match unsafe { self.vk.wait_for_fences(&[self.fence], true, WAIT_NS) } {
+        let waited = unsafe { self.vk.wait_for_fences(&[self.fence], true, WAIT_NS) };
+        if let Some(began) = began {
+            // winfence (timed at the wait's return): when the wait for a taken image's fence
+            // began, and 1 where the fence signalled, else 0
+            trace::event("winfence", &[began, u64::from(waited.is_ok())]);
+        }
+        match waited {
             Ok(()) => {
                 // SAFETY: the fence has signalled, and nothing else waits on it.
                 if let Err(e) = unsafe { self.vk.reset_fences(&[self.fence]) } {
@@ -534,6 +552,7 @@ impl RtSwapchain {
         // The image's frame is waited for before its swapchain goes, presented or not.
         image.last = Some(raw.clone());
         image.acquired = false;
+        let scheduling = trace::on().then(trace::now);
         let scheduled = raw.wait_until_scheduled();
         if scheduled.is_err() || raw.status() == rt::CommandBufferStatus::Error {
             // It signals nothing, and the image stays taken, its move home perhaps not run: the
@@ -560,16 +579,30 @@ impl RtSwapchain {
             info = info.push_next(&mut fenced);
         }
         let api = &self.swapchain_api;
+        let mut called = 0;
         let present = |queue: vk::Queue| {
+            if scheduling.is_some() {
+                called = trace::now();
+            }
             // SAFETY: the present is the only call on rt's presenting queue, inside its lock; the
             // image was taken from this swapchain and its semaphore's signal is submitted, as its
             // command buffer is scheduled. A fence is chained only where the device enabled
             // `swapchainMaintenance1`, and is unsignalled with nothing pending on it.
             unsafe { api.queue_present(queue, &info) }
         };
+        let asked = scheduling.map(|_| trace::now());
         let wsi = WSI.lock();
         let presented = self.device.rt().with_present_queue(present);
+        let returned = scheduling.map(|_| trace::now());
         drop(wsi);
+        if let (Some(scheduling), Some(asked), Some(returned)) = (scheduling, asked, returned) {
+            // winpresent (timed at the call's return): when the wait for the frame's command
+            // buffer to be scheduled began, when the take of the window system's lock began, when
+            // the `vkQueuePresentKHR` call began, holding it and rt's lock of its presenting
+            // queue, and 1 where the call answered success, else 0
+            let ok = u64::from(presented.is_ok());
+            trace::event_at(returned, "winpresent", &[scheduling, asked, called, ok]);
+        }
         // Numbered whatever the compositor answers: a present it rejects still waits on its
         // semaphore.
         image.presented = self.presents.make();
@@ -1038,21 +1071,13 @@ mod tests {
         panic!("no image of {size:?} in 100 takes");
     }
 
-    /// A window's swapchain on rt's device over a headless surface (`VK_EXT_headless_surface`,
-    /// where the device's driver presents to one): each frame takes an image, clears its
-    /// drawable and copies it out in a command buffer that presents it, and the copy holds the
-    /// clear; the swapchain is made again at a new size; an image taken for a frame that encodes
-    /// nothing is the next draw's, and the swapchain ends with it taken, its move home settled.
-    /// rt refuses nothing on the way. The present mode is logged once, at the first make: the
-    /// remake at the new size makes as many images.
-    #[test]
-    fn a_window_presents_rt_drawables_on_vulkan() {
-        let platform = RtPlatform::new();
-        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+    /// A headless surface (`VK_EXT_headless_surface`) on `device`'s instance, where the loader
+    /// offers one and the device's driver presents to it; `None`, saying why, where not.
+    fn headless_surface(device: &RtDevice) -> Option<vk::SurfaceKHR> {
         let headless = ash::ext::headless_surface::NAME;
         if !(device.instance().extensions().iter()).any(|e| e.as_c_str() == headless) {
             eprintln!("the loader offers no VK_EXT_headless_surface: no window swapchain tested");
-            return;
+            return None;
         }
         let (entry, instance) = device.instance().raw();
         let surfaces = khr::surface::Instance::new(entry, instance);
@@ -1069,8 +1094,25 @@ mod tests {
             eprintln!("the device presents to no headless surface ({presents:?}): none tested");
             // SAFETY: the surface is this test's, and nothing was made of it.
             unsafe { surfaces.destroy_surface(surface, None) };
-            return;
+            return None;
         }
+        Some(surface)
+    }
+
+    /// A window's swapchain on rt's device over a headless surface (`VK_EXT_headless_surface`,
+    /// where the device's driver presents to one): each frame takes an image, clears its
+    /// drawable and copies it out in a command buffer that presents it, and the copy holds the
+    /// clear; the swapchain is made again at a new size; an image taken for a frame that encodes
+    /// nothing is the next draw's, and the swapchain ends with it taken, its move home settled.
+    /// rt refuses nothing on the way. The present mode is logged once, at the first make: the
+    /// remake at the new size makes as many images.
+    #[test]
+    fn a_window_presents_rt_drawables_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let Some(surface) = headless_surface(&device) else {
+            return;
+        };
         let before = refusals();
         let logs = crate::core::testkit::logs::capture();
         // SAFETY: the surface is live, of the device's instance, and the swapchain's alone.
@@ -1149,5 +1191,78 @@ mod tests {
         );
         drop(swapchain);
         assert_eq!(refusals(), before);
+    }
+
+    /// A traced frame of a window's swapchain over a headless surface, on the GPU the test holds:
+    /// each take of its image writes `winacquire`, the wait for the image's fence `winfence`, and
+    /// its present `winpresent`, all on the thread that draws, on the trace's clock (`cbdone`'s):
+    /// each time a value holds is at or after the one before it, and none is after its line's own
+    /// time; the last take answered an image, its fence signalled, and the present succeeded.
+    #[test]
+    fn a_traced_window_frame_writes_its_takes_and_present_on_vulkan() {
+        // nextest runs each test in a process of its own, whose trace file is this one
+        let path = std::env::temp_dir().join(format!("rvg-rt-window-{}.txt", std::process::id()));
+        assert!(trace::to_file(&path));
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let Some(surface) = headless_surface(&device) else {
+            std::fs::remove_file(&path).unwrap();
+            return;
+        };
+        // SAFETY: the surface is live, of the device's instance, and the swapchain's alone.
+        let made = unsafe { RtSwapchain::new(&device, surface) };
+        let mut swapchain = made.expect("a swapchain over the headless surface");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let frame = take(&mut swapchain, (64, 48));
+        let texture = swapchain.texture(frame).expect("the frame's drawable");
+        let made = queue.command_buffer(on).expect("never a raise");
+        let made = made.expect("a command buffer");
+        let mut pass = rt::RenderPassDescriptor::default();
+        let attachment = &mut pass.color_attachments[0];
+        attachment.texture = Some(texture.rt().clone());
+        attachment.load_action = rt::LoadAction::Clear;
+        let clear = made.rt().render_command_encoder(&pass);
+        clear.expect("a clear of the drawable").end_encoding();
+        assert!(swapchain.encode_ready(frame, &made));
+        assert_eq!(made.commit(on), Ok(()));
+        assert!(swapchain.present(frame, &made));
+        assert_eq!(made.wait_until_completed(on), Ok(()));
+        drop(swapchain);
+        trace::flush_before_death();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // Each line of `kind`: its thread, then its time and its values.
+        let lines = |kind: &str| -> Vec<(String, Vec<u64>)> {
+            (text.lines())
+                .map(|l| l.split(' ').collect::<Vec<_>>())
+                .filter(|f| f.get(2) == Some(&kind))
+                .map(|f| {
+                    let at = f[0].parse::<u64>().unwrap();
+                    let values = f[3..].iter().map(|v| v.parse::<u64>().unwrap());
+                    (f[1].to_owned(), std::iter::once(at).chain(values).collect())
+                })
+                .collect()
+        };
+        let (takes, fences, presents) =
+            (lines("winacquire"), lines("winfence"), lines("winpresent"));
+        assert!(
+            !takes.is_empty() && !fences.is_empty() && presents.len() == 1,
+            "{text}"
+        );
+        let thread = &presents[0].0;
+        for (th, f) in takes.iter().chain(&fences).chain(&presents) {
+            assert_eq!(th, thread, "{text}");
+            // The values are times but the last, which is the call's answer.
+            let (&answer, times) = f[1..].split_last().unwrap();
+            assert!(times[0] > 0 && answer <= 1, "{text}");
+            assert!(times.windows(2).all(|w| w[0] <= w[1]), "{text}");
+            assert!(times.last() <= Some(&f[0]), "{text}");
+        }
+        let answered =
+            |lines: &[(String, Vec<u64>)]| lines.last().and_then(|(_, f)| f.last().copied());
+        assert_eq!(answered(&takes), Some(1), "{text}");
+        assert_eq!(answered(&fences), Some(1), "{text}");
+        assert_eq!(answered(&presents), Some(1), "{text}");
     }
 }
