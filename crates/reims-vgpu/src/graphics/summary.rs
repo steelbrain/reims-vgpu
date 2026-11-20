@@ -12,9 +12,9 @@
 //!   `PresentAnswers::refreshed` calls).
 //! - **Window**: the window's own times (`reims_vgpu_vulkan::rt_platform::window_times`): the CPU
 //!   time inside its swapchain's `vkAcquireNextImageKHR` and `vkQueuePresentKHR` calls, its
-//!   presents' waits for rt's lock of the presenting queue, and its frames' command buffers' GPU
-//!   time, each with its count, its time in all and the longest (the waits with no count: one a
-//!   present).
+//!   presents' waits for rt's lock of the presenting queue, its frames' command buffers' GPU
+//!   time, and the CPU time inside its `vkCreateSwapchainKHR` calls, each with its count, its time
+//!   in all and the longest (the waits with no count: one a present).
 //! - **rt**: rt's part (`reims_vgpu_vulkan::rt_platform::summary`), once its device is made.
 //! - **Waits**: our waits of 5 ms or more, by name, each with its count, its time in all and the
 //!   longest (`reims_vgpu_vulkan::core::long_waits`, whose doc names them).

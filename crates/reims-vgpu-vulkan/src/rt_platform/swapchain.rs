@@ -36,7 +36,8 @@
 //!
 //! **Its calls are timed** for the host's summary, where it counts them
 //! ([`super::window_times`]): each `vkAcquireNextImageKHR` call and each `vkQueuePresentKHR` call,
-//! and each present's wait before its call for rt's lock of the presenting queue.
+//! each present's wait before its call for rt's lock of the presenting queue, and each
+//! `vkCreateSwapchainKHR` call.
 //!
 //! **Destroying a swapchain** (rt's guide, "Destroying a swapchain"). Every command buffer that
 //! drew into or presented one of its images has completed, waited for as it retires, and so has
@@ -941,9 +942,13 @@ impl RtSwapchain {
             .present_mode(self.mode)
             .clipped(true)
             .old_swapchain(old);
+        let began = window_times::on().then(trace::now);
         // SAFETY: a valid create info over the live surface; `old` is this swapchain's last.
-        let raw = unsafe { self.swapchain_api.create_swapchain(&info, None) }
-            .map_err(|e| Unmade::Asked(self.refused_by("vkCreateSwapchainKHR", e)))?;
+        let made = unsafe { self.swapchain_api.create_swapchain(&info, None) };
+        if let Some(began) = began {
+            window_times::created(trace::now().saturating_sub(began));
+        }
+        let raw = made.map_err(|e| Unmade::Asked(self.refused_by("vkCreateSwapchainKHR", e)))?;
         let images = self
             .wrap(raw, &info)
             .inspect_err(|_| {
@@ -1304,8 +1309,9 @@ mod tests {
     /// A frame of a window's swapchain over a headless surface, on the GPU the test holds, with
     /// the window's times counted (`super::window_times`): its takes' `vkAcquireNextImageKHR`
     /// calls, one at least, its one `vkQueuePresentKHR` call and its wait for the presenting
-    /// queue's lock, and, through a completed handler as the window's draw adds one, its command
-    /// buffer's GPU time; each call took some time, and none longer than the period's in all.
+    /// queue's lock, its swapchain's one `vkCreateSwapchainKHR` call, and, through a completed
+    /// handler as the window's draw adds one, its command buffer's GPU time; each call took some
+    /// time, and none longer than the period's in all.
     #[test]
     fn a_counted_window_frame_times_its_calls_and_gpu_time_on_vulkan() {
         let platform = RtPlatform::new();
@@ -1346,16 +1352,17 @@ mod tests {
         let counted = window_times::take();
         let (acquires, presents) = (counted.acquires, counted.presents);
         let (waits, frames) = (counted.present_lock_waits, counted.frames_on_gpu);
+        let creates = counted.creates;
         assert!(acquires.count >= 1, "{counted:?}");
         assert_eq!(
-            (presents.count, waits.count, frames.count),
-            (1, 1, 1),
+            (presents.count, waits.count, frames.count, creates.count),
+            (1, 1, 1, 1),
             "{counted:?}"
         );
-        for spans in [acquires, presents, frames] {
+        for spans in [acquires, presents, frames, creates] {
             assert!(spans.total > std::time::Duration::ZERO, "{counted:?}");
         }
-        for spans in [acquires, presents, waits, frames] {
+        for spans in [acquires, presents, waits, frames, creates] {
             assert!(spans.longest <= spans.total, "{counted:?}");
         }
     }

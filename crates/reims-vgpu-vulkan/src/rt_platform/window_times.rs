@@ -16,6 +16,9 @@
 //!   queue), from its GPU start to its GPU end as its completed handler learns them
 //!   ([`CompletedInfo::gpu_times_ns`]), the span of rt's two timestamps of it. One that ended
 //!   with an error has no GPU times, and is not counted.
+//! - **`vkCreateSwapchainKHR`**: the CPU time inside each call of a window's swapchain, made or
+//!   refused, holding the window system's lock: a window makes one at its first draw and at each
+//!   remake (a new size, a swapchain out of date).
 //!
 //! The CPU times are on the trace's clock ([`crate::core::trace::now`]). The trace
 //! (`REIMS_VGPU_TRACE`) times the same spans one by one where it is on: `winacquire` each take's
@@ -49,6 +52,9 @@ static PRESENT_LOCK_WAITS: Counter = Counter::new();
 /// The window frames' command buffers on the GPU.
 static FRAMES_ON_GPU: Counter = Counter::new();
 
+/// The `vkCreateSwapchainKHR` calls.
+static CREATES: Counter = Counter::new();
+
 /// What one kind counted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Spans {
@@ -71,6 +77,8 @@ pub struct Period {
     pub present_lock_waits: Spans,
     /// The window frames' command buffers on the GPU.
     pub frames_on_gpu: Spans,
+    /// The `vkCreateSwapchainKHR` calls.
+    pub creates: Spans,
 }
 
 /// One kind's count, nanoseconds in all and longest, since the take before.
@@ -132,6 +140,13 @@ pub(crate) fn presented(lock_wait: u64, call: u64) {
     }
 }
 
+/// A `vkCreateSwapchainKHR` call took `nanos`: counted where counting is on.
+pub(crate) fn created(nanos: u64) {
+    if on() {
+        CREATES.add(nanos);
+    }
+}
+
 /// A window frame's command buffer completed with `gpu_times_ns`, its GPU start and end
 /// ([`CompletedInfo::gpu_times_ns`]): counted where it has them and counting is on.
 ///
@@ -151,11 +166,13 @@ pub fn take() -> Period {
         presents: PRESENTS.take(),
         present_lock_waits: PRESENT_LOCK_WAITS.take(),
         frames_on_gpu: FRAMES_ON_GPU.take(),
+        creates: CREATES.take(),
     }
 }
 
 /// The summary's part of `period`: `window: ...`, each kind by name with its count, its time in
-/// all and the longest, the lock waits without their count, which is the presents'.
+/// all and the longest, the lock waits without their count, which is the presents'; the creates
+/// last, after the parts written before they were counted.
 pub fn line(period: &Period) -> String {
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
     let spans = |name: &str, s: &Spans| {
@@ -168,12 +185,13 @@ pub fn line(period: &Period) -> String {
     };
     let waits = &period.present_lock_waits;
     format!(
-        "window: {}; {}; presenting-queue lock waits {:.1} ms, the longest {:.1} ms; {}",
+        "window: {}; {}; presenting-queue lock waits {:.1} ms, the longest {:.1} ms; {}; {}",
         spans("vkAcquireNextImageKHR", &period.acquires),
         spans("vkQueuePresentKHR", &period.presents),
         ms(waits.total),
         ms(waits.longest),
         spans("frames on the GPU", &period.frames_on_gpu),
+        spans("vkCreateSwapchainKHR", &period.creates),
     )
 }
 
@@ -189,6 +207,7 @@ mod tests {
         acquired(1_000_000);
         presented(1_000, 2_000_000);
         frame_ran(Some((10, 300_010)));
+        created(700_000);
         assert_eq!(take(), Period::default());
         count();
         acquired(1_000_000);
@@ -198,6 +217,7 @@ mod tests {
         frame_ran(Some((10, 300_010)));
         frame_ran(Some((5_000, 105_000)));
         frame_ran(None);
+        created(700_000);
         let spans = |count, total, longest| Spans {
             count,
             total: Duration::from_nanos(total),
@@ -210,6 +230,7 @@ mod tests {
                 presents: spans(2, 2_500_000, 2_000_000),
                 present_lock_waits: spans(2, 401_000, 400_000),
                 frames_on_gpu: spans(2, 400_000, 300_000),
+                creates: spans(1, 700_000, 700_000),
             }
         );
         assert_eq!(take(), Period::default());
@@ -229,18 +250,21 @@ mod tests {
             presents: spans(238, 41_600, 2_260),
             present_lock_waits: spans(238, 380, 160),
             frames_on_gpu: spans(238, 30_940, 310),
+            creates: spans(2, 1_480, 910),
         };
         assert_eq!(
             line(&period),
             "window: vkAcquireNextImageKHR 412 in 3.1 ms, the longest 0.9 ms; vkQueuePresentKHR \
              238 in 41.6 ms, the longest 2.3 ms; presenting-queue lock waits 0.4 ms, the longest \
-             0.2 ms; frames on the GPU 238 in 30.9 ms, the longest 0.3 ms"
+             0.2 ms; frames on the GPU 238 in 30.9 ms, the longest 0.3 ms; vkCreateSwapchainKHR \
+             2 in 1.5 ms, the longest 0.9 ms"
         );
         assert_eq!(
             line(&Period::default()),
             "window: vkAcquireNextImageKHR 0 in 0.0 ms, the longest 0.0 ms; vkQueuePresentKHR 0 \
              in 0.0 ms, the longest 0.0 ms; presenting-queue lock waits 0.0 ms, the longest 0.0 \
-             ms; frames on the GPU 0 in 0.0 ms, the longest 0.0 ms"
+             ms; frames on the GPU 0 in 0.0 ms, the longest 0.0 ms; vkCreateSwapchainKHR 0 in 0.0 \
+             ms, the longest 0.0 ms"
         );
     }
 }
