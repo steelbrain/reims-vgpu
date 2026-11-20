@@ -5,8 +5,8 @@
 #
 #   scripts/install-ctl.sh [--yes] [--update] [--skip-qemu]
 #
-# The library runs on Vulkan everywhere (on a Mac through MoltenVK), and VMs
-# run on QEMU built on it:
+# The library runs on Vulkan everywhere (on a Mac on Mesa's KosmicKrisp, which
+# Homebrew's mesa has on macOS 26 and later), and VMs run on QEMU built on it:
 # - Linux on x86-64 (Ubuntu or Debian, Fedora, Arch or CachyOS; other
 #   distributions get the list of what to install): x86-64 VMs on KVM, and
 #   arm64 VMs, emulated by TCG;
@@ -283,12 +283,34 @@ missing=()
 
 # A Mac's C compiler and linker, which Rust's builds use, and Homebrew's
 # packages: QEMU's build tools and the libraries it links, CMake for SDL3,
-# which the library builds from source, and the Vulkan loader and MoltenVK,
-# its Vulkan driver, which the library opens.
+# which the library builds from source, the Vulkan loader, and mesa, whose
+# KosmicKrisp is the Vulkan driver the library runs on (mac_vulkan_links,
+# below). Homebrew's mesa builds KosmicKrisp on macOS 26 and later only (its
+# formula's vulkan-drivers are "kosmickrisp,swrast" from Tahoe on, "swrast"
+# before), so on an older macOS mesa is left out, and the install goes on
+# saying that VMs there get no GPU (mac_gpu_note). Nothing of ours loads
+# MoltenVK: rt's floor refuses it
+# (crates/reims-vgpu-vulkan/src/os/macos/rt_driver.rs), so it is not listed;
+# Homebrew's mesa depends on molten-vk itself, for its zink driver.
+MAC_GPU=1
+# mac_gpu_note: where this Mac's macOS is too old for KosmicKrisp, says so.
+mac_gpu_note() {
+  [[ $MAC_GPU == 1 ]] ||
+    warn "VMs on this Mac get no GPU: reims-vgpu runs on Mesa's KosmicKrisp Vulkan driver, which needs macOS 26 or later, and this Mac runs macOS $(sw_vers -productVersion 2>/dev/null). reims-ctl and QEMU install anyway."
+}
 if [[ $OS == Darwin ]]; then
   xcode-select -p >/dev/null 2>&1 || die "Xcode's command line tools are missing: run xcode-select --install, then this again"
   command -v brew >/dev/null 2>&1 || die "Homebrew is missing (https://brew.sh): install it, then run this again"
-  for f in ninja pkgconf cmake glib pixman libslirp gnutls vulkan-loader molten-vk; do
+  mac_major="$(sw_vers -productVersion 2>/dev/null || true)"
+  mac_major="${mac_major%%.*}"
+  brews=(ninja pkgconf cmake glib pixman libslirp gnutls vulkan-loader)
+  if [[ $mac_major =~ ^[0-9]+$ ]] && ((mac_major < 26)); then
+    MAC_GPU=0
+  else
+    brews+=(mesa)
+  fi
+  mac_gpu_note
+  for f in "${brews[@]}"; do
     brew list --formula "$f" >/dev/null 2>&1 || missing+=("$f")
   done
   if ((${#missing[@]})); then
@@ -628,14 +650,11 @@ kept_qemu() {
 # library's rt platform loads only from beside QEMU's binary or from ../lib
 # (crates/reims-vgpu-vulkan/src/os/macos/rt_driver.rs). Each links to the file
 # in its Homebrew formula's opt directory, which brew upgrade moves to the new
-# version: the loader to vulkan-loader's, and KosmicKrisp to mesa's, where mesa
-# is installed (its build has KosmicKrisp on macOS 26 and later). mesa is not
-# among the packages this script installs, since the library's default platform
-# does not use it: where its manifest in Homebrew's share has the system loader
-# list KosmicKrisp beside MoltenVK, the default platform passes KosmicKrisp
-# over, as a device a display's window cannot present on, and opens MoltenVK
-# (docs/qemu.md, "The rt platform's Vulkan on a Mac"). Without KosmicKrisp the
-# rt platform makes its own instance.
+# version: the loader to vulkan-loader's, and KosmicKrisp to mesa's, which the
+# dependencies above install on macOS 26 and later. Without KosmicKrisp the rt
+# platform makes its own instance, over the system loader's drivers, which give
+# it no device (rt's floor refuses MoltenVK): a mesa without it, as one poured
+# for an older macOS, is said to give VMs no GPU.
 mac_vulkan_links() {
   local brew_prefix loader driver
   brew_prefix="$(brew --prefix)"
@@ -646,6 +665,8 @@ mac_vulkan_links() {
   ln -sfn "$loader" "$1/libvulkan.1.dylib"
   if [[ -f $driver ]]; then
     ln -sfn "$driver" "$1/libvulkan_kosmickrisp.dylib"
+  elif [[ $MAC_GPU == 1 ]]; then
+    warn "Homebrew's mesa has no KosmicKrisp Vulkan driver ($driver), so VMs get no GPU: run brew reinstall mesa, then this again"
   fi
 }
 
@@ -808,6 +829,7 @@ if [[ $WINDOWS == 1 ]]; then
   echo "  reims-ctl doctor"
   exit 0
 fi
+mac_gpu_note
 # By its full path, which works before PATH finds reims-ctl.
 echo "Check this host:"
 printf '  %q doctor\n' "$BIN"
