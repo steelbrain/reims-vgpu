@@ -26,7 +26,9 @@
 // the answer marks the header's clients for the host. The wire of the pages a deferral carried is
 // held while the host may read them, is the caller's once the block's pages are named or the
 // deferral refused, and goes with the entry wherever it goes. A block's SURFACE_PAGES carries its
-// surface's layout where it asks, and where it is cached on a device that asks nothing.
+// surface's layout where it asks, and where it is cached on a device that asks nothing. A
+// generation's refill record is written as the block is cached and at each read-write lock, and
+// asks one refill once the lock that moved the generation is let go (RgfxSurfaceRefill.hpp).
 #include "RgfxSurfaceCaches.hpp"
 
 #include <cstdio>
@@ -47,6 +49,104 @@ void check(bool ok, const char *what)
 constexpr uint64_t kSurface = 0x1000, kOther = 0x2000, kNotCached = 0x3000;
 constexpr uint64_t kBlock = 0x40000, kOtherBlock = 0x80000;
 constexpr uint32_t kId = 42, kOtherId = 43;
+
+// The refill record (RgfxSurfaceRefill.hpp): the kext writes it as it caches the block and at
+// each read-write lock, before the generation; the first use once the unlock seed moves past the
+// record's asks a refill and settles it, whatever filled the cache meanwhile; a use while the lock
+// is held or being taken asks nothing and leaves it owed; a GPU write asks once more; a newer
+// generation's record is left alone; an older one's is made anew, unsure with no lock held; and
+// without seeds it settles at once.
+void refillRecords()
+{
+	RgfxCachedSurface entries[2] = {};
+	RgfxCacheTable t = {entries, 0, 2};
+	uint64_t header[4] = {};
+	RgfxCachedSurface *c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	check(c != nullptr && c->refillAt == nullptr, "a cached surface with no header yet");
+	rgfxCacheNoteFirstRefill(*c, true, 5, 5);
+	check(rgfxCacheReadWriteLock(t, kSurface, true, 5) == 1, "a lock with no header writes none");
+	c->refillAt = &header[3];
+	auto record = [&] { return rgfxRefillRead(header[3]); };
+
+	// Cached with no lock held: unsure at generation 1; with one held: owed.
+	rgfxCacheNoteFirstRefill(*c, true, 5, 5);
+	check(record().gen == 1 && record().state == kRgfxRefillUnsure && record().unlockSeed == 5,
+	      "cached with no lock held: unsure");
+	rgfxCacheNoteFirstRefill(*c, true, 6, 5);
+	check(record().state == kRgfxRefillOwed && record().unlockSeed == 5,
+	      "cached with a lock held: owed");
+	rgfxCacheNoteFirstRefill(*c, false, 6, 5);
+	check(record().state == kRgfxRefillSettled, "with no seeds exported: settled");
+
+	// A read-write lock: owed at the unlock seed before it, the generation the new one.
+	check(rgfxCacheReadWriteLock(t, kSurface, true, 5) == 2, "a read-write lock: generation 2");
+	check(record().gen == 2 && record().state == kRgfxRefillOwed && record().unlockSeed == 5,
+	      "its record: owed at the unlock seed before it");
+	check(!rgfxRefillSettled(header[3], 2), "a use at generation 2 asks the kext");
+	// Named as the lock is taken (the seeds not yet moved), and while it is held: nothing asked.
+	RgfxRefillStep s = rgfxRefillStep(header[3], 2, true, 5, 5);
+	check(!s.refill && !s.write && s.midWrite, "named as the lock is taken: stays owed");
+	s = rgfxRefillStep(header[3], 2, true, 6, 5);
+	check(!s.refill && !s.write && s.midWrite, "named while it is held: stays owed");
+	// Its unlock: the first use asks the refill and settles it.
+	s = rgfxRefillStep(header[3], 2, true, 6, 6);
+	check(s.refill && s.write && !s.midWrite && rgfxRefillRead(s.word).gen == 2 &&
+	          rgfxRefillRead(s.word).state == kRgfxRefillSettled &&
+	          rgfxRefillRead(s.word).unlockSeed == 6,
+	      "the first use after the unlock asks the refill, and settles the record");
+	header[3] = s.word;
+	check(rgfxRefillSettled(header[3], 2), "the next asks nothing");
+	// A GPU write moves both seeds: the next use asks again.
+	check(!rgfxRefillSettled(rgfxRefillWord(2, kRgfxRefillOwed, 6), 2), "owed again");
+	s = rgfxRefillStep(rgfxRefillWord(2, kRgfxRefillOwed, 6), 2, true, 7, 7);
+	check(s.refill && rgfxRefillRead(s.word).state == kRgfxRefillSettled,
+	      "a use after a GPU write asks once more");
+	// Released, but held again as it is settled: the refill, owed at the new unlock seed.
+	s = rgfxRefillStep(rgfxRefillWord(2, kRgfxRefillOwed, 6), 2, true, 8, 7);
+	check(s.refill && rgfxRefillRead(s.word).state == kRgfxRefillOwed &&
+	          rgfxRefillRead(s.word).unlockSeed == 7,
+	      "a lock held again as it settles leaves it owed");
+
+	// Unsure: the next use asks the refill where the unlock seed moved, or settles it.
+	s = rgfxRefillStep(rgfxRefillWord(2, kRgfxRefillUnsure, 6), 2, true, 6, 6);
+	check(!s.refill && s.write && rgfxRefillRead(s.word).state == kRgfxRefillSettled,
+	      "unsure, nothing moved: settled");
+	s = rgfxRefillStep(rgfxRefillWord(2, kRgfxRefillUnsure, 6), 2, true, 7, 7);
+	check(s.refill && rgfxRefillRead(s.word).state == kRgfxRefillSettled,
+	      "unsure, the unlock seed moved: the refill");
+
+	// A newer generation's record (a lock moved it after the use read the generation): left
+	// alone, nothing asked; an older one's is made anew as the generation is named first.
+	check(rgfxRefillSettled(rgfxRefillWord(3, kRgfxRefillOwed, 6), 2), "a newer record: alone");
+	s = rgfxRefillStep(rgfxRefillWord(1, kRgfxRefillSettled, 6), 2, true, 6, 6);
+	check(!s.refill && s.write && !s.midWrite && rgfxRefillRead(s.word).gen == 2 &&
+	          rgfxRefillRead(s.word).state == kRgfxRefillUnsure,
+	      "an older record, no lock held: unsure");
+	s = rgfxRefillStep(rgfxRefillWord(1, kRgfxRefillSettled, 6), 2, true, 7, 6);
+	check(!s.refill && s.midWrite && rgfxRefillRead(s.word).state == kRgfxRefillOwed &&
+	          rgfxRefillRead(s.word).unlockSeed == 6,
+	      "an older record, a lock held: owed at the unlock seed now");
+	// Without seeds: settled at once.
+	s = rgfxRefillStep(rgfxRefillWord(2, kRgfxRefillOwed, 6), 2, false, 0, 0);
+	check(!s.refill && s.write && rgfxRefillRead(s.word).state == kRgfxRefillSettled,
+	      "no seeds: settled");
+	// The generation's low 30 bits, across their wrap.
+	const uint64_t top = (1ull << 30) - 1;
+	check(rgfxRefillRead(rgfxRefillWord(top, kRgfxRefillOwed, 1)).gen == top &&
+	          rgfxRefillRead(rgfxRefillWord(top + 1, kRgfxRefillOwed, 1)).gen == 0,
+	      "the generation's low 30 bits");
+	check(rgfxRefillSettled(rgfxRefillWord(top + 1, kRgfxRefillOwed, 1), top) &&
+	          !rgfxRefillSettled(rgfxRefillWord(top, kRgfxRefillSettled, 1), top + 1),
+	      "newer and older across the wrap");
+	check(!rgfxRefillSettled(rgfxRefillWord(2, kRgfxRefillOwed, 1), 2) &&
+	          rgfxRefillRead(rgfxRefillWord(2, kRgfxRefillOwed, 0xffffffffu)).unlockSeed ==
+	              0xffffffffu,
+	      "the unlock seed whole");
+	// The lock with no seeds exported writes a settled record.
+	check(rgfxCacheReadWriteLock(t, kSurface) == 3 && record().gen == 3 &&
+	          record().state == kRgfxRefillSettled,
+	      "a lock with no seeds: settled");
+}
 
 void dormancy()
 {
@@ -1189,6 +1289,7 @@ int main()
 	          wire == &memory,
 	      "a block let go with no release lets the cache, the surface and the wiring go at once");
 
+	refillRecords();
 	dormancy();
 	clients();
 	room();

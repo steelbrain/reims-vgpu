@@ -71,6 +71,7 @@
 #include <stdint.h>
 
 #include "RgfxSurfaceBlocks.hpp"
+#include "RgfxSurfaceRefill.hpp"
 
 // Where a cached surface's block stands with its pages (RgfxSurfaceBlocks.hpp's deferred
 // blocks).
@@ -138,6 +139,10 @@ struct RgfxCachedSurface {
 	// kRgfxSurfaceClientsOffset), and the surface, whose reference the block's entry holds, or
 	// this table's `surface` after the let-go, while this entry lives: opaque here.
 	volatile uint32_t *clientsAt;
+	// Where the kext writes the generation's refill record for the processes (the header's
+	// kRgfxSurfaceRefillOffset, RgfxSurfaceRefill.hpp), as it caches the block and at each
+	// read-write lock.
+	volatile uint64_t *refillAt;
 	const void *object;
 	// Its pages (RgfxCacheDeferral): `wire` holds the surface's memory retained but not prepared
 	// while the block is deferred (rgfxCacheWired), and an attach prepares it. The block's
@@ -773,14 +778,44 @@ inline RgfxCacheReleaseStep rgfxCacheReleaseNext(RgfxCacheTable &t, uint64_t off
 	return step;
 }
 
-// A read-write CPU lock of surface `key` goes on: its CPU generation moves. The new generation,
-// or 0 where the surface is not cached.
-inline uint64_t rgfxCacheReadWriteLock(RgfxCacheTable &t, uint64_t key)
+// Writes `c`'s refill record for its generation where it has a header (RgfxSurfaceRefill.hpp):
+// `state` at the surface's unlock seed `unlockSeed` where `seeds` (IOSurface exports it), else
+// settled.
+inline void rgfxCacheNoteRefill(const RgfxCachedSurface &c, bool seeds, RgfxRefillState state,
+                                uint32_t unlockSeed)
+{
+	if (c.refillAt == nullptr)
+		return;
+	const uint64_t word = seeds ? rgfxRefillWord(c.cpuGen, state, unlockSeed)
+	                            : rgfxRefillWord(c.cpuGen, kRgfxRefillSettled, 0);
+	__atomic_store_n(c.refillAt, word, __ATOMIC_RELEASE);
+}
+
+// The refill record of a block just cached, at generation 0: owed where a CPU holds the surface
+// locked for writing as it is cached (its lock seed `lockSeed` past its unlock seed), that
+// lock's op 2 come before the block was, so the first fill may be mid-write; else unsure, as a
+// lock may be being taken.
+inline void rgfxCacheNoteFirstRefill(const RgfxCachedSurface &c, bool seeds, uint32_t lockSeed,
+                                     uint32_t unlockSeed)
+{
+	rgfxCacheNoteRefill(c, seeds, lockSeed != unlockSeed ? kRgfxRefillOwed : kRgfxRefillUnsure,
+	                    unlockSeed);
+}
+
+// A read-write CPU lock of surface `key` goes on: its CPU generation moves, and its refill record
+// is the new generation's (rgfxCacheNoteRefill), written before the caller writes the generation,
+// so a holder that reads the generation reads its record. `unlockSeed` is the surface's unlock
+// seed as the lock is taken, before IOSurface moves its lock seed. The new generation, or 0
+// where the surface is not cached.
+inline uint64_t rgfxCacheReadWriteLock(RgfxCacheTable &t, uint64_t key, bool seeds = false,
+                                       uint32_t unlockSeed = 0)
 {
 	RgfxCachedSurface *c = rgfxCacheFind(t, key);
 	if (c == nullptr)
 		return 0;
-	return ++c->cpuGen;
+	++c->cpuGen;
+	rgfxCacheNoteRefill(*c, seeds, kRgfxRefillOwed, unlockSeed);
+	return c->cpuGen;
 }
 
 // The BLOCK_RELEASE of the cached block at `offset` is to be posted: locks of its surface wait

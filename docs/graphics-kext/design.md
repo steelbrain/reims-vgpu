@@ -645,17 +645,22 @@ Stages:
       them; a decode that answers no picture makes the fill. A block named
       again over the same pages is filled again, as of the count then. The
       count moves at a read-write lock, and IOSurface calls no control
-      function at its unlock, so a buffer committed while a CPU holds the lock
-      fills the cache with the pages as they were mid-write. Where the kext
-      took `RGFX_FEATURE_SURFACE_REFILL`, the bundle reads the surface's lock
-      and unlock seeds from the kext (`kRgfxAccelMethodSurfaceSeeds`) as a
-      commit first names a count, and records them in the block's header (the
-      bundle's `RgfxSurfaceHeader`, which the kext's count shares); where they
-      show the lock held, or show none (the kext moves the count inside the
-      lock, before IOSurface moves its lock seed, so a commit can read the new
-      count before the seed), the next commit that names the count reads them
-      again, and once the unlock seed has moved past the recorded one, that
-      commit's use carries `RGFX_SURFACE_USE_REFILL`. The host then fills the
+      function at its unlock, so a fill made while a CPU holds the lock (a
+      buffer's committed then, or one the host makes at that count for its
+      own reasons: the first fill a block owes, a block named again) holds
+      the pages as they were mid-write. Where the kext took
+      `RGFX_FEATURE_SURFACE_REFILL`, each count has a refill record in the
+      block's header (the bundle's `RgfxSurfaceHeader`, which the kext's count
+      shares; the kext's `RgfxSurfaceRefill.hpp`): the kext writes it as it
+      caches the block and at each read-write lock, before the count, with the
+      surface's unlock seed then, which the lock's unlock moves (the kext
+      moves the count inside the lock, before IOSurface moves its lock seed).
+      A commit that names a count whose record is not settled reads the
+      surface's lock and unlock seeds from the kext
+      (`kRgfxAccelMethodSurfaceSeeds`); while the unlock seed is the
+      record's, the lock held or being taken, it asks nothing, and the first
+      commit once it has moved past it, in any process, carries
+      `RGFX_SURFACE_USE_REFILL` and settles the record. The host then fills the
       cache again at the count it holds, unless a buffer that may write it was
       committed since the cache was last copied into the pages, whose write a
       fill would lose: it keeps the cache, as without the flag. Both are
@@ -691,7 +696,8 @@ Stages:
         since a fill waits for it; a buffer committed while a CPU holds the
         surface locked for writing reads the pages as they were then, and the
         CPU's writes after it reach the first buffer committed after the
-        unlock that names the surface (the refill, above); a buffer of an
+        unlock that names the surface (the refill, above), whatever filled the
+        cache while the lock was held; a buffer of an
         older count taken after a fill of a newer one (two queues' buffers
         committed apart and taken in the other order) reads the newer bytes;
         a download of a cache nothing

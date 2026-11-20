@@ -382,6 +382,28 @@ static_assert(kRgfxPurgeableNonVolatile == kIOMemoryPurgeableNonVolatile, "op 7'
 static_assert(kRgfxPurgeableVolatile == kIOMemoryPurgeableVolatile, "op 7's volatile");
 static_assert(kRgfxPurgeableEmpty == kIOMemoryPurgeableEmpty, "op 7's empty");
 
+// The unlock seed of cached surface `c` into `seed`, where IOSurface exports it. IOSurface's
+// getter loads a field and takes no lock (rgfxSurfaceLocksSeeds), so it is read under state.lock,
+// inside a CPU lock's op 2 too.
+bool unlockSeedOf(const RgfxCachedSurface &c, uint32_t *seed)
+{
+	if (c.object == nullptr || !rgfxSurfaceUnlockSeedExported())
+		return false;
+	*seed = rgfxIOSurfaceUnlockSeed(static_cast<const OSObject *>(c.object));
+	return true;
+}
+
+// A block just cached: its refill record at generation 0 (rgfxCacheNoteFirstRefill), by the
+// surface's seeds now. Under state.lock.
+void noteFirstRefill(const RgfxCachedSurface &c)
+{
+	uint32_t unlockSeed = 0;
+	const bool seeds = unlockSeedOf(c, &unlockSeed);
+	const uint32_t lockSeed =
+	    seeds ? rgfxIOSurfaceLockSeed(static_cast<const OSObject *>(c.object)) : 0;
+	rgfxCacheNoteFirstRefill(c, seeds, lockSeed, unlockSeed);
+}
+
 // The control function every device cache the kext makes calls (RgfxIOSurfaceKPI.hpp), from
 // inside a CPU lock of its surface: op 2 waits while a write of the surface is pending, op 3
 // releases the reference IOSurface took for the call it ends, op 6 answers in its byte, and
@@ -536,7 +558,11 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 	}
 	if (a == 0) {
 		if (RgfxCachedSurface *c = rgfxCacheFind(state.caches, key)) {
-			const uint64_t gen = rgfxCacheReadWriteLock(state.caches, key);
+			// The unlock seed before this lock's: the generation's refill record is owed until
+			// the lock's unlock moves it (RgfxSurfaceRefill.hpp).
+			uint32_t unlockSeed = 0;
+			const bool seeds = unlockSeedOf(*c, &unlockSeed);
+			const uint64_t gen = rgfxCacheReadWriteLock(state.caches, key, seeds, unlockSeed);
 			if (c->genAt)
 				__atomic_store_n(c->genAt, gen, __ATOMIC_RELEASE);
 		}
@@ -931,7 +957,10 @@ RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
 		c->wire = memory;
 		c->clientsAt = reinterpret_cast<volatile uint32_t *>(header->getVirtualAddress() +
 		                                                     kRgfxSurfaceClientsOffset);
+		c->refillAt = reinterpret_cast<volatile uint64_t *>(header->getVirtualAddress() +
+		                                                    kRgfxSurfaceRefillOffset);
 		c->object = surface;
+		noteFirstRefill(*c);
 		c->deferral = kRgfxCacheGating;
 		c->context = context;
 		c->size = size;
@@ -1242,7 +1271,10 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 		c->wire = wire;
 		c->clientsAt = reinterpret_cast<volatile uint32_t *>(header->getVirtualAddress() +
 		                                                     kRgfxSurfaceClientsOffset);
+		c->refillAt = reinterpret_cast<volatile uint64_t *>(header->getVirtualAddress() +
+		                                                    kRgfxSurfaceRefillOffset);
 		c->object = surface;
+		noteFirstRefill(*c);
 		// IOSurface's getter, as in op 5, under state.lock, kept there on purpose: it loads a field
 		// and takes no lock (read from IOSurface's x86_64 code in macOS 26.6's KDK), and op 5 calls
 		// it holding IOSurface's own lock at each client's release, which a getter taking that lock

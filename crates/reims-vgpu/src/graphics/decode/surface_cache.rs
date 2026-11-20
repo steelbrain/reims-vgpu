@@ -60,11 +60,13 @@
 //!   pages, the CPU's writes, over it. On a block that reads back (Early copy, below), the
 //!   write's early copy lands in the pages whenever the GPU runs it, among the CPU's writes, as
 //!   a GPU's write lands where the GPU shares the CPU's memory, and the fill waits for it.
-//! - **Refill.** The generation moves at a read-write lock, not at its unlock, so a buffer
-//!   committed while a CPU holds the lock fills the cache with the pages as they were mid-write,
-//!   and the CPU's writes after it would reach the cache only at the next lock. A guest that took
-//!   `RGFX_FEATURE_SURFACE_REFILL` tracks each cached surface's unlock seed from such a commit,
-//!   and once the unlock has come, the next buffer's use carries `RGFX_SURFACE_USE_REFILL`: the
+//! - **Refill.** The generation moves at a read-write lock, not at its unlock, so a fill made
+//!   while a CPU holds the lock (a buffer's committed then, a present's, or the host's own: the
+//!   first fill a block owes, a block named again) holds the pages as they were mid-write, and
+//!   the CPU's writes after it would reach the cache only at the next lock. A guest that took
+//!   `RGFX_FEATURE_SURFACE_REFILL` keeps each cached surface's unlock seed at each read-write
+//!   lock, and once that lock's unlock has come, the next buffer's use carries
+//!   `RGFX_SURFACE_USE_REFILL`, whatever filled the cache meanwhile: the
 //!   cache is filled again at the generation it holds, as for a newer one, unless a buffer that
 //!   may write it was committed since its last copy into the pages, whose write a fill would
 //!   lose: the cache is then kept, as without the flag ([`SurfaceCaches::refill`]). Both are
@@ -3250,11 +3252,10 @@ impl<P: Platform> SurfaceCaches<P> {
         self.needs_fill_at(u.block_offset, u.cpu_gen) || self.refill(u) == Refill::Fill
     }
 
-    /// What the use `u` asks with [`RGFX_SURFACE_USE_REFILL`]: the guest's process saw a CPU
-    /// write the surface's pages after the read-write lock that moved the surface to `u`'s
-    /// generation (the lock was held as an earlier command buffer was committed, and its unlock
-    /// has come since), so the cache, which holds that generation, or will once the fills asked
-    /// of it are made ([`Self::will_hold`]), may hold the pages as they were mid-write. It is
+    /// What the use `u` asks with [`RGFX_SURFACE_USE_REFILL`]: the guest saw the unlock of the
+    /// read-write lock that moved the surface to `u`'s generation come since the generation was
+    /// last settled, so the cache, which holds that generation, or will once the fills asked of
+    /// it are made ([`Self::will_hold`]), may hold the pages as they were mid-write. It is
     /// filled again ([`Refill::Fill`]), unless a command buffer that may write it was committed
     /// since its last copy into the pages ([`Refill::Kept`]): a fill would lose that buffer's
     /// writes, which the pages lack, and the cache stays as at an equal generation without the

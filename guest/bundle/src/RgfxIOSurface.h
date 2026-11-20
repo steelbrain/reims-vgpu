@@ -35,13 +35,15 @@
  * which the kext serves, and at the commit of each command buffer that uses the surface, which
  * names it before its first encoder with the surface's CPU generation from the block's header
  * (rgfxIOSurfaceNameUses), so the host fills the cache where the CPU wrote the surface under a
- * read-write lock since. The generation moves at the lock, not at its unlock, so a commit made
- * while a CPU holds the surface locked for writing has the cache filled mid-write; where the host
- * took RGFX_FEATURE_SURFACE_REFILL (rgfxIOSurfaceSetRefill), the block's header records the
- * surface's unlock seed as such a commit named it, as copy mode's does (below), and the first
- * commit after the unlock seed moves asks the host to fill the cache again
- * (RGFX_SURFACE_USE_REFILL). The texture's own CPU access takes the surface's lock, as a CPU
- * access does. Whether a block is cached is the kext's answer, the same for every holder.
+ * read-write lock since. The generation moves at the lock, not at its unlock, so a fill made
+ * while a CPU holds the surface locked for writing (a commit's, or the host's own at that
+ * generation) holds the pages mid-write; where the host took RGFX_FEATURE_SURFACE_REFILL
+ * (rgfxIOSurfaceSetRefill), the block's header holds each generation's refill record, which the
+ * kext writes at the lock with the surface's unlock seed then (the kext's RgfxSurfaceRefill.hpp),
+ * and the first commit after the unlock seed moves asks the host to fill the cache again
+ * (RGFX_SURFACE_USE_REFILL), as copy mode syncs again (below). The texture's own CPU access takes
+ * the surface's lock, as a CPU access does. Whether a block is cached is the kext's answer, the
+ * same for every holder.
  *
  * Where it does not, or the device uses no surface in place (no RGFX_FEATURE_SURFACE_PAGES), or
  * the host or the kext refuses the surface's pages, the view is a copy: the surface's own pages
@@ -56,7 +58,7 @@
  * on", off, or unknown before a device says), and counts the uploads made while a CPU held the
  * surface locked for writing ("mid-write"), those made again once such a CPU let go ("synced
  * again at the unlock"), and the kext's answers they took ("asks for it"); and, for cached
- * surfaces, the uses named at a new generation while such a CPU held its lock ("named
+ * surfaces, the uses named while the lock that moved their generation was held ("named
  * mid-write"), the refills asked once it let go ("filled again at the unlock"), and the kext's
  * answers they took.
  *
@@ -269,8 +271,9 @@ void rgfxIOSurfaceNoteUse(RgfxEncoder *_Nullable enc, __unsafe_unretained id _Nu
 /// buffer uses (rgfxIOSurfaceNoteUse) or writes (`writes`, taken from `enc`), once each
 /// (RGFX_OP_SURFACE_USE): its block, its CPU generation as the kext left it at the surface's last
 /// read-write lock, whether the buffer writes it, and, where the process has caches filled again
-/// (rgfxIOSurfaceSetRefill), whether a CPU that held the surface locked for writing as an earlier
-/// commit named that generation has let go since (RGFX_SURFACE_USE_REFILL). The host fills the
+/// (rgfxIOSurfaceSetRefill), whether the read-write lock that moved the surface to that
+/// generation has been let go since its refill record was last settled (RGFX_SURFACE_USE_REFILL,
+/// the kext's RgfxSurfaceRefill.hpp). The host fills the
 /// surface's device cache from its pages before the buffer's work where the cache holds an older
 /// generation, or the use asks it again. The answer
 /// is every surface the buffer uses, taken from `enc`, for its post to name its order by
@@ -299,8 +302,8 @@ std::vector<std::shared_ptr<void>> rgfxIOSurfaceNameOrder(
 /// feature word holds RGFX_FEATURE_SURFACE_ORDER, as the device is made.
 void rgfxIOSurfaceSetOrder(bool on);
 
-/// Whether the process has the host fill a cached surface's device cache again once a CPU that
-/// held the surface locked for writing as a commit named it has let go (RGFX_SURFACE_USE_REFILL,
+/// Whether the process has the host fill a cached surface's device cache again once the read-write
+/// lock that moved its generation has been let go (RGFX_SURFACE_USE_REFILL,
 /// rgfxIOSurfaceNameUses): where the device's feature word holds RGFX_FEATURE_SURFACE_REFILL and
 /// the kext answers surfaces' seeds (kRgfxKextFeatureSurfaceSeeds), as the device is made.
 void rgfxIOSurfaceSetRefill(bool on);

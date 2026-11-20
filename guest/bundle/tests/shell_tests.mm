@@ -65,6 +65,7 @@
 #include "RgfxCommitOrder.hpp"
 #include "RgfxHeapSizes.hpp"
 #include "RgfxSlabs.hpp"
+#include "../../kext/src/RgfxSurfaceRefill.hpp"
 #include "../../kext/src/RgfxUserClientABI.hpp"
 
 #include <CoreVideo/CoreVideo.h>
@@ -21924,16 +21925,17 @@ void test_iosurface_cached()
 		         bytesPerRow:4];
 		CHECK(IOSurfaceGetSeed(plain) == plainSeed);
 
-		// Where the host took SURFACE_REFILL (rgfxIOSurfaceSetRefill): the block's header records
-		// the surface's unlock seed as a commit names a new generation, and the first commit
-		// after the unlock of a CPU's write lock held then asks the host to fill the cache again
-		// (RGFX_SURFACE_USE_REFILL), once. Another holder's CPU is played as in
-		// test_iosurface_copy_waits_for_the_cpu_unlock: the kext's seeds as IOSurface keeps them
-		// (the unlock seed is the lock seed less the write locks held), and the generation the
-		// kext moves at each read-write lock.
+		// Where the host took SURFACE_REFILL (rgfxIOSurfaceSetRefill): each generation's refill
+		// record in the block's header, which the kext writes as it caches the block and at each
+		// read-write lock (the kext's RgfxSurfaceRefill.hpp), has the first commit after the
+		// unlock of the lock that moved the generation ask the host to fill the cache again
+		// (RGFX_SURFACE_USE_REFILL), once. The kext is played here: the surface's seeds as
+		// IOSurface keeps them (a read-write lock moves the lock seed, its unlock the unlock seed,
+		// a GPU write both), and the generation and record it writes at each read-write lock,
+		// before IOSurface moves the lock seed.
 		struct Seeds {
 			IOSurfaceRef surface = nullptr;
-			uint32_t held = 0; // the other holder's write locks
+			uint32_t lockSeed = 100, unlockSeed = 100;
 			int asked = 0;
 			static bool seeds(void *c, uint32_t surfaceId, uint32_t *lockSeed,
 			                  uint32_t *unlockSeed)
@@ -21942,8 +21944,8 @@ void test_iosurface_cached()
 				k->asked++;
 				if (k->surface == nullptr || IOSurfaceGetID(k->surface) != surfaceId)
 					return false;
-				*lockSeed = IOSurfaceGetSeed(k->surface);
-				*unlockSeed = *lockSeed - k->held;
+				*lockSeed = k->lockSeed;
+				*unlockSeed = k->unlockSeed;
 				return true;
 			}
 		} kext;
@@ -21957,63 +21959,85 @@ void test_iosurface_cached()
 			[rce endEncoding];
 			return uses(rcb);
 		};
-		auto otherLock = [&] {
+		// The kext's op 2: the record, then the generation.
+		auto kextLock = [&] {
+			header[3] = rgfxRefillWord(header[2] + 1, kRgfxRefillOwed, kext.unlockSeed);
 			header[2]++;
-			CHECK(IOSurfaceLock(surface, 0, nullptr) == kIOReturnSuccess);
-			kext.held++;
 		};
-		auto otherUnlock = [&] {
-			IOSurfaceUnlock(surface, 0, nullptr);
-			kext.held--;
+		auto otherLock = [&] {
+			kextLock();
+			kext.lockSeed++;
 		};
+		auto otherUnlock = [&] { kext.unlockSeed = kext.lockSeed; };
 		const uint32_t refill = RGFX_SURFACE_USE_REFILL;
-		// A new generation, no lock held: its first two commits ask, the second settling it.
+		// Cached at generation 10 with no lock held: unsure, so its first commit asks the kext,
+		// and settles it.
 		header[2] = 10;
+		header[3] = rgfxRefillWord(10, kRgfxRefillUnsure, kext.unlockSeed);
 		CHECK(is(read(), block, 10, 0) && kext.asked == 1);
-		CHECK(is(read(), block, 10, 0) && kext.asked == 2);
-		CHECK(is(read(), block, 10, 0) && kext.asked == 2);
+		CHECK(is(read(), block, 10, 0) && kext.asked == 1);
 		// The other holder writes under its lock, and this holder commits: the cache is filled
 		// mid-write. Each commit asks while the lock is held; the first after the unlock asks the
 		// refill, and the next nothing.
 		otherLock();
+		CHECK(is(read(), block, 11, 0) && kext.asked == 2);
 		CHECK(is(read(), block, 11, 0) && kext.asked == 3);
-		CHECK(is(read(), block, 11, 0) && kext.asked == 4);
 		otherUnlock();
-		CHECK(is(read(), block, 11, refill) && kext.asked == 5);
-		CHECK(is(read(), block, 11, 0) && kext.asked == 5);
+		CHECK(is(read(), block, 11, refill) && kext.asked == 4);
+		CHECK(is(read(), block, 11, 0) && kext.asked == 4);
+		// A lock no commit saw held, whose generation the host may have filled mid-write all the
+		// same (a present's fill, or the first a block owes): the first commit after its unlock
+		// asks the refill.
+		otherLock();
+		otherUnlock();
+		CHECK(is(read(), block, 12, refill) && kext.asked == 5);
+		CHECK(is(read(), block, 12, 0) && kext.asked == 5);
 		// Named as the lock is taken: the kext has moved the generation, IOSurface not yet the
-		// lock seed. The lock and its unlock come before the next commit, which asks the refill.
-		header[2] = 12;
-		CHECK(is(read(), block, 12, 0) && kext.asked == 6);
-		CHECK(IOSurfaceLock(surface, 0, nullptr) == kIOReturnSuccess);
-		IOSurfaceUnlock(surface, 0, nullptr);
-		CHECK(is(read(), block, 12, refill) && kext.asked == 7);
-		CHECK(is(read(), block, 12, 0) && kext.asked == 7);
+		// lock seed. The commit asks nothing of the host and leaves the record owed; the lock and
+		// its unlock come before the next commit, which asks the refill.
+		kextLock();
+		CHECK(is(read(), block, 13, 0) && kext.asked == 6);
+		kext.lockSeed++;
+		otherUnlock();
+		CHECK(is(read(), block, 13, refill) && kext.asked == 7);
+		CHECK(is(read(), block, 13, 0) && kext.asked == 7);
 		// A buffer that writes the surface after the unlock carries both flags.
 		otherLock();
-		CHECK(is(read(), block, 13, 0) && kext.asked == 8);
+		CHECK(is(read(), block, 14, 0) && kext.asked == 8);
 		otherUnlock();
 		cb = [queue commandBuffer];
 		[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
-		CHECK(is(uses(cb), block, 13, RGFX_SURFACE_USE_WRITES | refill) && kext.asked == 9);
-		// A block made again holds an older block's record, not its own (the serial): read as a
-		// new generation's.
-		header[0] = ~0ull;
-		CHECK(is(read(), block, 13, 0) && kext.asked == 10);
-		CHECK(is(read(), block, 13, 0) && kext.asked == 11);
-		CHECK(is(read(), block, 13, 0) && kext.asked == 11);
+		CHECK(is(uses(cb), block, 14, RGFX_SURFACE_USE_WRITES | refill) && kext.asked == 9);
+		// A GPU write moves both seeds: the next commit asks again, which the host keeps where a
+		// buffer wrote the cache since its last copy into the pages.
+		kext.lockSeed++;
+		kext.unlockSeed++;
+		CHECK(is(read(), block, 14, refill) && kext.asked == 10);
+		CHECK(is(read(), block, 14, 0) && kext.asked == 10);
+		// A commit that read the generation before a lock moved it finds the newer generation's
+		// record, and asks nothing.
+		header[3] = rgfxRefillWord(15, kRgfxRefillOwed, kext.unlockSeed);
+		CHECK(is(read(), block, 14, 0) && kext.asked == 10);
+		// A record of an older generation than the commit's (the kext's written over by another
+		// holder's) is made as the generation is named first: unsure with no lock held, which the
+		// next commit settles.
+		header[2] = 16;
+		CHECK(is(read(), block, 16, 0) && kext.asked == 11);
+		CHECK(is(read(), block, 16, 0) && kext.asked == 12);
+		CHECK(is(read(), block, 16, 0) && kext.asked == 12);
 		// Where the kext answers no seeds, the record settles at its first commit.
 		kext.surface = nullptr;
-		header[2] = 14;
-		CHECK(is(read(), block, 14, 0) && kext.asked == 12);
-		CHECK(is(read(), block, 14, 0) && kext.asked == 12);
+		otherLock();
+		CHECK(is(read(), block, 17, 0) && kext.asked == 13);
+		otherUnlock();
+		CHECK(is(read(), block, 17, 0) && kext.asked == 13);
 		// Where the host did not take it, no commit asks or refills.
 		rgfxIOSurfaceSetRefill(false);
 		kext.surface = surface;
 		otherLock();
-		CHECK(is(read(), block, 15, 0));
+		CHECK(is(read(), block, 18, 0));
 		otherUnlock();
-		CHECK(is(read(), block, 15, 0) && kext.asked == 12);
+		CHECK(is(read(), block, 18, 0) && kext.asked == 13);
 		region.setSurfaceSeedsSource(nullptr, nullptr);
 
 #if RgfxMakesResidencySets

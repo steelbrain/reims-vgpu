@@ -122,7 +122,8 @@ FRAMEWORKS  = -framework Metal -framework Foundation -framework IOKit -framework
 # the flat namespace), so the class never realises and MTLCopyAllDevices=0.
 PRIVFW      = -F $(SDK)/System/Library/PrivateFrameworks -framework IOGPU
 
-HEADERS      = $(wildcard src/*.hpp) $(wildcard src/*.h) ../kext/src/RgfxUserClientABI.hpp
+HEADERS      = $(wildcard src/*.hpp) $(wildcard src/*.h) ../kext/src/RgfxUserClientABI.hpp \
+               ../kext/src/RgfxSurfaceRefill.hpp
 TESTHEADERS  = $(wildcard tests/*.hpp)
 
 # Serialiser core (C++).

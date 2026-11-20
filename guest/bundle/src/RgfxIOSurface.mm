@@ -28,6 +28,7 @@
 #include "RgfxMemoryShadow.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
+#include "../../kext/src/RgfxSurfaceRefill.hpp"
 #include "../../kext/src/RgfxUserClientABI.hpp"
 
 namespace {
@@ -351,9 +352,9 @@ std::atomic<uint64_t> gCachedLive{0};
 /// The process names its command buffers' order over IOSurfaces (rgfxIOSurfaceSetOrder): every
 /// surface a buffer uses is noted, and its commit names the buffers of other queues it runs after.
 std::atomic<bool> gSurfaceOrder{false};
-/// The process has the host fill a cached surface's device cache again once a CPU that held the
-/// surface locked for writing as a commit named it has let go (rgfxIOSurfaceSetRefill): each
-/// commit's use of the surface reads the record in its block's header (RgfxSurfaceShadow::refillAt).
+/// The process has the host fill a cached surface's device cache again once the read-write lock
+/// that moved its generation has been let go (rgfxIOSurfaceSetRefill): each commit's use of the
+/// surface reads the record in its block's header (RgfxSurfaceShadow::refillAt).
 std::atomic<bool> gRefill{false};
 /// The RgfxAskUncachedScopes alive on this thread.
 thread_local unsigned tAskUncached = 0;
@@ -441,9 +442,9 @@ std::atomic<uint64_t> gUploadsMidWrite{0};
 std::atomic<uint64_t> gSyncsAtUnlock{0};
 // The commits that asked the kext whether such a CPU had let go of its lock yet.
 std::atomic<uint64_t> gUnlockAsks{0};
-// For a cached surface (gRefill): the uses named at a new CPU generation while a CPU held the
-// surface locked for writing, whose device cache the host filled, or will fill, mid-write; the
-// uses that asked the host to fill it again because such a CPU had let go of its lock
+// For a cached surface (gRefill): the uses named while the read-write CPU lock that moved their
+// generation was held, or being taken, whose device cache the host may fill mid-write; the uses
+// that asked the host to fill it again because that lock had been let go
 // (RGFX_SURFACE_USE_REFILL); and the uses that asked the kext for the surface's seeds for it.
 std::atomic<uint64_t> gNamedMidWrite{0};
 std::atomic<uint64_t> gRefillsAtUnlock{0};
@@ -571,9 +572,9 @@ struct SyncedWrite {
 /// past its unlock seed, RgfxRegion::surfaceSeeds), `writeHeld` is 1 and `unlockSeed` the unlock
 /// seed then: the copy holds the pages as they were mid-write, and syncs again once the unlock
 /// seed moves (RgfxSurfaceShadow::changed). A cached block in place, which holds no copy, keeps
-/// its refill record in the same fields (RgfxSurfaceShadow::refillAt): `serial` the block's own
-/// where the record is valid, `seed` the low 32 bits of the CPU generation a commit last named the
-/// surface at, `unlockSeed` the surface's unlock seed then and `writeHeld` a RefillState.
+/// its refill record in `unlockSeed` and `writeHeld`, one 64-bit word at the kext's
+/// kRgfxSurfaceRefillOffset (RgfxSurfaceRefill.hpp, RgfxSurfaceShadow::refillAt), which the kext
+/// writes as it caches the block and at each read-write CPU lock.
 struct RgfxSurfaceHeader {
 	uint64_t serial;
 	uint32_t seed;
@@ -588,6 +589,10 @@ static_assert(offsetof(RgfxSurfaceHeader, cpuGen) == kRgfxSurfaceCpuGenOffset,
 static_assert(offsetof(RgfxSurfaceHeader, clients) == kRgfxSurfaceClientsOffset,
               "where the kext writes the surface's clients");
 
+static_assert(offsetof(RgfxSurfaceHeader, unlockSeed) == kRgfxSurfaceRefillOffset &&
+                  offsetof(RgfxSurfaceHeader, writeHeld) == kRgfxSurfaceRefillOffset + 4 &&
+                  kRgfxSurfaceRefillOffset % 8 == 0,
+              "where the kext writes a cached block's refill record, one aligned word");
 static_assert(sizeof(RgfxSurfaceHeader) % alignof(RgfxSurfaceWriters) == 0,
               "the writers follow the header, aligned");
 
@@ -915,66 +920,38 @@ struct RgfxSurfaceShadow {
 	}
 	bool changed() const { return change() != Change::None; }
 
-	/// A cached block's refill record (RgfxSurfaceHeader::writeHeld): `Settled`, the cache was
-	/// filled at the generation with no CPU write lock held, and nothing is asked again at it;
-	/// `Held`, a CPU held the surface locked for writing as a commit named the generation, so the
-	/// cache may hold the pages mid-write; `Unsure`, the first commit that named it saw no lock
-	/// held, which may yet be one being taken: the kext moves the generation inside the lock,
-	/// before IOSurface moves the lock seed, so the next commit asks once more.
-	enum RefillState : uint32_t { Settled = 0, Held = 1, Unsure = 2 };
-
 	/// At a commit that names the cached surface at CPU generation `gen` (rgfxIOSurfaceNameUses),
 	/// where the process has the host fill caches again (gRefill): whether the use asks the host to
 	/// fill the device cache again at the generation it holds (RGFX_SURFACE_USE_REFILL), as copy
-	/// mode syncs a copy again (change): a commit named it at `gen` while a CPU held the surface
-	/// locked for writing, or held it unsure, and the surface's unlock seed has moved since. The
-	/// record lives in the shared block's header, which every holder of the surface reads and
-	/// writes, so a commit of any process sees another's. The first commit that names a generation
-	/// asks the kext for the surface's seeds and records them; a later one asks again while the
-	/// record is not settled, and settles it once no lock is held. Without the kext's seeds the
-	/// record settles at once: a fill made mid-write stands until the next read-write lock.
+	/// mode syncs a copy again (change), by the generation's refill record in the shared block's
+	/// header (RgfxSurfaceRefill.hpp): the first commit once the surface's unlock seed has moved
+	/// past the record's, the read-write lock that moved the generation let go, asks, in any
+	/// process, whatever filled the cache meanwhile. A commit whose record is settled asks the kext
+	/// nothing; any other asks it for the surface's seeds. Without them the record settles at
+	/// once: a fill made mid-write stands until the next read-write lock.
 	bool refillAt(uint64_t gen)
 	{
-		const uint32_t low = static_cast<uint32_t>(gen);
-		const bool valid = __atomic_load_n(&header->serial, __ATOMIC_ACQUIRE) == serial;
-		const bool same = valid && __atomic_load_n(&header->seed, __ATOMIC_ACQUIRE) == low;
-		const uint32_t state = __atomic_load_n(&header->writeHeld, __ATOMIC_ACQUIRE);
-		if (same && state == Settled)
+		auto *at = reinterpret_cast<uint64_t *>(reinterpret_cast<char *>(header) +
+		                                        kRgfxSurfaceRefillOffset);
+		uint64_t word = __atomic_load_n(at, __ATOMIC_ACQUIRE);
+		if (rgfxRefillSettled(word, gen))
 			return false;
-		const uint32_t recorded = __atomic_load_n(&header->unlockSeed, __ATOMIC_ACQUIRE);
 		gRefillAsks.fetch_add(1, std::memory_order_relaxed);
 		uint32_t lockSeed = 0, unlockSeed = 0;
-		if (region == nullptr || !region->surfaceSeeds(surfaceId, &lockSeed, &unlockSeed)) {
-			noteRefill(low, Settled, 0);
-			return false;
-		}
-		const bool held = lockSeed != unlockSeed;
-		if (!same) {
-			noteRefill(low, held ? Held : Unsure, unlockSeed);
-			if (held) {
-				gNamedMidWrite.fetch_add(1, std::memory_order_relaxed);
-				reportCopies(nowNs());
-			}
-			return false;
-		}
-		const bool refill = unlockSeed != recorded;
-		noteRefill(low, held ? Held : Settled, unlockSeed);
-		if (refill) {
+		const bool seeds =
+		    region != nullptr && region->surfaceSeeds(surfaceId, &lockSeed, &unlockSeed);
+		const RgfxRefillStep step = rgfxRefillStep(word, gen, seeds, lockSeed, unlockSeed);
+		// Never over a record another holder or the kext wrote since it was read.
+		if (step.write)
+			__atomic_compare_exchange_n(at, &word, step.word, false, __ATOMIC_ACQ_REL,
+			                            __ATOMIC_ACQUIRE);
+		if (step.midWrite)
+			gNamedMidWrite.fetch_add(1, std::memory_order_relaxed);
+		if (step.refill)
 			gRefillsAtUnlock.fetch_add(1, std::memory_order_relaxed);
+		if (step.midWrite || step.refill)
 			reportCopies(nowNs());
-		}
-		return refill;
-	}
-
-	/// Records the refill record of generation `low` (refillAt): its state and the unlock seed,
-	/// then the generation and the block's serial, so a holder that reads the serial and the
-	/// generation reads the rest with them.
-	void noteRefill(uint32_t low, RefillState state, uint32_t unlockSeed)
-	{
-		__atomic_store_n(&header->unlockSeed, unlockSeed, __ATOMIC_RELEASE);
-		__atomic_store_n(&header->writeHeld, static_cast<uint32_t>(state), __ATOMIC_RELEASE);
-		__atomic_store_n(&header->seed, low, __ATOMIC_RELEASE);
-		__atomic_store_n(&header->serial, serial, __ATOMIC_RELEASE);
+		return step.refill;
 	}
 
 	/// Pages -> copy, under a read lock of the surface taken before `lock` (the views' lock
@@ -2044,8 +2021,8 @@ std::vector<std::shared_ptr<void>> rgfxIOSurfaceNameUses(
 		// As the kext left it at the surface's last read-write CPU lock, in any process.
 		op.cpu_gen = __atomic_load_n(&s->header->cpuGen, __ATOMIC_ACQUIRE);
 		op.flags = writes ? RGFX_SURFACE_USE_WRITES : 0;
-		// A CPU that held the surface locked for writing as an earlier commit named this
-		// generation has let go: the host fills the cache again (refillAt).
+		// The read-write lock that moved the surface to this generation has been let go since its
+		// record settled: the host fills the cache again (refillAt).
 		if (gRefill.load(std::memory_order_relaxed) && s->refillAt(op.cpu_gen))
 			op.flags |= RGFX_SURFACE_USE_REFILL;
 		ops.push_back(op);
