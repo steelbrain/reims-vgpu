@@ -102,9 +102,13 @@
 //!   the index then holds the new owner for: by the last owner's site and the take's, each what it
 //!   is, the selector that made it, the decoder's message carried out on the thread and the
 //!   thread's name without its number ([`own_index_reused`]). Its line is written on the rt
-//!   platform whether or not one was counted, with the textures' and sampler states' totals; the
-//!   first of each pair of sites, ten at most, writes its line as it is counted, with the last
-//!   owner's context, format, size and usage. A diagnostic: nothing waits for the reads.
+//!   platform whether or not one was counted, with the textures' and sampler states' totals and
+//!   what they are counted among: the indices taken again after they were given back
+//!   ([`own_index_taken_again`]), and the indices given back ([`own_index_given_back`]). A take
+//!   of an index not taken before counts in neither, so a zero over a run that never took a
+//!   given-back index says nothing of reuse. The first of each pair of sites, ten at most, writes
+//!   its line as it is counted, with the last owner's context, format, size and usage. A
+//!   diagnostic: nothing waits for the reads.
 //!
 //! Totals, numbers, formats, sizes and usages only: no name, label or byte of the guest's leaves
 //! the process, but through the switch below. A diagnostic, which the contract leaves free:
@@ -1341,8 +1345,35 @@ pub fn own_index_reused(what: &'static str, last: &OwnMade, sel: &'static str) {
     }
 }
 
+/// The platform's own indices taken again after they were given back, textures' then sampler
+/// states'.
+static OWN_TAKEN_AGAIN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// The platform's own indices given back, textures' then sampler states'.
+static OWN_GIVEN_BACK: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Where a count of own indices of objects `what` names is kept: 0 for textures, 1 for sampler
+/// states.
+fn own_class(what: &'static str) -> usize {
+    usize::from(what == "sampler")
+}
+
+/// Each of the platform's own indices of objects `what` names taken again after it was given
+/// back (`super::texture::OwnIndices::take`), whether or not a command buffer that read its last
+/// owner is unfinished: what [`own_index_reused`]'s count is among.
+pub fn own_index_taken_again(what: &'static str) {
+    OWN_TAKEN_AGAIN[own_class(what)].fetch_add(1, Relaxed);
+}
+
+/// Each of the platform's own indices of objects `what` names given back
+/// (`super::texture::OwnIndices::give_back`).
+pub fn own_index_given_back(what: &'static str) {
+    OWN_GIVEN_BACK[own_class(what)].fetch_add(1, Relaxed);
+}
+
 /// The own-index-reuse line (the module's docs, "Own indices taken while their last owner's
-/// reads are unfinished"): the textures' and sampler states' totals, then each pair of sites.
+/// reads are unfinished"): the textures' and sampler states' totals, the takes of given-back
+/// indices they are among and the indices given back, then each pair of sites.
 fn own_reused_line() -> String {
     let reused = OWN_REUSED.lock();
     let of = |sampler: bool| -> u64 {
@@ -1352,6 +1383,8 @@ fn own_reused_line() -> String {
             .sum()
     };
     let (textures, samplers) = (of(false), of(true));
+    let [again_textures, again_samplers] = OWN_TAKEN_AGAIN.each_ref().map(|n| n.load(Relaxed));
+    let [back_textures, back_samplers] = OWN_GIVEN_BACK.each_ref().map(|n| n.load(Relaxed));
     let sites: Vec<String> = (reused.iter())
         .map(|((last, taker), n)| format!("{} -> {}: {n}", last.name(), taker.name()))
         .collect();
@@ -1364,7 +1397,9 @@ fn own_reused_line() -> String {
     };
     format!(
         "reims-vgpu: rt-diag own-index-reuse: textures {textures}, samplers {samplers} taken \
-         while a command buffer that read their last owner was unfinished{by}"
+         while a command buffer that read their last owner was unfinished, of textures \
+         {again_textures}, samplers {again_samplers} taken again after they were given back; \
+         given back: textures {back_textures}, samplers {back_samplers}{by}"
     )
 }
 
