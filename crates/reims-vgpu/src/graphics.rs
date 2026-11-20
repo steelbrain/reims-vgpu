@@ -145,7 +145,7 @@ use crate::graphics::device_info::device_info;
 use crate::graphics::present::{Drawing, PresentAnswers, PresentQueue};
 use crate::graphics::read::DisplayRead;
 use crate::memory::{GuestMemoryLease, MemoryMap};
-use crate::platform::{ApiPlatform, api_state};
+use crate::platform::{ApiPlatform, ShapeBlock, api_state};
 use crate::pool::{
     Give, HostBlocks, Pool, PoolAddFn, PoolConfig, PoolHost, PoolLedger, PoolRemoveFn,
     PrivateBlocks, PrivateGive, PrivateTakeAnswer, PrivateTakeError, TAKE_MAX,
@@ -820,8 +820,25 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 );
             }
             // The reset gate ([`GraphicsControl::reset_gate`]), which the staged copies' spares'
-            // top-ups hold shared too.
+            // top-ups and the takes of blocks ahead of shapes' images hold shared too.
             let reset_gate: Arc<RwLock<()>> = Arc::default();
+            // A platform that places shapes' images takes the block of a large surface's
+            // whole-extent shape ahead of its image, off the ring
+            // (`decode::surface_cache`'s `shapes`, "Blocks taken ahead").
+            if P::SURFACE_SHAPES && P::PLACED_SHAPE_IMAGES {
+                let (taker, placer) = (Arc::clone(&platform), Arc::clone(&platform));
+                decoder.set_surface_shape_blocks(
+                    Arc::new(move |device: &P::Device, descs: &[TextureDesc]| {
+                        taker.shape_block(device, descs)
+                    }),
+                    Arc::new(
+                        move |device: &P::Device, desc: &TextureDesc, block: ShapeBlock| {
+                            placer.placed_shape_image_in(device, desc, block)
+                        },
+                    ),
+                    Arc::clone(&reset_gate),
+                );
+            }
             // A platform whose imports of the host's memory cost each submission stages the
             // caches' copies through the host's CPU (`ApiPlatform::STAGED_SURFACE_COPIES`).
             if P::STAGED_SURFACE_COPIES {
@@ -2186,6 +2203,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 answer.answer_at(status, at);
             }
             drop(settle);
+            // The block of the surface's whole-extent shape's image, taken ahead on a worker of
+            // its own, which nothing waits for: after the answer and the settle, so no message
+            // waits for the hand-over (`decode::surface_cache`'s `shapes`, "Blocks taken ahead").
+            if status == Some(RGFX_STATUS_OK) {
+                (me.decoder()).take_shape_block_ahead(&me.device, pages.block_offset);
+            }
         };
         entry::run(|_| {
             self.decoder()

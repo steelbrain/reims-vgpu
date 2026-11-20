@@ -106,6 +106,29 @@
 //! placing does 1069 MiB less of it; the longer takes are rt's allocation of its blocks, which
 //! keeping blocks ahead of their takes is rt's to shorten.
 //!
+//! **Blocks taken ahead.** rt makes a block over its unit (16 MiB, `super::PIECE`) as an
+//! allocation of its own on the thread that takes it, so a new shape over the unit would take one
+//! on the decoding thread, the guest's ring: a 34.5 MiB image's took 24.6 ms there, and the
+//! longest of rt's takes in a desktop and 3D-scene boot 45.7 ms (**measured** on rt on a Radeon
+//! 780M, 11-19). So
+//! where the platform places images, a cache of one plane over the unit, of the surface's own and
+//! not the host's video's, has the block of its whole-extent shape's image taken ahead, once its
+//! `SURFACE_PAGES` is answered and settled (`super::Caches::take_shape_block_ahead`): on a worker
+//! of its own (`super::SHAPE_BLOCKS_THREADS`), which nothing waits for, under the reset gate held
+//! shared, of the length a `BGRA8Unorm` image of the plane's rows and texel bytes takes, plain or
+//! storage (`ApiPlatform::shape_block`). The block is kept in the cache, and the cache's first new
+//! shape takes it: where the shape is over the unit and placed now, its image is placed in the
+//! block (`ApiPlatform::placed_shape_image_in`) and filled as above; one that does not fit gives
+//! the block back to rt and is placed as before. A first new shape that finds the block asked and
+//! not yet taken makes its image as before, never waiting for the take, and the block goes as it
+//! comes. Every block that goes with no image in it goes back to rt. A cache asks once, and keeps
+//! no block past its first new shape, so a block is held only until the surface's first texture
+//! or its release. Counted: the takes, with their time and KiB (`rt-shape-blocks-ahead`), the
+//! shapes over the unit that came before the block (`-late`), the blocks the image did not fit
+//! (`-unfit`), the asks the platform gave none for (`-refused`), and the blocks that went unused
+//! (`-unused`), beside the decoding thread's makes of shapes' images, all, those over the unit,
+//! and those placed in a block taken ahead (`rt-shape-image-makes`, `-over-unit`, `-ahead`).
+//!
 //! **Plane shapes.** A cache of a two-plane surface the host's video writes keeps its planes in
 //! a surface the platform exports (`super::exported`): each plane's whole extent is a plane
 //! shape, its image the surface's plane, made with `PixelFormatView`, so a guest texture over the

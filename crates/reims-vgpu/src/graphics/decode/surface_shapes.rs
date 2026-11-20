@@ -33,6 +33,7 @@
 //! makes no texture over a surface's buffer that is not one. Runs that are not the surface's
 //! bytes in whole guest pages, or that the host maps no part of, are refused still.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use reims_vgpu_graphics::wire::{
@@ -46,7 +47,9 @@ use reims_vgpu_vulkan::core::raise::RaiseResult;
 use reims_vgpu_vulkan::gpu::no_texture::views_without_usage;
 
 use super::surface_cache::shapes::{self, PLAIN_VIEW_REFUSED, ShapeCounts, ShapeKey, ShapeUse};
-use super::surface_cache::{self, CacheLayout, STORAGE_PRIVATE, ShapeMaker};
+use super::surface_cache::{
+    self, CacheLayout, STORAGE_PRIVATE, ShapeBlockPlacer, ShapeBlockTaker, ShapeMaker,
+};
 use super::{GraphicsDecoder, ObjHandle, TEXTURE_USAGE_WRITES, texture_desc};
 
 /// `MTLTextureType2D`.
@@ -61,6 +64,22 @@ const TEXTURE_USAGE_PIXEL_FORMAT_VIEW: u64 = 0x10;
 /// A plain shape's image's usage: `MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget`
 /// (`shapes`, "The shape").
 const PLAIN_USAGE: u64 = 0x1 | 0x4;
+
+/// The descriptor of shape `key`'s image of `pixel_format`: the guest's format and size, Private,
+/// at no index of the guest's; a storage shape's of Metal's Unknown usage, which takes every use
+/// and a view in any format of the texel's size, a plain shape's `ShaderRead | RenderTarget`
+/// alone (`shapes`, "The shape").
+pub(super) fn shape_image_desc(pixel_format: u64, key: &ShapeKey) -> TextureDesc {
+    TextureDesc {
+        texture_type: TEXTURE_TYPE_2D,
+        pixel_format,
+        width: key.width,
+        height: key.height,
+        usage: if key.storage { 0 } else { PLAIN_USAGE },
+        resource_options: Some(STORAGE_PRIVATE),
+        ..TextureDesc::default()
+    }
+}
 
 /// Whether a view refused over a plain shape was logged ([`PLAIN_VIEW_REFUSED`]): its line is
 /// logged the first time alone, the rest counted (docs/conventions.md).
@@ -90,6 +109,26 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// surface is named.
     pub(crate) fn set_surface_shapes(&self, maker: ShapeMaker<P>, places: bool) {
         self.surface_caches.set_shapes(maker, places);
+    }
+
+    /// Takes a block ahead of each cache's whole-extent shape's image from now on, by `take`,
+    /// and places the image in it by `place`, each take under the device's reset `gate` held
+    /// shared (`surface_cache::shapes`, "Blocks taken ahead"): set once, at the device's make,
+    /// before any surface is named.
+    pub(crate) fn set_surface_shape_blocks(
+        &self,
+        take: ShapeBlockTaker<P>,
+        place: ShapeBlockPlacer<P>,
+        gate: Arc<parking_lot::RwLock<()>>,
+    ) {
+        self.surface_caches.set_shape_blocks(take, place, gate);
+    }
+
+    /// Hands over the take of a block ahead of the whole-extent shape's image of the block at
+    /// `block`'s cache, on `device`, after its `SURFACE_PAGES` was answered and settled
+    /// (`surface_cache::shapes`, "Blocks taken ahead"); nothing waits for it.
+    pub(crate) fn take_shape_block_ahead(&self, device: &P::Device, block: u64) {
+        self.surface_caches.take_shape_block_ahead(device, block);
     }
 
     /// Refuses the block at `block` as uncached in the per-shape form (module doc): any device
@@ -201,19 +240,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         let d = &m.desc;
         let pixel_format = u64::from(d.pixel_format);
-        // The image: the guest's format and size, Private, at no index of the guest's; a storage
-        // shape's of Metal's Unknown usage, which takes every use and a view in any format of the
-        // texel's size, a plain shape's `ShaderRead | RenderTarget` alone (`shapes`, "The
-        // shape").
-        let image = TextureDesc {
-            texture_type: TEXTURE_TYPE_2D,
-            pixel_format,
-            width: key.width,
-            height: key.height,
-            usage: if key.storage { 0 } else { PLAIN_USAGE },
-            resource_options: Some(STORAGE_PRIVATE),
-            ..TextureDesc::default()
-        };
+        let image = shape_image_desc(pixel_format, &key);
         let Some((reference, image)) = caches.shape(device, block, key, &image) else {
             return unshaped(|_| {});
         };
@@ -347,7 +374,10 @@ fn takes_storage(m: &RgfxTextureFromIOSurface) -> bool {
 mod tests {
     use std::sync::Arc;
 
-    use reims_vgpu_graphics::wire::{RGFX_STATUS_CACHE, RGFX_STATUS_OK};
+    use reims_vgpu_graphics::wire::{
+        RGFX_STATUS_CACHE, RGFX_STATUS_OK, RGFX_SURFACE_PAGES_CACHED, RgfxSurfacePagesLayout,
+        RgfxSurfacePlaneLayout,
+    };
     use reims_vgpu_vulkan::core::testkit::FakePlatform;
     use reims_vgpu_vulkan::core::testkit::calllog::{Arg, Call};
 
@@ -367,7 +397,7 @@ mod tests {
     };
     use super::super::surface_pages::tests::{BLOCK, Rig, one_plane, rig};
     use super::*;
-    use crate::platform::ApiPlatform as _;
+    use crate::platform::{ApiPlatform as _, ShapeBlock};
     use reims_vgpu_vulkan::core::testkit::Step;
     use reims_vgpu_vulkan::core::testkit::impls::resource::TEXTURE_SLOT_WRITES;
 
@@ -704,6 +734,252 @@ mod tests {
             (0, 0),
             "asked for none"
         );
+    }
+
+    /// The bytes that stand for rt's unit in [`ahead`]'s rig: its staged copies' piece.
+    const UNIT: u64 = 512;
+
+    /// The length of each block [`ahead`]'s fake takes.
+    const AHEAD_LEN: u64 = 4 * UNIT;
+
+    /// What [`ahead`]'s fakes saw: the descriptors each take was asked for, and the length of
+    /// each block an image was asked to be placed in.
+    #[derive(Default)]
+    struct AheadLog {
+        takes: Mutex<Vec<Vec<TextureDesc>>>,
+        places: Mutex<Vec<u64>>,
+    }
+
+    /// The (pixel format, width, height, usage) of each descriptor of each take in `log`.
+    fn takes(log: &AheadLog) -> Vec<Vec<(u64, u64, u64, u64)>> {
+        (log.takes.lock().iter())
+            .map(|d| {
+                (d.iter())
+                    .map(|d| (d.pixel_format, d.width, d.height, d.usage))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// How many of the kind of code `code` the process counted ([`reims_vgpu_vulkan::answer`]).
+    fn counted(code: &str) -> u64 {
+        (reims_vgpu_vulkan::answer::counted_kinds().into_iter())
+            .find(|(c, _)| *c == code)
+            .map_or(0, |(_, n)| n)
+    }
+
+    /// [`placing`]'s rig, its copies staged in pieces of [`UNIT`] bytes, which stand for rt's
+    /// unit, with blocks taken ahead of shapes' images by fakes ("Blocks taken ahead"): each take
+    /// answered with a block of [`AHEAD_LEN`] bytes, and each image placed in one the fake's own
+    /// texture where `fits`, else the block given back. The block's `SURFACE_PAGES` carries
+    /// `layout` of its page's bytes, and its take is handed over as the device does after the
+    /// answer, the takes' worker held where `hold`, else let run to its end.
+    fn ahead(
+        layout: fn(u64) -> Option<RgfxSurfacePagesLayout>,
+        fits: bool,
+        hold: bool,
+    ) -> (Rig, Placed, Arc<AheadLog>) {
+        let mut r = rig(8);
+        r.dec.set_staged_surface_copies(Arc::default());
+        r.dec.surface_caches.set_staging_piece(UNIT);
+        let page = r.page;
+        let (p, q) = (Arc::clone(&r.p), Arc::clone(&r.p));
+        let placed = Placed::default();
+        let kept = Arc::clone(&placed);
+        r.dec.set_surface_shapes(
+            Arc::new(
+                move |device: &<FakePlatform as Platform>::Device,
+                      desc: &TextureDesc,
+                      asked: bool| {
+                    kept.lock().push(asked);
+                    p.own_texture(device, desc)
+                },
+            ),
+            true,
+        );
+        let log = Arc::new(AheadLog::default());
+        let (took, put) = (Arc::clone(&log), Arc::clone(&log));
+        r.dec.set_surface_shape_blocks(
+            Arc::new(
+                move |_: &<FakePlatform as Platform>::Device, descs: &[TextureDesc]| {
+                    took.takes.lock().push(descs.to_vec());
+                    Some(ShapeBlock::new(Box::new(()), AHEAD_LEN))
+                },
+            ),
+            Arc::new(
+                move |device: &<FakePlatform as Platform>::Device,
+                      desc: &TextureDesc,
+                      block: ShapeBlock| {
+                    put.places.lock().push(block.length());
+                    match fits {
+                        true => Ok(q.own_texture(device, desc)),
+                        false => Err(block),
+                    }
+                },
+            ),
+            Arc::default(),
+        );
+        if hold {
+            r.dec.surface_caches.hold_shape_blocks();
+        }
+        r.dec.hold_resource_ids(0, 1);
+        assert_eq!(
+            r.pages_laid_out(
+                BLOCK,
+                0,
+                &[(1, 2)],
+                2 * page,
+                RGFX_SURFACE_PAGES_CACHED,
+                layout(page)
+            ),
+            RGFX_STATUS_OK
+        );
+        r.dec.take_shape_block_ahead(&r.device, BLOCK);
+        if !hold {
+            r.dec.surface_caches.settle_shape_blocks();
+        }
+        queues(&mut r);
+        assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
+        (r, placed, log)
+    }
+
+    /// One plane of two rows of a page, over [`UNIT`].
+    fn over_the_unit(page: u64) -> Option<RgfxSurfacePagesLayout> {
+        Some(one_plane(page, page, 2))
+    }
+
+    /// A cache of one plane over rt's unit has the block of its whole-extent shape's image taken
+    /// ahead after its `SURFACE_PAGES`, for the extent's plain and storage shapes in `BGRA8Unorm`,
+    /// counted with its KiB. Its first new shape over the unit is placed in the block, filled at
+    /// its make, with no image made on the ring, counted apart; its next is made on the ring as
+    /// before, counted over the unit, as the cache keeps no block past its first new shape, and
+    /// asks for none again
+    #[test]
+    fn a_block_taken_ahead_holds_the_caches_first_shape_over_rts_unit() {
+        let (mut r, placed, log) = ahead(over_the_unit, true, false);
+        let page = r.page;
+        let extent = |usage| (80, page / 4, 2, usage);
+        assert_eq!(takes(&log), [vec![extent(0x5), extent(0)]]);
+        assert_eq!(counted("rt-shape-blocks-ahead"), 1);
+        assert_eq!(
+            counted("rt-shape-blocks-ahead-kib"),
+            AHEAD_LEN.div_ceil(1024)
+        );
+        let cache = cache_id(&r);
+        let mark = r.p.call_log().mark();
+        let image = texture_image(&mut r, 21, 80, (32, 8));
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(
+            *log.places.lock(),
+            [AHEAD_LEN],
+            "placed in the block taken ahead"
+        );
+        assert!(placed.lock().is_empty(), "no image made on the ring");
+        assert_eq!(fills(&calls), [(cache, 0, image)], "filled at its make");
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.placed, counts.made), (1, 1));
+        assert_eq!(counted("rt-shape-image-makes-ahead"), 1);
+        let ring = || {
+            (
+                counted("rt-shape-image-makes"),
+                counted("rt-shape-image-makes-over-unit"),
+            )
+        };
+        assert_eq!(ring(), (0, 0));
+
+        let storage = texture_as_image(&mut r, 22, 80, (32, 8), 0x2);
+        assert_ne!(storage, image);
+        assert_eq!(*placed.lock(), [true], "made on the ring, as before");
+        assert_eq!(log.places.lock().len(), 1);
+        assert_eq!(ring(), (1, 1));
+        r.dec.take_shape_block_ahead(&r.device, BLOCK);
+        r.dec.surface_caches.settle_shape_blocks();
+        assert_eq!(log.takes.lock().len(), 1, "asked once");
+        let unplaced = ["late", "unfit", "unused", "refused"]
+            .map(|c| counted(&format!("rt-shape-blocks-ahead-{c}")));
+        assert_eq!(unplaced, [0; 4]);
+    }
+
+    /// The ring never waits for a block taken ahead: a first new shape over rt's unit made while
+    /// the take has not run makes its image as before, counted late and over the unit, and the
+    /// block goes as it comes, unused, counted with its KiB
+    #[test]
+    fn a_shape_made_before_its_block_is_taken_waits_for_none() {
+        let (mut r, placed, log) = ahead(over_the_unit, true, true);
+        texture_image(&mut r, 21, 80, (32, 8));
+        assert_eq!(
+            *placed.lock(),
+            [true],
+            "placed in a block taken at its make"
+        );
+        assert_eq!(counted("rt-shape-blocks-ahead-late"), 1);
+        let ring = (
+            counted("rt-shape-image-makes"),
+            counted("rt-shape-image-makes-over-unit"),
+        );
+        assert_eq!(ring, (1, 1));
+        assert!(log.takes.lock().is_empty(), "not taken yet");
+
+        r.dec.surface_caches.release_shape_blocks();
+        r.dec.surface_caches.settle_shape_blocks();
+        assert_eq!(log.takes.lock().len(), 1);
+        assert!(log.places.lock().is_empty());
+        assert_eq!(counted("rt-shape-blocks-ahead-unused"), 1);
+        assert_eq!(
+            counted("rt-shape-blocks-ahead-unused-kib"),
+            AHEAD_LEN.div_ceil(1024)
+        );
+    }
+
+    /// A block taken ahead that the shape's image does not fit goes back, counted, and the image
+    /// is placed in a block taken at its make as before; a cache's first new shape at or under
+    /// rt's unit leaves its block unused, counted, its image made as before
+    #[test]
+    fn a_block_taken_ahead_that_no_image_takes_goes() {
+        let (mut r, placed, log) = ahead(over_the_unit, false, false);
+        texture_image(&mut r, 21, 80, (32, 8));
+        assert_eq!(*log.places.lock(), [AHEAD_LEN]);
+        assert_eq!(*placed.lock(), [true]);
+        assert_eq!(counted("rt-shape-blocks-ahead-unfit"), 1);
+        assert_eq!(counted("rt-shape-blocks-ahead-unused"), 0);
+        assert_eq!(counted("rt-shape-image-makes-over-unit"), 1);
+
+        let (mut r, placed, log) = ahead(over_the_unit, true, false);
+        texture_image(&mut r, 21, 80, (8, 8));
+        assert!(log.places.lock().is_empty());
+        assert_eq!(*placed.lock(), [true]);
+        assert_eq!(counted("rt-shape-blocks-ahead-unused"), 1);
+        assert_eq!(
+            counted("rt-shape-image-makes-over-unit"),
+            1,
+            "the first rig's"
+        );
+    }
+
+    /// No block is taken ahead for a cache whose `SURFACE_PAGES` carries no layout, one of a
+    /// plane at or under rt's unit, or one of two planes
+    #[test]
+    fn a_block_is_taken_ahead_only_for_one_plane_over_rts_unit() {
+        let layouts: [fn(u64) -> Option<RgfxSurfacePagesLayout>; 3] = [
+            |_| None,
+            |_| Some(one_plane(UNIT / 2, UNIT / 2, 2)),
+            |page| {
+                let mut layout = one_plane(page, page, 1);
+                layout.plane_count = 2;
+                layout.planes[1] = RgfxSurfacePlaneLayout {
+                    offset: page,
+                    bytes_per_row: page,
+                    row_bytes: page,
+                    rows: 1,
+                };
+                Some(layout)
+            },
+        ];
+        for layout in layouts {
+            let (_r, _, log) = ahead(layout, true, false);
+            assert!(log.takes.lock().is_empty());
+        }
+        assert_eq!(counted("rt-shape-blocks-ahead"), 0);
     }
 
     /// The usage a texture declares picks its shape's kind: one that declares Metal's Unknown

@@ -45,6 +45,10 @@
 //! - The staged copies' spares' worker's (`reims-vgpu.graphics-staging-spares-<i>`) jobs share
 //!   one key: a top-up of the spare pieces at a time (`surface_cache`, "Staged copies"), each of
 //!   its makes under the reset gate held shared, waiting for no key's job and answering nothing.
+//! - The shape blocks' worker's (`reims-vgpu.graphics-shape-blocks-<i>`) key is a block's offset:
+//!   the take of a block ahead of its cache's whole-extent shape's image, handed over after the
+//!   block's `SURFACE_PAGES` is answered (`surface_cache::shapes`, "Blocks taken ahead"), under
+//!   the reset gate held shared, waiting for no key's job and answering nothing.
 //!
 //! **No job waits for another key's.** A job waits only for jobs of its own key, which were handed
 //! over before it and are done when it runs: a `BUFFER_OVER_PAGES` waits for its block's
