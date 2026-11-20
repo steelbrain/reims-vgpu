@@ -96,6 +96,13 @@
 //!   `take_lock_waits`, `take_makes`, `take_maps`, `maker_makes`, `zero_writes`,
 //!   `long_take_zero_writes`): for each, its calls, those over 5 ms, and its longest call with
 //!   that call's bytes and whether it made an allocation of its own.
+//! - **rt's pipeline makes.** rt's `VkPipeline`s created; its first-use waits (encoding calls that
+//!   waited while the pipeline they needed was made), with their milliseconds and the longest, and
+//!   of them those for a compute kernel's pipeline at a threadgroup size, threadgroup memory
+//!   lengths or grid tiles none of its states had run with, and those for a render content's first
+//!   draw of lines; and the compute pipelines made ahead of their dispatches by the device's
+//!   pre-pass (rt's `prepare_dispatch`, reims-vgpu's `graphics::decode::prepass`), with their
+//!   milliseconds ([`pipelines_line`]).
 //! - **Own indices taken while their last owner's reads are unfinished.** Each of the platform's
 //!   own texture and sampler indices (`super::texture::OwnIndices`) taken again while a command
 //!   buffer that read its last owner through it was unfinished (made and not completed: encoding,
@@ -1275,6 +1282,28 @@ fn timed_parts_line(m: &rt::Metrics) -> String {
     format!("reims-vgpu: rt-diag timed take parts: {}", all.join(", "))
 }
 
+/// The line of rt's pipeline makes in `m` (the module's docs, "rt's pipeline makes").
+fn pipelines_line(m: &rt::Metrics) -> String {
+    let ms = |nanos: u64| nanos as f64 / 1e6;
+    format!(
+        "reims-vgpu: rt-diag pipelines: {} created; first-use waits {} ({:.1} ms, longest {:.1} \
+         ms), of a compute variant {} ({:.1} ms, longest {:.1} ms), of lines {} ({:.1} ms, \
+         longest {:.1} ms); made ahead {} ({:.1} ms)",
+        m.pipelines_created,
+        m.first_use_waits,
+        ms(m.first_use_wait_nanos),
+        ms(m.first_use_wait_max_nanos),
+        m.first_use_variant_waits,
+        ms(m.first_use_variant_wait_nanos),
+        ms(m.first_use_variant_wait_max_nanos),
+        m.first_use_line_waits,
+        ms(m.first_use_line_wait_nanos),
+        ms(m.first_use_line_wait_max_nanos),
+        m.made_ahead_variants,
+        ms(m.made_ahead_variant_nanos),
+    )
+}
+
 // ----- Own indices taken while their last owner's reads are unfinished.
 
 /// Where an object at one of the platform's own indices was made, or such an index taken
@@ -2243,6 +2272,7 @@ pub fn write() {
             all.join(", ")
         );
         let _ = writeln!(out, "{}", timed_parts_line(&m));
+        let _ = writeln!(out, "{}", pipelines_line(&m));
         // The textures rt cleared at their make, which placed images skip
         // (`texture::PLACED_IMAGES_CODE`), and the Private memory it holds now.
         let (private, idle, blocks) = super::device::gauges().map_or((0, 0, 0), |g| {
@@ -2758,6 +2788,31 @@ mod tests {
              0 over 5 ms longest 0.000 ms of 0 bytes, maker-makes 0 calls 0 over 5 ms longest \
              0.000 ms of 0 bytes, zero-writes 2 calls 0 over 5 ms longest 0.001 ms of 4096 bytes, \
              long-take-zero-writes 0 calls 0 over 5 ms longest 0.000 ms of 0 bytes"
+        );
+    }
+
+    /// rt's pipeline makes' line gives its first-use waits by kind and its makes ahead, each
+    /// with its milliseconds.
+    #[test]
+    fn the_pipelines_line_gives_first_use_waits_and_makes_ahead() {
+        let mut m = rt::Metrics::default();
+        m.pipelines_created = 40;
+        m.first_use_waits = 5;
+        m.first_use_wait_nanos = 250_000_000;
+        m.first_use_wait_max_nanos = 120_500_000;
+        m.first_use_variant_waits = 4;
+        m.first_use_variant_wait_nanos = 240_000_000;
+        m.first_use_variant_wait_max_nanos = 120_500_000;
+        m.first_use_line_waits = 1;
+        m.first_use_line_wait_nanos = 10_000_000;
+        m.first_use_line_wait_max_nanos = 10_000_000;
+        m.made_ahead_variants = 13;
+        m.made_ahead_variant_nanos = 1_052_340_000;
+        assert_eq!(
+            pipelines_line(&m),
+            "reims-vgpu: rt-diag pipelines: 40 created; first-use waits 5 (250.0 ms, longest \
+             120.5 ms), of a compute variant 4 (240.0 ms, longest 120.5 ms), of lines 1 (10.0 ms, \
+             longest 10.0 ms); made ahead 13 (1052.3 ms)"
         );
     }
 
