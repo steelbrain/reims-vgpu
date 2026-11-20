@@ -3,7 +3,8 @@
 //! `crate::answer::write_counts` runs). They hold:
 //!
 //! - **Gaps by kind.** Each refusal of rt's `Gap`, by the gap's kind, a draw's by its draw kind
-//!   ([`refusal`]), which the counts line holds as one `rt-refused-gap`.
+//!   and a linear plane pass's by its shape ([`refusal`]), which the counts line holds as one
+//!   `rt-refused-gap`.
 //! - **Refusals by variant.** Each refusal of Metal's that rt answers (`Error::Refused`) and each of
 //!   its limits (`Error::Limit`), by its variant, `Refused-<variant>` and `Limit-<variant>`
 //!   ([`refusal`]), which the counts line holds as `rt-refused-metal` and `rt-refused-limit` with
@@ -849,6 +850,9 @@ static REFUSALS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 pub fn refusal(error: &rt::Error) {
     let (map, name) = match error {
         rt::Error::Unsupported(rt::Gap::Draw { kind }) => (&GAPS, format!("Draw-{kind:?}")),
+        rt::Error::Unsupported(rt::Gap::LinearPlanePass { kind }) => {
+            (&GAPS, format!("LinearPlanePass-{kind:?}"))
+        }
         rt::Error::Unsupported(gap) => (&GAPS, variant(&format!("{gap:?}")).to_owned()),
         rt::Error::Refused(r) => (&REFUSALS, format!("Refused-{}", variant(&format!("{r:?}")))),
         rt::Error::Limit(l) => (&REFUSALS, format!("Limit-{}", variant(&format!("{l:?}")))),
@@ -2384,14 +2388,17 @@ mod tests {
         assert!(line.contains(shown), "{line}");
     }
 
-    /// A gap is counted by its kind, a draw's by its draw kind, and a refusal of Metal's and a
-    /// limit by their variant; another error is not.
+    /// A gap is counted by its kind, a draw's by its draw kind and a linear plane pass's by its
+    /// shape, and a refusal of Metal's and a limit by their variant; another error is not.
     #[test]
     fn refusals_count_by_kind() {
         refusal(&rt::Error::Unsupported(rt::Gap::Draw {
             kind: rt::DrawKind::AttachmentRead,
         }));
         refusal(&rt::Error::Unsupported(rt::Gap::CubicSampler));
+        refusal(&rt::Error::Unsupported(rt::Gap::LinearPlanePass {
+            kind: rt::LinearPlanePassKind::DepthStencil,
+        }));
         refusal(&rt::Error::Refused(rt::Refusal::BufferTooLong {
             length: 8,
             max: 4,
@@ -2401,6 +2408,10 @@ mod tests {
         let gaps = GAPS.lock();
         assert!(gaps.get("Draw-AttachmentRead").is_some_and(|&n| n >= 1));
         assert!(gaps.get("CubicSampler").is_some_and(|&n| n >= 1));
+        assert!(
+            gaps.get("LinearPlanePass-DepthStencil")
+                .is_some_and(|&n| n >= 1)
+        );
         drop(gaps);
         let refusals = REFUSALS.lock();
         assert!(
