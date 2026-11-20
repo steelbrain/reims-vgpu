@@ -74,7 +74,7 @@ use metal2vulkan_runtime as rt;
 
 use crate::core::num::ToU64 as _;
 use crate::core::platform::os::Threads;
-use crate::core::platform::os::clock::{Clock as _, MonoTime};
+use crate::core::platform::os::clock::Clock as _;
 use crate::core::platform::os::vm::HostVm;
 use crate::core::platform::types::MtlSize;
 use crate::core::platform::values::{RateMapDesc, TextureDesc};
@@ -206,18 +206,20 @@ struct Unended {
     /// The device, where rt's quiesce of it answered false: kept to the exit, since its drop
     /// would wait with no deadline for the threads and the GPU work the quiesce did not see end.
     device: Option<RtObj<RtDevice>>,
-    /// rt's counters of it, whose gauges all read zero once it is torn down.
-    counters: rt::Counters,
     /// The let-go's handle of the instance it was made on, where the let-go's wait for its
     /// teardown ran out: kept to the exit, since rt's README (Teardown) has the consumer wait for
     /// the teardown before it drops its instance.
-    _instance: Option<rt::Instance>,
+    instance: Option<rt::Instance>,
 }
 
 impl Unended {
-    /// Whether the device is torn down.
+    /// Whether the device is torn down: its handles all dropped and rt's teardown of it ended,
+    /// its thread joined (rt's `Instance::wait_until_devices_torn_down`, which this asks with no
+    /// wait).
     fn ended(&self) -> bool {
-        self.device.is_none() && self.counters.gauges() == rt::Gauges::default()
+        self.device.is_none()
+            && (self.instance.as_ref())
+                .is_some_and(|instance| instance.wait_until_devices_torn_down(Duration::ZERO))
     }
 }
 
@@ -240,7 +242,7 @@ const DROP_LET_GO: Duration = Duration::from_secs(5);
 /// and drops it on the dropping thread, then waits, bounded, for the teardown, and drops its
 /// handle of the instance last. The process's platform lives to the exit, so this serves the
 /// platforms tests make. A let-go past its bound is logged with what was left (handles beyond
-/// the platform's, rt's threads or GPU work, or gauges not at zero), and the devices and
+/// the platform's, rt's threads or GPU work, or a teardown not ended), and the devices and
 /// instances kept to the exit are left undropped, since their drops would wait with no deadline
 /// or come ahead of the teardown.
 impl Drop for RtPlatform {
@@ -311,16 +313,20 @@ impl RtPlatform {
     /// (reims-vgpu's `ApiPlatform::let_go_of_devices`), so that no device of rt's is live as the
     /// process exits (the type's docs). In order, each wait ending by `bound`:
     /// - it waits for every handle beyond the platform's own to go (an object, a command buffer
-    ///   still running, a thread that holds one), looking every [`POLL`]. Where
-    ///   one outlives the wait, nothing goes, and `Err` says how many still held it;
+    ///   still running, a thread that holds one, the pool's source of blocks), looking every
+    ///   [`POLL`]. Where one outlives the wait, nothing goes, and `Err` says how many still held
+    ///   it;
     /// - rt's `Device::quiesce`, so that the drop's wait for rt's threads and GPU work, which
     ///   has no deadline, finds them ended. Where it answers false, the device is kept to the
     ///   exit, and `Err` says so;
     /// - the drop of the platform's handle, on this thread, which tears the device down where it
-    ///   was rt's last; then the wait for the teardown, rt's gauges of the device reading zero, as
-    ///   they do once it is torn down; then the drop of the let-go's handle of the instance the
-    ///   device was made on, which rt's README (Teardown) puts after that wait. Where rt's objects
-    ///   of it outlive the wait, `Err` names them, and the instance's handle is kept to the exit.
+    ///   was rt's last; then the wait for the teardown, rt's own
+    ///   (`Instance::wait_until_devices_torn_down` of the instance the device was made on): its
+    ///   `VkDevice` destroyed, every object of it freed and the thread that tore it down joined,
+    ///   where a handle of rt's that this platform does not count (an rt object's, a thread's)
+    ///   was the last; then the drop of the let-go's handle of that instance, which rt's README
+    ///   (Teardown) puts after that wait. Where the teardown outlives the wait, `Err` gives rt's
+    ///   gauges of the device, and the instance's handle is kept to the exit.
     ///
     /// A device taken and not torn down makes the exit's quiesce answer false while it lives.
     /// The next ask makes a new device, whose IDs start from new pools. `Ok`, with nothing let
@@ -358,8 +364,7 @@ impl RtPlatform {
         if !device.rt().quiesce(left) {
             self.unended.lock().push(Unended {
                 device: Some(device),
-                counters,
-                _instance: None,
+                instance: None,
             });
             return Err(format!(
                 "rt's threads or GPU work on {named}, which its quiesce did not see end,"
@@ -367,45 +372,23 @@ impl RtPlatform {
         }
         let instance = device.instance().clone();
         drop(device);
-        match self.wait_for_teardown(&counters, until) {
-            Ok(()) => {
-                drop(instance);
-                log::debug!(
-                    target: "reims_vgpu_vulkan::let_go",
-                    "let go of 1 GPU devices: rt's {named}"
-                );
-                Ok(())
-            }
-            Err(gauges) => {
-                self.unended.lock().push(Unended {
-                    device: None,
-                    counters,
-                    _instance: Some(instance),
-                });
-                Err(format!(
-                    "rt's objects of {named}, its gauges not at zero ({gauges:?}),"
-                ))
-            }
+        let left = until.saturating_duration_since(self.clock.now_mono());
+        if instance.wait_until_devices_torn_down(left) {
+            drop(instance);
+            log::debug!(
+                target: "reims_vgpu_vulkan::let_go",
+                "let go of 1 GPU devices: rt's {named}"
+            );
+            return Ok(());
         }
-    }
-
-    /// Waits, until `until`, for rt's teardown of the device whose counters are `counters`, all
-    /// of whose handles are gone: `Err` with the gauges where they did not all read zero by then.
-    fn wait_for_teardown(
-        &self,
-        counters: &rt::Counters,
-        until: MonoTime,
-    ) -> Result<(), Box<rt::Gauges>> {
-        loop {
-            let gauges = counters.gauges();
-            if gauges == rt::Gauges::default() {
-                return Ok(());
-            }
-            if self.clock.now_mono() >= until {
-                return Err(Box::new(gauges));
-            }
-            std::thread::sleep(POLL);
-        }
+        let gauges = counters.gauges();
+        self.unended.lock().push(Unended {
+            device: None,
+            instance: Some(instance),
+        });
+        Err(format!(
+            "rt's objects of {named}, its teardown not ended (its gauges {gauges:?}),"
+        ))
     }
 }
 
@@ -885,6 +868,105 @@ mod tests {
             "handlers run 8",
             "gauges zero true",
             "quiesce answered true, at once true",
+        ] {
+            assert!(stderr.contains(line), "no {line:?}: {stderr}");
+        }
+    }
+
+    /// The let-go's wait for the teardown is rt's own (`Instance::wait_until_devices_torn_down`),
+    /// bounded, on the GPU the test holds: where a plain handle of rt's device, which the
+    /// platform does not count, outlives the platform's, rt tears the device down on the thread
+    /// that drops it last. A let-go whose bound that handle outlives answers `Err`, the device's
+    /// teardown not ended, and keeps it among the devices the exit's quiesce finds live until the
+    /// handle goes; one whose bound it does not outlive answers `Ok` once that thread's teardown
+    /// ended, rt's gauges of the device at zero. The next ask after each makes a new device.
+    #[test]
+    fn on_vulkan_the_let_go_waits_for_a_teardown_on_another_thread_within_its_bound() {
+        const HELD: Duration = Duration::from_secs(1);
+        let platform = RtPlatform::new();
+        for (bound, ends) in [
+            (Duration::from_millis(200), false),
+            (Duration::from_secs(10), true),
+        ] {
+            let device = (platform.system_default_device()).expect("an rt device on the GPU");
+            let counters = device.rt().counters();
+            let plain = device.rt().clone();
+            drop(device);
+            let start = std::time::Instant::now();
+            let holder = std::thread::spawn(move || {
+                std::thread::sleep(HELD);
+                drop(plain);
+            });
+            let let_go = platform.let_go_of_device(bound);
+            let took = start.elapsed();
+            let live = || {
+                (platform.unended.lock().iter())
+                    .filter(|unended| !unended.ended())
+                    .count()
+            };
+            if ends {
+                assert_eq!(let_go, Ok(()), "the {bound:?} let-go");
+                assert!(took >= HELD, "the let-go took {took:?}, the handle held {HELD:?}");
+                assert_eq!(counters.gauges(), rt::Gauges::default());
+                assert_eq!(live(), 0);
+            } else {
+                assert!(
+                    let_go
+                        .as_ref()
+                        .is_err_and(|held| held.contains("its teardown not ended")),
+                    "the {bound:?} let-go: {let_go:?}"
+                );
+                assert_eq!(live(), 1, "the device the let-go did not see torn down");
+            }
+            holder.join().expect("the holder's drop");
+            assert_eq!(counters.gauges(), rt::Gauges::default());
+            assert_eq!(live(), 0, "the device torn down on the holder's thread");
+        }
+    }
+
+    /// An ask for the device after its let-go makes a new device, which nothing lets go of: the
+    /// exit's quiesce then answers false, as while any device lives, and the host ends with
+    /// `_exit`, the device live. A host thread that asks after the release of the last graphics
+    /// device let go of the device (reims-vgpu's display window at its next frame,
+    /// `ScanoutDraw::on_queue`, or a graphics device's start) leaves the process so. In a child
+    /// process, on the GPU the test holds, since the quiesce closes the exit gate; it ends with
+    /// `_exit`, with status 0.
+    #[test]
+    fn on_vulkan_an_ask_after_the_let_go_makes_a_device_the_exit_s_quiesce_finds_live() {
+        const TEST: &str = "rt_platform::tests::\
+            on_vulkan_an_ask_after_the_let_go_makes_a_device_the_exit_s_quiesce_finds_live";
+        unsafe extern "C" {
+            /// The C library's `_exit`, as the quiesce's test declares it.
+            safe fn _exit(status: i32) -> !;
+        }
+        let say = |line: &str| eprintln!("{line}");
+        if std::env::var("RVG_QUIESCE_CHILD").as_deref() == Ok(TEST) {
+            let platform = RtPlatform::new();
+            let device = (platform.system_default_device()).expect("an rt device on the GPU");
+            let first = device.rt().counters();
+            drop(device);
+            let let_go = platform.let_go_of_device(Duration::from_secs(5));
+            say(&format!("let-go answered {let_go:?}"));
+            let asked = std::thread::scope(|scope| {
+                (scope.spawn(|| platform.system_default_device().is_some()).join())
+                    .expect("the ask's thread")
+            });
+            say(&format!("the ask after it made a device {asked}"));
+            say(&format!(
+                "the first torn down {}",
+                first.gauges() == rt::Gauges::default()
+            ));
+            let quiesced = platform.quiesce(Duration::from_secs(5));
+            say(&format!("the exit's quiesce answered {quiesced}"));
+            _exit(0)
+        }
+        let (status, stderr) = run_child(TEST);
+        assert_eq!(status, Some(0), "{stderr}");
+        for line in [
+            "let-go answered Ok(())",
+            "the ask after it made a device true",
+            "the first torn down true",
+            "the exit's quiesce answered false",
         ] {
             assert!(stderr.contains(line), "no {line:?}: {stderr}");
         }

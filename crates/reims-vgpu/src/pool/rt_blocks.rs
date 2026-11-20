@@ -16,6 +16,15 @@
 //! places inside one is that range of the block, at its pin, where it would be made elsewhere at
 //! rt's address. A block is known from its take until just before its handle goes back to rt.
 //!
+//! **The device's handle.** The source holds the platform's handle of its device
+//! (`RtObj<RtDevice>`), not a plain one of rt's, so that the release's let-go of the device
+//! (`RtPlatform::let_go_of_device`) counts it among the handles beyond the platform's: it waits
+//! for the source to go, the pool's last holder letting go of it on whichever thread, before it
+//! quiesces the device and tears it down on its own thread. A plain handle of rt's would be out
+//! of that count: the let-go would quiesce the device under the source, and the source's drop,
+//! on another thread, would run rt's teardown (`vkDestroyDevice` and the instance's last drop)
+//! beside the process's exit.
+//!
 //! A block's bytes are undefined, new or taken again: rt zeroes nothing ahead of need, and
 //! nothing here zeroes them. rt maps and unmaps whole allocations through the `BlockMappings`
 //! hook its device was made with (`DeviceOptions::block_mappings`), not through the pool: `map`
@@ -26,12 +35,14 @@ use std::collections::HashMap;
 use metal2vulkan_runtime as rt;
 use parking_lot::Mutex;
 use reims_vgpu_vulkan::core::trace;
+use reims_vgpu_vulkan::rt_platform::{RtDevice, RtObj};
 
 use super::{BlockError, BlockId, BlockInfo, BlockSource, MemoryClass};
 
 /// The pool's blocks from an rt device, with the handle of each one handed out.
 pub(crate) struct RtBlocks {
-    device: rt::Device,
+    /// The platform's handle of the device, which its let-go counts (the module's docs).
+    device: RtObj<RtDevice>,
     /// The blocks the platform's device knows, where each block handed out is known.
     known: Box<dyn Knowing>,
     /// The handle of each block handed out, by its number.
@@ -40,8 +51,8 @@ pub(crate) struct RtBlocks {
 
 impl RtBlocks {
     /// A source of `device`'s blocks, with none handed out, each known in `known` (the rt
-    /// platform's device's set) while it is.
-    pub(crate) fn new(device: rt::Device, known: Box<dyn Knowing>) -> RtBlocks {
+    /// platform's device's set) while it is; holding `device` until it goes.
+    pub(crate) fn new(device: RtObj<RtDevice>, known: Box<dyn Knowing>) -> RtBlocks {
         RtBlocks {
             device,
             known,
@@ -82,7 +93,7 @@ impl BlockSource for RtBlocks {
         };
         let started = trace::on().then(trace::now);
         let began = reims_vgpu_vulkan::core::long_waits::begin();
-        let taken = self.device.take_block(rt_class, len);
+        let taken = self.device.rt().take_block(rt_class, len);
         began.end("pool-take");
         if let Some(started) = started {
             // rttake: the class (0 Private, 1 Shared), the length asked, the nanoseconds rt's
@@ -115,7 +126,7 @@ impl BlockSource for RtBlocks {
         self.known.forget(handle.id);
         // The source's own device made it, so rt's one refusal, another device's block, cannot
         // be; rt drops the handle all the same.
-        (self.device.release_block(handle)).map_err(|_| BlockError::NotHeld)
+        (self.device.rt().release_block(handle)).map_err(|_| BlockError::NotHeld)
     }
 }
 
@@ -125,7 +136,7 @@ impl Drop for RtBlocks {
         let held = std::mem::take(self.held.get_mut());
         for block in held.into_values() {
             self.known.forget(block.id);
-            let _ = self.device.release_block(block);
+            let _ = self.device.rt().release_block(block);
         }
     }
 }
@@ -133,8 +144,12 @@ impl Drop for RtBlocks {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use reims_vgpu_vulkan::core::platform::Handle as _;
 
     use super::*;
+    use crate::platform::ApiPlatform as _;
 
     const MIB: u64 = 1 << 20;
 
@@ -164,10 +179,11 @@ mod tests {
         ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), and these have not run on KosmicKrisp, which the M3 Max lacks; ledger: rt on the Mac"
     )]
     fn on_vulkan_rt_blocks_give_a_block_back_by_its_number() {
-        let (device, name) = reims_vgpu_vulkan::seam::test_device().unwrap();
-        println!("rt's device: {name}");
+        let platform = crate::rt_test_end::platform();
+        let device = platform.metal_device(None).expect("rt's device on the GPU");
+        println!("rt's device: {}", device.facts().name);
         let known = Known::default();
-        let blocks = RtBlocks::new(device.clone(), Box::new(known.clone()));
+        let blocks = RtBlocks::new(device.clone_ref(), Box::new(known.clone()));
         let shared = blocks.take_block(MemoryClass::Shared, MIB).unwrap();
         assert_eq!(shared.class, MemoryClass::Shared);
         assert!(shared.len >= MIB, "{shared:?}");
@@ -199,9 +215,9 @@ mod tests {
         // rt counts one long reuse, and the take makes no allocation.
         let long = blocks.take_block(MemoryClass::Shared, 64 * MIB).unwrap();
         assert_eq!(blocks.release_block(long.id), Ok(()));
-        let before = device.counters().metrics();
+        let before = device.rt().counters().metrics();
         let again = blocks.take_block(MemoryClass::Shared, 64 * MIB).unwrap();
-        let after = device.counters().metrics();
+        let after = device.rt().counters().metrics();
         assert!(again.id > long.id, "{again:?} after {long:?}");
         assert_eq!(
             again.gpu_address, long.gpu_address,
@@ -216,5 +232,51 @@ mod tests {
             "long reuses, and allocations the take made"
         );
         assert_eq!(blocks.release_block(again.id), Ok(()));
+    }
+
+    /// The platform's source of blocks holds its device's handle, which the release's let-go of
+    /// the device waits for, on the GPU the test holds: a let-go while the source lives ends at
+    /// its bound by one handle beyond the platform's, the device kept, and the next ask answers
+    /// the same device, whose blocks the source still takes and gives back. Once the source goes,
+    /// on another thread, a block still held in it given back at its drop, the let-go tears the
+    /// device down on its own thread: it returns after the source's drop, rt's gauges of the
+    /// device at zero.
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), and these have not run on KosmicKrisp, which the M3 Max lacks; ledger: rt on the Mac"
+    )]
+    fn on_vulkan_rt_the_let_go_of_the_device_waits_for_its_block_source() {
+        const HELD: Duration = Duration::from_millis(300);
+        let platform = crate::rt_test_end::platform();
+        let device = platform.metal_device(None).expect("rt's device on the GPU");
+        let counters = device.rt().counters();
+        let id = device.id();
+        let source = platform.block_source(&device).expect("rt's blocks");
+        let block = source.take_block(MemoryClass::Shared, MIB).unwrap();
+        drop(device);
+
+        let held = platform.let_go_of_device(Duration::from_millis(200));
+        assert!(
+            (held.as_ref()).is_err_and(|why| why.contains("by 1 handles beyond the platform's")),
+            "{held:?}"
+        );
+        let again = platform.metal_device(None).expect("the device the let-go kept");
+        assert_eq!(again.id(), id, "the next ask's device");
+        drop(again);
+        assert_eq!(source.release_block(block.id), Ok(()));
+        let kept = source.take_block(MemoryClass::Private, MIB).unwrap();
+        assert_eq!(kept.class, MemoryClass::Private);
+
+        let start = Instant::now();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(HELD);
+            drop(source);
+        });
+        assert_eq!(platform.let_go_of_device(Duration::from_secs(10)), Ok(()));
+        let took = start.elapsed();
+        assert!(took >= HELD, "the let-go took {took:?}, the source held {HELD:?}");
+        assert_eq!(counters.gauges(), metal2vulkan_runtime::Gauges::default());
+        holder.join().expect("the source's drop");
     }
 }

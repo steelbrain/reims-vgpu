@@ -1134,8 +1134,10 @@ mod tests {
         ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), and these have not run on KosmicKrisp, which the M3 Max lacks; ledger: rt on the Mac"
     )]
     fn on_vulkan_rt_a_private_take_is_an_rt_block_answered_on_its_worker() {
-        let (device, name) = reims_vgpu_vulkan::seam::test_device().unwrap();
-        println!("rt's device: {name}");
+        use crate::platform::ApiPlatform as _;
+        let platform = crate::rt_test_end::platform();
+        let device = platform.metal_device(None).expect("rt's device on the GPU");
+        println!("rt's device: {}", device.facts().name);
         let source = super::super::rt_blocks::RtBlocks::new(device, Box::new(Unknown));
         let blocks = PrivateBlocks::new(Some(Arc::new(source)), now());
         let (a, a_len) = answered(&take(&blocks, 3, 0x1_8000)).unwrap();

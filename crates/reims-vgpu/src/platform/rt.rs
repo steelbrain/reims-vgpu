@@ -48,14 +48,15 @@ impl ApiPlatform for RtPlatform {
 
     /// rt's blocks (`pool::RtBlocks`), each known to `device` from its take until just before it
     /// goes back (`KnownBlocks`): the buffers and heaps the guest pins inside its pool's blocks
-    /// and its Private blocks are ranges of them, at the guest's addresses.
+    /// and its Private blocks are ranges of them, at the guest's addresses. The source holds the
+    /// platform's handle of `device`, which the let-go of the device counts and waits for.
     fn block_source(
         &self,
         device: &<Self as Platform>::Device,
     ) -> Option<Arc<dyn crate::pool::BlockSource>> {
         let known = Box::new(device.known_blocks().clone());
         Some(Arc::new(crate::pool::RtBlocks::new(
-            device.rt().clone(),
+            device.clone_ref(),
             known,
         )))
     }
