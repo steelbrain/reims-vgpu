@@ -9,38 +9,44 @@
 //!
 //! The test's thread: nextest runs each test in a process of its own, as `<binary> --exact
 //! <name>`, and libtest runs it on a thread named after it, which it joins before `main` returns
-//! and the process exits. In a process run with `--exact`, that thread keeps, weakly, the
-//! process's platform at its first use there ([`process_platform`]) and each platform a test
+//! and the process exits. In a process run with `--exact`, that thread keeps a hold of the
+//! process's platform at its first use there ([`process_platform`]) and of each platform a test
 //! makes of its own ([`platform`]) in a thread-local, whose destructor runs once the test's
 //! function returned or unwound, before the join ends. It lets go of each one's device as a
 //! host's release does (`RtPlatform::let_go_of_device`: it waits for the handles other threads
 //! still hold, a decoder's or a video session's ending as the test's drops reached them, then
-//! quiesces the device and waits for its teardown), on a thread of its own, since this thread's
-//! other thread-locals may be gone by then. Where a device is still held after `BOUND`, the
-//! process writes a line saying so and ends with `_exit` with the status of a failed test,
-//! running no exit handler: the test fails, rather than its process exiting with the device
-//! live.
+//! quiesces the device, waits for its teardown and drops the instance it was made on, which
+//! closes the Vulkan loader where that was the last), on a thread of its own, since this
+//! thread's other thread-locals may be gone by then. Where a device is still held after
+//! `BOUND`, the process writes a line saying so and ends with `_exit` with the status of a
+//! failed test, running no exit handler: the test fails, rather than its process exiting with
+//! the device live.
+//!
+//! The hold is strong, so that a platform's last hold is never a thread's that nothing joins: a
+//! thread the test's drops left holding the platform (a decoder's watch over its waiting
+//! command buffers, a VA display's call thread) drops it after the let-go, when its drop finds
+//! no device. Held weakly, the hold missed a drop already running elsewhere, as an `Arc`'s last
+//! drop takes its strong count to zero before the value's drop runs: on an RTX 3090 (NVIDIA
+//! 620.70.06), `graphics::decode::cmdbuf`'s test of the platform's own indices printed ok, then
+//! died of `SIGSEGV` with the decoder's `reims-vgpu.graphics-event-waits` thread inside
+//! `vkDestroyDevice`, in the platform's drop and its let-go, while the main thread ran
+//! `libEGL_nvidia.so.0`'s exit handler (**measured** from its core, 1 of 2440 tests under the
+//! suite's load, 2026-11-20); on a 780M, NVIDIA's driver installed beside RADV, the same test
+//! died after ok with its main thread fetching an instruction from an unmapped address
+//! (**measured**, the kernel's log, 1 of 2427 tests). And on an
+//! i9-13900H's Iris Xe, with NVIDIA 620.70.06 installed beside Mesa 26.2.6, a VA display's call
+//! thread so dropped the last hold of `graphics::vaapi`'s tests of writes into dma-buf caches,
+//! its let-go closing the Vulkan loader beside the exit's handlers: they printed ok and died of
+//! `SIGSEGV` in 3 of 9 processes, at `libEGL_nvidia.so.0` + 0xa28c2 after its link map was
+//! destroyed (**measured**, `LD_DEBUG=files`, 2026-11-20; docs/lessons.md). The NVIDIA crate
+//! keeps the first runtime it is opened with, and so the platform in it, for the process's life
+//! (its waits' `RUNTIME`): an NVDEC or NVENC test's platform is let go of here and never
+//! dropped.
 //!
 //! Unix only: Windows runs a thread's destructors under the loader lock, which a thread started
 //! or joined there waits for. There a test's process exits with the device as before.
-//!
-//! A test that hands its platform to the video crate's VA-API arm (a VA display's runtime) drops
-//! it with `drop_last` (Linux's): the threads of what it made there hold the platform until they
-//! end, behind the test's own drops, and the platform's last hold destroys rt's instance and
-//! closes the Vulkan loader, which unloads the drivers. Where that hold is a video thread's,
-//! ending as the process exits, NVIDIA's EGL library, which NVIDIA's Vulkan driver loaded, is
-//! unloaded beside the exit's handlers: on an i9-13900H's Iris Xe, with NVIDIA 620.70.06
-//! installed beside Mesa 26.2.6, `graphics::vaapi`'s tests of writes into dma-buf caches printed
-//! ok and then died of `SIGSEGV` in 3 of 9 processes, at `libEGL_nvidia.so.0` + 0xa28c2 after its
-//! link map was destroyed, its own finaliser having left the libraries it loaded mapped
-//! (**measured**, `LD_DEBUG=files`, 2026-11-20; docs/lessons.md). The NVIDIA crate keeps the
-//! first runtime it is opened with, and so the platform in it, for the process's life (its waits'
-//! `RUNTIME`): an NVDEC or NVENC test's platform is never dropped, and `drop_last` would wait for
-//! good there (**measured**: 6 such tests on an RTX 3090 each failed its bound, 2026-11-20).
 
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
-use std::time::Duration;
 
 use reims_vgpu_vulkan::RtPlatform;
 
@@ -49,7 +55,7 @@ pub(crate) use end::process_platform;
 
 /// A platform of the test's own, in place of `Arc::new(RtPlatform::new())`: its device goes as
 /// the test's thread ends where a handle of it outlives the test's own (a video session's
-/// thread, a pool's clock).
+/// thread, a decoder's watch, a pool's clock).
 pub(crate) fn platform() -> Arc<RtPlatform> {
     let platform = Arc::new(RtPlatform::new());
     #[cfg(unix)]
@@ -57,36 +63,12 @@ pub(crate) fn platform() -> Arc<RtPlatform> {
     platform
 }
 
-/// How long [`drop_last`] waits for the platform's other holds to end.
-#[cfg(target_os = "linux")]
-const LAST_BOUND: Duration = Duration::from_secs(30);
-
-/// Drops `platform`, a test's own ([`platform`]), once its other holds ended, on the test's
-/// thread: rt's instance and the Vulkan loader then go before the test returns, not beside the
-/// process's exit (the module docs). Fails the test where another hold outlives [`LAST_BOUND`].
-/// Linux's VA-API tests alone hand a platform to video threads that end (the module docs).
-#[cfg(target_os = "linux")]
-pub(crate) fn drop_last(platform: Arc<RtPlatform>) {
-    const POLL: Duration = Duration::from_millis(1);
-    let mut waited = Duration::ZERO;
-    while Arc::strong_count(&platform) > 1 {
-        assert!(
-            waited < LAST_BOUND,
-            "after {LAST_BOUND:?}, {} other holds of the test's platform",
-            Arc::strong_count(&platform) - 1
-        );
-        std::thread::sleep(POLL);
-        waited += POLL;
-    }
-    drop(platform);
-}
-
 /// The let-go at the end of the test's thread.
 #[cfg(unix)]
 mod end {
     use std::cell::{Cell, RefCell};
     use std::io::Write as _;
-    use std::sync::{Arc, OnceLock, Weak};
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
 
     use reims_vgpu_vulkan::RtPlatform;
@@ -108,15 +90,14 @@ mod end {
 
     /// What the test's thread lets go of as it ends.
     struct AtTheEnd {
-        /// The platforms, held weakly: one the test's own drops ended let go of its device then.
-        platforms: Vec<Weak<RtPlatform>>,
+        /// The platforms, each held to the let-go, which leaves it no device for a later drop on
+        /// another thread to tear down (the module docs).
+        platforms: Vec<Arc<RtPlatform>>,
     }
 
     impl Drop for AtTheEnd {
         fn drop(&mut self) {
-            let platforms: Vec<Arc<RtPlatform>> = (self.platforms.drain(..))
-                .filter_map(|platform| platform.upgrade())
-                .collect();
+            let platforms = std::mem::take(&mut self.platforms);
             if platforms.is_empty() {
                 return;
             }
@@ -160,8 +141,8 @@ mod end {
         (std::thread::current().name()).is_some_and(|name| names.iter().any(|arg| arg == name))
     }
 
-    /// Keeps `platform`'s device for the let-go at the end of the test's thread, where this is
-    /// it.
+    /// Holds `platform` to the let-go of its device at the end of the test's thread, where this
+    /// is it.
     pub(super) fn keep(platform: &Arc<RtPlatform>) {
         if !is_the_test_s_thread() {
             return;
@@ -171,7 +152,7 @@ mod end {
                 platforms: Vec::new(),
             }))
             .platforms
-            .push(Arc::downgrade(platform));
+            .push(Arc::clone(platform));
         });
     }
 
@@ -189,24 +170,32 @@ mod end {
 mod tests {
     use std::io::Write as _;
     use std::process::Command;
-    use std::sync::OnceLock;
+    use std::sync::{Arc, OnceLock};
+    use std::time::Duration;
 
     use metal2vulkan_runtime::{Counters, Gauges};
     use reims_vgpu_vulkan::RtPlatform;
+    use reims_vgpu_vulkan::core::platform::Handle as _;
     use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
     use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
     use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
     use reims_vgpu_vulkan::core::platform::types::NsRange;
     use reims_vgpu_vulkan::core::raise::OnFault;
     use reims_vgpu_vulkan::core::testkit::death::{exit_signal, no_core_at_spawn};
+    use reims_vgpu_vulkan::rt_platform::{RtDevice, RtObj};
 
     use crate::platform::ApiPlatform;
 
-    const TEST: &str =
+    const PROCESS_S: &str =
         "rt_test_end::tests::on_vulkan_a_test_s_rt_device_goes_before_its_process_exits";
+    const A_THREAD_S: &str =
+        "rt_test_end::tests::on_vulkan_a_platform_a_thread_drops_last_has_no_device_by_the_exit";
     const CHILD: &str = "RVG_RT_TEST_END_CHILD";
     /// The child's line from its exit handler.
     const AT_EXIT: &str = "the rt device at the exit: torn down";
+    /// How long the thread of [`a_thread_s_child`] holds the device after its hold of the
+    /// platform went.
+    const DEVICE_HELD: Duration = Duration::from_millis(300);
 
     /// The child's device's counters, for its exit handler.
     static COUNTERS: OnceLock<Counters> = OnceLock::new();
@@ -218,11 +207,10 @@ mod tests {
         let _ = writeln!(std::io::stderr(), "{AT_EXIT} {torn_down:?}");
     }
 
-    /// The child: a test that takes the process's rt device as the tests do, runs GPU work on
-    /// it and returns, its own handles dropped and the platform keeping the device.
-    fn child() {
+    /// `platform`'s device, once GPU work ran on it; its counters kept and the exit handler
+    /// registered.
+    fn worked(platform: &RtPlatform) -> RtObj<RtDevice> {
         const LEN: u64 = 1 << 20;
-        let platform = <RtPlatform as ApiPlatform>::process();
         let device = platform.metal_device(None).expect("the rt device");
         let buffer = device
             .new_buffer_of_length(OnFault::Die, LEN, 0)
@@ -243,19 +231,57 @@ mod tests {
         assert!(COUNTERS.set(device.rt().counters()).is_ok());
         // SAFETY: a handler that takes nothing and returns, as `atexit` asks.
         assert_eq!(unsafe { libc::atexit(at_exit) }, 0);
+        device
     }
 
-    /// A test that ends with the process's rt device kept leaves its process no device by the
-    /// exit's handlers: the end of its thread let go of it. The child is this test run again as
-    /// nextest runs it, which writes from an exit handler whether rt tore the device down.
-    #[test]
-    fn on_vulkan_a_test_s_rt_device_goes_before_its_process_exits() {
-        if std::env::var_os(CHILD).is_some() {
-            child();
-            return;
+    /// The child of the process's platform: a test that takes the process's rt device as the
+    /// tests do, runs GPU work on it and returns, its own handles dropped and the platform
+    /// keeping the device.
+    fn process_s_child() {
+        drop(worked(&<RtPlatform as ApiPlatform>::process()));
+    }
+
+    /// The child of a thread's last hold: a test that makes a platform of its own, runs GPU work
+    /// on its device and leaves a hold of each to a thread nothing joins. Once the test's own
+    /// holds went, as its function returns, the thread drops its hold of the platform, then,
+    /// [`DEVICE_HELD`] later, the device's handle. Where the test's end held the platform
+    /// weakly, the thread's hold was then the platform's last, and the platform's drop on that
+    /// thread let go of the device beside the exit, after the end found the platform gone.
+    fn a_thread_s_child() {
+        const POLL: Duration = Duration::from_millis(1);
+        let platform = super::platform();
+        let device = worked(&platform);
+        let (go, went) = std::sync::mpsc::channel::<()>();
+        let held = (Arc::clone(&platform), device.clone_ref());
+        let thread = std::thread::Builder::new()
+            .name("rt test end's other hold".to_owned())
+            .spawn(move || {
+                let (platform, device) = held;
+                let _ = went.recv();
+                drop(platform);
+                std::thread::sleep(DEVICE_HELD);
+                drop(device);
+            });
+        // Nothing joins it.
+        drop(thread.unwrap());
+        drop(device);
+        let weak = Arc::downgrade(&platform);
+        drop(platform);
+        let before = weak.strong_count();
+        go.send(()).unwrap();
+        let mut waited = Duration::ZERO;
+        while weak.strong_count() >= before {
+            assert!(waited < Duration::from_secs(10), "the thread kept its hold");
+            std::thread::sleep(POLL);
+            waited += POLL;
         }
+    }
+
+    /// Runs `test` again as nextest runs it, as the child: its exit handler found the device
+    /// torn down, and it passed.
+    fn its_child_s_device_went_before_the_exit(test: &str) {
         let out = no_core_at_spawn(&mut Command::new(std::env::current_exe().unwrap()))
-            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
             .env(CHILD, "1")
             .output()
             .unwrap();
@@ -267,5 +293,29 @@ mod tests {
             exit_signal(out.status),
         );
         assert_eq!(out.status.code(), Some(0), "{stderr}");
+    }
+
+    /// A test that ends with the process's rt device kept leaves its process no device by the
+    /// exit's handlers: the end of its thread let go of it. The child is this test run again as
+    /// nextest runs it, which writes from an exit handler whether rt tore the device down.
+    #[test]
+    fn on_vulkan_a_test_s_rt_device_goes_before_its_process_exits() {
+        if std::env::var_os(CHILD).is_some() {
+            process_s_child();
+            return;
+        }
+        its_child_s_device_went_before_the_exit(PROCESS_S);
+    }
+
+    /// A test's platform whose last hold, after the test's own, is a thread's that nothing joins
+    /// leaves its process no device by the exit's handlers: the end of the test's thread held the
+    /// platform, and let go of its device once the thread's handle of it went.
+    #[test]
+    fn on_vulkan_a_platform_a_thread_drops_last_has_no_device_by_the_exit() {
+        if std::env::var_os(CHILD).is_some() {
+            a_thread_s_child();
+            return;
+        }
+        its_child_s_device_went_before_the_exit(A_THREAD_S);
     }
 }
