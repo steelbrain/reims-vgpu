@@ -18,10 +18,10 @@
 //!   or none for parameter sets and for a picture the stream's random access skips.
 //! - **The device's caches are made dma-bufs** ([`CacheTargets`], `writes_into_device_caches`)
 //!   where the platform makes caches of dma-bufs and either of the driver's checks passed anything
-//!   ([`cache_writes`]): the check of decodes into targets (the VA crate's `TargetChecks`, kept
-//!   under `device-checks/va-targets` in the platform's cache directory) a codec and format, or
-//!   the import check (the VA crate's `import_check`) NV12 or P010. iHD fails the first for every
-//!   kind, its decodes writing their render target tiled whatever the import says
+//!   (`cache_writes`, on Unix): the check of decodes into targets (the VA crate's `TargetChecks`,
+//!   kept under `device-checks/va-targets` in the platform's cache directory) a codec and format,
+//!   or the import check (the VA crate's `import_check`) NV12 or P010. iHD fails the first for
+//!   every kind, its decodes writing their render target tiled whatever the import says
 //!   (`docs/video/bugs.md`, U30), and passes the second, so on iHD every picture is written into
 //!   its cache by the driver's video processing (the first way below).
 //! - **A picture is decoded into its output's device cache** where it can be: where both planes
@@ -341,7 +341,7 @@ struct VaapiVideo<P: Platform> {
     /// What makes each session's GPU copies of its pictures (the module doc's second way).
     copies: Option<Arc<dyn GpuCopies<P>>>,
     /// What writes pictures into device caches through their memory, where the platform makes
-    /// caches of dma-bufs and the driver's checks passed anything ([`cache_writes`]).
+    /// caches of dma-bufs and the driver's checks passed anything (`cache_writes`, on Unix).
     targets: Option<Arc<CacheTargets<P>>>,
 }
 
@@ -432,8 +432,8 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
     }
 
     /// Where the platform makes caches of dma-bufs and the driver's checks passed anything
-    /// ([`cache_writes`]): a picture is decoded into its cache, or written there by the driver's
-    /// video processing (module doc).
+    /// (`cache_writes`, on Unix): a picture is decoded into its cache, or written there by the
+    /// driver's video processing (module doc).
     fn writes_into_device_caches(&self) -> bool {
         self.targets.is_some()
     }
