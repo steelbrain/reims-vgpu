@@ -55,10 +55,22 @@ when it asks for more. When the guest lets go of some, QEMU gives it back once i
 for 5 seconds. On a Radeon 780M, a desktop with a browser and video used at most 73 MiB of it at
 a time, and 3D apps use more. So leave your host some memory beyond what you give the VM.
 
-## A Mac needs macOS 26 or later to run VMs
+## On a Mac
+
+### You need macOS 26 or later to run VMs
 
 On a Mac, reims-vgpu runs on Mesa's KosmicKrisp Vulkan driver, which comes with Homebrew's `mesa`.
 Homebrew builds KosmicKrisp only on macOS 26 and later, so on a Mac running macOS 15 or earlier,
 VMs don't start: QEMU finds no GPU it can use and stops. `scripts/install-ctl.sh` installs `mesa`
 for you on macOS 26 and later, and tells you when your Mac's macOS is too old. We've booted arm64
 macOS 27.0.1 to its desktop this way on an M3 Max.
+
+### Opening apps copies more than on Linux
+
+On a Mac, the guest's memory reaches the GPU through its address on the host. That way of sharing
+memory can't hand the GPU an image's bytes as they are, so we copy them. Most of the copying happens
+while apps open. On our M3 Max, we copied from about a quarter of a 1080p frame's bytes to about one
+and a half frames' worth while apps opened, and under 1% of a frame's bytes during steady
+animation. Windows hosts share the guest's memory the same way, so this applies there too, though
+we've only measured it on a Mac. Linux hosts share it another way, and we're building support
+there for using an image's bytes in place.
