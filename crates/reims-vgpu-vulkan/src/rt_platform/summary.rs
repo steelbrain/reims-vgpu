@@ -5,9 +5,9 @@
 //!
 //! A part is `rt: ...` ([`line()`]):
 //! - the `VkPipeline`s rt made;
-//! - its first-use waits, their count and time in all, then those for a kernel's variant and for
-//!   a content's lines among them, and the longest since the device was made (rt keeps no longest
-//!   of a period); its waits for a lowering are left out;
+//! - its first-use waits, their count and time in all, then those for a kernel's variant, for a
+//!   content's lines and for its points among them, and the longest since the device was made (rt
+//!   keeps no longest of a period); its waits for a lowering are left out;
 //! - its `vkQueueSubmit2` calls, their count and time inside the driver in all, those longer than
 //!   100 ms, and the longest since the device was made; then the submit thread's waits for rt's
 //!   queue lock before them, their time in all and the longest since the device was made;
@@ -128,11 +128,11 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges)
     );
     format!(
         "rt: pipelines made {}; first-use waits {} in {:.1} ms (variants {} in {:.1} ms, lines {} \
-         in {:.1} ms), the longest since the device was made {:.1} ms; submits {} in {:.1} ms \
-         ({} over 100 ms), the longest since the device was made {:.1} ms; queue-lock waits \
-         {:.1} ms, the longest since the device was made {:.1} ms; bytes copied {copied}: \
-         staging {staging}, attachment reads {attachments}, over-copies {over}{}; counted {}; \
-         gauges {}",
+         in {:.1} ms, points {} in {:.1} ms), the longest since the device was made {:.1} ms; \
+         submits {} in {:.1} ms ({} over 100 ms), the longest since the device was made {:.1} \
+         ms; queue-lock waits {:.1} ms, the longest since the device was made {:.1} ms; bytes \
+         copied {copied}: staging {staging}, attachment reads {attachments}, over-copies \
+         {over}{}; counted {}; gauges {}",
         rose!(pipelines_created),
         rose!(first_use_waits),
         ms(rose!(first_use_wait_nanos)),
@@ -140,6 +140,8 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges)
         ms(rose!(first_use_variant_wait_nanos)),
         rose!(first_use_line_waits),
         ms(rose!(first_use_line_wait_nanos)),
+        rose!(first_use_point_waits),
+        ms(rose!(first_use_point_wait_nanos)),
         ms(now.first_use_wait_max_nanos),
         rose!(submissions),
         ms(rose!(submit_call_nanos)),
@@ -188,6 +190,8 @@ mod tests {
         now.first_use_variant_wait_nanos = 6_000_000;
         now.first_use_line_waits = 1;
         now.first_use_line_wait_nanos = 1_500_000;
+        now.first_use_point_waits = 1;
+        now.first_use_point_wait_nanos = 500_000;
         now.first_use_wait_max_nanos = 4_200_000;
         before.submissions = 100;
         before.submit_call_nanos = 50_000_000;
@@ -241,11 +245,11 @@ mod tests {
         assert_eq!(
             line(&before, &now, &gauges),
             "rt: pipelines made 3; first-use waits 3 in 7.5 ms (variants 2 in 6.0 ms, lines 1 in \
-             1.5 ms), the longest since the device was made 4.2 ms; submits 60 in 312.5 ms (2 \
-             over 100 ms), the longest since the device was made 140.0 ms; queue-lock waits 2.3 \
-             ms, the longest since the device was made 0.9 ms; bytes copied 4672: staging 64, \
-             attachment reads 512, over-copies 4096 (dma-buf 4000, pitch 96); counted \
-             texture_clears 2, texture_clear_bytes 524288, texture_clear_barriers 1, \
+             1.5 ms, points 1 in 0.5 ms), the longest since the device was made 4.2 ms; submits 60 \
+             in 312.5 ms (2 over 100 ms), the longest since the device was made 140.0 ms; \
+             queue-lock waits 2.3 ms, the longest since the device was made 0.9 ms; bytes copied \
+             4672: staging 64, attachment reads 512, over-copies 4096 (dma-buf 4000, pitch 96); \
+             counted texture_clears 2, texture_clear_bytes 524288, texture_clear_barriers 1, \
              external_acquires 2, barriers 9, held_releases 3, held_release_bytes 16842752, \
              held_release_starts 1, held_starts 6, held_start_gap_nanos 250000, \
              pipeline_creation_nanos 7250000, translation_nanos 3125000; gauges textures 12, \
