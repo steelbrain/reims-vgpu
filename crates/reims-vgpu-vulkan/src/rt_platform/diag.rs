@@ -106,8 +106,8 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 
 use metal2vulkan_rt as rt;
@@ -1797,7 +1797,10 @@ mod tests {
             kind: rt::DrawKind::AttachmentRead,
         }));
         refusal(&rt::Error::Unsupported(rt::Gap::CubicSampler));
-        refusal(&rt::Error::Refused(rt::Refusal::BufferTooLong { length: 8, max: 4 }));
+        refusal(&rt::Error::Refused(rt::Refusal::BufferTooLong {
+            length: 8,
+            max: 4,
+        }));
         refusal(&rt::Error::Limit(rt::Limit::BlockLen { len: 8, max: 4 }));
         refusal(&rt::Error::Quiesced);
         let gaps = GAPS.lock();
@@ -1805,7 +1808,11 @@ mod tests {
         assert!(gaps.get("CubicSampler").is_some_and(|&n| n >= 1));
         drop(gaps);
         let refusals = REFUSALS.lock();
-        assert!(refusals.get("Refused-BufferTooLong").is_some_and(|&n| n >= 1));
+        assert!(
+            refusals
+                .get("Refused-BufferTooLong")
+                .is_some_and(|&n| n >= 1)
+        );
         assert!(refusals.get("Limit-BlockLen").is_some_and(|&n| n >= 1));
         drop(refusals);
         for map in [&GAPS, &REFUSALS] {
