@@ -2719,8 +2719,11 @@ pub fn out_of_host_memory_count() -> u64 {
 /// GPU's copy declined (`rt-video-gpu-copy-declined`), and draws a picture into a cache's planes
 /// over Direct3D 11 textures there (`video-pictures-drawn`, and their crops' KiB,
 /// `video-drawn-kib`), and as such a cache's surface uses a spare made ahead
-/// (`video-drawn-spares-used`) or makes its own (`video-drawn-spares-missed`), with the spares
-/// made (`video-drawn-spares-made`) and dropped untaken (`video-drawn-spares-dropped`), and as
+/// (`video-drawn-spares-used`) or makes its own (`video-drawn-spares-missed`), waits for the
+/// spare being made for it (`video-drawn-spares-waited`, its nanoseconds waited,
+/// `video-drawn-spares-wait-ns`, and the longest wait, `video-drawn-spares-wait-max-ns`), with
+/// the spares made (`video-drawn-spares-made`) and dropped untaken (`video-drawn-spares-dropped`),
+/// and as
 /// its video session's picture does not land after its command buffer
 /// completed at its decode, the session's next decode failing in its stead
 /// (`video-landing-failure-carried`); the rt platform's surfaces over Direct3D 11 textures on

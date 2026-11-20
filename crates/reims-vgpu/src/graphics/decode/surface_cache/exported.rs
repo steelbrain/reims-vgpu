@@ -68,9 +68,12 @@
 //! at its last decode on the device's video (`Caches::saw_decodes_in_flight`), at least one
 //! and at most `spares::MOST_SPARES` of every ask, by the plane shapes, their formats and the
 //! device's recoveries it was made at, so none made before a recovery is taken after it.
-//! Counted: `video-drawn-spares-used`, the asks that took a spare; `video-drawn-spares-missed`,
-//! those that made their own; `video-drawn-spares-made`, the spares made; and
-//! `video-drawn-spares-dropped`, those let go of untaken.
+//! An ask that finds none while the spares' thread is making its spare waits for that make
+//! (`spares`). Counted: `video-drawn-spares-used`, the asks that took a spare;
+//! `video-drawn-spares-missed`, those that made their own; `video-drawn-spares-waited`, those
+//! that waited for a make, with `video-drawn-spares-wait-ns` their nanoseconds waited and
+//! `video-drawn-spares-wait-max-ns` the longest wait; `video-drawn-spares-made`, the spares made;
+//! and `video-drawn-spares-dropped`, those let go of untaken.
 
 use std::sync::Arc;
 
@@ -98,6 +101,8 @@ use reims_vgpu_vulkan::core::raise::Raise;
 use super::super::super::drawn::{DrawnPlanes, DrawnTarget};
 #[cfg(unix)]
 use super::super::video::SurfaceTarget;
+#[cfg(windows)]
+use super::Now;
 use super::shapes::{Held, ShapeCounts, ShapeKey, ShapeTable};
 #[cfg(windows)]
 use super::spares::{SpareCodes, Spares};
@@ -662,15 +667,23 @@ pub(super) type DrawnSpares<P> = Spares<(DrawnAsk, u64), (ImportedSurface<P>, Dr
 static DRAWN_SPARE_CODES: SpareCodes = SpareCodes {
     used: "video-drawn-spares-used",
     missed: "video-drawn-spares-missed",
+    waited: "video-drawn-spares-waited",
+    wait_ns: "video-drawn-spares-wait-ns",
+    wait_max_ns: "video-drawn-spares-wait-max-ns",
     made: "video-drawn-spares-made",
     dropped: "video-drawn-spares-dropped",
 };
 
 /// The spare surfaces made ahead for a device's caches (the module doc), each make under the
-/// device's reset `gate` held shared.
+/// device's reset `gate` held shared, the asks' waits timed by `now`.
 #[cfg(windows)]
-pub(super) fn drawn_spares<P: Platform>(gate: Arc<RwLock<()>>) -> DrawnSpares<P> {
-    Spares::new("reims-vgpu.graphics-drawn-spares", gate, &DRAWN_SPARE_CODES)
+pub(super) fn drawn_spares<P: Platform>(gate: Arc<RwLock<()>>, now: Now) -> DrawnSpares<P> {
+    Spares::new(
+        "reims-vgpu.graphics-drawn-spares",
+        gate,
+        &DRAWN_SPARE_CODES,
+        now,
+    )
 }
 
 /// Why [`DrawnAsk::make`] made no surface.

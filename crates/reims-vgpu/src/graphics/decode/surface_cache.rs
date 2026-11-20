@@ -6879,14 +6879,16 @@ impl<P: Platform> Caches<P> {
     /// (`graphics::drawn`): set once, at the device's make, before any cache, where the device's
     /// video lands its pictures so. The video lands pictures only in two-plane surfaces (NV12,
     /// P010), so a cache of one plane is made as any other laid-out cache. The surfaces' spares
-    /// are made ahead under the device's reset `gate` held shared (`exported`).
+    /// are made ahead under the device's reset `gate` held shared, an ask's wait for one timed by
+    /// `now` (`exported`).
     #[cfg(windows)]
     pub(crate) fn set_drawn(
         &self,
         draw: Arc<reims_vgpu_video::vaapi::PlaneDraw>,
         gate: Arc<RwLock<()>>,
+        now: Now,
     ) {
-        drop(self.drawn_spares.set(exported::drawn_spares(gate)));
+        drop(self.drawn_spares.set(exported::drawn_spares(gate, now)));
         self.lock().drawn = Some(draw);
     }
 

@@ -1019,14 +1019,18 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Direct3D 11 textures that `draw` writes the host's video's pictures into
     /// (`graphics::drawn`): set once, at the device's make, before any cache, where the device's
     /// video lands pictures so, their spares made ahead under the device's `reset_gate` held
-    /// shared.
+    /// shared, an ask's wait for one timed by the platform's clock.
     #[cfg(windows)]
     pub(crate) fn set_drawn_caches(
         &self,
         draw: Arc<reims_vgpu_video::vaapi::PlaneDraw>,
         reset_gate: Arc<parking_lot::RwLock<()>>,
     ) {
-        self.shared.surface_caches.set_drawn(draw, reset_gate);
+        use reims_vgpu_vulkan::core::platform::os::clock::Clock as _;
+
+        let platform = Arc::clone(&self.platform);
+        let now = Arc::new(move || platform.clock().now_mono());
+        self.shared.surface_caches.set_drawn(draw, reset_gate, now);
     }
 
     /// A hold of the session `id` names; an exec fault where it names none, and a refused
