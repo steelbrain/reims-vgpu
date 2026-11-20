@@ -4,6 +4,7 @@
 
 > **Beta.** reims-vgpu has largely stabilized. We're now working through differences between
 > platforms and GPU drivers, so how well it runs can still depend on your host and its GPU.
+> [docs/known-issues.md](docs/known-issues.md) lists what we know is wrong right now.
 
 reims-vgpu is a virtual GPU for macOS VMs. It gives x86-64 macOS running in QEMU on Linux or
 Windows accelerated graphics, on your GPU's Vulkan driver. The guest drives it with macOS drivers
