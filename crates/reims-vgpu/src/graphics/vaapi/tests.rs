@@ -343,6 +343,7 @@ fn the_rt_platforms_va_api_arm_decodes_alone() {
             writes.p010()
         );
     });
+    crate::rt_test_end::drop_last(platform);
 }
 
 /// A picture the driver decoded into a surface of its own, written by its video processing into a
@@ -531,6 +532,7 @@ fn a_picture_written_into_a_dma_buf_cache_by_video_processing_is_the_cpus_copy()
         );
         assert!(pictures > 0, "no picture written: {declined:?}");
     });
+    crate::rt_test_end::drop_last(platform);
 }
 
 /// A picture the driver decoded into a surface of its own, written by its video processing into a
@@ -723,6 +725,7 @@ fn a_picture_written_into_a_dma_buf_caches_surface_by_video_processing_is_the_cp
         );
         assert!(pictures > 0, "no picture written: {declined:?}");
     });
+    crate::rt_test_end::drop_last(platform);
 }
 
 /// The pictures of each stream the tests of writes into caches write.

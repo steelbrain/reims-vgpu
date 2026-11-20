@@ -562,4 +562,5 @@ fn a_guest_encoders_frames_code_alike_from_the_cpu_and_the_gpu_and_decode_back()
         }
         assert!(checked > 0);
     });
+    crate::rt_test_end::drop_last(platform);
 }
