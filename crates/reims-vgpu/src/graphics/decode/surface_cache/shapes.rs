@@ -21,9 +21,9 @@
 //! renders into it is rt's to build only on such an image, and the long list of view formats
 //! that `PixelFormatView` brings costs a compositing pass time on some GPUs. A plain image is
 //! viewed in its own format and its sRGB sibling alone, as Metal views a texture with no
-//! `PixelFormatView` usage: a texture over a plain shape in any other format is a view rt
-//! refuses, counted ([`PLAIN_VIEW_REFUSED`]), and lies over the buffer as one whose view the
-//! platform does not make.
+//! `PixelFormatView` usage, and rt refuses a view of it in any other format: a texture over a
+//! plain shape in another format takes the storage shape of its extent instead, as one that takes
+//! storage does, counted ([`FORMAT_STORAGE`]).
 //!
 //! **A storage shape serves every texture of its extent** (its key but for the storage bit),
 //! whatever the texture declares: [`ShapeTable::find`] prefers it. A texture that takes storage
@@ -176,11 +176,11 @@ use reims_vgpu_vulkan::gpu::no_texture::no_view;
 /// 2026-11-19: referenced shapes and 4 more).
 pub(crate) const UNREFERENCED_KEPT: usize = 4;
 
-/// The degradation code of a texture over a plain shape in a format that is neither the shape's
-/// nor its sRGB sibling: a view rt refuses, as Metal's validation refuses a view in another format
-/// of a texture without `PixelFormatView` usage (the module doc, "The shape"). The texture lies
-/// over the buffer as one whose view the platform does not make.
-pub(crate) const PLAIN_VIEW_REFUSED: &str = "rt-refused-surface-plain-view-format";
+/// The counts' code of a texture over a plain shape in a format that is neither the shape's nor
+/// its sRGB sibling, a view of the plain image rt refuses, as Metal's validation refuses a view in
+/// another format of a texture without `PixelFormatView` usage: the texture takes the storage
+/// shape of its extent instead (the module doc, "The shape").
+pub(crate) const FORMAT_STORAGE: &str = "rt-shape-format-storage";
 
 /// The counts' codes of shapes made over a plane that held a shape of the other kind, plain or
 /// storage, and of rule 1's copies between a plain and a storage shape and their bytes
@@ -442,9 +442,9 @@ pub(crate) struct ShapeCounts {
     pub(crate) order_case: u64,
     pub(crate) order_copies: u64,
     pub(crate) order_bytes: u64,
-    /// Textures over a plain shape in a format neither the shape's nor its sRGB sibling, whose
-    /// view rt refuses ([`PLAIN_VIEW_REFUSED`]).
-    pub(crate) plain_views_refused: u64,
+    /// Textures over a plain shape in a format neither the shape's nor its sRGB sibling, which
+    /// took the storage shape of their extent ([`FORMAT_STORAGE`]).
+    pub(crate) format_storage: u64,
     /// Textures over a plain shape that declare `PixelFormatView` usage.
     pub(crate) plain_format_views: u64,
     /// Shapes whose image the platform placed and their first fill filled at their make, and

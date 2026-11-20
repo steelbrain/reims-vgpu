@@ -7,10 +7,10 @@
 //! shape of its extent, made of the Unknown usage where the cache holds none; any other views the
 //! storage shape of its extent where the cache holds one, else its plain shape, made of
 //! `ShaderRead | RenderTarget` alone. A texture over a plain shape in a format neither the
-//! shape's nor its sRGB sibling asks a view rt refuses, counted
-//! ([`shapes::PLAIN_VIEW_REFUSED`], logged once), and lies over the buffer as any texture whose
-//! view the platform does not make; one over a plain shape that declares `PixelFormatView` is
-//! counted too.
+//! shape's nor its sRGB sibling, a view of the plain image that rt refuses as Metal refuses one
+//! of a texture with no `PixelFormatView` usage, takes the storage shape of its extent instead,
+//! counted ([`shapes::FORMAT_STORAGE`], logged once); one over a plain shape that declares
+//! `PixelFormatView` is counted too.
 //!
 //! A texture takes a shape where it is a 2D texture of one level, one slice and one sample in a
 //! colour format of texels ([`shapes::texel_bytes`]) lying wholly inside the cache's buffer; any
@@ -45,7 +45,7 @@ use reims_vgpu_vulkan::core::platform::values::TextureDesc;
 use reims_vgpu_vulkan::core::raise::RaiseResult;
 use reims_vgpu_vulkan::gpu::no_texture::views_without_usage;
 
-use super::surface_cache::shapes::{self, PLAIN_VIEW_REFUSED, ShapeCounts, ShapeKey, ShapeUse};
+use super::surface_cache::shapes::{self, FORMAT_STORAGE, ShapeCounts, ShapeKey, ShapeUse};
 use super::surface_cache::{self, CacheLayout, STORAGE_PRIVATE, ShapeMaker};
 use super::{GraphicsDecoder, ObjHandle, TEXTURE_USAGE_WRITES, texture_desc};
 
@@ -62,9 +62,10 @@ const TEXTURE_USAGE_PIXEL_FORMAT_VIEW: u64 = 0x10;
 /// (`shapes`, "The shape").
 const PLAIN_USAGE: u64 = 0x1 | 0x4;
 
-/// Whether a view refused over a plain shape was logged ([`PLAIN_VIEW_REFUSED`]): its line is
-/// logged the first time alone, the rest counted (docs/conventions.md).
-static PLAIN_LOGGED: AtomicBool = AtomicBool::new(false);
+/// Whether a texture over a plain shape took the storage shape for its format was logged
+/// ([`FORMAT_STORAGE`]): its line is logged the first time alone, the rest counted
+/// (docs/conventions.md).
+static FORMAT_STORAGE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// The degradation code of a block refused as uncached in the per-shape form, which the kext
 /// gives a copy block instead (module doc).
@@ -214,12 +215,22 @@ impl<P: Platform> GraphicsDecoder<P> {
             resource_options: Some(STORAGE_PRIVATE),
             ..TextureDesc::default()
         };
-        let Some((reference, image)) = caches.shape(device, block, key, &image) else {
+        let Some(mut held) = caches.shape(device, block, key, &image) else {
             return unshaped(|_| {});
         };
-        if image.usage() == PLAIN_USAGE {
-            self.note_plain_view(m, image.pixel_format());
+        if held.1.usage() == PLAIN_USAGE && !self.views_plain(m, held.1.pixel_format()) {
+            // A plain image is viewed in its own format and its sRGB sibling alone: the texture
+            // takes the storage shape of its extent, made of the Unknown usage where the cache
+            // holds none, which rule 1 keeps current with the plain one (`shapes`, "The shape").
+            drop(held);
+            let key = key.as_storage();
+            let image = TextureDesc { usage: 0, ..image };
+            let Some(storage) = caches.shape(device, block, key, &image) else {
+                return unshaped(|_| {});
+            };
+            held = storage;
         }
+        let (reference, image) = held;
         let swizzle = texture_desc(d, m.resource_id).swizzle;
         let one_of = NsRange::new(0, 1);
         let view = match swizzle {
@@ -248,31 +259,33 @@ impl<P: Platform> GraphicsDecoder<P> {
         Ok(Some((view, shape)))
     }
 
-    /// The texture `m` asks lies over a plain shape of `shape_format`: one that declares
-    /// `PixelFormatView` is counted ([`ShapeCounts::plain_format_views`]), and one in a format
-    /// neither `shape_format` nor its sRGB sibling asks a view rt refuses, counted
-    /// ([`PLAIN_VIEW_REFUSED`], logged once). The view is asked all the same.
-    fn note_plain_view(&self, m: &RgfxTextureFromIOSurface, shape_format: u64) {
+    /// Whether the plain shape of `shape_format` the texture `m` asks lies over takes it as a
+    /// view: in `shape_format` or its sRGB sibling, as Metal views a texture with no
+    /// `PixelFormatView` usage. One that declares `PixelFormatView` is counted
+    /// ([`ShapeCounts::plain_format_views`]), and one in any other format, which takes the storage
+    /// shape of its extent instead, is counted too ([`FORMAT_STORAGE`], logged once).
+    fn views_plain(&self, m: &RgfxTextureFromIOSurface, shape_format: u64) -> bool {
         let caches = &self.surface_caches;
         if u64::from(m.desc.usage) & TEXTURE_USAGE_PIXEL_FORMAT_VIEW != 0 {
             caches.count_shapes(|c| c.plain_format_views += 1);
         }
         let pixel_format = u64::from(m.desc.pixel_format);
         if views_without_usage(shape_format, pixel_format) {
-            return;
+            return true;
         }
-        caches.count_shapes(|c| c.plain_views_refused += 1);
-        reims_vgpu_vulkan::answer::count_kind(PLAIN_VIEW_REFUSED);
+        caches.count_shapes(|c| c.format_storage += 1);
+        reims_vgpu_vulkan::answer::count_kind(FORMAT_STORAGE);
         reims_vgpu_vulkan::rt_platform::diag::plain_view_refused(shape_format, pixel_format);
-        if !PLAIN_LOGGED.swap(true, Ordering::Relaxed) {
-            log::warn!(
-                target: "reims_vgpu::graphics", kind:% = PLAIN_VIEW_REFUSED;
-                "the texture {:#x} over plane {} of the IOSurface {}: a view in format \
-                 {pixel_format} of a plain shape of format {shape_format}, neither it nor its \
-                 sRGB sibling, which rt refuses ({PLAIN_VIEW_REFUSED}; the rest are counted)",
+        if !FORMAT_STORAGE_LOGGED.swap(true, Ordering::Relaxed) {
+            log::info!(
+                target: "reims_vgpu::graphics", kind:% = FORMAT_STORAGE;
+                "the texture {:#x} over plane {} of the IOSurface {}: in format {pixel_format}, \
+                 neither its plain shape's format {shape_format} nor its sRGB sibling, it takes \
+                 the storage shape of its extent ({FORMAT_STORAGE}; the rest are counted)",
                 m.obj_id, m.plane, m.iosurface_id
             );
         }
+        false
     }
 
     /// The shape the texture `m` asks would take over its surface, of the format `info`
@@ -657,7 +670,7 @@ mod tests {
         let counts = r.dec.caches().counts().shapes;
         assert_eq!((counts.made, counts.found, counts.unshaped), (3, 2, 0));
         assert_eq!(counts.made_bytes, 2 * 32 * 8 * 4 + 16 * 8 * 4);
-        assert_eq!(counts.plain_views_refused, 0);
+        assert_eq!(counts.format_storage, 0);
         let shape = |n: u64| {
             let entry = r.dec.entry(n).unwrap();
             entry.shape.as_ref().map(|s| (s.block, s.writes))
@@ -849,8 +862,10 @@ mod tests {
     /// usage, and writes its shape where it is bound; any other takes a plain shape, its image
     /// made of `ShaderRead | RenderTarget` alone, and leaves it clean; each storage shape made
     /// over the plane while it holds the plain one is counted, whatever its extent. Over a plain
-    /// shape a texture in the shape's format's sRGB sibling is a view of it; one in another
-    /// format is a view rt refuses, counted, and one that declares `PixelFormatView` is counted
+    /// shape a texture in the shape's format's sRGB sibling is a view of it, and one that declares
+    /// `PixelFormatView` is counted; one in another format, a view of the plain image rt refuses,
+    /// takes the storage shape of its extent, made of the Unknown usage beside the plain one,
+    /// counted, and a later texture of the extent views that storage shape
     #[test]
     fn a_textures_declared_usage_picks_its_shapes_kind() {
         let (mut r, made) = shaped_made();
@@ -867,14 +882,50 @@ mod tests {
 
         let sibling = texture_as_image(&mut r, 25, 81, (32, 8), 0x1);
         let format_view = texture_as_image(&mut r, 26, 80, (32, 8), 0x11);
-        let refused = texture_as_image(&mut r, 27, 70, (32, 8), 0x5);
-        assert_eq!([sibling, format_view, refused], [plain; 3]);
+        assert_eq!([sibling, format_view], [plain; 2]);
         assert_eq!(made.lock().len(), 4);
+        let other_format = texture_as_image(&mut r, 27, 70, (32, 8), 0x5);
+        assert!(![plain].iter().chain(&storage).any(|&i| i == other_format));
+        assert_eq!(made.lock()[4..], [(70, 0)], "a storage shape of its extent");
+        assert_eq!(writes(&r, 27), Some(false), "writes as its usage says");
+        assert_eq!(texture_as_image(&mut r, 28, 80, (32, 8), 0x5), other_format);
         let counts = r.dec.caches().counts().shapes;
-        assert_eq!((counts.made, counts.found), (4, 3));
-        assert_eq!(counts.order_case, 3, "beside the plain one");
-        let plain_counts = (counts.plain_views_refused, counts.plain_format_views);
+        assert_eq!((counts.made, counts.found), (5, 4));
+        assert_eq!(counts.order_case, 4, "beside the plain one");
+        let plain_counts = (counts.format_storage, counts.plain_format_views);
         assert_eq!(plain_counts, (1, 1));
+        assert_eq!((counts.unshaped, counts.views_refused), (0, 0));
+    }
+
+    /// A texture over a plain shape in a format the plain image is not viewed in without
+    /// `PixelFormatView` (`RGBA8Unorm` over a `BGRA8Unorm` plain shape), a view rt refuses, is a
+    /// view of the storage shape of its extent, made beside the plain one, and nothing lies over
+    /// the buffer: rule 1 keeps the two current, a write through the plain shape reaching it at
+    /// the end of its encoder, as a Mac's next encoder reads a write made through another texture
+    /// over the same memory. Over the buffer, as before, it would have read the write only once
+    /// a copy out of the cache wrote the plain shape back
+    #[test]
+    fn a_texture_in_a_format_its_plain_shape_is_not_viewed_in_takes_the_storage_shape() {
+        let (mut r, made) = shaped_made();
+        let mark = r.p.call_log().mark();
+        let plain = texture_as_image(&mut r, 21, 80, (32, 8), 0x5);
+        let other = texture_as_image(&mut r, 27, 70, (32, 8), 0x1);
+        assert_ne!(other, plain);
+        assert_eq!(*made.lock(), [(80, 0x5), (70, 0)]);
+        let calls = r.p.call_log().since(mark);
+        assert!(surface_textures(&calls).is_empty(), "none over the buffer");
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let mark = r.p.call_log().mark();
+        write(&mut r, 0x101, 21, (32, 8));
+        let (out, into) = overlaps(&r.p.call_log().since(mark), &[plain, other]);
+        assert_eq!(out, [(plain, texels(32, 8))]);
+        assert_eq!(into, [(other, texels(32, 8))]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.format_storage, counts.order_case), (1, 1));
+        assert_eq!((counts.unshaped, counts.views_refused), (0, 0));
     }
 
     /// A texture that takes storage over a plane with only a plain shape of its extent makes a
@@ -905,7 +956,7 @@ mod tests {
         assert_eq!(texture_as_image(&mut r, 27, 70, (32, 8), 0x1), storage);
         let counts = r.dec.caches().counts().shapes;
         assert_eq!((counts.made, counts.found, counts.order_case), (2, 2, 1));
-        assert_eq!(counts.plain_views_refused, 0, "any view of storage");
+        assert_eq!(counts.format_storage, 0, "any view of storage");
     }
 
     /// In the default form the counts read what the per-shape form would hold, and nothing else

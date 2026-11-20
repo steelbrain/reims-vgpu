@@ -1952,8 +1952,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                      says, {} read as their slots say; {} textures over the buffer instead ({} \
                      images and {} views refused); {} caches kept past the budget; {} blocks \
                      refused uncached; {} made beside a shape of the other kind, {} copies \
-                     between the kinds ({} MiB); {} views of a plain shape in another format, {} \
-                     textures over a plain shape asking PixelFormatView; {} blocks with no view \
+                     between the kinds ({} MiB); {} textures over a plain shape in another format \
+                     given the storage shape, {} over a plain shape asking PixelFormatView; {} blocks with no view \
                      of their pages cached with them copied",
                     sh.made, sh.made_bytes >> 20, sh.found, sh.again, sh.fills,
                     sh.filled_bytes >> 20, sh.fills_made, sh.fills_deferred, sh.written_back,
@@ -1962,7 +1962,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     sh.unseen, sh.video_owed, sh.dropped, sh.dropped_bytes >> 20,
                     sh.usage_writes, sh.slot_reads, sh.unshaped,
                     sh.images_refused, sh.views_refused, sh.past_budget, sh.uncached_refused,
-                    sh.order_case, sh.order_copies, sh.order_bytes >> 20, sh.plain_views_refused,
+                    sh.order_case, sh.order_copies, sh.order_bytes >> 20, sh.format_storage,
                     sh.plain_format_views, sh.pages_copied
                 );
             }
