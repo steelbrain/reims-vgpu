@@ -5,7 +5,8 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::null_mut;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::core::runtime::{Runtime as _, StdRuntime};
 
@@ -415,6 +416,61 @@ fn targets_let_go_give_back_their_memory() {
     assert!(
         left < held / 10,
         "{left} bytes of the {held} that 16 pairs held are left once they are let go"
+    );
+}
+
+/// Pairs of targets let go of together share their flushes (the module doc's): four pairs of
+/// 3840 by 2160 luma samples let go of on four threads while the draws' lock is held, as a draw
+/// or another pair's flush holds it, wait for a flush begun after their release, and the first of
+/// them makes one, once the lock is let go, that destroys all four: no drop returns before it,
+/// and their memory goes as they do. Run holding the GPU, on the default adapter.
+#[test]
+#[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
+fn pairs_let_go_together_share_one_flush() {
+    const SIZE: (u32, u32) = (3840, 2160);
+    let draw = PlaneDraw::new(None).expect("the plane draws");
+    let before = memory_used(&draw);
+    let pairs: Vec<PlaneTargets> = (0..4)
+        .map(|_| draw.targets(SIZE, false).expect("the targets"))
+        .collect();
+    let held = memory_used(&draw).saturating_sub(before);
+    let lock = draw.state.lock();
+    let returned = Arc::new(AtomicUsize::new(0));
+    let threads: Vec<_> = (pairs.into_iter())
+        .map(|pair| {
+            let returned = Arc::clone(&returned);
+            std::thread::spawn(move || {
+                drop(pair);
+                returned.fetch_add(1, Ordering::SeqCst);
+            })
+        })
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while draw.flushes.owed.lock().asked < 4 {
+        assert!(Instant::now() < deadline, "the four pairs ask for a flush");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        returned.load(Ordering::SeqCst),
+        0,
+        "no pair's drop returns before a flush begun after it"
+    );
+    drop(lock);
+    for thread in threads {
+        thread.join().expect("a pair's drop");
+    }
+    let owed = draw.flushes.owed.lock();
+    assert_eq!(
+        (owed.asked, owed.covered, owed.made),
+        (4, 4, 1),
+        "one flush for the four pairs"
+    );
+    drop(owed);
+    let left = memory_used(&draw).saturating_sub(before);
+    assert!(
+        left < held / 10,
+        "{left} bytes of the {held} that 4 pairs held are left once they are let go"
     );
 }
 

@@ -36,6 +36,14 @@
 //! under the lock, once its objects are released ([`PlaneTargets`]' last field): its textures
 //! and their memory go as it does.
 //!
+//! Pairs let go of together, as a session's are at its end on several threads, share their
+//! flushes ([`Flushes`]): a pair let go of while another's flush runs waits for the next flush,
+//! which the first of the waiting pairs makes, once, for every pair released before it began,
+//! and each pair's drop returns once a flush begun after its release is done. So a burst takes
+//! the lock and flushes once for the pairs let go of meanwhile, not once a pair, and a flush
+//! destroys no more than the pairs whose drops wait for it, one a thread: a picture's draw
+//! waiting for the lock waits for no more than that.
+//!
 //! A target's bytes are undefined at its make. Its owner may say they are to read zeros wherever
 //! no draw writes them ([`PlaneTargets::owe_zeros`]): the next draw whose extent leaves part of
 //! them unwritten then clears both to zeros first, in the same hold of their keyed mutexes and
@@ -65,7 +73,7 @@ use std::ptr::{NonNull, null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
-use crate::core::sync::Mutex;
+use crate::core::sync::{Condvar, Mutex};
 
 use super::d3d12::{
     Com, CommandQueueDesc, CreateEventW, DEVICE_CREATE_COMMAND_QUEUE, DEVICE_CREATE_FENCE, Device,
@@ -313,6 +321,8 @@ fn formats(ten_bit: bool) -> Formats {
 pub struct PlaneDraw {
     /// Shared with each pair of targets made, whose release flushes its contexts (module doc).
     state: Arc<Mutex<State>>,
+    /// The flushes the pairs let go of share (module doc), shared with each pair made.
+    flushes: Arc<Flushes>,
     makers: Makers,
     fence: Com,
 }
@@ -376,12 +386,64 @@ pub struct PlaneTargets {
 
 /// The flushes of a [`PlaneDraw`]'s two immediate contexts, under its lock, as a pair of targets
 /// goes, once the pair's objects are released (module doc).
-struct Destroyed(Arc<Mutex<State>>);
+struct Destroyed {
+    state: Arc<Mutex<State>>,
+    flushes: Arc<Flushes>,
+}
 
 impl Drop for Destroyed {
+    /// The pair's objects are released by now (its last field). The pair asks for a flush and
+    /// returns once one begun after its ask is done: one that runs already began before it, so
+    /// it waits for the next, which it makes where no other pair waiting began it first.
     fn drop(&mut self) {
-        self.0.lock().flush_destroyed();
+        let mut owed = self.flushes.owed.lock();
+        owed.asked += 1;
+        let mine = owed.asked;
+        while owed.covered < mine {
+            if owed.flushing {
+                self.flushes.done.wait(&mut owed);
+                continue;
+            }
+            owed.flushing = true;
+            drop(owed);
+            let state = self.state.lock();
+            // Every pair that asked by now released its objects before it asked: this flush,
+            // begun after, destroys them.
+            let covers = self.flushes.owed.lock().asked;
+            state.flush_destroyed();
+            drop(state);
+            owed = self.flushes.owed.lock();
+            owed.covered = owed.covered.max(covers);
+            owed.flushing = false;
+            #[cfg(test)]
+            {
+                owed.made += 1;
+            }
+            self.flushes.done.notify_all();
+        }
     }
+}
+
+/// The flushes the pairs of a [`PlaneDraw`]'s let go of share (module doc).
+#[derive(Default)]
+struct Flushes {
+    owed: Mutex<Owed>,
+    /// Told as a flush is done.
+    done: Condvar,
+}
+
+/// The pairs let go of, and the flushes of them.
+#[derive(Default)]
+struct Owed {
+    /// The pairs that asked for a flush so far, each once its objects were released.
+    asked: u64,
+    /// The pairs the last flush done covered: every pair that had asked as it began.
+    covered: u64,
+    /// A pair's drop is making a flush.
+    flushing: bool,
+    /// The flushes made (tests only).
+    #[cfg(test)]
+    made: u64,
 }
 
 /// One of [`PlaneTargets`]: a texture of the native device, shared by NT handle with a keyed
@@ -511,6 +573,7 @@ impl PlaneDraw {
         state.make_pipelines()?;
         Ok(PlaneDraw {
             state: Arc::new(Mutex::new(state)),
+            flushes: Arc::default(),
             makers,
             fence: waits,
         })
@@ -523,7 +586,10 @@ impl PlaneDraw {
         let chroma = (width.div_ceil(2), height.div_ceil(2));
         let formats = formats(ten_bit);
         // Made first, so that a luma target made before the chroma's make fails is destroyed too.
-        let destroyed = Destroyed(Arc::clone(&self.state));
+        let destroyed = Destroyed {
+            state: Arc::clone(&self.state),
+            flushes: Arc::clone(&self.flushes),
+        };
         let planes = [
             self.makers.target(formats.targets[0], size)?,
             self.makers.target(formats.targets[1], chroma)?,
