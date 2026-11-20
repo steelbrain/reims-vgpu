@@ -607,12 +607,20 @@ runtime's own device. The switches above apply, and `resolution=` too.
   where the windows are), and the display goes on there. The old window's
   swapchain stays held by work that never ends, so no new one can be made
   over it; the old window is kept hidden, never destroyed. Keys and buttons
-  held lift and capture ends before it hides. A GPU the driver reports lost
-  keeps its window, its swapchain made again on the new device. On macOS the
-  window stays as it is after such a stop.
+  held lift and capture ends before it hides. On macOS the window stays as it
+  is after such a stop.
   `test: present::a_parked_presenter_asks_for_a_new_window`,
   `test: native::sdl_thread::render::a_parked_window_is_drawn_only_in_its_new_window`,
   `manual` (a boot whose GPU stops: NVIDIA's Xid 109)
+- A GPU the driver reports lost, which the library makes no new device for:
+  the window stays open and keeps the last frame it showed, and draws no
+  more. Its swapchain makes no Vulkan call on the lost device from then on,
+  and none is made again; a window opened after the loss stays empty. Only
+  the destroys at the window's end reach the device.
+  `test: present::a_lost_device_s_presenter_is_kept_and_asked_no_more`,
+  `test: reims-vgpu-vulkan::rt_platform::swapchain::a_lost_device_s_swapchain_makes_no_vulkan_call_but_its_end_s_destroys_on_vulkan`,
+  `test: reims-vgpu::graphics::rt_window::on_vulkan_a_lost_device_s_sink_asks_for_no_surface`,
+  `manual` (a boot whose rt device is lost: the Windows mini's UHD 630)
 
 Not on Linux: a menu bar, Dock icon or ⌘Tab entry (the compositor's task
 bar shows the window, as `reims-vgpu`), the camera-housing fit, and trackpad
