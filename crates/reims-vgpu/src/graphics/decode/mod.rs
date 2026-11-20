@@ -6054,7 +6054,6 @@ impl<P: Platform> PipelineJob<P> {
         let mut out = Vec::new();
         match &self.shape {
             PipelineShape::Render {
-                vertex_name,
                 vertex_constants,
                 fragment,
                 vertex_linked,
