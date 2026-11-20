@@ -270,7 +270,7 @@ mod fake {
     }
 
     /// The fake processes that import their pages blocks' views as blocks they know, each with
-    /// what imports them ([`fake_view_imports`]).
+    /// what imports them (`fake_view_imports`, in tests).
     static VIEW_IMPORTS: Mutex<Vec<(std::sync::Weak<FakePlatform>, ViewImports<FakePlatform>)>> =
         parking_lot::const_mutex(Vec::new());
 
@@ -289,7 +289,7 @@ mod fake {
 
     /// The testkit's platform: a process per test thread, its one device (registry ID
     /// [`FAKE_REGISTRY_ID`]), and pixels that read as zero. A process a test gave view imports
-    /// ([`fake_view_imports`]) answers them.
+    /// (`fake_view_imports`, in tests) answers them.
     impl ApiPlatform for FakePlatform {
         fn process() -> Arc<FakePlatform> {
             PLATFORM.with(Arc::clone)
