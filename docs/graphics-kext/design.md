@@ -212,7 +212,11 @@ Stages:
 6. **Addresses and IDs.** The guest bundle picks every `gpuAddress` and
    `gpuResourceID`, and the host pins them in metal2vulkan's own Metal
    address space. Creating a buffer then needs no round trip, and argument
-   buffers need no patching. Host device addresses never reach the guest.
+   buffers need no patching. A pin lies where the guest picked it while a
+   block the host knows holds its range; one no known block holds is made at
+   the driver's own device address, which the guest's GPU work then sees in
+   place of its pick, counted (`reims-vgpu-vulkan`'s `rt_platform::buffer`,
+   "A pinned address").
 7. **Contexts.** Every guest process that opens the device is a context, with
    its own resources, queues, and slices of the address and ID spaces.
    Sharing across contexts (IOSurfaces, shared events, shared textures) is
@@ -4540,7 +4544,8 @@ answer in time does. A close never answered, or refused, keeps it for good.
 guest picks, unique per device; the host keeps an `ObjId` → `Platform` handle
 table (handles are refcounted in core, `clone_ref`/`Drop`). The guest also
 picks buffer/texture/heap GPU addresses and resource IDs, and the host pins
-them — the host never hands a host device address to the guest (m2v's rule). A
+them where a block it knows holds the range; a pin no known block holds is made
+at the driver's device address, counted (section "Addresses and IDs", above). A
 destroy carries the `ObjId` alone; the host drops its handle.
 
 **Rings.** Ring 0 stays the control ring: the framebuffer kext's stage-2
