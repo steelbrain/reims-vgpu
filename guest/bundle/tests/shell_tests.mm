@@ -18360,6 +18360,122 @@ void test_iosurface_planes()
 	CFRelease(plain);
 }
 
+// A texture's plane lies where its view's own planes say, so the view, not the surface's plane
+// count, bounds it. A view the registry holds for the surface's id that lays out fewer planes than
+// the surface has now (here, its plane 1 dropped) once sent the video decoder's chroma texture
+// over a 4K '420v' output at offset 0, rows 0 bytes apart, and facts of two planes with plane 1 at
+// offset 0, 0 bytes a row: the host refused the create, and the picture's decode, which names it,
+// was dropped. Such a view gives way to a new one made of the surface as it is, whose texture
+// lies at plane 1's place in the new copy; the old view lives on for the texture that holds it.
+void test_iosurface_texture_over_a_view_not_of_its_surface()
+{
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	struct Source {
+		uint64_t offset = RGFX_ALLOCATIONS_OFFSET + 0x40000;
+		int acquired = 0;
+		static bool acquire(void *c, const void *, uint64_t, uint64_t, uint64_t *offset,
+		                    uint64_t *serial, bool *fresh)
+		{
+			Source *src = static_cast<Source *>(c);
+			src->acquired++;
+			*offset = src->offset;
+			*serial = 5;
+			*fresh = true;
+			return true;
+		}
+		static void release(void *, uint64_t) {}
+	} src;
+	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+	// The 64 x 48 '420v' surface as CoreVideo lays one out: 8-bit luma, then chroma pairs at half
+	// size, both 64 bytes a row; its copy holds plane 0's rows from 0 and plane 1's from 12288,
+	// 256 bytes apart.
+	const uint32_t k420v = 0x34323076;
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @64,
+		(id)kIOSurfaceHeight : @48,
+		(id)kIOSurfacePixelFormat : @(k420v),
+		(id)kIOSurfaceAllocSize : @(64 * 48 + 64 * 24),
+		(id)kIOSurfacePlaneInfo : @[
+			@{
+				(id)kIOSurfacePlaneWidth : @64,
+				(id)kIOSurfacePlaneHeight : @48,
+				(id)kIOSurfacePlaneBytesPerElement : @1,
+				(id)kIOSurfacePlaneBytesPerRow : @64,
+				(id)kIOSurfacePlaneOffset : @0,
+				(id)kIOSurfacePlaneSize : @(64 * 48),
+			},
+			@{
+				(id)kIOSurfacePlaneWidth : @32,
+				(id)kIOSurfacePlaneHeight : @24,
+				(id)kIOSurfacePlaneBytesPerElement : @2,
+				(id)kIOSurfacePlaneBytesPerRow : @64,
+				(id)kIOSurfacePlaneOffset : @(64 * 48),
+				(id)kIOSurfacePlaneSize : @(64 * 24),
+			},
+		],
+	};
+	IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(surface != nullptr && IOSurfaceGetPlaneCount(surface) == 2);
+	const uint64_t kPitch = 256, kChroma = 12288;
+	auto overPlane = [&](MTLPixelFormat format, NSUInteger w, NSUInteger h, NSUInteger plane) {
+		MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+		                                                                              width:w
+		                                                                             height:h
+		                                                                          mipmapped:NO];
+		return [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                        iosurface:surface
+		                                            plane:plane
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&fx.ser];
+	};
+	@autoreleasepool {
+		const uint64_t stale = rgfxIOSurfaceStaleViews();
+		RgfxIOSurfaceTexture *luma = overPlane(MTLPixelFormatR8Unorm, 64, 48, 0);
+		CHECK(luma != nil && src.acquired == 1);
+		auto first =
+		    expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		auto lumaMade = expectMessage<RgfxSurfaceTextureMessage>(fx.ring,
+		                                                         RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+		CHECK(lumaMade.texture.buffer_obj_id == first.obj_id && lumaMade.texture.offset == 0 &&
+		      lumaMade.texture.bytes_per_row == kPitch && lumaMade.facts.plane_count == 2 &&
+		      lumaMade.facts.chroma_offset == kChroma &&
+		      lumaMade.facts.chroma_bytes_per_row == kPitch);
+
+		// The live view now lays out plane 0 alone, as one made of the surface as it no
+		// longer is would.
+		rgfxIOSurfaceKeepViewPlanesForTests(surface, 1);
+		RgfxIOSurfaceTexture *chroma = overPlane(MTLPixelFormatRG8Unorm, 32, 24, 1);
+		CHECK(chroma != nil && rgfxIOSurfaceStaleViews() == stale + 1 && src.acquired == 2);
+		auto second =
+		    expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		auto chromaMade = expectMessage<RgfxSurfaceTextureMessage>(
+		    fx.ring, RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+		CHECK(second.obj_id != first.obj_id && chromaMade.texture.buffer_obj_id == second.obj_id &&
+		      chromaMade.texture.offset == kChroma && chromaMade.texture.bytes_per_row == kPitch &&
+		      chromaMade.texture.plane == 1);
+		CHECK(std::memcmp(&chromaMade.facts, &lumaMade.facts, sizeof(lumaMade.facts)) == 0);
+		CHECK(chroma.iosurfacePlane == 1 && luma.iosurfacePlane == 0);
+
+		// The new view describes the surface: a texture over plane 0 now takes it.
+		RgfxIOSurfaceTexture *again = overPlane(MTLPixelFormatR8Unorm, 64, 48, 0);
+		CHECK(again != nil && rgfxIOSurfaceStaleViews() == stale + 1 && src.acquired == 2);
+		auto againMade = expectMessage<RgfxSurfaceTextureMessage>(fx.ring,
+		                                                          RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+		CHECK(againMade.texture.buffer_obj_id == second.obj_id && againMade.texture.offset == 0);
+		CHECK(ringEmpty(fx.ring));
+		drainRing(fx.ring);
+	}
+	drainRing(fx.ring); // the textures' and the buffers' destroys
+	CFRelease(surface);
+}
+
 // Two threads make textures over one surface at once, as ImageIO's do over the tiles of one
 // decoded picture: the second finds the view the first is still making, waits until the first
 // has made its buffer, and names that buffer too. It names no buffer at all (0, which the host
@@ -22595,6 +22711,7 @@ int main(int argc, char **argv)
 		test_iosurface_shared_block();
 		test_iosurface_copy_waits_for_the_cpu_unlock();
 		test_iosurface_planes();
+		test_iosurface_texture_over_a_view_not_of_its_surface();
 		test_iosurface_texture_waits_for_a_view_being_made();
 		test_iosurface_cpu_access_in_the_texture_s_format();
 		test_iosurface_block_compressed_textures_are_made();

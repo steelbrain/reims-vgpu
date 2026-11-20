@@ -609,6 +609,12 @@ struct RgfxSurfaceShadow {
 	IOSurfaceRef surface = nullptr; // retained
 	uint32_t surfaceId = 0;
 	std::vector<ShadowPlane> planes; // by plane; a surface without planes has the one plane 0
+	// The surface as the view was made of it, for the line a view that no longer describes its
+	// surface logs (describes): its IOSurfaceGetPlaneCount, allocation and OSType, and when.
+	size_t madePlaneCount = 0;
+	uint64_t madeAlloc = 0;
+	uint32_t madeFormat = 0;
+	uint64_t madeNs = 0;
 	RgfxRegion::Block block = {};
 	RgfxRegion *region = nullptr; // where the block goes back at the copy's end
 	id<MTLBuffer> buffer = nil; // the Shared buffer over the view: the pages, or the block
@@ -1089,6 +1095,63 @@ RgfxSurfaceShadow::~RgfxSurfaceShadow()
 
 namespace {
 
+/// Whether `view` lays out the planes of `s` as they are now: as many planes, each of the shape
+/// the view was made of. A view the registry holds for the surface's id that does not is not given
+/// for the surface (shadowFor), and a texture over a plane past a view's planes is none
+/// (RgfxIOSurfaceTexture): the view's planes are where the texture's message says the plane lies,
+/// and a plane it does not hold would be sent at offset 0, rows 0 bytes apart.
+bool describes(const RgfxSurfaceShadow &view, IOSurfaceRef s)
+{
+	if (view.planes.size() != std::max<size_t>(IOSurfaceGetPlaneCount(s), 1))
+		return false;
+	for (size_t k = 0; k < view.planes.size(); k++) {
+		const PlaneShape &was = view.planes[k].shape;
+		PlaneShape now = {};
+		if (!planeShape(s, k, &now) || now.rowBytes != was.rowBytes || now.rows != was.rows ||
+		    now.bytesPerElement != was.bytesPerElement || now.elementWidth != was.elementWidth ||
+		    now.elementHeight != was.elementHeight)
+			return false;
+	}
+	return true;
+}
+
+/// An OSType as its four characters where each is printable, else in hex.
+std::string fourCharacters(uint32_t f)
+{
+	const char c[4] = {char(f >> 24), char(f >> 16), char(f >> 8), char(f)};
+	for (char k : c)
+		if (k < 0x20 || k >= 0x7f)
+			return format("0x%08x", f);
+	return format("'%c%c%c%c'", c[0], c[1], c[2], c[3]);
+}
+
+/// The views this process found not to describe their surface (describes).
+std::atomic<uint64_t> gStaleViews{0};
+
+/// Counts a view that does not describe `asked`, a surface of its id, found `where`, and logs the
+/// first few of the process: the surface as the view was made of it, the view's own surface now,
+/// and `asked`.
+void logStaleView(const RgfxSurfaceShadow &view, IOSurfaceRef asked, const char *where)
+{
+	const uint64_t n = gStaleViews.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n > 8)
+		return;
+	IOSurfaceRef own = view.surface;
+	rgfxLogLine(@"RGFX: a view does not describe its surface (%s; %llu in the process): made of "
+	            @"IOSurface %u, %zu planes, %llu bytes, %s, %llu ms ago, laid out as %zu planes; "
+	            @"its surface now %u, %zu planes, %llu bytes, %s; the surface asked is %s, %u, "
+	            @"%zu planes, %llu bytes, %s",
+	            where, (unsigned long long)n, view.surfaceId, view.madePlaneCount,
+	            (unsigned long long)view.madeAlloc, fourCharacters(view.madeFormat).c_str(),
+	            (unsigned long long)((nowNs() - view.madeNs) / 1000000), view.planes.size(),
+	            IOSurfaceGetID(own), IOSurfaceGetPlaneCount(own),
+	            (unsigned long long)IOSurfaceGetAllocSize(own),
+	            fourCharacters(IOSurfaceGetPixelFormat(own)).c_str(),
+	            asked == own ? "its object" : "another object", IOSurfaceGetID(asked),
+	            IOSurfaceGetPlaneCount(asked), (unsigned long long)IOSurfaceGetAllocSize(asked),
+	            fourCharacters(IOSurfaceGetPixelFormat(asked)).c_str());
+}
+
 /// The process's GPU view of every plane of `surface`, made (and, a copy, synced) on first use.
 std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *region,
                                              id<MTLDevice> device, RgfxSerializer *serializer)
@@ -1117,28 +1180,45 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 	const uint64_t ownLength = alignUp(IOSurfaceGetAllocSize(surface), kSurfacePage);
 	uint32_t surfaceId = IOSurfaceGetID(surface);
 	Registry &r = registry();
+	// A view the registry held for the id that does not describe the surface (describes); before
+	// `shadow`, so it is let go after the registry's lock.
+	std::shared_ptr<RgfxSurfaceShadow> stale;
 	std::shared_ptr<RgfxSurfaceShadow> shadow;
 	// The new view's `making`, held from its entry in the registry until this returns; after
 	// `shadow`, so it is let go before a view not made dies.
 	std::unique_lock<std::mutex> making;
 	{
 		std::unique_lock<std::mutex> g(r.lock);
-		auto it = r.shadows.find(surfaceId);
-		if (it != r.shadows.end()) {
-			shadow = it->second.lock();
-			// A live copy holds its surface, so its id still names that surface.
-			if (shadow != nullptr) {
-				// Its maker may be making its buffer still: once it lets go, the buffer is
-				// made, or never will be (the maker logged why), and no view is given.
-				g.unlock();
+		// A live copy holds its surface, so its id still names that surface. One that does not
+		// lay out the surface's planes as they are now is not given: a new view takes its place
+		// in the registry, and it lives on for the textures that hold it.
+		for (int found = 0; found < 2; found++) {
+			auto it = r.shadows.find(surfaceId);
+			shadow = it != r.shadows.end() ? it->second.lock() : nullptr;
+			if (shadow == nullptr || shadow == stale)
+				break;
+			// Its maker may be making its buffer still: once it lets go, the buffer is made,
+			// or never will be (the maker logged why), and no view is given.
+			g.unlock();
+			{
 				std::lock_guard<std::mutex> made(shadow->making);
-				return shadow->buffer != nil ? shadow : nullptr;
+				if (shadow->buffer == nil)
+					return nullptr;
 			}
+			if (describes(*shadow, surface))
+				return shadow;
+			logStaleView(*shadow, surface, "found for its id");
+			stale = std::move(shadow);
+			g.lock();
 		}
 		shadow = std::make_shared<RgfxSurfaceShadow>();
 		shadow->surface = (IOSurfaceRef)CFRetain(surface);
 		shadow->surfaceId = surfaceId;
 		shadow->region = region;
+		shadow->madePlaneCount = IOSurfaceGetPlaneCount(surface);
+		shadow->madeAlloc = IOSurfaceGetAllocSize(surface);
+		shadow->madeFormat = IOSurfaceGetPixelFormat(surface);
+		shadow->madeNs = nowNs();
 		// The GPU uses the surface's own pages where the host's textures lie over its planes and
 		// the kext gives the surface's block in place; else it copies them, as every holder of
 		// the surface then does (the kext gives a surface's blocks in one mode).
@@ -1598,6 +1678,8 @@ void rgfxIOSurfaceNoteSurfaceSeeds(bool on)
 
 @implementation RgfxIOSurfaceTexture {
 	std::shared_ptr<RgfxSurfaceShadow> _shadow;
+	// One of `_shadow`'s planes: the texture is made only where its view holds the plane, and a
+	// view's planes never change, so `_shadow->planes[_plane]` is always the view's own.
 	NSUInteger _plane;
 	// Bytes from the plane's first byte to the texture's (textureWithDescriptor:...origin:).
 	uint64_t _offset;
@@ -1641,6 +1723,22 @@ void rgfxIOSurfaceNoteSurfaceSeeds(bool on)
 	// shadowFor logs why it made no view.
 	std::shared_ptr<RgfxSurfaceShadow> shadow = shadowFor(surface, region, device, serializer);
 	if (shadow == nullptr) {
+		return nil;
+	}
+	// The plane lies where the view's own planes say, so the view, not the surface's count,
+	// bounds it (describes): a view made of the surface as it no longer is gives way to a new
+	// one, once; one that still does not lay out the surface's planes makes no texture.
+	if (!describes(*shadow, surface)) {
+		logStaleView(*shadow, surface, "at a texture's make");
+		shadow = shadowFor(surface, region, device, serializer);
+		if (shadow == nullptr) {
+			return nil;
+		}
+	}
+	if (plane >= shadow->planes.size() || !describes(*shadow, surface)) {
+		logNoTexture(surface, "view",
+		             format("plane %lu of a view of %zu planes that are not the surface's",
+		                    (unsigned long)plane, shadow->planes.size()));
 		return nil;
 	}
 	// The guest sees the shape it asked for; the host's texture lies over the Shared
@@ -2236,6 +2334,22 @@ void rgfxIOSurfaceNoteFinished(const std::vector<std::shared_ptr<void>> &writes,
 uint64_t rgfxIOSurfaceLocksUnderView(void)
 {
 	return gLocksUnderView.load(std::memory_order_relaxed);
+}
+
+uint64_t rgfxIOSurfaceStaleViews(void)
+{
+	return gStaleViews.load(std::memory_order_relaxed);
+}
+
+void rgfxIOSurfaceKeepViewPlanesForTests(IOSurfaceRef surface, size_t keep)
+{
+	Registry &r = registry();
+	std::lock_guard<std::mutex> g(r.lock);
+	auto it = r.shadows.find(IOSurfaceGetID(surface));
+	std::shared_ptr<RgfxSurfaceShadow> view = it != r.shadows.end() ? it->second.lock() : nullptr;
+	// A vector of its own, so that the planes past `keep` are not held at all.
+	if (view != nullptr && keep < view->planes.size())
+		view->planes = std::vector<ShadowPlane>(view->planes.begin(), view->planes.begin() + keep);
 }
 
 uint64_t rgfxIOSurfaceNilLog(IOSurfaceRef surface, const char *cause, std::string *line)

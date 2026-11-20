@@ -456,7 +456,7 @@ void rgfxIOSurfaceWriteBack(const std::vector<std::shared_ptr<void>> &writes);
 bool rgfxIOSurfaceWritesInPlace(const std::vector<std::shared_ptr<void>> &writes);
 
 /// How many textures over `surface` were answered nil for `cause` ("arguments", "plane",
-/// "plane shape", "region", "buffer", "origin", "resource id", "create", "texture"), and the
+/// "plane shape", "view", "region", "buffer", "origin", "resource id", "create", "texture"), and the
 /// "RGFX:" line logged for the first, without the prefix (for the tests): 0 and empty where none
 /// was.
 uint64_t rgfxIOSurfaceNilLog(IOSurfaceRef _Nullable surface, const char *_Nonnull cause,
@@ -467,5 +467,14 @@ uint64_t rgfxIOSurfaceNilLog(IOSurfaceRef _Nullable surface, const char *_Nonnul
 /// write-back at its completion takes the view's lock before the buffer's writes retire, and a
 /// CPU lock of the surface waits for them in the kext, so such a lock waited out the kext's wait.
 uint64_t rgfxIOSurfaceLocksUnderView(void);
+
+/// How many views of surfaces the process found not to lay out their surface's planes as they are
+/// now, as a texture over the surface was asked (RgfxIOSurface.mm, describes; for the tests). Each
+/// gave way to a new view; the first few are logged with the surface as the view was made of it.
+uint64_t rgfxIOSurfaceStaleViews(void);
+
+/// Leaves the live view of `surface` laying out its first `keep` planes alone, as a view made of
+/// the surface as it no longer is would (for the tests).
+void rgfxIOSurfaceKeepViewPlanesForTests(IOSurfaceRef _Nonnull surface, size_t keep);
 
 #endif // RGFX_IOSURFACE_H_
