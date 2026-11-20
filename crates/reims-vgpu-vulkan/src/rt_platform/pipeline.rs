@@ -558,8 +558,9 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
     /// rt's 32 bits makes nothing: the dispatch, or the length's set, refuses it
     /// (`super::compute`).
     fn prepare_dispatch(&self, dispatch: Dispatch, threads: MtlSize, lengths: &[(u64, u64)]) {
-        if let Some((dispatch, threads, lengths)) = rt_dispatch(dispatch, threads, lengths) {
-            self.rt.prepare_dispatch(dispatch, threads, &lengths);
+        if let Some(args) = RtDispatch::of(dispatch, threads, lengths) {
+            self.rt
+                .prepare_dispatch(args.dispatch, args.threads, &args.lengths);
         }
     }
 
@@ -573,30 +574,43 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
         threads: MtlSize,
         lengths: &[(u64, u64)],
     ) -> Option<rt::DispatchVariant> {
-        let (dispatch, threads, lengths) = rt_dispatch(dispatch, threads, lengths)?;
-        self.rt.dispatch_variant(dispatch, threads, &lengths)
+        let args = RtDispatch::of(dispatch, threads, lengths)?;
+        self.rt
+            .dispatch_variant(args.dispatch, args.threads, &args.lengths)
     }
 }
 
-/// A dispatch's arguments as rt's make ahead and key take them: its grid, its `threads` per
-/// threadgroup and its threadgroup memory `lengths`; `None` where a value is past rt's 32 bits.
-fn rt_dispatch(
-    dispatch: Dispatch,
-    threads: MtlSize,
-    lengths: &[(u64, u64)],
-) -> Option<(rt::Dispatch, [u32; 3], Vec<(u32, u32)>)> {
-    let small = |n: u64| u32::try_from(n).ok();
-    let size = |s: MtlSize| Some([small(s.width)?, small(s.height)?, small(s.depth)?]);
-    let threads = size(threads)?;
-    let dispatch = match dispatch {
-        Dispatch::Threads(grid) => rt::Dispatch::Threads(size(grid)?),
-        Dispatch::Threadgroups(groups) => rt::Dispatch::Threadgroups(size(groups)?),
-        Dispatch::ThreadgroupsIndirect => rt::Dispatch::Indirect,
-    };
-    let lengths = (lengths.iter())
-        .map(|&(index, length)| Some((small(index)?, small(length)?)))
-        .collect::<Option<Vec<_>>>()?;
-    Some((dispatch, threads, lengths))
+/// A dispatch's arguments as rt's make ahead and key take them.
+struct RtDispatch {
+    /// Its grid.
+    dispatch: rt::Dispatch,
+    /// Its threads per threadgroup.
+    threads: [u32; 3],
+    /// Its threadgroup memory lengths, by index.
+    lengths: Vec<(u32, u32)>,
+}
+
+impl RtDispatch {
+    /// The dispatch's, of its `threads` per threadgroup and its threadgroup memory `lengths`;
+    /// `None` where a value is past rt's 32 bits.
+    fn of(dispatch: Dispatch, threads: MtlSize, lengths: &[(u64, u64)]) -> Option<Self> {
+        let small = |n: u64| u32::try_from(n).ok();
+        let size = |s: MtlSize| Some([small(s.width)?, small(s.height)?, small(s.depth)?]);
+        let threads = size(threads)?;
+        let dispatch = match dispatch {
+            Dispatch::Threads(grid) => rt::Dispatch::Threads(size(grid)?),
+            Dispatch::Threadgroups(groups) => rt::Dispatch::Threadgroups(size(groups)?),
+            Dispatch::ThreadgroupsIndirect => rt::Dispatch::Indirect,
+        };
+        let lengths = (lengths.iter())
+            .map(|&(index, length)| Some((small(index)?, small(length)?)))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            dispatch,
+            threads,
+            lengths,
+        })
+    }
 }
 
 #[cfg(test)]

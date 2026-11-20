@@ -1060,7 +1060,7 @@ impl World {
         if let Some(key_of) = &variants.given {
             return key_of(&prepared).map(FakeVariant);
         }
-        let next = variants.asked.len() as u64;
+        let next = u64::try_from(variants.asked.len()).unwrap_or(u64::MAX);
         Some(FakeVariant(*variants.asked.entry(prepared).or_insert(next)))
     }
 
