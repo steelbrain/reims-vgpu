@@ -421,7 +421,10 @@ fn a_source_whose_copy_out_has_no_blit_encoder_fails_its_frame() {
     (e.luma, e.chroma) = (luma, chroma);
     assert_eq!(s.encode(&e).unwrap(), 1);
     assert!(event_of(&s).wait_until_signaled_value(1, 10_000));
-    assert!(p.call_log().calls_to(COPY).is_empty(), "no copy out of the cache");
+    assert!(
+        p.call_log().calls_to(COPY).is_empty(),
+        "no copy out of the cache"
+    );
     assert_eq!(result_in(&bytes(&failed)).status, RGFX_VIDEO_ENCODE_FAILED);
     assert!(
         !(log.lock().iter()).any(|seen| matches!(seen, Seen::Finished(..))),
@@ -434,7 +437,11 @@ fn a_source_whose_copy_out_has_no_blit_encoder_fails_its_frame() {
     (e.luma, e.chroma) = (luma, chroma);
     assert_eq!(s.encode(&e).unwrap(), 2);
     assert!(event_of(&s).wait_until_signaled_value(2, 10_000));
-    assert_eq!(p.call_log().calls_to(COPY).len(), 32, "the next frame's copy, one a row");
+    assert_eq!(
+        p.call_log().calls_to(COPY).len(),
+        32,
+        "the next frame's copy, one a row"
+    );
     assert_eq!(result_in(&bytes(&next)).status, RGFX_VIDEO_ENCODE_OK);
     drop(s);
 }

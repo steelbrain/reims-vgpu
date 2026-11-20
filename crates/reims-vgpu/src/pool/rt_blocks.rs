@@ -144,9 +144,10 @@ impl Drop for RtBlocks {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use reims_vgpu_vulkan::core::platform::Handle as _;
+    use reims_vgpu_vulkan::core::platform::os::clock::Clock as _;
 
     use super::*;
     use crate::platform::ApiPlatform as _;
@@ -261,22 +262,30 @@ mod tests {
             (held.as_ref()).is_err_and(|why| why.contains("by 1 handles beyond the platform's")),
             "{held:?}"
         );
-        let again = platform.metal_device(None).expect("the device the let-go kept");
+        let again = platform
+            .metal_device(None)
+            .expect("the device the let-go kept");
         assert_eq!(again.id(), id, "the next ask's device");
         drop(again);
         assert_eq!(source.release_block(block.id), Ok(()));
         let kept = source.take_block(MemoryClass::Private, MIB).unwrap();
         assert_eq!(kept.class, MemoryClass::Private);
 
-        let start = Instant::now();
-        let holder = std::thread::spawn(move || {
-            std::thread::sleep(HELD);
-            drop(source);
+        let clock = reims_vgpu_vulkan::os::OsClock::new();
+        std::thread::scope(|scope| {
+            let start = clock.now_mono();
+            let holder = scope.spawn(move || {
+                std::thread::sleep(HELD);
+                drop(source);
+            });
+            assert_eq!(platform.let_go_of_device(Duration::from_secs(10)), Ok(()));
+            let took = clock.now_mono().saturating_duration_since(start);
+            assert!(
+                took >= HELD,
+                "the let-go took {took:?}, the source held {HELD:?}"
+            );
+            assert_eq!(counters.gauges(), metal2vulkan_runtime::Gauges::default());
+            holder.join().expect("the source's drop");
         });
-        assert_eq!(platform.let_go_of_device(Duration::from_secs(10)), Ok(()));
-        let took = start.elapsed();
-        assert!(took >= HELD, "the let-go took {took:?}, the source held {HELD:?}");
-        assert_eq!(counters.gauges(), metal2vulkan_runtime::Gauges::default());
-        holder.join().expect("the source's drop");
     }
 }

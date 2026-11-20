@@ -440,7 +440,10 @@ fn a_copy_into_caches_the_platform_makes_no_blit_encoder_for_is_skipped() {
     let skipped = (s.decode(&decode(&bitstream, &[], planes(&cache, &cache, 128)))).unwrap();
     assert_eq!(skipped.value, 1);
     assert!(event_of(&s).wait_until_signaled_value(1, 10_000));
-    assert!(p.call_log().calls_to(COPY).is_empty(), "no copy into the caches");
+    assert!(
+        p.call_log().calls_to(COPY).is_empty(),
+        "no copy into the caches"
+    );
     assert!(
         skipped.landed.as_deref().is_some_and(|l| !l.failed()),
         "its command buffer completes as any landed picture's"
@@ -450,7 +453,11 @@ fn a_copy_into_caches_the_platform_makes_no_blit_encoder_for_is_skipped() {
     let next = (s.decode(&decode(&bitstream, &[], planes(&cache, &cache, 128)))).unwrap();
     assert_eq!(next.value, 2);
     assert!(event_of(&s).wait_until_signaled_value(2, 10_000));
-    assert_eq!(p.call_log().calls_to(COPY).len(), 2, "the next picture's copy");
+    assert_eq!(
+        p.call_log().calls_to(COPY).len(),
+        2,
+        "the next picture's copy"
+    );
     assert!(next.landed.as_deref().is_some_and(|l| !l.failed()));
     assert_eq!(s.counts.lock().failed, 0);
     drop(s);

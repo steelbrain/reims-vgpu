@@ -884,6 +884,12 @@ mod tests {
     fn on_vulkan_the_let_go_waits_for_a_teardown_on_another_thread_within_its_bound() {
         const HELD: Duration = Duration::from_secs(1);
         let platform = RtPlatform::new();
+        let clock = OsClock::new();
+        let live = || {
+            (platform.unended.lock().iter())
+                .filter(|unended| !unended.ended())
+                .count()
+        };
         for (bound, ends) in [
             (Duration::from_millis(200), false),
             (Duration::from_secs(10), true),
@@ -892,33 +898,33 @@ mod tests {
             let counters = device.rt().counters();
             let plain = device.rt().clone();
             drop(device);
-            let start = std::time::Instant::now();
-            let holder = std::thread::spawn(move || {
-                std::thread::sleep(HELD);
-                drop(plain);
+            std::thread::scope(|scope| {
+                let start = clock.now_mono();
+                let holder = scope.spawn(move || {
+                    std::thread::sleep(HELD);
+                    drop(plain);
+                });
+                let let_go = platform.let_go_of_device(bound);
+                let took = clock.now_mono().saturating_duration_since(start);
+                if ends {
+                    assert_eq!(let_go, Ok(()), "the {bound:?} let-go");
+                    assert!(
+                        took >= HELD,
+                        "the let-go took {took:?}, the handle held {HELD:?}"
+                    );
+                    assert_eq!(counters.gauges(), rt::Gauges::default());
+                    assert_eq!(live(), 0);
+                } else {
+                    assert!(
+                        let_go
+                            .as_ref()
+                            .is_err_and(|held| held.contains("its teardown not ended")),
+                        "the {bound:?} let-go: {let_go:?}"
+                    );
+                    assert_eq!(live(), 1, "the device the let-go did not see torn down");
+                }
+                holder.join().expect("the holder's drop");
             });
-            let let_go = platform.let_go_of_device(bound);
-            let took = start.elapsed();
-            let live = || {
-                (platform.unended.lock().iter())
-                    .filter(|unended| !unended.ended())
-                    .count()
-            };
-            if ends {
-                assert_eq!(let_go, Ok(()), "the {bound:?} let-go");
-                assert!(took >= HELD, "the let-go took {took:?}, the handle held {HELD:?}");
-                assert_eq!(counters.gauges(), rt::Gauges::default());
-                assert_eq!(live(), 0);
-            } else {
-                assert!(
-                    let_go
-                        .as_ref()
-                        .is_err_and(|held| held.contains("its teardown not ended")),
-                    "the {bound:?} let-go: {let_go:?}"
-                );
-                assert_eq!(live(), 1, "the device the let-go did not see torn down");
-            }
-            holder.join().expect("the holder's drop");
             assert_eq!(counters.gauges(), rt::Gauges::default());
             assert_eq!(live(), 0, "the device torn down on the holder's thread");
         }
@@ -948,8 +954,10 @@ mod tests {
             let let_go = platform.let_go_of_device(Duration::from_secs(5));
             say(&format!("let-go answered {let_go:?}"));
             let asked = std::thread::scope(|scope| {
-                (scope.spawn(|| platform.system_default_device().is_some()).join())
-                    .expect("the ask's thread")
+                (scope
+                    .spawn(|| platform.system_default_device().is_some())
+                    .join())
+                .expect("the ask's thread")
             });
             say(&format!("the ask after it made a device {asked}"));
             say(&format!(
