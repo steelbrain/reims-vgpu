@@ -35,7 +35,7 @@ use crate::core::sync::Mutex;
 
 /// The domain of the `NSError` a refused creator with an `error:` out-parameter answers
 /// ([`refused_error`]).
-pub const RT_DOMAIN: &str = "metal2vulkan-rt";
+pub const RT_DOMAIN: &str = "metal2vulkan-runtime";
 
 /// A piece of the rt platform not built yet, which the calls that reach it refuse ([`refuse`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -221,7 +221,7 @@ pub fn refused_error(piece: Unbuilt, sel: &'static str) -> NsErrorText {
         domain: RT_DOMAIN.to_owned(),
         code: 0,
         description: format!(
-            "{} is not built on metal2vulkan-rt ({})",
+            "{} is not built on metal2vulkan-runtime ({})",
             piece.what(),
             piece.code()
         ),
@@ -539,7 +539,7 @@ fn rt_error(kind: RtRefusal, why: &dyn std::fmt::Display) -> NsErrorText {
     NsErrorText {
         domain: RT_DOMAIN.to_owned(),
         code: 0,
-        description: format!("metal2vulkan-rt refused it: {why} ({})", kind.code()),
+        description: format!("metal2vulkan-runtime refused it: {why} ({})", kind.code()),
     }
 }
 
@@ -740,10 +740,13 @@ mod tests {
         let (error, relayed) =
             relaying_gaps(|| refused_error(Unbuilt::DynamicLibrary, "newDynamicLibrary:error:"));
         assert!(relayed);
-        assert_eq!((error.domain.as_str(), error.code), (RT_DOMAIN, 0));
+        assert_eq!(
+            (error.domain.as_str(), error.code),
+            ("metal2vulkan-runtime", 0)
+        );
         assert_eq!(
             error.description,
-            "a dynamic library is not built on metal2vulkan-rt (rt-unbuilt-dynamic-library)"
+            "a dynamic library is not built on metal2vulkan-runtime (rt-unbuilt-dynamic-library)"
         );
         let (error, relayed) = relaying_gaps(|| rt_refused_error("test", &rt::Error::Quiesced));
         assert!(relayed);
@@ -757,7 +760,7 @@ mod tests {
         assert!(relayed);
         assert_eq!(
             error.description,
-            "metal2vulkan-rt refused it: full (rt-refused-limit)"
+            "metal2vulkan-runtime refused it: full (rt-refused-limit)"
         );
         let code = RtRefusal::NoDevice.code();
         let before = counted(code);

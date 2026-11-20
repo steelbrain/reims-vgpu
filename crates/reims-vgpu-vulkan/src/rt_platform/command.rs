@@ -816,7 +816,7 @@ fn ns_error(error: rt::CommandBufferError, loss: &DeviceLoss) -> NsErrorText {
     NsErrorText {
         domain: ERROR_DOMAIN.to_owned(),
         code,
-        description: format!("metal2vulkan-rt's command buffer failed: {error:?}"),
+        description: format!("metal2vulkan-runtime's command buffer failed: {error:?}"),
     }
 }
 
