@@ -8,6 +8,9 @@
 //! - its first-use waits, their count and time in all, then those for a kernel's variant and for
 //!   a content's lines among them, and the longest since the device was made (rt keeps no longest
 //!   of a period); its waits for a lowering are left out;
+//! - its `vkQueueSubmit2` calls, their count and time inside the driver in all, those longer than
+//!   100 ms, and the longest since the device was made; then the submit thread's waits for rt's
+//!   queue lock before them, their time in all and the longest since the device was made;
 //! - the bytes rt copied for calls: in all, then by cause: staging (`replace_region` and
 //!   `get_bytes`), attachments' images into their shadows, and the over-copies between a texture
 //!   over a buffer and its image of its own, by the cause rt gives each, those of none left out.
@@ -72,7 +75,9 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics) -> String {
     let staging = copied.saturating_sub(attachments).saturating_sub(over);
     format!(
         "rt: pipelines made {}; first-use waits {} in {:.1} ms (variants {} in {:.1} ms, lines {} \
-         in {:.1} ms), the longest since the device was made {:.1} ms; bytes copied {copied}: \
+         in {:.1} ms), the longest since the device was made {:.1} ms; submits {} in {:.1} ms \
+         ({} over 100 ms), the longest since the device was made {:.1} ms; queue-lock waits \
+         {:.1} ms, the longest since the device was made {:.1} ms; bytes copied {copied}: \
          staging {staging}, attachment reads {attachments}, over-copies {over}{}",
         rose!(pipelines_created),
         rose!(first_use_waits),
@@ -82,6 +87,12 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics) -> String {
         rose!(first_use_line_waits),
         ms(rose!(first_use_line_wait_nanos)),
         ms(now.first_use_wait_max_nanos),
+        rose!(submissions),
+        ms(rose!(submit_call_nanos)),
+        rose!(submit_calls_over_100_ms),
+        ms(now.submit_call_max_nanos),
+        ms(rose!(queue_lock_wait_nanos)),
+        ms(now.queue_lock_wait_max_nanos),
         if by_cause.is_empty() {
             String::new()
         } else {
@@ -94,9 +105,9 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics) -> String {
 mod tests {
     use super::*;
 
-    /// A part says what rose since the metrics before, each over-copy cause with bytes by name
-    /// and none without, staging as the copies neither of attachments nor over-copies; a count
-    /// that fell, a new device's, reads as it is.
+    /// A part says what rose since the metrics before, the maxima since the device was made as
+    /// they are, each over-copy cause with bytes by name and none without, staging as the copies
+    /// neither of attachments nor over-copies; a count that fell, a new device's, reads as it is.
     #[test]
     fn an_rt_part_says_what_rose_with_each_copy_cause_by_name() {
         let mut before = rt::Metrics::default();
@@ -113,6 +124,18 @@ mod tests {
         now.first_use_line_waits = 1;
         now.first_use_line_wait_nanos = 1_500_000;
         now.first_use_wait_max_nanos = 4_200_000;
+        before.submissions = 100;
+        before.submit_call_nanos = 50_000_000;
+        before.queue_lock_wait_nanos = 1_000_000;
+        // The maxima are since the device was made: written as they are, not as a rise.
+        before.submit_call_max_nanos = 120_000_000;
+        before.queue_lock_wait_max_nanos = 500_000;
+        now.submissions = 160;
+        now.submit_call_nanos = 50_000_000 + 312_500_000;
+        now.submit_calls_over_100_ms = 2;
+        now.submit_call_max_nanos = 140_000_000;
+        now.queue_lock_wait_nanos = 1_000_000 + 2_300_000;
+        now.queue_lock_wait_max_nanos = 900_000;
         now.bytes_copied = 1_000 + 4_096 + 512 + 64;
         now.attachment_read_copy_bytes = 512;
         now.over_copy_bytes = 4_096;
@@ -121,8 +144,10 @@ mod tests {
         assert_eq!(
             line(&before, &now),
             "rt: pipelines made 3; first-use waits 3 in 7.5 ms (variants 2 in 6.0 ms, lines 1 in \
-             1.5 ms), the longest since the device was made 4.2 ms; bytes copied 4672: staging \
-             64, attachment reads 512, over-copies 4096 (dma-buf 4000, pitch 96)"
+             1.5 ms), the longest since the device was made 4.2 ms; submits 60 in 312.5 ms (2 \
+             over 100 ms), the longest since the device was made 140.0 ms; queue-lock waits 2.3 \
+             ms, the longest since the device was made 0.9 ms; bytes copied 4672: staging 64, \
+             attachment reads 512, over-copies 4096 (dma-buf 4000, pitch 96)"
         );
         let mut fresh = rt::Metrics::default();
         fresh.pipelines_created = 2;
