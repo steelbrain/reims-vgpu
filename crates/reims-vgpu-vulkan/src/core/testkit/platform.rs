@@ -19,7 +19,7 @@ use super::clock::VirtualClock;
 use super::faults::Faults;
 use super::impls::descriptor::TextureDescriptorModel;
 use super::impls::device::DeviceModel;
-use super::objects::{Fk, Model, TexDesc, World, kind};
+use super::objects::{FakeVariant, Fk, Model, TexDesc, World, kind};
 use super::script::Script;
 use super::threads::FakeThreads;
 use super::vm::FakeVm;
@@ -191,6 +191,7 @@ impl Platform for FakePlatform {
     type RateMapDescriptor = Fk<kind::RateMapDescriptor>;
     type RateMapLayerDescriptor = Fk<kind::RateMapLayerDescriptor>;
     type Clock = VirtualClock;
+    type DispatchVariant = FakeVariant;
 
     fn new_render_pass_descriptor(&self) -> Self::RenderPassDescriptor {
         self.fresh()

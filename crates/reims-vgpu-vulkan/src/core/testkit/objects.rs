@@ -918,6 +918,28 @@ pub struct World {
     prepared: Mutex<Vec<Prepared>>,
     /// The holds the next makes ahead wait in, one each, in order ([`World::hold_prepare`]).
     prepare_holds: Mutex<std::collections::VecDeque<HeldCall>>,
+    /// The keys the compute states answer of their dispatches ([`World::dispatch_variant`]).
+    variants: Mutex<Variants>,
+}
+
+/// The fake's key of the pipeline a compute dispatch runs
+/// ([`ComputePipeline::dispatch_variant`](crate::core::platform::resource::ComputePipeline::dispatch_variant)):
+/// by default one of each state and dispatch, as a [`Prepared`] holds them, numbered from 0 in
+/// the order first asked; where the test gave its keys ([`World::key_dispatches`]), the number
+/// it gave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FakeVariant(pub u64);
+
+/// A test's keys of the compute states' dispatches ([`World::key_dispatches`]).
+type KeyOf = Box<dyn Fn(&Prepared) -> Option<u64> + Send>;
+
+/// What the compute states answer of their dispatches' keys ([`World::dispatch_variant`]).
+#[derive(Default)]
+struct Variants {
+    /// Each state and dispatch asked of, with its default key's number.
+    asked: std::collections::HashMap<Prepared, u64>,
+    /// The test's keys, where it gave them.
+    given: Option<KeyOf>,
 }
 
 /// One call of a compute state's
@@ -1000,6 +1022,7 @@ impl World {
             pins_dropped: AtomicU64::new(0),
             prepared: Mutex::new(Vec::new()),
             prepare_holds: Mutex::new(std::collections::VecDeque::new()),
+            variants: Mutex::new(Variants::default()),
         })
     }
 
@@ -1021,6 +1044,24 @@ impl World {
         if let Some(held) = held {
             held.hold();
         }
+    }
+
+    /// Has the compute states answer, from now on, the key `key_of` gives of each dispatch, as
+    /// a [`Prepared`] holds it, and none where it gives `None`, as a state that would make
+    /// nothing for the dispatch answers ([`FakeVariant`]). Until then each state and dispatch
+    /// has a key of its own.
+    pub fn key_dispatches(&self, key_of: impl Fn(&Prepared) -> Option<u64> + Send + 'static) {
+        self.variants.lock().given = Some(Box::new(key_of));
+    }
+
+    /// The key a compute state answers of its dispatch `prepared` ([`World::key_dispatches`]).
+    pub(crate) fn dispatch_variant(&self, prepared: Prepared) -> Option<FakeVariant> {
+        let mut variants = self.variants.lock();
+        if let Some(key_of) = &variants.given {
+            return key_of(&prepared).map(FakeVariant);
+        }
+        let next = variants.asked.len() as u64;
+        Some(FakeVariant(*variants.asked.entry(prepared).or_insert(next)))
     }
 
     /// Has the devices keep no pin of a buffer or heap they make from now on, where `on`: each

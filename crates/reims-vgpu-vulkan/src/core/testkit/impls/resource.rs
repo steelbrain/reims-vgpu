@@ -6,7 +6,7 @@
 
 use super::super::calllog::Arg;
 use super::super::objects::{
-    Fk, Model, Prepared, PreparedGrid, ResourceCommon, TexDesc, TextureModel, kind,
+    FakeVariant, Fk, Model, Prepared, PreparedGrid, ResourceCommon, TexDesc, TextureModel, kind,
 };
 use super::super::platform::FakePlatform;
 use super::{Backing, fatal, new_buffer, new_texture};
@@ -709,24 +709,44 @@ impl ComputePipeline<FakePlatform> for Fk<kind::ComputePipeline> {
     /// Noted beside the call log
     /// ([`World::prepared`](super::super::objects::World::prepared)), and held where the test
     /// asked; it makes nothing.
-    fn prepare_dispatch(
+    fn prepare_dispatch(&self, dispatch: Dispatch, threads: MtlSize, lengths: &[(u64, u64)]) {
+        self.world()
+            .note_prepared(prepared(self, dispatch, threads, lengths));
+    }
+
+    /// The world's key of the dispatch
+    /// ([`World::key_dispatches`](super::super::objects::World::key_dispatches)): by default one
+    /// of the state and the dispatch's own. Not logged, as its make ahead is not.
+    fn dispatch_variant(
         &self,
         dispatch: Dispatch,
-        threads_per_threadgroup: MtlSize,
-        threadgroup_memory_lengths: &[(u64, u64)],
-    ) {
-        let size = |s: MtlSize| (s.width, s.height, s.depth);
-        let dispatch = match dispatch {
-            Dispatch::Threads(s) => PreparedGrid::Threads(s.width, s.height, s.depth),
-            Dispatch::Threadgroups(s) => PreparedGrid::Threadgroups(s.width, s.height, s.depth),
-            Dispatch::ThreadgroupsIndirect => PreparedGrid::ThreadgroupsIndirect,
-        };
-        self.world().note_prepared(Prepared {
-            state: self.id(),
-            dispatch,
-            threads: size(threads_per_threadgroup),
-            lengths: threadgroup_memory_lengths.to_vec(),
-        });
+        threads: MtlSize,
+        lengths: &[(u64, u64)],
+    ) -> Option<FakeVariant> {
+        self.world()
+            .dispatch_variant(prepared(self, dispatch, threads, lengths))
+    }
+}
+
+/// A dispatch of `state`, of `threads` threads a threadgroup with the threadgroup memory
+/// `lengths`, as the world notes its make ahead.
+fn prepared(
+    state: &Fk<kind::ComputePipeline>,
+    dispatch: Dispatch,
+    threads: MtlSize,
+    lengths: &[(u64, u64)],
+) -> Prepared {
+    let size = |s: MtlSize| (s.width, s.height, s.depth);
+    let dispatch = match dispatch {
+        Dispatch::Threads(s) => PreparedGrid::Threads(s.width, s.height, s.depth),
+        Dispatch::Threadgroups(s) => PreparedGrid::Threadgroups(s.width, s.height, s.depth),
+        Dispatch::ThreadgroupsIndirect => PreparedGrid::ThreadgroupsIndirect,
+    };
+    Prepared {
+        state: state.id(),
+        dispatch,
+        threads: size(threads),
+        lengths: lengths.to_vec(),
     }
 }
 

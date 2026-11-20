@@ -439,6 +439,7 @@ impl Platform for RtPlatform {
     type RateMapDescriptor = RtObj<RateMapFields>;
     type RateMapLayerDescriptor = Unmade<kinds::RateMapLayerDescriptor>;
     type Clock = OsClock;
+    type DispatchVariant = rt::DispatchVariant;
 
     fn new_render_pass_descriptor(&self) -> RtObj<PassFields> {
         let recorded_call = crate::recorder::rec_call!("MTLRenderPassDescriptor.new", self);

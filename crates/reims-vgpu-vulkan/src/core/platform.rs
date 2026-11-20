@@ -131,6 +131,12 @@ pub trait Platform: Sized + Send + Sync + 'static {
     // Non-Metal handles.
     /// Time and timed waits (not object safe: its waits are generic).
     type Clock: Clock;
+    /// No Metal counterpart: the key of what a compute dispatch runs, as its compute state
+    /// answers it ([`resource::ComputePipeline::dispatch_variant`]). Two keys a device's states
+    /// answer are equal exactly where their dispatches run one pipeline the device made, whichever
+    /// of its states they are of; a key once answered names no other pipeline later, even once
+    /// its own is gone, so one memo of keys serves every state of a device.
+    type DispatchVariant: Copy + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static;
 
     // Class methods, one per class core instantiates.
     /// sel: new — (`[MTLRenderPassDescriptor new]`, +1).

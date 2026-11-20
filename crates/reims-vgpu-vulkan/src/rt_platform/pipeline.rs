@@ -42,7 +42,9 @@
 //!   `prepare_dispatch` is rt's make of it ahead, at the size the dispatch gives, on the caller's
 //!   thread, for the device's pre-pass of a committed command buffer (reims-vgpu's
 //!   `graphics::decode::prepass`). It lowers nothing. A dispatch that needs what such a call is
-//!   making waits for that call alone, and gets every result and error of its own.
+//!   making waits for that call alone, and gets every result and error of its own. The pre-pass
+//!   makes each pipeline once by rt's key of it (`dispatch_variant`), of the compiled content:
+//!   the states of one content share its `VkPipeline`s, and answer one key for one dispatch.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -555,29 +557,46 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
     /// first use, at its threadgroup size, threadgroup memory lengths and grid tiles. A value past
     /// rt's 32 bits makes nothing: the dispatch, or the length's set, refuses it
     /// (`super::compute`).
-    fn prepare_dispatch(
-        &self,
-        dispatch: Dispatch,
-        threads_per_threadgroup: MtlSize,
-        threadgroup_memory_lengths: &[(u64, u64)],
-    ) {
-        let small = |n: u64| u32::try_from(n).ok();
-        let size = |s: MtlSize| Some([small(s.width)?, small(s.height)?, small(s.depth)?]);
-        let Some(threads) = size(threads_per_threadgroup) else {
-            return;
-        };
-        let dispatch = match dispatch {
-            Dispatch::Threads(grid) => size(grid).map(rt::Dispatch::Threads),
-            Dispatch::Threadgroups(groups) => size(groups).map(rt::Dispatch::Threadgroups),
-            Dispatch::ThreadgroupsIndirect => Some(rt::Dispatch::Indirect),
-        };
-        let lengths = (threadgroup_memory_lengths.iter())
-            .map(|&(index, length)| Some((small(index)?, small(length)?)))
-            .collect::<Option<Vec<_>>>();
-        if let (Some(dispatch), Some(lengths)) = (dispatch, lengths) {
+    fn prepare_dispatch(&self, dispatch: Dispatch, threads: MtlSize, lengths: &[(u64, u64)]) {
+        if let Some((dispatch, threads, lengths)) = rt_dispatch(dispatch, threads, lengths) {
             self.rt.prepare_dispatch(dispatch, threads, &lengths);
         }
     }
+
+    /// rt's key (`dispatch_variant`) of the `VkPipeline` the dispatch runs: of the compiled
+    /// content, so the states of one content answer one key for one dispatch. `None` where rt
+    /// would make nothing for it, and for a value past rt's 32 bits, as
+    /// [`prepare_dispatch`](Self::prepare_dispatch) makes nothing there.
+    fn dispatch_variant(
+        &self,
+        dispatch: Dispatch,
+        threads: MtlSize,
+        lengths: &[(u64, u64)],
+    ) -> Option<rt::DispatchVariant> {
+        let (dispatch, threads, lengths) = rt_dispatch(dispatch, threads, lengths)?;
+        self.rt.dispatch_variant(dispatch, threads, &lengths)
+    }
+}
+
+/// A dispatch's arguments as rt's make ahead and key take them: its grid, its `threads` per
+/// threadgroup and its threadgroup memory `lengths`; `None` where a value is past rt's 32 bits.
+fn rt_dispatch(
+    dispatch: Dispatch,
+    threads: MtlSize,
+    lengths: &[(u64, u64)],
+) -> Option<(rt::Dispatch, [u32; 3], Vec<(u32, u32)>)> {
+    let small = |n: u64| u32::try_from(n).ok();
+    let size = |s: MtlSize| Some([small(s.width)?, small(s.height)?, small(s.depth)?]);
+    let threads = size(threads)?;
+    let dispatch = match dispatch {
+        Dispatch::Threads(grid) => rt::Dispatch::Threads(size(grid)?),
+        Dispatch::Threadgroups(groups) => rt::Dispatch::Threadgroups(size(groups)?),
+        Dispatch::ThreadgroupsIndirect => rt::Dispatch::Indirect,
+    };
+    let lengths = (lengths.iter())
+        .map(|&(index, length)| Some((small(index)?, small(length)?)))
+        .collect::<Option<Vec<_>>>()?;
+    Some((dispatch, threads, lengths))
 }
 
 #[cfg(test)]
@@ -816,5 +835,56 @@ mod tests {
         let made = optional.new_function_with_options(on, "optional_constant", &[], 0x100, None);
         assert!(made.expect("never a raise").is_none());
         assert_eq!(counted(metal), before + 2);
+    }
+
+    /// rt's key of the `VkPipeline` a dispatch runs (`dispatch_variant`): one for the states of
+    /// one kernel, and for grids that differ only in how many whole threadgroups they hold;
+    /// another for another threadgroup size of a kernel that observes its threadgroups, or for
+    /// another kernel; none where rt would make nothing (a threadgroup size past the state's
+    /// most, a grid of no threadgroups) and for a value past rt's 32 bits
+    #[test]
+    fn dispatch_variants_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let function = |metallib: &[u8], name: &str| {
+            let library = device.new_library(metallib).expect("never a raise");
+            let library = library.expect("a metallib").expect("a library");
+            let made = library.new_function(on, name).expect("never a raise");
+            made.expect("a function of the table")
+        };
+        let state = |f: &RtObj<RtFunction>| {
+            let made = device.new_compute_pipeline_state_for_function(Some(f));
+            made.expect("a compute state").expect("a compute state")
+        };
+        // The key of `state`'s dispatch of `groups` threadgroups of `threads` threads, with
+        // the threadgroup memory `lengths`.
+        let key = |state: &RtObj<RtComputePipeline>, groups, threads, lengths: &[(u64, u64)]| {
+            let grid = Dispatch::Threadgroups(MtlSize::new(groups, 1, 1));
+            state.dispatch_variant(grid, MtlSize::new(threads, 1, 1), lengths)
+        };
+
+        let tgstatic = function(TGSTATIC, "tg_static");
+        let (first, second) = (state(&tgstatic), state(&tgstatic));
+        let made = key(&first, 2, 32, &[]);
+        assert!(
+            made.is_some(),
+            "no key of a dispatch rt makes a pipeline for"
+        );
+        assert_eq!(key(&second, 2, 32, &[]), made);
+        assert_eq!(key(&first, 4, 32, &[]), made);
+        let wider = key(&first, 2, 64, &[]);
+        assert!(wider.is_some(), "no key of a wider threadgroup");
+        assert_ne!(wider, made);
+        let read = state(&function(NUMBERED, "numbered_read"));
+        let other = key(&read, 2, 32, &[]);
+        assert!(other.is_some(), "no key of another kernel's dispatch");
+        assert_ne!(other, made);
+
+        let most = first.max_total_threads_per_threadgroup();
+        assert_eq!(key(&first, 2, most * 2, &[]), None);
+        assert_eq!(key(&first, 0, 32, &[]), None);
+        assert_eq!(key(&first, 1 << 32, 32, &[]), None);
+        assert_eq!(key(&first, 2, 32, &[(1 << 32, 16)]), None);
     }
 }

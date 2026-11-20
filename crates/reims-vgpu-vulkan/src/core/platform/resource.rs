@@ -560,13 +560,31 @@ pub trait ComputePipeline<P: Platform>: Handle {
     ///
     /// It changes nothing the guest or the dispatch observes, and reports nothing: every result
     /// and error is the dispatch's own. A dispatch that needs what another thread is making here
-    /// waits for that thread. The default makes nothing.
+    /// waits for that thread. What it makes is the pipeline
+    /// [`dispatch_variant`](Self::dispatch_variant) names. The default makes nothing.
     fn prepare_dispatch(
         &self,
         _dispatch: super::compute::Dispatch,
         _threads_per_threadgroup: MtlSize,
         _threadgroup_memory_lengths: &[(u64, u64)],
     ) {
+    }
+    /// No Metal counterpart: the key of the pipeline a dispatch of the state runs
+    /// ([`Platform::DispatchVariant`]), for the arguments [`prepare_dispatch`](Self::prepare_dispatch)
+    /// takes: dispatches of equal keys, of this state or another of the device's, run one
+    /// pipeline, so a caller that makes ahead once for each key it has not met makes each
+    /// pipeline once. `None` where [`prepare_dispatch`](Self::prepare_dispatch) makes nothing
+    /// (the dispatch would refuse its arguments or record nothing), whatever was made before.
+    ///
+    /// It makes nothing, says nothing of whether the pipeline is made, and changes nothing the
+    /// guest or the dispatch observes. The default is `None`, as its make ahead makes nothing.
+    fn dispatch_variant(
+        &self,
+        _dispatch: super::compute::Dispatch,
+        _threads_per_threadgroup: MtlSize,
+        _threadgroup_memory_lengths: &[(u64, u64)],
+    ) -> Option<P::DispatchVariant> {
+        None
     }
 }
 
