@@ -965,6 +965,26 @@ makes are a first boot's cost. The scene's other load gaps, 0.8 to 6.1 s,
 hold no pipeline makes in either boot. Over the benchmark the guest presented
 22.0 frames a second on the first boot and 23.4 on the second.
 
+NVIDIA's driver keeps a disk cache of its own beside the runtime's,
+`nvidia/GLCache` in the user's cache directory (by its README,
+`XDG_CACHE_HOME`, else `.cache` under `HOME`). It keeps it only for a Vulkan
+instance made while that directory exists, and does not make the directory
+itself: an instance made before it exists keeps none, even once Mesa's
+drivers or the runtime make the directory later in the same process.
+**Measured** on 2026-11-20 on an RTX 2080 and an RTX 3090 (NVIDIA
+620.70.06), with a program of our own that makes an instance, a device and 64
+compute pipelines (jobs m3-max-59980, 59982, 59988 and 59989). With no
+`.cache` in `HOME` the driver wrote nothing. With an empty `.cache` it wrote
+492 KiB while the pipelines were made, and a later instance in the process,
+made once `.cache` existed, wrote them too. How the process ended (the device
+destroyed, `exit`, `_exit`, `SIGTERM` or `SIGKILL`) changed nothing. A user's
+`HOME` has `.cache`, which `scripts/install-ctl.sh` makes for
+`~/.cache/reims-ctl`. So a boot that stands for a user's first one starts QEMU
+with a `HOME` that is empty but for an empty `.cache`. The two boots in the
+table above started with a `HOME` that was wholly empty: the first left no
+NVIDIA cache (four such boots on the 2080 left none), and the second started
+without one and wrote 14 MiB.
+
 ### Linux hosts: the guest's disk
 
 `reims-ctl` gives a VM its system disk as an image file in the VM's
