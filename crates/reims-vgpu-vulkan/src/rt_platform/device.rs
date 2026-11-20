@@ -1487,28 +1487,43 @@ mod tests {
         };
         let counted = over_copies();
         let mut made: Vec<rt::Counters> = Vec::new();
-        // Each commit waited for before the next, so each is a submission of its own: the first
-        // device's count differs from the second's at each read.
+        // Each command buffer fills a buffer, as rt submits nothing for one with no work, and
+        // each commit is waited for before the next, so each is a submission of its own: the
+        // first device's count differs from the second's at each read.
         for (turn, commits) in [(1, 8), (2, 1)] {
             let device = (platform.system_default_device()).expect("an rt device on the GPU");
             let counters = device.rt().counters();
             let own = || Some(counters.metrics().submissions);
             let others = || (made.iter()).map(|c| Some(c.metrics().submissions));
             assert_eq!(read(), own(), "device {turn} made: its count");
+            let before = counters.metrics().submissions;
             let queue = device.new_command_queue().expect("a command queue");
+            let filled = device.new_buffer_of_length(OnFault::Return, 4096, 0);
+            let filled = filled.expect("never a raise").expect("a Shared buffer");
             for _ in 0..commits {
                 let buffer = (queue.command_buffer(OnFault::Return))
                     .expect("never a raise")
                     .expect("a command buffer");
+                let mut blit = buffer.rt().blit_command_encoder().expect("a blit encoder");
+                blit.fill_buffer(filled.rt(), 0..4096, 0x5a)
+                    .expect("a fill");
+                blit.end_encoding();
                 assert_eq!(buffer.commit(OnFault::Return), Ok(()));
                 assert_eq!(buffer.wait_until_completed(OnFault::Return), Ok(()));
             }
             assert_eq!(read(), own(), "device {turn}'s work: its count");
+            let rose = counters.metrics().submissions - before;
+            assert!(
+                rose >= commits,
+                "device {turn}: {rose} submissions for {commits} commits"
+            );
             assert!(
                 others().all(|other| other != own()),
-                "device {turn}: the devices' counts tell them apart"
+                "device {turn}: the devices' counts tell them apart: {:?} against {:?}",
+                own(),
+                others().collect::<Vec<_>>()
             );
-            drop((queue, device));
+            drop((filled, queue, device));
             assert_eq!(
                 platform.let_go_of_device(std::time::Duration::from_secs(5)),
                 Ok(())
