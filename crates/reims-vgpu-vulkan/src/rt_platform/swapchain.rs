@@ -47,9 +47,9 @@
 //! swapchain waits for the presenting queue to idle inside `with_present_queue`. Where the device
 //! has one queue, that queue is the runtime's, so the wait holds the lock of rt's submissions and
 //! waits for rt's submitted work too, which rt's contract of `with_present_queue` asks its callers
-//! not to do. The wait ends all the same: rt submits a wait for an event only once its signal is
-//! submitted (rt's `encode_wait_for_event`), so submitted work waits on nothing a later submission
-//! signals.
+//! not to do. The wait ends all the same: rt holds a command buffer that waits for an event's
+//! value until a signal of it is submitted, and submits no semaphore wait for it (rt's
+//! `encode_wait_for_event`), so submitted work waits on nothing a later submission signals.
 //!
 //! **No device recovery.** rt makes its device once and recovers none: a lost device fails the
 //! take or the present, and the window's draws end ([`Acquired::Failed`]).
