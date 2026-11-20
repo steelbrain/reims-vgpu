@@ -142,7 +142,7 @@ public:
 	uint64_t allocPrivateAddress(uint64_t size, uint64_t align, uint64_t blockAlign = 0);
 
 	/// The bytes of addresses the space asks a Private block for: 16 MiB,
-	/// metal2vulkan-rt's unit (`MemoryClass::block_len`), which rt's block maker
+	/// metal2vulkan-runtime's unit (`MemoryClass::block_len`), which rt's block maker
 	/// makes ahead of need, so the host answers a take of it with no allocation of
 	/// the driver's in the take. A longer take is one pick's own block, which rt
 	/// allocates in the take. Picks wrap round the blocks held, so a freed span is

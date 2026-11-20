@@ -870,7 +870,7 @@ public:
 	/// byte (createHeap): 256 KiB, the largest image alignment measured on the hosts' GPUs (a
 	/// multisample target on an RX 7900 XTX; 64 KiB on a Radeon 780M and an Iris Xe, 1 KiB on
 	/// an RTX 3090). The host binds a heap's texture at the heap's offset in the block's memory
-	/// plus the texture's offset, which Metal's rule aligns, and metal2vulkan-rt refuses one
+	/// plus the texture's offset, which Metal's rule aligns, and metal2vulkan-runtime refuses one
 	/// whose place there is off the image's alignment; the block's memory starts at a multiple
 	/// of 2 MiB there.
 	static constexpr uint64_t kHeapAddressAlign = 0x40000;

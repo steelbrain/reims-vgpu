@@ -160,7 +160,7 @@ pub const RGFX_FEATURE_QUEUE_VECTORS: u32 = 1 << 8;
 /// places at the view's address plus the buffer's `offset`, where it would lie had the answer
 /// carried the address, and asks a buffer's address with [`RGFX_CMD_PAGES_BUFFER_ADDRESS`] where
 /// it needs it. A host offers it where a view's address is that of an import of the block's pages
-/// (metal2vulkan-rt's device), and else not, so a guest there sees `IMPORT_ADDRESSES` alone.
+/// (metal2vulkan-runtime's device), and else not, so a guest there sees `IMPORT_ADDRESSES` alone.
 pub const RGFX_FEATURE_IMPORT_ADDRESSES_LATER: u32 = 1 << 9;
 /// `FEATURES_LO` bit 11, `SURFACE_ORDER`, which the guest takes through
 /// [`RGFX_REG_DRIVER_FEATURES_LO`]: the host decodes
@@ -570,7 +570,7 @@ pub const RGFX_FEATURE_SURFACE_REFILL: u64 = 0x400_0000_0000_0000;
 /// answer ([`RgfxPoolBlock`]) carries the GPU address of the block's first byte, and the guest
 /// places the heaps it makes over the block ([`RGFX_CMD_HEAP_OVER_POOL`]) at that address plus
 /// their spans' offsets, rather than at addresses it picks in its context's range
-/// ([`RGFX_CONTEXT_VA_BASE`]). On metal2vulkan-rt's device the address is the block's Vulkan
+/// ([`RGFX_CONTEXT_VA_BASE`]). On metal2vulkan-runtime's device the address is the block's Vulkan
 /// device address; on the Vulkan platform before it, an address the host picks in
 /// `[2^45, 2^46)`, below every context's range, and pins the heaps there. Every host with a pool
 /// offers it; the x86-64 and arm64e kexts take it.
@@ -582,11 +582,11 @@ pub const RGFX_FEATURE_POOL_ADDRESSES: u64 = 0x800_0000_0000_0000;
 /// ([`RGFX_CMD_BUFFER_CREATE`], [`RGFX_CMD_HEAP_CREATE`]) and its Managed buffers' GPU copies
 /// ([`RGFX_CMD_MANAGED_BUFFER_CREATE`], [`RGFX_CMD_BUFFER_MANAGED_AT_OFFSET`]) at addresses inside
 /// blocks its context holds, rather than at addresses it picks in its context's range
-/// ([`RGFX_CONTEXT_VA_BASE`]). On metal2vulkan-rt's device a block is device memory no one maps,
-/// and its address the memory's Vulkan device address; on the Vulkan platform before it, a range
-/// of addresses the host picks in `[2^44, 2^45)`, below the Shared pool's, with no memory of its
-/// own: the platform pins each object made there, as it pins the guest's picks. Every host offers
-/// it; the x86-64 and arm64e kexts take it.
+/// ([`RGFX_CONTEXT_VA_BASE`]). On metal2vulkan-runtime's device a block is device memory no one
+/// maps, and its address the memory's Vulkan device address; on the Vulkan platform before it, a
+/// range of addresses the host picks in `[2^44, 2^45)`, below the Shared pool's, with no memory of
+/// its own: the platform pins each object made there, as it pins the guest's picks. Every host
+/// offers it; the x86-64 and arm64e kexts take it.
 pub const RGFX_FEATURE_PRIVATE_BLOCKS: u64 = 0x1000_0000_0000_0000;
 /// `FEATURES_HI` bit 29, feature bit 61, `IMPORT_ADDRESSES`: the host gives each pages block of a
 /// process's own memory ([`RGFX_SURFACE_PAGES_PRIVATE`]) its GPU address. Where the guest took it
@@ -597,17 +597,16 @@ pub const RGFX_FEATURE_PRIVATE_BLOCKS: u64 = 0x1000_0000_0000_0000;
 /// ([`RGFX_CONTEXT_VA_BASE`]); buffers over the same bytes, which share a block, share their
 /// address. Where the guest took [`RGFX_FEATURE_IMPORT_ADDRESSES_LATER`] too, the answer comes
 /// before the view has its address and carries 0, and the host places the buffers at it, the
-/// guest asking each one's ([`RGFX_CMD_PAGES_BUFFER_ADDRESS`]). On metal2vulkan-rt's device the
-/// address is the Vulkan device address of the import of
-/// the block's pages; on the Vulkan platform before it, an address the host picks in
-/// `[2^43, 2^44)`, holding Metal's span of the view's length, where the platform pins the first
-/// buffer made over the block, which then reaches the block's pages for the buffers made over the
-/// same bytes after it until the block's release. A block of pages its process maps read-only
-/// ([`RGFX_SURFACE_PAGES_READ_ONLY`]) is given none there: its buffers lie over copies of the
-/// pages. On metal2vulkan-rt's device such a block is given the address of a copy of its pages,
-/// whose GPU writes are dropped as each command buffer completes, as Metal drops a GPU write to
-/// memory mapped read-only, so the pages keep the bytes their process wrote. Every host offers
-/// it; the x86-64 and arm64e kexts take it.
+/// guest asking each one's ([`RGFX_CMD_PAGES_BUFFER_ADDRESS`]). On metal2vulkan-runtime's device
+/// the address is the Vulkan device address of the import of the block's pages; on the Vulkan
+/// platform before it, an address the host picks in `[2^43, 2^44)`, holding Metal's span of the
+/// view's length, where the platform pins the first buffer made over the block, which then reaches
+/// the block's pages for the buffers made over the same bytes after it until the block's release. A
+/// block of pages its process maps read-only ([`RGFX_SURFACE_PAGES_READ_ONLY`]) is given none
+/// there: its buffers lie over copies of the pages. On metal2vulkan-runtime's device such a block
+/// is given the address of a copy of its pages, whose GPU writes are dropped as each command buffer
+/// completes, as Metal drops a GPU write to memory mapped read-only, so the pages keep the bytes
+/// their process wrote. Every host offers it; the x86-64 and arm64e kexts take it.
 pub const RGFX_FEATURE_IMPORT_ADDRESSES: u64 = 0x2000_0000_0000_0000;
 /// `FEATURES_HI` bit 30, feature bit 62, `SURFACE_CACHE_EVERY`, which the guest takes through
 /// [`RGFX_REG_DRIVER_FEATURES_HI`], beside [`RGFX_FEATURE_SURFACE_PAGES`]: the host's GPU form of
@@ -619,8 +618,8 @@ pub const RGFX_FEATURE_IMPORT_ADDRESSES: u64 = 0x2000_0000_0000_0000;
 /// its tables of the surfaces' blocks, of a block's holders and of the cached surfaces grow
 /// rather than refuse; and it and its bundle count each copy block made, by why the surface's
 /// view is not in place, logging each reason the first time. The host acts on nothing more. A
-/// host offers it where its platform caches every surface (metal2vulkan-rt's per-shape form) and
-/// it offers [`RGFX_FEATURE_POOL`]; the x86-64 and arm64e kexts take it.
+/// host offers it where its platform caches every surface (metal2vulkan-runtime's per-shape form)
+/// and it offers [`RGFX_FEATURE_POOL`]; the x86-64 and arm64e kexts take it.
 pub const RGFX_FEATURE_SURFACE_CACHE_EVERY: u64 = 0x4000_0000_0000_0000;
 /// `FEATURES_HI` bit 31, feature bit 63, `MANAGED_AT_COPY`, which the guest takes through
 /// [`RGFX_REG_DRIVER_FEATURES_HI`]: on a GPU that shares the CPU's memory, a `Managed` buffer is
@@ -632,10 +631,10 @@ pub const RGFX_FEATURE_SURFACE_CACHE_EVERY: u64 = 0x4000_0000_0000_0000;
 /// where its platform makes it at another address (a CPU copy in no block it knows), the host keeps
 /// the buffer there, as it makes it for a guest that did not take the bit, and counts it, and the
 /// create is not refused. A host offers it where its GPU shares the CPU's memory, its platform
-/// keeps a pin only inside a block it knows (metal2vulkan-rt's), whose Shared blocks the CPU copies
-/// lie in, and it offers [`RGFX_FEATURE_POOL`], whose blocks the slabs' copies lie in: on the
-/// Vulkan platform before it the guest's own pick is pinned, and a pin inside the CPU copy's range
-/// would be refused. The x86-64 and arm64e kexts take it.
+/// keeps a pin only inside a block it knows (metal2vulkan-runtime's), whose Shared blocks the CPU
+/// copies lie in, and it offers [`RGFX_FEATURE_POOL`], whose blocks the slabs' copies lie in: on
+/// the Vulkan platform before it the guest's own pick is pinned, and a pin inside the CPU copy's
+/// range would be refused. The x86-64 and arm64e kexts take it.
 pub const RGFX_FEATURE_MANAGED_AT_COPY: u64 = 0x8000_0000_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -745,7 +744,7 @@ pub const RGFX_CONTEXT_OBJ_ID_SHIFT: u32 = 40;
 /// Where the guest's GPU addresses start. The kext hands each context (each process) a range of its
 /// own from `[RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_END)`, the top half of the Metal address space,
 /// `[2^46, 2^47)`. The host takes each range as given: it knows no context's range, only that the
-/// guest's lie here. On metal2vulkan-rt's device a buffer the host places itself lies at the
+/// guest's lie here. On metal2vulkan-runtime's device a buffer the host places itself lies at the
 /// driver's Vulkan device address, which the host does not pick, and so do the blocks of the Shared
 /// pool ([`RGFX_FEATURE_POOL_ADDRESSES`]) and the contexts' Private blocks
 /// ([`RGFX_FEATURE_PRIVATE_BLOCKS`]), each rt's device memory at its own address. The platform
