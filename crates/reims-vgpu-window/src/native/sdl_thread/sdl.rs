@@ -187,10 +187,14 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
         window.title(),
         display.0
     );
+    #[cfg(target_os = "linux")]
+    let seamless = crate::env::seamless_input();
+    #[cfg(target_os = "windows")]
+    let seamless = false;
     Some(Opened {
         sdl,
         asked: size,
-        input: Input(input::Input::new()),
+        input: Input(input::Input::new(seamless)),
         state: State { display },
     })
 }
@@ -368,7 +372,7 @@ mod tests {
     /// capture ends
     #[test]
     fn a_close_the_person_asks_for_lifts_every_key_and_ends_capture() {
-        let mut input = Input(input::Input::new());
+        let mut input = Input(input::Input::new(false));
         input.focus_gained(0);
         let at = At {
             point: Some((10.0, 10.0)),

@@ -3,6 +3,8 @@
 //!
 //! - `REIMS_VGPU_WINDOW_BORDERLESS`: `1`, `true`, `yes` or `on`, in any case, makes each
 //!   window a borderless one that fills its screen. Default: titled windows.
+//! - `REIMS_VGPU_WINDOW_SEAMLESS_INPUT`: on Linux, those same values let the pointer cross the
+//!   window freely and send the click that gives it focus to the guest. Default: click to capture.
 //! - `REIMS_VGPU_WINDOW_SCREENS`: a comma-separated list of host screen indices (spaces
 //!   allowed): display i opens on the screen the list's i-th entry names. One bad entry unsets
 //!   the whole list. Default: display i on screen i (`screens::pick_screen`).
@@ -19,6 +21,18 @@ pub const BORDERLESS_VAR: &str = "REIMS_VGPU_WINDOW_BORDERLESS";
 pub const SCREENS_VAR: &str = "REIMS_VGPU_WINDOW_SCREENS";
 /// The window implementation's variable (macOS).
 pub const IMPL_VAR: &str = "REIMS_VGPU_WINDOW_IMPL";
+
+/// Whether Linux windows send input without capturing it.
+#[cfg(target_os = "linux")]
+pub(crate) fn seamless_input() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("REIMS_VGPU_WINDOW_SEAMLESS_INPUT")
+            .ok()
+            .as_deref()
+            .is_some_and(parse_switch)
+    })
+}
 
 /// What the variables say.
 #[derive(Clone, Debug, Default, PartialEq)]
