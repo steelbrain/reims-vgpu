@@ -13,13 +13,15 @@
 //! gap, a failed Vulkan call) answers the same way, counted under the error's kind,
 //! `rt-refused-<kind>` ([`RtRefusal::code`]), its first line naming the call and rt's error. The
 //! first of each of rt's kinds by its name in the boot diagnostics (`Draw-AttachmentRead`,
-//! `TextureCopy`, `RenderPass`, `Limit-TextureSamples`), whichever count it goes to, writes a line
-//! of its own too: rt's error as it displays and as it debugs, which carries the gap's fields, and
-//! what the call asked of rt where its site names it, as structure alone: a texture's descriptor,
-//! a copy's kind, textures, places and buffer layout, a pass's attachments, a draw's primitive
-//! type and its pipeline state's rasterization fields ([`refusal_detail`]). No name of the
-//! guest's (a function's, a label) is in it. A texture rt makes none of for its pixel format
-//! (`Gap::TextureFormat`) is counted under its format's own code instead,
+//! `TextureCopy`, `RenderPass`, `Limit-TextureSamples`, `Translation-Lowering`), whichever count
+//! it goes to, writes a line of its own too: rt's error as it displays and as it debugs, which
+//! carries the gap's fields (the translator's refusal as the feature it refused, what it needs and
+//! its attachment alone), and what the call asked of rt where its site names it, as structure
+//! alone: a texture's descriptor, a copy's kind, textures, places and buffer layout, a pass's
+//! attachments, a draw's primitive type and its pipeline state's rasterization fields
+//! ([`refusal_detail`]). No name of the guest's (a function's, a symbol's, a label) is in it. A
+//! texture rt makes none of for its pixel format (`Gap::TextureFormat`) is counted under its
+//! format's own code instead,
 //! `rt-refused-texture-format-<n>` ([`rt_refused_texture`]), so a boot's counts line gives each
 //! format number with its count. A pipeline state's imageblock length rt refuses
 //! (`Gap::ImageblockLength`) is counted apart from rt's other gaps too,
@@ -352,12 +354,13 @@ fn diagnosed(sel: &'static str, error: &rt::Error) {
 
 /// Writes on stderr the process's first line of each kind of rt's refusals by its name in the
 /// boot diagnostics (`super::diag::refusal_name`: `Draw-AttachmentRead`, `TextureCopy`,
-/// `RenderPass`, `Limit-TextureSamples`), which the line of the first of its [`RtRefusal`] kind
-/// ([`refused_as`]) leaves out past that kind's first: [`detail_line`] of the call `sel`, rt's
-/// `error` and `what`, what the call asked of rt that rt's error does not name, as structure
-/// alone (a texture's descriptor; a copy's kind, textures, places and buffer layout; a pass's
-/// attachments; a draw's primitive type and its pipeline state's rasterization fields). A caller
-/// that names `what` calls it before it counts the refusal, whose own call here ([`rt_refused`],
+/// `RenderPass`, `Limit-TextureSamples`, `Translation-Lowering`), which the line of the first of
+/// its [`RtRefusal`] kind ([`refused_as`]) leaves out past that kind's first: [`detail_line`] of
+/// the call `sel`, rt's `error` and `what`, what the call asked of rt that rt's error does not
+/// name, as structure alone (a texture's descriptor; a copy's kind, textures, places and buffer
+/// layout; a pass's attachments; a draw's primitive type and its pipeline state's rasterization
+/// fields). A caller that names `what` calls it before it counts the refusal, whose own call here
+/// ([`rt_refused`],
 /// [`diagnosed`]) then writes nothing. Every count of the diagnostics' calls here, so each name
 /// the counts give has its line. Counts nothing.
 pub fn refusal_detail(sel: &'static str, error: &rt::Error, what: Option<&dyn std::fmt::Display>) {
@@ -377,24 +380,45 @@ fn first_named(name: String) -> bool {
 }
 
 /// The line [`refusal_detail`] writes of rt's `error` of the call `sel`, of the kind `name`, and
-/// what the call asked of rt, `what`, where it names it: rt's error as it displays and as it
-/// debugs (its variant's fields), the name, and the code of [`counted_code`].
+/// what the call asked of rt, `what`, where it names it: rt's error as [`said`] gives it, the
+/// name, and the code of [`counted_code`].
 fn detail_line(
     sel: &str,
     error: &rt::Error,
     name: &str,
     what: Option<&dyn std::fmt::Display>,
 ) -> String {
-    let code = counted_code(error);
+    let (code, said) = (counted_code(error), said(error));
     match what {
         Some(what) => format!(
-            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({error}; {error:?}); the first of \
-             {name} ({code}): {what}\n"
+            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({said}); the first of {name} \
+             ({code}): {what}\n"
         ),
         None => format!(
-            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({error}; {error:?}); the first of \
-             {name} ({code})\n"
+            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({said}); the first of {name} \
+             ({code})\n"
         ),
+    }
+}
+
+/// rt's `error` in [`detail_line`]: as it displays and as it debugs (its variant's fields), but
+/// the translator's refusal, whose display and fields can name the guest's functions and symbols,
+/// as structure alone: the feature it refused and what it needs (their variants' fields) and the
+/// attachment it is tied to, else its error's variant
+/// ([`refusal_name`](super::diag::refusal_name)).
+fn said(error: &rt::Error) -> String {
+    use metal2vulkan::error::Error as Translator;
+    match error {
+        rt::Error::Translation(Translator::Unsupported(u)) => {
+            let at = (u.location.as_ref()).and_then(|l| l.attachment());
+            let at = at.map_or(String::new(), |a| format!(", at the {a}"));
+            format!(
+                "the translator refused the feature {:?}, needing {:?}{at}",
+                u.feature, u.needs
+            )
+        }
+        rt::Error::Translation(_) => "the translator refused it".to_owned(),
+        _ => format!("{error}; {error:?}"),
     }
 }
 
@@ -850,6 +874,38 @@ mod tests {
         let kind = "test-first-named";
         assert!(first_named(kind.to_owned()));
         assert!(!first_named(kind.to_owned()));
+    }
+
+    /// The first of each feature the translator refuses has its line, naming the feature and what
+    /// it needs, as structure alone, and the attachment it is tied to; no name of the guest's (a
+    /// function's, a symbol's) is in it. An error of the translator's that refuses no feature is
+    /// named by its variant.
+    #[test]
+    fn a_translator_refusal_s_line_names_its_feature_and_no_name() {
+        use metal2vulkan::error::{Attachment, DiagName, Error as Translator, Feature, Location};
+        use metal2vulkan::error::{LowerFamily, Unsupported};
+        let at = Location::function(DiagName::new("a_guest_function"), Some(3), Some(9));
+        let refused = Unsupported::not_implemented(Feature::Lowering(LowerFamily::Texture))
+            .at(at.with_attachment(Attachment::Color(1)))
+            .naming(DiagName::new("air.a_guest_symbol"));
+        let error = rt::Error::Translation(Translator::Unsupported(refused));
+        let name = crate::rt_platform::diag::refusal_name(&error).expect("a translator's name");
+        assert_eq!(name, "Translation-Lowering");
+        let sel = "newRenderPipelineStateWithDescriptor:error:";
+        assert_eq!(
+            detail_line(sel, &error, &name, None),
+            "reims-vgpu: newRenderPipelineStateWithDescriptor:error:: metal2vulkan-runtime refused \
+             it (the translator refused the feature Lowering(Texture), needing NotImplemented, at \
+             the color attachment 1); the first of Translation-Lowering (rt-refused-translation)\n"
+        );
+        let cancelled = rt::Error::Translation(Translator::Cancelled);
+        let name = crate::rt_platform::diag::refusal_name(&cancelled).expect("a translator's name");
+        assert_eq!(
+            detail_line(sel, &cancelled, &name, None),
+            "reims-vgpu: newRenderPipelineStateWithDescriptor:error:: metal2vulkan-runtime refused \
+             it (the translator refused it); the first of Translation-Cancelled \
+             (rt-refused-translation)\n"
+        );
     }
 
     /// The refusals counted under a code of their own (a pixel format's, an imageblock length's, a

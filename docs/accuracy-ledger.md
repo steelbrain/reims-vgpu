@@ -74,7 +74,13 @@ and rt's error. A texture rt makes none of for its pixel format is counted under
 code instead, `rt-refused-texture-format-<n>`; a pipeline state's imageblock length rt refuses,
 `rt-refused-imageblock-length`; and a heap texture rt refuses on its place in its block,
 `rt-refused-heap-texture-place`. The boot diagnostics (`rt_platform/diag.rs`, lines that start
-`reims-vgpu: rt-diag`) add what the call asked of rt where its site names it.
+`reims-vgpu: rt-diag`) add what the call asked of rt where its site names it. Their refusals
+line counts the translator's refusals by the feature each refused, `Translation-<feature>`
+(metal2vulkan's `Feature`'s variant, as `Translation-DivergentInterpolation`), or by its
+error's variant where it refused none (`Translation-Cancelled`), all of them one code,
+`rt-refused-translation`; the process's first of each has a line naming the feature, what it
+needs and the attachment it is at, and no function's or symbol's name (`rt_platform/diag.rs`,
+`refusal_name`; `rt_platform/unbuilt.rs`, `refusal_detail`).
 
 A render, compute or blit pass whose encoder the platform makes none of (on rt, a pass it
 refuses, as a resolve it builds none of, counted as above) is skipped whole: the decoder drops

@@ -8,7 +8,10 @@
 //! - **Refusals by variant.** Each refusal of Metal's that rt answers (`Error::Refused`) and each of
 //!   its limits (`Error::Limit`), by its variant, `Refused-<variant>` and `Limit-<variant>`
 //!   ([`refusal`]), which the counts line holds as `rt-refused-metal` and `rt-refused-limit` with
-//!   the platform's own refusals of those kinds.
+//!   the platform's own refusals of those kinds; and each of the translator's refusals
+//!   (`Error::Translation`), by the feature it refused, `Translation-<feature>` (the feature's
+//!   variant), or the translator's error's variant where it refused no feature, which the counts
+//!   line holds as one `rt-refused-translation`.
 //! - **Attachment reads through a texture.** Each draw rt refused as one
 //!   (`Gap::Draw { kind: AttachmentRead }`), by its class ([`attachment_read`]): for each texture
 //!   slot of the draw's state whose texture's image a target of the pass renders, the slot's stage
@@ -879,12 +882,12 @@ pub const SURFACE_PLANE_COPY_BYTES_CODE: &str = "rt-surface-plane-copy-bytes";
 /// The refusals of rt's gaps by kind.
 static GAPS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 
-/// The refusals of Metal's that rt answers, and its limits, by variant.
+/// The refusals of Metal's that rt answers, its limits, and the translator's refusals, by variant.
 static REFUSALS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 
 /// Counts a refusal of rt's `error`: a gap under its gap's kind, a draw's by its draw kind; a
 /// refusal of Metal's and a limit under their variant, `Refused-<variant>` and `Limit-<variant>`;
-/// any other error not.
+/// the translator's under the feature it refused, `Translation-<feature>`; any other error not.
 pub fn refusal(error: &rt::Error) {
     let Some(name) = refusal_name(error) else {
         return;
@@ -897,9 +900,12 @@ pub fn refusal(error: &rt::Error) {
 }
 
 /// The kind [`refusal`] counts rt's `error` under: a gap's kind, a draw's `Draw-<kind>`, a
-/// refusal of Metal's `Refused-<variant>` and a limit `Limit-<variant>`; `None` for any other
-/// error.
+/// refusal of Metal's `Refused-<variant>`, a limit `Limit-<variant>`, and the translator's
+/// `Translation-<feature>`, the variant of the feature it refused, or of its error where it
+/// refused no feature (`Translation-InvalidInput`); `None` for any other error. Each is a variant's
+/// name alone, no name of the guest's.
 pub fn refusal_name(error: &rt::Error) -> Option<String> {
+    use metal2vulkan::error::Error as Translator;
     Some(match error {
         rt::Error::Unsupported(rt::Gap::Draw { kind }) => format!("Draw-{kind:?}"),
         rt::Error::Unsupported(rt::Gap::LinearPlanePass { kind }) => {
@@ -908,6 +914,10 @@ pub fn refusal_name(error: &rt::Error) -> Option<String> {
         rt::Error::Unsupported(gap) => variant(&format!("{gap:?}")).to_owned(),
         rt::Error::Refused(r) => format!("Refused-{}", variant(&format!("{r:?}"))),
         rt::Error::Limit(l) => format!("Limit-{}", variant(&format!("{l:?}"))),
+        rt::Error::Translation(Translator::Unsupported(u)) => {
+            format!("Translation-{}", variant(&format!("{:?}", u.feature)))
+        }
+        rt::Error::Translation(t) => format!("Translation-{}", variant(&format!("{t:?}"))),
         _ => return None,
     })
 }
@@ -2631,9 +2641,12 @@ mod tests {
     }
 
     /// A gap is counted by its kind, a draw's by its draw kind and a linear plane pass's by its
-    /// shape, and a refusal of Metal's and a limit by their variant; another error is not.
+    /// shape, a refusal of Metal's and a limit by their variant, and the translator's by the
+    /// feature it refused, else its error's variant, with no name of the guest's; another error is
+    /// not.
     #[test]
     fn refusals_count_by_kind() {
+        use metal2vulkan::error::{DiagName, Error as Translator, Feature, LowerFamily, Unsupported};
         refusal(&rt::Error::Unsupported(rt::Gap::Draw {
             kind: rt::DrawKind::AttachmentRead,
         }));
@@ -2646,6 +2659,11 @@ mod tests {
             max: 4,
         }));
         refusal(&rt::Error::Limit(rt::Limit::BlockLen { len: 8, max: 4 }));
+        let translator = |u: Unsupported| rt::Error::Translation(Translator::Unsupported(u));
+        let lowering = Unsupported::not_implemented(Feature::Lowering(LowerFamily::Texture));
+        refusal(&translator(lowering.naming(DiagName::new("a_function"))));
+        refusal(&translator(Unsupported::not_implemented(Feature::Imageblocks)));
+        refusal(&rt::Error::Translation(Translator::Cancelled));
         refusal(&rt::Error::Quiesced);
         let gaps = GAPS.lock();
         assert!(gaps.get("Draw-AttachmentRead").is_some_and(|&n| n >= 1));
@@ -2662,9 +2680,18 @@ mod tests {
                 .is_some_and(|&n| n >= 1)
         );
         assert!(refusals.get("Limit-BlockLen").is_some_and(|&n| n >= 1));
+        for name in [
+            "Translation-Lowering",
+            "Translation-Imageblocks",
+            "Translation-Cancelled",
+        ] {
+            assert!(refusals.get(name).is_some_and(|&n| n >= 1), "{name}");
+        }
         drop(refusals);
         for map in [&GAPS, &REFUSALS] {
-            assert!(!map.lock().keys().any(|k| k.contains("Quiesced")));
+            let keys = map.lock();
+            assert!(!keys.keys().any(|k| k.contains("Quiesced")));
+            assert!(!keys.keys().any(|k| k.contains("a_function")));
         }
     }
 
