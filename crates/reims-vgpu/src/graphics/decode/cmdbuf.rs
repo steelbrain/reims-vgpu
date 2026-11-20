@@ -7786,6 +7786,205 @@ mod tests {
         assert!(bytes.iter().all(|&b| b == 0x5a));
     }
 
+    /// On the rt platform, through the decoder: process 1's command buffer binds a texture and a
+    /// sampler state at the platform's own indices to a compute encoder, behind a wait for a
+    /// shared event its name keeps past the process's close. The close's worker lets go of the
+    /// two while the buffer waits, giving their indices back. With each class's range three
+    /// indices from there, and a spare of each given back after the close, its last owner read by
+    /// no buffer, the takes get the last fresh index and the spare's, then none: the closed
+    /// process's are passed over. Once the unname sets the event past every value and the close's
+    /// drain is answered, the buffer done, a take gets each of them.
+    #[cfg(feature = "rt")]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
+    fn on_vulkan_rt_s_own_indices_wait_for_a_closed_process_s_running_buffer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        use reims_vgpu_graphics::ops::compute::{
+            RGFX_OP_COMPUTE_SET_SAMPLER_STATES, RGFX_OP_COMPUTE_SET_TEXTURES,
+            RgfxComputeOpSetSamplerStates, RgfxComputeOpSetTextures, RgfxComputeSamplerBinding,
+            RgfxComputeTextureBinding,
+        };
+        use reims_vgpu_graphics::wire::{
+            RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT,
+            RGFX_STATUS_OK, RgfxSharedEventName, RgfxSharedEventUnname,
+        };
+        use reims_vgpu_vulkan::RtPlatform;
+        use reims_vgpu_vulkan::core::platform::resource::{SamplerState as _, Texture as _};
+        use reims_vgpu_vulkan::core::platform::values::{SamplerDesc, TextureDesc};
+        use reims_vgpu_vulkan::rt_platform::texture::OwnIndices;
+
+        use crate::platform::ApiPlatform as _;
+
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
+        // A platform of the test's own, whose device goes before the process exits.
+        let platform = crate::rt_test_end::platform();
+        let device = platform.metal_device(None).unwrap();
+        let mut dec = GraphicsDecoder::<RtPlatform>::new(
+            Arc::clone(&platform),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
+        );
+        let obj = |n: u64| (1 << RGFX_CONTEXT_OBJ_ID_SHIFT) | n;
+        let header = |r#type: u32, size: usize| RgfxMsgHeader {
+            r#type,
+            size: size as u32,
+            seqno: 0,
+        };
+        let on = OnFault::Return;
+        let small = TextureDesc {
+            width: 4,
+            height: 4,
+            ..TextureDesc::default()
+        };
+        let desc = platform.texture_descriptor(&small);
+        // A texture and a sampler state of the platform's own indices, made on the device, each
+        // `None` where no index is left for it.
+        let texture = || device.new_texture(on, &desc).expect("never a raise");
+        let sampler = || {
+            let made = device.new_sampler_state(&SamplerDesc::default());
+            made.expect("never a raise")
+        };
+        let made = || {
+            let made = (texture(), sampler());
+            (made.0.expect("a texture"), made.1.expect("a sampler state"))
+        };
+        // Each class's takes counted while their last owner's reads were unfinished, takes of
+        // indices given back and give-backs, since the test's start.
+        let counts = |own: &OwnIndices| [own.reused(), own.taken_again(), own.given_back()];
+        let classes = || [counts(device.indices()), counts(device.sampler_indices())];
+        let base = classes();
+        let since = || {
+            let now = classes();
+            [0usize, 1].map(|c| [0usize, 1, 2].map(|k| now[c][k] - base[c][k]))
+        };
+
+        // Process 1: its queue, its shared event, named, and the two the buffer binds.
+        dec.set_context(Some(1));
+        let queue = RgfxQueueCreate {
+            header: header(RGFX_CMD_QUEUE_CREATE, size_of::<RgfxQueueCreate>()),
+            obj_id: obj(1),
+            ..RgfxQueueCreate::default()
+        };
+        assert_eq!(dec.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
+        let event = RgfxSharedEventCreate {
+            header: header(
+                RGFX_CMD_SHARED_EVENT_CREATE,
+                size_of::<RgfxSharedEventCreate>(),
+            ),
+            obj_id: obj(3),
+            initial_value: 0,
+        };
+        assert_eq!(dec.decode(&device, event.as_bytes()).unwrap(), Ok(()));
+        let named = RgfxSharedEventName {
+            header: header(RGFX_CMD_SHARED_EVENT_NAME, size_of::<RgfxSharedEventName>()),
+            obj_id: obj(3),
+            name: 5,
+            listen_queue_obj_id: obj(1),
+        };
+        let listen: super::super::shares::ListenSink = Arc::new(|_: &RgfxEventSignalled| true);
+        assert_eq!(
+            dec.name_shared_event(named.as_bytes(), Some(listen)),
+            (Some(0), RGFX_STATUS_OK)
+        );
+        device.indices().leave_fresh(3);
+        device.sampler_indices().leave_fresh(3);
+        let (spare, read) = (made(), made());
+        let spare_at = (spare.0.resource_index(), spare.1.resource_index());
+        let read_at = (read.0.resource_index(), read.1.resource_index());
+        let (read_texture, read_sampler) = read;
+        let texture_in = dec.insert(obj(10), ObjHandle::Texture(read_texture));
+        assert_eq!(texture_in.unwrap(), Ok(()));
+        let sampler_in = dec.insert(obj(11), ObjHandle::Sampler(read_sampler));
+        assert_eq!(sampler_in.unwrap(), Ok(()));
+        let mut ops = event_op(RGFX_OP_WAIT_EVENT, obj(3), 1);
+        ops.extend(op(
+            RGFX_OP_ENCODER_BEGIN_COMPUTE,
+            RgfxComputePassDesc::default().as_bytes(),
+        ));
+        let mut textures = RgfxComputeOpSetTextures {
+            location: 0,
+            length: 1,
+        }
+        .as_bytes()
+        .to_vec();
+        let binding = RgfxComputeTextureBinding {
+            texture_obj_id: obj(10),
+        };
+        textures.extend_from_slice(binding.as_bytes());
+        ops.extend(op(RGFX_OP_COMPUTE_SET_TEXTURES, &textures));
+        let mut samplers = RgfxComputeOpSetSamplerStates {
+            location: 0,
+            length: 1,
+        }
+        .as_bytes()
+        .to_vec();
+        let binding = RgfxComputeSamplerBinding {
+            sampler_obj_id: obj(11),
+        };
+        samplers.extend_from_slice(binding.as_bytes());
+        ops.extend(op(RGFX_OP_COMPUTE_SET_SAMPLER_STATES, &samplers));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let buffer = command_buffer_on(obj(1), obj(20), &ops);
+        assert_eq!(dec.decode(&device, &buffer).unwrap(), Ok(()));
+        dec.set_context(None);
+        assert_eq!(since(), [[0, 0, 0]; 2]);
+
+        // Its close, as a `CONTEXT_CLOSE` makes it, the buffer waiting: the close worker lets go
+        // of the two, giving their indices back, and the drain answers once the buffer is done.
+        let (_, closed) = dec.close_tables(&device, 1);
+        let drained = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&drained);
+        let answer = Box::new(move || flag.store(true, Ordering::Release));
+        let drain = dec.drain_context(1, true, answer);
+        dec.let_go_later(closed, drain);
+        dec.closes_let_go();
+        assert_eq!(since(), [[0, 0, 1]; 2]);
+        // The spare of each is given back after them: the takes get the last fresh index and the
+        // spare's, then none.
+        drop(spare);
+        let fresh = made();
+        let again = made();
+        assert_eq!(
+            (again.0.resource_index(), again.1.resource_index()),
+            spare_at
+        );
+        let (t, s) = (texture(), sampler());
+        assert!(
+            t.is_none() && s.is_none(),
+            "an index taken that the closed process's buffer reads"
+        );
+        assert!(
+            !drained.load(Ordering::Acquire),
+            "drained before the buffer ran"
+        );
+        assert_eq!(since(), [[0, 1, 2]; 2]);
+
+        // The unname sets the event past every value: the buffer runs and completes, and its
+        // indices are taken again.
+        let unname = RgfxSharedEventUnname {
+            header: header(
+                RGFX_CMD_SHARED_EVENT_UNNAME,
+                size_of::<RgfxSharedEventUnname>(),
+            ),
+            reserved_10: 0,
+            name: 5,
+        };
+        dec.unname_shared_event(unname.as_bytes());
+        let start = Instant::now();
+        while !drained.load(Ordering::Acquire) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the closed process's buffer never finished"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let last = made();
+        assert_eq!((last.0.resource_index(), last.1.resource_index()), read_at);
+        assert_eq!(since(), [[0, 2, 2]; 2]);
+        drop((fresh, again, last));
+    }
+
     /// Through the decoder on `P`: a buffer fills a buffer, signals shared event 7 to 1, waits
     /// for 7 to reach 2, and fills it again, as a guest whose CPU waits for the signal before it
     /// sets 2 encodes it. Whether the value 1 reached the guest before the buffer completed,

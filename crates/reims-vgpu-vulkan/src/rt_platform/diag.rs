@@ -107,8 +107,9 @@
 //!   ([`own_index_taken_again`]), and the indices given back ([`own_index_given_back`]). A take
 //!   of an index not taken before counts in neither, so a zero over a run that never took a
 //!   given-back index says nothing of reuse. The first of each pair of sites, ten at most, writes
-//!   its line as it is counted, with the last owner's context, format, size and usage. A
-//!   diagnostic: nothing waits for the reads.
+//!   its line as it is counted, with the last owner's context, format, size and usage. A take
+//!   passes over such an index (`super::texture::OwnIndices::take`), so the count is the check
+//!   that none was taken so: 0.
 //!
 //! Totals, numbers, formats, sizes and usages only: no name, label or byte of the guest's leaves
 //! the process, but through the switch below. A diagnostic, which the contract leaves free:

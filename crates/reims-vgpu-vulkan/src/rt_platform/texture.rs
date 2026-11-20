@@ -38,11 +38,14 @@
 //! guest's reservation (`reserveResourceIndicesForResourceType:`). One it does not place takes one
 //! of the platform's own ([`OwnIndices`]): the highest index of the class that no reservation holds
 //! and no texture of the platform's took yet, granted as it is taken, and once those are gone the
-//! one given back longest ago. So an index a released texture held is taken again as late as can
-//! be: rt leaves to the program that no work in flight reads a released texture through its index,
-//! and Metal frees a texture's ID only once its command buffers completed. Nothing waits for that
-//! here, and a take of an index while a command buffer that read its last owner through it is
-//! unfinished is counted, for the boot diagnostics ([`IndexUse`]): a command buffer's work reads a
+//! one given back longest ago whose last owner no unfinished command buffer reads through it. So
+//! an index a released texture held is taken again as late as can be, and never while work reads
+//! it: rt leaves to the program that no work in flight reads a released texture through its index,
+//! and Metal frees a texture's ID only once its command buffers completed. A take passes over an
+//! index while a command buffer that read its last owner through it is unfinished, as a process
+//! closed while its command buffers run gives its textures back ([`IndexUse`]); where only such
+//! indices are left, it takes none, and the texture is refused as at the class's last. A take of
+//! one so would be counted, for the boot diagnostics. A command buffer's work reads a
 //! texture through its index where its encoders bind it to a shader's slot, declare it with
 //! `useResource:`, which an argument buffer's reads through its ID need, or render it as a colour
 //! attachment, which a fragment function may read through the index; not where a blit copies it,
@@ -756,10 +759,10 @@ pub(super) fn refused_metal<T>(sel: &'static str, why: &dyn std::fmt::Display) -
 
 /// What reads an object at one of the platform's own indices through its index: the command
 /// buffers not finished (made and not completed) whose work reads it so, which [`Reads`] notes, and
-/// where it was made. Its index goes back with it ([`OwnIndices::give_back`]), and a take of the
-/// index while one of those command buffers is unfinished is counted (`super::diag`'s
-/// `own_index_reused`): rt writes the new owner into the index's array element at once, which
-/// such work then reads. A diagnostic: nothing waits for the reads.
+/// where it was made. Its index goes back with it ([`OwnIndices::give_back`]), and is not taken
+/// again while one of those command buffers is unfinished ([`Own::next`]): rt writes the new owner
+/// into the index's array element at once, which such work would then read. A take of the index
+/// so, which that leaves none of, is counted (`super::diag`'s `own_index_reused`).
 pub struct IndexUse {
     /// The notes of it ([`Reads::note`]) whose command buffers are unfinished: one a command
     /// buffer, but one that notes it again after another's note.
@@ -859,7 +862,7 @@ pub struct OwnIndices {
     /// What was taken and reserved.
     own: Mutex<Own>,
     /// How many were taken while a command buffer that read their last owner was unfinished
-    /// ([`IndexUse`]).
+    /// ([`IndexUse`]): none, as [`Own::next`] passes over those; the boot diagnostics' check.
     reused: AtomicU64,
     /// How many taken were given back before: the takes [`OwnIndices::reused`] counts among. A
     /// take of an index not taken before counts in neither.
@@ -876,7 +879,8 @@ struct Own {
     first: u32,
     /// The next index not taken yet, counting down; none once every one was taken.
     fresh: Option<u32>,
-    /// The indices given back, the longest ago first, each with what read its last owner.
+    /// The indices given back, the longest ago first, each with what read its last owner; one
+    /// reserved since goes as a take reaches it.
     free: VecDeque<(u32, Option<Arc<IndexUse>>)>,
 }
 
@@ -929,9 +933,10 @@ impl OwnIndices {
     }
 
     /// An index for an object of the platform's own, which `sel` makes, granted on `device` where
-    /// it is new; `None` where every index is reserved or held. One given back before is counted
-    /// ([`OwnIndices::taken_again`]), and so is one taken while a command buffer that read its last
-    /// owner is unfinished ([`IndexUse`]).
+    /// it is new; `None` where every index is reserved, held, or given back with a command buffer
+    /// that read its last owner unfinished ([`Own::next`]). One given back before is counted
+    /// ([`OwnIndices::taken_again`]), and so would be one taken while a command buffer that read
+    /// its last owner is unfinished ([`IndexUse`]).
     pub fn take(&self, device: &rt::Device, sel: &'static str) -> Result<Option<u32>, rt::Error> {
         let mut own = self.own.lock();
         let Some((index, fresh, last)) = own.next() else {
@@ -959,19 +964,24 @@ impl OwnIndices {
         Ok(Some(index))
     }
 
-    /// Gives `index` back, to be taken again once those given back before it are, with what read
-    /// its last owner (`read`; `None` for none, or an owner never made), counted
-    /// ([`OwnIndices::given_back`]).
+    /// Gives `index` back, with what read its last owner (`read`; `None` for none, or an owner
+    /// never made), counted ([`OwnIndices::given_back`]): it is taken again after those given back
+    /// before it that are ready, once no command buffer that read its last owner is unfinished.
     pub fn give_back(&self, index: u32, read: Option<Arc<IndexUse>>) {
         self.own.lock().give_back(index, read);
         self.given_back.fetch_add(1, Ordering::Relaxed);
         super::diag::own_index_given_back(self.what());
     }
 
-    /// Takes no index not taken before from here: each take is of one given back.
-    #[cfg(test)]
-    fn take_none_fresh(&self) {
-        self.own.lock().fresh = None;
+    /// Leaves at most `n` of the class's indices not taken before, the next ones down: a test's
+    /// small range, which its takes use up before they take any given back.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn leave_fresh(&self, n: u32) {
+        let mut own = self.own.lock();
+        match (own.fresh, n.checked_sub(1)) {
+            (Some(next), Some(more)) => own.first = own.first.max(next.saturating_sub(more)),
+            _ => own.fresh = None,
+        }
     }
 }
 
@@ -1001,7 +1011,9 @@ impl Own {
 
     /// The next index to take, whether it is new (not given back before), and what read its last
     /// owner where it was given back: the highest not taken yet and not reserved, else the one
-    /// given back longest ago that is not reserved since.
+    /// given back longest ago that is not reserved since and that no unfinished command buffer
+    /// reads through ([`IndexUse`]), one load a given-back index it looks at; one so read stays in
+    /// its place. `None` where neither is left.
     fn next(&mut self) -> Option<(u32, bool, Option<Arc<IndexUse>>)> {
         while let Some(index) = self.fresh {
             self.fresh = (index.checked_sub(1)).filter(|&next| next >= self.first);
@@ -1009,9 +1021,15 @@ impl Own {
                 return Some((index, true, None));
             }
         }
-        while let Some((index, read)) = self.free.pop_front() {
-            if !self.is_reserved(index) {
-                return Some((index, false, read));
+        let mut at = 0;
+        while let Some((index, read)) = self.free.get(at) {
+            let (index, read_now) = (*index, read.as_ref().is_some_and(|r| r.unfinished()));
+            if self.is_reserved(index) {
+                self.free.remove(at);
+            } else if read_now {
+                at += 1;
+            } else {
+                return (self.free.remove(at)).map(|(index, read)| (index, false, read));
             }
         }
         None
@@ -1433,14 +1451,16 @@ mod tests {
         assert_eq!(next(&mut own), Some((2, false)));
     }
 
-    /// On the GPU the test holds: an own index taken again while a command buffer whose compute
-    /// encoder bound its last owner, a texture or a sampler state, is uncommitted, or committed
-    /// and in flight, held by a wait for a shared event, is counted, once a take; one taken after
-    /// the command buffer completed, its completed handlers run, is not. Each give-back counts
-    /// once, and each take of an index given back once, whether or not it is counted as taken
-    /// while its last owner's reads were unfinished.
+    /// On the GPU the test holds, each class's fresh indices used up: an own index given back
+    /// while a command buffer whose compute encoder bound its last owner, a texture or a sampler
+    /// state, is uncommitted, or committed and in flight, held by a wait for a shared event, is
+    /// not taken again. A take gets the index given back after it whose last owner no command
+    /// buffer read, and then none, only it being left; once its command buffer goes uncommitted,
+    /// or completes and its completed handlers ran, a take gets it. None is counted as taken while
+    /// its last owner's reads were unfinished; each give-back counts once, and each take of an
+    /// index given back once.
     #[test]
-    fn own_indices_taken_while_their_last_owner_s_reads_are_unfinished_count_on_vulkan() {
+    fn own_indices_wait_for_their_last_owner_s_reads_on_vulkan() {
         use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
         use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
         use crate::core::platform::device::GpuDevice as _;
@@ -1456,20 +1476,26 @@ mod tests {
             height: 4,
             ..TextureDesc::default()
         };
+        // A texture and a sampler state, each `None` where no index is left for it.
         let texture = || {
             let made = device.new_texture(on, &platform.texture_descriptor(&small));
-            made.expect("never a raise").expect("a texture")
+            made.expect("never a raise")
         };
         let sampler = || {
             let made = device.new_sampler_state(&SamplerDesc::default());
-            made.expect("never a raise").expect("a sampler state")
+            made.expect("never a raise")
         };
-        let [t0, t1, t2] = [texture(), texture(), texture()];
-        let [s0, s1, s2] = [sampler(), sampler(), sampler()];
+        let made = || {
+            let made = (texture(), sampler());
+            (made.0.expect("a texture"), made.1.expect("a sampler state"))
+        };
+        // The first of each class is read by a command buffer left uncommitted, the second by
+        // one committed, and the third by none.
+        let [(t0, s0), (t1, s1), (t2, s2)] = [made(), made(), made()];
         let textures = [&t0, &t1, &t2].map(|t| t.resource_index());
         let samplers = [&s0, &s1, &s2].map(|s| s.resource_index());
-        device.indices().take_none_fresh();
-        device.sampler_indices().take_none_fresh();
+        device.indices().leave_fresh(0);
+        device.sampler_indices().leave_fresh(0);
         // Each class's (textures', then sampler states') takes counted while their last owner's
         // reads were unfinished, takes of indices given back and give-backs, since now.
         let counts = |own: &OwnIndices| [own.reused(), own.taken_again(), own.given_back()];
@@ -1480,58 +1506,75 @@ mod tests {
             [0usize, 1].map(|c| [0usize, 1, 2].map(|k| now[c][k] - base[c][k]))
         };
 
-        // A command buffer held by a wait for the event binds the three of each.
+        // A command buffer whose compute encoder binds `t` and `s`, behind a wait for the shared
+        // event where `wait`.
         let shared = device.new_shared_event().expect("a shared event");
         let queue = device.new_command_queue().expect("a command queue");
-        let commands = queue.command_buffer(on).expect("never a raise");
-        let commands = commands.expect("a command buffer");
-        let wait = commands.encode_wait(Some(EventRef::Shared(&shared)), 1);
-        assert_eq!(wait, Ok(()));
-        {
+        let bound = |t: &RtObj<RtTexture>, s: &RtObj<super::super::state::RtSampler>, wait| {
+            let commands = queue.command_buffer(on).expect("never a raise");
+            let commands = commands.expect("a command buffer");
+            if wait {
+                let wait = commands.encode_wait(Some(EventRef::Shared(&shared)), 1);
+                assert_eq!(wait, Ok(()));
+            }
             let encoder = commands.compute_encoder(on).expect("never a raise");
             let encoder = encoder.expect("a compute encoder");
             let binds = [
                 ComputeCmd::SetTextures {
-                    textures: &[Some(&t0), Some(&t1), Some(&t2)],
-                    range: NsRange::new(0, 3),
+                    textures: &[Some(t)],
+                    range: NsRange::new(0, 1),
                 },
                 ComputeCmd::SetSamplerStates {
-                    samplers: &[Some(&s0), Some(&s1), Some(&s2)],
-                    range: NsRange::new(0, 3),
+                    samplers: &[Some(s)],
+                    range: NsRange::new(0, 1),
                 },
                 ComputeCmd::EndEncoding,
             ];
             for bind in binds {
                 assert_eq!(encoder.encode(on, bind), Ok(()));
             }
-        }
-        assert_eq!(since(), [[0, 0, 0]; 2]);
+            drop(encoder);
+            commands
+        };
+        let none_left = || {
+            let (t, s) = (texture(), sampler());
+            assert!(t.is_none() && s.is_none(), "an index taken that work reads");
+        };
 
-        // Uncommitted: the first of each, given back and taken again, counts.
+        // Uncommitted: the first of each, given back, is passed over for the third, given back
+        // after it, and then none is left.
+        let first = bound(&t0, &s0, false);
+        assert_eq!(since(), [[0, 0, 0]; 2]);
         drop((t0, s0));
-        let (u0, v0) = (texture(), sampler());
+        drop((t2, s2));
+        let (u0, v0) = made();
         assert_eq!(
             (u0.resource_index(), v0.resource_index()),
-            (textures[0], samplers[0])
+            (textures[2], samplers[2])
         );
-        assert_eq!(since(), [[1, 1, 1]; 2]);
-
-        // Committed and in flight, held by the wait: the second of each counts.
-        assert_eq!(commands.commit(on), Ok(()));
-        drop((t1, s1));
-        let (u1, v1) = (texture(), sampler());
+        none_left();
+        assert_eq!(since(), [[0, 1, 2]; 2]);
+        // It goes uncommitted: the first of each is taken again.
+        drop(first);
+        let (u1, v1) = made();
         assert_eq!(
             (u1.resource_index(), v1.resource_index()),
-            (textures[1], samplers[1])
+            (textures[0], samplers[0])
         );
-        assert_eq!(since(), [[2, 2, 2]; 2]);
+        assert_eq!(since(), [[0, 2, 2]; 2]);
 
-        // Completed, its completed handlers run: the third of each counts no more as taken while
-        // its last owner's reads were unfinished, and still as given back and taken again.
-        assert_eq!(shared.set_signaled_value(1), Ok(()));
-        assert_eq!(commands.wait_until_completed(on), Ok(()));
-        let reads = [t2.index_use(), s2.index_use()];
+        // Committed and in flight, held by the wait: the second of each, given back, is passed
+        // over, and none is left.
+        let second = bound(&t1, &s1, true);
+        assert_eq!(second.commit(on), Ok(()));
+        let reads = [t1.index_use(), s1.index_use()];
         let reads = reads.map(|read| Arc::clone(read.expect("what reads an own index")));
+        drop((t1, s1));
+        none_left();
+        assert_eq!(since(), [[0, 2, 3]; 2]);
+        // Completed, its completed handlers run: the second of each is taken again.
+        assert_eq!(shared.set_signaled_value(1), Ok(()));
+        assert_eq!(second.wait_until_completed(on), Ok(()));
         for _ in 0..1000 {
             if reads.iter().all(|read| !read.unfinished()) {
                 break;
@@ -1539,14 +1582,30 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(reads.iter().all(|read| !read.unfinished()));
-        drop((t2, s2));
-        let (u2, v2) = (texture(), sampler());
+        let (u2, v2) = made();
         assert_eq!(
             (u2.resource_index(), v2.resource_index()),
-            (textures[2], samplers[2])
+            (textures[1], samplers[1])
         );
-        assert_eq!(since(), [[2, 3, 3]; 2]);
+        assert_eq!(since(), [[0, 3, 3]; 2]);
         drop((u0, u1, u2, v0, v1, v2));
+    }
+
+    /// A test's small range ([`OwnIndices::leave_fresh`]): the next ones down, then those given
+    /// back.
+    #[test]
+    fn own_indices_left_fresh_are_the_next_ones_down() {
+        let own = OwnIndices::new(rt::IndexClass::Sampler);
+        own.leave_fresh(2);
+        let mut state = own.own.lock();
+        let mut next = || state.next().map(|(index, fresh, _)| (index, fresh));
+        assert_eq!(
+            [next(), next(), next()],
+            [Some((3999, true)), Some((3998, true)), None]
+        );
+        state.give_back(3999, None);
+        let next = state.next().map(|(index, fresh, _)| (index, fresh));
+        assert_eq!(next, Some((3999, false)));
     }
 
     /// The texture class's own indices start at its last, 65,535.
@@ -1565,8 +1624,10 @@ mod tests {
     /// What reads an object at an own index ([`IndexUse`]): unfinished from a command buffer's
     /// first note of it until what it noted drops, as the command buffer completes or goes
     /// uncommitted; a command buffer that noted it last notes it no more, and one that notes it
-    /// again after another's note finishes both notes; an index given back carries what read its
-    /// last owner to its take, and one reserved since drops it.
+    /// again after another's note finishes both notes. A take passes over an index given back
+    /// while what read its last owner is unfinished, for one given back after it, takes none where
+    /// only it is left, and takes it once the reads finish; an index given back carries what read
+    /// its last owner to its take, and one reserved since drops it.
     #[test]
     fn reads_through_own_indices_are_unfinished_until_their_command_buffers_finish() {
         let made = super::super::diag::OwnMade::sampler("a test's make");
@@ -1591,20 +1652,26 @@ mod tests {
             "an uncommitted command buffer's reads end as it goes"
         );
 
-        let mut own = Own::new(1..3);
-        let taken = [own.next(), own.next()].map(|n| n.map(|(index, fresh, _)| (index, fresh)));
-        assert_eq!(taken, [Some((2, true)), Some((1, true))]);
+        let mut own = Own::new(1..4);
+        let taken = [own.next(), own.next(), own.next()];
+        let taken = taken.map(|n| n.map(|(index, fresh, _)| (index, fresh)));
+        assert_eq!(taken, [Some((3, true)), Some((2, true)), Some((1, true))]);
         let reads = Reads::default();
         reads.note(Some(&other));
-        own.give_back(2, Some(Arc::clone(&other)));
+        own.give_back(3, Some(Arc::clone(&other)));
+        own.give_back(2, Some(Arc::clone(&read)));
         own.give_back(1, Some(Arc::clone(&read)));
-        let (index, fresh, last) = own.next().expect("one given back");
-        assert_eq!((index, fresh), (2, false));
-        assert!(last.is_some_and(|last| Arc::ptr_eq(&last, &other) && last.unfinished()));
-        own.reserve(1);
-        assert!(own.next().is_none());
+        own.reserve(2);
+        let (index, fresh, last) = own.next().expect("one given back whose reads finished");
+        assert_eq!((index, fresh), (1, false));
+        assert!(last.is_some_and(|last| Arc::ptr_eq(&last, &read)));
+        assert!(own.next().is_none(), "3's last owner is read still");
         drop(reads);
         assert!(!other.unfinished());
+        let (index, fresh, last) = own.next().expect("3, its reads finished");
+        assert_eq!((index, fresh), (3, false));
+        assert!(last.is_some_and(|last| Arc::ptr_eq(&last, &other)));
+        assert!(own.next().is_none());
         assert_eq!(
             (Arc::strong_count(&read), Arc::strong_count(&other)),
             (1, 1)
