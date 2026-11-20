@@ -137,13 +137,16 @@ fn headroom_pieces() -> Vec<(u64, u64)> {
         .collect()
 }
 
-/// A piece is one of metal2vulkan-rt's units, its length read from rt, and the headroom is
+/// A piece is one of metal2vulkan-runtime's units, its length read from rt, and the headroom is
 /// [`HEADROOM`] bytes of them, asked ahead of the guest's first take lowest address first: a take
 /// of a unit fills one, and the pool asks one more; a take longer than a unit has a piece of its
 /// own length past them, and the headroom's pieces stay empty, so the pool asks none
 #[test]
 fn a_piece_is_one_rt_unit() {
-    assert_eq!(BLOCK_LEN, metal2vulkan_rt::MemoryClass::Shared.block_len());
+    assert_eq!(
+        BLOCK_LEN,
+        metal2vulkan_runtime::MemoryClass::Shared.block_len()
+    );
     assert_eq!(KEPT * BLOCK_LEN, HEADROOM);
     let host = Arc::new(Host::default());
     let (pool, _blocks) = pool(range(64), &host, LONG);
@@ -1649,7 +1652,7 @@ fn the_release_leaves_the_blocks_with_a_live_ledger_until_its_drop() {
     assert_eq!(blocks.counts(), (0, 2));
 }
 
-/// A source whose blocks have GPU addresses, as metal2vulkan-rt's do: [`HostBlocks`]' blocks, the
+/// A source whose blocks have GPU addresses, as metal2vulkan-runtime's do: [`HostBlocks`]' blocks, the
 /// `n`th handed out at `ADDRESSED + n * BLOCK_LEN`.
 struct Addressed {
     blocks: HostBlocks,

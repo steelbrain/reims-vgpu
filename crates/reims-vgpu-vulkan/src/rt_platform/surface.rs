@@ -32,7 +32,7 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::resource::{
     ExportedMemory, ExportedSurface, SurfaceDesc, SurfaceHandle, SurfaceMemory, SurfacePlaneLayout,
@@ -113,7 +113,7 @@ fn refused(desc: &SurfaceDesc<'_>, why: &dyn std::fmt::Display) {
         log::warn!(
             target: TARGET,
             kind:% = SURFACE_REFUSED_CODE;
-            "an exported surface of {desc:?}: metal2vulkan-rt makes none ({why}); its planes stay \
+            "an exported surface of {desc:?}: metal2vulkan-runtime makes none ({why}); its planes stay \
              in images of their own, and the host's video lands its pictures another way \
              ({SURFACE_REFUSED_CODE}), counted from here"
         );
@@ -172,7 +172,7 @@ pub(super) fn exported_surface(
                 log::warn!(
                     target: TARGET,
                     kind:% = SURFACES_COPIED_CODE;
-                    "an exported surface of {desc:?}: metal2vulkan-rt made it in the copy form \
+                    "an exported surface of {desc:?}: metal2vulkan-runtime made it in the copy form \
                      ({reason:?}), its planes copied into and back ({SURFACES_COPIED_CODE}), \
                      counted from here"
                 );

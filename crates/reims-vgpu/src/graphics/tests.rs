@@ -244,7 +244,7 @@ fn the_device_reserves_the_guest_s_texture_ids_first() {
 /// host makes never share an index, and one placed at the guest's last id, past the table a fresh
 /// device has, is made and lives. Each answers rt's resource id: its index in the low word, the
 /// guest's id for a placed texture, and in the high word rt's word for its descriptor
-/// (metal2vulkan-rt's `ResourceId`), the same for every texture here, whose descriptors differ
+/// (metal2vulkan-runtime's `ResourceId`), the same for every texture here, whose descriptors differ
 /// only in where they are placed. Each test runs in a process of its own, so the device's ids
 /// start fresh
 #[test]
@@ -393,7 +393,7 @@ fn on_vulkan_a_cold_device_takes_no_guest_texture_id() {
                 .unwrap()
         })
         .collect();
-    // rt's resource id: the texture's index in its low word (metal2vulkan-rt's `ResourceId`).
+    // rt's resource id: the texture's index in its low word (metal2vulkan-runtime's `ResourceId`).
     let inside: Vec<u64> = plain
         .iter()
         .map(|t| t.gpu_resource_id() & 0xffff_ffff)
@@ -11024,7 +11024,7 @@ fn surface_device_taking(
 }
 
 /// [`surface_device_taking`] on a platform that imports each pages block's view as a block it
-/// knows through `imports`, where given (metal2vulkan-rt's, `ApiPlatform::view_imports`).
+/// knows through `imports`, where given (metal2vulkan-runtime's, `ApiPlatform::view_imports`).
 fn surface_device_importing(
     pages: u64,
     features: u64,
@@ -11385,7 +11385,7 @@ fn a_pages_block_s_answer_carries_its_view_s_address_where_the_guest_took_import
     );
 }
 
-/// Where the platform imports a pages block's view as a block it knows (metal2vulkan-rt's) and
+/// Where the platform imports a pages block's view as a block it knows (metal2vulkan-runtime's) and
 /// the guest took `IMPORT_ADDRESSES_LATER` beside `IMPORT_ADDRESSES`, a pages block's
 /// `SURFACE_PAGES` is answered OK with no address while its view's import is held, so the guest's
 /// call waits for none of it. A `BUFFER_OVER_PAGES` at 0 over the block, a texture over that

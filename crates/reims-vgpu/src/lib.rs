@@ -4,7 +4,7 @@
 //! A device is made from one config ([`GraphicsConfig`]) holding closures for its callbacks, and
 //! answers a [`Result`] with what refused it ([`Error`]). It is generic over the platform with
 //! [`DefaultPlatform`] as the default, so its forwarding is unit-tested on core's fake platform.
-//! The platform is `RtPlatform`, over metal2vulkan-rt, on the host's Vulkan driver on Linux and
+//! The platform is `RtPlatform`, over metal2vulkan-runtime, on the host's Vulkan driver on Linux and
 //! Windows and on macOS on Mesa's KosmicKrisp; it draws the device's window into a swapchain of its
 //! window, on macOS one over the window's `CAMetalLayer`.
 //!
@@ -55,7 +55,7 @@ pub use pool::{BLOCK_LEN, PIECE_ALIGN, PoolAddFn, PoolConfig, PoolRemoveFn, RELE
 pub use reims_vgpu_graphics::RawDoorbell;
 pub use reims_vgpu_vulkan::RtPlatform;
 
-/// The platform every handle is made on: `RtPlatform`, over metal2vulkan-rt.
+/// The platform every handle is made on: `RtPlatform`, over metal2vulkan-runtime.
 pub type DefaultPlatform = RtPlatform;
 pub use reims_vgpu_window::{
     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,

@@ -25,7 +25,7 @@
 
 use std::ops::Range;
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::Platform;
 use crate::core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
@@ -38,7 +38,7 @@ use super::diag::Use;
 use super::unbuilt::{RtRefusal, Unbuilt, refuse, refused_as, rt_refused_texture};
 use super::{RtObj, RtPlatform};
 
-/// `id<MTLBlitCommandEncoder>` on metal2vulkan-rt.
+/// `id<MTLBlitCommandEncoder>` on metal2vulkan-runtime.
 pub struct RtBlitEncoder {
     /// rt's encoder, until `endEncoding` ends it.
     rt: Mutex<Option<rt::BlitCommandEncoder>>,

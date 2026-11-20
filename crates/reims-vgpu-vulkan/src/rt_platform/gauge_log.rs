@@ -24,7 +24,7 @@
 use std::sync::Once;
 use std::time::Duration;
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 /// The log target of the lines, at debug, which [`start`] asks the log for.
 pub(crate) const TARGET: &str = "reims_vgpu::rt_gauges";

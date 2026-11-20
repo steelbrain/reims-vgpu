@@ -47,7 +47,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::num::ToUsize as _;
 use crate::core::platform::Handle as _;
@@ -84,7 +84,7 @@ const UNTRACKED: u64 = 0x100;
 /// The CPU cache and storage modes, which a heap's resources share with it: bits 0 to 7.
 const MODES: u64 = 0xff;
 
-/// `id<MTLHeap>` on metal2vulkan-rt: its range of a block and what the platform answers of it.
+/// `id<MTLHeap>` on metal2vulkan-runtime: its range of a block and what the platform answers of it.
 pub struct RtHeap {
     /// The block it is a range of, held.
     block: rt::Block,

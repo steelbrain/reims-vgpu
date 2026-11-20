@@ -1,11 +1,11 @@
 //! What the device makes on a platform that places a pinned buffer or heap only inside a block it
-//! knows (`ApiPlatform::PINS_IN_BLOCKS`, metal2vulkan-rt's), counted by the kind of make, so a
+//! knows (`ApiPlatform::PINS_IN_BLOCKS`, metal2vulkan-runtime's), counted by the kind of make, so a
 //! boot's counts line says which makes still lie elsewhere than the guest's pointers say, and
 //! which import the host's memory.
 //!
 //! **Pins not kept.** On such a platform any other pinned object lies at the platform's own
 //! address, which the guest's pointers to it do not hold. The platform counts each such object
-//! once (metal2vulkan-rt's `rt-gpu-address-unpinned`); the decoder, which knows what each create
+//! once (metal2vulkan-runtime's `rt-gpu-address-unpinned`); the decoder, which knows what each create
 //! makes, counts it again under its kind's code ([`Codes::unpinned`]), so the kinds' counts sum to
 //! that total. A pin counts where the decoder passed it to the platform and the object made
 //! answers another `gpuAddress` ([`made`]). A texture placed by the device at the guest's own pick
@@ -17,7 +17,7 @@
 //! holds a [`Live`], which counts it gone as the entry goes.
 //!
 //! **Imports.** Each make the decoder or the device asks of the platform runs as a make of its
-//! kind on its thread (`reims_vgpu_vulkan::answer::making_as`, [`Codes::imports`]): metal2vulkan-rt
+//! kind on its thread (`reims_vgpu_vulkan::answer::making_as`, [`Codes::imports`]): metal2vulkan-runtime
 //! counts each import of the host's memory it makes there under that kind, with the most live at
 //! once, and under its total (`rt-imports`), so the kinds' counts sum to it. Each refusal of rt's
 //! there is counted under the kind too (`reims_vgpu_vulkan::answer::refusing_as`,
@@ -92,7 +92,7 @@ pub(crate) const KINDS: [Kind; 12] = [
 /// A kind's codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Codes {
-    /// A pin of the kind's the platform did not keep: metal2vulkan-rt's total's code,
+    /// A pin of the kind's the platform did not keep: metal2vulkan-runtime's total's code,
     /// `rt-gpu-address-unpinned`, and the kind.
     pub(crate) unpinned: &'static str,
     /// The kind's objects made, `rt-made-<kind>`, and the most live at once.
@@ -186,7 +186,7 @@ const STORAGE_PRIVATE: u64 = 2;
 /// The code of a texture the device placed at the guest's own pick of a GPU address
 /// (`TEXTURE_CREATE` placed by the device, `MANAGED_TEXTURE_CREATE`), counted per texture: no
 /// platform takes a texture's pin, so its `gpuAddress` is the guest's answer alone, which on
-/// metal2vulkan-rt may equal a live buffer's address there.
+/// metal2vulkan-runtime may equal a live buffer's address there.
 pub(crate) const TEXTURE_PICKS: &str = "rt-texture-address-guest-pick";
 
 /// An object made of a kind, live while this lives ([`made`]): its decoder entry holds it, and

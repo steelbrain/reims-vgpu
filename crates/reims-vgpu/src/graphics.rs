@@ -523,7 +523,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // The GPU's memory heaps, summed, which size the guest's Shared pool's range below.
             let memory_heaps = gpu_device.memory_heaps_total();
             // The source of the guest's pool's blocks and of its contexts' Private blocks: the
-            // platform's where it gives blocks (metal2vulkan-rt's), else the process's own memory
+            // platform's where it gives blocks (metal2vulkan-runtime's), else the process's own memory
             // for the pool and the host's picks of Private addresses.
             let block_source = platform.block_source(&gpu_device);
             // The guest's Shared pool, its blocks the source's. Its range is what the GPU's
@@ -1277,9 +1277,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     /// the last call of the host's before its exit, on the thread that then exits. Its answer is
     /// whether the host may then call `exit`. The library's threads park at their next step and
     /// the steps in progress on other threads are waited for; on the platform over
-    /// metal2vulkan-rt, then, where a GPU device is still live, rt's threads end and its GPU work
+    /// metal2vulkan-runtime, then, where a GPU device is still live, rt's threads end and its GPU work
     /// completes, and the process's GPU work after it is refused. Nothing is freed. On the
-    /// platform over metal2vulkan-rt, true where it keeps no GPU device (the release of the last
+    /// platform over metal2vulkan-runtime, true where it keeps no GPU device (the release of the last
     /// graphics device let go of it, [`Self::let_go_of_gpu`]) and the steps ended in time; false
     /// where it keeps one, stopped or not, since its runtime supports no `exit` with a device
     /// live. On the Vulkan platform, true only where it never asked its runtime for a GPU device
@@ -1393,7 +1393,7 @@ struct GraphicsControl<P: ApiPlatform> {
     shared_pool: Option<PoolLedger>,
     /// The ledger of the contexts' Private blocks (`PRIVATE_TAKE`, `PRIVATE_GIVE`,
     /// [`Self::take_private_block`]): the host's picks of addresses until the device runs on
-    /// metal2vulkan-rt, whose Private blocks then fill it.
+    /// metal2vulkan-runtime, whose Private blocks then fill it.
     private_blocks: PrivateBlocks,
 }
 
@@ -4134,7 +4134,7 @@ fn stepped<T>(f: impl FnOnce() -> T) -> T {
 /// where a submission handler runs inside a commit on any other thread ([`foreign_committer`]).
 /// The rt platform runs submission handlers on rt's own threads, never inside a commit: on its
 /// submit thread, before the buffer's submission goes to the driver (after it, for one that
-/// presents a drawable), or on its completion thread, for one held for a shared event's value
+/// presents a drawable), one held for a shared event's value among them
 /// ([`RT_HANDLER_THREADS`]). A platform may run them, other buffers' among them, inside a commit
 /// (`reims_vgpu_vulkan::core::platform::command::committing`), as the testkit's does. A
 /// buffer's transition to scheduled, and every later one of its queue, waits for its submission
@@ -4162,9 +4162,9 @@ fn foreign_committer() -> bool {
 /// rt's threads that run a command buffer's handlers, and so post onto its queue's ring and raise
 /// its vector inline: its submit thread, which runs its submission and scheduled handlers, and its
 /// completion thread, which runs its completed handlers but those handed on
-/// (`reims-vgpu.rt-handed-on`) and the scheduled handlers of one held for a shared event's value
-/// (`reims_vgpu_vulkan::rt_platform::command`'s module doc). The host's trace times the device's
-/// posts on them (`qraise`, `qhanded`, `reims_vgpu_graphics::Host::trace`).
+/// (`reims-vgpu.rt-handed-on`; `reims_vgpu_vulkan::rt_platform::command`'s module doc). The
+/// host's trace times the device's posts on them (`qraise`, `qhanded`,
+/// `reims_vgpu_graphics::Host::trace`).
 const RT_HANDLER_THREADS: [&str; 2] = ["m2v-submit", "m2v-complete"];
 
 /// The names, or their prefixes, of the library's threads `RvgGraphicsRaiseFn` names: the
@@ -4576,7 +4576,7 @@ const RESERVATION_CHECKS: usize = 16;
 /// beside the ids it leaves, which it hands out twice. So this is the first call on the device,
 /// and a few plain textures check it took: one whose index lies inside the guest's ids is logged
 /// as an error. The index is a resource id's low word: rt's ids carry its word for the texture's
-/// descriptor in the high one (metal2vulkan-rt's `ResourceId`).
+/// descriptor in the high one (metal2vulkan-runtime's `ResourceId`).
 fn reserve_guest_texture_ids<P: Platform>(platform: &P, device: &P::Device) {
     let ids: Vec<u64> = guest_texture_ids().collect();
     if let Err(raise) = refusing(|| device.reserve_resource_indices(0, &ids)) {
@@ -4750,7 +4750,7 @@ fn cache_every(shapes: bool, pool: bool) -> u64 {
 /// address, and every CPU copy lies in a block the platform knows, a slab's in a pool block at the
 /// address the host gave it (`POOL_ADDRESSES`), a no-copy one's in a pages block's view at its
 /// import's (`IMPORT_ADDRESSES`), so the platform keeps the pin. A GPU of its own memory keeps a
-/// `Managed` buffer's GPU copy elsewhere; the Vulkan platform before metal2vulkan-rt pins each
+/// `Managed` buffer's GPU copy elsewhere; the Vulkan platform before metal2vulkan-runtime pins each
 /// buffer at the guest's pick and refuses a pin inside another buffer's range; and with no pool the
 /// slabs' copies lie in heaps over the region, which no block the platform knows holds: none offers
 /// it, and their guests pick each buffer an address of its own.

@@ -293,7 +293,7 @@
 //!   pages taken so at their naming. A fill is the host's CPU reading the pages' bytes into
 //!   Shared pieces of its own, which the GPU then copies into the cache; a download is the GPU's
 //!   copy of the cache into such pieces, which the CPU empties into the pages once it is done.
-//!   A copy lays the bytes it moves back to back in pieces of at most metal2vulkan-rt's unit
+//!   A copy lays the bytes it moves back to back in pieces of at most metal2vulkan-runtime's unit
 //!   ([`PIECE`], 16 MiB), a range that crosses a piece's end split there ([`pack`]), so no
 //!   piece takes an allocation of a surface's length: rt carves each from its pool's free
 //!   ranges, or makes one unit for it where none fits. The pieces are the host's own, made
@@ -8253,16 +8253,16 @@ fn encode_home<P: Platform>(
     Ok(true)
 }
 
-/// The longest piece of a staged copy (the module doc, "Staged copies"): metal2vulkan-rt's unit,
+/// The longest piece of a staged copy (the module doc, "Staged copies"): metal2vulkan-runtime's unit,
 /// the length of each allocation its pool makes ([`MemoryClass::block_len`]), so a piece is
 /// carved from the pool's free ranges, or is the start of one unit's allocation where none fits,
 /// and never takes an allocation of a surface's length.
 ///
-/// [`MemoryClass::block_len`]: metal2vulkan_rt::MemoryClass::block_len
-const PIECE: u64 = metal2vulkan_rt::MemoryClass::Shared.block_len();
+/// [`MemoryClass::block_len`]: metal2vulkan_runtime::MemoryClass::block_len
+const PIECE: u64 = metal2vulkan_runtime::MemoryClass::Shared.block_len();
 
 /// A staged copy's last piece's length is a multiple of this, up to a whole piece: the granule
-/// metal2vulkan-rt rounds a block's length up to (`Device::take_block`), so the rounding takes
+/// metal2vulkan-runtime rounds a block's length up to (`Device::take_block`), so the rounding takes
 /// no byte the pool would not hold anyway, and a spare piece serves more of the copies after.
 const PIECE_GRANULE: u64 = 64 << 10;
 

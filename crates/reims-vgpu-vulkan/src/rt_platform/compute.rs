@@ -33,7 +33,7 @@
 
 use std::ops::Range;
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::blit::ResourceRef;
 use crate::core::platform::compute::{ComputeCmd, ComputeEncoder};
@@ -52,7 +52,7 @@ use super::{RtObj, RtPlatform};
 /// An index, a length or a size past rt's 32 bits.
 const WIDE: Stop = Stop::Metal("an index, a length or a size past 32 bits");
 
-/// `id<MTLComputeCommandEncoder>` on metal2vulkan-rt.
+/// `id<MTLComputeCommandEncoder>` on metal2vulkan-runtime.
 pub struct RtComputeEncoder {
     /// rt's encoder and what the encoder set.
     open: Mutex<Open>,

@@ -5,7 +5,7 @@
 //!
 //! # A block
 //!
-//! On a source that gives Private blocks (metal2vulkan-rt's device), a take is one block of the
+//! On a source that gives Private blocks (metal2vulkan-runtime's device), a take is one block of the
 //! source's ([`BlockSource::take_block`] of [`MemoryClass::Private`]): device memory no one maps,
 //! at the block's own GPU address, the whole of it the context's (the take's length rounded up to
 //! rt's 64 KiB, carved from one of its 16 MiB allocations where it fits, else the start of an
@@ -24,7 +24,7 @@
 //! source gives no Private blocks, is answered at once on the thread that carries the take out,
 //! the context's lane. A source's block may be an allocation of the driver's, which waits for the
 //! memory and, on NVIDIA's driver, holds the device's other calls while it allocates (about
-//! 0.08 ms a MiB of Private memory, metal2vulkan-rt's `memory.rs`, `ALLOCATION_LEN`): on an RTX
+//! 0.08 ms a MiB of Private memory, metal2vulkan-runtime's `memory.rs`, `ALLOCATION_LEN`): on an RTX
 //! 3090 a boot whose guest asked for blocks of 256 MiB took 7, 52.7 ms in all and 11.5 ms at
 //! most, each on the control ring's lane, which held every context's next messages behind it
 //! (**measured**). So a take of
@@ -88,10 +88,10 @@ pub const SOURCED_CODE: &str = "private-take-sourced";
 pub const SOURCED_US_CODE: &str = "private-take-sourced-us";
 
 /// The length of the guest's Private blocks, `kPrivateBlockBytes` in its Metal bundle: 16 MiB,
-/// metal2vulkan-rt's allocation unit ([`metal2vulkan_rt::MemoryClass::block_len`]), which rt's
+/// metal2vulkan-runtime's allocation unit ([`metal2vulkan_runtime::MemoryClass::block_len`]), which rt's
 /// block maker makes ahead of need while the class's free bytes are fewer than half of one. A
 /// longer take is an object's own span, which rt makes an allocation for in the take.
-pub const UNIT_LEN: u64 = metal2vulkan_rt::MemoryClass::Private.block_len();
+pub const UNIT_LEN: u64 = metal2vulkan_runtime::MemoryClass::Private.block_len();
 
 /// The code of a take longer than [`UNIT_LEN`] its worker took from the source, counted once
 /// each, among [`SOURCED_CODE`]'s.
@@ -1121,8 +1121,8 @@ mod tests {
     struct Unknown;
 
     impl super::super::rt_blocks::Knowing for Unknown {
-        fn know(&self, _: metal2vulkan_rt::Block) {}
-        fn forget(&self, _: metal2vulkan_rt::BlockId) {}
+        fn know(&self, _: metal2vulkan_runtime::Block) {}
+        fn forget(&self, _: metal2vulkan_runtime::BlockId) {}
     }
 
     /// On rt's device, a take is one of rt's Private blocks at its own address, answered on its

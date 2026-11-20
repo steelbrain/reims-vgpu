@@ -53,7 +53,7 @@ use metal2vulkan::pipeline::{
     LinkedFunction, LinkedFunctions, StageEntries, StageInputAttributeDescriptor,
     StageInputDescriptor, StageInputLayoutDescriptor,
 };
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::compute::Dispatch;
 use crate::core::platform::resource::ComputePipeline;
@@ -197,7 +197,7 @@ impl Drop for Lease {
     }
 }
 
-/// `id<MTLComputePipelineState>` on metal2vulkan-rt.
+/// `id<MTLComputePipelineState>` on metal2vulkan-runtime.
 pub struct RtComputePipeline {
     /// rt's state. Declared before `lease`, so it goes first: rt gives up a constexpr sampler's
     /// device samplers before its index is the platform's again.

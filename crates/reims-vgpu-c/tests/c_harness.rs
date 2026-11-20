@@ -1,6 +1,6 @@
 //! Builds `tests/c/harness.c` against the committed `include/reims_vgpu.h`, links it to this
 //! crate's dynamic library, and runs it. The harness uses the platform the library is built on, as
-//! a C host does: by default the one over metal2vulkan-rt, which on macOS runs on Mesa's
+//! a C host does: by default the one over metal2vulkan-runtime, which on macOS runs on Mesa's
 //! KosmicKrisp, found beside the harness ([`link_vulkan`]). On Windows it links the DLL's import
 //! library.
 
@@ -162,7 +162,7 @@ fn run(h: &Harness, args: &[&str]) -> Output {
 /// The C API from C, end to end on the library's platform — every check of tests/c/harness.c
 /// passes, and its quiesce ahead of the exit, after its graphics devices were released, answers
 /// false on the Vulkan platform, which made a GPU device in the process, and true on the platform
-/// over metal2vulkan-rt, whose release let go of it
+/// over metal2vulkan-runtime, whose release let go of it
 #[test]
 fn c_harness_passes() {
     let h = harness("run");

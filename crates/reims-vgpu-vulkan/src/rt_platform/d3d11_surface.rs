@@ -52,7 +52,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::resource::{D3d11PlaneDesc, ImportedSurface, ImportedSurfaceMemory};
 use crate::core::platform::values::TextureDesc;
@@ -133,7 +133,7 @@ fn refused(planes: &[D3d11PlaneDesc<'_>], why: &dyn std::fmt::Display) {
         log::warn!(
             target: TARGET,
             kind:% = D3D11_SURFACE_REFUSED_CODE;
-            "a surface over Direct3D 11 textures of {planes:?}: metal2vulkan-rt makes none \
+            "a surface over Direct3D 11 textures of {planes:?}: metal2vulkan-runtime makes none \
              ({why}); its planes stay in images of their own, and the host's video lands its \
              pictures another way ({D3D11_SURFACE_REFUSED_CODE}), counted from here"
         );

@@ -1,6 +1,6 @@
 //! The blit copies between a buffer and a texture that take an `MTLBlitOption`
 //! (`copyFromBuffer:...toTexture:...options:` and `copyFromTexture:...toBuffer:...options:`), on
-//! metal2vulkan-rt, whose copies take none: its copy with no option is the options form's with
+//! metal2vulkan-runtime, whose copies take none: its copy with no option is the options form's with
 //! none (rt's README, "Blit encoders").
 //!
 //! Options 0, `MTLBlitOptionNone`, is rt's copy. Any other value, the depth or the stencil of a
@@ -8,7 +8,9 @@
 //! [`BlitError::Options`], with nothing recorded, for the caller to fail the command buffer on
 //! as it does for rt's refusals.
 
-use metal2vulkan_rt::{BlitCommandEncoder, Buffer, BufferLayout, Error, Texture, TexturePlace};
+use metal2vulkan_runtime::{
+    BlitCommandEncoder, Buffer, BufferLayout, Error, Texture, TexturePlace,
+};
 
 /// A copy that was not recorded.
 #[derive(Debug)]

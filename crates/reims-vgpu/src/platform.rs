@@ -59,7 +59,7 @@ pub trait ApiPlatform: Platform {
     const PLACED_SHAPE_IMAGES: bool = false;
 
     /// Whether the platform keeps a pinned buffer's or heap's GPU address only inside a block it
-    /// knows, and places it at an address of its own elsewhere (metal2vulkan-rt's): a graphics
+    /// knows, and places it at an address of its own elsewhere (metal2vulkan-runtime's): a graphics
     /// device on it counts each pin not kept by the kind of object
     /// (`graphics::decode::unkept`). False by default: the platform keeps every pin.
     const PINS_IN_BLOCKS: bool = false;
@@ -285,7 +285,7 @@ mod fake {
         parking_lot::const_mutex(Vec::new());
 
     /// Has `platform` import each pages block's view as a block it knows, through `imports`, as
-    /// metal2vulkan-rt's does ([`ApiPlatform::view_imports`]): a graphics device made on it from
+    /// metal2vulkan-runtime's does ([`ApiPlatform::view_imports`]): a graphics device made on it from
     /// now on offers what goes with them. The entries of processes gone are dropped here.
     #[cfg(test)]
     pub(crate) fn fake_view_imports(

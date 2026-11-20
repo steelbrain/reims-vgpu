@@ -25,7 +25,7 @@ use metal2vulkan::error::{DescriptorError, Error as TranslatorError};
 use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
 use metal2vulkan::metal::{DataType, FunctionOptions};
 use metal2vulkan::pipeline::LinkedFunction;
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::Handle;
 use crate::core::platform::resource::{FunctionConstant, Library};
@@ -42,7 +42,7 @@ const LIBRARY: &str = "newLibraryWithData:error:";
 /// `newLibraryWithSource:options:error:`, which core asks the platform's shaders by.
 const SHADERS: &str = "newLibraryWithSource:options:error:";
 
-/// `id<MTLLibrary>` on metal2vulkan-rt: the translator's library.
+/// `id<MTLLibrary>` on metal2vulkan-runtime: the translator's library.
 pub struct RtLibrary {
     rt: rt::Library,
 }
@@ -54,7 +54,7 @@ impl RtLibrary {
     }
 }
 
-/// `id<MTLFunction>` on metal2vulkan-rt: a function of a library, as it was made (the module's
+/// `id<MTLFunction>` on metal2vulkan-runtime: a function of a library, as it was made (the module's
 /// docs).
 pub struct RtFunction {
     made: LinkedFunction,

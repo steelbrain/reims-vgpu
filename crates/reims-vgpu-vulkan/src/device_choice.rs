@@ -1,6 +1,6 @@
 //! Which GPU the library opens where the host has more than one Vulkan device: the rt
 //! platform's one device is made of the physical device this module picks ([`chosen`]), of the
-//! physical devices of the platform's instance that meet metal2vulkan-rt's floor
+//! physical devices of the platform's instance that meet metal2vulkan-runtime's floor
 //! (`crate::rt_platform::device`).
 //!
 //! **Candidates.** The physical devices are those the platform's instance lists, in the loader's
@@ -377,7 +377,7 @@ fn user_selection(var: impl Fn(&str) -> Option<OsString>) -> Vec<(&'static str, 
         .collect()
 }
 
-/// The device of `seen` (an instance's physical devices that meet metal2vulkan-rt's floor, in the
+/// The device of `seen` (an instance's physical devices that meet metal2vulkan-runtime's floor, in the
 /// loader's order) the rt platform opens (`crate::rt_platform`), and logged: the device the host's
 /// user's selection variables name, else the one GPU, else the first by kind (the module doc).
 /// `None` where no device is a candidate.

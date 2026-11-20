@@ -43,7 +43,7 @@
 use metal2vulkan::metal::{
     CullMode, DepthClipMode, IndexType, PrimitiveType, TriangleFillMode, Winding,
 };
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::blit::ResourceRef;
 use crate::core::platform::render::{RenderCmd, RenderEncoder};
@@ -68,7 +68,7 @@ const WIDE: Stop = Stop::Metal("a count, a base or an index past 32 bits");
 /// `MTLVisibilityResultModeDisabled`.
 const VISIBILITY_DISABLED: u64 = 0;
 
-/// `id<MTLRenderCommandEncoder>` on metal2vulkan-rt.
+/// `id<MTLRenderCommandEncoder>` on metal2vulkan-runtime.
 pub struct RtRenderEncoder {
     /// rt's encoder and what the encoder set.
     open: Mutex<Open>,

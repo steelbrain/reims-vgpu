@@ -130,7 +130,7 @@ pub(crate) unsafe fn device_local_budget_of(
 }
 
 /// The bytes of `memory`'s heaps, every one of them, summed (`GpuDevice::memory_heaps_total`),
-/// which bound the guest's Shared pool's range. Every heap, not only the heap of metal2vulkan-rt's
+/// which bound the guest's Shared pool's range. Every heap, not only the heap of metal2vulkan-runtime's
 /// Shared memory type (host-visible, host-coherent and host-cached), whose blocks fill the pool: a
 /// heap's size is how the driver accounts for its memory, not what it will allocate (on a 780M,
 /// RADV gives that type a 5.52 GiB heap beside an 11.05 GiB device-local one, measured with

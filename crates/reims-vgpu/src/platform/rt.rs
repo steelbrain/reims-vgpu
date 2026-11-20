@@ -1,4 +1,4 @@
-//! `RtPlatform` as an `ApiPlatform`: the platform over metal2vulkan-rt
+//! `RtPlatform` as an `ApiPlatform`: the platform over metal2vulkan-runtime
 //! (`reims_vgpu_vulkan::rt_platform`), built piece by piece. A piece not built yet is a counted,
 //! typed refusal there. A graphics device's start makes the process's rt device and answers the
 //! guest's device info from it; the guest's work is refused at each unbuilt piece it reaches.
@@ -92,7 +92,7 @@ impl ApiPlatform for RtPlatform {
         texture.read_pixels(dst, bytes_per_row);
     }
 
-    /// rt's image for views (`RtObj::<RtDevice>::new_texture_for_views`, metal2vulkan-rt's
+    /// rt's image for views (`RtObj::<RtDevice>::new_texture_for_views`, metal2vulkan-runtime's
     /// `Device::new_texture_for_views`): it takes no index, and the guest's textures over the
     /// shape are its views at their own. Nil where rt refuses it, counted.
     fn shape_image(

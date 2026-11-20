@@ -554,7 +554,7 @@ do_ship() {
     git -C "$qb" bundle create -q "$S/lg/ship/qemu.bundle" refs/heads/lane-gate ${nots[@]+"${nots[@]}"}
   fi
   rm -rf "$qb"
-  m2v=$(grep -m1 -o -E '^metal2vulkan-rt = .*rev = "[0-9a-f]+"' "$TREE/Cargo.toml" | grep -o -E '[0-9a-f]{40}' || echo unknown)
+  m2v=$(grep -m1 -o -E '^metal2vulkan-runtime = .*rev = "[0-9a-f]+"' "$TREE/Cargo.toml" | grep -o -E '[0-9a-f]{40}' || echo unknown)
   echo "$m2v" > "$RUN/m2v"
   # The signed bundle RgfxGate carries, so that a fixer can build an RgfxGate of exactly the tip's.
   cdhash=$(codesign -dvvv "$TREE/guest/bundle/build/package/reims-graphics.bundle" 2>&1 | sed -n 's/^CDHash=//p')

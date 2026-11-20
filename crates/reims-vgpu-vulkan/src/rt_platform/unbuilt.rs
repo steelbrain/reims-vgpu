@@ -28,7 +28,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::types::NsErrorText;
 use crate::core::sync::Mutex;
@@ -231,7 +231,7 @@ pub fn refused_error(piece: Unbuilt, sel: &'static str) -> NsErrorText {
 /// The line of the process's first refusal of `piece`, at `sel`.
 fn refusal_line(piece: Unbuilt, sel: &'static str) -> String {
     format!(
-        "reims-vgpu: {sel}: {} is not built on metal2vulkan-rt; refused ({}), the first of its \
+        "reims-vgpu: {sel}: {} is not built on metal2vulkan-runtime; refused ({}), the first of its \
          kind\n",
         piece.what(),
         piece.code()
@@ -378,11 +378,11 @@ fn detail_line(
     let code = RtRefusal::of(error).code();
     match what {
         Some(what) => format!(
-            "reims-vgpu: {sel}: metal2vulkan-rt refused it ({error}); the first of {name} \
+            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({error}); the first of {name} \
              ({code}): {what}\n"
         ),
         None => format!(
-            "reims-vgpu: {sel}: metal2vulkan-rt refused it ({error}); the first of {name} \
+            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({error}); the first of {name} \
              ({code})\n"
         ),
     }
@@ -395,7 +395,7 @@ pub fn refused_as(sel: &'static str, kind: RtRefusal, why: &dyn std::fmt::Displa
     count_refusal(kind);
     if first(&SAID_RT, kind.at()) {
         say(&format!(
-            "reims-vgpu: {sel}: metal2vulkan-rt refused it ({why}); refused ({}), the first of \
+            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({why}); refused ({}), the first of \
              its kind\n",
             kind.code()
         ));
@@ -443,7 +443,7 @@ pub fn rt_refused_texture(sel: &'static str, error: &rt::Error) -> RtRefusal {
     super::diag::refusal(error);
     if first {
         say(&format!(
-            "reims-vgpu: {sel}: metal2vulkan-rt refused it ({error}); refused ({code}), the first \
+            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({error}); refused ({code}), the first \
              of its format\n"
         ));
     }
@@ -467,7 +467,7 @@ pub fn rt_refused_imageblock(sel: &'static str, error: &rt::Error) {
     super::diag::refusal(error);
     if !SAID_IMAGEBLOCK.swap(true, Ordering::Relaxed) {
         say(&format!(
-            "reims-vgpu: {sel}: metal2vulkan-rt refused it ({error}); refused \
+            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({error}); refused \
              ({IMAGEBLOCK_LENGTH}), the first of its kind\n"
         ));
     }
@@ -508,7 +508,7 @@ fn heap_texture_place(sel: &'static str, error: &rt::Error) -> Option<RtRefusal>
     }
     if !SAID_HEAP_PLACE.swap(true, Ordering::Relaxed) {
         say(&format!(
-            "reims-vgpu: {sel}: metal2vulkan-rt refused it ({error}), where Metal places it; \
+            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({error}), where Metal places it; \
              refused ({HEAP_TEXTURE_PLACE}), the first of its kind\n"
         ));
     }
@@ -781,7 +781,7 @@ mod tests {
         assert_eq!(
             detail_line("newTextureWithDescriptor:", &samples, &name, Some(&what)),
             format!(
-                "reims-vgpu: newTextureWithDescriptor:: metal2vulkan-rt refused it ({samples}); \
+                "reims-vgpu: newTextureWithDescriptor:: metal2vulkan-runtime refused it ({samples}); \
                  the first of Limit-TextureSamples (rt-refused-limit): a texture of format 70\n"
             )
         );
@@ -795,7 +795,7 @@ mod tests {
                 "Draw-Points",
                 None
             ),
-            "reims-vgpu: drawPrimitives:vertexStart:vertexCount:: metal2vulkan-rt refused it (a \
+            "reims-vgpu: drawPrimitives:vertexStart:vertexCount:: metal2vulkan-runtime refused it (a \
              draw with Points is not built); the first of Draw-Points (rt-refused-gap)\n"
         );
         let kind = "test-first-named";
@@ -809,7 +809,7 @@ mod tests {
         assert_eq!(
             refusal_line(Unbuilt::Buffer, "newBufferWithDescriptor:"),
             "reims-vgpu: newBufferWithDescriptor:: a Private buffer of bytes is not built on \
-             metal2vulkan-rt; refused (rt-unbuilt-buffer), the first of its kind\n"
+             metal2vulkan-runtime; refused (rt-unbuilt-buffer), the first of its kind\n"
         );
     }
 }

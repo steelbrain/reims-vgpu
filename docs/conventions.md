@@ -31,7 +31,7 @@ repeats the ones code cites.
   splitting cannot be avoided, and keeps its `cfg`s to a few whole items;
   index files that pick modules are exempt.
 - **The Vulkan platform** (`RtPlatform`) answers as Metal does through
-  metal2vulkan-rt, and these rules decide where its code goes and how it
+  metal2vulkan-runtime, and these rules decide where its code goes and how it
   gets fast:
   - **GPU memory is the runtime's.** rt allocates it, and the device maps
     its host-visible blocks into the guest: the pool's blocks and the

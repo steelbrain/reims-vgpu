@@ -1,4 +1,4 @@
-//! The sampler IDs of the pipeline states made on metal2vulkan-rt.
+//! The sampler IDs of the pipeline states made on metal2vulkan-runtime.
 //!
 //! rt's creation of a pipeline state (`Device::new_compute_pipeline_state`,
 //! `Device::new_render_pipeline_state`) lowers the state's functions, then hands its consumer the
@@ -26,7 +26,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
-use metal2vulkan_rt::{
+use metal2vulkan_runtime::{
     ComputePipelineDescriptor, ComputePipelineState, Device, Error, IndexClass, IndexGrant,
     NumberedSampler, Refusal, RenderPipelineDescriptor, RenderPipelineState,
 };

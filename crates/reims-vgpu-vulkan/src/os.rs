@@ -92,8 +92,8 @@ pub(crate) use macos::rt_instance;
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn rt_instance(
     extensions: &[&std::ffi::CStr],
-) -> Result<metal2vulkan_rt::Instance, metal2vulkan_rt::Error> {
-    metal2vulkan_rt::Instance::new(extensions)
+) -> Result<metal2vulkan_runtime::Instance, metal2vulkan_runtime::Error> {
+    metal2vulkan_runtime::Instance::new(extensions)
 }
 
 /// The user's cache directory, where the library keeps for the host's later processes what they

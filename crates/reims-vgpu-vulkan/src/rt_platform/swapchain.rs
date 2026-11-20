@@ -55,7 +55,7 @@
 //! take or the present, and the window's draws end ([`Acquired::Failed`]).
 
 use ash::{khr, vk};
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::long_waits;
 use crate::core::platform::Handle as _;

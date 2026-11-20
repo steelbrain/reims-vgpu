@@ -1,4 +1,4 @@
-//! The `Platform` implementation over metal2vulkan-rt, a Metal-shaped runtime on Vulkan
+//! The `Platform` implementation over metal2vulkan-runtime, a Metal-shaped runtime on Vulkan
 //! (architecture D1): the library's only platform, [`RtPlatform`], on the host's Vulkan driver on
 //! Linux and Windows, and on macOS on Mesa's KosmicKrisp.
 //!
@@ -15,7 +15,7 @@
 //!   Windows this crate's own.
 //! - **A display window's swapchain**: what the rt platform's swapchain
 //!   (`rt_platform::swapchain`) takes of the window system's rules (`swapchain`).
-//! - **metal2vulkan-rt's seam** ([`seam`]): our side of rt's contract.
+//! - **metal2vulkan-runtime's seam** ([`seam`]): our side of rt's contract.
 //! - **The device's choice** ([`device_choice`]), the recorder ([`recorder`]) and the process's
 //!   exit gate ([`exit_gate`]).
 //! - **The host GPU's render node** (`host_gpus`, on Linux), which the device's VA-API video

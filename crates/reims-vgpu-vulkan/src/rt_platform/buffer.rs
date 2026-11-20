@@ -204,7 +204,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::host::HostPtr;
 use crate::core::num::{ToU64 as _, ToUsize as _};
@@ -460,7 +460,7 @@ const MANAGED: u64 = 1;
 /// `MTLTextureType2D`.
 const TEXTURE_TYPE_2D: u64 = 2;
 
-/// `id<MTLBuffer>` on metal2vulkan-rt: rt's buffer and what the platform answers of it.
+/// `id<MTLBuffer>` on metal2vulkan-runtime: rt's buffer and what the platform answers of it.
 pub struct RtBuffer {
     /// rt's buffer: a deferred one's from its first use (the module's docs, "Deferred memory").
     rt: OnceLock<rt::Buffer>,
@@ -641,7 +641,7 @@ fn deferred_refused(length: u64) -> ! {
             call: DEFERRED_SEL,
         },
         &format!(
-            "metal2vulkan-rt refused the memory of a deferred buffer of {length} bytes at a use \
+            "metal2vulkan-runtime refused the memory of a deferred buffer of {length} bytes at a use \
              that answers no refusal ({DEFERRED_REFUSED_CODE})"
         ),
     )
@@ -1789,7 +1789,7 @@ fn by_dma_buf(
         return import_refused(sel, kind, len, error);
     }
     count_refused(kind, len);
-    let why = format!("metal2vulkan-rt refused their pointer: {error}");
+    let why = format!("metal2vulkan-runtime refused their pointer: {error}");
     copied(device, sel, codes, (at, len), then, &why, false, |_| {
         rt_refused_create(sel, error);
     })
@@ -1819,7 +1819,7 @@ impl DmaBufNo {
         match self {
             DmaBufNo::TooLarge { .. } => "more runs or bytes than one dma-buf holds".to_owned(),
             DmaBufNo::Refused => "the host made no dma-buf of them".to_owned(),
-            DmaBufNo::Rt(error) => format!("metal2vulkan-rt refused it: {error}"),
+            DmaBufNo::Rt(error) => format!("metal2vulkan-runtime refused it: {error}"),
         }
     }
 }
@@ -1906,7 +1906,7 @@ fn dma_bufs(
     too_large: DmaBufNo,
 ) -> Result<(rt::Block, u64), DmaBufNo> {
     let Some(granule) = device.rt().dma_buf_granule() else {
-        let why = "metal2vulkan-rt binds no dma-bufs behind one buffer here";
+        let why = "metal2vulkan-runtime binds no dma-bufs behind one buffer here";
         dma_bufs_refused(sel, 0, &why);
         return Err(too_large);
     };
@@ -1950,7 +1950,7 @@ fn dma_bufs(
         }
         Err(error @ rt::Error::Quiesced) => Err(DmaBufNo::Rt(error)),
         Err(error) => {
-            let why = format!("metal2vulkan-rt refused {count} of {bytes} bytes: {error}");
+            let why = format!("metal2vulkan-runtime refused {count} of {bytes} bytes: {error}");
             dma_bufs_refused(sel, 2, &why);
             Err(too_large)
         }
@@ -2011,7 +2011,7 @@ fn both_refused(sel: &'static str, dma_buf: &rt::Error, pointer: &rt::Error) {
     if !BOTH_REFUSED_SAID.swap(true, Ordering::Relaxed) {
         log::info!(
             target: TARGET,
-            "{sel}: metal2vulkan-rt refused both a dma-buf of the pages of a no-copy buffer or \
+            "{sel}: metal2vulkan-runtime refused both a dma-buf of the pages of a no-copy buffer or \
              heap ({dma_buf}) and their pointer ({pointer}); each such import is counted from \
              here ({IMPORTS_DMA_BUF_AND_POINTER_REFUSED})"
         );
@@ -2255,7 +2255,7 @@ pub(super) fn unpinned(sel: &'static str, pin: u64) {
         log::warn!(
             target: TARGET,
             "{sel}: the guest pinned it at {pin:#x}, in no block the device knows, so it lies at \
-             metal2vulkan-rt's address, which the guest's pointers to it do not hold \
+             metal2vulkan-runtime's address, which the guest's pointers to it do not hold \
              ({UNPINNED_CODE}), counted from here"
         );
     }

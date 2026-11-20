@@ -41,7 +41,7 @@ use crate::core::platform::values::{
 use crate::core::platform::{Handle, Platform};
 use crate::core::raise::{OnFault, Raise, RaiseResult};
 use crate::core::sync::{Mutex, MutexGuard};
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use super::diag::{Point, Target};
 use super::tiled::Tiled;

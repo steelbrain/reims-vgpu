@@ -20,7 +20,7 @@
 
 use std::time::Duration;
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 /// The metrics a part read last, to tell what rose since.
 #[derive(Default)]

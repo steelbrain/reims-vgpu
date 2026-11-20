@@ -1,5 +1,5 @@
 //! [`HostBlocks`]: a [`BlockSource`] of the process's own memory, which hands blocks out, keeps
-//! them ready and frees them as metal2vulkan-rt's device does, until the pool takes its blocks from
+//! them ready and frees them as metal2vulkan-runtime's device does, until the pool takes its blocks from
 //! that runtime: then only the source changes.
 //!
 //! Each block is zeroed memory of the process's, aligned to 2 MiB and touched a byte a page before

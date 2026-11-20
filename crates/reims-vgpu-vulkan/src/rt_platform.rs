@@ -1,4 +1,4 @@
-//! The library's platform over metal2vulkan-rt: [`RtPlatform`], core's [`Platform`] over rt's
+//! The library's platform over metal2vulkan-runtime: [`RtPlatform`], core's [`Platform`] over rt's
 //! public API, and reims-vgpu's `DefaultPlatform`.
 //!
 //! **Built piece by piece**, in the order a guest's boot reaches the pieces: the device and its
@@ -67,7 +67,7 @@ use std::mem::ManuallyDrop;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::num::ToU64 as _;
 use crate::core::platform::os::Threads;
@@ -173,11 +173,11 @@ const TARGET: &str = "reims_vgpu_vulkan::rt_platform";
 /// ([`RtPlatform::let_go_of_device`]).
 pub const POLL: Duration = Duration::from_millis(1);
 
-/// The process's platform over metal2vulkan-rt (the module's docs): the OS's VM, clocks and
+/// The process's platform over metal2vulkan-runtime (the module's docs): the OS's VM, clocks and
 /// threads, the process's one rt device once asked for, and rt's objects as its pieces are built.
 ///
 /// **Its device goes before the exit.** The release of the last graphics device lets go of the
-/// device ([`RtPlatform::let_go_of_device`]), which rt then tears down, as metal2vulkan-rt's
+/// device ([`RtPlatform::let_go_of_device`]), which rt then tears down, as metal2vulkan-runtime's
 /// contract asks of a process that exits: it drops the device's last handle first, and a process
 /// that cannot quiesces and ends with `_exit` (its README, "Quiesce and exit"; on NVIDIA's driver
 /// an exit with a device live that ran work can end in `SIGSEGV` inside the driver's exit
@@ -228,7 +228,7 @@ impl Default for RtPlatform {
 const DROP_LET_GO: Duration = Duration::from_secs(5);
 
 /// A platform that drops lets go of its device first ([`RtPlatform::let_go_of_device`]), so that
-/// rt's teardown of it has ended when the drop returns. metal2vulkan-rt's README (Teardown):
+/// rt's teardown of it has ended when the drop returns. metal2vulkan-runtime's README (Teardown):
 /// "Every gauge reads zero only once the `VkDevice` is destroyed, so a consumer whose last handle
 /// dropped in a handler waits for that before it drops its instance or exits." Where the
 /// device's last handle goes in a shared event's notification or a command buffer's handler, on
@@ -417,10 +417,10 @@ impl Platform for RtPlatform {
     type Texture = RtObj<RtTexture>;
     type Heap = RtObj<RtHeap>;
     type SamplerState = RtObj<RtSampler>;
-    type DepthStencilState = RtObj<metal2vulkan_rt::DepthStencilState>;
-    type Fence = RtObj<metal2vulkan_rt::Fence>;
-    type Event = RtObj<metal2vulkan_rt::Event>;
-    type SharedEvent = RtObj<metal2vulkan_rt::SharedEvent>;
+    type DepthStencilState = RtObj<metal2vulkan_runtime::DepthStencilState>;
+    type Fence = RtObj<metal2vulkan_runtime::Fence>;
+    type Event = RtObj<metal2vulkan_runtime::Event>;
+    type SharedEvent = RtObj<metal2vulkan_runtime::SharedEvent>;
     type SharedEventListener = RtObj<Listener>;
     type SharedTextureHandle = Unmade<kinds::SharedTextureHandle>;
     type Library = RtObj<RtLibrary>;
@@ -562,7 +562,7 @@ impl Platform for RtPlatform {
     /// end. Nothing is freed. True where the steps ended in time and no device of rt's lives:
     /// none was made, or the release of the last graphics device let go of it
     /// ([`RtPlatform::let_go_of_device`]). False where one lives, quiesced or not, since rt
-    /// supports no `exit()` with a device live (metal2vulkan-rt's README, "Quiesce and exit"),
+    /// supports no `exit()` with a device live (metal2vulkan-runtime's README, "Quiesce and exit"),
     /// and where a step outlasted the wait, which it warns of.
     fn quiesce(&self, bound: Duration) -> bool {
         let until = self.clock.now_mono().saturating_add(bound);

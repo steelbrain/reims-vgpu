@@ -13,7 +13,7 @@
 //! - every struct the host writes starts with `struct_size` ([`sized`]);
 //! - every callback table has one `ctx` and one `destroy` ([`table`]).
 //!
-//! The exports are made over [`Plat`]: `RtPlatform`, over metal2vulkan-rt, on the host's Vulkan
+//! The exports are made over [`Plat`]: `RtPlatform`, over metal2vulkan-runtime, on the host's Vulkan
 //! driver on Linux and Windows and on Mesa's KosmicKrisp on macOS; and core's testkit platform in this crate's unit tests, which then run the
 //! product's code.
 
@@ -51,7 +51,7 @@ pub use status::RvgStatus;
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// The platform every handle is made on: the platform over metal2vulkan-rt (architecture 2.2)
+/// The platform every handle is made on: the platform over metal2vulkan-runtime (architecture 2.2)
 /// (`reims_vgpu::DefaultPlatform`).
 #[cfg(not(test))]
 pub(crate) type Plat = reims_vgpu::DefaultPlatform;

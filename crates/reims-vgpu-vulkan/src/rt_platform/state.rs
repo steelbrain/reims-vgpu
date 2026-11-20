@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::Handle;
 use crate::core::platform::resource::{DepthStencilState, SamplerState};
@@ -38,7 +38,7 @@ const SAMPLER: &str = "newSamplerStateWithDescriptor:";
 /// `newDepthStencilStateWithDescriptor:`.
 const DEPTH_STENCIL: &str = "newDepthStencilStateWithDescriptor:";
 
-/// `id<MTLSamplerState>` on metal2vulkan-rt.
+/// `id<MTLSamplerState>` on metal2vulkan-runtime.
 pub struct RtSampler {
     /// rt's state.
     rt: rt::SamplerState,

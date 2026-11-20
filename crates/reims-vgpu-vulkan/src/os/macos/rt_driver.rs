@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use ash::vk;
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 /// The log target.
 const TARGET: &str = "reims_vgpu_vulkan::rt_platform";

@@ -22,7 +22,7 @@ library's `reims-vgpu.ui` on Linux and Windows.
 | layer | crate | what it is |
 |---|---|---|
 | core | `reims-vgpu-vulkan`'s `core` | the platform traits, the runtime (threads, queues, holds), raises and deaths, the display's present pipeline, guest memory and the fake platform the tests run on |
-| platform | `reims-vgpu-vulkan` | core's `Platform`: `RtPlatform`, over metal2vulkan-rt, on the host's Vulkan driver on Linux and Windows, and on macOS on Mesa's KosmicKrisp |
+| platform | `reims-vgpu-vulkan` | core's `Platform`: `RtPlatform`, over metal2vulkan-runtime, on the host's Vulkan driver on Linux and Windows, and on macOS on Mesa's KosmicKrisp |
 | window | `reims-vgpu-window` | a display's own window (AppKit's or SDL3's on macOS, SDL3's on Linux and Windows), its input and the host's screens; it knows nothing of devices |
 | device | `reims-vgpu-graphics` | the wire: the records, rings and registers the guest and the host share, and the C header the guest's kexts and the option ROM compile |
 | Rust API | `reims-vgpu` | the graphics device over the platform: its rings, decoder, display and window, and owned Rust types for its config and callbacks |
@@ -189,7 +189,7 @@ submitted and the rest ends unrun, the GPU completes what was submitted, and the
 end. Every wait ends within the call's bound, and nothing is freed. It answers true where the steps
 ended in time and the library holds no GPU device the exit could meet: none was opened in the
 process, or the release of the last graphics device let go of it. It answers false otherwise,
-quiesced or not, and where a step outlasted the wait, since metal2vulkan-rt supports an `exit` with
+quiesced or not, and where a step outlasted the wait, since metal2vulkan-runtime supports an `exit` with
 a device live on no device (its README, "Quiesce and exit"): on an RTX 3090 (620.70.06), 3 of 9
 power-offs that called `exit` after the quiesce stopped everything in time ended with `SIGSEGV` in a
 thread of the driver's own while its exit handler waited on a lock. On false the library writes its
@@ -332,7 +332,7 @@ Rust enum; the handle is a Rust struct cbindgen emits as opaque; the configs are
 
 `reims-vgpu` is the device; the C API wraps it one to one. Its rustdoc is the reference:
 - `GraphicsDevice<P = DefaultPlatform>`, made by `GraphicsDevice::new(GraphicsConfig)` on the
-  default platform (`RtPlatform`, over metal2vulkan-rt) or `with_platform`, so its
+  default platform (`RtPlatform`, over metal2vulkan-runtime) or `with_platform`, so its
   forwarding is unit-tested on core's fake platform;
 - `GraphicsConfig`: `GraphicsCallbacks` (closures, `Arc<dyn Fn … + Send + Sync>`, each optional),
   an optional `WindowConfig`, the display count and the windows of displays 1 and up, an optional

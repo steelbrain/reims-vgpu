@@ -43,7 +43,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::num::{ToU64 as _, ToUsize as _};
 use crate::core::platform::Handle as _;

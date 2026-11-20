@@ -1,4 +1,4 @@
-//! The rt platform's device ([`RtDevice`]): one metal2vulkan-rt device for the process, made of
+//! The rt platform's device ([`RtDevice`]): one metal2vulkan-runtime device for the process, made of
 //! the physical device the library's choice of device picks ([`open`]), with its answers
 //! (`super::answers`), its command queues (`super::queue`), its buffers (`super::buffer`), heaps
 //! (`super::heap`) and the blocks it knows ([`KnownBlocks`]), its textures (`super::texture`),
@@ -47,7 +47,7 @@
 use std::sync::{Arc, OnceLock};
 
 use ash::vk;
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::caps::{DeviceCaps, IdentityCaps, SAMPLE_COUNTS};
 use crate::core::platform::device::{GpuDevice, NoCopyDeallocator};
@@ -185,7 +185,7 @@ pub(crate) const SHADER_CACHE_CAPACITY: u64 = 25 << 30;
 #[cfg(any(test, feature = "testkit"))]
 pub(crate) const SHADER_CACHE_CAPACITY: u64 = 1 << 30;
 
-/// `id<MTLDevice>` on metal2vulkan-rt: rt's device and what the platform read of it.
+/// `id<MTLDevice>` on metal2vulkan-runtime: rt's device and what the platform read of it.
 pub struct RtDevice {
     /// rt's device.
     rt: rt::Device,

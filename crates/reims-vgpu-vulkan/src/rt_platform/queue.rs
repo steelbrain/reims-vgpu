@@ -1,7 +1,7 @@
 //! The rt platform's command queue ([`RtQueue`]): rt's queue, whose `commandBuffer` makes rt's
 //! command buffers ([`super::command`]).
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::command::CommandQueue;
 use crate::core::platform::{Handle, Platform};
@@ -12,7 +12,7 @@ use super::device::RtDevice;
 use super::unbuilt::rt_refused_create;
 use super::{RtObj, RtPlatform};
 
-/// `id<MTLCommandQueue>` on metal2vulkan-rt.
+/// `id<MTLCommandQueue>` on metal2vulkan-runtime.
 pub struct RtQueue {
     /// rt's queue.
     rt: rt::CommandQueue,

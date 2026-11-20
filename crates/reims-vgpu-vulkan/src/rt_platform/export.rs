@@ -45,7 +45,7 @@
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::resource::ExportedMemory;
 
@@ -88,7 +88,7 @@ fn refused(sel: &'static str, why: &dyn std::fmt::Display) {
         log::warn!(
             target: TARGET,
             kind:% = EXPORT_REFUSED_CODE;
-            "{sel}: metal2vulkan-rt makes no exportable buffer ({why}); the buffer is made as any \
+            "{sel}: metal2vulkan-runtime makes no exportable buffer ({why}); the buffer is made as any \
              other, and the host's video lands its pictures another way ({EXPORT_REFUSED_CODE}), \
              counted from here"
         );

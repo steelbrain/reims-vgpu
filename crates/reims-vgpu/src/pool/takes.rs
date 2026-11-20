@@ -92,7 +92,7 @@
 //! # Its GPU address
 //!
 //! Each carve has a GPU address from its carving, which its take's answer gives the guest
-//! (`POOL_ADDRESSES`): where its piece's block has one (metal2vulkan-rt's), the block's address
+//! (`POOL_ADDRESSES`): where its piece's block has one (metal2vulkan-runtime's), the block's address
 //! at the carve's offset in it, so a heap the guest places there is a range of the block; where it
 //! has none (`HostBlocks`), the host's pick ([`super::addresses`]), freed with the carve. A carve
 //! with no room left for its pick is not carved, as one with no room in a piece.

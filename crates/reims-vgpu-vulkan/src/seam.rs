@@ -1,4 +1,4 @@
-//! Our side of metal2vulkan-rt's seam: what the Vulkan platform gives rt, built on rt at the commit
+//! Our side of metal2vulkan-runtime's seam: what the Vulkan platform gives rt, built on rt at the commit
 //! the workspace pins. Its tests run it on the GPU each test host holds, but on the Mac: rt's floor
 //! refuses MoltenVK (it lacks `nullDescriptor`), and the tests have not run on KosmicKrisp.
 //!
@@ -23,7 +23,7 @@ pub use testkit::test_device;
 
 #[cfg(any(test, feature = "testkit"))]
 mod testkit {
-    use metal2vulkan_rt::{Device, DeviceOptions, Instance, PhysicalDevice};
+    use metal2vulkan_runtime::{Device, DeviceOptions, Instance, PhysicalDevice};
 
     /// The variables that name the host's pick of GPU, in the order they are read, as the
     /// platform's device choice reads them (`crate::device_choice`): `vendor:device` in hex, with

@@ -48,7 +48,7 @@ use metal2vulkan::pipeline::{
     PrivateRenderState, TessellationDescriptor, VertexAttributeDescriptor,
     VertexBufferLayoutDescriptor,
 };
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::resource::{RenderFunction, RenderPipeline};
 use crate::core::platform::types::{MtlSize, NsErrorText};
@@ -81,7 +81,7 @@ const IMAGEBLOCK_SAMPLE_LENGTH: &str = "imageblockSampleLength";
 /// `MTLBufferLayoutStrideDynamic`: a layout whose stride the encoder binds the buffer with.
 const STRIDE_DYNAMIC: u64 = u64::MAX;
 
-/// `id<MTLRenderPipelineState>` on metal2vulkan-rt.
+/// `id<MTLRenderPipelineState>` on metal2vulkan-runtime.
 pub struct RtRenderPipeline {
     /// rt's state. Declared before `lease`, so it goes first, as a compute state's.
     rt: rt::RenderPipelineState,

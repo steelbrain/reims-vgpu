@@ -82,7 +82,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::num::{ToU64 as _, ToUsize as _};
 use crate::core::platform::Handle as _;
@@ -202,7 +202,7 @@ pub(super) const NON_VOLATILE: u64 = 2;
 /// `MTLPurgeableStateEmpty`, the last state.
 const EMPTY: u64 = 4;
 
-/// `id<MTLTexture>` on metal2vulkan-rt: rt's texture and what the platform answers of it beyond
+/// `id<MTLTexture>` on metal2vulkan-runtime: rt's texture and what the platform answers of it beyond
 /// rt's descriptor.
 pub struct RtTexture {
     /// rt's texture.
@@ -1480,7 +1480,7 @@ fn counted_copy(bytes: usize) {
     if !COPIED.swap(true, Ordering::Relaxed) {
         log::warn!(
             target: "reims_vgpu_vulkan::rt_platform",
-            "{REPLACE}: the guest's bytes are copied before metal2vulkan-rt takes them, a copy \
+            "{REPLACE}: the guest's bytes are copied before metal2vulkan-runtime takes them, a copy \
              Metal does not make ({COPY_CODE}), counted from here"
         );
     }

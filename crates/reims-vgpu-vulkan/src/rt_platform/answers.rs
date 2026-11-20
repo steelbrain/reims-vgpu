@@ -24,7 +24,7 @@
 //!   float filtering and MSAA), and no for what rt has none of (dynamic libraries, function
 //!   pointers, ray tracing);
 //! - no sparse tile answers: rt has no sparse textures;
-//! - `maxBufferLength` is rt's [`MAX_BUFFER_LENGTH`](metal2vulkan_rt::MAX_BUFFER_LENGTH), and
+//! - `maxBufferLength` is rt's [`MAX_BUFFER_LENGTH`](metal2vulkan_runtime::MAX_BUFFER_LENGTH), and
 //!   `maxArgumentBufferSamplerCount` the indices of rt's sampler class;
 //! - the linear texture alignments (the device's, an IOSurface's, a linear texture's) are the
 //!   largest of rt's `minimumLinearTextureAlignmentForPixelFormat:` answers, as the runtime's were
@@ -184,7 +184,7 @@ pub fn registry_id(uuid: &[u8; vk::UUID_SIZE]) -> u64 {
 /// `maxArgumentBufferSamplerCount`: the indices of rt's sampler class, each of which a sampler
 /// state an argument buffer names takes.
 fn sampler_count() -> u64 {
-    let range = metal2vulkan_rt::IndexClass::Sampler.range();
+    let range = metal2vulkan_runtime::IndexClass::Sampler.range();
     u64::from(range.end.saturating_sub(range.start))
 }
 
@@ -198,7 +198,7 @@ const LINEAR_ALIGNMENT: &str = "minimumLinearTextureAlignmentForPixelFormat:";
 
 /// The raise of `minimumLinearTextureAlignmentForPixelFormat:` of BGRA8 where rt refuses it.
 fn bgra8_refused() -> Raise {
-    Raise::platform(LINEAR_ALIGNMENT).with_detail("metal2vulkan-rt refused BGRA8Unorm")
+    Raise::platform(LINEAR_ALIGNMENT).with_detail("metal2vulkan-runtime refused BGRA8Unorm")
 }
 
 /// The device's capabilities: Metal's answers ([`metal`]), held to `facts`' Vulkan limits where
@@ -335,7 +335,7 @@ pub fn identity(
             .collect(),
         sizes: IdentitySizes {
             recommended_max_working_set_size: Some(facts.device_local),
-            max_buffer_length: Some(metal2vulkan_rt::MAX_BUFFER_LENGTH),
+            max_buffer_length: Some(metal2vulkan_runtime::MAX_BUFFER_LENGTH),
             max_argument_buffer_sampler_count: Some(sampler_count()),
             argument_buffers_support: Some(metal::ARGUMENT_BUFFERS_TIER),
             read_write_texture_support: Some(metal::READ_WRITE_TEXTURE_TIER),

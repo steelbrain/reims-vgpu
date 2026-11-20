@@ -8,7 +8,7 @@
 //! (`Gap::TextureFormat`). A level's layout is computed from the description by the rule rt
 //! fitted to Metal's answers. Neither asks Vulkan anything.
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::types::{PixelFormatInfo, TextureLevelInfo, TextureLevelQuery};
 

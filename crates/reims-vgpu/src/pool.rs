@@ -25,7 +25,7 @@
 //! A new piece is empty: nothing of the guest's lies in it. The guest's processes take blocks of
 //! the pool and give them back (`takes`): a piece is used from its first block's take and empty
 //! again once its last block went back. The pool keeps [`HEADROOM`] bytes of empty pieces as
-//! headroom, each [`BLOCK_LEN`] long, metal2vulkan-rt's unit: where the guest's use of a piece
+//! headroom, each [`BLOCK_LEN`] long, metal2vulkan-runtime's unit: where the guest's use of a piece
 //! leaves the empty pieces, with the asks for more pool no take waits on, fewer bytes than that,
 //! the pool asks for a block more for each piece short ([`State::keep_headroom`]). It keeps them
 //! from the moment the guest's driver takes the pool (`PoolLedger::keep_headroom`), before any
@@ -54,7 +54,7 @@
 //!
 //! # The block source
 //!
-//! [`BlockSource`] is metal2vulkan-rt's block calls as its API names them (`Device::take_block`,
+//! [`BlockSource`] is metal2vulkan-runtime's block calls as its API names them (`Device::take_block`,
 //! `release_block`, [`BlockInfo`]). On the rt platform the source is the runtime's blocks
 //! ([`rt_blocks::RtBlocks`], the platform's `ApiPlatform::block_source`), each known to its device
 //! while handed out. A platform that gives none (the testkit's) takes [`HostBlocks`], blocks of
@@ -179,7 +179,7 @@ pub const TAKE_WAIT_CODES: [(&str, &str); 4] = [
 
 /// The length of each piece the pool asks for as headroom (the module doc's "Headroom and giving
 /// blocks back"), and of every block [`HostBlocks`] hands out for an ask no longer:
-/// metal2vulkan-rt's unit, the length of the Shared allocations its block maker makes ahead of
+/// metal2vulkan-runtime's unit, the length of the Shared allocations its block maker makes ahead of
 /// need ([`MemoryClass::block_len`], 16 MiB), read from rt.
 ///
 /// rt hands out a block of the length asked, rounded up to 64 KiB. A take of up to a unit is the
@@ -199,8 +199,8 @@ pub const TAKE_WAIT_CODES: [(&str, &str); 4] = [
 /// took nothing longer than 16 MiB and carved at most 73 MiB at once outside the benchmarks
 /// (**measured**, 11-19).
 ///
-/// [`MemoryClass::block_len`]: metal2vulkan_rt::MemoryClass::block_len
-pub const BLOCK_LEN: u64 = metal2vulkan_rt::MemoryClass::Shared.block_len();
+/// [`MemoryClass::block_len`]: metal2vulkan_runtime::MemoryClass::block_len
+pub const BLOCK_LEN: u64 = metal2vulkan_runtime::MemoryClass::Shared.block_len();
 
 /// The bytes of empty pieces the pool keeps ahead of the guest's takes, its headroom (the module
 /// doc's "Headroom and giving blocks back"): 64 MiB, in pieces of [`BLOCK_LEN`]. On an RTX 3090
@@ -217,11 +217,11 @@ pub const PIECE_ALIGN: u64 = 2 << 20;
 /// source (the module doc's "Headroom and giving blocks back").
 pub const RELEASE_DELAY: Duration = Duration::from_secs(5);
 
-/// A block's storage mode as the guest's buffers in it see it (metal2vulkan-rt's `MemoryClass`).
+/// A block's storage mode as the guest's buffers in it see it (metal2vulkan-runtime's `MemoryClass`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[allow(
     dead_code,
-    reason = "metal2vulkan-rt's shape, kept whole so only the source changes when it lands"
+    reason = "metal2vulkan-runtime's shape, kept whole so only the source changes when it lands"
 )]
 pub enum MemoryClass {
     /// Device-local, never mapped, no host pointer.
@@ -230,7 +230,7 @@ pub enum MemoryClass {
     Shared,
 }
 
-/// A block's number, never reused while its source lives (metal2vulkan-rt's `BlockId`).
+/// A block's number, never reused while its source lives (metal2vulkan-runtime's `BlockId`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockId(pub u32);
 
@@ -238,18 +238,18 @@ impl BlockId {
     /// The number.
     #[allow(
         dead_code,
-        reason = "metal2vulkan-rt's shape, kept whole so only the source changes when it lands"
+        reason = "metal2vulkan-runtime's shape, kept whole so only the source changes when it lands"
     )]
     pub fn get(self) -> u32 {
         self.0
     }
 }
 
-/// A block a source handed out (metal2vulkan-rt's `BlockInfo`): plain data.
+/// A block a source handed out (metal2vulkan-runtime's `BlockInfo`): plain data.
 #[derive(Clone, Copy, Debug)]
 #[allow(
     dead_code,
-    reason = "metal2vulkan-rt's shape, kept whole so only the source changes when it lands"
+    reason = "metal2vulkan-runtime's shape, kept whole so only the source changes when it lands"
 )]
 pub struct BlockInfo {
     /// Its number.
@@ -280,7 +280,7 @@ pub enum BlockError {
     NotHeld,
 }
 
-/// Where the pool's blocks come from (metal2vulkan-rt's `Device::take_block` and
+/// Where the pool's blocks come from (metal2vulkan-runtime's `Device::take_block` and
 /// `release_block`).
 pub trait BlockSource: Send + Sync {
     /// A block of `class` at least `len` long ([`BlockInfo::len`]). Waits only when no block is

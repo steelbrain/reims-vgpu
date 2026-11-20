@@ -151,7 +151,7 @@ mod tests {
     use std::process::Command;
     use std::sync::OnceLock;
 
-    use metal2vulkan_rt::{Counters, Gauges};
+    use metal2vulkan_runtime::{Counters, Gauges};
     use reims_vgpu_vulkan::RtPlatform;
     use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
     use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};

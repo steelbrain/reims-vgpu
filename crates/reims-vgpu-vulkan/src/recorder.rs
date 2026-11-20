@@ -915,7 +915,7 @@ impl<T: Send + Sync + 'static> RecObj for crate::rt_platform::RtObj<T> {
 #[derive(Clone)]
 pub enum RawCb {
     /// The rt platform's: rt's.
-    Rt(metal2vulkan_rt::CommandBuffer),
+    Rt(metal2vulkan_runtime::CommandBuffer),
 }
 
 impl RawCb {
@@ -930,8 +930,8 @@ impl RawCb {
 /// Whether rt's command buffer `raw`, which a commit returned from, completed or failed, or never
 /// runs. rt sets the status before it runs the command buffer's handlers; one whose commit rt
 /// refused stays not enqueued, and nothing of it runs, so no capture waits for it.
-fn rt_finished(raw: &metal2vulkan_rt::CommandBuffer) -> bool {
-    use metal2vulkan_rt::CommandBufferStatus as S;
+fn rt_finished(raw: &metal2vulkan_runtime::CommandBuffer) -> bool {
+    use metal2vulkan_runtime::CommandBufferStatus as S;
     matches!(raw.status(), S::Completed | S::Error | S::NotEnqueued)
 }
 

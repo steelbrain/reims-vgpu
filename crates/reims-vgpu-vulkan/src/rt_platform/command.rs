@@ -2,18 +2,18 @@
 //! and handed to rt's submit thread at its commit.
 //!
 //! - **Handlers.** rt runs a command buffer's scheduled handlers on its submit thread before the
-//!   submission goes to the driver (after it, for one that presents a drawable), or on its
-//!   completion thread, for one held at `Committed` for a shared event's value, before it retires;
-//!   and its completed handlers on its completion thread, each kind in the order added. Core's
+//!   submission goes to the driver (after it, for one that presents a drawable), one held at
+//!   `Committed` for a shared event's value among them, once the submit thread stages it; and its
+//!   completed handlers on its completion thread, each kind in the order added. Core's
 //!   submission handlers run before its scheduled handlers, and its completion-seen handlers before
 //!   its completed handlers, whatever the order they were added in: so the command buffer holds
 //!   each kind until its commit, which hands rt one scheduled handler that runs the submission
 //!   handlers and then the scheduled ones, and one completed handler that runs the completion-seen
-//!   handlers and then the completed ones. A submission handler therefore runs on one of those two
-//!   threads of rt's, never inside the commit. A handler added after the commit is Metal's refusal
+//!   handlers and then the completed ones. A submission handler therefore runs on rt's submit
+//!   thread, never inside the commit. A handler added after the commit is Metal's refusal
 //!   (its validation stops it): counted (`rt-refused-metal`), and it never runs.
 //! - **What a completed handler learns**: rt's status and error then, and its GPU times, in
-//!   nanoseconds of rt's host clock (`metal2vulkan_rt::host_time`); none where either is 0,
+//!   nanoseconds of rt's host clock (`metal2vulkan_runtime::host_time`); none where either is 0,
 //!   as for a command buffer that ended with an error. rt's errors are Metal's
 //!   `MTLCommandBufferErrorDomain` codes, as Metal answers its GPU's recovery (measured on the M3
 //!   Max, macOS 27.0.1, the bundle's `rgfxCommandBufferError`): of the work a lost device ends,
@@ -97,7 +97,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::command::{
     CommandBuffer, CompletedHandler, CompletedInfo, EscapedCopies, KeptWhole, PartCut,
@@ -156,7 +156,7 @@ const METRICS_EVERY: u64 = 50_000_000;
 /// command buffer; and rt's metrics, where
 /// they are due ([`trace_metrics`]). The command buffer is named by its address, and numbered in
 /// the order of the commits the trace timed. `cbdone`'s times are rt's (the module's docs, what
-/// a completed handler learns), on rt's host clock (`metal2vulkan_rt::host_time`:
+/// a completed handler learns), on rt's host clock (`metal2vulkan_runtime::host_time`:
 /// `CLOCK_MONOTONIC` on Linux, `CLOCK_MONOTONIC_RAW` on macOS, the performance counter on
 /// Windows), which is the trace's own clock wherever the platform installs it
 /// (`crate::gpu::timing::trace_clock`): each is moved onto the trace's clock by the two clocks'
@@ -331,7 +331,7 @@ fn finished(cb: &rt::CommandBuffer) -> bool {
     )
 }
 
-/// `id<MTLCommandBuffer>` on metal2vulkan-rt.
+/// `id<MTLCommandBuffer>` on metal2vulkan-runtime.
 pub struct RtCommandBuffer {
     /// rt's command buffer.
     rt: rt::CommandBuffer,

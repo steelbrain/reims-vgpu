@@ -6,7 +6,7 @@
 //! **Which clock the platform's times count** is [`PLATFORM`]:
 //! - [`PLATFORM`] is [`Domain::Device`]: the times pass unchanged. The guest reads only a run's
 //!   length (`gpu_end_ns - gpu_start_ns`), which an offset between the clocks leaves as it is.
-//! - metal2vulkan's runtime (`metal2vulkan-rt`) counts `CLOCK_MONOTONIC` on Linux and the
+//! - metal2vulkan's runtime (`metal2vulkan-runtime`) counts `CLOCK_MONOTONIC` on Linux and the
 //!   other Unix systems but macOS, `CLOCK_MONOTONIC_RAW` on macOS and the performance counter on
 //!   Windows (**read**: its `times.rs`, `host_time` and `HOST_DOMAIN`). metal2vulkan's ruling of
 //!   2026-11-18 keeps Linux on `CLOCK_MONOTONIC`, as lavapipe calibrates its GPU clock against no

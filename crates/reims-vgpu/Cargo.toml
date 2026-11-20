@@ -41,8 +41,8 @@ parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
 # The Vulkan platform (architecture 2.2), the library's only one: natively on Linux and Windows,
 # and on macOS over Mesa's KosmicKrisp where the distribution ships it (`os/macos/rt_driver.rs`).
 reims-vgpu-vulkan.workspace = true
-# The platform's runtime, metal2vulkan-rt: the pool's block source over it (`pool::rt_blocks`).
-metal2vulkan-rt.workspace = true
+# The platform's runtime, metal2vulkan-runtime: the pool's block source over it (`pool::rt_blocks`).
+metal2vulkan-runtime.workspace = true
 
 # On Windows, a file's ID and times, which name the library's build (`graphics/answers/windows.rs`),
 # and the lines a fault writes (`faults.rs`): its exception handler, the loader's and the unwind's

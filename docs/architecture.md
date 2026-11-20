@@ -7,7 +7,7 @@ reaches it through.
 The library is the host side of the reims-graphics device (PCI 1234:5247), the GPU our own guest
 drivers (`guest/`) drive in x86-64 macOS guests. The guest's Metal bundle serialises its Metal
 calls onto the device's rings, and the library carries them out on the host's GPU, over
-metal2vulkan-rt, a Metal-shaped runtime on Vulkan: on the host's Vulkan driver on Linux and
+metal2vulkan-runtime, a Metal-shaped runtime on Vulkan: on the host's Vulkan driver on Linux and
 Windows, and on Mesa's KosmicKrisp on a Mac. The device's wire protocol and what the guest sees are
 [graphics-kext/design.md](graphics-kext/design.md); its C API is [api.md](api.md).
 
@@ -68,7 +68,7 @@ table is retired and not reused.
 
 | # | decision | why |
 |---|---|---|
-| D1 | One Cargo workspace at the repository root: the library's crates (`reims-vgpu-vulkan`, `-window`, `reims-vgpu-graphics`, `reims-vgpu`, `-c`), the host video crates (`reims-vgpu-video-*`), and `xtask`. `reims-vgpu-vulkan` is the library's `Platform`, `RtPlatform`, over `metal2vulkan-rt`, a Metal-shaped API on Vulkan: on Linux and Windows on the host's Vulkan driver, and on macOS on Mesa's KosmicKrisp; its module `core` is what the platform and the device share (2.1, 2.2). | Each crate does one job the others cannot without breaking a rule below. |
+| D1 | One Cargo workspace at the repository root: the library's crates (`reims-vgpu-vulkan`, `-window`, `reims-vgpu-graphics`, `reims-vgpu`, `-c`), the host video crates (`reims-vgpu-video-*`), and `xtask`. `reims-vgpu-vulkan` is the library's `Platform`, `RtPlatform`, over `metal2vulkan-runtime`, a Metal-shaped API on Vulkan: on Linux and Windows on the host's Vulkan driver, and on macOS on Mesa's KosmicKrisp; its module `core` is what the platform and the device share (2.1, 2.2). | Each crate does one job the others cannot without breaking a rule below. |
 | D2 | Modules by area and responsibility, not one file per Objective-C class. | The code is Rust; the contract binds behaviour, not file shape. |
 | D3 | Core is generic over one `P: Platform` whose associated types name every Metal object kind. `dyn` only for the host's callbacks, the display executor and the OS services. | A handle flows into another Metal call (a texture into an encoder) with its kind checked at compile time. |
 | D4 | One typed platform method per Metal method the library calls, and one enum variant per encoder and ICB command (`BlitCmd`, `ComputeCmd`, `RenderCmd`, `IcbRenderCmd`, `IcbComputeCmd`), with no table of ops between the caller and Metal. The platform's dispatch is one exhaustive `match` per command family, and it names each call by its selector and raise policy (4.3, 4.6). A call whose position the guest or host observes (a creation, release or retain, an aliasing setter, a command, a call with raw guest values) is sent where the caller makes it; a getter or device query is not ordered. | A send per guest operation, in order, with raw guest values: Metal's results, aborts and numbering follow the calls a process makes. |
@@ -113,7 +113,7 @@ D26, D28, D40 and D48.
 Cargo.toml Cargo.lock rust-toolchain.toml clippy.toml .cargo/config.toml
 crates/
   reims-vgpu-vulkan/    core (src/core.rs, src/core/), what the platform and the device share,
-                        generic over P: Platform; RtPlatform over metal2vulkan-rt, the
+                        generic over P: Platform; RtPlatform over metal2vulkan-runtime, the
                         library's only one: on Linux and Windows, and on KosmicKrisp on
                         macOS; its OS services; the library's shaders
   reims-vgpu-window/    the device's own window: AppKit or SDL3, input, the host's screens,
@@ -142,12 +142,12 @@ preferences domain and no entitlement: the device's options are its config's fie
 ### 2.2 Crate graph
 
 ```
-metal2vulkan-rt, metal2vulkan  <-  reims-vgpu-vulkan  <-  reims-vgpu-window  <-  reims-vgpu
+metal2vulkan-runtime, metal2vulkan  <-  reims-vgpu-vulkan  <-  reims-vgpu-window  <-  reims-vgpu
 reims-vgpu-graphics, reims-vgpu-video-*  <-  reims-vgpu  <-  reims-vgpu-c  <-  QEMU
 ```
 
 - **The Vulkan platform** (`reims-vgpu-vulkan`) is the library's `Platform`, `RtPlatform`
-  (`rt_platform`), over `metal2vulkan-rt`, the Metal-shaped API on Vulkan of metal2vulkan (with
+  (`rt_platform`), over `metal2vulkan-runtime`, the Metal-shaped API on Vulkan of metal2vulkan (with
   `metal2vulkan`'s Metal types), at the commit of its public repository `Cargo.toml` names. It
   picks one GPU of the host's (`device_choice`) and makes one rt device on it for the process. On
   a Mac it runs on Mesa's KosmicKrisp, `libvulkan_kosmickrisp.dylib` beside the executable or in
@@ -955,7 +955,7 @@ take's worker zeroes the carve; a piece is found only once the host says it is i
 The source is rt's blocks (`pool::RtBlocks`, the platform's `ApiPlatform::block_source`), each known
 to its device while handed out; where a platform gives none (the testkit's), it is `HostBlocks`, the
 process's own memory, in the same shape (`take_block`, `release_block`). A piece the pool asks for
-itself is one of metal2vulkan-rt's units, 16 MiB (`BLOCK_LEN`, read from rt), and a take longer than
+itself is one of metal2vulkan-runtime's units, 16 MiB (`BLOCK_LEN`, read from rt), and a take longer than
 a unit has a piece of its own length. The pool keeps 64 MiB of empty pieces as headroom
 (`HEADROOM`), from the guest driver's take of `POOL` on (`Host::pool_taken`), so the guest's first
 takes find them, and gives a piece above them that stays empty past `RELEASE_DELAY` back to the

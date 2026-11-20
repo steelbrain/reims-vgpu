@@ -1964,7 +1964,7 @@ only where no negotiation can carry it.
   answered before the host gives the block's view its address, and the host
   places the buffers over the block ("Import addresses", below). A host offers
   it where a view's address is an import of the block's pages, on
-  metal2vulkan-rt's device, and on no other platform.
+  metal2vulkan-runtime's device, and on no other platform.
 - Bit 10 is reserved for a pipeline's warm-up, bit 11 is `SURFACE_ORDER`: a
   command buffer that uses IOSurfaces runs after the buffers of other queues
   it names (`RGFX_OP_SURFACE_ORDER`; "Surface order", below), and bit 12 is
@@ -4885,7 +4885,7 @@ reads it once.
   never wait behind another context's growth or zeroing, nor behind the
   headroom's blocks or the pieces going back. The host keeps
   64 MiB of empty pieces ahead of the takes from the kext's take of `POOL`
-  on (`Host::pool_taken`), each 16 MiB, metal2vulkan-rt's unit, so a take
+  on (`Host::pool_taken`), each 16 MiB, metal2vulkan-runtime's unit, so a take
   grows the pool only where those pieces have no room for it, as a take longer
   than a unit does. The answer is
   the block's offset in the pool and its length, the bytes asked for rounded
@@ -4923,7 +4923,7 @@ reads it once.
   reads the rest of the answer as before), and the bundle, where its kext
   answers the fourth output, makes the block's heap there, picking no address
   of the context's and giving none back at the heap's destroy; its buffers
-  lie at their offsets from it. On metal2vulkan-rt's device the address is
+  lie at their offsets from it. On metal2vulkan-runtime's device the address is
   the block's Vulkan device address. On the Vulkan platform before it, whose
   blocks have none, the host picks it in `[2^45, 2^46)`, below the context's
   range, where the platform places none of its own ranges: next fit, each
@@ -4975,7 +4975,7 @@ it (kext feature bit 1 << 17 `PrivateBlocks`); the bundle uses blocks where
 its kext sets that bit and the device took the feature.
 - **A take.** Where no block the context holds has room for a pick, the
   bundle asks the kext for one (selector 18, `PrivateTake`): 16 MiB
-  (`kPrivateBlockBytes`), metal2vulkan-rt's allocation unit, which its block
+  (`kPrivateBlockBytes`), metal2vulkan-runtime's allocation unit, which its block
   maker makes ahead of need, so the host answers it with no allocation of
   the driver's in the take. Where the pick's span and alignment are more,
   the block is the pick's own: their length rounded up to 64 KiB, holding
@@ -4993,7 +4993,7 @@ its kext sets that bit and the device took the feature.
   freed span picked again only once the picks wrap round. Free ranges never
   join across blocks, so no pick spans two of them, side by side as the host
   may give them. A heap's address lies at a multiple of 256 KiB from its
-  block's first byte (`kHeapAddressAlign`), not from 0: on metal2vulkan-rt
+  block's first byte (`kHeapAddressAlign`), not from 0: on metal2vulkan-runtime
   the host binds a heap's texture at the heap's offset in the block's memory
   plus the texture's offset, and rt refuses a texture whose place there is
   off its image's alignment (counted as `rt-refused-heap-texture-place`).
@@ -5015,7 +5015,7 @@ its kext sets that bit and the device took the feature.
   block go once every command buffer the context committed has finished. A
   context's `CONTEXT_CLOSE` lets go of every block it still holds, and the
   device's reset of every block.
-- **Its addresses.** On metal2vulkan-rt's device a block is device memory no
+- **Its addresses.** On metal2vulkan-runtime's device a block is device memory no
   process maps, its address the memory's Vulkan device address, and the host
   answers the whole block it took. On the Vulkan platform before it, the
   host picks a block's addresses in `[2^44, 2^45)`, below the Shared pool's
@@ -5028,7 +5028,7 @@ its kext sets that bit and the device took the feature.
 - **What the guest sees.** The `gpuAddress` of a Private buffer, a heap that
   is not Shared and the buffers in it, and a Managed buffer (but at its copy,
   below) lies in `[2^44, 2^45)` on the Vulkan platform, and wherever the
-  host's device memory lies on metal2vulkan-rt's, rather than in the context's range in
+  host's device memory lies on metal2vulkan-runtime's, rather than in the context's range in
   `[2^46, 2^47)`. Shared buffers, the pool's heaps and no-copy buffers keep
   theirs.
 
@@ -5101,7 +5101,7 @@ device took the feature.
   the address is 0, the bundle picks one in the context's range, as a guest
   that did not take the bit does. Slabs over the process's own pages keep
   their picks.
-- **Its address.** On metal2vulkan-rt's device the address is the Vulkan
+- **Its address.** On metal2vulkan-runtime's device the address is the Vulkan
   device address of the import of the block's pages. On the Vulkan platform
   before it, the host picks it in `[2^43, 2^44)`, below the Private blocks'
   range, where the platform places none of its own ranges: next fit, as it
@@ -5112,12 +5112,12 @@ device took the feature.
   same bytes made after it is made where the platform places it, and the
   guest's pointers to it reach the same pages through the first. A block of
   memory the process maps read-only is given no address there: each buffer
-  over it lies over a copy of its own. On metal2vulkan-rt's device it is given
+  over it lies over a copy of its own. On metal2vulkan-runtime's device it is given
   its import's address as any block is, and its buffers lie in the import,
   where a GPU write through one reaches the pages (Metal drops it).
 - **What the guest sees.** The `gpuAddress` of a no-copy Shared buffer over
   writable memory the kext wires lies in `[2^43, 2^44)` on the Vulkan
-  platform, and at its pages' import on metal2vulkan-rt's, rather than in the
+  platform, and at its pages' import on metal2vulkan-runtime's, rather than in the
   context's range in `[2^46, 2^47)`. Two no-copy buffers over the same bytes
   answer the same `gpuAddress`, where each had a pick of its own before.
   Buffers over read-only memory (on the Vulkan platform), over memory the
@@ -5126,7 +5126,7 @@ device took the feature.
   `IMPORT_ADDRESSES_LATER` (feature bit 9), the host answers a pages block's
   `SURFACE_PAGES` once it has checked and kept the block's runs, with the
   address 0, and then makes the view and gives it its address on the same
-  surface-worker job, before the block settles. On metal2vulkan-rt's device
+  surface-worker job, before the block settles. On metal2vulkan-runtime's device
   that is the import of the block's pages, which the guest's no-copy call then
   no longer waits for. The
   sender's later messages that name the block (its `BUFFER_OVER_PAGES`, and
@@ -5145,7 +5145,7 @@ device took the feature.
 bit 62), the host's GPU form of every IOSurface is its device cache: it keeps
 one for every block in place named cached, lays no texture over a surface's
 pages, and refuses a block in place named uncached. A host offers it where its
-platform caches every surface (metal2vulkan-rt's per-shape form) and it offers
+platform caches every surface (metal2vulkan-runtime's per-shape form) and it offers
 `POOL`; both kexts take it, read with `SURFACE_CACHE`. A surface's copy block
 is then a second copy beside the device cache its other holders use, so the
 guest keeps it only as the fallback, counted by why.
@@ -5181,7 +5181,7 @@ guest keeps it only as the fallback, counted by why.
   block's pages all the same. A surface whose planes lie at multiples of 16
   bytes but not of the host's alignment is in place where it was a copy.
 - **The host.** A block in place named cached whose pages the host makes no
-  view of, or no buffer over (on metal2vulkan-rt, whose platform holds no
+  view of, or no buffer over (on metal2vulkan-runtime, whose platform holds no
   lease of the guest's RAM to map views by, every block), still takes its
   device cache, answered `OK`: each fill and download
   of the cache goes through a Shared buffer of its own that the host's CPU
@@ -5198,7 +5198,7 @@ guest keeps it only as the fallback, counted by why.
 that shares the CPU's memory a Managed buffer is its bytes, one copy, so the
 address the guest's pointers hold is the address of those bytes. A host offers
 it where its GPU shares the CPU's memory, its platform keeps a pin only inside
-a block it knows (metal2vulkan-rt's), and it offers the Shared pool, whose
+a block it knows (metal2vulkan-runtime's), and it offers the Shared pool, whose
 blocks the slabs' copies lie in; both kexts take it (it is carried, with no
 kext feature bit of its own), and the bundle reads it from the device's
 features.

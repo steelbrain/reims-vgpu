@@ -74,7 +74,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::num::ToUsize as _;
 use crate::core::platform::blit::ResourceRef;
@@ -151,8 +151,12 @@ impl std::fmt::Display for Uncopied {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Uncopied::NoMemory => f.write_str("no host memory for the copy's base"),
-            Uncopied::Rt(error) => write!(f, "metal2vulkan-rt refused the copy's block: {error}"),
-            Uncopied::Unmapped => f.write_str("metal2vulkan-rt mapped none of the copy's block"),
+            Uncopied::Rt(error) => {
+                write!(f, "metal2vulkan-runtime refused the copy's block: {error}")
+            }
+            Uncopied::Unmapped => {
+                f.write_str("metal2vulkan-runtime mapped none of the copy's block")
+            }
         }
     }
 }

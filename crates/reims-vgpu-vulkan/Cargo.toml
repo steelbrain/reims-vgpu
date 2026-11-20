@@ -1,6 +1,6 @@
 [package]
 name = "reims-vgpu-vulkan"
-description = "The library's platform: core, what the graphics device and its platform share, and the Platform implementation over metal2vulkan-rt, on Vulkan"
+description = "The library's platform: core, what the graphics device and its platform share, and the Platform implementation over metal2vulkan-runtime, on Vulkan"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,7 +18,7 @@ zerocopy.workspace = true
 # metal2vulkan's Metal types, for the enums and descriptor values the runtime's calls take.
 metal2vulkan.workspace = true
 # The library's runtime (`rt_platform`, `RtPlatform`), and our side of its seam (`seam`).
-metal2vulkan-rt.workspace = true
+metal2vulkan-runtime.workspace = true
 # The debug lines that time the runtime's compiles (gpu/timing.rs), through core's logger.
 log.workspace = true
 # The call recorder's blob hashes (`recorder::format`), SHA-256 as the replay format names them.

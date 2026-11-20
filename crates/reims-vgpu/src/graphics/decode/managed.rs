@@ -2175,7 +2175,7 @@ mod tests {
         assert_eq!(count(), before + 1);
     }
 
-    /// On metal2vulkan-rt's platform, a `Managed` buffer over a slab's CPU copy (a Shared buffer in
+    /// On metal2vulkan-runtime's platform, a `Managed` buffer over a slab's CPU copy (a Shared buffer in
     /// a heap over a block of the guest's Shared pool, at the block's GPU address,
     /// `POOL_ADDRESSES`), which the GPU reads and writes by a blit. On a GPU that shares the CPU's
     /// memory the device offers `MANAGED_AT_COPY`, the guest posts its copy's address, and the

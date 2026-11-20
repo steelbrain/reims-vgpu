@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use metal2vulkan_rt as rt;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::Platform;
 use crate::core::platform::event::{Notification, SharedEvent};
