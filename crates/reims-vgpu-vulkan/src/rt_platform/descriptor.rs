@@ -117,6 +117,17 @@ pub fn rt_texture_descriptor(d: &TextureDesc) -> Result<rt::TextureDescriptor, S
     Ok(out)
 }
 
+/// rt's storage mode `mode` as Metal numbers it (`MTLStorageMode`), the resource options' bits 4
+/// to 7 that [`rt_texture_descriptor`] reads it from.
+pub fn storage_number(mode: rt::StorageMode) -> u32 {
+    match mode {
+        rt::StorageMode::Shared => 0,
+        rt::StorageMode::Managed => 1,
+        rt::StorageMode::Private => 2,
+        rt::StorageMode::Memoryless => 3,
+    }
+}
+
 /// The values of `texture2DDescriptorWithPixelFormat:width:height:mipmapped:`: a 2D texture of
 /// the format and size, of every level down to 1×1 where it is mipmapped (the levels of the larger
 /// side), and Metal's defaults for the rest.
@@ -707,10 +718,13 @@ impl<P: Platform> RateMapDescriptor<P> for RtObj<RateMapFields> {
 
 /// What a render pass asked of rt, for the process's first line of each kind of rt's refusals
 /// of it (`super::unbuilt::refusal_detail`, at `renderCommandEncoderWithDescriptor:`), as
-/// structure alone: each attachment of a texture, and the render target's width and height.
+/// structure alone: each attachment of a texture, the depth and stencil attachments' store
+/// actions, and the render target's width and height ([`PassFields::detail`]).
 pub struct PassDetail {
     /// The attachments, colours in index order, then depth, then stencil.
     attachments: Vec<PassAttachment>,
+    /// The depth and stencil attachments' store actions, whether or not each names a texture.
+    stores: (rt::StoreAction, rt::StoreAction),
     /// `renderTargetWidth` and `renderTargetHeight`.
     size: [u32; 2],
 }
@@ -731,7 +745,9 @@ struct PassAttachment {
     clear_depth: Option<f64>,
 }
 
-/// A texture an attachment names: its pixel format, type, sample count and size.
+/// A texture an attachment names: its pixel format, type, sample count, size, usage and storage
+/// mode, and how it was made (`super::diag::Made::made_as`: `drawable` for a window
+/// swapchain's).
 struct AttachedTexture {
     /// Its pixel format.
     format: rt::PixelFormat,
@@ -741,40 +757,49 @@ struct AttachedTexture {
     samples: u32,
     /// Its width, height and depth.
     size: [u32; 3],
+    /// Its usage, Metal's bits.
+    usage: u32,
+    /// Its storage mode.
+    storage: rt::StorageMode,
+    /// How it was made.
+    made_as: &'static str,
 }
 
 impl AttachedTexture {
-    /// The texture `t`.
-    fn of(t: &rt::Texture) -> AttachedTexture {
-        let d = t.descriptor();
+    /// The texture `t`, of rt's descriptor of it.
+    fn of(t: &RtTexture) -> AttachedTexture {
+        let d = t.rt().descriptor();
         AttachedTexture {
             format: d.pixel_format,
             texture_type: d.texture_type,
             samples: d.sample_count,
             size: [d.width, d.height, d.depth],
+            usage: d.usage.as_raw(),
+            storage: d.storage_mode,
+            made_as: t.made().made_as(),
         }
     }
 }
 
-impl PassDetail {
-    /// The detail of rt's pass `pass`.
-    pub fn of(pass: &rt::RenderPassDescriptor) -> PassDetail {
-        let colors = (pass.color_attachments.iter().enumerate()).filter_map(|(i, c)| {
-            let resolve = (&c.resolve_texture, [c.resolve_level, c.resolve_slice]);
-            let actions = (c.load_action, c.store_action);
-            attached(
-                Point::Color(i),
-                (&c.texture, [c.level, c.slice]),
-                actions,
-                resolve,
-            )
-        });
+impl PassFields {
+    /// The detail of rt's pass `pass`, which [`PassFields::rt_pass`] made of what is set, for the
+    /// process's first line of each kind of rt's refusals of it ([`PassDetail`]).
+    pub fn detail(&self, pass: &rt::RenderPassDescriptor) -> PassDetail {
+        let set = self.lock();
+        let colors = (pass.color_attachments.iter().zip(&set.colors).enumerate()).filter_map(
+            |(i, (c, a))| {
+                let actions = (c.load_action, c.store_action);
+                let resolved_at = [c.resolve_level, c.resolve_slice];
+                attached(Point::Color(i), a, [c.level, c.slice], actions, resolved_at)
+            },
+        );
         let d = &pass.depth_attachment;
         let depth = attached(
             Point::Depth,
-            (&d.texture, [d.level, d.slice]),
+            &set.depth,
+            [d.level, d.slice],
             (d.load_action, d.store_action),
-            (&d.resolve_texture, [d.resolve_level, d.resolve_slice]),
+            [d.resolve_level, d.resolve_slice],
         )
         .map(|a| PassAttachment {
             clear_depth: Some(d.clear_depth),
@@ -783,33 +808,35 @@ impl PassDetail {
         let s = &pass.stencil_attachment;
         let stencil = attached(
             Point::Stencil,
-            (&s.texture, [s.level, s.slice]),
+            &set.stencil,
+            [s.level, s.slice],
             (s.load_action, s.store_action),
-            (&s.resolve_texture, [s.resolve_level, s.resolve_slice]),
+            [s.resolve_level, s.resolve_slice],
         );
         PassDetail {
             attachments: colors.chain(depth).chain(stencil).collect(),
+            stores: (d.store_action, s.store_action),
             size: [pass.render_target_width, pass.render_target_height],
         }
     }
 }
 
-/// The attachment `point` of a pass, of `texture` at its level and slice, with no clear depth,
-/// or `None` where it names no texture.
+/// The attachment `point` of a pass, `set`'s texture and resolve texture at the level and slice
+/// `at` and `resolved_at`, of the actions `actions`, with no clear depth, or `None` where it names
+/// no texture.
 fn attached(
     point: Point,
-    (texture, at): (&Option<rt::Texture>, [u32; 2]),
+    set: &Attachment,
+    at: [u32; 2],
     actions: (rt::LoadAction, rt::StoreAction),
-    (resolve, resolved_at): (&Option<rt::Texture>, [u32; 2]),
+    resolved_at: [u32; 2],
 ) -> Option<PassAttachment> {
     Some(PassAttachment {
         point,
-        texture: AttachedTexture::of(texture.as_ref()?),
+        texture: AttachedTexture::of(set.texture.as_ref()?),
         at,
         actions,
-        resolve: resolve
-            .as_ref()
-            .map(|t| (AttachedTexture::of(t), resolved_at)),
+        resolve: (set.resolve_texture.as_ref()).map(|t| (AttachedTexture::of(t), resolved_at)),
         clear_depth: None,
     })
 }
@@ -819,8 +846,8 @@ impl std::fmt::Display for AttachedTexture {
         let [width, height, depth] = self.size;
         write!(
             f,
-            "{:?} {:?} {width}x{height}x{depth}, {} samples",
-            self.format, self.texture_type, self.samples
+            "{:?} {:?} {width}x{height}x{depth}, {} samples, usage {:#x}, storage {:?}, {}",
+            self.format, self.texture_type, self.samples, self.usage, self.storage, self.made_as
         )
     }
 }
@@ -850,10 +877,11 @@ impl std::fmt::Display for PassAttachment {
 
 impl std::fmt::Display for PassDetail {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let [width, height] = self.size;
+        let ([width, height], (depth, stencil)) = (self.size, self.stores);
         write!(
             f,
-            "a pass of {} attachments, render target {width}x{height}",
+            "a pass of {} attachments, render target {width}x{height}, depth store {depth:?}, \
+             stencil store {stencil:?}",
             self.attachments.len()
         )?;
         for a in &self.attachments {
@@ -868,8 +896,9 @@ mod tests {
     use super::*;
     use crate::core::raise::Origin;
 
-    /// A refused pass's detail names each attachment's format, type, size, sample count, level,
-    /// slice, load and store actions, its resolve texture and a depth attachment's clear depth,
+    /// A refused pass's detail names each attachment's format, type, size, sample count, usage,
+    /// storage mode, how its texture was made, level, slice, load and store actions, its resolve
+    /// texture so too and a depth attachment's clear depth; the depth and stencil store actions;
     /// and the render target's size.
     #[test]
     fn a_refused_pass_s_detail_names_each_attachment() {
@@ -879,6 +908,9 @@ mod tests {
             texture_type,
             samples,
             size: [64, 32, 1],
+            usage: 0x4,
+            storage: rt::StorageMode::Private,
+            made_as: "ordinary",
         };
         let colour = PassAttachment {
             point: Point::Color(0),
@@ -886,7 +918,11 @@ mod tests {
             at: [0, 0],
             actions: (LoadAction::Clear, StoreAction::MultisampleResolve),
             resolve: Some((
-                texture(PixelFormat::BGRA8Unorm, TextureType::Type2D, 1),
+                AttachedTexture {
+                    usage: 0x5,
+                    made_as: "drawable",
+                    ..texture(PixelFormat::BGRA8Unorm, TextureType::Type2D, 1)
+                },
                 [1, 0],
             )),
             clear_depth: None,
@@ -901,23 +937,28 @@ mod tests {
         };
         let what = PassDetail {
             attachments: vec![colour, depth],
+            stores: (StoreAction::DontCare, StoreAction::DontCare),
             size: [0, 0],
         };
         assert_eq!(
             what.to_string(),
-            "a pass of 2 attachments, render target 0x0; colour 0 BGRA8Unorm Type2DMultisample \
-             64x32x1, 4 samples at level 0 slice 0, load Clear, store MultisampleResolve, resolve \
-             into BGRA8Unorm Type2D 64x32x1, 1 samples at level 1 slice 0; depth Depth32Float \
-             Type2D 64x32x1, 1 samples at level 0 slice 2, load Clear, store DontCare, clear \
+            "a pass of 2 attachments, render target 0x0, depth store DontCare, stencil store \
+             DontCare; colour 0 BGRA8Unorm Type2DMultisample 64x32x1, 4 samples, usage 0x4, \
+             storage Private, ordinary at level 0 slice 0, load Clear, store MultisampleResolve, \
+             resolve into BGRA8Unorm Type2D 64x32x1, 1 samples, usage 0x5, storage Private, \
+             drawable at level 1 slice 0; depth Depth32Float Type2D 64x32x1, 1 samples, usage \
+             0x4, storage Private, ordinary at level 0 slice 2, load Clear, store DontCare, clear \
              depth 1.5"
         );
         let none = PassDetail {
             attachments: Vec::new(),
+            stores: (StoreAction::Store, StoreAction::MultisampleResolve),
             size: [16, 16],
         };
         assert_eq!(
             none.to_string(),
-            "a pass of 0 attachments, render target 16x16"
+            "a pass of 0 attachments, render target 16x16, depth store Store, stencil store \
+             MultisampleResolve"
         );
     }
 

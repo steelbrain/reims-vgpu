@@ -19,7 +19,8 @@
 //!   (`GpuDevice::copies_guest_ram`), so each copy of it answers false.
 //!
 //! A command rt refuses encodes nothing, counted under the refusal's kind
-//! ([`rt_refused_texture`]), the first texture copy of each kind naming its textures and places
+//! ([`rt_refused_texture`]), the first texture copy of each kind naming its textures (with each
+//! one's usage, storage mode and how it was made), its places, and what its two textures share
 //! ([`copy_texture`]); so does one Metal's validation stops before rt (a nil argument, a value
 //! past rt's 32 bits, a command after `endEncoding`), as Metal's refusal.
 
@@ -36,7 +37,7 @@ use crate::core::sync::Mutex;
 use super::command::{Kept, OpenMark};
 use super::diag::Use;
 use super::unbuilt::{RtRefusal, Unbuilt, refuse, refused_as, rt_refused_texture};
-use super::{RtObj, RtPlatform};
+use super::{RtObj, RtPlatform, RtTexture};
 
 /// `id<MTLBlitCommandEncoder>` on metal2vulkan-runtime.
 pub struct RtBlitEncoder {
@@ -231,11 +232,11 @@ fn no_options(options: u64) -> Result<(), Stop> {
 fn copy_slices(
     e: &mut rt::BlitCommandEncoder,
     sel: &'static str,
-    (source, from): (&rt::Texture, (u32, u32)),
-    (destination, to): (&rt::Texture, (u32, u32)),
+    (source, from): (&RtTexture, (u32, u32)),
+    (destination, to): (&RtTexture, (u32, u32)),
     (slices, levels): (u32, u32),
 ) -> Result<(), Stop> {
-    let d = source.descriptor();
+    let d = source.rt().descriptor();
     let three_d = d.texture_type == rt::TextureType::Type3D;
     for level in 0..levels {
         let (at, into) = (from.1.saturating_add(level), to.1.saturating_add(level));
@@ -261,21 +262,23 @@ fn copy_slices(
 }
 
 /// rt's copy of `size` texels of `source` from `from` into `destination` at `to`, for `sel`. A
-/// copy rt refuses names the two textures and the places in the process's first line of its kind
-/// ([`super::unbuilt::refusal_detail`]), and is counted with the command ([`report`]).
+/// copy rt refuses names the two textures, the places and what the two share in the process's
+/// first line of its kind ([`super::unbuilt::refusal_detail`]), and is counted with the command
+/// ([`report`]).
 fn copy_texture(
     e: &mut rt::BlitCommandEncoder,
     sel: &'static str,
-    (source, from): (&rt::Texture, rt::TexturePlace),
+    (source, from): (&RtTexture, rt::TexturePlace),
     size: [u32; 3],
-    (destination, to): (&rt::Texture, rt::TexturePlace),
+    (destination, to): (&RtTexture, rt::TexturePlace),
 ) -> Result<(), Stop> {
-    e.copy_from_texture(source, from, size, destination, to)
+    e.copy_from_texture(source.rt(), from, size, destination.rt(), to)
         .map_err(|error| {
             let what = CopyDetail {
                 source: Copied::of(source, from),
                 size,
                 destination: Copied::of(destination, to),
+                shared: Some(source.made().shared_with(destination.made())),
             };
             super::unbuilt::refusal_detail(sel, &error, Some(&what));
             Stop::Rt(error)
@@ -292,13 +295,13 @@ fn copy_bytes(
     sel: &'static str,
     (buffer, lies): (&rt::Buffer, rt::BufferLayout),
     size: [u32; 3],
-    (texture, place): (&rt::Texture, rt::TexturePlace),
+    (texture, place): (&RtTexture, rt::TexturePlace),
     into: bool,
 ) -> Result<(), Stop> {
     let copied = if into {
-        e.copy_from_buffer(buffer, lies, size, texture, place)
+        e.copy_from_buffer(buffer, lies, size, texture.rt(), place)
     } else {
-        e.copy_from_texture_to_buffer(texture, place, size, buffer, lies)
+        e.copy_from_texture_to_buffer(texture.rt(), place, size, buffer, lies)
     };
     copied.map_err(|error| {
         let (texture, buffer) = (Copied::of(texture, place), Copied::Buffer(lies));
@@ -311,6 +314,7 @@ fn copy_bytes(
             source,
             size,
             destination,
+            shared: None,
         };
         super::unbuilt::refusal_detail(sel, &error, Some(&what));
         Stop::Rt(error)
@@ -319,7 +323,8 @@ fn copy_bytes(
 
 /// What a copy of texels asked of rt, for the process's first line of each kind of rt's refusals
 /// of it ([`copy_texture`], [`copy_bytes`]), as structure alone: its kind (texture to texture,
-/// buffer to texture, texture to buffer), each end, and the size copied.
+/// buffer to texture, texture to buffer), each end, the size copied, and what a copy's two
+/// textures share.
 struct CopyDetail {
     /// What it copies from.
     source: Copied,
@@ -327,6 +332,10 @@ struct CopyDetail {
     size: [u32; 3],
     /// What it copies into.
     destination: Copied,
+    /// What the two textures of a texture to texture copy share (`super::diag::Made::shared_with`:
+    /// `one texture`, `one image`, `one buffer`, `one surface plane`, `no image`); `None` for a
+    /// copy between a buffer and a texture.
+    shared: Option<&'static str>,
 }
 
 /// An end of a copy of texels ([`CopyDetail`]).
@@ -339,8 +348,8 @@ enum Copied {
 
 impl Copied {
     /// `texture` at `place`.
-    fn of(texture: &rt::Texture, place: rt::TexturePlace) -> Copied {
-        Copied::Texture(CopiedTexture::of(texture.descriptor()), place)
+    fn of(texture: &RtTexture, place: rt::TexturePlace) -> Copied {
+        Copied::Texture(CopiedTexture::of(texture), place)
     }
 
     /// `texture` or `buffer`, as the copy's kind names the end.
@@ -372,8 +381,9 @@ impl std::fmt::Display for Copied {
     }
 }
 
-/// A copied texture as rt made it: its pixel format, size, levels, array length, sample count
-/// and texture type, Metal's numbers.
+/// A copied texture as rt made it: its pixel format, size, levels, array length, sample count,
+/// texture type, usage and storage mode, Metal's numbers, and how it was made
+/// (`super::diag::Made::made_as`).
 struct CopiedTexture {
     format: u32,
     size: [u32; 3],
@@ -381,11 +391,15 @@ struct CopiedTexture {
     array_length: u32,
     samples: u32,
     texture_type: u32,
+    usage: u32,
+    storage: u32,
+    made_as: &'static str,
 }
 
 impl CopiedTexture {
-    /// The texture of rt's descriptor `d`.
-    fn of(d: &rt::TextureDescriptor) -> CopiedTexture {
+    /// The texture `texture`, of rt's descriptor of it.
+    fn of(texture: &RtTexture) -> CopiedTexture {
+        let d = texture.rt().descriptor();
         CopiedTexture {
             format: d.pixel_format.as_raw(),
             size: [d.width, d.height, d.depth],
@@ -393,6 +407,9 @@ impl CopiedTexture {
             array_length: d.array_length,
             samples: d.sample_count,
             texture_type: d.texture_type.as_raw(),
+            usage: d.usage.as_raw(),
+            storage: super::descriptor::storage_number(d.storage_mode),
+            made_as: texture.made().made_as(),
         }
     }
 }
@@ -403,8 +420,15 @@ impl std::fmt::Display for CopiedTexture {
         write!(
             f,
             "a texture of format {} {width}x{height}x{depth}, {} levels, array length {}, {} \
-             samples, type {}",
-            self.format, self.levels, self.array_length, self.samples, self.texture_type
+             samples, type {}, usage {:#x}, storage {}, {}",
+            self.format,
+            self.levels,
+            self.array_length,
+            self.samples,
+            self.texture_type,
+            self.usage,
+            self.storage,
+            self.made_as
         )
     }
 }
@@ -419,7 +443,11 @@ impl std::fmt::Display for CopyDetail {
             self.destination.kind(),
             self.source,
             self.destination
-        )
+        )?;
+        match self.shared {
+            Some(shared) => write!(f, "; the two textures share {shared}"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -441,7 +469,7 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
         } => {
             let to = place(destination_slice, destination_level, destination_origin)?;
             let lies = layout(source_offset, source_bytes_per_row, source_bytes_per_image);
-            let (source, destination) = (source_buffer.rt(), destination_texture.rt());
+            let (source, destination) = (source_buffer.rt(), destination_texture);
             let size = size(source_size)?;
             copy_bytes(e, sel, (source, lies), size, (destination, to), true)?;
         }
@@ -463,7 +491,7 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
             no_options(options)?;
             let to = place(destination_slice, destination_level, destination_origin)?;
             let lies = layout(source_offset, source_bytes_per_row, source_bytes_per_image);
-            let (source, destination) = (source.rt(), destination.rt());
+            let (source, destination) = (source.rt(), destination);
             let size = size(source_size)?;
             copy_bytes(e, sel, (source, lies), size, (destination, to), true)?;
         }
@@ -500,7 +528,7 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
                 destination_bytes_per_row,
                 destination_bytes_per_image,
             );
-            let (source, destination) = (source_texture.rt(), destination_buffer.rt());
+            let (source, destination) = (source_texture, destination_buffer.rt());
             let size = size(source_size)?;
             copy_bytes(e, sel, (destination, lies), size, (source, from), false)?;
         }
@@ -526,7 +554,7 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
                 destination_bytes_per_row,
                 destination_bytes_per_image,
             );
-            let (source, destination) = (source.rt(), destination.rt());
+            let (source, destination) = (source, destination.rt());
             let size = size(source_size)?;
             copy_bytes(e, sel, (destination, lies), size, (source, from), false)?;
         }
@@ -555,7 +583,7 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
         } => {
             let from = place(source_slice, source_level, source_origin)?;
             let to = place(destination_slice, destination_level, destination_origin)?;
-            let (source, destination) = (source_texture.rt(), destination_texture.rt());
+            let (source, destination) = (source_texture, destination_texture);
             copy_texture(
                 e,
                 sel,
@@ -578,8 +606,13 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
             let from = (narrow(source_slice)?, narrow(source_level)?);
             let to = (narrow(destination_slice)?, narrow(destination_level)?);
             let counts = (narrow(slice_count)?, narrow(level_count)?);
-            let source = (source_texture.rt(), from);
-            copy_slices(e, sel, source, (destination_texture.rt(), to), counts)?;
+            copy_slices(
+                e,
+                sel,
+                (source_texture, from),
+                (destination_texture, to),
+                counts,
+            )?;
         }
         BlitCmd::CopyIndirectCommandBuffer { source, .. } => source.unreachable(),
         BlitCmd::OptimizeIndirectCommandBuffer {
@@ -738,9 +771,10 @@ mod tests {
             .map_or(0, |(_, n)| n)
     }
 
-    /// A refused copy's detail names its kind, the size copied, and each texture's pixel format,
-    /// size, levels, array length, sample count and texture type, as Metal numbers them, with
-    /// its slice, level and origin, and a buffer's layout.
+    /// A refused copy's detail names its kind, the size copied, each texture's pixel format,
+    /// size, levels, array length, sample count, texture type, usage and storage mode, as Metal
+    /// numbers them, and how it was made, with its slice, level and origin, a buffer's layout,
+    /// and what a copy's two textures share.
     #[test]
     fn a_refused_copy_s_detail_names_both_textures_and_places() {
         let texture = |format, samples, texture_type| CopiedTexture {
@@ -750,6 +784,9 @@ mod tests {
             array_length: 1,
             samples,
             texture_type,
+            usage: 0x5,
+            storage: 2,
+            made_as: "view",
         };
         let what = CopyDetail {
             source: Copied::Texture(
@@ -769,13 +806,15 @@ mod tests {
                     origin: [4, 2, 0],
                 },
             ),
+            shared: Some("one image"),
         };
         assert_eq!(
             what.to_string(),
             "a texture to texture copy of 16x8x1 texels from a texture of format 260 64x32x1, 2 \
-             levels, array length 1, 4 samples, type 4 at slice 0 level 0 origin (0, 0, 0) into a \
-             texture of format 260 64x32x1, 2 levels, array length 1, 1 samples, type 2 at slice \
-             0 level 1 origin (4, 2, 0)"
+             levels, array length 1, 4 samples, type 4, usage 0x5, storage 2, view at slice 0 \
+             level 0 origin (0, 0, 0) into a texture of format 260 64x32x1, 2 levels, array \
+             length 1, 1 samples, type 2, usage 0x5, storage 2, view at slice 0 level 1 origin \
+             (4, 2, 0); the two textures share one image"
         );
         let what = CopyDetail {
             source: Copied::Buffer(rt::BufferLayout {
@@ -785,12 +824,13 @@ mod tests {
             }),
             size: [64, 1, 1],
             destination: Copied::Texture(texture(250, 1, 2), rt::TexturePlace::default()),
+            shared: None,
         };
         assert_eq!(
             what.to_string(),
             "a buffer to texture copy of 64x1x1 texels from a buffer at offset 2, 128 bytes a \
              row, 0 bytes an image into a texture of format 250 64x32x1, 2 levels, array length \
-             1, 1 samples, type 2 at slice 0 level 0 origin (0, 0, 0)"
+             1, 1 samples, type 2, usage 0x5, storage 2, view at slice 0 level 0 origin (0, 0, 0)"
         );
     }
 

@@ -367,6 +367,33 @@ impl Made {
         }
     }
 
+    /// How it was made, as the boot diagnostics' lines name it: `ordinary`, `surface-image`,
+    /// `view`, `surface-view` (a view of a surface's shape image, as a guest surface texture is),
+    /// `over-buffer`, `tiled`, `in-heap` or `drawable` (over a window swapchain's image).
+    pub fn made_as(&self) -> &'static str {
+        self.call_name()
+    }
+
+    /// What it and `other`, two textures one call names (a copy's ends), share, as structure
+    /// alone: `one texture`; `one image` (a texture and a view of it, or two views of one texture,
+    /// which rt takes as one texture, so the same level and slice of both is one subresource);
+    /// `one buffer` (two textures over one buffer's bytes, or views of them); `one surface plane`
+    /// (two guest surface textures over one IOSurface plane, of two images); else `no image`.
+    pub fn shared_with(&self, other: &Made) -> &'static str {
+        let plane = |m: &Made| m.on_plane.get().map(|on| on.plane);
+        if self.id == other.id {
+            "one texture"
+        } else if self.image == other.image && self.image >> 63 == 0 {
+            "one image"
+        } else if self.image == other.image {
+            "one buffer"
+        } else if plane(self).is_some() && plane(self) == plane(other) {
+            "one surface plane"
+        } else {
+            "no image"
+        }
+    }
+
     /// The usage its maker declared: a surface view's, the guest's; any other's, its
     /// descriptor's.
     fn declared_usage(&self) -> u64 {
@@ -2607,6 +2634,42 @@ mod tests {
             "over-buffer: no cache",
         );
         assert_eq!(counted(PLANE_PIXEL_FORMAT_VIEW_CODE), before);
+    }
+
+    /// Two textures one call names say what they share, by their makes: one texture, one image (a
+    /// texture and a view of it, two views of one texture), one buffer, one surface plane, or no
+    /// image; and each says how it was made.
+    #[test]
+    fn two_textures_say_what_they_share() {
+        let shape = Shape {
+            format: 80,
+            width: 8,
+            height: 8,
+            storage: 2,
+            usage: 0x5,
+        };
+        let texture = Made::new(Call::Plain, &shape);
+        let view = Made::view(&texture, 81, (1, 0));
+        let other_view = Made::view(&texture, 80, (0, 0));
+        let apart = Made::new(Call::Plain, &shape);
+        assert_eq!(texture.shared_with(&texture), "one texture");
+        assert_eq!(texture.shared_with(&view), "one image");
+        assert_eq!(view.shared_with(&other_view), "one image");
+        assert_eq!(texture.shared_with(&apart), "no image");
+        let over = || {
+            let id = NEXT.fetch_add(1, Relaxed);
+            let image = 0x4000 | (1 << 63);
+            Made::of(id, image, Call::OverBuffer, false, &shape, (0, 0), (None, None))
+        };
+        assert_eq!(over().shared_with(&over()), "one buffer");
+        let (s, t) = (Made::new(Call::View, &shape), Made::new(Call::View, &shape));
+        on_plane(&s, (0x5d5d_0000, 0), 0x5, 64);
+        on_plane(&t, (0x5d5d_0000, 0), 0x5, 64);
+        assert_eq!(s.shared_with(&t), "one surface plane");
+        assert_eq!(s.shared_with(&apart), "no image");
+        let drawable = Made::new(Call::Drawable, &shape);
+        let made_as = [&texture, &view, &over(), &drawable].map(|m| m.made_as());
+        assert_eq!(made_as, ["ordinary", "view", "over-buffer", "drawable"]);
     }
 
     /// An import made by its pointer once its pages were mapped from their files, as too large for

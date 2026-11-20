@@ -17,11 +17,11 @@
 //! it goes to, writes a line of its own too: rt's error as it displays and as it debugs, which
 //! carries the gap's fields (the translator's refusal as the feature it refused, what it needs and
 //! its attachment alone), and what the call asked of rt where its site names it, as structure
-//! alone: a texture's descriptor, a copy's kind, textures, places and buffer layout, a pass's
-//! attachments, a draw's primitive type and its pipeline state's rasterization fields
-//! ([`refusal_detail`]). No name of the guest's (a function's, a symbol's, a label) is in it. A
-//! texture rt makes none of for its pixel format (`Gap::TextureFormat`) is counted under its
-//! format's own code instead,
+//! alone: a texture's descriptor, a view's and the texture it views, a copy's kind, textures,
+//! places, buffer layout and what its two textures share, a pass's attachments and store actions,
+//! a draw's primitive type and its pipeline state's rasterization fields ([`refusal_detail`]). No
+//! name of the guest's (a function's, a symbol's, a label) is in it. A texture rt makes none of
+//! for its pixel format (`Gap::TextureFormat`) is counted under its format's own code instead,
 //! `rt-refused-texture-format-<n>` ([`rt_refused_texture`]), so a boot's counts line gives each
 //! format number with its count. A pipeline state's imageblock length rt refuses
 //! (`Gap::ImageblockLength`) is counted apart from rt's other gaps too,
@@ -357,10 +357,10 @@ fn diagnosed(sel: &'static str, error: &rt::Error) {
 /// `RenderPass`, `Limit-TextureSamples`, `Translation-Lowering`), which the line of the first of
 /// its [`RtRefusal`] kind ([`refused_as`]) leaves out past that kind's first: [`detail_line`] of
 /// the call `sel`, rt's `error` and `what`, what the call asked of rt that rt's error does not
-/// name, as structure alone (a texture's descriptor; a copy's kind, textures, places and buffer
-/// layout; a pass's attachments; a draw's primitive type and its pipeline state's rasterization
-/// fields). A caller that names `what` calls it before it counts the refusal, whose own call here
-/// ([`rt_refused`],
+/// name, as structure alone (a texture's descriptor; a view's and its texture's; a copy's kind,
+/// textures, places, buffer layout and what its textures share; a pass's attachments and store
+/// actions; a draw's primitive type and its pipeline state's rasterization fields). A caller that
+/// names `what` calls it before it counts the refusal, whose own call here ([`rt_refused`],
 /// [`diagnosed`]) then writes nothing. Every count of the diagnostics' calls here, so each name
 /// the counts give has its line. Counts nothing.
 pub fn refusal_detail(sel: &'static str, error: &rt::Error, what: Option<&dyn std::fmt::Display>) {

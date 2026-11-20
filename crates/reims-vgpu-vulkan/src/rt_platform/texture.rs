@@ -193,6 +193,49 @@ impl std::fmt::Display for TextureDetail<'_> {
     }
 }
 
+/// What a texture view's make asked of rt, for the process's first line of each kind of rt's
+/// refusals of it (`super::unbuilt::refusal_detail`), as structure alone: the view's pixel format,
+/// texture type, levels and slices, Metal's numbers, and whether it swizzles; and the texture it
+/// views, of rt's descriptor of it: its pixel format, type, levels, array length, sample count,
+/// usage and storage mode, and how it was made (`super::diag::Made::made_as`).
+struct ViewDetail<'a> {
+    format: u32,
+    view_type: u32,
+    levels: Range<u32>,
+    slices: Range<u32>,
+    swizzled: bool,
+    /// The texture it views.
+    of: &'a RtTexture,
+}
+
+impl std::fmt::Display for ViewDetail<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let d = self.of.rt.descriptor();
+        let swizzled = if self.swizzled { ", swizzled" } else { "" };
+        write!(
+            f,
+            "a view of format {}, type {}, levels {:?}, slices {:?}{swizzled}, of a texture of \
+             format {} {}x{}x{}, {} levels, array length {}, {} samples, type {}, usage {:#x}, \
+             storage {}, {}",
+            self.format,
+            self.view_type,
+            self.levels,
+            self.slices,
+            d.pixel_format.as_raw(),
+            d.width,
+            d.height,
+            d.depth,
+            d.mipmap_level_count,
+            d.array_length,
+            d.sample_count,
+            d.texture_type.as_raw(),
+            d.usage.as_raw(),
+            super::descriptor::storage_number(d.storage_mode),
+            self.of.made.made_as()
+        )
+    }
+}
+
 /// `MTLPurgeableStateKeepCurrent`.
 const KEEP_CURRENT: u64 = 1;
 
@@ -372,6 +415,14 @@ impl RtTexture {
             .index_for(sel, reaches(d.usage, format), resource_index)?;
         let first = (levels.start, slices.start);
         let format_raw = u32::try_from(pixel_format).unwrap_or(u32::MAX);
+        let asked = ViewDetail {
+            format: format_raw,
+            view_type: view_type.as_raw(),
+            levels: levels.clone(),
+            slices: slices.clone(),
+            swizzled: channels.is_some(),
+            of: self,
+        };
         let made = match channels {
             None => self
                 .rt
@@ -379,6 +430,9 @@ impl RtTexture {
             Some(channels) => (self.rt)
                 .new_texture_view_with_swizzle(format, view_type, levels, slices, channels, index),
         };
+        if let Err(error) = &made {
+            super::unbuilt::refusal_detail(sel, error, Some(&asked));
+        }
         super::diag::plane_view(&self.made, format_raw, made.is_ok());
         let usage = match swizzle {
             Some(s) if s != DEFAULT_SWIZZLE => self.usage & SWIZZLED_VIEW_KEEPS,
@@ -2055,6 +2109,41 @@ mod tests {
         let plain = make(70);
         let _of_plain = view(&plain, 71);
         assert_eq!(counted(plain_srgb), plain_before);
+    }
+
+    /// On the GPU the test holds: a refused view's detail names the view asked (its pixel format,
+    /// type, levels and slices, as Metal numbers them, and whether it swizzles) and the texture it
+    /// views, of rt's descriptor of it, its usage, storage mode and how it was made among the rest.
+    #[test]
+    fn a_refused_view_s_detail_names_the_texture_s_usage_on_vulkan() {
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::raise::OnFault;
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let desc = TextureDesc {
+            pixel_format: 80,
+            width: 8,
+            height: 4,
+            usage: 0x1,
+            resource_options: Some(STORAGE_PRIVATE),
+            ..TextureDesc::default()
+        };
+        let made = device.new_texture(OnFault::Return, &platform.texture_descriptor(&desc));
+        let texture = made.expect("never a raise").expect("a texture");
+        let what = ViewDetail {
+            format: 81,
+            view_type: 2,
+            levels: 0..1,
+            slices: 0..1,
+            swizzled: true,
+            of: &texture,
+        };
+        assert_eq!(
+            what.to_string(),
+            "a view of format 81, type 2, levels 0..1, slices 0..1, swizzled, of a texture of \
+             format 80 8x4x1, 1 levels, array length 1, 1 samples, type 2, usage 0x1, storage 2, \
+             ordinary"
+        );
     }
 
     /// On the GPU the test holds: an image for views (a shape's image of the platform's own,
