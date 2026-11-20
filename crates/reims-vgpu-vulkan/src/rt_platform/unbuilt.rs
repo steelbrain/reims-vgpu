@@ -65,9 +65,6 @@ pub enum Unbuilt {
     /// `newVisibleFunctionTableWithDescriptor:`): rt's kernels take no function table. Each
     /// answers nil.
     FunctionTable,
-    /// Argument buffers' layouts (`newArgumentEncoderWithArguments:` and a function's). Each
-    /// answers nil.
-    ArgumentLayout,
     /// Render commands rt has no form of: indirect draws, indexed patch draws, mesh draws, tile
     /// dispatches, resolve textures, visibility results, and the private settings of other than
     /// Metal's default rt has none of (`super::render`). Each encodes nothing.
@@ -112,14 +109,13 @@ pub enum Unbuilt {
 
 impl Unbuilt {
     /// Every piece, once, in the order of their codes' places.
-    pub const ALL: [Unbuilt; 19] = [
+    pub const ALL: [Unbuilt; 18] = [
         Unbuilt::Buffer,
         Unbuilt::IosurfaceTexture,
         Unbuilt::SharedTexture,
         Unbuilt::Heap,
         Unbuilt::MeshPipeline,
         Unbuilt::FunctionTable,
-        Unbuilt::ArgumentLayout,
         Unbuilt::RenderCommand,
         Unbuilt::ComputeCommand,
         Unbuilt::Predication,
@@ -143,7 +139,6 @@ impl Unbuilt {
             Unbuilt::Heap => "rt-unbuilt-heap",
             Unbuilt::MeshPipeline => "rt-unbuilt-mesh-pipeline",
             Unbuilt::FunctionTable => "rt-unbuilt-function-table",
-            Unbuilt::ArgumentLayout => "rt-unbuilt-argument-layout",
             Unbuilt::RenderCommand => "rt-unbuilt-render-command",
             Unbuilt::ComputeCommand => "rt-unbuilt-compute-command",
             Unbuilt::Predication => "rt-unbuilt-predication",
@@ -168,7 +163,6 @@ impl Unbuilt {
             Unbuilt::Heap => "a sparse heap",
             Unbuilt::MeshPipeline => "a mesh render pipeline state",
             Unbuilt::FunctionTable => "a function handle or a visible function table",
-            Unbuilt::ArgumentLayout => "an argument buffer's layout",
             Unbuilt::RenderCommand => "an indirect, mesh or tile draw, a resolve or a GL setting",
             Unbuilt::ComputeCommand => "an indirect dispatchThreads or stage-in region",
             Unbuilt::Predication => "command predication",

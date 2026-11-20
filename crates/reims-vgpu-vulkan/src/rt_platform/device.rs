@@ -71,6 +71,7 @@ use crate::gpu::device::{HEAP_DESCRIPTOR_OPTIONS, descriptor_options};
 use crate::gpu::identity;
 
 use super::answers::{self, Facts};
+use super::argument;
 use super::buffer::{self, KnownBlocks};
 use super::command::DeviceLoss;
 use super::heap;
@@ -640,25 +641,20 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     /// Nothing: rt takes a library of any platform's.
     fn allow_foreign_libraries(&self) {}
 
-    /// Unbuilt: no encoder ([`Unbuilt::ArgumentLayout`]).
+    /// The translator's layout of the descriptors, Metal's encoder's (`super::argument`); `None`,
+    /// counted, where Metal makes no encoder.
     fn argument_layout(&self, arguments: &[ArgumentDesc]) -> RaiseResult<Option<ArgumentLayout>> {
-        let _ = arguments;
-        refuse_create(Unbuilt::ArgumentLayout, "newArgumentEncoderWithArguments:");
-        Ok(None)
+        Ok(argument::descriptors_layout(arguments))
     }
 
-    /// Unbuilt: no encoder ([`Unbuilt::ArgumentLayout`]).
+    /// The translator's layout of the function's argument buffer at the index, the one its
+    /// translation reads (`super::argument`); `None`, counted, where Metal makes no encoder.
     fn function_argument_layout(
         &self,
         function: &<RtPlatform as Platform>::Function,
         buffer_index: u64,
     ) -> RaiseResult<Option<ArgumentLayout>> {
-        let _ = (function, buffer_index);
-        refuse_create(
-            Unbuilt::ArgumentLayout,
-            "newArgumentEncoderWithBufferIndex:",
-        );
-        Ok(None)
+        Ok(argument::function_layout(function, buffer_index))
     }
 
     /// rt's answer: the device's image's own memory requirements, rounded to its buffer-image

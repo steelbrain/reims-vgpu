@@ -223,6 +223,7 @@ mod tests {
         RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN,
         RgfxFunctionConstant,
     };
+    use reims_vgpu_vulkan::core::platform::blit::ResourceRef;
     use reims_vgpu_vulkan::core::platform::device::GpuDevice;
     use reims_vgpu_vulkan::core::testkit::FakePlatform;
 
@@ -529,5 +530,353 @@ mod tests {
             dec.argument_layout(&device, &empty).unwrap().1,
             RGFX_STATUS_REFUSED
         );
+    }
+
+    /// The kernels of `tests/shaders/argument_buffers.metal`.
+    const ARGUMENT_BUFFERS: &[u8] =
+        include_bytes!("../../../../../tests/shaders/argument_buffers.metallib");
+
+    type Rt = reims_vgpu_vulkan::RtPlatform;
+    type RtBuffer = <Rt as Platform>::Buffer;
+
+    /// The Vulkan platform, its device, the decoder over it, a region with one MiB of the processes' blocks, the
+    /// reply's offset in it, and the argument-buffer kernels' library as object 0x10.
+    fn on_vulkan() -> (
+        Arc<Rt>,
+        <Rt as Platform>::Device,
+        Arc<Region>,
+        GraphicsDecoder<Rt>,
+        u64,
+    ) {
+        use crate::platform::ApiPlatform as _;
+        let platform = Rt::process();
+        let device = platform.metal_device(None).unwrap();
+        let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+        let size = blocks + 0x10_0000 + RGFX_CURSOR_SPAN;
+        let region = Arc::new(Region::new(size as usize).unwrap());
+        let dec = GraphicsDecoder::<Rt>::new(Arc::clone(&platform), Arc::clone(&region));
+        let library = device
+            .new_library(ARGUMENT_BUFFERS)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        dec.store(
+            0x10,
+            super::super::tables::Entry::of(ObjHandle::Library(library)),
+        );
+        (platform, device, region, dec, blocks + 0x2000)
+    }
+
+    /// A Shared buffer of `words`, each `word(i)`.
+    fn words(
+        device: &<Rt as Platform>::Device,
+        words: usize,
+        word: impl Fn(u32) -> u32,
+    ) -> RtBuffer {
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::raise::OnFault;
+        let buffer = device
+            .new_buffer_of_length(OnFault::Return, (words * 4).max(16) as u64, 0)
+            .unwrap()
+            .unwrap();
+        let at = buffer.contents().as_ptr::<u32>();
+        for i in 0..words {
+            // SAFETY: the buffer is Shared and holds `words` words; the GPU has not started.
+            unsafe { at.add(i).write(word(i as u32)) };
+        }
+        buffer
+    }
+
+    /// Writes `value`'s bytes at byte `offset` of `buffer`, as the guest's encoder writes an
+    /// argument: an 8-byte word, or a constant's bytes.
+    fn put(buffer: &RtBuffer, offset: u64, value: &[u8]) {
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        assert!(offset as usize + value.len() <= buffer.length() as usize);
+        // SAFETY: the bytes lie in the buffer (above), which is Shared; the GPU has not started.
+        unsafe {
+            let at = buffer.contents().as_ptr::<u8>().add(offset as usize);
+            std::ptr::copy_nonoverlapping(value.as_ptr(), at, value.len());
+        };
+    }
+
+    /// Runs `kernel` of the library over `threads` threads, the argument buffer `args` at index
+    /// 0 and `out` at 1, `resident` made resident for reads; answers `out`'s first `threads`
+    /// words.
+    fn run(
+        device: &<Rt as Platform>::Device,
+        kernel: &str,
+        args: &RtBuffer,
+        resident: &[ResourceRef<'_, Rt>],
+        threads: u64,
+    ) -> Vec<u32> {
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, Library as _};
+        use reims_vgpu_vulkan::core::platform::types::{MtlSize, NsRange};
+        use reims_vgpu_vulkan::core::platform::values::ComputePassDesc;
+        use reims_vgpu_vulkan::core::raise::OnFault;
+        let library = device
+            .new_library(ARGUMENT_BUFFERS)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let function = library
+            .new_function(OnFault::Return, kernel)
+            .unwrap()
+            .unwrap();
+        let pipeline = device
+            .new_compute_pipeline_state_for_function(Some(&function))
+            .unwrap()
+            .unwrap();
+        let out = words(device, threads as usize, |_| 0xdead_beef);
+        let resources: Vec<_> = resident.iter().map(|r| Some(*r)).collect();
+        let queue = device.new_command_queue().unwrap();
+        let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+        let enc = cb
+            .compute_encoder_for_pass(&ComputePassDesc::default())
+            .unwrap()
+            .unwrap();
+        for cmd in [
+            ComputeCmd::SetComputePipelineState {
+                state: Some(&pipeline),
+            },
+            ComputeCmd::SetBuffers {
+                buffers: &[Some(args), Some(&out)],
+                offsets: &[0, 0],
+                range: NsRange {
+                    location: 0,
+                    length: 2,
+                },
+            },
+            ComputeCmd::UseResources {
+                resources: &resources,
+                usage: 1, // MTLResourceUsageRead
+            },
+            ComputeCmd::DispatchThreadgroups {
+                threadgroups_per_grid: MtlSize::new(threads / 64, 1, 1),
+                threads_per_threadgroup: MtlSize::new(64, 1, 1),
+            },
+            ComputeCmd::EndEncoding,
+        ] {
+            enc.encode(OnFault::Return, cmd).unwrap();
+        }
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        let at = out.contents().as_ptr::<u32>();
+        // SAFETY: the GPU wrote the buffer's `threads` words, and is done.
+        (0..threads as usize)
+            .map(|i| unsafe { at.add(i).read() })
+            .collect()
+    }
+
+    /// The members of the answer's layout `layout`: id, count, offset, stride, size, kind and the
+    /// layout each names.
+    fn members_of(
+        layouts: &[RgfxArgumentLayoutRecord],
+        members: &[RgfxArgumentMemberRecord],
+        layout: usize,
+    ) -> Vec<(u32, u32, u64, u64, u64, u32, u32)> {
+        let l = &layouts[layout];
+        members[l.first_member as usize..][..l.member_count as usize]
+            .iter()
+            .map(|m| (m.id, m.count, m.offset, m.stride, m.size, m.kind, m.layout))
+            .collect()
+    }
+
+    /// On the Vulkan platform, the guest's probe shape reads what the guest wrote: `sum_args`'
+    /// argument buffer answers two pointers at 0 and 8, 16 bytes aligned to 8, from the function
+    /// and from the same two descriptors, as Metal's encoder answers it; the words the guest's
+    /// encoder writes there (each buffer's GPU address plus its offset) are what the kernel reads,
+    /// for two buffers, and for two places in one buffer
+    #[test]
+    fn on_vulkan_a_kernel_reads_the_pointers_the_guest_writes_at_its_argument_layout() {
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        let (_platform, device, region, dec, reply) = on_vulkan();
+        let mut answers = Vec::new();
+        for m in [
+            query(
+                RGFX_ARGUMENT_SOURCE_FUNCTION,
+                reply,
+                0x1000,
+                0x10,
+                &[],
+                "sum_args",
+                &[],
+            ),
+            query(
+                RGFX_ARGUMENT_SOURCE_DESCRIPTORS,
+                reply,
+                0x1000,
+                0,
+                &[descriptor(60, 0, 0), descriptor(60, 1, 0)],
+                "",
+                &[],
+            ),
+        ] {
+            assert_eq!(
+                dec.argument_layout(&device, &m).unwrap(),
+                (Some(9), RGFX_STATUS_OK)
+            );
+            answers.push(answer(&region, reply));
+        }
+        for (head, layouts, members) in &answers {
+            assert_eq!((head.layout_count, head.member_count), (1, 2));
+            assert_eq!((layouts[0].encoded_length, layouts[0].alignment), (16, 8));
+            assert_eq!(
+                members_of(layouts, members, 0),
+                [
+                    (0, 1, 0, 8, 8, RGFX_ARGUMENT_BUFFER, RGFX_ARGUMENT_NO_LAYOUT),
+                    (1, 1, 8, 8, 8, RGFX_ARGUMENT_BUFFER, RGFX_ARGUMENT_NO_LAYOUT),
+                ]
+            );
+        }
+        let (_, layouts, members) = &answers[0];
+        let (at_a, at_b) = (members[0].offset, members[1].offset);
+        const N: usize = 4096;
+        let a = words(&device, N + 256, |i| i * 3 + 1);
+        let b = words(&device, N + 64, |i| i.wrapping_mul(0x9e37_79b9));
+        let args = words(&device, layouts[0].encoded_length as usize / 4, |_| 0);
+        put(&args, at_a, a.gpu_address().as_bytes());
+        put(&args, at_b, (b.gpu_address() + 256).as_bytes());
+        let got = run(
+            &device,
+            "sum_args",
+            &args,
+            &[ResourceRef::Buffer(&a), ResourceRef::Buffer(&b)],
+            N as u64,
+        );
+        let want: Vec<u32> = (0..N as u32)
+            .map(|i| (i * 3 + 1).wrapping_add((i + 64).wrapping_mul(0x9e37_79b9)))
+            .collect();
+        assert_eq!(first_wrong(&got, &want), None);
+        // Both pointers into one buffer, 1 KiB apart.
+        put(&args, at_b, (a.gpu_address() + 1024).as_bytes());
+        let got = run(
+            &device,
+            "sum_args",
+            &args,
+            &[ResourceRef::Buffer(&a)],
+            N as u64,
+        );
+        let want: Vec<u32> = (0..N as u32)
+            .map(|i| (i * 3 + 1) + ((i + 256) * 3 + 1))
+            .collect();
+        assert_eq!(first_wrong(&got, &want), None);
+    }
+
+    /// The first index where `got` differs from `want`, with the two values, and how many differ.
+    fn first_wrong(got: &[u32], want: &[u32]) -> Option<(usize, u32, u32, usize)> {
+        assert_eq!(got.len(), want.len());
+        let wrong = got.iter().zip(want).filter(|(g, w)| g != w).count();
+        (got.iter().zip(want).enumerate())
+            .find(|(_, (g, w))| g != w)
+            .map(|(i, (g, w))| (i, *g, *w, wrong))
+    }
+
+    /// On the Vulkan platform, every kind a kernel reads through an argument buffer lands where
+    /// the guest writes it: `mixed_args`' layout answers an array of two pointers at 0, a constant
+    /// at 16, a texture at 24 and a pointer at 32 to a nested argument buffer (layout 1: a pointer
+    /// at 0, a constant at 8), and the kernel reads each word the guest writes there: the buffers'
+    /// addresses, the constant, the texture's resource ID, and the nested buffer's address and
+    /// words
+    #[test]
+    fn on_vulkan_every_argument_kind_lands_where_the_guest_writes_it() {
+        use reims_vgpu_vulkan::core::platform::host_range::HostRange;
+        use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, Texture as _};
+        use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+        use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+        use reims_vgpu_vulkan::core::raise::OnFault;
+        let (platform, device, region, dec, reply) = on_vulkan();
+        let m = query(
+            RGFX_ARGUMENT_SOURCE_FUNCTION,
+            reply,
+            0x1000,
+            0x10,
+            &[],
+            "mixed_args",
+            &[],
+        );
+        assert_eq!(
+            dec.argument_layout(&device, &m).unwrap(),
+            (Some(9), RGFX_STATUS_OK)
+        );
+        let (head, layouts, members) = answer(&region, reply);
+        assert_eq!((head.layout_count, head.member_count), (2, 6));
+        assert_eq!((layouts[0].encoded_length, layouts[0].alignment), (40, 8));
+        assert_eq!((layouts[1].encoded_length, layouts[1].alignment), (16, 8));
+        let none = RGFX_ARGUMENT_NO_LAYOUT;
+        assert_eq!(
+            members_of(&layouts, &members, 0),
+            [
+                (0, 2, 0, 8, 8, RGFX_ARGUMENT_BUFFER, none),
+                (2, 1, 16, 4, 4, RGFX_ARGUMENT_CONSTANT, none),
+                (3, 1, 24, 8, 8, RGFX_ARGUMENT_TEXTURE, none),
+                (4, 1, 32, 8, 8, RGFX_ARGUMENT_BUFFER, 1),
+            ]
+        );
+        assert_eq!(
+            members_of(&layouts, &members, 1),
+            [
+                (0, 1, 0, 8, 8, RGFX_ARGUMENT_BUFFER, none),
+                (1, 1, 8, 4, 4, RGFX_ARGUMENT_CONSTANT, none),
+            ]
+        );
+        const N: usize = 256;
+        let a = words(&device, N, |i| i + 1);
+        let b = words(&device, N + 64, |i| i * 2);
+        let c = words(&device, N, |i| i * 100);
+        let texels: Vec<u32> = (0..N as u32).map(|i| i * 11).collect();
+        let desc = platform.texture_descriptor(&TextureDesc {
+            pixel_format: 53, // MTLPixelFormatR32Uint
+            width: N as u64,
+            height: 1,
+            ..TextureDesc::default()
+        });
+        let texture = device.new_texture(OnFault::Return, &desc).unwrap().unwrap();
+        texture
+            .replace_region(
+                MtlRegion {
+                    origin: MtlOrigin::default(),
+                    size: MtlSize::new(N as u64, 1, 1),
+                },
+                0,
+                0,
+                HostRange::of_slice(texels.as_bytes()),
+                N as u64 * 4,
+                0,
+            )
+            .unwrap();
+        let inner = words(&device, layouts[1].encoded_length as usize / 4, |_| 0);
+        let nested = members_of(&layouts, &members, 1);
+        put(&inner, nested[0].2, c.gpu_address().as_bytes());
+        put(&inner, nested[1].2, 5u32.as_bytes());
+        let args = words(&device, layouts[0].encoded_length as usize / 4, |_| 0);
+        let outer = members_of(&layouts, &members, 0);
+        put(&args, outer[0].2, a.gpu_address().as_bytes());
+        put(
+            &args,
+            outer[0].2 + outer[0].3,
+            (b.gpu_address() + 256).as_bytes(),
+        );
+        put(&args, outer[1].2, 3u32.as_bytes());
+        put(&args, outer[2].2, texture.gpu_resource_id().as_bytes());
+        put(&args, outer[3].2, inner.gpu_address().as_bytes());
+        let got = run(
+            &device,
+            "mixed_args",
+            &args,
+            &[
+                ResourceRef::Buffer(&a),
+                ResourceRef::Buffer(&b),
+                ResourceRef::Buffer(&c),
+                ResourceRef::Buffer(&inner),
+                ResourceRef::Texture(&texture),
+            ],
+            N as u64,
+        );
+        let want: Vec<u32> = (0..N as u32)
+            .map(|i| (i + 1) + (i + 64) * 2 * 3 + i * 11 + i * 100 + 5)
+            .collect();
+        assert_eq!(first_wrong(&got, &want), None);
     }
 }

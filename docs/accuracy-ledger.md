@@ -53,7 +53,6 @@ many times. The pieces, by code:
 | `rt-unbuilt-heap` | sparse heaps: nil |
 | `rt-unbuilt-mesh-pipeline` | mesh render pipeline states: nil and an `NSError` |
 | `rt-unbuilt-function-table` | function handles and visible function tables: nil |
-| `rt-unbuilt-argument-layout` | argument encoders' layouts (`newArgumentEncoderWithArguments:` and a function's): nil |
 | `rt-unbuilt-render-command` | indirect draws, indexed patch draws, mesh draws, tile dispatches, resolve textures, visibility results, and private settings other than Metal's default: nothing encoded |
 | `rt-unbuilt-compute-command` | an indirect `dispatchThreads` and an indirect stage-in region: nothing encoded |
 | `rt-unbuilt-predication` | command predication: a start encodes nothing, an end answers NO |
