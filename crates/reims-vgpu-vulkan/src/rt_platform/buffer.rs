@@ -116,7 +116,13 @@
 //! device is made: `crate::os`'s `learn_dma_buf_granule`), each view more than one dma-buf holds,
 //! from the first; and from rt's first refusal of a view's one dma-buf on, which rt answers only
 //! at the call, every view (`crate::os`'s `views_need_files`). Such a view's import then takes
-//! its pointer with nothing mapped again. Pages in no dma-buf's mapping go by their pointer first.
+//! its pointer with nothing mapped again. On NVIDIA's driver rt refuses the first view's one
+//! dma-buf so, by its rule for dma-bufs (it imports one only into a host-visible, host-coherent
+//! type): measured on an RTX 3090 (driver 620.70.06, 2026-11-20), the query of a udmabuf's fd
+//! offers types 0x11, none of them both, so a boot there counts one
+//! [`IMPORTS_FROM_FILES_DMA_BUF_REFUSED`], at the process's first such view, and maps every later
+//! view from its files, which the guest does not see. Pages in no dma-buf's mapping go by their
+//! pointer first.
 //! From before an import asks where its pages lie until rt frees an import of their pointer, the
 //! platform holds their mappings as they are (`crate::os`'s `MappingsHeld`), so no fold of the
 //! views maps them through dma-bufs under it (`vm`'s docs, "Folding back").
