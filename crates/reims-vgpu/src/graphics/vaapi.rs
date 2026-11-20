@@ -1465,17 +1465,21 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
             return Ok(());
         }
         // Into its cache's surface over Direct3D 11 textures: drawn there from the shared
-        // texture it was decoded into, and the platform's images see it once the draw's writes
-        // are said done (`graphics::drawn`). A picture not drawn is copied there by the CPU.
+        // texture it was decoded into once its decode is done, which is told first, so that what
+        // is left is the draw, which the output's readers wait for; and the platform's images see
+        // it once the draw's writes are said done (`graphics::drawn`). A picture not drawn is
+        // copied there by the CPU.
         #[cfg(windows)]
         let undrawn = match (&to.luma.drawn, &to.chroma.drawn) {
-            (Some(luma), Some(_)) => match luma.planes.draw(&self.frame) {
-                Ok(()) => {
-                    luma.memory.external_writes_done()?;
-                    return Ok(());
+            (Some(luma), Some(_)) => {
+                match luma.planes.draw(&self.frame, &mut || to.decode_done()) {
+                    Ok(()) => {
+                        luma.memory.external_writes_done()?;
+                        return Ok(());
+                    }
+                    Err(why) => Some(format!("not drawn into its cache's surface: {why}")),
                 }
-                Err(why) => Some(format!("not drawn into its cache's surface: {why}")),
-            },
+            }
             _ => None,
         };
         let bit_depth = self.frame.bit_depth();

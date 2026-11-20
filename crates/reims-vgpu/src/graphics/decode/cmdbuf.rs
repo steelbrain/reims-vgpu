@@ -6142,6 +6142,108 @@ mod tests {
         assert!(writers(&r).is_empty());
     }
 
+    /// A blit of another queue that copies from a decode's output, its luma texture's texels and
+    /// its buffer's bytes, begun after the decode's completion went at its decode, waits on the
+    /// GPU, ahead of its copies, for the value the decode's buffer signals at its end; and the
+    /// decode's buffer signals it only behind its wait for its session's event to reach the
+    /// decode's value, which the session signals once the picture has landed, its copy or its draw
+    /// done (`super::super::super::video_host`'s tests,
+    /// `a_picture_landed_behind_its_decode_done_is_posted_then_and_signalled_once_landed`). The
+    /// guest names the output's block with the copies, as its driver names every surface a buffer
+    /// uses.
+    #[test]
+    fn a_blit_from_a_decode_completed_ahead_copies_after_its_end() {
+        use super::super::surface_pages::tests::BLOCK;
+        use reims_vgpu_graphics::ops::blit::{
+            RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, RGFX_OP_BLIT_COPY_TEXTURE_TO_BUFFER,
+            RgfxBlitOpCopyBufferToBuffer, RgfxBlitOpCopyTextureToBuffer,
+        };
+        use reims_vgpu_graphics::ops::{RGFX_OP_SURFACE_USE, RgfxOpSurfaceUse};
+
+        let (mut r, seen, records, _) = video_posting();
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, true))
+                .unwrap(),
+            Ok(())
+        );
+        let decoding = event_calls(&r, mark);
+        let session = (decoding.iter())
+            .position(|&(signals, _, value)| !signals && value == 1)
+            .expect("the decode's buffer waits for its session's value");
+        let signals: Vec<_> = (decoding.iter().enumerate())
+            .filter(|&(_, &(signals, ..))| signals)
+            .map(|(at, &call)| (at, call))
+            .collect();
+        assert!(
+            !signals.is_empty() && signals.iter().all(|&(at, _)| at > session),
+            "its end's signals come behind its session's wait: {decoding:?}"
+        );
+        Arc::clone(&seen.landings.lock()[0]).decoded();
+        assert_eq!(posted(&records).len(), 1);
+
+        let surface_use = RgfxOpSurfaceUse {
+            block_offset: BLOCK,
+            cpu_gen: 0,
+            flags: 0,
+            reserved_14: 0,
+        };
+        let texels = RgfxBlitOpCopyTextureToBuffer {
+            source_texture_obj_id: 7,
+            destination_buffer_obj_id: 2,
+            source_size_width: 64,
+            source_size_height: 16,
+            source_size_depth: 1,
+            destination_bytes_per_row: 64,
+            destination_bytes_per_image: 64 * 16,
+            ..RgfxBlitOpCopyTextureToBuffer::default()
+        };
+        let bytes = RgfxBlitOpCopyBufferToBuffer {
+            source_buffer_obj_id: 6,
+            destination_buffer_obj_id: 2,
+            source_offset: 32,
+            destination_offset: 2048,
+            size: 64 * 16,
+        };
+        let mut ops = op(RGFX_OP_SURFACE_USE, surface_use.as_bytes());
+        ops.extend(op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]));
+        ops.extend(op(RGFX_OP_BLIT_COPY_TEXTURE_TO_BUFFER, texels.as_bytes()));
+        ops.extend(op(RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, bytes.as_bytes()));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let blit = on_queue(command_buffer_message(200, 1, &ops), 9);
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.dec.decode(&r.device, &blit).unwrap(), Ok(()));
+        let calls = r.p.call_log().since(mark);
+        let id = |a: Option<&Arg>| a.and_then(Arg::as_obj).map_or(0, |o| o.0);
+        let wait = (calls.iter())
+            .position(|c| {
+                c.sel == "encodeWaitForEvent:value:"
+                    && signals.iter().any(|&(_, (_, event, value))| {
+                        id(c.args.first()) == event && c.args.get(1) == Some(&Arg::U64(value))
+                    })
+            })
+            .expect("the blit waits for the decode's buffer's end");
+        let Some(ObjHandle::Buffer(into)) = r.dec.object(2) else {
+            panic!("no buffer 2");
+        };
+        let into = Arg::obj(into);
+        let copies: Vec<_> = (calls.iter().enumerate())
+            .filter(|(_, c)| c.sel.starts_with("copyFrom") && c.args.contains(&into))
+            .map(|(at, c)| (at, c.sel.split(':').next().unwrap_or_default()))
+            .collect();
+        assert!(
+            (copies.iter()).any(|&(_, sel)| sel == "copyFromTexture")
+                && (copies.iter()).any(|&(_, sel)| sel == "copyFromBuffer"),
+            "{copies:?}"
+        );
+        assert!(
+            copies.iter().all(|&(at, _)| at > wait),
+            "a copy ahead of its wait: {copies:?}, the wait at {wait}"
+        );
+        assert_eq!(r.dec.shared.surface_order.lock().counts().held, 1);
+    }
+
     /// A decoder's new output, a command buffer of a decode alone whose textures are the whole of
     /// the surface's two planes, takes no fill of its cache: the cache made as zeros, the decode
     /// waits for those, its picture lands over them, and nothing is copied in from the pages. The

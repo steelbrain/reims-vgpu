@@ -20,21 +20,24 @@
 //! complete is a decode error").
 //!
 //! **Completed at the decode.** A session whose picture lands in its output's device caches by
-//! GPU work of its own after the decode is done (the VA-API arm's video processing,
-//! `super::super::vaapi`) tells of the decode done as it issues that work ([`Landed::decoded`]).
-//! A command buffer of that decode alone, which waits for no event and signals none, then posts
-//! its `CB_COMPLETE` there, in its queue's order of records, ahead of its platform end
-//! ([`Landed::arm`], `super::cmdbuf`): the guest's decoder hands the picture on while the copy
-//! runs. Everything else stays at the platform end, after the copy: the session's signal, the
-//! buffer's surface timeline and its caches' copies into the pages, which every reader of the
-//! output waits for (a GPU reader on another queue, a lock's download, a present), the queue's
+//! GPU work of its own after the decode is done tells of the decode done as that work is all that
+//! is left ([`Landed::decoded`]): the VA-API arm's video processing, as it issues its copy, and
+//! on Windows its draw into a cache's surface over Direct3D 11 textures, before the draw
+//! (`super::super::vaapi`, `super::super::drawn`). A command buffer of that decode alone, which
+//! waits for no event and signals none, then posts its `CB_COMPLETE` there, in its queue's order
+//! of records, ahead of its platform end ([`Landed::arm`], `super::cmdbuf`): the guest's decoder
+//! hands the picture on while the copy or the draw runs. Everything else stays at the platform
+//! end, after the copy or the draw: the session's signal, the buffer's surface timeline and its
+//! caches' copies into the pages, which every reader of the output waits for (a GPU reader on
+//! another queue, a blit or copy from it among them, a lock's download, a present), the queue's
 //! later work, the drain of its context and its place among the queue's buffers in flight. Such
 //! a `CB_COMPLETE` carries no GPU times (0 for each), and is posted on the thread that tells of
 //! the decode done (the VA-API arm's picture landing thread, `reims-vgpu.graphics-video-land`),
-//! or on the buffer's lane where the decode was done before its commit. A picture whose copy then
-//! fails, its buffer completed already as landed, fails the session's next decode in its stead,
-//! whose buffer completes failed at its platform end: the guest is told of the failure one
-//! picture late (`super::super::video_host::CARRIED_CODE`, counted as a degradation).
+//! or on the buffer's lane where the decode was done before its commit. A picture that then fails
+//! to land (its copy, or a draw and the CPU's copy after it), its buffer completed already as
+//! landed, fails the session's next decode in its stead, whose buffer completes failed at its
+//! platform end: the guest is told of the failure one picture late
+//! (`super::super::video_host::CARRIED_CODE`, counted as a degradation).
 
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
@@ -453,6 +456,13 @@ impl Landed {
         self.arm(Box::new(|landed| {
             landed.post();
         }));
+    }
+
+    /// Whether the command buffer's completion was posted, at the decode or at its end, for the
+    /// tests of the sessions that land pictures.
+    #[cfg(test)]
+    pub(crate) fn posted(&self) -> bool {
+        self.0.lock().posted.is_some()
     }
 
     /// Fixes what the command buffer's completion answers, once: whether the picture failed, to

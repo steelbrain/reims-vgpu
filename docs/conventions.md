@@ -152,12 +152,12 @@ repeats the ones code cites.
     `video-drawn-spares-wait-max-ns` the longest wait, and
     `video-drawn-spares-made` and `video-drawn-spares-dropped`, the spares
     made and those dropped untaken: no degradation) and its decodes'
-    (`video-landing-failure-carried`, a picture whose copy into its output's
-    caches failed after its command buffer completed at its decode, the
-    session's next decode failing in its stead), the rt platform's on Windows
-    (`rt-d3d11-surfaces`, the surfaces over Direct3D 11 textures it made,
-    and `rt-refused-d3d11-surface`, those it refused), the Vulkan
-    platform's command predication's
+    (`video-landing-failure-carried`, a picture whose copy or draw into its
+    output's caches failed after its command buffer completed at its
+    decode, the session's next decode failing in its stead), the rt
+    platform's on Windows (`rt-d3d11-surfaces`, the surfaces over Direct3D
+    11 textures it made, and `rt-refused-d3d11-surface`, those it refused),
+    the Vulkan platform's command predication's
     (`predication-loop-overrun`, a command buffer whose loop ran past the
     iterations laid down for it, which fails), and the contexts' Private
     takes' (`private-take-queued`, a take that waited behind its context's

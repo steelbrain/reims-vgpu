@@ -310,7 +310,8 @@ impl<P: Platform> Landing<'_, P> {
     /// the output's device caches, which every reader of the output waits for: where both planes
     /// lie in caches, the command buffer that waits for the picture may post its completion now
     /// ([`Landed::decoded`]; `super::decode`'s video module docs, "Completed at the decode"). Said
-    /// by the VA-API arm's video processing into the caches (`super::vaapi`).
+    /// by the VA-API arm's video processing into the caches, and on Windows by its draw into a
+    /// cache's surface over Direct3D 11 textures (`super::vaapi`, `super::drawn`).
     pub(crate) fn decode_done(&self) {
         if self.luma.cached && self.chroma.cached {
             self.landed.decoded();

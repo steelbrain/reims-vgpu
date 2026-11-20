@@ -144,23 +144,25 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   reach the value the decode signals once its picture has landed. So a CPU lock of the output
   waits for the picture, as for any GPU write.
 - **A command buffer of a decode alone into device caches completes at the decode**, where the
-  VA-API arm copies the picture into the caches by its video processing on the GPU: its
-  `CB_COMPLETE` goes as the decode is done and that copy is issued, in its queue's order, with
-  GPU times of 0, so the guest's decoder hands the picture on while the copy runs. The rest stays
-  at the buffer's end, after the copy: its later work, its surface timeline and the caches' copy
-  into the pages. Every reader of the output that the guest's writer slots, emptied at the
-  `CB_COMPLETE`, no longer point at the decode waits for that end all the same: a command buffer
-  of another queue that uses the output, on the GPU, or on the CPU for a decode; a CPU lock's
-  download; and a present (reims-vgpu's `graphics/decode/video.rs`, "Completed at the decode").
+  VA-API arm copies the picture into the caches by its video processing on the GPU, or on Windows
+  draws it into a cache's surface over Direct3D 11 textures: its `CB_COMPLETE` goes as the decode
+  is done and that copy is issued, or before that draw, in its queue's order, with GPU times of 0,
+  so the guest's decoder hands the picture on while the copy or the draw runs. The rest stays at
+  the buffer's end, after the copy or the draw: its later work, its surface timeline and the
+  caches' copy into the pages. Every reader of the output that the guest's writer slots, emptied
+  at the `CB_COMPLETE`, no longer point at the decode waits for that end all the same: a command
+  buffer of another queue that uses the output (a blit or copy from it among them), on the GPU,
+  or on the CPU for a decode; a CPU lock's download; and a present (reims-vgpu's
+  `graphics/decode/video.rs`, "Completed at the decode").
 - **A picture that fails to land** still signals its value, and the command buffer completes
   failed, with Metal's internal error. The guest's video driver answers that as a decode error:
   an HEVC picture's schedule waits for its verdict and fails (`kVTVideoDecoderMalfunctionErr`,
   design.md, "A decode the driver cannot complete is a decode error"); an H.264 picture reaches
   the guest as decoded, as AppleGVA's H.264 decoder reports no failure, so the driver refuses what
   it can tell before a picture, its size, at the create ([bugs.md](bugs.md), D25). A picture
-  whose copy into its output's caches fails after its command buffer completed at the decode
-  (above) fails the session's next decode in its stead, whose command buffer completes failed at
-  its end: the guest is told of the failure one picture late, counted as a degradation
+  whose copy or draw into its output's caches fails after its command buffer completed at the
+  decode (above) fails the session's next decode in its stead, whose command buffer completes
+  failed at its end: the guest is told of the failure one picture late, counted as a degradation
   (`video-landing-failure-carried`).
 - **A failed picture's output holds what the driver wrote** where the driver writes the output
   itself: a picture decoded into its output's cache, and one the driver's video processing

@@ -8,9 +8,13 @@
 //! element is one packed pair. reims-vgpu-video's `PlaneDraw` makes them ([`DrawnPlanes::new`])
 //! and the platform imports them (`GpuDevice::import_d3d11_surface`). A decode whose planes are
 //! the surface's then lands its picture by one draw from the shared Direct3D 12 texture that
-//! VA-API decoded it into ([`DrawnPlanes::draw`]). The draw holds the targets' keyed mutexes
-//! across its write, waits for it on the landing's thread and releases them, and the landing then
-//! says the writes are done (`ImportedSurfaceMemory::external_writes_done`).
+//! VA-API decoded it into ([`DrawnPlanes::draw`]). The landing waits for the decode, tells of it
+//! done (`Landing::decode_done`), and then draws: a command buffer of the decode alone completes
+//! as the decode is done, with the draw running behind it, and every reader of the output waits
+//! for the draw (`decode`'s video module docs, "Completed at the decode"). The draw holds the
+//! targets' keyed mutexes across its write, waits for it on the landing's thread and releases
+//! them, and the landing then says the writes are done
+//! (`ImportedSurfaceMemory::external_writes_done`), before the session signals the decode.
 //!
 //! A new cache's plane shapes owe a fill from its buffer, its make's zeros. A decode that takes
 //! the cache's first fill as met takes theirs as met too (`decode::surface_cache`'s
@@ -68,14 +72,16 @@ impl DrawnPlanes {
         &self.targets
     }
 
-    /// Draws `frame`'s crop into the textures once its decode is done (the module doc), and
-    /// counts it. `Err` says why it was not drawn, the textures cleared to the zeros they owe
-    /// first ([`Self::unwritten`]).
-    pub(crate) fn draw(&self, frame: &Frame) -> Result<(), String> {
+    /// Draws `frame`'s crop into the textures once its decode is done, telling `decoded` between
+    /// the two (the module doc), and counts it. `Err` says why it was not drawn, the textures
+    /// cleared to the zeros they owe first ([`Self::unwritten`]); `decoded` is told only of a
+    /// decode that is done.
+    pub(crate) fn draw(&self, frame: &Frame, decoded: &mut dyn FnMut()) -> Result<(), String> {
         let drawn = frame
             .sync()
             .map_err(|error| error.to_string())
             .and_then(|()| {
+                decoded();
                 let texture = (frame.texture()).ok_or("the picture lies in no shared texture")?;
                 let extent = (frame.width(), frame.height());
                 self.draw

@@ -65,6 +65,9 @@ enum Picture {
     Fail,
     /// A failure to land once `go` is sent, after its decode was said done.
     FailDone(mpsc::Receiver<()>),
+    /// As `Fill`, once `go` is sent, after its decode was said done and `told` sent: the rest of
+    /// a landing behind its decode, as the VA-API arm's video processing and its draw on Windows.
+    DoneGated(u8, Log, mpsc::Sender<()>, mpsc::Receiver<()>),
     /// As `Fill`, of a decode the hardware answered failed.
     FailedFill(u8, Log),
 }
@@ -117,6 +120,12 @@ impl HostPicture<P> for Picture {
                 go.recv().unwrap();
                 to.decode_done();
                 Err("the GPU failed the copy".into())
+            }
+            Picture::DoneGated(n, log, told, go) => {
+                to.decode_done();
+                told.send(()).unwrap();
+                go.recv().unwrap();
+                fill(to, n, &log)
             }
             Picture::FailedFill(n, log) => {
                 to.hardware_failed("status 8".to_owned());
@@ -536,6 +545,52 @@ fn a_failure_after_a_completion_at_the_decode_fails_the_next_decode_alone() {
     );
     assert!(holds(&bytes(&pages), 0, 64, 96, 3));
     assert_eq!(s.counts.lock().failed, 1);
+}
+
+/// A picture whose landing tells of its decode done before the rest of it (the VA-API arm's video
+/// processing, and on Windows its draw into a cache's surface) has its command buffer's
+/// completion posted then, while the session's event, which the buffer's end and so every reader
+/// of the output waits for, reaches the decode's value only once the rest has landed: its planes
+/// written and copied into their caches (`super::super::decode`'s video module docs, "Completed
+/// at the decode").
+#[test]
+fn a_picture_landed_behind_its_decode_done_is_posted_then_and_signalled_once_landed() {
+    let p = FakePlatform::new();
+    p.world().set_auto_complete(Some(CompleteOn::Caller));
+    let log = Log::default();
+    let (told, heard) = mpsc::channel();
+    let (go, gate) = mpsc::channel();
+    let picture = Picture::DoneGated(5, Arc::clone(&log), told, gate);
+    let s = session(&p, vec![Ok(Some(picture))], &log);
+    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
+    let cache = buffer(&p, 16384, PRIVATE);
+    let landed = (s.decode(&decode(&bitstream, &[], planes(&cache, &cache, 128))))
+        .unwrap()
+        .landed
+        .unwrap();
+    // Its command buffer's commit arms its completion's post at the decode.
+    landed.arm_answering();
+    heard.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(landed.posted(), "its completion goes at its decode");
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        event_of(&s).signaled_value(),
+        0,
+        "signalled before it landed"
+    );
+    assert!(p.call_log().calls_to(COPY).is_empty());
+    assert!(!log.lock().iter().any(|s| matches!(s, Seen::Landed { .. })));
+
+    go.send(()).unwrap();
+    assert!(event_of(&s).wait_until_signaled_value(1, 10_000));
+    assert!(log.lock().iter().any(|s| matches!(s, Seen::Landed { .. })));
+    assert_eq!(
+        p.call_log().calls_to(COPY).len(),
+        2,
+        "its planes copied into their caches before the signal"
+    );
+    assert!(!landed.failed());
+    assert_eq!(s.counts.lock().failed, 0);
 }
 
 /// A picture the hardware answered failed that its backend lands all the same lands as any, its
