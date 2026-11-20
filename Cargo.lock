@@ -408,6 +408,7 @@ dependencies = [
 name = "reims-vgpu"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "libc",
  "log",
  "metal2vulkan-runtime",

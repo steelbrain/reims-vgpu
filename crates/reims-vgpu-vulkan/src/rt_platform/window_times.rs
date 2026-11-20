@@ -18,7 +18,8 @@
 //!   with an error has no GPU times, and is not counted.
 //! - **`vkCreateSwapchainKHR`**: the CPU time inside each call of a window's swapchain, made or
 //!   refused, holding the window system's lock: a window makes one at its first draw and at each
-//!   remake (a new size, a swapchain out of date).
+//!   remake (a new size, a swapchain out of date), and none once rt's device is lost
+//!   (`super::swapchain`'s docs, "A lost device").
 //!
 //! The CPU times are on the trace's clock ([`crate::core::trace::now`]). The trace
 //! (`REIMS_VGPU_TRACE`) times the same spans one by one where it is on: `winacquire` each take's

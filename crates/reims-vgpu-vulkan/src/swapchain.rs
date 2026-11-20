@@ -63,8 +63,10 @@
 //! `oldSwapchain` while the window has a swapchain, and a retired one is the window's until it
 //! is destroyed (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`, read from the specification of
 //! `vkCreateSwapchainKHR` and `VkSwapchainCreateInfoKHR`). A swapchain the surface refuses for
-//! now is tried again at the next draw ([`remake`]); only a lost surface, or a lost device, ends
-//! the swapchain's draws ([`Acquired::Failed`]).
+//! now is tried again at the next draw ([`remake`]); only a lost surface ends the swapchain's
+//! draws ([`Acquired::Failed`]), or a lost device, which ends every Vulkan call of the swapchain's
+//! on it but its end's destroys ([`Acquired::Lost`], the rt platform's swapchain's module doc, "A
+//! lost device").
 //!
 //! **Retiring one, with no wait on the queue.** A retired swapchain, its images' textures and
 //! their semaphores are destroyed once nothing uses them: its frames' command buffers have
@@ -151,8 +153,13 @@ pub enum Acquired {
     /// No image yet: the compositor has not given one back in time, or the swapchain was made
     /// again. The draw is tried again.
     Retry,
-    /// No image, nor will there be: the surface is lost, or the device.
+    /// No image, nor will there be: the surface is lost, or a call of the window system's or rt's
+    /// failed. A new swapchain over a new surface may draw again.
     Failed,
+    /// No image, nor will there be: the GPU device is lost, which nothing makes again. The
+    /// swapchain makes no Vulkan call on it from here but its end's destroys, and nothing made on
+    /// it can draw: the window keeps the frame it shows.
+    Lost,
 }
 
 /// An image a draw took, until it is presented or kept for the next draw.

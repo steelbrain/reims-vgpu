@@ -61,6 +61,8 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 reims-vgpu-vulkan = { workspace = true, features = ["testkit"] }
+# A test's window, which makes the Vulkan surfaces asked of it (`graphics::rt_window`'s tests).
+ash.workspace = true
 # The tests' host calls: on Linux the guest's RAM as a host maps it (`platform::tests`), whether a
 # page is mapped, and the cost measurements' clocks and threads.
 libc.workspace = true

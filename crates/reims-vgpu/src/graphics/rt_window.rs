@@ -10,6 +10,12 @@
 //! compositor's GPU: rt makes one device for everything. The route is logged once a sink, at its
 //! first presenter.
 //!
+//! **A lost device.** Once rt's device is known lost, which nothing makes again
+//! (`reims_vgpu_vulkan::rt_platform::swapchain`'s module doc, "A lost device"), a presenter's draw
+//! answers [`Drawn::Lost`] with no Vulkan call made: the window keeps it, and the frame it shows,
+//! to its end. The sink makes no presenter on a lost device, nor the window's surface: a window
+//! made after the loss stays empty.
+//!
 //! **A frame's GPU time** is counted for the host's summary where it counts the window's times
 //! (`reims_vgpu_vulkan::rt_platform::window_times`): a completed handler of the frame's command
 //! buffer, added after its presents' handler and before its commit, hands on its GPU start and
@@ -95,8 +101,17 @@ impl RtScanoutSink {
 
 impl FrameSink for RtScanoutSink {
     /// The window's surface on rt's instance and a swapchain over it on rt's device; none where
-    /// either is refused, which is logged.
+    /// either is refused, or rt's device is known lost (the module doc, "A lost device"), which is
+    /// logged.
     fn presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>> {
+        if self.draw.device.loss().is_lost() {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "no swapchain for the graphics display's window: rt's device is lost, which \
+                 nothing makes again, and the window stays empty"
+            );
+            return None;
+        }
         self.log_route(target);
         match swapchain_over(&self.draw, target) {
             Ok(swapchain) => Some(Box::new(RtPresenter {
@@ -153,8 +168,9 @@ impl Presenter for RtPresenter {
             let frame = match self.swapchain.acquire(drawable) {
                 Acquired::Image(frame) => frame,
                 Acquired::Retry => return Drawn::Retry,
-                // rt parks no device: a take that ends answers Failed.
+                // rt parks no device: a take that ends answers Failed, or Lost.
                 Acquired::Failed => return Drawn::Ended,
+                Acquired::Lost => return Drawn::Lost,
             };
             let Some(texture) = self.swapchain.texture(frame) else {
                 return Drawn::Nothing;
@@ -185,5 +201,56 @@ impl Presenter for RtPresenter {
                 false => Drawn::Nothing,
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicU32;
+
+    use ash::vk;
+
+    use super::*;
+
+    /// A window that makes no surface, counting the surfaces asked of it.
+    #[derive(Default)]
+    struct Counting(AtomicU32);
+
+    impl VulkanTarget for Counting {
+        fn create_surface(
+            &self,
+            _get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
+            _instance: vk::Instance,
+        ) -> Option<vk::SurfaceKHR> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+    }
+
+    /// On the host's GPU, once rt's device is known lost the sink makes no presenter, and asks the
+    /// window for no surface: a window made after the loss stays empty (the module doc, "A lost
+    /// device")
+    #[test]
+    fn on_vulkan_a_lost_device_s_sink_asks_for_no_surface() {
+        let platform = crate::rt_test_end::platform();
+        entry::run(|_| {
+            let region = Arc::new(Region::new(reims_vgpu_graphics::REGION_SIZE as usize).unwrap());
+            let shown = Arc::new(Shown::default());
+            let presented = Arc::new(Presented::<RtPlatform>::default());
+            let draw = ScanoutDraw::new(Arc::clone(&platform), &region, &shown, &presented);
+            let sink = RtScanoutSink {
+                draw: Arc::new(draw.expect("the scanout's draw on rt's device")),
+                routed: AtomicBool::new(false),
+            };
+            let window = Counting::default();
+            assert!(
+                sink.presenter(&window).is_none(),
+                "no surface, no presenter"
+            );
+            assert_eq!(window.0.load(Ordering::SeqCst), 1, "asked before the loss");
+            sink.draw.device.loss().seen_lost();
+            assert!(sink.presenter(&window).is_none());
+            assert_eq!(window.0.load(Ordering::SeqCst), 1, "asked for none after");
+        });
     }
 }

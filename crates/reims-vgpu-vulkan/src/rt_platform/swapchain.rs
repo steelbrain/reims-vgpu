@@ -56,8 +56,19 @@
 //! value until a signal of it is submitted, and submits no semaphore wait for it (rt's
 //! `encode_wait_for_event`), so submitted work waits on nothing a later submission signals.
 //!
-//! **No device recovery.** rt makes its device once and recovers none: a lost device fails the
-//! take or the present, and the window's draws end ([`Acquired::Failed`]).
+//! **A lost device.** rt makes its device once and recovers none. Once the device is known lost
+//! (`DeviceLoss::is_lost`: one of rt's command buffers failed with it lost, a frame's command
+//! buffer ended with rt's error naming a lost device, or a Vulkan call of the swapchain's
+//! answered `VK_ERROR_DEVICE_LOST`), the swapchain makes no Vulkan call on it but its end's
+//! destroys: no create, take, wait, present or remake, and no clear of rt's at a retire. Every
+//! draw answers [`Acquired::Lost`] at once, and a present presents nothing; the window keeps the
+//! frame it shows. Vulkan allows any call on a lost device ("It is still legal to call any API
+//! command on the device and child objects", the specification's "Lost Device"), and the calls
+//! achieve nothing there; Intel's Windows driver for a UHD 630 died of an access violation inside
+//! one of them (`vkCreateSwapchainKHR`, retried at every draw for about 6 minutes after the loss,
+//! **measured** 2026-11-20). The destroys are the calls the specification still asks for: a lost
+//! device's objects stay valid until destroyed, and are destroyed before their device, which rt
+//! destroys at the host's let-go of it. None waits first: nothing runs on a lost device any more.
 
 use ash::{khr, vk};
 use metal2vulkan_runtime as rt;
@@ -341,8 +352,12 @@ impl RtSwapchain {
     /// else the next the compositor gives, waited for up to [`WAIT_NS`] ([`take_image`]), its
     /// fence waited for up to [`WAIT_NS`] and its `drawable_acquired` made, else a retry (the
     /// module doc). Makes the swapchain first where there is none, where it is stale, or where
-    /// its size is another.
+    /// its size is another. [`Acquired::Lost`], with no call made, once rt's device is known lost
+    /// (the module doc, "A lost device").
     pub fn acquire(&mut self, size: (u64, u64)) -> Acquired {
+        if self.device_lost() {
+            return self.lost_device();
+        }
         if size.0 == 0 || size.1 == 0 {
             return Acquired::Retry;
         }
@@ -350,6 +365,7 @@ impl RtSwapchain {
         if self.stale || current != Some(size) {
             match self.remake(size) {
                 Ok(()) => self.refusing = false,
+                Err(_) if self.device_lost() => return self.lost_device(),
                 Err(e) if self.lost => {
                     log::warn!(
                         target: TARGET, kind:? = e;
@@ -430,6 +446,10 @@ impl RtSwapchain {
                 self.stale = true;
                 Acquired::Retry
             }
+            Err(vk::Result::ERROR_DEVICE_LOST) => {
+                self.note("vkAcquireNextImageKHR", vk::Result::ERROR_DEVICE_LOST);
+                self.lost_device()
+            }
             Err(e) => {
                 log::warn!(
                     target: TARGET, kind:? = e;
@@ -438,6 +458,29 @@ impl RtSwapchain {
                 Acquired::Failed
             }
         }
+    }
+
+    /// Whether rt's device is known lost (the module doc, "A lost device"): the swapchain makes
+    /// no Vulkan call on it from then on but its end's destroys.
+    fn device_lost(&self) -> bool {
+        self.device.loss().is_lost()
+    }
+
+    /// The answer of a draw once rt's device is known lost: [`Acquired::Lost`], logged.
+    fn lost_device(&self) -> Acquired {
+        log::warn!(
+            target: TARGET,
+            "rt's device is lost, which nothing makes again: the window stops presenting and keeps \
+             the frame it shows, and its swapchain makes no Vulkan call on the device but its \
+             end's destroys"
+        );
+        Acquired::Lost
+    }
+
+    /// Notes `result`, the answer of the swapchain's Vulkan call `call` on rt's device
+    /// ([`answer_seen`]).
+    fn note(&self, call: &'static str, result: vk::Result) {
+        answer_seen(&self.device, call, result);
     }
 
     /// Waits up to [`WAIT_NS`] for image `index`'s fence: the image, its `drawable_acquired`
@@ -457,6 +500,10 @@ impl RtSwapchain {
             Ok(()) => {
                 // SAFETY: the fence has signalled, and nothing else waits on it.
                 if let Err(e) = unsafe { self.vk.reset_fences(&[self.fence]) } {
+                    self.note("vkResetFences", e);
+                    if self.device_lost() {
+                        return self.lost_device();
+                    }
                     log::warn!(target: TARGET, kind:? = e; "vkResetFences: {e}");
                     return Acquired::Failed;
                 }
@@ -468,6 +515,10 @@ impl RtSwapchain {
             Err(vk::Result::TIMEOUT) => {
                 self.pending = Some(index);
                 Acquired::Retry
+            }
+            Err(vk::Result::ERROR_DEVICE_LOST) => {
+                self.note("vkWaitForFences", vk::Result::ERROR_DEVICE_LOST);
+                self.lost_device()
             }
             Err(e) => {
                 log::warn!(target: TARGET, kind:? = e; "vkWaitForFences: {e}");
@@ -490,6 +541,7 @@ impl RtSwapchain {
                 self.held = Some(index);
                 Acquired::Image(Frame::at(index))
             }
+            Err(_) if self.device_lost() => self.lost_device(),
             Err(e) => {
                 rt_refused(NEXT_DRAWABLE, &e);
                 log::warn!(
@@ -542,8 +594,9 @@ impl RtSwapchain {
     /// fence of its own where the device has present fences. A swapchain the compositor reports
     /// out of date or suboptimal, or whose frame ended without running, is made again at the next
     /// draw. Waits for the scheduling alone. False where nothing was presented: the commit was
-    /// refused (counted, `RtCommandBuffer`'s commit), and the image is kept for the next draw, or
-    /// the frame ended without running.
+    /// refused (counted, `RtCommandBuffer`'s commit), and the image is kept for the next draw, the
+    /// frame ended without running, or rt's device is known lost, which a frame that ended with
+    /// rt's error naming a lost device makes it (the module doc, "A lost device").
     pub fn present(&mut self, frame: Frame, command_buffer: &RtCommandBuffer) -> bool {
         let raw = command_buffer.rt().clone();
         if matches!(
@@ -573,6 +626,12 @@ impl RtSwapchain {
         let scheduled = raw.wait_until_scheduled();
         began.end("window-scheduled");
         if scheduled.is_err() || raw.status() == rt::CommandBufferStatus::Error {
+            if matches!(raw.error(), Some(rt::CommandBufferError::DeviceLost { .. })) {
+                // Known lost from here, before its completed handlers tell the device: nothing
+                // is presented or made again (the module doc, "A lost device").
+                self.device.loss().seen_lost();
+                return false;
+            }
             // It signals nothing, and the image stays taken, its move home perhaps not run: the
             // swapchain is made again, its retire settling the image (the module doc).
             log::warn!(
@@ -581,6 +640,10 @@ impl RtSwapchain {
             );
             image.acquired = true;
             self.stale = true;
+            return false;
+        }
+        if self.device.loss().is_lost() {
+            // Lost since the take: nothing is presented (the module doc, "A lost device").
             return false;
         }
         let waits = [image.ready];
@@ -649,6 +712,7 @@ impl RtSwapchain {
             Ok(suboptimal) => self.stale |= suboptimal,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.stale = true,
             Err(e) => {
+                self.note("vkQueuePresentKHR", e);
                 log::warn!(target: TARGET, kind:? = e; "vkQueuePresentKHR: {e}");
                 self.stale = true;
             }
@@ -678,10 +742,12 @@ impl RtSwapchain {
 
     /// Destroys every retired swapchain once its presents are known complete, waiting for their
     /// fences, or where they do not tell it, for the presenting queue to idle (the module doc);
-    /// `why` is logged where it waits for the queue.
+    /// `why` is logged where it waits for the queue. With rt's device known lost, it waits for
+    /// nothing (the module doc, "A lost device").
     fn end_retired(&mut self, why: &str) {
         let newest = self.retired.iter().map(Chain::last_present).max();
         if let Some(newest) = newest
+            && !self.device_lost()
             && !self.wait_fences(newest)
         {
             self.wait_idle(why);
@@ -719,8 +785,12 @@ impl RtSwapchain {
     /// it: a command buffer with commands committed after the call has then completed, which
     /// carried the image's move home (the module doc, "Destroying a swapchain"). What the image
     /// held is never shown: the swapchain goes. A clear rt refuses is logged, and the swapchain
-    /// goes all the same.
+    /// goes all the same. With rt's device known lost, none is committed: nothing runs there any
+    /// more, a move home included (the module doc, "A lost device").
     fn settle_acquired(&mut self, chain: &mut Chain) {
+        if self.device_lost() {
+            return;
+        }
         for image in chain.images.iter_mut().filter(|i| i.acquired) {
             image.acquired = false;
             if let Err(e) = self.clear(&image.texture) {
@@ -765,8 +835,12 @@ impl RtSwapchain {
 
     /// Destroys the retired swapchains whose last present is known complete; past [`RETIRED`]
     /// kept, waits first for the oldest one's presents' fences, or where they do not tell it, for
-    /// the presenting queue to idle (the module doc).
+    /// the presenting queue to idle (the module doc). With rt's device known lost, it does
+    /// nothing: the end destroys them (the module doc, "A lost device").
     fn collect(&mut self) {
+        if self.device_lost() {
+            return;
+        }
         self.poll_fences();
         if self.retired.len() > RETIRED {
             let oldest = self.retired.first().map_or(0, Chain::last_present);
@@ -803,6 +877,7 @@ impl RtSwapchain {
         let wait = |queue: vk::Queue| unsafe { commands.queue_wait_idle(queue) };
         let idle = self.device.rt().with_present_queue(wait);
         if let Err(e) = idle {
+            self.note("vkQueueWaitIdle", e);
             log::warn!(target: TARGET, kind:? = e; "vkQueueWaitIdle: {e}");
         }
         self.presents.idle();
@@ -822,6 +897,7 @@ impl RtSwapchain {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {
+                    answer_seen(&self.device, "vkGetFenceStatus", e);
                     log::warn!(target: TARGET, kind:? = e; "vkGetFenceStatus: {e}");
                     break;
                 }
@@ -851,7 +927,10 @@ impl RtSwapchain {
             .collect();
         if !waited.is_empty() {
             // SAFETY: the fences are live, each chained into a present that was enqueued.
-            let _ = unsafe { self.vk.wait_for_fences(&waited, true, END_WAIT_NS) };
+            let answer = unsafe { self.vk.wait_for_fences(&waited, true, END_WAIT_NS) };
+            if let Err(e) = answer {
+                self.note("vkWaitForFences", e);
+            }
         }
         self.poll_fences();
         self.presents.done(last)
@@ -859,11 +938,19 @@ impl RtSwapchain {
 
     /// Waits for an image still pending on the fence, up to [`END_WAIT_NS`], so the fence is
     /// unsignalled with nothing pending on it; where the wait runs out, it is left behind and
-    /// another made. The image's index where its fence signalled: it was taken.
+    /// another made. The image's index where its fence signalled: it was taken. With rt's device
+    /// known lost, it waits for nothing and makes nothing, and the fence goes with the swapchain
+    /// (the module doc, "A lost device").
     fn settle_fence(&mut self) -> Option<u32> {
         let index = self.pending.take()?;
+        if self.device_lost() {
+            return None;
+        }
         // SAFETY: the fence is live.
         let waited = unsafe { self.vk.wait_for_fences(&[self.fence], true, END_WAIT_NS) };
+        if let Err(e) = waited {
+            self.note("vkWaitForFences", e);
+        }
         // SAFETY: the fence has signalled, or is left behind unused.
         let settled = waited.is_ok() && unsafe { self.vk.reset_fences(&[self.fence]) }.is_ok();
         if !settled {
@@ -885,8 +972,8 @@ impl RtSwapchain {
         drop(images);
         // SAFETY: every frame of the swapchain has completed and every image taken has its move
         // home run ([`RtSwapchain::retire`]), its last present is complete, its semaphore's wait
-        // included ([`RtSwapchain::collect`]), and its textures are gone: nothing uses its
-        // semaphores or images any more.
+        // included ([`RtSwapchain::collect`]), or the device is lost, where nothing runs; and its
+        // textures are gone: nothing uses its semaphores or images any more.
         unsafe {
             for semaphore in semaphores {
                 self.vk.destroy_semaphore(semaphore, None);
@@ -975,9 +1062,11 @@ impl RtSwapchain {
         })
     }
 
-    /// `what`'s refusal with `result`, which marks the surface lost where it says so.
-    fn refused_by(&mut self, what: &str, result: vk::Result) -> Refused {
+    /// `what`'s refusal with `result`, which marks the surface lost where it says so, and rt's
+    /// device known lost where it says that (the module doc, "A lost device").
+    fn refused_by(&mut self, what: &'static str, result: vk::Result) -> Refused {
         self.lost |= result == vk::Result::ERROR_SURFACE_LOST_KHR;
+        self.note(what, result);
         refused(what, result)
     }
 
@@ -989,8 +1078,11 @@ impl RtSwapchain {
         info: &vk::SwapchainCreateInfoKHR<'_>,
     ) -> Result<Vec<Image>, Refused> {
         // SAFETY: `swapchain` is live.
-        let raw_images = unsafe { self.swapchain_api.get_swapchain_images(swapchain) }
-            .map_err(|e| refused("vkGetSwapchainImagesKHR", e))?;
+        let raw_images =
+            unsafe { self.swapchain_api.get_swapchain_images(swapchain) }.map_err(|e| {
+                self.note("vkGetSwapchainImagesKHR", e);
+                refused("vkGetSwapchainImagesKHR", e)
+            })?;
         let extent = info.image_extent;
         let descriptor = texture::drawable_descriptor(extent.width, extent.height);
         let reached = texture::reaches(descriptor.usage, descriptor.pixel_format);
@@ -1036,7 +1128,10 @@ impl RtSwapchain {
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
             } {
                 Ok(ready) => ready,
-                Err(e) => return Err(undo(images, refused("vkCreateSemaphore", e))),
+                Err(e) => {
+                    self.note("vkCreateSemaphore", e);
+                    return Err(undo(images, refused("vkCreateSemaphore", e)));
+                }
             };
             images.push(Image {
                 texture,
@@ -1050,12 +1145,26 @@ impl RtSwapchain {
     }
 }
 
+/// Where the swapchain's Vulkan call `call` on `device`, rt's, answered `result`: the one place a
+/// call of the window's sees rt's device lost. `VK_ERROR_DEVICE_LOST` makes the device known lost
+/// (`DeviceLoss::seen_lost`), so the swapchain makes no Vulkan call on it from then on but its
+/// end's destroys, and the window's sink makes no swapchain (the module doc, "A lost device").
+fn answer_seen(device: &RtDevice, call: &'static str, result: vk::Result) {
+    if result == vk::Result::ERROR_DEVICE_LOST {
+        if !device.loss().is_lost() {
+            log::info!(target: TARGET, "{call} answered VK_ERROR_DEVICE_LOST: rt's device is lost");
+        }
+        device.loss().seen_lost();
+    }
+}
+
 impl Drop for RtSwapchain {
     /// The swapchain's end, on the render thread: its frames complete and its taken images'
     /// moves home run, and where a present is not known complete, the swapchain waits for its
     /// presents' fences, or for the presenting queue to idle (the module doc); then every
     /// swapchain's images' textures, its semaphores and the swapchain go, then the fences and the
-    /// surface.
+    /// surface. With rt's device known lost, it waits for none of it, and its only Vulkan calls
+    /// are the destroys (the module doc, "A lost device").
     fn drop(&mut self) {
         let last = self.retire();
         self.retired.extend(last);
@@ -1063,8 +1172,8 @@ impl Drop for RtSwapchain {
         let _ = self.settle_fence();
         self.end_retired("the window's end");
         let _wsi = WSI.lock();
-        // SAFETY: every present is complete, so nothing waits on a fence any more, nor uses the
-        // surface.
+        // SAFETY: every present is complete, or the device is lost, where nothing runs: nothing
+        // waits on a fence any more, nor uses the surface.
         unsafe {
             for fence in self.fences.iter().flat_map(Fences::all) {
                 self.vk.destroy_fence(fence, None);
@@ -1365,5 +1474,104 @@ mod tests {
         for spans in [acquires, presents, waits, frames, creates] {
             assert!(spans.longest <= spans.total, "{counted:?}");
         }
+    }
+
+    /// A clear of `frame`'s drawable on `queue`, `swapchain`'s present of it encoded and the
+    /// command buffer committed and waited for: the command buffer.
+    fn clear_and_commit(
+        device: &RtObj<RtDevice>,
+        swapchain: &RtSwapchain,
+        frame: Frame,
+    ) -> RtObj<RtCommandBuffer> {
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let texture = swapchain.texture(frame).expect("the frame's drawable");
+        let made = queue.command_buffer(on).expect("never a raise");
+        let made = made.expect("a command buffer");
+        let mut pass = rt::RenderPassDescriptor::default();
+        pass.color_attachments[0].texture = Some(texture.rt().clone());
+        pass.color_attachments[0].load_action = rt::LoadAction::Clear;
+        let clear = made.rt().render_command_encoder(&pass);
+        clear.expect("a clear of the drawable").end_encoding();
+        assert!(swapchain.encode_ready(frame, &made));
+        assert_eq!(made.commit(on), Ok(()));
+        assert_eq!(made.wait_until_completed(on), Ok(()));
+        made
+    }
+
+    /// Once a Vulkan call of a window's swapchain answers `VK_ERROR_DEVICE_LOST` (here its create's
+    /// refusal, as on Intel's Windows driver after rt's device was lost), rt's device is known lost
+    /// and the swapchain makes no Vulkan call on it but its end's destroys (the module doc, "A lost
+    /// device"), over a headless surface on the GPU the test holds, whose device itself lives on:
+    /// a frame committed before then presents nothing; every draw, at its size or another, answers
+    /// [`Acquired::Lost`] with no take, present or create counted and the swapchain made at the
+    /// first draw kept, retiring none; and its end commits no clear for the image taken and not
+    /// presented, and waits on nothing. rt refuses nothing on the way, and the loss is logged.
+    #[test]
+    fn a_lost_device_s_swapchain_makes_no_vulkan_call_but_its_end_s_destroys_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let Some(surface) = headless_surface(&device) else {
+            return;
+        };
+        let before = refusals();
+        let logs = crate::core::testkit::logs::capture();
+        // SAFETY: the surface is live, of the device's instance, and the swapchain's alone.
+        let made = unsafe { RtSwapchain::new(&device, surface) };
+        let mut swapchain = made.expect("a swapchain over the headless surface");
+        let size = (64, 48);
+        let frame = take(&mut swapchain, size);
+        let shown = clear_and_commit(&device, &swapchain, frame);
+        assert!(
+            swapchain.present(frame, &shown),
+            "the frame before the loss"
+        );
+        let kept = take(&mut swapchain, size);
+        let unshown = clear_and_commit(&device, &swapchain, kept);
+        let raw = (swapchain.chain.as_ref()).map(|c| c.raw);
+        assert!(!device.loss().is_lost());
+        let _ = swapchain.refused_by("vkCreateSwapchainKHR", vk::Result::ERROR_DEVICE_LOST);
+        assert!(
+            device.loss().is_lost(),
+            "a call's answer makes the device known lost"
+        );
+        window_times::count();
+        let _ = window_times::take();
+        assert!(!swapchain.present(kept, &unshown), "nothing is presented");
+        for size in [size, (80, 40), size] {
+            assert!(
+                matches!(swapchain.acquire(size), Acquired::Lost),
+                "{size:?}"
+            );
+        }
+        assert_eq!(
+            swapchain.chain.as_ref().map(|c| c.raw),
+            raw,
+            "none made again"
+        );
+        assert_eq!(swapchain.extent(), Some(size));
+        assert!(swapchain.retired.is_empty());
+        let counted = window_times::take();
+        assert_eq!(
+            (
+                counted.acquires.count,
+                counted.presents.count,
+                counted.creates.count
+            ),
+            (0, 0, 0),
+            "{counted:?}"
+        );
+        // The end's retire: the image taken and not presented gets no clear, and no queue is made
+        // for one.
+        let chain = swapchain.retire();
+        assert!(chain.is_some() && swapchain.settling.is_none());
+        swapchain.retired.extend(chain);
+        drop(swapchain);
+        let lost: Vec<String> = (logs.take().into_iter())
+            .filter(|(_, target, line)| target == TARGET && line.contains("rt's device is lost"))
+            .map(|(_, _, line)| line)
+            .collect();
+        assert!(!lost.is_empty(), "the loss is logged");
+        assert_eq!(refusals(), before);
     }
 }

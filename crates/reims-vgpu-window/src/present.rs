@@ -21,6 +21,12 @@
 //! surface the next presenter is made over, counted as a renewal as an ended one is: on Linux a
 //! new SDL window, the old one hidden and kept, never destroyed, under the old swapchain
 //! (`crate::sdl::shell::park`). On macOS nothing takes it, and the window stays as it is.
+//!
+//! **A lost device.** Where the GPU's driver reports the runtime's device lost, which nothing makes
+//! again, the presenter can draw no more ([`Drawn::Lost`]): the render thread keeps it to the
+//! window's end, unasked, so the window keeps the frame it shows, its swapchain made no Vulkan call
+//! on the lost device since, and no presenter is made again: one would make a new surface and
+//! swapchain on the lost device.
 
 use std::time::Duration;
 
@@ -56,6 +62,10 @@ pub enum Drawn {
     /// GPU device parked: the next presenter needs a new window (the module doc, "A parked
     /// presenter").
     Parked,
+    /// The presenter can draw no more, its GPU device lost, which nothing makes again: the render
+    /// thread keeps it to the window's end, and the window keeps the frame it shows (the module
+    /// doc, "A lost device").
+    Lost,
 }
 
 /// What a window's render thread presents through: the sink's, over the window's swapchain.
@@ -112,8 +122,8 @@ pub trait VulkanTarget {
 pub(crate) struct Presenting {
     /// The presenter, once made.
     presenter: Option<Box<dyn Presenter>>,
-    /// The window stays as it is: the sink made no presenter, or the presenters ended too many
-    /// times in a row.
+    /// The window stays as it is: the sink made no presenter, the presenters ended too many
+    /// times in a row, or the presenter's device is lost ([`Drawn::Lost`]).
     ended: bool,
     /// The presenters made again since the last frame presented.
     renewals: Renewals,
@@ -165,6 +175,12 @@ impl Presenting {
             return false;
         };
         let drawn = presenter.draw(drawable, scale, region, cursor);
+        if drawn == Drawn::Lost {
+            // Kept to the window's end, asked no more, and no other made (the module doc, "A lost
+            // device").
+            self.ended = true;
+            return false;
+        }
         if matches!(drawn, Drawn::Ended | Drawn::Parked) {
             // A parked presenter's end leaves its objects as they are (the module doc).
             self.presenter = None;
@@ -192,7 +208,7 @@ impl Renewals {
         match drawn {
             Drawn::Presented => self.0 = 0,
             Drawn::Ended | Drawn::Parked => self.0 = self.0.saturating_add(1),
-            Drawn::Nothing | Drawn::Retry => {}
+            Drawn::Nothing | Drawn::Retry | Drawn::Lost => {}
         }
         self.0 <= RENEWALS
     }
@@ -216,6 +232,33 @@ mod tests {
             _cursor: Option<&DrawnCursor>,
         ) -> Drawn {
             self.0.pop_front().unwrap_or(Drawn::Presented)
+        }
+    }
+
+    /// A presenter whose GPU device is lost, counting its draws in `draws` and its drop in
+    /// `dropped`.
+    struct Losing {
+        draws: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Presenter for Losing {
+        fn draw(
+            &mut self,
+            _drawable: (u64, u64),
+            _scale: f64,
+            _region: PixelRect,
+            _cursor: Option<&DrawnCursor>,
+        ) -> Drawn {
+            self.draws.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Drawn::Lost
+        }
+    }
+
+    impl Drop for Losing {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -297,6 +340,36 @@ mod tests {
             assert!(r.after(Drawn::Parked));
         }
         assert!(!r.after(Drawn::Parked), "the window stays as it is");
+    }
+
+    /// A presenter whose device is lost is kept to the window's end, so the window keeps the frame
+    /// it shows, and is asked to draw no more; no presenter is made again, nor a new window asked
+    /// for
+    #[test]
+    fn a_lost_device_s_presenter_is_kept_and_asked_no_more() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let draws = Arc::new(AtomicU32::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut p = Presenting::default();
+        let losing = Losing {
+            draws: Arc::clone(&draws),
+            dropped: Arc::clone(&dropped),
+        };
+        p.make(|| Some(Box::new(losing)));
+        assert!(!p.draw((4, 4), 1.0, REGION, None), "no retry");
+        for _ in 0..100 {
+            assert!(!p.needs_presenter(), "none made again");
+            assert!(!p.draw((4, 4), 1.0, REGION, None));
+        }
+        assert_eq!(draws.load(Ordering::SeqCst), 1, "asked once, at the loss");
+        assert!(!p.take_parked(), "no new window");
+        assert!(
+            p.presenter.is_some() && !dropped.load(Ordering::SeqCst),
+            "kept"
+        );
+        drop(p);
+        assert!(dropped.load(Ordering::SeqCst), "let go at the window's end");
     }
 
     /// Presenters that end too many times in a row leave the window as it is

@@ -34,7 +34,10 @@
 //!   ends with the device lost), and how many of its command buffers were committed and not
 //!   complete then, the one failing among them ([`DeviceLoss`]).
 //!   Each command buffer that fails with the device lost is counted, `rt-device-lost`, in the
-//!   process's degradation counts (docs/conventions.md).
+//!   process's degradation counts (docs/conventions.md). The device is known lost from then on
+//!   ([`DeviceLoss::is_lost`]), as it is once a window's swapchain sees the loss itself
+//!   ([`DeviceLoss::seen_lost`]): its swapchains make no Vulkan call on it but their ends'
+//!   destroys (`super::swapchain`'s docs, "A lost device").
 //!   One its caller failed for a deferred buffer's memory rt refused
 //!   (`CommandBuffer::fail_out_of_memory`, `super::buffer`'s "Deferred memory") ends with
 //!   `OutOfMemory` (8) where rt gave it no error of its own: its status, once rt's is completed,
@@ -396,6 +399,8 @@ pub struct DeviceLoss {
     hung: AtomicBool,
     /// Whether the loss's line was written.
     said: AtomicBool,
+    /// Whether the device is known lost ([`DeviceLoss::is_lost`]).
+    known: AtomicBool,
     /// Its command buffers committed and not complete: a commit adds one before rt has it (and
     /// takes it off where rt refuses it), and its first completed handler takes it off once its
     /// error is read, so a failing command buffer counts itself.
@@ -409,13 +414,32 @@ impl DeviceLoss {
             gpu,
             hung: AtomicBool::new(false),
             said: AtomicBool::new(false),
+            known: AtomicBool::new(false),
             open: AtomicI64::new(0),
         }
     }
 
-    /// A command buffer failed with the device lost: counted, and the first writes the loss's
-    /// line, with rt's cause, which `cause` reads (the module's docs, "A lost device's line").
+    /// Whether the device is known lost, which nothing makes again: one of its command buffers
+    /// failed with it lost, or the platform saw it lost elsewhere first
+    /// ([`DeviceLoss::seen_lost`]). A window's swapchain makes no Vulkan call on it from then on
+    /// but its end's destroys (`super::swapchain`'s docs, "A lost device").
+    pub fn is_lost(&self) -> bool {
+        self.known.load(Ordering::SeqCst)
+    }
+
+    /// The platform saw the device lost outside a command buffer's completion: a Vulkan call on
+    /// it answered `VK_ERROR_DEVICE_LOST`, or rt's error of a command buffer whose completed
+    /// handlers have yet to run says so. It is known lost from here on ([`DeviceLoss::is_lost`]);
+    /// the loss's line stays the first failing command buffer's to write.
+    pub fn seen_lost(&self) {
+        self.known.store(true, Ordering::SeqCst);
+    }
+
+    /// A command buffer failed with the device lost: known lost, counted, and the first writes
+    /// the loss's line, with rt's cause, which `cause` reads (the module's docs, "A lost device's
+    /// line").
     fn lost(&self, cause: &dyn Fn() -> Option<rt::DeviceLoss>) {
+        self.seen_lost();
         crate::answer::count_kind(DEVICE_LOST);
         if self.said.swap(true, Ordering::SeqCst) {
             return;
@@ -1427,8 +1451,10 @@ mod tests {
     /// A lost device writes one line, at the first of its command buffers that fails with it lost,
     /// naming its GPU, the Vulkan call rt took it as lost at and what it returned, and how many of
     /// its command buffers were committed and not complete then, the failing one among them; each
-    /// command buffer that fails so is counted, once however often its error is read (the
-    /// module's docs, "A lost device's line"). Where rt names no call, the line says so.
+    /// command buffer that fails so is counted, once however often its error is read, and the
+    /// device is known lost from then on; a loss a swapchain sees marks it known lost with no line
+    /// nor count (the module's docs, "A lost device's line"). Where rt names no call, the line
+    /// says so.
     #[test]
     fn a_lost_device_writes_one_line_and_counts_each_command_buffer() {
         use rt::CommandBufferError::{DeviceLost, NotRun};
@@ -1452,7 +1478,9 @@ mod tests {
         third.completed(Some(NotRun));
         assert_eq!(said(), Vec::<String>::new());
         assert_eq!(counted(DEVICE_LOST), before);
+        assert!(!loss.is_lost(), "an unrun command buffer is no loss");
         first.completed(Some(DeviceLost { in_flight: true }));
+        assert!(loss.is_lost());
         second.completed(Some(DeviceLost { in_flight: false }));
         // Read again, each keeps its answer and is not counted again.
         let reads = [first.read(Some(NotRun)), second.read(Some(NotRun))];
@@ -1468,6 +1496,11 @@ mod tests {
         );
         assert_eq!(counted(DEVICE_LOST), before + 2);
         assert_eq!(loss.open.load(Ordering::SeqCst), 0);
+        let seen = DeviceLoss::new("A GPU (1234:5678)".to_owned());
+        seen.seen_lost();
+        assert!(seen.is_lost(), "a loss a swapchain saw");
+        assert_eq!(said().len(), 1, "no line of its own");
+        assert_eq!(counted(DEVICE_LOST), before + 2, "nor a count");
         // Another device, whose loss rt names no call for.
         let other = Arc::new(DeviceLoss::new("B GPU (1234:9abc)".to_owned()));
         other.open.fetch_add(1, Ordering::SeqCst);
