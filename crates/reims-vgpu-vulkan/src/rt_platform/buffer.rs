@@ -63,10 +63,10 @@
 //! **Read-only memory.** Metal's GPU drops a kernel's and a blit's writes to a no-copy buffer or
 //! heap of option bit 24, and to the pages a guest process maps read-only, and the CPU and later
 //! command buffers read the pages' bytes (measured on the M3 Max, the 5300M and the UHD 630,
-//! `crate::gpu::command`'s docs); Vulkan has no memory that drops writes, and rt no read-only
-//! import. So such pages are imported as a copy whose GPU writes are dropped, the pages written
-//! whole into it at each commit that uses it (`super::copied`, "Writes dropped"), never by their
-//! pointer or a dma-buf, which the GPU would write: a pages block's view its process maps
+//! docs/graphics-kext/dgpu-oracle.md, Q38); Vulkan has no memory that drops writes, and rt no
+//! read-only import. So such pages are imported as a copy whose GPU writes are dropped, the pages
+//! written whole into it at each commit that uses it (`super::copied`, "Writes dropped"), never by
+//! their pointer or a dma-buf, which the GPU would write: a pages block's view its process maps
 //! read-only (`import_known`'s `access`), whose address the guest's buffers over the block are
 //! pinned in, and a buffer or heap of option bit 24 with no pin, over a copy of its own. Each such
 //! import is counted ([`IMPORTS_READ_ONLY`]), and as a copy ([`IMPORTS_COPIED`]). A render pass's

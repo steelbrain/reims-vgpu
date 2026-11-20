@@ -55,10 +55,10 @@
 //!   ever written into the pages, and each commit that uses the copy writes the whole of the pages
 //!   into it, with no base and no compare, so the CPU and the command buffers committed after a
 //!   write read the pages' bytes, as the M3 Max, the 5300M and the UHD 630 answer
-//!   (`crate::gpu::command`'s docs). A completion does nothing with such a copy. Within a command
-//!   buffer, and between command buffers in flight at once, a read after the GPU's write sees the
-//!   write until the next commit that uses the copy, which writes over it, that of work still in
-//!   flight among it.
+//!   (docs/graphics-kext/dgpu-oracle.md, Q38). A completion does nothing with such a copy.
+//!   Within a command buffer, and between command buffers in flight at once, a read after the
+//!   GPU's write sees the write until the next commit that uses the copy, which writes over it,
+//!   that of work still in flight among it.
 //! - **Unchanging pages** ([`Kind::Unchanging`]): a copy of pages whose GPU writes are dropped
 //!   that no one writes while the block lives, a file's own on a volume mounted read-only or
 //!   anonymous memory with a copy pending (`RGFX_SURFACE_PAGES_UNCHANGING`, the guest's word,
@@ -210,7 +210,8 @@ pub const READ_ONLY_KIB_CODE: &str = "rt-copied-read-only-kib";
 
 /// The code whose count is the render passes with an attachment over a copy whose writes are
 /// dropped ([`store_outs`]): the 5300M and the UHD 630 complete such a pass, its store dropped
-/// with the copy's other writes, as rt's does; the M3 Max faults it (`crate::gpu::command`'s docs).
+/// with the copy's other writes, as rt's does; the M3 Max faults it
+/// (docs/graphics-kext/dgpu-oracle.md, Q38).
 pub const STORE_OUTS_CODE: &str = "rt-copied-store-outs";
 
 /// The code whose count is the nanoseconds the copies' syncs took, on the committing thread and
