@@ -4858,9 +4858,9 @@ reads it once.
   `pool-take-zero-skipped-prezeroed-bytes`); a take over bytes it has not
   reached zeroes them itself. The zeroer claims 64 KiB at a time with the
   pool's lock held, writes it with the lock let go of, and marks it zeroed
-  with the lock held again; a take passes over the claimed 64 KiB, and waits
-  for its write only where it alone keeps the take out of every piece
-  (`pool-take-claim-waits`). No other empty piece is zeroed: it goes back
+  with the lock held again; a take whose first fit holds some of the
+  claimed 64 KiB waits for its write (`pool-take-claim-waits`), so a block
+  lies where it would with no zeroer. No other empty piece is zeroed: it goes back
   whole. The device's release waits for the zeroer and the take workers to
   let go of the pool. So a context's takes are answered in its order, and
   never wait behind another context's growth or zeroing. The host keeps

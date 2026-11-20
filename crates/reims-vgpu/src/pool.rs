@@ -141,8 +141,8 @@ pub const ZERO_LONG_HOLD_PART_NS_CODES: [&str; 2] =
 /// longest the walks of 11-19 saw, with 16 KiB written inside the hold, was 64 µs.
 pub const ZERO_HOLD_LONG: std::time::Duration = std::time::Duration::from_micros(50);
 
-/// The code of the takes that waited for the zeroer's claimed chunk, which alone kept them out of
-/// a piece, to be written (`takes`, "Zeros ahead"), counted by the take.
+/// The code of the takes that waited for the zeroer's claimed chunk, which their first fit held
+/// bytes of, to be written (`takes`, "Zeros ahead"), counted by the take.
 pub const TAKE_CLAIM_WAITS_CODE: &str = "pool-take-claim-waits";
 
 /// The code of the nanoseconds the takes [`TAKE_CLAIM_WAITS_CODE`] counts waited, in all.
@@ -399,8 +399,8 @@ struct State {
     /// The chunk the zeroer is writing, which no carve takes: its piece's address and its
     /// offsets in the piece's block (`takes`, "Zeros ahead").
     claim: Option<(u64, std::ops::Range<u64>)>,
-    /// The takes waiting for the claimed chunk's write, the only room for them: the zeroer claims
-    /// no other meanwhile (`takes`, "Zeros ahead").
+    /// The takes whose first fit holds bytes of the claimed chunk, waiting for its write: the
+    /// zeroer claims no other meanwhile (`takes`, "Zeros ahead").
     claim_waits: usize,
     /// The zeroer runs.
     zeroer: bool,

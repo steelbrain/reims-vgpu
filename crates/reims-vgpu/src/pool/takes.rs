@@ -46,21 +46,21 @@
 //! pick and the mark, and each hold longer than [`super::ZERO_HOLD_LONG`] with its parts' time
 //! ([`super::ZERO_HOLDS_LONG_CODE`]).
 //!
-//! A carve passes over the claimed chunk as over another carve, so no carve's bytes are ever
-//! the zeroer's, and the chunk's piece goes back only once the zeroer let go of it. A carve takes
-//! its bytes out of the record, and its worker zeroes only those the record lacks; the rest it
-//! leaves, counted ([`super::TAKE_ZERO_PREZEROED_BYTES_CODE`]). So no byte is zeroed twice, and
-//! the zeroer holds the pool's lock only to pick and to mark a chunk, never for its write: no
-//! holder of the lock waits for its write, the take workers among them, nor does any of the
-//! Private blocks' ([`super::private_blocks`], whose ledger, lock and workers it shares nothing
-//! with). One take may: where the claimed chunk alone keeps a take out of every piece, its worker
-//! waits for the chunk's write and mark rather than ask for a piece, the zeroer claiming no other
-//! chunk meanwhile, counted with its wait, in all and at its longest
-//! ([`super::TAKE_CLAIM_WAITS_CODE`]): one chunk's write at most. The device's release ends the
-//! zeroer once its chunk is written, and waits for it and for the take workers to let go of the
-//! pool ([`super::Threads`]). The guest writes no freed carve's
-//! bytes: the kext takes a block's mapping out of the process before its give, and the device
-//! frees it once the context's command buffers have finished.
+//! No carve takes the claimed chunk, so no carve's bytes are ever the zeroer's, and the chunk's
+//! piece goes back only once the zeroer let go of it. A carve takes its bytes out of the record,
+//! and its worker zeroes only those the record lacks; the rest it leaves, counted
+//! ([`super::TAKE_ZERO_PREZEROED_BYTES_CODE`]). So no byte is zeroed twice, and the zeroer holds
+//! the pool's lock only to pick and to mark a chunk, never for its write: no holder of the lock
+//! waits for its write, the take workers among them, nor does any of the Private blocks'
+//! ([`super::private_blocks`], whose ledger, lock and workers it shares nothing with). One take
+//! may: where a take's first fit holds bytes of the claimed chunk, its worker waits for the chunk's
+//! write and mark, the zeroer claiming no other chunk meanwhile, and then carves that first fit,
+//! counted with its wait, in all and at its longest ([`super::TAKE_CLAIM_WAITS_CODE`]): one chunk's
+//! write at most. So the zeroer moves no carve: a block lies where it would with no zeroer, first
+//! fit over the carves alone. The device's release ends the zeroer once its chunk is written, and
+//! waits for it and for the take workers to let go of the pool ([`super::Threads`]). The guest
+//! writes no freed carve's bytes: the kext takes a block's mapping out of the process before its
+//! give, and the device frees it once the context's command buffers have finished.
 //!
 //! The zeroer touches no memory the pool does not hold already: the blocks of its pieces alone,
 //! and of those the headroom and the pieces the guest uses.
@@ -681,11 +681,10 @@ impl State {
     }
 
     /// Where `len` bytes of a carve go, first fit: the live piece with room for them at the
-    /// lowest address, and the lowest address in it where they overlap neither a carve nor the
-    /// zeroer's claimed chunk. `Err(true)` where none is but for the claimed chunk, `Err(false)`
-    /// where none is.
+    /// lowest address, and the lowest address in it where they overlap no carve. `Err(true)`
+    /// where they overlap the zeroer's claimed chunk, whose write the take waits for, so a carve
+    /// lies where it would with no zeroer; `Err(false)` where no piece has room.
     fn spot(&self, len: u64) -> Result<(u64, u64), bool> {
-        let mut claimed = false;
         for (&start, p) in &self.pieces {
             if p.mapped != Mapped::Live || p.block.len < len {
                 continue;
@@ -696,21 +695,14 @@ impl State {
             let Some(at) = self.fit(start, end, len) else {
                 continue;
             };
-            let claim = (self.claim.as_ref())
-                .filter(|(piece, _)| *piece == start)
-                .map(|(_, r)| start.saturating_add(r.start)..start.saturating_add(r.end));
-            let Some(claim) = claim.filter(|k| at < k.end && k.start < at.saturating_add(len))
-            else {
-                return Ok((start, at));
-            };
-            // Every fit from `at` to the claimed chunk overlaps it: the next lies past its end,
-            // which no carve straddles, as its bytes are no carve's.
-            match self.fit(claim.end, end, len) {
-                Some(at) => return Ok((start, at)),
-                None => claimed = true,
-            }
+            let claimed = (self.claim.as_ref()).is_some_and(|(piece, r)| {
+                *piece == start
+                    && start.saturating_add(r.start) < at.saturating_add(len)
+                    && at < start.saturating_add(r.end)
+            });
+            return if claimed { Err(true) } else { Ok((start, at)) };
         }
-        Err(claimed)
+        Err(false)
     }
 
     /// The lowest address from `from` where `len` bytes fit below `end` with no carve over
@@ -1070,9 +1062,10 @@ impl Shared {
                 while st.claim.is_some() && st.stands(context, life) {
                     self.changed.wait(st);
                 }
-                st.claim_waits = st.claim_waits.saturating_sub(1);
                 let waited = (self.now)().saturating_duration_since(since);
                 MutexGuard::unlocked(st, || claim_waited(waited));
+                // The zeroer claims nothing until the take is carved, with the lock held from here.
+                st.claim_waits = st.claim_waits.saturating_sub(1);
                 continue;
             }
             asked = asked.or_else(|| Some((self.now)()));

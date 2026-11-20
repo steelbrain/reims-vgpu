@@ -967,6 +967,51 @@ fn a_take_racing_the_zeroer_reads_zero_and_keeps_what_the_guest_writes() {
     assert_eq!(zeroed_by(&pool)[0], top);
 }
 
+/// A take whose first fit holds bytes of the zeroer's claimed chunk waits for the chunk's write,
+/// counted, and is carved at that first fit, as with no zeroer: the zeroer moves no carve, and the
+/// take's worker zeroes only the bytes the zeroer did not
+#[test]
+fn a_take_over_the_claimed_chunk_waits_for_its_write_and_keeps_its_first_fit() {
+    let host = Arc::new(Host::default());
+    let (pool, _blocks, ledger) = live_pool_unzeroed(&host, LONG);
+    assert_eq!(
+        answer(&take(&ledger, 1, 2 * TAKE_ALIGN)),
+        Some((0, 2 * TAKE_ALIGN))
+    );
+    assert_eq!(
+        answer(&take(&ledger, 2, TAKE_ALIGN)),
+        Some((2 * TAKE_ALIGN, TAKE_ALIGN))
+    );
+    let Give::Given(carve) = ledger.give(1, 0, 2 * TAKE_ALIGN, |_, _| false) else {
+        panic!("not given");
+    };
+    ledger.free(&[carve]);
+    // The zeroer claims the top chunk of the freed bytes, the lowest run, and waits before its
+    // write.
+    pool.shared.state.lock().zero_paused = true;
+    open_zeroer(&pool);
+    assert_eq!(wait_claim(&pool), (BASE, TAKE_ALIGN..2 * TAKE_ALIGN));
+    fill(&pool, 0, 2 * TAKE_ALIGN, 0xa5);
+    let before = zeroed_by(&pool)[0];
+    let waits = counted(TAKE_CLAIM_WAITS_CODE);
+    let rx = take(&ledger, 3, 2 * TAKE_ALIGN);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pool.shared.state.lock().claim_waits == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the take did not wait for the chunk"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(rx.try_recv().is_err(), "answered past the claimed chunk");
+    pool.shared.state.lock().zero_paused = false;
+    pool.shared.changed.notify_all();
+    assert_eq!(answer(&rx), Some((0, 2 * TAKE_ALIGN)));
+    assert!(all(&pool, 0, 2 * TAKE_ALIGN, 0));
+    assert_eq!(zeroed_by(&pool)[0] - before, TAKE_ALIGN);
+    assert!(counted(TAKE_CLAIM_WAITS_CODE) > waits);
+}
+
 /// A take that only the zeroer's claimed chunk keeps out of a piece waits for the chunk's write
 /// rather than asking for a piece, counted, and is carved over it once it is written; its worker
 /// zeroes the rest
