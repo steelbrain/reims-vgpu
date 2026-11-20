@@ -742,17 +742,23 @@ pub const RGFX_CONTEXT_ALLOCATIONS_OFFSET: u64 = RGFX_ALLOCATIONS_OFFSET + RGFX_
 /// `c << RGFX_CONTEXT_OBJ_ID_SHIFT` and up, below the next context's: the guest bundle picks them
 /// there, and `CONTEXT_CLOSE` drops the context's.
 pub const RGFX_CONTEXT_OBJ_ID_SHIFT: u32 = 40;
-/// Where the guest's GPU addresses start. The kext hands each context (each process) a range of
-/// its own from `[RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_END)`, the top half of the Metal address
-/// space, `[2^46, 2^47)`, which no range the host places itself reaches: the platform's runtime
-/// places its own buffers of Metal's space lowest first from 2^32, and the Vulkan platform's
-/// model of Metal's layout places the host's unpinned buffers and textures lowest first from
-/// 2^40, each as far as its live ranges reach, which the host's memory bounds far below 2^46. A
-/// guest's pin meets only the guest's own ranges then. The host takes each range as given: it
-/// knows no context's range, only that the guest's lie here. The addresses the host gives the
-/// Shared pool's blocks on that platform ([`RGFX_FEATURE_POOL_ADDRESSES`]) lie below them, in
-/// `[2^45, 2^46)`, and those of the contexts' Private blocks ([`RGFX_FEATURE_PRIVATE_BLOCKS`])
-/// below those, in `[2^44, 2^45)`.
+/// Where the guest's GPU addresses start. The kext hands each context (each process) a range of its
+/// own from `[RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_END)`, the top half of the Metal address space,
+/// `[2^46, 2^47)`. The host takes each range as given: it knows no context's range, only that the
+/// guest's lie here. On metal2vulkan-rt's device a buffer the host places itself lies at the
+/// driver's Vulkan device address, which the host does not pick, and so do the blocks of the Shared
+/// pool ([`RGFX_FEATURE_POOL_ADDRESSES`]) and the contexts' Private blocks
+/// ([`RGFX_FEATURE_PRIVATE_BLOCKS`]), each rt's device memory at its own address. The platform
+/// finds a block by its address alone, so a pin the guest picks in its range lies in no block the
+/// host holds only while no such address lies in `[2^46, 2^47)`. None did on any device measured
+/// (2026-11-20, a 64 MiB Shared buffer's): those on the RTX 3090 (NVIDIA), the Iris Xe (ANV) and
+/// the RX 550 (RADV) lie below 2^46, and those on the Radeon 780M (RADV) and the UHD 630 (Intel's
+/// Windows driver) in the upper canonical half, above 2^47 (reims-vgpu-vulkan's
+/// `rt_platform::buffer`, "A pinned address"); reims-vgpu's test
+/// `on_vulkan_the_host_s_own_ranges_lie_outside_every_unit` checks it on each device it runs on.
+/// Where the blocks' source gives them no address (the testkit platform's), the host picks the
+/// pool's blocks' addresses in `[2^45, 2^46)` and the Private blocks' in `[2^44, 2^45)`, below the
+/// guest's.
 pub const RGFX_CONTEXT_VA_BASE: u64 = 0x4000_0000_0000;
 /// Where the guest's GPU addresses end: 2^47, the Metal address space's end.
 pub const RGFX_CONTEXT_VA_END: u64 = 0x8000_0000_0000;
