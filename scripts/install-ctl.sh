@@ -631,10 +631,11 @@ kept_qemu() {
 # version: the loader to vulkan-loader's, and KosmicKrisp to mesa's, where mesa
 # is installed (its build has KosmicKrisp on macOS 26 and later). mesa is not
 # among the packages this script installs: with its manifest in Homebrew's
-# share, the system loader lists KosmicKrisp ahead of MoltenVK (measured on an
-# M3 Max, 2026-11-19), and the library's default platform takes the first GPU
-# of its kind the loader lists. Without KosmicKrisp the rt platform makes its
-# own instance.
+# share, the system loader lists KosmicKrisp beside MoltenVK, and the library's
+# default platform times each GPU the loader lists and takes the fastest, which
+# on an M3 Max was KosmicKrisp, where that platform's window cannot present
+# (docs/qemu.md, "The rt platform's Vulkan on a Mac"). Without KosmicKrisp the
+# rt platform makes its own instance.
 mac_vulkan_links() {
   local brew_prefix loader driver
   brew_prefix="$(brew --prefix)"
