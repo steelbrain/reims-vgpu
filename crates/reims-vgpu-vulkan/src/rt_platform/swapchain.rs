@@ -59,16 +59,18 @@
 //! **A lost device.** rt makes its device once and recovers none. Once the device is known lost
 //! (`DeviceLoss::is_lost`: one of rt's command buffers failed with it lost, a frame's command
 //! buffer ended with rt's error naming a lost device, or a Vulkan call of the swapchain's
-//! answered `VK_ERROR_DEVICE_LOST`), the swapchain makes no Vulkan call on it but its end's
-//! destroys: no create, take, wait, present or remake, and no clear of rt's at a retire. Every
-//! draw answers [`Acquired::Lost`] at once, and a present presents nothing; the window keeps the
-//! frame it shows. Vulkan allows any call on a lost device ("It is still legal to call any API
-//! command on the device and child objects", the specification's "Lost Device"), and the calls
-//! achieve nothing there; Intel's Windows driver for a UHD 630 died of an access violation inside
-//! one of them (`vkCreateSwapchainKHR`, retried at every draw for about 6 minutes after the loss,
-//! **measured** 2026-11-20). The destroys are the calls the specification still asks for: a lost
-//! device's objects stay valid until destroyed, and are destroyed before their device, which rt
-//! destroys at the host's let-go of it. None waits first: nothing runs on a lost device any more.
+//! answered `VK_ERROR_DEVICE_LOST`, which the swapchain reports to rt as the device's loss, rt's
+//! `Device::report_loss`, so that rt ends the device's work as at a loss it meets itself), the
+//! swapchain makes no Vulkan call on it but its end's destroys: no create, take, wait, present or
+//! remake, and no clear of rt's at a retire. Every draw answers [`Acquired::Lost`] at once, and a
+//! present presents nothing; the window keeps the frame it shows. Vulkan allows any call on a lost
+//! device ("It is still legal to call any API command on the device and child objects", the
+//! specification's "Lost Device"), and the calls achieve nothing there; Intel's Windows driver for
+//! a UHD 630 died of an access violation inside one of them (`vkCreateSwapchainKHR`, retried at
+//! every draw for about 6 minutes after the loss, **measured** 2026-11-20). The destroys are the
+//! calls the specification still asks for: a lost device's objects stay valid until destroyed,
+//! and are destroyed before their device, which rt destroys at the host's let-go of it. None waits
+//! first: nothing runs on a lost device any more.
 
 use ash::{khr, vk};
 use metal2vulkan_runtime as rt;
@@ -1146,14 +1148,18 @@ impl RtSwapchain {
 }
 
 /// Where the swapchain's Vulkan call `call` on `device`, rt's, answered `result`: the one place a
-/// call of the window's sees rt's device lost. `VK_ERROR_DEVICE_LOST` makes the device known lost
-/// (`DeviceLoss::seen_lost`), so the swapchain makes no Vulkan call on it from then on but its
+/// call of the window's sees rt's device lost. `VK_ERROR_DEVICE_LOST` is reported to rt as the
+/// device's loss, of `call` and `result` (rt's `Device::report_loss`): rt ends the device's work
+/// as at a loss it meets itself, every command buffer the loss reaches failing with the device
+/// lost, and names the call as its cause where it is the device's first loss. The device is known
+/// lost (`DeviceLoss::seen_lost`), so the swapchain makes no Vulkan call on it from then on but its
 /// end's destroys, and the window's sink makes no swapchain (the module doc, "A lost device").
 fn answer_seen(device: &RtDevice, call: &'static str, result: vk::Result) {
     if result == vk::Result::ERROR_DEVICE_LOST {
         if !device.loss().is_lost() {
             log::info!(target: TARGET, "{call} answered VK_ERROR_DEVICE_LOST: rt's device is lost");
         }
+        device.rt().report_loss(rt::DeviceLoss { call, result });
         device.loss().seen_lost();
     }
 }
@@ -1500,10 +1506,12 @@ mod tests {
     }
 
     /// Once a Vulkan call of a window's swapchain answers `VK_ERROR_DEVICE_LOST` (here its create's
-    /// refusal, as on Intel's Windows driver after rt's device was lost), rt's device is known lost
-    /// and the swapchain makes no Vulkan call on it but its end's destroys (the module doc, "A lost
-    /// device"), over a headless surface on the GPU the test holds, whose device itself lives on:
-    /// a frame committed before then presents nothing; every draw, at its size or another, answers
+    /// refusal, as on Intel's Windows driver after rt's device was lost), it is rt's device's loss,
+    /// reported to rt (`Device::report_loss`): rt names that call and result as the loss, and a
+    /// command buffer committed after it fails with the device lost, not in flight. The device is
+    /// known lost, and the swapchain makes no Vulkan call on it but its end's destroys (the module
+    /// doc, "A lost device"), over a headless surface on the GPU the test holds: a frame committed
+    /// before then presents nothing; every draw, at its size or another, answers
     /// [`Acquired::Lost`] with no take, present or create counted and the swapchain made at the
     /// first draw kept, retiring none; and its end commits no clear for the image taken and not
     /// presented, and waits on nothing. rt refuses nothing on the way, and the loss is logged.
@@ -1530,10 +1538,31 @@ mod tests {
         let unshown = clear_and_commit(&device, &swapchain, kept);
         let raw = (swapchain.chain.as_ref()).map(|c| c.raw);
         assert!(!device.loss().is_lost());
+        assert_eq!(device.rt().loss(), None);
         let _ = swapchain.refused_by("vkCreateSwapchainKHR", vk::Result::ERROR_DEVICE_LOST);
         assert!(
             device.loss().is_lost(),
             "a call's answer makes the device known lost"
+        );
+        assert_eq!(
+            device.rt().loss(),
+            Some(rt::DeviceLoss {
+                call: "vkCreateSwapchainKHR",
+                result: vk::Result::ERROR_DEVICE_LOST,
+            }),
+            "reported to rt as the device's loss"
+        );
+        // rt ends the device's work as at a loss of its own.
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let late = queue.command_buffer(on).expect("never a raise");
+        let late = late.expect("a command buffer");
+        assert_eq!(late.commit(on), Ok(()));
+        assert_eq!(late.wait_until_completed(on), Ok(()));
+        assert_eq!(
+            late.rt().error(),
+            Some(rt::CommandBufferError::DeviceLost { in_flight: false }),
+            "a commit after the loss"
         );
         window_times::count();
         let _ = window_times::take();
