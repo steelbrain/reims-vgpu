@@ -218,9 +218,9 @@ guest, our kexts drive the device, and our Metal bundle turns macOS's Metal call
 device's command stream. On the host, QEMU's `reims-graphics-pci` hands that stream to the
 library, which runs it on Vulkan through [`metal2vulkan`](https://github.com/steelbrain/metal2vulkan)
 and draws the guest's display into a window of its own. On a Mac the library runs on Vulkan too,
-over MoltenVK rather than Metal, and the guest's side is built there. x86-64 VMs run on Linux and
-Windows hosts, and arm64 VMs under HVF on Apple silicon Macs, under KVM on arm64 Linux and under
-TCG on x86-64 Linux ([docs/qemu.md](docs/qemu.md), "arm64 guests").
+on Mesa's KosmicKrisp driver rather than on Metal, and the guest's side is built there. x86-64 VMs
+run on Linux and Windows hosts, and arm64 VMs under HVF on Apple silicon Macs, under KVM on arm64
+Linux and under TCG on x86-64 Linux ([docs/qemu.md](docs/qemu.md), "arm64 guests").
 
 The library's C API (`crates/reims-vgpu-c/include/reims_vgpu.h`, specified in
 [docs/api.md](docs/api.md)) is its interface to QEMU: `cargo xtask dist` writes the library, the
@@ -242,9 +242,9 @@ it needs itself; working on the code needs the following.
 - cbindgen 0.29.4, for `cargo xtask header` (`cargo install --locked cbindgen --version 0.29.4`).
 - On the Mac, Xcode's clang, for objc2's exception helper (which the `cc` crate builds), Xcode's
   Metal toolchain, with which the Vulkan platform's crate compiles its metallibs as it builds
-  (`xcodebuild -downloadComponent MetalToolchain`), and Homebrew's `vulkan-loader` and
-  `molten-vk`, the Vulkan the library runs on there. The guest's kexts build with Xcode and a
-  macOS 26 KDK (`guest/Makefile`).
+  (`xcodebuild -downloadComponent MetalToolchain`), and Homebrew's `vulkan-loader` and `mesa`,
+  whose KosmicKrisp, on macOS 26 and later, is the Vulkan driver the library runs on there. The
+  guest's kexts build with Xcode and a macOS 26 KDK (`guest/Makefile`).
 - clang and lld for the option ROM and the Ambrosia module (`firmware/`; on a Mac, Homebrew's
   `lld`). reims-ctl's build makes the module itself with clang and the Rust toolchain's own lld.
 - For `make qemu`: the `vendor/qemu` submodule (`git submodule update --init vendor/qemu`) and
